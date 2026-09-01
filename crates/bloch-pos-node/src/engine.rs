@@ -58,6 +58,25 @@
 //! `expected_bits` incident. Rebuilding is O(blocks x attestations) per call
 //! and, on a devnet, free; when it stops being free the fix is an incremental
 //! store with a test proving it equals the rebuild, not a cache with a comment.
+//!
+//! **That remedy cannot be built as written today.** An incremental store folds
+//! in arrival order; the rebuild folds in block-root order, then pool order —
+//! and `forkchoice::Store::observe` is not order-independent, despite saying it
+//! is. A vote at a higher slot hides an equivocating pair at a lower one, so the
+//! two fold orders can disagree on whether a validator is barred, and the test
+//! proving "incremental equals rebuild" is refuted by construction. Witness:
+//! `forkchoice_tests::two_nodes_with_the_same_attestations_split_on_whether_a_block_arrived`
+//! below, and `tests/probe_fold_order.rs` in the committee crate.
+//!
+//! Order-independence has to land first —
+//! `forkchoice::Store::new_set_determined`, behind
+//! `params::FORKCHOICE_SET_DETERMINED_ACTIVATION_EPOCH` — and only then is the
+//! equality the prescription asks for even a statement that could be true.
+//!
+//! Note also that the rebuild is itself what keeps the divergence transient: it
+//! re-derives the equivocator bar from whatever it happens to fold, and does
+//! NOT read the bar the chain has already committed in `fc_equivocators`. A
+//! cache would make that discrepancy permanent.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io;
@@ -1303,6 +1322,8 @@ impl Engine {
             self.pool.values(),
             &self.state.active_validators(),
             self.state.finality().justified.root,
+            epoch_of(self.state.slot())
+                >= bloch_pos_committee::params::FORKCHOICE_SET_DETERMINED_ACTIVATION_EPOCH,
         )
     }
 
@@ -2693,8 +2714,9 @@ pub fn lmd_ghost_head<'a>(
     pool: impl Iterator<Item = &'a Attestation>,
     validators: &[bloch_pos_committee::sample::Validator],
     justified: [u8; 32],
+    set_determined: bool,
 ) -> [u8; 32] {
-    let (fc, parents, children) = forkchoice_store(blocks, pool, validators);
+    let (fc, parents, children) = forkchoice_store(blocks, pool, validators, set_determined);
     let tree = BlockTree { parents: &parents };
     fc.head(&tree, justified, &children)
 }
@@ -2714,8 +2736,9 @@ pub fn lmd_ghost_head_reference<'a>(
     pool: impl Iterator<Item = &'a Attestation>,
     validators: &[bloch_pos_committee::sample::Validator],
     justified: [u8; 32],
+    set_determined: bool,
 ) -> [u8; 32] {
-    let (fc, parents, children) = forkchoice_store(blocks, pool, validators);
+    let (fc, parents, children) = forkchoice_store(blocks, pool, validators, set_determined);
     let tree = BlockTree { parents: &parents };
     fc.head_reference(&tree, justified, &children)
 }
@@ -2729,6 +2752,10 @@ fn forkchoice_store<'a>(
     blocks: &BTreeMap<[u8; 32], BlockEnvelope>,
     pool: impl Iterator<Item = &'a Attestation>,
     validators: &[bloch_pos_committee::sample::Validator],
+    // Apply the set-determined fold instead of the legacy arrival-order one.
+    // Gated by `FORKCHOICE_SET_DETERMINED_ACTIVATION_EPOCH` at the call site;
+    // see the fork-safety argument on that constant.
+    set_determined: bool,
 ) -> (
     FcStore,
     HashMap<[u8; 32], [u8; 32]>,
@@ -2744,7 +2771,11 @@ fn forkchoice_store<'a>(
         kids.sort_unstable();
     }
 
-    let mut fc = FcStore::new();
+    let mut fc = if set_determined {
+        FcStore::new_set_determined()
+    } else {
+        FcStore::new()
+    };
     // Weight is the stake the CANONICAL state committed. A competing branch may
     // commit a different validator set; using its numbers would let a branch
     // vote itself heavier, so the fork choice reads one set — the one this node
@@ -3148,7 +3179,7 @@ mod forkchoice_tests {
             attest(3, 1, b1),
         ];
 
-        let head = lmd_ghost_head(&blocks, pool.iter(), &validators, g);
+        let head = lmd_ghost_head(&blocks, pool.iter(), &validators, g, false);
         assert_eq!(
             head, b1,
             "fork choice followed length instead of attested weight — LMD-GHOST is not wired"
@@ -3163,7 +3194,7 @@ mod forkchoice_tests {
             attest(3, 1, b1),
         ];
         assert_eq!(
-            lmd_ghost_head(&blocks, pool_flipped.iter(), &validators, g),
+            lmd_ghost_head(&blocks, pool_flipped.iter(), &validators, g, false),
             a3
         );
     }
@@ -3172,6 +3203,14 @@ mod forkchoice_tests {
     /// attestations in a different order must not move it — the property whose
     /// violation in `Store::observe` made two honest nodes with identical
     /// inputs compute different heads (found 2026-08-11).
+    ///
+    /// **What this does NOT cover.** Every attestation here is from a distinct
+    /// validator, so `Store::observe` never compares two messages from one
+    /// signer, and the arm that actually depends on arrival order is never
+    /// reached. The property this test names is still false; see
+    /// `two_nodes_with_the_same_attestations_split_on_whether_a_block_arrived`.
+    /// Left as-is rather than widened: it is the pinned witness for the
+    /// cross-validator half, and the case it misses now has its own test.
     #[test]
     fn head_is_independent_of_attestation_order() {
         let g = [0x99u8; 32];
@@ -3183,9 +3222,9 @@ mod forkchoice_tests {
 
         let validators = vals(4);
         let mut pool = vec![attest(0, 1, a1), attest(1, 1, b1), attest(2, 1, b1)];
-        let first = lmd_ghost_head(&blocks, pool.iter(), &validators, g);
+        let first = lmd_ghost_head(&blocks, pool.iter(), &validators, g, false);
         pool.reverse();
-        let second = lmd_ghost_head(&blocks, pool.iter(), &validators, g);
+        let second = lmd_ghost_head(&blocks, pool.iter(), &validators, g, false);
         assert_eq!(first, second);
     }
 
@@ -3206,7 +3245,7 @@ mod forkchoice_tests {
         let validators = vals(1);
         let mut pool = vec![attest(0, 1, a1)];
         pool.extend((100..150u32).map(|v| attest(v, 1, b1)));
-        assert_eq!(lmd_ghost_head(&blocks, pool.iter(), &validators, g), a1);
+        assert_eq!(lmd_ghost_head(&blocks, pool.iter(), &validators, g, false), a1);
     }
 
     /// An equivocator is barred entirely, not counted for either side. With the
@@ -3224,10 +3263,124 @@ mod forkchoice_tests {
         let validators = vals(2);
         // Validator 1 signs both heads in the same slot; validator 0 backs a1.
         let pool = vec![attest(0, 1, a1), attest(1, 1, a1), attest(1, 1, b1)];
-        let head = lmd_ghost_head(&blocks, pool.iter(), &validators, g);
+        let head = lmd_ghost_head(&blocks, pool.iter(), &validators, g, false);
         assert_eq!(
             head, a1,
             "the equivocator was counted, or the honest vote was dropped"
+        );
+    }
+
+    /// **Two honest nodes, the identical attestation set, two different heads
+    /// — differing only in which of them has already imported the block that
+    /// carries one of those attestations.**
+    ///
+    /// This is `Store::observe`'s arrival-order defect reached through the
+    /// node's own fork-choice entry point, with the production containers:
+    /// `blocks` a `BTreeMap` keyed by block root, `pool` a `BTreeMap` keyed by
+    /// `(validator, signing_root)`. Neither node chooses an order; the fold
+    /// order falls out of where each message happens to live.
+    ///
+    /// `forkchoice_store` folds in two phases — every block body first, then
+    /// the loose pool. So the same attestation is folded in phase 1 on a node
+    /// that has the block and in phase 2 on a node that is still holding it
+    /// loose, which is the ordinary state of affairs for the second or so
+    /// between a block being gossiped and being imported. When the validator
+    /// in question has equivocated at an earlier slot, that phase difference
+    /// decides whether the equivocation is seen at all.
+    ///
+    /// The instance is SEARCHED for rather than hand-placed: the pool orders
+    /// one validator's own messages by the SHA3 signing root, which no test
+    /// gets to pick. The search is over block markers only, and the assertion
+    /// is that such an instance exists — i.e. that the divergence is
+    /// reachable, not merely expressible.
+    #[test]
+    fn two_nodes_with_the_same_attestations_split_on_whether_a_block_arrived() {
+        let g = [0x99u8; 32];
+        let heavy = vec![
+            Validator { index: 0, effective_stake: 100 },
+            Validator { index: 1, effective_stake: 1 },
+        ];
+
+        let mut found = 0usize;
+        let mut tried = 0usize;
+        let mut witness: Option<([u8; 32], [u8; 32])> = None;
+        for marker in 0u8..60 {
+            tried += 1;
+            // Three siblings off genesis, plus a fourth carrier block that
+            // holds nothing but validator 0's later attestation.
+            let (siblings, ids) = chain_of(vec![
+                (g, 1, marker, vec![]),
+                (g, 1, marker.wrapping_add(64), vec![]),
+                (g, 1, marker.wrapping_add(128), vec![]),
+            ]);
+            let (a, b, c) = (ids[0], ids[1], ids[2]);
+
+            // Validator 0 signs two heads in slot 5 — slashable, and both
+            // halves are on the wire by design
+            // (`gossip::MAX_EQUIVOCATIONS_PER_DUTY == 2` admits the second one
+            // as `Accept`, not `Ignore`, precisely so the slashing pair can be
+            // built). It then attests normally at slot 40.
+            //
+            // Slot 40, not slot 7: the epoch's committees PARTITION the active
+            // set (`committees::total_active_stake`), so a validator has
+            // exactly one duty per epoch and its next message is necessarily
+            // in the next epoch. 5 and 40 are epochs 0 and 1 at
+            // `SLOTS_PER_EPOCH = 32` — the tightest spacing production can
+            // actually produce, and both are simultaneously holdable: the pool
+            // admits `wall_epoch` and `wall_epoch + 1` (engine.rs
+            // `on_attestation`) and retains `epoch_of(slot) >= cur_e`.
+            let eq_a = attest(0, 5, a);
+            let eq_b = attest(0, 5, b);
+            let later = attest(0, 40, c);
+            let honest = attest(1, 6, a);
+
+            let (carrier, cids) =
+                chain_of(vec![(g, 41, marker.wrapping_add(192), vec![later.clone()])]);
+            let k = cids[0];
+
+            let mut pool_common: BTreeMap<(u32, [u8; 32]), Attestation> = BTreeMap::new();
+            for att in [&eq_a, &eq_b, &honest] {
+                pool_common.insert((att.validator, att.data.signing_root()), att.clone());
+            }
+
+            // NODE A — has imported the carrier block. `later` is in a body.
+            let mut blocks_a = siblings.clone();
+            blocks_a.extend(carrier);
+            let head_a = lmd_ghost_head(&blocks_a, pool_common.values(), &heavy, g, false);
+
+            // NODE B — has not seen the carrier yet, but did receive the same
+            // attestation over gossip, so it sits in the pool.
+            let mut pool_b = pool_common.clone();
+            pool_b.insert((later.validator, later.data.signing_root()), later.clone());
+            let head_b = lmd_ghost_head(&siblings, pool_b.values(), &heavy, g, false);
+
+            // Guard: the carrier block itself carries no weight, so it can
+            // never be the head and cannot be what makes the two differ.
+            assert_ne!(head_a, k, "the zero-weight carrier block won the descent");
+
+            if head_a != head_b {
+                found += 1;
+                if witness.is_none() {
+                    witness = Some((head_a, head_b));
+                }
+                // And the fix closes exactly this instance.
+                assert_eq!(
+                    lmd_ghost_head(&blocks_a, pool_common.values(), &heavy, g, true),
+                    lmd_ghost_head(&siblings, pool_b.values(), &heavy, g, true),
+                    "the set-determined fold still splits the two nodes"
+                );
+            }
+        }
+
+        let (ha, hb) = witness.expect(
+            "no split found in 60 block layouts — either the two-phase fold no \
+             longer decides the equivocation, or the pool stopped carrying both \
+             halves of a pair",
+        );
+        assert_ne!(ha, hb);
+        eprintln!(
+            "block/pool phase split produced divergent heads in {found}/{tried} \
+             randomised block layouts from the IDENTICAL attestation set"
         );
     }
 
@@ -3330,8 +3483,8 @@ mod forkchoice_tests {
 
             for justified in [g, ids[rng.below(ids.len() as u64) as usize]] {
                 assert_eq!(
-                    lmd_ghost_head(&blocks, pool.iter(), &validators, justified),
-                    lmd_ghost_head_reference(&blocks, pool.iter(), &validators, justified),
+                    lmd_ghost_head(&blocks, pool.iter(), &validators, justified, false),
+                    lmd_ghost_head_reference(&blocks, pool.iter(), &validators, justified, false),
                     "round {round}: the rewritten fork choice selected a \
                      different head than the one it replaced"
                 );
@@ -3368,8 +3521,8 @@ mod forkchoice_tests {
         let with_pool: Vec<Attestation> = carried.clone();
         let without_pool: Vec<Attestation> = Vec::new();
         assert_eq!(
-            lmd_ghost_head(&blocks, with_pool.iter(), &validators, g),
-            lmd_ghost_head(&blocks, without_pool.iter(), &validators, g),
+            lmd_ghost_head(&blocks, with_pool.iter(), &validators, g, false),
+            lmd_ghost_head(&blocks, without_pool.iter(), &validators, g, false),
             "dropping from the pool an attestation the stored block {} still \
              carries moved the head — `fc_covered_removals` would be unsound",
             crate::codec::hex8(&carrier)
@@ -3391,12 +3544,12 @@ mod forkchoice_tests {
         };
         let loose = vec![attest(0, 1, smaller)];
         assert_eq!(
-            lmd_ghost_head(&bare, loose.iter(), &validators, g),
+            lmd_ghost_head(&bare, loose.iter(), &validators, g, false),
             smaller,
             "the loose vote did not carry its block"
         );
         assert_eq!(
-            lmd_ghost_head(&bare, [].iter(), &validators, g),
+            lmd_ghost_head(&bare, [].iter(), &validators, g, false),
             larger,
             "the control is not controlling: dropping an uncarried \
              attestation must be able to move the head, or the epoch `retain` \
@@ -3449,11 +3602,11 @@ mod forkchoice_tests {
                 .collect();
 
             let t = Instant::now();
-            let new_head = lmd_ghost_head(&blocks, pool.iter(), &validators, g);
+            let new_head = lmd_ghost_head(&blocks, pool.iter(), &validators, g, false);
             let new_ms = t.elapsed().as_secs_f64() * 1000.0;
 
             let t = Instant::now();
-            let old_head = lmd_ghost_head_reference(&blocks, pool.iter(), &validators, g);
+            let old_head = lmd_ghost_head_reference(&blocks, pool.iter(), &validators, g, false);
             let old_ms = t.elapsed().as_secs_f64() * 1000.0;
 
             // Split the surviving cost, because there are two of them and only
@@ -3463,7 +3616,7 @@ mod forkchoice_tests {
             // chain length), and `Store::head` then walks it. Reporting the
             // total alone would hide which one is left.
             let t = Instant::now();
-            let (fc, parents, children) = forkchoice_store(&blocks, pool.iter(), &validators);
+            let (fc, parents, children) = forkchoice_store(&blocks, pool.iter(), &validators, false);
             let build_ms = t.elapsed().as_secs_f64() * 1000.0;
             let tree = BlockTree { parents: &parents };
             let t = Instant::now();

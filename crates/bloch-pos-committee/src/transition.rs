@@ -1975,7 +1975,14 @@ impl CommittedState {
     /// is deliberate: a long-lived store on the node is exactly the mutable
     /// local state rule 1 bans from the transition.
     fn accumulate_forkchoice(&mut self, roster: &[Validator], attestations: &[Attestation]) {
-        let mut store = Store::new();
+        // Which fold rule, decided by the epoch this state is AT — committed
+        // state, never a local clock. Reading node-local mutable state here is
+        // the 2026-08-08 `expected_bits` failure exactly.
+        let mut store = if self.epoch >= crate::params::FORKCHOICE_SET_DETERMINED_ACTIVATION_EPOCH {
+            Store::new_set_determined()
+        } else {
+            Store::new()
+        };
         for v in roster {
             store.set_stake(v.index, v.effective_stake);
         }

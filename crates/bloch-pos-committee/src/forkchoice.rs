@@ -47,14 +47,50 @@ pub struct Store {
     stake: HashMap<u32, u64>,
     /// Validators observed equivocating; excluded from weight forever.
     equivocators: std::collections::HashSet<u32>,
+    /// Set-determined mode only: every `(validator, slot)` this fold has been
+    /// shown, and the root it named. Empty and never read in legacy mode, so
+    /// a legacy `Store` costs exactly what it did before.
+    seen: HashMap<(u32, u64), [u8; 32]>,
+    /// Which fold rule [`Store::observe`] applies. See
+    /// [`Store::new_set_determined`].
+    set_determined: bool,
 }
 
 impl Store {
+    /// The fold as the live chain has run it since Genesis-4. Arrival-order
+    /// dependent on message sets that contain a masked equivocation — see
+    /// [`Store::observe`] — and kept bit-exact so a pre-flag-day state root
+    /// stays reproducible.
     pub fn new() -> Self {
         Store {
             latest: HashMap::new(),
             stake: HashMap::new(),
             equivocators: std::collections::HashSet::new(),
+            seen: HashMap::new(),
+            set_determined: false,
+        }
+    }
+
+    /// The fold that is actually what the doc comment on [`Store::observe`]
+    /// has always claimed: a pure function of the message SET.
+    ///
+    /// It differs from [`Store::new`] on exactly one class of input — a set in
+    /// which some validator named two different roots in one slot, and the
+    /// legacy rule failed to notice because a higher-slot message from that
+    /// validator was already stored. On every set with no such pair the two
+    /// modes agree message-for-message and head-for-head; that equivalence is
+    /// the fork-safety argument and it is asserted, not assumed, by
+    /// `both_folds_agree_on_every_non_equivocating_set` in
+    /// tests/probe_fold_order.rs.
+    ///
+    /// `seen` is bounded by the fold, not by history: both production callers
+    /// build a fresh `Store` per call (`transition::accumulate_forkchoice`
+    /// per block, `engine::forkchoice_store` per head computation), so it
+    /// holds at most the messages of that one fold.
+    pub fn new_set_determined() -> Self {
+        Store {
+            set_determined: true,
+            ..Store::new()
         }
     }
 
@@ -82,9 +118,43 @@ impl Store {
     /// drops equivocators from both tallies, and it is the honest posture —
     /// equivocation is slashable (§7.3), so the validator is about to be ejected
     /// regardless. Its votes are evidence, not weight.
+    /// ## The masking defect, and what `new_set_determined` does about it
+    ///
+    /// The rule below tests only the message it happens to be *storing*. A
+    /// vote at a higher slot therefore hides an equivocating pair at a lower
+    /// one: both halves fall to the `prev.slot >= msg.slot` arm before the
+    /// equivocation arm is ever consulted, and the bar never fires. Fold the
+    /// same three messages pair-first and the validator is barred forever.
+    /// Two heads, one message set — which is precisely what the paragraph
+    /// above says cannot happen. Witness:
+    /// `fold_of_an_equivocating_pair_plus_a_later_vote_is_order_dependent`.
+    ///
+    /// [`Store::new_set_determined`] closes it by remembering the root named
+    /// at every `(validator, slot)` this fold has seen, so the pair is
+    /// compared against its own slot rather than against whatever is stored.
+    /// It is off by default because the legacy answer is committed to the
+    /// state root through `transition::accumulate_forkchoice`; see
+    /// `params::FORKCHOICE_SET_DETERMINED_ACTIVATION_EPOCH`.
     pub fn observe(&mut self, validator: u32, msg: LatestMessage) -> bool {
         if self.equivocators.contains(&validator) {
             return false;
+        }
+        if self.set_determined {
+            match self.seen.get(&(validator, msg.slot)) {
+                // Two roots at one slot, wherever either half sits in the
+                // fold: equivocation, and the bar no longer depends on what
+                // else has arrived.
+                Some(root) if *root != msg.root => {
+                    self.latest.remove(&validator);
+                    self.equivocators.insert(validator);
+                    return false;
+                }
+                // Exact re-broadcast. Not an offence, and not news.
+                Some(_) => return false,
+                None => {
+                    self.seen.insert((validator, msg.slot), msg.root);
+                }
+            }
         }
         match self.latest.get(&validator) {
             // Same slot, different head: equivocation. Drop the stored message

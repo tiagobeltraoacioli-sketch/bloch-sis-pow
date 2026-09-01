@@ -596,6 +596,49 @@ pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// `u64::MAX` means INERT. Same arming rules as above.
 pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+/// Flag day for the **set-determined fork-choice fold**
+/// ([`crate::forkchoice::Store::new_set_determined`]).
+///
+/// `Store::observe` claims to be a function of the message set. It is not: a
+/// vote at a higher slot makes an equivocating pair at a lower slot invisible,
+/// because the `prev.slot >= msg.slot` arm swallows both halves before the
+/// equivocation arm is consulted. Fold the same messages pair-first and the
+/// validator is barred forever. Witness:
+/// `tests/probe_fold_order.rs::fold_of_an_equivocating_pair_plus_a_later_vote_is_order_dependent`.
+///
+/// Why this needs a flag day at all, given the defect is in a *fold*: the
+/// outcome is committed. `transition::accumulate_forkchoice` writes the fold's
+/// verdict into `latest_messages` and `fc_equivocators`, and both are hashed
+/// into the state root (`state_root.rs`, `FcMessageRecord` /
+/// `FcEquivocatorRecord`). A node folding history under the new rule computes
+/// a root the historical headers do not carry.
+///
+/// ## Fork safety
+///
+/// The two folds differ on exactly one class of input: a message set in which
+/// some validator named two different roots in one slot **and** the legacy rule
+/// missed it. On every set without such a pair they agree message-for-message,
+/// bar-for-bar and head-for-head — asserted over randomised sets by
+/// `both_folds_agree_on_every_non_equivocating_set`, not assumed. So:
+///
+/// * **Old binary, before the flag day** — legacy fold. Unchanged.
+/// * **New binary, before the flag day** — legacy fold, because the gate reads
+///   the epoch of the block being applied. Byte-identical roots to the old one
+///   on every block, equivocating or not. This is what makes the rollout safe
+///   to do in any order, at any pace.
+/// * **After the flag day** — both fleets must be new. A block whose
+///   attestations contain a masked pair commits a different `fc_equivocators`
+///   set under the two rules, so an un-upgraded node rejects the state root and
+///   stalls. It does not silently follow a wrong chain.
+/// * **The chain's own history** — replay of blocks below the flag day uses the
+///   legacy fold and reproduces the roots already in the headers. Nothing is
+///   retroactive.
+///
+/// `u64::MAX` means INERT. Same arming rules as
+/// [`ANCESTRY_SEED_ACTIVATION_EPOCH`]: strictly in the future, and only after
+/// the whole fleet carries the code.
+pub const FORKCHOICE_SET_DETERMINED_ACTIVATION_EPOCH: u64 = u64::MAX;
+
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.
 pub const DS_SORTITION: [u8; 16] = *b"BLCH4:SORTIT\0\0\0\0";
