@@ -59,8 +59,10 @@ use bloch_pos_committee::genesis_cohort::{
     cohort_cap_bps, COHORT_CAP_FLOOR_BPS, COHORT_CAP_START_BPS, COHORT_TAPER_EPOCHS,
 };
 use bloch_pos_committee::params::{
-    DS_ATTEST, DS_BLOCK, DS_BODY, DS_DEPOSIT, DS_EXIT, DS_PROPOSE, DS_RANDAO, DS_SLASH,
-    DS_SORTITION, DS_STATE, SLOTS_PER_EPOCH, SLOT_DURATION_SECS,
+    ANCESTRY_SEED_ACTIVATION_EPOCH, BLOCK_BYTES_V2_ACTIVATION_EPOCH, DS_ATTEST, DS_BLOCK, DS_BODY,
+    DS_DEPOSIT, DS_EXIT, DS_PROPOSE, DS_RANDAO, DS_SLASH, DS_SORTITION, DS_STATE,
+    LEAKED_ROSTER_ACTIVATION_EPOCH, LEAK_RECOVERY_ACTIVATION_EPOCH, SLOTS_PER_EPOCH,
+    SLOT_DURATION_SECS, TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH,
 };
 use bloch_pos_committee::tokenomics_v4::{
     FOUNDER_BLOCH, SAT_PER_BLOCH, TEAM_BLOCH, TOTAL_SUPPLY_SAT, VALIDATOR_EMISSION_BLOCH, VC_BLOCH,
@@ -94,7 +96,12 @@ fn main() {
         Some("--help") | Some("-h") | None => print_help(),
         Some("selfcheck") => {
             self_check();
-            println!("self-check passed");
+            if args.iter().any(|a| a == "--json") {
+                println!("{}", consensus_compat_json());
+            } else {
+                println!("self-check passed");
+                print_consensus_compat();
+            }
         }
         Some("keygen") => keygen(&args[1..]),
         Some("keygen-public") => keygen_public(&args[1..]),
@@ -114,8 +121,12 @@ fn print_help() {
         "{NAME} {VERSION} — Bloch Genesis-4 Proof-of-Stake node\n\
          \n\
          USAGE:\n\
-           bloch-pos selfcheck\n\
-               Verify the frozen consensus parameters this binary links.\n\
+           bloch-pos selfcheck [--json]\n\
+               Verify the frozen consensus parameters this binary links,\n\
+               then state which consensus flag days (activation epochs) it\n\
+               was built knowing — the epoch range it is valid for. --json\n\
+               prints only the machine-readable statement, for release\n\
+               pages and fleet sweeps.\n\
            bloch-pos keygen --dir <dir> --index <i>\n\
                Generate a THROWAWAY devnet validator keystore (hybrid\n\
                ML-DSA-65‖Falcon-1024 + RANDAO seed) at <dir>/validator.key.\n\
@@ -913,4 +924,310 @@ fn self_check() {
     // Migration design §5.1: the slot cadence everything descends from.
     assert_eq!(SLOT_DURATION_SECS, 30);
     assert_eq!(SLOTS_PER_EPOCH, 32);
+}
+
+/// The consensus flag days this binary was built knowing. `u64::MAX` means the
+/// gate ships INERT — code present, rule not armed.
+///
+/// This is the release-page compatibility statement, produced by the binary
+/// itself so it cannot drift from the code — the same principle as the version
+/// stamp (deploy/RELEASE-INTEGRITY.md §1: nothing that cannot state its own
+/// identity is a release). The defect it closes is `genesis4-node-20260814`:
+/// a published binary that predated the epoch-800 and epoch-1400 armings,
+/// diverged on schedule, and whose release page said nothing — because there
+/// was no artifact that could say it.
+///
+/// Two binaries are consensus-compatible at epoch E if and only if their gate
+/// lists agree on every gate with activation epoch ≤ E. A binary missing a
+/// gate armed after it was published follows the old rule at that epoch and
+/// forks. `gates_digest` collapses that comparison to one string equality,
+/// which is what `scripts/fleet-gate-sweep.sh` compares across the fleet
+/// before anyone arms a flag day.
+///
+/// An INERT gate is part of the statement, not an omission from it: a binary
+/// that ships a gate inert is distinguishable from one that never heard of the
+/// gate, and only the second is doomed when the flag day is set. That is why
+/// `u64::MAX` serializes as an explicit `NAME=inert` line rather than being
+/// skipped.
+///
+/// This table is a MIRROR of the `*_ACTIVATION_EPOCH` constants in
+/// `bloch_pos_committee::params` — it imports them, so the VALUES cannot
+/// drift and no epoch can be armed from here. The failure mode it must be
+/// defended against is OMISSION, and that is what
+/// `gate_table_mirrors_params_exactly` below pins.
+const CONSENSUS_GATES: [(&str, u64); 5] = [
+    // Armed.
+    (
+        "TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH",
+        TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH,
+    ),
+    (
+        "BLOCK_BYTES_V2_ACTIVATION_EPOCH",
+        BLOCK_BYTES_V2_ACTIVATION_EPOCH,
+    ),
+    (
+        "LEAKED_ROSTER_ACTIVATION_EPOCH",
+        LEAKED_ROSTER_ACTIVATION_EPOCH,
+    ),
+    // Inert — code present, flag day not set.
+    (
+        "ANCESTRY_SEED_ACTIVATION_EPOCH",
+        ANCESTRY_SEED_ACTIVATION_EPOCH,
+    ),
+    (
+        "LEAK_RECOVERY_ACTIVATION_EPOCH",
+        LEAK_RECOVERY_ACTIVATION_EPOCH,
+    ),
+];
+
+/// Canonical serialization of [`CONSENSUS_GATES`]: one `NAME=<epoch|inert>\n`
+/// line per gate, sorted by name. Sorted, so the digest is a property of the
+/// gate SET and not of declaration order — reordering the table must not
+/// change what the fleet sweep compares.
+fn consensus_gates_canonical() -> String {
+    let mut lines: Vec<String> = CONSENSUS_GATES
+        .iter()
+        .map(|(name, epoch)| {
+            if *epoch == u64::MAX {
+                format!("{name}=inert\n")
+            } else {
+                format!("{name}={epoch}\n")
+            }
+        })
+        .collect();
+    lines.sort();
+    lines.concat()
+}
+
+/// SHA3-256 over [`consensus_gates_canonical`]. Same hash family as the rest
+/// of Genesis-4 consensus, so no new primitive enters the binary for this.
+fn consensus_gates_digest() -> String {
+    use sha3::{Digest, Sha3_256};
+    let digest: [u8; 32] = Sha3_256::digest(consensus_gates_canonical().as_bytes()).into();
+    hex_lower(&digest)
+}
+
+/// The machine-readable consensus-compatibility statement, for release pages
+/// and fleet sweeps: `bloch-pos selfcheck --json`. Hand-rolled JSON on
+/// purpose — every value is a constant this binary links, and a serializer
+/// dependency for eight fields would be surface without benefit.
+fn consensus_compat_json() -> String {
+    let mut gates = String::new();
+    let mut max_armed: u64 = 0;
+    for (i, (name, epoch)) in CONSENSUS_GATES.iter().enumerate() {
+        if i > 0 {
+            gates.push_str(",\n");
+        }
+        if *epoch == u64::MAX {
+            gates.push_str(&format!("    {{\"name\": \"{name}\", \"epoch\": null}}"));
+        } else {
+            gates.push_str(&format!("    {{\"name\": \"{name}\", \"epoch\": {epoch}}}"));
+            max_armed = max_armed.max(*epoch);
+        }
+    }
+    format!(
+        "{{\n  \"binary\": \"{NAME} {VERSION}\",\n  \"block_version\": \"{:#010x}\",\n  \
+         \"slot_duration_secs\": {SLOT_DURATION_SECS},\n  \"slots_per_epoch\": {SLOTS_PER_EPOCH},\n  \
+         \"consensus_gates\": [\n{gates}\n  ],\n  \
+         \"gates_digest\": \"{}\",\n  \
+         \"knows_gates_through_epoch\": {max_armed},\n  \
+         \"compatibility_rule\": \"valid at epoch E only if this gate list matches the canonical one on every gate with epoch <= E; a gate armed on the network after this build makes this binary consensus-dead at that gate's epoch\"\n}}",
+        bloch_pos_committee::header::VERSION_G4,
+        consensus_gates_digest(),
+    )
+}
+
+/// Human form of the same statement, printed after `selfcheck` passes.
+fn print_consensus_compat() {
+    println!("\nconsensus gates this binary knows (epoch = flag day; inert = not armed):");
+    for (name, epoch) in CONSENSUS_GATES {
+        if epoch == u64::MAX {
+            println!("  {name:<44} inert");
+        } else {
+            println!("  {name:<44} {epoch}");
+        }
+    }
+    println!("  gates digest: {}", consensus_gates_digest());
+    println!(
+        "A gate armed on the network after this build makes this binary\n\
+         consensus-dead at that gate's epoch. Compare against the current\n\
+         release page before trusting this node past today's epoch.\n\
+         Machine-readable: bloch-pos selfcheck --json"
+    );
+}
+
+#[cfg(test)]
+mod consensus_gate_tripwire {
+    use super::{consensus_compat_json, consensus_gates_canonical, CONSENSUS_GATES};
+
+    /// The params source, read from disk so the test sees DECLARATIONS, not
+    /// just the constants this file happens to import. Importing is exactly
+    /// what a drifted table does not do.
+    fn params_src() -> String {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../bloch-pos-committee/src/params.rs"
+        );
+        std::fs::read_to_string(path).unwrap_or_else(|e| {
+            panic!(
+                "TRIPWIRE BROKEN: cannot read {path}: {e}\n\
+                 The gate table can no longer be checked against params.rs. \
+                 Fix the path before shipping — a tripwire that cannot read \
+                 its subject is worse than none, because it passes."
+            )
+        })
+    }
+
+    /// Every `pub const *_ACTIVATION_EPOCH` declared in the committee params
+    /// must appear in [`CONSENSUS_GATES`], and vice versa.
+    ///
+    /// The VALUES cannot drift — the table imports the constants, so a changed
+    /// epoch changes the digest automatically and the compiler enforces the
+    /// link. The failure mode this guards is OMISSION: a new gate added to
+    /// params.rs that the release-page statement (`selfcheck --json`) silently
+    /// does not mention. That reproduces the genesis4-node-20260814 defect one
+    /// flag day later — a binary that answers confidently and is wrong.
+    ///
+    /// It fails LOUDLY and specifically: it names the constants missing from
+    /// the table and the ones naming nothing, and states the consequence,
+    /// because a bare `assert_eq!` on two sorted lists is a puzzle at 3am on
+    /// the morning of a flag day.
+    #[test]
+    fn gate_table_mirrors_params_exactly() {
+        let src = params_src();
+
+        let mut in_params: Vec<&str> = src
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim_start();
+                // Only real declarations. The `///` doc lines that MENTION a
+                // gate (params.rs has several) never survive this strip.
+                let rest = l.strip_prefix("pub const ")?;
+                let name = rest.split(':').next()?.trim();
+                name.ends_with("_ACTIVATION_EPOCH").then_some(name)
+            })
+            .collect();
+        in_params.sort_unstable();
+        let before_dedup = in_params.len();
+        in_params.dedup();
+        assert_eq!(
+            before_dedup,
+            in_params.len(),
+            "params.rs declares the same *_ACTIVATION_EPOCH constant twice"
+        );
+
+        // A parser that silently matches nothing would wave through ANY table.
+        assert!(
+            !in_params.is_empty(),
+            "TRIPWIRE BROKEN: found zero `pub const *_ACTIVATION_EPOCH` in \
+             params.rs. Either every gate was deleted (it was not) or the \
+             declaration style changed and this parser no longer sees them. \
+             Fix the parser — as written it would now accept any gate table \
+             at all, which is the failure this test exists to prevent."
+        );
+
+        let mut in_table: Vec<&str> = CONSENSUS_GATES.iter().map(|(n, _)| *n).collect();
+        in_table.sort_unstable();
+        let table_len = in_table.len();
+        in_table.dedup();
+        assert_eq!(
+            table_len,
+            in_table.len(),
+            "CONSENSUS_GATES lists the same gate name twice — the digest would \
+             count it twice and no two binaries could ever be compared"
+        );
+
+        let missing: Vec<&str> = in_params
+            .iter()
+            .filter(|n| !in_table.contains(n))
+            .copied()
+            .collect();
+        let stale: Vec<&str> = in_table
+            .iter()
+            .filter(|n| !in_params.contains(n))
+            .copied()
+            .collect();
+
+        assert!(
+            missing.is_empty() && stale.is_empty(),
+            "CONSENSUS_GATES (bloch-pos-node/src/main.rs) does not mirror the \
+             *_ACTIVATION_EPOCH constants in bloch-pos-committee/src/params.rs.\n\
+             \n\
+             MISSING from the table (declared in params.rs, absent from \
+             `selfcheck --json`): {missing:?}\n\
+             STALE in the table (named here, no longer declared in params.rs): \
+             {stale:?}\n\
+             \n\
+             params.rs declares {} gate(s); the table lists {}.\n\
+             \n\
+             CONSEQUENCE IF SHIPPED: `gates_digest` would be computed over an \
+             incomplete set, so two binaries that genuinely disagree about a \
+             gate would publish the SAME digest and scripts/fleet-gate-sweep.sh \
+             would call them compatible on the eve of a flag day. That is \
+             exactly how genesis4-node-20260814 went out.\n\
+             \n\
+             FIX: add one row per missing constant to CONSENSUS_GATES in \
+             main.rs (and import it in the `bloch_pos_committee::params` use \
+             block), and delete any row named stale. Do NOT change a value in \
+             params.rs to make this pass — this test never justifies arming or \
+             moving an activation epoch.",
+            in_params.len(),
+            in_table.len(),
+        );
+    }
+
+    /// The digest is over the gate SET, not the declaration order, and inert
+    /// gates are part of the set. Both are load-bearing for the fleet sweep:
+    /// two boxes built from the same source must agree byte for byte, and a
+    /// binary that ships a gate inert must NOT collide with one that has never
+    /// heard of it.
+    #[test]
+    fn canonical_form_is_sorted_and_names_inert_gates() {
+        let canon = consensus_gates_canonical();
+        let lines: Vec<&str> = canon.lines().collect();
+        assert_eq!(lines.len(), CONSENSUS_GATES.len());
+
+        let mut sorted = lines.clone();
+        sorted.sort_unstable();
+        assert_eq!(lines, sorted, "canonical gate form must be sorted by name");
+
+        for (name, epoch) in CONSENSUS_GATES {
+            let want = if epoch == u64::MAX {
+                format!("{name}=inert")
+            } else {
+                format!("{name}={epoch}")
+            };
+            assert!(
+                lines.contains(&want.as_str()),
+                "gate {name} missing from canonical form (expected `{want}`)"
+            );
+        }
+    }
+
+    /// `selfcheck --json` is parsed by the fleet sweep, so it has to be valid
+    /// JSON carrying the fields that sweep reads. Checked without pulling a
+    /// JSON dependency into the node binary.
+    #[test]
+    fn json_statement_carries_the_fields_the_sweep_reads() {
+        let json = consensus_compat_json();
+        for field in [
+            "\"binary\"",
+            "\"block_version\"",
+            "\"consensus_gates\"",
+            "\"gates_digest\"",
+            "\"knows_gates_through_epoch\"",
+        ] {
+            assert!(json.contains(field), "selfcheck --json lost {field}");
+        }
+        assert_eq!(
+            json.matches("{\"name\":").count(),
+            CONSENSUS_GATES.len(),
+            "every gate must appear in the JSON statement"
+        );
+        assert_eq!(
+            json.chars().filter(|c| *c == '{').count(),
+            json.chars().filter(|c| *c == '}').count(),
+            "unbalanced braces in the hand-rolled JSON"
+        );
+    }
 }
