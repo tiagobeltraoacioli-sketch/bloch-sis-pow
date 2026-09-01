@@ -2426,7 +2426,28 @@ impl CommittedState {
         // arms that once read it are consensus-rejects now.
         total_active_sat: u128,
         base_fee_millisat_per_gas: u128,
-        verifier: &dyn SignatureVerifier,
+        // ONE injected verifier, TWO interfaces — and this is why it stopped
+        // being `&dyn SignatureVerifier`.
+        //
+        // The transfer and deposit arms verify whole hybrid keys
+        // (`verify_with_key`); the staking rules take the half-split
+        // `staking::HybridKeyVerifier`, because they verify against the
+        // registered key with the suite envelope stripped
+        // (`staking::committed_hybrid_body`) and compose the two halves with
+        // AND themselves (`staking::verify_hybrid`). Neither interface can be
+        // written in terms of the other: a single half handed to
+        // `verify_with_key` is simply a malformed key.
+        //
+        // Both views are the SAME crypto and must be the same object. A
+        // transition that could be given a real verifier for spends and a
+        // permissive one for the staking lifecycle would make retiring a
+        // validator cheaper to forge than moving a coin. A generic bound is
+        // what makes that unrepresentable — there is no second verifier to
+        // pass. The alternative considered and rejected was a second,
+        // optional verifier defaulting to one that refuses: fail-closed, but
+        // SILENTLY, and only after a flag day arms the path — "every exit is
+        // refused and nobody knows why" is the worse failure.
+        verifier: &(impl SignatureVerifier + staking::HybridKeyVerifier),
     ) -> Result<fee_market::TxCharge, TxReject> {
         match tx {
             PosTransaction::Transfer { .. } => self
@@ -4270,11 +4291,11 @@ impl StateReader for CommittedState {
 /// The state transition function. Carries only genesis-fixed configuration —
 /// the injected signature verifier — per the interfaces' purity contract:
 /// no clock, no cache, no handle to anything mutable.
-pub struct Transition<V: SignatureVerifier> {
+pub struct Transition<V: SignatureVerifier + staking::HybridKeyVerifier> {
     verifier: V,
 }
 
-impl<V: SignatureVerifier> Transition<V> {
+impl<V: SignatureVerifier + staking::HybridKeyVerifier> Transition<V> {
     pub fn new(verifier: V) -> Self {
         Transition { verifier }
     }
@@ -4596,7 +4617,7 @@ impl<V: SignatureVerifier> Transition<V> {
     }
 }
 
-impl<V: SignatureVerifier> StateTransition for Transition<V> {
+impl<V: SignatureVerifier + staking::HybridKeyVerifier> StateTransition for Transition<V> {
     type State = CommittedState;
     type Transaction = PosTransaction;
 
@@ -4874,6 +4895,19 @@ mod tests {
             true
         }
     }
+    // The transition demands both interfaces of its ONE injected verifier
+    // (`Transition<V: SignatureVerifier + HybridKeyVerifier>`), so an
+    // accept-everything verifier must say yes on both — otherwise "accept
+    // everything" would quietly mean "accept everything except the staking
+    // lifecycle".
+    impl staking::HybridKeyVerifier for OkVerifier {
+        fn verify_mldsa65(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            true
+        }
+        fn verify_falcon1024(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            true
+        }
+    }
 
     fn sat(bloch: u128) -> u128 {
         bloch * tokenomics_v4::SAT_PER_BLOCH
@@ -4914,6 +4948,19 @@ mod tests {
         }
         fn verify_with_key(&self, pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
             sig == toy_sign(pk, root).as_slice()
+        }
+    }
+    // Permissive on the staking halves, deliberately: `ToyVerifier` exists to
+    // bind SPEND signatures to keys, and the tests that bind STAKING
+    // signatures use the `ToyHybridKeys` switchboard so a single half can be
+    // failed on purpose. A transfer test must die on the transfer, never on
+    // staking plumbing.
+    impl staking::HybridKeyVerifier for ToyVerifier {
+        fn verify_mldsa65(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            true
+        }
+        fn verify_falcon1024(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            true
         }
     }
 
@@ -5212,6 +5259,14 @@ mod tests {
             sig != b"forged"
         }
         fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], sig: &[u8]) -> bool {
+            sig != b"forged"
+        }
+    }
+    impl staking::HybridKeyVerifier for MarkerVerifier {
+        fn verify_mldsa65(&self, _pk: &[u8], _root: &[u8; 32], sig: &[u8]) -> bool {
+            sig != b"forged"
+        }
+        fn verify_falcon1024(&self, _pk: &[u8], _root: &[u8; 32], sig: &[u8]) -> bool {
             sig != b"forged"
         }
     }
@@ -5573,7 +5628,7 @@ mod tests {
         println!("  pre.clone() of the whole state   : {pre_clone:.4?}");
     }
 
-    fn setup_with<V: SignatureVerifier>(
+    fn setup_with<V: SignatureVerifier + staking::HybridKeyVerifier>(
         n: u32,
         verifier: V,
         opening_balances: &[crate::state_root::EutxoEntry],
@@ -5619,7 +5674,7 @@ mod tests {
 
     /// Build a valid block at `slot` on top of `pre`, consuming the drawn
     /// proposer's next reveal — the same walk a real validator client does.
-    fn build_block<V: SignatureVerifier>(
+    fn build_block<V: SignatureVerifier + staking::HybridKeyVerifier>(
         t: &Transition<V>,
         pre: &CommittedState,
         slot: u64,

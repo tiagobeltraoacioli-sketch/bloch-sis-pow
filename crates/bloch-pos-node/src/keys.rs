@@ -135,6 +135,31 @@ impl bloch_pos_committee::attestation::SignatureVerifier for HybridVerifier {
     }
 }
 
+/// The same crypto, seen through the half-split interface the STAKING rules
+/// take ([`bloch_pos_committee::staking::validate_exit`] and the funded
+/// deposit path).
+///
+/// Two interfaces, ONE object, deliberately: `SignatureVerifier` verifies a
+/// whole suite-framed key, `HybridKeyVerifier` verifies one primitive at a
+/// time and lets `staking::verify_hybrid` compose them with AND at the fixed
+/// split points. The transition demands both of the single verifier it is
+/// given (`Transition<V: SignatureVerifier + HybridKeyVerifier>`), so a node
+/// cannot be built that checks spends with the real crypto and exits with
+/// something weaker — retiring a validator must be exactly as hard to forge
+/// as moving a coin.
+///
+/// The two primitives are the same ones
+/// [`crate::ws_boot::WsHybridVerifier`] calls, and for the same reason: the
+/// halves arrive pre-split, so no framing is parsed twice.
+impl bloch_pos_committee::staking::HybridKeyVerifier for HybridVerifier {
+    fn verify_mldsa65(&self, pubkey: &[u8], signing_root: &[u8; 32], sig: &[u8]) -> bool {
+        bloch_crypto::crypto::verify_mldsa65_raw(pubkey, signing_root, sig)
+    }
+    fn verify_falcon1024(&self, pubkey: &[u8], signing_root: &[u8; 32], sig: &[u8]) -> bool {
+        bloch_crypto::crypto::falcon::verify(pubkey, signing_root, sig)
+    }
+}
+
 /// Accept-everything verifier for the producer's own `compute_post_state`
 /// probe: the state a block commits does not depend on the verifier, and the
 /// producer needs the post-state root *before* it can sign the header the
@@ -147,6 +172,22 @@ impl bloch_pos_committee::attestation::SignatureVerifier for ProbeVerifier {
         true
     }
     fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+        true
+    }
+}
+
+/// Accept-everything on the staking interface too, for the same reason and
+/// with the same limit: the producer prices its own block before it can sign
+/// the header the real verifier will check, and the post-state does not depend
+/// on the verifier. Every block still passes through [`HybridVerifier`] in
+/// `apply_block` before it is accepted or broadcast — so a signed exit whose
+/// signature does not verify can enter a proposed block here and is refused
+/// there, exactly like a transfer with a bad witness.
+impl bloch_pos_committee::staking::HybridKeyVerifier for ProbeVerifier {
+    fn verify_mldsa65(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+        true
+    }
+    fn verify_falcon1024(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
         true
     }
 }
