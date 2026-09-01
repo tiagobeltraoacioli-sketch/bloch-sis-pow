@@ -51,10 +51,18 @@
 #     you submit reaches the observer and the observer passes it to the 63
 #     validators on its outbound connections.
 #
-# Verified 2026-09-01 ~01:45 UTC: both reachable from off-network on 19100,
-# both keyless, both `--transport devnet`, both at epoch 1638 reporting the
-# IDENTICAL finalized root bb9fe982…5670 at finalized height 31462 — the
-# check that proves they are on one chain and not two.
+# Verified 2026-09-01 06:58 UTC by `verify-bootnodes.sh --deep`, re-run from
+# off-network immediately before this list was prepared for publication: both
+# reachable on 19100 (3/3 probes each), both keyless, both `--transport
+# devnet`, both RPC-bound to 127.0.0.1, both `behind_by_slots=0`, and both at
+# epoch 1666 reporting the IDENTICAL finalized root
+# 0ac677b8…a4cd at finalized height 32356 — the check that proves they are on
+# one chain and not two.
+#
+# The root above is a MOVING VALUE, not a fingerprint of this file: it advances
+# roughly every 16 minutes. Do not compare a live node against it. Re-run the
+# script, which compares the nodes against EACH OTHER at equal finalized
+# height and fails loudly when they disagree.
 
 139.180.166.5:19100
 139.180.173.231:19100

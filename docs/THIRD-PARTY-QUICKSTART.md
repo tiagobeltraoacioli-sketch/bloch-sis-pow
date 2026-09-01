@@ -20,7 +20,7 @@ your own validation, not our word.
 Three facts that decide whether this works for you. None of them is discovered
 later in the document.
 
-### The clock: 2026-09-05 07:07 UTC
+### The clock: 2026-09-05 07:07:19 UTC
 
 Bloch is proof of stake, so it has a weak-subjectivity window. A validator set
 that has already withdrawn its stake can sign an alternative history at no
@@ -32,7 +32,7 @@ Genesis-4 started at epoch 0. So:
 
 | If your node's first sync starts | What it needs |
 |---|---|
-| **before epoch 2016** — i.e. before **2026-09-05 07:07 UTC** | the genesis manifest and nothing else. The genesis block is its own trust anchor. |
+| **before epoch 2016** — i.e. before **2026-09-05 07:07:19 UTC** | the genesis manifest and nothing else. The genesis block is its own trust anchor. |
 | **after** that instant | a **signed checkpoint** (`--ws-checkpoint` + `--ws-signer-set`) |
 
 **No signed checkpoint exists today.** The signing keys have not been
@@ -45,10 +45,23 @@ finality as its anchor from then on and never needs a checkpoint. **If you
 intend to run a node in 2026, start it before 5 September.** This is the single
 time-sensitive item in this document.
 
+That instant is `genesis + 2016 × 32 × 30 s`, and you should derive it
+yourself rather than take our word for it. Genesis-4 slot 0 was
+**2026-08-13 21:31 UTC**; the two constants are `WITHDRAWAL_DELAY_EPOCHS = 2048`
+and `EXIT_DELAY_EPOCHS = 32` in `crates/bloch-pos-committee/src/staking.rs`.
+To re-derive it from the live chain, read `wall_slot` from any node and
+subtract `wall_slot × 30 s` from your clock. Slots are 30 s, so an independent
+derivation lands within about half a minute of the figure above — treat the
+deadline as "07:07 UTC, give or take a slot", not as a value to cut fine.
+
+**A full cold sync takes about 26 hours (§5), so the last safe moment to
+start is roughly 2026-09-04 05:00 UTC — and that leaves no margin for a
+restart.** Starting "on the 4th" is not starting in time; start now.
+
 You can watch the gate count down in your own node's boot log:
 
 ```
-fresh node: syncing under the genesis anchor (age 1637 of 2016 epochs)
+fresh node: syncing under the genesis anchor (age 1667 of 2016 epochs)
 weak subjectivity: anchored at epoch 0 (9953da73), WITHOUT own finality
 ```
 
@@ -78,8 +91,18 @@ read one.
 **Bind it to `127.0.0.1` and leave it there.** If other hosts in your
 infrastructure need it, put it behind your own authenticating reverse proxy on
 a private network. Our own fleet's RPC is loopback-only for exactly this
-reason. `--rpc-bind 0.0.0.0` on a public host is the single most damaging
-mistake you can make with this software.
+reason — verified on both bootnodes on 2026-09-01. `--rpc-bind 0.0.0.0` on a
+public host is the single most damaging mistake you can make with this
+software.
+
+It is also a denial-of-service surface, because RPC work competes with the
+consensus thread. Measured against a live archival node on 2026-09-01,
+`getbalance` costs **~1.7 ms median** — the same for an empty address and for
+the heaviest address in the ledger (426,194 outputs), so the lookup is indexed
+rather than a scan — with the **first, cold call ~22 ms**. That puts roughly
+**500-600 calls/second** on one saturated core. There is no rate limiting in
+front of it, so that ceiling is whatever your attacker chooses. Throttle it
+yourself; nothing in the node will do it for you.
 
 ---
 
@@ -122,19 +145,36 @@ cargo build --release -p bloch-pos-node
 > initial state construction take hours instead of minutes, because the
 > Keccak permutation is unoptimised.
 
+**Budget time for the build itself.** The release profile is `lto = true` with
+`codegen-units = 1`, which is deliberate — it also carries `overflow-checks`,
+mandatory for a consensus build — and it makes the final link slow and
+single-threaded. Measured ~40 minutes on an 8-core M-series Mac that had other
+compiles competing for CPU. Do not "optimise" this by dropping LTO or building
+in debug: both change the binary you validate with. Start the build before you
+need it.
+
 ## 3. Get the genesis files
 
 **Both ship in the repository you just cloned** — you do not need to download
 them separately:
 
 ```bash
-ls genesis/mainnet.manifest        # 247 KB
-gunzip -k carryover.tsv.gz         # 17 MB compressed -> 55 MB
+ls -l genesis/mainnet.manifest     # 247,514 bytes
+gunzip -k carryover.tsv.gz         # 17 MB compressed -> 54,780,151 bytes
 sha256sum genesis/mainnet.manifest carryover.tsv   # compare against §1
+wc -l carryover.tsv                # 452726
+```
+
+Then put them where §5 expects them, so the commands below run as written:
+
+```bash
+sudo mkdir -p /var/lib/bloch
+sudo cp genesis/mainnet.manifest carryover.tsv /var/lib/bloch/
 ```
 
 Verified 2026-09-01: both are byte-identical to what the live fleet runs
-(checked against `/home/ubuntu/g4/` on archival node 139.180.166.5).
+(checked against `/home/ubuntu/g4/` on archival node 139.180.166.5), and both
+digests in §1 were reproduced from a clean clone of `main`.
 
 > The R2 paths under `…r2.dev/node/genesis4/` referenced by older documents
 > **return 404** — the artifacts were never uploaded there. Use the repository
@@ -168,10 +208,14 @@ in the file rather than let you find out during an incident.
 
 ## 5. Run it
 
-```bash
-mkdir -p /var/lib/bloch/data
+Run this from the repository root you built in §2 (the binary is
+`./target/release/bloch-pos`; copy it onto your `PATH` if you prefer):
 
-./bloch-pos run \
+```bash
+sudo mkdir -p /var/lib/bloch/data
+sudo chown -R "$USER" /var/lib/bloch
+
+./target/release/bloch-pos run \
   --data-dir   /var/lib/bloch/data \
   --genesis    /var/lib/bloch/mainnet.manifest \
   --carryover  /var/lib/bloch/carryover.tsv \
@@ -199,12 +243,38 @@ survives a reboot.
 Two phases, and the first one is silent — this is the part that looks like a
 hang and is not:
 
-**Phase 1 — genesis state construction (~2 minutes, completely silent).** The
-node builds the sparse Merkle tree over all 452,726 carryover outputs before it
-opens its RPC or connects to any peer. Nothing is printed, no port is open, and
-`getchaininfo` does not answer. **It is not stuck.** Measured at ~2 minutes on
-an idle M-series Mac (release build); it stretched to ~10 minutes on the same
-machine while a compile was competing for CPU, so give it a quiet core.
+**Phase 1 — genesis state construction (silent).** The node builds the sparse
+Merkle tree over all 452,726 carryover outputs before it opens its RPC or
+connects to any peer.
+
+You get exactly **two lines within about five seconds**, and then nothing:
+
+```
+carryover: 452726 outputs, 1814640000000000000 sat carried … set root 7c756ee8
+observer mode: no keystore in /var/lib/bloch/data. This node follows the chain,
+applies every block and serves the RPC. It does not propose and does not attest.
+```
+
+> **Do not kill it after those two lines.** This is the part that looks like a
+> hang and is not. Once they are printed there is **no further log output, no
+> open RPC port, no answer to `getchaininfo` and no peer connection** until the
+> tree is finished. Every signal you would normally use to tell "working" from
+> "crashed just after startup" is absent, and the two lines it already printed
+> make it look like it started and then died. **It is not stuck.**
+
+**How long is very sensitive to spare CPU, so treat any single figure with
+suspicion.** The construction pins one core and is not parallel. Measured on an
+8-core M-series Mac: ~2 minutes on an idle machine, but **11 minutes** on the
+same machine at load average ~60-90 with other builds running. Resident memory
+climbs steadily throughout (~265 MB → ~800 MB) — that, and CPU, are the only
+signals that move.
+
+To confirm it is alive, look at the **process, not the files**: the data
+directory does *not* change during this phase (`blocks.log` stays 0 bytes), so
+`ls` there tells you nothing and looks like a dead node. Use
+`ps -o %cpu,rss -p <pid>` and watch RSS climb.
+
+A **debug** build turns this into hours (§2).
 
 **Phase 2 — replay from genesis.** Blocks arrive from the bootnodes and are
 applied one at a time, each one fully validated:
@@ -229,23 +299,31 @@ epochs**, then settles, minute to minute erratic (0–83), averaging
 **~35 slots/min** over a sustained window.
 
 The chain itself only advances 2 slots/min, so your node does still gain and
-will converge. But at 35 slots/min a full sync to a head near slot 52,600 is
+will converge. But at 35 slots/min a full sync to a head near slot 53,300 is
 about **26 hours** — a day, not an afternoon. Plan for it, and note that the
 figure grows as the chain does: every day you wait adds roughly another 40
 minutes of catch-up on top.
 
 If you are syncing to beat the weak-subjectivity deadline in §0, **26 hours of
-sync inside a 4-day window means starting now, not on 4 September.**
+sync inside a four-day window means starting now, not on 4 September.**
 
-> This deceleration is a **known open defect**, not a property of the chain:
-> each epoch boundary does work proportional to the whole ledger. A partial
-> fix (`fix(catch-up): share the eUTXO map so an epoch roll stops paying the
-> ledger`, `Arc<BTreeMap>` copy-on-write) is on `integ/ws-checkpoint-tooling`,
-> and the table above was measured **with** that fix applied — so it does not
-> remove the deceleration. A build without it reached the same epoch in about
-> twice the time in our run, but that comparison was contaminated by CPU
-> contention and should not be quoted as the fix's effect. Use a build that
-> has it; do not expect it to change the order of magnitude.
+> **Read this before you trust the 26 hours.** The deceleration is a **known
+> open defect**, not a property of the chain: each epoch boundary does work
+> proportional to the whole ledger.
+>
+> The table above was measured with a partial fix applied (`fix(catch-up):
+> share the eUTXO map so an epoch roll stops paying the ledger`,
+> `Arc<BTreeMap>` copy-on-write). **That fix is not on `main`**, which is the
+> branch §2 tells you to clone — it is still on the integration branch
+> `integ/ws-checkpoint-tooling` and has not been merged. So the build you
+> produce by following this document does **not** have it, and 26 hours is a
+> **floor, not an estimate**. In our run an unfixed build took roughly twice as
+> long to reach the same epoch, though that measurement was contaminated by CPU
+> contention and should not be quoted as the fix's effect.
+>
+> Budget accordingly: assume up to ~2× and treat §5's archival-seed path as the
+> default rather than the fallback if you are racing the 5 September deadline.
+> We would rather you over-provision the window than discover this at hour 30.
 
 ### The faster path: seed from an archival node — recommended
 
@@ -253,9 +331,19 @@ Given the numbers above, this is the path to use unless you have a specific
 reason to replay from genesis.
 
 If a full replay does not fit your window, copy `blocks.log`, `meta.bin` and
-`ws_latest.bin` (~202 MB) from a healthy node's data directory and let your
-node replay them locally instead of over the network — measured at
-**52 blocks/s**, about 4 minutes for 15,000 blocks.
+`ws_latest.bin` from a healthy node's data directory and let your node replay
+them locally instead of over the network — measured at **52 blocks/s**.
+
+Copy those three files **by name**. Measured on an archival node on
+2026-09-01: `blocks.log` was **453 MB** (`meta.bin` and `ws_latest.bin` are a
+few dozen bytes each), and it grows with the chain, so treat the figure as a
+floor and check before you provision. A data directory may also contain
+`.TRAVADO-*` files — operator-made snapshots of an earlier, stuck log. Do not
+copy those and do not glob the directory; take the three names above.
+
+At 52 blocks/s a local replay of the current chain (height ~32,450) is roughly
+**10 minutes**, against ~26 hours or more over the network. That is the whole
+reason this path is the recommended one.
 
 Copy from an **archival** node, never from a validator's data directory: a
 validator's directory contains `validator.key`, and copying a live validator
@@ -310,14 +398,25 @@ curl -s -X POST http://127.0.0.1:16400 -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"getchaininfo","params":[]}' | jq '.result.finalized'
 ```
 
-Compare that `{epoch, root}` against both bootnodes at the same finalized
-height. They must be byte-identical. A worked example from 2026-09-01, both
-bootnodes at finalized height 31462:
+Compare that `{epoch, root}` against both bootnodes **at the same finalized
+height**. They must be byte-identical to *each other*.
+
+**The root below is not a constant to match.** It advances every epoch — about
+every 16 minutes — so by the time you read this it will have moved many times.
+The test is agreement between the nodes you are comparing at one finalized
+height, never equality with a value printed in a document. A worked example
+measured 2026-09-01 06:58 UTC, both bootnodes at finalized height 32356
+(epoch 1666):
 
 ```
-139.180.166.5    finalized root bb9fe9828f9d70ed9bb5f488835755f44cb97d9ea655ef262b9e267b2b5a5670
-139.180.173.231  finalized root bb9fe9828f9d70ed9bb5f488835755f44cb97d9ea655ef262b9e267b2b5a5670
+139.180.166.5    finalized root 0ac677b83b9b566b761bbbfa639824ab3b35defe59eb2fbda65c40735235a4cd
+139.180.173.231  finalized root 0ac677b83b9b566b761bbbfa639824ab3b35defe59eb2fbda65c40735235a4cd
 ```
+
+If the two finalized heights differ, you have not learned anything yet — the
+roots are only comparable at equal height. Re-read both and compare again.
+`./deploy/bootnodes/verify-bootnodes.sh --deep` does exactly this comparison
+and fails loudly on a mismatch.
 
 Also check `behind_by_slots` in `getchaininfo`: 0–1 means you are at the head.
 
@@ -389,7 +488,7 @@ Stated here rather than left for you to discover:
 |---|---|
 | **Running a validator** | Closed at the node level. New deposits are refused at mempool admission because bonded stake is not funded from the eUTXO set, so a deposit would mint stake from nothing. The set is fixed at the 64 genesis validators. |
 | **`--transport libp2p`** | The fleet speaks `devnet`; see above. |
-| **A signed WS checkpoint** | No signer keys exist yet. Sync before 2026-09-05 07:07 UTC and you will not need one. |
+| **A signed WS checkpoint** | No signer keys exist yet. Sync before 2026-09-05 07:07:19 UTC and you will not need one. |
 | **Checkpoint-sync state download** | Not implemented. Every node replays and revalidates from its anchor. |
 | **`gettransaction` / transaction index** | No txid at this layer; deposit detection is UTXO polling. |
 | **HSM support for the PQ keys** | No HSM signs ML-DSA‖Falcon. Relevant to custody design. |
