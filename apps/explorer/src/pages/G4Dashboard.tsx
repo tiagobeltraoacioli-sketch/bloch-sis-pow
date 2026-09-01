@@ -148,8 +148,8 @@ export function G4Dashboard() {
 
         <p className="g4-note">
           Production and finality are separate questions. A block every slot says proposers are
-          healthy; a finalized epoch says two thirds of the bonded stake agreed and cannot take it
-          back. Two epochs of lag is the floor — finalizing epoch <em>n</em> requires epoch{" "}
+          healthy; a finalized epoch says two thirds of the leak-adjusted bonded stake agreed. It does
+          not say they cannot take it back — see finality. Two epochs of lag is the floor — finalizing epoch <em>n</em> requires epoch{" "}
           <em>n+1</em> to justify on top of it.
         </p>
 

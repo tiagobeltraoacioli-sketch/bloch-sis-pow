@@ -5,6 +5,7 @@ import { Route, match } from "./routes";
 import { G4Search } from "./components/g4search";
 import { g4rpc, G4_RPC } from "./lib/g4";
 import { G4Dashboard } from "./pages/G4Dashboard";
+import { FinalityPage } from "./pages/Finality";
 import { G4BlockPage } from "./pages/G4Block";
 import { BalancePage } from "./pages/Balance";
 import { ValidatorsPage } from "./pages/Validators";
@@ -35,6 +36,7 @@ const Logo = () => (
 // from being shadowed by patterns.
 const ROUTES: (Route & { nav?: string })[] = [
   { pattern: "/", nav: "Chain", render: () => <G4Dashboard /> },
+  { pattern: "/finality", nav: "Finality", render: () => <FinalityPage /> },
   { pattern: "/balance", nav: "Balance", render: () => <BalancePage /> },
   {
     pattern: "/balance/:h",
