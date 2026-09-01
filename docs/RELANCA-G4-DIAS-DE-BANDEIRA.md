@@ -66,6 +66,22 @@ sed "s/__E_STAR__/$E/g" docs/RELANCA-G4-DIAS-DE-BANDEIRA.activation.patch | git 
 cargo test -p bloch-pos-committee --lib   # o tripwire armado agora pina $E
 ```
 
+> **Este patch APODRECE, e o apodrecimento é silencioso.** Ele casa por
+> contexto dentro de `transition.rs` — um arquivo que hoje está sendo editado
+> por mais de uma esteira ao mesmo tempo. Verificado limpo
+> (`git apply --check`, RC=0) em **2026-08-31, sobre `a8df1a45`**, com o
+> `__E_STAR__` substituído por um valor de teste. Isso NÃO é uma garantia
+> para o dia do tag: **re-rode o `--check` antes de confiar nele**, e se
+> falhar, re-derive o diff a partir das três coisas que ele troca (as duas
+> constantes e o tripwire) em vez de forçar o apply. Um patch que não aplica
+> é melhor que um que aplica torto; o pior dos três é descobrir isso no dia.
+
+```sh
+# antes de confiar no patch, sempre:
+sed "s/__E_STAR__/9999/g" docs/RELANCA-G4-DIAS-DE-BANDEIRA.activation.patch \
+  | git apply --check && echo "aplica limpo" || echo "APODRECEU — re-derive"
+```
+
 ---
 
 ## 1. O que cada portão muda no COMPORTAMENTO do nó
