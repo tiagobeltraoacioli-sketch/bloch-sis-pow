@@ -1740,17 +1740,21 @@ impl Engine {
             .iter()
             .position(|(_, cid)| cid.as_bytes() == &id)
             .expect("replay target is canonical");
-        let prefix: Vec<BlockEnvelope> = self.chain[1..=cut]
-            .iter()
-            .map(|(_, cid)| {
-                self.blocks
-                    .get(cid.as_bytes())
-                    .expect("canonical block stored")
-                    .clone()
-            })
-            .collect();
+        // Borrowed, not collected. This used to build a `Vec<BlockEnvelope>`
+        // of the entire canonical prefix — a second full copy of the chain,
+        // ~440 MiB at the live height and chain-linear — purely to iterate it
+        // once, in order, and drop it. The same envelopes are read in the same
+        // order from the map that already owns them. The missing-block panic
+        // fires on exactly the same condition; it now fires PART WAY through
+        // the walk rather than before it starts, which is not observable —
+        // this function takes `&self`, folds into a local, and a panic aborts
+        // the process either way.
         let mut st = self.manifest.genesis_state();
-        for env in &prefix {
+        for (_, cid) in &self.chain[1..=cut] {
+            let env = self
+                .blocks
+                .get(cid.as_bytes())
+                .expect("canonical block stored");
             let envelope = ProposalEnvelope {
                 header: env.header.clone(),
                 proposer_sig: env.proposer_sig.clone(),
@@ -1851,11 +1855,20 @@ impl Engine {
         let cur_e = epoch_of(self.state.slot());
         self.pool.retain(|_, a| epoch_of(a.data.slot) >= cur_e);
         if self.live {
-            let canonical_envs: Vec<BlockEnvelope> = self.chain[1..]
+            // Borrowed, not collected — see `Store::rewrite`. Building this as
+            // a `Vec<BlockEnvelope>` cloned the whole canonical chain (~440
+            // MiB at the live height, ~2.9 GiB at 200k blocks) to write bytes
+            // the map already holds, so a reorg transiently needed TWICE the
+            // node's largest allocation. The frames written are identical.
+            //
+            // The fields are destructured so the borrow checker can see that
+            // the mutable borrow (`store`) and the shared ones (`chain`,
+            // `blocks`) are disjoint.
+            let Engine { store, chain, blocks, .. } = self;
+            let canonical_envs = chain[1..]
                 .iter()
-                .map(|(_, id)| self.blocks.get(id.as_bytes()).expect("stored").clone())
-                .collect();
-            if let Err(e) = self.store.rewrite(&canonical_envs) {
+                .map(|(_, id)| blocks.get(id.as_bytes()).expect("stored"));
+            if let Err(e) = store.rewrite(canonical_envs) {
                 eprintln!("FATAL: block log rewrite failed: {e}");
                 std::process::exit(1);
             }
@@ -2388,6 +2401,15 @@ pub fn run(cfg: Config) -> io::Result<()> {
 
     let store = Store::open(&cfg.data_dir, &digest)?;
     let genesis_state = manifest.genesis_state();
+    // Computed ONCE, here, and carried. The weak-subjectivity genesis anchor
+    // at the end of boot needs this exact value, and `genesis_state` is moved
+    // into the engine long before that point — so the anchor used to rebuild
+    // the entire genesis state (452,726 carryover outputs) and recompute this
+    // root from scratch, at the single instant boot is at its peak: the whole
+    // chain already resident in `blocks`, the live state and its epoch memo
+    // full. `state_root` is a pure function of the state and `manifest` has
+    // not moved, so the rebuilt value was bit-for-bit this one.
+    let genesis_state_root = genesis_state.state_root();
     let genesis_id = manifest.genesis_id();
     println!(
         "bloch-pos node — {}, genesis {} (state root {}), network digest {}",
@@ -2396,11 +2418,18 @@ pub fn run(cfg: Config) -> io::Result<()> {
             None => "observer (no keystore, signs nothing)".to_string(),
         },
         crate::codec::hex8(genesis_id.as_bytes()),
-        crate::codec::hex8(&genesis_state.state_root()),
+        crate::codec::hex8(&genesis_state_root),
         crate::codec::hex8(&digest),
     );
 
-    let logged = store.read_all()?;
+    // The chain is COUNTED here and STREAMED below — it is deliberately not
+    // read into a `Vec`. `Store::read_all` holds the whole log file and the
+    // whole decoded chain in memory at the same instant (~850 MiB at the live
+    // height, chain-linear), and boot has no use for either: it moves
+    // envelopes into `Engine::blocks` one at a time, in log order, and never
+    // looks back. The count is a seek-only frame walk so the operator still
+    // gets the progress denominator the loop below argues for.
+    let n_logged = Store::count(&cfg.data_dir)?;
     let head_slot = Arc::new(AtomicU64::new(0));
     // Network events queued but not yet handled. The transport reads it to
     // decide when to shed rather than queue — see `net::send_to_engine`. It is
@@ -2509,7 +2538,6 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // no way to tell whether it was progressing, stuck, or minutes from
     // finishing. An operator needs a rate and a remainder to decide whether to
     // wait or intervene, and neither existed.
-    let n_logged = logged.len();
     if n_logged > 0 {
         println!(
             "replaying {n_logged} blocks from the log — the RPC stays silent until this finishes"
@@ -2517,7 +2545,11 @@ pub fn run(cfg: Config) -> io::Result<()> {
     }
     let replay_started = std::time::Instant::now();
     let mut last_report = replay_started;
-    for (i, env) in logged.into_iter().enumerate() {
+    for (i, env) in crate::store::LogReader::open(&cfg.data_dir)?.enumerate() {
+        // A frame that will not decode is fatal for the same reason it was
+        // when `read_all` returned `Err`: replaying a chain with a hole in it
+        // would diverge from what the network saw.
+        let env = env?;
         engine.ingest(env);
         // Time-based, not every-N-blocks: block cost varies by an order of
         // magnitude with how many transactions a block carries, so a fixed
@@ -2586,7 +2618,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         let g_anchor = bloch_pos_committee::ws::genesis_anchor(
             network_id,
             genesis_root,
-            engine.manifest.genesis_state().state_root(),
+            genesis_state_root,
             [0u8; 32], // no validator-set SMT root exposed at this milestone
             genesis_ms / 1000,
         );
