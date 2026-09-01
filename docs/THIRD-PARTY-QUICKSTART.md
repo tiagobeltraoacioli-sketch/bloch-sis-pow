@@ -54,9 +54,12 @@ subtract `wall_slot × 30 s` from your clock. Slots are 30 s, so an independent
 derivation lands within about half a minute of the figure above — treat the
 deadline as "07:07 UTC, give or take a slot", not as a value to cut fine.
 
-**A full cold sync takes about 26 hours (§5), so the last safe moment to
-start is roughly 2026-09-04 05:00 UTC — and that leaves no margin for a
-restart.** Starting "on the 4th" is not starting in time; start now.
+**A full cold sync completed in 21 minutes on an idle 2-vCPU box (§5), so the
+sync itself is not what puts the deadline at risk — but it is one measurement
+on one machine, and the deadline is hard.** Leave yourself a day, not an hour:
+if your first attempt misconfigures something you want room for a second.
+An earlier edition of this document said 26 hours here. That figure was
+extrapolated from a run that was stopped after 13 minutes; see §5.
 
 You can watch the gate count down in your own node's boot log:
 
@@ -108,9 +111,11 @@ yourself; nothing in the node will do it for you.
 
 ## 1. What you need
 
-- **Linux x86-64**, 4+ vCPU, 8 GB RAM, 80 GB SSD. Replay is single-threaded
+- **Linux x86-64**, 2+ vCPU, 8 GB RAM, 80 GB SSD. Replay is single-threaded
   and pins one core; extra cores let you run several nodes, they do not make
-  one node faster.
+  one node faster. Everything measured in this document was run on **2 vCPU /
+  7.9 GB** boxes, including a full cold sync from genesis, which peaked at
+  **934 MB** resident. 8 GB is comfortable; we have not tested below it.
 - **The node binary**, built from source (§2).
 - **`mainnet.manifest`** (~247 KB) — the genesis manifest.
 - **`carryover.tsv`** (~55 MB, 452,726 outputs) — the opening ledger carried
@@ -136,22 +141,71 @@ consensus build can serve reads that disagree with the network.
 ```bash
 git clone https://gitlab.com/blochsispow-group/bloch-pos.git
 cd bloch-pos
-cargo build --release -p bloch-pos-node
+git checkout g4-node-20260901            # the release tag — NOT `main`, see below
+cargo build --locked --release -p bloch-pos-node
 ./target/release/bloch-pos --version    # must NOT say "+dirty"
 ./target/release/bloch-pos selfcheck    # verifies the frozen consensus params
 ```
+
+> ### Build the release tag, not `main`
+>
+> **`main` is not a descendant of the commit the live fleet runs.** The two
+> branches diverged on 2026-08-24, and `main` is missing six commits that the
+> fleet has been running since — including `47f7644b`, four consensus
+> corrections. A binary built from `main` therefore differs from the network
+> in consensus-relevant code. Check it yourself:
+>
+> ```bash
+> git merge-base --is-ancestor 46133196 HEAD && echo "descends from the fleet" \
+>                                            || echo "DOES NOT — do not run this"
+> ```
+>
+> `46133196` is the commit the fleet runs; the release tag descends from it and
+> `main` does not. This check is the one that matters and it is cheap: run it on
+> whatever you are about to build.
 
 > **Use a release build.** A debug build is not merely slower — it makes the
 > initial state construction take hours instead of minutes, because the
 > Keccak permutation is unoptimised.
 
-**Budget time for the build itself.** The release profile is `lto = true` with
-`codegen-units = 1`, which is deliberate — it also carries `overflow-checks`,
-mandatory for a consensus build — and it makes the final link slow and
-single-threaded. Measured ~40 minutes on an 8-core M-series Mac that had other
-compiles competing for CPU. Do not "optimise" this by dropping LTO or building
-in debug: both change the binary you validate with. Start the build before you
-need it.
+**The build is quick; earlier editions of this guide said otherwise.** The
+release profile is `lto = true` with `codegen-units = 1`, which is deliberate —
+it also carries `overflow-checks`, mandatory for a consensus build. This
+document previously said "~40 minutes"; that was measured on a laptop with
+other compiles competing for the CPU and is not what you should expect.
+
+Measured 2026-09-01 on an idle 2-vCPU / 7.9 GB Linux x86-64 box, from a clean
+clone, `cargo build --locked --release -p bloch-pos-node`:
+
+| Box | Wall clock |
+|---|---|
+| A | **2 min 59 s** |
+| B | **3 min 28 s** |
+
+Two vCPUs, not eight. Do not "optimise" this by dropping LTO or building in
+debug: both change the binary you validate with.
+
+### Check what you built against what we published
+
+Both boxes above produced a **byte-identical** binary, so you can compare
+digests rather than trust ours:
+
+```
+7935aed25817fbaacbac27e21eb77a4c7871484a49cdd7fb19d294e2d683944e  bloch-pos   (7,347,832 bytes)
+```
+
+That digest is for a **`git clone` + `git checkout` of the tag**, built with
+the pinned toolchain **Rust 1.94.0** (the version `Dockerfile` pins) on
+`x86_64-unknown-linux-gnu`. Two caveats that will otherwise waste your
+afternoon:
+
+- **The commit hash is compiled into the binary.** `--version` on the above
+  prints `0.1.0-mainnet (65608807b55e+nogit)`. Building the same source from a
+  tarball or an export instead of a git checkout yields a *different* digest,
+  because the embedded identifier changes. Compare digests only against a build
+  made the same way.
+- A different Rust version will produce a different digest. That is not a
+  tampering signal on its own; it means you have not reproduced our build.
 
 ## 3. Get the genesis files
 
@@ -283,47 +337,72 @@ applied one at a time, each one fully validated:
 [slot 1] applied 1f65a776 by v46 — head root 17f80dfd, justified e0, finalized e0
 ```
 
-**This is the slow part, and it decelerates.** Measured 2026-09-01, release
-build, idle machine, syncing from the two published bootnodes:
+**This is the slow part, and it decelerates within a run** — but it finishes,
+and the previous edition of this document was badly wrong about how long it
+takes. That edition printed a table of the first twelve minutes, extrapolated
+`~35 slots/min` out to the head, and published **"about 26 hours"**. The run
+behind that table **was stopped at 13 minutes and never reached the head**. The
+extrapolation was never checked against a completed sync.
 
-| Elapsed | Slot | Epoch | Rate |
-|---|---|---|---|
-| 3 min | 528 | 12 | 408 slots/min |
-| 5 min | 620 | 12 | 37 slots/min |
-| 7 min | 664 | 18 | 22 slots/min |
-| 9 min | 734 | 20 | 37 slots/min |
-| 12 min | 846 | 24 | 83 slots/min |
+**Measured to completion, 2026-09-01.** Release build of the tag in §2, an idle
+2-vCPU / 7.9 GB Linux box, from genesis, over the network, from the two
+published bootnodes, with nothing else on the machine:
 
-The rate falls by **more than an order of magnitude within the first 20
-epochs**, then settles, minute to minute erratic (0–83), averaging
-**~35 slots/min** over a sustained window.
+| | |
+|---|---|
+| Time from launch to `behind_by_slots = 0` | **21.2 minutes** (1,273 s) |
+| Height reached | 33,602 |
+| Peak resident memory | **934 MB** |
 
-The chain itself only advances 2 slots/min, so your node does still gain and
-will converge. But at 35 slots/min a full sync to a head near slot 53,300 is
-about **26 hours** — a day, not an afternoon. Plan for it, and note that the
-figure grows as the chain does: every day you wait adds roughly another 40
-minutes of catch-up on top.
+That is the whole sync: state construction, then every block from genesis
+applied and validated. Not 26 hours.
 
-If you are syncing to beat the weak-subjectivity deadline in §0, **26 hours of
-sync inside a four-day window means starting now, not on 4 September.**
+**Treat this as one run on one machine, because that is what it is.** It is a
+single measurement on a 2-vCPU box with no other load, taken at a chain height
+of ~33,600. It is not a guarantee and it is not an average. What you should
+take from it is the order of magnitude — tens of minutes, not tens of hours —
+and the method: we ran it to completion and read the finishing time off the
+clock, rather than extrapolating from the first few minutes.
 
-> **Read this before you trust the 26 hours.** The deceleration is a **known
-> open defect**, not a property of the chain: each epoch boundary does work
-> proportional to the whole ledger.
+Two things that will make your run slower than ours: a busy machine (the
+initial state construction pins one core and does not share it), and a taller
+chain than 33,600 by the time you start.
+
+> **Why the old figure was so far out.** The rate genuinely does decay inside a
+> run — fork choice does work proportional to the depth it walks — so a rate
+> sampled in the first minutes is far higher than the lifetime average, and a
+> deadline extrapolated from it is far *longer* than the truth only if you
+> extrapolate the *low* late-run rate over the whole chain, which is what
+> happened. The node's own progress line reports a **cumulative average** and a
+> "time left" derived from it; both move throughout the run. Do not read either
+> as a prediction. We did, and published 26 hours.
+
+> **Memory: what this release fixes, and what it does not.** Until this
+> release, an epoch roll deep-copied the whole eUTXO ledger (452,726 entries),
+> so a node catching up across a large gap paid that copy repeatedly. The
+> ledger now sits behind an `Arc` with copy-on-write, and an epoch roll copies
+> it zero times.
 >
-> The table above was measured with a partial fix applied (`fix(catch-up):
-> share the eUTXO map so an epoch roll stops paying the ledger`,
-> `Arc<BTreeMap>` copy-on-write). **That fix is not on `main`**, which is the
-> branch §2 tells you to clone — it is still on the integration branch
-> `integ/ws-checkpoint-tooling` and has not been merged. So the build you
-> produce by following this document does **not** have it, and 26 hours is a
-> **floor, not an estimate**. In our run an unfixed build took roughly twice as
-> long to reach the same epoch, though that measurement was contaminated by CPU
-> contention and should not be quoted as the fix's effect.
+> Measured side by side on 2026-09-01 — two identical idle 2-vCPU / 7.9 GB
+> boxes, cold sync from genesis over the network, launched within a second of
+> each other and both run to `behind_by_slots = 0`:
 >
-> Budget accordingly: assume up to ~2× and treat §5's archival-seed path as the
-> default rather than the fallback if you are racing the 5 September deadline.
-> We would rather you over-provision the window than discover this at hour 30.
+> | Build | Time to caught up | Peak RSS | Outcome |
+> |---|---|---|---|
+> | This release (with the fix) | **21.2 min** | **934 MB** | completed, h=33,602 |
+> | `main` (without the fix) | **30.3 min** | **1,014 MB** | completed, h=33,620 |
+>
+> So the fix is worth about **1.4× on cold-sync wall clock** and ~8% on peak
+> memory, on this shape of run.
+>
+> **Both fitted in 8 GB and neither was killed.** If you have read that an
+> unfixed node gets OOM-killed on a cold sync over the network, that is not
+> what we measured and we will not repeat it. The pathological case in the
+> fix's own commit message — a ~93 GB transient — is a *single* re-roll across
+> a ~1,550-epoch gap evaluated in one step, which is not the shape of an
+> incremental network sync where the gap closes block by block. The fix is
+> real, it is worth having, and it is why this release exists; the memory
+> catastrophe is not the thing you would have hit here.
 
 ### The faster path: seed from an archival node — recommended
 
@@ -415,8 +494,29 @@ measured 2026-09-01 06:58 UTC, both bootnodes at finalized height 32356
 
 If the two finalized heights differ, you have not learned anything yet — the
 roots are only comparable at equal height. Re-read both and compare again.
-`./deploy/bootnodes/verify-bootnodes.sh --deep` does exactly this comparison
-and fails loudly on a mismatch.
+
+> **You cannot run this comparison against our bootnodes, and the guide used to
+> tell you to.** The published bootnodes bind their RPC to loopback — which §0
+> tells you to do too, and which is correct — so `getchaininfo` on
+> `139.180.166.5:16400` from your machine gets no answer. The worked example
+> above was collected *on* those hosts. Verified 2026-09-01: from a third-party
+> box, neither bootnode answers RPC.
+>
+> `./deploy/bootnodes/verify-bootnodes.sh --deep` is therefore an **operator**
+> tool, not a third-party one: it also tries to `ssh` into each host to confirm
+> it is keyless, which you cannot do either. Run it without `--deep` — that
+> checks reachability and exits 0 — and expect `--deep` to report
+> `FAIL … keyless: unknown (ssh failed)` for reasons that say nothing about the
+> chain. (Until this release `--deep` additionally died with a bash error,
+> `line 125: [: 0\n0: integer expression expected`, and skipped the fork check
+> in silence. Both are fixed here; the skip is now stated out loud.)
+>
+> **What to do instead.** The comparison is sound; only the counterparties are
+> wrong. Run **two nodes of your own**, ideally seeded differently — one cold
+> from genesis, one from an archival copy — and compare *their* finalized roots
+> at equal finalized height. Two nodes you control that agree is a stronger
+> statement than one node agreeing with ours, because it is not a claim you are
+> taking on our word.
 
 Also check `behind_by_slots` in `getchaininfo`: 0–1 means you are at the head.
 
