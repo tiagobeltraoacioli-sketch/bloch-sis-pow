@@ -643,6 +643,8 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         blocks: BTreeMap::new(),
         chain: vec![(0, genesis_id)],
         canonical: BTreeSet::from([*genesis_id.as_bytes()]),
+        finalized_floor: None,
+        latch_violations: 0,
         // Both of these mirror `boot`'s literal exactly, and they have to:
         // this harness measures the engine boot replay actually runs. An
         // empty ring means the first reorg it meets takes the `replay_to`

@@ -470,6 +470,13 @@ fn book_activation_gates_are_classified_not_assumed() {
          must not describe self-healing finality as current behaviour"
     );
     assert_eq!(
+        bloch_pos_committee::params::FINALITY_LATCH_ACTIVATION_EPOCH,
+        u64::MAX,
+        "the finality latch is INERT; the book must not tell an integrator that \
+         a node refuses to abandon its own finalized checkpoint, because on this \
+         binary it still does — it only says so in the log"
+    );
+    assert_eq!(
         bloch_pos_committee::params::ANCESTRY_SEED_ACTIVATION_EPOCH,
         u64::MAX,
         "INERT, and additionally unreferenced: the seed look-ahead was made \
@@ -498,7 +505,7 @@ fn book_validator_entry_has_no_scheduled_flag_day_on_this_branch() {
     // Guard by construction: if someone adds a funded-bonding activation
     // constant to `params`, this list is what they must come and update, and
     // the book section is named right here.
-    let known_gates: [(&str, u64); 4] = [
+    let known_gates: [(&str, u64); 5] = [
         ("BLOCK_BYTES_V2_ACTIVATION_EPOCH", BLOCK_BYTES_V2_ACTIVATION_EPOCH),
         (
             "TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH",
@@ -509,10 +516,14 @@ fn book_validator_entry_has_no_scheduled_flag_day_on_this_branch() {
             "LEAK_RECOVERY_ACTIVATION_EPOCH",
             bloch_pos_committee::params::LEAK_RECOVERY_ACTIVATION_EPOCH,
         ),
+        (
+            "FINALITY_LATCH_ACTIVATION_EPOCH",
+            bloch_pos_committee::params::FINALITY_LATCH_ACTIVATION_EPOCH,
+        ),
     ];
     assert_eq!(
         known_gates.len(),
-        4,
+        5,
         "the Integration Book §8 and §11 enumerate exactly these gates; a new \
          one means the book is now incomplete"
     );

@@ -596,6 +596,49 @@ pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// `u64::MAX` means INERT. Same arming rules as above.
 pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+/// Flag day at which a node **refuses** to adopt a head that is not a
+/// descendant of its own finalized checkpoint — the finality latch.
+///
+/// # What is broken without it
+///
+/// The finalized checkpoint is monotone *inside* [`crate::finality::FinalityState`]
+/// (`process_epoch` replaces it only with a strictly higher one), but the NODE
+/// does not own one `FinalityState` across a reorg. `Engine::do_reorg` takes an
+/// ancestor's committed state, folds the winning branch onto it, and adopts the
+/// result unconditionally; the incoming finalized checkpoint is never compared
+/// with the outgoing one. Fork choice compounds it: the LMD-GHOST walk starts at
+/// the **justified** root (`forkchoice::Store::head`), so the deepest cut fork
+/// choice can propose already sits below the finalized checkpoint — and once a
+/// rewind lands, the *next* walk starts from the lower justified root the
+/// rewound state carries, so each rewind enables a deeper one. That descending
+/// ratchet is the mechanism behind nodes observed below their own finalized
+/// point.
+///
+/// `TransitionError::FinalityRegression` does not cover this. It checks that a
+/// header carries its own parent's committed roots — a local consistency rule.
+/// Every block on the rewinding branch satisfies it, because an older finalized
+/// root is exactly what that branch's parents commit.
+///
+/// # Why this is not a block-validity change
+///
+/// The latch changes only which head this node ADOPTS. It does not change
+/// `apply_block`, any state root, or whether any block is valid — a refused
+/// block stays stored and stays valid, and a node that refuses computes no root
+/// that differs from one that does not. Two binaries handed the same blocks
+/// therefore agree except in the one case where the old one would have
+/// abandoned its own finalized checkpoint, which is already a safety violation
+/// rather than a rule the chain relies on.
+///
+/// That argument is why the gate exists anyway. Head selection decides what
+/// this node ATTESTS to and what it builds on, so an armed minority and an
+/// unarmed majority can vote differently during a live rewind, and that is a
+/// fork by another name. `u64::MAX` means INERT: below the flag day the engine
+/// DETECTS and logs `FINALITY_LATCH_VIOLATION` and adopts anyway, exactly as
+/// today. Arm it only after the fleet is rebuilt, on the
+/// [`LEAKED_ROSTER_ACTIVATION_EPOCH`] procedure, and only once the detector has
+/// run long enough to say how often it would have fired.
+pub const FINALITY_LATCH_ACTIVATION_EPOCH: u64 = u64::MAX;
+
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.
 pub const DS_SORTITION: [u8; 16] = *b"BLCH4:SORTIT\0\0\0\0";

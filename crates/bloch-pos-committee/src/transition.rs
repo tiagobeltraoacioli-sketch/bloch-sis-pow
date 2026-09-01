@@ -6927,6 +6927,15 @@ mod tests {
         for (name, value) in [
             ("ANCESTRY_SEED_ACTIVATION_EPOCH", crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH),
             ("LEAK_RECOVERY_ACTIVATION_EPOCH", crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH),
+            // Not a replay-compatibility gate in the same sense — the finality
+            // latch changes no state root and no block's validity, only which
+            // head a node adopts — but it is a consensus flag day and it earns
+            // the same tripwire: an armed minority and an unarmed majority vote
+            // differently during a live rewind.
+            (
+                "FINALITY_LATCH_ACTIVATION_EPOCH",
+                crate::params::FINALITY_LATCH_ACTIVATION_EPOCH,
+            ),
         ] {
             assert_eq!(
                 value,

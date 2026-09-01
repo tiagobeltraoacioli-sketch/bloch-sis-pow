@@ -507,14 +507,28 @@ that passes 1,000 outputs cannot be fully enumerated. Keep each address under
 |---|---|---|
 | Accepted | `sendrawtransaction` → `accepted:true` | in this node's mempool |
 | Included | output visible via `gettxout` / `getutxos` | in a block |
-| **Final** | `getchaininfo.finalized.epoch` ≥ that block's epoch | **credit** |
+| Finalised | `getchaininfo.finalized.epoch` ≥ that block's epoch | **not yet — see §5.3–5.5** |
+| **Settled, operationally** | the above **+ 3 epochs**, agreed by **two independent nodes** on the same root, re-verified immediately before release | **credit** |
 
 Finality is explicit and published in every `getchaininfo` response — you do
 not estimate it from a confirmation count, and there is no `confirmations`
 field to misread.
 
-**Credit on `finalized`.** Included is not settled: a block that is canonical
-now can be reorganised, and only finalisation is the cryptographic guarantee.
+**`finalized` is a strong signal, not a settlement guarantee — not on this
+binary.** An earlier revision of this table said "credit on `finalized`" and
+called finalisation the cryptographic guarantee. That was true of the design and
+is not true of the released node, and it contradicted §5.3 and §5.4 of this same
+document thirty lines below it. Two independent defects stand between
+`finalized` and settlement:
+
+- the finalized checkpoint is not a network-unique value (§5.3) — mitigated by
+  reading two nodes;
+- the finalized checkpoint is not a latch and can move backwards (§5.4) — **not**
+  mitigated by reading two nodes.
+
+Credit on the last row of the table, not the one above it, and read §5.5 before
+you build against either. The reasoning behind the three-epoch margin, and what
+it does and does not cover, is in `BLOCH-G4-SETTLEMENT-NOTE.md`.
 
 ### 5.2 How long finality actually takes
 

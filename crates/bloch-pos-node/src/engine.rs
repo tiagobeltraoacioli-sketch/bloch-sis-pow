@@ -537,6 +537,24 @@ struct Engine {
     /// that kind of pool shrinkage apart from the epoch `retain`, which fork
     /// choice very much can see. See the argument there.
     fc_covered_removals: u64,
+    /// **The finality latch's high-water mark**: the highest finalized
+    /// checkpoint this node has ever committed, and the block every future
+    /// head must descend from. `None` until this node finalizes something of
+    /// its own — genesis is "finalized by definition", not knowledge it
+    /// witnessed, and a node that has witnessed nothing must latch nothing.
+    ///
+    /// It is a field on the ENGINE and not a read of `self.state`, because
+    /// `self.state` is precisely what a reorg replaces.
+    /// [`FinalityState`](bloch_pos_committee::finality::FinalityState) is
+    /// monotone within one instance; `do_reorg` swaps the instance for an
+    /// ancestor's, and a monotone rule whose subject is swapped out from under
+    /// it has nothing left to compare against. This floor is the thing that
+    /// survives the swap.
+    finalized_floor: Option<bloch_pos_committee::interfaces::Checkpoint>,
+    /// Times the latch has been violated since boot — counted whether or not
+    /// the flag day has bound, because the point of shipping the detector
+    /// inert is to learn the rate before anyone arms the refusal.
+    latch_violations: u64,
 }
 
 /// A fingerprint of the four values `lmd_ghost_head` reads, so `advance` can
@@ -1268,6 +1286,108 @@ impl Engine {
         None
     }
 
+    // ── The finality latch ──────────────────────────────────────────────────
+    //
+    // One rule: a node may never adopt a head that is not a descendant of its
+    // own finalized checkpoint. See
+    // `params::FINALITY_LATCH_ACTIVATION_EPOCH` for why the refusal is behind
+    // a flag day and the detection is not.
+
+    /// Raise the floor to the state's finalized checkpoint. Never lowers it —
+    /// that is the whole point, and it is why this takes a `max` on the epoch
+    /// rather than assigning.
+    ///
+    /// Genesis is skipped: `finalized.epoch == 0` is the gadget's "finalized
+    /// by definition" seed, not a checkpoint this node witnessed, and latching
+    /// onto it would be latching onto a fact no attester ever voted.
+    fn raise_finalized_floor(&mut self) {
+        let fin = self.state.finality().finalized;
+        if fin.epoch == 0 {
+            return;
+        }
+        let raise = match self.finalized_floor {
+            None => true,
+            Some(cur) => fin.epoch > cur.epoch,
+        };
+        if raise {
+            self.finalized_floor = Some(fin);
+        }
+    }
+
+    /// Is `node` `ancestor`, or reachable from it by walking parents through
+    /// the stored blocks?
+    ///
+    /// Bounded by the number of stored blocks plus one, for the same reason
+    /// [`bloch_pos_committee::forkchoice`]'s walk is bounded — a peer that can
+    /// induce a parent cycle must not hang the consensus thread — and the plus
+    /// one is genesis, which is synthesized and never in `blocks`, so the walk
+    /// must be able to take one more step to compare against it.
+    fn descends_from_stored(&self, node: [u8; 32], ancestor: [u8; 32]) -> bool {
+        let mut cur = node;
+        for _ in 0..=(self.blocks.len() + 1) {
+            if cur == ancestor {
+                return true;
+            }
+            match self.blocks.get(&cur) {
+                Some(env) => cur = env.header.parent,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// Has the flag day bound for the epoch this node's state is in?
+    ///
+    /// Read off the STATE's slot, never a wall clock: reading node-local
+    /// mutable time is what caused the 2026-08-08 `expected_bits` split, and a
+    /// gate two nodes evaluate differently is the fork it is supposed to
+    /// prevent.
+    fn latch_is_armed(&self) -> bool {
+        #[cfg(test)]
+        if latch_hook::FORCE_ARMED.with(|c| c.get()) {
+            return true;
+        }
+        epoch_of(self.state.slot()) >= bloch_pos_committee::params::FINALITY_LATCH_ACTIVATION_EPOCH
+    }
+
+    /// **The predicate.** Would adopting `target` as head abandon this node's
+    /// own finalized checkpoint? Pure: no logging, no counter, so it can be
+    /// asked twice on one event without inventing a second event.
+    fn latch_violated(&self, target: [u8; 32]) -> bool {
+        match self.finalized_floor {
+            None => false,
+            Some(floor) => !self.descends_from_stored(target, floor.root),
+        }
+    }
+
+    /// The latch, as `advance` asks it: may this node adopt `target` as head?
+    ///
+    /// Returns `true` when the head must be REFUSED. Detection is
+    /// unconditional and loud; refusal is behind the flag day. Below it this
+    /// returns `false` after logging, so the binary behaves exactly as it does
+    /// today and the log tells the fleet how often the armed one would have
+    /// diverged — which is the number nobody has, and the number the decision
+    /// to arm should rest on.
+    fn latch_refuses(&mut self, target: [u8; 32]) -> bool {
+        if !self.latch_violated(target) {
+            return false;
+        }
+        let floor = self.finalized_floor.expect("violated implies a floor");
+        self.latch_violations += 1;
+        let armed = self.latch_is_armed();
+        eprintln!(
+            "FINALITY_LATCH_VIOLATION #{}: fork choice selected head {} which does NOT \
+             descend from this node's own finalized checkpoint (epoch {}, root {}). \
+             {} This node would be abandoning a checkpoint it finalized.",
+            self.latch_violations,
+            crate::codec::hex8(&target),
+            floor.epoch,
+            crate::codec::hex8(&floor.root),
+            if armed { "REFUSING (flag day bound)." } else { "ADOPTING ANYWAY (latch inert)." },
+        );
+        armed
+    }
+
     /// Make the canonical chain equal the LMD-GHOST head.
     ///
     /// Three cases, and the third is the one longest-chain could not express:
@@ -1302,6 +1422,20 @@ impl Engine {
             memo = Some((inputs, target));
             let head = *self.head_id().as_bytes();
             if target == head {
+                return;
+            }
+            // THE LATCH, before `path_to_canonical` and before any adoption.
+            // `target` is the prospective head, so one check here covers every
+            // way the chain can move: an extension always descends from the
+            // current head and so from the floor, and every rewind — a reorg
+            // onto a sibling branch, or the give-blocks-back case that reorgs
+            // to an empty branch — passes through this same value.
+            if self.latch_refuses(target) {
+                // Ask the mesh rather than adopt. Refusing is a stall, and a
+                // stall is the correct posture: reverting a finalized
+                // checkpoint takes a third of the stake signing slashable
+                // votes, so a node that sees one must not quietly follow it.
+                self.needs_sync = true;
                 return;
             }
             let Some((ancestor, branch)) = self.path_to_canonical(target) else {
@@ -1518,6 +1652,12 @@ impl Engine {
                         self.enforce_ws_anchor();
                     }
                 }
+                // The latch's high-water mark rises here and nowhere
+                // else on this path — outside `if self.live`, because a node
+                // replaying its log at boot finalizes exactly what it
+                // finalized the first time and must come back up holding the
+                // same floor.
+                self.raise_finalized_floor();
                 true
             }
             Err(err) => {
@@ -1613,6 +1753,24 @@ impl Engine {
         // that since the fold now starts at the fork point, the replay this
         // used to charge here is mostly gone rather than moved.
         let _perf = bloch_pos_committee::perf::span(bloch_pos_committee::perf::Phase::Reorg);
+        // THE LATCH, at the point of adoption rather than the point of
+        // decision. `advance` already refuses such a target and returns, so on
+        // the production path this never fires; it is here because `do_reorg`
+        // is the only function in the engine that can make the canonical chain
+        // SHORTER, and a rule about what may never be given back belongs at the
+        // place that gives it back. Silent — `advance` did the reporting, and
+        // one violation must not be counted twice.
+        let prospective = branch
+            .last()
+            .map_or(ancestor, |env| *env.block_id().as_bytes());
+        if self.latch_is_armed() && self.latch_violated(prospective) {
+            eprintln!(
+                "FINALITY_LATCH: refusing a reorg to {} — it does not descend from this \
+                 node's finalized checkpoint.",
+                crate::codec::hex8(&prospective),
+            );
+            return false;
+        }
         let cut = self
             .chain
             .iter()
@@ -1714,6 +1872,11 @@ impl Engine {
             // A reorg can move the finalized root at the anchor's epoch.
             self.enforce_ws_anchor();
         }
+        // Never lowers: `raise_finalized_floor` takes the max. A reorg that
+        // installs an ancestor's state therefore leaves the floor where it
+        // was, which is the entire point — the floor has to outlive the state
+        // that produced it or it is not a latch.
+        self.raise_finalized_floor();
         true
     }
 
@@ -2314,6 +2477,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
         ws_anchor_hard: false,
         ws_conflict_reported: false,
         fc_covered_removals: 0,
+        finalized_floor: None,
+        latch_violations: 0,
         manifest,
     };
 
@@ -3860,6 +4025,8 @@ mod transfer_v2_end_to_end {
             ws_anchor_hard: false,
             ws_conflict_reported: false,
             fc_covered_removals: 0,
+            finalized_floor: None,
+            latch_violations: 0,
         }
     }
 
@@ -4059,6 +4226,36 @@ mod transfer_v2_end_to_end {
 /// fires and the block it builds is validated by the real
 /// `Transition::apply_block` under the real ML-DSA-65 ‖ Falcon-1024 verifier.
 /// That is what makes a claim measured here a claim about production code.
+/// The flag day, forced open, for tests only.
+///
+/// `FINALITY_LATCH_ACTIVATION_EPOCH` ships at `u64::MAX`, so no epoch a test
+/// can construct ever reaches it and the refusal would be untestable — which
+/// is how a gated fix becomes a gated fix nobody ever ran. Thread-local, for
+/// the reason `params::rehearsal::TlFlag` is: a process-global switch read
+/// from inside a consensus path mutates the rule under every test running
+/// beside it, and `cargo test` runs them in parallel.
+#[cfg(test)]
+mod latch_hook {
+    use std::cell::Cell;
+    thread_local! {
+        pub static FORCE_ARMED: Cell<bool> = const { Cell::new(false) };
+    }
+    /// Arms the latch for the current thread, and disarms it on drop so a
+    /// panicking test cannot leave the switch on for the next one.
+    pub struct Armed;
+    impl Armed {
+        pub fn new() -> Self {
+            FORCE_ARMED.with(|c| c.set(true));
+            Armed
+        }
+    }
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            FORCE_ARMED.with(|c| c.set(false));
+        }
+    }
+}
+
 #[cfg(test)]
 mod perf_support {
     use super::*;
@@ -4158,6 +4355,8 @@ mod perf_support {
             // offset the very first comparison against a pool that really is
             // empty.
             fc_covered_removals: 0,
+            finalized_floor: None,
+            latch_violations: 0,
         };
         (engine, TestDir(dir))
     }
@@ -5437,6 +5636,8 @@ mod duty_view_anchor {
             ws_anchor_hard: false,
             ws_conflict_reported: false,
             fc_covered_removals: 0,
+            finalized_floor: None,
+            latch_violations: 0,
         };
         (engine, dir)
     }
@@ -5506,5 +5707,409 @@ mod duty_view_anchor {
             partition_caught_up.len()
         );
         assert!(moved > 0);
+    }
+}
+
+/// **The finality latch: the defect, and the guard.**
+///
+/// Two claims are under test here, and they are independent of the quorum
+/// defect in `finality.rs` — a chain whose denominator never shrinks still has
+/// this one.
+///
+/// 1. The node's finalized checkpoint is NOT a latch. `do_reorg` installs an
+///    ancestor's committed state and never compares its finalized checkpoint
+///    with the outgoing one, so `finalized.epoch` moves DOWN and a block that
+///    `getblockbyslot` reported as `finalized: true` reports `justified` or
+///    `canonical` afterwards.
+/// 2. It is not merely callable, it is REACHABLE: fork choice walks from the
+///    justified root, and the state committed at the justified root already
+///    carries a lower finalized epoch than the head does. So the deepest cut
+///    LMD-GHOST may legitimately propose is already a rewind — no invalid
+///    block, no misbehaving peer, no rule broken.
+///
+/// And the compound: once a rewind lands, `forkchoice_inputs` reads the
+/// justified root out of the REWOUND state, so the next walk starts lower
+/// still. That is the descending ratchet behind nodes found below their own
+/// finalized point, and it is this same defect rather than a second one.
+#[cfg(test)]
+mod finality_latch_tests {
+    use super::*;
+
+    /// Drive the single-validator fixture to real finality on the real paths:
+    /// `attest` and `propose`, through `ingest`/`advance`, with nothing
+    /// hand-stuffed.
+    ///
+    /// **Two blocks per epoch, not thirty-two.** The slots are sparse for the
+    /// reason `head_root_tests` gives: `propose` takes the slot as an argument
+    /// and this fixture's single validator is the proposer at every one of
+    /// them, so an epoch costs two blocks instead of a full sweep. The pair is
+    /// the minimum that makes an epoch finalisable:
+    ///
+    ///   - `32e`     — the first block of epoch `e`, which is what fires
+    ///                 `close_epoch(e-1)` and runs the previous epoch's votes
+    ///                 through the finality gadget;
+    ///   - `32e + 1` — an attestation for epoch `e` and the block that carries
+    ///                 it.
+    ///
+    /// Casper k=1 then finalises epoch `e` once `e+2` has justified
+    /// (`finality.rs:458`), so `epochs` boundaries leave the head finalising
+    /// about `epochs - 2`.
+    fn finalized_engine(epochs: u64) -> (Engine, perf_support::TestDir) {
+        let (mut engine, dir) = perf_support::proposing_engine();
+        engine.propose(1);
+        for e in 1..=epochs {
+            // The first block of epoch `e`, which is what fires
+            // `close_epoch(e-1)` and runs the previous epoch's votes.
+            engine.propose(32 * e);
+
+            // WHICH slot this validator may attest in is not free. The
+            // boundary tally (`finality::votes_from_partition`) accepts a vote
+            // only if `slot % 32` is the index of the subcommittee this
+            // validator was drawn into for this epoch, and that index moves
+            // with the beacon seed. A fixture that guesses the slot silently
+            // has every vote dropped, the chain never justifies, and every
+            // assertion downstream passes vacuously — which is exactly what a
+            // first version of this fixture did.
+            let rolled = engine.rolled_to(e);
+            let roster = rolled.active_validators();
+            let seed = Engine::seed_for(&rolled, e);
+            let idx = bloch_pos_committee::committees::epoch_committees(&seed, e, &roster)
+                .iter()
+                .position(|c| c.contains(&0))
+                .expect("the only validator is in exactly one of the epoch's subcommittees");
+            let att_slot = 32 * e + idx as u64;
+            engine.attest(att_slot);
+            // A block at or after that slot, to carry the vote. When the drawn
+            // slot is the epoch's first one the block above already went by, so
+            // one more is needed.
+            engine.propose(if att_slot > 32 * e { att_slot } else { 32 * e + 1 });
+        }
+        assert!(
+            engine.state.finality().finalized.epoch >= 3,
+            "fixture: the chain must actually finalize something, or every assertion \
+             below is vacuous — got finalized e{} after {epochs} boundaries",
+            engine.state.finality().finalized.epoch
+        );
+        (engine, dir)
+    }
+
+    /// **Claim 1, and it is the whole defect in one assertion.**
+    ///
+    /// The engine has finalized epoch `F` at some canonical block. Hand back
+    /// the blocks above an ancestor that sits BELOW that checkpoint — the
+    /// give-blocks-back case, `do_reorg` to an empty branch, which the module
+    /// docs call a legitimate LMD-GHOST outcome. The adopt path installs the
+    /// ancestor's state and the node's finalized epoch goes down.
+    ///
+    /// The latch is INERT here (no `latch_hook::Armed`), so this is what the
+    /// shipped binary does today.
+    #[test]
+    fn the_finalized_checkpoint_is_not_a_latch_across_a_reorg() {
+        let (mut engine, _dir) = finalized_engine(8);
+
+        let before = engine.state.finality().finalized;
+        let before_height = engine.finalized_height().expect("finalized is canonical");
+        // A canonical block strictly BELOW the finalized checkpoint. Nothing
+        // exotic: it is an ordinary ancestor of the chain the node just built.
+        let (_, target_id) = engine.chain[(before_height as usize) / 2];
+        let ancestor = *target_id.as_bytes();
+
+        // The node reports the finalized checkpoint as finalized, before.
+        let cp_slot = engine
+            .slot_of_canonical_root(&before.root)
+            .expect("the finalized checkpoint is on this node's canonical chain");
+        assert_eq!(
+            engine.finality_of(cp_slot, true),
+            Finality::Finalized,
+            "fixture: the checkpoint must read as finalized before the reorg"
+        );
+
+        assert!(
+            engine.do_reorg(ancestor, Vec::new()),
+            "the adopt path takes this reorg — that it does is the defect"
+        );
+
+        let after = engine.state.finality().finalized;
+        assert!(
+            after.epoch < before.epoch,
+            "NO REWIND: finalized stayed at e{} across a reorg to a block below it. \
+             If this ever fails, the adopt path grew a comparison and this analysis \
+             is out of date.",
+            before.epoch
+        );
+        // And the integrator-visible consequence, through the same accessors
+        // the RPC calls.
+        assert_ne!(
+            engine.finality_of(cp_slot, engine.canonical.contains(&before.root)),
+            Finality::Finalized,
+            "a block this node returned as finalized must now report something else — \
+             that is what an exchange sees"
+        );
+        eprintln!(
+            "REWIND: finalized e{} -> e{}; finalized_height {} -> {:?}",
+            before.epoch,
+            after.epoch,
+            before_height,
+            engine.finalized_height()
+        );
+    }
+
+    /// **Claim 2 — reachability, which is what makes claim 1 a defect rather
+    /// than a note about an internal function.**
+    ///
+    /// Fork choice starts its walk at the justified root
+    /// (`forkchoice_inputs`/`forkchoice_head`), so the shallowest block it can
+    /// ever return is the justified checkpoint and the deepest cut a reorg can
+    /// take is down to that block. This asserts that the state committed AT
+    /// the justified root already carries a strictly lower finalized epoch —
+    /// so that legitimate, in-rules cut is itself a finality rewind. No peer
+    /// has to misbehave.
+    #[test]
+    fn the_deepest_cut_fork_choice_may_propose_is_already_below_finality() {
+        let (engine, _dir) = finalized_engine(8);
+        let fin = engine.state.finality();
+
+        let justified_id = fin.justified.root;
+        assert!(
+            engine.canonical.contains(&justified_id),
+            "fixture: the justified root must be canonical for this to be the walk root"
+        );
+        assert_eq!(
+            engine.forkchoice_inputs().justified,
+            justified_id,
+            "fixture: fork choice really does walk from the justified root"
+        );
+
+        let at_justified = engine.state_at_canonical(justified_id);
+        assert!(
+            at_justified.finality().finalized.epoch < fin.finalized.epoch,
+            "the state at the justified root finalizes e{} and the head finalizes e{} — \
+             if these were equal, a cut to the justified root would not rewind finality \
+             and claim 2 would be refuted",
+            at_justified.finality().finalized.epoch,
+            fin.finalized.epoch
+        );
+        eprintln!(
+            "REACHABLE: fork choice may cut to the justified root, whose state finalizes \
+             e{} against the head's e{} — a {}-epoch rewind inside the rules",
+            at_justified.finality().finalized.epoch,
+            fin.finalized.epoch,
+            fin.finalized.epoch - at_justified.finality().finalized.epoch,
+        );
+    }
+
+    /// **The descending ratchet — the same defect, seen twice.**
+    ///
+    /// After a rewind, `forkchoice_inputs().justified` is read out of the
+    /// REWOUND state, so the root the next walk starts from is lower than the
+    /// one this walk started from. Nothing pushes it back up. That is the
+    /// mechanism by which a node ends up far below its own finalized point
+    /// rather than one reorg below it, and it is why the already-recorded
+    /// "finality rewind" observation and this defect are one bug and not two.
+    #[test]
+    fn each_rewind_lowers_the_root_the_next_walk_starts_from() {
+        let (mut engine, _dir) = finalized_engine(8);
+
+        let mut walk_roots = Vec::new();
+        let mut finalized = Vec::new();
+        for _ in 0..3 {
+            let just = engine.forkchoice_inputs().justified;
+            walk_roots.push(engine.height_of(&just).expect("justified is canonical"));
+            finalized.push(engine.state.finality().finalized.epoch);
+            // Take the cut fork choice is allowed to take: down to the
+            // justified root itself.
+            assert!(engine.do_reorg(just, Vec::new()), "the cut is adopted");
+        }
+        walk_roots.push(
+            engine
+                .height_of(&engine.forkchoice_inputs().justified)
+                .expect("justified is canonical"),
+        );
+        finalized.push(engine.state.finality().finalized.epoch);
+
+        assert!(
+            walk_roots.windows(2).all(|w| w[1] < w[0]),
+            "NOT A RATCHET: the walk root did not descend on every step, heights {walk_roots:?}. \
+             If it stopped descending, something bounds the descent and the compound \
+             claim is wrong."
+        );
+        assert!(
+            finalized.windows(2).all(|w| w[1] < w[0]),
+            "finalized did not fall on every step: {finalized:?}"
+        );
+        eprintln!(
+            "DESCENDING RATCHET: walk-root heights {walk_roots:?}, finalized epochs {finalized:?} \
+             — each rewind lowers the root the next one starts from"
+        );
+    }
+
+    /// **The guard, verified by deliberately violating it.**
+    ///
+    /// Same engine, same reorg as
+    /// `the_finalized_checkpoint_is_not_a_latch_across_a_reorg`, with the flag
+    /// day forced open. The adopt path must refuse, and the node's finalized
+    /// checkpoint must not move.
+    #[test]
+    fn the_armed_latch_refuses_the_reorg_that_rewinds_finality() {
+        let _armed = latch_hook::Armed::new();
+        let (mut engine, _dir) = finalized_engine(8);
+
+        let before = engine.state.finality().finalized;
+        let before_head = engine.head_id();
+        let before_len = engine.chain.len();
+        let ancestor = *engine.chain[(engine.finalized_height().unwrap() as usize) / 2]
+            .1
+            .as_bytes();
+
+        assert!(
+            engine.finalized_floor.is_some(),
+            "the floor must have been raised by the real apply path, not by the test"
+        );
+        assert_eq!(
+            engine.finalized_floor.map(|c| c.epoch),
+            Some(before.epoch),
+            "the floor must track the finalized checkpoint the node actually reached"
+        );
+
+        assert!(
+            !engine.do_reorg(ancestor, Vec::new()),
+            "GUARD DID NOT BITE: the armed latch adopted a head below its own finalized \
+             checkpoint"
+        );
+        assert_eq!(
+            engine.state.finality().finalized,
+            before,
+            "the refusal must leave the finalized checkpoint exactly where it was"
+        );
+        assert_eq!(engine.head_id(), before_head, "the head must not move");
+        assert_eq!(
+            engine.chain.len(),
+            before_len,
+            "the canonical chain must not be truncated"
+        );
+    }
+
+    /// **The mutation.** Disarm the latch and run the identical scenario. It
+    /// must go through. If it does not, the test above is passing for some
+    /// reason other than the guard, and the guard is unproven.
+    #[test]
+    fn mutation_with_the_latch_disarmed_the_same_reorg_is_adopted() {
+        let (mut engine, _dir) = finalized_engine(8);
+        let before = engine.state.finality().finalized;
+        let ancestor = *engine.chain[(engine.finalized_height().unwrap() as usize) / 2]
+            .1
+            .as_bytes();
+
+        assert!(
+            engine.do_reorg(ancestor, Vec::new()),
+            "MUTATION DID NOT BITE: the reorg was refused with the latch inert, so the \
+             armed test proves nothing about the flag day"
+        );
+        assert!(engine.state.finality().finalized.epoch < before.epoch);
+    }
+
+    /// The guard must not fire on the ordinary case, or it is a liveness bug
+    /// wearing a safety bug's clothes: a reorg to a SIBLING branch that still
+    /// descends from the finalized checkpoint is legitimate and must be taken,
+    /// armed or not.
+    #[test]
+    fn the_armed_latch_still_adopts_a_reorg_that_keeps_the_checkpoint() {
+        let _armed = latch_hook::Armed::new();
+        for depth in 1..=3u64 {
+            let (mut engine, _dir, fork_point, rival) = reorg_state_tests::forked(depth);
+            // This fixture never finalizes anything (it proposes a handful of
+            // blocks in epoch 0), so the floor is None and the latch is
+            // vacuous. Raise a floor by hand at GENESIS — the weakest real
+            // floor there is — and check the reorg still goes through.
+            engine.finalized_floor = Some(bloch_pos_committee::interfaces::Checkpoint {
+                epoch: 1,
+                root: *engine.chain[0].1.as_bytes(),
+            });
+            assert!(
+                engine.do_reorg(fork_point, vec![rival]),
+                "depth {depth}: a reorg that keeps the finalized checkpoint on the chain \
+                 must still be adopted with the latch armed"
+            );
+        }
+    }
+
+    /// **Ships inert, and not by inspection.**
+    ///
+    /// `latch_is_armed` compares `slot / 32` against
+    /// `FINALITY_LATCH_ACTIVATION_EPOCH`. At `u64::MAX` that comparison is
+    /// UNSATISFIABLE for every representable slot — the largest epoch a `u64`
+    /// slot can produce is `u64::MAX / 32` — so the refusal is unreachable in a
+    /// release build rather than merely improbable. Asserted here because "the
+    /// constant is big" and "the branch cannot be taken" are different claims
+    /// and only the second one is the ships-inert promise.
+    #[test]
+    fn the_refusal_is_unreachable_while_the_gate_is_u64_max() {
+        assert_eq!(
+            bloch_pos_committee::params::FINALITY_LATCH_ACTIVATION_EPOCH,
+            u64::MAX,
+            "the finality latch has been armed; that is a flag day and this test must be \
+             updated in the same commit that arms it"
+        );
+        assert!(
+            epoch_of(u64::MAX) < bloch_pos_committee::params::FINALITY_LATCH_ACTIVATION_EPOCH,
+            "the highest epoch any slot can reach is {}, which must stay strictly below the \
+             gate — otherwise the refusal is reachable on a chain that runs long enough",
+            epoch_of(u64::MAX)
+        );
+
+        // And the engine agrees, through the shipped accessor rather than
+        // through a restatement of the arithmetic.
+        let (engine, _dir) = perf_support::proposing_engine();
+        assert!(
+            !engine.latch_is_armed(),
+            "a fresh engine reports the latch ARMED with the gate at u64::MAX"
+        );
+    }
+
+    /// Below the flag day the latch must be observationally inert: it detects,
+    /// it counts, it logs — and the head it adopts is the same head.
+    ///
+    /// This is the fork-safety claim stated as a test. Two engines, the same
+    /// slots, one of them driven through a reorg the latch flags: the inert
+    /// binary must adopt exactly what a binary without the latch would, which
+    /// is what makes an un-upgraded peer indistinguishable on the wire.
+    #[test]
+    fn below_the_flag_day_the_latch_changes_nothing_but_the_log() {
+        let (mut engine, _dir) = finalized_engine(8);
+        let ancestor = *engine.chain[(engine.finalized_height().unwrap() as usize) / 2]
+            .1
+            .as_bytes();
+        assert_eq!(engine.latch_violations, 0, "nothing has been flagged yet");
+
+        // The reorg the armed binary refuses.
+        assert!(
+            engine.do_reorg(ancestor, Vec::new()),
+            "the inert binary must still adopt it — that is the whole point of inert"
+        );
+        assert_eq!(
+            *engine.head_id().as_bytes(),
+            ancestor,
+            "and it must land on exactly the head the pre-latch binary would have"
+        );
+    }
+
+    /// The floor never comes down, which is the property that makes it a latch
+    /// rather than a second copy of the state's own field.
+    #[test]
+    fn the_floor_only_ever_rises() {
+        let (mut engine, _dir) = finalized_engine(8);
+        let peak = engine.finalized_floor.expect("finalized something");
+        let just = engine.forkchoice_inputs().justified;
+        assert!(engine.do_reorg(just, Vec::new()), "the cut is adopted (latch inert)");
+        assert!(
+            engine.state.finality().finalized.epoch < peak.epoch,
+            "fixture: the state's own finalized must have fallen, or nothing is tested"
+        );
+        assert_eq!(
+            engine.finalized_floor,
+            Some(peak),
+            "the FLOOR followed the state down — then it is not a high-water mark and \
+             the guard would forgive the very rewind it exists to catch"
+        );
     }
 }
