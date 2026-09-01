@@ -367,7 +367,11 @@ next agent does not read the gap as free space and take it.
 ## 7. Known registry gaps
 
 1. **No test freezes any frame byte.** Sections 2 and 3 have no `Frozen by`
-   entries because no such test exists. The namespace with the weakest compiler
+   entries because no such test exists. **Verified exhaustively 2026-09-01:** a
+   search for `FRAME_` or `SYNC_TAG_` across every `tests/` directory in mainline
+   *and* all 195 worktrees returns **zero matches**. Not one test anywhere in the
+   repository, merged or unmerged, references a frame byte or a sync tag by name.
+   The gap is total, not partial. The namespace with the weakest compiler
    support has the weakest test support. **PMO ask: one wire-constant golden test
    asserting every `FRAME_*` and `SYNC_TAG_*` value, plus a no-wildcard
    exhaustiveness test over the transaction-tag `match`.** Small, and it converts
