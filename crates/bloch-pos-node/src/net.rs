@@ -69,6 +69,19 @@ pub const FRAME_GET_TIME: u8 = 0x05;
 /// not slot: milliseconds are manifest-independent, and the requester judges
 /// skew on its own slot geometry.
 pub const FRAME_TIME: u8 = 0x06;
+/// Payload is an encoded [`crate::state_sync::StateSyncRequest`] — a
+/// checkpoint-sync state download request, answered from the local snapshot
+/// store rather than relayed.
+///
+/// **0x07, not 0x05.** The clock gate and checkpoint sync were written
+/// against the same base, independently, and BOTH claimed 0x05/0x06 — two
+/// consts with different names and the same value, which the compiler
+/// accepts in silence. Neither had shipped, so the collision was resolved
+/// here by moving state sync up; `frame_bytes_are_claimed_exactly_once`
+/// below is what stops the next one.
+pub const FRAME_GET_STATE: u8 = 0x07;
+/// Payload is an encoded [`crate::state_sync::StateSyncResponse`].
+pub const FRAME_STATE: u8 = 0x08;
 
 pub use crate::p2p::{Origin, Verdict};
 
@@ -81,6 +94,10 @@ pub enum NetEvent {
     /// [`Origin::none`] and reporting is a no-op.
     Attestation(Attestation, Origin),
     Transaction(bloch_pos_committee::transition::PosTransaction),
+    /// A checkpoint-sync state download answer (manifest, chunk, or
+    /// unavailable). Only the boot-time download loop consumes these; at any
+    /// other time they are dropped, harmlessly.
+    StateSync(crate::state_sync::StateSyncResponse),
 }
 
 /// The transport the engine holds. One of two, chosen at startup.
@@ -261,6 +278,15 @@ pub fn get_blocks_frame(after_slot: u64) -> Vec<u8> {
     f
 }
 
+/// A state-sync request as an engine frame: the devnet mesh sends it to every
+/// peer (any holder may answer; duplicates dedup in the download bookkeeping),
+/// libp2p routes it onto the directed-sync protocol.
+pub fn get_state_frame(req: &crate::state_sync::StateSyncRequest) -> Vec<u8> {
+    let mut f = vec![FRAME_GET_STATE];
+    f.extend_from_slice(&crate::state_sync::encode_request(req));
+    f
+}
+
 /// Send one transaction to a running node and disconnect.
 ///
 /// The node gossips it onward, so any peer is an equally good entry point.
@@ -307,6 +333,9 @@ fn decode_event(frame: &[u8]) -> Option<NetEvent> {
             r.finish().ok()?;
             Some(NetEvent::Attestation(att, Origin::none()))
         }
+        &FRAME_STATE => {
+            crate::state_sync::decode_response(&frame[1..]).ok().map(NetEvent::StateSync)
+        }
         &FRAME_TX => {
             // Decoding here, at the edge, is deliberate: a frame that does not
             // decode never reaches the mempool, so a proposer cannot be handed
@@ -317,6 +346,18 @@ fn decode_event(frame: &[u8]) -> Option<NetEvent> {
         }
         _ => None,
     }
+}
+
+/// Answer a peer's `FRAME_GET_STATE` on the socket it asked over, from the
+/// local snapshot store. Same locking discipline as [`serve_get_blocks`]: the
+/// write half is shared, so the lock is taken around one whole frame.
+fn serve_get_state(sock: &Arc<Mutex<TcpStream>>, data_dir: &PathBuf, frame: &[u8]) {
+    let Ok(req) = crate::state_sync::decode_request(&frame[1..]) else { return };
+    let resp = crate::state_sync::serve(data_dir, &req);
+    let mut f = vec![FRAME_STATE];
+    f.extend_from_slice(&crate::state_sync::encode_response(&resp));
+    let Ok(mut w) = sock.lock() else { return };
+    let _ = write_frame(&mut w, &f);
 }
 
 /// Serve one get-blocks request on `sock` from the local block log.
@@ -470,6 +511,8 @@ pub fn start(
                                 if write_frame(&mut w, &f).is_err() {
                                     return;
                                 }
+                            } else if frame.first() == Some(&FRAME_GET_STATE) {
+                                serve_get_state(&wsock, &data_dir, &frame);
                             } else if let Some(ev) = decode_event(&frame) {
                                 if !send_to_engine(&events, &inflight, ev) {
                                     return;
@@ -756,5 +799,55 @@ mod tests {
         // And the stranger got no vote: a median open to inbound volunteers
         // would be a median an attacker can pack with free sybils.
         assert_eq!(clock.len(), 0, "inbound peers must not enter the clock median");
+    }
+
+    /// Every frame byte this transport defines, and the claim that no two of
+    /// them are the same number.
+    ///
+    /// # Why this exists
+    ///
+    /// The clock gate and checkpoint sync were developed against the same
+    /// base at the same time and BOTH claimed `0x05`/`0x06` — the clock gate
+    /// for `FRAME_GET_TIME`/`FRAME_TIME`, checkpoint sync for
+    /// `FRAME_GET_STATE`/`FRAME_STATE`. git merged the two additions without
+    /// a conflict where they did not touch the same lines, and rustc says
+    /// NOTHING about two `pub const`s with different names and equal values:
+    /// no error, no warning, not even `unreachable_patterns`, because the
+    /// dispatch is an `if/else if` chain on runtime values and not a `match`.
+    /// The failure would have been silent and remote — a peer answering a
+    /// state request with its clock — and it would have been found on the
+    /// fleet, not here.
+    ///
+    /// So the list is frozen, by value, and duplicates fail the build. A new
+    /// frame must be added HERE as well as above, which is the point: the
+    /// author is forced to look at every number already spent.
+    #[test]
+    fn frame_bytes_are_claimed_exactly_once() {
+        let frames: [(&str, u8); 8] = [
+            ("FRAME_BLOCK", FRAME_BLOCK),
+            ("FRAME_ATT", FRAME_ATT),
+            ("FRAME_GET_BLOCKS", FRAME_GET_BLOCKS),
+            ("FRAME_TX", FRAME_TX),
+            ("FRAME_GET_TIME", FRAME_GET_TIME),
+            ("FRAME_TIME", FRAME_TIME),
+            ("FRAME_GET_STATE", FRAME_GET_STATE),
+            ("FRAME_STATE", FRAME_STATE),
+        ];
+        for (i, (na, va)) in frames.iter().enumerate() {
+            for (nb, vb) in frames.iter().skip(i + 1) {
+                assert_ne!(
+                    va, vb,
+                    "frame bytes {na} and {nb} are both {va:#04x} — two frame types \
+                     with one number is a silent wire collision"
+                );
+            }
+        }
+        // The values themselves, pinned: a renumber is a wire change and must
+        // be a deliberate edit to this list, not a side effect of a merge.
+        assert_eq!(
+            frames.map(|(_, v)| v),
+            [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+            "a frame byte moved; that is a wire-compatibility change"
+        );
     }
 }

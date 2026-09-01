@@ -267,6 +267,26 @@ impl SlashingState {
         self.ejected.iter()
     }
 
+    /// Rebuild the state machine from its committed components — the
+    /// checkpoint-sync restore path (`transition::snapshot`), and nothing
+    /// else.
+    ///
+    /// `applied` and `window` are committed under `TAG_SLASH_APPLIED` /
+    /// `TAG_SLASH_WINDOW`, so the restore's whole-state root check binds
+    /// them. `ejected` is **derived, not decoded**: the caller must pass
+    /// exactly `{v : registry[v].slashed}` from the (also committed) registry
+    /// it restored — the equivalence the `ejected_ids` doc records, pinned by
+    /// `transition::tests::ejected_set_is_exactly_the_slashed_registry`.
+    /// Accepting ejected ids from a wire format instead would give the one
+    /// deliberately-uncommitted field a path around the root.
+    pub fn from_committed_parts(
+        applied: BTreeSet<[u8; 32]>,
+        window: BTreeMap<u64, u128>,
+        ejected: BTreeSet<u32>,
+    ) -> Self {
+        SlashingState { applied, ejected, window }
+    }
+
     /// Poke the committed sets directly. **Test-only**, and only so the
     /// state-root coverage test can prove each component is bound by the root
     /// without building a distinct real offence per component — the honest

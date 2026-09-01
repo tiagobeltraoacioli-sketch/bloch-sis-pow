@@ -359,6 +359,44 @@ onboarding (migration spec, Appendix B). Concretely:
 trusted one thing — that `block_root` is the real network's finalized epoch
 boundary. Everything else it verified.
 
+#### 4.3.2-impl How the shipped state download verifies (2026-08-31)
+
+Step 2 is implemented (`crate::state_sync` in the node,
+`transition::snapshot` in the committee crate), with one deliberate
+simplification over the sketch above, stated here so nobody mistakes the
+sketch for the code:
+
+- **The unit of verification is the whole state, not the piece.** The
+  snapshot travels as one canonical byte artifact (boundary block envelope +
+  the committed state's canonical serialization). The importing node checks,
+  in order: `BlockId(envelope.header) == checkpoint.block_root`;
+  `envelope.header.state_root == checkpoint.state_root`; and then
+  `snapshot::restore` rebuilds the `CommittedState` and **recomputes the
+  full state root from scratch** — the same `compute_root` every block
+  commits with — refusing the artifact unless it equals the checkpoint's.
+  There is no other constructor, so an unverified state cannot exist. The
+  per-chunk SHA3-256 hashes in the transfer manifest are transport
+  integrity only (early rejection, resumable re-fetch, mixing peers); they
+  carry zero trust. Per-piece SMT inclusion proofs — verifying entries
+  against the root *during* download — remain a streaming optimisation for
+  a state too large to hold before verifying; they would change memory
+  shape, not the trust argument.
+- **`validator_set_root` is not consumed, and stays all-zeros by milestone
+  convention.** The registry is committed leaf-by-leaf inside `state_root`
+  (`TAG_VALIDATOR`), so the single root already verifies the downloaded
+  registry; a second root would be the same fact committed twice, with room
+  to drift (the exact argument `state_root.rs` makes against committing the
+  slashing ejected set). The field stays in the format for a future
+  registry-only fast path; the epoch-1536 artifact already minted is
+  unaffected.
+- **Fields the root does not bind are never taken from the wire.** `slot`
+  and `head` come from the boundary header the signed `block_root` pins;
+  chain identity (`genesis_mix`, the genesis cohort) comes from the node's
+  own manifest; derived indices (`pubkey_index`, the slashing ejected set)
+  are rebuilt from committed data. The one width the root narrows (registry
+  stake, committed as u64) is enforced at decode: a wider value is refused
+  before the root could be asked to miss it.
+
 ---
 
 ## 5. Detecting a false checkpoint — what is detectable and what is not

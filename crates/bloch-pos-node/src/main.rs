@@ -51,9 +51,11 @@ mod net;
 mod p2p;
 mod rpc;
 mod signing_history;
+mod state_sync;
 mod store;
 mod time_check;
 mod ws_boot;
+mod ws_tool;
 
 use std::path::PathBuf;
 use std::process::exit;
@@ -118,6 +120,10 @@ fn main() {
             }
         }
         Some("run") => run_cmd(&args[1..]),
+        Some(
+            cmd @ ("ws-keygen" | "ws-signer-set" | "ws-checkpoint" | "ws-sign" | "ws-envelope"
+            | "ws-verify"),
+        ) => ws_tool::run(cmd, &args[1..]),
         Some(other) => {
             eprintln!("{NAME}: unknown command `{other}` (see --help)");
             exit(2);
@@ -157,6 +163,32 @@ fn print_help() {
                SAME flags plus --signature. This tool never holds a\n\
                spending key. No acknowledgement: confirmation is seeing\n\
                it in a block.\n\
+           run … --ws-checkpoint <envelope> --ws-signer-set <set> --state-sync\n\
+               Checkpoint-sync: verify the signed checkpoint, DOWNLOAD its\n\
+               committed state from peers (chunked, resumable), verify that\n\
+               the state reproduces the checkpoint's state_root, and sync\n\
+               forward from there instead of replaying from genesis.\n\
+               --state-snapshot <file> uses a local artifact instead of\n\
+               downloading (same verification, no trust in the file).\n\
+           run … --export-state-epoch <E> --export-state-out <file>\n\
+               Replay the local log and write epoch E's boundary-state\n\
+               snapshot artifact (the file --state-snapshot consumes and\n\
+               nodes serve to peers), then exit.\n\
+           bloch-pos ws-checkpoint --genesis <manifest> --rpc <a>[,<b>...]\n\
+                                   --epoch <E> --signer-set-id <n>\n\
+                                   --out <prefix>\n\
+               Derive the weak-subjectivity checkpoint for a FINALIZED\n\
+               epoch from running nodes (all --rpc endpoints must agree),\n\
+               writing <prefix>.bin (154 canonical bytes) + <prefix>.json\n\
+               and printing the ws digest the signers sign.\n\
+           bloch-pos ws-keygen | ws-signer-set | ws-sign | ws-envelope\n\
+                     | ws-verify\n\
+               The rest of the signing ceremony (BLOCH-WEAK-SUBJECTIVITY.md\n\
+               section 6): per-signer keypairs, the signer-arrangement file that\n\
+               --ws-signer-set consumes, offline signing of the ws digest,\n\
+               envelope assembly, and verification exactly as a booting\n\
+               node performs it. See src/ws_tool.rs for each command's\n\
+               flags.\n\
            bloch-pos genesis --keys <dir1,dir2,...> --out <file>\n\
                              [--slot-ms <ms>] [--start-in <secs>]\n\
                Build a devnet genesis manifest from the keystores' public\n\
@@ -1073,6 +1105,19 @@ fn run_cmd(args: &[String]) {
                 }
             },
         },
+        state_snapshot: arg_value(args, "--state-snapshot").map(PathBuf::from),
+        state_sync: args.iter().any(|a| a == "--state-sync"),
+        export_state_epoch: match arg_value(args, "--export-state-epoch") {
+            None => None,
+            Some(s) => match s.parse::<u64>() {
+                Ok(e) => Some(e),
+                Err(_) => {
+                    eprintln!("run: --export-state-epoch must be an epoch number (got `{s}`)");
+                    exit(2);
+                }
+            },
+        },
+        export_state_out: arg_value(args, "--export-state-out").map(PathBuf::from),
     };
     if let Err(e) = engine::run(cfg) {
         eprintln!("bloch-pos: {e}");

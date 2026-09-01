@@ -366,6 +366,11 @@ pub enum SyncRequest {
     /// other effect, so old and new builds interoperate and no flag day is
     /// needed. Rolling the fleet forward is what arms the check.
     GetTime,
+    /// A checkpoint-sync state request, carried opaquely: the payload is an
+    /// encoded `state_sync::StateSyncRequest`, so the chunked-download wire
+    /// form has exactly one definition (in `state_sync.rs`) on both
+    /// transports and this codec stays a framing layer.
+    State { payload: Vec<u8> },
 }
 
 /// The answer to a [`SyncRequest`].
@@ -377,12 +382,16 @@ pub enum SyncResponse {
     /// milliseconds are manifest-independent, and the requester judges skew
     /// on its own slot geometry.
     Time { now_ms: u64 },
+    /// An encoded `state_sync::StateSyncResponse` — see [`SyncRequest::State`].
+    State { payload: Vec<u8> },
 }
 
 const SYNC_TAG_GET_BLOCKS: u8 = 0x01;
+const SYNC_TAG_GET_STATE: u8 = 0x03;
 const SYNC_TAG_BLOCKS: u8 = 0x01;
 const SYNC_TAG_GET_TIME: u8 = 0x02;
 const SYNC_TAG_TIME: u8 = 0x02;
+const SYNC_TAG_STATE: u8 = 0x03;
 
 pub fn encode_sync_request(req: &SyncRequest) -> Vec<u8> {
     match req {
@@ -394,6 +403,12 @@ pub fn encode_sync_request(req: &SyncRequest) -> Vec<u8> {
             out
         }
         SyncRequest::GetTime => vec![SYNC_TAG_GET_TIME],
+        SyncRequest::State { payload } => {
+            let mut out = Vec::with_capacity(1 + payload.len());
+            out.push(SYNC_TAG_GET_STATE);
+            out.extend_from_slice(payload);
+            out
+        }
     }
 }
 
@@ -409,6 +424,11 @@ pub fn decode_sync_request(buf: &[u8]) -> Result<SyncRequest, crate::codec::Deco
         SYNC_TAG_GET_TIME => {
             r.finish()?;
             Ok(SyncRequest::GetTime)
+        }
+        SYNC_TAG_GET_STATE => {
+            // Opaque to this layer; `state_sync::decode_request` is the
+            // strict decoder and runs on the serving side.
+            Ok(SyncRequest::State { payload: buf[1..].to_vec() })
         }
         _ => Err(crate::codec::DecodeErr("unknown sync request tag")),
     }
@@ -429,6 +449,12 @@ pub fn encode_sync_response(resp: &SyncResponse) -> Vec<u8> {
             let mut out = Vec::with_capacity(9);
             out.push(SYNC_TAG_TIME);
             out.extend_from_slice(&now_ms.to_le_bytes());
+            out
+        }
+        SyncResponse::State { payload } => {
+            let mut out = Vec::with_capacity(1 + payload.len());
+            out.push(SYNC_TAG_STATE);
+            out.extend_from_slice(payload);
             out
         }
     }
@@ -454,6 +480,7 @@ pub fn decode_sync_response(buf: &[u8]) -> Result<SyncResponse, crate::codec::De
             r.finish()?;
             Ok(SyncResponse::Time { now_ms })
         }
+        SYNC_TAG_STATE => Ok(SyncResponse::State { payload: buf[1..].to_vec() }),
         _ => Err(crate::codec::DecodeErr("unknown sync response tag")),
     }
 }
@@ -779,6 +806,39 @@ pub fn start(
 
 type Swarm = libp2p::Swarm<G4Behaviour>;
 
+/// The behaviour stack, factored out of [`build_swarm`] so the DNS and
+/// TCP-only transport paths below cannot drift into two configurations.
+fn g4_behaviour(
+    gs: gossipsub::Behaviour,
+    max_peers: u32,
+    key: &identity::Keypair,
+) -> G4Behaviour {
+    let identify = identify::Behaviour::new(identify::Config::new(
+        IDENTIFY_PROTOCOL.into(),
+        key.public(),
+    ));
+    // Hold established-incoming at max_peers so inbound dials cannot
+    // fill every slot (eclipse hardening — bounded, not adversarially
+    // tested); allow 2× total for churn headroom.
+    let limits = libp2p::connection_limits::ConnectionLimits::default()
+        .with_max_established(Some(max_peers.saturating_mul(2)))
+        .with_max_established_incoming(Some(max_peers))
+        .with_max_pending_incoming(Some(max_peers))
+        .with_max_pending_outgoing(Some(max_peers.max(1)));
+    G4Behaviour {
+        gossipsub: gs,
+        identify,
+        sync: request_response::Behaviour::with_codec(
+            SyncCodec,
+            std::iter::once((SYNC_PROTOCOL, ProtocolSupport::Full)),
+            RrConfig::default()
+                .with_request_timeout(Duration::from_secs(30))
+                .with_max_concurrent_streams(MAX_CONCURRENT_SYNC_STREAMS),
+        ),
+        connection_limits: libp2p::connection_limits::Behaviour::new(limits),
+    }
+}
+
 fn build_swarm(keypair: &identity::Keypair, cfg: &Config) -> io::Result<Swarm> {
     let gs_cfg = gossipsub_config().map_err(io::Error::other)?;
     let mut gs = gossipsub::Behaviour::new(MessageAuthenticity::Signed(keypair.clone()), gs_cfg)
@@ -790,41 +850,40 @@ fn build_swarm(keypair: &identity::Keypair, cfg: &Config) -> io::Result<Swarm> {
     }
 
     let max_peers = cfg.max_peers as u32;
-    let mut swarm = SwarmBuilder::with_existing_identity(keypair.clone())
+    // DNS is a convenience for `/dns4/…` peer entries, not a requirement —
+    // the fleet's peer lists are `/ip4/…` multiaddrs. `with_dns` reads the
+    // SYSTEM resolver config at startup and fails outright where none is
+    // readable (measured: a sandboxed spawn on macOS dies with "no
+    // nameservers found in config" before binding a single socket). A node
+    // that cannot resolve names can still run the network it was given
+    // addresses for, so that failure downgrades to TCP-only with a loud
+    // warning instead of refusing to start.
+    let mut swarm = match SwarmBuilder::with_existing_identity(keypair.clone())
         .with_tokio()
         .with_tcp(libp2p::tcp::Config::default(), noise::Config::new, yamux_config)
         .map_err(|e| io::Error::other(e.to_string()))?
         .with_dns()
-        .map_err(|e| io::Error::other(e.to_string()))?
-        .with_behaviour(|key| {
-            let identify = identify::Behaviour::new(identify::Config::new(
-                IDENTIFY_PROTOCOL.into(),
-                key.public(),
-            ));
-            // Hold established-incoming at max_peers so inbound dials cannot
-            // fill every slot (eclipse hardening — bounded, not adversarially
-            // tested); allow 2× total for churn headroom.
-            let limits = libp2p::connection_limits::ConnectionLimits::default()
-                .with_max_established(Some(max_peers.saturating_mul(2)))
-                .with_max_established_incoming(Some(max_peers))
-                .with_max_pending_incoming(Some(max_peers))
-                .with_max_pending_outgoing(Some(max_peers.max(1)));
-            G4Behaviour {
-                gossipsub: gs,
-                identify,
-                sync: request_response::Behaviour::with_codec(
-                    SyncCodec,
-                    std::iter::once((SYNC_PROTOCOL, ProtocolSupport::Full)),
-                    RrConfig::default()
-                        .with_request_timeout(Duration::from_secs(30))
-                        .with_max_concurrent_streams(MAX_CONCURRENT_SYNC_STREAMS),
-                ),
-                connection_limits: libp2p::connection_limits::Behaviour::new(limits),
-            }
-        })
-        .map_err(|e| io::Error::other(e.to_string()))?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(300)))
-        .build();
+    {
+        Ok(b) => b
+            .with_behaviour(|key| g4_behaviour(gs, max_peers, key))
+            .map_err(|e| io::Error::other(e.to_string()))?
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(300)))
+            .build(),
+        Err(e) => {
+            eprintln!(
+                "p2p: system DNS unavailable ({e}); running TCP-only — /dns4 peer \
+                 multiaddrs will not resolve, /ip4 peers are unaffected"
+            );
+            SwarmBuilder::with_existing_identity(keypair.clone())
+                .with_tokio()
+                .with_tcp(libp2p::tcp::Config::default(), noise::Config::new, yamux_config)
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .with_behaviour(|key| g4_behaviour(gs, max_peers, key))
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(300)))
+                .build()
+        }
+    };
 
     for t in [TOPIC_BLOCKS, TOPIC_ATTESTATIONS, TOPIC_TXS] {
         swarm
@@ -1048,6 +1107,9 @@ fn handle_command(swarm: &mut Swarm, st: &mut Loop, cmd: Command) {
                     let after = u64::from_le_bytes(payload.try_into().unwrap());
                     request_blocks(swarm, st, after);
                 }
+                crate::net::FRAME_GET_STATE => {
+                    request_state(swarm, st, payload.to_vec());
+                }
                 _ => {}
             }
         }
@@ -1085,6 +1147,23 @@ fn publish(swarm: &mut Swarm, topic: IdentTopic, data: Vec<u8>, name: &str) {
 /// O(peers × blocks) amplification that stalled the chain. Not a single peer
 /// either — a silent one would stall recovery — so [`SYNC_FANOUT`] peers,
 /// preferring the highest observed head.
+/// Direct a state-sync request at the best-connected peers. Fanout, like
+/// blocks: one silent peer must not stall a bootstrap, and the download
+/// bookkeeping dedups duplicate answers by chunk index.
+fn request_state(swarm: &mut Swarm, st: &Loop, payload: Vec<u8>) {
+    let mut peers: Vec<PeerId> = swarm.connected_peers().copied().collect();
+    if peers.is_empty() {
+        return;
+    }
+    peers.sort_by_key(|p| {
+        (std::cmp::Reverse(st.peer_head.get(p).copied().unwrap_or(0)), p.to_bytes())
+    });
+    let req = SyncRequest::State { payload };
+    for p in peers.into_iter().take(SYNC_FANOUT) {
+        swarm.behaviour_mut().sync.send_request(&p, req.clone());
+    }
+}
+
 fn request_blocks(swarm: &mut Swarm, st: &Loop, after_slot: u64) {
     let mut peers: Vec<PeerId> = swarm.connected_peers().copied().collect();
     if peers.is_empty() {
@@ -1224,6 +1303,19 @@ fn handle_swarm_event(
                         // handshake, so however many connections a peer holds
                         // it gets one clock vote.
                         st.clock.record(&peer.to_string(), now_ms, crate::time_check::now_ms());
+                        return true;
+                    }
+                    SyncResponse::State { payload } => {
+                        match crate::state_sync::decode_response(&payload) {
+                            Ok(resp) => {
+                                if !st.emit(NetEvent::StateSync(resp)) {
+                                    return false;
+                                }
+                            }
+                            Err(e) => eprintln!(
+                                "p2p: undecodable state-sync response from {peer}: {e}"
+                            ),
+                        }
                         return true;
                     }
                     SyncResponse::Blocks { envelopes } => envelopes,
@@ -1368,6 +1460,21 @@ fn serve_sync(
         SyncRequest::GetTime => {
             // Answered in place — reading the clock needs no blocking pool.
             let _ = resp_tx.send((channel, SyncResponse::Time { now_ms: crate::time_check::now_ms() }));
+            return;
+        }
+        SyncRequest::State { payload } => {
+            // Checkpoint-sync serving: strict-decode the inner request and
+            // answer from the snapshot store. Anything malformed or absent is
+            // `Unavailable` — the peer's remedy is the same either way.
+            let dir = st.data_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                let resp = match crate::state_sync::decode_request(&payload) {
+                    Ok(req) => crate::state_sync::serve(&dir, &req),
+                    Err(_) => return, // not even a request; answer nothing
+                };
+                let payload = crate::state_sync::encode_response(&resp);
+                let _ = resp_tx.send((channel, SyncResponse::State { payload }));
+            });
             return;
         }
         SyncRequest::GetBlocks { after_slot, limit } => (after_slot, limit),
@@ -1774,5 +1881,70 @@ mod tests {
         assert!(matches!(MessageAcceptance::from(Verdict::Accept), MessageAcceptance::Accept));
         assert!(matches!(MessageAcceptance::from(Verdict::Ignore), MessageAcceptance::Ignore));
         assert!(matches!(MessageAcceptance::from(Verdict::Reject), MessageAcceptance::Reject));
+    }
+
+    /// The directed-sync tag bytes, frozen, with the claim that no two tags
+    /// in the SAME namespace share a number.
+    ///
+    /// Requests and responses are two independent namespaces — they are read
+    /// by two different decoders — so `SYNC_TAG_GET_TIME` and
+    /// `SYNC_TAG_TIME` are both `0x02` on purpose and that is not a
+    /// collision. What IS a collision is two requests, or two responses,
+    /// with one number, and that is what nearly shipped: the clock gate and
+    /// checkpoint sync both claimed `0x02` in both namespaces. See
+    /// `net::tests::frame_bytes_are_claimed_exactly_once` for the same guard
+    /// on the devnet transport and the reason neither the compiler nor git
+    /// caught it.
+    #[test]
+    fn sync_tags_are_claimed_exactly_once_per_namespace() {
+        let requests: [(&str, u8); 3] = [
+            ("SYNC_TAG_GET_BLOCKS", SYNC_TAG_GET_BLOCKS),
+            ("SYNC_TAG_GET_TIME", SYNC_TAG_GET_TIME),
+            ("SYNC_TAG_GET_STATE", SYNC_TAG_GET_STATE),
+        ];
+        let responses: [(&str, u8); 3] = [
+            ("SYNC_TAG_BLOCKS", SYNC_TAG_BLOCKS),
+            ("SYNC_TAG_TIME", SYNC_TAG_TIME),
+            ("SYNC_TAG_STATE", SYNC_TAG_STATE),
+        ];
+        for (label, ns) in [("request", &requests), ("response", &responses)] {
+            for (i, (na, va)) in ns.iter().enumerate() {
+                for (nb, vb) in ns.iter().skip(i + 1) {
+                    assert_ne!(
+                        va, vb,
+                        "{label} tags {na} and {nb} are both {va:#04x} — one number, \
+                         two meanings, and no compiler diagnostic"
+                    );
+                }
+            }
+        }
+        assert_eq!(requests.map(|(_, v)| v), [0x01, 0x02, 0x03]);
+        assert_eq!(responses.map(|(_, v)| v), [0x01, 0x02, 0x03]);
+    }
+
+    /// Both wire additions survive a round trip, and neither decodes as the
+    /// other — the property the shared `0x02` would have destroyed.
+    #[test]
+    fn time_and_state_sync_messages_do_not_decode_as_each_other() {
+        let t = encode_sync_request(&SyncRequest::GetTime);
+        let s = encode_sync_request(&SyncRequest::State { payload: vec![9, 9, 9] });
+        assert_eq!(decode_sync_request(&t).expect("time req"), SyncRequest::GetTime);
+        assert_eq!(
+            decode_sync_request(&s).expect("state req"),
+            SyncRequest::State { payload: vec![9, 9, 9] }
+        );
+        assert_ne!(t[0], s[0], "a state request must not be read as a clock request");
+
+        let tr = encode_sync_response(&SyncResponse::Time { now_ms: 1 });
+        let sr = encode_sync_response(&SyncResponse::State { payload: vec![7] });
+        assert_eq!(
+            decode_sync_response(&tr).expect("time resp"),
+            SyncResponse::Time { now_ms: 1 }
+        );
+        assert_eq!(
+            decode_sync_response(&sr).expect("state resp"),
+            SyncResponse::State { payload: vec![7] }
+        );
+        assert_ne!(tr[0], sr[0], "a state response must not be read as a clock response");
     }
 }
