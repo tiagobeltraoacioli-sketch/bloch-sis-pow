@@ -1,0 +1,39 @@
+# Bloch Genesis-4 — public entry points (devnet transport)
+#
+# Format: one <host>:<port> per line, '#' comments. Pass the whole list to
+# `bloch-pos run --peers` as a comma-separated string. See
+# docs/THIRD-PARTY-QUICKSTART.md.
+#
+# WHAT THESE ARE. Both are keyless ARCHIVAL OBSERVERS (`bloch-archival.service`)
+# run by Postern Labs. They hold no validator.key, so they never propose and
+# never attest; they follow the chain and answer block-sync requests. They are
+# the correct thing for a third party to peer with.
+#
+# WHY NOT VALIDATOR ADDRESSES. The devnet transport has no authentication and
+# no admission control, so a published validator address is an unauthenticated
+# frame-push surface directly into consensus. On 2026-08-09 one stale node
+# dumped 1,270 old blocks and stopped block production across the whole
+# network. Validator addresses stay private, behind per-IP firewall rules.
+#
+# WHY THESE TWO AND NOT MORE. The public list may contain only addresses we
+# control and expect to keep. Validators move between hosts — 64 of them moved
+# on 2026-08-30/31 — and a public list naming them would rot silently, because
+# the devnet transport reconnects dead peers forever and never raises an error
+# (net.rs). These two addresses do not move when validators move.
+#
+# TRANSPORT. devnet, NOT libp2p. This is not a preference; `--transport libp2p`
+# against these hosts exchanges zero frames and leaves you alone on your own
+# fork (see the quick start, "Why not libp2p"). Verified 2026-09-01: all 63
+# fleet validators and both nodes below run `--transport devnet`.
+#
+# Verified 2026-09-01 ~01:45 UTC: both reachable from off-network on 19100,
+# both keyless, both at epoch 1637 with finalized height 31430.
+
+139.180.166.5:19100
+139.180.173.231:19100
+
+# HONEST LIMIT: two hosts, one provider family (139.180.x). One provider
+# suspension takes out both. A three-host tier on three providers is staged in
+# ~/bloch-rollout/bootnodes-20260831/ (provision-bootnode.sh) and is the
+# durable answer; these two are what exists and is publishable today without
+# restarting anything.
