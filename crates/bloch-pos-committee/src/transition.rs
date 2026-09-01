@@ -3187,6 +3187,10 @@ impl StateReader for CommittedState {
     fn finality(&self) -> FinalityView {
         self.finality_view()
     }
+
+    fn fc_equivocators(&self) -> BTreeSet<u32> {
+        self.fc_equivocators.clone()
+    }
 }
 
 // ─── The transition ─────────────────────────────────────────────────────────

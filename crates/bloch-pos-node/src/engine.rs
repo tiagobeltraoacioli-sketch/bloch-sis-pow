@@ -74,9 +74,17 @@
 //! equality the prescription asks for even a statement that could be true.
 //!
 //! Note also that the rebuild is itself what keeps the divergence transient: it
-//! re-derives the equivocator bar from whatever it happens to fold, and does
-//! NOT read the bar the chain has already committed in `fc_equivocators`. A
-//! cache would make that discrepancy permanent.
+//! re-derives the equivocator bar from whatever it happens to fold. It no
+//! longer *only* re-derives it: `forkchoice_store` now SEEDS the store from
+//! `StateReader::fc_equivocators` — the bar the chain has already committed
+//! and hashed into the state root — before folding a single message. That
+//! needs no flag day, because the seed feeds the node's head computation and
+//! the head is written to no root; and it is strictly a floor, because
+//! `Store::observe` refuses a barred validator outright. What it does NOT do
+//! is close the masking defect: the committed bar is itself the legacy fold's
+//! verdict, so a pair the legacy rule never noticed is absent from committed
+//! state too and there is nothing to seed. See `forkchoice::Store::bar` and
+//! `forkchoice_tests::the_committed_bar_decides_the_head_that_the_fold_alone_would_not`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io;
@@ -146,6 +154,11 @@ pub struct Config {
     /// libp2p transport: zero the IP-colocation score penalty.
     pub behind_proxy: bool,
     pub stop_at_slot: Option<u64>,
+    /// Seed fork choice from the equivocator bar the chain has committed
+    /// (`--forkchoice-seed-committed-bar`). See [`Engine::seed_committed_bar`]
+    /// for why this is an operator switch that defaults to OFF rather than
+    /// unconditional behaviour.
+    pub seed_committed_bar: bool,
     pub ws: crate::ws_boot::WsConfig,
     /// The Genesis-3 balance snapshot, when the manifest commits to one. It is
     /// a separate file rather than a manifest field because it is tens of
@@ -625,6 +638,32 @@ struct Engine {
     /// that kind of pool shrinkage apart from the epoch `retain`, which fork
     /// choice very much can see. See the argument there.
     fc_covered_removals: u64,
+    /// Whether [`Engine::forkchoice_head`] seeds its store from
+    /// `StateReader::fc_equivocators` — the equivocator bar the chain has
+    /// already committed and hashed into the state root.
+    ///
+    /// ## Why this is a switch, and why it is off
+    ///
+    /// Seeding needs no flag day in the consensus sense: it moves no state
+    /// root, changes no block's validity, and two nodes on the same chain
+    /// derive the same set. On a chain whose committed bar is empty it is
+    /// bit-for-bit the old behaviour.
+    ///
+    /// Genesis-4 mainnet's bar is not empty. Replaying real history to slot
+    /// 51828 on 2026-09-01 committed **48 of 64 validators, holding 78.7% of
+    /// effective stake** — the duplicated-key fleet that double-signed before
+    /// it was stopped. None of them is `slashed` in the registry, so all 48
+    /// are still active and still attesting, and every node's fork choice
+    /// still weighs votes that `transition::accumulate_forkchoice` refuses.
+    ///
+    /// That makes turning this on a large, immediate change to head selection
+    /// rather than a quiet correction — and a fleet in which some nodes seed
+    /// and others do not is a fleet computing two different heads. So the
+    /// rollout that needs no CONSENSUS flag day still needs a coordinated
+    /// one, and the switch exists so the binary can be everywhere before the
+    /// behaviour is anywhere. Default off means installing this build changes
+    /// nothing at all.
+    seed_committed_bar: bool,
 }
 
 /// A fingerprint of the four values `lmd_ghost_head` reads, so `advance` can
@@ -639,6 +678,18 @@ struct ForkChoiceInputs {
     pool: u64,
     justified: [u8; 32],
     validators: Vec<bloch_pos_committee::sample::Validator>,
+    /// The committed equivocator bar `forkchoice_store` seeds from.
+    ///
+    /// It is a FIFTH input and it has to be here, by value, or the memo is
+    /// unsound: `apply_canonical` can commit a new equivocator without moving
+    /// the justified root and without moving the active set — a validator
+    /// caught equivocating is not ejected from the registry by that alone —
+    /// so none of the other four fields would change, the memo would report a
+    /// hit, and `advance` would keep steering by a head computed under the
+    /// stale bar. Compared by value rather than by count for the same reason
+    /// `justified` is: this one is not monotone-shrinking, it GROWS, so a
+    /// length is not a fingerprint of it.
+    fc_equivocators: BTreeSet<u32>,
 }
 
 /// Why a transaction was turned away at the door.
@@ -1311,6 +1362,14 @@ impl Engine {
             pool: self.pool.len() as u64 + self.fc_covered_removals,
             justified: self.state.finality().justified.root,
             validators: self.state.active_validators(),
+            // The seeded value, not the raw committed one: with the switch
+            // off the seed is empty and cannot move the head, so making the
+            // memo miss on it would only cost recomputes.
+            fc_equivocators: if self.seed_committed_bar {
+                self.state.fc_equivocators()
+            } else {
+                BTreeSet::new()
+            },
         }
     }
 
@@ -1322,6 +1381,11 @@ impl Engine {
             self.pool.values(),
             &self.state.active_validators(),
             self.state.finality().justified.root,
+            &if self.seed_committed_bar {
+                self.state.fc_equivocators()
+            } else {
+                BTreeSet::new()
+            },
             epoch_of(self.state.slot())
                 >= bloch_pos_committee::params::FORKCHOICE_SET_DETERMINED_ACTIVATION_EPOCH,
         )
@@ -2413,6 +2477,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         ws_anchor_hard: false,
         ws_conflict_reported: false,
         fc_covered_removals: 0,
+        seed_committed_bar: cfg.seed_committed_bar,
         manifest,
     };
 
@@ -2611,8 +2676,16 @@ pub fn run(cfg: Config) -> io::Result<()> {
         if let Some(stop) = cfg.stop_at_slot {
             if slot >= stop {
                 let fin = engine.state.finality();
+                // `fc_equivocators` is reported because it is the input
+                // `forkchoice_store` seeds from, and its SIZE is the whole
+                // blast radius of that seeding: at zero, a node carrying the
+                // seed and a node without it compute identical heads, which is
+                // what makes the rollout a no-op needing no flag day. An
+                // operator checking whether this build can possibly differ
+                // from the fleet's reads this number.
+                let barred = engine.state.fc_equivocators();
                 println!(
-                    "STOP at slot {stop}: head slot {}, {} blocks, state root {}, justified e{} ({}), finalized e{} ({})",
+                    "STOP at slot {stop}: head slot {}, {} blocks, state root {}, justified e{} ({}), finalized e{} ({}), fc_equivocators {} {:?}",
                     engine.state.slot(),
                     engine.chain.len() - 1,
                     crate::codec::hex32(&engine.state.state_root()),
@@ -2620,6 +2693,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
                     crate::codec::hex8(&fin.justified.root),
                     fin.finalized.epoch,
                     crate::codec::hex8(&fin.finalized.root),
+                    barred.len(),
+                    barred,
                 );
                 return Ok(());
             }
@@ -2714,9 +2789,11 @@ pub fn lmd_ghost_head<'a>(
     pool: impl Iterator<Item = &'a Attestation>,
     validators: &[bloch_pos_committee::sample::Validator],
     justified: [u8; 32],
+    seed_equivocators: &BTreeSet<u32>,
     set_determined: bool,
 ) -> [u8; 32] {
-    let (fc, parents, children) = forkchoice_store(blocks, pool, validators, set_determined);
+    let (fc, parents, children) =
+        forkchoice_store(blocks, pool, validators, seed_equivocators, set_determined);
     let tree = BlockTree { parents: &parents };
     fc.head(&tree, justified, &children)
 }
@@ -2736,9 +2813,11 @@ pub fn lmd_ghost_head_reference<'a>(
     pool: impl Iterator<Item = &'a Attestation>,
     validators: &[bloch_pos_committee::sample::Validator],
     justified: [u8; 32],
+    seed_equivocators: &BTreeSet<u32>,
     set_determined: bool,
 ) -> [u8; 32] {
-    let (fc, parents, children) = forkchoice_store(blocks, pool, validators, set_determined);
+    let (fc, parents, children) =
+        forkchoice_store(blocks, pool, validators, seed_equivocators, set_determined);
     let tree = BlockTree { parents: &parents };
     fc.head_reference(&tree, justified, &children)
 }
@@ -2752,6 +2831,26 @@ fn forkchoice_store<'a>(
     blocks: &BTreeMap<[u8; 32], BlockEnvelope>,
     pool: impl Iterator<Item = &'a Attestation>,
     validators: &[bloch_pos_committee::sample::Validator],
+    // Validators the CANONICAL state already committed as equivocators
+    // (`StateReader::fc_equivocators`), so the head never counts weight the
+    // chain has struck out. Needs no flag day: nothing downstream of here is
+    // committed to a root, and `transition::accumulate_forkchoice` already
+    // applies this same bar on its own side (it skips barred attestations
+    // outright) — the transition honoured the field and the node's head
+    // computation did not, which is the asymmetry this closes.
+    //
+    // It is the same CLASS of input as `validators` directly above: a value
+    // read from the one state this node has validated, not from whatever a
+    // competing branch asserts. That is what makes it convergent rather than
+    // node-local noise — two nodes on the same chain seed the same set.
+    //
+    // Honest bound, because it is not unconditional: two nodes whose canonical
+    // chains committed DIFFERENT bars can be split by this where unseeded they
+    // agreed, and that is reachable only when the legacy fold masks the pair
+    // both are holding. `seeding_splits_two_nodes_only_where_the_legacy_fold_masks_the_pair`
+    // builds that case and shows `set_determined` removing it, which is the
+    // sense in which the two changes compose rather than merely coexist.
+    seed_equivocators: &BTreeSet<u32>,
     // Apply the set-determined fold instead of the legacy arrival-order one.
     // Gated by `FORKCHOICE_SET_DETERMINED_ACTIVATION_EPOCH` at the call site;
     // see the fork-safety argument on that constant.
@@ -2782,6 +2881,21 @@ fn forkchoice_store<'a>(
     // has validated — exactly as Ethereum weights by the justified state.
     for v in validators {
         fc.set_stake(v.index, v.effective_stake);
+    }
+    // Seeded before the fold so `Store::observe` can return early on a barred
+    // validator instead of doing work whose result is discarded.
+    //
+    // That is a cost argument and NOT a correctness one, which is worth saying
+    // because the comment here originally claimed otherwise. Moving this loop
+    // below both fold phases was tried, and every test in
+    // `forkchoice_tests` still passed: `Store::bar` removes the stored latest
+    // message as well as inserting into the bar, so a validator barred after
+    // the fold carries exactly as little weight as one barred before it. The
+    // position becomes load-bearing only if `bar` ever stops clearing
+    // `latest` — which is why `bar` does both in one place rather than
+    // leaving the caller to remember the second half.
+    for v in seed_equivocators {
+        fc.bar(*v);
     }
     for env in blocks.values() {
         for att in &env.body.attestations {
@@ -3179,7 +3293,7 @@ mod forkchoice_tests {
             attest(3, 1, b1),
         ];
 
-        let head = lmd_ghost_head(&blocks, pool.iter(), &validators, g, false);
+        let head = lmd_ghost_head(&blocks, pool.iter(), &validators, g, &no_bar(), false);
         assert_eq!(
             head, b1,
             "fork choice followed length instead of attested weight — LMD-GHOST is not wired"
@@ -3194,7 +3308,7 @@ mod forkchoice_tests {
             attest(3, 1, b1),
         ];
         assert_eq!(
-            lmd_ghost_head(&blocks, pool_flipped.iter(), &validators, g, false),
+            lmd_ghost_head(&blocks, pool_flipped.iter(), &validators, g, &no_bar(), false),
             a3
         );
     }
@@ -3222,9 +3336,9 @@ mod forkchoice_tests {
 
         let validators = vals(4);
         let mut pool = vec![attest(0, 1, a1), attest(1, 1, b1), attest(2, 1, b1)];
-        let first = lmd_ghost_head(&blocks, pool.iter(), &validators, g, false);
+        let first = lmd_ghost_head(&blocks, pool.iter(), &validators, g, &no_bar(), false);
         pool.reverse();
-        let second = lmd_ghost_head(&blocks, pool.iter(), &validators, g, false);
+        let second = lmd_ghost_head(&blocks, pool.iter(), &validators, g, &no_bar(), false);
         assert_eq!(first, second);
     }
 
@@ -3245,7 +3359,7 @@ mod forkchoice_tests {
         let validators = vals(1);
         let mut pool = vec![attest(0, 1, a1)];
         pool.extend((100..150u32).map(|v| attest(v, 1, b1)));
-        assert_eq!(lmd_ghost_head(&blocks, pool.iter(), &validators, g, false), a1);
+        assert_eq!(lmd_ghost_head(&blocks, pool.iter(), &validators, g, &no_bar(), false), a1);
     }
 
     /// An equivocator is barred entirely, not counted for either side. With the
@@ -3263,7 +3377,7 @@ mod forkchoice_tests {
         let validators = vals(2);
         // Validator 1 signs both heads in the same slot; validator 0 backs a1.
         let pool = vec![attest(0, 1, a1), attest(1, 1, a1), attest(1, 1, b1)];
-        let head = lmd_ghost_head(&blocks, pool.iter(), &validators, g, false);
+        let head = lmd_ghost_head(&blocks, pool.iter(), &validators, g, &no_bar(), false);
         assert_eq!(
             head, a1,
             "the equivocator was counted, or the honest vote was dropped"
@@ -3346,13 +3460,13 @@ mod forkchoice_tests {
             // NODE A — has imported the carrier block. `later` is in a body.
             let mut blocks_a = siblings.clone();
             blocks_a.extend(carrier);
-            let head_a = lmd_ghost_head(&blocks_a, pool_common.values(), &heavy, g, false);
+            let head_a = lmd_ghost_head(&blocks_a, pool_common.values(), &heavy, g, &no_bar(), false);
 
             // NODE B — has not seen the carrier yet, but did receive the same
             // attestation over gossip, so it sits in the pool.
             let mut pool_b = pool_common.clone();
             pool_b.insert((later.validator, later.data.signing_root()), later.clone());
-            let head_b = lmd_ghost_head(&siblings, pool_b.values(), &heavy, g, false);
+            let head_b = lmd_ghost_head(&siblings, pool_b.values(), &heavy, g, &no_bar(), false);
 
             // Guard: the carrier block itself carries no weight, so it can
             // never be the head and cannot be what makes the two differ.
@@ -3365,8 +3479,8 @@ mod forkchoice_tests {
                 }
                 // And the fix closes exactly this instance.
                 assert_eq!(
-                    lmd_ghost_head(&blocks_a, pool_common.values(), &heavy, g, true),
-                    lmd_ghost_head(&siblings, pool_b.values(), &heavy, g, true),
+                    lmd_ghost_head(&blocks_a, pool_common.values(), &heavy, g, &no_bar(), true),
+                    lmd_ghost_head(&siblings, pool_b.values(), &heavy, g, &no_bar(), true),
                     "the set-determined fold still splits the two nodes"
                 );
             }
@@ -3382,6 +3496,457 @@ mod forkchoice_tests {
             "block/pool phase split produced divergent heads in {found}/{tried} \
              randomised block layouts from the IDENTICAL attestation set"
         );
+    }
+
+
+    // ── The committed equivocator bar, seeded into the node's fork choice ───
+
+    /// The bar the chain committed, with no seed. Fork choice is a free
+    /// function; this is what the production call site passes when the
+    /// canonical state has struck nobody out, and it is what mainnet passes
+    /// today.
+    fn no_bar() -> BTreeSet<u32> {
+        BTreeSet::new()
+    }
+
+    fn bar(vs: &[u32]) -> BTreeSet<u32> {
+        vs.iter().copied().collect()
+    }
+
+    /// **VERIFY BY VIOLATING — the seeded bar picks a different head.**
+    ///
+    /// Validator 0 holds 100 of the 101 active stake and equivocated at slot
+    /// 5. The chain noticed: its `fc_equivocators` carries validator 0, and
+    /// that verdict is hashed into every state root since. This node,
+    /// however, is holding only ONE half of the pair — the block carrying the
+    /// other half is not in `blocks` (pruned, or it simply never arrived) —
+    /// so its own fold has no pair to find and counts all 100 of that stake
+    /// toward whichever branch the surviving half named.
+    ///
+    /// Unseeded, the head is the equivocator's branch. Seeded, it is the one
+    /// honest validator's, on a single satoshi of stake. Same blocks, same
+    /// pool, same validator set, same justified root: the seed is the only
+    /// difference, and it decides the head. A mitigation that never changes
+    /// an outcome is not a mitigation, so this asserts the change, not merely
+    /// the absence of a crash.
+    #[test]
+    fn the_committed_bar_decides_the_head_that_the_fold_alone_would_not() {
+        let g = [0x99u8; 32];
+        let heavy = vec![
+            Validator { index: 0, effective_stake: 100 },
+            Validator { index: 1, effective_stake: 1 },
+        ];
+        let (blocks, ids) = chain_of(vec![
+            (g, 1, 0, vec![]),
+            (g, 1, 64, vec![]),
+            (g, 1, 128, vec![]),
+        ]);
+        let (a, b) = (ids[0], ids[1]);
+
+        // The half this node kept. Its twin, `attest(0, 5, b)`, is the one the
+        // chain also saw and this node no longer holds.
+        let surviving_half = attest(0, 5, a);
+        let honest = attest(1, 6, b);
+        let pool = vec![surviving_half, honest];
+
+        let unseeded = lmd_ghost_head(&blocks, pool.iter(), &heavy, g, &no_bar(), false);
+        let seeded = lmd_ghost_head(&blocks, pool.iter(), &heavy, g, &bar(&[0]), false);
+
+        assert_eq!(
+            unseeded, a,
+            "without the seed the equivocator's 100 stake still steers the head"
+        );
+        assert_eq!(
+            seeded, b,
+            "with the seed the head is the honest validator's branch"
+        );
+        assert_ne!(
+            unseeded, seeded,
+            "the seed changed nothing — then it is not a mitigation"
+        );
+
+        // The bar is a floor, not a re-derivation: it does not depend on which
+        // half of the pair survived, which is the whole point of reading a
+        // verdict instead of recomputing one.
+        let other_half = vec![attest(0, 5, b), attest(1, 6, a)];
+        assert_eq!(
+            lmd_ghost_head(&blocks, other_half.iter(), &heavy, g, &bar(&[0]), false),
+            a,
+            "seeded, the head follows the honest vote whichever half survived"
+        );
+        assert_eq!(
+            lmd_ghost_head(&blocks, other_half.iter(), &heavy, g, &no_bar(), false),
+            b,
+            "unseeded, it follows the equivocator either way"
+        );
+    }
+
+    /// **How much of the gap the seed closes.**
+    ///
+    /// Two honest nodes, one committed bar. Node A still holds both blocks of
+    /// the equivocating pair; node B has kept only one — the ordinary
+    /// consequence of pruning, or of a block that never propagated. Unseeded,
+    /// A's fold finds the pair and B's cannot, so the two disagree about who
+    /// is barred and, from there, about the head. Seeded, both read the same
+    /// committed verdict and the disagreement is gone.
+    ///
+    /// Searched over block layouts rather than hand-placed, for the reason
+    /// `two_nodes_with_the_same_attestations_split_on_whether_a_block_arrived`
+    /// gives: the claim is that the split is REACHABLE, and that the seed
+    /// closes it wherever it is reachable — not that one hand-picked marker
+    /// behaves.
+    #[test]
+    fn the_seed_closes_the_split_when_one_node_no_longer_holds_the_pair() {
+        let g = [0x99u8; 32];
+        let heavy = vec![
+            Validator { index: 0, effective_stake: 100 },
+            Validator { index: 1, effective_stake: 1 },
+        ];
+
+        let mut split_unseeded = 0usize;
+        let mut split_seeded = 0usize;
+        let mut tried = 0usize;
+        for marker in 0u8..60 {
+            tried += 1;
+            let (siblings, ids) = chain_of(vec![
+                (g, 1, marker, vec![]),
+                (g, 1, marker.wrapping_add(64), vec![]),
+                (g, 1, marker.wrapping_add(128), vec![]),
+            ]);
+            let (a, b) = (ids[0], ids[1]);
+
+            let eq_a = attest(0, 5, a);
+            let eq_b = attest(0, 5, b);
+            let honest = attest(1, 6, b);
+
+            // Both halves reached the chain, so the chain barred validator 0
+            // and every node that validated those blocks committed it.
+            let committed = bar(&[0]);
+
+            // NODE A — still holds the block carrying the second half.
+            let (carrier, _) = chain_of(vec![(
+                g,
+                2,
+                marker.wrapping_add(192),
+                vec![eq_b.clone()],
+            )]);
+            let mut blocks_a = siblings.clone();
+            blocks_a.extend(carrier);
+            let pool_a = vec![eq_a.clone(), honest.clone()];
+
+            // NODE B — pruned it. Identical committed state, one block short.
+            let blocks_b = siblings.clone();
+            let pool_b = vec![eq_a.clone(), honest.clone()];
+
+            let ua = lmd_ghost_head(&blocks_a, pool_a.iter(), &heavy, g, &no_bar(), false);
+            let ub = lmd_ghost_head(&blocks_b, pool_b.iter(), &heavy, g, &no_bar(), false);
+            if ua != ub {
+                split_unseeded += 1;
+            }
+
+            let sa = lmd_ghost_head(&blocks_a, pool_a.iter(), &heavy, g, &committed, false);
+            let sb = lmd_ghost_head(&blocks_b, pool_b.iter(), &heavy, g, &committed, false);
+            if sa != sb {
+                split_seeded += 1;
+            }
+        }
+
+        assert!(
+            split_unseeded > 0,
+            "no split found unseeded in {tried} layouts — the scenario stopped \
+             reaching the defect and this test is no longer measuring anything"
+        );
+        assert_eq!(
+            split_seeded, 0,
+            "the seed left {split_seeded} of {split_unseeded} splits open"
+        );
+        eprintln!(
+            "carrier-block asymmetry: {split_unseeded}/{tried} layouts split \
+             unseeded, {split_seeded}/{tried} seeded"
+        );
+    }
+
+    /// **What the seed does NOT close, stated as a test rather than a caveat.**
+    ///
+    /// The committed bar is itself the legacy fold's verdict
+    /// (`transition::accumulate_forkchoice` runs `Store::observe`). So a pair
+    /// the legacy rule never noticed — one masked by a later vote from the
+    /// same validator — is absent from `fc_equivocators` too. There is
+    /// nothing to seed, and the node's head is exactly what it was.
+    ///
+    /// This is the same instance
+    /// `two_nodes_with_the_same_attestations_split_on_whether_a_block_arrived`
+    /// exhibits, re-run with the seed a node in that position could actually
+    /// have. It still splits. Only `set_determined` closes it, and that needs
+    /// the flag day.
+    #[test]
+    fn the_seed_cannot_close_a_pair_the_committed_fold_itself_masked() {
+        let g = [0x99u8; 32];
+        let heavy = vec![
+            Validator { index: 0, effective_stake: 100 },
+            Validator { index: 1, effective_stake: 1 },
+        ];
+
+        let mut split_seeded = 0usize;
+        let mut closed_by_flag_day = 0usize;
+        let mut tried = 0usize;
+        for marker in 0u8..60 {
+            tried += 1;
+            let (siblings, ids) = chain_of(vec![
+                (g, 1, marker, vec![]),
+                (g, 1, marker.wrapping_add(64), vec![]),
+                (g, 1, marker.wrapping_add(128), vec![]),
+            ]);
+            let (a, b, c) = (ids[0], ids[1], ids[2]);
+
+            let eq_a = attest(0, 5, a);
+            let eq_b = attest(0, 5, b);
+            let later = attest(0, 40, c);
+            let honest = attest(1, 6, a);
+
+            let (carrier, _) =
+                chain_of(vec![(g, 41, marker.wrapping_add(192), vec![later.clone()])]);
+
+            let mut pool_common: BTreeMap<(u32, [u8; 32]), Attestation> = BTreeMap::new();
+            for att in [&eq_a, &eq_b, &honest] {
+                pool_common.insert((att.validator, att.data.signing_root()), att.clone());
+            }
+
+            let mut blocks_a = siblings.clone();
+            blocks_a.extend(carrier);
+            let mut pool_b = pool_common.clone();
+            pool_b.insert((later.validator, later.data.signing_root()), later.clone());
+
+            // The masked pair is what the CHAIN folded too, so its committed
+            // bar is empty. Seeding it is seeding nothing.
+            let committed = no_bar();
+
+            let ha = lmd_ghost_head(&blocks_a, pool_common.values(), &heavy, g, &committed, false);
+            let hb = lmd_ghost_head(&siblings, pool_b.values(), &heavy, g, &committed, false);
+            if ha != hb {
+                split_seeded += 1;
+                // The flag-day fold closes exactly this residue.
+                let fa =
+                    lmd_ghost_head(&blocks_a, pool_common.values(), &heavy, g, &committed, true);
+                let fb = lmd_ghost_head(&siblings, pool_b.values(), &heavy, g, &committed, true);
+                if fa == fb {
+                    closed_by_flag_day += 1;
+                }
+            }
+        }
+
+        assert!(
+            split_seeded > 0,
+            "the masked-pair split vanished — then this test is asserting nothing"
+        );
+        assert_eq!(
+            closed_by_flag_day, split_seeded,
+            "the set-determined fold left {} masked splits open",
+            split_seeded - closed_by_flag_day
+        );
+        eprintln!(
+            "masked pair, seeded from committed state: {split_seeded}/{tried} \
+             layouts STILL split; all {closed_by_flag_day} close only under \
+             the set-determined fold"
+        );
+    }
+
+    /// **Where seeding is not free, and what makes it free.**
+    ///
+    /// The honest statement of the risk, built rather than argued. Two nodes
+    /// holding the IDENTICAL block set and the IDENTICAL pool, differing only
+    /// in the committed bar their own canonical chain carries — which is
+    /// reachable, because equivocating does not eject a validator or move the
+    /// justified root, so two siblings can commit different `fc_equivocators`
+    /// off the same checkpoint with the same active set.
+    ///
+    /// Part 1 — the case that is free. The evidence blocks are in the shared
+    /// set, so the node with the empty seed finds the pair in its own fold and
+    /// bars validator 0 anyway. The seed adds nothing either node could
+    /// disagree about, and the heads are equal.
+    ///
+    /// Part 2 — the case that is not. Add the masking vote. Now the fold finds
+    /// nothing on either node, so the seeded node bars and the unseeded node
+    /// does not, and the heads differ where without the seed they agreed.
+    /// Seeding is therefore free *up to the masking defect*, and no further.
+    ///
+    /// Part 3 — and that residue is exactly what the flag day removes. Under
+    /// `set_determined` the fold finds the masked pair itself, both nodes bar
+    /// validator 0 whatever they seed, and the heads agree again. The two
+    /// changes compose: this one closes the resurrection of a committed
+    /// equivocator with no flag day, and the inert one closes the last case in
+    /// which reading the committed bar could itself split two nodes.
+    #[test]
+    fn seeding_splits_two_nodes_only_where_the_legacy_fold_masks_the_pair() {
+        let g = [0x99u8; 32];
+        let heavy = vec![
+            Validator { index: 0, effective_stake: 100 },
+            Validator { index: 1, effective_stake: 1 },
+        ];
+        let (siblings, ids) = chain_of(vec![
+            (g, 1, 7, vec![]),
+            (g, 1, 71, vec![]),
+            (g, 1, 135, vec![]),
+        ]);
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+
+        let eq_a = attest(0, 5, a);
+        let eq_b = attest(0, 5, b);
+        let honest = attest(1, 6, b);
+
+        // Node A's chain committed the bar; node B's sibling chain did not.
+        let (seed_a, seed_b) = (bar(&[0]), no_bar());
+
+        // ── Part 1: both halves visible to the fold. ────────────────────────
+        let pool: Vec<Attestation> = vec![eq_a.clone(), eq_b.clone(), honest.clone()];
+        let ha = lmd_ghost_head(&siblings, pool.iter(), &heavy, g, &seed_a, false);
+        let hb = lmd_ghost_head(&siblings, pool.iter(), &heavy, g, &seed_b, false);
+        assert_eq!(
+            ha, hb,
+            "with the pair in the shared set, the fold bars validator 0 on the \
+             node that seeded nothing, so the seed cannot split them"
+        );
+
+        // ── Part 2: the same set, plus a masking vote in a BLOCK BODY. ──────
+        //
+        // The masking vote has to be folded before the pair, and neither node
+        // gets to choose that: `forkchoice_store` folds every block body first
+        // and the loose pool second, so a slot-40 vote carried by a block is
+        // folded ahead of a slot-5 pair sitting in the pool. Both halves then
+        // fall to the `prev.slot >= msg.slot` arm and the bar never fires.
+        // Putting the same three messages in one `Vec` does NOT reproduce this
+        // — the pair lands adjacent and the equivocation arm catches it — and
+        // an earlier version of this test made exactly that mistake and
+        // concluded, wrongly, that the seed could never split two nodes.
+        let (carrier, _) = chain_of(vec![(g, 41, 199, vec![attest(0, 40, c)])]);
+        let mut shared = siblings.clone();
+        shared.extend(carrier);
+        let masked: Vec<Attestation> = vec![eq_a.clone(), eq_b.clone(), honest.clone()];
+
+        let ma = lmd_ghost_head(&shared, masked.iter(), &heavy, g, &seed_a, false);
+        let mb = lmd_ghost_head(&shared, masked.iter(), &heavy, g, &seed_b, false);
+        let unseeded_both = lmd_ghost_head(&shared, masked.iter(), &heavy, g, &no_bar(), false);
+        assert_eq!(
+            mb, unseeded_both,
+            "the empty seed must be the unseeded answer, or part 2 is measuring \
+             something else"
+        );
+        assert_ne!(
+            ma, mb,
+            "the masked pair is the case where the seed CAN split two nodes; if \
+             this stopped holding, say so rather than deleting the caveat"
+        );
+
+        // ── Part 3: the flag-day fold removes the residue. ──────────────────
+        let fa = lmd_ghost_head(&shared, masked.iter(), &heavy, g, &seed_a, true);
+        let fb = lmd_ghost_head(&shared, masked.iter(), &heavy, g, &seed_b, true);
+        assert_eq!(
+            fa, fb,
+            "under the set-determined fold both nodes find the pair themselves, \
+             so the seed is free unconditionally"
+        );
+    }
+
+    /// **The rollout is a no-op on a chain that has barred nobody.**
+    ///
+    /// `fc_equivocators` is empty on Genesis-4 mainnet as of this commit, so
+    /// every seeded call is passing the empty set, and this pins that the
+    /// empty set is not merely *usually* the old answer but bit-identically
+    /// it, over randomised DAGs and both folds. That is what lets the binary
+    /// go out one node at a time with no flag day and no coordination: a node
+    /// carrying this code and a node without it compute the same head from the
+    /// same inputs until the chain actually commits an equivocator, and from
+    /// that moment the whole fleet reads the same committed set.
+    #[test]
+    fn an_empty_seed_is_bit_identical_to_the_unseeded_fold() {
+        let mut rng = Rng(0xB10C_0004);
+        for case in 0..64u32 {
+            let g = [0x99u8; 32];
+            let validators = vals(6);
+            let mut specs: Vec<([u8; 32], u64, u8, Vec<Attestation>)> = Vec::new();
+            let mut roots = vec![g];
+            for i in 0..12u64 {
+                let parent = roots[(rng.next_u64() as usize) % roots.len()];
+                specs.push((parent, i + 1, (rng.next_u64() % 256) as u8, Vec::new()));
+                // The id is not known until `chain_of` runs; parents are picked
+                // from what exists so far, which is enough to make a DAG.
+                roots.push(g);
+            }
+            let (blocks, ids) = chain_of(specs);
+            let mut pool: Vec<Attestation> = Vec::new();
+            for v in 0..6u32 {
+                let slot = 1 + rng.next_u64() % 12;
+                let head = ids[(rng.next_u64() as usize) % ids.len()];
+                pool.push(attest(v, slot, head));
+            }
+            for set_determined in [false, true] {
+                assert_eq!(
+                    lmd_ghost_head(&blocks, pool.iter(), &validators, g, &no_bar(), set_determined),
+                    lmd_ghost_head_reference(
+                        &blocks,
+                        pool.iter(),
+                        &validators,
+                        g,
+                        &no_bar(),
+                        set_determined
+                    ),
+                    "case {case}: the empty seed disagreed with the reference fold"
+                );
+            }
+        }
+    }
+
+    /// **`advance`'s memo must be able to see a newly committed bar.**
+    ///
+    /// `Engine::advance` skips recomputing the head whenever
+    /// [`ForkChoiceInputs`] is unchanged, and that shortcut is only sound if
+    /// the fingerprint covers everything `lmd_ghost_head` reads. Seeding added
+    /// a fifth input, and the failure it would cause is silent rather than
+    /// loud: `apply_canonical` can commit a new equivocator without moving the
+    /// justified root, without changing `blocks.len()` or the pool count, and
+    /// without altering the active set — equivocating does not eject anyone by
+    /// itself — so all four original fields would compare equal, the memo
+    /// would report a hit, and the node would keep steering by a head computed
+    /// under the stale bar for the rest of the loop.
+    ///
+    /// There is no assertion inside `advance` that would catch that, so the
+    /// guard is pinned here instead: two fingerprints that differ ONLY in the
+    /// committed bar must not compare equal.
+    #[test]
+    fn the_forkchoice_memo_distinguishes_a_newly_committed_bar() {
+        let base = ForkChoiceInputs {
+            blocks: 12,
+            pool: 5,
+            justified: [0x11u8; 32],
+            validators: vals(4),
+            fc_equivocators: no_bar(),
+        };
+        let after_a_bar = ForkChoiceInputs {
+            fc_equivocators: bar(&[3]),
+            ..ForkChoiceInputs {
+                blocks: 12,
+                pool: 5,
+                justified: [0x11u8; 32],
+                validators: vals(4),
+                fc_equivocators: no_bar(),
+            }
+        };
+        assert!(
+            base != after_a_bar,
+            "the memo cannot tell that the chain barred a validator, so \
+             `advance` will serve a head computed under the old bar"
+        );
+
+        // Control: identical inputs still compare equal, so the field has not
+        // simply broken the memo into never hitting.
+        let same = ForkChoiceInputs {
+            blocks: 12,
+            pool: 5,
+            justified: [0x11u8; 32],
+            validators: vals(4),
+            fc_equivocators: no_bar(),
+        };
+        assert!(base == same, "the memo stopped recognising identical inputs");
     }
 
     // ── The 2026-08-23 rewrite, checked from the node's own entry point ─────
@@ -3483,8 +4048,8 @@ mod forkchoice_tests {
 
             for justified in [g, ids[rng.below(ids.len() as u64) as usize]] {
                 assert_eq!(
-                    lmd_ghost_head(&blocks, pool.iter(), &validators, justified, false),
-                    lmd_ghost_head_reference(&blocks, pool.iter(), &validators, justified, false),
+                    lmd_ghost_head(&blocks, pool.iter(), &validators, justified, &no_bar(), false),
+                    lmd_ghost_head_reference(&blocks, pool.iter(), &validators, justified, &no_bar(), false),
                     "round {round}: the rewritten fork choice selected a \
                      different head than the one it replaced"
                 );
@@ -3521,8 +4086,8 @@ mod forkchoice_tests {
         let with_pool: Vec<Attestation> = carried.clone();
         let without_pool: Vec<Attestation> = Vec::new();
         assert_eq!(
-            lmd_ghost_head(&blocks, with_pool.iter(), &validators, g, false),
-            lmd_ghost_head(&blocks, without_pool.iter(), &validators, g, false),
+            lmd_ghost_head(&blocks, with_pool.iter(), &validators, g, &no_bar(), false),
+            lmd_ghost_head(&blocks, without_pool.iter(), &validators, g, &no_bar(), false),
             "dropping from the pool an attestation the stored block {} still \
              carries moved the head — `fc_covered_removals` would be unsound",
             crate::codec::hex8(&carrier)
@@ -3544,12 +4109,12 @@ mod forkchoice_tests {
         };
         let loose = vec![attest(0, 1, smaller)];
         assert_eq!(
-            lmd_ghost_head(&bare, loose.iter(), &validators, g, false),
+            lmd_ghost_head(&bare, loose.iter(), &validators, g, &no_bar(), false),
             smaller,
             "the loose vote did not carry its block"
         );
         assert_eq!(
-            lmd_ghost_head(&bare, [].iter(), &validators, g, false),
+            lmd_ghost_head(&bare, [].iter(), &validators, g, &no_bar(), false),
             larger,
             "the control is not controlling: dropping an uncarried \
              attestation must be able to move the head, or the epoch `retain` \
@@ -3602,11 +4167,11 @@ mod forkchoice_tests {
                 .collect();
 
             let t = Instant::now();
-            let new_head = lmd_ghost_head(&blocks, pool.iter(), &validators, g, false);
+            let new_head = lmd_ghost_head(&blocks, pool.iter(), &validators, g, &no_bar(), false);
             let new_ms = t.elapsed().as_secs_f64() * 1000.0;
 
             let t = Instant::now();
-            let old_head = lmd_ghost_head_reference(&blocks, pool.iter(), &validators, g, false);
+            let old_head = lmd_ghost_head_reference(&blocks, pool.iter(), &validators, g, &no_bar(), false);
             let old_ms = t.elapsed().as_secs_f64() * 1000.0;
 
             // Split the surviving cost, because there are two of them and only
@@ -3616,7 +4181,7 @@ mod forkchoice_tests {
             // chain length), and `Store::head` then walks it. Reporting the
             // total alone would hide which one is left.
             let t = Instant::now();
-            let (fc, parents, children) = forkchoice_store(&blocks, pool.iter(), &validators, false);
+            let (fc, parents, children) = forkchoice_store(&blocks, pool.iter(), &validators, &no_bar(), false);
             let build_ms = t.elapsed().as_secs_f64() * 1000.0;
             let tree = BlockTree { parents: &parents };
             let t = Instant::now();
@@ -4091,6 +4656,7 @@ mod transfer_v2_end_to_end {
             ws_anchor_hard: false,
             ws_conflict_reported: false,
             fc_covered_removals: 0,
+            seed_committed_bar: false,
         }
     }
 
@@ -4389,6 +4955,7 @@ mod perf_support {
             // offset the very first comparison against a pool that really is
             // empty.
             fc_covered_removals: 0,
+            seed_committed_bar: false,
         };
         (engine, TestDir(dir))
     }
@@ -6055,6 +6622,7 @@ mod duty_view_anchor {
             ws_anchor_hard: false,
             ws_conflict_reported: false,
             fc_covered_removals: 0,
+            seed_committed_bar: false,
         };
         (engine, dir)
     }

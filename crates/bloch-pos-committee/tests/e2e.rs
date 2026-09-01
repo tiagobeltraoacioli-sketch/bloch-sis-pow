@@ -474,6 +474,11 @@ mod harness {
         fn randao_mix_at(&self, epoch: u64) -> Option<[u8; 32]> {
             self.seed_mixes.get(&epoch).copied()
         }
+        // This harness drives the transition directly and never runs a fork
+        // choice, so it commits no equivocator bar to seed one from.
+        fn fc_equivocators(&self) -> std::collections::BTreeSet<u32> {
+            std::collections::BTreeSet::new()
+        }
         fn finality(&self) -> IFinalityState {
             let conv = |c: FCheckpoint| ICheckpoint { epoch: c.epoch, root: c.root };
             IFinalityState {

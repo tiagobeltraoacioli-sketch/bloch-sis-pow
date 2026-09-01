@@ -94,6 +94,50 @@ impl Store {
         }
     }
 
+    /// Bar a validator the CHAIN has already committed as an equivocator.
+    ///
+    /// This is not a second opinion about who equivocated — it is the verdict
+    /// `transition::accumulate_forkchoice` already wrote into
+    /// `CommittedState::fc_equivocators` and hashed into the state root, handed
+    /// back to the fold that would otherwise re-derive it from scratch.
+    ///
+    /// ## Why the fold cannot be trusted to rediscover it
+    ///
+    /// The committed bar is a fold over *the canonical chain's blocks, in chain
+    /// order, one block at a time, starting from the previous block's committed
+    /// messages*. The node's bar is a fold over *every stored block body in
+    /// block-root order, then the loose pool*. Those are different orders over
+    /// different sets, and [`Store::observe`]'s legacy rule is order-dependent,
+    /// so the node's re-derivation can come out weaker than the chain's. It can
+    /// also come out weaker for reasons that have nothing to do with the fold:
+    /// the block carrying one half of a pair may have been pruned, or never
+    /// have reached this node at all. In every one of those cases the node
+    /// counts, toward the head, the weight of a validator its own committed
+    /// state says is barred forever.
+    ///
+    /// ## Why this needs no flag day
+    ///
+    /// Nothing here is committed. The transition builds its own `Store` and
+    /// seeds it with nothing (`accumulate_forkchoice` re-applies the committed
+    /// bar itself, by skipping barred attestations); this entry point is for
+    /// the node's head computation, which is written to no root. The chain's
+    /// definition of who is barred does not change — only whether the node
+    /// bothers to read it.
+    ///
+    /// Monotone and idempotent: barring is permanent in this store as it is in
+    /// committed state, and `equivocators` is a set.
+    ///
+    /// It clears `latest` as well as setting the bar, and those two halves
+    /// belong together: clearing is what makes the call's POSITION relative to
+    /// the fold irrelevant, so a caller cannot get a different head by seeding
+    /// late. `engine::forkchoice_store` seeds early anyway, for cost — see the
+    /// note there, which records that moving it after both fold phases changed
+    /// no test.
+    pub fn bar(&mut self, validator: u32) {
+        self.latest.remove(&validator);
+        self.equivocators.insert(validator);
+    }
+
     /// Register a validator's effective stake (as committed by the parent
     /// block's state).
     pub fn set_stake(&mut self, validator: u32, effective_stake: u64) {

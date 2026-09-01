@@ -663,6 +663,9 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         ws_anchor_hard: false,
         ws_conflict_reported: false,
         fc_covered_removals: 0,
+        // The bench measures replay throughput, not head selection under
+        // contention, and it must keep measuring what it measured before.
+        seed_committed_bar: false,
         manifest,
     }
 }

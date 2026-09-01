@@ -591,6 +591,23 @@ pub trait StateReader {
 
     /// Justification/finality bookkeeping as of this state.
     fn finality(&self) -> FinalityState;
+
+    /// Validators the chain has **committed** as equivocators — barred from
+    /// LMD-GHOST weight forever (`CommittedState::fc_equivocators`, hashed
+    /// into the state root as `FcEquivocatorRecord`).
+    ///
+    /// It is on this trait rather than reached for as an inherent method
+    /// precisely because of the paragraph at the top: fork choice is a
+    /// consensus rule, the value is already committed state and already
+    /// appears under `StateRoots`, so this is the boundary it is supposed to
+    /// cross. The node's fork choice seeds its store with this set
+    /// (`engine::forkchoice_store`) instead of re-deriving the bar from
+    /// whichever blocks it happens to be holding; see `forkchoice::Store::bar`
+    /// for why re-derivation comes out weaker.
+    ///
+    /// Sorted and deduplicated — a `BTreeSet` at the source — so a caller that
+    /// folds it cannot make the result depend on iteration order.
+    fn fc_equivocators(&self) -> std::collections::BTreeSet<u32>;
 }
 
 // ─── Boundary 1: block production (proposer duties) ─────────────────────────

@@ -168,7 +168,7 @@ fn print_help() {
                zeroes the IP-colocation score penalty, which otherwise\n\
                graylists a whole mesh that shares one proxy address.\n\
          \n\
-                         [--stop-at-slot <n>]\n\
+                         [--stop-at-slot <n>] [--forkchoice-seed-committed-bar]\n\
                          [--ws-checkpoint <file>] [--ws-signer-set <file>]\n\
                          [--carryover <snapshot.tsv>]\n\
                Run a validator node. <dir> must hold validator.key; chain\n\
@@ -794,6 +794,10 @@ fn run_cmd(args: &[String]) {
         p2p_listen.push("/ip4/0.0.0.0/tcp/16400".to_string());
     }
     let stop_at_slot = arg_value(args, "--stop-at-slot").and_then(|s| s.parse::<u64>().ok());
+    // Off unless asked. See `Engine::seed_committed_bar`: on mainnet the
+    // committed bar is 48 of 64 validators, so this changes which head the
+    // node follows and the whole fleet has to flip together.
+    let seed_committed_bar = args.iter().any(|a| a == "--forkchoice-seed-committed-bar");
 
     let ws = ws_boot::WsConfig {
         checkpoint: arg_value(args, "--ws-checkpoint").map(PathBuf::from),
@@ -831,6 +835,7 @@ fn run_cmd(args: &[String]) {
             .unwrap_or(64),
         behind_proxy: args.iter().any(|a| a == "--behind-proxy"),
         stop_at_slot,
+        seed_committed_bar,
         ws,
         // Required exactly when the manifest commits to a carryover; `run`
         // refuses both mismatches rather than defaulting either way.
