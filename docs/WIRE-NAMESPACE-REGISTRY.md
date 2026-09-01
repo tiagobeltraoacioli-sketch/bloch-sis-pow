@@ -366,12 +366,44 @@ next agent does not read the gap as free space and take it.
 
 ## 7. Known registry gaps
 
-1. **No test freezes any frame byte.** Sections 2 and 3 have no `Frozen by`
-   entries because no such test exists. **Verified exhaustively 2026-09-01:** a
-   search for `FRAME_` or `SYNC_TAG_` across every `tests/` directory in mainline
-   *and* all 195 worktrees returns **zero matches**. Not one test anywhere in the
-   repository, merged or unmerged, references a frame byte or a sync tag by name.
-   The gap is total, not partial. The namespace with the weakest compiler
+1. **No test freezes any frame byte *on mainline*. The tests exist and are
+   unmerged.** Sections 2 and 3 have no `Frozen by` entries for that reason.
+
+   **Correction, 2026-09-01 — read this before acting on the earlier wording.**
+   An earlier revision of this file claimed the gap was "total, not partial",
+   on the strength of a search that returned zero matches across every `tests/`
+   directory. **That search was wrong, and wrong in the way this document keeps
+   warning about: it searched by location instead of by content.** Rust unit
+   tests live in `#[cfg(test)] mod tests` *inside* `src/`, so a `tests/`-only
+   sweep cannot see them. `net.rs` has no `#[cfg(test)]` block on mainline, which
+   is what made the false negative look plausible.
+
+   What actually exists, verified by reading the files:
+
+   | Test | Location | Trees carrying it |
+   | --- | --- | --- |
+   | `frame_bytes_are_claimed_exactly_once` | `crates/bloch-pos-node/src/net.rs:825` | `agent-ad3f0cc77273711fd`, `agent-testnet-deliver`, `agent-testnet-spendpath` |
+   | `sync_tags_are_claimed_exactly_once_per_namespace` | `crates/bloch-pos-node/src/p2p.rs:1899` | same three |
+   | `time_and_state_sync_messages_do_not_decode_as_each_other` | `crates/bloch-pos-node/src/p2p.rs:1926` | same three |
+   | `every_wire_tag_is_claimed_exactly_once` | `crates/bloch-pos-committee/src/transition.rs` (~`:8725`) | `agent-a5a0a10bb332b59ca`, `signed-exit-wire`, `exit-churn` |
+
+   They implement §8 almost exactly as specified below — pairwise `assert_ne!`,
+   then a golden-value `assert_eq!` over the whole array, with the two sync
+   halves checked **separately** and the reason documented in the test file
+   (`p2p.rs:1888-1897`). §8 is therefore a **specification of work already done**,
+   and the action is to **merge `agent-ad3f0cc77273711fd`, not to write tests.**
+
+   Three qualifications keep this a live gap rather than a closed one:
+   - Present in **3 of ~65** worktrees, and in **none** of mainline.
+   - **`agent-a58dfe6cc066ef5b3` — the one tree carrying the colliding
+     numbering (C-1, C-2) — has no assertion on any frame or tag value.** The
+     guard and the collision are in different trees, so merge order decides
+     whether the guard ever sees the collision.
+   - The two clock-gate trees `agent-a22395c3fedb01315` and
+     `agent-a2fad5378f9076f04` have a *weak* partial guard
+     (`p2p.rs:~1523`) asserting only that the new time tags differ from the
+     block tags. **It would not have caught C-1.** A partial guard that passes
+     is more dangerous than no guard, because it reads as coverage. The namespace with the weakest compiler
    support has the weakest test support. **PMO ask: one wire-constant golden test
    asserting every `FRAME_*` and `SYNC_TAG_*` value, plus a no-wildcard
    exhaustiveness test over the transaction-tag `match`.** Small, and it converts
@@ -396,9 +428,12 @@ next agent does not read the gap as free space and take it.
 
 ---
 
-## 8. The freezing tests — specification (PMO ask, not yet built)
+## 8. The freezing tests — specification (**built and unmerged**, see §7 gap 1)
 
-§7 gap 1 records that **no test anywhere freezes a frame byte or a sync tag**.
+§7 gap 1 records that no test freezes a frame byte or a sync tag **on mainline**.
+The implementation already exists in `agent-ad3f0cc77273711fd` and matches this
+specification closely; what follows is kept as the normative statement of what
+the tests must assert, and as the acceptance criteria for that merge.
 This section specifies exactly what to build, because "add a test" has already
 been mis-implemented once as a round-trip test, which does not catch a collision:
 encoding and decoding with the *same* wrong constant round-trips perfectly.
