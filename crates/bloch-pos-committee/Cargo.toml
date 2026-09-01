@@ -23,6 +23,11 @@ sha3 = { version = "0.10", default-features = false }
 
 [dev-dependencies]
 hex = "0.4"
+# tests/kat.rs only: the normative vector file (kat/vectors.json) is JSON,
+# and a KAT that parsed it with a hand-rolled reader would be testing the
+# reader. Dev-only — no release build, and no new edge in the workspace
+# graph: serde_json is already a dependency of the node crate.
+serde_json = "1"
 
 # The suite walks 8,192-step SHAKE-256 reveal chains and 256-deep SMTs, so an
 # unoptimized Keccak permutation puts tens of seconds on `cargo test`. Optimize

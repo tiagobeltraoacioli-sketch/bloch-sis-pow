@@ -1,0 +1,1504 @@
+{
+  "_comment": [
+    "NORMATIVE known-answer vectors for bloch-pos-committee.",
+    "Spec: docs/specs/BLOCH-POS-SHA3-LATTICE-MIGRATION.md (§6.1 tags, §6.3 beacon, §12 KATs).",
+    "Any second implementation of these rules validates against THIS file.",
+    "Do not edit by hand. Regenerate only for an intentional consensus change:",
+    "  cargo test --test kat -- --ignored regenerate_vectors",
+    "and review the diff — every changed digest is a consensus break.",
+    "All u64 values are decimal strings so consumers without exact 64-bit integers cannot round them.",
+    "Hashes: SHA3-256 for fixed-length digests, SHAKE-256 (32-byte output) for XOF uses (§6.1)."
+  ],
+  "attestation": [
+    {
+      "head": "0000000000000000000000000000000000000000000000000000000000000000",
+      "name": "all_zero",
+      "signing_root": "01f504949ae5821c6a23e1b0df1e284c21900f6cfafb3dff147745f4967de78b",
+      "slot": "0",
+      "source_epoch": "0",
+      "source_root": "0000000000000000000000000000000000000000000000000000000000000000",
+      "target_epoch": "0",
+      "target_root": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "head": "1111111111111111111111111111111111111111111111111111111111111111",
+      "name": "distinct_fields",
+      "signing_root": "51d92b1259478d1f41245138dd505d788e24b62f94998776afb9ee2dae46e6f3",
+      "slot": "123456789",
+      "source_epoch": "7",
+      "source_root": "2222222222222222222222222222222222222222222222222222222222222222",
+      "target_epoch": "8",
+      "target_root": "3333333333333333333333333333333333333333333333333333333333333333"
+    },
+    {
+      "head": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "name": "max_values",
+      "signing_root": "6638de9f1ce09f3b7fef2289a2c75070ac5d176e8e34eac083789ee50de54473",
+      "slot": "18446744073709551615",
+      "source_epoch": "18446744073709551614",
+      "source_root": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "target_epoch": "18446744073709551615",
+      "target_root": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    }
+  ],
+  "domain_tags": [
+    {
+      "ascii": "BLCH4:BLOCK",
+      "name": "DS_BLOCK",
+      "sha3_256_empty": "bb4fa12a9b756bd3d6960f71373ddaa84fdec03ead8b240918947bebd7eb74d3",
+      "sha3_256_msg": "cf04da3a840ccc6efece2c29293a84faf2e2526dd36eaea60a28cbb4a38d0a72",
+      "shake256_32_empty": "841379c56eb76c98d2a78a236416f65f8cf92ac2500a4a867265f6b3858a4e6a",
+      "shake256_32_msg": "fa9f3e69f3e8e2cf255a1ff5208e7f6a7eedb8914236f97ea702484e04d48102",
+      "tag_hex": "424c4348343a424c4f434b0000000000"
+    },
+    {
+      "ascii": "BLCH4:BODY",
+      "name": "DS_BODY",
+      "sha3_256_empty": "8e8ca0def1b2dec32e308e33571f1bd647c796f19097ffe2c00741846681ce25",
+      "sha3_256_msg": "4c95c4add3cc0b21888c894a2a8f5515a74db111874cbc151f4a7b9b1f3a2b50",
+      "shake256_32_empty": "4a2b1550686011d966845aff95a2346d04b7506e6020e7102a85f7aa082b16e4",
+      "shake256_32_msg": "aba93a745314ea710ddaef2a9838698d733bf392d37fc1a57cedff1e2f41896a",
+      "tag_hex": "424c4348343a424f4459000000000000"
+    },
+    {
+      "ascii": "BLCH4:STATE",
+      "name": "DS_STATE",
+      "sha3_256_empty": "0383b484a4ee26060f7c168007575b820f5f506542b387b655ecd6b7505d47c8",
+      "sha3_256_msg": "0992c5e230df0c9d8f9a4cf3b65f36645cd3a7cedb99d796165cf768e8119da1",
+      "shake256_32_empty": "d97f9ad67143c752ace37d1afb741934a4676d4bcfac441415913cb82d3e932f",
+      "shake256_32_msg": "fb87ca1a56380b68671f9bea668b434c8f822c7cf87d7d799e8ab7d5b678f69a",
+      "tag_hex": "424c4348343a53544154450000000000"
+    },
+    {
+      "ascii": "BLCH4:ATTEST",
+      "name": "DS_ATTEST",
+      "sha3_256_empty": "4f56a7fe89419ef74d5a95c9ba0726e08a146da7b4d01455d50eb440e14bf88c",
+      "sha3_256_msg": "1dd801d15385687d59ba14098e415686ecafe5d669c438143a6dd15afdfc6661",
+      "shake256_32_empty": "d1f289bb6f9434795627a50b1bd871061ff8f0d0fedbb42777e4dcbf295481a0",
+      "shake256_32_msg": "e871902ff186148e1094e61ee5fb2586236c057479cce0545bc8cf7bbc7b07de",
+      "tag_hex": "424c4348343a41545445535400000000"
+    },
+    {
+      "ascii": "BLCH4:RANDAO",
+      "name": "DS_RANDAO",
+      "sha3_256_empty": "55bf4dc9e77c58ca4c0e2df765ad09285d0d35c01370f1d9d2d48dbfde2c5f41",
+      "sha3_256_msg": "7d2681e2604a7a31cc77ef1b64242683dec7c798249338b119c49f6aea8554cb",
+      "shake256_32_empty": "264a88d7af7103b3774f479e2817a78f1ba919d11ffaf2fdb599de288bc52797",
+      "shake256_32_msg": "1c1f7a639c99842cae02e2e4bd9d55793775e29e35b372dae8fc41ed96b880cd",
+      "tag_hex": "424c4348343a52414e44414f00000000"
+    },
+    {
+      "ascii": "BLCH4:SORTIT",
+      "name": "DS_SORTITION",
+      "sha3_256_empty": "7e998d8ad58c6f401bd98558abf758fe51543bef7181cb0006316b157b23e4a4",
+      "sha3_256_msg": "60ff018b9be7cb6f916aee81f0986c9ca9bdd48eecfaee7eec42670de123dbd0",
+      "shake256_32_empty": "71095d9c168b49ada4276bfc4b6515549fbc7e9a633f369f55d91cacbb4af0a6",
+      "shake256_32_msg": "b5405391debc07d01e651aaff5bf325564f2fa37873fc27b2399d11de0b17e1e",
+      "tag_hex": "424c4348343a534f5254495400000000"
+    },
+    {
+      "ascii": "BLCH4:DEPOSIT",
+      "name": "DS_DEPOSIT",
+      "sha3_256_empty": "4bac897cbe81411acefb66a338f65cee672f065fb4d4075136db772ed64a12e6",
+      "sha3_256_msg": "5e06d9462819b438e8ddbf739c09f785866d95ae80f702f0256de716ed0e2fdb",
+      "shake256_32_empty": "cb299b2e98fdff4a275feb9cb3706b95530067f9c8142f8554b527c8ae22ada9",
+      "shake256_32_msg": "a35c793e5ba0a02f1774cea6c6630e5dc8597582a02c131751cce17da9612680",
+      "tag_hex": "424c4348343a4445504f534954000000"
+    },
+    {
+      "ascii": "BLCH4:SLASH",
+      "name": "DS_SLASH",
+      "sha3_256_empty": "12106422fd44cf73b68c302287a9859683023c0b431abc34d1bc104599f36a4d",
+      "sha3_256_msg": "88975ae42b02b922e43369f6ac4cc22f01f1249037d6f6a69795806c46f3a14d",
+      "shake256_32_empty": "f440d55cee163b444b4b891013b51a9e95a4cbbaa3d03bb629029bc083760465",
+      "shake256_32_msg": "f70dc74cdbd2c7160f4ae82d12e641659615eed2f659f7e64028f7a2f30b35e0",
+      "tag_hex": "424c4348343a534c4153480000000000"
+    },
+    {
+      "ascii": "BLCH4:SPEND",
+      "name": "DS_SPEND",
+      "sha3_256_empty": "b24bfc5e133ae5e898ad6eee59cf947d06186beadadf02b99fd2a12b2a0bb8d3",
+      "sha3_256_msg": "daa1c3630009001882f4f65e29f24ea3b7fa69a98f3d3a4d24cbac7cae880efb",
+      "shake256_32_empty": "3c520b1f3a5dd086c03c02b89e9fe9ddd5f696048cf40fd5049c583365ff58af",
+      "shake256_32_msg": "a8530fd46dec8b5eac6c7cf93437660f5cab65d08118f0a6030523905934e244",
+      "tag_hex": "424c4348343a5350454e440000000000"
+    },
+    {
+      "ascii": "BLCH4:TXID",
+      "name": "DS_TXID",
+      "sha3_256_empty": "9b86eb44c1feb0e9264091ca795767f5e539d8e15d37bbbba13286ae2085e1f4",
+      "sha3_256_msg": "de214d965eec111e9f5ffe9aa956958ed1e2b11ffdf6368c981c1e809c2a5148",
+      "shake256_32_empty": "b0c77ce32a7f42acd9ab93b888577b0dabbf14595f8f5633b5237269c85281ed",
+      "shake256_32_msg": "f5987be9cbb04b456876ed634bd4cefe31a715a1722ab95210305860e2c56bb7",
+      "tag_hex": "424c4348343a54584944000000000000"
+    },
+    {
+      "ascii": "BLCH4:PROPOSE",
+      "name": "DS_PROPOSE",
+      "sha3_256_empty": "52a474a1e3bfb4fa6803c55ec9240400eb71441393bd1f90eaa1a3a056aa5b5d",
+      "sha3_256_msg": "8c2350aff262f6df83e394fbca38c0b726078e428ce6a1ad1221892f6267292f",
+      "shake256_32_empty": "c4a2e2e0ddd4870d7859224a6c08c72debbf5d59fec20d53340c596982ed7af8",
+      "shake256_32_msg": "df13ded2077892fead73f2c4cf3f46fd541a6c962876ac71aaeb3c6c104f8032",
+      "tag_hex": "424c4348343a50524f504f5345000000"
+    },
+    {
+      "ascii": "BLCH4:EXIT",
+      "name": "DS_EXIT",
+      "sha3_256_empty": "5a45f0813df0ff8b7ff6680956879dbfa6fec269f3a594c81d70456c1fcd9f49",
+      "sha3_256_msg": "f9e252c31c3933e458cacc3492cdc6b15ad3ba907c88044d1586d929ba3ee299",
+      "shake256_32_empty": "4d89c7e9b1e054f5b2a53c324a740ded3d82527e03b3561cccd07d369c3f493d",
+      "shake256_32_msg": "25cbd3a1907d233089839c2d080ee555e93bf8f3a229236b31074cefba3f0515",
+      "tag_hex": "424c4348343a45584954000000000000"
+    },
+    {
+      "ascii": "BLCH4:WSCKPT",
+      "name": "DS_WSCKPT",
+      "sha3_256_empty": "22ce3499b0dd29b91975bde3950209cb6006f69326d263a3514172a60e938c87",
+      "sha3_256_msg": "9c1b03b02f2ed40f34f85d3f84fc7781515c82aee541707141852c8360380e69",
+      "shake256_32_empty": "99dd0ac1db415cef1fe92164f0c391d9076a1eedc1e7d3b19140b05758e2dc4b",
+      "shake256_32_msg": "b8c31ed2a076d83a2296caa3351db3c007c70aa0a5adeea01d6bff99ef1f7cf0",
+      "tag_hex": "424c4348343a5753434b505400000000"
+    },
+    {
+      "ascii": "BLCH4:COHERE",
+      "name": "DS_COHERENCE",
+      "sha3_256_empty": "6864db68509a7b68065ffa51152a5f73f0d83b97dee81aec6c659da47b3a7cb5",
+      "sha3_256_msg": "7e840abf63f01b902987a5b59d8ceac9707c1b5721c8dae2934198f8355388a0",
+      "shake256_32_empty": "189a20178398ac87d379a0b3ad3b882b4e640e89860d8fca0456d81eb0f0a504",
+      "shake256_32_msg": "169067bb78ed9e176ba3f6124086a7c98aca45af41f142ef7456785750d144ba",
+      "tag_hex": "424c4348343a434f4845524500000000"
+    }
+  ],
+  "hash_message_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+  "randao": {
+    "chain_length_full": "8192",
+    "commitment_full": "829249ca724a570c7d6a08103e7922a27b51cbfec588d58a6750f1827f9ebae0",
+    "initial_mix": "0000000000000000000000000000000000000000000000000000000000000000",
+    "seed": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+    "short_chain": [
+      "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+      "c2b30f8233e61aa4fc732afaf248656eb1fce5f49bd105f655f46f774eff9ca7",
+      "17c6b5c9d826d418d682dd42f142dbc3dbe67651cc954a1316f3fd7e134b7875",
+      "35c46fbf42db524c59b158cbcbdb8d28dff2bf399dd2207711efaf3173fe998e",
+      "ad82ed13cafb03c614c75b95d80bd078e93e2319ef11b63d67101cb2c435f669",
+      "4d87b5f97fa6d2bdd7b0cab566bfc1c23163ae9f3871ee72193195c3449d3be2",
+      "e8d631242decd034b315a0b29b70da9eeb23cef0872b353c5a70a7f6dbc1dce7",
+      "40f81488d0182e031de1eaf50b62c6159ce7f2f9360ba22abaaf307195fe9594",
+      "9da9ee9a22765801bb2054bdf2269c74169491e125f96a18fb2d015dae015b3c"
+    ],
+    "short_chain_length": 8,
+    "steps": [
+      {
+        "commitment": "9da9ee9a22765801bb2054bdf2269c74169491e125f96a18fb2d015dae015b3c",
+        "mix": "671536a7b54f3f9c3e593d4a9e701744a338d7894387c5daf36855aa837eecee",
+        "prev_mix": "0000000000000000000000000000000000000000000000000000000000000000",
+        "reveal": "40f81488d0182e031de1eaf50b62c6159ce7f2f9360ba22abaaf307195fe9594"
+      },
+      {
+        "commitment": "40f81488d0182e031de1eaf50b62c6159ce7f2f9360ba22abaaf307195fe9594",
+        "mix": "4094e3805bb7ebaff372b992ae7a0ef7cc7d57c83813f4c1272b481de60c5860",
+        "prev_mix": "671536a7b54f3f9c3e593d4a9e701744a338d7894387c5daf36855aa837eecee",
+        "reveal": "e8d631242decd034b315a0b29b70da9eeb23cef0872b353c5a70a7f6dbc1dce7"
+      },
+      {
+        "commitment": "e8d631242decd034b315a0b29b70da9eeb23cef0872b353c5a70a7f6dbc1dce7",
+        "mix": "199a9d9c60189f482d688477dde82cd279ec00f3dd88caf75500d2d81d05a7a1",
+        "prev_mix": "4094e3805bb7ebaff372b992ae7a0ef7cc7d57c83813f4c1272b481de60c5860",
+        "reveal": "4d87b5f97fa6d2bdd7b0cab566bfc1c23163ae9f3871ee72193195c3449d3be2"
+      },
+      {
+        "commitment": "4d87b5f97fa6d2bdd7b0cab566bfc1c23163ae9f3871ee72193195c3449d3be2",
+        "mix": "44a55071157b4b9090cb5039d410b34bd08644459a0cb94f042171343cf548b5",
+        "prev_mix": "199a9d9c60189f482d688477dde82cd279ec00f3dd88caf75500d2d81d05a7a1",
+        "reveal": "ad82ed13cafb03c614c75b95d80bd078e93e2319ef11b63d67101cb2c435f669"
+      },
+      {
+        "commitment": "ad82ed13cafb03c614c75b95d80bd078e93e2319ef11b63d67101cb2c435f669",
+        "mix": "deca7650428261c9f18cb772cbf01819f7eb609fadc281137621aa1812cb0e5a",
+        "prev_mix": "44a55071157b4b9090cb5039d410b34bd08644459a0cb94f042171343cf548b5",
+        "reveal": "35c46fbf42db524c59b158cbcbdb8d28dff2bf399dd2207711efaf3173fe998e"
+      },
+      {
+        "commitment": "35c46fbf42db524c59b158cbcbdb8d28dff2bf399dd2207711efaf3173fe998e",
+        "mix": "37db856a508ab8e00f0ea48c3dcd08872a49c06a4f739a6862b5484d60a8fe97",
+        "prev_mix": "deca7650428261c9f18cb772cbf01819f7eb609fadc281137621aa1812cb0e5a",
+        "reveal": "17c6b5c9d826d418d682dd42f142dbc3dbe67651cc954a1316f3fd7e134b7875"
+      },
+      {
+        "commitment": "17c6b5c9d826d418d682dd42f142dbc3dbe67651cc954a1316f3fd7e134b7875",
+        "mix": "ab3a4a87ed45a2c7c813fcf1214e4cf6856a0dca05abe5a48e123947ed6ca1e1",
+        "prev_mix": "37db856a508ab8e00f0ea48c3dcd08872a49c06a4f739a6862b5484d60a8fe97",
+        "reveal": "c2b30f8233e61aa4fc732afaf248656eb1fce5f49bd105f655f46f774eff9ca7"
+      },
+      {
+        "commitment": "c2b30f8233e61aa4fc732afaf248656eb1fce5f49bd105f655f46f774eff9ca7",
+        "mix": "72c8b11964b7dc4aafb05aba6c424e66749353e194f968a3003349be2ea95bac",
+        "prev_mix": "ab3a4a87ed45a2c7c813fcf1214e4cf6856a0dca05abe5a48e123947ed6ca1e1",
+        "reveal": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f"
+      }
+    ]
+  },
+  "sortition": [
+    {
+      "beacon_mix": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "expected": [
+        0,
+        2,
+        3,
+        4,
+        7,
+        8,
+        10,
+        11
+      ],
+      "index": "5",
+      "k": 8,
+      "name": "slot_subcommittee_basic",
+      "role": "slot",
+      "validators": [
+        {
+          "index": 7,
+          "stake": "8000"
+        },
+        {
+          "index": 0,
+          "stake": "1000"
+        },
+        {
+          "index": 3,
+          "stake": "4000"
+        },
+        {
+          "index": 11,
+          "stake": "12000"
+        },
+        {
+          "index": 2,
+          "stake": "3000"
+        },
+        {
+          "index": 9,
+          "stake": "10000"
+        },
+        {
+          "index": 5,
+          "stake": "6000"
+        },
+        {
+          "index": 1,
+          "stake": "2000"
+        },
+        {
+          "index": 10,
+          "stake": "11000"
+        },
+        {
+          "index": 4,
+          "stake": "5000"
+        },
+        {
+          "index": 8,
+          "stake": "9000"
+        },
+        {
+          "index": 6,
+          "stake": "7000"
+        }
+      ]
+    },
+    {
+      "beacon_mix": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "expected": [
+        3,
+        4,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11
+      ],
+      "index": "5",
+      "k": 8,
+      "name": "role_separation_epoch",
+      "role": "epoch",
+      "validators": [
+        {
+          "index": 7,
+          "stake": "8000"
+        },
+        {
+          "index": 0,
+          "stake": "1000"
+        },
+        {
+          "index": 3,
+          "stake": "4000"
+        },
+        {
+          "index": 11,
+          "stake": "12000"
+        },
+        {
+          "index": 2,
+          "stake": "3000"
+        },
+        {
+          "index": 9,
+          "stake": "10000"
+        },
+        {
+          "index": 5,
+          "stake": "6000"
+        },
+        {
+          "index": 1,
+          "stake": "2000"
+        },
+        {
+          "index": 10,
+          "stake": "11000"
+        },
+        {
+          "index": 4,
+          "stake": "5000"
+        },
+        {
+          "index": 8,
+          "stake": "9000"
+        },
+        {
+          "index": 6,
+          "stake": "7000"
+        }
+      ]
+    },
+    {
+      "beacon_mix": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+      "expected": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "index": "0",
+      "k": 128,
+      "name": "epoch_committee_all_serve",
+      "role": "epoch",
+      "validators": [
+        {
+          "index": 0,
+          "stake": "5000"
+        },
+        {
+          "index": 1,
+          "stake": "5000"
+        },
+        {
+          "index": 2,
+          "stake": "5000"
+        },
+        {
+          "index": 3,
+          "stake": "5000"
+        },
+        {
+          "index": 4,
+          "stake": "5000"
+        },
+        {
+          "index": 5,
+          "stake": "5000"
+        },
+        {
+          "index": 6,
+          "stake": "5000"
+        },
+        {
+          "index": 7,
+          "stake": "5000"
+        },
+        {
+          "index": 8,
+          "stake": "5000"
+        },
+        {
+          "index": 9,
+          "stake": "5000"
+        },
+        {
+          "index": 10,
+          "stake": "5000"
+        },
+        {
+          "index": 11,
+          "stake": "5000"
+        },
+        {
+          "index": 12,
+          "stake": "5000"
+        },
+        {
+          "index": 13,
+          "stake": "5000"
+        },
+        {
+          "index": 14,
+          "stake": "5000"
+        },
+        {
+          "index": 15,
+          "stake": "5000"
+        }
+      ]
+    },
+    {
+      "beacon_mix": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+      "expected": [
+        0,
+        1,
+        9,
+        13,
+        16,
+        17,
+        20,
+        22,
+        25,
+        26,
+        28,
+        30,
+        31,
+        32,
+        33,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        50,
+        51,
+        52,
+        55,
+        56,
+        57,
+        58,
+        59,
+        60,
+        61,
+        62,
+        64,
+        65,
+        66,
+        68,
+        69,
+        73,
+        75,
+        76,
+        77,
+        80,
+        81,
+        84,
+        85,
+        86,
+        87,
+        88,
+        89,
+        92,
+        93,
+        94,
+        96,
+        97,
+        98,
+        99,
+        100,
+        101,
+        102,
+        103,
+        104,
+        105,
+        110,
+        112,
+        113,
+        115,
+        116,
+        118,
+        120,
+        123,
+        124,
+        126,
+        128,
+        129,
+        130,
+        131,
+        132,
+        133,
+        136,
+        137,
+        139,
+        141,
+        143,
+        144,
+        145,
+        146,
+        147,
+        148,
+        150,
+        151,
+        152,
+        153,
+        154,
+        156,
+        157,
+        158,
+        159,
+        160,
+        161,
+        162,
+        163,
+        164,
+        165,
+        166,
+        168,
+        169,
+        170,
+        173,
+        174,
+        175,
+        176,
+        177,
+        178,
+        180,
+        181,
+        183,
+        184,
+        186,
+        189,
+        190,
+        191,
+        192,
+        193,
+        194,
+        195,
+        197,
+        198,
+        199
+      ],
+      "index": "42",
+      "k": 128,
+      "name": "epoch_committee_weighted_200",
+      "role": "epoch",
+      "validators": [
+        {
+          "index": 0,
+          "stake": "1000000"
+        },
+        {
+          "index": 1,
+          "stake": "1013337"
+        },
+        {
+          "index": 2,
+          "stake": "1026674"
+        },
+        {
+          "index": 3,
+          "stake": "1040011"
+        },
+        {
+          "index": 4,
+          "stake": "1053348"
+        },
+        {
+          "index": 5,
+          "stake": "1066685"
+        },
+        {
+          "index": 6,
+          "stake": "1080022"
+        },
+        {
+          "index": 7,
+          "stake": "1093359"
+        },
+        {
+          "index": 8,
+          "stake": "1106696"
+        },
+        {
+          "index": 9,
+          "stake": "1120033"
+        },
+        {
+          "index": 10,
+          "stake": "1133370"
+        },
+        {
+          "index": 11,
+          "stake": "1146707"
+        },
+        {
+          "index": 12,
+          "stake": "1160044"
+        },
+        {
+          "index": 13,
+          "stake": "1173381"
+        },
+        {
+          "index": 14,
+          "stake": "1186718"
+        },
+        {
+          "index": 15,
+          "stake": "1200055"
+        },
+        {
+          "index": 16,
+          "stake": "1213392"
+        },
+        {
+          "index": 17,
+          "stake": "1226729"
+        },
+        {
+          "index": 18,
+          "stake": "1240066"
+        },
+        {
+          "index": 19,
+          "stake": "1253403"
+        },
+        {
+          "index": 20,
+          "stake": "1266740"
+        },
+        {
+          "index": 21,
+          "stake": "1280077"
+        },
+        {
+          "index": 22,
+          "stake": "1293414"
+        },
+        {
+          "index": 23,
+          "stake": "1306751"
+        },
+        {
+          "index": 24,
+          "stake": "1320088"
+        },
+        {
+          "index": 25,
+          "stake": "1333425"
+        },
+        {
+          "index": 26,
+          "stake": "1346762"
+        },
+        {
+          "index": 27,
+          "stake": "1360099"
+        },
+        {
+          "index": 28,
+          "stake": "1373436"
+        },
+        {
+          "index": 29,
+          "stake": "1386773"
+        },
+        {
+          "index": 30,
+          "stake": "1400110"
+        },
+        {
+          "index": 31,
+          "stake": "1413447"
+        },
+        {
+          "index": 32,
+          "stake": "1426784"
+        },
+        {
+          "index": 33,
+          "stake": "1440121"
+        },
+        {
+          "index": 34,
+          "stake": "1453458"
+        },
+        {
+          "index": 35,
+          "stake": "1466795"
+        },
+        {
+          "index": 36,
+          "stake": "1480132"
+        },
+        {
+          "index": 37,
+          "stake": "1493469"
+        },
+        {
+          "index": 38,
+          "stake": "1506806"
+        },
+        {
+          "index": 39,
+          "stake": "1520143"
+        },
+        {
+          "index": 40,
+          "stake": "1533480"
+        },
+        {
+          "index": 41,
+          "stake": "1546817"
+        },
+        {
+          "index": 42,
+          "stake": "1560154"
+        },
+        {
+          "index": 43,
+          "stake": "1573491"
+        },
+        {
+          "index": 44,
+          "stake": "1586828"
+        },
+        {
+          "index": 45,
+          "stake": "1600165"
+        },
+        {
+          "index": 46,
+          "stake": "1613502"
+        },
+        {
+          "index": 47,
+          "stake": "1626839"
+        },
+        {
+          "index": 48,
+          "stake": "1640176"
+        },
+        {
+          "index": 49,
+          "stake": "1653513"
+        },
+        {
+          "index": 50,
+          "stake": "1666850"
+        },
+        {
+          "index": 51,
+          "stake": "1680187"
+        },
+        {
+          "index": 52,
+          "stake": "1693524"
+        },
+        {
+          "index": 53,
+          "stake": "1706861"
+        },
+        {
+          "index": 54,
+          "stake": "1720198"
+        },
+        {
+          "index": 55,
+          "stake": "1733535"
+        },
+        {
+          "index": 56,
+          "stake": "1746872"
+        },
+        {
+          "index": 57,
+          "stake": "1760209"
+        },
+        {
+          "index": 58,
+          "stake": "1773546"
+        },
+        {
+          "index": 59,
+          "stake": "1786883"
+        },
+        {
+          "index": 60,
+          "stake": "1800220"
+        },
+        {
+          "index": 61,
+          "stake": "1813557"
+        },
+        {
+          "index": 62,
+          "stake": "1826894"
+        },
+        {
+          "index": 63,
+          "stake": "1840231"
+        },
+        {
+          "index": 64,
+          "stake": "1853568"
+        },
+        {
+          "index": 65,
+          "stake": "1866905"
+        },
+        {
+          "index": 66,
+          "stake": "1880242"
+        },
+        {
+          "index": 67,
+          "stake": "1893579"
+        },
+        {
+          "index": 68,
+          "stake": "1906916"
+        },
+        {
+          "index": 69,
+          "stake": "1920253"
+        },
+        {
+          "index": 70,
+          "stake": "1933590"
+        },
+        {
+          "index": 71,
+          "stake": "1946927"
+        },
+        {
+          "index": 72,
+          "stake": "1960264"
+        },
+        {
+          "index": 73,
+          "stake": "1973601"
+        },
+        {
+          "index": 74,
+          "stake": "1986938"
+        },
+        {
+          "index": 75,
+          "stake": "2000275"
+        },
+        {
+          "index": 76,
+          "stake": "2013612"
+        },
+        {
+          "index": 77,
+          "stake": "2026949"
+        },
+        {
+          "index": 78,
+          "stake": "2040286"
+        },
+        {
+          "index": 79,
+          "stake": "2053623"
+        },
+        {
+          "index": 80,
+          "stake": "2066960"
+        },
+        {
+          "index": 81,
+          "stake": "2080297"
+        },
+        {
+          "index": 82,
+          "stake": "2093634"
+        },
+        {
+          "index": 83,
+          "stake": "2106971"
+        },
+        {
+          "index": 84,
+          "stake": "2120308"
+        },
+        {
+          "index": 85,
+          "stake": "2133645"
+        },
+        {
+          "index": 86,
+          "stake": "2146982"
+        },
+        {
+          "index": 87,
+          "stake": "2160319"
+        },
+        {
+          "index": 88,
+          "stake": "2173656"
+        },
+        {
+          "index": 89,
+          "stake": "2186993"
+        },
+        {
+          "index": 90,
+          "stake": "2200330"
+        },
+        {
+          "index": 91,
+          "stake": "2213667"
+        },
+        {
+          "index": 92,
+          "stake": "2227004"
+        },
+        {
+          "index": 93,
+          "stake": "2240341"
+        },
+        {
+          "index": 94,
+          "stake": "2253678"
+        },
+        {
+          "index": 95,
+          "stake": "2267015"
+        },
+        {
+          "index": 96,
+          "stake": "2280352"
+        },
+        {
+          "index": 97,
+          "stake": "2293689"
+        },
+        {
+          "index": 98,
+          "stake": "2307026"
+        },
+        {
+          "index": 99,
+          "stake": "2320363"
+        },
+        {
+          "index": 100,
+          "stake": "2333700"
+        },
+        {
+          "index": 101,
+          "stake": "2347037"
+        },
+        {
+          "index": 102,
+          "stake": "2360374"
+        },
+        {
+          "index": 103,
+          "stake": "2373711"
+        },
+        {
+          "index": 104,
+          "stake": "2387048"
+        },
+        {
+          "index": 105,
+          "stake": "2400385"
+        },
+        {
+          "index": 106,
+          "stake": "2413722"
+        },
+        {
+          "index": 107,
+          "stake": "2427059"
+        },
+        {
+          "index": 108,
+          "stake": "2440396"
+        },
+        {
+          "index": 109,
+          "stake": "2453733"
+        },
+        {
+          "index": 110,
+          "stake": "2467070"
+        },
+        {
+          "index": 111,
+          "stake": "2480407"
+        },
+        {
+          "index": 112,
+          "stake": "2493744"
+        },
+        {
+          "index": 113,
+          "stake": "2507081"
+        },
+        {
+          "index": 114,
+          "stake": "2520418"
+        },
+        {
+          "index": 115,
+          "stake": "2533755"
+        },
+        {
+          "index": 116,
+          "stake": "2547092"
+        },
+        {
+          "index": 117,
+          "stake": "2560429"
+        },
+        {
+          "index": 118,
+          "stake": "2573766"
+        },
+        {
+          "index": 119,
+          "stake": "2587103"
+        },
+        {
+          "index": 120,
+          "stake": "2600440"
+        },
+        {
+          "index": 121,
+          "stake": "2613777"
+        },
+        {
+          "index": 122,
+          "stake": "2627114"
+        },
+        {
+          "index": 123,
+          "stake": "2640451"
+        },
+        {
+          "index": 124,
+          "stake": "2653788"
+        },
+        {
+          "index": 125,
+          "stake": "2667125"
+        },
+        {
+          "index": 126,
+          "stake": "2680462"
+        },
+        {
+          "index": 127,
+          "stake": "2693799"
+        },
+        {
+          "index": 128,
+          "stake": "2707136"
+        },
+        {
+          "index": 129,
+          "stake": "2720473"
+        },
+        {
+          "index": 130,
+          "stake": "2733810"
+        },
+        {
+          "index": 131,
+          "stake": "2747147"
+        },
+        {
+          "index": 132,
+          "stake": "2760484"
+        },
+        {
+          "index": 133,
+          "stake": "2773821"
+        },
+        {
+          "index": 134,
+          "stake": "2787158"
+        },
+        {
+          "index": 135,
+          "stake": "2800495"
+        },
+        {
+          "index": 136,
+          "stake": "2813832"
+        },
+        {
+          "index": 137,
+          "stake": "2827169"
+        },
+        {
+          "index": 138,
+          "stake": "2840506"
+        },
+        {
+          "index": 139,
+          "stake": "2853843"
+        },
+        {
+          "index": 140,
+          "stake": "2867180"
+        },
+        {
+          "index": 141,
+          "stake": "2880517"
+        },
+        {
+          "index": 142,
+          "stake": "2893854"
+        },
+        {
+          "index": 143,
+          "stake": "2907191"
+        },
+        {
+          "index": 144,
+          "stake": "2920528"
+        },
+        {
+          "index": 145,
+          "stake": "2933865"
+        },
+        {
+          "index": 146,
+          "stake": "2947202"
+        },
+        {
+          "index": 147,
+          "stake": "2960539"
+        },
+        {
+          "index": 148,
+          "stake": "2973876"
+        },
+        {
+          "index": 149,
+          "stake": "2987213"
+        },
+        {
+          "index": 150,
+          "stake": "3000550"
+        },
+        {
+          "index": 151,
+          "stake": "3013887"
+        },
+        {
+          "index": 152,
+          "stake": "3027224"
+        },
+        {
+          "index": 153,
+          "stake": "3040561"
+        },
+        {
+          "index": 154,
+          "stake": "3053898"
+        },
+        {
+          "index": 155,
+          "stake": "3067235"
+        },
+        {
+          "index": 156,
+          "stake": "3080572"
+        },
+        {
+          "index": 157,
+          "stake": "3093909"
+        },
+        {
+          "index": 158,
+          "stake": "3107246"
+        },
+        {
+          "index": 159,
+          "stake": "3120583"
+        },
+        {
+          "index": 160,
+          "stake": "3133920"
+        },
+        {
+          "index": 161,
+          "stake": "3147257"
+        },
+        {
+          "index": 162,
+          "stake": "3160594"
+        },
+        {
+          "index": 163,
+          "stake": "3173931"
+        },
+        {
+          "index": 164,
+          "stake": "3187268"
+        },
+        {
+          "index": 165,
+          "stake": "3200605"
+        },
+        {
+          "index": 166,
+          "stake": "3213942"
+        },
+        {
+          "index": 167,
+          "stake": "3227279"
+        },
+        {
+          "index": 168,
+          "stake": "3240616"
+        },
+        {
+          "index": 169,
+          "stake": "3253953"
+        },
+        {
+          "index": 170,
+          "stake": "3267290"
+        },
+        {
+          "index": 171,
+          "stake": "3280627"
+        },
+        {
+          "index": 172,
+          "stake": "3293964"
+        },
+        {
+          "index": 173,
+          "stake": "3307301"
+        },
+        {
+          "index": 174,
+          "stake": "3320638"
+        },
+        {
+          "index": 175,
+          "stake": "3333975"
+        },
+        {
+          "index": 176,
+          "stake": "3347312"
+        },
+        {
+          "index": 177,
+          "stake": "3360649"
+        },
+        {
+          "index": 178,
+          "stake": "3373986"
+        },
+        {
+          "index": 179,
+          "stake": "3387323"
+        },
+        {
+          "index": 180,
+          "stake": "3400660"
+        },
+        {
+          "index": 181,
+          "stake": "3413997"
+        },
+        {
+          "index": 182,
+          "stake": "3427334"
+        },
+        {
+          "index": 183,
+          "stake": "3440671"
+        },
+        {
+          "index": 184,
+          "stake": "3454008"
+        },
+        {
+          "index": 185,
+          "stake": "3467345"
+        },
+        {
+          "index": 186,
+          "stake": "3480682"
+        },
+        {
+          "index": 187,
+          "stake": "3494019"
+        },
+        {
+          "index": 188,
+          "stake": "3507356"
+        },
+        {
+          "index": 189,
+          "stake": "3520693"
+        },
+        {
+          "index": 190,
+          "stake": "3534030"
+        },
+        {
+          "index": 191,
+          "stake": "3547367"
+        },
+        {
+          "index": 192,
+          "stake": "3560704"
+        },
+        {
+          "index": 193,
+          "stake": "3574041"
+        },
+        {
+          "index": 194,
+          "stake": "3587378"
+        },
+        {
+          "index": 195,
+          "stake": "3600715"
+        },
+        {
+          "index": 196,
+          "stake": "3614052"
+        },
+        {
+          "index": 197,
+          "stake": "3627389"
+        },
+        {
+          "index": 198,
+          "stake": "3640726"
+        },
+        {
+          "index": 199,
+          "stake": "3654063"
+        }
+      ]
+    },
+    {
+      "beacon_mix": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "expected": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "index": "1",
+      "k": 8,
+      "name": "deterministic_fallback_concentrated_stake",
+      "role": "slot",
+      "validators": [
+        {
+          "index": 3,
+          "stake": "9223372036854775807"
+        },
+        {
+          "index": 0,
+          "stake": "1"
+        },
+        {
+          "index": 1,
+          "stake": "1"
+        },
+        {
+          "index": 2,
+          "stake": "1"
+        },
+        {
+          "index": 4,
+          "stake": "1"
+        },
+        {
+          "index": 5,
+          "stake": "1"
+        },
+        {
+          "index": 6,
+          "stake": "1"
+        },
+        {
+          "index": 7,
+          "stake": "1"
+        },
+        {
+          "index": 8,
+          "stake": "1"
+        },
+        {
+          "index": 9,
+          "stake": "1"
+        }
+      ]
+    },
+    {
+      "beacon_mix": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "expected": [
+        1,
+        3,
+        5
+      ],
+      "index": "9",
+      "k": 8,
+      "name": "zero_stake_never_selected",
+      "role": "slot",
+      "validators": [
+        {
+          "index": 0,
+          "stake": "0"
+        },
+        {
+          "index": 1,
+          "stake": "10"
+        },
+        {
+          "index": 2,
+          "stake": "0"
+        },
+        {
+          "index": 3,
+          "stake": "30"
+        },
+        {
+          "index": 4,
+          "stake": "0"
+        },
+        {
+          "index": 5,
+          "stake": "50"
+        }
+      ]
+    }
+  ]
+}
