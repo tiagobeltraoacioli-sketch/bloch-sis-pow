@@ -46,15 +46,27 @@
 //! chain that contradicts its trust anchor; a node that booted on its own
 //! finality treats it as the WS_CONFLICT alarm, never a reorg.
 //!
+//! ## Checkpoint-sync state download (§4.3.2) — WIRED
+//!
+//! An admitted non-genesis anchor is now a *sync starting point*, not only a
+//! floor: after this gate passes, the engine's acquisition phase
+//! (`engine::run`, using `crate::state_sync`) obtains the checkpoint's
+//! committed state — from a local artifact (`--state-snapshot`) or from
+//! peers in verified chunks (`--state-sync`) — and installs it only after
+//! the recomputed state root reproduces the checkpoint's `state_root`
+//! (`transition::snapshot::restore` is the sole constructor and carries the
+//! check; no transport is trusted). Without either flag the node still
+//! replays from genesis under the anchor, and says how to do better.
+//!
 //! ## Honestly not wired (devnet stage)
 //!
-//! Checkpoint-sync state download (§4.3.2) does not exist — this node syncs
-//! by replaying full blocks from genesis, so a non-genesis anchor is a
-//! *floor and cross-check*, not a sync starting point. Consequently the
-//! `RefuseStale` recovery can only establish "checkpoint descends from local
-//! history" against blocks it already has; a fresh checkpoint beyond the
-//! local head halts for the operator instead of header-syncing forward, and
-//! `--ws-accept-reorg` is not implemented.
+//! The `RefuseStale` recovery can still only establish "checkpoint descends
+//! from local history" against blocks the node already has: a node WITH own
+//! (stale) finality whose fresh checkpoint lies beyond its local head halts
+//! for the operator — adopting it would abandon local history, and
+//! `--ws-accept-reorg` is not implemented. State download moves fresh
+//! installs and nodes without finality of their own; it does not overrule
+//! anyone's database.
 
 use std::fs;
 use std::io;
@@ -139,11 +151,10 @@ pub fn decode_checkpoint(bytes: &[u8]) -> Result<WeakSubjectivityCheckpoint, Dec
 /// Encode a distribution envelope: magic ‖ canonical checkpoint ‖ signature
 /// list. This is the node's file framing of the spec's `wscheckpoint-*.bin`
 /// artifact family; the digest signers sign is over the canonical bytes only.
-/// Not called by the node binary — the *publication* side (the signing
-/// ceremony of §6, which is not this program) writes these files and the node
-/// only reads them. It lives next to its decoder anyway, and the round-trip
-/// tests below are what keep the two from drifting into two formats.
-#[allow(dead_code)]
+/// Not called on the node's boot path — the *publication* side (the signing
+/// ceremony of §6, `ws_tool`) writes these files and the boot path only
+/// reads them. Living next to its decoder, with the round-trip tests below,
+/// is what keeps the two from drifting into two formats.
 pub fn encode_envelope_file(env: &CheckpointEnvelope) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(WS_ENVELOPE_MAGIC);
@@ -175,11 +186,11 @@ pub fn decode_envelope_file(bytes: &[u8]) -> Result<CheckpointEnvelope, DecodeEr
     Ok(CheckpointEnvelope { checkpoint, signatures })
 }
 
-/// Encode a signer arrangement (devnet aid — a release build hard-codes the
-/// §6 arrangements next to its pinned genesis, and this file form becomes a
-/// test fixture). Pubkeys are the RAW hybrid halves (`HYBRID_PK_BYTES`), the
-/// form `ws::Signer` carries — not the 4-byte suite envelope.
-#[allow(dead_code)] // written by the release/ceremony side, read by the node.
+/// Encode a signer arrangement (written by the ceremony side, `ws_tool`;
+/// a release build will additionally hard-code the §6 arrangements next to
+/// its pinned genesis, and this file form then becomes a test fixture).
+/// Pubkeys are the RAW hybrid halves (`HYBRID_PK_BYTES`), the form
+/// `ws::Signer` carries — not the 4-byte suite envelope.
 pub fn encode_signer_set_file(set: &SignerSet) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(WS_SIGNER_SET_MAGIC);
@@ -290,6 +301,11 @@ pub struct WsOutcome {
     /// Prominent messages the engine prints (collected so tests can assert
     /// on them instead of scraping stderr).
     pub warnings: Vec<String>,
+    /// The full admitted anchor artifact. `anchor_epoch`/`anchor_root` above
+    /// are its enforcement view; checkpoint-sync state download needs the
+    /// rest — above all `state_root`, which is what a downloaded state must
+    /// reproduce (`state_sync::import`).
+    pub checkpoint: WeakSubjectivityCheckpoint,
 }
 
 fn hex32(b: &[u8; 32]) -> String {
@@ -524,6 +540,7 @@ pub fn boot(
             anchor_root: anchor.block_root,
             anchor_is_hard: !has_local_finality,
             warnings,
+            checkpoint: anchor,
         }),
         Err(msg) => Err(msg),
     })

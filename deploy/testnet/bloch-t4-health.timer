@@ -1,0 +1,10 @@
+# /etc/systemd/system/bloch-t4-health.timer
+[Unit]
+Description=Run the Bloch t4 health probe every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target

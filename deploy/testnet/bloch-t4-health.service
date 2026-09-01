@@ -1,0 +1,9 @@
+# /etc/systemd/system/bloch-t4-health.service
+[Unit]
+Description=Bloch t4 testnet health probe (writes /home/ubuntu/t4/health.json)
+
+[Service]
+Type=oneshot
+User=ubuntu
+Environment=T4DIR=/home/ubuntu/t4
+ExecStart=/home/ubuntu/t4-health.sh
