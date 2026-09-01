@@ -67,12 +67,27 @@ const ARCHIVALS = [
  */
 const ALLOWED = new Set([
   "getchaininfo",
+  "getblockcount",
   "getblockbyslot",
+  "getblockbyid",
   "getvalidator",
   "getvalidatorcount",
+  "getvalidators",
+  "getstakedistribution",
+  "getsupply",
   "getmempoolinfo",
   "getbalance",
+  "getutxos",
   "listunspent",
+  "gettxout",
+  "getcapabilities",
+  // Named on purpose although the node REFUSES both, permanently. Leaving them
+  // out would make this proxy answer "method not allowed" where the node would
+  // have answered NO_TRANSACTION_INDEX / NO_WALLET with its reason. The client
+  // branches on those codes (see CODE in src/lib/source.ts); a proxy-level 403
+  // would send an integrator hunting for a newer binary that does not exist.
+  "gettransaction",
+  "getnewaddress",
 ]);
 
 /**
@@ -98,6 +113,10 @@ const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
+  // `source.ts` reads the answering node out of this header to decide whether
+  // a cross-check was possible at all. Without the expose header the browser
+  // hides it and every pinned read looks unattributed.
+  "Access-Control-Expose-Headers": "x-bloch-source, x-bloch-node-index",
 };
 
 function json(status, body, extraHeaders) {
@@ -144,6 +163,46 @@ export async function onRequestOptions() {
   return new Response(null, { status: 204, headers: CORS });
 }
 
+/**
+ * `POST /g4?node=N` — pinned to ONE archival, no failover, no corroboration.
+ *
+ * This is not a weaker version of the default path; it is what makes the
+ * default path's promise checkable. `agree()` in `src/lib/source.ts` needs two
+ * reads it KNOWS came from different boxes, and a failover pool cannot give
+ * that — ask it twice and it may answer from the same node both times. So the
+ * client pins each of the two reads itself and compares them. The answer is
+ * returned as plain JSON-RPC, with the node it came from stamped in
+ * `x-bloch-node-index`, because a corroboration envelope here would be this
+ * Function asserting agreement it deliberately did not check.
+ */
+async function pinned(nodes, index, forward, id) {
+  const node = nodes[index];
+  if (!node) {
+    return json(400, {
+      jsonrpc: "2.0",
+      id,
+      error: { code: -32602, message: `no archival at index ${index}` },
+    });
+  }
+  const a = await askOne(node, forward);
+  if (!a.ok) {
+    return json(
+      502,
+      { jsonrpc: "2.0", id, error: { code: -32050, message: a.error || "archival did not answer" } },
+      { "x-bloch-source": "none", "x-bloch-node-index": String(index) },
+    );
+  }
+  return json(
+    200,
+    { jsonrpc: "2.0", id, result: a.result },
+    {
+      "x-bloch-source": "archival",
+      "x-bloch-node-index": String(index),
+      "Cache-Control": "no-store",
+    },
+  );
+}
+
 export async function onRequestPost(context) {
   let body;
   try {
@@ -169,6 +228,10 @@ export async function onRequestPost(context) {
     method,
     params: Array.isArray(body.params) ? body.params : [],
   };
+
+  // Pinned read? Answer from exactly that box and say so.
+  const q = new URL(context.request.url).searchParams.get("node");
+  if (q !== null && /^\d+$/.test(q)) return pinned(ARCHIVALS, Number(q), forward, id);
 
   const answers = await Promise.all(ARCHIVALS.map((n) => askOne(n, forward)));
   const live = answers.filter((a) => a.ok);
@@ -248,6 +311,10 @@ export async function onRequestPost(context) {
     },
     // Never cached. A stale finality answer is worse than no answer: the whole
     // point of the page above is that it is showing the chain *now*.
-    { "Cache-Control": "no-store" },
+    {
+      "Cache-Control": "no-store",
+      "x-bloch-source": "archival",
+      "x-bloch-node-index": String(ARCHIVALS.findIndex((n) => n.id === chosen.id)),
+    },
   );
 }

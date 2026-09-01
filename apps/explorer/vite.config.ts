@@ -1,4 +1,4 @@
-import { defineConfig, type Plugin } from "vite";
+import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
 // EXERCISING `/g4` LOCALLY. The finality page reads a same-origin `/g4`, which
@@ -30,54 +30,31 @@ import react from "@vitejs/plugin-react";
 //    different port.
 const RPC_TARGET = process.env.VITE_RPC_TARGET || "http://127.0.0.1:16210";
 
-/**
- * Run the `/g4` Pages Function in dev.
- *
- * Without this, the finality page can only be exercised in replay mode
- * locally: `/g4` exists solely as a Cloudflare Function, so `npm run dev`
- * would 404 it and the live path would never be looked at before deploy. The
- * Function is imported and invoked here rather than reimplemented, so the dev
- * server and production run the same corroboration logic — a second copy would
- * drift, and drift in this particular file means the page starts claiming two
- * nodes agreed when it never asked one of them.
- */
-function g4Function(): Plugin {
-  return {
-    name: "g4-function-dev",
-    configureServer(server) {
-      server.middlewares.use("/g4", async (req, res) => {
-        try {
-          const chunks: Buffer[] = [];
-          for await (const c of req) chunks.push(c as Buffer);
-          const mod = await server.ssrLoadModule("/functions/g4.js");
-          const request = new Request("http://local/g4", {
-            method: req.method,
-            headers: { "content-type": "application/json" },
-            body: req.method === "POST" ? Buffer.concat(chunks) : undefined,
-          });
-          const out =
-            req.method === "OPTIONS"
-              ? await mod.onRequestOptions()
-              : await mod.onRequestPost({ request, env: {} });
-          res.statusCode = out.status;
-          out.headers.forEach((v: string, k: string) => res.setHeader(k, v));
-          res.end(Buffer.from(await out.arrayBuffer()));
-        } catch (e: any) {
-          res.statusCode = 500;
-          res.end(JSON.stringify({ error: { message: String(e?.message ?? e) } }));
-        }
-      });
-    },
-  };
-}
+// The Genesis-4 read upstream for `npm run dev`. An archival, never a
+// validator: the node RPC has no auth or rate limiting and is served by the
+// consensus thread itself.
+const G4_TARGET = process.env.VITE_G4_TARGET || "http://139.180.166.5:8080";
 
 export default defineConfig({
-  plugins: [react(), g4Function()],
+  plugins: [react()],
   server: {
     port: 5273,
     proxy: {
       "/rpc": {
         target: RPC_TARGET,
+        changeOrigin: true,
+        rewrite: () => "/",
+      },
+      // Genesis-4 reads. In production this path is `functions/g4.js`, which
+      // fans out to the two archivals; in dev there are no CF Functions, so
+      // point straight at one archival. This loses the `?node=` pinning that
+      // two-node agreement needs — every pinned read lands on the same box.
+      // `agree()` detects that (it compares the `x-bloch-node-index` the
+      // Function stamps, which this proxy does not set) and reports "no
+      // cross-check was possible" rather than a false agreement. So the
+      // finality panels are honest in dev; they are just less informative.
+      "/g4": {
+        target: G4_TARGET,
         changeOrigin: true,
         rewrite: () => "/",
       },
