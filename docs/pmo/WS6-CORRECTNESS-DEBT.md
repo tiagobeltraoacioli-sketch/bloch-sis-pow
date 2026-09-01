@@ -418,10 +418,27 @@ cites**, because the repo currently supports citing either. The PMO's reading is
 
 Nothing here is on the 5 September path. Suggested order after it:
 
-1. **§4.5's ratchet test** — smallest, and it guards the live defect.
-2. **§2.2's documentation fix** — hours, and it removes a reconciliation
-   surprise before any listing conversation.
-3. **The decision not to merge `DepositV2`** until §1.3 is answered — free, and
-   it stops the debt growing.
-4. **§1's consensus fix and the `LEAK_RECOVERY` arming** — one flag day, founder
-   only, properly scoped and rehearsed. Not before the exchange is synced.
+1. **Arm `LEAK_RECOVERY_ACTIVATION_EPOCH`** (§4.3.1). The ratchet that caused
+   2026-08-24 is live on all 63 validators, and the founder's `1/2` floor —
+   already written, already correct — is sitting behind an off switch. This is
+   the highest-value consensus action available. Founder-only, one flag day, and
+   it should be scoped and rehearsed *after* 5 September precisely because it
+   deserves that care.
+2. **Pick the right `DepositV2` lineage** (§1.3) — merge `a5a0a10bb332b59ca`,
+   which also closes `0x02`; do **not** merge `a087ea83a391a7f0a`, which
+   reproduces the mint while appearing to fix it. Free, and it stops the debt
+   growing.
+3. **§4.5's ratchet test** — small, and it guards the live defect directly.
+4. **§2.2's documentation fix** — hours, and it removes a reconciliation surprise
+   before any listing conversation. Note the true fix needs a relaunch, so the
+   documentation *is* the answer for this chain.
+5. **Bring `main` up to the fleet** (§3a) — the repository is behind the
+   validators, not ahead of them. `origin/relanca/e1400-quatro-portoes` is the
+   minimal published carrier.
+6. **Retire the stale public-RPC observer** (§3a) — epoch 800 against the fleet's
+   1666, and it is one of the two nodes we would tell an exchange to corroborate
+   against. This one is cheap and belongs before the exchange handover, not
+   after.
+
+**Do not arm `ANCESTRY_SEED_ACTIVATION_EPOCH`** until the third, ungated seed
+definition at `engine.rs:912-928` is closed (§3a).

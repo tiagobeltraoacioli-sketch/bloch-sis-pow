@@ -61,6 +61,11 @@ read from the *unleaked* roster. `getchaininfo` has no peers field and there is
 no `getpeerinfo` method, so zero peers is not observable over RPC at all.
 **Every indicator an exchange monitors reads healthy, inside one working day.**
 
+**0.5 — Retire or resync the stale public-RPC observer.** `136.244.90.238` runs
+`2701feab` and sits at **epoch 800 against the fleet's 1666**. It is one of the
+two nodes the corrected integration book tells the exchange to corroborate
+against (WS5 §1.5). Cheap, and it belongs before the handover, not after.
+
 **0.4 — Founder decisions, listed so they can be answered in one sitting:**
 ratify `Withdraw = 0x08` (registry C-4); fund ~0.001 BLCH for the mainnet spend
 rehearsal; decide disclosure on the staking-deposit defect; **name the owner of
@@ -155,6 +160,15 @@ already makes `engine.rs:2568`'s comment false on the libp2p path.
 **2.5 — Widen the consensus-gate tripwires and merge the schedule feed**
 (revision 1 items 2.1–2.5, unchanged and still correct). The union is 13 gates;
 the best existing digest covers 5. A digest with gaps is read as exhaustive.
+
+**2.6 — Bring `main` up to what the fleet actually runs.** Measured: all 63
+validators run `bloch-pos-cinco` (`46133196`, descending from `47f7644b`), and
+**`47f7644b` is not an ancestor of `main` or `validator-ops`.** The fleet is
+ahead; the repository is behind. This inverts the premise this workstream was
+handed, and it matters for 1.4: a release cut from `main` today would ship
+*without* the consensus corrections the fleet has been running for a week.
+`origin/relanca/e1400-quatro-portoes` is the minimal already-published carrier.
+Merging arms nothing — every gate involved stays `u64::MAX`. See WS6 §3a.
 
 ---
 
