@@ -3,13 +3,17 @@ import { useEffect, useState } from "react";
 import { useRouter, Link, matchRoute } from "./lib/router";
 import { rpcIsDegraded, activeRpcEndpoint } from "./lib/rpc";
 import { G4Search } from "./components/g4search";
-import { g4rpc, G4_RPC } from "./lib/g4";
+import { read, readFrom, G4_READ } from "./lib/source";
 import { G4Dashboard } from "./pages/G4Dashboard";
 import { G4BlockPage } from "./pages/G4Block";
+import { G4BlocksPage } from "./pages/G4Blocks";
+import { TxAnswerPage } from "./pages/TxAnswer";
+import { OutpointPage } from "./pages/Outpoint";
 import { BalancePage } from "./pages/Balance";
 import { ValidatorsPage } from "./pages/Validators";
 import { SnapshotPage } from "./pages/Snapshot";
 import "./features.css";
+import "./blocks.css";
 
 // The Bloch sphere — one qubit, every state. Canonical protocol mark,
 // self-theming via the brand tokens.
@@ -27,6 +31,7 @@ const Logo = () => (
 // with, and a reader who came looking for it must still find it.
 const NAV = [
   { to: "/", label: "Chain" },
+  { to: "/blocks", label: "Blocks" },
   { to: "/balance", label: "Balance" },
   { to: "/validators", label: "Validators" },
   { to: "/snapshot", label: "Snapshot" },
@@ -44,6 +49,38 @@ function renderRoute(path: string) {
 
   const m = matchRoute(path, "/slot/:s");
   if (m) return <G4BlockPage slot={Number(m.s)} key={"s" + m.s} />;
+
+  // By block id rather than by slot. This is the only way to reach a block
+  // fork choice did not select: `getblockbyslot` resolves through the
+  // canonical chain and cannot return an orphan, while `getblockbyid` can.
+  {
+    const mid = matchRoute(path, "/block/:id");
+    if (mid) return <G4BlockPage blockId={mid.id} key={"b" + mid.id} />;
+  }
+
+  if (path === "/blocks") return <G4BlocksPage />;
+  {
+    const mr = matchRoute(path, "/blocks/:from");
+    if (mr) return <G4BlocksPage from={Number(mr.from)} key={"r" + mr.from} />;
+  }
+
+  // Where a transaction hash lands. Not a 404 — see pages/TxAnswer for why a
+  // 404 and a fake "found" are both worse answers than the explanation.
+  if (path === "/tx") return <TxAnswerPage />;
+  {
+    const mt = matchRoute(path, "/tx/:h");
+    if (mt) return <TxAnswerPage hash={mt.h} key={"t" + mt.h} />;
+  }
+
+  {
+    const mo = matchRoute(path, "/outpoint/:op");
+    if (mo) {
+      const [txid, vout] = mo.op.split(":");
+      if (/^[0-9a-f]{64}$/i.test(txid || "")) {
+        return <OutpointPage txid={txid.toLowerCase()} vout={Number(vout) || 0} key={"o" + mo.op} />;
+      }
+    }
+  }
 
   // Genesis-3 routes are gone, not broken-on-purpose: this explorer is the
   // proof-of-stake chain now. The state proof of work ended in is published
@@ -64,16 +101,24 @@ function renderRoute(path: string) {
   );
 }
 
-// Surfaces the RPC client's own failover state (src/lib/rpc.ts). Reads the
-// exported getters on a slow tick — no extra network traffic.
+// Which archival is answering, and whether it is answering at all.
+//
+// Names the node index rather than just "up/down", because the two archivals
+// are what the whole two-node cross-check rests on: a page that has quietly
+// been served by one box for an hour is in a different epistemic position from
+// one being answered by both, and that should be visible rather than inferred.
 function RpcStatus() {
   const [state, setState] = useState<"live" | "warn">("warn");
+  const [node, setNode] = useState<number | null>(null);
   useEffect(() => {
     let stop = false;
     const ping = async () => {
       try {
-        await g4rpc("getchaininfo");
-        if (!stop) setState("live");
+        const r = await readFrom("getchaininfo");
+        if (!stop) {
+          setState("live");
+          setNode(r.node);
+        }
       } catch {
         if (!stop) setState("warn");
       }
@@ -86,10 +131,22 @@ function RpcStatus() {
     };
   }, []);
   return (
-    <div className="rpc-status" title="The Genesis-4 endpoint this page reads">
+    <div
+      className="rpc-status"
+      title="Reads go to the archival peers, never to a validator: the node RPC has no auth or rate limiting and shares a thread with consensus."
+    >
       <span className={"dot " + state} />
       <span>
-        Genesis-4 RPC {state === "live" ? "via" : "not answering —"} <code>{G4_RPC}</code>
+        {state === "live" ? (
+          <>
+            Reading Genesis-4 from the archivals via <code>{G4_READ}</code>
+            {node !== null && <> — answered by archival {node}</>}
+          </>
+        ) : (
+          <>
+            No archival answering on <code>{G4_READ}</code>
+          </>
+        )}
       </span>
     </div>
   );

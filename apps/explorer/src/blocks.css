@@ -1,0 +1,242 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later
+ *
+ * The block surface: slot table, range bar, search disambiguation, and the
+ * finality panel.
+ *
+ * Its own file rather than an addition to features.css so that this work
+ * merges cleanly alongside the other explorer branches in flight.
+ *
+ * One rule runs through the colour choices here and it is not decorative. The
+ * three states of a slot must be told apart at a glance, and the third —
+ * "we could not read this" — must not look like either of the other two. It
+ * gets a distinct hue and a dashed left edge precisely so it cannot be
+ * mistaken for a missed proposal, which would attribute a miss to a validator
+ * who in fact proposed. Likewise no finality state gets an unqualified
+ * celebratory green: on this chain a finalized reading can be withdrawn.
+ */
+
+/* ---- pills ------------------------------------------------------------- */
+
+.pill {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.pill.ok {
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 34%, transparent);
+}
+.pill.warn {
+  color: #8a6100;
+  background: #fdf3dc;
+  border-color: #e9cf94;
+}
+.pill.quiet {
+  color: var(--muted);
+  background: var(--surface-2, var(--bg-deep));
+  border-color: var(--line);
+}
+.pill.bad {
+  color: #a33227;
+  background: #fdeae7;
+  border-color: #eeb5ac;
+}
+/* Deliberately a different hue family from both "ok" and "missed": this is
+ * the absence of knowledge, not a state of the chain. */
+.pill.unknown {
+  color: #4a4a8a;
+  background: #ececf8;
+  border-color: #c2c2e4;
+}
+@media (prefers-color-scheme: dark) {
+  .pill.warn { color: #f0cd7d; background: #3a2f11; border-color: #6b5620; }
+  .pill.bad { color: #f3a99e; background: #3d1d18; border-color: #74392f; }
+  .pill.unknown { color: #b9b9ee; background: #22224a; border-color: #3c3c73; }
+}
+
+/* ---- slot rows --------------------------------------------------------- */
+
+tr.row-missed td { opacity: 0.72; }
+tr.row-unknown td {
+  background: color-mix(in srgb, #6a6ad0 7%, transparent);
+}
+tr.row-unknown td:first-child {
+  box-shadow: inset 3px 0 0 0 #8a8ad8;
+}
+
+.age { font-size: 12px; margin-left: 8px; white-space: nowrap; }
+
+.reorg-flag {
+  display: inline-block;
+  margin-left: 6px;
+  font-size: 12px;
+  color: #8a6100;
+  cursor: help;
+}
+.reorg-flag.danger { color: #a33227; font-weight: 700; }
+@media (prefers-color-scheme: dark) {
+  .reorg-flag { color: #f0cd7d; }
+  .reorg-flag.danger { color: #f3a99e; }
+}
+
+/* ---- range bar --------------------------------------------------------- */
+
+.range-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.range-label {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12.5px;
+  color: var(--muted);
+  margin: 0 4px;
+}
+.pill-tab {
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--surface, transparent);
+  color: var(--ink-2);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.pill-tab:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.pill-tab:disabled { opacity: 0.4; cursor: not-allowed; }
+.pill-tab.go { border-color: var(--accent); color: var(--accent); }
+
+.slot-jump {
+  width: 110px;
+  padding: 4px 8px;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: var(--surface, transparent);
+  color: var(--ink);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12.5px;
+}
+
+/* ---- block header rows ------------------------------------------------- */
+
+.hdr-row {
+  display: grid;
+  grid-template-columns: 160px 1fr;
+  gap: 10px;
+  align-items: baseline;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+.hdr-row:last-child { border-bottom: none; }
+.hdr-row .snap-hash {
+  font-size: 12px;
+  word-break: break-all;
+  line-height: 1.5;
+}
+@media (max-width: 680px) {
+  .hdr-row { grid-template-columns: 1fr; gap: 2px; }
+}
+
+/* ---- the finality panel ------------------------------------------------ */
+
+.finality-card { margin-bottom: 14px; }
+
+.truth-list { list-style: none; padding: 0; margin: 10px 0 14px; }
+.truth-list li {
+  display: grid;
+  grid-template-columns: 22px 1fr;
+  gap: 8px;
+  padding: 7px 0;
+  font-size: 13.5px;
+  line-height: 1.55;
+  border-bottom: 1px solid var(--line-soft);
+}
+.truth-list li:last-child { border-bottom: none; }
+.truth-list .mark { font-weight: 700; }
+.truth-list li.yes .mark { color: var(--accent); }
+.truth-list li.no .mark { color: var(--muted); }
+
+.reorg-card { border-color: color-mix(in srgb, #c08a20 45%, var(--line)); }
+
+/* ---- search disambiguation --------------------------------------------- */
+
+.search-wrap { position: relative; flex: 1; max-width: 460px; }
+.search-wrap.hero { max-width: 760px; margin: 0 auto; }
+
+.search-note,
+.search-err {
+  font-size: 12.5px;
+  line-height: 1.5;
+  margin-top: 6px;
+  padding: 7px 10px;
+  border-radius: 8px;
+}
+.search-note { color: var(--muted); background: var(--bg-deep); }
+.search-err { color: #a33227; background: #fdeae7; border: 1px solid #eeb5ac; }
+@media (prefers-color-scheme: dark) {
+  .search-err { color: #f3a99e; background: #3d1d18; border-color: #74392f; }
+}
+
+/* The box sits in a 64px-tall header bar, so the disambiguation panel floats
+ * rather than displacing the layout underneath it. */
+.search-choose {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  background: var(--surface, var(--bg));
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 14px;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.16);
+}
+.choose-lede { font-size: 12.5px; line-height: 1.55; color: var(--ink-2); margin-bottom: 10px; }
+.choose-opts { display: flex; flex-direction: column; gap: 6px; align-items: stretch; }
+.choose-opts .pill-tab { text-align: left; border-radius: 9px; padding: 8px 12px; }
+.choose-hint { color: var(--muted); font-size: 11.5px; }
+
+/* ---- shared odds and ends ---------------------------------------------- */
+
+.code-block {
+  background: var(--bg-deep);
+  border: 1px solid var(--line-soft);
+  border-radius: 9px;
+  padding: 11px 13px;
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-x: auto;
+  margin: 10px 0;
+}
+
+.node-quote {
+  margin: 10px 0;
+  padding: 10px 14px;
+  border-left: 3px solid var(--accent);
+  background: var(--bg-deep);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--ink-2);
+}
+
+.how-list { padding-left: 20px; margin: 8px 0; }
+.how-list li { padding: 6px 0; font-size: 13.5px; line-height: 1.6; }
+
+.errbox.warn {
+  border-color: #e9cf94;
+  background: #fdf3dc;
+  color: #6d4d00;
+}
+@media (prefers-color-scheme: dark) {
+  .errbox.warn { border-color: #6b5620; background: #2c240d; color: #f0cd7d; }
+}
+
+details.raw summary { cursor: pointer; font-size: 12.5px; color: var(--muted); }
+details.raw summary:hover { color: var(--accent); }

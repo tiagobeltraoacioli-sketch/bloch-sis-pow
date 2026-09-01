@@ -8,15 +8,9 @@
 // slot while finality stalls; that is a real and survivable state, and it must
 // be readable at a glance rather than inferred.
 import { useEffect, useState } from "react";
-import {
-  g4rpc,
-  recentBlocks,
-  pollWhileVisible,
-  G4,
-  G4Head,
-  G4Block,
-  G4ValidatorCount,
-} from "../lib/g4";
+import { g4rpc, pollWhileVisible, G4, G4Head, G4ValidatorCount } from "../lib/g4";
+import { read, slotRange, SlotCell } from "../lib/source";
+import { SlotTable, SlotTally } from "../components/blockstream";
 import { fmtBloch, fmtInt, timeAgo } from "../lib/format";
 import { Link } from "../lib/router";
 import { Loading } from "../components/ui";
@@ -34,14 +28,16 @@ export function G4Dashboard() {
   const [head, setHead] = useState<G4Head | null>(null);
   const [vals, setVals] = useState<G4ValidatorCount | null>(null);
   const [mp, setMp] = useState<Mempool | null>(null);
-  const [blocks, setBlocks] = useState<(G4Block | null)[] | null>(null);
+  const [cells, setCells] = useState<SlotCell[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
     let stop = false;
     const tick = async () => {
       try {
-        const h = await g4rpc<G4Head>("getchaininfo");
+        // Through the archivals, never a validator: the node RPC has no auth or
+        // rate limiting and is served by the consensus thread itself.
+        const h = await read<G4Head>("getchaininfo");
         if (stop) return;
         setHead(h);
         setErr(null);
@@ -49,14 +45,14 @@ export function G4Dashboard() {
         // the consensus loop, so a slow answer during block production is
         // ordinary — one timeout must not blank the page.
         const [v, m, b] = await Promise.allSettled([
-          g4rpc<G4ValidatorCount>("getvalidatorcount"),
-          g4rpc<Mempool>("getmempoolinfo"),
-          recentBlocks(h.slot, RECENT),
+          read<G4ValidatorCount>("getvalidatorcount"),
+          read<Mempool>("getmempoolinfo"),
+          slotRange(h.slot - RECENT + 1, h.slot),
         ]);
         if (stop) return;
         if (v.status === "fulfilled") setVals(v.value);
         if (m.status === "fulfilled") setMp(m.value);
-        if (b.status === "fulfilled") setBlocks(b.value);
+        if (b.status === "fulfilled") setCells(b.value);
       } catch (e: any) {
         if (!stop) setErr(String(e?.message ?? e));
       }
@@ -205,68 +201,18 @@ export function G4Dashboard() {
 
       <section className="card" style={{ marginTop: 14 }}>
         <h2 className="snap-h2">Recent blocks</h2>
-        {!blocks ? (
+        {!cells ? (
           <Loading />
         ) : (
-          <div className="table-wrap">
-            <table className="tbl">
-              <thead>
-                <tr>
-                  <th className="num">Slot</th>
-                  <th className="num">Proposer</th>
-                  <th>Block</th>
-                  <th className="num">Txs</th>
-                  <th className="num">Attestations</th>
-                  <th>Age</th>
-                  <th>State</th>
-                </tr>
-              </thead>
-              <tbody>
-                {blocks.map((b, i) => {
-                  const slot = head.slot - i;
-                  if (!b) {
-                    return (
-                      <tr key={slot} className="row-missed">
-                        <td className="num">{fmtInt(slot)}</td>
-                        <td className="num">—</td>
-                        <td colSpan={4} className="faint">
-                          no block for this slot
-                        </td>
-                        <td>
-                          <span className="pill quiet">missed</span>
-                        </td>
-                      </tr>
-                    );
-                  }
-                  return (
-                    <tr key={b.block_id}>
-                      <td className="num">{fmtInt(b.slot)}</td>
-                      <td className="num">v{b.proposer_index}</td>
-                      <td>
-                        <Link to={`/slot/${b.slot}`}>
-                          <code>{b.block_id.slice(0, 16)}</code>
-                        </Link>
-                      </td>
-                      <td className="num">{fmtInt(b.tx_count)}</td>
-                      <td className="num">{fmtInt(b.attestation_count)}</td>
-                      <td className="faint">{timeAgo(b.timestamp)}</td>
-                      <td>
-                        {b.finalized ? (
-                          <span className="pill ok">final</span>
-                        ) : (
-                          <span className="pill quiet">{b.finality}</span>
-                        )}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+          <>
+            <SlotTable cells={cells} />
+            <SlotTally cells={cells} />
+          </>
         )}
         <p className="lookup-hint">
           A missed slot is a proposal that did not arrive in time. It costs that validator its
-          reward for the slot and nothing else — the chain moves on to the next.
+          reward for the slot and nothing else — the chain moves on to the next, and height does
+          not advance. <Link to="/blocks">Browse every slot</Link>.
         </p>
       </section>
     </div>

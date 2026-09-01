@@ -50,8 +50,21 @@ export interface G4Head {
   finalized_height: number;
   justified: { epoch: number; root: string };
   finalized: { epoch: number; root: string };
+  previous_justified?: { epoch: number; root: string };
   block_id: string;
   state_root: string;
+  /** Present on the live build; the validator set as this node sees it. */
+  validators?: { total: number; active: number };
+  total_active_stake_sat?: string;
+  base_fee_millisat_per_gas?: string;
+  next_base_fee_millisat_per_gas?: string;
+  mempool?: number;
+  /** Blocks this node holds. With ~38% of slots empty, well below `slot`. */
+  blocks_known?: number;
+  /** The slot the wall clock says it is, whether or not a block arrived. */
+  wall_slot?: number;
+  /** `wall_slot - slot`. Non-zero means this node is behind, not the chain. */
+  behind_by_slots?: number;
 }
 
 export interface G4Balance {
@@ -120,27 +133,63 @@ export function isPaddedH160(scriptHash: string): boolean {
   return scriptHash.length === 64 && scriptHash.slice(40) === "0".repeat(24);
 }
 
-/** A Genesis-4 block header as the node reports it. */
+/**
+ * A Genesis-4 block header as the node reports it.
+ *
+ * Field list verified against a live archival, not against the spec — the
+ * deployed binary and the source tree are not always the same build (the
+ * archivals answer `method not found` to `getcapabilities`, which `route()`
+ * has had for a while).
+ */
 export interface G4Block {
   block_id: string;
+  /** Consensus version word carried in the header. */
+  version: number;
   parent: string;
   slot: number;
   epoch: number;
-  height: number;
+  /**
+   * Height, or `null` for a block that is not on the canonical chain.
+   *
+   * Not a defensive type. `getblockbyid` serves non-canonical blocks — that
+   * is deliberate and documented on the method — and the node computes height
+   * by searching the canonical chain, so an orphan has no height to report.
+   * Anything rendering this must handle the null rather than print "0", which
+   * would put an orphan at genesis.
+   */
+  height: number | null;
   proposer_index: number;
   timestamp: number;
   state_root: string;
   body_root: string;
+  /** The proposer's RANDAO contribution for this slot. */
+  randao_reveal: string;
   randao_mix: string;
   justified_root: string;
   finalized_root: string;
   attestation_root: string;
-  /** "canonical" | "orphan" | … — the node's own word, shown verbatim. */
+  /** Root of the coherence commitment carried by this header. */
+  coherence_root: string;
+  /**
+   * The node's own word, shown verbatim. Observed values, live:
+   * `"finalized"`, `"justified"`, `"canonical"`, and `"not_canonical"` for a
+   * block reachable by id that fork choice did not select.
+   *
+   * This is a reading, not a property — see `lib/source.ts`, note 2.
+   */
   finality: string;
   finalized: boolean;
+  /**
+   * How many transactions the block carries. There is **no `transactions`
+   * array** — the count is all the node gives, and a Genesis-4 transaction has
+   * no id to list it under anyway. See the `/tx` page.
+   */
   tx_count: number;
   attestation_count: number;
 }
+
+/** The finality word the node uses for a block it holds but did not select. */
+export const NOT_CANONICAL = "not_canonical";
 
 /** A validator record. Stakes are decimal strings: they exceed a JS number. */
 export interface G4Validator {
@@ -188,39 +237,19 @@ async function mapLimit<T, R>(
   return out;
 }
 
-/**
- * Blocks already known to be final.
- *
- * Only finalized blocks go in here, and that restriction is the whole point.
- * A block that is merely canonical can still be reorganised out — caching one
- * would leave the page showing a block the chain has since dropped, which is
- * exactly the class of stale-cache bug this project has been bitten by
- * before. Finality is the moment the answer stops being able to change.
- */
-const finalBlocks = new Map<number, G4Block>();
+// `recentBlocks` and its cache used to live here and have been REMOVED, not
+// moved. The cache kept any block whose `finalized` flag was true, forever, on
+// the reasoning that finality is the moment an answer stops being able to
+// change. That reasoning does not hold on this chain: the finalized checkpoint
+// is not a latch across a reorg, so the cache would go on serving a block the
+// chain had since reorganised away, with total confidence and no expiry.
+//
+// The replacement is `slotRange` in `lib/source.ts`, which reads through the
+// archivals rather than this client, expires entries, and distinguishes "the
+// chain says this slot is empty" from "we could not find out".
 
 /** How many RPC calls this page will have in flight at once. */
 export const RPC_CONCURRENCY = 6;
-
-/**
- * The last `n` blocks, newest first, walked back from `fromSlot`.
- *
- * There is no range call on this RPC, so this asks per slot and tolerates
- * gaps: a slot with no block is a missed proposal, which is normal and must
- * read as absence rather than as an error. Finalized slots are answered from
- * cache, so a page left open settles to asking only about the new ones.
- */
-export async function recentBlocks(fromSlot: number, n: number): Promise<(G4Block | null)[]> {
-  const slots = Array.from({ length: n }, (_, i) => fromSlot - i).filter((s) => s >= 0);
-  const settled = await mapLimit(slots, RPC_CONCURRENCY, async (s) => {
-    const hit = finalBlocks.get(s);
-    if (hit) return hit;
-    const b = await g4rpc<G4Block>("getblockbyslot", [s]);
-    if (b.finalized) finalBlocks.set(s, b);
-    return b;
-  });
-  return settled.map((r) => (r.status === "fulfilled" ? r.value : null));
-}
 
 /** Fetch every validator, bounded — see `mapLimit`. */
 export async function allValidators(total: number): Promise<(G4Validator | null)[]> {
