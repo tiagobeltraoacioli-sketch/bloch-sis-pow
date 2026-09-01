@@ -39,10 +39,12 @@
 #   bash rolar-arquivais.sh verificar             # leitura
 #
 # ORDEM RECOMENDADA (o `checar` recusa outra):
-#   1. 139.180.173.231  — ja tem `bloch-pos-cinco` em disco, entao tem DOIS
-#      degraus de reversao (cinco e depois quatro) em vez de um.
-#   2. 139.180.166.5    — so depois do primeiro estar provado e de volta no
-#      8080 por uma epoca inteira.
+#   1. 139.180.173.231  — tem `cinco` E `quatro` em disco: um degrau manual a
+#      mais se o proprio `quatro` falhar. (O `reverter` automatico volta para o
+#      `quatro` da unit pre-roll nos dois hosts.)
+#   2. 139.180.166.5    — so tem `quatro`; vai por ultimo, quando o
+#      procedimento ja tiver sido exercido uma vez de verdade, e so depois do
+#      primeiro estar provado e de volta no 8080 por uma epoca inteira.
 
 set -u -o pipefail
 
@@ -73,16 +75,24 @@ mal()  { printf '  RUIM %s\n' "$*"; RUIM=1; }
 # conferia UMA referencia e concluia "so 1 referencia respondeu": o primeiro
 # ssh comia as outras linhas. Uma prova que le menos testemunhas do que pensa
 # e pior do que nenhuma prova.
+# ServerAliveInterval/CountMax NAO sao redundantes com ConnectTimeout.
+# ConnectTimeout so limita o APERTO DE MAO; depois disso um ssh cuja conexao
+# emudece fica pendurado para sempre. Medido em 31/08 rodando o `checar` contra
+# a frota: dois ssh presos, saida parada por minutos, e nenhum timeout. Um
+# operador no meio de um roll interpreta silencio como "esta trabalhando".
+# 5s x 3 = o comando morre em ~15s e vira uma leitura falha, que o chamador ja
+# sabe distinguir de uma bifurcacao.
+SSHOPT=(-n -o StrictHostKeyChecking=no -o BatchMode=yes
+        -o ConnectTimeout=15 -o ServerAliveInterval=5 -o ServerAliveCountMax=3)
+
 G() { # G <host> <comando>  — ssh de leitura
-  ssh -n -i "$CHAVE" -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
-      -o BatchMode=yes "ubuntu@$1" "$2" 2>/dev/null
+  ssh "${SSHOPT[@]}" -i "$CHAVE" "ubuntu@$1" "$2" 2>/dev/null
 }
 
 # Toda escrita passa por aqui. Sem EXECUTAR=1 ela IMPRIME e nao roda.
 E() { # E <host> <comando>
   if [ "$EXECUTAR" = 1 ]; then
-    ssh -n -i "$CHAVE" -o StrictHostKeyChecking=no -o ConnectTimeout=20 \
-        -o BatchMode=yes "ubuntu@$1" "$2"
+    ssh "${SSHOPT[@]}" -i "$CHAVE" "ubuntu@$1" "$2"
   else
     printf '  [ENSAIO] ssh ubuntu@%s -- %s\n' "$1" "$2"
   fi
@@ -156,13 +166,14 @@ prova_de_raiz() { # prova_de_raiz <host> <porta>
   # slots podem ser VAZIOS (nem todo slot vira bloco). Varre para tras ate achar
   # um que a primeira referencia sirva de verdade — 12 tentativas.
   local b1 p1; read -r b1 p1 < <(printf '%s\n' "$refs" | head -1)
-  local S="" i=0
-  while [ "$i" -lt 12 ]; do
-    local cand=$(( menor - i )) j
-    j=$(RPC "$b1" "$p1" getblockbyslot "[$cand]")
-    if campo "$j" block_id >/dev/null 2>&1; then S=$cand; break; fi
-    i=$((i+1))
-  done
+  # A varredura acontece DENTRO da caixa, num unico ssh. Doze `ssh` seguidos
+  # levavam quase um minuto so para escolher o slot, e um operador que espera
+  # um minuto sem saida comeca a achar que travou.
+  local S
+  S=$(G "$b1" "for k in \$(seq 0 11); do c=\$(( $menor - k )); \
+        if curl -s --max-time 10 -X POST 127.0.0.1:$p1 -H 'content-type: application/json' \
+             -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getblockbyslot\",\"params\":['\$c']}' \
+           | grep -q '\"block_id\"'; then echo \$c; break; fi; done")
   [ -n "$S" ] || { mal "nenhum slot com bloco real nos 12 candidatos — nao provo nada sem raiz"; return 2; }
 
   local esperado_id="" esperado_sr="" concordam=0 caixas=""

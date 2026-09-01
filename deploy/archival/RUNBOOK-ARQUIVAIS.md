@@ -129,10 +129,13 @@ caixas de validador = 8 upstreams**.
 
 **Ordem obrigatória** (o script recusa outra):
 
-1. `139.180.173.231` — já tem `bloch-pos-cinco` em disco, então tem **dois**
-   degraus de reversão (`cinco`, depois `quatro`) em vez de um.
-2. `139.180.166.5` — só depois que o primeiro estiver provado e de volta no
-   8080 por uma época inteira.
+1. `139.180.173.231` — tem `bloch-pos-cinco` **e** `bloch-pos-quatro` em disco.
+   O `reverter` automático volta para o `quatro` da unit pré-roll nos dois
+   hosts; o que este ganha é um degrau manual a mais (o `cinco` que a frota
+   rodou e que, portanto, é sabidamente bom) se o `quatro` também falhar.
+2. `139.180.166.5` — só tem `quatro`. Vai por último, quando o procedimento já
+   tiver sido exercido uma vez de verdade, e só depois que o primeiro estiver
+   provado e de volta no 8080 por uma época inteira.
 
 `behind_by_slots` **não é prova**. Um nó que virou cabeça de si mesmo anda na
 própria bifurcação e marca `behind=0` — limite medido no ensaio de 31/08. Ele é
