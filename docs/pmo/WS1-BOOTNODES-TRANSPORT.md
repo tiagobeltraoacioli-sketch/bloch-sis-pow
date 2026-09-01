@@ -1,5 +1,25 @@
 # WS1 — Bootnodes + routable transport
 
+> **SUPERSEDED, 2026-09-01, on the transport question only.
+> Read `WS0-TRANSPORT-AND-THE-EXCHANGE-NODE.md` first.**
+>
+> This page plans to deliver bootnodes by bringing fleet nodes up on
+> `--transport libp2p` (see §"the narrow path" below). **Do not execute that.**
+> The two transports cannot interoperate, and the live fleet is 100% devnet, so
+> nodes switched to libp2p *leave* the chain rather than becoming an entry point
+> to it — and a newcomer dialing them syncs a private fork that prints ordinary
+> `applied … finalized` lines. It is also blocked independently: no
+> `p2p_identity.bin` exists anywhere on the fleet.
+>
+> **The correct bootnode list already exists**, on the devnet transport, verified
+> 2026-09-01: `deploy/bootnodes/bootnodes.txt` in `agent-bootnode-onboarding`.
+> It is a merge, not a deployment. See `WS5-EXCHANGE-FACING.md` §3.
+>
+> Everything on this page about the *second* deadline (the weak-subjectivity
+> window and the unsigned checkpoint) remains correct and is the reason the
+> 5 September date is real.
+
+
 **Deadline item.** The exchange cannot run the independently-validating node our
 own documentation tells them to run.
 Status: **AT RISK — deliverable by 5 Sep, but only on a narrow path, and it has a
