@@ -3,9 +3,21 @@
 **Owner: PMO.** Authoritative allocation record for every shared-namespace byte and
 name in the Genesis-4 wire protocol.
 
-Status: **LIVE — 5 unresolved collisions.** See §6.
-Last swept: 2026-08-31, against mainline `canario/cache-recusa` @ `d21c3370`
-and all 195 worktrees under `.claude/worktrees/`.
+Status: **LIVE — 4 unresolved collisions (C-3 resolved in code), 5 newly
+registered namespaces, 1 new hazard (§9.1).** See §6 and §9.
+Last swept: 2026-09-01, against `main` @ `1f21a3ed` and branch
+`pmo/wire-namespace-registry` @ `cc3f79b7`, plus all 195 worktrees under
+`.claude/worktrees/`.
+Previous sweep: 2026-08-31 against `canario/cache-recusa` @ `d21c3370`.
+
+**Changed since the 2026-08-31 sweep** (mainline moved; re-verify before
+citing the older sweep):
+- `crates/bloch-pos-committee/src/ws.rs` and `crates/bloch-pos-node/src/ws_boot.rs`
+  are now **merged on `main`**. Weak-subjectivity boot is no longer unmerged
+  worktree work. `WS_PERIOD_EPOCHS` is *derived* (`ws.rs:140-141`) as
+  `WITHDRAWAL_DELAY_EPOCHS − EXIT_DELAY_EPOCHS`, not a chosen literal — do not
+  hard-code 2016 anywhere.
+- A nested sub-namespace appeared under transaction tag `0x05`. See §1a.
 
 ---
 
@@ -67,6 +79,53 @@ has drifted to ~1008 in the deeper worktrees).
 
 Mainline today decodes `0x01`–`0x06` and returns `UnknownTag(other)` for
 everything else. Tags `0x07`/`0x08` exist only in worktrees.
+
+## 1a. Slashing-evidence kinds — `u8`, NESTED sub-namespace inside tag `0x05`
+
+**New in this sweep. This namespace did not exist at the 2026-08-31 sweep and is
+not covered by any earlier claim.**
+
+Commit `d21c3370` (`wip: caminho de submissao de evidencia de slashing`) on
+branch `pmo/wire-namespace-registry` converts transaction tag `0x05` from a flat
+rejection (`return Err(TxDecodeError::EvidenceNotDecodable)`) into a decoder that
+reads **a second discriminant byte** and matches on it —
+`crates/bloch-pos-committee/src/transition.rs:792-818`.
+
+That second byte is a new, independent namespace. It is nested inside `0x05`, so
+its values are free to repeat values used by §1; `0x01` here is not `Transfer`.
+
+| Sub-tag | Meaning | Status | Owner | Frozen by |
+| --- | --- | --- | --- | --- |
+| `0x01` | `SlashingEvidence::ProposerEquivocation { first, second }` | **UNMERGED** — `transition.rs:795` | slashing | *none yet — gap* |
+| `0x02` | `SlashingEvidence::AttestationOffence { first, second }` | **UNMERGED** — `transition.rs:805` | slashing | *none yet — gap* |
+| `0x03`–`0xFF` | free | — | — | — |
+
+**Next free evidence sub-tag: `0x03`.**
+
+Two properties make this safer than the frame-byte namespace, and one makes it
+more dangerous:
+
+- *Safer:* it dispatches by `match` on `u8` literals with an explicit
+  `other => return Err(TxDecodeError::NotCanonical(other))` arm. Duplicate
+  literals in one `match` **do** raise `unreachable_patterns`, and the catch-all
+  refuses unknown values rather than ignoring them. This namespace is
+  freezable by a no-wildcard exhaustiveness test, exactly like §1.
+- *More dangerous:* it is invisible to every sweep that greps for
+  `const NAME: u8 = 0x..`. These two values are bare literals inside a nested
+  `match`, bound to no constant at all. **The 2026-08-31 sweep missed it for
+  precisely this reason** — see §7 gap 3, which predicted this class.
+
+**PMO ruling:** before this decoder merges, its two values must be lifted to
+named constants (`EVIDENCE_KIND_PROPOSER_EQUIVOCATION = 0x01`,
+`EVIDENCE_KIND_ATTESTATION_OFFENCE = 0x02`) so that future sweeps can see them.
+A bare literal in a nested match is not a claimable allocation.
+
+**Related — a transport-level gate, not a namespace, recorded so it is not
+mistaken for one:** the same commit adds a gossipsub relay verdict for evidence
+at `crates/bloch-pos-node/src/p2p.rs`, keyed on
+`SLASHING_EVIDENCE_ACTIVATION_EPOCH` (`params.rs:638`). **Verified inert:
+`u64::MAX`.** It is the only activation constant this branch adds, and it is not
+armed. `main` does not define it at all.
 
 ## 2. Frame bytes — `u8`, first byte of a devnet-transport frame
 
@@ -161,11 +220,15 @@ wrong message; it produces a wrong state root, on every node, permanently.
 | `0x14` | `TAG_ISSUED_SUPPLY` | Merged, `:193` | tokenomics |
 | `0x15` | `TAG_BASE_FEE` | Merged, `:209` | fee-market |
 | `0x16` | `TAG_DELEGATOR_FEE_REWARD` | Merged, `:219` | fee-market |
-| `0x17` | **CONTESTED** — `TAG_COHERENCE_ANCHORS` *and* `TAG_SHIELDED_POOL` | **UNMERGED, see C-3** | — |
-| `0x18`+ | free | — | — |
+| `0x17` | `TAG_COHERENCE_ANCHORS` | **UNMERGED — ruling applied**, `recon-coherence/…/state_root.rs:295` | coherence | *none — gap, see §8.3* |
+| `0x18` | `TAG_SHIELDED_POOL` | **UNMERGED — ruling applied**, `recon-coherence/…/state_root.rs:330` | coherence | *none — gap, see §8.3* |
+| `0x19`+ | free | — | — | — |
 
-**Next free state-root tag: `0x18`** — and `0x17` must be adjudicated before
-either claimant merges.
+**Next free state-root tag: `0x19`.**
+
+**C-3 is resolved in code as of 2026-09-01** — see §6 C-3. The two stale
+claimants (`agent-a905f26b0f5a3faaf`, `agent-a14a11d370747fe90`) must not be
+merged; `recon-coherence` supersedes both.
 
 Note the separate, non-colliding tag namespaces that also live in this crate and
 are **not** the state trie: `LEAF_TAG`/`NODE_TAG`/`KEY_TAG` (trie node domain
@@ -248,8 +311,31 @@ between nodes that ran different subsets of the work.
 
 **Resolution: PMO assigns `0x17` to `TAG_COHERENCE_ANCHORS` and `0x18` to
 `TAG_SHIELDED_POOL`** — coherence-anchors is on the C1 activation path and is the
-nearer-term merge. Shielded-pool owner to rebase. **Neither may merge until this
-is applied.**
+nearer-term merge. Shielded-pool owner to rebase.
+
+### C-3 — **STATUS: RESOLVED IN CODE, 2026-09-01. Pending merge.**
+
+Worktree `recon-coherence`, branch **`recon/coherence-core-20260901`** @ `52c40d89`,
+carries the ruling exactly as issued:
+- `TAG_COHERENCE_ANCHORS = 0x17` (`state_root.rs:295`)
+- `TAG_SHIELDED_POOL = 0x18` (`state_root.rs:330`)
+
+It is the reconciliation of the five divergent `coherence-core` copies
+(`0810f1eb`) and it has already merged `main` (`52c40d89`), so it is ahead of both
+original claimants rather than parallel to them.
+
+**Supersession, and this is the operative instruction:** `agent-a905f26b0f5a3faaf`
+and `agent-a14a11d370747fe90` are now **stale claimants**. Merging either one
+after `recon-coherence` re-introduces the collision from behind — each still
+defines its own tag at `0x17`, and neither `git` nor `rustc` will object, because
+the two definitions live in worktrees that never see each other. **Neither may be
+merged. Their non-tag content must be cherry-picked, never merged as a tree.**
+
+**Caveat before endorsing this branch:** its base commit `0810f1eb` is a
+`wip(coherence)` commit — unreviewed input under the standing rule, not history.
+Run `git diff --stat` from the last validated point and read the delta before the
+merge; do not rely on `git log`. The tag allocation above is verified; the rest of
+the branch is not.
 
 ### C-4 — Transaction tag `0x07`: `DepositV2` vs `Withdraw` — semantic
 - `0x07 => DepositV2` (multi-line structural arm) in `agent-a5a0a10bb332b59ca:1092`,
@@ -289,6 +375,169 @@ next agent does not read the gap as free space and take it.
    critical path, but it is the cheapest durable fix in this document.
 2. **The RPC namespace has no owner column populated** beyond mainline, because
    no unmerged method names have been claimed yet.
-3. This sweep covers `u8` constants named `FRAME_*`, `SYNC_TAG_*`, `TAG_*`, and
+3. ~~This sweep covers `u8` constants named `FRAME_*`, `SYNC_TAG_*`, `TAG_*`, and
    `match` arms on `0x0N` literals in `transition.rs`. A namespace that names its
-   constants differently would not be caught. Report any you find to the PMO.
+   constants differently would not be caught.~~ **CLOSED 2026-09-01.** Re-swept
+   by *shape* (`const NAME: u8 = 0x..`, and bare hex literals in nested `match`
+   arms) instead of by name. Found five previously untracked namespaces: the
+   evidence sub-namespace (§1a) and four in §9. One of them, `ROLE_*` (§9.1), is
+   a live collision hazard split across two files.
+4. **A namespace can still hide as a bare literal bound to no constant.** §1a was
+   missed by the 2026-08-31 sweep for exactly this reason: its two values are
+   literals inside a nested `match`, matching no `const` pattern. The shape sweep
+   now covers `^\s*0x.. =>` as well, but an agent who writes
+   `if byte == 7` rather than `0x07 =>` remains invisible to both. **Rule: every
+   value with wire or hash meaning must be a named constant.** This is now the
+   cheapest thing separating us from a sixth collision.
+
+---
+
+## 8. The freezing tests — specification (PMO ask, not yet built)
+
+§7 gap 1 records that **no test anywhere freezes a frame byte or a sync tag**.
+This section specifies exactly what to build, because "add a test" has already
+been mis-implemented once as a round-trip test, which does not catch a collision:
+encoding and decoding with the *same* wrong constant round-trips perfectly.
+
+A collision test must assert **values**, and **distinctness**, not behaviour.
+
+### 8.1 Frame bytes and sync tags — pairwise distinctness (the one that matters)
+
+Location: `crates/bloch-pos-node/tests/wire_constants.rs` (new file).
+Owner: networking. Blocks: nothing — build it independently, merge it early.
+
+Three assertions, in this order:
+
+1. **Golden values.** One `assert_eq!` per constant against a hard-coded literal
+   (`assert_eq!(FRAME_BLOCK, 0x01)`, …). This makes any renumbering a loud test
+   failure that names the constant, so a renumber becomes a deliberate act with a
+   diff reviewers can read.
+2. **Pairwise distinctness within each namespace.** Collect each namespace into
+   an array of `(name, value)` pairs, then assert every pair of distinct names
+   has distinct values — and **assert the array length**, so a newly added
+   constant that is not added to the array fails the count rather than passing
+   silently. This is the assertion that has no compiler equivalent.
+   - `FRAME_*` → one namespace.
+   - `SYNC_TAG_GET_*` (requests) → one namespace.
+   - `SYNC_TAG_*` non-`GET_` (responses) → a **separate** namespace.
+3. **The two sync halves are NOT cross-checked.** `SYNC_TAG_GET_BLOCKS = 0x01`
+   and `SYNC_TAG_BLOCKS = 0x01` are both correct (§3). A test that checks all
+   sync tags for global distinctness will fail on correct code, be "fixed" by
+   renumbering, and cause the split it was written to prevent. **Write this
+   caveat as a comment in the test file itself**, not only here.
+
+### 8.2 Transaction tags — no-wildcard exhaustiveness
+
+Location: alongside `crates/bloch-pos-committee/tests/committee.rs`.
+Owner: consensus.
+
+Assert the decoder's accepted set is exactly `{0x01…0x06}` on `main`, by feeding
+each byte `0x00..=0xFF` a minimal payload and asserting that every byte outside
+the allocated set returns `UnknownTag`. This freezes the *boundary*, so an agent
+that adds `0x07` must update the test, which is the moment the PMO gets asked.
+
+Extend to the §1a evidence sub-namespace with the same shape once its literals
+are lifted to constants.
+
+### 8.3 State-root tags — distinctness, and why it is urgent
+
+Location: `crates/bloch-pos-committee/tests/state_root_tags.rs` (new file).
+Owner: consensus.
+
+Same pairwise-distinctness shape as 8.1. These constants are `const` and
+file-local, so the test must live in the crate or the constants must be made
+`pub(crate)` and re-exported behind `#[cfg(test)]`.
+
+This is the namespace where a duplicate is **consensus-fatal and silent** (§4,
+C-3). It is also the easiest to test, because all 22 constants sit in one
+contiguous block. **Highest value per line of test code in this document.**
+
+### 8.4 Deliberately out of scope
+
+Not RPC method names: a duplicate `match` arm on a string literal is a shadowed
+arm the compiler does warn about under `unreachable_patterns`, and the dispatch
+table is one contiguous block that a reader can check. Cheap to add later; not
+where the risk is.
+
+---
+
+## 9. Secondary namespaces — newly registered, 2026-09-01
+
+§7 gap 3 warned that the sweep only covered constants named `FRAME_*`,
+`SYNC_TAG_*`, `TAG_*`, and `0x0N` match arms in `transition.rs`, and that a
+namespace naming its constants differently would be missed. Sweeping for the
+*shape* (`const NAME: u8 = 0x..`) rather than the *name* found four. One is a
+live hazard.
+
+### 9.1 Role tags — **HAZARD: one namespace, two files**
+
+Mixed into the SHAKE-256 sortition seed under `DS_SORTITION`. These select the
+committee, so a duplicate silently corrupts committee selection — the same
+severity class as a state-root tag.
+
+| Value | Const | File | Owner |
+| --- | --- | --- | --- |
+| `0x01` | `ROLE_SLOT` | `crates/bloch-pos-committee/src/params.rs:717` | consensus |
+| `0x02` | `ROLE_EPOCH` | `crates/bloch-pos-committee/src/params.rs:718` | consensus |
+| `0x03` | `ROLE_PARTITION` | `crates/bloch-pos-committee/src/committees.rs:64` | consensus |
+| `0x04`+ | free | — | — |
+
+**Next free role tag: `0x04`.**
+
+**Why this is a hazard and not just an omission.** `ROLE_SLOT` and `ROLE_EPOCH`
+are declared in `params.rs`; `ROLE_PARTITION` is declared in `committees.rs`,
+**a different file**, and is `const` (file-local), so nothing links them. An
+agent adding a role will grep `params.rs`, see `0x01` and `0x02`, and take
+`0x03` — which is already `ROLE_PARTITION`. No warning, no error, wrong
+committee. The `committees.rs:62-63` doc comment is aware of the coupling
+("Distinct from the sortition roles so the partition can never coincide with a
+proposer draw") but a comment in the *other* file is not a mechanism.
+
+**PMO ruling: `ROLE_PARTITION` should move to `params.rs` beside the other two,
+or all three should be re-exported from one module.** Until then this table is
+the only thing linking them. Freeze all three with the §8.1 pairwise test.
+
+### 9.2 Merkle mark / kind tags — `crates/bloch-pos-committee/src/derive.rs`
+
+Two independent namespaces in one file; their overlap is correct.
+
+| Value | Const | Line | Namespace |
+| --- | --- | --- | --- |
+| `0x00` | `MARK_LEAF` | `:355` | tree-position marks |
+| `0x01` | `MARK_NODE` | `:356` | tree-position marks |
+| `0x02` | `MARK_EMPTY` | `:357` | tree-position marks |
+| `0x01` | `KIND_TX` | `:358` | body-item kinds |
+| `0x02` | `KIND_ATTESTATION` | `:359` | body-item kinds |
+
+`MARK_NODE` and `KIND_TX` are both `0x01` and this is **correct** — they are
+hashed into different positions and never compared. Do not "fix" it. Next free:
+`MARK_*` `0x03`, `KIND_*` `0x03`.
+
+### 9.3 Genesis allocation buckets — `crates/bloch-pos-node/src/genesis.rs:173-179`
+
+`FOUNDER` `0x01`, `VC` `0x02`, `TEAM` `0x03`, `MARKETING` `0x04`,
+`LIQUIDITY` `0x05`, `VALIDATOR_EMISSION` `0x06`. Next free: `0x07`.
+
+Contiguous, `pub`, in one block, and genesis is already stamped — low risk, but
+recorded because a bucket added here changes the genesis allocation and must be
+a founder decision, never an agent's. **Frozen in practice by the live chain,
+not by a test.**
+
+### 9.4 Domain separators — `[u8; 16]`, `params.rs:642-709`
+
+14 allocated: `DS_SORTITION`, `DS_ATTEST`, `DS_BLOCK`, `DS_BODY`, `DS_STATE`,
+`DS_RANDAO`, `DS_DEPOSIT`, `DS_SPEND`, `DS_TXID`, `DS_SLASH`, `DS_PROPOSE`,
+`DS_EXIT`, `DS_WSCKPT`, `DS_COHERENCE`. **Verified all 14 values distinct**
+(2026-09-01).
+
+Lower risk than the `u8` namespaces because the values are self-describing
+strings, and a duplicate is visible on the line that declares it. **The real
+constraint is the fixed 16-byte width:** the `BLCH4:` prefix costs 6, leaving 10
+characters. `DS_PROPOSE` ("BLCH4:PROPOSE" + 3 nulls) is already at 13 of 16. A
+name needing more than 10 characters after the prefix must be abbreviated, and
+**two different concepts abbreviating to the same 10 characters would collide
+silently.** Claim the abbreviation from the PMO, not just the concept.
+
+`crates/coherence-core` uses a separate `bloch:coherence:*:v1` domain family
+(noted at `params.rs:705-709`) which is deliberately outside the BLCH4 sweep.
+Distinct namespace; not tracked here.
