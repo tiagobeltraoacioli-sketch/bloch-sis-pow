@@ -750,7 +750,23 @@ fn build_swarm(keypair: &identity::Keypair, cfg: &Config) -> io::Result<Swarm> {
     let gs_cfg = gossipsub_config().map_err(io::Error::other)?;
     let mut gs = gossipsub::Behaviour::new(MessageAuthenticity::Signed(keypair.clone()), gs_cfg)
         .map_err(|e| io::Error::other(format!("gossipsub: {e}")))?;
-    if let Err(e) = gs.with_peer_score(peer_score_params(cfg.behind_proxy), peer_score_thresholds()) {
+    // DIAGNOSTIC SWITCH, devnet only. `BLOCH_P2P_NO_SCORE=1` starts the swarm
+    // with no peer scoring at all. It exists because the question "does this
+    // mesh fall apart on its own, or is it scoring its honest peers again?"
+    // cannot be answered by reading the config — 2026-08-07 was two separate
+    // score defects that both looked like a network fault — and the only way
+    // to answer it is to run the same fleet twice with the penalty on and off.
+    // Never set this on a node that faces the public network: with scoring off
+    // a hostile peer pays nothing for an invalid message.
+    let scoring_off = std::env::var("BLOCH_P2P_NO_SCORE").is_ok_and(|v| v == "1");
+    if scoring_off {
+        eprintln!(
+            "p2p: peer scoring OFF by BLOCH_P2P_NO_SCORE — diagnostic only, \
+             rejections carry no penalty"
+        );
+    } else if let Err(e) =
+        gs.with_peer_score(peer_score_params(cfg.behind_proxy), peer_score_thresholds())
+    {
         // Non-fatal, but say it: with scoring off, every `Reject` this node
         // reports is log-only and a hostile peer pays nothing.
         eprintln!("p2p: peer scoring DISABLED ({e}) — rejections carry no penalty");

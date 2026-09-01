@@ -67,7 +67,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bloch_pos_committee::attestation::{Attestation, AttestationData};
+use bloch_pos_committee::attestation::{Attestation, AttestationData, RejectReason};
 use bloch_pos_committee::beacon::{mix_in, RandaoChain};
 use bloch_pos_committee::forkchoice::{BlockTree, LatestMessage, Store as FcStore};
 use bloch_pos_committee::gossip::{AttestationPool, GossipDecision};
@@ -1873,7 +1873,20 @@ impl Engine {
             }
             GossipDecision::Reject(reason) => {
                 eprintln!("attestation from v{} REJECTED: {reason:?}", att.validator);
-                self.net.report(origin, Verdict::Reject);
+                // DIAGNOSTIC SWITCH, devnet only. `BLOCH_ATT_NOTINCOMMITTEE_IGNORE=1`
+                // downgrades exactly one reason — `NotInCommittee` — from a peer
+                // penalty to a silent drop, and changes nothing else: the
+                // attestation is still refused, it just stops counting against
+                // the sender's gossipsub P4 score. It exists to separate two
+                // hypotheses that produce the same symptom, because this node
+                // judges committee membership with a seed one epoch older than
+                // the one the transition uses, so `NotInCommittee` is reached
+                // by HONEST peers on a healthy chain. Off by default: whether
+                // that is a defect worth changing is a consensus-adjacent
+                // decision, not a diagnostic one.
+                let downgrade = reason == RejectReason::NotInCommittee
+                    && std::env::var("BLOCH_ATT_NOTINCOMMITTEE_IGNORE").is_ok_and(|v| v == "1");
+                self.net.report(origin, if downgrade { Verdict::Ignore } else { Verdict::Reject });
             }
         }
     }
