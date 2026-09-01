@@ -514,6 +514,416 @@ fn every_method_routes_to_its_request() {
     assert_eq!(spy.last(), Some(RpcRequest::SendRawTransaction(tx)));
 }
 
+// ─── 2b. The frozen namespace ───────────────────────────────────────────────
+//
+// `docs/WIRE-NAMESPACE-REGISTRY.md` §5 allocates RPC method names, and §7 gap 2
+// records that the allocation was not frozen by anything. These three tests are
+// that freeze. They exist because the compiler will not do it: a `match` on
+// `&str` has no exhaustiveness to check, and a duplicate literal is at most an
+// `unreachable_patterns` warning — one that fires only after the merge that
+// puts both arms in the same file, which is precisely the case the registry
+// says has already gone wrong four times in adjacent namespaces.
+
+/// The dispatcher's own source, so the test can read the arms rather than
+/// guess at them. Relative to `src/rpc/tests.rs`, this is `src/rpc.rs`.
+const ROUTE_SOURCE: &str = include_str!("../rpc.rs");
+
+/// Every method-name literal that appears as a `match` arm inside `route`,
+/// extracted from the source.
+///
+/// The rule is positional and deliberately strict: an arm of the `Ok(match
+/// method {` block is indented exactly eight spaces and begins with a quote.
+/// Anything more clever (a real parser, a proc macro) buys nothing here, and
+/// anything looser would sweep up the argument-name literals inside the arm
+/// bodies. If a future refactor changes the indentation, this returns a short
+/// list and the assertions below fail loudly — which is the correct outcome for
+/// a freeze that has stopped being able to see what it froze.
+fn dispatch_arm_names() -> Vec<String> {
+    let body = ROUTE_SOURCE
+        .split_once("pub fn route(")
+        .expect("route() must exist")
+        .1
+        .split_once("Ok(match method {")
+        .expect("route() must dispatch with `Ok(match method {`")
+        .1;
+    let end = body.find("\n    })\n}").expect("route()'s match must close at `    })`");
+
+    let mut names = Vec::new();
+    for line in body[..end].lines() {
+        let Some(rest) = line.strip_prefix("        ") else { continue };
+        if !rest.starts_with('"') {
+            continue;
+        }
+        // Collect every literal to the left of `=>`, so an aliased arm
+        // (`"getutxos" | "listunspent" =>`) contributes both of its names.
+        let head = rest.split_once("=>").map(|(h, _)| h).unwrap_or(rest);
+        let mut i = 0;
+        while let Some(open) = head[i..].find('"') {
+            let open = i + open;
+            let close = open + 1 + head[open + 1..].find('"').expect("unterminated arm literal");
+            names.push(head[open + 1..close].to_string());
+            i = close + 1;
+        }
+    }
+    names
+}
+
+/// The namespace, frozen in both directions.
+///
+/// A method wired into `route` but missing from [`RPC_SURFACE`] fails here, and
+/// so does a name in `RPC_SURFACE` that nothing dispatches. That two-way check
+/// is the whole value: it means the table is not documentation that can drift
+/// from the code, it is the code's index, and an agent adding a method cannot
+/// do it without touching the line the PMO registry points at.
+#[test]
+fn the_rpc_method_namespace_is_frozen() {
+    // The golden list, written out. Not derived from `RPC_SURFACE` — deriving
+    // it would make an accidental edit to the table invisible, and the point of
+    // a golden list is that changing the surface shows up as a diff a reviewer
+    // must approve and register with the PMO before it can go green.
+    let golden = [
+        "getbalance",
+        "getblockbyid",
+        "getblockbyslot",
+        "getblockcount",
+        "getcapabilities",
+        "getchaininfo",
+        "getmempoolinfo",
+        "getnewaddress",
+        "gettransaction",
+        "gettxout",
+        "getutxos",
+        "getvalidator",
+        "getvalidatorcount",
+        "listunspent",
+        "sendrawtransaction",
+    ];
+
+    let table: Vec<&str> = RPC_SURFACE.iter().map(|m| m.name).collect();
+    assert_eq!(
+        table, golden,
+        "RPC_SURFACE changed. This is a shared namespace: claim the name from the \
+         PMO (docs/WIRE-NAMESPACE-REGISTRY.md, section 5) and update the golden \
+         list here in the same commit."
+    );
+
+    // A registry has to be sorted and unique to be readable as one.
+    let mut sorted = table.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted, table, "RPC_SURFACE must be sorted and free of duplicates");
+
+    // What the dispatcher actually accepts, read out of its own source.
+    let raw = dispatch_arm_names();
+    assert!(
+        raw.len() >= golden.len(),
+        "the arm extractor found only {} names — it has stopped seeing the \
+         dispatch table and is no longer freezing anything: {raw:?}",
+        raw.len()
+    );
+
+    // Duplicates in the source, which a `match` would only warn about, and only
+    // after the merge that creates them.
+    let mut seen: Vec<&str> = Vec::new();
+    for name in &raw {
+        assert!(
+            !seen.contains(&name.as_str()),
+            "`{name}` is dispatched twice; the second arm is dead and the \
+             compiler's `unreachable_patterns` warning is not an error"
+        );
+        seen.push(name);
+    }
+
+    let mut arms: Vec<&str> = raw.iter().map(String::as_str).collect();
+    arms.sort_unstable();
+    assert_eq!(
+        arms, golden,
+        "the dispatcher and RPC_SURFACE disagree. Every name `route` answers must \
+         be in the table with a stability class, and every name in the table must \
+         be dispatched."
+    );
+
+    // The wildcard must be the typed refusal, not a silent fallthrough.
+    assert!(
+        ROUTE_SOURCE.contains("other => return Err(RpcError::method_not_found(other)),"),
+        "an unknown method must answer -32601 by name; a `_ => ...` that swallowed \
+         it would make a typo look like a working call"
+    );
+}
+
+/// Every frozen name routes, and nothing else does.
+///
+/// The negative half is the one that matters. `-32601` is the only answer a
+/// name outside the namespace may give: an integrator's probe of a name this
+/// build does not serve must not accidentally reach a handler, and the names
+/// listed in [`RPC_ABSENT`] — each of which a real integrator has sent — must
+/// stay absent rather than being quietly re-added under their Genesis-3
+/// meaning.
+#[test]
+fn only_the_frozen_names_route() {
+    for m in RPC_SURFACE {
+        let err = route(m.name, None).err();
+        assert_ne!(
+            err.as_ref().map(|e| e.code),
+            Some(-32601),
+            "`{}` is in RPC_SURFACE but the dispatcher does not know it",
+            m.name
+        );
+        // A refused method must answer with its own permanent code, and must
+        // do so at the dispatcher — never by reaching the node.
+        if m.stability == Stability::Refused {
+            let code = err.as_ref().map(|e| e.code);
+            assert!(
+                code == Some(NO_TRANSACTION_INDEX) || code == Some(NO_WALLET),
+                "`{}` is classed Refused but answered {code:?}; a refusal must \
+                 carry the code that says which capability is missing",
+                m.name
+            );
+        }
+    }
+
+    let outside = [
+        // The names an integrator probed on the live endpoint, all absent.
+        "getblockbyheight",
+        "getissuance",
+        "getpeers",
+        "getstakinginfo",
+        "getsupply",
+        "getsupplyinfo",
+        "getvalidators",
+        "help",
+        // Genesis-3 names that must not silently come back with PoW meanings.
+        "getblock",
+        "getblockhash",
+        "getdaginfo",
+        "getdifficultyhistory",
+        "gethashrate",
+        "getnetworkinfo",
+        "getrawmempool",
+        "getsupplydistribution",
+        "gettxstatus",
+        "validateaddress",
+        // Near misses: a method name is an exact string, not a fuzzy match.
+        "GetBalance",
+        "getbalance ",
+        " getbalance",
+        "getBalance",
+        "get_balance",
+        "",
+    ];
+    for name in outside {
+        assert_eq!(
+            route(name, None).err().map(|e| e.code),
+            Some(-32601),
+            "`{name}` must answer -32601; if this build now serves it, claim the \
+             name from the PMO and add it to RPC_SURFACE"
+        );
+    }
+
+    // Every name the capability document calls absent really is absent — the
+    // two lists cannot drift into telling a client something untrue.
+    for (name, _) in RPC_ABSENT {
+        assert_eq!(
+            route(name, None).err().map(|e| e.code),
+            Some(-32601),
+            "`{name}` is advertised as absent but the dispatcher serves it"
+        );
+        assert!(
+            !RPC_SURFACE.iter().any(|m| m.name == *name),
+            "`{name}` is in both RPC_SURFACE and RPC_ABSENT"
+        );
+    }
+}
+
+/// `getcapabilities` answers the questions probing was being used to answer,
+/// at constant cost.
+#[test]
+fn getcapabilities_describes_the_surface_without_reading_state() {
+    let spy = Spy::new();
+    call(spy.as_ref(), &request("getcapabilities", "[]"));
+    assert_eq!(spy.last(), Some(RpcRequest::Capabilities));
+
+    let genesis = [0x11u8; 32];
+    let v = capabilities_json("0.1.0-test", &genesis, 0xB10C_0005);
+
+    assert_eq!(v.get("rpc_surface_version"), Some(&Json::s(RPC_SURFACE_VERSION)));
+    assert_eq!(v.get("node_version"), Some(&Json::s("0.1.0-test")));
+    assert_eq!(v.get("genesis_block_id"), Some(&Json::hex(&genesis)));
+    // The raw header magic, not a friendlier `4`: a client recomputing a block
+    // id hashes this value.
+    assert_eq!(v.get("block_version"), Some(&Json::u(0xB10C_0005)));
+
+    // Every method, with its class, in the order the table declares.
+    let Some(Json::Arr(methods)) = v.get("methods") else { panic!("no methods array") };
+    assert_eq!(methods.len(), RPC_SURFACE.len());
+    for (entry, m) in methods.iter().zip(RPC_SURFACE) {
+        assert_eq!(entry.get("name"), Some(&Json::s(m.name)));
+        assert_eq!(entry.get("stability"), Some(&Json::s(m.stability.as_str())));
+    }
+
+    // The alias is declared as one, so a client does not have to discover that
+    // two names are one question by comparing two answers.
+    let listunspent = methods
+        .iter()
+        .find(|m| m.get("name") == Some(&Json::s("listunspent")))
+        .expect("listunspent must be listed");
+    assert_eq!(listunspent.get("alias_of"), Some(&Json::s("getutxos")));
+
+    // The absent list is the substitute for probing.
+    let Some(Json::Arr(absent)) = v.get("absent") else { panic!("no absent array") };
+    for want in ["getblockbyheight", "getsupply", "getvalidators", "getstakinginfo", "help"] {
+        assert!(
+            absent.iter().any(|a| a.get("name") == Some(&Json::s(want))),
+            "`{want}` was probed by a real integrator and must be answered here"
+        );
+    }
+
+    // Every code this surface can return, so a client builds its branch table
+    // from the node rather than from a document describing another build.
+    let Some(Json::Arr(codes)) = v.get("error_codes") else { panic!("no error_codes") };
+    for want in [NO_TRANSACTION_INDEX, NO_WALLET, SLOT_EMPTY, TX_REFUSED, MEMPOOL_FULL] {
+        assert!(
+            codes.iter().any(|c| c.get("code") == Some(&Json::Num(want.to_string()))),
+            "code {want} is reachable but undocumented in getcapabilities"
+        );
+    }
+
+    // R3, stated in the capability document because parsing an amount as a JSON
+    // number is the most common integration bug on this chain.
+    assert_eq!(
+        v.get("encoding").and_then(|e| e.get("amounts")),
+        Some(&Json::s("decimal_string"))
+    );
+    // Batch is refused by `handle_body`; a client must be able to learn that
+    // without sending one.
+    assert_eq!(
+        v.get("transport").and_then(|t| t.get("batch")),
+        Some(&Json::Bool(false))
+    );
+    // The limits a client must respect are numbers, not prose in a README.
+    assert_eq!(
+        v.get("limits").and_then(|l| l.get("utxo_page_max")),
+        Some(&Json::u(UTXO_PAGE_MAX as u64))
+    );
+    assert_eq!(
+        v.get("limits").and_then(|l| l.get("max_body_bytes")),
+        Some(&Json::u(MAX_BODY_BYTES as u64))
+    );
+    // The port's honest description of itself.
+    assert_eq!(
+        v.get("authentication").and_then(|a| a.get("scheme")),
+        Some(&Json::s("none"))
+    );
+    // R1: there is no confirmation count to report, and the field says so
+    // rather than being absent, which a client would read as "unknown".
+    assert_eq!(
+        v.get("settlement").and_then(|s| s.get("confirmations")),
+        Some(&Json::Null)
+    );
+}
+
+/// What the read surface costs at carryover scale — a measurement, not an
+/// assertion, which is why it is `#[ignore]`d.
+///
+/// Run it with `cargo test -p bloch-pos-node --bins --ignored
+/// what_a_read_costs_at_carryover_scale -- --nocapture`.
+///
+/// # Why this exists
+///
+/// The RPC port has no authentication, no authorisation and no rate limit, and
+/// every read is serviced **on the consensus thread**. So the price of a method
+/// is not a performance footnote: it is the size of the lever an anonymous
+/// caller has on block production. Two of the methods here walk the whole eUTXO
+/// set — `getbalance` walks it twice, once to sum and once to count — and that
+/// set is 452,726 entries at the Genesis-4 carryover and only grows.
+///
+/// The numbers this prints are the input to §4 and §5 of
+/// `docs/specs/BLOCH-RPC-STABILITY-V4.md`, which is why any proposed method
+/// that would add a third scan has to justify itself against them.
+///
+/// Measured 2026-08-31, release build, 452,726 entries:
+///
+/// ```text
+/// getbalance          18.2 ms    (two full scans)
+/// getutxos limit=100  10.7 ms    (one full scan, collects every match)
+/// getutxos limit=1000 30.8 ms
+/// gettxout            28 µs      (one map lookup)
+/// getcapabilities     100 µs     (constants only)
+/// ```
+///
+/// Reads are serialised onto the consensus thread, so ~55 `getbalance` calls a
+/// second are 100% of a validator's consensus thread — on a port with no
+/// authentication and no rate limit.
+#[test]
+#[ignore = "a measurement of the read surface, not a pass/fail assertion"]
+fn what_a_read_costs_at_carryover_scale() {
+    use std::time::Instant;
+
+    // The live carryover, to the entry.
+    const CARRYOVER_N: u32 = 452_726;
+
+    let mut balances = Vec::with_capacity(CARRYOVER_N as usize);
+    for i in 0..CARRYOVER_N {
+        let mut txid = [0u8; 32];
+        txid[..4].copy_from_slice(&i.to_le_bytes());
+        let mut script_hash = [0u8; 32];
+        // A hundred distinct holders, so the filter matches a realistic slice
+        // rather than everything or nothing.
+        script_hash[0] = (i % 100) as u8;
+        balances.push(EutxoEntry { txid, vout: 0, value: 100_000, script_hash });
+    }
+
+    let validators = vec![GenesisValidator {
+        index: 0,
+        pubkey: vec![0xAA; 64],
+        staked_sat: 200_000 * 100_000_000,
+        randao_commitment: [1u8; 32],
+        withdrawal_credentials: vec![],
+        commission_bps: 500,
+    }];
+
+    let built = Instant::now();
+    let state = CommittedState::genesis(
+        BlockId::of(&genesis_header()),
+        [9u8; 32],
+        &validators,
+        &[0],
+        [0u8; 32],
+        [0u8; 32],
+        [0u8; 32],
+        EvmCommitment {
+            account_root: [0u8; 32],
+            receipts_root: [0u8; 32],
+            gas_used: 0,
+            base_fee_per_gas: 0,
+        },
+        &balances,
+    );
+    println!("built {CARRYOVER_N} entries in {:?}", built.elapsed());
+
+    let script = [0u8; 32];
+
+    let t = Instant::now();
+    let _ = balance_json(&state, &script);
+    println!("getbalance          {:?}  (two full scans)", t.elapsed());
+
+    let t = Instant::now();
+    let _ = utxos_json(&state, &script, UTXO_PAGE_DEFAULT);
+    println!("getutxos limit=100  {:?}  (one full scan, collects every match)", t.elapsed());
+
+    let t = Instant::now();
+    let _ = utxos_json(&state, &script, UTXO_PAGE_MAX);
+    println!("getutxos limit=1000 {:?}", t.elapsed());
+
+    let t = Instant::now();
+    let _ = txout_json(&state, &balances[0].txid, 0);
+    println!("gettxout            {:?}  (one map lookup)", t.elapsed());
+
+    let t = Instant::now();
+    let _ = capabilities_json("0.1.0-test", &[0u8; 32], VERSION_G4);
+    println!("getcapabilities     {:?}  (constants only)", t.elapsed());
+}
+
 /// `gettxout` routes one outpoint, and refuses what it cannot answer.
 ///
 /// The refusals matter more than the happy path here. This method exists so a

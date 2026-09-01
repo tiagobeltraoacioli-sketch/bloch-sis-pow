@@ -1968,6 +1968,17 @@ impl Engine {
 
     fn serve_rpc(&mut self, req: RpcRequest) -> RpcResult {
         match req {
+            // Answered from constants and two O(1) reads. It still crosses the
+            // engine channel like every other method, so that there is exactly
+            // one path into this state and no second, cheaper one that could
+            // observe a half-applied block — but it is the only method here
+            // whose cost does not grow with the chain.
+            RpcRequest::Capabilities => Ok(rpc::capabilities_json(
+                env!("CARGO_PKG_VERSION"),
+                self.chain[0].1.as_bytes(),
+                VERSION_G4,
+            )),
+
             RpcRequest::ChainInfo => Ok(rpc::chain_info_json(
                 &self.state,
                 &self.head_id(),

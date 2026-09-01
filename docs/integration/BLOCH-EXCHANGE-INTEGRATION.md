@@ -11,6 +11,20 @@
 > Sections 1–10 remain the reference for the Genesis-3 chain and for the
 > Genesis-3 → Genesis-4 balance mapping. **Section 11 is superseded**: it was accurate on
 > the day it was written and describes a pre-launch state that Genesis-4 has since passed.
+>
+> **Two further warnings, added 2026-08-31.**
+>
+> 1. **The `Endpoints` block below is stale.** `g2rpc.posternpool.com` was repointed to a
+>    Genesis-4 PoS node on 2026-08-21 and no longer serves Genesis-3. The Genesis-3 chain
+>    has not produced a block since 2026-08-13. The method surface at that host is the
+>    Genesis-4 one (`getchaininfo`, `script_hash` in place of addresses), **not** the one
+>    documented here. Do not point a Genesis-3 client at it.
+> 2. **This document was not part of the 2026-08-31 claim audit.** That audit covered
+>    `BLOCH-GENESIS4-EXCHANGE-INTEGRATION.md` only — see
+>    [`INTEGRATION-BOOK-AUDIT-2026-08-31.md`](INTEGRATION-BOOK-AUDIT-2026-08-31.md). Its
+>    claims are unverified against current code and describe a chain that is no longer
+>    running. Treat it as a historical reference for the carryover mapping, and nothing
+>    else.
 
 ```
 Document:   BLOCH-EXCHANGE-INTEGRATION

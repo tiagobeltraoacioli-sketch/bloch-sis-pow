@@ -1,0 +1,35 @@
+# Host table for scripts/fleet-gate-sweep.sh — READ-ONLY probe targets.
+#
+# The sweep runs exactly one command per host: `<binary> selfcheck --json`.
+# That opens no data directory, binds no port, and writes nothing. Adding a
+# host here grants no other access.
+#
+# Columns, tab-separated:
+#   label <TAB> host <TAB> ssh_key_basename <TAB> binary_path <TAB> role
+#
+# `ssh_key_basename` is resolved under ~/.ssh. `role` is free text; the single
+# row marked `ref` is the default reference the rest are compared against.
+#
+# WHY THE ARCHIVALS ARE LISTED FIRST AND SEPARATELY
+# They serve the public RPC quorum and they are NOT on the fleet binary: the
+# fleet moved to bloch-pos-cinco while the archivals stayed on
+# bloch-pos-quatro. They are the population most likely to fork on a flag day
+# and the least likely to be noticed doing it, because a wrong answer from an
+# archival looks like an answer.
+#
+# The 7 "grandes" carry ~9 validators each (63 of 64) since the 2026-08-31
+# migration off the classic boxes. One row per BOX, not per validator: every
+# validator on a box runs the same binary file, so probing the box answers for
+# all of them. If a box is ever split across two binaries, split the row.
+
+# label			host			ssh_key			binary_path				role
+archival-1		139.180.173.231		edgevana_fleet_g4	/home/ubuntu/g4/bloch-pos-quatro	archival
+archival-2		139.180.166.5		edgevana_fleet_g4	/home/ubuntu/g4/bloch-pos-quatro	archival
+rpc-public		136.244.90.238		edgevana_rpc_2026	/home/ubuntu/g4/bloch-pos-fixed		rpc
+grande-1		139.84.201.52		edgevana_fleet_g4	/home/ubuntu/g4/bloch-pos-cinco		ref
+grande-2		139.84.202.139		edgevana_fleet_g4	/home/ubuntu/g4/bloch-pos-cinco		validators
+grande-3		139.84.204.46		edgevana_fleet_g4	/home/ubuntu/g4/bloch-pos-cinco		validators
+grande-4		139.84.205.54		edgevana_fleet_g4	/home/ubuntu/g4/bloch-pos-cinco		validators
+grande-5		149.28.180.128		edgevana_fleet_g4	/home/ubuntu/g4/bloch-pos-cinco		validators
+grande-6		67.219.108.230		edgevana_fleet_g4	/home/ubuntu/g4/bloch-pos-cinco		validators
+grande-7		67.219.108.96		edgevana_fleet_g4	/home/ubuntu/g4/bloch-pos-cinco		validators

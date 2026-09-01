@@ -48,3 +48,9 @@ deploy/artifacts/
 # Python bytecode (sdk/codegen, tools/*)
 __pycache__/
 *.pyc
+
+# Fixtures de benchmark: contem validator.key de descarte. Chave privada nao
+# entra no repositorio, nem descartavel — este repo e empurrado para GitLab e
+# GitHub, e uma chave commitada e indistinguivel de um vazamento para quem
+# audita depois. Regenerar com os scripts de bench.
+bench/

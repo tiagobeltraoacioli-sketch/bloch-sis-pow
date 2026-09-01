@@ -678,6 +678,223 @@ fn hex32_from(s: &str) -> Option<[u8; 32]> {
     bytes.try_into().ok()
 }
 
+// ─── The frozen method namespace ────────────────────────────────────────────
+//
+// # Why a table and not just the `match`
+//
+// The dispatch below is `match method { "getchaininfo" => …, … }` over a
+// `&str`. Rust checks nothing useful about that: a string `match` has no
+// exhaustiveness to verify, and a second arm with the same literal is at most
+// an `unreachable_patterns` warning — and only when both arms land in the same
+// `match`, in the same file, after a merge. Two worktrees each adding one arm
+// produce no diagnostic at all until they meet, which is exactly the failure
+// mode `docs/WIRE-NAMESPACE-REGISTRY.md` was written for (four collisions in
+// one day, in namespaces whose dispatch is `if`/`==` rather than `match`).
+//
+// So the namespace is frozen here instead, as data: [`RPC_SURFACE`] is the
+// authoritative list of every method name this build answers, and
+// `the_rpc_method_namespace_is_frozen` in `rpc/tests.rs` asserts in both
+// directions — every name in the table routes, and nothing outside the table
+// does. Adding a method without adding it here fails the test; adding a name
+// here without wiring it fails the test. That is the strongest guarantee
+// string dispatch admits, and it is what makes the PMO registry's §5 entry
+// checkable rather than aspirational.
+
+/// What an integrator may rely on for a method, across a release.
+///
+/// The classes are about *change*, not quality. `Provisional` does not mean
+/// broken; it means an integrator who hard-codes today's response shape will
+/// have to touch their code again, and the contract says so up front rather
+/// than after it happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stability {
+    /// The name, its parameters, and every field of its response keep their
+    /// meaning for the life of the major surface version. Fields may be
+    /// **added**; none is removed or repurposed without a major bump and a
+    /// deprecation window in which both shapes are served.
+    Committed,
+    /// The name and its meaning hold, but the response shape is not finished
+    /// and will change within this major version. Read the specific fields you
+    /// need and tolerate new ones; do not assume the set is closed.
+    Provisional,
+    /// The method is routed and answers, permanently, with a typed error. It
+    /// exists precisely so the answer is "this node cannot do that, here is
+    /// why, do not retry" rather than "method not found", which would send an
+    /// integrator hunting for a newer binary that does not exist.
+    Refused,
+}
+
+impl Stability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Stability::Committed => "committed",
+            Stability::Provisional => "provisional",
+            Stability::Refused => "refused",
+        }
+    }
+}
+
+/// One entry in the frozen namespace.
+pub struct Method {
+    /// The wire name. This is the namespaced identifier; see the PMO registry.
+    pub name: &'static str,
+    pub stability: Stability,
+    /// Set when this name shares another name's handler, so a client can tell
+    /// an alias from a second opinion. Two names with one meaning is fine; two
+    /// names with two implementations of the same question is how a client
+    /// ends up with two balances that disagree.
+    pub alias_of: Option<&'static str>,
+    pub summary: &'static str,
+}
+
+/// The surface version, as `major.minor.patch`.
+///
+/// - **major** — a committed method changed meaning, lost a field, or was
+///   removed. An integrator must read the changelog before upgrading.
+/// - **minor** — a method or a response field was **added**, or a provisional
+///   response changed shape. Nothing an integrator already reads has moved.
+/// - **patch** — wording of an error message, or a documentation fix.
+///
+/// `getcapabilities` reports this, which is the whole point of it: a client
+/// asks one question at connect time instead of probing fourteen names and
+/// inferring the answer from which ones return -32601.
+pub const RPC_SURFACE_VERSION: &str = "4.1.0";
+
+/// Every method name this build answers. Sorted, unique, and asserted to be
+/// exactly the set the dispatcher accepts.
+pub const RPC_SURFACE: &[Method] = &[
+    Method {
+        name: "getbalance",
+        stability: Stability::Committed,
+        alias_of: None,
+        summary: "summed value of every unspent output locked to a 32-byte script hash",
+    },
+    Method {
+        name: "getblockbyid",
+        stability: Stability::Committed,
+        alias_of: None,
+        summary: "one block by its 32-byte block id, canonical or not",
+    },
+    Method {
+        name: "getblockbyslot",
+        stability: Stability::Committed,
+        alias_of: None,
+        summary: "the canonical block at a slot; SLOT_EMPTY (-32007) when the proposer missed",
+    },
+    Method {
+        name: "getblockcount",
+        stability: Stability::Committed,
+        alias_of: None,
+        summary: "head height, slot, epoch, and the finalized height beside them",
+    },
+    Method {
+        name: "getcapabilities",
+        stability: Stability::Committed,
+        alias_of: None,
+        summary: "this table, the surface version, the limits, and the deliberately absent names",
+    },
+    Method {
+        name: "getchaininfo",
+        stability: Stability::Committed,
+        alias_of: None,
+        summary: "head, both checkpoints, active stake, base fee, and this node's lag in slots",
+    },
+    Method {
+        name: "getmempoolinfo",
+        stability: Stability::Committed,
+        alias_of: None,
+        summary: "this node's pending count, capacity and next price — node-local, not consensus",
+    },
+    Method {
+        name: "getnewaddress",
+        stability: Stability::Refused,
+        alias_of: None,
+        summary: "always NO_WALLET (-32006): a node RPC does not mint key material",
+    },
+    Method {
+        name: "gettransaction",
+        stability: Stability::Refused,
+        alias_of: None,
+        summary: "always NO_TRANSACTION_INDEX (-32005): a Genesis-4 transaction has no id",
+    },
+    Method {
+        name: "gettxout",
+        stability: Stability::Committed,
+        alias_of: None,
+        summary: "is this one outpoint still unspent, answered against committed state",
+    },
+    Method {
+        name: "getutxos",
+        stability: Stability::Provisional,
+        alias_of: None,
+        summary: "the outputs themselves, first page only — pagination is not final, see `truncated`",
+    },
+    Method {
+        name: "getvalidator",
+        stability: Stability::Committed,
+        alias_of: None,
+        summary: "one registry record by index, with commission and lifecycle",
+    },
+    Method {
+        name: "getvalidatorcount",
+        stability: Stability::Committed,
+        alias_of: None,
+        summary: "registered total, active count, and total active stake",
+    },
+    Method {
+        name: "listunspent",
+        stability: Stability::Provisional,
+        alias_of: Some("getutxos"),
+        summary: "the exchange-facing name for `getutxos` — one request, one meaning",
+    },
+    Method {
+        name: "sendrawtransaction",
+        stability: Stability::Committed,
+        alias_of: None,
+        summary: "canonical transaction bytes in, mempool admission out; no consensus txid comes back",
+    },
+];
+
+/// Names an integrator is known to probe for, that this build deliberately
+/// does not serve, each with the reason it is absent.
+///
+/// This list is the reason `getcapabilities` exists. Every one of these was
+/// discovered by an integrator sending the call and reading -32601, which
+/// cannot distinguish "never existed here", "not built yet" and "you are
+/// talking to an old node". Saying it once, in a structured field, is cheaper
+/// than every integrator rediscovering it.
+pub const RPC_ABSENT: &[(&str, &str)] = &[
+    ("getblockbyheight", "height is not the addressing unit under PoS; use `getblockbyslot`"),
+    ("getissuance", "no method reads the issued-supply counter yet; proposed, not built"),
+    ("getpeers", "peer identities are not exposed on an unauthenticated port"),
+    ("getstakinginfo", "proposed as `getstakedistribution`, not built"),
+    ("getsupply", "proposed as `getsupply`, not built — see BLOCH-RPC-STABILITY-V4.md §5"),
+    ("getsupplyinfo", "Genesis-3 name; not carried forward"),
+    ("getvalidators", "no bulk validator listing yet; read one at a time with `getvalidator`"),
+    ("help", "the machine-readable form is this method"),
+];
+
+/// Every error code this surface can return, paired with its name.
+///
+/// Emitted by `getcapabilities` so a client can build its branch table from the
+/// node instead of from a document that may describe a different build.
+pub const RPC_ERROR_CODES: &[(i64, &str)] = &[
+    (-32700, "PARSE_ERROR"),
+    (-32600, "INVALID_REQUEST"),
+    (-32601, "METHOD_NOT_FOUND"),
+    (-32602, "INVALID_PARAMS"),
+    (-32603, "INTERNAL_ERROR"),
+    (BLOCK_NOT_FOUND, "BLOCK_NOT_FOUND"),
+    (VALIDATOR_NOT_FOUND, "VALIDATOR_NOT_FOUND"),
+    (TX_DECODE_FAILED, "TX_DECODE_FAILED"),
+    (MEMPOOL_FULL, "MEMPOOL_FULL"),
+    (NODE_UNAVAILABLE, "NODE_UNAVAILABLE"),
+    (NO_TRANSACTION_INDEX, "NO_TRANSACTION_INDEX"),
+    (NO_WALLET, "NO_WALLET"),
+    (SLOT_EMPTY, "SLOT_EMPTY"),
+    (TX_REFUSED, "TX_REFUSED"),
+];
+
 // ─── The request surface ────────────────────────────────────────────────────
 
 /// A decoded call, with its arguments already validated into node types.
@@ -689,6 +906,14 @@ fn hex32_from(s: &str) -> Option<[u8; 32]> {
 /// has already been decided.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RpcRequest {
+    /// `getcapabilities` — the surface describing itself.
+    ///
+    /// Constant cost by construction: it reads [`RPC_SURFACE`], [`RPC_ABSENT`],
+    /// [`RPC_ERROR_CODES`] and the limit constants, plus two O(1) values the
+    /// engine already holds. It walks no state, so it is the one method whose
+    /// price does not grow with the chain — which matters on an unauthenticated
+    /// port, because the method every client calls first must be the cheapest.
+    Capabilities,
     ChainInfo,
     /// `getblockcount` — the polling method, carrying finality with it.
     BlockCount,
@@ -853,6 +1078,8 @@ fn want_hex32(params: Option<&Json>, pos: usize, name: &str) -> Result<[u8; 32],
 /// and "no such method" would send an integrator looking for a newer build.
 pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError> {
     Ok(match method {
+        // First, because it is what a client should call first.
+        "getcapabilities" => RpcRequest::Capabilities,
         "getchaininfo" => RpcRequest::ChainInfo,
         "getblockcount" => RpcRequest::BlockCount,
         "getblockbyslot" => RpcRequest::BlockBySlot(want_u64(params, 0, "slot")?),
@@ -1165,6 +1392,152 @@ fn respond(sock: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
 // §5.5 gives and `engine::lmd_ghost_head` follows: a value a client will read
 // must be derivable from its inputs so it can be tested without standing up a
 // node. Every one of them is exercised below against a real `CommittedState`.
+
+/// `getcapabilities` — the surface, described by the node that serves it.
+///
+/// # Why this method exists
+///
+/// Before it, the only way to learn what a Bloch node speaks was to send a call
+/// and read the error. That is a bad protocol for three reasons an integrator
+/// hit in order: `-32601` cannot distinguish "this build never had it" from
+/// "this build is older than the one you read about"; the two *deliberate*
+/// refusals (`gettransaction`, `getnewaddress`) look like gaps rather than
+/// answers until you read their message; and nothing at all tells a client
+/// which parts of a response it may hard-code. Probing also costs one
+/// round-trip per guess against a port with no rate limit.
+///
+/// So the node states it: the surface version, every method with its stability
+/// class, the names deliberately absent and why, every error code, and the
+/// limits that bound a request. A client asks once at connect time and branches
+/// on data instead of on absence.
+///
+/// # Cost
+///
+/// Constant. Everything but `node_version`, `genesis_block_id` and
+/// `block_version` is a `const` in this module; those three are an `env!`, an
+/// O(1) index into the canonical chain, and a `u32`. No state walk, no
+/// allocation proportional to the chain. This is deliberate and it is a
+/// property to preserve: the method every client calls first, on an
+/// unauthenticated port, must not be a lever.
+pub fn capabilities_json(
+    node_version: &str,
+    genesis_block_id: &[u8; 32],
+    block_version: u32,
+) -> Json {
+    let methods: Vec<Json> = RPC_SURFACE
+        .iter()
+        .map(|m| {
+            Json::obj(vec![
+                ("name", Json::s(m.name)),
+                ("stability", Json::s(m.stability.as_str())),
+                ("alias_of", m.alias_of.map_or(Json::Null, Json::s)),
+                ("summary", Json::s(m.summary)),
+            ])
+        })
+        .collect();
+
+    let absent: Vec<Json> = RPC_ABSENT
+        .iter()
+        .map(|(name, why)| {
+            Json::obj(vec![("name", Json::s(*name)), ("reason", Json::s(*why))])
+        })
+        .collect();
+
+    let codes: Vec<Json> = RPC_ERROR_CODES
+        .iter()
+        .map(|(code, name)| {
+            Json::obj(vec![
+                ("code", Json::Num(code.to_string())),
+                ("name", Json::s(*name)),
+            ])
+        })
+        .collect();
+
+    Json::obj(vec![
+        ("rpc_surface_version", Json::s(RPC_SURFACE_VERSION)),
+        ("node_version", Json::s(node_version)),
+        // The header `version` field verbatim, the same 32-bit magic
+        // `block_json` emits. A client that recomputes a block id hashes this
+        // value, so it is reported unaltered here too.
+        ("block_version", Json::u(u64::from(block_version))),
+        // Chain identity that does not depend on a name anybody could reuse:
+        // two nodes agreeing on this agree on the same genesis.
+        ("genesis_block_id", Json::hex(genesis_block_id)),
+        ("methods", Json::Arr(methods)),
+        ("absent", Json::Arr(absent)),
+        ("error_codes", Json::Arr(codes)),
+        (
+            "encoding",
+            Json::obj(vec![
+                // R3. The single most common integration bug on this chain is
+                // parsing an amount as a JSON number, so it is stated in the
+                // capability document rather than only in prose.
+                ("amounts", Json::s("decimal_string")),
+                ("hashes", Json::s("hex_lowercase_unprefixed_32_bytes")),
+                ("hash_input", Json::s("hex_with_or_without_0x")),
+                // R4.
+                ("errors", Json::s("jsonrpc_2_0_error_object")),
+                ("params", Json::s("positional_array_or_named_object")),
+            ]),
+        ),
+        (
+            "transport",
+            Json::obj(vec![
+                ("http", Json::s("1.1")),
+                ("verb", Json::s("POST")),
+                ("batch", Json::Bool(false)),
+                ("chunked_transfer_encoding", Json::Bool(false)),
+                ("keep_alive", Json::Bool(false)),
+                ("tls", Json::Bool(false)),
+                ("content_length_required", Json::Bool(true)),
+            ]),
+        ),
+        (
+            "limits",
+            Json::obj(vec![
+                ("max_body_bytes", Json::u(MAX_BODY_BYTES as u64)),
+                ("max_header_bytes", Json::u(MAX_HEADER_BYTES as u64)),
+                ("max_connections", Json::u(MAX_CONNECTIONS as u64)),
+                ("max_json_depth", Json::u(u64::from(MAX_DEPTH))),
+                ("engine_timeout_secs", Json::u(ENGINE_TIMEOUT.as_secs())),
+                ("io_timeout_secs", Json::u(IO_TIMEOUT.as_secs())),
+                ("utxo_page_default", Json::u(UTXO_PAGE_DEFAULT as u64)),
+                ("utxo_page_max", Json::u(UTXO_PAGE_MAX as u64)),
+            ]),
+        ),
+        (
+            "authentication",
+            Json::obj(vec![
+                ("scheme", Json::s("none")),
+                ("rate_limit", Json::Bool(false)),
+                (
+                    "note",
+                    Json::s(
+                        "this port authenticates nothing and rate-limits nothing; \
+                         `sendrawtransaction` is a write, so an exposed bind must be \
+                         firewalled to the clients meant to reach it",
+                    ),
+                ),
+            ]),
+        ),
+        (
+            "settlement",
+            Json::obj(vec![
+                ("model", Json::s("casper_finality")),
+                ("confirmations", Json::Null),
+                (
+                    "rule",
+                    Json::s(
+                        "credit when the block carrying the output reports \
+                         `finalized: true`; depth is not security under proof of \
+                         stake and no number of further blocks substitutes for \
+                         finalisation",
+                    ),
+                ),
+            ]),
+        ),
+    ])
+}
 
 /// `getchaininfo` — the method the finality-aware consumers read (V4 §2).
 #[allow(clippy::too_many_arguments)]

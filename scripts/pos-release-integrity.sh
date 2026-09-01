@@ -113,9 +113,68 @@ git diff --exit-code -- \
   "$NODE_DIR/Cargo.lock" "$COMMITTEE_DIR/Cargo.lock" \
   || fail "a build rewrote a committed Cargo.lock."
 
+# ── 4. The binary can state which consensus flag days it knows ───────────────
+# A release is only comparable to a fleet if both can answer "which activation
+# epochs do you implement?". Until `selfcheck --json` existed, neither could:
+# `selfcheck` printed `self-check passed` and silently IGNORED `--json`, so the
+# only way to know whether a box would follow a flag day was to arm it and
+# watch. That is how genesis4-node-20260814 shipped — it predated every armed
+# gate, diverged on schedule, and its release page said nothing, because there
+# was no artifact that could say it.
+#
+# Three things are blocking here:
+#   a. the statement exists and parses;
+#   b. it is COMPLETE — every *_ACTIVATION_EPOCH in params.rs appears in it.
+#      An incomplete statement is worse than none: two binaries that genuinely
+#      disagree would publish the same gates_digest and a fleet sweep would
+#      call them compatible;
+#   c. the digest is stable across the two identical builds above, since the
+#      fleet sweep compares it as a string.
+GJ="$($WORK/t1/release/bloch-pos selfcheck --json 2>/dev/null)" \
+  || fail "\`bloch-pos selfcheck --json\` failed. The release binary cannot \
+state which consensus gates it links, so it cannot be compared against the \
+fleet before a flag day."
+
+case "$GJ" in
+  *'"gates_digest"'*) : ;;
+  *) fail "\`selfcheck --json\` produced no gates_digest. Either the flag is \
+being ignored again (the exact defect this gate replaces — the pre-2026-09 \
+binary accepted --json and printed 'self-check passed'), or the statement was \
+removed." ;;
+esac
+
+# (b) completeness, checked here as well as in the unit test, because CI must
+# refuse to CUT a release with a drifted table even if tests were skipped.
+DECLARED="$(grep -c '^pub const [A-Za-z0-9_]*_ACTIVATION_EPOCH' \
+  "$COMMITTEE_DIR/src/params.rs" || true)"
+STATED="$(printf '%s' "$GJ" | grep -c '"name":' || true)"
+[ "$DECLARED" -gt 0 ] \
+  || fail "found zero \`pub const *_ACTIVATION_EPOCH\` in params.rs. The \
+declaration style changed and this check no longer sees them — as written it \
+would wave through any gate table at all. Fix the pattern."
+[ "$DECLARED" = "$STATED" ] \
+  || fail "params.rs declares $DECLARED activation gate(s) but \
+\`selfcheck --json\` states $STATED. The CONSENSUS_GATES table in \
+crates/bloch-pos-node/src/main.rs is out of sync. An incomplete gates_digest \
+makes incompatible binaries look identical to the fleet sweep. Add the \
+missing row(s); do NOT change params.rs to make this pass."
+
+GD="$(printf '%s' "$GJ" | sed -n 's/.*"gates_digest": "\([0-9a-f]*\)".*/\1/p')"
+GD2="$("$WORK/t2/release/bloch-pos" selfcheck --json 2>/dev/null \
+  | sed -n 's/.*"gates_digest": "\([0-9a-f]*\)".*/\1/p')"
+[ -n "$GD" ] && [ "$GD" = "$GD2" ] \
+  || fail "gates_digest differs between two identical builds ($GD vs $GD2). \
+The fleet sweep compares this as a string; a digest that is not a pure \
+function of the source is useless."
+echo "consensus gates: ok ($DECLARED gate(s) declared and stated, digest $GD)"
+
 echo
 echo "pos-release-integrity: PASS — locked, deterministic (same-path),"
-echo "commit-stamped. Reference hashes for THIS runner's platform:"
+echo "commit-stamped, gate-complete. Reference values for THIS runner's platform:"
 echo "  bloch-pos @ $COMMIT : $H1"
+echo "  gates_digest        : $GD"
+echo "PUBLISH THE gates_digest ON THE RELEASE PAGE. It is what an operator"
+echo "compares a box against with scripts/fleet-gate-sweep.sh before arming a"
+echo "flag day, and the only thing that makes 'will this node follow?' answerable"
 echo "NOTE: this hash is platform- and path-scoped. The publishable reference"
 echo "hash is the canonical /build container build — deploy/RELEASE-INTEGRITY.md §3."
