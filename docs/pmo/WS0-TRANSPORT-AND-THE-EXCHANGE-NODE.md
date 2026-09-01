@@ -265,10 +265,79 @@ against a chain that exists only on their machine. **The finality signal we told
 them to trust is the signal that fails.** This is the settlement guarantee that
 does not hold, reached from the transport side.
 
-*Verified:* the constants, gate conditions, absent floor, and the absence of every
-peer surface. *Inferred:* the leak trajectory — the arithmetic was read, not run.
-**Ask: run it.** A single simulation over epochs 1400+ turns the most important
-claim on this page from inferred to measured, and it needs no fleet access.
+### 7.4.1 MEASURED, 2026-09-01 — it finalizes alone in under eight hours
+
+The trajectory above was read, not run. **It has now been run**, against the
+crate's real `FinalityState::process_epoch`, `schedule::proposer` and `sample`,
+with production gate values. The harness was validated first by reproducing the
+repo's own recorded control exactly — justification at epoch 25 after 92.195% of
+stake destroyed, which is the number `MIN_QUORUM_DENOMINATOR_NUM`'s own doc
+cites.
+
+**A node forked by transport mismatch — 1 of 64, the other 63 unreachable:**
+
+| Epochs since stall | Each absent validator's remaining stake | `3w ≥ 2d`? |
+| --- | --- | --- |
+| 1–5 | 100.000% | no |
+| 10 | 78.553% | no |
+| 20 | 12.901% | no |
+| 27 | 0.9787% | no |
+| **28** | **0.69735%** | **JUSTIFIES** |
+| **29** | **0.43585%** | **FINALIZES** |
+| 30…∞ | 0.43585%, frozen | finalizes every epoch |
+
+- **First justification: stall epoch 28**, after **98.008%** of total network
+  stake has leaked away. **First finalization: epoch 29** (k=1 needs two
+  consecutive justifications).
+- At 32 slots/epoch and 30 s/slot — **16 minutes per epoch** — that is
+  **justification ≈ 7h 28m after the fork, finalization ≈ 7h 44m.**
+- Hand-derived cross-check agrees: quorum needs `3S ≥ 2(S + 63r)`, i.e.
+  `r ≤ S/126 = 0.7937%`; the measured crossing sits between epoch 27 (0.9787%)
+  and epoch 28 (0.69735%).
+- **It is a stable fixed point, not a transient.** Once finalized,
+  `since_finality ≤ 4`, so no further leak accrues and recovery is gated off
+  forever. Over a 3,000-epoch run: **2,973 justified, 2,972 finalized, finality
+  lag 1 epoch**, the lone node holding 78.46% of a permanently frozen
+  denominator.
+
+**And every RPC field reports health:**
+
+- `getchaininfo` has **no peers field**, and there is **no `getpeerinfo` method
+  at all**. Zero peers is not observable over RPC.
+- `validators.active` = `consensus_roster_at().len()` = **64, forever** — the
+  leaked roster keeps zeroed records rather than dropping them.
+- `total_active_stake_sat` is computed from `duty_roster()`, the **unleaked**
+  roster (`transition.rs:3183`), so it reports the **full 64-validator stake even
+  after 98% of it has been leaked to nothing.**
+- `finalized`, `justified` and `finalized_height` all advance every epoch.
+- `behind_by_slots`: **~48 slots before the roster gate, ~1.3 slots after** —
+  measured proposer occupancy rises from 2.09% to 78.97% over 3,200 slots.
+- `p2p.rs:1041` returns early on an empty peer set — **silently, no log.**
+
+**Within eight hours of a misconfigured start, an exchange's monitoring sees:
+in sync, finalizing every epoch, 64 active validators, full stake bonded, no
+errors. All of it false.**
+
+**One correction to §7.4 as originally written.** The leaked validators do *not*
+leave the duty roster, and the lone node does *not* propose every slot.
+`with_leak_applied` deliberately keeps zeroed records
+(`transition.rs:3109-3117`), and the absent validators never reach zero anyway —
+their stake freezes at 0.436% each the moment finality resumes. They stay
+eligible in `sample` and collectively still win ~21% of slots. **The mechanism
+and the end state are as claimed; the magnitude is 79%, not 100%.** The
+conclusion is unchanged and the correction makes it slightly worse: the private
+chain even has *apparent proposer diversity*.
+
+*Provenance.* **Measured:** epochs 28/29, the decay curve, 98.008%, the
+3,000-epoch lag, the k=4 and k=7 controls, 78.46% weight share, the 2.09% →
+78.97% occupancy shift. **Derived:** the `r ≤ S/126` threshold and the wall-clock
+conversions. **Still inferred, and both are premises rather than results:** that
+a libp2p node in fact reaches zero peers against this fleet (read from the
+transport split, not tested against a live node), and that the live chain is
+already past absolute epoch 1400.
+
+**Remaining ask, now much smaller:** confirm the zero-peer premise on a throwaway
+node. Everything downstream of it is measured.
 
 ### 7.5 The guard tests exist — merge, do not write
 
