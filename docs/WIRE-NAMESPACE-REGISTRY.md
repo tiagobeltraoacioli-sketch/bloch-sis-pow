@@ -23,7 +23,8 @@ citing the older sweep):
 
 ## Quick reference — every namespace and its next free value
 
-Nine namespaces. **Claim from the PMO before writing the constant.**
+**Twelve namespaces** (§9.2 is two, sharing a row). **Claim from the PMO before
+writing the constant.**
 
 | # | Namespace | Dispatch | Diagnostic on duplicate | Next free |
 | --- | --- | --- | --- | --- |
