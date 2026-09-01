@@ -1,0 +1,31 @@
+[package]
+name = "bloch-partner-send"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = """
+Operator tool for a small, controlled BLCH transfer to an integration
+partner on Genesis-4. Explicit amount and destination, full preview of
+what will be signed, interactive typed confirmation, hard amount cap,
+dust refusal. No batch mode, no defaults, no unattended path.
+"""
+
+[[bin]]
+name = "bloch-partner-send"
+path = "src/main.rs"
+
+[dependencies]
+# The live chain's transaction type and fee market — the SAME crate the
+# fleet's consensus runs, so the fee this tool computes is the fee the
+# chain will demand (exact conservation: inputs == outputs + fee).
+bloch-pos-committee = { path = "../../crates/bloch-pos-committee" }
+# Address parsing (bloch1q… checksum), hybrid ML-DSA-65 ‖ Falcon-1024
+# sign/verify, BIP39 seed derivation, encrypted keyfile decryption.
+bloch-crypto = { path = "../../crates/bloch-crypto" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+sha3 = { version = "0.10", default-features = false }
+# Hidden terminal input for seed phrases / keyfile passwords. Already in
+# the workspace lock (bloch-crypto's wallet-cli uses the same version).
+rpassword = "7"
