@@ -5,6 +5,7 @@ import { rpcIsDegraded, activeRpcEndpoint } from "./lib/rpc";
 import { G4Search } from "./components/g4search";
 import { g4rpc, G4_RPC } from "./lib/g4";
 import { G4Dashboard } from "./pages/G4Dashboard";
+import { FinalityPage } from "./pages/Finality";
 import { G4BlockPage } from "./pages/G4Block";
 import { BalancePage } from "./pages/Balance";
 import { ValidatorsPage } from "./pages/Validators";
@@ -27,6 +28,7 @@ const Logo = () => (
 // with, and a reader who came looking for it must still find it.
 const NAV = [
   { to: "/", label: "Chain" },
+  { to: "/finality", label: "Finality" },
   { to: "/balance", label: "Balance" },
   { to: "/validators", label: "Validators" },
   { to: "/snapshot", label: "Snapshot" },
@@ -34,6 +36,7 @@ const NAV = [
 
 function renderRoute(path: string) {
   if (path === "/" || path === "") return <G4Dashboard />;
+  if (path === "/finality") return <FinalityPage />;
   if (path === "/balance") return <BalancePage />;
   {
     const mb = matchRoute(path, "/balance/:h");

@@ -63,7 +63,7 @@ export function G4BlockPage({ slot }: { slot: number }) {
         {b.tx_count === 1 ? "transaction" : "transactions"} and {fmtInt(b.attestation_count)}{" "}
         {b.attestation_count === 1 ? "attestation" : "attestations"}.{" "}
         {b.finalized
-          ? "It is finalized: reversing it would require burning a third of the bonded stake."
+          ? "It is finalized: two thirds of the bonded stake voted for a checkpoint above it. That is the chain's claim, not a proof — see the finality page for what it does and does not rule out."
           : `The chain calls it ${b.finality}; it is not finalized yet.`}
       </p>
 
