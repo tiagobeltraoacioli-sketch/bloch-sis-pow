@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[package]
+name = "bloch-memoria-projecao"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = """
+The Genesis-4 fleet memory projection, as a checked artefact. Recomputes the
+box-exhaustion date from a kernel-measured snapshot of the live fleet rather
+than restating constants, and fails its own tests when the fleet stops
+matching what the projection assumes. No dependencies: this must build and
+run on any box, in any CI, in seconds, or it will not be run.
+"""
+
+[dependencies]
+
+[[bin]]
+name = "memoria-projecao"
+path = "src/main.rs"
+
+[lib]
+name = "bloch_memoria_projecao"
+path = "src/lib.rs"
