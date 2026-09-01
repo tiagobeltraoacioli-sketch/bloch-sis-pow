@@ -1,13 +1,30 @@
 //! Coherence shielded-pool primitives — the lean, portable core.
 //!
-//! > **Not live on Genesis-4.** These primitives were built for the Genesis-3
-//! > proof-of-work node (`legacy/genesis3-node`, which re-exports them as
-//! > `bloch::coherence`); that chain stopped permanently at height 39,918 on
-//! > 2026-08-13. The live chain is **Genesis-4, proof of stake**, and it has
-//! > **no shielded pool**: `bloch-pos-node` does not depend on this crate, and
-//! > no Genesis-4 transaction type is shielded. This crate reaches the live
-//! > build only transitively, as a dependency of `bloch-crypto`. Nothing here
-//! > has been audited.
+//! > **The pool has never held a note — but this crate IS in the consensus
+//! > graph.** Status as of **2026-09-01**, and guarded by
+//! > `dependency_claims::the_dependents_named_here_are_the_real_ones` below,
+//! > which fails if the graph moves without this paragraph moving with it.
+//! >
+//! > These primitives were built for the Genesis-3 proof-of-work node
+//! > (`legacy/genesis3-node`, which re-exports them as `bloch::coherence`);
+//! > that chain stopped permanently at height 39,918 on 2026-08-13.
+//! >
+//! > **No Genesis-4 transaction type is shielded**: no wire tag encodes one, so
+//! > a shielded transfer is inexpressible rather than rejected, and the pool is
+//! > provably empty. That much of the older note still holds.
+//! >
+//! > **What no longer holds**: the older note said `bloch-pos-node` does not
+//! > depend on this crate and reaches the live build only transitively via
+//! > `bloch-crypto`. The Coherence wave (2026-08-29) made both halves false.
+//! > `bloch-pos-committee` now carries `coherence-core` as a direct
+//! > `[dependencies]` edge — deliberately, because `CommittedState` holds the
+//! > pool's accumulator frontier and nullifier SMT, and `coherence_root` is
+//! > computed and **hard-validated on block acceptance** with no flag day.
+//! > This is consensus code today.
+//! >
+//! > The older note was true when written on 2026-08-14 and false two weeks
+//! > later, with nothing failing in between. That is why the claim is now
+//! > executable instead of prose. Nothing here has been audited.
 //!
 //! Single source of truth shared by the Genesis-3 node, the SP1 guest prover
 //! (`crates/coherence-prover`), and the mobile
@@ -2719,5 +2736,50 @@ mod bridge_tests {
         // note b (300, untouched at pb) + the 150 change note.
         assert_eq!(pool.sat(), 450);
         let _ = pb;
+    }
+}
+
+/// The module doc above makes a checkable claim about who depends on this
+/// crate. Prose cannot fail when it stops being true; this can.
+///
+/// The claim it guards went stale in exactly that way: written 2026-08-14
+/// saying the consensus crate did not depend on this one, made false by the
+/// Coherence wave on 2026-08-29, and still sitting there on 2026-09-01 reading
+/// as authoritative. No compiler, no test and no reviewer caught it, because
+/// nothing was watching.
+///
+/// So the rule this encodes: **a fact the build system knows must never be
+/// recorded only in prose.** Change an edge and this test names the paragraph
+/// you have to change with it.
+#[cfg(test)]
+mod dependency_claims {
+    const COMMITTEE: &str = include_str!("../../bloch-pos-committee/Cargo.toml");
+    const NODE: &str = include_str!("../../bloch-pos-node/Cargo.toml");
+
+    /// True if the manifest declares `coherence-core` as a dependency key.
+    /// Deliberately naive and deliberately not a TOML parser: a real parser
+    /// is a second thing that can drift. It looks for the key at the start of
+    /// a line, which is how the workspace writes every dependency.
+    fn declares_coherence_core(manifest: &str) -> bool {
+        manifest
+            .lines()
+            .map(str::trim_start)
+            .any(|l| l.starts_with("coherence-core") && l.contains('='))
+    }
+
+    #[test]
+    fn the_dependents_named_here_are_the_real_ones() {
+        assert!(
+            declares_coherence_core(COMMITTEE),
+            "bloch-pos-committee no longer declares coherence-core. The module \
+             doc says it DOES, and calls this crate consensus code. If the edge \
+             was removed on purpose, rewrite that paragraph in THIS commit and \
+             re-date it; do not leave the two disagreeing."
+        );
+        assert!(
+            declares_coherence_core(NODE),
+            "bloch-pos-node no longer declares coherence-core. The module doc \
+             says it DOES. Same rule: rewrite the paragraph in this commit."
+        );
     }
 }
