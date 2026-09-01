@@ -672,6 +672,10 @@ to find.
      `public/MANIFEST`;
   4. `bloch-pos protection-import --data-dir <new> --from history.txt`
      (merging only ever raises watermarks);
+  4b. `blochv-guard.sh --data-dir <new> --migration` — it hard-refuses a
+     migration with no signing history in the destination, and refuses a
+     history that binds a *different* public key than the keystore beside it,
+     which is the way the right key gets carried with the wrong history file;
   5. start the new node **without** `--accept-new-signing-history`, with the
      doppelganger watch at its default — it is your last line if step 1
      silently failed.

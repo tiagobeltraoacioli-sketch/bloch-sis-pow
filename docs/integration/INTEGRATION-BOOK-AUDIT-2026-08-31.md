@@ -297,6 +297,67 @@ category of its own, `ANCESTRY_SEED_ACTIVATION_EPOCH` (`u64::MAX`, and
 **unreferenced** — the code it guarded was made unconditional on 2026-08-24, so
 it gates nothing and is dead rather than pending).
 
+## K. Pre-existing: five failing tests on `main`, disputing their own analysis
+
+Found while running the committee suite to check this work. **Not caused by
+this audit** — `prova.rs` was last touched by `49dfdd02` and is not in the
+audit commit, which changed only documents plus a new separate test target.
+
+`cargo test -p bloch-pos-committee --lib` is **285 passed, 5 failed**:
+
+```
+prova::tests::s1_disease_two_nodes_diverge_and_the_chain_never_finalizes_again
+prova::tests::s2_mutation_restoring_the_pre_fix_filter_breaks_the_cure
+prova::tests::s3_mutation_the_comparator_bites_one_zero_stake_validator
+prova::tests::s4_accrued_leak_plus_the_reset_restore_the_quorum_denominator
+prova::tests::s4_mutation_the_pre_fix_filter_destroys_the_quorum_again
+```
+
+What makes these worth a section rather than a bug report is that **their
+failure messages are self-refuting**. These are the in-tree proof and mutation
+tests for the 2026-08-24 relaunch. They now say, in their own assertion text:
+
+- s1 — *"different zero-sets produced the SAME step-8 partition — the
+  length-dependent shuffle is not the mechanism and **this analysis is
+  wrong**"*
+- s4 — *"pre-fix, 34 honest validators holding 100% of live stake justified
+  anyway — then the roster split does not block finality and **this finding is
+  refuted**"*
+- s3 mutation — *"the comparator saw a difference in only 0 of 8 epochs after
+  planting a zero-stake validator; **it is blind to the defect it exists to
+  catch**"*
+- s2 and s4 mutations — *"MUTATION DID NOT BITE ... Either the switch is not
+  wired or the cure was passing for some other reason."*
+
+Both mutation switches failing to bite, while the partitions come out
+byte-identical across zero-sets, points at the mutation hooks no longer
+reaching production code after the committee partition rewrite (finding F1)
+rather than at a live consensus regression. That is the static-reference rot
+pattern: the hook is a fixed reference to code that moved, and it fails silent
+until something runs it.
+
+**Effect on finding F — none, and the distinction matters.** F rests on direct
+reading of the code, not on `prova.rs`: the denominator is leak-adjusted
+unconditionally (`finality.rs:320–345`), the floor is gated
+(`finality.rs:353–360`), the gate is `u64::MAX` (`params.rs:597`), and the
+accumulator's single write path is documented on
+`INACTIVITY_LEAK_RECOVERY_QUOTIENT`. All of that is verifiable without
+`prova.rs` and stands.
+
+What `prova.rs` disputes is a **different proposed mechanism for the same
+incident** — a pre-shuffle roster filter — not the denominator ratchet that
+`params.rs` names as "the ratchet behind the 2026-08-24 incident". So the
+repository currently holds two explanations of one incident, and the one
+encoded as runnable tests is failing while asserting itself refuted.
+
+**Recommendation, for someone who owns consensus rather than documents:**
+resolve which explanation is correct before the next relaunch post-mortem cites
+either. A failing proof module that says "this analysis is wrong" is worse than
+no proof module, because it reads as a broken test and gets muted. Whoever
+picks this up should also decide whether the audit's F narrative should be
+softened; this document deliberately does not soften it, because the code
+reading is independent of the dispute.
+
 ## What now pins this
 
 - `crates/bloch-pos-committee/tests/integration_book_claims.rs` — 10 tests,

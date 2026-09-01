@@ -521,6 +521,15 @@ transition behaviour and is the same shape as the `validator_count` /
 }
 ```
 
+**Read `remaining_sat` correctly, or a supply audit will be wrong by
+construction.** `GENESIS_ISSUED_SAT = TOTAL_SUPPLY_SAT − VALIDATOR_EMISSION_SAT`
+(`tokenomics_v4.rs:251`): everything except the validator emission exists from
+slot 0. So `remaining_sat` is the **unminted validator emission budget**, not
+"coins the chain has yet to create" in the sense a Bitcoin-shaped audit
+assumes. The response must carry `genesis_issued_sat` alongside it so the two
+cannot be confused, and `emitted_since_genesis_sat` — the number that actually
+grows — should be the headline for anyone watching issuance.
+
 **Honesty requirements, in the response and not only in prose.** `issued_sat`
 is **gross and monotone**: fees move existing coins, whistleblower rewards come
 out of slashed bonds, and burns never decrement it — they widen the gap below
