@@ -645,14 +645,45 @@ fn sign(args: &[String]) -> Result<(), String> {
 
 // ─── ws-envelope ────────────────────────────────────────────────────────────
 
-/// `ws-envelope --checkpoint <file.bin> --sig <index>:<sigfile> ... --out
-///  <env.bin>` — assemble the distribution envelope (§2.3's
-/// `wscheckpoint-<epoch>` artifact) that `--ws-checkpoint` consumes.
+/// `ws-envelope --checkpoint <file.bin> --signer-set <set.bin>
+///  --sig <index>:<sigfile> ... [--genesis <manifest>] --out <env.bin>`
+///
+/// Assemble the distribution envelope (§2.3's `wscheckpoint-<epoch>` artifact)
+/// that `--ws-checkpoint` consumes — and REFUSE to write one a booting node
+/// would reject.
+///
+/// The gate is the last thing this does before touching disk: it calls
+/// `ws::verify_envelope`, the exact function `ws_boot::boot` calls, under the
+/// real hybrid verifier, on the envelope it just built — and then again on the
+/// envelope as re-read from its own file bytes, because what a node loads is
+/// the file and not the value that happened to be in memory. Nothing is
+/// written unless both pass. An under-quorum envelope, one missing its
+/// external signature, one naming the wrong arrangement, or one whose
+/// checkpoint has been altered after signing cannot come out of this command.
+///
+/// `--signer-set` is therefore required, not optional: without the
+/// arrangement there is no quorum rule to check against, and an "assemble"
+/// that cannot check is just a file concatenator.
 fn envelope(args: &[String]) -> Result<(), String> {
     let cp_path = req(args, "--checkpoint")?;
+    let set_path = req(args, "--signer-set")?;
     let out = req(args, "--out")?;
     let cp_bytes = fs::read(&cp_path).map_err(|e| format!("{cp_path}: {e}"))?;
     let cp = decode_checkpoint(&cp_bytes).map_err(|e| format!("{cp_path}: {e}"))?;
+    let set = decode_signer_set_file(&fs::read(&set_path).map_err(|e| format!("{set_path}: {e}"))?)
+        .map_err(|e| format!("{set_path}: {e}"))?;
+
+    // The chain identity to check against. Taken from the manifest when one is
+    // given — the same derivation a booting node does — and otherwise from the
+    // checkpoint's own claims, which is a circular check and is announced as
+    // one rather than passed off as verification.
+    let (network_id, genesis_root, circular) = match crate::arg_value(args, "--genesis") {
+        Some(m) => {
+            let (n, g) = manifest_identity(&m)?;
+            (n, g, false)
+        }
+        None => (cp.network_id, cp.genesis_root, true),
+    };
 
     let specs = all_values(args, "--sig");
     if specs.is_empty() {
@@ -670,27 +701,181 @@ fn envelope(args: &[String]) -> Result<(), String> {
     }
 
     let env = CheckpointEnvelope { checkpoint: cp, signatures };
+
+    // THE GATE. Not a re-implementation of the acceptance rules — the rules.
+    ws::verify_envelope(&env, &set, network_id, &genesis_root, &WsHybridVerifier).map_err(
+        |reject| {
+            format!(
+                "REFUSING to write an envelope the network would reject.\n  \
+                 ws::verify_envelope (the same function a booting node runs) returned \
+                 {reject:?}\n  {}\n  ws digest {}",
+                explain_reject(&reject, &set),
+                hex32(&env.checkpoint.ws_digest()),
+            )
+        },
+    )?;
+
     let bytes = encode_envelope_file(&env);
-    decode_envelope_file(&bytes).map_err(|e| format!("assembled envelope is malformed: {e}"))?;
+    let back = decode_envelope_file(&bytes).map_err(|e| format!("assembled envelope is malformed: {e}"))?;
+    // Verify the DECODED form too. A framing bug that survives the in-memory
+    // check and not the file would otherwise ship as a valid-looking artifact.
+    ws::verify_envelope(&back, &set, network_id, &genesis_root, &WsHybridVerifier).map_err(
+        |reject| {
+            format!(
+                "self-check FAILED: the envelope verifies in memory but NOT after the file \
+                 round trip ({reject:?}). Do not publish this file."
+            )
+        },
+    )?;
     write_file(&out, &bytes, false)?;
+
     println!(
-        "wrote {out}: epoch {}, {} signature(s), {} bytes, ws digest {}",
+        "ACCEPTED by ws::verify_envelope — wrote {out}: epoch {}, {} signature(s), {} bytes",
         env.checkpoint.epoch,
         env.signatures.len(),
         bytes.len(),
-        hex32(&env.checkpoint.ws_digest()),
     );
-    println!("verify it as a node would:  bloch-pos ws-verify --envelope {out} --signer-set <set.bin> --genesis <manifest>");
+    println!("ws digest {}", hex32(&env.checkpoint.ws_digest()));
+    println!(
+        "quorum {}-of-{} met, {} of ≥{} external",
+        set.threshold,
+        set.signers.len(),
+        env.signatures
+            .iter()
+            .filter(|(i, _)| set.signers.get(*i as usize).is_some_and(|s| s.external))
+            .count(),
+        set.min_external,
+    );
+    if circular {
+        println!(
+            "note: no --genesis given, so network_id/genesis_root were checked against the \
+             checkpoint's own claims — circular, and it proves nothing about cross-chain \
+             replay. Pass --genesis <manifest> to make that check real."
+        );
+    }
+    println!("verify it as a node would:  bloch-pos ws-verify --envelope {out} --signer-set {set_path} --genesis <manifest>");
     Ok(())
+}
+
+// ─── Reject messages and the per-signature probe ────────────────────────────
+
+/// Turn an `EnvelopeReject` into something an operator can act on. The variant
+/// itself is always printed alongside, so this is a gloss on the verdict and
+/// never a substitute for it.
+fn explain_reject(r: &ws::EnvelopeReject, set: &SignerSet) -> String {
+    use ws::EnvelopeReject as E;
+    match r {
+        E::WrongVersion { got } => format!(
+            "the checkpoint declares format version {got}; this build speaks {WS_FORMAT_VERSION}."
+        ),
+        E::WrongNetwork { got, expected } => format!(
+            "network id mismatch: the checkpoint carries {got:#010x}, you expected \
+             {expected:#010x}. A checkpoint for one network must never verify on another. \
+             Check --genesis."
+        ),
+        E::WrongGenesisRoot => "genesis root mismatch: this checkpoint belongs to a different \
+             chain than the manifest you named. Cross-chain replay refused."
+            .to_string(),
+        E::WrongSignerSet { got, expected } => format!(
+            "the checkpoint names arrangement {got}; the signer-set file is arrangement \
+             {expected}. Re-mint the checkpoint with --signer-set-id {expected}, or verify \
+             against arrangement {got}'s file. Nothing here can be fixed by signing more."
+        ),
+        E::ReservedSignerSet => format!(
+            "signer-set id {WS_GENESIS_SIGNER_SET_ID} is reserved for the genesis anchor and \
+             no envelope may claim it."
+        ),
+        E::ArrangementExpired { hard_stop_epoch } => format!(
+            "arrangement {} is past review + grace (adopted at epoch {}, hard stop at \
+             {hard_stop_epoch}). This is the §6.3 dead-man's switch: envelopes from an \
+             arrangement nobody reviewed stop being accepted. Governance must adopt a new \
+             arrangement — more signatures will not help.",
+            set.id, set.adopted_epoch
+        ),
+        E::UnknownSignerIndex { index } => format!(
+            "a signature claims signer index {index}, but arrangement {} has {} signers \
+             (valid indices 0..{}). Check the --sig <index>:<file> pairing.",
+            set.id,
+            set.signers.len(),
+            set.signers.len().saturating_sub(1)
+        ),
+        E::DuplicateSigner { index } => format!(
+            "signer index {index} appears twice. One key must not count twice toward the \
+             quorum — most likely the same signer's file was collected from two machines."
+        ),
+        E::QuorumNotReached { got, need } => format!(
+            "{got} signature(s), but arrangement {} needs {need}. Collect {} more.",
+            set.id,
+            need.saturating_sub(*got)
+        ),
+        E::ExternalQuorumNotReached { got, need } => format!(
+            "{got} of the listed signatures come from externally-flagged signers; \
+             arrangement {} requires {need}. A quorum of only founder-adjacent keys must not \
+             verify — that is the entire point of the external minimum (§2.2 rule 4). The \
+             external signer has to sign.",
+            set.id
+        ),
+        E::BadSignature { index } => format!(
+            "the signature at index {index} does not verify over this checkpoint's ws digest \
+             under that signer's key. Either it was made over DIFFERENT bytes (the signer was \
+             shown another checkpoint), or it came from a key that is not the one at index \
+             {index} of the arrangement, or the file is corrupt."
+        ),
+    }
+}
+
+/// Per-signature verdict, obtained by asking the REAL verifier about a
+/// one-signature envelope under a quorum-relaxed clone of the arrangement.
+///
+/// Why not check each signature directly: the AND-composition of the two
+/// hybrid halves is `staking::verify_hybrid`, deliberately `pub(crate)` to the
+/// frozen committee crate precisely so a second copy cannot introduce the OR
+/// bug. Probing through `verify_envelope` keeps the crypto path singular and
+/// relaxes only the counting rules, which the full run judges anyway. (This is
+/// the same device `ws-sign --pubkey` uses for its own self-check.)
+fn probe_signatures(
+    env: &CheckpointEnvelope,
+    set: &SignerSet,
+    network_id: u32,
+    genesis_root: &[u8; 32],
+) -> Vec<(u8, bool, bool)> {
+    let relaxed = SignerSet { threshold: 1, min_external: 0, ..set.clone() };
+    env.signatures
+        .iter()
+        .map(|(index, sig)| {
+            let one = CheckpointEnvelope {
+                checkpoint: env.checkpoint,
+                signatures: vec![(*index, sig.clone())],
+            };
+            let external =
+                set.signers.get(*index as usize).is_some_and(|s| s.external);
+            let valid = ws::verify_envelope(
+                &one,
+                &relaxed,
+                network_id,
+                genesis_root,
+                &WsHybridVerifier,
+            )
+            .is_ok();
+            (*index, external, valid)
+        })
+        .collect()
 }
 
 // ─── ws-verify ──────────────────────────────────────────────────────────────
 
-/// `ws-verify --envelope <file> --signer-set <file> --genesis <manifest>` —
-/// the exact check a booting node runs (`ws::verify_envelope` under the real
+/// `ws-verify --envelope <file> --signer-set <file> --genesis <manifest>
+///  [--rpc <host:port>] [--now-epoch <n>]`
+///
+/// The exact check a booting node runs (`ws::verify_envelope` under the real
 /// hybrid verifier, against the chain identity the manifest fixes), minus the
-/// boot: publication dry-run, release-gate check, and exchange due diligence
-/// are all this one command.
+/// boot: publication dry-run, release-gate check, and third-party due
+/// diligence are all this one command.
+///
+/// It prints every field, a per-signature verdict, the quorum arithmetic, the
+/// arrangement's review clock, and — when a clock is available — whether the
+/// artifact is still inside the weak-subjectivity window. A stranger who did
+/// not mint the artifact should be able to run exactly this and decide.
 fn verify(args: &[String]) -> Result<(), String> {
     let env_path = req(args, "--envelope")?;
     let set_path = req(args, "--signer-set")?;
@@ -701,27 +886,121 @@ fn verify(args: &[String]) -> Result<(), String> {
     let set = decode_signer_set_file(&fs::read(&set_path).map_err(|e| format!("{set_path}: {e}"))?)
         .map_err(|e| format!("{set_path}: {e}"))?;
     let (network_id, genesis_root) = manifest_identity(&manifest_path)?;
+    let cp = env.checkpoint;
+
+    println!("ENVELOPE  {env_path}");
+    println!("  format version    {}", cp.version);
+    println!("  network id        {:#010x}", cp.network_id);
+    println!("  genesis root      {}", hex32(&cp.genesis_root));
+    println!("  epoch             {}", cp.epoch);
+    println!("  block root        {}", hex32(&cp.block_root));
+    println!("  state root        {}", hex32(&cp.state_root));
+    println!("  validator set     {}{}", hex32(&cp.validator_set_root), if cp.validator_set_root == [0u8; 32] {
+        "   (all-zero placeholder — see the note below)"
+    } else {
+        ""
+    });
+    println!("  issued at         {}", cp.issued_at);
+    println!("  signer set id     {}", cp.signer_set_id);
+    println!("  WS DIGEST         {}", hex32(&cp.ws_digest()));
+    println!();
+
+    println!("ARRANGEMENT  {set_path}");
+    println!(
+        "  quorum            {}-of-{}, at least {} external",
+        set.threshold,
+        set.signers.len(),
+        set.min_external
+    );
+    println!("  adopted at epoch  {}", set.adopted_epoch);
+    println!("  review due        epoch {} (envelopes warn after this)", set.review_deadline());
+    println!("  hard stop         epoch {} (envelopes REFUSED after this — §6.3)", set.hard_stop());
+    println!();
+
+    println!("SIGNATURES  ({} listed)", env.signatures.len());
+    let verdicts = probe_signatures(&env, &set, network_id, &genesis_root);
+    for (index, external, valid) in &verdicts {
+        println!(
+            "  index {index:<3} {:<9} {}",
+            if *external { "EXTERNAL" } else { "internal" },
+            if *valid { "VALID" } else { "INVALID" }
+        );
+    }
+    println!(
+        "  {} valid of {} listed; {} external of ≥{} required",
+        verdicts.iter().filter(|(_, _, v)| *v).count(),
+        env.signatures.len(),
+        verdicts.iter().filter(|(_, e, v)| *e && *v).count(),
+        set.min_external,
+    );
+    println!();
+
+    // Freshness. NOT part of envelope validity — the window is a consumer-side
+    // rule against the consuming node's own clock (§2.1: there is deliberately
+    // no expiry field) — but it decides whether this artifact is still USABLE,
+    // so it is reported when a clock is available.
+    let now_epoch = match crate::arg_value(args, "--now-epoch") {
+        Some(s) => Some(s.parse::<u64>().map_err(|_| "--now-epoch must be an epoch number".to_string())?),
+        None => match crate::arg_value(args, "--rpc") {
+            Some(addr) => {
+                let info = rpc_call(&addr, "getchaininfo", vec![])?;
+                Some(field_u64(&info, "epoch", "getchaininfo")?)
+            }
+            None => None,
+        },
+    };
+    let window_days = ws::WS_PERIOD_EPOCHS / ws::EPOCHS_PER_DAY;
+    match now_epoch {
+        Some(now) => {
+            let age = now.saturating_sub(cp.epoch);
+            let state = if age >= ws::WS_PERIOD_EPOCHS {
+                "EXPIRED — a fresh node given this checkpoint would STILL refuse to sync"
+            } else if age >= ws::WS_FRESH_EPOCHS {
+                "STALE — inside the window but past the freshness threshold; publish a newer one"
+            } else {
+                "FRESH"
+            };
+            println!(
+                "FRESHNESS  epoch {} vs now {now}: age {age} of {} epochs (~{window_days} days) — {state}",
+                cp.epoch,
+                ws::WS_PERIOD_EPOCHS
+            );
+        }
+        None => println!(
+            "FRESHNESS  not evaluated (pass --rpc <host:port> or --now-epoch <n>). The window \
+             is {} epochs, ~{window_days} days.",
+            ws::WS_PERIOD_EPOCHS
+        ),
+    }
+    println!();
 
     match ws::verify_envelope(&env, &set, network_id, &genesis_root, &WsHybridVerifier) {
         Ok(ok) => {
-            println!(
-                "VALID: epoch {}, signer set {}, {} signature(s), ws digest {}",
-                env.checkpoint.epoch,
-                env.checkpoint.signer_set_id,
-                env.signatures.len(),
-                hex32(&env.checkpoint.ws_digest()),
-            );
             if ok.arrangement_past_review {
                 println!(
-                    "WARNING: the arrangement is past its 12-month review deadline (inside \
-                     grace) — the §6.3 review ADR is overdue."
+                    "WARNING: the arrangement is past its 12-month review deadline (epoch {}, \
+                     inside grace) — the §6.3 review ADR is overdue.",
+                    set.review_deadline()
                 );
             }
+            println!("VERDICT: ACCEPTED by ws::verify_envelope.");
+            println!();
+            println!(
+                "Before trusting it, compare this digest against a SECOND independent \
+                 publication channel:\n  {}",
+                hex32(&cp.ws_digest())
+            );
+            println!(
+                "Agreement across independent channels is the evidence. The artifact's own \
+                 say-so is not."
+            );
             Ok(())
         }
         Err(reject) => Err(format!(
-            "REFUSED: {reject:?} (ws digest {})",
-            hex32(&env.checkpoint.ws_digest())
+            "VERDICT: REFUSED — {reject:?}\n  {}\n  ws digest {}\n  \
+             A node given this envelope would refuse to start. Do not publish it.",
+            explain_reject(&reject, &set),
+            hex32(&cp.ws_digest())
         )),
     }
 }
@@ -797,6 +1076,7 @@ mod tests {
         }
         envelope(&[
             s("--checkpoint"), format!("{dir}/cp.bin"),
+            s("--signer-set"), format!("{dir}/set.bin"),
             s("--sig"), format!("0:{dir}/sig0"),
             s("--sig"), format!("2:{dir}/sig2"),
             s("--out"), format!("{dir}/env.bin"),
@@ -869,6 +1149,340 @@ mod tests {
             field_hex32(fin, "root", "finalized").unwrap()[..4],
             [0x5d, 0xab, 0x3c, 0x00]
         );
+    }
+
+    // ── The refusals `ws-envelope` must not be talked out of ────────────────
+    //
+    // `ws-envelope` is only worth anything if it is impossible to make it
+    // write something a node would reject. Each of these drives the whole
+    // command — files in, file out — and asserts BOTH that nothing was
+    // written and that the reason names the exact `EnvelopeReject` variant
+    // `ws::verify_envelope` produced. A test that accepted "some error" would
+    // pass against a command that refused for the wrong reason.
+
+    /// A signer set, three real keys, a checkpoint, and signatures over it —
+    /// the fixture every refusal below starts from. Key generation dominates
+    /// the runtime, so each test builds its own directory but the shape is
+    /// identical to the ceremony test's.
+    struct Fixture {
+        dir: String,
+        set: SignerSet,
+        cp: WeakSubjectivityCheckpoint,
+    }
+
+    const FIX_NET: u32 = 0x493E_7DF4;
+    const FIX_GEN: [u8; 32] = [0x61; 32];
+
+    fn fixture(name: &str, signer_set_id: u32) -> Fixture {
+        let dir = tmp(name);
+        for i in 0..3 {
+            keygen(&[s("--out"), format!("{dir}/signer{i}")]).unwrap();
+        }
+        signer_set(&[
+            s("--id"), s("1"),
+            s("--threshold"), s("2"),
+            s("--min-external"), s("1"),
+            s("--adopted-epoch"), s("0"),
+            s("--signer"), format!("{dir}/signer0.pk:internal"),
+            s("--signer"), format!("{dir}/signer1.pk:internal"),
+            s("--signer"), format!("{dir}/signer2.pk:external"),
+            s("--out"), format!("{dir}/set.bin"),
+        ])
+        .unwrap();
+        let set = decode_signer_set_file(&fs::read(format!("{dir}/set.bin")).unwrap()).unwrap();
+
+        let cp = WeakSubjectivityCheckpoint {
+            version: WS_FORMAT_VERSION,
+            network_id: FIX_NET,
+            genesis_root: FIX_GEN,
+            epoch: 1536,
+            block_root: [0x22; 32],
+            state_root: [0x33; 32],
+            validator_set_root: [0u8; 32],
+            issued_at: 1_756_600_000,
+            signer_set_id,
+        };
+        fs::write(format!("{dir}/cp.bin"), cp.canonical_serialize()).unwrap();
+        for i in [0usize, 1, 2] {
+            sign(&[
+                s("--key"), format!("{dir}/signer{i}.sk"),
+                s("--checkpoint"), format!("{dir}/cp.bin"),
+                s("--out"), format!("{dir}/sig{i}"),
+            ])
+            .unwrap();
+        }
+        Fixture { dir, set, cp }
+    }
+
+    /// Below threshold. `ws-envelope` must not produce the file at all — the
+    /// operator learns at assembly, not at somebody's failed boot.
+    #[test]
+    fn envelope_refuses_a_one_signature_quorum() {
+        let f = fixture("neg-quorum", 1);
+        let out = format!("{}/env.bin", f.dir);
+        let e = envelope(&[
+            s("--checkpoint"), format!("{}/cp.bin", f.dir),
+            s("--signer-set"), format!("{}/set.bin", f.dir),
+            s("--sig"), format!("2:{}/sig2", f.dir),
+            s("--out"), out.clone(),
+        ])
+        .unwrap_err();
+        assert!(e.contains("QuorumNotReached"), "{e}");
+        assert!(e.contains("REFUSING to write"), "{e}");
+        assert!(!Path::new(&out).exists(), "a refused envelope must not reach disk");
+    }
+
+    /// Two internal keys reach the threshold but not the external minimum —
+    /// §2.2 rule 4, the rule that stops a founder-only quorum.
+    #[test]
+    fn envelope_refuses_a_quorum_with_no_external_signer() {
+        let f = fixture("neg-external", 1);
+        let out = format!("{}/env.bin", f.dir);
+        let e = envelope(&[
+            s("--checkpoint"), format!("{}/cp.bin", f.dir),
+            s("--signer-set"), format!("{}/set.bin", f.dir),
+            s("--sig"), format!("0:{}/sig0", f.dir),
+            s("--sig"), format!("1:{}/sig1", f.dir),
+            s("--out"), out.clone(),
+        ])
+        .unwrap_err();
+        assert!(e.contains("ExternalQuorumNotReached"), "{e}");
+        assert!(!Path::new(&out).exists());
+    }
+
+    /// The checkpoint names an arrangement that is not the one signing. The
+    /// signatures are genuine; the envelope is still not usable, and the
+    /// message must say which two ids disagree.
+    #[test]
+    fn envelope_refuses_a_wrong_signer_set_id() {
+        let f = fixture("neg-setid", 7); // checkpoint says 7, the set is id 1
+        let out = format!("{}/env.bin", f.dir);
+        let e = envelope(&[
+            s("--checkpoint"), format!("{}/cp.bin", f.dir),
+            s("--signer-set"), format!("{}/set.bin", f.dir),
+            s("--sig"), format!("0:{}/sig0", f.dir),
+            s("--sig"), format!("2:{}/sig2", f.dir),
+            s("--out"), out.clone(),
+        ])
+        .unwrap_err();
+        assert!(e.contains("WrongSignerSet"), "{e}");
+        assert!(e.contains('7') && e.contains('1'), "must name both ids: {e}");
+        assert!(!Path::new(&out).exists());
+    }
+
+    /// The attack the whole artifact exists to stop: real signatures, but the
+    /// checkpoint they are paired with has been altered after signing. One
+    /// flipped bit in `block_root` — a different chain history — must not
+    /// produce a publishable envelope.
+    #[test]
+    fn envelope_refuses_a_tampered_root() {
+        let f = fixture("neg-tamper", 1);
+        let mut tampered = f.cp;
+        tampered.block_root[0] ^= 0x01;
+        let tampered_path = format!("{}/cp-tampered.bin", f.dir);
+        fs::write(&tampered_path, tampered.canonical_serialize()).unwrap();
+        assert_ne!(tampered.ws_digest(), f.cp.ws_digest());
+
+        let out = format!("{}/env.bin", f.dir);
+        let e = envelope(&[
+            s("--checkpoint"), tampered_path,
+            s("--signer-set"), format!("{}/set.bin", f.dir),
+            s("--sig"), format!("0:{}/sig0", f.dir),
+            s("--sig"), format!("2:{}/sig2", f.dir),
+            s("--out"), out.clone(),
+        ])
+        .unwrap_err();
+        assert!(e.contains("BadSignature"), "{e}");
+        assert!(!Path::new(&out).exists(), "a tampered checkpoint must not reach disk");
+    }
+
+    /// A signature paired with the wrong index. Genuine bytes, wrong slot.
+    #[test]
+    fn envelope_refuses_a_misindexed_signature() {
+        let f = fixture("neg-index", 1);
+        let out = format!("{}/env.bin", f.dir);
+        // signer 1's signature offered as signer 2 (the external slot).
+        let e = envelope(&[
+            s("--checkpoint"), format!("{}/cp.bin", f.dir),
+            s("--signer-set"), format!("{}/set.bin", f.dir),
+            s("--sig"), format!("0:{}/sig0", f.dir),
+            s("--sig"), format!("2:{}/sig1", f.dir),
+            s("--out"), out.clone(),
+        ])
+        .unwrap_err();
+        assert!(e.contains("BadSignature"), "{e}");
+        assert!(!Path::new(&out).exists());
+    }
+
+    /// Cross-chain replay: the same envelope, checked against another chain's
+    /// identity, must be refused. This is the check that is CIRCULAR when
+    /// `--genesis` is omitted, so it is exercised explicitly.
+    #[test]
+    fn a_valid_envelope_is_still_refused_on_another_chain() {
+        let f = fixture("neg-network", 1);
+        let out = format!("{}/env.bin", f.dir);
+        envelope(&[
+            s("--checkpoint"), format!("{}/cp.bin", f.dir),
+            s("--signer-set"), format!("{}/set.bin", f.dir),
+            s("--sig"), format!("0:{}/sig0", f.dir),
+            s("--sig"), format!("2:{}/sig2", f.dir),
+            s("--out"), out.clone(),
+        ])
+        .unwrap();
+        let env = decode_envelope_file(&fs::read(&out).unwrap()).unwrap();
+
+        // Right chain: accepted.
+        ws::verify_envelope(&env, &f.set, FIX_NET, &FIX_GEN, &WsHybridVerifier).unwrap();
+        // Wrong network id, and wrong genesis root: refused both ways.
+        assert!(matches!(
+            ws::verify_envelope(&env, &f.set, FIX_NET ^ 0xFF, &FIX_GEN, &WsHybridVerifier),
+            Err(ws::EnvelopeReject::WrongNetwork { .. })
+        ));
+        assert!(matches!(
+            ws::verify_envelope(&env, &f.set, FIX_NET, &[0x62; 32], &WsHybridVerifier),
+            Err(ws::EnvelopeReject::WrongGenesisRoot)
+        ));
+    }
+
+    /// Every reject variant gets an actionable gloss, and the gloss never
+    /// replaces the variant. A refusal an operator cannot act on is a refusal
+    /// that gets worked around.
+    #[test]
+    fn every_reject_variant_explains_itself() {
+        let set = SignerSet {
+            id: 1,
+            signers: vec![
+                Signer { pubkey: [0u8; HYBRID_PK_BYTES], external: false },
+                Signer { pubkey: [1u8; HYBRID_PK_BYTES], external: true },
+            ],
+            threshold: 2,
+            min_external: 1,
+            adopted_epoch: 0,
+        };
+        use ws::EnvelopeReject as E;
+        for r in [
+            E::WrongVersion { got: 9 },
+            E::WrongNetwork { got: 1, expected: 2 },
+            E::WrongGenesisRoot,
+            E::WrongSignerSet { got: 3, expected: 1 },
+            E::ReservedSignerSet,
+            E::ArrangementExpired { hard_stop_epoch: 100 },
+            E::UnknownSignerIndex { index: 9 },
+            E::DuplicateSigner { index: 1 },
+            E::QuorumNotReached { got: 1, need: 2 },
+            E::ExternalQuorumNotReached { got: 0, need: 1 },
+            E::BadSignature { index: 0 },
+        ] {
+            let m = explain_reject(&r, &set);
+            assert!(m.len() > 40, "{r:?} deserves a real explanation, got {m:?}");
+            assert!(!m.contains("{"), "unformatted placeholder in {m:?}");
+        }
+    }
+
+    /// `validator_set_root` is all zeros in every checkpoint this tool mints,
+    /// and that is deliberate — pinned here so nobody "fixes" it into a
+    /// fabricated value.
+    ///
+    /// The validator registry IS pinned by the checkpoint, transitively and
+    /// cryptographically: `state_root` is the root of the single state SMT
+    /// that carries every `ValidatorRecord` under `TAG_VALIDATOR`
+    /// (`state_root::build_state_tree_inner`). `validator_set_root` is a
+    /// SEPARATE, convenience commitment the spec (§4.3 step 2) reserves so a
+    /// checkpoint-syncing node can verify a downloaded registry without
+    /// rebuilding the whole state tree. No such root is computed anywhere in
+    /// this repository, and checkpoint-sync state download — wired as of
+    /// 2026-08-31 — deliberately does not consume it: `state_sync::import`
+    /// verifies a downloaded snapshot against `state_root` alone and writes
+    /// `validator_set_root: [0; 32]`. Since the registry is a set of leaves
+    /// under that same root, the one root already verifies it.
+    /// `ws::verify_envelope` never reads the field — it is bound into
+    /// `ws_digest`, and nothing more. The node itself passes the same zeros
+    /// to `ws::genesis_anchor`.
+    ///
+    /// The hazard this test guards is the FUTURE one: the day a registry-only
+    /// fast path is built — verifying a downloaded registry against
+    /// `validator_set_root` WITHOUT rebuilding the state tree — it must
+    /// REFUSE an all-zero root rather than treat it as "matches".
+    #[test]
+    fn zero_validator_set_root_is_deliberate_and_does_not_weaken_the_envelope() {
+        let f = fixture("vsr", 1);
+        assert_eq!(f.cp.validator_set_root, [0u8; 32]);
+        let out = format!("{}/env.bin", f.dir);
+        envelope(&[
+            s("--checkpoint"), format!("{}/cp.bin", f.dir),
+            s("--signer-set"), format!("{}/set.bin", f.dir),
+            s("--sig"), format!("0:{}/sig0", f.dir),
+            s("--sig"), format!("2:{}/sig2", f.dir),
+            s("--out"), out.clone(),
+        ])
+        .unwrap();
+        let env = decode_envelope_file(&fs::read(&out).unwrap()).unwrap();
+        ws::verify_envelope(&env, &f.set, FIX_NET, &FIX_GEN, &WsHybridVerifier)
+            .expect("zeros are accepted — the verifier never reads this field");
+
+        // But the field IS covered by the signature: changing it changes the
+        // digest, so it cannot be edited in a published artifact.
+        let mut other = f.cp;
+        other.validator_set_root = [0x44; 32];
+        assert_ne!(other.ws_digest(), f.cp.ws_digest());
+        let other_path = format!("{}/cp-vsr.bin", f.dir);
+        fs::write(&other_path, other.canonical_serialize()).unwrap();
+        let e = envelope(&[
+            s("--checkpoint"), other_path,
+            s("--signer-set"), format!("{}/set.bin", f.dir),
+            s("--sig"), format!("0:{}/sig0", f.dir),
+            s("--sig"), format!("2:{}/sig2", f.dir),
+            s("--out"), format!("{}/env2.bin", f.dir),
+        ])
+        .unwrap_err();
+        assert!(e.contains("BadSignature"), "{e}");
+    }
+
+    /// No command writes key material anywhere but the `.sk` file it was told
+    /// to write, and the signature it publishes carries none of it.
+    #[test]
+    fn published_artifacts_carry_no_key_material() {
+        let f = fixture("nokeys", 1);
+        let sk = fs::read(format!("{}/signer0.sk", f.dir)).unwrap();
+        let sk_raw = unhex(String::from_utf8_lossy(&sk).trim()).unwrap();
+
+        let out = format!("{}/env.bin", f.dir);
+        envelope(&[
+            s("--checkpoint"), format!("{}/cp.bin", f.dir),
+            s("--signer-set"), format!("{}/set.bin", f.dir),
+            s("--sig"), format!("0:{}/sig0", f.dir),
+            s("--sig"), format!("2:{}/sig2", f.dir),
+            s("--out"), out.clone(),
+        ])
+        .unwrap();
+
+        let contains = |hay: &[u8], needle: &[u8]| -> bool {
+            !needle.is_empty()
+                && hay.len() >= needle.len()
+                && hay.windows(needle.len()).any(|w| w == needle)
+        };
+        for artifact in ["sig0", "set.bin", "env.bin", "cp.bin", "signer0.pk"] {
+            let bytes = fs::read(format!("{}/{artifact}", f.dir)).unwrap();
+            assert!(!contains(&bytes, &sk_raw), "{artifact} contains the whole secret key");
+            for window in sk_raw.chunks(64) {
+                assert!(
+                    !contains(&bytes, window),
+                    "{artifact} contains 64 bytes of the secret key"
+                );
+            }
+        }
+
+        // And the secret file itself is 0600.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(format!("{}/signer0.sk", f.dir))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "a signer secret must not be group/world readable");
+        }
     }
 
     fn s(v: &str) -> String {

@@ -90,6 +90,8 @@ Assemble and verify exactly as a booting node would:
 
 ```
 bloch-pos ws-envelope --checkpoint wscheckpoint-<epoch>.bin \
+  --signer-set checkpoints/signer-set-1.bin \
+  --genesis genesis/mainnet.manifest \
   --sig 0:foundation-<epoch>.sig --sig 2:auditor-<epoch>.sig \
   --out checkpoints/wscheckpoint-<epoch>.envelope.bin
 
@@ -98,8 +100,11 @@ bloch-pos ws-verify --envelope checkpoints/wscheckpoint-<epoch>.envelope.bin \
   --genesis genesis/mainnet.manifest
 ```
 
-`ws-verify` enforces every §2.2 rule, including that no quorum of purely
-internal keys verifies. Publish the envelope, the signer-set file, and the
+`ws-envelope` will not write a file the network would reject: before touching
+disk it runs `ws::verify_envelope` — the same function a booting node runs —
+on the envelope it built and again on the envelope re-read from its own bytes,
+which is why `--signer-set` is required. `ws-verify` enforces every §2.2 rule,
+including that no quorum of purely internal keys verifies. Publish the envelope, the signer-set file, and the
 64-hex `ws_digest` on every channel (site, release pages, explorer,
 announcement channel) — the digest fits in a chat message, which is the
 out-of-band property the whole mechanism needs.
