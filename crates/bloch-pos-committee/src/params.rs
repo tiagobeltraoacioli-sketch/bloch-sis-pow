@@ -753,6 +753,37 @@ pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// re-root under the C1 tree is bound (DEV-5) — an armed gate with no engine
 /// behind it turns every shielded transaction into
 /// `ShieldedReject::PoolUnavailable`, a fail-closed block reject.
+///
+/// # A third arming precondition — PROPOSED, not yet ratified
+///
+/// `docs/specs/BLOCH-COHERENCE-UNDER-POS.md` §4.1.1 (2026-09-01) proposes a
+/// precondition the two above do not cover, and it is recorded here because
+/// this constant is the door anyone arming the trail has to walk through.
+///
+/// The measured SP1 proof is ~1.21 MiB against a 512 KiB block cap, so a
+/// shielded proof cannot travel inline; `ProofCarrier::Detached` carries a
+/// commitment while the bytes travel out of band. That makes validity depend
+/// on a **fetch succeeding**. `coherence-core` is fail-closed
+/// (`ProofUnavailable::NotFound` ⇒ unverifiable, not valid), which is the
+/// right local choice and does not remove the hazard, only relocates it: a
+/// validator that cannot fetch rejects, one that can accepts, and two honest
+/// nodes on identical binaries then split on network reachability rather than
+/// on committed state. This crate's `finality` floor is **1/2**, so that
+/// split **double-finalizes rather than stalling** — the same defect shape as
+/// the 2026-08-08 `expected_bits` failure, displaced one layer outward.
+///
+/// The proposed rule: availability must be a **consensus predicate**, decided
+/// by the same quorum on evidence carried in the chain. *Fetchability by one
+/// validator is not availability.* Satisfying it means data-availability
+/// sampling, which is workstream **W-DAS** with gate **G-DAS**
+/// (§4.1.2 of the same document). Bloch has an erasure-coding scaffold on a
+/// Genesis-3 branch (`c5d01f3`, `feat/zk-ledger`) and **no `das` module in
+/// this tree at all**; the scaffold is not that subsystem and its own commit
+/// message says so.
+///
+/// Until §4.1.1 is ratified and G-DAS is met, this constant must not take a
+/// finite value while the only available answer to *"was the proof
+/// available?"* is *"it resolved on my node."*
 pub const COHERENCE_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// Root of the **empty** C1-frozen commitment accumulator: 32 levels of the

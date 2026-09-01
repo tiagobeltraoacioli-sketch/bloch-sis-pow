@@ -277,12 +277,21 @@ one, with no compatibility burden and no deployed wallets to break.
 
 ### 3.2 `shield_tx` design (transparent → shielded)
 
+> **Superseded as a design sketch, kept as reasoning (2026-09-01).** The type
+> now exists: `coherence_core::ShieldTx` (`crates/coherence-core/src/lib.rs`),
+> with `UnshieldTx` alongside it. It differs from the sketch below in ways the
+> top-of-document banner already explains — **no taint rule** (the taint
+> machinery was dissolved), no `binding_sig` (the transparent signer is the
+> binder), the fee paid on the transparent side, and `proof: ProofCarrier`
+> rather than raw bytes (§4.1.1). Read the sketch for the argument; read the
+> code for the format.
+
 ```text
 ShieldTx {
     transparent_inputs:  Vec<OutPoint>       // spends eUTXO outputs; signed hybrid, public
     value_shielded:      u64                 // public: total entering the pool
     outputs:             Vec<[u8;32]>        // note commitments (cm)
-    output_ciphertexts:  Vec<NoteCiphertext> // ML-KEM-768 per output (7c9fe63)
+    output_ciphertexts:  Vec<NoteCiphertext> // ML-KEM-1024 per output (see §6.1)
     fee:                 u64
     proof:               Vec<u8>             // proves: each cm opens to some (v_i, …)
                                              // with Σ v_i = value_shielded; range checks
@@ -452,6 +461,100 @@ not one per transaction. That is a large improvement in the ratio. It does not
 remove the requirement, and it does not by itself satisfy the amended
 invariant.
 
+### 4.1.2 Data availability sampling — its own workstream, its own gate
+
+**Status: proposed, with §4.1.1.** Sequenced here so that the amended
+invariant has a named owner and a named gate instead of an intention.
+
+**Position.** DAS is **W-DAS**, a workstream in its own right, sequenced
+**ahead of any shielded flag day** and gated on its own terms. It is not a
+sub-task of Coherence. Availability of block-adjacent data is a base-layer
+property: it is worth building whether or not a shielded pool ever activates,
+and it can therefore be built and gated without committing to one. Coherence
+merely happens to be the first consumer that *cannot ship without it*.
+
+#### What exists today, stated exactly
+
+**Nothing, in the Genesis-4 tree.** There is no `das` module in any crate
+under `crates/`, and no erasure-coding dependency in any Genesis-4 manifest.
+Both are checkable in one command each; neither returns a hit.
+
+The scaffold is `c5d01f3` on `feat/zk-ledger` — `src/das/` in the **Genesis-3
+single-crate layout**, on a branch predating the entire PoS work. Landing it is
+a port into a new crate, not a merge, on the same lineage argument §0 already
+makes for the rest of that branch.
+
+What the scaffold does contain, and it is real work: RS(2k) Vandermonde
+erasure at rate 1/2 (any k of n reconstruct, k ≤ 128), a SHAKE-256 `ShareTree`
+whose root is `da_root`, an XChaCha20-Poly1305 at-rest body wrap,
+deterministic 1/k custody-slice assignment (`SHAKE256(node_id ‖ epoch)`),
+s = 30 sampling, and a `SHAKE256(r ‖ share)` proof-of-custody challenge, under
+26 tests including exhaustive C(8,4) reconstruction.
+
+What it is not — **in its own module documentation, not in this assessment**:
+
+- `DasChallenger` defaults to `Unattested` and **certifies nothing** until
+  `BLOCH_DAS_MODE=custody` *plus* storage and P2P seams that do not exist.
+- No `DAS_ACTIVATION_HEIGHT` is defined; `da_root` is a **zero sentinel**.
+- The AEAD key derives from the **public** block hash: integrity and
+  structural uniformity, explicitly not confidentiality.
+- Proof-of-custody proves possession **at challenge time only**. There is no
+  sequentiality hardness, so a colluding cluster holding one archival copy
+  answers every challenge. Closing that needs a PoRep/PoSt-class construction,
+  which the scaffold declares out of scope.
+
+That is a correct, honest erasure-coding and sampling *library*. A subsystem
+that could decide a consensus predicate needs storage, transport, a
+commitment, a vote, and a dispute path — five things, none of which the
+scaffold claims. **`c5d01f3` must not be cited as the DAS subsystem**, here or
+in any public material; its own commit message declines the citation.
+
+#### The soundness risk the scaffold names, sharpened for Genesis-4
+
+The scaffold records that `1 - (1-f)^s ≈ 1 - 2⁻³⁰` (s = 30, f = 1/2) assumes
+**many independent custodians**, and that at ~12 nodes the 30 samples collapse
+onto ~12 responders — an adversary then needs a handful of colluding nodes,
+not half of `n`. Under Genesis-4 that risk is *sharper*, not milder: the
+operative quantity is **independent custody domains, not validator
+processes**, and the G4 fleet's validator count and its distinct-host count
+differ by close to an order of magnitude. Sampling parameters must be set
+against the measured host count, and re-derived whenever the fleet
+consolidates. This is a live unresolved risk, carried forward, not closed.
+
+#### W-DAS phases
+
+| Phase | Content | Consensus edge |
+|---|---|---|
+| D0 | Port/rewrite the scaffold into a Genesis-4 crate (`crates/bloch-das`), inert, no dependent | none |
+| D1 | `da_root` from zero sentinel to a real `ShareTree` root, and a decision on where it is committed (a `state_root` leaf vs a header mirror). Ships **with** its sibling roots, never alone | hard fork |
+| D2 | Storage and P2P seams: share persistence, share request/response, custody assignment bound to real node identity | none (wire additive) |
+| D3 | **Sampling as a consensus predicate**: validators sample, the outcome is attested, and the quorum — not the individual node — decides availability. This is the entire content of the amended §4.1 invariant, and the largest phase by a wide margin | hard fork |
+| D4 | Challenge/response and the dispute path: what a failed sample *does* (non-finalization, or slashing), and the reconstruction path that repairs it | hard fork |
+| D5 | Parameters (`k`, `n`, `s`, rate) set against **measured** block sizes and the measured custody-domain count, replacing the scaffold's placeholders | parameter fork |
+
+#### Gate G-DAS
+
+Conjunctive. Every clause must hold before `COHERENCE_ACTIVATION_EPOCH` may
+take a finite value. Any one unmet ⇒ the constant stays `u64::MAX`.
+
+1. Availability is decided by **quorum vote on chain-carried evidence**. No
+   node's own fetch result is an input to any validity rule.
+2. A validator that can fetch and a validator that cannot reach the **same
+   verdict** on the same block. Demonstrated adversarially, not asserted.
+3. The double-finalization path is reviewed **explicitly under the ratified
+   1/2 quorum floor** — the floor is the reason this is a safety question and
+   not a liveness one.
+4. The custody-domain count is measured, and `s` and the rate are justified
+   against that number rather than against the validator count.
+5. Reconstruction from `k` of `n` is demonstrated end to end on the real
+   fleet, not only in unit tests.
+6. §4.1.1 and `COHERENCE-C1.2.md` are both ratified by the founder.
+
+**G-DAS authorizes DAS, and nothing else.** The shielded flag day is
+downstream of it and carries its own gate (§3.5 ordering, G11, and the C1.2
+ratification); passing G-DAS does not shorten that list, it only stops being
+the reason the list cannot start.
+
 ### 4.2 Coupling risks to pin down (A6 requirements, A9 concurs)
 
 1. **Verifier key discipline.** Both statements' guest ELFs are consensus
@@ -488,7 +591,7 @@ resolution (same lineage, heavy `main.rs` drift).
 | # | Item | Source | Phase |
 |---|------|--------|-------|
 | 1 | Port frontier `CommitmentTree` + golden root-equality tests | `cd7f62a` | now |
-| 2 | Port `NoteCiphertext` (ML-KEM-768) + DoS bounds + mempool purge | `7c9fe63`, `26bd7ae` | now |
+| 2 | Port `NoteCiphertext` + DoS bounds + mempool purge. **Landed at ML-KEM-1024, not the `7c9fe63` parameter** — §6.1 | `7c9fe63`, `26bd7ae` | now |
 | 3 | Port SP1 verify path with ELF pinning (stays fail-closed) | `407cffc` | now |
 | 4 | Port reorg wiring: call `disconnect_block_self` from the reorg driver (closes F5) | `f069610` wiring, *(zk-ledger)* `src/main.rs:2228` | now |
 | 5 | Shielded persistence CFs, batch-atomic with block commit (closes F1/F11) | new | DEV-3 |
@@ -499,6 +602,14 @@ resolution (same lineage, heavy `main.rs` drift).
 | 10 | G4 state machine: Coherence leaves in `state_root` SMT + `coherence_root` header mirror; seam copies from last PoW commitment (§1.2(2), §2.5) | new | DEV-1/DEV-3 |
 | 11 | Port `PruneGate`/`ProofCheckpoint` as the §6.6.4 degradation posture; epoch-proof statement added later without touching accept paths | `0b64d94` | DEV-2 |
 | 12 | A3 shadow-fork continuity matrix (§1.3); §3.4 negative deposit test; no-`new()`-outside-genesis lint | tests | gate **G11** |
+| **W-DAS** | **Data availability sampling — separate workstream, phases D0-D5, gate G-DAS (§4.1.2). Blocks any finite `COHERENCE_ACTIVATION_EPOCH`. `c5d01f3` is a scaffold and is not this item** | new; `c5d01f3` ports into D0 only | **ahead of any shielded flag day** |
+
+**Sequencing note.** Items 1-12 are the state-lifecycle work and none of them
+put a shielded transaction on the wire. W-DAS is what stands between that work
+and an activation, and it is sized in its own right (§4.1.2), not folded into
+item 11. Items 7 and 9 are additionally gated on founder ratification of
+`COHERENCE-C1.2.md`, which is a draft: by its own preamble an extension does
+not inherit ratification by silence.
 
 **Out of scope for A9, flagged:** the Utreexo-crate dedup ruling
 (`a167203` vs `ed030c3`, founder ADR pending) — it affects `state_root`'s
@@ -517,3 +628,80 @@ About half of that already exists, tested and fail-closed, on
 reorg wiring, the pinned SP1 verifier, and the prune gate — and the shield
 taint rule costs no privacy because the transparent→shielded bridge it must
 guard has not been built yet: we get to build the gate before the door.
+
+
+---
+
+## 6. Parameter decisions of record
+
+Decisions that were made, are implemented, and keep being re-asked. Recorded
+here so the answer has one address.
+
+### 6.1 ML-KEM parameters: 1024 for notes, 768 for transport
+
+**Decided, implemented, and enforced by the domain separator. Not open.**
+
+| Use | Parameter | Category | Why |
+|---|---|---|---|
+| Note ciphertexts (`NoteCiphertext.kem_ct`) | **ML-KEM-1024** (FIPS 203) | 5 | The ciphertext is **on-chain forever**. Harvest-now-decrypt-later against it has no deadline, so the margin is chosen against an unbounded window |
+| libp2p transport session keys | **ML-KEM-768** (FIPS 203) | 3 | Data **in flight**. The window closes when the session does |
+
+The note parameter is deliberately **a category above the ML-DSA-65 signatures
+(Category 3)**, and that asymmetry is the decision, not an oversight: forging a
+signature requires a quantum adversary *at spend time*, while decrypting a
+stored ciphertext requires one *at any time from now on*. Different threat
+windows, different margins.
+
+**Where it is enforced.** The parameter is baked into the domain separator:
+
+```
+DOM_NOTE_CT = b"bloch:coherence:notect:mlkem1024:v1"
+```
+
+This is the strongest available placement. The tag is an input to
+`derive_note_aead_key` (the AEAD key) and to `note_ciphertext_aad` (the
+per-output AAD), so a KEM swap changes the tag and therefore **every
+derivation** — a silent parameter substitution cannot decrypt anything. Two
+tests hold it (`crates/coherence-core/src/lib.rs`): one asserts
+`DOM_NOTE_CT.ends_with(b"mlkem1024:v1")`, the other pins the 1568 + 12 + 88 =
+1668-byte per-output wire cost. On the wallet side
+`crates/bloch-crypto/src/wallet/note_crypto.rs` imports `NOTE_KEM_CT_LEN` from
+`coherence-core` rather than restating it, and asserts a real
+`mlkem1024::encapsulate` output against it — so the library, the constant and
+the tag cannot drift apart in silence.
+
+**Provenance of the confusion.** `7c9fe63` on `feat/zk-ledger` genuinely
+introduced `NoteCiphertext` at ML-KEM-768; the parameter was raised to 1024
+when the construction landed. References to 768 that name `7c9fe63` are
+correct as history (§0's table). A reference to 768 describing what the field
+carries **now** is stale, and one such comment survived in §3.2 until
+2026-09-01. There is no 768 anywhere in the note-ciphertext implementation —
+the only surviving 768 in `crates/` is the transport row above, which is
+correct, and a wallet test that *rejects* a 768-sized key as a wrong-length
+input.
+
+
+### 6.2 ESCALATED, not decided here — the two statements disagree on duplicate nullifiers
+
+`crates/coherence-core/src/lib.rs` holds three proved statements over the same
+nullifier derivation. **Two of them disagree about whether a transaction may
+repeat a nullifier against itself:**
+
+| Statement | Line | In-transaction duplicate nullifiers |
+|---|---|---|
+| `check_unshield` | 1341 (check at 1365) | **Rejected** — `UnshieldError::DuplicateNullifier(i)`, covered by a test at 2481 |
+| `check_spend` | 943 | **Accepted** — the loop binds `public.nullifiers[i]` position by position and never compares them to each other. No test either way |
+
+This is finding **F1 (ALTO)** of `docs/audit/COHERENCE-FINDINGS-2026-08-29.md`,
+still open, and it is now visibly inconsistent with the sibling statement
+written after it. The set-level `NullifierSet` insert catches a *cross*-block
+and cross-transaction repeat; it does not catch a repeat *within* one
+transaction's own nullifier vector, which is where the double-spend lives.
+
+**Not fixed here, deliberately.** `check_spend` is the exact statement the SP1
+guest proves. Adding a conjunct to it changes the circuit and therefore the
+verifier key, which is a hard fork by the §4.2(1) rule this document already
+states. It is also a disagreement between two consensus statements rather than
+a coding slip, and the standing instruction on those is to stop and escalate
+rather than to pick a side in a merge. The window in which it costs nothing to
+fix is the window the pool is inert — which is now.
