@@ -286,14 +286,19 @@ why first.
 Machine time for the whole ceremony is under 20 seconds. Measured, on one
 laptop, against the live chain:
 
-| step | machine time |
-| --- | --- |
-| `ws-keygen` (per holder, once) | 0.18 – 0.3 s |
-| `ws-signer-set` (once) | 0.11 s |
-| `ws-checkpoint` mint, 2 endpoints | 8.6 s |
-| `ws-sign` (per signer) | 0.13 s |
-| `ws-envelope` assemble | 0.12 s |
-| `ws-verify` | 0.12 s |
+| step | machine | cold run | warm run |
+| --- | --- | --- | --- |
+| `ws-keygen` (per holder, once) | S0/S1/S2 | 0.18 – 1.5 s | 0.12 – 0.16 s |
+| `ws-signer-set` (once) | M | 0.11 s | 0.07 s |
+| `ws-checkpoint` mint, 2 endpoints | M | 8.6 s | 12.2 s |
+| `ws-sign` (per signer) | S0/S1/S2 | 0.13 s | 0.08 s |
+| `ws-envelope` assemble | M | 0.12 s | 0.07 s |
+| `ws-verify` | M | 0.12 s | 0.08 s |
+
+Every step except the mint is **under a fifth of a second**. The mint is
+entirely network: it makes about three JSON-RPC calls per endpoint, and the
+measurement above went through a TLS-fronted public endpoint. Against nodes on
+your own network it is well under a second. It is not a step to plan around.
 
 Transferring the artifacts adds nothing: the checkpoint is **154 bytes**, a
 signature ≈ 9 KB, the envelope ≈ 9 KB, the arrangement ≈ 11 KB. A signer on
