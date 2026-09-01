@@ -72,8 +72,15 @@ three different roots.** `finalized: true` from one node is not evidence that th
 network finalized anything.
 
 *(The founder-set quorum floor of 1/2 is a deliberate decision — liveness over
-root-uniqueness. The defect is not the value; it is that the floor is gated off
-entirely, so the decision is not in force.)*
+root-uniqueness. **The defect is not the value; it is that the floor is gated off
+entirely, so the decision is not in force.** Verified 2026-09-01:
+`MIN_QUORUM_DENOMINATOR_NUM/DEN = 1/2` at `params.rs:147-149`, last written by
+the founder on 2026-08-24 in `consensus: the leak accumulator can come back down,
+and the denominator has a floor` — the value is intact and has not been altered
+by an agent. **Whoever fixes this must arm `LEAK_RECOVERY_ACTIVATION_EPOCH`, not
+change the fraction.** A previous attempt to move this ratio to 3/4 was made
+unilaterally by a subagent and reversed; check commit authorship before accepting
+any change to it.)*
 
 ### 1.4 `finalized` is not a latch — it can move backwards
 
