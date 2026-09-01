@@ -169,6 +169,7 @@ fn print_help() {
                graylists a whole mesh that shares one proxy address.\n\
          \n\
                          [--stop-at-slot <n>] [--sig-retention <r>]\n\
+                         [--replay-blocks <n>]\n\
                --sig-retention says how much of the chain keeps its\n\
                proposer signatures in RAM: `finalized` (default; from the\n\
                finalized checkpoint to the tip), a slot count, or `none`.\n\
@@ -799,6 +800,20 @@ fn run_cmd(args: &[String]) {
         p2p_listen.push("/ip4/0.0.0.0/tcp/16400".to_string());
     }
     let stop_at_slot = arg_value(args, "--stop-at-slot").and_then(|s| s.parse::<u64>().ok());
+    // MEASUREMENT ONLY, and refused unless the run also exits before going
+    // live. A node that replayed only part of its own log and then joined the
+    // network would attest and propose from a head thousands of blocks behind
+    // the chain it is on — the same class of mistake `--sig-retention` is
+    // guarded against, and guarded the same way.
+    let replay_blocks = arg_value(args, "--replay-blocks").and_then(|s| s.parse::<usize>().ok());
+    if replay_blocks.is_some() && stop_at_slot.is_none() {
+        eprintln!(
+            "run: --replay-blocks is a measurement mode and requires --stop-at-slot, \
+             which exits before the node goes live. A node that replayed part of its \
+             log and then went live would perform duties from a stale head."
+        );
+        exit(2);
+    }
 
     // How much of the chain keeps its proposer signatures resident. A
     // malformed value is refused rather than silently defaulting, for the same
@@ -881,6 +896,7 @@ fn run_cmd(args: &[String]) {
             .unwrap_or(64),
         behind_proxy: args.iter().any(|a| a == "--behind-proxy"),
         stop_at_slot,
+        replay_blocks,
         sig_retention,
         ws,
         // Required exactly when the manifest commits to a carryover; `run`

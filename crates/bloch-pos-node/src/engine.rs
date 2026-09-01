@@ -127,6 +127,14 @@ pub struct Config {
     /// libp2p transport: zero the IP-colocation score penalty.
     pub behind_proxy: bool,
     pub stop_at_slot: Option<u64>,
+    /// MEASUREMENT ONLY. Stop the boot replay after this many blocks, leaving
+    /// the engine at exactly the state the chain held at that height. This is
+    /// a shorter CHAIN, not a truncated file: the log is untouched, every
+    /// block up to the limit is applied by the same `ingest` path, and
+    /// `apply_block` re-derives and checks the post-state root on each one. It
+    /// exists so resident memory can be sampled at two heights of the same
+    /// history; see `--replay-blocks`.
+    pub replay_blocks: Option<usize>,
     /// How much of the chain keeps its proposer signatures in RAM.
     /// [`SigRetention::ToFinalized`] unless an operator says otherwise.
     pub sig_retention: SigRetention,
@@ -2603,6 +2611,46 @@ impl Engine {
 /// How often replay reports progress. Ten seconds is short enough that an
 /// operator watching a stalled fleet gets an answer quickly, and long enough
 /// that the log of a multi-hour replay stays readable.
+/// Resident memory as the kernel accounts it, in KiB: `VmRSS` is what is
+/// resident NOW, `VmHWM` the high-water mark over the whole life of the
+/// process. Both are printed together at every sampling point on purpose —
+/// a growth measurement wants the first and a capacity ceiling wants the
+/// second, and a single unlabelled "RSS" figure has been read as each of
+/// them by different readers of the same report.
+///
+/// `None` off Linux, where neither field exists.
+fn vm_kb() -> Option<(u64, u64)> {
+    let st = std::fs::read_to_string("/proc/self/status").ok()?;
+    let field = |name: &str| -> Option<u64> {
+        st.lines()
+            .find(|l| l.starts_with(name))?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
+    };
+    Some((field("VmRSS:")?, field("VmHWM:")?))
+}
+
+/// Print a resident-memory sample with a label naming the moment it was taken.
+fn print_mem(label: &str) {
+    match vm_kb() {
+        Some((rss, hwm)) => println!(
+            "MEM {label}: VmRSS {:.1} MiB ({rss} kB), VmHWM {:.1} MiB ({hwm} kB)",
+            rss as f64 / 1024.0,
+            hwm as f64 / 1024.0,
+        ),
+        None => println!("MEM {label}: unavailable (no /proc/self/status)"),
+    }
+}
+
+/// How often the replay prints a state-root mark. A run that replays the full
+/// log passes THROUGH every height a shorter run stops at, so its marks are
+/// what certifies that the shorter run landed on the real chain's state and
+/// not on some other system. Read the two against each other; they must be
+/// identical hex.
+const REPLAY_MARK_EVERY: usize = 5_000;
+
 const REPLAY_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub fn run(cfg: Config) -> io::Result<()> {
@@ -2844,6 +2892,29 @@ pub fn run(cfg: Config) -> io::Result<()> {
         // would diverge from what the network saw.
         let env = env?;
         engine.ingest(env);
+        let done = i + 1;
+        // A mark every REPLAY_MARK_EVERY blocks, and one at the limit itself.
+        // The full-length run's mark at height N and a `--replay-blocks N`
+        // run's final root are the same number computed twice; if they differ,
+        // the short run measured a different chain and its memory figure means
+        // nothing.
+        if done % REPLAY_MARK_EVERY == 0 || cfg.replay_blocks == Some(done) {
+            let fin = engine.state.finality();
+            println!(
+                "MARK {done}: head slot {}, state root {}, justified e{}, finalized e{}",
+                engine.state.slot(),
+                crate::codec::hex32(&engine.state.state_root()),
+                fin.justified.epoch,
+                fin.finalized.epoch,
+            );
+            print_mem(&format!("at block {done}"));
+        }
+        if cfg.replay_blocks == Some(done) {
+            println!(
+                "replay stopped at {done} of {n_logged} logged blocks (--replay-blocks)"
+            );
+            break;
+        }
         // Time-based, not every-N-blocks: block cost varies by an order of
         // magnitude with how many transactions a block carries, so a fixed
         // count reports in bursts and then goes quiet exactly when the work is
@@ -2884,6 +2955,12 @@ pub fn run(cfg: Config) -> io::Result<()> {
             engine.sig_retention, engine.sig_trimmed_through,
         );
     }
+    // END OF REPLAY. This is the sample a growth measurement must use. The
+    // peak (VmHWM, printed beside it) is set by the carryover load and the
+    // state-root work near the start of the run and does not move with chain
+    // length; reporting one as the other is the confusion this line exists to
+    // end.
+    print_mem("end of replay");
     engine
         .head_slot
         .store(engine.state.slot(), Ordering::Relaxed);
@@ -3041,6 +3118,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 println!(
                     "STOP signatures: {hits} from RAM, {misses} from the log, {absent} not found"
                 );
+                print_mem("at STOP");
                 return Ok(());
             }
         }
