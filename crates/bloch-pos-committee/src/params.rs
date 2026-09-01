@@ -1012,6 +1012,30 @@ pub const FUNDED_STAKING_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// requirement and reading only the committed epoch.
 pub const SIGNED_EXIT_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+// ── The ordering the three staking gates may never be armed out of ─────────
+//
+// Checked at COMPILE TIME, because the failure mode is an edit to a constant
+// weeks from now — a runbook line and a doc paragraph are exactly what got
+// skipped the last time a flag day was armed wrong. All three constants are
+// `u64::MAX` today, so both assertions hold trivially; they exist to make the
+// ARMING order a build error rather than a fleet incident.
+//
+// Carried from the sibling integration pass (2026-08-31), which arrived at
+// the same two invariants independently.
+const _: () = assert!(
+    WITHDRAWAL_ACTIVATION_EPOCH >= FUNDED_STAKING_ACTIVATION_EPOCH,
+    "WITHDRAWAL_ACTIVATION_EPOCH must not precede FUNDED_STAKING_ACTIVATION_EPOCH: \
+     paying out bonds while deposits are still unfunded turns deposit → exit → \
+     withdraw into a mint"
+);
+const _: () = assert!(
+    WITHDRAWAL_ACTIVATION_EPOCH >= SIGNED_EXIT_ACTIVATION_EPOCH,
+    "WITHDRAWAL_ACTIVATION_EPOCH must not precede SIGNED_EXIT_ACTIVATION_EPOCH: \
+     a withdrawal consumes an EXITED record, and after the 2026-08-31 closure the \
+     signed exit is the only thing that can exit one — arming the payout first \
+     ships a door with no road to it"
+);
+
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.
 pub const DS_SORTITION: [u8; 16] = *b"BLCH4:SORTIT\0\0\0\0";
