@@ -1566,6 +1566,14 @@ impl Engine {
             PosTransaction::TransferV2 { inputs, .. } => {
                 Some(inputs.iter().map(|i| (i.txid, i.vout)).collect())
             }
+            // A funded deposit spends outputs like a transfer does, so it must
+            // be evictable like one. It cannot reach the mempool while the
+            // format is inert, which is exactly why this is easy to forget —
+            // and why forgetting it would surface only on the flag day, as a
+            // mempool that never drops a deposit whose funding coin is gone.
+            PosTransaction::DepositV2 { inputs, .. } => {
+                Some(inputs.iter().map(|i| (i.txid, i.vout)).collect())
+            }
             _ => None,
         }
     }
@@ -3401,6 +3409,25 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
         PosTransaction::Exit { .. } => Err(
             "exits are not accepted: the Exit message is not authenticated, \
              so anyone could retire any validator irreversibly",
+        ),
+        // The FUNDED deposit is the successor that fixes the two refusals
+        // above — it spends transparent eUTXO inputs and carries a proof of
+        // possession — but it is INERT: no wire tag is assigned to it
+        // (`params::FUNDED_DEPOSIT_WIRE_TAG` is `None`) and its flag day
+        // (`FUNDED_DEPOSIT_ACTIVATION_EPOCH`) is `u64::MAX`. Consensus refuses
+        // it at the transition on both counts.
+        //
+        // Refused HERE too, and this is defence in depth rather than the rule:
+        // the rule is the transition's, because mempool policy is per-node and
+        // one producer that lifted it would lift it for the whole network —
+        // that is the whole lesson of the `Deposit` arm above. What this arm
+        // buys is that a transaction consensus will certainly refuse does not
+        // occupy a mempool slot or propagate. When the founder assigns a tag
+        // and arms the flag day, this arm becomes the wall-clock check that
+        // mirrors the committed-epoch one, and must be changed with it.
+        PosTransaction::DepositV2 { .. } => Err(
+            "funded deposits are not accepted yet: the format has no assigned wire tag \
+             and its activation epoch is unarmed, so consensus would refuse it",
         ),
         _ => Ok(()),
     }

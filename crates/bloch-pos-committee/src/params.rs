@@ -485,6 +485,58 @@ pub mod rehearsal {
         Restore(prev)
     }
 
+    thread_local! {
+        static FUNDED_DEPOSIT_GATE_TL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Test-only: treat [`super::FUNDED_DEPOSIT_ACTIVATION_EPOCH`] as bound.
+    ///
+    /// Its own switch, like `bonding_gate_forced_open`, and for the mirror-image
+    /// reason: that one turns the OLD (unfunded) behaviour back on for a gate
+    /// whose inert value is a refusal, this one turns the NEW (funded) format on
+    /// for a gate whose inert value is dormancy. Folding either into
+    /// `GATES_OPEN` would let a fixture aimed at some third rule silently change
+    /// which staking rules the chain it models has.
+    ///
+    /// Default is CLOSED: an unadorned `cargo test` runs the fleet's rules.
+    pub fn funded_deposit_forced_open() -> bool {
+        FUNDED_DEPOSIT_GATE_TL.with(|c| c.get())
+    }
+
+    /// Opens the funded-deposit gate for this thread until the guard drops,
+    /// including on unwind, so a failing assertion cannot leave the format live
+    /// for the rest of the thread.
+    pub fn funded_deposit_open_guard() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FUNDED_DEPOSIT_GATE_TL.with(|c| c.set(self.0));
+            }
+        }
+        let prev = FUNDED_DEPOSIT_GATE_TL.with(|c| c.replace(true));
+        Restore(prev)
+    }
+
+    /// A PROVISIONAL wire tag for the funded deposit, visible to tests only.
+    ///
+    /// [`super::FUNDED_DEPOSIT_WIRE_TAG`] is `None` because the byte is the
+    /// founder's to assign, and an unassigned tag makes the format unencodable
+    /// — which is the point, but it also makes the format untestable through
+    /// `build_block`/`apply_block`, and a consensus rule with no negative test
+    /// through the real seam is a comment.
+    ///
+    /// So tests encode under this byte instead. It is `#[cfg(test)]`, so it does
+    /// not exist in a shipped binary and cannot be mistaken for an assignment;
+    /// it is `0xFE`, chosen precisely because it is implausible as a real
+    /// allocation — a test that starts passing because someone assigned the real
+    /// tag to `0xFE` is a test whose fixture the reviewer will notice.
+    ///
+    /// This is NOT a claim on `0xFE`. It is a scaffold, and the day
+    /// `FUNDED_DEPOSIT_WIRE_TAG` becomes `Some(byte)` this constant should be
+    /// deleted and the fixtures pointed at the real one.
+    #[cfg(test)]
+    pub const PROVISIONAL_FUNDED_DEPOSIT_TAG: u8 = 0xFE;
+
     /// Test-only: treat [`super::ANCESTRY_SEED_ACTIVATION_EPOCH`] and
     /// [`super::LEAK_RECOVERY_ACTIVATION_EPOCH`] as if they had already bound.
     ///
@@ -735,6 +787,115 @@ pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// that says all of the above out loud.
 pub const DEPOSIT_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+/// Flag day for the **funded, authenticated deposit** (`DepositV2`): the epoch
+/// at and after which that format is valid in consensus. Below it the format is
+/// refused at the transition with `TransferReject::FormatNotActive`.
+///
+/// # Standard polarity — the opposite of [`DEPOSIT_ACTIVATION_EPOCH`]
+///
+/// The gate is `epoch >= FUNDED_DEPOSIT_ACTIVATION_EPOCH`, so `u64::MAX` means
+/// **INERT**: no epoch ever reaches it and the funded format is dormant, today,
+/// on every node. This is deliberately NOT the inverted polarity of
+/// [`DEPOSIT_ACTIVATION_EPOCH`], whose `u64::MAX` selects a permanent
+/// *refusal*. The two constants gate opposite things and must not be read
+/// alike: that one keeps unfunded bonding dead forever, this one keeps the
+/// funded successor asleep until a flag day.
+///
+/// # Why this is the constant that MAY one day be armed
+///
+/// [`DEPOSIT_ACTIVATION_EPOCH`]'s documentation says, correctly, that arming it
+/// is not how deposits open — arming it would make stake-minted-from-nothing
+/// consensus-valid on all 64 nodes at once. Deposits open through *this*
+/// constant instead, because the format it gates spends transparent eUTXO
+/// inputs, conserves value by strict equality, and carries a proof of
+/// possession. Opening deposits is therefore a REPLACEMENT of the legacy path,
+/// not an arming of it, and the two constants compose: the legacy arm stays
+/// refused at every epoch while this one is the single switch that opens the
+/// funded one.
+///
+/// # It ships unarmed, and it has a real reader
+///
+/// `u64::MAX` as shipped. The consensus reader is
+/// `CommittedState::funded_deposit_active`, called from the `DepositV2` arm of
+/// `apply_transaction` against `self.epoch` — COMMITTED state, already rolled
+/// to the judged block's own `epoch_of(header.slot)` by `compute_post_state`'s
+/// boundary walk. Not a wall clock, not the node's head, not a
+/// `current_bits`-style mutable local; the 2026-08-08 `expected_bits` split is
+/// the standing reason for the distinction. `funded_deposit_ships_inert` pins
+/// the value.
+///
+/// # The name, and the two contested spellings it deliberately avoids
+///
+/// Two other spellings exist in this repository —
+/// `FUNDED_STAKE_ACTIVATION_EPOCH` (30 heads) and
+/// `FUNDED_STAKING_ACTIVATION_EPOCH` (9 heads) — and **neither exists on the
+/// fleet lineage at all**, which is a different fact from being present and
+/// unarmed. Both of those gate a wider scope (deposit *and* delegation) than
+/// this one, which gates the funded deposit format only. Reusing either
+/// spelling for a narrower rule would let a textual merge unify two different
+/// scopes with no conflict marker — the failure this crate has already been bitten
+/// by twice. The founder may rename this on landing; the rename is mechanical,
+/// a silent scope change is not.
+pub const FUNDED_DEPOSIT_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Wire tag for the funded deposit — **DELIBERATELY UNASSIGNED**.
+///
+/// `None` means this crate has not been told which byte the format owns, and
+/// the consequence is enforced rather than documented: with no tag the variant
+/// has no canonical encoding, so it cannot appear in a block body, cannot be
+/// decoded off the wire, and is refused by the transition before any other
+/// check. That is a second, independent inertness on top of
+/// [`FUNDED_DEPOSIT_ACTIVATION_EPOCH`], and it is the one that cannot be
+/// undone by moving an epoch number.
+///
+/// # Why no number is chosen here
+///
+/// Assigning it is a founder decision, not an implementation detail, and the
+/// space is genuinely contested. Per the frozen registry
+/// (`docs/WIRE-NAMESPACE-REGISTRY.md` and
+/// `crates/bloch-pos-committee/tests/wire_tag_registry.rs` on
+/// `guard/wire-tag-registry-release`): the released range through `0x06` is
+/// spoken for — and `0x06` itself carries a live rival claim inside the
+/// released space — while the three bytes above it are claimed by five, three
+/// and two mutually incompatible meanings across unmerged lineages. Whichever
+/// meaning lands second splits the chain at decode, and the failure is silent
+/// on the side that decodes.
+///
+/// # The requirement, stated so it can be satisfied in one edit
+///
+/// The founder assigns one byte that is (a) recorded as free in the frozen
+/// registry, (b) not any released tag, since re-pointing a released byte
+/// re-reads every block already finalised, and (c) written into the registry
+/// table in the same commit that sets this constant, so the choice is visible
+/// in a diff instead of inherited from a merge resolution. Setting this to
+/// `Some(byte)` is the whole change: the encoder, the decoder and the
+/// exhaustive tag test all read it, and `funded_deposit_has_no_wire_tag_yet`
+/// is the test that must be updated to say the number out loud.
+///
+/// Until then, no partner-facing document may name a tag for this format.
+pub const FUNDED_DEPOSIT_WIRE_TAG: Option<u8> = None;
+
+/// The tag the encoder and decoder actually use.
+///
+/// In a shipped binary this IS [`FUNDED_DEPOSIT_WIRE_TAG`] — `None`, so the
+/// funded deposit has no canonical encoding and cannot reach a block body.
+/// Under `cfg(test)` it falls back to
+/// [`rehearsal::PROVISIONAL_FUNDED_DEPOSIT_TAG`] so the format can be driven
+/// through the real `build_block`/`apply_block` seam; the scaffold does not
+/// exist outside a test build. The `.or(...)` order is load-bearing: a real
+/// assignment always wins over the scaffold, so the day the founder sets the
+/// constant the tests move to the real byte without a second edit.
+pub fn effective_funded_deposit_tag() -> Option<u8> {
+    #[cfg(test)]
+    {
+        FUNDED_DEPOSIT_WIRE_TAG.or(Some(rehearsal::PROVISIONAL_FUNDED_DEPOSIT_TAG))
+    }
+    #[cfg(not(test))]
+    {
+        FUNDED_DEPOSIT_WIRE_TAG
+    }
+}
+
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.
 pub const DS_SORTITION: [u8; 16] = *b"BLCH4:SORTIT\0\0\0\0";
@@ -752,6 +913,16 @@ pub const DS_STATE: [u8; 16] = *b"BLCH4:STATE\0\0\0\0\0";
 pub const DS_RANDAO: [u8; 16] = *b"BLCH4:RANDAO\0\0\0\0";
 /// Deposit message signing root (§7.1 proof of possession).
 pub const DS_DEPOSIT: [u8; 16] = *b"BLCH4:DEPOSIT\0\0\0";
+/// Domain for the **input-witness** root of a funded deposit — the digest the
+/// coins' owners sign to authorise funding a bond.
+///
+/// Distinct from [`DS_DEPOSIT`] (which the validator key signs for the proof of
+/// possession) and from [`DS_SPEND`] (which a transfer's owners sign) because
+/// all three are signed by different parties over overlapping fields. Sharing
+/// `DS_SPEND` would be the real hazard: a signature authorising a payment would
+/// then also authorise bonding the same coins, and an owner who signed to send
+/// money would have signed to stake it.
+pub const DS_DEPOSIT_FUND: [u8; 16] = *b"BLCH4:DEPFUND\0\0\0";
 /// The signing root an eUTXO spend authorisation covers: the domain under
 /// which an output's owner authorises *this* transfer and no other.
 ///

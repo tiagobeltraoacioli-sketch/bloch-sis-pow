@@ -288,6 +288,49 @@ pub fn validate_deposit(
     max_stake_sat: u128,
     verifier: &dyn HybridKeyVerifier,
 ) -> Result<(), DepositReject> {
+    validate_deposit_fields(tx, inputs, max_stake_sat)?;
+    if !verify_hybrid(&tx.validator_pubkey, &tx.signing_root(), &tx.proof_of_possession, verifier)
+    {
+        return Err(DepositReject::BadProofOfPossession);
+    }
+    Ok(())
+}
+
+/// The five state-independent §7.1/§4.1 checks — everything in
+/// [`validate_deposit`] except the proof of possession.
+///
+/// # Why this split exists, and why it is not a second definition
+///
+/// The consensus transition must run these rules, and it cannot call
+/// [`validate_deposit`]: that function takes a [`HybridKeyVerifier`], which
+/// splits a hybrid key into its ML-DSA and Falcon halves, and the transition's
+/// injected verifier is an [`crate::attestation::SignatureVerifier`], which
+/// verifies a whole key at once. The two are the same contract at different
+/// granularity — `verify_with_key`'s own documentation requires it to check
+/// **both** halves, for exactly the reason [`HybridKeyVerifier`] exposes them
+/// separately — but neither can be built from the other, because a whole-key
+/// verifier cannot answer "did the Falcon half alone verify?".
+///
+/// So the PoP rule is stated once *per injection point* (here through
+/// `verify_hybrid`, in the transition through `verify_with_key`) and
+/// everything else is stated once, period, in this function. The alternative —
+/// restating suite, shielded, tainted, minimum and cap inline in the
+/// transition — is the duplicate-derivation defect this crate exists to
+/// refuse, and it is precisely the defect that was found on the release
+/// lineage: a second inline copy of the min/cap rule that had silently drifted
+/// to a *different* cap formula from the one this module documents.
+///
+/// [`validate_deposit`] is now a thin wrapper over this, so its thirteen
+/// existing call sites keep testing the same rules and no branch of the
+/// original is left without a caller.
+///
+/// Check order is preserved exactly: cheapest-first, the same DoS argument
+/// `attestation::validate` makes.
+pub fn validate_deposit_fields(
+    tx: &DepositTx,
+    inputs: &[DepositInput],
+    max_stake_sat: u128,
+) -> Result<(), DepositReject> {
     if tx.suite != SUITE_MLDSA65_FALCON1024 {
         return Err(DepositReject::WrongSuite);
     }
@@ -306,11 +349,31 @@ pub fn validate_deposit(
     if tx.amount_sat > max_stake_sat {
         return Err(DepositReject::AboveMaximum);
     }
-    if !verify_hybrid(&tx.validator_pubkey, &tx.signing_root(), &tx.proof_of_possession, verifier)
-    {
-        return Err(DepositReject::BadProofOfPossession);
-    }
     Ok(())
+}
+
+/// Bytes of a suite-framed hybrid public key: the `u16` suite tag followed by
+/// the ML-DSA-65 ‖ Falcon-1024 body.
+pub const FRAMED_HYBRID_PK_BYTES: usize = 2 + HYBRID_PK_BYTES;
+
+/// Split a suite-framed public key into `(suite, body)`, or `None` if it is
+/// not exactly [`FRAMED_HYBRID_PK_BYTES`] long.
+///
+/// The frame exists so the wire carries ONE key field rather than a key plus a
+/// separately-declared suite that could disagree with it. Consensus identity
+/// (`pubkey_hash`) is taken over the **framed** bytes, so a key registered
+/// under one suite tag can never be re-read as the same validator under
+/// another.
+///
+/// Fixed length, not length-prefixed: a variable frame would give the same
+/// logical key two encodings and therefore two identities.
+pub fn parse_framed_pubkey(framed: &[u8]) -> Option<(u16, &[u8; HYBRID_PK_BYTES])> {
+    if framed.len() != FRAMED_HYBRID_PK_BYTES {
+        return None;
+    }
+    let suite = u16::from_le_bytes([framed[0], framed[1]]);
+    let body: &[u8; HYBRID_PK_BYTES] = framed[2..].try_into().ok()?;
+    Some((suite, body))
 }
 
 // ---------------------------------------------------------------------------

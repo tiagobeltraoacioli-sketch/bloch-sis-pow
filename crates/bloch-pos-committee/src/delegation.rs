@@ -209,6 +209,69 @@ pub struct Registry {
     activated: Vec<((u64, u32, u32, u128), u128)>,
 }
 
+/// The §4.1 per-validator stake cap: [`MAX_VALIDATOR_STAKE_BPS`] of total
+/// **capped** active stake, resolved by fixed-point iteration.
+///
+/// # The single definition of the cap rule
+///
+/// This is a free function, not a method, because it has two callers that hold
+/// their stake lists in different shapes: [`Registry::cap_sat`] (delegated
+/// stake, for the roster) and the consensus transition's funded-deposit path
+/// (the duty roster's effective stakes, for the deposit ceiling). Before this
+/// extraction those two were **two different formulas**, and the divergence was
+/// not cosmetic — see the note below.
+///
+/// The obvious implementation measures the cap against the *uncapped* total,
+/// and it is much weaker than "1%" sounds — precisely when it matters most.
+/// With one operator holding 90% of raw stake among a hundred operators, a cap
+/// of 1%-of-uncapped leaves it 9.99M against 1M for everyone else: still ten
+/// times any peer, 9.2% of effective weight, and present in over half of all
+/// committees. The cap's strength degrades exactly as concentration rises.
+///
+/// Iterating to a fixed point instead clamps that same operator to 1.0% —
+/// level with a normal validator, a ninefold improvement. The iteration is
+/// safe to specify: clamping can only lower the total, which can only lower
+/// the cap, so the sequence is monotonically decreasing and bounded below,
+/// and integer arithmetic reaches a fixed point in finitely many rounds.
+/// The round bound is fixed at [`CAP_FIXPOINT_ROUNDS`] and the value after
+/// the bound is used as-is, so every node stops at the same number
+/// regardless of convergence speed.
+///
+/// # What the release lineage's second copy said instead
+///
+/// The `Deposit` arm of the transition carried its own inline cap,
+/// `total_active_sat * MAX_VALIDATOR_STAKE_BPS / 10_000`, floored at
+/// `MIN_DEPOSIT_SAT` — the naive uncapped product this function's first
+/// paragraph argues against, and therefore the *looser* of the two rules in
+/// exactly the concentration regime the cap exists for. Two definitions of one
+/// consensus rule is the duplicate-derivation defect this crate refuses (the
+/// `pow_hash`/`block_hash` family); they are now one, and this is the survivor
+/// because it is the one §4.1 and the `staking::validate_deposit` docs
+/// describe. The `MIN_DEPOSIT_SAT` floor stays the CALLER's, as
+/// `validate_deposit`'s documentation already specified — this function
+/// returns the cap, not the bootstrap accommodation.
+///
+/// `total_active` is passed rather than summed from `stakes` because
+/// [`Registry`] maintains it as a field and re-deriving it here would be a
+/// third derivation of a fourth quantity.
+pub fn cap_from_stakes(total_active: u128, stakes: &[u128]) -> u128 {
+    if total_active == 0 {
+        return 0;
+    }
+    let mut cap = total_active * MAX_VALIDATOR_STAKE_BPS / 10_000;
+    let mut round = 0;
+    while round < CAP_FIXPOINT_ROUNDS {
+        let capped_total: u128 = stakes.iter().map(|s| if *s > cap { cap } else { *s }).sum();
+        let next = capped_total * MAX_VALIDATOR_STAKE_BPS / 10_000;
+        if next == cap {
+            break;
+        }
+        cap = next;
+        round += 1;
+    }
+    cap
+}
+
 impl Registry {
     /// Resolve the registry at `epoch`.
     ///
@@ -372,22 +435,11 @@ impl Registry {
     /// the bound is used as-is, so every node stops at the same number
     /// regardless of convergence speed.
     pub fn cap_sat(&self) -> u128 {
-        if self.total_active == 0 {
-            return 0;
-        }
-        let mut cap = self.total_active * MAX_VALIDATOR_STAKE_BPS / 10_000;
-        let mut round = 0;
-        while round < CAP_FIXPOINT_ROUNDS {
-            let capped_total: u128 =
-                self.stakes.iter().map(|(_, s)| if *s > cap { cap } else { *s }).sum();
-            let next = capped_total * MAX_VALIDATOR_STAKE_BPS / 10_000;
-            if next == cap {
-                break;
-            }
-            cap = next;
-            round += 1;
-        }
-        cap
+        // One derivation, shared with the deposit cap: see [`cap_from_stakes`].
+        // `total_active` is passed rather than re-summed so this call is
+        // bit-for-bit what it was before the extraction.
+        let stakes: Vec<u128> = self.stakes.iter().map(|(_, s)| *s).collect();
+        cap_from_stakes(self.total_active, &stakes)
     }
 
     /// The validator set as consensus sees it, capped, ready for sampling.
