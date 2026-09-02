@@ -4,7 +4,7 @@
 Document:   BLOCH-GENESIS4-EXCHANGE-INTEGRATION
 Audience:   Exchange integration, custody and risk teams
 Chain:      Bloch Genesis-4 · Ticker BLCH · Proof of Stake · live mainnet
-Describes:  the RELEASED binary — main @ e4083f9
+Describes:  the RELEASED binary — tag g4-node-20260901 @ 7a83ca89
 Measured:   2026-08-26, height 15,146, epoch 1,101
 Revised:    2026-08-31, after an integrator audit (see §0.1)
 Delivery:   file, to named contacts. Not published. Not a shared artifact.
@@ -17,7 +17,8 @@ Delivery:   file, to named contacts. Not published. Not a shared artifact.
 ### 0.1 Why this revision exists
 
 An exchange integrating against Genesis-4 audited the previous revision of this
-document against the code at `main` @ `e4083f9` and found three claims it did
+document against the code at `main` @ `e4083f9` (not the released lineage — see
+§10) and found three claims it did
 not support:
 
 1. `staking::validate_deposit` has no production call site.
@@ -49,11 +50,18 @@ input published here is load-bearing: build against a stale one and every
 transaction you sign is rejected, with an error that names a value mismatch
 rather than the parameter that actually moved.
 
-Every number in this document is now pinned by a test
-(`crates/bloch-pos-committee/tests/integration_book_claims.rs`) that names the
-section it belongs to, and moving a published constant without updating this
-document is a CI failure. The rule is written down in
+The volatile numbers in this document are pinned by tests that name the
+section they belong to: `integration_book_claims.rs` for the constants, and
+`integration_book_lineage.rs` for the claims about *which tree* those constants
+were read from. The rule is written down in
 [`CONSENSUS-CHANGELOG-DISCIPLINE.md`](CONSENSUS-CHANGELOG-DISCIPLINE.md).
+
+**Scope limit, stated because a previous revision overstated it.** Those tests
+live on the branch this document is maintained on. They are **not** in the
+released tag `g4-node-20260901`, so they do not gate the release you
+downloaded, and you should not read "pinned by a test" as "CI could not have
+shipped this wrong". CI could, and once did — the rejection cache in §10.1 is
+the example.
 
 ### 0.2 Status markers
 
@@ -140,7 +148,7 @@ Pinned by `book_block_payload_cap_and_the_era_it_belongs_to`.
 
 ### 1.2 Activation gates
 
-Four gates exist in `params.rs`. Three of them arm code that nothing on the
+Five gates exist in `params.rs`. Three of them arm code that nothing on the
 wire can reach today. They are listed here because a capability behind a closed
 gate is not a capability, and you should not design against one.
 
@@ -151,11 +159,27 @@ gate is not a capability, and you should not design against one.
 | `LEAKED_ROSTER_ACTIVATION_EPOCH` | 1,400 | `[SCHEDULED]` | whether the inactivity leak reaches the duty roster (§5.3) |
 | `LEAK_RECOVERY_ACTIVATION_EPOCH` | `u64::MAX` | `[INERT]` | leak recovery and the quorum-denominator floor — **read §5.3 before crediting** |
 
-A fifth constant, `ANCESTRY_SEED_ACTIVATION_EPOCH`, is also `u64::MAX` but
-**gates nothing**: the seed look-ahead it once guarded was made unconditional
-on 2026-08-24 and the constant is now unreferenced. It is dead, not scheduled.
-It is named here only so that finding it in the source does not read as a
-pending feature.
+| `ANCESTRY_SEED_ACTIVATION_EPOCH` | `u64::MAX` | `[INERT]` | the committee seed look-ahead — see below |
+
+**Correction (2026-09-01): the fifth gate is inert, not dead.** A previous
+revision said `ANCESTRY_SEED_ACTIVATION_EPOCH` "gates nothing", that the seed
+look-ahead was made unconditional on 2026-08-24, and that the constant was
+unreferenced. None of that is true of the released binary. It is read on two
+live consensus paths — `transition.rs:1608` and `engine.rs:946` — and because
+it is `u64::MAX`, both pin the look-ahead to **0**. So the constant is
+load-bearing precisely by being closed: it is what makes the committee seed
+derive without look-ahead today.
+
+Two doc comments in the source (`params.rs:323-334`, `transition.rs:1569-1572`)
+still assert the gate was removed. They are stale; the code above them is
+authoritative. We are naming this because an integrator who greps for the
+constant will find the comment before the code.
+
+Nothing in this is reachable from the wire, so it changes nothing you build
+today. It is stated because `engine.rs:940-947` records that arming it would
+make the producer's `sortition_seed` disagree with the transition's committee —
+i.e. it is an unresolved consensus hazard, not a pending feature, and it should
+not be read as one.
 
 There is **no gate for validator entry**. See §8.
 
@@ -362,21 +386,33 @@ the same table from the running node.
 | `-32005` | `NO_TRANSACTION_INDEX` | permanent answer for `gettransaction`. There is no txid index |
 | `-32006` | `NO_WALLET` | permanent answer for `getnewaddress`. The node has no wallet |
 | `-32007` | `SLOT_EMPTY` | **normal.** The proposer missed that slot. Advance; do not alert |
-| `-32008` | `TX_REFUSED` | judged invalid on its merits. **Never resubmit these bytes** |
+| `-32008` | `TX_REFUSED` | **two meanings — read the message.** Either judged invalid (terminal, rebuild) or *barred until slot N* (retryable after the bar). See below |
 
 Two of these decide whether your integration is operable:
 
 - **`-32007` is not an error condition.** Missed proposals are ordinary under
   PoS. A block scanner that treats a `-32007` as a fault will page you
   continuously. Advance to the next slot.
-- **`-32003` and `-32008` are opposites and must not be conflated.**
-  `-32003` means try again; `-32008` means these exact bytes will never be
-  accepted, rebuild the transaction. A client that retries `-32008` loops
-  forever.
+- **`-32003` is always retryable.** It is capacity, not a verdict.
+- **`-32008` is two different answers under one code, and only the message
+  separates them.** The released engine returns it from two places:
+  - *"…this transaction cannot be admitted; retrying the same bytes will not
+    help"* — **terminal.** Rebuild.
+  - *"…is barred until slot N. … If the parent is still pending, resubmit after
+    it confirms."* — **retryable.** This is the rejection cache (§10.1): the
+    bar lifts after `REJECTION_TTL_SLOTS = 128` slots, ≈ 64 minutes. The usual
+    cause is that the parent transaction has not landed yet.
+
+  **A previous revision of this table said `-32008` always means "never
+  resubmit these bytes".** Implemented literally, that permanently drops a
+  transaction whose only fault was arriving before its parent. Branch on the
+  presence of *"barred until slot"* in the message, and treat that case as a
+  scheduled retry.
 
 Anything you do not handle explicitly will be treated as a generic failure,
-which for `-32007` means false alarms and for `-32008` means an infinite retry
-loop. Handle both by name.
+which for `-32007` means false alarms and for `-32008` means either an infinite
+retry loop or a silently abandoned transfer, depending on which of the two it
+was. Handle both by name.
 
 ### 3.10 Methods that do not exist
 
@@ -744,19 +780,24 @@ A wallet that folds the prices together and divides once
 short is a hard rejection. Pinned by
 `book_fee_is_base_plus_tip_each_rounded_up_separately`.
 
-### 6.5 Refusal is not permanent — but `-32008` is
+### 6.5 Refusal is not always permanent, and neither is `-32008`
 
-Distinguish two different things that both look like "my transaction was
+Distinguish three different things that all look like "my transaction was
 refused":
 
-- **`-32008 TX_REFUSED` at the RPC layer** means the node judged those exact
-  bytes invalid. Never resubmit them; rebuild.
+- **`-32008 TX_REFUSED` whose message says the transaction *cannot be
+  admitted*** — the node judged those exact bytes invalid. Never resubmit
+  them; rebuild.
+- **`-32008 TX_REFUSED` whose message says *barred until slot N*** — the
+  rejection cache (§10.1). Not a verdict on the bytes. Retry after the bar
+  lifts, or after the parent transaction confirms.
 - A transfer refused because it was priced against a base fee that has since
   moved is refused *about the chain state at the time*, not about the bytes.
   Repricing and re-signing is the correct response.
 
-`[UNRELEASED]` — a mempool rejection cache with an expiring bar is on branch
-`canario/cache-recusa` and is **not in the released binary**. See §10.
+`[LIVE]` — the released binary bars a refused transaction from re-entering
+the mempool for `REJECTION_TTL_SLOTS = 128` slots (≈ 64 minutes). See §10.1 for
+what that means for a retry.
 
 ---
 
@@ -922,7 +963,7 @@ is no such flag day**, and "scheduled" implied a constant a reader could look
 up. There is none — §1.2 lists every gate in `params.rs` and no gate concerns
 validator entry.
 
-What is actually true of `main` @ `e4083f9`:
+What is actually true of the released tag `g4-node-20260901` @ `7a83ca89`:
 
 - `staking::validate_deposit` is public, fully tested, and **has no production
   call site**. Neither does `validate_exit` or `validate_withdrawal`, and the
@@ -985,17 +1026,27 @@ The reason two of the three audit findings existed. Anything in this table is
 **not in the binary the network runs**, regardless of how complete it looks in
 the repository.
 
-| Capability | On `main` @ `e4083f9` | Branch | Book section |
+| Capability | On `g4-node-20260901` @ `7a83ca89` | Branch | Book section |
 |---|---|---|---|
 | Funded validator bonding — deposit reaches the transition via `staking::validate_deposit_fields` | absent; `validate_deposit` has no call site | `wt/signed-exit-wire`, `wt/exit-churn-limit`, `lead/delegation-off-explicit` | §8.1 |
 | `unlock_epoch` enforcement in the committee (`if entry.unlock_epoch > self.epoch`) | absent from `bloch-pos-committee` entirely | same | §8.1 |
-| Mempool rejection cache — `REJECTION_TTL_SLOTS = 128` slots (≈ 64 min) | absent | `canario/cache-recusa` | §6.5 |
 
-### 10.1 The rejection cache, since you will read about it
+### 10.1 The rejection cache — CORRECTED, it is in the release
 
-`[UNRELEASED]`. On `canario/cache-recusa`, a transaction the block transition
-refuses is removed from the mempool *and barred from re-entering* for
-`REJECTION_TTL_SLOTS = 128` slots — 128 × 30 s ≈ **64 minutes**. Without the
+**A previous revision of this document said the mempool rejection cache was
+`[UNRELEASED]` and "not in the released binary". That was wrong, and it is the
+error that prompted this revision.** The claim was checked against `main`,
+where the constant genuinely is absent — but `main` is not the released
+lineage. `const REJECTION_TTL_SLOTS: u64 = 128` is at
+`crates/bloch-pos-node/src/engine.rs:178` on the fleet commit `46133196` and on
+the released tag `g4-node-20260901` @ `7a83ca89`.
+
+Had we shipped the earlier wording, we would have told you there was **no bar
+at all** on resubmission. There is one.
+
+`[LIVE]`. A transaction the block transition refuses is removed from the
+mempool *and barred from re-entering* for `REJECTION_TTL_SLOTS = 128` slots —
+128 × 30 s ≈ **64 minutes**. Without the
 bar, peers still holding the transaction re-offer it and it walks straight back
 in; this was measured on the live chain on 2026-08-30, a node proposing with
 `mempool 0` in the log line and still holding 21 of the same transactions 383
@@ -1008,14 +1059,17 @@ comes back, and a permanent ban would turn a transient pricing error into a
 dead transaction — coins quietly unspendable through a node that will never
 reconsider. So: if your transaction is barred, you may retry after the TTL.
 
-Note this is a *different* instruction from `-32008 TX_REFUSED` (§3.9), which
-says never resubmit those bytes. Do not conflate them.
+Note that this bar is reported **as `-32008`**, the same code as a terminal
+refusal (§3.9). The codes are identical; only the message differs. That is why
+§3.9 tells you to branch on the words *"barred until slot"* rather than on the
+code alone.
 
-Behaviour on that branch is pinned by
-`a_refused_transaction_does_not_come_back_through_gossip` (which asserts the
-bar lifts at exactly `slot + REJECTION_TTL_SLOTS`) and
-`the_rejection_cache_is_bounded`. When it merges, this section moves to §6 and
-its pin moves into `integration_book_claims.rs` in the same commit.
+Behaviour is pinned by `a_refused_transaction_does_not_come_back_through_gossip`
+(which asserts the bar lifts at exactly `slot + REJECTION_TTL_SLOTS`) and
+`the_rejection_cache_is_bounded`, and the fact that it is *released* — the
+thing we got wrong — is pinned by `the_rejection_cache_is_in_the_released_binary`
+in `integration_book_lineage.rs`, which reads `engine.rs` out of the release tag
+rather than out of whatever branch is checked out.
 
 ---
 
@@ -1026,13 +1080,15 @@ its pin moves into `integration_book_claims.rs` in the same commit.
 - [ ] Derive `script_hash` per §4.2 — **48 hex characters follow the prefix**,
       take the first 40 — and verify it against the echo in the first response
 - [ ] Handle `-32007 SLOT_EMPTY` as normal, not as a fault
-- [ ] Handle `-32008 TX_REFUSED` as terminal and `-32003 MEMPOOL_FULL` as
-      retryable — never the reverse
+- [ ] Handle `-32003 MEMPOOL_FULL` as retryable, and branch `-32008
+      TX_REFUSED` on its **message**: *"barred until slot N"* is retryable
+      after the bar, anything else is terminal
 - [ ] Do not read `result.txid` from `sendrawtransaction`; there is none
 - [ ] Poll `getbalance`; expand with `getutxos [script_hash, limit]` — no
       `offset`, default limit 100, max 1,000, no cursor
 - [ ] Keep deposit addresses under 1,000 outputs
-- [ ] Credit on `finalized` from `getchaininfo`; budget 2–3 epochs
+- [ ] Credit on `finalized` from `getchaininfo` **plus a depth margin**, never
+      at the finality boundary itself (§5.1, §5.5); budget 2–3 epochs
 - [ ] Require **two independent nodes to agree** on the finalized root before
       crediting — disagreement is a hold, not a retry (§5.3)
 - [ ] Credit at a **depth margin past** finality, not at the boundary, and
@@ -1066,5 +1122,6 @@ its pin moves into `integration_book_claims.rs` in the same commit.
 - Protocol specification — [`../SPEC.md`](../SPEC.md)
 
 Chain figures measured 2026-08-26 at height 15,146, epoch 1,101.
-Code claims verified against `main` @ `e4083f9` on 2026-08-31 and pinned by
+Code claims verified against the released tag `g4-node-20260901` @ `7a83ca89`
+on 2026-09-01 and pinned by
 `crates/bloch-pos-committee/tests/integration_book_claims.rs`.
