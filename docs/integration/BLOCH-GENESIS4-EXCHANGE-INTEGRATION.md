@@ -240,19 +240,26 @@ These are not defaults you can tune; they are what the server does.
 `sendrawtransaction` is a write on an unauthenticated port. Bind to loopback
 and put your own proxy in front of it. Do not expose it.
 
-### 3.1 `getcapabilities` — ask the node, not this document
+### 3.1 `getcapabilities` — `[UNRELEASED]`, do not build on it yet
 
-Call this first. It returns the method table, the deliberately absent names,
-the error-code table, the limits above, and `rpc_surface_version` — from the
-running binary, so it cannot be stale the way a document can.
+**Correction (2026-09-01). A previous revision opened this section with "Call
+this first" and told you to branch your client on `getcapabilities` rather than
+on the tables below. Do not do that: the method does not exist.**
 
-**Branch your client on `getcapabilities`, not on the tables in this
-document.** This document exists to explain what the numbers mean and what is
-not there; the node itself is the authority on what it serves.
+`"getcapabilities" =>` is absent from `rpc.rs` in the released tag
+`g4-node-20260901`, absent from the fleet commit `46133196`, and absent from
+`main`. It exists only on an unreleased branch. Both public archival nodes
+answer `-32601 method not found` — verified 2026-09-01 — which is simply what
+the released dispatch does with a name it does not know.
 
-`rpc_surface_version` is currently `4.1.0` and moves under semver: major for a
-removal or a breaking change, minor for an added method or field, patch for
-wording.
+`rpc_surface_version` is part of the same unreleased response and is likewise
+not observable on any node today. Ignore any version number quoted for it.
+
+**Until it ships, §3.2–§3.11 below are your surface**, and the way to confirm a
+method exists is to call it and treat `-32601` as "not on this build". We are
+leaving this section in place, rather than deleting it, because the previous
+revision told you to make this call at connect time and we would rather you
+read why it fails than discover it in an integration test.
 
 ### 3.2 `getchaininfo` — chain head and settlement state
 
@@ -368,8 +375,9 @@ serve both purposes.
 ### 3.9 Error codes — the complete table
 
 The previous revision listed five codes, mislabelled one, and omitted the two
-that matter most operationally. This is the full set; `getcapabilities` returns
-the same table from the running node.
+that matter most operationally. This is the full set. (A previous revision
+said `getcapabilities` returns the same table from the running node; it does
+not exist — see §3.1.)
 
 | Code | Name | Meaning and correct client response |
 |---|---|---|
@@ -416,8 +424,9 @@ was. Handle both by name.
 
 ### 3.10 Methods that do not exist
 
-Deliberately absent, each with its reason. `getcapabilities` returns this list
-too, so you do not have to probe and infer from `-32601`.
+Deliberately absent, each with its reason. You do have to probe and infer from
+`-32601`: the `getcapabilities` method that would have told you this is itself
+unreleased (§3.1).
 
 | Name | Why not |
 |---|---|
@@ -1075,7 +1084,8 @@ rather than out of whatever branch is checked out.
 
 ## 11. Integration checklist
 
-- [ ] Call `getcapabilities` at connect time and branch on it, not on §3
+- [ ] Do **not** call `getcapabilities` — it is `[UNRELEASED]` and every
+      deployed node answers `-32601` (§3.1). Build against §3's tables
 - [ ] Parse all amounts as big integers from decimal strings
 - [ ] Derive `script_hash` per §4.2 — **48 hex characters follow the prefix**,
       take the first 40 — and verify it against the echo in the first response

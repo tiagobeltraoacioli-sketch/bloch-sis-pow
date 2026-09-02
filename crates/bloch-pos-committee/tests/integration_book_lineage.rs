@@ -575,3 +575,70 @@ fn the_ancestry_seed_gate_is_inert_but_not_dead() {
         wrong.join("\n"),
     );
 }
+
+/// **`getcapabilities` is not in the release, and the book tells integrators to
+/// build on it.**
+///
+/// This is the rejection-cache error with the sign flipped. There, a released
+/// feature was described as unreleased. Here, an **unreleased** method is
+/// described as the first call a client should make — §3.1 says "Call this
+/// first" and "branch your client on `getcapabilities`, not on the tables in
+/// this document", and the checklist repeats it.
+///
+/// The method exists only on the branch this document is maintained on. It is
+/// absent from the release tag, from the fleet commit and from `main`, and
+/// both public archivals answer `-32601` (probed 2026-09-01). A client written
+/// to the checklist fails on its first call to every node that exists.
+#[test]
+fn getcapabilities_is_not_promised_as_live_while_it_is_unreleased() {
+    let rpc = released_file("crates/bloch-pos-node/src/rpc.rs");
+    let in_release = rpc.contains("\"getcapabilities\" =>");
+
+    let book = book_text();
+    let mut promises = Vec::new();
+    for (i, line) in book.lines().enumerate() {
+        if !line.contains("getcapabilities") {
+            continue;
+        }
+        let l = line.to_ascii_lowercase();
+        // A line that marks it unreleased, or that explains its absence, is
+        // fine. A line that instructs the reader to call it is not.
+        if l.contains("[unreleased]") || l.contains("-32601") || l.contains("not in the release") {
+            continue;
+        }
+        // A correction is allowed to quote the instruction it withdraws.
+        if l.contains("revision") || l.contains("correction") || l.contains("told you") {
+            continue;
+        }
+        if l.contains("call this first")
+            || l.contains("call `getcapabilities` at connect")
+            || l.contains("branch your client on")
+        {
+            promises.push(format!("  {BOOK}:{} {}", i + 1, line.trim()));
+        }
+    }
+
+    if in_release {
+        // It shipped; the instruction is then correct and there is nothing to
+        // police here.
+        return;
+    }
+
+    assert!(
+        promises.is_empty(),
+        "{BOOK} instructs an integrator to call `getcapabilities` and to branch \
+         on it, but the method is NOT in the released binary:\n{}\n\n\
+         `\"getcapabilities\" =>` is absent from rpc.rs at the release tag {}, at \
+         the fleet commit {} and on `main`. It exists only on the branch this \
+         document is maintained on. Both public archivals answer -32601 \
+         (probed 2026-09-01), which is exactly what the released dispatch does \
+         for an unknown method.\n\n\
+         This is the rejection-cache mistake inverted: there a released feature \
+         was called unreleased; here an unreleased method is presented as the \
+         first call a client should make. Mark it [UNRELEASED] and tell the \
+         reader to build against §3's tables until it ships.",
+        promises.join("\n"),
+        &RELEASE_TAG[..8],
+        &FLEET_COMMIT[..8],
+    );
+}
