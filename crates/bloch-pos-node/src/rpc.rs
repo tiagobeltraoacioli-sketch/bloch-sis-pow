@@ -123,6 +123,19 @@ const UTXO_PAGE_MAX: usize = 1_000;
 // | `-32005` | `NO_TRANSACTION_INDEX`   | This build cannot look a transaction up by id — see [`RpcError::no_transaction_index`]. Not a transient failure. |
 // | `-32006` | `NO_WALLET`              | This node holds no wallet and mints no addresses — see [`RpcError::no_wallet`]. Not a transient failure. |
 // | `-32007` | `SLOT_EMPTY`             | The slot exists and carries no canonical block. **Normal under PoS** (a missed proposal); advance to the next slot. |
+// | `-32008` | `TX_REFUSED`             | The node judged these BYTES invalid on their merits. **Terminal**: never resubmit them. Carries no `error.data`. |
+// | `-32009` | `TX_REFUSED_RETRYABLE`   | The transaction was barred against a **state**, not condemned on its bytes. **Retryable**: `error.data.until_slot` says from which slot. |
+//
+// ## `error.data`
+//
+// JSON-RPC 2.0 §5.1 allows an `error.data` member, and this surface uses it for
+// exactly one thing: a value a client must ACT on that would otherwise exist
+// only inside the English message. A retry deadline is the whole example — a
+// client that has to regex `until slot 4242` out of a sentence is a client that
+// breaks the next time the sentence is reworded, and the wording is explicitly
+// the part of this contract that may change. `data` is OPTIONAL and absent on
+// every code above except `-32009`: a client that ignores it still reads a
+// correct `code` and `message`.
 
 /// No block with that id is known to this node.
 pub const BLOCK_NOT_FOUND: i64 = -32000;
@@ -144,20 +157,99 @@ pub const SLOT_EMPTY: i64 = -32007;
 /// The node refused a submitted transaction on its merits — it was judged
 /// invalid, not deferred. Distinct from [`MEMPOOL_FULL`] because the client's
 /// correct response is opposite: never resubmit these bytes.
+///
+/// **Terminal, and only terminal.** This code is published to integrators with
+/// that meaning, so it must never come to mean "try again later" for some
+/// subset of its causes: a client branching on the number alone would then be
+/// wrong for half of them, which is worse than having no code at all. Any
+/// refusal that time can lift belongs to [`TX_REFUSED_RETRYABLE`] — which is
+/// exactly the split this constant used to be missing: `Refusal::Invalid` and
+/// `Refusal::PreviouslyRefused` both landed here, distinguishable only by
+/// reading the English message.
 pub const TX_REFUSED: i64 = -32008;
+
+/// A submitted transaction was barred **against a state**, not condemned on
+/// its bytes — so the bar lifts on its own, and the answer says when.
+///
+/// # Why this is a second code rather than a second message
+///
+/// [`TX_REFUSED`] (-32008) is a verdict on the bytes: no passage of time
+/// changes an unverifiable signature, so the only correct client behaviour is
+/// to stop. A transaction can also be turned away for a reason that is true
+/// *now* and false later — this node's own proposer watched the transition
+/// refuse it against the current branch, most often because it spends an
+/// output this branch does not have yet. The engine bars those bytes for
+/// `REJECTION_TTL_SLOTS` (128 slots, ~64 minutes) and then admits them again
+/// with no further action from anyone.
+///
+/// That is the opposite advice, and a client that reads only the code cannot
+/// tell the two apart if they share one number. It is not a hypothetical: our
+/// own published integration guidance says never to resubmit after -32008, so
+/// an exchange following it permanently abandons transactions the node would
+/// have taken an hour later.
+///
+/// The deadline rides in `error.data.until_slot` rather than only in the
+/// message, because "retry after slot N" is a value a client must compute
+/// with, and the messages on this surface are explicitly allowed to be
+/// reworded while the codes are not.
+pub const TX_REFUSED_RETRYABLE: i64 = -32009;
 
 /// A JSON-RPC error object: a code a client can branch on and a message a human
 /// can act on. Both halves are required — a bare code makes an operator read
 /// this source file, and a bare message makes a client parse English.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// The optional third member is `data` (JSON-RPC 2.0 §5.1): a machine-readable
+/// companion to the message, for the cases where the message contains a value
+/// the client has to act on. It is `None` for every error here except
+/// [`TX_REFUSED_RETRYABLE`], and a client that never looks at it is still a
+/// correct client.
+///
+/// `Eq` is gone from the derive list because [`Json`] holds numbers as their
+/// raw source text and derives only `PartialEq`. Nothing compares `RpcError`
+/// for `Eq`; the codes and messages compare exactly as before.
+#[derive(Clone, Debug, PartialEq)]
 pub struct RpcError {
     pub code: i64,
     pub message: String,
+    /// Structured detail, serialised as `error.data`. Omitted from the wire
+    /// object entirely when `None` — never emitted as `null`, which a client
+    /// would have to distinguish from "absent".
+    pub data: Option<Json>,
 }
 
 impl RpcError {
     pub fn new(code: i64, message: impl Into<String>) -> Self {
-        RpcError { code, message: message.into() }
+        RpcError { code, message: message.into(), data: None }
+    }
+
+    /// Attach structured detail to an error, to be emitted as `error.data`.
+    pub fn with_data(mut self, data: Json) -> Self {
+        self.data = Some(data);
+        self
+    }
+
+    /// [`TX_REFUSED_RETRYABLE`]: barred until `until_slot`, then admissible
+    /// again — with the deadline in `data` where a client can read it.
+    ///
+    /// The wire shape is fixed:
+    ///
+    /// ```text
+    /// "data": { "retryable": true, "until_slot": 4242 }
+    /// ```
+    ///
+    /// `retryable` is redundant with the code and is there on purpose: it is
+    /// the one field a generic client can branch on without a table of Bloch
+    /// error numbers, and it is what keeps "did I get the retryable one?" from
+    /// being answered by string-matching the message.
+    ///
+    /// `until_slot` is a JSON number, not a string: it is a slot index, and
+    /// slot indexes are nowhere near the 2^53 boundary that makes this module
+    /// render satoshis as strings (see [`Json::sat`]).
+    pub fn tx_refused_retryable(until_slot: u64, detail: impl Into<String>) -> Self {
+        Self::new(TX_REFUSED_RETRYABLE, detail.into()).with_data(Json::obj(vec![
+            ("retryable", Json::Bool(true)),
+            ("until_slot", Json::u(until_slot)),
+        ]))
     }
 
     /// -32700: the body was not JSON.
@@ -690,6 +782,8 @@ fn hex32_from(s: &str) -> Option<[u8; 32]> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RpcRequest {
     ChainInfo,
+    /// `getbuildinfo` — which binary is answering. Reads no chain state.
+    BuildInfo,
     /// `getblockcount` — the polling method, carrying finality with it.
     BlockCount,
     BlockBySlot(u64),
@@ -847,6 +941,11 @@ fn want_hex32(params: Option<&Json>, pos: usize, name: &str) -> Result<[u8; 32],
 /// - `getnewaddress` — **refused**, with [`RpcError::no_wallet`]. A node RPC
 ///   does not mint key material, and no address format is frozen.
 ///
+/// Beside them, `getbuildinfo` answers a question this surface could not
+/// answer at all before: **which binary is this?** See [`build_info_json`].
+/// It is the ONLY method that answers it — see the registry note on
+/// [`build_info_json`] and `tests/rpc_method_registry.rs`.
+///
 /// The refusals are routed here, as methods that exist and answer, rather than
 /// left to fall through to `method not found`. The distinction is the whole
 /// point: "this node cannot do that, here is why, do not retry" is actionable,
@@ -854,6 +953,7 @@ fn want_hex32(params: Option<&Json>, pos: usize, name: &str) -> Result<[u8; 32],
 pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError> {
     Ok(match method {
         "getchaininfo" => RpcRequest::ChainInfo,
+        "getbuildinfo" => RpcRequest::BuildInfo,
         "getblockcount" => RpcRequest::BlockCount,
         "getblockbyslot" => RpcRequest::BlockBySlot(want_u64(params, 0, "slot")?),
         "getblockbyid" => RpcRequest::BlockById(want_hex32(params, 0, "block_id")?),
@@ -930,17 +1030,26 @@ fn envelope(id: Json, outcome: RpcResult) -> String {
         ]),
         // R4: failures are the top-level `error` object, never a string inside
         // `result` under HTTP 200.
-        Err(e) => Json::Obj(vec![
-            ("jsonrpc".into(), Json::s("2.0")),
-            ("id".into(), id),
-            (
-                "error".into(),
-                Json::obj(vec![
-                    ("code", Json::Num(e.code.to_string())),
-                    ("message", Json::s(e.message)),
-                ]),
-            ),
-        ]),
+        Err(e) => {
+            // `data` is written only when there is data. An `error.data: null`
+            // would be a third state a client has to tell apart from absence,
+            // for no gain — JSON-RPC 2.0 §5.1 makes the member optional, so
+            // absence is the honest encoding of "nothing structured to add",
+            // and every code that predates `data` keeps the exact shape it
+            // has always had on the wire.
+            let mut err = vec![
+                ("code".to_string(), Json::Num(e.code.to_string())),
+                ("message".to_string(), Json::s(e.message)),
+            ];
+            if let Some(data) = e.data {
+                err.push(("data".to_string(), data));
+            }
+            Json::Obj(vec![
+                ("jsonrpc".into(), Json::s("2.0")),
+                ("id".into(), id),
+                ("error".into(), Json::Obj(err)),
+            ])
+        }
     };
     body.to_string()
 }
@@ -1165,6 +1274,31 @@ fn respond(sock: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
 // §5.5 gives and `engine::lmd_ghost_head` follows: a value a client will read
 // must be derivable from its inputs so it can be tested without standing up a
 // node. Every one of them is exercised below against a real `CommittedState`.
+
+// `getnodeversion` / `node_version_json` were removed here on 2026-09-02.
+//
+// They answered the same question as [`build_info_json`] below, arrived on a
+// sibling branch off the same tag, and the two merged with no conflict in this
+// file — leaving both names routed and both dispatched. What decided which
+// survives was not which branch was older but what each answer PROVES:
+//
+// * every identity field `getnodeversion` reported was either a compile-time
+//   constant (`name`, `version`, `block_version`) or `commit`, which
+//   `BLOCH_BUILD_COMMIT` lets any builder assert to any value. Its `dirty`
+//   field, the one fact about the TREE, could not report `clean` at all on
+//   this tag (see `build.rs`). So on its own motivating case — "is this
+//   archival running the release?" — it was defeated by one environment
+//   variable, and it said nothing about the tree that was compiled;
+// * `build_info_json` reports those same fields plus `source_digest`, computed
+//   from bytes on disk with no environment variable in the path, and
+//   `commit_source`, which makes the forgeability of `commit` visible IN the
+//   response rather than only in a doc comment.
+//
+// No alias was kept: swept across every local and remote ref on 2026-09-02,
+// `getnodeversion` had no caller anywhere outside the five files of its own
+// branch, so there was no compatibility claim — and an alias with no caller is
+// just the second name again.
+
 
 /// `getchaininfo` — the method the finality-aware consumers read (V4 §2).
 #[allow(clippy::too_many_arguments)]
@@ -1585,5 +1719,153 @@ pub fn mempool_info_json(
     ])
 }
 
+
+/// `getbuildinfo` — the identity of the binary that is answering.
+///
+/// # Why this method exists
+///
+/// We told a partner exchange to trust a read only when two nodes agree. That
+/// rule is unfalsifiable if you cannot tell the two nodes apart, and until this
+/// method there was no way to: nothing on this surface said which binary was on
+/// the other end of the socket. The failure is not hypothetical here. The
+/// 2026-08-11 fleet survey found three boxes running three different binaries,
+/// all reporting `bloch 0.3.0-genesis2`. The published Genesis-3 release was an
+/// abandoned branch while the fleet ran unpublished fixes, and nobody noticed
+/// until nodes froze at block 10802. And on 2026-09-02 both public archivals
+/// answered `getmempoolinfo` with four fields where this build emits six — a
+/// difference no version string on either side would have shown.
+///
+/// # The honesty bar, and the part that is only evidence
+///
+/// A version string a developer typed proves nothing; that is the whole lesson
+/// above. So the load-bearing field here is `source_digest`, which the build
+/// script computes over the FILES it is about to compile
+/// (`crates/**/*.{rs,toml,c,h,S,s}` plus the workspace `Cargo.toml` and
+/// `Cargo.lock`), not over anything anyone asserted. No environment variable
+/// moves it.
+///
+/// What it can prove:
+///
+/// - Two nodes reporting **different** `source_digest` were built from
+///   different trees. Full stop, no interpretation needed.
+/// - A node whose `source_digest` differs from the digest published for a
+///   release tag is **not** running that tag's source, even if it reports the
+///   tag's commit id — which is exactly the accident this method is for, since
+///   `BLOCH_BUILD_COMMIT` lets a caller assert any commit it likes.
+///
+/// What it cannot prove:
+///
+/// - It cannot prove a node IS running the tag. Equal digests mean the hashed
+///   set matched; a hostile operator who can edit the source can also edit
+///   `build.rs` to print a digest it never computed, or patch the linked
+///   binary after the fact. This is tamper-EVIDENT against drift and accident,
+///   not tamper-PROOF against a liar. Only a reproducible build compared
+///   against an independently built artifact closes that, and
+///   `deploy/RELEASE-INTEGRITY.md` is where that lives.
+/// - It says nothing about behaviour. Equal source and equal `rustc`,
+///   `profile` and `target` is a strong claim about the artifact and still not
+///   a claim that two nodes will derive the same committee — see the fork
+///   history in this repo, where identical binaries diverged on local state.
+/// - It does not cover `legacy/`, `tools/`, `apps/` or `scripts/`, and it does
+///   not cover the compiled artifact itself.
+///
+/// `commit_source` is the field that keeps `commit` from being read as more
+/// than it is: `git` means the build script read it from the repository,
+/// `asserted` means the caller passed `BLOCH_BUILD_COMMIT` and nothing checked
+/// it, `none` means there was no repository. An `asserted` commit beside a
+/// `source_digest` that does not match the tag is the signature of exactly the
+/// mistake this method was written to catch.
+///
+/// # What is deliberately absent
+///
+/// No paths, no hostname, no peer id, no key material, no data directory, no
+/// operator identity. Everything reported is either a hash, a compiler
+/// version, or a target triple. `getbuildinfo_leaks_nothing_operational` in
+/// `rpc/tests.rs` holds that line.
+///
+/// # Cost
+///
+/// Constant. Every field is a `&'static str` baked in at compile time; the
+/// method reads no chain state, takes no lock and allocates one small object.
+/// It does not move with the height.
+// NAMESPACE NOTE, 2026-09-02 — read before adding `RPC_SURFACE_VERSION` here.
+//
+// This method deliberately does NOT report a semantic surface version, and the
+// omission is a decision rather than an oversight.
+//
+// `RPC_SURFACE_VERSION` is defined against `RPC_SURFACE` and `getcapabilities`.
+// Neither exists on this lineage: `main`, the release tag `g4-node-20260901`
+// (7a83ca89) and the fleet commit 46133196 contain no `RPC_SURFACE`, no
+// `RPC_SURFACE_VERSION` and no `getcapabilities`, and the three documents that
+// carry the counter (BLOCH-GENESIS4-EXCHANGE-INTEGRATION.md,
+// BLOCH-RPC-STABILITY-V4.md, WIRE-NAMESPACE-REGISTRY.md) are absent from the
+// tag entirely. Landing a bare "4.2.0" string here would assert that 4.0.0 and
+// 4.1.0 shipped on the lineage the fleet runs. They did not. A version number
+// is a claim, and that one would be false in the same way `bloch 0.3.0-genesis2`
+// on three different binaries was false.
+//
+// The collision itself, for whoever lands the counter: 4.1.0 comes from
+// `dev/rpc-surface-20260901` (d28b2edc), and TWO unlanded branches each bump it
+// to 4.2.0 off that base — `rpc/build-identity` (8cece026, for getbuildinfo)
+// and 163befdb (for the settlement-guarantee retraction on `Finality`). Both
+// merge without a conflict and a client would then see one string standing for
+// two surfaces. **4.3.0 is reserved here for whichever of the two lands
+// second**, so 4.2.0 stays free for exactly one claimant instead of being burnt
+// by a third. When `RPC_SURFACE`/`getcapabilities` reach this lineage, the
+// counter arrives with them and `getbuildinfo` gains a `surface_version` field
+// in the same commit — a minor bump, since it only adds a field.
+//
+// Until then the honest answer to "which surface is this?" is the one below:
+// a digest of the tree that was compiled. It cannot drift from the binary,
+// which is the property a hand-maintained counter has never had here.
+pub fn build_info_json() -> Json {
+    Json::obj(vec![
+        // The display string `--version` prints, so an operator can match what
+        // the RPC says against what the binary says on the console.
+        ("build_version", Json::s(env!("BLOCH_BUILD_VERSION"))),
+        ("package_version", Json::s(env!("CARGO_PKG_VERSION"))),
+        ("commit", Json::s(env!("BLOCH_BUILD_COMMIT_ID"))),
+        ("commit_source", Json::s(env!("BLOCH_BUILD_COMMIT_SOURCE"))),
+        ("tree_state", Json::s(env!("BLOCH_BUILD_TREE_STATE"))),
+        ("source_digest", Json::s(env!("BLOCH_SOURCE_DIGEST"))),
+        ("source_digest_alg", Json::s("sha3-256")),
+        (
+            "source_digest_scope",
+            Json::s(
+                "workspace crates dir: rs, toml, c, h, S, s; \
+                 plus workspace Cargo.toml and Cargo.lock; \
+                 relative paths, sorted, length-prefixed",
+            ),
+        ),
+        ("source_files", Json::s(env!("BLOCH_SOURCE_FILES"))),
+        ("source_bytes", Json::s(env!("BLOCH_SOURCE_BYTES"))),
+        ("rustc", Json::s(env!("BLOCH_BUILD_RUSTC"))),
+        ("profile", Json::s(env!("BLOCH_BUILD_PROFILE"))),
+        ("target", Json::s(env!("BLOCH_BUILD_TARGET"))),
+        // The bound rides with the answer. A client that reads `source_digest`
+        // and stops reading has been told, in the response itself, what it is
+        // allowed to conclude.
+        (
+            "digest_note",
+            Json::s(
+                "different digests prove different source trees; \
+                 equal digests are evidence of the same source, not proof — \
+                 whoever can edit the source can edit the build script that hashes it",
+            ),
+        ),
+    ])
+}
+
 #[cfg(test)]
 mod tests;
+
+// The frozen method registry — layer 1 of the guard against two methods
+// answering one question. It lives in its OWN file, at a path no other branch
+// in this repository carries, so a merge that brings a rival `rpc.rs` cannot
+// bring a rival copy of the freeze with it.
+//
+// THIS LINE IS LOAD-BEARING: it is how the freeze is attached, and a merge
+// could drop it. `crates/bloch-pos-node/tests/rpc_method_registry.rs` asserts
+// this declaration is still here, so deleting it goes red rather than quiet.
+#[cfg(test)]
+mod method_registry;
