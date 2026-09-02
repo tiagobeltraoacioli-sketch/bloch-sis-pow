@@ -12065,6 +12065,117 @@ mod tests {
             );
         }
     }
+
+    // ── VIOLATION DEMONSTRATION, THE "AFTER" HALF (agent, 2026-09-02) ───────
+    //
+    // The byte-for-byte mirror of the test that PASSES on the fleet lineage
+    // (46133196), where it asserts `.is_ok()`, `validator_count` 8 -> 9 and
+    // an unchanged coin set. Same body, same slot, same fixture size, driven
+    // through `apply_block` — the consensus door — and not through
+    // `admissible`, the mempool one.
+    //
+    // The envelope is built by `probe_env` rather than `build_block` for a
+    // structural reason, not a convenience: `build_block` stamps the state
+    // root by running `compute_post_state` and panics on a body that does not
+    // apply, so no honest builder can produce this block at all. `apply_block`
+    // rejects at step 10 (the transaction loop) and never reaches the
+    // state-root comparison, which is exactly the ordering that makes the
+    // refusal a property of the body and not of the header.
+
+    /// The same unfunded `Deposit` that the fleet binary applies is rejected
+    /// wholesale here — and the flag day does not soften it.
+    #[test]
+    fn unfunded_deposit_is_refused_at_block_ingest() {
+        let (t, g, mut chains) = setup(8);
+
+        let tx = PosTransaction::Deposit {
+            pubkey: vec![0xAB; 8],
+            amount_sat: staking::MIN_DEPOSIT_SAT,
+            randao_commitment: [0xCD; 32],
+            withdrawal_credentials: vec![0xEF; 4],
+            commission_bps: 500,
+        };
+
+        assert_eq!(g.validator_count(), 8);
+        let env = probe_env(&g, 1, std::slice::from_ref(&tx), &mut chains);
+        assert_eq!(
+            t.apply_block(&g, &env, &[], std::slice::from_ref(&tx)).unwrap_err(),
+            TransitionError::Transaction(0),
+            "the mint must die at the consensus door, not only at the mempool"
+        );
+
+        // The successor's flag day arms the FUNDED format; it does not
+        // resurrect this one. Forced open, the verdict is identical.
+        crate::params::rehearsal::with_funded_staking_activation_at(0, || {
+            let (t, g, mut chains) = setup(8);
+            let env = probe_env(&g, 1, std::slice::from_ref(&tx), &mut chains);
+            assert_eq!(
+                t.apply_block(&g, &env, &[], std::slice::from_ref(&tx)).unwrap_err(),
+                TransitionError::Transaction(0),
+                "no flag day reopens tag 0x02"
+            );
+        });
+    }
+
+    /// **The hole the flag-day ORDER does not close.**
+    ///
+    /// `WITHDRAWAL_ACTIVATION_EPOCH >= FUNDED_STAKING_ACTIVATION_EPOCH` is
+    /// asserted at compile time in `params.rs`, and the `Withdraw` arm's own
+    /// comment leans on it: `issued_sat` may stay still on a payout "because
+    /// the bond's value was already counted issued when it entered the bond
+    /// ... a funded deposit's coins were issued before they were bonded".
+    ///
+    /// That premise is true for a bond created by `DepositV2` and true for
+    /// reward compounding. It is FALSE for the launch cohort. Those 64 bonds
+    /// predate both flag days: 64 x 25,000 = 1,600,000 BLCH seeded straight
+    /// into `ValidatorRecord.staked_sat` by the genesis manifest, never in the
+    /// eUTXO set and never in `GENESIS_ISSUED_SAT` (which sums carryover plus
+    /// the five allocations and nothing else). Ordering the flag days cannot
+    /// reach them, because they were never deposits.
+    ///
+    /// So a genesis bond withdrawing turns stake that was never issued into
+    /// spendable coins while the cap's own counter does not move. This test
+    /// does not assert that is wrong — it is a founder decision. It pins the
+    /// quantity, so the decision is made against a number.
+    #[test]
+    fn a_genesis_bond_withdraws_into_coins_the_issuance_counter_never_saw() {
+        let _gates = crate::params::rehearsal::gates_open_guard();
+        let (_t, mut st) = exited_payable(0);
+
+        // The precondition, restated from committed state: the counter is the
+        // genesis constant, and the cohort's bonds are NOT inside it.
+        assert_eq!(st.issued_sat, tokenomics_v4::GENESIS_ISSUED_SAT);
+        let bond = st.validator_record(0).unwrap().staked_sat;
+        assert!(bond > 0, "the fixture must have a genesis bond to withdraw");
+
+        let issued_before = st.issued_sat;
+        let coins_before = st.total_unspent_sat();
+
+        st.epoch = st.validator_record(0).unwrap().withdrawable_epoch;
+        withdraw(&mut st, 0, 0).expect("a ripe genesis bond is payable");
+
+        // Coins appeared.
+        assert_eq!(
+            st.total_unspent_sat() - coins_before,
+            bond,
+            "the spendable set grew by the whole bond"
+        );
+        // And the hard cap's counter did not notice.
+        assert_eq!(
+            st.issued_sat, issued_before,
+            "issued_sat is unmoved: this bond was never issued, so the payout \
+             is a mint the cap invariant cannot see"
+        );
+
+        // Scaled to mainnet, that is the whole cohort.
+        assert_eq!(
+            64u128 * staking::MIN_DEPOSIT_SAT,
+            1_600_000 * tokenomics_v4::SAT_PER_BLOCH,
+            "64 x MIN_DEPOSIT is the 1,600,000 BLCH in genesis/mainnet.manifest"
+        );
+    }
+
+
 }
 
 #[cfg(test)]
