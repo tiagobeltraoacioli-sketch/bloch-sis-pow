@@ -1268,8 +1268,55 @@ fn on_gossip(
     } else if topic == st.topics.txs.hash() {
         match bloch_pos_committee::transition::PosTransaction::from_canonical_bytes(&message.data) {
             Ok(tx) => {
-                report(swarm, Verdict::Accept);
-                return st.emit(NetEvent::Transaction(tx));
+                // Evidence gets a transport-level relay gate the other
+                // transactions do not need, because this verdict decides
+                // whether gossipsub relays the bytes BEFORE the engine's
+                // admission (which holds the state and the verifier) has
+                // judged them:
+                //
+                // - below its flag day the format is refused at every
+                //   mempool, and — worse — a pre-upgrade peer PENALIZES
+                //   whoever relays bytes it cannot decode, so auto-relaying
+                //   early evidence would cost honest nodes score in a mixed
+                //   mesh. Ignore: drop from relay, penalize nobody, and
+                //   still hand it to the engine, whose refusal is the
+                //   authoritative (and logged) one. The epoch read here is
+                //   this node's applied head — transport policy, not
+                //   consensus, so the approximation is harmless;
+                // - a structurally non-offending pair (no conflict, two
+                //   different signers) is provable garbage from a
+                //   non-compliant node — the same class as undecodable
+                //   bytes: Reject, and P4 counts it.
+                //
+                // What this deliberately does NOT check is the signatures:
+                // the swarm loop holds no verifier, so a signed-garbage pair
+                // still relays and then dies at every node's admission — the
+                // same residual the topic already carries for transfers with
+                // forged spend signatures.
+                let verdict = match &tx {
+                    bloch_pos_committee::transition::PosTransaction::SlashingEvidence(ev) => {
+                        let head_epoch = bloch_pos_committee::epoch_of(
+                            st.head_slot.load(Ordering::Relaxed),
+                        );
+                        if head_epoch
+                            < bloch_pos_committee::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH
+                        {
+                            Verdict::Ignore
+                        } else if bloch_pos_committee::slashing::wire_offence(ev).is_err() {
+                            Verdict::Reject
+                        } else {
+                            Verdict::Accept
+                        }
+                    }
+                    _ => Verdict::Accept,
+                };
+                if matches!(verdict, Verdict::Reject) {
+                    eprintln!("p2p: non-offending evidence pair from {source}: rejected");
+                    report(swarm, verdict);
+                } else {
+                    report(swarm, verdict);
+                    return st.emit(NetEvent::Transaction(tx));
+                }
             }
             Err(e) => {
                 eprintln!("p2p: undecodable transaction from {source}: {e}");

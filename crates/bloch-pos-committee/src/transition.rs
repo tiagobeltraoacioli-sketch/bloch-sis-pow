@@ -677,12 +677,21 @@ impl PosTransaction {
                 b.push(u8::from(*eligible));
             }
             PosTransaction::SlashingEvidence(ev) => {
+                // The nested messages ride WHOLE — the fixed-width header or
+                // the six fixed-width attestation fields, plus the
+                // length-prefixed signature — never as their signing roots.
+                // The first version of this arm folded them in as roots,
+                // which no verifier can invert: evidence was one-way,
+                // undecodable from a block body, and the entire §7.3 pipeline
+                // was unreachable from the network however complete
+                // `slashing.rs` was. A root-based encoding must never come
+                // back here; `tka_evidence_round_trips_whole` pins it.
                 b.push(0x05);
                 match ev {
                     crate::interfaces::SlashingEvidence::ProposerEquivocation { first, second } => {
                         b.push(0x01);
                         for env in [first, second] {
-                            b.extend_from_slice(&env.header.proposal_signing_root());
+                            b.extend_from_slice(&env.header.canonical_serialize());
                             put(&mut b, &env.proposer_sig);
                         }
                     }
@@ -690,7 +699,12 @@ impl PosTransaction {
                         b.push(0x02);
                         for att in [first, second] {
                             b.extend_from_slice(&att.validator.to_le_bytes());
-                            b.extend_from_slice(&att.data.signing_root());
+                            b.extend_from_slice(&att.data.slot.to_le_bytes());
+                            b.extend_from_slice(&att.data.head);
+                            b.extend_from_slice(&att.data.source_epoch.to_le_bytes());
+                            b.extend_from_slice(&att.data.source_root);
+                            b.extend_from_slice(&att.data.target_epoch.to_le_bytes());
+                            b.extend_from_slice(&att.data.target_root);
                             put(&mut b, &att.signature);
                         }
                     }
@@ -779,7 +793,38 @@ impl PosTransaction {
                     other => return Err(TxDecodeError::NotCanonical(other)),
                 },
             },
-            0x05 => return Err(TxDecodeError::EvidenceNotDecodable),
+            0x05 => {
+                // Sub-namespace §1a, frozen by the wire-tag registry:
+                // 0x01 = ProposerEquivocation, 0x02 = AttestationOffence.
+                // Anything else is a second encoding trying to exist, refused
+                // like the non-0/1 bool above. Whether the format is ACTIVE is
+                // not this function's question — the flag-day gate lives in the
+                // transition (`TxReject::EvidenceNotActive`), against the
+                // committed epoch.
+                match r.u8()? {
+                    0x01 => {
+                        let first = read_proposal_envelope(&mut r)?;
+                        let second = read_proposal_envelope(&mut r)?;
+                        PosTransaction::SlashingEvidence(
+                            crate::interfaces::SlashingEvidence::ProposerEquivocation {
+                                first,
+                                second,
+                            },
+                        )
+                    }
+                    0x02 => {
+                        let first = read_attestation(&mut r)?;
+                        let second = read_attestation(&mut r)?;
+                        PosTransaction::SlashingEvidence(
+                            crate::interfaces::SlashingEvidence::AttestationOffence {
+                                first,
+                                second,
+                            },
+                        )
+                    }
+                    other => return Err(TxDecodeError::NotCanonical(other)),
+                }
+            }
             0x06 => {
                 // Purely structural, like tag 0x01: counts come from untrusted
                 // bytes, so nothing is preallocated from them, and every push
@@ -877,6 +922,39 @@ pub enum TxReject {
     /// Slashing evidence reached the plain transaction seam instead of
     /// `apply_slashing_evidence`, which is the only path that verifies it.
     MisroutedEvidence,
+    /// Wire tag `0x05` decoded, but the slashing-evidence format is not yet
+    /// active at the committed epoch
+    /// ([`crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH`]). Judged
+    /// against committed state, never node-local state.
+    EvidenceNotActive,
+}
+
+/// One whole signed proposal envelope, as the evidence encoder writes it:
+/// the 304-byte canonical header, then the length-prefixed signature.
+fn read_proposal_envelope(r: &mut TxReader) -> Result<ProposalEnvelope, TxDecodeError> {
+    let raw = r.take(crate::header::BlockHeaderV4::ENCODED_LEN)?;
+    // `take` returned exactly ENCODED_LEN bytes and the deserializer's only
+    // error is a length mismatch, so this cannot fail — but a consensus
+    // decoder stays total rather than panicking on its own reasoning.
+    let header = crate::header::BlockHeaderV4::canonical_deserialize(raw)
+        .map_err(|_| TxDecodeError::Truncated)?;
+    Ok(ProposalEnvelope { header, proposer_sig: r.bytes()? })
+}
+
+/// One whole signed attestation, as the evidence encoder writes it: the
+/// validator index, the six fixed-width `AttestationData` fields in
+/// declaration order, then the length-prefixed signature.
+fn read_attestation(r: &mut TxReader) -> Result<Attestation, TxDecodeError> {
+    let validator = r.u32()?;
+    let data = AttestationData {
+        slot: r.u64()?,
+        head: r.h32()?,
+        source_epoch: r.u64()?,
+        source_root: r.h32()?,
+        target_epoch: r.u64()?,
+        target_root: r.h32()?,
+    };
+    Ok(Attestation { data, validator, signature: r.bytes()? })
 }
 
 /// Little-endian reader mirroring the encoder's field order and widths.
@@ -2644,6 +2722,13 @@ impl CommittedState {
         Ok(())
     }
 
+    /// Has this evidence id already been applied on this chain? The node's
+    /// mempool asks before admitting, so settled evidence never takes a slot
+    /// and is never relayed a second time.
+    pub fn evidence_applied(&self, id: &[u8; 32]) -> bool {
+        self.slashing.is_applied(id)
+    }
+
     /// Total slashing loss committed against one delegator account, in
     /// satoshis. The number a wallet subtracts from the delegator's bonded
     /// amounts at withdrawal — a delegator who chose a slashed operator finds
@@ -3133,6 +3218,25 @@ fn mutation_leak_drops_zeroed() -> bool {
     false
 }
 
+/// Is the slashing-evidence transaction format (wire tag `0x05`) active at
+/// `committed_epoch`? Inert until the flag day
+/// ([`crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH`], `u64::MAX`
+/// today). Test builds may force the gate open through
+/// `params::rehearsal::gates_open_guard`, which is how the post-flag-day
+/// behaviour stays testable while an unadorned `cargo test` still exercises
+/// the configuration the fleet actually runs.
+///
+/// This function is the constant's READER. An activation constant with no
+/// reader is inert decoration — the antipattern that left 48 validators
+/// barred in committed state and zero barred by any node's engine.
+fn slashing_evidence_active(committed_epoch: u64) -> bool {
+    #[cfg(test)]
+    let gate_open = crate::params::rehearsal::gates_are_forced_open();
+    #[cfg(not(test))]
+    let gate_open = false;
+    gate_open || committed_epoch >= crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH
+}
+
 /// Narrow a `u128` stake to the `u64` the sampling layer carries. Saturating,
 /// never wrapping: unreachable at the V4 supply scale for a single bond, and
 /// present only so a refactor cannot introduce a silent wrap.
@@ -3418,6 +3522,14 @@ impl<V: SignatureVerifier> Transition<V> {
         let mut block_bytes: u64 = 0;
         for (i, tx) in transactions.iter().enumerate() {
             let applied = match tx {
+                // GATED. Below the flag day the tag decodes (so the reason a
+                // block is invalid is legible) but never applies, and the
+                // verdict comes from the COMMITTED epoch, never node-local
+                // state — the 2026-08-08 `expected_bits` fork is the standing
+                // reason.
+                PosTransaction::SlashingEvidence(_) if !slashing_evidence_active(st.epoch) => {
+                    Err(TxReject::EvidenceNotActive)
+                }
                 PosTransaction::SlashingEvidence(ev) => st
                     .apply_slashing_evidence(
                         ev,
@@ -6173,6 +6285,180 @@ mod tests {
             coherence_root: pre.coherence_root(),
         };
         ProposalEnvelope { header, proposer_sig: vec![0u8; 8] }
+    }
+
+    /// Both evidence arms survive the wire, byte for byte.
+    ///
+    /// The attestation arm is exercised end-to-end by the slashing test
+    /// below; this pins the arm that test does not reach. A mutation that
+    /// reverts EITHER arm to the old signing-root encoding — the bug that
+    /// made §7.3 unreachable — must turn this red, which is the property a
+    /// round-trip over one arm silently failed to give.
+    #[test]
+    fn tka_both_evidence_arms_round_trip_whole() {
+        fn env(slot: u64, proposer: u32, state_root: [u8; 32]) -> ProposalEnvelope {
+            ProposalEnvelope {
+                header: BlockHeaderV4 {
+                    version: BLOCK_VERSION_V4,
+                    parent: [0x11; 32],
+                    state_root,
+                    body_root: [0x22; 32],
+                    slot,
+                    proposer_index: proposer,
+                    randao_reveal: [0x33; 32],
+                    randao_mix: [0x44; 32],
+                    justified_root: [0x55; 32],
+                    finalized_root: [0x66; 32],
+                    attestation_root: [0x77; 32],
+                    coherence_root: [0x88; 32],
+                },
+                proposer_sig: vec![0xAB; 11],
+            }
+        }
+
+        let cases = [
+            PosTransaction::SlashingEvidence(SlashingEvidence::ProposerEquivocation {
+                first: env(9, 3, [0xC1; 32]),
+                second: env(9, 3, [0xC2; 32]),
+            }),
+            PosTransaction::SlashingEvidence(double_vote_evidence(3)),
+        ];
+
+        for tx in cases {
+            let bytes = tx.canonical_bytes();
+            let back = PosTransaction::from_canonical_bytes(&bytes)
+                .expect("evidence this crate encoded must decode");
+            assert_eq!(back, tx, "the decoder must be the encoder's exact inverse");
+            assert_eq!(
+                back.canonical_bytes(),
+                bytes,
+                "re-encoding must reproduce the same bytes, or body_root \
+                 disagrees between proposer and verifier"
+            );
+            // Every truncation must die cleanly rather than decode to
+            // something shorter — injectivity is what body_root leans on.
+            for cut in 1..bytes.len() {
+                assert!(
+                    PosTransaction::from_canonical_bytes(&bytes[..cut]).is_err(),
+                    "a {cut}-byte prefix of evidence must not decode"
+                );
+            }
+        }
+    }
+
+    /// An unknown sub-tag inside `0x05` is a second encoding trying to exist.
+    /// The registry freezes `0x01`/`0x02`; `0x03`+ are free and must stay
+    /// refused until someone assigns them.
+    #[test]
+    fn tka_unknown_evidence_subtag_is_refused() {
+        for sub in [0x00u8, 0x03, 0x04, 0xFF] {
+            let bytes = vec![0x05, sub, 0, 0, 0, 0];
+            assert_eq!(
+                PosTransaction::from_canonical_bytes(&bytes),
+                Err(TxDecodeError::NotCanonical(sub)),
+                "evidence sub-tag {sub:#04x} must be refused"
+            );
+        }
+    }
+
+    /// END-TO-END, THROUGH THE CODEC AND THROUGH `apply_block`.
+    ///
+    /// The pristine tag refused this exact payload at
+    /// `from_canonical_bytes` (`TxDecodeError::EvidenceNotDecodable`), so no
+    /// block could carry evidence and §7.3 was unreachable however complete
+    /// `slashing.rs` was. What makes this test load-bearing rather than
+    /// decorative is that the transaction is **re-decoded from its canonical
+    /// bytes** before it is applied: that is the step a receiving node
+    /// performs (`engine::body_transactions`), and it is the step that used
+    /// to fail. Applying a `PosTransaction` value directly — which the
+    /// sibling test does — never crosses the codec and so never proved the
+    /// network path.
+    #[test]
+    fn tka_evidence_decodes_from_the_wire_and_slashes_through_apply_block() {
+        let _gate = crate::params::rehearsal::gates_open_guard();
+        let (t, g, mut chains) = setup(4);
+        let seed = g.seed_for_epoch(0);
+        let p1 = schedule::proposer(&seed, 1, &g.duty_roster()).unwrap();
+        let offender = (p1 + 1) % 4;
+
+        let before = g.validator_record(offender).unwrap().staked_sat;
+        assert!(before > 0, "test premise: the offender has a bond to lose");
+
+        // A REAL equivocation: one validator, one target epoch, two heads.
+        let ev = PosTransaction::SlashingEvidence(double_vote_evidence(offender));
+
+        // The wire step. This is the whole point of the change.
+        let bytes = ev.canonical_bytes();
+        assert_eq!(bytes[0], 0x05, "evidence still rides the pristine tag 0x05");
+        let decoded = PosTransaction::from_canonical_bytes(&bytes)
+            .expect("AFTER: real evidence must decode from a block body");
+        assert_eq!(decoded, ev, "the decoder must be the encoder's exact inverse");
+        assert_eq!(
+            decoded.canonical_bytes(),
+            bytes,
+            "re-encoding must reproduce the same bytes, or body_root disagrees \
+             between proposer and verifier"
+        );
+
+        // Consensus applies the DECODED value, exactly as a receiving node would.
+        let b1 = build_block(&t, &g, 1, &[], std::slice::from_ref(&decoded), &mut chains);
+        let s1 = t
+            .apply_block(&g, &b1, &[], std::slice::from_ref(&decoded))
+            .expect("AFTER: a block carrying decoded evidence must be valid");
+
+        let rec = s1.validator_record(offender).unwrap();
+        assert!(rec.slashed, "the offender must be marked slashed");
+        assert!(
+            rec.staked_sat < before,
+            "AFTER: the offender's stake must be REDUCED by consensus \
+             (was {before}, now {})",
+            rec.staked_sat
+        );
+        assert!(
+            !s1.active_validators().iter().any(|v| v.index == offender),
+            "a slashed validator must leave the duty roster at once"
+        );
+    }
+
+    /// The flag day is real, not decoration: with the gate closed — the
+    /// configuration every node on the fleet runs today — the very same
+    /// bytes still decode, and consensus still refuses to apply them.
+    /// This is what makes `SLASHING_EVIDENCE_ACTIVATION_EPOCH` a constant
+    /// with a READER rather than an inert number.
+    #[test]
+    fn tka_evidence_is_inert_while_the_flag_day_is_unarmed() {
+        assert_eq!(
+            crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH,
+            u64::MAX,
+            "the flag day must ship UNARMED"
+        );
+        // No `gates_open_guard` here: this is the shipped configuration.
+        let (t, g, mut chains) = setup(4);
+        let seed = g.seed_for_epoch(0);
+        let p1 = schedule::proposer(&seed, 1, &g.duty_roster()).unwrap();
+        let offender = (p1 + 1) % 4;
+        let before = g.validator_record(offender).unwrap().staked_sat;
+
+        let ev = PosTransaction::SlashingEvidence(double_vote_evidence(offender));
+        let decoded = PosTransaction::from_canonical_bytes(&ev.canonical_bytes())
+            .expect("the tag decodes even while inert — the gate is not the codec");
+
+        // `probe_env`, not `build_block`: the builder refuses to assemble a
+        // block whose transactions do not transition, so the rejection has to
+        // be observed on the verifying side — which is the side that matters.
+        let b1 = probe_env(&g, 1, std::slice::from_ref(&decoded), &mut chains);
+        let err = t
+            .apply_block(&g, &b1, &[], std::slice::from_ref(&decoded))
+            .expect_err("an unarmed flag day must refuse the transaction");
+        assert!(
+            matches!(err, TransitionError::Transaction(0)),
+            "refused as a transaction rejection, got {err:?}"
+        );
+        assert_eq!(
+            g.validator_record(offender).unwrap().staked_sat,
+            before,
+            "nothing may be slashed before the flag day"
+        );
     }
 
     #[test]
@@ -9077,3 +9363,4 @@ mod carried_ownership_tests {
         assert!(!owns(&mine, &almost));
     }
 }
+

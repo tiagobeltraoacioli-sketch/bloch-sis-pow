@@ -72,7 +72,10 @@ use bloch_pos_committee::beacon::{mix_in, RandaoChain};
 use bloch_pos_committee::forkchoice::{BlockTree, LatestMessage, Store as FcStore};
 use bloch_pos_committee::gossip::{AttestationPool, GossipDecision};
 use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, VERSION_G4};
-use bloch_pos_committee::interfaces::{ProposalEnvelope, StateReader, StateTransition};
+use bloch_pos_committee::interfaces::{
+    ProposalEnvelope, SlashingEvidence, StateReader, StateTransition,
+};
+use bloch_pos_committee::slashing;
 use bloch_pos_committee::schedule::first_slot_of_epoch;
 use bloch_pos_committee::transition::{CommittedState, PosTransaction, Transition};
 use bloch_pos_committee::interfaces::TransitionError;
@@ -2229,19 +2232,57 @@ impl Engine {
         pool.process(att, self.wall_slot, &committees_at, &known, &self.verifier)
     }
 
+    /// Turn an observed equivocation into a submitted §7.3 evidence
+    /// transaction.
+    ///
+    /// This is the whistleblower path that was missing. The slashing reward
+    /// (1/32 of the penalty) accrued only to a *proposer* that included
+    /// evidence, but a validator that merely OBSERVED an equivocation had no
+    /// way to get the evidence in front of one — detection ran, built the
+    /// pair, printed a line and dropped it. Any node that sees two
+    /// conflicting signed messages now constructs the evidence, admits it to
+    /// its own mempool and broadcasts it, so the offence reaches a proposer
+    /// that can be paid for including it.
+    ///
+    /// A refusal here is policy speaking (the flag day unarmed, a duplicate,
+    /// an already-slashed offender), not an error — and it is logged, never
+    /// silent, because a silent drop is what this replaced.
+    fn report_equivocation(&mut self, ev: SlashingEvidence) {
+        let offender = slashing::wire_offender(&ev);
+        let what = match &ev {
+            SlashingEvidence::ProposerEquivocation { first, .. } => {
+                format!("signed two blocks for slot {}", first.header.slot)
+            }
+            SlashingEvidence::AttestationOffence { second, .. } => {
+                format!("signed two attestations for slot {}", second.data.slot)
+            }
+        };
+        eprintln!(
+            "EQUIVOCATION observed: validator {offender} {what}; submitting slashing evidence"
+        );
+        match self.on_transaction(PosTransaction::SlashingEvidence(ev)) {
+            Ok(_) => eprintln!(
+                "slashing evidence against v{offender} admitted to the mempool and broadcast"
+            ),
+            Err(e) => eprintln!(
+                "slashing evidence against v{offender} not submitted: {e:?}"
+            ),
+        }
+    }
+
     fn apply_decision(&mut self, att: Attestation, decision: GossipDecision, origin: &Origin) {
         match decision {
             GossipDecision::Accept { slashing_candidate } => {
                 if let Some(ev) = slashing_candidate {
-                    // Captured, not processed. The slashing pipeline
-                    // (`SlashingState::process`, evidence transactions) is not
-                    // wired in this binary — saying so here beats a silent
-                    // drop that looks like nothing happened.
-                    eprintln!(
-                        "EQUIVOCATION captured: validator {} signed two attestations for slot {} \
-                         (slashing pipeline NOT wired — evidence is logged, not prosecuted)",
-                        ev.second.validator, ev.second.data.slot,
-                    );
+                    // PROSECUTED, not merely captured. Detection already
+                    // produced real evidence here and then dropped it: the
+                    // pair was logged and thrown away, which is the
+                    // "runs but does nothing" shape. It now becomes a §7.3
+                    // evidence transaction and goes through the ordinary
+                    // mempool door, so it is judged by the same admission
+                    // every other transaction faces — including the flag-day
+                    // gate, which refuses it while unarmed.
+                    self.report_equivocation((*ev).into());
                 }
                 self.pool
                     .insert((att.validator, att.data.signing_root()), att);
@@ -3199,6 +3240,31 @@ fn forkchoice_store<'a>(
 /// exploited or is currently exploitable.
 pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'static str> {
     match tx {
+        // Evidence, structurally, and against its flag day. Keeping it OFF
+        // THE WIRE until the day is the point: a pre-upgrade peer cannot
+        // decode tag 0x05 and answers `Verdict::Reject`, so evidence gossiped
+        // into a mixed mesh scores down the honest nodes that relayed it.
+        //
+        // The structural check calls `slashing::wire_offence`, which is the
+        // very function `SlashingState::process` runs as its step 1 — one
+        // definition, two doors. Admission that admitted a shape the
+        // transition refuses is how a proposer builds a block nobody accepts.
+        //
+        // Signatures are NOT checked here: this function holds no verifier.
+        // A signed-garbage pair still reaches the mempool and dies in the
+        // transition, the same residual a forged transfer already carries.
+        PosTransaction::SlashingEvidence(ev) => {
+            if wall_epoch < bloch_pos_committee::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH {
+                return Err(
+                    "slashing evidence is not accepted: the format's flag day \
+                     (SLASHING_EVIDENCE_ACTIVATION_EPOCH) is not armed",
+                );
+            }
+            if slashing::wire_offence(ev).is_err() {
+                return Err("evidence pair is not an offence: no conflict, or two signers");
+            }
+            Ok(())
+        }
         // Staking messages are refused outright until bonding is funded from
         // the eUTXO set.
         //

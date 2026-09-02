@@ -609,6 +609,45 @@ pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// `u64::MAX` means INERT. Same arming rules as above.
 pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+/// Flag day for **slashing-evidence transactions in blocks** (wire tag `0x05`).
+///
+/// The §7.3 pipeline (`slashing.rs`, `apply_slashing_evidence`) has been
+/// complete for weeks and was still unreachable from the network: the old
+/// `0x05` encoding folded the two conflicting messages in as their *signing
+/// roots*, which no verifier can invert, so `from_canonical_bytes` refused
+/// the tag and no block could ever carry evidence. The encoding now carries
+/// both envelopes whole — a header pair or an attestation pair, signatures
+/// included — and every node re-verifies both signatures itself. That makes
+/// evidence a transaction a block MAY carry, which is a change to block
+/// validity, so it arrives by flag day, never by whoever restarts first.
+///
+/// # Why a mixed fleet agrees before the flag day
+///
+/// Same shape as [`TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH`]: a
+/// pre-activation block carrying `0x05` is rejected by BOTH binaries, for
+/// different proximate reasons and the same verdict — the old binary fails
+/// to decode the body (its `TxDecodeError::EvidenceNotDecodable`), the new
+/// one decodes it and refuses it at the gate
+/// (`transition::TxReject::EvidenceNotActive`). Either way the block is
+/// invalid everywhere, so no honest proposer produces one and no fork opens.
+/// AFTER activation the two binaries diverge — the old one still rejects
+/// what the new one accepts — so **the fleet must be rebuilt before this
+/// constant is ever lowered**. There is a second, softer reason the whole
+/// fleet must move first: an old node's gossip layer penalizes peers that
+/// relay transaction bytes it cannot decode (`p2p.rs` answers
+/// `Verdict::Reject` to an undecodable tx), so evidence gossiped into a
+/// mixed mesh gets honest relayers scored down. The node-side mempool
+/// refuses evidence below this epoch (`engine::admissible`), which keeps it
+/// off the wire until the day.
+///
+/// The gate reads the COMMITTED epoch (`CommittedState::epoch`, already
+/// rolled to the block's epoch), never node-local state — the 2026-08-08
+/// `expected_bits` fork is the standing reason.
+///
+/// `u64::MAX` means INERT. Same arming rules as above: strictly in the
+/// future, and only after the rollout completes.
+pub const SLASHING_EVIDENCE_ACTIVATION_EPOCH: u64 = u64::MAX;
+
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.
 pub const DS_SORTITION: [u8; 16] = *b"BLCH4:SORTIT\0\0\0\0";
