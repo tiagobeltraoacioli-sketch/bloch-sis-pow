@@ -468,6 +468,23 @@ Two of these decide whether your integration is operable:
   treat `slot` as a hard ceiling** — not `wall_slot`, which is clock time and
   runs ahead of the head. The message text does carry `head is at slot N` if you
   want a second check, but the cursor rule needs no English parsing.
+
+  **This is the rule for the binary you have today, and it stays correct
+  afterwards.** In a coming release a slot above the head answers with its own
+  code, `-32012 SLOT_IN_FUTURE`, carrying `head_slot`, `wall_slot` and
+  `requested_slot` in `error.data`, so the two cases stop sharing a number:
+
+  ```json
+  {"code":-32012,"message":"slot 11 is above this node's head … MUST NOT be skipped …",
+   "data":{"retryable":true,"head_slot":10,"wall_slot":25634,"requested_slot":11}}
+  ```
+
+  Treat `-32012` as "wait and retry", never as "skip". It is measured against
+  the node's **head**, not the wall clock, so an honest poller at the tip may
+  see it for a slot or two before the chain reaches it — that costs one retry,
+  whereas skipping costs the deposit. Note also that our public RPC is fronted
+  by an edge proxy which uses `-32010`, `-32011`, `-32029` and `-32030` for its
+  own conditions; those come from the proxy, not the node.
 - **`-32008` carries two different verdicts and the code alone does not
   separate them.** This is a correction to the previous revision, which said
   flatly that `-32008` means "never resubmit". At 7a83ca89
@@ -1318,6 +1335,8 @@ wrong tree was read.
       above `getchaininfo.slot`**: a future slot returns the same `-32007`, so a
       scanner that skips it walks past the head and loses the deposits that
       land there (§3.9)
+- [ ] When you meet `-32012 SLOT_IN_FUTURE` (a coming release), **wait and
+      retry — never skip**; clamp your cursor to `error.data.head_slot` (§3.9)
 - [ ] Handle `-32003 MEMPOOL_FULL` as retryable. For `-32008 TX_REFUSED`,
       **read the message**: *"retrying the same bytes will not help"* is
       terminal, *"barred until slot N"* is retryable after slot N (the
