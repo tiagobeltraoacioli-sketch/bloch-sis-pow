@@ -1608,6 +1608,83 @@ mod tests {
 
     /// End-to-end: a validly-signed envelope for the SAME epoch as the stored
     /// ws_latest but a different digest refuses the boot loudly.
+    /// The arrangement-window gate WHERE IT ACTUALLY RUNS.
+    ///
+    /// `the_arrangement_window_bounds_every_adopted_epoch` proves the
+    /// predicate; this proves `boot` calls it. Without a test at this level
+    /// the wiring could be deleted and every other test would stay green —
+    /// which is the whole failure mode this gate exists to prevent, since the
+    /// `adopted_epoch` it guards is itself a field nothing used to look at.
+    ///
+    /// The envelope here is signed by a real hybrid key over the real digest
+    /// and `ws::verify_envelope` ACCEPTS it: the arrangement claims adoption
+    /// at epoch 10^12, which no chain reaches, so the §6.3 hard stop is a
+    /// comparison that can never fire. Nothing upstream objects. This gate is
+    /// the only thing between that arrangement and a booting node.
+    ///
+    /// VIOLATION: delete the `arrangement_window` block in `boot` → red.
+    #[test]
+    fn boot_refuses_an_arrangement_adopted_after_the_checkpoint() {
+        let dir = tmpdir("window");
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair();
+        let mut pubkey = [0u8; HYBRID_PK_BYTES];
+        pubkey.copy_from_slice(&strip(&pk));
+
+        let far = 10u64.pow(12);
+        let set = SignerSet {
+            id: 9,
+            signers: vec![Signer { pubkey, external: true }],
+            threshold: 1,
+            min_external: 1,
+            adopted_epoch: far,
+        };
+        // The clock does not saturate, so the decoder admits it...
+        let set_bytes = encode_signer_set_file(&set);
+        decode_signer_set_file(&set_bytes).expect("10^12 saturates nothing; the decoder admits it");
+
+        let mut cp = checkpoint(256);
+        cp.signer_set_id = 9;
+        let env = CheckpointEnvelope {
+            checkpoint: cp,
+            signatures: vec![(0, strip(&bloch_crypto::crypto::sign(&sk, &cp.ws_digest()).unwrap()))],
+        };
+        // ...and the frozen verifier accepts the envelope outright, because
+        // `cp.epoch > hard_stop()` is false and always will be.
+        ws::verify_envelope(&env, &set, NET, &GEN, &WsHybridVerifier)
+            .expect("verify_envelope has no lower bound to apply");
+
+        let env_path = dir.join("env.bin");
+        let set_path = dir.join("set.bin");
+        fs::write(&env_path, encode_envelope_file(&env)).unwrap();
+        fs::write(&set_path, &set_bytes).unwrap();
+
+        let cfg = WsConfig { checkpoint: Some(env_path), signer_set: Some(set_path) };
+        let err = boot(
+            &cfg, &dir, NET, &GEN, &genesis_anchor(),
+            300, false, (0, GEN), |_| None, |_| false,
+        )
+        .expect_err("boot must refuse an arrangement adopted after the checkpoint");
+        let msg = err.to_string();
+        assert!(msg.contains("outside arrangement"), "{msg}");
+        assert!(msg.contains(&far.to_string()), "the message must name the adoption epoch: {msg}");
+
+        // Violating the guard: the SAME envelope under an arrangement adopted
+        // at a sane epoch must boot, so the refusal is attributable to
+        // adopted_epoch and to nothing else about this envelope.
+        let sane = SignerSet { adopted_epoch: 0, ..set };
+        fs::write(dir.join("set-ok.bin"), encode_signer_set_file(&sane)).unwrap();
+        let cfg = WsConfig {
+            checkpoint: Some(dir.join("env.bin")),
+            signer_set: Some(dir.join("set-ok.bin")),
+        };
+        boot(
+            &cfg, &dir, NET, &GEN, &genesis_anchor(),
+            300, false, (0, GEN), |_| None, |_| false,
+        )
+        .expect("io")
+        .expect("a sanely-adopted arrangement must still boot");
+    }
+
     #[test]
     fn ws_conflict_refuses_boot() {
         let dir = tmpdir("conflict");
