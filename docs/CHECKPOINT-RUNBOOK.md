@@ -526,13 +526,26 @@ arrangement, and the re-mint conflict above. The whole node binary is 161
 passed / 11 ignored.
 
 > **Profile note, so nobody repeats a wasted hour.** The ceremony changes are
-> all in `bloch-pos-node`; `crates/bloch-pos-committee/` is untouched. If you
-> nevertheless run the committee crate's suite, run it `--release`. In a debug
-> profile a single test there —
-> `beacon::tests::every_reveal_verifies_and_the_chain_walks_down_to_the_seed`,
-> which walks all 8,192 steps of a SHAKE-256 RANDAO chain — takes about a
-> minute unoptimized, and the 301-test suite takes tens of minutes. That is
-> slowness, not a hang, and it predates this work.
+> all in `bloch-pos-node`; `crates/bloch-pos-committee/` is untouched by this
+> work. If you run that crate's suite anyway, run it in the **debug** profile
+> and be patient — do NOT reach for `--release` to speed it up:
+>
+> - **Debug is the only correct profile for it.** Two of its tests assert that
+>   they are running under `debug_assertions` and fail by construction in
+>   release: `finality::tests::the_only_guard_on_the_roster_split_is_absent_from_a_release_build`
+>   (whose first line is `assert!(cfg!(debug_assertions))`) and
+>   `transition::tests::the_boundary_divergence_detector_fires_on_a_mid_epoch_slash`
+>   (which expects a `debug_assert!` to stop the run). A release run reports
+>   `295 passed; 2 failed` and both failures are those two tests doing their
+>   job. That is not a red suite; it is the suite being run wrong.
+> - **Debug is slow, and that is not a hang.** A single test —
+>   `beacon::tests::every_reveal_verifies_and_the_chain_walks_down_to_the_seed`,
+>   which walks all 8,192 steps of a SHAKE-256 RANDAO chain — takes about a
+>   minute unoptimized, so the 301-test suite runs for tens of minutes.
+>
+> Both facts predate this work: the crate is byte-identical to tag
+> `g4-node-20260901` (`git diff g4-node-20260901 -- crates/bloch-pos-committee/`
+> is empty), so nothing here can change its result either way.
 
 Each refusal below was confirmed *by violation*: the named check was deleted,
 the suite was run to confirm exactly the paired test went red, and the check
