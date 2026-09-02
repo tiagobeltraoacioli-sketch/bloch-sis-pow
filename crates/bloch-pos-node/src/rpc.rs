@@ -1430,9 +1430,15 @@ pub fn chain_info_json(
 ///    an equivocating pair and prints it; the log line itself reads "slashing
 ///    pipeline NOT wired — evidence is logged, not prosecuted"
 ///    (`engine.rs:2241`).
-/// 4. **There is no activation constant to arm.**
-///    `SLASHING_EVIDENCE_ACTIVATION_EPOCH` does not exist in this repository.
-///    It is not set to `u64::MAX` — it is absent.
+/// 4. **There is no activation constant to arm on the release lineage.**
+///    `SLASHING_EVIDENCE_ACTIVATION_EPOCH` is not defined on tag
+///    `g4-node-20260901`, on fleet commit `46133196`, or on `main`. It IS
+///    defined off-lineage — `d21c3370:params.rs:638`, `u64::MAX`, unarmed — on
+///    a direct child of the fleet commit that is pushed to a public remote.
+///    An earlier draft said it "does not exist in this repository" and was
+///    "absent, not set to `u64::MAX`". Both halves were false: the constant
+///    exists and its value is exactly `u64::MAX`. The claim was measured on the
+///    release lineage and stated about the repository.
 ///
 /// Read from the live chain on 2026-09-02 at height 34,665, epoch 1736, from
 /// two keyless archival observers whose responses were byte-for-byte

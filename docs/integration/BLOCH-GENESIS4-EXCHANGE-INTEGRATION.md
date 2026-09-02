@@ -212,8 +212,11 @@ not estimate it from a confirmation count.
 >      proposer that included it would produce a block no one can import.
 >    - Nothing constructs the transaction outside tests. The node detects an equivocating
 >      pair and logs it, with a line that says the pipeline is not wired.
->    - There is no activation constant to arm. `SLASHING_EVIDENCE_ACTIVATION_EPOCH` does
->      not exist — it is absent, not set to `u64::MAX`.
+>    - There is no activation constant to arm **in the binary you are integrating
+>      against**. `SLASHING_EVIDENCE_ACTIVATION_EPOCH` is not defined on the release
+>      lineage. It is defined off-lineage, unarmed at `u64::MAX`, on preserved work
+>      that no released binary contains. Treat break 4 as "no flag day exists on the
+>      release", not as "no such constant has ever been written".
 >
 >    Read on 2026-09-02 at height 34,665, epoch 1736, from two keyless archival
 >    observers returning byte-for-byte identical responses: 64 validators, 64 active,

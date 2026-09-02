@@ -352,8 +352,20 @@ decoder is the only one on every ingress path
 proposer that included it would produce an unimportable block. Nothing
 constructs the transaction outside `#[cfg(test)]`; the node logs `EQUIVOCATION
 captured … (slashing pipeline NOT wired — evidence is logged, not prosecuted)`
-(`engine.rs:2241`); and `SLASHING_EVIDENCE_ACTIVATION_EPOCH` does not exist in
-this repository. Read from the live chain on 2026-09-02 at height 34,665,
+(`engine.rs:2241`); and `SLASHING_EVIDENCE_ACTIVATION_EPOCH` is not defined on
+the release lineage — not on tag `g4-node-20260901`, not on fleet commit
+`46133196`, and not on `main`. **It is defined elsewhere in the repository**:
+`d21c3370` ("wip: caminho de submissao de evidencia de slashing"), a direct
+child of the fleet commit and a sibling of the tag, declares it at
+`params.rs:638` as `u64::MAX`, and that commit is reachable from six local
+branches and is pushed to a public remote. So the correct statement of break 4
+is narrower than "absent": on the binary the fleet runs there is no constant to
+arm, and the work that would introduce one exists, unarmed, off-lineage. An
+earlier draft of this dossier said the constant "does not exist in this
+repository" and that it was "absent, not set to `u64::MAX`" — both halves were
+wrong, and wrong in the specific direction of being more reassuring than the
+facts. The error came from measuring the release lineage and generalising to
+the repository. Read from the live chain on 2026-09-02 at height 34,665,
 epoch 1736, from two keyless archival observers returning byte-for-byte
 identical responses: 64 validators, 64 active, zero records with
 `slashed: true`, zero with a non-null `exit_epoch`, 64 of 64 `active`.

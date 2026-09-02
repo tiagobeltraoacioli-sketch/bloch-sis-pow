@@ -25,8 +25,11 @@
 //!    block.
 //! 3. Nothing constructs the transaction outside tests. The node captures an
 //!    equivocating pair and prints that the pipeline is not wired.
-//! 4. `SLASHING_EVIDENCE_ACTIVATION_EPOCH` does not exist — it is absent, not
-//!    set to `u64::MAX`.
+//! 4. `SLASHING_EVIDENCE_ACTIVATION_EPOCH` is not defined **on the release
+//!    lineage**. It IS defined off-lineage at `d21c3370:params.rs:638` as
+//!    `u64::MAX`, unarmed, on a direct child of fleet commit `46133196` that is
+//!    pushed to a public remote. So there is no flag day in the shipped binary,
+//!    which is what break 4 means; there is no claim here about every ref.
 //!
 //! # Why a test, and why this shape
 //!
@@ -356,18 +359,41 @@ fn there_is_no_slashing_activation_constant_to_arm() {
         })
         .map(|(path, _)| path)
         .collect();
-    if reachability() == Reachability::RefusedByConstruction {
-        assert!(
-            hits.is_empty(),
-            "`SLASHING_EVIDENCE_ACTIVATION_EPOCH` now appears in:\n  {}\n\n\
-             The published retractions say it does not exist — that it is absent \
-             rather than set to `u64::MAX`, which is a claim about how far the \
-             work has got. If a flag day now exists, say so in the retraction \
-             sites before changing this test.",
-            hits.iter().map(|p| p.as_str()).collect::<Vec<_>>().join("\n  "),
-        );
-    }
+    // UNCONDITIONAL, and it did not used to be. This assertion was wrapped in
+    // `if reachability() == Reachability::RefusedByConstruction { .. }`, which
+    // meant it stopped checking at exactly the moment it mattered: the codec
+    // becoming able to decode evidence is the same event that would bring the
+    // constant in, so the guard went silent on the transition it exists to
+    // catch, while still reporting green. A guard that disables itself when its
+    // subject changes is worse than no guard, because a passing run reads as
+    // evidence. The reachability verdict is still reported — in the failure
+    // message, where it explains the hit rather than suppressing it.
+    assert!(
+        hits.is_empty(),
+        "`SLASHING_EVIDENCE_ACTIVATION_EPOCH` is declared in the CHECKED-OUT TREE, \
+         in:\n  {}\n\nCodec reachability right now: {:?}.\n\n\
+         The retraction sites say there is no activation constant to arm ON THE \
+         RELEASE LINEAGE. If one is now in this tree, that sentence has to move \
+         before this test does. Update `rpc.rs` break 4, the CertiK dossier and \
+         BLOCH-GENESIS4-EXCHANGE-INTEGRATION.md first.",
+        hits.iter().map(|p| p.as_str()).collect::<Vec<_>>().join("\n  "),
+        reachability(),
+    );
 }
+
+// SCOPE, stated because getting it wrong is what produced the defect this
+// file's break 4 had to be corrected for on 2026-09-02.
+//
+// This test walks the CHECKED-OUT WORKING TREE. It can therefore only ever
+// support a claim about the tree that is built — never a claim about "this
+// repository", which is 1,300+ refs, most of which no released binary contains.
+// `SLASHING_EVIDENCE_ACTIVATION_EPOCH` is declared today on `d21c3370`
+// (`params.rs:638`, `u64::MAX`), a direct child of fleet commit `46133196`
+// pushed to a public remote, and this test was green the whole time — correctly,
+// because that commit is not in this tree. It was the retraction PROSE that
+// overreached, by saying "does not exist in this repository" about a measurement
+// that only covered one lineage. No test in a tree can close that gap; only a
+// narrower sentence can, which is why the sentences now say "release lineage".
 
 /// Break 3, measured: the node still says out loud that it does not prosecute.
 ///
