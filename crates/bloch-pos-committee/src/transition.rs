@@ -8856,6 +8856,59 @@ mod tests {
             );
         }
     }
+
+    // ── VIOLATION DEMONSTRATION (agent, 2026-09-02) ─────────────────────────
+    //
+    // Not a rule. A measurement of the rule that is MISSING, taken at the
+    // seam that decides consensus (`apply_block`), not at the RPC door.
+    //
+    // `engine::admissible` refuses `Deposit` with "bonding is not yet funded
+    // from the UTXO set". That refusal has exactly one non-test caller
+    // (`Engine::on_transaction`), and the block-ingest path
+    // (`ingest` -> `advance` -> `apply_canonical` -> `apply_block`) never
+    // reaches it. So a proposer on a patched binary — or simply one that puts
+    // the transaction in its own block, which never consults the mempool —
+    // mints bonded stake, and every honest node applies it.
+
+    /// An unfunded `Deposit` is ACCEPTED through `apply_block`, and the stake
+    /// it creates comes from nowhere: no output is spent, no fee is charged,
+    /// and `issued_sat` — the hard cap's own counter — does not move.
+    #[test]
+    fn unfunded_deposit_is_accepted_at_block_ingest_and_mints_stake() {
+        let (t, g, mut chains) = setup(8);
+
+        let tx = PosTransaction::Deposit {
+            pubkey: vec![0xAB; 8],
+            amount_sat: staking::MIN_DEPOSIT_SAT,
+            randao_commitment: [0xCD; 32],
+            withdrawal_credentials: vec![0xEF; 4],
+            commission_bps: 500,
+        };
+
+        let coins_before: u128 = g.eutxos.values().map(|e| e.value as u128).sum();
+        let bonded_before: u128 = g.validators.values().map(|v| v.staked_sat).sum();
+        assert_eq!(g.validator_count(), 8);
+
+        let b = build_block(&t, &g, 1, &[], std::slice::from_ref(&tx), &mut chains);
+        let st = t
+            .apply_block(&g, &b, &[], std::slice::from_ref(&tx))
+            .expect("THE FINDING: block ingest applies an unfunded deposit");
+
+        // The registry grew.
+        assert_eq!(st.validator_count(), 9, "validator_count 8 -> 9");
+        let bonded_after: u128 = st.validators.values().map(|v| v.staked_sat).sum();
+        assert_eq!(
+            bonded_after - bonded_before,
+            staking::MIN_DEPOSIT_SAT,
+            "25,000 BLCH of bonded stake now exists"
+        );
+
+        // And nothing paid for it.
+        let coins_after: u128 = st.eutxos.values().map(|e| e.value as u128).sum();
+        assert_eq!(coins_after, coins_before, "no output was spent: the bond is minted");
+        assert_eq!(st.issued_sat, g.issued_sat, "the cap's counter never saw the mint");
+    }
+
 }
 
 #[cfg(test)]
