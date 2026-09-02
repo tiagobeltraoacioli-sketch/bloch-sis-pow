@@ -57,6 +57,10 @@ bloch-pos-committee = { path = "../bloch-pos-committee" }
 # build stopped being instant at M2 — planned in the integration doc §6.
 bloch-crypto = { path = "../bloch-crypto" }
 sha3 = "0.10"
+# `flock(2)` and `F_FULLFSYNC` for src/slashdb.rs. Already in the lock file via
+# tokio/libp2p; named here because the data-directory lock is a safety
+# property of this binary and must not depend on a transitive edge.
+libc = "0.2"
 
 # The production network layer (src/p2p.rs). Same major version the Genesis-3
 # node runs (0.56), so the mesh fixes ported from it apply to the same

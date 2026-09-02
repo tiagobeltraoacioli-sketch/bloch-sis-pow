@@ -81,6 +81,7 @@ use crate::genesis::{Manifest, GENESIS_MIX};
 use crate::keys::{HybridVerifier, Keystore, ProbeVerifier};
 use crate::net::{self, NetEvent, Origin, Verdict};
 use crate::rpc::{self, Admitted, Finality, Json, RpcCall, RpcError, RpcRequest, RpcResult};
+use crate::slashdb::{DirLock, SlashingProtection};
 use crate::store::Store;
 
 /// Everything that reaches the consensus thread from outside it.
@@ -584,6 +585,15 @@ struct Engine {
     /// that belongs and it is still not wired.
     mempool: BTreeMap<Vec<u8>, PosTransaction>,
     store: Store,
+    /// The durable anti-double-sign fence — `Some` exactly when `keys` is.
+    ///
+    /// Deliberately NOT part of `Store`: the block log is transplanted
+    /// between boxes as a repair and rewritten wholesale by a reorg, and a
+    /// fence either of those could move is not a fence. See `slashdb.rs`.
+    fence: Option<SlashingProtection>,
+    /// Held for the life of the process so a second node cannot open this
+    /// data directory. Never read — its existence is the whole effect.
+    _dir_lock: DirLock,
     net: net::Net,
     head_slot: Arc<AtomicU64>,
     /// False during boot replay: no log appends, no broadcasts, no logs.
@@ -1008,11 +1018,43 @@ impl Engine {
             target_epoch: e,
             target_root: self.checkpoint_root(e),
         };
-        let signature = self
-            .keys
-            .as_ref()
-            .expect("checked above")
-            .sign(&data.signing_root());
+        // The fence, and the ORDER is the safety property: `attest_with`
+        // appends and fsyncs the new maxima and only then runs the closure
+        // that signs. A record written after the signature is released is not
+        // a fence — the window it leaves open is exactly the window a crash
+        // lands in. See `slashdb.rs` and the violation tests there.
+        //
+        // Borrowed as two disjoint fields on purpose: `fence` mutably,
+        // `keys` immutably.
+        // `run` opens a fence for every node that holds a key, so this is
+        // unreachable — and it refuses rather than panicking anyway. A panic
+        // on the duty path of a live validator is a remotely-adjacent crash
+        // (the h28080 lesson, four hundred lines down); a refusal costs one
+        // vote and is the safe side of the same uncertainty.
+        let Some(fence) = self.fence.as_mut() else {
+            eprintln!(
+                "[slot {slot}] SLASHING FENCE: this node holds a key but has no \
+                 slashing-protection record open; refusing to attest"
+            );
+            return;
+        };
+        let keys = self.keys.as_ref().expect("checked above");
+        let signature = match fence.attest_with(
+            slot,
+            data.source_epoch,
+            data.target_epoch,
+            || keys.sign(&data.signing_root()),
+        ) {
+            Ok(sig) => sig,
+            Err(why) => {
+                // LOUD, and never fatal. A refused duty costs one vote; the
+                // offence it refused costs the stake. The message names which
+                // offence was prevented, so this line is a diagnosis and not
+                // "attestation skipped".
+                eprintln!("[slot {slot}] SLASHING FENCE: {why}");
+                return;
+            }
+        };
         let att = Attestation {
             data,
             validator: index,
@@ -1147,11 +1189,27 @@ impl Engine {
         };
         header.state_root = post.state_root();
 
-        let proposer_sig = self
-            .keys
-            .as_ref()
-            .expect("checked above")
-            .sign(&header.proposal_signing_root());
+        // The proposer's own fence. `store.rs`'s append-then-broadcast is a
+        // restart fence for blocks this node ACCEPTED; this is a fence for
+        // blocks it SIGNED, which is a different set — a signed header that
+        // never made it into the log is invisible to the store and perfectly
+        // sufficient to be slashed for.
+        let Some(fence) = self.fence.as_mut() else {
+            eprintln!(
+                "[slot {slot}] SLASHING FENCE: this node holds a key but has no \
+                 slashing-protection record open; refusing to propose"
+            );
+            return;
+        };
+        let keys = self.keys.as_ref().expect("checked above");
+        let proposer_sig =
+            match fence.propose_with(slot, || keys.sign(&header.proposal_signing_root())) {
+                Ok(sig) => sig,
+                Err(why) => {
+                    eprintln!("[slot {slot}] SLASHING FENCE: {why}");
+                    return;
+                }
+            };
         let env = BlockEnvelope {
             header,
             proposer_sig,
@@ -2205,6 +2263,21 @@ impl Engine {
 const REPLAY_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub fn run(cfg: Config) -> io::Result<()> {
+    // FIRST, before the manifest, before the keystore, before the store: one
+    // process per data directory.
+    //
+    // Two processes sharing one keystore double-sign as soon as their heads
+    // differ — no clock anomaly, no malice, no reorg required. That is the
+    // 2026-08-21..30 incident (48 validators, 364 double-head slots), and it
+    // is one `systemctl start` away from happening again while 64 armed
+    // `validator.key` copies sit on the classic boxes with their units
+    // disabled but not masked. This refusal is what turns that keystroke into
+    // an error message.
+    //
+    // Taken before anything expensive so the operator gets the answer
+    // immediately rather than after a replay.
+    let dir_lock = DirLock::acquire(&cfg.data_dir)?;
+
     let (mut manifest, digest) = Manifest::load(&cfg.genesis_path)?;
 
     // The opening ledger, before anything else touches the manifest. A
@@ -2285,6 +2358,26 @@ pub fn run(cfg: Config) -> io::Result<()> {
             ));
         }
     }
+
+    // Opened here, next to the identity checks that just proved this keystore
+    // is the validator the manifest says, because the fence is keyed to that
+    // key. An observer holds no key, has no duty and gets no fence.
+    let fence = match keys.as_ref() {
+        Some(k) => {
+            let f = SlashingProtection::open(&cfg.data_dir, &k.pubkey, &digest)?;
+            let m = f.marks();
+            println!(
+                "slashing fence: {} (attested up to slot {}, target epoch {}; proposed up \
+                 to slot {})",
+                f.path().display(),
+                if m.has_attested { m.attested_slot.to_string() } else { "none".into() },
+                if m.has_attested { m.target_epoch.to_string() } else { "none".into() },
+                if m.has_proposed { m.proposed_slot.to_string() } else { "none".into() },
+            );
+            Some(f)
+        }
+        None => None,
+    };
 
     let store = Store::open(&cfg.data_dir, &digest)?;
     let genesis_state = manifest.genesis_state();
@@ -2382,6 +2475,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
         wall_slot: 0,
         mempool: BTreeMap::new(),
         store,
+        fence,
+        _dir_lock: dir_lock,
         net,
         head_slot,
         live: false,
@@ -2566,8 +2661,19 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // ── The slot loop ──
     let genesis_ms = engine.manifest.genesis_time_ms;
     let slot_ms = engine.manifest.slot_ms;
-    let mut last_attested: u64 = engine.state.slot();
-    let mut last_built: u64 = engine.state.slot();
+    // These two are a cheap pre-filter, not the guard. They used to BE the
+    // guard, seeded from the chain head — which is why a restart re-opened
+    // every slot the head did not contain, and why a backward clock step
+    // re-opened an already-voted one. The guard is now the persisted fence
+    // inside `attest`/`propose`; these only avoid recomputing a committee
+    // every loop iteration for a duty that is already done.
+    //
+    // Seeded from the fence as well as the head so a restarted node does not
+    // even attempt what it would be refused, and so the refusal log is a
+    // signal rather than noise.
+    let fence_marks = engine.fence.as_ref().map(|f| f.marks()).unwrap_or_default();
+    let mut last_attested: u64 = engine.state.slot().max(fence_marks.attested_slot);
+    let mut last_built: u64 = engine.state.slot().max(fence_marks.proposed_slot);
     let mut last_sync_req: u64 = 0;
 
     loop {
@@ -3912,7 +4018,10 @@ mod transfer_v2_end_to_end {
             .expect("bind the devnet transport on an ephemeral port"),
         );
         let verifier = HybridVerifier::new(Vec::new());
+        let dir_lock = DirLock::acquire(&dir).expect("test data dir lock");
         Engine {
+            fence: None, // no keystore in this harness: nothing to fence
+            _dir_lock: dir_lock,
             manifest,
             state: StateCell::new(state),
             tr: Transition::new(verifier.clone()),
@@ -4204,7 +4313,11 @@ mod perf_support {
             .expect("bind the devnet transport on an ephemeral port"),
         );
         let verifier = HybridVerifier::new(manifest.pubkeys());
+        let dir_lock = DirLock::acquire(&dir).expect("test data dir lock");
+        let fence = SlashingProtection::open(&dir, &ks.pubkey, &[0u8; 32]).expect("test fence");
         let engine = Engine {
+            fence: Some(fence),
+            _dir_lock: dir_lock,
             manifest,
             state: StateCell::new(state),
             tr: Transition::new(verifier.clone()),
@@ -4240,6 +4353,188 @@ mod perf_support {
         (engine, TestDir(dir))
     }
 }
+
+/// The fence, as the engine actually calls it.
+///
+/// `slashdb.rs` proves the fence refuses; this proves `attest` and `propose`
+/// are the callers. Without it the module could be perfect and unreachable —
+/// which is exactly the shape of the bug it exists to close.
+///
+/// The harness is one genesis validator holding its own hybrid key, so this
+/// node is the proposer AND the whole committee: every refusal below is a
+/// signature that production code would otherwise have released.
+#[cfg(test)]
+mod slashing_fence_wiring {
+    use super::*;
+    use bloch_pos_committee::params::SLOTS_PER_EPOCH;
+
+    /// Proposing the same slot twice is `SlashableOffense::ProposerEquivocation`.
+    ///
+    /// The setup matters, and finding out why cost a mutation test. Simply
+    /// re-proposing a slot after truncating the chain is NOT an equivocation:
+    /// the produce path is deterministic, so with the same parent and the same
+    /// RANDAO position it re-derives a byte-identical header, and identical
+    /// headers are not a slashable pair (`SlashingEvidence::offense` requires
+    /// them to differ). A test written that way passes with the fence torn
+    /// out, which is to say it tests nothing.
+    ///
+    /// So the second attempt here is given a genuinely different ancestry:
+    /// slot 7 is first proposed on top of slot 6, then both blocks leave the
+    /// chain — a reorg, or a crash before `store.append` that replay never
+    /// saw — and slot 7 is proposed again onto genesis. Different parent,
+    /// different RANDAO position, different header, same slot, same key. That
+    /// is the offence, the local chain has no objection left to raise, and the
+    /// fence is the only thing standing in the way.
+    ///
+    /// The real binary produced five such pairs in a single run on one data
+    /// directory before this existed.
+    #[test]
+    fn propose_refuses_a_slot_whose_block_left_the_chain() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        // Counts every structurally-valid block this node has SEEN for a slot,
+        // adopted or not — `ingest` records them before fork choice runs. That
+        // is the right detector: the offence is a second signed header, not a
+        // second adopted one, and `chain.len()` cannot tell the difference
+        // between "never signed" and "signed but not adopted".
+        fn headers_for(engine: &Engine, slot: u64) -> usize {
+            engine.blocks.values().filter(|e| e.header.slot == slot).count()
+        }
+
+        engine.propose(6);
+        engine.propose(7);
+        assert_eq!(engine.chain.len(), 3, "both proposals must land");
+        assert_eq!(headers_for(&engine, 7), 1, "one signed header for slot 7");
+        let first_7 = engine
+            .blocks
+            .values()
+            .find(|e| e.header.slot == 7)
+            .expect("the first slot-7 header")
+            .clone();
+
+        // Both of our blocks leave the chain. The signatures already released
+        // do not go with them, which is the whole point.
+        let genesis = engine.chain[0].1;
+        engine.chain.truncate(1);
+        engine.canonical = BTreeSet::from([*genesis.as_bytes()]);
+        engine.state = StateCell::new(engine.manifest.genesis_state());
+        engine.recent_states.clear();
+
+        engine.propose(7);
+        assert_eq!(
+            headers_for(&engine, 7),
+            1,
+            "a SECOND, DIFFERENT header was signed for slot 7 — that pair is a \
+             proposer equivocation, and the fence is the only thing that could \
+             have stopped it"
+        );
+        assert_eq!(
+            engine.blocks.values().find(|e| e.header.slot == 7).expect("still one").header.parent,
+            first_7.header.parent,
+            "and the one header that exists is still the first one"
+        );
+
+        // A floor, not a brick: a later slot is still proposable.
+        engine.propose(9);
+        assert_eq!(headers_for(&engine, 9), 1, "the fence must not stop honest production");
+        assert_eq!(engine.fence.as_ref().expect("fenced").marks().proposed_slot, 9);
+    }
+
+    /// Two attestations for one slot with different heads is the incident: 48
+    /// validators, 364 double-head slots. Here one process does it on purpose
+    /// — vote a slot, move the head, vote the same slot again.
+    ///
+    /// The detector is `engine.pool`: `attest` inserts into it as the last
+    /// thing it does after signing, so an empty pool after the second call is
+    /// proof that no second signature was produced. The final block of the
+    /// test is the vacuity guard — it shows `attest` still works, so the
+    /// empty pool above is a refusal and not a broken harness.
+    #[test]
+    fn attest_refuses_a_slot_it_already_voted_even_when_the_head_moved() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+
+        // Epoch 0 has no attestation duty (its checkpoint is genesis), and
+        // the epoch's committees partition the validator set, so find the one
+        // slot of epoch 1 this validator is actually assigned.
+        let mut duty = None;
+        for slot in SLOTS_PER_EPOCH..2 * SLOTS_PER_EPOCH {
+            engine.attest(slot);
+            if !engine.pool.is_empty() {
+                duty = Some(slot);
+                break;
+            }
+        }
+        let duty = duty.expect("this validator holds exactly one duty in epoch 1");
+        assert_eq!(engine.pool.len(), 1, "one attestation signed");
+        let first_head = engine.pool.values().next().expect("the vote").data.head;
+
+        // Move the head. A second attestation for `duty` would now carry
+        // different bytes, so it would land as a NEW pool entry rather than
+        // collapsing onto the first — which is what makes the assertion below
+        // mean "nothing was signed".
+        engine.propose(duty + 1);
+        assert_ne!(
+            *engine.head_id().as_bytes(),
+            first_head,
+            "the head must really have moved, or the next assertion proves nothing"
+        );
+        // Proposing swept the pending vote into the block it built.
+        assert!(engine.pool.is_empty());
+
+        engine.attest(duty);
+        assert!(
+            engine.pool.is_empty(),
+            "a second vote for slot {duty} was signed — the fence is not wired into attest"
+        );
+
+        // Vacuity guard: the duty of the NEXT epoch is still performed.
+        let mut next = None;
+        for slot in 2 * SLOTS_PER_EPOCH..3 * SLOTS_PER_EPOCH {
+            engine.attest(slot);
+            if !engine.pool.is_empty() {
+                next = Some(slot);
+                break;
+            }
+        }
+        let next = next.expect("attest must still work, or the test above proves nothing");
+        assert!(next > duty);
+
+        let marks = engine.fence.as_ref().expect("fenced").marks();
+        assert_eq!(marks.attested_slot, next);
+        assert_eq!(marks.target_epoch, 2);
+    }
+
+    /// The seam the whole incident lived in: the fence must not be derivable
+    /// from the block log. A reorg rewrites the log wholesale
+    /// (`Store::rewrite`) and a transplant replaces it; neither may lower the
+    /// floor.
+    #[test]
+    fn the_fence_does_not_move_when_the_block_log_is_replaced() {
+        let (mut engine, dir) = perf_support::proposing_engine();
+        for slot in 1..=5 {
+            engine.propose(slot);
+        }
+        assert_eq!(engine.fence.as_ref().expect("fenced").marks().proposed_slot, 5);
+
+        // The harsher of the two repairs: throw the log away entirely.
+        engine.store.rewrite(&[]).expect("rewrite the log empty");
+        assert_eq!(
+            std::fs::metadata(dir.0.join("blocks.log")).expect("stat").len(),
+            0
+        );
+
+        // Reopened from disk, not from the live handle — this is what the
+        // next boot would read.
+        let ks = Keystore::load(&dir.0).expect("keystore");
+        let fence = crate::slashdb::SlashingProtection::open(&dir.0, &ks.pubkey, &[0u8; 32])
+            .expect("reopen the fence");
+        assert_eq!(
+            fence.marks().proposed_slot,
+            5,
+            "an emptied block log must not unarm the fence"
+        );
+    }
+}
+
 
 /// **Win 3's proof.** A proposer used to compute the whole committed state
 /// root THREE times for one slot; it now computes it twice, and the two that
@@ -5876,7 +6171,12 @@ mod duty_view_anchor {
         );
         let verifier = HybridVerifier::new(manifest.pubkeys());
         let ks0 = Keystore::load(&dir.0.join("v0")).expect("re-load validator 0");
+        let dir_lock = DirLock::acquire(&dir.0).expect("test data dir lock");
+        let fence =
+            SlashingProtection::open(&dir.0, &ks0.pubkey, &[0u8; 32]).expect("test fence");
         let engine = Engine {
+            fence: Some(fence),
+            _dir_lock: dir_lock,
             manifest,
             state: StateCell::new(state),
             tr: Transition::new(verifier.clone()),

@@ -640,6 +640,11 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         tr_probe: Transition::new(ProbeVerifier),
         verifier,
         keys: None, // observer: replay proposes nothing and attests nothing
+        // An observer signs nothing, so it carries no fence. It still takes
+        // the data-directory lock, because a benchmark sharing a live node's
+        // dir is exactly the mistake the lock exists to catch.
+        fence: None,
+        _dir_lock: crate::slashdb::DirLock::acquire(dir).expect("benchmark data dir lock"),
         blocks: BTreeMap::new(),
         chain: vec![(0, genesis_id)],
         canonical: BTreeSet::from([*genesis_id.as_bytes()]),
