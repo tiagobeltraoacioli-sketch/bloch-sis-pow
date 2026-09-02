@@ -6476,6 +6476,13 @@ mod tests {
 
     #[test]
     fn evidence_transaction_slashes_operator_and_delegators_and_pays_whistleblower() {
+        // The §7.3 evidence FORMAT is now behind a flag day
+        // (`SLASHING_EVIDENCE_ACTIVATION_EPOCH`, `u64::MAX` today), so a block
+        // carrying evidence is refused until the gate opens. This test is about
+        // what happens once it has, so it forces the gate — the shipped
+        // configuration is pinned separately by
+        // `tka_evidence_is_inert_while_the_flag_day_is_unarmed`.
+        let _gate = crate::params::rehearsal::gates_open_guard();
         let (t, g, mut chains) = setup(4);
         let seed = g.seed_for_epoch(0);
         // Pick an offender that is NOT the proposer of the evidence-carrying
@@ -6532,6 +6539,13 @@ mod tests {
 
     #[test]
     fn proposer_equivocation_evidence_slashes_through_the_transition() {
+        // The §7.3 evidence FORMAT is now behind a flag day
+        // (`SLASHING_EVIDENCE_ACTIVATION_EPOCH`, `u64::MAX` today), so a block
+        // carrying evidence is refused until the gate opens. This test is about
+        // what happens once it has, so it forces the gate — the shipped
+        // configuration is pinned separately by
+        // `tka_evidence_is_inert_while_the_flag_day_is_unarmed`.
+        let _gate = crate::params::rehearsal::gates_open_guard();
         let (t, g, mut chains) = setup(4);
         let p1 = schedule::proposer(&g.seed_for_epoch(0), 1, &g.duty_roster()).unwrap();
         let offender = (p1 + 1) % 4;
@@ -6573,6 +6587,13 @@ mod tests {
 
     #[test]
     fn forged_evidence_rejects_the_block_and_slashes_nobody() {
+        // The §7.3 evidence FORMAT is now behind a flag day
+        // (`SLASHING_EVIDENCE_ACTIVATION_EPOCH`, `u64::MAX` today), so a block
+        // carrying evidence is refused until the gate opens. This test is about
+        // what happens once it has, so it forces the gate — the shipped
+        // configuration is pinned separately by
+        // `tka_evidence_is_inert_while_the_flag_day_is_unarmed`.
+        let _gate = crate::params::rehearsal::gates_open_guard();
         // MarkerVerifier: every ordinary signature passes, `b"forged"` fails —
         // so the block dies on exactly the evidence signature and nothing else.
         let (t, g, mut chains) = setup_with(4, MarkerVerifier, &[]);
@@ -6650,6 +6671,13 @@ mod tests {
 
     #[test]
     fn replayed_evidence_rejects_the_second_block_even_swapped() {
+        // The §7.3 evidence FORMAT is now behind a flag day
+        // (`SLASHING_EVIDENCE_ACTIVATION_EPOCH`, `u64::MAX` today), so a block
+        // carrying evidence is refused until the gate opens. This test is about
+        // what happens once it has, so it forces the gate — the shipped
+        // configuration is pinned separately by
+        // `tka_evidence_is_inert_while_the_flag_day_is_unarmed`.
+        let _gate = crate::params::rehearsal::gates_open_guard();
         let (t, g, mut chains) = setup(4);
         let p1 = schedule::proposer(&g.seed_for_epoch(0), 1, &g.duty_roster()).unwrap();
         let offender = (p1 + 1) % 4;
@@ -7136,6 +7164,13 @@ mod tests {
     /// free to drift, in the structure whose whole purpose is that they cannot.)
     #[test]
     fn ejected_set_is_exactly_the_slashed_registry() {
+        // The §7.3 evidence FORMAT is now behind a flag day
+        // (`SLASHING_EVIDENCE_ACTIVATION_EPOCH`, `u64::MAX` today), so a block
+        // carrying evidence is refused until the gate opens. This test is about
+        // what happens once it has, so it forces the gate — the shipped
+        // configuration is pinned separately by
+        // `tka_evidence_is_inert_while_the_flag_day_is_unarmed`.
+        let _gate = crate::params::rehearsal::gates_open_guard();
         let (t, g, mut chains) = setup(4);
         let seed = g.seed_for_epoch(0);
         let p1 = schedule::proposer(&seed, 1, &g.duty_roster()).unwrap();
