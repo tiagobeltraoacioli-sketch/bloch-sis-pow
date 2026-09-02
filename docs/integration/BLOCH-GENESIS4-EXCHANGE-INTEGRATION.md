@@ -4,9 +4,15 @@
 Document:   BLOCH-GENESIS4-EXCHANGE-INTEGRATION
 Audience:   Exchange integration, custody and risk teams
 Chain:      Bloch Genesis-4 · Ticker BLCH · Proof of Stake · live mainnet
-Describes:  the RELEASED binary — main @ e4083f9
-Measured:   2026-08-26, height 15,146, epoch 1,101
-Revised:    2026-08-31, after an integrator audit (see §0.1)
+Describes:  the PUBLISHED RELEASE — tag `g4-node-20260901` = 7a83ca89.
+            That is the commit you will build and the one we pointed you at.
+            `main` is NOT it. The tag is not an ancestor of `main`, and the
+            live fleet's tip (46133196) is not an ancestor of `main` either.
+            Anything checked against `main` was checked against a tree the
+            network does not run — see §0.1.1.
+Measured:   chain figures 2026-08-26, height 15,146, epoch 1,101
+            node figures 2026-09-01, height ~33,600 (§7)
+Revised:    2026-09-01, re-audited against the release tag (see §0.1.1)
 Delivery:   file, to named contacts. Not published. Not a shared artifact.
 ```
 
@@ -49,11 +55,41 @@ input published here is load-bearing: build against a stale one and every
 transaction you sign is rejected, with an error that names a value mismatch
 rather than the parameter that actually moved.
 
-Every number in this document is now pinned by a test
+~~Every number in this document is now pinned by a test
 (`crates/bloch-pos-committee/tests/integration_book_claims.rs`) that names the
 section it belongs to, and moving a published constant without updating this
-document is a CI failure. The rule is written down in
-[`CONSENSUS-CHANGELOG-DISCIPLINE.md`](CONSENSUS-CHANGELOG-DISCIPLINE.md).
+document is a CI failure.~~ **Withdrawn 2026-09-01.** That test file exists
+only on the unreleased branch this revision was written on. It is **not in the
+release tag**, so nothing in the release's CI fails when a published constant
+moves, and the pin names quoted throughout this document (`book_…`) are not
+gates you can rely on. Treat every number here as dated, not as guarded. The
+same applies to two documents this one links to,
+`CONSENSUS-CHANGELOG-DISCIPLINE.md` and `INTEGRATION-BOOK-AUDIT-2026-08-31.md`:
+they are not in the release tree, so those links will not resolve in a
+checkout of the tag. Ask us for them as files.
+
+### 0.1.1 Second correction, 2026-09-01 — the first audit read the wrong tree
+
+The revision above was verified against `main` @ `e4083f9`. **`main` is not the
+lineage of the binary we gave you.** The tag you were pointed at,
+`g4-node-20260901` = 7a83ca89, is not an ancestor of `main`; neither is the tip
+the live fleet runs, 46133196. `e4083f9` is six days and seventeen commits
+behind the release. So "verified against `main`" was, for several claims, a
+verification against code no one is running.
+
+It produced at least one published statement that was the exact opposite of the
+truth: this document told you the mempool **rejection cache** was not in the
+released binary. It is (§6.5, §10.1). It changes what `-32008` means.
+
+Everything below has now been re-checked against **7a83ca89** specifically.
+Where the release and the fleet tip differ, the difference is stated. They do
+not differ on any RPC or consensus behaviour in this document — the only delta
+between 46133196 and the tag is a memory fix in the eUTXO ledger and the node
+measurements in §7.
+
+**The rule this gives you, and we would apply it to any vendor:** a claim about
+a chain is a claim about a *commit*. Ask which one. If the answer is a branch
+name rather than a tag or a hash, the answer is not yet an answer.
 
 ### 0.2 Status markers
 
@@ -88,6 +124,14 @@ this: functions that are public, fully tested, and unreachable.
    will alert continuously. See §3.9.
 3. **The fee is derived, never declared, and conservation is an equality.**
    You cannot overpay. Read the price immediately before building. See §6.4.
+
+4. **There is no `getcapabilities` method on the released binary.** It answers
+   `-32601 METHOD_NOT_FOUND`, on our public archival nodes and on anything you
+   build from the tag. §3.1 tells you to call it first and to branch your client
+   on it; **§3.1 is wrong and is being withdrawn.** There is no
+   `rpc_surface_version` either. The tables in §3 are the only surface
+   description that exists — build against them, and re-read them on each
+   release rather than asking the node.
 
 And one that will not break your client but should shape your credit policy:
 **`finalized` is not currently guaranteed to be the same value on every node.**
@@ -140,9 +184,11 @@ Pinned by `book_block_payload_cap_and_the_era_it_belongs_to`.
 
 ### 1.2 Activation gates
 
-Four gates exist in `params.rs`. Three of them arm code that nothing on the
-wire can reach today. They are listed here because a capability behind a closed
-gate is not a capability, and you should not design against one.
+**Five** gates exist in `params.rs` — the previous revision said four and
+demoted the fifth to a dead constant, which was wrong (see below). Two are
+open; the other **three** arm code that nothing on the wire can reach today. They are listed here because
+a capability behind a closed gate is not a capability, and you should not design
+against one.
 
 | Gate | Value | State | What it controls |
 |---|---|---|---|
@@ -150,12 +196,21 @@ gate is not a capability, and you should not design against one.
 | `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` | 800 | **open** | the V2 deduplicated-witness transfer (§6) |
 | `LEAKED_ROSTER_ACTIVATION_EPOCH` | 1,400 | `[SCHEDULED]` | whether the inactivity leak reaches the duty roster (§5.3) |
 | `LEAK_RECOVERY_ACTIVATION_EPOCH` | `u64::MAX` | `[INERT]` | leak recovery and the quorum-denominator floor — **read §5.3 before crediting** |
+| `ANCESTRY_SEED_ACTIVATION_EPOCH` | `u64::MAX` | `[INERT]` | the sortition-seed look-ahead (`back = 1` below it) — see the correction below |
 
-A fifth constant, `ANCESTRY_SEED_ACTIVATION_EPOCH`, is also `u64::MAX` but
+~~A fifth constant, `ANCESTRY_SEED_ACTIVATION_EPOCH`, is also `u64::MAX` but
 **gates nothing**: the seed look-ahead it once guarded was made unconditional
-on 2026-08-24 and the constant is now unreferenced. It is dead, not scheduled.
-It is named here only so that finding it in the source does not read as a
-pending feature.
+on 2026-08-24 and the constant is now unreferenced. It is dead, not
+scheduled.~~ **Withdrawn 2026-09-01 — this was simply wrong, at the release and
+at every other commit we checked.** `ANCESTRY_SEED_ACTIVATION_EPOCH` is
+referenced and it does gate: at 7a83ca89,
+`crates/bloch-pos-committee/src/transition.rs:1608` reads
+`if !gate_open && epoch < ANCESTRY_SEED_ACTIVATION_EPOCH` and takes the
+original `back = 1` rule below it, the look-ahead rule above it. It is a fifth
+`[INERT]` gate, on the same footing as `LEAK_RECOVERY_ACTIVATION_EPOCH`:
+unreachable, no date, and arming it would be a flag day. Nothing you can reach
+changes — but do not read "dead" into the source on our word, because we read
+it wrong.
 
 There is **no gate for validator entry**. See §8.
 
@@ -334,18 +389,31 @@ See §5.
 ### 3.8 `getmempoolinfo` — pending state and next price
 
 ```json
-{"size":1,"max":4096,"bytes":338487,"next_base_fee_millisat_per_gas":"10"}
+{"size":1,"max":4096,"bytes":338487,"next_base_fee_millisat_per_gas":"10",
+ "barred":0,"barred_hits":0}
 ```
 
 `max` is 4,096 transactions. `next_base_fee_millisat_per_gas` is the price the
 next block will charge; the same value is on `getchaininfo`, so one poll can
 serve both purposes.
 
+**`barred` and `barred_hits` are the rejection cache seen from outside, and the
+previous revision did not list them because it wrongly believed the cache was
+unreleased (§6.5).** They are on the released binary —
+`crates/bloch-pos-node/src/rpc.rs:1568-1569` at 7a83ca89. `barred` is how many
+transactions this node is currently refusing to re-admit; `barred_hits` is how
+many re-offers it has turned away since boot. If your withdrawal is answered
+`-32008` and `barred` is non-zero, read the error message: it will name the
+slot the bar lifts at.
+
 ### 3.9 Error codes — the complete table
 
 The previous revision listed five codes, mislabelled one, and omitted the two
-that matter most operationally. This is the full set; `getcapabilities` returns
-the same table from the running node.
+that matter most operationally. This is the full set. ~~`getcapabilities`
+returns the same table from the running node.~~ **Withdrawn: there is no
+`getcapabilities` on the released binary (§0.3).** This table is the only
+description of the error surface that exists, so pin it, and re-read it on each
+release rather than probing the node.
 
 | Code | Name | Meaning and correct client response |
 |---|---|---|
@@ -362,26 +430,51 @@ the same table from the running node.
 | `-32005` | `NO_TRANSACTION_INDEX` | permanent answer for `gettransaction`. There is no txid index |
 | `-32006` | `NO_WALLET` | permanent answer for `getnewaddress`. The node has no wallet |
 | `-32007` | `SLOT_EMPTY` | **normal.** The proposer missed that slot. Advance; do not alert |
-| `-32008` | `TX_REFUSED` | judged invalid on its merits. **Never resubmit these bytes** |
+| `-32008` | `TX_REFUSED` | **two distinct cases — read the message.** Either the bytes were judged invalid (never resubmit them), or this node has *barred* them for a bounded time (resubmit after the bar lifts). See below. |
 
 Two of these decide whether your integration is operable:
 
 - **`-32007` is not an error condition.** Missed proposals are ordinary under
   PoS. A block scanner that treats a `-32007` as a fault will page you
   continuously. Advance to the next slot.
-- **`-32003` and `-32008` are opposites and must not be conflated.**
-  `-32003` means try again; `-32008` means these exact bytes will never be
-  accepted, rebuild the transaction. A client that retries `-32008` loops
-  forever.
+- **`-32008` carries two different verdicts and the code alone does not
+  separate them.** This is a correction to the previous revision, which said
+  flatly that `-32008` means "never resubmit". At 7a83ca89
+  (`crates/bloch-pos-node/src/engine.rs:2566-2581`) `sendrawtransaction`
+  returns `-32008` for both of these:
+
+  | Cause | Message contains | Correct response |
+  |---|---|---|
+  | `Refusal::Invalid` | *"this transaction cannot be admitted; retrying the same bytes will not help"* | **terminal.** Rebuild. |
+  | `Refusal::PreviouslyRefused` | *"…so it is barred until slot N…"* | **retryable after slot N.** The bar is 128 slots (≈64 min) from the refusal — see §6.5. |
+
+  The second case is the rejection cache, which this document previously told
+  you was not in the released binary. It is. **Branch on the message, not on the
+  code**, and if you cannot, treat `-32008` as terminal — that is safe, it just
+  costs you a rebuild you did not need.
+
+- **`-32003` and `-32008` are still not the same thing.** `-32003` means the
+  mempool is full and says nothing about your transaction; `-32008` is always a
+  statement about your transaction. The bar is also checked *before* capacity,
+  so a barred transaction is never answered `-32003`.
 
 Anything you do not handle explicitly will be treated as a generic failure,
-which for `-32007` means false alarms and for `-32008` means an infinite retry
-loop. Handle both by name.
+which for `-32007` means false alarms and for `-32008` means either an infinite
+retry loop or a withdrawal you abandoned that would have succeeded an hour
+later. Handle both by name.
 
 ### 3.10 Methods that do not exist
 
-Deliberately absent, each with its reason. `getcapabilities` returns this list
-too, so you do not have to probe and infer from `-32601`.
+Deliberately absent, each with its reason. ~~`getcapabilities` returns this
+list too, so you do not have to probe and infer from `-32601`.~~ **Withdrawn:
+`getcapabilities` is itself one of the absent methods (§0.3).** You do have to
+work from this list. It is complete for 7a83ca89: the released dispatch table
+(`crates/bloch-pos-node/src/rpc.rs:855-921`) serves exactly `getchaininfo`,
+`getblockcount`, `getblockbyslot`, `getblockbyid`, `getvalidator`,
+`getvalidatorcount`, `getbalance`, `gettxout`, `getutxos`, `listunspent`,
+`sendrawtransaction`, `getmempoolinfo` — plus `gettransaction` and
+`getnewaddress`, which exist only to refuse. Everything else, including
+`getcapabilities`, is `-32601`.
 
 | Name | Why not |
 |---|---|
@@ -744,25 +837,81 @@ A wallet that folds the prices together and divides once
 short is a hard rejection. Pinned by
 `book_fee_is_base_plus_tip_each_rounded_up_separately`.
 
-### 6.5 Refusal is not permanent — but `-32008` is
+### 6.5 Refusal, and the bar — corrected 2026-09-01
 
-Distinguish two different things that both look like "my transaction was
-refused":
+~~`[UNRELEASED]` — a mempool rejection cache with an expiring bar is on branch
+`canario/cache-recusa` and is **not in the released binary**.~~
 
-- **`-32008 TX_REFUSED` at the RPC layer** means the node judged those exact
-  bytes invalid. Never resubmit them; rebuild.
-- A transfer refused because it was priced against a base fee that has since
-  moved is refused *about the chain state at the time*, not about the bytes.
-  Repricing and re-signing is the correct response.
+**That was false, and it is the single worst error in the previous revision.**
+The mempool rejection cache **is in the released binary**. At 7a83ca89:
+`crates/bloch-pos-node/src/engine.rs:178` defines
+`REJECTION_TTL_SLOTS = 128`, and `engine.rs:1701` and `engine.rs:1752-1755`
+put it on the live admission path. It is also on the fleet tip, 46133196. It is
+absent from `main` — which is why an audit against `main` reported it missing,
+and why §0.1.1 exists. `[LIVE]`.
 
-`[UNRELEASED]` — a mempool rejection cache with an expiring bar is on branch
-`canario/cache-recusa` and is **not in the released binary**. See §10.
+What it does, and what it means for your withdrawal pipeline:
+
+- A transaction the block transition refuses is removed from this node's
+  mempool **and barred from re-entering it** for 128 slots — 128 × 30 s ≈ **64
+  minutes**. Without the bar, peers still holding the transaction re-offer it
+  and it walks straight back in.
+- **The bar is answered before the capacity check.** A barred transaction is
+  never told `-32003 MEMPOOL_FULL`; it is told `-32008` with a message naming
+  the slot the bar lifts at.
+- **The bar expires, and that is deliberate.** Refused bytes are not
+  permanently invalid — a transfer priced against a base fee that has since
+  moved becomes valid again when the price comes back, and a permanent ban
+  would turn a transient pricing error into coins that are quietly unspendable
+  through that node. So a barred transaction *may* be retried after the TTL.
+- **The bar is node-local.** It is one node's memory of what its own proposer
+  watched fail; another node has its own. If you run two nodes, a bar on one is
+  not a verdict from the chain.
+- `getmempoolinfo` reports `barred` and `barred_hits` (§3.8), so you can see it
+  from outside rather than reading someone's log.
+
+So the two things that both look like "my transaction was refused" are still
+distinct, but the distinction is **inside** `-32008`, not between `-32008` and
+something else:
+
+- `-32008` whose message says *"retrying the same bytes will not help"* —
+  terminal. Rebuild.
+- `-32008` whose message says *"barred until slot N"* — bounded. If the cause
+  was a stale price or a parent that had not landed, reprice or wait for the
+  parent, then resubmit after slot N.
+
+If your client cannot parse the message, treat all `-32008` as terminal and
+rebuild. That is safe. What is **not** safe is the previous revision's advice
+read the other way — an unconditional retry of `-32008` against a node holding
+a bar is a loop that cannot succeed until the TTL lapses.
 
 ---
 
 ## 7. Running a node
 
 Any integrator can run their own node and read from it directly.
+
+### 7.0 Start it before 2026-09-05 07:07:19 UTC, or you cannot start it at all
+
+**The previous revision omitted this entirely and it is the first thing you
+need to know in this section.** Genesis-4 is proof of stake, so it has a
+weak-subjectivity window: `WS_PERIOD_EPOCHS` =
+`WITHDRAWAL_DELAY_EPOCHS (2048) − EXIT_DELAY_EPOCHS (32)` = **2016 epochs ≈
+22.4 days**. Genesis-4 started at epoch 0 on 2026-08-13 21:31 UTC.
+
+| If your node's first sync starts | What it needs |
+|---|---|
+| **before epoch 2016** — i.e. before **2026-09-05 07:07:19 UTC** | the genesis manifest and nothing else; the genesis block is its own trust anchor |
+| **after** that instant | a **signed checkpoint** (`--ws-checkpoint` + `--ws-signer-set`) |
+
+**No signed checkpoint exists today.** After that instant a fresh node started
+without one refuses to sync and says so — it does not quietly follow a peer,
+which is the right failure but it is still a failure. A node that completes its
+first sync *before* the deadline keeps its own anchor and is unaffected
+afterwards.
+
+If running your own node is part of your integration plan, this is a date, not
+a caveat. Raise it with us now if you cannot make it.
 
 ### 7.1 The binary is `bloch-pos`
 
@@ -776,10 +925,20 @@ gives `command not found`.
 - `mainnet.manifest` (~247 KB)
 - `carryover.tsv` (~55 MB, 452,726 opening outputs) — required, because the
   mainnet manifest commits to it
-- 8 GB RAM, 2 cores, 20 GB disk per node
+- Linux x86-64, 2+ vCPU, 8 GB RAM, **80 GB SSD** per node (the previous
+  revision said 20 GB; `blocks.log` alone was 448 MB at height 33,602 on
+  2026-09-01 and grows with the chain — provision for growth, not for today)
 
 Replay is single-threaded and pins one core; allocate cores per node, not per
-box.
+box. Measured on 2026-09-01 on 2 vCPU / 7.9 GB boxes, a full cold sync from
+genesis peaked at **934 MB** resident. 8 GB is comfortable; we have not tested
+below it.
+
+Build the **release tag**, not `main` — `git checkout g4-node-20260901`. A
+release build of that tag took 3 min 39 s, 4 min 12 s and 6 min 04 s on three
+independent 2-vCPU boxes on 2026-09-01; call it 4 to 6 minutes and provision
+for the slow end. Do not use a debug build: it makes the initial state
+construction take hours rather than minutes.
 
 ### 7.3 Run
 
@@ -789,7 +948,7 @@ bloch-pos run \
   --genesis   /var/lib/bloch/mainnet.manifest \
   --carryover /var/lib/bloch/carryover.tsv \
   --transport devnet \
-  --listen 19100 --listen-addr 0.0.0.0 \
+  --listen 19100 --listen-addr 127.0.0.1 \
   --peers <ip:port,…> \
   --rpc-port 16400 --rpc-bind 127.0.0.1
 ```
@@ -816,17 +975,44 @@ harmless under `--transport devnet`, but if you later switch transports you
 will get a bind conflict. Pick your ports deliberately.
 
 **`--transport devnet` authenticates nothing.** It is a TCP full mesh with no
-authentication, no admission control and no relay logic. If you bind it to a
-routable address, as the example does, you **must** firewall it to your known
-peer addresses.
+authentication, no admission control and no relay logic. The previous revision
+bound it to `0.0.0.0` in the example above and told you to firewall it; the
+example now binds to loopback, because **you do not need an inbound port to
+sync at all** — your node dials the bootnodes and its sync requests are
+answered on those same outbound connections. Bind to loopback, or if you must
+listen, firewall it to your known peer addresses.
+
+The name `devnet` is historical and misleading: it is the transport the **live
+mainnet fleet runs today**, verified 2026-09-01 across all seven fleet hosts
+and both archival nodes. Do not use `--transport libp2p`.
 
 ### 7.4 Bootstrap
 
-Copy `blocks.log` (and optionally `meta.bin` and `ws_latest.bin`) from a
-current node's data directory (~202 MB today) and start. Replay of 15,000
-blocks completes in about 4 minutes at 52 blocks/s. `meta.bin` and
-`ws_latest.bin` are both recreated if absent, and both are refused if they came
-from a different network — so copying them is safe but not required.
+**Two paths, and — correcting the previous revision — neither is meaningfully
+faster than the other. Pick on operational grounds, not speed.**
+
+**Replay over the network.** Point the node at the bootnodes and let it fetch
+and apply every block from genesis. Measured to completion on 2026-09-01, on an
+idle 2-vCPU / 7.9 GB box, release build of the tag: **21.2 minutes** (1,273 s)
+from launch to `behind_by_slots = 0`, height 33,602 reached, peak RSS 934 MB.
+
+**Seed from an archival copy.** Copy `blocks.log`, `meta.bin` and
+`ws_latest.bin` — **by name**, never by globbing the directory — from a healthy
+*archival* node and replay them locally. Measured to completion the same day on
+an identical box: 33,608 blocks in **22.1 minutes** (1,328 s), a lifetime rate
+of **25.3 blocks/s**, peak RSS 983 MB. `blocks.log` was **469,561,433 bytes
+(448 MB)** at height 33,602 and grows with the chain, so treat that as a floor.
+
+~~(~202 MB today). Replay of 15,000 blocks completes in about 4 minutes at 52
+blocks/s.~~ **Both figures withdrawn.** 202 MB was less than half the measured
+size. And "52 blocks/s" is not a rate the node sustains: the node's progress
+line reports a *cumulative average* that decays throughout a run — 82.5
+blocks/s at 4.6% of the way in, 54.6 at 22.8%, 41.3 at 41.9%, 29.3 at 87.4%,
+and 25.3 at the end. 52 blocks/s is roughly what that counter reads one fifth
+of the way in, and it was published as though it were a result. **Do not size
+anything off the progress line's rate or its "time left"** — wait for the
+`replayed N blocks:` line. At the real rate, a replay to today's head is about
+twenty minutes, not four.
 
 **Two things to delete from a copied data directory, which the previous
 revision did not warn about:**
@@ -835,16 +1021,43 @@ revision did not warn about:**
   `--transport devnet` it is never read, so the problem is latent; it becomes
   real the moment you switch to libp2p. Delete it.
 - **`validator.key`** — if the donor was a validator, copying this makes your
-  node a **second signer for the same validator index**. That is equivocation,
-  and it is slashable. There is no safe version of it. Copy the three files
-  named above and nothing else.
+  node a **second signer for the same validator index**. That is equivocation.
+  There is no safe version of it. Copy from an **archival** node, take the three
+  files named above, and nothing else.
 
-**"Syncing from genesis is also supported" was wrong for the transport this
+  One correction on the word we used. The previous revision said equivocation
+  "is slashable". In the released binary the on-chain penalty **cannot
+  currently be applied**: slashing evidence has no decodable wire form — tag
+  `0x05` returns `EvidenceNotDecodable` by construction, because the evidence
+  arm folds in signing *roots* rather than the envelopes, and nothing recovers
+  an envelope from a hash
+  (`crates/bloch-pos-committee/src/transition.rs:714-730` at 7a83ca89). The
+  penalty logic in `slashing.rs` is complete and unreachable from the network.
+  What *is* live is the equivocator bar: an equivocating validator is barred
+  from fork-choice weight. So do not copy the key — but do not model a slashing
+  penalty as a control that exists today either.
+
+~~**"Syncing from genesis is also supported" was wrong for the transport this
 document recommends.** Over `--transport devnet`, cold sync does not complete,
-and the failure is silent: the node reports a head, a height and a state root
-as though it were caught up. Reproduced 2026-08-14 at height 556 against a
-network at 1,511, with no error raised. Bootstrap from a copied `blocks.log`,
-and verify with §7.5 before you trust the node.
+and the failure is silent… Bootstrap from a copied `blocks.log`.~~
+
+**Withdrawn 2026-09-01. Cold sync over `--transport devnet` completes**, and
+the figures are above: 21.2 minutes to `behind_by_slots = 0`, run to completion
+on the release build of the tag against the two published bootnodes. The
+2026-08-14 observation at height 556 was real, but it was on a pre-release
+binary and it was read as a property of the transport rather than of that
+build.
+
+An older edition also published **"about 26 hours"** for a cold sync. That came
+from a run on a loaded laptop that was **stopped after 13 minutes**, with its
+slowest observed rate extrapolated to a head 53,300 slots away. Both mistakes
+compound into the same lesson, and it is the one we would ask you to apply to
+any number we give you: **a partial run is not a measurement.**
+
+Whichever path you take, verify with §7.5 before you trust the node. Both
+re-apply every transition and recompute every state root, so neither is weaker
+validation than the other; seeding trades a dependency on a donor for the block
+*data*, not for its validity.
 
 ### 7.5 Observer mode
 
@@ -973,6 +1186,15 @@ Stated so that silence is not read as assurance:
   cursor on `getutxos`. Reconstructing history from the RPC surface is not
   something we have made work.
 - **Validator entry and exit** (§8).
+- **A node build/version RPC.** No method on any commit in the repository
+  returns the node's build identity. You cannot ask a node which commit it is
+  running, so you cannot verify from the wire that a peer — or our archival
+  node — is the release you were given. §3.1's premise, "ask the node, not this
+  document", has no method behind it. Verify by digest at build time instead
+  (reproducible-build manifest, distributed with the tag).
+- **Enforced slashing.** The penalty rules are written and tested; the evidence
+  they consume cannot reach a block (§7.4). Treat validator misbehaviour as
+  economically unpunished today.
 - **Decentralisation.** Stake is concentrated and the validator set is the
   genesis set. We are not going to characterise that as decentralised here, and
   you should form your own view before listing.
@@ -985,49 +1207,65 @@ The reason two of the three audit findings existed. Anything in this table is
 **not in the binary the network runs**, regardless of how complete it looks in
 the repository.
 
-| Capability | On `main` @ `e4083f9` | Branch | Book section |
+**Read the second column's heading carefully.** It says `main`, and `main` is
+not the binary the network runs (§0.1.1). One row below was wrong for exactly
+that reason and is struck out. The two surviving rows have been re-checked
+against the release tag 7a83ca89 and hold there too.
+
+| Capability | On the release, 7a83ca89 | Branch | Book section |
 |---|---|---|---|
 | Funded validator bonding — deposit reaches the transition via `staking::validate_deposit_fields` | absent; `validate_deposit` has no call site | `wt/signed-exit-wire`, `wt/exit-churn-limit`, `lead/delegation-off-explicit` | §8.1 |
 | `unlock_epoch` enforcement in the committee (`if entry.unlock_epoch > self.epoch`) | absent from `bloch-pos-committee` entirely | same | §8.1 |
-| Mempool rejection cache — `REJECTION_TTL_SLOTS = 128` slots (≈ 64 min) | absent | `canario/cache-recusa` | §6.5 |
+| ~~Mempool rejection cache — `REJECTION_TTL_SLOTS = 128` slots (≈ 64 min)~~ | ~~absent~~ **WRONG — it is present in the release (7a83ca89) and on the fleet tip (46133196); it is absent only from `main`** | — | §6.5 |
 
-### 10.1 The rejection cache, since you will read about it
+### 10.1 The rejection cache — this section was wrong and has moved
 
-`[UNRELEASED]`. On `canario/cache-recusa`, a transaction the block transition
-refuses is removed from the mempool *and barred from re-entering* for
-`REJECTION_TTL_SLOTS = 128` slots — 128 × 30 s ≈ **64 minutes**. Without the
-bar, peers still holding the transaction re-offer it and it walks straight back
-in; this was measured on the live chain on 2026-08-30, a node proposing with
-`mempool 0` in the log line and still holding 21 of the same transactions 383
-slots later.
+~~`[UNRELEASED]`. On `canario/cache-recusa`…~~ **Retracted 2026-09-01.** The
+rejection cache is `[LIVE]` in the release. The correct description, including
+what it does to `-32008`, is now **§6.5**, and it is the first thing to re-read
+if you built a withdrawal retry loop against the previous revision.
 
-**The bar expires, and that is a design decision, not an oversight.** Refused
-bytes are not permanently invalid. A transfer refused because it was priced
-against a base fee that has since moved becomes valid again when the price
-comes back, and a permanent ban would turn a transient pricing error into a
-dead transaction — coins quietly unspendable through a node that will never
-reconsider. So: if your transaction is barred, you may retry after the TTL.
+The original measurement stands and is worth keeping: on 2026-08-30 a node on
+the live chain proposed with `mempool 0` in its log line and was still holding
+21 of the same transactions 383 slots later. That is the behaviour the bar
+exists to stop.
 
-Note this is a *different* instruction from `-32008 TX_REFUSED` (§3.9), which
-says never resubmit those bytes. Do not conflate them.
-
-Behaviour on that branch is pinned by
+The behaviour is pinned in the release by
 `a_refused_transaction_does_not_come_back_through_gossip` (which asserts the
-bar lifts at exactly `slot + REJECTION_TTL_SLOTS`) and
-`the_rejection_cache_is_bounded`. When it merges, this section moves to §6 and
-its pin moves into `integration_book_claims.rs` in the same commit.
+bar lifts at exactly `slot + REJECTION_TTL_SLOTS`),
+`the_rejection_cache_is_bounded`, and
+`the_bar_is_answered_before_capacity`, all in
+`crates/bloch-pos-node/src/engine.rs` at 7a83ca89.
+
+**Why this section existed at all is the lesson.** The cache reached the fleet
+tip and the release without reaching `main`. The audit read `main`, found
+nothing, and published "not in the released binary" — about the one file an
+integrator's retry loop depends on. Nothing about the code was subtle; the
+wrong tree was read.
 
 ---
 
 ## 11. Integration checklist
 
-- [ ] Call `getcapabilities` at connect time and branch on it, not on §3
+- [ ] ~~Call `getcapabilities` at connect time and branch on it, not on §3~~
+      **Do not.** There is no `getcapabilities` on the released binary; it
+      answers `-32601`. Build against the §3 tables and re-read them on each
+      release. Do not branch on `rpc_surface_version` either — no released or
+      deployed binary returns one (§0.3)
+- [ ] Build the **release tag** `g4-node-20260901` (7a83ca89), not `main` —
+      `main` is not the fleet lineage (§0.1.1)
+- [ ] If you will run your own node, **start its first sync before
+      2026-09-05 07:07:19 UTC** — after that it needs a signed checkpoint and
+      none exists (§7.0)
 - [ ] Parse all amounts as big integers from decimal strings
 - [ ] Derive `script_hash` per §4.2 — **48 hex characters follow the prefix**,
       take the first 40 — and verify it against the echo in the first response
 - [ ] Handle `-32007 SLOT_EMPTY` as normal, not as a fault
-- [ ] Handle `-32008 TX_REFUSED` as terminal and `-32003 MEMPOOL_FULL` as
-      retryable — never the reverse
+- [ ] Handle `-32003 MEMPOOL_FULL` as retryable. For `-32008 TX_REFUSED`,
+      **read the message**: *"retrying the same bytes will not help"* is
+      terminal, *"barred until slot N"* is retryable after slot N (the
+      rejection cache, ≈64 min — §6.5). If you cannot parse the message, treat
+      all `-32008` as terminal and rebuild; never retry `-32008` blindly
 - [ ] Do not read `result.txid` from `sendrawtransaction`; there is none
 - [ ] Poll `getbalance`; expand with `getutxos [script_hash, limit]` — no
       `offset`, default limit 100, max 1,000, no cursor
@@ -1049,22 +1287,39 @@ its pin moves into `integration_book_claims.rs` in the same commit.
 - [ ] Size transfers by **measuring** encoded bytes against 524,288 and gas
       against 60,000,000 — do not use a fixed input count
 - [ ] Run your own node in observer mode, supervised, `bloch-pos` binary
-- [ ] Delete `p2p_identity.bin` and `validator.key` from any copied data dir
+- [ ] Seed only from an **archival** node; copy `blocks.log`, `meta.bin` and
+      `ws_latest.bin` by name, and delete `p2p_identity.bin` and
+      `validator.key` from any copied data dir
+- [ ] Do not size replay or sync off the node's progress-line rate — it is a
+      decaying cumulative average, not a result (§7.4)
 - [ ] Check `state_root` agreement against **two** independent references
 
 ---
 
 ## 12. Reference
 
-- Claim-by-claim audit behind this revision —
-  [`INTEGRATION-BOOK-AUDIT-2026-08-31.md`](INTEGRATION-BOOK-AUDIT-2026-08-31.md)
+- Claim-by-claim audit behind the 2026-08-31 revision —
+  `INTEGRATION-BOOK-AUDIT-2026-08-31.md` **(not in the release tree — ask us
+  for the file)**
 - How a consensus-parameter change reaches you —
-  [`CONSENSUS-CHANGELOG-DISCIPLINE.md`](CONSENSUS-CHANGELOG-DISCIPLINE.md)
+  `CONSENSUS-CHANGELOG-DISCIPLINE.md` **(not in the release tree — ask us for
+  the file)**
+- Running your own node, measured end to end — `docs/THIRD-PARTY-QUICKSTART.md`,
+  which **is** in the release tree and is the authority for every figure in §7
 - Designed RPC surface, including methods scheduled but not shipped —
   [`../specs/BLOCH-RPC-V4.md`](../specs/BLOCH-RPC-V4.md)
 - Carryover ledger construction — [`../CARRYOVER.md`](../CARRYOVER.md)
 - Protocol specification — [`../SPEC.md`](../SPEC.md)
 
-Chain figures measured 2026-08-26 at height 15,146, epoch 1,101.
-Code claims verified against `main` @ `e4083f9` on 2026-08-31 and pinned by
-`crates/bloch-pos-committee/tests/integration_book_claims.rs`.
+Chain figures measured 2026-08-26 at height 15,146, epoch 1,101. Node figures
+(§7) measured 2026-09-01 at height ~33,600.
+
+Code claims re-verified 2026-09-01 against the **published release**,
+tag `g4-node-20260901` = **7a83ca89**, and cross-checked against the live
+fleet's tip **46133196**; the two do not differ on any behaviour described
+here. The 2026-08-31 revision's claims were verified against `main` @
+`e4083f9`, which is **not** in that lineage — see §0.1.1 for what that cost.
+
+The `book_…` pin names cited in this document live in
+`crates/bloch-pos-committee/tests/integration_book_claims.rs`, which is **not
+in the release tree**. They are provenance, not a CI guarantee.
