@@ -3478,11 +3478,30 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
         // to a third of the active stake and stop finality, a hundred and
         // eighty to two thirds and take the chain.
         //
-        // This is a node-side refusal, not a consensus rule: a block that
-        // already carries a deposit still applies it. It closes the path anyone
-        // can reach and buys time to close the real one — giving deposits and
-        // withdrawals eUTXO inputs and outputs, which is a wire-format change
-        // and needs a flag day.
+        // THIS IS NO LONGER THE ONLY THING STANDING HERE, and the sentence
+        // that used to be at this spot is the reason the gap was found: "this
+        // is a node-side refusal, not a consensus rule: a block that already
+        // carries a deposit still applies it." That was true and it was the
+        // whole defect. `admissible` has exactly one non-test caller — the
+        // mempool door below — so a single producer that patched it out lifted
+        // the rule for all sixty-four nodes, because every one of them judged
+        // the block with `bloch-pos-committee`, and that crate applied the
+        // deposit unconditionally.
+        //
+        // The rule now lives where it belongs:
+        // `params::DEPOSIT_ACTIVATION_EPOCH`, read at the transition by
+        // `apply_transaction` off the block's own committed epoch, refusing
+        // with `TxReject::StakingNotActive`. `Delegate` is gated by the same
+        // constant, because it reaches `effective_stake` a full activation
+        // delay sooner.
+        //
+        // What is left here is what it should always have been: an early,
+        // cheap rejection that keeps a transaction consensus will never apply
+        // out of the mempool and off the wire. It is not load-bearing. The
+        // real closure — giving deposits and withdrawals eUTXO inputs and
+        // outputs, authenticated — is still a wire-format change and still
+        // needs a tag and a flag day of its own; see the constant's docs for
+        // why arming `DEPOSIT_ACTIVATION_EPOCH` is NOT that change.
         PosTransaction::Deposit { .. } => Err(
             "deposits are not accepted: bonding is not yet funded from the UTXO set, \
              so a deposit would create stake without spending coins",
