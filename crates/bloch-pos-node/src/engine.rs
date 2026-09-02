@@ -3881,6 +3881,193 @@ mod forkchoice_tests {
             );
         }
     }
+
+    /// FIRST-HAND wall-clock cost of the fork-choice fold at REAL MAP SCALE.
+    ///
+    /// The number in circulation — "0.0–0.2 ms/block up to depth 192" — was
+    /// taken at a tree of a few hundred blocks. `Engine::blocks` is never
+    /// pruned and holds every structurally-valid block the node has ever seen
+    /// (34,377 finalized at the height this was written), and BOTH surviving
+    /// O(N) terms walk that whole map on every call: `forkchoice_store`
+    /// rebuilds the parent map, the sibling lists and the entire message set,
+    /// and `Store::subtree_weights` then folds over it. Depth is not the
+    /// parameter that grew; N is.
+    ///
+    ///   BLOCH_FOLD_CELLS=5000,12200,34377 BLOCH_FOLD_REPS=7 \
+    ///   cargo test --release -p bloch-pos-node -- --ignored --nocapture \
+    ///       perf_fold_at_real_map_scale
+    ///
+    /// `BLOCH_FOLD_MODE=violate-n` swaps the fold for a deliberately quadratic
+    /// one over the SAME inputs. A harness that reports the same shape for
+    /// both is not measuring shape, so that arm is the control.
+    #[test]
+    #[ignore]
+    fn perf_fold_at_real_map_scale() {
+        use std::time::Instant;
+
+        fn ev(k: &str, d: &str) -> String {
+            std::env::var(k).unwrap_or_else(|_| d.to_string())
+        }
+
+        let cells: Vec<usize> = ev("BLOCH_FOLD_CELLS", "5000,12200,34377")
+            .split(',')
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().parse().expect("cell"))
+            .collect();
+        let reps: usize = ev("BLOCH_FOLD_REPS", "7").parse().expect("reps");
+        // Attestations per block x1000. Default is the MEASURED fleet mean,
+        // not the 2/slot committee ceiling.
+        let att_milli: u64 = ev("BLOCH_FOLD_ATT_MILLI", "1687").parse().expect("att");
+        let mode = ev("BLOCH_FOLD_MODE", "real");
+        // Distance from the justified root the descent starts at, in blocks.
+        // Production sits ~2 epochs behind: finalized 34,367 of head 34,452.
+        let just_back: usize = ev("BLOCH_FOLD_JUST_BACK", "64").parse().expect("back");
+
+        let g = [0x99u8; 32];
+        let n_validators = 64u32;
+        let validators = vals(n_validators);
+
+        /// Deliberately O(N^2) over the same parent map: the pre-rewrite
+        /// pattern of walking every block's whole ancestor chain instead of
+        /// accumulating bottom-up in one pass.
+        fn quadratic_fold(tree: &BlockTree<'_>, justified: [u8; 32]) -> [u8; 32] {
+            let mut acc = 0u64;
+            let cap = tree.parents.len() + 1;
+            for id in tree.parents.keys() {
+                let mut cur = *id;
+                let mut steps = 0usize;
+                while let Some(p) = tree.parents.get(&cur) {
+                    acc = acc.wrapping_add(cur[0] as u64);
+                    cur = *p;
+                    steps += 1;
+                    if steps > cap {
+                        break;
+                    }
+                }
+            }
+            std::hint::black_box(acc);
+            justified
+        }
+
+        fn stats(v: &mut Vec<f64>) -> (f64, f64, f64, f64, f64) {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let n = v.len() as f64;
+            let mean = v.iter().sum::<f64>() / n;
+            let med = v[v.len() / 2];
+            let sd = (v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n).sqrt();
+            let cv = if mean > 0.0 { 100.0 * sd / mean } else { 0.0 };
+            (v[0], med, mean, v[v.len() - 1], cv)
+        }
+
+        println!(
+            "\n== fold at real map scale ==  mode={mode} reps={reps} \
+             att/block={:.4} validators={n_validators} just_back={just_back}",
+            att_milli as f64 / 1000.0
+        );
+        println!(
+            "{:>8} {:>8} {:>8}  {:>9} {:>9} {:>9}  {:>7}  {:>9} {:>9}",
+            "N", "atts", "depth", "build_ms", "head_ms", "call_ms", "cv%", "block_ms", "vs_prev"
+        );
+
+        let mut prev: Option<(f64, f64)> = None; // (N, call_ms median)
+        for &n in &cells {
+            // A canonical spine with a losing fork every 500 blocks — real
+            // chains fork occasionally and the map keeps every loser forever,
+            // which is the whole reason it grows.
+            let orphan_every = 500usize;
+            let total_atts = (n as u64 * att_milli) / 1000;
+            let mut blocks: BTreeMap<[u8; 32], BlockEnvelope> = BTreeMap::new();
+            let mut spine: Vec<[u8; 32]> = Vec::new();
+            let mut parent = g;
+            let mut made = 0usize;
+            let mut slot = 0u64;
+            let mut atts_made = 0u64;
+            while made < n {
+                slot += 1;
+                // Spread the budget so the MEAN is att_milli/1000 and the
+                // per-block counts are the two integers either side of it —
+                // which is what the real distribution looks like.
+                let want = ((made as u64 + 1) * total_atts) / (n as u64) - atts_made;
+                let mut atts = Vec::with_capacity(want as usize);
+                for k in 0..want {
+                    let v = ((atts_made + k) % n_validators as u64) as u32;
+                    let back = ((atts_made + k) % 8) as usize;
+                    let head = if spine.len() > back {
+                        spine[spine.len() - 1 - back]
+                    } else {
+                        g
+                    };
+                    atts.push(attest(v, slot, head));
+                }
+                atts_made += want;
+                let (blk, ids) = chain_of(vec![(parent, slot, 0u8, atts)]);
+                blocks.extend(blk);
+                spine.push(ids[0]);
+                parent = ids[0];
+                made += 1;
+                if made < n && made % orphan_every == 0 && spine.len() >= 2 {
+                    let gp = spine[spine.len() - 2];
+                    let (o, _) = chain_of(vec![(gp, slot, 7u8, Vec::new())]);
+                    blocks.extend(o);
+                    made += 1;
+                }
+            }
+            let n_real = blocks.len();
+            let justified = spine[spine.len().saturating_sub(just_back + 1)];
+            // The loose pool: what has arrived on the wire this slot and is
+            // not in a block yet.
+            let pool: Vec<Attestation> = (0..2u32)
+                .map(|v| attest(v, slot + 1, *spine.last().unwrap()))
+                .collect();
+
+            let mut b_ms: Vec<f64> = Vec::new();
+            let mut h_ms: Vec<f64> = Vec::new();
+            let mut t_ms: Vec<f64> = Vec::new();
+            for _ in 0..reps {
+                let t0 = Instant::now();
+                let (fc, parents, children) = forkchoice_store(&blocks, pool.iter(), &validators);
+                let b = t0.elapsed().as_secs_f64() * 1000.0;
+                let tree = BlockTree { parents: &parents };
+                let t1 = Instant::now();
+                let head = if mode == "violate-n" {
+                    quadratic_fold(&tree, justified)
+                } else {
+                    fc.head(&tree, justified, &children)
+                };
+                let h = t1.elapsed().as_secs_f64() * 1000.0;
+                std::hint::black_box(head);
+                b_ms.push(b);
+                h_ms.push(h);
+                t_ms.push(b + h);
+            }
+            let (_, bmed, _, _, _) = stats(&mut b_ms);
+            let (_, hmed, _, _, _) = stats(&mut h_ms);
+            let (tmin, tmed, _tmean, tmax, tcv) = stats(&mut t_ms);
+            let vs = match prev {
+                None => "  --".to_string(),
+                Some((pn, pt)) => format!(
+                    "{:.2}x/{:.2}x",
+                    tmed / pt.max(1e-12),
+                    n_real as f64 / pn
+                ),
+            };
+            println!(
+                "{n_real:>8} {atts_made:>8} {just_back:>8}  {bmed:>9.3} {hmed:>9.3} \
+                 {tmed:>9.3}  {tcv:>7.3}  {:>9.3} {vs:>9}",
+                tmed * 2.0
+            );
+            println!(
+                "{:>8} {:>8} {:>8}   min {tmin:.3}  max {tmax:.3}  spread {:.3}%",
+                "", "", "",
+                100.0 * (tmax - tmin) / tmed.max(1e-12)
+            );
+            prev = Some((n_real as f64, tmed));
+        }
+        println!(
+            "  (call_ms = one lmd_ghost_head; block_ms = call_ms x2, the two \
+             calls advance() makes per block)"
+        );
+    }
 }
 
 #[cfg(test)]
