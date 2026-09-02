@@ -90,10 +90,30 @@ read one.
 
 **Bind it to `127.0.0.1` and leave it there.** If other hosts in your
 infrastructure need it, put it behind your own authenticating reverse proxy on
-a private network. Our own fleet's RPC is loopback-only for exactly this
-reason — verified on both bootnodes on 2026-09-01. `--rpc-bind 0.0.0.0` on a
-public host is the single most damaging mistake you can make with this
-software.
+a private network. `--rpc-bind 0.0.0.0` on a public host is the single most
+damaging mistake you can make with this software.
+
+> **Correction, 2026-09-02.** This paragraph said "our own fleet's RPC is
+> loopback-only for exactly this reason — verified on both bootnodes on
+> 2026-09-01". **That is false, and it was false when it was published.**
+> Re-measured from a machine outside our infrastructure: both published
+> bootnodes answer JSON-RPC on `:8080` from the open internet, and
+> `sendrawtransaction` is reachable there — an invalid payload returns
+> `-32002 "unknown transaction tag 0xff"`, which is a *decode* error, so the
+> method dispatched. Not "method not found", not "unauthorized".
+>
+> We are correcting this rather than quietly closing the port, because you may
+> have read the original sentence and taken our practice as the standard to
+> copy. **Do not copy it. Follow the advice above, which is unchanged and
+> correct.**
+>
+> Those two hosts are keyless archival observers — no `validator.key`, zero
+> blocks proposed — so the exposure is availability, not chain safety: they
+> cannot propose, sign or manufacture a branch. But RPC work shares the
+> consensus thread, and two modest concurrent read loops have already made one
+> of them stop answering for over a minute. Whether those ports stay open is
+> an operational decision that has not been taken; this note records the state
+> as measured, not as intended.
 
 It is also a denial-of-service surface, because RPC work competes with the
 consensus thread. Measured against a live archival node on 2026-09-01,
