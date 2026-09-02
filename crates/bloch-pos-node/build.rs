@@ -158,17 +158,19 @@ fn hex(b: &[u8]) -> String {
 fn main() {
     let pkg = env!("CARGO_PKG_VERSION");
 
-    let git = |args: &[&str]| -> Option<String> {
+    // Ran and exited 0, whatever it printed. `None` means "git could not
+    // answer" and NOTHING else.
+    let git_raw = |args: &[&str]| -> Option<String> {
         let out = Command::new("git").args(args).output().ok()?;
         if !out.status.success() {
             return None;
         }
-        let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
-        if s.is_empty() {
-            None
-        } else {
-            Some(s)
-        }
+        Some(String::from_utf8(out.stdout).ok()?.trim().to_string())
+    };
+    // The same, but with an empty answer folded into "could not answer" —
+    // correct for `rev-parse`, where a blank line is not a commit id.
+    let git = |args: &[&str]| -> Option<String> {
+        git_raw(args).filter(|s| !s.is_empty())
     };
 
     let commit = std::env::var("BLOCH_BUILD_COMMIT")
@@ -183,7 +185,14 @@ fn main() {
         // Caller-supplied commit: it asserted the tree state, do not second-guess.
         ""
     } else {
-        match git(&["status", "--porcelain"]) {
+        // MUST be git_raw, not git. `git status --porcelain` prints NOTHING
+        // on a clean tree and exits 0, so the empty-is-None helper collapsed
+        // "clean" onto "no repository" and every clean build stamped itself
+        // `+nogit`. That is not a cosmetic slip: it made `clean` unreachable,
+        // so the one field meant to say the tree was intact could only ever
+        // say it did not know. Measured on this tag before the fix — a clean
+        // build at 2ae0e7f1 reported `+nogit`.
+        match git_raw(&["status", "--porcelain"]) {
             Some(s) if !s.is_empty() => "+dirty",
             Some(_) => "",
             None => "+nogit",
