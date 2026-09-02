@@ -51,6 +51,7 @@ mod p2p;
 mod rpc;
 mod store;
 mod ws_boot;
+mod ws_tool;
 
 use std::path::PathBuf;
 use std::process::exit;
@@ -102,6 +103,10 @@ fn main() {
         Some("genesis-mainnet") => genesis_mainnet(&args[1..]),
         Some("submit-tx") => submit_tx(&args[1..]),
         Some("run") => run_cmd(&args[1..]),
+        Some(
+            cmd @ ("ws-keygen" | "ws-signer-set" | "ws-checkpoint" | "ws-sign" | "ws-envelope"
+            | "ws-verify"),
+        ) => ws_tool::run(cmd, &args[1..]),
         Some(other) => {
             eprintln!("{NAME}: unknown command `{other}` (see --help)");
             exit(2);
@@ -136,6 +141,53 @@ fn print_help() {
                SAME flags plus --signature. This tool never holds a\n\
                spending key. No acknowledgement: confirmation is seeing\n\
                it in a block.\n\
+           bloch-pos ws-checkpoint --genesis <manifest> --rpc <a>[,<b>...]\n\
+                                   --epoch <E> --signer-set-id <n>\n\
+                                   --out <prefix>\n\
+               Derive the weak-subjectivity checkpoint for a FINALIZED\n\
+               epoch from running nodes (all --rpc endpoints must agree),\n\
+               writing <prefix>.bin (154 canonical bytes) + <prefix>.json\n\
+               and printing the ws digest the signers sign.\n\
+           bloch-pos ws-keygen --out <prefix>\n\
+           bloch-pos ws-signer-set --id <n> --threshold <m>\n\
+                                   --min-external <k> --adopted-epoch <e>\n\
+                                   --current-epoch <e>\n\
+                                   --signer <pk>:<internal|external> ...\n\
+                                   --out <set.bin>\n\
+               --adopted-epoch may not be in the future: it is what the\n\
+               section 6.3 review and hard-stop epochs are derived from, so\n\
+               a large value pushes the dead-man switch past every epoch\n\
+               the chain will reach. --current-epoch is what it is checked\n\
+               against. The arrangement file is PUBLIC and carries the\n\
+               quorum rule itself — publish it, and its fingerprint, with\n\
+               every envelope.\n\
+           bloch-pos ws-sign --key <sk> --checkpoint <cp.bin>\n\
+                             --signer-index <i> [--pubkey <pk>]\n\
+                             --out <partialfile>\n\
+               Writes a PARTIAL: the signature plus the ws digest it was\n\
+               made over and the slot it was made for. The digest is what\n\
+               lets a coordinator tell a signature over ANOTHER checkpoint\n\
+               from a corrupt file, and name the signer to call.\n\
+           bloch-pos ws-envelope --checkpoint <cp.bin>\n\
+                                 --signer-set <set.bin>\n\
+                                 --sig <index>:<partialfile> ...\n\
+                                 [--genesis <manifest>] --out <env.bin>\n\
+           bloch-pos ws-verify --envelope <env.bin> --signer-set <set.bin>\n\
+                               --genesis <manifest> [--rpc <a>] [--now-epoch <n>]\n\
+           bloch-pos ws-verify --checkpoint <cp.bin>\n\
+           bloch-pos ws-verify --partial <partialfile>\n\
+               The two read-only forms need no arrangement and no manifest:\n\
+               the first prints the 154 bytes and the digest they hash to\n\
+               (what a signer runs BEFORE signing), the second prints which\n\
+               digest a partial was actually made over.\n\
+               The rest of the signing ceremony (BLOCH-WEAK-SUBJECTIVITY.md\n\
+               section 6): per-signer keypairs, the signer-arrangement file\n\
+               that --ws-signer-set consumes, offline signing of the ws\n\
+               digest, envelope assembly, and verification exactly as a\n\
+               booting node performs it. ws-envelope runs ws::verify_envelope\n\
+               on its own output and REFUSES to write an envelope a node\n\
+               would reject, which is why --signer-set is required there.\n\
+               Runbook: docs/CHECKPOINT-RUNBOOK.md.\n\
            bloch-pos genesis --keys <dir1,dir2,...> --out <file>\n\
                              [--slot-ms <ms>] [--start-in <secs>]\n\
                Build a devnet genesis manifest from the keystores' public\n\
