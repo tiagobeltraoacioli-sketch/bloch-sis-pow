@@ -18,13 +18,52 @@
 //!    guard moves to whatever the merge decided. A test cannot police a file
 //!    it rides inside.
 //!
-//! This file fixes (2) by construction: **no branch in this repository has a
-//! file at this path** (re-verified 2026-09-02 across 528 ref and worktree
-//! tips). A merge of any rival therefore lands that branch's `transition.rs`
-//! and leaves this table untouched — the code changes, the frozen table does
-//! not, and the assertions below go red naming both claimants. That is the
-//! whole mechanism. It bites at MERGE time, which is the moment that matters,
-//! not on the branch where each tree looks fine.
+//! This file addresses (2) by sitting outside the file it guards. A merge that
+//! brings a rival `transition.rs` lands that branch's code and leaves this
+//! table untouched — the code changes, the frozen table does not, and the
+//! assertions below go red naming both claimants. That is the whole mechanism.
+//! It bites at MERGE time, which is the moment that matters, not on the branch
+//! where each tree looks fine.
+//!
+//! ## The limit of that mechanism, stated because an earlier draft denied it
+//!
+//! Until 2026-09-02 these lines claimed the mechanism was airtight because
+//! **"no branch in this repository has a file at this path (re-verified across
+//! 528 ref and worktree tips)."** That was false when it was written, and the
+//! branch that falsifies it is the same `70991742` this file cites nine lines
+//! below as the executed hazard.
+//!
+//! Measured 2026-09-02 over all 1,320 ref tips, the following carry a file at
+//! `crates/bloch-pos-committee/tests/wire_tag_registry.rs`:
+//!
+//! * `demo/final-writeoff-ruled` (`70991742`) — local, **and pushed to both
+//!   `origin` and `github`**. A 507-line rival of this 966-line file. Its table
+//!   records `0x07 = DepositFunded` and `0x08 = ExitV2`; its own
+//!   `transition.rs` decoder produces `FundedDeposit` (`:1158`) and
+//!   `SignedExit` (`:1189`). Two bytes, table against code, on one tree. The
+//!   branch is 17 ahead / 87 behind tag `g4-node-20260901` and its copy of this
+//!   test is red on its own tree.
+//! * `guard/wire-tag-registry` (`61e9342d`) — local + both remotes; this
+//!   file's own pre-release sibling, not a rival.
+//!
+//! So the honest statement of the guarantee is narrower, and it is a
+//! guarantee about *code*, not about *this file*:
+//!
+//! > A merge that brings a rival `transition.rs` **and no rival copy of this
+//! > path** trips these assertions. A merge that brings BOTH replaces the
+//! > guard with the rival's own guard, and nothing here fires.
+//!
+//! A plain `git merge` of `demo/final-writeoff-ruled` conflicts loudly on this
+//! path, so the default is safe. What is NOT safe is `-X theirs`, or any
+//! scripted resolution that prefers the incoming side: it silently substitutes
+//! the rival table and the substitution appears in no test output. The file
+//! this mechanism cannot police is itself, and one branch already holds the
+//! copy that would replace it.
+//!
+//! The durable fix is not in this file. It is to remove the rival copy from
+//! `demo/final-writeoff-ruled` on both remotes, which needs the founder's
+//! word because it rewrites a published branch. Until that happens this
+//! paragraph is the guard, and it only guards a reader.
 //!
 //! ## The hazard, executed and dated
 //!
