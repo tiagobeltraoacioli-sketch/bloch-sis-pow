@@ -11,6 +11,7 @@ resolver = "2"
 # live on 2026-08-13 and Genesis-3 stopped at height 39,918; the layout now
 # says so. The PoW node is a normal member at legacy/genesis3-node.
 members = [
+    "tools/validator-onboard",
     # ── Genesis-4, proof of stake. THE LIVE CHAIN. ──
     "crates/bloch-pos-committee",  # frozen consensus math (pure, sha3-only)
     "crates/bloch-pos-node",       # the `bloch-pos` binary the fleet runs

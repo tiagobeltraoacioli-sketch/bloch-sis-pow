@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[package]
+name = "bloch-validator-onboard"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = """
+The newcomer's deposit-construction path, built to compile against the
+RELEASE LINEAGE as shipped (tag g4-node-20260901) and nothing else.
+
+This is deliberately NOT a second staking-cli. `tools/staking-cli` already
+implements the funded, authenticated lifecycle (DepositV2, signed exit,
+withdrawal crank) and is the tool that should survive; it does not compile
+against the released consensus crate because seven symbols it imports do not
+exist there. This crate fills the gap that leaves: it constructs the deposit
+the SHIPPED chain can actually accept (`PosTransaction::Deposit`, wire tag
+0x02), derives the identity and address material a stranger otherwise has to
+re-implement (and re-implements wrongly), and states in its output exactly
+what that deposit is not.
+
+Every consensus quantity is imported from bloch-pos-committee and
+bloch-crypto. Nothing here re-derives a hash, a checksum or a canonical
+encoding.
+"""
+
+[[bin]]
+name = "bloch-onboard"
+path = "src/main.rs"
+
+[dependencies]
+bloch-pos-committee = { path = "../../crates/bloch-pos-committee" }
+bloch-crypto = { path = "../../crates/bloch-crypto" }
+sha3 = { version = "0.10", default-features = false }
+hex = "0.4"
