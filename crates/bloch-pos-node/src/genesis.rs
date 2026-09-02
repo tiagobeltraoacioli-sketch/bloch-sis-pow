@@ -1139,8 +1139,29 @@ mod tests {
     #[test]
     fn vesting_is_not_enforced() {
         let mut src = Vec::new();
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../bloch-pos-committee/src");
+        // Resolved by WALKING UP to the workspace root, not by a fixed
+        // `../` hop off CARGO_MANIFEST_DIR.
+        //
+        // This file is `#[path]`-included by `tools/bloch-indexer` as well as
+        // compiled in its own crate, and CARGO_MANIFEST_DIR is a different
+        // directory in each. The fixed hop resolved to
+        // `tools/bloch-pos-committee/src` there and the test died on read_dir
+        // — a false red about a real guarantee. The fact under test is a
+        // WORKSPACE fact, so it must be located from the workspace root
+        // whatever crate is compiling it.
+        let root = {
+            let mut dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+            loop {
+                let cand = dir.join("crates/bloch-pos-committee/src");
+                if cand.is_dir() {
+                    break cand;
+                }
+                dir = dir.parent().expect(
+                    "walked past the filesystem root without finding \
+                     crates/bloch-pos-committee/src — has the crate moved?",
+                );
+            }
+        };
         let mut stack = vec![root.clone()];
         while let Some(d) = stack.pop() {
             for e in std::fs::read_dir(&d).expect("bloch-pos-committee/src is readable") {
