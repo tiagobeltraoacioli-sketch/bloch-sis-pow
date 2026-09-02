@@ -136,7 +136,10 @@ consensus build can serve reads that disagree with the network.
 **Build the tag, not `main`.** This matters more than it looks:
 
 ```bash
-git clone https://gitlab.com/blochsispow-group/bloch-pos.git
+# The GitLab origin currently requires credentials — measured 2026-09-02,
+# `GET .../info/refs?service=git-upload-pack` returns 401 unauthenticated.
+# The GitHub mirror is public and carries the same tag at the same commit.
+git clone https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow.git bloch-pos
 cd bloch-pos
 git checkout g4-node-20260901          # published 2026-09-02
 git describe --tags --exact-match      # must print g4-node-20260901
