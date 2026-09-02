@@ -520,7 +520,7 @@ byte surgery, outside the toolchain*, so the drill tests the verifier and not
 the tool's willingness to refuse itself. 40 checks; every one must pass. It
 reads two archival RPCs and writes nothing outside its workdir.
 
-**Unit:** `cargo test -p bloch-pos-node --bin bloch-pos ws_` — 37 tests
+**Unit:** `cargo test -p bloch-pos-node --bin bloch-pos ws_` — 38 tests
 covering the combination rules, the arrangement-clock bound, the duplicate-key
 arrangement, and the re-mint conflict above. The whole node binary is 161
 passed / 11 ignored.
@@ -558,6 +558,7 @@ was restored.
 | `combine`: the external minimum | `combine_refuses_a_quorum_that_violates_the_policy`, `combine_agrees_with_verify_envelope` |
 | `combine`: the deterministic ordering | `combination_is_order_independent` |
 | `arrangement_window`: the lower bound | `the_arrangement_window_bounds_every_adopted_epoch` |
+| `boot`: the call to `arrangement_window` | `boot_refuses_an_arrangement_adopted_after_the_checkpoint` |
 | `decode_signer_set_file`: the saturating-clock refusal | `the_decoder_refuses_an_overflowing_arrangement_clock` |
 | `decode_signer_set_file`: the duplicate-key refusal | `one_key_in_two_slots_is_a_forgeable_quorum_and_the_decoder_refuses_it` |
 
