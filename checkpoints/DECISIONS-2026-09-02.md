@@ -180,6 +180,32 @@ bound an old envelope's usefulness — not the review clock.
 
 ---
 
+## 3b. The second out-of-band artifact nobody has named yet
+
+The spec (§6.3) says the arrangement is *"hard-coded in the client alongside
+the signer pubkeys"*. It is not, in any binary that exists today.
+`ws_boot::boot` says so out loud: *"this devnet build bakes no Phase A keys,
+so pass `--ws-signer-set <file>`"*. So a consumer needs **two** files, and
+only one of them has a published 64-hex digest.
+
+That means `signer-set-1.bin` is itself an unauthenticated download: an
+attacker who can substitute it can substitute the keys, and then any envelope
+they sign verifies. The checkpoint digest does not protect it — nothing in the
+checkpoint commits to the arrangement beyond its integer id.
+
+Two ways to close it, and the announcement needs one of them:
+
+1. **Cheap, available today:** publish `sha3-256(signer-set-1.bin)` on the
+   same two independent channels as the ws digest, and put both hashes in the
+   same announcement. Sixty-four more hex characters.
+2. **Correct, needs a release:** bake the arrangement into the client, as §6.3
+   already says it should be, and demote the file to a test fixture.
+
+Do (1) now; schedule (2). Publishing the envelope with an unauthenticated
+signer set would leave the whole ceremony resting on a file transfer.
+
+---
+
 ## 4. Degraded variants, priced without discount
 
 If the auditor cannot sign in time, these are the options and there are no
@@ -228,6 +254,7 @@ promised.
 | 5 | If the auditor cannot sign by 2026-09-04: variant (1) or (3), never (2) | Founder | **2026-09-04 18:00 UTC** |
 | 6 | Land `converge/ws-tool` (tool + runbook) and the `ws-publisher` worktree on `main` | PMO | before the ceremony, so what is rehearsed is what ships |
 | 7 | Rewrite `BLOCH-GENESIS4-EXCHANGE-INTEGRATION.md` §7 — "syncing from genesis is also supported" expires at epoch 2016 | PMO | 2026-09-05 |
+| 8 | Publish a digest for `signer-set-1.bin` too (§3b), and schedule baking the arrangement into the client | Coordinator / PMO | with the announcement |
 
 ---
 
