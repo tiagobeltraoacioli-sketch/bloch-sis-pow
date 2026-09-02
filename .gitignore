@@ -59,3 +59,10 @@ __pycache__/
 # duas outras — apagar a branch de origem nao as remove. Aquelas duas so podem
 # ser cherry-picked, nunca mescladas.
 bench/
+
+# Binario compilado que um `git add -A` cego capturou (665c2b95): 7,1 MB de ELF
+# Linux na raiz do repositorio. Nao contem chave — os `BPOSKEY1` nele sao o
+# prefixo do formato compilado de dentro de `keys.rs` —, mas artefato de build
+# nao entra no repositorio, e um binario commitado num repo de consenso e o
+# formato de problema que um auditor tem razao em levar a serio.
+/bloch-pos-flagday
