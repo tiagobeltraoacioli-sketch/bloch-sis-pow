@@ -225,12 +225,21 @@ the §11 checklist, told you to call `getcapabilities` at connect time. **That
 instruction fails on every node you can reach today.** We measured it rather
 than assuming it:
 
-| Endpoint | `getcapabilities` |
-|---|---|
-| archival `139.180.166.5:8080` | `-32601 method not found` |
-| archival `139.180.173.231:8080` | `-32601 method not found` |
-| all nine RPC upstreams behind our public edge | `-32601 method not found` |
-| published binary `g4-node-20260901` (`7a83ca89`) | the method is not in its source at all |
+Measured **2026-09-02T04:13:56Z**, both archivals then on the same head
+(height 34,628, epoch 1,735, block id `4b0949e8624ff38b…`):
+
+| Endpoint | `getcapabilities` | `getbuildinfo` | `getversion` |
+|---|---|---|---|
+| archival `139.180.166.5:8080` | `-32601` | `-32601` | `-32601` |
+| archival `139.180.173.231:8080` | `-32601` | `-32601` | `-32601` |
+| all nine RPC upstreams behind our public edge | `-32601` | `-32601` | `-32601` |
+| published binary `g4-node-20260901` (`7a83ca89`) | absent from its source | absent | absent |
+
+Read that table beside the head they agreed on. The two archivals returned the
+identical height, epoch and block id — flawless agreement on chain state — and
+there is no query in the surface that would tell you whether that agreement is
+two independent opinions or one opinion served twice. That is the gap, stated
+as compactly as it can be.
 
 The method is real, implemented and tested — on an **unreleased branch**. It is
 not in the tag you downloaded. The document described the repository and called
