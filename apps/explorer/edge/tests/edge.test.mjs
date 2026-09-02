@@ -633,9 +633,10 @@ test('getcapabilities is answered by the edge because no live node has it', asyn
   reset();
   const now = clock();
   // Measured 2026-09-01: all nine deployed upstreams answer -32601 to this
-  // name, which is frozen into the node's RPC_SURFACE at surface version 4.1.0
-  // and exists in no running binary. Forwarding it would return
-  // method-not-found for a method this edge does implement.
+  // name. It is in the node's RPC_SURFACE (now surface version 4.2.0) on an
+  // unreleased branch and in no running binary — nor in the published
+  // g4-node-20260901 tag, which is why that -32601 dates nothing. Forwarding it
+  // would return method-not-found for a method this edge does implement.
   const map = {};
   for (const u of [...ARCHIVALS, ...FLEET]) {
     map[u] = (m) =>

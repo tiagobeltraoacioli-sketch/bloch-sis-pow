@@ -1625,19 +1625,43 @@ pub fn capabilities_json(
 /// string, a `const` table of five entries, one O(1) index into the canonical
 /// chain, and hashes roughly 200 bytes.
 ///
-/// Measured (2026-09-01, debug profile, 2,000 calls): **65.7 µs/call**, against
-/// **19.7 µs/call** for `getblockcount`, which is the cheapest formatter on this
-/// surface. Same order of magnitude, and both are noise beside the read that
-/// actually threatens this port: `getbalance` is a linear pass over the whole
-/// committed output set — 452,726 entries on the live chain — and a sibling
-/// measured a 500-record validator page at 17.1 ms, then capped it at 50 for
-/// exactly this reason. `getbuildinfo` is roughly three orders of magnitude
-/// below that, and it does not move with the chain at all: the gate table is
-/// five entries whatever the height.
+/// ## Measured
 ///
-/// `getbuildinfo_is_constant_cost` in `rpc/tests.rs` pins the ratio against
+/// **Provenance, because a cost number without one has already misled a whole
+/// programme here.** Every figure below is from branch `rpc/build-identity`
+/// @ `a8a0912e` — base `16d36638` on `validator-ops`, merged with
+/// `gates/selfcheck-json` @ `b4448362`. **This is not the release tag** and not
+/// `main`: `g4-node-20260901` (`7a83ca89`), the fleet binary (`46133196`) and
+/// `main` contain neither `RPC_SURFACE` nor this method, so none of these
+/// numbers describes a binary anyone is running today. Profile `--release`,
+/// rustc 1.94.0, on an **idle 2-core box** (`136.244.95.190`, load average
+/// 0.00 at launch), 2026-09-01. Fixture at live carryover scale: 452,726 eUTXO
+/// entries.
+///
+/// | method | release, idle 2-core | what it does |
+/// |---|---|---|
+/// | `getblockcount` | **1.37 µs** | the cheapest formatter on this surface |
+/// | `getbuildinfo` | **4.71 µs** | this method |
+/// | `gettxout` | 88.7 µs | one map lookup |
+/// | `getcapabilities` | 386.9 µs | constants only, but a much larger document |
+/// | `getutxos` limit=1000 | 7.46 ms | walks the committed set |
+/// | `getbalance` | 4.85 ms | one fold over all 452,726 outputs |
+///
+/// So `getbuildinfo` is **3.4x** the cheapest method on the surface, **82x
+/// cheaper than the `getcapabilities` call it sits beside**, and about **1,030x
+/// cheaper than `getbalance`** — the read that actually threatens this port. A
+/// sibling measured a 500-record validator page at 17.1 ms and shipped a cap of
+/// 50 for exactly this reason; nothing here needs a cap, because nothing here
+/// grows: the gate table is five entries whatever the height.
+///
+/// Do not compare these against a number measured on the Mac. The same test on
+/// the shared laptop, **debug** profile and under contention, read 65.7 µs
+/// against 19.7 µs — a 14x shift in the absolute figures and the same 3.4x
+/// ratio. The ratio is the portable part, which is why the test asserts on it.
+///
+/// `getbuildinfo_is_constant_cost` in `rpc/tests.rs` pins that ratio against
 /// `getblockcount` rather than against a wall-clock constant, so it means the
-/// same thing on a loaded CI box and on a fast laptop. The bar is 8x — loose on
+/// same thing on a loaded CI box and on an idle one. The bar is 8x — loose on
 /// purpose. It is there to fail when somebody makes this method read state, not
 /// to police microseconds.
 ///

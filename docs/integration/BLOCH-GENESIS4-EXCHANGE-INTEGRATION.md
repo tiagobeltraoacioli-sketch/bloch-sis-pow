@@ -265,8 +265,9 @@ statement about any node. Do not read it as one.
 
 ### 3.1.1 `getbuildinfo` — which binary, and which consensus lineage — `[UNRELEASED]`
 
-Also on the unreleased branch, and named here because it is the answer to a
-question this document could not previously answer at all: **which binary is
+Branch `rpc/build-identity` @ `a8a0912e`, unmerged — named per §0.2, because
+`[UNRELEASED]` without a branch is the defect §0.1 records. It is the answer to
+a question this document could not previously answer at all: **which binary is
 the node I am talking to running?**
 
 Until it lands, there is no way to tell. No deployed node exposes any version
@@ -321,6 +322,18 @@ means, because the useful half and the dangerous half are the same field:
 `scope` says `node-local`: the answer describes the one node that replied. If
 you put a load balancer in front of several nodes, this answer is meaningless —
 ask each node on its own address.
+
+**It is cheap enough to poll.** Measured on branch `rpc/build-identity`
+@ `a8a0912e`, `--release`, on an idle 2-core box, against a fixture at live
+carryover scale (452,726 outputs): **4.7 µs** per call, against 1.4 µs for
+`getblockcount` and 4.85 **ms** for `getbalance`. It reads no chain state and
+does not grow with the height, so polling it per connection — or per credit
+decision — costs the node nothing measurable. That matters more here than
+elsewhere: this port has no authentication and no rate limit, and every method
+is served by the consensus thread, so we will not add a method to it that a
+caller could turn into a lever. Do **not** infer from these numbers what
+`getbalance` costs you at your own scale; §3.3 has that, and it is three orders
+of magnitude away.
 
 ### 3.2 `getchaininfo` — chain head and settlement state
 

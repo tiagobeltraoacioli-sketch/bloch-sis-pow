@@ -32,11 +32,26 @@
 // # Two archivals agreeing is not corroboration
 //
 // They are the same population: same role, same operator, same provisioning,
-// and — measured 2026-09-01 — the same binary generation, which is OLDER than
-// the repo's (all nine deployed upstreams answer -32601 to `getcapabilities`,
-// a method frozen into RPC_SURFACE at surface version 4.1.0). Two nodes built
-// from one stale artefact fail identically. So `quorum` from the archivals is
-// necessary and not sufficient, and `lineage.js` supplies the rest.
+// same deployment. Two nodes built from one artefact fail identically, so
+// `quorum` from the archivals is necessary and not sufficient, and `lineage.js`
+// supplies the rest.
+//
+// CORRECTION 2026-09-01. This comment used to add "and — measured — the same
+// binary generation, which is OLDER than the repo's", citing the fact that all
+// nine deployed upstreams answer -32601 to `getcapabilities`. **That inference
+// was wrong and the citation does not support it.** `getcapabilities` is absent
+// from the published `g4-node-20260901` binary, from `main`, and from the
+// binary the fleet runs; it exists on one unreleased branch. A node on the
+// newest published artefact answers -32601 to it too. The observation is
+// therefore consistent with every generation and identifies none.
+//
+// The honest statement is stronger, not weaker: **no deployed node exposes any
+// version method at all** (`getcapabilities`, `getbuildinfo` and `getversion`
+// all -32601 on both archivals, measured 2026-09-01), so the claim "these two
+// upstreams are the same build" is not merely unproven — it is *unfalsifiable
+// over the RPC*. That is what `getbuildinfo` is being added for. The design
+// conclusion above does not depend on it: same operator and same provisioning
+// is already sufficient reason not to call two archivals corroboration.
 
 /**
  * The keyless archival observers. Data plane.
