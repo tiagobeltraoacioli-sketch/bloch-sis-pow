@@ -198,6 +198,14 @@ pub const TX_REFUSED: i64 = -32008;
 /// in [`RPC_ERROR_CODES`], instead of a fresh argument about which number to
 /// use. Whoever lands `PreviouslyRefused` here must do both, and bump
 /// [`RPC_SURFACE_VERSION`]'s minor.
+///
+/// `dead_code` is allowed here deliberately, and it is the honest state rather
+/// than an oversight: this is reserved surface, and the warning it would
+/// otherwise raise on every build of the binary is noise an operator learns to
+/// scroll past — which is how the three real dead-code warnings already in this
+/// crate stopped being read. `the_reserved_retryable_code_is_not_advertised_until_it_is_wired`
+/// is the tripwire that actually holds the reservation.
+#[allow(dead_code)]
 pub const TX_REFUSED_RETRYABLE: i64 = -32009;
 
 /// A JSON-RPC error object: a code a client can branch on and a message a human
@@ -224,6 +232,11 @@ impl RpcError {
     }
 
     /// Attach structured detail to an error, to be emitted as `error.data`.
+    ///
+    /// Reserved with [`TX_REFUSED_RETRYABLE`] — see that constant for why
+    /// nothing in this build calls it yet, and why the warning is silenced
+    /// rather than left to accumulate.
+    #[allow(dead_code)]
     pub fn with_data(mut self, data: Json) -> Self {
         self.data = Some(data);
         self
@@ -245,6 +258,7 @@ impl RpcError {
     ///
     /// See [`TX_REFUSED_RETRYABLE`] for why nothing on this lineage calls it
     /// yet.
+    #[allow(dead_code)]
     pub fn tx_refused_retryable(until_slot: u64, detail: impl Into<String>) -> Self {
         Self::new(TX_REFUSED_RETRYABLE, detail.into()).with_data(Json::obj(vec![
             ("retryable", Json::Bool(true)),
