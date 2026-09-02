@@ -1081,12 +1081,36 @@ impl Engine {
 
     // ── Duties ──────────────────────────────────────────────────────────────
 
+    /// This node's validator index, but only if the registry it is judging
+    /// against still says that index is *this* key.
+    ///
+    /// Every duty goes through here rather than reading `keys.index`
+    /// directly. The index alone is not identity: indices are handed out as
+    /// `registry.keys().next_back() + 1`, so a keystore minted for index 64
+    /// before its deposit landed can be beaten to index 64 by somebody else's
+    /// deposit. Checking only membership would then pass — the index is
+    /// genuinely active — and this node would sign under another validator's
+    /// key. Two conflicting messages under one index is the equivocation
+    /// `slashing.rs` punishes, so the check that matters is the KEY.
+    ///
+    /// `None` also covers the ordinary pending-activation case (index not yet
+    /// registered), which is why this is a silent early return and not a
+    /// warning: for a newcomer it is the expected state of every slot until
+    /// its deposit is applied.
+    ///
+    /// Cost is one registry probe and one ~3.7 KB compare per duty check —
+    /// nothing beside the hybrid signature it guards.
+    fn duty_index(&self, rolled: &CommittedState) -> Option<u32> {
+        let keys = self.keys.as_ref()?;
+        let rec = rolled.validator_record(keys.index)?;
+        (rec.pubkey == keys.pubkey).then_some(keys.index)
+    }
+
     fn attest(&mut self, slot: u64) {
         // An observer holds no key and therefore has no duty.
-        let Some(keys) = self.keys.as_ref() else {
+        if self.keys.is_none() {
             return;
-        };
-        let index = keys.index;
+        }
         let e = epoch_of(slot);
         if e == 0 {
             // Epoch 0's checkpoint is genesis — justified by definition;
@@ -1094,6 +1118,11 @@ impl Engine {
             return;
         }
         let rolled = self.rolled_to(e);
+        // Identity re-checked against the same snapshot that draws the
+        // committee, before membership is even asked about.
+        let Some(index) = self.duty_index(&rolled) else {
+            return;
+        };
         let roster = rolled.active_validators();
         let seed = Self::seed_for(&rolled, e);
         let committee = committees::committee_for_slot(&seed, slot, &roster);
@@ -1130,12 +1159,16 @@ impl Engine {
     }
 
     fn propose(&mut self, slot: u64) {
-        let Some(keys) = self.keys.as_ref() else {
+        if self.keys.is_none() {
             return;
-        };
-        let index = keys.index;
+        }
         let e = epoch_of(slot);
         let rolled = self.rolled_to(e);
+        // Same rule as `attest`: the key, not just the index, and from the
+        // same snapshot the schedule is drawn from.
+        let Some(index) = self.duty_index(&rolled) else {
+            return;
+        };
         let roster = rolled.active_validators();
         let seed = Self::seed_for(&rolled, e);
         if schedule::proposer(&seed, slot, &roster) != Some(index) {
@@ -2637,14 +2670,20 @@ pub(crate) enum KeystoreIdentity {
 /// (`ValidatorRecord`), and a deposit writes all three. The manifest is only
 /// the registry's value at height 0.
 ///
-/// The shape of the real fix (NOT made here — it needs its own design
-/// decision about when a node concludes it is not a validator):
-/// check the keystore against the registry of the state the node is actually
-/// starting from, and when the index is absent there, start in a
-/// *pending-activation* mode — follow the chain, sign nothing, re-check each
-/// epoch — rather than refusing to boot. Refusing to boot is right for "your
-/// key is wrong"; it is wrong for "your deposit has not been applied yet",
-/// and today those are the same branch.
+/// **That fix is now made, in [`check_registry_identity`] below, and this
+/// function is no longer authoritative.** It survives as a *fast pre-pass*
+/// only: the registry is not reachable here (the store is not open, the log
+/// is not read, and `CommittedState` has no on-disk form — boot is a full
+/// replay), so the authoritative check cannot run until replay finishes,
+/// which on the live fleet is ~21 minutes of silence. Keeping a cheap
+/// manifest look first means a genesis operator who mistyped a seed still
+/// learns it in a second instead of after a replay.
+///
+/// What changed is which verdicts are fatal. `NotInGenesisSet` is no longer
+/// an error at all — it is the *normal and expected* state of every validator
+/// the network will ever add by deposit, and refusing to boot on it is
+/// precisely the wall that kept a deposit-added validator off the network.
+/// It is now advisory, and [`check_registry_identity`] decides.
 ///
 /// # One latent defect fixed in the extraction
 ///
@@ -2674,6 +2713,87 @@ pub(crate) fn check_keystore_identity(
         return KeystoreIdentity::RandaoMismatch;
     }
     KeystoreIdentity::Ok
+}
+
+/// Verdict of the authoritative, registry-backed identity gate.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RegistryIdentity {
+    /// The committed registry holds this index, it carries exactly this
+    /// keystore's key, and the local RANDAO chain opens its committed
+    /// commitment. Duties are armed.
+    Active,
+    /// The registry has no such index *yet*. Not an error: it is what a
+    /// deposit-added validator looks like before its deposit is applied.
+    /// Boot, follow the chain, sign nothing, re-check every slot.
+    PendingActivation,
+    /// The registry holds this index and it belongs to a DIFFERENT key.
+    /// Fatal — see the double-signing note on [`check_registry_identity`].
+    WrongValidator,
+    /// The right key at the right index, but the local RANDAO seed does not
+    /// regenerate the committed commitment. Fatal: this node cannot produce a
+    /// reveal the network will accept, so every block it proposes is refused.
+    RandaoMismatch,
+}
+
+/// The identity gate that actually decides, read from the **committed
+/// registry** rather than from the genesis manifest.
+///
+/// # Why this had to move past replay
+///
+/// `CommittedState` has no serialized form; the node persists its *inputs*
+/// (manifest digest + every block envelope) and rebuilds state by replaying
+/// them. So at the point `run` loads the keystore there is no registry to
+/// consult — no `Store`, no log, no `Engine`. The only registry that exists
+/// before replay is the manifest's, i.e. the height-0 one, which by
+/// construction cannot contain anyone added since height 0. Any gate placed
+/// there can only ever ask "were you in the genesis set?", which is the wrong
+/// question. This one runs after replay, where `engine.state` is the registry
+/// as of the node's own head. The weak-subjectivity gate already sets that
+/// precedent for the same reason.
+///
+/// # Why absence must not be fatal, and why a mismatch must be
+///
+/// The two cases were one branch before, and collapsing them is what closed
+/// the network:
+///
+/// - **Absent** means "your deposit has not been applied on this node's head
+///   yet" — a newcomer that has just deposited, or one still replaying. It is
+///   a temporary, self-healing condition, and the honest response is to
+///   follow the chain and keep checking.
+/// - **Present but a different key** means another validator already owns
+///   this index. Signing there is signing *as them*: two conflicting messages
+///   under one index is exactly the equivocation `slashing.rs` exists to
+///   punish. This must refuse to boot, and it is the real safety value the
+///   old gate was providing — preserved here, and now aimed at the case that
+///   actually warrants it.
+///
+/// # The re-check is a safety requirement, not a convenience
+///
+/// It is tempting to conclude that pending-activation needs no machinery,
+/// because `attest` and `propose` already return early when the index is not
+/// in the roster they derive from committed state. That is true and it is not
+/// sufficient. Indices are allocated `keys().next_back() + 1`, so an operator
+/// whose keystore was minted for index 64 *before* depositing can be beaten
+/// to index 64 by somebody else's deposit. The roster check would then pass —
+/// the index is active — and this node would sign under a key that is not
+/// its own. So the duty path re-checks the *key*, not just the index, every
+/// time it is about to sign: see `Engine::duty_index`.
+pub(crate) fn check_registry_identity(
+    state: &dyn StateReader,
+    index: u32,
+    pubkey: &[u8],
+    randao_seed: [u8; 32],
+) -> RegistryIdentity {
+    let Some(rec) = state.validator_record(index) else {
+        return RegistryIdentity::PendingActivation;
+    };
+    if rec.pubkey != pubkey {
+        return RegistryIdentity::WrongValidator;
+    }
+    if RandaoChain::generate(randao_seed).commitment() != rec.randao_commitment {
+        return RegistryIdentity::RandaoMismatch;
+    }
+    RegistryIdentity::Active
 }
 
 pub fn run(cfg: Config) -> io::Result<()> {
@@ -2739,15 +2859,26 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // the committed registry by whichever consensus site is asking.
     let verifier = HybridVerifier::new();
 
-    // Identity sanity: the keystore must be the validator the manifest says.
+    // Identity, pre-pass. Advisory only — the authoritative gate is
+    // `check_registry_identity`, and it cannot run until replay has rebuilt
+    // the registry. This exists so that the one failure a genesis operator
+    // can cause locally (a RANDAO seed that does not open the committed
+    // commitment) is reported in a second rather than after a full replay.
+    //
+    // `NotInGenesisSet` is deliberately NOT an error here. Every validator
+    // this network ever adds by deposit is outside the genesis manifest by
+    // construction; refusing to boot on that fact is the wall that kept
+    // deposit-added validators off the chain entirely.
     if let Some(keys) = keys.as_ref() {
         match check_keystore_identity(&manifest, keys.index, &keys.pubkey, keys.randao_seed) {
             KeystoreIdentity::Ok => {}
             KeystoreIdentity::NotInGenesisSet => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "keystore does not match the genesis manifest's validator set",
-                ))
+                println!(
+                    "validator {} is not in the genesis manifest — expected for a \
+                     deposit-added validator. Identity will be settled against the \
+                     committed registry once replay finishes.",
+                    keys.index
+                );
             }
             KeystoreIdentity::RandaoMismatch => {
                 return Err(io::Error::new(
@@ -2926,6 +3057,65 @@ pub fn run(cfg: Config) -> io::Result<()> {
     engine
         .head_slot
         .store(engine.state.slot(), Ordering::Relaxed);
+
+    // ── Identity, authoritative: the committed registry, not the manifest ──
+    //
+    // Here and not before, because the registry only exists once replay has
+    // rebuilt it. `PendingActivation` is a normal boot state, not a failure:
+    // it is every deposit-added validator until its deposit is applied, and
+    // the duty path (`Engine::duty_index`) re-checks the key each slot, so
+    // the node arms itself the moment the registry says it may.
+    if let Some(keys) = engine.keys.as_ref() {
+        match check_registry_identity(
+            &*engine.state,
+            keys.index,
+            &keys.pubkey,
+            keys.randao_seed,
+        ) {
+            RegistryIdentity::Active => {
+                println!(
+                    "validator {} is registered and its key matches the committed \
+                     registry at head slot {}",
+                    keys.index,
+                    engine.state.slot()
+                );
+            }
+            RegistryIdentity::PendingActivation => {
+                println!(
+                    "validator {} is NOT in the committed registry at head slot {} — \
+                     pending activation. This node follows the chain and signs nothing \
+                     until its deposit is applied; no restart is needed when it is.",
+                    keys.index,
+                    engine.state.slot()
+                );
+            }
+            RegistryIdentity::WrongValidator => {
+                // Fatal, and this is the case the old manifest gate was really
+                // protecting against: another validator owns this index, so
+                // signing here would be equivocating under their identity.
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "validator index {} is registered to a DIFFERENT public key — \
+                         refusing to start, because signing under it would equivocate \
+                         as that validator",
+                        keys.index
+                    ),
+                ));
+            }
+            RegistryIdentity::RandaoMismatch => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "validator {}'s local RANDAO chain does not open the \
+                         commitment in the committed registry — every block this node \
+                         proposed would be refused",
+                        keys.index
+                    ),
+                ));
+            }
+        }
+    }
 
     // ── Weak subjectivity: may the node sync at all? (§4.2) ──
     //
