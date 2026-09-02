@@ -431,9 +431,14 @@ message is that block or a descendant, and the head is found by walking from
 the latest **justified** checkpoint, taking the heaviest child at each step
 (`crates/bloch-pos-committee/src/forkchoice.rs:1-10`). Equivocating validators
 are dropped from fork-choice weight permanently (`forkchoice.rs:54-58`).
-Starting the walk at the justified checkpoint gives two properties for free:
-finalized history can never be reorganized out, and the walk is bounded by the
-unfinalized suffix (`bloch-pos-node/src/engine.rs:50-53`).
+Starting the walk at the justified checkpoint bounds it by the unfinalized
+suffix (`bloch-pos-node/src/engine.rs:50-53`). That source used to claim a
+second property for free — "finalized history can never be reorganized out" —
+and both it and this sentence were CORRECTED 2026-09-01. The walk starts at the
+*justified* root, and the state committed there finalizes two epochs below the
+head, so the deepest cut the algorithm may legitimately propose is itself a
+finality rewind. Measured: finalized epoch 6 -> 4 -> 2 -> 0 in three in-rules
+cuts.
 
 The devnet engine binds this rule and the documentation states why the naive
 alternative is not merely weaker but wrong: longest-valid-chain "lets a
@@ -662,11 +667,17 @@ There is a third, smaller strand: Edition 1 treated "no committee" as
 protecting the validity/finality distinction. The PoS design keeps that
 distinction fully intact — validity remains deterministic and proof-gated
 (now against committed state under `transition.rs`'s rules), while finality
-becomes a *stronger* claim than depth: accountable, slashable, two-thirds of
-bonded stake. Nothing in the Chapter 8 taxonomy is abandoned; the finality
-column upgrades from "probabilistic, cost-based" to "deterministic,
-accountable" — on a chain whose cost-based column had, in practice, no cost
-in it.
+becomes a claim of a different *kind* than depth: a discrete, two-thirds-of-
+bonded-stake commitment rather than a probabilistic one. This passage used to
+call it "accountable, slashable" and to describe the finality column as
+upgrading to "deterministic, accountable". CORRECTED 2026-09-01: accountability
+is the half that has not shipped. Equivocation is detected and permanently
+dropped from fork-choice weight, but it is not *punished* — slashing evidence
+cannot travel on the wire (wire tag `0x05` is undecodable on every ingress
+path), so the column moves from "probabilistic, cost-based" to "discrete, and
+still with no cost in it". The honest statement is that Genesis-4 replaced one
+absent cost with another, and gained determinism of form rather than of
+guarantee.
 
 ## 4.3 What the reversal pays, stated without discount
 

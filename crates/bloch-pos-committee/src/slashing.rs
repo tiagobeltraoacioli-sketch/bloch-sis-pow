@@ -2,6 +2,20 @@
 
 //! Slashing execution — the state machine behind §7.3.
 //!
+//! > **NOT REACHABLE FROM THE NETWORK (stated 2026-09-01).** Everything in
+//! > this module is complete, unit-tested and correct, and nothing can invoke
+//! > it on the live chain. Evidence rides on wire tag `0x05`, and
+//! > `transition::PosTransaction::from_canonical_bytes` refuses that tag
+//! > unconditionally — the encoder folds the nested messages in as the signing
+//! > roots they were signed over, so the envelopes are unrecoverable by
+//! > construction. That decoder is the only one on every ingress path (block
+//! > body, gossip, `sendrawtransaction`), nothing constructs the transaction
+//! > outside tests, and no activation constant exists. Read the penalties
+//! > below as a *design*, and do not let them back a finality guarantee
+//! > anywhere: the retraction on `bloch-pos-node`'s `rpc::Finality` says why,
+//! > and `crates/bloch-pos-node/tests/slashing_backed_finality_claims.rs`
+//! > keeps this note and that codec in step.
+//!
 //! [`crate::attestation`] supplies *detection* (`surrounds`, `is_double_vote`)
 //! and [`crate::delegation::apply_slash`] supplies the pro-rata *arithmetic*.
 //! What neither supplies — and what this module adds — is the evidence
