@@ -24,6 +24,18 @@ rules) and `ws_boot.rs` (file framings) are normative; the spec is
   file `--ws-checkpoint` takes. **Exists only after the signing ceremony.**
 - `signer-set-<id>.bin` — the signer arrangement `--ws-signer-set` takes.
   **Exists only after the signer keys exist** (see the ceremony below).
+  Publish its SHA3-256 fingerprint the way you publish the ws digest: this
+  file carries the quorum RULE, not just the keys, and every node enforces
+  the `threshold` and `min_external` *it* states. Nothing on the acceptance
+  path compares them against §6, so an attacker who can substitute this file
+  does not need to forge a signature. See `docs/CHECKPOINT-RUNBOOK.md` §2.
+
+**One-way door:** the first artifact published for an epoch is the only one
+that epoch can ever have. `issued_at` is inside `ws_digest`, and `ws::accept`
+keys on the epoch, so a second mint of the same epoch is
+`Acceptance::Conflict` and refuses the boot of every node that stored the
+first. Correct a bad publication at the NEXT publication epoch, never the same
+one — runbook §7.
 
 ## How a checkpoint is minted (no keys involved)
 
