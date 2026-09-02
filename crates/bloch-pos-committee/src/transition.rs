@@ -874,6 +874,17 @@ pub enum TxReject {
     Transfer(TransferReject),
     /// A deposit, exit or delegation failed its state-dependent rule.
     StakingRule,
+    /// A `Deposit` or `Delegate` arrived below
+    /// [`crate::params::DEPOSIT_ACTIVATION_EPOCH`]. Unfunded bonding is not a
+    /// rule this chain has ever activated: both messages create consensus
+    /// weight without spending an eUTXO input, and the gate is what makes the
+    /// refusal a property of the CHAIN rather than of whichever node happened
+    /// to hold the transaction. Its own variant, not `StakingRule`, because
+    /// "the flag day has not arrived" and "the amount was below the minimum"
+    /// are different facts and a test that cannot tell them apart is not
+    /// testing the gate. Both still surface as the frozen
+    /// `TransitionError::Transaction(i)`; no error code changes.
+    StakingNotActive,
     /// Slashing evidence reached the plain transaction seam instead of
     /// `apply_slashing_evidence`, which is the only path that verifies it.
     MisroutedEvidence,
@@ -2013,6 +2024,21 @@ impl CommittedState {
     /// `verifier` is threaded in because a transfer's authorisation is a
     /// signature check, and the only thing that may decide whether an output
     /// moves is whether its owner said so.
+    /// Is unfunded bonding (`Deposit`, `Delegate`) active in `epoch`?
+    ///
+    /// `epoch` is the caller's `self.epoch`, which `compute_post_state` has
+    /// already rolled to the judged block's own `epoch_of(header.slot)`. It is
+    /// committed state, never a clock — see the constant's docs for the full
+    /// divergence argument and for why arming the constant is not how deposits
+    /// open.
+    fn unfunded_bonding_active(epoch: u64) -> bool {
+        #[cfg(test)]
+        let forced = crate::params::rehearsal::bonding_gate_forced_open();
+        #[cfg(not(test))]
+        let forced = false;
+        forced || epoch >= crate::params::DEPOSIT_ACTIVATION_EPOCH
+    }
+
     fn apply_transaction(
         &mut self,
         tx: &PosTransaction,
@@ -2053,6 +2079,19 @@ impl CommittedState {
                 withdrawal_credentials,
                 commission_bps,
             } => {
+                // THE FLAG-DAY GATE, FIRST — before the registry is even
+                // consulted, for the same reason the TransferV2 arm above puts
+                // its gate first. Read from `self.epoch`: COMMITTED state,
+                // rolled to this block's epoch by compute_post_state's boundary
+                // walk, never node-local. `DEPOSIT_ACTIVATION_EPOCH` is
+                // `u64::MAX`, so this refuses at EVERY epoch — which is the
+                // point. Until this existed the only thing standing between a
+                // block and stake minted from nothing was
+                // `bloch-pos-node`'s `admissible`, mempool policy that one
+                // producer could lift for the whole network.
+                if !Self::unfunded_bonding_active(self.epoch) {
+                    return Err(TxReject::StakingNotActive);
+                }
                 let pubkey_hash: [u8; 32] = Sha3_256::digest(pubkey).into();
                 // A second deposit of a registered key is a top-up path
                 // decision the interface refuses to make implicitly.
@@ -2120,6 +2159,15 @@ impl CommittedState {
                 Ok(free)
             }
             PosTransaction::Delegate { delegator, validator, amount_sat, eligible } => {
+                // Same gate, same constant, and it must be the same constant:
+                // a delegation adds to `effective_stake` through
+                // `consensus_roster_at` and requests from `self.epoch + 1`, so
+                // it reaches consensus weight FASTER than a deposit, which
+                // waits out ACTIVATION_DELAY_EPOCHS. Closing the slow door
+                // alone would be a fix that reads like one and is not.
+                if !Self::unfunded_bonding_active(self.epoch) {
+                    return Err(TxReject::StakingNotActive);
+                }
                 let Some(rec) = self.validators.get(validator) else {
                     return Err(TxReject::StakingRule);
                 };
@@ -4748,6 +4796,11 @@ mod tests {
 
     #[test]
     fn replay_is_delivery_order_independent() {
+        // Pre-gate fixture: this test bonds through the legacy unfunded
+        // `Deposit`/`Delegate` path, which `DEPOSIT_ACTIVATION_EPOCH` now
+        // refuses at every epoch. The switch says so out loud rather than the
+        // constant being weakened to keep an old fixture green.
+        let _bonding = crate::params::rehearsal::bonding_gate_open_guard();
         let (t, g, mut chains) = setup(8);
 
         // A chain with real content: a deposit, a delegation, and a full
@@ -4850,6 +4903,11 @@ mod tests {
 
     #[test]
     fn deposit_queues_and_activates_through_the_epoch_pipeline() {
+        // Pre-gate fixture: this test bonds through the legacy unfunded
+        // `Deposit`/`Delegate` path, which `DEPOSIT_ACTIVATION_EPOCH` now
+        // refuses at every epoch. The switch says so out loud rather than the
+        // constant being weakened to keep an old fixture green.
+        let _bonding = crate::params::rehearsal::bonding_gate_open_guard();
         let (t, g, mut chains) = setup(4);
         let deposit = PosTransaction::Deposit {
             pubkey: vec![0xAA; 8],
@@ -4900,6 +4958,143 @@ mod tests {
                 &OkVerifier
             ),
             Err(TxReject::StakingRule)
+        );
+    }
+
+    // -- DEPOSIT_ACTIVATION_EPOCH -------------------------------------------
+
+    /// THE GATE IS A CONSENSUS RULE, AND THIS PROVES IT IS NOT THE MEMPOOL'S.
+    ///
+    /// At the pristine tree (`g4-node-20260901`) this test's fixture applied
+    /// clean: `apply_block` returned a state with a fifth validator record
+    /// holding `MIN_DEPOSIT_SAT` against no input spent. The only thing
+    /// refusing a deposit was `bloch-pos-node`'s `admissible`, and that crate
+    /// is not in this test's dependency graph — there is no mempool here to
+    /// blame, which is the whole reason the test lives in the committee crate.
+    ///
+    /// The block is BUILT with the gate forced open, so the header carries a
+    /// real `state_root` and `body_root` over a body that really contains the
+    /// deposit — exactly the block a patched producer would gossip. It is then
+    /// JUDGED with the gate shut, by the code every honest node runs. The
+    /// refusal that comes back is `compute_post_state`'s.
+    #[test]
+    fn a_deposit_in_a_block_is_refused_by_consensus_not_by_the_mempool() {
+        let (t, g, mut chains) = setup(4);
+        let deposit = PosTransaction::Deposit {
+            pubkey: vec![0x5A; 8],
+            amount_sat: staking::MIN_DEPOSIT_SAT,
+            randao_commitment: [0x5B; 32],
+            withdrawal_credentials: vec![0x5C; 4],
+            commission_bps: 500,
+        };
+
+        // Built by a producer whose gate is open: a well-formed block, every
+        // root correct, carrying stake minted from nothing.
+        let (b, applied_open) = {
+            let _open = crate::params::rehearsal::bonding_gate_open_guard();
+            let b = build_block(&t, &g, 33, &[], std::slice::from_ref(&deposit), &mut chains);
+            let st = t
+                .apply_block(&g, &b, &[], std::slice::from_ref(&deposit))
+                .expect("with the gate open this is the pre-gate behaviour");
+            (b, st)
+        };
+        // The fixture is live: with the gate open the deposit really does what
+        // the finding says it does. Without this the test below could pass
+        // against a block that was never applicable for some other reason.
+        assert_eq!(applied_open.validator_count(), 5, "fixture must actually mint a validator");
+
+        // Judged by a node running the shipped rules. Same block, same body.
+        assert_eq!(
+            t.apply_block(&g, &b, &[], std::slice::from_ref(&deposit)),
+            Err(TransitionError::Transaction(0)),
+            "consensus must refuse the deposit, at index 0, on the frozen variant",
+        );
+
+        // And the reason is the flag day, not the minimum, not a duplicate
+        // pubkey, not the per-validator cap.
+        let mut probe = g.clone();
+        assert_eq!(
+            probe.apply_transaction(
+                &deposit,
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &OkVerifier,
+            ),
+            Err(TxReject::StakingNotActive),
+        );
+        assert_eq!(probe.validator_count(), 4, "a refused deposit must leave no trace");
+    }
+
+    /// The faster door. A delegation reaches `effective_stake` at `epoch + 1`
+    /// with no activation queue in front of it, so it must be shut by the same
+    /// constant or the deposit gate is decoration.
+    #[test]
+    fn a_delegation_in_a_block_is_refused_by_consensus_too() {
+        let (t, g, mut chains) = setup(4);
+        let delegate = PosTransaction::Delegate {
+            delegator: 900,
+            validator: 0,
+            amount_sat: delegation::MIN_DELEGATION_SAT,
+            eligible: true,
+        };
+        let b = {
+            let _open = crate::params::rehearsal::bonding_gate_open_guard();
+            let b = build_block(&t, &g, 33, &[], std::slice::from_ref(&delegate), &mut chains);
+            let st = t.apply_block(&g, &b, &[], std::slice::from_ref(&delegate)).unwrap();
+            assert!(!st.delegations.is_empty(), "fixture must actually bond");
+            b
+        };
+        assert_eq!(
+            t.apply_block(&g, &b, &[], std::slice::from_ref(&delegate)),
+            Err(TransitionError::Transaction(0)),
+        );
+    }
+
+    /// The gate reads the epoch of the BLOCK, and the same body flips verdict
+    /// on nothing but that number.
+    ///
+    /// This is the divergence property stated as a test: `unfunded_bonding_active`
+    /// is a function of one `u64` that `compute_post_state` derives as
+    /// `epoch_of(header.slot)` and from nothing else. There is no node identity,
+    /// no clock and no mutable local in its argument list, so two honest nodes
+    /// handed the same header cannot disagree — which is precisely what the
+    /// 2026-08-08 `expected_bits` rule could not say about itself.
+    #[test]
+    fn the_gate_is_a_function_of_the_block_epoch_alone() {
+        // Below the flag day: refused, at every epoch a chain can reach.
+        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1] {
+            assert!(!CommittedState::unfunded_bonding_active(e), "epoch {e} must be below");
+        }
+        // At and above it: allowed. Reached only by moving the constant, which
+        // `deposit_gate_is_inert` forbids — the arm is covered, not open.
+        assert!(CommittedState::unfunded_bonding_active(
+            crate::params::DEPOSIT_ACTIVATION_EPOCH
+        ));
+    }
+
+    /// TRIPWIRE. `DEPOSIT_ACTIVATION_EPOCH` must stay `u64::MAX`.
+    ///
+    /// Not a style rule. The encoding this constant gates is the
+    /// UNAUTHENTICATED one: `Deposit` spends no input and carries no signature,
+    /// `Delegate` likewise. Moving this number to a reachable epoch does not
+    /// open deposits safely — it makes stake minted from nothing a
+    /// consensus-VALID transaction on every node at once, which is strictly
+    /// worse than the pre-gate tree, where at least the mempool refused it.
+    ///
+    /// Deposits open by a funded, authenticated message that spends transparent
+    /// eUTXO inputs and proves possession of the key — the shape
+    /// `staking::validate_deposit` already describes and no encoder emits. That
+    /// message needs a wire tag the founder has not assigned, and it will bring
+    /// its own activation constant. This one is a permanent closure.
+    ///
+    /// Whoever arms it has to delete this test first, and read this while doing
+    /// so.
+    #[test]
+    fn deposit_gate_is_inert() {
+        assert_eq!(
+            crate::params::DEPOSIT_ACTIVATION_EPOCH,
+            u64::MAX,
+            "arming this reopens unfunded bonding on all nodes; read the test docs",
         );
     }
 
@@ -5739,6 +5934,11 @@ mod tests {
     /// delegator revenue at exactly zero at the moment fees became everything.
     #[test]
     fn producer_fees_reach_delegators_through_the_commission_split() {
+        // Pre-gate fixture: this test bonds through the legacy unfunded
+        // `Deposit`/`Delegate` path, which `DEPOSIT_ACTIVATION_EPOCH` now
+        // refuses at every epoch. The switch says so out loud rather than the
+        // constant being weakened to keep an old fixture green.
+        let _bonding = crate::params::rehearsal::bonding_gate_open_guard();
         let spender = owner_key(0x3B);
         let coins: Vec<_> =
             (0..2u32).map(|i| opening(0x78, i, 100_000_000, &spender)).collect();
@@ -6177,6 +6377,11 @@ mod tests {
 
     #[test]
     fn evidence_transaction_slashes_operator_and_delegators_and_pays_whistleblower() {
+        // Pre-gate fixture: this test bonds through the legacy unfunded
+        // `Deposit`/`Delegate` path, which `DEPOSIT_ACTIVATION_EPOCH` now
+        // refuses at every epoch. The switch says so out loud rather than the
+        // constant being weakened to keep an old fixture green.
+        let _bonding = crate::params::rehearsal::bonding_gate_open_guard();
         let (t, g, mut chains) = setup(4);
         let seed = g.seed_for_epoch(0);
         // Pick an offender that is NOT the proposer of the evidence-carrying
@@ -6451,6 +6656,11 @@ mod tests {
     /// have been blind to most of what follows.
     fn state_with_live_bookkeeping() -> (Transition<ToyVerifier>, CommittedState, Vec<Attestation>)
     {
+        // Pre-gate fixture: this test bonds through the legacy unfunded
+        // `Deposit`/`Delegate` path, which `DEPOSIT_ACTIVATION_EPOCH` now
+        // refuses at every epoch. The switch says so out loud rather than the
+        // constant being weakened to keep an old fixture green.
+        let _bonding = crate::params::rehearsal::bonding_gate_open_guard();
         // Funded, and the transfer below actually spends: the unspent set is
         // one of the components the root must bind, and a fixture where it sat
         // empty (or untouched since genesis) would exercise that leaf
@@ -6676,6 +6886,11 @@ mod tests {
     /// now binds.
     #[test]
     fn convergent_paths_commit_identical_roots_with_bookkeeping_live() {
+        // Pre-gate fixture: this test bonds through the legacy unfunded
+        // `Deposit`/`Delegate` path, which `DEPOSIT_ACTIVATION_EPOCH` now
+        // refuses at every epoch. The switch says so out loud rather than the
+        // constant being weakened to keep an old fixture green.
+        let _bonding = crate::params::rehearsal::bonding_gate_open_guard();
         let spender = owner_key(0x3F);
         let coin = opening(0x7A, 0, 100_000_000, &spender);
         let (t, g, mut chains) = setup_funded(8, &[coin.clone()]);

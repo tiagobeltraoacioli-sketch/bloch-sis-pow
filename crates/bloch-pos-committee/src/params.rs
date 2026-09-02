@@ -445,6 +445,46 @@ pub mod rehearsal {
         static GATES_OPEN_TL: Cell<bool> = const { Cell::new(false) };
     }
 
+    thread_local! {
+        static BONDING_GATE_OPEN_TL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Test-only: treat [`super::DEPOSIT_ACTIVATION_EPOCH`] as already bound.
+    ///
+    /// Its own switch, NOT folded into `GATES_OPEN`, and the reason is that the
+    /// two mean opposite things. `GATES_OPEN` turns the NEW rule on for gates
+    /// whose inert value is the old behaviour; this one turns the OLD (unfunded
+    /// bonding) behaviour BACK ON for a gate whose inert value is the refusal.
+    /// A test that wanted a post-ancestry-seed roster and got a chain where
+    /// stake mints from nothing would be a fixture lying about the network it
+    /// models.
+    ///
+    /// It exists because the only two things a test can do with a permanently
+    /// closed gate are assert it is closed and build the fixture that proves
+    /// the refusal comes from consensus rather than from the mempool. The
+    /// second needs a block that CARRIES a deposit, and a producer cannot
+    /// stamp a `state_root` over a transition that refuses the transaction —
+    /// so the block is built with this open and judged with it shut.
+    ///
+    /// Default is CLOSED: an unadorned `cargo test` runs the fleet's rules.
+    pub fn bonding_gate_forced_open() -> bool {
+        BONDING_GATE_OPEN_TL.with(|c| c.get())
+    }
+
+    /// Opens the unfunded-bonding gate for this thread until the guard drops,
+    /// including on unwind, so a failing assertion cannot leave stake minting
+    /// from nothing for the rest of the thread.
+    pub fn bonding_gate_open_guard() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                BONDING_GATE_OPEN_TL.with(|c| c.set(self.0));
+            }
+        }
+        let prev = BONDING_GATE_OPEN_TL.with(|c| c.replace(true));
+        Restore(prev)
+    }
+
     /// Test-only: treat [`super::ANCESTRY_SEED_ACTIVATION_EPOCH`] and
     /// [`super::LEAK_RECOVERY_ACTIVATION_EPOCH`] as if they had already bound.
     ///
@@ -608,6 +648,92 @@ pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = u64::MAX;
 ///
 /// `u64::MAX` means INERT. Same arming rules as above.
 pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Flag day for **unfunded bonding**: the epoch at and after which the legacy
+/// `Deposit` and `Delegate` messages are valid. Below it they are refused by
+/// CONSENSUS, on every node, with [`crate::transition::TxReject::StakingNotActive`].
+///
+/// # What it closes, and why a node-side check was not enough
+///
+/// `bloch-pos-node`'s `admissible` has refused both messages at the mempool
+/// door since 2026-08-13, and its own comment says what that is worth: "this is
+/// a node-side refusal, not a consensus rule: a block that already carries a
+/// deposit still applies it." It is MEMPOOL POLICY. One producer that lifts it
+/// — a patched binary, a `--` flag, a fork of the node crate — lifts it for the
+/// entire network, because every other node runs `apply_transaction`, and
+/// `apply_transaction` applied both messages unconditionally. Sixty-four
+/// validators judging the block would each have accepted it.
+///
+/// Both messages mint consensus weight without spending an output. `Deposit`
+/// registers a `ValidatorRecord` holding `amount_sat` (>= `MIN_DEPOSIT_SAT`,
+/// 25,000 BLCH) against no input and no signature. `Delegate` is the same shape
+/// one layer along and lands FASTER: `consensus_roster_at` adds resolved
+/// delegated stake into `effective_stake` (transition.rs, `roster.push`), and a
+/// delegation requests from `self.epoch + 1` rather than waiting out
+/// `ACTIVATION_DELAY_EPOCHS`. They are one rule — bonding is not funded from
+/// the eUTXO set — so they share one constant, and arming for one without the
+/// other would reopen the hole through the faster door.
+///
+/// # Where the epoch comes from
+///
+/// `self.epoch` inside `apply_transaction`, which `compute_post_state` has
+/// already rolled to `crate::epoch_of(header.slot)` — the boundary walk `while
+/// st.epoch < block_epoch { st.close_epoch() }`, and `close_epoch` advances by
+/// exactly one. So at the gate, `self.epoch` IS the epoch of the block being
+/// judged, a pure function of a header field that the block id commits to
+/// (`DS_BLOCK` over the canonical header). It is not a wall clock, not a
+/// `current_bits`-style mutable local, and not the node's own head. Two honest
+/// nodes handed the same block read the same number. This is deliberately the
+/// same shape as the `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` gate that sits
+/// four lines above it, and deliberately NOT the shape of the 2026-08-08
+/// `expected_bits` split, where the verdict came from state each node mutated
+/// on its own accepted-block path and identical binaries diverged.
+///
+/// # Replay safety
+///
+/// Refusing below the flag day rewrites history only if history contains one.
+/// It does not: measured 2026-09-02 against the two keyless archivals
+/// 139.180.166.5 and 139.180.173.231, which agreed byte-for-byte at height
+/// 35,628 / epoch 1,766 (`state_root`
+/// 71e71e6a5a0843af78d4bd2a63b0e4192a62f5108741ac3ed76797d57f063fa7) on
+/// `validators.total == 64`. `validator_count` is `validators.len()` — EVERY
+/// record, including one queued at `activation_epoch == u64::MAX` — and the
+/// genesis cohort is 64. No `Deposit` has ever been applied on the canonical
+/// chain, so every historical block replays through this gate unchanged and
+/// the fleet can adopt it without a coordinated flag day. (`Delegate` leaves no
+/// registry trace, so its absence is argued, not measured: nothing on this
+/// chain has ever had an incentive to delegate to a founder-held validator, and
+/// a delegation would have moved `effective_stake` in `total_active_stake_sat`,
+/// which is uniform across the 64 at 142,582,277.37013640 BLCH.)
+///
+/// # `u64::MAX` means INERT — and here inert means the rule is FULLY LIVE
+///
+/// Unlike [`ANCESTRY_SEED_ACTIVATION_EPOCH`], whose inert value selects the OLD
+/// behaviour, this constant's inert value selects the REFUSAL. Set to
+/// `u64::MAX`, no epoch ever reaches it and both messages are invalid in
+/// consensus at every epoch, today, on any node running this crate. The gate is
+/// not waiting to be armed to do its work; it is doing it.
+///
+/// # ARMING THIS CONSTANT IS NOT HOW DEPOSITS OPEN
+///
+/// Read that twice. The encoding this gate governs is the UNAUTHENTICATED one.
+/// Moving this number to a real epoch does not make deposits safe; it makes
+/// stake-minted-from-nothing a consensus-VALID transaction on all 64 nodes,
+/// which is strictly worse than today, where at least the mempool refuses it.
+/// The recommendation of the commit that introduced this gate is that this
+/// number never move.
+///
+/// Deposits open by a different route: a funded, authenticated message that
+/// spends transparent eUTXO inputs and carries a proof of possession — the form
+/// `staking::validate_deposit` and `DepositTx` already describe and nothing
+/// encodes. That form needs a wire tag, the tag space above the released range
+/// is contested across live lineages, and the registry that resolves it is the
+/// founder's to assign. When it lands it brings its OWN activation constant.
+/// This one stays `u64::MAX` and the legacy arm stays refused, permanently.
+///
+/// `deposit_gate_is_inert` pins the value, so arming it means deleting a test
+/// that says all of the above out loud.
+pub const DEPOSIT_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.
