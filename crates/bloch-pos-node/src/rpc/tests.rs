@@ -1117,3 +1117,70 @@ fn getnodeversion_reports_the_build_stamp_this_binary_was_compiled_with() {
         "a Genesis-3 binary answering a Genesis-4 client must be visible here"
     );
 }
+
+// ─── 5. The empty slot and the unreached slot ───────────────────────────────
+
+/// **The settled empty slot and the unreached slot must not share one code.**
+///
+/// This is the tripwire for the deposit-loss defect. `-32007` is published to
+/// integrators as "a missed proposal is normal under PoS; advance to the next
+/// slot", and the same code with the same wording was returned for a slot above
+/// the chain head — so a deposit scanner following our own guidance advanced
+/// its cursor past the tip, read every future slot as ordinary and empty, and
+/// never came back for the blocks that later landed there. If someone collapses
+/// the two back onto one constant, this goes red on the first line.
+#[test]
+fn the_empty_slot_and_the_future_slot_are_different_codes() {
+    assert_ne!(
+        SLOT_EMPTY, SLOT_IN_FUTURE,
+        "a reached-and-blockless slot and an unreached slot must never share a \
+         code: the published advice for one (`skip it`) loses deposits for the \
+         other"
+    );
+    // The numbers themselves are the published contract. -32007 in particular
+    // is already in integrators' hands as the missed proposal; it must not move.
+    assert_eq!(SLOT_EMPTY, -32007, "-32007 is published; it cannot be redefined");
+    assert_eq!(SLOT_IN_FUTURE, -32012);
+    // -32010 and -32011 belong to the explorer edge (NO_QUORUM, STALE_UPSTREAM),
+    // which answers on the same `error.code` field in front of this node.
+    for taken in [-32010i64, -32011] {
+        assert_ne!(SLOT_IN_FUTURE, taken, "collides with an explorer-edge code");
+    }
+}
+
+/// The future-slot error carries the head where a client can read it.
+///
+/// The message may be reworded; the head slot is a value the client computes
+/// with — it is the slot a scanner clamps its cursor back to. This asserts the
+/// envelope actually emits `error.data` for the new code, in the literal bytes.
+#[test]
+fn a_future_slot_error_puts_the_head_slot_on_the_wire() {
+    let spy = Spy::failing(RpcError::slot_in_future(60_494, 55_493, 55_495));
+    let raw = handle_body(&request("getblockbyslot", "[60494]"), spy.as_ref());
+    let v = parse_json(&raw).expect("a response is always JSON");
+
+    assert_eq!(error_code(&v), Some(SLOT_IN_FUTURE));
+    let data = v
+        .get("error")
+        .and_then(|e| e.get("data"))
+        .expect("a future-slot error must carry `error.data`");
+    assert_eq!(
+        data.get("head_slot").and_then(Json::as_u64),
+        Some(55_493),
+        "the head must be readable without parsing the message: {raw}"
+    );
+    assert_eq!(data.get("requested_slot").and_then(Json::as_u64), Some(60_494));
+    assert_eq!(
+        data.get("retryable"),
+        Some(&Json::Bool(true)),
+        "a generic client must be able to branch without a table of Bloch codes"
+    );
+    assert!(
+        matches!(data.get("head_slot"), Some(Json::Num(_))),
+        "head_slot must be a JSON number: {raw}"
+    );
+    assert!(
+        raw.contains("\"code\":-32012") && raw.contains("\"head_slot\":55493"),
+        "the wire bytes must carry both: {raw}"
+    );
+}

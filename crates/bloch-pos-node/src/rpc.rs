@@ -122,9 +122,10 @@ const UTXO_PAGE_MAX: usize = 1_000;
 // | `-32004` | `NODE_UNAVAILABLE`       | Consensus thread did not answer, or is shutting down. Retry. |
 // | `-32005` | `NO_TRANSACTION_INDEX`   | This build cannot look a transaction up by id — see [`RpcError::no_transaction_index`]. Not a transient failure. |
 // | `-32006` | `NO_WALLET`              | This node holds no wallet and mints no addresses — see [`RpcError::no_wallet`]. Not a transient failure. |
-// | `-32007` | `SLOT_EMPTY`             | The slot exists and carries no canonical block. **Normal under PoS** (a missed proposal); advance to the next slot. |
+// | `-32007` | `SLOT_EMPTY`             | A slot **at or below this node's head** carries no canonical block. **Normal under PoS** (a missed proposal); advance to the next slot. |
 // | `-32008` | `TX_REFUSED`             | The node judged these BYTES invalid on their merits. **Terminal**: never resubmit them. Carries no `error.data`. |
 // | `-32009` | `TX_REFUSED_RETRYABLE`   | The transaction was barred against a **state**, not condemned on its bytes. **Retryable**: `error.data.until_slot` says from which slot. |
+// | `-32012` | `SLOT_IN_FUTURE`         | The slot is **above this node's head** — it has not been reached. **Never skip it**: `error.data.head_slot` says where to clamp the cursor back to. |
 //
 // ## `error.data`
 //
@@ -134,8 +135,18 @@ const UTXO_PAGE_MAX: usize = 1_000;
 // client that has to regex `until slot 4242` out of a sentence is a client that
 // breaks the next time the sentence is reworded, and the wording is explicitly
 // the part of this contract that may change. `data` is OPTIONAL and absent on
-// every code above except `-32009`: a client that ignores it still reads a
-// correct `code` and `message`.
+// every code above except `-32009` and `-32012`: a client that ignores it
+// still reads a correct `code` and `message`.
+//
+// ## Why the numbering skips -32010 and -32011
+//
+// Those two are not free, and not ours. The explorer edge — the front the
+// public RPC is actually reached through — defines `NO_QUORUM = -32010` and
+// `STALE_UPSTREAM = -32011` (plus `-32029` / `-32030` for its budgets) in
+// `apps/explorer/edge/governor.js`. An integrator pointed at that host sees
+// the proxy's codes and this node's codes in the same `error.code` field, so
+// reusing a number here would make one value mean two unrelated things
+// depending on which hop answered. `-32012` is the next value free of both.
 
 /// No block with that id is known to this node.
 pub const BLOCK_NOT_FOUND: i64 = -32000;
@@ -151,7 +162,14 @@ pub const NODE_UNAVAILABLE: i64 = -32004;
 pub const NO_TRANSACTION_INDEX: i64 = -32005;
 /// This node has no wallet and no frozen address format.
 pub const NO_WALLET: i64 = -32006;
-/// The slot carries no canonical block — a missed proposal, not an error state.
+/// A slot **at or below this node's head** carries no canonical block — a
+/// missed proposal, not an error state.
+///
+/// The bound is part of the meaning, not a footnote: this code says the node
+/// REACHED the slot and nobody proposed in it, which is what makes the
+/// published advice for it ("advance to the next slot") correct. A slot the
+/// node has not reached is [`SLOT_IN_FUTURE`], because that advice is wrong
+/// there — see that constant for what it cost.
 pub const SLOT_EMPTY: i64 = -32007;
 
 /// The node refused a submitted transaction on its merits — it was judged
@@ -193,6 +211,52 @@ pub const TX_REFUSED: i64 = -32008;
 /// with, and the messages on this surface are explicitly allowed to be
 /// reworded while the codes are not.
 pub const TX_REFUSED_RETRYABLE: i64 = -32009;
+
+/// The requested slot is **above this node's head**: the node has not reached
+/// it, so "there is no block here" is not yet a fact about the chain.
+///
+/// # Why this is a second code rather than a second message
+///
+/// [`SLOT_EMPTY`] (-32007) is a settled fact: the node reached the slot, no
+/// proposer produced in it, and nothing will ever appear there. Our published
+/// integration guidance therefore tells a scanner — correctly — that -32007 is
+/// normal under PoS and that it should ADVANCE to the next slot rather than
+/// alert.
+///
+/// A slot above the head is the opposite kind of answer. It is empty only in
+/// the sense that the future is empty: a block may land in it in seconds. Both
+/// used to be reported as -32007, with the same sentence, and that is a defect
+/// that **silently loses customer deposits**:
+///
+/// > A deposit scanner follows the guidance for -32007 and advances its cursor
+/// > past the head. Every slot above the head answers -32007, so the cursor
+/// > keeps advancing — through the tip, and on to slot numbers the chain will
+/// > not reach for hours. It NEVER RETURNS to those slots. When blocks finally
+/// > land in them, the deposits they carry are behind a cursor that already
+/// > passed by, and are credited to nobody.
+///
+/// So the two facts must be separable by a client that reads the number and
+/// nothing else. A scanner seeing this code must **not** skip the slot: it
+/// clamps its cursor back to `error.data.head_slot` and retries later.
+///
+/// # Measured against the head, not the wall clock
+///
+/// The comparison is against this node's own head slot — the same value
+/// `getchaininfo` reports as `slot` — and deliberately not against `wall_slot`.
+/// A synced node's head legitimately lags the wall clock by a slot or two, and
+/// those in-between slots are exactly where a scanner at the tip lives. Judging
+/// them against the wall clock would answer -32007 for slots the node has not
+/// reached, which is the deposit-losing bug in miniature, restricted to the tip
+/// — the one place deposits actually arrive. Judging against the head can only
+/// err the safe way: a slot that really was missed reads as
+/// `SLOT_IN_FUTURE` until the chain moves past it, and then settles to
+/// [`SLOT_EMPTY`] on its own. A client that waits is late; a client that skips
+/// is wrong forever.
+///
+/// `error.data` carries `head_slot` (and `wall_slot`, so a client can tell "this
+/// node is behind the network" from "this slot is genuinely ahead of the chain"
+/// and pick another upstream rather than wait).
+pub const SLOT_IN_FUTURE: i64 = -32012;
 
 /// A JSON-RPC error object: a code a client can branch on and a message a human
 /// can act on. Both halves are required — a bare code makes an operator read
@@ -249,6 +313,51 @@ impl RpcError {
         Self::new(TX_REFUSED_RETRYABLE, detail.into()).with_data(Json::obj(vec![
             ("retryable", Json::Bool(true)),
             ("until_slot", Json::u(until_slot)),
+        ]))
+    }
+
+    /// [`SLOT_IN_FUTURE`]: the slot is above this node's head, so the answer
+    /// is "not yet", not "never" — with the head where a client can read it.
+    ///
+    /// The wire shape is fixed:
+    ///
+    /// ```text
+    /// "data": { "retryable": true, "head_slot": 55493, "wall_slot": 55495,
+    ///           "requested_slot": 60494 }
+    /// ```
+    ///
+    /// `retryable` matches [`RpcError::tx_refused_retryable`]: it is the one
+    /// field a generic client can branch on without a table of Bloch error
+    /// numbers, and it is what keeps "may I skip this?" from being answered by
+    /// string-matching the message.
+    ///
+    /// `head_slot` is the whole point — it is where a scanner clamps its cursor
+    /// back to. `wall_slot` lets a client tell a node that is BEHIND THE
+    /// NETWORK (`head_slot` far below `wall_slot`: ask a different upstream)
+    /// from a slot that is genuinely ahead of the chain (`head_slot` close to
+    /// `wall_slot`: just wait). `requested_slot` echoes the question so a
+    /// pipelined client can match the answer to it without bookkeeping.
+    ///
+    /// All four are JSON numbers: slot indexes are nowhere near the 2^53
+    /// boundary that makes this module render satoshis as strings (see
+    /// [`Json::sat`]).
+    pub fn slot_in_future(requested_slot: u64, head_slot: u64, wall_slot: u64) -> Self {
+        Self::new(
+            SLOT_IN_FUTURE,
+            format!(
+                "slot {requested_slot} is above this node's head (head is at slot \
+                 {head_slot}, wall clock is at slot {wall_slot}): this node has not \
+                 reached it. This is NOT an empty slot and MUST NOT be skipped — a \
+                 block may still be produced here, and a scanner that advances past \
+                 it will never come back for the deposits in it. Clamp your cursor \
+                 to `error.data.head_slot` and retry."
+            ),
+        )
+        .with_data(Json::obj(vec![
+            ("retryable", Json::Bool(true)),
+            ("head_slot", Json::u(head_slot)),
+            ("wall_slot", Json::u(wall_slot)),
+            ("requested_slot", Json::u(requested_slot)),
         ]))
     }
 

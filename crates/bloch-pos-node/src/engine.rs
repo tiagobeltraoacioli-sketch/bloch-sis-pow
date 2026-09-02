@@ -2478,15 +2478,30 @@ impl Engine {
 
             RpcRequest::BlockBySlot(slot) => {
                 let Some((_, id)) = self.chain.iter().find(|(s, _)| *s == slot) else {
-                    // A slot with no canonical block is the ordinary PoS case —
-                    // a proposer missed its turn — and is reported as its own
-                    // code so a scanner advances instead of alerting.
+                    let head = self.head_slot_now();
+                    // Two different facts, and they must not share a code.
+                    //
+                    // ABOVE the head, the node has simply not got there yet: a
+                    // block may still land in this slot. Telling a scanner it
+                    // is empty is how a deposit cursor walks past the tip and
+                    // never comes back — see [`rpc::SLOT_IN_FUTURE`].
+                    //
+                    // The bound is the HEAD, not `wall_slot()`: a synced node's
+                    // head lags the wall clock by a slot or two, and those are
+                    // precisely the slots a scanner at the tip is asking about.
+                    if slot > head {
+                        return Err(RpcError::slot_in_future(slot, head, self.wall_slot()));
+                    }
+                    // At or below the head: the node reached this slot and
+                    // nobody proposed in it. That is the ordinary PoS case, and
+                    // it gets its own code so a scanner advances instead of
+                    // alerting.
                     return Err(RpcError::new(
                         rpc::SLOT_EMPTY,
                         format!(
-                            "no canonical block at slot {slot} (head is at slot {}); \
-                             a slot with no block is a missed proposal, not an error",
-                            self.head_slot_now()
+                            "no canonical block at slot {slot} (head is at slot \
+                             {head}); a slot with no block is a missed proposal, \
+                             not an error"
                         ),
                     ));
                 };
@@ -4960,6 +4975,163 @@ mod transfer_v2_end_to_end {
         assert!(
             !wire.contains("until_slot") && !wire.contains(r#""data""#),
             "a terminal refusal must carry no retry hint at all: {wire}"
+        );
+    }
+
+    /// A node whose head sits at slot 10 while the wall clock is far past it.
+    ///
+    /// `engine_at_wall_epoch` leaves the chain holding only genesis at slot 0,
+    /// which cannot express the case under test: there is no slot that is both
+    /// at-or-below the head and blockless. Appending one canonical entry at
+    /// slot 10 opens exactly that window — slots 1..=10 are reached and empty,
+    /// slots 11+ are unreached — with the wall clock thousands of slots ahead
+    /// of both, which is what lets the two rules be told apart. The entry
+    /// reuses the genesis id so that every lookup path still resolves.
+    fn engine_with_head_at_slot_10() -> Engine {
+        let (entries, _tx) = sweep_fixture(1);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let genesis_id = node.chain[0].1;
+        node.chain.push((10, genesis_id));
+        assert_eq!(node.head_slot_now(), 10);
+        node
+    }
+
+    /// **The defect: a slot above the head must not be answered as an empty
+    /// slot.**
+    ///
+    /// Both answers used to be `-32007` with the same sentence. Our published
+    /// guidance for `-32007` is "a missed proposal is normal under PoS, advance
+    /// to the next slot" — correct for a slot the node reached, and ruinous for
+    /// one it has not: a deposit scanner that follows it walks its cursor past
+    /// the head, reads every future slot as ordinary and empty, and NEVER
+    /// RETURNS to those slots when blocks land in them. The deposits are
+    /// credited to nobody.
+    ///
+    /// Both halves are asserted, because either alone can be satisfied wrongly:
+    /// without the past-slot control, "always return -32012" passes and the
+    /// ordinary missed proposal starts alarming every integrator; without the
+    /// future half, today's defect passes.
+    #[test]
+    fn a_slot_above_the_head_is_not_an_empty_slot() {
+        let mut node = engine_with_head_at_slot_10();
+        let head = node.head_slot_now();
+
+        // ── Reached, and blockless: the ordinary missed proposal ────────────
+        let RpcResult::Err(past) = node.serve_rpc(RpcRequest::BlockBySlot(5)) else {
+            panic!("a blockless slot must produce an RPC error");
+        };
+        assert_eq!(
+            past.code,
+            rpc::SLOT_EMPTY,
+            "-32007 is published to integrators as the missed proposal; a slot at \
+             or below the head must keep meaning exactly that: {past:?}"
+        );
+        assert!(
+            past.data.is_none(),
+            "a settled empty slot offers nothing to clamp to: {past:?}"
+        );
+
+        // ── Above the head: not reached, and must not be skipped ────────────
+        let future = head + 1;
+        assert!(
+            future < node.wall_slot(),
+            "the fixture must put the tested slot BELOW the wall clock, or this \
+             test cannot tell a head-based rule from a wall-clock-based one"
+        );
+        let RpcResult::Err(ahead) = node.serve_rpc(RpcRequest::BlockBySlot(future)) else {
+            panic!("an unreached slot must produce an RPC error");
+        };
+        assert_ne!(
+            ahead.code,
+            rpc::SLOT_EMPTY,
+            "THE DEFECT: a slot this node has not reached must not be reported \
+             with the code whose published advice is `advance past it` — that is \
+             how a deposit scanner loses deposits: {ahead:?}"
+        );
+        assert_eq!(ahead.code, rpc::SLOT_IN_FUTURE, "{ahead:?}");
+
+        // Far above the head, the answer is the same one: the PMO measured
+        // slot 99,999,999 answering -32007 against the live archival node.
+        let RpcResult::Err(far) = node.serve_rpc(RpcRequest::BlockBySlot(99_999_999)) else {
+            panic!("an unreached slot must produce an RPC error");
+        };
+        assert_eq!(far.code, rpc::SLOT_IN_FUTURE, "{far:?}");
+
+        // And the message says so in words, for the human reading a log.
+        let m = ahead.message.to_lowercase();
+        assert!(
+            m.contains("not") && m.contains("skip"),
+            "the message must say plainly that the slot must not be skipped: {}",
+            ahead.message
+        );
+
+        // Both codes survive to the wire, distinct, in the literal bytes.
+        let wire_past = on_the_wire(Err(past));
+        let wire_ahead = on_the_wire(Err(ahead));
+        assert!(wire_past.contains(r#""code":-32007"#), "{wire_past}");
+        assert!(wire_ahead.contains(r#""code":-32012"#), "{wire_ahead}");
+        assert!(
+            !wire_ahead.contains(r#""code":-32007"#),
+            "the future slot must not carry the empty-slot code: {wire_ahead}"
+        );
+    }
+
+    /// **The head slot must be machine-readable**, not a number in a sentence.
+    ///
+    /// `head_slot` is the value the client ACTS on: it is where a scanner
+    /// clamps its cursor back to after asking past the tip. The messages on
+    /// this surface are explicitly allowed to be reworded while the codes are
+    /// not, so a client that has to regex `head is at slot 55493` out of prose
+    /// is a client that breaks on the next rewording — and breaking here means
+    /// losing deposits again.
+    #[test]
+    fn a_future_slot_carries_the_head_slot_in_error_data() {
+        let mut node = engine_with_head_at_slot_10();
+        let head = node.head_slot_now();
+        let wall = node.wall_slot();
+        let asked = head + 7;
+
+        let RpcResult::Err(e) = node.serve_rpc(RpcRequest::BlockBySlot(asked)) else {
+            panic!("an unreached slot must produce an RPC error");
+        };
+        let data = e
+            .data
+            .as_ref()
+            .expect("a future-slot error must carry `error.data`");
+
+        assert_eq!(
+            data.get("head_slot").and_then(rpc::Json::as_u64),
+            Some(head),
+            "the head must be readable without parsing the message: {data:?}"
+        );
+        assert_eq!(
+            data.get("requested_slot").and_then(rpc::Json::as_u64),
+            Some(asked),
+            "{data:?}"
+        );
+        assert_eq!(data.get("retryable"), Some(&rpc::Json::Bool(true)), "{data:?}");
+        // `wall_slot` is what lets a client tell "this node is behind the
+        // network" from "this slot is genuinely ahead of the chain". It is
+        // read from the same clock the assertion is, so it may have ticked.
+        let reported_wall = data
+            .get("wall_slot")
+            .and_then(rpc::Json::as_u64)
+            .expect("a future-slot error must report the wall slot");
+        assert!(reported_wall >= wall, "{data:?}");
+        // NUMBERS, not strings: slot indexes are nowhere near 2^53, so the R3
+        // string treatment for satoshis would only make a client parse twice.
+        for k in ["head_slot", "wall_slot", "requested_slot"] {
+            assert!(
+                matches!(data.get(k), Some(rpc::Json::Num(_))),
+                "{k} must be a JSON number: {data:?}"
+            );
+        }
+
+        // And it is really on the wire, in the bytes a client receives.
+        let wire = on_the_wire(Err(e));
+        assert!(
+            wire.contains(&format!(r#""head_slot":{head}"#)),
+            "the wire must carry the head as a number: {wire}"
         );
     }
 
