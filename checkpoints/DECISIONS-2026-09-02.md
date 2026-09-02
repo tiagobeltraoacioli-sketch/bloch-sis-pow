@@ -273,3 +273,25 @@ its workdir.
 
 Run it on the exact binary the ceremony will use. A green drill on a different
 build is a claim about a different binary.
+
+Measured 2026-09-02: **25 passed / 0 failed** on the `converge/ws-tool` build
+(hardened assembler gate), **19 / 0** on the `7c311b04` build (no assembler
+gate — section 3 skips itself and says so). Both re-minted epoch 1536 from the
+two archivals byte-identically to the committed artifact, digest
+`a5d047674074251c7a2031266ac2a3c7e05a82960959ffef847bb4291e744e44`.
+
+### One result worth reading twice
+
+```
+FRESHNESS  epoch 1536 vs now 3600: age 2064 of 2016 epochs — EXPIRED
+VERDICT: ACCEPTED by ws::verify_envelope.
+```
+
+**A green `VERDICT` is not a usable checkpoint.** Signature validity and
+freshness are two independent gates: `ws::verify_envelope` has no clock by
+design (§2.1 — no expiry field, so the artifact verifies identically on every
+machine), and the window is enforced at `ws_boot::boot`. An operator who reads
+only the `VERDICT:` line will hand an exchange an expired anchor and be
+surprised when the node refuses to start. The `FRESHNESS` line is the one that
+decides usability, and it only appears when `--rpc` or `--now-epoch` is passed.
+Pass it, always.
