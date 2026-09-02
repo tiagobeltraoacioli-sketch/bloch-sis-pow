@@ -698,8 +698,13 @@ Correcting these is cheap now and expensive after someone plans against them.
    the node is "a 134-line skeleton" with "zero lines" for `store/`, `net/`,
    `genesis/`; the node is now ~3,600 lines across `engine.rs` (1303),
    `ws_boot.rs` (949), `genesis.rs` (577), `main.rs` (378), `net.rs` (264),
-   `codec.rs` (246), `store.rs` (166), `keys.rs` (159). **GAP-3 is fixed**
-   (`PosTransaction::SlashingEvidence` exists, `transition.rs:251`). **GAP-2 is
+   `codec.rs` (246), `store.rs` (166), `keys.rs` (159). **GAP-3 is NOT fixed** — this
+   line said it was, and was CORRECTED 2026-09-01.
+   `PosTransaction::SlashingEvidence` exists and `apply_slashing_evidence` is
+   complete, which closed the *transition* half. The wire half was never
+   closed: `from_canonical_bytes` refuses tag `0x05` unconditionally on every
+   ingress path (block body, gossip, `sendrawtransaction`), nothing constructs
+   the transaction outside tests, and no activation constant exists. **GAP-2 is
    half-fixed** — the parallel validator was deleted (commit `a79f322`), but a
    *new* divergence was recorded 2026-08-12 (`derive.rs:452-464`, §6.3).
 2. **`BLOCH-POS-NODE-INTEGRATION.md` §0/§7.1** says the PoS crates carry their

@@ -596,10 +596,25 @@ demoted to a display value with no security meaning
 (`docs/specs/BLOCH-RPC-V4.md` §0 R1, §3.1).
 
 This is a different kind of claim, not a stronger number. Depth is probabilistic
-and continuous; finalization is a discrete, attributable commitment — reverting
-a finalized checkpoint requires a supermajority of stake to have signed
-conflicting votes, which is detectable and slashable. **Credit on `finalized`,
-not on depth.**
+and continuous; finalization is discrete.
+
+> **RETRACTION (2026-09-01).** This paragraph used to continue: "reverting a
+> finalized checkpoint requires a supermajority of stake to have signed
+> conflicting votes, which is detectable and slashable. **Credit on
+> `finalized`, not on depth.**" The equivocation is indeed detectable — the
+> node detects it today and logs it. It is **not slashable**: evidence rides
+> on wire tag `0x05`, `PosTransaction::from_canonical_bytes` refuses that tag
+> unconditionally on every ingress path, nothing constructs the transaction
+> outside tests, and no activation constant exists. Read on 2026-09-01 at
+> epoch 1726 from two agreeing archivals: 64 validators, 64 active, all
+> `slashed: false` — and equivocation on this fleet is detected and logged but
+> never prosecuted. (A figure of "48 double-signing validators" has circulated
+> internally. It is **not substantiated** in this repository and no RPC
+> exposes equivocation history; do not quote it. Nothing here rests on it.) So
+> finalization is a discrete commitment with **no attributable cost
+> attached**. Do not credit on `finalized` alone; see
+> `docs/integration/BLOCH-GENESIS4-EXCHANGE-INTEGRATION.md` §5 (Settlement)
+> for the guidance that replaces it.
 
 The honest caveat that belongs beside this: finality is only as decentralized as
 the validator set that votes, and the Genesis-4 validator set does not exist
