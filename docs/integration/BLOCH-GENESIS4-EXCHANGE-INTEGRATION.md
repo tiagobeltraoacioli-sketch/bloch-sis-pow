@@ -139,15 +139,71 @@ Exact, single-output answer. This is the primitive for confirming an individual 
 `next_base_fee_millisat_per_gas` is the price the next block will charge. Read it before
 building a transfer.
 
-### Error codes
+### Error codes — the decision table
 
-| Code | Meaning |
-|---|---|
-| `-32602` | invalid params — the message names the field |
-| `-32000` | general node error |
-| `-32001` | validator not found |
-| `-32002` | transaction decode failed — do not retry unchanged |
-| `-32601` | method not found |
+Branch on the **code**, and on `error.data` where it exists. Never on the message:
+codes and `data` are the contract, messages are prose and get reworded.
+
+| Code | Name | Terminal? | What to do |
+|---|---|---|---|
+| `-32700` / `-32600` / `-32601` / `-32602` | parse / invalid request / method not found / invalid params | **Terminal** | Fix the client. Never retry unchanged. |
+| `-32603` | internal error | Retryable | A bug in the node. Retry once, then report it. |
+| `-32000` | `BLOCK_NOT_FOUND` | **Depends — read `data.canonical`** | `true`: the block is canonical and this node pruned it. It exists. **Fetch it from an archival — do not conclude the block is absent.** `false`: this node cannot say whether it ever existed (unsynced, pruned, other branch, or never was). |
+| `-32001` | `VALIDATOR_NOT_FOUND` | **Terminal** | The index is not in the committed registry. |
+| `-32002` | `TX_DECODE_FAILED` | **Terminal** | The bytes are not a canonical transaction. Rebuild; never resubmit these bytes. |
+| `-32003` | `MEMPOOL_FULL` | Retryable | Capacity only — the transaction was **not** judged invalid. Back off and resubmit the same bytes. |
+| `-32004` | `NODE_UNAVAILABLE` | Retryable | The consensus thread did not answer. Retry, or fail over to another node. |
+| `-32005` | `NO_TRANSACTION_INDEX` | **Terminal** | This build has no txid lookup. Do not retry; see §"There are no transaction ids". |
+| `-32006` | `NO_WALLET` | **Terminal** | The node mints no keys and no addresses. Generate them yourself. |
+| `-32007` | `SLOT_EMPTY` | **Depends — read `data.settled`** | `true`: the slot is behind the head and settled empty (a missed proposal). **Advance.** `false`: this node has not reached the slot. **Do not advance — it may still fill.** |
+| `-32008` | `TX_REFUSED` | **Terminal** | Judged on its merits — an unverifiable signature, no inputs, no outputs, a format behind a flag day. Retrying these bytes cannot help. |
+| `-32009` | `TX_BARRED` | **Retryable, and it says when** | This node's proposer watched the transition refuse it against a *state*. Wait for the head to pass `data.until_slot`, then resubmit the **same** bytes. See the two remedies below. |
+
+#### `-32008` vs `-32009`: the split, and why you may not see `-32009` yet
+
+These were **one code**. Until the split, `-32008` carried both the terminal verdict and
+the retryable bar, separable only by the English in `message` — which is exactly the
+parse-the-prose failure a code-based contract exists to prevent. A withdrawal retry loop
+branching on `-32008` alone was wrong half the time, in whichever direction hurt:
+abandoning a transfer that would have landed, or hammering bytes that never will.
+
+`-32008` **kept the terminal half**. If you are already integrated against it as "give
+up", that belief was right half the time before and is right always now. `-32009` is a
+code you will not recognise until you add it; your default branch should surface it to a
+human rather than act on it, which is the safe direction while you update.
+
+#### A bar has two remedies, and `data` tells you which
+
+`-32009` fires for two different reasons and only one of them is fixed by waiting:
+
+1. **Wait.** The transfer spends an output this branch does not have — built against a
+   node on another branch, or its parent has not landed. Resubmit after `data.until_slot`.
+2. **Reprice.** Conservation is a **strict equality** (`spent == created + fee`) and the
+   base fee belongs to the *block*, not to the transaction. Outputs built at an old price
+   cannot balance a new block, and no amount of waiting changes that. Rebuild the outputs
+   against `data.next_base_fee_millisat_per_gas` (also on `getmempoolinfo`).
+
+If you resubmit identical bytes and are barred a second time, you are looking at the
+price, not at the clock.
+
+#### The trap: a stale fee is accepted, then dropped in silence
+
+A transfer priced against a stale base fee **passes admission** — `sendrawtransaction`
+returns success, and it gossips across the mesh. The strict-equality check runs inside
+block production, where the proposer drops it without telling anyone. There is no error
+to catch.
+
+Therefore: **confirmation must be positive, never the absence of an error.** A `200` from
+`sendrawtransaction` means "admitted to a mempool", not "will confirm".
+
+#### There are no transaction ids
+
+`gettransaction` is refused by design (`-32005`), and `sendrawtransaction`'s `tx_hash` is
+**node-local** — no other node, block or client agrees on it. Do not key anything on it.
+
+A retry loop must key on **outpoint and balance**: poll `listunspent` / `getbalance` for
+the destination `script_hash` and treat the appearance of the expected outputs as the only
+confirmation. Positive evidence, from the eUTXO set, at a height you have read back.
 
 ---
 

@@ -988,3 +988,260 @@ fn a_body_split_across_packets_is_reassembled() {
     assert!(out.starts_with("HTTP/1.1 200"), "got {out}");
     assert_eq!(spy.last(), Some(RpcRequest::BlockBySlot(41_290)));
 }
+
+// ─── The error-code contract, guarded ───────────────────────────────────────
+//
+// An integrator branches on the CODE. That is the entire promise of the table
+// in `rpc.rs`, and a promise nothing checks is a comment. Two ways it rots, and
+// both have happened on this tree:
+//
+//   * a constant exists and the table does not list it — `-32008` shipped this
+//     way, defined at `rpc.rs` and absent from the table above it, so the one
+//     document an integrator reads did not mention the code they would meet
+//     most; and
+//   * two causes a client must answer DIFFERENTLY share one code — `-32008`
+//     also shipped this way, carrying both a terminal refusal and a retryable
+//     bar, told apart only by the English in `message`.
+//
+// The scan below is a source tripwire in the idiom of `prova.rs` and
+// `coherence_replay_identity.rs`, for the same reason those are: it asserts the
+// WIRING, not the behaviour, and the wiring is what silently came undone.
+// `include_str!("../rpc.rs")` reads the module under test and NOT this file, so
+// no needle here can match itself.
+
+/// Every `pub const … : i64 = -320xx` in `rpc.rs`, as (name, code).
+fn declared_codes() -> Vec<(String, i64)> {
+    let src = include_str!("../rpc.rs");
+    let mut out = Vec::new();
+    for line in src.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("pub const ") else { continue };
+        let Some((name, tail)) = rest.split_once(": i64 = ") else { continue };
+        let Some(num) = tail.strip_suffix(';') else { continue };
+        let Ok(code) = num.trim().parse::<i64>() else { continue };
+        // The JSON-RPC 2.0 implementation-defined server-error range. An
+        // `i64` constant in this module that is not an error code (a limit, a
+        // width) is not part of the contract and must not be dragged into the
+        // table; an error code outside the range would be a spec violation
+        // this scan should not quietly normalise.
+        if !(-32099..=-32000).contains(&code) {
+            continue;
+        }
+        out.push((name.trim().to_string(), code));
+    }
+    out
+}
+
+/// Every row of the table in `rpc.rs`'s "The error contract" comment that names
+/// a named constant, as (name, code). Rows for the JSON-RPC reserved range
+/// (`-32700`, `-32600`, …) name no constant and are skipped: they are defined
+/// by the specification, not by this file.
+fn tabled_codes() -> Vec<(String, i64)> {
+    let src = include_str!("../rpc.rs");
+    let mut out = Vec::new();
+    for line in src.lines() {
+        let line = line.trim();
+        let Some(row) = line.strip_prefix("// |") else { continue };
+        let cells: Vec<&str> = row.split('|').map(str::trim).collect();
+        if cells.len() < 3 {
+            continue;
+        }
+        let Some(code) = cells[0].strip_prefix('`').and_then(|c| c.strip_suffix('`')) else {
+            continue;
+        };
+        let Ok(code) = code.parse::<i64>() else { continue };
+        let Some(name) = cells[1].strip_prefix('`').and_then(|n| n.strip_suffix('`')) else {
+            continue; // a reserved-range row, which names its cause in prose
+        };
+        out.push((name.to_string(), code));
+    }
+    out
+}
+
+/// **The table and the constants must agree, in both directions.**
+///
+/// One direction alone is half a guard. "Every constant is documented" lets a
+/// table row outlive the code it described, so an integrator writes a branch
+/// for a code no node will ever send. "Every row has a constant" lets a new
+/// code ship undocumented, which is how `-32008` reached a client.
+#[test]
+fn every_error_code_is_declared_and_documented_both_ways() {
+    let declared = declared_codes();
+    let tabled = tabled_codes();
+
+    // A floor, not a count. If the parser stops matching the source — a
+    // rustfmt pass, a `pub(crate)`, a type alias — both loops below iterate
+    // nothing and pass, which is the vacuous-guard failure this whole file is
+    // written against. Deliberately well below the ten codes that exist, so a
+    // legitimate deletion trips the real assertion and not this one.
+    assert!(
+        declared.len() >= 8,
+        "the scan found only {} error-code constants — the parser has stopped \
+         matching rpc.rs, which would make this whole guard vacuous",
+        declared.len()
+    );
+
+    for (name, code) in &declared {
+        assert!(
+            tabled.iter().any(|(n, c)| n == name && c == code),
+            "`{name}` = {code} is a live error code with NO ROW in the contract \
+             table in rpc.rs. An integrator reads that table; a code missing from \
+             it is a code they will meet and not recognise. Add the row."
+        );
+    }
+    for (name, code) in &tabled {
+        assert!(
+            declared.iter().any(|(n, c)| n == name && c == code),
+            "the contract table documents `{name}` = {code}, and no such constant \
+             exists in rpc.rs. Either the constant was renamed or removed and the \
+             row outlived it — a client would branch on a code nothing sends."
+        );
+    }
+
+    // And no two names on one number: the table is keyed by code, so a
+    // duplicate would silently document one of them as the other.
+    for (i, (n1, c1)) in declared.iter().enumerate() {
+        for (n2, c2) in &declared[i + 1..] {
+            assert_ne!(
+                c1, c2,
+                "`{n1}` and `{n2}` are both {c1}. Two names for one code is the \
+                 same defect as one code for two causes, seen from the other side."
+            );
+        }
+    }
+}
+
+/// **The terminal refusal and the retryable bar must not share a code.**
+///
+/// This is the specific collapse that shipped, and the specific one a
+/// withdrawal retry loop cannot survive: `Refusal::Invalid` means rebuild or
+/// give up, `Refusal::PreviouslyRefused` means wait for `until_slot` and send
+/// the same bytes, and while both answered `-32008` a client branching on the
+/// code was wrong for one of them no matter which way it branched.
+///
+/// Read out of `engine.rs`'s dispatch rather than driven through it: the arms
+/// live inside `serve_rpc`, which needs a keystore, a genesis manifest and a
+/// mesh listener to reach. The behavioural half of this claim is
+/// `the_bar_is_answered_before_capacity` and the flag-day control in
+/// `engine.rs`; this half is the one that catches the two arms being merged
+/// back together, which is an edit no behavioural test in this module can see.
+#[test]
+fn the_two_refusals_do_not_share_one_code() {
+    assert_ne!(
+        TX_REFUSED, TX_BARRED,
+        "the terminal and retryable refusals are back on one code"
+    );
+
+    let engine = include_str!("../engine.rs");
+
+    // The needles are assembled from pieces for the reason the sweep tripwire
+    // in engine.rs states: written whole they would appear in a source file
+    // this scan reads, and a tripwire that matches itself can never go red.
+    let barred_arm = concat!("Err(Refusal::PreviouslyRefused { until_slot }) =>");
+    assert!(
+        engine.contains(barred_arm),
+        "the retryable refusal no longer has its own dispatch arm in serve_rpc"
+    );
+
+    // The retryable arm must go through the constructor that carries
+    // `until_slot` as structured data...
+    assert!(
+        engine.contains(concat!("RpcError::tx_", "barred(")),
+        "the retryable refusal stopped answering with tx_barred — if it went back \
+         to RpcError::new(rpc::TX_REFUSED, ...) it is collapsed onto the terminal \
+         code again, and `until_slot` is back inside an English sentence"
+    );
+
+    // ...and the terminal code must be RAISED from exactly one place. Two
+    // raises is precisely the shape this test exists to refuse — it is what
+    // `-32008` looked like before the split.
+    //
+    // Whitespace is stripped first so the count follows the CODE and not the
+    // formatting: a rustfmt pass that rewraps the argument list must not
+    // silently disarm the guard. It also keeps the needle from matching the
+    // assertions in engine.rs's own tests, which mention the constant but do
+    // not raise it (`assert_eq!(e.code, rpc::TX_REFUSED, ...)` has a comma
+    // before the constant, a construction has an open paren).
+    let dense: String = engine.chars().filter(|c| !c.is_whitespace()).collect();
+    let raise = concat!("RpcError::new(rpc::TX_", "REFUSED,");
+    let terminal_raises = dense.matches(raise).count();
+    assert_eq!(
+        terminal_raises, 1,
+        "rpc::TX_REFUSED is raised from {terminal_raises} places in engine.rs. It \
+         names ONE cause — a transaction judged on its merits, never retryable. \
+         A second raise means some other condition is being reported as terminal, \
+         and a client that gives up on -32008 will give up on something it \
+         should have retried."
+    );
+}
+
+/// **`until_slot` reaches the client as a number, not as prose.**
+///
+/// The point of the split is that a retry loop never parses English. A code
+/// that says "retryable" and a message that hides the deadline in a sentence
+/// would leave the client regexing anyway, so the structured half is asserted
+/// on the actual wire bytes.
+#[test]
+fn a_barred_refusal_carries_its_lift_slot_as_structured_data() {
+    let e = RpcError::tx_barred(41_203, 41_190, 1_000);
+    assert_eq!(e.code, TX_BARRED);
+
+    let wire = envelope(Json::u(1), Err(e));
+    let v = parse_json(&wire).expect("the envelope must be JSON");
+    let err = v.get("error").expect("an error envelope");
+    assert_eq!(error_code(&v), Some(TX_BARRED));
+
+    let data = err.get("data").expect(
+        "a retryable refusal with no `data` is a retryable refusal a client \
+         must read English to act on",
+    );
+    // A JSON NUMBER, not a string and not a sentence: `Json::u` emits a bare
+    // token, so this is the raw wire form.
+    assert_eq!(
+        data.get("until_slot"),
+        Some(&Json::Num("41203".to_string())),
+        "until_slot must be a number a client can compare against the head"
+    );
+    assert_eq!(
+        data.get("current_slot"),
+        Some(&Json::Num("41190".to_string())),
+        "current_slot must travel with it, or `wait until 41203` has no duration"
+    );
+    assert_eq!(data.get("retryable"), Some(&Json::Bool(true)));
+    // R3: a price is satoshi-denominated, so it goes out as a STRING. That is
+    // the module rule, not an inconsistency with the slots above — slots are
+    // counts and fit a double, 10^19 millisatoshi does not.
+    assert_eq!(
+        data.get("next_base_fee_millisat_per_gas"),
+        Some(&Json::Str("1000".to_string())),
+        "a bar has two remedies, and only the price distinguishes them"
+    );
+
+    // The wire text itself: `"until_slot":41203`, unquoted.
+    assert!(
+        wire.contains(r#""until_slot":41203"#),
+        "the lift slot must be a bare JSON number on the wire: {wire}"
+    );
+
+    // And the message still explains, for the human reading a log — `data`
+    // is added to the answer, never substituted for it.
+    let msg = err.get("message").and_then(Json::as_str).unwrap();
+    assert!(msg.contains("barred until slot 41203"), "the message must still say why: {msg}");
+    assert!(msg.contains("Retryable"), "and must say which of the two it is: {msg}");
+}
+
+/// **An error with no structured half must not grow a `null` data member.**
+///
+/// Absence and `"data": null` are the same to a client that checks for the
+/// member, but they are not the same promise, and the smaller one is right:
+/// every other error on this surface says everything in its code and message.
+#[test]
+fn errors_without_data_omit_the_member_entirely() {
+    let wire = envelope(Json::u(1), Err(RpcError::no_wallet()));
+    assert!(
+        !wire.contains("\"data\""),
+        "an error with nothing structured to say must not carry an empty `data`: {wire}"
+    );
+    let v = parse_json(&wire).unwrap();
+    assert_eq!(error_code(&v), Some(NO_WALLET));
+}

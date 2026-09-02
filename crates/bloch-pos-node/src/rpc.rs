@@ -115,14 +115,25 @@ const UTXO_PAGE_MAX: usize = 1_000;
 // | `-32601` | method not found         | No such method in this build. |
 // | `-32602` | invalid params           | Method exists, arguments do not fit (bad hex, missing field, out of range). |
 // | `-32603` | internal error           | A bug in this node. Report it. |
-// | `-32000` | `BLOCK_NOT_FOUND`        | No block with that id is known. Retry after syncing, or it never existed. |
+// | `-32000` | `BLOCK_NOT_FOUND`        | No block body here. `data.canonical` decides: `true` — it exists and this node pruned it, **ask an archival**; `false` — this node cannot say whether it ever existed. |
 // | `-32001` | `VALIDATOR_NOT_FOUND`    | Index is not in the committed registry. |
 // | `-32002` | `TX_DECODE_FAILED`       | Bytes were valid hex but are not a canonical transaction. Do not retry unchanged. |
 // | `-32003` | `MEMPOOL_FULL`           | Admission refused for capacity. Retry later — the transaction is not invalid. |
 // | `-32004` | `NODE_UNAVAILABLE`       | Consensus thread did not answer, or is shutting down. Retry. |
 // | `-32005` | `NO_TRANSACTION_INDEX`   | This build cannot look a transaction up by id — see [`RpcError::no_transaction_index`]. Not a transient failure. |
 // | `-32006` | `NO_WALLET`              | This node holds no wallet and mints no addresses — see [`RpcError::no_wallet`]. Not a transient failure. |
-// | `-32007` | `SLOT_EMPTY`             | The slot exists and carries no canonical block. **Normal under PoS** (a missed proposal); advance to the next slot. |
+// | `-32007` | `SLOT_EMPTY`             | No canonical block at that slot. `data.settled` decides: `true` — behind the head, a missed proposal, **advance**; `false` — this node has not reached the slot, **do not advance**, it may still fill. |
+// | `-32008` | `TX_REFUSED`             | **Terminal.** The transaction was judged on its merits and cannot be admitted. Never resubmit these bytes. |
+// | `-32009` | `TX_BARRED`              | **Retryable.** This node's proposer watched the transition refuse it against a STATE; barred until `data.until_slot`. Resubmit the same bytes after that slot. |
+//
+// The last two are the pair this table exists for. They used to share
+// `-32008`, told apart only by the English in `message` — which is precisely
+// the parse-the-prose failure the contract forbids, and it faced a client
+// building a withdrawal retry loop with a coin flip: abandon a good transfer,
+// or hammer a dead one. `-32008` kept the terminal half, so a client written
+// against the old code keeps a belief that is now strictly true; the
+// retryable half moved to a code such a client does not recognise, which its
+// default branch surfaces to a human instead of acting on wrongly.
 
 /// No block with that id is known to this node.
 pub const BLOCK_NOT_FOUND: i64 = -32000;
@@ -141,10 +152,43 @@ pub const NO_WALLET: i64 = -32006;
 /// The slot carries no canonical block — a missed proposal, not an error state.
 pub const SLOT_EMPTY: i64 = -32007;
 
-/// The node refused a submitted transaction on its merits — it was judged
-/// invalid, not deferred. Distinct from [`MEMPOOL_FULL`] because the client's
-/// correct response is opposite: never resubmit these bytes.
+/// **Terminal.** The node refused a submitted transaction on its merits — it
+/// was judged invalid, not deferred. Distinct from [`MEMPOOL_FULL`] because the
+/// client's correct response is opposite: never resubmit these bytes.
+///
+/// This code is terminal and ONLY terminal. It carried a second, retryable
+/// meaning until the two were split; that half is now [`TX_BARRED`]. The
+/// direction of the split is deliberate — a client already branching on
+/// `-32008` as "give up" was right half the time before and is right always
+/// now, because nothing retryable is left under this code.
 pub const TX_REFUSED: i64 = -32008;
+
+/// **Retryable, and it says when.** This node's own proposer already put these
+/// bytes in a candidate block and the transition refused them, so they are
+/// barred from the mempool for a bounded window.
+///
+/// Distinct from [`TX_REFUSED`] because the verdict is of a different kind.
+/// `TX_REFUSED` judges the BYTES — an unverifiable signature, an empty witness
+/// table — and no passage of time changes that. This judges the bytes AGAINST A
+/// STATE: the usual cause is spending an output this branch does not have,
+/// because the transfer was built against a node on another branch or its
+/// parent has not landed. That can stop being true, so the bar lifts on its
+/// own.
+///
+/// The lift slot travels as **structured data**, not prose: the error object
+/// carries `data.until_slot` (a JSON number) and `data.current_slot`. A client
+/// waits for the chain to pass `until_slot` — `getchaininfo` reports the head
+/// slot — and resubmits the SAME bytes. Nothing about the transaction needs to
+/// change, which is the whole difference from `-32008`.
+///
+/// With one exception, and `data` carries what it needs too. A stale fee also
+/// lands here: conservation is a strict EQUALITY and the base fee belongs to
+/// the block, not to the transaction, so outputs built at an old price cannot
+/// balance a new block and the transition refuses them. Waiting does not fix
+/// that — rebuilding the outputs at `data.next_base_fee_millisat_per_gas`
+/// does. A client that resubmits identical bytes and is barred a second time
+/// is looking at the price, not at the clock.
+pub const TX_BARRED: i64 = -32009;
 
 /// A JSON-RPC error object: a code a client can branch on and a message a human
 /// can act on. Both halves are required — a bare code makes an operator read
@@ -153,11 +197,76 @@ pub const TX_REFUSED: i64 = -32008;
 pub struct RpcError {
     pub code: i64,
     pub message: String,
+    /// JSON-RPC 2.0 §5.1 `data`: the machine-readable half of the answer.
+    ///
+    /// A code says WHICH failure and a message says why to a human; anything a
+    /// client must compute with belongs here, never in the message. The
+    /// motivating case is [`TX_BARRED`]'s `until_slot` — a retry loop needs the
+    /// number, and "barred until slot 41203" in prose means a regex against a
+    /// sentence this module reserves the right to reword.
+    ///
+    /// `None` for every error whose code and message already say everything,
+    /// and omitted from the wire entirely when `None` rather than sent as
+    /// `null` — an absent member and a null member are the same to a client
+    /// that checks, and absence is the smaller promise.
+    pub data: Option<Json>,
 }
 
 impl RpcError {
     pub fn new(code: i64, message: impl Into<String>) -> Self {
-        RpcError { code, message: message.into() }
+        RpcError { code, message: message.into(), data: None }
+    }
+
+    /// Attach the structured half.
+    pub fn with_data(mut self, data: Json) -> Self {
+        self.data = Some(data);
+        self
+    }
+
+    /// [`TX_BARRED`] — refused against a state, and here is when to try again.
+    ///
+    /// Both slots go out as numbers so a client can subtract them without
+    /// touching the message. `current_slot` is included because the answer
+    /// "wait until 41203" is useless without "it is 41190 now": a client that
+    /// has just booted, or that talks to several nodes, has no other way to
+    /// turn the lift slot into a duration, and the head it would otherwise
+    /// read from `getchaininfo` is a second round trip against a node that may
+    /// not be this one.
+    pub fn tx_barred(until_slot: u64, current_slot: u64, next_base_fee: u128) -> Self {
+        Self::new(
+            TX_BARRED,
+            format!(
+                "this node's proposer already had the transition refuse this \
+                 transaction, so it is barred until slot {until_slot} (now {current_slot}). \
+                 The usual cause is that it spends an output this chain does not have — \
+                 either it was built against a node on a different branch, or its \
+                 parent transaction has not landed yet. Retryable: resubmit the SAME \
+                 bytes once the head passes `data.until_slot`; if the parent is still \
+                 pending, wait for it to confirm first."
+            ),
+        )
+        .with_data(Json::obj(vec![
+            ("until_slot", Json::u(until_slot)),
+            ("current_slot", Json::u(current_slot)),
+            ("retryable", Json::Bool(true)),
+            // The price, because a bar has TWO remedies and the message
+            // cannot tell which one this is.
+            //
+            // A transfer is barred when the transition refused it against a
+            // state, and one common way to earn that is a stale fee:
+            // conservation is a strict equality (`spent == created + fee`,
+            // `transition.rs`, ValueNotConserved) and the base fee is the
+            // block's, not the transaction's, so outputs built against
+            // yesterday's price cannot balance today's block. Waiting for
+            // `until_slot` does not fix that one — only rebuilding the
+            // outputs at the current price does. Handing back the price the
+            // next block will charge lets a client tell "wait" from
+            // "reprice" without a second call to `getmempoolinfo`.
+            (
+                "next_base_fee_millisat_per_gas",
+                Json::sat(next_base_fee),
+            ),
+        ]))
     }
 
     /// -32700: the body was not JSON.
@@ -253,7 +362,7 @@ pub type RpcResult = Result<Json, RpcError>;
 /// satoshi amount must survive a round trip, and it cannot if it passes through
 /// a double. This layer never does arithmetic on a parsed number, so the raw
 /// token is not merely sufficient — it is strictly more faithful.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Json {
     Null,
     Bool(bool),
@@ -930,17 +1039,23 @@ fn envelope(id: Json, outcome: RpcResult) -> String {
         ]),
         // R4: failures are the top-level `error` object, never a string inside
         // `result` under HTTP 200.
-        Err(e) => Json::Obj(vec![
-            ("jsonrpc".into(), Json::s("2.0")),
-            ("id".into(), id),
-            (
-                "error".into(),
-                Json::obj(vec![
-                    ("code", Json::Num(e.code.to_string())),
-                    ("message", Json::s(e.message)),
-                ]),
-            ),
-        ]),
+        Err(e) => {
+            // `data` is APPENDED, never substituted for the message: a client
+            // that ignores it must still get a complete answer, and a human
+            // reading a log must not have to reassemble one.
+            let mut err = vec![
+                ("code".to_string(), Json::Num(e.code.to_string())),
+                ("message".to_string(), Json::s(e.message)),
+            ];
+            if let Some(d) = e.data {
+                err.push(("data".to_string(), d));
+            }
+            Json::Obj(vec![
+                ("jsonrpc".into(), Json::s("2.0")),
+                ("id".into(), id),
+                ("error".into(), Json::Obj(err)),
+            ])
+        }
     };
     body.to_string()
 }

@@ -2468,34 +2468,89 @@ impl Engine {
                     // A slot with no canonical block is the ordinary PoS case —
                     // a proposer missed its turn — and is reported as its own
                     // code so a scanner advances instead of alerting.
+                    //
+                    // BUT THIS CODE ANSWERS TWO QUESTIONS, and a scanner must
+                    // act on them oppositely. Below the head, the slot is
+                    // settled empty and advancing is right. AT OR ABOVE the
+                    // head, the slot has simply not happened on this node yet —
+                    // and "a missed proposal, not an error" told a deposit
+                    // scanner to advance PAST a slot that may still be filled,
+                    // which silently loses every deposit in it. That is the
+                    // same defect as `-32008`'s two meanings, one layer over,
+                    // and the same reason the answer belongs in `data` rather
+                    // than in a sentence naming the head slot.
+                    //
+                    // No new code: `-32007` still means exactly "no canonical
+                    // block here", which is true both ways. What the client
+                    // needs is which of the two it is, as a boolean it can
+                    // branch on without reading the message.
+                    let head = self.head_slot_now();
+                    let settled = slot < head;
                     return Err(RpcError::new(
                         rpc::SLOT_EMPTY,
                         format!(
-                            "no canonical block at slot {slot} (head is at slot {}); \
-                             a slot with no block is a missed proposal, not an error",
-                            self.head_slot_now()
+                            "no canonical block at slot {slot} (head is at slot {head}); {}",
+                            if settled {
+                                "the slot is behind the head and settled empty — a missed \
+                                 proposal, not an error; advance"
+                            } else {
+                                "the slot is NOT behind the head, so this node has not \
+                                 reached it yet — do not treat it as empty; wait or ask \
+                                 a node with a further head"
+                            }
                         ),
-                    ));
+                    )
+                    .with_data(rpc::Json::obj(vec![
+                        ("slot", rpc::Json::u(slot)),
+                        ("head_slot", rpc::Json::u(head)),
+                        // The whole point: `true` means advance, `false` means
+                        // this answer is provisional and advancing loses data.
+                        ("settled", rpc::Json::Bool(settled)),
+                    ])));
                 };
                 let id = *id.as_bytes();
                 let env = self.envelope_by_id(&id).ok_or_else(|| {
+                    // The SAME code as the by-id lookup below, and a different
+                    // fact. Here the chain index names the block, so it is
+                    // canonical and it happened — this node simply does not
+                    // hold the body. The client must fetch it from an archival,
+                    // never conclude the block does not exist. The by-id arm
+                    // cannot make that claim, and `data.canonical` is what
+                    // separates them without a second code.
                     RpcError::new(
                         rpc::BLOCK_NOT_FOUND,
-                        format!("slot {slot} names a block this node no longer stores"),
+                        format!(
+                            "slot {slot} names a canonical block this node no longer \
+                             stores; it exists — retry against an archival node"
+                        ),
                     )
+                    .with_data(rpc::Json::obj(vec![
+                        ("slot", rpc::Json::u(slot)),
+                        ("canonical", rpc::Json::Bool(true)),
+                    ]))
                 })?;
                 Ok(self.block_reply(&env))
             }
 
             RpcRequest::BlockById(id) => {
                 let env = self.envelope_by_id(&id).ok_or_else(|| {
+                    // `canonical: false` is a statement about THIS NODE'S
+                    // KNOWLEDGE and not about the block. An id this node does
+                    // not know may be unsynced, pruned, on another branch, or
+                    // may never have existed — nothing here can tell those
+                    // apart, and saying so is the honest answer. The by-slot
+                    // arm above CAN tell, which is exactly why the two carry
+                    // different data under one code.
                     RpcError::new(
                         rpc::BLOCK_NOT_FOUND,
                         format!(
-                            "no block {} is known to this node",
+                            "no block {} is known to this node — it may be unsynced, \
+                             pruned, on another branch, or never have existed; this \
+                             node cannot tell which",
                             crate::codec::hex32(&id)
                         ),
                     )
+                    .with_data(rpc::Json::obj(vec![("canonical", rpc::Json::Bool(false))]))
                 })?;
                 Ok(self.block_reply(&env))
             }
@@ -2563,17 +2618,27 @@ impl Engine {
                          the transaction was not judged invalid"
                     ),
                 )),
-                Err(Refusal::PreviouslyRefused { until_slot }) => Err(RpcError::new(
-                    rpc::TX_REFUSED,
-                    format!(
-                        "this node's proposer already had the transition refuse this \
-                         transaction, so it is barred until slot {until_slot}. The usual \
-                         cause is that it spends an output this chain does not have — \
-                         either it was built against a node on a different branch, or its \
-                         parent transaction has not landed yet. If the parent is still \
-                         pending, resubmit after it confirms."
-                    ),
-                )),
+                // A DIFFERENT CODE, and the whole point of this arm.
+                //
+                // This refusal and the `Invalid` one below shared `-32008`
+                // and were told apart only by the English in the message —
+                // in an error contract whose stated purpose is to spare a
+                // client from parsing English. One is retryable and one is
+                // terminal, so a withdrawal retry loop branching on the code
+                // alone was wrong half the time, in whichever direction hurt:
+                // abandoning a transfer that would land, or hammering bytes
+                // that never will.
+                //
+                // `until_slot` rides in `data` as a NUMBER. Putting it in the
+                // sentence, as this arm used to, means a client regexes prose
+                // this module reserves the right to reword.
+                Err(Refusal::PreviouslyRefused { until_slot }) => {
+                    Err(RpcError::tx_barred(
+                        until_slot,
+                        self.wall_slot(),
+                        self.state.next_base_fee(),
+                    ))
+                }
                 Err(Refusal::Invalid(why)) => Err(RpcError::new(
                     rpc::TX_REFUSED,
                     format!("{why} — this transaction cannot be admitted; retrying \
