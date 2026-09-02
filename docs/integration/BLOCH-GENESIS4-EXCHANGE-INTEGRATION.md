@@ -73,7 +73,7 @@ checkout of the tag. Ask us for them as files.
 The revision above was verified against `main` @ `e4083f9`. **`main` is not the
 lineage of the binary we gave you.** The tag you were pointed at,
 `g4-node-20260901` = 7a83ca89, is not an ancestor of `main`; neither is the tip
-the live fleet runs, 46133196. `e4083f9` is six days and seventeen commits
+the live fleet runs, 46133196. `e4083f9` is six days and 19 commits
 behind the release. So "verified against `main`" was, for several claims, a
 verification against code no one is running.
 
@@ -271,19 +271,33 @@ These are not defaults you can tune; they are what the server does.
 `sendrawtransaction` is a write on an unauthenticated port. Bind to loopback
 and put your own proxy in front of it. Do not expose it.
 
-### 3.1 `getcapabilities` — ask the node, not this document
+### 3.1 `getcapabilities` — WITHDRAWN 2026-09-01, there is no such method
 
-Call this first. It returns the method table, the deliberately absent names,
+~~Call this first. It returns the method table, the deliberately absent names,
 the error-code table, the limits above, and `rpc_surface_version` — from the
-running binary, so it cannot be stale the way a document can.
+running binary, so it cannot be stale the way a document can. **Branch your
+client on `getcapabilities`, not on the tables in this document.**
+`rpc_surface_version` is currently `4.1.0` and moves under semver.~~
 
-**Branch your client on `getcapabilities`, not on the tables in this
-document.** This document exists to explain what the numbers mean and what is
-not there; the node itself is the authority on what it serves.
+**Withdrawn 2026-09-01.** There is no `getcapabilities` method on the released
+binary, on the tip the live fleet runs, or on either of our public archival
+nodes. All of them answer:
 
-`rpc_surface_version` is currently `4.1.0` and moves under semver: major for a
-removal or a breaking change, minor for an added method or field, patch for
-wording.
+```json
+{"jsonrpc":"2.0","id":1,
+ "error":{"code":-32601,"message":"method not found: getcapabilities"}}
+```
+
+There is no `rpc_surface_version` either, and no `4.1.0`. The method exists only
+on an unreleased internal branch and was written up here as though it had
+shipped. This section told you to build your client against a call that always
+fails, and it was item 1 of the checklist in §11.
+
+**Do this instead:** build against the tables in §3 and re-read them on each
+release. Treat `-32601` as "this build does not serve that name", not as a
+fault. And note the limitation this leaves you with, stated plainly in §9:
+**no method on any Bloch node reports which binary it is running** — so you
+cannot ask a node to confirm its own version, and neither can we.
 
 ### 3.2 `getchaininfo` — chain head and settlement state
 
@@ -600,14 +614,30 @@ that passes 1,000 outputs cannot be fully enumerated. Keep each address under
 |---|---|---|
 | Accepted | `sendrawtransaction` → `accepted:true` | in this node's mempool |
 | Included | output visible via `gettxout` / `getutxos` | in a block |
-| **Final** | `getchaininfo.finalized.epoch` ≥ that block's epoch | **credit** |
+| **Final** | `getchaininfo.finalized.epoch` ≥ that block's epoch | **not sufficient — see §5.5** |
 
 Finality is explicit and published in every `getchaininfo` response — you do
 not estimate it from a confirmation count, and there is no `confirmations`
 field to misread.
 
-**Credit on `finalized`.** Included is not settled: a block that is canonical
-now can be reorganised, and only finalisation is the cryptographic guarantee.
+> **Do not credit on `finalized` alone.** An earlier revision of this page called
+> that a cryptographic settlement guarantee. **It is not one**, and we are
+> correcting it rather than waiting to be asked. Included is not settled — but
+> neither is finalised. What Genesis-4 offers today is *economic* finality under
+> an assumption of healthy participation. Two defects, both demonstrated by test:
+>
+> 1. **The quorum denominator shrinks with no floor.** It is leak-adjusted
+>    unconditionally; the floor and the recovery rule are written but gated
+>    behind `LEAK_RECOVERY_ACTIVATION_EPOCH`, which is `u64::MAX`. A partitioned
+>    minority holding **6.25%** of stake has been shown to self-finalise once the
+>    absent majority has leaked away.
+> 2. **`finalized` is not a latch across a reorg.** The deepest cut fork choice
+>    may legitimately propose — with no invalid block and no misbehaving peer —
+>    is itself a finality rewind. Measured repeatedly: finalized epoch
+>    **6 → 4 → 2 → 0** in three in-rules cuts.
+>
+> **Two nodes agreeing does not mitigate this.** Both can rewind independently.
+> See §5.3, §5.4 and §5.5 for what to do instead.
 
 ### 5.2 How long finality actually takes
 
@@ -645,8 +675,12 @@ The problem is what bounds that subtraction, and today nothing does.
 no reset and no removal**. The denominator therefore shrinks monotonically and
 never comes back. Once enough stake has leaked, a handful of validators — one,
 in the limit — hold two thirds of what remains and can finalise alone. That is
-not hypothetical: on **2026-08-24 three nodes finalised epoch 986 under three
-different roots**, and no amount of arriving blocks reunified them.
+not hypothetical: the mechanism is reproduced by test. The incident that first
+showed it — on **2026-08-24**, nodes finalising the same epoch under different
+roots, with no amount of arriving blocks reunifying them — is recorded in our
+source from the same evening. **The epoch number 986 and the count of three are
+single-sourced recollection, not measurement**, and we mark them as such rather
+than let a specific figure read as a reading.
 
 Two mitigations exist in the binary and **neither is reachable**:
 
@@ -689,15 +723,18 @@ divergence, not against §5.4's rewind.
 
 ### 5.5 What to do about §5.3 and §5.4
 
-- **Credit on `finalized`, and require two independent nodes to report the same
-  finalized root at the same epoch.** Disagreement is a hold condition, not a
-  retry.
+- **Credit at `finalized` + 3 epochs** (~48 minutes past finality), **not at the
+  finality boundary itself**, and require **two independently operated nodes** to
+  agree on the same finalized **root and epoch** — not the epoch alone.
+  Disagreement is a hold condition, not a retry.
 - **Re-verify before releasing funds.** Do not treat a single `finalized: true`
   reading as durable. Re-read the output with `gettxout` immediately before you
   act on it, and treat a block that has stopped being finalized as a hold.
-- **Add a depth margin.** Credit at a fixed number of epochs *past* finality
-  rather than at the finality boundary itself. The margin is what absorbs a
-  rewind, and it is the only mechanism here that does.
+- **Know what the margin does and does not buy.** The margin of 3 bounds the
+  single-cut case with one epoch to spare, and it is the only mechanism here
+  that absorbs a rewind at all. It does **not** bound a repeated ratchet:
+  **no depth is provably safe today**, and we would rather say so than quote a
+  number that sounds like one.
 - **Alert on `finalized.epoch` not advancing, independently of height.** Block
   production and finalisation are separate: heights advance, `getblockbyslot`
   keeps answering, the node looks healthy, deposits stop being creditable.
