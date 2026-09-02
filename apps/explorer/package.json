@@ -8,7 +8,7 @@
     "dev": "vite",
     "build": "node scripts/check-fees.mjs && tsc -b && vite build",
     "preview": "vite preview",
-    "deploy": "CLOUDFLARE_ACCOUNT_ID=CLOUDFLARE_ACCOUNT_ID npx wrangler pages deploy dist --project-name bloch-explorer --branch main --commit-dirty=true",
+    "deploy": "npx wrangler pages deploy --project-name bloch-explorer --branch main",
     "test": "node --test \"edge/tests/*.test.mjs\"",
     "test:lab": "node edge/tests/live-lab.mjs",
     "check:fees": "node scripts/check-fees.mjs",
