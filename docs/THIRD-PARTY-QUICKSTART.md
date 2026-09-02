@@ -614,51 +614,94 @@ curl -s -X POST http://127.0.0.1:16400 -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"getchaininfo","params":[]}' | jq '.result.finalized'
 ```
 
-Compare that `{epoch, root}` against both bootnodes **at the same finalized
-height**. They must be byte-identical to *each other*.
+**Compare it against a second node you control.** Run **two nodes of your own**,
+ideally seeded differently — one cold from genesis, one from an archival copy
+(§5) — and compare *their* `{epoch, root}` at the **same finalized height**.
+They must be byte-identical to each other.
+
+If the two finalized heights differ, you have not learned anything yet — the
+roots are only comparable at equal height. Re-read both and compare again.
+
+> **Why two of your own, and not ours.** You may expect this section to tell
+> you to compare against the published bootnodes. **You cannot**, and an
+> earlier edition of this guide wrongly told you to. The bootnodes bind their
+> RPC to loopback — which §0 tells you to do too, and which is correct — so
+> `getchaininfo` on `139.180.166.5:16400` from your machine gets no answer.
+> Verified 2026-09-01: from a third-party box, neither bootnode answers RPC.
+>
+> This is not a downgrade. Two nodes you control that agree is a *stronger*
+> statement than one node agreeing with ours, because it is not a claim you are
+> taking on our word.
 
 **The root below is not a constant to match.** It advances every epoch — about
 every 16 minutes — so by the time you read this it will have moved many times.
 The test is agreement between the nodes you are comparing at one finalized
-height, never equality with a value printed in a document. A worked example
-measured 2026-09-01 06:58 UTC, both bootnodes at finalized height 32356
-(epoch 1666):
+height, never equality with a value printed in a document. This worked example
+is only here to show the *shape* of agreement; it was collected **on** the
+bootnode hosts (where the loopback RPC does answer), 2026-09-01 06:58 UTC, both
+at finalized height 32356 (epoch 1666):
 
 ```
 139.180.166.5    finalized root 0ac677b83b9b566b761bbbfa639824ab3b35defe59eb2fbda65c40735235a4cd
 139.180.173.231  finalized root 0ac677b83b9b566b761bbbfa639824ab3b35defe59eb2fbda65c40735235a4cd
 ```
 
-If the two finalized heights differ, you have not learned anything yet — the
-roots are only comparable at equal height. Re-read both and compare again.
-
-> **You cannot run this comparison against our bootnodes, and the guide used to
-> tell you to.** The published bootnodes bind their RPC to loopback — which §0
-> tells you to do too, and which is correct — so `getchaininfo` on
-> `139.180.166.5:16400` from your machine gets no answer. The worked example
-> above was collected *on* those hosts. Verified 2026-09-01: from a third-party
-> box, neither bootnode answers RPC.
->
-> `./deploy/bootnodes/verify-bootnodes.sh --deep` is therefore an **operator**
-> tool, not a third-party one: it also tries to `ssh` into each host to confirm
-> it is keyless, which you cannot do either. Run it without `--deep` — that
-> checks reachability and exits 0 — and expect `--deep` to report
+> **`verify-bootnodes.sh` is an operator tool, not a third-party one.**
+> `--deep` tries to `ssh` into each host to confirm it is keyless, which you
+> cannot do. Run it **without** `--deep`; note that a plain run only opens a
+> TCP connection to each entry and checks nothing about the chain — the script
+> now says so in its own PASS line. Expect `--deep` to report
 > `FAIL … keyless: unknown (ssh failed)` for reasons that say nothing about the
 > chain. (Until this release `--deep` additionally died with a bash error,
 > `line 125: [: 0\n0: integer expression expected`, and skipped the fork check
 > in silence. Both are fixed here; the skip is now stated out loud.)
->
-> **What to do instead.** The comparison is sound; only the counterparties are
-> wrong. Run **two nodes of your own**, ideally seeded differently — one cold
-> from genesis, one from an archival copy — and compare *their* finalized roots
-> at equal finalized height. Two nodes you control that agree is a stronger
-> statement than one node agreeing with ours, because it is not a claim you are
-> taking on our word.
 
-Also check `behind_by_slots` in `getchaininfo`: 0–1 means you are at the head.
+Also check `behind_by_slots` in `getchaininfo`: 0–2 is normal (see §6) and a
+number that climbs and stays up means your peers stopped answering.
 
 Do this **before** you credit anything to a customer, and keep doing it — a
 node that silently diverges is the failure mode that costs money.
+
+### Finding the deposit itself
+
+Three things the balance and UTXO methods require that are easy to get wrong.
+All three verified against the live chain on 2026-09-01.
+
+**1. They take a `script_hash`, not an address.** `getbalance`, `listunspent`
+and `gettxout` all take a **32-byte hex** script hash. A Genesis-4 address is
+`bloch1q` + **40 hex characters** + an 8-character checksum. Take the 40 hex
+characters between the prefix and the checksum — that is the 20-byte script
+hash — and **right-pad with zeroes to 64 hex characters**:
+
+```
+address      bloch1qe986db5149cff7499b282a048272a09aff0af4ff84242073
+             ^^^^^^^ prefix                                 ^^^^^^^^ checksum
+script_hash  e986db5149cff7499b282a048272a09aff0af4ff000000000000000000000000
+                                                     ^^^^ zero padding to 32 bytes
+```
+
+**2. `listunspent` caps at 1,000 outputs and has no cursor.** The default page
+is 100 and the maximum is 1,000; asking for more is silently clamped. There is
+no cursor or offset parameter, so **outputs past the first 1,000 cannot be
+reached through this method at all** — the same page comes back every time. The
+response does tell you when this has happened:
+
+```json
+{"script_hash":"e986db51…","total":45149,"returned":1000,"truncated":true,"utxos":[…]}
+```
+
+**Always read `truncated` and `total`.** A hot wallet crosses 1,000 outputs
+quickly, and a deposit-polling loop that ignores those two fields will
+silently stop seeing new deposits once the address gets busy. If you need to
+check one specific output, use **`gettxout`** with its outpoint — that is the
+method that exists precisely because `listunspent` cannot answer it. In
+practice: keep your own outpoint set, poll `getbalance` (cheap, and see §0 for
+its scaling caveat) to notice that *something* changed, and use `gettxout` to
+settle individual outpoints, rather than trying to enumerate a large address.
+
+**3. There is no transaction index.** `gettransaction` is refused by design, so
+there is no txid-based lookup at this layer — deposit detection is UTXO
+polling. Per-block finality is exposed as `finalized: bool` on the block.
 
 ## 8. Once a signed checkpoint exists
 
