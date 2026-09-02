@@ -17,11 +17,32 @@ are needed; neither is useful alone.
 
 ## Running a node against it
 
+Decompress the carryover first — the loader reads TSV, not gzip:
+
+    gunzip -k carryover.tsv.gz
+
+Then:
+
     bloch-pos run \
-      --data-dir  ./data \
+      --data-dir   ./data \
       --genesis    ./genesis/mainnet.manifest \
-      --carryover  ./carryover.tsv.gz  # decompress first; the loader reads TSV
-      --rpc-port   16400
+      --carryover  ./carryover.tsv \
+      --transport  devnet \
+      --listen 19100 --listen-addr 127.0.0.1 \
+      --peers 139.180.166.5:19100,139.180.173.231:19100 \
+      --rpc-port 16400 --rpc-bind 127.0.0.1
+
+`--transport` and `--listen` are **not optional**: the transport defaults to
+`devnet`, and the devnet transport exits with status 2
+(`run: --listen <port> is required for the devnet transport`) if no listen port
+is given. Without `--peers` the node starts but never finds the chain. An
+earlier edition of this file printed a four-line command that had none of the
+three, passed the `.gz` path, and lost `--rpc-port` to a missing line
+continuation; it could not have run as written.
+
+`--listen-addr 127.0.0.1` is deliberate — you dial out to the bootnodes and do
+not need to accept inbound connections. See `docs/THIRD-PARTY-QUICKSTART.md` §5
+for the full walkthrough and for what the first twenty minutes look like.
 
 A data dir with no `validator.key` runs in observer mode: the node follows the
 chain and serves RPC, and signs nothing.

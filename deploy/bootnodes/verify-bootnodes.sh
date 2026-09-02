@@ -162,6 +162,19 @@ elif [ $DEEP -eq 1 ]; then
 fi
 
 echo
-if [ $FAIL -eq 0 ]; then echo "PASS — every published entry is reachable and sound."
+if [ $FAIL -eq 0 ]; then
+  # Say what actually ran. A plain run does ONE TCP connect per entry and
+  # checks nothing about keylessness, transport or chain — calling that
+  # "sound" is the same class of mistake as a check that silently skips.
+  if [ $DEEP -eq 1 ]; then
+    echo "PASS — every published entry passed the checks that ran above."
+    echo "       Read the per-check lines: some may say NOT PERFORMED."
+  else
+    echo "PASS — every published entry accepted a TCP connection."
+    echo "       That is ALL this run checked. Keylessness, transport, RPC"
+    echo "       binding and finalized root were NOT examined; a reachable"
+    echo "       port is exactly what a stale or ghost entry also passes."
+    echo "       Re-run with --deep (needs ssh to the hosts) for those."
+  fi
 else echo "FAIL — fix or unpublish the entries flagged above before shipping."; fi
 exit $FAIL

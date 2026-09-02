@@ -100,12 +100,22 @@ software.
 
 It is also a denial-of-service surface, because RPC work competes with the
 consensus thread. Measured against a live archival node on 2026-09-01,
-`getbalance` costs **~1.7 ms median** — the same for an empty address and for
-the heaviest address in the ledger (426,194 outputs), so the lookup is indexed
-rather than a scan — with the **first, cold call ~22 ms**. That puts roughly
-**500-600 calls/second** on one saturated core. There is no rate limiting in
-front of it, so that ceiling is whatever your attacker chooses. Throttle it
-yourself; nothing in the node will do it for you.
+`getbalance` costs **~1.7 ms median**, with the **first, cold call ~22 ms**.
+That puts roughly **500-600 calls/second** on one saturated core. There is no
+rate limiting in front of it, so that ceiling is whatever your attacker
+chooses. Throttle it yourself; nothing in the node will do it for you.
+
+> **And that cost grows with the chain, not with the address you ask about.**
+> `getbalance` is a **full linear scan of the eUTXO set** —
+> `CommittedState::balance_sat` filters `self.eutxos.values()` on every call
+> (`crates/bloch-pos-committee/src/transition.rs`). That is why an empty
+> address and the heaviest address in the ledger (426,194 outputs) cost the
+> same: the work is proportional to the size of the *whole* ledger and is
+> independent of what you queried. An earlier edition of this document read
+> that same measurement backwards and concluded the lookup was "indexed rather
+> than a scan". It is not indexed. Budget for the ~1.7 ms figure to degrade as
+> the ledger grows, and do not size a deposit-polling loop on the assumption
+> that it will hold.
 
 ---
 
@@ -203,11 +213,29 @@ sha256sum target/release/bloch-pos      # compare against the release manifest
 
 Three caveats that will otherwise waste your afternoon:
 
-- **The commit hash is compiled into the binary.** `--version` prints
-  `0.1.0-mainnet (<short sha>+nogit)`. Building the same source from a tarball
-  or a source export rather than a `git` checkout yields a *different* digest,
-  because the embedded identifier differs. Reproduce our build the way §2
-  describes it — clone, checkout the tag — or the comparison is meaningless.
+- **The commit hash is compiled into the binary.** From the clean `git`
+  checkout this section tells you to make, `--version` prints the commit with
+  **no suffix**:
+
+  ```
+  bloch-pos 0.1.0-mainnet (7a83ca898426) (Genesis-4, block version 0x...)
+  ```
+
+  The sha is 12 characters (`git rev-parse --short=12`). Two suffixes mean you
+  have not built what we built, and both change the digest:
+
+  | Suffix | Meaning |
+  |---|---|
+  | *(none)* | clean git checkout — this is what you want |
+  | `+dirty` | your working tree has uncommitted changes |
+  | `+nogit` | built without git metadata — a tarball or source export |
+
+  In particular **`+nogit` is the failure case, not the expected output**: an
+  earlier edition of this document printed it as the normal string. Building
+  from a tarball or source export rather than a `git` checkout yields a
+  *different* digest, because the embedded identifier differs. Reproduce our
+  build the way §2 describes it — clone, checkout the tag — or the comparison
+  is meaningless.
 - **The toolchain is part of the input.** We build with **Rust 1.94.0**, the
   version `Dockerfile` pins, targeting `x86_64-unknown-linux-gnu`. A different
   Rust version gives a different digest. That is not a tampering signal on its
