@@ -154,6 +154,30 @@ comment-constant-guard:
     - python3 scripts/check-comment-constants.py
   allow_failure: false
 
+# Source-in-archive guard. BLOCKING.
+# `tools/staking-cli/integration-merge/merged-consensus-files.tar.gz` is a
+# 276 KB gzip of six consensus and node source files, based six commits behind
+# fleet tip 46133196 (missing 47f7644b, the consensus commit). Measured
+# 2026-09-02 it is reachable from ~130 refs including `validator-ops` and is
+# pushed to both `origin` and `github`. Unpacking it over a checkout — which
+# its own README frames as the way to reproduce "the verified combination" —
+# reverts six fleet commits from an artifact that `git diff` renders as
+# "Binary files differ" and that no lint, review or other job here reads.
+# The archive is NOT on the release lineage: tag g4-node-20260901, fleet commit
+# 46133196 and all seven Ride 1 branches are clean of it. This job is what keeps
+# it that way, and it fails the moment such a blob reaches a branch that runs CI.
+# Judged by CONTENT, not size: an archive is refused when it carries source
+# files, so real data fixtures (carryover.tsv.gz, 452,726 rows) stay green.
+# An archive that will not list is also refused — a guard that cannot read a
+# file must not report the file as fine. Verified by violation both ways on
+# 2026-09-02. Pure Python 3, no toolchain, no build.
+no-source-archives:
+  stage: check
+  before_script: []
+  script:
+    - python3 scripts/check-no-source-archives.py
+  allow_failure: false
+
 # Falcon constant-time guard (PoS finding F1, BLOCH-FALCON-ONLINE-SIGNING.md
 # §3.2). BLOCKING: fails if the workspace's resolved features for
 # pqcrypto-falcon include "avx2" or "neon" — those dispatch Falcon SIGNING to
