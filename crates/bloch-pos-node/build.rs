@@ -264,6 +264,37 @@ fn main() {
         std::env::var("TARGET").unwrap_or_else(|_| "unknown".into())
     );
 
+    // ── `BLOCH_BUILD_DIRTY` is deliberately NOT stamped ────────────────────
+    //
+    // `dev/refusal-split-release-20260901` (5e39d7f6) stamped a second
+    // tri-state here, `BLOCH_BUILD_DIRTY` in {"true","false","unknown"}, for
+    // its `getnodeversion` method. Both are gone, for two separate reasons,
+    // and the reasons are recorded here because deleting a field silently is
+    // how the next branch reinvents it.
+    //
+    // 1. It is the SAME FACT as `BLOCH_BUILD_TREE_STATE` above, computed from
+    //    the same `dirty` string, with strictly less resolution: `tree_state`
+    //    separates `unverified` (the caller asserted a commit, so the tree was
+    //    never examined) from `unknown` (there was no repository to examine),
+    //    where `dirty` folded both onto "unknown". One question, one stamp.
+    //
+    // 2. Its `"" => "false"` arm — the only arm that could ever have said
+    //    "clean" — was UNREACHABLE on tag g4-node-20260901, and not because of
+    //    anything in that branch. The shared `git` helper folded empty output
+    //    into `None`, `git status --porcelain` prints nothing and exits 0 on a
+    //    clean tree, so `dirty` was `"+nogit"` on a pristine checkout and the
+    //    match fell through to `_ => "unknown"`. The preceding
+    //    `"" if BLOCH_BUILD_COMMIT is set => "unknown"` arm consumed the only
+    //    other way to reach `""`. So `getnodeversion` would have answered
+    //    `dirty: null` on every clean release build it was ever run on — the
+    //    field existed and could not carry its own load-bearing value.
+    //
+    // The underlying defect is fixed above (`git_raw` for `status`, `git` for
+    // `rev-parse`), so `tree_state` can now actually report `clean`. The dead
+    // arm is removed rather than repaired because the field it fed is removed:
+    // repairing it would leave two stamps answering one question, which is the
+    // shape this whole branch exists to collapse.
+
     // Rebuild when HEAD moves, so the stamp cannot go stale in an incremental
     // build — a stale stamp is worse than no stamp: it is a confident lie.
     //

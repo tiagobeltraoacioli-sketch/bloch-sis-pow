@@ -212,10 +212,13 @@ fn print_help() {
                default 127.0.0.1:16310 (`--rpc-port off` disables it). It\n\
                answers for THIS node's own validated state — run your own\n\
                node and query it rather than trusting someone else's.\n\
-                 Methods: getchaininfo, getblockcount, getblockbyslot,\n\
-                 getblockbyid, getvalidator, getvalidatorcount, getbalance,\n\
-                 getutxos (alias listunspent), sendrawtransaction,\n\
-                 getmempoolinfo. gettransaction and getnewaddress answer\n\
+                 Methods: getnodeversion, getchaininfo, getblockcount,\n\
+                 getblockbyslot, getblockbyid, getvalidator,\n\
+                 getvalidatorcount, getbalance, gettxout, getutxos (alias\n\
+                 listunspent), sendrawtransaction, getmempoolinfo.\n\
+                 getnodeversion reports which binary is answering: package\n\
+                 version, build stamp, git commit and whether the tree was\n\
+                 dirty. gettransaction and getnewaddress answer\n\
                  with a permanent, explained refusal — there is no txid at\n\
                  this layer and this node holds no wallet.\n\
                  Finality: block responses carry `finalized: true|false`.\n\

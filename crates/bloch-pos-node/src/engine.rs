@@ -657,10 +657,18 @@ struct ForkChoiceInputs {
 
 /// Why a transaction was turned away at the door.
 ///
-/// The distinction is load-bearing, not cosmetic: one of these means "ask me
-/// again in a moment" and the other means "these bytes will never be
-/// admitted, stop sending them". Collapsing both into one RPC code is how an
-/// operator ends up growing the mempool to fix a bad signature.
+/// The distinction is load-bearing, not cosmetic: two of these mean "ask me
+/// again in a moment" and the third means "these bytes will never be
+/// admitted, stop sending them". Collapsing them into one RPC code is how an
+/// operator ends up growing the mempool to fix a bad signature — or, the way
+/// it actually happened, how an exchange told "never resubmit after -32008"
+/// writes off transactions that a self-lifting bar would have admitted an
+/// hour later.
+///
+/// The RPC boundary now preserves the variant rather than only its sentence:
+/// `AtCapacity` -> `MEMPOOL_FULL`, `PreviouslyRefused` ->
+/// `TX_REFUSED_RETRYABLE` (with `error.data.until_slot`), `Invalid` ->
+/// `TX_REFUSED`. See `Engine::serve_rpc`.
 #[derive(Debug, PartialEq, Eq)]
 enum Refusal {
     /// The mempool is full. The transaction was NOT judged invalid.
@@ -2545,8 +2553,10 @@ impl Engine {
 
             RpcRequest::SendRawTransaction(tx) => match self.on_transaction(tx.clone()) {
                 Ok(outcome) => Ok(rpc::submitted_json(&tx, outcome)),
-                // The two refusals are not the same fact and must not carry
-                // the same advice. "Retry later" is correct for a full
+                // The three refusals are not the same fact and must not
+                // carry the same advice, and each has its own code:
+                // MEMPOOL_FULL (-32003), TX_REFUSED_RETRYABLE (-32009),
+                // TX_REFUSED (-32008). "Retry later" is correct for a full
                 // mempool and actively harmful for a refused transaction:
                 // the founder's consolidation sweep submits hundreds of
                 // thousands of transfers through this method, and an
@@ -2563,17 +2573,37 @@ impl Engine {
                          the transaction was not judged invalid"
                     ),
                 )),
-                Err(Refusal::PreviouslyRefused { until_slot }) => Err(RpcError::new(
-                    rpc::TX_REFUSED,
-                    format!(
-                        "this node's proposer already had the transition refuse this \
-                         transaction, so it is barred until slot {until_slot}. The usual \
-                         cause is that it spends an output this chain does not have — \
-                         either it was built against a node on a different branch, or its \
-                         parent transaction has not landed yet. If the parent is still \
-                         pending, resubmit after it confirms."
-                    ),
-                )),
+                //
+                // And the two REFUSALS are not the same fact either, which is
+                // the split this arm exists for. `PreviouslyRefused` is a
+                // verdict on the bytes AGAINST A STATE: the bar lifts by
+                // itself after REJECTION_TTL_SLOTS, so the correct advice is
+                // "resubmit after slot N". `Invalid` is a verdict on the bytes
+                // and the correct advice is "stop". They shared TX_REFUSED
+                // until now, distinguishable only by reading the English —
+                // and the `Refusal` enum's own doc says a caller that must act
+                // on the difference has to match the variant, which is exactly
+                // what this boundary was throwing away. An exchange following
+                // our published "-32008 means never resubmit" guidance
+                // permanently abandoned transactions this node would have
+                // taken ~64 minutes later.
+                //
+                // The deadline goes in `error.data.until_slot` as well as in
+                // the sentence: the codes are stable, the wording is not.
+                Err(Refusal::PreviouslyRefused { until_slot }) => {
+                    Err(RpcError::tx_refused_retryable(
+                        until_slot,
+                        format!(
+                            "this node's proposer already had the transition refuse this \
+                             transaction, so it is barred until slot {until_slot}. The usual \
+                             cause is that it spends an output this chain does not have — \
+                             either it was built against a node on a different branch, or its \
+                             parent transaction has not landed yet. This bar lifts on its own: \
+                             resubmit the same bytes from slot {until_slot}, or sooner once \
+                             the parent confirms. See `error.data.until_slot`."
+                        ),
+                    ))
+                }
                 Err(Refusal::Invalid(why)) => Err(RpcError::new(
                     rpc::TX_REFUSED,
                     format!("{why} — this transaction cannot be admitted; retrying \
@@ -4853,6 +4883,118 @@ mod transfer_v2_end_to_end {
                 Err(Refusal::PreviouslyRefused { .. })
             ),
             "a barred transaction must be told it is barred, never told to retry"
+        );
+    }
+
+    /// A backend that hands the dispatcher ONE answer the real engine
+    /// produced, so a test can see the literal bytes a client receives.
+    ///
+    /// `Engine` is not `Sync` and cannot be an `RpcBackend` itself, so the
+    /// error is carried across rather than the engine: everything from
+    /// `on_transaction` through `serve_rpc` to `handle_body` is the production
+    /// code, and only the socket is missing.
+    struct Canned(std::sync::Mutex<Option<RpcResult>>);
+
+    impl crate::rpc::RpcBackend for Canned {
+        fn call(&self, _req: RpcRequest) -> RpcResult {
+            self.0.lock().unwrap().take().expect("one canned answer, one call")
+        }
+    }
+
+    /// Put an engine-produced outcome on the wire and return the response body.
+    fn on_the_wire(outcome: RpcResult) -> String {
+        let backend = Canned(std::sync::Mutex::new(Some(outcome)));
+        crate::rpc::handle_body(
+            r#"{"jsonrpc":"2.0","id":1,"method":"getchaininfo","params":[]}"#,
+            &backend,
+        )
+    }
+
+    /// **The defect, end to end: the two refusals must reach the client as two
+    /// codes, and the retryable one must carry its deadline as a number.**
+    ///
+    /// `Refusal::Invalid` is a verdict on the BYTES — no passage of time
+    /// changes an unverifiable signature, so the client must stop.
+    /// `Refusal::PreviouslyRefused` is a verdict on the bytes AGAINST A STATE —
+    /// the bar lifts by itself after `REJECTION_TTL_SLOTS`, so the client must
+    /// try again. Both used to leave this node as `TX_REFUSED` (-32008), whose
+    /// published meaning is "never resubmit these bytes"; an exchange
+    /// following that guidance permanently abandoned transactions this node
+    /// would have admitted ~64 minutes later. The two facts were separable
+    /// only by reading the English message, and `Refusal`'s own doc says a
+    /// caller that must act on the difference has to match the variant.
+    ///
+    /// Both halves are asserted here, because either alone can be satisfied
+    /// wrongly: without the terminal control, "always return -32009" passes;
+    /// without the retryable half, "always return -32008" — today's defect —
+    /// passes.
+    #[test]
+    fn the_two_refusals_reach_the_client_as_two_codes() {
+        // ── Retryable: barred against a state, and the bar lifts on its own ──
+        let (entries, tx) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let slot = node.wall_slot();
+        node.reject_transaction(tx.canonical_bytes(), slot);
+
+        let RpcResult::Err(retryable) = node.serve_rpc(RpcRequest::SendRawTransaction(tx.clone()))
+        else {
+            panic!("a barred transaction must produce an RPC error");
+        };
+        assert_eq!(
+            retryable.code,
+            rpc::TX_REFUSED_RETRYABLE,
+            "a bar that lifts by itself must NOT be reported as terminal: {retryable:?}"
+        );
+        assert_ne!(
+            retryable.code,
+            rpc::TX_REFUSED,
+            "collapsing the retryable refusal back onto -32008 is the defect"
+        );
+
+        // The deadline is a value the client computes with, so it must be
+        // readable without parsing the sentence — and it must be the real one.
+        let data = retryable
+            .data
+            .as_ref()
+            .expect("the retryable refusal must carry `error.data`");
+        assert_eq!(
+            data.get("until_slot").and_then(rpc::Json::as_u64),
+            Some(slot + REJECTION_TTL_SLOTS),
+            "the deadline must be the slot the bar actually lifts at: {data:?}"
+        );
+        assert_eq!(data.get("retryable"), Some(&rpc::Json::Bool(true)));
+
+        // And it survives to the wire, in the literal bytes a client reads.
+        let wire = on_the_wire(Err(retryable));
+        assert!(
+            wire.contains(r#""code":-32009"#),
+            "the wire must carry -32009: {wire}"
+        );
+        assert!(
+            wire.contains(&format!(r#""until_slot":{}"#, slot + REJECTION_TTL_SLOTS)),
+            "the wire must carry the deadline as a number: {wire}"
+        );
+
+        // ── Terminal: a verdict on the bytes, and it must stay terminal ──────
+        let (entries, tx) = sweep_fixture(16);
+        let mut pre = engine_at_wall_epoch(0, &entries);
+        let RpcResult::Err(terminal) = pre.serve_rpc(RpcRequest::SendRawTransaction(tx)) else {
+            panic!("a transaction refused on its merits must produce an RPC error");
+        };
+        assert_eq!(
+            terminal.code,
+            rpc::TX_REFUSED,
+            "-32008 is published as terminal and must keep meaning that: {terminal:?}"
+        );
+        assert!(
+            terminal.data.is_none(),
+            "a terminal refusal must not offer a deadline: {terminal:?}"
+        );
+        let wire = on_the_wire(Err(terminal));
+        assert!(wire.contains(r#""code":-32008"#), "{wire}");
+        assert!(
+            !wire.contains("until_slot") && !wire.contains(r#""data""#),
+            "a terminal refusal must carry no retry hint at all: {wire}"
         );
     }
 
