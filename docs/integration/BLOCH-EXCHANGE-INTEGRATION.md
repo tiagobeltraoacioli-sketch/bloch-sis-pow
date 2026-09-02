@@ -596,10 +596,28 @@ demoted to a display value with no security meaning
 (`docs/specs/BLOCH-RPC-V4.md` §0 R1, §3.1).
 
 This is a different kind of claim, not a stronger number. Depth is probabilistic
-and continuous; finalization is a discrete, attributable commitment — reverting
-a finalized checkpoint requires a supermajority of stake to have signed
-conflicting votes, which is detectable and slashable. **Credit on `finalized`,
-not on depth.**
+and continuous; finalization is discrete.
+
+> **RETRACTION (2026-09-01).** This paragraph used to continue: "reverting a
+> finalized checkpoint requires a supermajority of stake to have signed
+> conflicting votes, which is detectable and slashable. **Credit on
+> `finalized`, not on depth.**" The equivocation is indeed detectable — the
+> node detects it today and logs it. It is **not slashable**: evidence rides
+> on wire tag `0x05`, `PosTransaction::from_canonical_bytes` refuses that tag
+> unconditionally on every ingress path, nothing constructs the transaction
+> outside tests, and no activation constant exists. Read on 2026-09-02 at
+> height 34,665, epoch 1736, from two keyless archival observers returning
+> byte-for-byte identical responses: 64 validators, 64 active, zero records
+> with `slashed: true`, zero with a non-null `exit_epoch` — and equivocation on
+> this fleet is detected and logged but never prosecuted. Note what that second
+> fact does *not* mean: `slashed: false` on every record is the expected
+> reading here, not a clean bill of health, and no RPC method exposes
+> equivocation evidence, so the registry you can query cannot tell you how much
+> equivocation the chain actually carries. So
+> finalization is a discrete commitment with **no attributable cost
+> attached**. Do not credit on `finalized` alone; see
+> `docs/integration/BLOCH-GENESIS4-EXCHANGE-INTEGRATION.md` §5 (Settlement)
+> for the guidance that replaces it.
 
 The honest caveat that belongs beside this: finality is only as decentralized as
 the validator set that votes, and the Genesis-4 validator set does not exist
