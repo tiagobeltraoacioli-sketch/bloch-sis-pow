@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT OR Apache-2.0
 """
+RETIRED — this does not reproduce the live Genesis-4 carryover.
+
+The rule set below (drop founder-controlled outputs, then cap pro-rata) was
+abandoned before launch. The live snapshot carries the founder's outputs
+(93.94% of the total) and scales every balance by 100/21; this file never
+applies that split. See README.md and docs/CARRYOVER.md.
+
+Kept as a record of what was considered.
+"""
+
+"""
 Genesis-4 carryover builder.
 
 Takes the raw UTXO snapshot produced by `bloch-snapshot-utxo` at the terminal

@@ -152,9 +152,29 @@ pub struct CarryoverCommitment {
 ///
 /// These are the buckets §3 names — founder, VC, team, marketing, liquidity,
 /// validator emission — expressed as genesis outputs rather than as a promise
-/// kept off-chain. `unlock_epoch` is what makes the vesting consensus: an
-/// output is unspendable until the chain reaches that epoch, so the schedule
-/// is enforced by every node instead of by whoever holds the key.
+/// kept off-chain.
+///
+/// # `unlock_epoch` is NOT enforced
+///
+/// This comment used to say that `unlock_epoch` "is what makes the vesting
+/// consensus: an output is unspendable until the chain reaches that epoch, so
+/// the schedule is enforced by every node instead of by whoever holds the
+/// key." **That is false, and it was false when it was written.**
+///
+/// The field is encoded into the manifest, decoded from it, and hashed into
+/// the allocation's txid — so every node agrees on the number. No node ever
+/// reads it to decide whether an output may be spent: `unlock_epoch` does not
+/// appear anywhere in `bloch-pos-committee`, which is the crate that
+/// authorises spends. See `vesting_is_not_enforced` in this module.
+///
+/// It is doubly inert on the live chain, for two independent reasons: the
+/// shipped `genesis-mainnet` path writes `0` for all five buckets, and even a
+/// non-zero value would be ignored. Every allocation is liquid from slot 0,
+/// and the schedule is kept by whoever holds the key — the exact thing the
+/// old comment claimed it was not.
+///
+/// Enforcing it later is a consensus change: coins already liquid cannot be
+/// re-locked by a rule adopted after the fact.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GenesisAllocation {
     /// Which bucket this is, as a stable tag (see `alloc_purpose`).
@@ -1103,6 +1123,86 @@ impl Manifest {
 
 #[cfg(test)]
 mod tests {
+    /// `unlock_epoch` is committed but never consulted. This test exists so
+    /// the claim is checked rather than remembered.
+    ///
+    /// The doc comment on [`GenesisAllocation`] once asserted the opposite —
+    /// that an allocation is "unspendable until the chain reaches that epoch,
+    /// so the schedule is enforced by every node". It was read as a guarantee
+    /// for weeks. Nothing was verifying it, because a comment cannot fail.
+    ///
+    /// Spends are authorised in `bloch-pos-committee`. If the identifier ever
+    /// appears there, this test fails — and the right response is not to
+    /// delete the test but to go and correct that doc comment, which will by
+    /// then be describing something real for the first time. Enforcement
+    /// arriving is good news that must not arrive silently.
+    #[test]
+    fn vesting_is_not_enforced() {
+        let mut src = Vec::new();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../bloch-pos-committee/src");
+        let mut stack = vec![root.clone()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).expect("bloch-pos-committee/src is readable") {
+                let p = e.expect("dir entry").path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    src.push((p.clone(), std::fs::read_to_string(&p).expect("utf-8 source")));
+                }
+            }
+        }
+        // If the crate ever moves, this test would pass by finding nothing —
+        // the failure mode it is here to prevent.
+        assert!(
+            src.len() > 5,
+            "found only {} source files under {} — this test cannot pass by \
+             looking at nothing",
+            src.len(),
+            root.display(),
+        );
+
+        let hits: Vec<String> = src
+            .iter()
+            .flat_map(|(p, s)| {
+                s.lines().enumerate().filter(|(_, l)| l.contains("unlock_epoch")).map(
+                    move |(i, l)| format!("  {}:{}: {}", p.display(), i + 1, l.trim()),
+                )
+            })
+            .collect();
+
+        assert!(
+            hits.is_empty(),
+            "`unlock_epoch` now appears in bloch-pos-committee, the crate that \
+             authorises spends:\n{}\n\nIf vesting is genuinely enforced now, say so: \
+             the doc comment on GenesisAllocation states that it is NOT, and the \
+             public supply page repeats that. Fix those first, then this test.",
+            hits.join("\n"),
+        );
+    }
+
+    /// The five shipped buckets are liquid at genesis independently of the
+    /// above: `genesis-mainnet` writes `unlock_epoch: 0` for every one of
+    /// them, so even an enforcing node would let them all spend from slot 0.
+    /// Two independent reasons, so removing either one changes nothing.
+    #[test]
+    fn the_shipped_buckets_are_all_liquid_at_slot_zero() {
+        let src = include_str!("main.rs");
+        let start = src.find("let allocations = vec![").expect("the mainnet allocation list");
+        let end = src[start..].find("];").expect("end of the allocation list") + start;
+        let list = &src[start..end];
+        let n = list.matches("alloc(ap::").count();
+        assert_eq!(n, 5, "expected the five §3 buckets, found {n} in:\n{list}");
+        let liquid = list.matches(", 0),").count();
+        assert_eq!(
+            liquid, 5,
+            "a bucket in genesis-mainnet no longer has unlock_epoch 0. That is a \
+             consensus-visible change to the genesis manifest — it changes the \
+             allocation txids, therefore the state root, therefore which network \
+             a node thinks it joined:\n{list}",
+        );
+    }
+
     use super::*;
 
     /// A validator pubkey shaped the way Genesis-4 requires: the 0x0001

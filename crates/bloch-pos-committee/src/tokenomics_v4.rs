@@ -155,10 +155,12 @@ pub const FOUNDATION_LIQUID_AT_GENESIS_BLOCH: u128 =
 /// the activation gates, and it states it the same way it did before either
 /// decision.
 ///
-/// Re-measured 2026-08-13 against a live node, and **still provisional**:
-/// Genesis-3 halts at height 50,000 and keeps minting until it does, so this
-/// figure grows with every block. The terminal snapshot is what pins it, and
-/// nothing here should be treated as final before then.
+/// Re-measured 2026-08-13 against a live node, then **pinned to the terminal
+/// snapshot** (h39,918) once Genesis-3 halted. No longer provisional: while
+/// the old chain still minted, this figure grew with every block, which is
+/// why the earlier rows below differ. Re-verified 2026-09-01 by measuring
+/// the shipped carryover.tsv.gz directly — 452,726 rows, sha256 84ddbbac…,
+/// 381,074,400,000,000,000 G3 sat, ×100/21 = this constant exactly.
 ///
 /// | when | height | block_count | UTXOs | Genesis-3 BLOCH | ×100/21 |
 /// |---|---|---|---|---|---|
@@ -175,7 +177,7 @@ pub const FOUNDATION_LIQUID_AT_GENESIS_BLOCH: u128 =
 /// 43,172" would have waited days for a height that produces a different
 /// number. Heights and block counts are now stated separately, both times.
 ///
-/// The split stays exact: 3,805,746,000 is divisible by 21, so ×100/21 lands
+/// The split stays exact: 3,810,744,000 is divisible by 21, so ×100/21 lands
 /// on a whole number with no aggregate dust, same as the previous figure.
 ///
 /// Raising this does not breach the cap. [`VALIDATOR_EMISSION_BLOCH`] is the
@@ -387,9 +389,14 @@ const _: () = assert!(VC_BLOCH * SPLIT_DENOMINATOR == 2_100_000_000 * SPLIT_NUME
 const _: () = assert!(TEAM_BLOCH * SPLIT_DENOMINATOR == 2_100_000_000 * SPLIT_NUMERATOR);
 const _: () = assert!(MARKETING_BLOCH * SPLIT_DENOMINATOR == 840_000_000 * SPLIT_NUMERATOR);
 const _: () = assert!(LIQUIDITY_BLOCH * SPLIT_DENOMINATOR == 1_050_000_000 * SPLIT_NUMERATOR);
-// Re-pinned 2026-08-13 to the measured snapshot (h39,328): the carryover is
+// Re-pinned 2026-08-13 to the TERMINAL snapshot (h39,918): the carryover is
 // what the ledger says it is, not what a draft said it would be. The split
-// stays exact on the new figure too — 3,805,746,000 is divisible by 21.
+// stays exact on the new figure too — 3,810,744,000 is divisible by 21.
+//
+// Careful when reading the prose in this file: it was re-pinned TWICE on
+// 2026-08-13 and only the assertions were carried forward, so comments
+// written in between described h39,328 / 3,805,746,000 / 452,133 long after
+// those stopped being true. Corrected 2026-09-01 against the file itself.
 const _: () =
     assert!(CARRYOVER_TOTAL_BLOCH * SPLIT_DENOMINATOR == 3_810_744_000 * SPLIT_NUMERATOR);
 const _: () =
@@ -397,18 +404,24 @@ const _: () =
 
 /// Largest single carried-over address, for the concentration reporting in §4A.
 /// Not a consensus quantity and not a distinct class of coin — a measurement,
-/// re-taken 2026-08-13 from the same snapshot as [`CARRYOVER_TOTAL_BLOCH`]
-/// (h39,328, root `162cb763…`): the address `e986db51…` holds
-/// 357,483,616,997,963,769 sat = 3,574,836,169.98 BLCH across 425,599 of the
-/// set's 452,133 outputs. Scaled ×100/21 and truncated to whole BLCH.
+/// re-taken from the same snapshot as [`CARRYOVER_TOTAL_BLOCH`] — the terminal
+/// one, h39,918: the address `e986db51…` holds
+/// 357,983,416,998,063,769 sat = 3,579,834,169.98 BLCH across 426,194 of the
+/// set's 452,726 outputs. Scaled ×100/21 and truncated to whole BLCH.
+/// The assertion below has always carried these figures; only this prose
+/// lagged. Re-measured from the file 2026-09-01.
 ///
 /// Both figures now come from one snapshot, which is the only way the ratio
 /// between them means anything. Updating the total against a fresh
 /// measurement while leaving this one at the older reading would have moved
 /// the reported concentration from 93.96% to 93.17% — a 0.8-point "drop" that
 /// was an artifact of mixing two measurements, not a change in who holds
-/// what. Measured together, concentration is **93.93%**: essentially
+/// what. Measured together, concentration is **93.9406%**: essentially
 /// unchanged, which is the true answer.
+///
+/// This describes the snapshot — the state the chain OPENED with. It is not
+/// what that address holds today: a consolidation has since reduced it to
+/// ~45,149 outputs. The two counts must never appear in one sentence.
 /// The 20-byte hash160 of the address holding the carryover — the founder's.
 ///
 /// Used as the withdrawal credential and allocation script for the launch
@@ -425,9 +438,9 @@ pub const FOUNDER_WITHDRAWAL_H160: [u8; 20] = [
 pub const LARGEST_CARRYOVER_ADDRESS_BLOCH: u128 = 17_046_829_380;
 const _: () = assert!(LARGEST_CARRYOVER_ADDRESS_BLOCH < CARRYOVER_TOTAL_BLOCH);
 // Pinned against the measurement in satoshis, not in whole BLOCH. The address
-// holds 3,574,836,169.97963769 BLCH; rounding that to whole BLOCH before
-// scaling gives 17,023,029,376 and scaling the satoshi figure gives
-// 17,023,029,380. Four BLOCH of difference is nothing to the reporting, but a
+// holds 3,579,834,169.98063769 BLCH; rounding that to whole BLOCH before
+// scaling gives 17,046,829,376 and scaling the satoshi figure gives
+// 17,046,829,380. Four BLOCH of difference is nothing to the reporting, but a
 // constant that disagrees with its own derivation is a trap for whoever
 // re-derives it next.
 const _: () = assert!(
@@ -436,10 +449,10 @@ const _: () = assert!(
     "a medida escalada nao bate com a medida G3 sob o split"
 );
 
-/// Founder carried-over balance plus the new grant: 27.02% of supply.
+/// Founder carried-over balance plus the new grant: 27.05% of supply.
 ///
 /// Up from 26.89%: the re-measured carryover is larger and the founder holds
-/// 93.93% of it, so their share of a fixed cap rises. Recorded rather than
+/// 93.9406% of it, so their share of a fixed cap rises. Recorded rather than
 /// smoothed — the number moving in this direction is exactly what §4A exists
 /// to report.
 pub const FOUNDER_TOTAL_BLOCH: u128 = LARGEST_CARRYOVER_ADDRESS_BLOCH + FOUNDER_BLOCH;
@@ -632,11 +645,11 @@ pub const INITIAL_ANNUAL_SAT: u128 = 434_965_169_252_191_762;
 ///
 /// The 40-year sum is `Σ (annual_n / SPY) · SPY` — a multiple of
 /// `SLOTS_PER_YEAR` by construction — and the allocation is **not** a multiple
-/// of `SLOTS_PER_YEAR` (4,302,912,000,000,000,000 mod 1,051,920 = 176,880), so
+/// of `SLOTS_PER_YEAR` (4,285,360,000,000,000,000 mod 1,051,920 = 855,280), so
 /// no choice of `INITIAL_ANNUAL_SAT` lands exactly. An earlier revision of
 /// this file claimed a zero residual; that claim was arithmetically impossible
 /// (the 21 B schedule's true residual was 889,200 sat) and is corrected here
-/// rather than repeated. 176,880 sat is 0.0018 BLCH, permanently unissued —
+/// rather than repeated. 855,280 sat is 0.0086 BLCH, permanently unissued —
 /// which errs on the only acceptable side of a hard cap: under, never over.
 /// The compile-time assertion below pins it.
 pub const EMISSION_DUST_SAT: u128 = 855_280;

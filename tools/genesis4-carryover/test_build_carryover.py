@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT OR Apache-2.0
-"""Testes do gerador de carryover. Rodar: python3 test_build_carryover.py"""
+"""Testes do gerador de carryover — RETIRADO.
+
+O arquivo real em ~/dev/BlochPOS/carryover.tsv.gz nao e mais o de 413.743
+linhas contra o qual estes numeros foram fixados; foi substituido em
+2026-08-14 pelo terminal de Genesis-3 (452.726 linhas). As checagens
+"contra os dados reais" abaixo descrevem um arquivo que nao existe mais e
+uma regra (taint + teto) que foi abandonada antes do lancamento.
+
+Rodar: python3 test_build_carryover.py"""
 import os, sys, tempfile, subprocess
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from build_carryover import build, write, SAT_PER_BLOCH
@@ -19,7 +27,9 @@ def tmp_tsv(rows):
         fh.write(f"{'aa'*32}\t{i}\t{val}\t{addr}\n")
     fh.close(); return fh.name
 
-print("contra os dados reais (carryover.tsv.gz, 413.743 utxos):")
+print("contra os dados reais (carryover.tsv.gz, 413.743 utxos) -- RETIRADO:")
+print("  este arquivo agora tem 452.726 linhas; as checagens abaixo vao falhar")
+print("  por projeto. Ver README.md.")
 if os.path.exists(REAL):
     r = build(REAL, {FOUNDER}, 300_000_000)
     check("fundador excluido = 3.294.337.200 BLCH",
