@@ -808,8 +808,21 @@ pub trait StakingLifecycle {
     /// majority in one epoch.
     fn activation_epoch(&self, deposit_epoch: u64, queue_ahead: u64) -> u64;
 
-    /// Signing root of a voluntary exit, under `DS_SLASH`'s sibling domain
-    /// (see [`crate::params::DS_SLASH`]): `SHA3-256(DS_SLASH ‖ fields)`.
+    /// Signing root of a voluntary exit: `SHA3-256(DS_EXIT ‖ pubkey_hash ‖
+    /// epoch)` — see [`crate::params::DS_EXIT`] and
+    /// [`crate::staking::ExitTx::signing_root`], which is the implementation
+    /// this line now agrees with.
+    ///
+    /// It said `DS_SLASH` until 2026-09-02, and nothing caught it because
+    /// [`StakingLifecycle`] has zero implementations — the trait is a spec
+    /// that no code is checked against. The mismatch was inert and would not
+    /// have stayed inert: a signer written from this line would have signed
+    /// under one domain while the verifier checked another, and every
+    /// honest exit would have failed with a bad signature. Worse in the other
+    /// direction — `DS_SLASH` is not a signing domain at all, it keys the
+    /// slashing-evidence identity set (`SHA3-256(DS_SLASH ‖ validator ‖ lo ‖
+    /// hi)`), so adopting it here would have put a signature domain on top of
+    /// a dedup domain and thrown away the separation both rely on.
     fn exit_signing_root(&self, exit: &ExitTx) -> [u8; 32];
 
     /// Validate a voluntary exit against the committed record.

@@ -1785,6 +1785,23 @@ impl Engine {
         // feeds. Gossip (`NetEvent::Transaction`) and RPC both land in this
         // one call, so one call site carries the whole decision.
         admissible(&tx, epoch_of(self.wall_slot())).map_err(Refusal::Invalid)?;
+        // The one admission check `admissible` CANNOT make, made here where
+        // the state lives: a signed exit's signature verifies against the
+        // REGISTERED pubkey, and only the committed registry holds it.
+        //
+        // Skipping it reopens the slot-69 class for exits. The producer
+        // prices its own block with `ProbeVerifier`, whose `verify_with_key`
+        // returns true for anything, so a garbage-signed exit passes the
+        // probe, goes into a proposed block, and is then refused by the real
+        // verifier at ingest — the proposer loses its slot, for the price of
+        // one unauthenticated request. The transfer path learned this and
+        // verifies at this same door; the exit path cannot do it inside
+        // `admissible` because that function has no state, so it happens
+        // here instead.
+        if let PosTransaction::ExitV2(x) = &tx {
+            signed_exit_preverifies(&self.state, x, &self.verifier)
+                .map_err(Refusal::Invalid)?;
+        }
         let mut frame = vec![net::FRAME_TX];
         frame.extend_from_slice(&key);
         self.mempool.insert(key, tx);
@@ -3197,6 +3214,38 @@ fn forkchoice_store<'a>(
 /// running the transition, which needs a candidate header this path has no
 /// reason to build. What it catches is the class that has actually been
 /// exploited or is currently exploitable.
+/// The registry-dependent half of exit admission, split out so it can be
+/// exercised without a running engine — the same seam discipline as
+/// [`admissible`], and for a reason proved by mutation: while
+/// `SIGNED_EXIT_ACTIVATION_EPOCH` ships as `u64::MAX`, `admissible` refuses
+/// every `ExitV2` before `on_transaction` reaches the call site, so no test
+/// can drive the WIRING without arming the gate. Shipping the slot-69 guard
+/// as dead-until-flag-day untested code is how decorative rules are born, so
+/// the FUNCTION is what the tests pin.
+///
+/// The root derivation is `staking::ExitTx`'s — the single definition the
+/// transition verifies against — so this check and consensus cannot drift.
+/// This is node-local policy: it stops a bad exit PROPAGATING, and consensus
+/// still re-judges every exit that reaches a block.
+pub(crate) fn signed_exit_preverifies(
+    state: &CommittedState,
+    exit: &bloch_pos_committee::staking::ExitTx,
+    verifier: &dyn bloch_pos_committee::attestation::SignatureVerifier,
+) -> Result<(), &'static str> {
+    let Some(index) = state.validator_index_of(&exit.pubkey_hash) else {
+        return Err("signed exit names a key that is not in the validator registry");
+    };
+    let Some(rec) = state.validator_record(index) else {
+        return Err("signed exit resolves to an index with no committed record");
+    };
+    // The case only a registry check can catch: a signature that is perfectly
+    // valid — for somebody else's key.
+    if !verifier.verify_with_key(&rec.pubkey, &exit.signing_root(), &exit.signature) {
+        return Err("signed exit's signature does not verify against the registered key");
+    }
+    Ok(())
+}
+
 pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'static str> {
     match tx {
         // Staking messages are refused outright until bonding is funded from
@@ -3383,6 +3432,33 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
             "exits are not accepted: the Exit message is not authenticated, \
              so anyone could retire any validator irreversibly",
         ),
+        // The AUTHENTICATED exit (tag 0x0a) is admitted from its flag day —
+        // and this arm is deliberately thin, because the refusal that matters
+        // no longer lives here.
+        //
+        // This door cannot authenticate this message: `admissible` sees a
+        // transaction and a wall epoch, and verifying an exit needs the
+        // REGISTRY — the pubkey_hash must be resolved to a committed record
+        // before there is a key to check the signature against. That check
+        // now runs in `apply_signed_exit`, on the consensus path, where every
+        // node re-judges it; which is the whole correction, since a refusal
+        // that only lives here is one a proposer simply skips.
+        //
+        // So this arm does the two free things: it refuses the format before
+        // its era (wall epoch, for the reason the TransferV2 arm states at
+        // length), and it refuses a message with no signature at all rather
+        // than relay it to be refused by everyone.
+        PosTransaction::ExitV2(x) => {
+            if wall_epoch < bloch_pos_committee::params::SIGNED_EXIT_ACTIVATION_EPOCH {
+                return Err(
+                    "signed exits are not accepted yet: the format is inert until its flag day",
+                );
+            }
+            if x.signature.is_empty() {
+                return Err("signed exit carries no signature");
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -3960,6 +4036,128 @@ mod admission_authorisation {
         let err = admissible(&PosTransaction::Exit { validator: 0 }, 0)
             .expect_err("Exit carries no signature and must not be admitted");
         assert!(err.contains("not authenticated"), "got: {err}");
+    }
+
+    /// The registry pre-check's whole surface, against REAL hybrid keys and
+    /// the real [`HybridVerifier`] — the same verifier the node runs.
+    ///
+    /// The CALL SITE cannot be driven by a test while
+    /// `SIGNED_EXIT_ACTIVATION_EPOCH` is `u64::MAX`: `admissible` refuses
+    /// every `ExitV2` before `on_transaction` reaches it. So the FUNCTION is
+    /// what gets pinned, and the call site is recorded as
+    /// unreachable-by-test until arming rather than papered over. Deleting
+    /// any branch of the function must kill this test.
+    #[test]
+    fn the_signed_exit_registry_precheck_catches_what_admissible_cannot() {
+        use bloch_pos_committee::staking::ExitTx;
+        use bloch_pos_committee::state_root::EvmCommitment;
+        use sha3::{Digest, Sha3_256};
+
+        let (pk0, sk0) = bloch_crypto::crypto::generate_keypair_from_seed(&[1u8; 32])
+            .expect("hybrid keypair");
+        let (pk1, sk1) = bloch_crypto::crypto::generate_keypair_from_seed(&[2u8; 32])
+            .expect("hybrid keypair");
+
+        let vs: Vec<bloch_pos_committee::transition::GenesisValidator> = [&pk0, &pk1]
+            .iter()
+            .enumerate()
+            .map(|(i, pk)| bloch_pos_committee::transition::GenesisValidator {
+                index: i as u32,
+                pubkey: (*pk).clone(),
+                staked_sat: 32 * 100_000_000,
+                randao_commitment: [i as u8; 32],
+                withdrawal_credentials: vec![0xAB; 32],
+                commission_bps: 500,
+            })
+            .collect();
+        let state = CommittedState::genesis(
+            BlockId::of(&BlockHeaderV4 {
+                version: VERSION_G4,
+                parent: [0u8; 32],
+                state_root: [0u8; 32],
+                body_root: [0u8; 32],
+                slot: 0,
+                proposer_index: 0,
+                randao_reveal: [0u8; 32],
+                randao_mix: [0u8; 32],
+                justified_root: [0u8; 32],
+                finalized_root: [0u8; 32],
+                attestation_root: [0u8; 32],
+                coherence_root: [0u8; 32],
+            }),
+            [0u8; 32],
+            &vs,
+            &[],
+            [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
+            EvmCommitment {
+                account_root: [0u8; 32],
+                receipts_root: [0u8; 32],
+                gas_used: 0,
+                base_fee_per_gas: 0,
+            },
+            &[],
+        );
+        // `verify_with_key` takes the key from the caller, so the registry
+        // this verifier was built with is irrelevant — which is the point.
+        let verifier = HybridVerifier::new(Vec::new());
+
+        let exit_signed_by = |target: &[u8], sk: &[u8]| {
+            let pubkey_hash: [u8; 32] = Sha3_256::digest(target).into();
+            let unsigned = ExitTx { pubkey_hash, epoch: 0, signature: Vec::new() };
+            ExitTx {
+                pubkey_hash,
+                epoch: 0,
+                signature: bloch_crypto::crypto::sign(sk, &unsigned.signing_root())
+                    .expect("sign the exit root"),
+            }
+        };
+
+        // Control, and the regression that would matter most: a validator's
+        // own signed exit must still be admitted.
+        assert_eq!(
+            signed_exit_preverifies(&state, &exit_signed_by(&pk0, &sk0), &verifier),
+            Ok(()),
+            "a validly signed exit must still reach the mempool",
+        );
+
+        // A key nobody registered.
+        let mut stranger = exit_signed_by(&pk0, &sk0);
+        stranger.pubkey_hash = [0xFF; 32];
+        let err = signed_exit_preverifies(&state, &stranger, &verifier)
+            .expect_err("an unregistered key must not be admitted");
+        assert!(err.contains("registry"), "got: {err}");
+
+        // A flipped byte in an otherwise valid signature.
+        let mut bent = exit_signed_by(&pk0, &sk0);
+        bent.signature[0] ^= 0x01;
+        assert!(
+            signed_exit_preverifies(&state, &bent, &verifier).is_err(),
+            "a corrupted signature must not be admitted",
+        );
+
+        // THE CASE ONLY A REGISTRY CHECK CATCHES: a signature that is
+        // cryptographically valid — for the wrong key. Validator 1 signs
+        // validator 0's retirement.
+        let wrong_signer = ExitTx {
+            pubkey_hash: Sha3_256::digest(&pk0).into(),
+            epoch: 0,
+            signature: exit_signed_by(&pk0, &sk1).signature,
+        };
+        // With the gate open, `admissible` ADMITS it: it sees a well-formed
+        // message with a non-empty signature and holds no registry to check
+        // it against. Asserting that here is what stops someone deleting the
+        // registry check on the grounds that admission already covers exits.
+        assert_eq!(
+            admissible(&PosTransaction::ExitV2(wrong_signer.clone()), u64::MAX),
+            Ok(()),
+            "admission cannot catch a wrong-key signature; only the registry can",
+        );
+        let err = signed_exit_preverifies(&state, &wrong_signer, &verifier)
+            .expect_err("a valid signature by the wrong key must not be admitted");
+        assert!(err.contains("registered key"), "got: {err}");
+        let _ = &pk1;
     }
 
     // ── TransferV2 admission: the flag-day arm ──────────────────────────────

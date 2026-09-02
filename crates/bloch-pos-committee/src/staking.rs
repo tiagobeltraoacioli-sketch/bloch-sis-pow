@@ -110,6 +110,37 @@ pub const MAX_ACTIVATIONS_PER_EPOCH: usize = 4;
 /// Epochs between a voluntary exit and the validator no longer being assigned
 /// duties (§5.1: ~8.5 h). Non-zero so an exit cannot be used to dodge duties
 /// — or slashing for duties already assigned — within the same epoch.
+/// The most validators that may commit to retiring in one epoch.
+///
+/// Written as the EQUALITY to [`MAX_ACTIVATIONS_PER_EPOCH`], because the
+/// equality is the rule: while `MAX_EXITS_PER_EPOCH <= MAX_ACTIVATIONS_PER_EPOCH`
+/// the active set can never shrink faster than the activation queue refills it.
+///
+/// Stated honestly, this does NOT buy wall-clock drain time —
+/// [`EXIT_DELAY_EPOCHS`] dominates that, and refilling is already the faster
+/// direction. What it bounds is how much IRREVOCABLE commitment one epoch of
+/// block space can absorb: an exit cannot be withdrawn once recorded, so
+/// without this limit a single block makes the loss of the whole set a settled
+/// fact, while the only remedy is metered at four per epoch.
+pub const MAX_EXITS_PER_EPOCH: usize = MAX_ACTIVATIONS_PER_EPOCH;
+
+/// How far in the past a signed exit's epoch may be and still be included.
+///
+/// [`ExitTx::epoch`] is signed, and `validate_exit` bounded it only from
+/// ABOVE: `FutureEpoch` caught a pre-signed exit, and nothing at all caught a
+/// CAPTURED one. An exit signed for epoch 8 was accepted at epoch 208. That is
+/// the difference between a message that authorises a retirement now and a
+/// bearer token good forever: combined with an unmetered exit rate, someone
+/// holding N captured exits retires N validators at a moment of their own
+/// choosing, years later.
+///
+/// Four epochs is inclusion latency with margin, not a grace period: the
+/// signer is online — it just signed — and an exit that missed the window is
+/// re-signed for the current epoch at no cost. The floor must stay well below
+/// [`EXIT_DELAY_EPOCHS`] so a captured exit expires long before the duties it
+/// would have ended.
+pub const EXIT_SIGNATURE_VALIDITY_EPOCHS: u64 = 4;
+
 pub const EXIT_DELAY_EPOCHS: u64 = 32;
 
 /// Epochs between a voluntary exit and the stake becoming spendable
@@ -453,6 +484,9 @@ pub enum ExitReject {
     FutureEpoch,
     /// Hybrid signature invalid (either half).
     BadSignature,
+    /// The signed epoch is further in the past than
+    /// [`EXIT_SIGNATURE_VALIDITY_EPOCHS`] — a captured exit, replayed.
+    StaleExit,
 }
 
 /// Validate a voluntary exit against the validator's committed record.
@@ -471,6 +505,12 @@ pub fn validate_exit(
     }
     if exit.epoch > current_epoch {
         return Err(ExitReject::FutureEpoch);
+    }
+    // ...and the floor the doc always claimed and the code never had. Both
+    // bounds together are what make the signed epoch mean "the epoch of
+    // inclusion" instead of "some epoch, once".
+    if current_epoch - exit.epoch > EXIT_SIGNATURE_VALIDITY_EPOCHS {
+        return Err(ExitReject::StaleExit);
     }
     // Signature last: cheapest-first, as everywhere else in the crate.
     if !verify_hybrid(&record.pubkey, &exit.signing_root(), &exit.signature, verifier) {
@@ -799,6 +839,37 @@ mod tests {
         let exit = exit_for(&rec, 100);
         let mldsa_only = HalfwiseVerifier { accept_mldsa: true, accept_falcon: false };
         assert_eq!(validate_exit(&exit, &rec, 100, &mldsa_only), Err(ExitReject::BadSignature));
+    }
+
+    /// The staleness floor, in the model the wire format is built on.
+    ///
+    /// Until 2026-09-02 this bounded the signed epoch only from ABOVE:
+    /// `FutureEpoch` caught a pre-signed exit and NOTHING caught a captured
+    /// one — `validate_exit(&exit_for(&rec, 8), &rec, 208, ..)` returned
+    /// `Ok(())` and retired the validator two hundred epochs late, while the
+    /// field's own doc claimed the signed epoch "must match the epoch of
+    /// inclusion". Combined with an unmetered exit rate, N captured exits
+    /// were N validators retired at a moment of the holder's choosing.
+    ///
+    /// Unconditional, with no flag day, and that is deliberate: this function
+    /// has zero production callers (the live path is `apply_signed_exit`,
+    /// which carries its own copy of the floor behind the gate), so tightening
+    /// it changes no chain rule.
+    #[test]
+    fn a_stale_exit_is_refused_by_validate_exit() {
+        let rec = record();
+        assert_eq!(
+            validate_exit(&exit_for(&rec, 8), &rec, 208, &accept_all()),
+            Err(ExitReject::StaleExit),
+            "a captured exit must expire, not retire its validator",
+        );
+        // The window's own edges, both sides.
+        let oldest_ok = 208 - EXIT_SIGNATURE_VALIDITY_EPOCHS;
+        assert_eq!(validate_exit(&exit_for(&rec, oldest_ok), &rec, 208, &accept_all()), Ok(()));
+        assert_eq!(
+            validate_exit(&exit_for(&rec, oldest_ok - 1), &rec, 208, &accept_all()),
+            Err(ExitReject::StaleExit),
+        );
     }
 
     #[test]

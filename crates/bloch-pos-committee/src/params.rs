@@ -542,6 +542,35 @@ pub mod rehearsal {
         f()
     }
 
+    thread_local! {
+        /// Test-only override of [`super::SIGNED_EXIT_ACTIVATION_EPOCH`].
+        /// Thread-local for the reason the whole module exists: a flag day
+        /// read from inside a consensus function must not move under the
+        /// tests running beside this one.
+        static SIGNED_EXIT_ACTIVATION_TL: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    /// Run `f` with the signed-exit flag day set to `epoch` on this thread,
+    /// then restore the shipped constant — including on the unwind path.
+    #[cfg(test)]
+    pub fn with_signed_exit_activation_at<R>(epoch: u64, f: impl FnOnce() -> R) -> R {
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                SIGNED_EXIT_ACTIVATION_TL.with(|c| c.set(None));
+            }
+        }
+        SIGNED_EXIT_ACTIVATION_TL.with(|c| c.set(Some(epoch)));
+        let _r = Restore;
+        f()
+    }
+
+    /// The override this thread has set, if any. Read through
+    /// [`super::effective_signed_exit_activation`], never directly.
+    pub(super) fn signed_exit_override() -> Option<u64> {
+        SIGNED_EXIT_ACTIVATION_TL.with(Cell::get)
+    }
+
     /// The look-ahead this build's readers must use: the shipped constant,
     /// unless a test has mutated the rule on this thread.
     #[cfg(test)]
@@ -591,6 +620,54 @@ pub mod rehearsal {
 /// never fired, and it fails SILENTLY. The gate reads the epoch derived from the
 /// BLOCK, never a local clock: reading node-local mutable state is what caused
 /// the 2026-08-08 `expected_bits` consensus split.
+/// Flag day for the **authenticated voluntary exit** — the epoch from which
+/// [`crate::transition::PosTransaction::ExitV2`] (wire tag `0x0a`) applies and
+/// the unauthenticated [`crate::transition::PosTransaction::Exit`] (tag
+/// `0x03`) is refused.
+///
+/// `u64::MAX` — INERT. Arming this is a consensus change and a coordinated
+/// fleet rebuild: below the flag day an old binary answers tag `0x0a` with
+/// `UnknownTag(0x0a)` at decode while a new one answers `FormatNotActive` at
+/// apply, which are two roads to one verdict on one block; ABOVE it the two
+/// disagree about tag `0x03`, and that is a fork. The fleet must carry this
+/// code before the epoch, not after.
+///
+/// It is the SECOND of three gates — funded staking, then signed exit, then
+/// withdrawal. Stated carefully, because the other two constants DO NOT EXIST
+/// on this lineage, which is a different thing from existing and being
+/// unarmed: they live on branches that do not descend from the fleet commit,
+/// under two spellings that do not agree (`FUNDED_STAKE_ACTIVATION_EPOCH` on
+/// one, `FUNDED_STAKING_ACTIVATION_EPOCH` on the others). Where they do exist,
+/// only "withdrawal last" is compile-asserted, against BOTH predecessors; the
+/// order of the first two is deliberately left open, because forcing it would
+/// turn a liveness decision into a build error.
+///
+/// Authenticating the exit does not make a deposit two-way: it stops anyone
+/// else retiring a validator, and leaves the coins exactly as unreachable as
+/// they were. There is no `Withdraw` variant on this lineage at all,
+/// `withdrawable_epoch` is written and never compared against the epoch to
+/// authorise a payout, and `validate_withdrawal` has no production caller.
+pub const SIGNED_EXIT_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// The signed-exit flag day this build's consensus readers must use.
+///
+/// In a release build this is the shipped constant and nothing else — the
+/// gate is consensus, and a consensus rule that can be moved at runtime is
+/// the 2026-08-08 `expected_bits` fork wearing a different hat. Under `cfg(test)`
+/// it consults a THREAD-LOCAL override so a test can open the flag day
+/// without moving the rule under the ~300 tests running beside it.
+#[inline]
+pub fn effective_signed_exit_activation() -> u64 {
+    #[cfg(test)]
+    {
+        rehearsal::signed_exit_override().unwrap_or(SIGNED_EXIT_ACTIVATION_EPOCH)
+    }
+    #[cfg(not(test))]
+    {
+        SIGNED_EXIT_ACTIVATION_EPOCH
+    }
+}
+
 pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// Flag day for **inactivity-leak recovery and the quorum-denominator floor**

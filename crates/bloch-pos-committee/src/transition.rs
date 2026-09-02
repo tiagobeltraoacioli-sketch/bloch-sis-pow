@@ -402,6 +402,28 @@ pub enum PosTransaction {
     },
     /// Voluntary exit (§7.2). Signature already checked at admission.
     Exit { validator: u32 },
+    /// The **authenticated** voluntary exit (wire tag `0x0a`) — INERT until
+    /// [`crate::params::SIGNED_EXIT_ACTIVATION_EPOCH`].
+    ///
+    /// [`Self::Exit`] names a validator by INDEX and carries nothing else:
+    /// five bytes, no key, no epoch, no signature. Every refusal of it lived
+    /// in `admissible`, which is node-local mempool policy in another crate
+    /// and never runs on block ingest — so the exit was closed against the
+    /// public RPC and open to any proposer. This variant moves the refusal
+    /// onto the consensus path.
+    ///
+    /// Two properties, and both are deliberate:
+    ///
+    /// 1. **The index is not on the wire.** The message names a
+    ///    `pubkey_hash`, which is INSIDE the signed root, and the applier
+    ///    resolves the registry index from committed `pubkey_index`. This is
+    ///    stronger than the attestation shape, whose signing root does not
+    ///    cover the validator index — do not copy that one here.
+    /// 2. **The epoch is bounded on both sides.** Signed, so it cannot be
+    ///    edited in flight; floored by
+    ///    [`staking::EXIT_SIGNATURE_VALIDITY_EPOCHS`], so a captured exit
+    ///    expires instead of retiring its validator years later.
+    ExitV2(staking::ExitTx),
     /// Bond delegated stake behind an operator.
     Delegate {
         delegator: u32,
@@ -669,6 +691,30 @@ impl PosTransaction {
                 b.push(0x03);
                 b.extend_from_slice(&validator.to_le_bytes());
             }
+            // 0x0a: the signed voluntary exit. Fixed-width hash and epoch,
+            // then the length-prefixed signature — the same shape, and the
+            // same injectivity argument, as every other arm.
+            //
+            // WHY 0x0a AND NOT 0x07, 0x08 OR 0x09. A census of all 1,245 refs
+            // (2026-09-02) found every one of those three already means two
+            // to five different transactions on different branches: 0x07 is
+            // FundedDeposit / DepositV2 / DepositFunded / Withdraw /
+            // SignedExit; 0x08 is SignedExit / Withdraw / ExitV2; 0x09 is
+            // Withdraw on 53 refs and ExitV2 on 6. Git merges a tag collision
+            // TEXTUALLY and silently — the framing-byte lesson — so any of
+            // the three lands as a chain split discovered at decode time on
+            // somebody else's node.
+            //
+            // 0x0a is free on every ref in the repository. Nothing above 0x06
+            // has ever been published, tags carry no ordering meaning, and
+            // skipping three numbers costs exactly nothing. The number is the
+            // founder's to rule on; this is the reasoning, not the ruling.
+            PosTransaction::ExitV2(x) => {
+                b.push(0x0a);
+                b.extend_from_slice(&x.pubkey_hash);
+                b.extend_from_slice(&x.epoch.to_le_bytes());
+                put(&mut b, &x.signature);
+            }
             PosTransaction::Delegate { delegator, validator, amount_sat, eligible } => {
                 b.push(0x04);
                 b.extend_from_slice(&delegator.to_le_bytes());
@@ -767,6 +813,11 @@ impl PosTransaction {
                 commission_bps: r.u128()?,
             },
             0x03 => PosTransaction::Exit { validator: r.u32()? },
+            0x0a => PosTransaction::ExitV2(staking::ExitTx {
+                pubkey_hash: r.h32()?,
+                epoch: r.u64()?,
+                signature: r.bytes()?,
+            }),
             0x04 => PosTransaction::Delegate {
                 delegator: r.u32()?,
                 validator: r.u32()?,
@@ -2013,6 +2064,98 @@ impl CommittedState {
     /// `verifier` is threaded in because a transfer's authorisation is a
     /// signature check, and the only thing that may decide whether an output
     /// moves is whether its owner said so.
+    /// The registry index committed for `pubkey_hash`, if any.
+    ///
+    /// Read-only over committed state, and the ONLY sanctioned way to turn a
+    /// key hash into an index — `apply_signed_exit` uses the same map, so a
+    /// node-side pre-check and the consensus rule cannot disagree about who a
+    /// message names.
+    pub fn validator_index_of(&self, pubkey_hash: &[u8; 32]) -> Option<u32> {
+        self.pubkey_index.get(pubkey_hash).copied()
+    }
+
+    /// How many validators have already committed to retiring in the epoch
+    /// this state is open at.
+    ///
+    /// DERIVED from `exit_epoch`, not stored: every exit recorded during
+    /// epoch E writes `exit_epoch = E + EXIT_DELAY_EPOCHS`, so counting the
+    /// records that carry that value counts this epoch's exits exactly. No
+    /// new committed field, therefore a byte-identical state root and no
+    /// migration — the meter costs nothing but the scan.
+    ///
+    /// A SLASHED validator is not counted, and that is a property rather than
+    /// an accident: slashing writes `exit_epoch = epoch` (the current one),
+    /// never `epoch + EXIT_DELAY_EPOCHS`, so an ejection cannot consume the
+    /// voluntary quota. The honest converse is that slashing therefore
+    /// empties roster slots this meter does not bound — the limit meters
+    /// voluntary retirement, not attrition.
+    fn exits_recorded_this_epoch(&self) -> usize {
+        let this_epoch = self.epoch.saturating_add(staking::EXIT_DELAY_EPOCHS);
+        self.validators.values().filter(|r| r.exit_epoch == this_epoch).count()
+    }
+
+    /// Apply an authenticated voluntary exit.
+    ///
+    /// The order is cheapest-first, as everywhere else in the crate, and the
+    /// signature is deliberately last. What matters more than the order is
+    /// WHERE this runs: on the consensus path, from `apply_transaction`,
+    /// which is reached by `compute_post_state` for every block a node
+    /// ingests. The refusal it replaces lived in `admissible` — node-local
+    /// mempool policy, in another crate, with one non-test caller — and a
+    /// block that already carried an exit applied it regardless.
+    pub(crate) fn apply_signed_exit(
+        &mut self,
+        exit: &staking::ExitTx,
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<(), TxReject> {
+        // 2. THE INDEX IS RESOLVED FROM COMMITTED STATE, NEVER FROM THE WIRE.
+        //    The message names a key hash; the registry says which index that
+        //    key is. `AttestationData::signing_root` does NOT cover the
+        //    validator index and must not be the model here — a signed root
+        //    that omits the subject lets a captured signature be re-pointed.
+        let Some(&index) = self.pubkey_index.get(&exit.pubkey_hash) else {
+            return Err(TxReject::StakingRule);
+        };
+        let epoch = self.epoch;
+        let already = self.exits_recorded_this_epoch();
+        let Some(rec) = self.validators.get(&index) else {
+            return Err(TxReject::StakingRule);
+        };
+        if rec.slashed || rec.activation_epoch > epoch || rec.exit_epoch != u64::MAX {
+            return Err(TxReject::StakingRule);
+        }
+        // 3. THE EPOCH, BOUNDED ON BOTH SIDES. Above: a pre-signed exit would
+        //    decouple the withdrawal clock from inclusion time. Below: without
+        //    a floor the signed epoch is decoration, and an exit signed for
+        //    epoch 8 retires its validator at epoch 208.
+        if exit.epoch > epoch {
+            return Err(TxReject::StakingRule);
+        }
+        if epoch - exit.epoch > staking::EXIT_SIGNATURE_VALIDITY_EPOCHS {
+            return Err(TxReject::StakingRule);
+        }
+        // 4. THE CHURN LIMIT. Entry is metered at MAX_ACTIVATIONS_PER_EPOCH
+        //    and exit was metered at nothing; EXIT_DELAY_EPOCHS is a delay,
+        //    which shifts a batch rather than spreading it. Surplus is
+        //    REFUSED, not queued: a queue would need a new committed field,
+        //    and refusing is the verdict a re-signed exit costs nothing to
+        //    retry next epoch.
+        if already >= staking::MAX_EXITS_PER_EPOCH {
+            return Err(TxReject::StakingRule);
+        }
+        // 5. THE SIGNATURE, LAST — over the record's COMMITTED key, not over
+        //    anything the message supplied.
+        let root = exit.signing_root();
+        if !verifier.verify_with_key(&rec.pubkey, &root, &exit.signature) {
+            return Err(TxReject::StakingRule);
+        }
+        let exit_epoch = epoch.saturating_add(staking::EXIT_DELAY_EPOCHS);
+        let rec = self.validators.get_mut(&index).expect("record read above");
+        rec.exit_epoch = exit_epoch;
+        rec.withdrawable_epoch = exit_epoch.saturating_add(staking::WITHDRAWAL_DELAY_EPOCHS);
+        Ok(())
+    }
+
     fn apply_transaction(
         &mut self,
         tx: &PosTransaction,
@@ -2098,7 +2241,29 @@ impl CommittedState {
                 });
                 Ok(free)
             }
+            PosTransaction::ExitV2(exit) => {
+                // 1. THE FLAG-DAY GATE, FIRST — read from `self.epoch`, which
+                //    is COMMITTED state already rolled to the block's epoch,
+                //    never from anything node-local. Pre-activation this
+                //    reject and an old binary's `UnknownTag(0x0a)` decode
+                //    failure are two roads to the same verdict on the same
+                //    block, which is what keeps a mixed fleet on one chain
+                //    until the flag day.
+                if self.epoch < crate::params::effective_signed_exit_activation() {
+                    return Err(TxReject::StakingRule);
+                }
+                self.apply_signed_exit(exit, verifier)?;
+                Ok(free)
+            }
             PosTransaction::Exit { validator } => {
+                // The unauthenticated encoding, refused from the same flag
+                // day that opens its successor. Below the flag day it still
+                // applies — that is today's chain and rewriting history is
+                // not on the table; above it, five bytes naming an index are
+                // no longer a retirement.
+                if self.epoch >= crate::params::effective_signed_exit_activation() {
+                    return Err(TxReject::StakingRule);
+                }
                 let Some(rec) = self.validators.get_mut(validator) else {
                     return Err(TxReject::StakingRule);
                 };
@@ -3620,6 +3785,24 @@ mod tx_codec_tests {
                 tx_bytes: 0,
                 tip_millisat_per_gas: 0,
             },
+            // Appended at the END, like V2 before it, so the index-addressed
+            // sweeps (`samples()[1]`) keep pointing where they were aimed.
+            //
+            // The signed exit, with a realistic hybrid signature length — the
+            // truncation and trailing-byte sweeps are the whole reason a new
+            // wire format joins this corpus rather than getting a bespoke test.
+            PosTransaction::ExitV2(staking::ExitTx {
+                pubkey_hash: [0x9E; 32],
+                epoch: u64::MAX,
+                signature: vec![0x4D; 3309 + 1280],
+            }),
+            // The zero/empty edges the length prefix and the fixed widths must
+            // both survive.
+            PosTransaction::ExitV2(staking::ExitTx {
+                pubkey_hash: [0u8; 32],
+                epoch: 0,
+                signature: Vec::new(),
+            }),
         ]
     }
 
@@ -4931,6 +5114,401 @@ mod tests {
             Err(TxReject::StakingRule)
         );
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // THE THREE VIOLATIONS — a validator can be retired by anyone who can
+    // propose. Each test states the hole by EXERCISING it; each must FAIL
+    // once the hole is closed. They are written against `apply_block`, the
+    // consensus path, not against the mempool door.
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// A verifier that accepts the registry form (proposer and attestation
+    /// plumbing, so a test dies on its subject and not on block mechanics)
+    /// and REFUSES every keyed signature. Under it no transfer can spend.
+    /// If an exit still applies under it, the exit consulted no signature at
+    /// all — which is the claim under test, and it is stronger than "the
+    /// check is permissive": there is no check.
+    struct DenyKeyedVerifier;
+    impl SignatureVerifier for DenyKeyedVerifier {
+        fn verify(&self, _v: u32, _root: &[u8; 32], _sig: &[u8]) -> bool {
+            true
+        }
+        fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            false
+        }
+    }
+
+    /// VIOLATION 1 — an unsigned exit is accepted AT BLOCK INGEST.
+    ///
+    /// `admissible` (bloch-pos-node) refuses `Exit` with "not authenticated",
+    /// and that refusal has exactly one non-test caller: the mempool door.
+    /// It is in a different crate from consensus and never runs here. This
+    /// test names 32 validators by index, from a proposer holding none of
+    /// their keys, under a verifier that refuses every keyed signature, and
+    /// `apply_block` takes it.
+    #[test]
+    fn violation_1_unsigned_exit_retires_the_roster_at_block_ingest() {
+        const N: u32 = 32;
+        let (t, g, mut chains) = setup_with(N, DenyKeyedVerifier, &[]);
+        assert_eq!(g.active_validators().len(), N as usize, "control: full roster");
+
+        let txs: Vec<PosTransaction> =
+            (0..N).map(|i| PosTransaction::Exit { validator: i }).collect();
+        let b = build_block(&t, &g, 1, &[], &txs, &mut chains);
+        let st = t
+            .apply_block(&g, &b, &[], &txs)
+            .expect("VIOLATION 1: apply_block accepted 32 exits carrying no signature");
+
+        for i in 0..N {
+            let rec = st.validator_record(i).expect("record");
+            assert_eq!(
+                rec.exit_epoch,
+                staking::EXIT_DELAY_EPOCHS,
+                "validator {i} was retired by a block, not by its own key",
+            );
+        }
+
+        // ...and the roster empties, in one step, at one epoch.
+        let mut rolled = st.clone();
+        while rolled.epoch < staking::EXIT_DELAY_EPOCHS {
+            rolled = rolled.close_epoch();
+        }
+        assert_eq!(
+            rolled.active_validators().len(),
+            0,
+            "VIOLATION 1: roster {N} -> 0, no signature anywhere in the path",
+        );
+    }
+
+    /// VIOLATION 2 — a captured exit replays forever.
+    ///
+    /// The live wire form is five bytes: tag `0x03` and a `u32` index. It
+    /// names no epoch, no key and no signature, so the bytes captured at
+    /// epoch 0 are byte-identical to the bytes accepted at epoch 200. The
+    /// `ExitTx` model in staking.rs does carry a signed epoch, but bounds it
+    /// only from ABOVE (`FutureEpoch`) — so even the shape a fix would build
+    /// on replays from the arbitrarily distant past.
+    #[test]
+    fn violation_2_a_captured_exit_replays_at_any_later_epoch() {
+        let exit = PosTransaction::Exit { validator: 3 };
+        let wire = exit.canonical_bytes();
+        assert_eq!(
+            wire,
+            vec![0x03, 3, 0, 0, 0],
+            "the entire authenticated surface of an exit: a tag and an index",
+        );
+
+        let decoded = PosTransaction::from_canonical_bytes(&wire).expect("decodes");
+        let (_t, g, _c) = setup(4);
+
+        // The same bytes at epoch 0...
+        let mut early = g.clone();
+        assert!(
+            early
+                .apply_transaction(
+                    &decoded,
+                    0,
+                    fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                    &OkVerifier
+                )
+                .is_ok(),
+            "control: the exit applies when fresh",
+        );
+
+        // ...and the SAME bytes 200 epochs later, against a validator that
+        // never asked twice.
+        let mut late = g.clone();
+        while late.epoch < 200 {
+            late = late.close_epoch();
+        }
+        assert!(
+            late.apply_transaction(
+                &decoded,
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &OkVerifier
+            )
+            .is_ok(),
+            "VIOLATION 2: a captured exit retires the validator 200 epochs later",
+        );
+    }
+
+
+    // ════════════════════════════════════════════════════════════════════════
+    // THE SAME THREE, CLOSED. Each of these fails if the corresponding rule
+    // is deleted, and each is the violation above run again with the flag day
+    // open. The gate is opened per-thread, never by moving the constant.
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// A validator's signed exit, valid under [`ToyVerifier`] — which binds a
+    /// signature to one key over one root and to nothing else.
+    fn signed_exit(pubkey: &[u8], epoch: u64) -> PosTransaction {
+        let pubkey_hash: [u8; 32] = Sha3_256::digest(pubkey).into();
+        let unsigned = staking::ExitTx { pubkey_hash, epoch, signature: Vec::new() };
+        let root = unsigned.signing_root();
+        PosTransaction::ExitV2(staking::ExitTx {
+            pubkey_hash,
+            epoch,
+            signature: toy_sign(pubkey, &root),
+        })
+    }
+
+    /// A block whose header commits to `txs` but whose state root is not
+    /// stamped — enough for `compute_post_state`, which is the frame that
+    /// judges transactions. `build_block` cannot be used when the block is
+    /// meant to be REFUSED: it panics stamping the root it will never get.
+    fn build_block_expecting_refusal<V: SignatureVerifier>(
+        pre: &CommittedState,
+        slot: u64,
+        txs: &[PosTransaction],
+        chains: &mut [RandaoChain],
+    ) -> ProposalEnvelope {
+        let mut ctx = pre.clone();
+        while ctx.epoch < crate::epoch_of(slot) {
+            ctx = ctx.close_epoch();
+        }
+        let roster = ctx.duty_roster();
+        let seed = ctx.seed_for_epoch(ctx.epoch);
+        let p = schedule::proposer(&seed, slot, &roster).expect("no eligible proposer");
+        let reveal = chains[p as usize].next_reveal().expect("chain spent");
+        let mix = beacon::mix_in(&ctx.randao_mix, &reveal);
+        let fin = ctx.finality_view();
+        let _ = std::marker::PhantomData::<V>;
+        ProposalEnvelope {
+            header: BlockHeaderV4 {
+                version: BLOCK_VERSION_V4,
+                parent: *pre.head.as_bytes(),
+                state_root: [0u8; 32],
+                body_root: crate::derive::body_root(
+                    &txs.iter().map(PosTransaction::canonical_bytes).collect::<Vec<_>>(),
+                ),
+                slot,
+                proposer_index: p,
+                randao_reveal: reveal,
+                randao_mix: mix,
+                justified_root: fin.justified.root,
+                finalized_root: fin.finalized.root,
+                attestation_root: crate::derive::attestation_root(&[]),
+                coherence_root: pre.coherence_root(),
+            },
+            proposer_sig: vec![0u8; 8],
+        }
+    }
+
+    /// CLOSED 1 — the unauthenticated exit is refused AT BLOCK INGEST, and an
+    /// exit whose signature does not verify is refused there too.
+    ///
+    /// The first half is the one that matters: the block is built while the
+    /// flag day is shut (so it is a block the chain would have taken today)
+    /// and then judged with the flag day open. The refusal comes from
+    /// `compute_post_state`, on the consensus path, in the consensus crate —
+    /// not from `admissible`, which is in another crate and never runs here.
+    #[test]
+    fn closed_1_unsigned_exit_is_refused_at_block_ingest() {
+        const N: u32 = 32;
+        let (t, g, mut chains) = setup_with(N, ToyVerifier, &[]);
+        let txs: Vec<PosTransaction> =
+            (0..N).map(|i| PosTransaction::Exit { validator: i }).collect();
+
+        // Built under today's rule, where it is a valid block.
+        let b = build_block(&t, &g, 1, &[], &txs, &mut chains);
+        assert!(t.apply_block(&g, &b, &[], &txs).is_ok(), "control: valid before the flag day");
+
+        // Judged under the new rule.
+        crate::params::rehearsal::with_signed_exit_activation_at(0, || {
+            assert!(
+                t.compute_post_state(&g, &b, &[], &txs).is_err(),
+                "the five-byte exit must not retire anyone once the gate is open",
+            );
+        });
+
+        // And the successor is not a rubber stamp: a wrong signature is
+        // refused, a right one applies, and the only difference is the key.
+        crate::params::rehearsal::with_signed_exit_activation_at(0, || {
+            let good = signed_exit(&vec![0u8; 8], 0);
+            let PosTransaction::ExitV2(inner) = &good else { panic!("shape") };
+
+            let forged = PosTransaction::ExitV2(staking::ExitTx {
+                signature: toy_sign(&vec![9u8; 8], &inner.signing_root()),
+                ..inner.clone()
+            });
+            let mut probe = g.clone();
+            assert_eq!(
+                probe.apply_transaction(
+                    &forged,
+                    0,
+                    fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                    &ToyVerifier
+                ),
+                Err(TxReject::StakingRule),
+                "a signature by anyone but the validator must not retire it",
+            );
+
+            let mut probe = g.clone();
+            assert!(
+                probe
+                    .apply_transaction(
+                        &good,
+                        0,
+                        fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                        &ToyVerifier
+                    )
+                    .is_ok(),
+                "control: the validator's own signed exit applies",
+            );
+            assert_eq!(
+                probe.validator_record(0).unwrap().exit_epoch,
+                staking::EXIT_DELAY_EPOCHS,
+                "and it is validator 0 that retired — the index came from pubkey_index",
+            );
+        });
+    }
+
+    /// CLOSED 2 — the staleness floor. The signed epoch is now bounded on
+    /// both sides, so a captured exit expires instead of retiring its
+    /// validator two hundred epochs later.
+    #[test]
+    fn closed_2_a_stale_exit_is_refused() {
+        let (_t, g, _c) = setup_with(4, ToyVerifier, &[]);
+        let mut late = g.clone();
+        while late.epoch < 200 {
+            late = late.close_epoch();
+        }
+        let key = vec![0u8; 8];
+
+        crate::params::rehearsal::with_signed_exit_activation_at(0, || {
+            let charge = |st: &mut CommittedState, tx: &PosTransaction| {
+                st.apply_transaction(tx, 0, fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS, &ToyVerifier)
+            };
+
+            // Captured at epoch 8, presented at 200.
+            let mut probe = late.clone();
+            assert_eq!(
+                charge(&mut probe, &signed_exit(&key, 8)),
+                Err(TxReject::StakingRule),
+                "VIOLATION 2 CLOSED: a captured exit no longer retires anyone",
+            );
+
+            // The edge, from both sides: the window is inclusive at its floor.
+            let oldest_ok = 200 - staking::EXIT_SIGNATURE_VALIDITY_EPOCHS;
+            let mut probe = late.clone();
+            assert!(
+                charge(&mut probe, &signed_exit(&key, oldest_ok)).is_ok(),
+                "the floor must be inclusive, or a valid exit is refused at the boundary",
+            );
+            let mut probe = late.clone();
+            assert_eq!(
+                charge(&mut probe, &signed_exit(&key, oldest_ok - 1)),
+                Err(TxReject::StakingRule),
+                "one epoch past the floor is stale",
+            );
+
+            // The ceiling still holds: a pre-signed exit is refused.
+            let mut probe = late.clone();
+            assert_eq!(
+                charge(&mut probe, &signed_exit(&key, 201)),
+                Err(TxReject::StakingRule),
+                "a future-dated exit must stay refused",
+            );
+        });
+    }
+
+    /// CLOSED 3 — the churn limit actually bounds a batch, at block ingest.
+    ///
+    /// `MAX_EXITS_PER_EPOCH` retirements are admitted in an epoch and the
+    /// surplus is REFUSED, which makes the whole block invalid rather than
+    /// silently dropping one transaction.
+    #[test]
+    fn closed_3_the_churn_limit_bounds_a_batch() {
+        const N: u32 = 32;
+        let cap = staking::MAX_EXITS_PER_EPOCH;
+        let (t, g, mut chains) = setup_with(N, ToyVerifier, &[]);
+
+        crate::params::rehearsal::with_signed_exit_activation_at(0, || {
+            // Exactly the cap: a valid block.
+            let ok: Vec<PosTransaction> =
+                (0..cap as u32).map(|i| signed_exit(&vec![i as u8; 8], 0)).collect();
+            let b = build_block(&t, &g, 1, &[], &ok, &mut chains);
+            let st = t.apply_block(&g, &b, &[], &ok).expect("the cap itself must apply");
+            assert_eq!(
+                st.exits_recorded_this_epoch(),
+                cap,
+                "the meter counts what it admitted",
+            );
+
+            // One more than the cap, in one block: refused at ingest.
+            // `RandaoChain` is deliberately not `Clone` (a reveal chain that
+            // could be copied is a reveal that could be reused), so the
+            // surplus block is built on a second, identical fixture —
+            // `setup_with` is deterministic in `n`.
+            let (_t2, g2, mut chains2) = setup_with(N, ToyVerifier, &[]);
+            let too_many: Vec<PosTransaction> =
+                (0..=cap as u32).map(|i| signed_exit(&vec![i as u8; 8], 0)).collect();
+            let b2 = build_block_expecting_refusal::<ToyVerifier>(&g2, 1, &too_many, &mut chains2);
+            assert_eq!(
+                t.compute_post_state(&g2, &b2, &[], &too_many).unwrap_err(),
+                TransitionError::Transaction(cap as u32),
+                "VIOLATION 3 CLOSED: the surplus exit is refused, and it names which one",
+            );
+
+            // The roster cannot be emptied in one epoch any more.
+            let mut rolled = st.clone();
+            while rolled.epoch < staking::EXIT_DELAY_EPOCHS {
+                rolled = rolled.close_epoch();
+            }
+            assert_eq!(
+                rolled.active_validators().len(),
+                N as usize - cap,
+                "at most {cap} left, not all {N}",
+            );
+        });
+    }
+
+    /// VIOLATION 3 — nothing bounds how many exits an epoch admits.
+    ///
+    /// Entry is throttled at `MAX_ACTIVATIONS_PER_EPOCH` inside
+    /// `resolve_activations`. Exit has no counterpart: the epoch boundary
+    /// says so in one line ("Exits need no active step"). `EXIT_DELAY_EPOCHS`
+    /// is a DELAY, not a rate — it shifts a batch, it does not spread one,
+    /// which is what this test pins: N exits included together take effect
+    /// together.
+    #[test]
+    fn violation_3_no_churn_limit_bounds_a_batch_of_exits() {
+        // Entry is throttled...
+        assert_eq!(staking::MAX_ACTIVATIONS_PER_EPOCH, 4, "entry is rate-limited");
+        // ...and there is no `staking::MAX_EXITS_PER_EPOCH` to compare it to.
+
+        const N: u32 = 32;
+        let (t, g, mut chains) = setup(N);
+        let txs: Vec<PosTransaction> =
+            (0..N).map(|i| PosTransaction::Exit { validator: i }).collect();
+        let b = build_block(&t, &g, 1, &[], &txs, &mut chains);
+        let st = t.apply_block(&g, &b, &[], &txs).expect("one block, every exit");
+
+        // Every exit lands on the SAME epoch: the delay is uniform, so it
+        // preserves the batch instead of metering it.
+        let epochs: std::collections::BTreeSet<u64> =
+            (0..N).map(|i| st.validator_record(i).unwrap().exit_epoch).collect();
+        assert_eq!(
+            epochs.len(),
+            1,
+            "VIOLATION 3: {N} exits, one effective epoch — a delay is not a rate",
+        );
+
+        // The roster steps straight to zero across a single boundary.
+        let mut rolled = st.clone();
+        while rolled.epoch < staking::EXIT_DELAY_EPOCHS - 1 {
+            rolled = rolled.close_epoch();
+        }
+        let before = rolled.active_validators().len();
+        let after = rolled.close_epoch().active_validators().len();
+        assert_eq!(
+            (before, after),
+            (N as usize, 0),
+            "VIOLATION 3: one boundary took the roster from {N} to 0",
+        );
+    }
+
 
     /// One transfer, charged by the fee market rather than by its own say-so,
     /// accruing in-epoch and compounding at the boundary.
@@ -6982,6 +7560,11 @@ mod tests {
             PosTransaction::TransferV2 { .. } => {}
             PosTransaction::Deposit { .. } => {}
             PosTransaction::Exit { .. } => {}
+            // The authenticated exit unbonds exactly what `Exit` unbonds: it
+            // changes WHO may request the retirement, never how many coins
+            // exist. It writes two epoch clocks on a committed record and
+            // touches no balance and no issuance.
+            PosTransaction::ExitV2(_) => {}
             PosTransaction::Delegate { .. } => {}
             PosTransaction::SlashingEvidence(_) => {}
         }
