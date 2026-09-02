@@ -618,11 +618,37 @@ subtracted only from a derived roster view (`finality.rs:159`, `:489`;
 `transition.rs:3101-3106`). The only decrement of `staked_sat` anywhere in the
 crate is inside the unreachable slashing path.
 
+There is also **no activation constant to arm.**
+`SLASHING_EVIDENCE_ACTIVATION_EPOCH` does not exist in the repository — it is
+not set to `u64::MAX`, it is absent. This is not a feature waiting on a flag
+day.
+
 **So the economic cost our RPC documentation sells you as the basis of
-settlement cannot be imposed by any code path reachable from the wire.** Take
-§4.1's guidance — depth, two nodes, re-verify — as the whole of what we offer,
-and discount the slashing sentence to zero. Correcting the source comment is
-[D4]; we are telling you before we fix it, not after.
+settlement cannot be imposed by any code path reachable from the wire.**
+Genesis-4 finality today is economic by intent and cryptographic by nothing:
+reverting a finalised checkpoint costs an attacker no bonded stake, only the
+coordination of the validators who would have to do it. Take §4.1's guidance —
+depth, two nodes, re-verify — as the whole of what we offer, and discount the
+slashing sentence to zero.
+
+**One further disclosure, which we are marking as pending confirmation rather
+than holding back.** A correction to that RPC comment is in flight in our
+working tree — it retracts both sentences, adds machine-readable
+`"slashing_enforced": false` and `"finalized_is_a_latch": false` to the
+capabilities object so a client can branch on a flag instead of parsing prose,
+and it records a measurement against the live chain at epoch 1726, both
+archivals agreeing on head and root: 64 validators, all 64 with
+`"slashed": false` and `"exit_epoch": null` — **including 48 whose
+double-signing is committed on chain and cryptographically provable.**
+
+If that measurement holds, it is the sharpest available statement of §4.2: the
+penalty has not merely been unreachable in principle, it has already failed to
+fire against provable equivocation by three quarters of the validator set.
+**We have not independently re-measured it for this letter, and the test the
+correction cites (`tests/slashing_backed_finality_claims.rs`) is named but not
+yet written.** We are telling you it exists in that state rather than waiting
+for it to be tidy. Landing and corroborating it is [D4]; you will get the
+confirmed number either way.
 
 ### 4.3 Your §7.9 — partly stale, and the accurate version is worse in one place
 ### and better in another
@@ -849,7 +875,7 @@ flattering information.
 | **D1** | **Push `release/g4-node-20260901` (`7a83ca89`) + tag + checksum to both remotes.** Merging arms nothing: `ANCESTRY_SEED` and `LEAK_RECOVERY` stay `u64::MAX`. Without it we cannot honestly tell them to build anything, and our own quickstart is pointing strangers off-lineage. | §2.3, §5.3, the whole letter | **2026-09-02, first working hour.** Every hour costs them window. |
 | **D2** | Fund a throwaway key with ~0.001 BLCH for the mainnet spend rehearsal, and decide whether a small mainnet amount goes to the exchange. | §3.1 | 2026-09-03 |
 | **D3** | Roll the two public archival observers onto the fleet lineage, or name two nodes on different builds. The two-node corroboration rule we are giving them is currently satisfied by two copies of the same stale build. | §1.1, §4.1 | 2026-09-04 |
-| **D4** | Approve correcting `rpc.rs:1650-1652` and `:1669-1670`. Doc-comment only, no behaviour change. The letter discloses it either way; this decides whether it is fixed before or after they read it. | §4.2 | 2026-09-03 |
+| **D4** | **The retraction is already written, uncommitted, in the main checkout** — `rpc.rs` (+107/−20): both sentences retracted, `slashing_enforced`/`finalized_is_a_latch` flags added to capabilities, and a live measurement at epoch 1726 asserting **48 validators with provable on-chain double-signing and `"slashed": false`**. Two things needed: **(a)** corroborate the 48 figure independently before it goes to a partner — it is the single most quotable sentence in this letter and it is currently one agent's uncommitted measurement; **(b)** write `tests/slashing_backed_finality_claims.rs`, which the comment cites and which does not exist. Then commit and push. | §4.2 | **(a) 2026-09-02** — it gates sending. (b) 2026-09-03 |
 | **D5** | Land `docs/LIVE-SUPPLY.md` and its expiry test on `main`. | §4.3 | 2026-09-04 |
 | **D6** | Contact the external audit firm to open the Phase A ceremony calendar. **Not compressible and not delegable.** The letter commits only to a trigger, not a date, so this does not gate sending — but it gates every post-window guarantee. | §5.1 | Immediately; the window closes regardless. |
 
