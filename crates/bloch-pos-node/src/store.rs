@@ -31,6 +31,24 @@ use bloch_pos_committee::header::BlockEnvelope;
 
 const META_MAGIC: &[u8; 8] = b"BPOSMETA";
 
+thread_local! {
+    /// Frame-body bytes [`Store::blocks_after`] has actually read on this
+    /// thread. Observability only; nothing branches on it.
+    ///
+    /// A **count**, not a timing, for the reason the rest of this tree gives:
+    /// on a loaded box a timing cannot honestly separate "we stopped reading
+    /// the whole log" from "the box was quieter this run", and this is
+    /// precisely the kind of claim that has been withdrawn here before after
+    /// a 409 s-vs-1757 s gap turned out to be machine variance. Bytes read is
+    /// a property of the code and of nothing else.
+    static SYNC_BODY_BYTES_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The calling thread's [`SYNC_BODY_BYTES_READ`]. Observability only.
+pub fn sync_body_bytes_read() -> u64 {
+    SYNC_BODY_BYTES_READ.with(|c| c.get())
+}
+
 pub struct Store {
     dir: PathBuf,
     log: File,
@@ -182,25 +200,71 @@ impl Store {
             if len > crate::codec::MAX_FIELD_LEN {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "log frame over cap"));
             }
-            let mut payload = vec![0u8; len];
-            match f.read_exact(&mut payload) {
+            // Read the HEADER only, then decide. The slot is all the filter
+            // needs, and it lives in the first `ENCODED_LEN` bytes of the
+            // frame, so a frame that will be discarded never has to be read
+            // or allocated past its header.
+            //
+            // **This is the cold-sync bottleneck, and it was measured.**
+            // Before this change the body of every frame was read into a
+            // fresh `vec![0u8; len]` before the slot was even looked at, so
+            // answering `after_slot = S` read and allocated the WHOLE log
+            // from byte zero — every block ahead of S included. It is
+            // O(chain length) per request, on the SERVER, for every peer,
+            // every time, and it gets worse as the chain grows. Serving a
+            // node at slot 38,000 of a 500 MB log meant reading 500 MB and
+            // throwing away ~38,000 payloads to emit at most 512.
+            //
+            // Measured against the two published bootnodes on 2026-09-02,
+            // asking for one page as a plain socket client: the answer
+            // arrived at 1.9-22 blocks/s and varied by 10x between the two
+            // hosts and between requests, while a cold node's own CPU sat at
+            // 0-6% waiting for it. The requester is not the slow half.
+            //
+            // Skipping with `seek` keeps the frames returned, their order and
+            // their bytes exactly as they were: `out` is pushed from the same
+            // predicate over the same headers. Only the reads that produced
+            // nothing are gone. Not a consensus change -- this function
+            // serves bytes off the log and computes no state.
+            let hdr_len = bloch_pos_committee::header::BlockHeaderV4::ENCODED_LEN;
+            if len < hdr_len {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "log frame shorter than a header"));
+            }
+            let mut hdr_buf = vec![0u8; hdr_len];
+            match f.read_exact(&mut hdr_buf) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e),
             }
-            // Only the header is parsed while skipping: the slot is all the
-            // filter needs, and the signatures/attestations behind it are the
-            // expensive part.
-            let hdr_len = bloch_pos_committee::header::BlockHeaderV4::ENCODED_LEN;
-            if payload.len() < hdr_len {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "log frame shorter than a header"));
-            }
-            let header = bloch_pos_committee::header::BlockHeaderV4::canonical_deserialize(
-                &payload[..hdr_len],
-            )
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "undecodable header in block log"))?;
+            let header =
+                bloch_pos_committee::header::BlockHeaderV4::canonical_deserialize(&hdr_buf)
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "undecodable header in block log")
+                    })?;
+            let rest = len - hdr_len;
             if header.slot > after_slot {
+                // Wanted: read the body and hand back the whole frame, byte
+                // for byte identical to what the old path pushed.
+                let mut payload = hdr_buf;
+                payload.resize(len, 0);
+                match f.read_exact(&mut payload[hdr_len..]) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e),
+                }
+                SYNC_BODY_BYTES_READ.with(|c| c.set(c.get() + rest as u64));
                 out.push(payload);
+            } else {
+                // Not wanted: skip the body without reading or allocating it.
+                // `BufReader::seek_relative` discards buffered bytes it can
+                // and seeks the rest, so this stays correct on a file the
+                // writer is appending to.
+                if let Err(e) = f.seek_relative(rest as i64) {
+                    if e.kind() == io::ErrorKind::UnexpectedEof {
+                        break;
+                    }
+                    return Err(e);
+                }
             }
         }
         Ok(out)
@@ -241,6 +305,70 @@ mod tests {
 
         let past_tip = Store::blocks_after(&dir, 99, 100).expect("scan");
         assert!(past_tip.is_empty(), "a peer at the tip is told there is nothing more");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// **Serving a page must not read the whole log.** This is the cold-sync
+    /// bottleneck, pinned as an assertion rather than a timing.
+    ///
+    /// `blocks_after`'s own doc comment has always promised that a frame
+    /// costs "a 4-byte length read plus a fixed-size header parse until the
+    /// window is found". It did not: the body of every frame was read into a
+    /// fresh allocation before the slot was consulted, so answering a peer
+    /// deep in the chain read the entire log from byte zero. The comment was
+    /// the specification and the code did not implement it; prose cannot go
+    /// red, so this test is what makes the promise enforceable.
+    ///
+    /// The claim, in the shape that cannot pass vacuously: with fat bodies
+    /// ahead of the window and one thin block inside it, the body bytes read
+    /// while answering must be the bytes of the blocks actually RETURNED —
+    /// not the bytes of the blocks skipped. The returned frames are compared
+    /// against the log verbatim in the same test, so "reads less" can never
+    /// be bought by serving less.
+    #[test]
+    fn serving_a_page_does_not_read_the_bodies_it_skips() {
+        let dir = std::env::temp_dir().join(format!("bloch-pos-skip-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[9u8; 32]).expect("open");
+
+        // Slots 1..=20 carry a fat body; slot 21 is thin. A request for
+        // `after_slot = 20` returns only the thin one, so every fat body is
+        // on the skip path.
+        let mut fat_bytes = 0u64;
+        let hdr = bloch_pos_committee::header::BlockHeaderV4::ENCODED_LEN as u64;
+        for slot in 1..=20u64 {
+            let mut env = sample_envelope(slot);
+            env.proposer_sig = vec![0xCD; 8192];
+            let enc = crate::codec::encode_envelope(&env);
+            fat_bytes += enc.len() as u64 - hdr;
+            store.append(&env).expect("append");
+        }
+        let thin = sample_envelope(21);
+        let thin_enc = crate::codec::encode_envelope(&thin);
+        store.append(&thin).expect("append");
+
+        let before = sync_body_bytes_read();
+        let page = Store::blocks_after(&dir, 20, 100).expect("scan");
+        let read = sync_body_bytes_read() - before;
+
+        // It served the right thing, verbatim. Without this the byte
+        // assertion below could be satisfied by returning nothing.
+        assert_eq!(page.len(), 1, "only slot 21 is past the window");
+        assert_eq!(page[0], thin_enc, "served bytes are the logged bytes, verbatim");
+
+        let thin_body = thin_enc.len() as u64 - hdr;
+        assert_eq!(
+            read, thin_body,
+            "answering read {read} body bytes but only {thin_body} were returned — the \
+             skipped frames' bodies are being read again, which is the O(chain-length) \
+             per-request scan that starves a cold sync ({fat_bytes} bytes of fat bodies \
+             sit ahead of this window)"
+        );
+        assert!(
+            read < fat_bytes,
+            "the skip path read at least as much as the bodies it skipped"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
