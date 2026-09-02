@@ -658,7 +658,14 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         live: false,
         needs_sync: false,
         last_applied_ms: now_ms(),
-        booted_ms: now_ms(),
+        ready_ms: now_ms(),
+        // A bench fixture is not booting into a network; the catch-up gate is
+        // a boot concern and has nothing to say here.
+        caught_up: true,
+        saw_ahead_ms: 0,
+        heard_peer_ms: 0,
+        has_peers: false,
+        replayed_a_head: false,
         ws_anchor: None,
         ws_anchor_hard: false,
         ws_conflict_reported: false,

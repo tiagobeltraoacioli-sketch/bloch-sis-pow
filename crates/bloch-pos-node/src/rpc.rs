@@ -1186,6 +1186,9 @@ pub fn chain_info_json(
     validators_total: usize,
     mempool: usize,
     blocks_known: usize,
+    // Whether this node is taking its duties, or is still withholding them
+    // until it has established where the chain is. See `engine::catchup_reached`.
+    taking_duties: bool,
 ) -> Json {
     let fin = state.finality();
     let slot = state.slot();
@@ -1239,6 +1242,17 @@ pub fn chain_info_json(
         // (R1), so the node states it.
         ("wall_slot", Json::u(wall_slot)),
         ("behind_by_slots", Json::u(wall_slot.saturating_sub(slot))),
+        // The field a monitor needed on 2026-08 and did not have.
+        //
+        // `behind_by_slots` cannot answer "is this validator participating".
+        // It reads 0 for a healthy node and it reads 0 for a node that has
+        // proposed onto its own stale head — that block puts its head at the
+        // wall slot, which is exactly how v10 and v63 looked healthy while
+        // forked. This says instead whether the node considers itself to have
+        // established where the chain is. `false` here means it is deliberately
+        // signing nothing, and its log says what it is waiting for; `false` for
+        // more than a few slots after a restart is the alarm.
+        ("taking_duties", Json::Bool(taking_duties)),
     ])
 }
 

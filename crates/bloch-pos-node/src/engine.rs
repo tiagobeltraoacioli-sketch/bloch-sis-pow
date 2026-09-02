@@ -521,7 +521,47 @@ struct Engine {
     live: bool,
     needs_sync: bool,
     last_applied_ms: u64,
-    booted_ms: u64,
+    /// The instant **replay ended** and this node first became able to act on
+    /// the network — not the instant the process started.
+    ///
+    /// The distinction is the whole of the 2026-08 self-fork. The field this
+    /// replaces (`booted_ms`) was stamped at construction, forty-nine lines
+    /// above the end of the replay loop, and the two-slot grace it fed was
+    /// therefore spent in full inside a replay that takes 16–26 minutes on
+    /// mainnet. The node emerged with its grace already expired and took its
+    /// next proposing duty on the head it had just replayed to.
+    ready_ms: u64,
+    /// Has this node established, **since `ready_ms`**, that its head is the
+    /// network's head? Duties are withheld until it has.
+    ///
+    /// This is a latch, not a per-slot condition, and it has to be. "Is my head
+    /// at the wall slot" is false for every validator on a chain whose blocks
+    /// are minutes apart — Genesis-4 currently produces one about every 19
+    /// slots — so a per-slot test would gate the whole fleet off permanently
+    /// and the chain would stop. Asked once, on emerging, it is the right
+    /// question; asked every slot it is a liveness bug.
+    caught_up: bool,
+    /// Last time a peer showed this node a block **above its own head**: direct
+    /// evidence that it is not at the tip. Resets the catch-up quiet window, so
+    /// that window cannot expire while the node is still being fed history.
+    saw_ahead_ms: u64,
+    /// Last time anything at all arrived from a peer.
+    ///
+    /// Separate from `saw_ahead_ms` because it answers a different question:
+    /// whether this node is attached to a network at all. Silence right after a
+    /// restart usually means the dial and the gossipsub mesh have not finished
+    /// forming — which is exactly the state v63 proposed from — and silence
+    /// from an unattached node is not evidence of being at the tip.
+    heard_peer_ms: u64,
+    /// Whether this node was configured with any peers.
+    ///
+    /// A node with none is alone **by configuration**, not by accident: it has
+    /// nothing to catch up to and nothing to wait for, so the mesh-contact
+    /// requirement above does not apply to it. A configuration fact rather than
+    /// a timing one, so a solo devnet cannot be gated off by a slow dial.
+    has_peers: bool,
+    /// Whether boot replay found any blocks at all. See `Catchup`.
+    replayed_a_head: bool,
     /// The weak-subjectivity anchor this node booted under (epoch, root), and
     /// whether it is the node's ONLY defense (it had no finality of its own).
     /// `None` until `ws_boot::boot` has run.
@@ -578,6 +618,146 @@ impl Refusal {
     }
 }
 
+
+/// Slots of silence from a mesh this node HAS heard from, measured from the end
+/// of replay, after which it concludes nobody has anything newer for it.
+///
+/// Six, and the number comes from the loop it lives in rather than from taste.
+/// A `get_blocks` broadcast is rate-limited to one per two slots
+/// (`last_sync_req`), and replay now ends with `needs_sync` set, so the node
+/// asks at roughly slot 0, 2 and 4 after emerging and the last request still
+/// gets two slots to be answered. Any answer — an applied block, or merely the
+/// sight of a block above this node's head — resets the window, so it cannot
+/// expire while the node is still catching up; it expires only when peers have
+/// genuinely stopped offering anything.
+///
+/// At the mainnet cadence this is three minutes, against a replay of sixteen to
+/// twenty-six. It is not a meaningful addition to a restart.
+const CATCHUP_QUIET_SLOTS: u64 = 6;
+
+/// Everything the catch-up gate reads, as a value.
+///
+/// A free function of its inputs rather than a method on the engine, for the
+/// reason §5.5 gives and `lmd_ghost_head` follows: a decision that decides
+/// whether a validator signs must be checkable without standing up a node. The
+/// unit tests below are the whole point of the shape.
+#[derive(Clone, Copy, Debug)]
+struct Catchup {
+    /// This node's own head slot.
+    head_slot: u64,
+    /// The wall-clock slot.
+    wall_slot: u64,
+    now_ms: u64,
+    slot_ms: u64,
+    /// When replay ended. See `Engine::ready_ms`.
+    ready_ms: u64,
+    /// When a block above this node's head was last seen.
+    saw_ahead_ms: u64,
+    /// When a block was last applied.
+    last_applied_ms: u64,
+    /// When anything was last received from a peer.
+    heard_peer_ms: u64,
+    /// Whether any peers are configured at all.
+    has_peers: bool,
+    /// Whether replay produced a head of this node's own — i.e. the store held
+    /// blocks. A node whose store was empty has no head but genesis.
+    replayed_a_head: bool,
+}
+
+/// May this node take its duties? `None` means withhold; `Some` is the reason
+/// it may act, which the node logs.
+///
+/// Four ways out, and the ordering is the argument:
+///
+/// 1. **The head is the wall slot.** Exact: there is nothing above it to be
+///    behind. This is the only branch that is a *fact* rather than an
+///    inference, and it is why the gate opens instantly on a chain that is
+///    producing every slot.
+///
+/// 2. **An empty store inside epoch 0.** A launching network. Bounded to epoch
+///    0 so it cannot cover a joiner; see the branch itself.
+///
+/// 3. **Quiet, having heard from the mesh.** The node has asked (replay ends
+///    with `needs_sync` set), a peer has spoken to it since, and for
+///    [`CATCHUP_QUIET_SLOTS`] nothing has arrived that it did not already have.
+///    The clock is reset by an applied block AND by a block merely seen above
+///    the head, so this cannot expire mid-backfill — only when peers have run
+///    out of things to send.
+///
+/// 4. **Quiet, having heard nothing at all, for two epochs.** The fail-open
+///    floor. It exists only to stop a simultaneous fleet restart deadlocking;
+///    see [`CATCHUP_ALONE_SLOTS`] for why it is unavoidable and what it costs.
+///
+/// A node with no peers configured is exempt from the mesh-contact requirement
+/// in (3): it is alone by configuration rather than by accident, so a solo
+/// devnet is released by (3) at six slots rather than waiting out (4).
+fn catchup_reached(c: Catchup) -> Option<&'static str> {
+    // `+ 1` because a head produced for the slot in progress is current: the
+    // wall slot's own block has not been built yet by anyone.
+    if c.head_slot + 1 >= c.wall_slot {
+        return Some("the head is the wall slot");
+    }
+    // A launching network. An empty store means this node has no head but
+    // genesis, so it has nothing of its own that can be stale — and inside
+    // epoch 0 every node on a network that is starting is in exactly this
+    // state, all of them silent because none has produced anything yet. Without
+    // this the launch deadlocks: every node withholds, so nothing is broadcast,
+    // so no node ever observes contact, and the chain does not begin until the
+    // two-epoch floor expires. MEASURED: the first build of this gate stalled a
+    // fresh four-validator devnet at slot 0 for exactly that reason.
+    //
+    // Bounded by epoch 0 deliberately. Past it, an empty store means a JOINER,
+    // not a launcher, and a joiner proposing on genesis is the thirteen-block
+    // reorg `tests/warm_join.rs` documents — a real failure with a real cost,
+    // and one this predicate should not wave through just because it shares a
+    // shape with a launch. Epoch 0 is the right boundary and not an arbitrary
+    // one: no attestation exists inside it (`attest` returns early for e == 0),
+    // so nothing can have justified yet and there is no chain state a fresh
+    // node could be behind.
+    if !c.replayed_a_head && c.wall_slot < bloch_pos_committee::SLOTS_PER_EPOCH {
+        return Some("no stored head and the network is inside epoch 0");
+    }
+    let quiet_for = c
+        .now_ms
+        .saturating_sub(c.ready_ms.max(c.saw_ahead_ms).max(c.last_applied_ms));
+    let heard_from_mesh = !c.has_peers || c.heard_peer_ms > c.ready_ms;
+    if heard_from_mesh && quiet_for >= CATCHUP_QUIET_SLOTS * c.slot_ms {
+        return Some("no peer has offered anything newer");
+    }
+    if quiet_for >= CATCHUP_ALONE_SLOTS * c.slot_ms {
+        return Some("NOTHING has been heard from the configured peers for two epochs");
+    }
+    None
+}
+
+
+/// Slots of silence from a mesh this node has heard NOTHING from, after which
+/// it acts anyway.
+///
+/// This exists for exactly one reason and it is not a good one: without it, a
+/// fleet that restarts together and comes back on identical heads never speaks.
+/// Every node is gated, so no node proposes and no node attests; there is
+/// therefore no traffic; so no node ever observes contact with the mesh, so no
+/// node is ever released. The chain would be dead, permanently, with every node
+/// healthy and connected. A `get_blocks` exchange does not break the tie either
+/// — peers on the same head answer it with nothing, and nothing is not an
+/// event.
+///
+/// So the gate needs a floor, and this is it: two epochs. Two, because one is
+/// the unit in which this protocol does everything — a committee rotation, a
+/// justification — and a node that has heard nothing for two of them has missed
+/// the window in which finality itself would have moved. It is not a guess at
+/// how long syncing takes (nothing here is); it is the point past which
+/// "silent" stops being distinguishable from "not there".
+///
+/// This is the fix's one remaining fail-open path, and it is stated rather than
+/// hidden: a validator whose peers are configured but unreachable — a one-way
+/// partition, a firewall, a mesh that never forms — will after two epochs
+/// propose on a head it has no way to know is stale. That is strictly better
+/// than the two slots from process start it replaces, and the honest way to
+/// close it is a transport-level "how many peers am I connected to", which this
+/// change does not add.
+const CATCHUP_ALONE_SLOTS: u64 = 2 * bloch_pos_committee::SLOTS_PER_EPOCH;
 
 impl Engine {
     // ── Derivations over the canonical chain ────────────────────────────────
@@ -952,9 +1132,14 @@ impl Engine {
         self.pool
             .insert((att.validator, att.data.signing_root()), att.clone());
         self.net.broadcast(net::att_frame(&att));
+        // The head's SLOT, for the same reason the proposal line carries its
+        // parent's: an attestation on a stale head is indistinguishable from an
+        // honest one by any other field in this line, and the head root alone
+        // tells an operator nothing about how old it is.
         println!(
-            "[slot {slot}] attested (epoch {e}, head {}, target {})",
+            "[slot {slot}] attested (epoch {e}, head {} at slot {}, target {})",
             crate::codec::hex8(&data.head),
+            self.head_slot_now(),
             crate::codec::hex8(&data.target_root)
         );
     }
@@ -1092,9 +1277,18 @@ impl Engine {
             },
         };
         let id = env.block_id();
+        // The parent's slot is in this line because its ABSENCE is what made
+        // the 2026-08 self-fork unreadable from a log. A proposer building on
+        // a stale head prints a perfectly ordinary "proposing block" — the
+        // only thing that distinguishes it from a healthy proposal is how far
+        // below the slot its parent sits, and that number was nowhere. It is
+        // also the number `getchaininfo` cannot give you after the fact:
+        // `behind_by_slots` reads 0 the instant this block lands, because the
+        // node's own head is now at the wall slot.
         println!(
-            "[slot {slot}] proposing block {} ({} attestations, {} txs, mempool {})",
+            "[slot {slot}] proposing block {} on parent slot {} ({} attestations, {} txs, mempool {})",
             crate::codec::hex8(id.as_bytes()),
+            self.head_slot_now(),
             env.body.attestations.len(),
             env.body.transactions.len(),
             self.mempool.len()
@@ -1172,6 +1366,14 @@ impl Engine {
         }
         if env.header.slot == 0 {
             return; // genesis is synthesized, never received
+        }
+        if env.header.slot > self.head_slot_now() {
+            // Somebody holds a block this node does not, above its own head.
+            // Recorded whether or not the block turns out to be adoptable:
+            // an orphan whose parent is missing is still proof that this node
+            // is not at the tip, and it is the ONLY proof available while the
+            // lineage in between is still being fetched.
+            self.saw_ahead_ms = now_ms();
         }
         self.blocks.insert(id, env);
         self.advance();
@@ -1978,6 +2180,7 @@ impl Engine {
                 self.state.validator_count(),
                 self.mempool.len(),
                 self.blocks.len(),
+                self.caught_up,
             )),
 
             RpcRequest::BlockCount => {
@@ -2298,7 +2501,15 @@ pub fn run(cfg: Config) -> io::Result<()> {
         live: false,
         needs_sync: false,
         last_applied_ms: now_ms(),
-        booted_ms: now_ms(),
+        // Provisional: overwritten the instant replay ends, which is the only
+        // value that means anything. See the field's doc.
+        ready_ms: now_ms(),
+        caught_up: false,
+        saw_ahead_ms: 0,
+        heard_peer_ms: 0,
+        has_peers: !cfg.peers.is_empty() || !cfg.p2p_peers.is_empty(),
+        // Set from the store once replay has run.
+        replayed_a_head: false,
         ws_anchor: None,
         ws_anchor_hard: false,
         ws_conflict_reported: false,
@@ -2348,6 +2559,16 @@ pub fn run(cfg: Config) -> io::Result<()> {
         }
     }
     engine.live = true;
+    // THE grace clock. Everything the node is allowed to do on the network is
+    // measured from here, because here is where it became able to do anything.
+    engine.ready_ms = now_ms();
+    engine.replayed_a_head = n_logged > 0;
+    // And ask, immediately, rather than waiting for the loop's `behind` test to
+    // notice. That test compares against `last_applied_ms`, which the final
+    // block of replay has just refreshed — so a node emerging from replay was
+    // permitted to PROPOSE at once while being barred from ASKING for two more
+    // slots. Exactly the wrong way round.
+    engine.needs_sync = true;
     if n_logged > 0 {
         println!(
             "replayed {} blocks: head slot {}, state root {}, justified e{}, finalized e{}",
@@ -2479,6 +2700,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let slot_ms = engine.manifest.slot_ms;
     let mut last_attested: u64 = engine.state.slot();
     let mut last_built: u64 = engine.state.slot();
+    // The last slot a withheld-duty line was printed for.
+    let mut last_withheld: u64 = 0;
     let mut last_sync_req: u64 = 0;
 
     loop {
@@ -2515,18 +2738,132 @@ pub fn run(cfg: Config) -> io::Result<()> {
             }
         }
 
-        // Boot grace: give the mesh one round of sync before performing
-        // duties, so a restarted proposer does not build on a stale head.
-        let in_grace = now.saturating_sub(engine.booted_ms) < 2 * slot_ms;
-
-        if !in_grace && slot > last_attested {
-            engine.attest(slot);
-            last_attested = slot;
+        // ── The catch-up gate ──
+        //
+        // This replaces a wall-clock boot grace that could not work. The old
+        // one was `now - booted_ms < 2 * slot_ms` with `booted_ms` stamped at
+        // construction: two slots, measured from before a replay that takes
+        // sixteen to twenty-six minutes on mainnet, so it had always expired by
+        // the time the node could act and the first thing the node did on
+        // emerging was propose on the head it had replayed to. That cost v10
+        // and v63, and v63 resisted three repairs because each one handed it a
+        // good store and restarted the same binary into the same five lines.
+        //
+        // What replaces it is not a longer clock. A clock cannot answer this
+        // question at all — it guesses at how long syncing takes, and the guess
+        // is wrong on any chain whose replay time is not a constant. The
+        // question the node can actually answer is "have I reached the head",
+        // and it is asked ONCE, on emerging, and latched:
+        //
+        //   * `head_is_current` — the node's own head is at the wall clock, so
+        //     there is nothing above it to be behind. Exact, and the fast path.
+        //     It is not sufficient on its own: Genesis-4 currently produces a
+        //     block about every 19 slots, so a perfectly healthy node's head
+        //     trails the wall clock nearly always.
+        //
+        //   * otherwise, silence: the mesh has been asked (replay ends with
+        //     `needs_sync` set) and for `CATCHUP_QUIET_SLOTS` has offered
+        //     nothing this node does not already have. Any block applied, and
+        //     any block merely SEEN above this node's head, restarts that
+        //     window — so it cannot expire mid-backfill, only when the peers
+        //     have genuinely run out of things to send.
+        //
+        //     Guarded by having heard from a peer at all since replay ended.
+        //     Silence from a node whose dial has not completed is not evidence
+        //     of being at the tip, and that is precisely the state a validator
+        //     is in for the first seconds after a restart. A node configured
+        //     with NO peers is exempt, because it is alone by configuration and
+        //     has nothing to wait for — otherwise a solo devnet could never
+        //     produce another block after a restart.
+        //
+        // The error direction is deliberate and is the reason for every "and"
+        // above. Failing to propose costs one slot and the next proposer fills
+        // it. Proposing early cost two validators and thirteen blocks off two
+        // founders' chains.
+        //
+        // ── Why ATTESTING is gated too, which is not symmetry ──
+        //
+        // Attesting on a stale head is LESS harmful than proposing on one, and
+        // the difference is worth stating rather than eliding: an attestation
+        // creates no block, so it cannot become this node's own head, cannot
+        // wedge it, and cannot orphan anyone's work. It carries no slashing
+        // exposure here either — `epoch_committees` partitions the active set
+        // across an epoch's 32 slots, so a validator attests at most ONCE per
+        // epoch and cannot equivocate with itself; and a stale view's source
+        // epoch is lower, not higher, so it cannot surround its own later vote.
+        //
+        // It is gated anyway, for a reason that is about attestations and not
+        // about proposals. `AttestationData::head` is a fork-choice vote:
+        // `forkchoice_store` feeds it to `FcStore::observe`, which keeps the
+        // highest-slot message per validator — so a vote cast on a stale head
+        // puts that validator's whole stake behind the wrong branch and LEAVES
+        // it there until the validator's next duty, a full epoch later. That is
+        // a vote for a branch the voter has explicitly not established, held
+        // for an epoch, cast by every restarting validator at once; and this
+        // fleet is restarted in coordinated waves, so the error correlates
+        // exactly where correlation is most expensive.
+        //
+        // The cost of withholding it is real and smaller. Either the stale
+        // view's checkpoint matches the network's — in which case the vote
+        // would have been valid, and the node casts an equivalent one an epoch
+        // later — or it does not, in which case the vote is for a target root
+        // nobody else recognises and contributes nothing to quorum at all. So
+        // the trade is: a bounded, occasional loss of one validator's finality
+        // vote, against an epoch of misdirected fork-choice weight from every
+        // validator that restarts. Unlike the proposing case, this IS a trade;
+        // it is just a good one.
+        if !engine.caught_up {
+            // One clock, two thresholds. The clock is reset by any evidence
+            // that the network is ahead of this node — a block applied, or a
+            // block merely SEEN above its head — so neither threshold can
+            // expire while the node is still being fed. The shorter one
+            // additionally requires that the node has heard from the mesh at
+            // all since replay ended; the longer one is the floor that keeps a
+            // simultaneous fleet restart from deadlocking (see the constants).
+            let why = catchup_reached(Catchup {
+                head_slot: engine.state.slot(),
+                wall_slot: slot,
+                now_ms: now,
+                slot_ms,
+                ready_ms: engine.ready_ms,
+                saw_ahead_ms: engine.saw_ahead_ms,
+                last_applied_ms: engine.last_applied_ms,
+                heard_peer_ms: engine.heard_peer_ms,
+                has_peers: engine.has_peers,
+                replayed_a_head: engine.replayed_a_head,
+            });
+            if let Some(why) = why {
+                engine.caught_up = true;
+                println!(
+                    "caught up at slot {slot}: head slot {} — {why}. Taking duties.",
+                    engine.state.slot(),
+                );
+            }
         }
+
         let propose_at = slot_start + slot_ms / 3;
-        if !in_grace && now >= propose_at && slot > last_built {
-            engine.propose(slot);
-            last_built = slot;
+        if engine.caught_up {
+            if slot > last_attested {
+                engine.attest(slot);
+                last_attested = slot;
+            }
+            if now >= propose_at && slot > last_built {
+                engine.propose(slot);
+                last_built = slot;
+            }
+        } else if slot > last_withheld {
+            // One line per slot, not per iteration. An operator watching a
+            // validator that has gone quiet after a restart needs to see that
+            // it is deliberate and what it is waiting for — the alternative is
+            // a node that silently does nothing, which is how this class of
+            // failure stays invisible.
+            last_withheld = slot;
+            println!(
+                "[slot {slot}] withholding duties: head slot {} is {} slots below the wall \
+                 clock and nothing has confirmed this is the tip",
+                engine.state.slot(),
+                slot.saturating_sub(engine.state.slot()),
+            );
         }
 
         // Sync when behind or when a stored branch has holes. Rate-limited;
@@ -2560,6 +2897,12 @@ pub fn run(cfg: Config) -> io::Result<()> {
                     // not done yet".
                     if matches!(ev, EngineEvent::Net(_)) {
                         inflight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                        // Proof of contact with the mesh, which the catch-up
+                        // gate needs and which no other signal supplies: the
+                        // transport tracks connections, but a connection that
+                        // has said nothing is not a peer that has told this
+                        // node where the chain is.
+                        engine.heard_peer_ms = now_ms();
                     }
                     match ev {
                         EngineEvent::Net(NetEvent::Block(env)) => engine.ingest(env),
@@ -3844,7 +4187,14 @@ mod transfer_v2_end_to_end {
             live: true,
             needs_sync: false,
             last_applied_ms: now_ms(),
-            booted_ms: now_ms(),
+            ready_ms: now_ms(),
+            // Fixtures model a node already on the network: the gate is a boot
+            // concern and nothing here is booting.
+            caught_up: true,
+            saw_ahead_ms: 0,
+            heard_peer_ms: 0,
+            has_peers: false,
+            replayed_a_head: false,
             ws_anchor: None,
             ws_anchor_hard: false,
             ws_conflict_reported: false,
@@ -4136,7 +4486,14 @@ mod perf_support {
             live: true,
             needs_sync: false,
             last_applied_ms: now_ms(),
-            booted_ms: now_ms(),
+            ready_ms: now_ms(),
+            // Fixtures model a node already on the network: the gate is a boot
+            // concern and nothing here is booting.
+            caught_up: true,
+            saw_ahead_ms: 0,
+            heard_peer_ms: 0,
+            has_peers: false,
+            replayed_a_head: false,
             ws_anchor: None,
             ws_anchor_hard: false,
             ws_conflict_reported: false,
@@ -4434,14 +4791,14 @@ mod bench {
         let before = |st: &CommittedState| -> u128 {
             let t = Instant::now();
             let root = st.state_root();
-            let v = crate::rpc::chain_info_json(st, &head, root, 0, Some(0), 0, 1, 0, 1);
+            let v = crate::rpc::chain_info_json(st, &head, root, 0, Some(0), 0, 1, 0, 1, true);
             let us = t.elapsed().as_micros();
             std::hint::black_box(v);
             us
         };
         let after = |st: &CommittedState| -> u128 {
             let t = Instant::now();
-            let v = crate::rpc::chain_info_json(st, &head, header_root, 0, Some(0), 0, 1, 0, 1);
+            let v = crate::rpc::chain_info_json(st, &head, header_root, 0, Some(0), 0, 1, 0, 1, true);
             let us = t.elapsed().as_micros();
             std::hint::black_box(v);
             us
@@ -4481,10 +4838,10 @@ mod bench {
         // Byte-identical, which is what makes this transport-only. Asserted
         // rather than printed: a bench that quietly changed the answer would
         // be measuring the wrong thing to begin with.
-        let a = crate::rpc::chain_info_json(&st, &head, header_root, 0, Some(0), 0, 1, 0, 1);
+        let a = crate::rpc::chain_info_json(&st, &head, header_root, 0, Some(0), 0, 1, 0, 1, true);
         let b = {
             let root = st.state_root();
-            crate::rpc::chain_info_json(&st, &head, root, 0, Some(0), 0, 1, 0, 1)
+            crate::rpc::chain_info_json(&st, &head, root, 0, Some(0), 0, 1, 0, 1, true)
         };
         assert_eq!(
             a.to_string(),
@@ -5421,7 +5778,14 @@ mod duty_view_anchor {
             live: true,
             needs_sync: false,
             last_applied_ms: now_ms(),
-            booted_ms: now_ms(),
+            ready_ms: now_ms(),
+            // Fixtures model a node already on the network: the gate is a boot
+            // concern and nothing here is booting.
+            caught_up: true,
+            saw_ahead_ms: 0,
+            heard_peer_ms: 0,
+            has_peers: false,
+            replayed_a_head: false,
             ws_anchor: None,
             ws_anchor_hard: false,
             ws_conflict_reported: false,
@@ -5495,5 +5859,183 @@ mod duty_view_anchor {
             partition_caught_up.len()
         );
         assert!(moved > 0);
+    }
+}
+
+#[cfg(test)]
+mod catchup_gate_tests {
+    use super::*;
+
+    // ── The catch-up gate ───────────────────────────────────────────────────
+    //
+    // `catchup_reached` decides whether a validator signs. The cases below are
+    // its specification: each one is a state a real node reaches, and the
+    // withhold/release verdict is asserted rather than argued. They cost
+    // microseconds, which matters — the integration reproduction in
+    // `tests/propose_after_replay.rs` costs twelve minutes and four real nodes.
+
+    /// A convenient slot length for these cases. The gate is scale-free — every
+    /// threshold is in slots — so the unit is arbitrary and stated once.
+    const GATE_SLOT_MS: u64 = 1_000;
+    /// An arbitrary "now" the cases move forward from.
+    const GATE_T0: u64 = 1_000_000;
+
+    /// A validator one millisecond out of a replay that left it forty slots
+    /// behind: peers configured, nothing heard from any of them, nothing
+    /// applied since replay's last block. This is v63 at the instant it forked.
+    fn emerging_from_replay() -> Catchup {
+        Catchup {
+            head_slot: 100,
+            wall_slot: 140,
+            now_ms: GATE_T0,
+            slot_ms: GATE_SLOT_MS,
+            ready_ms: GATE_T0,
+            saw_ahead_ms: 0,
+            last_applied_ms: GATE_T0,
+            heard_peer_ms: 0,
+            has_peers: true,
+            replayed_a_head: true,
+        }
+    }
+
+    #[test]
+    fn a_validator_emerging_from_replay_withholds_its_duties() {
+        assert_eq!(catchup_reached(emerging_from_replay()), None);
+    }
+
+    #[test]
+    fn the_two_slot_grace_this_replaces_would_have_released_it() {
+        // The defect, stated as a case. Two slots is everything the old
+        // `booted_ms` grace ever allowed, and on mainnet all of it was spent
+        // inside a sixteen-to-twenty-six-minute replay — so this is the state
+        // the old code took its next duty in. Nothing about the node has
+        // changed: still forty slots behind, still spoken to by nobody.
+        let mut c = emerging_from_replay();
+        c.now_ms = GATE_T0 + 2 * GATE_SLOT_MS + 1;
+        assert_eq!(catchup_reached(c), None);
+        // Nor at six slots. Without contact the quiet window does not apply at
+        // all; silence from a node that has not finished dialling is not
+        // evidence of being at the tip.
+        c.now_ms = GATE_T0 + CATCHUP_QUIET_SLOTS * GATE_SLOT_MS + 1;
+        assert_eq!(catchup_reached(c), None);
+    }
+
+    #[test]
+    fn contact_plus_quiet_releases_it_at_the_boundary_and_not_before() {
+        let mut c = emerging_from_replay();
+        c.heard_peer_ms = GATE_T0 + 1;
+        c.now_ms = GATE_T0 + CATCHUP_QUIET_SLOTS * GATE_SLOT_MS;
+        assert!(catchup_reached(c).is_some());
+        c.now_ms -= 1;
+        assert_eq!(catchup_reached(c), None);
+    }
+
+    #[test]
+    fn the_quiet_window_cannot_expire_while_blocks_are_still_arriving() {
+        // Backfill, for far longer than the quiet window: the node hears from
+        // the mesh and applies a block every two slots. It must stay gated
+        // throughout — a node in the middle of catching up is the one case
+        // where releasing on "quiet" would be most wrong, and a naive timer
+        // started at the end of replay would do exactly that.
+        let mut c = emerging_from_replay();
+        c.heard_peer_ms = GATE_T0 + 1;
+        for k in 1..=20u64 {
+            c.last_applied_ms = GATE_T0 + k * 2 * GATE_SLOT_MS;
+            c.now_ms = c.last_applied_ms + GATE_SLOT_MS;
+            assert_eq!(catchup_reached(c), None, "released mid-backfill at step {k}");
+        }
+    }
+
+    #[test]
+    fn a_block_seen_above_the_head_counts_even_when_it_cannot_be_applied() {
+        // An orphan whose parent is missing applies nothing, so
+        // `last_applied_ms` does not move. It is still proof that this node is
+        // not at the tip — and while the lineage in between is being fetched it
+        // is the ONLY proof available.
+        let mut c = emerging_from_replay();
+        c.heard_peer_ms = GATE_T0 + 1;
+        c.now_ms = GATE_T0 + CATCHUP_QUIET_SLOTS * GATE_SLOT_MS;
+        assert!(catchup_reached(c).is_some(), "fixture: this must otherwise release");
+        c.saw_ahead_ms = c.now_ms - GATE_SLOT_MS;
+        assert_eq!(catchup_reached(c), None);
+    }
+
+    #[test]
+    fn a_head_at_the_wall_slot_is_released_at_once() {
+        let mut c = emerging_from_replay();
+        // One below: the wall slot's own block has not been built by anyone
+        // yet, so this head IS current.
+        c.head_slot = c.wall_slot - 1;
+        assert!(catchup_reached(c).is_some());
+        c.head_slot = c.wall_slot;
+        assert!(catchup_reached(c).is_some());
+    }
+
+    #[test]
+    fn a_chain_whose_blocks_are_slots_apart_is_not_gated_off() {
+        // Why this is a latch asked once and not a condition tested every slot.
+        // Genesis-4 currently produces a block about every nineteen slots, so a
+        // perfectly healthy validator's head is nineteen slots below the wall
+        // clock nearly always. A per-slot "is my head the wall slot" test would
+        // withhold every duty from every validator on the live chain and stop
+        // it — trading the fork this change prevents for a halt.
+        let mut c = emerging_from_replay();
+        c.head_slot = c.wall_slot - 19;
+        assert_eq!(catchup_reached(c), None, "fixture: not released before contact");
+        c.heard_peer_ms = GATE_T0 + 1;
+        c.now_ms = GATE_T0 + CATCHUP_QUIET_SLOTS * GATE_SLOT_MS;
+        assert!(catchup_reached(c).is_some());
+    }
+
+    #[test]
+    fn a_node_with_no_peers_configured_is_alone_by_configuration() {
+        // It has nothing to catch up to and nobody to wait for, so the
+        // mesh-contact requirement does not apply and a solo devnet resumes
+        // after the quiet window rather than after the two-epoch floor.
+        let mut c = emerging_from_replay();
+        c.has_peers = false;
+        c.now_ms = GATE_T0 + CATCHUP_QUIET_SLOTS * GATE_SLOT_MS;
+        assert!(catchup_reached(c).is_some());
+    }
+
+    #[test]
+    fn a_launching_network_is_not_gated_off_at_slot_zero() {
+        // MEASURED regression. The first build of this gate had no launch case,
+        // and a fresh four-validator devnet printed "withholding duties: head
+        // slot 0 is 2 slots below the wall clock" on every node at once: all
+        // four gated, none producing, so none broadcasting, so none observing
+        // contact. The chain could not start until the two-epoch floor expired.
+        let mut c = emerging_from_replay();
+        c.replayed_a_head = false;
+        c.head_slot = 0;
+        c.wall_slot = 3;
+        assert!(catchup_reached(c).is_some());
+    }
+
+    #[test]
+    fn an_empty_store_past_epoch_zero_is_a_joiner_and_stays_gated() {
+        // The other half, and the reason the launch case is bounded rather than
+        // a blanket exemption for an empty store: past epoch 0 a node with no
+        // blocks is arriving at a chain that already exists, and building on
+        // genesis is the thirteen-block reorg `tests/warm_join.rs` documents.
+        let mut c = emerging_from_replay();
+        c.replayed_a_head = false;
+        c.head_slot = 0;
+        c.wall_slot = bloch_pos_committee::SLOTS_PER_EPOCH;
+        assert_eq!(catchup_reached(c), None);
+    }
+
+    #[test]
+    fn a_node_that_hears_nothing_waits_two_epochs_and_not_six_slots() {
+        // The fail-open floor, pinned at its documented value so it cannot be
+        // shortened by accident. It exists only to stop a simultaneous fleet
+        // restart deadlocking; it is the one path by which this gate can still
+        // release a node onto a stale head, and CATCHUP_ALONE_SLOTS says so.
+        let mut c = emerging_from_replay();
+        c.now_ms = GATE_T0 + CATCHUP_ALONE_SLOTS * GATE_SLOT_MS - 1;
+        assert_eq!(catchup_reached(c), None);
+        c.now_ms += 1;
+        assert!(catchup_reached(c).is_some());
+        assert_eq!(CATCHUP_ALONE_SLOTS, 2 * bloch_pos_committee::SLOTS_PER_EPOCH);
     }
 }
