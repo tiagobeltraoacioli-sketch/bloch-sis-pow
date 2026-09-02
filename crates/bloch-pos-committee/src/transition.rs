@@ -725,22 +725,30 @@ impl PosTransaction {
     /// `tests::canonical_bytes_round_trips` pins it against the encoder rather
     /// than against a hand-written expectation.
     ///
-    /// # Why `SlashingEvidence` is not decodable, and is not an oversight
+    /// # `SlashingEvidence` used to be undecodable, and why it no longer is
     ///
-    /// The evidence arm deliberately folds its nested messages in through the
-    /// roots they were *signed over* plus their signatures — it never
-    /// re-serialises the header or the attestation. A signing root is a hash;
-    /// nothing recovers the envelope from it. So evidence encoded this way is
-    /// one-way by construction, and this returns
-    /// [`TxDecodeError::EvidenceNotDecodable`] for tag `0x05` instead of
-    /// pretending otherwise.
+    /// The evidence arm once folded its nested messages in through the roots
+    /// they were *signed over* — never re-serialising the header or the
+    /// attestation. A signing root is a hash, and nothing recovers the
+    /// envelope from it, so evidence was one-way BY CONSTRUCTION and this
+    /// function returned [`TxDecodeError::EvidenceNotDecodable`] rather than
+    /// pretend otherwise. The consequence bounded the whole pipeline:
+    /// evidence could not reach a verifier through `body.transactions`,
+    /// because the verifier would have had only hashes to re-verify against,
+    /// so the §7.3 path was unreachable from the network however complete
+    /// `slashing.rs` was.
     ///
-    /// The consequence is worth stating plainly, because it bounds what the
-    /// slashing pipeline can be built on: evidence cannot reach a verifier
-    /// through `body.transactions`, since the verifier would have only hashes
-    /// to re-verify against. Evidence needs its own wire shape carrying the
-    /// two envelopes whole. Until that exists, the §7.3 path is unreachable
-    /// from the network however complete `slashing.rs` is.
+    /// The fix was to the ENCODER, not to this function: both nested messages
+    /// now ride whole (canonical header, or the six fixed-width attestation
+    /// fields, each followed by its length-prefixed signature), so every node
+    /// re-verifies both signatures itself and never trusts the reporter. Tag
+    /// `0x05` therefore decodes, over the sub-namespace the wire-tag registry
+    /// froze — `0x01` proposer equivocation, `0x02` attestation offence.
+    ///
+    /// [`TxDecodeError::EvidenceNotDecodable`] is kept in the enum, no longer
+    /// constructed here, so the frozen registry guard that asserts it still
+    /// compiles and fails with its OWN diagnostic instead of a type error.
+    /// Whether the tag stays `0x05` is recorded there, not decided here.
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, TxDecodeError> {
         let mut r = TxReader { b: bytes, i: 0 };
         let tag = r.u8()?;
@@ -3751,15 +3759,20 @@ mod tx_codec_tests {
     }
 
     #[test]
-    fn evidence_is_one_way_and_says_so() {
-        // Not a limitation to route around: the encoder folds nested messages
-        // in as signing roots, and a hash does not invert.
+    fn evidence_is_no_longer_one_way() {
+        // This test used to assert the opposite, and the assertion was true:
+        // the encoder folded the nested messages in as signing roots, and a
+        // hash does not invert. The ENCODER was the bug. What must never
+        // return is a payload shaped like the old one silently decoding: the
+        // old bytes (root + signature, no envelope) are far too short for the
+        // real shape and must die as `Truncated`, not as evidence.
         let mut b = vec![0x05, 0x01];
         b.extend_from_slice(&[0u8; 32]);
         b.extend_from_slice(&0u32.to_le_bytes());
         assert_eq!(
             PosTransaction::from_canonical_bytes(&b),
-            Err(TxDecodeError::EvidenceNotDecodable)
+            Err(TxDecodeError::Truncated),
+            "old root-shaped evidence bytes must not decode"
         );
     }
 
