@@ -3982,6 +3982,41 @@ mod admission_authorisation {
     }
 
     #[test]
+    fn tka_evidence_is_refused_by_admission_while_the_flag_day_is_unarmed() {
+        // The mempool gate is what keeps evidence OFF THE WIRE before the
+        // flag day, and that matters for a reason beyond tidiness: a
+        // pre-upgrade peer cannot decode tag 0x05 and answers
+        // `Verdict::Reject`, so evidence gossiped into a mixed mesh scores
+        // down the honest nodes that relayed it.
+        let data = |head: u8| AttestationData {
+            slot: 32,
+            head: [head; 32],
+            source_epoch: 0,
+            source_root: [1; 32],
+            target_epoch: 1,
+            target_root: [head; 32],
+        };
+        let raw = SlashingEvidence::AttestationOffence {
+            first: Attestation { data: data(0xAA), validator: 3, signature: vec![7u8; 8] },
+            second: Attestation { data: data(0xBB), validator: 3, signature: vec![9u8; 8] },
+        };
+        // Structurally a real offence, so this is the FLAG DAY refusing it,
+        // not the structural check.
+        assert!(slashing::wire_offence(&raw).is_ok(), "test premise: a real offence");
+        let ev = PosTransaction::SlashingEvidence(raw);
+        let err = admissible(&ev, 0).expect_err("unarmed flag day must refuse evidence");
+        assert!(err.contains("flag day"), "the refusal must name the flag day, got: {err}");
+
+        // And a pair that is NOT an offence is refused on structure, by the
+        // very function the transition runs as its step 1.
+        let innocent = SlashingEvidence::AttestationOffence {
+            first: Attestation { data: data(0xAA), validator: 3, signature: vec![7u8; 8] },
+            second: Attestation { data: data(0xAA), validator: 4, signature: vec![9u8; 8] },
+        };
+        assert!(slashing::wire_offence(&innocent).is_err(), "test premise: not an offence");
+    }
+
+    #[test]
     fn a_correctly_signed_transfer_is_still_admitted() {
         // THE REGRESSION THAT WOULD MATTER MOST. A signature check that refuses
         // everything stops the chain accepting any transfer at all — worse than
