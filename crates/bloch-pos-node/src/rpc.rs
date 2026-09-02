@@ -1202,21 +1202,44 @@ pub fn chain_info_json(
 
 /// How a block stands relative to this node's own checkpoints.
 ///
-/// # This is the field an exchange credits a deposit on
+/// # ~~This is the field an exchange credits a deposit on~~
+///
+/// **Heading struck 2026-09-02.** This is the field an exchange *reads*. It is
+/// **not**, on its own, the field an exchange credits on — see the correction
+/// below.
 ///
 /// The integration question was "how many confirmations should we require, and
 /// what does the guarantee rest on". Under PoS there is no answer in that
 /// currency: depth is not security (R1), and a chain with no difficulty cannot
-/// price a reorg in work. The guarantee rests on **Casper justification and
-/// finalisation** — a finalised checkpoint cannot be reverted unless at least
-/// one third of the total stake is slashed, which is a bonded, attributable,
-/// on-chain cost rather than a probabilistic one.
+/// price a reorg in work.
 ///
-/// So the honest replacement for "N confirmations" is exactly one boolean:
-/// [`Finality::Finalized`]. A deposit in a finalised block is settled under the
-/// protocol's strongest guarantee; a deposit in a merely justified or canonical
-/// block can still be reorganised out. Nothing is gained by waiting a further
-/// number of blocks past finalisation, and nothing else substitutes for it.
+/// > ~~The guarantee rests on **Casper justification and finalisation** — a
+/// > finalised checkpoint cannot be reverted unless at least one third of the
+/// > total stake is slashed, which is a bonded, attributable, on-chain cost
+/// > rather than a probabilistic one.~~
+/// >
+/// > ~~So the honest replacement for "N confirmations" is exactly one boolean:
+/// > [`Finality::Finalized`]. A deposit in a finalised block is settled under
+/// > the protocol's strongest guarantee. Nothing is gained by waiting a further
+/// > number of blocks past finalisation, and nothing else substitutes for it.~~
+/// >
+/// > **Correction, 2026-09-02 — struck, not deleted.** The text above is false
+/// > of the released node (`g4-node-20260901` = `7a83ca89`) and must not be
+/// > quoted to an integrator. **No stake can be slashed on Genesis-4 today.**
+/// > Slashing evidence (wire tag `0x05`) is undecodable on every ingress path,
+/// > so the penalty can never be applied —
+/// > `crates/bloch-pos-committee/src/transition.rs:714-730`, decode refusal at
+/// > `:782`. A cost that cannot be imposed does not bound anything, so
+/// > `finalized` **is not a settlement guarantee and must not be credited on**.
+/// >
+/// > **What to do instead, until this note is withdrawn:** credit at
+/// > **`finalized` + 3 epochs** (~48 minutes past finality); require **two
+/// > independently operated nodes** to agree on the same finalized **root AND
+/// > epoch** — not the epoch alone; compare `finalized`, never `block_id` or
+/// > height, since honest nodes routinely sit one slot apart; and **re-verify
+/// > immediately before releasing funds**. The margin of 3 bounds the
+/// > single-cut case only — **no depth is provably safe today**. **Two nodes
+/// > agreeing does not mitigate a rewind:** both can rewind independently.
 ///
 /// One caveat, stated because it bounds the guarantee: this is **this node's**
 /// view, computed from the chain it has validated itself. That is the property
@@ -1226,8 +1249,15 @@ pub fn chain_info_json(
 /// staleness, which `getchaininfo`'s `behind_by_slots` is there to expose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Finality {
-    /// At or below the finalised checkpoint. Irreversible short of a
-    /// one-third-of-stake slashing event. **Credit here.**
+    /// At or below the finalised checkpoint.
+    ///
+    /// ~~Irreversible short of a one-third-of-stake slashing event. **Credit
+    /// here.**~~ **Struck 2026-09-02:** no stake can be slashed on Genesis-4
+    /// today, so this state is **not** a settlement guarantee. Do not credit on
+    /// `finalized` alone — credit at `finalized` + 3 epochs, confirmed by two
+    /// independently operated nodes on the same finalized root **and** epoch,
+    /// re-verified immediately before release. See the correction on
+    /// [`Finality`] itself.
     Finalized,
     /// At or below the justified checkpoint but above the finalised one. One
     /// epoch away from finality in the normal case; still reversible.

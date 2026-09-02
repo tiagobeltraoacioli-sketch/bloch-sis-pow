@@ -522,21 +522,44 @@ provider is active on this node.
 
 ### 5.1 The rule, in one line
 
-**Credit a deposit when the block carrying it is finalized. Do not wait a
-further number of blocks, and do not substitute anything else.**
+~~**Credit a deposit when the block carrying it is finalized. Do not wait a
+further number of blocks, and do not substitute anything else.**~~
+
+> **Correction, 2026-09-02 — struck, not deleted. This is the rule that governs
+> §5.** `finalized` alone **is not a settlement guarantee and must not be
+> credited on**. The released node (`g4-node-20260901` = `7a83ca89`) **cannot
+> slash any stake**: slashing evidence (wire tag `0x05`) is undecodable on every
+> ingress path, so the penalty can never be applied
+> (`crates/bloch-pos-committee/src/transition.rs:714-730`, decode refusal at
+> `:782`). Every claim in §5 that rests on a one-third-of-stake slashing cost is
+> struck for that reason.
+>
+> **The rule, until this note is withdrawn:** credit at **`finalized` + 3
+> epochs** (~48 minutes past finality); require **two independently operated
+> nodes** to agree on the same finalized **root AND epoch** — not the epoch
+> alone; compare `finalized`, never `block_id` or height, since honest nodes
+> routinely sit one slot apart; and **re-verify immediately before releasing
+> funds**. The margin of 3 bounds the single-cut case only — **no depth is
+> provably safe today**. **Two nodes agreeing does not mitigate a rewind:** both
+> can rewind independently.
 
 Under Genesis-4 there is no confirmation count, and there is no honest way to
 manufacture one. Depth is not security on a chain with no difficulty: nothing in
 the protocol prices a reorg in work, so "6 blocks" and "100 blocks" are the same
 statement — a statement about how long you waited, not about what it would cost
-to undo. The guarantee rests instead on **Casper justification and
+to undo. ~~The guarantee rests instead on **Casper justification and
 finalisation**: a finalised checkpoint cannot be reverted unless at least one
 third of the total active stake is slashed, which is a bonded, attributable,
-on-chain cost rather than a probabilistic one.
+on-chain cost rather than a probabilistic one.~~ **Struck 2026-09-02** — no
+stake can be slashed on Genesis-4 today; see the correction above.
 
-The node states this itself, at the type that carries it. From
+The node stated this itself, at the type that carries it — and the text below
+has been **struck at source** by the same correction (see `enum Finality` in
+`crates/bloch-pos-node/src/rpc.rs`). It is reproduced only as the record of what
+was withdrawn. From
 `crates/bloch-pos-node/src/rpc.rs:1200-1216`, on `enum Finality`, under the
-heading *"This is the field an exchange credits a deposit on"*:
+heading ~~*"This is the field an exchange credits a deposit on"*~~ — **struck
+at source 2026-09-02**:
 
 > The integration question was "how many confirmations should we require, and
 > what does the guarantee rest on". Under PoS there is no answer in that
@@ -552,14 +575,14 @@ judgement in two shapes (`rpc.rs:1293-1294`):
 
 | Field | Type | Use |
 |---|---|---|
-| `finalized` | boolean | **This is the one to branch on.** |
+| `finalized` | boolean | **This is the one to branch on** — never `block_id` or height, which differ between honest nodes one slot apart. Necessary, **not sufficient**: see the correction in §5.1. |
 | `finality` | string — `finalized` \| `justified` \| `canonical` \| `not_canonical` | The gradation, for display and for support tooling |
 
 The four states, verbatim from `Finality` (`rpc.rs:1224-1236`):
 
 | Value | Meaning |
 |---|---|
-| `finalized` | At or below the finalised checkpoint. Irreversible short of a one-third-of-stake slashing event. **Credit here.** |
+| `finalized` | At or below the finalised checkpoint. ~~Irreversible short of a one-third-of-stake slashing event. **Credit here.**~~ **Struck 2026-09-02 — necessary, not sufficient.** No stake can be slashed today. Credit at `finalized` + 3 epochs, agreed by two independently operated nodes on the same finalized root **and** epoch, re-verified immediately before release; no depth is provably safe. |
 | `justified` | At or below the justified checkpoint, above the finalised one. One epoch from finality in the normal case; **still reversible.** |
 | `canonical` | On this node's canonical chain, not yet justified. Reorganisable by ordinary fork choice. |
 | `not_canonical` | Known to this node, not on its canonical chain. |

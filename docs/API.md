@@ -340,23 +340,46 @@ currency.** There is no confirmation count, and manufacturing one would be
 dishonest. Depth is not security on a chain with no difficulty: nothing prices a
 reorg in work, so waiting more blocks tells you only how long you waited.
 
-**The rule on the live chain.** Genesis-4's settlement guarantee is **Casper
+**The rule on the live chain.** ~~Genesis-4's settlement guarantee is **Casper
 justification and finalisation** — a finalised checkpoint cannot be reverted
 unless at least one third of the total active stake is slashed, which is a
-bonded, attributable, on-chain cost. The node returns:
+bonded, attributable, on-chain cost.~~
+
+> **Correction, 2026-09-02 — struck, not deleted.** The sentence above is false
+> of the released node (`g4-node-20260901` = `7a83ca89`) and must not be quoted.
+> **No stake can be slashed on Genesis-4 today:** slashing evidence (wire tag
+> `0x05`) is undecodable on every ingress path, so the penalty can never be
+> applied (`crates/bloch-pos-committee/src/transition.rs:714-730`, decode
+> refusal at `:782`). A cost that cannot be imposed bounds nothing, so
+> **`finalized` alone is not a settlement guarantee and must not be credited
+> on.**
+>
+> **What to do instead, until this note is withdrawn:** credit at **`finalized`
+> + 3 epochs** (~48 minutes past finality); require **two independently
+> operated nodes** to agree on the same finalized **root AND epoch** — not the
+> epoch alone; compare `finalized`, never `block_id` or height, since honest
+> nodes routinely sit one slot apart; and **re-verify immediately before
+> releasing funds**. The margin of 3 bounds the single-cut case only — **no
+> depth is provably safe today**. **Two nodes agreeing does not mitigate a
+> rewind:** both can rewind independently.
+
+The node returns:
 
 | Field | Where | Use |
 |---|---|---|
-| `finalized` | on every block | **Boolean. This is the whole rule. Credit here.** |
+| `finalized` | on every block | Boolean. ~~**This is the whole rule. Credit here.**~~ **Struck 2026-09-02 — necessary, not sufficient.** Credit at `finalized` + 3 epochs, agreed by two independently operated nodes on the same finalized root **and** epoch, re-verified immediately before release. |
 | `finality` | on every block | `finalized` \| `justified` \| `canonical` \| `not_canonical` — the gradation, for display |
 | `finalized_height` | `getchaininfo` | the settled line; `height` is the number that is *not* the guarantee |
 | `behind_by_slots` | `getchaininfo` | check this first — a lagging node reports its own staleness, not an error |
 
-Nothing is gained by waiting further blocks past finalisation, and nothing else
-substitutes for it. Typical time to finality is ≈ 32 minutes (32-slot epochs at
+~~Nothing is gained by waiting further blocks past finalisation, and nothing
+else substitutes for it.~~ **Struck 2026-09-02** — see the correction above:
+three further epochs are the current guidance, and they bound the single-cut
+case only. Typical time to finality is ≈ 32 minutes (32-slot epochs at
 30 s, two rounds); worst case ≈ 48 minutes for a block early in an epoch. Source:
-`crates/bloch-pos-node/src/rpc.rs`, on `enum Finality` — "This is the field an
-exchange credits a deposit on".
+`crates/bloch-pos-node/src/rpc.rs`, on `enum Finality` — whose heading
+~~"This is the field an exchange credits a deposit on"~~ was **struck at source
+on 2026-09-02** for the reason given above.
 
 ### Heights, supply and emission (Genesis-3 traps — superseded figures)
 
