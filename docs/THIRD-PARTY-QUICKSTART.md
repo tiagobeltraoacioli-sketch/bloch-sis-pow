@@ -483,7 +483,17 @@ weaker validation than the other.
 
 Copy from an **archival** node, never from a validator's data directory: a
 validator's directory contains `validator.key`, and copying a live validator
-key to a second machine risks double-signing, which is slashable.
+key to a second machine makes it a second signer for the same validator index.
+That is equivocation, and there is no safe version of it.
+
+One correction to how we used to justify that, because the advice is right and
+the reason we gave was not: we said equivocation "is slashable". **It is not,
+on Genesis-4 today** — slashing evidence cannot be decoded on any ingress path,
+so the penalty cannot be applied to anyone (see the retraction on `Finality` in
+`crates/bloch-pos-node/src/rpc.rs`). What *is* live is fork choice's
+equivocator bar: a validator observed signing two blocks at one height stops
+counting toward finality. So the deterrent is real but it is exclusion, not a
+fine, and it does not return your stake to you.
 
 Seeding is a genuine trade: you are trusting the donor for the block data.
 You are *not* trusting them for validity — your node re-applies every
