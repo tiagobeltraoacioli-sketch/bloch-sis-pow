@@ -157,6 +157,106 @@ that restarted onto something else).
 The sweep is read-only and needs ~30 s per host over SSH. It is deliberately
 manual (or PMO-driven) — CI must never hold fleet SSH keys.
 
+### 4.1 Gate-vs-flag-day verification — "will this node follow, or fork?"
+
+§4 answers *what is this node running*. It does not answer the question that
+matters on the morning of a flag day: **does that binary implement the rule
+about to activate?** Those are different questions, and a matching sha256 only
+answers the first.
+
+Until 2026-08-31 the second question had no answer at all. `bloch-pos
+selfcheck` printed `self-check passed` and nothing else, and **silently
+ignored `--json`** — it accepted the flag and discarded it, so a script asking
+a binary which gates it knew got a success exit and no information. Measured
+on the production binaries that day:
+
+| binary | commit stamp | `selfcheck --json` |
+|---|---|---|
+| `bloch-pos-quatro` (both archivals) | `0a3a436a2d18+dirty` | `self-check passed` |
+| `bloch-pos-cinco` (the 7 fleet boxes) | `46133196-varredura` | `self-check passed` |
+
+That is the `genesis4-node-20260814` blind spot exactly: that release predated
+every armed flag day, diverged on schedule, and its release page said nothing —
+because there was no artifact that could say it.
+
+**The statement.** `bloch-pos selfcheck --json` now emits the activation epochs
+the binary links, plus a `gates_digest` over the set:
+
+```json
+{
+  "binary": "bloch-pos-node 0.1.0-mainnet (<commit>)",
+  "consensus_gates": [
+    {"name": "TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH", "epoch": 800},
+    {"name": "ANCESTRY_SEED_ACTIVATION_EPOCH", "epoch": null}
+  ],
+  "gates_digest": "<sha3-256>",
+  "knows_gates_through_epoch": 1400
+}
+```
+
+`epoch: null` means the gate ships **inert** — code present, flag day not set.
+Inert gates are part of the digest on purpose: a binary that ships a gate inert
+is a different thing from one that never heard of the gate, and only the second
+is doomed when the epoch is chosen.
+
+**The rule.** Two binaries are consensus-compatible **at epoch E** iff their
+gate lists agree on every gate with activation epoch ≤ E. Equal `gates_digest`
+is the stronger property — compatible at every epoch, now and later.
+
+**The sweep.** `scripts/fleet-gate-sweep.sh` runs the statement across the host
+table in `scripts/fleet-gates.tsv`, groups by digest and reports disagreement.
+Run it **before arming**, never after:
+
+```sh
+scripts/fleet-gate-sweep.sh --epoch 1400            # the flag day under test
+scripts/fleet-gate-sweep.sh                          # strict: the whole gate set
+scripts/fleet-gate-sweep.sh --reference-json new.json # vs the binary you will ship
+```
+
+Exit 0 = every probed node agrees. Exit 1 = at least one would fork, **or at
+least one could not be asked** — and those are the same verdict. A binary that
+cannot state its gates is not evidence that it agrees.
+
+It is read-only: one `selfcheck` per host, which opens no data directory, binds
+no port and writes nothing. Its report logic is pinned by
+`scripts/fleet-gate-sweep.selftest.sh`, which runs on fixtures because the tool
+cannot be validated against production without the failure it exists to prevent.
+
+**Completeness is the whole game.** The digest is only trustworthy if the gate
+table in `crates/bloch-pos-node/src/main.rs` names *every*
+`*_ACTIVATION_EPOCH` in `bloch-pos-committee/src/params.rs`. An incomplete
+table is worse than none: two binaries that genuinely disagree about the
+omitted gate publish the *same* digest, and the sweep calls them compatible.
+Two blocking checks enforce this — the unit test
+`gate_table_mirrors_params_exactly`, which parses the declarations out of
+params.rs and names anything missing or stale, and §4 of
+`scripts/pos-release-integrity.sh`, so CI refuses to *cut* a release with a
+drifted table even if tests were skipped. Neither check ever justifies editing
+params.rs: the table mirrors the constants, it does not set them.
+
+**Publish the `gates_digest` on the release page.** It is what an operator
+compares a box against, and it is the only thing that makes "will this node
+follow the flag day?" answerable before the answer costs a fork.
+
+**Measured 2026-08-31.** Derived from each binary's stamped source commit (the
+fallback the sweep prescribes for a binary that cannot state its own gates):
+the archival binary (`0a3a436a`) and the fleet binary (`46133196`) carry
+**identical** gate sets — the five below — and therefore the same digest
+`a03bccc3e460ae15e7b233637334ab09610a684b66f77540ac88b1b7cc34876f`. The
+archivals will not fork the fleet at any presently-known gate.
+
+| gate | epoch |
+|---|---|
+| `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` | 800 |
+| `BLOCK_BYTES_V2_ACTIVATION_EPOCH` | 800 |
+| `LEAKED_ROSTER_ACTIVATION_EPOCH` | 1400 |
+| `ANCESTRY_SEED_ACTIVATION_EPOCH` | inert |
+| `LEAK_RECOVERY_ACTIVATION_EPOCH` | inert |
+
+This was luck, not process: nothing in the release path had checked it, and the
+two populations were on different binaries for four days. The point of the
+tooling is that the next answer is produced rather than reconstructed.
+
 ## 5. The rollback package
 
 ### 5.1 What it is

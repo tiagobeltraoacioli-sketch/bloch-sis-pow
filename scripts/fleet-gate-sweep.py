@@ -92,7 +92,13 @@ for row in load_rows():
         with open(os.path.join(WORK, row["label"] + ".out")) as fh:
             raw = fh.read()
     except OSError:
-        raw = ""
+        # No probe file at all means the shell half never ran this host --
+        # a bug in the SWEEP, not a fact about the fleet. Say so, loudly and
+        # separately, so it is never read as "this node is fine" or as a
+        # property of the binary.
+        raw = ("SWEEP-ERROR: this host was never probed — the sweep itself "
+               "failed to run it. Re-run; if it repeats, fix the sweep. Do NOT "
+               "read this as information about the node.")
     gates, digest, binary, err = parse_statement(raw)
     row.update(gates=gates, digest=digest, binary=binary, error=err)
     nodes.append(row)

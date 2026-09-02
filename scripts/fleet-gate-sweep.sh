@@ -96,6 +96,19 @@ case "$EPOCH" in ''|*[!0-9]*) [ -z "$EPOCH" ] || die "--epoch must be a number" 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/gate-sweep.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
+# A hard wall-clock cap per host, because a wedged box must not hold up a
+# pre-flag-day sweep. macOS ships no coreutils `timeout`; ssh's own
+# ConnectTimeout only covers the CONNECT, so where neither `timeout` nor
+# `gtimeout` exists we fall back to ServerAliveInterval/CountMax (set on the
+# ssh call below), which bounds a connection that opens and then goes silent.
+if command -v timeout >/dev/null 2>&1; then
+  TIMEOUT_CMD="timeout $((TIMEOUT + 5))"
+elif command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT_CMD="gtimeout $((TIMEOUT + 5))"
+else
+  TIMEOUT_CMD=""
+fi
+
 # ── Probe one host ───────────────────────────────────────────────────────────
 # Writes $WORK/<label>.out (raw stdout) and $WORK/<label>.meta (label,host,bin).
 # Deliberately captures stdout VERBATIM: a binary that predates `--json` prints
@@ -108,11 +121,18 @@ probe() {
     printf 'SWEEP-ERROR: ssh key %s not found\n' "$keypath" > "$WORK/$label.out"
     return
   fi
-  timeout "$((TIMEOUT + 5))" ssh \
+  # `-n` is load-bearing, not tidiness: without it ssh inherits the read loop's
+  # stdin — the host table — and EATS the rows that have not been read yet.
+  # Observed 2026-08-31: with 10 hosts and 8 parallel probes, the last two were
+  # never probed at all and surfaced as "no output", i.e. the sweep quietly
+  # under-reported the fleet. A sweep that silently skips hosts is worse than
+  # no sweep, because its verdict looks complete.
+  $TIMEOUT_CMD ssh -n \
       -i "$keypath" \
       -o BatchMode=yes \
       -o StrictHostKeyChecking=accept-new \
       -o ConnectTimeout="$TIMEOUT" \
+      -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
       "$SSH_USER@$host" \
       "'$bin' selfcheck --json 2>&1" \
       > "$WORK/$label.out" 2>"$WORK/$label.err"
