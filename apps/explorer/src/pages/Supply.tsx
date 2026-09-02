@@ -12,6 +12,9 @@ import { g4rpc, G4, G4ValidatorCount, G4Balance, G4Head } from "../lib/g4";
 import { fmtBloch, fmtInt } from "../lib/format";
 import { Link } from "../lib/router";
 import {
+  FOUNDER_POSITION,
+  PUBLISHED_UNDERSTATEMENT,
+  NO_ONCHAIN_LOCKUP,
   SAT,
   TOTAL_SUPPLY_BLOCH,
   TOTAL_SUPPLY_SAT,
@@ -670,6 +673,81 @@ export function SupplyPage() {
             </>
           )}
         </div>
+      </section>
+
+      {/* ── the founder's position, every denominator named ── */}
+      <section className="card sup-card">
+        <h2 className="snap-h2">Founder concentration — three figures, three denominators</h2>
+        <p className="snap-body">
+          One number cannot answer this. The same balance is 37.92% or 66.35% depending only on
+          whether you divide by the 100 billion cap or by what has actually been issued, and both
+          are legitimate questions. So all of them are published, each against the denominator it
+          belongs to, and none is nominated as “the” concentration figure.
+        </p>
+        <div className="conc-table-wrap">
+          <table className="conc-table">
+            <thead>
+              <tr>
+                <th>Position</th>
+                <th className="num">BLCH</th>
+                <th className="num">of the 100B cap</th>
+                <th className="num">of 57.1464B issued</th>
+                <th>Provenance</th>
+              </tr>
+            </thead>
+            <tbody>
+              {FOUNDER_POSITION.map((r) => (
+                <tr key={r.key} className={r.provenance === "stated" ? "row-stated" : undefined}>
+                  <td>
+                    <strong>{r.label}</strong>
+                    <span className="conc-note">{r.note}</span>
+                  </td>
+                  <td className="num">{r.bloch}</td>
+                  <td className="num">{r.ofCap}</td>
+                  <td className="num">{r.ofIssued}</td>
+                  <td>
+                    <span className={"prov prov-" + r.provenance}>{r.provenance}</span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <Caveat title="The genesis row is not optional. ">
+          Read the first two rows together or not at all. Against the cap the position went from{" "}
+          <strong>56.05% to 37.92%</strong> — it <em>shrank</em>. Quoting the published 27.04%
+          beside today's 37.92% produces the opposite story, a rise, out of two numbers that are
+          not measuring the same thing.
+        </Caveat>
+        <Caveat title="What “stated” means, and why it is marked. ">
+          That 18,128,356,145.07 BLCH <em>left the address</em> across epochs 184–1618, to 14 addresses, is measured — anyone
+          can reproduce it. That it was <strong>sold to third parties</strong> is the founder's
+          statement, and it is marked as such because the chain cannot attribute control of an
+          address to a person and never will. An auditor re-running this page must reproduce every
+          measured row and must <em>fail</em> to reproduce that one. Keeping that line visible is
+          what makes the rest of the audit worth anything; erasing it would turn a disclosure into
+          a proof it is not. Supply is genuinely more distributed than the genesis row — on the
+          founder's word, not the chain's.
+        </Caveat>
+        <Caveat title="The 27.04% published today is a fourth thing, and it is wrong. ">
+          It is <code>FOUNDER_TOTAL_BLOCH</code> — the largest carryover plus the founder grant —
+          and it omits the other four buckets ({PUBLISHED_UNDERSTATEMENT.omittedBuckets},{" "}
+          {PUBLISHED_UNDERSTATEMENT.omittedBloch} BLCH) that{" "}
+          <code>main.rs:605-622</code> writes to the <em>same script hash</em>. It has understated
+          from genesis onward. A compile-time assert pins it, which proves the constant has not
+          drifted — not that it measures what its name says. It appears in none of the rows above
+          and should not be quoted.
+        </Caveat>
+        <Caveat title="There is no on-chain lockup on any of it. ">
+          Not on what was sold, and not on what is retained.{" "}
+          <code>unlock_epoch</code> is <strong>{NO_ONCHAIN_LOCKUP.unlockEpoch}</strong> on all five
+          buckets, <strong>no node reads the field</strong>, and all five were spent between epochs{" "}
+          {NO_ONCHAIN_LOCKUP.bucketsSpentFrom} and {NO_ONCHAIN_LOCKUP.bucketsSpentTo} (documented
+          and tested on <code>main</code>, commit <code>{NO_ONCHAIN_LOCKUP.evidenceCommit}</code>).
+          The vesting schedule in the tokenomics is a statement of intent, not a constraint the
+          chain enforces. A reader comparing this page against that schedule should learn the
+          difference here rather than discover it later.
+        </Caveat>
       </section>
 
       {/* ── cohort bond sits outside issuance ── */}

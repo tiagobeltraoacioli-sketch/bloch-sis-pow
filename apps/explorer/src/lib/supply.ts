@@ -251,3 +251,118 @@ export const CIRCULATING_NOT_SERVED =
   "refuses to compute it per request on the consensus thread; if it is served " +
   "at all it must be memoised per finalised epoch and report the epoch it was " +
   "computed at. No endpoint offers it today.";
+
+// ───────────────────────────────────────────────────────────────────────────
+// The founder's position, with every denominator named
+// ───────────────────────────────────────────────────────────────────────────
+//
+// Four figures for "founder concentration" circulate and they describe four
+// different things. Published together or not at all: a reader given one
+// number and no denominator cannot tell which question it answers, and the
+// three that are real move in OPPOSITE directions depending on the denominator
+// chosen.
+//
+// The genesis row is the one that must never be dropped. Without it
+// "27.04% -> 37.92%" reads as growth, when the position has in fact SHRUNK
+// from 56.05%.
+//
+// MEASURED vs STATED is the distinction that gives this table its value.
+// Everything marked `measured` is reproducible from the chain by anyone. The
+// `sold` row is NOT: the founder states the outflow was private sales to third
+// parties, and the chain cannot attribute control of an address to anyone,
+// ever. An auditor re-running this must reproduce every measured row and must
+// FAIL to reproduce that one. If they can reproduce it, something is wrong
+// with the claim, not with the auditor.
+
+/** Total supply cap, BLCH. */
+export const CAP_BLOCH = 100_000_000_000;
+
+/** Issued so far — the denominator that is not the cap. */
+export const ISSUED_BLOCH = 57_146_400;
+
+/** Issued so far, to the satoshi scale used in the table below. */
+export const ISSUED_FOR_TABLE_BLOCH = 57_146_400_000 / 1000; // 57,146,400 BLCH
+
+export type Provenance = "measured" | "stated";
+
+export interface FounderRow {
+  key: string;
+  label: string;
+  /** BLCH, as measured/stated. Decimal string — it exceeds a JS integer. */
+  bloch: string;
+  /** Percent of the 100B cap. */
+  ofCap: string;
+  /** Percent of what has been issued so far. */
+  ofIssued: string;
+  provenance: Provenance;
+  note: string;
+}
+
+/**
+ * The three rows that are real, in the order that makes the movement legible.
+ *
+ * Measured against the chain on 2026-09-01. The outflow spans epochs 184-1618
+ * to 14 addresses.
+ */
+export const FOUNDER_POSITION: FounderRow[] = [
+  {
+    key: "genesis",
+    label: "At genesis",
+    bloch: "56,046,829,380.86",
+    ofCap: "56.05%",
+    ofIssued: "98.08%",
+    provenance: "measured",
+    note: "Five buckets at one script hash. This is the row that makes the other two readable: leave it out and a rising percentage looks like accumulation.",
+  },
+  {
+    key: "today",
+    label: "Today",
+    bloch: "37,918,473,235.79",
+    ofCap: "37.92%",
+    ofIssued: "66.35%",
+    provenance: "measured",
+    note: "The same address, now. Lower than genesis against both denominators.",
+  },
+  {
+    key: "sold",
+    label: "Left the address",
+    bloch: "18,128,356,145.07",
+    ofCap: "18.13%",
+    ofIssued: "31.72%",
+    provenance: "stated",
+    note: "Epochs 184-1618, to 14 addresses. That it MOVED is measured. That it was sold to third parties is the founder's statement, and the chain cannot confirm or refute it — an address is not an identity.",
+  },
+];
+
+/**
+ * The number published on the site today, which is none of the above.
+ *
+ * `FOUNDER_TOTAL_BLOCH` = largest carryover + the founder grant, and it OMITS
+ * the other four buckets (VC, TEAM, MARKETING, LIQUIDITY = 29B) which
+ * `main.rs:605-622` writes to the SAME script hash. It has understated from
+ * genesis onward. It is pinned by a compile-time assert
+ * (`tokenomics_v4.rs:446`), which froze the arithmetic without making it
+ * correct — the assert proves the constant has not drifted, not that it
+ * measures what its name says.
+ */
+export const PUBLISHED_UNDERSTATEMENT = {
+  percent: "27.04%",
+  omittedBuckets: "VC, TEAM, MARKETING, LIQUIDITY",
+  omittedBloch: "29,000,000,000",
+};
+
+/**
+ * There is no on-chain lockup on ANY of it — sold or retained.
+ *
+ * `unlock_epoch` is 0 on all five buckets, no node reads the field, and all
+ * five were spent between epochs 1052 and 1167. Documented and tested on
+ * `main` at commit fa4ad9be. This belongs beside the concentration figures
+ * rather than in a footnote: a reader who sees a vesting schedule in the
+ * tokenomics and no lockup here should learn that from this page.
+ */
+export const NO_ONCHAIN_LOCKUP = {
+  unlockEpoch: 0,
+  bucketsSpentFrom: 1052,
+  bucketsSpentTo: 1167,
+  evidenceCommit: "fa4ad9be",
+};

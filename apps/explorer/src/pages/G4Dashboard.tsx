@@ -176,10 +176,13 @@ export function G4Dashboard() {
         <p className="g4-note">
           Production and finality are separate questions. A block every slot says proposers are
           healthy; a finalized epoch says two thirds of the <em>consensus</em> stake agreed —
-          the post-leak total on the right, not the duty total on the left. The two differ by
-          more than a factor of two while the leak is biting, so two thirds of the wrong one is
-          not a near-miss. It does not say they cannot take it back — see{" "}
-          <Link to="/finality">finality</Link>. Two epochs of lag is the floor — finalizing epoch <em>n</em> requires epoch{" "}
+          the post-leak roster, which is <strong>not</strong> the duty total shown under the
+          validators. The two differ by more than a factor of two while the leak is biting, so
+          two thirds of the duty number is not a near-miss.{" "}
+          {stake
+            ? "Both totals are shown so the threshold can be taken against the right one."
+            : "This node build does not serve the post-leak total, so no quorum figure is offered here rather than one computed from the wrong denominator."}{" "}
+          It does not say they cannot take it back — see <Link to="/finality">finality</Link>. Two epochs of lag is the floor — finalizing epoch <em>n</em> requires epoch{" "}
           <em>n+1</em> to justify on top of it.
         </p>
 
@@ -214,13 +217,22 @@ export function G4Dashboard() {
                 <span className="g4-v">{fmtBloch(BigInt(vals.total_active_stake_sat), 0)}</span>
                 <span className="g4-dim">roster before the leak</span>
               </div>
-              {stake && (
+              {stake ? (
                 <div className="g4-stat">
                   <span className="g4-k">Consensus stake</span>
                   <span className="g4-v">
                     {fmtBloch(BigInt(stake.total_active_stake_sat), 0)}
                   </span>
                   <span className="g4-dim">after the leak — quorum is taken on this</span>
+                </div>
+              ) : (
+                <div className="g4-stat">
+                  <span className="g4-k">Consensus stake</span>
+                  <span className="g4-v g4-absent">not served</span>
+                  <span className="g4-dim">
+                    <code>getstakedistribution</code> is in the node source, not in the deployed
+                    build
+                  </span>
                 </div>
               )}
             </div>

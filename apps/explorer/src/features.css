@@ -660,3 +660,38 @@
   .vtable td:nth-child(5),
   .vtable th:nth-child(5) { display: none; }
 }
+
+/* A figure the deployed node does not serve. Deliberately not styled as an
+   error: the page is working, the method is absent. Rendering it as a dash or
+   a zero would be the actual mistake — a reader takes a zero for a measurement. */
+.g4-absent {
+  opacity: 0.55;
+  font-style: italic;
+  font-weight: 500;
+}
+
+/* ── Founder concentration table ──────────────────────────────────────────
+ * Every row carries its denominator in the header and its provenance in the
+ * last column. `stated` is tinted differently from `measured` on purpose:
+ * the difference between a number anyone can reproduce and a number only the
+ * founder can assert is the most important thing on the page, and it must
+ * survive being skimmed. */
+.conc-table-wrap { overflow-x: auto; margin: 14px 0 4px; }
+.conc-table { width: 100%; border-collapse: collapse; font-size: 14px; min-width: 640px; }
+.conc-table th, .conc-table td {
+  text-align: left;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--rule, rgba(128,128,128,0.22));
+  vertical-align: top;
+}
+.conc-table th { font-weight: 600; font-size: 12.5px; letter-spacing: 0.02em; opacity: 0.78; }
+.conc-table .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.conc-table th.num { text-align: right; }
+.conc-note { display: block; font-size: 12px; opacity: 0.7; margin-top: 4px; max-width: 46ch; }
+.conc-table tr.row-stated { background: rgba(184, 121, 26, 0.07); }
+.prov {
+  display: inline-block; padding: 2px 8px; border-radius: 999px;
+  font-size: 11.5px; font-weight: 600; border: 1px solid currentColor;
+}
+.prov-measured { color: #2f9e5e; background: rgba(47, 158, 94, 0.09); }
+.prov-stated   { color: #b8791a; background: rgba(184, 121, 26, 0.12); }
