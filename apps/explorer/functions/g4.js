@@ -159,6 +159,12 @@ async function askOne(node, forward) {
   }
 }
 
+import { gate, gateResponse } from "../edge/gate.js";
+import { WALK_COST, UPSTREAM_WALK_COST } from "../edge/governor.js";
+
+/** Methods that walk the whole committed eUTXO set on the consensus thread. */
+const WALKS = new Set(["getbalance", "getutxos", "listunspent"]);
+
 export async function onRequestOptions() {
   return new Response(null, { status: 204, headers: CORS });
 }
@@ -231,7 +237,28 @@ export async function onRequestPost(context) {
 
   // Pinned read? Answer from exactly that box and say so.
   const q = new URL(context.request.url).searchParams.get("node");
-  if (q !== null && /^\d+$/.test(q)) return pinned(ARCHIVALS, Number(q), forward, id);
+  const isPinned = q !== null && /^\d+$/.test(q);
+
+  // ── the governor ────────────────────────────────────────────────────────
+  //
+  // This Function is `no-store` by design (a stale finality answer is worse
+  // than no answer), which means EVERY request reaches the chain. There is no
+  // cache to hide behind, so the meter is the only thing between a burst of
+  // readers and two nodes that serve RPC from their consensus thread.
+  //
+  // A pinned read costs one upstream call; the corroborating default costs
+  // one per archival, because it asks all of them and comparing the answers
+  // is the whole point.
+  const walks = WALKS.has(method);
+  const refusal = gate(context.request, {
+    clientCost: walks ? WALK_COST : 1,
+    upstreamCalls: (isPinned ? 1 : ARCHIVALS.length) * (walks ? UPSTREAM_WALK_COST : 1),
+    method,
+    id,
+  });
+  if (refusal) return gateResponse(refusal, CORS);
+
+  if (isPinned) return pinned(ARCHIVALS, Number(q), forward, id);
 
   const answers = await Promise.all(ARCHIVALS.map((n) => askOne(n, forward)));
   const live = answers.filter((a) => a.ok);

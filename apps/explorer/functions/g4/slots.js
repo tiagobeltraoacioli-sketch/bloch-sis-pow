@@ -29,6 +29,8 @@
 // tail is still being written.
 // ---------------------------------------------------------------------------
 
+import { gate, gateResponse } from "../../edge/gate.js";
+
 const MAX_LIMIT = 32;
 
 /**
@@ -129,6 +131,16 @@ export async function onRequestGet(context) {
   const wanted = Number(url.searchParams.get("limit") || MAX_LIMIT) | 0;
   const limit = Math.min(MAX_LIMIT, Math.max(1, wanted || MAX_LIMIT));
 
+  // ── the governor, part 1: the head read ─────────────────────────────────
+  //
+  // This one is unavoidable even on a cache hit — the key is keyed on `to`,
+  // which defaults to the head, so the head must be known before the cache can
+  // be consulted. It is one cheap call; it is charged as one.
+  {
+    const refusal = gate(request, { clientCost: 1, upstreamCalls: 1, method: url.pathname });
+    if (refusal) return gateResponse(refusal, CORS);
+  }
+
   let head;
   try {
     head = await rpcAny(urls, "getchaininfo", []);
@@ -152,6 +164,26 @@ export async function onRequestGet(context) {
     const marked = new Response(hit.body, hit);
     marked.headers.set("X-Bloch-Cache", "hit");
     return marked;
+  }
+
+  // ── the governor, part 2: the walk ──────────────────────────────────────
+  //
+  // Below the cache-hit return on purpose: a hit costs the chain nothing, so
+  // it is neither charged nor refused. Serving from cache while the budget is
+  // empty is what the cache is FOR.
+  //
+  // Charged `limit` — the calls this miss will really make — because pricing
+  // per REQUEST would make the widest range cost the same as the narrowest,
+  // i.e. make the expensive shape the cheapest to abuse. CONCURRENCY bounds
+  // one request's fan-out; it does nothing about a thousand requests a second,
+  // and this route serves the dashboard's slot strip.
+  {
+    const refusal = gate(request, {
+      clientCost: 2,
+      upstreamCalls: limit,
+      method: url.pathname,
+    });
+    if (refusal) return gateResponse(refusal, CORS);
   }
 
   const slots = [];

@@ -41,19 +41,32 @@
 // prevent.
 // ---------------------------------------------------------------------------
 
+import { gate, gateResponse } from "../../edge/gate.js";
+
 /** Hard ceiling on `limit`, chosen to stay under the subrequest budget. */
 const MAX_LIMIT = 32;
 
 /**
  * How long a page of the set stays fresh at the edge.
  *
- * An epoch is 32 slots of 30s — 16 minutes — and effective stake only moves on
- * an epoch boundary, so a minute of staleness cannot show a wrong number for
- * long. It is short enough that a state change (an exit, a slashing) surfaces
- * quickly, and long enough that a thousand readers cost the archival one
- * fan-out rather than a thousand.
+ * The cache key carries the EPOCH (see `onRequestGet`), so this TTL is no
+ * longer what protects against cross-boundary staleness — the key is. An epoch
+ * change produces a different key and the walk happens exactly once, for
+ * whoever asks first.
+ *
+ * So why not a full epoch (960s)? Because effective stake is not the only
+ * thing on the record. A slashing or an exit changes `state` MID-epoch, and a
+ * key that only moves on the boundary would hold that back for up to sixteen
+ * minutes. Five minutes is the compromise: the epoch key makes the boundary
+ * exact, and this bounds how long a mid-epoch state change stays invisible.
+ *
+ * The load this removes is the point. At 60s with no epoch in the key, every
+ * visitor in a fresh minute walked 64 records — one `getvalidator` each,
+ * against a node that serves RPC from its consensus thread. `/validators`
+ * first paint was measured at ~6s per page and occasionally over 30s, which is
+ * that walk being felt. This makes it one walk per five minutes, per page.
  */
-const CACHE_SECONDS = 60;
+const CACHE_SECONDS = 300;
 
 /** Per-upstream timeout. Shorter than the client's patience, deliberately. */
 const UPSTREAM_TIMEOUT_MS = 9000;
@@ -224,11 +237,34 @@ export async function onRequestGet(context) {
   const wanted = Number(url.searchParams.get("limit") || MAX_LIMIT) | 0;
   const limit = Math.min(MAX_LIMIT, Math.max(1, wanted || MAX_LIMIT));
 
+  // The EPOCH the key is taken against.
+  //
+  // One cheap `getchaininfo` before the cache is consulted, because a
+  // validator record is an epoch-class answer: activation, exit and effective
+  // stake all move on the boundary and nowhere else. Without the epoch in the
+  // key, a TTL is a guess about when the answer went stale; with it, the
+  // boundary invalidates by construction and the TTL only has to bound
+  // mid-epoch changes. This is the same reasoning `edge/surface.js` applies to
+  // `getvalidator` on the `/rpc` path — the two now agree.
+  {
+    const refusal = gate(request, { clientCost: 1, upstreamCalls: 1, method: url.pathname });
+    if (refusal) return gateResponse(refusal, CORS);
+  }
+  let keyEpoch;
+  try {
+    keyEpoch = (await rpcAny(upstreams(env), "getchaininfo", [])).epoch;
+  } catch (e) {
+    return json(502, {
+      error: `no archival answered getchaininfo: ${String((e && e.message) || e)}`,
+    });
+  }
+
   // Normalise the cache key so `?limit=999` and `?limit=32` are one entry,
   // and so a missing parameter and its default are not two.
   const keyUrl = new URL(url.origin + url.pathname);
   keyUrl.searchParams.set("offset", String(offset));
   keyUrl.searchParams.set("limit", String(limit));
+  keyUrl.searchParams.set("epoch", String(keyEpoch));
   const cacheKey = new Request(keyUrl.toString(), { method: "GET" });
   const cache = caches.default;
 
@@ -240,6 +276,26 @@ export async function onRequestGet(context) {
   }
 
   const urls = upstreams(env);
+
+  // ── the governor, AFTER the cache ───────────────────────────────────────
+  //
+  // Below the cache-hit return on purpose: a hit costs the chain nothing, so
+  // it is neither charged nor refused. Serving from cache while the budget is
+  // empty is what the cache is FOR.
+  //
+  // A miss here is the most expensive read the explorer performs: one
+  // getchaininfo per archival to corroborate the head, then one getvalidator
+  // per record. `getvalidators` — one call for a whole page — is in the node
+  // source and in no deployed binary, so per-record is the only shape
+  // available and the charge has to reflect it.
+  {
+    const refusal = gate(request, {
+      clientCost: 2,
+      upstreamCalls: urls.length + limit,
+      method: url.pathname,
+    });
+    if (refusal) return gateResponse(refusal, CORS);
+  }
 
   let head;
   let headSource;
