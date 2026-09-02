@@ -439,8 +439,34 @@ function corroborationOf(spec, answers, ctx) {
  * "not settled" is behaving correctly; one that treats it as "settled" was
  * always going to be wrong about something.
  */
+/**
+ * Does this result carry a per-BLOCK finality verdict this layer may recompute?
+ *
+ * The distinction is not cosmetic and it cost a wrong number on the front page.
+ * A block reports `finalized` as a BOOLEAN — the asking node's classification
+ * of that block, which moves, and which this layer therefore re-derives from
+ * the fleet witness rather than caching.
+ *
+ * `getchaininfo` reports `finalized` as a CHECKPOINT OBJECT, `{epoch, root}`,
+ * sitting beside `justified`. That is not a verdict about a block; it is the
+ * chain's finalized checkpoint, and it is the single most important number the
+ * explorer publishes. Both shapes have a `height`, so the old `'height' in
+ * result` test matched the head too and overwrote the checkpoint with a
+ * boolean `false` — making the dashboard report "Finalized epoch 0" on a chain
+ * that had finalized epoch 1,718.
+ */
+function carriesBlockFinality(result) {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return false;
+  if (!('height' in result)) return false;
+  // A checkpoint object, not a boolean verdict: leave it alone.
+  if (result.finalized !== null && typeof result.finalized === 'object') return false;
+  // Head-shaped answers carry these; blocks do not.
+  if ('justified' in result || 'finalized_height' in result) return false;
+  return true;
+}
+
 export function rederiveFinality(result, now) {
-  if (!result || typeof result !== 'object' || !('height' in result)) return result;
+  if (!carriesBlockFinality(result)) return result;
   const wit = witnessView(now);
   const out = { ...result };
   const h = Number(result.height);
@@ -843,6 +869,8 @@ export async function handleRead(payload, opts) {
  */
 function stripFinality(result) {
   if (!result || typeof result !== 'object' || Array.isArray(result)) return result;
+  // Never strip the head's finalized CHECKPOINT — see `carriesBlockFinality`.
+  if (!carriesBlockFinality(result)) return result;
   if (!('finality' in result) && !('finalized' in result)) return result;
   const out = { ...result };
   delete out.finality;

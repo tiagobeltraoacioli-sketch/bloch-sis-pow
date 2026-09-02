@@ -14,7 +14,7 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 
-import { handleRead, Level, _resetCoreForTests } from '../core.js';
+import { handleRead, Level, _resetCoreForTests, rederiveFinality } from '../core.js';
 import { salt, events, _setWitnessForTests, WITNESS_TTL_MS } from '../lineage.js';
 import { ARCHIVAL_RATE, ARCHIVAL_BURST, WALK_COST, CLIENT_BURST, counters } from '../governor.js';
 import {
@@ -689,4 +689,34 @@ test('an epoch boundary invalidates validator records by construction', async ()
   const next = await handleRead(call('getvalidator', [7]), o);
   assert.equal(next.cacheState, 'miss', 'an epoch boundary must invalidate, not a TTL');
   assert.ok(f.archival().length > before);
+});
+
+// ── Regression: the head's finalized CHECKPOINT is not a block verdict ──────
+//
+// `rederiveFinality` recomputes a BLOCK's `finalized` boolean from the fleet
+// witness. `getchaininfo` also has a `height`, and its `finalized` is the
+// chain's finalized checkpoint object `{epoch, root}`. The first version of the
+// guard tested only for `height`, so the head matched and the checkpoint was
+// overwritten with `false` — the dashboard rendered "Finalized epoch 0" while
+// the chain had finalized epoch 1,718. Caught by walking the routes, not by a
+// test, which is why there is one now.
+test('getchaininfo keeps its finalized checkpoint through the edge', () => {
+  const head = {
+    height: 34164,
+    slot: 55060,
+    epoch: 1720,
+    finalized_height: 34047,
+    justified: { epoch: 1719, root: 'aa' },
+    finalized: { epoch: 1718, root: 'bb' },
+  };
+  const out = rederiveFinality(head, Date.now());
+  assert.deepEqual(out.finalized, { epoch: 1718, root: 'bb' },
+    'the head checkpoint must survive: it is not a per-block verdict');
+  assert.deepEqual(out.justified, { epoch: 1719, root: 'aa' });
+});
+
+test('a block still gets its finality re-derived', () => {
+  const block = { height: 10, block_id: 'cc', finalized: true, finality: 'finalized' };
+  const out = rederiveFinality(block, Date.now());
+  assert.ok('finality_source' in out, 'a block verdict must still be recomputed');
 });
