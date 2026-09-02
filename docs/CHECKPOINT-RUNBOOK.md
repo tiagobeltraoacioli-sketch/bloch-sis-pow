@@ -522,7 +522,17 @@ reads two archival RPCs and writes nothing outside its workdir.
 
 **Unit:** `cargo test -p bloch-pos-node --bin bloch-pos ws_` — 37 tests
 covering the combination rules, the arrangement-clock bound, the duplicate-key
-arrangement, and the re-mint conflict above.
+arrangement, and the re-mint conflict above. The whole node binary is 161
+passed / 11 ignored.
+
+> **Profile note, so nobody repeats a wasted hour.** The ceremony changes are
+> all in `bloch-pos-node`; `crates/bloch-pos-committee/` is untouched. If you
+> nevertheless run the committee crate's suite, run it `--release`. In a debug
+> profile a single test there —
+> `beacon::tests::every_reveal_verifies_and_the_chain_walks_down_to_the_seed`,
+> which walks all 8,192 steps of a SHAKE-256 RANDAO chain — takes about a
+> minute unoptimized, and the 301-test suite takes tens of minutes. That is
+> slowness, not a hang, and it predates this work.
 
 Each refusal below was confirmed *by violation*: the named check was deleted,
 the suite was run to confirm exactly the paired test went red, and the check
