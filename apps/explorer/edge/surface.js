@@ -183,14 +183,42 @@ export const EDGE_SURFACE = [
     summary: 'the ASKED NODE pending count and price — not a chain fact',
   },
   {
+    name: 'getbuildinfo',
+    // NOT `epoch`, and not `content`: this is a property of the node that was
+    // asked, exactly like `getmempoolinfo`. Two upstreams answering differently
+    // is not a fork and is not an error — it is the finding. Corroborating it
+    // would average away the one thing it is for.
+    //
+    // It is also the reason this method is exposed rather than listed absent.
+    // Nine deployed upstreams answer -32601 to every version question, so a
+    // caller with only the public edge cannot learn which binary answered them
+    // at all. Hiding it here would keep that true after the node ships it.
+    cacheClass: CacheClass.NodeLocal,
+    cost: Cost.Cheap,
+    corroboration: 'none',
+    // Long for a node-local answer, because a build identity changes only when
+    // an operator restarts a node with a new binary — minutes-scale staleness
+    // is the honest resolution of the question and it keeps a poller off the
+    // consensus thread.
+    ttlMs: 60_000,
+    summary: 'the ASKED NODE build commit and consensus gate set — never the fleet',
+  },
+  {
     name: 'getcapabilities',
     cacheClass: CacheClass.Epoch,
     cost: Cost.Cheap,
     // Answered by the edge itself. Every one of the nine deployed upstreams
-    // returns -32601 for this name (measured 2026-09-01): it is in the repo's
-    // RPC_SURFACE at surface version 4.1.0 and in no running binary. Forwarding
-    // it would hand a caller a method-not-found for a method this edge does in
-    // fact implement.
+    // returns -32601 for this name (measured 2026-09-01, re-measured against
+    // both archivals the same day): it is in the repo's RPC_SURFACE — now at
+    // surface version 4.2.0 — and in no running binary. Forwarding it would
+    // hand a caller a method-not-found for a method this edge does in fact
+    // implement.
+    //
+    // `getbuildinfo` above is deliberately NOT handled this way, and the
+    // difference is the point. The edge can answer "what does this edge
+    // guarantee" out of its own knowledge; it cannot answer "which binary is
+    // that node running" for a node, and inventing an answer would be worse
+    // than the -32601 the upstream honestly gives until the fleet is rebuilt.
     corroboration: 'edge',
     ttlMs: 60_000,
     summary: 'what this EDGE guarantees; answered here, not forwarded',

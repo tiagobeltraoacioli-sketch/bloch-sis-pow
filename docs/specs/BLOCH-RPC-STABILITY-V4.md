@@ -264,8 +264,19 @@ Every name carries one, in `RPC_SURFACE` (`rpc.rs:765`) and in the
    `deprecated` in `getcapabilities`.
 
 Committed: `getbalance`, `getblockbyid`, `getblockbyslot`, `getblockcount`,
-`getcapabilities`, `getchaininfo`, `getmempoolinfo`, `gettxout`, `getvalidator`,
-`getvalidatorcount`, `sendrawtransaction`.
+`getbuildinfo`, `getcapabilities`, `getchaininfo`, `getmempoolinfo`, `gettxout`,
+`getvalidator`, `getvalidatorcount`, `sendrawtransaction`.
+
+`getbuildinfo` (added at 4.2.0) is committed on the same terms as the rest, with
+one property stated explicitly because it is unlike every other name here: its
+answer is **node-local**. Two nodes returning different `build_commit` or
+`gates_digest` values is not a fault and not a fork — it is the finding the
+method exists to surface. Its `gates_digest` is a necessary and **not
+sufficient** condition for consensus compatibility: it covers the SET of
+consensus gate constants, not the code behind them, so two nodes with identical
+digests can still derive different committees. That limit ships in the response
+itself (`gates_digest_does_not_prove`) so a client cannot read the digest
+without reading its bound.
 
 **`provisional`** — the name and its meaning hold; the response shape is not
 finished and **will** change inside this major version. Read the fields you
@@ -284,7 +295,17 @@ Refused: `gettransaction` (`-32005`), `getnewaddress` (`-32006`).
 
 ### 2.2 Versioning
 
-`getcapabilities.rpc_surface_version` — currently **`4.1.0`**.
+`getcapabilities.rpc_surface_version` — currently **`4.2.0`** (4.1.0 → 4.2.0:
+`getbuildinfo` added; minor, nothing an integrator already reads has moved).
+`getbuildinfo` reports the same string, so a client that cannot yet reach
+`getcapabilities` can still learn the surface version.
+
+**Namespace note.** This counter is a shared name and collides the same silent
+way a method name does. At the time `getbuildinfo` was written, separate
+in-flight work had also moved this constant to `4.2.0` for a different reason
+(the settlement retraction on `Finality`). Whichever lands second renumbers to
+`4.3.0` in the landing commit — two branches can both bump to 4.2.0 without a
+git conflict, and the result is one version string standing for two surfaces.
 
 | Bump | Means |
 |---|---|

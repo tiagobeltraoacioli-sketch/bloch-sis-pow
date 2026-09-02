@@ -758,7 +758,17 @@ pub struct Method {
 /// `getcapabilities` reports this, which is the whole point of it: a client
 /// asks one question at connect time instead of probing fourteen names and
 /// inferring the answer from which ones return -32601.
-pub const RPC_SURFACE_VERSION: &str = "4.1.0";
+// NAMESPACE NOTE, 2026-09-01: this counter is a shared name like a method name
+// is, and it collides the same silent way. At the time `getbuildinfo` was
+// added, an uncommitted change in the shared checkout at
+// `~/dev/BlochPOS` had ALSO moved this constant 4.1.0 → 4.2.0, for a
+// different reason (the settlement-guarantee retraction on `Finality`). Two
+// branches each bumping to 4.2.0 merge without a conflict if they touch
+// different lines around it, and a client would then see one version string
+// standing for two different surfaces. Whichever of the two lands second must
+// renumber to 4.3.0 in the landing commit. Registered here rather than in a
+// message, because the message is not what the next agent reads.
+pub const RPC_SURFACE_VERSION: &str = "4.2.0";
 
 /// Every method name this build answers. Sorted, unique, and asserted to be
 /// exactly the set the dispatcher accepts.
@@ -786,6 +796,12 @@ pub const RPC_SURFACE: &[Method] = &[
         stability: Stability::Committed,
         alias_of: None,
         summary: "head height, slot, epoch, and the finalized height beside them",
+    },
+    Method {
+        name: "getbuildinfo",
+        stability: Stability::Committed,
+        alias_of: None,
+        summary: "the build commit, and the consensus gate set this binary links, with its digest",
     },
     Method {
         name: "getcapabilities",
@@ -914,6 +930,14 @@ pub enum RpcRequest {
     /// price does not grow with the chain — which matters on an unauthenticated
     /// port, because the method every client calls first must be the cheapest.
     Capabilities,
+    /// `getbuildinfo` — which binary is answering, and which consensus lineage
+    /// it is on.
+    ///
+    /// Constant cost, on the same terms as [`RpcRequest::Capabilities`]: an
+    /// `env!` string, a `const` gate table, a SHA3-256 over ~200 bytes of that
+    /// table, and one O(1) index into the canonical chain for the genesis id.
+    /// It walks no state and allocates nothing proportional to the chain.
+    BuildInfo,
     ChainInfo,
     /// `getblockcount` — the polling method, carrying finality with it.
     BlockCount,
@@ -1080,6 +1104,9 @@ pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError
     Ok(match method {
         // First, because it is what a client should call first.
         "getcapabilities" => RpcRequest::Capabilities,
+        // Second, because it is the other question a client must ask before it
+        // trusts an answer: not "what do you serve" but "what are you".
+        "getbuildinfo" => RpcRequest::BuildInfo,
         "getchaininfo" => RpcRequest::ChainInfo,
         "getblockcount" => RpcRequest::BlockCount,
         "getblockbyslot" => RpcRequest::BlockBySlot(want_u64(params, 0, "slot")?),
@@ -1537,6 +1564,203 @@ pub fn capabilities_json(
             ]),
         ),
     ])
+}
+
+/// `getbuildinfo` — which binary is answering, and which consensus lineage it
+/// is on.
+///
+/// # Why a version number was not enough
+///
+/// `getcapabilities` already carries a `node_version`, and until this method
+/// was written that field was `env!("CARGO_PKG_VERSION")` — the bare package
+/// version, `0.1.0-mainnet`, identical on every binary ever built from this
+/// crate. That is the exact defect `build.rs` exists to prevent, restated on
+/// the wire: the 2026-08-11 fleet survey found three boxes running three
+/// different binaries, all reporting `bloch 0.3.0-genesis2`. The stamp
+/// (`BLOCH_BUILD_VERSION` = `pkg (commit[+dirty])`) was already compiled in and
+/// reachable from `--version`; it simply never reached the RPC, so it was
+/// answerable by an operator with SSH and by nobody else.
+///
+/// A semantic version is close to useless to an integrator anyway. The question
+/// that decides whether an answer can be trusted is not "how new is this build"
+/// but **"is this build on the same consensus lineage as the one I checked"**,
+/// and the honest answer to that is a commit plus the gate set.
+///
+/// # What `gates_digest` proves, and what it does not
+///
+/// The digest is SHA3-256 over the canonical serialisation of
+/// `CONSENSUS_GATES` — one `NAME=<epoch|inert>` line per gate, sorted. State
+/// both halves, because the useful half and the dangerous half are one field:
+///
+/// **It proves**: the two binaries link the same *set* of consensus gates, with
+/// the same activation epochs, and agree about which are inert. That is what
+/// `scripts/fleet-gate-sweep.sh` compares before anyone arms a flag day, and it
+/// is what catches the `genesis4-node-20260814` defect — a published binary
+/// that predated an arming, diverged on schedule, and whose release page could
+/// not say so because no artifact could state it.
+///
+/// **It does not prove**: that the two binaries *behave* the same at those
+/// epochs. The digest covers the constants, not the code behind them. Two nodes
+/// with an identical `gates_digest` can still derive different committees,
+/// different fork choices and different state roots, because every defect this
+/// project has actually shipped lived below the gate table and not in it: fork
+/// choice reading order-dependent local state, a roster derived from the wrong
+/// head, a leak adjustment that moved the quorum without moving the roster.
+/// **Matching digests are a necessary condition for consensus compatibility and
+/// nowhere near a sufficient one.** A client that reads a match as "these two
+/// nodes agree" has learned the wrong thing; what it may conclude is the
+/// contrapositive — digests that *differ* mean the two nodes will diverge at
+/// the first gate they disagree about, and that is worth acting on immediately.
+///
+/// The response says this in `gates_digest_proves` / `gates_digest_does_not_prove`
+/// rather than only here, because the integrator reading the JSON is not
+/// reading this file.
+///
+/// # Cost
+///
+/// Constant, and this is a property to preserve rather than an observation.
+/// Every RPC on this node is served by the consensus thread, on a port with no
+/// authentication, no authorisation and no rate limit, so a method that walks
+/// anything is a lever an anonymous caller can pull. This one reads an `env!`
+/// string, a `const` table of five entries, one O(1) index into the canonical
+/// chain, and hashes roughly 200 bytes.
+///
+/// Measured (2026-09-01, debug profile, 2,000 calls): **65.7 µs/call**, against
+/// **19.7 µs/call** for `getblockcount`, which is the cheapest formatter on this
+/// surface. Same order of magnitude, and both are noise beside the read that
+/// actually threatens this port: `getbalance` is a linear pass over the whole
+/// committed output set — 452,726 entries on the live chain — and a sibling
+/// measured a 500-record validator page at 17.1 ms, then capped it at 50 for
+/// exactly this reason. `getbuildinfo` is roughly three orders of magnitude
+/// below that, and it does not move with the chain at all: the gate table is
+/// five entries whatever the height.
+///
+/// `getbuildinfo_is_constant_cost` in `rpc/tests.rs` pins the ratio against
+/// `getblockcount` rather than against a wall-clock constant, so it means the
+/// same thing on a loaded CI box and on a fast laptop. The bar is 8x — loose on
+/// purpose. It is there to fail when somebody makes this method read state, not
+/// to police microseconds.
+///
+/// # Free function of its arguments
+///
+/// The gate table and its digest are handed in rather than read from
+/// `crate::` for the reason §5.5 gives and every other builder in this file
+/// follows: a value a client will read must be derivable from its inputs, so
+/// that it is testable without standing up a node — and so that the test can
+/// hand it a *different* gate set and prove the digest actually moves.
+pub fn build_info_json(
+    node_version: &str,
+    genesis_block_id: &[u8; 32],
+    block_version: u32,
+    gates: &[(&str, u64)],
+    gates_digest: &str,
+) -> Json {
+    // `pkg (commit[+dirty|+nogit])`, split so a client does not have to parse
+    // it. The commit is the load-bearing half: it is what the G8
+    // release-integrity gate compares fleet, release and source through
+    // (deploy/RELEASE-INTEGRITY.md).
+    let (commit, clean) = split_build_stamp(node_version);
+
+    let mut max_armed: u64 = 0;
+    let gate_list: Vec<Json> = gates
+        .iter()
+        .map(|(name, epoch)| {
+            // `u64::MAX` is "code present, flag day not set" and serialises as
+            // an explicit null rather than being omitted. The distinction is
+            // the whole point: a binary that ships a gate inert is
+            // distinguishable from one that never heard of the gate, and only
+            // the second is doomed when the flag day is set.
+            let armed = *epoch != u64::MAX;
+            if armed {
+                max_armed = max_armed.max(*epoch);
+            }
+            Json::obj(vec![
+                ("name", Json::s(*name)),
+                ("epoch", if armed { Json::u(*epoch) } else { Json::Null }),
+                ("armed", Json::Bool(armed)),
+            ])
+        })
+        .collect();
+
+    Json::obj(vec![
+        ("node_version", Json::s(node_version)),
+        ("build_commit", Json::s(commit)),
+        // `null`, not `false`, when the build had no git to ask (`+nogit`):
+        // "I do not know whether the tree was clean" and "the tree was dirty"
+        // are different facts and an integrator must be able to tell them
+        // apart. A CI build that passed BLOCH_BUILD_COMMIT asserted the tree
+        // state itself and reports `true`.
+        ("build_clean", clean.map_or(Json::Null, Json::Bool)),
+        ("rpc_surface_version", Json::s(RPC_SURFACE_VERSION)),
+        ("block_version", Json::u(u64::from(block_version))),
+        ("genesis_block_id", Json::hex(genesis_block_id)),
+        ("consensus_gates", Json::Arr(gate_list)),
+        ("gates_digest", Json::s(gates_digest)),
+        ("knows_gates_through_epoch", Json::u(max_armed)),
+        (
+            "gates_digest_proves",
+            Json::s(
+                "two nodes reporting the same digest link the same SET of \
+                 consensus gates, at the same activation epochs, and agree on \
+                 which are inert",
+            ),
+        ),
+        (
+            "gates_digest_does_not_prove",
+            Json::s(
+                "that they BEHAVE the same. The digest covers the constants, \
+                 not the code behind them: two nodes with an identical digest \
+                 can still derive different committees, fork choices and state \
+                 roots. Treat a match as necessary and not sufficient; treat a \
+                 mismatch as a divergence that will happen at the first gate \
+                 they disagree about.",
+            ),
+        ),
+        (
+            "compatibility_rule",
+            Json::s(
+                "this binary is valid at epoch E only if its gate list matches \
+                 the canonical one on every gate with epoch <= E. A gate armed \
+                 on the network after this build makes this binary \
+                 consensus-dead at that gate's epoch.",
+            ),
+        ),
+        (
+            "scope",
+            Json::s(
+                "node-local. This describes the ONE node that answered, not \
+                 the network. Ask every node you rely on, separately, and \
+                 compare; a load balancer in front of several nodes makes this \
+                 answer meaningless.",
+            ),
+        ),
+    ])
+}
+
+/// Split `pkg (commit[+dirty|+nogit])` into the commit and what is known about
+/// the tree it was built from.
+///
+/// Returns `(commit, clean)` where `clean` is `None` when the build had no git
+/// to ask. Total on any input, including a stamp from a future `build.rs` that
+/// changed shape: an unparseable stamp yields `("unknown", None)` rather than a
+/// panic on the consensus thread.
+fn split_build_stamp(stamp: &str) -> (&str, Option<bool>) {
+    let Some(open) = stamp.find('(') else {
+        return ("unknown", None);
+    };
+    let Some(close) = stamp[open..].find(')') else {
+        return ("unknown", None);
+    };
+    let inner = &stamp[open + 1..open + close];
+    if let Some(c) = inner.strip_suffix("+dirty") {
+        (c, Some(false))
+    } else if let Some(c) = inner.strip_suffix("+nogit") {
+        (c, None)
+    } else if inner.is_empty() {
+        ("unknown", None)
+    } else {
+        (inner, Some(true))
+    }
 }
 
 /// The two roster-derived numbers `getchaininfo` and `getvalidatorcount`

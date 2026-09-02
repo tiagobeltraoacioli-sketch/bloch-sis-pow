@@ -2043,9 +2043,29 @@ impl Engine {
             // observe a half-applied block — but it is the only method here
             // whose cost does not grow with the chain.
             RpcRequest::Capabilities => Ok(rpc::capabilities_json(
-                env!("CARGO_PKG_VERSION"),
+                // `BLOCH_BUILD_VERSION`, not `CARGO_PKG_VERSION`. This field
+                // used to be the bare package version — `0.1.0-mainnet`,
+                // byte-identical on every binary ever built from this crate —
+                // which made the one RPC field named "version" the one field
+                // that could not distinguish two builds. That is precisely the
+                // failure `build.rs` was written to prevent (three boxes, three
+                // binaries, all reporting `bloch 0.3.0-genesis2`, 2026-08-11);
+                // the stamp existed and simply never reached the wire.
+                env!("BLOCH_BUILD_VERSION"),
                 self.chain[0].1.as_bytes(),
                 VERSION_G4,
+            )),
+
+            // Same terms as `Capabilities`: constants, one O(1) index into the
+            // canonical chain, and a SHA3-256 over ~200 bytes. It crosses the
+            // engine channel like every other method so there is exactly one
+            // path into this state, but its cost does not grow with the chain.
+            RpcRequest::BuildInfo => Ok(rpc::build_info_json(
+                env!("BLOCH_BUILD_VERSION"),
+                self.chain[0].1.as_bytes(),
+                VERSION_G4,
+                &crate::CONSENSUS_GATES,
+                &crate::consensus_gates_digest(),
             )),
 
             RpcRequest::ChainInfo => {

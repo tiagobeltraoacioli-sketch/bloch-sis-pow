@@ -151,6 +151,27 @@ division of labour is deliberate and integrators should be told both halves:
 | covers | methods, fields, error codes, limits, auth, transport | fees, capacity, gates, cadence |
 | staleness | impossible — the node describes itself | prevented by CI |
 
+**Correction, 2026-09-01.** "Staleness impossible — the node describes itself"
+was true of the design and false of the deployment, and the difference cost an
+integrator real time. `getcapabilities` answers `-32601` on every node running
+today, including both public archivals and the published `g4-node-20260901`
+binary; it exists only on an unreleased branch. A method that describes the
+running binary describes nothing until the binary runs it. The row above is
+correct **for a node that serves the method** and is not a claim about the
+fleet — see the Integration Book §3.1, where the instruction to call it at
+connect time has been withdrawn until it ships.
+
+The same measurement produced the harder finding: **no deployed node exposes any
+version method at all**, so neither an integrator nor we could tell which binary
+any node was running. That is what `getbuildinfo` is for, and it makes the table
+above a three-way split rather than a two-way one:
+
+| | `getcapabilities` | `getbuildinfo` | this discipline |
+|---|---|---|---|
+| answers | "what does this node serve?" | "**what is** this node?" | "what do the numbers mean?" |
+| source | the running binary | the running binary's build stamp and gate table | the constants, pinned by tests |
+| scope | the node asked | the node asked — node-local, never the fleet | the network |
+
 A client should branch on `getcapabilities` at connect time and never on this
 document's method tables. This document owns the arithmetic, which
 `getcapabilities` deliberately does not carry: a node cannot tell you what its
@@ -158,11 +179,21 @@ fee constants *will be* after a flag day.
 
 `selfcheck` is the offline half of the same idea — it asserts the frozen
 parameters agree with each other at startup, so a binary built with an
-inconsistent parameter set refuses to run rather than forking. When
-`selfcheck --json` lands, its output becomes the third leg: `getcapabilities`
-for the wire surface, `selfcheck --json` for the parameter set the binary was
-built with, and this document plus its test file for what those parameters
-mean to somebody building a transaction. **Do not duplicate the parameter dump
+inconsistent parameter set refuses to run rather than forking. `selfcheck
+--json` now exists and emits the gate table and its digest — but only to
+somebody with a shell on the box, which is an operator and never an integrator.
+`getbuildinfo` puts the same statement on the wire, which is the half that was
+missing: `getcapabilities` for the wire surface, `getbuildinfo` /
+`selfcheck --json` for the consensus lineage the binary was built on, and this
+document plus its test file for what those parameters mean to somebody building
+a transaction.
+
+**State the digest's bound wherever the digest is quoted.** `gates_digest`
+covers the SET of consensus gate constants and not the behaviour behind them.
+Two nodes with identical digests can still derive different committees, fork
+choices and state roots — every consensus defect this chain has shipped lived
+below the gate table. Publish a match as necessary-not-sufficient; publish a
+mismatch as a divergence that is going to happen. **Do not duplicate the parameter dump
 into the Integration Book.** Point at `selfcheck --json` and keep the book to
 the parts a machine cannot emit: the derivations, the caveats and the reachable
 / unreachable distinction.

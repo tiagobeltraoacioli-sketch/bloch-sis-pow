@@ -88,6 +88,7 @@ test('the edge method namespace is frozen', () => {
     'getblockbyid',
     'getblockbyslot',
     'getblockcount',
+    'getbuildinfo',
     'getcapabilities',
     'getchaininfo',
     'getmempoolinfo',
@@ -226,5 +227,44 @@ test('mempool is declared node-local, matching the node own words', () => {
     SOURCE.includes('node-local, not consensus'),
     "rpc.rs no longer calls getmempoolinfo node-local; the edge's `node_local` " +
       'corroboration level is derived from that claim',
+  );
+});
+
+test('build identity is node-local and is never corroborated away', () => {
+  // The correctness property of this one method, pinned separately because it
+  // is the opposite of every other read here. Everything else on this edge is a
+  // chain fact, and two upstreams disagreeing about a chain fact is a fork. Two
+  // upstreams disagreeing about which binary they run is not a fault at all —
+  // it is the answer, and it is the answer this edge exists to stop hiding.
+  // As of 2026-09-01 nothing on the wire can reveal it: every deployed node
+  // answers -32601 to every version question, and that -32601 is also what the
+  // published g4-node-20260901 binary gives, so it dates nothing.
+  //
+  // So if this method is ever given `corroboration: 'quorum'`, the edge would
+  // report a mismatch as an error and serve nothing, which converts the finding
+  // back into the silence.
+  const m = methodSpec('getbuildinfo');
+  assert.ok(m, 'getbuildinfo must be exposed; a caller with only the public edge ' +
+    'otherwise has no way to learn which binary answered them');
+  assert.equal(m.corroboration, 'none');
+  assert.equal(m.cacheClass, CacheClass.NodeLocal);
+  assert.equal(m.cost, Cost.Cheap, 'the second method every client calls must not be priced as a walk');
+  assert.ok(/ASKED NODE/.test(m.summary), 'the summary must say whose build it is');
+});
+
+test('the node source still carries the digest limit beside the digest', () => {
+  // `gates_digest` is the field most likely to be over-read: matching digests
+  // are necessary for consensus compatibility and nowhere near sufficient,
+  // because the digest covers the SET of consensus constants and not the code
+  // behind them. Two nodes with identical digests can still derive different
+  // committees. If the node ever ships the digest without shipping that
+  // sentence next to it, this fails.
+  assert.ok(
+    SOURCE.includes('gates_digest_does_not_prove'),
+    'rpc.rs publishes gates_digest without publishing its limit beside it',
+  );
+  assert.ok(
+    SOURCE.includes('build_commit'),
+    'the build commit is the load-bearing half of build identity and has left rpc.rs',
   );
 });

@@ -92,7 +92,9 @@ this: functions that are public, fully tested, and unreachable.
 And one that will not break your client but should shape your credit policy:
 **`finalized` is not currently guaranteed to be the same value on every node.**
 Read it from two independent nodes and require agreement. See §5.3 — it is the
-most important risk disclosure in this document.
+most important risk disclosure in this document, and read the caveat under it
+on what "two independent nodes" is currently worth, which is less than it
+sounds.
 
 ---
 
@@ -216,19 +218,109 @@ These are not defaults you can tune; they are what the server does.
 `sendrawtransaction` is a write on an unauthenticated port. Bind to loopback
 and put your own proxy in front of it. Do not expose it.
 
-### 3.1 `getcapabilities` — ask the node, not this document
+### 3.1 `getcapabilities` — `[UNRELEASED]`. Do not call it yet.
 
-Call this first. It returns the method table, the deliberately absent names,
-the error-code table, the limits above, and `rpc_surface_version` — from the
-running binary, so it cannot be stale the way a document can.
+**Correction, 2026-09-01.** A previous revision of this document, and item 1 of
+the §11 checklist, told you to call `getcapabilities` at connect time. **That
+instruction fails on every node you can reach today.** We measured it rather
+than assuming it:
 
-**Branch your client on `getcapabilities`, not on the tables in this
-document.** This document exists to explain what the numbers mean and what is
-not there; the node itself is the authority on what it serves.
+| Endpoint | `getcapabilities` |
+|---|---|
+| archival `139.180.166.5:8080` | `-32601 method not found` |
+| archival `139.180.173.231:8080` | `-32601 method not found` |
+| all nine RPC upstreams behind our public edge | `-32601 method not found` |
+| published binary `g4-node-20260901` (`7a83ca89`) | the method is not in its source at all |
 
-`rpc_surface_version` is currently `4.1.0` and moves under semver: major for a
-removal or a breaking change, minor for an added method or field, patch for
-wording.
+The method is real, implemented and tested — on an **unreleased branch**. It is
+not in the tag you downloaded. The document described the repository and called
+it the wire, which is the same error §0.1 already records twice, made a third
+time; our apology for the wasted integration time.
+
+**What to do instead, today.** Treat this document's §3 tables as the surface,
+and probe nothing. When you get `-32601` for `getcapabilities`, that is the
+expected answer and not a sign of a misconfigured endpoint.
+
+**And do not use that `-32601` to date a node.** It is tempting to read a
+method-not-found as "this endpoint is behind" — it is not. `getcapabilities` is
+absent from the source of the published `g4-node-20260901` binary, absent from
+`main`, and absent from the binary the fleet runs; it exists on one unreleased
+branch. A node on the newest thing we have published and a node that has not
+been restarted in months return the same `-32601`. The answer is consistent with
+every generation and identifies none, which is precisely why §3.1.1 exists.
+
+**What it will do when it lands.** It returns the method table with a stability
+class per method, the deliberately absent names with the reason for each, the
+error-code table, the limits above, and `rpc_surface_version` — from the running
+binary, so it cannot be stale the way a document can. At that point, branch on
+it rather than on §3. `rpc_surface_version` is `4.2.0` on the branch and moves
+under semver: major for a removal or a breaking change, minor for an added
+method or field, patch for wording.
+
+**One place it already works.** Our public explorer edge
+(`blochl1.com`, `posternlabs.com`) answers `getcapabilities` **itself**, out of
+its own knowledge, without forwarding it. That answer describes *the edge's*
+guarantees — its cache classes, its corroboration rules — and is not a
+statement about any node. Do not read it as one.
+
+### 3.1.1 `getbuildinfo` — which binary, and which consensus lineage — `[UNRELEASED]`
+
+Also on the unreleased branch, and named here because it is the answer to a
+question this document could not previously answer at all: **which binary is
+the node I am talking to running?**
+
+Until it lands, there is no way to tell. No deployed node exposes any version
+method — `getcapabilities`, `getbuildinfo` and `getversion` all return `-32601`
+on both public archivals (measured 2026-09-01). The `node_version` field inside
+`getcapabilities` did not help either: on the branch it was the bare package
+version, `0.1.0-mainnet`, byte-identical on every binary ever built from this
+crate. That is fixed in the same change.
+
+```json
+{"node_version":"0.1.0-mainnet (46133196f0a1)",
+ "build_commit":"46133196f0a1",
+ "build_clean":true,
+ "rpc_surface_version":"4.2.0",
+ "block_version":2969567237,
+ "genesis_block_id":"…",
+ "consensus_gates":[
+   {"name":"BLOCK_BYTES_V2_ACTIVATION_EPOCH","epoch":800,"armed":true},
+   {"name":"LEAKED_ROSTER_ACTIVATION_EPOCH","epoch":1400,"armed":true},
+   {"name":"LEAK_RECOVERY_ACTIVATION_EPOCH","epoch":null,"armed":false}, …],
+ "gates_digest":"…",
+ "knows_gates_through_epoch":1400,
+ "gates_digest_proves":"…", "gates_digest_does_not_prove":"…",
+ "compatibility_rule":"…", "scope":"node-local …"}
+```
+
+`build_commit` is the field that matters. A semantic version does not identify a
+binary on this chain — the 2026-08-11 fleet survey found three boxes running
+three different binaries, all reporting the same version string — and what you
+actually need to know is not how new a node is but **whether it is on the same
+consensus lineage as the node you checked yesterday.**
+
+`build_clean` is `true`, `false` (built from a modified tree) or `null` (the
+build had no git to ask, e.g. a container). `null` and `false` are different
+facts; do not collapse them.
+
+**`gates_digest`, and its limit.** The digest is SHA3-256 over the sorted list
+of consensus gates and their activation epochs. Read both halves of what it
+means, because the useful half and the dangerous half are the same field:
+
+- **It proves**: two nodes reporting the same digest link the same *set* of
+  consensus gates, at the same epochs, and agree on which are inert. Digests
+  that **differ** mean those two nodes will diverge at the first gate they
+  disagree about. Act on a mismatch immediately.
+- **It does not prove**: that the two nodes *behave* the same. The digest covers
+  the constants, not the code behind them. **Two nodes with an identical
+  `gates_digest` can still derive different committees, different fork choices
+  and different state roots.** Every consensus defect this chain has actually
+  shipped lived below the gate table, not in it. A match is necessary for
+  compatibility and nowhere near sufficient.
+
+`scope` says `node-local`: the answer describes the one node that replied. If
+you put a load balancer in front of several nodes, this answer is meaningless —
+ask each node on its own address.
 
 ### 3.2 `getchaininfo` — chain head and settlement state
 
@@ -537,6 +629,34 @@ revision did not carry it at all.
 them to agree before you credit.** Our own public RPC front end does exactly
 this internally — it refuses a read unless two nodes concur — and an integrator
 crediting from a single node has weaker assurance than we give ourselves.
+
+> **Caveat added 2026-09-01, and it bounds the rule above.** "Two independent
+> nodes" is only worth what the independence is worth, and today **that is not
+> checkable — by you or by us.**
+>
+> The rule assumes the two nodes you poll are two different things. Nothing on
+> the wire establishes that. No node deployed today exposes any version method:
+> `getcapabilities`, `getbuildinfo` and `getversion` all answer `-32601` on both
+> of our public archivals (measured 2026-09-01). And that `-32601` is not itself
+> evidence of anything, which is the sharper half of the finding — **the
+> published `g4-node-20260901` binary does not contain `getcapabilities` in its
+> source at all**, so a node running the current release and a node running
+> something years older give the identical answer. The observation is consistent
+> with every generation and distinguishes none.
+>
+> So the two-node rule we gave you is, as of this revision, **unfalsifiable over
+> the RPC**: there is no query whose result could show that your two nodes are
+> the same build, and therefore none that could show the rule is being satisfied.
+> Two nodes on one build are two copies of one opinion — they agree with each
+> other by construction, and would go on agreeing while both were wrong.
+>
+> Until `getbuildinfo` (§3.1.1) ships and you can compare `build_commit` and
+> `gates_digest` across the nodes you poll, prefer **one of our archivals plus a
+> node you run yourself** over two of ours: you at least know the provenance of
+> one of them. Treat agreement between two endpoints you cannot tell apart as
+> weaker evidence than it looks. This does not weaken §5.4's separate warning:
+> two nodes still do not protect you from a finality rewind, because both rewind
+> independently.
 
 Here is why, precisely.
 
@@ -1021,7 +1141,12 @@ its pin moves into `integration_book_claims.rs` in the same commit.
 
 ## 11. Integration checklist
 
-- [ ] Call `getcapabilities` at connect time and branch on it, not on §3
+- [ ] ~~Call `getcapabilities` at connect time and branch on it, not on §3~~
+      **WITHDRAWN 2026-09-01 — this call fails on every node deployed today**
+      (`-32601` on both public archivals and all nine of our upstreams; the
+      method is not in the published `g4-node-20260901` binary at all). Branch
+      on §3's tables until §3.1 says otherwise. Do not treat the `-32601` as a
+      fault on your side.
 - [ ] Parse all amounts as big integers from decimal strings
 - [ ] Derive `script_hash` per §4.2 — **48 hex characters follow the prefix**,
       take the first 40 — and verify it against the echo in the first response
@@ -1035,6 +1160,15 @@ its pin moves into `integration_book_claims.rs` in the same commit.
 - [ ] Credit on `finalized` from `getchaininfo`; budget 2–3 epochs
 - [ ] Require **two independent nodes to agree** on the finalized root before
       crediting — disagreement is a hold, not a retry (§5.3)
+- [ ] Check that those two nodes are actually two: compare `build_commit` and
+      `gates_digest` from `getbuildinfo` (§3.1.1) once it ships. **Until then
+      the two-node rule is unfalsifiable over the RPC** — no deployed node
+      answers any version query, and the `-32601` it gives you is also what the
+      current release gives, so it distinguishes nothing. Prefer one of ours
+      plus one of yours (§5.3)
+- [ ] Do **not** read matching `gates_digest` values as "these nodes agree".
+      The digest covers the consensus constants, not the behaviour behind them
+      (§3.1.1)
 - [ ] Credit at a **depth margin past** finality, not at the boundary, and
       re-verify with `gettxout` before releasing funds — `finalized` can move
       backwards and two nodes do not protect you from that (§5.4)

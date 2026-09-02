@@ -602,6 +602,7 @@ fn the_rpc_method_namespace_is_frozen() {
         "getblockbyid",
         "getblockbyslot",
         "getblockcount",
+        "getbuildinfo",
         "getcapabilities",
         "getchaininfo",
         "getmempoolinfo",
@@ -1493,4 +1494,164 @@ fn a_body_split_across_packets_is_reassembled() {
     let _ = sock.read_to_string(&mut out);
     assert!(out.starts_with("HTTP/1.1 200"), "got {out}");
     assert_eq!(spy.last(), Some(RpcRequest::BlockBySlot(41_290)));
+}
+
+// ─── `getbuildinfo` — which binary, and which consensus lineage ─────────────
+
+/// A gate set to hand `build_info_json`, with one armed and one inert.
+///
+/// Deliberately NOT `crate::CONSENSUS_GATES`: the point of taking the table as
+/// an argument is that the test can hand it a set the binary does not link, and
+/// so can prove the response is a function of its input rather than a constant
+/// that happens to look right today.
+const FIXTURE_GATES: &[(&str, u64)] = &[
+    ("ALPHA_ACTIVATION_EPOCH", 800),
+    ("BRAVO_ACTIVATION_EPOCH", 1_400),
+    ("CHARLIE_ACTIVATION_EPOCH", u64::MAX),
+];
+
+#[test]
+fn getbuildinfo_routes_and_reports_the_build_and_the_gate_set() {
+    let spy = Spy::new();
+    call(spy.as_ref(), &request("getbuildinfo", "[]"));
+    assert_eq!(spy.last(), Some(RpcRequest::BuildInfo));
+
+    let genesis = [0x11u8; 32];
+    let v = build_info_json(
+        "0.1.0-mainnet (46133196f0a1)",
+        &genesis,
+        0xB10C_0005,
+        FIXTURE_GATES,
+        "d00dfeed",
+    );
+
+    // The commit, split out so a client does not parse the stamp itself. This
+    // is the field the whole method exists for: `node_version` alone was the
+    // bare package version and identical on every build.
+    assert_eq!(v.get("node_version"), Some(&Json::s("0.1.0-mainnet (46133196f0a1)")));
+    assert_eq!(v.get("build_commit"), Some(&Json::s("46133196f0a1")));
+    assert_eq!(v.get("build_clean"), Some(&Json::Bool(true)));
+
+    assert_eq!(v.get("gates_digest"), Some(&Json::s("d00dfeed")));
+    assert_eq!(v.get("block_version"), Some(&Json::u(0xB10C_0005)));
+    assert_eq!(v.get("genesis_block_id"), Some(&Json::hex(&genesis)));
+    assert_eq!(v.get("rpc_surface_version"), Some(&Json::s(RPC_SURFACE_VERSION)));
+
+    // The highest ARMED epoch. An inert gate must not raise it: a binary that
+    // ships a gate at `u64::MAX` knows the gate exists, not the flag day.
+    assert_eq!(v.get("knows_gates_through_epoch"), Some(&Json::u(1_400)));
+
+    let Some(Json::Arr(gates)) = v.get("consensus_gates") else { panic!("no gate list") };
+    assert_eq!(gates.len(), FIXTURE_GATES.len());
+    assert_eq!(gates[0].get("epoch"), Some(&Json::u(800)));
+    assert_eq!(gates[0].get("armed"), Some(&Json::Bool(true)));
+    // Inert is an explicit null plus `armed: false`, never an omission. A
+    // binary that ships a gate inert must be distinguishable from one that
+    // never heard of the gate — only the second is doomed at the flag day.
+    assert_eq!(gates[2].get("name"), Some(&Json::s("CHARLIE_ACTIVATION_EPOCH")));
+    assert_eq!(gates[2].get("epoch"), Some(&Json::Null));
+    assert_eq!(gates[2].get("armed"), Some(&Json::Bool(false)));
+}
+
+/// The digest's limit is published beside the digest, not only in a comment.
+///
+/// This is the field that stops a matching digest from being read as "these two
+/// nodes agree". It does not, and every consensus defect this project has
+/// actually shipped lived below the gate table rather than in it.
+#[test]
+fn the_digest_publishes_what_it_does_not_prove() {
+    let v = build_info_json("x (abc)", &[0u8; 32], 0, FIXTURE_GATES, "deadbeef");
+
+    let Some(Json::Str(neg)) = v.get("gates_digest_does_not_prove") else {
+        panic!("the digest must ship with its own limit; a client reading only \
+                `gates_digest` would conclude two nodes agree, which it does not show")
+    };
+    assert!(neg.contains("committees"), "the limit must name the concrete failure: {neg}");
+    assert!(
+        v.get("gates_digest_proves").is_some(),
+        "and the positive half, so the field is usable rather than merely hedged"
+    );
+    // Node-local, said on the wire. A caller behind a load balancer in front of
+    // several nodes is reading a random node's identity and must be told.
+    let Some(Json::Str(scope)) = v.get("scope") else { panic!("no scope") };
+    assert!(scope.contains("node-local"), "{scope}");
+}
+
+/// `+dirty`, `+nogit` and a clean build are three different facts.
+#[test]
+fn the_build_stamp_splits_into_commit_and_tree_state() {
+    assert_eq!(split_build_stamp("0.1.0 (abc123)"), ("abc123", Some(true)));
+    assert_eq!(split_build_stamp("0.1.0 (abc123+dirty)"), ("abc123", Some(false)));
+    // `+nogit` is `None`, not `false`: "the tree was dirty" and "there was no
+    // git to ask" are different, and a container build is the second.
+    assert_eq!(split_build_stamp("0.1.0 (abc123+nogit)"), ("abc123", None));
+    // Total on nonsense rather than panicking on the consensus thread.
+    assert_eq!(split_build_stamp("0.1.0"), ("unknown", None));
+    assert_eq!(split_build_stamp("0.1.0 (abc"), ("unknown", None));
+    assert_eq!(split_build_stamp("0.1.0 ()"), ("unknown", None));
+    assert_eq!(split_build_stamp(""), ("unknown", None));
+}
+
+/// The method must stay constant-cost, because the port has no rate limit.
+///
+/// Every RPC here is served by the consensus thread, on a port with no
+/// authentication and no rate limiting, so an anonymous caller chooses how much
+/// work the chain does. `getbuildinfo` is the second method every client calls,
+/// so it must be in the same price class as `getblockcount` — not in the
+/// class of `getbalance`, which is a linear walk of the whole committed output
+/// set.
+///
+/// The comparison is against another method in this process rather than against
+/// a wall-clock constant, so the test says something on a loaded CI box and on
+/// a fast laptop alike. The bar is deliberately loose (8x): it is there to fail
+/// when somebody makes this method read state, not to police microseconds.
+#[test]
+fn getbuildinfo_is_constant_cost() {
+    use std::time::Instant;
+
+    let genesis = [0x11u8; 32];
+    const N: u32 = 2_000;
+
+    // Warm both paths first; the first call of either allocates its `Vec`s.
+    let _ = build_info_json("v (abc)", &genesis, 0, FIXTURE_GATES, "d");
+    let _ = block_count_json(1, 1, Some(1), 1, 1);
+
+    let t0 = Instant::now();
+    for _ in 0..N {
+        std::hint::black_box(build_info_json(
+            std::hint::black_box("0.1.0-mainnet (46133196f0a1)"),
+            &genesis,
+            0xB10C_0005,
+            FIXTURE_GATES,
+            "cafebabe",
+        ));
+    }
+    let build = t0.elapsed();
+
+    let t1 = Instant::now();
+    for _ in 0..N {
+        std::hint::black_box(block_count_json(
+            std::hint::black_box(34_448),
+            std::hint::black_box(55_344),
+            Some(34_367),
+            1_729,
+            1_728,
+        ));
+    }
+    let baseline = t1.elapsed();
+
+    println!(
+        "getbuildinfo {:?}/call vs getblockcount {:?}/call over {N} calls",
+        build / N,
+        baseline / N
+    );
+    assert!(
+        build < baseline * 8,
+        "getbuildinfo has left the constant-cost class: {:?}/call against a \
+         {:?}/call baseline. Every method here runs on the consensus thread on \
+         an unauthenticated, unmetered port; a method every client calls at \
+         connect time must not walk state.",
+        build / N,
+        baseline / N,
+    );
 }
