@@ -123,6 +123,19 @@ const UTXO_PAGE_MAX: usize = 1_000;
 // | `-32005` | `NO_TRANSACTION_INDEX`   | This build cannot look a transaction up by id — see [`RpcError::no_transaction_index`]. Not a transient failure. |
 // | `-32006` | `NO_WALLET`              | This node holds no wallet and mints no addresses — see [`RpcError::no_wallet`]. Not a transient failure. |
 // | `-32007` | `SLOT_EMPTY`             | The slot exists and carries no canonical block. **Normal under PoS** (a missed proposal); advance to the next slot. |
+// | `-32008` | `TX_REFUSED`             | The node judged these BYTES invalid on their merits. **Terminal**: never resubmit them. Carries no `error.data`. |
+// | `-32009` | `TX_REFUSED_RETRYABLE`   | The transaction was barred against a **state**, not condemned on its bytes. **Retryable**: `error.data.until_slot` says from which slot. |
+//
+// ## `error.data`
+//
+// JSON-RPC 2.0 §5.1 allows an `error.data` member, and this surface uses it for
+// exactly one thing: a value a client must ACT on that would otherwise exist
+// only inside the English message. A retry deadline is the whole example — a
+// client that has to regex `until slot 4242` out of a sentence is a client that
+// breaks the next time the sentence is reworded, and the wording is explicitly
+// the part of this contract that may change. `data` is OPTIONAL and absent on
+// every code above except `-32009`: a client that ignores it still reads a
+// correct `code` and `message`.
 
 /// No block with that id is known to this node.
 pub const BLOCK_NOT_FOUND: i64 = -32000;
@@ -144,20 +157,99 @@ pub const SLOT_EMPTY: i64 = -32007;
 /// The node refused a submitted transaction on its merits — it was judged
 /// invalid, not deferred. Distinct from [`MEMPOOL_FULL`] because the client's
 /// correct response is opposite: never resubmit these bytes.
+///
+/// **Terminal, and only terminal.** This code is published to integrators with
+/// that meaning, so it must never come to mean "try again later" for some
+/// subset of its causes: a client branching on the number alone would then be
+/// wrong for half of them, which is worse than having no code at all. Any
+/// refusal that time can lift belongs to [`TX_REFUSED_RETRYABLE`] — which is
+/// exactly the split this constant used to be missing: `Refusal::Invalid` and
+/// `Refusal::PreviouslyRefused` both landed here, distinguishable only by
+/// reading the English message.
 pub const TX_REFUSED: i64 = -32008;
+
+/// A submitted transaction was barred **against a state**, not condemned on
+/// its bytes — so the bar lifts on its own, and the answer says when.
+///
+/// # Why this is a second code rather than a second message
+///
+/// [`TX_REFUSED`] (-32008) is a verdict on the bytes: no passage of time
+/// changes an unverifiable signature, so the only correct client behaviour is
+/// to stop. A transaction can also be turned away for a reason that is true
+/// *now* and false later — this node's own proposer watched the transition
+/// refuse it against the current branch, most often because it spends an
+/// output this branch does not have yet. The engine bars those bytes for
+/// `REJECTION_TTL_SLOTS` (128 slots, ~64 minutes) and then admits them again
+/// with no further action from anyone.
+///
+/// That is the opposite advice, and a client that reads only the code cannot
+/// tell the two apart if they share one number. It is not a hypothetical: our
+/// own published integration guidance says never to resubmit after -32008, so
+/// an exchange following it permanently abandons transactions the node would
+/// have taken an hour later.
+///
+/// The deadline rides in `error.data.until_slot` rather than only in the
+/// message, because "retry after slot N" is a value a client must compute
+/// with, and the messages on this surface are explicitly allowed to be
+/// reworded while the codes are not.
+pub const TX_REFUSED_RETRYABLE: i64 = -32009;
 
 /// A JSON-RPC error object: a code a client can branch on and a message a human
 /// can act on. Both halves are required — a bare code makes an operator read
 /// this source file, and a bare message makes a client parse English.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// The optional third member is `data` (JSON-RPC 2.0 §5.1): a machine-readable
+/// companion to the message, for the cases where the message contains a value
+/// the client has to act on. It is `None` for every error here except
+/// [`TX_REFUSED_RETRYABLE`], and a client that never looks at it is still a
+/// correct client.
+///
+/// `Eq` is gone from the derive list because [`Json`] holds numbers as their
+/// raw source text and derives only `PartialEq`. Nothing compares `RpcError`
+/// for `Eq`; the codes and messages compare exactly as before.
+#[derive(Clone, Debug, PartialEq)]
 pub struct RpcError {
     pub code: i64,
     pub message: String,
+    /// Structured detail, serialised as `error.data`. Omitted from the wire
+    /// object entirely when `None` — never emitted as `null`, which a client
+    /// would have to distinguish from "absent".
+    pub data: Option<Json>,
 }
 
 impl RpcError {
     pub fn new(code: i64, message: impl Into<String>) -> Self {
-        RpcError { code, message: message.into() }
+        RpcError { code, message: message.into(), data: None }
+    }
+
+    /// Attach structured detail to an error, to be emitted as `error.data`.
+    pub fn with_data(mut self, data: Json) -> Self {
+        self.data = Some(data);
+        self
+    }
+
+    /// [`TX_REFUSED_RETRYABLE`]: barred until `until_slot`, then admissible
+    /// again — with the deadline in `data` where a client can read it.
+    ///
+    /// The wire shape is fixed:
+    ///
+    /// ```text
+    /// "data": { "retryable": true, "until_slot": 4242 }
+    /// ```
+    ///
+    /// `retryable` is redundant with the code and is there on purpose: it is
+    /// the one field a generic client can branch on without a table of Bloch
+    /// error numbers, and it is what keeps "did I get the retryable one?" from
+    /// being answered by string-matching the message.
+    ///
+    /// `until_slot` is a JSON number, not a string: it is a slot index, and
+    /// slot indexes are nowhere near the 2^53 boundary that makes this module
+    /// render satoshis as strings (see [`Json::sat`]).
+    pub fn tx_refused_retryable(until_slot: u64, detail: impl Into<String>) -> Self {
+        Self::new(TX_REFUSED_RETRYABLE, detail.into()).with_data(Json::obj(vec![
+            ("retryable", Json::Bool(true)),
+            ("until_slot", Json::u(until_slot)),
+        ]))
     }
 
     /// -32700: the body was not JSON.
@@ -689,6 +781,11 @@ fn hex32_from(s: &str) -> Option<[u8; 32]> {
 /// has already been decided.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RpcRequest {
+    /// `getnodeversion` — which binary is answering.
+    ///
+    /// Constant: every field is an `env!` fixed at compile time, so it walks no
+    /// state and cannot be used as a lever on the consensus thread.
+    NodeVersion,
     ChainInfo,
     /// `getblockcount` — the polling method, carrying finality with it.
     BlockCount,
@@ -847,12 +944,16 @@ fn want_hex32(params: Option<&Json>, pos: usize, name: &str) -> Result<[u8; 32],
 /// - `getnewaddress` — **refused**, with [`RpcError::no_wallet`]. A node RPC
 ///   does not mint key material, and no address format is frozen.
 ///
+/// Beside them, `getnodeversion` answers a question this surface could not
+/// answer at all before: **which binary is this?** See [`node_version_json`].
+///
 /// The refusals are routed here, as methods that exist and answer, rather than
 /// left to fall through to `method not found`. The distinction is the whole
 /// point: "this node cannot do that, here is why, do not retry" is actionable,
 /// and "no such method" would send an integrator looking for a newer build.
 pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError> {
     Ok(match method {
+        "getnodeversion" => RpcRequest::NodeVersion,
         "getchaininfo" => RpcRequest::ChainInfo,
         "getblockcount" => RpcRequest::BlockCount,
         "getblockbyslot" => RpcRequest::BlockBySlot(want_u64(params, 0, "slot")?),
@@ -930,17 +1031,26 @@ fn envelope(id: Json, outcome: RpcResult) -> String {
         ]),
         // R4: failures are the top-level `error` object, never a string inside
         // `result` under HTTP 200.
-        Err(e) => Json::Obj(vec![
-            ("jsonrpc".into(), Json::s("2.0")),
-            ("id".into(), id),
-            (
-                "error".into(),
-                Json::obj(vec![
-                    ("code", Json::Num(e.code.to_string())),
-                    ("message", Json::s(e.message)),
-                ]),
-            ),
-        ]),
+        Err(e) => {
+            // `data` is written only when there is data. An `error.data: null`
+            // would be a third state a client has to tell apart from absence,
+            // for no gain — JSON-RPC 2.0 §5.1 makes the member optional, so
+            // absence is the honest encoding of "nothing structured to add",
+            // and every code that predates `data` keeps the exact shape it
+            // has always had on the wire.
+            let mut err = vec![
+                ("code".to_string(), Json::Num(e.code.to_string())),
+                ("message".to_string(), Json::s(e.message)),
+            ];
+            if let Some(data) = e.data {
+                err.push(("data".to_string(), data));
+            }
+            Json::Obj(vec![
+                ("jsonrpc".into(), Json::s("2.0")),
+                ("id".into(), id),
+                ("error".into(), Json::Obj(err)),
+            ])
+        }
     };
     body.to_string()
 }
@@ -1165,6 +1275,71 @@ fn respond(sock: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
 // §5.5 gives and `engine::lmd_ghost_head` follows: a value a client will read
 // must be derivable from its inputs so it can be tested without standing up a
 // node. Every one of them is exercised below against a real `CommittedState`.
+
+/// `getnodeversion` — which binary is answering this port.
+///
+/// # Why a method for this
+///
+/// Until it, the identity of a running node was **unobservable over RPC**.
+/// `bloch-pos --version` prints the build stamp, but that requires a shell on
+/// the box, and nothing on this surface carried it — so neither an operator nor
+/// an integrator could answer "which build is this?" without SSH, and the claim
+/// that the fleet runs a given commit rested on repository evidence rather than
+/// on any observation of the fleet. That is the exact shape of the failure
+/// `build.rs` was written about: the 2026-08-11 survey found three boxes
+/// running three different binaries, all reporting `bloch 0.3.0-genesis2`.
+///
+/// # What the answer proves, and what it does not
+///
+/// It proves what the binary was COMPILED from, and only that. Every field is
+/// `env!`, stamped by `build.rs` at compile time and unforgeable at runtime by
+/// anything short of patching the binary — so a MISMATCH is conclusive: a box
+/// reporting a different `commit` than the release is not running the release,
+/// full stop.
+///
+/// A match is weaker, and the honest limits are these:
+///
+/// - `commit` is what the build was TOLD it was building. `build.rs` prefers an
+///   explicit `BLOCH_BUILD_COMMIT` over the repository precisely so container
+///   builds work, and a caller that passes the wrong value gets a confidently
+///   wrong stamp. `dirty` is then `null`, which is the tell.
+/// - `dirty: null` also covers a build with no `.git`. It never means clean.
+/// - Nothing here attests to the RUNNING process beyond compilation: not the
+///   genesis manifest, not the data directory, not the flags, not which branch
+///   the node is actually following. `getchaininfo` answers those, and this
+///   method deliberately does not duplicate them.
+/// - It is unauthenticated, like the rest of this port, so it is evidence about
+///   a node you already trust to be the node you meant to ask — not
+///   authentication of one you do not.
+///
+/// `block_version` is included as the one cross-check that costs nothing: it is
+/// the consensus magic this binary links, so a Genesis-3 binary answering a
+/// Genesis-4 client is visible in the same response rather than three calls
+/// later.
+///
+/// # Cost
+///
+/// Constant, with no allocation proportional to anything — which matters on an
+/// unauthenticated port.
+pub fn node_version_json() -> Json {
+    // Tri-state on the wire: `true`, `false`, or `null` for "the build could
+    // not tell". `null` is NOT `false` — see the doc comment above.
+    let dirty = match env!("BLOCH_BUILD_DIRTY") {
+        "true" => Json::Bool(true),
+        "false" => Json::Bool(false),
+        _ => Json::Null,
+    };
+    Json::obj(vec![
+        ("name", Json::s(env!("CARGO_PKG_NAME"))),
+        ("version", Json::s(env!("CARGO_PKG_VERSION"))),
+        // The `--version` string verbatim, so an operator can compare what a
+        // client sees against what the box prints without reformatting either.
+        ("build", Json::s(env!("BLOCH_BUILD_VERSION"))),
+        ("commit", Json::s(env!("BLOCH_BUILD_COMMIT_ID"))),
+        ("dirty", dirty),
+        ("block_version", Json::u(u64::from(bloch_pos_committee::header::VERSION_G4))),
+    ])
+}
 
 /// `getchaininfo` — the method the finality-aware consumers read (V4 §2).
 #[allow(clippy::too_many_arguments)]

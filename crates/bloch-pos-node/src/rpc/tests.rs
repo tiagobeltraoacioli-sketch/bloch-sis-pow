@@ -514,6 +514,9 @@ fn every_method_routes_to_its_request() {
     call(b, &request("getmempoolinfo", "[]"));
     assert_eq!(spy.last(), Some(RpcRequest::MempoolInfo));
 
+    call(b, &request("getnodeversion", "[]"));
+    assert_eq!(spy.last(), Some(RpcRequest::NodeVersion));
+
     let tx = test_transfer(1, 250, 1_000);
     let hex: String = tx.canonical_bytes().iter().map(|b| format!("{b:02x}")).collect();
     call(b, &request("sendrawtransaction", &format!("[\"{hex}\"]")));
@@ -987,4 +990,130 @@ fn a_body_split_across_packets_is_reassembled() {
     let _ = sock.read_to_string(&mut out);
     assert!(out.starts_with("HTTP/1.1 200"), "got {out}");
     assert_eq!(spy.last(), Some(RpcRequest::BlockBySlot(41_290)));
+}
+
+// ─── 4. The refusal split, and `error.data` ─────────────────────────────────
+
+/// **The two refusals must not share one code.**
+///
+/// This is the tripwire for the defect the split fixes: `Refusal::Invalid` and
+/// `Refusal::PreviouslyRefused` both mapped to `TX_REFUSED`, so opposite advice
+/// — "never resubmit these bytes" and "resubmit after slot N" — arrived under
+/// one number, separable only by reading English. If someone collapses them
+/// back onto one constant, this goes red on the first line.
+#[test]
+fn the_terminal_and_the_retryable_refusal_are_different_codes() {
+    assert_ne!(
+        TX_REFUSED, TX_REFUSED_RETRYABLE,
+        "terminal and retryable refusals must never share a code: a client \
+         branching on the number would be wrong for half of them"
+    );
+    // The numbers themselves are the published contract. -32008 in particular
+    // is already in integrators' hands as "never resubmit"; it must not move.
+    assert_eq!(TX_REFUSED, -32008, "-32008 is published as terminal; it cannot be redefined");
+    assert_eq!(TX_REFUSED_RETRYABLE, -32009);
+}
+
+/// **`until_slot` must be machine-readable**, not a number embedded in prose.
+///
+/// The message is explicitly allowed to be reworded; the deadline is a value a
+/// client computes with. If `error.data` stops carrying it, a client is back to
+/// regexing `until slot 4242` out of a sentence — which is the failure mode
+/// this whole change exists to end.
+#[test]
+fn a_retryable_refusal_carries_its_deadline_in_error_data() {
+    let spy = Spy::failing(RpcError::tx_refused_retryable(
+        4_242,
+        "barred until slot 4242",
+    ));
+    // Any routable method: the backend answer is canned, and the point is
+    // what the ENVELOPE does with an error that carries `data`.
+    let raw = handle_body(&request("getblockcount", "[]"), spy.as_ref());
+    let v = parse_json(&raw).expect("a response is always JSON");
+
+    assert_eq!(error_code(&v), Some(TX_REFUSED_RETRYABLE));
+    let data = v
+        .get("error")
+        .and_then(|e| e.get("data"))
+        .expect("a retryable refusal must carry `error.data`");
+    assert_eq!(
+        data.get("until_slot").and_then(Json::as_u64),
+        Some(4_242),
+        "the deadline must be readable without parsing the message: {raw}"
+    );
+    assert_eq!(
+        data.get("retryable"),
+        Some(&Json::Bool(true)),
+        "a generic client must be able to branch without a table of Bloch codes"
+    );
+    // A NUMBER, not a string: slot indexes are nowhere near 2^53, so the R3
+    // string treatment for satoshis would only make a client parse twice.
+    assert!(
+        matches!(data.get("until_slot"), Some(Json::Num(_))),
+        "until_slot must be a JSON number: {raw}"
+    );
+    // And it is really on the wire, in the literal bytes a client receives.
+    assert!(
+        raw.contains("\"code\":-32009") && raw.contains("\"until_slot\":4242"),
+        "the wire bytes must carry both: {raw}"
+    );
+}
+
+/// Every code that predates `data` keeps the exact wire shape it always had.
+///
+/// `error.data` is optional in JSON-RPC 2.0 §5.1, and an `error.data: null`
+/// would be a third state a client has to tell apart from absence. A terminal
+/// refusal in particular must carry nothing: "there is a deadline" is precisely
+/// the fact it is denying.
+#[test]
+fn errors_without_structured_detail_emit_no_data_member() {
+    for err in [
+        RpcError::new(TX_REFUSED, "cannot be admitted; retrying will not help"),
+        RpcError::new(BLOCK_NOT_FOUND, "no such block"),
+        RpcError::no_wallet(),
+    ] {
+        let code = err.code;
+        let spy = Spy::failing(err);
+        let raw = handle_body(&request("getblockbyslot", "[5]"), spy.as_ref());
+        let v = parse_json(&raw).unwrap();
+        assert_eq!(error_code(&v), Some(code));
+        assert!(
+            v.get("error").unwrap().get("data").is_none(),
+            "code {code} must emit no `data` member at all: {raw}"
+        );
+        assert!(!raw.contains("\"data\""), "not even as null: {raw}");
+    }
+}
+
+/// `getnodeversion` answers with the build stamp, and the stamp is real.
+///
+/// The point of the method is that a node's identity stops being unobservable
+/// over RPC, so the assertions are about the fields being PRESENT and non-empty
+/// rather than about their values, which differ per build by design.
+#[test]
+fn getnodeversion_reports_the_build_stamp_this_binary_was_compiled_with() {
+    let v = node_version_json();
+    assert_eq!(v.get("name").unwrap().as_str(), Some("bloch-pos-node"));
+    assert_eq!(v.get("version").unwrap().as_str(), Some(env!("CARGO_PKG_VERSION")));
+    // The `--version` string verbatim: an operator compares one to the other.
+    assert_eq!(v.get("build").unwrap().as_str(), Some(env!("BLOCH_BUILD_VERSION")));
+
+    let commit = v.get("commit").unwrap().as_str().expect("commit is a string");
+    assert!(!commit.is_empty(), "an empty commit is worse than `unknown`");
+    assert!(
+        v.get("build").unwrap().as_str().unwrap().contains(commit),
+        "the joined stamp and the split field must name the same commit"
+    );
+
+    // Tri-state, and `null` is a real answer: it is what a caller-supplied
+    // BLOCH_BUILD_COMMIT or a build with no .git reports. It never means clean.
+    assert!(
+        matches!(v.get("dirty"), Some(Json::Bool(_)) | Some(Json::Null)),
+        "dirty must be true, false, or null"
+    );
+    assert_eq!(
+        v.get("block_version").and_then(Json::as_u64),
+        Some(u64::from(VERSION_G4)),
+        "a Genesis-3 binary answering a Genesis-4 client must be visible here"
+    );
 }
