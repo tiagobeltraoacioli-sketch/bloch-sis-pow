@@ -119,9 +119,12 @@ this: functions that are public, fully tested, and unreachable.
    to it and no other node agrees on it. There is no transaction id on this
    chain and no txid→block index. Key your deposit records on outpoints
    (`txid`, `vout`) read from the UTXO set. See §3.7 and §5.
-2. **`getblockbyslot` returns an error, `-32007`, for empty slots.** Missed
-   proposals are normal under PoS. A scanner that treats `-32007` as a fault
-   will alert continuously. See §3.9.
+2. **`getblockbyslot` returns `-32007` for empty slots — AND for slots that
+   have not happened yet.** Missed proposals are normal under PoS, so a scanner
+   that treats `-32007` as a fault will alert continuously. But the identical
+   code for a *future* slot means a scanner that simply skips `-32007` walks
+   past the chain head and **never returns for the deposits that later land
+   there**. Never request a slot above `getchaininfo.slot`. See §3.9.
 3. **The fee is derived, never declared, and conservation is an equality.**
    You cannot overpay. Read the price immediately before building. See §6.4.
 
@@ -448,9 +451,23 @@ release rather than probing the node.
 
 Two of these decide whether your integration is operable:
 
-- **`-32007` is not an error condition.** Missed proposals are ordinary under
-  PoS. A block scanner that treats a `-32007` as a fault will page you
-  continuously. Advance to the next slot.
+- **`-32007` is not an error condition — but skipping it blindly loses money.**
+  Missed proposals are ordinary under PoS, so treating `-32007` as a fault will
+  page you continuously. The trap is that a slot **above the head** answers with
+  the same code and the same wording. Measured 2026-09-02 against our public
+  archival node with the head at slot 55,493, both slot 60,494 and slot
+  99,999,999 returned:
+
+  ```json
+  {"code":-32007,"message":"no canonical block at slot 60494 (head is at slot 55493);
+   a slot with no block is a missed proposal, not an error"}
+  ```
+
+  A deposit scanner that advances on every `-32007` therefore runs its cursor
+  off the end of the chain and never comes back. **Read `getchaininfo` first and
+  treat `slot` as a hard ceiling** — not `wall_slot`, which is clock time and
+  runs ahead of the head. The message text does carry `head is at slot N` if you
+  want a second check, but the cursor rule needs no English parsing.
 - **`-32008` carries two different verdicts and the code alone does not
   separate them.** This is a correction to the previous revision, which said
   flatly that `-32008` means "never resubmit". At 7a83ca89
@@ -1297,7 +1314,10 @@ wrong tree was read.
 - [ ] Parse all amounts as big integers from decimal strings
 - [ ] Derive `script_hash` per §4.2 — **48 hex characters follow the prefix**,
       take the first 40 — and verify it against the echo in the first response
-- [ ] Handle `-32007 SLOT_EMPTY` as normal, not as a fault
+- [ ] Handle `-32007 SLOT_EMPTY` as normal, not as a fault — **and never scan
+      above `getchaininfo.slot`**: a future slot returns the same `-32007`, so a
+      scanner that skips it walks past the head and loses the deposits that
+      land there (§3.9)
 - [ ] Handle `-32003 MEMPOOL_FULL` as retryable. For `-32008 TX_REFUSED`,
       **read the message**: *"retrying the same bytes will not help"* is
       terminal, *"barred until slot N"* is retryable after slot N (the
