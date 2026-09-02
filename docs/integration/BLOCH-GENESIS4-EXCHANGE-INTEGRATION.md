@@ -1307,12 +1307,17 @@ wrong tree was read.
 - [ ] Poll `getbalance`; expand with `getutxos [script_hash, limit]` — no
       `offset`, default limit 100, max 1,000, no cursor
 - [ ] Keep deposit addresses under 1,000 outputs
-- [ ] Credit on `finalized` from `getchaininfo`; budget 2–3 epochs
-- [ ] Require **two independent nodes to agree** on the finalized root before
-      crediting — disagreement is a hold, not a retry (§5.3)
-- [ ] Credit at a **depth margin past** finality, not at the boundary, and
-      re-verify with `gettxout` before releasing funds — `finalized` can move
-      backwards and two nodes do not protect you from that (§5.4)
+- [ ] Do **not** credit on `finalized` alone — it is not a settlement
+      guarantee (§5.1). Credit at **finalized + 3 epochs** (~48 min past
+      finality); budget a further 2–3 epochs to reach finality in the first place
+- [ ] Require **two independently operated nodes** to agree on the same
+      finalized **root AND epoch** before crediting — disagreement is a hold,
+      not a retry (§5.3). Compare `finalized`, never `block_id` or height:
+      honest nodes routinely sit a slot apart
+- [ ] Re-verify with `gettxout` **immediately before releasing funds** —
+      `finalized` can move backwards and two nodes do not protect you from
+      that; both can rewind independently (§5.4). The margin of 3 bounds the
+      single-cut case only: **no depth is provably safe today**
 - [ ] Alert on `finalized.epoch` stalling **independently of height**, and on it
       moving backwards
 - [ ] Do not read a rising `finalized` as evidence the network reunified (§5.5)
