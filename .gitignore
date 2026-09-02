@@ -49,8 +49,13 @@ deploy/artifacts/
 __pycache__/
 *.pyc
 
-# Fixtures de benchmark: contem validator.key de descarte. Chave privada nao
-# entra no repositorio, nem descartavel — este repo e empurrado para GitLab e
+# Fixtures de benchmark. Contem `validator.key` de descarte — chave privada NAO
+# entra no repositorio, nem descartavel: este repo e empurrado para GitLab e
 # GitHub, e uma chave commitada e indistinguivel de um vazamento para quem
 # audita depois. Regenerar com os scripts de bench.
+#
+# Isto e prevencao, nao limpeza: em 01/09/2026 um levantamento achou 41
+# `BPOSKEY1` numa branch de trabalho, e o commit que as adiciona e ANCESTRAL de
+# duas outras — apagar a branch de origem nao as remove. Aquelas duas so podem
+# ser cherry-picked, nunca mescladas.
 bench/

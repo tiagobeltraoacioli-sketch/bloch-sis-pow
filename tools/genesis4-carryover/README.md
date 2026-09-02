@@ -1,5 +1,22 @@
 # Genesis-4 carryover
 
+> **RETIRED — do not run this to reproduce the live genesis.**
+>
+> This tool implements a rule set that was **abandoned before Genesis-4
+> launched**: drop founder-controlled outputs (taint), then apply a 300 M cap
+> pro-rata. The live `carryover.tsv.gz` does the opposite — it *carries* the
+> founder's 426,194 outputs, 93.94% of the total — and it scales every balance
+> by 100/21 rather than capping. This tool never applies that split at all.
+>
+> Run against the shipped file it emits a different ledger in a different unit,
+> and its tests below still describe the 413,743-row **Genesis-1** file that was
+> replaced on 2026-08-14.
+>
+> The live genesis was assembled by `bloch-pos genesis-mainnet` with the balance
+> set ingested through `Manifest::ingest_carryover`. See `docs/CARRYOVER.md` and
+> `docs/GENESIS4-MIGRATION-RUNBOOK.md`. This directory is kept as a record of
+> what was considered, not as a runbook.
+
 Turns the raw UTXO snapshot taken at the terminal height into the Genesis-4
 opening balances: drop founder-controlled outputs, aggregate by address, apply
 the 300 M cap pro-rata if it binds, emit a deterministic TSV and a SHAKE-256

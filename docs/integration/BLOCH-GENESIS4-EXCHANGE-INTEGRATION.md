@@ -507,127 +507,56 @@ that passes 1,000 outputs cannot be fully enumerated. Keep each address under
 |---|---|---|
 | Accepted | `sendrawtransaction` → `accepted:true` | in this node's mempool |
 | Included | output visible via `gettxout` / `getutxos` | in a block |
-| **Final** | `getchaininfo.finalized.epoch` ≥ that block's epoch | **credit** |
+| **Final** | `getchaininfo.finalized.epoch` ≥ that block's epoch | **not sufficient — see the note below** |
 
-Finality is explicit and published in every `getchaininfo` response — you do
-not estimate it from a confirmation count, and there is no `confirmations`
-field to misread.
+Finality is explicit on Genesis-4 and published in every `getchaininfo` response — you do
+not estimate it from a confirmation count.
 
-**Credit on `finalized`.** Included is not settled: a block that is canonical
-now can be reorganised, and only finalisation is the cryptographic guarantee.
+> **Do not credit on `finalized` alone.** An earlier revision of this page called that a
+> cryptographic settlement guarantee. **It is not one**, and we are correcting it rather
+> than waiting to be asked. What Genesis-4 offers today is *economic* finality under an
+> assumption of healthy participation. Two defects, both demonstrated by test:
+>
+> 1. **The quorum denominator shrinks with no floor.** It is leak-adjusted
+>    unconditionally; the floor and the recovery rule are written but gated behind
+>    `LEAK_RECOVERY_ACTIVATION_EPOCH`, which is `u64::MAX`. A partitioned minority
+>    holding 6.25% of stake has been shown to self-finalise once the absent majority
+>    has leaked away.
+> 2. **`finalized` is not a latch across a reorg.** Fork choice walks from the
+>    *justified* root, and the state committed there already finalises two epochs below
+>    the head — so the deepest cut the algorithm may legitimately propose, with no
+>    invalid block and no misbehaving peer, is itself a finality rewind. Measured
+>    repeatedly: finalized epoch 6 → 4 → 2 → 0 in three in-rules cuts.
+>
+> **Two nodes agreeing does not mitigate this.** Both can rewind independently.
+>
+> **What to do instead**, until this note is withdrawn: credit at **finalized + 3 epochs**
+> (~48 minutes past finality), require **two independently operated nodes** to agree on
+> the same finalized **root and epoch** — not the epoch alone — and **re-verify
+> immediately before releasing funds**. The margin of 3 bounds the single-cut case with
+> one epoch to spare. It does not bound a repeated ratchet: **no depth is provably safe
+> today**, and we would rather say so than quote a number that sounds like one.
+>
+> This note is withdrawn when the finality latch ships and the denominator floor is
+> armed. See `docs/decisions/LEAK-RECOVERY-ARMING-BRIEF.md` and
+> `docs/decisions/FINALITY-LATCH-FORK-SAFETY.md`.
 
-### 5.2 How long finality actually takes
+#### `gettxout` has no `finalized` field
 
-Finalisation happens at epoch boundaries, so the floor is set by where in an
-epoch your transaction landed, and the realistic figure is **2–3 epochs
-(32–48 minutes)** from inclusion, not the "1–2 epochs" the previous revision
-gave. Under degraded participation it is unbounded — see §5.3.
+Separate from the note above, and a correction to earlier partner guidance that
+told integrators to read one. `gettxout` returns exactly
+`{txid, vout, unspent, utxo, at_slot}` — five fields, verified against the live
+archivals on 2026-09-01. A client keying settlement on `result.finalized` from
+this call reads `undefined`, which is falsy, and so settles nothing — or, if it
+coerces, settles everything. The `finalized` flag is a *block* field
+(`getblockbyslot`) and the authority on the checkpoint is `getchaininfo.finalized`.
+`gettxout` answers one question, "is this output still unspent"; you combine the
+two yourself.
 
-Size your customer-facing SLA off the observed distribution, not off the floor,
-and treat `finalized` as the only signal. If you need a faster provisional
-credit, take it against `finality: "justified"` with your own risk limit and
-know that you are taking reorg risk to do it.
-
-### 5.3 `finalized` is not currently a network-unique value — read it from two nodes
-
-This is the most important risk disclosure in this document and the previous
-revision did not carry it at all.
-
-**Read the finalized checkpoint from at least two independent nodes and require
-them to agree before you credit.** Our own public RPC front end does exactly
-this internally — it refuses a read unless two nodes concur — and an integrator
-crediting from a single node has weaker assurance than we give ourselves.
-
-Here is why, precisely.
-
-Finalisation is Casper-style: a checkpoint is justified when attestations
-covering it reach **two thirds of the active stake**, and finalised by
-consecutive justification. The denominator that "two thirds" is measured
-against is **leak-adjusted**: stake belonging to validators that have not been
-heard from is subtracted, which is what lets a partitioned majority keep
-finalising.
-
-The problem is what bounds that subtraction, and today nothing does.
-`FinalityState::leaked` has exactly one write path — accrual — with **no decay,
-no reset and no removal**. The denominator therefore shrinks monotonically and
-never comes back. Once enough stake has leaked, a handful of validators — one,
-in the limit — hold two thirds of what remains and can finalise alone. That is
-not hypothetical: on **2026-08-24 three nodes finalised epoch 986 under three
-different roots**, and no amount of arriving blocks reunified them.
-
-Two mitigations exist in the binary and **neither is reachable**:
-
-| Mitigation | Constant | State |
-|---|---|---|
-| Leak recovery — the accumulator drains on healthy epochs | `INACTIVITY_LEAK_RECOVERY_QUOTIENT = 16` | `[INERT]` |
-| Quorum-denominator floor — the denominator may not fall below **half** the unleaked total | `MIN_QUORUM_DENOMINATOR_NUM/DEN = 1/2` | `[INERT]` |
-
-Both sit behind `LEAK_RECOVERY_ACTIVATION_EPOCH = u64::MAX`. They are gated
-because the floor decides which checkpoints justify, justification is committed
-into the state root, and applying either rule to historical epochs makes a node
-compute a root the existing headers do not carry — which stops its replay dead.
-Arming them is a flag day with a fleet rebuild, not a config change.
-
-Separately, whether the leak reaches the **duty roster** — so a written-off
-validator also stops winning proposer draws — is `[SCHEDULED]` at
-`LEAKED_ROSTER_ACTIVATION_EPOCH = 1400` and is not in force yet.
-
-### 5.4 `finalized` is also not a latch — it can move backwards
-
-A second, independent defect, and you must plan for it separately because the
-mitigation for §5.3 does not cover it.
-
-Within the finality gadget itself the finalized checkpoint is monotone — it
-will only ever be replaced by a strictly higher one. **But the node does not
-own that gadget across a reorg.** A reorg replaces the whole committed state
-with an ancestor's, and the adopt path performs no comparison of the incoming
-finalized checkpoint against the outgoing one. Fork choice walks from the
-*justified* root, not the finalized one, and nothing prunes branches by
-finalized checkpoint.
-
-The practical consequence: a reorg down to the justified root installs a state
-whose finalized epoch predates the one the node was reporting. A block that
-`getblockbyslot` returned with `"finalized": true` can subsequently report
-`"justified"` or `"canonical"`. `finalized_height` can go down.
-
-**Two independent nodes do not fix this one.** Both can rewind, and they can
-rewind independently. Agreement between them protects you against §5.3's
-divergence, not against §5.4's rewind.
-
-### 5.5 What to do about §5.3 and §5.4
-
-- **Credit on `finalized`, and require two independent nodes to report the same
-  finalized root at the same epoch.** Disagreement is a hold condition, not a
-  retry.
-- **Re-verify before releasing funds.** Do not treat a single `finalized: true`
-  reading as durable. Re-read the output with `gettxout` immediately before you
-  act on it, and treat a block that has stopped being finalized as a hold.
-  **`gettxout` is not where finality comes from.** It returns exactly
-  `{txid, vout, unspent, utxo, at_slot}` — five fields, none of them
-  `finalized`, verified against the live archivals 2026-09-01. A client keying
-  settlement on `result.finalized` from this call reads `undefined`. The
-  `finalized: true` above is a *block* field (`getblockbyslot`) and the
-  authority is `getchaininfo.finalized`; `gettxout` answers one question only,
-  "is this output still unspent", and you combine the two yourself.
-  While here: `at_slot` in that reply is the **head slot the node answered
-  from** (`txout_json` emits `state.slot()` on both the found and the not-found
-  branch), not the slot the output was created in. Dating a deposit by it dates
-  it to whenever you happened to ask.
-- **Add a depth margin.** Credit at a fixed number of epochs *past* finality
-  rather than at the finality boundary itself. The margin is what absorbs a
-  rewind, and it is the only mechanism here that does.
-- **Alert on `finalized.epoch` not advancing, independently of height.** Block
-  production and finalisation are separate: heights advance, `getblockbyslot`
-  keeps answering, the node looks healthy, deposits stop being creditable.
-- **Alert on `finalized.epoch` moving backwards**, and on a finalized root at a
-  given epoch changing. Neither should happen; both do.
-- **Do not read a rising `finalized` as recovery.** Because the denominator
-  shrinks and has no floor, a partitioned minority reaching two thirds of what
-  is left will finalise its own branch. `finalized` advancing again is not
-  evidence the network reunified.
-- Have a manual hold procedure. A stall does not currently clear itself.
-
-We would rather you learned this from us than from your reconciliation.
+While here: `at_slot` in that reply is the **head slot the node answered from**
+(`txout_json` emits `state.slot()` on both the found and the not-found branch),
+not the slot the output was created in. Dating a deposit by it dates it to
+whenever you happened to ask.
 
 ---
 
@@ -1043,7 +972,10 @@ its pin moves into `integration_book_claims.rs` in the same commit.
 - [ ] Poll `getbalance`; expand with `getutxos [script_hash, limit]` — no
       `offset`, default limit 100, max 1,000, no cursor
 - [ ] Keep deposit addresses under 1,000 outputs
-- [ ] Credit on `finalized` from `getchaininfo`; budget 2–3 epochs
+- [ ] Credit at **`finalized` + 3 epochs**, not at the finality boundary — and
+      read the checkpoint from `getchaininfo`. NOT on `finalized` alone: that
+      was withdrawn as a settlement guarantee (§5), and no depth is provably
+      safe today
 - [ ] Require **two independent nodes to agree** on the finalized root before
       crediting — disagreement is a hold, not a retry (§5.3)
 - [ ] Credit at a **depth margin past** finality, not at the boundary, and
