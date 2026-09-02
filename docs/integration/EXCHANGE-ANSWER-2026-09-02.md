@@ -272,6 +272,19 @@ cargo build --release -p bloch-pos-node
 No branch, tag or commit is pinned, and `origin` HEAD symrefs to `main`. **So
 our published quickstart instructs a stranger to build off-lineage.**
 
+**Fixed since we drafted this, and it was worse than off-lineage.** That URL is
+a GitLab group you have no membership in, so for you it did not merely build
+the wrong tree — it returned **HTTP 401 and cloned nothing at all**. Line 1 of
+our own third-party guide was unusable by any third party. It now points at the
+public GitHub mirror, with the reason written beside it, and we verified it by
+cloning with no credentials on a clean machine and landing on `7a83ca89` with
+the tag present:
+
+```bash
+git clone https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow.git bloch-pos
+cd bloch-pos && git checkout g4-node-20260901
+```
+
 ### 2.1 What we previously believed, and why it was wrong
 
 Our first reading was that the two lineages agree today because the gates
@@ -631,24 +644,39 @@ coordination of the validators who would have to do it. Take §4.1's guidance �
 depth, two nodes, re-verify — as the whole of what we offer, and discount the
 slashing sentence to zero.
 
-**One further disclosure, which we are marking as pending confirmation rather
-than holding back.** A correction to that RPC comment is in flight in our
-working tree — it retracts both sentences, adds machine-readable
-`"slashing_enforced": false` and `"finalized_is_a_latch": false` to the
-capabilities object so a client can branch on a flag instead of parsing prose,
-and it records a measurement against the live chain at epoch 1726, both
-archivals agreeing on head and root: 64 validators, all 64 with
-`"slashed": false` and `"exit_epoch": null` — **including 48 whose
-double-signing is committed on chain and cryptographically provable.**
+**One further disclosure. We are giving you the corroborated half and the
+uncorroborated half separately, and labelling which is which.**
 
-If that measurement holds, it is the sharpest available statement of §4.2: the
-penalty has not merely been unreachable in principle, it has already failed to
-fire against provable equivocation by three quarters of the validator set.
-**We have not independently re-measured it for this letter, and the test the
-correction cites (`tests/slashing_backed_finality_claims.rs`) is named but not
-yet written.** We are telling you it exists in that state rather than waiting
-for it to be tidy. Landing and corroborating it is [D4]; you will get the
-confirmed number either way.
+A correction to that RPC comment is in flight in our working tree; it retracts
+both sentences. Three things about it you should know before relying on it.
+
+**Corroborated.** We re-measured the validator set independently for this
+letter, on 2026-09-02, calling `getvalidator` for every index 0 through 63 on
+our public archival node: **all 64 validators read `"slashed": false` and
+`"exit_epoch": null`.** `getvalidatorcount` reports 64 total, 64 active. That
+is a direct reading and it is the part of §4.2 you can hold us to.
+
+**Not corroborated, and therefore withdrawn from this letter.** An earlier
+draft of this section said that 48 of those validators have on-chain,
+cryptographically provable double-signing. **We cannot substantiate that
+number.** No RPC method on any Bloch node exposes equivocation evidence, so it
+cannot be checked the way the sentence above can. We are removing it rather
+than sending a figure we cannot stand behind. If we substantiate it later, you
+will get it together with the method used.
+
+**A correction to the correction.** That in-flight change adds machine-readable
+`"slashing_enforced": false` and `"finalized_is_a_latch": false` to a
+`getcapabilities` response. **You will not be able to read those flags.** There
+is no `getcapabilities` method on the released binary, on the tip our fleet
+runs, or on either of our public archival nodes — all of them answer `-32601
+method not found`. That work sits on an internal branch outside the release
+lineage. Until it ships, this retraction is prose you read here, not a flag
+your client can branch on. We would rather say so than let you code against a
+field that does not exist. It is the same defect as §3.1 of the integration
+book, which we are withdrawing for the same reason.
+
+Landing this on the release lineage — it is currently commingled with unrelated
+work in a single local commit — and getting it onto public `main` is [D4].
 
 ### 4.3 Your §7.9 — partly stale, and the accurate version is worse in one place
 ### and better in another
@@ -731,6 +759,78 @@ it is [D5].
   is marked exited and then sits.**
 
   **Please keep finding these.** Every item in your last two notes was correct.
+
+### 4.5 Two error codes, and one of them loses deposits
+
+Neither of these was in your notes. We found them auditing our own answers to
+you, and the first one is the most expensive thing in this letter.
+
+**`-32007` will make a deposit scanner skip deposits. Read this one first.**
+
+`getblockbyslot` answers `-32007 SLOT_EMPTY` for a slot with no block, and our
+integration book tells you — correctly, for its intended case — that a missed
+proposal is normal under proof of stake and that you should advance to the next
+slot rather than treat it as a fault.
+
+**It returns exactly the same code for a slot that has not happened yet.**
+Measured on our public archival node on 2026-09-02, with the chain head at slot
+55,493:
+
+```json
+{"code":-32007,"message":"no canonical block at slot 60494 (head is at slot 55493);
+ a slot with no block is a missed proposal, not an error"}
+```
+
+The same answer comes back for slot 99,999,999. A scanner that follows our
+guidance walks past the head into slots that do not exist, reads each as an
+ordinary empty slot, advances its cursor past them, and **never returns to the
+slots where the deposits actually land.** The money is credited to nobody. This
+is our documentation defect, not your bug, and we would rather hand it to you
+than have you find it in a reconciliation.
+
+**What to do, today, with the deployed binary:** never scan past the head.
+Read `getchaininfo` first and treat `slot` as your hard ceiling — do not
+request a slot above it, and re-read it each pass. Note `getchaininfo` also
+returns `wall_slot` and `behind_by_slots`; `wall_slot` is clock time, **not** a
+scannable ceiling, so use `slot`. If you want a belt-and-braces check, the
+`-32007` message text carries `head is at slot N` and you can compare, but the
+cursor rule above is sufficient and does not require parsing English.
+
+**We are fixing it in the node**, so that a slot above the head answers with a
+distinct code rather than borrowing the one that means "keep going".
+
+**`-32008` is ambiguous in the released source — but has not yet misled anyone,
+and we are fixing it before it can.**
+
+In the release you build from (`g4-node-20260901` = `7a83ca89`), `-32008` is
+returned for two opposite outcomes: a transaction judged invalid on its bytes
+(terminal — never resubmit) and a transaction the node has *barred* for a
+bounded time (retryable once the bar lifts, 128 slots ≈ 64 minutes). They are
+separable only by reading the English message, which defeats the purpose of an
+error code.
+
+**Why you have not been bitten by it yet:** the binary on our public archival
+nodes predates the defect. The retryable refusal and the rejection cache landed
+together on 2026-08-30, and those nodes still answer `getmempoolinfo` without
+the `barred` and `barred_hits` fields that shipped with it — we checked. So on
+the wire you can reach today, `-32008` still has exactly one meaning. The
+ambiguity is real in the source you would build from, and it becomes reachable
+the moment those nodes are rolled forward.
+
+**The fix is written and lands before that rollout.** The terminal case keeps
+`-32008` with its published meaning unchanged. The retryable case moves to a
+new code, `-32009`, carrying the deadline machine-readably so you never parse
+prose:
+
+```json
+{"code":-32009,"message":"… barred until slot 25764 …",
+ "data":{"retryable":true,"until_slot":25764}}
+```
+
+`data` is absent, not null, on every other code, so nothing else changes shape.
+Until you are running a node that emits `-32009`: treat every `-32008` as
+terminal. That is the safe direction — it costs you a rebuild, never a lost
+transaction.
 
 ---
 
@@ -854,6 +954,8 @@ If you do not see that line, stop — you have a key you did not mean to have.
 | **On receipt of the tag** | Build, take a seed copy, be finalized and past the gate the same day — §5.3 Path A. |
 | **Today, independent of us** | Change your crediting rule: **finalized + 3 epochs, two independently operated nodes agreeing on root *and* epoch, re-verified immediately before release**. Do not credit on `finalized` alone — §4.1. |
 | **Today, independent of us** | Delete the one-third-of-stake slashing guarantee from your risk model. It is in our RPC source and it is not true — §4.2. |
+| **Before you scan a single slot** | **Never request a slot above `getchaininfo.slot`.** A future slot answers `-32007`, identical to a real empty slot, so a scanner that skips empty slots walks past the head and never comes back for the deposits that land there. Use `slot` as a hard ceiling, not `wall_slot` — §4.5. |
+| **Today, independent of us** | Treat every `-32008` as terminal until you are on a node that emits `-32009`. Safe direction: it costs a rebuild, never a lost transaction — §4.5. |
 | **Today** | Treat any testnet key as a mainnet key — §3.1. |
 | **Before you write balance-polling code** | `script_hash` is `SHA3-256(pubkey)`, all 32 bytes — not the 20-byte address-truncated form. Consensus opens both, so the wrong one reads a silent zero — §3.1. |
 | **On request** | Local testnet branch, build command, and a captured dated transcript of a full spend-path run. A small mainnet amount if you prefer [D2]. |
@@ -875,7 +977,8 @@ flattering information.
 | **D1** | **Push `release/g4-node-20260901` (`7a83ca89`) + tag + checksum to both remotes.** Merging arms nothing: `ANCESTRY_SEED` and `LEAK_RECOVERY` stay `u64::MAX`. Without it we cannot honestly tell them to build anything, and our own quickstart is pointing strangers off-lineage. | §2.3, §5.3, the whole letter | **2026-09-02, first working hour.** Every hour costs them window. |
 | **D2** | Fund a throwaway key with ~0.001 BLCH for the mainnet spend rehearsal, and decide whether a small mainnet amount goes to the exchange. | §3.1 | 2026-09-03 |
 | **D3** | Roll the two public archival observers onto the fleet lineage, or name two nodes on different builds. The two-node corroboration rule we are giving them is currently satisfied by two copies of the same stale build. | §1.1, §4.1 | 2026-09-04 |
-| **D4** | **The retraction is already written, uncommitted, in the main checkout** — `rpc.rs` (+107/−20): both sentences retracted, `slashing_enforced`/`finalized_is_a_latch` flags added to capabilities, and a live measurement at epoch 1726 asserting **48 validators with provable on-chain double-signing and `"slashed": false`**. Two things needed: **(a)** corroborate the 48 figure independently before it goes to a partner — it is the single most quotable sentence in this letter and it is currently one agent's uncommitted measurement; **(b)** write `tests/slashing_backed_finality_claims.rs`, which the comment cites and which does not exist. Then commit and push. | §4.2 | **(a) 2026-09-02** — it gates sending. (b) 2026-09-03 |
+| **D4 — STATUS CHANGED 2026-09-02** | Superseded in part. The 64/64 `slashed:false` / `exit_epoch:null` reading is now **independently re-measured** by the PMO (every index 0–63 via `getvalidator`, archival node, 2026-09-02) and is safe to send. The **48-double-signing figure is withdrawn from the letter** — no RPC method exposes equivocation evidence, so it cannot be substantiated, and it must not be sent as fact. The cited test now exists (475 lines) but sits on `validator-ops`, which is **not** in the release lineage. Two things remain: separate the retraction out of the mixed local commit `163befdb`, and land it on the release lineage and public `main` — the promise is still live in `rpc.rs` on all three remotes. Original note follows. |
+| **D4 (original)** | **The retraction is already written, uncommitted, in the main checkout** — `rpc.rs` (+107/−20): both sentences retracted, `slashing_enforced`/`finalized_is_a_latch` flags added to capabilities, and a live measurement at epoch 1726 asserting **48 validators with provable on-chain double-signing and `"slashed": false`**. Two things needed: **(a)** corroborate the 48 figure independently before it goes to a partner — it is the single most quotable sentence in this letter and it is currently one agent's uncommitted measurement; **(b)** write `tests/slashing_backed_finality_claims.rs`, which the comment cites and which does not exist. Then commit and push. | §4.2 | **(a) 2026-09-02** — it gates sending. (b) 2026-09-03 |
 | **D5** | Land `docs/LIVE-SUPPLY.md` and its expiry test on `main`. | §4.3 | 2026-09-04 |
 | **D6** | Contact the external audit firm to open the Phase A ceremony calendar. **Not compressible and not delegable.** The letter commits only to a trigger, not a date, so this does not gate sending — but it gates every post-window guarantee. | §5.1 | Immediately; the window closes regardless. |
 
