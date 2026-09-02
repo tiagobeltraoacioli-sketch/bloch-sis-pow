@@ -133,13 +133,39 @@ before it admits a single balance, and refuses to start on any mismatch. The
 Do not run a binary whose provenance you cannot check; a node on a different
 consensus build can serve reads that disagree with the network.
 
+**Build the tag, not `main`.** This matters more than it looks:
+
 ```bash
 git clone https://gitlab.com/blochsispow-group/bloch-pos.git
 cd bloch-pos
+git checkout g4-node-20260901          # published 2026-09-02
+git describe --tags --exact-match      # must print g4-node-20260901
 cargo build --release -p bloch-pos-node
 ./target/release/bloch-pos --version    # must NOT say "+dirty"
 ./target/release/bloch-pos selfcheck    # verifies the frozen consensus params
 ```
+
+> **Why the tag and not the default branch.** `main` is **not a descendant of
+> the commit the fleet runs** (`46133196`) — six commits are missing from it,
+> including four consensus corrections. The divergence is not dormant: on
+> `main`, `Engine::seed_for_attestation` reads the seed from epoch E−2 while
+> the transition admits against E−1, so a node built there derives **different
+> committees every epoch** and can publish a `finalized` view that disagrees
+> with the network. There is no activation gate in that path to wait for, and
+> `selfcheck` cannot catch it — it compares the *set* of consensus constants,
+> which is identical, not the behaviour behind them.
+>
+> The tag `g4-node-20260901` (commit `7a83ca89`) descends from the fleet tip and
+> carries those corrections. Verify it yourself rather than trusting this
+> paragraph:
+>
+> ```bash
+> git merge-base --is-ancestor 46133196 g4-node-20260901 && echo "on-lineage"
+> ```
+>
+> Nothing in the tag is armed that is not already live on the network: both
+> `ANCESTRY_SEED_ACTIVATION_EPOCH` and `LEAK_RECOVERY_ACTIVATION_EPOCH` remain
+> `u64::MAX`, and every activation constant is byte-identical to the fleet's.
 
 > **Use a release build.** A debug build is not merely slower — it makes the
 > initial state construction take hours instead of minutes, because the
@@ -148,8 +174,11 @@ cargo build --release -p bloch-pos-node
 **Budget time for the build itself.** The release profile is `lto = true` with
 `codegen-units = 1`, which is deliberate — it also carries `overflow-checks`,
 mandatory for a consensus build — and it makes the final link slow and
-single-threaded. Measured ~40 minutes on an 8-core M-series Mac that had other
-compiles competing for CPU. Do not "optimise" this by dropping LTO or building
+single-threaded. Re-measured 2026-09-02 on three 2-vCPU cloud boxes building
+the tag from a clean clone: **3m07s, 3m40s, 4m12s**. Run-to-run variance on
+shared vCPUs is around 40% — the same box gave 6m04s and then 4m12s for the
+same work — so provision for the slow end. The "~40 minutes" this document
+carried until today was measured on a laptop running several other compiles. Do not "optimise" this by dropping LTO or building
 in debug: both change the binary you validate with. Start the build before you
 need it.
 
@@ -174,7 +203,13 @@ sudo cp genesis/mainnet.manifest carryover.tsv /var/lib/bloch/
 
 Verified 2026-09-01: both are byte-identical to what the live fleet runs
 (checked against `/home/ubuntu/g4/` on archival node 139.180.166.5), and both
-digests in §1 were reproduced from a clean clone of `main`.
+digests in §1 were reproduced from a clean clone of the tag
+`g4-node-20260901`. The binary that tag produces is
+`sha256 ac79e2fabfab40c627b0381d8f1c05b06407553db51a75801e968664ccf92654`
+(7,347,832 bytes), reproduced byte-identically on three machines by two
+independent checkout paths — a clone of a bundle and an incremental fetch onto
+an already-built tree. A tarball build differs, because the commit hash is
+compiled in.
 
 > The R2 paths under `…r2.dev/node/genesis4/` referenced by older documents
 > **return 404** — the artifacts were never uploaded there. Use the repository
@@ -313,17 +348,24 @@ sync inside a four-day window means starting now, not on 4 September.**
 >
 > The table above was measured with a partial fix applied (`fix(catch-up):
 > share the eUTXO map so an epoch roll stops paying the ledger`,
-> `Arc<BTreeMap>` copy-on-write). **That fix is not on `main`**, which is the
-> branch §2 tells you to clone — it is still on the integration branch
-> `integ/ws-checkpoint-tooling` and has not been merged. So the build you
-> produce by following this document does **not** have it, and 26 hours is a
-> **floor, not an estimate**. In our run an unfixed build took roughly twice as
-> long to reach the same epoch, though that measurement was contaminated by CPU
-> contention and should not be quoted as the fix's effect.
+> `Arc<BTreeMap>` copy-on-write). **That fix is in the tag `g4-node-20260901`**
+> and is not on `main` — one more reason §2 now tells you to check out the tag.
 >
-> Budget accordingly: assume up to ~2× and treat §5's archival-seed path as the
-> default rather than the fallback if you are racing the 5 September deadline.
-> We would rather you over-provision the window than discover this at hour 30.
+> The 26-hour figure itself was wrong and is withdrawn. Re-measured 2026-09-02
+> on a 7.9 GB / 2-vCPU box: `main` completed a cold sync **twice**, in 29.5 and
+> 30.3 minutes, peaking at ~1,015 MB and never being OOM-killed; the tag does it
+> in **21.2 minutes at 934 MB**. The "26 hours" came from a contended laptop run
+> that was stopped at 13 minutes and extrapolated. An earlier warning in this
+> document that an 8 GB box would be OOM-killed did not reproduce, in either
+> direction, and is withdrawn with it.
+>
+> Two facts that do survive, and that an integrator should plan around. First,
+> §5's archival-seed path is not faster than syncing from the network — measured
+> 22.1 minutes against 21.2 — so choose it for provenance reasons, not for
+> speed. Second, **a node restart costs a full local replay of its block log,
+> and the RPC is closed for the whole of it**: during a 21-minute sync the node
+> answered `getchaininfo` once, at 65 seconds, and then not again. Monitoring
+> that treats an unanswered RPC as a dead node will page you on every restart.
 
 ### The faster path: seed from an archival node — recommended
 
