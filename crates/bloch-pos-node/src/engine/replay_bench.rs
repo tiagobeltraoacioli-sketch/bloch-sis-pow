@@ -16,20 +16,23 @@
 //! So this drives the **real** node path:
 //!
 //! ```text
-//!   Engine::ingest                engine.rs:691   <- the entry point boot replay uses
-//!     +- Engine::advance          engine.rs:795
-//!         +- Engine::forkchoice_head    engine.rs:743   (2x per block)
-//!         +- Engine::path_to_canonical  engine.rs:760
-//!         +- Engine::apply_canonical    engine.rs:912
-//!             +- Transition::apply_block   transition.rs:3112
-//!                 +- compute_post_state    transition.rs:2816  (clone, epoch roll, txs)
-//!                 +- compute_root          transition.rs:1480  (the state root)
+//!   Engine::ingest                              <- the entry point boot replay uses
+//!     +- Engine::advance
+//!         +- Engine::forkchoice_head            (2x per block)
+//!         +- Engine::path_to_canonical
+//!         +- Engine::apply_canonical
+//!             +- Transition::apply_block
+//!                 +- compute_post_state         (clone, epoch roll, txs)
+//!                 +- compute_root               (the state root)
 //! ```
 //!
-//! and it drives it through the same loop `run()` executes at boot
-//! (`for (i, env) in logged.into_iter().enumerate() { engine.ingest(env); .. }`,
-//! engine.rs ~1700) with `live = false` — which is exactly what a restarting
-//! node runs.
+//! Symbols, not line numbers: this tree carried eight of them and every one had
+//! rotted past the function it named. Grep the symbol — it is unambiguous in
+//! both `engine.rs` and `transition.rs`.
+//!
+//! It drives that tree through the same loop `run()` executes at boot
+//! (`for (i, env) in logged.into_iter().enumerate() { engine.ingest(env); .. }`)
+//! with `live = false` — which is exactly what a restarting node runs.
 //!
 //! # Why this lives in `src/engine/` under `cfg(test)`
 //!
@@ -60,7 +63,7 @@
 //!
 //! | var | default | meaning |
 //! |---|---|---|
-//! | `BLOCH_BENCH_BLOCKS` | 128 | blocks in the synthetic chain |
+//! | `BLOCH_BENCH_BLOCKS` | 192 | blocks in the synthetic chain |
 //! | `BLOCH_BENCH_RUNS` | 5 | full replays, for the median |
 //! | `BLOCH_BENCH_CARRYOVER` | 452726 | opening eUTXO set size |
 //! | `BLOCH_BENCH_DEPTH` | 12200 | chain depth used for the extrapolation |
@@ -335,7 +338,7 @@ impl Generator {
             .map(|e| Coin { txid: e.txid, vout: e.vout, value: e.value })
             .collect();
 
-        let verifier = HybridVerifier::new(manifest.pubkeys());
+        let verifier = HybridVerifier::new();
         let state = manifest.genesis_state();
         let genesis_id = manifest.genesis_id();
         Generator {
@@ -621,7 +624,7 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
     let store = Store::open(dir, &[0u8; 32]).expect("store");
     let genesis_state = manifest.genesis_state();
     let genesis_id = manifest.genesis_id();
-    let verifier = HybridVerifier::new(manifest.pubkeys());
+    let verifier = HybridVerifier::new();
     let head_slot = Arc::new(AtomicU64::new(0));
     let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (tx, rx) = std::sync::mpsc::channel();
@@ -652,6 +655,12 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         att_pool: AttestationPool::new(),
         wall_slot: 0,
         mempool: BTreeMap::new(),
+        // O cache de recusa (2026-08-30): o replay nao propoe, entao nunca
+        // bane nada — o campo existe para o tipo, sempre vazio aqui.
+        rejected: BTreeMap::new(),
+        rejected_hits: 0,
+        mempool_suspect: BTreeSet::new(),
+        mempool_swept_epoch: u64::MAX,
         store,
         net,
         head_slot,

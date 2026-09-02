@@ -122,7 +122,16 @@ done
 #    than publishing one, so this must be a comparison and not a suggestion
 #    that the reader make one. Roots are only comparable at the SAME finalized
 #    height, so unequal heights are inconclusive, not a pass.
-if [ $DEEP -eq 1 ] && [ "$(grep -c . "$ROOTS" 2>/dev/null || echo 0)" -ge 2 ]; then
+# `grep -c .` EXITS 1 when the count is zero, so `grep -c . f || echo 0` emits
+# BOTH the "0" it printed and the fallback "0" — the test then receives the
+# two-line string "0\n0" and bash aborts the comparison with "integer
+# expression expected". That is exactly what happened when the cross-check
+# collected no roots, which is the normal case for a third party: the published
+# bootnodes bind their RPC to loopback (correctly — see the quickstart §0), so
+# nobody outside the host can read a finalized root from them. `wc -l < file`
+# always succeeds and always prints one number.
+ROOTC_LINES=$(wc -l < "$ROOTS" 2>/dev/null || echo 0)
+if [ $DEEP -eq 1 ] && [ "$ROOTC_LINES" -ge 2 ]; then
   echo
   echo "Cross-check: published entries must agree on ONE chain."
   HEIGHTS=$(awk '{print $2}' "$ROOTS" | sort -u | grep -c .)
@@ -140,6 +149,16 @@ if [ $DEEP -eq 1 ] && [ "$(grep -c . "$ROOTS" 2>/dev/null || echo 0)" -ge 2 ]; t
     awk '{printf "         %-18s finalized=%s %s\n", $1, $2, $3}' "$ROOTS"
     FAIL=1
   fi
+elif [ $DEEP -eq 1 ]; then
+  # Say why the fork check did not run, rather than printing nothing and
+  # letting the reader assume it passed. A check that silently does not
+  # execute is worse than one that fails.
+  echo
+  echo "Cross-check: NOT PERFORMED — fewer than two entries returned a"
+  echo "   finalized root over RPC. The published bootnodes bind RPC to"
+  echo "   loopback, so this cross-check can only be run ON one of them."
+  echo "   From outside, compare YOUR node against a second node you control"
+  echo "   at the same finalized height instead; see quickstart section 7."
 fi
 
 echo

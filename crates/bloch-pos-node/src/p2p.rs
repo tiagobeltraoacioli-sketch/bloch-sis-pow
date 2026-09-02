@@ -1525,10 +1525,14 @@ mod tests {
                 data_dir: dir.clone(),
                 max_peers: 16,
                 // Every node in these tests shares 127.0.0.1, and the
-                // colocation penalty is -50 × (peers_on_ip − 3)². Four nodes on
-                // one host would graylist each other before the test could
-                // observe anything. This is the same switch a fleet behind one
-                // proxy needs, and it is why it exists.
+                // colocation penalty is -50 × (peers_on_ip − 3)². It reaches
+                // `graylist_threshold` (-400) at SIX peers on one IP, not four
+                // — `peer_score_params` says six and is the number to trust;
+                // four scores -50 and graylists nobody. So this flag is not
+                // what keeps these tests alive at their current size. It is set
+                // because it is the same switch a fleet behind one proxy needs,
+                // and because a test that grows two more nodes would otherwise
+                // graylist itself with nothing in the output to say so.
                 behind_proxy: true,
             },
             tx,

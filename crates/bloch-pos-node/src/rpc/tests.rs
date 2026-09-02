@@ -32,9 +32,14 @@ fn entry(txid: u8, vout: u32, value: u64, script: u8) -> EutxoEntry {
 /// A committed genesis state with two validators and four outputs across two
 /// script hashes.
 ///
-/// The values are deliberately enormous: `18_000_000_000_000_000_000` is above
-/// `u64::MAX / 2`, so any code that sums balances in `u64` overflows on this
-/// fixture instead of on mainnet.
+/// The values are deliberately enormous: the `0xAB` script hash sums to
+/// 18,000,000,000,000,000,500, about 1,998x JavaScript's 2^53 exact-integer
+/// limit, so a client that reads `balance_sat` as a JSON *number* is silently
+/// wrong on this fixture instead of on mainnet.
+///
+/// It does not overflow `u64` — `u64::MAX` is 18,446,744,073,709,551,615, and
+/// this comment used to claim otherwise. What the fixture pins is the wire
+/// form (a decimal string), not u64 arithmetic.
 fn state_with_balances() -> CommittedState {
     let validators = vec![
         GenesisValidator {
@@ -375,7 +380,9 @@ fn getbalance_sums_the_eutxo_set_for_one_script_hash() {
     let st = state_with_balances();
     let v = balance_json(&st, &[0xAB; 32]);
 
-    // 9e18 + 9e18 + 500 — a sum that wraps u64 and does not wrap u128.
+    // 9e18 + 9e18 + 500. It still fits u64, barely (u64::MAX is ~18.45e18),
+    // and is held in u128; what it does exceed is 2^53, so it must leave as a
+    // string.
     assert_eq!(v.get("balance_sat").unwrap().as_str(), Some("18000000000000000500"));
     assert_eq!(v.get("utxo_count").unwrap().as_u64(), Some(3));
 
@@ -446,11 +453,17 @@ fn getutxos_lists_the_outputs_and_reports_truncation() {
 
 #[test]
 fn getmempoolinfo_reports_size_capacity_and_the_next_price() {
-    let v = mempool_info_json(7, 4_096, 1_750, 1_000);
+    let v = mempool_info_json(7, 4_096, 1_750, 1_000, 12, 34);
     assert_eq!(v.get("size").unwrap().as_u64(), Some(7));
     assert_eq!(v.get("max").unwrap().as_u64(), Some(4_096));
     assert_eq!(v.get("bytes").unwrap().as_u64(), Some(1_750));
     assert_eq!(v.get("next_base_fee_millisat_per_gas").unwrap().as_str(), Some("1000"));
+    // O cache de recusa, de fora (2026-08-30). Duas perguntas diferentes:
+    // quantas transacoes o no se recusa a readmitir, e quantas reofertas ele
+    // ja recusou de fato. Cache com entradas e zero hits nao esta barrando
+    // nada real.
+    assert_eq!(v.get("barred").unwrap().as_u64(), Some(12));
+    assert_eq!(v.get("barred_hits").unwrap().as_u64(), Some(34));
 }
 
 #[test]
@@ -597,7 +610,10 @@ fn unsupported_capabilities_refuse_with_their_own_codes_and_reasons() {
     let v = call(spy.as_ref(), &request("gettransaction", r#"["ab"]"#));
     assert_eq!(error_code(&v), Some(NO_TRANSACTION_INDEX));
     let msg = v.get("error").unwrap().get("message").unwrap().as_str().unwrap();
-    assert!(msg.contains("no id"), "the message must say why, not just no: {msg}");
+    assert!(
+        msg.contains("no transaction index"),
+        "the message must say why, not just no: {msg}"
+    );
     assert!(msg.contains("do not retry"), "a permanent answer must say it is permanent");
     assert!(spy.last().is_none(), "a refused method must never reach the node");
 
@@ -982,3 +998,285 @@ fn a_body_split_across_packets_is_reassembled() {
     assert!(out.starts_with("HTTP/1.1 200"), "got {out}");
     assert_eq!(spy.last(), Some(RpcRequest::BlockBySlot(41_290)));
 }
+
+// ─── getbuildinfo: which binary is answering ────────────────────────────────
+//
+// These guards were written against the failure they are for. Three fleet
+// boxes once ran three different binaries and all reported the same version
+// string; a published release was an abandoned branch while the fleet ran
+// something else; and on 2026-09-02 both public archivals answered
+// `getmempoolinfo` with four fields where this build emits six. Every one of
+// those is a case where a node's self-report was true and useless.
+//
+// So the bar for these tests is not "the method returns JSON". It is that the
+// identity is derived from the tree, that it is honest about which parts are
+// assertions, and that it says nothing an operator would refuse to publish.
+
+/// The method routes, and it routes to something that reads no chain state.
+#[test]
+fn getbuildinfo_routes() {
+    let spy = Spy::new();
+    let b = spy.as_ref();
+    call(b, &request("getbuildinfo", "[]"));
+    assert_eq!(spy.last(), Some(RpcRequest::BuildInfo));
+
+    // Params are ignored rather than rejected: this method asks nothing of the
+    // caller, and an integrator sending `null` or a stray array must not get a
+    // parse error for a question with no arguments.
+    assert_eq!(route("getbuildinfo", None).unwrap(), RpcRequest::BuildInfo);
+    assert_eq!(
+        route("getbuildinfo", Some(&Json::Arr(vec![Json::u(1)]))).unwrap(),
+        RpcRequest::BuildInfo
+    );
+}
+
+/// Every field a partner is told to compare is present and non-empty.
+///
+/// A missing field would degrade silently: a client comparing two nodes on a
+/// key neither of them emits sees them agree.
+#[test]
+fn getbuildinfo_reports_the_fields_a_partner_compares() {
+    let v = build_info_json();
+    for k in [
+        "build_version",
+        "package_version",
+        "commit",
+        "commit_source",
+        "tree_state",
+        "source_digest",
+        "source_digest_alg",
+        "source_digest_scope",
+        "source_files",
+        "source_bytes",
+        "rustc",
+        "profile",
+        "target",
+        "digest_note",
+    ] {
+        let f = v.get(k).unwrap_or_else(|| panic!("getbuildinfo has no `{k}`"));
+        let s = f.as_str().unwrap_or_else(|| panic!("`{k}` must be a string"));
+        assert!(!s.is_empty(), "`{k}` must not be empty");
+    }
+
+    assert_eq!(v.get("source_digest_alg").unwrap().as_str(), Some("sha3-256"));
+
+    // `commit_source` is the field that separates evidence from assertion.
+    // Anything outside this set means the build script grew a case nobody
+    // taught a client to read.
+    let cs = v.get("commit_source").unwrap().as_str().unwrap();
+    assert!(
+        ["git", "asserted", "none"].contains(&cs),
+        "commit_source must be git|asserted|none, got {cs}"
+    );
+    let ts = v.get("tree_state").unwrap().as_str().unwrap();
+    assert!(
+        ["clean", "modified", "unverified", "unknown"].contains(&ts),
+        "tree_state must be clean|modified|unverified|unknown, got {ts}"
+    );
+
+    // The bound rides with the answer, so a client cannot read the digest as
+    // proof without having been told otherwise in the same object.
+    let note = v.get("digest_note").unwrap().as_str().unwrap();
+    assert!(note.contains("not proof"), "the digest must ship with its bound: {note}");
+}
+
+/// The digest is a real digest of a real tree, not a placeholder.
+///
+/// This is the test that would have caught the whole method being cosmetic.
+/// `unavailable` is a legitimate runtime answer when the crate is built out of
+/// a vendored copy with no workspace around it — but a workspace build that
+/// reports it means the build script silently failed to find the tree, and the
+/// identity everyone is about to rely on is a constant string.
+#[test]
+fn getbuildinfo_digest_is_computed_not_typed() {
+    let v = build_info_json();
+    let d = v.get("source_digest").unwrap().as_str().unwrap();
+    assert_eq!(d.len(), 64, "sha3-256 is 64 hex characters, got {d:?}");
+    assert!(
+        d.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "digest must be lowercase hex: {d}"
+    );
+    // Not the digest of the empty string, and not all one character.
+    assert_ne!(d, "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a");
+    assert!(d.chars().collect::<std::collections::HashSet<_>>().len() > 4);
+
+    // The tree it hashed must be this repository's, at the order of magnitude
+    // it actually has. A digest over three files would pass every assertion
+    // above and cover none of the consensus crates.
+    let files: u64 = v.get("source_files").unwrap().as_str().unwrap().parse().unwrap();
+    let bytes: u64 = v.get("source_bytes").unwrap().as_str().unwrap().parse().unwrap();
+    assert!(files > 100, "digest scope covers only {files} files — it lost the tree");
+    assert!(bytes > 1_000_000, "digest scope covers only {bytes} bytes — it lost the tree");
+}
+
+/// Nothing here is anything an operator would refuse to publish.
+///
+/// The constraint is not decorative: this method is meant to be answered to an
+/// exchange over an open port, so a field that carried a data directory, a home
+/// directory or a peer id would turn an identity endpoint into a disclosure.
+#[test]
+fn getbuildinfo_leaks_nothing_operational() {
+    let json = build_info_json().to_string();
+
+    // Absolute paths, in any of the shapes this crate is built under.
+    for probe in ["/Users", "/home", "/root", "/var", "/private/tmp", "C:\\"] {
+        assert!(!json.contains(probe), "getbuildinfo leaked a path fragment {probe}: {json}");
+    }
+    // The build directory itself, whatever it happens to be on this machine.
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    assert!(!json.contains(manifest), "getbuildinfo leaked the manifest dir: {json}");
+    for comp in manifest.split('/').filter(|c| c.len() > 3) {
+        // Every component of the build path — the username among them — must
+        // be absent. `crates` and `bloch-pos-node` are repository-relative
+        // names, not machine facts, so they are exempt.
+        if ["crates", "bloch-pos-node"].contains(&comp) {
+            continue;
+        }
+        assert!(
+            !json.contains(comp),
+            "getbuildinfo leaked build-path component {comp:?}: {json}"
+        );
+    }
+    // Environment the node is run with, and the things an operator holds.
+    for probe in ["ssh", "PRIVATE", "secret", "mnemonic", "keystore", "validator_key"] {
+        assert!(
+            !json.to_lowercase().contains(&probe.to_lowercase()),
+            "getbuildinfo mentions {probe}: {json}"
+        );
+    }
+}
+
+/// The identity survives the round trip a partner actually makes.
+///
+/// Testing `build_info_json()` directly would pass even if the method were
+/// unreachable over the wire — which is precisely the state the release tag is
+/// in today, where the whole machine-readable surface exists on branches and
+/// answers -32601 in production.
+#[test]
+fn getbuildinfo_answers_over_the_json_rpc_envelope() {
+    /// A backend that answers `BuildInfo` the way the engine does and nothing
+    /// else, so this test covers the dispatcher and the formatter without
+    /// standing a node up.
+    struct Ident;
+    impl RpcBackend for Ident {
+        fn call(&self, req: RpcRequest) -> RpcResult {
+            match req {
+                RpcRequest::BuildInfo => Ok(build_info_json()),
+                other => panic!("getbuildinfo must not decode to {other:?}"),
+            }
+        }
+    }
+
+    let out = call(&Ident, &request("getbuildinfo", "[]")).to_string();
+    assert!(out.contains("\"source_digest\""), "not reachable over the envelope: {out}");
+    assert!(out.contains("\"commit_source\""), "not reachable over the envelope: {out}");
+    assert!(!out.contains("\"error\""), "getbuildinfo errored: {out}");
+    // The envelope must carry the id back, or a client cannot match it.
+    assert!(out.contains("\"id\":1"), "envelope lost the id: {out}");
+}
+
+// ─── 4. The refusal split, and `error.data` ─────────────────────────────────
+
+/// **The two refusals must not share one code.**
+///
+/// This is the tripwire for the defect the split fixes: `Refusal::Invalid` and
+/// `Refusal::PreviouslyRefused` both mapped to `TX_REFUSED`, so opposite advice
+/// — "never resubmit these bytes" and "resubmit after slot N" — arrived under
+/// one number, separable only by reading English. If someone collapses them
+/// back onto one constant, this goes red on the first line.
+#[test]
+fn the_terminal_and_the_retryable_refusal_are_different_codes() {
+    assert_ne!(
+        TX_REFUSED, TX_REFUSED_RETRYABLE,
+        "terminal and retryable refusals must never share a code: a client \
+         branching on the number would be wrong for half of them"
+    );
+    // The numbers themselves are the published contract. -32008 in particular
+    // is already in integrators' hands as "never resubmit"; it must not move.
+    assert_eq!(TX_REFUSED, -32008, "-32008 is published as terminal; it cannot be redefined");
+    assert_eq!(TX_REFUSED_RETRYABLE, -32009);
+}
+
+/// **`until_slot` must be machine-readable**, not a number embedded in prose.
+///
+/// The message is explicitly allowed to be reworded; the deadline is a value a
+/// client computes with. If `error.data` stops carrying it, a client is back to
+/// regexing `until slot 4242` out of a sentence — which is the failure mode
+/// this whole change exists to end.
+#[test]
+fn a_retryable_refusal_carries_its_deadline_in_error_data() {
+    let spy = Spy::failing(RpcError::tx_refused_retryable(
+        4_242,
+        "barred until slot 4242",
+    ));
+    // Any routable method: the backend answer is canned, and the point is
+    // what the ENVELOPE does with an error that carries `data`.
+    let raw = handle_body(&request("getblockcount", "[]"), spy.as_ref());
+    let v = parse_json(&raw).expect("a response is always JSON");
+
+    assert_eq!(error_code(&v), Some(TX_REFUSED_RETRYABLE));
+    let data = v
+        .get("error")
+        .and_then(|e| e.get("data"))
+        .expect("a retryable refusal must carry `error.data`");
+    assert_eq!(
+        data.get("until_slot").and_then(Json::as_u64),
+        Some(4_242),
+        "the deadline must be readable without parsing the message: {raw}"
+    );
+    assert_eq!(
+        data.get("retryable"),
+        Some(&Json::Bool(true)),
+        "a generic client must be able to branch without a table of Bloch codes"
+    );
+    // A NUMBER, not a string: slot indexes are nowhere near 2^53, so the R3
+    // string treatment for satoshis would only make a client parse twice.
+    assert!(
+        matches!(data.get("until_slot"), Some(Json::Num(_))),
+        "until_slot must be a JSON number: {raw}"
+    );
+    // And it is really on the wire, in the literal bytes a client receives.
+    assert!(
+        raw.contains("\"code\":-32009") && raw.contains("\"until_slot\":4242"),
+        "the wire bytes must carry both: {raw}"
+    );
+}
+
+/// Every code that predates `data` keeps the exact wire shape it always had.
+///
+/// `error.data` is optional in JSON-RPC 2.0 §5.1, and an `error.data: null`
+/// would be a third state a client has to tell apart from absence. A terminal
+/// refusal in particular must carry nothing: "there is a deadline" is precisely
+/// the fact it is denying.
+#[test]
+fn errors_without_structured_detail_emit_no_data_member() {
+    for err in [
+        RpcError::new(TX_REFUSED, "cannot be admitted; retrying will not help"),
+        RpcError::new(BLOCK_NOT_FOUND, "no such block"),
+        RpcError::no_wallet(),
+    ] {
+        let code = err.code;
+        let spy = Spy::failing(err);
+        let raw = handle_body(&request("getblockbyslot", "[5]"), spy.as_ref());
+        let v = parse_json(&raw).unwrap();
+        assert_eq!(error_code(&v), Some(code));
+        assert!(
+            v.get("error").unwrap().get("data").is_none(),
+            "code {code} must emit no `data` member at all: {raw}"
+        );
+        assert!(!raw.contains("\"data\""), "not even as null: {raw}");
+    }
+}
+
+// `getnodeversion` and its test were dropped here on 2026-09-02, deliberately.
+//
+// `dev/refusal-split-release-20260901` added a second method answering the
+// question `getbuildinfo` above already answers, and the two branches merged
+// with NO conflict in `rpc.rs` or `engine.rs` — both methods routed, both
+// dispatched, one question with two answers on the wire. The surviving method
+// is `getbuildinfo`; see `rpc::build_info_json` and the registry at
+// `crates/bloch-pos-node/tests/rpc_method_registry.rs`. No alias was kept
+// because nothing anywhere called `getnodeversion` — swept 2026-09-02 across
+// every local and remote ref, it appeared only in the five files of its own
+// branch, so there is no compatibility claim to honour and an alias would
+// simply re-create the second name.

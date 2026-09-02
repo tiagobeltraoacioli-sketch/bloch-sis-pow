@@ -2,6 +2,20 @@
 
 //! Slashing execution — the state machine behind §7.3.
 //!
+//! > **NOT REACHABLE FROM THE NETWORK (stated 2026-09-01).** Everything in
+//! > this module is complete, unit-tested and correct, and nothing can invoke
+//! > it on the live chain. Evidence rides on wire tag `0x05`, and
+//! > `transition::PosTransaction::from_canonical_bytes` refuses that tag
+//! > unconditionally — the encoder folds the nested messages in as the signing
+//! > roots they were signed over, so the envelopes are unrecoverable by
+//! > construction. That decoder is the only one on every ingress path (block
+//! > body, gossip, `sendrawtransaction`), nothing constructs the transaction
+//! > outside tests, and no activation constant exists. Read the penalties
+//! > below as a *design*, and do not let them back a finality guarantee
+//! > anywhere: the retraction on `bloch-pos-node`'s `rpc::Finality` says why,
+//! > and `crates/bloch-pos-node/tests/slashing_backed_finality_claims.rs`
+//! > keeps this note and that codec in step.
+//!
 //! [`crate::attestation`] supplies *detection* (`surrounds`, `is_double_vote`)
 //! and [`crate::delegation::apply_slash`] supplies the pro-rata *arithmetic*.
 //! What neither supplies — and what this module adds — is the evidence
@@ -37,7 +51,7 @@
 //! collections are B-trees so iteration and any future serialization are
 //! canonical, and nothing here reads a clock — the epoch is an argument.
 
-use crate::attestation::{Attestation, SignatureVerifier};
+use crate::attestation::{Attestation, KeyLookup, SignatureVerifier};
 use crate::delegation::{apply_slash, Delegation};
 use crate::interfaces::ProposalEnvelope;
 use crate::params::DS_SLASH;
@@ -127,6 +141,15 @@ pub enum EvidenceError {
     AlreadySlashed,
     /// A signature failed verification — forged or corrupted evidence.
     BadSignature,
+    /// The registry the caller named has no key for the accused index, so the
+    /// evidence cannot be judged at all.
+    ///
+    /// Distinct from `BadSignature`: "I cannot resolve this validator" is not
+    /// "this validator did not sign". Before the verifier read the registry,
+    /// these two were the same value, and the consequence was that a
+    /// deposit-added validator was **unslashable** — every piece of evidence
+    /// against it came back `BadSignature` and was discarded as forged.
+    UnknownValidator,
 }
 
 /// Two conflicting signed attestations from one validator — the attestation
@@ -326,6 +349,7 @@ impl SlashingState {
         total_active_sat: u128,
         including_proposer: u32,
         verifier: &dyn SignatureVerifier,
+        keys: &dyn KeyLookup,
     ) -> Result<SlashingOutcome, EvidenceError> {
         // 1. Structure: one signer, real conflict.
         let offense = evidence.offense()?;
@@ -347,8 +371,17 @@ impl SlashingState {
         // 4. Signatures, last. Both messages, both verified under the same
         //    validator key — evidence is only evidence if the validator
         //    really signed both sides of the conflict.
+        //
+        //    "The same key" is now enforced structurally: the key is resolved
+        //    ONCE, from the offender's index, and both signatures are checked
+        //    against it. `offense()` has already established that both
+        //    attestations name the same validator, so resolving per-message
+        //    would be resolving the same index twice.
+        let Some(pubkey) = keys.pubkey(validator) else {
+            return Err(EvidenceError::UnknownValidator);
+        };
         for att in [&evidence.first, &evidence.second] {
-            if !verifier.verify(att.validator, &att.data.signing_root(), &att.signature) {
+            if !verifier.verify_with_key(pubkey, &att.data.signing_root(), &att.signature) {
                 return Err(EvidenceError::BadSignature);
             }
         }
@@ -390,6 +423,7 @@ impl SlashingState {
         total_active_sat: u128,
         including_proposer: u32,
         verifier: &dyn SignatureVerifier,
+        keys: &dyn KeyLookup,
     ) -> Result<SlashingOutcome, EvidenceError> {
         // 1. Structure: one signer, one slot, two different blocks.
         if first.header.proposer_index != second.header.proposer_index {
@@ -426,9 +460,14 @@ impl SlashingState {
         }
 
         // 4. Signatures, last — the proposer really signed both headers.
+        //    One key, resolved from the offender's index in the caller's
+        //    registry; step 1 has already established both headers name it.
+        let Some(pubkey) = keys.pubkey(validator) else {
+            return Err(EvidenceError::UnknownValidator);
+        };
         for env in [first, second] {
-            if !verifier.verify(
-                validator,
+            if !verifier.verify_with_key(
+                pubkey,
                 &env.header.proposal_signing_root(),
                 &env.proposer_sig,
             ) {
@@ -499,15 +538,20 @@ mod tests {
     /// A signature is "valid" iff it equals the signing root — enough to make
     /// forgery (any other bytes) detectable per-message in tests.
     struct RootEchoVerifier;
-    impl SignatureVerifier for RootEchoVerifier {
-        fn verify(&self, _v: u32, signing_root: &[u8; 32], signature: &[u8]) -> bool {
-            signature == signing_root
+    /// Every index resolves to the same placeholder key. These tests are about
+    /// window, dedup, membership and ordering — not about key binding — and
+    /// their verifier doubles ignore the key bytes. The cases that DO care
+    /// about resolution use `NoKeys` / a real registry instead.
+    struct AnyKey;
+    impl crate::attestation::KeyLookup for AnyKey {
+        fn pubkey(&self, _v: u32) -> Option<&[u8]> {
+            Some(b"placeholder-key")
         }
-        /// Mirrors this mock's `verify`: a test double that accepted
-        /// spends more easily than attestations would hide the very
-        /// forgery the spend path must refuse.
+    }
+
+    impl SignatureVerifier for RootEchoVerifier {
         fn verify_with_key(&self, _pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
-            self.verify(0, root, sig)
+            sig == root
         }
     }
 
@@ -561,14 +605,14 @@ mod tests {
         ev.second.signature = vec![0u8; 32]; // not the signing root: forged
         let mut st = SlashingState::new();
         let dels = [delegation(1, 7, 100_000)];
-        let r = st.process(&ev, 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier);
+        let r = st.process(&ev, 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey);
         assert_eq!(r.unwrap_err(), EvidenceError::BadSignature);
         assert!(!st.is_ejected(7));
         assert_eq!(st.slashed_in_window(10), 0);
         // The forged submission must not have burned the id: the honest
         // version of the same evidence still applies.
         let ok = double_vote(7);
-        assert!(st.process(&ok, 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier).is_ok());
+        assert!(st.process(&ok, 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey).is_ok());
     }
 
     #[test]
@@ -578,7 +622,7 @@ mod tests {
             second: signed(8, data(1, 2, 0xBB)),
         };
         let mut st = SlashingState::new();
-        let r = st.process(&ev, 10, &[], TOTAL_ACTIVE, 99, &RootEchoVerifier);
+        let r = st.process(&ev, 10, &[], TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey);
         assert_eq!(r.unwrap_err(), EvidenceError::DifferentValidators);
     }
 
@@ -607,7 +651,7 @@ mod tests {
             delegation(3, 8, 600_000), // other validator: untouched
         ];
         let mut st = SlashingState::new();
-        let out = st.process(&double_vote(7), 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier).unwrap();
+        let out = st.process(&double_vote(7), 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey).unwrap();
         assert_eq!(out.offense, SlashableOffense::DoubleVote);
         assert_eq!(out.penalty_bps, 500); // empty window: base only
         assert_eq!(out.delegation_losses_sat, vec![5_000, 15_000, 0]); // 5% each
@@ -631,7 +675,7 @@ mod tests {
     fn whistleblower_gets_one_thirty_second() {
         let dels = [delegation(1, 7, 640_000)];
         let mut st = SlashingState::new();
-        let out = st.process(&double_vote(7), 10, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier).unwrap();
+        let out = st.process(&double_vote(7), 10, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey).unwrap();
         assert_eq!(out.total_slashed_sat, 32_000); // 5% of 640k
         assert_eq!(out.whistleblower_reward_sat, 1_000); // exactly 1/32
         assert_eq!(out.including_proposer, 42);
@@ -644,11 +688,11 @@ mod tests {
         // pays 500 + 3 × 10000 × 15000/1000000 = 950 bps, not 500.
         let dels = [delegation(1, 7, 300_000), delegation(2, 8, 100_000)];
         let mut st = SlashingState::new();
-        let first = st.process(&double_vote(7), 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier).unwrap();
+        let first = st.process(&double_vote(7), 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey).unwrap();
         assert_eq!(first.penalty_bps, 500);
         assert_eq!(first.total_slashed_sat, 15_000);
 
-        let second = st.process(&double_vote(8), 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier).unwrap();
+        let second = st.process(&double_vote(8), 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey).unwrap();
         assert_eq!(second.penalty_bps, 950);
         assert!(second.penalty_bps > first.penalty_bps);
         assert_eq!(second.total_slashed_sat, 9_500); // 9.5% of 100k
@@ -668,7 +712,7 @@ mod tests {
     fn slashes_outside_the_window_stop_amplifying() {
         let dels = [delegation(1, 7, 300_000), delegation(2, 8, 100_000)];
         let mut st = SlashingState::new();
-        st.process(&double_vote(7), 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier).unwrap();
+        st.process(&double_vote(7), 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey).unwrap();
         // Just inside the window: still amplified.
         let inside = 10 + CORRELATION_WINDOW_EPOCHS - 1;
         assert_eq!(st.penalty_bps(500, inside, TOTAL_ACTIVE), 950);
@@ -681,14 +725,14 @@ mod tests {
         let dels = [delegation(1, 7, 100_000)];
         let mut st = SlashingState::new();
         let ev = double_vote(7);
-        st.process(&ev, 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier).unwrap();
+        st.process(&ev, 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey).unwrap();
 
-        let replay = st.process(&ev, 11, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier);
+        let replay = st.process(&ev, 11, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey);
         assert_eq!(replay.unwrap_err(), EvidenceError::AlreadyApplied);
 
         // Swapping first/second must not mint a fresh identity.
         let swapped = SlashingEvidence { first: ev.second.clone(), second: ev.first.clone() };
-        let r = st.process(&swapped, 11, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier);
+        let r = st.process(&swapped, 11, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey);
         assert_eq!(r.unwrap_err(), EvidenceError::AlreadyApplied);
 
         // And the window recorded the slash exactly once.
@@ -699,13 +743,13 @@ mod tests {
     fn an_ejected_validator_is_not_punished_again() {
         let dels = [delegation(1, 7, 100_000)];
         let mut st = SlashingState::new();
-        st.process(&double_vote(7), 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier).unwrap();
+        st.process(&double_vote(7), 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey).unwrap();
 
         // Genuinely different evidence (a surround, new messages) against the
         // same validator: rejected, and neither delegators nor the window are
         // touched a second time.
         let other = surround(7);
-        let r = st.process(&other, 11, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier);
+        let r = st.process(&other, 11, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey);
         assert_eq!(r.unwrap_err(), EvidenceError::AlreadySlashed);
         assert_eq!(st.slashed_in_window(11), 5_000);
     }
@@ -741,7 +785,7 @@ mod tests {
         let (a, b) = (signed_header(5, 7, 0xAA), signed_header(5, 7, 0xBB));
         let mut st = SlashingState::new();
         let out = st
-            .process_proposer(&a, &b, 10, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier)
+            .process_proposer(&a, &b, 10, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey)
             .unwrap();
         assert_eq!(out.offense, SlashableOffense::ProposerEquivocation);
         assert_eq!(out.penalty_bps, SLASH_PROPOSER_EQUIV_BPS); // empty window: base only
@@ -756,7 +800,7 @@ mod tests {
         // Re-gossiping your own block must never be punishable.
         let a = signed_header(5, 7, 0xAA);
         let mut st = SlashingState::new();
-        let r = st.process_proposer(&a, &a.clone(), 10, &[], TOTAL_ACTIVE, 42, &RootEchoVerifier);
+        let r = st.process_proposer(&a, &a.clone(), 10, &[], TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey);
         assert_eq!(r.unwrap_err(), EvidenceError::NotConflicting);
     }
 
@@ -765,7 +809,7 @@ mod tests {
         // One proposer legitimately proposes in many slots over time.
         let (a, b) = (signed_header(5, 7, 0xAA), signed_header(6, 7, 0xBB));
         let mut st = SlashingState::new();
-        let r = st.process_proposer(&a, &b, 10, &[], TOTAL_ACTIVE, 42, &RootEchoVerifier);
+        let r = st.process_proposer(&a, &b, 10, &[], TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey);
         assert_eq!(r.unwrap_err(), EvidenceError::NotConflicting);
     }
 
@@ -776,13 +820,13 @@ mod tests {
         b.proposer_sig = vec![0u8; 32]; // not the signing root: forged
         let dels = [delegation(1, 7, 100_000)];
         let mut st = SlashingState::new();
-        let r = st.process_proposer(&a, &b, 10, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier);
+        let r = st.process_proposer(&a, &b, 10, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey);
         assert_eq!(r.unwrap_err(), EvidenceError::BadSignature);
         assert!(!st.is_ejected(7));
         assert_eq!(st.slashed_in_window(10), 0);
         // The honest version of the same pair still applies.
         let b_ok = signed_header(5, 7, 0xBB);
-        assert!(st.process_proposer(&a, &b_ok, 10, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier).is_ok());
+        assert!(st.process_proposer(&a, &b_ok, 10, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey).is_ok());
     }
 
     #[test]
@@ -790,8 +834,8 @@ mod tests {
         let dels = [delegation(1, 7, 100_000)];
         let (a, b) = (signed_header(5, 7, 0xAA), signed_header(5, 7, 0xBB));
         let mut st = SlashingState::new();
-        st.process_proposer(&a, &b, 10, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier).unwrap();
-        let r = st.process_proposer(&b, &a, 11, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier);
+        st.process_proposer(&a, &b, 10, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey).unwrap();
+        let r = st.process_proposer(&b, &a, 11, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey);
         assert_eq!(r.unwrap_err(), EvidenceError::AlreadyApplied);
         assert_eq!(st.slashed_in_window(11), 5_000); // recorded exactly once
     }
@@ -802,9 +846,9 @@ mod tests {
         // later proposer-equivocation evidence — the stake was already burned.
         let dels = [delegation(1, 7, 100_000)];
         let mut st = SlashingState::new();
-        st.process(&double_vote(7), 10, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier).unwrap();
+        st.process(&double_vote(7), 10, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey).unwrap();
         let (a, b) = (signed_header(5, 7, 0xAA), signed_header(5, 7, 0xBB));
-        let r = st.process_proposer(&a, &b, 11, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier);
+        let r = st.process_proposer(&a, &b, 11, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey);
         assert_eq!(r.unwrap_err(), EvidenceError::AlreadySlashed);
         assert_eq!(st.slashed_in_window(11), 5_000);
     }
@@ -818,7 +862,7 @@ mod tests {
         tainted.eligible = false;
         let dels = [delegation(1, 7, 100_000), tainted];
         let mut st = SlashingState::new();
-        let out = st.process(&double_vote(7), 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier).unwrap();
+        let out = st.process(&double_vote(7), 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey).unwrap();
         assert_eq!(out.delegation_losses_sat, vec![5_000, 0]);
     }
 }

@@ -120,6 +120,12 @@ mod harness {
         h3(&[b"E2E:PUBKEY", &index.to_le_bytes()]).to_vec()
     }
 
+    /// Invert `stub_pubkey`. A scan over the fixture's index space, so an
+    /// unissued key answers `None` rather than aliasing onto index 0.
+    pub fn stub_index_of_key(pk: &[u8]) -> Option<u32> {
+        (0..64u32).find(|i| stub_pubkey(*i) == pk)
+    }
+
     pub fn stub_key_sign(pubkey: &[u8], signing_root: &[u8; 32]) -> Vec<u8> {
         h3(&[b"E2E:PROPSIG", pubkey, signing_root]).to_vec()
     }
@@ -139,14 +145,14 @@ mod harness {
     /// The injected attestation verifier (frozen `SignatureVerifier` boundary).
     pub struct StubAttSigs;
     impl SignatureVerifier for StubAttSigs {
-        fn verify(&self, validator: u32, signing_root: &[u8; 32], signature: &[u8]) -> bool {
-            signature == stub_att_sign(validator, signing_root).as_slice()
-        }
-        /// Mirrors this mock's `verify`: a test double that accepted
-        /// spends more easily than attestations would hide the very
-        /// forgery the spend path must refuse.
-        fn verify_with_key(&self, _pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
-            self.verify(0, root, sig)
+        /// Binds signature → KEY. See the note on `produce::MockCrypto`: the
+        /// index form is gone from the trait, so the double recovers the index
+        /// this harness assigned the key and checks that index's signature.
+        fn verify_with_key(&self, pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
+            match stub_index_of_key(pk) {
+                Some(v) => sig == stub_att_sign(v, root).as_slice(),
+                None => false,
+            }
         }
     }
 
@@ -195,6 +201,20 @@ mod harness {
         pub index: u32,
         pub stake: u64,
         pub pubkey: Vec<u8>,
+    }
+
+    /// This harness's registry answering "what key is validator `i` under?",
+    /// mirroring the production impls over the real registry. By the `index`
+    /// FIELD, never by position — the harness happens to build a dense sorted
+    /// registry, and relying on that would be relying on a coincidence.
+    /// A newtype because the orphan rule forbids `impl ForeignTrait for
+    /// Vec<_>` from a test crate. Borrowing, not owning: this wraps the
+    /// pre-state registry in place on the hot path.
+    pub struct RegKeys<'a>(pub &'a [RegEntry]);
+    impl bloch_pos_committee::attestation::KeyLookup for RegKeys<'_> {
+        fn pubkey(&self, validator: u32) -> Option<&[u8]> {
+            self.0.iter().find(|r| r.index == validator).map(|r| r.pubkey.as_slice())
+        }
     }
 
     /// The post-state of one block, and the only thing a consensus rule may
@@ -578,7 +598,9 @@ mod harness {
                 if a.data.target_epoch != epoch {
                     return Err(TransitionError::Attestation(i as u32));
                 }
-                validate_attestation(a, &committee, h.slot, &StubAttSigs)
+                // Keys from the same pre-state registry `committee` was drawn
+                // from — the harness mirrors the transition's own pairing.
+                validate_attestation(a, &committee, h.slot, &StubAttSigs, &RegKeys(&pre.registry))
                     .map_err(|_| TransitionError::Attestation(i as u32))?;
             }
 

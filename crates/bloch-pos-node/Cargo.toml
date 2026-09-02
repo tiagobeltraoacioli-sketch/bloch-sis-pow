@@ -82,3 +82,10 @@ async-trait = "0.1"
 # not inherit the root's patch table, so it is restated here.
 [patch.crates-io]
 pqcrypto-internals = { path = "../pqcrypto-internals" }
+
+# Build-time only. The build script hashes the source tree it is about to
+# compile (see build.rs) so `getbuildinfo` can report an identity derived from
+# FILES rather than from a string someone typed. Same version the crate already
+# depends on at runtime, so this adds no package to Cargo.lock.
+[build-dependencies]
+sha3 = "0.10"

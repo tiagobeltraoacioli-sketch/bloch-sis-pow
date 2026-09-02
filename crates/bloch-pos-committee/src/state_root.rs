@@ -1005,6 +1005,39 @@ pub struct EutxoEntry {
     pub script_hash: [u8; 32],
 }
 
+/// The committed registry in its slice form (`derive::ChainState::registry`),
+/// answering the same question the `BTreeMap` form answers in `transition`.
+///
+/// **Lookup is by the `index` FIELD, never by position in the slice.** Those
+/// coincide only while the registry is dense and sorted, which is true today
+/// and is not a property anything enforces — and the moment a registry is ever
+/// filtered, reordered, or built with a gap, position-indexing silently
+/// returns *another validator's key*. That is the one way this design could
+/// produce a wrong key rather than no key, so it is closed here by
+/// construction. (The same latent shape exists in the node's genesis keystore
+/// gate, `engine.rs`, which does `manifest.validators[keys.index as usize]`
+/// after having found the record by `.index` — reported separately.)
+///
+/// A linear scan, deliberately, rather than a binary search over an assumed
+/// sort order: the scan is correct for any ordering, and it feeds a ≈4.6 KB
+/// hybrid verify that costs milliseconds — the scan of a 64-element slice is
+/// free at that scale. Correctness over a micro-optimisation whose precondition
+/// nothing checks.
+impl crate::attestation::KeyLookup for [ValidatorRecord] {
+    fn pubkey(&self, validator: u32) -> Option<&[u8]> {
+        self.iter().find(|r| r.index == validator).map(|r| r.pubkey.as_slice())
+    }
+}
+
+/// The owned form, delegating to the slice impl above. Needed as a separate
+/// impl rather than relying on deref: `[T]` is unsized, so `&[ValidatorRecord]`
+/// cannot be coerced to `&dyn KeyLookup`, and callers hold a `Vec`.
+impl crate::attestation::KeyLookup for Vec<ValidatorRecord> {
+    fn pubkey(&self, validator: u32) -> Option<&[u8]> {
+        <[ValidatorRecord] as crate::attestation::KeyLookup>::pubkey(self.as_slice(), validator)
+    }
+}
+
 impl EutxoEntry {
     fn entry_key(&self) -> Vec<u8> {
         let mut k = Vec::with_capacity(36);

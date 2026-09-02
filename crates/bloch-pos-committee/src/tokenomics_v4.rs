@@ -5,10 +5,15 @@
 //! Spec: `docs/specs/BLOCH-TOKENOMICS-V4.md`. Supersedes `tokenomics_v2.rs`
 //! (21 B nominal, perpetual tail) and the ADR-035 emission V3 floor.
 //!
-//! **Nothing here is active.** These constants live in the standalone PoS crate
-//! and are not referenced by the node. Genesis-4 is a fresh chain, so there is
-//! no activation height to gate — the constants take effect only if and when a
-//! new genesis is produced from them.
+//! **These constants are active and consensus-critical.** They are read from
+//! the production transition — `GENESIS_ISSUED_SAT` seeds the genesis state,
+//! `TOTAL_SUPPLY_SAT` is the hard-cap check on every epoch boundary, and
+//! `validator_reward_decay_sat` drives issuance — and from `fee_market`,
+//! `rewards`, `delegation`, `genesis_cohort` and `staking`. Genesis-4 is a
+//! fresh chain, so there is no activation height gating THEM; that is a
+//! different statement from being inert, and this header made the second one
+//! until 2026-09-02, claiming the crate was standalone and unreferenced by the
+//! node.
 //!
 //! ## The u64 hazard, front and centre
 //!
@@ -92,7 +97,9 @@ pub const TOTAL_SUPPLY_SAT: u128 = TOTAL_SUPPLY_BLOCH * SAT_PER_BLOCH;
 /// founder's Genesis-3 holdings come across as ordinary liquid carryover and a
 /// fresh grant is made on top (founder decision, 2026-08-11; an earlier draft
 /// re-granted the full 17%, the decision settled at 10%). Combined, the
-/// founder holds 26.89% of supply — [`FOUNDER_TOTAL_BLOCH`] pins it. §4A of
+/// founder holds 27.04% of supply — [`FOUNDER_TOTAL_BLOCH`] pins it, and its
+/// assert pins that share at 2,704 basis points. 26.89% was the figure before
+/// the carryover was re-measured; this line still stated it as current. §4A of
 /// the tokenomics spec states what that does to the activation gates.
 pub const FOUNDER_BLOCH: u128 = 10_000_000_000; // 10%
 /// Sold to funds; the Foundation is the counterparty. Nothing liquid at
@@ -126,8 +133,11 @@ pub const FOUNDATION_LIQUID_AT_GENESIS_BLOCH: u128 =
 
 /// The carried-over ledger — **one balance set, no founder line**.
 ///
-/// Measured on Genesis-3 at height 43,172 (448,337 UTXOs, 15 addresses) as
-/// 3,773,884,800 BLCH, and carried across under the split: x100/21 exactly,
+/// Measured on Genesis-3 at height 39,918 (452,726 UTXOs, 16 addresses) as
+/// 3,810,744,000 BLCH, and carried across under the split: x100/21 exactly,
+/// prose-guard: bind height=CARRYOVER_MEASURED_HEIGHT,
+///   UTXOs=CARRYOVER_MEASURED_UTXOS
+///
 /// which this figure is (the G3 total is divisible by 21, so the scaled total
 /// is exact — no dust at the aggregate level; per-row dust is the builder's
 /// problem, see [`split_g3_sat`]). Every balance crosses as ordinary liquid
@@ -389,14 +399,12 @@ const _: () = assert!(VC_BLOCH * SPLIT_DENOMINATOR == 2_100_000_000 * SPLIT_NUME
 const _: () = assert!(TEAM_BLOCH * SPLIT_DENOMINATOR == 2_100_000_000 * SPLIT_NUMERATOR);
 const _: () = assert!(MARKETING_BLOCH * SPLIT_DENOMINATOR == 840_000_000 * SPLIT_NUMERATOR);
 const _: () = assert!(LIQUIDITY_BLOCH * SPLIT_DENOMINATOR == 1_050_000_000 * SPLIT_NUMERATOR);
-// Re-pinned 2026-08-13 to the TERMINAL snapshot (h39,918): the carryover is
-// what the ledger says it is, not what a draft said it would be. The split
-// stays exact on the new figure too — 3,810,744,000 is divisible by 21.
-//
-// Careful when reading the prose in this file: it was re-pinned TWICE on
-// 2026-08-13 and only the assertions were carried forward, so comments
-// written in between described h39,328 / 3,805,746,000 / 452,133 long after
-// those stopped being true. Corrected 2026-09-01 against the file itself.
+// Re-pinned to the measured snapshot at `CARRYOVER_MEASURED_HEIGHT`: the
+// carryover is what the ledger says it is, not what a draft said it would be.
+// The split stays exact on the terminal figure — 3,810,744,000 is divisible
+// by 21, which is what the assert below actually pins. This comment named the
+// superseded 2026-08-13 row (a different height and 3,805,746,000) beside an
+// assert that rejects it.
 const _: () =
     assert!(CARRYOVER_TOTAL_BLOCH * SPLIT_DENOMINATOR == 3_810_744_000 * SPLIT_NUMERATOR);
 const _: () =
@@ -404,12 +412,14 @@ const _: () =
 
 /// Largest single carried-over address, for the concentration reporting in §4A.
 /// Not a consensus quantity and not a distinct class of coin — a measurement,
-/// re-taken from the same snapshot as [`CARRYOVER_TOTAL_BLOCH`] — the terminal
-/// one, h39,918: the address `e986db51…` holds
-/// 357,983,416,998,063,769 sat = 3,579,834,169.98 BLCH across 426,194 of the
-/// set's 452,726 outputs. Scaled ×100/21 and truncated to whole BLCH.
-/// The assertion below has always carried these figures; only this prose
-/// lagged. Re-measured from the file 2026-09-01.
+/// re-taken from the same snapshot as [`CARRYOVER_TOTAL_BLOCH`] — the one at
+/// [`CARRYOVER_MEASURED_HEIGHT`], whose root is [`CARRYOVER_MEASURED_ROOT`] and
+/// whose size is [`CARRYOVER_MEASURED_UTXOS`] outputs: the address `e986db51…`
+/// holds 357,983,416,998,063,769 sat = 3,579,834,169.98 BLCH. Scaled ×100/21
+/// and truncated to whole BLCH. The satoshi figure is the one the compile-time
+/// assert below actually pins; this doc previously carried a different snapshot
+/// (a different height, root and output count) and a satoshi figure that scales
+/// to 17,023,029,380 — which is not the constant.
 ///
 /// Both figures now come from one snapshot, which is the only way the ratio
 /// between them means anything. Updating the total against a fresh
@@ -449,7 +459,11 @@ const _: () = assert!(
     "a medida escalada nao bate com a medida G3 sob o split"
 );
 
-/// Founder carried-over balance plus the new grant: 27.05% of supply.
+/// Founder carried-over balance plus the new grant. The exact value is
+/// 27.0468% of supply, which rounds to **27.05%**; the `2704`-basis-point
+/// assert below pins the TRUNCATED basis points, not the rounded percentage.
+/// Both numbers are correct about different things, and stating only one of
+/// them reads as a discrepancy. (Stated as 27.02% here until 2026-09-02.)
 ///
 /// Up from 26.89%: the re-measured carryover is larger and the founder holds
 /// 93.9406% of it, so their share of a fixed cap rises. Recorded rather than

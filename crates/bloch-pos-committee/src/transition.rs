@@ -142,6 +142,7 @@ use crate::params::SLOTS_PER_EPOCH;
 use crate::rewards::{self, StakeAccount};
 use crate::sample::Validator;
 use crate::schedule;
+use crate::attestation::KeyLookup as _;
 use crate::slashing;
 use crate::staking::{self, QueuedDeposit};
 use crate::fee_market;
@@ -874,6 +875,17 @@ pub enum TxReject {
     Transfer(TransferReject),
     /// A deposit, exit or delegation failed its state-dependent rule.
     StakingRule,
+    /// A `Deposit` or `Delegate` arrived below
+    /// [`crate::params::DEPOSIT_ACTIVATION_EPOCH`]. Unfunded bonding is not a
+    /// rule this chain has ever activated: both messages create consensus
+    /// weight without spending an eUTXO input, and the gate is what makes the
+    /// refusal a property of the CHAIN rather than of whichever node happened
+    /// to hold the transaction. Its own variant, not `StakingRule`, because
+    /// "the flag day has not arrived" and "the amount was below the minimum"
+    /// are different facts and a test that cannot tell them apart is not
+    /// testing the gate. Both still surface as the frozen
+    /// `TransitionError::Transaction(i)`; no error code changes.
+    StakingNotActive,
     /// Slashing evidence reached the plain transaction seam instead of
     /// `apply_slashing_evidence`, which is the only path that verifies it.
     MisroutedEvidence,
@@ -950,6 +962,30 @@ thread_local! {
 /// The calling thread's [`ROOT_COMPUTATION_COUNT`]. Observability only.
 pub fn root_computations() -> u64 {
     ROOT_COMPUTATION_COUNT.with(|c| c.get())
+}
+
+thread_local! {
+    /// How many times the copy-on-write eUTXO map was **deeply copied** on
+    /// this thread — the O(n) event [`EutxoSet`]'s `Arc` exists to make rare.
+    ///
+    /// **Observability only.** No consensus rule reads it, nothing branches
+    /// on it, and it is never committed — it exists so a test can assert *how
+    /// many* full-map copies an epoch roll or a block costs, which is the
+    /// claim that decides whether a node far behind the wall clock can catch
+    /// up at all (2026-08-31: `close_epoch`'s clone of a 452,726-entry map,
+    /// once per rolled epoch per arriving attestation, was the whole stall).
+    /// Timing cannot make that claim honestly on a loaded box; a count can.
+    ///
+    /// Per-thread for the same two reasons as [`ROOT_COMPUTATION_COUNT`]: the
+    /// consensus engine is one thread by construction, and a process-wide
+    /// atomic would make test assertions a race against every other test in
+    /// the binary.
+    static EUTXO_MAP_DEEP_COPIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The calling thread's [`EUTXO_MAP_DEEP_COPIES`]. Observability only.
+pub fn eutxo_map_deep_copies() -> u64 {
+    EUTXO_MAP_DEEP_COPIES.with(|c| c.get())
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1033,6 +1069,10 @@ pub struct CommittedState {
     /// The validator registry, keyed by index. `BTreeMap` everywhere in this
     /// struct: iteration order must be a function of the data, never of a
     /// hasher seed or insertion history (rule 2).
+    ///
+    /// This is also the **authoritative key store** for consensus signature
+    /// checks — see the `impl KeyLookup` below and
+    /// [`crate::attestation::KeyLookup`] for which state answers where.
     validators: BTreeMap<u32, ValidatorRecord>,
     /// RANDAO chain position per validator. The chain *head* lives in the
     /// registry record (`randao_commitment`); this is how far down it is.
@@ -1204,6 +1244,35 @@ pub struct CommittedState {
     eutxos: EutxoSet,
 }
 
+/// The committed registry answering "what key is validator `i` registered
+/// under?", for whichever `CommittedState` the caller chose.
+///
+/// Implemented on the map rather than on `CommittedState` deliberately: the
+/// borrow a caller needs is of `self.validators` alone, so that a transition
+/// step can hold this immutable borrow while mutating *other* fields of the
+/// same state (participation, pending votes, the slashing machine). An impl on
+/// the whole state would borrow all of it and force a clone of the key — 3,745
+/// bytes per attestation, on the hot path.
+impl crate::attestation::KeyLookup for BTreeMap<u32, ValidatorRecord> {
+    fn pubkey(&self, validator: u32) -> Option<&[u8]> {
+        self.get(&validator).map(|r| r.pubkey.as_slice())
+    }
+}
+
+/// The same registry reached through the whole state, for callers that hold an
+/// immutable `CommittedState` (the node's gossip path holds an
+/// `Arc<CommittedState>` from `rolled_to`) and therefore have no borrow
+/// conflict to avoid.
+///
+/// Both impls exist on purpose. Inside the transition the map form is required:
+/// a step must hold this borrow while mutating participation and pending votes
+/// on the same state, and an impl over the whole state would borrow all of it.
+impl crate::attestation::KeyLookup for CommittedState {
+    fn pubkey(&self, validator: u32) -> Option<&[u8]> {
+        self.validators.pubkey(validator)
+    }
+}
+
 /// The committed eUTXO set, and the Merkle subtree it contributes to the
 /// state root, in one value.
 ///
@@ -1230,21 +1299,66 @@ pub struct CommittedState {
 /// recomputed one cannot disagree by construction.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EutxoSet {
-    entries: BTreeMap<([u8; 32], u32), crate::state_root::EutxoEntry>,
+    /// Behind an `Arc`, and that is a **liveness** decision, not a style one
+    /// (2026-08-31). `CommittedState` is cloned in two places that never
+    /// touch this map: `close_epoch` (via `Transition::process_epoch`) and
+    /// `compute_post_state`'s `pre.clone()`. A node `E` epochs behind the
+    /// wall clock re-derives `rolled_to(wall_epoch)` after every applied
+    /// block — the memo is generation-keyed and an applied block moves the
+    /// generation — so it paid `E` full copies of this map (452,726 entries,
+    /// ~60 MB, tens of ms each) *per block* while catching up. The break-even
+    /// was near a 6–10 epoch gap; a cold start (~1,550 epochs) held
+    /// `E × 60 MB` transiently and was unconditionally fatal. Sharing the map
+    /// makes those clones a refcount bump, exactly as the `Smt` beside it
+    /// already shares its nodes.
+    ///
+    /// Mutation goes through [`EutxoSet::entries_mut`] — `Arc::make_mut`, so
+    /// a *shared* map is copied in full once, on first write, and a writer
+    /// can never be observed by the states it was cloned from. The copy this
+    /// buys back is the one `pre.clone()` used to pay unconditionally: it now
+    /// happens only for a block that actually moves the ledger, and
+    /// [`EUTXO_MAP_DEEP_COPIES`] counts every occurrence so tests can pin
+    /// "an epoch roll copies nothing" as an assertion rather than a timing.
+    ///
+    /// **Not a consensus change.** The entries, their `BTreeMap` iteration
+    /// order, the leaves and the root are bit-identical to the unshared
+    /// representation; only *when the allocator copies* moved.
+    entries: std::sync::Arc<BTreeMap<([u8; 32], u32), crate::state_root::EutxoEntry>>,
     /// The subtree of `entry key -> value hash` leaves, one per entry, always
     /// exactly in step.
     tree: crate::state_root::Smt,
 }
 
 impl EutxoSet {
+    /// The single mutable path to the entries map — copy-on-write.
+    ///
+    /// If the map is shared (any other `CommittedState` clone still holds
+    /// it), `Arc::make_mut` copies it in full first; the counter records that
+    /// this happened, because "how many full copies" is the load-bearing
+    /// claim of the whole representation (see the field docs). Both mutators
+    /// go through here so no third path can copy — or worse, fail to
+    /// unshare — without being counted.
+    fn entries_mut(&mut self) -> &mut BTreeMap<([u8; 32], u32), crate::state_root::EutxoEntry> {
+        if std::sync::Arc::get_mut(&mut self.entries).is_none() {
+            EUTXO_MAP_DEEP_COPIES.with(|c| c.set(c.get() + 1));
+        }
+        std::sync::Arc::make_mut(&mut self.entries)
+    }
+
     fn insert(&mut self, entry: crate::state_root::EutxoEntry) {
         let (key, value_hash) = crate::state_root::eutxo_leaf(&entry);
         self.tree.insert(key, value_hash);
-        self.entries.insert((entry.txid, entry.vout), entry);
+        self.entries_mut().insert((entry.txid, entry.vout), entry);
     }
 
     fn remove(&mut self, outpoint: &([u8; 32], u32)) {
-        if let Some(entry) = self.entries.remove(outpoint) {
+        // The containment probe runs on the shared map so removing an absent
+        // outpoint stays what it always was — a no-op — instead of becoming
+        // the one full-map copy this type exists to avoid.
+        if !self.entries.contains_key(outpoint) {
+            return;
+        }
+        if let Some(entry) = self.entries_mut().remove(outpoint) {
             let (key, _) = crate::state_root::eutxo_leaf(&entry);
             self.tree.remove(&key);
         }
@@ -1317,7 +1431,10 @@ impl FromIterator<crate::state_root::EutxoEntry> for EutxoSet {
         // leaves — and therefore commit an identical root.
         let leaves: BTreeMap<[u8; 32], [u8; 32]> =
             entries.values().map(crate::state_root::eutxo_leaf).collect();
-        EutxoSet { entries, tree: crate::state_root::Smt::from_leaf_map(&leaves) }
+        EutxoSet {
+            entries: std::sync::Arc::new(entries),
+            tree: crate::state_root::Smt::from_leaf_map(&leaves),
+        }
     }
 }
 
@@ -1493,11 +1610,15 @@ impl CommittedState {
     ///
     /// # The look-ahead
     ///
-    /// `back = 1 + `[`crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS`],
-    /// unconditionally — there is no flag day. See
-    /// [`crate::params`]'s note on the removed
-    /// `ANCESTRY_SEED_ACTIVATION_EPOCH` for why the gate went away with the
-    /// coordinated relaunch, and why that is not a precedent.
+    /// `back = 1 + `[`crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS`] **only at
+    /// and above [`crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH`]**, which is
+    /// `u64::MAX`. Below it — that is, for every epoch any chain can reach —
+    /// this function computes `back = 1`, the original pre-F6 rule, exactly as
+    /// the `GATED.` note in the body says. Until 2026-09-02 this doc said the
+    /// look-ahead was unconditional and pointed at the constant as removed. It
+    /// was deleted on 2026-08-24 and restored; see its doc block for why the
+    /// coordinated-relaunch premise was wrong. **F6 is not closed in the
+    /// shipped binary**; arming that constant is what closes it.
     ///
     /// `back = 2` is what closes finding F6: at `back = 1` the seed for epoch
     /// `E` is the mix at the close of `E − 1`, so the trailing proposers of
@@ -1941,6 +2062,21 @@ impl CommittedState {
     /// `verifier` is threaded in because a transfer's authorisation is a
     /// signature check, and the only thing that may decide whether an output
     /// moves is whether its owner said so.
+    /// Is unfunded bonding (`Deposit`, `Delegate`) active in `epoch`?
+    ///
+    /// `epoch` is the caller's `self.epoch`, which `compute_post_state` has
+    /// already rolled to the judged block's own `epoch_of(header.slot)`. It is
+    /// committed state, never a clock — see the constant's docs for the full
+    /// divergence argument and for why arming the constant is not how deposits
+    /// open.
+    fn unfunded_bonding_active(epoch: u64) -> bool {
+        #[cfg(test)]
+        let forced = crate::params::rehearsal::bonding_gate_forced_open();
+        #[cfg(not(test))]
+        let forced = false;
+        forced || epoch >= crate::params::DEPOSIT_ACTIVATION_EPOCH
+    }
+
     fn apply_transaction(
         &mut self,
         tx: &PosTransaction,
@@ -1981,6 +2117,19 @@ impl CommittedState {
                 withdrawal_credentials,
                 commission_bps,
             } => {
+                // THE FLAG-DAY GATE, FIRST — before the registry is even
+                // consulted, for the same reason the TransferV2 arm above puts
+                // its gate first. Read from `self.epoch`: COMMITTED state,
+                // rolled to this block's epoch by compute_post_state's boundary
+                // walk, never node-local. `DEPOSIT_ACTIVATION_EPOCH` is
+                // `u64::MAX`, so this refuses at EVERY epoch — which is the
+                // point. Until this existed the only thing standing between a
+                // block and stake minted from nothing was
+                // `bloch-pos-node`'s `admissible`, mempool policy that one
+                // producer could lift for the whole network.
+                if !Self::unfunded_bonding_active(self.epoch) {
+                    return Err(TxReject::StakingNotActive);
+                }
                 let pubkey_hash: [u8; 32] = Sha3_256::digest(pubkey).into();
                 // A second deposit of a registered key is a top-up path
                 // decision the interface refuses to make implicitly.
@@ -2048,6 +2197,15 @@ impl CommittedState {
                 Ok(free)
             }
             PosTransaction::Delegate { delegator, validator, amount_sat, eligible } => {
+                // Same gate, same constant, and it must be the same constant:
+                // a delegation adds to `effective_stake` through
+                // `consensus_roster_at` and requests from `self.epoch + 1`, so
+                // it reaches consensus weight FASTER than a deposit, which
+                // waits out ACTIVATION_DELAY_EPOCHS. Closing the slow door
+                // alone would be a fix that reads like one and is not.
+                if !Self::unfunded_bonding_active(self.epoch) {
+                    return Err(TxReject::StakingNotActive);
+                }
                 let Some(rec) = self.validators.get(validator) else {
                     return Err(TxReject::StakingRule);
                 };
@@ -2512,6 +2670,20 @@ impl CommittedState {
                     first: first.clone(),
                     second: second.clone(),
                 };
+                // `&self.validators` beside `&mut self.slashing`: disjoint
+                // fields, so borrowck allows it, and the offender's key comes
+                // from the same pre-state registry that everything else in
+                // this block is judged against.
+                //
+                // Slashing is the site where the old index table failed most
+                // quietly. A deposit-added validator was not merely unable to
+                // vote — it was UNSLASHABLE: evidence against it hit
+                // `pubkeys.get(index) == None`, returned false, and was
+                // rejected as `BadSignature`. It could equivocate for free.
+                // A record is never removed from the registry (exit and
+                // slashing set fields, they do not delete), so evidence
+                // against an exited or already-slashed validator still
+                // resolves its key here.
                 self.slashing.process(
                     &pair,
                     self.epoch,
@@ -2519,6 +2691,7 @@ impl CommittedState {
                     total_active_sat,
                     including_proposer,
                     verifier,
+                    &self.validators,
                 )
             }
             SlashingEvidence::ProposerEquivocation { first, second } => {
@@ -2530,6 +2703,7 @@ impl CommittedState {
                     total_active_sat,
                     including_proposer,
                     verifier,
+                    &self.validators,
                 )
             }
         }
@@ -2734,10 +2908,21 @@ impl CommittedState {
             // `active_set` is the whole duty roster, not the slot committee:
             // the union of an epoch's committees IS the active set, so the
             // quorum denominator is total active stake (F1).
+            //
+            // The PARTITION is drawn from `consensus_roster_at` — the roster
+            // step 8 admitted these votes against — while the DENOMINATOR base
+            // stays the unleaked `roster`, because `process_epoch` subtracts
+            // the leak itself and would otherwise charge it twice. Below
+            // `LEAKED_ROSTER_ACTIVATION_EPOCH` the two are the same value, so
+            // this changes nothing about the chain as it stands; above it, it
+            // is what keeps the boundary tally reading the same committee the
+            // block did.
             let mut accepted = Vec::new();
+            let partition_set = st.consensus_roster_at(closing);
             let epoch_votes = finality::votes_from_partition(
                 closing,
                 &roster,
+                &partition_set,
                 &votes,
                 &st.seed_for_epoch(closing),
                 &mut accepted,
@@ -3275,8 +3460,28 @@ impl<V: SignatureVerifier> Transition<V> {
 
         // 7. The proposer's signature — one hybrid verify, after every cheap
         //    check and before the N attestation verifies.
-        if !self.verifier.verify(
-            header.proposer_index,
+        //
+        //    The key comes from `st.validators` — the registry of the BLOCK'S
+        //    PRE-STATE, which is the parent's post-state. Not this node's
+        //    head, not `rolled_to`, not a table built at boot from the genesis
+        //    manifest (which is what this used to read, and why a
+        //    deposit-added validator could not propose). That choice is what
+        //    keeps `apply_block` a pure function of (parent state, block):
+        //    every node judging this block resolves the same bytes, because
+        //    they all hold the same parent state. Deriving a consensus verdict
+        //    from node-local state instead is the 2026-08-08 `expected_bits`
+        //    fork, and this is the same shape of decision.
+        //
+        //    Note the proposer signing root covers `canonical_serialize()` of
+        //    the header, which includes `proposer_index` — so a proposer
+        //    signature is bound to its index and cannot be replayed under
+        //    another. (Attestation signing roots are NOT so bound; see the
+        //    note in step 8.)
+        let Some(proposer_key) = st.validators.pubkey(header.proposer_index) else {
+            return Err(TransitionError::Proposal(ProposalReject::UnknownProposer));
+        };
+        if !self.verifier.verify_with_key(
+            proposer_key,
             &header.proposal_signing_root(),
             &envelope.proposer_sig,
         ) {
@@ -3288,13 +3493,32 @@ impl<V: SignatureVerifier> Transition<V> {
         //    retained state (the 2-epoch mix window), so only they are
         //    admissible; membership is checked before each signature inside
         //    attestation::validate (its DoS ordering, not re-decided here).
+        //
+        //    Keys come from `st.validators`, the same pre-state registry that
+        //    produced `roster` and therefore `committee`. Membership and key
+        //    MUST come from one state: an attestation is authorised by the
+        //    pair (this index is in the committee, this key is registered at
+        //    that index), and splitting the pair across two states is how a
+        //    seat drawn from one view gets filled by a key from another.
+        //
+        //    This matters more here than for the proposer, because
+        //    `AttestationData::signing_root()` does NOT cover the validator
+        //    index — it covers only the vote (slot, head, source, target). The
+        //    binding of vote to voter is done entirely by which key this
+        //    lookup returns. It is sound because the registry makes index→key
+        //    injective and permanent (indices are never reused, pubkeys never
+        //    mutated, records never removed, and the Deposit handler rejects a
+        //    pubkey already registered), so no two indices can ever hold the
+        //    same key and no index can ever change hands.
         for (i, att) in attestations.iter().enumerate() {
             let reject = TransitionError::Attestation(i as u32);
             if crate::epoch_of(att.data.slot) != st.epoch {
                 return Err(reject);
             }
             let committee = committees::committee_for_slot(&seed, att.data.slot, &roster);
-            if attestation::validate(att, &committee, header.slot, &self.verifier).is_err() {
+            if attestation::validate(att, &committee, header.slot, &self.verifier, &st.validators)
+                .is_err()
+            {
                 return Err(reject);
             }
             // A validated, included attestation is participation — the fact
@@ -3680,9 +3904,6 @@ mod tests {
     /// links — the same reasoning as attestation.rs).
     struct OkVerifier;
     impl SignatureVerifier for OkVerifier {
-        fn verify(&self, _v: u32, _root: &[u8; 32], _sig: &[u8]) -> bool {
-            true
-        }
         fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
             true
         }
@@ -3722,9 +3943,6 @@ mod tests {
 
     struct ToyVerifier;
     impl SignatureVerifier for ToyVerifier {
-        fn verify(&self, _v: u32, _root: &[u8; 32], _sig: &[u8]) -> bool {
-            true
-        }
         fn verify_with_key(&self, pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
             sig == toy_sign(pk, root).as_slice()
         }
@@ -3954,9 +4172,6 @@ mod tests {
     /// bad while every other signature in the block still passes.
     struct MarkerVerifier;
     impl SignatureVerifier for MarkerVerifier {
-        fn verify(&self, _v: u32, _root: &[u8; 32], sig: &[u8]) -> bool {
-            sig != b"forged"
-        }
         fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], sig: &[u8]) -> bool {
             sig != b"forged"
         }
@@ -4149,6 +4364,97 @@ mod tests {
         setup_with(n, ToyVerifier, opening_balances)
     }
 
+    /// A distinguishable output for the copy-on-write tests.
+    fn cow_coin(i: u32) -> crate::state_root::EutxoEntry {
+        let mut txid = [0u8; 32];
+        txid[..4].copy_from_slice(&i.to_le_bytes());
+        crate::state_root::EutxoEntry {
+            txid,
+            vout: 0,
+            value: 1_000 + i as u64,
+            script_hash: [7u8; 32],
+        }
+    }
+
+    /// **The catch-up fix's load-bearing claim, as a count.** Rolling a state
+    /// across epoch boundaries — what `rolled_to(wall_epoch)` does once per
+    /// applied block on a node that is behind — must copy the eUTXO map ZERO
+    /// times, because `close_epoch` never writes to the ledger. Before the
+    /// `Arc` (2026-08-31) it copied the full map once per epoch crossed,
+    /// which at carryover scale (452,726 entries, ~60 MB) made a gap of ~15
+    /// epochs a stall and a cold start (~1,550 epochs) fatal.
+    ///
+    /// The `ptr_eq` half is what makes this a sharing test and not an
+    /// equality test: fifty rolls end on the *same allocation* the genesis
+    /// state holds, so the memory a roll of N epochs pins is N × (the small
+    /// per-epoch fields), never N × the ledger.
+    #[test]
+    fn an_epoch_roll_deep_copies_no_eutxo_maps() {
+        let balances: Vec<_> = (0..512).map(cow_coin).collect();
+        let (_t, st, _chains) = setup_funded(8, &balances);
+        let before = eutxo_map_deep_copies();
+        let mut cur = st.clone();
+        for _ in 0..50 {
+            cur = cur.close_epoch();
+        }
+        assert_eq!(
+            eutxo_map_deep_copies() - before,
+            0,
+            "an epoch roll wrote to the ledger, or a clone stopped sharing it — \
+             either way a catching-up node is back to one full-map copy per epoch per block"
+        );
+        assert_eq!(cur.eutxos, st.eutxos, "a boundary must not move the ledger");
+        assert!(
+            std::sync::Arc::ptr_eq(&cur.eutxos.entries, &st.eutxos.entries),
+            "the rolled state re-allocated an identical ledger instead of sharing it"
+        );
+    }
+
+    /// The other half of copy-on-write: a write to a *shared* map copies it
+    /// exactly once, unshares it, and is invisible to every other holder —
+    /// and a no-op write (removing an absent outpoint) copies nothing.
+    #[test]
+    fn a_ledger_write_copies_the_shared_map_once_and_disturbs_no_sharer() {
+        let balances: Vec<_> = (0..8).map(cow_coin).collect();
+        let (_t, st, _chains) = setup_funded(4, &balances);
+        let root_before = st.state_root();
+
+        let mut writer = st.clone();
+        let before = eutxo_map_deep_copies();
+        writer.eutxos.remove(&(balances[0].txid, balances[0].vout));
+        assert_eq!(
+            eutxo_map_deep_copies() - before,
+            1,
+            "the first write to a shared map must pay exactly one full copy"
+        );
+        writer.eutxos.remove(&(balances[1].txid, balances[1].vout));
+        assert_eq!(
+            eutxo_map_deep_copies() - before,
+            1,
+            "the map was unshared by the first write; the second must not copy again"
+        );
+
+        // The sharer still holds both spent outputs, and its root stands.
+        assert!(st.eutxos.get(&(balances[0].txid, balances[0].vout)).is_some());
+        assert!(st.eutxos.get(&(balances[1].txid, balances[1].vout)).is_some());
+        assert_eq!(st.state_root(), root_before, "a writer's edit leaked into its sharer");
+        assert_ne!(writer.state_root(), root_before, "control: the writes must move the writer");
+
+        // Removing an outpoint that is not there is a no-op, not a copy.
+        let mut reader = st.clone();
+        let before = eutxo_map_deep_copies();
+        reader.eutxos.remove(&([0xEE; 32], 7));
+        assert_eq!(
+            eutxo_map_deep_copies() - before,
+            0,
+            "a no-op remove on a shared map must not pay the full-map copy"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&reader.eutxos.entries, &st.eutxos.entries),
+            "a no-op remove must leave the map shared"
+        );
+    }
+
     /// What a block-level state root costs at Genesis-4's real carryover
     /// size, and what the `pre.clone()` in `apply_block` costs beside it.
     ///
@@ -4311,19 +4617,44 @@ mod tests {
             attestation_root: crate::derive::attestation_root(atts),
             coherence_root: pre.coherence_root(),
         };
-        let probe = ProposalEnvelope { header, proposer_sig: vec![0u8; 8] };
+        // The proposer signature is now SIGNED, not stubbed with eight zero
+        // bytes. It has to be: the proposer check resolves the proposer's key
+        // from the registry and calls `verify_with_key`, so a verifier double
+        // that binds signature→key (`ToyVerifier`) rejects a stub.
+        //
+        // This is strictly more coverage than before, not a workaround. Under
+        // the old index-keyed `verify`, `ToyVerifier` answered `true` for any
+        // proposer signature whatsoever, so every block these tests built
+        // carried a proposer signature nothing ever checked. Signing it here
+        // means the builder now exercises the real binding: sign with the key
+        // the PARENT STATE has registered for the drawn proposer, over that
+        // header's own signing root.
+        //
+        // Signed twice because the signing root covers `state_root`: the probe
+        // header (root still zero) and the final header are different messages.
+        let sign_for = |h: &BlockHeaderV4| -> Vec<u8> {
+            match crate::attestation::KeyLookup::pubkey(pre, p) {
+                Some(pk) => toy_sign(pk, &h.proposal_signing_root()),
+                // A fixture whose registry has no such index: leave the stub
+                // and let the transition reject it, which is the honest
+                // outcome rather than a silently-passing block.
+                None => vec![0u8; 8],
+            }
+        };
+        let probe = ProposalEnvelope { header, proposer_sig: sign_for(&header) };
         let post = t
             .compute_post_state(pre, &probe, atts, txs)
             .expect("builder produced an untransitionable block");
         header.state_root = post.state_root();
-        ProposalEnvelope { header, proposer_sig: vec![0u8; 8] }
+        let proposer_sig = sign_for(&header);
+        ProposalEnvelope { header, proposer_sig }
     }
 
     /// One attestation from `v` for `slot`, voting `target_root` as both head
     /// and target, sourcing the state's current justified checkpoint.
     fn attest(st: &CommittedState, v: u32, slot: u64, target_root: [u8; 32]) -> Attestation {
         let fin = st.finality_view();
-        Attestation {
+        let att = Attestation {
             data: AttestationData {
                 slot,
                 head: target_root,
@@ -4333,8 +4664,18 @@ mod tests {
                 target_root,
             },
             validator: v,
-            signature: vec![0u8; 8],
-        }
+            // Signed with the key the registry holds for `v`. Under the old
+            // index-keyed verify, `ToyVerifier` accepted any attestation
+            // signature at all, so these fixtures asserted on attestations
+            // nothing verified. Now the signature has to be real, which is
+            // more coverage, not less.
+            signature: Vec::new(),
+        };
+        let sig = match crate::attestation::KeyLookup::pubkey(st, v) {
+            Some(pk) => toy_sign(pk, &att.data.signing_root()),
+            None => vec![0u8; 8],
+        };
+        Attestation { signature: sig, ..att }
     }
 
     /// Every validator's attestation for its own partition slot in the
@@ -4574,6 +4915,11 @@ mod tests {
 
     #[test]
     fn replay_is_delivery_order_independent() {
+        // Pre-gate fixture: this test bonds through the legacy unfunded
+        // `Deposit`/`Delegate` path, which `DEPOSIT_ACTIVATION_EPOCH` now
+        // refuses at every epoch. The switch says so out loud rather than the
+        // constant being weakened to keep an old fixture green.
+        let _bonding = crate::params::rehearsal::bonding_gate_open_guard();
         let (t, g, mut chains) = setup(8);
 
         // A chain with real content: a deposit, a delegation, and a full
@@ -4629,8 +4975,24 @@ mod tests {
         // is to hold everything except the ordering constant.
         let mut b3_rev = b3.clone();
         b3_rev.header.attestation_root = crate::derive::attestation_root(&reversed);
+        // Re-stamping the header means RE-SIGNING it. The proposer signature
+        // covers `canonical_serialize()` of the whole header, so mutating
+        // `attestation_root` (and then `state_root`) invalidates the
+        // signature carried over from `b3`. Under the old index-keyed verify
+        // this went unnoticed, because the double accepted ANY proposer
+        // signature; now the key comes from the registry and the signature
+        // is really checked.
+        let resign_header = |env: &mut ProposalEnvelope, st: &CommittedState| {
+            if let Some(pk) =
+                crate::attestation::KeyLookup::pubkey(st, env.header.proposer_index)
+            {
+                env.proposer_sig = toy_sign(pk, &env.header.proposal_signing_root());
+            }
+        };
+        resign_header(&mut b3_rev, &r2);
         b3_rev.header.state_root =
             t.compute_post_state(&r2, &b3_rev, &reversed, &[]).unwrap().state_root();
+        resign_header(&mut b3_rev, &r2);
         let final_c = t.apply_block(&r2, &b3_rev, &reversed, &[]).unwrap();
         assert_eq!(
             final_a.state_root(),
@@ -4676,6 +5038,11 @@ mod tests {
 
     #[test]
     fn deposit_queues_and_activates_through_the_epoch_pipeline() {
+        // Pre-gate fixture: this test bonds through the legacy unfunded
+        // `Deposit`/`Delegate` path, which `DEPOSIT_ACTIVATION_EPOCH` now
+        // refuses at every epoch. The switch says so out loud rather than the
+        // constant being weakened to keep an old fixture green.
+        let _bonding = crate::params::rehearsal::bonding_gate_open_guard();
         let (t, g, mut chains) = setup(4);
         let deposit = PosTransaction::Deposit {
             pubkey: vec![0xAA; 8],
@@ -4726,6 +5093,143 @@ mod tests {
                 &OkVerifier
             ),
             Err(TxReject::StakingRule)
+        );
+    }
+
+    // -- DEPOSIT_ACTIVATION_EPOCH -------------------------------------------
+
+    /// THE GATE IS A CONSENSUS RULE, AND THIS PROVES IT IS NOT THE MEMPOOL'S.
+    ///
+    /// At the pristine tree (`g4-node-20260901`) this test's fixture applied
+    /// clean: `apply_block` returned a state with a fifth validator record
+    /// holding `MIN_DEPOSIT_SAT` against no input spent. The only thing
+    /// refusing a deposit was `bloch-pos-node`'s `admissible`, and that crate
+    /// is not in this test's dependency graph — there is no mempool here to
+    /// blame, which is the whole reason the test lives in the committee crate.
+    ///
+    /// The block is BUILT with the gate forced open, so the header carries a
+    /// real `state_root` and `body_root` over a body that really contains the
+    /// deposit — exactly the block a patched producer would gossip. It is then
+    /// JUDGED with the gate shut, by the code every honest node runs. The
+    /// refusal that comes back is `compute_post_state`'s.
+    #[test]
+    fn a_deposit_in_a_block_is_refused_by_consensus_not_by_the_mempool() {
+        let (t, g, mut chains) = setup(4);
+        let deposit = PosTransaction::Deposit {
+            pubkey: vec![0x5A; 8],
+            amount_sat: staking::MIN_DEPOSIT_SAT,
+            randao_commitment: [0x5B; 32],
+            withdrawal_credentials: vec![0x5C; 4],
+            commission_bps: 500,
+        };
+
+        // Built by a producer whose gate is open: a well-formed block, every
+        // root correct, carrying stake minted from nothing.
+        let (b, applied_open) = {
+            let _open = crate::params::rehearsal::bonding_gate_open_guard();
+            let b = build_block(&t, &g, 33, &[], std::slice::from_ref(&deposit), &mut chains);
+            let st = t
+                .apply_block(&g, &b, &[], std::slice::from_ref(&deposit))
+                .expect("with the gate open this is the pre-gate behaviour");
+            (b, st)
+        };
+        // The fixture is live: with the gate open the deposit really does what
+        // the finding says it does. Without this the test below could pass
+        // against a block that was never applicable for some other reason.
+        assert_eq!(applied_open.validator_count(), 5, "fixture must actually mint a validator");
+
+        // Judged by a node running the shipped rules. Same block, same body.
+        assert_eq!(
+            t.apply_block(&g, &b, &[], std::slice::from_ref(&deposit)),
+            Err(TransitionError::Transaction(0)),
+            "consensus must refuse the deposit, at index 0, on the frozen variant",
+        );
+
+        // And the reason is the flag day, not the minimum, not a duplicate
+        // pubkey, not the per-validator cap.
+        let mut probe = g.clone();
+        assert_eq!(
+            probe.apply_transaction(
+                &deposit,
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &OkVerifier,
+            ),
+            Err(TxReject::StakingNotActive),
+        );
+        assert_eq!(probe.validator_count(), 4, "a refused deposit must leave no trace");
+    }
+
+    /// The faster door. A delegation reaches `effective_stake` at `epoch + 1`
+    /// with no activation queue in front of it, so it must be shut by the same
+    /// constant or the deposit gate is decoration.
+    #[test]
+    fn a_delegation_in_a_block_is_refused_by_consensus_too() {
+        let (t, g, mut chains) = setup(4);
+        let delegate = PosTransaction::Delegate {
+            delegator: 900,
+            validator: 0,
+            amount_sat: delegation::MIN_DELEGATION_SAT,
+            eligible: true,
+        };
+        let b = {
+            let _open = crate::params::rehearsal::bonding_gate_open_guard();
+            let b = build_block(&t, &g, 33, &[], std::slice::from_ref(&delegate), &mut chains);
+            let st = t.apply_block(&g, &b, &[], std::slice::from_ref(&delegate)).unwrap();
+            assert!(!st.delegations.is_empty(), "fixture must actually bond");
+            b
+        };
+        assert_eq!(
+            t.apply_block(&g, &b, &[], std::slice::from_ref(&delegate)),
+            Err(TransitionError::Transaction(0)),
+        );
+    }
+
+    /// The gate reads the epoch of the BLOCK, and the same body flips verdict
+    /// on nothing but that number.
+    ///
+    /// This is the divergence property stated as a test: `unfunded_bonding_active`
+    /// is a function of one `u64` that `compute_post_state` derives as
+    /// `epoch_of(header.slot)` and from nothing else. There is no node identity,
+    /// no clock and no mutable local in its argument list, so two honest nodes
+    /// handed the same header cannot disagree — which is precisely what the
+    /// 2026-08-08 `expected_bits` rule could not say about itself.
+    #[test]
+    fn the_gate_is_a_function_of_the_block_epoch_alone() {
+        // Below the flag day: refused, at every epoch a chain can reach.
+        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1] {
+            assert!(!CommittedState::unfunded_bonding_active(e), "epoch {e} must be below");
+        }
+        // At and above it: allowed. Reached only by moving the constant, which
+        // `deposit_gate_is_inert` forbids — the arm is covered, not open.
+        assert!(CommittedState::unfunded_bonding_active(
+            crate::params::DEPOSIT_ACTIVATION_EPOCH
+        ));
+    }
+
+    /// TRIPWIRE. `DEPOSIT_ACTIVATION_EPOCH` must stay `u64::MAX`.
+    ///
+    /// Not a style rule. The encoding this constant gates is the
+    /// UNAUTHENTICATED one: `Deposit` spends no input and carries no signature,
+    /// `Delegate` likewise. Moving this number to a reachable epoch does not
+    /// open deposits safely — it makes stake minted from nothing a
+    /// consensus-VALID transaction on every node at once, which is strictly
+    /// worse than the pre-gate tree, where at least the mempool refused it.
+    ///
+    /// Deposits open by a funded, authenticated message that spends transparent
+    /// eUTXO inputs and proves possession of the key — the shape
+    /// `staking::validate_deposit` already describes and no encoder emits. That
+    /// message needs a wire tag the founder has not assigned, and it will bring
+    /// its own activation constant. This one is a permanent closure.
+    ///
+    /// Whoever arms it has to delete this test first, and read this while doing
+    /// so.
+    #[test]
+    fn deposit_gate_is_inert() {
+        assert_eq!(
+            crate::params::DEPOSIT_ACTIVATION_EPOCH,
+            u64::MAX,
+            "arming this reopens unfunded bonding on all nodes; read the test docs",
         );
     }
 
@@ -5565,6 +6069,11 @@ mod tests {
     /// delegator revenue at exactly zero at the moment fees became everything.
     #[test]
     fn producer_fees_reach_delegators_through_the_commission_split() {
+        // Pre-gate fixture: this test bonds through the legacy unfunded
+        // `Deposit`/`Delegate` path, which `DEPOSIT_ACTIVATION_EPOCH` now
+        // refuses at every epoch. The switch says so out loud rather than the
+        // constant being weakened to keep an old fixture green.
+        let _bonding = crate::params::rehearsal::bonding_gate_open_guard();
         let spender = owner_key(0x3B);
         let coins: Vec<_> =
             (0..2u32).map(|i| opening(0x78, i, 100_000_000, &spender)).collect();
@@ -5998,11 +6507,23 @@ mod tests {
             attestation_root: crate::derive::attestation_root(&[]),
             coherence_root: pre.coherence_root(),
         };
-        ProposalEnvelope { header, proposer_sig: vec![0u8; 8] }
+        // Signed, for the same reason `build_block` signs: the proposer check
+        // resolves the key from the registry, so a stub no longer passes a
+        // key-binding verifier double.
+        let proposer_sig = match crate::attestation::KeyLookup::pubkey(pre, p) {
+            Some(pk) => toy_sign(pk, &header.proposal_signing_root()),
+            None => vec![0u8; 8],
+        };
+        ProposalEnvelope { header, proposer_sig }
     }
 
     #[test]
     fn evidence_transaction_slashes_operator_and_delegators_and_pays_whistleblower() {
+        // Pre-gate fixture: this test bonds through the legacy unfunded
+        // `Deposit`/`Delegate` path, which `DEPOSIT_ACTIVATION_EPOCH` now
+        // refuses at every epoch. The switch says so out loud rather than the
+        // constant being weakened to keep an old fixture green.
+        let _bonding = crate::params::rehearsal::bonding_gate_open_guard();
         let (t, g, mut chains) = setup(4);
         let seed = g.seed_for_epoch(0);
         // Pick an offender that is NOT the proposer of the evidence-carrying
@@ -6277,6 +6798,11 @@ mod tests {
     /// have been blind to most of what follows.
     fn state_with_live_bookkeeping() -> (Transition<ToyVerifier>, CommittedState, Vec<Attestation>)
     {
+        // Pre-gate fixture: this test bonds through the legacy unfunded
+        // `Deposit`/`Delegate` path, which `DEPOSIT_ACTIVATION_EPOCH` now
+        // refuses at every epoch. The switch says so out loud rather than the
+        // constant being weakened to keep an old fixture green.
+        let _bonding = crate::params::rehearsal::bonding_gate_open_guard();
         // Funded, and the transfer below actually spends: the unspent set is
         // one of the components the root must bind, and a fixture where it sat
         // empty (or untouched since genesis) would exercise that leaf
@@ -6502,6 +7028,11 @@ mod tests {
     /// now binds.
     #[test]
     fn convergent_paths_commit_identical_roots_with_bookkeeping_live() {
+        // Pre-gate fixture: this test bonds through the legacy unfunded
+        // `Deposit`/`Delegate` path, which `DEPOSIT_ACTIVATION_EPOCH` now
+        // refuses at every epoch. The switch says so out loud rather than the
+        // constant being weakened to keep an old fixture green.
+        let _bonding = crate::params::rehearsal::bonding_gate_open_guard();
         let spender = owner_key(0x3F);
         let coin = opening(0x7A, 0, 100_000_000, &spender);
         let (t, g, mut chains) = setup_funded(8, &[coin.clone()]);
@@ -6553,8 +7084,22 @@ mod tests {
         // committed state, not that two different blocks agree.
         let mut b3_rev = b3.clone();
         b3_rev.header.attestation_root = crate::derive::attestation_root(&reversed);
+        // Re-stamping the header means RE-SIGNING it: the proposer signature
+        // covers the whole header, so mutating `attestation_root` (and then
+        // `state_root`) invalidates the signature carried over from `b3`.
+        // The old index-keyed verify accepted any proposer signature, so this
+        // block was never actually signature-checked.
+        let resign_header = |env: &mut ProposalEnvelope, st: &CommittedState| {
+            if let Some(pk) =
+                crate::attestation::KeyLookup::pubkey(st, env.header.proposer_index)
+            {
+                env.proposer_sig = toy_sign(pk, &env.header.proposal_signing_root());
+            }
+        };
+        resign_header(&mut b3_rev, &r2);
         b3_rev.header.state_root =
             t.compute_post_state(&r2, &b3_rev, &reversed, &[]).unwrap().state_root();
+        resign_header(&mut b3_rev, &r2);
         let b = t.apply_block(&r2, &b3_rev, &reversed, &[]).unwrap();
 
         // Mid-epoch, with every extended component live — not after a
@@ -6797,9 +7342,20 @@ mod tests {
         assert_eq!(CAP, 10_000_000_000_000_000_000);
 
         // Exhaustive match, no `_` arm: every transaction the protocol can
-        // carry is enumerated, and none of them is a mint or a cap edit —
-        // Transfer moves existing coins and pays fees from them, Deposit and
-        // Delegate bond existing coins, Exit unbonds them, evidence burns.
+        // carry is enumerated, and none of them edits the cap.
+        //
+        // Read that as written: NONE OF THEM EDITS THE CAP. It is not the
+        // same claim as "none of them mints", and this comment used to make
+        // the stronger one by asserting that Deposit and Delegate bond
+        // EXISTING coins. They do not. The live `Deposit` handler consumes no
+        // eUTXO input — it hashes the pubkey, checks the bounds, inserts a
+        // `ValidatorRecord` and writes `staked_sat` from nothing — which the
+        // crate states plainly at `transition.rs`'s eUTXO-set doc: bonding is
+        // not funded from that set, and `Deposit`/`Delegate` spend no output.
+        // This test never checked the bonding claim, so it passed while the
+        // claim was false; the exhaustive match below proves only that the
+        // variant SET cannot grow without a human reading this comment.
+        // The supply consequence is tracked separately and is not pinned here.
         let witness = PosTransaction::Exit { validator: 0 };
         match &witness {
             PosTransaction::Transfer { .. } => {}
@@ -7009,7 +7565,7 @@ mod tests {
         for epoch in 1..400u64 {
             let roster = g.duty_roster_at(0);
             let mut accepted = Vec::new();
-            let votes = finality::votes_from_partition(epoch, &roster, &[], &seed, &mut accepted);
+            let votes = finality::votes_from_partition(epoch, &roster, &roster, &[], &seed, &mut accepted);
             if g.finality_engine.process_epoch(&votes).is_err() {
                 break;
             }
@@ -7116,7 +7672,7 @@ mod tests {
         for epoch in 1..400u64 {
             let roster = g.duty_roster_at(0);
             let mut accepted = Vec::new();
-            let votes = finality::votes_from_partition(epoch, &roster, &[], &seed, &mut accepted);
+            let votes = finality::votes_from_partition(epoch, &roster, &roster, &[], &seed, &mut accepted);
             if g.finality_engine.process_epoch(&votes).is_err() {
                 break;
             }
@@ -7462,9 +8018,13 @@ mod tests {
     //
     // The tests below call `apply_transfer_v2` directly — the unit seam
     // BELOW the flag-day gate, the same pattern as testing
-    // `with_leak_applied` directly — because the gate is `u64::MAX` and the
-    // block path correctly refuses everything. The gate itself is tested
-    // end-to-end through `compute_post_state`.
+    // `with_leak_applied` directly. This banner used to justify that by
+    // saying the gate was still at its inert maximum value so the block path
+    // refused everything; that stopped being true when
+    // `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` was bound, and the chain is
+    // long past it. The unit seam is still the right place to test the apply
+    // rules in isolation — it just is not because the format is unreachable.
+    // The gate itself is tested end-to-end through `compute_post_state`.
 
     /// Arming this format is a flag day. Once armed, the thing that must hold
     /// is not "still inert" — it is that the epoch is in the FUTURE relative

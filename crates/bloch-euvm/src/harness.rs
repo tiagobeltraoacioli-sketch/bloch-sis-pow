@@ -24,9 +24,14 @@
 //! - Everything here is a **model**. [`BlockModel`] is NOT the node's real block;
 //!   `legacy_bytes` is an opaque stand-in for the node's canonical legacy
 //!   serialization; the eUTXO txs are [`crate::EuTx`], not the node `Transaction`.
-//! - [`EUVM_ACTIVATION_HEIGHT`] is pinned at `u64::MAX` (an inert sentinel) so that
-//!   *merely shipping this code activates nothing*. A real activation requires editing
-//!   the constant to a coordinated fork height — a deliberate, reviewable act.
+//! - [`EUVM_ACTIVATION_HEIGHT`] is `4320` — a real coordinated fork height, **not**
+//!   the inert `u64::MAX` sentinel this bullet claimed until 2026-09-02. Merely
+//!   shipping this code still activates nothing, but for a structural reason worth
+//!   naming rather than a sentinel: `bloch-euvm` is not a dependency of
+//!   `bloch-pos-node` or `bloch-pos-committee`, so no consensus path reads this
+//!   constant or calls [`is_feature_active`] — only this crate's own tests do. The
+//!   inertness would end the moment the crate were wired in, with nobody editing
+//!   this number, which is the opposite of what the sentinel wording promised.
 //! - The harness **orchestrates** the existing lib.rs engine ([`validate_block`],
 //!   [`EuTx`], [`TxError`], [`fee_burn`]); it does not reimplement value conservation,
 //!   validator execution, or gas metering.
@@ -38,14 +43,19 @@ use crate::{fee_burn, validate_block, EuTx, ExtOutput, SigVerifier, TxError, Val
 
 /// **The activation height for the eUTXO VM feature.**
 ///
-/// Pinned at `u64::MAX` — an inert sentinel that keeps the feature OFF for every real
-/// block height while the code ships and is reviewed. Activation is performed by
-/// changing this constant to a coordinated hard-fork height (and only then). This is a
-/// pure height gate: no committee registry, no activation signatures, no quorum, no
-/// finality gadget (FFG was dropped).
-// COORDINATED Genesis-2 activation height. 4320 is above the current network tip
-// (~3757), so euvm/Ustav/Kirpich stays INERT on every block the fleet has produced
-// to date — the canonical a397a9d2 binary and this one are byte-identical below
+/// Currently `4320` — a coordinated Genesis-2 hard-fork height. Until 2026-09-02 this
+/// doc block described the constant as an inert maximum-value sentinel, which was
+/// false of the line directly below it; the `//` note that follows has carried the
+/// real value and its reasoning all along. What keeps the feature off is not this number but the fact
+/// that no consensus crate depends on `bloch-euvm`. This is a pure height gate: no
+/// committee registry, no activation signatures, no quorum, no finality gadget (FFG
+/// was dropped).
+// COORDINATED Genesis-2 activation height. As of the Genesis-2/3 measurement that
+// set it, 4320 was above the then-current network tip (~3757) — a dated statement
+// about a chain that is no longer running, NOT a claim about Genesis-4, whose
+// heights are far past 4320. On G2/G3, euvm/Ustav/Kirpich stayed INERT on every
+// block the fleet produced — the canonical a397a9d2 binary and this one are
+// byte-identical below
 // 4320, so shipping this is NOT a hard fork for the live chain. (Was momentarily 10
 // for an isolated single-node rehearsal; that value would have activated euvm
 // immediately at the live tip and forked the fleet.)
@@ -60,13 +70,18 @@ pub const EUVM_BURN_BPS: u16 = 2_000;
 ///
 /// `height >= EUVM_ACTIVATION_HEIGHT`. Every node computes this identically from the
 /// block height alone; there is no per-node state, clock, or vote involved. Because
-/// [`EUVM_ACTIVATION_HEIGHT`] is `u64::MAX`, this is `false` for every real height
-/// today.
+/// [`EUVM_ACTIVATION_HEIGHT`] is `4320`, this returns `true` at and above 4320 — it
+/// is NOT `false` for every real height, which is what this sentence claimed until
+/// 2026-09-02. What keeps the feature off is that no consensus crate calls this
+/// function at all.
 #[inline]
-// `EUVM_ACTIVATION_HEIGHT` is the `u64::MAX` disabled-sentinel today, so Clippy
-// flags `>=` as an absurd extreme comparison. The `>=` is deliberate: it is the
-// correct activation predicate for when the constant is later set to a real
-// height by a hard fork. Keep it (do not narrow to `==`) and silence the lint.
+// This `#[allow]` is VESTIGIAL. It was added when the constant was the disabled
+// sentinel, where Clippy flags `>=` as an absurd extreme comparison against
+// `u64::MAX`. `EUVM_ACTIVATION_HEIGHT` is `4320` today, so the lint cannot fire
+// and the attribute suppresses nothing. It is left in place because removing an
+// attribute is a code change, not a prose fix; it is safe for the founder to
+// delete. The `>=` itself is deliberate and correct either way: it is the
+// activation predicate, not an equality test. Do not narrow it to `==`.
 #[allow(clippy::absurd_extreme_comparisons)]
 pub const fn is_feature_active(height: u64) -> bool {
     height >= EUVM_ACTIVATION_HEIGHT

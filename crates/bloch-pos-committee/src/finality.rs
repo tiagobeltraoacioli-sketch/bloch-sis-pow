@@ -265,16 +265,18 @@ impl FinalityState {
         Ok(state)
     }
 
-    /// Fold one epoch of votes into the state.
+    /// Mutation switch: tally the quorum denominator WITHOUT the leak
+    /// adjustment, reproducing the pre-fix behaviour so the tests that
+    /// document it stay reproducible.
     ///
-    /// Order inside this function matters and is part of consensus:
-    /// 1. tally votes with **pre-epoch** leak-adjusted stakes (this epoch's
-    ///    leak must not influence this epoch's own quorum),
-    /// 2. justify / finalize,
-    /// 3. tick the leak using the **post-vote** finalized epoch, so the epoch
-    ///    that restores finality does not also punish its participants.
     /// `true` only in a test build with the mutation switch on. Constant
-    /// `false` everywhere else, so the branch above folds away in a release.
+    /// `false` everywhere else, so the branch that reads it folds away in a
+    /// release.
+    ///
+    /// (This function carried the doc block for `process_epoch` until
+    /// 2026-09-02 — a missing separator glued eight lines about consensus
+    /// ordering onto a boolean flag reader, and left `process_epoch`
+    /// undocumented. The block is now back on `process_epoch` below.)
     #[inline]
     fn denominator_ignores_leak() -> bool {
         #[cfg(test)]
@@ -299,11 +301,6 @@ impl FinalityState {
         false
     }
 
-    /// Mutation switch: reproduce the PRE-FIX accumulator, which had exactly
-    /// one write path and never came back down. Same purpose as
-    /// [`Self::denominator_floor_disabled`]. Constant `false` in a release
-    /// build.
-    #[inline]
     /// See `params::rehearsal::gates_are_forced_open`. Constant `false` in any
     /// build that is not a test build, so the gate folds to the shipped one.
     #[inline]
@@ -316,6 +313,16 @@ impl FinalityState {
         false
     }
 
+    /// Mutation switch: reproduce the PRE-FIX accumulator, which had exactly
+    /// one write path and never came back down. Same purpose as
+    /// [`Self::denominator_floor_disabled`]. Constant `false` in a release
+    /// build.
+    ///
+    /// (This doc sat on `gates_forced_open` until 2026-09-02 — a stray
+    /// `#[inline]` between two doc blocks attached both to that function and
+    /// left this one, the accumulator switch it actually describes, with no
+    /// doc at all.)
+    #[inline]
     fn leak_recovery_disabled() -> bool {
         #[cfg(test)]
         {
@@ -325,6 +332,14 @@ impl FinalityState {
         false
     }
 
+    /// Fold one epoch of votes into the state.
+    ///
+    /// Order inside this function matters and is part of consensus:
+    /// 1. tally votes with **pre-epoch** leak-adjusted stakes (this epoch's
+    ///    leak must not influence this epoch's own quorum),
+    /// 2. justify / finalize,
+    /// 3. tick the leak using the **post-vote** finalized epoch, so the epoch
+    ///    that restores finality does not also punish its participants.
     pub fn process_epoch(&mut self, votes: &EpochVotes<'_>) -> Result<EpochOutcome, FinalityError> {
         if votes.epoch != self.next_epoch {
             return Err(FinalityError::OutOfOrderEpoch {
@@ -1733,7 +1748,7 @@ mod tests {
         // Now the boundary tally, against the UNLEAKED roster — the real
         // production function, the real seed, the real partition filter.
         let mut accepted = Vec::new();
-        let ev = votes_from_partition(epoch, &duty, &atts, &seed, &mut accepted);
+        let ev = votes_from_partition(epoch, &duty, &duty, &atts, &seed, &mut accepted);
         let survived = ev.attestations.len();
         println!(
             "ROSTER UNIFIED: step 8 admitted {admitted} honest attestations; the boundary \
@@ -1761,7 +1776,7 @@ mod tests {
         // the same answer, because the whole point is that there is no longer
         // a "step 8 roster" and a "boundary roster" as far as membership goes.
         let mut accepted2 = Vec::new();
-        let ev2 = votes_from_partition(epoch, &consensus, &atts, &seed, &mut accepted2);
+        let ev2 = votes_from_partition(epoch, &consensus, &consensus, &atts, &seed, &mut accepted2);
         assert_eq!(ev2.attestations.len(), admitted, "control: same roster keeps every vote");
         let mut st2 = FinalityState::new(genesis());
         let out2 = st2.process_epoch(&ev2).unwrap();
@@ -1869,14 +1884,45 @@ mod tests {
 /// "absent": an out-of-slot vote is a protocol violation, not a missed duty,
 /// and counting it as absence would leak stake from an honest validator whose
 /// vote merely arrived mislabelled.
+///
+/// # `active_set` and `partition_set` are two different questions
+///
+/// `active_set` is the quorum DENOMINATOR base and must be the unleaked duty
+/// roster: [`FinalityState::process_epoch`] subtracts its own `leaked` map
+/// from whatever it is handed, so feeding it a leak-applied roster charges the
+/// leak twice.
+///
+/// `partition_set` is the index set the committees are drawn from, and it must
+/// be the roster `transition::compute_post_state` step 8 admitted against —
+/// `CommittedState::consensus_roster_at`. The two call paths deciding whether
+/// one attestation counts have to draw one committee; when they do not, votes
+/// the block ADMITTED are dropped at the boundary and the numerator collapses.
+/// Measured 2026-08-24: 63 of 64 honest validators voting one root, the
+/// boundary keeping 4 of them — 6.3% surviving, justification `None`.
+///
+/// **Today the two arguments are interchangeable, and that is a derived
+/// property, not a structural one.** `epoch_committees` carries no stake
+/// filter, so membership is a pure function of the index set, and
+/// `with_leak_applied` keeps a fully-leaked validator at zero rather than
+/// dropping it — so the leaked and unleaked rosters have the SAME index set
+/// and partition identically. Splitting the parameter makes the agreement
+/// structural instead: the boundary now reads the same roster step 8 reads, so
+/// reinstating a stake filter anywhere could no longer separate them. Belt and
+/// braces on a seam that has already cost one stalled mainnet.
+///
+/// It is inert on the existing chain by construction, not by argument:
+/// `consensus_roster_at(e)` returns `duty_roster_at(e)` unchanged for every
+/// `e < `[`crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH`], so below the armed
+/// flag day the two arguments are literally the same value.
 pub fn votes_from_partition<'a>(
     epoch: u64,
     active_set: &'a [Validator],
+    partition_set: &[Validator],
     attestations: &'a [(u32, AttestationData)],
     beacon_mix: &[u8; 32],
     accepted: &'a mut Vec<(u32, AttestationData)>,
 ) -> EpochVotes<'a> {
-    let committees = crate::committees::epoch_committees(beacon_mix, epoch, active_set);
+    let committees = crate::committees::epoch_committees(beacon_mix, epoch, partition_set);
     let slots_per_epoch = crate::params::SLOTS_PER_EPOCH;
 
     accepted.clear();

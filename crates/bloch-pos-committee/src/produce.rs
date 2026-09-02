@@ -284,16 +284,33 @@ mod tests {
         h.finalize().to_vec()
     }
 
+    /// The fixture's `index -> pubkey` map, in one place so the tests and
+    /// `fixture_index_of_key` cannot drift apart.
+    fn fixture_key(index: u32) -> Vec<u8> {
+        vec![index as u8; 8]
+    }
+
+    /// Invert the fixture's `index -> pubkey` map (`vec![i as u8; 8]`).
+    /// A scan, not `pk[0]`: it must answer `None` for a key the fixture never
+    /// issued, which is the case the "key not in the registry" test needs.
+    fn fixture_index_of_key(pk: &[u8]) -> Option<u32> {
+        (0..8u32).find(|i| pk == fixture_key(*i).as_slice())
+    }
+
     struct MockCrypto;
     impl SignatureVerifier for MockCrypto {
-        fn verify(&self, validator: u32, signing_root: &[u8; 32], signature: &[u8]) -> bool {
-            signature == mock_sig(validator, signing_root).as_slice()
-        }
-        /// Mirrors this mock's `verify`: a test double that accepted
-        /// spends more easily than attestations would hide the very
-        /// forgery the spend path must refuse.
-        fn verify_with_key(&self, _pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
-            self.verify(0, root, sig)
+        /// Binds signature → KEY, mirroring what production now does. This
+        /// mock used to answer by validator index and its `verify_with_key`
+        /// delegated to `verify(0, ..)` — which was wrong for every validator
+        /// but 0 and went unnoticed because only spends used the key form.
+        /// Now attestations use it too, so the double has to model the real
+        /// binding: recover the index this fixture assigned the key, then
+        /// check the signature that index would have produced.
+        fn verify_with_key(&self, pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
+            match fixture_index_of_key(pk) {
+                Some(v) => sig == mock_sig(v, root).as_slice(),
+                None => false,
+            }
         }
     }
 
@@ -328,7 +345,7 @@ mod tests {
         let registry: Vec<ValidatorRecord> = (0..4u32)
             .map(|i| ValidatorRecord {
                 index: i,
-                pubkey: vec![i as u8; 8],
+                pubkey: fixture_key(i),
                 stake: 100_000_000_000 * (4 - i as u64), // skewed, nonzero
                 activation_epoch: 0,
                 exit_epoch: u64::MAX,
@@ -412,28 +429,35 @@ mod tests {
         (chain, parent_header, reveal_states)
     }
 
-    /// Attestations for the parent slot from the full slot subcommittee,
-    /// signed by the mock suite — plus helpers to reach the scheduled
-    /// proposer.
+    /// One attestation per F1 partition committee member across the block's
+    /// epoch (the partition spreads the fixture's validators over the first
+    /// slots of the epoch, one member each), signed by the mock suite — the
+    /// same committee rule `validate_included_attestation` and the
+    /// transition's step 8 enforce since the 2026-08-25 alignment.
     fn collected_attestations(parent: &ParentState<'_>) -> Vec<Attestation> {
-        let att_slot = PARENT_SLOT;
-        let seed = derive::sortition_seed(parent, att_slot).expect("seed committed");
-        let active =
-            derive::active_validators(&parent.chain.registry, crate::epoch_of(SLOT));
-        let committee = crate::slot_subcommittee(&seed, att_slot, &active);
-        committee
-            .iter()
-            .map(|&v| {
-                let data = AttestationData {
-                    slot: att_slot,
-                    head: *parent.header.id().as_bytes(),
-                    source_epoch: 0,
-                    source_root: parent.header.justified_root,
-                    target_epoch: 1,
-                    target_root: *parent.header.id().as_bytes(),
-                };
-                let signature = mock_sig(v, &data.signing_root());
-                Attestation { data, validator: v, signature }
+        let epoch = crate::epoch_of(SLOT);
+        let active = derive::active_validators(&parent.chain.registry, epoch);
+        let first = epoch * crate::params::SLOTS_PER_EPOCH;
+        (first..=PARENT_SLOT)
+            .flat_map(|att_slot| {
+                let seed = derive::sortition_seed(parent, att_slot).expect("seed committed");
+                let committee =
+                    crate::committees::committee_for_slot(&seed, att_slot, &active);
+                committee
+                    .into_iter()
+                    .map(move |v| {
+                        let data = AttestationData {
+                            slot: att_slot,
+                            head: *parent.header.id().as_bytes(),
+                            source_epoch: 0,
+                            source_root: parent.header.justified_root,
+                            target_epoch: 1,
+                            target_root: *parent.header.id().as_bytes(),
+                        };
+                        let signature = mock_sig(v, &data.signing_root());
+                        Attestation { data, validator: v, signature }
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
@@ -522,8 +546,8 @@ mod tests {
         );
 
         // The signature covers the one signing root, and verifies.
-        assert!(MockCrypto.verify(
-            h.proposer_index,
+        assert!(MockCrypto.verify_with_key(
+            &fixture_key(h.proposer_index),
             &h.proposal_signing_root(),
             &envelope.proposer_sig
         ));
@@ -540,6 +564,84 @@ mod tests {
         assert_eq!(envelope.body.transactions, txs());
         // And the header names the validator that built it.
         assert_eq!(h.proposer_index, proposer);
+    }
+
+    /// The producer's inclusion filter must draw the SAME committee the
+    /// transition's step 8 draws — `committees::committee_for_slot` (the F1
+    /// partition), not the superseded `slot_subcommittee` sample.
+    ///
+    /// The divergence was recorded in derive.rs on 2026-08-12 and was harmless
+    /// only while gossip pools stayed empty. The shared-basis gossip fix fills
+    /// them, and a producer filtering by the wrong draw then assembles blocks
+    /// the whole network refuses at step 8 (`TransitionError::Attestation`).
+    ///
+    /// Both halves are here: the sampled-only validator must be DROPPED, and
+    /// the real partition member must be KEPT (a filter that drops everything
+    /// would satisfy the first half alone).
+    #[test]
+    fn the_inclusion_filter_draws_the_partition_committee_not_the_sampled_one() {
+        let (chain, pheader, reveals) = fixture();
+        let parent = ParentState { header: &pheader, chain: &chain, reveal_states: &reveals };
+        let epoch = crate::epoch_of(SLOT);
+        let active = derive::active_validators(&parent.chain.registry, epoch);
+
+        // A slot of this epoch whose partition committee is non-empty and
+        // whose superseded sampled draw contains someone the partition does
+        // not — i.e. a slot where the two rules actually disagree. If the
+        // fixture stopped exposing one, this test proves nothing and says so.
+        let (att_slot, member, intruder) = (epoch * crate::params::SLOTS_PER_EPOCH..=PARENT_SLOT)
+            .find_map(|slot| {
+                let seed = derive::sortition_seed(&parent, slot)?;
+                let partition = crate::committees::committee_for_slot(&seed, slot, &active);
+                let member = *partition.first()?;
+                let intruder = crate::slot_subcommittee(&seed, slot, &active)
+                    .into_iter()
+                    .find(|v| !partition.contains(v))?;
+                Some((slot, member, intruder))
+            })
+            .expect("the fixture must expose a slot where the two draws disagree");
+
+        let vote = |v: u32| {
+            let data = AttestationData {
+                slot: att_slot,
+                head: *parent.header.id().as_bytes(),
+                source_epoch: 0,
+                source_root: parent.header.justified_root,
+                target_epoch: 1,
+                target_root: *parent.header.id().as_bytes(),
+            };
+            Attestation { data, validator: v, signature: mock_sig(v, &data.signing_root()) }
+        };
+
+        // The predicate itself, both directions.
+        assert!(
+            derive::validate_included_attestation(&parent, SLOT, &vote(member), &MockCrypto)
+                .is_ok(),
+            "a member of the partition committee the transition uses must be includable"
+        );
+        assert_eq!(
+            derive::validate_included_attestation(&parent, SLOT, &vote(intruder), &MockCrypto),
+            Err(crate::attestation::RejectReason::NotInCommittee),
+            "v{intruder} is in the superseded sampled draw for slot {att_slot} but NOT in the \
+             partition committee the transition enforces — including it would doom the block"
+        );
+
+        // And end to end: the producer carries the one and drops the other.
+        let proposer = derive::scheduled_proposer(&parent, SLOT).expect("stake is nonzero");
+        let envelope = produce(
+            &parent,
+            SLOT,
+            proposer,
+            &mut producer_randao(proposer),
+            &[vote(intruder), vote(member)],
+            &txs(),
+            &MockSigner(proposer),
+            &MockCrypto,
+        )
+        .expect("the scheduled proposer must produce");
+        let carried: Vec<u32> = envelope.body.attestations.iter().map(|a| a.validator).collect();
+        assert!(carried.contains(&member), "carried {carried:?}, expected v{member} kept");
+        assert!(!carried.contains(&intruder), "carried {carried:?}, expected v{intruder} dropped");
     }
 
     // ── Refusals ──
@@ -741,8 +843,8 @@ mod tests {
         assert_eq!(envelope.header.parent, *pheader.id().as_bytes());
         // The signature covers the DS_PROPOSE root, not the id (§6.1).
         assert_eq!(envelope.signing_root(), envelope.header.proposal_signing_root());
-        assert!(MockCrypto.verify(
-            envelope.header.proposer_index,
+        assert!(MockCrypto.verify_with_key(
+            &fixture_key(envelope.header.proposer_index),
             &envelope.signing_root(),
             &envelope.proposer_sig
         ));
@@ -797,7 +899,11 @@ mod tests {
                 && h.coherence_root == derive::expected_coherence(&parent)
                 && h.state_root
                     == derive::post_state_root(&parent, h.slot, mix, &e.body.attestations)
-                && MockCrypto.verify(h.proposer_index, &h.proposal_signing_root(), &e.proposer_sig)
+                && MockCrypto.verify_with_key(
+                    &fixture_key(h.proposer_index),
+                    &h.proposal_signing_root(),
+                    &e.proposer_sig,
+                )
                 && e.body.attestations.iter().all(|att| {
                     derive::validate_included_attestation(&parent, h.slot, att, &MockCrypto).is_ok()
                 })

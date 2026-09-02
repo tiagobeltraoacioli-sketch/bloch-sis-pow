@@ -40,7 +40,7 @@
 //! it would have gotten had the block arrived first; the tests pin this).
 //! Nothing here reads a clock: `current_slot` is always an argument.
 
-use crate::attestation::{Attestation, RejectReason, SignatureVerifier};
+use crate::attestation::{Attestation, KeyLookup, RejectReason, SignatureVerifier};
 use crate::params::SLOTS_PER_EPOCH;
 use crate::slashing::SlashingEvidence;
 use std::collections::{BTreeMap, BTreeSet};
@@ -99,6 +99,23 @@ pub enum IgnoreReason {
     /// membership from the same finalized state"; a node that cannot reach the
     /// branch has no standing to make that claim about anyone.
     Unjudgeable,
+    /// The signer is in the committee this node drew, but this node's registry
+    /// projection has no key registered at that index — so the signature
+    /// cannot be checked at all.
+    ///
+    /// The sibling of [`Self::Unjudgeable`], and Ignore for the same reason:
+    /// it is a statement about what this node holds, not about the
+    /// attestation. It is reachable exactly when a validator joined by deposit
+    /// and this node has not yet applied the block that registered it. The
+    /// peer that relayed the attestation may be perfectly honest and ahead of
+    /// us; penalising it would graylist the best-informed peers precisely
+    /// during a validator-set change.
+    ///
+    /// Note this cannot be caused by a *disagreement* about who holds an
+    /// index — the registry is append-only with non-reusable indices and
+    /// immutable pubkeys, so two states can differ only in whether an index is
+    /// present, never in what key it holds. Absence means "behind", full stop.
+    UnknownValidator,
 }
 
 /// The decision on one arriving attestation. The node maps this onto
@@ -233,6 +250,7 @@ impl AttestationPool {
         committees: &impl CommitteeLookup,
         blocks: &impl BlockLookup,
         verifier: &dyn SignatureVerifier,
+        keys: &dyn KeyLookup,
     ) -> GossipDecision {
         let slot = att.data.slot;
 
@@ -302,7 +320,36 @@ impl AttestationPool {
         //    injected verifier. Only verified attestations are recorded, so
         //    every equivocation pair we hand to slashing already carries two
         //    valid signatures — a forger cannot frame a validator here.
-        if !verifier.verify(att.validator, &data_hash, &att.signature) {
+        //    The key comes from the SAME state snapshot that drew the
+        //    committee checked in step 4 — `rolled_to(epoch)` at the node.
+        //    That is deliberate and it is the only defensible pairing: an
+        //    attestation is authorised by (index in committee, key at index),
+        //    and taking the two halves from different states is precisely the
+        //    inconsistency this change removes. It reads node-local state, but
+        //    it introduces no NEW node-local dependency: membership already
+        //    came from that projection, and the old code took the key from a
+        //    boot-time constant, which is worse — it could not follow the
+        //    chain at all.
+        //
+        //    A verdict here is a relay/scoring decision, not a validity
+        //    verdict: an attestation that arrives inside a block is re-judged
+        //    by the transition against that block's pre-state. So a node whose
+        //    projection lags and answers `UnknownValidator` loses propagation,
+        //    never consensus. Reject-vs-Ignore matters for exactly that
+        //    reason — see below.
+        let Some(pubkey) = keys.pubkey(att.validator) else {
+            // IGNORE, not Reject. A committee member this node cannot resolve
+            // is a node that is BEHIND — its registry projection has not yet
+            // caught up to the deposit that added the validator — and the
+            // module's own rule is that "behind" is never provable hostility
+            // (step 1 makes the same call for a stale slot). Rejecting here
+            // would penalise the peer that relayed a perfectly valid
+            // attestation and graylist honest peers during exactly the window
+            // when a new validator joins: the mesh-collapse failure this
+            // module exists to prevent.
+            return GossipDecision::Ignore(IgnoreReason::UnknownValidator);
+        };
+        if !verifier.verify_with_key(pubkey, &data_hash, &att.signature) {
             return GossipDecision::Reject(RejectReason::BadSignature);
         }
 
@@ -334,6 +381,7 @@ impl AttestationPool {
         committees: &impl CommitteeLookup,
         blocks: &impl BlockLookup,
         verifier: &dyn SignatureVerifier,
+        keys: &dyn KeyLookup,
     ) -> Vec<(Attestation, GossipDecision)> {
         let seqs = match self.pending_by_root.remove(root) {
             Some(s) => s,
@@ -349,7 +397,8 @@ impl AttestationPool {
             let key = (entry.att.data.slot, entry.att.validator, entry.att.data.signing_root());
             self.pending_keys.remove(&key);
             let att = entry.att;
-            let decision = self.process(att.clone(), current_slot, committees, blocks, verifier);
+            let decision =
+                self.process(att.clone(), current_slot, committees, blocks, verifier, keys);
             out.push((att, decision));
         }
         out
@@ -440,15 +489,20 @@ mod tests {
     /// slashing.rs: forgery (any other bytes) is detectable per-message
     /// without dragging the PQ stack into a policy test.
     struct RootEchoVerifier;
-    impl SignatureVerifier for RootEchoVerifier {
-        fn verify(&self, _v: u32, signing_root: &[u8; 32], signature: &[u8]) -> bool {
-            signature == signing_root
+    /// Every index resolves to the same placeholder key. These tests are about
+    /// window, dedup, membership and ordering — not about key binding — and
+    /// their verifier doubles ignore the key bytes. The cases that DO care
+    /// about resolution use `NoKeys` / a real registry instead.
+    struct AnyKey;
+    impl crate::attestation::KeyLookup for AnyKey {
+        fn pubkey(&self, _v: u32) -> Option<&[u8]> {
+            Some(b"placeholder-key")
         }
-        /// Mirrors this mock's `verify`: a test double that accepted
-        /// spends more easily than attestations would hide the very
-        /// forgery the spend path must refuse.
+    }
+
+    impl SignatureVerifier for RootEchoVerifier {
         fn verify_with_key(&self, _pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
-            self.verify(0, root, sig)
+            sig == root
         }
     }
 
@@ -502,7 +556,7 @@ mod tests {
     fn valid_attestation_is_accepted() {
         let mut pool = AttestationPool::new();
         let blocks = default_known();
-        let d = pool.process(att(1, CURRENT_SLOT, 0xAA), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier);
+        let d = pool.process(att(1, CURRENT_SLOT, 0xAA), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
         assert!(is_accept(&d));
         assert_eq!(pool.accepted_hashes(CURRENT_SLOT, 1).len(), 1);
     }
@@ -512,11 +566,11 @@ mod tests {
         let mut pool = AttestationPool::new();
         let blocks = default_known();
         let a = att(1, CURRENT_SLOT, 0xAA);
-        assert!(is_accept(&pool.process(a.clone(), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier)));
+        assert!(is_accept(&pool.process(a.clone(), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey)));
         // Same attestation again — e.g. after the transport duplicate cache
         // expired. One fact, one copy: Ignore, and specifically NOT Reject,
         // because Reject is the only decision wired to peer penalties.
-        let d = pool.process(a, CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier);
+        let d = pool.process(a, CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
         assert!(matches!(d, GossipDecision::Ignore(IgnoreReason::Duplicate)));
         assert_eq!(pool.accepted_hashes(CURRENT_SLOT, 1).len(), 1);
     }
@@ -527,7 +581,7 @@ mod tests {
         let blocks = default_known();
         // Validator 99 is not in any committee: membership is a deterministic
         // function of committed state, so this cannot be honest skew.
-        let d = pool.process(att(99, CURRENT_SLOT, 0xAA), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier);
+        let d = pool.process(att(99, CURRENT_SLOT, 0xAA), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
         assert!(matches!(d, GossipDecision::Reject(RejectReason::NotInCommittee)));
     }
 
@@ -537,7 +591,7 @@ mod tests {
         let blocks = default_known();
         let mut a = att(1, CURRENT_SLOT, 0xAA);
         a.signature = vec![0u8; 32]; // not the signing root: forged
-        let d = pool.process(a, CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier);
+        let d = pool.process(a, CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
         assert!(matches!(d, GossipDecision::Reject(RejectReason::BadSignature)));
         // And nothing was recorded: a forgery cannot seed an equivocation
         // record against the validator it names.
@@ -550,7 +604,7 @@ mod tests {
         let blocks = default_known();
         let mut d0 = data(CURRENT_SLOT, 0xAA);
         d0.source_epoch = 2; // == target_epoch: malformed by construction
-        let d = pool.process(signed(1, d0), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier);
+        let d = pool.process(signed(1, d0), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
         assert!(matches!(d, GossipDecision::Reject(RejectReason::NonMonotonicCheckpoints)));
     }
 
@@ -561,15 +615,15 @@ mod tests {
         let cs = 200u64;
         // Too old: a stale node replaying history — the 2026-08-09 shape.
         let old = att(1, cs - ATTESTATION_WINDOW_SLOTS - 1, 0xAA);
-        let d = pool.process(old, cs, &committees(), &known(&blocks), &RootEchoVerifier);
+        let d = pool.process(old, cs, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
         assert!(matches!(d, GossipDecision::Ignore(IgnoreReason::OutsideWindow)));
         // Too far ahead: more than one slot of clock skew.
         let fut = att(1, cs + CLOCK_SKEW_SLOTS + 1, 0xAA);
-        let d = pool.process(fut, cs, &committees(), &known(&blocks), &RootEchoVerifier);
+        let d = pool.process(fut, cs, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
         assert!(matches!(d, GossipDecision::Ignore(IgnoreReason::OutsideWindow)));
         // Boundaries are inside: exactly −64 and +1 are accepted.
-        assert!(is_accept(&pool.process(att(1, cs - ATTESTATION_WINDOW_SLOTS, 0xAA), cs, &committees(), &known(&blocks), &RootEchoVerifier)));
-        assert!(is_accept(&pool.process(att(2, cs + CLOCK_SKEW_SLOTS, 0xAA), cs, &committees(), &known(&blocks), &RootEchoVerifier)));
+        assert!(is_accept(&pool.process(att(1, cs - ATTESTATION_WINDOW_SLOTS, 0xAA), cs, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey)));
+        assert!(is_accept(&pool.process(att(2, cs + CLOCK_SKEW_SLOTS, 0xAA), cs, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey)));
     }
 
     #[test]
@@ -578,14 +632,14 @@ mod tests {
         // The guaranteed boundary race: the attestation beat its block.
         let mut blocks = [root(0x22)].into_iter().collect::<BTreeSet<_>>();
         let a = att(1, CURRENT_SLOT, 0xAA);
-        let d = pool.process(a, CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier);
+        let d = pool.process(a, CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
         assert!(matches!(d, GossipDecision::Hold { missing_root } if missing_root == root(0xAA)));
         assert_eq!(pool.pending_len(), 1);
         assert!(pool.accepted_hashes(CURRENT_SLOT, 1).is_empty()); // not accepted yet
 
         // Block arrives, becomes queryable, waiters are replayed.
         blocks.insert(root(0xAA));
-        let released = pool.on_block(&root(0xAA), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier);
+        let released = pool.on_block(&root(0xAA), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
         assert_eq!(released.len(), 1);
         assert!(is_accept(&released[0].1));
         assert_eq!(pool.pending_len(), 0);
@@ -598,12 +652,12 @@ mod tests {
         let blocks = [root(0x22)].into_iter().collect::<BTreeSet<_>>();
         let a = att(1, CURRENT_SLOT, 0xAA);
         assert!(matches!(
-            pool.process(a.clone(), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier),
+            pool.process(a.clone(), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey),
             GossipDecision::Hold { .. }
         ));
         // The same frame again while parked: one copy is enough, and a
         // double-hold would double-release later.
-        let d = pool.process(a, CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier);
+        let d = pool.process(a, CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
         assert!(matches!(d, GossipDecision::Ignore(IgnoreReason::Duplicate)));
         assert_eq!(pool.pending_len(), 1);
     }
@@ -614,19 +668,19 @@ mod tests {
         // Neither head nor target known: hold is keyed by the head first.
         let mut blocks = BTreeSet::new();
         let a = att(1, CURRENT_SLOT, 0xAA);
-        let d = pool.process(a, CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier);
+        let d = pool.process(a, CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
         assert!(matches!(d, GossipDecision::Hold { missing_root } if missing_root == root(0xAA)));
 
         // Head arrives but the target (an epoch-boundary block, racing too)
         // has not: the full pipeline re-runs and re-holds under the target.
         blocks.insert(root(0xAA));
-        let released = pool.on_block(&root(0xAA), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier);
+        let released = pool.on_block(&root(0xAA), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
         assert_eq!(released.len(), 1);
         assert!(matches!(released[0].1, GossipDecision::Hold { missing_root } if missing_root == root(0x22)));
         assert_eq!(pool.pending_len(), 1);
 
         blocks.insert(root(0x22));
-        let released = pool.on_block(&root(0x22), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier);
+        let released = pool.on_block(&root(0x22), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
         assert_eq!(released.len(), 1);
         assert!(is_accept(&released[0].1));
     }
@@ -640,11 +694,11 @@ mod tests {
         let mut a = att(1, CURRENT_SLOT, 0xAA);
         a.signature = vec![0u8; 32];
         assert!(matches!(
-            pool.process(a, CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier),
+            pool.process(a, CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey),
             GossipDecision::Hold { .. }
         ));
         blocks.insert(root(0xAA));
-        let released = pool.on_block(&root(0xAA), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier);
+        let released = pool.on_block(&root(0xAA), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
         assert!(matches!(released[0].1, GossipDecision::Reject(RejectReason::BadSignature)));
         assert!(pool.accepted_hashes(CURRENT_SLOT, 1).is_empty());
     }
@@ -655,14 +709,14 @@ mod tests {
         let blocks = default_known();
         // First vote: plain accept, no evidence.
         let first = att(1, CURRENT_SLOT, 0xAA);
-        match pool.process(first.clone(), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier) {
+        match pool.process(first.clone(), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey) {
             GossipDecision::Accept { slashing_candidate: None } => {}
             other => panic!("expected clean accept, got {other:?}"),
         }
         // Second, distinct vote for the same duty: accepted (the network
         // needs both halves of the evidence) AND captured as a pair.
         let second = att(1, CURRENT_SLOT, 0xBB);
-        match pool.process(second, CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier) {
+        match pool.process(second, CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey) {
             GossipDecision::Accept { slashing_candidate: Some(ev) } => {
                 // The pair really is this validator conflicting with itself,
                 // in a form the slashing pipeline recognizes as a double vote.
@@ -679,7 +733,7 @@ mod tests {
         let mut blocks3 = blocks.clone();
         blocks3.insert(root(0xCC));
         let third = att(1, CURRENT_SLOT, 0xCC);
-        let d = pool.process(third, CURRENT_SLOT, &committees(), &known(&blocks3), &RootEchoVerifier);
+        let d = pool.process(third, CURRENT_SLOT, &committees(), &known(&blocks3), &RootEchoVerifier, &AnyKey);
         assert!(matches!(d, GossipDecision::Ignore(IgnoreReason::EquivocationLimit)));
         assert_eq!(pool.accepted_hashes(CURRENT_SLOT, 1).len(), 2);
     }
@@ -700,7 +754,7 @@ mod tests {
                 h[..8].copy_from_slice(&i.to_le_bytes());
                 h
             };
-            let d = pool.process(signed(v, d0), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier);
+            let d = pool.process(signed(v, d0), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
             assert!(matches!(d, GossipDecision::Hold { .. }));
         }
         // Never exceeds capacity, and the evictees are exactly the oldest 8.
@@ -713,11 +767,11 @@ mod tests {
     fn prune_drops_expired_state_deterministically() {
         let mut pool = AttestationPool::new();
         let blocks = default_known();
-        assert!(is_accept(&pool.process(att(1, 10, 0xAA), 11, &committees(), &known(&blocks), &RootEchoVerifier)));
+        assert!(is_accept(&pool.process(att(1, 10, 0xAA), 11, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey)));
         // Park one entry at the same old slot.
         let none = BTreeSet::new();
         assert!(matches!(
-            pool.process(att(2, 10, 0x33), 11, &committees(), &known(&none), &RootEchoVerifier),
+            pool.process(att(2, 10, 0x33), 11, &committees(), &known(&none), &RootEchoVerifier, &AnyKey),
             GossipDecision::Hold { .. }
         ));
 
@@ -748,15 +802,15 @@ mod tests {
         let mut pool_a = AttestationPool::new();
         let a = att(1, CURRENT_SLOT, 0xAA);
         assert!(matches!(
-            pool_a.process(a.clone(), CURRENT_SLOT, &committee, &known(&only_target), &RootEchoVerifier),
+            pool_a.process(a.clone(), CURRENT_SLOT, &committee, &known(&only_target), &RootEchoVerifier, &AnyKey),
             GossipDecision::Hold { .. }
         ));
-        let released = pool_a.on_block(&root(0xAA), CURRENT_SLOT, &committee, &known(&all_known), &RootEchoVerifier);
+        let released = pool_a.on_block(&root(0xAA), CURRENT_SLOT, &committee, &known(&all_known), &RootEchoVerifier, &AnyKey);
         assert!(is_accept(&released[0].1));
 
         // Ordering B: block first, attestation second.
         let mut pool_b = AttestationPool::new();
-        assert!(is_accept(&pool_b.process(a, CURRENT_SLOT, &committee, &known(&all_known), &RootEchoVerifier)));
+        assert!(is_accept(&pool_b.process(a, CURRENT_SLOT, &committee, &known(&all_known), &RootEchoVerifier, &AnyKey)));
 
         // Identical observable state: same accepted set, same pending set.
         assert_eq!(pool_a.accepted_hashes(CURRENT_SLOT, 1), pool_b.accepted_hashes(CURRENT_SLOT, 1));
@@ -765,11 +819,11 @@ mod tests {
         // And a duplicate afterwards is judged identically by both.
         let dup = att(1, CURRENT_SLOT, 0xAA);
         assert!(matches!(
-            pool_a.process(dup.clone(), CURRENT_SLOT, &committee, &known(&all_known), &RootEchoVerifier),
+            pool_a.process(dup.clone(), CURRENT_SLOT, &committee, &known(&all_known), &RootEchoVerifier, &AnyKey),
             GossipDecision::Ignore(IgnoreReason::Duplicate)
         ));
         assert!(matches!(
-            pool_b.process(dup, CURRENT_SLOT, &committee, &known(&all_known), &RootEchoVerifier),
+            pool_b.process(dup, CURRENT_SLOT, &committee, &known(&all_known), &RootEchoVerifier, &AnyKey),
             GossipDecision::Ignore(IgnoreReason::Duplicate)
         ));
     }
@@ -786,11 +840,11 @@ mod tests {
 
         for (first, second) in [(x.clone(), y.clone()), (y, x)] {
             let mut pool = AttestationPool::new();
-            match pool.process(first, CURRENT_SLOT, &committee, &known(&blocks), &RootEchoVerifier) {
+            match pool.process(first, CURRENT_SLOT, &committee, &known(&blocks), &RootEchoVerifier, &AnyKey) {
                 GossipDecision::Accept { slashing_candidate: None } => {}
                 other => panic!("expected clean accept, got {other:?}"),
             }
-            match pool.process(second, CURRENT_SLOT, &committee, &known(&blocks), &RootEchoVerifier) {
+            match pool.process(second, CURRENT_SLOT, &committee, &known(&blocks), &RootEchoVerifier, &AnyKey) {
                 GossipDecision::Accept { slashing_candidate: Some(ev) } => {
                     assert!(ev.offense().is_ok());
                     // The evidence identity is order-independent by

@@ -35,11 +35,17 @@
 //!
 //! ## Status
 //!
-//! **UNAUDITED. Not wired into the node.** This crate is not a member of the
-//! node workspace and is not a path-dependency of `bloch`, so the node's build
-//! and validation path are untouched — the same posture
-//! `crates/coherence-prover` takes. Activation, when it comes, is a
-//! height-gated flag day like `STATE_ROOT_ACTIVATION_HEIGHT`.
+//! **UNAUDITED — but WIRED. This crate IS the node's consensus.** It is a
+//! member of the root workspace and a path-dependency of `bloch-pos-node`
+//! (`crates/bloch-pos-node/Cargo.toml`), so its transition, its state root and
+//! its flag days are on the live validation path. This header claimed the
+//! opposite — not a workspace member, not wired, node build untouched — until
+//! 2026-09-02; it was written when the crate was standalone and was never
+//! updated when Genesis-4 became the trunk. Anyone triaging on the strength of
+//! that sentence was reading consensus code believing it was inert.
+//!
+//! The one clause that survives: this is still not a path-dependency of the
+//! retired Genesis-3 PoW binary under `legacy/`.
 //!
 //! ## The rule this crate is written to obey
 //!

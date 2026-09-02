@@ -48,8 +48,18 @@
 //! statement in proof of stake; attested stake is.
 //!
 //! Two properties come from starting the walk at the justified checkpoint
-//! rather than at genesis: finalised history can never be reorganised out, and
-//! the walk is bounded by the unfinalised suffix instead of the whole chain.
+//! rather than at genesis: the walk never proposes a head that conflicts with
+//! the justified checkpoint it starts from, and it is bounded by the
+//! unfinalised suffix instead of the whole chain.
+//!
+//! This sentence used to read "finalised history can never be reorganised
+//! out". CORRECTED 2026-09-01: that is false, and it is false in normal
+//! operation, not under attack. The walk starts at the *justified* root, and
+//! the state committed there finalises two epochs below the head — so the
+//! deepest cut this algorithm may legitimately propose is itself a finality
+//! rewind. It has been measured: finalized epoch 6 -> 4 -> 2 -> 0 in three
+//! in-rules cuts. `finalized` is not a latch, and `rpc.rs`'s `Finality` doc
+//! carries the retraction an integrator needs.
 //!
 //! The store is **rebuilt from scratch on every head computation** rather than
 //! carried as mutable node state. That is the §5.5 posture applied where it is
@@ -75,6 +85,7 @@ use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, V
 use bloch_pos_committee::interfaces::{ProposalEnvelope, StateReader, StateTransition};
 use bloch_pos_committee::schedule::first_slot_of_epoch;
 use bloch_pos_committee::transition::{CommittedState, PosTransaction, Transition};
+use bloch_pos_committee::interfaces::TransitionError;
 use bloch_pos_committee::{committees, derive, epoch_of, schedule};
 
 use crate::genesis::{Manifest, GENESIS_MIX};
@@ -157,6 +168,33 @@ const NO_TXS: [PosTransaction; 0] = [];
 /// (fees, per-sender limits, eviction by price) is `gossip.rs` work.
 const MEMPOOL_MAX: usize = 4_096;
 
+/// How long a transaction the proposer's drop loop refused stays barred from
+/// re-admission, in slots. 128 slots is four epochs (~64 min at 30 s slots).
+///
+/// **Why a ban expires instead of being permanent.** The refusal that sends a
+/// transaction here is the transition's, and not every one of those is a
+/// property of the transaction alone. `UnknownInput` in particular is a
+/// statement about the state at ONE moment: a transfer that spends the output
+/// of another transfer still in the mempool is refused today and applies
+/// perfectly once its parent lands. Barring it forever would turn a chained
+/// spend — a legitimate thing a wallet does — into a coin that can never be
+/// moved, and the node would give no sign. A ban that lapses costs such a
+/// transaction a delay; a ban that does not costs it everything.
+///
+/// Four epochs is chosen against what the ban has to outlive: the gossip that
+/// keeps re-offering the transaction. It must be long enough that the mesh
+/// stops handing it back before the door reopens, and short enough that a
+/// wrongly-barred chained spend is not stuck past a user's patience.
+const REJECTION_TTL_SLOTS: u64 = 128;
+
+/// Cap on the rejection cache, so remembering refusals cannot itself become
+/// the memory exhaustion it prevents. Same order as [`MEMPOOL_MAX`], because
+/// the cache can hold at most what passed through the mempool.
+///
+/// At the cap the entry expiring SOONEST is evicted first: it is the one whose
+/// door was about to reopen anyway, so the eviction costs the least protection.
+const REJECTION_MAX: usize = 4_096;
+
 /// Transactions a proposal will carry at most, independent of the consensus
 /// byte cap it is also checked against.
 const MAX_TXS_PER_BLOCK: usize = 256;
@@ -214,10 +252,14 @@ fn body_transactions(env: &BlockEnvelope) -> Result<Vec<PosTransaction>, String>
 /// caller can forget.
 ///
 /// It cannot be forgotten here, because `state` is private to this module and
-/// [`StateCell::set`] is the ONLY way to write it — and `set` both bumps the
-/// generation and empties the memo. There is no assignment path that skips
-/// either. Reads go through `Deref`, so every existing `self.state.foo()`
-/// still reads the live state and nothing else.
+/// the only ways to write it are `StateCell::set` and `StateCell::set_arc` —
+/// **two** writers, not one: `set_arc` is how `do_reorg` installs the post-state
+/// it already holds behind an `Arc`. Both do identical bookkeeping: replace the
+/// state, bump the generation, empty the memo. What the argument needs is not
+/// one writer but no writer that does less than these two — the property point
+/// 2 below states, and the one to re-check if a third is ever added. Reads go
+/// through `Deref`, so every existing `self.state.foo()` still reads the live
+/// state and nothing else.
 ///
 /// # The memo key, and why it is complete
 ///
@@ -263,17 +305,22 @@ mod state_cell {
     /// a node whose head lags its wall clock. The memo is dropped whole on
     /// every applied block anyway, so this bounds a burst, not a lifetime.
     ///
-    /// **It is also a memory budget, and it is the larger of the two this
-    /// module spends.** Each entry is a whole `CommittedState`, structurally
-    /// sharing nothing with the live one, so a full memo is `MEMO_CAP` extra
-    /// copies — the same unit [`REORG_STATE_WINDOW`] is counted in, four
-    /// times over. It is transient where the retention window is steady
-    /// state, but the peak is what an OOM kills on.
+    /// **It is also a memory budget, and it used to be the larger of the two
+    /// this module spends.** Each entry is a whole `CommittedState` — but
+    /// since 2026-08-31 a rolled state *shares its eUTXO map* with the state
+    /// it was rolled from (`close_epoch` never writes to the ledger, so the
+    /// `Arc` in `EutxoSet` is never unshared on this path), and the eUTXO map
+    /// was almost all of the 60 MB the measurement below records. A memo
+    /// entry now costs the per-epoch fields — registry, participation,
+    /// finality view — not the ledger. The figures below predate the sharing
+    /// and are kept as the record of what an *unshared* state costs, which is
+    /// still what [`REORG_STATE_WINDOW`] holds when blocks move the ledger.
     ///
     /// MEASURED on this tree by `bench::bench_state_footprint` (`--release`,
-    /// Genesis-3-sized eUTXO set, RSS delta over four clones): **60 MB per
-    /// state**, so a full memo is ~240 MB and the two features together peak
-    /// around 300 MB per validator above the pre-change baseline.
+    /// Genesis-3-sized eUTXO set, RSS delta over four clones, PRE-sharing):
+    /// **60 MB per state**, so a full memo was ~240 MB and the two features
+    /// together peaked around 300 MB per validator above the pre-change
+    /// baseline.
     ///
     /// That 60 MB does NOT match the 128 MB in [`REORG_STATE_WINDOW`]'s doc.
     /// Both are real measurements of the same quantity on different hosts
@@ -314,10 +361,10 @@ mod state_cell {
             }
         }
 
-        /// Replace the canonical state. The only writer, and the reason the
-        /// memo key is sound: it moves the generation and drops the memo in
-        /// the same breath, so no caller can advance the state and leave a
-        /// rolled copy of the old one reachable.
+        /// Replace the canonical state. One of the two writers — `set_arc` is
+        /// the other — and it is why the memo key is sound: it moves the
+        /// generation and drops the memo in the same breath, so no caller can
+        /// advance the state and leave a rolled copy of the old one reachable.
         pub(super) fn set(&mut self, state: CommittedState) {
             self.state = Arc::new(state);
             self.generation = self.generation.wrapping_add(1);
@@ -346,6 +393,20 @@ mod state_cell {
         #[cfg(test)]
         pub(super) fn generation(&self) -> u64 {
             self.generation
+        }
+
+        /// How many rolled states the memo holds right now. Test surface —
+        /// so a test can pin that a roll of many epochs leaves (and, with the
+        /// in-loop eviction, passes through) no more than `MEMO_CAP` entries.
+        #[cfg(test)]
+        pub(super) fn memo_len(&self) -> usize {
+            self.memo.borrow().len()
+        }
+
+        /// The eviction bound, for the same test.
+        #[cfg(test)]
+        pub(super) fn memo_cap() -> usize {
+            MEMO_CAP
         }
 
         /// Plant an entry in the memo by hand. TEST ONLY, and only so a test
@@ -417,12 +478,21 @@ mod state_cell {
                     epoch: cur_epoch,
                     rolled: Arc::clone(&cur),
                 });
-            }
-            // Evict the lowest epochs first: they are the cheapest to rebuild
-            // (fewest rolls from the base) and the least likely to be asked
-            // for again, since the traffic walks forward.
-            while memo.len() > MEMO_CAP {
-                memo.remove(0);
+                // Evict the lowest epochs first: they are the cheapest to
+                // rebuild (fewest rolls from the base) and the least likely
+                // to be asked for again, since the traffic walks forward.
+                //
+                // INSIDE the loop, not after it (2026-08-31): evicting after
+                // meant a roll of N epochs transiently held N entries, and on
+                // a node N epochs behind the wall clock — the one node that
+                // rolls far — that was N full states at once. The rolled
+                // states now share the eUTXO map, so an entry is small; this
+                // keeps the memo's population bounded by MEMO_CAP at every
+                // point of the roll rather than only between calls, so the
+                // bound does not depend on the sharing to hold.
+                while memo.len() > MEMO_CAP {
+                    memo.remove(0);
+                }
             }
             cur
         }
@@ -508,12 +578,71 @@ struct Engine {
     /// Transactions waiting for a block, keyed by canonical bytes so a
     /// duplicate gossip collapses instead of being included twice.
     ///
-    /// Devnet mempool, and the limitations are the point: no fee ordering (it
-    /// is insertion-ordered), no per-sender limit, no eviction beyond
-    /// `MEMPOOL_MAX`, and admission checks only that the bytes decode. A
-    /// public network needs all four; `gossip.rs` in the pure crate is where
-    /// that belongs and it is still not wired.
+    /// Devnet mempool, and the limitations are the point: no fee ordering, no
+    /// per-sender limit, no eviction beyond `MEMPOOL_MAX`. A public network
+    /// needs all three; `gossip.rs` in the pure crate is where that belongs
+    /// and it is still not wired.
+    ///
+    /// Ordering has to be stated precisely, because this comment used to call
+    /// it insertion order and that is not what happens. The container is a
+    /// `BTreeMap` keyed by the canonical transaction bytes, and
+    /// [`Engine::select_transactions`] walks it with `iter()` — so inclusion
+    /// order is **lexicographic over the encoded transaction**, not arrival
+    /// order. That is worse than merely absent: a sender who re-encodes until
+    /// the bytes sort low buys priority for nothing, so inclusion order here
+    /// is grindable.
+    ///
+    /// Admission is not "the bytes decode" either. `on_transaction` calls
+    /// `admissible`, which refuses deposits, delegations and exits, refuses a
+    /// transfer with no inputs or no outputs, and verifies every spend
+    /// signature.
     mempool: BTreeMap<Vec<u8>, PosTransaction>,
+    /// Transactions the proposer's drop loop refused, keyed exactly like
+    /// [`Self::mempool`] and mapping to `(slot the bar lifts at, times it has
+    /// barred a re-offer)`.
+    ///
+    /// The counter exists because the first version of this was UNMEASURABLE
+    /// in production: the gossip path discards `on_transaction`'s result on
+    /// purpose ("a peer is not waiting on a verdict"), so a bar left no trace
+    /// anywhere — no line, no counter, no RPC — and "is the cache working?"
+    /// could only be answered by inference from mempool sizes. In a repo whose
+    /// rule is that a proof you cannot re-run is a claim, that was the wrong
+    /// thing to ship.
+    ///
+    /// Without this, dropping a refused transaction from the mempool does not
+    /// remove it from the NETWORK: the peers still holding it re-offer it, the
+    /// thin structural admission check lets it back in, and the next proposal
+    /// drops it again. Measured on the live chain 2026-08-30 — a node cleared
+    /// its mempool to 0 while proposing at slot 47,878 and was holding 21 of
+    /// the same transactions 383 slots later. The mempool self-cleans; the
+    /// fleet-wide population does not converge. This is what makes the removal
+    /// stick, and it is why the ban is checked BEFORE the re-broadcast: a node
+    /// that knows better must stop amplifying.
+    ///
+    /// It is deliberately node-local and unsigned. Nothing here is gossiped —
+    /// a refusal one node reached is not evidence another must accept, and a
+    /// shared ban list is a censorship channel that needs a threat model this
+    /// does not have. Each node learns from its own proposals, and convergence
+    /// is the fleet arriving at the same answer separately.
+    rejected: BTreeMap<Vec<u8>, (u64, u64)>,
+    /// Total re-offers this node has barred since boot, across all keys.
+    rejected_hits: u64,
+    /// Transactions the epoch sweep found spending inputs this chain does not
+    /// have — on ONE sweep. Eviction takes two.
+    ///
+    /// The second strike exists for the chained spend: a transfer paying from
+    /// the output of another transfer still in the mempool points, at this
+    /// instant, at an outpoint the eUTXO set does not have, and becomes
+    /// perfectly valid the moment its parent lands. Evicting on the first
+    /// sweep would kill a legitimate wallet pattern. Surviving one sweep and
+    /// failing the next gives it between one and two epochs (16-32 min) for
+    /// the parent to arrive — generous, because parents land in blocks, not
+    /// in epochs. A transaction that becomes valid again leaves this set.
+    mempool_suspect: BTreeSet<Vec<u8>>,
+    /// Epoch of the last sweep, so it runs once per epoch and not once per
+    /// block. Starts at `u64::MAX` so the first boundary a node crosses
+    /// sweeps, whatever epoch it booted into.
+    mempool_swept_epoch: u64,
     store: Store,
     net: net::Net,
     head_slot: Arc<AtomicU64>,
@@ -555,16 +684,32 @@ struct ForkChoiceInputs {
 
 /// Why a transaction was turned away at the door.
 ///
-/// The distinction is load-bearing, not cosmetic: one of these means "ask me
-/// again in a moment" and the other means "these bytes will never be
-/// admitted, stop sending them". Collapsing both into one RPC code is how an
-/// operator ends up growing the mempool to fix a bad signature.
+/// The distinction is load-bearing, not cosmetic: two of these mean "ask me
+/// again in a moment" and the third means "these bytes will never be
+/// admitted, stop sending them". Collapsing them into one RPC code is how an
+/// operator ends up growing the mempool to fix a bad signature — or, the way
+/// it actually happened, how an exchange told "never resubmit after -32008"
+/// writes off transactions that a self-lifting bar would have admitted an
+/// hour later.
+///
+/// The RPC boundary now preserves the variant rather than only its sentence:
+/// `AtCapacity` -> `MEMPOOL_FULL`, `PreviouslyRefused` ->
+/// `TX_REFUSED_RETRYABLE` (with `error.data.until_slot`), `Invalid` ->
+/// `TX_REFUSED`. See `Engine::serve_rpc`.
 #[derive(Debug, PartialEq, Eq)]
 enum Refusal {
     /// The mempool is full. The transaction was NOT judged invalid.
     AtCapacity,
     /// `admissible` refused it on its merits. Retrying is pointless.
     Invalid(&'static str),
+    /// This node's own proposer already tried to build a block with it and the
+    /// transition refused. Distinct from `Invalid`, and the difference is not
+    /// cosmetic: `Invalid` is a verdict on the bytes, which no passage of time
+    /// changes, while this is a verdict on the bytes AGAINST A STATE — it can
+    /// stop being true, so the bar lifts on its own after
+    /// [`REJECTION_TTL_SLOTS`]. Carries the slot it lifts at, so a caller with
+    /// someone to answer to can say when to try again.
+    PreviouslyRefused { until_slot: u64 },
 }
 
 impl Refusal {
@@ -574,10 +719,38 @@ impl Refusal {
         match self {
             Refusal::AtCapacity => "mempool is at capacity",
             Refusal::Invalid(why) => why,
+            Refusal::PreviouslyRefused { .. } => {
+                "this node's proposer already had the transition refuse this transaction"
+            }
         }
     }
 }
 
+
+/// Which transaction in the body the transition is accusing, if it says.
+///
+/// `TransitionError::Transfer(u32, _)` and `Transaction(u32)` both carry "the
+/// index into the body list" — the variant docs say it in those words. Every
+/// other error names no transaction: a root mismatch, a shielded refusal, a
+/// cap breach are properties of the block or of the whole selection.
+///
+/// A free function, and bounds-checked against the CURRENT length, for two
+/// reasons. It is the one decision in the drop loop worth testing on its own —
+/// the loop around it needs a proposer slot, a RANDAO chain and a signing key
+/// to run at all. And the index came from a transition that judged a list this
+/// function may no longer be holding: the loop shrinks `txs` every round, so an
+/// index that was valid when the error was raised can be stale by the time it
+/// is used. Out of range falls back to `None`, and `None` means "drop the tail
+/// and retry", which is the behaviour that keeps the node producing.
+fn culprit_index(err: &TransitionError, len: usize) -> Option<usize> {
+    match err {
+        TransitionError::Transfer(i, _) | TransitionError::Transaction(i) => {
+            let i = *i as usize;
+            (i < len).then_some(i)
+        }
+        _ => None,
+    }
+}
 
 impl Engine {
     // ── Derivations over the canonical chain ────────────────────────────────
@@ -778,7 +951,39 @@ impl Engine {
     /// node that cannot reach the branch is not in a position to make that
     /// claim about anybody.
     fn seed_for_attestation(&self, target_root: &[u8; 32], epoch: u64) -> Option<[u8; 32]> {
-        match epoch.checked_sub(committees::MIN_SEED_LOOKAHEAD_EPOCHS) {
+        // GATED, on the SAME constant as `CommittedState::seed_for_epoch`, and
+        // this is a correction: until 2026-08-25 the look-ahead here was
+        // unconditional while the committed rule was gated, so the two
+        // disagreed by exactly one boundary for every epoch below the flag day
+        // — which is every epoch this chain has ever had. The node judged
+        // arriving attestations against the committee of `mix(E − 2)` while
+        // the transition admitted them against `mix(E − 1)`. Anchoring the
+        // seed to the attester's branch (the 2026-08-24 fix) is orthogonal to
+        // WHICH boundary that branch is read at, and only the anchor was
+        // gated.
+        //
+        // The two must move together or the gate buys nothing: a duty view
+        // that disagrees with the consensus authority is the defect the
+        // anchor was introduced to remove, one boundary along.
+        //
+        // # The third definition, which this does NOT fix
+        //
+        // `derive::sortition_seed` — the producer's inclusion filter and
+        // proposer draw — reads `epoch − 1` unconditionally, with no gate.
+        // Below the flag day that is the same boundary all three now use, so
+        // the fleet is consistent today. **The moment
+        // `ANCESTRY_SEED_ACTIVATION_EPOCH` is armed, `sortition_seed` becomes
+        // the odd one out** and the producer will filter against a committee
+        // the transition does not recognise. It is not gated here because its
+        // history lives in `ParentState::chain.randao_mixes`, whose retention
+        // is a separate question from `boundary_mixes`'. Arming this flag day
+        // is not safe until that is closed.
+        let lookahead = if epoch < bloch_pos_committee::params::ANCESTRY_SEED_ACTIVATION_EPOCH {
+            0
+        } else {
+            committees::MIN_SEED_LOOKAHEAD_EPOCHS
+        };
+        match epoch.checked_sub(lookahead) {
             None => Some(GENESIS_MIX),
             Some(src) => self.ancestral_boundary_mix(target_root, src),
         }
@@ -911,12 +1116,36 @@ impl Engine {
 
     // ── Duties ──────────────────────────────────────────────────────────────
 
+    /// This node's validator index, but only if the registry it is judging
+    /// against still says that index is *this* key.
+    ///
+    /// Every duty goes through here rather than reading `keys.index`
+    /// directly. The index alone is not identity: indices are handed out as
+    /// `registry.keys().next_back() + 1`, so a keystore minted for index 64
+    /// before its deposit landed can be beaten to index 64 by somebody else's
+    /// deposit. Checking only membership would then pass — the index is
+    /// genuinely active — and this node would sign under another validator's
+    /// key. Two conflicting messages under one index is the equivocation
+    /// `slashing.rs` punishes, so the check that matters is the KEY.
+    ///
+    /// `None` also covers the ordinary pending-activation case (index not yet
+    /// registered), which is why this is a silent early return and not a
+    /// warning: for a newcomer it is the expected state of every slot until
+    /// its deposit is applied.
+    ///
+    /// Cost is one registry probe and one ~3.7 KB compare per duty check —
+    /// nothing beside the hybrid signature it guards.
+    fn duty_index(&self, rolled: &CommittedState) -> Option<u32> {
+        let keys = self.keys.as_ref()?;
+        let rec = rolled.validator_record(keys.index)?;
+        (rec.pubkey == keys.pubkey).then_some(keys.index)
+    }
+
     fn attest(&mut self, slot: u64) {
         // An observer holds no key and therefore has no duty.
-        let Some(keys) = self.keys.as_ref() else {
+        if self.keys.is_none() {
             return;
-        };
-        let index = keys.index;
+        }
         let e = epoch_of(slot);
         if e == 0 {
             // Epoch 0's checkpoint is genesis — justified by definition;
@@ -924,6 +1153,11 @@ impl Engine {
             return;
         }
         let rolled = self.rolled_to(e);
+        // Identity re-checked against the same snapshot that draws the
+        // committee, before membership is even asked about.
+        let Some(index) = self.duty_index(&rolled) else {
+            return;
+        };
         let roster = rolled.active_validators();
         let seed = Self::seed_for(&rolled, e);
         let committee = committees::committee_for_slot(&seed, slot, &roster);
@@ -960,12 +1194,16 @@ impl Engine {
     }
 
     fn propose(&mut self, slot: u64) {
-        let Some(keys) = self.keys.as_ref() else {
+        if self.keys.is_none() {
             return;
-        };
-        let index = keys.index;
+        }
         let e = epoch_of(slot);
         let rolled = self.rolled_to(e);
+        // Same rule as `attest`: the key, not just the index, and from the
+        // same snapshot the schedule is drawn from.
+        let Some(index) = self.duty_index(&rolled) else {
+            return;
+        };
         let roster = rolled.active_validators();
         let seed = Self::seed_for(&rolled, e);
         if schedule::proposer(&seed, slot, &roster) != Some(index) {
@@ -1060,11 +1298,40 @@ impl Engine {
             {
                 Ok(p) => break (p, tx_bytes),
                 Err(err) => {
-                    let Some(bad) = txs.pop() else {
-                        // Empty and still refused: the fault is not in any
-                        // transaction, so proposing is genuinely impossible.
-                        eprintln!("[slot {slot}] produce refused with no transactions: {err:?}");
-                        return;
+                    // WHICH transaction, when the transition says which.
+                    //
+                    // `TransitionError::Transfer(u32, _)` and `Transaction(u32)`
+                    // both carry "the index into the body list" — the doc on the
+                    // variant says so in those words. Popping the TAIL instead
+                    // was a defect with a cost that compounds: if the offender
+                    // sits early in the selection, the loop discards every good
+                    // transaction behind it one at a time, re-running the whole
+                    // transition each round (O(k^2) for k = MAX_TXS_PER_BLOCK),
+                    // and — since the rejection cache landed on 2026-08-30 —
+                    // BARS each of those innocent transactions for
+                    // REJECTION_TTL_SLOTS. One bad transaction could bar up to
+                    // 255 legitimate ones for ~64 minutes. The cache did not
+                    // create the defect; it turned a wasted slot into an hour
+                    // of censorship, which is why the two are fixed together.
+                    //
+                    // The tail is still the fallback for the errors that name
+                    // no index (`Shielded`, root mismatches): dropping SOMEthing
+                    // and retrying is what keeps the node producing, and that is
+                    // the whole point of this loop.
+                    let bad = match culprit_index(&err, txs.len()) {
+                        Some(i) => txs.remove(i),
+                        None => match txs.pop() {
+                            Some(t) => t,
+                            None => {
+                                // Empty and still refused: the fault is not in
+                                // any transaction, so proposing is genuinely
+                                // impossible.
+                                eprintln!(
+                                    "[slot {slot}] produce refused with no transactions: {err:?}"
+                                );
+                                return;
+                            }
+                        },
                     };
                     eprintln!(
                         "[slot {slot}] dropping a transaction the transition refuses ({err:?}); \
@@ -1072,7 +1339,17 @@ impl Engine {
                     );
                     // Out of the mempool too, or the next proposer inherits the
                     // same halt this loop just avoided.
-                    self.mempool.remove(&bad.canonical_bytes());
+                    //
+                    // And barred from returning: removal alone is not enough,
+                    // because the peers that still hold it re-offer it and the
+                    // structural admission check has no way to see what the
+                    // transition just saw. Without the bar the node cleans
+                    // itself and refills — observed on the live chain, mempool
+                    // 0 at slot 47,878 and 21 of the same transactions back
+                    // 383 slots later.
+                    let bad_key = bad.canonical_bytes();
+                    self.mempool.remove(&bad_key);
+                    self.reject_transaction(bad_key, slot);
                 }
             }
         };
@@ -1330,14 +1607,203 @@ impl Engine {
     }
 
 
+    /// Outpoints a transaction spends, when it spends any.
+    ///
+    /// `None` for everything that is not a transfer: staking messages consume
+    /// no eUTXO today (that is precisely the gap the validator-opening wave
+    /// closes), so "spends nothing" and "spends something absent" must not be
+    /// the same answer — the sweep may only ever judge transactions that
+    /// actually name outpoints.
+    fn spent_outpoints(tx: &PosTransaction) -> Option<Vec<([u8; 32], u32)>> {
+        match tx {
+            PosTransaction::Transfer { inputs, .. } => {
+                Some(inputs.iter().map(|i| (i.txid, i.vout)).collect())
+            }
+            PosTransaction::TransferV2 { inputs, .. } => {
+                Some(inputs.iter().map(|i| (i.txid, i.vout)).collect())
+            }
+            _ => None,
+        }
+    }
+
+    /// Evict mempool transactions that spend outputs this chain does not have.
+    ///
+    /// # Why this exists, and why the proposer's drop loop was not enough
+    ///
+    /// The drop loop is the ONLY path that removed an inapplicable
+    /// transaction, and it runs exactly when this node PROPOSES. A node that
+    /// never proposes therefore never drops anything: its mempool is a
+    /// one-way sink that fills to `MEMPOOL_MAX` and stays there.
+    ///
+    /// That is not hypothetical. Measured on the live fleet, 2026-08-30:
+    /// the two archival nodes and the public RPC node — none of which holds a
+    /// validator key, all three with `proposing block` count of exactly zero —
+    /// were sitting on 63, 63 and **190** transactions (5 MB) while the
+    /// validators around them had drained from 91 to 9 by proposing. The
+    /// public explorer reads one of those observers, so the number the world
+    /// saw was a figure no validator held any more.
+    ///
+    /// The rejection cache (see [`Self::reject_transaction`]) does not help
+    /// them either: it is written by the drop loop, so on an observer it is
+    /// never written at all. This sweep is the half that works without
+    /// proposing.
+    ///
+    /// # What it checks, and what it deliberately does not
+    ///
+    /// Only outpoint existence. That is a lookup per input against committed
+    /// state, and it catches the class that actually accumulates
+    /// (`UnknownInput` — a transfer built against a divergent node's UTXO
+    /// view, or one whose inputs were spent by someone else). It does NOT
+    /// re-run the transition: conservation, signatures and script matching
+    /// stay where they are, because a full answer needs a candidate header
+    /// this path has no reason to build. Two checks, neither trusting the
+    /// other — the same posture `admissible` documents for itself.
+    ///
+    /// Once per epoch, not once per block: every RPC call already competes
+    /// with consensus on this thread, and an observer accumulates over days,
+    /// so 16 minutes of latency costs nothing and 32 sweeps per epoch would
+    /// be waste.
+    fn sweep_mempool(&mut self, epoch: u64) {
+        if self.mempool_swept_epoch == epoch {
+            return;
+        }
+        self.mempool_swept_epoch = epoch;
+
+        let mut evict: Vec<Vec<u8>> = Vec::new();
+        let mut suspect: Vec<Vec<u8>> = Vec::new();
+        let mut cleared: Vec<Vec<u8>> = Vec::new();
+        for (key, tx) in &self.mempool {
+            let Some(outpoints) = Self::spent_outpoints(tx) else {
+                continue;
+            };
+            let missing = outpoints
+                .iter()
+                .any(|(txid, vout)| self.state.utxo(txid, *vout).is_none());
+            if !missing {
+                if self.mempool_suspect.contains(key) {
+                    cleared.push(key.clone());
+                }
+                continue;
+            }
+            if self.mempool_suspect.contains(key) {
+                evict.push(key.clone());
+            } else {
+                suspect.push(key.clone());
+            }
+        }
+
+        for key in cleared {
+            self.mempool_suspect.remove(&key);
+        }
+        for key in suspect {
+            self.mempool_suspect.insert(key);
+        }
+        if evict.is_empty() {
+            return;
+        }
+        let n = evict.len();
+        // The WALL slot, not the head's.
+        //
+        // `is_rejected` is checked against `wall_slot()` on the admission
+        // path, so a bar minted against the committed head is born already
+        // expired on exactly the node this sweep exists for: an observer
+        // catching up sits thousands of slots behind the clock, and
+        // `head + TTL` is then far in the past. Same clock on both sides or
+        // the TTL means nothing. (The proposer's drop loop is not exposed to
+        // this: it bars with the slot it is building for, which IS the wall.)
+        let slot = self.wall_slot();
+        for key in evict {
+            self.mempool.remove(&key);
+            self.mempool_suspect.remove(&key);
+            // Barred as well, and for the same reason the drop loop bars: the
+            // peers still holding it re-offer it, and structural admission
+            // cannot see what this sweep just saw.
+            self.reject_transaction(key, slot);
+        }
+        if self.live {
+            eprintln!(
+                "[epoch {epoch}] mempool sweep: evicted {n} transaction(s) spending outputs \
+                 this chain does not have; {} left, {} barred",
+                self.mempool.len(),
+                self.rejected.len()
+            );
+        }
+    }
+
+    /// Bar a transaction the transition refused from coming back, and expire
+    /// whatever is due to expire while we are here.
+    ///
+    /// Purging lazily on write rather than on a timer keeps the cache free of
+    /// its own upkeep loop: nothing has to run for entries to lapse, they are
+    /// simply not honoured past their slot (see [`Self::is_rejected`]), and
+    /// this call reclaims the space. A node that stops proposing therefore
+    /// stops growing this, which is the correct shape — it also stops learning.
+    fn reject_transaction(&mut self, key: Vec<u8>, slot: u64) {
+        self.rejected.retain(|_, (until, _)| *until > slot);
+        while self.rejected.len() >= REJECTION_MAX {
+            // Evict the soonest to lapse: it is the entry closest to being
+            // worthless anyway. `BTreeMap` is ordered by KEY, not by value, so
+            // the minimum has to be found rather than popped.
+            let Some(victim) = self
+                .rejected
+                .iter()
+                .min_by_key(|(_, (until, _))| *until)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.rejected.remove(&victim);
+        }
+        self.rejected.insert(key, (slot.saturating_add(REJECTION_TTL_SLOTS), 0));
+    }
+
+    /// Whether `key` is barred as of `slot`, without mutating anything.
+    ///
+    /// Reads the expiry rather than assuming the purge has run, so a stale
+    /// entry can never bar a transaction one slot longer than it should.
+    fn is_rejected(&self, key: &[u8], slot: u64) -> Option<u64> {
+        self.rejected.get(key).map(|(until, _)| *until).filter(|until| *until > slot)
+    }
+
+    /// Record that a bar just refused a re-offer, and say so ONCE per
+    /// transaction.
+    ///
+    /// Once, not every time: the gossip mesh re-offers, and this node's log
+    /// already carries 18,912 lines of `attestation REJECTED: NotInCommittee`
+    /// — a message that repeats is a message nobody reads. The first refusal
+    /// per key is the event worth seeing (it proves the bar met a real
+    /// re-offer, which is the whole claim); the rest is a number, and the
+    /// number is `rejected_hits`, readable from outside through
+    /// `getmempoolinfo` so measuring the cache needs no shell on the box.
+    fn note_bar(&mut self, key: &[u8], until_slot: u64) {
+        self.rejected_hits = self.rejected_hits.saturating_add(1);
+        let first = match self.rejected.get_mut(key) {
+            Some((_, hits)) => {
+                *hits = hits.saturating_add(1);
+                *hits == 1
+            }
+            None => false,
+        };
+        if first && self.live {
+            eprintln!(
+                "barred a re-offered transaction the transition had refused \
+                 (bar lifts at slot {until_slot}); total barred since boot: {}",
+                self.rejected_hits
+            );
+        }
+    }
+
     /// Admit a transaction to the mempool and pass it on.
     ///
-    /// Admission is deliberately thin here — the bytes already decoded at the
-    /// network edge, and that is the whole check. What is missing is named in
-    /// the `mempool` field's doc rather than half-built: no fee floor, no
-    /// per-sender accounting, no replacement policy. Re-broadcast only on
-    /// first sight, so a transaction traverses the mesh once instead of
-    /// echoing between every pair of peers.
+    /// Admission is thin, but it is not "the bytes decoded at the network edge
+    /// and that is the whole check": `admissible`, called below, refuses
+    /// deposits, delegations and exits, refuses a transfer with no inputs or no
+    /// outputs, and verifies every spend signature. What is missing is the
+    /// fee-market half — no fee floor, no per-sender accounting, no replacement
+    /// policy — and that is named in the `mempool` field's doc rather than
+    /// half-built. Re-broadcast only on first sight, so a transaction traverses
+    /// the mesh once instead of echoing between every pair of peers.
+    ///
     /// Returns what became of the transaction, so a caller that has someone to
     /// answer to — the RPC — can say. The gossip path ignores the result: a
     /// peer is not waiting on a verdict, and a duplicate arriving twice over a
@@ -1346,6 +1812,16 @@ impl Engine {
         let key = tx.canonical_bytes();
         if self.mempool.contains_key(&key) {
             return Ok(Admitted::Duplicate);
+        }
+        // Before capacity, and before the structural check: a transaction this
+        // node's own proposer already watched the transition refuse must not
+        // take a mempool slot, and must not be re-broadcast. Ahead of the
+        // capacity test on purpose — otherwise a mempool filled by refused
+        // transactions answers `AtCapacity`, which tells the sender to retry
+        // and is exactly the wrong advice.
+        if let Some(until_slot) = self.is_rejected(&key, self.wall_slot()) {
+            self.note_bar(&key, until_slot);
+            return Err(Refusal::PreviouslyRefused { until_slot });
         }
         if self.mempool.len() >= MEMPOOL_MAX {
             return Err(Refusal::AtCapacity);
@@ -1364,11 +1840,14 @@ impl Engine {
         // is the class that was actually exploited — a transfer that spends
         // nothing or pays no one, which no state can make applicable.
         //
-        // It does NOT catch a transfer whose signature is wrong, whose inputs
-        // do not exist, or which fails conservation. Those still reach the
-        // mempool and are dropped by the proposer, which is why the proposer's
-        // guard is the one that carries liveness and this one only reduces
-        // waste. Two checks, neither trusting the other.
+        // The signature IS caught here — `admissible`'s Transfer arm verifies
+        // every input's spend signature, under a comment in capitals saying
+        // why, and refusing at the mempool door is what stops a garbage
+        // signature propagating. What this does NOT catch is a transfer whose
+        // inputs do not exist, or which fails conservation. Those still reach
+        // the mempool and are dropped by the proposer, which is why the
+        // proposer's guard is the one that carries liveness and this one only
+        // reduces waste. Two checks, neither trusting the other.
         //
         // The epoch handed down is the WALL-CLOCK epoch, read here through
         // the `wall_slot()` METHOD (the clock against the manifest's genesis)
@@ -1389,11 +1868,19 @@ impl Engine {
 
     /// Transactions for the block this node is about to propose.
     ///
-    /// Insertion order, bounded by both [`MAX_TXS_PER_BLOCK`] and the
-    /// consensus byte cap. Insertion order is not a fee market: a real
-    /// proposer sorts by what the transaction pays, and doing that here before
-    /// transfers carry a value format would be inventing an ordering over a
-    /// field nobody sets yet.
+    /// Bounded by both [`MAX_TXS_PER_BLOCK`] and the consensus byte cap, and
+    /// taken in the mempool's own key order — **lexicographic over the
+    /// canonical transaction bytes**, because the mempool is a `BTreeMap` keyed
+    /// by exactly those bytes. Not insertion order, whatever this comment used
+    /// to say.
+    ///
+    /// That is not a fee market, and it is not neutral either: a sender who
+    /// re-encodes until the bytes sort low is included first, for free, so
+    /// inclusion order is grindable. The material for a real ordering is
+    /// already on the wire — a `Transfer` carries `outputs` with values and a
+    /// `tip_millisat_per_gas`, which `submit-tx` sets on every transaction it
+    /// builds (main.rs) — so sorting by what the transaction pays is a change
+    /// that can be made; it simply has not been made here.
     ///
     /// `epoch` is the epoch of the slot being produced, because the byte cap
     /// is flag-day gated. Packing against the wrong era is not symmetric: the
@@ -1470,6 +1957,10 @@ impl Engine {
                 }
                 let cur_e = epoch_of(self.state.slot());
                 self.pool.retain(|_, a| epoch_of(a.data.slot) >= cur_e);
+                // Once per epoch: drop what can no longer apply. On a
+                // validator this only anticipates the drop loop; on an
+                // observer it is the ONLY thing that ever empties the pool.
+                self.sweep_mempool(cur_e);
 
                 if self.live {
                     if let Err(e) = self.store.append(env) {
@@ -1764,17 +2255,64 @@ impl Engine {
         // therefore never scored against the peer that relayed it. A syncing
         // node used to Reject its way through every attestation on the network
         // and graylist the very peers feeding it blocks.
-        let Some(seed) = self.seed_for_attestation(&att.data.target_root, epoch) else {
-            return GossipDecision::Ignore(bloch_pos_committee::gossip::IgnoreReason::Unjudgeable);
+        //
+        // TWO different "no seed" cases, and collapsing them loses votes:
+        //
+        //   * the target block is one we simply have not received yet. That is
+        //     the ORDINARY epoch-boundary race the pool already handles by
+        //     PARKING the attestation (`gossip.rs` step 5) and replaying it
+        //     when the block lands. Ignoring it instead silently drops the
+        //     first slots' votes of every epoch — the very fork-choice weight
+        //     the anchor exists to preserve. So we let the pool reach step 5
+        //     and hold, with a membership lookup that ADMITS rather than
+        //     rejects: we do not know the committee, and "do not know" must
+        //     not read as "not a member". The real committee check runs on
+        //     release, off the real seed.
+        //
+        //   * the target block IS known but its ancestry is not reachable from
+        //     what this node stores (a pruned or partially-synced view).
+        //     Nothing will arrive to unpark it, so parking would only burn one
+        //     of the pending slots. Ignore, and score nobody.
+        //
+        // The cost of the first case is that a non-member can occupy a pending
+        // slot until its target arrives. The pool is hard-bounded with FIFO
+        // eviction and per-peer token buckets upstream, so that is bounded
+        // churn, not unbounded memory — a strictly better trade than dropping
+        // every boundary vote.
+        let known_root =
+            |root: &[u8; 32]| self.canonical.contains(root) || self.blocks.contains_key(root);
+        let seed = match self.seed_for_attestation(&att.data.target_root, epoch) {
+            Some(seed) => Some(seed),
+            None if !known_root(&att.data.target_root) => None,
+            None => {
+                return GossipDecision::Ignore(
+                    bloch_pos_committee::gossip::IgnoreReason::Unjudgeable,
+                )
+            }
         };
-        let committees_at = |slot: u64| committees::committee_for_slot(&seed, slot, &roster);
+        let committees_at = |slot: u64| match seed {
+            Some(seed) => committees::committee_for_slot(&seed, slot, &roster),
+            // Unjudgeable-but-parkable: admit, so step 5 parks on the missing
+            // target instead of step 4 rejecting on a committee we cannot
+            // compute. Every index in the roster, ascending — `committee` is
+            // consumed by `binary_search`, so it must stay sorted.
+            None => {
+                let mut all: Vec<u32> = roster.iter().map(|v| v.index).collect();
+                all.sort_unstable();
+                all
+            }
+        };
         // "Do we have this block?" — canonical ids include genesis, which is
         // synthesized and never stored as an envelope; `blocks` holds every
         // structurally-valid block seen, canonical or not. A vote for a block
         // on a losing branch is still a vote we can verify.
         let known =
             |root: &[u8; 32]| self.canonical.contains(root) || self.blocks.contains_key(root);
-        pool.process(att, self.wall_slot, &committees_at, &known, &self.verifier)
+        // Keys from `rolled`, the SAME projection that produced `roster` and
+        // therefore `committees_at`. Membership and key must come from one
+        // snapshot; the old code took membership from here and the key from a
+        // boot-time genesis table, which is the inconsistency being removed.
+        pool.process(att, self.wall_slot, &committees_at, &known, &self.verifier, &*rolled)
     }
 
     fn apply_decision(&mut self, att: Attestation, decision: GossipDecision, origin: &Origin) {
@@ -1824,7 +2362,27 @@ impl Engine {
             let rolled_epoch = epoch_of(self.wall_slot);
             let rolled = self.rolled_to(rolled_epoch);
             let roster = rolled.active_validators();
-            let seed = Self::seed_for(&rolled, rolled_epoch);
+            // Anchored to the BLOCK THAT JUST ARRIVED, not to this node's
+            // head. Everything released by this call was parked waiting for
+            // `root`, so `root` is on the released attestation's own branch
+            // (it is either its head or its target, and the target is an
+            // ancestor of the head), and the boundary mix read off `root`'s
+            // ancestry is the one that branch's transition will use. Judging
+            // the release against this node's head is the same defect the
+            // ingest path was fixed for on 2026-08-24, left standing on the
+            // path that decides whether a parked vote is ever counted.
+            //
+            // KNOWN GAP, deliberately not papered over: `on_block` re-runs the
+            // whole pipeline through ONE `CommitteeLookup` closure that sees
+            // only a slot, so a single seed serves every attestation released
+            // in this batch. That is right whenever they are on one branch,
+            // which is the case that actually occurs (they were all waiting on
+            // the same root); it is wrong if a future caller batches roots.
+            // Fixing it properly means letting the lookup see the attestation,
+            // which is a `gossip.rs` signature change.
+            let seed = self
+                .seed_for_attestation(&root, rolled_epoch)
+                .unwrap_or_else(|| Self::seed_for(&rolled, rolled_epoch));
             let committees_at = |slot: u64| committees::committee_for_slot(&seed, slot, &roster);
             let known = |r: &[u8; 32]| self.canonical.contains(r) || self.blocks.contains_key(r);
             pool.on_block(
@@ -1833,6 +2391,8 @@ impl Engine {
                 &committees_at,
                 &known,
                 &self.verifier,
+                // Same snapshot `roster` and the seed came from.
+                &*rolled,
             )
         };
         self.att_pool = pool;
@@ -2073,8 +2633,10 @@ impl Engine {
 
             RpcRequest::SendRawTransaction(tx) => match self.on_transaction(tx.clone()) {
                 Ok(outcome) => Ok(rpc::submitted_json(&tx, outcome)),
-                // The two refusals are not the same fact and must not carry
-                // the same advice. "Retry later" is correct for a full
+                // The three refusals are not the same fact and must not
+                // carry the same advice, and each has its own code:
+                // MEMPOOL_FULL (-32003), TX_REFUSED_RETRYABLE (-32009),
+                // TX_REFUSED (-32008). "Retry later" is correct for a full
                 // mempool and actively harmful for a refused transaction:
                 // the founder's consolidation sweep submits hundreds of
                 // thousands of transfers through this method, and an
@@ -2091,6 +2653,37 @@ impl Engine {
                          the transaction was not judged invalid"
                     ),
                 )),
+                //
+                // And the two REFUSALS are not the same fact either, which is
+                // the split this arm exists for. `PreviouslyRefused` is a
+                // verdict on the bytes AGAINST A STATE: the bar lifts by
+                // itself after REJECTION_TTL_SLOTS, so the correct advice is
+                // "resubmit after slot N". `Invalid` is a verdict on the bytes
+                // and the correct advice is "stop". They shared TX_REFUSED
+                // until now, distinguishable only by reading the English —
+                // and the `Refusal` enum's own doc says a caller that must act
+                // on the difference has to match the variant, which is exactly
+                // what this boundary was throwing away. An exchange following
+                // our published "-32008 means never resubmit" guidance
+                // permanently abandoned transactions this node would have
+                // taken ~64 minutes later.
+                //
+                // The deadline goes in `error.data.until_slot` as well as in
+                // the sentence: the codes are stable, the wording is not.
+                Err(Refusal::PreviouslyRefused { until_slot }) => {
+                    Err(RpcError::tx_refused_retryable(
+                        until_slot,
+                        format!(
+                            "this node's proposer already had the transition refuse this \
+                             transaction, so it is barred until slot {until_slot}. The usual \
+                             cause is that it spends an output this chain does not have — \
+                             either it was built against a node on a different branch, or its \
+                             parent transaction has not landed yet. This bar lifts on its own: \
+                             resubmit the same bytes from slot {until_slot}, or sooner once \
+                             the parent confirms. See `error.data.until_slot`."
+                        ),
+                    ))
+                }
                 Err(Refusal::Invalid(why)) => Err(RpcError::new(
                     rpc::TX_REFUSED,
                     format!("{why} — this transaction cannot be admitted; retrying \
@@ -2098,11 +2691,16 @@ impl Engine {
                 )),
             },
 
+            // Identity of the binary, not of the chain: no state read, no
+            // lock taken, constant cost at any height.
+            RpcRequest::BuildInfo => Ok(rpc::build_info_json()),
             RpcRequest::MempoolInfo => Ok(rpc::mempool_info_json(
                 self.mempool.len(),
                 MEMPOOL_MAX,
                 self.mempool.keys().map(Vec::len).sum(),
                 self.state.next_base_fee(),
+                self.rejected.len(),
+                self.rejected_hits,
             )),
         }
     }
@@ -2114,6 +2712,163 @@ impl Engine {
 /// operator watching a stalled fleet gets an answer quickly, and long enough
 /// that the log of a multi-hour replay stays readable.
 const REPLAY_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Verdict of the boot-time keystore identity gate ("gate 3").
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum KeystoreIdentity {
+    /// The keystore is the manifest's validator at that index, and its local
+    /// RANDAO chain opens the committed head.
+    Ok,
+    /// No manifest validator carries this (index, pubkey) pair.
+    NotInGenesisSet,
+    /// The validator is in the manifest, but the local RANDAO seed does not
+    /// regenerate the committed commitment.
+    RandaoMismatch,
+}
+
+/// The boot-time identity gate, extracted from `run` so it can be tested.
+///
+/// # This gate is the third thing blocking an open network, and it is
+/// # independent of the verifier
+///
+/// A validator added by an on-chain deposit is, by construction, NOT in the
+/// genesis manifest. So even once the verifier reads the registry and the
+/// network can *count* a newcomer's votes, the newcomer's own node still
+/// refuses to boot with `keystore does not match the genesis manifest's
+/// validator set`. Fixing the verifier alone gets you a validator everyone
+/// else can verify and that cannot start.
+///
+/// The root cause is the same one the verifier had: **identity is being read
+/// from the genesis manifest instead of from the committed registry.** A
+/// validator's index, key and RANDAO commitment are all committed state
+/// (`ValidatorRecord`), and a deposit writes all three. The manifest is only
+/// the registry's value at height 0.
+///
+/// **That fix is now made, in [`check_registry_identity`] below, and this
+/// function is no longer authoritative.** It survives as a *fast pre-pass*
+/// only: the registry is not reachable here (the store is not open, the log
+/// is not read, and `CommittedState` has no on-disk form — boot is a full
+/// replay), so the authoritative check cannot run until replay finishes,
+/// which on the live fleet is ~21 minutes of silence. Keeping a cheap
+/// manifest look first means a genesis operator who mistyped a seed still
+/// learns it in a second instead of after a replay.
+///
+/// What changed is which verdicts are fatal. `NotInGenesisSet` is no longer
+/// an error at all — it is the *normal and expected* state of every validator
+/// the network will ever add by deposit, and refusing to boot on it is
+/// precisely the wall that kept a deposit-added validator off the network.
+/// It is now advisory, and [`check_registry_identity`] decides.
+///
+/// # One latent defect fixed in the extraction
+///
+/// The original read the RANDAO commitment as
+/// `manifest.validators[keys.index as usize]` — indexing by POSITION after
+/// having found the record by its `index` FIELD. Those coincide only while
+/// the manifest is dense and sorted; otherwise it compares against another
+/// validator's commitment, or panics out of bounds. This version uses the
+/// record it already found. On the live fleet's dense manifest the two are
+/// identical; everywhere else this one is correct and the old one was not.
+/// (`Manifest::pubkeys()` carries the same position-vs-index assumption and
+/// silently yields an EMPTY key for an out-of-range index — see
+/// `genesis::tests::the_manifest_table_silently_empties_sparse_indices`.)
+pub(crate) fn check_keystore_identity(
+    manifest: &crate::genesis::Manifest,
+    index: u32,
+    pubkey: &[u8],
+    randao_seed: [u8; 32],
+) -> KeystoreIdentity {
+    let Some(v) = manifest.validators.iter().find(|v| v.index == index) else {
+        return KeystoreIdentity::NotInGenesisSet;
+    };
+    if v.pubkey != pubkey {
+        return KeystoreIdentity::NotInGenesisSet;
+    }
+    if RandaoChain::generate(randao_seed).commitment() != v.randao_commitment {
+        return KeystoreIdentity::RandaoMismatch;
+    }
+    KeystoreIdentity::Ok
+}
+
+/// Verdict of the authoritative, registry-backed identity gate.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RegistryIdentity {
+    /// The committed registry holds this index, it carries exactly this
+    /// keystore's key, and the local RANDAO chain opens its committed
+    /// commitment. Duties are armed.
+    Active,
+    /// The registry has no such index *yet*. Not an error: it is what a
+    /// deposit-added validator looks like before its deposit is applied.
+    /// Boot, follow the chain, sign nothing, re-check every slot.
+    PendingActivation,
+    /// The registry holds this index and it belongs to a DIFFERENT key.
+    /// Fatal — see the double-signing note on [`check_registry_identity`].
+    WrongValidator,
+    /// The right key at the right index, but the local RANDAO seed does not
+    /// regenerate the committed commitment. Fatal: this node cannot produce a
+    /// reveal the network will accept, so every block it proposes is refused.
+    RandaoMismatch,
+}
+
+/// The identity gate that actually decides, read from the **committed
+/// registry** rather than from the genesis manifest.
+///
+/// # Why this had to move past replay
+///
+/// `CommittedState` has no serialized form; the node persists its *inputs*
+/// (manifest digest + every block envelope) and rebuilds state by replaying
+/// them. So at the point `run` loads the keystore there is no registry to
+/// consult — no `Store`, no log, no `Engine`. The only registry that exists
+/// before replay is the manifest's, i.e. the height-0 one, which by
+/// construction cannot contain anyone added since height 0. Any gate placed
+/// there can only ever ask "were you in the genesis set?", which is the wrong
+/// question. This one runs after replay, where `engine.state` is the registry
+/// as of the node's own head. The weak-subjectivity gate already sets that
+/// precedent for the same reason.
+///
+/// # Why absence must not be fatal, and why a mismatch must be
+///
+/// The two cases were one branch before, and collapsing them is what closed
+/// the network:
+///
+/// - **Absent** means "your deposit has not been applied on this node's head
+///   yet" — a newcomer that has just deposited, or one still replaying. It is
+///   a temporary, self-healing condition, and the honest response is to
+///   follow the chain and keep checking.
+/// - **Present but a different key** means another validator already owns
+///   this index. Signing there is signing *as them*: two conflicting messages
+///   under one index is exactly the equivocation `slashing.rs` exists to
+///   punish. This must refuse to boot, and it is the real safety value the
+///   old gate was providing — preserved here, and now aimed at the case that
+///   actually warrants it.
+///
+/// # The re-check is a safety requirement, not a convenience
+///
+/// It is tempting to conclude that pending-activation needs no machinery,
+/// because `attest` and `propose` already return early when the index is not
+/// in the roster they derive from committed state. That is true and it is not
+/// sufficient. Indices are allocated `keys().next_back() + 1`, so an operator
+/// whose keystore was minted for index 64 *before* depositing can be beaten
+/// to index 64 by somebody else's deposit. The roster check would then pass —
+/// the index is active — and this node would sign under a key that is not
+/// its own. So the duty path re-checks the *key*, not just the index, every
+/// time it is about to sign: see `Engine::duty_index`.
+pub(crate) fn check_registry_identity(
+    state: &dyn StateReader,
+    index: u32,
+    pubkey: &[u8],
+    randao_seed: [u8; 32],
+) -> RegistryIdentity {
+    let Some(rec) = state.validator_record(index) else {
+        return RegistryIdentity::PendingActivation;
+    };
+    if rec.pubkey != pubkey {
+        return RegistryIdentity::WrongValidator;
+    }
+    if RandaoChain::generate(randao_seed).commitment() != rec.randao_commitment {
+        return RegistryIdentity::RandaoMismatch;
+    }
+    RegistryIdentity::Active
+}
 
 pub fn run(cfg: Config) -> io::Result<()> {
     let (mut manifest, digest) = Manifest::load(&cfg.genesis_path)?;
@@ -2174,26 +2929,37 @@ pub fn run(cfg: Config) -> io::Result<()> {
         }
         Err(e) => return Err(e),
     };
-    let verifier = HybridVerifier::new(manifest.pubkeys());
+    // Stateless now: it holds no key table. Keys are resolved per call from
+    // the committed registry by whichever consensus site is asking.
+    let verifier = HybridVerifier::new();
 
-    // Identity sanity: the keystore must be the validator the manifest says.
+    // Identity, pre-pass. Advisory only — the authoritative gate is
+    // `check_registry_identity`, and it cannot run until replay has rebuilt
+    // the registry. This exists so that the one failure a genesis operator
+    // can cause locally (a RANDAO seed that does not open the committed
+    // commitment) is reported in a second rather than after a full replay.
+    //
+    // `NotInGenesisSet` is deliberately NOT an error here. Every validator
+    // this network ever adds by deposit is outside the genesis manifest by
+    // construction; refusing to boot on that fact is the wall that kept
+    // deposit-added validators off the chain entirely.
     if let Some(keys) = keys.as_ref() {
-        match manifest.validators.iter().find(|v| v.index == keys.index) {
-            Some(v) if v.pubkey == keys.pubkey => {}
-            _ => {
+        match check_keystore_identity(&manifest, keys.index, &keys.pubkey, keys.randao_seed) {
+            KeystoreIdentity::Ok => {}
+            KeystoreIdentity::NotInGenesisSet => {
+                println!(
+                    "validator {} is not in the genesis manifest — expected for a \
+                     deposit-added validator. Identity will be settled against the \
+                     committed registry once replay finishes.",
+                    keys.index
+                );
+            }
+            KeystoreIdentity::RandaoMismatch => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "keystore does not match the genesis manifest's validator set",
+                    "local RANDAO chain does not open the manifest's committed head",
                 ))
             }
-        }
-        if RandaoChain::generate(keys.randao_seed).commitment()
-            != manifest.validators[keys.index as usize].randao_commitment
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "local RANDAO chain does not open the manifest's committed head",
-            ));
         }
     }
 
@@ -2292,6 +3058,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
         att_pool: AttestationPool::new(),
         wall_slot: 0,
         mempool: BTreeMap::new(),
+        rejected: BTreeMap::new(),
+        rejected_hits: 0,
+        mempool_suspect: BTreeSet::new(),
+        mempool_swept_epoch: u64::MAX,
         store,
         net,
         head_slot,
@@ -2361,6 +3131,65 @@ pub fn run(cfg: Config) -> io::Result<()> {
     engine
         .head_slot
         .store(engine.state.slot(), Ordering::Relaxed);
+
+    // ── Identity, authoritative: the committed registry, not the manifest ──
+    //
+    // Here and not before, because the registry only exists once replay has
+    // rebuilt it. `PendingActivation` is a normal boot state, not a failure:
+    // it is every deposit-added validator until its deposit is applied, and
+    // the duty path (`Engine::duty_index`) re-checks the key each slot, so
+    // the node arms itself the moment the registry says it may.
+    if let Some(keys) = engine.keys.as_ref() {
+        match check_registry_identity(
+            &*engine.state,
+            keys.index,
+            &keys.pubkey,
+            keys.randao_seed,
+        ) {
+            RegistryIdentity::Active => {
+                println!(
+                    "validator {} is registered and its key matches the committed \
+                     registry at head slot {}",
+                    keys.index,
+                    engine.state.slot()
+                );
+            }
+            RegistryIdentity::PendingActivation => {
+                println!(
+                    "validator {} is NOT in the committed registry at head slot {} — \
+                     pending activation. This node follows the chain and signs nothing \
+                     until its deposit is applied; no restart is needed when it is.",
+                    keys.index,
+                    engine.state.slot()
+                );
+            }
+            RegistryIdentity::WrongValidator => {
+                // Fatal, and this is the case the old manifest gate was really
+                // protecting against: another validator owns this index, so
+                // signing here would be equivocating under their identity.
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "validator index {} is registered to a DIFFERENT public key — \
+                         refusing to start, because signing under it would equivocate \
+                         as that validator",
+                        keys.index
+                    ),
+                ));
+            }
+            RegistryIdentity::RandaoMismatch => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "validator {}'s local RANDAO chain does not open the \
+                         commitment in the committed registry — every block this node \
+                         proposed would be refused",
+                        keys.index
+                    ),
+                ));
+            }
+        }
+    }
 
     // ── Weak subjectivity: may the node sync at all? (§4.2) ──
     //
@@ -2699,8 +3528,10 @@ fn forkchoice_store<'a>(
 /// `wall_epoch` is the admitting node's WALL-CLOCK epoch
 /// (`epoch_of(self.wall_slot())` at the call site in `on_transaction`), and
 /// it exists for exactly one arm: the `TransferV2` flag-day gate below. It is
-/// in EPOCHS, not slots — `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH`
-/// (params.rs:150) is an epoch, and a caller passing a raw slot would be
+/// in EPOCHS, not slots — `bloch_pos_committee::params`'s
+/// `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` is an epoch (cited by symbol, not
+/// by line: the line number it used to give had already rotted), and a caller
+/// passing a raw slot would be
 /// early by `SLOTS_PER_EPOCH` (32×). The boundary test pins the unit by
 /// deriving both sides of the flag day from slots via `epoch_of`.
 ///
@@ -2723,11 +3554,30 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
         // to a third of the active stake and stop finality, a hundred and
         // eighty to two thirds and take the chain.
         //
-        // This is a node-side refusal, not a consensus rule: a block that
-        // already carries a deposit still applies it. It closes the path anyone
-        // can reach and buys time to close the real one — giving deposits and
-        // withdrawals eUTXO inputs and outputs, which is a wire-format change
-        // and needs a flag day.
+        // THIS IS NO LONGER THE ONLY THING STANDING HERE, and the sentence
+        // that used to be at this spot is the reason the gap was found: "this
+        // is a node-side refusal, not a consensus rule: a block that already
+        // carries a deposit still applies it." That was true and it was the
+        // whole defect. `admissible` has exactly one non-test caller — the
+        // mempool door below — so a single producer that patched it out lifted
+        // the rule for all sixty-four nodes, because every one of them judged
+        // the block with `bloch-pos-committee`, and that crate applied the
+        // deposit unconditionally.
+        //
+        // The rule now lives where it belongs:
+        // `params::DEPOSIT_ACTIVATION_EPOCH`, read at the transition by
+        // `apply_transaction` off the block's own committed epoch, refusing
+        // with `TxReject::StakingNotActive`. `Delegate` is gated by the same
+        // constant, because it reaches `effective_stake` a full activation
+        // delay sooner.
+        //
+        // What is left here is what it should always have been: an early,
+        // cheap rejection that keeps a transaction consensus will never apply
+        // out of the mempool and off the wire. It is not load-bearing. The
+        // real closure — giving deposits and withdrawals eUTXO inputs and
+        // outputs, authenticated — is still a wire-format change and still
+        // needs a tag and a flag day of its own; see the constant's docs for
+        // why arming `DEPOSIT_ACTIVATION_EPOCH` is NOT that change.
         PosTransaction::Deposit { .. } => Err(
             "deposits are not accepted: bonding is not yet funded from the UTXO set, \
              so a deposit would create stake without spending coins",
@@ -2888,7 +3738,8 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
         // it. Sixty-four Exit messages would set exit_epoch on all sixty-four
         // validators, and an exit cannot be revoked (`exit_epoch != u64::MAX`
         // is refused), so the roster would empty and every bond lock for
-        // 2,080 epochs. Refused until the message carries a signature that
+        // `staking::WITHDRAWAL_DELAY_EPOCHS` = 2,048 epochs. Refused until the
+        // message carries a signature that
         // binds it to the validator's own key.
         PosTransaction::Exit { .. } => Err(
             "exits are not accepted: the Exit message is not authenticated, \
@@ -2970,16 +3821,6 @@ mod forkchoice_tests {
             .collect()
     }
 
-    /// **The reason this fork choice was changed.** A branch three blocks long
-    /// with one attester loses to a branch one block long with three.
-    ///
-    /// Under longest-valid-chain — what the node ran until now — the head is
-    /// the tip of the long branch, and a proposer who can produce blocks fast
-    /// overrides whatever the honest majority has voted for. Length is not the
-    /// security statement in proof of stake; attested stake is. Without this
-    /// test, swapping the implementations would be a claim rather than a
-    /// change: the cooperative devnet passes either way, because on a chain
-    /// with no forks the two rules agree.
     /// The exposure this closes: a `Deposit` names an amount, carries no
     /// signature, and spends no output. Until bonding is funded from the eUTXO
     /// set, admitting one is admitting stake minted from nothing.
@@ -3030,6 +3871,16 @@ mod forkchoice_tests {
         );
     }
 
+    /// **The reason this fork choice was changed.** A branch three blocks long
+    /// with one attester loses to a branch one block long with three.
+    ///
+    /// Under longest-valid-chain — what the node ran until now — the head is
+    /// the tip of the long branch, and a proposer who can produce blocks fast
+    /// overrides whatever the honest majority has voted for. Length is not the
+    /// security statement in proof of stake; attested stake is. Without this
+    /// test, swapping the implementations would be a claim rather than a
+    /// change: the cooperative devnet passes either way, because on a chain
+    /// with no forks the two rules agree.
     #[test]
     fn weight_beats_length() {
         let g = [0x99u8; 32]; // the justified root the walk starts from
@@ -3437,7 +4288,8 @@ mod admission_authorisation {
             "a validly signed transfer must still reach the mempool"
         );
         // V1 is EPOCH-INDEPENDENT, on both sides of the TransferV2 flag day
-        // (params.rs:150). Part of the pre-activation control: teaching the
+        // (`params::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH`). Part of the
+        // pre-activation control: teaching the
         // epoch to `admissible` must change nothing about the format the
         // chain already runs on.
         assert!(
@@ -3526,7 +4378,7 @@ mod admission_authorisation {
 
     /// The flag day itself, with the unit pinned: both epochs are DERIVED
     /// FROM SLOTS via `epoch_of`, because the gate compares EPOCHS against
-    /// `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` (params.rs:150) and a call
+    /// `params::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` and a call
     /// site that handed it a raw wall SLOT would activate 32× early —
     /// silently, since both are bare u64s.
     ///
@@ -3822,7 +4674,7 @@ mod transfer_v2_end_to_end {
             )
             .expect("bind the devnet transport on an ephemeral port"),
         );
-        let verifier = HybridVerifier::new(Vec::new());
+        let verifier = HybridVerifier::new();
         Engine {
             manifest,
             state: StateCell::new(state),
@@ -3838,6 +4690,10 @@ mod transfer_v2_end_to_end {
             att_pool: AttestationPool::new(),
             wall_slot: 0,
             mempool: BTreeMap::new(),
+            rejected: BTreeMap::new(),
+        rejected_hits: 0,
+        mempool_suspect: BTreeSet::new(),
+        mempool_swept_epoch: u64::MAX,
             store,
             net,
             head_slot,
@@ -3960,6 +4816,518 @@ mod transfer_v2_end_to_end {
         assert_eq!(selected_rpc, vec![tx]);
     }
 
+    /// **A varredura esta LIGADA no caminho de aplicacao.**
+    ///
+    /// Os tres testes abaixo chamam `sweep_mempool` diretamente: provam a
+    /// logica e NAO provam a fiacao. Rodei a mutacao — removi a chamada de
+    /// `apply_canonical` — e os tres continuaram verdes. Um teste que nao
+    /// pode ficar vermelho nao esta testando nada, que e literalmente o
+    /// defeito que o arnes `prova` carregou por seis dias.
+    ///
+    /// Dirigir `apply_canonical` daqui exigiria bloco, proponente e cadeia
+    /// RANDAO — o harness disso vive nos testes de integracao. Entao a fiacao
+    /// e presa no fonte, o mesmo idioma dos tripwires de
+    /// `coherence_replay_identity.rs` e de `prova.rs`: e a diferenca entre
+    /// "a funcao funciona" e "a funcao e chamada".
+    #[test]
+    fn the_sweep_is_wired_into_the_apply_path() {
+        let src = include_str!("engine.rs");
+        // A agulha e montada em pedacos: escrita inteira, ela apareceria no
+        // fonte DENTRO deste proprio teste, e o scan casaria consigo mesmo —
+        // um tripwire que nao pode ficar vermelho. Cai nessa duas vezes hoje.
+        let chamada = concat!("self.sweep_", "mempool(cur_e);");
+        assert!(
+            src.contains(chamada),
+            "a chamada de sweep_mempool sumiu de apply_canonical. Sem ela a \
+             varredura e codigo morto e um no observador volta a ser \
+             sorvedouro de mao unica — 190 transacoes num deles em 2026-08-30."
+        );
+        // E na fronteira de epoca, nao a cada bloco: `cur_e` e a epoca, e a
+        // propria funcao retorna cedo se ja varreu nesta epoca.
+        assert!(
+            src.contains(concat!("let cur_e = epoch_of(self.", "state.slot());")),
+            "o argumento da varredura deixou de ser a epoca da cabeca"
+        );
+    }
+
+    /// **A varredura de epoca e a UNICA coisa que limpa um observador.**
+    ///
+    /// O laco de descarte do proponente so roda quando o no propoe. Um no sem
+    /// chave de validador nunca propoe, entao nunca descarta — e o mempool
+    /// dele vira sorvedouro de mao unica ate o teto de 4.096. Medido na frota
+    /// viva em 2026-08-30: dois archivals e o no de RPC publico, todos com
+    /// `proposing block` igual a ZERO, seguravam 63, 63 e 190 transacoes
+    /// enquanto os validadores em volta drenaram de 91 para 9 propondo. O
+    /// explorer publico le um desses observadores, entao o numero que o mundo
+    /// via era um que nenhum validador tinha mais.
+    ///
+    /// E o cache de recusa nao os ajuda: ele e ESCRITO pelo laco de descarte,
+    /// que num observador nunca roda.
+    #[test]
+    fn the_epoch_sweep_evicts_what_can_no_longer_apply() {
+        let (entries, good) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+
+        // Uma transacao gastando um outpoint que esta cadeia NAO tem: o txid
+        // do fixture e [0x33; 32], este e outro. Inserida direto no mempool
+        // porque `admissible` conferiria a assinatura — e o que se testa aqui
+        // e o que acontece DEPOIS da admissao.
+        let bad = match good.clone() {
+            PosTransaction::TransferV2 { keys, mut inputs, outputs, tx_bytes, tip_millisat_per_gas } => {
+                for i in inputs.iter_mut() {
+                    i.txid = [0x99u8; 32];
+                }
+                PosTransaction::TransferV2 { keys, inputs, outputs, tx_bytes, tip_millisat_per_gas }
+            }
+            other => other,
+        };
+        let bad_key = bad.canonical_bytes();
+        let good_key = good.canonical_bytes();
+        node.mempool.insert(bad_key.clone(), bad);
+        node.mempool.insert(good_key.clone(), good);
+        assert_eq!(node.mempool.len(), 2);
+
+        // PRIMEIRA varredura: a ruim vira suspeita, ninguem e despejado. O
+        // segundo tempo existe para o gasto encadeado — uma transferencia que
+        // paga da saida de outra ainda no mempool aponta, neste instante,
+        // para um outpoint ausente e fica valida quando a mae entra.
+        node.sweep_mempool(10);
+        assert_eq!(
+            node.mempool.len(),
+            2,
+            "a primeira varredura NAO pode despejar: seria matar gasto encadeado"
+        );
+        assert!(node.mempool_suspect.contains(&bad_key), "a ruim tem que ficar suspeita");
+        assert!(!node.mempool_suspect.contains(&good_key), "a boa nao pode ficar suspeita");
+
+        // A varredura roda UMA VEZ POR EPOCA: repetir a mesma epoca e no-op.
+        node.sweep_mempool(10);
+        assert_eq!(node.mempool.len(), 2, "duas chamadas na mesma epoca sao uma varredura");
+
+        // SEGUNDA epoca: agora despeja, e barra.
+        node.sweep_mempool(11);
+        assert_eq!(node.mempool.len(), 1, "a ruim tem que sair na segunda varredura");
+        assert!(node.mempool.contains_key(&good_key), "a boa tem que permanecer");
+        assert!(
+            node.is_rejected(&bad_key, node.wall_slot()).is_some(),
+            "despejar sem barrar e enxugar gelo: os pares reoferecem"
+        );
+    }
+
+    /// **Uma transacao que volta a ser valida sai da suspeita.** O caso do
+    /// gasto encadeado, do outro lado: a mae entrou, o outpoint existe, e a
+    /// filha nao pode carregar a marca para a varredura seguinte.
+    #[test]
+    fn becoming_valid_again_clears_the_suspicion() {
+        let (entries, good) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let key = good.canonical_bytes();
+        node.mempool.insert(key.clone(), good);
+
+        // Marcada a mao, como se uma varredura anterior a tivesse reprovado
+        // enquanto a mae ainda nao tinha entrado.
+        node.mempool_suspect.insert(key.clone());
+        node.sweep_mempool(20);
+
+        assert!(
+            !node.mempool_suspect.contains(&key),
+            "os inputs existem: a marca tem que ser apagada, senao a proxima \
+             varredura despeja uma transacao perfeitamente valida"
+        );
+        assert_eq!(node.mempool.len(), 1);
+    }
+
+    /// Mensagens que nao gastam eUTXO nao sao julgadas pela varredura.
+    ///
+    /// Hoje `Deposit` e `Delegate` nao consomem output nenhum — e exatamente a
+    /// lacuna que a onda de abertura fecha. Ate la, "nao gasta nada" e "gasta
+    /// algo ausente" precisam ser respostas diferentes, ou a varredura despeja
+    /// staking por engano.
+    #[test]
+    fn the_sweep_does_not_judge_transactions_that_spend_nothing() {
+        let (entries, _) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let dep = PosTransaction::Deposit {
+            pubkey: vec![0x77; 32],
+            amount_sat: 25_000 * 100_000_000,
+            randao_commitment: [0x78; 32],
+            withdrawal_credentials: vec![0x79; 32],
+            commission_bps: 0,
+        };
+        node.mempool.insert(dep.canonical_bytes(), dep);
+        node.sweep_mempool(30);
+        node.sweep_mempool(31);
+        assert_eq!(
+            node.mempool.len(),
+            1,
+            "uma mensagem que nao nomeia outpoint nenhum nao pode ser despejada \
+             por 'gastar algo ausente'"
+        );
+    }
+
+    /// **A transição diz QUAL transação, e o laço tem que acreditar nela.**
+    ///
+    /// O laço de descarte tirava a ÚLTIMA (`txs.pop()`) enquanto o erro carrega
+    /// o índice do corpo. Com a ofensora no início da seleção, isso descarta
+    /// uma a uma todas as boas atrás dela, re-rodando a transição inteira a
+    /// cada volta — e, desde que o cache de recusa entrou em 2026-08-30,
+    /// BARRANDO cada inocente por `REJECTION_TTL_SLOTS`. Uma transação ruim
+    /// podia barrar até 255 legítimas por ~64 minutos. O cache não criou o
+    /// defeito; transformou um slot desperdiçado em uma hora de censura.
+    #[test]
+    fn the_drop_loop_accuses_the_transaction_the_transition_named() {
+        use bloch_pos_committee::interfaces::{TransferReject, TransitionError};
+
+        // As duas variantes que nomeiam índice.
+        assert_eq!(
+            culprit_index(&TransitionError::Transfer(0, TransferReject::UnknownInput), 8),
+            Some(0),
+            "a ofensora no INICIO e o caso que o pop() da cauda errava por 7 posicoes"
+        );
+        assert_eq!(culprit_index(&TransitionError::Transaction(5), 8), Some(5));
+
+        // Índice obsoleto: o laço encurta `txs` a cada volta, então um índice
+        // válido quando o erro subiu pode não ser mais. Fora de alcance cai no
+        // descarte da cauda, que é o que mantém o nó produzindo.
+        assert_eq!(culprit_index(&TransitionError::Transaction(8), 8), None);
+        assert_eq!(culprit_index(&TransitionError::Transaction(0), 0), None);
+
+        // Erros que não nomeiam transação nenhuma continuam na cauda.
+        assert_eq!(culprit_index(&TransitionError::AttestationRootMismatch, 8), None);
+        assert_eq!(culprit_index(&TransitionError::CoherenceRootMismatch, 8), None);
+    }
+
+    /// **The bar is what makes the drop stick.** Removing a refused
+    /// transaction from the mempool does not remove it from the network: the
+    /// peers still holding it re-offer it, and the structural admission check
+    /// cannot see what the transition saw. Measured on the live chain
+    /// 2026-08-30 — a node proposed at slot 47,878 with `mempool 0` in the
+    /// same log line, and was holding 21 of the same transactions 383 slots
+    /// later.
+    ///
+    /// Mutation: delete the `is_rejected` arm from `on_transaction` and this
+    /// test goes red on the second assertion — the transaction walks straight
+    /// back in, which is the pre-2026-08-30 behaviour.
+    #[test]
+    fn a_refused_transaction_does_not_come_back_through_gossip() {
+        let (entries, tx) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let key = tx.canonical_bytes();
+
+        assert_eq!(
+            node.on_transaction(tx.clone()),
+            Ok(Admitted::New),
+            "control: the fixture must be admissible before anything bars it"
+        );
+
+        // Exactly what the proposer's drop loop does when the transition
+        // refuses: out of the mempool, and barred.
+        let slot = node.wall_slot();
+        node.mempool.remove(&key);
+        node.reject_transaction(key.clone(), slot);
+
+        match node.on_transaction(tx.clone()) {
+            Err(Refusal::PreviouslyRefused { until_slot }) => assert_eq!(
+                until_slot,
+                slot + REJECTION_TTL_SLOTS,
+                "the bar must lift exactly REJECTION_TTL_SLOTS after the refusal"
+            ),
+            other => panic!("a barred transaction must not be re-admitted: {other:?}"),
+        }
+        assert!(
+            node.mempool.is_empty(),
+            "a barred transaction must not take a mempool slot"
+        );
+    }
+
+    /// **A barra tem que ser mensuravel de fora.** A primeira versao deste
+    /// cache nao era: o caminho de gossip descarta o resultado de
+    /// `on_transaction` de proposito, entao barrar nao deixava rastro nenhum e
+    /// "o cache esta funcionando?" so podia ser respondido por inferencia
+    /// sobre o tamanho do mempool. Num repo cujo lema e que prova que ninguem
+    /// pode rodar de novo e alegacao, isso era a coisa errada de embarcar.
+    ///
+    /// `barred` e `barred_hits` respondem perguntas diferentes: quantas
+    /// transacoes o no esta se recusando a readmitir, e quantas reofertas ele
+    /// de fato ja recusou. Cache com entradas e zero hits nao esta barrando
+    /// nada real — distincao que o tamanho do mempool sozinho nao faz.
+    #[test]
+    fn the_bar_is_counted_so_it_can_be_measured_from_outside() {
+        let (entries, tx) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let key = tx.canonical_bytes();
+        let slot = node.wall_slot();
+
+        node.reject_transaction(key.clone(), slot);
+        assert_eq!(node.rejected.len(), 1, "uma entrada no cache");
+        assert_eq!(node.rejected_hits, 0, "entrada nova ainda nao barrou nada");
+
+        // Tres reofertas pelo gossip, como a malha faz.
+        for _ in 0..3 {
+            assert!(matches!(
+                node.on_transaction(tx.clone()),
+                Err(Refusal::PreviouslyRefused { .. })
+            ));
+        }
+        assert_eq!(node.rejected_hits, 3, "as tres reofertas tem que ser contadas");
+        assert_eq!(
+            node.rejected.get(&key).map(|(_, hits)| *hits),
+            Some(3),
+            "e contadas TAMBEM por chave, que e o que decide se a linha de log sai uma vez so"
+        );
+
+        // E o RPC precisa dizer isso sem ninguem ter chave da caixa.
+        let out = node.serve_rpc(RpcRequest::MempoolInfo).expect("mempoolinfo responde");
+        let json = out.to_string();
+        assert!(
+            json.contains("\"barred\":1"),
+            "getmempoolinfo tem que expor o tamanho do cache: {json}"
+        );
+        assert!(
+            json.contains("\"barred_hits\":3"),
+            "getmempoolinfo tem que expor as reofertas barradas: {json}"
+        );
+    }
+
+    /// **The engine answers `getbuildinfo`, and answers it about ITSELF.**
+    ///
+    /// The routing test in `rpc/tests.rs` proves the dispatcher decodes the
+    /// name; it cannot prove the engine has an arm for it, because a spy
+    /// backend answers everything. This one goes through `serve_rpc` on a real
+    /// engine, which is the path an exchange's request actually takes.
+    ///
+    /// The reason it matters here rather than only in the RPC module: on
+    /// 2026-09-02 both public archivals answered `getmempoolinfo` with four
+    /// fields where this build emits six. Nothing on the surface said which
+    /// binary either of them was. This is the method that would have said it,
+    /// and a method that routes but is never dispatched would have shipped
+    /// looking identical from the outside.
+    #[test]
+    fn getbuildinfo_is_answered_by_the_engine_and_names_this_tree() {
+        let entries = vec![];
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+
+        let json = node.serve_rpc(RpcRequest::BuildInfo).expect("getbuildinfo responde").to_string();
+
+        // The identity fields a partner is told to compare.
+        for k in ["commit", "commit_source", "tree_state", "source_digest", "rustc", "target"] {
+            assert!(json.contains(&format!("\"{k}\"")), "engine reply has no `{k}`: {json}");
+        }
+        // And the digest is the one this binary was built with — not a stub
+        // the engine substituted, and not a value read at request time.
+        assert!(
+            json.contains(env!("BLOCH_SOURCE_DIGEST")),
+            "the engine must report the digest compiled into it: {json}"
+        );
+        assert_ne!(
+            env!("BLOCH_SOURCE_DIGEST"),
+            "unavailable",
+            "built inside the workspace, so the build script must have found the tree"
+        );
+    }
+
+    /// **And the bar lifts.** `UnknownInput` — the refusal that sends almost
+    /// everything here — is a verdict against a STATE, not against the bytes:
+    /// a transfer spending a parent still in the mempool is refused now and
+    /// applies once the parent lands. A permanent bar would make a chained
+    /// spend an unspendable coin, silently.
+    ///
+    /// The clock is real here (`wall_slot()` reads the manifest against the
+    /// system clock), so the expiry is exercised by barring at a slot far
+    /// behind the wall rather than by winding the wall forward.
+    #[test]
+    fn the_bar_lifts_after_the_ttl() {
+        let (entries, tx) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let key = tx.canonical_bytes();
+        let now = node.wall_slot();
+        assert!(
+            now > REJECTION_TTL_SLOTS,
+            "harness: the wall slot must be past the TTL for this test to mean anything"
+        );
+
+        node.reject_transaction(key.clone(), 0); // lapses at slot REJECTION_TTL_SLOTS
+        assert_eq!(
+            node.is_rejected(&key, now),
+            None,
+            "a bar whose slot has passed must not be honoured"
+        );
+        assert_eq!(
+            node.on_transaction(tx),
+            Ok(Admitted::New),
+            "once the bar lapses the transaction must be admissible again"
+        );
+    }
+
+    /// **Remembering refusals must not become the exhaustion it prevents.**
+    /// The cache is capped, and the entry evicted is the one expiring soonest
+    /// — the one closest to worthless anyway.
+    #[test]
+    fn the_rejection_cache_is_bounded() {
+        let (entries, tx) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let now = node.wall_slot();
+        for i in 0..(REJECTION_MAX as u64 + 64) {
+            // Distinct keys, increasing expiry, so eviction has a defined order.
+            node.reject_transaction(i.to_le_bytes().to_vec(), now + i);
+        }
+        assert!(
+            node.rejected.len() <= REJECTION_MAX,
+            "the cache grew past its cap: {} entries",
+            node.rejected.len()
+        );
+        assert_eq!(
+            node.is_rejected(&0u64.to_le_bytes().to_vec(), now),
+            None,
+            "the earliest-expiring entry must be the one evicted"
+        );
+        assert!(
+            node.is_rejected(&(REJECTION_MAX as u64 + 63).to_le_bytes().to_vec(), now)
+                .is_some(),
+            "the most recent bar must survive the eviction"
+        );
+        // The mempool fixture is untouched by any of this.
+        assert_eq!(node.on_transaction(tx), Ok(Admitted::New));
+    }
+
+    /// **The bar answers before capacity, and the order is the message.** A
+    /// mempool filled to `MEMPOOL_MAX` answering `AtCapacity` tells the sender
+    /// to retry later; for a transaction this node has already watched the
+    /// transition refuse, that is precisely the wrong advice, and it invites
+    /// the retry loop that keeps the population alive.
+    #[test]
+    fn the_bar_is_answered_before_capacity() {
+        let (entries, tx) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let key = tx.canonical_bytes();
+        let slot = node.wall_slot();
+        node.reject_transaction(key, slot);
+        // Fill to the cap with anything: the point is which check speaks first.
+        for i in 0..MEMPOOL_MAX as u64 {
+            node.mempool.insert(i.to_le_bytes().to_vec(), tx.clone());
+        }
+        assert!(node.mempool.len() >= MEMPOOL_MAX, "harness: the mempool must be full");
+        assert!(
+            matches!(
+                node.on_transaction(tx),
+                Err(Refusal::PreviouslyRefused { .. })
+            ),
+            "a barred transaction must be told it is barred, never told to retry"
+        );
+    }
+
+    /// A backend that hands the dispatcher ONE answer the real engine
+    /// produced, so a test can see the literal bytes a client receives.
+    ///
+    /// `Engine` is not `Sync` and cannot be an `RpcBackend` itself, so the
+    /// error is carried across rather than the engine: everything from
+    /// `on_transaction` through `serve_rpc` to `handle_body` is the production
+    /// code, and only the socket is missing.
+    struct Canned(std::sync::Mutex<Option<RpcResult>>);
+
+    impl crate::rpc::RpcBackend for Canned {
+        fn call(&self, _req: RpcRequest) -> RpcResult {
+            self.0.lock().unwrap().take().expect("one canned answer, one call")
+        }
+    }
+
+    /// Put an engine-produced outcome on the wire and return the response body.
+    fn on_the_wire(outcome: RpcResult) -> String {
+        let backend = Canned(std::sync::Mutex::new(Some(outcome)));
+        crate::rpc::handle_body(
+            r#"{"jsonrpc":"2.0","id":1,"method":"getchaininfo","params":[]}"#,
+            &backend,
+        )
+    }
+
+    /// **The defect, end to end: the two refusals must reach the client as two
+    /// codes, and the retryable one must carry its deadline as a number.**
+    ///
+    /// `Refusal::Invalid` is a verdict on the BYTES — no passage of time
+    /// changes an unverifiable signature, so the client must stop.
+    /// `Refusal::PreviouslyRefused` is a verdict on the bytes AGAINST A STATE —
+    /// the bar lifts by itself after `REJECTION_TTL_SLOTS`, so the client must
+    /// try again. Both used to leave this node as `TX_REFUSED` (-32008), whose
+    /// published meaning is "never resubmit these bytes"; an exchange
+    /// following that guidance permanently abandoned transactions this node
+    /// would have admitted ~64 minutes later. The two facts were separable
+    /// only by reading the English message, and `Refusal`'s own doc says a
+    /// caller that must act on the difference has to match the variant.
+    ///
+    /// Both halves are asserted here, because either alone can be satisfied
+    /// wrongly: without the terminal control, "always return -32009" passes;
+    /// without the retryable half, "always return -32008" — today's defect —
+    /// passes.
+    #[test]
+    fn the_two_refusals_reach_the_client_as_two_codes() {
+        // ── Retryable: barred against a state, and the bar lifts on its own ──
+        let (entries, tx) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let slot = node.wall_slot();
+        node.reject_transaction(tx.canonical_bytes(), slot);
+
+        let RpcResult::Err(retryable) = node.serve_rpc(RpcRequest::SendRawTransaction(tx.clone()))
+        else {
+            panic!("a barred transaction must produce an RPC error");
+        };
+        assert_eq!(
+            retryable.code,
+            rpc::TX_REFUSED_RETRYABLE,
+            "a bar that lifts by itself must NOT be reported as terminal: {retryable:?}"
+        );
+        assert_ne!(
+            retryable.code,
+            rpc::TX_REFUSED,
+            "collapsing the retryable refusal back onto -32008 is the defect"
+        );
+
+        // The deadline is a value the client computes with, so it must be
+        // readable without parsing the sentence — and it must be the real one.
+        let data = retryable
+            .data
+            .as_ref()
+            .expect("the retryable refusal must carry `error.data`");
+        assert_eq!(
+            data.get("until_slot").and_then(rpc::Json::as_u64),
+            Some(slot + REJECTION_TTL_SLOTS),
+            "the deadline must be the slot the bar actually lifts at: {data:?}"
+        );
+        assert_eq!(data.get("retryable"), Some(&rpc::Json::Bool(true)));
+
+        // And it survives to the wire, in the literal bytes a client reads.
+        let wire = on_the_wire(Err(retryable));
+        assert!(
+            wire.contains(r#""code":-32009"#),
+            "the wire must carry -32009: {wire}"
+        );
+        assert!(
+            wire.contains(&format!(r#""until_slot":{}"#, slot + REJECTION_TTL_SLOTS)),
+            "the wire must carry the deadline as a number: {wire}"
+        );
+
+        // ── Terminal: a verdict on the bytes, and it must stay terminal ──────
+        let (entries, tx) = sweep_fixture(16);
+        let mut pre = engine_at_wall_epoch(0, &entries);
+        let RpcResult::Err(terminal) = pre.serve_rpc(RpcRequest::SendRawTransaction(tx)) else {
+            panic!("a transaction refused on its merits must produce an RPC error");
+        };
+        assert_eq!(
+            terminal.code,
+            rpc::TX_REFUSED,
+            "-32008 is published as terminal and must keep meaning that: {terminal:?}"
+        );
+        assert!(
+            terminal.data.is_none(),
+            "a terminal refusal must not offer a deadline: {terminal:?}"
+        );
+        let wire = on_the_wire(Err(terminal));
+        assert!(wire.contains(r#""code":-32008"#), "{wire}");
+        assert!(
+            !wire.contains("until_slot") && !wire.contains(r#""data""#),
+            "a terminal refusal must carry no retry hint at all: {wire}"
+        );
+    }
+
     /// (d): before the flag day NOTHING changes — this is the photograph of
     /// today's behaviour, taken with the same harness, the same transaction
     /// bytes, and a manifest whose genesis is now (wall epoch 0). Both entry
@@ -4070,6 +5438,15 @@ mod perf_support {
     /// the slot as an argument and read no clock — so the manifest's cadence
     /// is set to something plausible and then not depended upon.
     pub(super) fn proposing_engine() -> (Engine, TestDir) {
+        proposing_engine_funded(&[])
+    }
+
+    /// The same engine, opening with a ledger — for the tests whose claim is
+    /// about what happens (or must not happen) to the eUTXO map. On an empty
+    /// map "no copies" is vacuous; on a funded one it is the catch-up fix.
+    pub(super) fn proposing_engine_funded(
+        opening: &[bloch_pos_committee::state_root::EutxoEntry],
+    ) -> (Engine, TestDir) {
         static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "bloch-pos-perf-{}-{}",
@@ -4094,7 +5471,7 @@ mod perf_support {
             cohort: Vec::new(),
             carryover: None,
             allocations: Vec::new(),
-            carryover_entries: Vec::new(),
+            carryover_entries: opening.to_vec(),
         };
         let genesis_id = manifest.genesis_id();
         let state = manifest.genesis_state();
@@ -4114,7 +5491,7 @@ mod perf_support {
             )
             .expect("bind the devnet transport on an ephemeral port"),
         );
-        let verifier = HybridVerifier::new(manifest.pubkeys());
+        let verifier = HybridVerifier::new();
         let engine = Engine {
             manifest,
             state: StateCell::new(state),
@@ -4130,6 +5507,10 @@ mod perf_support {
             att_pool: AttestationPool::new(),
             wall_slot: 0,
             mempool: BTreeMap::new(),
+            rejected: BTreeMap::new(),
+        rejected_hits: 0,
+        mempool_suspect: BTreeSet::new(),
+        mempool_swept_epoch: u64::MAX,
             store,
             net,
             head_slot,
@@ -4253,7 +5634,15 @@ mod bench {
     use bloch_pos_committee::state_root::{EutxoEntry, EvmCommitment};
     use std::time::Instant;
 
-    /// The Genesis-3 carryover's output count, per `CARRYOVER-SNAPSHOT.md`.
+    /// The opening-ledger size this bench sizes its state to.
+    ///
+    /// It does NOT agree with `CARRYOVER-SNAPSHOT.md`, which records 452,726
+    /// rows, nor with `engine/replay_bench.rs`'s `CARRYOVER_N`, which is that
+    /// same 452,726 — a gap of 593 outputs. The constant is left at 452,133
+    /// rather than quietly moved: this is an `#[ignore]`d measurement that
+    /// asserts nothing, so the gap costs nothing today, and editing a figure to
+    /// match a document is exactly how a wrong figure becomes load-bearing.
+    /// Which of the two is stale is for the founder to settle.
     const MAINNET_EUTXOS: u32 = 452_133;
 
     fn mainnet_sized_state(n: u32) -> CommittedState {
@@ -4662,6 +6051,69 @@ mod bench {
             median(rolls)
         );
     }
+
+    /// **The catch-up regime, measured.** A node `gap` epochs behind the wall
+    /// clock re-derives `rolled_to(wall_epoch)` after every applied block,
+    /// because applying a block bumps the state generation and empties the
+    /// memo. The number that decides whether such a node can catch up is the
+    /// cost of that one re-roll — `gap` × `process_epoch` — paid per block,
+    /// against a 30 s slot.
+    ///
+    /// Sized at the Genesis-4 carryover's own output count so the figure is
+    /// the fleet's. `cargo test --release -p bloch-pos-node -- --ignored
+    /// --nocapture bench_catch_up_roll`.
+    ///
+    /// MEASURED 2026-08-31 (macOS/x86_64, `--release`, box under load — the
+    /// counts are exact, the times are indicative):
+    ///
+    /// BEFORE the eUTXO map was shared, the primitives on this same state
+    /// were clone ≈ 204 ms and `process_epoch` ≈ 369 ms (the clone is inside
+    /// it), 65 MB RSS per unshared state — so one re-roll cost the gap times
+    /// that, per applied block: gap 4 ≈ 1.7 s, gap 15 ≈ 5.8 s, gap 100
+    /// ≈ 37 s (past the 30 s slot), gap 1550 ≈ 9.5 min and ~93 GB transient
+    /// — unrunnable on this 16 GB machine, which is the fleet's cold-start
+    /// death reproduced as an OOM instead of a stall. Map copies per block
+    /// = the gap, by construction.
+    ///
+    /// AFTER: clone ≈ 0 µs, `process_epoch` ≈ 3 µs, rolled states share the
+    /// ledger (~0 MB each). The re-roll per applied block measured gap 1 =
+    /// 6 µs, gap 4 = 14 µs, gap 15 = 82 µs, gap 100 = 842 µs, gap 1550 =
+    /// 81 ms — and ZERO map copies at every gap. The catch-up bound moves
+    /// from `gap × ~0.37 s + t_apply < 30 s` (breaks near gap ≈ 6–10 on
+    /// fleet hardware) to `gap × ~50 µs + t_apply < 30 s`, with memory flat
+    /// at `MEMO_CAP` ledger-sharing entries instead of `gap × 60 MB`.
+    #[test]
+    #[ignore]
+    fn bench_catch_up_roll() {
+        let st = mainnet_sized_state(MAINNET_EUTXOS);
+        let tr = Transition::new(ProbeVerifier);
+        let head = epoch_of(st.slot());
+        for gap in [1u64, 4, 15, 100, 1550] {
+            let mut cell = StateCell::new(st.clone());
+            let mut samples = Vec::new();
+            let copies_before = bloch_pos_committee::transition::eutxo_map_deep_copies();
+            // Three "applied blocks": each replaces the state (same content —
+            // the cost under measurement is the roll, not the apply) so the
+            // generation moves and the memo empties, exactly as `set` does on
+            // the live path. The timed call is what the first attestation
+            // after each block pays.
+            for _ in 0..3 {
+                cell.set((*cell.arc()).clone());
+                let t = Instant::now();
+                let out = cell.rolled_to(head + gap, |s| {
+                    tr.process_epoch(s).expect("infallible")
+                });
+                samples.push(t.elapsed().as_micros());
+                std::hint::black_box(&out);
+            }
+            let copies = bloch_pos_committee::transition::eutxo_map_deep_copies() - copies_before;
+            println!(
+                "gap {gap:>5} epochs: rolled_to after each of 3 applied blocks = \
+                 {samples:?} us (median {} us), eUTXO-map deep copies {copies}",
+                median(samples.clone())
+            );
+        }
+    }
 }
 
 /// **Win 1's proof.** The memoized rolled state must be the SAME STATE the
@@ -4820,6 +6272,100 @@ mod rolled_memo_tests {
             poison.state_root(),
             "an entry under the LIVE generation was not served, so the test above passed \
              because nothing reads the memo rather than because the key rejected the entry"
+        );
+    }
+
+    /// **The catch-up stall of 2026-08-31, reproduced and pinned shut.** A
+    /// node whose head lags the wall clock runs exactly this loop: apply a
+    /// block (which moves the generation and empties the memo), then judge
+    /// the next gossiped attestation, which calls `rolled_to(wall_epoch)` —
+    /// a fresh roll across the entire gap, every block, all the way up.
+    ///
+    /// Before the eUTXO map was shared, each of those rolls deep-copied the
+    /// full ledger once per epoch crossed (`close_epoch` starts with
+    /// `self.clone()`), so a block cost `gap` map copies — ~60 MB and tens
+    /// of milliseconds each at carryover scale — and eviction ran only after
+    /// the roll, so the roll transiently held `gap` whole states. The fleet's
+    /// measured break was a 6–10-epoch gap; a cold start (~1,550 epochs)
+    /// was unconditionally fatal.
+    ///
+    /// The claim that ends that regime, as assertions rather than timings:
+    /// over the same number of applied blocks, the number of full-map copies
+    /// is **the same at a trivial gap and at a deep one — and it is zero** —
+    /// and the memo's population never exceeds `MEMO_CAP` even immediately
+    /// after a roll much longer than the cap. The bit-identity check against
+    /// the uncached derivation is what makes "the roll still happened" a
+    /// fact and not an assumption: the rolled state at the far epoch equals
+    /// the one derived from scratch, on a funded ledger, so nothing was
+    /// skipped to make the counter read zero.
+    ///
+    /// With the copies gone, catch-up needs `gap × t_process_epoch + t_apply
+    /// < slot time` and `MEMO_CAP` small memo entries of memory — not
+    /// `gap × t_map_clone` and `gap × 60 MB`.
+    #[test]
+    fn a_node_far_behind_judges_the_wall_epoch_without_copying_the_ledger() {
+        use bloch_pos_committee::transition::eutxo_map_deep_copies;
+
+        // A funded ledger, so "zero copies" is a claim about real entries and
+        // not about an empty map.
+        let opening: Vec<bloch_pos_committee::state_root::EutxoEntry> = (0..256u32)
+            .map(|i| {
+                let mut txid = [0u8; 32];
+                txid[..4].copy_from_slice(&i.to_le_bytes());
+                bloch_pos_committee::state_root::EutxoEntry {
+                    txid,
+                    vout: 0,
+                    value: 1_000 + u64::from(i),
+                    script_hash: [7u8; 32],
+                }
+            })
+            .collect();
+
+        // 48 epochs is past the fleet's measured 6–10-epoch break AND well
+        // past MEMO_CAP, so the mid-roll eviction actually runs; 3 epochs is
+        // the gap the fleet survives. The regime being killed is "copies
+        // scale with the gap", so the assertion is equality across the two.
+        const BLOCKS: u64 = 10;
+        let mut copies_per_gap = Vec::new();
+        for gap in [3u64, 48] {
+            let (mut engine, _dir) = perf_support::proposing_engine_funded(&opening);
+            assert_eq!(
+                engine.state.utxos().count(),
+                opening.len(),
+                "fixture: the opening ledger must actually be in the state"
+            );
+            let before = eutxo_map_deep_copies();
+            let mut wall = 0;
+            for slot in 1..=BLOCKS {
+                engine.propose(slot);
+                wall = epoch_of(engine.state.slot()) + gap;
+                let rolled = engine.rolled_to(wall);
+                std::hint::black_box(&rolled);
+                assert!(
+                    engine.state.memo_len() <= StateCell::memo_cap(),
+                    "slot {slot}, gap {gap}: the memo held {} entries after the roll — \
+                     the in-loop eviction is not bounding it",
+                    engine.state.memo_len()
+                );
+            }
+            // The roll is real: its far end is bit-identical to the uncached
+            // derivation on this funded ledger.
+            assert_eq!(
+                *engine.rolled_to(wall),
+                engine.rolled_to_uncached(wall),
+                "gap {gap}: the rolled state diverged from the from-scratch derivation"
+            );
+            copies_per_gap.push(eutxo_map_deep_copies() - before);
+        }
+        assert_eq!(
+            copies_per_gap[0], copies_per_gap[1],
+            "full-map copies scale with the gap again ({copies_per_gap:?} for gaps [3, 48]) — \
+             a node far behind is back to paying the ledger per epoch per block"
+        );
+        assert_eq!(
+            copies_per_gap[1], 0,
+            "an epoch roll deep-copied the ledger — close_epoch writes to it, or a clone \
+             stopped sharing it"
         );
     }
 }
@@ -5398,7 +6944,7 @@ mod duty_view_anchor {
             )
             .expect("bind the devnet transport on an ephemeral port"),
         );
-        let verifier = HybridVerifier::new(manifest.pubkeys());
+        let verifier = HybridVerifier::new();
         let ks0 = Keystore::load(&dir.0.join("v0")).expect("re-load validator 0");
         let engine = Engine {
             manifest,
@@ -5415,6 +6961,10 @@ mod duty_view_anchor {
             att_pool: AttestationPool::new(),
             wall_slot: 0,
             mempool: BTreeMap::new(),
+            rejected: BTreeMap::new(),
+        rejected_hits: 0,
+        mempool_suspect: BTreeSet::new(),
+        mempool_swept_epoch: u64::MAX,
             store,
             net,
             head_slot,
@@ -5495,5 +7045,80 @@ mod duty_view_anchor {
             partition_caught_up.len()
         );
         assert!(moved > 0);
+    }
+
+    /// **The `NotInCommittee` flood, in one assertion.**
+    ///
+    /// Two functions in this file decide committee membership for the same
+    /// attestation, and they must agree or every honest vote on the network is
+    /// answered with a Reject:
+    ///
+    ///   * [`Engine::attest`] draws with [`Engine::seed_for`], which is
+    ///     `CommittedState::seed_for_epoch` — GATED, so below
+    ///     `ANCESTRY_SEED_ACTIVATION_EPOCH` it is the mix at the close of
+    ///     `E − 1`.
+    ///   * [`Engine::judge`] draws with [`Engine::seed_for_attestation`],
+    ///     anchored to the attestation's own branch.
+    ///
+    /// Until 2026-08-25 the second applied
+    /// `committees::MIN_SEED_LOOKAHEAD_EPOCHS` UNCONDITIONALLY while the first
+    /// was gated, so the two read boundaries one apart for every epoch below
+    /// the flag day — which is every epoch this chain has ever had. With 64
+    /// validators over 32 slots the committees are pairs, and two independent
+    /// permutations agree on a given validator's slot about 3% of the time. So
+    /// ~97% of honest attestations were Rejected as `NotInCommittee` by every
+    /// receiver, blocks carried almost no votes, and finality froze while the
+    /// chain looked healthy — one branch, a block every 30 s, 63 peers.
+    /// Measured on mainnet 2026-08-25: 156 of the last 156 rejections were
+    /// `NotInCommittee`, and 19 consecutive blocks carried 4 attestations
+    /// against the ~38 the roster predicts.
+    ///
+    /// This is a REGRESSION test, not an aspiration: run it against the fleet
+    /// binary (`98d8fb06`) and the `assert_eq!` on the seeds fails.
+    #[test]
+    fn the_attester_and_the_judge_draw_the_same_committee_below_the_flag_day() {
+        assert_eq!(
+            bloch_pos_committee::params::ANCESTRY_SEED_ACTIVATION_EPOCH,
+            u64::MAX,
+            "this test describes the PRE-flag-day regime; if the gate has been armed, the              agreement it pins has to be re-derived rather than assumed"
+        );
+
+        let (mut engine, _dir) = engine_with_registry(8);
+        for slot in 1..=(SLOTS_PER_EPOCH * 3) {
+            engine.propose(slot);
+        }
+        let head_epoch = epoch_of(engine.state.slot());
+        assert!(
+            head_epoch >= 2,
+            "the head only reached epoch {head_epoch}; the fixture needs epoch 2"
+        );
+
+        let e = head_epoch;
+        let rolled = engine.rolled_to(e);
+        let roster = rolled.active_validators();
+
+        // What `attest` signs under.
+        let attester_seed = Engine::seed_for(&rolled, e);
+        // What `judge` checks it against: anchored on the very `target_root`
+        // `attest` stamps into the attestation.
+        let target = engine.checkpoint_root(e);
+        let judge_seed = engine
+            .seed_for_attestation(&target, e)
+            .expect("the checkpoint of this node's own epoch is on its own branch");
+
+        assert_eq!(
+            attester_seed, judge_seed,
+            "THE FLOOD: the seed a validator attests under and the seed its peers judge it              against are different boundaries, so honest votes read as NotInCommittee"
+        );
+
+        // And the consequence spelled out, so a future refactor that keeps the
+        // seeds equal but changes the draw is still caught.
+        for slot in e * SLOTS_PER_EPOCH..(e + 1) * SLOTS_PER_EPOCH {
+            assert_eq!(
+                committees::committee_for_slot(&attester_seed, slot, &roster),
+                committees::committee_for_slot(&judge_seed, slot, &roster),
+                "slot {slot}: attester and judge disagree on who is in the committee"
+            );
+        }
     }
 }

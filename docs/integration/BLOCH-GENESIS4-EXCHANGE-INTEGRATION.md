@@ -192,15 +192,58 @@ not estimate it from a confirmation count.
 
 > **Do not credit on `finalized` alone.** An earlier revision of this page called that a
 > cryptographic settlement guarantee. **It is not one**, and we are correcting it rather
-> than waiting to be asked. What Genesis-4 offers today is *economic* finality under an
-> assumption of healthy participation. Two defects, both demonstrated by test:
+> than waiting to be asked. What Genesis-4 offers today is finality that is *economic by
+> intent and cryptographic by nothing*. Three defects, each demonstrated by test:
 >
-> 1. **The quorum denominator shrinks with no floor.** It is leak-adjusted
+> 1. **No stake can be slashed — RETRACTION, 2026-09-01.** Casper's guarantee is
+>    cryptoeconomic: reverting a finalised checkpoint is supposed to cost at least one
+>    third of the total stake, burned and attributable on chain. Other pages of ours said
+>    exactly that. **On Genesis-4 today no stake can be slashed at all**, for four
+>    independent reasons, any one of them sufficient:
+>
+>    - Slashing evidence rides on wire tag `0x05`, and
+>      `PosTransaction::from_canonical_bytes` refuses that tag unconditionally
+>      (`crates/bloch-pos-committee/src/transition.rs:782`). The encoder folds the two
+>      nested messages in as the *signing roots* they were signed over — hashes — so the
+>      envelopes cannot be recovered. This is by construction, not by omission, and the
+>      codec documents it as such (`:713-729`).
+>    - That decoder is the only one on **every** ingress path — block body, gossip, and
+>      `sendrawtransaction`. A block carrying evidence is rejected by every peer; a
+>      proposer that included it would produce a block no one can import.
+>    - Nothing constructs the transaction outside tests. The node detects an equivocating
+>      pair and logs it, with a line that says the pipeline is not wired.
+>    - There is no activation constant to arm **in the binary you are integrating
+>      against**. `SLASHING_EVIDENCE_ACTIVATION_EPOCH` is not defined on the release
+>      lineage. It is defined off-lineage, unarmed at `u64::MAX`, on preserved work
+>      that no released binary contains. Treat break 4 as "no flag day exists on the
+>      release", not as "no such constant has ever been written".
+>
+>    Read on 2026-09-02 at height 34,665, epoch 1736, from two keyless archival
+>    observers returning byte-for-byte identical responses: 64 validators, 64 active,
+>    zero records with `slashed: true`, zero with a non-null `exit_epoch`, 64 of 64
+>    `active`. Equivocation on this fleet is **detected** and **never prosecuted**. So
+>    reverting a finalised checkpoint costs an attacker no bonded stake — only the
+>    coordination of the validators who would have to do it. `slashing.rs` is complete;
+>    nothing can reach it.
+>
+>    Read `slashed: false` correctly: on this network it is the **expected** reading,
+>    not a clean bill of health. No RPC method exposes equivocation evidence, so the
+>    validator registry cannot tell you how much equivocation the chain carries — it can
+>    only tell you that none of it was punished, which is already known from the four
+>    breaks above. Do not build a monitor that treats `slashed: true` appearing as your
+>    alarm; it cannot appear.
+>
+>    **There is no machine-readable form of this.** The released node serves no
+>    `getcapabilities` method — it answers `-32601`, as do both public archival nodes — so
+>    there is no `slashing_enforced` flag to branch on. Branch on this document, and
+>    re-read it before each integration release.
+>
+> 2. **The quorum denominator shrinks with no floor.** It is leak-adjusted
 >    unconditionally; the floor and the recovery rule are written but gated behind
 >    `LEAK_RECOVERY_ACTIVATION_EPOCH`, which is `u64::MAX`. A partitioned minority
 >    holding 6.25% of stake has been shown to self-finalise once the absent majority
 >    has leaked away.
-> 2. **`finalized` is not a latch across a reorg.** Fork choice walks from the
+> 3. **`finalized` is not a latch across a reorg.** Fork choice walks from the
 >    *justified* root, and the state committed there already finalises two epochs below
 >    the head — so the deepest cut the algorithm may legitimately propose, with no
 >    invalid block and no misbehaving peer, is itself a finality rewind. Measured
@@ -215,9 +258,12 @@ not estimate it from a confirmation count.
 > one epoch to spare. It does not bound a repeated ratchet: **no depth is provably safe
 > today**, and we would rather say so than quote a number that sounds like one.
 >
-> This note is withdrawn when the finality latch ships and the denominator floor is
-> armed. See `docs/decisions/LEAK-RECOVERY-ARMING-BRIEF.md` and
-> `docs/decisions/FINALITY-LATCH-FORK-SAFETY.md`.
+> This note is withdrawn when slashing evidence gets a wire shape that survives the codec
+> and the §7.3 path is reachable and armed, the finality latch ships, and the denominator
+> floor is armed. See `docs/decisions/LEAK-RECOVERY-ARMING-BRIEF.md` and
+> `docs/decisions/FINALITY-LATCH-FORK-SAFETY.md`. The slashing half is held in step with
+> the code by `crates/bloch-pos-node/tests/slashing_backed_finality_claims.rs`, which
+> fails both if the promise returns and if enforcement arrives while this note stands.
 
 ---
 

@@ -7,9 +7,18 @@
 //! (`spikes/prover-cost/RESULTS.md`): 7,274,849 RV32IM instructions per
 //! ML-DSA-65 ‖ Falcon-1024 verification, and a 4,589-byte signature.
 //!
-//! Nothing here is active. There is no activation height in this crate because
-//! the crate is not wired into the node; when it is, activation follows the
-//! height-gated flag-day idiom used by `STATE_ROOT_ACTIVATION_HEIGHT`.
+//! These are LIVE consensus constants, and several of the activation heights
+//! below are bound, not inert: `LEAKED_ROSTER_ACTIVATION_EPOCH` (1400),
+//! `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` (800) and
+//! `BLOCK_BYTES_V2_ACTIVATION_EPOCH` (800) are all epochs the chain is past.
+//! `ANCESTRY_SEED_ACTIVATION_EPOCH` and `LEAK_RECOVERY_ACTIVATION_EPOCH` are
+//! the ones still at `u64::MAX`.
+//!
+//! Until 2026-09-02 this header said nothing here was active and that the
+//! crate held no activation height at all because it was not wired into the
+//! node. All three clauses were false: the crate is a path-dependency of
+//! `bloch-pos-node`, and this file has five activation constants, three of
+//! them bound.
 
 /// Full committee, voting once at each epoch boundary for justification and
 /// finality. At 4,589 B per signature this is ≈ 588 KB in the epoch-boundary
@@ -167,10 +176,20 @@ pub const MIN_QUORUM_DENOMINATOR_DEN: u128 = 2;
 /// Flag-day epoch at which the inactivity leak starts reaching the **duty
 /// roster**, and not only the quorum denominator.
 ///
-/// `u64::MAX` means INERT: every node ships the code and none of it changes a
-/// single committee or proposer draw until this constant is lowered and the
-/// fleet is rebuilt together. Same idiom as `STATE_ROOT_ACTIVATION_HEIGHT` —
-/// a consensus rule arrives by flag day, never by whoever restarts first.
+/// **This flag day is ARMED, and bound long ago.** It is currently `1400`,
+/// which the chain passed on 2026-08-29; the leak reaches the duty roster on
+/// every block since. It is not a sentinel and has not been one since
+/// 2026-08-24 — see "ARMED" below for the arming record and the provenance of
+/// the number.
+///
+/// A `u64::MAX` here WOULD mean inert: every node ships the code and none of
+/// it changes a single committee or proposer draw until the constant is
+/// lowered and the fleet is rebuilt together. That is the idiom, shared with
+/// `STATE_ROOT_ACTIVATION_HEIGHT` — a consensus rule arrives by flag day,
+/// never by whoever restarts first — and it is the state this constant was in
+/// before it was armed, not the state it is in now. The opening paragraph
+/// asserted the inert state in the present tense for eight days after arming;
+/// `scripts/check-comment-constants.py` now fails the build on that shape.
 ///
 /// # The defect this closes
 ///
@@ -259,12 +278,18 @@ pub const LEAKED_ROSTER_ACTIVATION_EPOCH: u64 = 1400;
 /// Flag-day epoch at which the deduplicated transfer format (`TransferV2`,
 /// wire tag `0x06`) becomes acceptable in blocks.
 ///
-/// `u64::MAX` means INERT: every node ships the decoder and the apply path
-/// and none of it changes what a block may carry until this constant is
-/// lowered and the fleet is rebuilt together. Same idiom as
-/// `LEAKED_ROSTER_ACTIVATION_EPOCH` — a consensus rule arrives by flag day,
-/// never by whoever restarts first. The V1 format (tag `0x01`) stays valid
-/// forever; this gate only *adds* an encoding, it retires nothing.
+/// **This flag day is BOUND.** It is currently `800`, an epoch the chain is
+/// long past, so `TransferV2` is acceptable in blocks today and the paragraphs
+/// below describing the gate as pending describe history, not the live rule.
+/// The V1 format (tag `0x01`) stays valid forever; this gate only *adds* an
+/// encoding, it retires nothing.
+///
+/// A `u64::MAX` here WOULD mean inert: every node ships the decoder and the
+/// apply path and none of it changes what a block may carry until the
+/// constant is lowered and the fleet is rebuilt together. That is the idiom,
+/// shared with `LEAKED_ROSTER_ACTIVATION_EPOCH` — a consensus rule arrives by
+/// flag day, never by whoever restarts first — and it is the state this
+/// constant was in before it was bound, not the state it is in now.
 ///
 /// # The defect this closes
 ///
@@ -311,16 +336,31 @@ pub const TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH: u64 = 800;
 /// cap — read as 2.3x over target and push the base fee up on a block that is
 /// not scarce at all.
 ///
-/// `u64::MAX` until the founder sets it. Below it every node computes the old
-/// cap and the old target, so a mixed fleet reaches one verdict on every
-/// block; at and above it they diverge on both, so **the fleet must be
-/// rebuilt before this constant is ever lowered**. Same idiom as
+/// **This flag day is BOUND.** It is currently `800`, an epoch the chain is
+/// long past, so the 512 KiB cap and the moved byte target are the live rule
+/// and the two paragraphs above describe a switch that has already happened.
+/// Until 2026-09-02 this paragraph described the constant as an unset
+/// sentinel awaiting the founder, while the constant beside it read `800`.
+///
+/// Below the epoch every node computes the old cap and the old target, so a
+/// mixed fleet reaches one verdict on every block; at and above it they
+/// diverge on both, which is why rebuilding the fleet is a PRECONDITION of
+/// lowering this constant and not a follow-up. Same idiom as
 /// [`LEAKED_ROSTER_ACTIVATION_EPOCH`], and the gate reads the epoch derived
 /// from the block's own header slot — never node-local state, which is what
 /// the 2026-08-08 `expected_bits` fork cost us.
 pub const BLOCK_BYTES_V2_ACTIVATION_EPOCH: u64 = 800;
 
-/// **The F6 seed look-ahead is UNCONDITIONAL.** There is no flag day.
+/// **Superseded — read [`ANCESTRY_SEED_ACTIVATION_EPOCH`] below instead.**
+///
+/// This heading used to declare the F6 seed look-ahead unconditional and the
+/// gate gone. The gate was deleted on 2026-08-24 and then RESTORED, for the
+/// reason its own doc block records: boot is a replay of an append-only block
+/// log, so a node running the corrected rule against the old log does not
+/// disagree at a boundary, it stops. The constant exists, it is `u64::MAX`,
+/// and therefore the SHIPPED rule is still `back = 1` — the pre-F6 rule — for
+/// every epoch any chain can reach. The paragraphs below describe the deletion
+/// and are kept as the record of it, not as a description of today.
 ///
 /// `CommittedState::seed_for_epoch` seeds epoch `E` from the mix at the close
 /// of `E − 1 − `[`crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS`], always. It
@@ -443,6 +483,46 @@ pub mod rehearsal {
 
     thread_local! {
         static GATES_OPEN_TL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    thread_local! {
+        static BONDING_GATE_OPEN_TL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Test-only: treat [`super::DEPOSIT_ACTIVATION_EPOCH`] as already bound.
+    ///
+    /// Its own switch, NOT folded into `GATES_OPEN`, and the reason is that the
+    /// two mean opposite things. `GATES_OPEN` turns the NEW rule on for gates
+    /// whose inert value is the old behaviour; this one turns the OLD (unfunded
+    /// bonding) behaviour BACK ON for a gate whose inert value is the refusal.
+    /// A test that wanted a post-ancestry-seed roster and got a chain where
+    /// stake mints from nothing would be a fixture lying about the network it
+    /// models.
+    ///
+    /// It exists because the only two things a test can do with a permanently
+    /// closed gate are assert it is closed and build the fixture that proves
+    /// the refusal comes from consensus rather than from the mempool. The
+    /// second needs a block that CARRIES a deposit, and a producer cannot
+    /// stamp a `state_root` over a transition that refuses the transaction —
+    /// so the block is built with this open and judged with it shut.
+    ///
+    /// Default is CLOSED: an unadorned `cargo test` runs the fleet's rules.
+    pub fn bonding_gate_forced_open() -> bool {
+        BONDING_GATE_OPEN_TL.with(|c| c.get())
+    }
+
+    /// Opens the unfunded-bonding gate for this thread until the guard drops,
+    /// including on unwind, so a failing assertion cannot leave stake minting
+    /// from nothing for the rest of the thread.
+    pub fn bonding_gate_open_guard() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                BONDING_GATE_OPEN_TL.with(|c| c.set(self.0));
+            }
+        }
+        let prev = BONDING_GATE_OPEN_TL.with(|c| c.replace(true));
+        Restore(prev)
     }
 
     /// Test-only: treat [`super::ANCESTRY_SEED_ACTIVATION_EPOCH`] and
@@ -608,6 +688,92 @@ pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = u64::MAX;
 ///
 /// `u64::MAX` means INERT. Same arming rules as above.
 pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Flag day for **unfunded bonding**: the epoch at and after which the legacy
+/// `Deposit` and `Delegate` messages are valid. Below it they are refused by
+/// CONSENSUS, on every node, with [`crate::transition::TxReject::StakingNotActive`].
+///
+/// # What it closes, and why a node-side check was not enough
+///
+/// `bloch-pos-node`'s `admissible` has refused both messages at the mempool
+/// door since 2026-08-13, and its own comment says what that is worth: "this is
+/// a node-side refusal, not a consensus rule: a block that already carries a
+/// deposit still applies it." It is MEMPOOL POLICY. One producer that lifts it
+/// — a patched binary, a `--` flag, a fork of the node crate — lifts it for the
+/// entire network, because every other node runs `apply_transaction`, and
+/// `apply_transaction` applied both messages unconditionally. Sixty-four
+/// validators judging the block would each have accepted it.
+///
+/// Both messages mint consensus weight without spending an output. `Deposit`
+/// registers a `ValidatorRecord` holding `amount_sat` (>= `MIN_DEPOSIT_SAT`,
+/// 25,000 BLCH) against no input and no signature. `Delegate` is the same shape
+/// one layer along and lands FASTER: `consensus_roster_at` adds resolved
+/// delegated stake into `effective_stake` (transition.rs, `roster.push`), and a
+/// delegation requests from `self.epoch + 1` rather than waiting out
+/// `ACTIVATION_DELAY_EPOCHS`. They are one rule — bonding is not funded from
+/// the eUTXO set — so they share one constant, and arming for one without the
+/// other would reopen the hole through the faster door.
+///
+/// # Where the epoch comes from
+///
+/// `self.epoch` inside `apply_transaction`, which `compute_post_state` has
+/// already rolled to `crate::epoch_of(header.slot)` — the boundary walk `while
+/// st.epoch < block_epoch { st.close_epoch() }`, and `close_epoch` advances by
+/// exactly one. So at the gate, `self.epoch` IS the epoch of the block being
+/// judged, a pure function of a header field that the block id commits to
+/// (`DS_BLOCK` over the canonical header). It is not a wall clock, not a
+/// `current_bits`-style mutable local, and not the node's own head. Two honest
+/// nodes handed the same block read the same number. This is deliberately the
+/// same shape as the `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` gate that sits
+/// four lines above it, and deliberately NOT the shape of the 2026-08-08
+/// `expected_bits` split, where the verdict came from state each node mutated
+/// on its own accepted-block path and identical binaries diverged.
+///
+/// # Replay safety
+///
+/// Refusing below the flag day rewrites history only if history contains one.
+/// It does not: measured 2026-09-02 against the two keyless archivals
+/// 139.180.166.5 and 139.180.173.231, which agreed byte-for-byte at height
+/// 35,628 / epoch 1,766 (`state_root`
+/// 71e71e6a5a0843af78d4bd2a63b0e4192a62f5108741ac3ed76797d57f063fa7) on
+/// `validators.total == 64`. `validator_count` is `validators.len()` — EVERY
+/// record, including one queued at `activation_epoch == u64::MAX` — and the
+/// genesis cohort is 64. No `Deposit` has ever been applied on the canonical
+/// chain, so every historical block replays through this gate unchanged and
+/// the fleet can adopt it without a coordinated flag day. (`Delegate` leaves no
+/// registry trace, so its absence is argued, not measured: nothing on this
+/// chain has ever had an incentive to delegate to a founder-held validator, and
+/// a delegation would have moved `effective_stake` in `total_active_stake_sat`,
+/// which is uniform across the 64 at 142,582,277.37013640 BLCH.)
+///
+/// # `u64::MAX` means INERT — and here inert means the rule is FULLY LIVE
+///
+/// Unlike [`ANCESTRY_SEED_ACTIVATION_EPOCH`], whose inert value selects the OLD
+/// behaviour, this constant's inert value selects the REFUSAL. Set to
+/// `u64::MAX`, no epoch ever reaches it and both messages are invalid in
+/// consensus at every epoch, today, on any node running this crate. The gate is
+/// not waiting to be armed to do its work; it is doing it.
+///
+/// # ARMING THIS CONSTANT IS NOT HOW DEPOSITS OPEN
+///
+/// Read that twice. The encoding this gate governs is the UNAUTHENTICATED one.
+/// Moving this number to a real epoch does not make deposits safe; it makes
+/// stake-minted-from-nothing a consensus-VALID transaction on all 64 nodes,
+/// which is strictly worse than today, where at least the mempool refuses it.
+/// The recommendation of the commit that introduced this gate is that this
+/// number never move.
+///
+/// Deposits open by a different route: a funded, authenticated message that
+/// spends transparent eUTXO inputs and carries a proof of possession — the form
+/// `staking::validate_deposit` and `DepositTx` already describe and nothing
+/// encodes. That form needs a wire tag, the tag space above the released range
+/// is contested across live lineages, and the registry that resolves it is the
+/// founder's to assign. When it lands it brings its OWN activation constant.
+/// This one stays `u64::MAX` and the legacy arm stays refused, permanently.
+///
+/// `deposit_gate_is_inert` pins the value, so arming it means deleting a test
+/// that says all of the above out loud.
+pub const DEPOSIT_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.

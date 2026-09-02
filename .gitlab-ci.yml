@@ -114,6 +114,70 @@ trademark-gate:
   script:
     - bash scripts/ci-banned-words.sh
 
+# Comment-vs-constant guard (the prose-rot class, 2026-09-02).
+# BLOCKING: fails if a comment states a value for a constant that the constant
+# does not have. This is the defect that has cost this project the most: not a
+# wrong constant, but correct prose that stopped being correct, sitting inches
+# from the line it describes, so a reviewer reads comment and code as one
+# statement instead of two claims. Live instances at the time it was written:
+# TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH and BLOCK_BYTES_V2_ACTIVATION_EPOCH
+# documented as `u64::MAX` while both were 800 and long since bound;
+# LEAKED_ROSTER_ACTIVATION_EPOCH the same while armed at 1400;
+# EUVM_ACTIVATION_HEIGHT documented as an inert sentinel in three places while
+# it was 4320; DIFFICULTY_ANCESTRY_FORK_HEIGHT documented as 27_600 while it
+# was 30_030. Five of the six are consensus or flag-day constants.
+#
+# The subset it checks is narrow ON PURPOSE and is stated in the script's
+# docstring: comments that name a constant together with a literal value or a
+# `<type>::MAX` sentinel, plus prose numbers an author has explicitly bound
+# with `prose-guard: bind`. It cannot check English in general — claims of
+# presence, of absence, or about a type's shape are outside it, and the
+# docstring says so rather than implying coverage it does not have.
+#
+# Measured before it was wired: 346 files, 449 resolvable constants, 15 value
+# claims in the checked subset, 7 contradictions, ZERO false positives. It
+# accepts "`u64::MAX` means INERT" on the two constants in params.rs that
+# really are u64::MAX and rejects the same sentence three lines away on the two
+# that are not, which is the discrimination that makes it safe to block on.
+#
+# The selftest is the reason to trust the verdict: it builds a synthetic
+# repository, asserts every lie shape goes red BY NAME and every honest shape
+# stays green, and asserts that a `bind` which has stopped matching anything
+# FAILS instead of going quiet. Three guards audited here were green while what
+# they guarded was broken; this one is required to prove it can still fail.
+# Pure Python 3, no toolchain, no build — override the default before_script.
+comment-constant-guard:
+  stage: check
+  before_script: []
+  script:
+    - python3 scripts/check-comment-constants.selftest.py
+    - python3 scripts/check-comment-constants.py
+  allow_failure: false
+
+# Source-in-archive guard. BLOCKING.
+# `tools/staking-cli/integration-merge/merged-consensus-files.tar.gz` is a
+# 276 KB gzip of six consensus and node source files, based six commits behind
+# fleet tip 46133196 (missing 47f7644b, the consensus commit). Measured
+# 2026-09-02 it is reachable from ~130 refs including `validator-ops` and is
+# pushed to both `origin` and `github`. Unpacking it over a checkout — which
+# its own README frames as the way to reproduce "the verified combination" —
+# reverts six fleet commits from an artifact that `git diff` renders as
+# "Binary files differ" and that no lint, review or other job here reads.
+# The archive is NOT on the release lineage: tag g4-node-20260901, fleet commit
+# 46133196 and all seven Ride 1 branches are clean of it. This job is what keeps
+# it that way, and it fails the moment such a blob reaches a branch that runs CI.
+# Judged by CONTENT, not size: an archive is refused when it carries source
+# files, so real data fixtures (carryover.tsv.gz, 452,726 rows) stay green.
+# An archive that will not list is also refused — a guard that cannot read a
+# file must not report the file as fine. Verified by violation both ways on
+# 2026-09-02. Pure Python 3, no toolchain, no build.
+no-source-archives:
+  stage: check
+  before_script: []
+  script:
+    - python3 scripts/check-no-source-archives.py
+  allow_failure: false
+
 # Falcon constant-time guard (PoS finding F1, BLOCH-FALCON-ONLINE-SIGNING.md
 # §3.2). BLOCKING: fails if the workspace's resolved features for
 # pqcrypto-falcon include "avx2" or "neon" — those dispatch Falcon SIGNING to

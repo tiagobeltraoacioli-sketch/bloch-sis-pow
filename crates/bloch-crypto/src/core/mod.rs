@@ -49,9 +49,10 @@ pub const AUXPOW_ACTIVATION_HEIGHT: u64 = 0;
 /// BEFORE the chain reaches this height — same discipline as
 /// `AUXPOW_ACTIVATION_HEIGHT` and the earlier SHA-256d-LE fork.
 ///
-/// Set to 27_600 on 2026-08-08 — a retarget boundary (460 × 60) roughly 230
-/// blocks above the tip at the time, which is ~100 minutes of build-and-deploy
-/// margin.
+/// **History, not the current value — the constant is 30_030; see the closing
+/// note below.** It was first set to 27_600 on 2026-08-08 — a retarget boundary
+/// (460 × 60) roughly 230 blocks above the tip at the time, which is ~100
+/// minutes of build-and-deploy margin.
 ///
 /// It was briefly 30_000, and that was wrong. The reasoning then was that a
 /// distant height buys room to upgrade the fleet without rushing the only
