@@ -26,9 +26,11 @@
 //! signatures are hybrid PQ regardless), no peer persistence or peer
 //! exchange, no deposits/exits, no slashing-evidence pipeline, no
 //! checkpoint-sync **state download** (the weak-subjectivity boot gate itself
-//! IS wired — `ws_boot`), no RPC, no mainnet genesis manifest. See the module
-//! docs of `engine`, `net`, `p2p`, `store`, `ws_boot` for each limitation at
-//! its site.
+//! IS wired — `ws_boot`). RPC and the mainnet genesis manifest were on this
+//! list and have since been wired: `mod rpc` is served from the engine once the
+//! boot gate clears, and `genesis-mainnet` is a subcommand of this binary. See
+//! the module docs of `engine`, `net`, `p2p`, `rpc`, `store`, `ws_boot` for
+//! each limitation at its site.
 //!
 //! ## Key hygiene
 //!
@@ -191,8 +193,9 @@ fn print_help() {
                  getblockbyid, getvalidator, getvalidatorcount, getbalance,\n\
                  getutxos (alias listunspent), sendrawtransaction,\n\
                  getmempoolinfo. gettransaction and getnewaddress answer\n\
-                 with a permanent, explained refusal — there is no txid at\n\
-                 this layer and this node holds no wallet.\n\
+                 with a permanent, explained refusal — a transaction does\n\
+                 have an id, but this node keeps no txid-to-block index to\n\
+                 look it up in, and it holds no wallet.\n\
                  Finality: block responses carry `finalized: true|false`.\n\
                  That boolean, not a confirmation count, is the settlement\n\
                  guarantee — PoS has no depth-as-security.\n\

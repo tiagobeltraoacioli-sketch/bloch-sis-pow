@@ -1565,11 +1565,15 @@ impl CommittedState {
     ///
     /// # The look-ahead
     ///
-    /// `back = 1 + `[`crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS`],
-    /// unconditionally — there is no flag day. See
-    /// [`crate::params`]'s note on the removed
-    /// `ANCESTRY_SEED_ACTIVATION_EPOCH` for why the gate went away with the
-    /// coordinated relaunch, and why that is not a precedent.
+    /// `back = 1 + `[`crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS`] **only at
+    /// and above [`crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH`]**, which is
+    /// `u64::MAX`. Below it — that is, for every epoch any chain can reach —
+    /// this function computes `back = 1`, the original pre-F6 rule, exactly as
+    /// the `GATED.` note in the body says. Until 2026-09-02 this doc said the
+    /// look-ahead was unconditional and pointed at the constant as removed. It
+    /// was deleted on 2026-08-24 and restored; see its doc block for why the
+    /// coordinated-relaunch premise was wrong. **F6 is not closed in the
+    /// shipped binary**; arming that constant is what closes it.
     ///
     /// `back = 2` is what closes finding F6: at `back = 1` the seed for epoch
     /// `E` is the mix at the close of `E − 1`, so the trailing proposers of
@@ -6971,9 +6975,20 @@ mod tests {
         assert_eq!(CAP, 10_000_000_000_000_000_000);
 
         // Exhaustive match, no `_` arm: every transaction the protocol can
-        // carry is enumerated, and none of them is a mint or a cap edit —
-        // Transfer moves existing coins and pays fees from them, Deposit and
-        // Delegate bond existing coins, Exit unbonds them, evidence burns.
+        // carry is enumerated, and none of them edits the cap.
+        //
+        // Read that as written: NONE OF THEM EDITS THE CAP. It is not the
+        // same claim as "none of them mints", and this comment used to make
+        // the stronger one by asserting that Deposit and Delegate bond
+        // EXISTING coins. They do not. The live `Deposit` handler consumes no
+        // eUTXO input — it hashes the pubkey, checks the bounds, inserts a
+        // `ValidatorRecord` and writes `staked_sat` from nothing — which the
+        // crate states plainly at `transition.rs`'s eUTXO-set doc: bonding is
+        // not funded from that set, and `Deposit`/`Delegate` spend no output.
+        // This test never checked the bonding claim, so it passed while the
+        // claim was false; the exhaustive match below proves only that the
+        // variant SET cannot grow without a human reading this comment.
+        // The supply consequence is tracked separately and is not pinned here.
         let witness = PosTransaction::Exit { validator: 0 };
         match &witness {
             PosTransaction::Transfer { .. } => {}
@@ -7636,9 +7651,13 @@ mod tests {
     //
     // The tests below call `apply_transfer_v2` directly — the unit seam
     // BELOW the flag-day gate, the same pattern as testing
-    // `with_leak_applied` directly — because the gate is `u64::MAX` and the
-    // block path correctly refuses everything. The gate itself is tested
-    // end-to-end through `compute_post_state`.
+    // `with_leak_applied` directly. This banner used to justify that by
+    // saying the gate was still at its inert maximum value so the block path
+    // refused everything; that stopped being true when
+    // `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` was bound, and the chain is
+    // long past it. The unit seam is still the right place to test the apply
+    // rules in isolation — it just is not because the format is unreachable.
+    // The gate itself is tested end-to-end through `compute_post_state`.
 
     /// Arming this format is a flag day. Once armed, the thing that must hold
     /// is not "still inert" — it is that the epoch is in the FUTURE relative

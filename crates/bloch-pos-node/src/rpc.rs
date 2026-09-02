@@ -17,13 +17,20 @@
 //! ## Why there is no framework here
 //!
 //! The Genesis-3 node's RPC (`src/rpc/mod.rs` at the repo root) is axum + tower
-//! + serde_json + tokio. This crate's dependency set is `bloch-pos-committee`,
-//! `bloch-crypto` and `sha3` — it has no async runtime at all, and `net.rs` is
-//! blocking `std::net` with one thread per connection. Pulling an async stack
-//! in to serve nine read methods would add ~90 transitive crates and a runtime
-//! to a node whose consensus loop is a single synchronous thread. So HTTP/1.1
-//! and JSON are implemented here, in about 400 lines, against `std` only:
-//! `serve` mirrors `net::start`'s accept-thread shape exactly.
+//! + serde_json + tokio. **This module** imports `std`, `bloch-pos-committee`
+//! and `sha3` and nothing else: no framework, no `async`, no `await`, and the
+//! server is blocking `std::net` with one thread per connection, the same shape
+//! `net.rs` has.
+//!
+//! The **crate** is not runtime-free, and saying it was is what this note used
+//! to get wrong: `Cargo.toml` declares `libp2p`, `tokio`, `futures` and
+//! `async-trait` for the production transport, and `p2p::start` builds a
+//! current-thread tokio runtime on its own thread. What is avoided is dragging
+//! that stack across the RPC surface as well — an axum + tower server in front
+//! of a consensus loop that is a single synchronous thread, to serve nine read
+//! methods. So HTTP/1.1 and JSON are implemented here, in about 400 lines,
+//! against `std` only: `serve` mirrors `net::start`'s accept-thread shape
+//! exactly.
 //!
 //! The cost is stated rather than hidden: this server speaks the subset of
 //! HTTP/1.1 a JSON-RPC client needs (POST, `Content-Length`, no chunked
@@ -134,7 +141,8 @@ pub const TX_DECODE_FAILED: i64 = -32002;
 pub const MEMPOOL_FULL: i64 = -32003;
 /// The consensus thread could not be reached.
 pub const NODE_UNAVAILABLE: i64 = -32004;
-/// There is no txid→block index (and, at this layer, no txid).
+/// There is no txid→block index. The transaction id itself exists
+/// (`PosTransaction::txid`); what this node lacks is anywhere to look one up.
 pub const NO_TRANSACTION_INDEX: i64 = -32005;
 /// This node has no wallet and no frozen address format.
 pub const NO_WALLET: i64 = -32006;
@@ -182,31 +190,37 @@ impl RpcError {
     }
 
     /// [`NO_TRANSACTION_INDEX`] — `gettransaction`'s permanent answer in this
-    /// build, and the reason is structural rather than a missing feature.
+    /// build. The missing thing is an INDEX, not an identity.
     ///
-    /// A `PosTransaction` has **no transaction id at all** at this layer. The
-    /// eUTXO value-transfer format is out of the migration's scope, so
-    /// `Transfer` encodes `inputs`, `tx_bytes` and a tip — fee-market terms,
-    /// with no sender, no recipient, no amount and no identity. Blocks commit
-    /// to a `body_root` over the canonical *bytes*, and the store is an
-    /// append-only block log with no secondary index.
+    /// A `PosTransaction` does have a transaction id, and every node agrees on
+    /// it: `PosTransaction::txid` (`bloch-pos-committee/src/transition.rs`) is
+    /// `SHA3-256(DS_TXID ‖ spend_signing_root)`, and it is consensus-committed
+    /// — the transfer arms of `apply_transaction` key every created
+    /// `EutxoEntry` by `(txid, vout)`, so the state root the whole network
+    /// checks commits to it. A `Transfer` is not fee-market terms only either:
+    /// it carries `inputs`, `outputs` (each a value and a `script_hash`),
+    /// `tx_bytes` and `tip_millisat_per_gas`. This module both serves and
+    /// consumes that id — `eutxo_json` emits `txid`, and `gettxout` takes one
+    /// as a parameter.
     ///
-    /// So there is nothing to hash into a txid and nothing to look one up in.
-    /// Returning a synthesised digest of the canonical bytes would produce an
-    /// identifier that no other node, block or client agrees on — an integrator
-    /// would build deposit crediting on it and it would mean nothing. Saying
-    /// the capability is absent is the only honest answer, and it is why this
-    /// is a distinct code and not [`BLOCK_NOT_FOUND`].
+    /// What is absent is the txid→block index. Blocks commit to a `body_root`
+    /// over the canonical *bytes*, and the store is an append-only block log
+    /// with no secondary index, so answering `gettransaction` would mean
+    /// scanning every block in the log on every call. The transaction may well
+    /// be on this chain; this node simply cannot find it by id — which is why
+    /// this is a distinct code and not [`BLOCK_NOT_FOUND`].
     pub fn no_transaction_index() -> Self {
         Self::new(
             NO_TRANSACTION_INDEX,
-            "this node cannot look up a transaction by id: at Genesis-4's current \
-             layer a transaction carries no id (the transfer format is not yet \
-             specified — `PosTransaction::Transfer` encodes only fee-market terms), \
-             and the block store keeps no txid index. Track deposits by scanning \
-             blocks via `getblockbyslot` and reading the eUTXO set via `getbalance` \
-             / `listunspent`, both of which are exact. This is a permanent answer \
-             for this build, not a transient failure — do not retry.",
+            "this node keeps no transaction index: a transaction does have an id \
+             (`PosTransaction::txid`, the same id the eUTXO set is keyed by and \
+             that `listunspent` and `gettxout` use), but the block store is an \
+             append-only log with no txid-to-block mapping, so it cannot be \
+             looked up by id here. Track deposits by scanning blocks via \
+             `getblockbyslot` and reading the eUTXO set via `getbalance` / \
+             `listunspent`, both of which are exact and both of which return the \
+             txid. This is a permanent answer for this build, not a transient \
+             failure — do not retry.",
         )
     }
 
@@ -842,8 +856,9 @@ fn want_hex32(params: Option<&Json>, pos: usize, name: &str) -> Result<[u8; 32],
 ///   finality that height is entitled to (see [`block_count_json`]).
 /// - `sendrawtransaction` — canonical bytes in, mempool admission out.
 /// - `gettransaction` — **refused**, with [`RpcError::no_transaction_index`].
-///   There is no txid at this layer to look up, and approximating one would be
-///   worse than the absence.
+///   The transaction has an id (`PosTransaction::txid`, the key of every eUTXO
+///   entry this node serves); what is missing is a txid→block index to look it
+///   up in, and scanning the whole block log per call is not a lookup.
 /// - `getnewaddress` — **refused**, with [`RpcError::no_wallet`]. A node RPC
 ///   does not mint key material, and no address format is frozen.
 ///
@@ -1384,13 +1399,16 @@ pub enum Admitted {
 
 /// `sendrawtransaction` — what the node did with the bytes.
 ///
-/// There is no txid here, and its absence is the same structural fact
-/// [`RpcError::no_transaction_index`] documents: a `PosTransaction` has no
-/// identity at this layer. `tx_hash` is SHA3-256 over the canonical bytes and
-/// is labelled for what it is — a **local** handle for correlating this
-/// submission with this response. It is not a consensus identifier, no block
-/// commits to it, and no other node will agree it names anything. Building
-/// deposit crediting on it would be building on a number this node invented.
+/// The consensus txid is not in this response — a gap in this method, not in
+/// the format. The transaction has an id (`PosTransaction::txid`, the key of
+/// every eUTXO entry it creates), and this response does not carry it.
+///
+/// `tx_hash` below is a DIFFERENT digest: SHA3-256 over the canonical bytes,
+/// not over the spend signing root. It is labelled for what it is — a **local**
+/// handle for correlating this submission with this response. No block commits
+/// to `tx_hash`, and building deposit crediting on it would be building on a
+/// number this node invented. Take the txid from the eUTXO set instead
+/// (`listunspent`, `gettxout`), where it is the consensus one.
 pub fn submitted_json(tx: &PosTransaction, outcome: Admitted) -> Json {
     use sha3::{Digest, Sha3_256};
     let bytes = tx.canonical_bytes();
