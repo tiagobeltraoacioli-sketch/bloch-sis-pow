@@ -344,6 +344,8 @@ mod tests {
             .collect();
         let genesis_cp = CheckpointRecord { epoch: 0, root: [0u8; 32] };
         let chain = ChainState {
+            written_off_sat: 0,
+            stake_low_water: Vec::new(),
             eutxos: Vec::new(),
             registry,
             current_participation: (0..4u32)

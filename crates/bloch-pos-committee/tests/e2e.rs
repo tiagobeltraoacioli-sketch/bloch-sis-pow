@@ -401,6 +401,10 @@ mod harness {
             .collect();
         mixes.push(RandaoMix { epoch: s.current_epoch + 1, mix: s.mix });
         compute_state_root(&ConsensusState {
+            // The withdrawal write-off components. Empty here: this fixture
+            // predates the flag day and nothing in it withdraws or is slashed.
+            written_off_sat: 0,
+            stake_low_water: &[],
             eutxos: &eutxos,
             validators: &validators,
             current_participation: &cur,

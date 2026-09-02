@@ -126,6 +126,15 @@ pub struct ChainState {
     /// Delegator fee-reward ledger, carried unchanged: it is filled at the
     /// epoch boundary, which is the transition's job.
     pub delegator_fee_rewards: Vec<crate::state_root::DelegatorFeeRecord>,
+    /// Write-off audit counter, carried unchanged: it moves only when a
+    /// `Withdraw` executes, which is transaction execution and not this
+    /// seam's job. Carried rather than omitted for the same reason
+    /// [`Self::base_fee`] is -- the state root commits all components, and a
+    /// root over a subset is not the root the header must carry.
+    pub written_off_sat: u128,
+    /// Bond low-water marks, carried unchanged: written only by the slashing
+    /// path in the transition.
+    pub stake_low_water: Vec<crate::state_root::StakeLowWaterRecord>,
 }
 
 impl ChainState {
@@ -156,6 +165,8 @@ impl ChainState {
             coherence_nullifier_root: self.coherence_nullifier_root,
             evm: self.evm,
             issued_sat: self.issued_sat,
+            written_off_sat: self.written_off_sat,
+            stake_low_water: &self.stake_low_water,
         })
     }
 }
@@ -628,6 +639,8 @@ mod coherence_tests {
 
     fn chain(acc: [u8; 32], nf: [u8; 32]) -> ChainState {
         ChainState {
+            written_off_sat: 0,
+            stake_low_water: Vec::new(),
             eutxos: Vec::new(),
             registry: Vec::new(),
             current_participation: Vec::new(),

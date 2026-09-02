@@ -218,6 +218,58 @@ const TAG_BASE_FEE: u8 = 0x15;
 /// that disagreed on it would pay a different amount for the same exit.
 const TAG_DELEGATOR_FEE_REWARD: u8 = 0x16;
 
+// NOTE on 0x17: deliberately UNUSED. The two tags below are carried over from
+// `dev1/transition-merge` at their original byte values so that a state root
+// computed by this lineage and one computed by that branch agree leaf for
+// leaf; that branch had a column at 0x17 which did not survive its own
+// review, and re-packing these two down by one byte to close the gap would
+// silently change every root either lineage produces once the write-off is
+// non-empty. A one-byte hole in a private namespace is cheaper than a root
+// that disagrees across lineages for no reason a reader can see.
+
+/// Cumulative unissued principal written off at withdrawals, in satoshis.
+/// A single leaf, committed only once non-zero -- so every pre-gate root
+/// stays byte-identical -- and monotone thereafter. Pure audit surface: it
+/// lets an operator verify over RPC that the 1,600,000 BLOCH of genesis
+/// principal left the books as write-off, never as coin.
+const TAG_WRITTEN_OFF: u8 = 0x18;
+
+/// The LOW-WATER MARK of each bond that a slash has ever reduced, in
+/// satoshis -- `min` over the whole history of `staked_sat` immediately after
+/// every stake reduction.
+///
+/// # Why it starts at the REBUILD and not at the flag day
+///
+/// The write-off owed at withdrawal is `U(t) = min(P, min_{s<=t} staked(s))`
+/// -- the principal, floored by the smallest the bond has ever been. The
+/// principal term is derived from committed history and needs no leaf; THIS
+/// map is the `min` term, and it is the only part that cannot be
+/// reconstructed after the fact. Without it the rule has no choice but
+/// `min(P, staked_now)`.
+///
+/// That substitution is not conservative. Worked example: `P = 25,000`, a
+/// pre-gate slash burns 5,000 (the bond is 20,000, and 20,000 is all that is
+/// truly unissued), later rewards add 10,000 (the bond is 30,000, of which
+/// 10,000 is emitted coin the operator earned). `min(25,000, 30,000) =
+/// 25,000` pays 5,000. The right answer is 10,000. The write-off would
+/// confiscate 5,000 of ALREADY-EMITTED coin -- precisely the amount the
+/// pre-gate slash burned, taken a second time.
+///
+/// So the recorder must be running before the first slash it needs to
+/// remember, which means UNGATED: the gate arrives too late to record what
+/// the gate itself must read. That is safe to ship without a second flag
+/// day only because the map is empty on the live chain (no validator has
+/// ever been slashed), and an empty map contributes NO leaves, so the root
+/// is byte-identical to the ungated binary's on every state that exists
+/// today.
+///
+/// Canonical form: **a zero-valued entry is meaningful and IS committed.**
+/// Absent means "never slashed, no floor recorded"; present-and-zero means
+/// "slashed to nothing, floor is zero". Collapsing the two would turn a bond
+/// slashed to zero into a bond with no history -- which is the indeterminate
+/// class, and would hand it a payout instead of a refusal.
+const TAG_STAKE_LOW_WATER: u8 = 0x19;
+
 
 fn sha3(parts: &[&[u8]]) -> [u8; 32] {
     let mut h = Sha3_256::new();
@@ -1326,6 +1378,28 @@ impl DepositQueueRecord {
     }
 }
 
+/// The low-water mark of one validator's bond ([`TAG_STAKE_LOW_WATER`]) --
+/// the smallest `staked_sat` has been since the recorder started. A zero
+/// value is a real record and IS committed; see the tag's docs for why
+/// absent and zero must not collapse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StakeLowWaterRecord {
+    pub validator: u32,
+    pub low_water_sat: u128,
+}
+
+impl StakeLowWaterRecord {
+    fn entry_key(&self) -> Vec<u8> {
+        self.validator.to_le_bytes().to_vec()
+    }
+    fn serialize(&self) -> Vec<u8> {
+        let mut s = Vec::with_capacity(20);
+        s.extend_from_slice(&self.validator.to_le_bytes());
+        s.extend_from_slice(&self.low_water_sat.to_le_bytes());
+        s
+    }
+}
+
 /// One delegation in the permanent history, committed per entry under
 /// [`TAG_DELEGATION`]. Keyed by **position** in the history, unlike the
 /// deposit queue: two byte-identical delegations (same delegator, validator,
@@ -1609,6 +1683,10 @@ pub struct ConsensusState<'a> {
     /// Cumulative fee rewards per delegator account
     /// ([`TAG_DELEGATOR_FEE_REWARD`]).
     pub delegator_fee_rewards: &'a [DelegatorFeeRecord],
+    /// Cumulative written-off principal ([`TAG_WRITTEN_OFF`]).
+    pub written_off_sat: u128,
+    /// Per-validator bond low-water marks ([`TAG_STAKE_LOW_WATER`]).
+    pub stake_low_water: &'a [StakeLowWaterRecord],
 }
 
 /// How many **closed** epoch boundaries the committed beacon history retains,
@@ -1807,6 +1885,38 @@ fn build_state_tree_inner(state: &ConsensusState<'_>, eutxo_tree: &Smt) -> Smt {
         smt.insert(
             derive_key(TAG_DELEGATOR_FEE_REWARD, &d.entry_key()),
             hash_value(&d.serialize()),
+        );
+    }
+    // NOTE: there is deliberately NO leaf for the per-validator unbacked
+    // principal, and none for the indeterminate class. Both are pure
+    // functions of state this tree already commits -- the deposit queue, the
+    // genesis principals, `slashed`, and the low-water marks below -- so a
+    // leaf for either would be a second encoding of a fact the root already
+    // fixes. The write-off is derived per call in `transition.rs` rather than
+    // materialised into a map, precisely so that no boundary has to fire for
+    // the rule to hold.
+    if state.written_off_sat > 0 {
+        smt.insert(
+            derive_key(TAG_WRITTEN_OFF, &[]),
+            hash_value(&state.written_off_sat.to_le_bytes()),
+        );
+    }
+    // The write-off's HISTORY, ungated -- committed from the rebuild rather
+    // than from the flag day, because the gate needs to READ a history the
+    // gate itself would be too late to WRITE. Shipping it ungated is safe
+    // without a second flag day because of a measurement, not a comment: no
+    // live validator carries an applied slash, so this component is empty
+    // everywhere, an empty component inserts nothing, and a tree with no
+    // extra leaves has the ungated binary's root to the byte.
+    //
+    // What must NOT be copied from `written_off_sat` above is the "skip when
+    // zero" conditional -- a zero low-water mark is a fact about a bond
+    // slashed to nothing, and dropping its leaf would make it
+    // indistinguishable from a bond that was never slashed at all.
+    for w in state.stake_low_water {
+        smt.insert(
+            derive_key(TAG_STAKE_LOW_WATER, &w.entry_key()),
+            hash_value(&w.serialize()),
         );
     }
     smt
@@ -2800,6 +2910,8 @@ mod tests {
         losses: Vec<DelegatorLossRecord>,
         base_fee: BaseFeeRecord,
         fee_rewards: Vec<DelegatorFeeRecord>,
+        written_off_sat: u128,
+        low_water: Vec<StakeLowWaterRecord>,
     }
 
     fn fixture() -> Fx {
@@ -2929,6 +3041,17 @@ mod tests {
             DelegatorFeeRecord { delegator: 900, reward_sat: 4_321 },
         ];
         Fx {
+            // Non-empty and asymmetric on purpose: a component whose fixture
+            // is empty is a component the coverage test below cannot
+            // distinguish from an absent one. `validator: 77` carries a ZERO
+            // low water deliberately -- present-and-zero is a real record, and
+            // a serialization that elided it would make a bond slashed to
+            // nothing indistinguishable from one never slashed.
+            written_off_sat: 777,
+            low_water: vec![
+                StakeLowWaterRecord { validator: 1, low_water_sat: 1_900_000_000_000 },
+                StakeLowWaterRecord { validator: 77, low_water_sat: 0 },
+            ],
             eutxos,
             validators,
             current,
@@ -3110,6 +3233,8 @@ mod tests {
 
     fn state(f: &Fx) -> ConsensusState<'_> {
         ConsensusState {
+            written_off_sat: f.written_off_sat,
+            stake_low_water: &f.low_water,
             eutxos: &f.eutxos,
             validators: &f.validators,
             current_participation: &f.current,

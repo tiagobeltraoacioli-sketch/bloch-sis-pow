@@ -609,6 +609,82 @@ pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// `u64::MAX` means INERT. Same arming rules as above.
 pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+/// Flag day for **funded stake and validator withdrawal**
+/// (`PosTransaction::Withdraw`, the write-off arithmetic, and the
+/// whistleblower-reward cap that goes with it).
+///
+/// `u64::MAX` means INERT, and it is NOT ARMED. Arming it is a founder
+/// decision that also requires the wire tag below to be assigned; either one
+/// alone leaves the feature unreachable, which is deliberate.
+///
+/// # This constant has a reader
+///
+/// Stated explicitly because the alternative has already cost this project
+/// once: an activation constant with no reader is not a gate, it is a
+/// comment. This one is read on every transaction, on the only path that
+/// applies one -- `CommittedState::apply_transaction` computes
+/// `funded_era = self.epoch >= funded_stake_gate_epoch` from it and the
+/// `Withdraw` arm's FIRST rule is `if !funded_era { reject }`. It is also
+/// read by `withdrawable_sat` and by the whistleblower cap in
+/// `apply_slashing_evidence`. `withdrawal_gate_is_inert_and_has_a_reader`
+/// pins both halves: that the shipped value is `u64::MAX`, and that moving
+/// it changes behaviour.
+///
+/// The gate epoch is threaded through `apply_transaction` as a parameter
+/// rather than read from this constant at the point of use -- the same
+/// testable-seam idiom as `with_leak_applied` -- so tests can exercise both
+/// sides of the gate without arming anything globally.
+pub const FUNDED_STAKE_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// The `PosTransaction` wire tag for `Withdraw`: **UNASSIGNED**.
+///
+/// `None` is the shipped value and it is not a placeholder for "pick the next
+/// free byte" -- the byte is contested and the choice belongs to the founder.
+/// `0x06` is already collided inside the released space, and the three bytes
+/// above it are claimed with INCOMPATIBLE meanings across lineages: the same
+/// byte decodes to a different transaction depending on which branch built
+/// the binary, which is a chain split with no error message. The frozen
+/// registry (`guard/wire-tag-registry-release`,
+/// `crates/bloch-pos-committee/tests/wire_tag_registry.rs`) records the
+/// released space and the rival claims; it does not resolve them, because
+/// resolving them is not an editorial decision.
+///
+/// # What "unassigned" buys, mechanically
+///
+/// While this is `None`, `canonical_bytes` encodes `Withdraw` under
+/// [`WITHDRAW_TAG_UNASSIGNED`], and `from_canonical_bytes` has NO arm for
+/// that byte -- so the shape round-trips to `UnknownTag` and can never enter
+/// a node from the network. The payload is the validator index either way, so
+/// the encoded LENGTH is five bytes under any eventual assignment: the fee
+/// and byte accounting the `Withdraw` arm performs does not shift when the
+/// founder picks the byte.
+///
+/// This is the second of the two independent locks. The flag day above stops
+/// a withdrawal that is already inside the node; this stops one from getting
+/// in at all.
+///
+/// # ORDERING CONSTRAINT: assign the byte BEFORE arming the flag day
+///
+/// The encoded length is stable across assignments, but the TXID IS NOT. A
+/// transaction's id is `SHA3-256(DS_TXID || spend_signing_root)`, and the
+/// staking shapes fold their whole `canonical_bytes` -- tag byte included --
+/// into that root. So changing this byte changes every withdrawal's txid, and
+/// with it the eUTXO key of the output the payout creates.
+///
+/// Harmless today, because nothing can execute while both locks are shut. It
+/// stops being harmless the moment the flag day arms: assigning the byte
+/// AFTER activation would re-key outputs that already exist, which is a fork
+/// with no error message. Assign the byte first, or in the same change; never
+/// after. `withdraw_has_no_wire_tag_until_the_founder_assigns_one` pins that
+/// the byte is still unassigned, which is what keeps this ordering available.
+pub const WITHDRAW_WIRE_TAG: Option<u8> = None;
+
+/// The sentinel `canonical_bytes` uses while [`WITHDRAW_WIRE_TAG`] is
+/// unassigned. Outside the transaction namespace on every lineage surveyed,
+/// and refused by every decoder including this one -- it is not a claim on
+/// the namespace, it is the absence of one.
+pub const WITHDRAW_TAG_UNASSIGNED: u8 = 0xFF;
+
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.
 pub const DS_SORTITION: [u8; 16] = *b"BLCH4:SORTIT\0\0\0\0";

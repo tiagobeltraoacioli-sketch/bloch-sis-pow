@@ -278,6 +278,10 @@ fn fixture() -> Fixture {
 
 fn state<'a>(f: &'a Fixture, e: &'a [EutxoEntry]) -> ConsensusState<'a> {
     ConsensusState {
+        // Empty: this is a carryover-scale fixture, with no withdrawal and no
+        // slash in it.
+        written_off_sat: 0,
+        stake_low_water: &[],
         eutxos: e,
         validators: &f.validators,
         current_participation: &f.current,
