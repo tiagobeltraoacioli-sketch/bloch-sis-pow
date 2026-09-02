@@ -988,3 +988,179 @@ fn a_body_split_across_packets_is_reassembled() {
     assert!(out.starts_with("HTTP/1.1 200"), "got {out}");
     assert_eq!(spy.last(), Some(RpcRequest::BlockBySlot(41_290)));
 }
+
+// ─── getbuildinfo: which binary is answering ────────────────────────────────
+//
+// These guards were written against the failure they are for. Three fleet
+// boxes once ran three different binaries and all reported the same version
+// string; a published release was an abandoned branch while the fleet ran
+// something else; and on 2026-09-02 both public archivals answered
+// `getmempoolinfo` with four fields where this build emits six. Every one of
+// those is a case where a node's self-report was true and useless.
+//
+// So the bar for these tests is not "the method returns JSON". It is that the
+// identity is derived from the tree, that it is honest about which parts are
+// assertions, and that it says nothing an operator would refuse to publish.
+
+/// The method routes, and it routes to something that reads no chain state.
+#[test]
+fn getbuildinfo_routes() {
+    let spy = Spy::new();
+    let b = spy.as_ref();
+    call(b, &request("getbuildinfo", "[]"));
+    assert_eq!(spy.last(), Some(RpcRequest::BuildInfo));
+
+    // Params are ignored rather than rejected: this method asks nothing of the
+    // caller, and an integrator sending `null` or a stray array must not get a
+    // parse error for a question with no arguments.
+    assert_eq!(route("getbuildinfo", None).unwrap(), RpcRequest::BuildInfo);
+    assert_eq!(
+        route("getbuildinfo", Some(&Json::Arr(vec![Json::u(1)]))).unwrap(),
+        RpcRequest::BuildInfo
+    );
+}
+
+/// Every field a partner is told to compare is present and non-empty.
+///
+/// A missing field would degrade silently: a client comparing two nodes on a
+/// key neither of them emits sees them agree.
+#[test]
+fn getbuildinfo_reports_the_fields_a_partner_compares() {
+    let v = build_info_json();
+    for k in [
+        "build_version",
+        "package_version",
+        "commit",
+        "commit_source",
+        "tree_state",
+        "source_digest",
+        "source_digest_alg",
+        "source_digest_scope",
+        "source_files",
+        "source_bytes",
+        "rustc",
+        "profile",
+        "target",
+        "digest_note",
+    ] {
+        let f = v.get(k).unwrap_or_else(|| panic!("getbuildinfo has no `{k}`"));
+        let s = f.as_str().unwrap_or_else(|| panic!("`{k}` must be a string"));
+        assert!(!s.is_empty(), "`{k}` must not be empty");
+    }
+
+    assert_eq!(v.get("source_digest_alg").unwrap().as_str(), Some("sha3-256"));
+
+    // `commit_source` is the field that separates evidence from assertion.
+    // Anything outside this set means the build script grew a case nobody
+    // taught a client to read.
+    let cs = v.get("commit_source").unwrap().as_str().unwrap();
+    assert!(
+        ["git", "asserted", "none"].contains(&cs),
+        "commit_source must be git|asserted|none, got {cs}"
+    );
+    let ts = v.get("tree_state").unwrap().as_str().unwrap();
+    assert!(
+        ["clean", "modified", "unverified", "unknown"].contains(&ts),
+        "tree_state must be clean|modified|unverified|unknown, got {ts}"
+    );
+
+    // The bound rides with the answer, so a client cannot read the digest as
+    // proof without having been told otherwise in the same object.
+    let note = v.get("digest_note").unwrap().as_str().unwrap();
+    assert!(note.contains("not proof"), "the digest must ship with its bound: {note}");
+}
+
+/// The digest is a real digest of a real tree, not a placeholder.
+///
+/// This is the test that would have caught the whole method being cosmetic.
+/// `unavailable` is a legitimate runtime answer when the crate is built out of
+/// a vendored copy with no workspace around it — but a workspace build that
+/// reports it means the build script silently failed to find the tree, and the
+/// identity everyone is about to rely on is a constant string.
+#[test]
+fn getbuildinfo_digest_is_computed_not_typed() {
+    let v = build_info_json();
+    let d = v.get("source_digest").unwrap().as_str().unwrap();
+    assert_eq!(d.len(), 64, "sha3-256 is 64 hex characters, got {d:?}");
+    assert!(
+        d.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "digest must be lowercase hex: {d}"
+    );
+    // Not the digest of the empty string, and not all one character.
+    assert_ne!(d, "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a");
+    assert!(d.chars().collect::<std::collections::HashSet<_>>().len() > 4);
+
+    // The tree it hashed must be this repository's, at the order of magnitude
+    // it actually has. A digest over three files would pass every assertion
+    // above and cover none of the consensus crates.
+    let files: u64 = v.get("source_files").unwrap().as_str().unwrap().parse().unwrap();
+    let bytes: u64 = v.get("source_bytes").unwrap().as_str().unwrap().parse().unwrap();
+    assert!(files > 100, "digest scope covers only {files} files — it lost the tree");
+    assert!(bytes > 1_000_000, "digest scope covers only {bytes} bytes — it lost the tree");
+}
+
+/// Nothing here is anything an operator would refuse to publish.
+///
+/// The constraint is not decorative: this method is meant to be answered to an
+/// exchange over an open port, so a field that carried a data directory, a home
+/// directory or a peer id would turn an identity endpoint into a disclosure.
+#[test]
+fn getbuildinfo_leaks_nothing_operational() {
+    let json = build_info_json().to_string();
+
+    // Absolute paths, in any of the shapes this crate is built under.
+    for probe in ["/Users", "/home", "/root", "/var", "/private/tmp", "C:\\"] {
+        assert!(!json.contains(probe), "getbuildinfo leaked a path fragment {probe}: {json}");
+    }
+    // The build directory itself, whatever it happens to be on this machine.
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    assert!(!json.contains(manifest), "getbuildinfo leaked the manifest dir: {json}");
+    for comp in manifest.split('/').filter(|c| c.len() > 3) {
+        // Every component of the build path — the username among them — must
+        // be absent. `crates` and `bloch-pos-node` are repository-relative
+        // names, not machine facts, so they are exempt.
+        if ["crates", "bloch-pos-node"].contains(&comp) {
+            continue;
+        }
+        assert!(
+            !json.contains(comp),
+            "getbuildinfo leaked build-path component {comp:?}: {json}"
+        );
+    }
+    // Environment the node is run with, and the things an operator holds.
+    for probe in ["ssh", "PRIVATE", "secret", "mnemonic", "keystore", "validator_key"] {
+        assert!(
+            !json.to_lowercase().contains(&probe.to_lowercase()),
+            "getbuildinfo mentions {probe}: {json}"
+        );
+    }
+}
+
+/// The identity survives the round trip a partner actually makes.
+///
+/// Testing `build_info_json()` directly would pass even if the method were
+/// unreachable over the wire — which is precisely the state the release tag is
+/// in today, where the whole machine-readable surface exists on branches and
+/// answers -32601 in production.
+#[test]
+fn getbuildinfo_answers_over_the_json_rpc_envelope() {
+    /// A backend that answers `BuildInfo` the way the engine does and nothing
+    /// else, so this test covers the dispatcher and the formatter without
+    /// standing a node up.
+    struct Ident;
+    impl RpcBackend for Ident {
+        fn call(&self, req: RpcRequest) -> RpcResult {
+            match req {
+                RpcRequest::BuildInfo => Ok(build_info_json()),
+                other => panic!("getbuildinfo must not decode to {other:?}"),
+            }
+        }
+    }
+
+    let out = call(&Ident, &request("getbuildinfo", "[]")).to_string();
+    assert!(out.contains("\"source_digest\""), "not reachable over the envelope: {out}");
+    assert!(out.contains("\"commit_source\""), "not reachable over the envelope: {out}");
+    assert!(!out.contains("\"error\""), "getbuildinfo errored: {out}");
+    // The envelope must carry the id back, or a client cannot match it.
+    assert!(out.contains("\"id\":1"), "envelope lost the id: {out}");
+}

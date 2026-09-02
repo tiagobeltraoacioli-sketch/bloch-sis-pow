@@ -2581,6 +2581,9 @@ impl Engine {
                 )),
             },
 
+            // Identity of the binary, not of the chain: no state read, no
+            // lock taken, constant cost at any height.
+            RpcRequest::BuildInfo => Ok(rpc::build_info_json()),
             RpcRequest::MempoolInfo => Ok(rpc::mempool_info_json(
                 self.mempool.len(),
                 MEMPOOL_MAX,
@@ -4723,6 +4726,43 @@ mod transfer_v2_end_to_end {
         assert!(
             json.contains("\"barred_hits\":3"),
             "getmempoolinfo tem que expor as reofertas barradas: {json}"
+        );
+    }
+
+    /// **The engine answers `getbuildinfo`, and answers it about ITSELF.**
+    ///
+    /// The routing test in `rpc/tests.rs` proves the dispatcher decodes the
+    /// name; it cannot prove the engine has an arm for it, because a spy
+    /// backend answers everything. This one goes through `serve_rpc` on a real
+    /// engine, which is the path an exchange's request actually takes.
+    ///
+    /// The reason it matters here rather than only in the RPC module: on
+    /// 2026-09-02 both public archivals answered `getmempoolinfo` with four
+    /// fields where this build emits six. Nothing on the surface said which
+    /// binary either of them was. This is the method that would have said it,
+    /// and a method that routes but is never dispatched would have shipped
+    /// looking identical from the outside.
+    #[test]
+    fn getbuildinfo_is_answered_by_the_engine_and_names_this_tree() {
+        let entries = vec![];
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+
+        let json = node.serve_rpc(RpcRequest::BuildInfo).expect("getbuildinfo responde").to_string();
+
+        // The identity fields a partner is told to compare.
+        for k in ["commit", "commit_source", "tree_state", "source_digest", "rustc", "target"] {
+            assert!(json.contains(&format!("\"{k}\"")), "engine reply has no `{k}`: {json}");
+        }
+        // And the digest is the one this binary was built with — not a stub
+        // the engine substituted, and not a value read at request time.
+        assert!(
+            json.contains(env!("BLOCH_SOURCE_DIGEST")),
+            "the engine must report the digest compiled into it: {json}"
+        );
+        assert_ne!(
+            env!("BLOCH_SOURCE_DIGEST"),
+            "unavailable",
+            "built inside the workspace, so the build script must have found the tree"
         );
     }
 

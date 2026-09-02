@@ -90,7 +90,27 @@ fn main() {
                 "{NAME} {VERSION} (Genesis-4, block version {:#010x})",
                 bloch_pos_committee::header::VERSION_G4
             );
+            // Second line, appended rather than folded into the first, because
+            // `scripts/pos-release-integrity.sh` and the fleet sweep in
+            // deploy/RELEASE-INTEGRITY.md match the first line's shape.
+            //
+            // The commit answers "what was checked out"; the digest answers
+            // "what was compiled", and only the second one survives an
+            // operator editing a file and rebuilding. See `rpc::build_info_json`
+            // for what each field can and cannot prove.
+            println!(
+                "source-digest sha3-256:{} ({} files, {} bytes) commit-source:{} tree:{}",
+                env!("BLOCH_SOURCE_DIGEST"),
+                env!("BLOCH_SOURCE_FILES"),
+                env!("BLOCH_SOURCE_BYTES"),
+                env!("BLOCH_BUILD_COMMIT_SOURCE"),
+                env!("BLOCH_BUILD_TREE_STATE"),
+            );
         }
+        // The same object `getbuildinfo` returns, for an operator who is on the
+        // box and for a release check that must compare two artifacts without
+        // standing either of them up as a node.
+        Some("buildinfo") => println!("{}", rpc::build_info_json().to_string()),
         Some("--help") | Some("-h") | None => print_help(),
         Some("selfcheck") => {
             self_check();
@@ -116,6 +136,11 @@ fn print_help() {
          USAGE:\n\
            bloch-pos selfcheck\n\
                Verify the frozen consensus parameters this binary links.\n\
+           bloch-pos buildinfo\n\
+               Print this binary's identity as JSON — the same object\n\
+               `getbuildinfo` returns over the RPC. The source digest is\n\
+               computed from the files that were compiled, so an edited tree\n\
+               cannot report a clean tag id.\n\
            bloch-pos keygen --dir <dir> --index <i>\n\
                Generate a THROWAWAY devnet validator keystore (hybrid\n\
                ML-DSA-65‖Falcon-1024 + RANDAO seed) at <dir>/validator.key.\n\

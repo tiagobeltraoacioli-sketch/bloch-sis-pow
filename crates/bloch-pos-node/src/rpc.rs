@@ -690,6 +690,8 @@ fn hex32_from(s: &str) -> Option<[u8; 32]> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RpcRequest {
     ChainInfo,
+    /// `getbuildinfo` — which binary is answering. Reads no chain state.
+    BuildInfo,
     /// `getblockcount` — the polling method, carrying finality with it.
     BlockCount,
     BlockBySlot(u64),
@@ -854,6 +856,7 @@ fn want_hex32(params: Option<&Json>, pos: usize, name: &str) -> Result<[u8; 32],
 pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError> {
     Ok(match method {
         "getchaininfo" => RpcRequest::ChainInfo,
+        "getbuildinfo" => RpcRequest::BuildInfo,
         "getblockcount" => RpcRequest::BlockCount,
         "getblockbyslot" => RpcRequest::BlockBySlot(want_u64(params, 0, "slot")?),
         "getblockbyid" => RpcRequest::BlockById(want_hex32(params, 0, "block_id")?),
@@ -1582,6 +1585,143 @@ pub fn mempool_info_json(
         // rather than a log line on a box someone has to hold a key for.
         ("barred", Json::u(barred as u64)),
         ("barred_hits", Json::u(barred_hits)),
+    ])
+}
+
+
+/// `getbuildinfo` — the identity of the binary that is answering.
+///
+/// # Why this method exists
+///
+/// We told a partner exchange to trust a read only when two nodes agree. That
+/// rule is unfalsifiable if you cannot tell the two nodes apart, and until this
+/// method there was no way to: nothing on this surface said which binary was on
+/// the other end of the socket. The failure is not hypothetical here. The
+/// 2026-08-11 fleet survey found three boxes running three different binaries,
+/// all reporting `bloch 0.3.0-genesis2`. The published Genesis-3 release was an
+/// abandoned branch while the fleet ran unpublished fixes, and nobody noticed
+/// until nodes froze at block 10802. And on 2026-09-02 both public archivals
+/// answered `getmempoolinfo` with four fields where this build emits six — a
+/// difference no version string on either side would have shown.
+///
+/// # The honesty bar, and the part that is only evidence
+///
+/// A version string a developer typed proves nothing; that is the whole lesson
+/// above. So the load-bearing field here is `source_digest`, which the build
+/// script computes over the FILES it is about to compile
+/// (`crates/**/*.{rs,toml,c,h,S,s}` plus the workspace `Cargo.toml` and
+/// `Cargo.lock`), not over anything anyone asserted. No environment variable
+/// moves it.
+///
+/// What it can prove:
+///
+/// - Two nodes reporting **different** `source_digest` were built from
+///   different trees. Full stop, no interpretation needed.
+/// - A node whose `source_digest` differs from the digest published for a
+///   release tag is **not** running that tag's source, even if it reports the
+///   tag's commit id — which is exactly the accident this method is for, since
+///   `BLOCH_BUILD_COMMIT` lets a caller assert any commit it likes.
+///
+/// What it cannot prove:
+///
+/// - It cannot prove a node IS running the tag. Equal digests mean the hashed
+///   set matched; a hostile operator who can edit the source can also edit
+///   `build.rs` to print a digest it never computed, or patch the linked
+///   binary after the fact. This is tamper-EVIDENT against drift and accident,
+///   not tamper-PROOF against a liar. Only a reproducible build compared
+///   against an independently built artifact closes that, and
+///   `deploy/RELEASE-INTEGRITY.md` is where that lives.
+/// - It says nothing about behaviour. Equal source and equal `rustc`,
+///   `profile` and `target` is a strong claim about the artifact and still not
+///   a claim that two nodes will derive the same committee — see the fork
+///   history in this repo, where identical binaries diverged on local state.
+/// - It does not cover `legacy/`, `tools/`, `apps/` or `scripts/`, and it does
+///   not cover the compiled artifact itself.
+///
+/// `commit_source` is the field that keeps `commit` from being read as more
+/// than it is: `git` means the build script read it from the repository,
+/// `asserted` means the caller passed `BLOCH_BUILD_COMMIT` and nothing checked
+/// it, `none` means there was no repository. An `asserted` commit beside a
+/// `source_digest` that does not match the tag is the signature of exactly the
+/// mistake this method was written to catch.
+///
+/// # What is deliberately absent
+///
+/// No paths, no hostname, no peer id, no key material, no data directory, no
+/// operator identity. Everything reported is either a hash, a compiler
+/// version, or a target triple. `getbuildinfo_leaks_nothing_operational` in
+/// `rpc/tests.rs` holds that line.
+///
+/// # Cost
+///
+/// Constant. Every field is a `&'static str` baked in at compile time; the
+/// method reads no chain state, takes no lock and allocates one small object.
+/// It does not move with the height.
+// NAMESPACE NOTE, 2026-09-02 — read before adding `RPC_SURFACE_VERSION` here.
+//
+// This method deliberately does NOT report a semantic surface version, and the
+// omission is a decision rather than an oversight.
+//
+// `RPC_SURFACE_VERSION` is defined against `RPC_SURFACE` and `getcapabilities`.
+// Neither exists on this lineage: `main`, the release tag `g4-node-20260901`
+// (7a83ca89) and the fleet commit 46133196 contain no `RPC_SURFACE`, no
+// `RPC_SURFACE_VERSION` and no `getcapabilities`, and the three documents that
+// carry the counter (BLOCH-GENESIS4-EXCHANGE-INTEGRATION.md,
+// BLOCH-RPC-STABILITY-V4.md, WIRE-NAMESPACE-REGISTRY.md) are absent from the
+// tag entirely. Landing a bare "4.2.0" string here would assert that 4.0.0 and
+// 4.1.0 shipped on the lineage the fleet runs. They did not. A version number
+// is a claim, and that one would be false in the same way `bloch 0.3.0-genesis2`
+// on three different binaries was false.
+//
+// The collision itself, for whoever lands the counter: 4.1.0 comes from
+// `dev/rpc-surface-20260901` (d28b2edc), and TWO unlanded branches each bump it
+// to 4.2.0 off that base — `rpc/build-identity` (8cece026, for getbuildinfo)
+// and 163befdb (for the settlement-guarantee retraction on `Finality`). Both
+// merge without a conflict and a client would then see one string standing for
+// two surfaces. **4.3.0 is reserved here for whichever of the two lands
+// second**, so 4.2.0 stays free for exactly one claimant instead of being burnt
+// by a third. When `RPC_SURFACE`/`getcapabilities` reach this lineage, the
+// counter arrives with them and `getbuildinfo` gains a `surface_version` field
+// in the same commit — a minor bump, since it only adds a field.
+//
+// Until then the honest answer to "which surface is this?" is the one below:
+// a digest of the tree that was compiled. It cannot drift from the binary,
+// which is the property a hand-maintained counter has never had here.
+pub fn build_info_json() -> Json {
+    Json::obj(vec![
+        // The display string `--version` prints, so an operator can match what
+        // the RPC says against what the binary says on the console.
+        ("build_version", Json::s(env!("BLOCH_BUILD_VERSION"))),
+        ("package_version", Json::s(env!("CARGO_PKG_VERSION"))),
+        ("commit", Json::s(env!("BLOCH_BUILD_COMMIT_ID"))),
+        ("commit_source", Json::s(env!("BLOCH_BUILD_COMMIT_SOURCE"))),
+        ("tree_state", Json::s(env!("BLOCH_BUILD_TREE_STATE"))),
+        ("source_digest", Json::s(env!("BLOCH_SOURCE_DIGEST"))),
+        ("source_digest_alg", Json::s("sha3-256")),
+        (
+            "source_digest_scope",
+            Json::s(
+                "workspace crates dir: rs, toml, c, h, S, s; \
+                 plus workspace Cargo.toml and Cargo.lock; \
+                 relative paths, sorted, length-prefixed",
+            ),
+        ),
+        ("source_files", Json::s(env!("BLOCH_SOURCE_FILES"))),
+        ("source_bytes", Json::s(env!("BLOCH_SOURCE_BYTES"))),
+        ("rustc", Json::s(env!("BLOCH_BUILD_RUSTC"))),
+        ("profile", Json::s(env!("BLOCH_BUILD_PROFILE"))),
+        ("target", Json::s(env!("BLOCH_BUILD_TARGET"))),
+        // The bound rides with the answer. A client that reads `source_digest`
+        // and stops reading has been told, in the response itself, what it is
+        // allowed to conclude.
+        (
+            "digest_note",
+            Json::s(
+                "different digests prove different source trees; \
+                 equal digests are evidence of the same source, not proof — \
+                 whoever can edit the source can edit the build script that hashes it",
+            ),
+        ),
     ])
 }
 
