@@ -377,6 +377,54 @@ Two things that will make your run slower than ours: a busy machine (the
 initial state construction pins one core and does not share it), and a taller
 chain than 33,600 by the time you start.
 
+### The RPC goes dark during the sync — plan your health checks around it
+
+**This is the single most likely way you will misdiagnose a healthy node**, and
+it is not the Phase 1 silence described above. Phase 1 is silent because the
+RPC is not open yet. What follows is different: the RPC **opens, answers a
+handful of times, and then stops answering for essentially the whole replay**
+before coming back at the head.
+
+Measured on the 21.2-minute release run above, sampling `getchaininfo` every
+five seconds for the whole run (194 samples):
+
+| Elapsed | `getchaininfo` |
+|---|---|
+| 0 – 47 s | no answer (Phase 1, RPC not yet open) |
+| 52 – 131 s | **answers**, 11 times, reporting height climbing 27 → 7,275 |
+| 131 s – 1,273 s | **no answer for 1,142 consecutive seconds (19.0 minutes)** |
+| 1,273 s onward | answers on every sample, `behind_by_slots` 0–1 |
+
+The node was healthy and applying blocks throughout that 19-minute gap. The
+`main`-built baseline behaved worse: on a 29.5-minute cold sync it returned
+**no answer at all** until the run completed at 1,768 s.
+
+Consequences, and they are practical:
+
+- **Do not use RPC reachability as your liveness probe during a sync.** A
+  `systemd` unit, load balancer or container health check that restarts the
+  node when the RPC stops answering will kill it mid-replay, and the restart
+  starts another replay — an unattended crash-loop that never reaches the head.
+  If you run the node under an orchestrator, disable the health check until
+  `behind_by_slots` first reads 0, or set the failure threshold above the full
+  expected sync time.
+- **Use the process and the log, not the port.** The signals that keep moving
+  are the `[slot N] applied …` lines and RSS (`ps -o %cpu,rss -p <pid>`).
+- **Every restart pays this again.** There is no checkpoint or state download
+  (see "What does not work today"): a node that restarts replays and
+  revalidates from its anchor, so the blackout is not a one-time cost of
+  provisioning — it recurs on **every** process restart, including one
+  triggered by a deploy, an OOM, or a reboot. Budget the full sync time as
+  your restart cost, and expect the node to be unqueryable for that whole
+  window.
+
+> The table above is an observation, not a specification: we measured *that*
+> the RPC stops answering during replay, on these two runs. We have not
+> published a mechanism for it, and the exact boundaries of the gap may differ
+> on your hardware. Treat "the RPC may not answer at any point before
+> `behind_by_slots` first reads 0" as the contract, and do not build alerting
+> that assumes otherwise.
+
 > **Why the old figure was so far out.** Two mistakes compounded. The run was
 > on a laptop under heavy load — the same machine and session that took 11
 > minutes over an initial state construction that needs about 2 minutes idle —
@@ -404,8 +452,12 @@ chain than 33,600 by the time you start.
 > | Build | Time to caught up | Peak RSS | Outcome |
 > |---|---|---|---|
 > | This release (with the fix) | **21.2 min** | **934 MB** | completed, h=33,602 |
-> | `main` (without the fix), run 1 | **30.3 min** | **1,014 MB** | completed, h=33,620 |
+> | `main` (without the fix), run 1 | **30.3 min** | **1,014 MB** | completed; height not retained |
 > | `main` (without the fix), run 2 | **29.5 min** | **1,016 MB** | completed, h=33,794 |
+>
+> Per-sample traces were kept for the release run and for `main` run 2; for
+> `main` run 1 only the finishing time and peak RSS were recorded, so no height
+> is quoted for it.
 >
 > The two unfixed runs were on different boxes and agree to within 3%, so the
 > fix is worth about **1.4× on cold-sync wall clock** and a few percent on peak
