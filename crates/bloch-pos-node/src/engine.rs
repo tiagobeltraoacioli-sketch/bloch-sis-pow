@@ -5974,3 +5974,237 @@ mod duty_view_anchor {
     }
 }
 
+
+/// THROWAWAY INVESTIGATION PROBE — not a fix, not a rule, never to be merged.
+///
+/// Question: can a validator added after genesis, by deposit, attest at all?
+/// This drives the REAL engine, the REAL manifest, REAL hybrid keys and the
+/// REAL verifier, and reports where it actually stops.
+#[cfg(test)]
+mod deposit_added_validator_probe {
+    use super::*;
+    use crate::genesis::ManifestValidator;
+    use bloch_pos_committee::attestation::{self, SignatureVerifier};
+    use bloch_pos_committee::SLOTS_PER_EPOCH;
+
+    const SAT_PER_BLOCH: u128 = 100_000_000;
+
+    struct Dir(PathBuf);
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn engine_with_registry(n: u32) -> (Engine, Dir, Vec<Keystore>) {
+        static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = Dir(std::env::temp_dir().join(format!(
+            "bloch-deposit-probe-{}-{}",
+            std::process::id(),
+            DIR_SEQ.fetch_add(1, Ordering::Relaxed)
+        )));
+        let _ = std::fs::remove_dir_all(&dir.0);
+        std::fs::create_dir_all(&dir.0).expect("create the test data dir");
+
+        let keys: Vec<Keystore> = (0..n)
+            .map(|i| {
+                Keystore::generate(&dir.0.join(format!("v{i}")), i)
+                    .expect("generate a devnet keystore")
+            })
+            .collect();
+        let manifest = Manifest {
+            genesis_time_ms: now_ms(),
+            slot_ms: 1_000,
+            validators: keys
+                .iter()
+                .map(|ks| ManifestValidator {
+                    index: ks.index,
+                    stake_sat: 200_000 * SAT_PER_BLOCH,
+                    randao_commitment: RandaoChain::generate(ks.randao_seed).commitment(),
+                    pubkey: ks.pubkey.clone(),
+                    withdrawal_credentials: Vec::new(),
+                    commission_bps: 0,
+                })
+                .collect(),
+            cohort: Vec::new(),
+            carryover: None,
+            allocations: Vec::new(),
+            carryover_entries: Vec::new(),
+        };
+        let genesis_id = manifest.genesis_id();
+        let state = manifest.genesis_state();
+        let store = Store::open(&dir.0, &[0u8; 32]).expect("open the test store");
+        let (events, _rx) = mpsc::channel::<EngineEvent>();
+        let head_slot = Arc::new(AtomicU64::new(0));
+        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let net = net::Net::Devnet(
+            net::start("127.0.0.1", 0, Vec::new(), events, dir.0.clone(), head_slot.clone(), inflight)
+                .expect("bind the devnet transport on an ephemeral port"),
+        );
+        let verifier = HybridVerifier::new(manifest.pubkeys());
+        let ks0 = Keystore::load(&dir.0.join("v0")).expect("re-load validator 0");
+        let engine = Engine {
+            manifest,
+            state: StateCell::new(state),
+            tr: Transition::new(verifier.clone()),
+            tr_probe: Transition::new(ProbeVerifier),
+            verifier,
+            keys: Some(ks0),
+            blocks: BTreeMap::new(),
+            chain: vec![(0, genesis_id)],
+            canonical: BTreeSet::from([*genesis_id.as_bytes()]),
+            recent_states: VecDeque::new(),
+            pool: BTreeMap::new(),
+            att_pool: AttestationPool::new(),
+            wall_slot: 0,
+            mempool: BTreeMap::new(),
+            store,
+            net,
+            head_slot,
+            live: true,
+            needs_sync: false,
+            last_applied_ms: now_ms(),
+            booted_ms: now_ms(),
+            ws_anchor: None,
+            ws_anchor_hard: false,
+            ws_conflict_reported: false,
+            fc_covered_removals: 0,
+        };
+        (engine, dir, keys)
+    }
+
+    #[test]
+    fn where_a_deposit_added_validator_actually_stops() {
+        const N: u32 = 8;
+        let (mut engine, dir, _genesis_keys) = engine_with_registry(N);
+
+        // The newcomer. Index N — one past the last genesis index. Its
+        // keystore is real, its hybrid keypair is real, it is in no manifest.
+        let newcomer = Keystore::generate(&dir.0.join("newcomer"), N)
+            .expect("generate the newcomer's keystore");
+        let deposit = PosTransaction::Deposit {
+            pubkey: newcomer.pubkey.clone(),
+            amount_sat: bloch_pos_committee::staking::MIN_DEPOSIT_SAT,
+            randao_commitment: RandaoChain::generate(newcomer.randao_seed).commitment(),
+            withdrawal_credentials: vec![0xAA; 32],
+            commission_bps: 0,
+        };
+
+        // ─── STOP 1: the mempool door ───────────────────────────────────
+        let door = admissible(&deposit, 0);
+        println!("\n[STOP 1] admissible(Deposit) -> {door:?}");
+        assert!(
+            door.is_err(),
+            "the mempool door admitted a Deposit — this probe's premise is wrong"
+        );
+
+        // Same door via the RPC entry point every external submitter uses.
+        let rpc_verdict = engine.serve_rpc(RpcRequest::SendRawTransaction(deposit.clone()));
+        println!("[STOP 1] sendrawtransaction(Deposit) -> {rpc_verdict:?}");
+        println!("[STOP 1] mempool now holds {} txs", engine.mempool.len());
+
+        // ─── Bypass STOP 1 and keep going, to see what is behind it ─────
+        engine
+            .mempool
+            .insert(deposit.canonical_bytes(), deposit.clone());
+        println!(
+            "\n[BYPASS] injected the deposit straight into the proposer's pool ({} txs)",
+            engine.mempool.len()
+        );
+
+        let before = engine.state.validator_count();
+        // Nine epochs: deposit lands in epoch 0, ACTIVATION_DELAY_EPOCHS = 8.
+        for slot in 1..=(SLOTS_PER_EPOCH * 10) {
+            engine.wall_slot = slot;
+            engine.propose(slot);
+        }
+        let head_epoch = epoch_of(engine.state.slot());
+        let after = engine.state.validator_count();
+        println!(
+            "[REGISTRY] head slot {} (epoch {head_epoch}), {} blocks; validator_count {before} -> {after}",
+            engine.state.slot(),
+            engine.chain.len() - 1,
+        );
+        println!("[MEMPOOL ] {} txs left after production", engine.mempool.len());
+
+        if after == before {
+            println!(
+                "[STOP 2] the deposit never reached committed state — it stops at block \
+                 inclusion, before the registry"
+            );
+            return;
+        }
+
+        // ─── STOP 3: does the roster carry it? ──────────────────────────
+        let roster = engine.state.active_validators();
+        let in_roster = roster.iter().any(|v| v.index == N);
+        println!(
+            "[ROSTER  ] active set = {:?}; newcomer (index {N}) present: {in_roster}",
+            roster.iter().map(|v| v.index).collect::<Vec<_>>()
+        );
+        if !in_roster {
+            println!("[STOP 3] registered but never activated — it stops at the roster");
+            return;
+        }
+
+        // ─── STOP 4: committee membership, then the signature ───────────
+        let e = head_epoch;
+        let rolled = engine.rolled_to(e);
+        let seed = Engine::seed_for(&rolled, e);
+        let roster_e = rolled.active_validators();
+        let mut duty_slot = None;
+        let e0 = first_slot_of_epoch(e).expect("epoch start slot");
+        for s in e0..e0 + SLOTS_PER_EPOCH {
+            let c = committees::committee_for_slot(&seed, s, &roster_e);
+            if c.binary_search(&N).is_ok() {
+                duty_slot = Some((s, c));
+                break;
+            }
+        }
+        let Some((slot, committee)) = duty_slot else {
+            println!("[STOP 4] the newcomer was drawn for no slot in epoch {e}");
+            return;
+        };
+        println!("[DUTY    ] newcomer drawn for slot {slot}, committee {committee:?}");
+
+        let head = *engine.chain.last().unwrap().1.as_bytes();
+        let data = AttestationData {
+            slot,
+            head,
+            source_epoch: e.saturating_sub(1),
+            source_root: head,
+            target_epoch: e,
+            target_root: head,
+        };
+        let root = data.signing_root();
+        let signature = newcomer.sign(&root);
+        let att = Attestation { data, validator: N, signature: signature.clone() };
+
+        // The signature IS genuine — proved by the key-supplied form.
+        let by_key = engine.verifier.verify_with_key(&newcomer.pubkey, &root, &signature);
+        // The registry form is the one the whole consensus path uses.
+        let by_index = engine.verifier.verify(N, &root, &signature);
+        println!("\n[VERIFIER] verify_with_key(newcomer_pk, ..) = {by_key}   <- signature is real");
+        println!("[VERIFIER] verify(index {N}, ..)             = {by_index}   <- registry lookup");
+
+        let verdict = attestation::validate(&att, &committee, slot, &engine.verifier);
+        println!("[VALIDATE] attestation::validate(..) = {verdict:?}");
+
+        assert!(by_key, "the newcomer's own signature must verify against its own key");
+        assert!(
+            !by_index,
+            "index lookup SUCCEEDED for a post-genesis validator — the reported bug is refuted"
+        );
+        assert_eq!(
+            verdict,
+            Err(attestation::RejectReason::BadSignature),
+            "expected a genuine attestation from an in-committee validator to be rejected \
+             as BadSignature"
+        );
+        println!(
+            "\n[STOP 4] CONFIRMED: in the registry, activated, in the roster, drawn for a \
+             committee, signature genuine — and REJECTED as BadSignature because the \
+             verifier's key table is the genesis manifest.\n"
+        );
+    }
+}
