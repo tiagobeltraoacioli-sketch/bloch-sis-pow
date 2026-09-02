@@ -382,15 +382,12 @@ mod tests {
                 tx_bytes: 0,
             },
             delegator_fee_rewards: Vec::new(),
-            // Pre-flag-day shape: no unissued-principal entries, nothing
-            // written off. Written out rather than defaulted, same
-            // break-this-line reason.
-            unbacked_principals: Vec::new(),
+            // Pre-flag-day shape: nothing written off. Written out rather
+            // than defaulted, same break-this-line reason.
             written_off_sat: 0,
             // No slash has ever been applied on this chain, so no bond has a
-            // low-water mark and no write-off is indeterminate.
+            // low-water mark.
             stake_low_water: Vec::new(),
-            unbacked_indeterminate: Vec::new(),
             evm: EvmCommitment {
                 account_root: [0x14; 32],
                 receipts_root: [0x15; 32],

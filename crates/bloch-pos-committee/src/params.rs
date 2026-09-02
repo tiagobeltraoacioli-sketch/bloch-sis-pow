@@ -208,7 +208,8 @@ pub const BLOCK_BYTES_V2_ACTIVATION_EPOCH: u64 = 800;
 ///   state root is bit-identical across the gate slot itself, so nothing
 ///   changes outside the gate (rule 2).
 ///
-/// # The founder's decision — OPTION 3, WRITE-OFF AT WITHDRAWAL (2026-08-22)
+/// # The founder's decision — OPTION 3, WRITE-OFF AT WITHDRAWAL
+/// (recorded 2026-08-21; implemented 2026-08-22)
 ///
 /// The facts that forced a decision: the mainnet manifest bonds 25,000 BLOCH
 /// for each of its 64 validators — 1,600,000 BLOCH of principal that
@@ -217,41 +218,60 @@ pub const BLOCK_BYTES_V2_ACTIVATION_EPOCH: u64 = 800;
 /// `CommittedState::genesis` seeds the registry bonds with no eUTXO
 /// counterpart and no `issued_sat` contribution. All 64 withdrawal
 /// credentials are one address — the founder's carried H160, zero-padded to
-/// 32 bytes (pinned by test against the published manifest). The three
-/// candidate rules were (1) retroactive emission, (2) re-backing by burning
-/// founder coins, (3) write-off. The founder chose **(3)**: a genesis
-/// withdrawal pays only the post-genesis accrual; the never-emitted
-/// principal is written to zero and never becomes coin.
+/// 32 bytes (pinned by test against the published manifest). Of the three
+/// possible resolutions — (1) retroactive emission, (2) founder re-backing by
+/// burn, (3) write-off — the founder chose **(3), the write-off**: a genesis
+/// withdrawal pays only the post-genesis accrual, the never-emitted principal
+/// is written to zero and never becomes spendable coin, and the shipped rule
+/// is one sentence — *a bond is withdrawable only to the extent it was
+/// funded* (`CommittedState::unbacked_principal_sat` / `withdrawable_sat` in
+/// `transition.rs`).
 ///
-/// The implementation (transition.rs, 2026-08-22, this crate): the
-/// per-validator committed quantity `unbacked_sat` (`TAG_UNBACKED_PRINCIPAL`)
-/// records how much of each bond was never emitted — materialized once, at
-/// this gate's activation boundary, from genesis data plus the committed
-/// deposit history; min-folded under every slash; paid around by `Withdraw`
-/// (`payout = staked_sat - unbacked_sat`); summed into `written_off_sat`
-/// (`TAG_WRITTEN_OFF`) when written off. A validator registered by
-/// `DepositFunded` destroyed real, already-issued coins and carries
-/// `unbacked_sat = 0`, so it withdraws principal AND rewards in full.
-/// (The post-genesis accrual is clean in both classes: epoch emission
-/// advances `issued_sat` when it credits a bond, and fee rewards are backed
-/// by coins the transfer path already destroyed.)
+/// Chosen for risk surface: it needs no consensus machinery — no one-shot
+/// boundary trigger, no retroactive counter, no burn mechanism G4 does not
+/// have — and it closes no doors: if that principal is ever wanted as coin, a
+/// voluntary funded deposit after the gate buys it back. The genesis bonds
+/// keep their FULL consensus weight; only the conversion to spendable coin is
+/// limited.
+///
+/// The implementation (`transition.rs`, this crate): `unbacked_principal_sat`
+/// DERIVES, per call, how much of each bond was never emitted —
+/// `min(principal, low_water)`, where the principal comes from genesis data
+/// or the committed deposit history and the floor from `stake_low_water`
+/// (`TAG_STAKE_LOW_WATER`). `Withdraw` pays `staked_sat - unbacked_principal`
+/// and adds the remainder to `written_off_sat` (`TAG_WRITTEN_OFF`). A
+/// validator registered by `FundedDeposit` (wire tag `0x07`) destroyed real,
+/// already-issued coins and derives an unbacked principal of zero, so it
+/// withdraws principal AND rewards in full.
+///
+/// DERIVED, not materialized into a committed map, and the difference is a
+/// decision. A map has to be seeded, and the only place to seed it is the ONE
+/// boundary where `closing < gate && next >= gate`. If the founder arms an
+/// epoch the chain has already passed — see "Choosing the epoch" below, which
+/// is an ordinary operational outcome — that condition never holds again, the
+/// map stays empty, and every genesis bond withdraws its full never-emitted
+/// principal as spendable coin. All 1,600,000 BLOCH of it, silently, in the
+/// exact opposite direction from this decision. A derivation over
+/// already-committed inputs has no boundary to miss, and it adds no column to
+/// the state root.
+/// (The post-genesis accrual itself is clean in both classes and needed no
+/// repair: epoch emission advances `issued_sat` when it credits a bond, and
+/// fee rewards are backed by coins the transfer path already destroyed.)
 ///
 /// # The part of the rule that is NOT behind this gate, and why
 ///
 /// The write-off owed is `min(P, min over history of staked_sat)` — the
-/// principal, floored by the smallest the bond has ever been. `unbacked_sat`
-/// computes that running minimum correctly, but only from the moment its
-/// entry exists, and the entry is created at this gate. Everything the
-/// minimum did BEFORE the gate would be discarded, and `min(P, staked_now)`
-/// substituted for it — which CONFISCATES ALREADY-EMITTED COIN whenever a
-/// pre-gate slash burned principal and later rewards rebuilt the bond: with
-/// `P = 25,000`, a burn of 5,000 and rewards of 10,000, the correct payout is
-/// 10,000 and the substitution pays 5,000, taking the burn a second time.
+/// principal, floored by the smallest the bond has ever been. Drop the floor
+/// and the rule becomes `min(P, staked_now)`, which CONFISCATES
+/// ALREADY-EMITTED COIN whenever a slash burned principal and later rewards
+/// rebuilt the bond: MEASURED on 2026-08-23 with `P = 25,000`, a burn of
+/// 5,000 and rewards of 10,000, the correct payout is 10,000 and the
+/// unfloored rule pays 5,000 — the burn taken a second time, out of coin the
+/// operator really earned.
 ///
 /// So the RECORDER runs ungated, from the rebuild: `stake_low_water`
-/// (`TAG_STAKE_LOW_WATER`) is written by every slash, and the
-/// materialization at this gate reads it. The gate cannot record what the
-/// gate itself has to read. Shipping it ungated is safe without a second flag
+/// (`TAG_STAKE_LOW_WATER`) is written by every slash, and the derivation
+/// reads it. The gate cannot record what the gate itself has to read. Shipping it ungated is safe without a second flag
 /// day because of a MEASUREMENT and not because of a comment — 64 of 64 live
 /// validators carry no applied slash and no delegation (2026-08-22) — so the
 /// map is empty everywhere, empty components commit no leaves, and every root
@@ -262,7 +282,8 @@ pub const BLOCK_BYTES_V2_ACTIVATION_EPOCH: u64 = 800;
 /// can be born is a slash landing on a node still running the old binary.
 ///
 /// A validator slashed with no recorded floor is INDETERMINATE
-/// (`TAG_UNBACKED_INDETERMINATE`): every available default is wrong in one
+/// (`CommittedState::is_write_off_indeterminate`, a predicate over committed
+/// state rather than a stored set): every available default is wrong in one
 /// direction (the current stake or zero releases never-emitted principal as
 /// coin; `P` confiscates emitted coin), so `Withdraw` refuses. A stuck bond
 /// is recoverable by a rule written later; a wrong payout is recoverable by
@@ -280,11 +301,15 @@ pub const BLOCK_BYTES_V2_ACTIVATION_EPOCH: u64 = 800;
 /// AND THE VALUE MUST BE IN THE FUTURE. Arming this with an epoch at or below
 /// the chain's committed epoch does not "activate it immediately": every
 /// legacy `Deposit`, `Exit` and `Delegate` becomes consensus-invalid at once
-/// while the fleet is mid-rebuild, and the boundary that materializes
-/// `unbacked_sat` has already passed, so it never runs and no write-off is
-/// ever recorded. It fails in the safe direction — a bricked fleet, not a
-/// leak — but silently, and the margin must exceed the rollout's own
-/// duration, not merely the current epoch.
+/// while the fleet is mid-rebuild. It fails in the safe direction — a bricked
+/// fleet, not a leak — and the margin must exceed the rollout's own duration,
+/// not merely the current epoch.
+///
+/// The write-off itself survives that mistake, deliberately: because it is
+/// derived rather than materialized at a boundary, arming a past epoch still
+/// writes off every unfunded principal
+/// (`transition::tests::arming_the_gate_at_an_epoch_already_passed_still_writes_off`).
+/// A design where it did not was rejected for exactly this reason.
 pub const FUNDED_STAKE_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
@@ -304,12 +329,14 @@ pub const DS_STATE: [u8; 16] = *b"BLCH4:STATE\0\0\0\0\0";
 pub const DS_RANDAO: [u8; 16] = *b"BLCH4:RANDAO\0\0\0\0";
 /// Deposit message signing root (§7.1 proof of possession).
 pub const DS_DEPOSIT: [u8; 16] = *b"BLCH4:DEPOSIT\0\0\0";
-/// Funded-deposit spend authorisation (2026-08-22): the domain each input
-/// owner of a `DepositFunded` signs under. Its own tag — not `DS_SPEND`,
-/// not `DS_DEPOSIT` — because the same outputs must not be spendable into a
-/// transfer by a signature that authorised a bond, and a bond authorisation
-/// must not double as a proof-of-possession; one signature, one meaning.
-pub const DS_FUND: [u8; 16] = *b"BLCH4:FUND\0\0\0\0\0\0";
+// NO `DS_FUND` (removed 2026-08-23). A rejected funded-deposit wire shape gave
+// the input owners a domain of their own; the shape that ships reuses
+// `DS_SPEND` over `PosTransaction::spend_signing_root`, whose funded arm
+// covers the whole registration payload INCLUDING the proof of possession, so
+// a bond authorisation is already unusable as a plain transfer and vice versa.
+// A domain tag with no rule behind it is worse than no tag: the next author to
+// need one reaches for it and inherits an empty promise. If a separate domain
+// is ever wanted, define it with its rule in the same change.
 /// The signing root an eUTXO spend authorisation covers: the domain under
 /// which an output's owner authorises *this* transfer and no other.
 ///

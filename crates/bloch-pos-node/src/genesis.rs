@@ -1920,6 +1920,18 @@ mod blp02_hybrid_suite {
         let bonded: u128 = m.validators.iter().map(|v| v.stake_sat).sum();
         for v in &m.validators {
             assert_eq!(v.stake_sat, 25_000 * t::SAT_PER_BLOCH, "one launch bond size");
+            // The write-off constant the founder's 2026-08-21 decision is
+            // implemented with (`transition::GENESIS_UNFUNDED_PRINCIPAL_SAT`,
+            // subtracted by `unbacked_principal_sat` for every registration
+            // that has no deposit history) must equal the manifest's actual
+            // per-validator bond. If the artefact and the constant ever
+            // disagree, a genesis withdrawal would write off the wrong
+            // amount — stop and re-derive before touching the flag day.
+            assert_eq!(
+                v.stake_sat,
+                bloch_pos_committee::transition::GENESIS_UNFUNDED_PRINCIPAL_SAT,
+                "the write-off constant must match the manifest bond it writes off"
+            );
         }
         assert_eq!(bonded, 1_600_000 * t::SAT_PER_BLOCH, "1.6M BLOCH of principal");
 

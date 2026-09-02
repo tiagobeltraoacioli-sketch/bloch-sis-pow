@@ -92,10 +92,19 @@ fn run_to_completion(args: &[&str]) -> String {
 }
 
 fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let p = l.local_addr().expect("addr").port();
-    drop(l);
-    p
+    // The node's RPC port is derived as `listen + 1000`, and macOS hands
+    // ephemeral ports all the way up to 65535 — a port above 64535 overflows
+    // the u16 addition and panics the harness before any node runs. Skip the
+    // top of the range; the OS allocator walks it sequentially, so this bit
+    // in practice (2026-08-22).
+    loop {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let p = l.local_addr().expect("addr").port();
+        drop(l);
+        if p <= u16::MAX - 1000 {
+            return p;
+        }
+    }
 }
 
 /// `slot -> (block id, post-state root)`, parsed out of a node's own log.
