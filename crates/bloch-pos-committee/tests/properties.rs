@@ -427,15 +427,20 @@ fn forkchoice_queries_do_not_mutate_the_store() {
 #[test]
 fn signing_root_and_validate_are_pure_and_field_sensitive() {
     struct AlwaysValid;
-    impl SignatureVerifier for AlwaysValid {
-        fn verify(&self, _v: u32, _r: &[u8; 32], _s: &[u8]) -> bool {
-            true
+    /// Every index resolves to the same placeholder key. These tests are about
+    /// window, dedup, membership and ordering — not about key binding — and
+    /// their verifier doubles ignore the key bytes. The cases that DO care
+    /// about resolution use `NoKeys` / a real registry instead.
+    struct AnyKey;
+    impl crate::attestation::KeyLookup for AnyKey {
+        fn pubkey(&self, _v: u32) -> Option<&[u8]> {
+            Some(b"placeholder-key")
         }
-        /// Mirrors this mock's `verify`: a test double that accepted
-        /// spends more easily than attestations would hide the very
-        /// forgery the spend path must refuse.
-        fn verify_with_key(&self, _pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
-            self.verify(0, root, sig)
+    }
+
+    impl SignatureVerifier for AlwaysValid {
+        fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            true
         }
     }
     let mut rng = Rng::new(0xB10C_000A);
@@ -456,8 +461,8 @@ fn signing_root_and_validate_are_pure_and_field_sensitive() {
 
         let att = Attestation { data: a, validator: 3, signature: vec![0u8; 8] };
         let committee = vec![1u32, 3, 5];
-        let r1 = attestation::validate(&att, &committee, a.slot, &AlwaysValid);
-        let r2 = attestation::validate(&att, &committee, a.slot, &AlwaysValid);
+        let r1 = attestation::validate(&att, &committee, a.slot, &AlwaysValid, &AnyKey);
+        let r2 = attestation::validate(&att, &committee, a.slot, &AlwaysValid, &AnyKey);
         assert_eq!(r1, r2, "validate is not repeatable");
     }
 }

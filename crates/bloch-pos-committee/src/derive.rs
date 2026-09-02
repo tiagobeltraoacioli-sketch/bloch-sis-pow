@@ -497,7 +497,18 @@ pub fn validate_included_attestation(
     // `transition::compute_post_state` step 8 makes, or the producer assembles
     // blocks the network refuses (`TransitionError::Attestation`).
     let committee = crate::committees::committee_for_slot(&seed, att.data.slot, &active);
-    validate_attestation(att, &committee, block_slot, verifier)
+    // Keys from the SAME parent registry that produced `active` and therefore
+    // `committee`. This is the producer's pre-flight filter, and its whole job
+    // is to answer exactly as `transition::compute_post_state` step 8 will —
+    // which resolves keys from the block's pre-state. Any other key source
+    // here and the producer assembles blocks the network then refuses.
+    validate_attestation(
+        att,
+        &committee,
+        block_slot,
+        verifier,
+        &parent.chain.registry,
+    )
 }
 
 /// The child block's committed consensus state: the parent's components with

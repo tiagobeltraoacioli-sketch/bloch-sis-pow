@@ -276,6 +276,13 @@ pub enum ProposalReject {
     NotScheduledProposer,
     /// Hybrid signature failed (either half).
     BadSignature,
+    /// The block's pre-state registry has no key registered for the header's
+    /// `proposer_index`, so the proposer signature cannot be checked.
+    ///
+    /// Separate from `BadSignature` because the causes are unrelated: this
+    /// one says the registry does not know the index, which is a statement
+    /// about state, not about the signature bytes.
+    UnknownProposer,
     /// `randao_reveal` is not the preimage of the proposer's current
     /// commitment.
     BadRandaoReveal,

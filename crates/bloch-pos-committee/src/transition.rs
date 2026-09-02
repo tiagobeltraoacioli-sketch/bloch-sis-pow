@@ -142,6 +142,7 @@ use crate::params::SLOTS_PER_EPOCH;
 use crate::rewards::{self, StakeAccount};
 use crate::sample::Validator;
 use crate::schedule;
+use crate::attestation::KeyLookup as _;
 use crate::slashing;
 use crate::staking::{self, QueuedDeposit};
 use crate::fee_market;
@@ -1057,6 +1058,10 @@ pub struct CommittedState {
     /// The validator registry, keyed by index. `BTreeMap` everywhere in this
     /// struct: iteration order must be a function of the data, never of a
     /// hasher seed or insertion history (rule 2).
+    ///
+    /// This is also the **authoritative key store** for consensus signature
+    /// checks — see the `impl KeyLookup` below and
+    /// [`crate::attestation::KeyLookup`] for which state answers where.
     validators: BTreeMap<u32, ValidatorRecord>,
     /// RANDAO chain position per validator. The chain *head* lives in the
     /// registry record (`randao_commitment`); this is how far down it is.
@@ -1226,6 +1231,35 @@ pub struct CommittedState {
 
     /// number in this state is "the supply".
     eutxos: EutxoSet,
+}
+
+/// The committed registry answering "what key is validator `i` registered
+/// under?", for whichever `CommittedState` the caller chose.
+///
+/// Implemented on the map rather than on `CommittedState` deliberately: the
+/// borrow a caller needs is of `self.validators` alone, so that a transition
+/// step can hold this immutable borrow while mutating *other* fields of the
+/// same state (participation, pending votes, the slashing machine). An impl on
+/// the whole state would borrow all of it and force a clone of the key — 3,745
+/// bytes per attestation, on the hot path.
+impl crate::attestation::KeyLookup for BTreeMap<u32, ValidatorRecord> {
+    fn pubkey(&self, validator: u32) -> Option<&[u8]> {
+        self.get(&validator).map(|r| r.pubkey.as_slice())
+    }
+}
+
+/// The same registry reached through the whole state, for callers that hold an
+/// immutable `CommittedState` (the node's gossip path holds an
+/// `Arc<CommittedState>` from `rolled_to`) and therefore have no borrow
+/// conflict to avoid.
+///
+/// Both impls exist on purpose. Inside the transition the map form is required:
+/// a step must hold this borrow while mutating participation and pending votes
+/// on the same state, and an impl over the whole state would borrow all of it.
+impl crate::attestation::KeyLookup for CommittedState {
+    fn pubkey(&self, validator: u32) -> Option<&[u8]> {
+        self.validators.pubkey(validator)
+    }
 }
 
 /// The committed eUTXO set, and the Merkle subtree it contributes to the
@@ -2584,6 +2618,20 @@ impl CommittedState {
                     first: first.clone(),
                     second: second.clone(),
                 };
+                // `&self.validators` beside `&mut self.slashing`: disjoint
+                // fields, so borrowck allows it, and the offender's key comes
+                // from the same pre-state registry that everything else in
+                // this block is judged against.
+                //
+                // Slashing is the site where the old index table failed most
+                // quietly. A deposit-added validator was not merely unable to
+                // vote — it was UNSLASHABLE: evidence against it hit
+                // `pubkeys.get(index) == None`, returned false, and was
+                // rejected as `BadSignature`. It could equivocate for free.
+                // A record is never removed from the registry (exit and
+                // slashing set fields, they do not delete), so evidence
+                // against an exited or already-slashed validator still
+                // resolves its key here.
                 self.slashing.process(
                     &pair,
                     self.epoch,
@@ -2591,6 +2639,7 @@ impl CommittedState {
                     total_active_sat,
                     including_proposer,
                     verifier,
+                    &self.validators,
                 )
             }
             SlashingEvidence::ProposerEquivocation { first, second } => {
@@ -2602,6 +2651,7 @@ impl CommittedState {
                     total_active_sat,
                     including_proposer,
                     verifier,
+                    &self.validators,
                 )
             }
         }
@@ -3358,8 +3408,28 @@ impl<V: SignatureVerifier> Transition<V> {
 
         // 7. The proposer's signature — one hybrid verify, after every cheap
         //    check and before the N attestation verifies.
-        if !self.verifier.verify(
-            header.proposer_index,
+        //
+        //    The key comes from `st.validators` — the registry of the BLOCK'S
+        //    PRE-STATE, which is the parent's post-state. Not this node's
+        //    head, not `rolled_to`, not a table built at boot from the genesis
+        //    manifest (which is what this used to read, and why a
+        //    deposit-added validator could not propose). That choice is what
+        //    keeps `apply_block` a pure function of (parent state, block):
+        //    every node judging this block resolves the same bytes, because
+        //    they all hold the same parent state. Deriving a consensus verdict
+        //    from node-local state instead is the 2026-08-08 `expected_bits`
+        //    fork, and this is the same shape of decision.
+        //
+        //    Note the proposer signing root covers `canonical_serialize()` of
+        //    the header, which includes `proposer_index` — so a proposer
+        //    signature is bound to its index and cannot be replayed under
+        //    another. (Attestation signing roots are NOT so bound; see the
+        //    note in step 8.)
+        let Some(proposer_key) = st.validators.pubkey(header.proposer_index) else {
+            return Err(TransitionError::Proposal(ProposalReject::UnknownProposer));
+        };
+        if !self.verifier.verify_with_key(
+            proposer_key,
             &header.proposal_signing_root(),
             &envelope.proposer_sig,
         ) {
@@ -3371,13 +3441,32 @@ impl<V: SignatureVerifier> Transition<V> {
         //    retained state (the 2-epoch mix window), so only they are
         //    admissible; membership is checked before each signature inside
         //    attestation::validate (its DoS ordering, not re-decided here).
+        //
+        //    Keys come from `st.validators`, the same pre-state registry that
+        //    produced `roster` and therefore `committee`. Membership and key
+        //    MUST come from one state: an attestation is authorised by the
+        //    pair (this index is in the committee, this key is registered at
+        //    that index), and splitting the pair across two states is how a
+        //    seat drawn from one view gets filled by a key from another.
+        //
+        //    This matters more here than for the proposer, because
+        //    `AttestationData::signing_root()` does NOT cover the validator
+        //    index — it covers only the vote (slot, head, source, target). The
+        //    binding of vote to voter is done entirely by which key this
+        //    lookup returns. It is sound because the registry makes index→key
+        //    injective and permanent (indices are never reused, pubkeys never
+        //    mutated, records never removed, and the Deposit handler rejects a
+        //    pubkey already registered), so no two indices can ever hold the
+        //    same key and no index can ever change hands.
         for (i, att) in attestations.iter().enumerate() {
             let reject = TransitionError::Attestation(i as u32);
             if crate::epoch_of(att.data.slot) != st.epoch {
                 return Err(reject);
             }
             let committee = committees::committee_for_slot(&seed, att.data.slot, &roster);
-            if attestation::validate(att, &committee, header.slot, &self.verifier).is_err() {
+            if attestation::validate(att, &committee, header.slot, &self.verifier, &st.validators)
+                .is_err()
+            {
                 return Err(reject);
             }
             // A validated, included attestation is participation — the fact
@@ -3763,9 +3852,6 @@ mod tests {
     /// links — the same reasoning as attestation.rs).
     struct OkVerifier;
     impl SignatureVerifier for OkVerifier {
-        fn verify(&self, _v: u32, _root: &[u8; 32], _sig: &[u8]) -> bool {
-            true
-        }
         fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
             true
         }
@@ -3805,9 +3891,6 @@ mod tests {
 
     struct ToyVerifier;
     impl SignatureVerifier for ToyVerifier {
-        fn verify(&self, _v: u32, _root: &[u8; 32], _sig: &[u8]) -> bool {
-            true
-        }
         fn verify_with_key(&self, pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
             sig == toy_sign(pk, root).as_slice()
         }
@@ -4037,9 +4120,6 @@ mod tests {
     /// bad while every other signature in the block still passes.
     struct MarkerVerifier;
     impl SignatureVerifier for MarkerVerifier {
-        fn verify(&self, _v: u32, _root: &[u8; 32], sig: &[u8]) -> bool {
-            sig != b"forged"
-        }
         fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], sig: &[u8]) -> bool {
             sig != b"forged"
         }
@@ -4485,19 +4565,44 @@ mod tests {
             attestation_root: crate::derive::attestation_root(atts),
             coherence_root: pre.coherence_root(),
         };
-        let probe = ProposalEnvelope { header, proposer_sig: vec![0u8; 8] };
+        // The proposer signature is now SIGNED, not stubbed with eight zero
+        // bytes. It has to be: the proposer check resolves the proposer's key
+        // from the registry and calls `verify_with_key`, so a verifier double
+        // that binds signature→key (`ToyVerifier`) rejects a stub.
+        //
+        // This is strictly more coverage than before, not a workaround. Under
+        // the old index-keyed `verify`, `ToyVerifier` answered `true` for any
+        // proposer signature whatsoever, so every block these tests built
+        // carried a proposer signature nothing ever checked. Signing it here
+        // means the builder now exercises the real binding: sign with the key
+        // the PARENT STATE has registered for the drawn proposer, over that
+        // header's own signing root.
+        //
+        // Signed twice because the signing root covers `state_root`: the probe
+        // header (root still zero) and the final header are different messages.
+        let sign_for = |h: &BlockHeaderV4| -> Vec<u8> {
+            match crate::attestation::KeyLookup::pubkey(pre, p) {
+                Some(pk) => toy_sign(pk, &h.proposal_signing_root()),
+                // A fixture whose registry has no such index: leave the stub
+                // and let the transition reject it, which is the honest
+                // outcome rather than a silently-passing block.
+                None => vec![0u8; 8],
+            }
+        };
+        let probe = ProposalEnvelope { header, proposer_sig: sign_for(&header) };
         let post = t
             .compute_post_state(pre, &probe, atts, txs)
             .expect("builder produced an untransitionable block");
         header.state_root = post.state_root();
-        ProposalEnvelope { header, proposer_sig: vec![0u8; 8] }
+        let proposer_sig = sign_for(&header);
+        ProposalEnvelope { header, proposer_sig }
     }
 
     /// One attestation from `v` for `slot`, voting `target_root` as both head
     /// and target, sourcing the state's current justified checkpoint.
     fn attest(st: &CommittedState, v: u32, slot: u64, target_root: [u8; 32]) -> Attestation {
         let fin = st.finality_view();
-        Attestation {
+        let att = Attestation {
             data: AttestationData {
                 slot,
                 head: target_root,
@@ -4507,8 +4612,18 @@ mod tests {
                 target_root,
             },
             validator: v,
-            signature: vec![0u8; 8],
-        }
+            // Signed with the key the registry holds for `v`. Under the old
+            // index-keyed verify, `ToyVerifier` accepted any attestation
+            // signature at all, so these fixtures asserted on attestations
+            // nothing verified. Now the signature has to be real, which is
+            // more coverage, not less.
+            signature: Vec::new(),
+        };
+        let sig = match crate::attestation::KeyLookup::pubkey(st, v) {
+            Some(pk) => toy_sign(pk, &att.data.signing_root()),
+            None => vec![0u8; 8],
+        };
+        Attestation { signature: sig, ..att }
     }
 
     /// Every validator's attestation for its own partition slot in the
@@ -4803,8 +4918,24 @@ mod tests {
         // is to hold everything except the ordering constant.
         let mut b3_rev = b3.clone();
         b3_rev.header.attestation_root = crate::derive::attestation_root(&reversed);
+        // Re-stamping the header means RE-SIGNING it. The proposer signature
+        // covers `canonical_serialize()` of the whole header, so mutating
+        // `attestation_root` (and then `state_root`) invalidates the
+        // signature carried over from `b3`. Under the old index-keyed verify
+        // this went unnoticed, because the double accepted ANY proposer
+        // signature; now the key comes from the registry and the signature
+        // is really checked.
+        let resign_header = |env: &mut ProposalEnvelope, st: &CommittedState| {
+            if let Some(pk) =
+                crate::attestation::KeyLookup::pubkey(st, env.header.proposer_index)
+            {
+                env.proposer_sig = toy_sign(pk, &env.header.proposal_signing_root());
+            }
+        };
+        resign_header(&mut b3_rev, &r2);
         b3_rev.header.state_root =
             t.compute_post_state(&r2, &b3_rev, &reversed, &[]).unwrap().state_root();
+        resign_header(&mut b3_rev, &r2);
         let final_c = t.apply_block(&r2, &b3_rev, &reversed, &[]).unwrap();
         assert_eq!(
             final_a.state_root(),
@@ -6172,7 +6303,14 @@ mod tests {
             attestation_root: crate::derive::attestation_root(&[]),
             coherence_root: pre.coherence_root(),
         };
-        ProposalEnvelope { header, proposer_sig: vec![0u8; 8] }
+        // Signed, for the same reason `build_block` signs: the proposer check
+        // resolves the key from the registry, so a stub no longer passes a
+        // key-binding verifier double.
+        let proposer_sig = match crate::attestation::KeyLookup::pubkey(pre, p) {
+            Some(pk) => toy_sign(pk, &header.proposal_signing_root()),
+            None => vec![0u8; 8],
+        };
+        ProposalEnvelope { header, proposer_sig }
     }
 
     #[test]
@@ -6727,8 +6865,22 @@ mod tests {
         // committed state, not that two different blocks agree.
         let mut b3_rev = b3.clone();
         b3_rev.header.attestation_root = crate::derive::attestation_root(&reversed);
+        // Re-stamping the header means RE-SIGNING it: the proposer signature
+        // covers the whole header, so mutating `attestation_root` (and then
+        // `state_root`) invalidates the signature carried over from `b3`.
+        // The old index-keyed verify accepted any proposer signature, so this
+        // block was never actually signature-checked.
+        let resign_header = |env: &mut ProposalEnvelope, st: &CommittedState| {
+            if let Some(pk) =
+                crate::attestation::KeyLookup::pubkey(st, env.header.proposer_index)
+            {
+                env.proposer_sig = toy_sign(pk, &env.header.proposal_signing_root());
+            }
+        };
+        resign_header(&mut b3_rev, &r2);
         b3_rev.header.state_root =
             t.compute_post_state(&r2, &b3_rev, &reversed, &[]).unwrap().state_root();
+        resign_header(&mut b3_rev, &r2);
         let b = t.apply_block(&r2, &b3_rev, &reversed, &[]).unwrap();
 
         // Mid-epoch, with every extended component live — not after a
