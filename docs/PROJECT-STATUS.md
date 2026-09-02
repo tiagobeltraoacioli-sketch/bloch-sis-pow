@@ -39,9 +39,30 @@ build products on the open protocol; Postern is one builder among many.
 > The live chain is proof of stake. There is no hashrate, so there is no 51%
 > attack; there is no premine on a cliff, because Genesis-4's supply was issued
 > at height 0. The risks that do exist — one operator running all 64
-> validators, and 56,046,829,380 of the 57,146,400,000 BLOCH issued at genesis
-> sitting at a single script hash — are stated in the README and in
-> `SECURITY.md`, once each, where a reader will find them.
+> validators, and a supply that opened almost entirely on one script hash — are
+> stated in the README and in `SECURITY.md`, once each, where a reader will
+> find them.
+>
+> This block used to end, in the present tense, with the claim that
+> 56,046,829,380 of the 57,146,400,000 BLOCH sat at a single script hash. That
+> is right at genesis and was wrong as a statement of current holdings from
+> roughly epoch 1050 onward: the address has since moved
+> 18,128,356,145.07452011 BLCH, on chain, to fourteen others — **18.13% of the
+> cap**, which the founder states were private sales to third parties. That
+> attribution is declared, not measured: the chain shows the movement in full
+> and cannot attribute control of any destination address to anyone. The
+> address now holds 37,918,473,235.79 BLCH (37.92% of the cap, 66.35% of
+> issued supply). Current holdings are measured, dated and re-derivable in
+> [`docs/LIVE-SUPPLY.md`](./LIVE-SUPPLY.md), and
+> `tests/published_supply_claims.rs` fails when that measurement goes stale.
+>
+> Two further corrections belong with it, both in that file: the constant
+> `FOUNDER_TOTAL_BLOCH` understates the founder's *genesis* position by
+> 29,000,000,000 BLCH — it omits four of the five allocation buckets, which all
+> land on the same script hash — so every "26.89% / 27.04% of supply" figure in
+> this repository and on the site is wrong by construction rather than stale;
+> and no coin sold or held was ever locked on chain, because `unlock_epoch` is
+> 0 in all five buckets and no node reads it (commit `fa4ad9be`).
 
 ## ✅ Built + verified
 

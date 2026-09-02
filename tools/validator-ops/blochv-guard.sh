@@ -6,8 +6,8 @@
 #
 # ── Why this is the only tool here that can cost you money ──────────────────
 #
-# Every other failure in this toolkit costs you downtime. This one costs you
-# stake, permanently, with no appeal:
+# Every other failure in this toolkit costs you downtime. This one is the one
+# that is DESIGNED to cost you stake, permanently, with no appeal:
 #
 #   * A slashed validator is removed from every roster immediately and can
 #     NEVER rejoin with that key.
@@ -19,6 +19,18 @@
 #     refuses rather than warns.
 #   * Self-reporting does not help: the whistleblower's 1/32 means reporting
 #     your own offence nets you -31/32.
+#
+# CORRECTION 2026-09-01 — read this before you calibrate your risk. Every
+# penalty above is the DESIGNED schedule and NONE of it can be applied on the
+# chain as it runs today. Slashing evidence rides on wire tag 0x05 and the
+# node's decoder refuses that tag unconditionally on every ingress path, so
+# evidence can never reach a verifier; nothing constructs the transaction
+# outside tests; and no activation constant exists. At epoch 1726 all 64
+# validators read `slashed: false`. Equivocation IS detected and logged; it is
+# never prosecuted. This script still refuses rather than warns, and should: the
+# evidence is permanent, enforcement is a flag day away, and a key that has
+# equivocated is a key to retire regardless. See docs/VALIDATOR-RUNBOOK.md
+# §14.1.
 #
 # The protocol cannot distinguish a high-availability mistake from an attack.
 # There is no failover design that is safe here. One key, one machine, ever.

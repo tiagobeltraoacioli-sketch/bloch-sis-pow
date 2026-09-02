@@ -48,8 +48,18 @@
 //! statement in proof of stake; attested stake is.
 //!
 //! Two properties come from starting the walk at the justified checkpoint
-//! rather than at genesis: finalised history can never be reorganised out, and
-//! the walk is bounded by the unfinalised suffix instead of the whole chain.
+//! rather than at genesis: the walk never proposes a head that conflicts with
+//! the justified checkpoint it starts from, and it is bounded by the
+//! unfinalised suffix instead of the whole chain.
+//!
+//! This sentence used to read "finalised history can never be reorganised
+//! out". CORRECTED 2026-09-01: that is false, and it is false in normal
+//! operation, not under attack. The walk starts at the *justified* root, and
+//! the state committed there finalises two epochs below the head — so the
+//! deepest cut this algorithm may legitimately propose is itself a finality
+//! rewind. It has been measured: finalized epoch 6 -> 4 -> 2 -> 0 in three
+//! in-rules cuts. `finalized` is not a latch, and `rpc.rs`'s `Finality` doc
+//! carries the retraction an integrator needs.
 //!
 //! The store is **rebuilt from scratch on every head computation** rather than
 //! carried as mutable node state. That is the §5.5 posture applied where it is

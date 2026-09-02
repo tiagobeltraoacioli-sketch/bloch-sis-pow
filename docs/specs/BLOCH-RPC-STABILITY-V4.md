@@ -284,7 +284,9 @@ Refused: `gettransaction` (`-32005`), `getnewaddress` (`-32006`).
 
 ### 2.2 Versioning
 
-`getcapabilities.rpc_surface_version` — currently **`4.1.0`**.
+`getcapabilities.rpc_surface_version` — currently **`4.2.0`** (4.1.0 → 4.2.0 on
+2026-09-01 added `settlement.slashing_enforced` and
+`settlement.finalized_is_a_latch`; nothing already read moved).
 
 | Bump | Means |
 |---|---|
@@ -317,10 +319,23 @@ question on this chain.
   node no longer stores. Absence is not evidence.
 - **The public proxy's allowlist** (§0). It is a separate repository with a
   separate release cycle and it is not versioned by `rpc_surface_version`.
-- **Depth.** There is no confirmation count and none is coming. Settlement is
-  `finalized: true` — a finalised checkpoint cannot revert unless at least one
-  third of the total stake is slashed, an attributable on-chain cost. Waiting N
-  further blocks past finalisation buys nothing, and nothing else substitutes.
+- **Depth.** There is no confirmation count and none is coming, and no depth is
+  provably safe. This bullet used to read: "Settlement is `finalized: true` — a
+  finalised checkpoint cannot revert unless at least one third of the total
+  stake is slashed, an attributable on-chain cost." **Retracted 2026-09-01: no
+  stake on this network can be slashed.** Slashing evidence carries wire tag
+  `0x05`, and `PosTransaction::from_canonical_bytes` refuses that tag
+  unconditionally — the encoder folds the nested messages in as signing roots,
+  so the envelopes are unrecoverable by construction — and that decoder is the
+  only one on the block-body, gossip and `sendrawtransaction` paths alike.
+  Nothing constructs the transaction outside tests, and there is no activation
+  constant to arm. `getcapabilities.settlement.slashing_enforced` reports
+  `false` for exactly this reason. `finalized: true` is still the strongest
+  signal this chain publishes and still cannot be replaced by waiting N further
+  blocks — but it is not a settlement guarantee, and it is not a latch: it has
+  been measured descending across reorgs that break no rule. See the retraction
+  on `Finality` in `rpc.rs` and the note in
+  `docs/integration/BLOCH-GENESIS4-EXCHANGE-INTEGRATION.md` §4.
 
 ### 2.4 Asking instead of probing
 

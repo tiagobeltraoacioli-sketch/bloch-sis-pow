@@ -26,9 +26,20 @@ re-derive it. Report a Genesis-3 finding if it changes what that carried
 ledger should have been; a finding that only affects mining or block
 production on a chain nobody is producing on has no live impact.
 
-The live network is **unaudited**, and stake is heavily concentrated: the
-founder holds roughly 94% of the carried-over balance and it is stakeable, so
-a naive Nakamoto coefficient is 1. The genesis validator cohort was allocated
+The live network is **unaudited**, and stake is heavily concentrated: at
+genesis the founder held 93.94% of the carried-over balance and 98.08% of all
+issued supply (56.05% of the 100-billion cap), and it is stakeable, so a naive
+Nakamoto coefficient is 1. As of the dated measurement in
+[`docs/LIVE-SUPPLY.md`](./docs/LIVE-SUPPLY.md) that address holds 66.35% of
+issued supply (37.92% of the cap). The difference, 18,128,356,145 BLCH, moved
+on chain to fourteen addresses; the founder states these were private sales to
+third parties. **That attribution is declared, not measured** — the chain
+cannot attribute control of any address to anyone, and if the declaration is
+wrong the position is undiminished at 98.26%. Nothing sold or held is locked on
+chain: `unlock_epoch` is 0 in all five allocation buckets, no node reads it,
+and all five have been spent. Quote no percentage from this paragraph without
+its denominator; the three in circulation describe different things and are
+tabulated in `docs/LIVE-SUPPLY.md`. The genesis validator cohort was allocated
 by the founder and sits on five servers. Running a live mainnet is a
 designation, not a security claim, and no security property is claimed.
 **No external security audit has been contracted to date**; if any other page
@@ -79,9 +90,12 @@ will not pursue reporters acting in good faith.
 
 ## Out of scope
 
-- The **known** stake-concentration exposure — the founder holding roughly 94%
-  of a stakeable supply, and having allocated the genesis validator cohort, is
-  a documented, disclosed gap, not a bug (a concrete exploit beyond it — e.g.
+- The **known** stake-concentration exposure — a stakeable supply that opened
+  98.08% on one script hash (66.35% there as of the measurement in
+  [`docs/LIVE-SUPPLY.md`](./docs/LIVE-SUPPLY.md), the rest moved on chain to
+  addresses whose control the chain cannot attribute), and the founder having
+  allocated the genesis validator cohort, is a documented, disclosed gap, not a
+  bug (a concrete exploit beyond it — e.g.
   a way to justify or finalise without an honest two-thirds, or to attest
   without being in the committee — is in scope).
 - The retired Genesis-3 chain's low-hashrate exposure. It was real while the

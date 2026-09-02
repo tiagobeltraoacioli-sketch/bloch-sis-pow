@@ -758,7 +758,7 @@ pub struct Method {
 /// `getcapabilities` reports this, which is the whole point of it: a client
 /// asks one question at connect time instead of probing fourteen names and
 /// inferring the answer from which ones return -32601.
-pub const RPC_SURFACE_VERSION: &str = "4.1.0";
+pub const RPC_SURFACE_VERSION: &str = "4.2.0";
 
 /// Every method name this build answers. Sorted, unique, and asserted to be
 /// exactly the set the dispatcher accepts.
@@ -1525,13 +1525,29 @@ pub fn capabilities_json(
             Json::obj(vec![
                 ("model", Json::s("casper_finality")),
                 ("confirmations", Json::Null),
+                // ADDED 2026-09-01, and the reason this object exists at all:
+                // a client branching on `model` alone would read
+                // "casper_finality" and assume Casper's cryptoeconomic
+                // guarantee. It does not hold here. This flag is the
+                // machine-readable half of the retraction on `Finality` — a
+                // client can branch on it instead of parsing prose.
+                ("slashing_enforced", Json::Bool(false)),
+                ("finalized_is_a_latch", Json::Bool(false)),
                 (
                     "rule",
                     Json::s(
-                        "credit when the block carrying the output reports \
-                         `finalized: true`; depth is not security under proof of \
+                        "read `finalized`; depth is not security under proof of \
                          stake and no number of further blocks substitutes for \
-                         finalisation",
+                         finalisation. `finalized: true` is NOT a settlement \
+                         guarantee on this network: no stake can be slashed \
+                         (evidence wire tag 0x05 is undecodable on every ingress \
+                         path, so the penalty backing Casper finality cannot be \
+                         applied), and `finalized` is not a latch — it has been \
+                         measured descending across legal reorgs. Until this text \
+                         changes: credit at finalized + 3 epochs, with two \
+                         independently operated nodes agreeing on the same \
+                         finalized root AND epoch, re-checked immediately before \
+                         release. No depth is provably safe today.",
                     ),
                 ),
             ]),
@@ -1591,9 +1607,11 @@ pub fn chain_info_json(
         ("block_id", Json::hex(head.as_bytes())),
         ("slot", Json::u(slot)),
         ("height", Json::u(height)),
-        // The settled line, next to the head. See `Finality`: this is what
+        // The finalised line, next to the head. See `Finality`: this is what
         // replaces a confirmation count, and an integrator reading only
-        // `height` is reading the number that is *not* the guarantee.
+        // `height` is reading a number that is weaker still. "Replaces" is not
+        // "guarantees" — the retraction on `Finality` bounds what this line
+        // buys, and it is less than an earlier revision of this file promised.
         ("finalized_height", finalized_height.map_or(Json::Null, Json::u)),
         ("epoch", Json::u(epoch_of(slot))),
         ("slot_in_epoch", Json::u(slot % SLOTS_PER_EPOCH)),
@@ -1642,21 +1660,90 @@ pub fn chain_info_json(
 
 /// How a block stands relative to this node's own checkpoints.
 ///
-/// # This is the field an exchange credits a deposit on
+/// # This is the field an exchange reads — and what it does NOT buy
 ///
 /// The integration question was "how many confirmations should we require, and
 /// what does the guarantee rest on". Under PoS there is no answer in that
 /// currency: depth is not security (R1), and a chain with no difficulty cannot
-/// price a reorg in work. The guarantee rests on **Casper justification and
-/// finalisation** — a finalised checkpoint cannot be reverted unless at least
-/// one third of the total stake is slashed, which is a bonded, attributable,
-/// on-chain cost rather than a probabilistic one.
+/// price a reorg in work. [`Finality::Finalized`] is the right field to read.
+/// What it rests on is far narrower than an earlier revision of this comment
+/// claimed, and the difference is the one that decides customer money.
 ///
-/// So the honest replacement for "N confirmations" is exactly one boolean:
-/// [`Finality::Finalized`]. A deposit in a finalised block is settled under the
-/// protocol's strongest guarantee; a deposit in a merely justified or canonical
-/// block can still be reorganised out. Nothing is gained by waiting a further
-/// number of blocks past finalisation, and nothing else substitutes for it.
+/// ## RETRACTION (2026-09-01): finality here is NOT backed by a slashing cost
+///
+/// This comment used to say that "a finalised checkpoint cannot be reverted
+/// unless at least one third of the total stake is slashed, which is a bonded,
+/// attributable, on-chain cost rather than a probabilistic one", and
+/// [`Finality::Finalized`] used to be annotated "Credit here". That is
+/// Casper's guarantee on paper. It is not this binary's. **No stake on
+/// Genesis-4 can be slashed at all**, for four independent reasons, any one of
+/// which is sufficient on its own:
+///
+/// 1. **Evidence cannot be decoded.**
+///    `PosTransaction::from_canonical_bytes` returns
+///    `TxDecodeError::EvidenceNotDecodable` for wire tag `0x05`
+///    unconditionally, with no gate. The encoder folds the nested messages in
+///    as the signing roots they were signed over — hashes — so the envelopes
+///    are unrecoverable by construction, not by omission.
+/// 2. **That decoder is the only one on every ingress path**: block body
+///    (`engine::body_transactions`), gossip (`p2p.rs`, `net.rs`) and
+///    `sendrawtransaction` (this file). A block carrying evidence is therefore
+///    rejected by every peer, and a proposer that included it would produce an
+///    unimportable block.
+/// 3. **Nothing constructs the transaction outside tests.** The node captures
+///    an equivocating pair and prints it; the log line itself reads "slashing
+///    pipeline NOT wired — evidence is logged, not prosecuted".
+/// 4. **There is no activation constant to arm.**
+///    `SLASHING_EVIDENCE_ACTIVATION_EPOCH` does not exist in this repository.
+///    It is not set to `u64::MAX` — it is absent.
+///
+/// Confirmed against the live chain at epoch 1726, both archivals agreeing on
+/// the same head and root: 64 validators, 64 active, every record
+/// `"slashed": false` and `"exit_epoch": null`. Equivocation on this fleet is
+/// *detected* — the node captures each pair and logs it — and none of it has
+/// ever been prosecuted. (A figure of 48 double-signing validators has been
+/// reported internally; no RPC exposes equivocation history, so this note does
+/// not re-derive it, and nothing above rests on the number.) `slashing.rs` is
+/// complete; nothing can reach it.
+///
+/// So Genesis-4 finality today is **economic by intent and cryptographic by
+/// nothing**. Reverting a finalised checkpoint costs an attacker no bonded
+/// stake — only the coordination of the validators who would have to do it.
+///
+/// ## What an integrator can actually rely on
+///
+/// `Finalized` still carries real information: it is this node's own
+/// judgement, computed from a chain it validated itself, and it is strictly
+/// stronger than `Justified` or `Canonical`. It is not a settlement guarantee.
+/// Three limits bound it, and they compound:
+///
+/// - **No slashing cost**, per the retraction above.
+/// - **`finalized` is not a latch.** It has been measured *descending* across
+///   reorgs that break no rule: fork choice walks from the *justified* root
+///   and the state committed there finalises two epochs below the head, so the
+///   deepest cut the algorithm may legitimately propose is itself a finality
+///   rewind (finalized epoch 6 → 4 → 2 → 0 in three in-rules cuts).
+/// - **The quorum denominator has no floor.** It is leak-adjusted
+///   unconditionally; the floor and the recovery rule are written but gated
+///   behind `LEAK_RECOVERY_ACTIVATION_EPOCH`, which is `u64::MAX`. A
+///   partitioned minority holding 6.25% of stake has been shown to
+///   self-finalise once the absent majority leaked away.
+///
+/// **Current honest guidance**, until this note is withdrawn: credit at
+/// **`finalized` plus a margin of 3 epochs**, require **two independently
+/// operated nodes to agree on the same finalized root AND epoch** — the epoch
+/// alone is not enough — and **re-verify immediately before releasing funds**.
+/// Two nodes agreeing does not mitigate the rewind, because both rewind
+/// independently; it catches divergence, which is a different failure. The
+/// margin of 3 bounds a single legal cut with one epoch to spare. It does not
+/// bound a repeated ratchet: **no depth is provably safe today**, and saying
+/// so is worth more than quoting a number that sounds like it is.
+///
+/// This note is withdrawn when evidence has a wire shape that survives the
+/// codec, the slashing path is reachable from the network and armed, the
+/// finality latch ships, and the denominator floor is armed. The promise
+/// returning and enforcement arriving are kept in step by
+/// `tests/slashing_backed_finality_claims.rs`, which fails either way round.
 ///
 /// One caveat, stated because it bounds the guarantee: this is **this node's**
 /// view, computed from the chain it has validated itself. That is the property
@@ -1666,8 +1753,10 @@ pub fn chain_info_json(
 /// staleness, which `getchaininfo`'s `behind_by_slots` is there to expose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Finality {
-    /// At or below the finalised checkpoint. Irreversible short of a
-    /// one-third-of-stake slashing event. **Credit here.**
+    /// At or below the finalised checkpoint. The strongest classification
+    /// this node offers — and NOT irreversible: it is backed by no slashing
+    /// cost (none can be applied on this network) and it is not a latch. Read
+    /// the retraction on [`Finality`] before crediting anything on it.
     Finalized,
     /// At or below the justified checkpoint but above the finalised one. One
     /// epoch away from finality in the normal case; still reversible.
@@ -1824,8 +1913,9 @@ pub fn submitted_json(tx: &PosTransaction, outcome: Admitted) -> Json {
             "confirmation",
             Json::s(
                 "this transport does not confirm: watch for the transaction in a \
-                 block via `getblockbyslot`, and treat it as settled only once that \
-                 block reports `finalized: true`",
+                 block via `getblockbyslot`. `finalized: true` on that block is \
+                 the strongest signal this chain offers, but it is not a \
+                 settlement guarantee — see `settlement` in `getcapabilities`",
             ),
         ),
     ])

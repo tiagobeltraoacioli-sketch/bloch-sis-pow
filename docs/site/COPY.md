@@ -135,10 +135,15 @@ slot's reward. Bounded, not eliminated.
 ### Finality
 
 Two-round BFT finality over checkpoints, one per epoch, at a two-thirds stake
-quorum. Deterministic — a finalized block does not reorganize without slashing
-at least a third of stake. **The cost:** ≈ 32 minutes to finality, and the
-quorum math is only as decentralized as the stake behind it, which at launch
-is not decentralized at all (see Supply).
+quorum. **The cost:** ≈ 32 minutes to finality; the quorum math is only as
+decentralized as the stake behind it, which at launch is not decentralized at
+all (see Supply); and — corrected 2026-09-01 — **the penalty that is supposed
+to make finality expensive to reverse cannot be applied.** This card used to
+read "Deterministic — a finalized block does not reorganize without slashing
+at least a third of stake." Slashing evidence is undecodable on every ingress
+path of the running node, nothing constructs it outside tests, and no
+activation constant exists, so finality on Genesis-4 today is economic by
+intent and cryptographic by nothing. Say that, not the old sentence.
 
 ### The devnet disclaimer, verbatim
 

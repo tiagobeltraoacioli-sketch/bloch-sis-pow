@@ -413,7 +413,10 @@ if [ -n "$INDEX" ]; then
   if [ "$VSLASHED" = "True" ] || [ "$VSLASHED" = "true" ]; then
     crit "validator $INDEX: SLASHED. Stop the node NOW. It cannot un-slash, and \
 correlation pricing (3x over the surrounding 4,096-epoch window) means every \
-further offence in the window costs you and everyone else caught in it more."
+further offence in the window costs you and everyone else caught in it more. \
+NOTE: no slashing has ever been applied on this chain and none can be today \
+(see VALIDATOR-RUNBOOK 14.1) - so this flag reading true means the state or \
+the binary changed, and that is itself worth investigating."
   fi
   case "$VSTATE" in
     active)  ok "validator $INDEX: active" ;;

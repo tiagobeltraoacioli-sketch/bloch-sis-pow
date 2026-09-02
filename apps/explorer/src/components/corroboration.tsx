@@ -31,10 +31,17 @@ const COPY: Record<
     label: "final",
     tone: "ok",
     title:
+      // CORRECTED 2026-09-01. This tooltip used to end "reverting it would
+      // require slashing at least a third of the total stake". No stake on
+      // Genesis-4 can be slashed — evidence wire tag 0x05 is undecodable on
+      // every ingress path — so no penalty backs this state. See the
+      // retraction on `Finality` in crates/bloch-pos-node/src/rpc.rs.
       "At or below the finalised checkpoint, confirmed by two independent " +
       "archival nodes and certified against a fleet validator. Under proof of " +
-      "stake this — not a confirmation count — is what makes a value settled: " +
-      "reverting it would require slashing at least a third of the total stake.",
+      "stake this — not a confirmation count — is the strongest state the " +
+      "chain reports. It is not irreversible: no slashing penalty backs it " +
+      "(none can be applied on this network today), and the finalised " +
+      "checkpoint has been observed moving backwards across legal reorgs.",
   },
   corroborated: {
     label: "corroborated",

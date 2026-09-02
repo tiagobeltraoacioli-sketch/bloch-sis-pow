@@ -226,7 +226,7 @@ running binary, so it cannot be stale the way a document can.
 document.** This document exists to explain what the numbers mean and what is
 not there; the node itself is the authority on what it serves.
 
-`rpc_surface_version` is currently `4.1.0` and moves under semver: major for a
+`rpc_surface_version` is currently `4.2.0` and moves under semver: major for a
 removal or a breaking change, minor for an added method or field, patch for
 wording.
 
@@ -507,14 +507,71 @@ that passes 1,000 outputs cannot be fully enumerated. Keep each address under
 |---|---|---|
 | Accepted | `sendrawtransaction` → `accepted:true` | in this node's mempool |
 | Included | output visible via `gettxout` / `getutxos` | in a block |
-| **Final** | `getchaininfo.finalized.epoch` ≥ that block's epoch | **credit** |
+| **Final** | `getchaininfo.finalized.epoch` ≥ that block's epoch | necessary, **not sufficient** — see below and §5.5 |
 
 Finality is explicit and published in every `getchaininfo` response — you do
 not estimate it from a confirmation count, and there is no `confirmations`
 field to misread.
 
-**Credit on `finalized`.** Included is not settled: a block that is canonical
-now can be reorganised, and only finalisation is the cryptographic guarantee.
+`finalized` is the strongest signal this chain publishes, and included is
+certainly not settled: a block that is canonical now can be reorganised. But
+`finalized` alone is **not** a settlement guarantee, and this section used to
+say it was.
+
+> **RETRACTION (2026-09-01): finality here is not backed by a slashing cost.**
+> An earlier revision of this section called finalisation "the cryptographic
+> guarantee". Casper's guarantee is cryptoeconomic: reverting a finalised
+> checkpoint is supposed to cost at least one third of the total stake, burned
+> and attributable on chain. **On Genesis-4 today no stake can be slashed at
+> all**, for four independent reasons, any one of them sufficient:
+>
+> 1. Slashing evidence rides on wire tag `0x05`, and
+>    `PosTransaction::from_canonical_bytes` refuses that tag unconditionally.
+>    The encoder folds the two nested messages in as the *signing roots* they
+>    were signed over — hashes — so the envelopes cannot be recovered. This is
+>    by construction, not by omission, and it is documented as such in the
+>    codec.
+> 2. That decoder is the only one on **every** ingress path — block body,
+>    gossip, and `sendrawtransaction`. A block carrying evidence is rejected by
+>    every peer; a proposer that included it would produce a block no one can
+>    import.
+> 3. Nothing constructs the transaction outside tests. The node detects an
+>    equivocating pair and logs it, with a line that says the pipeline is not
+>    wired.
+> 4. There is no activation constant to arm. `SLASHING_EVIDENCE_ACTIVATION_EPOCH`
+>    does not exist — it is absent, not set to `u64::MAX`.
+>
+> Live at epoch 1726, read from two archivals agreeing on the same head and
+> root: 64 validators, 64 active, every record `slashed: false`,
+> `exit_epoch: null`. Equivocation on this fleet is **detected** — the node
+> captures each pair and logs it — and **never prosecuted**. (A figure of 48
+> double-signing validators has been reported internally; no RPC exposes
+> equivocation history, so this note does not re-derive it, and nothing above
+> rests on the number.)
+>
+> So Genesis-4 finality is **economic by intent and cryptographic by nothing**:
+> reverting a finalised checkpoint costs an attacker no bonded stake, only the
+> coordination of the validators who would have to do it. This compounds with
+> §5.3 (`finalized` is not network-unique) and §5.4 (`finalized` is not a
+> latch, and rewinds are *legal*, not attacks).
+>
+> The node says so itself:
+> `getcapabilities.settlement.slashing_enforced` is `false` and
+> `settlement.finalized_is_a_latch` is `false`, from
+> `rpc_surface_version` 4.2.0 onward. **Branch on those fields**, not on this
+> paragraph.
+>
+> **What to do instead** is §5.5, unchanged in substance and now load-bearing:
+> credit at `finalized` **plus a margin of 3 epochs**, with **two independently
+> operated nodes agreeing on the same finalized root AND epoch**, re-verified
+> immediately before you release funds. The margin bounds a single legal cut
+> with one epoch to spare. It does not bound a repeated ratchet: **no depth is
+> provably safe today**, and we would rather say that than quote a number that
+> sounds like it is.
+>
+> This note is withdrawn when evidence gets a wire shape that survives the
+> codec, the slashing path is reachable from the network and armed, the
+> finality latch ships, and the leak denominator floor is armed.
 
 ### 5.2 How long finality actually takes
 
@@ -602,9 +659,12 @@ divergence, not against §5.4's rewind.
 - **Re-verify before releasing funds.** Do not treat a single `finalized: true`
   reading as durable. Re-read the output with `gettxout` immediately before you
   act on it, and treat a block that has stopped being finalized as a hold.
-- **Add a depth margin.** Credit at a fixed number of epochs *past* finality
+- **Add a depth margin: 3 epochs.** Credit at `finalized` **plus 3 epochs**
   rather than at the finality boundary itself. The margin is what absorbs a
-  rewind, and it is the only mechanism here that does.
+  rewind, and it is the only mechanism here that does — two nodes agreeing does
+  not, because both rewind independently. Three bounds a single legal cut with
+  one epoch to spare. It does **not** bound a repeated ratchet: no depth is
+  provably safe today, and there is no slashing cost behind any of it (§5.1).
 - **Alert on `finalized.epoch` not advancing, independently of height.** Block
   production and finalisation are separate: heights advance, `getblockbyslot`
   keeps answering, the node looks healthy, deposits stop being creditable.

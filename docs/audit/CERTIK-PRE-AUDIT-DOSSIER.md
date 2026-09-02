@@ -114,7 +114,7 @@ references are to this repository at `470b608`.
 | 12 | Whitelist | None at chain level — no allowlist gates participation in transfer, staking, delegation, or block production beyond the public parameter thresholds. (`MembershipList` in `bloch-euvm` is token-scoped and not consensus-wired.) | PASS | §1.3 grep table; `crates/bloch-euvm/src/state.rs:520` |
 | 13 | Hidden ownership | No hidden control mechanism (§1.3 grep). Governance is explicitly **not** ownerless — the earlier "ownerless" claim was formally retracted — and the structure is disclosed: two entities, founder allocates the genesis validator cohort under a consensus-coded taper. Honest limit: beneficial ownership of the 14 non-founder carryover addresses is asserted, not provable on-chain — the tokenomics doc treats the whole non-founder remainder as "independent parties" without attribution. | PASS (disclosed, not hidden) — with the attribution caveat | `docs/adr/ADR-036-*`; `docs/specs/BLOCH-ENTITY-STRUCTURE.md`; `crates/bloch-pos-committee/src/genesis_cohort.rs:29-48` |
 | 14 | Proxy contract (upgradeable logic) | No proxy slot exists. Role played by: node releases — operators choose what to run, and the release-integrity discipline (reproducible builds, published == fleet binary) is the substitute control. That discipline is specified (gate G8, `REPRO.md`) but **G8 is unmeasured** (§4). | N/A — substitute specified, not yet measured | `REPRO.md`; `repro-manifest.sh`; `docs/specs/BLOCH-POS-SHA3-LATTICE-MIGRATION.md` §11 (G8) |
-| 15 | Balance modification (privileged) | No privileged balance write exists. Slashing is the only involuntary balance reduction and it requires structurally valid evidence validated inside the state transition — invalid evidence rejects the whole block; forged evidence slashes nobody (regression-tested). | PASS | `crates/bloch-pos-committee/src/transition.rs:1177`, `:1186-1188`, `:1482-1489`; `src/transition.rs` tests at `:2198`, `:2372` |
+| 15 | Balance modification (privileged) | No privileged balance write exists. Slashing is the only involuntary balance reduction, and it requires structurally valid evidence validated inside the state transition — invalid evidence rejects the whole block; forged evidence slashes nobody (regression-tested). **CORRECTED 2026-09-01, and it strengthens this row rather than weakening it: no evidence can reach that transition at all.** `PosTransaction::from_canonical_bytes` refuses wire tag `0x05` unconditionally on every ingress path (block body, gossip, `sendrawtransaction`), nothing constructs the transaction outside tests, and no activation constant exists. So there is *no* involuntary balance reduction on the live chain today. The auditor should read this as: the control is sound and inert, and the finality guarantee elsewhere in this dossier and in the node's RPC docs must not be described as slashing-backed (see F-4 below, reopened). | PASS (and inert) | `crates/bloch-pos-committee/src/transition.rs:1177`, `:1186-1188`, `:1482-1489`; `src/transition.rs` tests at `:2198`, `:2372` |
 | 16 | Tax modification by privileged roles | The fee split constants have no setter and no role that can change them; the base fee moves only by the in-protocol controller as a function of block usage. Change requires a hard fork. | PASS (via substitute) | `crates/bloch-pos-committee/src/rewards.rs:38`, `:42`, `:65-75`; `src/fee_market.rs:193` |
 | 17 | Transfer cooldown | None on transfers. The delays that exist are stake-scoped, constant, disclosed, and apply equally to everyone — including the founder (`ACTIVATION_DELAY_EPOCHS`, `EXIT_DELAY_EPOCHS`, `WITHDRAWAL_DELAY_EPOCHS`, delegation `COOLDOWN_EPOCHS`). | PASS | `crates/bloch-pos-committee/src/staking.rs:89`, `:99`, `:106`; `src/delegation.rs:110` |
 | 18 | Transfer pausability | No pause authority. The only halt-shaped code is (a) the node-local `HaltForOperator` on a checkpoint conflict, which by test **cannot** override a node's own finality, and (b) the disclosed one-time terminal height (check 8). | PASS — with the terminal-height disclosure | `crates/bloch-pos-committee/src/ws.rs:602-623`, test `:1112` (`published_checkpoint_never_overrides_own_finality`) |
@@ -323,10 +323,11 @@ of `tests/one_state_root.rs` (reverting the old rule fails 2 of 5). The file
 opens with the written statement of the one-derivation-path rule.
 
 **F-4. Slashing existed but nothing called it; then its bookkeeping was not
-under the root (2026-08-11/12).** First: `slashing.rs` was implemented,
-tested, sealed — and had no call site. Fixed in `8a3e0ea`: evidence became a
-transaction (`PosTransaction::SlashingEvidence`) validated inside the
-transition; invalid evidence rejects the whole block; 12 new tests including
+under the root (2026-08-11/12). REOPENED 2026-09-01 — this finding was
+recorded as closed and it is not.** First: `slashing.rs` was implemented,
+tested, sealed — and had no call site. `8a3e0ea` closed the *transition* half:
+evidence became a transaction (`PosTransaction::SlashingEvidence`) validated
+inside the transition; invalid evidence rejects the whole block; 12 new tests including
 `evidence_transaction_slashes_operator_and_delegators_and_pays_whistleblower`
 (`src/transition.rs:2198`) and
 `replayed_evidence_rejects_the_second_block_even_swapped` (`:2372`). Second:
@@ -336,6 +337,24 @@ or reach a different verdict. Fixed in `319c7e6`: three new leaves (tags
 `0x11`–`0x13`, `src/state_root.rs:148-150`). Regression:
 `every_committed_state_field_is_bound_by_the_root` (`src/transition.rs:2518`)
 and `ejected_set_is_exactly_the_slashed_registry` (`:2815`).
+
+**What is still open, and why this finding is reopened.** Both fixes above are
+real and both are *downstream of a transaction that cannot arrive*. The wire
+half of "nothing called it" was never closed:
+`PosTransaction::from_canonical_bytes` returns
+`TxDecodeError::EvidenceNotDecodable` for tag `0x05` unconditionally, with no
+gate — the encoder folds the two nested messages in as the signing roots they
+were signed over, so the envelopes are unrecoverable by construction, and the
+codec documents this as deliberate. That decoder is the only one on every
+ingress path, so a block carrying evidence is rejected by every peer and a
+proposer that included it would produce an unimportable block. Nothing
+constructs the transaction outside tests; the node logs `EQUIVOCATION captured
+… (slashing pipeline NOT wired — evidence is logged, not prosecuted)`; and
+`SLASHING_EVIDENCE_ACTIVATION_EPOCH` does not exist. Measured on the live chain
+at epoch 1726 from two agreeing archivals: 64 validators, 64 active, every
+record `slashed: false` and `exit_epoch: null`. Equivocation on this fleet is *detected* — the node captures each pair and logs it — and none of it has ever been prosecuted. (A figure of 48 double-signing validators has been reported internally; no RPC exposes equivocation history, so this note does not re-derive it, and the conclusion does not rest on the number.) Closing
+this needs a §7.3 wire shape carrying both envelopes whole, then a flag day.
+Regression guard: `crates/bloch-pos-node/tests/slashing_backed_finality_claims.rs`.
 
 **F-5. The Ustav supply cap was not a cap (HIGH, 2026-08-11).**
 `compile_supply` compared the cap against a value the *spender* wrote in the

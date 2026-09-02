@@ -108,9 +108,11 @@ V3 (`mod.rs:1267`) answers `pending | confirmed | final | unknown`, with
 `"final"` hardcoded at ≥ 100 confirmations — coinbase-maturity depth standing
 in for finality. The explorer, the `anchoring` crate (`FINAL_DEPTH = 100`,
 `anchoring/src/anchor.rs:79`), and the wallets all trust this method verbatim
-and do no arithmetic of their own. Under PoS, depth no longer means finality —
-a 5-deep transaction inside a finalized epoch is irreversible while a 500-deep
-transaction past a stalled finality gadget is not.
+and do no arithmetic of their own. Under PoS, depth no longer means finality:
+a 5-deep transaction inside a finalized epoch is in a stronger position than a
+500-deep transaction past a stalled finality gadget. This sentence used to say
+the first one was "irreversible". CORRECTED 2026-09-01 — it is not; see §3.1's
+note on `finalized` below.
 
 V4 contract:
 
@@ -133,9 +135,16 @@ V4 contract:
 - `justified` — the containing block is an ancestor of (or equal to) the
   latest justified checkpoint.
 - `finalized` — the containing block is an ancestor of (or equal to) the
-  latest finalized checkpoint. **This is the only state that may be treated
-  as irreversible.** A rollback below it is a network catastrophe, not a
-  reorg to handle (ecosystem plan §5.1).
+  latest finalized checkpoint. The strongest state this API reports, and
+  **not irreversible.** This bullet used to read "This is the only state that
+  may be treated as irreversible." RETRACTED 2026-09-01, on two independent
+  grounds: (1) no slashing penalty backs it — evidence wire tag `0x05` is
+  undecodable on every ingress path of the node, so the cost Casper prices a
+  reversal at cannot be applied; (2) a rollback below the finalized checkpoint
+  is not only a catastrophe, it is *legal* — fork choice walks from the
+  justified root and the deepest cut it may propose is itself a finality
+  rewind, measured descending 6 -> 4 -> 2 -> 0. `getcapabilities.settlement`
+  reports `slashing_enforced: false` and `finalized_is_a_latch: false`.
 - `unknown` — not found.
 
 `confirmations` is retained for display continuity but documented as

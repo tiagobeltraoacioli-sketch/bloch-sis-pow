@@ -64,10 +64,18 @@ wallet and tooling ecosystem in exchange for not having a quantum-vulnerable
 authorisation path. Every design question downstream of that — including
 whether to run an EVM at L1 — reopens the same trade.
 
-**The coin is not a security and not an asset.** No token sale, no listing,
-no price, no value claim. Supply is heavily concentrated: the founder holds
-roughly 94% of the carried-over balance, which is stakeable, so a naive
-Nakamoto coefficient is 1. Bounding mechanisms exist and are documented with
+**The coin is not a security and not an asset.** No listing, no price, no
+value claim. There has been **no public token sale**; the founder states that
+18,128,356,145 BLCH (18.13% of the cap) was sold privately to third parties,
+which is a declared fact the chain cannot corroborate. Supply is heavily
+concentrated: at genesis the founder held 93.94% of the carried-over balance,
+98.08% of issued supply and 56.05% of the 100-billion cap, all stakeable, so a
+naive Nakamoto coefficient is 1; today the same address holds 66.35% of issued
+supply (37.92% of the cap). No coin, sold or held, is locked on chain. Current
+holdings are measured and dated in
+[`docs/LIVE-SUPPLY.md`](./docs/LIVE-SUPPLY.md), with every percentage against a
+named denominator — never quoted from memory, because that number moves and
+this file cannot. Bounding mechanisms exist and are documented with
 what they do *not* reach — see `docs/audit/CERTIK-CENTRALIZATION.md` and
 `docs/specs/BLOCH-TOKENOMICS-V4.md` §4A. There is no framing that makes this
 number acceptable, and none is attempted here.

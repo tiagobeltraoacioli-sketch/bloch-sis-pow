@@ -35,10 +35,15 @@ Statements you are entitled to before bonding 25,000 BLCH for a minimum of
 - **The coin has no listed market.** Acquiring BLCH to stake means receiving a
   transfer from an existing holder. There is no faucet, no exchange listing,
   no market price (§8.1).
-- **Slashing is real and correlation-priced** (§14). A key-management mistake —
-  the same key live on two machines — is indistinguishable from an attack, by
-  design, and costs you 3× more if others are being slashed in the same
-  4,096-epoch window.
+- **Slashing is specified and correlation-priced, but CANNOT BE APPLIED
+  today** (§14). A key-management mistake — the same key live on two machines —
+  is indistinguishable from an attack by design, and the schedule prices it 3×
+  if others are slashed in the same 4,096-epoch window. That schedule has never
+  run: no evidence transaction can reach a verifier on this network (§14.1), so
+  every equivocation to date is logged and unpunished. Operate as if the
+  penalty were live — it is designed to arrive, arriving is a flag day, and a
+  key that equivocated before the flag day is a key you should already have
+  retired.
 - **Your validator key cannot live in any hardware wallet** (§2). If your
   custody policy requires an HSM, you cannot run this validator. That is the
   full sentence.
@@ -350,8 +355,11 @@ keeps pace with the wall clock and the field reads 0 permanently while it
 agrees with nobody. The 2026-08-30 fork had 15 nodes on one head and 33
 alone, each confident, each reading behind = 0.
 
-Settlement is the `finalized: true` boolean on a block, never a confirmation
-count; `height` is the number that is *not* the guarantee.
+`finalized: true` on a block — never a confirmation count — is the strongest
+state this chain reports; `height` is a weaker number still. This paragraph
+used to call that boolean "settlement". CORRECTED 2026-09-01: it is not one.
+No slashing penalty backs it (§14.1) and it is not a latch. An integrator's
+rule is in `docs/integration/BLOCH-GENESIS4-EXCHANGE-INTEGRATION.md` §5.
 
 ---
 
@@ -710,11 +718,12 @@ you carry duties (and slashability) through the whole exit delay.
 
 ---
 
-## 14. Slashing — what an offence costs
+## 14. Slashing — what an offence is specified to cost
 
 Offences: double-signing blocks (equivocation) and contradictory attestations
-(Casper surround/double votes). Evidence is a transaction any node can
-include, re-verified by every node.
+(Casper surround/double votes). Everything in this section is the **designed**
+schedule. Read §14.1 first: none of it can be applied on the network as it runs
+today.
 
 - Base penalty, amplified by **correlation**: your penalty scales 3×
   (`CORRELATION_MULTIPLIER`) with the total stake slashed in the surrounding
@@ -728,6 +737,45 @@ include, re-verified by every node.
 - A slashed validator is removed from every roster immediately and can never
   rejoin with that key. If `blochv-health.sh` ever prints `SLASHED`, stop the
   node; every further signature can only add correlation cost.
+
+### 14.1 None of §14 is enforceable today — CORRECTED 2026-09-01
+
+This section used to open "Evidence is a transaction any node can include,
+re-verified by every node." **No node can include it.** Four independent
+breaks, any one sufficient:
+
+1. Evidence carries wire tag `0x05`, and
+   `PosTransaction::from_canonical_bytes` returns
+   `TxDecodeError::EvidenceNotDecodable` for it unconditionally, with no gate.
+   The encoder folds the two nested messages in as the *signing roots* they
+   were signed over — hashes — so the envelopes are unrecoverable by
+   construction. The codec documents this as deliberate.
+2. That decoder is the only one on every ingress path: block body, gossip, and
+   `sendrawtransaction`. So a block carrying evidence is rejected by every
+   peer, and a proposer who hand-built the bytes would produce a block nobody
+   can import — which is why G10 below is stronger than "no tooling".
+3. Nothing constructs the transaction outside tests. The node detects
+   equivocation and prints `EQUIVOCATION captured: … (slashing pipeline NOT
+   wired — evidence is logged, not prosecuted)`.
+4. There is no activation constant to arm: `SLASHING_EVIDENCE_ACTIVATION_EPOCH`
+   does not exist in the repository.
+
+Measured on the live chain at epoch 1726, from two archivals agreeing on head
+and root: 64 validators, 64 active, every record `slashed: false` and
+`exit_epoch: null`. Equivocation on this fleet is *detected* — the node captures each pair and logs it — and none of it has ever been prosecuted. (A figure of 48 double-signing validators has been reported internally; no RPC exposes equivocation history, so this note does not re-derive it, and the conclusion does not rest on the number.) `slashing.rs` is complete and correct;
+nothing can reach it.
+
+Two consequences an operator must hold at once:
+
+- **Do not relax key hygiene.** Enforcement is a flag day away, the evidence
+  is already on chain and permanent, and a §7.3 wire shape that carries whole
+  envelopes would make historical offences prosecutable in principle. Treat
+  every equivocation as a permanently retired key.
+- **Do not price your risk off §14 either.** Nobody has been slashed and
+  nobody can be, so the correlation window and the 1/32 whistleblower reward
+  are schedules, not experience.
+
+This subsection is deleted when the §7.3 path is reachable and armed.
 
 ---
 
@@ -748,7 +796,7 @@ runbook is done when this section is empty.
 | **G7** | §8.1 — acquiring stake | No market, no faucet, no listed venue; supply is concentrated in the founder's carryover. | 25,000 BLCH is obtainable only by private transfer from an existing holder. Economic/legal workstream, not code. |
 | **G8** | §8.2 — deposit sizing at low stake | Below 2.5M BLCH total active stake the cap band collapses: every deposit is forced to exactly 25,000 BLCH (1% cap unsatisfiable below ~100 minimum-bond validators). | Consensus constant interaction, known and accepted (`max(…, MIN)` floor); stated so operators size expectations, not a bug to fix silently. |
 | **G9** | §6.4, §11 — serving anyone but yourself | RPC has no authentication/rate-limit/authorisation; safe only on loopback. All 64 fleet nodes were exposed on 2026-08-30. | Any multi-tenant or public read service needs an authenticating proxy in front; in-node auth is future work. |
-| **G10** | §14 — reporting an offence | Slashing evidence is consensus-valid but has no submission tooling, and its canonical encoding cannot travel through `submit-tx` at all. | The 1/32 whistleblower incentive is real but unreachable for anyone who is not a block proposer with hand-built bytes. |
+| **G10** | §14 — reporting an offence | **Slashing cannot be applied at all** (§14.1). Evidence is consensus-valid *inside* `apply_slashing_evidence`, but wire tag `0x05` is undecodable on every ingress path by construction, nothing builds the transaction outside tests, and no activation constant exists. | Not a tooling gap. A block proposer with hand-built bytes cannot do it either — the block would be unimportable by every peer. Needs a new §7.3 wire shape carrying both envelopes whole, then a flag day. Until then the 1/32 whistleblower incentive is unreachable by anyone, and `slashed: false` on all 64 records is the expected reading, not a healthy one. |
 | **G11** | §5, §6 — the RPC port | The runbook, the fleet and the tooling use **16400** for RPC; the binary's `DEFAULT_RPC_PORT` is **16310**, and 16400 is the libp2p transport's default *listen* port. An operator following this document with `--transport libp2p` gets a bind conflict. | Cosmetic to fix (move one default, or document one number), load-bearing to get wrong at 03:00. `blochv-preflight.sh` warns on the collision rather than letting you discover it. |
 | **G12** | §11 — richer health | `getvalidatorstatus`, `getmetrics`, `/metrics` and `/health` — which expose the signing-guard watermarks and the doppelganger state directly — exist in the observability branch but **not in the binary the live fleet runs** (verified against a fleet node on 2026-08-31: `method not found`). | Same dependency as G5: merge + release. Until then the tooling reads `getvalidator` only, and the doppelganger/slashing state is observable on disk and in logs, not over RPC. |
 | **G13** | §9.2 — proving a key is unused | `blochv-guard.sh` refuses `--accept-new-signing-history` when the chain says the validator is already `active`, which catches the common case. It cannot prove the *negative*: a key that signed and then had its history lost, on a validator not yet activated, still looks new. | No protocol mechanism attests "this key has never signed". The residual risk is carried by operator discipline (disable the old unit, not just stop it) and by the doppelganger watch. |
