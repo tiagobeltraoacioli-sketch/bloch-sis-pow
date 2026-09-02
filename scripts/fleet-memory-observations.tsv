@@ -13,6 +13,12 @@
 # slots_per_day	2880
 # blocks_per_day_window	slot 49383..54919 height 28590..34024
 # rpc_source	139.84.205.54:16403
+# blocks_known	34385
+# fork_overhang_blocks	226
+# bytes_per_block_measured	13888.4
+# tx_per_block_measured	0.0000
+# contingency_anchor_slot	55055
+# contingency_note	fork overhang and idleness measured read-only at slot 55055 on 139.84.201.52; blocks.log 477542599 B over 34385 known blocks; 13 blocks sampled slot 54800..55040 carried 0 transactions; mempool 0
 # validator_rows	63
 #
 box_ip	box_host	mem_total_mib	mem_avail_mib	cached_mib	nproc	unit	pid	vmhwm_mib	vmrss_mib	started_unix	mark_age_s	boot_height

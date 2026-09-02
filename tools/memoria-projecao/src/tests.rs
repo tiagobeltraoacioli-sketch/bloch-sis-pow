@@ -175,9 +175,25 @@ fn the_date_does_not_move_when_only_the_block_cadence_moves() {
     slower.blocks_per_slot_measured = slower.blocks_per_slot_measured.map(|v| v / 2.0);
     slower.blocks_per_day_measured = slower.blocks_per_day_measured.map(|v| v / 2.0);
     let p2 = project(&slower, RESERVE_MIB_DEFAULT);
+    // The SECOND ARM is included deliberately. SIG_GROWTH_FACTOR is a ratio of
+    // two per-BLOCK measurements (6,410 / 10,579 B per block) applied to a
+    // per-DAY rate. That is only sound while the cadence of the two
+    // measurements matches the cadence of the fleet; it is the one place a
+    // block denominator still survives inside the arithmetic instead of in
+    // prose, and it was previously unguarded.
     assert_eq!(
-        (base.roll.unix_lo, base.drift.unix_lo),
-        (p2.roll.unix_lo, p2.drift.unix_lo),
+        (
+            base.roll.unix_lo,
+            base.drift.unix_lo,
+            base.roll_nosig.unix_lo,
+            base.drift_nosig.unix_lo
+        ),
+        (
+            p2.roll.unix_lo,
+            p2.drift.unix_lo,
+            p2.roll_nosig.unix_lo,
+            p2.drift_nosig.unix_lo
+        ),
         "halving the block cadence moved the projected dates. It must not: growth is\n\
          denominated in SLOTS, which the wall clock delivers at {SLOTS_PER_DAY:.0}/day\n\
          whether or not blocks are produced in them. If project() has started reading\n\
@@ -459,6 +475,8 @@ fn the_report_states_what_it_cannot_do() {
         "grows with USAGE",
         "FLOOR, NOT HEADROOM",
         "SLOTS",
+        "CONTINGENT ON AN EMPTY CHAIN",
+        "REPLAY IS NOT THE REGIME THE FLEET LIVES IN",
         "HOW FAR PAST THE EVIDENCE THIS REACHES",
     ] {
         assert!(
@@ -468,4 +486,117 @@ fn the_report_states_what_it_cannot_do() {
              plan, which is the failure this artefact exists to prevent."
         );
     }
+}
+
+// ── the contingency: the far date is a claim about an EMPTY chain ─────────
+
+#[test]
+fn the_chain_is_still_as_idle_as_the_surviving_eutxo_slope_assumes() {
+    // THIS IS THE TEST THAT GUARDS THE 2027 DATE.
+    //
+    // Serving the block map from the log removes the chain-retention term.
+    // What it leaves behind -- ~3,174 B/block -- is almost entirely the eUTXO
+    // ledger, and that was measured across a window carrying 1,048
+    // transactions in 29,472 blocks. It is not a rate that time drives. It is
+    // a rate that USERS drive, and the validator-opening programme exists to
+    // add users. So the far date is contingent on the chain staying empty,
+    // and this is where that contingency is checked instead of hoped for.
+    let s = snap();
+
+    if let Some(bpb) = s.bytes_per_block_measured {
+        let moved = (bpb - BYTES_PER_BLOCK_AT_DERIVATION).abs() / BYTES_PER_BLOCK_AT_DERIVATION;
+        assert!(
+            moved <= BYTES_PER_BLOCK_TOLERANCE_FRACTION,
+            "the block log is now carrying {bpb:.0} B/block against the \
+             {BYTES_PER_BLOCK_AT_DERIVATION:.0} B/block this projection was derived under \
+             -- a move of {:.1}%, limit {:.0}%.\n\
+             \n\
+             Frame size rises with transaction volume, and the growth term that survives\n\
+             every optimisation in flight is the eUTXO ledger, whose slope is a function\n\
+             of exactly that. The far dates in docs/MEMORY-PROJECTION.md were computed for\n\
+             a chain doing {:.4} tx/block -- essentially nothing. If the chain has started\n\
+             being used, those dates are not merely stale, they are the wrong SHAPE:\n\
+             memory then grows with adoption rather than with the calendar, and no date\n\
+             derived from an idle window bounds it.\n{REDO}",
+            moved * 100.0,
+            BYTES_PER_BLOCK_TOLERANCE_FRACTION * 100.0,
+            TX_PER_BLOCK_AT_DERIVATION
+        );
+    }
+
+    if let Some(tx) = s.tx_per_block_measured {
+        assert!(
+            tx <= TX_PER_BLOCK_TOLERANCE,
+            "the chain is carrying {tx:.3} transactions per block, against the \
+             {:.4} tx/block the surviving eUTXO slope was measured under (limit \
+             {TX_PER_BLOCK_TOLERANCE:.2}).\n\
+             \n\
+             The dates that assume the store-backed block map are the ones this breaks.\n\
+             They are not a forecast about time; they are a statement about an empty\n\
+             chain. Re-measure the eUTXO slope against a window that carries real\n\
+             traffic before quoting any 2027 date again.\n{REDO}",
+            TX_PER_BLOCK_AT_DERIVATION
+        );
+    }
+}
+
+#[test]
+fn the_fork_overhang_is_still_a_rounding_error_and_not_a_term() {
+    // Fork overhang is real -- `blocks_known` exceeds `height` by 226 on every
+    // box asked -- and it is the one term here that grows without a bound.
+    // It is also, today, 3.0 MiB against a 1,205 MiB validator. Both halves of
+    // that sentence matter: recording it keeps the level honest, and refusing
+    // to promote it to a dating term keeps the risk in the right place. This
+    // test exists to notice if it stops being a rounding error.
+    let s = snap();
+    let Some(fork) = s.fork_overhang_blocks else {
+        return;
+    };
+    let bpb = s
+        .bytes_per_block_measured
+        .unwrap_or(BYTES_PER_BLOCK_AT_DERIVATION);
+    let mib = fork * bpb / (1024.0 * 1024.0);
+    assert!(
+        fork <= FORK_OVERHANG_TOLERANCE_BLOCKS,
+        "the fleet is holding {fork:.0} non-canonical blocks in RAM ({mib:.1} MiB at \
+         {bpb:.0} B/block), against {FORK_OVERHANG_BLOCKS_AT_DERIVATION:.0} when this \
+         projection was derived (limit {FORK_OVERHANG_TOLERANCE_BLOCKS:.0}).\n\
+         \n\
+         At this size it stops being a rounding error and becomes a memory term the\n\
+         projection does not model. It is also, at this size, a fork-choice incident\n\
+         before it is a memory problem -- look there first.\n{REDO}"
+    );
+}
+
+#[test]
+fn a_replay_slope_is_never_used_to_date_the_live_fleet() {
+    // The programme's most expensive confusion, made structural.
+    //
+    // A static replay grows at 0.01718 MiB/block; a running validator grows at
+    // 8,837 B/block, measured two independent ways. The replay figure is 1.99x
+    // the live one, so a date computed from replay is roughly HALF the time
+    // that actually exists. The binding rate must therefore stay on the live
+    // side of that gap.
+    let live_mib_per_day = LIVE_B_PER_BLOCK * 2880.0 * 0.982 / (1024.0 * 1024.0);
+    let replay_mib_per_day = REPLAY_B_PER_BLOCK * 2880.0 * 0.982 / (1024.0 * 1024.0);
+    assert!(
+        REPLAY_B_PER_BLOCK > LIVE_B_PER_BLOCK,
+        "the replay slope is no longer above the live slope; re-check which regime\n\
+         each was measured in before trusting either."
+    );
+    assert!(
+        STEADY_MIB_PER_DAY_RECENT < replay_mib_per_day,
+        "the binding rate {STEADY_MIB_PER_DAY_RECENT:.1} MiB/day/validator has reached the\n\
+         REPLAY-derived rate of {replay_mib_per_day:.1} MiB/day. Replay is not the regime\n\
+         the fleet lives in: a replay pays for the chain in a way a running node does\n\
+         not, and dating the fleet from it halves the time that actually exists."
+    );
+    assert!(
+        (STEADY_MIB_PER_DAY_RECENT - live_mib_per_day).abs() < 12.0,
+        "the binding rate {STEADY_MIB_PER_DAY_RECENT:.1} MiB/day/validator has drifted away\n\
+         from the live per-block lineage ({live_mib_per_day:.1} MiB/day at\n\
+         {LIVE_B_PER_BLOCK:.0} B/block). These are two independent routes to the same\n\
+         quantity and they agreed to ~6% when the projection was derived; if they no\n\
+         longer do, one of them is measuring something else.\n{REDO}"
+    );
 }

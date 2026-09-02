@@ -263,27 +263,35 @@ mod state_cell {
     /// a node whose head lags its wall clock. The memo is dropped whole on
     /// every applied block anyway, so this bounds a burst, not a lifetime.
     ///
-    /// **It is also a memory budget, and it is the larger of the two this
-    /// module spends.** Each entry is a whole `CommittedState`, structurally
-    /// sharing nothing with the live one, so a full memo is `MEMO_CAP` extra
-    /// copies — the same unit [`REORG_STATE_WINDOW`] is counted in, four
-    /// times over. It is transient where the retention window is steady
-    /// state, but the peak is what an OOM kills on.
+    /// **It is NOT the memory budget this comment used to claim.** The
+    /// previous text said each entry is "a whole `CommittedState`, structurally
+    /// sharing nothing with the live one", costing **60 MB per state** and
+    /// ~240 MB for a full memo. That was wrong by a factor of ~750, and it was
+    /// wrong in the direction that makes this module look like the problem.
     ///
-    /// MEASURED on this tree by `bench::bench_state_footprint` (`--release`,
-    /// Genesis-3-sized eUTXO set, RSS delta over four clones): **60 MB per
-    /// state**, so a full memo is ~240 MB and the two features together peak
-    /// around 300 MB per validator above the pre-change baseline.
+    /// `EutxoSet.entries` is an `Arc<BTreeMap<..>>`
+    /// (`bloch-pos-committee/src/transition.rs:1250`). Holding a state is a
+    /// **refcount bump**, not a copy. MEASURED 2026-09-01: four extra
+    /// mainnet-sized states cost **320 kB**, not 240 MB.
     ///
-    /// That 60 MB does NOT match the 128 MB in [`REORG_STATE_WINDOW`]'s doc.
-    /// Both are real measurements of the same quantity on different hosts
-    /// (this one is macOS/arm64); RSS for a heap this shape is an allocator
-    /// artifact as much as a data size. Neither number has been taken on an
-    /// Edgevana box, and on a fleet running EIGHT validators per host the
-    /// per-host multiple is what matters, so **measure there before trusting
-    /// either figure for capacity planning.** Recorded rather than
-    /// reconciled, because reconciling them here would mean picking one
-    /// without evidence.
+    /// Measured on the same tree, the memo is also never populated: across a
+    /// full 29,377-block replay `rolled_to` performed **zero** rolls, so
+    /// `MEMO_CAP` bounded nothing at all.
+    ///
+    /// The real cost of retention is downstream and belongs to
+    /// [`REORG_STATE_WINDOW`], not here: holding a state makes the `Arc`
+    /// *shared*, so the next eUTXO mutation hits `Arc::make_mut` and copies
+    /// the whole 452,726-entry map — **52.4 MiB**, taken 892 times in that
+    /// replay against 384,638 mutations that proceeded in place. Retention is
+    /// the enabler of that copy, not a holding cost, and the peak curve steps
+    /// in exactly 52.4 MiB units because of it.
+    ///
+    /// The old 60 MB and the 128 MB in [`REORG_STATE_WINDOW`]'s doc were not
+    /// two host-dependent readings of one real quantity. They were both
+    /// measuring an allocator response to a copy that the refcount makes
+    /// unnecessary. Capacity planning uses
+    /// `docs/MEMORY-PROJECTION.md`, which is recomputed from a live fleet
+    /// snapshot; do not re-derive a per-validator budget from this constant.
     const MEMO_CAP: usize = 4;
 
     struct Entry {

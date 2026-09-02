@@ -129,6 +129,36 @@ awk -F'\t' -v OFS='\t' 'NF>=13 && $1 !~ /^#/ {$9=$10-1} {print}' \
 run_case "a peak below its own resident set (corrupt columns)" \
          "snapshot_is_structurally_whole" "$TMP/peak-below-resident.tsv"
 
+# 9. THE CHAIN STOPS BEING EMPTY. This is the one that guards the far date.
+#    The growth term that survives every optimisation in flight is the eUTXO
+#    ledger, and its slope was measured across a window carrying 1,048
+#    transactions in 29,472 blocks. A chain in use has a different slope, and
+#    the 2027 dates simply do not describe it. Frame size is the cheap proxy:
+#    it rises with transaction volume. Here it doubles.
+sed 's/^# bytes_per_block_measured	.*/# bytes_per_block_measured	27776.8/' \
+  "$SNAP" > "$TMP/chain-in-use.tsv"
+run_case "the chain started being used (frame size doubled)" \
+         "the_chain_is_still_as_idle_as_the_surviving_eutxo_slope_assumes" \
+         "$TMP/chain-in-use.tsv"
+
+# 10. The same contingency by its direct measure rather than its proxy: real
+#     transaction volume. 2 tx/block is still a nearly idle chain by any
+#     ordinary standard, and it is already 56x the derivation window.
+sed 's/^# tx_per_block_measured	.*/# tx_per_block_measured	2.0000/' \
+  "$SNAP" > "$TMP/tx-volume.tsv"
+run_case "real transaction volume on the chain" \
+         "the_chain_is_still_as_idle_as_the_surviving_eutxo_slope_assumes" \
+         "$TMP/tx-volume.tsv"
+
+# 11. Fork overhang stops being a rounding error. At 226 blocks it is 3 MiB and
+#     correctly ignored; at ten thousand it is a memory term the projection does
+#     not model -- and a fork-choice incident before that.
+sed 's/^# fork_overhang_blocks	.*/# fork_overhang_blocks	10000/' \
+  "$SNAP" > "$TMP/fork-overhang.tsv"
+run_case "fork overhang an order of magnitude larger" \
+         "the_fork_overhang_is_still_a_rounding_error_and_not_a_term" \
+         "$TMP/fork-overhang.tsv"
+
 # ---- and the control: the real snapshot must be GREEN ---------------------
 echo
 if (cd "$ROOT" && cargo test -q -p bloch-memoria-projecao >/dev/null 2>&1); then

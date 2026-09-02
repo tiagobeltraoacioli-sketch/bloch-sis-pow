@@ -175,6 +175,42 @@ CHAIN=$(printf '%s\n' "$PAIR"  | sed -n '2p')
 CAP_HI=$(printf '%s\n' "$PAIR" | sed -n '3p')
 jget() { printf '%s' "$CHAIN" | sed -n "s/.*\"$1\":\([0-9]*\).*/\1/p" | head -1; }
 HEIGHT=$(jget height); SLOT=$(jget slot); FINAL=$(jget finalized_height); EPOCH=$(jget epoch)
+
+# ---- THE CONTINGENCY INPUTS ----------------------------------------------
+# The far dates in docs/MEMORY-PROJECTION.md are a claim about an EMPTY chain:
+# what survives every optimisation in flight is the eUTXO ledger, whose slope
+# is a function of transaction volume, not of the calendar. Without these three
+# the claim cannot be checked and goes stale in silence.
+#   fork_overhang_blocks     = blocks_known - height, held whole in RAM
+#   bytes_per_block_measured = blocks.log / blocks_known, rises with tx volume
+#   tx_per_block_measured    = the same question asked outright
+# See tests::the_chain_is_still_as_idle_as_the_surviving_eutxo_slope_assumes.
+BLOCKS_KNOWN=$(jget blocks_known)
+FORK_OVERHANG=""
+if [ -n "$BLOCKS_KNOWN" ] && [ -n "$HEIGHT" ]; then
+  FORK_OVERHANG=$(( BLOCKS_KNOWN - HEIGHT ))
+fi
+
+LOGBYTES=$(sshq "$RPC_HOST" 'ls -1 /home/ubuntu/g4/*/blocks.log 2>/dev/null | head -1 | xargs -r stat -c %s 2>/dev/null' | tr -dc '0-9')
+BYTES_PER_BLOCK=""
+if [ -n "$LOGBYTES" ] && [ -n "$BLOCKS_KNOWN" ] && [ "$BLOCKS_KNOWN" -gt 0 ] 2>/dev/null; then
+  BYTES_PER_BLOCK=$(awk -v b="$LOGBYTES" -v n="$BLOCKS_KNOWN" 'BEGIN{printf "%.1f", b/n}')
+fi
+
+# Sampled across a spread of recent slots, not a contiguous run, so one busy or
+# one empty stretch cannot stand for the chain.
+TXPB=""
+if [ "$FAST" -eq 0 ] && [ -n "$SLOT" ]; then
+  TX_FROM=$(( SLOT - 240 ))
+  TX_REMOTE='t=0; n=0; for s in $(seq '"$TX_FROM"' 20 '"$SLOT"'); do
+      c=$(curl -s --max-time 4 -X POST http://127.0.0.1:'"$RPC_PORT"' \
+            -H "content-type: application/json" \
+            -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getblockbyslot\",\"params\":[$s]}" \
+          | grep -o "\"tx_count\":[0-9]*" | head -1 | cut -d: -f2)
+      if [ -n "$c" ]; then t=$(( t + c )); n=$(( n + 1 )); fi
+    done; echo "$t $n"'
+  TXPB=$(sshq "$RPC_HOST" "$TX_REMOTE" | awk '{ if ($2 > 0) printf "%.4f", $1/$2 }')
+fi
 [ -n "$HEIGHT" ] && [ -n "$SLOT" ] || die "could not parse getchaininfo"
 SLOT_SECS=30   # SLOT_DURATION_SECS, asserted at crates/bloch-pos-node/src/main.rs:914
 GENESIS=$(( CAP_LO - SLOT * SLOT_SECS ))
@@ -272,6 +308,10 @@ NROWS=$(wc -l < "$TMP/final" | tr -d ' ')
   echo "# blocks_per_slot_measured	$BPS"
   echo "# slots_per_day	$(( 86400 / SLOT_SECS ))"
   echo "# blocks_per_day_window	$BPD_WINDOW"
+  echo "# blocks_known	${BLOCKS_KNOWN:-NA}"
+  echo "# fork_overhang_blocks	${FORK_OVERHANG:-NA}"
+  echo "# bytes_per_block_measured	${BYTES_PER_BLOCK:-NA}"
+  [ -n "$TXPB" ] && echo "# tx_per_block_measured	$TXPB"
   echo "# rpc_source	$RPC_HOST:$RPC_PORT"
   echo "# validator_rows	$NROWS"
   printf '#\n'

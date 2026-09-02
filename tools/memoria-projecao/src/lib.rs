@@ -185,6 +185,67 @@ pub const BLOCKS_PER_SLOT_AT_DERIVATION: f64 = 0.982;
 /// wrong by a factor of 1/cadence.
 pub const BLOCKS_PER_SLOT_TOLERANCE: f64 = 0.15;
 
+// ---------------------------------------------------------------------------
+// THE CONTINGENCY THE FAR DATES REST ON
+// ---------------------------------------------------------------------------
+
+/// After the resident block map is served from the log, the growth that
+/// SURVIVES is ~3,174 B/block -- and only ~297 B/block of that is the block
+/// index. **The rest is the eUTXO ledger**, and it was measured over a window
+/// carrying 1,048 transactions in 29,472 blocks: 0.0356 tx/block, a chain
+/// doing essentially nothing.
+///
+/// That slope is a function of TRANSACTION VOLUME, not of the calendar. The
+/// validator-opening programme exists to add users. So the far date is not a
+/// forecast -- it is a statement about a chain that stays this empty, and it
+/// is the first thing that moves when the chain stops being empty.
+pub const TX_PER_BLOCK_AT_DERIVATION: f64 = 1048.0 / 29472.0;
+/// A quiet chain rattles around near zero; this fires when it stops being
+/// quiet at all. 0.5 tx/block is still 14x the derivation window.
+pub const TX_PER_BLOCK_TOLERANCE: f64 = 0.5;
+
+/// Bytes of block log per block. Rises directly with transaction volume, so
+/// it is the cheapest robust proxy for "is the chain still idle", and it needs
+/// no RPC sweep -- one `stat` and one `blocks_known`.
+///
+/// MEASURED 2026-09-01 on 139.84.201.52 `n00`: blocks.log 477,542,599 B over
+/// 34,385 known blocks.
+pub const BYTES_PER_BLOCK_AT_DERIVATION: f64 = 13888.4;
+/// 15% of a frame is roughly one extra transaction every four blocks.
+pub const BYTES_PER_BLOCK_TOLERANCE_FRACTION: f64 = 0.15;
+
+/// **Fork overhang**: non-canonical blocks the node keeps whole in RAM.
+///
+/// MEASURED live 2026-09-01: `blocks_known` 34,385 against `height` 34,159 =
+/// 226 blocks. Real, and unbounded in principle -- but at
+/// [`BYTES_PER_BLOCK_AT_DERIVATION`] it is **3.0 MiB**, 0.25% of a 1,205 MiB
+/// validator. Recorded so the level is honest and so a change is visible. It
+/// is NOT a dating term today, and promoting it to one would misplace the
+/// risk it actually represents.
+pub const FORK_OVERHANG_BLOCKS_AT_DERIVATION: f64 = 226.0;
+/// An overhang an order of magnitude larger would be a memory term -- and,
+/// long before that, a fork-choice incident.
+pub const FORK_OVERHANG_TOLERANCE_BLOCKS: f64 = 2000.0;
+
+// ---------------------------------------------------------------------------
+// REPLAY IS NOT THE REGIME THE FLEET LIVES IN
+// ---------------------------------------------------------------------------
+
+/// Per-block growth of a RUNNING validator, from the fleet's own lineage:
+/// 8.63 KiB/block. Corroborated independently in live production at
+/// +23.0 MiB/day median with 18 of 18 validators positive -- two methods with
+/// nothing in common agreeing to ~6%.
+pub const LIVE_B_PER_BLOCK: f64 = 8837.0;
+/// The same quantity measured on a static REPLAY: 0.01718 MiB/block. It is
+/// 1.99x the live figure. A replay pays for the chain in a way a running node
+/// does not, so replay-derived slopes are an UPPER bound on the live regime
+/// and must not be used to date the fleet directly.
+pub const REPLAY_B_PER_BLOCK: f64 = 0.01718 * 1024.0 * 1024.0;
+/// What survives when `Engine::blocks` is served from `blocks.log`:
+/// 0.0031 MiB/block, of which only 0.00029 MiB/block is the block index.
+pub const STORE_BACKED_RESIDUAL_B_PER_BLOCK: f64 = 0.0031 * 1024.0 * 1024.0;
+pub const STORE_BACKED_INDEX_B_PER_BLOCK: f64 = 0.00029 * 1024.0 * 1024.0;
+
 /// Every input, with its standing. The report prints this verbatim so nobody
 /// has to take the arithmetic on trust.
 pub const INPUTS: &[Input] = &[
@@ -269,6 +330,19 @@ WHAT THIS PROJECTION CANNOT DO
   with time. The validator-opening programme exists to add users. The one
   term nobody can optimise away is the one the roadmap is designed to grow.
 
+  EVERY FAR DATE HERE IS CONTINGENT ON AN EMPTY CHAIN. Once the block map is
+  served from the log, ~3,174 B/block of growth survives and only ~297 B/block
+  of that is the block index -- the rest is the eUTXO ledger, whose slope was
+  measured over a window carrying 1,048 transactions in 29,472 blocks
+  (0.036 tx/block). Re-measured live: 13 blocks sampled, ZERO transactions,
+  mempool empty. That is not a forecast about time. It is a statement about a
+  chain nobody is using yet, and the roadmap's purpose is to change that.
+
+  REPLAY IS NOT THE REGIME THE FLEET LIVES IN. A static replay grows at
+  17,592 B/block; a running validator at 8,837 B/block, measured two
+  independent ways that agree to ~6%. Dating the fleet from a replay slope
+  halves the time that actually exists.
+
   Two of the three ways this projection can be wrong point the same way --
   later than the truth. The VmHWM marks it reads are floors; the reserve it
   holds back is smaller than the page cache the boxes actually use; and the
@@ -324,6 +398,13 @@ pub struct Snapshot {
     pub blocks_per_slot_measured: Option<f64>,
     pub blocks_per_day_measured: Option<f64>,
     pub cadence_window: String,
+    /// Tripwire for the contingency, not an input: transaction volume is what
+    /// the surviving eUTXO slope is a function of.
+    pub tx_per_block_measured: Option<f64>,
+    /// blocks.log bytes / blocks_known. The cheap proxy for the same thing.
+    pub bytes_per_block_measured: Option<f64>,
+    /// `blocks_known - height`: non-canonical blocks held whole in RAM.
+    pub fork_overhang_blocks: Option<f64>,
     pub rows: Vec<Observation>,
 }
 
@@ -426,6 +507,9 @@ impl Snapshot {
                 .copied()
                 .unwrap_or("unrecorded")
                 .to_string(),
+            tx_per_block_measured: getf("tx_per_block_measured"),
+            bytes_per_block_measured: getf("bytes_per_block_measured"),
+            fork_overhang_blocks: getf("fork_overhang_blocks"),
             rows,
         })
     }
