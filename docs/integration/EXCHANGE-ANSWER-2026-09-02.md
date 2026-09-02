@@ -796,8 +796,34 @@ scannable ceiling, so use `slot`. If you want a belt-and-braces check, the
 `-32007` message text carries `head is at slot N` and you can compare, but the
 cursor rule above is sufficient and does not require parsing English.
 
-**We are fixing it in the node**, so that a slot above the head answers with a
-distinct code rather than borrowing the one that means "keep going".
+**We have fixed it in the node.** A slot above the head now answers with its
+own code, `-32012 SLOT_IN_FUTURE`, instead of borrowing the one that means
+"keep going", and it carries the bound machine-readably:
+
+```json
+{"code":-32012,"message":"slot 11 is above this node's head … MUST NOT be skipped …",
+ "data":{"retryable":true,"head_slot":10,"wall_slot":25634,"requested_slot":11}}
+```
+
+Treat `-32012` as **wait and retry**, never as skip. It is measured against the
+node's **head**, not the wall clock, deliberately: judging it by wall clock
+would re-create the deposit-losing bug in the one place deposits actually
+arrive — the tip. The cost of the head rule is that an honest poller at the tip
+may see `-32012` for a slot or two before the chain reaches it, and retry. A
+client that waits is late; a client that skips is wrong forever. `wall_slot` is
+in `error.data` anyway, so you can still tell "this node is behind the network,
+ask another upstream" from "this slot is genuinely ahead of the chain, just
+wait".
+
+That fix is on the release lineage and is **not yet in the binary you can build
+today** — until it ships, the cursor rule above is what protects you, and it
+stays correct afterwards.
+
+One related warning, because both will reach you in the same `error.code`
+field: our public RPC is fronted by an edge proxy that uses `-32010`, `-32011`,
+`-32029` and `-32030` for its own conditions (no quorum, stale upstream, rate
+limited, budget). Those come from the proxy, not from a node. We avoided those
+numbers for exactly this reason.
 
 **`-32008` is ambiguous in the released source — but has not yet misled anyone,
 and we are fixing it before it can.**
