@@ -2,290 +2,293 @@
 # Genesis-4 fleet memory: the projection, and what keeps it honest
 
 **Do not quote a date from this file without running the tool.** The numbers
-below were true of the fleet on 2026-09-01 at chain slot 54,919. They are
-reproduced here for reading; the artefact is:
+below were true of the fleet on 2026-09-01 at chain height 34,104. The
+artefact is:
 
 ```
 scripts/fleet-memory-observe.sh          # read-only capture of the live fleet
 scripts/fleet-memory-observations.tsv    # the capture, checked in
 cargo run  -p bloch-memoria-projecao     # the projection, recomputed from it
-cargo test -p bloch-memoria-projecao     # fails when the fleet stops matching
-scripts/memoria-projecao-violacao.sh     # proves those tests actually bite
+cargo test -p bloch-memoria-projecao     # 21 tests; fail when the fleet moves
+scripts/memoria-projecao-violacao.sh     # 10 falsifications; proves they bite
 ```
 
-The reason for that instruction is the whole point of this document. Every
-headline number in this programme that lacked a commit behind it has turned
-out to be wrong: `0.0198 MiB/block`, `86.1% signature material`, a `367 MiB`
-saving, an "early October" date. Each was published, each was used, none was
-re-checked. So this projection is not a paragraph. It is a program that reads
-the fleet and goes red when the fleet stops agreeing with it.
+Every headline number in this programme that lacked a commit behind it has
+turned out to be wrong: `0.0198 MiB/block`, `86.1% signature material`, a
+`367 MiB` saving, `60 MB per CommittedState`, an "early October" date. So this
+is not a paragraph. It is a program that reads the fleet and goes red when the
+fleet stops agreeing with it.
 
 ---
 
 ## 1. The dates
 
-Two regimes, two dates. Confusing them is the error this artefact is shaped
-to prevent.
-
-| regime | what it is | date | days out |
+| regime | curve | date | days |
 |---|---|---|---|
-| **ROLL** | nine validators boot at once — the **peak** curve, paid at every restart | **2026-11-02** .. 2027-01-21 | 61.1 .. 141.7 |
-| **DRIFT** | nine validators resident, nobody touching them — the **steady** curve | **2026-11-11** .. 2027-02-11 | 70.2 .. 162.7 |
+| **ROLL** — nine boot at once | PEAK | **2026-10-06** | 34.6 |
+| **DRIFT** — nine resident | STEADY | **2026-10-29 .. 2026-11-25** | 57.6 .. 84.1 |
+| ROLL, block map store-backed | PEAK | 2027-04-30 .. 2027-06-20 | 240 .. 292 |
+| DRIFT, block map store-backed | STEADY | 2027-05-16 .. 2027-07-10 | 257 .. 312 |
 
-Binding box in both: `139.84.201.52` (host652460), which carries the fleet's
-largest boot peak (1,513.2 MiB, `bloch-n00`) and its largest resident sum
-(11,366.1 MiB). Capacity is 28,794 MiB after a 3,072 MiB page-cache reserve.
+Binding box `139.84.201.52` in both regimes: largest boot peak (1,517.0 MiB,
+`bloch-n00`) and largest resident sum (11,374.0 MiB). Capacity 28,794 MiB
+after a 3,072 MiB page-cache reserve. Cadence 2,827 blocks/day, measured.
 
-**The roll date is 9.1 days earlier than the drift date — days, not weeks.**
-The peak premium is a *constant* (86.7 MiB on an isolated node; 13–23% on the
-live fleet), not a multiple, so the two curves run parallel instead of
-diverging. A box that survives running can still die in replay.
+A box that survives running can still die in replay. The roll date is the one
+an operator plans against; `scripts/fleet-memory-gate.sh` is the go/no-go for a
+specific roll.
 
-### Second arm: signature material removed
+---
 
-| regime | date | days out |
+## 2. Reconciling the two slopes — confirmed, not averaged
+
+Three numbers were in play. They are **three different quantities**, and the
+apparent conflict dissolves once they are named:
+
+| number | what it measures | standing |
 |---|---|---|
-| ROLL | 2026-12-27 .. 2027-05-30 | 116.7 .. 270.6 |
-| DRIFT | 2027-01-08 .. 2027-06-28 | 129.0 .. 299.2 |
+| **0.01718** MiB/block | the **peak** curve across a replay | reproduced to four digits, three lengths, two chains |
+| **0.01188** MiB/block | the **replay's own retention** (348.9 MiB over 29,377 blocks) | 50 ms curve, five runs |
+| **0.00814** MiB/block | the **live fleet's steady drift** at the tip | 63 validators, 5,235 s (mine) |
+| **0.001234** MiB/block | an artefact | discredited |
 
-Two measured effects, and they are not the same thing:
+**The coordinator's reading is confirmed, and for a sharper reason than "the
+pair spans a regime change."**
 
-* a **one-off drop in the level** — 116.8 MiB, 17.5% of resident, at end of
-  replay. At the *peak* the same change is worth only 55.3 MiB / 7.3%,
-  because allocator arenas depress it.
-* a **lower growth rate** — per-block growth above the 370.0 MiB
-  genesis+carryover plateau falls from 10,579 to 6,410 B/block, a factor of
-  0.606.
+The slope agent's own intervals include one measuring **exactly 0.00000**
+MiB/block. A term genuinely O(chain) cannot grow by exactly zero across an
+interval; that reading is downstream of an allocator release, not a
+data-structure size. We now know why: RSS peaks at 60% of the blocks and the
+run *gives back 96 MiB*, so an end-of-replay reading past the peak measures the
+post-release plateau. For a two-point fit over h=15,000→29,630 to land at
+0.001234, the zero interval must dominate the span — the number is a property
+of the window, not of the system.
 
-The level saving buys a fixed number of days. Only the rate saving multiplies
-the date — and it multiplies it. It does not remove it.
+And **0.01718 carries a confirmed mechanism with matching dimensions**: the
+term store-backing removes is 13.9–14.6 KB/block against a measured on-disk
+envelope of 13,934 B/block. 0.001234 carries none. Finally, 0.01718 lies
+*inside* the slope agent's own interval range, so nothing has to be discarded.
+No average was taken.
 
----
-
-## 2. The denominator is slots, not blocks
-
-This is the correction that matters most, and it arrived late enough to have
-nearly been missed.
-
-Measured **per block**, interval by interval on a real log, growth comes out
-at 0.005, 0.032 and 0.011 MiB/block — a sixfold disagreement. Any two
-endpoints would have produced any one of them, which is precisely what the
-earlier two-point slopes did. Measured **per slot**, the same intervals are
-far steadier. Between h=10,000 and h=15,000 the chain burned 21,187 slots to
-produce 5,000 blocks, and memory followed the slots.
-
-Slots arrive at **2,880/day on the wall clock** whether or not anybody
-produces a block in them (`SLOT_DURATION_SECS = 30`, asserted at
-`crates/bloch-pos-node/src/main.rs:914`). This chain's block cadence has run
-anywhere from 24% to 100% of slots. Denominating in blocks folds a variable
-that has moved by 4× into the rate; denominating in slots removes it, and the
-date becomes a function of the calendar alone. That is normally a *tighter*
-and more trustworthy projection, not a looser one.
-
-Re-denominating moved the date **later**: from the retired mid-October sketch
-to early November. Two things did that — dropping the discredited
-`0.0198 MiB/block`, and taking the block cadence out of the rate.
-
-The block cadence is therefore no longer an input.
-`the_date_does_not_move_when_only_the_block_cadence_moves` proves it
-structurally: halve the cadence in the snapshot and the dates must not move by
-a second. It is still *recorded*, as a **tripwire** — it is the variable that
-was hiding, and if it moves again that is the live natural experiment which
-confirms or refutes the slot hypothesis.
+The denominator therefore reverts to **blocks**, and the slot-denominated model
+is marked Superseded. It rested on that same end-of-replay interval series, and
+a contaminated series is not decontaminated by changing its unit. Today's
+cadence is 0.98 blocks/slot, so live data cannot separate the two denominators
+at all — the mechanism decides: one envelope per block, and an empty slot
+creates no envelope.
 
 ---
 
-## 3. Peak and steady are two curves
+## 3. The four briefing corrections, checked
 
-RSS is **not monotone across a replay**. It climbs while the block map fills,
-peaks around h≈17,000–20,000, then *falls* before the replay ends: `VmHWM`
-762.0 MiB against `VmRSS` 709.6 at h=20,000 and 675.3 at the end. So
-`/usr/bin/time -v`'s maximum answers a different question from "how much is
-resident once the chain is loaded", and the two answers enter the projection
-at different moments.
+| # | claim | verdict |
+|---|---|---|
+| 1 | 10 validators/box; ceiling 2,879 MiB | **REFUTED** |
+| 2 | mean RSS 1,032 MiB | **SUPERSEDED** — now 1,204 |
+| 3 | fork overhang 225–226 blocks | **CONFIRMED** |
+| 4 | cadence 2,903 blocks/day | **CONFIRMED** within 3% |
 
-The peak is a mid-replay transient, so it carries no growth information of its
-own; the growth in the peak curve is the steady curve underneath it, plus a
-constant premium. That the premium *stays* constant as the chain grows is
-**modelled, not measured**, and it is the single most valuable thing left to
-measure — `the_roll_date_is_earlier_than_the_drift_date_but_only_by_days`
-fires if it starts to grow.
+**(1)** Four independent lenses on all seven boxes — argv `run`+`--data-dir`,
+`pgrep -f bloch-pos`, systemd `bloch-n*.service`, distinct `--data-dir` — all
+return **9**, 63 total, indices n00..n62 on stride 7. The classic boxes are
+near-empty (three boxes running one process each, 228–469 MiB), so the total
+live population is 66, not 70. The ceiling is **3,199 MiB**, not 2,879.
 
----
+The briefing's warning that idle classic boxes are running nine `bloch`
+processes at load 9.5 is itself no longer true.
 
-## 4. What sets the width of the range
+**(2)** The fleet measures 75,883 MiB across 63 validators = **1,204
+MiB/validator**. 1,032 is not reproducible against any population I can find:
+even the most generous set of 66 gives 1,166. It is most likely a *correct
+reading that aged* — at the measured 23.4 MiB/day drift, 1,032 is about seven
+days old, which puts it near G4's launch window.
 
-| source | days |
-|---|---|
-| the growth curve's own **non-linearity** | 80.6 of an 80.6-day band — **dominates** |
-| the page-cache reserve, if halved | 6.2 |
-| best box vs worst box | 5.1 |
+**Worth flagging: corrections (1) and (2) nearly cancelled.** A 10% too-small
+ceiling against an 18% too-small resident level gave 37 days where the
+corrected inputs give 39.4 by the same method. Two wrong inputs cancelling is
+exactly how a wrong number survives review.
 
-The three measured intervals are 11.9, 21.8 and 27.6 MiB/day/validator. They
-differ by 2.3× **and they are rising**. That spread — not measurement error,
-not the reserve, not the box variation — is essentially the entire width.
-Narrowing these dates means measuring a fourth interval, not doing more
-arithmetic on these three.
+**(3)** Confirmed independently, and it is now *measured* rather than quoted:
+`blocks_known − height` off three validators gives 225 / 226 / 226. The
+collector records it every run.
 
-Because the intervals rise, the binding arm is a **lower bound on the rate**,
-which makes the near date an **upper bound on the time available**.
-
-### How far past the evidence this reaches
-
-The chain is 54,919 slots old. The binding roll date is slot ~230,900 —
-**4.2× the chain that exists today** — while every growth rate behind it was
-measured on a log of at most ~30,600 blocks. This is an extrapolation several
-times beyond the range of any measurement supporting it. That is a larger
-source of error than everything in the table above, and it is *not* in the
-band, because a band cannot express it.
+**(4)** 2,827/day over slot 49,382–55,000; 2,861/day over the last 83 minutes;
+0.98 blocks/slot. The projection uses the snapshot's own figure.
 
 ---
 
-## 5. Inputs, with their standing
+## 4. The peak is copy-on-write, not a term that grows on its own
 
-Printed in full by the tool. Summarised:
+RSS is **not monotone**. At 50 ms sampling over five runs (noise floor 8 kB)
+the peak lands at t≈253 s of a 376 s run, at height ~17,663 of 29,377 — 60% of
+the blocks — and the run then gives back 96 MiB. End of replay 666.1 MiB
+against `VmHWM` 761.9.
 
-**Measured** — box RAM (31,866 MiB, `/proc/meminfo`, all 7 boxes); validators
-per box (9; argv scan for `run` + `--data-dir`, 63 processes); resident per
-box (10,426–11,366 MiB, sum of `VmRSS`); boot peak per validator
-(1,145–1,513 MiB, `VmHWM`, kernel-retained); slots per day (2,880, exact);
-the three growth intervals (11.9 / 21.8 / 27.6 MiB/day/validator); the peak
-premium (86.7 MiB isolated, 13–23% fleet); both signature-arm effects.
+The alternatives were eliminated **by measurement**, not by argument:
 
-**Modelled** — the 3,072 MiB page-cache reserve (an operator *choice*; the
-boxes were observed holding 5,135–8,137 MiB of cache, so it is if anything
-too low, which makes these dates *later* than the truth); that the peak
-premium stays constant; that growth stays linear in slots; that a single-node
-replay rate transfers to a nine-per-box fleet; that the 17.5% level saving
-transfers to a fleet validator.
+* carryover and state-root work finish at t≈0.5 s and t≈52 s, long before the
+  peak;
+* `MEMO_CAP` twice over — `rolled_to` performed **zero** rolls in the entire
+  replay, so the memo is never populated, and four extra mainnet-sized states
+  measure **320 kB** anyway.
 
-**Superseded** — the per-block rates (0.01473–0.01719 MiB/block) and
-2,873 blocks/day. Correctly measured, wrong denominator. Kept visible because
-deleting them is how they get quoted again next month.
+What remains: `REORG_STATE_WINDOW` holding a state makes the eUTXO `Arc`
+**shared**, and a shared `Arc` sends the next mutation through
+`Arc::make_mut` — a clone of the whole 452,726-entry map, **52.4 MiB** a time.
+Counted directly: **892** mutations copied the map, **384,638** mutated in
+place. The curve steps in units of exactly 52.4 MiB and releases exactly two of
+them in a single 50 ms sample.
 
-**Discredited** — `0.0198 MiB/block` (measured on a tree lacking the boot-copy
-fix; overestimates; behind the retired "early October" sketch) and
-`86.1% of Engine::blocks is signature material` (the proposer signature is
-32.9% of a frame; the ~90% figure counts attestations too).
+So the retention window is the **enabler, not the retention cost**, and the
+premium scales with **the size of the eUTXO map**, not with chain length. At
+0.0356 tx/block that map is near-constant, so the premium is a roughly fixed
+1–2 copies and grows only when usage does — the same back wall as §6, reached
+by a different road.
 
-### The one the fleet cannot answer for itself
+**Open, and stated rather than smoothed over:** a constant transient does not
+by itself explain a peak slope of 0.01718 MiB/block reproduced to four digits
+across three lengths. The mechanism is confirmed; it does not yet close the
+arithmetic. Counting live CoW copies against replay length is the next
+measurement, and until it exists the roll arm keeps the reproduced slope rather
+than the mechanism's prediction.
 
-It is tempting to read a growth rate off the fleet directly: 63 validators
-booted at 63 different chain lengths, and `VmHWM` is free. Doing it yields
-0.17–0.30 MiB/block within six of the seven boxes at r = 0.84–0.99 — ten to
-twenty times any replay-measured rate — and the seventh box returns a
-**negative** rate at r = −0.51.
+### `60 MB per CommittedState` is wrong by ~750×
 
-It is not a rate. The fleet was migrated in batches, so within a box the k-th
-validator to boot is *both* the k-th highest boot height *and* the one that
-booted with k−1 siblings already resident competing for page cache. Boot order
-and chain length are perfectly collinear within a box. The negative box is the
-tell. Recorded in `Snapshot::fleet_slope_is_confounded` so nobody spends an
-afternoon rediscovering it and, worse, publishing the answer.
+Four extra mainnet-sized states measure 320 kB, because `EutxoSet.entries` is
+an `Arc<BTreeMap>` and holding a state is a refcount increment — states *do*
+structurally share, which is exactly what the doc comment denies. The figure,
+and the ~240 MB and ~300 MB totals built on it, are still live at
+**`crates/bloch-pos-node/src/engine.rs:274-277`**. That file is not this
+crate's to edit (it is on the consensus path and another agent's area); the
+figure is recorded here as Discredited and the owner should strike it. The same
+comment also says "EIGHT validators per host", which is wrong too.
 
 ---
 
-## 6. Floor, never headroom
+## 5. The 1.8× end-of-replay gap: level, not slope — and not this date
 
-`VmHWM` is a lifetime high-water mark, so for every validator running right
-now the boot peak it actually paid is already recorded, kernel-measured, at no
-cost. That is why this projection can be checked against reality instead of
-against a model.
+The model predicted 344–375 MiB at end of replay; measured 666.1. The peak/end
+distinction accounts for only 96 MiB of a ~300 MiB gap, so non-monotonicity
+does not rescue it: **RSS is non-monotone *and* the model is refuted.** Both.
 
-It comes with one hard rule: **a mark set days ago was set against a shorter
-chain.** It is a floor and never the headroom you have. On the 2026-09-01
-capture the freshest mark on the whole fleet was 4,140 slots old (1.4 days);
-`roll_arm_rests_on_marks_that_are_still_informative` fails past 20,160 slots
-(seven days), because past that no process on the fleet has booted recently
-enough to bound a boot today.
+The measurer's hypothesis holds exactly. Pre-replay `VmRSS` is 317.2 MiB and
+the replay retains +348.9 MiB in both runs; **317.2 + 348.9 = 666.1**, to
+within a tenth of a MiB. The model costed the state and omitted the chain the
+replay retains. That is a missing **additive term** — a level error.
 
-Staleness is counted in **slots**, deliberately. Counting it in blocks would
-understate it by 1/cadence exactly when the chain is slow — exactly when it
-matters.
+**It does not move the dates here, and not by luck.** This projection never
+reads a predicted level: it reads `VmRSS` and `VmHWM` off 63 live validators. A
+model that mis-predicts the level cannot move a date computed from a measured
+level. Any date computed *from* that model moves a great deal.
 
-**Do not restart a validator to refresh a mark.** That is a double-signing
-risk incurred for a number. Measure a candidate boot on an *idle* box against
-a tip-height `blocks.log` and pass it to `scripts/fleet-memory-gate.sh` as
-`--peak-mib`. That script is the operational go/no-go for a specific roll;
-this one is the dated projection behind it.
+And the missing term **confirms the slope rather than changing it**. Spread
+over 29,377 blocks, 348.9 MiB is 0.01188 MiB/block — a third independent route
+to the block-map term, against 0.01329 MiB/block of on-disk envelope and a
+store-backed removed term of 13.9–14.6 KB/block. Three methods, three
+directions, one number. The gap is the strongest evidence yet *for* the
+block-map slope, and it is now a test
+(`the_replay_retention_term_still_reconciles_with_the_on_disk_envelope`).
+
+It also recalibrated the drift arm. The live-fleet reading (0.00814) is used as
+the **optimistic** end and the replay's retention rate (0.01188) as the
+**binding** end, because a validator at the tip is filling allocator slack the
+replay transient left behind — short-run RSS growth understates the durable
+rate until that slack is gone.
+
+---
+
+## 6. The wall behind the wall
+
+What survives store-backing is **not** the block map — that is 0.00029 of a
+0.0031 MiB/block residual. About **90% is the committed state**, the eUTXO
+ledger, measured across a window carrying 1,048 transactions in 29,472 blocks:
+**0.0356 tx/block**, a nearly empty chain.
+
+Dividing through gives **0.0785 MiB of resident state per transaction**
+(derived — arithmetic on measured inputs, one low-volume window). At **one
+transaction per block** the state term alone is 0.0785 MiB/block, which is
+**4.6× the baseline block-map term store-backing removed**, and the
+store-backed fleet exhausts a box in **10 days**.
+
+The date does not merely return. It arrives *sooner than it would have without
+the fix*, because the fix removed the term that does **not** grow with usage.
+And the validator-opening programme exists to add users. Store-backing clears
+the front wall; the back wall is made of transactions.
 
 ---
 
 ## 7. What this projection cannot do
 
-Growth is linear in chain length — and the three measured intervals are
-rising, so linear is the *optimistic* reading. **Nothing on the table makes
-memory bounded.** Removing the signature term multiplies the date; it does not
-move it to infinity, because what is left is still a line with positive slope.
-Every improvement in flight removes a *constant factor* from a curve that
-still rises forever. The date returns.
+Growth is linear in chain length. **Nothing on the table makes memory
+bounded.** Store-backing multiplies the date by roughly seven; it does not move
+it to infinity, because what is left is still a line with positive slope. Every
+improvement in flight removes a *constant factor* from a curve that still rises
+forever.
 
 A bounded design would be **O(unfinalized + state)**, not O(chain): resident
-cost set by the unfinalized suffix (85 blocks today) plus the state, with
-history paged from the log. **No current workstream aims there.** That is not
-a criticism of the work in flight, which is real and measured; it is the
-difference between postponing a date and removing one.
+cost set by the unfinalized suffix (88 blocks today) plus the state, with
+history paged from the log. **No current workstream aims there.**
 
-And the irreducible term is not constant either. What survives every
-optimisation is the **carryover eUTXO set**, and that grows with *usage*, not
-with time. The validator-opening programme exists to add users. The one term
-nobody can optimise away is the one the roadmap is designed to grow.
+The **fork overhang** is the one growing term with no workstream at all: 225
+non-canonical blocks held whole in RAM (~3 MiB), and store-backing does not
+touch it — that change moves the *canonical* map to disk. Small today,
+unbounded in principle, now measured every run and alarmed at 2,000 blocks.
 
 **Every way this projection is likely to be wrong points the same direction —
-later than the truth.** The `VmHWM` marks it reads are floors. The reserve it
-holds back is smaller than the page cache the boxes actually use. The growth
-intervals are rising rather than flat. And it extrapolates 4.2× past its own
-evidence. Read the dates as an upper bound on the time available, not as a
-forecast.
+later than the truth.** The `VmHWM` marks are stale floors. The reserve is
+smaller than the page cache the boxes actually use (5,135–8,148 MiB observed
+against 3,072 held back). The live-fleet drift rate is a lower bound. And the
+dates extrapolate several times past the longest log ever replayed (~30,600
+blocks) — a source of error larger than everything in the width table, and not
+expressible as a band.
 
 ---
 
-## 8. How the staleness alarm works
+## 8. The staleness alarm, and the guard that was missing
 
-`cargo test -p bloch-memoria-projecao` recomputes the dates from the snapshot
-and fails when reality has moved them more than 7 days, when the snapshot is
-more than 14 days old, when a box changes size or tenancy, when the block
-cadence moves more than 0.15 blocks/slot, when no `VmHWM` mark is fresher than
-20,160 slots, when the boot premium vanishes or becomes a multiple, or when
-the recomputed date is already in the past. None of these re-assert a
-constant; each compares a claim to a kernel-measured reading and names the box
-that broke it.
+21 tests recompute the dates from the snapshot and fail when a box changes size
+or tenancy, when the four tenancy lenses disagree, when the fleet outgrows the
+published date by a week, when the snapshot passes 14 days, when the cadence
+moves 10%, when no `VmHWM` mark is fresher than 20,000 blocks, when the boot
+premium vanishes or becomes a multiple, when the fork overhang runs away, when
+the three routes to the block-map term stop agreeing, or when the recomputed
+date is already in the past. None re-asserts a constant.
 
-Two are deliberately time-dependent. That is not a flake. A projection whose
-inputs are 40 days old *is* broken, and a suite that cannot say so leaves the
-staleness for a human to remember. Nobody remembered last time.
+**The guard that was missing.** The previous round asserted "9 validators per
+box" and passed — but it would have passed just as happily if the *collector*
+had miscounted, because an under-count makes a box look emptier, moves the date
+in the safe direction, and leaves every downstream check green. A tenancy claim
+of 10-per-box reached this programme and was refuted only because four lenses
+were read instead of one. So the box is now enumerated four independent ways,
+the counts are carried in the snapshot, and
+`the_four_independent_counts_of_tenancy_agree` fails when they part — whichever
+of them is wrong. The falsification harness proves it by making systemd see ten
+where argv sees nine.
 
-`scripts/memoria-projecao-violacao.sh` is the proof that the alarm is wired to
-something. It falsifies the snapshot eight ways — a resized box, a tenth
-validator, a cadence collapse to 24%, a fleet 250 MiB/validator fatter, marks
-ten days stale, a 40-day-old snapshot, a vanished boot premium, and a
-column-shifted file — and requires the named test to go red for each. If a
-falsification passes green, that script fails, because a check that no longer
-bites is worse than no check: it is still being counted.
+Two tests are deliberately time-dependent. That is not a flake: a projection
+whose inputs are 40 days old *is* broken, and a suite that cannot say so leaves
+the staleness for a human to remember.
 
-Last run: **8 caught, 0 missed, control green.**
+`scripts/memoria-projecao-violacao.sh` falsifies the snapshot ten ways and
+requires the named test to go red for each; if one passes green, that script
+fails. Last run: **10 caught, 0 missed, control green.**
 
 ---
 
 ## 9. Provenance of the fleet reading
 
-`scripts/fleet-memory-observe.sh` is read-only with respect to the fleet by
-construction: one `ssh` per box that reads `/proc` and curls the node's own
-loopback RPC. It starts nothing, stops nothing, restarts no validator, writes
-nothing on any box outside `/tmp`, and arms nothing.
+`scripts/fleet-memory-observe.sh` is read-only by construction: one `ssh` per
+box reading `/proc`, plus the node's own loopback RPC. It starts nothing, stops
+nothing, restarts no validator, writes nothing on any box outside `/tmp`, and
+arms nothing. Boot heights come from the chain's archive via `getblockbyslot`,
+not from wall-clock arithmetic.
 
-Boot heights are read out of the chain's archive via `getblockbyslot`, not
-inferred from wall-clock arithmetic. Slot↔time is exact (a fixed 30 s off
-`genesis_time_ms`), so `started_unix` converts to a slot without error, and
-the snapshot carries its own anchor error bar (`anchor_error_secs`).
-
-Three portability traps are pinned in that script because each produced a file
-that looked correct:
-
-* `LC_ALL=C` — under a pt_BR locale `awk` emits `2826,8` and the parse fails
-  days later with a message about a malformed field rather than about a locale.
-* no `declare -A` — macOS ships bash 3.2, where it fails *non-fatally*,
-  leaving every boot height `NA` and the roll arm silently unbounded.
-* the RPC port is read as the argument *after* `--rpc-port`. Taking "the first
-  five-digit argument" picks up `--listen`, which comes earlier in this argv,
-  and every later probe then talks to the p2p port and finds nothing.
+Four portability traps are pinned there, because each produced a file that
+looked correct: `LC_ALL=C` (a pt_BR locale emits `2826,8` and the parse fails
+days later complaining about a field, not a locale); no `declare -A` (macOS
+ships bash 3.2, where it fails *non-fatally*, leaving boot heights `NA` and the
+roll arm silently unbounded); the RPC port is read as the argument *after*
+`--rpc-port` (taking "the first five-digit argument" picks up `--listen`, which
+comes earlier in this argv); and the `BOXMETA` column indices, which were off
+by one and put the hostname in `mem_total_mib` — caught by
+`snapshot_is_structurally_whole`, and now a falsification case of its own.

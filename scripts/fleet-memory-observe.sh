@@ -109,7 +109,25 @@ NC=$(nproc)
 NOW=$(date +%s)
 BOOT=$(awk '/^btime/{print $2}' /proc/stat)
 HZ=$(getconf CLK_TCK)
-echo "BOXMETA	$BOX	$MT	$MA	$CA	$NC	$NOW"
+# Four INDEPENDENT enumerations of "how many validators is this box running".
+# They exist because a single lens that under-counts is invisible: it moves the
+# projected date in the SAFE direction and every check built on it still passes.
+# A tenancy change (9 -> 10) went unnoticed once already and moves the ceiling
+# by 10%, so the count is not read once -- it is read four ways and the
+# projection refuses to run when they disagree.
+L_ARGV=0
+for p in /proc/[0-9]*; do
+  [ -r "$p/cmdline" ] || continue
+  a=$(tr '\000' '\012' < "$p/cmdline" 2>/dev/null)
+  printf '%s\n' "$a" | grep -qx -- 'run' || continue
+  printf '%s\n' "$a" | grep -qx -- '--data-dir' || continue
+  L_ARGV=$((L_ARGV+1))
+done
+L_PGREP=$(pgrep -c -f 'bloch-pos' 2>/dev/null); L_PGREP=${L_PGREP:-0}
+L_UNITS=$(systemctl list-units --type=service --all --no-legend --no-pager 'bloch-n*' 2>/dev/null | wc -l | tr -d ' ')
+L_DDIR=$(for p in /proc/[0-9]*; do [ -r "$p/cmdline" ] || continue
+  tr '\000' '\012' < "$p/cmdline" 2>/dev/null | awk '/^--data-dir$/{getline; print}'; done | sort -u | wc -l | tr -d ' ')
+echo "BOXMETA	$BOX	$MT	$MA	$CA	$NC	$NOW	$L_ARGV	$L_PGREP	$L_UNITS	$L_DDIR"
 for p in /proc/[0-9]*; do
   pid=${p#/proc/}
   [ -r "$p/cmdline" ] || continue
@@ -175,6 +193,11 @@ CHAIN=$(printf '%s\n' "$PAIR"  | sed -n '2p')
 CAP_HI=$(printf '%s\n' "$PAIR" | sed -n '3p')
 jget() { printf '%s' "$CHAIN" | sed -n "s/.*\"$1\":\([0-9]*\).*/\1/p" | head -1; }
 HEIGHT=$(jget height); SLOT=$(jget slot); FINAL=$(jget finalized_height); EPOCH=$(jget epoch)
+BKNOWN=$(jget blocks_known)
+# Non-canonical blocks the node is holding whole in RAM. Unbounded, and the
+# only growing term here with no workstream aimed at it.
+OVERHANG="NA"
+[ -n "${BKNOWN:-}" ] && [ -n "$HEIGHT" ] && OVERHANG=$(( BKNOWN - HEIGHT ))
 [ -n "$HEIGHT" ] && [ -n "$SLOT" ] || die "could not parse getchaininfo"
 SLOT_SECS=30   # SLOT_DURATION_SECS, asserted at crates/bloch-pos-node/src/main.rs:914
 GENESIS=$(( CAP_LO - SLOT * SLOT_SECS ))
@@ -244,16 +267,16 @@ fi
 # ------------------------------------------------------------- emit ---------
 NOW=$(date -u +%s)
 awk -F'\t' -v OFS='\t' -v g="$GENESIS" -v ss="$SLOT_SECS" -v now="$NOW" '
-  $2=="BOXMETA"{ mt[$1]=$4; ma[$1]=$5; ca[$1]=$6; nc[$1]=$7; next }
-  $2=="PROC"{ print $1, $3, mt[$1], ma[$1], ca[$1], nc[$1], $5, $4, $7, $8, $9, now-$9, int(($9-g)/ss) }
+  $2=="BOXMETA"{ mt[$1]=$4; ma[$1]=$5; ca[$1]=$6; nc[$1]=$7; la[$1]=$9; lp[$1]=$10; lu[$1]=$11; ld[$1]=$12; next }
+  $2=="PROC"{ print $1, $3, mt[$1], ma[$1], ca[$1], nc[$1], $5, $4, $7, $8, $9, now-$9, int(($9-g)/ss), la[$1], lp[$1], lu[$1], ld[$1] }
 ' "$TMP/raw" > "$TMP/rows"
 
 # join the slot->height map onto the last column, and convert KiB -> MiB
 awk -F'\t' -v OFS='\t' '
   NR==FNR { H[$1]=$2; next }
   { bh = ($13 in H) ? H[$13] : "NA"
-    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%.1f\t%.1f\t%s\t%s\t%s\n", \
-           $1,$2,$3,$4,$5,$6,$7,$8, $9/1024, $10/1024, $11,$12, bh }
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%.1f\t%.1f\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", \
+           $1,$2,$3,$4,$5,$6,$7,$8, $9/1024, $10/1024, $11,$12, bh, $14,$15,$16,$17 }
 ' "$TMP/bh.tsv" "$TMP/rows" | sort -t"$(printf '\t')" -k1,1 -k11,11n > "$TMP/final"
 
 NROWS=$(wc -l < "$TMP/final" | tr -d ' ')
@@ -264,6 +287,8 @@ NROWS=$(wc -l < "$TMP/final" | tr -d ' ')
   echo "# chain_height	$HEIGHT"
   echo "# chain_slot	$SLOT"
   echo "# chain_finalized_height	${FINAL:-NA}"
+  echo "# blocks_known	${BKNOWN:-NA}"
+  echo "# fork_overhang_blocks	$OVERHANG"
   echo "# chain_epoch	${EPOCH:-NA}"
   echo "# slot_secs	$SLOT_SECS"
   echo "# genesis_unix	$GENESIS"
@@ -275,11 +300,11 @@ NROWS=$(wc -l < "$TMP/final" | tr -d ' ')
   echo "# rpc_source	$RPC_HOST:$RPC_PORT"
   echo "# validator_rows	$NROWS"
   printf '#\n'
-  printf 'box_ip\tbox_host\tmem_total_mib\tmem_avail_mib\tcached_mib\tnproc\tunit\tpid\tvmhwm_mib\tvmrss_mib\tstarted_unix\tmark_age_s\tboot_height\n'
+  printf 'box_ip\tbox_host\tmem_total_mib\tmem_avail_mib\tcached_mib\tnproc\tunit\tpid\tvmhwm_mib\tvmrss_mib\tstarted_unix\tmark_age_s\tboot_height\tlens_argv\tlens_pgrep\tlens_units\tlens_datadirs\n'
   cat "$TMP/final"
 } > "$OUT"
 
-NA=$(awk -F'\t' 'NF>=13 && $13=="NA"' "$OUT" | wc -l | tr -d ' ')
+NA=$(awk -F'\t' 'NF>=17 && $13=="NA"' "$OUT" | wc -l | tr -d ' ')
 echo "fleet-memory-observe: wrote $OUT"
 echo "  chain height $HEIGHT slot $SLOT, blocks/day measured $BPD ($BPD_WINDOW)"
 echo "  $NROWS validator processes across $(printf '%s\n' "$BOXES" | wc -l | tr -d ' ') boxes, $NA without a boot height"

@@ -92,7 +92,10 @@ fn snapshot_has_not_gone_stale() {
          At the binding rate the fleet has since put on roughly {:.0} MiB per box, so\n\
          every number the projection rests on is a memory rather than a measurement\n\
          and the published dates are unsupported.\n{REDO}",
-        age_days * STEADY_MIB_PER_DAY_RECENT * 9.0
+        age_days
+            * REPLAY_RETENTION_MIB_PER_BLOCK
+            * BLOCKS_PER_DAY_AT_DERIVATION
+            * EXPECTED_VALIDATORS_PER_BOX as f64
     );
 }
 
@@ -121,7 +124,7 @@ fn every_box_still_carries_the_validators_the_projection_assumes() {
     let s = snap();
     for b in s.boxes() {
         assert_eq!(
-            b.validators, 9,
+            b.validators, EXPECTED_VALIDATORS_PER_BOX,
             "box {} ({}) is running {} validators, not 9. Both dates scale with N:\n\
              the roll need is N x peak and the drift burn is N x rate, so a box with\n\
              a different tenancy has a different date. Note also that boxes recorded\n\
@@ -132,57 +135,206 @@ fn every_box_still_carries_the_validators_the_projection_assumes() {
     }
 }
 
-// ── the hidden variable: slots against blocks ─────────────────────────────
+// ── tenancy: the input a single lens cannot be trusted with ───────────────
 
 #[test]
-fn the_slot_to_block_relation_is_still_what_the_projection_was_derived_under() {
+fn the_four_independent_counts_of_tenancy_agree() {
+    // The guard the previous round did not have. Asserting "9 validators" is
+    // useless if the collector is the thing that miscounted: an under-count
+    // moves the date in the SAFE direction and every check built on it still
+    // passes. So the box is enumerated four independent ways -- argv,
+    // pgrep, systemd units, distinct --data-dir -- and the projection refuses
+    // to run when they disagree, whichever of them is wrong.
     let s = snap();
-    let bps = s.blocks_per_slot_measured.unwrap_or_else(|| {
-        panic!(
-            "the snapshot records no blocks-per-slot ratio, so the one variable that\n\
-             was hiding inside the old per-block rates cannot be watched at all.\n\
-             Re-run the collector WITHOUT --fast.\n{REDO}"
-        )
+    for b in s.boxes() {
+        let lenses = [b.lens_argv, b.lens_pgrep, b.lens_units, b.lens_datadirs];
+        let all_agree = lenses.iter().all(|&v| v == lenses[0]);
+        assert!(
+            all_agree,
+            "box {} ({}): the four independent counts of how many validators it is\n\
+             running DISAGREE -- argv={} pgrep={} systemd-units={} data-dirs={}.\n\
+             \n\
+             Do not pick one. A tenancy claim of 10-per-box reached this programme\n\
+             and would have cut the per-validator ceiling from 3,199 to 2,879 MiB;\n\
+             it was refuted only because four lenses were read instead of one.\n\
+             A disagreement here means either a validator is running that systemd\n\
+             does not manage (an orphan from a manual start -- check for a duplicate\n\
+             signer before anything else, that is a slashing risk), or a unit is\n\
+             enabled with no process behind it, or the argv shape changed.\n{REDO}",
+            b.ip, b.host, b.lens_argv, b.lens_pgrep, b.lens_units, b.lens_datadirs
+        );
+        assert_eq!(
+            b.validators, lenses[0] as usize,
+            "box {} ({}): the snapshot carries {} validator ROWS but the box reports\n\
+             {} running validators. The collector dropped a process it should have\n\
+             captured -- and a dropped process is invisible in every downstream\n\
+             number, because it makes the box look emptier than it is.\n{REDO}",
+            b.ip, b.host, b.validators, lenses[0]
+        );
+    }
+}
+
+// ── the block cadence, which is an input again ────────────────────────────
+
+#[test]
+fn the_block_cadence_still_matches_what_the_dates_are_denominated_in() {
+    // Reversal from the previous round, and it is decided by mechanism rather
+    // than by fit: the dominant term is one envelope per BLOCK, and an empty
+    // slot creates no envelope. So cadence is an input, not a tripwire, and a
+    // change in it moves the date in direct proportion.
+    let s = snap();
+    let bpd = s.blocks_per_day_measured.unwrap_or_else(|| {
+        panic!("the snapshot records no measured block rate. Re-run the collector.\n{REDO}")
     });
-    let moved = (bps - BLOCKS_PER_SLOT_AT_DERIVATION).abs();
+    let drift = (bpd - BLOCKS_PER_DAY_AT_DERIVATION).abs() / BLOCKS_PER_DAY_AT_DERIVATION;
     assert!(
-        moved <= BLOCKS_PER_SLOT_TOLERANCE,
-        "the chain is producing {bps:.3} blocks per slot (measured over {}), against\n\
-         the {BLOCKS_PER_SLOT_AT_DERIVATION:.3} this projection was derived under --\n\
-         a move of {moved:.3}, limit {BLOCKS_PER_SLOT_TOLERANCE:.2}.\n\
+        drift <= BLOCKS_PER_DAY_TOLERANCE,
+        "the chain is producing {bpd:.1} blocks/day (measured over {}), against the\n\
+         {BLOCKS_PER_DAY_AT_DERIVATION:.0}/day the dates are denominated in -- {:.1}% off,\n\
+         limit {:.0}%.\n\
          \n\
-         This is the tripwire, and tripping it is INFORMATIVE rather than merely\n\
-         bad. Growth was found to follow SLOTS, not blocks: between h=10,000 and\n\
-         h=15,000 the chain burned 21,187 slots for 5,000 blocks and memory tracked\n\
-         the slots. If that is right, the dates here should NOT move now that the\n\
-         cadence has -- and this is the live natural experiment that settles it.\n\
-         Re-measure the growth rate across this cadence change before touching the\n\
-         dates. Separately: every per-BLOCK memory figure still in circulation is\n\
-         now wrong by a factor of about {:.2}.\n{REDO}",
+         Memory grows per BLOCK, so the date moves in direct proportion: at\n\
+         {bpd:.1}/day the roll date moves by about {:.1} days.\n\
+         \n\
+         Note the cadence is ALSO the experiment that would settle blocks against\n\
+         slots. Today it runs at 0.98 blocks/slot, so the two denominators are\n\
+         numerically indistinguishable on live data and only the mechanism\n\
+         separates them. A cadence far from 1.0 makes them separable: measure the\n\
+         growth rate across the change before re-deriving anything.\n{REDO}",
         s.cadence_window,
-        BLOCKS_PER_SLOT_AT_DERIVATION / bps.max(1e-9)
+        drift * 100.0,
+        BLOCKS_PER_DAY_TOLERANCE * 100.0,
+        CLAIMED_ROLL_DAYS * (1.0 - BLOCKS_PER_DAY_AT_DERIVATION / bpd)
     );
 }
 
 #[test]
-fn the_date_does_not_move_when_only_the_block_cadence_moves() {
-    // The point of re-denominating in slots is that the block rate stops being
-    // an input. This proves it structurally rather than by inspection: halve
-    // the cadence and the dates must not budge by a single second.
+fn the_date_moves_in_proportion_to_the_block_cadence() {
+    // Structural check that the denominator really is the block. The previous
+    // model asserted the opposite of this and was wrong; the assertion is kept
+    // pointing the other way so the reversal cannot be undone by accident.
     let s = snap();
     let base = project(&s, RESERVE_MIB_DEFAULT);
-    let mut slower = s.clone();
-    slower.blocks_per_slot_measured = slower.blocks_per_slot_measured.map(|v| v / 2.0);
-    slower.blocks_per_day_measured = slower.blocks_per_day_measured.map(|v| v / 2.0);
-    let p2 = project(&slower, RESERVE_MIB_DEFAULT);
-    assert_eq!(
-        (base.roll.unix_lo, base.drift.unix_lo),
-        (p2.roll.unix_lo, p2.drift.unix_lo),
-        "halving the block cadence moved the projected dates. It must not: growth is\n\
-         denominated in SLOTS, which the wall clock delivers at {SLOTS_PER_DAY:.0}/day\n\
-         whether or not blocks are produced in them. If project() has started reading\n\
-         a block rate again, the sixfold spread that per-block rates showed across\n\
-         three intervals (0.005 / 0.032 / 0.011 MiB/block) is back inside the date."
+    let mut faster = s.clone();
+    faster.blocks_per_day_measured = Some(base.blocks_per_day * 2.0);
+    let p2 = project(&faster, RESERVE_MIB_DEFAULT);
+    let ratio = base.roll.days_lo / p2.roll.days_lo;
+    assert!(
+        (ratio - 2.0).abs() < 1e-6,
+        "doubling the block rate should halve the days-to-exhaustion exactly, since\n\
+         the dominant term is one envelope per block; got a factor of {ratio}.\n\
+         Either project() has stopped reading the cadence -- the retired\n\
+         slot-denominated model -- or it has acquired a term that is not linear in\n\
+         blocks."
+    );
+}
+
+// ── the two curves must stay two ──────────────────────────────────────────
+
+// ── model-internal coherence guards ───────────────────────────────────────
+//
+// The three tests below are NOT reality checks and must not be counted as
+// such. They compare a constant to a constant, which clippy correctly notices
+// and which is the exact anti-pattern the rest of this file exists to avoid:
+// they cannot fail because the fleet moved, only because someone edited a
+// number without editing the ones it has to stay consistent with.
+//
+// They earn their place anyway, because the numbers they relate come from
+// four different measuring parties, and a later edit that breaks the
+// relationship between them would otherwise land silently. Read them as
+// "these constants still describe one system", never as evidence about the
+// fleet. The `#[allow]` is a label, not a silencing.
+
+#[test]
+#[allow(clippy::assertions_on_constants)]
+fn the_peak_curve_still_grows_faster_than_the_steady_curve() {
+    assert!(
+        PEAK_MIB_PER_BLOCK_BASELINE > REPLAY_RETENTION_MIB_PER_BLOCK,
+        "the PEAK rate ({PEAK_MIB_PER_BLOCK_BASELINE}) is no longer above the replay's\n\
+         retention rate ({:.5}). If they have converged, the boot premium has stopped\n\
+         growing and the roll and drift dates collapse into one.",
+        REPLAY_RETENTION_MIB_PER_BLOCK
+    );
+    assert!(
+        REPLAY_RETENTION_MIB_PER_BLOCK > STEADY_MIB_PER_BLOCK_FLEET,
+        "the drift band is inverted: its binding end ({:.5}, the replay's retention\n\
+         rate) must exceed its optimistic end ({STEADY_MIB_PER_BLOCK_FLEET}, what the\n\
+         live fleet is currently adding). The fleet reading is the LOWER bound on\n\
+         purpose -- a validator at the tip is filling allocator slack the replay\n\
+         transient left behind, so short-run RSS growth understates the durable rate.",
+        REPLAY_RETENTION_MIB_PER_BLOCK
+    );
+}
+
+#[test]
+#[allow(clippy::assertions_on_constants)]
+fn the_replay_retention_term_still_reconciles_with_the_on_disk_envelope() {
+    // Three independent routes to the block-map term must keep agreeing, or
+    // the mechanism behind the whole second arm is no longer confirmed.
+    let envelope_mib_per_block = ENVELOPE_BYTES_PER_BLOCK / 1_048_576.0;
+    let ratio = REPLAY_RETENTION_MIB_PER_BLOCK / envelope_mib_per_block;
+    assert!(
+        (0.80..=1.20).contains(&ratio),
+        "the replay's retention rate ({:.5} MiB/block, from 348.9 MiB over 29,377\n\
+         blocks) and the measured on-disk envelope ({:.5} MiB/block) have drifted\n\
+         apart -- ratio {ratio:.2}, expected 0.80-1.20.\n\
+         Their agreement is what turns the store-backed saving from a claim into a\n\
+         confirmed mechanism: the thing removed from RAM is the size of the thing\n\
+         that lives on disk. Without it the second arm is an assertion again.",
+        REPLAY_RETENTION_MIB_PER_BLOCK,
+        envelope_mib_per_block
+    );
+}
+
+#[test]
+#[allow(clippy::assertions_on_constants)]
+fn the_refuted_state_footprint_is_nowhere_in_the_arithmetic() {
+    // 60 MB per CommittedState was wrong by ~750x: four extra mainnet-sized
+    // states measure 320 kB, because EutxoSet.entries is an Arc<BTreeMap> and
+    // holding a state is a refcount increment. It is still in the tree at
+    // crates/bloch-pos-node/src/engine.rs and it is not this crate's to edit,
+    // so the guard here is that nothing in THIS arithmetic is near it.
+    assert!(
+        MEMO_FOUR_STATES_KIB < 1024.0,
+        "four extra states are recorded at {MEMO_FOUR_STATES_KIB} kB. The refuted\n\
+         figure was 240 MB for the same four. If this has grown by three orders of\n\
+         magnitude, either Arc sharing was lost in EutxoSet or the wrong number\n\
+         came back."
+    );
+    assert!(
+        INPUTS
+            .iter()
+            .any(|i| i.name.contains("60 MB per CommittedState")
+                && i.standing == Standing::Discredited),
+        "the 60 MB/state figure has left the discredited list. It is wrong by ~750x,\n\
+         it is still live in a doc comment at crates/bloch-pos-node/src/engine.rs,\n\
+         and the graveyard is the only thing stopping it being quoted again."
+    );
+}
+
+// ── the term with no plan ─────────────────────────────────────────────────
+
+#[test]
+fn the_fork_overhang_has_not_started_running() {
+    let s = snap();
+    let f = s.fork_overhang_blocks.unwrap_or_else(|| {
+        panic!(
+            "the snapshot records no fork overhang. It is read straight off the node\n\
+             as `blocks_known - height` and it is the ONE growing term here with no\n\
+             workstream aimed at it -- store-backing moves the CANONICAL map to disk.\n\
+             Re-run the collector.\n{REDO}"
+        )
+    });
+    assert!(
+        f <= FORK_OVERHANG_ALARM,
+        "the fleet is holding {f} non-canonical blocks whole in RAM, against {}\n\
+         when these dates were derived and an alarm at {FORK_OVERHANG_ALARM}.\n\
+         That is about {:.0} MiB per validator at the measured envelope, and unlike\n\
+         every other term here nothing bounds it and nothing is being done about it.\n\
+         A jump this size is more likely to mean the fleet is forking than that the\n\
+         term grew: check that the nodes agree on a head before touching memory.\n{REDO}",
+        FORK_OVERHANG_AT_DERIVATION,
+        f as f64 * ENVELOPE_BYTES_PER_BLOCK / 1_048_576.0
     );
 }
 
@@ -202,7 +354,7 @@ fn the_published_roll_date_still_follows_from_the_live_fleet() {
          binding box   {} ({}), {} validators\n\
          boot peak     {:.1} MiB (unit {}), so nine at once need {:.0} MiB\n\
          capacity      {:.0} MiB after a {:.0} MiB page-cache reserve\n\
-         headroom      {:.0} MiB at {:.1} MiB/day/validator\n\
+         headroom      {:.0} MiB at the PEAK rate\n\
          \n\
          The fleet programme is sequencing around the published date, and it is now\n\
          wrong by more than a week.\n{REDO}",
@@ -218,7 +370,6 @@ fn the_published_roll_date_still_follows_from_the_live_fleet() {
         p.roll_box.mem_total_mib
             - p.reserve_mib
             - p.roll_box.max_hwm_mib * p.roll_box.validators as f64,
-        STEADY_MIB_PER_DAY_RECENT,
     );
 }
 
@@ -262,13 +413,13 @@ fn the_roll_date_is_earlier_than_the_drift_date_but_only_by_days() {
         p.drift.days_lo
     );
     assert!(
-        gap < 28.0,
+        gap < 45.0,
         "the ROLL date is now {gap:.1} days ahead of the DRIFT date. The programme is\n\
          told these are days apart because the peak premium is a CONSTANT (86.7 MiB\n\
          isolated, 13-23% on the fleet) rather than a multiple, so the two curves run\n\
-         parallel. A gap this wide means the premium has started to grow, which would\n\
-         make the peak a second curve with its own slope -- currently unmeasured, and\n\
-         the single most valuable thing to measure next.\n{REDO}"
+         curves. The premium DOES grow -- peak 0.01718 against retention 0.01188 --\n\
+         so a gap of a few weeks is expected. A gap this wide means the two rates\n\
+         have diverged further than any measurement supports.\n{REDO}"
     );
 }
 
@@ -292,11 +443,11 @@ fn the_projection_has_not_already_expired() {
 #[test]
 fn roll_arm_rests_on_marks_that_are_still_informative() {
     let s = snap();
-    let stale = s.mark_staleness_slots();
+    let stale = s.mark_staleness_blocks();
     assert!(
-        stale <= MARK_MAX_STALENESS_SLOTS,
-        "the FRESHEST VmHWM on the whole fleet was set {stale} slots ago -- about\n\
-         {:.1} days -- against a limit of {MARK_MAX_STALENESS_SLOTS} slots.\n\
+        stale <= MARK_MAX_STALENESS_BLOCKS,
+        "the FRESHEST VmHWM on the whole fleet was set {stale} blocks ago -- about\n\
+         {:.1} days -- against a limit of {MARK_MAX_STALENESS_BLOCKS} slots.\n\
          \n\
          VmHWM is a lifetime high-water mark: a validator that booted that long ago\n\
          recorded what a boot cost against a SHORTER CHAIN. Every peak in the\n\
@@ -305,15 +456,11 @@ fn roll_arm_rests_on_marks_that_are_still_informative() {
          recently enough to bound a boot today, and the roll date is optimistic by an\n\
          amount nothing here can measure.\n\
          \n\
-         Measured in SLOTS deliberately: counting this staleness in blocks would\n\
-         understate it by 1/cadence exactly when the chain is slow, which is exactly\n\
-         when it matters.\n\
-         \n\
          Do NOT restart a validator to refresh a mark -- that is a double-signing\n\
          risk incurred for a number. Measure a candidate boot on an IDLE box against\n\
          a tip-height blocks.log and pass it as `--peak-mib` to\n\
          scripts/fleet-memory-gate.sh, which exists for exactly this.\n{REDO}",
-        stale as f64 / SLOTS_PER_DAY
+        stale as f64 / BLOCKS_PER_DAY_AT_DERIVATION
     );
 }
 
@@ -455,11 +602,15 @@ fn the_report_states_what_it_cannot_do() {
         "MEASURED",
         "MODELLED",
         "SUPERSEDED",
+        "DISCREDITED",
         "O(unfinalized + state)",
         "grows with USAGE",
         "FLOOR, NOT HEADROOM",
-        "SLOTS",
-        "HOW FAR PAST THE EVIDENCE THIS REACHES",
+        "LEVEL, NOT SLOPE",
+        "Arc::make_mut",
+        "FORK OVERHANG",
+        "WALL BEHIND THE WALL",
+        "A band cannot express an extrapolation",
     ] {
         assert!(
             r.contains(must),

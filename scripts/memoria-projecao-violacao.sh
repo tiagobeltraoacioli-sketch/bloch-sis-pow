@@ -65,66 +65,84 @@ run_case() {
 
 # ---- the falsifications --------------------------------------------------
 # Each edits ONE thing, so a red suite is attributable to it.
+# Columns: 1 ip 2 host 3 memtotal 4 memavail 5 cached 6 nproc 7 unit 8 pid
+#          9 vmhwm 10 vmrss 11 started 12 markage 13 boot_height
+#          14 lens_argv 15 lens_pgrep 16 lens_units 17 lens_datadirs
 
 # 1. A box is re-provisioned smaller. The per-validator ceiling is
 #    (MemTotal - reserve) / N, so this silently changes the date for that box.
-awk -F'\t' -v OFS='\t' 'NF>=13 && $1 !~ /^#/ && $1=="139.84.201.52" {$3="16384"} {print}' \
+awk -F'\t' -v OFS='\t' 'NF>=17 && $1 !~ /^#/ && $1=="139.84.201.52" {$3="16384"} {print}' \
   "$SNAP" > "$TMP/box-shrunk.tsv"
 run_case "a box re-provisioned to 16 GiB" \
          "every_box_still_has_the_ram_the_projection_assumes" "$TMP/box-shrunk.tsv"
 
-# 2. A tenth validator lands on a box. Both dates scale with N.
+# 2. A tenth validator lands on a box. Both dates scale with N, and this is the
+#    exact claim that reached this programme as a briefing correction.
 { cat "$SNAP"; grep -m1 '^139\.84\.201\.52	' "$SNAP" | awk -F'\t' -v OFS='\t' '{$8=$8+1; print}'; } \
   > "$TMP/tenth.tsv"
 run_case "a tenth validator on one box" \
          "every_box_still_carries_the_validators_the_projection_assumes" "$TMP/tenth.tsv"
 
-# 3. THE HIDDEN VARIABLE. The block cadence falls back to the h10k-15k regime
-#    (5,000 blocks in 21,187 slots). Nothing about the boxes changes. If growth
-#    really follows slots the dates should not move -- and this is the live
-#    experiment that would confirm it. It must not pass unnoticed.
-sed 's/^# blocks_per_slot_measured	.*/# blocks_per_slot_measured	0.2360/' \
-  "$SNAP" > "$TMP/cadence-collapse.tsv"
-run_case "block cadence back to 24% of slots" \
-         "the_slot_to_block_relation_is_still_what_the_projection_was_derived_under" \
-         "$TMP/cadence-collapse.tsv"
+# 3. THE COLLECTOR'S OWN BLIND SPOT. systemd knows about a validator that the
+#    argv scan did not see. This is the failure that a single-lens count cannot
+#    express at all: it makes the box look emptier than it is, moves the date
+#    in the SAFE direction, and leaves every other check green.
+awk -F'\t' -v OFS='\t' 'NF>=17 && $1 !~ /^#/ && $1=="67.219.108.96" {$16="10"} {print}' \
+  "$SNAP" > "$TMP/lens-disagree.tsv"
+run_case "systemd sees 10 validators, argv sees 9" \
+         "the_four_independent_counts_of_tenancy_agree" "$TMP/lens-disagree.tsv"
 
-# 4. The fleet is fatter than the projection was derived against -- the
+# 4. The chain speeds up. Memory grows per BLOCK, so the date moves in
+#    direct proportion and nothing about the boxes has to change.
+sed 's/^# blocks_per_day_measured	.*/# blocks_per_day_measured	4200.0/' \
+  "$SNAP" > "$TMP/faster-chain.tsv"
+run_case "chain cadence up to 4,200 blocks/day" \
+         "the_block_cadence_still_matches_what_the_dates_are_denominated_in" \
+         "$TMP/faster-chain.tsv"
+
+# 5. The fleet is fatter than the projection was derived against -- the
 #    dangerous direction, and the one nobody notices, because nothing breaks
-#    until a box dies. 250 MiB per validator is about nine days of drift.
-awk -F'\t' -v OFS='\t' 'NF>=13 && $1 !~ /^#/ {$9=$9+250; $10=$10+250} {print}' \
+#    until a box dies.
+awk -F'\t' -v OFS='\t' 'NF>=17 && $1 !~ /^#/ {$9=$9+400; $10=$10+400} {print}' \
   "$SNAP" > "$TMP/fatter.tsv"
-run_case "every validator 250 MiB fatter than projected" \
+run_case "every validator 400 MiB fatter than projected" \
          "the_published_roll_date_still_follows_from_the_live_fleet" "$TMP/fatter.tsv"
 
-# 5. Nobody has restarted a validator in ten days, so every VmHWM was set
+# 6. Nobody has restarted a validator in a fortnight, so every VmHWM was set
 #    against a much shorter chain. The marks still LOOK fine -- they are just
-#    no longer evidence about a boot today. This is the floor-not-headroom
-#    failure, and it is invisible unless something checks the age.
-awk -F'\t' -v OFS='\t' 'NF>=13 && $1 !~ /^#/ {$11=$11-864000; $12=$12+864000} {print}' \
+#    no longer evidence about a boot today.
+awk -F'\t' -v OFS='\t' 'NF>=17 && $1 !~ /^#/ {$13=$13-25000} {print}' \
   "$SNAP" > "$TMP/stale-marks.tsv"
-run_case "no boot fresher than 10 days" \
+run_case "no boot fresher than 25,000 blocks" \
          "roll_arm_rests_on_marks_that_are_still_informative" "$TMP/stale-marks.tsv"
 
-# 6. The snapshot itself is old. Every other number in it can be internally
+# 7. The snapshot itself is old. Every other number in it can be internally
 #    consistent and still describe a fleet that no longer exists.
 OLD=$(( $(date +%s) - 40*86400 ))
 sed "s/^# captured_unix	.*/# captured_unix	$OLD/" "$SNAP" > "$TMP/old-snapshot.tsv"
 run_case "snapshot 40 days old" \
          "snapshot_has_not_gone_stale" "$TMP/old-snapshot.tsv"
 
-# 7. The boot premium collapses. That would retire the PEAK curve as a
-#    distinct risk -- which is good news, and good news is what this programme
-#    has historically believed without checking.
-awk -F'\t' -v OFS='\t' 'NF>=13 && $1 !~ /^#/ {$9=$10} {print}' \
+# 8. The boot premium collapses. That would retire the PEAK curve as a
+#    distinct risk -- good news, and good news is what this programme has
+#    historically believed without checking.
+awk -F'\t' -v OFS='\t' 'NF>=17 && $1 !~ /^#/ {$9="1200.0"; $10="1200.0"} {print}' \
   "$SNAP" > "$TMP/no-premium.tsv"
 run_case "boot peak equal to steady state" \
          "the_boot_premium_is_still_a_premium_and_still_not_a_multiple" "$TMP/no-premium.tsv"
 
-# 8. A column shift -- the exact bug this collector shipped once already, where
-#    the hostname landed in mem_total_mib and every downstream number moved one
-#    place right. It reads as a plausible file, not as an error.
-awk -F'\t' -v OFS='\t' 'NF>=13 && $1 !~ /^#/ {$9=$10-1} {print}' \
+# 9. The fork overhang runs away. It is the one growing term with no
+#    workstream aimed at it, and store-backing does not touch it: that change
+#    moves the CANONICAL map to disk.
+sed 's/^# fork_overhang_blocks	.*/# fork_overhang_blocks	48000/' \
+  "$SNAP" > "$TMP/fork-runaway.tsv"
+run_case "fork overhang at 48,000 blocks" \
+         "the_fork_overhang_has_not_started_running" "$TMP/fork-runaway.tsv"
+
+# 10. A column shift -- the exact bug this collector shipped once already,
+#     where the hostname landed in mem_total_mib and every downstream number
+#     moved one place right. It reads as a plausible file, not as an error.
+awk -F'\t' -v OFS='\t' 'NF>=17 && $1 !~ /^#/ {$9=$10-1} {print}' \
   "$SNAP" > "$TMP/peak-below-resident.tsv"
 run_case "a peak below its own resident set (corrupt columns)" \
          "snapshot_is_structurally_whole" "$TMP/peak-below-resident.tsv"
