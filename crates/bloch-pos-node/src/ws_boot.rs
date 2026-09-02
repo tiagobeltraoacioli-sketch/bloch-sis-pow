@@ -817,6 +817,78 @@ mod tests {
         assert!(refusal.contains("not a fault"));
     }
 
+    /// The cold-start cliff, in the exact epochs the live chain will pass
+    /// through — the arithmetic the 2026-09-05 deadline rests on, made
+    /// mechanical so nobody has to re-derive it from a calendar.
+    ///
+    /// Genesis-4 launched at epoch 0 on 2026-08-13. A fresh install carries
+    /// only the release-baked genesis anchor, so its `anchor_age` IS the wall
+    /// epoch. The last wall epoch at which that anchor still admits a fresh
+    /// node is `WS_PERIOD_EPOCHS - 1 = 2015`; at 2016 the same install is
+    /// refused. Nothing about the chain changes at that boundary — what
+    /// changes is that the only anchor a fresh node has stops being inside
+    /// the window.
+    ///
+    /// Publishing a signed checkpoint at epoch 1536 moves the cliff to
+    /// `1536 + 2016 = 3552`, and this test proves the move rather than
+    /// asserting it.
+    #[test]
+    fn genesis_anchor_expires_at_epoch_2016_and_a_1536_checkpoint_moves_it_to_3552() {
+        // 1. The genesis anchor, one epoch before the cliff: admitted.
+        let dir = tmpdir("cliff-2015");
+        let out = boot(
+            &no_flags(), &dir, NET, &GEN, &genesis_anchor(),
+            WS_PERIOD_EPOCHS - 1, // wall epoch 2015
+            false, (0, GEN), |_| None, |_| false,
+        )
+        .unwrap()
+        .expect("at wall epoch 2015 the genesis anchor still admits a fresh node");
+        assert_eq!(out.anchor_epoch, 0);
+
+        // 2. One epoch later: the same fresh install is refused. This is the
+        //    event dated 2026-09-05 07:07 UTC — 16-minute epochs from a
+        //    2026-08-13 21:31 UTC genesis.
+        let dir = tmpdir("cliff-2016");
+        let refusal = boot(
+            &no_flags(), &dir, NET, &GEN, &genesis_anchor(),
+            WS_PERIOD_EPOCHS, // wall epoch 2016
+            false, (0, GEN), |_| None, |_| false,
+        )
+        .unwrap()
+        .expect_err("at wall epoch 2016 a fresh node has no anchor inside the window");
+        assert!(refusal.contains("ERR_WS_REQUIRE_CHECKPOINT"), "{refusal}");
+
+        // 3. With a verified epoch-1536 checkpoint stored as ws_latest, the
+        //    same wall epoch 2016 is unremarkable: age 480 of 2016.
+        let dir = tmpdir("cliff-1536");
+        save_latest(&dir, &checkpoint(1536)).unwrap();
+        let out = boot(
+            &no_flags(), &dir, NET, &GEN, &genesis_anchor(),
+            WS_PERIOD_EPOCHS, false, (0, GEN), |_| None, |_| false,
+        )
+        .unwrap()
+        .expect("an epoch-1536 anchor is 480 epochs old at wall 2016 — well inside");
+        assert_eq!(out.anchor_epoch, 1536);
+        assert!(
+            out.warnings.iter().any(|w| w.contains("age 480 of 2016")),
+            "{:?}",
+            out.warnings
+        );
+
+        // 4. And the 1536 anchor has its own cliff, 2016 epochs later.
+        let dir = tmpdir("cliff-3552");
+        save_latest(&dir, &checkpoint(1536)).unwrap();
+        let refusal = boot(
+            &no_flags(), &dir, NET, &GEN, &genesis_anchor(),
+            1536 + WS_PERIOD_EPOCHS, // wall epoch 3552
+            false, (0, GEN), |_| None, |_| false,
+        )
+        .unwrap()
+        .expect_err("a checkpoint buys exactly one window, not permanence");
+        assert!(refusal.contains("ERR_WS_REQUIRE_CHECKPOINT"), "{refusal}");
+        assert!(refusal.contains("a checkpoint at epoch 1536"), "{refusal}");
+    }
+
     #[test]
     fn own_finality_resumes_and_warns_when_stale_inside_window() {
         let dir = tmpdir("resume");
