@@ -8998,6 +8998,159 @@ mod tests {
             );
         }
     }
+    // ===================================================================
+    // WITHDRAWAL EXECUTION PROBE  (audit, 2026-09-01)
+    // Establishes BY EXECUTION where a validator withdrawal stops.
+    // ===================================================================
+
+    /// Enumerate the ENTIRE wire tag space. A withdrawal is documented as
+    /// wire tag 0x08; this asks the real decoder which tags exist at all.
+    #[test]
+    fn probe_wire_tag_space_has_no_withdrawal() {
+        let mut decodable = Vec::new();
+        let mut evidence = Vec::new();
+        let mut unknown = Vec::new();
+        for tag in 0u8..=255 {
+            // A bare tag byte: enough to distinguish "this build knows the
+            // discriminant" (Truncated / NotCanonical / ok) from "it does
+            // not" (UnknownTag). A tag the build knows will complain about
+            // the MISSING FIELDS, never about the tag itself.
+            match PosTransaction::from_canonical_bytes(&[tag]) {
+                Err(TxDecodeError::UnknownTag(t)) => {
+                    assert_eq!(t, tag);
+                    unknown.push(tag);
+                }
+                Err(TxDecodeError::EvidenceNotDecodable) => evidence.push(tag),
+                _ => decodable.push(tag),
+            }
+        }
+        eprintln!("decodable tags      = {decodable:02x?}");
+        eprintln!("one-way (evidence)  = {evidence:02x?}");
+        eprintln!("unknown tag count   = {}", unknown.len());
+
+        // What the build actually knows.
+        assert_eq!(decodable, vec![0x01, 0x02, 0x03, 0x04, 0x06]);
+        assert_eq!(evidence, vec![0x05]);
+
+        // 0x07 (funded deposit / DepositV2) and 0x08 (withdrawal) are BOTH
+        // unknown to this build. Not gated - absent.
+        assert!(unknown.contains(&0x07), "0x07 must be unknown");
+        assert!(unknown.contains(&0x08), "0x08 must be unknown");
+        assert_eq!(
+            PosTransaction::from_canonical_bytes(&[0x08]),
+            Err(TxDecodeError::UnknownTag(0x08)),
+            "the withdrawal wire tag does not exist in this build"
+        );
+    }
+
+    /// Deposit -> activation -> exit runs. Then the withdrawal has nothing
+    /// to run: the payout is scheduled, computable, and unreachable.
+    #[test]
+    fn probe_withdrawal_stops_after_exit_is_scheduled() {
+        let (t, g, mut chains) = setup(4);
+
+        // --- 1. EXIT is accepted and SCHEDULES a payout. ---
+        let exit = PosTransaction::Exit { validator: 0 };
+        let b = build_block(&t, &g, 1, &[], std::slice::from_ref(&exit), &mut chains);
+        let st = t.apply_block(&g, &b, &[], std::slice::from_ref(&exit)).unwrap();
+        let rec = st.validator_record(0).unwrap().clone();
+        assert_eq!(rec.exit_epoch, staking::EXIT_DELAY_EPOCHS);
+        let withdrawable_at = rec.withdrawable_epoch;
+        assert_eq!(
+            withdrawable_at,
+            staking::EXIT_DELAY_EPOCHS + staking::WITHDRAWAL_DELAY_EPOCHS
+        );
+        eprintln!(
+            "exit accepted: validator 0 staked_sat={} withdrawable_epoch={} \
+             withdrawal_credentials={} bytes",
+            rec.staked_sat,
+            withdrawable_at,
+            rec.withdrawal_credentials.len()
+        );
+
+        // --- 2. The stake is STILL IN THE REGISTRY after the exit. ---
+        // Nothing moved it anywhere. There is no pending-payout queue.
+        assert_eq!(
+            st.validator_record(0).unwrap().staked_sat,
+            rec.staked_sat,
+            "the bond is still in the registry; the exit moved no value"
+        );
+
+        // --- 3. No transaction can request the payout. ---
+        // Withdraw is not a variant, so this cannot even be written:
+        //     PosTransaction::Withdraw { validator: 0 }
+        // The nearest reachable thing is the raw wire tag, which is refused.
+        assert_eq!(
+            PosTransaction::from_canonical_bytes(&[0x08, 0, 0, 0, 0]),
+            Err(TxDecodeError::UnknownTag(0x08)),
+            "no wire encoding carries a withdrawal request"
+        );
+
+        // --- 4. Re-exiting does not help; the clock never restarts. ---
+        let mut probe = st.clone();
+        assert_eq!(
+            probe.apply_transaction(
+                &exit,
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &OkVerifier
+            ),
+            Err(TxReject::StakingRule)
+        );
+
+        eprintln!(
+            "STOP: payout scheduled for epoch {withdrawable_at}, but no \
+             transaction type exists to claim it."
+        );
+    }
+
+    /// The withdrawal ARITHMETIC exists and returns the payout - against a
+    /// record type the live chain never produces.
+    #[test]
+    fn probe_withdrawal_math_runs_on_a_disconnected_record_type() {
+        use crate::staking::{validate_withdrawal, WithdrawReject};
+
+        // The live registry record (interfaces::ValidatorRecord) after an exit.
+        let (t, g, mut chains) = setup(4);
+        let exit = PosTransaction::Exit { validator: 0 };
+        let b = build_block(&t, &g, 1, &[], std::slice::from_ref(&exit), &mut chains);
+        let st = t.apply_block(&g, &b, &[], std::slice::from_ref(&exit)).unwrap();
+        let live = st.validator_record(0).unwrap().clone();
+
+        // `validate_withdrawal` does NOT take this type. It takes
+        // `staking::ValidatorRecord`, which has different fields:
+        //   live:    exit_epoch: u64 (u64::MAX sentinel), withdrawal_credentials: Vec<u8>,
+        //            staked_sat, withdrawable_epoch, slashed, commission_bps
+        //   staking: exit_epoch: Option<u64>, withdrawal_addr: Address,
+        //            amount_sat, withdrawn: bool
+        // There is no From/Into between them anywhere in the crate, so the
+        // committed record can never be handed to the validator. To run the
+        // math at all we must HAND-BUILD the other type:
+        let hand_built = crate::staking::ValidatorRecord {
+            pubkey: [0u8; crate::staking::HYBRID_PK_BYTES],
+            amount_sat: live.staked_sat,
+            activation_epoch: 0,
+            exit_epoch: Some(live.exit_epoch),
+            withdrawal_addr: Default::default(),
+            withdrawn: false,
+        };
+
+        // Before the delay: refused, as designed.
+        assert_eq!(
+            validate_withdrawal(&hand_built, live.withdrawable_epoch - 1),
+            Err(WithdrawReject::DelayNotElapsed)
+        );
+        // After the delay: the payout is fully determined and RETURNED.
+        let (addr, amount) = validate_withdrawal(&hand_built, live.withdrawable_epoch)
+            .expect("the math succeeds");
+        eprintln!(
+            "validate_withdrawal OK at epoch {}: pays {amount} sat to {addr:?}",
+            live.withdrawable_epoch
+        );
+        assert_eq!(amount, live.staked_sat);
+
+        // ...and nothing in the crate ever calls this function outside tests.
+    }
 }
 
 #[cfg(test)]
@@ -9253,4 +9406,5 @@ mod eutxo_clone_cost {
              so 97.2% of blocks take the cheap path."
         );
     }
+
 }

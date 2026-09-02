@@ -1494,3 +1494,53 @@ fn a_body_split_across_packets_is_reassembled() {
     assert!(out.starts_with("HTTP/1.1 200"), "got {out}");
     assert_eq!(spy.last(), Some(RpcRequest::BlockBySlot(41_290)));
 }
+
+// =====================================================================
+// WITHDRAWAL EXECUTION PROBE (audit, 2026-09-01)
+// What an exchange's withdrawal actually gets back from the node's own
+// RPC, executed through the real `handle_body` seam.
+// =====================================================================
+
+/// A withdrawal request submitted to a real node's `sendrawtransaction`.
+#[test]
+fn probe_withdrawal_submission_is_refused_at_the_rpc() {
+    let spy = Spy::new();
+
+    // The documented withdrawal encoding: tag 0x08 followed by the
+    // big-endian validator index (the shape every other staking tx uses
+    // -- cf. Exit, tag 0x03 + u32).
+    for validator in [0u32, 7, 63] {
+        let mut raw = vec![0x08u8];
+        raw.extend_from_slice(&validator.to_be_bytes());
+        let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+
+        let v = call(spy.as_ref(), &request("sendrawtransaction", &format!("[\"{hex}\"]")));
+        eprintln!("withdraw(validator={validator}) hex={hex} -> {v:?}");
+
+        assert_eq!(error_code(&v), Some(TX_DECODE_FAILED));
+        assert!(
+            spy.last().is_none(),
+            "a withdrawal never reaches the mempool -- it dies in the decoder"
+        );
+    }
+
+    // For contrast, the EXIT that precedes it is accepted by the same
+    // endpoint: the staking family is not blanket-refused, only the
+    // withdrawal is absent.
+    let exit = PosTransaction::Exit { validator: 7 }.canonical_bytes();
+    let hex: String = exit.iter().map(|b| format!("{b:02x}")).collect();
+    let v = call(spy.as_ref(), &request("sendrawtransaction", &format!("[\"{hex}\"]")));
+    eprintln!("exit(validator=7)   hex={hex} -> {v:?}");
+    assert_eq!(error_code(&v), None, "an exit IS admitted by the same endpoint");
+    assert!(spy.last().is_some(), "the exit reached the mempool");
+}
+
+/// `gettransaction` is refused by design, so a submitter has no id to
+/// follow -- the tracking trap, executed.
+#[test]
+fn probe_no_transaction_id_to_track_a_withdrawal_by() {
+    let spy = Spy::new();
+    let v = call(spy.as_ref(), &request("gettransaction", r#"["00"]"#));
+    eprintln!("gettransaction -> {v:?}");
+    assert!(error_code(&v).is_some(), "gettransaction is refused by design");
+}
