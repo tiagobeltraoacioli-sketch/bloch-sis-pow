@@ -64,6 +64,28 @@ fn main() {
 
     println!("cargo:rustc-env=BLOCH_BUILD_VERSION={pkg} ({commit}{dirty})");
 
+    // The same two facts, unjoined, so a consumer does not have to parse the
+    // display string back apart. `getnodeversion` publishes them as separate
+    // fields: a client comparing a fleet box against a release compares a
+    // commit to a commit, not one formatted sentence to another.
+    //
+    // `BLOCH_BUILD_VERSION` above stays byte-identical — `--version` and the
+    // release-integrity gate read it, and this adds to that contract without
+    // touching it.
+    println!("cargo:rustc-env=BLOCH_BUILD_COMMIT_ID={commit}");
+    // Tri-state, and "unknown" is a real answer rather than an optimistic
+    // "false": a caller-supplied BLOCH_BUILD_COMMIT asserts an identity and
+    // says nothing about the tree, and a build with no git cannot look. Both
+    // of those used to read as clean, which is the confident lie this file
+    // exists to stop telling.
+    let dirty_flag = match dirty {
+        "+dirty" => "true",
+        "" if std::env::var("BLOCH_BUILD_COMMIT").is_ok() => "unknown",
+        "" => "false",
+        _ => "unknown",
+    };
+    println!("cargo:rustc-env=BLOCH_BUILD_DIRTY={dirty_flag}");
+
     // Rebuild when HEAD moves, so the stamp cannot go stale in an incremental
     // build — a stale stamp is worse than no stamp: it is a confident lie.
     //

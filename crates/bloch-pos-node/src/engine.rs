@@ -2043,10 +2043,22 @@ impl Engine {
             // observe a half-applied block — but it is the only method here
             // whose cost does not grow with the chain.
             RpcRequest::Capabilities => Ok(rpc::capabilities_json(
-                env!("CARGO_PKG_VERSION"),
+                // The BUILD stamp, not `CARGO_PKG_VERSION`. This field used to
+                // be the bare package version — the literal `0.1.0-mainnet` on
+                // every binary this crate has ever produced — which made the
+                // one field named `node_version` the one field that could not
+                // tell two nodes apart. `build.rs`'s own comment says why:
+                // "a version string without a commit is not a version string".
+                // `getnodeversion` publishes the same stamp in parts.
+                env!("BLOCH_BUILD_VERSION"),
                 self.chain[0].1.as_bytes(),
                 VERSION_G4,
             )),
+
+            // Constant by construction: every field is an `env!` fixed at
+            // compile time. It crosses the engine channel anyway, for the same
+            // reason `Capabilities` does — one path in, not two.
+            RpcRequest::NodeVersion => Ok(rpc::node_version_json()),
 
             RpcRequest::ChainInfo => {
                 // Read BEFORE the call and handed in, for the same reason

@@ -606,6 +606,7 @@ fn the_rpc_method_namespace_is_frozen() {
         "getchaininfo",
         "getmempoolinfo",
         "getnewaddress",
+        "getnodeversion",
         "gettransaction",
         "gettxout",
         "getutxos",
@@ -1493,4 +1494,221 @@ fn a_body_split_across_packets_is_reassembled() {
     let _ = sock.read_to_string(&mut out);
     assert!(out.starts_with("HTTP/1.1 200"), "got {out}");
     assert_eq!(spy.last(), Some(RpcRequest::BlockBySlot(41_290)));
+}
+
+// ─── 4. The two refusals, and the deadline a client has to act on ───────────
+//
+// These four tests exist to make ONE regression impossible to land quietly:
+// putting a retryable refusal and a terminal one back on the same error code.
+// That is not a hypothetical — it is the state of the release tag
+// (`g4-node-20260901` = 7a83ca89) and of the fleet tip (46133196), where
+// `Refusal::PreviouslyRefused` and `Refusal::Invalid` both answer -32008 and a
+// client branching on the number is wrong for one of them.
+
+/// Params for `sendrawtransaction` carrying bytes that really decode, so the
+/// call reaches the backend instead of stopping at TX_DECODE_FAILED in the
+/// dispatcher. What the transaction says does not matter here: the backend is
+/// a stub whose whole job is to answer with the refusal under test.
+fn submittable() -> String {
+    let hex: String = PosTransaction::Exit { validator: 3 }
+        .canonical_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("[\"{hex}\"]")
+}
+
+/// Terminal and retryable refusals are different numbers, and stay different.
+///
+/// Written against the constants rather than against a live refusal on purpose:
+/// the thing that must never change is the CONTRACT, and the contract is
+/// violated the moment two opposite pieces of advice share a code — before any
+/// particular call site exists to demonstrate it.
+#[test]
+fn the_terminal_and_retryable_refusals_never_share_a_code() {
+    assert_ne!(
+        TX_REFUSED, TX_REFUSED_RETRYABLE,
+        "TX_REFUSED means `never resubmit these bytes` and TX_REFUSED_RETRYABLE \
+         means `resubmit after until_slot`. One number cannot carry both; a \
+         client branching on it would be wrong for half its traffic."
+    );
+    // MEMPOOL_FULL is the third, older member of this family — retryable, but
+    // for capacity rather than for state. Three causes, three codes.
+    assert_ne!(MEMPOOL_FULL, TX_REFUSED);
+    assert_ne!(MEMPOOL_FULL, TX_REFUSED_RETRYABLE);
+    assert_eq!(TX_REFUSED, -32008, "-32008 is published to integrators as terminal");
+    assert_eq!(TX_REFUSED_RETRYABLE, -32009);
+}
+
+/// A retryable refusal carries its deadline where a machine can read it.
+///
+/// The message may be reworded — the error contract says so in as many words —
+/// so a client that regexes `until slot 4242` out of English breaks on a
+/// wording change. `error.data.until_slot` is the field it is allowed to
+/// depend on, and this walks it all the way through the real dispatcher and
+/// out the wire envelope rather than inspecting the struct.
+#[test]
+fn a_retryable_refusal_carries_its_deadline_in_error_data() {
+    let spy = Spy::failing(RpcError::tx_refused_retryable(
+        4_242,
+        "barred until the parent transaction lands",
+    ));
+    let v = call(spy.as_ref(), &request("sendrawtransaction", &submittable()));
+
+    assert_eq!(error_code(&v), Some(TX_REFUSED_RETRYABLE));
+    let data = v
+        .get("error")
+        .and_then(|e| e.get("data"))
+        .expect("a retryable refusal must carry `error.data`; without it the \
+                 deadline exists only inside an English sentence");
+    assert_eq!(data.get("until_slot"), Some(&Json::u(4_242)));
+    assert_eq!(data.get("retryable"), Some(&Json::Bool(true)));
+}
+
+/// A terminal refusal carries NO deadline — absence is the signal.
+///
+/// The mirror of the test above, and the half that actually catches a
+/// collapse: if someone maps a retryable refusal back onto -32008, either this
+/// goes red (because it now carries `data`) or the deadline is being dropped on
+/// the floor, and both are the bug.
+#[test]
+fn a_terminal_refusal_carries_no_retry_deadline() {
+    let spy = Spy::failing(RpcError::new(TX_REFUSED, "unverifiable signature"));
+    let v = call(spy.as_ref(), &request("sendrawtransaction", &submittable()));
+
+    assert_eq!(error_code(&v), Some(TX_REFUSED));
+    assert!(
+        v.get("error").and_then(|e| e.get("data")).is_none(),
+        "-32008 is terminal: there is no slot to wait for, so there must be no \
+         `until_slot` for a client to wait until"
+    );
+}
+
+/// `error.data` is omitted, never emitted as `null`.
+///
+/// An `error.data: null` is a third state a client has to distinguish from
+/// absence for no gain, and JSON-RPC 2.0 §5.1 makes the member optional. This
+/// checks the raw text, because a `Json` comparison would not tell the two
+/// apart the way a client's parser does.
+#[test]
+fn an_error_without_structured_detail_omits_the_data_member() {
+    let spy = Spy::failing(RpcError::new(BLOCK_NOT_FOUND, "no such block"));
+    let text = handle_body(&request("getblockcount", "[]"), spy.as_ref());
+    assert!(!text.contains("\"data\""), "data must be absent, not null: {text}");
+    assert!(text.contains("\"code\":-32000"), "got {text}");
+}
+
+/// -32009 is reserved and NOT advertised as reachable on this lineage.
+///
+/// [`RPC_ERROR_CODES`] means "codes this build can return", and a client builds
+/// its branch table from it. Nothing here produces a retryable refusal yet —
+/// `Refusal::PreviouslyRefused` lives on the release/fleet lineage, not this
+/// one — so listing the code would be the capability document telling a client
+/// something untrue, which is the exact failure `getcapabilities` exists to
+/// prevent.
+///
+/// This test is a tripwire, not a preference: whoever lands the retryable
+/// refusal here will see it go red, and the fix is to add the code to the table
+/// in the same commit that wires it.
+#[test]
+fn the_reserved_retryable_code_is_not_advertised_until_it_is_wired() {
+    assert!(
+        !RPC_ERROR_CODES.iter().any(|(c, _)| *c == TX_REFUSED_RETRYABLE),
+        "TX_REFUSED_RETRYABLE is advertised in getcapabilities but no code path \
+         emits it. If you just wired `Refusal::PreviouslyRefused`, this is the \
+         right diff — delete this assertion, add the code to RPC_ERROR_CODES, \
+         and bump RPC_SURFACE_VERSION's minor."
+    );
+    // The terminal one, by contrast, IS reachable and IS advertised.
+    assert!(RPC_ERROR_CODES.iter().any(|(c, _)| *c == TX_REFUSED));
+}
+
+// ─── 5. Which binary is answering ───────────────────────────────────────────
+
+/// `getnodeversion` routes, and answers from compile-time constants only.
+#[test]
+fn getnodeversion_routes_to_its_own_request() {
+    let spy = Spy::new();
+    call(spy.as_ref(), &request("getnodeversion", "[]"));
+    assert_eq!(spy.last(), Some(RpcRequest::NodeVersion));
+    // It takes no arguments, and junk in the params must not change that: a
+    // constant answer cannot be steered.
+    let spy = Spy::new();
+    call(spy.as_ref(), &request("getnodeversion", r#"["nonsense", 7]"#));
+    assert_eq!(spy.last(), Some(RpcRequest::NodeVersion));
+}
+
+/// The response names the binary, and the commit is really a commit.
+///
+/// The point of the method is that two nodes built from two commits give two
+/// different answers. A field that is the same string on every binary ever
+/// built — which is what `getcapabilities`' `node_version` was — cannot do
+/// that, so the commit is checked for SHAPE here rather than for a value: a
+/// short hex object name, or the honest literal `unknown`.
+#[test]
+fn getnodeversion_reports_the_build_it_was_compiled_from() {
+    let v = node_version_json();
+
+    assert_eq!(v.get("name"), Some(&Json::s(env!("CARGO_PKG_NAME"))));
+    assert_eq!(v.get("version"), Some(&Json::s(env!("CARGO_PKG_VERSION"))));
+    assert_eq!(v.get("rpc_surface_version"), Some(&Json::s(RPC_SURFACE_VERSION)));
+    // The consensus magic this binary links, so a client asking a node from
+    // the wrong chain sees it in this response and not three calls later.
+    assert_eq!(v.get("block_version"), Some(&Json::u(u64::from(VERSION_G4))));
+
+    let commit = v.get("commit").and_then(Json::as_str).expect("commit field");
+    assert!(
+        commit == "unknown"
+            || (commit.len() >= 7
+                && commit.len() <= 40
+                && commit.chars().all(|c| c.is_ascii_hexdigit())),
+        "`commit` must be a git object name or the literal `unknown`, never a \
+         made-up value: got {commit:?}"
+    );
+
+    // The display stamp and the parts must agree — they come from one build
+    // script, and a client comparing `commit` against a release must not be
+    // reading something the operator's `--version` disagrees with.
+    let build = v.get("build").and_then(Json::as_str).expect("build field");
+    assert!(build.contains(env!("CARGO_PKG_VERSION")), "got {build:?}");
+    assert!(build.contains(commit), "`build` ({build:?}) must contain `commit` ({commit:?})");
+
+    // Tri-state. `null` means the build could not tell, and must NOT be
+    // reported as clean.
+    let dirty = v.get("dirty").expect("dirty field");
+    assert!(
+        matches!(dirty, Json::Bool(_) | Json::Null),
+        "`dirty` is true, false, or null for unknown: got {dirty:?}"
+    );
+}
+
+/// `getcapabilities` stopped reporting a version string that cannot tell two
+/// binaries apart.
+///
+/// It used to be handed `CARGO_PKG_VERSION` — `0.1.0-mainnet` on every binary
+/// this crate has produced. The engine now hands it the build stamp. This
+/// pins the property (the field distinguishes builds) rather than the value.
+#[test]
+fn the_capability_node_version_is_a_build_stamp_not_a_package_version() {
+    let stamp = env!("BLOCH_BUILD_VERSION");
+    assert_ne!(
+        stamp,
+        env!("CARGO_PKG_VERSION"),
+        "the stamp must add the commit; without it `node_version` is the same \
+         string on every build and identifies nothing"
+    );
+    assert!(stamp.contains(env!("BLOCH_BUILD_COMMIT_ID")));
+    // And the engine hands `capabilities_json` that stamp — read out of the
+    // engine's own source, because the alternative is standing up a node.
+    let engine_src = include_str!("../engine.rs");
+    let arm = engine_src
+        .split_once("RpcRequest::Capabilities => Ok(rpc::capabilities_json(")
+        .expect("the capabilities arm must exist")
+        .1;
+    let arm = &arm[..arm.find("))").unwrap_or(arm.len())];
+    assert!(
+        arm.contains("env!(\"BLOCH_BUILD_VERSION\")"),
+        "getcapabilities is back to reporting a version that cannot tell two \
+         binaries apart: {arm}"
+    );
 }
