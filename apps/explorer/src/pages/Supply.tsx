@@ -742,8 +742,14 @@ export function SupplyPage() {
           Not on what was sold, and not on what is retained.{" "}
           <code>unlock_epoch</code> is <strong>{NO_ONCHAIN_LOCKUP.unlockEpoch}</strong> on all five
           buckets, <strong>no node reads the field</strong>, and all five were spent between epochs{" "}
-          {NO_ONCHAIN_LOCKUP.bucketsSpentFrom} and {NO_ONCHAIN_LOCKUP.bucketsSpentTo} (documented
-          and tested on <code>main</code>, commit <code>{NO_ONCHAIN_LOCKUP.evidenceCommit}</code>).
+          {NO_ONCHAIN_LOCKUP.bucketsSpentFrom} and {NO_ONCHAIN_LOCKUP.bucketsSpentTo}. That is not
+          our assertion: <code>{NO_ONCHAIN_LOCKUP.tests[0]}</code> greps{" "}
+          <code>{NO_ONCHAIN_LOCKUP.crateChecked}</code> — the crate that authorises spending — and
+          asserts <strong>zero occurrences</strong> of the field, so it goes red the moment anyone
+          adds a read; <code>{NO_ONCHAIN_LOCKUP.tests[1]}</code> asserts every shipped bucket
+          carries <code>unlock_epoch: 0</code>. Both were verified by violation — made to fail
+          before being trusted to pass — and both are on <code>main</code> at commit{" "}
+          <code>{NO_ONCHAIN_LOCKUP.evidenceCommit}</code>.
           The vesting schedule in the tokenomics is a statement of intent, not a constraint the
           chain enforces. A reader comparing this page against that schedule should learn the
           difference here rather than discover it later.

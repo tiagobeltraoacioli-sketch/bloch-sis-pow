@@ -365,4 +365,18 @@ export const NO_ONCHAIN_LOCKUP = {
   bucketsSpentFrom: 1052,
   bucketsSpentTo: 1167,
   evidenceCommit: "fa4ad9be",
+  /**
+   * The two tests that make this checkable rather than our word.
+   *
+   * `vesting_is_not_enforced` greps the SPENDING-AUTHORISATION crate
+   * (`bloch-pos-committee`) for `unlock_epoch` and asserts ZERO occurrences —
+   * so it fails the moment anyone adds a read, which is the only way a claim
+   * about absence can be maintained. `the_shipped_buckets_are_all_liquid_at_slot_zero`
+   * asserts every bucket in `genesis-mainnet` carries `unlock_epoch: 0`.
+   *
+   * Both are verified by violation: they were made to fail before being
+   * trusted to pass.
+   */
+  tests: ["vesting_is_not_enforced", "the_shipped_buckets_are_all_liquid_at_slot_zero"],
+  crateChecked: "bloch-pos-committee",
 };
