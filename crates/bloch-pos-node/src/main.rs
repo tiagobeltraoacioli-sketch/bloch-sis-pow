@@ -26,9 +26,11 @@
 //! signatures are hybrid PQ regardless), no peer persistence or peer
 //! exchange, no deposits/exits, no slashing-evidence pipeline, no
 //! checkpoint-sync **state download** (the weak-subjectivity boot gate itself
-//! IS wired — `ws_boot`), no RPC, no mainnet genesis manifest. See the module
-//! docs of `engine`, `net`, `p2p`, `store`, `ws_boot` for each limitation at
-//! its site.
+//! IS wired — `ws_boot`). RPC and the mainnet genesis manifest were on this
+//! list and have since been wired: `mod rpc` is served from the engine once the
+//! boot gate clears, and `genesis-mainnet` is a subcommand of this binary. See
+//! the module docs of `engine`, `net`, `p2p`, `rpc`, `store`, `ws_boot` for
+//! each limitation at its site.
 //!
 //! ## Key hygiene
 //!
@@ -212,15 +214,17 @@ fn print_help() {
                default 127.0.0.1:16310 (`--rpc-port off` disables it). It\n\
                answers for THIS node's own validated state — run your own\n\
                node and query it rather than trusting someone else's.\n\
-                 Methods: getnodeversion, getchaininfo, getblockcount,\n\
+                 Methods: getbuildinfo, getchaininfo, getblockcount,\n\
                  getblockbyslot, getblockbyid, getvalidator,\n\
                  getvalidatorcount, getbalance, gettxout, getutxos (alias\n\
                  listunspent), sendrawtransaction, getmempoolinfo.\n\
-                 getnodeversion reports which binary is answering: package\n\
-                 version, build stamp, git commit and whether the tree was\n\
-                 dirty. gettransaction and getnewaddress answer\n\
-                 with a permanent, explained refusal — there is no txid at\n\
-                 this layer and this node holds no wallet.\n\
+                 getbuildinfo reports which binary is answering: package\n\
+                 version, build stamp, git commit, the source of that\n\
+                 commit, and a digest of the tree that was compiled.\n\
+                 gettransaction and getnewaddress answer\n\
+                 with a permanent, explained refusal — a transaction does\n\
+                 have an id, but this node keeps no txid-to-block index to\n\
+                 look it up in, and it holds no wallet.\n\
                  Finality: block responses carry `finalized: true|false`.\n\
                  That boolean, not a confirmation count, is the settlement\n\
                  guarantee — PoS has no depth-as-security.\n\

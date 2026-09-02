@@ -28,12 +28,19 @@
 //! still runs the pool, but a `Reject` costs the sender nothing here.
 //!
 //! Wire: `u32 LE frame length ‖ type byte ‖ payload`.
-//! Types: 0x01 block envelope, 0x02 attestation, 0x03 get-blocks{after_slot}.
+//! Types: 0x01 block envelope, 0x02 attestation, 0x03 get-blocks{after_slot},
+//! 0x04 transaction ([`FRAME_TX`], payload = one transaction's canonical
+//! bytes). All four are live: 0x04 is written by [`send_transaction`], decoded
+//! by `decode_event`, and republished on the production transport by `p2p`.
 //!
 //! Topology per peer pair: each side dials the other (two TCP connections per
-//! pair). A node broadcasts on its *outbound* connections; sync requests go
-//! out on outbound connections and are answered by the peer's inbound handler
-//! on the same socket.
+//! pair). A node broadcasts in **both** directions — [`DevnetMesh::broadcast`]
+//! sends to every peer it dialed and to every connection that dialed it —
+//! because the "each side dials the other" assumption does not hold on
+//! Genesis-4 mainnet, where broadcasting outbound-only silently stranded every
+//! peer this node had not dialed (the `inbound` field carries that story).
+//! Sync requests still go out on outbound connections only, and are answered
+//! by the peer's inbound handler on the same socket.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -102,14 +109,6 @@ impl Net {
     }
 }
 
-/// Depth of an inbound peer's broadcast queue before frames are dropped.
-///
-/// Bounded, unlike the outbound queues, because inbound connections are not
-/// something this node chose: a box with 104 of them (measured on Genesis-4
-/// mainnet, 2026-08-21) would let unbounded queues turn one stalled peer into
-/// this node's memory problem. A dropped frame is recoverable — the peer asks
-/// for what it missed with `FRAME_GET_BLOCKS` — so dropping is the safe end of
-/// this trade.
 /// How many peers may be answering our history request at the same time.
 ///
 /// **Why this is not "all of them".** Every outbound dialer used to send
@@ -147,6 +146,14 @@ const SYNC_PAGE_BLOCKS: usize = 512;
 /// gossiped again), so shedding beats dying.
 const ENGINE_QUEUE_CAP: usize = 4096;
 
+/// Depth of an inbound peer's broadcast queue before frames are dropped.
+///
+/// Bounded, unlike the outbound queues, because inbound connections are not
+/// something this node chose: a box with 104 of them (measured on Genesis-4
+/// mainnet, 2026-08-21) would let unbounded queues turn one stalled peer into
+/// this node's memory problem. A dropped frame is recoverable — the peer asks
+/// for what it missed with `FRAME_GET_BLOCKS` — so dropping is the safe end of
+/// this trade.
 const INBOUND_QUEUE_DEPTH: usize = 256;
 
 /// The devnet TCP mesh: one queue per peer we dialed, plus one per peer that

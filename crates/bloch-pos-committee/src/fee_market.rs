@@ -8,8 +8,16 @@
 //!
 //! ## The three transaction classes and the one price
 //!
-//! A Genesis-4 block carries eUTXO transfers, EVM transactions and Coherence
-//! shielded transactions. They consume different resources — an eUTXO input
+//! A Genesis-4 block carries eUTXO transfers. The gas model below is written
+//! for THREE classes — eUTXO transfers, EVM transactions and Coherence
+//! shielded transactions — but only the first exists on Layer 1 today: this
+//! crate does not depend on `bloch-euvm` (see its `Cargo.toml`), `PosTransaction`
+//! has no EVM variant, and the consensus state's `EvmCommitment` leaf
+//! (`state_root::EvmCommitment`) is written all-zero at genesis with no
+//! production writer. Until 2026-09-02 this paragraph asserted all three in the
+//! present tense, which read as though L1 were EVM-compatible. It is not; the
+//! EVM and shielded terms below are the market's DESIGN, not its current
+//! traffic. They consume different resources — an eUTXO input
 //! costs a hybrid ML-DSA-65 ‖ Falcon-1024 verification (measured **7,274,849**
 //! RV32IM instructions, `spikes/prover-cost/RESULTS.md`) and ≈ 4.6 KB of
 //! signature bytes; an EVM transaction costs computation and state; a shielded
@@ -480,10 +488,15 @@ mod tests {
 
     // ── The 512 KiB raise ───────────────────────────────────────────────
     //
-    // The activation epoch is `u64::MAX`, so `epoch == u64::MAX` is the only
-    // reachable point of the V2 era and every test below uses it as such. The
-    // whole rest of this suite runs at epoch 0 and is the control: it passes
-    // unchanged, which is the claim that nothing moves before the flag day.
+    // The activation epoch is `BLOCK_BYTES_V2_ACTIVATION_EPOCH`, an ordinary
+    // reachable epoch the chain is long past, so the tests below reach the V2
+    // era through `ACT`, `ACT - 1` and `ACT + 1` rather than through a
+    // sentinel. This banner previously described the epoch as the maximum u64
+    // value and claimed every test used that as the only reachable V2 point —
+    // false of the constant and false of the three tests directly below it.
+    // The whole rest of this suite runs at epoch 0 and is the control: it
+    // passes unchanged, which is the claim that nothing moves before the flag
+    // day.
 
     #[test]
     fn v1_era_is_untouched_by_the_raise() {

@@ -82,8 +82,9 @@ pub struct Manifest {
     /// materialised from the snapshot file by
     /// [`Manifest::ingest_carryover`], which is the only thing that should
     /// ever write it: the entries are meaningful precisely because they were
-    /// checked against all three fields of [`CarryoverCommitment`], and a
-    /// value assigned here by any other route carries no such evidence.
+    /// checked against all four fields of [`CarryoverCommitment`] — digest,
+    /// set root, entry count and total — and a value assigned here by any
+    /// other route carries no such evidence.
     ///
     /// A manifest that commits to a carryover and has this empty is the
     /// zero-balance launch this whole path exists to prevent, so
@@ -706,9 +707,10 @@ pub fn read_carryover_snapshot<R: BufRead>(
     })
 }
 
-/// Read a snapshot file and hold it against all three fields of the
-/// commitment. The only function that should produce carryover entries for a
-/// live chain.
+/// Read a snapshot file and hold it against all four fields of the commitment
+/// — digest, set root, entry count, total — via
+/// [`CarryoverSnapshot::check_against`]. The only function that should produce
+/// carryover entries for a live chain.
 pub fn load_carryover(
     path: &Path,
     commitment: &CarryoverCommitment,

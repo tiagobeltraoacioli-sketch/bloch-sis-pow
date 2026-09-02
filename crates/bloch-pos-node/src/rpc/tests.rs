@@ -32,9 +32,14 @@ fn entry(txid: u8, vout: u32, value: u64, script: u8) -> EutxoEntry {
 /// A committed genesis state with two validators and four outputs across two
 /// script hashes.
 ///
-/// The values are deliberately enormous: `18_000_000_000_000_000_000` is above
-/// `u64::MAX / 2`, so any code that sums balances in `u64` overflows on this
-/// fixture instead of on mainnet.
+/// The values are deliberately enormous: the `0xAB` script hash sums to
+/// 18,000,000,000,000,000,500, about 1,998x JavaScript's 2^53 exact-integer
+/// limit, so a client that reads `balance_sat` as a JSON *number* is silently
+/// wrong on this fixture instead of on mainnet.
+///
+/// It does not overflow `u64` — `u64::MAX` is 18,446,744,073,709,551,615, and
+/// this comment used to claim otherwise. What the fixture pins is the wire
+/// form (a decimal string), not u64 arithmetic.
 fn state_with_balances() -> CommittedState {
     let validators = vec![
         GenesisValidator {
@@ -375,7 +380,9 @@ fn getbalance_sums_the_eutxo_set_for_one_script_hash() {
     let st = state_with_balances();
     let v = balance_json(&st, &[0xAB; 32]);
 
-    // 9e18 + 9e18 + 500 — a sum that wraps u64 and does not wrap u128.
+    // 9e18 + 9e18 + 500. It still fits u64, barely (u64::MAX is ~18.45e18),
+    // and is held in u128; what it does exceed is 2^53, so it must leave as a
+    // string.
     assert_eq!(v.get("balance_sat").unwrap().as_str(), Some("18000000000000000500"));
     assert_eq!(v.get("utxo_count").unwrap().as_u64(), Some(3));
 
@@ -603,7 +610,10 @@ fn unsupported_capabilities_refuse_with_their_own_codes_and_reasons() {
     let v = call(spy.as_ref(), &request("gettransaction", r#"["ab"]"#));
     assert_eq!(error_code(&v), Some(NO_TRANSACTION_INDEX));
     let msg = v.get("error").unwrap().get("message").unwrap().as_str().unwrap();
-    assert!(msg.contains("no id"), "the message must say why, not just no: {msg}");
+    assert!(
+        msg.contains("no transaction index"),
+        "the message must say why, not just no: {msg}"
+    );
     assert!(msg.contains("do not retry"), "a permanent answer must say it is permanent");
     assert!(spy.last().is_none(), "a refused method must never reach the node");
 

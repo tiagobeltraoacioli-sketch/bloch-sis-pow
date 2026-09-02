@@ -18,7 +18,10 @@
 //! > - **the 100 B supply** — reverted to 21 B on 2026-08-11, then re-decided
 //! >   at 100 B on 2026-08-12 as a pure x100/21 split. The `u128`
 //! >   arithmetic contract survives (the danger was always the products, not
-//! >   the totals); the "54% of `u64::MAX`" premise does not.
+//! >   the totals), and so does the "54% of `u64::MAX`" premise: the supply is
+//! >   10^19 sat, which is 54.21% of `u64::MAX`, exactly as this module header
+//! >   restates below and as `tokenomics_v4`'s two headroom asserts pin. This
+//! >   line said the premise did not survive.
 //! > - **the taint machinery** — dissolved: the carryover crosses as one
 //! >   undifferentiated set. [`StateRoots::taint_root`] is retained as a
 //! >   reserved, all-zero slot (removing it would re-open the freeze);

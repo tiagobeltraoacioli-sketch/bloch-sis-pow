@@ -252,10 +252,14 @@ fn body_transactions(env: &BlockEnvelope) -> Result<Vec<PosTransaction>, String>
 /// caller can forget.
 ///
 /// It cannot be forgotten here, because `state` is private to this module and
-/// [`StateCell::set`] is the ONLY way to write it — and `set` both bumps the
-/// generation and empties the memo. There is no assignment path that skips
-/// either. Reads go through `Deref`, so every existing `self.state.foo()`
-/// still reads the live state and nothing else.
+/// the only ways to write it are `StateCell::set` and `StateCell::set_arc` —
+/// **two** writers, not one: `set_arc` is how `do_reorg` installs the post-state
+/// it already holds behind an `Arc`. Both do identical bookkeeping: replace the
+/// state, bump the generation, empty the memo. What the argument needs is not
+/// one writer but no writer that does less than these two — the property point
+/// 2 below states, and the one to re-check if a third is ever added. Reads go
+/// through `Deref`, so every existing `self.state.foo()` still reads the live
+/// state and nothing else.
 ///
 /// # The memo key, and why it is complete
 ///
@@ -357,10 +361,10 @@ mod state_cell {
             }
         }
 
-        /// Replace the canonical state. The only writer, and the reason the
-        /// memo key is sound: it moves the generation and drops the memo in
-        /// the same breath, so no caller can advance the state and leave a
-        /// rolled copy of the old one reachable.
+        /// Replace the canonical state. One of the two writers — `set_arc` is
+        /// the other — and it is why the memo key is sound: it moves the
+        /// generation and drops the memo in the same breath, so no caller can
+        /// advance the state and leave a rolled copy of the old one reachable.
         pub(super) fn set(&mut self, state: CommittedState) {
             self.state = Arc::new(state);
             self.generation = self.generation.wrapping_add(1);
@@ -574,11 +578,24 @@ struct Engine {
     /// Transactions waiting for a block, keyed by canonical bytes so a
     /// duplicate gossip collapses instead of being included twice.
     ///
-    /// Devnet mempool, and the limitations are the point: no fee ordering (it
-    /// is insertion-ordered), no per-sender limit, no eviction beyond
-    /// `MEMPOOL_MAX`, and admission checks only that the bytes decode. A
-    /// public network needs all four; `gossip.rs` in the pure crate is where
-    /// that belongs and it is still not wired.
+    /// Devnet mempool, and the limitations are the point: no fee ordering, no
+    /// per-sender limit, no eviction beyond `MEMPOOL_MAX`. A public network
+    /// needs all three; `gossip.rs` in the pure crate is where that belongs
+    /// and it is still not wired.
+    ///
+    /// Ordering has to be stated precisely, because this comment used to call
+    /// it insertion order and that is not what happens. The container is a
+    /// `BTreeMap` keyed by the canonical transaction bytes, and
+    /// [`Engine::select_transactions`] walks it with `iter()` — so inclusion
+    /// order is **lexicographic over the encoded transaction**, not arrival
+    /// order. That is worse than merely absent: a sender who re-encodes until
+    /// the bytes sort low buys priority for nothing, so inclusion order here
+    /// is grindable.
+    ///
+    /// Admission is not "the bytes decode" either. `on_transaction` calls
+    /// `admissible`, which refuses deposits, delegations and exits, refuses a
+    /// transfer with no inputs or no outputs, and verifies every spend
+    /// signature.
     mempool: BTreeMap<Vec<u8>, PosTransaction>,
     /// Transactions the proposer's drop loop refused, keyed exactly like
     /// [`Self::mempool`] and mapping to `(slot the bar lifts at, times it has
@@ -1590,18 +1607,6 @@ impl Engine {
     }
 
 
-    /// Admit a transaction to the mempool and pass it on.
-    ///
-    /// Admission is deliberately thin here — the bytes already decoded at the
-    /// network edge, and that is the whole check. What is missing is named in
-    /// the `mempool` field's doc rather than half-built: no fee floor, no
-    /// per-sender accounting, no replacement policy. Re-broadcast only on
-    /// first sight, so a transaction traverses the mesh once instead of
-    /// echoing between every pair of peers.
-    /// Returns what became of the transaction, so a caller that has someone to
-    /// answer to — the RPC — can say. The gossip path ignores the result: a
-    /// peer is not waiting on a verdict, and a duplicate arriving twice over a
-    /// full mesh is the normal case rather than a fault.
     /// Outpoints a transaction spends, when it spends any.
     ///
     /// `None` for everything that is not a transfer: staking messages consume
@@ -1788,6 +1793,21 @@ impl Engine {
         }
     }
 
+    /// Admit a transaction to the mempool and pass it on.
+    ///
+    /// Admission is thin, but it is not "the bytes decoded at the network edge
+    /// and that is the whole check": `admissible`, called below, refuses
+    /// deposits, delegations and exits, refuses a transfer with no inputs or no
+    /// outputs, and verifies every spend signature. What is missing is the
+    /// fee-market half — no fee floor, no per-sender accounting, no replacement
+    /// policy — and that is named in the `mempool` field's doc rather than
+    /// half-built. Re-broadcast only on first sight, so a transaction traverses
+    /// the mesh once instead of echoing between every pair of peers.
+    ///
+    /// Returns what became of the transaction, so a caller that has someone to
+    /// answer to — the RPC — can say. The gossip path ignores the result: a
+    /// peer is not waiting on a verdict, and a duplicate arriving twice over a
+    /// full mesh is the normal case rather than a fault.
     fn on_transaction(&mut self, tx: PosTransaction) -> Result<Admitted, Refusal> {
         let key = tx.canonical_bytes();
         if self.mempool.contains_key(&key) {
@@ -1820,11 +1840,14 @@ impl Engine {
         // is the class that was actually exploited — a transfer that spends
         // nothing or pays no one, which no state can make applicable.
         //
-        // It does NOT catch a transfer whose signature is wrong, whose inputs
-        // do not exist, or which fails conservation. Those still reach the
-        // mempool and are dropped by the proposer, which is why the proposer's
-        // guard is the one that carries liveness and this one only reduces
-        // waste. Two checks, neither trusting the other.
+        // The signature IS caught here — `admissible`'s Transfer arm verifies
+        // every input's spend signature, under a comment in capitals saying
+        // why, and refusing at the mempool door is what stops a garbage
+        // signature propagating. What this does NOT catch is a transfer whose
+        // inputs do not exist, or which fails conservation. Those still reach
+        // the mempool and are dropped by the proposer, which is why the
+        // proposer's guard is the one that carries liveness and this one only
+        // reduces waste. Two checks, neither trusting the other.
         //
         // The epoch handed down is the WALL-CLOCK epoch, read here through
         // the `wall_slot()` METHOD (the clock against the manifest's genesis)
@@ -1845,11 +1868,19 @@ impl Engine {
 
     /// Transactions for the block this node is about to propose.
     ///
-    /// Insertion order, bounded by both [`MAX_TXS_PER_BLOCK`] and the
-    /// consensus byte cap. Insertion order is not a fee market: a real
-    /// proposer sorts by what the transaction pays, and doing that here before
-    /// transfers carry a value format would be inventing an ordering over a
-    /// field nobody sets yet.
+    /// Bounded by both [`MAX_TXS_PER_BLOCK`] and the consensus byte cap, and
+    /// taken in the mempool's own key order — **lexicographic over the
+    /// canonical transaction bytes**, because the mempool is a `BTreeMap` keyed
+    /// by exactly those bytes. Not insertion order, whatever this comment used
+    /// to say.
+    ///
+    /// That is not a fee market, and it is not neutral either: a sender who
+    /// re-encodes until the bytes sort low is included first, for free, so
+    /// inclusion order is grindable. The material for a real ordering is
+    /// already on the wire — a `Transfer` carries `outputs` with values and a
+    /// `tip_millisat_per_gas`, which `submit-tx` sets on every transaction it
+    /// builds (main.rs) — so sorting by what the transaction pays is a change
+    /// that can be made; it simply has not been made here.
     ///
     /// `epoch` is the epoch of the slot being produced, because the byte cap
     /// is flag-day gated. Packing against the wrong era is not symmetric: the
@@ -3497,8 +3528,10 @@ fn forkchoice_store<'a>(
 /// `wall_epoch` is the admitting node's WALL-CLOCK epoch
 /// (`epoch_of(self.wall_slot())` at the call site in `on_transaction`), and
 /// it exists for exactly one arm: the `TransferV2` flag-day gate below. It is
-/// in EPOCHS, not slots — `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH`
-/// (params.rs:150) is an epoch, and a caller passing a raw slot would be
+/// in EPOCHS, not slots — `bloch_pos_committee::params`'s
+/// `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` is an epoch (cited by symbol, not
+/// by line: the line number it used to give had already rotted), and a caller
+/// passing a raw slot would be
 /// early by `SLOTS_PER_EPOCH` (32×). The boundary test pins the unit by
 /// deriving both sides of the flag day from slots via `epoch_of`.
 ///
@@ -3705,7 +3738,8 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
         // it. Sixty-four Exit messages would set exit_epoch on all sixty-four
         // validators, and an exit cannot be revoked (`exit_epoch != u64::MAX`
         // is refused), so the roster would empty and every bond lock for
-        // 2,080 epochs. Refused until the message carries a signature that
+        // `staking::WITHDRAWAL_DELAY_EPOCHS` = 2,048 epochs. Refused until the
+        // message carries a signature that
         // binds it to the validator's own key.
         PosTransaction::Exit { .. } => Err(
             "exits are not accepted: the Exit message is not authenticated, \
@@ -3787,16 +3821,6 @@ mod forkchoice_tests {
             .collect()
     }
 
-    /// **The reason this fork choice was changed.** A branch three blocks long
-    /// with one attester loses to a branch one block long with three.
-    ///
-    /// Under longest-valid-chain — what the node ran until now — the head is
-    /// the tip of the long branch, and a proposer who can produce blocks fast
-    /// overrides whatever the honest majority has voted for. Length is not the
-    /// security statement in proof of stake; attested stake is. Without this
-    /// test, swapping the implementations would be a claim rather than a
-    /// change: the cooperative devnet passes either way, because on a chain
-    /// with no forks the two rules agree.
     /// The exposure this closes: a `Deposit` names an amount, carries no
     /// signature, and spends no output. Until bonding is funded from the eUTXO
     /// set, admitting one is admitting stake minted from nothing.
@@ -3847,6 +3871,16 @@ mod forkchoice_tests {
         );
     }
 
+    /// **The reason this fork choice was changed.** A branch three blocks long
+    /// with one attester loses to a branch one block long with three.
+    ///
+    /// Under longest-valid-chain — what the node ran until now — the head is
+    /// the tip of the long branch, and a proposer who can produce blocks fast
+    /// overrides whatever the honest majority has voted for. Length is not the
+    /// security statement in proof of stake; attested stake is. Without this
+    /// test, swapping the implementations would be a claim rather than a
+    /// change: the cooperative devnet passes either way, because on a chain
+    /// with no forks the two rules agree.
     #[test]
     fn weight_beats_length() {
         let g = [0x99u8; 32]; // the justified root the walk starts from
@@ -4254,7 +4288,8 @@ mod admission_authorisation {
             "a validly signed transfer must still reach the mempool"
         );
         // V1 is EPOCH-INDEPENDENT, on both sides of the TransferV2 flag day
-        // (params.rs:150). Part of the pre-activation control: teaching the
+        // (`params::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH`). Part of the
+        // pre-activation control: teaching the
         // epoch to `admissible` must change nothing about the format the
         // chain already runs on.
         assert!(
@@ -4343,7 +4378,7 @@ mod admission_authorisation {
 
     /// The flag day itself, with the unit pinned: both epochs are DERIVED
     /// FROM SLOTS via `epoch_of`, because the gate compares EPOCHS against
-    /// `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` (params.rs:150) and a call
+    /// `params::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` and a call
     /// site that handed it a raw wall SLOT would activate 32× early —
     /// silently, since both are bare u64s.
     ///
@@ -5599,7 +5634,15 @@ mod bench {
     use bloch_pos_committee::state_root::{EutxoEntry, EvmCommitment};
     use std::time::Instant;
 
-    /// The Genesis-3 carryover's output count, per `CARRYOVER-SNAPSHOT.md`.
+    /// The opening-ledger size this bench sizes its state to.
+    ///
+    /// It does NOT agree with `CARRYOVER-SNAPSHOT.md`, which records 452,726
+    /// rows, nor with `engine/replay_bench.rs`'s `CARRYOVER_N`, which is that
+    /// same 452,726 — a gap of 593 outputs. The constant is left at 452,133
+    /// rather than quietly moved: this is an `#[ignore]`d measurement that
+    /// asserts nothing, so the gap costs nothing today, and editing a figure to
+    /// match a document is exactly how a wrong figure becomes load-bearing.
+    /// Which of the two is stale is for the founder to settle.
     const MAINNET_EUTXOS: u32 = 452_133;
 
     fn mainnet_sized_state(n: u32) -> CommittedState {

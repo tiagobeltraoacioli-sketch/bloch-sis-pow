@@ -265,16 +265,18 @@ impl FinalityState {
         Ok(state)
     }
 
-    /// Fold one epoch of votes into the state.
+    /// Mutation switch: tally the quorum denominator WITHOUT the leak
+    /// adjustment, reproducing the pre-fix behaviour so the tests that
+    /// document it stay reproducible.
     ///
-    /// Order inside this function matters and is part of consensus:
-    /// 1. tally votes with **pre-epoch** leak-adjusted stakes (this epoch's
-    ///    leak must not influence this epoch's own quorum),
-    /// 2. justify / finalize,
-    /// 3. tick the leak using the **post-vote** finalized epoch, so the epoch
-    ///    that restores finality does not also punish its participants.
     /// `true` only in a test build with the mutation switch on. Constant
-    /// `false` everywhere else, so the branch above folds away in a release.
+    /// `false` everywhere else, so the branch that reads it folds away in a
+    /// release.
+    ///
+    /// (This function carried the doc block for `process_epoch` until
+    /// 2026-09-02 — a missing separator glued eight lines about consensus
+    /// ordering onto a boolean flag reader, and left `process_epoch`
+    /// undocumented. The block is now back on `process_epoch` below.)
     #[inline]
     fn denominator_ignores_leak() -> bool {
         #[cfg(test)]
@@ -299,11 +301,6 @@ impl FinalityState {
         false
     }
 
-    /// Mutation switch: reproduce the PRE-FIX accumulator, which had exactly
-    /// one write path and never came back down. Same purpose as
-    /// [`Self::denominator_floor_disabled`]. Constant `false` in a release
-    /// build.
-    #[inline]
     /// See `params::rehearsal::gates_are_forced_open`. Constant `false` in any
     /// build that is not a test build, so the gate folds to the shipped one.
     #[inline]
@@ -316,6 +313,16 @@ impl FinalityState {
         false
     }
 
+    /// Mutation switch: reproduce the PRE-FIX accumulator, which had exactly
+    /// one write path and never came back down. Same purpose as
+    /// [`Self::denominator_floor_disabled`]. Constant `false` in a release
+    /// build.
+    ///
+    /// (This doc sat on `gates_forced_open` until 2026-09-02 — a stray
+    /// `#[inline]` between two doc blocks attached both to that function and
+    /// left this one, the accumulator switch it actually describes, with no
+    /// doc at all.)
+    #[inline]
     fn leak_recovery_disabled() -> bool {
         #[cfg(test)]
         {
@@ -325,6 +332,14 @@ impl FinalityState {
         false
     }
 
+    /// Fold one epoch of votes into the state.
+    ///
+    /// Order inside this function matters and is part of consensus:
+    /// 1. tally votes with **pre-epoch** leak-adjusted stakes (this epoch's
+    ///    leak must not influence this epoch's own quorum),
+    /// 2. justify / finalize,
+    /// 3. tick the leak using the **post-vote** finalized epoch, so the epoch
+    ///    that restores finality does not also punish its participants.
     pub fn process_epoch(&mut self, votes: &EpochVotes<'_>) -> Result<EpochOutcome, FinalityError> {
         if votes.epoch != self.next_epoch {
             return Err(FinalityError::OutOfOrderEpoch {

@@ -7,9 +7,18 @@
 //! (`spikes/prover-cost/RESULTS.md`): 7,274,849 RV32IM instructions per
 //! ML-DSA-65 ‖ Falcon-1024 verification, and a 4,589-byte signature.
 //!
-//! Nothing here is active. There is no activation height in this crate because
-//! the crate is not wired into the node; when it is, activation follows the
-//! height-gated flag-day idiom used by `STATE_ROOT_ACTIVATION_HEIGHT`.
+//! These are LIVE consensus constants, and several of the activation heights
+//! below are bound, not inert: `LEAKED_ROSTER_ACTIVATION_EPOCH` (1400),
+//! `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` (800) and
+//! `BLOCK_BYTES_V2_ACTIVATION_EPOCH` (800) are all epochs the chain is past.
+//! `ANCESTRY_SEED_ACTIVATION_EPOCH` and `LEAK_RECOVERY_ACTIVATION_EPOCH` are
+//! the ones still at `u64::MAX`.
+//!
+//! Until 2026-09-02 this header said nothing here was active and that the
+//! crate held no activation height at all because it was not wired into the
+//! node. All three clauses were false: the crate is a path-dependency of
+//! `bloch-pos-node`, and this file has five activation constants, three of
+//! them bound.
 
 /// Full committee, voting once at each epoch boundary for justification and
 /// finality. At 4,589 B per signature this is ≈ 588 KB in the epoch-boundary
@@ -167,10 +176,20 @@ pub const MIN_QUORUM_DENOMINATOR_DEN: u128 = 2;
 /// Flag-day epoch at which the inactivity leak starts reaching the **duty
 /// roster**, and not only the quorum denominator.
 ///
-/// `u64::MAX` means INERT: every node ships the code and none of it changes a
-/// single committee or proposer draw until this constant is lowered and the
-/// fleet is rebuilt together. Same idiom as `STATE_ROOT_ACTIVATION_HEIGHT` —
-/// a consensus rule arrives by flag day, never by whoever restarts first.
+/// **This flag day is ARMED, and bound long ago.** It is currently `1400`,
+/// which the chain passed on 2026-08-29; the leak reaches the duty roster on
+/// every block since. It is not a sentinel and has not been one since
+/// 2026-08-24 — see "ARMED" below for the arming record and the provenance of
+/// the number.
+///
+/// A `u64::MAX` here WOULD mean inert: every node ships the code and none of
+/// it changes a single committee or proposer draw until the constant is
+/// lowered and the fleet is rebuilt together. That is the idiom, shared with
+/// `STATE_ROOT_ACTIVATION_HEIGHT` — a consensus rule arrives by flag day,
+/// never by whoever restarts first — and it is the state this constant was in
+/// before it was armed, not the state it is in now. The opening paragraph
+/// asserted the inert state in the present tense for eight days after arming;
+/// `scripts/check-comment-constants.py` now fails the build on that shape.
 ///
 /// # The defect this closes
 ///
@@ -259,12 +278,18 @@ pub const LEAKED_ROSTER_ACTIVATION_EPOCH: u64 = 1400;
 /// Flag-day epoch at which the deduplicated transfer format (`TransferV2`,
 /// wire tag `0x06`) becomes acceptable in blocks.
 ///
-/// `u64::MAX` means INERT: every node ships the decoder and the apply path
-/// and none of it changes what a block may carry until this constant is
-/// lowered and the fleet is rebuilt together. Same idiom as
-/// `LEAKED_ROSTER_ACTIVATION_EPOCH` — a consensus rule arrives by flag day,
-/// never by whoever restarts first. The V1 format (tag `0x01`) stays valid
-/// forever; this gate only *adds* an encoding, it retires nothing.
+/// **This flag day is BOUND.** It is currently `800`, an epoch the chain is
+/// long past, so `TransferV2` is acceptable in blocks today and the paragraphs
+/// below describing the gate as pending describe history, not the live rule.
+/// The V1 format (tag `0x01`) stays valid forever; this gate only *adds* an
+/// encoding, it retires nothing.
+///
+/// A `u64::MAX` here WOULD mean inert: every node ships the decoder and the
+/// apply path and none of it changes what a block may carry until the
+/// constant is lowered and the fleet is rebuilt together. That is the idiom,
+/// shared with `LEAKED_ROSTER_ACTIVATION_EPOCH` — a consensus rule arrives by
+/// flag day, never by whoever restarts first — and it is the state this
+/// constant was in before it was bound, not the state it is in now.
 ///
 /// # The defect this closes
 ///
@@ -311,16 +336,31 @@ pub const TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH: u64 = 800;
 /// cap — read as 2.3x over target and push the base fee up on a block that is
 /// not scarce at all.
 ///
-/// `u64::MAX` until the founder sets it. Below it every node computes the old
-/// cap and the old target, so a mixed fleet reaches one verdict on every
-/// block; at and above it they diverge on both, so **the fleet must be
-/// rebuilt before this constant is ever lowered**. Same idiom as
+/// **This flag day is BOUND.** It is currently `800`, an epoch the chain is
+/// long past, so the 512 KiB cap and the moved byte target are the live rule
+/// and the two paragraphs above describe a switch that has already happened.
+/// Until 2026-09-02 this paragraph described the constant as an unset
+/// sentinel awaiting the founder, while the constant beside it read `800`.
+///
+/// Below the epoch every node computes the old cap and the old target, so a
+/// mixed fleet reaches one verdict on every block; at and above it they
+/// diverge on both, which is why rebuilding the fleet is a PRECONDITION of
+/// lowering this constant and not a follow-up. Same idiom as
 /// [`LEAKED_ROSTER_ACTIVATION_EPOCH`], and the gate reads the epoch derived
 /// from the block's own header slot — never node-local state, which is what
 /// the 2026-08-08 `expected_bits` fork cost us.
 pub const BLOCK_BYTES_V2_ACTIVATION_EPOCH: u64 = 800;
 
-/// **The F6 seed look-ahead is UNCONDITIONAL.** There is no flag day.
+/// **Superseded — read [`ANCESTRY_SEED_ACTIVATION_EPOCH`] below instead.**
+///
+/// This heading used to declare the F6 seed look-ahead unconditional and the
+/// gate gone. The gate was deleted on 2026-08-24 and then RESTORED, for the
+/// reason its own doc block records: boot is a replay of an append-only block
+/// log, so a node running the corrected rule against the old log does not
+/// disagree at a boundary, it stops. The constant exists, it is `u64::MAX`,
+/// and therefore the SHIPPED rule is still `back = 1` — the pre-F6 rule — for
+/// every epoch any chain can reach. The paragraphs below describe the deletion
+/// and are kept as the record of it, not as a description of today.
 ///
 /// `CommittedState::seed_for_epoch` seeds epoch `E` from the mix at the close
 /// of `E − 1 − `[`crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS`], always. It
