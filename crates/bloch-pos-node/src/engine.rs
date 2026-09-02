@@ -2226,7 +2226,11 @@ impl Engine {
         // on a losing branch is still a vote we can verify.
         let known =
             |root: &[u8; 32]| self.canonical.contains(root) || self.blocks.contains_key(root);
-        pool.process(att, self.wall_slot, &committees_at, &known, &self.verifier)
+        // Keys from `rolled`, the SAME projection that produced `roster` and
+        // therefore `committees_at`. Membership and key must come from one
+        // snapshot; the old code took membership from here and the key from a
+        // boot-time genesis table, which is the inconsistency being removed.
+        pool.process(att, self.wall_slot, &committees_at, &known, &self.verifier, &*rolled)
     }
 
     fn apply_decision(&mut self, att: Attestation, decision: GossipDecision, origin: &Origin) {
@@ -2305,6 +2309,8 @@ impl Engine {
                 &committees_at,
                 &known,
                 &self.verifier,
+                // Same snapshot `roster` and the seed came from.
+                &*rolled,
             )
         };
         self.att_pool = pool;
@@ -2600,6 +2606,76 @@ impl Engine {
 /// that the log of a multi-hour replay stays readable.
 const REPLAY_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Verdict of the boot-time keystore identity gate ("gate 3").
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum KeystoreIdentity {
+    /// The keystore is the manifest's validator at that index, and its local
+    /// RANDAO chain opens the committed head.
+    Ok,
+    /// No manifest validator carries this (index, pubkey) pair.
+    NotInGenesisSet,
+    /// The validator is in the manifest, but the local RANDAO seed does not
+    /// regenerate the committed commitment.
+    RandaoMismatch,
+}
+
+/// The boot-time identity gate, extracted from `run` so it can be tested.
+///
+/// # This gate is the third thing blocking an open network, and it is
+/// # independent of the verifier
+///
+/// A validator added by an on-chain deposit is, by construction, NOT in the
+/// genesis manifest. So even once the verifier reads the registry and the
+/// network can *count* a newcomer's votes, the newcomer's own node still
+/// refuses to boot with `keystore does not match the genesis manifest's
+/// validator set`. Fixing the verifier alone gets you a validator everyone
+/// else can verify and that cannot start.
+///
+/// The root cause is the same one the verifier had: **identity is being read
+/// from the genesis manifest instead of from the committed registry.** A
+/// validator's index, key and RANDAO commitment are all committed state
+/// (`ValidatorRecord`), and a deposit writes all three. The manifest is only
+/// the registry's value at height 0.
+///
+/// The shape of the real fix (NOT made here — it needs its own design
+/// decision about when a node concludes it is not a validator):
+/// check the keystore against the registry of the state the node is actually
+/// starting from, and when the index is absent there, start in a
+/// *pending-activation* mode — follow the chain, sign nothing, re-check each
+/// epoch — rather than refusing to boot. Refusing to boot is right for "your
+/// key is wrong"; it is wrong for "your deposit has not been applied yet",
+/// and today those are the same branch.
+///
+/// # One latent defect fixed in the extraction
+///
+/// The original read the RANDAO commitment as
+/// `manifest.validators[keys.index as usize]` — indexing by POSITION after
+/// having found the record by its `index` FIELD. Those coincide only while
+/// the manifest is dense and sorted; otherwise it compares against another
+/// validator's commitment, or panics out of bounds. This version uses the
+/// record it already found. On the live fleet's dense manifest the two are
+/// identical; everywhere else this one is correct and the old one was not.
+/// (`Manifest::pubkeys()` carries the same position-vs-index assumption and
+/// silently yields an EMPTY key for an out-of-range index — see
+/// `genesis::tests::the_manifest_table_silently_empties_sparse_indices`.)
+pub(crate) fn check_keystore_identity(
+    manifest: &crate::genesis::Manifest,
+    index: u32,
+    pubkey: &[u8],
+    randao_seed: [u8; 32],
+) -> KeystoreIdentity {
+    let Some(v) = manifest.validators.iter().find(|v| v.index == index) else {
+        return KeystoreIdentity::NotInGenesisSet;
+    };
+    if v.pubkey != pubkey {
+        return KeystoreIdentity::NotInGenesisSet;
+    }
+    if RandaoChain::generate(randao_seed).commitment() != v.randao_commitment {
+        return KeystoreIdentity::RandaoMismatch;
+    }
+    KeystoreIdentity::Ok
+}
+
 pub fn run(cfg: Config) -> io::Result<()> {
     let (mut manifest, digest) = Manifest::load(&cfg.genesis_path)?;
 
@@ -2659,26 +2735,26 @@ pub fn run(cfg: Config) -> io::Result<()> {
         }
         Err(e) => return Err(e),
     };
-    let verifier = HybridVerifier::new(manifest.pubkeys());
+    // Stateless now: it holds no key table. Keys are resolved per call from
+    // the committed registry by whichever consensus site is asking.
+    let verifier = HybridVerifier::new();
 
     // Identity sanity: the keystore must be the validator the manifest says.
     if let Some(keys) = keys.as_ref() {
-        match manifest.validators.iter().find(|v| v.index == keys.index) {
-            Some(v) if v.pubkey == keys.pubkey => {}
-            _ => {
+        match check_keystore_identity(&manifest, keys.index, &keys.pubkey, keys.randao_seed) {
+            KeystoreIdentity::Ok => {}
+            KeystoreIdentity::NotInGenesisSet => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "keystore does not match the genesis manifest's validator set",
                 ))
             }
-        }
-        if RandaoChain::generate(keys.randao_seed).commitment()
-            != manifest.validators[keys.index as usize].randao_commitment
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "local RANDAO chain does not open the manifest's committed head",
-            ));
+            KeystoreIdentity::RandaoMismatch => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "local RANDAO chain does not open the manifest's committed head",
+                ))
+            }
         }
     }
 
@@ -4311,7 +4387,7 @@ mod transfer_v2_end_to_end {
             )
             .expect("bind the devnet transport on an ephemeral port"),
         );
-        let verifier = HybridVerifier::new(Vec::new());
+        let verifier = HybridVerifier::new();
         Engine {
             manifest,
             state: StateCell::new(state),
@@ -4979,7 +5055,7 @@ mod perf_support {
             )
             .expect("bind the devnet transport on an ephemeral port"),
         );
-        let verifier = HybridVerifier::new(manifest.pubkeys());
+        let verifier = HybridVerifier::new();
         let engine = Engine {
             manifest,
             state: StateCell::new(state),
@@ -6424,7 +6500,7 @@ mod duty_view_anchor {
             )
             .expect("bind the devnet transport on an ephemeral port"),
         );
-        let verifier = HybridVerifier::new(manifest.pubkeys());
+        let verifier = HybridVerifier::new();
         let ks0 = Keystore::load(&dir.0.join("v0")).expect("re-load validator 0");
         let engine = Engine {
             manifest,

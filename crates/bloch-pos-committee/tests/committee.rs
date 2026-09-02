@@ -198,18 +198,22 @@ fn epoch_committee_is_larger_than_the_slot_sample() {
 // ── attestation ─────────────────────────────────────────────────────────────
 
 struct AlwaysValid;
+/// Every index resolves to the same placeholder key. These tests are about
+/// window, dedup, membership and ordering — not about key binding — and
+/// their verifier doubles ignore the key bytes. The cases that DO care
+/// about resolution use `NoKeys` / a real registry instead.
+struct AnyKey;
+impl crate::attestation::KeyLookup for AnyKey {
+fn pubkey(&self, _v: u32) -> Option<&[u8]> {
+Some(b"placeholder-key")
+}
+}
+
 impl SignatureVerifier for AlwaysValid {
-    fn verify(&self, _v: u32, _r: &[u8; 32], _s: &[u8]) -> bool { true }
-    /// Mirrors this mock's `verify`: a test double that accepted
-    /// spends more easily than attestations would hide the very
-    /// forgery the spend path must refuse.
-    fn verify_with_key(&self, _pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
-        self.verify(0, root, sig)
-    }
+    fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool { true }
 }
 struct AlwaysInvalid;
 impl SignatureVerifier for AlwaysInvalid {
-    fn verify(&self, _v: u32, _r: &[u8; 32], _s: &[u8]) -> bool { false }
     fn verify_with_key(&self, _pk: &[u8], _r: &[u8; 32], _s: &[u8]) -> bool { false }
 }
 
@@ -249,7 +253,7 @@ fn non_member_is_rejected_before_signature_check() {
     let committee = vec![1u32, 2, 3];
     let a = att(5, 0xAA, 99);
     assert_eq!(
-        bloch_pos_committee::attestation::validate(&a, &committee, 5, &AlwaysValid),
+        bloch_pos_committee::attestation::validate(&a, &committee, 5, &AlwaysValid, &AnyKey),
         Err(RejectReason::NotInCommittee)
     );
 }
@@ -259,7 +263,7 @@ fn bad_signature_is_rejected() {
     let committee = vec![1u32, 2, 3];
     let a = att(5, 0xAA, 2);
     assert_eq!(
-        bloch_pos_committee::attestation::validate(&a, &committee, 5, &AlwaysInvalid),
+        bloch_pos_committee::attestation::validate(&a, &committee, 5, &AlwaysInvalid, &AnyKey),
         Err(RejectReason::BadSignature)
     );
 }
@@ -269,14 +273,14 @@ fn future_slot_and_bad_checkpoints_are_rejected() {
     let committee = vec![2u32];
     let a = att(9, 0xAA, 2);
     assert_eq!(
-        bloch_pos_committee::attestation::validate(&a, &committee, 5, &AlwaysValid),
+        bloch_pos_committee::attestation::validate(&a, &committee, 5, &AlwaysValid, &AnyKey),
         Err(RejectReason::FutureSlot)
     );
     let mut b = att(5, 0xAA, 2);
     b.data.source_epoch = 5;
     b.data.target_epoch = 5;
     assert_eq!(
-        bloch_pos_committee::attestation::validate(&b, &committee, 5, &AlwaysValid),
+        bloch_pos_committee::attestation::validate(&b, &committee, 5, &AlwaysValid, &AnyKey),
         Err(RejectReason::NonMonotonicCheckpoints)
     );
 }
@@ -285,7 +289,7 @@ fn future_slot_and_bad_checkpoints_are_rejected() {
 fn valid_attestation_passes() {
     let committee = vec![1u32, 2, 3];
     assert!(bloch_pos_committee::attestation::validate(
-        &att(5, 0xAA, 2), &committee, 5, &AlwaysValid).is_ok());
+        &att(5, 0xAA, 2), &committee, 5, &AlwaysValid, &AnyKey).is_ok());
 }
 
 #[test]
@@ -1635,4 +1639,191 @@ fn out_of_slot_attestations_are_dropped_not_counted_absent() {
     assert_eq!(out.attestations[0].1.slot, base.slot);
     // E o denominador continua sendo o conjunto ativo INTEIRO.
     assert_eq!(out.active_set.len(), 200);
+}
+
+// ── The verifier reads the registry (2026-09-02) ────────────────────────────
+//
+// These are the "verify by violating" cases for the change that made consensus
+// signature checks resolve keys from the committed validator registry instead
+// of from a table built once at boot from the genesis manifest.
+//
+// The defect being closed: a validator added by an on-chain deposit registered,
+// activated, entered the roster and was drawn for a committee, and then its
+// GENUINE signature was rejected as `BadSignature`, because the boot-time table
+// had no entry past the genesis set. Its committee seats could never be filled,
+// so a deposit landing before the fix silently subtracted from finality.
+//
+// The verifier double below binds a signature to a KEY (not to an index),
+// which is what the real hybrid suite does. That is the whole point: the index
+// must stop being an input to "is this signature valid".
+
+/// `sig == SHA3-ish(key ‖ root)`, a stand-in for the hybrid suite. Pure: this
+/// crate deliberately carries no PQ dependency.
+fn key_sign(pubkey: &[u8], root: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(pubkey.len() + 32);
+    out.extend_from_slice(pubkey);
+    out.extend_from_slice(root);
+    out
+}
+
+struct KeyBound;
+impl SignatureVerifier for KeyBound {
+    fn verify_with_key(&self, pubkey: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
+        sig == key_sign(pubkey, root).as_slice()
+    }
+}
+
+/// A registry: index → key. Lookup by the index FIELD, as production does.
+struct KeyRegistry(Vec<(u32, Vec<u8>)>);
+impl attestation::KeyLookup for KeyRegistry {
+    fn pubkey(&self, validator: u32) -> Option<&[u8]> {
+        self.0.iter().find(|(i, _)| *i == validator).map(|(_, k)| k.as_slice())
+    }
+}
+
+fn key_of(index: u32) -> Vec<u8> {
+    format!("validator-{index}-key").into_bytes()
+}
+
+/// Indices 0..=7 are the "genesis set"; index 8 is the validator a deposit
+/// added afterwards — exactly the case the boot-time table could not serve.
+fn registry_with_newcomer() -> KeyRegistry {
+    KeyRegistry((0..=8u32).map(|i| (i, key_of(i))).collect())
+}
+
+fn signed_att(validator: u32, key: &[u8]) -> Attestation {
+    let data = AttestationData {
+        slot: 294,
+        head: [0xAA; 32],
+        source_epoch: 1,
+        source_root: [1u8; 32],
+        target_epoch: 2,
+        target_root: [2u8; 32],
+    };
+    let sig = key_sign(key, &data.signing_root());
+    Attestation { data, validator, signature: sig }
+}
+
+#[test]
+fn deposit_added_validator_now_verifies() {
+    // The exact failing case from the report: newcomer at index 8, drawn for
+    // slot 294, committee = [8] — a committee consisting ENTIRELY of the
+    // validator whose votes could never be counted.
+    let committee = vec![8u32];
+    let att = signed_att(8, &key_of(8));
+    assert_eq!(
+        attestation::validate(&att, &committee, 294, &KeyBound, &registry_with_newcomer()),
+        Ok(()),
+        "a deposit-added validator's genuine signature must be accepted"
+    );
+}
+
+#[test]
+fn genuinely_bad_signature_is_still_rejected() {
+    let committee = vec![8u32];
+    let mut att = signed_att(8, &key_of(8));
+    att.signature = b"not the signature".to_vec();
+    assert_eq!(
+        attestation::validate(&att, &committee, 294, &KeyBound, &registry_with_newcomer()),
+        Err(attestation::RejectReason::BadSignature),
+    );
+}
+
+#[test]
+fn key_not_in_the_registry_is_rejected() {
+    // A signature that is perfectly well-formed under a key the registry does
+    // not hold at that index. This is the case that matters most: the fix must
+    // not degrade into "any signature by any key passes". The signer holds a
+    // real keypair and signs correctly — it is simply not the key registered
+    // at index 8.
+    let committee = vec![8u32];
+    let stranger = b"a key that was never registered".to_vec();
+    let att = signed_att(8, &stranger);
+    assert_eq!(
+        attestation::validate(&att, &committee, 294, &KeyBound, &registry_with_newcomer()),
+        Err(attestation::RejectReason::BadSignature),
+        "a genuine signature under an unregistered key must not authorise an index"
+    );
+}
+
+#[test]
+fn index_outside_the_registry_is_rejected() {
+    // Index 9 is in the committee this node drew but absent from the registry.
+    // Distinct from BadSignature on purpose: it says the registry does not know
+    // the index, which is a statement about state, not about the bytes.
+    let committee = vec![9u32];
+    let att = signed_att(9, &key_of(9));
+    assert_eq!(
+        attestation::validate(&att, &committee, 294, &KeyBound, &registry_with_newcomer()),
+        Err(attestation::RejectReason::UnknownValidator),
+    );
+}
+
+#[test]
+fn one_validators_signature_does_not_authorise_another_index() {
+    // `AttestationData::signing_root()` does NOT cover the validator index —
+    // it covers only the vote. So the ONLY thing binding a vote to a voter is
+    // which key the registry returns for that index. Validator 3 signs; the
+    // attestation is presented as validator 4's. It must fail, and it fails
+    // because index 4 resolves to a different key.
+    //
+    // This is why the registry's index→key map being injective and permanent
+    // (indices never reused, pubkeys never mutated, records never removed,
+    // duplicate pubkeys refused at deposit) is load-bearing, not incidental.
+    let committee = vec![3u32, 4u32];
+    let mut att = signed_att(3, &key_of(3));
+    att.validator = 4;
+    assert_eq!(
+        attestation::validate(&att, &committee, 294, &KeyBound, &registry_with_newcomer()),
+        Err(attestation::RejectReason::BadSignature),
+    );
+}
+
+#[test]
+fn membership_is_still_checked_before_the_registry_is_touched() {
+    // The DoS ordering must survive the change: a non-member is rejected on
+    // the cheap binary search, never reaching the registry probe. Proven by a
+    // lookup that panics if consulted.
+    struct Exploding;
+    impl attestation::KeyLookup for Exploding {
+        fn pubkey(&self, _v: u32) -> Option<&[u8]> {
+            panic!("registry consulted before the committee membership check");
+        }
+    }
+    let committee = vec![1u32, 2u32];
+    let att = signed_att(7, &key_of(7));
+    assert_eq!(
+        attestation::validate(&att, &committee, 294, &KeyBound, &Exploding),
+        Err(attestation::RejectReason::NotInCommittee),
+    );
+}
+
+#[test]
+fn registry_lookup_equals_the_old_index_table_over_the_genesis_set() {
+    // THE INERTNESS PROOF, in its pure form.
+    //
+    // The deleted code did `pubkeys.get(index)` over a `Vec<Vec<u8>>` built
+    // from the genesis manifest in index order. While the registry still
+    // equals the genesis set — which is the live chain's state today: 64
+    // registered, 64 active, every activation_epoch 0, no deposit ever — the
+    // two lookups must return identical bytes for every index, and both must
+    // answer None past the end. If that holds, the change is observationally
+    // inert and can ship and soak ahead of the deposit flag day rather than
+    // being bundled with it.
+    let genesis_set: Vec<Vec<u8>> = (0..64u32).map(key_of).collect();
+    let old_table = |i: u32| genesis_set.get(i as usize).map(|k| k.as_slice());
+
+    let registry = KeyRegistry((0..64u32).map(|i| (i, key_of(i))).collect());
+    let new_lookup = |i: u32| attestation::KeyLookup::pubkey(&registry, i);
+
+    for i in 0..64u32 {
+        assert_eq!(old_table(i), new_lookup(i), "index {i} resolves differently");
+        assert!(new_lookup(i).is_some());
+    }
+    // And both agree about absence, which is the half that decides whether a
+    // node that has not yet applied a deposit behaves like the old one.
+    for i in 64..80u32 {
+        assert_eq!(old_table(i), None);
+        assert_eq!(new_lookup(i), None);
+    }
 }

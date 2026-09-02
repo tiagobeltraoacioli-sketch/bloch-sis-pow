@@ -1246,6 +1246,152 @@ mod tests {
         Manifest::decode(&m.encode()).expect("a manifest we just encoded decodes")
     }
 
+    // ── Gate 3: the newcomer's own node will not boot (2026-09-02) ─────────
+
+    /// The boot gate refuses a validator that a DEPOSIT added, because the
+    /// gate reads the genesis manifest and a deposit-added validator is by
+    /// definition not in it.
+    ///
+    /// This is independent of the verifier fix and survives it: with the
+    /// verifier reading the registry, the rest of the network can verify this
+    /// validator's signatures perfectly — and its own node still exits at
+    /// startup with "keystore does not match the genesis manifest's validator
+    /// set". Both must be fixed before a deposit-added validator can actually
+    /// participate; fixing only the verifier produces a validator everyone can
+    /// verify and that cannot start.
+    #[test]
+    fn gate3_refuses_a_deposit_added_validator() {
+        use crate::engine::{check_keystore_identity, KeystoreIdentity};
+        let m = sample(); // three genesis validators: indices 0, 1, 2
+        assert_eq!(m.validators.len(), 3);
+        // Index 3 is the validator a deposit registered after genesis. Its key
+        // and RANDAO commitment live in the committed registry, not here.
+        assert_eq!(
+            check_keystore_identity(&m, 3, &shaped_pubkey(3), [3u8; 32]),
+            KeystoreIdentity::NotInGenesisSet,
+            "a deposit-added validator's node refuses to boot"
+        );
+    }
+
+    #[test]
+    fn gate3_admits_a_genesis_validator() {
+        use crate::engine::{check_keystore_identity, KeystoreIdentity};
+        let m = sample();
+        // The fixture's RANDAO commitments are literal bytes, not chain heads,
+        // so the identity half is what this asserts: index+pubkey match.
+        assert_ne!(
+            check_keystore_identity(&m, 1, &shaped_pubkey(1), [1u8; 32]),
+            KeystoreIdentity::NotInGenesisSet,
+            "a genesis validator must pass the identity half of the gate"
+        );
+    }
+
+    #[test]
+    fn gate3_rejects_a_wrong_key_at_a_real_index() {
+        use crate::engine::{check_keystore_identity, KeystoreIdentity};
+        let m = sample();
+        assert_eq!(
+            check_keystore_identity(&m, 1, &shaped_pubkey(2), [1u8; 32]),
+            KeystoreIdentity::NotInGenesisSet,
+        );
+    }
+
+    /// The latent position-vs-index defect the extraction closed.
+    ///
+    /// The original gate found the record by its `index` FIELD and then read
+    /// the RANDAO commitment by POSITION (`manifest.validators[index]`). With
+    /// a non-dense manifest that reads another validator's commitment — or
+    /// panics out of bounds. Here validator index 9 sits at position 2: the
+    /// old expression would have indexed position 9 of a 3-element vector and
+    /// panicked. The extracted version uses the record it already found.
+    #[test]
+    fn gate3_does_not_index_the_manifest_by_position() {
+        use crate::engine::{check_keystore_identity, KeystoreIdentity};
+        let mut m = sample();
+        m.validators[2].index = 9;
+        let pk = m.validators[2].pubkey.clone();
+        // Reaches the RANDAO comparison without panicking, and answers about
+        // validator 9's own commitment.
+        assert_eq!(
+            check_keystore_identity(&m, 9, &pk, [0xEE; 32]),
+            KeystoreIdentity::RandaoMismatch,
+        );
+    }
+
+    // ── Inertness of the registry-reading verifier (2026-09-02) ────────────
+
+    /// THE INERTNESS PROOF, against the real genesis construction.
+    ///
+    /// The deleted code served consensus signature checks out of
+    /// `Manifest::pubkeys()` — a `Vec<Vec<u8>>` indexed by validator index,
+    /// built once at boot. The new code resolves the same question from the
+    /// committed registry inside `CommittedState`. While the registry still
+    /// equals the genesis set, the two must return byte-identical keys for
+    /// every index.
+    ///
+    /// That condition holds on the live chain today: both keyless archivals
+    /// report 64 registered / 64 active, every `activation_epoch` 0, no exits,
+    /// no slashings — i.e. every validator is a genesis validator and no
+    /// deposit has ever landed. So this equality is what licenses shipping and
+    /// soaking the change AHEAD of the funded-deposit flag day instead of
+    /// bundling the two.
+    #[test]
+    fn registry_lookup_equals_the_manifest_table_at_genesis() {
+        use bloch_pos_committee::attestation::KeyLookup;
+        for m in [sample(), mainnet_sample()] {
+            let table = m.pubkeys();
+            let state = m.genesis_state();
+            assert!(!table.is_empty());
+            for (i, expected) in table.iter().enumerate() {
+                assert_eq!(
+                    state.pubkey(i as u32),
+                    Some(expected.as_slice()),
+                    "validator {i}: the committed registry and the boot-time \
+                     manifest table disagree about the key"
+                );
+            }
+            // Past the end both answer "no such validator". This half decides
+            // whether a node behaves identically for indices nobody holds.
+            for i in table.len()..table.len() + 8 {
+                assert_eq!(state.pubkey(i as u32), None);
+            }
+        }
+    }
+
+    /// The manifest table's own latent defect, recorded rather than relied on.
+    ///
+    /// `Manifest::pubkeys()` allocates `vec![Vec::new(); validators.len()]` and
+    /// writes each validator at `pks[v.index]`, dropping any whose index is
+    /// past the length. A sparse or non-dense manifest therefore yields an
+    /// EMPTY key at some positions — and an empty key silently verifies
+    /// nothing while looking like a present entry. The committed registry has
+    /// no such failure mode: it is keyed by the index field, so a missing
+    /// index is `None`, which is a distinguishable answer.
+    ///
+    /// This is one more reason the registry is the right source, independent
+    /// of the deposit case.
+    #[test]
+    fn the_manifest_table_silently_empties_sparse_indices() {
+        let mut m = sample();
+        // Three validators, but indexed 0, 1, 9 — dense assumption broken.
+        m.validators[2].index = 9;
+        let table = m.pubkeys();
+        assert_eq!(table.len(), 3);
+        assert!(
+            table[2].is_empty(),
+            "index 9 fell off the end and left an empty key behind"
+        );
+        // The registry keyed by index answers honestly instead.
+        use bloch_pos_committee::attestation::KeyLookup;
+        let state = m.genesis_state();
+        assert_eq!(state.pubkey(2), None, "there is no validator 2");
+        assert_eq!(
+            state.pubkey(9).map(|k| k.to_vec()),
+            Some(m.validators[2].pubkey.clone()),
+            "validator 9 resolves to its own key"
+        );
+    }
+
     #[test]
     fn balances_change_the_genesis_state_root() {
         use bloch_pos_committee::interfaces::StateReader;

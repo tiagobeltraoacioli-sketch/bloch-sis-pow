@@ -17,7 +17,8 @@
 //! - [`HybridVerifier`] implements the pure crate's `SignatureVerifier`
 //!   boundary over `bloch_crypto::crypto::verify` — the real
 //!   ML-DSA-65 ‖ Falcon-1024 suite, both halves ANDed inside bloch-crypto.
-//!   It maps validator index → registered public key from the genesis set.
+//!   It holds NO key table: callers resolve the key from the committed
+//!   validator registry and pass it in. See the type's own docs for why.
 //! - [`Keystore`] holds this validator's secret key + RANDAO chain seed and
 //!   signs consensus signing roots (block proposals, attestations).
 //!
@@ -102,34 +103,55 @@ impl Keystore {
     }
 }
 
-/// The real `SignatureVerifier`: validator index → genesis-registered hybrid
-/// public key → bloch-crypto verify (both halves must pass).
+/// The real `SignatureVerifier`: bloch-crypto verify over a key the CALLER
+/// resolved (both halves of the hybrid suite must pass).
 ///
-/// Registry is the *genesis* validator set. Honest limitation, stated: a
-/// validator added later by an on-chain deposit would not be verifiable by
-/// this map — the devnet has no deposit path wired, so the set is static.
+/// ## This type used to hold a key table, and that table was the defect
+///
+/// It carried `pubkeys: Arc<Vec<Vec<u8>>>`, built once at boot from the
+/// genesis manifest and never rebuilt — not after sync, not after replay — and
+/// served `verify(index, ..)` out of it with `pubkeys.get(index)`. A validator
+/// added by an on-chain deposit registered, activated, entered the roster and
+/// got drawn for committees, and then every signature it made was rejected as
+/// `BadSignature`, because its index was past the end of a vector frozen at
+/// genesis. It could not attest, could not propose, and could not even be
+/// slashed. Its committee seats were dead weight subtracted from finality.
+///
+/// The table is now **gone**, not merely unused: this struct holds no state at
+/// all. The keys live where they were always committed — in the validator
+/// registry inside consensus state, whose `ValidatorRecord::pubkey` doc has
+/// said all along that "the registry *is* the authoritative key store". Every
+/// consensus call site now resolves the key from a registry it names and
+/// passes it to `verify_with_key`; see `attestation::KeyLookup` for which
+/// state answers where.
+///
+/// Deleting the field rather than leaving it unread is deliberate. An unused
+/// table is a table someone re-wires later.
 #[derive(Clone)]
-pub struct HybridVerifier {
-    pubkeys: std::sync::Arc<Vec<Vec<u8>>>,
-}
+pub struct HybridVerifier;
 
 impl HybridVerifier {
-    pub fn new(pubkeys: Vec<Vec<u8>>) -> Self {
-        HybridVerifier { pubkeys: std::sync::Arc::new(pubkeys) }
+    pub fn new() -> Self {
+        HybridVerifier
+    }
+}
+
+impl Default for HybridVerifier {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 impl bloch_pos_committee::attestation::SignatureVerifier for HybridVerifier {
-    fn verify(&self, validator: u32, signing_root: &[u8; 32], signature: &[u8]) -> bool {
-        match self.pubkeys.get(validator as usize) {
-            Some(pk) => bloch_crypto::crypto::verify(pk, signing_root, signature),
-            None => false,
-        }
-    }
-
-    /// Same suite, key supplied directly instead of looked up. Spending an
-    /// output must be exactly as hard to forge as attesting, so this is the
-    /// same call with the same both-halves check.
+    /// The suite check itself. Robust to arbitrary key bytes by contract:
+    /// `bloch_crypto::crypto::verify` documents "any body parse failure ⇒
+    /// false, never a panic (consensus rule)" and guards every length before
+    /// slicing. That matters more now than it did, because the bytes handed in
+    /// here can come from the registry, and the live `Deposit` handler does
+    /// **not** validate the suite or check a proof of possession before
+    /// inserting a pubkey (`staking::validate_deposit`, which does both, has
+    /// no production caller). So a registry key may be arbitrary bytes, and
+    /// this must fail closed on them rather than panic. It does.
     fn verify_with_key(&self, pubkey: &[u8], signing_root: &[u8; 32], signature: &[u8]) -> bool {
         bloch_crypto::crypto::verify(pubkey, signing_root, signature)
     }
@@ -143,9 +165,6 @@ impl bloch_pos_committee::attestation::SignatureVerifier for HybridVerifier {
 pub struct ProbeVerifier;
 
 impl bloch_pos_committee::attestation::SignatureVerifier for ProbeVerifier {
-    fn verify(&self, _v: u32, _root: &[u8; 32], _sig: &[u8]) -> bool {
-        true
-    }
     fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
         true
     }
@@ -156,4 +175,69 @@ fn os_random(buf: &mut [u8]) -> io::Result<()> {
     use std::io::Read;
     let mut f = fs::File::open("/dev/urandom")?;
     f.read_exact(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bloch_pos_committee::attestation::SignatureVerifier;
+
+    /// The real suite, end to end, through the only entry point the trait now
+    /// has. Disposable keypair generated in-process — no production or
+    /// treasury key material is involved anywhere in this file.
+    #[test]
+    fn real_hybrid_signature_verifies_through_the_key_form() {
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair();
+        let root = [0x5Au8; 32];
+        let sig = bloch_crypto::crypto::sign(&sk, &root).expect("sign");
+        assert!(HybridVerifier::new().verify_with_key(&pk, &root, &sig));
+    }
+
+    #[test]
+    fn a_tampered_signature_fails() {
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair();
+        let root = [0x5Au8; 32];
+        let mut sig = bloch_crypto::crypto::sign(&sk, &root).expect("sign");
+        let last = sig.len() - 1;
+        sig[last] ^= 0x01;
+        assert!(!HybridVerifier::new().verify_with_key(&pk, &root, &sig));
+    }
+
+    #[test]
+    fn a_signature_under_another_key_fails() {
+        let (_pk_a, sk_a) = bloch_crypto::crypto::generate_keypair();
+        let (pk_b, _sk_b) = bloch_crypto::crypto::generate_keypair();
+        let root = [0x5Au8; 32];
+        let sig = bloch_crypto::crypto::sign(&sk_a, &root).expect("sign");
+        assert!(
+            !HybridVerifier::new().verify_with_key(&pk_b, &root, &sig),
+            "A's signature must not verify under B's key"
+        );
+    }
+
+    /// The registry can hold arbitrary bytes as a pubkey, because the live
+    /// `Deposit` handler checks neither the suite nor a proof of possession
+    /// before inserting one (`staking::validate_deposit`, which does both, has
+    /// no production caller). Now that those bytes reach the verifier, it must
+    /// fail closed on every shape rather than panic — a panic in a consensus
+    /// check is a remote halt.
+    #[test]
+    fn malformed_registry_keys_fail_closed_and_never_panic() {
+        let v = HybridVerifier::new();
+        let root = [0x11u8; 32];
+        let (_pk, sk) = bloch_crypto::crypto::generate_keypair();
+        let good_sig = bloch_crypto::crypto::sign(&sk, &root).expect("sign");
+        for bad in [
+            Vec::new(),
+            vec![0u8; 1],
+            vec![0u8; 3],
+            vec![0xFFu8; 32],
+            vec![0u8; 1951],       // ML-DSA half only, nothing after it
+            vec![0xB1, 0x0C, 0, 0], // envelope magic, empty body
+            vec![7u8; 100_000],
+        ] {
+            assert!(!v.verify_with_key(&bad, &root, &good_sig));
+            assert!(!v.verify_with_key(&bad, &root, &[]));
+        }
+    }
 }

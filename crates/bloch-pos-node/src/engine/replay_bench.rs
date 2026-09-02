@@ -335,7 +335,7 @@ impl Generator {
             .map(|e| Coin { txid: e.txid, vout: e.vout, value: e.value })
             .collect();
 
-        let verifier = HybridVerifier::new(manifest.pubkeys());
+        let verifier = HybridVerifier::new();
         let state = manifest.genesis_state();
         let genesis_id = manifest.genesis_id();
         Generator {
@@ -621,7 +621,7 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
     let store = Store::open(dir, &[0u8; 32]).expect("store");
     let genesis_state = manifest.genesis_state();
     let genesis_id = manifest.genesis_id();
-    let verifier = HybridVerifier::new(manifest.pubkeys());
+    let verifier = HybridVerifier::new();
     let head_slot = Arc::new(AtomicU64::new(0));
     let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (tx, rx) = std::sync::mpsc::channel();

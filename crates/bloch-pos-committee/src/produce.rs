@@ -284,16 +284,33 @@ mod tests {
         h.finalize().to_vec()
     }
 
+    /// The fixture's `index -> pubkey` map, in one place so the tests and
+    /// `fixture_index_of_key` cannot drift apart.
+    fn fixture_key(index: u32) -> Vec<u8> {
+        vec![index as u8; 8]
+    }
+
+    /// Invert the fixture's `index -> pubkey` map (`vec![i as u8; 8]`).
+    /// A scan, not `pk[0]`: it must answer `None` for a key the fixture never
+    /// issued, which is the case the "key not in the registry" test needs.
+    fn fixture_index_of_key(pk: &[u8]) -> Option<u32> {
+        (0..8u32).find(|i| pk == fixture_key(*i).as_slice())
+    }
+
     struct MockCrypto;
     impl SignatureVerifier for MockCrypto {
-        fn verify(&self, validator: u32, signing_root: &[u8; 32], signature: &[u8]) -> bool {
-            signature == mock_sig(validator, signing_root).as_slice()
-        }
-        /// Mirrors this mock's `verify`: a test double that accepted
-        /// spends more easily than attestations would hide the very
-        /// forgery the spend path must refuse.
-        fn verify_with_key(&self, _pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
-            self.verify(0, root, sig)
+        /// Binds signature → KEY, mirroring what production now does. This
+        /// mock used to answer by validator index and its `verify_with_key`
+        /// delegated to `verify(0, ..)` — which was wrong for every validator
+        /// but 0 and went unnoticed because only spends used the key form.
+        /// Now attestations use it too, so the double has to model the real
+        /// binding: recover the index this fixture assigned the key, then
+        /// check the signature that index would have produced.
+        fn verify_with_key(&self, pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
+            match fixture_index_of_key(pk) {
+                Some(v) => sig == mock_sig(v, root).as_slice(),
+                None => false,
+            }
         }
     }
 
@@ -328,7 +345,7 @@ mod tests {
         let registry: Vec<ValidatorRecord> = (0..4u32)
             .map(|i| ValidatorRecord {
                 index: i,
-                pubkey: vec![i as u8; 8],
+                pubkey: fixture_key(i),
                 stake: 100_000_000_000 * (4 - i as u64), // skewed, nonzero
                 activation_epoch: 0,
                 exit_epoch: u64::MAX,
@@ -529,8 +546,8 @@ mod tests {
         );
 
         // The signature covers the one signing root, and verifies.
-        assert!(MockCrypto.verify(
-            h.proposer_index,
+        assert!(MockCrypto.verify_with_key(
+            &fixture_key(h.proposer_index),
             &h.proposal_signing_root(),
             &envelope.proposer_sig
         ));
@@ -826,8 +843,8 @@ mod tests {
         assert_eq!(envelope.header.parent, *pheader.id().as_bytes());
         // The signature covers the DS_PROPOSE root, not the id (§6.1).
         assert_eq!(envelope.signing_root(), envelope.header.proposal_signing_root());
-        assert!(MockCrypto.verify(
-            envelope.header.proposer_index,
+        assert!(MockCrypto.verify_with_key(
+            &fixture_key(envelope.header.proposer_index),
             &envelope.signing_root(),
             &envelope.proposer_sig
         ));
@@ -882,7 +899,11 @@ mod tests {
                 && h.coherence_root == derive::expected_coherence(&parent)
                 && h.state_root
                     == derive::post_state_root(&parent, h.slot, mix, &e.body.attestations)
-                && MockCrypto.verify(h.proposer_index, &h.proposal_signing_root(), &e.proposer_sig)
+                && MockCrypto.verify_with_key(
+                    &fixture_key(h.proposer_index),
+                    &h.proposal_signing_root(),
+                    &e.proposer_sig,
+                )
                 && e.body.attestations.iter().all(|att| {
                     derive::validate_included_attestation(&parent, h.slot, att, &MockCrypto).is_ok()
                 })

@@ -77,8 +77,10 @@ use crate::codec::{DecodeErr, Reader};
 /// `ws::verify_envelope` receives the halves pre-split at the fixed points
 /// (the AND-composition lives in `staking::verify_hybrid`, called — not
 /// copied); each half goes to its own primitive in `bloch_crypto`. Distinct
-/// from [`crate::keys::HybridVerifier`], which is keyed by validator index
-/// against the genesis registry — checkpoint signers are not validators.
+/// from [`crate::keys::HybridVerifier`], which serves the consensus signature
+/// checks — checkpoint signers are not validators. (Both are key-based now:
+/// `HybridVerifier` lost its index table on 2026-09-02, when the consensus
+/// call sites started resolving keys from the committed registry.)
 pub struct WsHybridVerifier;
 
 impl HybridKeyVerifier for WsHybridVerifier {
