@@ -107,6 +107,36 @@ pub const ACTIVATION_DELAY_EPOCHS: u64 = 8;
 /// `set_size / 4` epochs of publicly visible queue traffic to take a majority.
 pub const MAX_ACTIVATIONS_PER_EPOCH: usize = 4;
 
+/// Voluntary exits admitted per epoch — the churn budget on the way OUT, and
+/// the exact mirror of [`MAX_ACTIVATIONS_PER_EPOCH`] on the way in.
+///
+/// # Why a cap on genuine, correctly-signed exits
+///
+/// Authentication answers "did the validator ask for this?"; it does not
+/// answer "may the roster empty this block?". Those are different questions
+/// and only the second one is about liveness. A set of 64 whose keys sit under
+/// one operator — which is exactly Genesis-4's launch set, all 64
+/// founder-operated — can produce 64 genuine exits in one block. The chain
+/// would then be an epoch away from a roster of zero, with no committee to
+/// finalise the blocks that would let anyone deposit their way back in, and
+/// every bond locked for [`WITHDRAWAL_DELAY_EPOCHS`].
+///
+/// Four per epoch makes emptying a 64-validator set take 16 epochs of
+/// publicly visible, on-chain traffic — the same shape of guarantee, and the
+/// same honest limit, as the activation cap: it buys *time and visibility*,
+/// not prevention. A coordinated operator still leaves; it leaves slowly
+/// enough that the rest of the network can see it happening and react.
+///
+/// Symmetry with the entry cap is deliberate and load-bearing: if exits were
+/// cheaper than entries, the steady-state set size could be driven down faster
+/// than it can be rebuilt, which is a slow-motion version of the same attack.
+///
+/// Enforced from [`crate::params::EXIT_AUTH_ACTIVATION_EPOCH`] only — below
+/// the flag day the rule is written down and inert, because tightening a
+/// transaction's validity is a consensus change and a mixed fleet must reach
+/// one verdict on every block until the day.
+pub const MAX_EXITS_PER_EPOCH: usize = 4;
+
 /// Epochs between a voluntary exit and the validator no longer being assigned
 /// duties (§5.1: ~8.5 h). Non-zero so an exit cannot be used to dodge duties
 /// — or slashing for duties already assigned — within the same epoch.

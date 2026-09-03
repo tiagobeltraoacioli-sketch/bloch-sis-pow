@@ -1656,6 +1656,10 @@ pub fn submitted_json(tx: &PosTransaction, outcome: Admitted) -> Json {
         PosTransaction::TransferV2 { .. } => "transfer_v2",
         PosTransaction::Deposit { .. } => "deposit",
         PosTransaction::Exit { .. } => "exit",
+        // Distinct from "exit" on purpose: the two are different messages with
+        // different rules (one authenticated, one not) and an operator reading
+        // this field needs to see which one the chain took.
+        PosTransaction::ExitV2 { .. } => "exit_v2",
         PosTransaction::Delegate { .. } => "delegate",
         PosTransaction::SlashingEvidence(_) => "slashing_evidence",
     };

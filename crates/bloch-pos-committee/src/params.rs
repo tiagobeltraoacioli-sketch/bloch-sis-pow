@@ -525,6 +525,40 @@ pub mod rehearsal {
         Restore(prev)
     }
 
+    thread_local! {
+        static EXIT_AUTH_GATE_OPEN_TL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Test-only: treat [`super::EXIT_AUTH_ACTIVATION_EPOCH`] as already bound.
+    ///
+    /// Its own switch for the same reason `BONDING_GATE_OPEN` is: this gate's
+    /// inert value selects a REFUSAL of the new format and the *survival* of
+    /// the old unauthenticated one, so folding it into `GATES_OPEN` would
+    /// silently retire legacy `Exit` inside every test that only wanted a
+    /// post-ancestry-seed roster.
+    ///
+    /// Default CLOSED, deliberately: an unadorned `cargo test` exercises the
+    /// configuration the fleet actually runs today, in which `ExitV2` is
+    /// invalid at every epoch and legacy `Exit` still applies. Tests of the
+    /// post-flag-day rules — the signature check and the churn cap — opt in.
+    pub fn exit_auth_gate_forced_open() -> bool {
+        EXIT_AUTH_GATE_OPEN_TL.with(|c| c.get())
+    }
+
+    /// Opens the authenticated-exit gate for this thread until the guard
+    /// drops, including on unwind, so a failing assertion cannot leave the
+    /// exit rules mutated for the rest of the thread.
+    pub fn exit_auth_gate_open_guard() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                EXIT_AUTH_GATE_OPEN_TL.with(|c| c.set(self.0));
+            }
+        }
+        let prev = EXIT_AUTH_GATE_OPEN_TL.with(|c| c.replace(true));
+        Restore(prev)
+    }
+
     /// Test-only: treat [`super::ANCESTRY_SEED_ACTIVATION_EPOCH`] and
     /// [`super::LEAK_RECOVERY_ACTIVATION_EPOCH`] as if they had already bound.
     ///
@@ -774,6 +808,58 @@ pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// `deposit_gate_is_inert` pins the value, so arming it means deleting a test
 /// that says all of the above out loud.
 pub const DEPOSIT_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Flag day for the **authenticated voluntary exit** (§7.2) and the per-epoch
+/// exit churn cap. `u64::MAX` = INERT: no epoch reaches it, so on every node
+/// running this crate today the rule below is written down and does nothing.
+///
+/// # The hole it closes
+///
+/// [`crate::transition::PosTransaction::Exit`] (wire tag `0x03`) carries a
+/// registry index and NOTHING ELSE. Its arm in the transition consults the
+/// registry and never touches a verifier, so *anyone* can retire *any*
+/// validator, and an exit cannot be revoked (`exit_epoch != u64::MAX` is a
+/// refusal). Sixty-four such messages retire the whole roster and lock every
+/// bond for [`crate::staking::WITHDRAWAL_DELAY_EPOCHS`] = 2,048 epochs. The
+/// node's mempool has refused the message since 2026-08-13
+/// (`bloch-pos-node`'s `admissible`), but mempool policy is one producer's
+/// choice to lift; consensus is what makes it everyone's.
+///
+/// # What the gate switches, in both directions, at one epoch
+///
+/// - **at and above**: legacy `Exit` (`0x03`) becomes consensus-INVALID, and
+///   [`crate::transition::PosTransaction::ExitV2`] — hybrid signature verified
+///   against the *registered* pubkey, signed epoch bound to the inclusion
+///   epoch — becomes the only voluntary exit;
+/// - **at and above**: at most [`crate::staking::MAX_EXITS_PER_EPOCH`]
+///   voluntary exits may be included per epoch, the churn budget that stops a
+///   roster-wide retirement from being one block's work even when every
+///   signature is genuine (the mirror of `MAX_ACTIVATIONS_PER_EPOCH`, and for
+///   the same reason: a committee that can empty instantly can be emptied
+///   instantly);
+/// - **below**: every arm behaves EXACTLY as it does today, byte for byte.
+///   That is what lets a mixed fleet reach one verdict on every block until
+///   the day, and it is why the arms below the gate must not be "improved"
+///   while they are the control.
+///
+/// The gate reads `CommittedState::epoch` — committed state rolled to the
+/// block's own header slot by `compute_post_state`'s boundary walk, never
+/// node-local. The 2026-08-08 `expected_bits` fork is the standing reason.
+///
+/// # ARMING THIS IS A FOUNDER DECISION, AND IT HAS A PRECONDITION
+///
+/// Two, actually. (1) The whole fleet must already be running a binary that
+/// carries this rule, because the first post-gate block changes the verdict on
+/// legacy `Exit` — a node without the rule accepts what a node with it
+/// refuses. (2) `ExitV2` has **no decoder arm**: wire byte `0x08` is
+/// CONTESTED across live lineages (`SignedExit`, `Withdraw`, `ExitV2` all
+/// claim it — see `tests/wire_tag_registry.rs`), and this tree refuses to
+/// decode it until the founder rules on the byte. Arming this constant
+/// without that ruling retires the legacy message and puts nothing in its
+/// place: voluntary exit would simply stop existing.
+///
+/// `exit_auth_gate_is_inert` pins the value.
+pub const EXIT_AUTH_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.
