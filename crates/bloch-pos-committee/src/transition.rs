@@ -5017,14 +5017,8 @@ mod tests {
 
         // A chain with real content: a deposit, a delegation, and a full
         // attestation quorum.
-        let deposit = PosTransaction::Deposit {
-            pubkey: vec![0xAB; staking::HYBRID_PK_BYTES],
-            amount_sat: staking::MIN_DEPOSIT_SAT,
-            randao_commitment: [0xCD; 32],
-            withdrawal_credentials: vec![0xEF; 4],
-            commission_bps: 500,
-            proof_of_possession: vec![0xAB; 4_589],
-        };
+        let deposit =
+            toy_deposit(vec![0xAB; staking::HYBRID_PK_BYTES], [0xCD; 32], vec![0xEF; 4], 500);
         let delegate = PosTransaction::Delegate {
             delegator: 900,
             validator: 0,
@@ -5138,14 +5132,8 @@ mod tests {
         // constant being weakened to keep an old fixture green.
         let _bonding = crate::params::rehearsal::bonding_gate_open_guard();
         let (t, g, mut chains) = setup(4);
-        let deposit = PosTransaction::Deposit {
-            pubkey: vec![0xAA; staking::HYBRID_PK_BYTES],
-            amount_sat: staking::MIN_DEPOSIT_SAT,
-            randao_commitment: [0xBB; 32],
-            withdrawal_credentials: vec![0xCC; 4],
-            commission_bps: 500,
-            proof_of_possession: vec![0xAA; 4_589],
-        };
+        let deposit =
+            toy_deposit(vec![0xAA; staking::HYBRID_PK_BYTES], [0xBB; 32], vec![0xCC; 4], 500);
         // Included during epoch 1.
         let b = build_block(&t, &g, 33, &[], std::slice::from_ref(&deposit), &mut chains);
         let mut st = t.apply_block(&g, &b, &[], std::slice::from_ref(&deposit)).unwrap();
@@ -5172,14 +5160,8 @@ mod tests {
         );
 
         // A second deposit of the same pubkey is a deterministic reject.
-        let dup = PosTransaction::Deposit {
-            pubkey: vec![0xAA; staking::HYBRID_PK_BYTES],
-            amount_sat: staking::MIN_DEPOSIT_SAT,
-            randao_commitment: [0xDD; 32],
-            withdrawal_credentials: vec![0xEE; 4],
-            commission_bps: 500,
-            proof_of_possession: vec![0xAA; 4_589],
-        };
+        let dup =
+            toy_deposit(vec![0xAA; staking::HYBRID_PK_BYTES], [0xDD; 32], vec![0xEE; 4], 500);
         let mut probe = st.clone();
         assert_eq!(
             probe.apply_transaction(
@@ -5207,27 +5189,43 @@ mod tests {
     // is a committee seat nobody can ever fill — stake that counts toward the
     // quorum everyone else has to reach and never answers.
 
-    /// The wire deposit fixture these tests vary, signed under `key`.
-    fn signed_deposit(key: Vec<u8>, commission_bps: u128) -> PosTransaction {
-        let randao_commitment = [0xB1; 32];
-        let withdrawal_credentials = vec![0xC0; 32];
+    /// A wire deposit carrying a proof of possession that really verifies
+    /// under [`ToyVerifier`].
+    ///
+    /// Every deposit fixture in this module goes through here. A placeholder
+    /// proof is no longer a harmless filler: the transition refuses a deposit
+    /// that cannot prove it holds the key it is registering, so a fixture with
+    /// invented signature bytes does not register a validator and every
+    /// assertion downstream of it collapses.
+    fn toy_deposit(
+        pubkey: Vec<u8>,
+        randao_commitment: [u8; 32],
+        withdrawal_credentials: Vec<u8>,
+        commission_bps: u128,
+    ) -> PosTransaction {
         let amount_sat = staking::MIN_DEPOSIT_SAT;
         let root = staking::wire_deposit_pop_root(
-            &key,
+            &pubkey,
             amount_sat,
             &randao_commitment,
             &withdrawal_credentials,
             commission_bps,
         );
-        let proof_of_possession = toy_sign(&key, &root);
+        let proof_of_possession = toy_sign(&pubkey, &root);
         PosTransaction::Deposit {
-            pubkey: key,
+            pubkey,
             amount_sat,
             randao_commitment,
             withdrawal_credentials,
             commission_bps,
             proof_of_possession,
         }
+    }
+
+    /// The fixture the key tests below vary: one deposit, signed under `key`,
+    /// with the other fields held constant.
+    fn signed_deposit(key: Vec<u8>, commission_bps: u128) -> PosTransaction {
+        toy_deposit(key, [0xB1; 32], vec![0xC0; 32], commission_bps)
     }
 
     fn hybrid_shaped_key(tag: u8) -> Vec<u8> {
@@ -5440,14 +5438,8 @@ mod tests {
     #[test]
     fn a_deposit_in_a_block_is_refused_by_consensus_not_by_the_mempool() {
         let (t, g, mut chains) = setup(4);
-        let deposit = PosTransaction::Deposit {
-            pubkey: vec![0x5A; staking::HYBRID_PK_BYTES],
-            amount_sat: staking::MIN_DEPOSIT_SAT,
-            randao_commitment: [0x5B; 32],
-            withdrawal_credentials: vec![0x5C; 4],
-            commission_bps: 500,
-            proof_of_possession: vec![0x5A; 4_589],
-        };
+        let deposit =
+            toy_deposit(vec![0x5A; staking::HYBRID_PK_BYTES], [0x5B; 32], vec![0x5C; 4], 500);
 
         // Built by a producer whose gate is open: a well-formed block, every
         // root correct, carrying stake minted from nothing.
@@ -7136,14 +7128,8 @@ mod tests {
         let spender = owner_key(0x3D);
         let coin = opening(0x79, 0, 100_000_000, &spender);
         let (t, g, mut chains) = setup_funded(8, &[coin.clone()]);
-        let deposit = PosTransaction::Deposit {
-            pubkey: vec![0xAB; staking::HYBRID_PK_BYTES],
-            amount_sat: staking::MIN_DEPOSIT_SAT,
-            randao_commitment: [0xCD; 32],
-            withdrawal_credentials: vec![0xEF; 4],
-            commission_bps: 500,
-            proof_of_possession: vec![0xAB; 4_589],
-        };
+        let deposit =
+            toy_deposit(vec![0xAB; staking::HYBRID_PK_BYTES], [0xCD; 32], vec![0xEF; 4], 500);
         let delegate = PosTransaction::Delegate {
             delegator: 900,
             validator: 0,
@@ -7363,14 +7349,8 @@ mod tests {
         let spender = owner_key(0x3F);
         let coin = opening(0x7A, 0, 100_000_000, &spender);
         let (t, g, mut chains) = setup_funded(8, &[coin.clone()]);
-        let deposit = PosTransaction::Deposit {
-            pubkey: vec![0xAB; staking::HYBRID_PK_BYTES],
-            amount_sat: staking::MIN_DEPOSIT_SAT,
-            randao_commitment: [0xCD; 32],
-            withdrawal_credentials: vec![0xEF; 4],
-            commission_bps: 500,
-            proof_of_possession: vec![0xAB; 4_589],
-        };
+        let deposit =
+            toy_deposit(vec![0xAB; staking::HYBRID_PK_BYTES], [0xCD; 32], vec![0xEF; 4], 500);
         let delegate = PosTransaction::Delegate {
             delegator: 900,
             validator: 0,
