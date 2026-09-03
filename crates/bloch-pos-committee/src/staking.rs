@@ -282,6 +282,46 @@ pub enum DepositReject {
 /// Check order is cheapest-first, the same DoS argument `attestation::validate`
 /// makes: verifying a 4.6 KB hybrid signature costs far more than every other
 /// check combined, so spam must be rejected before the PoP runs.
+/// The deposit rules that depend on neither the funding inputs nor a proof of
+/// possession: suite tag, hybrid public-key geometry, and the `[MIN_DEPOSIT_SAT,
+/// max_stake_sat]` bounds.
+///
+/// Split out of [`validate_deposit`] so the block-apply path can enforce the
+/// same rules on the *wire* form of a deposit, which is not a [`DepositTx`]:
+/// `transition::PosTransaction::Deposit` carries the public key as a `Vec<u8>`
+/// of any length and carries no PoP at all. One derivation path called from
+/// both sites, for the reason [`verify_hybrid`] gives — a second copy of a
+/// consensus rule is a second place for it to drift.
+///
+/// **Why a wrong-length key is [`DepositReject::WrongSuite`].** The suite tag
+/// and the key geometry are one fact, not two: `SUITE_MLDSA65_FALCON1024` *is*
+/// "ML-DSA-65 ‖ Falcon-1024", so a byte string whose length is not
+/// [`HYBRID_PK_BYTES`] is not a key in that suite. Reusing the existing variant
+/// keeps [`DepositReject`] frozen — `interfaces.rs` owns that taxonomy — and
+/// avoids inventing a second, subtly different reason for the same refusal.
+/// [`validate_deposit`] itself can never hit that arm: its key is
+/// `[u8; HYBRID_PK_BYTES]`, so the type already decided.
+///
+/// Check order is cheapest-first and identical to [`validate_deposit`]'s, so
+/// two callers cannot disagree about which rule a deposit broke.
+pub fn deposit_shape(
+    suite: u16,
+    pubkey_len: usize,
+    amount_sat: u128,
+    max_stake_sat: u128,
+) -> Result<(), DepositReject> {
+    if suite != SUITE_MLDSA65_FALCON1024 || pubkey_len != HYBRID_PK_BYTES {
+        return Err(DepositReject::WrongSuite);
+    }
+    if amount_sat < MIN_DEPOSIT_SAT {
+        return Err(DepositReject::BelowMinimum);
+    }
+    if amount_sat > max_stake_sat {
+        return Err(DepositReject::AboveMaximum);
+    }
+    Ok(())
+}
+
 pub fn validate_deposit(
     tx: &DepositTx,
     inputs: &[DepositInput],
@@ -293,19 +333,25 @@ pub fn validate_deposit(
     }
     // Shielded before tainted: a shielded input has no public ancestry, so
     // its taint status is unknowable — reporting it as "tainted" would imply
-    // the taint check ran, which it cannot.
+    // the taint check ran, which it cannot. These two are input rules, so they
+    // stay here rather than in `deposit_shape`: the wire form has no inputs to
+    // judge, and a shared helper that silently passed an empty slice would be
+    // reporting "inputs checked" about a deposit that has none.
     if inputs.iter().any(|i| !i.transparent) {
         return Err(DepositReject::ShieldedInput);
     }
     if inputs.iter().any(|i| i.tainted) {
         return Err(DepositReject::TaintedInput);
     }
-    if tx.amount_sat < MIN_DEPOSIT_SAT {
-        return Err(DepositReject::BelowMinimum);
-    }
-    if tx.amount_sat > max_stake_sat {
-        return Err(DepositReject::AboveMaximum);
-    }
+    // Suite, key geometry and bounds — the rules the block-apply path shares.
+    // The suite is re-tested inside `deposit_shape`; that redundancy is
+    // deliberate, and it is the cheap direction. Hoisting the suite check
+    // above the input rules is what preserves this function's documented
+    // cheapest-first order, and `deposit_shape` must still test it for the
+    // callers that do not come through here. The key-geometry arm is
+    // unreachable from this call: `validator_pubkey` is
+    // `[u8; HYBRID_PK_BYTES]`, so the type already decided its length.
+    deposit_shape(tx.suite, tx.validator_pubkey.len(), tx.amount_sat, max_stake_sat)?;
     if !verify_hybrid(&tx.validator_pubkey, &tx.signing_root(), &tx.proof_of_possession, verifier)
     {
         return Err(DepositReject::BadProofOfPossession);

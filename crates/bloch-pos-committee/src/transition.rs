@@ -2136,17 +2136,42 @@ impl CommittedState {
                 if self.pubkey_index.contains_key(&pubkey_hash) {
                     return Err(TxReject::StakingRule);
                 }
-                if *amount_sat < staking::MIN_DEPOSIT_SAT {
-                    return Err(TxReject::StakingRule);
-                }
                 // Per-validator cap: 1% of committed active stake, floored at
                 // the minimum deposit — a naive 1% cap at genesis (active
                 // stake ≈ 0) would deadlock the bootstrap (staking.rs docs).
                 let cap = (total_active_sat * delegation::MAX_VALIDATOR_STAKE_BPS / 10_000)
                     .max(staking::MIN_DEPOSIT_SAT);
-                if *amount_sat > cap {
-                    return Err(TxReject::StakingRule);
-                }
+                // THE STAKING RULES THEMSELVES, from the module that owns them
+                // (`staking::deposit_shape`, the funding-independent half of
+                // `staking::validate_deposit`) rather than re-derived here.
+                // Until this call existed, `validate_deposit`'s rules had no
+                // caller outside its own tests and this arm re-stated only two
+                // of them inline; the key geometry it did NOT state is why
+                // `keys.rs` documents that "a registry key may be arbitrary
+                // bytes" and has to fail closed on them.
+                //
+                // Placed AFTER the flag-day gate, never before it: the gate is
+                // the rule that decides whether this encoding may apply at all,
+                // and a shape check that ran first would be judging a message
+                // consensus has already refused.
+                //
+                // The suite is passed as the constant, not read from the wire:
+                // this encoding has no suite field. That makes the suite half
+                // of the check a no-op HERE and the key-geometry half real —
+                // stated plainly so nobody reads this call as proof that the
+                // legacy form is suite-checked. It is not, and it cannot be.
+                //
+                // What this does NOT check is the proof of possession, because
+                // this encoding carries none — which is precisely why it must
+                // never be the form deposits open under. See
+                // `params::DEPOSIT_ACTIVATION_EPOCH`.
+                staking::deposit_shape(
+                    staking::SUITE_MLDSA65_FALCON1024,
+                    pubkey.len(),
+                    *amount_sat,
+                    cap,
+                )
+                .map_err(|_| TxReject::StakingRule)?;
                 // Next free index: a deterministic function of the registry,
                 // never of anything local.
                 let index = self.validators.keys().next_back().map_or(0, |k| k + 1);
@@ -4925,7 +4950,7 @@ mod tests {
         // A chain with real content: a deposit, a delegation, and a full
         // attestation quorum.
         let deposit = PosTransaction::Deposit {
-            pubkey: vec![0xAB; 8],
+            pubkey: vec![0xAB; staking::HYBRID_PK_BYTES],
             amount_sat: staking::MIN_DEPOSIT_SAT,
             randao_commitment: [0xCD; 32],
             withdrawal_credentials: vec![0xEF; 4],
@@ -5045,7 +5070,7 @@ mod tests {
         let _bonding = crate::params::rehearsal::bonding_gate_open_guard();
         let (t, g, mut chains) = setup(4);
         let deposit = PosTransaction::Deposit {
-            pubkey: vec![0xAA; 8],
+            pubkey: vec![0xAA; staking::HYBRID_PK_BYTES],
             amount_sat: staking::MIN_DEPOSIT_SAT,
             randao_commitment: [0xBB; 32],
             withdrawal_credentials: vec![0xCC; 4],
@@ -5078,7 +5103,7 @@ mod tests {
 
         // A second deposit of the same pubkey is a deterministic reject.
         let dup = PosTransaction::Deposit {
-            pubkey: vec![0xAA; 8],
+            pubkey: vec![0xAA; staking::HYBRID_PK_BYTES],
             amount_sat: staking::MIN_DEPOSIT_SAT,
             randao_commitment: [0xDD; 32],
             withdrawal_credentials: vec![0xEE; 4],
@@ -5116,7 +5141,7 @@ mod tests {
     fn a_deposit_in_a_block_is_refused_by_consensus_not_by_the_mempool() {
         let (t, g, mut chains) = setup(4);
         let deposit = PosTransaction::Deposit {
-            pubkey: vec![0x5A; 8],
+            pubkey: vec![0x5A; staking::HYBRID_PK_BYTES],
             amount_sat: staking::MIN_DEPOSIT_SAT,
             randao_commitment: [0x5B; 32],
             withdrawal_credentials: vec![0x5C; 4],
@@ -5156,6 +5181,88 @@ mod tests {
                 &OkVerifier,
             ),
             Err(TxReject::StakingNotActive),
+        );
+        assert_eq!(probe.validator_count(), 4, "a refused deposit must leave no trace");
+    }
+
+    /// THE SHAPE RULE BINDS EVEN WITH THE GATE OPEN.
+    ///
+    /// `DEPOSIT_ACTIVATION_EPOCH` refuses this encoding at every epoch, so on
+    /// its own it makes every other deposit rule unreachable — and unreachable
+    /// rules rot. This test forces the gate OPEN for its whole body, which
+    /// removes the gate as an explanation, and shows that a deposit whose
+    /// public key is not the hybrid suite's geometry is STILL refused, by
+    /// `staking::deposit_shape` called from `apply_transaction`.
+    ///
+    /// Why that matters beyond tidiness: before this call site existed, the
+    /// only thing between an opened gate and a registry full of arbitrary
+    /// bytes was `bloch-pos-node`'s mempool, and `keys.rs` had to document
+    /// that "a registry key may be arbitrary bytes" and fail closed on them.
+    /// The registry is now shape-checked by consensus, so opening the gate
+    /// alone can no longer admit a key no signature could ever verify under.
+    ///
+    /// The block is assembled BY HAND rather than through `build_block`,
+    /// which requires a transitionable body — the point of this fixture is a
+    /// body that is not one. It reuses a real header for the slot (real
+    /// proposer, real reveal, real mix) and re-roots and re-signs it over the
+    /// malformed body, so the only thing wrong with the block is the deposit.
+    #[test]
+    fn a_malformed_deposit_key_in_a_block_is_refused_even_with_the_gate_open() {
+        let _open = crate::params::rehearsal::bonding_gate_open_guard();
+        let (t, g, mut chains) = setup(4);
+
+        let well_formed = PosTransaction::Deposit {
+            pubkey: vec![0x6A; staking::HYBRID_PK_BYTES],
+            amount_sat: staking::MIN_DEPOSIT_SAT,
+            randao_commitment: [0x6B; 32],
+            withdrawal_credentials: vec![0x6C; 4],
+            commission_bps: 500,
+        };
+        // Same deposit in every respect but the key geometry.
+        let malformed = PosTransaction::Deposit {
+            pubkey: vec![0x6A; staking::HYBRID_PK_BYTES - 1],
+            amount_sat: staking::MIN_DEPOSIT_SAT,
+            randao_commitment: [0x6B; 32],
+            withdrawal_credentials: vec![0x6C; 4],
+            commission_bps: 500,
+        };
+
+        // The fixture is live: with the gate open the well-formed one really
+        // does register. Without this the refusal below could be coming from
+        // anything at all.
+        let good_block =
+            build_block(&t, &g, 33, &[], std::slice::from_ref(&well_formed), &mut chains);
+        let applied = t
+            .apply_block(&g, &good_block, &[], std::slice::from_ref(&well_formed))
+            .expect("the well-formed deposit must apply with the gate open");
+        assert_eq!(applied.validator_count(), 5, "fixture must actually register a validator");
+
+        // Re-root and re-sign that same header over the malformed body.
+        let mut header = good_block.header;
+        header.body_root = crate::derive::body_root(&[malformed.canonical_bytes()]);
+        let proposer_sig = match crate::attestation::KeyLookup::pubkey(&g, header.proposer_index) {
+            Some(pk) => toy_sign(pk, &header.proposal_signing_root()),
+            None => unreachable!("the drawn proposer is in the genesis registry"),
+        };
+        let bad_block = ProposalEnvelope { header, proposer_sig };
+
+        assert_eq!(
+            t.apply_block(&g, &bad_block, &[], std::slice::from_ref(&malformed)),
+            Err(TransitionError::Transaction(0)),
+            "a malformed deposit key must be refused by the transition, at index 0",
+        );
+
+        // And the reason is the shape rule, not the flag day — the gate is
+        // open for this whole test, so `StakingNotActive` is not available.
+        let mut probe = g.clone();
+        assert_eq!(
+            probe.apply_transaction(
+                &malformed,
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &OkVerifier,
+            ),
+            Err(TxReject::StakingRule),
         );
         assert_eq!(probe.validator_count(), 4, "a refused deposit must leave no trace");
     }
@@ -6811,7 +6918,7 @@ mod tests {
         let coin = opening(0x79, 0, 100_000_000, &spender);
         let (t, g, mut chains) = setup_funded(8, &[coin.clone()]);
         let deposit = PosTransaction::Deposit {
-            pubkey: vec![0xAB; 8],
+            pubkey: vec![0xAB; staking::HYBRID_PK_BYTES],
             amount_sat: staking::MIN_DEPOSIT_SAT,
             randao_commitment: [0xCD; 32],
             withdrawal_credentials: vec![0xEF; 4],
@@ -7037,7 +7144,7 @@ mod tests {
         let coin = opening(0x7A, 0, 100_000_000, &spender);
         let (t, g, mut chains) = setup_funded(8, &[coin.clone()]);
         let deposit = PosTransaction::Deposit {
-            pubkey: vec![0xAB; 8],
+            pubkey: vec![0xAB; staking::HYBRID_PK_BYTES],
             amount_sat: staking::MIN_DEPOSIT_SAT,
             randao_commitment: [0xCD; 32],
             withdrawal_credentials: vec![0xEF; 4],
