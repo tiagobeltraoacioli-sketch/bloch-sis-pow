@@ -16,6 +16,49 @@
 //! with a typed frame, and [`Net::report`] with a verdict — so nothing in the
 //! consensus loop knows which transport it is running on.
 //!
+//! ## Running both at once — [`Net::Both`], `--transport dual`, OFF BY DEFAULT
+//!
+//! The two transports used to be mutually exclusive, which made any move
+//! between them a flag day: the fleet crosses together, or it becomes two
+//! networks that both look healthy. [`Net::Both`] removes that, and it does so
+//! WITHOUT inventing a bridge.
+//!
+//! **What a dual node does.** It listens on both, it is dialled on both, and
+//! [`Net::broadcast`] hands the *same frame bytes* to both. Every call site in
+//! the engine is unchanged; the frame is built once and copied, so a dual node
+//! cannot put two encodings of one object on two wires.
+//!
+//! **What a dual node deliberately does NOT do: relay mesh-to-mesh.** It does
+//! not take a message off one transport and push it onto the other. The engine
+//! publishes exactly three classes of thing, and this is the whole list:
+//!
+//!   1. blocks and attestations it *authored* (`engine.rs` `propose`, `attest`),
+//!   2. transactions that passed its own `admissible` check on the way into
+//!      its mempool, and
+//!   3. attestations released from the pending pool on
+//!      `GossipDecision::Accept` — full signature and committee check.
+//!
+//! Every one of those is something this node has itself validated to the
+//! standard its peers will apply. That is the property that makes a dual node
+//! safe to attach to an authenticated mesh while it is also attached to an
+//! unauthenticated one: **the devnet mesh has no authentication and no
+//! admission control, but nothing arriving on it can be laundered onto
+//! gossipsub under this node's identity without first being validated here.**
+//! A hostile devnet peer therefore cannot spend this node's gossipsub peer
+//! score, which is the poisoning path a naive bridge would open.
+//!
+//! It also removes the other naive-bridge failure. A relaying bridge needs a
+//! seen-set or it loops: the devnet mesh has no duplicate cache at all (it
+//! never needed one — it is a full mesh with no relay), so two bridges would
+//! amplify one block forever. Not relaying means there is no loop to bound.
+//!
+//! The cost of not relaying is that a message crosses between the two
+//! populations only via the *sync* path (`FRAME_GET_BLOCKS` / the libp2p
+//! directed sync), which is a pull, is paged, and is rate-limited. That is
+//! slower than gossip and it is the honest price. It is also why the migration
+//! order is "everyone → dual → everyone → libp2p" rather than "put one bridge
+//! in the middle and leave it there".
+//!
 //! ## The devnet mesh, and what it is not
 //!
 //! **This is not the production network layer.** What a devnet needs from the
@@ -77,10 +120,17 @@ pub enum NetEvent {
     Transaction(bloch_pos_committee::transition::PosTransaction),
 }
 
-/// The transport the engine holds. One of two, chosen at startup.
+/// The transport the engine holds, chosen at startup.
+///
+/// `Devnet` and `Libp2p` are what they always were. [`Net::Both`] is the
+/// dual stack described in the module header: both live in one process, no
+/// mesh-to-mesh relay, off unless `--transport dual` asks for it.
 pub enum Net {
     Devnet(DevnetMesh),
     Libp2p(crate::p2p::Handle),
+    /// Both transports at once. **Off by default.** See the module header for
+    /// why this is not a bridge and must not become one.
+    Both(DevnetMesh, crate::p2p::Handle),
 }
 
 impl Net {
@@ -92,6 +142,20 @@ impl Net {
         match self {
             Net::Devnet(m) => m.broadcast(frame),
             Net::Libp2p(h) => h.broadcast(frame),
+            Net::Both(m, h) => {
+                // The SAME bytes on both wires. `frame` was built once by the
+                // caller (`block_frame`, `att_frame`, `get_blocks_frame`, or
+                // the transaction frame in `on_transaction`) and each
+                // transport gets a copy of it, so there is no second encoding
+                // that could disagree with the first.
+                //
+                // Both calls are non-blocking: the devnet mesh pushes onto per
+                // peer queues and the libp2p handle onto an unbounded command
+                // channel, so a stalled peer on one transport cannot hold up
+                // publication on the other.
+                m.broadcast(frame.clone());
+                h.broadcast(frame);
+            }
         }
     }
 
@@ -104,7 +168,38 @@ impl Net {
     pub fn report(&self, origin: &Origin, verdict: Verdict) {
         match self {
             Net::Devnet(_) => {}
-            Net::Libp2p(h) => h.report(origin, verdict),
+            // On `Both` this routes only the messages that actually came from
+            // gossipsub. An attestation the devnet mesh delivered carries
+            // `Origin::none()` — that transport does not construct an origin —
+            // and [`crate::p2p::Handle::report`] is a no-op for it. So a
+            // verdict on a devnet-sourced message can never be charged against
+            // a libp2p peer that never sent it.
+            Net::Libp2p(h) | Net::Both(_, h) => h.report(origin, verdict),
+        }
+    }
+
+    /// Peers attached right now, **per stack**, for the RPC to report.
+    ///
+    /// `None` means "this node runs no such stack", which is a different
+    /// answer from `Some(0)`, "it runs one and nobody is on it". A single
+    /// number could not tell those apart, and on `--transport dual` telling
+    /// them apart is the entire point: a dual node whose libp2p half reads
+    /// `Some(0)` is bound, reachable by nobody, and about to be mistaken for
+    /// a node that is bridging two populations.
+    pub fn peer_counts(&self) -> (Option<usize>, Option<usize>) {
+        match self {
+            Net::Devnet(m) => (Some(m.peer_count()), None),
+            Net::Libp2p(h) => (None, Some(h.peer_count())),
+            Net::Both(m, h) => (Some(m.peer_count()), Some(h.peer_count())),
+        }
+    }
+
+    /// The `--transport` spelling of what this node is actually running.
+    pub fn transport_name(&self) -> &'static str {
+        match self {
+            Net::Devnet(_) => "devnet",
+            Net::Libp2p(_) => "libp2p",
+            Net::Both(..) => "dual",
         }
     }
 }
@@ -182,9 +277,48 @@ pub struct DevnetMesh {
     /// Pushing on inbound connections costs nothing — the socket is already
     /// open and the peer is already reading it.
     inbound: Arc<Mutex<Vec<SyncSender<Vec<u8>>>>>,
+    /// TCP connections up **right now**, inbound and outbound together.
+    ///
+    /// Not `peers.len()`: that is one entry per *configured* peer address and
+    /// its dialer thread retries forever, so it reads the same whether the
+    /// peer is answering or has been down for a week. This counter is
+    /// incremented when a socket is established and decremented when its
+    /// reader thread ends, by [`ConnCount`], so it is a fact about the
+    /// network rather than about the command line.
+    ///
+    /// It exists so `getchaininfo` can say which stacks a node is actually
+    /// attached to. On `--transport dual` that is the whole proof that the
+    /// node is on both.
+    live: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Holds one unit of [`DevnetMesh::live`] for the lifetime of a connection.
+///
+/// A guard rather than a matching `fetch_sub` at each exit: the reader
+/// threads below leave by `return` from several arms and by unwinding, and a
+/// counter that leaks on one of those paths reports a node as connected
+/// forever — which is worse than not reporting at all.
+struct ConnCount(Arc<std::sync::atomic::AtomicUsize>);
+
+impl ConnCount {
+    fn new(c: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        c.fetch_add(1, Ordering::AcqRel);
+        ConnCount(c.clone())
+    }
+}
+
+impl Drop for ConnCount {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl DevnetMesh {
+    /// TCP connections established right now. See [`DevnetMesh::live`].
+    pub fn peer_count(&self) -> usize {
+        self.live.load(Ordering::Acquire)
+    }
+
     /// Broadcast one frame (type byte + payload, no length prefix) to every
     /// peer, dialed or dialing.
     pub fn broadcast(&self, frame: Vec<u8>) {
@@ -369,11 +503,13 @@ pub fn start(
     // the engine, get-blocks is answered in place from the log.
     let listener = TcpListener::bind((bind_addr, listen_port))?;
     let inbound: Arc<Mutex<Vec<SyncSender<Vec<u8>>>>> = Arc::new(Mutex::new(Vec::new()));
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     {
         let events = events.clone();
         let data_dir = data_dir.clone();
         let inbound = inbound.clone();
         let inflight = inflight.clone();
+        let live = live.clone();
         thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(sock) = conn else { continue };
@@ -407,18 +543,25 @@ pub fn start(
                 let data_dir = data_dir.clone();
                 let inflight = inflight.clone();
                 let mut rsock = rsock;
-                thread::spawn(move || loop {
-                    match read_frame(&mut rsock) {
-                        Ok(frame) => {
-                            if frame.first() == Some(&FRAME_GET_BLOCKS) {
-                                serve_get_blocks(&wsock, &data_dir, &frame);
-                            } else if let Some(ev) = decode_event(&frame) {
-                                if !send_to_engine(&events, &inflight, ev) {
-                                    return;
+                // Counted from here to wherever this thread leaves. The guard
+                // is moved into the closure, so every `return` below and any
+                // unwind releases it.
+                let counted = ConnCount::new(&live);
+                thread::spawn(move || {
+                    let _counted = counted;
+                    loop {
+                        match read_frame(&mut rsock) {
+                            Ok(frame) => {
+                                if frame.first() == Some(&FRAME_GET_BLOCKS) {
+                                    serve_get_blocks(&wsock, &data_dir, &frame);
+                                } else if let Some(ev) = decode_event(&frame) {
+                                    if !send_to_engine(&events, &inflight, ev) {
+                                        return;
+                                    }
                                 }
                             }
+                            Err(_) => return,
                         }
-                        Err(_) => return,
                     }
                 });
             }
@@ -440,11 +583,17 @@ pub fn start(
         let head_slot = head_slot.clone();
         let sync_slots = sync_slots.clone();
         let inflight = inflight.clone();
+        let live = live.clone();
         thread::spawn(move || loop {
             let Ok(sock) = TcpStream::connect(&addr) else {
                 thread::sleep(Duration::from_millis(300));
                 continue;
             };
+            // Counted from a SUCCESSFUL connect, and released when this
+            // connection's inner loop breaks to reconnect. A dialer retrying a
+            // peer that is down therefore contributes nothing, which is the
+            // difference between this number and `peers.len()`.
+            let _counted = ConnCount::new(&live);
             let mut wsock = sock;
             // Reader half: the peer answers our get-blocks on this socket.
             if let Ok(mut rsock) = wsock.try_clone() {
@@ -543,5 +692,139 @@ pub fn start(
         });
     }
 
-    Ok(DevnetMesh { peers, inbound })
+    Ok(DevnetMesh { peers, inbound, live })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Freeze every allocated frame byte at its registered value.
+    ///
+    /// `docs/WIRE-NAMESPACE-REGISTRY.md` §2 allocates these, and §7 gap 1
+    /// records that **nothing froze them**: the dispatch in this file matches
+    /// `&FRAME_BLOCK` as a binding-by-reference and compares `FRAME_GET_BLOCKS`
+    /// at runtime, so two constants with different names and the same value
+    /// produce no error, no warning, and no `unreachable_patterns`. This test
+    /// and the boot-time block in `main::self_check` are the entire mechanism.
+    ///
+    /// Dual-stack is why it lands now: the same four bytes are dispatched by
+    /// `net.rs` on the devnet wire AND routed by `p2p.rs::handle_command` onto
+    /// gossip topics, and with `--transport dual` both happen inside one
+    /// process against one vocabulary.
+    #[test]
+    fn frame_bytes_are_frozen() {
+        assert_eq!(FRAME_BLOCK, 0x01, "FRAME_BLOCK moved off its allocation");
+        assert_eq!(FRAME_ATT, 0x02, "FRAME_ATT moved off its allocation");
+        assert_eq!(FRAME_GET_BLOCKS, 0x03, "FRAME_GET_BLOCKS moved off its allocation");
+        assert_eq!(FRAME_TX, 0x04, "FRAME_TX moved off its allocation");
+        let all = [
+            ("FRAME_BLOCK", FRAME_BLOCK),
+            ("FRAME_ATT", FRAME_ATT),
+            ("FRAME_GET_BLOCKS", FRAME_GET_BLOCKS),
+            ("FRAME_TX", FRAME_TX),
+        ];
+        for (i, (na, a)) in all.iter().enumerate() {
+            for (nb, b) in all.iter().skip(i + 1) {
+                assert_ne!(a, b, "frame bytes {na} and {nb} collide");
+            }
+        }
+    }
+
+    /// A frame is a function of its payload alone — never of the transport.
+    ///
+    /// This is the invariant `Net::Both` leans on: it clones one `Vec<u8>` and
+    /// hands a copy to each transport, so if a builder ever grew a
+    /// transport-dependent branch, a dual node would emit two different
+    /// encodings of one object and the two populations would disagree about
+    /// what they had seen.
+    #[test]
+    fn frame_builders_are_transport_independent() {
+        let f = get_blocks_frame(7);
+        assert_eq!(f.len(), 9);
+        assert_eq!(f[0], FRAME_GET_BLOCKS);
+        assert_eq!(&f[1..], &7u64.to_le_bytes());
+        // Same input, same bytes, every time.
+        assert_eq!(get_blocks_frame(7), f);
+    }
+
+    /// The bug `--transport dual` would have inherited, stated as arithmetic.
+    ///
+    /// `engine::run`'s loop decrements `inflight` once per `EngineEvent::Net`
+    /// it handles, unconditionally. Before this change only the devnet path
+    /// incremented; the libp2p forwarder did not. One uncounted event is
+    /// therefore enough to take an `AtomicUsize` at zero to `usize::MAX` —
+    /// which is not "slightly wrong", it is permanently above
+    /// [`ENGINE_QUEUE_CAP`], so `send_to_engine` sheds every frame for the
+    /// life of the process.
+    ///
+    /// On `--transport libp2p` nothing reads the counter, so the wrap was
+    /// invisible. On `--transport dual` the devnet half reads it, and a node
+    /// would come up connected on both transports, log nothing, and receive
+    /// nothing on one of them.
+    #[test]
+    fn one_uncounted_event_wraps_the_counter_into_permanent_shedding() {
+        use std::sync::atomic::AtomicUsize;
+        let n = AtomicUsize::new(0);
+        // Exactly what the engine loop does for an event nobody counted in.
+        n.fetch_sub(1, Ordering::AcqRel);
+        assert_eq!(n.load(Ordering::Acquire), usize::MAX);
+        assert!(
+            n.load(Ordering::Acquire) >= ENGINE_QUEUE_CAP,
+            "a wrapped counter is above the shed threshold, i.e. shed everything, forever"
+        );
+    }
+
+    /// `send_to_engine` sheds above the cap and delivers below it — the two
+    /// halves of the behaviour the counter drives.
+    #[test]
+    fn send_to_engine_sheds_above_the_cap_and_delivers_below_it() {
+        use std::sync::atomic::AtomicUsize;
+        let (tx, rx) = mpsc::channel::<EngineEvent>();
+
+        // Below the cap: delivered, and counted in.
+        let inflight = Arc::new(AtomicUsize::new(0));
+        assert!(send_to_engine(
+            &tx,
+            &inflight,
+            NetEvent::Attestation(sample_attestation(), Origin::none())
+        ));
+        assert_eq!(inflight.load(Ordering::Acquire), 1);
+        assert!(rx.try_recv().is_ok(), "an event below the cap must reach the engine");
+
+        // At (or above) the cap: shed, silently, and the connection stays
+        // healthy — `send_to_engine` returns true.
+        let full = Arc::new(AtomicUsize::new(ENGINE_QUEUE_CAP));
+        assert!(send_to_engine(
+            &tx,
+            &full,
+            NetEvent::Attestation(sample_attestation(), Origin::none())
+        ));
+        assert_eq!(full.load(Ordering::Acquire), ENGINE_QUEUE_CAP, "shedding must not count");
+        assert!(rx.try_recv().is_err(), "an event at the cap must be shed");
+
+        // And the wrapped counter sheds too — this is the dual-stack failure.
+        let wrapped = Arc::new(AtomicUsize::new(usize::MAX));
+        assert!(send_to_engine(
+            &tx,
+            &wrapped,
+            NetEvent::Attestation(sample_attestation(), Origin::none())
+        ));
+        assert!(rx.try_recv().is_err(), "a wrapped counter sheds every frame");
+    }
+
+    fn sample_attestation() -> Attestation {
+        Attestation {
+            data: bloch_pos_committee::attestation::AttestationData {
+                slot: 1,
+                head: [1u8; 32],
+                source_epoch: 0,
+                source_root: [0u8; 32],
+                target_epoch: 0,
+                target_root: [0u8; 32],
+            },
+            validator: 0,
+            signature: Vec::new(),
+        }
+    }
 }

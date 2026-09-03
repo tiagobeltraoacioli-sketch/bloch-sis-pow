@@ -74,8 +74,12 @@ The flag is `--transport devnet`. The name is historical and misleading: it is
 the transport the **live mainnet fleet runs today** — verified 2026-09-01
 across all 7 fleet hosts (63 active validators) and both archival nodes.
 
-Do **not** use `--transport libp2p`. See [Why not libp2p](#why-not-libp2p) —
-it fails in the worst possible way, silently.
+Do **not** run `--transport libp2p` on its own. See
+[Why not libp2p — alone — today](#why-not-libp2p--alone--today) — it fails in
+the worst possible way, silently. There is now a third posture,
+`--transport dual`, which binds both stacks in one process; see
+[The three transports](#the-three-transports-and-the-order-they-must-be-adopted-in)
+for what it is for and the order it has to be adopted in.
 
 `devnet` has no authentication and no admission control. Consequences you must
 design around:
@@ -649,17 +653,93 @@ channels (the R2 bucket, the git repositories, and posternlabs.com carry it)
 before trusting it. Agreement between two channels is what makes a compromised
 third detectable.
 
-## Why not libp2p
+## The three transports, and the order they must be adopted in
 
-The node has a second transport, `--transport libp2p`, which is the better
-stack: authenticated Noise sessions, gossipsub, peer scoring, admission
-control. **Do not use it.** The live fleet does not speak it yet, and the two
-transports are mutually exclusive per process — `net.rs` defines
-`enum Net { Devnet | Libp2p }`, "one of two, chosen at startup". There is no
-dual-stack mode and no bridge.
+The node has three postures. Which one a process is on is **printed at
+startup** and **reported by `getchaininfo`** — it is no longer something you
+have to infer from behaviour.
 
-A libp2p node pointed at a devnet peer does not fail cleanly. Measured
-2026-09-01:
+| `--transport` | Binds | Use it when |
+|---|---|---|
+| `devnet` (**default**) | The unauthenticated TCP full mesh, `--listen`. | Today. This is what the live fleet speaks. |
+| `dual` | **Both**: the mesh (`--listen`) *and* the libp2p swarm (`--p2p-listen`), in one process. | During a transport migration, so it is rolling instead of a flag day. |
+| `libp2p` | The production swarm only, `--p2p-listen`. | Only after the whole fleet is on `dual`. See the ordering rule below. |
+
+### The ordering rule, and why it is not optional
+
+**`dual` must be fleet-wide BEFORE any node runs `libp2p` alone.**
+
+A dual node does not relay between the two meshes (see the header of
+`crates/bloch-pos-node/src/net.rs` for why bridging is refused, and what it
+would cost). It publishes only what it authored or itself validated, on both,
+and everything else crosses by the paged sync path. That is enough for a
+libp2p node to *follow* the chain, and not enough for a block **born** on
+libp2p alone to reach a devnet-only validator.
+
+So the crossing order is:
+
+```
+everyone devnet  →  everyone dual  →  (soak)  →  everyone libp2p
+```
+
+and the middle state is the one that is safe to sit in indefinitely.
+Reproduced locally on three nodes, 2026-09-03, one arm per posture:
+
+```
+node0 devnet-only, node1 DUAL, node2 libp2p-only (a producer)
+  node0 and node1 agree bit-for-bit through slot 32
+  node1 and node2 agree bit-for-bit at slot 36 (0192ee5b, root 13a34d0a)
+  node0 never sees the blocks node2 authored, and falls off after slot 32
+```
+
+The last line is the ordering rule, measured: a libp2p-only **producer**
+alongside a devnet-only validator forks the network. A libp2p-only
+**follower** behind a dual node does not.
+
+### Stating which transport you are on
+
+Two lines at startup — the plan, before anything binds, and what is bound,
+from the live transport object:
+
+```
+transport: DUAL — devnet mesh on 127.0.0.1:19711 AND libp2p swarm on /ip4/127.0.0.1/tcp/19721, both live in one process
+transport: dual bound — devnet mesh on 127.0.0.1:19711 AND libp2p swarm on /ip4/127.0.0.1/tcp/19721
+```
+
+and, from outside the process, `getchaininfo`:
+
+```json
+"transport": { "name": "dual", "peers": { "devnet": 2, "libp2p": 1 } }
+```
+
+`null` means *this node runs no such stack*; a number means it runs one, and
+says how many peers are on it. Those are different answers, and the difference
+is the point: `"libp2p": 0` is a node that is bound, reachable by nobody, and
+one restart away from being mistaken for a node that is bridging two
+populations. Poll the fleet on this field and you can watch a migration cross.
+
+### Flags for the other stack are refused, not ignored
+
+`--p2p-listen` under `devnet` used to parse and then be dropped, so a command
+line could claim libp2p while the process was on the mesh. It now refuses:
+
+```
+run: --p2p-listen is set for the `devnet` transport, which does not run a
+libp2p swarm. Either drop it or run `--transport dual`, which binds both
+stacks.
+```
+
+The same applies to `--listen` / `--listen-addr` / `--peers` under `libp2p`.
+`--max-peers` and `--behind-proxy` only *tune* the swarm, so under `devnet`
+they warn rather than refusing to boot — a deployment template that carries
+them across a transport change should not take a validator down.
+
+## Why not libp2p — alone — today
+
+`--transport libp2p` is the better stack: authenticated Noise sessions,
+gossipsub, peer scoring, admission control. **Do not run it by itself against
+these bootnodes.** The live fleet speaks `devnet`, so a libp2p-only node has
+nobody to talk to — and it does not fail cleanly. Measured 2026-09-01:
 
 ```
 p2p: NO PEERS — dial failed: Failed to negotiate transport protocol(s)
@@ -670,11 +750,16 @@ p2p: publish blocks: NoPeersSubscribedToTopic
 
 It negotiates nothing, finds no peers, and then **builds its own chain while
 printing "applied" and "finalized"** — looking healthy while being alone on a
-fork. If you point a libp2p node at these bootnodes you will get a node that
-appears to work and is not on Bloch.
+fork. Note what `getchaininfo` now says about that node:
+`"transport": { "name": "libp2p", "peers": { "devnet": null, "libp2p": 0 } }`.
+That zero is the fact `behind_by_slots` cannot give you: a node alone on its
+own fork is not *behind*, it is current, on nothing.
 
-This changes when the fleet migrates transport. Until that happens, `devnet` is
-not the recommended option; it is the only one.
+What has changed since that measurement is that there is now a way across.
+`--transport dual` runs both stacks in one process, so you can attach to the
+devnet fleet and to a libp2p peer at the same time and stay on one chain.
+Until the fleet has crossed, `devnet` is still the only posture to run
+**alone**.
 
 ## What does not work today
 
@@ -683,7 +768,7 @@ Stated here rather than left for you to discover:
 | | |
 |---|---|
 | **Running a validator** | Closed at the node level. New deposits are refused at mempool admission because bonded stake is not funded from the eUTXO set, so a deposit would mint stake from nothing. The set is fixed at the 64 genesis validators. |
-| **`--transport libp2p`** | The fleet speaks `devnet`; see above. |
+| **`--transport libp2p` alone** | The fleet speaks `devnet`; see above. `--transport dual` binds both stacks in one process and is the supported way across, but it has to be fleet-wide before anyone runs libp2p alone. |
 | **A signed WS checkpoint** | No signer keys exist yet. Sync before 2026-09-05 07:07:19 UTC and you will not need one. |
 | **Checkpoint-sync state download** | Not implemented. Every node replays and revalidates from its anchor. |
 | **`gettransaction` / transaction index** | No txid at this layer; deposit detection is UTXO polling. |

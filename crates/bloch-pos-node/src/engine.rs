@@ -111,10 +111,18 @@ pub enum EngineEvent {
 /// finalized on it and that result must stay reproducible by running the same
 /// command. `Libp2p` is the production stack (see [`crate::p2p`]) and is what
 /// anything reachable from outside a firewall must use.
+///
+/// `Dual` runs both in one process ([`crate::net::Net::Both`]). It exists so
+/// that moving a fleet between transports is a rolling change instead of a
+/// flag day: today a node speaks one or the other, so the whole fleet must
+/// cross at one instant or split into two networks that both look healthy.
+/// **It is never selected by default** — `--transport dual` is the only way to
+/// reach it, and `None` still means `Devnet`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transport {
     Devnet,
     Libp2p,
+    Dual,
 }
 
 pub struct Config {
@@ -2538,6 +2546,11 @@ impl Engine {
                 self.state.validator_count(),
                 self.mempool.len(),
                 self.blocks.len(),
+                // Which transport this process is on, and how many peers each
+                // of its stacks has. Read from the live `Net`, not from the
+                // config, so it cannot disagree with what is bound.
+                self.net.transport_name(),
+                self.net.peer_counts(),
             )),
 
             RpcRequest::BlockCount => {
@@ -2870,6 +2883,68 @@ pub(crate) fn check_registry_identity(
     RegistryIdentity::Active
 }
 
+/// Start the devnet TCP mesh. Called by the `Devnet` and `Dual` arms of
+/// [`run`] with identical arguments.
+fn start_devnet(
+    cfg: &Config,
+    tx: mpsc::Sender<EngineEvent>,
+    head_slot: &Arc<AtomicU64>,
+    inflight: &Arc<std::sync::atomic::AtomicUsize>,
+) -> io::Result<net::DevnetMesh> {
+    net::start(
+        &cfg.listen_addr,
+        cfg.listen,
+        cfg.peers.clone(),
+        tx,
+        cfg.data_dir.clone(),
+        head_slot.clone(),
+        inflight.clone(),
+    )
+}
+
+/// Start the libp2p stack. Called by the `Libp2p` and `Dual` arms of [`run`]
+/// with identical arguments.
+///
+/// The `p2p: node identity …` line stays here rather than at the call site so
+/// that both arms print it, in the same place, with the same wording — an
+/// operator reading a dual node's boot log sees exactly what a libp2p node's
+/// log says.
+fn start_libp2p(
+    cfg: &Config,
+    net_tx: mpsc::Sender<NetEvent>,
+    head_slot: &Arc<AtomicU64>,
+) -> io::Result<crate::p2p::Handle> {
+    let parse = |s: &str, what: &str| -> io::Result<crate::p2p::Multiaddr> {
+        s.parse().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{what} `{s}` is not a multiaddr: {e}"),
+            )
+        })
+    };
+    let mut listen = Vec::new();
+    for a in &cfg.p2p_listen {
+        listen.push(parse(a, "--p2p-listen")?);
+    }
+    let mut peers = Vec::new();
+    for a in &cfg.p2p_peers {
+        peers.push(parse(a, "--p2p-peer")?);
+    }
+    let handle = crate::p2p::start(
+        crate::p2p::Config {
+            listen,
+            peers,
+            data_dir: cfg.data_dir.clone(),
+            max_peers: cfg.max_peers,
+            behind_proxy: cfg.behind_proxy,
+        },
+        net_tx,
+        head_slot.clone(),
+    )?;
+    println!("p2p: node identity {}", handle.peer_id);
+    Ok(handle)
+}
+
 pub fn run(cfg: Config) -> io::Result<()> {
     let (mut manifest, digest) = Manifest::load(&cfg.genesis_path)?;
 
@@ -2993,56 +3068,82 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let (net_tx, net_rx) = mpsc::channel::<NetEvent>();
     {
         let tx = tx.clone();
+        let inflight = inflight.clone();
         std::thread::spawn(move || {
             for ev in net_rx {
+                // COUNT IT IN, exactly as `net::send_to_engine` does on the
+                // devnet path.
+                //
+                // The engine loop below decrements `inflight` for every
+                // `EngineEvent::Net` it handles, unconditionally. This
+                // forwarder is the libp2p path's only way in and it did not
+                // increment, so on `--transport libp2p` an `AtomicUsize` at
+                // zero was decremented on the first network event and wrapped
+                // to `usize::MAX`.
+                //
+                // That was invisible while the two transports could not
+                // coexist: nothing reads `inflight` on the libp2p path. It is
+                // fatal the moment they share a process. `net::send_to_engine`
+                // sheds when `inflight >= ENGINE_QUEUE_CAP`, so a wrapped
+                // counter means a dual node silently drops EVERY devnet frame
+                // for the life of the process — a node that looks connected,
+                // logs nothing, and receives nothing.
+                //
+                // This does NOT add shedding to the libp2p path. That channel
+                // stays unbounded on purpose (see the `p2p` module header on
+                // why a syncing node that stalls is worse than a fat one);
+                // counting only makes the number true.
+                inflight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 if tx.send(EngineEvent::Net(ev)).is_err() {
+                    inflight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                     return; // engine gone; nothing left to deliver to
                 }
             }
         });
     }
+    // The two transports are started by two helpers rather than inline, so the
+    // `Dual` arm calls exactly the same code with exactly the same arguments
+    // as the single-transport arms. A dual node is not a third transport; it
+    // is the other two, unmodified, in one process.
     let net = match cfg.transport {
-        Transport::Devnet => net::Net::Devnet(net::start(
-            &cfg.listen_addr,
-            cfg.listen,
-            cfg.peers.clone(),
-            tx.clone(),
-            cfg.data_dir.clone(),
-            head_slot.clone(),
-            inflight.clone(),
-        )?),
-        Transport::Libp2p => {
-            let parse = |s: &str, what: &str| -> io::Result<crate::p2p::Multiaddr> {
-                s.parse().map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("{what} `{s}` is not a multiaddr: {e}"),
-                    )
-                })
-            };
-            let mut listen = Vec::new();
-            for a in &cfg.p2p_listen {
-                listen.push(parse(a, "--p2p-listen")?);
-            }
-            let mut peers = Vec::new();
-            for a in &cfg.p2p_peers {
-                peers.push(parse(a, "--p2p-peer")?);
-            }
-            let handle = crate::p2p::start(
-                crate::p2p::Config {
-                    listen,
-                    peers,
-                    data_dir: cfg.data_dir.clone(),
-                    max_peers: cfg.max_peers,
-                    behind_proxy: cfg.behind_proxy,
-                },
-                net_tx,
-                head_slot.clone(),
-            )?;
-            println!("p2p: node identity {}", handle.peer_id);
-            net::Net::Libp2p(handle)
+        Transport::Devnet => {
+            net::Net::Devnet(start_devnet(&cfg, tx.clone(), &head_slot, &inflight)?)
+        }
+        Transport::Libp2p => net::Net::Libp2p(start_libp2p(&cfg, net_tx, &head_slot)?),
+        Transport::Dual => {
+            // Devnet FIRST. Binding its `TcpListener` is the cheap synchronous
+            // failure — a port already in use — and a node that cannot bind
+            // both must not come up holding one: half a dual node is a node
+            // that looks like it is bridging two populations and is not.
+            // `?` on either line aborts the whole start.
+            let mesh = start_devnet(&cfg, tx.clone(), &head_slot, &inflight)?;
+            let handle = start_libp2p(&cfg, net_tx, &head_slot)?;
+            net::Net::Both(mesh, handle)
         }
     };
+    // THE SECOND HALF OF THE STARTUP DECISION, AND THE AUTHORITATIVE ONE.
+    //
+    // `main::run_cmd` prints the plan before anything binds; this line prints
+    // what is bound, from the `Net` value the engine is actually holding.
+    // Two lines rather than one on purpose: a `dual` node whose libp2p half
+    // failed never reaches here at all (`?` above aborts the start), so
+    // "bound" appearing after "plan" is the operator's proof that both
+    // sockets exist. `getchaininfo`'s `transport` block then reports, from the
+    // same `Net`, how many peers each stack has found.
+    println!(
+        "transport: {} bound — {}",
+        net.transport_name(),
+        match &net {
+            net::Net::Devnet(_) => format!("devnet mesh on {}:{}", cfg.listen_addr, cfg.listen),
+            net::Net::Libp2p(_) => format!("libp2p swarm on {}", cfg.p2p_listen.join(", ")),
+            net::Net::Both(..) => format!(
+                "devnet mesh on {}:{} AND libp2p swarm on {}",
+                cfg.listen_addr,
+                cfg.listen,
+                cfg.p2p_listen.join(", ")
+            ),
+        }
+    );
 
     let mut engine = Engine {
         state: StateCell::new(genesis_state),
@@ -5823,14 +5924,14 @@ mod bench {
         let before = |st: &CommittedState| -> u128 {
             let t = Instant::now();
             let root = st.state_root();
-            let v = crate::rpc::chain_info_json(st, &head, root, 0, Some(0), 0, 1, 0, 1);
+            let v = crate::rpc::chain_info_json(st, &head, root, 0, Some(0), 0, 1, 0, 1, "devnet", (Some(0), None));
             let us = t.elapsed().as_micros();
             std::hint::black_box(v);
             us
         };
         let after = |st: &CommittedState| -> u128 {
             let t = Instant::now();
-            let v = crate::rpc::chain_info_json(st, &head, header_root, 0, Some(0), 0, 1, 0, 1);
+            let v = crate::rpc::chain_info_json(st, &head, header_root, 0, Some(0), 0, 1, 0, 1, "devnet", (Some(0), None));
             let us = t.elapsed().as_micros();
             std::hint::black_box(v);
             us
@@ -5870,10 +5971,10 @@ mod bench {
         // Byte-identical, which is what makes this transport-only. Asserted
         // rather than printed: a bench that quietly changed the answer would
         // be measuring the wrong thing to begin with.
-        let a = crate::rpc::chain_info_json(&st, &head, header_root, 0, Some(0), 0, 1, 0, 1);
+        let a = crate::rpc::chain_info_json(&st, &head, header_root, 0, Some(0), 0, 1, 0, 1, "devnet", (Some(0), None));
         let b = {
             let root = st.state_root();
-            crate::rpc::chain_info_json(&st, &head, root, 0, Some(0), 0, 1, 0, 1)
+            crate::rpc::chain_info_json(&st, &head, root, 0, Some(0), 0, 1, 0, 1, "devnet", (Some(0), None))
         };
         assert_eq!(
             a.to_string(),

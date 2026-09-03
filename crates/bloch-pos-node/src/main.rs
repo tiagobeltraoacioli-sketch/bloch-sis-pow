@@ -168,13 +168,28 @@ fn print_help() {
                Build a devnet genesis manifest from the keystores' public\n\
                parts. Slot 0 starts <secs> from now (default 5).\n\
            bloch-pos run --data-dir <dir> --genesis <file>\n\
-                         [--transport devnet|libp2p]\n\
+                         [--transport devnet|libp2p|dual]\n\
                devnet (default) is the TCP full mesh: no authentication, no\n\
                admission control, no relay logic. It is what the 64-validator\n\
                devnet finalized on and it stays reproducible.\n\
                libp2p is the production stack: gossipsub on Genesis-4-only\n\
                protocol ids, gossip.rs admission control, directed paginated\n\
                sync. Anything reachable from outside a firewall wants this.\n\
+               dual runs BOTH in one process, so a fleet can move between\n\
+               transports as a rolling change instead of a flag day. It needs\n\
+               the flags of both (--listen AND --p2p-listen) and refuses to\n\
+               start with only one half bound. It does NOT relay between the\n\
+               two meshes: it publishes what it authored or validated, on\n\
+               both, and everything else crosses by sync. See the header of\n\
+               crates/bloch-pos-node/src/net.rs for why bridging is refused.\n\
+               The transport in effect is PRINTED at startup (`transport:`,\n\
+               twice: the plan, then what is bound) and reported by\n\
+               getchaininfo under `transport`, with a peer count per stack.\n\
+               Flags belonging to a stack this transport does not run are\n\
+               REFUSED, not ignored: --p2p-listen/--p2p-peer under devnet,\n\
+               and --listen/--listen-addr/--peers under libp2p.\n\
+               ORDER MATTERS: dual must be fleet-wide BEFORE any node runs\n\
+               libp2p alone. See docs/THIRD-PARTY-QUICKSTART.md.\n\
          \n\
              devnet transport:\n\
                          --listen <port> [--listen-addr <ip>]\n\
@@ -787,6 +802,226 @@ fn genesis_cmd(args: &[String]) {
     );
 }
 
+/// The default libp2p listen address, used when a plan runs a swarm and the
+/// operator named no `--p2p-listen`.
+const DEFAULT_P2P_LISTEN: &str = "/ip4/0.0.0.0/tcp/16400";
+
+/// What [`decide_transport`] decided: the transport, the listener settings
+/// that follow from it, and the line the node prints about it.
+///
+/// This is the whole output of the decision. `run_cmd` copies these fields
+/// into [`engine::Config`] and does not re-derive any of them, so the line
+/// printed at boot and the sockets actually opened cannot disagree.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TransportPlan {
+    pub transport: engine::Transport,
+    /// Devnet mesh port. `0` exactly when the plan runs no devnet mesh.
+    pub listen: u16,
+    /// libp2p listen multiaddrs, defaulted to [`DEFAULT_P2P_LISTEN`] when the
+    /// plan runs a swarm and none was given. Empty exactly when the plan runs
+    /// no swarm.
+    pub p2p_listen: Vec<String>,
+    /// One line, printed as `transport: <summary>`, naming the transport
+    /// actually in effect and what it binds.
+    pub summary: String,
+    /// Flags that are real but that this transport does not read. Printed,
+    /// never dropped in silence — see the note below on refused vs. warned.
+    pub warnings: Vec<String>,
+}
+
+/// Decide the transport from the command line. **Pure**: it reads `args` and
+/// nothing else — no clock, no filesystem, no environment, no `exit`, no
+/// print — so every posture and every refusal below is a unit test.
+///
+/// # The default is deliberately unchanged
+///
+/// `None => Devnet`. The live Genesis-4 fleet speaks the devnet TCP mesh and
+/// nothing else; a node that quietly came up on libp2p instead would find no
+/// peers, build its own chain, and print `applied` and `finalized` the whole
+/// time (`docs/THIRD-PARTY-QUICKSTART.md`, "Why not libp2p"). Flipping the
+/// compiled-in default is a fleet-wide decision, not a code cleanup, and it
+/// is not made here.
+///
+/// # What is new is that the decision is stated, and contradictions refuse
+///
+/// Two failure modes are being closed:
+///
+///   1. **Silence.** The transport was an unannounced default. An operator
+///      reading a node's log could not tell which network layer it was on.
+///      Every plan now carries a `summary` and `run_cmd` prints it before a
+///      socket is bound.
+///   2. **Flags that did nothing.** `--p2p-listen` with the devnet transport
+///      parsed fine and was then dropped on the floor, so the command line
+///      said "I am on libp2p" and the process was not. Those combinations are
+///      refused.
+///
+/// # Refused vs. warned
+///
+/// Refused: a flag naming a **listener or a peer** for a stack this plan does
+/// not run. That is the class that makes an operator believe the node is
+/// reachable somewhere it is not, and reachability is what a fleet is
+/// debugged by.
+///
+/// Warned, not refused: `--max-peers` and `--behind-proxy`, which only *tune*
+/// the swarm. They are routinely carried along in deployment templates that
+/// predate a transport change, and refusing to boot a validator over a tuning
+/// knob it does not read would trade a real outage for a cosmetic one.
+pub(crate) fn decide_transport(args: &[String]) -> Result<TransportPlan, String> {
+    let transport = match arg_value(args, "--transport").as_deref() {
+        // Unchanged, and load-bearing: see the section above.
+        None | Some("devnet") => engine::Transport::Devnet,
+        Some("libp2p") => engine::Transport::Libp2p,
+        // Dual is reachable ONLY by naming it. `None` is still `Devnet`, so a
+        // command line that worked yesterday selects the same transport today.
+        Some("dual") => engine::Transport::Dual,
+        Some(other) => {
+            return Err(format!(
+                "--transport must be `devnet`, `libp2p` or `dual`, not `{other}`"
+            ))
+        }
+    };
+    let named = arg_value(args, "--transport").is_some();
+    let runs_devnet = matches!(
+        transport,
+        engine::Transport::Devnet | engine::Transport::Dual
+    );
+    let runs_libp2p = matches!(
+        transport,
+        engine::Transport::Libp2p | engine::Transport::Dual
+    );
+
+    let present = |name: &str| args.iter().any(|a| a == name);
+    let mut contradictions: Vec<String> = Vec::new();
+    if !runs_libp2p {
+        for f in ["--p2p-listen", "--p2p-peer"] {
+            if present(f) {
+                contradictions.push(f.to_string());
+            }
+        }
+    }
+    if !runs_devnet {
+        for f in ["--listen", "--listen-addr", "--peers"] {
+            if present(f) {
+                contradictions.push(f.to_string());
+            }
+        }
+    }
+    if !contradictions.is_empty() {
+        // The message names both ways out, because both are legitimate: an
+        // operator who meant the flags wants `dual`, and an operator who meant
+        // the transport wants the flags gone.
+        return Err(format!(
+            "{} {} for the `{}` transport, which does not {}. \
+             Either drop {} or run `--transport dual`, which binds both stacks{}.",
+            contradictions.join(" and "),
+            if contradictions.len() == 1 { "is set" } else { "are set" },
+            transport_name(transport),
+            if runs_devnet {
+                "run a libp2p swarm"
+            } else {
+                "run a devnet mesh"
+            },
+            if contradictions.len() == 1 { "it" } else { "them" },
+            if named {
+                ""
+            } else {
+                " (no --transport was given, so this is the devnet default)"
+            },
+        ));
+    }
+
+    let mut warnings = Vec::new();
+    if !runs_libp2p {
+        for f in ["--max-peers", "--behind-proxy"] {
+            if present(f) {
+                warnings.push(format!(
+                    "{f} tunes the libp2p swarm and the `{}` transport runs none — it is being ignored",
+                    transport_name(transport)
+                ));
+            }
+        }
+    }
+
+    // Devnet port. Refused rather than defaulted, on BOTH arms that run a
+    // mesh. A `dual` node that came up with only its libp2p half bound would
+    // look, in every log line and every RPC answer, exactly like a node
+    // bridging two populations — while one of them could not reach it at all.
+    // Half a dual node is worse than none.
+    let listen = if runs_devnet {
+        match arg_value(args, "--listen") {
+            None => {
+                return Err(format!(
+                    "--listen <port> is required for the `{}` transport",
+                    transport_name(transport)
+                ))
+            }
+            // A malformed port is a refusal, not a silent fall back to 0 — the
+            // same rule `--rpc-port` follows. Binding an ephemeral port is
+            // never what an operator who typed a number meant, and a mesh
+            // listening where nobody dials is a node that is up and alone.
+            Some(s) => match s.parse::<u16>() {
+                Ok(0) | Err(_) => {
+                    return Err(format!(
+                        "--listen must be a port number 1-65535 (got `{s}`)"
+                    ))
+                }
+                Ok(p) => p,
+            },
+        }
+    } else {
+        0
+    };
+
+    let mut p2p_listen: Vec<String> = arg_value(args, "--p2p-listen")
+        .map(|s| {
+            s.split(',')
+                .filter(|p| !p.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    if runs_libp2p && p2p_listen.is_empty() {
+        p2p_listen.push(DEFAULT_P2P_LISTEN.to_string());
+    }
+
+    let listen_addr = arg_value(args, "--listen-addr").unwrap_or_else(|| "127.0.0.1".to_string());
+    let summary = match transport {
+        engine::Transport::Devnet => format!(
+            "DEVNET{} — unauthenticated TCP mesh on {listen_addr}:{listen}, no libp2p swarm",
+            if named {
+                ""
+            } else {
+                " (default: no --transport given)"
+            }
+        ),
+        engine::Transport::Libp2p => {
+            format!("LIBP2P — swarm on {}, no devnet mesh", p2p_listen.join(", "))
+        }
+        engine::Transport::Dual => format!(
+            "DUAL — devnet mesh on {listen_addr}:{listen} AND libp2p swarm on {}, both live in one process",
+            p2p_listen.join(", ")
+        ),
+    };
+
+    Ok(TransportPlan {
+        transport,
+        listen,
+        p2p_listen,
+        summary,
+        warnings,
+    })
+}
+
+/// The `--transport` spelling of an [`engine::Transport`], so a refusal names
+/// the value the operator would have to type.
+fn transport_name(t: engine::Transport) -> &'static str {
+    match t {
+        engine::Transport::Devnet => "devnet",
+        engine::Transport::Libp2p => "libp2p",
+        engine::Transport::Dual => "dual",
+    }
+}
+
 fn run_cmd(args: &[String]) {
     self_check();
     let (Some(data_dir), Some(genesis_path)) =
@@ -795,22 +1030,31 @@ fn run_cmd(args: &[String]) {
         eprintln!("run: --data-dir and --genesis are required");
         exit(2);
     };
-    // Devnet stays the default. The 64-validator devnet finalized on that
-    // transport, and the same command must keep producing the same run;
-    // opting into the production stack is an explicit act.
-    let transport = match arg_value(args, "--transport").as_deref() {
-        None | Some("devnet") => engine::Transport::Devnet,
-        Some("libp2p") => engine::Transport::Libp2p,
-        Some(other) => {
-            eprintln!("run: --transport must be `devnet` or `libp2p`, not `{other}`");
+    // The transport is decided by a pure function (`decide_transport`) and
+    // then ANNOUNCED. Nothing below re-derives it, and nothing silently drops
+    // a flag: what the operator asked for either becomes the plan or becomes
+    // a refusal with a reason.
+    let plan = match decide_transport(args) {
+        Ok(plan) => plan,
+        Err(e) => {
+            eprintln!("run: {e}");
             exit(2);
         }
     };
-    let listen = arg_value(args, "--listen").and_then(|s| s.parse::<u16>().ok());
-    if transport == engine::Transport::Devnet && listen.is_none() {
-        eprintln!("run: --listen <port> is required for the devnet transport");
-        exit(2);
+    // ONE LINE, NAMING THE TRANSPORT ACTUALLY IN EFFECT, BEFORE ANYTHING BINDS.
+    //
+    // The transport used to be a silent default: `--transport` absent meant
+    // devnet and the log never said so, which is how a libp2p node could run
+    // for a whole session "applying" and "finalizing" its own fork while its
+    // operator believed it was on Bloch. A node states which network layer it
+    // is on, in one greppable line, at the top of its log.
+    println!("transport: {}", plan.summary);
+    for w in &plan.warnings {
+        eprintln!("transport: WARNING {w}");
     }
+    let transport = plan.transport;
+    let listen = plan.listen;
+    let p2p_listen = plan.p2p_listen.clone();
     let csv = |name: &str| -> Vec<String> {
         arg_value(args, name)
             .map(|s| {
@@ -821,10 +1065,6 @@ fn run_cmd(args: &[String]) {
             })
             .unwrap_or_default()
     };
-    let mut p2p_listen = csv("--p2p-listen");
-    if transport == engine::Transport::Libp2p && p2p_listen.is_empty() {
-        p2p_listen.push("/ip4/0.0.0.0/tcp/16400".to_string());
-    }
     let stop_at_slot = arg_value(args, "--stop-at-slot").and_then(|s| s.parse::<u64>().ok());
 
     let ws = ws_boot::WsConfig {
@@ -851,7 +1091,7 @@ fn run_cmd(args: &[String]) {
         data_dir: PathBuf::from(data_dir),
         genesis_path: PathBuf::from(genesis_path),
         transport,
-        listen: listen.unwrap_or(0),
+        listen,
         // Loopback unless asked otherwise: the devnet transport authenticates
         // nothing, so a routable bind is a deliberate act plus a firewall.
         listen_addr: arg_value(args, "--listen-addr").unwrap_or_else(|| "127.0.0.1".to_string()),
@@ -945,4 +1185,195 @@ fn self_check() {
     // Migration design §5.1: the slot cadence everything descends from.
     assert_eq!(SLOT_DURATION_SECS, 30);
     assert_eq!(SLOTS_PER_EPOCH, 32);
+
+    // WIRE-NAMESPACE-REGISTRY.md §2 — the frame-byte namespace, and §7 gap 1,
+    // which records that nothing froze it.
+    //
+    // This is the one shared namespace in the tree with NO compiler
+    // diagnostic of any kind: `net.rs` matches `&FRAME_BLOCK` as a
+    // binding-by-reference (so `unreachable_patterns` never fires) and
+    // compares `FRAME_GET_BLOCKS` with a runtime `==`. Two constants with
+    // different names and the same value are invisible to the toolchain. Five
+    // collisions in this family were found in a single day in August 2026.
+    //
+    // Asserted here, at every `run`, and not only in a unit test, because the
+    // failure it guards is a chain split and the cost of the check is four
+    // comparisons at boot.
+    let frames: [(&str, u8); 4] = [
+        ("FRAME_BLOCK", net::FRAME_BLOCK),
+        ("FRAME_ATT", net::FRAME_ATT),
+        ("FRAME_GET_BLOCKS", net::FRAME_GET_BLOCKS),
+        ("FRAME_TX", net::FRAME_TX),
+    ];
+    for (i, (na, a)) in frames.iter().enumerate() {
+        assert_eq!(
+            *a,
+            (i + 1) as u8,
+            "{na} is not on its registered allocation (§2 of the wire namespace registry)"
+        );
+        for (nb, b) in frames.iter().skip(i + 1) {
+            assert_ne!(a, b, "frame bytes {na} and {nb} collide — silent chain split");
+        }
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    fn argv(s: &str) -> Vec<String> {
+        s.split_whitespace().map(String::from).collect()
+    }
+
+    /// **The default is not being changed, and this test is what says so.**
+    ///
+    /// The live Genesis-4 fleet runs the devnet mesh. If a future edit flips
+    /// the `None` arm, every node that restarts with an unchanged unit file
+    /// comes up on a transport nobody else speaks, finds no peers, and builds
+    /// its own chain while logging `applied` and `finalized`. That is not a
+    /// crash, so nothing else in the tree would catch it.
+    #[test]
+    fn no_transport_flag_still_means_devnet() {
+        let plan = decide_transport(&argv("--listen 16400")).expect("plan");
+        assert_eq!(plan.transport, engine::Transport::Devnet);
+        assert_eq!(plan.listen, 16400);
+        assert!(plan.p2p_listen.is_empty(), "the default binds no swarm");
+        assert!(plan.summary.contains("DEVNET"));
+        assert!(
+            plan.summary.contains("default"),
+            "the line must say the transport was defaulted, not chosen: {}",
+            plan.summary
+        );
+    }
+
+    /// `--transport devnet` and no flag reach the same transport, and the only
+    /// difference is that one line says it was chosen.
+    #[test]
+    fn naming_devnet_matches_the_default() {
+        let implicit = decide_transport(&argv("--listen 16400")).unwrap();
+        let explicit = decide_transport(&argv("--transport devnet --listen 16400")).unwrap();
+        assert_eq!(implicit.transport, explicit.transport);
+        assert_eq!(implicit.listen, explicit.listen);
+        assert_eq!(implicit.p2p_listen, explicit.p2p_listen);
+        assert!(!explicit.summary.contains("default"));
+    }
+
+    #[test]
+    fn libp2p_binds_a_swarm_and_no_mesh() {
+        let plan = decide_transport(&argv("--transport libp2p")).unwrap();
+        assert_eq!(plan.transport, engine::Transport::Libp2p);
+        assert_eq!(plan.listen, 0, "no devnet mesh means no devnet port");
+        assert_eq!(plan.p2p_listen, vec![DEFAULT_P2P_LISTEN.to_string()]);
+        assert!(plan.summary.contains("LIBP2P"));
+    }
+
+    /// The posture this whole change exists for: one process, both stacks.
+    #[test]
+    fn dual_binds_both_stacks() {
+        let plan = decide_transport(&argv(
+            "--transport dual --listen 16400 --p2p-listen /ip4/0.0.0.0/tcp/16500",
+        ))
+        .unwrap();
+        assert_eq!(plan.transport, engine::Transport::Dual);
+        assert_eq!(plan.listen, 16400);
+        assert_eq!(plan.p2p_listen, vec!["/ip4/0.0.0.0/tcp/16500".to_string()]);
+        assert!(plan.summary.contains("DUAL"));
+        assert!(plan.summary.contains("16400") && plan.summary.contains("16500"));
+    }
+
+    /// A dual node with no `--p2p-listen` still binds a swarm, on the same
+    /// default a libp2p-only node would use — half a dual node is not a
+    /// posture this function can produce.
+    #[test]
+    fn dual_defaults_the_swarm_address() {
+        let plan = decide_transport(&argv("--transport dual --listen 16400")).unwrap();
+        assert_eq!(plan.p2p_listen, vec![DEFAULT_P2P_LISTEN.to_string()]);
+    }
+
+    /// The flags that used to be parsed and silently dropped.
+    #[test]
+    fn devnet_refuses_libp2p_listener_flags() {
+        for line in [
+            "--transport devnet --listen 16400 --p2p-listen /ip4/0.0.0.0/tcp/16500",
+            "--transport devnet --listen 16400 --p2p-peer /ip4/1.2.3.4/tcp/16500",
+            // Including under the DEFAULT, which is where the mistake is
+            // easiest to make: no --transport at all, and a p2p flag that
+            // reads like it selected one.
+            "--listen 16400 --p2p-listen /ip4/0.0.0.0/tcp/16500",
+        ] {
+            let e = decide_transport(&argv(line)).expect_err(line);
+            assert!(e.contains("dual"), "the refusal must name the way out: {e}");
+        }
+    }
+
+    #[test]
+    fn libp2p_refuses_devnet_listener_flags() {
+        for line in [
+            "--transport libp2p --listen 16400",
+            "--transport libp2p --listen-addr 0.0.0.0",
+            "--transport libp2p --peers 1.2.3.4:16400",
+        ] {
+            let e = decide_transport(&argv(line)).expect_err(line);
+            assert!(e.contains("dual"), "{e}");
+        }
+    }
+
+    /// Dual accepts both halves' flags — that is the definition of the
+    /// posture, and the refusals above must not reach it.
+    #[test]
+    fn dual_accepts_both_halves_flags() {
+        decide_transport(&argv(
+            "--transport dual --listen 16400 --listen-addr 0.0.0.0 --peers 1.2.3.4:16400 \
+             --p2p-listen /ip4/0.0.0.0/tcp/16500 --p2p-peer /ip4/5.6.7.8/tcp/16500 \
+             --max-peers 64 --behind-proxy",
+        ))
+        .expect("dual is the posture that reads every one of these");
+    }
+
+    /// Tuning knobs warn instead of refusing: a deployment template that
+    /// carries `--behind-proxy` across a transport change must not turn into a
+    /// validator that will not boot.
+    #[test]
+    fn devnet_warns_but_boots_with_swarm_tuning_flags() {
+        let plan = decide_transport(&argv("--listen 16400 --max-peers 32 --behind-proxy")).unwrap();
+        assert_eq!(plan.transport, engine::Transport::Devnet);
+        assert_eq!(plan.warnings.len(), 2, "{:?}", plan.warnings);
+        assert!(plan.warnings.iter().any(|w| w.contains("--max-peers")));
+        assert!(plan.warnings.iter().any(|w| w.contains("--behind-proxy")));
+    }
+
+    #[test]
+    fn a_mesh_without_a_port_is_refused_on_both_arms() {
+        assert!(decide_transport(&argv("--transport devnet")).is_err());
+        assert!(decide_transport(&argv("--transport dual")).is_err());
+        // And a port that is not a port, rather than a silent bind to an
+        // ephemeral one nobody will dial.
+        assert!(decide_transport(&argv("--listen banana")).is_err());
+        assert!(decide_transport(&argv("--listen 0")).is_err());
+        assert!(decide_transport(&argv("--listen 99999")).is_err());
+    }
+
+    #[test]
+    fn an_unknown_transport_names_all_three() {
+        let e = decide_transport(&argv("--transport quic --listen 16400")).unwrap_err();
+        assert!(
+            e.contains("devnet") && e.contains("libp2p") && e.contains("dual"),
+            "{e}"
+        );
+    }
+
+    /// Every plan says which transport it is, in a line an operator can grep a
+    /// fleet's logs for.
+    #[test]
+    fn every_posture_announces_itself() {
+        for (line, want) in [
+            ("--listen 16400", "DEVNET"),
+            ("--transport devnet --listen 16400", "DEVNET"),
+            ("--transport libp2p", "LIBP2P"),
+            ("--transport dual --listen 16400", "DUAL"),
+        ] {
+            let plan = decide_transport(&argv(line)).unwrap();
+            assert!(plan.summary.contains(want), "{line} → {}", plan.summary);
+        }
+    }
 }

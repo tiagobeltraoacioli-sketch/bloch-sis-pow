@@ -176,7 +176,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender as EngineSender;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -637,6 +637,10 @@ pub struct Handle {
     /// This node's libp2p identity. Public information; printed at boot so an
     /// operator can build the `/p2p/<id>` multiaddr peers dial.
     pub peer_id: PeerId,
+    /// Peers connected right now, written by the swarm loop. Shared rather
+    /// than asked for, because the RPC thread must not block on the swarm's
+    /// command channel to answer a status question.
+    peers_live: Arc<AtomicUsize>,
 }
 
 impl Handle {
@@ -644,6 +648,13 @@ impl Handle {
     /// byte, so the engine's call sites are identical on both transports.
     pub fn broadcast(&self, frame: Vec<u8>) {
         let _ = self.cmd.send(Command::Broadcast(frame));
+    }
+
+    /// Peers with a live connection right now. `0` on a swarm that is bound
+    /// and that nobody has reached — the state a node on the wrong transport
+    /// sits in while its log says `applied` and `finalized`.
+    pub fn peer_count(&self) -> usize {
+        self.peers_live.load(Ordering::Acquire)
     }
 
     /// Report the engine's decision on a gossip message. A no-op for an
@@ -715,6 +726,8 @@ pub fn start(
 
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<io::Result<()>>();
+    let peers_live = Arc::new(AtomicUsize::new(0));
+    let peers_live_swarm = peers_live.clone();
 
     std::thread::Builder::new().name("bloch-p2p".into()).spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
@@ -728,7 +741,7 @@ pub fn start(
             match build_swarm(&keypair, &cfg) {
                 Ok(swarm) => {
                     let _ = ready_tx.send(Ok(()));
-                    run_swarm(swarm, cfg, cmd_rx, events, head_slot).await;
+                    run_swarm(swarm, cfg, cmd_rx, events, head_slot, peers_live_swarm).await;
                 }
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -738,7 +751,7 @@ pub fn start(
     })?;
 
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok(Handle { cmd: cmd_tx, peer_id }),
+        Ok(Ok(())) => Ok(Handle { cmd: cmd_tx, peer_id, peers_live }),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(io::Error::other("p2p thread died before it started")),
     }
@@ -835,6 +848,12 @@ struct Loop {
     /// which reads in the log exactly like a peer that cannot be reached.
     dialed: HashMap<Multiaddr, PeerId>,
     topics: Topics,
+    /// Distinct peers with at least one connection up right now, shared with
+    /// [`Handle::peer_count`] so the RPC can read it without touching the
+    /// swarm. Maintained on `ConnectionEstablished`/`ConnectionClosed` at the
+    /// `num_established` boundaries, so a peer holding the usual two
+    /// connections (both sides dialled) counts once.
+    peers_live: Arc<AtomicUsize>,
 }
 
 struct Topics {
@@ -876,6 +895,7 @@ async fn run_swarm(
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>,
     events: EngineSender<NetEvent>,
     head_slot: Arc<AtomicU64>,
+    peers_live: Arc<AtomicUsize>,
 ) {
     let mut st = Loop {
         events,
@@ -891,6 +911,7 @@ async fn run_swarm(
             attestations: IdentTopic::new(TOPIC_ATTESTATIONS),
             txs: IdentTopic::new(TOPIC_TXS),
         },
+        peers_live,
     };
 
     // A node's own listen address commonly appears in a peer list that was
@@ -1097,6 +1118,11 @@ fn handle_swarm_event(
             // just opened, so `== 1` is the first. ConnectionClosed below already
             // reads the same counter the other way round.
             if num_established.get() == 1 {
+                // First connection to this peer: one new peer, counted once.
+                // Counting connections instead would double every pair that
+                // dialled each other, and `--transport dual`'s whole claim is
+                // a number an operator can compare against a peer list.
+                st.peers_live.fetch_add(1, Ordering::AcqRel);
                 let after = st.head_slot.load(Ordering::Relaxed);
                 swarm.behaviour_mut().sync.send_request(
                     &peer_id,
@@ -1106,6 +1132,15 @@ fn handle_swarm_event(
         }
         SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. } => {
             if num_established == 0 {
+                // Last connection to this peer gone: symmetric with the
+                // `== 1` increment above. `saturating` in effect, via
+                // fetch_update, because a counter that wraps to usize::MAX
+                // would read as a fully connected node forever.
+                let _ = st.peers_live.fetch_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |n| Some(n.saturating_sub(1)),
+                );
                 st.peer_head.remove(&peer_id);
                 // The cause is the whole diagnostic value of this line. A bare
                 // "disconnected" is what made the Genesis-3 yamux stream-cap
