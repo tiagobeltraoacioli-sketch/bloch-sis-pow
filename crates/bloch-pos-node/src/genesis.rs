@@ -905,10 +905,32 @@ impl Manifest {
         })
     }
 
-    /// What genesis puts into existence: carried balances plus allocations.
+    /// Satoshis this manifest bonds into the genesis validator registry.
+    ///
+    /// These are coins. `CommittedState::genesis` writes each
+    /// [`ManifestValidator::stake_sat`] into a `ValidatorRecord::staked_sat`,
+    /// where it earns rewards, carries consensus weight and is slashable —
+    /// every property a satoshi in the eUTXO set has, minus spendability until
+    /// a withdrawal path exists. A supply check that counted only the outputs
+    /// would be counting the smaller half of the money.
+    ///
+    /// **This is the term that was missing, and 1,600,000 BLOCH went through
+    /// the hole.** Genesis-4 mainnet bonds 64 validators at 25,000 BLOCH each
+    /// while [`Self::genesis_issued_sat`] summed the carryover and the
+    /// allocations only, so the ceremony's arithmetic balanced with the
+    /// cohort's entire stake outside it — minted from nothing, at slot 0, by a
+    /// check that reported the manifest added up.
+    pub fn genesis_bonded_sat(&self) -> u128 {
+        self.validators.iter().map(|v| v.stake_sat).sum()
+    }
+
+    /// What genesis puts into existence: carried balances, plus allocations,
+    /// plus the stake it bonds ([`Self::genesis_bonded_sat`] — see there for
+    /// why bonded stake is issuance and not bookkeeping).
     pub fn genesis_issued_sat(&self) -> u128 {
         self.carryover.as_ref().map_or(0, |c| c.total_sat)
             + self.allocations.iter().map(|a| a.amount_sat).sum::<u128>()
+            + self.genesis_bonded_sat()
     }
 
     /// Refuse a manifest that does not add up.
@@ -932,9 +954,18 @@ impl Manifest {
         // cap disagree and one of them silently wins.
         let expected = t::GENESIS_ISSUED_SAT;
         if self.carryover.is_some() && issued != expected {
+            // The message names the bonded half explicitly, because that is
+            // the term this check gained on 2026-09-03 and the one a ceremony
+            // operator will not expect to see inside a supply error. A
+            // manifest that balanced before this line existed now fails by
+            // exactly the stake it bonds, and the fix is to fund the cohort
+            // out of an allocation bucket — not to widen the check back.
             return Err(format!(
-                "genesis issues {issued} sat; tokenomics §3 says {expected} \
+                "genesis issues {issued} sat (carryover + allocations + {} sat \
+                 bonded to {} genesis validators); tokenomics §3 says {expected} \
                  (difference {})",
+                self.genesis_bonded_sat(),
+                self.validators.len(),
                 issued.abs_diff(expected)
             ));
         }

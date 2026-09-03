@@ -1327,6 +1327,26 @@ pub struct EutxoSet {
     /// The subtree of `entry key -> value hash` leaves, one per entry, always
     /// exactly in step.
     tree: crate::state_root::Smt,
+    /// Running sum of every entry's `value`, in satoshis — the eUTXO half of
+    /// [`CommittedState::accounted_supply_sat`].
+    ///
+    /// **Why it is kept and not summed on demand.** The conservation invariant
+    /// runs on every block and needs this total twice (pre-state and
+    /// post-state). Summing costs a walk of 452,726 entries each time, which
+    /// is the exact O(set) per-block cost the incremental `tree` beside it
+    /// exists to have removed — adding it back under a different name would
+    /// undo that work.
+    ///
+    /// **Why it cannot drift.** It is maintained by `insert` and `remove`,
+    /// the same two mutators that maintain `tree`, and by the bulk
+    /// `FromIterator`; no third path can touch the entries. `total_sat()`
+    /// re-sums under `debug_assert`, so every test in this crate checks the
+    /// kept total against the entries it claims to summarise — the same
+    /// discipline `tree()` applies to the leaves.
+    ///
+    /// `u128`, not `u64`: a single output fits `u64`, sums of them do not
+    /// (`state_root::total_utxo_value` carries the same note).
+    total_sat: u128,
 }
 
 impl EutxoSet {
@@ -1348,7 +1368,17 @@ impl EutxoSet {
     fn insert(&mut self, entry: crate::state_root::EutxoEntry) {
         let (key, value_hash) = crate::state_root::eutxo_leaf(&entry);
         self.tree.insert(key, value_hash);
-        self.entries_mut().insert((entry.txid, entry.vout), entry);
+        let value = u128::from(entry.value);
+        let replaced = self.entries_mut().insert((entry.txid, entry.vout), entry);
+        // An overwrite REPLACES a value, it does not add one. Nothing in the
+        // transition writes the same outpoint twice today (a txid commits to
+        // its inputs, so a second creation of the same outpoint would need a
+        // collision), but a total that assumed so would be wrong exactly when
+        // that assumption broke, and silently.
+        if let Some(old) = replaced {
+            self.total_sat -= u128::from(old.value);
+        }
+        self.total_sat += value;
     }
 
     fn remove(&mut self, outpoint: &([u8; 32], u32)) {
@@ -1361,6 +1391,7 @@ impl EutxoSet {
         if let Some(entry) = self.entries_mut().remove(outpoint) {
             let (key, _) = crate::state_root::eutxo_leaf(&entry);
             self.tree.remove(&key);
+            self.total_sat -= u128::from(entry.value);
         }
     }
 
@@ -1374,6 +1405,17 @@ impl EutxoSet {
 
     fn values(&self) -> impl Iterator<Item = &crate::state_root::EutxoEntry> {
         self.entries.values()
+    }
+
+    /// Satoshis held by the set: the kept total, checked against a full
+    /// re-sum in debug builds for the reason `tree()` re-derives its leaves.
+    fn total_sat(&self) -> u128 {
+        debug_assert_eq!(
+            self.total_sat,
+            self.entries.values().map(|e| u128::from(e.value)).sum::<u128>(),
+            "the kept eUTXO total drifted from the entries: a mutator updated one half only"
+        );
+        self.total_sat
     }
 
     /// Only tests count the set; the consensus paths iterate it.
@@ -1431,9 +1473,11 @@ impl FromIterator<crate::state_root::EutxoEntry> for EutxoSet {
         // leaves — and therefore commit an identical root.
         let leaves: BTreeMap<[u8; 32], [u8; 32]> =
             entries.values().map(crate::state_root::eutxo_leaf).collect();
+        let total_sat = entries.values().map(|e| u128::from(e.value)).sum();
         EutxoSet {
             entries: std::sync::Arc::new(entries),
             tree: crate::state_root::Smt::from_leaf_map(&leaves),
+            total_sat,
         }
     }
 }
@@ -2824,6 +2868,107 @@ impl CommittedState {
         self.eutxos.values()
     }
 
+    /// Cumulative issuance this state commits to, in satoshis
+    /// (`state_root::TAG_ISSUED_SUPPLY`). The numerator of the hard cap and
+    /// the right-hand side of the conservation invariant below.
+    pub fn issued_sat(&self) -> u128 {
+        self.issued_sat
+    }
+
+    /// **Every satoshi this state says someone holds**, in satoshis: the sum
+    /// of every place a coin can sit in committed state.
+    ///
+    /// Five places, and the list is exhaustive by construction — a coin that
+    /// sat anywhere else could not be committed, because the state root has no
+    /// other value-bearing component (`state_root`'s tag list):
+    ///
+    /// 1. the unspent-output set (`TAG_EUTXO`) — spendable coins;
+    /// 2. bonded stake, `ValidatorRecord::staked_sat` summed over the whole
+    ///    registry, exited and slashed records included (an exited bond is
+    ///    still a bond until a withdrawal path pays it out, and there is no
+    ///    such path yet — see `staking::apply_exit`);
+    /// 3. delegated stake (`TAG_DELEGATION`) — bonded by someone who is not
+    ///    the operator, and just as real;
+    /// 4. fee rewards accrued during the open epoch and not yet compounded
+    ///    (`TAG_PENDING_FEE`) — coins that have left the eUTXO set and have
+    ///    not yet reached a bond, i.e. exactly the in-flight case an
+    ///    invariant that skipped it would misread as a mint;
+    /// 5. the delegator fee ledger (`TAG_DELEGATOR_FEE_REWARD`) — the
+    ///    delegators' settled share, which lives in a ledger rather than in
+    ///    their delegation records for the reason those docs give.
+    ///
+    /// `delegator_slash_losses` is deliberately **not** here: it records value
+    /// destroyed, not value held, and adding a burn ledger to a total of
+    /// holdings would cancel the very burn the invariant should see.
+    ///
+    /// # What this number is not
+    ///
+    /// It is not equal to [`Self::issued_sat`], and on Genesis-4 mainnet it
+    /// never was. Two standing reasons, both named rather than left to be
+    /// discovered:
+    ///
+    /// - **Burns are one-way and uncounted.** The base-fee share and the
+    ///   uncredited part of a slashing penalty are burned *by omission* —
+    ///   nobody is credited and no counter decrements (`issued_sat` is gross
+    ///   and monotone by design). So this total drifts BELOW issuance, by the
+    ///   amount ever burned, and that is correct.
+    /// - **The genesis cohort's bonds were never issued.** The mainnet
+    ///   manifest funds 64 validators with 25,000 BLOCH each — 1,600,000
+    ///   BLOCH — while `Manifest::genesis_issued_sat` sums only the carryover
+    ///   and the five allocation buckets. That stake was minted from nothing
+    ///   at slot 0, so this total opens ABOVE `GENESIS_ISSUED_SAT` by exactly
+    ///   that much. It cannot be corrected in place: `issued_sat` is committed
+    ///   state, and rewriting a live chain's genesis is a relaunch, not a
+    ///   patch. What is closed is the way it happened —
+    ///   `Manifest::check_supply` now counts validator bonds, so no future
+    ///   genesis can be signed with an unfunded cohort — and the way it could
+    ///   have grown, which is the invariant below.
+    ///
+    /// Both are why the invariant is a **delta** rule and a one-sided one, not
+    /// an equality against a constant: a fixed offset present in both the pre
+    /// and the post state cancels, and burns can only move the total the safe
+    /// way.
+    pub fn accounted_supply_sat(&self) -> u128 {
+        self.eutxos.total_sat()
+            + self.validators.values().map(|r| r.staked_sat).sum::<u128>()
+            + self.delegations.iter().map(|d| d.amount_sat).sum::<u128>()
+            + self.pending_fee_rewards.values().sum::<u128>()
+            + self.delegator_fee_rewards.values().sum::<u128>()
+    }
+
+    /// Does `post` hold no more than `pre` plus what the transition between
+    /// them was entitled to create? The supply-conservation invariant, as one
+    /// predicate.
+    ///
+    ///   `accounted(post) <= accounted(pre) + minted + unfunded_bonded`
+    ///
+    /// where `minted` is the rise in the committed issuance counter and
+    /// `unfunded_bonded` is what the block bonded without spending an output
+    /// (`Deposit`/`Delegate`; zero on every block a chain can currently
+    /// produce — `params::DEPOSIT_ACTIVATION_EPOCH` is `u64::MAX`).
+    ///
+    /// A predicate and not four lines inline in `compute_post_state` for one
+    /// reason: the failing side has to be testable. The passing side is
+    /// exercised by every block in this crate's suite, but a guard nobody has
+    /// ever seen refuse anything is a guard nobody knows is wired up — and
+    /// the states that would trip this one (a bond credited without advancing
+    /// `issued_sat`) cannot be reached through the transition, only
+    /// constructed. See `an_inflated_bond_is_refused_as_unconserved_supply`.
+    ///
+    /// `saturating_add` on the allowance: an overflow there would wrap the
+    /// ceiling to a small number and refuse honest blocks, so it saturates
+    /// upward. It cannot lose a violation — the terms are all bounded by
+    /// `TOTAL_SUPPLY_SAT`, which is 54% of `u64::MAX` and nowhere near
+    /// `u128`.
+    fn supply_conserved(pre: &Self, post: &Self, unfunded_bonded: u128) -> bool {
+        let minted = post.issued_sat.saturating_sub(pre.issued_sat);
+        let allowed = pre
+            .accounted_supply_sat()
+            .saturating_add(minted)
+            .saturating_add(unfunded_bonded);
+        post.accounted_supply_sat() <= allowed
+    }
+
     /// Sum of the values of every output locked to `script_hash`, in satoshis.
     ///
     /// `u128` and not `u64`: a single output fits u64 (the cap is 54.21% of
@@ -3557,6 +3702,9 @@ impl<V: SignatureVerifier> Transition<V> {
         let mut priority_fees: u128 = 0;
         let mut block_gas: u64 = 0;
         let mut block_bytes: u64 = 0;
+        // Satoshis this block bonds without spending an output. See the
+        // conservation check at step 11b.
+        let mut unfunded_bonded: u128 = 0;
         for (i, tx) in transactions.iter().enumerate() {
             let applied = match tx {
                 PosTransaction::SlashingEvidence(ev) => st
@@ -3581,6 +3729,26 @@ impl<V: SignatureVerifier> Transition<V> {
                     priority_fees += charge.priority_fee_sat;
                     block_gas = block_gas.saturating_add(charge.gas);
                     block_bytes = block_bytes.saturating_add(charge.tx_bytes);
+                    // Bonding that funds itself from nothing, measured where
+                    // it happens. `Deposit` and `Delegate` name an
+                    // `amount_sat` and spend no output, so an admitted one
+                    // raises the accounted total with no issuance behind it —
+                    // the conservation check below would otherwise have to
+                    // refuse the very messages the deposit rehearsal exists to
+                    // exercise. Naming the quantity is the honest form: it is
+                    // the supply gap the block created, it is zero on every
+                    // block any chain can currently produce (both arms are
+                    // refused while `DEPOSIT_ACTIVATION_EPOCH` is `u64::MAX`),
+                    // and when deposits are finally funded from the eUTXO set
+                    // this term goes to zero permanently and the invariant
+                    // tightens to an equality with no edit here.
+                    match tx {
+                        PosTransaction::Deposit { amount_sat, .. }
+                        | PosTransaction::Delegate { amount_sat, .. } => {
+                            unfunded_bonded = unfunded_bonded.saturating_add(*amount_sat);
+                        }
+                        _ => {}
+                    }
                 }
                 // The transfer rules keep their reason; everything else stays
                 // on the frozen `Transaction(i)` variant it always used.
@@ -3626,6 +3794,48 @@ impl<V: SignatureVerifier> Transition<V> {
         st.base_fee_millisat_per_gas = base_fee;
         st.block_gas_used = block_gas;
         st.block_tx_bytes = block_bytes;
+
+        // 11b. SUPPLY CONSERVATION — the invariant that says nothing minted
+        //      from nothing (2026-09-03). The hard cap at step 3c watches the
+        //      issuance COUNTER; this watches whether the counter and the
+        //      LEDGER agree, and they are different questions: a bug that
+        //      credited a bond without advancing `issued_sat` passes the cap
+        //      forever while inflating the supply on every block.
+        //
+        //      The rule, in one line: what committed state holds may grow by
+        //      at most what this transition minted, plus what it bonded
+        //      without funding.
+        //
+        //        accounted(post) <= accounted(pre) + minted + unfunded_bonded
+        //
+        //      `pre`, not the epoch-rolled `st` snapshot, on both sides — the
+        //      boundary roll is part of what is being judged, so an issuance
+        //      step inside `close_epoch` must be covered by this check and not
+        //      hidden behind its own starting point.
+        //
+        //      Why each term is exactly what it is, and why `<=`, is on
+        //      `TransitionError::SupplyNotConserved` and on
+        //      `accounted_supply_sat`; the short form is that burns are
+        //      one-way and uncounted (so the total may legitimately fall
+        //      behind issuance), and that `unfunded_bonded` is zero on every
+        //      block any chain can currently produce because
+        //      `DEPOSIT_ACTIVATION_EPOCH` refuses both arms at every epoch.
+        //
+        //      Costs one subtraction and two small map walks per block: the
+        //      eUTXO half is the total `EutxoSet` keeps incrementally, so this
+        //      does NOT reintroduce the O(452,726) per-block walk the kept
+        //      subtree exists to have removed.
+        //
+        //      NOT GATED, and this is deliberate. A flag day exists to stop a
+        //      mixed fleet disagreeing about a block one binary accepts and
+        //      another rejects; here there is no such block, because no
+        //      reachable transaction can make the left side exceed the right.
+        //      An old binary and a new one return the same verdict on every
+        //      block either can build — which is the property a flag day buys,
+        //      already held.
+        if !CommittedState::supply_conserved(pre, &st, unfunded_bonded) {
+            return Err(TransitionError::SupplyNotConserved);
+        }
 
         st.slot = header.slot;
         st.head = BlockId::of(header);
