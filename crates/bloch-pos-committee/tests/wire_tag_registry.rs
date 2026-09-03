@@ -737,6 +737,7 @@ fn the_exhaustive_match_agrees_with_the_table() {
             randao_commitment: [0u8; 32],
             withdrawal_credentials: vec![9u8; 4],
             commission_bps: 0,
+            proof_of_possession: vec![8u8; 4],
         },
         PosTransaction::Exit { validator: 3 },
         PosTransaction::Delegate {

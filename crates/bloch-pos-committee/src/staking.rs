@@ -314,6 +314,134 @@ pub fn validate_deposit(
 }
 
 // ---------------------------------------------------------------------------
+// The deposit as it actually reaches consensus (wire form)
+// ---------------------------------------------------------------------------
+
+/// Domain-separated SHA3-256 root a **wire** deposit's proof of possession
+/// signs.
+///
+/// ## Why this exists beside [`DepositTx::signing_root`]
+///
+/// [`DepositTx`] is the §7.1 shape: fixed-width key, fixed-width withdrawal
+/// address, no commission. The shape that reaches the state transition
+/// (`PosTransaction::Deposit`, wire tag `0x02`) is not that: its key and
+/// withdrawal credentials are variable-width `Vec<u8>`, and it carries a
+/// `commission_bps` §7.1 never had — a field that decides what an operator
+/// keeps from its delegators' rewards.
+///
+/// A root that omits a field leaves that field **malleable**: anyone relaying
+/// the transaction could rewrite it and the proof of possession would still
+/// verify. So this root covers every field of the wire form, and the two
+/// roots are deliberately different values for deliberately different
+/// messages — signing one never authorises the other.
+///
+/// Variable-width fields are length-prefixed (`u32` LE) before their bytes,
+/// so no two distinct deposits can serialise to the same preimage: without
+/// the prefix, a long key and a short one whose tail happened to match the
+/// next field would collide.
+pub fn wire_deposit_pop_root(
+    pubkey: &[u8],
+    amount_sat: u128,
+    randao_commitment: &[u8; 32],
+    withdrawal_credentials: &[u8],
+    commission_bps: u128,
+) -> [u8; 32] {
+    let mut h = Sha3_256::new();
+    h.update(DS_DEPOSIT);
+    h.update((pubkey.len() as u32).to_le_bytes());
+    h.update(pubkey);
+    h.update(amount_sat.to_le_bytes());
+    h.update(randao_commitment);
+    h.update((withdrawal_credentials.len() as u32).to_le_bytes());
+    h.update(withdrawal_credentials);
+    h.update(commission_bps.to_le_bytes());
+    h.finalize().into()
+}
+
+/// Validate a wire-form deposit's **key**: that it is the right shape, and
+/// that whoever submitted it holds the secret half.
+///
+/// ## Why the state transition has to do this, and why now
+///
+/// The committee-signature path was changed so that the key a vote is checked
+/// against is the one the state root commits — the registry record written by
+/// this very deposit (`attestation::KeyLookup`). That closed the defect where
+/// a deposit-added validator's genuine signature was reported as
+/// `BadSignature`. It also made this function load-bearing: whatever bytes a
+/// deposit puts in the registry are now, from that moment, the bytes every
+/// node will verify that validator's blocks and attestations against.
+///
+/// Without this check a deposit could commit:
+///
+/// - bytes that are not a hybrid key at all — the seat is drawn into
+///   committees and every signature against it fails shape parsing forever;
+/// - a key whose secret half the depositor does not hold (a rogue-key
+///   registration lifted from someone else's public key) — the seat can
+///   never be filled by anyone, and its stake is subtracted from the quorum
+///   the rest of the network has to reach.
+///
+/// Either one is a permanently unsignable committee seat: the record can
+/// never be removed (nothing deletes from the registry) and the key can never
+/// be changed (no production path mutates `ValidatorRecord::pubkey`). It is
+/// exactly the "dead weight subtracted from finality" the key-lookup fix
+/// exists to end, arriving through the other door.
+///
+/// ## The verifier is the same one that will judge its votes — on purpose
+///
+/// This takes [`crate::attestation::SignatureVerifier`], not
+/// [`HybridKeyVerifier`], and that is the point rather than a convenience.
+/// The proof of possession must be checked by the *exact predicate* that will
+/// later check this validator's attestations, because the property being
+/// proven is "this key can produce signatures this network accepts". Checking
+/// the PoP under a different composition than the attestation path uses is
+/// how a key that passes at deposit time and fails forever afterwards gets
+/// committed. The AND over both halves lives inside that trait's contract
+/// ("Must verify **both** halves of the hybrid suite"), and it is the same
+/// object the transition already holds.
+///
+/// ## Check order is cheapest-first, and the caller owns the flag day
+///
+/// Shape before the ~4.6 KB hybrid verification, the same DoS argument
+/// [`validate_deposit`] and `attestation::validate` make. The flag-day gate
+/// (`params::DEPOSIT_ACTIVATION_EPOCH`) is **not** consulted here: it is the
+/// caller's first check, read from committed state, and a second copy of a
+/// consensus gate is a second thing that can drift.
+///
+/// State-dependent rules the caller still owns, because they need the
+/// registry this function cannot see: the amount floor and the per-validator
+/// cap ([`validate_deposit`] takes the cap as a parameter for the same
+/// reason), and whether the key is already registered.
+pub fn validate_wire_deposit_key(
+    pubkey: &[u8],
+    amount_sat: u128,
+    randao_commitment: &[u8; 32],
+    withdrawal_credentials: &[u8],
+    commission_bps: u128,
+    proof_of_possession: &[u8],
+    verifier: &dyn crate::attestation::SignatureVerifier,
+) -> Result<(), DepositReject> {
+    // Shape first. `HYBRID_PK_BYTES` is the suite's geometry (§6.2), so a key
+    // of any other length is not "a key that fails to verify" — it is not a
+    // `SUITE_MLDSA65_FALCON1024` key at all, which is what `WrongSuite` says.
+    // The wire form carries no suite tag to check instead; its length IS the
+    // tag.
+    if pubkey.len() != HYBRID_PK_BYTES {
+        return Err(DepositReject::WrongSuite);
+    }
+    let root = wire_deposit_pop_root(
+        pubkey,
+        amount_sat,
+        randao_commitment,
+        withdrawal_credentials,
+        commission_bps,
+    );
+    if !verifier.verify_with_key(pubkey, &root, proof_of_possession) {
+        return Err(DepositReject::BadProofOfPossession);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Activation queue (§4.1.4)
 // ---------------------------------------------------------------------------
 
