@@ -1335,6 +1335,14 @@ pub fn chain_info_json(
     validators_total: usize,
     mempool: usize,
     blocks_known: usize,
+    // `devnet`, `libp2p` or `dual` — read from the live `net::Net`, never
+    // from the command line, so this field is what the process is on and not
+    // what it was asked for.
+    transport: &str,
+    // Peers per stack: `(devnet, libp2p)`. `None` for a stack this node does
+    // not run, `Some(0)` for one it runs and that nobody has reached. See
+    // `net::Net::peer_counts` for why those two are not the same answer.
+    peers: (Option<usize>, Option<usize>),
 ) -> Json {
     let fin = state.finality();
     let slot = state.slot();
@@ -1390,6 +1398,35 @@ pub fn chain_info_json(
         // (R1), so the node states it.
         ("wall_slot", Json::u(wall_slot)),
         ("behind_by_slots", Json::u(wall_slot.saturating_sub(slot))),
+        // WHICH NETWORK LAYER THIS NODE IS ON, AND WHETHER ANYONE IS ON IT
+        // WITH IT.
+        //
+        // The transport used to be invisible from outside the process. A node
+        // on the wrong one does not fail: it finds no peers, builds its own
+        // chain, and answers `getchaininfo` with a plausible height, a moving
+        // slot and a `finalized` epoch — the exact failure
+        // `docs/THIRD-PARTY-QUICKSTART.md` warns about under "Why not
+        // libp2p". `behind_by_slots` does not catch it either, because a node
+        // alone on its own fork is not behind; it is current, on nothing.
+        //
+        // `peers.devnet` / `peers.libp2p` are `null` for a stack this node
+        // does not run and a number for one it does, so a `dual` node is the
+        // only shape that answers with two numbers. That is what makes a
+        // rolling transport migration auditable from outside: an operator
+        // polls the fleet and sees who has crossed.
+        (
+            "transport",
+            Json::obj(vec![
+                ("name", Json::s(transport)),
+                (
+                    "peers",
+                    Json::obj(vec![
+                        ("devnet", peers.0.map_or(Json::Null, |n| Json::u(n as u64))),
+                        ("libp2p", peers.1.map_or(Json::Null, |n| Json::u(n as u64))),
+                    ]),
+                ),
+            ]),
+        ),
     ])
 }
 
