@@ -3904,9 +3904,16 @@ mod forkchoice_tests {
             .collect()
     }
 
-    /// The exposure this closes: a `Deposit` names an amount, carries no
-    /// signature, and spends no output. Until bonding is funded from the eUTXO
-    /// set, admitting one is admitting stake minted from nothing.
+    /// The exposure this closes: a `Deposit` names an amount and spends no
+    /// output. Until bonding is funded from the eUTXO set, admitting one is
+    /// admitting stake minted from nothing.
+    ///
+    /// It does now carry a signature — a proof of possession over its own
+    /// fields, checked by the transition (`staking::validate_wire_deposit`)
+    /// so that the key the state root commits is one its depositor can
+    /// actually sign under. That proves who owns the KEY; it proves nothing
+    /// about where the STAKE came from, which is the separate hole this
+    /// refusal covers and which only funded bonding closes.
     #[test]
     fn staking_messages_are_refused_until_bonding_is_funded() {
         let deposit = PosTransaction::Deposit {
@@ -3915,6 +3922,7 @@ mod forkchoice_tests {
             randao_commitment: [7u8; 32],
             withdrawal_credentials: vec![1u8; 20],
             commission_bps: 0,
+            proof_of_possession: Vec::new(),
         };
         let err = admissible(&deposit, 0).expect_err("a deposit must not be admitted");
         assert!(
@@ -5104,6 +5112,7 @@ mod transfer_v2_end_to_end {
             randao_commitment: [0x78; 32],
             withdrawal_credentials: vec![0x79; 32],
             commission_bps: 0,
+            proof_of_possession: Vec::new(),
         };
         node.mempool.insert(dep.canonical_bytes(), dep);
         node.sweep_mempool(30);
