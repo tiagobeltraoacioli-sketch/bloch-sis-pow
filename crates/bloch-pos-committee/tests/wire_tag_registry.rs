@@ -277,6 +277,18 @@ const TX_TAGS: &[(u8, Status)] = &[
                 heads: 8,
                 example: "refs/heads/dev4/writeoff-memo",
             },
+            // THIS TREE. `ExitV2` encodes to 0x08 here (see
+            // `frozen_variant_space`) and is NOT decodable here — the byte
+            // stays Contested and the decoder stays silent on it, so this is a
+            // fourth claim on the encode side only, recorded rather than
+            // resolved. It becomes `Released` when the founder assigns the
+            // byte, and the decoder arm lands in the same diff.
+            Claim {
+                name: "ExitV2 (ENCODE-ONLY — this tree refuses to decode it)",
+                tips: 1,
+                heads: 1,
+                example: "refs/heads/validators/B4-exit-auth-churn-v2",
+            },
         ]),
     ),
     (
@@ -483,6 +495,15 @@ fn frozen_variant_space(tx: &PosTransaction) -> u8 {
         PosTransaction::Delegate { .. } => 0x04,
         PosTransaction::SlashingEvidence(_) => 0x05,
         PosTransaction::TransferV2 { .. } => 0x06,
+        // ENCODED at 0x08, NOT DECODED at 0x08. This tree gained an `ExitV2`
+        // variant (authenticated voluntary exit + per-epoch churn cap) whose
+        // `canonical_bytes` writes 0x08, and deliberately did NOT add a
+        // decoder arm: 0x08 is still `Contested` in the table above, and
+        // `contested_transaction_tags_are_refused` is what holds that line.
+        // The arm exists here because the freeze has no wildcard — which is
+        // exactly the freeze working: the variant could not be added without
+        // this file being edited and the byte being stated out loud.
+        PosTransaction::ExitV2 { .. } => 0x08,
         // NO wildcard arm. Adding one defeats the entire freeze.
     }
 }

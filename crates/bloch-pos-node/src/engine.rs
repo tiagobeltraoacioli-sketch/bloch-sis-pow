@@ -3745,8 +3745,91 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
             "exits are not accepted: the Exit message is not authenticated, \
              so anyone could retire any validator irreversibly",
         ),
+        // The AUTHENTICATED replacement. Named explicitly rather than left to
+        // the catch-all below, which returns `Ok(())`: a variant that reaches
+        // `_` is a variant the mempool admits, and admitting a shape consensus
+        // refuses is how a proposer builds a block nobody accepts.
+        //
+        // The gate first, and pre-activation the refusal is unconditional —
+        // exactly the `TransferV2` arm's discipline. `EXIT_AUTH_ACTIVATION_EPOCH`
+        // is `u64::MAX`, so this refuses at every epoch any chain can reach,
+        // which is what keeps this node's mempool in step with the transition
+        // arm it fronts for (`apply_exit_v2`).
+        //
+        // What this arm CANNOT do, stated rather than left to be discovered:
+        // verify the hybrid signature. The signature is over the validator's
+        // REGISTERED key, resolved from `pubkey_hash` through the committed
+        // `pubkey_index`, and this function is deliberately stateless (see its
+        // doc comment) — it holds no registry to resolve against. The
+        // authorisation check therefore lives in consensus and only in
+        // consensus, which is the right place for it: a mempool verdict is
+        // relay policy, re-judged by the transition against the block's
+        // pre-state. Post-activation this arm's job is the structural half —
+        // an exit carrying no signature bytes at all can never verify, so
+        // relaying one is free propagation of garbage every proposer then pays
+        // to drop.
+        PosTransaction::ExitV2 { epoch, signature, .. } => {
+            if wall_epoch < bloch_pos_committee::params::EXIT_AUTH_ACTIVATION_EPOCH {
+                return Err(
+                    "authenticated exits (tag 0x08) are not active: the format ships \
+                     behind a flag day (EXIT_AUTH_ACTIVATION_EPOCH) that this chain has \
+                     not reached, and the wire byte is not assigned",
+                );
+            }
+            exit_v2_structural_rules(*epoch, signature, wall_epoch)
+        }
         _ => Ok(()),
     }
+}
+
+/// The structural half of admitting an [`PosTransaction::ExitV2`], split out
+/// of `admissible` so it can be TESTED.
+///
+/// It cannot be tested through `admissible` itself, and that is not an
+/// oversight in the test: `EXIT_AUTH_ACTIVATION_EPOCH` is `u64::MAX`, so the
+/// flag-day check in front of these rules refuses at every epoch any chain can
+/// reach, and no argument to `admissible` ever gets past it. Rules that only
+/// run after a flag day are exactly the rules that get to the flag day
+/// unexercised. Extracting them makes them a pure function of three values and
+/// therefore checkable today, on the tree the fleet runs, without arming
+/// anything.
+///
+/// Both rules mirror consensus (`CommittedState::apply_exit_v2`) rather than
+/// inventing relay policy:
+///
+/// - an exit with no signature bytes authorises nothing and can never verify,
+///   so relaying it is free propagation of garbage every proposer pays to drop;
+/// - the signed epoch must EQUAL the caller's epoch, because consensus binds
+///   the signed epoch to the inclusion epoch. Without this, a captured exit —
+///   and an exit is public the moment it is gossiped — would circulate for
+///   every future proposer to try, forever.
+///
+/// What it deliberately does NOT do is check the signature. That needs the
+/// validator's REGISTERED key, resolved through the committed `pubkey_index`,
+/// and this path is stateless by design (see `admissible`'s docs). The
+/// authorisation lives in consensus and only in consensus, which is the right
+/// place for it: a mempool verdict is relay policy, re-judged by the
+/// transition against the block's pre-state.
+fn exit_v2_structural_rules(
+    epoch: u64,
+    signature: &[u8],
+    wall_epoch: u64,
+) -> Result<(), &'static str> {
+    if signature.is_empty() {
+        return Err("authenticated exit carries no signature — nothing authorises it");
+    }
+    // Equality, matching consensus exactly, and NOT a window: a one-epoch
+    // grace here would relay messages consensus refuses, which is the
+    // mempool/consensus mismatch this arm exists to avoid. A sender caught by
+    // an epoch boundary re-signs for the epoch it is now in; an exit is not
+    // time-critical and the signature is the sender's to reissue.
+    if epoch != wall_epoch {
+        return Err(
+            "authenticated exit is signed for a different epoch than the one it would be \
+             included in; consensus binds the two, so this can never apply",
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4300,6 +4383,74 @@ mod admission_authorisation {
             .is_ok(),
             "a V1 transfer must be admitted identically after the V2 flag day"
         );
+    }
+
+    /// The AUTHENTICATED exit is refused by the mempool too, at every epoch a
+    /// chain can reach — and refused by NAME, not by falling through to the
+    /// catch-all.
+    ///
+    /// That distinction is the whole test. `admissible` ends in `_ => Ok(())`,
+    /// so a new `PosTransaction` variant is admitted by default; a variant
+    /// consensus refuses (`EXIT_AUTH_ACTIVATION_EPOCH` is `u64::MAX`, so
+    /// `apply_exit_v2`'s gate never opens) but the mempool relays would be a
+    /// proposer building blocks nobody accepts. The `u64::MAX - 1` case is the
+    /// point: no reachable epoch admits it.
+    #[test]
+    fn authenticated_exits_are_refused_until_the_flag_day() {
+        let tx = PosTransaction::ExitV2 {
+            pubkey_hash: [9u8; 32],
+            epoch: 0,
+            signature: vec![1u8; 64],
+        };
+        for epoch in [0u64, 1, 800, 1400, u64::MAX - 1] {
+            let err = admissible(&tx, epoch)
+                .expect_err("ExitV2 is consensus-invalid at every reachable epoch");
+            assert!(
+                err.contains("EXIT_AUTH_ACTIVATION_EPOCH"),
+                "the refusal must name the gate that causes it, got: {err}"
+            );
+        }
+        // And the legacy message stays refused beside it — closing one door
+        // must not open the other.
+        assert!(
+            admissible(&PosTransaction::Exit { validator: 0 }, 0).is_err(),
+            "the unauthenticated Exit must remain refused"
+        );
+    }
+
+    /// The rules BEHIND the flag day, exercised today.
+    ///
+    /// `authenticated_exits_are_refused_until_the_flag_day` proves the gate
+    /// shuts the door; it cannot prove anything about what is on the other
+    /// side of it, because nothing gets there. That is the standing hazard
+    /// with a gated feature: the code that only runs after a flag day is the
+    /// code that arrives at the flag day never having run. So the structural
+    /// rules are a pure function and are tested as one.
+    ///
+    /// The epoch case is the load-bearing one. Consensus binds the signed
+    /// epoch to the inclusion epoch (`apply_exit_v2`), so an exit signed for
+    /// any other epoch is dead on arrival — and relaying it keeps a captured,
+    /// publicly gossiped retirement circulating for every future proposer to
+    /// try. Both directions are pinned: stale and premature.
+    #[test]
+    fn the_structural_exit_rules_bind_the_signature_and_the_epoch() {
+        let sig = vec![1u8; 64];
+
+        assert_eq!(exit_v2_structural_rules(7, &sig, 7), Ok(()), "the genuine shape is admitted");
+
+        assert!(
+            exit_v2_structural_rules(7, &[], 7).is_err(),
+            "an exit with no signature bytes authorises nothing and can never verify",
+        );
+
+        for (signed_for, wall) in [(6u64, 7u64), (8, 7), (0, 1_400), (u64::MAX, 7)] {
+            let err = exit_v2_structural_rules(signed_for, &sig, wall)
+                .expect_err("only the inclusion epoch's own signature may be relayed");
+            assert!(
+                err.contains("epoch"),
+                "the refusal must name the binding that causes it, got: {err}",
+            );
+        }
     }
 
     #[test]

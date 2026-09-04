@@ -401,8 +401,60 @@ pub enum PosTransaction {
         /// priced by delegators.
         commission_bps: u128,
     },
-    /// Voluntary exit (§7.2). Signature already checked at admission.
+    /// Voluntary exit (§7.2) — **UNAUTHENTICATED**, and retired at
+    /// [`crate::params::EXIT_AUTH_ACTIVATION_EPOCH`] in favour of
+    /// [`Self::ExitV2`].
+    ///
+    /// The doc line this replaces read "Signature already checked at
+    /// admission." No signature exists to check: the message is a registry
+    /// index and nothing else, the arm in `apply_transaction` never touches a
+    /// verifier, and `bloch-pos-node`'s `admissible` refuses the message
+    /// outright *because* of that — which is mempool policy, not consensus, so
+    /// a modified proposer can still put one in a block today.
+    ///
+    /// Below the flag day this arm behaves exactly as it always has (it is the
+    /// control); at and above it, it is invalid.
     Exit { validator: u32 },
+    /// Authenticated voluntary exit (§7.2) — consensus-INVALID until
+    /// [`crate::params::EXIT_AUTH_ACTIVATION_EPOCH`], which is `u64::MAX`.
+    ///
+    /// What it adds over [`Self::Exit`], and both are necessary:
+    ///
+    /// 1. **A hybrid signature verified IN CONSENSUS** against the pubkey the
+    ///    registry committed at registration — never a key carried in the
+    ///    message — over [`crate::staking::ExitTx::signing_root`] (`DS_EXIT`
+    ///    domain, one definition, shared with the reference validator). The
+    ///    signed `epoch` must EQUAL the inclusion epoch, so a captured exit
+    ///    message cannot be replayed at a time its signer never chose.
+    /// 2. **A per-epoch churn cap** ([`crate::staking::MAX_EXITS_PER_EPOCH`]).
+    ///    Authentication alone still lets one operator holding many keys
+    ///    retire the roster in a single block; see that constant's docs.
+    ///
+    /// # The wire byte is claimed but NOT DECODED
+    ///
+    /// `canonical_bytes` writes `0x08`. The decoder has **no `0x08` arm** and
+    /// deliberately keeps returning [`TxDecodeError::UnknownTag`]: that byte
+    /// is CONTESTED across live lineages — `SignedExit`, `Withdraw` and
+    /// `ExitV2` all claim it (`tests/wire_tag_registry.rs`, and the two
+    /// meanings are semantically incompatible, so whichever lands second
+    /// splits the chain at decode). Assigning it is the founder's, and the
+    /// registry test refuses contested bytes until they are assigned.
+    ///
+    /// So this variant is, today, encode-and-apply only: the rules are
+    /// written, compiled, tested and wired into the production dispatcher,
+    /// and nothing on the wire can reach them. Closing that last gap is a
+    /// one-line decoder arm plus a `Contested` → `Released` edit, and both
+    /// wait on the same ruling.
+    ExitV2 {
+        /// SHA3-256 of the exiting validator's **registered** pubkey. The
+        /// index is resolved from this through `pubkey_index`, so the message
+        /// names an identity rather than a position.
+        pubkey_hash: [u8; 32],
+        /// Epoch the exit was signed for; must equal the inclusion epoch.
+        epoch: u64,
+        /// Hybrid signature (both halves) over the `DS_EXIT` signing root.
+        signature: Vec<u8>,
+    },
     /// Bond delegated stake behind an operator.
     Delegate {
         delegator: u32,
@@ -670,6 +722,17 @@ impl PosTransaction {
                 b.push(0x03);
                 b.extend_from_slice(&validator.to_le_bytes());
             }
+            PosTransaction::ExitV2 { pubkey_hash, epoch, signature } => {
+                // 0x08. Same encoding rules as every other tag: fixed-width
+                // LE for the scalars, length-prefixed for the one
+                // variable-length field, so no two byte strings decode to one
+                // transaction. See the variant's docs for why the DECODER
+                // does not answer this byte yet.
+                b.push(0x08);
+                b.extend_from_slice(pubkey_hash);
+                b.extend_from_slice(&epoch.to_le_bytes());
+                put(&mut b, signature);
+            }
             PosTransaction::Delegate { delegator, validator, amount_sat, eligible } => {
                 b.push(0x04);
                 b.extend_from_slice(&delegator.to_le_bytes());
@@ -780,6 +843,17 @@ impl PosTransaction {
                     other => return Err(TxDecodeError::NotCanonical(other)),
                 },
             },
+            // NO `0x08` ARM, ON PURPOSE. `PosTransaction::ExitV2` ENCODES to
+            // 0x08 (`canonical_bytes`), and this decoder still answers
+            // `UnknownTag(0x08)`. The byte is contested across live lineages
+            // — `SignedExit`, `Withdraw` and `ExitV2` each claim it, and the
+            // first two are semantically incompatible with the third, so
+            // whichever landed second would split the chain at decode. The
+            // assignment is the founder's; `tests/wire_tag_registry.rs`
+            // refuses contested bytes until it is made, and adding an arm here
+            // is what would make that test go red. Until then no wire byte can
+            // reach the ExitV2 rules, which is the honest state of this
+            // feature and not an oversight.
             0x05 => return Err(TxDecodeError::EvidenceNotDecodable),
             0x06 => {
                 // Purely structural, like tag 0x01: counts come from untrusted
@@ -2077,6 +2151,23 @@ impl CommittedState {
         forced || epoch >= crate::params::DEPOSIT_ACTIVATION_EPOCH
     }
 
+    /// Is the AUTHENTICATED exit rule active in `epoch`?
+    ///
+    /// One reader for one gate, so the three sites it governs — legacy `Exit`
+    /// becoming invalid, `ExitV2` becoming valid, and the
+    /// [`staking::MAX_EXITS_PER_EPOCH`] churn cap starting to bind — can never
+    /// drift apart into a chain where the old message is dead and the new one
+    /// is not yet alive. `epoch` is the caller's `self.epoch`: committed
+    /// state, rolled to the judged block's own `epoch_of(header.slot)`, never
+    /// a clock.
+    fn exit_auth_active(epoch: u64) -> bool {
+        #[cfg(test)]
+        let forced = crate::params::rehearsal::exit_auth_gate_forced_open();
+        #[cfg(not(test))]
+        let forced = false;
+        forced || epoch >= crate::params::EXIT_AUTH_ACTIVATION_EPOCH
+    }
+
     fn apply_transaction(
         &mut self,
         tx: &PosTransaction,
@@ -2201,6 +2292,17 @@ impl CommittedState {
                 Ok(free)
             }
             PosTransaction::Exit { validator } => {
+                // THE FLAG-DAY GATE, FIRST — same discipline as the Deposit
+                // and TransferV2 arms, and read from `self.epoch`: COMMITTED
+                // state, rolled to this block's epoch by compute_post_state's
+                // boundary walk, never node-local. At and above
+                // EXIT_AUTH_ACTIVATION_EPOCH the unauthenticated message is
+                // dead and `ExitV2` is the only voluntary exit; the constant
+                // is `u64::MAX`, so today this never fires and everything
+                // below is byte-for-byte the behaviour that shipped.
+                if Self::exit_auth_active(self.epoch) {
+                    return Err(TxReject::StakingNotActive);
+                }
                 let Some(rec) = self.validators.get_mut(validator) else {
                     return Err(TxReject::StakingRule);
                 };
@@ -2220,6 +2322,14 @@ impl CommittedState {
                 rec.withdrawable_epoch =
                     exit_epoch.saturating_add(staking::WITHDRAWAL_DELAY_EPOCHS);
                 Ok(free)
+            }
+            PosTransaction::ExitV2 { pubkey_hash, epoch, signature } => {
+                // The gate first, before the registry is consulted and long
+                // before a hybrid verification is paid for.
+                if !Self::exit_auth_active(self.epoch) {
+                    return Err(TxReject::StakingNotActive);
+                }
+                self.apply_exit_v2(pubkey_hash, *epoch, signature, verifier).map(|()| free)
             }
             PosTransaction::Delegate { delegator, validator, amount_sat, eligible } => {
                 // Same gate, same constant, and it must be the same constant:
@@ -2261,6 +2371,147 @@ impl CommittedState {
             // beats silently accepting unverified evidence.
             PosTransaction::SlashingEvidence(_) => Err(TxReject::MisroutedEvidence),
         }
+    }
+
+    /// How many voluntary exits have already been included in the epoch this
+    /// state is open on — the input to the [`staking::MAX_EXITS_PER_EPOCH`]
+    /// churn budget.
+    ///
+    /// # Derived from the committed registry, never counted into a new field
+    ///
+    /// Both exit arms set `exit_epoch = self.epoch + EXIT_DELAY_EPOCHS`, so
+    /// "was this exit included during epoch E" is already written down in
+    /// state: it is exactly the records whose `exit_epoch` equals
+    /// `E + EXIT_DELAY_EPOCHS`. Counting them is a pure function of committed
+    /// data, which buys three things a counter field would not:
+    ///
+    /// - **no state-root change.** A new `CommittedState` field that the root
+    ///   commits to would re-key leaves on replay and split a mixed fleet
+    ///   *before* the flag day, which is the one thing the gate exists to
+    ///   prevent. A field the root did NOT commit to would be worse: consensus
+    ///   reading uncommitted state is the shape of the 2026-08-08
+    ///   `expected_bits` fork.
+    /// - **no reset to get wrong.** There is no epoch-boundary bookkeeping to
+    ///   forget in `close_epoch`; the window moves because `self.epoch` moved.
+    /// - **agreement by construction.** Two nodes with the same registry
+    ///   compute the same number, in any order, from any replay path.
+    ///
+    /// Slashing does NOT consume this budget: `apply_slashing_evidence` sets
+    /// `exit_epoch = self.epoch` (no delay), which cannot equal
+    /// `self.epoch + EXIT_DELAY_EPOCHS` while `EXIT_DELAY_EPOCHS` is non-zero.
+    /// A forced ejection is not a voluntary exit and must not be able to
+    /// exhaust the voluntary budget — nor to be blocked by it.
+    fn voluntary_exits_this_epoch(&self) -> usize {
+        let marker = self.epoch.saturating_add(staking::EXIT_DELAY_EPOCHS);
+        // The `!= u64::MAX` half is not redundant. `u64::MAX` is the registry's
+        // sentinel for "never exited", and `saturating_add` makes the marker
+        // equal that sentinel once `self.epoch` is within EXIT_DELAY_EPOCHS of
+        // the top — at which point a bare equality would count every ACTIVE
+        // validator as having exited this epoch and wedge the budget shut
+        // forever. Unreachable arithmetic, guarded anyway: an epoch counter is
+        // exactly the kind of thing that is unreachable until it is not, and
+        // the guard costs one comparison on a 64-entry map.
+        self.validators
+            .values()
+            .filter(|r| r.exit_epoch != u64::MAX && r.exit_epoch == marker)
+            .count()
+    }
+
+    /// Apply an authenticated voluntary exit. Seam below
+    /// [`crate::params::EXIT_AUTH_ACTIVATION_EPOCH`]; the caller holds the
+    /// gate, this function holds the rules.
+    ///
+    /// # Where this runs — the whole chain, written down
+    ///
+    /// `Transition::apply_block` → `compute_post_state` step 10 → the
+    /// transaction loop's `_ => st.apply_transaction(..)` → the `ExitV2` arm →
+    /// here. There is no second dispatcher and no parallel validator: step 10
+    /// names only `SlashingEvidence` and routes everything else through
+    /// `apply_transaction`, so this is the ONE path a block's transactions
+    /// take on every node. `exit_v2_transitions_through_apply_block_and_is_inert_below_the_gate`
+    /// drives a real signed block down it rather than asserting it here, for
+    /// the reason `derive::validate_block` exists as a warning: a rule
+    /// exercised only at its own seam can be correct and unreachable at once.
+    ///
+    /// And it is reachable in exactly the sense that matters and no further.
+    /// **Nothing on the fleet executes this today**, and nothing can: the gate
+    /// is `u64::MAX`, so the caller refuses before this function is entered,
+    /// and the wire byte is unassigned so no gossiped message could carry an
+    /// `ExitV2` even if it were open. Arming is the founder's, and it has an
+    /// unmet precondition. What is claimed here is narrower and checkable:
+    /// spec-correct, composed with the real handler, and tested under a
+    /// rehearsal gate, so that WHEN it is armed it is right.
+    ///
+    /// Check order is cheapest-first, the discipline the whole crate keeps:
+    /// epoch equality, identity resolution, lifecycle, the churn budget, and
+    /// only then the one hybrid verification (~145 µs). An attacker spamming
+    /// exits for validators that are already exiting, or exits past the
+    /// epoch's budget, pays arithmetic and a `BTreeMap` lookup — never a
+    /// signature check.
+    ///
+    /// Every check runs before any mutation, so a refused exit leaves the
+    /// state untouched.
+    fn apply_exit_v2(
+        &mut self,
+        pubkey_hash: &[u8; 32],
+        epoch: u64,
+        signature: &[u8],
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<(), TxReject> {
+        // Equality, not `<=`: `staking::validate_exit` refuses only FUTURE
+        // epochs because it is the reference validator and does not know when
+        // inclusion happens. Consensus does, so it can be stricter, and must
+        // be — a message signed for epoch E and included at E+900 would start
+        // the withdrawal clock at a time the signer never agreed to, and would
+        // make a captured exit permanently replayable.
+        if epoch != self.epoch {
+            return Err(TxReject::StakingRule);
+        }
+        // Identity, not position: the message names a key hash, and the
+        // registry resolves it. `pubkey_index` is injective and permanent
+        // (indices are never reused, records are never removed), so this
+        // cannot resolve to a different validator on a different node.
+        let Some(index) = self.pubkey_index.get(pubkey_hash).copied() else {
+            return Err(TxReject::StakingRule);
+        };
+        let Some(rec) = self.validators.get(&index) else {
+            return Err(TxReject::StakingRule);
+        };
+        // Same lifecycle rules as the legacy arm — active, not already
+        // exiting, not slashed. Slashing owns its own ejection path and must
+        // not share the voluntary one, or a slashed validator could reset its
+        // withdrawal clock.
+        if rec.slashed || rec.activation_epoch > self.epoch || rec.exit_epoch != u64::MAX {
+            return Err(TxReject::StakingRule);
+        }
+        // THE CHURN BUDGET. Deliberately before the signature: it is the rule
+        // that survives every key being genuine, so it must also be the rule
+        // an attacker cannot make expensive to enforce.
+        if self.voluntary_exits_this_epoch() >= staking::MAX_EXITS_PER_EPOCH {
+            return Err(TxReject::StakingRule);
+        }
+        // THE AUTHORISATION, LAST. Against `rec.pubkey` — the key the registry
+        // committed at registration — and over the shared `DS_EXIT` root, so
+        // this crate has exactly one definition of what an exit signature
+        // covers. A key carried in the message would authorise nothing: the
+        // signer would be choosing their own public key.
+        let root = staking::ExitTx {
+            pubkey_hash: *pubkey_hash,
+            epoch,
+            signature: Vec::new(),
+        }
+        .signing_root();
+        if !verifier.verify_with_key(&rec.pubkey, &root, signature) {
+            return Err(TxReject::StakingRule);
+        }
+        // Mutation only after every check has passed.
+        let Some(rec) = self.validators.get_mut(&index) else {
+            return Err(TxReject::StakingRule);
+        };
+        let exit_epoch = self.epoch.saturating_add(staking::EXIT_DELAY_EPOCHS);
+        rec.exit_epoch = exit_epoch;
+        rec.withdrawable_epoch = exit_epoch.saturating_add(staking::WITHDRAWAL_DELAY_EPOCHS);
+        Ok(())
     }
 
     /// Authorise, price and apply one value transfer against the committed
@@ -3787,6 +4038,36 @@ mod tx_codec_tests {
                 tip_millisat_per_gas: 0,
             },
         ]
+    }
+
+    /// `ExitV2` ENCODES to `0x08` and this tree DOES NOT DECODE `0x08`.
+    ///
+    /// Both halves are deliberate and both are pinned here, because "the
+    /// decoder happens not to know this byte yet" and "the decoder must not
+    /// know this byte yet" look identical in a diff. `0x08` is contested
+    /// across live lineages (`SignedExit`, `Withdraw`, `ExitV2` — see
+    /// `tests/wire_tag_registry.rs`); two of those meanings are incompatible,
+    /// so whichever landed second would split the chain at decode. The byte is
+    /// the founder's to assign, and until it is assigned an authenticated exit
+    /// cannot travel on the wire at all.
+    ///
+    /// Deliberately NOT in `samples()`: `canonical_bytes_round_trips` requires
+    /// every sample to decode, which is exactly what this one must not do.
+    #[test]
+    fn exit_v2_encodes_to_an_unassigned_byte_it_cannot_decode() {
+        let tx = PosTransaction::ExitV2 {
+            pubkey_hash: [0xAB; 32],
+            epoch: 7,
+            signature: vec![0xCD; 96],
+        };
+        let bytes = tx.canonical_bytes();
+        assert_eq!(bytes[0], 0x08, "the encoder claims 0x08");
+        assert_eq!(
+            PosTransaction::from_canonical_bytes(&bytes),
+            Err(TxDecodeError::UnknownTag(0x08)),
+            "0x08 is CONTESTED: adding a decoder arm before the founder assigns \
+             the byte is what splits the chain, and is what this pins against",
+        );
     }
 
     #[test]
@@ -5338,6 +5619,607 @@ mod tests {
             u64::MAX,
             "arming this reopens unfunded bonding on all nodes; read the test docs",
         );
+    }
+
+    // -- EXIT_AUTH_ACTIVATION_EPOCH -----------------------------------------
+
+    /// TRIPWIRE. `EXIT_AUTH_ACTIVATION_EPOCH` must stay `u64::MAX`.
+    ///
+    /// Arming it retires the legacy `Exit` message on every node — and puts
+    /// nothing in its place, because `ExitV2`'s wire byte (`0x08`) is still
+    /// contested and this tree's decoder refuses it. Voluntary exit would stop
+    /// existing rather than become authenticated. Whoever arms it has to
+    /// delete this test first, and read this while doing so.
+    #[test]
+    fn exit_auth_gate_is_inert() {
+        assert_eq!(
+            crate::params::EXIT_AUTH_ACTIVATION_EPOCH,
+            u64::MAX,
+            "arming this retires legacy Exit while ExitV2 is still undecodable; read the docs",
+        );
+    }
+
+    /// The unauthenticated message is STILL VALID today. This is the control
+    /// half of the flag day and it is an assertion about the network as it
+    /// runs, not a wish: below the gate `Exit` applies exactly as it always
+    /// did, so a fleet that is mid-rollout cannot disagree about a block.
+    #[test]
+    fn below_the_gate_the_legacy_exit_still_applies_and_exit_v2_does_not() {
+        let (_t, g, _c) = setup(4);
+
+        let mut probe = g.clone();
+        assert!(
+            probe
+                .apply_transaction(
+                    &PosTransaction::Exit { validator: 0 },
+                    0,
+                    fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                    &OkVerifier,
+                )
+                .is_ok(),
+            "the control must not move: legacy Exit applies below the flag day",
+        );
+
+        let exit = signed_exit(0, 0);
+        let mut probe = g.clone();
+        assert_eq!(
+            probe.apply_transaction(
+                &exit,
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &ToyVerifier,
+            ),
+            Err(TxReject::StakingNotActive),
+            "a perfectly signed ExitV2 is still consensus-INVALID below the flag day",
+        );
+    }
+
+    /// Build the signed exit a validator would actually send, under
+    /// [`ToyVerifier`]'s one-key-one-root rule.
+    fn signed_exit(validator: u8, epoch: u64) -> PosTransaction {
+        let pk = vec![validator; 8];
+        let pubkey_hash: [u8; 32] = Sha3_256::digest(&pk).into();
+        let root = staking::ExitTx { pubkey_hash, epoch, signature: Vec::new() }.signing_root();
+        PosTransaction::ExitV2 { pubkey_hash, epoch, signature: toy_sign(&pk, &root) }
+    }
+
+    /// THE AUTHENTICATION, above the gate. `ToyVerifier`, never `OkVerifier`:
+    /// the whole point of `ExitV2` over the legacy message is that a signature
+    /// is checked, and a verifier that accepts everything would pass this test
+    /// on an implementation that skipped the check entirely.
+    #[test]
+    fn exit_v2_requires_the_registered_validators_own_signature() {
+        let _guard = crate::params::rehearsal::exit_auth_gate_open_guard();
+        let (_t, g, _c) = setup(4);
+
+        // The genuine article applies.
+        let mut probe = g.clone();
+        assert!(
+            probe
+                .apply_transaction(
+                    &signed_exit(1, 0),
+                    0,
+                    fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                    &ToyVerifier,
+                )
+                .is_ok(),
+            "a correctly signed exit for a registered validator must apply",
+        );
+        assert_eq!(
+            probe.validator_record(1).unwrap().exit_epoch,
+            staking::EXIT_DELAY_EPOCHS,
+            "the authenticated path schedules the same duty stop as the legacy one",
+        );
+
+        // Validator 2's own key, over validator 1's message: the signature is
+        // real, it just does not authorise THIS exit.
+        let PosTransaction::ExitV2 { pubkey_hash, epoch, .. } = signed_exit(1, 0) else {
+            unreachable!()
+        };
+        let wrong_signer = PosTransaction::ExitV2 {
+            pubkey_hash,
+            epoch,
+            signature: toy_sign(
+                &vec![2u8; 8],
+                &staking::ExitTx { pubkey_hash, epoch, signature: Vec::new() }.signing_root(),
+            ),
+        };
+        let mut probe = g.clone();
+        assert_eq!(
+            probe.apply_transaction(
+                &wrong_signer,
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &ToyVerifier,
+            ),
+            Err(TxReject::StakingRule),
+            "one validator must not be able to retire another",
+        );
+
+        // No signature at all — the exact shape the legacy message has, and
+        // the exact shape that used to work.
+        let unsigned = PosTransaction::ExitV2 { pubkey_hash, epoch, signature: Vec::new() };
+        let mut probe = g.clone();
+        assert_eq!(
+            probe.apply_transaction(
+                &unsigned,
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &ToyVerifier,
+            ),
+            Err(TxReject::StakingRule),
+            "an exit with no signature authorises nothing",
+        );
+    }
+
+    /// A captured exit must not be replayable at a time its signer never
+    /// chose: the signed epoch has to EQUAL the inclusion epoch, in both
+    /// directions.
+    #[test]
+    fn exit_v2_binds_the_signed_epoch_to_the_inclusion_epoch() {
+        let _guard = crate::params::rehearsal::exit_auth_gate_open_guard();
+        let (_t, g, _c) = setup(4);
+        for signed_for in [1u64, 7] {
+            let mut probe = g.clone();
+            assert_eq!(
+                probe.apply_transaction(
+                    &signed_exit(1, signed_for),
+                    0,
+                    fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                    &ToyVerifier,
+                ),
+                Err(TxReject::StakingRule),
+                "an exit signed for epoch {signed_for} must not apply in epoch 0",
+            );
+        }
+    }
+
+    /// THE CHURN CAP — the rule that survives every signature being genuine.
+    ///
+    /// Four validators, all correctly signed, all in one epoch, against a
+    /// budget of [`staking::MAX_EXITS_PER_EPOCH`]: the first
+    /// `MAX_EXITS_PER_EPOCH` apply and every one after that is refused, so the
+    /// 64-validator roster cannot retire in a block even when the keys are all
+    /// under one roof — which at Genesis-4 they are.
+    #[test]
+    fn exit_v2_admits_at_most_max_exits_per_epoch() {
+        let _guard = crate::params::rehearsal::exit_auth_gate_open_guard();
+        let n = staking::MAX_EXITS_PER_EPOCH as u32 + 2;
+        let (_t, g, _c) = setup(n);
+        let mut st = g.clone();
+
+        let mut applied = 0usize;
+        for v in 0..n {
+            let r = st.apply_transaction(
+                &signed_exit(v as u8, 0),
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &ToyVerifier,
+            );
+            if r.is_ok() {
+                applied += 1;
+            } else {
+                assert_eq!(
+                    r, Err(TxReject::StakingRule),
+                    "past the budget an exit is refused, not applied differently",
+                );
+            }
+        }
+        assert_eq!(
+            applied,
+            staking::MAX_EXITS_PER_EPOCH,
+            "exactly the churn budget may be spent in one epoch",
+        );
+
+        // The budget is a property of the EPOCH, not of the state object: the
+        // same window reopens once the epoch moves, and the already-exited
+        // records do not keep consuming it.
+        let mut next = st.clone();
+        next.epoch += 1;
+        assert_eq!(
+            next.voluntary_exits_this_epoch(),
+            0,
+            "last epoch's exits must not spend this epoch's budget",
+        );
+        assert!(
+            next.apply_transaction(
+                &signed_exit((n - 1) as u8, 1),
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &ToyVerifier,
+            )
+            .is_ok(),
+            "a fresh epoch restores the budget",
+        );
+    }
+
+    /// The budget counts VOLUNTARY exits only. A slashing ejection sets
+    /// `exit_epoch = self.epoch` (no delay), so it can neither exhaust the
+    /// voluntary budget nor be blocked by it — otherwise an attacker could
+    /// buy immunity from ejection by spending the epoch's exits, or a wave of
+    /// ejections could freeze honest exits.
+    #[test]
+    fn a_slashing_ejection_does_not_spend_the_exit_budget() {
+        let _guard = crate::params::rehearsal::exit_auth_gate_open_guard();
+        let (_t, g, _c) = setup(4);
+        let mut st = g.clone();
+        // The shape slashing writes, applied directly: same epoch, no delay.
+        st.validators.get_mut(&3).unwrap().slashed = true;
+        st.validators.get_mut(&3).unwrap().exit_epoch = st.epoch;
+        assert_eq!(
+            st.voluntary_exits_this_epoch(),
+            0,
+            "an ejection is not a voluntary exit and must not consume the budget",
+        );
+    }
+
+    // -- B4 HARDENING: the production apply path, end to end ----------------
+
+    /// `build_block`, minus the "and this block transitions" assertion.
+    ///
+    /// The header is stamped by the same `derive` functions the validator
+    /// checks with and signed over a `state_root` of zeros. Every check
+    /// `compute_post_state` makes *before* step 10 — slot, parent, version,
+    /// body/attestation/coherence roots, the sortition draw, the RANDAO
+    /// reveal, the proposer signature — therefore still passes, and the block
+    /// reaches the transaction arms and reports the transaction's own error.
+    /// The bogus root is never the verdict, because step 12 runs after step
+    /// 10.
+    ///
+    /// `build_block` cannot serve here: it calls `compute_post_state` and
+    /// `expect`s success, which is precisely what a test about a body
+    /// consensus refuses must not require. Without this helper the only way
+    /// to reach a rejecting transaction arm through the real handler is to
+    /// build the block under a gate you then close — which works for the
+    /// flag-day tests, and does not work for a body that is invalid on BOTH
+    /// sides of the gate (an exhausted churn budget, a replayed exit).
+    fn stamped_block_unproven_root(
+        pre: &CommittedState,
+        slot: u64,
+        txs: &[PosTransaction],
+        chains: &mut [RandaoChain],
+    ) -> ProposalEnvelope {
+        let mut ctx = pre.clone();
+        while ctx.epoch < crate::epoch_of(slot) {
+            ctx = ctx.close_epoch();
+        }
+        let roster = ctx.duty_roster();
+        let seed = ctx.seed_for_epoch(ctx.epoch);
+        let p = schedule::proposer(&seed, slot, &roster).expect("no eligible proposer");
+        let reveal = chains[p as usize].next_reveal().expect("chain spent");
+        let mix = beacon::mix_in(&ctx.randao_mix, &reveal);
+        let fin = ctx.finality_view();
+        let header = BlockHeaderV4 {
+            version: BLOCK_VERSION_V4,
+            parent: *pre.head.as_bytes(),
+            state_root: [0u8; 32],
+            body_root: crate::derive::body_root(
+                &txs.iter().map(PosTransaction::canonical_bytes).collect::<Vec<_>>(),
+            ),
+            slot,
+            proposer_index: p,
+            randao_reveal: reveal,
+            randao_mix: mix,
+            justified_root: fin.justified.root,
+            finalized_root: fin.finalized.root,
+            attestation_root: crate::derive::attestation_root(&[]),
+            coherence_root: pre.coherence_root(),
+        };
+        let proposer_sig = match crate::attestation::KeyLookup::pubkey(pre, p) {
+            Some(pk) => toy_sign(pk, &header.proposal_signing_root()),
+            None => vec![0u8; 8],
+        };
+        ProposalEnvelope { header, proposer_sig }
+    }
+
+    /// **THE WIRING, PROVEN AT THE REAL BLOCK HANDLER** — and proven inert.
+    ///
+    /// Every other test in this section calls `apply_transaction` directly,
+    /// which is the seam, not the path. A rule that is only ever exercised at
+    /// its seam can be perfectly correct and still unreachable: the dispatcher
+    /// in `compute_post_state` step 10 routes `SlashingEvidence` by name and
+    /// everything else through `_ => apply_transaction`, and "everything else"
+    /// is an assumption until something drives a real block through it.
+    ///
+    /// So this drives one. `ToyVerifier`, never `OkVerifier`: the signature
+    /// has to be checked by the code under test, not waved through by the
+    /// fixture. Both halves are asserted, because each alone is misleading:
+    ///
+    /// - with the rehearsal gate OPEN the exit transitions end to end through
+    ///   `apply_block` — body root, proposer signature, state root and all —
+    ///   and the registry record it wrote is visible in the post-state, so the
+    ///   handler reached `apply_exit_v2` rather than skipping an unknown
+    ///   variant;
+    /// - with the gate CLOSED — the configuration every node on the fleet runs
+    ///   today, `EXIT_AUTH_ACTIVATION_EPOCH` being `u64::MAX` — the SAME block
+    ///   with the SAME body is invalid at the transaction.
+    ///
+    /// That second assertion is the honest statement of this feature's status:
+    /// spec-correct, composed with the real handler, and switched off. It is
+    /// not "wired to production" in the sense of executing on the fleet, and
+    /// it cannot be until the founder arms the constant — which is out of
+    /// scope here and has its own unmet precondition (the wire byte).
+    #[test]
+    fn exit_v2_transitions_through_apply_block_and_is_inert_below_the_gate() {
+        let (t, g, mut chains) = setup_funded(8, &[]);
+        let exit = signed_exit(1, 0);
+
+        let (b, applied_open) = {
+            let _open = crate::params::rehearsal::exit_auth_gate_open_guard();
+            let b = build_block(&t, &g, 1, &[], std::slice::from_ref(&exit), &mut chains);
+            let st = t
+                .apply_block(&g, &b, &[], std::slice::from_ref(&exit))
+                .expect("with the gate open an authenticated exit must transition end to end");
+            (b, st)
+        };
+
+        let rec = applied_open.validator_record(1).expect("validator 1 must still exist");
+        assert_eq!(
+            rec.exit_epoch,
+            staking::EXIT_DELAY_EPOCHS,
+            "the block handler did not reach apply_exit_v2: no exit was scheduled",
+        );
+        assert_eq!(
+            rec.withdrawable_epoch,
+            staking::EXIT_DELAY_EPOCHS.saturating_add(staking::WITHDRAWAL_DELAY_EPOCHS),
+            "the withdrawal clock must start from the exit's inclusion, not from zero",
+        );
+        assert_eq!(
+            applied_open.validator_record(0).unwrap().exit_epoch,
+            u64::MAX,
+            "an exit must retire the validator it names and no other",
+        );
+
+        assert_eq!(
+            t.apply_block(&g, &b, &[], std::slice::from_ref(&exit)),
+            Err(TransitionError::Transaction(0)),
+            "GATED INERT: on the rules this tree ships, that block is refused at the \
+             transaction by every node",
+        );
+    }
+
+    /// **THE CHURN CAP IS A PROPERTY OF THE EPOCH, ENFORCED BY THE BLOCK
+    /// HANDLER** — not of one block, and not of the mempool.
+    ///
+    /// This is the finding that matters most about a churn budget, and the one
+    /// a seam-level test cannot see. `bloch-pos-node`'s `admissible` is relay
+    /// policy: one modified producer lifts it for the whole network, which is
+    /// exactly the argument that put the authentication in consensus in the
+    /// first place. And a cap enforced per BLOCK would be no cap at all —
+    /// there are `SLOTS_PER_EPOCH` blocks in an epoch, so a 64-validator
+    /// roster would still empty inside one epoch, four at a time.
+    ///
+    /// So: spend the whole budget in block one, then put one more correctly
+    /// signed exit in block two of the SAME epoch, and the second block is
+    /// invalid. The budget survives across blocks because it is derived from
+    /// the committed registry (`voluntary_exits_this_epoch`) rather than from
+    /// a per-block counter — which is also why no replay path, no reordering
+    /// and no restart can reset it mid-epoch.
+    #[test]
+    fn the_churn_cap_binds_across_blocks_within_one_epoch() {
+        let _open = crate::params::rehearsal::exit_auth_gate_open_guard();
+        let n = staking::MAX_EXITS_PER_EPOCH as u32 + 2;
+        let (t, g, mut chains) = setup_funded(n + 4, &[]);
+
+        // Block one spends the epoch's whole budget, in one body.
+        let full: Vec<PosTransaction> =
+            (0..staking::MAX_EXITS_PER_EPOCH as u32).map(|v| signed_exit(v as u8, 0)).collect();
+        let b1 = build_block(&t, &g, 1, &[], &full, &mut chains);
+        let s1 = t.apply_block(&g, &b1, &[], &full).expect("the budget itself must fit in a block");
+        assert_eq!(
+            s1.voluntary_exits_this_epoch(),
+            staking::MAX_EXITS_PER_EPOCH,
+            "fixture must actually spend the budget, or the next assertion is vacuous",
+        );
+        assert_eq!(
+            crate::epoch_of(1),
+            crate::epoch_of(2),
+            "both blocks must sit in ONE epoch or this test proves nothing",
+        );
+
+        // Block two, same epoch, one more genuine exit by a validator that has
+        // not exited and whose signature is its own.
+        let over = vec![signed_exit(staking::MAX_EXITS_PER_EPOCH as u8, 0)];
+        let b2 = stamped_block_unproven_root(&s1, 2, &over, &mut chains);
+        assert_eq!(
+            t.apply_block(&s1, &b2, &[], &over),
+            Err(TransitionError::Transaction(0)),
+            "a second block in the same epoch must not be able to re-open the churn budget",
+        );
+
+        // And the refusal is the budget, not the signature or the lifecycle:
+        // the same message applies the moment the epoch — and only the epoch —
+        // moves on.
+        let mut next = s1.clone();
+        next.epoch += 1;
+        assert_eq!(
+            next.voluntary_exits_this_epoch(),
+            0,
+            "last epoch's exits must not spend this epoch's budget",
+        );
+        assert!(
+            next.apply_transaction(
+                &signed_exit(staking::MAX_EXITS_PER_EPOCH as u8, 1),
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &ToyVerifier,
+            )
+            .is_ok(),
+            "the refusal above must have been the budget and nothing else",
+        );
+    }
+
+    /// **REPLAY, THE ONE THAT MATTERS: an old signed exit re-submitted
+    /// later.**
+    ///
+    /// The existing epoch-binding test only refuses exits signed for the
+    /// FUTURE, which is also all `staking::validate_exit` refuses (`epoch >
+    /// current_epoch`) — it is the reference validator and cannot know when
+    /// inclusion happens. Consensus can, and a past-signed exit is the
+    /// dangerous direction: an exit message is public the moment it is
+    /// gossiped, so under a `<=` rule anyone who ever signed one exit has
+    /// signed a permanent, unrevocable retirement that any future proposer can
+    /// cash at any time — and with `WITHDRAWAL_DELAY_EPOCHS` = 2,048 the
+    /// victim's bond is locked from whenever that happens to be.
+    ///
+    /// Equality is what closes it, and this pins equality in the direction the
+    /// weaker rule would have allowed, through the real block handler.
+    #[test]
+    fn an_old_signed_exit_cannot_be_replayed_in_a_later_epoch() {
+        let _open = crate::params::rehearsal::exit_auth_gate_open_guard();
+        let (t, g, mut chains) = setup_funded(8, &[]);
+
+        // Captured in epoch 0, exactly as it would have been gossiped.
+        let captured = signed_exit(1, 0);
+
+        // Time passes. The state rolls to a later epoch by the boundary walk,
+        // not by a test poking a field.
+        let mut later = g.clone();
+        for _ in 0..3 {
+            later = later.close_epoch();
+        }
+        assert_eq!(later.epoch, 3, "fixture must actually advance the epoch");
+
+        // Directly at the seam: refused.
+        let mut probe = later.clone();
+        assert_eq!(
+            probe.apply_transaction(
+                &captured,
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &ToyVerifier,
+            ),
+            Err(TxReject::StakingRule),
+            "a signature from epoch 0 must not authorise a retirement in epoch 3",
+        );
+        assert_eq!(
+            probe.validator_record(1).unwrap().exit_epoch,
+            u64::MAX,
+            "a refused replay must leave no trace on the record",
+        );
+
+        // And through the real block handler, which is where a proposer would
+        // actually try it.
+        let body = vec![captured];
+        let slot = 3 * crate::SLOTS_PER_EPOCH + 1;
+        let b = stamped_block_unproven_root(&later, slot, &body, &mut chains);
+        assert_eq!(
+            t.apply_block(&later, &b, &[], &body),
+            Err(TransitionError::Transaction(0)),
+            "a block replaying a stale exit must be invalid, not merely unrelayed",
+        );
+
+        // The validator can still leave — by signing for the epoch it is
+        // actually in. The rule refuses stale AUTHORISATION, never the exit.
+        let mut fresh = later.clone();
+        assert!(
+            fresh
+                .apply_transaction(
+                    &signed_exit(1, 3),
+                    0,
+                    fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                    &ToyVerifier,
+                )
+                .is_ok(),
+            "binding the epoch must not make voluntary exit impossible",
+        );
+    }
+
+    /// The other replay: the same message, in the epoch it was signed for,
+    /// submitted twice.
+    ///
+    /// Epoch equality cannot catch this one — the epoch is right. What catches
+    /// it is the `exit_epoch != u64::MAX` lifecycle check, and it has to,
+    /// because a second application would re-stamp `withdrawable_epoch` and
+    /// move a withdrawal clock that must never move once started. It also
+    /// keeps one validator from spending the whole epoch's churn budget by
+    /// resubmitting its own exit.
+    #[test]
+    fn an_applied_exit_cannot_be_replayed_in_its_own_epoch() {
+        let _open = crate::params::rehearsal::exit_auth_gate_open_guard();
+        let (_t, g, _c) = setup(4);
+        let mut st = g.clone();
+        let exit = signed_exit(1, 0);
+
+        assert!(
+            st.apply_transaction(
+                &exit,
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &ToyVerifier,
+            )
+            .is_ok(),
+            "the first application must succeed or the replay proves nothing",
+        );
+        let after_first = st.validator_record(1).unwrap();
+
+        for _ in 0..3 {
+            assert_eq!(
+                st.apply_transaction(
+                    &exit,
+                    0,
+                    fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                    &ToyVerifier,
+                ),
+                Err(TxReject::StakingRule),
+                "the identical message must not apply twice",
+            );
+        }
+        assert_eq!(
+            st.validator_record(1).unwrap(),
+            after_first,
+            "a refused replay must not move the withdrawal clock",
+        );
+        assert_eq!(
+            st.voluntary_exits_this_epoch(),
+            1,
+            "one validator's resubmissions must not eat the epoch's churn budget",
+        );
+    }
+
+    /// **THE OTHER HALF OF THE FLAG DAY.** Above the gate the unauthenticated
+    /// `Exit` is INVALID — and that is not tidiness, it is the churn cap's
+    /// load-bearing precondition.
+    ///
+    /// Legacy `Exit` carries no signature and its arm never consults a
+    /// verifier. If it stayed valid past the flag day, both new rules would be
+    /// decoration: anyone could retire anyone with tag `0x03` and never touch
+    /// `apply_exit_v2` at all. The two arms therefore have to flip on ONE
+    /// reader (`exit_auth_active`) — one gate, opposite directions, no epoch
+    /// in which both are live and none in which neither is.
+    #[test]
+    fn above_the_gate_the_legacy_exit_is_invalid_so_it_cannot_bypass_the_new_rules() {
+        let _open = crate::params::rehearsal::exit_auth_gate_open_guard();
+        let (t, g, mut chains) = setup_funded(8, &[]);
+
+        let legacy = vec![PosTransaction::Exit { validator: 1 }];
+        let mut probe = g.clone();
+        assert_eq!(
+            probe.apply_transaction(
+                &legacy[0],
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &ToyVerifier,
+            ),
+            Err(TxReject::StakingNotActive),
+            "past the flag day the unauthenticated message must be dead",
+        );
+        assert_eq!(
+            probe.validator_record(1).unwrap().exit_epoch,
+            u64::MAX,
+            "a refused legacy exit must leave no trace",
+        );
+
+        let b = stamped_block_unproven_root(&g, 1, &legacy, &mut chains);
+        assert_eq!(
+            t.apply_block(&g, &b, &[], &legacy),
+            Err(TransitionError::Transaction(0)),
+            "and the block handler must refuse it too, or the cap is bypassable by tag 0x03",
+        );
+
+        // Neither can it be laundered through the budget: an epoch whose
+        // budget is untouched still refuses it.
+        assert_eq!(g.voluntary_exits_this_epoch(), 0);
     }
 
     #[test]
@@ -7471,6 +8353,12 @@ mod tests {
             PosTransaction::TransferV2 { .. } => {}
             PosTransaction::Deposit { .. } => {}
             PosTransaction::Exit { .. } => {}
+            // The authenticated exit schedules epochs on a record — an
+            // `exit_epoch` and a `withdrawable_epoch` — and moves no satoshi
+            // in either direction, so it cannot touch the cap either. What it
+            // adds over the legacy message is a signature check and a churn
+            // budget, neither of which is arithmetic on supply.
+            PosTransaction::ExitV2 { .. } => {}
             PosTransaction::Delegate { .. } => {}
             PosTransaction::SlashingEvidence(_) => {}
         }

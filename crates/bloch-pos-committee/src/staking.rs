@@ -107,6 +107,59 @@ pub const ACTIVATION_DELAY_EPOCHS: u64 = 8;
 /// `set_size / 4` epochs of publicly visible queue traffic to take a majority.
 pub const MAX_ACTIVATIONS_PER_EPOCH: usize = 4;
 
+/// Voluntary exits admitted per epoch — the churn budget on the way OUT, and
+/// the exact mirror of [`MAX_ACTIVATIONS_PER_EPOCH`] on the way in.
+///
+/// # Why a cap on genuine, correctly-signed exits
+///
+/// Authentication answers "did the validator ask for this?"; it does not
+/// answer "may the roster empty this block?". Those are different questions
+/// and only the second one is about liveness. A set of 64 whose keys sit under
+/// one operator — which is exactly Genesis-4's launch set, all 64
+/// founder-operated — can produce 64 genuine exits in one block. The chain
+/// would then be an epoch away from a roster of zero, with no committee to
+/// finalise the blocks that would let anyone deposit their way back in, and
+/// every bond locked for [`WITHDRAWAL_DELAY_EPOCHS`].
+///
+/// Four per epoch makes emptying a 64-validator set take 16 epochs of
+/// publicly visible, on-chain traffic — the same shape of guarantee, and the
+/// same honest limit, as the activation cap: it buys *time and visibility*,
+/// not prevention. A coordinated operator still leaves; it leaves slowly
+/// enough that the rest of the network can see it happening and react.
+///
+/// Symmetry with the entry cap is deliberate and load-bearing: if exits were
+/// cheaper than entries, the steady-state set size could be driven down faster
+/// than it can be rebuilt, which is a slow-motion version of the same attack.
+///
+/// Enforced from [`crate::params::EXIT_AUTH_ACTIVATION_EPOCH`] only — below
+/// the flag day the rule is written down and inert, because tightening a
+/// transaction's validity is a consensus change and a mixed fleet must reach
+/// one verdict on every block until the day.
+pub const MAX_EXITS_PER_EPOCH: usize = 4;
+
+/// The churn budget's accounting rests on ONE arithmetic fact, so it is
+/// checked at compile time rather than described in a doc comment.
+///
+/// `voluntary_exits_this_epoch` counts the records whose `exit_epoch` equals
+/// `epoch + EXIT_DELAY_EPOCHS`, and it is allowed to do that *only* because a
+/// slashing ejection writes `exit_epoch = epoch` with no delay. Those two
+/// numbers are distinguishable exactly while [`EXIT_DELAY_EPOCHS`] is
+/// non-zero. Set it to zero and the two paths become indistinguishable in
+/// state: a wave of ejections would silently consume the voluntary budget and
+/// freeze honest exits, and an attacker could buy immunity from ejection by
+/// spending the epoch's exits first — a consensus rule quietly changing
+/// meaning because an unrelated constant moved.
+///
+/// A `const` assertion, not a runtime one: it costs nothing, cannot be
+/// compiled out the way `debug_assert!` was in the 2026-08-21 roster split,
+/// and it fails the build of whoever edits the delay rather than a node in
+/// production.
+const _: () = assert!(
+    EXIT_DELAY_EPOCHS > 0,
+    "MAX_EXITS_PER_EPOCH accounting distinguishes a voluntary exit from a slashing \
+     ejection by the delay alone; with EXIT_DELAY_EPOCHS = 0 they are the same number",
+);
+
 /// Epochs between a voluntary exit and the validator no longer being assigned
 /// duties (§5.1: ~8.5 h). Non-zero so an exit cannot be used to dodge duties
 /// — or slashing for duties already assigned — within the same epoch.
