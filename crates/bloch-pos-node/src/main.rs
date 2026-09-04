@@ -682,13 +682,18 @@ fn genesis_mainnet(args: &[String]) {
         eprintln!("genesis-mainnet: {e}");
         exit(1);
     }
-    // The exhaustive rule, REPORTED and not enforced. Genesis-4 mainnet bonds
-    // its launch cohort outside `GENESIS_ISSUED_SAT`, so enforcing this here
-    // would make the tool refuse to regenerate the artifact the live chain
-    // already runs from. Printing it is what makes the omission a decision
-    // instead of an accident — see `Manifest::check_bonds_are_funded`.
+    // The exhaustive rule, ENFORCED (2026-09-04). This was `WARNING (not
+    // fatal)` for one release, on the argument that Genesis-4 mainnet bonds
+    // its launch cohort outside `GENESIS_ISSUED_SAT` and a hard check would
+    // stop the tool regenerating the artifact the live chain runs from. The
+    // argument was right about the constraint and wrong about the remedy: a
+    // warning makes the omission a decision nobody makes, which is how the
+    // first unfunded cohort shipped. `check_bonds_are_funded` now compares
+    // against a named, frozen ceiling, so committed history regenerates and
+    // anything that bonds MORE from nothing exits non-zero here.
     if let Err(e) = manifest.check_bonds_are_funded() {
-        eprintln!("genesis-mainnet: WARNING (not fatal): {e}");
+        eprintln!("genesis-mainnet: {e}");
+        exit(1);
     }
 
     let bytes = manifest.encode();

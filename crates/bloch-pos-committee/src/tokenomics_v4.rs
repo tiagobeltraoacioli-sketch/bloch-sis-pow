@@ -262,6 +262,37 @@ pub const VALIDATOR_EMISSION_SAT: u128 = VALIDATOR_EMISSION_BLOCH * SAT_PER_BLOC
 /// [`VALIDATOR_EMISSION_SAT`].
 pub const GENESIS_ISSUED_SAT: u128 = TOTAL_SUPPLY_SAT - VALIDATOR_EMISSION_SAT;
 
+/// Satoshis Genesis-4 mainnet **bonded into its launch cohort without issuing
+/// them** — 64 validators × 25,000 BLOCH = 1,600,000 BLOCH.
+///
+/// This is a record of what happened, used as a **ceiling**, and it is
+/// neither an activation constant nor a budget. [`GENESIS_ISSUED_SAT`] above
+/// sums the carryover and the five allocation buckets and nothing else, while
+/// `CommittedState::genesis` writes each validator's stake into a bond that
+/// earns, weighs and is slashable. The mainnet ceremony's arithmetic therefore
+/// balanced with the whole cohort's stake outside it: those coins were minted
+/// from nothing at slot 0, and the chain that did it is running.
+///
+/// # Why a ceiling and not a fix
+///
+/// It cannot be corrected in place. `issued_sat` is committed state and
+/// rewriting a live chain's slot 0 is a relaunch, not a patch. What is
+/// available is to stop the number from ever growing again, which is what
+/// this constant buys: `CommittedState::genesis` and
+/// `Manifest::check_bonds_are_funded` both refuse an opening that bonds MORE
+/// than this outside its issuance, so a 65th validator, a raised stake, or a
+/// second unfunded cohort is a hard error rather than a warning nobody reads.
+///
+/// **Frozen. Raising it legalises a new mint from nothing** — the one edit
+/// this constant exists to make impossible to perform quietly. Lowering it to
+/// zero is the goal state, and costs nothing here: it requires funding the
+/// cohort out of an allocation bucket first, which is a tokenomics decision.
+///
+/// The clean rule — `accounted == GENESIS_ISSUED_SAT`, no tolerance at all —
+/// is stated and tested as `Manifest::bonds_are_fully_funded`, so both sides
+/// of the eventual tightening already exist.
+pub const GENESIS_UNFUNDED_BONDED_CEILING_SAT: u128 = 1_600_000 * SAT_PER_BLOCH;
+
 // ── Time ────────────────────────────────────────────────────────────────────
 
 /// Slots per day at a 30 s slot.
