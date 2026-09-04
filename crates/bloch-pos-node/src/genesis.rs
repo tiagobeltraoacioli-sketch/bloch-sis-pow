@@ -905,10 +905,104 @@ impl Manifest {
         })
     }
 
-    /// What genesis puts into existence: carried balances plus allocations.
+    /// Satoshis this manifest bonds into the genesis validator registry.
+    ///
+    /// These are coins. `CommittedState::genesis` writes each
+    /// [`ManifestValidator::stake_sat`] into a `ValidatorRecord::staked_sat`,
+    /// where it earns rewards, carries consensus weight and is slashable —
+    /// every property a satoshi in the eUTXO set has, minus spendability until
+    /// a withdrawal path exists. A supply check that counted only the outputs
+    /// would be counting the smaller half of the money.
+    ///
+    /// **This is the term that had no name, and 1,600,000 BLOCH went through
+    /// the hole.** Genesis-4 mainnet bonds 64 validators at 25,000 BLOCH each
+    /// while [`Self::genesis_issued_sat`] sums the carryover and the
+    /// allocations only, so the ceremony's arithmetic balanced with the
+    /// cohort's entire stake outside it — minted from nothing, at slot 0, by a
+    /// check that reported the manifest added up.
+    ///
+    /// Naming it does not un-mint it; that chain is running. What it changes
+    /// is that the quantity is now summed, printed by `genesis-mainnet`, and
+    /// checkable through [`Self::check_bonds_are_funded`], so the next
+    /// ceremony cannot repeat the omission without seeing it.
+    pub fn genesis_bonded_sat(&self) -> u128 {
+        self.validators.iter().map(|v| v.stake_sat).sum()
+    }
+
+    /// What genesis **funds**: carried balances plus allocations.
+    ///
+    /// Deliberately *not* including [`Self::genesis_bonded_sat`], and the
+    /// name is the reason. This is the number that must equal
+    /// `tokenomics_v4::GENESIS_ISSUED_SAT`, because that constant is what
+    /// `CommittedState::genesis` seeds the committed `issued_sat` counter
+    /// with — so this function has to mean exactly what the counter means, or
+    /// the check below verifies a different quantity from the one the chain
+    /// commits.
+    ///
+    /// The bonds are real coins all the same. They are counted by
+    /// [`Self::genesis_accounted_sat`], and the difference between the two —
+    /// [`Self::genesis_unfunded_bonded_sat`] — is the supply gap Genesis-4
+    /// opened with.
     pub fn genesis_issued_sat(&self) -> u128 {
         self.carryover.as_ref().map_or(0, |c| c.total_sat)
             + self.allocations.iter().map(|a| a.amount_sat).sum::<u128>()
+    }
+
+    /// Every satoshi that exists the instant this manifest's genesis block is
+    /// committed: what it funds, plus what it bonds.
+    ///
+    /// The manifest-side mirror of
+    /// `CommittedState::accounted_supply_sat`, and it must stay that: at slot
+    /// 0 the committed state holds exactly the carryover and allocation
+    /// outputs (in the eUTXO set) and the cohort's bonds (in the registry).
+    /// Pinned against the committed state by
+    /// `genesis_accounting_matches_the_committed_state`.
+    pub fn genesis_accounted_sat(&self) -> u128 {
+        self.genesis_issued_sat() + self.genesis_bonded_sat()
+    }
+
+    /// Coins this manifest bonds that its issuance never accounted for —
+    /// `genesis_accounted_sat() - genesis_issued_sat()`, i.e. exactly
+    /// [`Self::genesis_bonded_sat`], stated under the name that says what is
+    /// wrong with it.
+    ///
+    /// **1,600,000 BLOCH on Genesis-4 mainnet** (64 validators × 25,000).
+    /// Non-zero is not a manifest defect that [`Self::check_supply`] can
+    /// refuse, because the mainnet manifest is already signed and its chain
+    /// is already running: the fix would be a relaunch, not a check.
+    ///
+    /// What [`Self::check_bonds_are_funded`] does refuse — as a hard error
+    /// since 2026-09-04, not a printed warning — is a manifest whose figure
+    /// here exceeds `tokenomics_v4::GENESIS_UNFUNDED_BONDED_CEILING_SAT`, the
+    /// frozen record of what this chain already did. A 65th validator, a
+    /// raised stake, or a second unfunded cohort is therefore impossible to
+    /// sign by accident, while regenerating the artifact the live chain runs
+    /// from still succeeds.
+    pub fn genesis_unfunded_bonded_sat(&self) -> u128 {
+        self.genesis_bonded_sat()
+    }
+
+    /// The clean rule, with no tolerance at all: every bonded satoshi was
+    /// funded, `genesis_accounted_sat() == GENESIS_ISSUED_SAT`.
+    ///
+    /// **False for Genesis-4 mainnet**, which is exactly why it is a separate
+    /// predicate from [`Self::check_bonds_are_funded`] rather than the rule
+    /// that one enforces. It is the state the next launch should be in, and
+    /// it is stated here so both sides of the eventual tightening are tested
+    /// today: when the cohort is funded out of an allocation bucket this
+    /// returns `true`, the ceiling constant drops to zero, and the two checks
+    /// become the same check with no edit to either.
+    ///
+    /// **No production caller**, and the dead-code warning is the honest
+    /// signal rather than something to silence: this is the rule the chain
+    /// does not yet satisfy. It is called only from
+    /// `unfunded_genesis_bonds_are_refused_above_the_committed_ceiling`, which
+    /// asserts it is FALSE for the live cohort and TRUE once the cohort is
+    /// funded — so the tightening is tested from both sides before anyone
+    /// performs it. Same posture as [`Self::pubkeys`] below.
+    pub fn bonds_are_fully_funded(&self) -> bool {
+        use bloch_pos_committee::tokenomics_v4 as t;
+        self.genesis_accounted_sat() == t::GENESIS_ISSUED_SAT
     }
 
     /// Refuse a manifest that does not add up.
@@ -932,10 +1026,77 @@ impl Manifest {
         // cap disagree and one of them silently wins.
         let expected = t::GENESIS_ISSUED_SAT;
         if self.carryover.is_some() && issued != expected {
+            // The message names the bonded stake even though this check does
+            // not judge it, because a ceremony operator reading a supply error
+            // needs both figures in front of them: the one that failed and the
+            // one that is unfunded on purpose (see `check_bonds_are_funded`).
             return Err(format!(
-                "genesis issues {issued} sat; tokenomics §3 says {expected} \
-                 (difference {})",
-                issued.abs_diff(expected)
+                "genesis funds {issued} sat (carryover + allocations); \
+                 tokenomics §3 says {expected} (difference {}); \
+                 {} sat additionally bonded to {} genesis validators",
+                issued.abs_diff(expected),
+                self.genesis_bonded_sat(),
+                self.validators.len(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The exhaustive genesis rule, **enforced**: a manifest may not bond
+    /// more outside its issuance than this chain has already committed to.
+    ///
+    ///   `genesis_unfunded_bonded_sat() <= GENESIS_UNFUNDED_BONDED_CEILING_SAT`
+    ///
+    /// # Why a ceiling, and why that is still a hard error
+    ///
+    /// The clean rule is [`Self::bonds_are_fully_funded`] — zero tolerance,
+    /// `accounted == GENESIS_ISSUED_SAT`. It is **false for the live chain**:
+    /// Genesis-4 mainnet bonds 1,600,000 BLOCH outside its issuance, so a
+    /// check that demanded zero would make the node's own `genesis-mainnet`
+    /// subcommand refuse to regenerate the artifact the network is running
+    /// from. A check that fails on committed history is not a check, it is a
+    /// broken tool, and that is why this shipped as a printed warning until
+    /// 2026-09-04.
+    ///
+    /// A warning was the wrong resolution. It made the omission a decision
+    /// nobody makes — the ceremony operator sees `WARNING (not fatal)`,
+    /// the tool exits zero, the artifact is written, and the next unfunded
+    /// cohort goes out under exactly the reasoning that produced the first
+    /// one. Comparing against a NAMED CEILING gets both: committed history
+    /// passes, and anything worse than committed history is `Err` and a
+    /// non-zero exit. A 65th validator, a raised `stake_sat`, a second
+    /// cohort — each of those raises the figure past the ceiling and is now
+    /// refused, which is the entire class of repeat the warning could only
+    /// describe.
+    ///
+    /// The ceiling is frozen and documented as such on the constant. Raising
+    /// it is the one edit that legalises a new mint from nothing, and it is
+    /// now an edit someone has to make deliberately, to a constant whose doc
+    /// says what it is, rather than a warning line scrolling past.
+    ///
+    /// Devnet manifests (no carryover) are exempt for the same reason
+    /// `check_supply` exempts them: they issue nothing — `GENESIS_ISSUED_SAT`
+    /// describes a network that carries Genesis-3 balances — and they bond
+    /// play money against it.
+    pub fn check_bonds_are_funded(&self) -> Result<(), String> {
+        use bloch_pos_committee::tokenomics_v4 as t;
+        if self.carryover.is_none() {
+            return Ok(());
+        }
+        let unfunded = self.genesis_unfunded_bonded_sat();
+        if unfunded > t::GENESIS_UNFUNDED_BONDED_CEILING_SAT {
+            return Err(format!(
+                "genesis holds {} sat at slot 0 (funded {} + bonded {}) but issues {}; \
+                 {unfunded} sat of validator stake is minted from nothing, which is \
+                 {} sat past the {} sat recorded Genesis-4 cohort offset. That offset \
+                 is committed history, not a budget: see \
+                 tokenomics_v4::GENESIS_UNFUNDED_BONDED_CEILING_SAT before raising it.",
+                self.genesis_accounted_sat(),
+                self.genesis_issued_sat(),
+                self.genesis_bonded_sat(),
+                t::GENESIS_ISSUED_SAT,
+                unfunded - t::GENESIS_UNFUNDED_BONDED_CEILING_SAT,
+                t::GENESIS_UNFUNDED_BONDED_CEILING_SAT,
             ));
         }
         Ok(())
@@ -2260,6 +2421,193 @@ mod tests {
             unlock_epoch: 0,
         }];
         good.check_supply().expect("carryover + allocations must equal GENESIS_ISSUED_SAT");
+    }
+
+    /// The manifest's own supply arithmetic equals what the state it builds
+    /// actually holds — the claim on [`Manifest::genesis_accounted_sat`], and
+    /// the reason that function is allowed to be the figure the ceremony
+    /// prints and the genesis checks judge.
+    ///
+    /// # What would otherwise go unnoticed
+    ///
+    /// `genesis_accounted_sat` adds two numbers read off the manifest.
+    /// `CommittedState::accounted_supply_sat` walks six components of a
+    /// committed state built by a different function through a different
+    /// path (`allocation_outputs` synthesises txids by hashing, the registry
+    /// is keyed by index, the ledger is an SMT). Nothing but a test makes
+    /// them the same quantity, and a drift between them is exactly the shape
+    /// of the original defect: two supply figures that disagree, each
+    /// self-consistent, neither obviously wrong.
+    #[test]
+    fn genesis_accounting_matches_the_committed_state() {
+        use bloch_pos_committee::tokenomics_v4 as t;
+
+        // ── A devnet manifest: bonds only, nothing funded. ────────────────
+        let m = sample();
+        let bonds: u128 = 1_000 + 2_000 + 3_000;
+        assert_eq!(m.genesis_bonded_sat(), bonds);
+        assert_eq!(m.genesis_issued_sat(), 0, "a devnet funds nothing");
+        assert_eq!(m.genesis_accounted_sat(), bonds);
+        assert_eq!(
+            m.genesis_state().accounted_supply_sat(),
+            m.genesis_accounted_sat(),
+            "the manifest's total and the state it builds must be the same number",
+        );
+
+        // ── A funded manifest: both pools carry coins. ────────────────────
+        //
+        // The allocation bucket stands in for the whole funded opening, so
+        // the eUTXO half of the committed total is non-empty and the equality
+        // above is tested against a state where BOTH terms are live rather
+        // than one where the ledger is zero and only the bonds are compared.
+        // Built from the constant, never from a retyped figure.
+        let mut funded = sample();
+        funded.allocations = vec![GenesisAllocation {
+            purpose: alloc_purpose::FOUNDER,
+            script_hash: [0xF1; 32],
+            amount_sat: t::GENESIS_ISSUED_SAT,
+            unlock_epoch: 0,
+        }];
+        assert_eq!(funded.genesis_issued_sat(), t::GENESIS_ISSUED_SAT);
+        assert_eq!(funded.genesis_accounted_sat(), t::GENESIS_ISSUED_SAT + bonds);
+
+        let st = funded.genesis_state();
+        assert_eq!(
+            st.accounted_supply_sat(),
+            funded.genesis_accounted_sat(),
+            "the manifest and the committed state disagree about the opening supply",
+        );
+        // And the two halves land where they are supposed to, so the equality
+        // above cannot be passing by two errors cancelling.
+        assert_eq!(
+            st.total_unspent_sat(),
+            funded.genesis_issued_sat(),
+            "the funded half must be in the ledger",
+        );
+        assert_eq!(
+            st.supply_gap_sat(),
+            funded.genesis_unfunded_bonded_sat() as i128,
+            "the state's own gap accessor must report the manifest's unfunded bonds",
+        );
+    }
+
+    /// The genesis bond rule is ENFORCED, and enforced as a ceiling: committed
+    /// history passes, anything worse is `Err`.
+    ///
+    /// This is the test that would have caught the original omission, and it
+    /// pins the posture as well as the arithmetic — until 2026-09-04
+    /// `check_bonds_are_funded` had exactly one caller and that caller printed
+    /// `WARNING (not fatal)` and continued. Both sides of the tightening are
+    /// checked here, so the day the cohort is funded and the ceiling drops to
+    /// zero, this test moves with it rather than silently passing.
+    #[test]
+    fn unfunded_genesis_bonds_are_refused_above_the_committed_ceiling() {
+        use bloch_pos_committee::tokenomics_v4 as t;
+
+        // A devnet is exempt: it issues nothing, so `GENESIS_ISSUED_SAT` —
+        // which describes a network carrying Genesis-3 balances — is not a
+        // figure it can be held to.
+        assert!(sample().check_bonds_are_funded().is_ok());
+        assert!(!sample().bonds_are_fully_funded(), "a devnet funds no bonds");
+
+        // A mainnet-shaped manifest whose funding adds up, bonding exactly the
+        // recorded Genesis-4 offset: this is committed history and must
+        // regenerate. Anything else makes `genesis-mainnet` a broken tool.
+        // A builder, because `Manifest` is deliberately not `Clone` — the
+        // three fixtures below are variations on it and each is built fresh.
+        let mainnet_at_ceiling = || {
+            let mut m = sample();
+            m.carryover = Some(CarryoverCommitment {
+                digest: [0xC0; 32],
+                set_root: [0xC1; 32],
+                entry_count: 1,
+                total_sat: t::CARRYOVER_TOTAL_BLOCH * t::SAT_PER_BLOCH,
+            });
+            m.allocations = vec![GenesisAllocation {
+                purpose: alloc_purpose::FOUNDER,
+                script_hash: [0xF1; 32],
+                amount_sat: t::GENESIS_ISSUED_SAT - t::CARRYOVER_TOTAL_BLOCH * t::SAT_PER_BLOCH,
+                unlock_epoch: 0,
+            }];
+            // 64 validators at 25,000 BLOCH — the live cohort, from the constant.
+            m.validators = (0..64)
+                .map(|i| ManifestValidator {
+                    index: i,
+                    stake_sat: 25_000 * t::SAT_PER_BLOCH,
+                    randao_commitment: [i as u8; 32],
+                    pubkey: shaped_pubkey(i as u8),
+                    withdrawal_credentials: Vec::new(),
+                    commission_bps: 500,
+                })
+                .collect();
+            m
+        };
+        let at_ceiling = mainnet_at_ceiling();
+        at_ceiling.check_supply().expect("the funding half must still add up");
+        assert_eq!(
+            at_ceiling.genesis_unfunded_bonded_sat(),
+            t::GENESIS_UNFUNDED_BONDED_CEILING_SAT,
+            "the fixture no longer reproduces the committed Genesis-4 cohort",
+        );
+        at_ceiling
+            .check_bonds_are_funded()
+            .expect("committed history must regenerate, or the ceremony tool is broken");
+        assert!(
+            !at_ceiling.bonds_are_fully_funded(),
+            "the live chain is NOT fully funded — if this passes, the clean rule \
+             and the ceiling rule have been conflated",
+        );
+
+        // One more validator, and it is a hard error. This is the entire
+        // class of repeat the warning could only describe: a 65th bond, a
+        // raised stake, a second cohort.
+        let mut over = mainnet_at_ceiling();
+        over.validators.push(ManifestValidator {
+            index: 64,
+            stake_sat: 25_000 * t::SAT_PER_BLOCH,
+            randao_commitment: [0x64; 32],
+            pubkey: shaped_pubkey(0x64),
+            withdrawal_credentials: Vec::new(),
+            commission_bps: 500,
+        });
+        let err = over
+            .check_bonds_are_funded()
+            .expect_err("a 65th unfunded bond must be refused, not warned about");
+        assert!(err.contains("minted from nothing"), "{err}");
+        // The message says by how much, so an operator can act on it.
+        assert!(
+            err.contains(&(25_000 * t::SAT_PER_BLOCH).to_string()),
+            "the error must name the excess: {err}",
+        );
+
+        // ── The clean end state, and the coupling it exposes ──────────────
+        //
+        // Funding the cohort means the ceremony emits that much LESS as
+        // outputs and bonds the difference, so the total minted at slot 0 is
+        // still `GENESIS_ISSUED_SAT` — it is just split across two pools
+        // instead of one. That satisfies the clean rule:
+        let mut clean = mainnet_at_ceiling();
+        clean.allocations[0].amount_sat -= t::GENESIS_UNFUNDED_BONDED_CEILING_SAT;
+        assert!(
+            clean.bonds_are_fully_funded(),
+            "moving the cohort's stake inside issuance must satisfy the clean rule",
+        );
+        clean.check_bonds_are_funded().expect("zero unfunded is under any ceiling");
+
+        // And it is refused by `check_supply`, which is not a contradiction
+        // but the coupling worth stating out loud: `check_supply` compares
+        // the FUNDED half against `GENESIS_ISSUED_SAT`, because that constant
+        // is what `CommittedState::genesis` seeds the committed counter with.
+        // Adopting the clean rule therefore means deciding what the counter
+        // should be seeded with when part of the issuance is bonded rather
+        // than emitted — a tokenomics decision about a committed field, which
+        // is exactly why the ceiling exists in the meantime instead of a
+        // quiet edit to one of these two checks.
+        assert!(
+            clean.check_supply().is_err(),
+            "if this passes, `check_supply` and `check_bonds_are_funded` have \
+             stopped measuring different halves and one of them is now decorative",
+        );
     }
 
     #[test]

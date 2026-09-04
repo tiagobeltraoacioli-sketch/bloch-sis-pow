@@ -32,14 +32,21 @@ fn entry(txid: u8, vout: u32, value: u64, script: u8) -> EutxoEntry {
 /// A committed genesis state with two validators and four outputs across two
 /// script hashes.
 ///
-/// The values are deliberately enormous: the `0xAB` script hash sums to
-/// 18,000,000,000,000,000,500, about 1,998x JavaScript's 2^53 exact-integer
-/// limit, so a client that reads `balance_sat` as a JSON *number* is silently
-/// wrong on this fixture instead of on mainnet.
+/// The values are deliberately large: the `0xAB` script hash sums to
+/// 18,000,000,000,000,500 — about 2x JavaScript's 2^53 exact-integer limit —
+/// so a client that reads `balance_sat` as a JSON *number* is silently wrong
+/// on this fixture instead of on mainnet.
 ///
-/// It does not overflow `u64` — `u64::MAX` is 18,446,744,073,709,551,615, and
-/// this comment used to claim otherwise. What the fixture pins is the wire
-/// form (a decimal string), not u64 arithmetic.
+/// **2x and not 1,998x, since 2026-09-04.** These entries used to hold
+/// 9,000,000,000,000,000,000 sat each, and the pair summed to more than THREE
+/// TIMES the chain's entire genesis issuance. That was fine for the property
+/// being pinned — the wire form of a big integer — and it stopped being fine
+/// when `CommittedState::genesis` began refusing an opening that holds more
+/// than it issued, which this fixture did by a factor of three. Exceeding
+/// 2^53 is the whole requirement here and 18e15 exceeds it; being an
+/// impossible supply was never part of the test and is now a caught error.
+/// (`u64` was never the constraint either: `u64::MAX` is
+/// 18,446,744,073,709,551,615.)
 fn state_with_balances() -> CommittedState {
     let validators = vec![
         GenesisValidator {
@@ -60,8 +67,8 @@ fn state_with_balances() -> CommittedState {
         },
     ];
     let balances = vec![
-        entry(0x11, 0, 9_000_000_000_000_000_000, 0xAB),
-        entry(0x11, 1, 9_000_000_000_000_000_000, 0xAB),
+        entry(0x11, 0, 9_000_000_000_000_000, 0xAB),
+        entry(0x11, 1, 9_000_000_000_000_000, 0xAB),
         entry(0x22, 0, 500, 0xAB),
         entry(0x33, 7, 12_345, 0xCD),
     ];
@@ -380,10 +387,9 @@ fn getbalance_sums_the_eutxo_set_for_one_script_hash() {
     let st = state_with_balances();
     let v = balance_json(&st, &[0xAB; 32]);
 
-    // 9e18 + 9e18 + 500. It still fits u64, barely (u64::MAX is ~18.45e18),
-    // and is held in u128; what it does exceed is 2^53, so it must leave as a
-    // string.
-    assert_eq!(v.get("balance_sat").unwrap().as_str(), Some("18000000000000000500"));
+    // 9e15 + 9e15 + 500. Comfortably inside u64 and held in u128; what it
+    // does exceed is 2^53, so it must leave as a string.
+    assert_eq!(v.get("balance_sat").unwrap().as_str(), Some("18000000000000500"));
     assert_eq!(v.get("utxo_count").unwrap().as_u64(), Some(3));
 
     let other = balance_json(&st, &[0xCD; 32]);
@@ -407,13 +413,13 @@ fn amounts_are_decimal_strings_not_json_numbers() {
     let raw = v.to_string();
 
     assert!(
-        raw.contains(r#""balance_sat":"18000000000000000500""#),
+        raw.contains(r#""balance_sat":"18000000000000500""#),
         "R3: satoshi amounts must be quoted decimal strings — got {raw}"
     );
     match v.get("balance_sat") {
         Some(Json::Str(s)) => {
-            assert_eq!(s.parse::<u128>().unwrap(), 18_000_000_000_000_000_500);
-            assert!(18_000_000_000_000_000_500u128 > 9_007_199_254_740_991);
+            assert_eq!(s.parse::<u128>().unwrap(), 18_000_000_000_000_500);
+            assert!(18_000_000_000_000_500u128 > 9_007_199_254_740_991);
         }
         other => panic!("balance_sat must be a JSON string, got {other:?}"),
     }

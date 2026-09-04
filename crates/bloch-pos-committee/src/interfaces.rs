@@ -352,6 +352,40 @@ pub enum TransitionError {
     /// operator can change any rule including this one; "impossible to
     /// change" would be false and is deliberately not the claim.
     SupplyCapExceeded,
+    /// The block would leave more satoshis in committed state than the block
+    /// before it plus everything the block was entitled to mint
+    /// (`CommittedState::accounted_supply_sat` grew faster than
+    /// `issued_sat`). **Coins appeared from nothing** — the one failure the
+    /// hard cap above cannot see, because the cap watches the issuance
+    /// counter and this watches whether the counter and the ledger agree.
+    ///
+    /// The rule is a delta, not an equality against `GENESIS_ISSUED_SAT`, and
+    /// one-sided (`<=`). Both choices are forced, and neither weakens it:
+    ///
+    /// - **One-sided**, because burns are real and uncounted: the base-fee
+    ///   share and the uncredited part of a slashing penalty are destroyed by
+    ///   nobody being credited, while `issued_sat` is gross and never
+    ///   decrements. A block may therefore hold *less* than issuance allows,
+    ///   and must never hold more.
+    /// - **A delta**, because Genesis-4 mainnet opened with the genesis
+    ///   cohort's 1,600,000 BLOCH of bonds outside `GENESIS_ISSUED_SAT`
+    ///   (`Manifest::genesis_issued_sat` sums the carryover and the
+    ///   allocations only). That offset is committed history on a live chain
+    ///   and cannot be patched away; in a delta it cancels, so the invariant
+    ///   binds tightly on every block *after* genesis without pretending the
+    ///   opening was clean. The opening itself is closed prospectively, in
+    ///   `Manifest::check_supply`.
+    ///
+    /// Unreachable through the transition's own arithmetic today, and that is
+    /// a proof rather than a hope: rewards credit bonds and advance
+    /// `issued_sat` by the same satoshis; fees move value the eUTXO set
+    /// already held; slashing only destroys; and the one path that does mint
+    /// stake from nothing — `Deposit`/`Delegate`, which name an `amount_sat`
+    /// and spend no output — is refused at every epoch by
+    /// `params::DEPOSIT_ACTIVATION_EPOCH` (`u64::MAX`). What this variant
+    /// refuses is a supplied pre-state or a future code path where that stops
+    /// being true.
+    SupplyNotConserved,
     /// The block's transactions consume more than `fee_market::BLOCK_GAS_LIMIT`
     /// gas — the CPU/state backstop of the L1 fee market
     /// (`BLOCH-L1-FEE-MARKET.md` §5).
