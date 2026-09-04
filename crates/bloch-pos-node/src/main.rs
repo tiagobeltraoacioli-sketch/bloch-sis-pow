@@ -682,6 +682,14 @@ fn genesis_mainnet(args: &[String]) {
         eprintln!("genesis-mainnet: {e}");
         exit(1);
     }
+    // The exhaustive rule, REPORTED and not enforced. Genesis-4 mainnet bonds
+    // its launch cohort outside `GENESIS_ISSUED_SAT`, so enforcing this here
+    // would make the tool refuse to regenerate the artifact the live chain
+    // already runs from. Printing it is what makes the omission a decision
+    // instead of an accident — see `Manifest::check_bonds_are_funded`.
+    if let Err(e) = manifest.check_bonds_are_funded() {
+        eprintln!("genesis-mainnet: WARNING (not fatal): {e}");
+    }
 
     let bytes = manifest.encode();
     if let Err(e) = std::fs::write(&out, &bytes) {
@@ -691,12 +699,14 @@ fn genesis_mainnet(args: &[String]) {
     use sha3::{Digest, Sha3_256};
     let digest: [u8; 32] = Sha3_256::digest(&bytes).into();
     println!(
-        "wrote {out}\n  validators : {}\n  carryover  : {} BLOCH ({} outputs)\n  allocations: {} buckets\n  issues     : {} BLOCH at genesis\n  digest     : {}",
+        "wrote {out}\n  validators : {}\n  carryover  : {} BLOCH ({} outputs)\n  allocations: {} buckets\n  issues     : {} BLOCH at genesis\n  bonds      : {} BLOCH to the launch cohort (unfunded)\n  holds      : {} BLOCH at slot 0\n  digest     : {}",
         manifest.validators.len(),
         t::CARRYOVER_TOTAL_BLOCH,
         t::CARRYOVER_MEASURED_UTXOS,
         manifest.allocations.len(),
         manifest.genesis_issued_sat() / t::SAT_PER_BLOCH,
+        manifest.genesis_bonded_sat() / t::SAT_PER_BLOCH,
+        manifest.genesis_accounted_sat() / t::SAT_PER_BLOCH,
         hex_lower(&digest),
     );
 }

@@ -489,6 +489,45 @@ pub mod rehearsal {
         static BONDING_GATE_OPEN_TL: Cell<bool> = const { Cell::new(false) };
     }
 
+    thread_local! {
+        static MINT_FROM_NOTHING_TL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// **MUTATION SWITCH — injects a mint from nothing.** `true` makes
+    /// `transition::CommittedState::close_epoch` credit the epoch's validator
+    /// reward into the operator's bond *without* advancing the committed
+    /// `issued_sat` counter.
+    ///
+    /// This is the one defect the hard cap cannot see and the whole point of
+    /// the supply-conservation invariant: the counter stays honest forever
+    /// while the ledger grows on every epoch boundary, so
+    /// `SupplyCapExceeded` never fires and the supply inflates without limit.
+    ///
+    /// It exists so the invariant can be shown to REFUSE something. A guard
+    /// that has only ever been observed passing is a guard nobody knows is
+    /// wired up — the same argument `PARTITION_DUPLICATES_AN_INDEX` above
+    /// makes for the epoch partition. Read only through
+    /// `transition::mutation_mints_from_nothing`, `cfg(test)` on both sides,
+    /// so the branch folds away and the switch cannot exist in a shipped
+    /// binary.
+    pub fn mint_from_nothing() -> bool {
+        MINT_FROM_NOTHING_TL.with(|c| c.get())
+    }
+
+    /// Injects the mint above for this thread until the guard drops,
+    /// including on unwind — a failing assertion must not leave the rest of
+    /// the thread minting coins from nothing.
+    pub fn mint_from_nothing_guard() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                MINT_FROM_NOTHING_TL.with(|c| c.set(self.0));
+            }
+        }
+        let prev = MINT_FROM_NOTHING_TL.with(|c| c.replace(true));
+        Restore(prev)
+    }
+
     /// Test-only: treat [`super::DEPOSIT_ACTIVATION_EPOCH`] as already bound.
     ///
     /// Its own switch, NOT folded into `GATES_OPEN`, and the reason is that the

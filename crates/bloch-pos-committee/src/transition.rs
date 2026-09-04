@@ -1238,9 +1238,18 @@ pub struct CommittedState {
     /// exactly what leaves the set, pinned by test) and **not** across the two
     /// pools. Closing it means giving deposits and withdrawals eUTXO inputs
     /// and outputs, which is a change to the staking messages' wire shape and
-    /// to their admission rules, not to this field. Until then, no single
-
-    /// number in this state is "the supply".
+    /// to their admission rules, not to this field.
+    ///
+    /// **What changed on 2026-09-03.** This doc used to end "no single number
+    /// in this state is the supply". There is one now:
+    /// [`CommittedState::accounted_supply_sat`] sums both pools and every
+    /// ledger beside them, and `compute_post_state` refuses any block that
+    /// grows it by more than the block was entitled to mint. That does not
+    /// close the gap above — deposits still bond coins the eUTXO set never
+    /// funded, which is why the rule carries an explicit `unfunded_bonded`
+    /// term — but it does mean the gap can no longer *widen* unobserved, and
+    /// when deposits are finally funded from this set the term goes to zero
+    /// and the rule tightens to an equality with no edit.
     eutxos: EutxoSet,
 }
 
@@ -2878,9 +2887,10 @@ impl CommittedState {
     /// **Every satoshi this state says someone holds**, in satoshis: the sum
     /// of every place a coin can sit in committed state.
     ///
-    /// Five places, and the list is exhaustive by construction — a coin that
+    /// Six terms, and the list is exhaustive by construction — a coin that
     /// sat anywhere else could not be committed, because the state root has no
-    /// other value-bearing component (`state_root`'s tag list):
+    /// other value-bearing component (`state_root`'s tag list). Five are
+    /// places a coin sits:
     ///
     /// 1. the unspent-output set (`TAG_EUTXO`) — spendable coins;
     /// 2. bonded stake, `ValidatorRecord::staked_sat` summed over the whole
@@ -2897,9 +2907,43 @@ impl CommittedState {
     ///    delegators' settled share, which lives in a ledger rather than in
     ///    their delegation records for the reason those docs give.
     ///
-    /// `delegator_slash_losses` is deliberately **not** here: it records value
-    /// destroyed, not value held, and adding a burn ledger to a total of
-    /// holdings would cancel the very burn the invariant should see.
+    /// and **minus** the sixth term, which is a debit and not a holding:
+    ///
+    /// 6. `delegator_slash_losses` (`TAG_DELEGATOR_SLASH_LOSS`) — satoshis a
+    ///    slash destroyed out of delegated bonds.
+    ///
+    /// # Why the slash ledger is subtracted, and why getting this wrong was a
+    /// # hole in the invariant rather than a rounding note
+    ///
+    /// `apply_slash` computes each delegation's pro-rata loss and **does not
+    /// mutate the delegation record** (`delegation::apply_slash` returns a
+    /// vector; the operator's own bond is debited from `staked_sat`, the
+    /// delegators' side is only recorded here). So term 3 above keeps
+    /// reporting the delegators' pre-slash `amount_sat` forever, and the burn
+    /// is invisible to a total that stops at five terms.
+    ///
+    /// That is not a cosmetic understatement of a burn. The whistleblower is
+    /// paid `total_slashed / 32` where `total_slashed` covers the operator's
+    /// bond **and** every delegated bond behind it
+    /// (`slashing::WHISTLEBLOWER_QUOTIENT`), and that payment lands in
+    /// `pending_fee_rewards`, which term 4 *does* count. Five terms therefore
+    /// move by `whistleblower − operator_loss` on a slash, which is
+    /// **positive** whenever the operator's own bond is under 1/32 of the
+    /// stake behind it — a heavily-delegated validator, i.e. exactly the
+    /// shape delegation exists to produce. The invariant would then refuse an
+    /// honest block: a false red in a consensus path, which is a halt.
+    ///
+    /// Subtracting the ledger makes both sides right at once. The delta over
+    /// a slash becomes `−(operator_loss + delegator_losses) + total/32`,
+    /// which is `−31/32` of the penalty: negative, so the burn is seen, and
+    /// safely inside `<=`, so no honest block is refused.
+    ///
+    /// `saturating_sub` on the aggregate: the ledger is bounded by the bonds
+    /// it was computed from (a validator is slashed at most once —
+    /// `SlashingState::ejected` and `rec.slashed` both refuse a second), so
+    /// it cannot exceed term 3. Saturating rather than asserting because a
+    /// consensus path must not panic, and a saturated total can only make the
+    /// left-hand side smaller, which is the direction that refuses nothing.
     ///
     /// # What this number is not
     ///
@@ -2929,11 +2973,43 @@ impl CommittedState {
     /// and the post state cancels, and burns can only move the total the safe
     /// way.
     pub fn accounted_supply_sat(&self) -> u128 {
-        self.eutxos.total_sat()
+        let held = self.eutxos.total_sat()
             + self.validators.values().map(|r| r.staked_sat).sum::<u128>()
             + self.delegations.iter().map(|d| d.amount_sat).sum::<u128>()
             + self.pending_fee_rewards.values().sum::<u128>()
-            + self.delegator_fee_rewards.values().sum::<u128>()
+            + self.delegator_fee_rewards.values().sum::<u128>();
+        let burned = self.delegator_slash_losses.values().sum::<u128>();
+        held.saturating_sub(burned)
+    }
+
+    /// How far this state's holdings sit above its issuance counter, in
+    /// satoshis: `accounted_supply_sat() - issued_sat()`, signed.
+    ///
+    /// **The genesis leg of the invariant, made visible instead of assumed.**
+    /// The conservation rule in `compute_post_state` is a *delta* — it judges
+    /// how the two numbers move relative to each other — so a constant offset
+    /// present at slot 0 cancels on every block and is never observed. That
+    /// is the right rule (see [`Self::accounted_supply_sat`]) and it leaves
+    /// the opening itself unjudged, which is precisely where Genesis-4's
+    /// 1,600,000 BLOCH went: `CommittedState::genesis` bonds the launch
+    /// cohort's `staked_sat` while seeding `issued_sat` from
+    /// `tokenomics_v4::GENESIS_ISSUED_SAT`, which sums the carryover and the
+    /// allocation buckets and not the bonds.
+    ///
+    /// So this returns a positive number at genesis, and that is a fact about
+    /// a live chain rather than a bug to be fixed here: `issued_sat` is
+    /// committed state, and rewriting a running chain's slot 0 is a relaunch.
+    /// What this accessor buys is that the offset is *named, readable and
+    /// pinned by test* (`the_genesis_supply_gap_is_exactly_the_cohorts_bonds`)
+    /// rather than an unexplained constant discovered later by someone
+    /// wondering why two supply figures disagree.
+    ///
+    /// Signed, because it goes negative in ordinary operation: burns are
+    /// one-way and uncounted, so a chain that has run for a while holds less
+    /// than it has issued. `i128` cannot overflow on the difference — both
+    /// terms are bounded by `TOTAL_SUPPLY_SAT`, 54% of `u64::MAX`.
+    pub fn supply_gap_sat(&self) -> i128 {
+        self.accounted_supply_sat() as i128 - self.issued_sat as i128
     }
 
     /// Does `post` hold no more than `pre` plus what the transition between
@@ -3179,7 +3255,9 @@ impl CommittedState {
                         // punishes honest validators. Bounded by
                         // `epoch_issuance <= headroom`, so it cannot pass the
                         // cap (pinned by `emission_stops_at_the_cap`).
-                        st.issued_sat += payout.operator;
+                        if !mutation_mints_from_nothing() {
+                            st.issued_sat += payout.operator;
+                        }
                     }
                 }
             }
@@ -3362,6 +3440,28 @@ fn with_leak_applied(roster: Vec<Validator>, leaked_of: impl Fn(u32) -> u64) -> 
         // `the_two_call_sites_agree_on_the_index_set_with_a_real_leak`.
         .filter(|v| !mutation_leak_drops_zeroed() || v.effective_stake > 0)
         .collect()
+}
+
+/// **MUTATION SWITCH.** `true` makes `close_epoch` credit the epoch's reward
+/// into the operator's bond **without advancing `issued_sat`** — a mint from
+/// nothing, planted on the production path.
+///
+/// It is the mutation the supply-conservation invariant exists for, and the
+/// only one that distinguishes it from the hard cap beside it: the counter
+/// stays below `TOTAL_SUPPLY_SAT` forever, so `SupplyCapExceeded` never
+/// fires, while the ledger grows every epoch. Pinned by
+/// `an_inflated_bond_is_refused_as_unconserved_supply`.
+///
+/// Constant `false` in every build that is not a test build, so the branch
+/// folds away and the switch cannot exist in a shipped binary.
+#[inline]
+fn mutation_mints_from_nothing() -> bool {
+    #[cfg(test)]
+    {
+        return crate::params::rehearsal::mint_from_nothing();
+    }
+    #[cfg(not(test))]
+    false
 }
 
 /// **MUTATION SWITCH.** `true` makes [`with_leak_applied`] drop a fully-leaked

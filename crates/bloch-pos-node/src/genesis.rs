@@ -914,23 +914,68 @@ impl Manifest {
     /// a withdrawal path exists. A supply check that counted only the outputs
     /// would be counting the smaller half of the money.
     ///
-    /// **This is the term that was missing, and 1,600,000 BLOCH went through
+    /// **This is the term that had no name, and 1,600,000 BLOCH went through
     /// the hole.** Genesis-4 mainnet bonds 64 validators at 25,000 BLOCH each
-    /// while [`Self::genesis_issued_sat`] summed the carryover and the
+    /// while [`Self::genesis_issued_sat`] sums the carryover and the
     /// allocations only, so the ceremony's arithmetic balanced with the
     /// cohort's entire stake outside it — minted from nothing, at slot 0, by a
     /// check that reported the manifest added up.
+    ///
+    /// Naming it does not un-mint it; that chain is running. What it changes
+    /// is that the quantity is now summed, printed by `genesis-mainnet`, and
+    /// checkable through [`Self::check_bonds_are_funded`], so the next
+    /// ceremony cannot repeat the omission without seeing it.
     pub fn genesis_bonded_sat(&self) -> u128 {
         self.validators.iter().map(|v| v.stake_sat).sum()
     }
 
-    /// What genesis puts into existence: carried balances, plus allocations,
-    /// plus the stake it bonds ([`Self::genesis_bonded_sat`] — see there for
-    /// why bonded stake is issuance and not bookkeeping).
+    /// What genesis **funds**: carried balances plus allocations.
+    ///
+    /// Deliberately *not* including [`Self::genesis_bonded_sat`], and the
+    /// name is the reason. This is the number that must equal
+    /// `tokenomics_v4::GENESIS_ISSUED_SAT`, because that constant is what
+    /// `CommittedState::genesis` seeds the committed `issued_sat` counter
+    /// with — so this function has to mean exactly what the counter means, or
+    /// the check below verifies a different quantity from the one the chain
+    /// commits.
+    ///
+    /// The bonds are real coins all the same. They are counted by
+    /// [`Self::genesis_accounted_sat`], and the difference between the two —
+    /// [`Self::genesis_unfunded_bonded_sat`] — is the supply gap Genesis-4
+    /// opened with.
     pub fn genesis_issued_sat(&self) -> u128 {
         self.carryover.as_ref().map_or(0, |c| c.total_sat)
             + self.allocations.iter().map(|a| a.amount_sat).sum::<u128>()
-            + self.genesis_bonded_sat()
+    }
+
+    /// Every satoshi that exists the instant this manifest's genesis block is
+    /// committed: what it funds, plus what it bonds.
+    ///
+    /// The manifest-side mirror of
+    /// `CommittedState::accounted_supply_sat`, and it must stay that: at slot
+    /// 0 the committed state holds exactly the carryover and allocation
+    /// outputs (in the eUTXO set) and the cohort's bonds (in the registry).
+    /// Pinned against the committed state by
+    /// `genesis_accounting_matches_the_committed_state`.
+    pub fn genesis_accounted_sat(&self) -> u128 {
+        self.genesis_issued_sat() + self.genesis_bonded_sat()
+    }
+
+    /// Coins this manifest bonds that its issuance never accounted for —
+    /// `genesis_accounted_sat() - genesis_issued_sat()`, i.e. exactly
+    /// [`Self::genesis_bonded_sat`], stated under the name that says what is
+    /// wrong with it.
+    ///
+    /// **1,600,000 BLOCH on Genesis-4 mainnet** (64 validators × 25,000).
+    /// Non-zero is not a manifest defect that [`Self::check_supply`] can
+    /// refuse, because the mainnet manifest is already signed and its chain
+    /// is already running: the fix would be a relaunch, not a check. What is
+    /// available is to make the number impossible to sign *by accident* —
+    /// [`Self::check_bonds_are_funded`] states the clean rule and
+    /// `genesis-mainnet` prints this figure on every generation, so the next
+    /// ceremony decides about it deliberately.
+    pub fn genesis_unfunded_bonded_sat(&self) -> u128 {
+        self.genesis_bonded_sat()
     }
 
     /// Refuse a manifest that does not add up.
@@ -954,19 +999,56 @@ impl Manifest {
         // cap disagree and one of them silently wins.
         let expected = t::GENESIS_ISSUED_SAT;
         if self.carryover.is_some() && issued != expected {
-            // The message names the bonded half explicitly, because that is
-            // the term this check gained on 2026-09-03 and the one a ceremony
-            // operator will not expect to see inside a supply error. A
-            // manifest that balanced before this line existed now fails by
-            // exactly the stake it bonds, and the fix is to fund the cohort
-            // out of an allocation bucket — not to widen the check back.
+            // The message names the bonded stake even though this check does
+            // not judge it, because a ceremony operator reading a supply error
+            // needs both figures in front of them: the one that failed and the
+            // one that is unfunded on purpose (see `check_bonds_are_funded`).
             return Err(format!(
-                "genesis issues {issued} sat (carryover + allocations + {} sat \
-                 bonded to {} genesis validators); tokenomics §3 says {expected} \
-                 (difference {})",
+                "genesis funds {issued} sat (carryover + allocations); \
+                 tokenomics §3 says {expected} (difference {}); \
+                 {} sat additionally bonded to {} genesis validators",
+                issued.abs_diff(expected),
                 self.genesis_bonded_sat(),
                 self.validators.len(),
-                issued.abs_diff(expected)
+            ));
+        }
+        Ok(())
+    }
+
+    /// The exhaustive genesis rule: **every bonded satoshi must have been
+    /// funded**, i.e. `genesis_accounted_sat() == GENESIS_ISSUED_SAT`.
+    ///
+    /// Separate from [`Self::check_supply`], and **not** wired into any exit
+    /// path, on purpose. This is the rule Genesis-4 should have launched
+    /// under and did not: the mainnet manifest bonds 1,600,000 BLOCH outside
+    /// its issuance, so folding this into `check_supply` would make the node's
+    /// own `genesis-mainnet` subcommand refuse to regenerate the artifact the
+    /// live chain is running from — a check that fails on committed history
+    /// is not a check, it is a broken tool.
+    ///
+    /// So it ships stated rather than enforced, which is the same posture as
+    /// every activation constant in `params`: the correct behaviour exists,
+    /// is tested on both sides, and binds when someone decides it does. What
+    /// it costs to adopt is one line at each `check_supply` call site, and
+    /// what adopting it requires first is funding the cohort out of an
+    /// allocation bucket — a tokenomics decision, not a code change.
+    ///
+    /// Devnet manifests (no carryover) are exempt for the same reason
+    /// `check_supply` exempts them: they issue nothing and bond play money.
+    pub fn check_bonds_are_funded(&self) -> Result<(), String> {
+        use bloch_pos_committee::tokenomics_v4 as t;
+        if self.carryover.is_none() {
+            return Ok(());
+        }
+        let accounted = self.genesis_accounted_sat();
+        if accounted != t::GENESIS_ISSUED_SAT {
+            return Err(format!(
+                "genesis holds {accounted} sat at slot 0 (funded {} + bonded {}), \
+                 but issues {}; {} sat of validator stake is minted from nothing",
+                self.genesis_issued_sat(),
+                self.genesis_bonded_sat(),
+                t::GENESIS_ISSUED_SAT,
+                accounted.abs_diff(t::GENESIS_ISSUED_SAT),
             ));
         }
         Ok(())
