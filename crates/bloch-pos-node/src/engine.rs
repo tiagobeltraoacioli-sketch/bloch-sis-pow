@@ -3826,7 +3826,7 @@ mod forkchoice_tests {
     /// admitting stake minted from nothing.
     ///
     /// It does now carry a signature — a proof of possession over its own
-    /// fields, checked by the transition (`staking::validate_wire_deposit_key`)
+    /// fields, checked by the transition (`staking::validate_wire_deposit`)
     /// so that the key the state root commits is one its depositor can
     /// actually sign under. That proves who owns the KEY; it proves nothing
     /// about where the STAKE came from, which is the separate hole this

@@ -269,6 +269,49 @@ pub enum DepositReject {
     BadProofOfPossession,
 }
 
+/// The deposit rules that depend on neither the funding inputs nor a proof of
+/// possession: suite tag, hybrid public-key geometry, and the
+/// `[MIN_DEPOSIT_SAT, max_stake_sat]` bounds.
+///
+/// **This function is the sole owner of those three rules.** Every deposit
+/// path in the crate reaches them through here and nowhere else:
+/// [`validate_deposit`] (the §7.1 [`DepositTx`] form) and
+/// [`validate_wire_deposit`] (the wire form the state transition actually
+/// sees) both call it, and `transition::apply_transaction`'s `Deposit` arm
+/// states none of them inline. That is the point of the split: the arm used to
+/// re-derive the bounds itself and `validate_wire_deposit_key` used to
+/// re-derive the geometry itself, which is two copies of one consensus rule
+/// and therefore two places for it to drift.
+///
+/// **Why a wrong-length key is [`DepositReject::WrongSuite`].** The suite tag
+/// and the key geometry are one fact, not two: `SUITE_MLDSA65_FALCON1024` *is*
+/// "ML-DSA-65 ‖ Falcon-1024", so a byte string whose length is not
+/// [`HYBRID_PK_BYTES`] is not a key in that suite. Reusing the existing variant
+/// keeps [`DepositReject`] frozen — `interfaces.rs` owns that taxonomy — and
+/// avoids inventing a second, subtly different reason for the same refusal.
+/// [`validate_deposit`] itself can never hit that arm: its key is
+/// `[u8; HYBRID_PK_BYTES]`, so the type already decided.
+///
+/// Check order is cheapest-first and identical for every caller, so two
+/// callers cannot disagree about which rule a deposit broke.
+pub fn deposit_shape(
+    suite: u16,
+    pubkey_len: usize,
+    amount_sat: u128,
+    max_stake_sat: u128,
+) -> Result<(), DepositReject> {
+    if suite != SUITE_MLDSA65_FALCON1024 || pubkey_len != HYBRID_PK_BYTES {
+        return Err(DepositReject::WrongSuite);
+    }
+    if amount_sat < MIN_DEPOSIT_SAT {
+        return Err(DepositReject::BelowMinimum);
+    }
+    if amount_sat > max_stake_sat {
+        return Err(DepositReject::AboveMaximum);
+    }
+    Ok(())
+}
+
 /// Validate a `DEPOSIT` against §7.1 and §4.1.
 ///
 /// `max_stake_sat` is a parameter, not a constant, because
@@ -293,19 +336,25 @@ pub fn validate_deposit(
     }
     // Shielded before tainted: a shielded input has no public ancestry, so
     // its taint status is unknowable — reporting it as "tainted" would imply
-    // the taint check ran, which it cannot.
+    // the taint check ran, which it cannot. These two are input rules, so they
+    // stay here rather than in `deposit_shape`: the wire form has no inputs to
+    // judge, and a shared helper that silently passed an empty slice would be
+    // reporting "inputs checked" about a deposit that has none.
     if inputs.iter().any(|i| !i.transparent) {
         return Err(DepositReject::ShieldedInput);
     }
     if inputs.iter().any(|i| i.tainted) {
         return Err(DepositReject::TaintedInput);
     }
-    if tx.amount_sat < MIN_DEPOSIT_SAT {
-        return Err(DepositReject::BelowMinimum);
-    }
-    if tx.amount_sat > max_stake_sat {
-        return Err(DepositReject::AboveMaximum);
-    }
+    // Suite, key geometry and bounds — from their owner, not restated. The
+    // suite is re-tested inside `deposit_shape`; that redundancy is deliberate
+    // and it is the cheap direction. Hoisting the suite check above the input
+    // rules is what preserves this function's documented cheapest-first order,
+    // and `deposit_shape` must still test it for the callers that do not come
+    // through here. The key-geometry arm is unreachable from this call:
+    // `validator_pubkey` is `[u8; HYBRID_PK_BYTES]`, so the type already
+    // decided its length.
+    deposit_shape(tx.suite, tx.validator_pubkey.len(), tx.amount_sat, max_stake_sat)?;
     if !verify_hybrid(&tx.validator_pubkey, &tx.signing_root(), &tx.proof_of_possession, verifier)
     {
         return Err(DepositReject::BadProofOfPossession);
@@ -358,8 +407,26 @@ pub fn wire_deposit_pop_root(
     h.finalize().into()
 }
 
-/// Validate a wire-form deposit's **key**: that it is the right shape, and
-/// that whoever submitted it holds the secret half.
+/// Validate a wire-form deposit: the funding-independent rules
+/// ([`deposit_shape`]) plus the one rule only this form can carry — that
+/// whoever submitted it holds the secret half of the key it registers.
+///
+/// ## This is the single owner of wire-deposit validation
+///
+/// `transition::apply_transaction`'s `Deposit` arm calls exactly this, and
+/// states no deposit rule of its own. The shape half is not re-derived here
+/// either: it is [`deposit_shape`], the same function [`validate_deposit`]
+/// calls for the §7.1 form, so suite, key geometry and the
+/// `[MIN_DEPOSIT_SAT, max_stake_sat]` bounds have one definition in the crate.
+/// Before this reconciliation there were two — an inline
+/// `pubkey.len() != HYBRID_PK_BYTES` here and inline amount bounds in the
+/// transition arm — and a consensus rule with two derivations is a fork
+/// waiting for one of them to be edited.
+///
+/// `max_stake_sat` is a parameter for the reason [`validate_deposit`] gives:
+/// the cap is 1% of *committed active stake* (§4.1.3), so only the caller
+/// holding the parent state can derive it, and §5.5 forbids reading it from
+/// anything node-local.
 ///
 /// ## Why the state transition has to do this, and why now
 ///
@@ -407,27 +474,25 @@ pub fn wire_deposit_pop_root(
 /// caller's first check, read from committed state, and a second copy of a
 /// consensus gate is a second thing that can drift.
 ///
-/// State-dependent rules the caller still owns, because they need the
-/// registry this function cannot see: the amount floor and the per-validator
-/// cap ([`validate_deposit`] takes the cap as a parameter for the same
-/// reason), and whether the key is already registered.
-pub fn validate_wire_deposit_key(
+/// The one rule that stays with the caller is the one this function cannot
+/// see: whether the key is already registered, which is a question about the
+/// registry, not about the deposit.
+pub fn validate_wire_deposit(
     pubkey: &[u8],
     amount_sat: u128,
     randao_commitment: &[u8; 32],
     withdrawal_credentials: &[u8],
     commission_bps: u128,
     proof_of_possession: &[u8],
+    max_stake_sat: u128,
     verifier: &dyn crate::attestation::SignatureVerifier,
 ) -> Result<(), DepositReject> {
-    // Shape first. `HYBRID_PK_BYTES` is the suite's geometry (§6.2), so a key
-    // of any other length is not "a key that fails to verify" — it is not a
-    // `SUITE_MLDSA65_FALCON1024` key at all, which is what `WrongSuite` says.
-    // The wire form carries no suite tag to check instead; its length IS the
-    // tag.
-    if pubkey.len() != HYBRID_PK_BYTES {
-        return Err(DepositReject::WrongSuite);
-    }
+    // Shape and bounds first, from their owner. The suite is passed as the
+    // constant because this encoding has no suite field — its key LENGTH is
+    // the tag, which is exactly the fact `deposit_shape` folds into
+    // `WrongSuite`. Stated plainly so nobody reads this call as proof that the
+    // wire form is suite-checked: it is not, and it cannot be.
+    deposit_shape(SUITE_MLDSA65_FALCON1024, pubkey.len(), amount_sat, max_stake_sat)?;
     let root = wire_deposit_pop_root(
         pubkey,
         amount_sat,
@@ -831,6 +896,129 @@ mod tests {
             validate_deposit(&tx, &transparent_clean(), MAX_STAKE, &accept_all()),
             Err(DepositReject::BadProofOfPossession)
         );
+    }
+
+    // -- the wire form, and the single owner it shares with §7.1 -------------
+    //
+    // `deposit_shape` is the only definition of three consensus rules — suite,
+    // key geometry, amount bounds. These tests exist to keep it that way: each
+    // asserts that the WIRE path reaches a rule it does not itself state, so
+    // re-inlining any of them at either call site would have to make one of
+    // these disagree with `deposit_shape` before it could pass.
+
+    /// A verifier that binds a signature to (key, message) exactly. An
+    /// accept-everything double would make every test below pass with the
+    /// proof-of-possession check deleted.
+    struct BindVerifier;
+
+    fn bound_sig(pubkey: &[u8], root: &[u8; 32]) -> Vec<u8> {
+        let mut h = Sha3_256::new();
+        h.update(pubkey);
+        h.update(root);
+        h.finalize().to_vec()
+    }
+
+    impl crate::attestation::SignatureVerifier for BindVerifier {
+        fn verify_with_key(&self, pubkey: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
+            sig == bound_sig(pubkey, root).as_slice()
+        }
+    }
+
+    /// A wire deposit whose proof really verifies under [`BindVerifier`].
+    fn wire(pubkey: Vec<u8>, amount_sat: u128) -> (Vec<u8>, u128, [u8; 32], Vec<u8>, u128, Vec<u8>)
+    {
+        let randao = [0x1A; 32];
+        let creds = vec![0x1B; 20];
+        let commission = 500u128;
+        let root = wire_deposit_pop_root(&pubkey, amount_sat, &randao, &creds, commission);
+        let pop = bound_sig(&pubkey, &root);
+        (pubkey, amount_sat, randao, creds, commission, pop)
+    }
+
+    fn check_wire(
+        d: &(Vec<u8>, u128, [u8; 32], Vec<u8>, u128, Vec<u8>),
+        max_stake_sat: u128,
+    ) -> Result<(), DepositReject> {
+        validate_wire_deposit(&d.0, d.1, &d.2, &d.3, d.4, &d.5, max_stake_sat, &BindVerifier)
+    }
+
+    /// The composition itself: for every input that `deposit_shape` refuses,
+    /// the wire path refuses it with the SAME variant — and for the one it
+    /// accepts, the wire path gets as far as the proof of possession. If the
+    /// wire path ever grew its own copy of a shape rule, it could disagree
+    /// here without anything else in the suite noticing.
+    #[test]
+    fn the_wire_path_reaches_the_shape_rules_through_their_owner() {
+        let good = HYBRID_PK_BYTES;
+        let cases: [(usize, u128); 5] = [
+            (good, MIN_DEPOSIT_SAT),          // accepted by both
+            (good - 1, MIN_DEPOSIT_SAT),      // WrongSuite (geometry)
+            (0, MIN_DEPOSIT_SAT),             // WrongSuite (geometry)
+            (good, MIN_DEPOSIT_SAT - 1),      // BelowMinimum
+            (good, MAX_STAKE + 1),            // AboveMaximum
+        ];
+        for (len, amount) in cases {
+            let owner = deposit_shape(SUITE_MLDSA65_FALCON1024, len, amount, MAX_STAKE);
+            let d = wire(vec![0x2C; len], amount);
+            assert_eq!(
+                check_wire(&d, MAX_STAKE),
+                owner,
+                "wire path and `deposit_shape` disagree at len={len}, amount={amount}"
+            );
+        }
+    }
+
+    /// The bounds really are enforced on the wire path — not merely delegated
+    /// to a function nobody calls. Sabotage: drop the `deposit_shape` call
+    /// from `validate_wire_deposit` and both halves of this go green as
+    /// `Ok(())`, because the proof itself is valid over the out-of-bounds
+    /// amount.
+    #[test]
+    fn a_perfectly_proved_wire_deposit_is_still_bounded() {
+        let low = wire(vec![0x3D; HYBRID_PK_BYTES], MIN_DEPOSIT_SAT - 1);
+        assert_eq!(check_wire(&low, MAX_STAKE), Err(DepositReject::BelowMinimum));
+        let high = wire(vec![0x3D; HYBRID_PK_BYTES], MAX_STAKE + 1);
+        assert_eq!(check_wire(&high, MAX_STAKE), Err(DepositReject::AboveMaximum));
+        // The control: same key, same proof recipe, an in-bounds amount.
+        let ok = wire(vec![0x3D; HYBRID_PK_BYTES], MAX_STAKE);
+        assert_eq!(check_wire(&ok, MAX_STAKE), Ok(()));
+    }
+
+    /// Shape before the ~4.6 KB verification, so a malformed key costs a
+    /// length comparison and not a hybrid verify. Stated as an observable:
+    /// a wrong-length key with garbage in the proof reports `WrongSuite`, the
+    /// shape verdict, never `BadProofOfPossession`.
+    #[test]
+    fn shape_is_decided_before_the_proof_is_verified() {
+        let mut d = wire(vec![0x4E; HYBRID_PK_BYTES - 1], MIN_DEPOSIT_SAT);
+        d.5 = vec![0xFF; 8];
+        assert_eq!(check_wire(&d, MAX_STAKE), Err(DepositReject::WrongSuite));
+    }
+
+    /// The proof is still the wire path's own rule: a well-shaped, in-bounds
+    /// deposit whose proof was made under a DIFFERENT key is refused.
+    #[test]
+    fn a_rogue_key_fails_the_wire_paths_own_rule() {
+        let victim = vec![0x5F; HYBRID_PK_BYTES];
+        let attacker = vec![0x6A; HYBRID_PK_BYTES];
+        let mut d = wire(victim, MIN_DEPOSIT_SAT);
+        let root = wire_deposit_pop_root(&d.0, d.1, &d.2, &d.3, d.4);
+        d.5 = bound_sig(&attacker, &root);
+        assert_eq!(check_wire(&d, MAX_STAKE), Err(DepositReject::BadProofOfPossession));
+    }
+
+    /// `validate_deposit` (§7.1 form) reaches the same owner. Its geometry arm
+    /// is unreachable — the type fixes the length — so what is pinned here is
+    /// that the bounds verdicts are the owner's, byte for byte.
+    #[test]
+    fn the_typed_path_reaches_the_same_owner() {
+        for amount in [MIN_DEPOSIT_SAT - 1, MIN_DEPOSIT_SAT, MAX_STAKE, MAX_STAKE + 1] {
+            assert_eq!(
+                validate_deposit(&deposit(amount), &transparent_clean(), MAX_STAKE, &accept_all()),
+                deposit_shape(SUITE_MLDSA65_FALCON1024, HYBRID_PK_BYTES, amount, MAX_STAKE),
+                "typed path and `deposit_shape` disagree at amount={amount}"
+            );
+        }
     }
 
     // -- activation queue ---------------------------------------------------
