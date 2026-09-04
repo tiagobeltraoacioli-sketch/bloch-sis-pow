@@ -3768,7 +3768,7 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
         // an exit carrying no signature bytes at all can never verify, so
         // relaying one is free propagation of garbage every proposer then pays
         // to drop.
-        PosTransaction::ExitV2 { signature, .. } => {
+        PosTransaction::ExitV2 { epoch, signature, .. } => {
             if wall_epoch < bloch_pos_committee::params::EXIT_AUTH_ACTIVATION_EPOCH {
                 return Err(
                     "authenticated exits (tag 0x08) are not active: the format ships \
@@ -3776,13 +3776,60 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
                      not reached, and the wire byte is not assigned",
                 );
             }
-            if signature.is_empty() {
-                return Err("authenticated exit carries no signature — nothing authorises it");
-            }
-            Ok(())
+            exit_v2_structural_rules(*epoch, signature, wall_epoch)
         }
         _ => Ok(()),
     }
+}
+
+/// The structural half of admitting an [`PosTransaction::ExitV2`], split out
+/// of `admissible` so it can be TESTED.
+///
+/// It cannot be tested through `admissible` itself, and that is not an
+/// oversight in the test: `EXIT_AUTH_ACTIVATION_EPOCH` is `u64::MAX`, so the
+/// flag-day check in front of these rules refuses at every epoch any chain can
+/// reach, and no argument to `admissible` ever gets past it. Rules that only
+/// run after a flag day are exactly the rules that get to the flag day
+/// unexercised. Extracting them makes them a pure function of three values and
+/// therefore checkable today, on the tree the fleet runs, without arming
+/// anything.
+///
+/// Both rules mirror consensus (`CommittedState::apply_exit_v2`) rather than
+/// inventing relay policy:
+///
+/// - an exit with no signature bytes authorises nothing and can never verify,
+///   so relaying it is free propagation of garbage every proposer pays to drop;
+/// - the signed epoch must EQUAL the caller's epoch, because consensus binds
+///   the signed epoch to the inclusion epoch. Without this, a captured exit —
+///   and an exit is public the moment it is gossiped — would circulate for
+///   every future proposer to try, forever.
+///
+/// What it deliberately does NOT do is check the signature. That needs the
+/// validator's REGISTERED key, resolved through the committed `pubkey_index`,
+/// and this path is stateless by design (see `admissible`'s docs). The
+/// authorisation lives in consensus and only in consensus, which is the right
+/// place for it: a mempool verdict is relay policy, re-judged by the
+/// transition against the block's pre-state.
+fn exit_v2_structural_rules(
+    epoch: u64,
+    signature: &[u8],
+    wall_epoch: u64,
+) -> Result<(), &'static str> {
+    if signature.is_empty() {
+        return Err("authenticated exit carries no signature — nothing authorises it");
+    }
+    // Equality, matching consensus exactly, and NOT a window: a one-epoch
+    // grace here would relay messages consensus refuses, which is the
+    // mempool/consensus mismatch this arm exists to avoid. A sender caught by
+    // an epoch boundary re-signs for the epoch it is now in; an exit is not
+    // time-critical and the signature is the sender's to reissue.
+    if epoch != wall_epoch {
+        return Err(
+            "authenticated exit is signed for a different epoch than the one it would be \
+             included in; consensus binds the two, so this can never apply",
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4369,6 +4416,41 @@ mod admission_authorisation {
             admissible(&PosTransaction::Exit { validator: 0 }, 0).is_err(),
             "the unauthenticated Exit must remain refused"
         );
+    }
+
+    /// The rules BEHIND the flag day, exercised today.
+    ///
+    /// `authenticated_exits_are_refused_until_the_flag_day` proves the gate
+    /// shuts the door; it cannot prove anything about what is on the other
+    /// side of it, because nothing gets there. That is the standing hazard
+    /// with a gated feature: the code that only runs after a flag day is the
+    /// code that arrives at the flag day never having run. So the structural
+    /// rules are a pure function and are tested as one.
+    ///
+    /// The epoch case is the load-bearing one. Consensus binds the signed
+    /// epoch to the inclusion epoch (`apply_exit_v2`), so an exit signed for
+    /// any other epoch is dead on arrival — and relaying it keeps a captured,
+    /// publicly gossiped retirement circulating for every future proposer to
+    /// try. Both directions are pinned: stale and premature.
+    #[test]
+    fn the_structural_exit_rules_bind_the_signature_and_the_epoch() {
+        let sig = vec![1u8; 64];
+
+        assert_eq!(exit_v2_structural_rules(7, &sig, 7), Ok(()), "the genuine shape is admitted");
+
+        assert!(
+            exit_v2_structural_rules(7, &[], 7).is_err(),
+            "an exit with no signature bytes authorises nothing and can never verify",
+        );
+
+        for (signed_for, wall) in [(6u64, 7u64), (8, 7), (0, 1_400), (u64::MAX, 7)] {
+            let err = exit_v2_structural_rules(signed_for, &sig, wall)
+                .expect_err("only the inclusion epoch's own signature may be relayed");
+            assert!(
+                err.contains("epoch"),
+                "the refusal must name the binding that causes it, got: {err}",
+            );
+        }
     }
 
     #[test]

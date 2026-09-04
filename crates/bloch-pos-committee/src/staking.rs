@@ -137,6 +137,29 @@ pub const MAX_ACTIVATIONS_PER_EPOCH: usize = 4;
 /// one verdict on every block until the day.
 pub const MAX_EXITS_PER_EPOCH: usize = 4;
 
+/// The churn budget's accounting rests on ONE arithmetic fact, so it is
+/// checked at compile time rather than described in a doc comment.
+///
+/// `voluntary_exits_this_epoch` counts the records whose `exit_epoch` equals
+/// `epoch + EXIT_DELAY_EPOCHS`, and it is allowed to do that *only* because a
+/// slashing ejection writes `exit_epoch = epoch` with no delay. Those two
+/// numbers are distinguishable exactly while [`EXIT_DELAY_EPOCHS`] is
+/// non-zero. Set it to zero and the two paths become indistinguishable in
+/// state: a wave of ejections would silently consume the voluntary budget and
+/// freeze honest exits, and an attacker could buy immunity from ejection by
+/// spending the epoch's exits first — a consensus rule quietly changing
+/// meaning because an unrelated constant moved.
+///
+/// A `const` assertion, not a runtime one: it costs nothing, cannot be
+/// compiled out the way `debug_assert!` was in the 2026-08-21 roster split,
+/// and it fails the build of whoever edits the delay rather than a node in
+/// production.
+const _: () = assert!(
+    EXIT_DELAY_EPOCHS > 0,
+    "MAX_EXITS_PER_EPOCH accounting distinguishes a voluntary exit from a slashing \
+     ejection by the delay alone; with EXIT_DELAY_EPOCHS = 0 they are the same number",
+);
+
 /// Epochs between a voluntary exit and the validator no longer being assigned
 /// duties (§5.1: ~8.5 h). Non-zero so an exit cannot be used to dodge duties
 /// — or slashing for duties already assigned — within the same epoch.

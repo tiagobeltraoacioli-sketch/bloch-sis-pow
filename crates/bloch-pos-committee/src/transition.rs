@@ -2396,6 +2396,27 @@ impl CommittedState {
     /// [`crate::params::EXIT_AUTH_ACTIVATION_EPOCH`]; the caller holds the
     /// gate, this function holds the rules.
     ///
+    /// # Where this runs — the whole chain, written down
+    ///
+    /// `Transition::apply_block` → `compute_post_state` step 10 → the
+    /// transaction loop's `_ => st.apply_transaction(..)` → the `ExitV2` arm →
+    /// here. There is no second dispatcher and no parallel validator: step 10
+    /// names only `SlashingEvidence` and routes everything else through
+    /// `apply_transaction`, so this is the ONE path a block's transactions
+    /// take on every node. `exit_v2_transitions_through_apply_block_and_is_inert_below_the_gate`
+    /// drives a real signed block down it rather than asserting it here, for
+    /// the reason `derive::validate_block` exists as a warning: a rule
+    /// exercised only at its own seam can be correct and unreachable at once.
+    ///
+    /// And it is reachable in exactly the sense that matters and no further.
+    /// **Nothing on the fleet executes this today**, and nothing can: the gate
+    /// is `u64::MAX`, so the caller refuses before this function is entered,
+    /// and the wire byte is unassigned so no gossiped message could carry an
+    /// `ExitV2` even if it were open. Arming is the founder's, and it has an
+    /// unmet precondition. What is claimed here is narrower and checkable:
+    /// spec-correct, composed with the real handler, and tested under a
+    /// rehearsal gate, so that WHEN it is armed it is right.
+    ///
     /// Check order is cheapest-first, the discipline the whole crate keeps:
     /// epoch equality, identity resolution, lifecycle, the churn budget, and
     /// only then the one hybrid verification (~145 µs). An attacker spamming
@@ -5723,6 +5744,375 @@ mod tests {
             0,
             "an ejection is not a voluntary exit and must not consume the budget",
         );
+    }
+
+    // -- B4 HARDENING: the production apply path, end to end ----------------
+
+    /// `build_block`, minus the "and this block transitions" assertion.
+    ///
+    /// The header is stamped by the same `derive` functions the validator
+    /// checks with and signed over a `state_root` of zeros. Every check
+    /// `compute_post_state` makes *before* step 10 — slot, parent, version,
+    /// body/attestation/coherence roots, the sortition draw, the RANDAO
+    /// reveal, the proposer signature — therefore still passes, and the block
+    /// reaches the transaction arms and reports the transaction's own error.
+    /// The bogus root is never the verdict, because step 12 runs after step
+    /// 10.
+    ///
+    /// `build_block` cannot serve here: it calls `compute_post_state` and
+    /// `expect`s success, which is precisely what a test about a body
+    /// consensus refuses must not require. Without this helper the only way
+    /// to reach a rejecting transaction arm through the real handler is to
+    /// build the block under a gate you then close — which works for the
+    /// flag-day tests, and does not work for a body that is invalid on BOTH
+    /// sides of the gate (an exhausted churn budget, a replayed exit).
+    fn stamped_block_unproven_root(
+        pre: &CommittedState,
+        slot: u64,
+        txs: &[PosTransaction],
+        chains: &mut [RandaoChain],
+    ) -> ProposalEnvelope {
+        let mut ctx = pre.clone();
+        while ctx.epoch < crate::epoch_of(slot) {
+            ctx = ctx.close_epoch();
+        }
+        let roster = ctx.duty_roster();
+        let seed = ctx.seed_for_epoch(ctx.epoch);
+        let p = schedule::proposer(&seed, slot, &roster).expect("no eligible proposer");
+        let reveal = chains[p as usize].next_reveal().expect("chain spent");
+        let mix = beacon::mix_in(&ctx.randao_mix, &reveal);
+        let fin = ctx.finality_view();
+        let header = BlockHeaderV4 {
+            version: BLOCK_VERSION_V4,
+            parent: *pre.head.as_bytes(),
+            state_root: [0u8; 32],
+            body_root: crate::derive::body_root(
+                &txs.iter().map(PosTransaction::canonical_bytes).collect::<Vec<_>>(),
+            ),
+            slot,
+            proposer_index: p,
+            randao_reveal: reveal,
+            randao_mix: mix,
+            justified_root: fin.justified.root,
+            finalized_root: fin.finalized.root,
+            attestation_root: crate::derive::attestation_root(&[]),
+            coherence_root: pre.coherence_root(),
+        };
+        let proposer_sig = match crate::attestation::KeyLookup::pubkey(pre, p) {
+            Some(pk) => toy_sign(pk, &header.proposal_signing_root()),
+            None => vec![0u8; 8],
+        };
+        ProposalEnvelope { header, proposer_sig }
+    }
+
+    /// **THE WIRING, PROVEN AT THE REAL BLOCK HANDLER** — and proven inert.
+    ///
+    /// Every other test in this section calls `apply_transaction` directly,
+    /// which is the seam, not the path. A rule that is only ever exercised at
+    /// its seam can be perfectly correct and still unreachable: the dispatcher
+    /// in `compute_post_state` step 10 routes `SlashingEvidence` by name and
+    /// everything else through `_ => apply_transaction`, and "everything else"
+    /// is an assumption until something drives a real block through it.
+    ///
+    /// So this drives one. `ToyVerifier`, never `OkVerifier`: the signature
+    /// has to be checked by the code under test, not waved through by the
+    /// fixture. Both halves are asserted, because each alone is misleading:
+    ///
+    /// - with the rehearsal gate OPEN the exit transitions end to end through
+    ///   `apply_block` — body root, proposer signature, state root and all —
+    ///   and the registry record it wrote is visible in the post-state, so the
+    ///   handler reached `apply_exit_v2` rather than skipping an unknown
+    ///   variant;
+    /// - with the gate CLOSED — the configuration every node on the fleet runs
+    ///   today, `EXIT_AUTH_ACTIVATION_EPOCH` being `u64::MAX` — the SAME block
+    ///   with the SAME body is invalid at the transaction.
+    ///
+    /// That second assertion is the honest statement of this feature's status:
+    /// spec-correct, composed with the real handler, and switched off. It is
+    /// not "wired to production" in the sense of executing on the fleet, and
+    /// it cannot be until the founder arms the constant — which is out of
+    /// scope here and has its own unmet precondition (the wire byte).
+    #[test]
+    fn exit_v2_transitions_through_apply_block_and_is_inert_below_the_gate() {
+        let (t, g, mut chains) = setup_funded(8, &[]);
+        let exit = signed_exit(1, 0);
+
+        let (b, applied_open) = {
+            let _open = crate::params::rehearsal::exit_auth_gate_open_guard();
+            let b = build_block(&t, &g, 1, &[], std::slice::from_ref(&exit), &mut chains);
+            let st = t
+                .apply_block(&g, &b, &[], std::slice::from_ref(&exit))
+                .expect("with the gate open an authenticated exit must transition end to end");
+            (b, st)
+        };
+
+        let rec = applied_open.validator_record(1).expect("validator 1 must still exist");
+        assert_eq!(
+            rec.exit_epoch,
+            staking::EXIT_DELAY_EPOCHS,
+            "the block handler did not reach apply_exit_v2: no exit was scheduled",
+        );
+        assert_eq!(
+            rec.withdrawable_epoch,
+            staking::EXIT_DELAY_EPOCHS.saturating_add(staking::WITHDRAWAL_DELAY_EPOCHS),
+            "the withdrawal clock must start from the exit's inclusion, not from zero",
+        );
+        assert_eq!(
+            applied_open.validator_record(0).unwrap().exit_epoch,
+            u64::MAX,
+            "an exit must retire the validator it names and no other",
+        );
+
+        assert_eq!(
+            t.apply_block(&g, &b, &[], std::slice::from_ref(&exit)),
+            Err(TransitionError::Transaction(0)),
+            "GATED INERT: on the rules this tree ships, that block is refused at the \
+             transaction by every node",
+        );
+    }
+
+    /// **THE CHURN CAP IS A PROPERTY OF THE EPOCH, ENFORCED BY THE BLOCK
+    /// HANDLER** — not of one block, and not of the mempool.
+    ///
+    /// This is the finding that matters most about a churn budget, and the one
+    /// a seam-level test cannot see. `bloch-pos-node`'s `admissible` is relay
+    /// policy: one modified producer lifts it for the whole network, which is
+    /// exactly the argument that put the authentication in consensus in the
+    /// first place. And a cap enforced per BLOCK would be no cap at all —
+    /// there are `SLOTS_PER_EPOCH` blocks in an epoch, so a 64-validator
+    /// roster would still empty inside one epoch, four at a time.
+    ///
+    /// So: spend the whole budget in block one, then put one more correctly
+    /// signed exit in block two of the SAME epoch, and the second block is
+    /// invalid. The budget survives across blocks because it is derived from
+    /// the committed registry (`voluntary_exits_this_epoch`) rather than from
+    /// a per-block counter — which is also why no replay path, no reordering
+    /// and no restart can reset it mid-epoch.
+    #[test]
+    fn the_churn_cap_binds_across_blocks_within_one_epoch() {
+        let _open = crate::params::rehearsal::exit_auth_gate_open_guard();
+        let n = staking::MAX_EXITS_PER_EPOCH as u32 + 2;
+        let (t, g, mut chains) = setup_funded(n + 4, &[]);
+
+        // Block one spends the epoch's whole budget, in one body.
+        let full: Vec<PosTransaction> =
+            (0..staking::MAX_EXITS_PER_EPOCH as u32).map(|v| signed_exit(v as u8, 0)).collect();
+        let b1 = build_block(&t, &g, 1, &[], &full, &mut chains);
+        let s1 = t.apply_block(&g, &b1, &[], &full).expect("the budget itself must fit in a block");
+        assert_eq!(
+            s1.voluntary_exits_this_epoch(),
+            staking::MAX_EXITS_PER_EPOCH,
+            "fixture must actually spend the budget, or the next assertion is vacuous",
+        );
+        assert_eq!(
+            crate::epoch_of(1),
+            crate::epoch_of(2),
+            "both blocks must sit in ONE epoch or this test proves nothing",
+        );
+
+        // Block two, same epoch, one more genuine exit by a validator that has
+        // not exited and whose signature is its own.
+        let over = vec![signed_exit(staking::MAX_EXITS_PER_EPOCH as u8, 0)];
+        let b2 = stamped_block_unproven_root(&s1, 2, &over, &mut chains);
+        assert_eq!(
+            t.apply_block(&s1, &b2, &[], &over),
+            Err(TransitionError::Transaction(0)),
+            "a second block in the same epoch must not be able to re-open the churn budget",
+        );
+
+        // And the refusal is the budget, not the signature or the lifecycle:
+        // the same message applies the moment the epoch — and only the epoch —
+        // moves on.
+        let mut next = s1.clone();
+        next.epoch += 1;
+        assert_eq!(
+            next.voluntary_exits_this_epoch(),
+            0,
+            "last epoch's exits must not spend this epoch's budget",
+        );
+        assert!(
+            next.apply_transaction(
+                &signed_exit(staking::MAX_EXITS_PER_EPOCH as u8, 1),
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &ToyVerifier,
+            )
+            .is_ok(),
+            "the refusal above must have been the budget and nothing else",
+        );
+    }
+
+    /// **REPLAY, THE ONE THAT MATTERS: an old signed exit re-submitted
+    /// later.**
+    ///
+    /// The existing epoch-binding test only refuses exits signed for the
+    /// FUTURE, which is also all `staking::validate_exit` refuses (`epoch >
+    /// current_epoch`) — it is the reference validator and cannot know when
+    /// inclusion happens. Consensus can, and a past-signed exit is the
+    /// dangerous direction: an exit message is public the moment it is
+    /// gossiped, so under a `<=` rule anyone who ever signed one exit has
+    /// signed a permanent, unrevocable retirement that any future proposer can
+    /// cash at any time — and with `WITHDRAWAL_DELAY_EPOCHS` = 2,048 the
+    /// victim's bond is locked from whenever that happens to be.
+    ///
+    /// Equality is what closes it, and this pins equality in the direction the
+    /// weaker rule would have allowed, through the real block handler.
+    #[test]
+    fn an_old_signed_exit_cannot_be_replayed_in_a_later_epoch() {
+        let _open = crate::params::rehearsal::exit_auth_gate_open_guard();
+        let (t, g, mut chains) = setup_funded(8, &[]);
+
+        // Captured in epoch 0, exactly as it would have been gossiped.
+        let captured = signed_exit(1, 0);
+
+        // Time passes. The state rolls to a later epoch by the boundary walk,
+        // not by a test poking a field.
+        let mut later = g.clone();
+        for _ in 0..3 {
+            later = later.close_epoch();
+        }
+        assert_eq!(later.epoch, 3, "fixture must actually advance the epoch");
+
+        // Directly at the seam: refused.
+        let mut probe = later.clone();
+        assert_eq!(
+            probe.apply_transaction(
+                &captured,
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &ToyVerifier,
+            ),
+            Err(TxReject::StakingRule),
+            "a signature from epoch 0 must not authorise a retirement in epoch 3",
+        );
+        assert_eq!(
+            probe.validator_record(1).unwrap().exit_epoch,
+            u64::MAX,
+            "a refused replay must leave no trace on the record",
+        );
+
+        // And through the real block handler, which is where a proposer would
+        // actually try it.
+        let body = vec![captured];
+        let slot = 3 * crate::SLOTS_PER_EPOCH + 1;
+        let b = stamped_block_unproven_root(&later, slot, &body, &mut chains);
+        assert_eq!(
+            t.apply_block(&later, &b, &[], &body),
+            Err(TransitionError::Transaction(0)),
+            "a block replaying a stale exit must be invalid, not merely unrelayed",
+        );
+
+        // The validator can still leave — by signing for the epoch it is
+        // actually in. The rule refuses stale AUTHORISATION, never the exit.
+        let mut fresh = later.clone();
+        assert!(
+            fresh
+                .apply_transaction(
+                    &signed_exit(1, 3),
+                    0,
+                    fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                    &ToyVerifier,
+                )
+                .is_ok(),
+            "binding the epoch must not make voluntary exit impossible",
+        );
+    }
+
+    /// The other replay: the same message, in the epoch it was signed for,
+    /// submitted twice.
+    ///
+    /// Epoch equality cannot catch this one — the epoch is right. What catches
+    /// it is the `exit_epoch != u64::MAX` lifecycle check, and it has to,
+    /// because a second application would re-stamp `withdrawable_epoch` and
+    /// move a withdrawal clock that must never move once started. It also
+    /// keeps one validator from spending the whole epoch's churn budget by
+    /// resubmitting its own exit.
+    #[test]
+    fn an_applied_exit_cannot_be_replayed_in_its_own_epoch() {
+        let _open = crate::params::rehearsal::exit_auth_gate_open_guard();
+        let (_t, g, _c) = setup(4);
+        let mut st = g.clone();
+        let exit = signed_exit(1, 0);
+
+        assert!(
+            st.apply_transaction(
+                &exit,
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &ToyVerifier,
+            )
+            .is_ok(),
+            "the first application must succeed or the replay proves nothing",
+        );
+        let after_first = st.validator_record(1).unwrap();
+
+        for _ in 0..3 {
+            assert_eq!(
+                st.apply_transaction(
+                    &exit,
+                    0,
+                    fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                    &ToyVerifier,
+                ),
+                Err(TxReject::StakingRule),
+                "the identical message must not apply twice",
+            );
+        }
+        assert_eq!(
+            st.validator_record(1).unwrap(),
+            after_first,
+            "a refused replay must not move the withdrawal clock",
+        );
+        assert_eq!(
+            st.voluntary_exits_this_epoch(),
+            1,
+            "one validator's resubmissions must not eat the epoch's churn budget",
+        );
+    }
+
+    /// **THE OTHER HALF OF THE FLAG DAY.** Above the gate the unauthenticated
+    /// `Exit` is INVALID — and that is not tidiness, it is the churn cap's
+    /// load-bearing precondition.
+    ///
+    /// Legacy `Exit` carries no signature and its arm never consults a
+    /// verifier. If it stayed valid past the flag day, both new rules would be
+    /// decoration: anyone could retire anyone with tag `0x03` and never touch
+    /// `apply_exit_v2` at all. The two arms therefore have to flip on ONE
+    /// reader (`exit_auth_active`) — one gate, opposite directions, no epoch
+    /// in which both are live and none in which neither is.
+    #[test]
+    fn above_the_gate_the_legacy_exit_is_invalid_so_it_cannot_bypass_the_new_rules() {
+        let _open = crate::params::rehearsal::exit_auth_gate_open_guard();
+        let (t, g, mut chains) = setup_funded(8, &[]);
+
+        let legacy = vec![PosTransaction::Exit { validator: 1 }];
+        let mut probe = g.clone();
+        assert_eq!(
+            probe.apply_transaction(
+                &legacy[0],
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &ToyVerifier,
+            ),
+            Err(TxReject::StakingNotActive),
+            "past the flag day the unauthenticated message must be dead",
+        );
+        assert_eq!(
+            probe.validator_record(1).unwrap().exit_epoch,
+            u64::MAX,
+            "a refused legacy exit must leave no trace",
+        );
+
+        let b = stamped_block_unproven_root(&g, 1, &legacy, &mut chains);
+        assert_eq!(
+            t.apply_block(&g, &b, &[], &legacy),
+            Err(TransitionError::Transaction(0)),
+            "and the block handler must refuse it too, or the cap is bypassable by tag 0x03",
+        );
+
+        // Neither can it be laundered through the budget: an epoch whose
+        // budget is untouched still refuses it.
+        assert_eq!(g.voluntary_exits_this_epoch(), 0);
     }
 
     #[test]
