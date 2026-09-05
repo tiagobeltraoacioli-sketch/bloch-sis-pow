@@ -358,11 +358,17 @@ deny-license-exceptions:
 # deny.toml misconfiguration cannot silently disable advisory scanning.
 # BLOCKING, same posture as supply-chain. `--deny warnings` also fails on
 # unmaintained/unsound informational advisories.
+# CHANGED 2026-09-05 (finding SC2-sharks-shamir): audits EVERY workspace
+# lockfile via scripts/audit-all-lockfiles.sh, not just the root Cargo.lock —
+# the standalone workspaces (pool/, pool-proxy/, services/pq-shield-api/, ...)
+# were invisible to a root-only `cargo audit`, which is how pool/ shipped
+# sharks 0.5.0 (RUSTSEC-2024-0398). The script fails if a committed lockfile
+# is missing from its list, so a new standalone workspace cannot escape.
 cargo-audit:
   stage: check
   script:
     - cargo install cargo-audit --locked 2>/dev/null || true
-    - cargo audit --deny warnings
+    - bash scripts/audit-all-lockfiles.sh
   allow_failure: false
 
 # osv-scanner — supplementary advisory scan against the OSV.dev DB (RustSec +
@@ -388,7 +394,21 @@ osv-scanner:
   script:
     - export PATH="$HOME/.local/bin:$PATH"
     - bash scripts/ci-install-scanner.sh osv-scanner
-    - osv-scanner --config=osv-scanner.toml --lockfile=Cargo.lock
+    # Every workspace lockfile (finding SC2-sharks-shamir), mirroring
+    # scripts/audit-all-lockfiles.sh — a root-only scan misses the
+    # standalone workspaces' pins.
+    - osv-scanner --config=osv-scanner.toml
+        --lockfile=Cargo.lock
+        --lockfile=pool/Cargo.lock
+        --lockfile=pool-proxy/Cargo.lock
+        --lockfile=services/pq-shield-api/Cargo.lock
+        --lockfile=euvm-tooling/Cargo.lock
+        --lockfile=fuzz/Cargo.lock
+        --lockfile=spikes/prover-cost/Cargo.lock
+        --lockfile=spikes/prover-cost/rv32/Cargo.lock
+        --lockfile=spikes/prover-cost/rv32f/Cargo.lock
+        --lockfile=spikes/prover-cost/rv32h/Cargo.lock
+        --lockfile=spikes/prover-cost/rv32k/Cargo.lock
   allow_failure: false
 
 # cargo-geiger — quantifies `unsafe` across the dependency tree (own code +
