@@ -170,14 +170,29 @@ Returns `commitment_bytes_hex` (sign these locally), `bloch_governance_guard_has
 
 ### `POST /anchor/verify`
 Verify a PQ signature over an anchor (safe server-side — no secrets). Supply either the
-fields + `signature`, or a full `signed_anchor_hex` blob.
+fields + `signature`, or a full `signed_anchor_hex` blob — **plus a required
+`trusted_pq_pubkey`**.
 ```json
 { "target_chain":"bitcoin", "btc_vault_address":"...", "recovery_hash":"...",
   "pq_recovery_pubkey":"...", "designated_safe_dest":"...", "csv_delay":144,
-  "policy":"watchtower-01", "signature":"<hex PQ signature>" }
+  "policy":"watchtower-01", "signature":"<hex PQ signature>",
+  "trusted_pq_pubkey":"<hex of the PQ pubkey YOU already trust for this vault>" }
 ```
-Returns `{ "valid": true|false, "reason": "...", "commitment_bytes_hex": "..." }`.
-Tampering with any committed field fails closed.
+Returns `{ "valid": true|false, "reason": "...", "verified_against_pq_pubkey": "...",
+"commitment_bytes_hex": "..." }`. Tampering with any committed field fails closed.
+
+> **`trusted_pq_pubkey` is not optional, and it is the whole point.** An anchor carries
+> its own `pq_recovery_pubkey`, so checking the signature against *that* is
+> self-certifying: an attacker generates a PQ keypair, writes their own
+> `designated_safe_dest` into an anchor, signs it with their own secret, and publishes a
+> blob that "verifies" perfectly. A watchtower trusting that answer would fee-bump a
+> clawback straight to the attacker. Authenticity here means *signed by **the** owner*,
+> so you must pass the key you obtained out-of-band — from vault registration or from
+> the anchor guard hash, which commits to it. A mismatch returns
+> `reason: "UntrustedKey"`. Omitting the field is a `400`, never an implicit "valid".
+
+`csv_delay` is a `u16` (Bitcoin's actual CSV width); a wider value is rejected, not
+truncated. `version` is honored — an anchor from an unknown format version is refused.
 
 ---
 
@@ -204,12 +219,14 @@ curl -s -X POST $BASE/anchor/commitment -d "{
   \"recovery_hash\":\"$HR\",\"pq_recovery_pubkey\":\"<pq pubkey hex>\",
   \"designated_safe_dest\":\"bcrt1q...safe...\",\"csv_delay\":144,\"policy\":\"wt-01\"}"
 
-# 3) verify your PQ signature before publishing the anchor
+# 3) verify your PQ signature before publishing the anchor.
+#    trusted_pq_pubkey = the key you already trust for this vault (here, your own).
 curl -s -X POST $BASE/anchor/verify -d "{
   \"target_chain\":\"bitcoin\",\"btc_vault_address\":\"bcrt1q...deposit...\",
   \"recovery_hash\":\"$HR\",\"pq_recovery_pubkey\":\"<pq pubkey hex>\",
   \"designated_safe_dest\":\"bcrt1q...safe...\",\"csv_delay\":144,\"policy\":\"wt-01\",
-  \"signature\":\"<your PQ signature hex>\"}"
+  \"signature\":\"<your PQ signature hex>\",
+  \"trusted_pq_pubkey\":\"<pq pubkey hex>\"}"
 
 # 4) attacker unvaults → you clawback within Δ to the anchored safe dest
 curl -s -X POST $BASE/vault/clawback-tx -d "{

@@ -75,8 +75,13 @@ pub struct PqShieldAnchor {
     /// The ONLY address the anchored clawback flow may target (a fresh, hidden-pubkey
     /// address — spec §9.4).
     pub designated_safe_dest: Vec<u8>,
-    /// Δ in blocks — MUST equal the on-chain branch-A CSV delay (spec §3.1).
-    pub csv_delay: u32,
+    /// Δ in blocks — MUST equal the on-chain branch-A CSV delay (spec §3.1). `u16`
+    /// because that is the width Bitcoin's `Sequence::from_height` (and therefore
+    /// [`crate::vault::VaultParams::csv_delay`]) actually enforces: keeping this wider
+    /// than the chain let an anchor advertise a Δ that silently truncated to a
+    /// *different* on-chain Δ under `as u16`. The wire encoding stays 4 bytes LE (see
+    /// [`PqShieldAnchor::commitment_bytes`]) so the signed format is unchanged.
+    pub csv_delay: u16,
     /// Opaque watchtower policy id / rotation rules / expiry.
     pub policy: Vec<u8>,
 }
@@ -94,7 +99,7 @@ impl PqShieldAnchor {
         b.extend_from_slice(&self.recovery_hash);
         put_bytes(&mut b, &self.pq_recovery_pubkey);
         put_bytes(&mut b, &self.designated_safe_dest);
-        b.extend_from_slice(&self.csv_delay.to_le_bytes());
+        b.extend_from_slice(&(self.csv_delay as u32).to_le_bytes());
         put_bytes(&mut b, &self.policy);
         b
     }
@@ -119,8 +124,17 @@ pub struct SignedAnchor {
 /// Errors from anchor (de)serialization / verification.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AnchorError {
-    /// The PQ signature did not verify under `pq_recovery_pubkey`.
+    /// The PQ signature did not verify under the caller's trusted key.
     BadSignature,
+    /// The anchor names a `pq_recovery_pubkey` that is NOT the key the relying party
+    /// trusts. This is the check that stops a self-certifying forgery: an attacker can
+    /// always mint a syntactically perfect anchor signed by their *own* PQ key.
+    UntrustedKey,
+    /// `version` is not a format this build understands.
+    UnsupportedVersion(u16),
+    /// `csv_delay` does not fit the on-chain (`u16`) CSV width, so it could never equal
+    /// the branch-A delay it claims to mirror.
+    CsvDelayOutOfRange(u32),
     /// Truncated / malformed serialized anchor.
     Malformed,
     /// Unknown `target_chain` tag on deserialize.
@@ -129,7 +143,7 @@ pub enum AnchorError {
 
 /// Sign a `PqShieldAnchor` with the owner's PQ secret key (ML-DSA-65 ‖ Falcon-1024).
 /// The `pq_secret` MUST correspond to `anchor.pq_recovery_pubkey`; [`verify_anchor`]
-/// enforces that binding at verification time.
+/// enforces that binding — against an *externally trusted* key — at verification time.
 pub fn sign_anchor(
     anchor: &PqShieldAnchor,
     pq_secret: &[u8],
@@ -138,13 +152,39 @@ pub fn sign_anchor(
     Ok(SignedAnchor { anchor: anchor.clone(), signature: sig })
 }
 
-/// Verify a signed anchor: the PQ signature must verify over the committed fields under
-/// the anchor's own `pq_recovery_pubkey`. Returns `Ok(())` iff authentic. Tampering with
-/// ANY committed field (address, `H(r)`, safe destination, Δ, policy, …) changes
-/// [`PqShieldAnchor::commitment_bytes`] and makes this fail closed.
-pub fn verify_anchor(signed: &SignedAnchor) -> Result<(), AnchorError> {
+/// Verify a signed anchor **against a PQ key the relying party already trusts**.
+///
+/// `trusted_pq_pubkey` is the enveloped ML-DSA-65 ‖ Falcon-1024 public key the caller
+/// obtained out-of-band — from the vault registration, the anchor guard hash
+/// ([`anchor_guard_governance`] / [`anchor_guard_custody`], which commit to it), or a
+/// previously-trusted anchor. It is NOT read out of the blob under inspection.
+///
+/// ## Why the key must come from outside (spec §3, and the reason this exists)
+/// Verifying under `signed.anchor.pq_recovery_pubkey` is *self-certifying* and decides
+/// nothing: anyone can generate a PQ keypair, write their own `designated_safe_dest`
+/// into an anchor, sign it with their own secret, and publish a blob that "verifies".
+/// A watchtower that fee-bumps a clawback to that destination would be paying an
+/// attacker. Authenticity here means "signed by **the** owner", so the owner's identity
+/// has to be an input, not a self-declaration.
+///
+/// Returns `Ok(())` iff the anchor is a supported version, names exactly
+/// `trusted_pq_pubkey`, and carries a valid PQ signature over its committed fields.
+/// Tampering with ANY committed field (address, `H(r)`, safe destination, Δ, policy, …)
+/// changes [`PqShieldAnchor::commitment_bytes`] and makes this fail closed.
+pub fn verify_anchor(
+    signed: &SignedAnchor,
+    trusted_pq_pubkey: &[u8],
+) -> Result<(), AnchorError> {
+    if signed.anchor.version != ANCHOR_VERSION {
+        return Err(AnchorError::UnsupportedVersion(signed.anchor.version));
+    }
+    // The hinge: identity is supplied by the verifier, never by the blob.
+    if signed.anchor.pq_recovery_pubkey.as_slice() != trusted_pq_pubkey {
+        return Err(AnchorError::UntrustedKey);
+    }
+    // Verify under the caller's copy, so the anchor's own bytes cannot steer the check.
     let ok = bloch_crypto::crypto::verify(
-        &signed.anchor.pq_recovery_pubkey,
+        trusted_pq_pubkey,
         &signed.anchor.commitment_bytes(),
         &signed.signature,
     );
@@ -161,12 +201,16 @@ impl SignedAnchor {
         self.anchor.serialize_with_sig(&self.signature)
     }
 
-    /// Inverse of [`SignedAnchor::serialize`]. Does NOT verify the signature — call
-    /// [`verify_anchor`] after.
+    /// Inverse of [`SignedAnchor::serialize`]. Validates the *format* only — version,
+    /// chain tag, Δ width, framing — and does NOT verify the signature or decide who
+    /// owns the anchor; call [`verify_anchor`] with a trusted key after.
     pub fn deserialize(bytes: &[u8]) -> Result<SignedAnchor, AnchorError> {
         let mut c = Cursor { b: bytes, i: 0 };
         c.expect_tag(ANCHOR_DOMAIN)?;
         let version = c.get_u16()?;
+        if version != ANCHOR_VERSION {
+            return Err(AnchorError::UnsupportedVersion(version));
+        }
         let chain_tag = c.get_u8()?;
         let target_chain = match chain_tag {
             0x01 => TargetChain::Bitcoin,
@@ -180,7 +224,11 @@ impl SignedAnchor {
         let recovery_hash = c.get_array32()?;
         let pq_recovery_pubkey = c.get_bytes()?;
         let designated_safe_dest = c.get_bytes()?;
-        let csv_delay = c.get_u32()?;
+        // 4 bytes on the wire (format-stable), but only a value the chain could actually
+        // enforce is accepted — a wider Δ is rejected, not silently truncated.
+        let wide_delay = c.get_u32()?;
+        let csv_delay = u16::try_from(wide_delay)
+            .map_err(|_| AnchorError::CsvDelayOutOfRange(wide_delay))?;
         let policy = c.get_bytes()?;
         let signature = c.get_bytes()?;
         Ok(SignedAnchor {
@@ -296,36 +344,134 @@ mod tests {
     fn sign_verify_roundtrip_and_tamper_fails() {
         let seed = [7u8; 32];
         let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&seed).unwrap();
-        let anchor = sample(pk);
+        let anchor = sample(pk.clone());
 
         let signed = sign_anchor(&anchor, &sk).unwrap();
-        assert!(verify_anchor(&signed).is_ok(), "honest anchor must verify");
+        assert!(verify_anchor(&signed, &pk).is_ok(), "honest anchor must verify");
 
         // tamper the safe destination → verify fails closed
         let mut t1 = signed.clone();
         t1.anchor.designated_safe_dest = b"bcrt1qATTACKERdestination".to_vec();
-        assert_eq!(verify_anchor(&t1), Err(AnchorError::BadSignature));
+        assert_eq!(verify_anchor(&t1, &pk), Err(AnchorError::BadSignature));
 
         // tamper H(r) → fails
         let mut t2 = signed.clone();
         t2.anchor.recovery_hash = [0xff; 32];
-        assert_eq!(verify_anchor(&t2), Err(AnchorError::BadSignature));
+        assert_eq!(verify_anchor(&t2, &pk), Err(AnchorError::BadSignature));
 
         // tamper Δ → fails
         let mut t3 = signed.clone();
         t3.anchor.csv_delay = 6;
-        assert_eq!(verify_anchor(&t3), Err(AnchorError::BadSignature));
+        assert_eq!(verify_anchor(&t3, &pk), Err(AnchorError::BadSignature));
+    }
+
+    /// REGRESSION (K-M6-anchor-selfcert). The attacker holds no part of the owner's PQ
+    /// key. They mint a *perfectly signed* anchor under their own key, naming their own
+    /// `designated_safe_dest` — the address a compliant watchtower would fee-bump a
+    /// clawback to. Under the old self-certifying `verify_anchor(&signed)` this returned
+    /// `Ok(())`, because the blob supplied both the claim and the key that judged it.
+    #[test]
+    fn forged_anchor_signed_by_attacker_key_is_rejected() {
+        let (owner_pk, owner_sk) =
+            bloch_crypto::crypto::generate_keypair_from_seed(&[11u8; 32]).unwrap();
+        let (attacker_pk, attacker_sk) =
+            bloch_crypto::crypto::generate_keypair_from_seed(&[66u8; 32]).unwrap();
+        assert_ne!(owner_pk, attacker_pk);
+
+        // The honest anchor the world trusts, and the key it is trusted by.
+        let honest = sign_anchor(&sample(owner_pk.clone()), &owner_sk).unwrap();
+        assert!(verify_anchor(&honest, &owner_pk).is_ok());
+
+        // The forgery: same vault, same H(r) — but the attacker's payout address and the
+        // attacker's PQ key. It is internally consistent and self-verifies perfectly.
+        let mut forged_anchor = sample(attacker_pk.clone());
+        forged_anchor.designated_safe_dest = b"bcrt1qATTACKERpayoutaddress".to_vec();
+        let forged = sign_anchor(&forged_anchor, &attacker_sk).unwrap();
+        assert!(
+            bloch_crypto::crypto::verify(
+                &forged.anchor.pq_recovery_pubkey,
+                &forged.anchor.commitment_bytes(),
+                &forged.signature,
+            ),
+            "the forgery IS self-consistent — that is exactly why self-certification fails"
+        );
+
+        // Against the key the relying party actually trusts, it fails closed.
+        assert_eq!(verify_anchor(&forged, &owner_pk), Err(AnchorError::UntrustedKey));
+
+        // …and it survives a serialize round-trip as a forgery, not as an anchor.
+        let back = SignedAnchor::deserialize(&forged.serialize()).unwrap();
+        assert_eq!(verify_anchor(&back, &owner_pk), Err(AnchorError::UntrustedKey));
+
+        // The owner's real anchor is not verifiable under the attacker's key either.
+        assert_eq!(verify_anchor(&honest, &attacker_pk), Err(AnchorError::UntrustedKey));
+    }
+
+    /// A signature lifted from the owner's honest anchor cannot be replayed onto a
+    /// different anchor that still names the owner's key.
+    #[test]
+    fn owner_key_with_transplanted_signature_is_rejected() {
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[12u8; 32]).unwrap();
+        let honest = sign_anchor(&sample(pk.clone()), &sk).unwrap();
+
+        let mut swapped = sample(pk.clone());
+        swapped.designated_safe_dest = b"bcrt1qATTACKERpayoutaddress".to_vec();
+        let replay = SignedAnchor { anchor: swapped, signature: honest.signature.clone() };
+        assert_eq!(verify_anchor(&replay, &pk), Err(AnchorError::BadSignature));
+    }
+
+    #[test]
+    fn unsupported_version_is_rejected_on_verify_and_deserialize() {
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[13u8; 32]).unwrap();
+        let mut a = sample(pk.clone());
+        a.version = ANCHOR_VERSION + 1;
+        // Signed honestly under a future version this build cannot interpret.
+        let signed = sign_anchor(&a, &sk).unwrap();
+        assert_eq!(
+            verify_anchor(&signed, &pk),
+            Err(AnchorError::UnsupportedVersion(ANCHOR_VERSION + 1)),
+            "version must be honored, not merely carried"
+        );
+        assert_eq!(
+            SignedAnchor::deserialize(&signed.serialize()),
+            Err(AnchorError::UnsupportedVersion(ANCHOR_VERSION + 1))
+        );
+    }
+
+    /// Δ is `u16` on the wire-decode path because that is what Bitcoin's CSV enforces.
+    /// A wider value must be REJECTED, never truncated into a different on-chain delay.
+    #[test]
+    fn oversized_csv_delay_is_rejected_not_truncated() {
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[14u8; 32]).unwrap();
+        let signed = sign_anchor(&sample(pk), &sk).unwrap();
+        let mut bytes = signed.serialize();
+
+        // The Δ field sits immediately before the length-prefixed `policy`, which ends
+        // the commitment — compute the offset instead of scanning for the bytes (the PQ
+        // pubkey blob can contain the same 4-byte pattern).
+        let commitment_len = signed.anchor.commitment_bytes().len();
+        let delta_at = commitment_len - 4 - (4 + signed.anchor.policy.len());
+        assert_eq!(&bytes[delta_at..delta_at + 4], &144u32.to_le_bytes());
+
+        // Overwrite with 0x0001_0090 = 65_680, which truncates to 144 — the honest Δ.
+        bytes[delta_at..delta_at + 4].copy_from_slice(&65_680u32.to_le_bytes());
+        assert_eq!(65_680u32 as u16, 144, "the truncation this rejection prevents");
+
+        assert_eq!(
+            SignedAnchor::deserialize(&bytes),
+            Err(AnchorError::CsvDelayOutOfRange(65_680))
+        );
     }
 
     #[test]
     fn serialize_roundtrips() {
         let seed = [9u8; 32];
         let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&seed).unwrap();
-        let signed = sign_anchor(&sample(pk), &sk).unwrap();
+        let signed = sign_anchor(&sample(pk.clone()), &sk).unwrap();
         let bytes = signed.serialize();
         let back = SignedAnchor::deserialize(&bytes).unwrap();
         assert_eq!(back, signed);
-        assert!(verify_anchor(&back).is_ok());
+        assert!(verify_anchor(&back, &pk).is_ok());
         // deterministic
         assert_eq!(signed.serialize(), back.serialize());
     }

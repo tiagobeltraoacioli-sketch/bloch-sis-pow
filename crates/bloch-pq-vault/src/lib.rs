@@ -319,13 +319,19 @@ mod e2e_tests {
             recovery_hash: p.recovery_hash,
             pq_recovery_pubkey: keys.pq_pubkey.clone(),
             designated_safe_dest: safe.to_string().into_bytes(),
-            csv_delay: DELTA as u32,
+            csv_delay: DELTA,
             policy: b"e2e-watchtower".to_vec(),
         };
         let signed = sign_anchor(&anchor, &keys.pq_secret).expect("PQ sign");
-        assert!(verify_anchor(&signed).is_ok(), "anchor must be PQ-authentic");
-        // the anchor's Δ agrees with the on-chain branch-A delay (spec §3.1 invariant)
-        assert_eq!(signed.anchor.csv_delay as u16, p.csv_delay);
+        // verified against the PQ key of the hybrid identity we already trust (§3), not
+        // against whatever key the anchor happens to carry
+        assert!(
+            verify_anchor(&signed, &keys.pq_pubkey).is_ok(),
+            "anchor must be PQ-authentic under the OWNER's key"
+        );
+        // the anchor's Δ agrees with the on-chain branch-A delay (spec §3.1 invariant);
+        // both are u16, so this comparison cannot be papered over by a truncating cast
+        assert_eq!(signed.anchor.csv_delay, p.csv_delay);
 
         // (4) attacker broadcasts the unvault U, creating the trigger T (window opens)
         let deposit_op = OutPoint::null();

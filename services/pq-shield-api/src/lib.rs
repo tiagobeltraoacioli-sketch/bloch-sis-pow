@@ -21,7 +21,8 @@
 //!
 //! The endpoint wraps only the crate's PUBLIC, non-secret functions: the `vault`
 //! script/address/tx/sighash builders, `PqShieldAnchor::commitment_bytes`,
-//! `verify_anchor`, and the anchor guard-hash helpers. It never calls
+//! `verify_anchor` (against a caller-supplied trusted PQ key), and the anchor
+//! guard-hash helpers. It never calls
 //! `sign_anchor`, `ecdsa_witness_sig`, `derive_vault_keys`, or the preimage
 //! derivation — those require secrets and belong on the client.
 
@@ -300,7 +301,9 @@ struct AnchorFields {
     /// The owner's enveloped ML-DSA-65 ‖ Falcon-1024 PUBLIC key (hex). Public, not secret.
     pq_recovery_pubkey: String,
     designated_safe_dest: String,
-    csv_delay: u32,
+    /// Δ in blocks. `u16` — the width Bitcoin's CSV actually enforces; a wider value is
+    /// rejected at parse time rather than truncated into a different on-chain delay.
+    csv_delay: u16,
     #[serde(default)]
     policy: String,
     /// Optional companion BTC PUBLIC key (hex, 33-byte compressed) — if present, the
@@ -324,6 +327,11 @@ struct AnchorVerifyReq {
     /// Alternatively, a full serialized `SignedAnchor` blob (commitment ‖ signature).
     #[serde(default)]
     signed_anchor_hex: Option<String>,
+    /// REQUIRED. The enveloped ML-DSA-65 ‖ Falcon-1024 PUBLIC key the caller already
+    /// trusts for this vault, obtained out-of-band. Verification is meaningless without
+    /// it: the key carried *inside* an anchor is chosen by whoever produced the anchor.
+    #[serde(default)]
+    trusted_pq_pubkey: Option<String>,
 }
 
 fn parse_target_chain(s: &str) -> Result<TargetChain, ApiError> {
@@ -543,7 +551,8 @@ async fn anchor_commitment(body: Bytes) -> Result<Json<Value>, ApiError> {
         "sign_algo": "ML-DSA-65 ‖ Falcon-1024 (hybrid, enveloped) — via bloch-crypto, CLIENT-SIDE",
         "bloch_governance_guard_hash": hex::encode(gov_hash),
         "next_step": "PQ-sign commitment_bytes_hex with your PQ SECRET key locally, then POST \
-                      the fields + signature to /anchor/verify to check it before publishing.",
+                      the fields + signature (plus your pq_recovery_pubkey as \
+                      trusted_pq_pubkey) to /anchor/verify to check it before publishing.",
         "non_custodial": SIGN_LOCALLY,
     });
     if let Some(btc_pk_hex) = &req.btc_pubkey {
@@ -574,13 +583,26 @@ async fn anchor_verify(body: Bytes) -> Result<Json<Value>, ApiError> {
         SignedAnchor { anchor: fields.to_anchor()?, signature: hexbytes("signature", signature)? }
     };
 
-    let result = bloch_pq_vault::anchor::verify_anchor(&signed);
+    // The anchor cannot be its own trust root: anyone can sign a well-formed anchor
+    // naming their own designated_safe_dest. Refuse to answer without an external key.
+    let trusted_hex = req.trusted_pq_pubkey.as_ref().ok_or_else(|| {
+        ApiError::bad(
+            "missing `trusted_pq_pubkey`: an anchor is only meaningful against a PQ key \
+             you already trust out-of-band (registration, or the anchor guard hash). \
+             The pq_recovery_pubkey inside the blob proves nothing about who owns it.",
+        )
+    })?;
+    let trusted = hexbytes("trusted_pq_pubkey", trusted_hex)?;
+
+    let result = bloch_pq_vault::anchor::verify_anchor(&signed, &trusted);
     Ok(Json(json!({
         "valid": result.is_ok(),
         "reason": match &result {
-            Ok(()) => "signature verifies under the anchor's own pq_recovery_pubkey".to_string(),
+            Ok(()) => "signature verifies over the committed fields under the SUPPLIED \
+                       trusted_pq_pubkey".to_string(),
             Err(e) => format!("{e:?}"),
         },
+        "verified_against_pq_pubkey": trusted_hex,
         "commitment_bytes_hex": hex::encode(signed.anchor.commitment_bytes()),
         "non_custodial": SIGN_LOCALLY,
     })))
@@ -764,11 +786,13 @@ mod tests {
         };
         assert_eq!(commit["commitment_bytes_hex"], hex::encode(anchor.commitment_bytes()));
 
-        // Sign CLIENT-SIDE (test-only secret) and verify via the API.
+        // Sign CLIENT-SIDE (test-only secret) and verify via the API, against the PQ key
+        // the caller already trusts for this vault.
         let signed = sign_anchor(&anchor, &keys.pq_secret).unwrap();
-        assert!(verify_anchor(&signed).is_ok());
+        assert!(verify_anchor(&signed, &keys.pq_pubkey).is_ok());
         let mut verify_req = fields.as_object().unwrap().clone();
         verify_req.insert("signature".into(), json!(hex::encode(&signed.signature)));
+        verify_req.insert("trusted_pq_pubkey".into(), json!(hex::encode(&keys.pq_pubkey)));
         let vr = anchor_verify(body(Value::Object(verify_req.clone()))).await.expect("ok").0;
         assert_eq!(vr["valid"], json!(true));
 
@@ -777,6 +801,80 @@ mod tests {
         tampered.insert("designated_safe_dest".into(), json!("bcrt1qATTACKER"));
         let vr2 = anchor_verify(body(Value::Object(tampered))).await.expect("ok").0;
         assert_eq!(vr2["valid"], json!(false));
+    }
+
+    /// REGRESSION (K-M6-anchor-selfcert), at the HTTP boundary — the shield path.
+    #[tokio::test]
+    async fn anchor_verify_rejects_forgery_and_demands_a_trust_root() {
+        let (owner, _r, hr) = public_inputs();
+        // A second, unrelated hybrid identity: the attacker. No owner secret involved.
+        let attacker = derive_vault_keys(&[0xA7u8; 64], false);
+        assert_ne!(owner.pq_pubkey, attacker.pq_pubkey);
+
+        // The attacker's anchor: same vault and same H(r), but THEIR payout address and
+        // THEIR PQ key — signed correctly, so it is self-consistent in every way.
+        let forged_anchor = PqShieldAnchor {
+            version: ANCHOR_VERSION,
+            target_chain: TargetChain::Bitcoin,
+            btc_vault_address: b"bcrt1qexampledepositaddress".to_vec(),
+            recovery_hash: hr,
+            pq_recovery_pubkey: attacker.pq_pubkey.clone(),
+            designated_safe_dest: b"bcrt1qATTACKERpayoutaddress".to_vec(),
+            csv_delay: 144,
+            policy: b"watchtower-01".to_vec(),
+        };
+        let forged = sign_anchor(&forged_anchor, &attacker.pq_secret).unwrap();
+
+        let forged_req = json!({
+            "target_chain": "bitcoin",
+            "btc_vault_address": "bcrt1qexampledepositaddress",
+            "recovery_hash": hex::encode(hr),
+            "pq_recovery_pubkey": hex::encode(&attacker.pq_pubkey),
+            "designated_safe_dest": "bcrt1qATTACKERpayoutaddress",
+            "csv_delay": 144u16,
+            "policy": "watchtower-01",
+            "signature": hex::encode(&forged.signature),
+        });
+
+        // (a) With no trust root the endpoint refuses to answer at all.
+        let err = anchor_verify(body(forged_req.clone())).await.err().expect("must refuse");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("trusted_pq_pubkey"));
+
+        // (b) Against the OWNER's key the forgery is invalid — the old self-certifying
+        //     check reported this same blob as valid.
+        let mut against_owner = forged_req.as_object().unwrap().clone();
+        against_owner
+            .insert("trusted_pq_pubkey".into(), json!(hex::encode(&owner.pq_pubkey)));
+        let vr = anchor_verify(body(Value::Object(against_owner))).await.expect("ok").0;
+        assert_eq!(vr["valid"], json!(false), "attacker anchor must not verify as the owner's");
+        assert_eq!(vr["reason"], json!("UntrustedKey"));
+
+        // (c) Sanity: the forgery is only "valid" for someone who trusts the attacker.
+        let mut against_attacker = forged_req.as_object().unwrap().clone();
+        against_attacker
+            .insert("trusted_pq_pubkey".into(), json!(hex::encode(&attacker.pq_pubkey)));
+        let vr2 = anchor_verify(body(Value::Object(against_attacker))).await.expect("ok").0;
+        assert_eq!(vr2["valid"], json!(true));
+    }
+
+    /// Δ wider than Bitcoin's CSV width is refused at the edge, not truncated: 65_680
+    /// would become the honest 144 under `as u16`.
+    #[tokio::test]
+    async fn anchor_rejects_oversized_csv_delay() {
+        let (keys, _r, hr) = public_inputs();
+        let req = json!({
+            "target_chain": "bitcoin",
+            "btc_vault_address": "bcrt1qexampledepositaddress",
+            "recovery_hash": hex::encode(hr),
+            "pq_recovery_pubkey": hex::encode(&keys.pq_pubkey),
+            "designated_safe_dest": "bcrt1qsafecolddestination",
+            "csv_delay": 65_680u32,
+            "policy": "watchtower-01",
+        });
+        assert_eq!(65_680u32 as u16, 144, "the truncation this rejection prevents");
+        let err = anchor_commitment(body(req)).await.err().expect("must reject");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -840,7 +938,7 @@ contain a private key, seed, or the preimage <code>r</code> are rejected (HTTP 4
 <tr><td>POST</td><td>/vault/branch-a-tx</td><td>unsigned delayed withdrawal + hot-key sighash</td></tr>
 <tr><td>POST</td><td>/vault/clawback-tx</td><td>unsigned PQ-gated clawback + recovery-key sighash</td></tr>
 <tr><td>POST</td><td>/anchor/commitment</td><td>canonical bytes to PQ-sign client-side + Bloch guard hash</td></tr>
-<tr><td>POST</td><td>/anchor/verify</td><td>verify a PQ signature over an anchor (valid/invalid)</td></tr>
+<tr><td>POST</td><td>/anchor/verify</td><td>verify a PQ signature over an anchor against a <em>trusted_pq_pubkey</em> you supply (valid/invalid)</td></tr>
 </table>
 <p>Full docs, request/response examples, and a curl walkthrough: see <code>README.md</code>.</p>
 <p><strong>Hardened recovery (audit M1):</strong> derive your recovery key on a HARDENED path,
