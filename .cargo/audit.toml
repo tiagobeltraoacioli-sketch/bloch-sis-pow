@@ -39,6 +39,16 @@ ignore = [
     "RUSTSEC-2024-0388", # derivative unmaintained    — via ark-ff (zk stack)
     "RUSTSEC-2025-0119", # number_prefix unmaintained — via indicatif (SP1 CLI)
     "RUSTSEC-2026-0002", # lru UNSOUND (IterMut aliasing) — sp1-prover host-side
+    "RUSTSEC-2026-0253", # lru 0.12.5 UNSOUND (LruCache::pop() panic safety) —
+                         # EXCEPTION added 2026-09-05 (finding SC1-advisories),
+                         # re-review by 2026-12-01. Fix is lru >= 0.18.2 but
+                         # sp1-prover 4.2.1 pins `lru ^0.12.4`, so there is no
+                         # bump path without forking the pinned SP1 stack.
+                         # Reachability: sp1-prover host-side proving only, never
+                         # the node consensus/mempool/P2P runtime; the UB needs a
+                         # panicking Drop/Hash impl inside the cache, which the
+                         # SP1 usage does not have. REMOVE when SP1 repins
+                         # lru >= 0.18.2.
     # ── Accepted vulnerabilities, no upstream bump path (mirrors deny.toml) ─────
     "RUSTSEC-2026-0118", # hickory-proto NSEC3 unbounded loop — libp2p 0.56-pinned
     "RUSTSEC-2026-0119", # hickory-proto O(n^2) name compression — libp2p-pinned

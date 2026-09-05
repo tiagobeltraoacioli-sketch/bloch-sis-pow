@@ -61,6 +61,13 @@ ignore = [
                          # ONLY by sp1-prover (host-side proving), not the node
                          # runtime; the unsoundness manifests only under Miri /
                          # strict-aliasing, and sp1-prover 4.2.1 pins this lru.
+    "RUSTSEC-2026-0253", # lru 0.12.5 UNSOUND (LruCache::pop() panic safety) —
+                         # EXCEPTION added 2026-09-05 (finding SC1-advisories),
+                         # re-review by 2026-12-01; mirrors audit.toml. Fix is
+                         # lru >= 0.18.2 but sp1-prover 4.2.1 pins `lru ^0.12.4`,
+                         # so there is no bump path without forking the pinned
+                         # SP1 stack. Host-side proving only, not the node
+                         # runtime. REMOVE when SP1 repins lru >= 0.18.2.
     "RUSTSEC-2026-0173", # proc-macro-error2 unmaintained — compile-time proc-macro
                          # helper (derive-macro diagnostics); no runtime surface.
     "RUSTSEC-2025-0134", # rustls-pemfile unmaintained — PEM decode, superseded by
