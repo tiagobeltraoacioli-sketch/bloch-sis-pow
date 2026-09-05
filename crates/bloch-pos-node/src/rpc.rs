@@ -1969,6 +1969,7 @@ pub fn mempool_info_json(
     next_base_fee_millisat_per_gas: u128,
     barred: usize,
     barred_hits: u64,
+    expired: u64,
 ) -> Json {
     Json::obj(vec![
         ("size", Json::u(size as u64)),
@@ -1984,6 +1985,12 @@ pub fn mempool_info_json(
         // rather than a log line on a box someone has to hold a key for.
         ("barred", Json::u(barred as u64)),
         ("barred_hits", Json::u(barred_hits)),
+        // Transactions dropped for AGE, which is a different event from every
+        // other way an entry leaves. Without it, a mempool that shrank because
+        // blocks included things and one that shrank because the TTL swept a
+        // wedged transaction out look identical from the outside — and the
+        // second is the one an operator needs to see.
+        ("expired", Json::u(expired)),
     ])
 }
 

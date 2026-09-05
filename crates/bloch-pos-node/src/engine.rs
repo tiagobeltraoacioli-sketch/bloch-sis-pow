@@ -179,6 +179,34 @@ const NO_TXS: [PosTransaction; 0] = [];
 /// (fees, per-sender limits, eviction by price) is `gossip.rs` work.
 const MEMPOOL_MAX: usize = 4_096;
 
+/// How long a transaction may sit in the mempool without ever being included
+/// before the node drops it, measured in slots of head progress.
+///
+/// **The defect this closes.** Admission and retention were the same decision:
+/// a transaction that passed `admissible` stayed until it was included,
+/// explicitly refused by a proposal, or caught by `sweep_mempool`'s
+/// spent-input scan. A transaction that is none of those — a stale fee, a
+/// sub-dust output, an input a branch this node does not hold has spent —
+/// is skipped by the producer block after block and never leaves. Measured on
+/// the live chain on 2026-09-05: one transaction held for over 200 blocks
+/// while the chain itself was healthy.
+///
+/// **This is node-local retention policy, not consensus.** No flag day, no
+/// activation height, nothing armed. Two nodes running different TTLs cannot
+/// fork: the mempool is not a consensus input, and a transaction dropped here
+/// is one this node stops offering — the mesh still carries it, and a peer
+/// that still holds it can still have it included. The only thing a TTL
+/// changes is how long THIS node pays to remember something it has never been
+/// able to use.
+///
+/// 100 slots is ~50 min at the §5.1 cadence: long enough to outlast a chained
+/// spend waiting on its parent (which `REJECTION_TTL_SLOTS`, four epochs,
+/// already budgets for) and short enough that a wedged entry does not outlive
+/// an operator's attention. Deliberately longer than `REJECTION_TTL_SLOTS`,
+/// so a transaction the proposer refused gets its ban lifted and a real
+/// second chance BEFORE this drops it.
+const MEMPOOL_TTL_SLOTS: u64 = 100;
+
 /// How long a transaction the proposer's drop loop refused stays barred from
 /// re-admission, in slots. 128 slots is four epochs (~64 min at 30 s slots).
 ///
@@ -762,6 +790,22 @@ struct Engine {
     /// transfer with no inputs or no outputs, and verifies every spend
     /// signature.
     mempool: BTreeMap<Vec<u8>, PosTransaction>,
+    /// Head slot at which each live mempool key was admitted, for
+    /// [`MEMPOOL_TTL_SLOTS`].
+    ///
+    /// A parallel map rather than widening `mempool`'s value, because the
+    /// mempool's key order IS the proposer's selection order (see
+    /// `select_transactions`) and its value type is what the transition is
+    /// handed; neither should acquire a retention concern. The two maps are
+    /// reconciled in `evict_stale_mempool`, which is the ONLY place either the
+    /// TTL or the bookkeeping is enforced — so the four other paths that drop
+    /// a transaction (included, refused by the proposal, swept, RPC) need no
+    /// change and cannot leak an entry here by forgetting one.
+    mempool_admitted_at: BTreeMap<Vec<u8>, u64>,
+    /// Transactions dropped for age alone. Counted for `getmempoolinfo`,
+    /// because "the mempool is smaller" and "the mempool is working" look
+    /// identical from outside without it.
+    mempool_expired: u64,
     /// Transactions the proposer's drop loop refused, keyed exactly like
     /// [`Self::mempool`] and mapping to `(slot the bar lifts at, times it has
     /// barred a re-offer)`.
@@ -2229,6 +2273,54 @@ impl Engine {
     /// with consensus on this thread, and an observer accumulates over days,
     /// so 16 minutes of latency costs nothing and 32 sweeps per epoch would
     /// be waste.
+    /// Drop mempool entries that have watched [`MEMPOOL_TTL_SLOTS`] of head
+    /// progress go by without ever being included, and reconcile the
+    /// admission-time bookkeeping with the mempool itself.
+    ///
+    /// Runs once per applied block, which is the only clock that matters here:
+    /// the entries this exists for are the ones a proposer skipped, and a
+    /// proposer only skips inside a block.
+    ///
+    /// Retention only. Admission is untouched — a transaction dropped for age
+    /// is not refused, not remembered in `rejected`, and not barred: if the
+    /// mesh offers it again it is admitted again, with a fresh clock. That is
+    /// the difference between this and `reject_transaction`, and it is why
+    /// this needs no flag day: the set of blocks this node will accept is
+    /// exactly the same before and after.
+    fn evict_stale_mempool(&mut self) {
+        let now = self.head_slot_now();
+        let pool = &mut self.mempool;
+        let suspect = &mut self.mempool_suspect;
+        let mut expired = 0u64;
+        self.mempool_admitted_at.retain(|key, at| {
+            if !pool.contains_key(key) {
+                // Included, refused, swept or replaced: its clock leaves with
+                // it. Doing this here — rather than at each of those four
+                // sites — is what keeps this map from being a slower leak
+                // than the one the TTL closes.
+                return false;
+            }
+            // `saturating_sub`: a reorg can move the head backwards, and the
+            // honest answer to "negative age" is zero, not eviction.
+            if now.saturating_sub(*at) <= MEMPOOL_TTL_SLOTS {
+                return true;
+            }
+            pool.remove(key);
+            suspect.remove(key);
+            expired += 1;
+            false
+        });
+        if expired > 0 {
+            self.mempool_expired += expired;
+            eprintln!(
+                "[slot {now}] mempool TTL: dropped {expired} transaction(s) unincluded for \
+                 more than {MEMPOOL_TTL_SLOTS} slots ({} left, {} dropped for age so far)",
+                self.mempool.len(),
+                self.mempool_expired,
+            );
+        }
+    }
+
     fn sweep_mempool(&mut self, epoch: u64) {
         if self.mempool_swept_epoch == epoch {
             return;
@@ -2427,6 +2519,12 @@ impl Engine {
         admissible(&tx, epoch_of(self.wall_slot())).map_err(Refusal::Invalid)?;
         let mut frame = vec![net::FRAME_TX];
         frame.extend_from_slice(&key);
+        // The retention clock starts at the head this node is on, not at the
+        // wall slot: the TTL is "this many blocks of chain went by and never
+        // took it", and a node whose clock runs ahead of its head must not
+        // expire transactions it never had a chance to include.
+        self.mempool_admitted_at
+            .insert(key.clone(), self.head_slot_now());
         self.mempool.insert(key, tx);
         self.net.broadcast(frame);
         Ok(Admitted::New)
@@ -2521,6 +2619,11 @@ impl Engine {
                 for encoded in &env.body.transactions {
                     self.mempool.remove(encoded);
                 }
+                // AFTER the inclusion drop above and BEFORE the epoch
+                // sweep: the head has just moved, so this is the moment the
+                // TTL is measured against, and anything this block carried is
+                // already out of the pool and must not be counted as expired.
+                self.evict_stale_mempool();
                 let cur_e = epoch_of(self.state.slot());
                 self.pool.retain(|_, a| epoch_of(a.data.slot) >= cur_e);
                 // Once per epoch: drop what can no longer apply. On a
@@ -3272,6 +3375,7 @@ impl Engine {
                 self.state.next_base_fee(),
                 self.rejected.len(),
                 self.rejected_hits,
+                self.mempool_expired,
             )),
         }
     }
@@ -3735,6 +3839,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
         att_pool: AttestationPool::new(),
         wall_slot: 0,
         mempool: BTreeMap::new(),
+        mempool_admitted_at: BTreeMap::new(),
+        mempool_expired: 0,
         rejected: BTreeMap::new(),
         rejected_hits: 0,
         mempool_suspect: BTreeSet::new(),
@@ -5700,6 +5806,8 @@ mod transfer_v2_end_to_end {
             att_pool: AttestationPool::new(),
             wall_slot: 0,
             mempool: BTreeMap::new(),
+            mempool_admitted_at: BTreeMap::new(),
+            mempool_expired: 0,
             rejected: BTreeMap::new(),
         rejected_hits: 0,
         mempool_suspect: BTreeSet::new(),
@@ -6529,6 +6637,8 @@ mod perf_support {
             att_pool: AttestationPool::new(),
             wall_slot: 0,
             mempool: BTreeMap::new(),
+            mempool_admitted_at: BTreeMap::new(),
+            mempool_expired: 0,
             rejected: BTreeMap::new(),
         rejected_hits: 0,
         mempool_suspect: BTreeSet::new(),
@@ -8069,6 +8179,8 @@ mod duty_view_anchor {
             att_pool: AttestationPool::new(),
             wall_slot: 0,
             mempool: BTreeMap::new(),
+            mempool_admitted_at: BTreeMap::new(),
+            mempool_expired: 0,
             rejected: BTreeMap::new(),
         rejected_hits: 0,
         mempool_suspect: BTreeSet::new(),
@@ -8315,6 +8427,8 @@ mod slot_horizon {
             att_pool: AttestationPool::new(),
             wall_slot: 0,
             mempool: BTreeMap::new(),
+            mempool_admitted_at: BTreeMap::new(),
+            mempool_expired: 0,
             rejected: BTreeMap::new(),
             rejected_hits: 0,
             mempool_suspect: BTreeSet::new(),
