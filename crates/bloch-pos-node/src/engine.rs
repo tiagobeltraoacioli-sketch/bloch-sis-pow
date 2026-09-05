@@ -264,6 +264,24 @@ const ORPHAN_MAX: usize = 256;
 /// 30 s cadence, far more skew than NTP ever leaves.
 const FUTURE_SLOT_TOLERANCE: u64 = 8;
 
+/// Where an envelope reached `ingest` from. The ONLY thing that reads it is
+/// the slot bound, and it exists because that bound is a statement about
+/// what a PEER may make this node store, not about what this node may build.
+///
+/// A producer chose the slot it is proposing for; re-judging its own block
+/// against the clock is how a node refuses to produce when the box is loaded
+/// enough that the two disagree by a few slots. Every other gate applies
+/// identically to both — a locally built block still has to authenticate and
+/// still has to connect.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// Arrived over the network, or was promoted out of the orphan pool
+    /// after arriving over the network.
+    Gossip,
+    /// Built by this node's own `propose`.
+    Local,
+}
+
 /// Decode a block body's transactions.
 ///
 /// A receiver MUST recompute the post-state from the same transactions the
@@ -1470,7 +1488,7 @@ impl Engine {
         // this block, these are the bytes to drop from the mempool.
         let produced_txs: Vec<Vec<u8>> = env.body.transactions.clone();
         let env_tx_count = produced_txs.len();
-        self.ingest(env);
+        self.ingest_from(env, Source::Local);
         // h28080: a producer whose own node did not adopt its block is a
         // producer/validator split inside one process. It must be LOUD — but it
         // must not be fatal.
@@ -1517,12 +1535,16 @@ impl Engine {
     /// the depth of. Here the depth is one frame no matter how long the
     /// parked chain is.
     fn ingest(&mut self, env: BlockEnvelope) {
+        self.ingest_from(env, Source::Gossip);
+    }
+
+    fn ingest_from(&mut self, env: BlockEnvelope, src: Source) {
         let mut queue: VecDeque<BlockEnvelope> = VecDeque::new();
         queue.push_back(env);
         // Bounded: every iteration either drops the envelope or takes one
         // entry out of `orphans`, and `orphans` is capped.
         while let Some(next) = queue.pop_front() {
-            let Some((landed, grew_registry)) = self.ingest_one(next) else {
+            let Some((landed, grew_registry)) = self.ingest_one(next, src) else {
                 continue;
             };
             // Whatever was waiting on the block that just landed can be
@@ -1554,7 +1576,7 @@ impl Engine {
     /// caller can release what was waiting on it, and `grew_registry` when
     /// the block carried a `Deposit` and therefore may have registered a
     /// validator index some parked block is waiting to be checkable under.
-    fn ingest_one(&mut self, env: BlockEnvelope) -> Option<([u8; 32], bool)> {
+    fn ingest_one(&mut self, env: BlockEnvelope, src: Source) -> Option<([u8; 32], bool)> {
         let id = *env.block_id().as_bytes();
         if self.blocks.contains_key(&id) || self.canonical.contains(&id) {
             return None;
@@ -1590,7 +1612,10 @@ impl Engine {
         // `advance` will ever consume. Gossip only — boot replay reads this
         // node's own log and must not depend on the wall clock (see
         // [`FUTURE_SLOT_TOLERANCE`]).
-        if self.live && env.header.slot > self.wall_slot().saturating_add(FUTURE_SLOT_TOLERANCE) {
+        if src == Source::Gossip
+            && self.live
+            && env.header.slot > self.wall_slot().saturating_add(FUTURE_SLOT_TOLERANCE)
+        {
             self.rejected_future += 1;
             eprintln!(
                 "reject {}: slot {} is more than {FUTURE_SLOT_TOLERANCE} ahead of wall slot {}",
@@ -7870,11 +7895,16 @@ mod ingest_admission_tests {
     #[test]
     fn a_block_far_ahead_of_the_wall_clock_is_refused() {
         let (mut engine, _dir, template, stored) = fixture();
+        // Well beyond the tolerance rather than one slot past it: the
+        // fixture's genesis is `now`, hybrid signing in a debug build takes
+        // real seconds, and the wall slot moves while the envelope is being
+        // built. One slot of margin makes this test pass or fail on how
+        // loaded the box is; ten thousand makes it a test of the rule.
         let far = repointed(
             &engine,
             &template,
             [0x9A; 32],
-            engine.wall_slot() + FUTURE_SLOT_TOLERANCE + 1,
+            engine.wall_slot() + FUTURE_SLOT_TOLERANCE + 10_000,
         );
         engine.ingest(far);
 
@@ -7957,6 +7987,43 @@ mod ingest_admission_tests {
             *b2.block_id().as_bytes(),
             "out-of-order delivery must still land on the same head as in-order \
              delivery — a bounded pool that never releases is just a slower leak"
+        );
+    }
+
+    /// **The slot bound is a rule about PEERS, not about this node's own
+    /// producer.**
+    ///
+    /// A proposer chose the slot it is building for, and the slot loop only
+    /// ever calls `propose` for the slot it is currently in. Re-judging that
+    /// block against the wall clock adds nothing and subtracts a lot: on a
+    /// box loaded enough that the two readings drift, the node would refuse
+    /// its own proposal and lose the slot — the h28080 shape, arrived at from
+    /// a different direction.
+    ///
+    /// The fixture makes the difference visible: its genesis is `now`, so a
+    /// slot past the tolerance is trivially reachable, and every other gate
+    /// (authentication, known parent) still applies to the block.
+    ///
+    /// Fails if the `Source::Local` exemption is removed.
+    #[test]
+    fn the_producer_is_not_refused_by_the_bound_it_imposes_on_peers() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        // Far enough past the tolerance that the clock moving during the
+        // proposal cannot quietly bring it back inside and make the assertion
+        // vacuous — 60 slots is 60 s of drift at the fixture's cadence.
+        let far = engine.wall_slot() + FUTURE_SLOT_TOLERANCE + 60;
+
+        engine.propose(far);
+
+        assert_eq!(
+            engine.head_slot_now(),
+            far,
+            "the node must adopt the block it just built for the slot it was \
+             asked to build for"
+        );
+        assert_eq!(
+            engine.rejected_future, 0,
+            "and it must not have been counted as a future-slot refusal"
         );
     }
 
