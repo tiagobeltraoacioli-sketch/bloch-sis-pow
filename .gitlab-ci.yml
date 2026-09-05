@@ -229,6 +229,23 @@ supply-chain:
     - cargo deny check advisories bans licenses sources
   allow_failure: false
 
+# deny.toml license-exception consistency — audit finding D-H1-deny-agpl.
+# BLOCKING. Same defect as `supply-chain` above catches, but offline and in a
+# second rather than after cargo-deny resolves the whole graph — and it names
+# the exact block to edit. Four AGPL workspace members (bloch-pos-committee, bloch-pos-node,
+# bloch-pq-vault, genesis4-ceremony) were never added to the hand-maintained
+# exceptions list, so the blocking `supply-chain` job above could NOT have been
+# passing as configured. The guard derives the AGPL member set from the
+# workspace manifests, so the list can no longer drift silently: it fails on a
+# member with no exception, on an exception naming no member, and on copyleft
+# smuggled into the global `allow`. No network, no cargo resolution.
+deny-license-exceptions:
+  stage: check
+  before_script: []
+  script:
+    - python3 scripts/deny-license-exceptions-guard.py
+  allow_failure: false
+
 # cargo-audit — narrower RUSTSEC-only backstop to cargo-deny: an independent
 # implementation of the advisory check, so a cargo-deny regression or a
 # deny.toml misconfiguration cannot silently disable advisory scanning.
