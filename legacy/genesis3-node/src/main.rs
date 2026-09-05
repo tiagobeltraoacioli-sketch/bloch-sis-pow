@@ -3339,15 +3339,25 @@ fn validate_tx_inputs(
 ) -> Result<u64, String> {
     let mut total_in = 0u64;
 
+    // C-R3-2: the intra-tx duplicate-outpoint check is UNCONDITIONAL. The
+    // standalone (gossip-relay) path passes `spent_set = None`, and the old
+    // Some-gated check let a tx list the SAME outpoint N times — its value
+    // was counted N times below, so a doubled-fee double-spend was admitted
+    // to the mempool. `local_spent` catches duplicates within THIS tx on
+    // every path; the caller's `spent_set` (when provided) still tracks
+    // cross-tx conflicts inside a block.
+    let mut local_spent: HashSet<([u8; 32], u32)> = HashSet::new();
+
     for (i, inp) in tx.inputs.iter().enumerate() {
         let outpoint = (inp.prev_txid, inp.prev_index);
 
-        // FIX #9: Check for double-spend within the same validation context
-        if let Some(spent) = spent_set.as_ref() {
-            if spent.contains(&outpoint) {
-                return Err(format!("double-spend: {}:{} already consumed",
-                    hex::encode(&inp.prev_txid[..8]), inp.prev_index));
-            }
+        // FIX #9 + C-R3-2: double-spend within the same validation context —
+        // cross-tx via the caller's set (when present), intra-tx ALWAYS via
+        // the local insert-as-check.
+        let cross_tx_dup = spent_set.as_ref().is_some_and(|s| s.contains(&outpoint));
+        if cross_tx_dup || !local_spent.insert(outpoint) {
+            return Err(format!("double-spend: {}:{} already consumed",
+                hex::encode(&inp.prev_txid[..8]), inp.prev_index));
         }
 
         // Resolve UTXO
@@ -4724,5 +4734,98 @@ mod euvm_hook_tests {
         let bad_block = mk_block(vec![bad_cb]);
         let err = euvm_check_coinbase_outputs(&bad_block).unwrap_err();
         assert!(err.contains("coinbase output 1"), "got: {err}");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// C-R3-2 (Round-2 audit, LEG2-intra-dup) — intra-transaction double-spend.
+// A tx listing the SAME outpoint N times must be refused on EVERY admission
+// path. Before the fix, `validate_tx_inputs` gated its duplicate-outpoint
+// check on `spent_set` being `Some`, and the gossip-relay path
+// (`validate_tx_standalone`) passes `None` — so the duplicated input's value
+// was counted N times and the tx was ADMITTED with an N×-inflated fee.
+// The RPC path (`rpc::validate_tx_for_mempool`) had no duplicate check at
+// all; its regression tests live in src/rpc/mod.rs. The euvm path already
+// checked (rpc euvm_admission_tests::intra_tx_double_spend_rejected).
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod intra_tx_dup_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn mk_store() -> (TempDir, Arc<storage::Storage>) {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = Arc::new(storage::Storage::open(&tmp.path().join("db")).expect("storage"));
+        (tmp, store)
+    }
+
+    /// A tx spending the SAME confirmed 100_000-sat outpoint `n` times, every
+    /// input carrying a VALID hybrid signature over its own sighash — so
+    /// without the duplicate-outpoint check nothing else rejects it and the
+    /// fee comes out inflated by the duplicated value.
+    fn dup_input_tx(store: &Arc<storage::Storage>, n: usize, out_value: u64)
+        -> core::Transaction
+    {
+        use sha3::{Digest as _, Sha3_256};
+        let (pk, sk) = crypto::generate_keypair();
+        let pk_hash = Sha3_256::digest(&pk)[..20].to_vec();
+        let prev_txid = [0x42u8; 32];
+        store.put_utxo(&prev_txid, 0,
+            &core::TxOutput { value: 100_000, script_pubkey: pk_hash })
+            .expect("put_utxo");
+
+        let mut tx = core::Transaction {
+            version: 1,
+            inputs: (0..n).map(|_| core::TxInput {
+                prev_txid, prev_index: 0, script_sig: vec![], sequence: u32::MAX,
+            }).collect(),
+            outputs: vec![core::TxOutput { value: out_value, script_pubkey: vec![7u8; 20] }],
+            locktime: 0,
+        };
+        for i in 0..n {
+            let sighash = tx.sighash(i, core::node_chain_id());
+            let sig = crypto::sign(&sk, &sighash).expect("sign");
+            tx.inputs[i].script_sig = core::Transaction::build_script_sig(&sig, &pk);
+        }
+        tx
+    }
+
+    /// Gossip-relay admission (`validate_tx_standalone`, spent_set = None):
+    /// a 2-duplicate-input tx spending a 100k outpoint but emitting 150k must
+    /// be refused. Without the fix this was ADMITTED with fee = 50_000.
+    #[test]
+    fn gossip_path_refuses_intra_tx_duplicate_outpoint() {
+        let (_tmp, store) = mk_store();
+        let tx = dup_input_tx(&store, 2, 150_000);
+        let err = validate_tx_standalone(&tx, &store, 0)
+            .expect_err("intra-tx duplicate outpoint must be refused");
+        assert!(err.contains("double-spend"), "got: {err}");
+    }
+
+    /// The exact conditional the audit flagged, hit directly: the shared core
+    /// with `spent_set = None` must still catch an N=3 duplication (value
+    /// would otherwise triple: 300k in, 290k out, fee 10k).
+    #[test]
+    fn validate_tx_inputs_refuses_duplicates_without_spent_set() {
+        let (_tmp, store) = mk_store();
+        let tx = dup_input_tx(&store, 3, 290_000);
+        let lookup = |txid: &[u8; 32], idx: u32| -> Result<Option<core::TxOutput>, String> {
+            store.get_utxo(txid, idx).map_err(|e| e.to_string())
+        };
+        let err = validate_tx_inputs(&tx, &lookup, None)
+            .expect_err("intra-tx duplicate outpoint must be refused");
+        assert!(err.contains("double-spend"), "got: {err}");
+    }
+
+    /// Control: the SAME signed shape with a single input and honest amounts
+    /// is still admitted with the right fee — the fix rejects duplication,
+    /// not the legacy path itself.
+    #[test]
+    fn single_input_control_still_admitted() {
+        let (_tmp, store) = mk_store();
+        let tx = dup_input_tx(&store, 1, 90_000);
+        let fee = validate_tx_standalone(&tx, &store, 0)
+            .expect("valid single-input spend must be admitted");
+        assert_eq!(fee, 10_000);
     }
 }

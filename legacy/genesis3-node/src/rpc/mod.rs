@@ -1700,7 +1700,16 @@ fn validate_tx_for_mempool(tx: &Transaction, store: &Arc<Storage>, current_heigh
     }
 
     let mut total_in = 0u64;
+    // C-R3-2: intra-tx duplicate-outpoint check (insert-as-check, the same
+    // pattern as `euvm_admit_tx_standalone` step (e)). Without it a tx
+    // listing the SAME outpoint N times had its value counted N times below
+    // and was admitted with an N×-inflated fee — an intra-tx double-spend.
+    let mut spent_in_tx = std::collections::HashSet::<([u8; 32], u32)>::new();
     for (i, inp) in tx.inputs.iter().enumerate() {
+        if !spent_in_tx.insert((inp.prev_txid, inp.prev_index)) {
+            return Err(format!("double-spend: {}:{} already consumed",
+                hex::encode(&inp.prev_txid[..8]), inp.prev_index));
+        }
         let utxo = store.get_utxo(&inp.prev_txid, inp.prev_index)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("UTXO {}:{} not found", hex::encode(&inp.prev_txid[..8]), inp.prev_index))?;
@@ -2072,5 +2081,87 @@ mod euvm_admission_tests {
                           vec![0xDE, 0xAD]);
         let err = euvm_admit_tx_standalone(&tx, &lookup).unwrap_err();
         assert!(err.contains("output 0 invalid"), "got: {err}");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// C-R3-2 (Round-2 audit, LEG2-intra-dup) — intra-transaction double-spend on
+// the RPC admission path. `validate_tx_for_mempool` (sendrawtransaction) had
+// NO duplicate-outpoint check at all: a tx listing the SAME outpoint N times
+// had its value counted N times and was admitted with an N×-inflated fee.
+// The gossip-path twins live in main.rs `intra_tx_dup_tests`; the euvm path
+// was already covered (`euvm_admission_tests::intra_tx_double_spend_rejected`).
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod c_r3_2_intra_dup_tests {
+    use super::*;
+    use crate::core::{TxInput, TxOutput};
+    use tempfile::TempDir;
+
+    fn mk_store() -> (TempDir, Arc<Storage>) {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = Arc::new(Storage::open(&tmp.path().join("db")).expect("storage"));
+        (tmp, store)
+    }
+
+    /// A tx spending the SAME confirmed 100_000-sat outpoint `n` times, every
+    /// input carrying a VALID hybrid signature over its own sighash — without
+    /// the duplicate check nothing else rejects it.
+    fn dup_input_tx(store: &Arc<Storage>, n: usize, out_value: u64) -> Transaction {
+        use sha3::{Digest as _, Sha3_256};
+        let (pk, sk) = crate::crypto::generate_keypair();
+        let pk_hash = Sha3_256::digest(&pk)[..20].to_vec();
+        let prev_txid = [0x42u8; 32];
+        store.put_utxo(&prev_txid, 0,
+            &TxOutput { value: 100_000, script_pubkey: pk_hash })
+            .expect("put_utxo");
+
+        let mut tx = Transaction {
+            version: 1,
+            inputs: (0..n).map(|_| TxInput {
+                prev_txid, prev_index: 0, script_sig: vec![], sequence: u32::MAX,
+            }).collect(),
+            outputs: vec![TxOutput { value: out_value, script_pubkey: vec![7u8; 20] }],
+            locktime: 0,
+        };
+        for i in 0..n {
+            let sighash = tx.sighash(i, crate::core::node_chain_id());
+            let sig = crate::crypto::sign(&sk, &sighash).expect("sign");
+            tx.inputs[i].script_sig = Transaction::build_script_sig(&sig, &pk);
+        }
+        tx
+    }
+
+    /// sendrawtransaction admission: a 2-duplicate-input tx spending a 100k
+    /// outpoint but emitting 150k must be refused. Without the fix it was
+    /// ADMITTED with fee = 50_000 (the outpoint's value counted twice).
+    #[test]
+    fn rpc_path_refuses_intra_tx_duplicate_outpoint() {
+        let (_tmp, store) = mk_store();
+        let tx = dup_input_tx(&store, 2, 150_000);
+        let err = validate_tx_for_mempool(&tx, &store, 0)
+            .expect_err("intra-tx duplicate outpoint must be refused");
+        assert!(err.contains("double-spend"), "got: {err}");
+    }
+
+    /// N=3 duplication is refused too (the check is set-based, not pairwise).
+    #[test]
+    fn rpc_path_refuses_triple_duplicate() {
+        let (_tmp, store) = mk_store();
+        let tx = dup_input_tx(&store, 3, 290_000);
+        let err = validate_tx_for_mempool(&tx, &store, 0)
+            .expect_err("intra-tx duplicate outpoint must be refused");
+        assert!(err.contains("double-spend"), "got: {err}");
+    }
+
+    /// Control: the SAME signed shape with a single input and honest amounts
+    /// is still admitted with the right fee.
+    #[test]
+    fn rpc_single_input_control_still_admitted() {
+        let (_tmp, store) = mk_store();
+        let tx = dup_input_tx(&store, 1, 90_000);
+        let fee = validate_tx_for_mempool(&tx, &store, 0)
+            .expect("valid single-input spend must be admitted");
+        assert_eq!(fee, 10_000);
     }
 }
