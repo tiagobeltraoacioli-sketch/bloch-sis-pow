@@ -52,6 +52,117 @@ pub fn sync_body_bytes_read() -> u64 {
 pub struct Store {
     dir: PathBuf,
     log: File,
+    /// Exclusive ownership of `dir`, held for as long as the store is. Never
+    /// read; its `Drop` is the whole point. See [`DirLock`].
+    _lock: DirLock,
+}
+
+/// Exclusive ownership of a data dir, for the lifetime of this `Store`.
+///
+/// ## Why a data dir needs a lock at all
+///
+/// Two `bloch-pos` processes over one data dir is not a corrupt-log problem —
+/// it is a **double-signing** problem. Both hold the same keystore, both reach
+/// the same duty, both sign, and the two signatures are exactly the evidence
+/// `slashing.rs` burns stake for. It is also the easiest mistake an operator
+/// can make: a systemd unit that did not stop cleanly plus a manual
+/// `bloch-pos --data-dir ...` in a shell is all it takes, and nothing in the
+/// node said a word about it. The slashing-protection watermarks
+/// ([`crate::slashprot`]) are per-process in-memory state in front of one
+/// file; they close the restart window, and this closes the concurrent one.
+///
+/// ## Two mechanisms, deliberately
+///
+/// 1. `O_EXCL` creation of `dir/LOCK` — the portable half, and the one that
+///    leaves a visible artifact an operator can see and reason about.
+/// 2. `flock(LOCK_EX | LOCK_NB)` on that same file, on unix — the half that
+///    is *honest about staleness*. A lock file alone cannot distinguish "a
+///    node is running" from "a node was killed"; a node that refuses to boot
+///    after every crash gets its lock file deleted by reflex, which trains
+///    exactly the wrong habit. `flock` is released by the kernel when the
+///    holder dies, so a stale `LOCK` from a dead process is *reclaimed
+///    silently* while a live one is refused. Two file descriptors in the same
+///    process conflict under `flock` too (the lock belongs to the open file
+///    description), so this refuses a second `Store::open` in-process as well
+///    — which is what the test can actually drive.
+pub struct DirLock {
+    path: PathBuf,
+    /// Held open because `flock` lives on the open file description: closing
+    /// this releases the lock, so this field is the lock. Never read after
+    /// construction — which is exactly why the `allow` is here rather than a
+    /// `_` name: dropping the field would compile and silently un-protect the
+    /// data dir.
+    #[allow(dead_code)]
+    file: File,
+}
+
+impl DirLock {
+    /// Take the lock, or fail with the message an operator needs.
+    pub fn acquire(dir: &Path) -> io::Result<DirLock> {
+        let path = dir.join("LOCK");
+        // Fresh dir (or a previous holder that shut down cleanly): O_EXCL
+        // creates the file and we take flock on it.
+        let (file, fresh) = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(f) => (f, true),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                // A LOCK file exists. Whether it MEANS anything is what flock
+                // answers below; without flock we have to assume it does.
+                if !cfg!(unix) {
+                    return Err(held(&path));
+                }
+                (OpenOptions::new().write(true).open(&path)?, false)
+            }
+            Err(e) => return Err(e),
+        };
+        let _ = fresh; // read only under `cfg(unix)`, below.
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: `file` is an open, owned descriptor for the duration of
+            // this call; flock(2) touches nothing else.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                let e = io::Error::last_os_error();
+                if !fresh {
+                    // Someone else holds it. This is the case the lock exists
+                    // for; say so, and do NOT remove their file.
+                    return Err(held(&path));
+                }
+                return Err(e);
+            }
+        }
+        let mut file = file;
+        file.set_len(0)?;
+        file.write_all(format!("{}\n", std::process::id()).as_bytes())?;
+        file.sync_all()?;
+        Ok(DirLock { path, file })
+    }
+}
+
+fn held(path: &Path) -> io::Error {
+    let holder = fs::read_to_string(path).unwrap_or_default();
+    io::Error::new(
+        io::ErrorKind::AddrInUse,
+        format!(
+            "data dir is already in use by another bloch-pos process (lock {}{}). Refusing to \
+             start: two nodes over one data dir hold one keystore, reach the same duty \
+             and both sign it, which is the equivocation evidence slashing burns stake \
+             for. Stop the other process first.",
+            path.display(),
+            match holder.trim() {
+                "" => String::new(),
+                pid => format!(", pid {pid}"),
+            }
+        ),
+    )
+}
+
+impl Drop for DirLock {
+    /// Clean shutdown removes the file. A crash does not, and does not need
+    /// to: `flock` dies with the process and the next boot reclaims it.
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 impl Store {
@@ -61,6 +172,10 @@ impl Store {
     /// migration** (integration plan §3.1).
     pub fn open(dir: &Path, genesis_digest: &[u8; 32]) -> io::Result<Store> {
         fs::create_dir_all(dir)?;
+        // FIRST, before a single byte of this dir is read or written: a second
+        // process over the same dir is a double-signing hazard, not a
+        // file-format one. See [`DirLock`].
+        let _lock = DirLock::acquire(dir)?;
         let meta_path = dir.join("meta.bin");
         match fs::read(&meta_path) {
             Ok(bytes) => {
@@ -94,7 +209,7 @@ impl Store {
             .append(true)
             .read(true)
             .open(dir.join("blocks.log"))?;
-        Ok(Store { dir: dir.to_path_buf(), log })
+        Ok(Store { dir: dir.to_path_buf(), log, _lock })
     }
 
     /// Append one applied block. One write, then fsync — the block is only
@@ -370,6 +485,64 @@ mod tests {
             "the skip path read at least as much as the bodies it skipped"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// **The data-dir lock.** A second `Store::open` over a dir this process
+    /// already holds is refused.
+    ///
+    /// This is the concurrent half of slashing protection, and it is the half
+    /// nothing in this node had. Two `bloch-pos` processes over one data dir
+    /// share one keystore, reach the same duty and both sign it — the exact
+    /// pair `slashing.rs` turns into a stake burn. Remove the
+    /// `DirLock::acquire` line from `Store::open` and this test fails: the
+    /// second open succeeds and returns a happily writable store.
+    ///
+    /// Same-process is what a unit test can drive, and it is not a weaker
+    /// claim than cross-process: `flock` is held by the open file description,
+    /// so a second descriptor conflicts whoever opened it.
+    #[test]
+    fn a_second_open_of_a_live_data_dir_is_refused() {
+        let dir = std::env::temp_dir().join(format!("bloch-pos-lock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let first = Store::open(&dir, &[3u8; 32]).expect("the first open takes the dir");
+        assert!(dir.join("LOCK").exists(), "the lock is a visible artifact, on purpose");
+
+        let second = Store::open(&dir, &[3u8; 32]);
+        let err = second.err().expect(
+            "a second process over one data dir holds one keystore and double-signs; \
+             the second open must be refused",
+        );
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "got: {err}");
+
+        // Releasing it makes the dir usable again — a lock that never lets go
+        // would just be a different outage.
+        drop(first);
+        assert!(!dir.join("LOCK").exists(), "a clean shutdown removes the lock file");
+        let reopened = Store::open(&dir, &[3u8; 32]).expect("reopen after a clean release");
+        drop(reopened);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A `LOCK` left behind by a process that is gone must not brick the node.
+    ///
+    /// The counterpart to the test above, and the reason this is `flock` and
+    /// not a bare lock file: refusing to boot after every crash teaches
+    /// operators to delete the lock by reflex, which is how the protection
+    /// gets removed on the day it matters.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_lock_from_a_dead_process_is_reclaimed() {
+        let dir = std::env::temp_dir().join(format!("bloch-pos-stale-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("mkdir");
+        // What a killed node leaves: the file, nobody holding it.
+        fs::write(dir.join("LOCK"), b"999999\n").expect("write a stale lock");
+
+        let store = Store::open(&dir, &[4u8; 32]).expect("a stale lock must be reclaimed");
+        drop(store);
         let _ = fs::remove_dir_all(&dir);
     }
 

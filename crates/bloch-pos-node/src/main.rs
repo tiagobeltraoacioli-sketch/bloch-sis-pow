@@ -51,6 +51,7 @@ mod keys;
 mod net;
 mod p2p;
 mod rpc;
+mod slashprot;
 mod store;
 mod ws_boot;
 
