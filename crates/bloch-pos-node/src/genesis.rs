@@ -28,7 +28,61 @@ use bloch_pos_committee::tokenomics_v4;
 use bloch_pos_committee::transition::{CommittedState, GenesisValidator};
 use sha3::{Digest, Sha3_256};
 
-const MANIFEST_MAGIC: &[u8; 8] = b"BPOSMAN1";
+/// Format 1: the genesis header is fixed-field and carries no commitment to
+/// the ledger the manifest describes. Every Genesis-4 manifest published so
+/// far — the live mainnet's included — is this format, and its `genesis_id`
+/// is what the running fleet has agreed on since slot 0.
+const MANIFEST_MAGIC_V1: &[u8; 8] = b"BPOSMAN1";
+
+/// Format 2: the genesis header binds the ledger (audit C5-genesis-header).
+/// Byte-identical layout to v1 — only the magic differs, and only the derived
+/// header changes. See [`ManifestFormat`].
+const MANIFEST_MAGIC_V2: &[u8; 8] = b"BPOSMAN2";
+
+/// Which genesis-binding rule a manifest's header derivation follows.
+///
+/// # Why this is a format flag and not just a fix
+///
+/// The v1 genesis header is all compile-time constants: zero state root, zero
+/// mix, zero everything but `version`. So `genesis_id()` is the SAME 32 bytes
+/// for every manifest ever written — a devnet with three validators and no
+/// money, and mainnet with 452k carried outputs, have the identical genesis
+/// block id. Two consequences, and the second is the finding:
+///
+/// 1. The manifest digest pinned into `meta` is what actually stops a node
+///    from switching networks, and it does (§3.1). That check is why this was
+///    a latent hole rather than a live break.
+/// 2. Nothing in the *block graph* carries the ledger. A substituted manifest
+///    — same validator set, different balances, different carryover
+///    commitment — produces a genesis block that pairs at height 0 with the
+///    real chain: same id, same parent, same everything a peer compares. The
+///    divergence only surfaces later, as a state-root mismatch attributed to
+///    whatever block happened to expose it.
+///
+/// [`ManifestFormat::V2Bound`] closes that: `state_root` carries the genesis
+/// state's own root and `randao_mix` is seeded from the carryover digest, the
+/// way `genesis4-ceremony::genesis_header` has always assembled the published
+/// header. Two manifests that describe different ledgers then have different
+/// genesis ids, which is the property the block graph was missing.
+///
+/// # Why v1 is still here
+///
+/// Changing the derivation for the manifest the fleet already runs would
+/// change `genesis_id` under a live chain: every stored block's ancestry
+/// walks back to an id the new binary no longer computes, so every node
+/// breaks on its next restart. Genesis identity cannot be flag-dayed by
+/// height — the flag day IS publishing a new manifest. So the rule ships
+/// inert: a `BPOSMAN1` file derives exactly the bytes it derives today, and
+/// the binding takes effect the moment a `BPOSMAN2` manifest is published.
+/// That publication is a founder decision, not this module's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManifestFormat {
+    /// `BPOSMAN1` — legacy, unbound genesis header. Consensus-frozen: the
+    /// live Genesis-4 chain's genesis id is derived under this rule.
+    V1Unbound,
+    /// `BPOSMAN2` — genesis header bound to the manifest's ledger.
+    V2Bound,
+}
 
 /// The beacon mix that seeds epoch 0 — fixed before any validator could have
 /// influenced it (same convention as the pure crate's tests).
@@ -91,6 +145,17 @@ pub struct Manifest {
     /// [`Manifest::opening_balances`] refuses it rather than quietly
     /// committing an empty ledger.
     pub carryover_entries: Vec<EutxoEntry>,
+    /// Which genesis-binding rule this manifest's header follows — decided by
+    /// the file's magic, never by a local setting. See [`ManifestFormat`].
+    pub format: ManifestFormat,
+    /// Memo for [`Manifest::genesis_pre_state_root`], which is otherwise a
+    /// full genesis-state synthesis (452k outputs into an SMT on mainnet) on
+    /// every `genesis_header()` call — and `genesis_header` is on the RPC path
+    /// for height 0. Derived, never encoded, never hashed: it is a cache of a
+    /// pure function of the fields above, so it carries no identity of its
+    /// own and a stale one cannot exist (nothing mutates a manifest after
+    /// `ingest_carryover`, which is why that method clears it).
+    pub(crate) pre_state_root: std::sync::OnceLock<[u8; 32]>,
 }
 
 /// What the genesis state must reproduce from the carryover snapshot: four
@@ -745,7 +810,13 @@ pub fn load_carryover(
 impl Manifest {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(MANIFEST_MAGIC);
+        // The magic IS the format: everything after it is byte-identical
+        // between v1 and v2, so a manifest cannot be re-tagged by editing a
+        // field, and the digest pinned into `meta` covers these 8 bytes.
+        out.extend_from_slice(match self.format {
+            ManifestFormat::V1Unbound => MANIFEST_MAGIC_V1,
+            ManifestFormat::V2Bound => MANIFEST_MAGIC_V2,
+        });
         out.extend_from_slice(&self.genesis_time_ms.to_le_bytes());
         out.extend_from_slice(&self.slot_ms.to_le_bytes());
         out.extend_from_slice(&(self.validators.len() as u32).to_le_bytes());
@@ -784,9 +855,11 @@ impl Manifest {
     pub fn decode(bytes: &[u8]) -> Result<Manifest, crate::codec::DecodeErr> {
         use crate::codec::{DecodeErr, Reader};
         let mut r = Reader::new(bytes);
-        if r.take(8)? != MANIFEST_MAGIC {
-            return Err(DecodeErr("not a genesis manifest"));
-        }
+        let format = match r.take(8)? {
+            m if m == MANIFEST_MAGIC_V1 => ManifestFormat::V1Unbound,
+            m if m == MANIFEST_MAGIC_V2 => ManifestFormat::V2Bound,
+            _ => return Err(DecodeErr("not a genesis manifest")),
+        };
         let genesis_time_ms = r.u64()?;
         let slot_ms = r.u64()?;
         if slot_ms == 0 {
@@ -902,6 +975,8 @@ impl Manifest {
             // arrives here incomplete and stays that way until
             // `ingest_carryover` checks a snapshot against the commitment.
             carryover_entries: Vec::new(),
+            format,
+            pre_state_root: std::sync::OnceLock::new(),
         })
     }
 
@@ -1111,9 +1186,57 @@ impl Manifest {
     }
 
     /// The genesis block header, synthesized deterministically from the
-    /// manifest. Fixed-field: genesis is a block, so its id derives from a
-    /// header through the single §5.4 path — never from a label.
+    /// manifest. Genesis is a block, so its id derives from a header through
+    /// the single §5.4 path — never from a label.
+    ///
+    /// Under [`ManifestFormat::V2Bound`] it commits to the ledger: the genesis
+    /// state root in `state_root` and a carryover-seeded `randao_mix`, so no
+    /// two manifests describing different chains can share a genesis id.
+    /// Under [`ManifestFormat::V1Unbound`] every field is a constant and the
+    /// id is the same for every network — see [`ManifestFormat`] for why that
+    /// rule is still reachable and what it costs.
     pub fn genesis_header(&self) -> BlockHeaderV4 {
+        let mut h = self.anchor_header();
+        if self.format == ManifestFormat::V2Bound {
+            h.state_root = self.genesis_pre_state_root();
+        }
+        h
+    }
+
+    /// The beacon mix genesis opens with.
+    ///
+    /// Under [`ManifestFormat::V2Bound`] this is one §6.3 mixing step over the
+    /// carryover digest — `SHA3-256(DS_RANDAO ‖ 0 ‖ carryover_digest)`, the
+    /// same expression `genesis4-ceremony::genesis_header` uses — so the
+    /// beacon's origin entropy is pinned to the artifact the chain opens with
+    /// instead of being a constant an operator can reuse across networks. A
+    /// manifest with no carryover (a devnet) mixes over a zero digest: the
+    /// ledger binding then rests entirely on `state_root`, which is where it
+    /// belongs anyway.
+    ///
+    /// Under [`ManifestFormat::V1Unbound`] it is [`GENESIS_MIX`], unchanged.
+    pub fn genesis_mix(&self) -> [u8; 32] {
+        match self.format {
+            ManifestFormat::V1Unbound => GENESIS_MIX,
+            ManifestFormat::V2Bound => {
+                let digest = self.carryover.as_ref().map(|c| c.digest).unwrap_or([0u8; 32]);
+                let mut h = Sha3_256::new();
+                h.update(bloch_pos_committee::params::DS_RANDAO);
+                h.update(GENESIS_MIX);
+                h.update(digest);
+                h.finalize().into()
+            }
+        }
+    }
+
+    /// The genesis header *before* it commits to the state it anchors: every
+    /// field final except `state_root`.
+    ///
+    /// Its id is the anchor `genesis_pre_state_root` builds the genesis state
+    /// against, which is what keeps the derivation from chasing its own tail
+    /// (see that method). Under v1 this IS the genesis header — which is why
+    /// a v1 manifest's `genesis_id` is bit-for-bit what it has always been.
+    fn anchor_header(&self) -> BlockHeaderV4 {
         BlockHeaderV4 {
             version: VERSION_G4,
             parent: [0u8; 32],
@@ -1122,12 +1245,43 @@ impl Manifest {
             slot: 0,
             proposer_index: 0,
             randao_reveal: [0u8; 32],
-            randao_mix: GENESIS_MIX,
+            randao_mix: self.genesis_mix(),
             justified_root: [0u8; 32],
             finalized_root: [0u8; 32],
             attestation_root: [0u8; 32],
             coherence_root: [0u8; 32],
         }
+    }
+
+    /// The state root a [`ManifestFormat::V2Bound`] genesis header commits to.
+    ///
+    /// # The self-reference, and where it is cut
+    ///
+    /// Genesis is the one block whose state depends on its own identity:
+    /// `CommittedState::genesis` seeds the justified and finalized checkpoints
+    /// with the genesis block id, that id is `SHA3-256(DS_BLOCK ‖ header)`,
+    /// and the header is what the root would go into. Committing the root of
+    /// the *final* state is therefore not an object that can exist — no
+    /// ordering of those three steps terminates.
+    ///
+    /// The cut: the state is built against [`Self::anchor_header`]'s id — the
+    /// header with `state_root` still zero — and its root is what the final
+    /// header carries. Every ledger fact is inside it: the validator registry
+    /// with its stakes, commissions and RANDAO commitments; the genesis
+    /// cohort; every opening balance (the whole carryover plus the vested
+    /// allocations, through the eUTXO subtree); `issued_sat`; the taint,
+    /// coherence and EVM commitments; epoch-0 participation. The only input
+    /// NOT under it is the 32 bytes that are the answer — and those are
+    /// determined by everything that is.
+    ///
+    /// So `genesis_id` becomes a function of the ledger, which is the whole
+    /// point: substituting a manifest now moves the genesis block id, and a
+    /// substituted chain no longer pairs at height 0.
+    pub fn genesis_pre_state_root(&self) -> [u8; 32] {
+        *self.pre_state_root.get_or_init(|| {
+            use bloch_pos_committee::interfaces::StateReader;
+            self.state_anchored_at(BlockId::of(&self.anchor_header())).state_root()
+        })
     }
 
     pub fn genesis_id(&self) -> BlockId {
@@ -1138,6 +1292,18 @@ impl Manifest {
     /// plan decision 6) and taint is dissolved (decision 8): all three
     /// carried roots are zero.
     pub fn genesis_state(&self) -> CommittedState {
+        self.state_anchored_at(self.genesis_id())
+    }
+
+    /// [`Self::genesis_state`] with the anchoring block id passed in.
+    ///
+    /// Two callers, one body: the real genesis state anchors at
+    /// `genesis_id()`, and `genesis_pre_state_root` anchors at the
+    /// pre-commitment header's id. Sharing the body is the point — if the two
+    /// were written out separately, a component added to one (the way the
+    /// eUTXO set once was not added to either) would go missing from the
+    /// other's commitment without anything failing.
+    fn state_anchored_at(&self, anchor: BlockId) -> CommittedState {
         let vals: Vec<GenesisValidator> = self
             .validators
             .iter()
@@ -1151,8 +1317,8 @@ impl Manifest {
             })
             .collect();
         CommittedState::genesis(
-            self.genesis_id(),
-            GENESIS_MIX,
+            anchor,
+            self.genesis_mix(),
             &vals,
             &self.cohort,
             [0u8; 32],
@@ -1187,6 +1353,10 @@ impl Manifest {
         };
         let snap = load_carryover(path, &c)?;
         self.carryover_entries = snap.entries.clone();
+        // The balance set just changed, so the memoised genesis root — which
+        // commits to it — must not survive. `OnceLock::take` needs `&mut`,
+        // which is exactly what this method holds and no other caller does.
+        self.pre_state_root.take();
         Ok(snap)
     }
 
@@ -1419,6 +1589,8 @@ mod tests {
             carryover: None,
             allocations: Vec::new(),
             carryover_entries: Vec::new(),
+            format: ManifestFormat::V1Unbound,
+            pre_state_root: std::sync::OnceLock::new(),
         }
     }
 
@@ -1898,6 +2070,183 @@ mod tests {
             Some(m.validators[2].pubkey.clone()),
             "validator 9 resolves to its own key"
         );
+    }
+
+    // ── C5-genesis-header: genesis identity must follow the ledger ───────
+
+    /// Turn a manifest into the bound format. Nothing else moves: same
+    /// validators, same cohort, same carryover, same allocations — so any
+    /// difference these tests observe is the binding rule and nothing else.
+    fn bound(mut m: Manifest) -> Manifest {
+        m.format = ManifestFormat::V2Bound;
+        m
+    }
+
+    /// **The finding.** Two manifests describing different ledgers must not
+    /// share a genesis block id.
+    ///
+    /// Under the unbound rule they did, always: `genesis_header` was twelve
+    /// compile-time constants, so `genesis_id()` was the same 32 bytes for a
+    /// devnet with no money and for mainnet with the whole carryover in it. A
+    /// substituted manifest — same cohort, different balances — produced a
+    /// genesis block that paired at height 0 with the real chain, and the
+    /// divergence only surfaced later as a state-root mismatch blamed on some
+    /// innocent block.
+    ///
+    /// Fails without the fix: with `state_root` pinned to `[0u8; 32]` the two
+    /// ids are equal by construction and this is the assertion that says so.
+    #[test]
+    fn bound_genesis_id_differs_for_two_ledgers() {
+        let a = bound(mainnet_sample());
+        let mut b = bound(mainnet_sample());
+        // One satoshi, on one output, out of four. Downward, so the one-sided
+        // genesis conservation check cannot be what fails instead.
+        b.carryover_entries[0].value -= 1;
+
+        assert_ne!(
+            a.genesis_id().as_bytes(),
+            b.genesis_id().as_bytes(),
+            "two manifests opening different ledgers must not share a genesis block id"
+        );
+        // And the reason is the header field the finding named, not some
+        // incidental difference elsewhere in it.
+        assert_ne!(a.genesis_header().state_root, b.genesis_header().state_root);
+    }
+
+    /// The same claim one level down, and the one that would catch a
+    /// `state_root` that commits to the validator set but forgets the money:
+    /// the difference is ONLY in the balances.
+    #[test]
+    fn bound_genesis_state_root_covers_the_opening_balances() {
+        let a = bound(mainnet_sample());
+        let mut b = bound(mainnet_sample());
+        b.carryover_entries[0].value -= 1;
+        assert_eq!(
+            a.validators.len(),
+            b.validators.len(),
+            "the fixture must differ in balances alone for this test to mean anything"
+        );
+        assert_ne!(a.genesis_pre_state_root(), b.genesis_pre_state_root());
+        // A changed cohort must move it too — same commitment, other half.
+        let mut c = bound(mainnet_sample());
+        c.validators[1].stake_sat += 1;
+        assert_ne!(a.genesis_pre_state_root(), c.genesis_pre_state_root());
+    }
+
+    /// The mix is seeded by the carryover digest, by the same expression
+    /// `genesis4-ceremony::genesis_header` publishes:
+    /// `SHA3-256(DS_RANDAO ‖ 0 ‖ carryover_digest)`.
+    ///
+    /// Written out by hand rather than called through `genesis_mix`, so this
+    /// pins the formula and not the implementation of it.
+    #[test]
+    fn bound_genesis_mix_is_seeded_by_the_carryover_digest() {
+        let m = bound(mainnet_sample());
+        let mut h = Sha3_256::new();
+        h.update(bloch_pos_committee::params::DS_RANDAO);
+        h.update([0u8; 32]);
+        h.update(m.carryover.as_ref().expect("the mainnet fixture commits to a carryover").digest);
+        let want: [u8; 32] = h.finalize().into();
+
+        assert_eq!(m.genesis_mix(), want);
+        assert_eq!(m.genesis_header().randao_mix, want);
+        assert_ne!(m.genesis_mix(), GENESIS_MIX, "a seeded mix is not the zero constant");
+        // The state opens on the same mix the header advertises — the duty
+        // view and the consensus authority for one quantity. (Read off the
+        // state directly, not through `seed_for_epoch`, whose test builds
+        // carry the A/B rehearsal's planted mutation.)
+        use bloch_pos_committee::interfaces::StateReader;
+        assert_eq!(StateReader::randao_mix(&m.genesis_state()), want);
+    }
+
+    /// A different carryover artifact, same everything else, moves the mix.
+    #[test]
+    fn bound_genesis_mix_follows_the_carryover_artifact() {
+        let a = bound(mainnet_sample());
+        let mut b = bound(mainnet_sample());
+        let mut c = b.carryover.clone().expect("fixture commits");
+        c.digest[0] ^= 1;
+        b.carryover = Some(c);
+        assert_ne!(a.genesis_mix(), b.genesis_mix());
+    }
+
+    /// **The freeze.** The unbound rule is what the live Genesis-4 chain
+    /// launched under, and every block it holds walks its ancestry back to
+    /// this id. Changing it under a running fleet breaks every node on its
+    /// next restart — genesis identity has no flag day, because the flag day
+    /// IS publishing a new manifest.
+    ///
+    /// So the legacy header is pinned here, field by field, spelled out rather
+    /// than called: this test fails if anybody makes the binding
+    /// unconditional, which is exactly the review that change deserves.
+    #[test]
+    fn unbound_genesis_identity_is_frozen() {
+        let legacy = BlockHeaderV4 {
+            version: VERSION_G4,
+            parent: [0u8; 32],
+            state_root: [0u8; 32],
+            body_root: [0u8; 32],
+            slot: 0,
+            proposer_index: 0,
+            randao_reveal: [0u8; 32],
+            randao_mix: [0u8; 32],
+            justified_root: [0u8; 32],
+            finalized_root: [0u8; 32],
+            attestation_root: [0u8; 32],
+            coherence_root: [0u8; 32],
+        };
+        for m in [sample(), mainnet_sample()] {
+            assert_eq!(m.format, ManifestFormat::V1Unbound, "the fixtures are v1");
+            assert_eq!(
+                m.genesis_id().as_bytes(),
+                BlockId::of(&legacy).as_bytes(),
+                "a v1 manifest's genesis id is consensus-frozen"
+            );
+        }
+    }
+
+    /// The two rules really are two rules: the same manifest under each has a
+    /// different genesis. This is the sentence the founder decision is about.
+    #[test]
+    fn binding_changes_genesis_identity() {
+        let unbound = mainnet_sample();
+        let bound_m = bound(mainnet_sample());
+        assert_ne!(unbound.genesis_id().as_bytes(), bound_m.genesis_id().as_bytes());
+    }
+
+    /// The format is carried by the file, not by a local setting: it survives
+    /// the round trip, and so therefore does the genesis id.
+    #[test]
+    fn format_round_trips_through_the_manifest_bytes() {
+        for m in [sample(), bound(sample())] {
+            let back = Manifest::decode(&m.encode()).expect("a manifest we just encoded decodes");
+            assert_eq!(back.format, m.format);
+            assert_eq!(back.genesis_id().as_bytes(), m.genesis_id().as_bytes());
+        }
+        // And the two encodings differ in the magic alone.
+        let (v1, v2) = (sample().encode(), bound(sample()).encode());
+        assert_eq!(&v1[..8], b"BPOSMAN1");
+        assert_eq!(&v2[..8], b"BPOSMAN2");
+        assert_eq!(v1[8..], v2[8..], "only the magic distinguishes the two formats");
+    }
+
+    /// The memo is a cache of a pure function, so ingesting the balance set —
+    /// the one mutation a manifest undergoes — must not leave a root behind
+    /// that predates the money.
+    #[test]
+    fn ingesting_the_carryover_invalidates_the_memoised_root() {
+        let mut m = bound(mainnet_sample());
+        m.carryover = None;
+        m.carryover_entries = Vec::new();
+        let before = m.genesis_pre_state_root();
+        m.carryover = Some(snapshot_commitment());
+        m.ingest_carryover(&snapshot_file("c5-memo", SNAPSHOT)).expect("the fixture ingests");
+        assert_ne!(
+            before,
+            m.genesis_pre_state_root(),
+            "the genesis root must follow the balances that were just ingested"
+        );
+        assert_eq!(m.genesis_pre_state_root(), bound(mainnet_sample()).genesis_pre_state_root());
     }
 
     #[test]
@@ -2677,6 +3026,8 @@ mod blp02_hybrid_suite {
             carryover: None,
             allocations: vec![],
             carryover_entries: vec![],
+            format: ManifestFormat::V1Unbound,
+            pre_state_root: std::sync::OnceLock::new(),
         }
     }
 

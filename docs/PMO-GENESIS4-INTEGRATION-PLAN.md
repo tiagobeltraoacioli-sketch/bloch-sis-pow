@@ -135,6 +135,37 @@ in this file anyway, populate `genesis_header().state_root` with the computed
 root.** It is a three-line change in the same function, it makes the failure
 happen at boot instead of at block 1, and pre-launch it is free.
 
+#### Resolution (audit C5-genesis-header, 2026-09-05) — shipped INERT
+
+It was not taken pre-launch, so it is no longer free: the live chain's blocks
+all walk their ancestry back to the unbound `genesis_id`, and a node that
+computes a different one cannot read its own store. Genesis identity has no
+flag day — **the flag day is publishing a new manifest.**
+
+So the rule ships as a manifest format, `genesis::ManifestFormat`:
+
+- **`BPOSMAN1` / `V1Unbound`** — every published manifest, mainnet included.
+  Derives byte-for-byte the header it derives today. Frozen by
+  `unbound_genesis_identity_is_frozen`.
+- **`BPOSMAN2` / `V2Bound`** — `state_root` carries the genesis state's own
+  root (`Manifest::genesis_pre_state_root`) and `randao_mix` is
+  `SHA3-256(DS_RANDAO ‖ 0 ‖ carryover_digest)`, the expression
+  `genesis4-ceremony::genesis_header` has always published. Two manifests
+  describing different ledgers then have different genesis ids.
+
+Emit one with `bloch-pos genesis --bind-genesis` / `genesis-mainnet
+--bind-genesis`. Nothing selects it by default, because a manifest carrying it
+is a **different network** from the one the fleet runs — adopting it means
+relaunching from its own block 0, which is a founder decision and not a
+deployment.
+
+The self-reference is cut at the anchor: `CommittedState::genesis` seeds its
+checkpoints with the genesis block id, so the root committed is that of the
+state anchored at the *pre-commitment* header's id (the same header with
+`state_root` still zero). Every ledger fact — registry, cohort, all opening
+balances, `issued_sat`, the carried roots — is under it; only the 32 bytes
+that are the answer are not.
+
 ---
 
 ## 3. Item 1 — the PoS RPC
