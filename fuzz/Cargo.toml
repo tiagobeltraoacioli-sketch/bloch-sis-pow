@@ -18,9 +18,27 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-bloch = { path = ".." }
+# Genesis-3, the CLOSED proof-of-work node. This used to read `path = ".."`,
+# from when the repo root WAS the `bloch` package. Genesis-4 made the root a
+# virtual manifest and moved the PoW node to legacy/genesis3-node/, and cargo
+# answers a path-dep on a virtual manifest with a hard error — so every target
+# in this harness failed to resolve, silently, for as long as that lasted.
+# `tests/fuzz_harness_resolves.rs` in bloch-pos-node is what now goes red if
+# this path stops naming a package.
+bloch = { path = "../legacy/genesis3-node" }
 bloch-sis-pow = { path = "../crates/bloch-sis-pow" }
 coherence-core = { path = "../crates/coherence-core" }
+# ── Genesis-4, THE LIVE CHAIN. The `pos_*` targets below. ──
+# The frozen consensus math: BlockHeaderV4::canonical_deserialize, Attestation,
+# tokenomics_v4::split_g3_sat.
+bloch-pos-committee = { path = "../crates/bloch-pos-committee" }
+# bloch-pos-node is a [[bin]]-only crate, so its decoders cannot be `use`d.
+# The pos_* targets pull src/codec.rs and src/genesis.rs in by `#[path]`, which
+# means the fuzzed bytes run the node's own source and not a copy of it — and
+# it means this harness needs what those two modules need: sha3, and
+# bloch-crypto for the suite check inside the genesis manifest verifier.
+bloch-crypto = { path = "../crates/bloch-crypto" }
+sha3 = "0.10"
 # P1 (roadmap §1b): the netmsg / handshake decode targets mirror the node's
 # gossipsub/transport ingest, which decodes with bincode 2 (serde). Match the
 # node's version so the wire format under fuzz is identical.
@@ -103,5 +121,38 @@ doc = false
 # Hybrid PQ signature verifier + crypto-agility suite envelope parser.
 name = "sig_verify"
 path = "fuzz_targets/sig_verify.rs"
+test = false
+doc = false
+
+# ── S-H1: Genesis-4 decoders. Every target above fuzzes a chain that stopped ──
+# ── at height 39,918; these four are the untrusted-input surface of the one  ──
+# ── that is running. Each asserts a PROPERTY, not merely absence of panic.   ──
+
+[[bin]]
+# Whole block frame off gossipsub: codec::decode_envelope.
+name = "pos_envelope_decode"
+path = "fuzz_targets/pos_envelope_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+# The highest-rate frame on the network: codec::decode_attestation.
+name = "pos_attestation_decode"
+path = "fuzz_targets/pos_attestation_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+# BlockHeaderV4::canonical_deserialize — the single derivation path BlockId
+# rests on.
+name = "pos_header_decode"
+path = "fuzz_targets/pos_header_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+# genesis::read_carryover_snapshot — the parser that reads the opening ledger.
+name = "pos_carryover_snapshot"
+path = "fuzz_targets/pos_carryover_snapshot.rs"
 test = false
 doc = false
