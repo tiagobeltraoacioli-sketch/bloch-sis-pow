@@ -214,8 +214,16 @@ view/spend stealth addresses (no scan key; a sender cannot derive them).
 
 ### 2.3 Seed phrases / HD wallet (context; out of the consensus surface)
 
-BIP39 24-word default; `to_seed_bytes` = PBKDF2-HMAC-SHA256, 2048 rounds, salt
-`"mnemonic"` (`wallet/seed.rs`). The "HD wallet" (`hd_wallet/mod.rs`) stores each
+BIP39 24-word default; `to_seed_bytes` = PBKDF2-HMAC-**SHA512**, 2048 rounds,
+salt `"mnemonic"` (`wallet/seed.rs`) — the seed BIP39 actually specifies, pinned
+to the official test vectors. Until audit finding K-M3 this used
+HMAC-**SHA256**, which silently produced a different 64-byte seed, and therefore
+a different PQ key, than every other BIP39 tool for the same phrase — including
+`bloch-btc-wallet::derive_identity` and `bloch-pq-vault::derive_vault_keys` in
+this repo. The pre-fix derivation survives as the deprecated
+`to_seed_bytes_legacy_sha256` for migration/sweep tooling only; whether any
+wallet in the wild needs that sweep is **needs-founder-decision**.
+The "HD wallet" (`hd_wallet/mod.rs`) stores each
 address as an independently generated keypair encrypted under a master key — it
 is **not** lattice-HD derivation, and recovery requires **both** the mnemonic and
 the wallet file. Note two non-unified notions of "derived key" coexist
