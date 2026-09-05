@@ -73,6 +73,11 @@ libp2p = { version = "0.56", features = [
     "tokio", "dns", "macros", "ed25519",
 ] }
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+# `flock(2)` for the data-dir lock (src/store.rs `DirLock`). A lock FILE alone
+# cannot tell a running node from a killed one; flock is released by the kernel
+# when the holder dies, which is what makes a stale lock reclaimable instead of
+# an outage. No new package in Cargo.lock — tokio already pulls this exact one.
+libc = "0.2"
 futures = "0.3"
 async-trait = "0.1"
 

@@ -94,6 +94,7 @@ use crate::genesis::{Manifest, GENESIS_MIX};
 use crate::keys::{HybridVerifier, Keystore, ProbeVerifier};
 use crate::net::{self, NetEvent, Origin, Verdict};
 use crate::rpc::{self, Admitted, Finality, Json, RpcCall, RpcError, RpcRequest, RpcResult};
+use crate::slashprot::SlashingProtection;
 use crate::store::Store;
 
 /// Everything that reaches the consensus thread from outside it.
@@ -808,6 +809,14 @@ struct Engine {
     /// sweeps, whatever epoch it booted into.
     mempool_swept_epoch: u64,
     store: Store,
+    /// Last-signed watermarks, on disk, consulted before EVERY signature this
+    /// node makes.
+    ///
+    /// Present even in observer mode: an observer signs nothing, so the file
+    /// simply never moves, and having the field unconditionally means there is
+    /// no mode in which a signing path could compile without a guard in front
+    /// of it. See [`crate::slashprot`] for the ordering rule.
+    slashprot: SlashingProtection,
     net: net::Net,
     head_slot: Arc<AtomicU64>,
     /// False during boot replay: no log appends, no broadcasts, no logs.
@@ -1361,11 +1370,30 @@ impl Engine {
             target_epoch: e,
             target_root: self.checkpoint_root(e),
         };
-        let signature = self
-            .keys
-            .as_ref()
-            .expect("checked above")
-            .sign(&data.signing_root());
+        // SLASHING PROTECTION. The duty is settled; the signature is not made
+        // until the watermark for it is on disk and fsync-ed. `slot` here is
+        // the wall-clock slot — the slot loop derives it from `wall_slot()`
+        // and hands it in — so "refuse unless the slot exceeds the watermark"
+        // is exactly "refuse unless the wall clock has moved past what we
+        // already signed", including after an NTP step backwards or a restart
+        // inside the same slot.
+        //
+        // Borrow shape: `keys` is read inside the closure while `slashprot` is
+        // borrowed mutably, so the key is resolved to a local first.
+        let keys = self.keys.as_ref().expect("checked above");
+        let root = data.signing_root();
+        let signature = match self.slashprot.guard_attestation(
+            slot,
+            data.source_epoch,
+            data.target_epoch,
+            || keys.sign(&root),
+        ) {
+            Ok(sig) => sig,
+            Err(refusal) => {
+                eprintln!("[slot {slot}] {refusal}");
+                return;
+            }
+        };
         let att = Attestation {
             data,
             validator: index,
@@ -1565,11 +1593,21 @@ impl Engine {
         };
         header.state_root = post.state_root();
 
-        let proposer_sig = self
-            .keys
-            .as_ref()
-            .expect("checked above")
-            .sign(&header.proposal_signing_root());
+        // SLASHING PROTECTION, same rule as `attest`: the watermark for this
+        // slot is durable before the block is signed. A proposer that signs a
+        // second block for a slot it already proposed hands `slashing.rs` a
+        // proposer offence, and everything above this line — the post-state,
+        // the transaction selection — is discardable work; the signature is
+        // not.
+        let keys = self.keys.as_ref().expect("checked above");
+        let root = header.proposal_signing_root();
+        let proposer_sig = match self.slashprot.guard_proposal(slot, || keys.sign(&root)) {
+            Ok(sig) => sig,
+            Err(refusal) => {
+                eprintln!("[slot {slot}] {refusal}");
+                return;
+            }
+        };
         let env = BlockEnvelope {
             header,
             proposer_sig,
@@ -3559,6 +3597,19 @@ pub fn run(cfg: Config) -> io::Result<()> {
     }
 
     let store = Store::open(&cfg.data_dir, &digest)?;
+    // Loaded before anything can sign. A corrupt watermark file stops the node
+    // here, on purpose: a validator that cannot prove which duties it already
+    // signed must not sign.
+    let slashprot = SlashingProtection::open(&cfg.data_dir)?;
+    if let Some(wm) = slashprot.watermarks().attestation_slot {
+        println!(
+            "slashing protection: last attested slot {wm}, last proposed slot {}",
+            match slashprot.watermarks().proposal_slot {
+                Some(p) => p.to_string(),
+                None => "none".to_string(),
+            }
+        );
+    }
     let genesis_state = manifest.genesis_state();
     let genesis_id = manifest.genesis_id();
     println!(
@@ -3684,6 +3735,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         mempool_suspect: BTreeSet::new(),
         mempool_swept_epoch: u64::MAX,
         store,
+        slashprot,
         net,
         head_slot,
         live: false,
@@ -3983,6 +4035,17 @@ pub fn run(cfg: Config) -> io::Result<()> {
         // duties, so a restarted proposer does not build on a stale head.
         let in_grace = now.saturating_sub(engine.booted_ms) < 2 * slot_ms;
 
+        // `slot` here IS `wall_slot()` — same expression, computed once per
+        // turn above. It is what reaches the slashing-protection watermark, so
+        // "refuse unless the slot exceeds the watermark" is literally "refuse
+        // unless the wall clock has passed what this node already signed".
+        //
+        // `last_attested`/`last_built` are NOT that protection: they start at
+        // `engine.state.slot()`, which is the head of the chain this node
+        // adopted, not a record of what this node signed, and they live in
+        // this function's stack — a restart forgets them entirely. They stop
+        // duplicate work within one run; `slashprot` is what stops a second
+        // signature across runs and across processes.
         if !in_grace && slot > last_attested {
             engine.attest(slot);
             last_attested = slot;
@@ -5637,6 +5700,7 @@ mod transfer_v2_end_to_end {
         mempool_suspect: BTreeSet::new(),
         mempool_swept_epoch: u64::MAX,
             store,
+            slashprot: SlashingProtection::open(&dir).expect("open slashing protection"),
             net,
             head_slot,
             live: true,
@@ -6461,6 +6525,7 @@ mod perf_support {
         mempool_suspect: BTreeSet::new(),
         mempool_swept_epoch: u64::MAX,
             store,
+            slashprot: SlashingProtection::open(&dir).expect("open slashing protection"),
             net,
             head_slot,
             live: true,
@@ -7134,6 +7199,78 @@ mod rolled_memo_tests {
             41,
             "forty proposed slots must land forty blocks on genesis"
         );
+    }
+
+    /// **The signing paths are actually wired to slashing protection.**
+    ///
+    /// The guard itself is proved in `slashprot.rs` (ordering, restart,
+    /// double vote, surround). What that cannot prove is that `propose` and
+    /// `attest` *go through it* — a guard nothing calls is the gap this
+    /// finding was re-opened for. So this drives the real engine and then
+    /// reads the watermark file the way the NEXT BOOT would: a fresh
+    /// `SlashingProtection::open` over the same data dir, no shared state
+    /// with the engine that wrote it.
+    ///
+    /// Mutation: take `guard_proposal` (or `guard_attestation`) back out of
+    /// the signing path and this fails — the duty still happens, the block is
+    /// still signed, and the file the next boot reads knows nothing about it,
+    /// which is precisely how a restart double-signs.
+    #[test]
+    fn every_signature_leaves_a_durable_watermark_the_next_boot_can_read() {
+        use bloch_pos_committee::SLOTS_PER_EPOCH;
+        let (mut engine, dir) = perf_support::proposing_engine();
+
+        engine.propose(1);
+        assert_eq!(engine.chain.len(), 2, "slot 1 must have landed, or nothing was signed");
+
+        // Attest the epoch-1 duty. With one validator the epoch committees
+        // partition it into exactly ONE slot (see `epoch_committees`: chunks
+        // of `len / SLOTS_PER_EPOCH`), and which slot depends on the seed, so
+        // the duty is found rather than assumed.
+        let mut attested_at = None;
+        for slot in SLOTS_PER_EPOCH..2 * SLOTS_PER_EPOCH {
+            let before = engine.pool.len();
+            engine.attest(slot);
+            if engine.pool.len() > before {
+                attested_at = Some(slot);
+                break;
+            }
+        }
+        let attested_at = attested_at.expect(
+            "this engine is the whole committee, so exactly one slot of epoch 1 is its duty; \
+             finding none means the test never exercised the attest path at all",
+        );
+
+        // What a restart would load.
+        let next_boot = SlashingProtection::open(&dir.0).expect("the next boot reads the file");
+        let wm = next_boot.watermarks();
+        assert_eq!(
+            wm.proposal_slot,
+            Some(1),
+            "a block was signed for slot 1 but the next boot does not know it — the proposer \
+             path is not going through slashing protection"
+        );
+        assert_eq!(
+            wm.attestation_slot,
+            Some(attested_at),
+            "an attestation was signed for slot {attested_at} but the next boot does not know \
+             it — the attester path is not going through slashing protection"
+        );
+        assert_eq!(wm.target_epoch, Some(1), "the target epoch voted is watermarked too");
+
+        // And that loaded state is a real refusal, not a record: the duties
+        // just signed cannot be signed again by the process that comes next.
+        let mut next_boot = next_boot;
+        let mut signed = false;
+        assert!(
+            next_boot.guard_proposal(1, || signed = true).is_err(),
+            "the next boot would re-propose slot 1"
+        );
+        assert!(
+            next_boot.guard_attestation(attested_at, 0, 1, || signed = true).is_err(),
+            "the next boot would re-attest slot {attested_at}"
+        );
+        assert!(!signed, "a refused duty must never reach a signing closure");
     }
 
     /// A block moves the state, and the rolled view of the *same* epoch must
@@ -7921,6 +8058,7 @@ mod duty_view_anchor {
         mempool_suspect: BTreeSet::new(),
         mempool_swept_epoch: u64::MAX,
             store,
+            slashprot: SlashingProtection::open(&dir.0).expect("open slashing protection"),
             net,
             head_slot,
             live: true,

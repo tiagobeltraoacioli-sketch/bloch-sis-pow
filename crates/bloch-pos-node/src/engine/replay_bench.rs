@@ -662,6 +662,9 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         mempool_suspect: BTreeSet::new(),
         mempool_swept_epoch: u64::MAX,
         store,
+        // Observer harness: nothing here signs, so the watermarks never move.
+        slashprot: crate::slashprot::SlashingProtection::open(dir)
+            .expect("open slashing protection"),
         net,
         head_slot,
         live: false,
