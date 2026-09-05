@@ -21,7 +21,7 @@ use bloch_euvm::minting::{
     MintRequest, MintTxError,
 };
 use bloch_euvm::modules::{ModuleKind, SupplyConfig};
-use bloch_euvm::{AssetId, EuTx, ExtOutput, SigVerifier, Val, Value};
+use bloch_euvm::{tx_sighash, AssetId, EuTx, ExtOutput, SigVerifier, Val, Value};
 
 struct MockVerifier {
     good: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
@@ -55,7 +55,6 @@ fn out(value: Value) -> ExtOutput {
 fn supply_module_cap_is_enforced_over_total_supply() {
     let issuer = b"issuer-pk".to_vec();
     let sig = b"issuer-sig".to_vec();
-    let sighash = b"the-sighash".to_vec();
 
     // The token's Supply module — cap is advertised as 1_000.
     let supply_program = ModuleKind::Supply(SupplyConfig {
@@ -73,7 +72,7 @@ fn supply_module_cap_is_enforced_over_total_supply() {
         inputs: vec![],
         outputs: vec![out(asset_val(asset, minted))],
         fee: 0,
-        sighash: sighash.clone(),
+        sighash: vec![],
     };
 
     // THE ATTACK, unchanged: seed the policy stack `[requested, sig]` with
@@ -84,7 +83,20 @@ fn supply_module_cap_is_enforced_over_total_supply() {
         action: MintAction { asset_id: asset, delta: minted as i128 },
     }];
 
-    let v = MockVerifier { good: vec![(sighash, issuer, sig.clone())] };
+    // The issuer signs the canonical sighash of each transaction it authorizes — the
+    // signature is bound to that tx's outputs, so one is needed per distinct effect.
+    let ok_tx_preview = |value: u64| EuTx {
+        inputs: vec![],
+        outputs: vec![out(asset_val(asset, value))],
+        fee: 0,
+        sighash: vec![],
+    };
+    let v = MockVerifier {
+        good: vec![
+            (tx_sighash(&tx).to_vec(), issuer.clone(), sig.clone()),
+            (tx_sighash(&ok_tx_preview(900)).to_vec(), issuer, sig.clone()),
+        ],
+    };
 
     // The over-cap mint is now REFUSED. (`Assert` and not a quiet `false`: an
     // over-cap mint is malformed, not merely unauthorized.)
@@ -111,12 +123,7 @@ fn supply_module_cap_is_enforced_over_total_supply() {
     // simply break the module. Without this, both assertions above would pass on a
     // Supply program that authorizes nothing at all.
     let small: u64 = 900;
-    let ok_tx = EuTx {
-        inputs: vec![],
-        outputs: vec![out(asset_val(asset, small))],
-        fee: 0,
-        sighash: b"the-sighash".to_vec(),
-    };
+    let ok_tx = ok_tx_preview(small);
     let ok_mints = vec![MintRequest {
         policy: supply_program,
         redeemer: vec![Val::Bytes(sig)],
@@ -140,7 +147,7 @@ fn contrast_correct_cap_policy_rejects_the_same_over_cap_mint() {
         inputs: vec![],
         outputs: vec![out(asset_val(asset, minted))],
         fee: 0,
-        sighash: b"sh".to_vec(),
+        sighash: vec![],
     };
     let mints = vec![MintRequest {
         policy: correct,

@@ -560,13 +560,31 @@ pub enum Gate {
     Deny,
 }
 
-/// Decide whether `proof` (against `root`) grants passage under `gate`. The proof
-/// must *both* verify against the committed root *and* carry the right membership
-/// polarity — so neither a forged proof nor a valid-but-wrong-polarity proof passes.
+/// Decide whether `id` — **the identity the transaction authenticates** — passes
+/// `gate`, given `proof` against the committed `root`.
 ///
-/// - `Allow`: pass iff a **valid membership** proof (the id is on the allow-list).
-/// - `Deny`:  pass iff a **valid non-membership** proof (the id is not deny-listed).
-pub fn gate_allows(gate: Gate, root: &Hash, proof: &Proof) -> bool {
+/// Three conditions, all required, all fail-closed:
+/// 1. **Identity binding.** `proof.key == id`. Without this a gate says nothing about
+///    who is transacting: a sanctioned party would clear a `Deny` gate by proving the
+///    non-membership of a key it invented on the spot, and a non-member would clear an
+///    `Allow` gate by **replaying a member's public proof** (proofs ride in the open,
+///    so any observer can copy one). The proof must be *about the caller*.
+/// 2. The proof verifies against the committed `root` (no forgery, no stale root).
+/// 3. The membership polarity matches the gate.
+///
+/// - `Allow`: pass iff `id` has a **valid membership** proof (it is on the allow-list).
+/// - `Deny`:  pass iff `id` has a **valid non-membership** proof (it is not deny-listed).
+///
+/// `id` MUST come from an authenticated source, not from the same untrusted blob as
+/// the proof — in a spend that is the identity covered by the signature the validator
+/// checks, and that signature is itself bound to the transaction's outputs by
+/// [`crate::tx_sighash`]. Identity binding here plus sighash binding there is what
+/// makes a gated spend non-replayable: the proof cannot be lifted onto another
+/// identity, and the authorization cannot be lifted onto another transaction.
+pub fn gate_allows(gate: Gate, root: &Hash, id: &[u8], proof: &Proof) -> bool {
+    if proof.key.as_slice() != id {
+        return false;
+    }
     if !verify(root, proof) {
         return false;
     }
@@ -803,11 +821,11 @@ mod tests {
         let root = allow.root();
 
         // member passes an allow-gate
-        assert!(gate_allows(Gate::Allow, &root, &allow.prove(b"kyc:alice")));
+        assert!(gate_allows(Gate::Allow, &root, b"kyc:alice", &allow.prove(b"kyc:alice")));
         // non-member fails an allow-gate (valid non-membership proof, wrong polarity)
         let pmallory = allow.prove(b"kyc:mallory");
         assert!(verify(&root, &pmallory));
-        assert!(!gate_allows(Gate::Allow, &root, &pmallory));
+        assert!(!gate_allows(Gate::Allow, &root, b"kyc:mallory", &pmallory));
     }
 
     #[test]
@@ -817,9 +835,9 @@ mod tests {
         let root = deny.root();
 
         // a clean id passes a deny-gate (proven NOT on the list)
-        assert!(gate_allows(Gate::Deny, &root, &deny.prove(b"clean:y")));
+        assert!(gate_allows(Gate::Deny, &root, b"clean:y", &deny.prove(b"clean:y")));
         // a listed id fails a deny-gate
-        assert!(!gate_allows(Gate::Deny, &root, &deny.prove(b"sanctioned:x")));
+        assert!(!gate_allows(Gate::Deny, &root, b"sanctioned:x", &deny.prove(b"sanctioned:x")));
     }
 
     #[test]
@@ -831,7 +849,7 @@ mod tests {
         b.add(b"id2");
         // a proof built from b does not pass against a's root
         let p = b.prove(b"id2");
-        assert!(!gate_allows(Gate::Allow, &a.root(), &p));
+        assert!(!gate_allows(Gate::Allow, &a.root(), b"id2", &p));
     }
 
     // ── the payoff: a root lives in Val::Bytes and a validator asserts it ──
@@ -1134,28 +1152,23 @@ mod tests {
         assert_eq!(snap.dividend_share(b"anyone", 100), None); // total==0 guard
     }
 
-    // ── (d) gate_allows: pins an integration hazard worth flagging explicitly ──
+    // ── (d) gate_allows: the identity binding is IN the gate (regression) ──
 
     #[test]
-    fn gate_allows_does_not_bind_the_proof_s_key_to_a_caller_s_claimed_identity() {
-        // `verify`/`gate_allows` only check that a proof is internally consistent
-        // with the root — NOT that `proof.key` equals whatever identity the
-        // integrator meant to authorize. So relaying *any* valid member's proof
-        // satisfies an `Allow` gate, regardless of who is actually transacting.
-        // This pins the current (documented) contract as a deliberate flag: an
-        // integrator wiring this into a validator MUST separately assert
-        // `proof.key == expected_id` (e.g. the signer/redeemer's id) — gate_allows
-        // alone does not perform that binding.
+    fn gate_allows_binds_the_proof_s_key_to_the_caller_s_identity() {
+        // `gate_allows` checks that the proof is about the *authenticated caller*, not
+        // merely that it is internally consistent with the root. Relaying a member's
+        // public proof under someone else's identity therefore fails closed.
         let mut allow = MembershipList::new();
         allow.add(b"alice");
         let root = allow.root();
         let alices_proof = allow.prove(b"alice");
 
-        // "bob" relays alice's proof and the gate alone cannot tell the difference
-        assert!(gate_allows(Gate::Allow, &root, &alices_proof));
-
-        // the only defense is the integrator explicitly checking the identity:
-        let claimed_caller: &[u8] = b"bob";
-        assert_ne!(alices_proof.key, claimed_caller);
+        // alice, proving about herself, passes
+        assert!(gate_allows(Gate::Allow, &root, b"alice", &alices_proof));
+        // "bob" relaying alice's proof does not — the gate itself performs the binding
+        assert!(!gate_allows(Gate::Allow, &root, b"bob", &alices_proof));
+        // ...and bob's own (non-membership) proof has the wrong polarity for Allow
+        assert!(!gate_allows(Gate::Allow, &root, b"bob", &allow.prove(b"bob")));
     }
 }

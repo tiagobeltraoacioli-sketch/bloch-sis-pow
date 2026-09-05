@@ -593,14 +593,109 @@ pub struct EuTxInput {
     pub redeemer: Vec<Val>,
 }
 
-/// A minimal eUTXO transaction: inputs consumed, outputs created, a fee, and the
-/// sighash message signature-validators check (exposed as `ctx.fields[0]`).
+/// A minimal eUTXO transaction: inputs consumed, outputs created, a fee, and an
+/// OPTIONAL declaration of the transaction's sighash.
+///
+/// **`sighash` is not authoritative.** The message a signature-checking validator
+/// sees in `ctx.fields[0]` is always [`tx_sighash`], recomputed by the verifier from
+/// the transaction's own inputs, outputs and fee — never a spender-supplied label.
+/// Leave this field empty to let the verifier compute it; a non-empty value is a
+/// wallet's declaration and MUST equal [`tx_sighash`], or the transaction is rejected
+/// fail-closed with [`TxError::SighashMismatch`].
 #[derive(Clone, Debug)]
 pub struct EuTx {
     pub inputs: Vec<EuTxInput>,
     pub outputs: Vec<ExtOutput>,
     pub fee: u64,
     pub sighash: Vec<u8>,
+}
+
+/// Domain tag for the sighash preimage — keeps it disjoint from every other digest
+/// space in the crate (`validator_hash` preimages, SMT leaf/node/key hashes).
+const SIGHASH_TAG: &[u8] = b"BLOCH-EUVM-SIGHASH-v1";
+
+/// Canonical, deterministic byte encoding of a single eUTXO output — the preimage
+/// piece committed by [`tx_sighash`] and the leaf value committed into the block's
+/// eUTXO state tree ([`crate::harness`]). Length-prefixed and fully typed so that two
+/// outputs differing in *any* field (a single asset amount, the validator hash, or the
+/// datum) encode to distinct bytes. No float/clock/HashMap: the multi-asset `Value` is
+/// a `BTreeMap` (canonical key order) and `datum` is domain-tagged.
+pub fn encode_output(o: &ExtOutput) -> Vec<u8> {
+    let mut b = Vec::new();
+    // Multi-asset value bundle: count, then each (asset_id, amount) in BTreeMap order.
+    b.extend_from_slice(&(o.value.len() as u64).to_le_bytes());
+    for (asset, amt) in &o.value {
+        b.extend_from_slice(asset);
+        b.extend_from_slice(&amt.to_le_bytes());
+    }
+    // The guarding validator's hash.
+    b.extend_from_slice(&o.validator_hash);
+    // The datum, domain-tagged so Int/Bytes spaces never collide.
+    match &o.datum {
+        Val::Int(n) => {
+            b.push(0x00);
+            b.extend_from_slice(&n.to_le_bytes());
+        }
+        Val::Bytes(bytes) => {
+            b.push(0x01);
+            b.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            b.extend_from_slice(bytes);
+        }
+    }
+    b
+}
+
+/// **The canonical transaction sighash — what a signature actually authorizes.**
+///
+/// `SHA-256d` (the crate's [`validator_hash`] primitive) over a domain-tagged,
+/// length-prefixed encoding of the transaction's *effect*: every consumed
+/// `prev_output`, every created output, and the fee — each in position order. A
+/// signature that verifies over this digest therefore authorizes **that** set of
+/// outputs and nothing else: change one recipient, one amount, one datum or the fee
+/// and the digest changes, so the signature no longer verifies.
+///
+/// Deliberately excluded: the revealed `validator` program (already committed by
+/// `prev_output.validator_hash`, which *is* covered) and the `redeemer` (it carries
+/// the signature itself — including it would be circular).
+///
+/// Deterministic and panic-free: canonical `BTreeMap` order inside
+/// [`encode_output`], little-endian length prefixes, no arithmetic that can overflow.
+pub fn tx_sighash(tx: &EuTx) -> [u8; 32] {
+    let mut p = Vec::new();
+    p.extend_from_slice(SIGHASH_TAG);
+    p.extend_from_slice(&(tx.inputs.len() as u64).to_le_bytes());
+    for i in &tx.inputs {
+        let e = encode_output(&i.prev_output);
+        p.extend_from_slice(&(e.len() as u64).to_le_bytes());
+        p.extend_from_slice(&e);
+    }
+    p.extend_from_slice(&(tx.outputs.len() as u64).to_le_bytes());
+    for o in &tx.outputs {
+        let e = encode_output(o);
+        p.extend_from_slice(&(e.len() as u64).to_le_bytes());
+        p.extend_from_slice(&e);
+    }
+    p.extend_from_slice(&tx.fee.to_le_bytes());
+    let d = Sha256::digest(Sha256::digest(&p));
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&d);
+    out
+}
+
+/// The sighash message a validator must see for `tx`: always the canonical
+/// [`tx_sighash`]. A non-empty `tx.sighash` declaration that disagrees with it is a
+/// malformed transaction and is rejected fail-closed — a transaction may never carry
+/// a label that contradicts what its signatures authorize.
+///
+/// Shared choke point: [`validate_tx`] and the mint-aware mirror
+/// ([`crate::minting::validate_tx_with_mint`]) both seed `ctx.fields[0]` from here, so
+/// neither path can be handed a spender-chosen message.
+pub(crate) fn bind_sighash(tx: &EuTx) -> Result<Vec<u8>, TxError> {
+    let canonical = tx_sighash(tx);
+    if !tx.sighash.is_empty() && tx.sighash.as_slice() != canonical.as_slice() {
+        return Err(TxError::SighashMismatch);
+    }
+    Ok(canonical.to_vec())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -616,6 +711,11 @@ pub enum TxError {
     /// is charged; without a ceiling that work is unbounded and unmetered (machine-
     /// dependent = consensus split). `what` names the ceiling that fired. Fail-closed.
     ResourceLimit { what: &'static str },
+    /// The transaction declared a `sighash` that is not the canonical [`tx_sighash`]
+    /// over its own inputs/outputs/fee. The declared value is never used as the signed
+    /// message (the verifier always recomputes it), so this is the fail-closed reject
+    /// of a self-contradicting transaction rather than a security boundary.
+    SighashMismatch,
 }
 
 /// Bytes of operand data a single [`ExtOutput`] carries (value map + datum) — the
@@ -725,9 +825,11 @@ pub fn validate_tx(tx: &EuTx, verifier: &dyn SigVerifier, gas_limit: u64) -> Res
             return Err(TxError::ValueNotConserved { asset: *asset, in_sum, out_plus_fee });
         }
     }
-    // (2)+(3) run every validator with the whole tx visible, sharing one gas budget
+    // (2)+(3) run every validator with the whole tx visible, sharing one gas budget.
+    // `fields[0]` is the sighash RECOMPUTED from this tx's own effect — never the
+    // spender-declared label — so a signature over it authorizes these outputs alone.
     let ctx = Ctx {
-        fields: vec![Val::Bytes(tx.sighash.clone())],
+        fields: vec![Val::Bytes(bind_sighash(tx)?)],
         tx_outputs: tx.outputs.clone(),
         self_validator_hash: [0u8; 32],
         self_value: Value::new(), // spend() sets this per-input
@@ -1077,10 +1179,59 @@ mod tests {
             inputs: vec![EuTxInput { prev_output: anyone_out(100, vh), validator: anyone.clone(), redeemer: vec![] }],
             outputs: vec![anyone_out(90, vh)],
             fee: 10,
-            sighash: b"sh".to_vec(),
+            sighash: vec![], // undeclared — validate_tx computes the canonical sighash
         };
         let noop = MockVerifier { good: vec![] };
         assert!(validate_tx(&tx, &noop, 1_000).unwrap() >= 1);
+    }
+
+    #[test]
+    fn tx_sighash_binds_every_field_of_the_effect_and_is_deterministic() {
+        let anyone = vec![Op::PushInt(1)];
+        let vh = validator_hash(&anyone);
+        let mk = |out_value: u64, fee: u64, in_value: u64| EuTx {
+            inputs: vec![EuTxInput {
+                prev_output: anyone_out(in_value, vh),
+                validator: anyone.clone(),
+                redeemer: vec![],
+            }],
+            outputs: vec![anyone_out(out_value, vh)],
+            fee,
+            sighash: vec![],
+        };
+        let base = mk(90, 10, 100);
+        // deterministic: same tx, same digest, every time
+        assert_eq!(tx_sighash(&base), tx_sighash(&mk(90, 10, 100)));
+        // every part of the effect is bound
+        assert_ne!(tx_sighash(&base), tx_sighash(&mk(80, 20, 100))); // output/fee split
+        assert_ne!(tx_sighash(&base), tx_sighash(&mk(90, 110, 200))); // inputs consumed
+        let mut other_recipient = base.clone();
+        other_recipient.outputs = vec![anyone_out(90, [0xAB; 32])];
+        assert_ne!(tx_sighash(&base), tx_sighash(&other_recipient));
+        let mut other_datum = base.clone();
+        other_datum.outputs = vec![ExtOutput { datum: Val::Int(7), ..anyone_out(90, vh) }];
+        assert_ne!(tx_sighash(&base), tx_sighash(&other_datum));
+        // the redeemer is deliberately NOT bound (it carries the signature itself)
+        let mut other_redeemer = base.clone();
+        other_redeemer.inputs[0].redeemer = vec![Val::Int(1)];
+        assert_eq!(tx_sighash(&base), tx_sighash(&other_redeemer));
+    }
+
+    #[test]
+    fn declared_sighash_that_contradicts_the_tx_is_rejected() {
+        let anyone = vec![Op::PushInt(1)];
+        let vh = validator_hash(&anyone);
+        let mut tx = EuTx {
+            inputs: vec![EuTxInput { prev_output: anyone_out(100, vh), validator: anyone, redeemer: vec![] }],
+            outputs: vec![anyone_out(90, vh)],
+            fee: 10,
+            sighash: b"a-label-i-chose".to_vec(),
+        };
+        let noop = MockVerifier { good: vec![] };
+        assert_eq!(validate_tx(&tx, &noop, 1_000), Err(TxError::SighashMismatch));
+        // declaring the canonical value is fine — and is what the verifier uses
+        tx.sighash = tx_sighash(&tx).to_vec();
+        assert!(validate_tx(&tx, &noop, 1_000).is_ok());
     }
 
     #[test]
