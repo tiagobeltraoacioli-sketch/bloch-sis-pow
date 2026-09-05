@@ -60,6 +60,12 @@
 //! 10. `StateRootMismatch` — last, because the root only exists once the
 //!     whole transition has run.
 //!
+//! `EpochAdvanceTooLarge` was appended to this order, not inserted into it: it
+//! sits between the header-commitment checks and the epoch boundary walk it
+//! bounds, which is the first point at which the walk's cost is about to be
+//! paid. Every block that was a reject before the rule existed still returns
+//! the error it returned before.
+//!
 //! ## Double-apply is a reject, not a no-op — decided here
 //!
 //! Applying a block to its own post-state fails with `NonMonotonicSlot`.
@@ -4036,10 +4042,29 @@ impl<V: SignatureVerifier> Transition<V> {
             return Err(TransitionError::CoherenceRootMismatch);
         }
 
+        // 3d. THE BOUNDARY WALK BELOW MUST HAVE A CEILING.
+        //
+        // Its trip count is `block_epoch`, which is `epoch_of(header.slot)`,
+        // which is an untrusted u64 that arrived over gossip. `u64::MAX`
+        // divided by 32 slots is ~5.76e17, and every turn clones the whole
+        // eUTXO set: unbounded, one packet costs every node that judges it its
+        // remaining uptime. `params::MAX_EPOCH_ADVANCE` is that ceiling — a
+        // plain bound, live at every epoch, with no flag day and nothing to
+        // arm. `block_epoch >= pre.epoch` is already guaranteed by the check
+        // above; `saturating_sub` says so rather than relying on it.
+        //
+        // Checked BEFORE the state clone (the clone is the expensive part) and
+        // before the walk it bounds. It is deliberately here and not up beside
+        // step 1, so that every block that was already a reject keeps
+        // returning the SAME error it returned before this rule existed.
+        if block_epoch.saturating_sub(pre.epoch) > crate::params::MAX_EPOCH_ADVANCE {
+            return Err(TransitionError::EpochAdvanceTooLarge);
+        }
+
         // Roll epoch accounting over any empty boundary slots the chain
         // skipped. Identical to the caller invoking process_epoch itself —
         // close_epoch is the single definition of the boundary — so explicit
-        // and implicit epoch processing cannot diverge.
+        // and implicit epoch processing cannot diverge. Bounded by 3d above.
         let mut st = {
             // Instrumentation only; compiled out without `perf-timing`.
             let _perf = crate::perf::span(crate::perf::Phase::StateClone);
@@ -4706,7 +4731,7 @@ mod tests {
     /// Accept-everything verifier: these tests exercise the transition's
     /// composition and ordering, not the PQ stack (which this crate never
     /// links — the same reasoning as attestation.rs).
-    struct OkVerifier;
+    pub(super) struct OkVerifier;
     impl SignatureVerifier for OkVerifier {
         fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
             true
@@ -5154,7 +5179,9 @@ mod tests {
         assert!(d > 0, "the comparator did not see a one-bit seed difference");
     }
 
-    fn setup(n: u32) -> (Transition<OkVerifier>, CommittedState, Vec<RandaoChain>) {
+    /// `pub(super)` so the sibling `epoch_advance_bound` module can build the
+    /// same fixture rather than a second one that could drift from it.
+    pub(super) fn setup(n: u32) -> (Transition<OkVerifier>, CommittedState, Vec<RandaoChain>) {
         setup_with(n, OkVerifier, &[])
     }
 
@@ -11554,5 +11581,113 @@ mod carried_ownership_tests {
         almost[..20].copy_from_slice(&mine[..20]);
         almost[31] = 1; // one byte of tail set
         assert!(!owns(&mine, &almost));
+    }
+}
+
+/// The consensus half of the untrusted-`header.slot` bound (finding
+/// C1-slot-bound).
+///
+/// `compute_post_state` walks `while st.epoch < block_epoch { st.close_epoch()
+/// }`, and `block_epoch` is `epoch_of(header.slot)` over a `u64` that arrived
+/// off the wire. These pin the ceiling that stops that walk from being a
+/// free denial of service, and — the half that matters more — pin that the
+/// ceiling is far enough away that no honest block can reach it.
+#[cfg(test)]
+mod epoch_advance_bound {
+    use super::tests::setup;
+    use super::*;
+    use crate::header::BlockHeaderV4;
+    use crate::params::MAX_EPOCH_ADVANCE;
+
+    /// A header that satisfies every check the transition runs BEFORE the
+    /// boundary walk — parent, version, and the three commitments — so the
+    /// only thing left that can refuse it is the walk's own ceiling. Nothing
+    /// downstream of the walk needs to be right, because nothing downstream
+    /// of the walk should ever be reached.
+    fn header_at_slot(pre: &CommittedState, slot: u64) -> ProposalEnvelope {
+        let fin = pre.finality_view();
+        ProposalEnvelope {
+            header: BlockHeaderV4 {
+                version: BLOCK_VERSION_V4,
+                parent: *pre.head.as_bytes(),
+                state_root: [0u8; 32],
+                body_root: crate::derive::body_root(&[]),
+                slot,
+                proposer_index: 0,
+                randao_reveal: [0u8; 32],
+                randao_mix: [0u8; 32],
+                justified_root: fin.justified.root,
+                finalized_root: fin.finalized.root,
+                attestation_root: crate::derive::attestation_root(&[]),
+                coherence_root: crate::derive::coherence_binding(
+                    &pre.coherence_accumulator_root,
+                    &pre.coherence_nullifier_root,
+                ),
+            },
+            proposer_sig: vec![0u8; 8],
+        }
+    }
+
+    /// **The finding.** `header.slot` is an untrusted `u64`; before the bound,
+    /// `u64::MAX` here meant ~5.76e17 `close_epoch` turns — one gossiped
+    /// packet, every node judging it frozen for longer than the universe has
+    /// run. It must come back as a decision, and it must come back fast.
+    ///
+    /// Delete the `MAX_EPOCH_ADVANCE` check in `compute_post_state` and this
+    /// test does not fail with a wrong error — it never returns at all, which
+    /// is precisely the defect.
+    #[test]
+    fn a_header_naming_the_end_of_time_is_refused_not_walked() {
+        let (t, g, _chains) = setup(4);
+        let b = header_at_slot(&g, u64::MAX);
+        assert_eq!(
+            t.compute_post_state(&g, &b, &[], &[]).err(),
+            Some(TransitionError::EpochAdvanceTooLarge),
+            "an unbounded epoch walk is a free denial of service",
+        );
+    }
+
+    /// The bound is on the gap to the PARENT, not on the absolute epoch — so
+    /// it must fire on the first epoch past the ceiling and not one before.
+    /// The pair is what makes this a bound rather than a constant: the second
+    /// half proves the rule is not simply refusing everything.
+    #[test]
+    fn the_ceiling_is_exact_and_the_epoch_below_it_still_transitions() {
+        let (t, g, _chains) = setup(4);
+        assert_eq!(g.epoch, 0, "the fixture starts at epoch 0");
+
+        // Exactly at the ceiling: this rule must NOT be the one that answers.
+        let at = header_at_slot(&g, MAX_EPOCH_ADVANCE * SLOTS_PER_EPOCH);
+        assert_ne!(
+            t.compute_post_state(&g, &at, &[], &[]).err(),
+            Some(TransitionError::EpochAdvanceTooLarge),
+            "a gap of exactly MAX_EPOCH_ADVANCE is inside the bound",
+        );
+
+        // One epoch past it: this rule, and no other.
+        let over = header_at_slot(&g, (MAX_EPOCH_ADVANCE + 1) * SLOTS_PER_EPOCH);
+        assert_eq!(
+            t.compute_post_state(&g, &over, &[], &[]).err(),
+            Some(TransitionError::EpochAdvanceTooLarge),
+        );
+    }
+
+    /// **Replay safety, as an assertion rather than a paragraph.** The bound
+    /// may not be adopted quietly unless it is unreachable by honest history,
+    /// and honest history's gaps are inter-block gaps of a few epochs. Pinning
+    /// the headroom here means anyone who later lowers the constant toward the
+    /// real world has to argue with a test instead of with a comment.
+    #[test]
+    fn the_bound_sits_orders_of_magnitude_above_any_gap_this_chain_has_made() {
+        // ~200 slots was the worst vão measured through the 2026-08/09 stalls.
+        let worst_observed_gap_epochs = 200 / SLOTS_PER_EPOCH + 1;
+        assert!(
+            MAX_EPOCH_ADVANCE >= worst_observed_gap_epochs * 100,
+            "MAX_EPOCH_ADVANCE ({MAX_EPOCH_ADVANCE}) must keep two orders of magnitude over \
+             the worst gap this chain has produced ({worst_observed_gap_epochs} epochs), or a \
+             stall stops being a delay and becomes a hard fork",
+        );
+        // And it must still be a bound: anything near u64::MAX is not one.
+        assert!(MAX_EPOCH_ADVANCE < 1 << 20, "a ceiling that large is not a ceiling");
     }
 }

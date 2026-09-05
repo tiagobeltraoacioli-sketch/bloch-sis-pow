@@ -100,7 +100,8 @@
 //!   receives goes through the same `Transition::apply_block` the producer
 //!   ran — signatures, state root, body root, attestation quorum, all of it.
 //!   Nothing about "this came from sync" makes validation lighter; the sync
-//!   path feeds `NetEvent::Block`, exactly like gossip does.
+//!   path feeds `NetEvent::Block`, exactly like gossip does (with
+//!   `Origin::none`: there is no gossip message to report a verdict on).
 //! - Because one answer is capped at [`MAX_SYNC_BLOCKS`], a cold node's
 //!   request is **paginated**: a full page is immediately followed by a
 //!   request for the next one, from the same peer, until a short page says the
@@ -149,14 +150,24 @@
 //!   What is exposed is *transport* confidentiality against a
 //!   harvest-now-decrypt-later adversary. Named as the next piece of work.
 //!
-//! - **Blocks and transactions are relayed on decodability, not on validity.**
-//!   The relay decision for those two topics is taken at the edge (does it
-//!   decode?), because gating relay on the full state transition would put a
-//!   consensus round-trip in front of every forward. Attestations are the ones
-//!   that get the full `gossip.rs` treatment. An invalid-but-decodable block
-//!   is therefore relayed once before the engine rejects it; the sender is
-//!   *not* penalized for it. Closing that needs the engine's verdict on the
-//!   block path too, the same shape as the attestation path.
+//! - **Transactions are relayed on decodability, not on validity.** That
+//!   relay decision is taken at the edge (does it decode?), because gating it
+//!   on the full state transition would put a consensus round-trip in front of
+//!   every forward.
+//!
+//!   **Blocks no longer are.** They used to be, and the entry that stood here
+//!   said so and named the fix: "closing that needs the engine's verdict on
+//!   the block path too, the same shape as the attestation path." That is what
+//!   the block arm of [`on_gossip`] now does — it carries an [`Origin`] and
+//!   stays silent until `Engine::ingest_judged` answers, so a header that does
+//!   not commit to its body, a body this build cannot decode, or a
+//!   `header.slot` past the node's horizon is dropped without being amplified
+//!   and IS charged to the forwarding peer. The relay condition is still
+//!   structural soundness, not full validity: a block on a losing branch or
+//!   one whose parent has not landed is honest and must keep propagating.
+//!
+//! - **Attestations get the full `gossip.rs` treatment** — the pool's own
+//!   `GossipDecision`, not merely a structural check.
 //!
 //! - **No peer persistence, no PEX, no DNS seeds, no mDNS.** Peers come from
 //!   `--p2p-peer` and are re-dialled on a timer. `known_peers.json`, peer
@@ -1203,7 +1214,10 @@ fn handle_swarm_event(
                             highest = highest.max(slot);
                             let e = st.peer_head.entry(peer).or_insert(0);
                             *e = (*e).max(slot);
-                            if !st.emit(NetEvent::Block(env)) {
+                            // Directed sync, not gossip: there is no message
+                            // id to report a verdict against, so `Origin::none`
+                            // and the engine's report is a no-op.
+                            if !st.emit(NetEvent::Block(env, Origin::none())) {
                                 return false;
                             }
                         }
@@ -1246,11 +1260,13 @@ fn handle_swarm_event(
 /// Map one gossip message onto an engine event, reporting the verdict the edge
 /// can already decide.
 ///
-/// Blocks and transactions are judged here (does it decode?) and relayed at
-/// once. Attestations are handed to the engine with their [`Origin`] and are
+/// Transactions are judged here (does it decode?) and relayed at once. Blocks
+/// and attestations are handed to the engine with their [`Origin`] and are
 /// **not** relayed until it answers — that is the whole point of
 /// `validate_messages()`, and the reason `gossip.rs` can be the admission
-/// control rather than a library nobody calls.
+/// control rather than a library nobody calls. Undecodable bytes on any of the
+/// three topics are still a `Reject` at the edge: there is nothing to hand
+/// over.
 fn on_gossip(
     swarm: &mut Swarm,
     st: &mut Loop,
@@ -1269,7 +1285,14 @@ fn on_gossip(
     if topic == st.topics.blocks.hash() {
         match crate::codec::decode_envelope(&message.data) {
             Ok(env) => {
-                report(swarm, Verdict::Accept);
+                // No verdict yet — this is the block half of the same
+                // deferred-judgement contract the attestation arm below runs
+                // on. Decodability used to be enough to relay, so a block that
+                // could not possibly be honest (a header that does not commit
+                // to its own body, a `header.slot` from the far future) was
+                // still forwarded once by every node that saw it, free of
+                // charge to whoever wrote it. `Engine::ingest_judged` answers
+                // now, and `Handle::report` is what finally relays it.
                 trace(|| {
                     format!("← block slot {} from {source}", env.header.slot)
                 });
@@ -1277,7 +1300,8 @@ fn on_gossip(
                 let e = st.peer_head.entry(source).or_insert(0);
                 *e = (*e).max(slot);
                 st.note_block(*env.block_id().as_bytes());
-                return st.emit(NetEvent::Block(env));
+                let origin = Origin { inner: Some((message_id, source)) };
+                return st.emit(NetEvent::Block(env, origin));
             }
             Err(e) => {
                 // Undecodable bytes on the block topic cannot come from a
@@ -1583,7 +1607,7 @@ mod tests {
         let mut slots = Vec::new();
         while slots.len() < want && Instant::now() < deadline {
             match rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(NetEvent::Block(env)) => slots.push(env.header.slot),
+                Ok(NetEvent::Block(env, _)) => slots.push(env.header.slot),
                 Ok(_) => {}
                 Err(_) => {}
             }
@@ -1637,7 +1661,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut got: Vec<u64> = Vec::new();
         while got.len() < 10 && Instant::now() < deadline {
-            if let Ok(NetEvent::Block(env)) = b.rx.recv_timeout(Duration::from_millis(200)) {
+            if let Ok(NetEvent::Block(env, _)) = b.rx.recv_timeout(Duration::from_millis(200)) {
                 if (2..=11).contains(&env.header.slot) {
                     got.push(env.header.slot);
                 }

@@ -42,6 +42,58 @@ pub const SLOTS_PER_EPOCH: u64 = 32;
 /// transition adds no new propagation pressure.
 pub const SLOT_DURATION_SECS: u64 = 30;
 
+/// The most epochs one block may advance the epoch accounting past its
+/// parent's, before [`crate::interfaces::TransitionError::EpochAdvanceTooLarge`].
+///
+/// # Why a bound has to exist at all
+///
+/// `compute_post_state` rolls the accounting over every epoch the chain
+/// skipped: `while st.epoch < block_epoch { st = st.close_epoch() }`. The loop
+/// is correct — `close_epoch` is the single definition of the boundary, so
+/// implicit and explicit epoch processing cannot diverge — but its trip count
+/// is `epoch_of(header.slot)` and `header.slot` is an untrusted `u64` that
+/// arrives off the wire. `u64::MAX / SLOTS_PER_EPOCH` is ~5.76e17, and each
+/// turn clones the whole eUTXO set. Unbounded, one packet costs every node
+/// that judges it its remaining uptime.
+///
+/// **This is a plain bound, NOT an armed activation.** There is no flag-day
+/// constant here, nothing set to `u64::MAX` waiting to be switched on, and no
+/// epoch at which the behaviour changes: the check is live at every epoch on
+/// any node running this crate.
+///
+/// # Why 4,096, and what it costs
+///
+/// The gap this measures is not "how old is the chain" — it is the distance
+/// between ONE block and its PARENT, since `pre.epoch` is always
+/// `epoch_of(parent.slot)`. So the number is a ceiling on how long the whole
+/// network may be dark and still resume on the same chain: 4,096 x 32 slots x
+/// 30s = **45.5 days** of total halt.
+///
+/// Against that, the largest gaps this chain has actually produced are three
+/// orders of magnitude smaller — tens to ~200 slots of vão (under 7 epochs)
+/// through the 2026-08/09 stalls, and the whole of Genesis-4 to date is under
+/// 2,000 epochs old. Replay safety therefore holds by construction and not by
+/// hope: no block in committed history advances the epoch by more than a
+/// handful, so every historical block replays through this gate unchanged.
+///
+/// The honest cost, named rather than buried: if the network really did halt
+/// for 46 days, the block that tried to restart it would be invalid under this
+/// rule and the chain would need a coordinated fork to resume. That is the
+/// trade — a bounded DoS in exchange for a liveness ceiling — and it is the
+/// reason the value is 4,096 rather than the ~10 that history alone would
+/// justify. Raising or lowering it is a consensus change and a founder call.
+///
+/// # This is the backstop, not the first line
+///
+/// `bloch-pos-node`'s `Engine::ingest` refuses a gossiped block whose slot is
+/// more than `2 x SLOTS_PER_EPOCH` past that node's own wall clock, which caps
+/// the walk at two turns on every path a stranger can reach. That rule is
+/// local (a node may hold it or not without forking); this one is consensus,
+/// and it is what still holds when the block arrives some other way — a
+/// crafted store, a sync response, a future transport, a node that drops the
+/// local rule.
+pub const MAX_EPOCH_ADVANCE: u64 = 4_096;
+
 /// Upper bound on weighted draws before the deterministic fallback in
 /// [`crate::sample::sample`] fills the remaining seats in index order.
 ///
