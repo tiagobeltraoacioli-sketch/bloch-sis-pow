@@ -18,7 +18,10 @@
 # NOTE: `cargo audit` (RUSTSEC-only) does NOT flag the GHSA-only advisories that
 # osv-scanner surfaces — yamux 0.12.1 (GHSA-vxx9-2994-q338, CVSS 8.7, libp2p-yamux
 # 0.47-pinned) and the SP1 plonky3 p3-challenger/p3-symmetric crates. Those remain
-# OPEN residuals documented in SECURITY_TOOLING.md; run osv-scanner to see them.
+# OPEN residuals documented in SECURITY_TOOLING.md. Their dispositions live in
+# ../osv-scanner.toml, which is this file's counterpart for the OSV/GHSA feed:
+# since 2026-09-04 the osv-scanner CI job is BLOCKING, so an OSV finding that is
+# not named there with a rationale and a review date fails the pipeline.
 [advisories]
 ignore = [
     # ── Post-quantum crypto: vendored, intentionally pinned (PQClean archived) ──

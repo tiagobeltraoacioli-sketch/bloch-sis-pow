@@ -1,0 +1,159 @@
+# osv-scanner — advisory policy for Bloch-SIS.
+#
+# Run: osv-scanner --config=osv-scanner.toml --lockfile=Cargo.lock
+#
+# This file is what makes the osv-scanner CI job BLOCKING instead of
+# informational. Before it existed the job carried two escapes — a
+# `command -v … || exit 0` skip and `allow_failure: true` — so the OSV findings
+# below were never a verdict, and the ONE tool in this repository that sees
+# GHSA-only advisories could not fail anything. The escapes are gone; the
+# accepted residuals are here, named, dated and expiring, exactly the way
+# deny.toml and audit.toml carry the RustSec ones.
+#
+# RULES (same as deny.toml):
+#   * an entry needs a written rationale and an `ignoreUntil` review date;
+#   * `ignoreUntil` is a RE-REVIEW deadline, not a dismissal — the advisory
+#     starts failing CI again on that date, which is the point;
+#   * anything NOT listed here fails the pipeline. A new advisory in a bumped
+#     dependency is a red build, which is the behaviour the job was named for
+#     and did not have.
+#
+# The authoritative disposition prose is SECURITY_TOOLING.md §Advisory posture.
+#
+# MEASURED 2026-09-04 on this Cargo.lock (876 packages), osv-scanner v1.9.2:
+# with this file the scan reports exactly FOUR advisories — RUSTSEC-2026-0220
+# (ruint), -0221 (event-listener), -0253 (lru), -0258 (h2). Those same four, and
+# only those, are what `cargo audit --deny warnings` fails on today; the already
+# blocking cargo-audit job is red on them right now. They are deliberately NOT
+# ignored here: each has a fixed upstream release, so the fix is a dependency
+# bump, not an ignore entry, and inventing a rationale to silence them is the
+# exact habit this file exists to replace. Making osv-scanner blocking therefore
+# adds no new failure to the pipeline — it adds a verdict on the GHSA-only
+# surface that nothing else covers.
+
+# ── OPEN, REAL, ACCEPTED: the most exposed residual on the node ──────────────
+# Stream-multiplexer DoS in yamux 0.12.1. Surfaced ONLY here: cargo-audit's
+# RustSec-only feed does not carry it. libp2p-yamux 0.47.0 (libp2p 0.56.0)
+# resolves both yamux 0.12.1 and 0.13.10 in Cargo.lock, and the 0.12 line has no
+# patched release, so there is no bump path that does not move off libp2p 0.56.
+# Reachability is any connected peer over the yamux muxer — neither noise nor
+# /ip4/-only peering mitigates it. Accepted-but-tracked, NOT dismissed: remove
+# this entry the moment libp2p repins yamux.
+[[IgnoredVulns]]
+id = "GHSA-vxx9-2994-q338"
+ignoreUntil = 2026-12-01
+reason = "yamux 0.12.1 DoS (CVSS 8.7), pinned by libp2p-yamux 0.47.0; no upstream bump path. Tracked in SECURITY_TOOLING.md as an OPEN residual; re-review 2026-12-01."
+
+# ── SP1 / plonky3 prover stack — host-side proving, never the node runtime ────
+# Pulled exclusively through the pinned SP1 4.2.1 prover; not on the consensus,
+# mempool or P2P path of bloch-pos-node. Not bumpable without moving off pinned
+# SP1, which would break the reproducible prover build.
+[[IgnoredVulns]]
+id = "GHSA-vj64-rjf3-w3v7"
+ignoreUntil = 2026-12-01
+reason = "p3-challenger 0.2.2-succinct (CVSS 8.9) via pinned SP1 4.2.1 prover; host-side proof generation only, not the node runtime. Re-review 2026-12-01."
+
+[[IgnoredVulns]]
+id = "GHSA-3g92-f9ch-qjcm"
+ignoreUntil = 2026-12-01
+reason = "p3-symmetric (CVSS 2.9) via pinned SP1 4.2.1 prover; host-side proof generation only, not the node runtime. Re-review 2026-12-01."
+
+# ── MIRRORED FROM audit.toml / deny.toml ─────────────────────────────────────
+# osv-scanner reads neither of those files, so a disposition already written
+# and argued there has to be repeated here or the two tools disagree about the
+# same lockfile. Every entry below is a RUSTSEC id that audit.toml already
+# ignores WITH a rationale; that file stays the source of truth — when an entry
+# is removed there it must be removed here. Nothing new is accepted in this
+# block, and all of it re-reviews on the same date as the rest of the file.
+#
+# Class 1 — unmaintained/unsound notices, no runtime attack surface on the node
+# (vendored PQClean wrappers frozen by design; compile-time proc-macro helpers;
+# the SP1/zk host-side prover toolchain).
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0165"   # pqcrypto-falcon unmaintained (PQClean archived)
+ignoreUntil = 2026-12-01
+reason = "Mirrors audit.toml: vendored PQ wrapper, frozen under Cargo.lock by design."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0166"   # pqcrypto-mldsa unmaintained
+ignoreUntil = 2026-12-01
+reason = "Mirrors audit.toml: vendored PQ wrapper, frozen under Cargo.lock by design."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0162"   # pqcrypto-traits unmaintained
+ignoreUntil = 2026-12-01
+reason = "Mirrors audit.toml: vendored PQ wrapper, frozen under Cargo.lock by design."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0163"   # pqcrypto-internals unmaintained (the vendored crate)
+ignoreUntil = 2026-12-01
+reason = "Mirrors audit.toml: vendored PQ crate with the seeded-RNG override; migration is a crypto-review event."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0381"   # pqcrypto-kyber superseded by pqcrypto-mlkem
+ignoreUntil = 2026-12-01
+reason = "Mirrors audit.toml: transitive, superseded wrapper."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0141"   # bincode 1.3.3 unmaintained
+ignoreUntil = 2026-12-01
+reason = "Mirrors audit.toml: the wire format uses bincode 2.x; 1.x carries no first-party (de)serialization path."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0436"   # paste unmaintained
+ignoreUntil = 2026-12-01
+reason = "Mirrors audit.toml: compile-time proc-macro helper, no runtime surface."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0173"   # proc-macro-error2 unmaintained
+ignoreUntil = 2026-12-01
+reason = "Mirrors audit.toml: compile-time proc-macro helper, no runtime surface."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0134"   # rustls-pemfile unmaintained
+ignoreUntil = 2026-12-01
+reason = "Mirrors audit.toml: transitive TLS PEM decode, not a first-party parse path."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0012"   # backoff unmaintained — via sp1-sdk
+ignoreUntil = 2026-12-01
+reason = "Mirrors audit.toml: SP1 host-side prover toolchain, never the node runtime."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0384"   # instant unmaintained — via backoff (SP1)
+ignoreUntil = 2026-12-01
+reason = "Mirrors audit.toml: SP1 host-side prover toolchain, never the node runtime."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2021-0139"   # ansi_term unmaintained — via tracing-forest (SP1)
+ignoreUntil = 2026-12-01
+reason = "Mirrors audit.toml: SP1 host-side prover logging, never the node runtime."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0388"   # derivative unmaintained — via ark-ff (zk stack)
+ignoreUntil = 2026-12-01
+reason = "Mirrors audit.toml: proc-macro in the SP1/arkworks stack, compile-time only."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0119"   # number_prefix unmaintained — via indicatif (SP1 CLI)
+ignoreUntil = 2026-12-01
+reason = "Mirrors audit.toml: SP1 prover CLI progress bars, host-side UX only."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0002"   # lru UNSOUND (IterMut aliasing) — sp1-prover host-side
+ignoreUntil = 2026-12-01
+reason = "Mirrors audit.toml: unsoundness on the SP1 host-side proving path, pinned by sp1-prover 4.2.1."
+
+# Class 2 — REAL vulnerabilities accepted with no upstream bump path, the same
+# two the deny.toml comment calls out by name. libp2p 0.56.0 pins hickory-proto
+# 0.25.2 via libp2p-dns + libp2p-mdns; the fix is hickory 0.26.x. Remove both
+# the moment a libp2p release repins hickory.
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0118"
+ignoreUntil = 2026-12-01
+reason = "hickory-proto NSEC3 unbounded loop (DoS), libp2p-pinned; mirrors deny.toml. Exposure is /dns4/ resolution and LAN mDNS; canonical peering is /ip4/ and DNSSEC is off."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0119"
+ignoreUntil = 2026-12-01
+reason = "hickory-proto O(n^2) name-compression CPU exhaustion (DoS), libp2p-pinned; mirrors deny.toml. Same reachability note as RUSTSEC-2026-0118."

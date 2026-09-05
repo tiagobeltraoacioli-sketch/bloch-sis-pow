@@ -178,6 +178,32 @@ no-source-archives:
     - python3 scripts/check-no-source-archives.py
   allow_failure: false
 
+# Scanner-posture guard (finding I-H4, 2026-09-04). BLOCKING.
+# The regression test for the defect this section was just fixed for: the
+# osv-scanner and secret-scan jobs were `allow_failure: true` AND opened with
+# `command -v <tool> || exit 0`, so on a runner without the tool they printed
+# "skipping (informational)" and went green. osv-scanner is the only tool in the
+# repository that sees GHSA-only advisories (yamux GHSA-vxx9-2994-q338, CVSS
+# 8.7, invisible to cargo-audit's RustSec feed), so the surface nothing else
+# covers had no verdict at all.
+#
+# This guard reads BOTH CI files — .gitlab-ci.yml and .github/workflows/
+# security.yml — and fails if a required scanner job is missing, is allowed to
+# fail, carries an `exit 0` escape, or is `when: manual`. Missing job counts as
+# a failure: a gate that was deleted must not read as a gate that passed.
+#
+# Its selftest runs first and is the reason to trust the verdict — it builds
+# synthetic CI files, asserts every escape shape goes red BY NAME and that the
+# honest shape stays green, including that a legitimately non-blocking job
+# (cargo-geiger) is NOT flagged. Pure Python 3, no toolchain, no build.
+scanners-blocking-guard:
+  stage: check
+  before_script: []
+  script:
+    - python3 scripts/check-scanners-blocking.selftest.py
+    - python3 scripts/check-scanners-blocking.py
+  allow_failure: false
+
 # Falcon constant-time guard (PoS finding F1, BLOCH-FALCON-ONLINE-SIGNING.md
 # §3.2). BLOCKING: fails if the workspace's resolved features for
 # pqcrypto-falcon include "avx2" or "neon" — those dispatch Falcon SIGNING to
@@ -243,24 +269,29 @@ cargo-audit:
 
 # osv-scanner — supplementary advisory scan against the OSV.dev DB (RustSec +
 # GHSA). Catches GHSA-only advisories that cargo-audit's RustSec-only feed does
-# NOT carry (e.g. yamux GHSA-vxx9-2994-q338, the plonky3 p3-* crates). Kept
-# NON-BLOCKING: it needs network for the OSV DB and its GHSA set overlaps but is
-# not identical to the deny.toml/audit.toml ignore policy, so it is an early-
-# warning surface, not a hard gate. Findings are triaged in SECURITY_TOOLING.md
-# §Advisory-posture. Local run: osv-scanner --lockfile=Cargo.lock
+# NOT carry (e.g. yamux GHSA-vxx9-2994-q338, the plonky3 p3-* crates).
+#
+# BLOCKING since 2026-09-04 (finding I-H4). It was `allow_failure: true` AND it
+# opened with `command -v osv-scanner || exit 0`, which is two independent ways
+# to be green without scanning — and the silent one was the skip: a runner that
+# never had the tool printed "skipping (informational)" and went green. This is
+# the ONLY job in the pipeline that can see a GHSA-only advisory, so "did not
+# run" and "found nothing" were the same colour on the one surface nothing else
+# covers.
+#
+# Fail-closed now: scripts/ci-install-scanner.sh installs a PINNED osv-scanner
+# and exits non-zero if it cannot, so an absent tool fails the job. The ignore
+# policy that used to be implicit in `allow_failure` is now explicit, dated and
+# expiring in osv-scanner.toml — a new advisory fails the build.
+# Local run: osv-scanner --config=osv-scanner.toml --lockfile=Cargo.lock
 osv-scanner:
   stage: check
   before_script: []
   script:
-    - |
-      if ! command -v osv-scanner >/dev/null; then
-        echo "osv-scanner not installed on this runner — install:"
-        echo "  go install github.com/google/osv-scanner/cmd/osv-scanner@latest"
-        echo "skipping (informational)."
-        exit 0
-      fi
-    - osv-scanner --lockfile=Cargo.lock
-  allow_failure: true
+    - export PATH="$HOME/.local/bin:$PATH"
+    - bash scripts/ci-install-scanner.sh osv-scanner
+    - osv-scanner --config=osv-scanner.toml --lockfile=Cargo.lock
+  allow_failure: false
 
 # cargo-geiger — quantifies `unsafe` across the dependency tree (own code +
 # transitive), so a dependency bump that pulls in new unsafe is visible in the
@@ -304,17 +335,30 @@ fuzz-smoke:
 
 # Secret scanning — catch committed credentials (e.g. a leaked token) before they
 # reach history. Best practice given the project's own PAT-rotation lesson.
+#
+# BLOCKING since 2026-09-04 (finding I-H4), same defect as osv-scanner above: a
+# `command -v gitleaks || exit 0` skip on an `allow_failure: true` job. A secret
+# scanner that reports "not installed — skipping (informational)" in green is
+# worse than no secret scanner, because the pipeline claims the check.
+# scripts/ci-install-scanner.sh installs a PINNED gitleaks and fails if it
+# cannot.
+#
+# Scope, stated rather than implied: `--no-git` scans the WORKING TREE, so the
+# gate is on what a merge would introduce. Measured 2026-09-04 the tree is clean
+# under .gitleaks.toml (nine findings triaged there as doc/type-alias/public-key
+# shapes, each exempted by line pattern, not by muting the file). A full-history
+# scan reports 55 findings across 2,216 commits — history is immutable, so a
+# blocking job over it could never go green; that triage is separate work and is
+# written down in .gitleaks.toml instead of being hidden behind allow_failure.
+# Local run: gitleaks detect --no-git --source . --config .gitleaks.toml --redact
 secret-scan:
   stage: check
   before_script: []
   script:
-    - |
-      if ! command -v gitleaks >/dev/null; then
-        echo "gitleaks not installed on this runner — skipping (informational)."
-        exit 0
-      fi
-    - gitleaks detect --source . --no-banner --redact
-  allow_failure: true
+    - export PATH="$HOME/.local/bin:$PATH"
+    - bash scripts/ci-install-scanner.sh gitleaks
+    - gitleaks detect --no-git --source . --config .gitleaks.toml --no-banner --redact
+  allow_failure: false
 
 # Build + full test suite (the gate).
 build-and-test:
