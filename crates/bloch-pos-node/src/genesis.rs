@@ -1216,9 +1216,24 @@ impl Manifest {
     /// clock terms still separate two devnets launched at different times.
     ///
     /// The two clock terms are the gap the first cut of this fix left open
-    /// (see the body). Any published ceremony tool that assembles a `BPOSMAN2`
-    /// header must mix them in too — no such manifest exists yet, which is
-    /// the only reason this expression is still free to be corrected.
+    /// (see the body). Correcting the expression is free today because no
+    /// `BPOSMAN2` manifest has ever been published — the format is inert
+    /// until a founder publishes one.
+    ///
+    /// # Before any `BPOSMAN2` manifest is published
+    ///
+    /// `tools/genesis4-ceremony::genesis_header` assembles the header the
+    /// ceremony PUBLISHES, and it does not agree with this function. It mixes
+    /// `SHA3-256(DS_RANDAO ‖ 0 ‖ carryover_digest)` with no clock terms, and
+    /// it also differs in three fields this one leaves zero
+    /// (`proposer_index`, `coherence_root`, and the state root it computes
+    /// from its own `Genesis`). That disagreement PREDATES this correction —
+    /// the tool has never matched the v1 rule the live chain runs either —
+    /// so nothing here breaks an equality that was holding. But a v2 launch
+    /// needs the two brought into line first, and the tool cannot even
+    /// express these terms today: its `Genesis` struct carries no
+    /// `genesis_time_ms` and no `slot_ms`. That is ceremony work, and it is a
+    /// precondition of publishing a bound manifest, not of shipping this.
     ///
     /// Under [`ManifestFormat::V1Unbound`] it is [`GENESIS_MIX`], unchanged.
     pub fn genesis_mix(&self) -> [u8; 32] {
