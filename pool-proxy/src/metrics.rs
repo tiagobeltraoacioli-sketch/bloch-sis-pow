@@ -505,8 +505,8 @@ mod tests {
             m.rpc_poll_failed();
         });
         let ledger = PplnsLedger::new(&ProxyConfig::default());
-        ledger.record(WorkerId(1), "j", 8.0, &ShareOutcome::Accepted);
-        ledger.record(WorkerId(2), "j", 4.0, &ShareOutcome::Accepted);
+        ledger.record(WorkerId(1), "j", Some(8.0), &ShareOutcome::Accepted);
+        ledger.record(WorkerId(2), "j", Some(4.0), &ShareOutcome::Accepted);
         let text = render_prometheus(&snap, &ledger.snapshot());
 
         for name in [
@@ -630,7 +630,7 @@ mod tests {
         let metrics = Arc::new(Metrics::new());
         let ledger = test_ledger();
         // Record an accepted share so the credit vector is non-empty.
-        ledger.record(WorkerId(1), "job", 8.0, &ShareOutcome::Accepted);
+        ledger.record(WorkerId(1), "job", Some(8.0), &ShareOutcome::Accepted);
 
         let m = metrics.clone();
         let l = ledger.clone();
