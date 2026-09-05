@@ -207,6 +207,37 @@ const REJECTION_MAX: usize = 4_096;
 /// byte cap it is also checked against.
 const MAX_TXS_PER_BLOCK: usize = 256;
 
+/// How far past THIS NODE'S wall-clock slot a gossiped block's `header.slot`
+/// may sit before `ingest` refuses it without storing it.
+///
+/// **This is a local admission rule, not a consensus rule.** It needs no flag
+/// day and two nodes disagreeing about it cannot fork: a block refused here is
+/// simply not stored by this node, and if it was honest it arrives again from
+/// the mesh once the clock catches up — the same shape as the mempool's
+/// `admissible` door, and deliberately NOT the shape of a validity rule.
+///
+/// What it closes is a liveness hole with no lower bound on cost to the
+/// attacker: `header.slot` is an untrusted `u64` off the wire, and everything
+/// downstream that walks slots or epochs from it is linear in its magnitude.
+/// `compute_post_state` rolls `while st.epoch < block_epoch { st.close_epoch()
+/// }`, and `close_epoch` clones the whole eUTXO set once per turn, so a single
+/// gossiped header naming `u64::MAX` asks every node on the network for
+/// ~5.7e17 ledger clones. One free packet, one frozen fleet. The header is
+/// signed by nobody the node has checked yet at this point in `ingest`, so
+/// there is not even a stake to burn.
+///
+/// Sixty-four slots — two epochs, ~32 minutes at the manifest's 30s cadence —
+/// is chosen against the honest reason a block can legitimately look like it
+/// is from the future: THIS node's clock is behind. That is a skew budget, and
+/// 32 minutes is far past any NTP-disciplined host's error while still turning
+/// an unbounded walk into a bounded one. It costs nothing on the sync path,
+/// where every block fetched is in the PAST relative to a correct clock.
+///
+/// The bound this leaves is the honest one: an attacker can still name a slot
+/// up to 64 ahead of wall clock, so the walk is at most two `close_epoch`
+/// turns. That is the point — bounded, not zero.
+const MAX_FUTURE_SLOTS: u64 = 2 * bloch_pos_committee::params::SLOTS_PER_EPOCH;
+
 /// How many recently-applied canonical post-states are retained so a reorg
 /// can start from the fork point instead of from genesis.
 ///
@@ -1427,9 +1458,40 @@ impl Engine {
     // ── Block ingestion: store, then advance canonical as far as possible ──
 
     fn ingest(&mut self, env: BlockEnvelope) {
+        let _ = self.ingest_judged(env);
+    }
+
+    /// `ingest`, plus the gossip verdict the engine — not the p2p edge — has
+    /// now earned the right to state.
+    ///
+    /// The block topic used to `Accept` (and therefore relay) at the edge on
+    /// decodability alone, which meant every structurally impossible block was
+    /// forwarded once by every node that saw it, at no cost to its author.
+    /// Attestations have never worked that way: `p2p.rs` hands them over with
+    /// an [`Origin`] and says nothing until `apply_decision` answers. This is
+    /// that same shape for blocks, and the mapping is the one `Verdict`'s docs
+    /// demand:
+    ///
+    /// - `Reject` — a *provable* violation, safe to charge to the forwarding
+    ///   peer: the header does not commit to the body it carries, the body
+    ///   does not decode, or the slot is one no honest node could be
+    ///   gossiping (0, or past [`MAX_FUTURE_SLOTS`]).
+    /// - `Accept` — structurally sound; relay it. This is deliberately NOT
+    ///   "the transition applied it". A block on a losing branch, or one whose
+    ///   parent has not arrived, is honest and must still propagate, so full
+    ///   validity cannot be the relay condition without stalling fork choice.
+    ///
+    /// Note the one asymmetry with `MAX_FUTURE_SLOTS`' own docs: refusing to
+    /// STORE the block is the local rule, but `Reject` also charges the peer's
+    /// P4 score off this node's clock. That is intentional and bounded — the
+    /// same 32-minute skew budget guards both, and gossipsub's penalty is a
+    /// score, not a ban.
+    fn ingest_judged(&mut self, env: BlockEnvelope) -> Verdict {
         let id = *env.block_id().as_bytes();
         if self.blocks.contains_key(&id) || self.canonical.contains(&id) {
-            return;
+            // Already known: a duplicate is an honest race, not a violation,
+            // and it is not this node's job to relay it a second time.
+            return Verdict::Ignore;
         }
         // A cheap early reject before the block reaches the transition, using
         // the same `derive::*` functions the transition checks with — one
@@ -1443,7 +1505,7 @@ impl Engine {
                 "reject {}: body/attestation commitment mismatch",
                 crate::codec::hex8(&id)
             );
-            return;
+            return Verdict::Reject;
         }
         // A block carrying transactions used to be rejected here, because the
         // node had no tx codec and failing closed was the honest response. The
@@ -1453,10 +1515,28 @@ impl Engine {
         // then be unreproducible.
         if let Err(e) = body_transactions(&env) {
             eprintln!("reject {}: {e}", crate::codec::hex8(&id));
-            return;
+            return Verdict::Reject;
         }
         if env.header.slot == 0 {
-            return; // genesis is synthesized, never received
+            return Verdict::Reject; // genesis is synthesized, never received
+        }
+        // The upper half of the same door. `header.slot` is untrusted `u64`
+        // and every slot/epoch walk downstream is linear in it — see
+        // [`MAX_FUTURE_SLOTS`]. Refused BEFORE `self.blocks.insert`, so a
+        // block naming a far-future slot never reaches `advance()` and never
+        // occupies memory; and before any signature work, so the refusal is
+        // one integer comparison rather than a hybrid verify.
+        let horizon = self.wall_slot().saturating_add(MAX_FUTURE_SLOTS);
+        if env.header.slot > horizon {
+            eprintln!(
+                "reject {}: slot {} is past this node's horizon {} (wall {} + {})",
+                crate::codec::hex8(&id),
+                env.header.slot,
+                horizon,
+                self.wall_slot(),
+                MAX_FUTURE_SLOTS,
+            );
+            return Verdict::Reject;
         }
         self.blocks.insert(id, env);
         self.advance();
@@ -1464,6 +1544,7 @@ impl Engine {
         // re-run. `advance()` first: an attestation released here votes on
         // fork choice, and it should see the chain the block already moved.
         self.release_held(id);
+        Verdict::Accept
     }
 
     // ── Fork choice: LMD-GHOST ──────────────────────────────────────────────
@@ -3492,7 +3573,13 @@ pub fn run(cfg: Config) -> io::Result<()> {
                         inflight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                     }
                     match ev {
-                        EngineEvent::Net(NetEvent::Block(env)) => engine.ingest(env),
+                        EngineEvent::Net(NetEvent::Block(env, origin)) => {
+                            // Judge first, THEN speak. Nothing is relayed
+                            // until the engine has an answer — the same
+                            // contract the attestation arm below runs on.
+                            let verdict = engine.ingest_judged(env);
+                            engine.net.report(&origin, verdict);
+                        }
                         EngineEvent::Net(NetEvent::Attestation(att, origin)) => {
                             engine.on_attestation(att, origin, wall_epoch)
                         }
@@ -7381,5 +7468,212 @@ mod duty_view_anchor {
                 "slot {slot}: attester and judge disagree on who is in the committee"
             );
         }
+    }
+}
+
+/// The node half of the untrusted-`header.slot` bound (finding C1-slot-bound),
+/// and the deferred block verdict that goes with it.
+///
+/// Two rules live here and they are deliberately different in kind. The
+/// horizon is LOCAL — a node may hold it or not without forking, because a
+/// block it refuses is simply one it did not store. The ceiling in
+/// `params::MAX_EPOCH_ADVANCE` is CONSENSUS, and is the backstop for every
+/// path that does not come through this door. This module pins the local one.
+#[cfg(test)]
+mod slot_horizon {
+    use super::*;
+    use bloch_pos_committee::state_root::EvmCommitment;
+
+    /// A real `Engine` whose slot-0 origin is `back_slots` slots in the past,
+    /// so `wall_slot()` is a number the test chose rather than whatever the
+    /// clock happens to say. Observer mode, empty state, devnet transport on
+    /// an ephemeral port with no peers — everything except `ingest_judged` is
+    /// scenery.
+    fn engine_at_wall_slot(back_slots: u64) -> Engine {
+        let slot_ms = 1_000u64;
+        let manifest = Manifest {
+            genesis_time_ms: now_ms().saturating_sub(back_slots.saturating_mul(slot_ms)),
+            slot_ms,
+            validators: Vec::new(),
+            cohort: Vec::new(),
+            carryover: None,
+            allocations: Vec::new(),
+            carryover_entries: Vec::new(),
+        };
+        let genesis_id = manifest.genesis_id();
+        let state = CommittedState::genesis(
+            genesis_id,
+            GENESIS_MIX,
+            &[],
+            &[],
+            [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
+            EvmCommitment {
+                account_root: [0u8; 32],
+                receipts_root: [0u8; 32],
+                gas_used: 0,
+                base_fee_per_gas: 0,
+            },
+            &[],
+        );
+        static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-pos-slot-horizon-{}-{}",
+            std::process::id(),
+            DIR_SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&dir).expect("create the test data dir");
+        let store = Store::open(&dir, &[0u8; 32]).expect("open the test store");
+        let (events, _rx) = mpsc::channel::<EngineEvent>();
+        let head_slot = Arc::new(AtomicU64::new(0));
+        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let net = net::Net::Devnet(
+            net::start("127.0.0.1", 0, Vec::new(), events, dir.clone(), head_slot.clone(), inflight)
+                .expect("bind the devnet transport on an ephemeral port"),
+        );
+        let verifier = HybridVerifier::new();
+        Engine {
+            manifest,
+            state: StateCell::new(state),
+            tr: Transition::new(verifier.clone()),
+            tr_probe: Transition::new(ProbeVerifier),
+            verifier,
+            keys: None,
+            blocks: BTreeMap::new(),
+            chain: vec![(0, genesis_id)],
+            canonical: BTreeSet::from([*genesis_id.as_bytes()]),
+            recent_states: VecDeque::new(),
+            pool: BTreeMap::new(),
+            att_pool: AttestationPool::new(),
+            wall_slot: 0,
+            mempool: BTreeMap::new(),
+            rejected: BTreeMap::new(),
+            rejected_hits: 0,
+            mempool_suspect: BTreeSet::new(),
+            mempool_swept_epoch: u64::MAX,
+            store,
+            net,
+            head_slot,
+            live: true,
+            needs_sync: false,
+            last_applied_ms: now_ms(),
+            booted_ms: now_ms(),
+            ws_anchor: None,
+            ws_anchor_hard: false,
+            ws_conflict_reported: false,
+            fc_covered_removals: 0,
+        }
+    }
+
+    /// An envelope that clears every check `ingest_judged` runs BEFORE the
+    /// horizon — the body/attestation commitments and the tx decode — so the
+    /// horizon is the only thing left that can refuse it. It names a parent
+    /// this node does not have, which is on purpose: a block that fails the
+    /// horizon must never be stored, and one that passes it must be stored
+    /// even though it cannot be applied. That separates "did the door let it
+    /// in" from "did the chain adopt it", which are different questions.
+    fn envelope_at_slot(slot: u64) -> BlockEnvelope {
+        BlockEnvelope {
+            header: BlockHeaderV4 {
+                version: VERSION_G4,
+                parent: [1; 32],
+                state_root: [2; 32],
+                body_root: derive::body_root(&[]),
+                slot,
+                proposer_index: 0,
+                randao_reveal: [4; 32],
+                randao_mix: [5; 32],
+                justified_root: [6; 32],
+                finalized_root: [7; 32],
+                attestation_root: derive::attestation_root(&[]),
+                coherence_root: [9; 32],
+            },
+            proposer_sig: vec![0u8; 96],
+            body: Body { transactions: Vec::new(), attestations: Vec::new() },
+        }
+    }
+
+    /// **The finding.** One gossiped header carrying `u64::MAX` used to be
+    /// stored and handed to the transition, whose boundary walk is linear in
+    /// `epoch_of(header.slot)`. Nothing about that header was signed by anyone
+    /// this node had checked. It must be refused at the door, before the
+    /// insert, and the peer that forwarded it must be charged for it.
+    ///
+    /// Remove the horizon check from `ingest_judged` and this fails on the
+    /// verdict AND on the store — two independent assertions of the same
+    /// defect, so a partial fix cannot make it green.
+    #[test]
+    fn a_block_from_the_far_future_is_refused_before_it_is_stored() {
+        let mut e = engine_at_wall_slot(10);
+        let env = envelope_at_slot(u64::MAX);
+        let id = *env.block_id().as_bytes();
+
+        assert_eq!(
+            e.ingest_judged(env),
+            Verdict::Reject,
+            "a slot no clock can justify is provable, and Reject is what charges the peer",
+        );
+        assert!(
+            !e.blocks.contains_key(&id),
+            "a block past the horizon must never reach `blocks` — storing it is what puts \
+             `epoch_of(u64::MAX)` in front of the transition",
+        );
+    }
+
+    /// The control, and the half that makes the test above mean something: a
+    /// block INSIDE the horizon is still stored and still relayed. Without
+    /// this, `ingest_judged` returning `Reject` unconditionally would pass.
+    #[test]
+    fn a_block_inside_the_horizon_is_still_stored_and_relayed() {
+        let mut e = engine_at_wall_slot(10);
+        let wall = e.wall_slot();
+        let env = envelope_at_slot(wall + MAX_FUTURE_SLOTS);
+        let id = *env.block_id().as_bytes();
+
+        assert_eq!(e.ingest_judged(env), Verdict::Accept);
+        assert!(e.blocks.contains_key(&id), "a block at the horizon is honest and must propagate");
+    }
+
+    /// The horizon is measured against the wall clock, not against the head.
+    /// A node whose chain is thousands of slots behind — every node on this
+    /// fleet, routinely — must keep accepting current blocks, or the rule
+    /// would quietly stop such a node from ever catching up.
+    #[test]
+    fn a_node_far_behind_its_own_chain_still_accepts_current_blocks() {
+        let mut e = engine_at_wall_slot(50_000);
+        let wall = e.wall_slot();
+        assert!(wall > 40_000, "fixture must actually be far along; wall = {wall}");
+        let env = envelope_at_slot(wall);
+        let id = *env.block_id().as_bytes();
+        assert_eq!(e.ingest_judged(env), Verdict::Accept);
+        assert!(e.blocks.contains_key(&id));
+    }
+
+    /// Slot 0 keeps its own answer. Genesis is synthesized, never received, so
+    /// a peer gossiping one is not racing — it is sending something no honest
+    /// node produces. The pre-existing `return` said nothing about the peer;
+    /// now it charges them, and that must not regress into a silent drop.
+    #[test]
+    fn slot_zero_is_still_refused_and_now_says_so() {
+        let mut e = engine_at_wall_slot(10);
+        let env = envelope_at_slot(0);
+        let id = *env.block_id().as_bytes();
+        assert_eq!(e.ingest_judged(env), Verdict::Reject);
+        assert!(!e.blocks.contains_key(&id));
+    }
+
+    /// The horizon is a skew budget, and naming the number it buys keeps the
+    /// next person from tightening it into a rule that refuses honest blocks
+    /// off a slightly-wrong clock.
+    #[test]
+    fn the_horizon_is_at_least_half_an_hour_of_clock_skew() {
+        // The §5.1 consensus cadence, not the 1s the fixtures run at.
+        let secs = MAX_FUTURE_SLOTS * bloch_pos_committee::params::SLOT_DURATION_SECS;
+        assert!(
+            secs >= 30 * 60,
+            "{MAX_FUTURE_SLOTS} slots is only {secs}s of skew tolerance — too tight for a \
+             fleet whose clocks are not a consensus input",
+        );
     }
 }

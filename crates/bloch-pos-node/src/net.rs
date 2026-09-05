@@ -111,7 +111,12 @@ pub use crate::p2p::{Origin, Verdict};
 
 /// What the engine receives from a transport.
 pub enum NetEvent {
-    Block(BlockEnvelope),
+    /// A block and where it came from. The [`Origin`] carries the same
+    /// deferred-verdict contract the attestation arm has always had: the p2p
+    /// edge stays silent, the engine's `ingest_judged` decides, and only then
+    /// is the block relayed (or the peer charged). On the devnet mesh it is
+    /// [`Origin::none`] and reporting is a no-op.
+    Block(BlockEnvelope, Origin),
     /// An attestation and where it came from. The [`Origin`] is what lets the
     /// engine's `gossip.rs` decision reach gossipsub's
     /// `report_message_validation_result`; on the devnet mesh it is
@@ -163,8 +168,9 @@ impl Net {
     ///
     /// This is the other half of wiring `gossip.rs`: with gossipsub in
     /// `validate_messages()` mode nothing is relayed until this is called, so
-    /// an attestation the pool has not judged is one this node does not
-    /// forward. The devnet mesh has no such notion and drops it.
+    /// an attestation the pool has not judged — or a block `ingest_judged`
+    /// has not judged — is one this node does not forward. The devnet mesh has
+    /// no such notion and drops it.
     pub fn report(&self, origin: &Origin, verdict: Verdict) {
         match self {
             Net::Devnet(_) => {}
@@ -419,7 +425,9 @@ fn read_frame(sock: &mut TcpStream) -> std::io::Result<Vec<u8>> {
 fn decode_event(frame: &[u8]) -> Option<NetEvent> {
     match frame.first()? {
         &FRAME_BLOCK => {
-            crate::codec::decode_envelope(&frame[1..]).ok().map(NetEvent::Block)
+            crate::codec::decode_envelope(&frame[1..])
+                .ok()
+                .map(|env| NetEvent::Block(env, Origin::none()))
         }
         &FRAME_ATT => {
             let mut r = crate::codec::Reader::new(&frame[1..]);

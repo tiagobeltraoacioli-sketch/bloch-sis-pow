@@ -352,6 +352,27 @@ pub enum TransitionError {
     /// operator can change any rule including this one; "impossible to
     /// change" would be false and is deliberately not the claim.
     SupplyCapExceeded,
+    /// The block's epoch is more than [`crate::params::MAX_EPOCH_ADVANCE`]
+    /// past its parent state's, so the boundary walk
+    /// (`while st.epoch < block_epoch { st.close_epoch() }`) would run more
+    /// turns than any honest gap can justify.
+    ///
+    /// The trip count of that loop is `epoch_of(header.slot)`, and
+    /// `header.slot` is an untrusted `u64` off the wire. Unbounded, a single
+    /// gossiped header naming `u64::MAX` asks every node that judges it for
+    /// ~5.76e17 whole-eUTXO-set clones — a free packet that freezes a fleet.
+    /// This variant is that loop's ceiling, and it is a plain bound live at
+    /// every epoch, not an activation waiting to be armed.
+    ///
+    /// Placed immediately before the walk rather than beside the step-1 slot
+    /// checks on purpose: every reject path that existed before this variant
+    /// still returns exactly the error it returned, so the frozen error order
+    /// above is extended, never reordered.
+    ///
+    /// It cannot fire on committed history — see the constant's own docs for
+    /// the replay argument and for the liveness ceiling it buys the bound
+    /// with.
+    EpochAdvanceTooLarge,
     /// The block would leave more satoshis in committed state than the block
     /// before it plus everything the block was entitled to mint
     /// (`CommittedState::accounted_supply_sat` grew faster than
