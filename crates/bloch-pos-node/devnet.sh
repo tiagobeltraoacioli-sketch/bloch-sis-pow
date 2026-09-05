@@ -37,6 +37,15 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 BIN="$HERE/target/release/bloch-pos"
 [ -x "$BIN" ] || BIN="$HERE/target/debug/bloch-pos"
 [ -x "$BIN" ] || { echo "build first: cargo build --release (in crates/bloch-pos-node)"; exit 1; }
+
+# ── Keystore at rest (audit I-H1) ──────────────────────────────────────────
+# This is a DEVNET harness: throwaway keys, throwaway chain, a temp dir. The
+# node now refuses to read or write a keystore whose secret key sits on disk in
+# the clear unless someone says so, so this script says so, once, for every
+# bloch-pos it launches below. A real validator is sealed instead: leave this
+# unset and export BLOCH_KEYSTORE_PASSPHRASE_FILE=<path> in the unit.
+export BLOCH_KEYSTORE_ALLOW_PLAINTEXT=1
+
 mkdir -p "$WORKDIR"
 
 # 1. Throwaway devnet keys (rule zero: devnet only, never production).
@@ -44,7 +53,11 @@ KEYDIRS=""
 for i in $(seq 0 $((N - 1))); do
   d="$WORKDIR/node$i"
   mkdir -p "$d"
-  [ -f "$d/validator.key" ] || "$BIN" keygen --dir "$d" --index "$i"
+  # Throwaway devnet keys in a temp dir: --allow-plaintext-keystore is the
+  # explicit opt-in the node now requires before it will write (or read) a
+  # keystore with the secret key in the clear (audit I-H1). A real validator
+  # is sealed instead, with BLOCH_KEYSTORE_PASSPHRASE_FILE.
+  [ -f "$d/validator.key" ] || "$BIN" keygen --allow-plaintext-keystore --dir "$d" --index "$i"
   KEYDIRS="${KEYDIRS:+$KEYDIRS,}$d"
 done
 

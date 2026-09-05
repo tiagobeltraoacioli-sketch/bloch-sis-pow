@@ -58,6 +58,14 @@ bloch-pos-committee = { path = "../bloch-pos-committee" }
 bloch-crypto = { path = "../bloch-crypto" }
 sha3 = "0.10"
 
+# Keystore encryption at rest (src/keys.rs, audit I-H1): Argon2id derives the
+# key, XChaCha20-Poly1305 seals the hybrid secret + RANDAO seed, zeroize wipes
+# both on drop. Same versions the Genesis-3 node already locks, so this adds no
+# new package to Cargo.lock.
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+
 # The production network layer (src/p2p.rs). Same major version the Genesis-3
 # node runs (0.56), so the mesh fixes ported from it apply to the same
 # behaviour code — libp2p-gossipsub 0.49.x is where `behaviour.rs:2224` and

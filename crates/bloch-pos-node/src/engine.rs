@@ -3547,12 +3547,18 @@ pub fn run(cfg: Config) -> io::Result<()> {
     }
 
     // No keystore in the data dir is not a misconfiguration — it selects
-    // observer mode. Any other read error still is, and is reported: a node
-    // that silently downgraded to observer because its key was unreadable
-    // would stop attesting and look healthy doing it.
-    let keys = match Keystore::load(&cfg.data_dir) {
-        Ok(k) => Some(k),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+    // observer mode. Anything else is a misconfiguration and stops the boot.
+    //
+    // The decision is `load_optional`'s, not this match's, and that is the
+    // whole point: `Ok(None)` there means the FILE IS ABSENT and nothing
+    // else. This site used to ask `e.kind() == NotFound` instead, which also
+    // caught a missing `BLOCH_KEYSTORE_PASSPHRASE_FILE` — so a validator with
+    // a good sealed key and an unprovisioned credential path restarted as a
+    // silent observer, printing the reassuring line below and attesting
+    // nothing. There is no error kind left here to misread.
+    let keys = match Keystore::load_optional(&cfg.data_dir)? {
+        Some(k) => Some(k),
+        None => {
             println!(
                 "observer mode: no keystore in {}. This node follows the chain, applies \
                  every block and serves the RPC. It does not propose and does not attest.",
@@ -3560,7 +3566,6 @@ pub fn run(cfg: Config) -> io::Result<()> {
             );
             None
         }
-        Err(e) => return Err(e),
     };
     // Stateless now: it holds no key table. Keys are resolved per call from
     // the committed registry by whichever consensus site is asking.
@@ -6469,7 +6474,11 @@ mod perf_support {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create the test data dir");
 
-        let ks = Keystore::generate(&dir, 0).expect("generate a devnet keystore");
+        // Explicit plaintext opt-in (audit I-H1): these are disposable in-process
+        // devnet keys in a temp dir, and paying Argon2id 64 MiB per keystore
+        // in an unoptimized test binary would dominate the suite.
+        let ks = Keystore::generate_with(&dir, 0, &crate::keys::Unlock::PlaintextOptIn)
+            .expect("generate a devnet keystore");
         let manifest = Manifest {
             genesis_time_ms: now_ms(),
             slot_ms: 1_000,
@@ -7995,8 +8004,14 @@ mod duty_view_anchor {
 
         let keys: Vec<Keystore> = (0..n)
             .map(|i| {
-                Keystore::generate(&dir.0.join(format!("v{i}")), i)
-                    .expect("generate a devnet keystore")
+                // Disposable devnet keys, plaintext by explicit opt-in — see
+                // the note in the single-validator harness above.
+                Keystore::generate_with(
+                    &dir.0.join(format!("v{i}")),
+                    i,
+                    &crate::keys::Unlock::PlaintextOptIn,
+                )
+                .expect("generate a devnet keystore")
             })
             .collect();
         let manifest = Manifest {
@@ -8037,7 +8052,8 @@ mod duty_view_anchor {
             .expect("bind the devnet transport on an ephemeral port"),
         );
         let verifier = HybridVerifier::new();
-        let ks0 = Keystore::load(&dir.0.join("v0")).expect("re-load validator 0");
+        let ks0 = Keystore::load_with(&dir.0.join("v0"), &crate::keys::Unlock::PlaintextOptIn)
+            .expect("re-load validator 0");
         let engine = Engine {
             manifest,
             state: StateCell::new(state),

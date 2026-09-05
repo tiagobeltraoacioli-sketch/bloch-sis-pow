@@ -81,8 +81,28 @@ fn tmp_root() -> PathBuf {
     d
 }
 
+/// This test is about SYNC, and it is timing-sensitive: three debug-build
+/// nodes have to come up inside a six-second window or they join out of step,
+/// reorg, and trip the byte-identity assertion at the bottom of this file.
+/// (Measured on `main`, before any of this: 1 failure in 5 runs.)
+///
+/// So it runs on plaintext keystores, by the explicit opt-in the node now
+/// requires (audit I-H1) — sealing them would add Argon2id at 64 MiB to every
+/// node's boot and buy nothing this test is trying to prove, at the cost of
+/// making a known-flaky consensus test flakier (measured: 2 in 5). That the
+/// BINARY can keygen and load a *sealed* keystore is proved in
+/// `tests/keystore_at_rest.rs`, which needs no fleet and no clock.
+///
+/// Throwaway devnet keys in a temp dir. No fleet host and no real keystore is
+/// involved anywhere in this file.
+const KEYSTORE_POLICY: (&str, &str) = ("BLOCH_KEYSTORE_ALLOW_PLAINTEXT", "1");
+
 fn run_to_completion(args: &[&str]) -> String {
-    let out = Command::new(BIN).args(args).output().expect("spawn bloch-pos");
+    let out = Command::new(BIN)
+        .env(KEYSTORE_POLICY.0, KEYSTORE_POLICY.1)
+        .args(args)
+        .output()
+        .expect("spawn bloch-pos");
     assert!(
         out.status.success(),
         "bloch-pos {args:?} failed: {}",
@@ -132,6 +152,7 @@ fn spawn_node(
     let out = std::fs::File::create(log).expect("create log");
     let err = out.try_clone().expect("dup log");
     Command::new(BIN)
+        .env(KEYSTORE_POLICY.0, KEYSTORE_POLICY.1)
         .args([
             "run",
             "--data-dir",

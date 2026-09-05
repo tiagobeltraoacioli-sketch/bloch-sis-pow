@@ -87,6 +87,16 @@ const VERSION: &str = env!("BLOCH_BUILD_VERSION");
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Audit I-H1. The keystore is sealed (Argon2id + XChaCha20-Poly1305) and
+    // its passphrase comes from BLOCH_KEYSTORE_PASSPHRASE_FILE /
+    // BLOCH_KEYSTORE_PASSPHRASE. Reading or writing a PLAINTEXT keystore is
+    // possible only when the operator says so here, once, for the whole
+    // process — never inferred from the file that happened to be on disk.
+    // Applies to `run`, `keygen` and `keygen-public` alike, which is why it is
+    // read before the subcommand dispatch rather than inside one of them.
+    if args.iter().any(|a| a == "--allow-plaintext-keystore") {
+        keys::allow_plaintext_at_rest();
+    }
     match args.first().map(String::as_str) {
         Some("--version") | Some("-V") => {
             println!(
@@ -148,6 +158,18 @@ fn print_help() {
                Generate a THROWAWAY devnet validator keystore (hybrid\n\
                ML-DSA-65‖Falcon-1024 + RANDAO seed) at <dir>/validator.key.\n\
                Devnet only; production keys follow BLOCH-GENESIS-KEYS.md.\n\
+         \n\
+           KEYSTORE AT REST (any subcommand that touches validator.key)\n\
+               validator.key is SEALED: Argon2id + XChaCha20-Poly1305 over the\n\
+               hybrid secret key and the RANDAO seed. Supply the passphrase\n\
+               out of band — there is no prompt:\n\
+                 BLOCH_KEYSTORE_PASSPHRASE_FILE=<path>   (preferred)\n\
+                 BLOCH_KEYSTORE_PASSPHRASE=<passphrase>\n\
+               --allow-plaintext-keystore (or BLOCH_KEYSTORE_ALLOW_PLAINTEXT=1)\n\
+               is the ONLY way to read or write a legacy plaintext keystore,\n\
+               where the secret key sits on disk behind nothing but mode 0600.\n\
+               Devnet only. Without it, a plaintext validator.key is refused\n\
+               rather than loaded.\n\
            bloch-pos keygen-public --dir <dir>\n\
                Print one TSV row of a keystore's PUBLIC halves — the only
                thing that leaves the air-gapped ceremony machine. Secret
