@@ -110,28 +110,58 @@ allow = [
 # ── First-party AGPL exceptions ───────────────────────────────────────────
 # The project relicensed its OWN workspace crates MIT→AGPL-3.0-or-later.
 # cargo-deny applies the license policy to workspace members too, so without
-# these the build rejects Bloch's own code. AGPL is allowed ONLY for the six
-# named first-party crates — it is deliberately NOT in the global `allow`
-# above, so any THIRD-PARTY AGPL/GPL/LGPL dependency still fails the gate.
-# (Add coherence-prover here with the same block when it enters the scan
-# scope — it is AGPL but currently excluded from the workspace.)
+# these the build rejects Bloch's own code. AGPL is allowed ONLY for the
+# first-party crates named below — it is deliberately NOT in the global
+# `allow` above, so any THIRD-PARTY AGPL/GPL/LGPL dependency still fails the
+# gate.
+#
+# THIS LIST MUST EQUAL the set of AGPL workspace members in the root
+# Cargo.toml `members`. It is not maintained by hand alone: the blocking
+# `deny-license-exceptions` CI job runs
+# `python3 scripts/deny-license-exceptions-guard.py`, which derives the AGPL
+# member set from the workspace manifests and fails closed on a member with no
+# exception (the gate cannot pass, so the whole pipeline is red) AND on an
+# exception that names no AGPL member (a rename or typo silently widening the
+# policy). Add a crate to `members` and the guard tells you to add it here.
+#
+# (coherence-prover is AGPL but is `exclude`d from the workspace — SP1/nightly
+# toolchain — so it is outside the scan graph. Give it the same block, and the
+# guard will then require it, if it ever becomes a member.)
+
+# Genesis-4, proof of stake — the live chain.
 [[licenses.exceptions]]
-name = "bloch"
+name = "bloch-pos-committee"
 allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "bloch-pos-node"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "genesis4-ceremony"
+allow = ["AGPL-3.0-or-later"]
+
+# Shared protocol crates — used by both eras.
 [[licenses.exceptions]]
 name = "bloch-crypto"
-allow = ["AGPL-3.0-or-later"]
-[[licenses.exceptions]]
-name = "bloch-euvm"
-allow = ["AGPL-3.0-or-later"]
-[[licenses.exceptions]]
-name = "bloch-ffg"
 allow = ["AGPL-3.0-or-later"]
 [[licenses.exceptions]]
 name = "coherence-core"
 allow = ["AGPL-3.0-or-later"]
 [[licenses.exceptions]]
 name = "bloch-btc-wallet"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "bloch-pq-vault"
+allow = ["AGPL-3.0-or-later"]
+
+# Genesis-3, proof of work — closed, kept buildable for audit.
+[[licenses.exceptions]]
+name = "bloch"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "bloch-euvm"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "bloch-ffg"
 allow = ["AGPL-3.0-or-later"]
 
 # ── Third-party permissive-data license ───────────────────────────────────
