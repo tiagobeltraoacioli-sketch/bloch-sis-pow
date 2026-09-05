@@ -188,8 +188,14 @@ fn print_help() {
                it in a block.\n\
            bloch-pos genesis --keys <dir1,dir2,...> --out <file>\n\
                              [--slot-ms <ms>] [--start-in <secs>]\n\
+                             [--bind-genesis]\n\
                Build a devnet genesis manifest from the keystores' public\n\
                parts. Slot 0 starts <secs> from now (default 5).\n\
+               --bind-genesis writes the BPOSMAN2 format, whose genesis\n\
+               header commits to the genesis state root and seeds the\n\
+               RANDAO mix from the carryover digest, so the block id at\n\
+               height 0 identifies the ledger. It is a DIFFERENT network\n\
+               from any manifest written without it.\n\
            bloch-pos run --data-dir <dir> --genesis <file>\n\
                          [--transport devnet|libp2p|dual]\n\
                devnet (default) is the TCP full mesh: no authentication, no\n\
@@ -486,6 +492,26 @@ fn arg_value(args: &[String], name: &str) -> Option<String> {
         .cloned()
 }
 
+/// Which genesis-binding rule to stamp into a manifest this command emits.
+///
+/// Default is [`genesis::ManifestFormat::V1Unbound`] — the rule the live
+/// Genesis-4 chain launched under. `--bind-genesis` selects the bound rule
+/// (audit C5-genesis-header): the genesis header then carries the genesis
+/// state root and a carryover-seeded RANDAO mix, so the block id at height 0
+/// is a function of the ledger instead of a constant every network shares.
+///
+/// It is a flag and not a default because a manifest emitted with it has a
+/// DIFFERENT `genesis_id` from the one the fleet runs. That is a new network,
+/// not an upgrade: no node can adopt it without relaunching from its block 0.
+/// Publishing such a manifest is the founder's decision.
+fn manifest_format(args: &[String]) -> genesis::ManifestFormat {
+    if args.iter().any(|a| a == "--bind-genesis") {
+        genesis::ManifestFormat::V2Bound
+    } else {
+        genesis::ManifestFormat::V1Unbound
+    }
+}
+
 /// `keygen-public --dir <dir>` — one TSV row of a keystore's PUBLIC halves.
 ///
 /// The carry-out half of the ceremony. An air-gapped machine holds the
@@ -563,7 +589,8 @@ fn keygen(args: &[String]) {
     }
 }
 
-/// `genesis-mainnet --cohort <cohort.tsv> --out <file> [--start-in <secs>]`
+/// `genesis-mainnet --cohort <cohort.tsv> --out <file> [--start-in <secs>]
+/// [--bind-genesis]`
 ///
 /// Assemble the mainnet manifest from the ceremony's **public halves only**.
 ///
@@ -706,6 +733,8 @@ fn genesis_mainnet(args: &[String]) {
         // fields below. A manifest is the artifact every node hashes to decide
         // which network it joined; a 54 MB balance set does not belong in it.
         carryover_entries: Vec::new(),
+        format: manifest_format(args),
+        pre_state_root: std::sync::OnceLock::new(),
         carryover: Some(genesis::CarryoverCommitment {
             digest: t::CARRYOVER_MEASURED_FILE_SHA3_256,
             set_root: t::CARRYOVER_MEASURED_ROOT,
@@ -819,6 +848,8 @@ fn genesis_cmd(args: &[String]) {
         carryover: None,
         allocations: Vec::new(),
         carryover_entries: Vec::new(),
+        format: manifest_format(args),
+        pre_state_root: std::sync::OnceLock::new(),
     };
     if let Err(e) = manifest.check_supply() {
         eprintln!("genesis: {e}");

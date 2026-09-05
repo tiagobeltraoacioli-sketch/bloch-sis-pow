@@ -206,6 +206,8 @@ fn clone_manifest(m: &Manifest) -> Manifest {
         carryover: m.carryover.clone(),
         allocations: m.allocations.clone(),
         carryover_entries: m.carryover_entries.clone(),
+        format: crate::genesis::ManifestFormat::V1Unbound,
+        pre_state_root: std::sync::OnceLock::new(),
     }
 }
 
@@ -342,6 +344,8 @@ impl Generator {
             carryover: None,
             allocations: Vec::new(),
             carryover_entries: eutxos(carryover_n, owned, owner_script),
+            format: crate::genesis::ManifestFormat::V1Unbound,
+            pre_state_root: std::sync::OnceLock::new(),
         };
         let coins: Vec<Coin> = manifest.carryover_entries[..owned as usize]
             .iter()

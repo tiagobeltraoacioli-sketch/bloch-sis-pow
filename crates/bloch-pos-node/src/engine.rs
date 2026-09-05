@@ -90,7 +90,9 @@ use bloch_pos_committee::transition::{CommittedState, PosTransaction, Transition
 use bloch_pos_committee::interfaces::TransitionError;
 use bloch_pos_committee::{committees, derive, epoch_of, schedule};
 
-use crate::genesis::{Manifest, GENESIS_MIX};
+use crate::genesis::Manifest;
+#[cfg(test)]
+use crate::genesis::GENESIS_MIX;
 use crate::keys::{HybridVerifier, Keystore, ProbeVerifier};
 use crate::net::{self, NetEvent, Origin, Verdict};
 use crate::rpc::{self, Admitted, Finality, Json, RpcCall, RpcError, RpcRequest, RpcResult};
@@ -1158,7 +1160,13 @@ impl Engine {
         // parent, and `blocks` is finite, so a cycle cannot spin forever.
         for _ in 0..=self.blocks.len() {
             if cur == genesis {
-                return Some(GENESIS_MIX);
+                // The manifest's mix, not the constant: under a v2 manifest
+                // genesis opens on a mix derived from the carryover digest,
+                // and this walk must return the same value
+                // `CommittedState::seed_for_epoch` reads out of the state's
+                // `genesis_mix` — the duty view and the consensus authority
+                // for one quantity (see `seed_for`).
+                return Some(self.manifest.genesis_mix());
             }
             let env = self.blocks.get(&cur)?;
             if env.header.slot < first {
@@ -1225,7 +1233,7 @@ impl Engine {
             committees::MIN_SEED_LOOKAHEAD_EPOCHS
         };
         match epoch.checked_sub(lookahead) {
-            None => Some(GENESIS_MIX),
+            None => Some(self.manifest.genesis_mix()),
             Some(src) => self.ancestral_boundary_mix(target_root, src),
         }
     }
@@ -5742,6 +5750,8 @@ mod transfer_v2_end_to_end {
             carryover: None,
             allocations: Vec::new(),
             carryover_entries: Vec::new(),
+            format: crate::genesis::ManifestFormat::V1Unbound,
+            pre_state_root: std::sync::OnceLock::new(),
         };
         let genesis_id = manifest.genesis_id();
         // `CommittedState::genesis` directly rather than
@@ -6602,6 +6612,8 @@ mod perf_support {
             carryover: None,
             allocations: Vec::new(),
             carryover_entries: opening.to_vec(),
+            format: crate::genesis::ManifestFormat::V1Unbound,
+            pre_state_root: std::sync::OnceLock::new(),
         };
         let genesis_id = manifest.genesis_id();
         let state = manifest.genesis_state();
@@ -8142,6 +8154,8 @@ mod duty_view_anchor {
             carryover: None,
             allocations: Vec::new(),
             carryover_entries: Vec::new(),
+            format: crate::genesis::ManifestFormat::V1Unbound,
+            pre_state_root: std::sync::OnceLock::new(),
         };
         let genesis_id = manifest.genesis_id();
         let state = manifest.genesis_state();
