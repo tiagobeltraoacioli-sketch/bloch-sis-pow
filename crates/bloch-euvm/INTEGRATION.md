@@ -54,9 +54,11 @@ Additive change (only meaningful when the feature is active):
 
 `src/main.rs` `accept_block` → per-tx validation. Add, guarded by `active`:
 1. For each input spending an eUTXO output: run `bloch_euvm::spend(...)` with the
-   real `Ctx` built from the spending tx (sighash in `fields[0]`, `tx_outputs`,
-   `self_value`), and the **real PQ verifier** as the `SigVerifier` (ML-DSA-65‖
-   Falcon-1024 from `bloch-crypto`).
+   real `Ctx` built from the spending tx (`fields[0]` = the sighash **recomputed**
+   from the tx's own inputs/outputs/fee — `bloch_euvm::tx_sighash`, or the node's own
+   `Transaction` sighash once wired; never a spender-supplied label — plus
+   `tx_outputs`, `self_value`), and the **real PQ verifier** as the `SigVerifier`
+   (ML-DSA-65‖Falcon-1024 from `bloch-crypto`).
 2. Enforce per-asset value conservation (`validate_tx`) including native tokens.
 3. Meter gas per tx and a **block gas ceiling**; fee paid in BLCH, base-fee **burned**
    per `fee_burn(fee, EUVM_BURN_BPS)` (§5-bis).

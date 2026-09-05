@@ -51,8 +51,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    run, spend, validator_hash, value_get, AssetId, Ctx, EuTx, Op, SigVerifier, TxError, Val,
-    Value, VmError, BLCH,
+    bind_sighash, run, spend, validator_hash, value_get, AssetId, Ctx, EuTx, Op, SigVerifier,
+    TxError, Val, Value, VmError, BLCH,
 };
 
 /// A minting policy is simply a validator program. Its identity — and therefore the
@@ -151,10 +151,13 @@ pub enum MintTxError {
 }
 
 /// Build the deterministic context a minting policy runs against for one action.
-fn mint_ctx(tx: &EuTx, asset: AssetId, delta: i128, mctx: &MintCtx) -> Ctx {
+/// `sighash` is the canonical [`crate::tx_sighash`] the caller already bound (never
+/// `tx.sighash`), so an issuer signature authorizing a mint is bound to the outputs
+/// the minted units land in — and, by conservation, to the delta itself.
+fn mint_ctx(tx: &EuTx, sighash: &[u8], asset: AssetId, delta: i128, mctx: &MintCtx) -> Ctx {
     Ctx {
         fields: vec![
-            Val::Bytes(tx.sighash.clone()),
+            Val::Bytes(sighash.to_vec()),
             Val::Int(delta),
             Val::Int(mctx.height),
             Val::Int(mctx.prior(&asset)),
@@ -179,6 +182,16 @@ pub fn validate_tx_with_mint(
     gas_limit: u64,
 ) -> Result<u64, MintTxError> {
     let mut gas = gas_limit;
+
+    // (0) F2: the same structural ceilings `validate_tx` enforces, so the unmetered
+    // pre-gas work below (the sighash hash and the per-asset conservation scan) is
+    // bounded on this path too — the shared choke point `check_tx_resource_limits`
+    // documents. Fail-closed, before any gas is spent.
+    crate::check_tx_resource_limits(tx).map_err(MintTxError::Tx)?;
+
+    // The signed message for BOTH policies and input validators: recomputed from the
+    // tx's own effect, never the spender-declared label (mirror of `validate_tx`).
+    let sighash = bind_sighash(tx).map_err(MintTxError::Tx)?;
 
     // ── (1) Authorise every requested mint/burn by running its policy program. ──
     // The net signed delta per asset, keyed canonically for determinism.
@@ -220,7 +233,7 @@ pub fn validate_tx_with_mint(
 
         // Run the policy over the mint context. It sees the delta it is authorising
         // (field 1), the height (field 2), the prior supply (field 3) and the sighash.
-        let ctx = mint_ctx(tx, asset, delta, mctx);
+        let ctx = mint_ctx(tx, &sighash, asset, delta, mctx);
         match run(&req.policy, req.redeemer.clone(), &ctx, verifier, &mut gas) {
             Ok(true) => {}
             Ok(false) => return Err(MintTxError::PolicyRejected { asset }),
@@ -292,7 +305,7 @@ pub fn validate_tx_with_mint(
     // ── (3) Run every input's validator with the whole tx visible (mirror of
     // `validate_tx`'s step (2)+(3)), sharing the same gas budget as the policies. ──
     let spend_ctx = Ctx {
-        fields: vec![Val::Bytes(tx.sighash.clone())],
+        fields: vec![Val::Bytes(sighash.clone())],
         tx_outputs: tx.outputs.clone(),
         self_validator_hash: [0u8; 32],
         self_value: Value::new(), // spend() sets this per-input
@@ -440,7 +453,7 @@ mod tests {
             inputs: vec![],
             outputs: vec![out(asset_val(asset, 500))],
             fee: 0,
-            sighash: b"sh".to_vec(),
+            sighash: vec![],
         };
         let mints = vec![MintRequest {
             policy,
@@ -458,7 +471,6 @@ mod tests {
     fn mint_with_authorized_minter_signature_passes() {
         let minter_pk = b"minter-pubkey".to_vec();
         let sig = b"minter-sig".to_vec();
-        let sighash = b"the-sighash".to_vec();
 
         let policy = authorized_minter_policy(minter_pk.clone());
         let asset = policy_asset_id(&policy);
@@ -467,8 +479,11 @@ mod tests {
             inputs: vec![],
             outputs: vec![out(asset_val(asset, 42))],
             fee: 0,
-            sighash: sighash.clone(),
+            sighash: vec![],
         };
+        // The issuer signs the sighash the node computes over THIS tx's effect — the
+        // mint is bound to the outputs the freshly minted units land in.
+        let sighash = crate::tx_sighash(&tx).to_vec();
         let mints = vec![MintRequest {
             policy,
             redeemer: vec![Val::Bytes(sig.clone())],
@@ -478,9 +493,25 @@ mod tests {
             },
         }];
         let v = MockVerifier {
-            good: vec![(sighash, minter_pk, sig)],
+            good: vec![(sighash.clone(), minter_pk, sig)],
         };
         assert!(validate_tx_with_mint(&tx, &mints, &MintCtx::default(), &v, 50_000).is_ok());
+
+        // ...and it authorizes THAT tx only: re-point the minted units at a different
+        // recipient and the same signature no longer verifies, because the policy's
+        // message is recomputed from the tx's own outputs.
+        let mut diverted = tx.clone();
+        diverted.outputs = vec![ExtOutput {
+            value: asset_val(asset, 42),
+            validator_hash: [0xAB; 32], // a different recipient
+            datum: Val::Int(0),
+        }];
+        assert_ne!(crate::tx_sighash(&diverted).to_vec(), sighash);
+        assert_eq!(
+            validate_tx_with_mint(&diverted, &mints, &MintCtx::default(), &v, 50_000),
+            Err(MintTxError::PolicyRejected { asset }),
+            "a mint authorization must not be replayable onto different outputs"
+        );
     }
 
     #[test]
@@ -491,7 +522,7 @@ mod tests {
             inputs: vec![],
             outputs: vec![out(asset_val(asset, 42))],
             fee: 0,
-            sighash: b"sh".to_vec(),
+            sighash: vec![],
         };
         let mints = vec![MintRequest {
             policy,
@@ -626,7 +657,6 @@ mod tests {
         // Use an authorized-minter policy so the burn is explicitly authorised.
         let minter_pk = b"pk".to_vec();
         let sig = b"sig".to_vec();
-        let sighash = b"sh".to_vec();
         let policy = authorized_minter_policy(minter_pk.clone());
         let asset = policy_asset_id(&policy);
 
@@ -653,8 +683,9 @@ mod tests {
             }],
             outputs: vec![out(asset_val(asset, 900))],
             fee: 0,
-            sighash: sighash.clone(),
+            sighash: vec![],
         };
+        let sighash = crate::tx_sighash(&tx).to_vec();
         let mints = vec![MintRequest {
             policy,
             redeemer: vec![Val::Bytes(sig.clone())],
@@ -908,7 +939,7 @@ mod tests {
             inputs: vec![],
             outputs: vec![out(asset_val(asset, 500))],
             fee: 0,
-            sighash: b"sh".to_vec(),
+            sighash: vec![],
         };
         let mints = vec![MintRequest {
             policy,
@@ -1299,7 +1330,6 @@ mod tests {
         let policy_b = authorized_minter_policy(minter_pk.clone());
         let asset_b = policy_asset_id(&policy_b);
 
-        let sighash = b"combined-sighash".to_vec();
         let guard = vec![Op::PushInt(1)];
         let gvh = validator_hash(&guard);
 
@@ -1318,8 +1348,9 @@ mod tests {
             }],
             outputs: vec![out(out1), out(out2)],
             fee: 10,
-            sighash: sighash.clone(),
+            sighash: vec![],
         };
+        let sighash = crate::tx_sighash(&tx).to_vec();
 
         let mut prior = BTreeMap::new();
         prior.insert(asset_b, 1000i128); // plenty of headroom for the 50 burn

@@ -124,7 +124,9 @@ snapshot / allow-deny list) committed as a single 32-byte root that fits in one
    `Op::PushBytes`/`Op::CtxField`) for whichever key the transaction concerns (a
    transferring holder, a KYC id being checked against an allow-list, ...).
 3. Run `verify(&datum_root, &proof)` — or for allow/deny gating,
-   `gate_allows(gate, &datum_root, &proof)` — inside the validator to decide whether
+   `gate_allows(gate, &datum_root, id, &proof)`, where `id` is the identity the
+   transaction *authenticates* (the gate requires `proof.key == id`, so a member's
+   public proof cannot be relayed by someone else) — inside the validator to decide
    the transaction is legal, and require the transaction's output carry the *new*
    root (computed off-chain the same way, checked by the validator via `Op::Eq`
    against `TxOutDatum`) if the state changes.

@@ -7,7 +7,8 @@ use bloch_euvm::harness::{
     DEFAULT_GAS_CEILINGS, EUVM_ACTIVATION_HEIGHT,
 };
 use bloch_euvm::{
-    blch, validate_tx, validator_hash, ExtOutput, EuTx, EuTxInput, Op, SigVerifier, TxError, Val,
+    blch, tx_sighash, validate_tx, validator_hash, ExtOutput, EuTx, EuTxInput, Op, SigVerifier,
+    TxError, Val,
 };
 
 // ── verifiers ────────────────────────────────────────────────────────────────
@@ -78,21 +79,21 @@ fn finding_a_committed_bytes_do_not_bind_eutxo_state() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// FINDING B — sighash is taken verbatim from the tx and never bound to tx contents.
-// `validate_tx` sets ctx.fields[0] = tx.sighash directly. A signature that verifies
-// over a sighash S therefore authorizes ANY transaction that merely DECLARES
-// sighash == S, regardless of that tx's actual outputs. One valid signature can be
-// replayed into a different tx with different outputs. The reference model omits the
-// sighash-over-tx-contents computation the node must perform.
+// FINDING B (FIXED — regression) — the signature is bound to the transaction's
+// outputs. `EuTx::sighash` used to be taken verbatim into `ctx.fields[0]`, so a
+// signature valid over a sighash S authorized ANY transaction that merely DECLARED
+// sighash == S — one signature, arbitrarily different outputs. `validate_tx` now
+// seeds `fields[0]` with `tx_sighash(tx)`, recomputed from the tx's own inputs,
+// outputs and fee, and rejects a declared sighash that contradicts it. These tests
+// fail closed if that binding is ever removed.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn finding_b_signature_not_bound_to_tx_outputs() {
-    let msg = b"SIGHASH-S".to_vec(); // attacker declares this; unrelated to outputs
+fn finding_b_signature_is_bound_to_tx_outputs() {
     let pk = b"victim-pubkey".to_vec();
     let sig = b"victim-sig".to_vec();
 
-    // Validator: verify a signature over ctx.fields[0] (the declared sighash).
+    // Validator: verify a signature over ctx.fields[0] (the sighash the node computes).
     let prog = vec![
         Op::CtxField(0),
         Op::PushBytes(pk.clone()),
@@ -100,27 +101,77 @@ fn finding_b_signature_not_bound_to_tx_outputs() {
         Op::VerifySig,
     ];
     let vh = validator_hash(&prog);
-    let v = PqOnlyVerifier { good: (msg.clone(), pk.clone(), sig.clone()) };
 
+    // Same inputs, DIFFERENT output/fee split — two distinct transaction effects.
     let mk = |out_value: u64| EuTx {
         inputs: vec![EuTxInput {
             prev_output: ExtOutput { value: blch(100), validator_hash: vh, datum: Val::Int(0) },
             validator: prog.clone(),
             redeemer: vec![],
         }],
-        // Same sighash S declared, but the recipient/amount split differs per tx.
         outputs: vec![ExtOutput { value: blch(out_value), validator_hash: vh, datum: Val::Int(0) }],
         fee: 100 - out_value,
-        sighash: msg.clone(),
+        sighash: vec![], // undeclared: the verifier computes the canonical sighash
+    };
+    let tx_a = mk(90); // pays 10 fee, 90 to output
+    let tx_b = mk(0); // pays 100 fee, 0 to output — a completely different effect
+    assert_ne!(tx_a.outputs, tx_b.outputs);
+
+    // The signature the victim gave authorizes tx_a's effect, and only that effect.
+    let msg_a = tx_sighash(&tx_a).to_vec();
+    assert_ne!(msg_a, tx_sighash(&tx_b).to_vec(), "distinct effects ⇒ distinct sighashes");
+    let v = PqOnlyVerifier { good: (msg_a, pk.clone(), sig.clone()) };
+
+    assert!(validate_tx(&tx_a, &v, 10_000).is_ok(), "tx_a authorized");
+    assert_eq!(
+        validate_tx(&tx_b, &v, 10_000),
+        Err(TxError::ValidatorRejected(0)),
+        "the SAME signature must NOT authorize a different output/fee split"
+    );
+}
+
+#[test]
+fn finding_b_declared_sighash_label_cannot_override_the_computed_one() {
+    let pk = b"victim-pubkey".to_vec();
+    let sig = b"victim-sig".to_vec();
+    let prog = vec![
+        Op::CtxField(0),
+        Op::PushBytes(pk.clone()),
+        Op::PushBytes(sig.clone()),
+        Op::VerifySig,
+    ];
+    let vh = validator_hash(&prog);
+    let label = b"SIGHASH-S".to_vec(); // the attacker's chosen, contents-free label
+
+    let mk = |out_value: u64, declared: Vec<u8>| EuTx {
+        inputs: vec![EuTxInput {
+            prev_output: ExtOutput { value: blch(100), validator_hash: vh, datum: Val::Int(0) },
+            validator: prog.clone(),
+            redeemer: vec![],
+        }],
+        outputs: vec![ExtOutput { value: blch(out_value), validator_hash: vh, datum: Val::Int(0) }],
+        fee: 100 - out_value,
+        sighash: declared,
     };
 
-    // The SAME signature authorizes two DIFFERENT transactions (different fee/output
-    // split) because nothing binds the signed sighash to the tx it authorizes.
-    let tx_a = mk(90); // pays 10 fee, 90 to output
-    let tx_b = mk(0);  // pays 100 fee, 0 to output — a completely different effect
-    assert_ne!(tx_a.outputs, tx_b.outputs);
-    assert!(validate_tx(&tx_a, &v, 10_000).is_ok(), "tx_a authorized");
-    assert!(validate_tx(&tx_b, &v, 10_000).is_ok(), "tx_b authorized by the SAME sig — replay");
+    // A verifier that would accept a signature over the attacker's label.
+    let v = PqOnlyVerifier { good: (label.clone(), pk.clone(), sig.clone()) };
+
+    // Declaring the label is rejected outright — a tx may not carry a sighash that
+    // contradicts its own contents, so the shared-label replay cannot even be built.
+    for value in [90u64, 0] {
+        assert_eq!(
+            validate_tx(&mk(value, label.clone()), &v, 10_000),
+            Err(TxError::SighashMismatch),
+            "a spender-chosen sighash label must be rejected fail-closed"
+        );
+    }
+
+    // Declaring the CORRECT sighash is accepted and is exactly what the node computes.
+    let mut tx = mk(90, vec![]);
+    tx.sighash = tx_sighash(&tx).to_vec();
+    let v_ok = PqOnlyVerifier { good: (tx.sighash.clone(), pk, sig) };
+    assert!(validate_tx(&tx, &v_ok, 10_000).is_ok());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -133,7 +184,6 @@ fn finding_b_signature_not_bound_to_tx_outputs() {
 
 #[test]
 fn finding_c_ecdsa_only_validator_unspendable_under_pq_only_verifier() {
-    let msg = b"sighash".to_vec();
     let pk = b"btc-pubkey".to_vec();
     let sig = b"btc-sig".to_vec();
 
@@ -154,8 +204,10 @@ fn finding_c_ecdsa_only_validator_unspendable_under_pq_only_verifier() {
         }],
         outputs: vec![ExtOutput { value: blch(100), validator_hash: vh, datum: Val::Int(0) }],
         fee: 0,
-        sighash: msg.clone(),
+        sighash: vec![],
     };
+    // The "correct" ECDSA signature is over the sighash the node computes for this tx.
+    let msg = tx_sighash(&tx).to_vec();
 
     // A PQ-only verifier does not override verify_ecdsa -> default false -> the
     // validator returns 0 -> the spend is rejected though the sig is "correct".

@@ -29,9 +29,11 @@ use tokio::net::{TcpListener, TcpStream};
 
 use bloch_pool_proxy::downstream::DownstreamConn;
 use bloch_pool_proxy::extranonce::ExtranonceRegistry;
+use bloch_pool_proxy::jobstore::parse_notify_full;
 use bloch_pool_proxy::pplns::PplnsLedger;
 use bloch_pool_proxy::router::run_worker;
 use bloch_pool_proxy::types::{Metrics, ProxyConfig, WorkerId};
+use bloch_pool_proxy::validator::{difficulty_to_target, le_for_height, validate};
 
 // A `mining.notify` the mock node emits so the proxy has an active job to
 // forward downstream. The proxy is a TRANSPARENT forwarder now (the NODE
@@ -39,6 +41,10 @@ use bloch_pool_proxy::types::{Metrics, ProxyConfig, WorkerId};
 // the mock accepts whatever the proxy relays up. The job_id follows the node's
 // real `"{sid:x}-{height}-{ctr:x}"` convention.
 const NOTIFY_JOB_ID: &str = "1a-531000-8e";
+/// The share target the proxy announces downstream in these tests — the same
+/// value `test_cfg` pins vardiff to, and therefore the target the router's
+/// local verification grades a submit against before crediting PPLNS.
+const ANNOUNCED_DIFF: f64 = 1e-9;
 const NOTIFY_NTIME: &str = "5f5e1000";
 const NOTIFY_LINE: &str = "{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"1a-531000-8e\",\"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\",\"aabbccdd\",\"eeff\",[],\"20000000\",\"1d00ffff\",\"5f5e1000\",true]}";
 
@@ -171,6 +177,31 @@ async fn connected_downstream(
     (miner, down)
 }
 
+/// Mine a nonce that makes the submit a GENUINE solution at the difficulty the
+/// proxy announces ([`ANNOUNCED_DIFF`]), reconstructing the header exactly as
+/// the router's local verification does — same job, same extranonces, same
+/// version-roll, same per-job endianness gate.
+///
+/// The pump credits PPLNS on PROVEN work, so an end-to-end test that wants a
+/// credited share has to submit real work; a fabricated nonce is (correctly)
+/// relayed and counted but never credited.
+fn mined_nonce(en1: &str, en2: &str, rolled_version: u32) -> String {
+    let job = parse_notify_full(NOTIFY_LINE).expect("the mock notify must parse");
+    let le = le_for_height(job.height);
+    let target = difficulty_to_target(ANNOUNCED_DIFF);
+    for nonce in 0u32..8_000_000 {
+        let hex = format!("{nonce:08x}");
+        let out = validate(
+            &job, en1, en2, NOTIFY_NTIME, &hex, Some(rolled_version), &target, le,
+        )
+        .expect("well-formed submit fields");
+        if out.meets_worker {
+            return hex;
+        }
+    }
+    panic!("the announced target is ~2^-12 per hash; it must be hit in budget");
+}
+
 /// Continuously read and discard downstream bytes so the proxy's writes never
 /// block on a full socket buffer.
 fn spawn_drain(rd: tokio::net::tcp::OwnedReadHalf) -> tokio::task::JoinHandle<()> {
@@ -217,8 +248,11 @@ async fn end_to_end_forwards_versionrolled_submit_and_relays_node_accept() {
     // carries a 6th VERSION-ROLLING param ("1fffe000"); the proxy MUST forward
     // it upstream verbatim so the node reconstructs the header the ASIC hashed.
     let en2 = "00000000";
-    let nonce_hex = "deadbeef";
     let rolled_version = "1fffe000";
+    // A REAL solution at the announced target: PPLNS credit is proven work, so
+    // only a genuine share lands in the ledger (see the S-H4 test below).
+    let nonce_hex = mined_nonce("aaaaaaaa", en2, 0x1fff_e000);
+    let nonce_hex = nonce_hex.as_str();
 
     // Real subscribe → authorize sequence through the live pump.
     wr.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"itest/1.0\"]}\n")
@@ -292,6 +326,82 @@ async fn end_to_end_forwards_versionrolled_submit_and_relays_node_accept() {
         .expect("worker did not finish in time");
     assert!(joined.is_ok(), "worker task panicked on hostile input");
 
+    drain.abort();
+}
+
+/// REGRESSION (S-H4), end to end through the REAL pump.
+///
+/// The proxy suppresses the node's `mining.set_difficulty` and announces its
+/// own vardiff, so the node grades a submit against ITS target — here a mock
+/// that answers `true` to anything — while the proxy announced something else
+/// entirely. The router used to credit PPLNS with the ANNOUNCED difficulty on
+/// the node's `true`, so a share that did no work at that level still took a
+/// full share of the payout window.
+///
+/// A fabricated nonce must therefore now be: forwarded upstream, relayed back
+/// to the miner, counted as accepted in the metrics AND in the ledger's
+/// lifetime totals — and credited NOTHING in the payout window.
+#[tokio::test]
+async fn node_accepted_but_unachieved_share_earns_no_pplns_credit() {
+    let (node_addr, _node, node_submits) = spawn_mock_node("bbbbbbbb").await;
+    let cfg = test_cfg(node_addr);
+    let metrics = Arc::new(Metrics::new());
+    let registry = Arc::new(ExtranonceRegistry::new());
+    let ledger = Arc::new(PplnsLedger::new(&cfg));
+
+    let (miner, down) = connected_downstream(cfg.clone(), metrics.clone(), WorkerId(1)).await;
+    let worker = tokio::spawn(run_worker(
+        down,
+        cfg.clone(),
+        metrics.clone(),
+        registry.clone(),
+        ledger.clone(),
+    ));
+
+    let (rd, mut wr) = miner.into_split();
+    let drain = spawn_drain(rd);
+
+    wr.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"itest/1.0\"]}\n")
+        .await
+        .unwrap();
+    wr.write_all(b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"bloch1qtest\",\"x\"]}\n")
+        .await
+        .unwrap();
+    wr.flush().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // A nonce that is NOT a solution at the announced target — the shape of
+    // every share from a miner (or interposed rig proxy) ignoring our
+    // `set_difficulty` while the node happily accepts at its own.
+    let bogus = format!(
+        "{{\"id\":3,\"method\":\"mining.submit\",\"params\":[\"w\",\"{NOTIFY_JOB_ID}\",\"00000000\",\"{NOTIFY_NTIME}\",\"ffffffff\"]}}\n"
+    );
+    wr.write_all(bogus.as_bytes()).await.unwrap();
+    wr.flush().await.unwrap();
+
+    // Wait for the node's verdict to be correlated and folded in.
+    let mut seen = false;
+    for _ in 0..250 {
+        if ledger.totals().accepted >= 1 {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(seen, "the node's accept must still reach the lifetime totals");
+    assert_eq!(metrics.snapshot().shares_accepted, 1, "still counted as accepted");
+    assert_eq!(node_submits.lock().unwrap().len(), 1, "still forwarded to the node");
+
+    // THE fix: no proven work at the announced difficulty ⇒ no payout weight.
+    assert!(
+        ledger.credit().is_empty(),
+        "an announced-but-not-achieved share must earn no PPLNS credit: {:?}",
+        ledger.credit(),
+    );
+    assert_eq!(ledger.snapshot().window_len, 0, "and no window entry");
+
+    drop(wr);
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker).await;
     drain.abort();
 }
 

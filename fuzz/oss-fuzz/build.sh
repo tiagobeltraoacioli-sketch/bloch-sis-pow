@@ -15,7 +15,10 @@ cargo fuzz build -O --debug-assertions
 
 FUZZ_TARGET_OUTPUT_DIR="$SRC/bloch/fuzz/target/x86_64-unknown-linux-gnu/release"
 
-# Keep this list in sync with the [[bin]] entries in fuzz/Cargo.toml.
+# Keep this list in sync with the [[bin]] entries in fuzz/Cargo.toml. Drift here
+# is silent — a target missing from this list is built and then never shipped to
+# $OUT, so OSS-Fuzz simply never runs it. `oss_fuzz_ships_every_declared_target`
+# in crates/bloch-pos-node/tests/fuzz_harness_resolves.rs is what goes red.
 TARGETS=(
   block_parse
   tx_parse
@@ -28,6 +31,10 @@ TARGETS=(
   pow_decode
   ghostdag_order
   sig_verify
+  pos_envelope_decode
+  pos_attestation_decode
+  pos_header_decode
+  pos_carryover_snapshot
 )
 
 for target in "${TARGETS[@]}"; do

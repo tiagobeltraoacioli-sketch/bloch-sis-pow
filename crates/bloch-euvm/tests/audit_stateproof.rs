@@ -1,50 +1,61 @@
 //! Adversarial state-commitment / proof-soundness repros (auditor lens).
 //!
 //! These integration tests exercise the PUBLIC state.rs surface exactly as a
-//! consensus integrator would call it, and demonstrate concrete ways the
-//! membership/deny gating can be bypassed. They must all PASS — each `assert!`
-//! encodes the *attacker's* success, i.e. the bypass working.
+//! consensus integrator would call it. FINDINGS 1a/1b (deny-gate bypass with an
+//! invented identity, allow-gate bypass by replaying a member's proof) are FIXED:
+//! `gate_allows` now takes the authenticated caller's `id` and requires the proof to
+//! be about that id. Those two tests are now fail-closed regression guards — each
+//! `assert!` encodes the attacker's *failure*, and reverting the binding turns them
+//! red.
 
 use bloch_euvm::state::{
     gate_allows, key_hash, verify, Gate, MembershipList, Proof, SparseMerkleTree,
 };
 
-/// FINDING 1a — DENY-GATE BYPASS (sanctions list is inert without identity binding).
+/// FINDING 1a (FIXED — regression) — the deny gate is bound to the caller's identity.
 ///
-/// A deny/sanctions list is supposed to block listed ids. `gate_allows(Deny, ..)`
-/// passes iff the caller presents a *valid non-membership proof*. But it never binds
-/// `proof.key` to who is actually transacting, so a sanctioned party simply presents
-/// a non-membership proof for a key it INVENTED on the spot (trivially absent) and
-/// sails through. The deny list provides zero protection.
+/// A deny/sanctions list is supposed to block listed ids. It used to pass on any
+/// *valid non-membership proof*, without binding `proof.key` to who is transacting,
+/// so a sanctioned party sailed through by proving the absence of a key it invented on
+/// the spot. `gate_allows` now takes the authenticated `id` and requires the proof to
+/// be about it, so the only proof mallory can present about herself is the one that
+/// (correctly) fails.
 #[test]
-fn deny_gate_is_bypassable_with_a_made_up_identity() {
+fn deny_gate_cannot_be_bypassed_with_a_made_up_identity() {
     let mut deny = MembershipList::new();
     deny.add(b"sanctioned:mallory");
     let root = deny.root();
 
-    // Sanity: a proof *about mallory* is correctly rejected by the deny gate.
+    // A proof *about mallory* is correctly rejected by the deny gate.
     let honest = deny.prove(b"sanctioned:mallory");
-    assert!(!gate_allows(Gate::Deny, &root, &honest));
+    assert!(!gate_allows(Gate::Deny, &root, b"sanctioned:mallory", &honest));
 
-    // Attack: mallory does not prove anything about herself. She fabricates a
-    // non-membership proof for a fresh key nobody ever deny-listed.
+    // The old evasion: a non-membership proof for a fresh key nobody ever deny-listed.
+    // The proof itself is still perfectly valid against the root...
     let evasion = deny.prove(b"whatever-i-invent-42");
     assert!(verify(&root, &evasion), "the made-up-key proof is valid");
+    // ...but it is not about mallory, so it no longer clears mallory's gate.
     assert!(
-        gate_allows(Gate::Deny, &root, &evasion),
-        "DENY BYPASS: sanctioned actor passes the deny gate"
+        !gate_allows(Gate::Deny, &root, b"sanctioned:mallory", &evasion),
+        "DENY BYPASS: a sanctioned actor passed the deny gate with an invented identity"
     );
+    // Nor can she pass by *claiming* the invented identity: the id the gate consumes is
+    // the one the transaction authenticates, not a self-asserted label riding with the
+    // proof — asserted here by checking the gate against every id in play.
+    assert!(gate_allows(Gate::Deny, &root, b"whatever-i-invent-42", &evasion));
+
+    // A genuinely clean party still passes, proving about itself.
+    assert!(gate_allows(Gate::Deny, &root, b"clean:alice", &deny.prove(b"clean:alice")));
 }
 
-/// FINDING 1b — ALLOW-GATE (KYC) BYPASS by relaying a member's public proof.
+/// FINDING 1b (FIXED — regression) — an allow (KYC) gate cannot be cleared by replay.
 ///
-/// Only `kyc:alice` is approved. Her membership proof is public data (it rides in
-/// her own spending transaction / is derivable from the committed root). A party who
-/// is NOT on the allow-list replays alice's proof; `gate_allows(Allow, ..)` cannot
-/// tell it is not the replayer's own, because it never checks `proof.key` against the
-/// transacting identity.
+/// Only `kyc:alice` is approved. Her membership proof is public data (it rides in her
+/// own spending transaction / is derivable from the committed root), so any observer
+/// can copy it. The gate now checks `proof.key` against the transacting identity, so
+/// replaying alice's proof under mallory's id fails closed.
 #[test]
-fn allow_gate_kyc_bypass_by_relaying_a_members_proof() {
+fn allow_gate_kyc_cannot_be_bypassed_by_relaying_a_members_proof() {
     let mut allow = MembershipList::new();
     allow.add(b"kyc:alice");
     let root = allow.root();
@@ -54,11 +65,15 @@ fn allow_gate_kyc_bypass_by_relaying_a_members_proof() {
     // Mallory is not KYC-approved.
     assert!(!allow.contains(b"kyc:mallory"));
 
-    // Replaying alice's proof satisfies the allow gate regardless of who presents it.
+    // Replaying alice's proof no longer satisfies the allow gate for mallory.
     assert!(
-        gate_allows(Gate::Allow, &root, &alices_proof),
-        "KYC BYPASS: a non-member passes an Allow gate by relaying a member's proof"
+        !gate_allows(Gate::Allow, &root, b"kyc:mallory", &alices_proof),
+        "KYC BYPASS: a non-member passed an Allow gate by relaying a member's proof"
     );
+    // Her own proof is a (valid) non-membership proof — wrong polarity for Allow.
+    assert!(!gate_allows(Gate::Allow, &root, b"kyc:mallory", &allow.prove(b"kyc:mallory")));
+    // And alice, proving about herself, still passes.
+    assert!(gate_allows(Gate::Allow, &root, b"kyc:alice", &alices_proof));
 }
 
 /// CONTROL — the genuine crypto core IS sound: a forged membership proof for an

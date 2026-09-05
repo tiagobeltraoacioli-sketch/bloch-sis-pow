@@ -113,8 +113,13 @@ async fn session_loop(
         let _ = wr.shutdown().await;
     });
 
+    // read_bounded_line enforces MAX_LINE_BYTES *during* accumulation, so a
+    // slowloris peer that never sends '\n' cannot grow the buffer without
+    // bound. `read_line` could not: it returns only on '\n' or EOF, so the
+    // old `n > MAX_LINE_BYTES` check ran AFTER the whole line had already
+    // been collected — multi-GB of heap per session, for free.
     let mut reader = BufReader::with_capacity(MAX_LINE_BYTES + 256, rd);
-    let mut line = String::with_capacity(1024);
+    let mut line_buf: Vec<u8> = Vec::with_capacity(1024);
     let auth_deadline = Instant::now() + Duration::from_secs(AUTH_TIMEOUT_SECS);
 
     loop {
@@ -122,26 +127,84 @@ async fn session_loop(
             warn!("stratum: session {} auth timeout", session.id);
             break;
         }
-        line.clear();
+        line_buf.clear();
+        // Bound every read. An unauthorized peer gets only what is left of
+        // the auth window — otherwise a silent socket sits here for the full
+        // idle window before the deadline above is ever re-checked.
+        let read_timeout = if session.is_authorized() {
+            Duration::from_secs(IDLE_TIMEOUT_SECS)
+        } else {
+            auth_deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(IDLE_TIMEOUT_SECS))
+        };
         match tokio::time::timeout(
-            Duration::from_secs(IDLE_TIMEOUT_SECS),
-            reader.read_line(&mut line),
+            read_timeout,
+            read_bounded_line(&mut reader, &mut line_buf),
         ).await {
             Ok(Ok(0)) => break,                          // EOF
-            Ok(Ok(n)) if n > MAX_LINE_BYTES => break,    // protocol violation
             Ok(Ok(_)) => {
-                let resp = dispatch(&pool, &session, &line).await;
+                let line = match std::str::from_utf8(&line_buf) {
+                    Ok(l)  => l,
+                    Err(_) => break,                     // protocol violation
+                };
+                let resp = dispatch(&pool, &session, line).await;
                 if let Some(resp) = resp {
                     if !session.send_line(resp.to_line()) { break; }
                 }
+                // Reclaim a large (but in-bound) line so a long-lived
+                // session does not retain the capacity forever.
+                if line_buf.capacity() > MAX_LINE_BYTES {
+                    line_buf.shrink_to(1024);
+                }
             }
-            Ok(Err(_)) | Err(_) => break,                // read error / idle
+            // Over-long line, read error, or idle timeout: all close.
+            Ok(Err(_)) | Err(_) => break,
         }
     }
 
     *session.out.lock() = None; // closes the channel; writer drains + exits
     let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
     Ok(())
+}
+
+/// Read one newline-terminated line, enforcing `MAX_LINE_BYTES` DURING
+/// accumulation. Mirrors the node's `stratum::session::read_bounded_line`.
+///
+/// Returns the number of bytes in `buf` (including the trailing `\n`), `0`
+/// on clean EOF, or `InvalidData` the instant an unterminated line crosses
+/// the cap — before those bytes can be handed on or grown further.
+async fn read_bounded_line<R>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::Result<usize>
+where
+    R: AsyncBufReadExt + Unpin,
+{
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(0); // EOF
+        }
+        if let Some(i) = available.iter().position(|&b| b == b'\n') {
+            buf.extend_from_slice(&available[..=i]);
+            let consumed = i + 1;
+            reader.consume(consumed);
+            if buf.len() > MAX_LINE_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "stratum line exceeds MAX_LINE_BYTES",
+                ));
+            }
+            return Ok(buf.len());
+        }
+        let n = available.len();
+        buf.extend_from_slice(available);
+        reader.consume(n);
+        if buf.len() > MAX_LINE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stratum line exceeds MAX_LINE_BYTES",
+            ));
+        }
+    }
 }
 
 async fn dispatch(
@@ -507,5 +570,91 @@ mod tests {
         let mut other = AUTH_DOMAIN.to_vec();
         other.extend_from_slice(&[8u8; 32]);
         assert!(!bloch_crypto::crypto::verify(&pk, &other, &sig));
+    }
+
+    // ── Framing: an over-long line must die DURING accumulation ──────────
+    //
+    // `Endless` is a slowloris in one struct: an infinite stream of 'x'
+    // with no '\n', ever. Against `read_line` this test never returns (the
+    // process ODs on memory instead); against `read_bounded_line` it must
+    // error after having pulled at most one BufReader refill past the cap.
+
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    struct Endless(Arc<AtomicUsize>);
+
+    impl AsyncRead for Endless {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let n = buf.remaining().min(4096);
+            buf.put_slice(&vec![b'x'; n]);
+            self.0.fetch_add(n, Ordering::Relaxed);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A never-terminated line is rejected before the bytes are collected:
+    /// the error arrives, and the total served stays within one refill of
+    /// MAX_LINE_BYTES instead of growing without bound.
+    #[tokio::test]
+    async fn unterminated_line_is_refused_during_accumulation() {
+        let served = Arc::new(AtomicUsize::new(0));
+        let mut reader =
+            BufReader::with_capacity(MAX_LINE_BYTES + 256, Endless(served.clone()));
+        let mut buf = Vec::with_capacity(1024);
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_bounded_line(&mut reader, &mut buf),
+        )
+        .await
+        .expect("bounded reader must return, not spin forever")
+        .expect_err("an unterminated over-long line is a protocol violation");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let n = served.load(Ordering::Relaxed);
+        assert!(
+            n <= 2 * (MAX_LINE_BYTES + 256),
+            "read {n} bytes for a {MAX_LINE_BYTES}-byte cap — not bounded"
+        );
+        assert!(buf.len() <= MAX_LINE_BYTES + 256 + 4096, "buffer grew past the cap");
+    }
+
+    /// A terminated line longer than the cap is refused too — the newline
+    /// arriving does not buy the peer an unbounded line.
+    #[tokio::test]
+    async fn over_long_terminated_line_is_refused() {
+        let mut src = vec![b'y'; MAX_LINE_BYTES + 1];
+        src.push(b'\n');
+        let mut reader = BufReader::with_capacity(MAX_LINE_BYTES + 256, &src[..]);
+        let mut buf = Vec::new();
+        let err = read_bounded_line(&mut reader, &mut buf).await.expect_err("over cap");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// And the happy path still frames normally: one line at a time, the
+    /// trailing newline kept (dispatch trims it via serde/`parse`).
+    #[tokio::test]
+    async fn in_bound_lines_frame_one_at_a_time() {
+        let src: &[u8] = b"{\"id\":1}\n{\"id\":2}\n";
+        let mut reader = BufReader::new(src);
+        let mut buf = Vec::new();
+
+        let n = read_bounded_line(&mut reader, &mut buf).await.expect("first line");
+        assert_eq!(n, 9);
+        assert_eq!(&buf, b"{\"id\":1}\n");
+
+        buf.clear();
+        read_bounded_line(&mut reader, &mut buf).await.expect("second line");
+        assert_eq!(&buf, b"{\"id\":2}\n");
+
+        buf.clear();
+        assert_eq!(read_bounded_line(&mut reader, &mut buf).await.expect("eof"), 0);
     }
 }

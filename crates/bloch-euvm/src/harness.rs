@@ -39,7 +39,7 @@
 //! Unaudited reference. Not consensus-wired.
 
 use crate::state::SparseMerkleTree;
-use crate::{fee_burn, validate_block, EuTx, ExtOutput, SigVerifier, TxError, Val};
+use crate::{encode_output, fee_burn, validate_block, EuTx, SigVerifier, TxError};
 
 /// **The activation height for the eUTXO VM feature.**
 ///
@@ -162,36 +162,6 @@ pub enum AcceptError {
 #[inline]
 pub fn legacy_committed_bytes(block: &BlockModel) -> Vec<u8> {
     block.legacy_bytes.clone()
-}
-
-/// Canonical, deterministic byte encoding of a single eUTXO output — the leaf value
-/// committed into the state tree. Length-prefixed and fully typed so that two outputs
-/// differing in *any* field (a single asset amount, the validator hash, or the datum)
-/// encode to distinct bytes and therefore distinct leaves. No float/clock/HashMap: the
-/// multi-asset `Value` is a `BTreeMap` (canonical key order) and `datum` is tagged.
-fn encode_output(o: &ExtOutput) -> Vec<u8> {
-    let mut b = Vec::new();
-    // Multi-asset value bundle: count, then each (asset_id, amount) in BTreeMap order.
-    b.extend_from_slice(&(o.value.len() as u64).to_le_bytes());
-    for (asset, amt) in &o.value {
-        b.extend_from_slice(asset);
-        b.extend_from_slice(&amt.to_le_bytes());
-    }
-    // The guarding validator's hash.
-    b.extend_from_slice(&o.validator_hash);
-    // The datum, domain-tagged so Int/Bytes spaces never collide.
-    match &o.datum {
-        Val::Int(n) => {
-            b.push(0x00);
-            b.extend_from_slice(&n.to_le_bytes());
-        }
-        Val::Bytes(bytes) => {
-            b.push(0x01);
-            b.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-            b.extend_from_slice(bytes);
-        }
-    }
-    b
 }
 
 /// **The resulting-eUTXO-state root (F1).** Commit the block's token movements as a

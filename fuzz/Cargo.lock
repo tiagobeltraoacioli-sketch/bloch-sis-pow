@@ -649,9 +649,19 @@ version = "0.0.0"
 dependencies = [
  "bincode",
  "bloch",
+ "bloch-crypto",
+ "bloch-pos-committee",
  "bloch-sis-pow",
  "coherence-core",
  "libfuzzer-sys",
+ "sha3",
+]
+
+[[package]]
+name = "bloch-pos-committee"
+version = "0.1.0"
+dependencies = [
+ "sha3",
 ]
 
 [[package]]

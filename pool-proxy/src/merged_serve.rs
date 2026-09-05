@@ -13,14 +13,15 @@
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
+use crate::codec::LineReader;
 use crate::merged_engine::{create_round, decide_submit, submit_win, MergedConfig, SubmitAction};
 use crate::mergedmining::{classify_merged_share, merged_job_to_notify, MergedJob};
 use crate::rpc::{AuxBlockInfo, RpcClient};
 use crate::btc_rpc::BtcRpcClient;
-use crate::types::PoolError;
+use crate::types::{Line, PoolError};
 use crate::validator::difficulty_to_target;
 
 /// Extranonce1 assigned to a merged worker (4 bytes), plus a 4-byte extranonce2
@@ -28,6 +29,11 @@ use crate::validator::difficulty_to_target;
 /// coinbase reserved (see [`crate::merged_engine::btc_coinbase_parts`]).
 const EN1_LEN: usize = 4;
 const EN2_SIZE: usize = 4;
+
+/// Idle ceiling for one merged worker. Jobs are PUSHED to the miner, so a
+/// socket that says nothing for this long is not waiting on us — it is a
+/// parked fd. Matches the pool's `IDLE_TIMEOUT_SECS`.
+const READ_IDLE_SECS: u64 = 600;
 
 /// What a handled Stratum line asks the socket loop to do.
 #[derive(Debug)]
@@ -196,13 +202,16 @@ pub async fn serve_merged(
 ) -> Result<(), PoolError> {
     let _ = stream.set_nodelay(true);
     let (rd, mut wr) = stream.into_split();
-    let mut reader = BufReader::new(rd);
+    // Bounded framing: `LineReader` enforces MAX_LINE_BYTES DURING
+    // accumulation, so a worker that never sends '\n' cannot make us buffer
+    // gigabytes (plain `read_line` returns only on '\n' or EOF).
+    let mut reader = LineReader::new(BufReader::new(rd));
     let mut worker = MergedWorker::new((worker_id as u32).to_be_bytes(), share_diff);
     let mut round_ctr: u64 = 0;
     let mut ticker = tokio::time::interval(refresh);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    let mut line = String::new();
+    let mut idle_deadline = tokio::time::Instant::now() + Duration::from_secs(READ_IDLE_SECS);
     loop {
         tokio::select! {
             // Refresh the round (new BTC template + Bloch candidate) and re-notify.
@@ -213,9 +222,14 @@ pub async fn serve_merged(
                     }
                 }
             }
-            r = reader.read_line(&mut line) => {
-                let n = r.map_err(PoolError::Io)?;
-                if n == 0 { break; } // peer closed
+            // `next_line` is cancel-safe: a partial line survives losing
+            // this select arm to the ticker above.
+            r = read_worker_line(&mut reader, idle_deadline) => {
+                let line = match r? {
+                    Some(l) => l,
+                    None    => break, // peer closed
+                };
+                idle_deadline = tokio::time::Instant::now() + Duration::from_secs(READ_IDLE_SECS);
                 match worker.handle_line(&line) {
                     WorkerReaction::Send(lines) => {
                         for l in &lines { send_line(&mut wr, l).await?; }
@@ -236,11 +250,28 @@ pub async fn serve_merged(
                     }
                     WorkerReaction::None => {}
                 }
-                line.clear();
             }
         }
     }
     Ok(())
+}
+
+/// One bounded, deadline-capped read from a merged worker.
+///
+/// Both failure modes close the session, and both close it EARLY: an
+/// over-long line is refused by [`LineReader`] the moment it crosses
+/// `MAX_LINE_BYTES` — before the bytes are ever collected into a line —
+/// and a peer silent past `deadline` is dropped instead of parked forever.
+async fn read_worker_line<R: AsyncBufRead + Unpin>(
+    reader: &mut LineReader<R>,
+    deadline: tokio::time::Instant,
+) -> Result<Option<Line>, PoolError> {
+    match tokio::time::timeout_at(deadline, reader.next_line()).await {
+        Ok(r)  => r,
+        Err(_) => Err(PoolError::Protocol(format!(
+            "merged worker idle for {READ_IDLE_SECS}s"
+        ))),
+    }
 }
 
 /// Pull a fresh round and serve set_difficulty + notify(clean).
@@ -351,5 +382,91 @@ mod tests {
             r#"{"id":9,"method":"mining.submit","params":["a","m1","00","66000000","00000000"]}"#,
         );
         assert!(matches!(r, WorkerReaction::Send(l) if l[0].contains("above target")));
+    }
+
+    // ── Framing: the socket loop's read is bounded and deadlined ─────────
+    //
+    // `Endless` is a slowloris in one struct: an infinite stream of 'x'
+    // with no '\n', ever. The old loop (`BufReader::read_line`) would grow
+    // a String until the box died; `read_worker_line` must error after at
+    // most one refill past MAX_LINE_BYTES.
+
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    struct Endless(Arc<AtomicUsize>);
+
+    impl AsyncRead for Endless {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let n = buf.remaining().min(4096);
+            buf.put_slice(&vec![b'x'; n]);
+            self.0.fetch_add(n, Ordering::Relaxed);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Never-terminated line: refused before the bytes are collected, with
+    /// the total pulled off the socket bounded by the cap.
+    #[tokio::test]
+    async fn worker_line_is_refused_during_accumulation() {
+        let served = Arc::new(AtomicUsize::new(0));
+        let mut reader = LineReader::new(BufReader::new(Endless(served.clone())));
+        let far = tokio::time::Instant::now() + Duration::from_secs(600);
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_worker_line(&mut reader, far),
+        )
+        .await
+        .expect("bounded read must return, not spin forever")
+        .expect_err("an unterminated over-long line is a protocol violation");
+        assert!(matches!(err, crate::types::PoolError::Protocol(_)), "got {err:?}");
+
+        let n = served.load(Ordering::Relaxed);
+        assert!(
+            n <= 2 * (crate::types::MAX_LINE_BYTES + 8192),
+            "read {n} bytes for a {}-byte cap — not bounded",
+            crate::types::MAX_LINE_BYTES
+        );
+    }
+
+    /// A silent (never-readable) peer is dropped at the deadline instead of
+    /// holding the fd forever.
+    #[tokio::test]
+    async fn silent_worker_hits_the_read_deadline() {
+        struct Silent;
+        impl AsyncRead for Silent {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Pending
+            }
+        }
+        let mut reader = LineReader::new(BufReader::new(Silent));
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        let err = read_worker_line(&mut reader, deadline)
+            .await
+            .expect_err("a silent peer must time out");
+        assert!(matches!(err, crate::types::PoolError::Protocol(_)), "got {err:?}");
+    }
+
+    /// The happy path still frames one stratum line at a time, EOF included.
+    #[tokio::test]
+    async fn worker_lines_frame_one_at_a_time() {
+        let src: &[u8] = b"{\"id\":1}\n{\"id\":2}\n";
+        let mut reader = LineReader::new(BufReader::new(src));
+        let far = tokio::time::Instant::now() + Duration::from_secs(600);
+        assert_eq!(read_worker_line(&mut reader, far).await.unwrap().as_deref(), Some("{\"id\":1}\n"));
+        assert_eq!(read_worker_line(&mut reader, far).await.unwrap().as_deref(), Some("{\"id\":2}\n"));
+        assert_eq!(read_worker_line(&mut reader, far).await.unwrap(), None);
     }
 }
