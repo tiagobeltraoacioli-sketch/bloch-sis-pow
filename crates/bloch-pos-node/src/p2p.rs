@@ -107,9 +107,20 @@
 //!   peer has no more. That is what makes "ask from genesis" work rather than
 //!   merely be accepted. [`MAX_PAGES_WITHOUT_PROGRESS`] bounds the loop so a
 //!   peer feeding blocks the engine will not apply cannot page forever.
-//! - The serving side reads its **whole** block log, so a request for
+//! - The serving side serves its **whole** block log, so a request for
 //!   `after_slot = 0` is answered from the beginning of the chain. There is no
 //!   "recent blocks only" fast path, and there is no datadir-donation path.
+//!   It does not *read* the whole log to do it: `store::Store::blocks_after`
+//!   finds the window through the `blocks.idx` slot → offset index, so the
+//!   work of answering is proportional to the page served and not to the
+//!   length of the chain.
+//! - **What one peer may make this node do is bounded on the serving side
+//!   too**, by [`SYNC_ANSWERS_PER_SEC`]/[`SYNC_ANSWER_BURST`] and
+//!   [`MAX_INFLIGHT_SYNC_PER_PEER`]. Capping the SIZE of an answer
+//!   ([`MAX_SYNC_BLOCKS`], [`MAX_SYNC_FRAME`]) never bounded their NUMBER:
+//!   before those limits a peer could ask again as fast as it liked, on up to
+//!   [`MAX_CONCURRENT_SYNC_STREAMS`] substreams, and each eight-byte question
+//!   started a blocking-pool task against the log.
 //!
 //! **The trust boundary, stated plainly (do not bury this).** Downloading and
 //! validating every block proves the chain is *internally* valid; it does not
@@ -175,7 +186,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender as EngineSender;
 use std::sync::Arc;
@@ -293,6 +304,164 @@ const SYNC_FANOUT: usize = 3;
 /// this node will pull before it stops asking that peer. Any real progress
 /// resets the counter, so a genuine multi-year backfill is unaffected.
 const MAX_PAGES_WITHOUT_PROGRESS: u32 = 64;
+
+// ── What one peer may make this node do (the serving side) ──────────────────
+//
+// [`MAX_PAGES_WITHOUT_PROGRESS`] bounds what this node will PULL. Nothing
+// bounded what it would SERVE. `MAX_SYNC_BLOCKS` and `MAX_SYNC_FRAME` cap one
+// answer's size, which is not the same thing: a peer could ask again
+// immediately, as often as it liked, on up to
+// [`MAX_CONCURRENT_SYNC_STREAMS`] substreams per connection, and every one of
+// those questions was answered off the block log by a `spawn_blocking` task
+// this node started on its behalf. Eight bytes to ask; a disk read and a
+// blocking-pool slot to answer. That asymmetry is the amplifier.
+//
+// Two limits close it, and they close different halves:
+//
+//   * the **token bucket** bounds the RATE — how many questions a peer may
+//     have answered per second, averaged, with a burst for the honest case;
+//   * the **in-flight cap** bounds the CONCURRENCY — how many answers this
+//     node is building for one peer at one instant, which is what actually
+//     consumes blocking-pool threads and memory.
+//
+// A refused request is answered with an empty page rather than dropped. The
+// channel exists either way; an empty answer costs no disk and tells a
+// well-behaved peer to come back on its sync timer, while dropping it would
+// leave the asker waiting out a protocol timeout for no diagnostic gain.
+
+/// Sustained `get-blocks` answers per peer, per second.
+///
+/// One answer is up to [`MAX_SYNC_BLOCKS`] blocks, so this is a sustained
+/// 1,024 blocks/s to a single peer — comfortably above what a genuine cold
+/// sync can apply, which is the number that matters: the limit must not be
+/// reachable by an honest catch-up.
+pub const SYNC_ANSWERS_PER_SEC: f64 = 8.0;
+
+/// Burst of answers a peer may take before the sustained rate binds. Covers
+/// the reconnect flurry (a peer redialling opens a walk per peer) without
+/// letting a burst be a strategy.
+pub const SYNC_ANSWER_BURST: f64 = 32.0;
+
+/// Answers being built for ONE peer at one instant. Two, not one: a peer may
+/// legitimately have its reconnect request and its page-chase request open at
+/// the same moment. Anything past that is not a sync pattern.
+pub const MAX_INFLIGHT_SYNC_PER_PEER: usize = 2;
+
+const _: () = assert!(
+    MAX_INFLIGHT_SYNC_PER_PEER < MAX_CONCURRENT_SYNC_STREAMS,
+    "the in-flight cap must bite before the substream cap, or it does nothing"
+);
+
+/// Why a `get-blocks` was refused. Carried so the log (and the tests) can
+/// tell the two limits apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncRefusal {
+    /// Over [`SYNC_ANSWERS_PER_SEC`] once the burst is spent.
+    RateLimited,
+    /// Already [`MAX_INFLIGHT_SYNC_PER_PEER`] answers being built.
+    TooManyInFlight,
+}
+
+#[derive(Debug)]
+struct PeerSync {
+    tokens: f64,
+    last: Instant,
+    inflight: usize,
+}
+
+/// Proof that one `get-blocks` from one peer was **admitted**, and the only
+/// key to the block log on the serving side.
+///
+/// [`SyncLimiter::begin`] is the only thing that mints one and it has no other
+/// constructor, while [`read_sync_page`] — the single place the serving path
+/// reads the log — takes one by reference. A future edit that answers a
+/// request without going through admission therefore does not compile, which
+/// is the property a test alone could not hold: the previous round of this
+/// fix tested the limiter in isolation and left the wiring to reviewers'
+/// eyes.
+///
+/// It is also the accounting token. Exactly one permit exists per occupied
+/// in-flight slot, it is moved into the blocking task and handed back to the
+/// swarm loop with the answer, and [`SyncLimiter::release`] consumes it — so a
+/// slot cannot be released twice, and a refused request (which holds no
+/// permit) cannot release one at all.
+#[derive(Debug)]
+#[must_use = "dropping a permit without SyncLimiter::release leaks the peer's in-flight slot"]
+pub struct SyncPermit {
+    peer: PeerId,
+}
+
+/// Per-peer admission for `get-blocks`: a token bucket and an in-flight cap.
+///
+/// Time is a parameter, not a call to `Instant::now()` inside, so the refill
+/// arithmetic is testable without sleeping.
+#[derive(Debug, Default)]
+pub struct SyncLimiter {
+    peers: HashMap<PeerId, PeerSync>,
+}
+
+impl SyncLimiter {
+    /// Admit one request, or say why not. The [`SyncPermit`] returned on `Ok`
+    /// holds the peer's in-flight slot until it is handed to
+    /// [`SyncLimiter::release`].
+    pub fn begin(&mut self, peer: PeerId, now: Instant) -> Result<SyncPermit, SyncRefusal> {
+        let e = self.peers.entry(peer).or_insert(PeerSync {
+            tokens: SYNC_ANSWER_BURST,
+            last: now,
+            inflight: 0,
+        });
+        // Refill first: `saturating_duration_since` because a caller may hand
+        // in a `now` that is not after `last` (it never does in the swarm
+        // loop, but a panic here would be a remote kill switch).
+        let dt = now.saturating_duration_since(e.last).as_secs_f64();
+        e.last = now;
+        e.tokens = (e.tokens + dt * SYNC_ANSWERS_PER_SEC).min(SYNC_ANSWER_BURST);
+        // The in-flight cap is checked BEFORE a token is spent: a peer that is
+        // simply being served slowly should not also lose its budget.
+        if e.inflight >= MAX_INFLIGHT_SYNC_PER_PEER {
+            return Err(SyncRefusal::TooManyInFlight);
+        }
+        if e.tokens < 1.0 {
+            return Err(SyncRefusal::RateLimited);
+        }
+        e.tokens -= 1.0;
+        e.inflight += 1;
+        Ok(SyncPermit { peer })
+    }
+
+    /// One answer finished (or failed): give the slot back.
+    ///
+    /// Takes the permit **by value** on purpose. The first cut of this fix
+    /// released by `PeerId` from the response channel, which every answer
+    /// travels down — including the empty one sent to a REFUSED peer. A peer
+    /// that flooded `get-blocks` therefore had a slot freed per refusal it
+    /// provoked, so the in-flight cap it had just tripped stopped binding:
+    /// the defence paid the attacker. Only a permit can be released now, and
+    /// a refusal never gets one.
+    pub fn release(&mut self, permit: SyncPermit) {
+        if let Some(e) = self.peers.get_mut(&permit.peer) {
+            e.inflight = e.inflight.saturating_sub(1);
+        }
+    }
+
+    /// Peer gone. Dropping the record refunds its burst, which is why it is
+    /// only done when the last connection closes — a peer cannot reset its
+    /// own bucket without paying for a full reconnect.
+    pub fn forget(&mut self, peer: &PeerId) {
+        if let Some(e) = self.peers.get(peer) {
+            if e.inflight > 0 {
+                return; // an answer is still being built; keep the slot honest
+            }
+        }
+        self.peers.remove(peer);
+    }
+
+    /// Peers currently tracked. Bounded by the connected set because
+    /// [`SyncLimiter::forget`] runs on the last disconnect.
+    pub fn tracked(&self) -> usize {
+        self.peers.len()
+    }
+}
 
 /// How often unconnected configured peers are re-dialled.
 const REDIAL_INTERVAL: Duration = Duration::from_secs(10);
@@ -847,6 +1016,9 @@ struct Loop {
     /// dials fail with EADDRINUSE against the connection that already exists,
     /// which reads in the log exactly like a peer that cannot be reached.
     dialed: HashMap<Multiaddr, PeerId>,
+    /// Per-peer admission for the `get-blocks` requests this node ANSWERS.
+    /// See [`SyncLimiter`].
+    sync_limiter: SyncLimiter,
     topics: Topics,
     /// Distinct peers with at least one connection up right now, shared with
     /// [`Handle::peer_count`] so the RPC can read it without touching the
@@ -906,6 +1078,7 @@ async fn run_swarm(
         pages_since_progress: 0,
         head_at_last_page: 0,
         dialed: HashMap::new(),
+        sync_limiter: SyncLimiter::default(),
         topics: Topics {
             blocks: IdentTopic::new(TOPIC_BLOCKS),
             attestations: IdentTopic::new(TOPIC_ATTESTATIONS),
@@ -930,6 +1103,7 @@ async fn run_swarm(
     // here to be written to the substream — the swarm loop must never sit in
     // a file read while blocks and attestations wait behind it.
     let (resp_tx, mut resp_rx) = tokio::sync::mpsc::unbounded_channel::<(
+        Option<SyncPermit>,
         request_response::ResponseChannel<SyncResponse>,
         SyncResponse,
     )>();
@@ -950,7 +1124,15 @@ async fn run_swarm(
                     None => return, // engine dropped the handle
                 }
             }
-            Some((channel, resp)) = resp_rx.recv() => {
+            Some((permit, channel, resp)) = resp_rx.recv() => {
+                // The answer is built: release the in-flight slot whether or
+                // not the write succeeds, or a peer that hangs up mid-answer
+                // would leak its own budget away. `None` is a REFUSED request
+                // riding the same channel — it never took a slot, so it must
+                // not give one back.
+                if let Some(permit) = permit {
+                    st.sync_limiter.release(permit);
+                }
                 let _ = swarm.behaviour_mut().sync.send_response(channel, resp);
             }
             _ = redial.tick() => {
@@ -1079,6 +1261,7 @@ fn handle_swarm_event(
     swarm: &mut Swarm,
     st: &mut Loop,
     resp_tx: &tokio::sync::mpsc::UnboundedSender<(
+        Option<SyncPermit>,
         request_response::ResponseChannel<SyncResponse>,
         SyncResponse,
     )>,
@@ -1142,6 +1325,7 @@ fn handle_swarm_event(
                     |n| Some(n.saturating_sub(1)),
                 );
                 st.peer_head.remove(&peer_id);
+                st.sync_limiter.forget(&peer_id);
                 // The cause is the whole diagnostic value of this line. A bare
                 // "disconnected" is what made the Genesis-3 yamux stream-cap
                 // failure take days to find: the transport was terminating
@@ -1190,7 +1374,7 @@ fn handle_swarm_event(
             ..
         })) => match message {
             request_response::Message::Request { request, channel, .. } => {
-                serve_sync(st, resp_tx.clone(), request, channel);
+                serve_sync(st, resp_tx.clone(), peer, request, channel);
             }
             request_response::Message::Response { response, .. } => {
                 let SyncResponse::Blocks { envelopes } = response;
@@ -1322,43 +1506,88 @@ fn on_gossip(
 /// Answer a `get-blocks` off the blocking pool, capped in both blocks and
 /// bytes, then hand the response back to the swarm loop to write.
 fn serve_sync(
-    st: &Loop,
+    st: &mut Loop,
     resp_tx: tokio::sync::mpsc::UnboundedSender<(
+        Option<SyncPermit>,
         request_response::ResponseChannel<SyncResponse>,
         SyncResponse,
     )>,
+    peer: PeerId,
     request: SyncRequest,
     channel: request_response::ResponseChannel<SyncResponse>,
 ) {
     let SyncRequest::GetBlocks { after_slot, limit } = request;
+    // Admission BEFORE the blocking task is spawned and before the log is
+    // touched: the whole point is that a refused request costs this node a
+    // hash lookup, not a disk read and a pool thread. The permit it mints is
+    // what `read_sync_page` demands, so this check cannot be edited away
+    // without the serving path ceasing to compile.
+    let permit = match st.sync_limiter.begin(peer, Instant::now()) {
+        Ok(permit) => permit,
+        Err(why) => {
+            let (permit, answer) = refusal_answer(peer, why);
+            let _ = resp_tx.send((permit, channel, answer));
+            return;
+        }
+    };
     let dir = st.data_dir.clone();
     let limit = (limit as usize).min(MAX_SYNC_BLOCKS);
     tokio::task::spawn_blocking(move || {
-        // `after_slot = 0` is the from-genesis case and is served like any
-        // other: the scan starts at the first logged block. There is no
-        // "recent only" path and no datadir donation.
-        let envelopes = match crate::store::Store::blocks_after(&dir, after_slot, limit) {
-            Ok(all) => {
-                let mut out = Vec::new();
-                let mut bytes = 0usize;
-                for b in all.into_iter() {
-                    // Byte cap as well as block cap: one answer must never
-                    // become a history dump. Leave slack for the framing.
-                    if bytes + b.len() + 4 > (MAX_SYNC_FRAME as usize) - 1024 {
-                        break;
-                    }
-                    bytes += b.len() + 4;
-                    out.push(b);
-                }
-                out
-            }
-            Err(e) => {
-                eprintln!("p2p: serving get-blocks failed: {e}");
-                Vec::new()
-            }
-        };
-        let _ = resp_tx.send((channel, SyncResponse::Blocks { envelopes }));
+        let envelopes = read_sync_page(&dir, &permit, after_slot, limit);
+        let _ = resp_tx.send((Some(permit), channel, SyncResponse::Blocks { envelopes }));
     });
+}
+
+/// What a REFUSED `get-blocks` is answered with: an empty page and **no
+/// permit**.
+///
+/// The `None` is the whole point and is why this is a function rather than two
+/// inline lines. Refusals ride the same response channel as real answers, and
+/// the swarm loop releases an in-flight slot for whatever comes back down it —
+/// so a refusal that carried a releasable token would hand the flooder a slot
+/// per refusal it provoked, and the in-flight cap it had just tripped would
+/// stop binding. Pinned by `refused_requests_do_not_free_in_flight_slots`.
+fn refusal_answer(peer: PeerId, why: SyncRefusal) -> (Option<SyncPermit>, SyncResponse) {
+    eprintln!("p2p: refusing get-blocks from {peer}: {why:?}");
+    (None, SyncResponse::Blocks { envelopes: Vec::new() })
+}
+
+/// Read one answer off the block log: the whole of the serving side's contact
+/// with storage, and the reason [`SyncPermit`] exists.
+///
+/// `after_slot = 0` is the from-genesis case and is served like any other:
+/// there is no "recent only" path and no datadir donation. The work is
+/// proportional to the page — `Store::blocks_after` finds the window through
+/// the `blocks.idx` slot → offset index rather than walking the log to it —
+/// so a request that selects nothing (`after_slot = u64::MAX`, the amplifier)
+/// opens the log and reads no frames at all.
+fn read_sync_page(
+    dir: &Path,
+    permit: &SyncPermit,
+    after_slot: u64,
+    limit: usize,
+) -> Vec<Vec<u8>> {
+    let _ = permit; // held for the whole read; see `SyncPermit`
+    match crate::store::Store::blocks_after(dir, after_slot, limit) {
+        Ok(all) => {
+            let mut out = Vec::new();
+            let mut bytes = 0usize;
+            for b in all.into_iter() {
+                // Byte cap as well as block cap: one answer must never become
+                // a history dump. Leave slack for the framing.
+                if bytes + b.len() + 4 > (MAX_SYNC_FRAME as usize) - 1024 {
+                    break;
+                }
+                bytes += b.len() + 4;
+                out.push(b);
+            }
+            out
+        }
+        Err(e) => {
+            eprintln!("p2p: serving get-blocks failed: {e}");
+            Vec::new()
+        }
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -1408,6 +1637,235 @@ mod tests {
                 "P4 disabled on {topic:?}: a Reject would cost the peer nothing"
             );
         }
+    }
+
+    /// **The serving-side bound for H5.** One peer must not be able to make
+    /// this node answer `get-blocks` as fast as it can ask.
+    ///
+    /// Asserted against injected time rather than a sleep, so the refill
+    /// arithmetic itself is under test and the test does not take a second to
+    /// run. Both limits are asserted separately, because they bound different
+    /// things and a single one would let the other regress silently: the
+    /// in-flight cap bounds concurrent blocking-pool work, the bucket bounds
+    /// the sustained rate.
+    #[test]
+    fn sync_limiter_bounds_in_flight_and_rate() {
+        let mut lim = SyncLimiter::default();
+        let peer = PeerId::random();
+        let t0 = Instant::now();
+
+        // Concurrency: the cap is reached with answers still open, and one
+        // finishing frees exactly one slot.
+        let mut open = Vec::new();
+        for i in 0..MAX_INFLIGHT_SYNC_PER_PEER {
+            match lim.begin(peer, t0) {
+                Ok(permit) => open.push(permit),
+                Err(why) => panic!("in-flight answer {i} refused: {why:?}"),
+            }
+        }
+        assert_eq!(
+            lim.begin(peer, t0).err(),
+            Some(SyncRefusal::TooManyInFlight),
+            "a peer opened more concurrent answers than MAX_INFLIGHT_SYNC_PER_PEER"
+        );
+        lim.release(open.pop().expect("a permit is open"));
+        let regained = lim.begin(peer, t0).expect("finishing an answer freed no slot");
+        open.push(regained);
+        for permit in open.drain(..) {
+            lim.release(permit);
+        }
+
+        // Rate: the burst is finite, and it is the burst.
+        // Bounded, not `while let`: a limiter with its bucket disarmed would
+        // otherwise spin here forever instead of failing.
+        let mut answered = MAX_INFLIGHT_SYNC_PER_PEER + 1; // spent above
+        while answered < 10_000 {
+            match lim.begin(peer, t0) {
+                Ok(permit) => {
+                    lim.release(permit);
+                    answered += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        assert_eq!(
+            lim.begin(peer, t0).err(),
+            Some(SyncRefusal::RateLimited),
+            "the bucket refused for the wrong reason"
+        );
+        assert_eq!(
+            answered as f64, SYNC_ANSWER_BURST,
+            "a peer took {answered} answers with no time passing; the burst is \
+             {SYNC_ANSWER_BURST}"
+        );
+
+        // And it refills at the stated rate, not faster.
+        let later = t0 + Duration::from_secs(1);
+        let mut refilled = 0usize;
+        while refilled < 10_000 {
+            match lim.begin(peer, later) {
+                Ok(permit) => {
+                    lim.release(permit);
+                    refilled += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        assert_eq!(
+            refilled as f64, SYNC_ANSWERS_PER_SEC,
+            "one second bought {refilled} answers, not SYNC_ANSWERS_PER_SEC"
+        );
+
+        // The limit is PER PEER: one peer spending its budget must not be
+        // able to stop this node serving anybody else, which would turn the
+        // defence into the denial of service it exists to prevent.
+        let honest = PeerId::random();
+        let permit = lim.begin(honest, later).expect("one greedy peer starved another");
+        lim.release(permit);
+    }
+
+    /// The limiter's own memory is bounded by the connected set: a peer is
+    /// forgotten when its last connection closes, but not while an answer is
+    /// still being built for it (that would refund its budget mid-flight).
+    #[test]
+    fn sync_limiter_forgets_disconnected_peers() {
+        let mut lim = SyncLimiter::default();
+        let peer = PeerId::random();
+        let now = Instant::now();
+        let permit = lim.begin(peer, now).expect("first request");
+        assert_eq!(lim.tracked(), 1);
+        lim.forget(&peer);
+        assert_eq!(lim.tracked(), 1, "forgot a peer with an answer still in flight");
+        lim.release(permit);
+        lim.forget(&peer);
+        assert_eq!(lim.tracked(), 0, "a disconnected peer's bucket is never released");
+    }
+
+    /// **THE end-to-end regression test for H5**, over the serving path a
+    /// hostile peer actually drives: admission, then the log.
+    ///
+    /// `GetBlocks { after_slot: u64::MAX }` is eight bytes on the wire and
+    /// selects nothing. In a loop, against a node with a chain, it used to buy
+    /// one full walk of the block log per request — on up to
+    /// [`MAX_CONCURRENT_SYNC_STREAMS`] substreams, each one a `spawn_blocking`
+    /// task — because the size caps on an ANSWER never bounded the NUMBER of
+    /// answers, and the scan started at byte zero every time.
+    ///
+    /// Two independent claims, and both are counted rather than timed (a
+    /// timing on a shared box cannot separate "we stopped scanning" from "the
+    /// box was quieter"):
+    ///
+    /// 1. **The flood is bounded.** 1,000 requests at one instant get
+    ///    [`SYNC_ANSWER_BURST`] answers, not 1,000. The other 968 never reach
+    ///    [`read_sync_page`] — which is not a matter of discipline: the permit
+    ///    it takes has no constructor but [`SyncLimiter::begin`].
+    /// 2. **Even an admitted one is not an amplifier.** Across the whole
+    ///    flood, the frames whose header the store parsed is ZERO: the index
+    ///    answers "nothing is past the tip" without opening the log.
+    ///
+    /// It cannot pass vacuously: the same store, asked an honest question,
+    /// still serves a full page.
+    #[test]
+    fn a_hostile_get_blocks_flood_is_bounded_and_reads_no_frames() {
+        let dir = tmpdir("hostile-flood");
+        let mut store = crate::store::Store::open(&dir, &[9u8; 32]).expect("store");
+        for slot in 1..=256u64 {
+            store.append(&envelope(slot)).expect("append");
+        }
+
+        let mut lim = SyncLimiter::default();
+        let hostile = PeerId::random();
+        let t0 = Instant::now();
+        let before = crate::store::sync_frames_scanned();
+        let mut answered = 0usize;
+        let mut refused = 0usize;
+        for _ in 0..1_000 {
+            // Exactly what `serve_sync` does, minus the libp2p response
+            // channel (which cannot be constructed outside the swarm).
+            match lim.begin(hostile, t0) {
+                Ok(permit) => {
+                    let page = read_sync_page(&dir, &permit, u64::MAX, MAX_SYNC_BLOCKS);
+                    assert!(page.is_empty(), "nothing is past u64::MAX");
+                    lim.release(permit);
+                    answered += 1;
+                }
+                Err(_) => refused += 1,
+            }
+        }
+        let scanned = crate::store::sync_frames_scanned() - before;
+
+        assert_eq!(
+            answered as f64, SYNC_ANSWER_BURST,
+            "a peer got {answered} answers out of 1,000 requests at one instant;              the bucket allows {SYNC_ANSWER_BURST}"
+        );
+        assert_eq!(refused, 1_000 - answered, "every other request must be refused, not queued");
+        assert_eq!(
+            scanned, 0,
+            "answering {answered} tip-requests parsed {scanned} block headers; with the              slot index it must parse none"
+        );
+
+        // Not vacuous: the same code, asked for real blocks, serves them.
+        let permit = lim.begin(PeerId::random(), t0).expect("an honest peer is admitted");
+        let page = read_sync_page(&dir, &permit, 0, MAX_SYNC_BLOCKS);
+        lim.release(permit);
+        assert_eq!(page.len(), MAX_SYNC_BLOCKS, "a from-genesis page still comes back full");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REFUSED request must not hand back an in-flight slot it never took.
+    ///
+    /// This is the hole the first cut of the fix left open, and it is the
+    /// reason [`SyncLimiter::release`] consumes a permit instead of taking a
+    /// `PeerId`. Refusals travel down the same response channel as answers, so
+    /// releasing by peer id there meant a peer that had just tripped the
+    /// in-flight cap freed a slot per refusal it provoked — the flood paid for
+    /// itself and the cap stopped binding. The loop below mirrors the swarm
+    /// loop's drain of that channel exactly.
+    #[test]
+    fn refused_requests_do_not_free_in_flight_slots() {
+        let mut lim = SyncLimiter::default();
+        let hostile = PeerId::random();
+        let t0 = Instant::now();
+
+        // Slow answers still being built: the cap is full.
+        let mut in_flight = Vec::new();
+        for _ in 0..MAX_INFLIGHT_SYNC_PER_PEER {
+            in_flight.push(lim.begin(hostile, t0).expect("under the cap"));
+        }
+
+        // The flood. Each refusal queues an empty answer, permit-less, on the
+        // same channel the real answers come back on.
+        let mut queued: Vec<Option<SyncPermit>> = Vec::new();
+        for _ in 0..64 {
+            match lim.begin(hostile, t0) {
+                Ok(_) => panic!("admitted a request over the in-flight cap"),
+                Err(why) => {
+                    assert_eq!(why, SyncRefusal::TooManyInFlight);
+                    let (permit, answer) = refusal_answer(hostile, why);
+                    let SyncResponse::Blocks { envelopes } = answer;
+                    assert!(envelopes.is_empty(), "a refusal must cost no blocks");
+                    queued.push(permit);
+                }
+            }
+        }
+        // The swarm loop drains it.
+        for permit in queued {
+            if let Some(permit) = permit {
+                lim.release(permit);
+            }
+        }
+
+        assert_eq!(
+            lim.begin(hostile, t0).err(),
+            Some(SyncRefusal::TooManyInFlight),
+            "64 refusals bought the flooder its in-flight slots back"
+        );
+        for permit in in_flight {
+            lim.release(permit);
+        }
+        let permit = lim.begin(hostile, t0).expect("the slots come back when the ANSWERS finish");
+        lim.release(permit);
     }
 
     /// The two bounds that killed connections when they drifted apart.
