@@ -171,7 +171,8 @@ on the live chain.
 
 | File:lines | What | Class | Justification |
 |---|---|---|---|
-| `crates/bloch-crypto/src/wallet/seed.rs:26,75` | Bloch seed = PBKDF2-HMAC-**SHA256** (2048 iters, 64B out; note: deviates from BIP-39's HMAC-SHA512) | **NON-CONSENSUS / KEY-COMPAT — FROZEN** | Every existing wallet's ML-DSA keygen seed comes from this. Migrating to SHAKE would silently re-derive different keys for the same mnemonic — loss of funds. Must stay SHA-2 for existing phrases forever; a v2 phrase format could use SHAKE, but that is a wallet-format decision, not part of the consensus migration. |
+| `crates/bloch-crypto/src/wallet/seed.rs` (`to_seed_bytes`) | Bloch seed = PBKDF2-HMAC-**SHA512** (2048 iters, 64B out) — BIP-39 conformant as of audit finding K-M3 | **NON-CONSENSUS / EXTERNAL-FIXED (BIP-39)** | This row previously read SHA-**256** and was classed FROZEN. That verdict was right about SHA-3 — the seed must never become SHAKE — but it froze a value that was never BIP-39 to begin with: HMAC-SHA256 here yields a different seed, and so a different ML-DSA key, than every other BIP-39 tool given the same phrase, `bloch-btc-wallet::derive_identity` included. The PRF is now SHA-512 and pinned to the official BIP-39 vectors, i.e. fixed by an external standard rather than by our own history. |
+| `crates/bloch-crypto/src/wallet/seed.rs` (`to_seed_bytes_legacy_sha256`) | the pre-K-M3 PBKDF2-HMAC-**SHA256** seed, deprecated | **KEY-COMPAT — FROZEN** | Retained solely so migration/sweep tooling can reach keys derived before the fix; pinned by test. Whether any wallet in the wild was derived that way, and whether the fix ships with a sweep, is **needs-founder-decision**. Never for new wallets. |
 
 ### 5.7 P2P transport & network — NON-CONSENSUS
 
