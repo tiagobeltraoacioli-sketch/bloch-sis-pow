@@ -223,6 +223,38 @@ pub const MAX_BASE_FEE_MILLISAT_PER_GAS: u128 = TOTAL_SUPPLY_SAT * MILLISAT_PER_
 /// Maximum base-fee change per block: ±1/8, Ethereum's constant.
 pub const BASE_FEE_CHANGE_DENOMINATOR: u128 = 8;
 
+/// Consensus ceiling on the **sender-set tip**, in millisatoshi per gas.
+///
+/// The tip is the one price term a transaction writes for itself, and before
+/// this constant existed nothing bounded it: the wire decodes a full `u128`
+/// and the transition multiplied it by the transaction's gas. Set equal to
+/// [`MAX_BASE_FEE_MILLISAT_PER_GAS`] — the price at which ONE gas costs the
+/// entire supply — for the same reason that ceiling exists: nothing economic
+/// happens anywhere near it, so the bound cannot refuse a transfer anyone
+/// would send, and with it in force the fee arithmetic's overflow headroom is
+/// a compile-time proof rather than a hope.
+///
+/// **This is not a flag day.** Every transfer the bound refuses was already
+/// impossible to include: at this price the cheapest transfer's fee is
+/// ~7.8 x 10^23 sat against a 10^19 sat total supply, so conservation
+/// (`sum(inputs) == sum(outputs) + fee`) could never hold — the old code
+/// answered `ValueNotConserved` where the new code answers `TipAboveCeiling`,
+/// and above the overflow threshold the old code did not answer at all, it
+/// panicked. No block that any node ever accepted changes verdict.
+pub const MAX_TIP_MILLISAT_PER_GAS: u128 = MAX_BASE_FEE_MILLISAT_PER_GAS;
+
+/// Ceiling on the intrinsic gas of ONE transaction: the whole block's cap.
+///
+/// A transaction owing more gas than a block may spend cannot appear in any
+/// valid block, so refusing it at the transaction — before it is priced —
+/// changes no verdict and bounds the pricing multiplication at its source.
+/// The per-block cap ([`BLOCK_GAS_LIMIT`], enforced on the summed body) is
+/// what it always was and is still reachable by a body of several
+/// individually-legal transactions; `the_two_block_caps_are_enforced` builds
+/// exactly that body so the block rule keeps being tested by something the
+/// transaction rule does not intercept.
+pub const MAX_TX_GAS: u64 = BLOCK_GAS_LIMIT;
+
 /// What the parent block actually used, for the controller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockUsage {
@@ -302,11 +334,40 @@ pub const fn fee_parts_sat(
     tip_millisat_per_gas: u128,
 ) -> (u128, u128) {
     (
-        ceil_div(gas_used as u128 * base_fee_millisat_per_gas, MILLISAT_PER_SAT),
-        ceil_div(gas_used as u128 * tip_millisat_per_gas, MILLISAT_PER_SAT),
+        part_sat(gas_used, base_fee_millisat_per_gas),
+        part_sat(gas_used, tip_millisat_per_gas),
     )
 }
 
+/// One fee part, in whole satoshis, **for any input this function can be
+/// handed** — including inputs no valid transaction has.
+///
+/// `saturating_mul`, not `*`, and it is not defensive style. The base fee is
+/// bounded by the controller and the compile-time assertions below, but the
+/// TIP is a number the SENDER writes into the transaction, decoded as a plain
+/// `u128` (`transition.rs`, `tip_millisat_per_gas: r.u128()?`). Until
+/// 2026-09-04 the product `gas as u128 * tip` was unchecked: a transfer
+/// carrying `tip = u128::MAX` overflowed here, and because consensus builds
+/// set `overflow-checks = true` (workspace `Cargo.toml`, mandatory since the
+/// bloch-euvm F3 audit) the overflow was a PANIC — taken by every node that
+/// applied the transaction, from one unauthenticated `submit-tx`. The bound
+/// now lives in consensus ([`MAX_TIP_MILLISAT_PER_GAS`], checked by
+/// `apply_transfer`/`apply_transfer_v2` BEFORE they price anything), so the
+/// saturation below is unreachable through the transition; it is here so that
+/// this module is total on its own terms and a future caller cannot
+/// reintroduce the crash by forgetting the bound.
+///
+/// Saturating rather than wrapping is the fail-closed direction on both
+/// counts: a saturated part is astronomically unpayable, so the conservation
+/// check refuses the transfer, whereas a wrapped product could price a
+/// gigantic tip at nearly zero.
+const fn part_sat(gas_used: u64, price_millisat_per_gas: u128) -> u128 {
+    ceil_div((gas_used as u128).saturating_mul(price_millisat_per_gas), MILLISAT_PER_SAT)
+}
+
+/// Total for every `n` because `d` is [`MILLISAT_PER_SAT`] = 1,000: `n / 1000`
+/// is at most `u128::MAX / 1000`, so the `+ 1` cannot overflow even at
+/// `n == u128::MAX` (the saturated case above).
 const fn ceil_div(n: u128, d: u128) -> u128 {
     n / d + if n % d != 0 { 1 } else { 0 }
 }
@@ -447,6 +508,23 @@ const _: () = assert!(
 const _: () = assert!(
     BLOCK_GAS_LIMIT as u128 <= u128::MAX / (MAX_BASE_FEE_MILLISAT_PER_GAS + 1),
     "gas x preco maximo estoura u128"
+);
+// (1b) the same proof for the SENDER-set half of the price. The assertion in
+//      (1) only ever covered the base fee; the tip was unbounded, which is
+//      what made `fee_parts_sat` panic. With `MAX_TIP_MILLISAT_PER_GAS` in
+//      force and gas bounded per transaction by `MAX_TX_GAS`, the tip product
+//      fits with the same headroom — the saturation in `part_sat` is
+//      unreachable from consensus, and this is the proof of it.
+const _: () = assert!(
+    MAX_TX_GAS as u128 <= u128::MAX / (MAX_TIP_MILLISAT_PER_GAS + 1),
+    "gas x gorjeta maxima estoura u128"
+);
+// (1c) and both parts SUMMED (what `apply_transfer` checks conservation
+//      against, and what the block accumulates) still fit.
+const _: () = assert!(
+    MAX_TX_GAS as u128 * MAX_TIP_MILLISAT_PER_GAS
+        <= u128::MAX - MAX_TX_GAS as u128 * MAX_BASE_FEE_MILLISAT_PER_GAS,
+    "base + gorjeta somadas estouram u128"
 );
 // (2) controller cross-multiplication: price x (used - target) x 1 fits,
 //     because used <= 2*target on either axis and base <= MAX price.
@@ -781,6 +859,88 @@ mod tests {
         let tipped = charge(TxClass::Eutxo { inputs: 1 }, 512, MIN_BASE_FEE_MILLISAT_PER_GAS, 100);
         assert_eq!(tipped.base_fee_sat, a.base_fee_sat);
         assert_eq!(tipped.priority_fee_sat, ceil_div(a.gas as u128 * 100, MILLISAT_PER_SAT));
+    }
+
+    /// **The H1 fee-overflow property, over the whole representable grid.**
+    ///
+    /// `fee_parts_sat` is handed a sender-written price (`tip`), so it must be
+    /// TOTAL: no input of the types it accepts may panic it. Before
+    /// 2026-09-04 it multiplied `gas as u128 * tip` unchecked, and with
+    /// `overflow-checks = true` — mandatory in every consensus profile — a
+    /// transfer carrying `tip = u128::MAX` panicked every node that applied
+    /// it.
+    ///
+    /// Run against the pre-fix implementation (restore the bare `*`), this
+    /// test does not merely fail: it aborts on the very first saturating
+    /// pair. That is the mutation proof.
+    #[test]
+    fn fee_parts_are_total_over_every_representable_price() {
+        let gases = [0u64, 1, BLOCK_GAS_LIMIT, MAX_TX_GAS, u64::MAX];
+        let prices = [
+            0u128,
+            1,
+            MIN_BASE_FEE_MILLISAT_PER_GAS,
+            MAX_BASE_FEE_MILLISAT_PER_GAS,
+            MAX_TIP_MILLISAT_PER_GAS,
+            u128::MAX,
+        ];
+        for gas in gases {
+            for base in prices {
+                for tip in prices {
+                    // 1. Totality: the call returns, for every pair.
+                    let (base_sat, tip_sat) = fee_parts_sat(gas, base, tip);
+
+                    // 2. Inside the consensus bounds the answer is EXACT —
+                    //    saturation is unreachable from the transition, and
+                    //    this is what says so. `transition.rs` refuses any
+                    //    transfer outside these bounds before it prices it.
+                    let bounded = gas <= MAX_TX_GAS
+                        && base <= MAX_BASE_FEE_MILLISAT_PER_GAS
+                        && tip <= MAX_TIP_MILLISAT_PER_GAS;
+                    if bounded {
+                        let exact = |price: u128| {
+                            let p = (gas as u128)
+                                .checked_mul(price)
+                                .expect("bounded inputs must not overflow");
+                            ceil_div(p, MILLISAT_PER_SAT)
+                        };
+                        assert_eq!(base_sat, exact(base), "gas={gas} base={base}");
+                        assert_eq!(tip_sat, exact(tip), "gas={gas} tip={tip}");
+                        // 3. And the two parts still sum inside u128, which
+                        //    is what `apply_transfer` does before it checks
+                        //    conservation.
+                        assert!(base_sat.checked_add(tip_sat).is_some());
+                    }
+
+                    // 4. Outside them, saturation is the FAIL-CLOSED
+                    //    direction: an unpayable fee, never a cheap one. A
+                    //    wrapping multiply could have priced `u128::MAX` at
+                    //    nearly zero.
+                    if !bounded && gas > 0 && tip > MAX_TIP_MILLISAT_PER_GAS {
+                        assert!(
+                            tip_sat > TOTAL_SUPPLY_SAT,
+                            "a saturated tip must be unpayable, not cheap"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The ceiling is a bound on the sender's number, not on the market's:
+    /// exactly at [`MAX_TIP_MILLISAT_PER_GAS`] the arithmetic is still exact,
+    /// which is why `transition.rs` can refuse with `>` rather than `>=`.
+    #[test]
+    fn the_tip_ceiling_is_itself_priceable() {
+        let (_, tip_sat) =
+            fee_parts_sat(MAX_TX_GAS, MIN_BASE_FEE_MILLISAT_PER_GAS, MAX_TIP_MILLISAT_PER_GAS);
+        assert_eq!(
+            tip_sat,
+            ceil_div(MAX_TX_GAS as u128 * MAX_TIP_MILLISAT_PER_GAS, MILLISAT_PER_SAT)
+        );
+        // And it is far beyond payable, which is why bounding it refuses no
+        // transfer anyone could have sent.
+        assert!(tip_sat > TOTAL_SUPPLY_SAT);
     }
 
     #[test]

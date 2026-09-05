@@ -173,8 +173,31 @@ overflow assertions into proofs). Skipped slots produce no update — the base
 fee is a function of parent-committed values only (§5.5 of the migration
 spec: no clocks, no node-local state).
 
-The tip (priority fee, millisat/gas, user-set, unbounded) is the ordering
-market on top; it is what `split_fees_at` sees as `priority_fee`.
+The tip (priority fee, millisat/gas, user-set) is the ordering market on
+top; it is what `split_fees_at` sees as `priority_fee`.
+
+It is **bounded**, and until 2026-09-04 this paragraph said "unbounded",
+which was both the description and the defect (audit H1). The tip is the one
+price term the sender writes and it decodes as a plain `u128`; the transition
+multiplied it by the transaction's gas, and that product overflowed `u128` —
+a PANIC, not a wrap, because every consensus profile sets
+`overflow-checks = true`. One unauthenticated `submit-tx` killed every node
+that priced the transaction. Two ceilings now bound the multiplication, both
+checked in `apply_transfer`/`apply_transfer_v2` **before** anything is
+priced, and mirrored at the mempool door (`admissible`):
+
+- `MAX_TIP_MILLISAT_PER_GAS` = `MAX_BASE_FEE_MILLISAT_PER_GAS` — the price at
+  which one gas costs the whole supply. Non-economic by construction, exactly
+  like the base-fee ceiling it equals.
+- `MAX_TX_GAS` = `BLOCK_GAS_LIMIT` — one transaction may not owe more gas
+  than a whole block may spend. The per-block cap is unchanged and still
+  binds on the summed body.
+
+Neither is a flag day: above the tip ceiling the cheapest transfer owes
+~7.8 × 10²³ sat against a 10¹⁹ sat supply, so `ValueNotConserved` was
+already the verdict; above `MAX_TX_GAS` the per-block cap already refused the
+body. No block any node ever accepted changes verdict. `fee_parts_sat` also
+multiplies saturating now, so the module is total on its own terms.
 
 ### 4.3 Units and arithmetic
 
@@ -193,9 +216,11 @@ market on top; it is what `split_fees_at` sees as `priority_fee`.
 - **Overflow:** all fee arithmetic `u128`, per the crate rule (the products
   overflow, not the totals). Compile-time assertions in `fee_market.rs` pin:
   byte-cap gas ≤ gas cap; targets are exact halves; `BLOCK_GAS_LIMIT ×
-  MAX_BASE_FEE` and the controller's cross-multiplications fit `u128` with
-  the supply (`TOTAL_SUPPLY_SAT`, 54.21% of `u64::MAX`) as the anchor; the
-  floor ≥ the change denominator.
+  MAX_BASE_FEE`, `MAX_TX_GAS × MAX_TIP`, their SUM, and the controller's
+  cross-multiplications fit `u128` with the supply (`TOTAL_SUPPLY_SAT`,
+  54.21% of `u64::MAX`) as the anchor; the floor ≥ the change denominator.
+  The tip assertions are what §4.2's two ceilings buy: before them the
+  headroom proof covered only the half of the price the protocol sets.
 
 ### 4.4 Where the base fee lives — committed state, not the header
 

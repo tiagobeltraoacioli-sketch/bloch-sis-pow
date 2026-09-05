@@ -434,6 +434,30 @@ pub enum TransferReject {
     /// the cap advisory. Declaring more than you use is allowed — you simply
     /// pay for it.
     UnderdeclaredSize,
+    /// `tip_millisat_per_gas` is above
+    /// [`crate::fee_market::MAX_TIP_MILLISAT_PER_GAS`].
+    ///
+    /// The tip is the only price term the SENDER writes, and the wire decodes
+    /// a full `u128`. Unbounded, it was multiplied by the transaction's gas
+    /// while pricing — and that product overflowed `u128`, which under the
+    /// mandatory `overflow-checks = true` of a consensus build is a panic on
+    /// every node that applies the transaction. Checked with the free
+    /// structural rules, before the unspent-set walk and long before the
+    /// signatures, so the crash costs an attacker not one lookup.
+    ///
+    /// Refuses nothing that was ever includable: at the ceiling the cheapest
+    /// transfer owes ~7.8 x 10^23 sat against a 10^19 sat supply, so such a
+    /// transfer failed `ValueNotConserved` before it failed anything else.
+    TipAboveCeiling,
+    /// The transaction's intrinsic gas exceeds
+    /// [`crate::fee_market::MAX_TX_GAS`] — one transaction owing more gas
+    /// than an entire block may spend.
+    ///
+    /// The per-block cap already made such a body invalid; this refuses the
+    /// transaction itself, before it is priced, so that the gas factor of
+    /// every fee multiplication is bounded at the point the multiplication is
+    /// made rather than by a check that runs after it.
+    TxGasCeilingExceeded,
     /// The same outpoint appears twice in one transfer: a double spend that
     /// would otherwise pass the per-input existence check on its first
     /// occurrence and be silently deduplicated by the set.

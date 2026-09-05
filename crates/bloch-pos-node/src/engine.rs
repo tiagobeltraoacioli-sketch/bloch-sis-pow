@@ -79,6 +79,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bloch_pos_committee::attestation::{Attestation, AttestationData};
 use bloch_pos_committee::beacon::{mix_in, RandaoChain};
+use bloch_pos_committee::fee_market;
 use bloch_pos_committee::forkchoice::{BlockTree, LatestMessage, Store as FcStore};
 use bloch_pos_committee::gossip::{AttestationPool, GossipDecision};
 use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, VERSION_G4};
@@ -3640,6 +3641,39 @@ fn forkchoice_store<'a>(
 /// running the transition, which needs a candidate header this path has no
 /// reason to build. What it catches is the class that has actually been
 /// exploited or is currently exploitable.
+/// The mempool's mirror of the two bounds `apply_transfer`/`apply_transfer_v2`
+/// put in front of the fee multiplication (`fee_market::MAX_TIP_MILLISAT_PER_GAS`
+/// and `fee_market::MAX_TX_GAS`).
+///
+/// Consensus is where these bounds LIVE — this is the door that stops the
+/// transaction propagating, and the distinction is the `admissible`
+/// deposit lesson written above: a rule that exists only here is a rule one
+/// patched producer lifts for the whole network. But a rule that exists only
+/// in consensus still lets an attacker fill every mempool on the network with
+/// transactions no block can carry, and this pair is free to check.
+///
+/// H1 (2026-09-04): the transfer these refuse used to reach `charge` and
+/// overflow `u128` there, which a consensus build turns into a panic. The
+/// mempool held it, gossip spread it, and every proposer that selected it
+/// died pricing its own block.
+fn price_bounds(
+    class: fee_market::TxClass,
+    tx_bytes: u64,
+    tip_millisat_per_gas: u128,
+) -> Result<(), &'static str> {
+    if tip_millisat_per_gas > fee_market::MAX_TIP_MILLISAT_PER_GAS {
+        return Err(
+            "transfer names a tip above the consensus ceiling — no block could carry it",
+        );
+    }
+    if fee_market::intrinsic_gas(class, tx_bytes) > fee_market::MAX_TX_GAS {
+        return Err(
+            "transfer declares more gas than a whole block may spend — no block could carry it",
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'static str> {
     match tx {
         // Staking messages are refused outright until bonding is funded from
@@ -3692,7 +3726,10 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
         // stopped at slot 69 with every node up and still attesting. Cost of
         // the attack: one unauthenticated request.
         PosTransaction::Transfer {
-            inputs, outputs, ..
+            inputs,
+            outputs,
+            tx_bytes,
+            tip_millisat_per_gas,
         } => {
             if inputs.is_empty() {
                 return Err("transfer has no inputs — it spends nothing and cannot apply");
@@ -3700,6 +3737,13 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
             if outputs.is_empty() {
                 return Err("transfer has no outputs — it pays no one and cannot apply");
             }
+            price_bounds(
+                fee_market::TxClass::Eutxo {
+                    inputs: inputs.len() as u32,
+                },
+                *tx_bytes,
+                *tip_millisat_per_gas,
+            )?;
             // THE SIGNATURE IS CHECKED HERE, BEFORE THE MEMPOOL, AND THIS IS WHY.
             //
             // The producer prices its own block with `ProbeVerifier`, whose
@@ -3754,7 +3798,8 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
             keys,
             inputs,
             outputs,
-            ..
+            tx_bytes,
+            tip_millisat_per_gas,
         } => {
             // The gate first, and pre-activation the refusal is today's,
             // byte for byte: before epoch 800 this arm's behaviour is the
@@ -3789,6 +3834,15 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
                     "deduplicated transfer carries no witness keys — nothing authorises it",
                 );
             }
+            // The two price bounds, on the V2 class term (one verification
+            // per TABLE entry) — mirroring `apply_transfer_v2`.
+            price_bounds(
+                fee_market::TxClass::Eutxo {
+                    inputs: keys.len() as u32,
+                },
+                *tx_bytes,
+                *tip_millisat_per_gas,
+            )?;
             // Stateless mirror of the table disciplines consensus enforces
             // and has mutation-proven (transition.rs:2043–2094 —
             // DuplicateWitnessKey, BadKeyIndex, WitnessKeyUnused). The one
@@ -4491,6 +4545,95 @@ mod admission_authorisation {
             )
             .is_ok(),
             "a V1 transfer must be admitted identically after the V2 flag day"
+        );
+    }
+
+    /// **H1, at the mempool door.** A transfer whose tip or declared gas is
+    /// outside the fee market's consensus bounds must not be admitted, must
+    /// not be gossiped, and must never reach a proposer that would price it.
+    ///
+    /// Pricing it is what used to happen: `charge` multiplied gas by the
+    /// sender's `u128` tip, the product overflowed, and `overflow-checks =
+    /// true` — mandatory in a consensus build — turned that into a panic.
+    /// The mempool relayed the transaction to every node first.
+    ///
+    /// Sabotage (2026-09-04): with `price_bounds` returning `Ok(())`, this
+    /// test fails on the first case. The real bound lives in consensus
+    /// (`transition::tests::an_attacker_chosen_tip_cannot_panic_the_transition`);
+    /// this is the door that stops the propagation.
+    #[test]
+    fn a_transfer_priced_outside_the_market_is_refused_before_the_mempool() {
+        // Signed FOR EACH price, never re-used: the tip and `tx_bytes` are
+        // both inside `spend_signing_root`, so a transfer carrying a stale
+        // signature would be refused for the wrong reason and this test would
+        // prove nothing.
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[9u8; 32])
+            .expect("hybrid keypair from a fixed seed");
+        let priced = |tx_bytes: u64, tip: u128| -> PosTransaction {
+            let mut tx = PosTransaction::Transfer {
+                inputs: vec![TransferInput {
+                    txid: [0x11u8; 32],
+                    vout: 0,
+                    pubkey: pk.clone(),
+                    signature: Vec::new(),
+                }],
+                outputs: vec![TransferOutput {
+                    value: 1_000,
+                    script_hash: [0x22u8; 32],
+                }],
+                tx_bytes,
+                tip_millisat_per_gas: tip,
+            };
+            let root = tx.spend_signing_root();
+            let sig = bloch_crypto::crypto::sign(&sk, &root).expect("sign the spend root");
+            if let PosTransaction::Transfer { inputs, .. } = &mut tx {
+                inputs[0].signature = sig;
+            }
+            tx
+        };
+
+        // The tip: the one price term the sender writes.
+        for tip in [
+            u128::MAX,
+            u128::MAX - 1,
+            fee_market::MAX_TIP_MILLISAT_PER_GAS + 1,
+        ] {
+            let err = admissible(&priced(0, tip), 0)
+                .expect_err("an unpriceable tip must not be admitted");
+            assert!(
+                err.contains("tip"),
+                "the refusal must name the bound that causes it, got: {err}"
+            );
+        }
+
+        // The gas: `tx_bytes` is a sender-declared u64 and `intrinsic_gas`
+        // saturates, so it is the other factor of the same product.
+        for bytes in [
+            fee_market::MAX_TX_GAS / fee_market::GAS_PER_BYTE + 1,
+            u64::MAX,
+        ] {
+            let err = admissible(&priced(bytes, 0), 0)
+                .expect_err("more gas than a block holds must not be admitted");
+            assert!(
+                err.contains("gas"),
+                "the refusal must name the bound that causes it, got: {err}"
+            );
+        }
+
+        // THE CONTROL, and the one that would matter most: an honestly priced
+        // transfer is untouched — including one at the largest payload any
+        // block can carry.
+        assert!(
+            admissible(&priced(0, 0), 0).is_ok(),
+            "a normally priced transfer must still reach the mempool"
+        );
+        assert!(
+            admissible(
+                &priced(bloch_pos_committee::fee_market::MAX_BLOCK_TX_BYTES_V2, 1_000),
+                0
+            )
+            .is_ok(),
+            "a block-sized, normally tipped transfer must still reach the mempool"
         );
     }
 

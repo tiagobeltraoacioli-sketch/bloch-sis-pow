@@ -2756,6 +2756,43 @@ impl CommittedState {
             return Err(TransferReject::UnderdeclaredSize);
         }
 
+        // The class term is the *actual* input count, not a number the
+        // transaction asserts: gas buys node CPU, and one hybrid verification
+        // per input is what this function is about to spend.
+        let class = fee_market::TxClass::Eutxo { inputs: inputs.len() as u32 };
+
+        // ── The price's two bounds, BEFORE anything is priced ───────────────
+        //
+        // Free arithmetic on numbers already in hand, placed with the
+        // structural rules for the reason the whole check order exists: the
+        // defect these close is a PANIC, and a panic that costs an attacker
+        // an unspent-set walk is still a panic on every node in the network.
+        //
+        // 1. The tip is the one price term the SENDER writes, decoded off the
+        //    wire as a plain `u128`. Multiplied by this transaction's gas it
+        //    overflowed `u128` — and a consensus build sets
+        //    `overflow-checks = true` (mandatory, workspace Cargo.toml), so
+        //    the overflow was a panic taken by every node that applied the
+        //    transaction, from one unauthenticated `submit-tx`.
+        // 2. The gas factor of that same multiplication is bounded here too:
+        //    `tx_bytes` is a u64 the sender declares and `intrinsic_gas`
+        //    saturates rather than wrapping, so without this a transaction
+        //    could carry `u64::MAX` gas into the pricing.
+        //
+        // NEITHER is a flag day, and neither needs one: every transaction
+        // they refuse was already unincludable — above the tip ceiling the
+        // fee exceeds the entire supply, so conservation could not hold, and
+        // above `MAX_TX_GAS` the per-block gas cap refused the body. The old
+        // code reached the same verdict later, by a different name, or not at
+        // all because it had already crashed. See
+        // `fee_market::MAX_TIP_MILLISAT_PER_GAS`.
+        if *tip_millisat_per_gas > fee_market::MAX_TIP_MILLISAT_PER_GAS {
+            return Err(TransferReject::TipAboveCeiling);
+        }
+        if fee_market::intrinsic_gas(class, *tx_bytes) > fee_market::MAX_TX_GAS {
+            return Err(TransferReject::TxGasCeilingExceeded);
+        }
+
         // ── The spend points, and the set ───────────────────────────────────
         //
         // Collected before anything is consumed, so the duplicate check sees
@@ -2782,15 +2819,12 @@ impl CommittedState {
 
         // ── The price, derived ──────────────────────────────────────────────
         //
-        // The class term is the *actual* input count, not a number the
-        // transaction asserts: gas buys node CPU, and one hybrid verification
-        // per input is what this function is about to spend.
-        let charge = fee_market::charge(
-            fee_market::TxClass::Eutxo { inputs: inputs.len() as u32 },
-            *tx_bytes,
-            base_fee_millisat_per_gas,
-            *tip_millisat_per_gas,
-        );
+        // `class` was fixed with the structural rules above, from the *actual*
+        // input count and not a number the transaction asserts: gas buys node
+        // CPU, and one hybrid verification per input is what this function is
+        // about to spend. Both of its factors are bounded there.
+        let charge =
+            fee_market::charge(class, *tx_bytes, base_fee_millisat_per_gas, *tip_millisat_per_gas);
 
         // ── Conservation ────────────────────────────────────────────────────
         //
@@ -2907,6 +2941,43 @@ impl CommittedState {
             return Err(TransferReject::UnderdeclaredSize);
         }
 
+        // The class term is the TABLE length — see the charge below. Fixed
+        // here because the gas ceiling is checked before anything is priced.
+        let class = fee_market::TxClass::Eutxo { inputs: keys.len() as u32 };
+
+        // ── The price's two bounds, BEFORE anything is priced ───────────────
+        //
+        // Free arithmetic on numbers already in hand, placed with the
+        // structural rules for the reason the whole check order exists: the
+        // defect these close is a PANIC, and a panic that costs an attacker
+        // an unspent-set walk is still a panic on every node in the network.
+        //
+        // 1. The tip is the one price term the SENDER writes, decoded off the
+        //    wire as a plain `u128`. Multiplied by this transaction's gas it
+        //    overflowed `u128` — and a consensus build sets
+        //    `overflow-checks = true` (mandatory, workspace Cargo.toml), so
+        //    the overflow was a panic taken by every node that applied the
+        //    transaction, from one unauthenticated `submit-tx`.
+        // 2. The gas factor of that same multiplication is bounded here too:
+        //    `tx_bytes` is a u64 the sender declares and `intrinsic_gas`
+        //    saturates rather than wrapping, so without this a transaction
+        //    could carry `u64::MAX` gas into the pricing.
+        //
+        // NEITHER is a flag day, and neither needs one: every transaction
+        // they refuse was already unincludable — above the tip ceiling the
+        // fee exceeds the entire supply, so conservation could not hold, and
+        // above `MAX_TX_GAS` the per-block gas cap refused the body. The old
+        // code reached the same verdict later, by a different name, or not at
+        // all because it had already crashed. See
+        // `fee_market::MAX_TIP_MILLISAT_PER_GAS`.
+        if *tip_millisat_per_gas > fee_market::MAX_TIP_MILLISAT_PER_GAS {
+            return Err(TransferReject::TipAboveCeiling);
+        }
+        if fee_market::intrinsic_gas(class, *tx_bytes) > fee_market::MAX_TX_GAS {
+            return Err(TransferReject::TxGasCeilingExceeded);
+        }
+
+
         // ── Table discipline: strictly ascending by pubkey bytes ────────────
         //
         // One pass replaces the order-free `BTreeSet` dedup this arm shipped
@@ -2992,16 +3063,14 @@ impl CommittedState {
 
         // ── The price, derived ──────────────────────────────────────────────
         //
-        // The class term is the TABLE length: gas buys node CPU, and one
-        // hybrid verification per table entry is what this function is about
-        // to spend — `keys.len()` verifications, not `inputs.len()`. Both
-        // counts are derived from the lists, never asserted.
-        let charge = fee_market::charge(
-            fee_market::TxClass::Eutxo { inputs: keys.len() as u32 },
-            *tx_bytes,
-            base_fee_millisat_per_gas,
-            *tip_millisat_per_gas,
-        );
+        // `class` was fixed with the structural rules above, and its term is
+        // the TABLE length: gas buys node CPU, and one hybrid verification per
+        // table entry is what this function is about to spend — `keys.len()`
+        // verifications, not `inputs.len()`. Both counts are derived from the
+        // lists, never asserted; both factors of the multiplication were
+        // bounded before it.
+        let charge =
+            fee_market::charge(class, *tx_bytes, base_fee_millisat_per_gas, *tip_millisat_per_gas);
 
         // ── Conservation ────────────────────────────────────────────────────
         //
@@ -7672,23 +7741,52 @@ mod tests {
             TransitionError::BlockByteLimitExceeded,
         );
 
-        // The gas cap: a declared size whose byte term alone exceeds the gas
-        // limit. Derived from the constants, so a change to either moves this
-        // with it.
+        // The gas cap: TWO transfers, each individually legal — each owes
+        // just over half the block's gas, which is under the per-transaction
+        // ceiling `fee_market::MAX_TX_GAS` — and together they exceed the
+        // block's. Derived from the constants, so a change to either moves
+        // this with it.
+        //
+        // It used to be ONE transfer declaring more than a whole block's gas.
+        // That body stopped reaching the block rule when `apply_transfer`
+        // grew the per-transaction gas ceiling (the H1 fee-overflow fix):
+        // the transaction is now refused before it is priced, so the single
+        // fat transfer proved the TRANSACTION rule and left the BLOCK rule
+        // untested. A cap only one test reaches is a cap one edit can delete
+        // silently.
         let c2 = coin(0x75);
-        let (t2, g2, mut chains2) = setup_funded(4, &[c2.clone()]);
-        let over_gas = fee_market::BLOCK_GAS_LIMIT / fee_market::GAS_PER_BYTE + 1;
-        let heavy = transfer_spending(
-            std::slice::from_ref(&c2),
-            &owner,
-            to,
-            over_gas,
-            0,
-            g2.next_base_fee(),
-        );
-        let env2 = probe_env(&g2, 1, std::slice::from_ref(&heavy), &mut chains2);
+        let c2b = coin(0x7B);
+        let (t2, g2, mut chains2) = setup_funded(4, &[c2.clone(), c2b.clone()]);
+        let half_over =
+            (fee_market::BLOCK_GAS_LIMIT / 2) / fee_market::GAS_PER_BYTE + 1;
+        let heavy: Vec<PosTransaction> = [&c2, &c2b]
+            .into_iter()
+            .map(|c| {
+                transfer_spending(
+                    std::slice::from_ref(c),
+                    &owner,
+                    to,
+                    half_over,
+                    0,
+                    g2.next_base_fee(),
+                )
+            })
+            .collect();
+        for tx in &heavy {
+            let PosTransaction::Transfer { inputs, tx_bytes, .. } = tx else { unreachable!() };
+            let gas = fee_market::intrinsic_gas(
+                fee_market::TxClass::Eutxo { inputs: inputs.len() as u32 },
+                *tx_bytes,
+            );
+            assert!(
+                gas <= fee_market::MAX_TX_GAS,
+                "fixture premise: each transfer must clear the per-tx ceiling on its own"
+            );
+            assert!(gas * 2 > fee_market::BLOCK_GAS_LIMIT, "fixture premise: the pair must not");
+        }
+        let env2 = probe_env(&g2, 1, &heavy, &mut chains2);
         assert_eq!(
-            t2.compute_post_state(&g2, &env2, &[], std::slice::from_ref(&heavy)).unwrap_err(),
+            t2.compute_post_state(&g2, &env2, &[], &heavy).unwrap_err(),
             TransitionError::BlockGasLimitExceeded,
         );
 
@@ -7746,6 +7844,151 @@ mod tests {
             probe.apply_transfer(&tx, g.next_base_fee(), &ToyVerifier),
             Err(TransferReject::UnderdeclaredSize),
         );
+    }
+
+    /// **H1: an attacker-chosen tip must not panic a node.**
+    ///
+    /// `tip_millisat_per_gas` is decoded off the wire as a plain `u128` and
+    /// was multiplied by the transaction's gas while pricing. With
+    /// `overflow-checks = true` — mandatory in every consensus profile — the
+    /// product's overflow was a PANIC, taken by every node that applied the
+    /// transfer: one unauthenticated `submit-tx`, and the block carrying it
+    /// killed the network. The transition now refuses the tip before it
+    /// prices anything.
+    ///
+    /// Sabotage runs (2026-09-04), both observed:
+    /// - remove the `TipAboveCeiling` check AND restore `fee_parts_sat`'s bare
+    ///   `*`: this test does not fail with a wrong verdict, it ABORTS the test
+    ///   binary at `fee_market.rs`, `attempt to multiply with overflow`, on
+    ///   the first `u128::MAX` case. That abort IS the defect.
+    /// - remove only the check, keeping the saturating multiply: the verdict
+    ///   becomes `ValueNotConserved` and the assertion fails. That is the
+    ///   proof the two halves of the fix are independent — saturation alone
+    ///   makes the node survive, the bound is what names the reason.
+    #[test]
+    fn an_attacker_chosen_tip_cannot_panic_the_transition() {
+        let owner = owner_key(0x3B);
+        let coin = opening(0x78, 0, 21_000_000_000_000_000, &owner);
+        let (_t, g, _chains) = setup_funded(4, std::slice::from_ref(&coin));
+        let price = g.next_base_fee();
+        let to = script_of(&owner_key(0x3C));
+
+        // A conserving transfer, then only its ONE sender-written price field
+        // is moved — the signatures restored each time, so the verdict is the
+        // tip rule and not a stale witness.
+        let mut tx = transfer_spending(std::slice::from_ref(&coin), &owner, to, 0, 0, price);
+        // `u128::MAX` FIRST, deliberately: it is the case that used to abort
+        // the process, so a sabotage of the rule below aborts this test on its
+        // first iteration instead of merely disagreeing with it.
+        for tip in [
+            u128::MAX,
+            u128::MAX - 1,
+            u128::MAX / 2,
+            fee_market::MAX_TIP_MILLISAT_PER_GAS + 1,
+        ] {
+            if let PosTransaction::Transfer { tip_millisat_per_gas, .. } = &mut tx {
+                *tip_millisat_per_gas = tip;
+            }
+            resign(&mut tx, &owner);
+            assert_eq!(
+                g.clone().apply_transfer(&tx, price, &ToyVerifier),
+                Err(TransferReject::TipAboveCeiling),
+                "tip {tip} must be refused, not multiplied"
+            );
+        }
+
+        // The boundary, and why the bound refuses nothing that was ever
+        // includable: AT the ceiling the arithmetic is exact and the transfer
+        // still dies — on conservation, because the fee it asks for exceeds
+        // the entire supply. That is the verdict the old code reached for
+        // every tip below the overflow threshold, unchanged.
+        if let PosTransaction::Transfer { tip_millisat_per_gas, .. } = &mut tx {
+            *tip_millisat_per_gas = fee_market::MAX_TIP_MILLISAT_PER_GAS;
+        }
+        resign(&mut tx, &owner);
+        assert_eq!(
+            g.clone().apply_transfer(&tx, price, &ToyVerifier),
+            Err(TransferReject::ValueNotConserved),
+        );
+    }
+
+    /// The same rule on the deduplicated format, because a bound on one
+    /// encoding of a transfer is not a bound on the transfer: `TransferV2`
+    /// carries the identical `tip_millisat_per_gas` field into the identical
+    /// `fee_market::charge` call.
+    #[test]
+    fn an_attacker_chosen_tip_cannot_panic_the_v2_transition() {
+        let owner = owner_key(0x3D);
+        let coin = opening(0x79, 0, 21_000_000_000_000_000, &owner);
+        let (_t, g, _chains) = setup_funded(4, std::slice::from_ref(&coin));
+        let price = g.next_base_fee();
+        let to = script_of(&owner_key(0x3E));
+
+        let mut tx = transfer_v2_raw(
+            std::slice::from_ref(&coin),
+            &[&owner],
+            &[0],
+            to,
+            0,
+            0,
+            price,
+        );
+        for tip in [u128::MAX, fee_market::MAX_TIP_MILLISAT_PER_GAS + 1] {
+            if let PosTransaction::TransferV2 { tip_millisat_per_gas, .. } = &mut tx {
+                *tip_millisat_per_gas = tip;
+            }
+            resign_v2(&mut tx);
+            assert_eq!(
+                g.clone().apply_transfer_v2(&tx, price, &ToyVerifier),
+                Err(TransferReject::TipAboveCeiling),
+                "tip {tip} must be refused, not multiplied"
+            );
+        }
+    }
+
+    /// The gas factor of the same multiplication, bounded at the transaction.
+    ///
+    /// `tx_bytes` is a sender-declared `u64` and `intrinsic_gas` saturates, so
+    /// without a per-transaction ceiling a transfer could carry `u64::MAX`
+    /// gas into the pricing — the other half of the H1 product, and the half
+    /// that overflows even at a modest price. The per-BLOCK cap does not help
+    /// here: it is summed and checked AFTER every transaction has been
+    /// charged.
+    ///
+    /// The verdict is not new, only earlier and better named: such a body was
+    /// already refused as `BlockGasLimitExceeded`
+    /// (`the_two_block_caps_are_enforced`, which now builds a body of
+    /// individually-legal transfers so that rule keeps being tested).
+    #[test]
+    fn one_transfer_cannot_outweigh_a_whole_block_of_gas() {
+        let owner = owner_key(0x3F);
+        let coin = opening(0x7A, 0, 21_000_000_000_000_000, &owner);
+        let (_t, g, _chains) = setup_funded(4, std::slice::from_ref(&coin));
+        let price = g.next_base_fee();
+        let to = script_of(&owner_key(0x40));
+
+        // The byte term alone puts the transaction over the ceiling.
+        let over = fee_market::MAX_TX_GAS / fee_market::GAS_PER_BYTE + 1;
+        let heavy =
+            transfer_spending(std::slice::from_ref(&coin), &owner, to, over, 0, price);
+        assert_eq!(
+            g.clone().apply_transfer(&heavy, price, &ToyVerifier),
+            Err(TransferReject::TxGasCeilingExceeded),
+        );
+
+        // And the largest transfer a block could ever carry is NOT caught by
+        // it: a payload at the (post-flag-day) byte cap prices normally, so
+        // the ceiling refuses nothing includable.
+        let biggest = fee_market::MAX_BLOCK_TX_BYTES_V2;
+        assert!(
+            fee_market::intrinsic_gas(
+                fee_market::TxClass::Eutxo { inputs: 1 },
+                biggest
+            ) <= fee_market::MAX_TX_GAS
+        );
+        let fat =
+            transfer_spending(std::slice::from_ref(&coin), &owner, to, biggest, 0, price);
+        assert!(g.clone().apply_transfer(&fat, price, &ToyVerifier).is_ok());
     }
 
     // ────────────────────────────────────────────────────────────────────────
