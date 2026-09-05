@@ -64,7 +64,12 @@ disk by the script. Lose it and the keystores are unopenable, by anyone.
 
 Devnet harnesses (`devnet.sh`, `scripts/devnet-transporte-misto.sh`,
 `scripts/transporte-postura-prova.sh`) export the plaintext opt-in on purpose:
-throwaway keys, throwaway chain, a temp dir.
+throwaway keys, throwaway chain, a temp dir. So does `tests/cold_start.rs`,
+which is a *sync* test on a six-second start window — adding a memory-hard KDF
+to every node boot made a known-flaky consensus test flakier (measured: 1 in 5
+on `main`, 2 in 5 with sealed keystores) and proved nothing about sync. The
+binary's sealed path is proved instead by `tests/keystore_at_rest.rs`, which
+drives the real executable and needs no fleet and no clock.
 
 ## Not covered by this change
 
