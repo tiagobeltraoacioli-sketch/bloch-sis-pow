@@ -32,7 +32,7 @@
 | **cargo-deny** | Advisories + **license policy** (permissive only; AGPL allowed for the six first-party crates, copyleft denied for third-party deps) + banned/duplicate crates + untrusted registries | Same as audit for logic | `cargo deny check` |
 | **osv-scanner** | Same `Cargo.lock`, but the **OSV.dev** DB (RustSec **+ GHSA**) — catches GHSA-only advisories cargo-audit's RustSec-only feed misses | Logic bugs, novel vulns | `osv-scanner --config=osv-scanner.toml --lockfile=Cargo.lock` (install: `bash scripts/ci-install-scanner.sh osv-scanner`, which pins the version and **fails** if it cannot install; needs network for the DB. **BLOCKING in CI since 2026-09-04** — accepted residuals are named with a rationale and an expiry in `osv-scanner.toml`) |
 | **cargo-geiger** | `unsafe` usage across the dependency tree; flags increases | Whether the unsafe is *correct* | `cargo geiger` |
-| **Clippy (hardened)** | Panics in consensus paths (`unwrap`/`expect`), arithmetic side-effects, pedantic smells. Covers the LIVE Genesis-4 crates (`bloch-pos-committee`, `bloch-pos-node`) and the closed Genesis-3 ones (`bloch`, `bloch-crypto`, `bloch-euvm`). A per-crate **ratchet**: baselines are recorded and the run fails when a count goes up | Semantic/consensus correctness | `./scripts/hardened-clippy.sh` (the script is the definition of the scope and the baselines; do not hand-roll the crate list) |
+| **Clippy (hardened)** | Panics in consensus paths (`unwrap`/`expect`), arithmetic side-effects, pedantic smells. Covers the LIVE Genesis-4 crates (`bloch-pos-committee`, `bloch-pos-node`) and the closed Genesis-3 ones (`bloch`, `bloch-crypto`, `bloch-euvm`). A per-crate **ratchet** with three separately-baselined signals — panics, arithmetic, everything else at error severity — counted by lint name from `--message-format=json`; the run fails when a count goes up | Semantic/consensus correctness | `./scripts/hardened-clippy.sh` (the script is the definition of the scope and the baselines; do not hand-roll the crate list). Prove the scorer first with `bash scripts/hardened-clippy.selftest.sh` — no toolchain needed |
 | **Miri** | Undefined behaviour in the consensus + serialization test suites | Anything not exercised by a test | `cargo +nightly miri test` (consensus/serialization crates) |
 | **cargo-fuzz / libFuzzer** | Panics/UB/DoS on adversarial input to the P2P wire, PoW verifier, DAG ordering, signature parsing | Deep logic bugs, consensus splits | `cargo +nightly fuzz run <target>` (targets below) |
 | **proptest** | Property invariants (deterministic ordering, blue-score monotonicity, emission conservation) | Invariants nobody wrote | `cargo test` (property tests run in-suite) |
@@ -54,6 +54,29 @@ The `clippy-hardened` job is described in both pipelines as BLOCKING. Until 2026
 | `bloch-euvm` | 0 | Genesis-3 |
 
 None of the nine in the live consensus crate is a reachable crash: each is a `try_into()` after a length-checked `take(n)`, a slice of a header whose length was validated first, or a `keys().next()` under `len() >= cap > 0`. They are hand-proofs where the lint wants a type-level guarantee, which is exactly why they stay counted. The job is now a **per-crate ratchet** — the recorded number may fall, never rise — rather than a pass/fail gate that was red on every commit and therefore read by nobody.
+
+### Correction (2026-09-05): that table was one signal short
+
+Every number above counts **panics only**. The profile also asks for `-W clippy::arithmetic_side_effects`, and the ratchet counted lines matching `^error` — but a lint requested with `-W` is emitted at *warning* severity. So unchecked arithmetic in consensus, emission and tokenomics was requested, emitted, printed into the job log, and scored as **zero**, for as long as the gate existed. The docstring above the gate said it denied unchecked arithmetic; the counter beneath it could not see any.
+
+Re-measured at `e266a76c` on the pinned toolchain (1.94.1), counting by **lint name** through `--message-format=json`:
+
+| Crate | panics | **arith** | other | Era |
+|---|---|---|---|---|
+| `bloch` | 59 | **205** | 0 | Genesis-3 |
+| `bloch-crypto` | 19 | **77** | 3 | shared; on the Genesis-4 signature path |
+| `bloch-pos-node` | 28 | **105** | 0 | **Genesis-4, live** |
+| `bloch-pos-committee` | 9 | **199** | 3 | **Genesis-4, live consensus** |
+| `bloch-euvm` | 0 | **30** | 0 | Genesis-3 |
+
+**616 unchecked arithmetic operations** across the gated crates, none of them previously counted. `bloch-euvm` is the sharpest illustration: it was documented above as the crate that had already reached 0 and was therefore "a hard gate again" — it has thirty.
+
+The panic column is *not* a relaxation. Split by lint name, four of the five come back exactly as recorded at `8167ceb`, including `bloch-crypto`, whose 22 is 19 panic sites plus 3 non-panic deny-level lints (`absurd_extreme_comparisons`, `erasing_op`, an inherent-method shadow) that now sit in `other` where they belong. The same conflation had pushed `bloch-pos-committee` to a spurious 12 against a correct baseline of 9. One number genuinely moved: `bloch-pos-node` is **28**, against a recorded 27 — a real new panic site that landed while the job was red for unrelated reasons, recorded so the gate can block the 29th, and flagged for review rather than accepted.
+
+Two further changes make the verdict mean something:
+
+- **The toolchain is pinned** to `crates/bloch-pos-node/rust-toolchain.toml`, the channel the release binary is built with. A lint count is a property of *(source, toolchain)*; scoring against the runner's floating `stable` makes the gate's verdict a function of the calendar. The script fails closed if that channel is unavailable.
+- **The counting half has a self-test** (`scripts/hardened-clippy.selftest.sh`, no toolchain required) that runs first and blocks in both pipelines. A gate that miscounts goes green, which is precisely how this one hid 616 findings behind a passing job; the arithmetic case that regressed is pinned by name.
 
 ## EVM / L2 scanners (configured for future Solidity)
 
