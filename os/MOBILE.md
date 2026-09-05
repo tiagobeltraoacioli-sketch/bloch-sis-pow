@@ -54,7 +54,10 @@ mobile-nixos-nixpkgs rev:  <mobile-nixos's own npins nixpkgs pin>
 ```
 
 (These are placeholders — an agent cannot run Nix. REPRO.md §"#2" has the exact
-commands that emit each value.)
+commands that emit each value. They are STILL placeholders, which is one of the
+things proving no `flake.lock` was ever generated for this repository despite
+`flake.nix` having claimed otherwise; the BLOCKING `repro-inputs-guard` CI job
+keeps that visible instead of letting the tooling print REPRODUCIBLE over it.)
 
 ## Honesty
 
