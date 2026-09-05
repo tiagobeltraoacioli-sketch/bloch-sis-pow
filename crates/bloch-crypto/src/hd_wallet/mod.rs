@@ -4,10 +4,18 @@
 //! containing multiple ML-DSA-65 keypairs. Optional passphrase supported
 //! (Ledger/Trezor style).
 //!
-//! Backup requires BOTH: the mnemonic phrase AND the wallet file.
-//! The mnemonic alone cannot reconstruct ML-DSA-65 keys (no lattice-based
-//! deterministic derivation standard exists yet). When such a standard
-//! emerges, this module will be upgraded.
+//! Keys are DERIVED from the mnemonic, not sampled from the OS RNG: the BIP39
+//! seed (`mnemonic` + optional passphrase, PBKDF2 per BIP39) is the master
+//! seed, and address `i` is `crypto::diversified_keypair(seed, i)` — the same
+//! domain-separated, deterministic derivation the diversified-address path
+//! uses. So the mnemonic (+ passphrase) alone recovers every derived address:
+//! see [`HdWallet::recover`], which needs no wallet file. The file password is
+//! deliberately NOT part of the seed; it only locks the file.
+//!
+//! Wallets written before v3 stored OS-random keys that no seed reproduces.
+//! Those files still load unchanged — each address carries a `derived` flag
+//! (absent = false = legacy random key), and `load` always uses the keypair
+//! stored in the file, never a re-derivation.
 
 use crate::crypto;
 use crate::wallet::{Keypair, KdfParams, KeystoreCrypto};
@@ -19,6 +27,7 @@ use argon2::{Argon2, Algorithm, Version, Params};
 use base64::{Engine as _, engine::general_purpose as b64};
 use rand::RngCore;
 use std::path::Path;
+use std::collections::BTreeSet;
 use bip39::Mnemonic;
 
 // ── Encrypted HD Wallet file format ──────────────────────────────────────────
@@ -40,6 +49,11 @@ pub struct HdAddress {
     pub address: String,
     pub label:   String,
     pub keypair_crypto: KeystoreCrypto,   // encrypted keypair for this index
+    /// True when this key was derived from the BIP39 seed at `index`, i.e. the
+    /// mnemonic alone reproduces it. False (and absent in pre-v3 files) for
+    /// imported keys and for legacy OS-random keys.
+    #[serde(default)]
+    pub derived: bool,
 }
 
 // ── Internal encrypted payload structures ───────────────────────────────────
@@ -55,12 +69,18 @@ struct KeypairPayload { private_key_hex: String, public_key_hex: String }
 pub struct HdWallet {
     pub mnemonic: Mnemonic,
     pub master_key: Vec<u8>,      // derived from mnemonic + passphrase + password
+    /// BIP39 seed (mnemonic + passphrase). Master seed for key DERIVATION —
+    /// no password in it, so the mnemonic alone recovers the keys.
+    seed: Vec<u8>,
     pub addresses: Vec<(u32, Keypair, String)>, // (index, keypair, label)
+    /// Indices whose key is NOT reproducible from `seed` (imported keys, and
+    /// every address of a pre-v3 random-key wallet).
+    imported: BTreeSet<u32>,
     pub network:  String,
 }
 
 impl Drop for HdWallet {
-    fn drop(&mut self) { self.master_key.zeroize(); }
+    fn drop(&mut self) { self.master_key.zeroize(); self.seed.zeroize(); }
 }
 
 impl HdWallet {
@@ -77,33 +97,79 @@ impl HdWallet {
         let mnemonic = Mnemonic::from_entropy(&entropy)
             .map_err(|e| format!("mnemonic generation failed: {}", e))?;
 
-        // New wallets use the v2 per-wallet salt.
-        let master_key = derive_master_key(&mnemonic.to_string(), passphrase.unwrap_or(""), password, 2)?;
+        // New wallets use the v2 per-wallet salt (v3 files keep it).
+        let master_key = derive_master_key(&mnemonic.to_string(), passphrase.unwrap_or(""), password, WALLET_VERSION)?;
 
-        let kp = crate::wallet::generate_keypair(testnet);
+        // Address 0 is DERIVED from the seed, so the mnemonic recovers it.
+        let seed = mnemonic.to_seed(passphrase.unwrap_or("")).to_vec();
+        let kp = derive_at(&seed, 0, testnet)?;
         let network = if testnet { "testnet" } else { "mainnet" }.to_string();
 
         Ok(HdWallet {
             mnemonic,
             master_key,
+            seed,
             addresses: vec![(0, kp, "primary".to_string())],
+            imported: BTreeSet::new(),
             network,
         })
     }
 
-    /// Add a new address to the wallet (generates a new keypair).
-    pub fn new_address(&mut self, label: &str) -> &Keypair {
+    /// Recover a wallet from the mnemonic ALONE — no wallet file needed.
+    ///
+    /// Derives addresses `0..count` from the BIP39 seed; `password` only sets
+    /// the key that a subsequent [`save`](Self::save) locks the file with.
+    /// Imported keys (and pre-v3 random keys) are NOT recoverable this way —
+    /// they never came from the seed.
+    pub fn recover(
+        mnemonic_str: &str,
+        passphrase: Option<&str>,
+        password: &str,
+        testnet: bool,
+        count: u32,
+    ) -> Result<Self, String> {
+        let mnemonic = Mnemonic::parse(mnemonic_str)
+            .map_err(|e| format!("invalid mnemonic: {}", e))?;
+        let master_key = derive_master_key(&mnemonic.to_string(), passphrase.unwrap_or(""), password, WALLET_VERSION)?;
+        let seed = mnemonic.to_seed(passphrase.unwrap_or("")).to_vec();
+
+        let mut addresses = Vec::with_capacity(count.max(1) as usize);
+        for index in 0..count.max(1) {
+            let label = if index == 0 { "primary".to_string() } else { format!("address-{}", index) };
+            addresses.push((index, derive_at(&seed, index, testnet)?, label));
+        }
+
+        Ok(HdWallet {
+            mnemonic,
+            master_key,
+            seed,
+            addresses,
+            imported: BTreeSet::new(),
+            network: if testnet { "testnet" } else { "mainnet" }.to_string(),
+        })
+    }
+
+    /// Add a new address to the wallet, DERIVED from the seed at the next index.
+    pub fn new_address(&mut self, label: &str) -> Result<&Keypair, String> {
         let next_index = self.addresses.iter().map(|(i, _, _)| *i).max().unwrap_or(0) + 1;
         let testnet = self.network == "testnet";
-        let kp = crate::wallet::generate_keypair(testnet);
+        let kp = derive_at(&self.seed, next_index, testnet)?;
         self.addresses.push((next_index, kp, label.to_string()));
-        &self.addresses.last().unwrap().1
+        Ok(&self.addresses.last().unwrap().1)
     }
 
     /// Import an existing keypair (e.g., from founder.json) into the HD wallet.
+    /// An imported key does not come from the seed, so the mnemonic alone will
+    /// never bring it back — the wallet file stays part of that key's backup.
     pub fn import_keypair(&mut self, keypair: Keypair, label: &str) {
         let next_index = self.addresses.iter().map(|(i, _, _)| *i).max().unwrap_or(0) + 1;
         self.addresses.push((next_index, keypair, label.to_string()));
+        self.imported.insert(next_index);
+    }
+
+    /// True when address `index` is reproducible from the mnemonic alone.
+    pub fn is_derived(&self, index: u32) -> bool {
+        !self.imported.contains(&index) && self.addresses.iter().any(|(i, _, _)| *i == index)
     }
 
     /// Get keypair at a given index.
@@ -139,11 +205,14 @@ impl HdWallet {
                 address: kp.address.clone(),
                 label: String::from(label),
                 keypair_crypto: crypto,
+                derived: !self.imported.contains(idx),
             });
         }
 
         let wallet = HdWalletFile {
-            version: 2, // v2: per-wallet Argon2 salt (v1 files still load via the legacy path)
+            // v3: seed-derived keys + per-address `derived` flag. v2 (per-wallet
+            // Argon2 salt) and v1 (constant salt) files still load unchanged.
+            version: WALLET_VERSION,
             format: "hd-wallet-v1".into(),
             network: self.network.clone(),
             mnemonic_crypto,
@@ -179,8 +248,11 @@ impl HdWallet {
             return Err("mnemonic mismatch — tampered file?".into());
         }
 
-        // Decrypt each keypair
+        // Decrypt each keypair. The stored key always wins — a pre-v3 wallet's
+        // OS-random keys are not reproducible from the seed, so re-deriving here
+        // would silently hand back the wrong (empty) addresses.
         let mut addresses = Vec::new();
+        let mut imported = BTreeSet::new();
         for addr in &wallet.addresses {
             let bytes = decrypt_with_key(&master_key, &addr.keypair_crypto)?;
             let mut kpp: KeypairPayload = serde_json::from_slice(&bytes)
@@ -190,8 +262,9 @@ impl HdWallet {
             kpp.zeroize();
 
             let testnet = addr.address.starts_with(TESTNET_PREFIX);
-            let derived = crypto::address_from_pubkey(&pub_key, testnet);
-            if derived != addr.address {
+            // NB: local, not `addr.derived` — this is the recomputed address string.
+            let derived_address = crypto::address_from_pubkey(&pub_key, testnet);
+            if derived_address != addr.address {
                 return Err(format!("address {} mismatch — tampered", addr.index));
             }
 
@@ -201,9 +274,11 @@ impl HdWallet {
                 address:     addr.address.clone(),
             };
             addresses.push((addr.index, kp, addr.label.clone()));
+            if !addr.derived { imported.insert(addr.index); }
         }
 
-        Ok(HdWallet { mnemonic, master_key, addresses, network: wallet.network })
+        let seed = mnemonic.to_seed(passphrase.unwrap_or("")).to_vec();
+        Ok(HdWallet { mnemonic, master_key, seed, addresses, imported, network: wallet.network })
     }
 
     /// List all addresses (for display).
@@ -213,6 +288,21 @@ impl HdWallet {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Current wallet-file version. v3 = keys derived from the BIP39 seed.
+const WALLET_VERSION: u32 = 3;
+
+/// Derive the keypair for `index` from the BIP39 seed.
+///
+/// Deterministic and domain-separated (`crypto::diversified_seed`), so the same
+/// mnemonic + passphrase yields the same address at the same index on every
+/// machine — which is what makes the mnemonic a real backup.
+fn derive_at(seed: &[u8], index: u32, testnet: bool) -> Result<Keypair, String> {
+    let (public_key, private_key) = crypto::diversified_keypair(seed, index)
+        .map_err(|e| format!("key derivation failed at index {}: {}", index, e))?;
+    let address = crypto::address_from_pubkey(&public_key, testnet);
+    Ok(Keypair { private_key, public_key, address })
+}
 
 /// Derive the master encryption key from mnemonic + passphrase + password.
 /// This is what locks/unlocks the wallet file.
@@ -308,9 +398,78 @@ mod tests {
     fn new_address_increments_index() {
         let mut w = HdWallet::create("test-password-12345!", None, true).unwrap();
         assert_eq!(w.addresses.len(), 1);
-        w.new_address("savings");
-        w.new_address("business");
+        w.new_address("savings").unwrap();
+        w.new_address("business").unwrap();
         assert_eq!(w.addresses.len(), 3);
         assert_eq!(w.addresses[2].0, 2);
+    }
+
+    /// K-M2: the mnemonic must actually recover the wallet. Same mnemonic (+
+    /// passphrase) → byte-identical addresses, with NO wallet file involved.
+    /// Before the fix every address came from `generate_keypair()` (OS random)
+    /// and this could only pass by a 2^-256 accident.
+    #[test]
+    fn same_mnemonic_reproduces_same_addresses() {
+        let mut w = HdWallet::create("test-password-12345!", Some("pp"), true).unwrap();
+        w.new_address("savings").unwrap();
+        w.new_address("business").unwrap();
+        let mnemonic = w.mnemonic.to_string();
+        let originals: Vec<String> = w.addresses.iter().map(|(_, kp, _)| kp.address.clone()).collect();
+        assert_eq!(originals.len(), 3);
+
+        // Recover from the mnemonic alone — different password on purpose: the
+        // file password locks the file, it must not enter key derivation.
+        let r = HdWallet::recover(&mnemonic, Some("pp"), "another-password-9!", true, 3).unwrap();
+        let recovered: Vec<String> = r.addresses.iter().map(|(_, kp, _)| kp.address.clone()).collect();
+        assert_eq!(recovered, originals, "mnemonic must reproduce the same addresses");
+
+        // Derivation is a pure function of (seed, index): recover twice, same keys.
+        let r2 = HdWallet::recover(&mnemonic, Some("pp"), "another-password-9!", true, 3).unwrap();
+        assert_eq!(r2.addresses[2].1.private_key, r.addresses[2].1.private_key);
+
+        // A different BIP39 passphrase is a different wallet.
+        let other = HdWallet::recover(&mnemonic, Some("other-pp"), "another-password-9!", true, 1).unwrap();
+        assert_ne!(other.addresses[0].1.address, originals[0]);
+
+        // Indices are independent of each other.
+        assert_ne!(originals[0], originals[1]);
+        assert_ne!(originals[1], originals[2]);
+    }
+
+    /// Backward compat: a pre-v3 file (no `derived` field, OS-random keys) must
+    /// still load, and `load` must hand back the STORED key, never a
+    /// re-derivation that would point at an empty address.
+    #[test]
+    fn loads_legacy_random_key_wallet() {
+        let tmp = std::env::temp_dir().join("bloch-hd-legacy-test.json");
+        let _ = std::fs::remove_file(&tmp);
+
+        // Build a wallet whose key is OS-random, exactly like a pre-v3 file.
+        let mut w = HdWallet::create("test-password-12345!", None, true).unwrap();
+        let random_kp = crate::wallet::generate_keypair(true);
+        let random_addr = random_kp.address.clone();
+        w.import_keypair(random_kp, "legacy");
+        assert!(w.is_derived(0));
+        assert!(!w.is_derived(1), "an imported key is not seed-derived");
+        w.save(&tmp).unwrap();
+        let mnemonic = w.mnemonic.to_string();
+
+        // Strip the v3-only fields to make it a genuine v2-shaped file.
+        let json = std::fs::read_to_string(&tmp).unwrap();
+        let mut file: serde_json::Value = serde_json::from_str(&json).unwrap();
+        file["version"] = serde_json::json!(2);
+        for a in file["addresses"].as_array_mut().unwrap() {
+            a.as_object_mut().unwrap().remove("derived");
+        }
+        std::fs::write(&tmp, serde_json::to_string_pretty(&file).unwrap()).unwrap();
+
+        let loaded = HdWallet::load(&tmp, &mnemonic, None, "test-password-12345!").unwrap();
+        assert_eq!(loaded.addresses.len(), 2);
+        assert_eq!(loaded.addresses[1].1.address, random_addr, "stored key must survive the load");
+        // No `derived` flag → treat every address as unreproducible, which is true.
+        assert!(!loaded.is_derived(0));
+        assert!(!loaded.is_derived(1));
+
+        let _ = std::fs::remove_file(&tmp);
     }
 }
