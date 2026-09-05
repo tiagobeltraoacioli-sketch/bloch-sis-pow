@@ -77,7 +77,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bloch_pos_committee::attestation::{Attestation, AttestationData};
+use bloch_pos_committee::attestation::{Attestation, AttestationData, KeyLookup, SignatureVerifier};
 use bloch_pos_committee::beacon::{mix_in, RandaoChain};
 use bloch_pos_committee::fee_market;
 use bloch_pos_committee::forkchoice::{BlockTree, LatestMessage, Store as FcStore};
@@ -262,6 +262,58 @@ const MAX_FUTURE_SLOTS: u64 = 2 * bloch_pos_committee::params::SLOTS_PER_EPOCH;
 /// window safe rather than merely cheap: the window is an optimisation with a
 /// correct slow path underneath it, never a limit on what can be reorganised.
 const REORG_STATE_WINDOW: usize = 2;
+
+/// Ceiling on blocks parked waiting for a parent this node has never seen.
+///
+/// **The bound is the whole point.** Before this existed, `ingest` stored
+/// every structurally-valid envelope in `blocks` — no proposer signature, no
+/// slot bound, no requirement that the parent be known — and fork choice was
+/// rebuilt over the result on every single one. One unauthenticated peer
+/// could therefore grow this node's memory without limit AND make every
+/// subsequent ingest more expensive, because `advance`'s loop and
+/// `path_to_canonical`'s cycle guard are both bounded by `blocks.len()`.
+///
+/// 256 is chosen against what a legitimate orphan burst looks like: a node a
+/// few slots behind receives the tip before the blocks under it, so the depth
+/// that has to be held is the sync gap, not the chain. Anything deeper is
+/// recovered by the `get_blocks` request the parking sets `needs_sync` for —
+/// which is why evicting here costs a round trip and never a fork.
+const ORPHAN_MAX: usize = 256;
+
+/// How far past this node's wall-clock slot a *gossiped* block's slot may sit
+/// and still be stored.
+///
+/// Without it, `blocks` is keyed by a hash the sender chooses and bounded by
+/// nothing: one peer signing headers at slot `u64::MAX - k` fills the map with
+/// entries that no `advance` will ever consume. With it, a sender can only
+/// occupy slots the clock will actually reach.
+///
+/// It is NOT a consensus rule and is deliberately not applied during boot
+/// replay (`live == false`): the log is this node's own history, its slots are
+/// by construction in the past, and making replay depend on the wall clock is
+/// how a node with a skewed clock refuses to restart. Tolerance is generous
+/// because the cost of being wrong is asymmetric — a dropped block is
+/// re-requested by the sync path, and 8 slots is four minutes at the fleet's
+/// 30 s cadence, far more skew than NTP ever leaves.
+const FUTURE_SLOT_TOLERANCE: u64 = 8;
+
+/// Where an envelope reached `ingest` from. The ONLY thing that reads it is
+/// the slot bound, and it exists because that bound is a statement about
+/// what a PEER may make this node store, not about what this node may build.
+///
+/// A producer chose the slot it is proposing for; re-judging its own block
+/// against the clock is how a node refuses to produce when the box is loaded
+/// enough that the two disagree by a few slots. Every other gate applies
+/// identically to both — a locally built block still has to authenticate and
+/// still has to connect.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// Arrived over the network, or was promoted out of the orphan pool
+    /// after arriving over the network.
+    Gossip,
+    /// Built by this node's own `propose`.
+    Local,
+}
 
 /// Decode a block body's transactions.
 ///
@@ -627,8 +679,32 @@ struct Engine {
     /// keystore, is how you equivocate and get slashed. There is no safe
     /// version of that, so there is this.
     keys: Option<Keystore>,
-    /// Every structurally-valid block seen, canonical or not, by id.
-    /// Unpruned — fine for a devnet, listed as a limitation.
+    /// Every block this node has *authenticated and connected*, canonical or
+    /// not, by id.
+    ///
+    /// Three admission rules stand in front of this map, and each closes a
+    /// distinct way an unauthenticated peer could grow it (H8):
+    ///
+    /// 1. **The proposer is authenticated before insertion.** The same call
+    ///    the transition makes at its step 7 — `verify_with_key` over
+    ///    `proposal_signing_root` — so writing to this map costs a hybrid
+    ///    signature only a key-holding validator can pay. A signature that
+    ///    fails under a key this node has registered is refused outright; an
+    ///    index this node has never registered is parked, not judged, because
+    ///    the transition resolves that key from the block's pre-state and
+    ///    this gate must never be the thing that forks.
+    /// 2. **The parent must already be here or canonical.** A block that
+    ///    connects to nothing goes to [`Engine::orphans`], which is bounded;
+    ///    it is promoted the moment its parent lands.
+    /// 3. **Non-canonical entries below the finalized checkpoint are
+    ///    pruned.** Finality is what makes that safe: fork choice descends
+    ///    from the justified root, so nothing under the finalized epoch can
+    ///    ever be selected or be on the path to something that is.
+    ///
+    /// Canonical blocks are NOT pruned — `do_reorg` rewrites the block log
+    /// from them — so this still grows with the chain. That is the chain's
+    /// own size, not an attacker's budget, and it is the honest remaining
+    /// limitation.
     blocks: BTreeMap<[u8; 32], BlockEnvelope>,
     /// Canonical chain, ascending slot, genesis first.
     chain: Vec<(u64, BlockId)>,
@@ -754,6 +830,30 @@ struct Engine {
     /// that kind of pool shrinkage apart from the epoch `retain`, which fork
     /// choice very much can see. See the argument there.
     fc_covered_removals: u64,
+    /// Blocks whose parent this node has never seen, oldest first, with their
+    /// ids so a repeat gossip is recognised without re-hashing.
+    ///
+    /// Bounded by [`ORPHAN_MAX`] with FIFO eviction. FIFO and not
+    /// lowest-slot-first on purpose: the oldest entry is the one whose parent
+    /// has had the longest to arrive and has not, so it is the one least
+    /// likely to ever connect.
+    ///
+    /// Parking sets `needs_sync`, so the gap the orphan is evidence of is
+    /// asked for over the wire. That is what makes eviction cheap: the worst
+    /// case is a round trip, never a missed branch.
+    orphans: VecDeque<([u8; 32], BlockEnvelope)>,
+    /// Orphans dropped at the cap, and orphans later connected. Counted so
+    /// "the bound is holding" is a measurement rather than an inference — a
+    /// pool with evictions and zero admissions is a node that is not syncing.
+    orphans_evicted: u64,
+    orphans_admitted: u64,
+    /// Non-canonical blocks dropped because they sat below the finalized
+    /// checkpoint. Same reason: pruning that never fires is pruning that is
+    /// not wired.
+    blocks_pruned: u64,
+    /// Envelopes turned away at the door, by reason.
+    rejected_unsigned: u64,
+    rejected_future: u64,
 }
 
 /// A fingerprint of the four values `lmd_ghost_head` reads, so `advance` can
@@ -1490,7 +1590,7 @@ impl Engine {
         // this block, these are the bytes to drop from the mempool.
         let produced_txs: Vec<Vec<u8>> = env.body.transactions.clone();
         let env_tx_count = produced_txs.len();
-        self.ingest(env);
+        self.ingest_from(env, Source::Local);
         // h28080: a producer whose own node did not adopt its block is a
         // producer/validator split inside one process. It must be LOUD — but it
         // must not be fatal.
@@ -1528,6 +1628,14 @@ impl Engine {
 
     // ── Block ingestion: store, then advance canonical as far as possible ──
 
+    /// Ingest `env` and then everything it unblocks.
+    ///
+    /// The orphan pool means one arrival can connect a chain of parked
+    /// blocks, and that promotion is a WORKLIST rather than recursion on
+    /// purpose: `ingest_one` calls `advance`, which calls `apply_block`, and
+    /// [`ORPHAN_MAX`] nested copies of that stack is a crash a peer chooses
+    /// the depth of. Here the depth is one frame no matter how long the
+    /// parked chain is.
     fn ingest(&mut self, env: BlockEnvelope) {
         let _ = self.ingest_judged(env);
     }
@@ -1545,24 +1653,112 @@ impl Engine {
     ///
     /// - `Reject` — a *provable* violation, safe to charge to the forwarding
     ///   peer: the header does not commit to the body it carries, the body
-    ///   does not decode, or the slot is one no honest node could be
-    ///   gossiping (0, or past [`MAX_FUTURE_SLOTS`]).
+    ///   does not decode, the slot is one no honest node could be gossiping
+    ///   (0, or past [`MAX_FUTURE_SLOTS`]), or the proposer signature is a
+    ///   forgery under a key this node has registered.
     /// - `Accept` — structurally sound; relay it. This is deliberately NOT
     ///   "the transition applied it". A block on a losing branch, or one whose
     ///   parent has not arrived, is honest and must still propagate, so full
     ///   validity cannot be the relay condition without stalling fork choice.
+    /// - `Ignore` — no opinion, and no relay: a duplicate, a block held under
+    ///   an identity or a parent this node cannot check yet, or one refused by
+    ///   a purely local clock policy ([`FUTURE_SLOT_TOLERANCE`]). None of
+    ///   those is a violation the forwarding peer can be charged for.
     ///
     /// Note the one asymmetry with `MAX_FUTURE_SLOTS`' own docs: refusing to
     /// STORE the block is the local rule, but `Reject` also charges the peer's
     /// P4 score off this node's clock. That is intentional and bounded — the
     /// same 32-minute skew budget guards both, and gossipsub's penalty is a
-    /// score, not a ban.
+    /// score, not a ban. The much tighter [`FUTURE_SLOT_TOLERANCE`] is NOT
+    /// charged to anyone, which is why it maps to `Ignore`.
     fn ingest_judged(&mut self, env: BlockEnvelope) -> Verdict {
+        self.ingest_from_judged(env, Source::Gossip)
+    }
+
+    /// Ingest `env` and then everything it unblocks, discarding the verdict.
+    ///
+    /// The path a block this node produced itself takes: there is no peer to
+    /// report to, so `Source::Local` and no verdict.
+    fn ingest_from(&mut self, env: BlockEnvelope, src: Source) {
+        let _ = self.ingest_from_judged(env, src);
+    }
+
+    /// Ingest `env` and then everything it unblocks.
+    ///
+    /// The orphan pool means one arrival can connect a chain of parked
+    /// blocks, and that promotion is a WORKLIST rather than recursion on
+    /// purpose: `ingest_one` calls `advance`, which calls `apply_block`, and
+    /// [`ORPHAN_MAX`] nested copies of that stack is a crash a peer chooses
+    /// the depth of. Here the depth is one frame no matter how long the
+    /// parked chain is.
+    fn ingest_from_judged(&mut self, env: BlockEnvelope, src: Source) -> Verdict {
+        let mut queue: VecDeque<BlockEnvelope> = VecDeque::new();
+        queue.push_back(env);
+        // The verdict belongs to the envelope the CALLER handed in — the
+        // first one out of the queue — and to no other. Blocks promoted out
+        // of the orphan pool below arrived on their own gossip message and
+        // were judged then; charging their outcome to the peer that relayed
+        // the block which merely unblocked them would punish it for the one
+        // thing it did right.
+        let mut verdict: Option<Verdict> = None;
+        // Bounded: every iteration either drops the envelope or takes one
+        // entry out of `orphans`, and `orphans` is capped.
+        while let Some(next) = queue.pop_front() {
+            let (v, landing) = self.ingest_one(next, src);
+            verdict.get_or_insert(v);
+            let Some((landed, grew_registry)) = landing else {
+                continue;
+            };
+            // Whatever was waiting on the block that just landed can be
+            // tried now, in arrival order.
+            //
+            // `grew_registry` widens that to the WHOLE pool for one reason:
+            // a block carrying a `Deposit` registers a validator index, and
+            // blocks parked for an unregistered proposer are exactly the ones
+            // that identity was missing for. Without this they would sit
+            // until eviction even though the node can now check them.
+            // Deposits are rare (and gated off entirely today), so the sweep
+            // is not on any hot path.
+            let mut i = 0;
+            while i < self.orphans.len() {
+                if grew_registry || self.orphans[i].1.header.parent == landed {
+                    let (_, env) = self.orphans.remove(i).expect("index in range");
+                    self.orphans_admitted += 1;
+                    queue.push_back(env);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        // An empty queue cannot happen — one envelope always goes in — but
+        // `Ignore` is the answer that charges nobody if it ever did.
+        verdict.unwrap_or(Verdict::Ignore)
+    }
+
+    /// One envelope through the door.
+    ///
+    /// Returns the gossip verdict for THIS envelope, and `Some((id,
+    /// grew_registry))` when the block was stored: `id` so the caller can
+    /// release what was waiting on it, and `grew_registry` when the block
+    /// carried a `Deposit` and therefore may have registered a validator
+    /// index some parked block is waiting to be checkable under.
+    ///
+    /// The order of the checks is load-bearing. Everything that costs only an
+    /// integer comparison or a hash of bytes already in hand runs BEFORE the
+    /// hybrid signature verify, and every one of them runs before
+    /// `self.blocks.insert` — so neither a fork-choice input nor a
+    /// post-quantum verification is something an unauthenticated peer can
+    /// spend on this node's behalf.
+    fn ingest_one(
+        &mut self,
+        env: BlockEnvelope,
+        src: Source,
+    ) -> (Verdict, Option<([u8; 32], bool)>) {
         let id = *env.block_id().as_bytes();
         if self.blocks.contains_key(&id) || self.canonical.contains(&id) {
             // Already known: a duplicate is an honest race, not a violation,
             // and it is not this node's job to relay it a second time.
-            return Verdict::Ignore;
+            return (Verdict::Ignore, None);
         }
         // A cheap early reject before the block reaches the transition, using
         // the same `derive::*` functions the transition checks with — one
@@ -1576,7 +1772,7 @@ impl Engine {
                 "reject {}: body/attestation commitment mismatch",
                 crate::codec::hex8(&id)
             );
-            return Verdict::Reject;
+            return (Verdict::Reject, None);
         }
         // A block carrying transactions used to be rejected here, because the
         // node had no tx codec and failing closed was the honest response. The
@@ -1586,10 +1782,11 @@ impl Engine {
         // then be unreproducible.
         if let Err(e) = body_transactions(&env) {
             eprintln!("reject {}: {e}", crate::codec::hex8(&id));
-            return Verdict::Reject;
+            return (Verdict::Reject, None);
         }
         if env.header.slot == 0 {
-            return Verdict::Reject; // genesis is synthesized, never received
+            // genesis is synthesized, never received
+            return (Verdict::Reject, None);
         }
         // The upper half of the same door. `header.slot` is untrusted `u64`
         // and every slot/epoch walk downstream is linear in it — see
@@ -1597,8 +1794,20 @@ impl Engine {
         // block naming a far-future slot never reaches `advance()` and never
         // occupies memory; and before any signature work, so the refusal is
         // one integer comparison rather than a hybrid verify.
+        //
+        // Gossip only, for the same reason the tolerance below is: this bounds
+        // what an UNTRUSTED `slot` can make this node walk, and neither the
+        // producer's own proposal nor a block read back out of this node's own
+        // log is untrusted. Removing the exemption would refuse the node's own
+        // block on a loaded box — the h28080 shape — and the path that skips
+        // this door is not unguarded: `params::MAX_EPOCH_ADVANCE` is the
+        // CONSENSUS ceiling on the same walk and applies to every source.
+        //
+        // It is also not shadowed by the much tighter `FUTURE_SLOT_TOLERANCE`
+        // below, which is skipped entirely while `!self.live` — during boot
+        // and sync this horizon is the only thing bounding a gossiped slot.
         let horizon = self.wall_slot().saturating_add(MAX_FUTURE_SLOTS);
-        if env.header.slot > horizon {
+        if src == Source::Gossip && env.header.slot > horizon {
             eprintln!(
                 "reject {}: slot {} is past this node's horizon {} (wall {} + {})",
                 crate::codec::hex8(&id),
@@ -1607,15 +1816,174 @@ impl Engine {
                 self.wall_slot(),
                 MAX_FUTURE_SLOTS,
             );
-            return Verdict::Reject;
+            return (Verdict::Reject, None);
         }
+        // A slot the clock will never reach is a write into `blocks` that no
+        // `advance` will ever consume. Gossip only — boot replay reads this
+        // node's own log and must not depend on the wall clock (see
+        // [`FUTURE_SLOT_TOLERANCE`]).
+        //
+        // `Ignore`, not `Reject`: this tolerance is orders of magnitude
+        // tighter than [`MAX_FUTURE_SLOTS`] and a peer one slot ahead of this
+        // node's clock has proved nothing about itself.
+        if src == Source::Gossip
+            && self.live
+            && env.header.slot > self.wall_slot().saturating_add(FUTURE_SLOT_TOLERANCE)
+        {
+            self.rejected_future += 1;
+            eprintln!(
+                "reject {}: slot {} is more than {FUTURE_SLOT_TOLERANCE} ahead of wall slot {}",
+                crate::codec::hex8(&id),
+                env.header.slot,
+                self.wall_slot(),
+            );
+            return (Verdict::Ignore, None);
+        }
+        // The proposer is authenticated BEFORE the block takes a byte of
+        // `blocks`, and the three outcomes are deliberately not two.
+        //
+        // The check itself is the transition's step 7 —
+        // `verify_with_key(registered key, proposal_signing_root, sig)` —
+        // moved in front of storage, so that a write into a fork-choice input
+        // costs a hybrid signature only a key-holder can produce.
+        //
+        // **The registry read here is this node's HEAD, and the transition's
+        // is the block's PRE-state.** That difference is why an unregistered
+        // index is not a rejection. The transition resolves the key from the
+        // parent's post-state deliberately (its step 7 says why: deriving a
+        // consensus verdict from node-local state is the 2026-08-08
+        // `expected_bits` fork), and a validator registered by a `Deposit` on
+        // a branch this node has not applied is genuinely absent from this
+        // registry. Refusing its blocks here would be that same fork in
+        // miniature.
+        //
+        // So:
+        //   * registered index, signature fails → REFUSED, and `Reject`:
+        //     registry records are append-only per index (transition step 7's
+        //     note: "records never removed"), so the key this node holds at
+        //     `i` is the key every branch holds at `i`, and this is a forgery
+        //     the transition would have rejected too — provable, and safe to
+        //     charge to the peer that relayed it.
+        //   * unregistered index → PARKED, never stored, `Ignore`. No verdict
+        //     is passed on it: it simply may not weigh on fork choice under an
+        //     identity this node cannot check, and the orphan pool is
+        //     bounded, so holding it costs nothing unbounded.
+        //   * registered index, signature verifies → through to the parent
+        //     rule.
+        //
+        // The middle case is the one that closes the actual leak. Refusing
+        // only forgeries would leave "unknown index, KNOWN parent" free to
+        // accumulate: such blocks enter `blocks`, all but one lose the
+        // fork-choice tie, and `advance` — which only ever removes the block
+        // it tried to apply — never touches the rest.
+        let authenticated = match KeyLookup::pubkey(&*self.state, env.header.proposer_index) {
+            Some(pk) => self.verifier.verify_with_key(
+                pk,
+                &env.header.proposal_signing_root(),
+                &env.proposer_sig,
+            ),
+            None => {
+                // Unknown identity: hold it, ask for the gap, decide nothing.
+                self.park_orphan(id, env);
+                return (Verdict::Ignore, None);
+            }
+        };
+        if !authenticated {
+            self.rejected_unsigned += 1;
+            eprintln!(
+                "reject {}: proposer {} signature does not verify",
+                crate::codec::hex8(&id),
+                env.header.proposer_index,
+            );
+            return (Verdict::Reject, None);
+        }
+        // A block that connects to nothing cannot be judged, so it is parked
+        // rather than stored: `blocks` is a fork-choice input and an entry
+        // hanging off an unknown root is weight this node cannot validate.
+        if !self.canonical.contains(&env.header.parent)
+            && !self.blocks.contains_key(&env.header.parent)
+        {
+            self.park_orphan(id, env);
+            return (Verdict::Ignore, None);
+        }
+        // Read before `env` moves: whether this block could have registered a
+        // validator index. Decoding already succeeded above, so this is a
+        // scan of a decoded list, not a second parse.
+        let grew_registry = body_transactions(&env)
+            .map(|txs| {
+                txs.iter()
+                    .any(|tx| matches!(tx, PosTransaction::Deposit { .. }))
+            })
+            .unwrap_or(false);
         self.blocks.insert(id, env);
         self.advance();
         // The block is queryable now, so attestations parked on it can be
         // re-run. `advance()` first: an attestation released here votes on
         // fork choice, and it should see the chain the block already moved.
         self.release_held(id);
-        Verdict::Accept
+        // After `advance`, because that is what can have moved finality.
+        self.prune_below_finalized();
+        (Verdict::Accept, Some((id, grew_registry)))
+    }
+
+    /// Park a block whose parent is unknown, and ask the mesh for the gap.
+    ///
+    /// Deduplicated by id, so a mesh that hands the same orphan back on every
+    /// heartbeat occupies one slot rather than the whole pool.
+    fn park_orphan(&mut self, id: [u8; 32], env: BlockEnvelope) {
+        if self.orphans.iter().any(|(seen, _)| *seen == id) {
+            return;
+        }
+        // FIFO: at the cap the OLDEST goes, since its parent has had the
+        // longest to arrive and has not.
+        while self.orphans.len() >= ORPHAN_MAX {
+            if self.orphans.pop_front().is_some() {
+                self.orphans_evicted += 1;
+            }
+        }
+        self.orphans.push_back((id, env));
+        // The gap is real and the sync loop is the thing that closes it.
+        self.needs_sync = true;
+    }
+
+    /// Drop non-canonical blocks — stored and parked — that sit below the
+    /// finalized checkpoint.
+    ///
+    /// **Why this cannot lose a branch.** `lmd_ghost_head` starts its descent
+    /// at the justified root and only ever walks to children, so the head is
+    /// always a descendant of justified, and justified is at or above
+    /// finalized. `path_to_canonical` walks from that head down to the first
+    /// canonical ancestor, which it therefore reaches at or above justified
+    /// too. Nothing removed here is on either walk.
+    ///
+    /// Canonical blocks stay: `do_reorg` rebuilds the block log out of
+    /// `self.blocks` for the whole canonical chain, and pruning them would
+    /// turn its `expect("stored")` into a panic a reorg reaches.
+    fn prune_below_finalized(&mut self) {
+        let finalized_epoch = self.state.finality().finalized.epoch;
+        if finalized_epoch == 0 {
+            return; // nothing is final yet; there is no floor to prune under
+        }
+        // `None` only on an epoch whose first slot overflows `u64` — no such
+        // chain exists, and pruning nothing is the right answer if one did.
+        let Some(floor) = first_slot_of_epoch(finalized_epoch) else {
+            return;
+        };
+        let doomed: Vec<[u8; 32]> = self
+            .blocks
+            .iter()
+            .filter(|(id, env)| env.header.slot < floor && !self.canonical.contains(*id))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in doomed {
+            self.blocks.remove(&id);
+            self.blocks_pruned += 1;
+        }
+        // Parked blocks under the floor can never connect to a branch that
+        // could win, so holding them only costs slots other orphans need.
+        let before = self.orphans.len();
+        self.orphans.retain(|(_, env)| env.header.slot >= floor);
+        self.orphans_evicted += (before - self.orphans.len()) as u64;
     }
 
     // ── Fork choice: LMD-GHOST ──────────────────────────────────────────────
@@ -3320,6 +3688,12 @@ pub fn run(cfg: Config) -> io::Result<()> {
         head_slot,
         live: false,
         needs_sync: false,
+        orphans: VecDeque::new(),
+        orphans_evicted: 0,
+        orphans_admitted: 0,
+        blocks_pruned: 0,
+        rejected_unsigned: 0,
+        rejected_future: 0,
         last_applied_ms: now_ms(),
         booted_ms: now_ms(),
         ws_anchor: None,
@@ -5267,6 +5641,12 @@ mod transfer_v2_end_to_end {
             head_slot,
             live: true,
             needs_sync: false,
+            orphans: VecDeque::new(),
+            orphans_evicted: 0,
+            orphans_admitted: 0,
+            blocks_pruned: 0,
+            rejected_unsigned: 0,
+            rejected_future: 0,
             last_applied_ms: now_ms(),
             booted_ms: now_ms(),
             ws_anchor: None,
@@ -6085,6 +6465,12 @@ mod perf_support {
             head_slot,
             live: true,
             needs_sync: false,
+            orphans: VecDeque::new(),
+            orphans_evicted: 0,
+            orphans_admitted: 0,
+            blocks_pruned: 0,
+            rejected_unsigned: 0,
+            rejected_future: 0,
             last_applied_ms: now_ms(),
             booted_ms: now_ms(),
             ws_anchor: None,
@@ -7539,6 +7925,12 @@ mod duty_view_anchor {
             head_slot,
             live: true,
             needs_sync: false,
+            orphans: VecDeque::new(),
+            orphans_evicted: 0,
+            orphans_admitted: 0,
+            blocks_pruned: 0,
+            rejected_unsigned: 0,
+            rejected_future: 0,
             last_applied_ms: now_ms(),
             booted_ms: now_ms(),
             ws_anchor: None,
@@ -7784,6 +8176,12 @@ mod slot_horizon {
             ws_anchor_hard: false,
             ws_conflict_reported: false,
             fc_covered_removals: 0,
+            orphans: VecDeque::new(),
+            orphans_evicted: 0,
+            orphans_admitted: 0,
+            blocks_pruned: 0,
+            rejected_unsigned: 0,
+            rejected_future: 0,
         }
     }
 
@@ -7843,32 +8241,96 @@ mod slot_horizon {
     }
 
     /// The control, and the half that makes the test above mean something: a
-    /// block INSIDE the horizon is still stored and still relayed. Without
-    /// this, `ingest_judged` returning `Reject` unconditionally would pass.
+    /// block INSIDE both clock rules is not refused BY them — it reaches the
+    /// gates that come after. Without this, `ingest_judged` returning `Reject`
+    /// unconditionally would pass.
+    ///
+    /// The witness is the ORPHAN POOL, and it is the right one precisely
+    /// because parking happens strictly behind both clock rules AND behind
+    /// H8's proposer-authentication gate. This fixture's envelope names a
+    /// proposer index the fixture state never registered, so an envelope that
+    /// reaches `orphans` is one that BOTH the horizon and the tolerance let
+    /// through. `rejected_future == 0` says the same thing from the other
+    /// side, and `blocks` staying empty says H8's rule is still in force.
     #[test]
-    fn a_block_inside_the_horizon_is_still_stored_and_relayed() {
+    fn a_block_inside_the_horizon_reaches_the_gates_behind_it() {
         let mut e = engine_at_wall_slot(10);
         let wall = e.wall_slot();
-        let env = envelope_at_slot(wall + MAX_FUTURE_SLOTS);
+        // Inside the horizon (64) AND inside the tolerance (8): the clock has
+        // no answer for this block, so a later rule must be the one that does.
+        let env = envelope_at_slot(wall + FUTURE_SLOT_TOLERANCE);
         let id = *env.block_id().as_bytes();
 
-        assert_eq!(e.ingest_judged(env), Verdict::Accept);
-        assert!(e.blocks.contains_key(&id), "a block at the horizon is honest and must propagate");
+        let verdict = e.ingest_judged(env);
+        assert_eq!(
+            e.rejected_future, 0,
+            "a block inside the tolerance must not be charged to the clock",
+        );
+        assert_eq!(
+            e.orphans.len(),
+            1,
+            "it must have reached the gates behind the clock — that is what proves neither slot rule turned it away",
+        );
+        assert_eq!(
+            verdict,
+            Verdict::Ignore,
+            "held under an identity this node cannot check is no charge against the peer that relayed it",
+        );
+        assert!(
+            !e.blocks.contains_key(&id),
+            "and an unauthenticated block still never reaches `blocks` (H8)",
+        );
     }
 
     /// The horizon is measured against the wall clock, not against the head.
     /// A node whose chain is thousands of slots behind — every node on this
-    /// fleet, routinely — must keep accepting current blocks, or the rule
-    /// would quietly stop such a node from ever catching up.
+    /// fleet, routinely — must keep judging current blocks on their merits,
+    /// or the rule would quietly stop such a node from ever catching up.
     #[test]
-    fn a_node_far_behind_its_own_chain_still_accepts_current_blocks() {
+    fn a_node_far_behind_its_own_chain_still_judges_current_blocks_on_merit() {
         let mut e = engine_at_wall_slot(50_000);
         let wall = e.wall_slot();
         assert!(wall > 40_000, "fixture must actually be far along; wall = {wall}");
         let env = envelope_at_slot(wall);
         let id = *env.block_id().as_bytes();
-        assert_eq!(e.ingest_judged(env), Verdict::Accept);
-        assert!(e.blocks.contains_key(&id));
+        let verdict = e.ingest_judged(env);
+        assert_eq!(e.rejected_future, 0, "a current block is never past any clock rule");
+        assert_eq!(
+            e.orphans.len(),
+            1,
+            "however far behind the chain is, a current block still gets past both slot rules to the gates behind them",
+        );
+        assert_eq!(verdict, Verdict::Ignore);
+        assert!(!e.blocks.contains_key(&id));
+    }
+
+    /// **The horizon is not shadowed by the tighter tolerance.**
+    ///
+    /// `FUTURE_SLOT_TOLERANCE` (8 slots) is stricter than `MAX_FUTURE_SLOTS`
+    /// (64) and would answer first — but only while the node is `live`. During
+    /// boot and sync it is skipped entirely, and this horizon is then the only
+    /// thing standing between a gossiped `u64::MAX` and `epoch_of` walking it.
+    ///
+    /// Delete the horizon check and this fails: the envelope lands in the
+    /// orphan pool instead of being turned away.
+    #[test]
+    fn the_horizon_still_bounds_a_gossiped_slot_while_the_node_is_not_live() {
+        let mut e = engine_at_wall_slot(10);
+        e.live = false;
+        let env = envelope_at_slot(u64::MAX);
+        let id = *env.block_id().as_bytes();
+
+        assert_eq!(
+            e.ingest_judged(env),
+            Verdict::Reject,
+            "the tolerance is off during sync; the horizon must still answer",
+        );
+        assert_eq!(e.rejected_future, 0, "and it is the horizon answering, not the tolerance");
+        assert!(!e.blocks.contains_key(&id));
+        assert!(
+            e.orphans.is_empty(),
+            "a slot past the horizon must not even reach the orphan pool",
+        );
     }
 
     /// Slot 0 keeps its own answer. Genesis is synthesized, never received, so
@@ -7896,5 +8358,347 @@ mod slot_horizon {
             "{MAX_FUTURE_SLOTS} slots is only {secs}s of skew tolerance — too tight for a \
              fleet whose clocks are not a consensus input",
         );
+    }
+}
+
+/// **H8 — `blocks` is no longer a write-anything map.**
+///
+/// The finding: `Engine::blocks` grew from UNVALIDATED envelopes. Nothing
+/// checked the proposer signature, nothing bounded the slot, nothing required
+/// the parent to be known, and fork choice was rebuilt over the result on
+/// every ingest — so one unauthenticated peer could grow this node's memory
+/// without limit AND make each subsequent ingest more expensive, since both
+/// `advance`'s loop bound and `path_to_canonical`'s cycle guard are
+/// `blocks.len()`.
+///
+/// The reason the leak survived is worth stating, because it is what these
+/// tests are shaped around: `advance` DOES delete an invalid block — but only
+/// the one block it actually tried to apply. A block whose parent is unknown
+/// is never tried (`path_to_canonical` returns `None`), and a block that
+/// loses the fork-choice tie is never tried either. Both stay forever. So
+/// every test here uses an envelope `advance` will not reach, which is
+/// precisely the envelope an attacker would send.
+#[cfg(test)]
+mod ingest_admission_tests {
+    use super::*;
+
+    /// A block built from a real proposal, re-pointed at `parent` and re-signed
+    /// so that the ONLY thing the node can hold against it is what the test is
+    /// about. Re-signing matters: `proposal_signing_root` covers the header, so
+    /// moving the parent invalidates the original signature and the block would
+    /// otherwise be refused for the wrong reason.
+    fn repointed(
+        engine: &Engine,
+        template: &BlockEnvelope,
+        parent: [u8; 32],
+        slot: u64,
+    ) -> BlockEnvelope {
+        let mut env = template.clone();
+        env.header.parent = parent;
+        env.header.slot = slot;
+        env.proposer_sig = engine
+            .keys
+            .as_ref()
+            .expect("the proposing fixture holds a keystore")
+            .sign(&env.header.proposal_signing_root());
+        env
+    }
+
+    /// One real proposal to use as a template, and the store size to compare
+    /// against.
+    fn fixture() -> (Engine, perf_support::TestDir, BlockEnvelope, usize) {
+        let (mut engine, dir) = perf_support::proposing_engine();
+        engine.propose(1);
+        let template = engine
+            .blocks
+            .get(engine.head_id().as_bytes())
+            .expect("the proposal was adopted")
+            .clone();
+        let stored = engine.blocks.len();
+        (engine, dir, template, stored)
+    }
+
+    /// **A block that connects to nothing does not become a fork-choice
+    /// input.** It is held in the bounded orphan pool and the gap it is
+    /// evidence of is asked for.
+    ///
+    /// Fails without the fix: `ingest` stored it, `advance` could not reach it
+    /// (`path_to_canonical` → `None`), and nothing ever removed it.
+    #[test]
+    fn an_unconnected_block_is_parked_not_stored() {
+        let (mut engine, _dir, template, stored) = fixture();
+        engine.needs_sync = false;
+
+        let orphan = repointed(&engine, &template, [0x9A; 32], 2);
+        engine.ingest(orphan);
+
+        assert_eq!(
+            engine.blocks.len(),
+            stored,
+            "a block hanging off a root this node has never seen must not enter \
+             `blocks` — nothing in `advance` can ever remove it again"
+        );
+        assert_eq!(engine.orphans.len(), 1, "it must be held, not dropped");
+        assert!(
+            engine.needs_sync,
+            "parking an orphan is evidence of a gap and must ask for it"
+        );
+    }
+
+    /// **And the pool is bounded, oldest out first.**
+    ///
+    /// The envelopes here name an unregistered proposer index, which is the
+    /// second half of the gate: an identity this node cannot check is parked
+    /// rather than stored, so it costs one bounded slot instead of a permanent
+    /// entry in a fork-choice input. That also makes the test cheap — it needs
+    /// no hybrid signatures at all, which is the shape the attack has too.
+    ///
+    /// Fails without the fix: all `ORPHAN_MAX + 8` land in `blocks` and stay.
+    #[test]
+    fn the_orphan_pool_is_bounded_and_evicts_the_oldest_first() {
+        let (mut engine, _dir, template, stored) = fixture();
+        const EXTRA: usize = 8;
+
+        let mut first_parent = [0u8; 32];
+        for i in 0..ORPHAN_MAX + EXTRA {
+            let mut env = template.clone();
+            // An index the genesis manifest never registered.
+            env.header.proposer_index = 7;
+            env.header.slot = 2;
+            env.header.parent = [0u8; 32];
+            env.header.parent[0] = (i & 0xFF) as u8;
+            env.header.parent[1] = ((i >> 8) & 0xFF) as u8;
+            if i == 0 {
+                first_parent = env.header.parent;
+            }
+            engine.ingest(env);
+        }
+
+        assert_eq!(
+            engine.blocks.len(),
+            stored,
+            "unauthenticated envelopes must never reach `blocks`"
+        );
+        assert_eq!(
+            engine.orphans.len(),
+            ORPHAN_MAX,
+            "the pool is capped at ORPHAN_MAX"
+        );
+        assert_eq!(
+            engine.orphans_evicted, EXTRA as u64,
+            "everything above the cap must be counted out, not silently kept"
+        );
+        assert!(
+            !engine
+                .orphans
+                .iter()
+                .any(|(_, env)| env.header.parent == first_parent),
+            "FIFO: the oldest entry is the one evicted"
+        );
+    }
+
+    /// **A repeated orphan takes one slot, not one per delivery.** Without the
+    /// dedup a full mesh re-offering the same block would evict the whole pool
+    /// with copies of itself.
+    #[test]
+    fn the_same_orphan_offered_repeatedly_occupies_one_slot() {
+        let (mut engine, _dir, template, _stored) = fixture();
+        let orphan = repointed(&engine, &template, [0x9A; 32], 2);
+        for _ in 0..16 {
+            engine.ingest(orphan.clone());
+        }
+        assert_eq!(engine.orphans.len(), 1, "dedup by block id");
+        assert_eq!(engine.orphans_evicted, 0, "and nothing was pushed out");
+    }
+
+    /// **A forged signature under a key this node HAS registered is refused at
+    /// the door** — it does not even take an orphan slot, because this node
+    /// can prove it is a forgery and the transition would reject it too.
+    ///
+    /// Fails without the fix: the envelope is stored and unreachable.
+    #[test]
+    fn a_forged_proposer_signature_is_refused_outright() {
+        let (mut engine, _dir, template, stored) = fixture();
+
+        let mut forged = repointed(&engine, &template, [0x9A; 32], 2);
+        let n = forged.proposer_sig.len();
+        forged.proposer_sig = vec![0u8; n];
+        engine.ingest(forged);
+
+        assert_eq!(engine.blocks.len(), stored, "a forgery must not be stored");
+        assert!(
+            engine.orphans.is_empty(),
+            "a provable forgery must not consume a slot the honest gap needs"
+        );
+        assert_eq!(engine.rejected_unsigned, 1, "and it must be counted");
+    }
+
+    /// **A slot the clock will not reach for hours is refused.** Otherwise a
+    /// peer signing at `u64::MAX - k` writes entries no `advance` will ever
+    /// consume.
+    ///
+    /// The parent is unknown as well, so that the ONLY thing standing between
+    /// this envelope and the orphan pool is the slot bound: fails without the
+    /// fix by landing in `orphans` instead of being turned away.
+    #[test]
+    fn a_block_far_ahead_of_the_wall_clock_is_refused() {
+        let (mut engine, _dir, template, stored) = fixture();
+        // Well beyond the tolerance rather than one slot past it: the
+        // fixture's genesis is `now`, hybrid signing in a debug build takes
+        // real seconds, and the wall slot moves while the envelope is being
+        // built. One slot of margin makes this test pass or fail on how
+        // loaded the box is; forty makes it a test of the rule.
+        //
+        // Forty and not ten thousand, because C1's `MAX_FUTURE_SLOTS` horizon
+        // now sits in front of this check and would answer first for a slot
+        // that far out. Staying inside the horizon is what keeps THIS test
+        // about the tolerance — `rejected_future` is incremented on no other
+        // path, so it also proves the horizon did not shadow the tolerance.
+        let far = repointed(
+            &engine,
+            &template,
+            [0x9A; 32],
+            engine.wall_slot() + FUTURE_SLOT_TOLERANCE + 40,
+        );
+        engine.ingest(far);
+
+        assert_eq!(engine.blocks.len(), stored);
+        assert!(
+            engine.orphans.is_empty(),
+            "the slot bound must turn it away before the orphan pool sees it"
+        );
+        assert_eq!(engine.rejected_future, 1);
+
+        // The control: one slot inside the tolerance is NOT refused, so the
+        // bound is a bound and not a blanket.
+        let near = repointed(
+            &engine,
+            &template,
+            [0x9B; 32],
+            engine.wall_slot() + FUTURE_SLOT_TOLERANCE,
+        );
+        engine.ingest(near);
+        assert_eq!(engine.orphans.len(), 1, "inside the tolerance it is held");
+        assert_eq!(engine.rejected_future, 1, "and nothing more was refused");
+    }
+
+    /// **The pool is not a black hole.** Out-of-order delivery — the child
+    /// before its parent, which is the normal case on a mesh — still converges
+    /// on the same head, through the promotion path rather than through a
+    /// re-request.
+    ///
+    /// This is the liveness half of the fix, and it is why the parent rule can
+    /// be as strict as it is.
+    #[test]
+    fn an_orphan_is_admitted_when_its_parent_lands() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let genesis = *engine.head_id().as_bytes();
+
+        engine.propose(1);
+        let b1 = engine
+            .blocks
+            .get(engine.head_id().as_bytes())
+            .expect("proposed")
+            .clone();
+        engine.propose(2);
+        let b2 = engine
+            .blocks
+            .get(engine.head_id().as_bytes())
+            .expect("proposed")
+            .clone();
+
+        // Hand both blocks back and forget them, so the same envelopes can be
+        // delivered again — this time in the wrong order.
+        assert!(
+            engine.do_reorg(genesis, Vec::new()),
+            "giving the chain back must succeed"
+        );
+        engine
+            .blocks
+            .remove(b1.block_id().as_bytes())
+            .expect("stored until now");
+        engine
+            .blocks
+            .remove(b2.block_id().as_bytes())
+            .expect("stored until now");
+        assert_eq!(*engine.head_id().as_bytes(), genesis);
+
+        // The child first.
+        engine.ingest(b2.clone());
+        assert_eq!(engine.orphans.len(), 1, "the child has nowhere to attach yet");
+        assert_eq!(
+            *engine.head_id().as_bytes(),
+            genesis,
+            "and it must not have moved the head"
+        );
+
+        // Then the parent, which must pull the child in behind it.
+        engine.ingest(b1.clone());
+        assert!(engine.orphans.is_empty(), "the child was promoted");
+        assert!(engine.orphans_admitted >= 1, "and the promotion was counted");
+        assert_eq!(
+            *engine.head_id().as_bytes(),
+            *b2.block_id().as_bytes(),
+            "out-of-order delivery must still land on the same head as in-order \
+             delivery — a bounded pool that never releases is just a slower leak"
+        );
+    }
+
+    /// **The slot bound is a rule about PEERS, not about this node's own
+    /// producer.**
+    ///
+    /// A proposer chose the slot it is building for, and the slot loop only
+    /// ever calls `propose` for the slot it is currently in. Re-judging that
+    /// block against the wall clock adds nothing and subtracts a lot: on a
+    /// box loaded enough that the two readings drift, the node would refuse
+    /// its own proposal and lose the slot — the h28080 shape, arrived at from
+    /// a different direction.
+    ///
+    /// The fixture makes the difference visible: its genesis is `now`, so a
+    /// slot past the tolerance is trivially reachable, and every other gate
+    /// (authentication, known parent) still applies to the block.
+    ///
+    /// Fails if the `Source::Local` exemption is removed.
+    #[test]
+    fn the_producer_is_not_refused_by_the_bound_it_imposes_on_peers() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        // Far enough past the tolerance that the clock moving during the
+        // proposal cannot quietly bring it back inside and make the assertion
+        // vacuous — 60 slots is 60 s of drift at the fixture's cadence.
+        let far = engine.wall_slot() + FUTURE_SLOT_TOLERANCE + 60;
+
+        engine.propose(far);
+
+        assert_eq!(
+            engine.head_slot_now(),
+            far,
+            "the node must adopt the block it just built for the slot it was \
+             asked to build for"
+        );
+        assert_eq!(
+            engine.rejected_future, 0,
+            "and it must not have been counted as a future-slot refusal"
+        );
+    }
+
+    /// **Pruning is finality-shaped, not slot-shaped.** With nothing finalized
+    /// there is no floor, so nothing may be dropped; this pins that the sweep
+    /// cannot start eating a live branch on a chain that has not finalized.
+    #[test]
+    fn nothing_is_pruned_before_the_chain_finalizes_anything() {
+        let (mut engine, _dir, template, stored) = fixture();
+        assert_eq!(
+            engine.state.finality().finalized.epoch,
+            0,
+            "the fixture has not finalized anything"
+        );
+        let orphan = repointed(&engine, &template, [0x9A; 32], 2);
+        engine.ingest(orphan);
+
+        engine.prune_below_finalized();
+
+        assert_eq!(engine.blocks.len(), stored, "no stored block may be dropped");
+        assert_eq!(engine.orphans.len(), 1, "and no parked block either");
+        assert_eq!(engine.blocks_pruned, 0);
     }
 }
