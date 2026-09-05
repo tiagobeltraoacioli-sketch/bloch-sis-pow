@@ -102,6 +102,23 @@ pub struct RpcConfig {
     /// Needed when node runs in Docker with default bridge networking.
     /// SECURITY: only set true on trusted single-tenant hosts.
     pub trust_private_ranges:      bool,
+    /// R3-audit H-R3-5: browser origins allowed to call this RPC (exact
+    /// `scheme://host[:port]` values). Empty (default) = no browser origin is
+    /// allowed: no CORS grants are emitted and any request carrying an
+    /// `Origin` header is refused. `"*"` allows any origin for READ methods
+    /// only — write methods never honour the wildcard.
+    pub allowed_origins:           Vec<String>,
+    /// R3-audit H-R3-5: extra hostnames accepted in the `Host` header
+    /// (anti-DNS-rebinding). IP literals and `localhost` are always accepted;
+    /// a reverse-proxy / tunnel hostname must be listed here. `"*"` disables
+    /// the check.
+    pub allowed_hosts:             Vec<String>,
+    /// R3-audit H-R3-5: restore the historical "loopback bypasses auth"
+    /// behaviour. Default false: loopback keeps its rate-limit exemption but
+    /// must satisfy the same API-key policy as remote callers (a browser on
+    /// the operator's machine connects from 127.0.0.1 — the blanket bypass
+    /// made every local web page an authenticated operator).
+    pub trust_loopback:            bool,
 }
 
 impl Default for RpcConfig {
@@ -114,6 +131,9 @@ impl Default for RpcConfig {
             rate_limit_reads_per_min:  60,
             rate_limit_writes_per_min: 5,
             trust_private_ranges:      false,
+            allowed_origins:           Vec::new(),
+            allowed_hosts:             Vec::new(),
+            trust_loopback:            false,
         }
     }
 }
@@ -130,8 +150,124 @@ struct AppState {
     require_auth_for_writes: bool,
     rate_limiter:            Arc<auth::RateLimiterSet>,
     trust_private_ranges:    bool,
+    // R3-audit H-R3-5: browser gate + loopback-auth policy + heavy-read bound.
+    allowed_origins:         Arc<Vec<String>>,
+    allowed_hosts:           Arc<Vec<String>>,
+    trust_loopback:          bool,
+    heavy_gate:              Arc<HeavyGate>,
     // B5f pool seam: submitblock hook (None = method returns "not wired").
     submit_block:            Option<Arc<SubmitBlockFn>>,
+}
+
+// ─── R3-audit H-R3-5: bound the unauthenticated heavy read RPCs ─────────────
+//
+// These five methods do O(chain) work per call — `supply_distribution` and
+// `chain_stats` iterate EVERY block (twice, for the former), and the
+// per-address history walks grow with the chain — on a port with no auth and,
+// for loopback/private callers, no rate limit, so a request loop stacks
+// O(chain) scans without bound. The bound is structural: results are served
+// from a short TTL cache, and at most ONE cache-missing scan runs at a time —
+// a second concurrent caller gets an immediate "busy" error instead of
+// stacking another O(chain) walk.
+const HEAVY_READ_METHODS: &[&str] = &[
+    "getsupplydistribution",
+    "getchainstats",
+    "gethashrate",
+    "getaddresscount",
+    "getaddressbalance_at_height",
+];
+
+/// TTL for cached heavy-read results. Analytics freshness of ~1 block is fine.
+const HEAVY_READ_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Cap on distinct cached keys (parameterised methods could otherwise grow
+/// the map unboundedly — the exact DoS shape this gate exists to close).
+const HEAVY_READ_CACHE_MAX_KEYS: usize = 64;
+
+pub struct HeavyGate {
+    ttl:   std::time::Duration,
+    cache: parking_lot::Mutex<std::collections::HashMap<String, (std::time::Instant, Value)>>,
+    /// Held for the duration of a scan; `try_lock` makes concurrency-1 a hard
+    /// bound with no queueing (queueing would just move the pile-up).
+    scan:  parking_lot::Mutex<()>,
+}
+
+impl HeavyGate {
+    pub fn new(ttl: std::time::Duration) -> Self {
+        Self {
+            ttl,
+            cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            scan:  parking_lot::Mutex::new(()),
+        }
+    }
+
+    pub fn is_heavy(method: &str) -> bool {
+        HEAVY_READ_METHODS.contains(&method)
+    }
+
+    /// Serve `key` from cache when fresh; otherwise run `f` under the single
+    /// scan permit. A caller that can neither hit the cache nor take the
+    /// permit gets an error Value immediately (bounded, non-queueing).
+    pub fn run<F: FnOnce() -> Value>(&self, key: String, f: F) -> Value {
+        let now = std::time::Instant::now();
+        if let Some((at, v)) = self.cache.lock().get(&key) {
+            if now.duration_since(*at) < self.ttl {
+                return v.clone();
+            }
+        }
+        match self.scan.try_lock() {
+            Some(_permit) => {
+                let v = f();
+                let mut cache = self.cache.lock();
+                if cache.len() >= HEAVY_READ_CACHE_MAX_KEYS {
+                    // Evict stale entries first; if still full, drop the map —
+                    // correctness is unaffected (it is a cache).
+                    cache.retain(|_, (at, _)| now.duration_since(*at) < self.ttl);
+                    if cache.len() >= HEAVY_READ_CACHE_MAX_KEYS {
+                        cache.clear();
+                    }
+                }
+                cache.insert(key, (std::time::Instant::now(), v.clone()));
+                v
+            }
+            None => json!({
+                "error": "busy: another heavy analytics scan is in flight; retry shortly",
+            }),
+        }
+    }
+}
+
+/// R3-audit H-R3-5: the CORS layer this server actually mounts.
+///
+/// Replaces `CorsLayer::permissive()`, which reflected EVERY origin (with
+/// methods and headers) and thereby let any web page preflight its way into
+/// `sendrawtransaction`. Policy:
+///   - empty allowlist (default): `CorsLayer::new()` — no CORS grants at all;
+///   - `"*"`: any origin may make CORS requests, but the per-request Origin
+///     gate in `handle_rpc` still refuses write methods (wildcard never
+///     applies to writes);
+///   - otherwise: exactly the listed origins.
+/// Credentials are never allowed; the API key travels in explicit headers.
+fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
+    use axum::http::{HeaderValue, Method, header};
+    let base = CorsLayer::new()
+        .allow_methods([Method::POST])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+            header::HeaderName::from_static("x-api-key"),
+        ]);
+    if allowed_origins.is_empty() {
+        // No allow-origin is ever emitted; browsers refuse the response.
+        CorsLayer::new()
+    } else if allowed_origins.iter().any(|o| o == "*") {
+        base.allow_origin(tower_http::cors::Any)
+    } else {
+        let origins: Vec<HeaderValue> = allowed_origins
+            .iter()
+            .filter_map(|o| HeaderValue::from_str(o.trim_end_matches('/')).ok())
+            .collect();
+        base.allow_origin(tower_http::cors::AllowOrigin::list(origins))
+    }
 }
 
 pub async fn start_rpc_server(
@@ -161,25 +297,34 @@ pub async fn start_rpc_server(
         require_auth_for_writes: config.require_auth_for_writes,
         rate_limiter,
         trust_private_ranges:    config.trust_private_ranges,
+        allowed_origins:         Arc::new(config.allowed_origins.clone()),
+        allowed_hosts:           Arc::new(config.allowed_hosts.clone()),
+        trust_loopback:          config.trust_loopback,
+        heavy_gate:              Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
         submit_block,
     };
 
     // P0 RPC hardening (roadmap §1.6 / §4.3): body-size cap, global
     // concurrency limit, and a per-request timeout on top of the existing
-    // per-IP auth/rate-limit. Auth behaviour is unchanged.
+    // per-IP auth/rate-limit.
+    // R3-audit H-R3-5: the CORS layer is restrictive (see build_cors_layer);
+    // Host/Origin are additionally checked per request in handle_rpc.
     let app = Router::new()
         .route("/", post(handle_rpc))
-        .layer(CorsLayer::permissive())
+        .layer(build_cors_layer(&config.allowed_origins))
         .layer(DefaultBodyLimit::max(RPC_MAX_BODY_BYTES))
         .layer(GlobalConcurrencyLimitLayer::new(RPC_MAX_CONCURRENCY))
         .layer(TimeoutLayer::new(std::time::Duration::from_secs(RPC_REQUEST_TIMEOUT_SECS)))
         .with_state(app_state);
 
-    info!("RPC on {} (auth={}, require_auth_writes={}, trust_private={}, limits: {}r/min, {}w/min)",
+    info!("RPC on {} (auth={}, require_auth_writes={}, trust_private={}, trust_loopback={}, origins={:?}, hosts={:?}, limits: {}r/min, {}w/min)",
         addr,
         config.api_key.is_some(),
         config.require_auth_for_writes,
         config.trust_private_ranges,
+        config.trust_loopback,
+        config.allowed_origins,
+        config.allowed_hosts,
         config.rate_limit_reads_per_min,
         config.rate_limit_writes_per_min,
     );
@@ -235,13 +380,39 @@ async fn handle_rpc(
     let client_ip = addr.ip();
     let presented_key = auth::extract_api_key(&headers);
 
-    let decision = auth::authorize_with_trust(
+    // R3-audit H-R3-5: Host + Origin gate BEFORE auth/rate-limit. Refuses
+    // DNS-rebinding (hostile hostname in Host) and browser-borne CSRF (an
+    // Origin the operator did not allowlist; wildcard never covers writes).
+    let host_hdr   = headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok());
+    let origin_hdr = headers.get(axum::http::header::ORIGIN).and_then(|v| v.to_str().ok());
+    if let Err(refusal) = auth::gate_browser_request(
+        host_hdr,
+        origin_hdr,
+        method,
+        &state.allowed_hosts,
+        &state.allowed_origins,
+    ) {
+        crate::metrics::inc_rpc_request(method, "forbidden");
+        log::info!("rpc denied ip={} method={} reason={:?} host={:?} origin={:?}",
+            client_ip, method, refusal, host_hdr, origin_hdr);
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id":      id,
+                "error":   { "code": -32003, "message": "forbidden: request refused by Host/Origin policy" },
+            })),
+        );
+    }
+
+    let decision = auth::authorize_with_policy(
         client_ip,
         method,
         presented_key,
         state.api_key.as_deref(),
         state.require_auth_for_writes,
         state.trust_private_ranges,
+        state.trust_loopback,
         &state.rate_limiter,
     );
 
@@ -278,7 +449,20 @@ async fn handle_rpc(
             let d_params = params.cloned();
             let d_handle = tokio::runtime::Handle::current();
             let result = tokio::task::spawn_blocking(move || {
-                d_handle.block_on(dispatch(&d_method, d_params.as_ref(), &d_state))
+                // R3-audit H-R3-5: heavy O(chain) analytics reads go through
+                // the HeavyGate — TTL cache + at most one scan in flight.
+                if HeavyGate::is_heavy(&d_method) {
+                    let key = format!(
+                        "{}|{}",
+                        d_method,
+                        d_params.as_ref().map(|p| p.to_string()).unwrap_or_default(),
+                    );
+                    d_state.heavy_gate.clone().run(key, || {
+                        d_handle.block_on(dispatch(&d_method, d_params.as_ref(), &d_state))
+                    })
+                } else {
+                    d_handle.block_on(dispatch(&d_method, d_params.as_ref(), &d_state))
+                }
             })
                 .instrument(tracing::info_span!(
                     "rpc_request",
@@ -2072,5 +2256,142 @@ mod euvm_admission_tests {
                           vec![0xDE, 0xAD]);
         let err = euvm_admit_tx_standalone(&tx, &lookup).unwrap_err();
         assert!(err.contains("output 0 invalid"), "got: {err}");
+    }
+}
+
+// ── R3-audit H-R3-5 tests: CORS layer + heavy-read gate ─────────────────────
+//
+// The auth-layer refusal logic (Host/Origin/loopback/WRITE_METHODS) is
+// unit-tested in `auth.rs`; these tests pin the two pieces that live here:
+// the mounted CORS layer is NOT permissive, and the heavy-read gate bounds
+// the O(chain) analytics methods.
+#[cfg(test)]
+mod h_r3_5_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{header, HeaderValue, Method, Request, StatusCode};
+    use tower::util::ServiceExt; // oneshot
+
+    fn router_with(origins: &[&str]) -> Router {
+        let origins: Vec<String> = origins.iter().map(|s| s.to_string()).collect();
+        Router::new()
+            .route("/", axum::routing::post(|| async { "ok" }))
+            .layer(build_cors_layer(&origins))
+    }
+
+    async fn preflight(router: Router, origin: &str) -> axum::http::Response<Body> {
+        let req = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/")
+            .header(header::ORIGIN, origin)
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+            .body(Body::empty())
+            .unwrap();
+        router.oneshot(req).await.unwrap()
+    }
+
+    /// The core regression: with the default (empty) origin allowlist, a
+    /// hostile page's preflight gets NO Access-Control-Allow-Origin grant.
+    /// `CorsLayer::permissive()` echoed the origin back — this test FAILS on
+    /// the pre-fix wiring.
+    #[tokio::test]
+    async fn default_config_grants_no_cors_to_any_origin() {
+        let resp = preflight(router_with(&[]), "https://evil.example").await;
+        assert!(
+            resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+            "no origin allowlisted, yet a CORS grant was emitted: {:?}",
+            resp.headers()
+        );
+    }
+
+    #[tokio::test]
+    async fn allowlisted_origin_gets_cors_unlisted_does_not() {
+        let router = router_with(&["https://wallet.posternlabs.com"]);
+        let ok = preflight(router.clone(), "https://wallet.posternlabs.com").await;
+        assert_eq!(
+            ok.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&HeaderValue::from_static("https://wallet.posternlabs.com")),
+        );
+        let bad = preflight(router, "https://evil.example").await;
+        assert!(bad.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+            "unlisted origin must not receive a CORS grant");
+    }
+
+    /// Simple (non-preflighted) POST: the response must carry no grant for an
+    /// unlisted origin, so a browser page cannot read it.
+    #[tokio::test]
+    async fn simple_post_response_carries_no_grant_for_unlisted_origin() {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/")
+            .header(header::ORIGIN, "https://evil.example")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router_with(&[]).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK); // handler ran (gate lives in handle_rpc)
+        assert!(resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+    }
+
+    // ── HeavyGate ───────────────────────────────────────────────────
+
+    #[test]
+    fn heavy_methods_are_exactly_the_five_scanners() {
+        for m in ["getsupplydistribution", "getchainstats", "gethashrate",
+                  "getaddresscount", "getaddressbalance_at_height"] {
+            assert!(HeavyGate::is_heavy(m), "{m} must be gated");
+        }
+        assert!(!HeavyGate::is_heavy("getblockcount"));
+        assert!(!HeavyGate::is_heavy("sendrawtransaction"));
+    }
+
+    #[test]
+    fn heavy_gate_serves_cache_instead_of_rescanning() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let gate = HeavyGate::new(std::time::Duration::from_secs(60));
+        let scans = AtomicU32::new(0);
+        for _ in 0..10 {
+            let v = gate.run("getsupplydistribution|".into(), || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                json!({"tiers": []})
+            });
+            assert_eq!(v, json!({"tiers": []}));
+        }
+        assert_eq!(scans.load(Ordering::SeqCst), 1,
+            "10 identical heavy calls inside the TTL must run exactly 1 scan");
+    }
+
+    #[test]
+    fn heavy_gate_refuses_concurrent_second_scan() {
+        use std::sync::Arc as StdArc;
+        let gate = StdArc::new(HeavyGate::new(std::time::Duration::from_secs(60)));
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let g2 = gate.clone();
+        let t = std::thread::spawn(move || {
+            g2.run("getchainstats|".into(), || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap(); // hold the scan permit
+                json!({"total_blocks": 1})
+            })
+        });
+        started_rx.recv().unwrap(); // first scan is in flight
+        // A different heavy key cannot start a second concurrent scan.
+        let v = gate.run("getsupplydistribution|".into(), || json!({"should": "not run"}));
+        assert!(v.get("error").is_some(),
+            "second concurrent heavy scan must be refused, got {v}");
+        release_tx.send(()).unwrap();
+        assert_eq!(t.join().unwrap(), json!({"total_blocks": 1}));
+    }
+
+    #[test]
+    fn heavy_gate_cache_is_bounded() {
+        let gate = HeavyGate::new(std::time::Duration::from_secs(3600));
+        // Parameterised heavy method: attacker varies params to grow the map.
+        for i in 0..(HEAVY_READ_CACHE_MAX_KEYS * 4) {
+            gate.run(format!("getaddressbalance_at_height|[\"addr{i}\",1]"), || json!(i));
+        }
+        assert!(gate.cache.lock().len() <= HEAVY_READ_CACHE_MAX_KEYS,
+            "cache must stay bounded under key churn");
     }
 }
