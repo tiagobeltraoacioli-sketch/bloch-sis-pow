@@ -31,18 +31,17 @@
 # adds no new failure to the pipeline — it adds a verdict on the GHSA-only
 # surface that nothing else covers.
 
-# ── OPEN, REAL, ACCEPTED: the most exposed residual on the node ──────────────
-# Stream-multiplexer DoS in yamux 0.12.1. Surfaced ONLY here: cargo-audit's
-# RustSec-only feed does not carry it. libp2p-yamux 0.47.0 (libp2p 0.56.0)
-# resolves both yamux 0.12.1 and 0.13.10 in Cargo.lock, and the 0.12 line has no
-# patched release, so there is no bump path that does not move off libp2p 0.56.
-# Reachability is any connected peer over the yamux muxer — neither noise nor
-# /ip4/-only peering mitigates it. Accepted-but-tracked, NOT dismissed: remove
-# this entry the moment libp2p repins yamux.
-[[IgnoredVulns]]
-id = "GHSA-vxx9-2994-q338"
-ignoreUntil = 2026-12-01
-reason = "yamux 0.12.1 DoS (CVSS 8.7), pinned by libp2p-yamux 0.47.0; no upstream bump path. Tracked in SECURITY_TOOLING.md as an OPEN residual; re-review 2026-12-01."
+# ── CLOSED 2026-09-05 (audit finding SC3-yamux-dedupe): GHSA-vxx9-2994-q338 ──
+# yamux 0.12.1 (stream-multiplexer DoS, CVSS 8.7, reachable by any peer) is
+# GONE from Cargo.lock: the workspace [patch.crates-io] points libp2p-yamux at
+# the vendored crates/libp2p-yamux fork, which removes the 0.12 backend and
+# floors yamux at 0.13.10 — the version that fixes the advisory. Worse than
+# the audit knew, upstream libp2p-yamux SWITCHED the live muxer onto 0.12.1
+# whenever a config setter ran, which bloch-pos-node's p2p bootstrap does.
+# The former [[IgnoredVulns]] entry for it is deliberately DELETED so any
+# regression (the patch dropped, a second yamux resolving) fails this scan
+# again; deny.toml `[bans] multiple-versions = "deny"` and
+# crates/libp2p-yamux/tests/lockfile_guard.rs guard the same invariant.
 
 # ── SP1 / plonky3 prover stack — host-side proving, never the node runtime ────
 # Pulled exclusively through the pinned SP1 4.2.1 prover; not on the consensus,

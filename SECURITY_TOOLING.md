@@ -5,8 +5,9 @@
 > Genesis-3 (proof of work) stopped at height 39,918; the ownerless thesis was
 > retracted (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
 >
-> The scanner inventory and the tracked open-advisory set (hickory-proto,
-> yamux GHSA-vxx9-2994-q338) are current and consensus-independent. The scope
+> The scanner inventory and the tracked open-advisory set (hickory-proto;
+> yamux GHSA-vxx9-2994-q338 was CLOSED 2026-09-05, see below) are current and
+> consensus-independent. The scope
 > table below now names the live PoS crates; the PoW fuzz targets and the
 > description of the EVM as an L2 scaffold are superseded
 > (`docs/adr/ADR-040-evm-and-ustav-at-l1.md`).
@@ -98,7 +99,7 @@ No Solidity is deployed yet (the L2 is a Rust revm scaffold). The Solidity toolc
    - **Why not fixed:** the fix is in hickory 0.26.x (DNSSEC code moved to `hickory-net`); **libp2p 0.56.0 pins hickory-proto 0.25.2** via `libp2p-dns` + `libp2p-mdns`. We cannot bump hickory without a libp2p release that repins it.
    - **Reachability / mitigation:** the DNS surface is `/dns4/` multiaddr resolution and LAN-only mDNS discovery. The node's canonical peering uses `/ip4/` addresses (no DNS resolution), and DNSSEC validation is not enabled — practical exposure is a self-inflicted malicious resolver or a hostile LAN.
    - **Action:** remove both `--ignore` entries the moment a libp2p release pins hickory ≥ 0.26.
-   - **⚠️ GHSA-vxx9-2994-q338 — yamux 0.12.1 (CVSS 8.7):** stream-multiplexer DoS. Surfaced by **osv-scanner** (GHSA-only — cargo-audit's RustSec feed does not carry it). Same upstream block as hickory: `libp2p-yamux 0.47.0` (libp2p 0.56.0) pins yamux 0.12.1; the fix (yamux 0.13/0.14) is unreachable until libp2p repins. Reachability is any connected peer over the yamux muxer — **the most exposed of the open residuals**; noise/`/ip4/` peering does not mitigate it. **Action:** bump the moment libp2p repins yamux; until then this is an accepted-but-tracked P2P DoS risk, carried as a dated `[[IgnoredVulns]]` entry in `osv-scanner.toml` (re-review **2026-12-01**, after which it fails CI again).
+   - **✅ GHSA-vxx9-2994-q338 — yamux 0.12.1 (CVSS 8.7): CLOSED 2026-09-05 (audit finding SC3-yamux-dedupe).** Stream-multiplexer DoS, was reachable by any connected peer — and worse than first assessed: upstream `libp2p-yamux 0.47.0` keeps TWO yamux backends and silently switches the live muxer onto the vulnerable 0.12.1 line the moment any config setter runs, which `bloch-pos-node`'s p2p bootstrap does (`set_max_num_streams(4096)`), so the "fixed" 0.13.10 copy in the lock was the one *not* running. **Fix:** the workspace `[patch.crates-io]` now points `libp2p-yamux` at the vendored `crates/libp2p-yamux` fork, which removes the 0.12 backend entirely and floors yamux at `>= 0.13.10`; yamux 0.12.1 is gone from `Cargo.lock`. **Regression guards (three, independent):** the `[[IgnoredVulns]]` entry was deleted from `osv-scanner.toml` (the advisory fails CI again if the copy returns); `deny.toml` `[bans] multiple-versions = "deny"` with yamux deliberately absent from the skip allowlist; and `crates/libp2p-yamux/tests/lockfile_guard.rs` fails if the lock ever holds two yamux entries, a yamux < 0.13.10, or a registry-sourced libp2p-yamux. Drop the vendored fork when an upstream libp2p release sheds the yamux 0.12 dependency.
    - **GHSA-vj64-rjf3-w3v7 — p3-challenger 0.2.2-succinct (CVSS 8.9)** and **GHSA-3g92-f9ch-qjcm — p3-symmetric (2.9):** plonky3 crates pinned by the SP1 4.2.1 prover stack — **host-side proof generation only, never the node consensus/P2P runtime.** Not bumpable without moving off pinned SP1. Tracked; low practical exposure. Same disposition, same dated entries in `osv-scanner.toml`.
 
    **Fixes applied this pass (real bumps, in-semver, staged in `Cargo.lock`):**
