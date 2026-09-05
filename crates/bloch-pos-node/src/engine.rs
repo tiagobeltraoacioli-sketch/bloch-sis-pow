@@ -84,6 +84,7 @@ use bloch_pos_committee::forkchoice::{BlockTree, LatestMessage, Store as FcStore
 use bloch_pos_committee::gossip::{AttestationPool, GossipDecision};
 use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, VERSION_G4};
 use bloch_pos_committee::interfaces::{ProposalEnvelope, StateReader, StateTransition};
+use bloch_pos_committee::params::{MAX_ATTESTATIONS_PER_BLOCK, SLOTS_PER_EPOCH};
 use bloch_pos_committee::schedule::first_slot_of_epoch;
 use bloch_pos_committee::transition::{CommittedState, PosTransaction, Transition};
 use bloch_pos_committee::interfaces::TransitionError;
@@ -1254,19 +1255,41 @@ impl Engine {
         // future, author in its slot's committee (the same predicate the
         // transition enforces at step 8, applied as the producer's filter so
         // one bad pool entry cannot poison the block — the dust-tx lesson).
-        let atts: Vec<Attestation> = self
+        //
+        // The epoch partition is drawn ONCE, exactly as the transition's step
+        // 8 draws it. `committee_for_slot` inside this filter shuffled the
+        // whole active set per pool entry and discarded 31 of the 32 chunks it
+        // built; on a full pool that is the same quadratic cost the validator
+        // side just shed, paid by the one node that is on the clock. The
+        // `epoch_of(..) == e` guard above the lookup is what makes the single
+        // draw sound — it is the same guard, in the same order, as step 8.
+        let partition = committees::epoch_committees(&seed, e, &roster);
+        let mut atts: Vec<Attestation> = self
             .pool
             .values()
             .filter(|a| {
                 epoch_of(a.data.slot) == e
                     && a.data.slot <= slot
                     && a.data.source_epoch < a.data.target_epoch
-                    && committees::committee_for_slot(&seed, a.data.slot, &roster)
-                        .binary_search(&a.validator)
-                        .is_ok()
+                    && partition
+                        .get((a.data.slot % SLOTS_PER_EPOCH) as usize)
+                        .is_some_and(|c| c.binary_search(&a.validator).is_ok())
             })
             .cloned()
             .collect();
+        // The producer's own half of the block-level bound the transition now
+        // enforces (`params::MAX_ATTESTATIONS_PER_BLOCK`). The pool is keyed
+        // by `(validator, signing_root)`, so it cannot hold a duplicate and
+        // this cannot silently drop one — but it can, in principle, hold more
+        // distinct votes than a body may carry, and a producer that built such
+        // a body would be building a block every node rejects. The dust-tx
+        // lesson: filter at the producer, do not discover it at validation.
+        //
+        // Sorted before the cut so the truncation is a function of the votes
+        // and not of `BTreeMap` iteration happening to be stable — and so two
+        // producers holding the same pool would cut the same way.
+        atts.sort_by_key(|a| (a.data.slot, a.validator, a.data.signing_root()));
+        atts.truncate(MAX_ATTESTATIONS_PER_BLOCK);
 
         let randao = self.randao_positioned();
         let Some(reveal) = randao.peek_reveal() else {

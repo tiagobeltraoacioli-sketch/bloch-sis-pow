@@ -431,6 +431,26 @@ pub enum TransitionError {
     /// and `BadSignature` in particular are the two facts an operator must be
     /// able to read off a divergence without a debugger.
     Transfer(u32, TransferReject),
+    /// The body carries more attestations than
+    /// `params::MAX_ATTESTATIONS_PER_BLOCK`.
+    ///
+    /// A property of the *block*, so it carries no index — like
+    /// `BlockGasLimitExceeded` above, blaming one attestation would point
+    /// whoever reads the log at an innocent vote. The bound restates the wire
+    /// decoder's own cap inside consensus so it holds on every path a body can
+    /// arrive by, not only the one that happens to run that decoder.
+    TooManyAttestations,
+    /// The body carries the same `(validator, signing_root)` pair twice; the
+    /// index of the *second* occurrence.
+    ///
+    /// Not folded into `Attestation(i)`, because the two facts differ in who
+    /// is at fault and what to do about it. `Attestation(i)` says a vote was
+    /// invalid — the attester or the state disagree. This says every vote may
+    /// be perfectly valid and the *proposer* padded the body with a repeat,
+    /// which commits nothing (the pending-vote map is keyed by exactly this
+    /// pair) and costs every node a hybrid verification. An operator reading
+    /// a divergence needs to tell those apart without a debugger.
+    DuplicateAttestation(u32),
 }
 
 /// Why a value transfer was refused by the state transition.
