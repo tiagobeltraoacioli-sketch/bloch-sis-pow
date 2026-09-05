@@ -68,7 +68,7 @@ output — so it runs over a small fixed `Ctx` instead of `[datum, redeemer…]`
 
 | Field | Index | Constant | Contents |
 |---|---|---|---|
-| sighash | `ctx.fields[0]` | `MINT_CTX_SIGHASH` | `tx.sighash`, `Val::Bytes` — same slot `validate_tx` uses, so `VerifySig` works unchanged |
+| sighash | `ctx.fields[0]` | `MINT_CTX_SIGHASH` | `tx_sighash(tx)` (recomputed over the tx's inputs/outputs/fee), `Val::Bytes` — same slot `validate_tx` uses, so `VerifySig` works unchanged |
 | delta | `ctx.fields[1]` | `MINT_CTX_DELTA` | the signed `Val::Int` delta *being authorised* |
 | height | `ctx.fields[2]` | `MINT_CTX_HEIGHT` | `mctx.height`, `Val::Int` |
 | prior_supply | `ctx.fields[3]` | `MINT_CTX_PRIOR_SUPPLY` | `mctx.prior_supply[asset]` (0 if absent), `Val::Int` |
@@ -201,13 +201,14 @@ unbuilt integration work, not something this note should claim already works.
   and never mutates it. This is an honest, load-bearing gap, not an oversight: it's
   the same "the hook only reads, never persists" framing `harness.rs`'s own note uses
   for its aggregate-only commitment.
-- **The authorising signature does not bind to the specific `delta`.**
+- **The authorising signature does not bind to the specific `delta` directly.**
   `authorized_minter_policy` signs over `ctx.fields[0]` (the tx sighash) only — the
   redeemer signature says "the minter approves this transaction," not "the minter
   approves minting exactly N of this asset." The actual minted amount is bound
   separately and correctly by pass 2's conservation check (the delta the policy
   authorised must equal the transaction's real net change in that asset, or
-  `ValueNotConserved` fires) — so this is not exploitable as written, but it does mean
-  the signature's scope is coarser than "signs the mint amount," and depends on
-  `tx.sighash` actually committing to `tx.outputs` upstream (that commitment is built
-  elsewhere, outside this module, and is not something `minting.rs` verifies).
+  `ValueNotConserved` fires). The sighash it signs is `crate::tx_sighash(tx)`, which
+  `validate_tx_with_mint` recomputes from the transaction's own inputs, outputs and
+  fee — never the spender-declared `tx.sighash` label — so the approval is bound to
+  *this* set of outputs, and (given conservation) to that delta. It cannot be
+  replayed onto a transaction that sends the minted units somewhere else.
