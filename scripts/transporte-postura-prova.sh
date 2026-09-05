@@ -35,11 +35,24 @@ STOP_AT="${STOP_AT:-40}"
 
 [ -x "$BIN" ] || { echo "no binary at $BIN (cargo build -p bloch-pos-node)" >&2; exit 1; }
 
+# ── Keystore at rest (audit I-H1) ──────────────────────────────────────────
+# This is a DEVNET harness: throwaway keys, throwaway chain, a temp dir. The
+# node now refuses to read or write a keystore whose secret key sits on disk in
+# the clear unless someone says so, so this script says so, once, for every
+# bloch-pos it launches below. A real validator is sealed instead: leave this
+# unset and export BLOCH_KEYSTORE_PASSPHRASE_FILE=<path> in the unit.
+export BLOCH_KEYSTORE_ALLOW_PLAINTEXT=1
+
+
 rm -rf "$W"; mkdir -p "$W/keys" "$W/logs"
 KEYDIRS=""
 for i in 0 1 2; do
   d="$W/keys/node$i"; mkdir -p "$d"
-  "$BIN" keygen --dir "$d" --index "$i" >/dev/null || exit 1
+  # Throwaway devnet keys in a temp dir: --allow-plaintext-keystore is the
+  # explicit opt-in the node now requires before it will write (or read) a
+  # keystore with the secret key in the clear (audit I-H1). A real validator
+  # is sealed instead, with BLOCH_KEYSTORE_PASSPHRASE_FILE.
+  "$BIN" keygen --allow-plaintext-keystore --dir "$d" --index "$i" >/dev/null || exit 1
   KEYDIRS="${KEYDIRS}${KEYDIRS:+,}$d"
 done
 "$BIN" genesis --keys "$KEYDIRS" --out "$W/g.blg" --slot-ms 2000 --start-in 5 >/dev/null || exit 1

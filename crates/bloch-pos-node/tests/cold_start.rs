@@ -54,9 +54,19 @@ const SLOT_MS: u64 = 1000;
 /// Where the run stops. Must leave the cold node enough slots after it joins.
 const STOP_SLOT: u64 = 45;
 /// Seconds the genesis manifest puts between `genesis` and slot 0.
-const GENESIS_START_IN_SECS: u64 = 6;
+///
+/// Was 6, raised with the sealed keystore (audit I-H1): every node now runs
+/// Argon2id at 64 MiB before it can read its key, which is ~1.6s of real
+/// startup per process in a debug build and is the cost the seal is buying.
+/// Three of those inside a 6-second window had the founders joining several
+/// slots late and out of step with each other, which is a reorg, which trips
+/// the byte-identity assertion at the bottom of this file. Budgeting for a
+/// cost the binary genuinely pays is not weakening the test — no assertion
+/// below changes, and `COLD_START_DELAY_SECS` moves by the same amount so
+/// `COLD_JOIN_SLOT` is exactly what it was.
+const GENESIS_START_IN_SECS: u64 = 12;
 /// How long after launching the founders the cold node is started, in seconds.
-const COLD_START_DELAY_SECS: u64 = 18;
+const COLD_START_DELAY_SECS: u64 = 24;
 /// The slot the chain has reached when the cold node's process begins. Blocks
 /// at earlier slots cannot have been gossiped to it live — it can only have
 /// them by asking a peer for history and validating what came back.
@@ -81,8 +91,23 @@ fn tmp_root() -> PathBuf {
     d
 }
 
+/// The keystore is sealed at rest (audit I-H1), and the passphrase is supplied
+/// out of band — there is no prompt and this test has no tty. Handing it to
+/// every child process is not test scaffolding around the fix: it is the
+/// deployment shape the fix requires, and running the whole cold start under
+/// it is what proves the binary can `keygen`, `genesis` and `run` against a
+/// sealed key rather than only the unit tests being able to.
+///
+/// A throwaway string for throwaway devnet keys in a temp dir. No fleet host,
+/// no real keystore, and no real passphrase is involved anywhere in this file.
+const TEST_PASSPHRASE: &str = "cold-start devnet throwaway";
+
 fn run_to_completion(args: &[&str]) -> String {
-    let out = Command::new(BIN).args(args).output().expect("spawn bloch-pos");
+    let out = Command::new(BIN)
+        .env("BLOCH_KEYSTORE_PASSPHRASE", TEST_PASSPHRASE)
+        .args(args)
+        .output()
+        .expect("spawn bloch-pos");
     assert!(
         out.status.success(),
         "bloch-pos {args:?} failed: {}",
@@ -132,6 +157,7 @@ fn spawn_node(
     let out = std::fs::File::create(log).expect("create log");
     let err = out.try_clone().expect("dup log");
     Command::new(BIN)
+        .env("BLOCH_KEYSTORE_PASSPHRASE", TEST_PASSPHRASE)
         .args([
             "run",
             "--data-dir",

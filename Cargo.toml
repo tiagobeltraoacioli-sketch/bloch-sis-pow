@@ -39,6 +39,17 @@ members = [
 # crate, add it to `members` — do not give it a private workspace.
 exclude = ["crates/coherence-prover", "fuzz"]
 
+# Argon2id is memory-hard BY DESIGN, so compiled unoptimized it is memory-hard
+# AND slow: ~7s per keystore unlock in a debug build, against ~0.2s optimized.
+# That is a build artefact, not a security parameter — it makes `cargo test`
+# and any debug-binary devnet run painful without making anything safer. Two
+# dependencies, optimized in dev/test only; no source, behaviour or output of
+# this workspace changes.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+
 [profile.release]
 opt-level      = 3
 lto            = true

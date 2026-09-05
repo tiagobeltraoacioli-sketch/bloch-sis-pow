@@ -53,6 +53,15 @@ ARMS=("$@"); [ ${#ARMS[@]} -eq 0 ] && ARMS=(control island island-obs observer b
 BIN="${BLOCH_POS_BIN:?set BLOCH_POS_BIN}"
 [ -x "$BIN" ] || { echo "no binary at $BIN" >&2; exit 1; }
 
+# ── Keystore at rest (audit I-H1) ──────────────────────────────────────────
+# This is a DEVNET harness: throwaway keys, throwaway chain, a temp dir. The
+# node now refuses to read or write a keystore whose secret key sits on disk in
+# the clear unless someone says so, so this script says so, once, for every
+# bloch-pos it launches below. A real validator is sealed instead: leave this
+# unset and export BLOCH_KEYSTORE_PASSPHRASE_FILE=<path> in the unit.
+export BLOCH_KEYSTORE_ALLOW_PLAINTEXT=1
+
+
 DEV_BASE="${DEV_BASE:-19510}"     # devnet mesh TCP ports
 P2P_BASE="${P2P_BASE:-19520}"     # libp2p TCP ports
 RPC_BASE="${RPC_BASE:-17510}"
@@ -65,7 +74,12 @@ mkdir -p "$WORKDIR/rpc" "$WORKDIR/logs" "$WORKDIR/keys"
 
 for i in 0 1 2; do
   d="$WORKDIR/keys/node$i"; mkdir -p "$d"
-  "$BIN" keygen --dir "$d" --index "$i" >/dev/null || { echo "keygen failed" >&2; exit 1; }
+  # Throwaway devnet keys in a temp dir: --allow-plaintext-keystore is the
+  # explicit opt-in the node now requires before it will write (or read) a
+  # keystore with the secret key in the clear (audit I-H1). A real validator
+  # is sealed instead, with BLOCH_KEYSTORE_PASSPHRASE_FILE.
+  "$BIN" keygen --allow-plaintext-keystore --dir "$d" --index "$i" >/dev/null \
+    || { echo "keygen failed" >&2; exit 1; }
   KEYDIRS="${KEYDIRS:-}${KEYDIRS:+,}$d"
 done
 

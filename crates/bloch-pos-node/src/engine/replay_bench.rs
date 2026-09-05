@@ -303,7 +303,17 @@ impl Generator {
         // 64 real hybrid keypairs. Slow (Falcon-1024 keygen), paid once, and
         // outside every measured region.
         let keys: Vec<Keystore> = (0..N_VALIDATORS)
-            .map(|i| Keystore::generate(&dir.join(format!("v{i}")), i).expect("keystore"))
+            .map(|i| {
+                // Plaintext by explicit opt-in (audit I-H1): throwaway bench
+                // keys in a temp dir, and 64 keystores x Argon2id would be
+                // pure setup cost outside every measured region.
+                Keystore::generate_with(
+                    &dir.join(format!("v{i}")),
+                    i,
+                    &crate::keys::Unlock::PlaintextOptIn,
+                )
+                .expect("keystore")
+            })
             .collect();
 
         let validators: Vec<ManifestValidator> = keys
