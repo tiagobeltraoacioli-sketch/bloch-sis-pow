@@ -577,8 +577,10 @@ fn do_newaddress(wallet_path: &str, label: &str) {
         Err(e) => { eprintln!("Load failed: {}", e); process::exit(1); }
     };
 
-    let new_kp = wallet.new_address(label);
-    let new_addr = new_kp.address.clone();
+    let new_addr = match wallet.new_address(label) {
+        Ok(kp) => kp.address.clone(),
+        Err(e) => { eprintln!("Derivation failed: {}", e); process::exit(1); }
+    };
 
     if let Err(e) = wallet.save(path) {
         eprintln!("Save failed: {}", e);
