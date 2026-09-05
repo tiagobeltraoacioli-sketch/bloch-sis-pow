@@ -8320,6 +8320,7 @@ mod slot_horizon {
             blocks_pruned: 0,
             rejected_unsigned: 0,
             rejected_future: 0,
+            slashprot: SlashingProtection::open(&dir).expect("open slashing protection"),
         }
     }
 
