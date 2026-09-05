@@ -2989,12 +2989,18 @@ pub fn run(cfg: Config) -> io::Result<()> {
     }
 
     // No keystore in the data dir is not a misconfiguration — it selects
-    // observer mode. Any other read error still is, and is reported: a node
-    // that silently downgraded to observer because its key was unreadable
-    // would stop attesting and look healthy doing it.
-    let keys = match Keystore::load(&cfg.data_dir) {
-        Ok(k) => Some(k),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+    // observer mode. Anything else is a misconfiguration and stops the boot.
+    //
+    // The decision is `load_optional`'s, not this match's, and that is the
+    // whole point: `Ok(None)` there means the FILE IS ABSENT and nothing
+    // else. This site used to ask `e.kind() == NotFound` instead, which also
+    // caught a missing `BLOCH_KEYSTORE_PASSPHRASE_FILE` — so a validator with
+    // a good sealed key and an unprovisioned credential path restarted as a
+    // silent observer, printing the reassuring line below and attesting
+    // nothing. There is no error kind left here to misread.
+    let keys = match Keystore::load_optional(&cfg.data_dir)? {
+        Some(k) => Some(k),
+        None => {
             println!(
                 "observer mode: no keystore in {}. This node follows the chain, applies \
                  every block and serves the RPC. It does not propose and does not attest.",
@@ -3002,7 +3008,6 @@ pub fn run(cfg: Config) -> io::Result<()> {
             );
             None
         }
-        Err(e) => return Err(e),
     };
     // Stateless now: it holds no key table. Keys are resolved per call from
     // the committed registry by whichever consensus site is asking.

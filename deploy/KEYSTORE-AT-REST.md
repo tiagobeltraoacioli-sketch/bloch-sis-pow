@@ -14,10 +14,10 @@ validator: the signing key *and* the RANDAO seed.
 ## READ THIS BEFORE DEPLOYING THE BINARY
 
 **Every keystore on the live fleet today is `BPOSKEY1` (plaintext), and the new
-binary refuses to load one unless told to.** `Keystore::load` returns
-`PermissionDenied`, and the engine treats any non-`NotFound` keystore error as
-fatal. A fleet-wide restart onto this binary with no other change is a
-**fleet-wide halt**, not a degraded mode.
+binary refuses to load one unless told to.** The loader returns
+`PermissionDenied` and the engine stops the boot. A fleet-wide restart onto
+this binary with no other change is a **fleet-wide halt**, not a degraded
+mode.
 
 Pick one *before* the rollout, not during it:
 
@@ -36,6 +36,38 @@ Pick one *before* the rollout, not during it:
 
 Never do both halves at once on more than one validator: a host that cannot
 open its key does not attest, and enough of them at once moves finality.
+
+## A halt, and never a silent observer
+
+That halt is the *intended* failure and it matters which one you get. A node
+with no `validator.key` at all runs as an **observer** — it follows the chain
+and serves RPC, and proposes and attests nothing. That is a legitimate role, so
+it is not an error. A node that has a keystore it cannot open must never land
+in it: an observer looks healthy, and a validator that came back from a restart
+as one is silently absent from finality until somebody counts attestations.
+
+So the rule in `keys.rs` is narrow: **observer mode is selected by the absence
+of the file, and by nothing else.** `Keystore::load_optional` returns
+`Ok(None)` only when `validator.key` is not there. A keystore that exists but
+is plaintext without the opt-in, sealed with no passphrase, sealed with the
+wrong passphrase, unreadable, truncated, or whose `BLOCH_KEYSTORE_PASSPHRASE_FILE`
+has not been provisioned is an `Err` that names the problem and stops the node.
+
+The last of those is the one that bit: an unmounted `LoadCredential=` path used
+to fail with `NotFound`, the engine matched on that error kind to decide
+observer mode, and a fully provisioned validator restarted into
+`observer mode: no keystore in /var/lib/bloch/nNN` with a good sealed key
+sitting in that very directory. Two things now prevent it — the engine no
+longer reads an error kind at all, and no configuration refusal is kinded
+`NotFound`. Both are covered by tests in `keys.rs`
+(`plaintext_without_the_flag_is_loud_and_with_the_flag_still_loads`,
+`a_present_keystore_that_will_not_open_is_never_reported_as_absent`,
+`only_an_absent_file_selects_observer_mode`,
+`a_missing_passphrase_file_cannot_impersonate_a_missing_keystore`).
+
+**What to check after a restart:** the absence of `observer mode:` on a host
+that is supposed to validate. If you see it, the node did not find a keystore —
+it did not fail to open one.
 
 ## Supplying the passphrase
 

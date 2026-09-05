@@ -200,8 +200,50 @@ impl Unlock {
     /// that quietly read a plaintext key because nobody configured anything
     /// is the defect this function exists to close.
     pub fn from_env() -> io::Result<Unlock> {
-        if let Some(path) = std::env::var_os("BLOCH_KEYSTORE_PASSPHRASE_FILE") {
-            let raw = Zeroizing::new(fs::read(&path)?);
+        Self::from_sources(
+            std::env::var_os("BLOCH_KEYSTORE_PASSPHRASE_FILE"),
+            std::env::var("BLOCH_KEYSTORE_PASSPHRASE").ok(),
+            plaintext_opt_in(),
+        )
+    }
+
+    /// The whole of [`Unlock::from_env`]'s decision, with the three inputs
+    /// passed in instead of read from the process. Split out so the rule
+    /// below can be tested without mutating a global environment that every
+    /// other test in the binary shares.
+    ///
+    /// ## Not one of these errors is `NotFound` — deliberately
+    ///
+    /// `NotFound` is a *load-bearing* error kind here: the engine reads
+    /// "there is no `validator.key`" as "run as an observer". A refusal from
+    /// this function is about the operator's configuration, never about the
+    /// keystore, so it must not be able to impersonate a missing keystore.
+    /// The passphrase file is where that used to leak: a bare `fs::read(path)?`
+    /// on a `LoadCredential=` path that did not exist returned `NotFound`, the
+    /// engine took it for "no keystore", and a fully provisioned validator
+    /// came back from a restart as a silent observer — attesting nothing,
+    /// logging nothing wrong. See `load_optional`.
+    pub fn from_sources(
+        pass_file: Option<std::ffi::OsString>,
+        pass: Option<String>,
+        plaintext_opt_in: bool,
+    ) -> io::Result<Unlock> {
+        if let Some(path) = pass_file {
+            let shown = std::path::Path::new(&path).display().to_string();
+            let raw = Zeroizing::new(fs::read(&path).map_err(|e| {
+                // Re-kinded, not just re-worded: see the doc comment. A
+                // missing or unreadable passphrase file is a configuration
+                // refusal, and PermissionDenied is what the engine treats as
+                // fatal.
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "BLOCH_KEYSTORE_PASSPHRASE_FILE={shown} cannot be read ({e}). \
+                         This node has a keystore it cannot open; it will NOT \
+                         fall back to observer mode"
+                    ),
+                )
+            })?);
             let mut s = String::from_utf8(raw.to_vec()).map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -219,12 +261,12 @@ impl Unlock {
             }
             return Ok(Unlock::passphrase(s));
         }
-        if let Ok(p) = std::env::var("BLOCH_KEYSTORE_PASSPHRASE") {
+        if let Some(p) = pass {
             if !p.is_empty() {
                 return Ok(Unlock::passphrase(p));
             }
         }
-        if plaintext_opt_in() {
+        if plaintext_opt_in {
             return Ok(Unlock::PlaintextOptIn);
         }
         Err(io::Error::new(
@@ -409,6 +451,75 @@ impl Keystore {
     pub fn load_with(dir: &Path, unlock: &Unlock) -> io::Result<Keystore> {
         let bytes = Zeroizing::new(fs::read(dir.join("validator.key"))?);
         Self::decode(&bytes, unlock)
+    }
+
+    /// **The production loader.** `Ok(None)` means one thing and only one
+    /// thing: `dir/validator.key` does not exist, so this node is an observer.
+    /// Every other outcome — a keystore that is there but plaintext without
+    /// the opt-in, sealed with no passphrase configured, sealed with the
+    /// WRONG passphrase, unreadable, truncated, or whose passphrase file is
+    /// missing — is a loud `Err`.
+    ///
+    /// ## Why this exists instead of matching on the error kind
+    ///
+    /// The engine used to spell the same rule as
+    /// `match Keystore::load(..) { Err(e) if e.kind() == NotFound => observer }`,
+    /// which quietly assumed that the only `NotFound` reachable from `load`
+    /// was the keystore itself. It was not: `Unlock::from_env` read
+    /// `BLOCH_KEYSTORE_PASSPHRASE_FILE` with a bare `?`, so a credential path
+    /// that had not been provisioned yet — the ordinary first-boot and
+    /// `LoadCredential=` failure — surfaced as `NotFound` too. A validator
+    /// with a perfectly good sealed key on disk then printed
+    /// "observer mode: no keystore in …" and ran on: no proposals, no
+    /// attestations, no error, no exit code. On a fleet where restarts are
+    /// routine, that is a validator lost to a typo, and the operator's only
+    /// evidence is a line that says everything is fine.
+    ///
+    /// So the observer decision is made HERE, from the one fact that means
+    /// it — the file is absent — and the caller gets an `Option` with no
+    /// error kind left to misread. `from_sources` additionally guarantees no
+    /// configuration refusal is ever kinded `NotFound`; this function does
+    /// not depend on that, which is the point of having both.
+    pub fn load_optional(dir: &Path) -> io::Result<Option<Keystore>> {
+        Self::load_optional_inner(dir, None)
+    }
+
+    /// [`Keystore::load_optional`] with the policy passed in rather than read
+    /// from the environment. Same contract: `Ok(None)` ⇔ no keystore file.
+    pub fn load_optional_with(dir: &Path, unlock: &Unlock) -> io::Result<Option<Keystore>> {
+        Self::load_optional_inner(dir, Some(unlock))
+    }
+
+    fn load_optional_inner(dir: &Path, unlock: Option<&Unlock>) -> io::Result<Option<Keystore>> {
+        let path = dir.join("validator.key");
+        let bytes = match fs::read(&path) {
+            Ok(b) => Zeroizing::new(b),
+            // The one and only observer signal.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            // Present but unreadable (mode, ACL, I/O error) is NOT observer
+            // mode. A node whose key it cannot read has a problem to fix, not
+            // a role to assume.
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "{} exists but cannot be read ({e}); refusing to start as an \
+                         observer with a validator key present",
+                        path.display()
+                    ),
+                ))
+            }
+        };
+        // A keystore IS present from here on, so a policy failure is fatal.
+        let owned;
+        let unlock = match unlock {
+            Some(u) => u,
+            None => {
+                owned = Unlock::from_env()?;
+                &owned
+            }
+        };
+        Self::decode(&bytes, unlock).map(Some)
     }
 
     fn decode(bytes: &[u8], unlock: &Unlock) -> io::Result<Keystore> {
@@ -873,6 +984,157 @@ mod tests {
             "u32::MAX KiB is 4 TiB",
         );
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+    }
+
+    // ── Fail loud, never silently keyless (the loader contract) ─────────
+    //
+    // These four cover the second half of I-H1: sealing the file is worth
+    // nothing if the loader answers "no keystore" when it means "I could not
+    // open the keystore". `Ok(None)` is the engine's instruction to run as an
+    // observer — no proposals, no attestations — and it must be reachable
+    // from exactly one fact.
+
+    /// `Result::expect_err`/`unwrap` need `T: Debug`, which `Keystore` does
+    /// not implement on purpose. So `Option<Keystore>` comes apart by hand.
+    fn expect_absent(r: io::Result<Option<Keystore>>, what: &str) {
+        match r {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("expected no keystore: {what}"),
+            Err(e) => panic!("expected Ok(None), got an error: {what}: {e}"),
+        }
+    }
+
+    fn expect_loaded(r: io::Result<Option<Keystore>>, what: &str) -> Keystore {
+        match r {
+            Ok(Some(k)) => k,
+            Ok(None) => panic!("SILENT: the keystore was there and the loader said None: {what}"),
+            Err(e) => panic!("expected a loaded keystore: {what}: {e}"),
+        }
+    }
+
+    fn expect_loud(r: io::Result<Option<Keystore>>, what: &str) -> io::Error {
+        match r {
+            Err(e) => e,
+            Ok(None) => panic!("SILENT LIVENESS BUG: {what} — the loader answered \"no keystore\" \
+                                over a keystore that exists. The engine reads that as observer \
+                                mode and this validator would stop attesting without an error"),
+            Ok(Some(_)) => panic!("expected a refusal, the keystore opened: {what}"),
+        }
+    }
+
+    /// THE test the finding asks for, both directions.
+    ///
+    /// A plaintext keystore with no opt-in must be a LOUD error — not
+    /// `Ok(None)`, which is how a restart turns a validator into an observer
+    /// while the log says everything is fine — and the same file must still
+    /// open for an operator who did opt in, so a fleet host is migrated on
+    /// its own schedule instead of being bricked by this fix.
+    #[test]
+    fn plaintext_without_the_flag_is_loud_and_with_the_flag_still_loads() {
+        let dir = tmp_dir("loudplain");
+        Keystore::generate_with(&dir, 11, &Unlock::PlaintextOptIn).expect("gen plaintext");
+
+        let e = expect_loud(
+            Keystore::load_optional_with(&dir, &Unlock::passphrase_with("pp", CHEAP)),
+            "a plaintext keystore under a passphrase policy",
+        );
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        assert_ne!(
+            e.kind(),
+            io::ErrorKind::NotFound,
+            "a refusal must never be able to pass for a missing keystore"
+        );
+
+        let ks = expect_loaded(
+            Keystore::load_optional_with(&dir, &Unlock::PlaintextOptIn),
+            "the explicit opt-in must still load a legacy plaintext keystore",
+        );
+        assert_eq!(ks.index, 11);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The other two ways a present keystore fails to open: no passphrase,
+    /// and the wrong one. Both must be loud. Only an absent file is `None`.
+    #[test]
+    fn a_present_keystore_that_will_not_open_is_never_reported_as_absent() {
+        let dir = tmp_dir("loudsealed");
+        Keystore::generate_with(&dir, 5, &Unlock::passphrase_with("right", CHEAP)).expect("gen");
+
+        expect_loud(
+            Keystore::load_optional_with(&dir, &Unlock::PlaintextOptIn),
+            "a sealed keystore and no passphrase",
+        );
+        expect_loud(
+            Keystore::load_optional_with(&dir, &Unlock::passphrase_with("wrong", CHEAP)),
+            "a sealed keystore and the wrong passphrase",
+        );
+        let ks = expect_loaded(
+            Keystore::load_optional_with(&dir, &Unlock::passphrase_with("right", CHEAP)),
+            "the right passphrase",
+        );
+        assert_eq!(ks.index, 5);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// And the liveness half of the contract, which is just as load-bearing:
+    /// a node with genuinely no key must still boot as an observer rather
+    /// than fail on an unconfigured passphrase.
+    #[test]
+    fn only_an_absent_file_selects_observer_mode() {
+        let dir = tmp_dir("observer");
+        expect_absent(
+            Keystore::load_optional_with(&dir, &Unlock::passphrase_with("pp", CHEAP)),
+            "no validator.key in this dir",
+        );
+        expect_absent(
+            Keystore::load_optional_with(&dir, &Unlock::PlaintextOptIn),
+            "no validator.key in this dir, plaintext policy",
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The exact leak the engine's old `e.kind() == NotFound` match caught by
+    /// accident: an unprovisioned `BLOCH_KEYSTORE_PASSPHRASE_FILE`.
+    ///
+    /// Before the fix this returned the raw `fs::read` error, kind
+    /// `NotFound`, indistinguishable from "there is no keystore" — so a
+    /// validator whose credential path had not been mounted yet came back
+    /// from a restart as a silent observer. Read through the pure
+    /// `from_sources` so no global environment is touched.
+    #[test]
+    fn a_missing_passphrase_file_cannot_impersonate_a_missing_keystore() {
+        let missing = tmp_dir("nopassfile").join("credential-that-was-never-mounted");
+        assert!(!missing.exists());
+        let e = err_of(
+            Unlock::from_sources(Some(missing.clone().into_os_string()), None, false),
+            "the passphrase file does not exist",
+        );
+        assert_ne!(
+            e.kind(),
+            io::ErrorKind::NotFound,
+            "a missing passphrase file must not be kinded like a missing keystore"
+        );
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+
+        // No configuration at all is also a refusal, and also not NotFound.
+        let e = err_of(
+            Unlock::from_sources(None, None, false),
+            "nothing configured",
+        );
+        assert_ne!(e.kind(), io::ErrorKind::NotFound);
+
+        // ...while the configurations that ARE valid still resolve.
+        assert!(matches!(
+            Unlock::from_sources(None, Some("pp".into()), false),
+            Ok(Unlock::Passphrase { .. })
+        ));
+        assert!(matches!(
+            Unlock::from_sources(None, None, true),
+            Ok(Unlock::PlaintextOptIn)
+        ));
+        // An empty BLOCH_KEYSTORE_PASSPHRASE is not a passphrase.
+        assert!(Unlock::from_sources(None, Some(String::new()), false).is_err());
+        let _ = fs::remove_dir_all(missing.parent().unwrap());
     }
 
     /// Junk is junk under every policy — no panic, no partial key.
