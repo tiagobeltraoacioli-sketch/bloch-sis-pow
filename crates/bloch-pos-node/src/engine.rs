@@ -334,7 +334,7 @@ fn body_transactions(env: &BlockEnvelope) -> Result<Vec<PosTransaction>, String>
 mod state_cell {
     use std::cell::RefCell;
     use std::ops::Deref;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use bloch_pos_committee::epoch_of;
     use bloch_pos_committee::interfaces::StateReader;
@@ -380,8 +380,30 @@ mod state_cell {
         rolled: Arc<CommittedState>,
     }
 
+    /// The committed head, published for threads that are not the consensus
+    /// thread. See [`StateCell::published_head`].
+    pub type SharedHead = Arc<Mutex<Arc<CommittedState>>>;
+
     pub(super) struct StateCell {
         state: Arc<CommittedState>,
+        /// The same `Arc` as `state`, in a handle the RPC threads can hold.
+        ///
+        /// **This is not a second source of truth.** It is not a
+        /// state-*shaped* copy maintained alongside the real one — the failure
+        /// `EngineBackend`'s doc warns about — it is the identical
+        /// `Arc<CommittedState>` value, replaced whole by the same two writers
+        /// that replace `state` and by nothing else. A reader either sees the
+        /// state before a block or the state after it; there is no
+        /// intermediate value to observe, because a `CommittedState` is
+        /// immutable once published and the transition builds the next one
+        /// beside it rather than editing it.
+        ///
+        /// The mutex is held for exactly one `Arc::clone` on each side, so a
+        /// reader running a long query is not holding anything the consensus
+        /// thread needs — which is the whole point: before this, a
+        /// `getbalance` over the founder's outputs occupied the slot loop for
+        /// its full duration.
+        published: SharedHead,
         /// Bumped by every writer of `state`. There are exactly two — `set`
         /// and `set_arc` — and they do identical bookkeeping: replace the
         /// state, bump this, empty the memo. Two entry points because the
@@ -395,11 +417,33 @@ mod state_cell {
 
     impl StateCell {
         pub(super) fn new(state: CommittedState) -> Self {
+            let state = Arc::new(state);
             StateCell {
-                state: Arc::new(state),
+                published: Arc::new(Mutex::new(Arc::clone(&state))),
+                state,
                 generation: 0,
                 memo: RefCell::new(Vec::new()),
             }
+        }
+
+        /// Publish the current state to the read handle. Called by both
+        /// writers and by nothing else, so the handle cannot lag the cell by
+        /// more than the instant between the two assignments — during which
+        /// it holds the previous *committed* state, never a partial one.
+        fn publish(&self) {
+            let mut slot = match self.published.lock() {
+                Ok(g) => g,
+                // A reader panicking mid-clone cannot have left the value
+                // torn, so the state behind the poison is still the state.
+                Err(p) => p.into_inner(),
+            };
+            *slot = Arc::clone(&self.state);
+        }
+
+        /// A handle on the committed head for threads that must not touch the
+        /// cell — today, the JSON-RPC server's connection threads.
+        pub(super) fn published_head(&self) -> SharedHead {
+            Arc::clone(&self.published)
         }
 
         /// Replace the canonical state. One of the two writers — `set_arc` is
@@ -410,6 +454,7 @@ mod state_cell {
             self.state = Arc::new(state);
             self.generation = self.generation.wrapping_add(1);
             self.memo.get_mut().clear();
+            self.publish();
         }
 
         /// Same, for a state that is already shared — the reorg path builds
@@ -420,6 +465,7 @@ mod state_cell {
             self.state = state;
             self.generation = self.generation.wrapping_add(1);
             self.memo.get_mut().clear();
+            self.publish();
         }
 
         /// The live state as a shared handle, for the one caller that must
@@ -549,6 +595,7 @@ mod state_cell {
 }
 
 use state_cell::StateCell;
+pub use state_cell::SharedHead;
 
 /// The end-to-end replay benchmark (`src/engine/replay_bench.rs`).
 ///
@@ -3480,7 +3527,15 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // `getchaininfo` during boot would be publishing a head it had not yet
     // earned the right to have.
     if let Some(port) = cfg.rpc_port {
-        let backend = Arc::new(crate::rpc::EngineBackend::new(tx.clone()));
+        // The reads that are bounded by the size of the ledger rather than by
+        // the size of the answer (`getbalance`, `getutxos`) are served from
+        // this handle, off the slot loop. Everything else still goes through
+        // the loop, which is where anything touching the mempool or the chain
+        // store belongs.
+        let backend = Arc::new(crate::rpc::EngineBackend::with_head(
+            tx.clone(),
+            engine.state.published_head(),
+        ));
         match crate::rpc::serve(&cfg.rpc_bind, port, backend) {
             Ok(addr) => {
                 println!("JSON-RPC listening on http://{addr}");

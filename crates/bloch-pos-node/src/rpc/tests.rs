@@ -457,6 +457,191 @@ fn getutxos_lists_the_outputs_and_reports_truncation() {
     assert_eq!(page.get("truncated"), Some(&Json::Bool(true)));
 }
 
+// ─── H6: the ledger reads must not be O(the ledger) ─────────────────────────
+
+/// A committed state holding `others` outputs under one script hash and
+/// `mine` under another — the shape of the founder's position in the
+/// carryover, scaled down to something a test can build in milliseconds.
+///
+/// Values are one satoshi each so the opening cannot exceed genesis issuance,
+/// which `CommittedState::genesis` refuses. The size, not the value, is what
+/// this fixture is for.
+fn state_with_many_outputs(others: u32, mine: u32) -> CommittedState {
+    let mut balances = Vec::with_capacity((others + mine) as usize);
+    for i in 0..others {
+        let mut txid = [0u8; 32];
+        txid[..4].copy_from_slice(&i.to_be_bytes());
+        balances.push(EutxoEntry { txid, vout: 0, value: 1, script_hash: [0x77; 32] });
+    }
+    for i in 0..mine {
+        let mut txid = [0xFFu8; 32];
+        txid[..4].copy_from_slice(&i.to_be_bytes());
+        balances.push(EutxoEntry { txid, vout: 0, value: 1_000, script_hash: [0xAB; 32] });
+    }
+    CommittedState::genesis(
+        BlockId::of(&genesis_header()),
+        [9u8; 32],
+        &[GenesisValidator {
+            index: 0,
+            pubkey: vec![0xAA; 64],
+            staked_sat: 200_000 * 100_000_000,
+            randao_commitment: [1u8; 32],
+            withdrawal_credentials: vec![],
+            commission_bps: 500,
+        }],
+        &[0],
+        [0u8; 32],
+        [0u8; 32],
+        [0u8; 32],
+        EvmCommitment {
+            account_root: [0u8; 32],
+            receipts_root: [0u8; 32],
+            gas_used: 0,
+            base_fee_per_gas: 0,
+        },
+        &balances,
+    )
+}
+
+/// **H6, half (a).** `getbalance` and `getutxos` must answer from the script
+/// index, and `getutxos` must apply its limit *during* iteration.
+///
+/// The assertion is a count of entries examined, not a duration: a wall-clock
+/// bound is a flake on a loaded box and says nothing about what the code did.
+/// [`bloch_pos_committee::transition::eutxo_entry_visits`] counts one per
+/// entry looked at, and every full walk of the set goes through the one
+/// iterator that increments it — so a query that reverts to scanning is
+/// counted, never silently uncounted.
+///
+/// What each half of the fix would look like if it regressed:
+///
+/// - Filtering the whole set (the pre-2026-09-05 form): ~20,008 visits here,
+///   452,726 on mainnet, on the thread that proposes blocks.
+/// - Indexing but collecting the holder's outputs before applying the limit
+///   (the half-fix): the `limit: 1` case below visits all 8 instead of 1, and
+///   at the founder's size that is hundreds of thousands of visits to return
+///   one output.
+#[test]
+fn ledger_reads_use_the_script_index_and_stop_at_the_page() {
+    use bloch_pos_committee::transition::{eutxo_entry_visits, reset_eutxo_entry_visits};
+
+    // 2,000 rather than the carryover's 452,726: the assertion is a RATIO
+    // (16 visits against 2,008), and a debug-build genesis pays a full
+    // Merkle build plus the `EutxoSet` debug invariants per entry, which at
+    // mainnet size turns this test into a minute of wall clock for a fact
+    // 2,000 entries already settle.
+    const OTHERS: u32 = 2_000;
+    const MINE: u32 = 8;
+    let st = state_with_many_outputs(OTHERS, MINE);
+
+    // Balance: the count comes from the index without visiting anything, the
+    // sum visits only the holder's own outputs.
+    reset_eutxo_entry_visits();
+    let v = balance_json(&st, &[0xAB; 32]);
+    let visited = eutxo_entry_visits();
+    assert_eq!(v.get("utxo_count").unwrap().as_u64(), Some(u64::from(MINE)));
+    assert_eq!(v.get("balance_sat").unwrap().as_str(), Some("8000"));
+    assert!(
+        visited <= u64::from(MINE) * 2,
+        "getbalance visited {visited} of {} outputs to sum {MINE}: it is walking the \
+         set, not the index",
+        OTHERS + MINE
+    );
+
+    // A holder with nothing must not walk the set either — the fresh-deposit
+    // address an exchange polls in a loop.
+    reset_eutxo_entry_visits();
+    let empty = balance_json(&st, &[0xEE; 32]);
+    assert_eq!(empty.get("balance_sat").unwrap().as_str(), Some("0"));
+    assert_eq!(eutxo_entry_visits(), 0, "an empty balance must visit no output at all");
+
+    // The page: `total` is free, and asking for one output visits one output.
+    reset_eutxo_entry_visits();
+    let page = utxos_json(&st, &[0xAB; 32], 1);
+    let visited = eutxo_entry_visits();
+    assert_eq!(page.get("total").unwrap().as_u64(), Some(u64::from(MINE)));
+    assert_eq!(page.get("returned").unwrap().as_u64(), Some(1));
+    assert_eq!(page.get("truncated"), Some(&Json::Bool(true)));
+    assert!(
+        visited <= 2,
+        "getutxos with limit 1 visited {visited} outputs: the limit is being applied \
+         after a full collect, not during iteration"
+    );
+
+    // The index is not merely fast, it is RIGHT: the same answer a scan gives.
+    //
+    // This scan is also the counter's oracle. Without it the assertions above
+    // could pass because the meter is broken rather than because the query is
+    // cheap — so the scan is measured too, and it must cost what a scan
+    // costs. That is what makes this a mutation test rather than a
+    // measurement of nothing: restore either query to its filtering form and
+    // its visit count moves to THIS number, and the bounds above fail.
+    reset_eutxo_entry_visits();
+    let scanned: u128 = st
+        .eutxos()
+        .filter(|e| e.script_hash == [0xAB; 32])
+        .map(|e| u128::from(e.value))
+        .sum();
+    let scan_cost = eutxo_entry_visits();
+    assert_eq!(scanned, 8_000);
+    assert!(
+        scan_cost >= u64::from(OTHERS),
+        "the visit counter is not counting a full walk ({scan_cost} for {} entries):          every bound in this test would pass vacuously",
+        OTHERS + MINE
+    );
+    assert_eq!(st.utxo_count_for_script(&[0x77; 32]), OTHERS as usize);
+}
+
+/// **H6, half (b).** The ledger reads are answered off the published head, so
+/// a large query cannot occupy the consensus thread.
+///
+/// Proved by taking the consensus thread away: the receiver is dropped, so
+/// anything that goes through the channel fails. `getbalance` still answers,
+/// which it could only do from the snapshot; `getchaininfo` — which reads the
+/// chain store and legitimately belongs on the loop — still fails, so the test
+/// is pinning a *split*, not a backend that answers everything locally.
+#[test]
+fn ledger_reads_are_served_off_the_published_head() {
+    use std::sync::Mutex as StdMutex;
+
+    let st = Arc::new(state_with_balances());
+    let head: crate::engine::SharedHead = Arc::new(StdMutex::new(Arc::clone(&st)));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    drop(rx); // there is no consensus thread; every send from here on fails.
+
+    let backend = EngineBackend::with_head(tx, head);
+
+    let v = backend
+        .call(RpcRequest::Balance([0xAB; 32]))
+        .expect("getbalance must be answerable with no consensus thread listening");
+    assert_eq!(v.get("balance_sat").unwrap().as_str(), Some("18000000000000500"));
+
+    let u = backend
+        .call(RpcRequest::Utxos { script_hash: [0xAB; 32], limit: 2 })
+        .expect("getutxos must be answerable with no consensus thread listening");
+    assert_eq!(u.get("total").unwrap().as_u64(), Some(3));
+    assert_eq!(u.get("returned").unwrap().as_u64(), Some(2));
+
+    assert!(
+        backend.call(RpcRequest::ChainInfo).is_err(),
+        "a read that needs the chain store must still go to the loop — a backend that \
+         answers everything from a state snapshot would be answering questions the \
+         snapshot cannot see"
+    );
+}
+
+/// A backend with no head handle is what it always was: everything crosses the
+/// channel. The fallback exists, and this is what keeps the test above from
+/// passing for the wrong reason.
+#[test]
+fn a_backend_without_a_head_still_routes_balance_to_the_loop() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    drop(rx);
+    let backend = EngineBackend::new(tx);
+    assert!(backend.call(RpcRequest::Balance([0xAB; 32])).is_err());
+}
+
 #[test]
 fn getmempoolinfo_reports_size_capacity_and_the_next_price() {
     let v = mempool_info_json(7, 4_096, 1_750, 1_000, 12, 34);

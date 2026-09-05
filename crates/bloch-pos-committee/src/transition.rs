@@ -1119,6 +1119,38 @@ pub fn eutxo_map_deep_copies() -> u64 {
     EUTXO_MAP_DEEP_COPIES.with(|c| c.get())
 }
 
+thread_local! {
+    /// Entries of the eUTXO set this thread has *looked at*, ever.
+    ///
+    /// The unit is one entry examined, not one query: a full walk of the set
+    /// adds one per entry, an indexed lookup adds one per entry it actually
+    /// yields. That is what makes it the honest measure of the 2026-08-21
+    /// incident, where `getbalance` on the founder's script hash walked all
+    /// 452,726 outputs to sum eight of them — a cost no wall-clock assertion
+    /// can pin without becoming a flake on a loaded box.
+    ///
+    /// Counted in [`EutxoSet::values`] (every full walk goes through it) as
+    /// well as in the indexed path, so a query that reverts to scanning is
+    /// counted rather than silently uncounted. Per-thread for the reason
+    /// [`EUTXO_MAP_DEEP_COPIES`] gives.
+    static EUTXO_ENTRY_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn note_entry_visit() {
+    EUTXO_ENTRY_VISITS.with(|c| c.set(c.get().wrapping_add(1)));
+}
+
+/// The calling thread's [`EUTXO_ENTRY_VISITS`]. Observability only.
+pub fn eutxo_entry_visits() -> u64 {
+    EUTXO_ENTRY_VISITS.with(|c| c.get())
+}
+
+/// Zero the calling thread's [`EUTXO_ENTRY_VISITS`], so a measurement can be
+/// taken across one query rather than across a whole test binary.
+pub fn reset_eutxo_entry_visits() {
+    EUTXO_ENTRY_VISITS.with(|c| c.set(0));
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // The boundary-partition divergence detector (unconditional, NON-FATAL)
 // ────────────────────────────────────────────────────────────────────────────
@@ -1463,7 +1495,11 @@ pub struct EutxoSet {
     /// **Not a consensus change.** The entries, their `BTreeMap` iteration
     /// order, the leaves and the root are bit-identical to the unshared
     /// representation; only *when the allocator copies* moved.
-    entries: std::sync::Arc<BTreeMap<([u8; 32], u32), crate::state_root::EutxoEntry>>,
+    /// Both maps live in ONE `Arc` on purpose: a single `make_mut` unshares
+    /// the outpoint map and the script index together, so they cannot be
+    /// unshared at different times and a clone can never observe one of them
+    /// updated without the other.
+    entries: std::sync::Arc<EutxoMaps>,
     /// The subtree of `entry key -> value hash` leaves, one per entry, always
     /// exactly in step.
     tree: crate::state_root::Smt,
@@ -1489,6 +1525,40 @@ pub struct EutxoSet {
     total_sat: u128,
 }
 
+/// The two views of the same entries the set keeps.
+///
+/// **Why the script index is here and not beside the set.** An index kept as
+/// a sibling field is a cache, and a cache of the ledger that can be updated
+/// independently of the ledger is the `expected_bits` failure with a
+/// different name. Here neither map is separately reachable: `insert` and
+/// `remove` are the only mutators, each writes both, and both live behind the
+/// one `Arc` — the same argument [`EutxoSet`]'s own doc makes for holding the
+/// leaves next to the entries.
+///
+/// **Why it exists at all.** `getbalance` and `listunspent` filtered the
+/// whole set by script hash, twice per call (once to sum, once to count), on
+/// the consensus thread. At the carryover's 452,726 outputs that is the
+/// 2026-08-21 stall under ordinary traffic — a holder asking for their own
+/// balance stops the node from proposing. The index turns the query into a
+/// lookup plus a walk of the matching outputs.
+///
+/// **Not a consensus change.** The index is derived from the entries and
+/// contributes nothing to the state root: [`crate::state_root::eutxo_leaf`]
+/// reads entries, not this. Two states with equal entries have equal indexes
+/// by construction, which is why deriving `PartialEq` over both is sound.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct EutxoMaps {
+    /// The entries themselves, keyed by outpoint — the order the state root
+    /// commits them in.
+    by_outpoint: BTreeMap<([u8; 32], u32), crate::state_root::EutxoEntry>,
+    /// Script hash -> the outpoints locked to it. A `BTreeSet`, not a `Vec`:
+    /// iteration order must be a function of the data (rule 2), so a
+    /// paginated `listunspent` returns the same page on two nodes holding the
+    /// same state. An empty set is removed rather than kept, so "present"
+    /// means "holds at least one output".
+    by_script: BTreeMap<[u8; 32], BTreeSet<([u8; 32], u32)>>,
+}
+
 impl EutxoSet {
     /// The single mutable path to the entries map — copy-on-write.
     ///
@@ -1498,7 +1568,7 @@ impl EutxoSet {
     /// claim of the whole representation (see the field docs). Both mutators
     /// go through here so no third path can copy — or worse, fail to
     /// unshare — without being counted.
-    fn entries_mut(&mut self) -> &mut BTreeMap<([u8; 32], u32), crate::state_root::EutxoEntry> {
+    fn entries_mut(&mut self) -> &mut EutxoMaps {
         if std::sync::Arc::get_mut(&mut self.entries).is_none() {
             EUTXO_MAP_DEEP_COPIES.with(|c| c.set(c.get() + 1));
         }
@@ -1509,7 +1579,26 @@ impl EutxoSet {
         let (key, value_hash) = crate::state_root::eutxo_leaf(&entry);
         self.tree.insert(key, value_hash);
         let value = u128::from(entry.value);
-        let replaced = self.entries_mut().insert((entry.txid, entry.vout), entry);
+        let outpoint = (entry.txid, entry.vout);
+        let script = entry.script_hash;
+        let maps = self.entries_mut();
+        let replaced = maps.by_outpoint.insert(outpoint, entry);
+        // An overwrite that MOVED the output to another script hash has to
+        // leave the old script's set, or the index would answer for a lock
+        // the entries no longer carry. Nothing writes an outpoint twice today
+        // (see the note below); this is here so the index cannot be the thing
+        // that is wrong on the day something does.
+        if let Some(old) = replaced.as_ref() {
+            if old.script_hash != script {
+                if let Some(set) = maps.by_script.get_mut(&old.script_hash) {
+                    set.remove(&outpoint);
+                    if set.is_empty() {
+                        maps.by_script.remove(&old.script_hash);
+                    }
+                }
+            }
+        }
+        maps.by_script.entry(script).or_default().insert(outpoint);
         // An overwrite REPLACES a value, it does not add one. Nothing in the
         // transition writes the same outpoint twice today (a txid commits to
         // its inputs, so a second creation of the same outpoint would need a
@@ -1525,10 +1614,17 @@ impl EutxoSet {
         // The containment probe runs on the shared map so removing an absent
         // outpoint stays what it always was — a no-op — instead of becoming
         // the one full-map copy this type exists to avoid.
-        if !self.entries.contains_key(outpoint) {
+        if !self.entries.by_outpoint.contains_key(outpoint) {
             return;
         }
-        if let Some(entry) = self.entries_mut().remove(outpoint) {
+        let maps = self.entries_mut();
+        if let Some(entry) = maps.by_outpoint.remove(outpoint) {
+            if let Some(set) = maps.by_script.get_mut(&entry.script_hash) {
+                set.remove(outpoint);
+                if set.is_empty() {
+                    maps.by_script.remove(&entry.script_hash);
+                }
+            }
             let (key, _) = crate::state_root::eutxo_leaf(&entry);
             self.tree.remove(&key);
             self.total_sat -= u128::from(entry.value);
@@ -1536,15 +1632,44 @@ impl EutxoSet {
     }
 
     fn get(&self, outpoint: &([u8; 32], u32)) -> Option<&crate::state_root::EutxoEntry> {
-        self.entries.get(outpoint)
+        self.entries.by_outpoint.get(outpoint)
     }
 
     fn contains_key(&self, outpoint: &([u8; 32], u32)) -> bool {
-        self.entries.contains_key(outpoint)
+        self.entries.by_outpoint.contains_key(outpoint)
     }
 
+    /// Every entry, and therefore every full walk of the set. Counted into
+    /// [`EUTXO_ENTRY_VISITS`] one entry at a time, which is what lets a test
+    /// assert that a balance query did NOT come through here.
     fn values(&self) -> impl Iterator<Item = &crate::state_root::EutxoEntry> {
-        self.entries.values()
+        self.entries.by_outpoint.values().inspect(|_| note_entry_visit())
+    }
+
+    /// The entries locked to `script_hash`, in outpoint order, **without
+    /// touching any other entry**.
+    ///
+    /// Lazy on purpose: the caller applies its own `take(limit)` and the work
+    /// stops there, which is the half of the fix a `collect()` before the
+    /// limit would throw away.
+    fn script_entries(
+        &self,
+        script_hash: &[u8; 32],
+    ) -> impl Iterator<Item = &crate::state_root::EutxoEntry> + '_ {
+        self.entries
+            .by_script
+            .get(script_hash)
+            .into_iter()
+            .flatten()
+            .filter_map(move |op| {
+                note_entry_visit();
+                self.entries.by_outpoint.get(op)
+            })
+    }
+
+    /// How many outputs `script_hash` holds, without visiting any of them.
+    fn script_len(&self, script_hash: &[u8; 32]) -> usize {
+        self.entries.by_script.get(script_hash).map_or(0, |s| s.len())
     }
 
     /// Satoshis held by the set: the kept total, checked against a full
@@ -1566,7 +1691,7 @@ impl EutxoSet {
     fn total_sat(&self) -> u128 {
         debug_assert_eq!(
             self.total_sat,
-            self.entries.values().map(|e| u128::from(e.value)).sum::<u128>(),
+            self.entries.by_outpoint.values().map(|e| u128::from(e.value)).sum::<u128>(),
             "the kept eUTXO total drifted from the entries: a mutator updated one half only"
         );
         self.total_sat
@@ -1575,7 +1700,7 @@ impl EutxoSet {
     /// Only tests count the set; the consensus paths iterate it.
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.by_outpoint.len()
     }
 
     /// The subtree this set contributes, ready for
@@ -1594,11 +1719,11 @@ impl EutxoSet {
     fn tree(&self) -> &crate::state_root::Smt {
         debug_assert_eq!(
             self.tree.len(),
-            self.entries.len(),
+            self.entries.by_outpoint.len(),
             "the kept eUTXO subtree drifted from the entries: a mutator updated one half only"
         );
         debug_assert!(
-            self.entries.values().all(|e| {
+            self.entries.by_outpoint.values().all(|e| {
                 let (key, value_hash) = crate::state_root::eutxo_leaf(e);
                 self.tree.get(&key) == Some(value_hash)
             }),
@@ -1628,8 +1753,15 @@ impl FromIterator<crate::state_root::EutxoEntry> for EutxoSet {
         let leaves: BTreeMap<[u8; 32], [u8; 32]> =
             entries.values().map(crate::state_root::eutxo_leaf).collect();
         let total_sat = entries.values().map(|e| u128::from(e.value)).sum();
+        // The index, built in the same pass and from the same entries, so a
+        // bulk-loaded set answers a script query identically to one built by
+        // repeated `insert`.
+        let mut by_script: BTreeMap<[u8; 32], BTreeSet<([u8; 32], u32)>> = BTreeMap::new();
+        for e in entries.values() {
+            by_script.entry(e.script_hash).or_default().insert((e.txid, e.vout));
+        }
         EutxoSet {
-            entries: std::sync::Arc::new(entries),
+            entries: std::sync::Arc::new(EutxoMaps { by_outpoint: entries, by_script }),
             tree: crate::state_root::Smt::from_leaf_map(&leaves),
             total_sat,
         }
@@ -3545,11 +3677,40 @@ impl CommittedState {
     /// is the arithmetic contract, and a balance query is precisely where
     /// ignoring it would be invisible until the one address that overflows.
     pub fn balance_sat(&self, script_hash: &[u8; 32]) -> u128 {
-        self.eutxos
-            .values()
-            .filter(|e| &e.script_hash == script_hash)
-            .map(|e| u128::from(e.value))
-            .sum()
+        // Through the script index, NOT a filter over the whole set. The
+        // filtered form is what stalled the node on 2026-08-21: it is O(every
+        // output that exists) for an answer about one holder's, and it ran on
+        // the thread that proposes blocks.
+        self.eutxos.script_entries(script_hash).map(|e| u128::from(e.value)).sum()
+    }
+
+    /// The outputs locked to `script_hash`, in outpoint order — the `getutxos`
+    /// / `listunspent` surface.
+    ///
+    /// Lazy, so the caller's `take(limit)` bounds the work actually done. A
+    /// caller that collects this before applying its limit has paid for the
+    /// whole of a holder's set to answer a question about the first page, which
+    /// for the founder's script hash is most of the ledger.
+    ///
+    /// Exact equality on `script_hash`, matching [`Self::balance_sat`] and the
+    /// pre-index behaviour: a *carried* Genesis-3 output is a distinct script
+    /// hash (20 significant bytes, 12 zeros) and is queried under the bytes it
+    /// is locked with. `owns` — which relates a KEY to either form — is the
+    /// spend-authorisation rule and deliberately not this.
+    pub fn utxos_for_script(
+        &self,
+        script_hash: &[u8; 32],
+    ) -> impl Iterator<Item = &crate::state_root::EutxoEntry> + '_ {
+        self.eutxos.script_entries(script_hash)
+    }
+
+    /// How many outputs `script_hash` holds, without visiting one of them.
+    ///
+    /// Its own method because `getbalance` reports a count beside the sum, and
+    /// deriving it from a second pass over the holder's outputs would put back
+    /// half of what the index removed.
+    pub fn utxo_count_for_script(&self, script_hash: &[u8; 32]) -> usize {
+        self.eutxos.script_len(script_hash)
     }
 
     /// The price the child block must charge: the EIP-1559 controller applied
@@ -8148,6 +8309,65 @@ mod tests {
         );
         let b = build_block(&t3, &g3, 1, &[], std::slice::from_ref(&at_cap), &mut chains3);
         assert!(t3.apply_block(&g3, &b, &[], std::slice::from_ref(&at_cap)).is_ok());
+    }
+
+    /// The script index must agree with the entries it summarises — after a
+    /// block has moved them, not merely at genesis.
+    ///
+    /// This is the drift guard for the index `getbalance` and `getutxos` now
+    /// read instead of scanning. A scan cannot be wrong about what the ledger
+    /// holds; an index can, and an index that is wrong reports a balance the
+    /// state root does not commit to — a holder told they own coins the chain
+    /// does not agree they own. So the assertion is not "the numbers look
+    /// right", it is "the index and a full scan of the entries return the
+    /// SAME outputs, in the same order", checked on both sides of a transfer
+    /// that spends some outputs and creates others.
+    #[test]
+    fn the_script_index_agrees_with_the_entries_after_a_transfer() {
+        let owner = owner_key(0x5C);
+        let from = script_of(&owner);
+        let to = script_of(&owner_key(0x5D));
+        let coins: Vec<_> = (0..3u32).map(|i| opening(0x5E, i, 4_000_000, &owner)).collect();
+        let (t, g, mut chains) = setup_funded(4, &coins);
+
+        fn agrees(st: &CommittedState, who: [u8; 32]) {
+            let scanned: Vec<_> =
+                st.eutxos().filter(|e| e.script_hash == who).cloned().collect();
+            let indexed: Vec<_> = st.utxos_for_script(&who).cloned().collect();
+            assert_eq!(
+                indexed, scanned,
+                "the script index disagrees with the entries for {:?}",
+                &who[..4]
+            );
+            assert_eq!(st.utxo_count_for_script(&who), scanned.len());
+            assert_eq!(
+                st.balance_sat(&who),
+                scanned.iter().map(|e| u128::from(e.value)).sum::<u128>(),
+                "the indexed balance disagrees with a full scan"
+            );
+        }
+
+        agrees(&g, from);
+        agrees(&g, to);
+        assert_eq!(g.utxo_count_for_script(&from), 3);
+        assert_eq!(g.utxo_count_for_script(&to), 0);
+
+        let tx = transfer_spending(&coins[..2], &owner, to, 0, 0, g.next_base_fee());
+        let b = build_block(&t, &g, 1, &[], std::slice::from_ref(&tx), &mut chains);
+        let post = t
+            .apply_block(&g, &b, &[], std::slice::from_ref(&tx))
+            .expect("the fixture transfer must apply");
+
+        agrees(&post, from);
+        agrees(&post, to);
+        assert!(
+            post.utxo_count_for_script(&from) < 3,
+            "the spender's outputs must have left the index, not only the entries"
+        );
+        assert!(
+            post.utxo_count_for_script(&to) > 0,
+            "the recipient's new output must have entered the index"
+        );
     }
 
     /// The shape the gas half of the test above can no longer take: a transfer
