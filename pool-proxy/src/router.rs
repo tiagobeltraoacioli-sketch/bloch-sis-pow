@@ -19,6 +19,13 @@
 //! node's response ([`ShareOutcome`]) into [`Metrics`], the pool-wide PPLNS
 //! ledger ([`crate::pplns::PplnsLedger`]) and the block-found hook.
 //!
+//! It also *verifies* each submit locally before letting it earn payout: the
+//! notify cache ([`crate::jobstore::JobStore`]) plus the header reconstruction
+//! in [`crate::validator`] decide what the share actually achieved, and only a
+//! share proven to have met the difficulty we announced is PPLNS-credited (see
+//! [`verify_share`] / [`credit_for`]). The node still owns accept/reject; the
+//! local check owns *payout weight*.
+//!
 //! ### Sprint-2 module split (was inline in Sprint 1)
 //!
 //! Two pieces that lived in this file in Sprint 1 now live in sibling modules
@@ -56,7 +63,13 @@
 //! //   (assigns wx to a not-in-use extranonce1, re-dialing the upstream up
 //! //    to cfg.extranonce_redial_max times; falls back to log+count+serve)
 //! //
-//! // crate::pplns::PplnsLedger::record(worker, job_id, difficulty, outcome)
+//! // crate::pplns::PplnsLedger::record(worker, job_id, credited, outcome)
+//! //   (`credited: Option<f64>` — the difficulty the share was LOCALLY
+//! //    VERIFIED to have achieved; `None` earns totals but no payout weight)
+//! //
+//! // crate::jobstore::{parse_notify_full, JobStore}  (the full notify cache)
+//! // crate::validator::{validate, hash_to_difficulty, difficulty_to_target,
+//! //     le_for_height}  (header reconstruction + the PoW compare)
 //! ```
 //!
 //! Keepalive is kept entirely inside the router as a router-owned
@@ -76,6 +89,7 @@ use crate::downstream::DownstreamConn;
 use crate::upstream::UpstreamConn;
 
 use crate::extranonce::{claim_unique, ExtranonceRegistry, WorkerExtranonce};
+use crate::jobstore::{parse_notify_full, FullJob, JobStore};
 use crate::pplns::PplnsLedger;
 use crate::vardiff::Vardiff;
 use crate::validator;
@@ -97,6 +111,97 @@ const PENDING_CAP: usize = 4096;
 /// Cap on non-`subscribe` lines a miner may send before it subscribes.
 /// Bounds the pre-handshake buffer against a peer that never subscribes.
 const PRE_SUBSCRIBE_CAP: usize = 32;
+
+/// Recent `mining.notify` jobs cached per worker so a `mining.submit` can be
+/// reconstructed and hashed LOCALLY (the PPLNS credit check). The `jobstore`
+/// design default: deep enough for a late or ntime-rolled submit against a
+/// slightly older template, shallow enough that the fallback scan over every
+/// cached job stays cheap.
+const JOB_CACHE: usize = 16;
+
+// ─────────────────────────────────────────────────────────────────────────
+// Local share verification — what PPLNS is allowed to credit
+// ─────────────────────────────────────────────────────────────────────────
+
+/// What the local validator concluded about one submitted share.
+#[derive(Clone, Copy, Debug)]
+struct LocalCheck {
+    /// The difficulty the reconstructed header's hash ACTUALLY achieved.
+    achieved: f64,
+    /// Whether that hash met the target we announced to this worker.
+    meets_worker: bool,
+}
+
+/// Reconstruct, hash and grade one submitted share against the cached job it
+/// names — the whole point being that the proxy must never take the miner's
+/// (or its own vardiff's) word for how much work a share represents.
+///
+/// The submitted `job_id` is authoritative when we cached it. When it is not —
+/// an interposed MRR/NiceHash rig proxy re-labels job ids — every cached job is
+/// tried and the STRONGEST reconstruction wins: the hash, not the label,
+/// identifies the work. Endianness is gated per job exactly as the node gates
+/// it per submit (`validator::le_for_height`), unless the operator forced it.
+///
+/// `None` means no cached job reconstructs this share at all, so the proxy
+/// cannot assert it is work — payout fails closed.
+fn verify_share(
+    jobs: &JobStore,
+    en1_hex: &str,
+    share: &Share,
+    announced: f64,
+    le_override: Option<bool>,
+) -> Option<LocalCheck> {
+    let worker_target = validator::difficulty_to_target(announced);
+    let candidates: Vec<&FullJob> = match jobs.get(&share.job_id) {
+        Some(job) => vec![job],
+        None => jobs.iter().collect(),
+    };
+
+    let mut best: Option<LocalCheck> = None;
+    for job in candidates {
+        let le = match le_override {
+            Some(v) => v,
+            None => validator::le_for_height(job.height),
+        };
+        let out = match validator::validate(
+            job,
+            en1_hex,
+            &share.extranonce2,
+            &share.ntime,
+            &share.nonce,
+            share.version,
+            &worker_target,
+            le,
+        ) {
+            Ok(out) => out,
+            // A malformed submit field (or extranonce) is not verifiable work.
+            Err(_) => continue,
+        };
+        let check = LocalCheck {
+            achieved: validator::hash_to_difficulty(&out.hash, le),
+            meets_worker: out.meets_worker,
+        };
+        if best.map_or(true, |b| check.achieved > b.achieved) {
+            best = Some(check);
+        }
+    }
+    best
+}
+
+/// The PPLNS credit a share has EARNED, from its local check.
+///
+/// `Some(announced)` only once the hash is proven to have met the difficulty we
+/// announced — that proven threshold, not the raw achieved value, is the
+/// standard PPLNS weight (crediting the raw value would hand a lucky hash an
+/// unbounded payout fraction). Everything else — a genuine share that landed
+/// below our target, a share we cannot reconstruct — earns `None`: counted in
+/// the totals, weighted at nothing.
+fn credit_for(check: Option<LocalCheck>, announced: f64) -> Option<f64> {
+    match check {
+        Some(c) if c.meets_worker => Some(announced),
+        _ => None,
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────
 // Downstream extranonce reassignment helper
@@ -272,8 +377,13 @@ pub async fn run_worker(
     // Whether the miner sent `mining.extranonce.subscribe`; decides how a
     // reconnect that changes extranonce1 is surfaced downstream.
     let mut miner_wants_extranonce = false;
-    // id_key -> pending submitted share, FIFO, capped.
-    let mut pending: VecDeque<(String, Share)> = VecDeque::new();
+    // id_key -> (pending submitted share, PPLNS credit earned), FIFO, capped.
+    // The credit is decided AT SUBMIT TIME (that is when the job, the
+    // extranonce1 and the announced difficulty are all still current) and
+    // carried here until the node's verdict correlates back.
+    let mut pending: VecDeque<(String, Share, Option<f64>)> = VecDeque::new();
+    // Full `mining.notify` cache backing `verify_share`.
+    let mut jobs = JobStore::new(JOB_CACHE);
 
     let keepalive = tokio::time::sleep(cfg.keepalive_idle);
     tokio::pin!(keepalive);
@@ -341,12 +451,54 @@ pub async fn run_worker(
                         // proxy — decides accept/reject.
                         if let ClientMsg::Submit(mut share) = parsed {
                             share.worker = worker;
-                            share.difficulty = vardiff.current();
+                            // The difficulty this share is JUDGED at: the
+                            // pre-raise grace value while it is still honored
+                            // (a stratum miner only applies a pushed
+                            // `set_difficulty` at the next job), else the
+                            // current announcement.
+                            let now = Instant::now();
+                            let announced = match vardiff.grace(now) {
+                                Some(g) => g.min(vardiff.current()),
+                                None => vardiff.current(),
+                            };
+                            share.difficulty = announced;
+
+                            // PPLNS credit is PROVEN work, never a claim. We
+                            // suppress the node's `set_difficulty`, so the node
+                            // grades against ITS target and can accept a share
+                            // that never met ours; crediting the announced
+                            // difficulty there inflates this worker's payout
+                            // fraction by the ratio between the two targets.
+                            // Reconstruct the header here and credit only what
+                            // the hash is shown to have met.
+                            let check = verify_share(
+                                &jobs,
+                                &upstream.extranonce1,
+                                &share,
+                                announced,
+                                cfg.sha256d_le,
+                            );
+                            let credited = credit_for(check, announced);
+
+                            // A GENUINE share below our announced target earns
+                            // nothing, but it is exactly the signal vardiff's
+                            // downward escape exists for: converge to what this
+                            // miner can actually do instead of announcing a
+                            // target it will never hit (and never be paid for).
+                            if let Some(c) = check {
+                                if !c.meets_worker
+                                    && vardiff.note_low_share(c.achieved).is_some()
+                                {
+                                    down.write(&vardiff.set_difficulty_line()).await?;
+                                    vardiff.mark_announced();
+                                }
+                            }
+
                             let key = id_key(&extract_request_id(&raw));
                             if pending.len() >= PENDING_CAP {
                                 pending.pop_front();
                             }
-                            pending.push_back((key, share));
+                            pending.push_back((key, share, credited));
                             keepalive.as_mut().reset(
                                 tokio::time::Instant::now() + cfg.keepalive_idle,
                             );
@@ -386,6 +538,13 @@ pub async fn run_worker(
                         // proxy suppresses in favour of its own vardiff target.
                         match parsed {
                             ServerMsg::Notify(_job) => {
+                                // Cache the FULL job so a later `mining.submit`
+                                // can be reconstructed and hashed locally. A
+                                // notify we cannot parse is still forwarded —
+                                // shares against it simply earn no credit.
+                                if let Some(full) = parse_notify_full(&raw) {
+                                    jobs.insert(full);
+                                }
                                 // Announce OUR vardiff share-target before the
                                 // first job so the miner mines at the proxy's
                                 // target, not the node's default.
@@ -403,7 +562,7 @@ pub async fn run_worker(
                                 let key = id_key(&id);
                                 let outcome = hooks.classify_block(outcome);
                                 if let Some(pos) =
-                                    pending.iter().position(|(k, _)| *k == key)
+                                    pending.iter().position(|(k, _, _)| *k == key)
                                 {
                                     // Correlates to a submit we forwarded: the
                                     // NODE decided accept/reject. RELAY its
@@ -412,9 +571,9 @@ pub async fn run_worker(
                                     // drive vardiff off the node's acceptance.
                                     down.write(&raw).await?;
                                     metrics.record_outcome(&outcome);
-                                    if let Some((_, share)) = pending.remove(pos) {
+                                    if let Some((_, share, credited)) = pending.remove(pos) {
                                         ledger.record(
-                                            worker, &share.job_id, share.difficulty, &outcome,
+                                            worker, &share.job_id, credited, &outcome,
                                         );
                                         if matches!(
                                             outcome,
@@ -652,6 +811,134 @@ mod tests {
         }
     }
 
+    /// A `mining.notify` in the node's real shape: job_id `"{sid:x}-{height}-
+    /// {ctr:x}"` (height 9000 ⇒ post-fork, so `le_for_height` gates LITTLE-
+    /// ENDIAN), coinb1 `aabb`, coinb2 `ccdd`, empty merkle branch, version 2,
+    /// nbits `1f00ffff` (≈2^-16 per hash, mineable inside a test budget).
+    fn notify_line() -> String {
+        let prevhash: String = (0u8..32).map(|b| format!("{:02x}", b)).collect();
+        format!(
+            r#"{{"id":null,"method":"mining.notify","params":["1a-9000-3","{prevhash}","aabb","ccdd",[],"00000002","1f00ffff","66000000",false]}}"#
+        )
+    }
+
+    /// Mine a share that is a GENUINE solution to `notify_line()`'s network
+    /// target, i.e. real work with a real, measurable achieved difficulty.
+    fn mined_share(jobs: &JobStore, en1: &str) -> Share {
+        let job = jobs.get("1a-9000-3").expect("job cached");
+        let le = validator::le_for_height(job.height);
+        let ntime = "66000000".to_string();
+        for nonce in 0u32..4_000_000 {
+            let nonce_hex = format!("{:08x}", nonce);
+            let out = validator::validate(
+                job, en1, "00000001", &ntime, &nonce_hex, None, &job.network_target, le,
+            )
+            .expect("well-formed submit fields");
+            if out.meets_network {
+                return Share {
+                    worker: WorkerId(1),
+                    job_id: "1a-9000-3".to_string(),
+                    extranonce2: "00000001".to_string(),
+                    ntime,
+                    nonce: nonce_hex,
+                    version: None,
+                    difficulty: 0.0,
+                    submitted_at: Instant::now(),
+                };
+            }
+        }
+        panic!("a 2^-16 target must be hit inside the budget");
+    }
+
+    /// REGRESSION (S-H4). PPLNS must credit work the share is PROVEN to have
+    /// done, never the difficulty the proxy merely ANNOUNCED.
+    ///
+    /// The proxy suppresses the node's `mining.set_difficulty` and serves its
+    /// own vardiff, so the node grades a submit against ITS (far lower) target
+    /// and can answer `true` for a share that never came near ours. The router
+    /// used to hand `vardiff.current()` straight to the ledger, so that share
+    /// earned the full announced weight — a payout-share inflation equal to the
+    /// whole ratio between the two targets.
+    ///
+    /// One genuine share is graded twice here, at two announced difficulties:
+    /// below what it achieved (credited) and 65536x above it (credits nothing).
+    #[test]
+    fn pplns_credits_achieved_difficulty_not_the_announced_one() {
+        let en1 = "deadbeef";
+        let mut jobs = JobStore::new(JOB_CACHE);
+        jobs.insert(parse_notify_full(&notify_line()).expect("valid notify"));
+        let share = mined_share(&jobs, en1);
+
+        // What the hash actually achieved (graded at the easiest target).
+        let probe = verify_share(&jobs, en1, &share, 0.0, None)
+            .expect("a cached job must reconstruct its own share");
+        let achieved = probe.achieved;
+        assert!(achieved.is_finite() && achieved > 0.0, "achieved={achieved}");
+
+        // Announced BELOW what it achieved: proven work → credited, at the
+        // proven threshold (luck above it is not extra payout).
+        let low = achieved / 2.0;
+        let checked_low = verify_share(&jobs, en1, &share, low, None).expect("reconstructs");
+        assert!(checked_low.meets_worker, "a real solution must clear an easier target");
+        assert_eq!(credit_for(Some(checked_low), low), Some(low));
+
+        // Announced 65536x ABOVE what it achieved — the vardiff-suppression
+        // case. Pre-fix this credited `high`; it must now credit NOTHING.
+        let high = achieved * 65_536.0;
+        let checked_high = verify_share(&jobs, en1, &share, high, None).expect("reconstructs");
+        assert!(
+            !checked_high.meets_worker,
+            "a share 65536x below the announcement must not read as meeting it",
+        );
+        assert_eq!(
+            credit_for(Some(checked_high), high),
+            None,
+            "an announced-but-not-achieved share must credit nothing",
+        );
+    }
+
+    /// Payout fails CLOSED. With no cached job the proxy cannot assert the
+    /// submit is work at all, so it earns no credit — the node's `true` still
+    /// reaches the miner and the lifetime totals, but not the payout window.
+    #[test]
+    fn unreconstructable_share_credits_nothing() {
+        let jobs = JobStore::new(JOB_CACHE);
+        let share = mk_share(1, "1a-9000-3", 65_536.0);
+        assert!(verify_share(&jobs, "deadbeef", &share, 65_536.0, None).is_none());
+        assert_eq!(credit_for(None, 65_536.0), None);
+    }
+
+    /// A submit whose fields are not hex at all is not verifiable work either —
+    /// `validate` errors, the candidate is skipped, and nothing is credited.
+    #[test]
+    fn malformed_submit_fields_credit_nothing() {
+        let mut jobs = JobStore::new(JOB_CACHE);
+        jobs.insert(parse_notify_full(&notify_line()).expect("valid notify"));
+        let mut share = mk_share(1, "1a-9000-3", 1024.0);
+        share.nonce = "zzzzzzzz".to_string();
+        assert!(verify_share(&jobs, "deadbeef", &share, 1024.0, None).is_none());
+    }
+
+    /// An interposed rig proxy (MRR/NiceHash) re-labels job ids, so the
+    /// submitted id matches nothing we cached. The hash — not the label —
+    /// identifies the work: the fallback scan finds the real template and the
+    /// share is still credited.
+    #[test]
+    fn relabeled_job_id_still_verifies_by_hash() {
+        let en1 = "deadbeef";
+        let mut jobs = JobStore::new(JOB_CACHE);
+        jobs.insert(parse_notify_full(&notify_line()).expect("valid notify"));
+        let mut share = mined_share(&jobs, en1);
+        let achieved = verify_share(&jobs, en1, &share, 0.0, None).expect("reconstructs").achieved;
+
+        share.job_id = "rigproxy-relabeled-1".to_string();
+        let low = achieved / 2.0;
+        let checked = verify_share(&jobs, en1, &share, low, None)
+            .expect("the fallback scan must find the real template");
+        assert!(checked.meets_worker);
+        assert_eq!(credit_for(Some(checked), low), Some(low));
+    }
+
     #[test]
     fn hooks_default_is_identity_and_noop() {
         let hooks = RouterHooks::new();
@@ -698,21 +985,22 @@ mod tests {
     fn submit_result_correlates_to_pending_share_by_id() {
         // Mirror the pump's correlation logic in isolation: a SubmitResult is
         // folded into accounting only when its id matches a pending submit.
-        let mut pending: VecDeque<(String, Share)> = VecDeque::new();
+        let mut pending: VecDeque<(String, Share, Option<f64>)> = VecDeque::new();
         let id = Some(Value::from(42u64));
-        pending.push_back((id_key(&id), mk_share(1, "j1", 8.0)));
+        pending.push_back((id_key(&id), mk_share(1, "j1", 8.0), Some(8.0)));
 
         // Matching id removes exactly the pending share.
         let key = id_key(&id);
-        let pos = pending.iter().position(|(k, _)| *k == key).unwrap();
-        let (_, share) = pending.remove(pos).unwrap();
+        let pos = pending.iter().position(|(k, _, _)| *k == key).unwrap();
+        let (_, share, credited) = pending.remove(pos).unwrap();
+        assert_eq!(credited, Some(8.0), "the submit-time credit rides with the share");
         assert_eq!(share.worker, WorkerId(1));
         assert!(pending.is_empty());
 
         // A non-matching id (e.g. an authorize ack) finds nothing to fold.
-        pending.push_back((id_key(&Some(Value::from(1u64))), mk_share(1, "j2", 8.0)));
+        pending.push_back((id_key(&Some(Value::from(1u64))), mk_share(1, "j2", 8.0), Some(8.0)));
         let ack_key = id_key(&Some(Value::from(99u64)));
-        assert!(pending.iter().position(|(k, _)| *k == ack_key).is_none());
+        assert!(pending.iter().position(|(k, _, _)| *k == ack_key).is_none());
         assert_eq!(pending.len(), 1);
     }
 

@@ -27,6 +27,18 @@
 //!   never silently dropped from the payout split. An empty (or zero-weight)
 //!   window yields an empty credit vector.
 //!
+//! * **Credit is PROVEN work, never a claim.** [`record`](PplnsLedger::record)
+//!   takes an `Option<f64>`, not an `f64`: `Some(d)` is a difficulty the caller
+//!   has LOCALLY VERIFIED the share achieved (the router reconstructs and
+//!   hashes the header — `crate::validator::validate` against the cached
+//!   `crate::jobstore` job), `None` is a share that was accepted upstream but
+//!   never shown to meet the difficulty we announced. `None` folds into the
+//!   totals and enters NO window entry. This matters because the proxy
+//!   suppresses the node's `mining.set_difficulty` and serves its own vardiff:
+//!   the node may accept at ITS (far lower) target a share that never met ours,
+//!   and crediting the ANNOUNCED difficulty there inflates that worker's payout
+//!   fraction by the whole ratio between the two targets.
+//!
 //! * **Totals count everything.** Every outcome — accepted, rejected, stale,
 //!   duplicate, block — is folded into the pool-wide [`LedgerTotals`],
 //!   independent of whether it entered the retention window.
@@ -187,24 +199,39 @@ impl PplnsLedger {
     }
 
     /// Record one share result. Bumps the pool-wide totals for EVERY outcome,
-    /// and — only for accepted/block outcomes, and only when count retention is
-    /// enabled (`cap > 0`) — pushes a difficulty-weighted entry onto the
-    /// window, then evicts anything past the count cap or time bound.
+    /// and — only for accepted/block outcomes, only when count retention is
+    /// enabled (`cap > 0`), and only when `credited` is `Some` — pushes a
+    /// difficulty-weighted entry onto the window, then evicts anything past the
+    /// count cap or time bound.
+    ///
+    /// `credited` is the difficulty the caller has VERIFIED this share
+    /// achieved, not the difficulty that was announced to the miner. `None`
+    /// means "accepted upstream, but never shown to be work at our target":
+    /// it counts in the totals and earns NO payout weight. See the module docs
+    /// for why the two differ under vardiff suppression.
     ///
     /// `&self` + interior mutability: safe to call concurrently from many
     /// worker tasks sharing one `Arc<PplnsLedger>`. `job_id` is accepted for a
     /// stable call-site shape (and future per-job accounting) but is not
     /// retained today. Never panics on any input.
-    pub fn record(&self, worker: WorkerId, job_id: &str, difficulty: f64, outcome: &ShareOutcome) {
+    pub fn record(
+        &self,
+        worker: WorkerId,
+        job_id: &str,
+        credited: Option<f64>,
+        outcome: &ShareOutcome,
+    ) {
         let _ = job_id; // reserved; not retained in the current window model
         let now = Instant::now();
         let mut inner = self.lock();
 
         inner.bump_totals(outcome);
 
-        if outcome.is_accepted() && inner.cap > 0 {
-            let weight = if difficulty > 0.0 { difficulty } else { 1.0 };
-            inner.window.push_back(Entry { worker, weight, at: now });
+        if let Some(difficulty) = credited {
+            if outcome.is_accepted() && inner.cap > 0 {
+                let weight = if difficulty > 0.0 { difficulty } else { 1.0 };
+                inner.window.push_back(Entry { worker, weight, at: now });
+            }
         }
 
         inner.evict(now);
@@ -268,12 +295,20 @@ impl PplnsLedger {
     /// Test-only: record with an explicit retention timestamp, so time-bound
     /// eviction can be exercised without real sleeps.
     #[cfg(test)]
-    fn record_at(&self, worker: WorkerId, difficulty: f64, outcome: &ShareOutcome, at: Instant) {
+    fn record_at(
+        &self,
+        worker: WorkerId,
+        credited: Option<f64>,
+        outcome: &ShareOutcome,
+        at: Instant,
+    ) {
         let mut inner = self.lock();
         inner.bump_totals(outcome);
-        if outcome.is_accepted() && inner.cap > 0 {
-            let weight = if difficulty > 0.0 { difficulty } else { 1.0 };
-            inner.window.push_back(Entry { worker, weight, at });
+        if let Some(difficulty) = credited {
+            if outcome.is_accepted() && inner.cap > 0 {
+                let weight = if difficulty > 0.0 { difficulty } else { 1.0 };
+                inner.window.push_back(Entry { worker, weight, at });
+            }
         }
         // Evict relative to "now" so a backdated entry is judged against real
         // wall-clock age.
@@ -317,7 +352,7 @@ mod tests {
     #[test]
     fn accepted_share_enters_window_and_totals() {
         let led = PplnsLedger::new(&cfg_cap(10));
-        led.record(w(1), "j1", 4.0, &ShareOutcome::Accepted);
+        led.record(w(1), "j1", Some(4.0), &ShareOutcome::Accepted);
         assert_eq!(led.snapshot().window_len, 1);
         assert_eq!(led.totals().accepted, 1);
         assert_eq!(led.totals().rejected, 0);
@@ -326,13 +361,13 @@ mod tests {
     #[test]
     fn rejected_outcomes_touch_totals_not_window() {
         let led = PplnsLedger::new(&cfg_cap(10));
-        led.record(w(1), "j1", 4.0, &ShareOutcome::Stale);
-        led.record(w(1), "j2", 4.0, &ShareOutcome::Duplicate);
-        led.record(w(1), "j3", 4.0, &ShareOutcome::LowDifficulty);
+        led.record(w(1), "j1", Some(4.0), &ShareOutcome::Stale);
+        led.record(w(1), "j2", Some(4.0), &ShareOutcome::Duplicate);
+        led.record(w(1), "j3", Some(4.0), &ShareOutcome::LowDifficulty);
         led.record(
             w(1),
             "j4",
-            4.0,
+            Some(4.0),
             &ShareOutcome::Rejected { code: 20, message: "nope".into() },
         );
         assert_eq!(led.snapshot().window_len, 0);
@@ -345,7 +380,7 @@ mod tests {
     #[test]
     fn block_counts_as_accepted_plus_block() {
         let led = PplnsLedger::new(&cfg_cap(10));
-        led.record(w(7), "j1", 1.0, &ShareOutcome::Block);
+        led.record(w(7), "j1", Some(1.0), &ShareOutcome::Block);
         assert_eq!(led.totals().accepted, 1);
         assert_eq!(led.totals().blocks, 1);
         assert_eq!(led.snapshot().window_len, 1);
@@ -355,7 +390,7 @@ mod tests {
     fn window_is_capped_and_drops_oldest() {
         let led = PplnsLedger::new(&cfg_cap(3));
         for i in 0..5 {
-            led.record(w(1), &format!("j{i}"), 1.0, &ShareOutcome::Accepted);
+            led.record(w(1), &format!("j{i}"), Some(1.0), &ShareOutcome::Accepted);
         }
         assert_eq!(led.snapshot().window_len, 3);
         assert_eq!(led.totals().accepted, 5);
@@ -364,7 +399,7 @@ mod tests {
     #[test]
     fn zero_window_disables_retention() {
         let led = PplnsLedger::new(&cfg_cap(0));
-        led.record(w(1), "j1", 4.0, &ShareOutcome::Accepted);
+        led.record(w(1), "j1", Some(4.0), &ShareOutcome::Accepted);
         assert_eq!(led.snapshot().window_len, 0);
         assert_eq!(led.totals().accepted, 1);
         assert!(led.credit().is_empty());
@@ -374,9 +409,9 @@ mod tests {
     fn pplns_credit_is_difficulty_weighted_and_normalized() {
         let led = PplnsLedger::new(&cfg_cap(100));
         // worker 1: 3 + 1 = 4 weight; worker 2: 4 weight → 50/50.
-        led.record(w(1), "j", 3.0, &ShareOutcome::Accepted);
-        led.record(w(1), "j", 1.0, &ShareOutcome::Accepted);
-        led.record(w(2), "j", 4.0, &ShareOutcome::Accepted);
+        led.record(w(1), "j", Some(3.0), &ShareOutcome::Accepted);
+        led.record(w(1), "j", Some(1.0), &ShareOutcome::Accepted);
+        led.record(w(2), "j", Some(4.0), &ShareOutcome::Accepted);
 
         let credit = led.credit();
         let c1 = credit.iter().find(|c| c.worker == w(1)).unwrap().fraction;
@@ -389,8 +424,8 @@ mod tests {
     #[test]
     fn pplns_treats_nonpositive_difficulty_as_unit_weight() {
         let led = PplnsLedger::new(&cfg_cap(100));
-        led.record(w(1), "j", 0.0, &ShareOutcome::Accepted);
-        led.record(w(2), "j", -5.0, &ShareOutcome::Accepted);
+        led.record(w(1), "j", Some(0.0), &ShareOutcome::Accepted);
+        led.record(w(2), "j", Some(-5.0), &ShareOutcome::Accepted);
         let credit = led.credit();
         let c1 = credit.iter().find(|c| c.worker == w(1)).unwrap();
         let c2 = credit.iter().find(|c| c.worker == w(2)).unwrap();
@@ -414,12 +449,12 @@ mod tests {
         let led = PplnsLedger::new(&cfg_full(100, 5));
         // An entry timestamped 20s ago is beyond the 5s bound → evicted on the
         // very record that inserts it, but its outcome still counts.
-        led.record_at(w(1), 1.0, &ShareOutcome::Accepted, Instant::now() - Duration::from_secs(20));
+        led.record_at(w(1), Some(1.0), &ShareOutcome::Accepted, Instant::now() - Duration::from_secs(20));
         assert_eq!(led.snapshot().window_len, 0);
         assert_eq!(led.totals().accepted, 1);
 
         // A fresh share stays in the window.
-        led.record(w(1), "j", 1.0, &ShareOutcome::Accepted);
+        led.record(w(1), "j", Some(1.0), &ShareOutcome::Accepted);
         assert_eq!(led.snapshot().window_len, 1);
         assert_eq!(led.totals().accepted, 2);
     }
@@ -430,7 +465,7 @@ mod tests {
         let led = PplnsLedger::new(&cfg_full(100, 0));
         led.record_at(
             w(1),
-            1.0,
+            Some(1.0),
             &ShareOutcome::Accepted,
             Instant::now() - Duration::from_secs(100_000),
         );
@@ -440,9 +475,9 @@ mod tests {
     #[test]
     fn distinct_workers_snapshot() {
         let led = PplnsLedger::new(&cfg_cap(100));
-        led.record(w(1), "j", 1.0, &ShareOutcome::Accepted);
-        led.record(w(1), "j", 1.0, &ShareOutcome::Accepted);
-        led.record(w(2), "j", 1.0, &ShareOutcome::Accepted);
+        led.record(w(1), "j", Some(1.0), &ShareOutcome::Accepted);
+        led.record(w(1), "j", Some(1.0), &ShareOutcome::Accepted);
+        led.record(w(2), "j", Some(1.0), &ShareOutcome::Accepted);
         let snap = led.snapshot();
         assert_eq!(snap.window_len, 3);
         assert_eq!(snap.distinct_workers, 2);
@@ -454,9 +489,9 @@ mod tests {
     fn credit_vec_is_ordered_and_sums_to_one() {
         let led = PplnsLedger::new(&cfg_cap(100));
         // Insert out of order; credit() must return ascending by worker.0.
-        led.record(w(3), "j", 2.0, &ShareOutcome::Accepted);
-        led.record(w(1), "j", 1.0, &ShareOutcome::Accepted);
-        led.record(w(2), "j", 1.0, &ShareOutcome::Accepted);
+        led.record(w(3), "j", Some(2.0), &ShareOutcome::Accepted);
+        led.record(w(1), "j", Some(1.0), &ShareOutcome::Accepted);
+        led.record(w(2), "j", Some(1.0), &ShareOutcome::Accepted);
 
         let credit = led.credit();
         let order: Vec<u64> = credit.iter().map(|c| c.worker.0).collect();
@@ -478,7 +513,7 @@ mod tests {
             let l = led.clone();
             handles.push(std::thread::spawn(move || {
                 for _ in 0..500 {
-                    l.record(WorkerId(t), "j", 1.0, &ShareOutcome::Accepted);
+                    l.record(WorkerId(t), "j", Some(1.0), &ShareOutcome::Accepted);
                     // Interleave reads to shake out any read/write deadlock.
                     let _ = l.credit();
                     let _ = l.snapshot();
@@ -497,9 +532,9 @@ mod tests {
     fn cap_zero_disables_retention_but_keeps_totals() {
         let led = PplnsLedger::new(&cfg_cap(0));
         for _ in 0..10 {
-            led.record(w(1), "j", 4.0, &ShareOutcome::Accepted);
+            led.record(w(1), "j", Some(4.0), &ShareOutcome::Accepted);
         }
-        led.record(w(1), "j", 4.0, &ShareOutcome::Stale);
+        led.record(w(1), "j", Some(4.0), &ShareOutcome::Stale);
         assert_eq!(led.snapshot().window_len, 0);
         assert!(led.credit().is_empty());
         // Totals are untouched by the retention setting.
@@ -508,12 +543,61 @@ mod tests {
         assert_eq!(led.totals().stale, 1);
     }
 
+    /// REGRESSION (S-H4). The proxy SUPPRESSES the node's `set_difficulty` and
+    /// announces its own vardiff, so the node can accept — at its own far
+    /// lower target — a share that never met the difficulty we announced.
+    /// Crediting the announcement there inflated that worker's payout fraction
+    /// by the whole ratio between the two targets (announced 65536 vs a share
+    /// that only achieved diff 1 ⇒ 65536x). An UNVERIFIED share (`None`) must
+    /// therefore earn NO window weight and NO payout fraction, while still
+    /// counting in the lifetime totals.
+    #[test]
+    fn announced_but_not_achieved_credits_nothing() {
+        let led = PplnsLedger::new(&cfg_cap(100));
+
+        // Worker 1 submits shares the node accepts but that were never shown to
+        // meet our announced difficulty: no local verification ⇒ no credit.
+        for _ in 0..10 {
+            led.record(w(1), "j", None, &ShareOutcome::Accepted);
+        }
+        // A block found this way is still a block for the totals, still no credit.
+        led.record(w(1), "j", None, &ShareOutcome::Block);
+
+        assert_eq!(led.snapshot().window_len, 0, "unverified shares must not enter the window");
+        assert!(led.credit().is_empty(), "unverified shares must earn no payout fraction");
+        assert_eq!(led.totals().accepted, 11, "totals still count every accepted share");
+        assert_eq!(led.totals().blocks, 1);
+
+        // Worker 2 submits ONE share verified at the announced difficulty. It
+        // must take the ENTIRE window — the pre-fix ledger gave worker 1 the
+        // 65536x-inflated majority instead.
+        led.record(w(2), "j", Some(1.0), &ShareOutcome::Accepted);
+        let credit = led.credit();
+        assert_eq!(credit.len(), 1, "only the verified worker is in the split");
+        assert_eq!(credit[0].worker, w(2));
+        assert!((credit[0].fraction - 1.0).abs() < 1e-9, "fraction={}", credit[0].fraction);
+    }
+
+    /// `None` is distinct from a zero/negative difficulty: a VERIFIED share
+    /// whose difficulty reads as non-positive still gets unit weight (a miner
+    /// is never silently dropped), while an UNVERIFIED one gets nothing.
+    #[test]
+    fn none_credit_is_not_the_same_as_zero_credit() {
+        let led = PplnsLedger::new(&cfg_cap(100));
+        led.record(w(1), "j", Some(0.0), &ShareOutcome::Accepted);
+        led.record(w(2), "j", None, &ShareOutcome::Accepted);
+        let credit = led.credit();
+        assert_eq!(credit.len(), 1);
+        assert_eq!(credit[0].worker, w(1));
+        assert!((credit[0].weight - 1.0).abs() < 1e-9);
+    }
+
     #[test]
     fn no_panic_on_extreme_and_nan_difficulty() {
         let led = PplnsLedger::new(&cfg_cap(100));
-        led.record(w(1), "j", f64::NAN, &ShareOutcome::Accepted);
-        led.record(w(2), "j", f64::INFINITY, &ShareOutcome::Accepted);
-        led.record(w(3), "j", f64::NEG_INFINITY, &ShareOutcome::Accepted);
+        led.record(w(1), "j", Some(f64::NAN), &ShareOutcome::Accepted);
+        led.record(w(2), "j", Some(f64::INFINITY), &ShareOutcome::Accepted);
+        led.record(w(3), "j", Some(f64::NEG_INFINITY), &ShareOutcome::Accepted);
         // NaN is not > 0.0 → unit weight; -inf → unit weight; +inf stays inf.
         let credit = led.credit();
         // Must not panic; every recorded worker appears.
