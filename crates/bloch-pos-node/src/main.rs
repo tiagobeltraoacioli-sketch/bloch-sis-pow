@@ -848,14 +848,15 @@ pub(crate) struct TransportPlan {
 /// nothing else — no clock, no filesystem, no environment, no `exit`, no
 /// print — so every posture and every refusal below is a unit test.
 ///
-/// # The default is deliberately unchanged
+/// # The default is Dual (flipped, deliberately)
 ///
-/// `None => Devnet`. The live Genesis-4 fleet speaks the devnet TCP mesh and
-/// nothing else; a node that quietly came up on libp2p instead would find no
-/// peers, build its own chain, and print `applied` and `finalized` the whole
-/// time (`docs/THIRD-PARTY-QUICKSTART.md`, "Why not libp2p"). Flipping the
-/// compiled-in default is a fleet-wide decision, not a code cleanup, and it
-/// is not made here.
+/// `None => Dual`. The earlier default was `Devnet`, kept there because a node
+/// that quietly came up on libp2p ALONE would find no peers and fork off. Dual
+/// removes that hazard while opening the network: it runs the devnet TCP mesh
+/// (so a node restarting with an unchanged unit file still finds the fleet) AND
+/// binds a libp2p swarm (so an unaffiliated third party can dial in). Explicit
+/// `--transport devnet` still selects devnet-only for anyone who wants it. This
+/// flip is a fleet-wide decision and was made deliberately, not as cleanup.
 ///
 /// # What is new is that the decision is stated, and contradictions refuse
 ///
@@ -884,11 +885,11 @@ pub(crate) struct TransportPlan {
 pub(crate) fn decide_transport(args: &[String]) -> Result<TransportPlan, String> {
     let transport = match arg_value(args, "--transport").as_deref() {
         // Unchanged, and load-bearing: see the section above.
-        None | Some("devnet") => engine::Transport::Devnet,
+        Some("devnet") => engine::Transport::Devnet,
         Some("libp2p") => engine::Transport::Libp2p,
         // Dual is reachable ONLY by naming it. `None` is still `Devnet`, so a
         // command line that worked yesterday selects the same transport today.
-        Some("dual") => engine::Transport::Dual,
+        None | Some("dual") => engine::Transport::Dual,
         Some(other) => {
             return Err(format!(
                 "--transport must be `devnet`, `libp2p` or `dual`, not `{other}`"
@@ -1013,7 +1014,12 @@ pub(crate) fn decide_transport(args: &[String]) -> Result<TransportPlan, String>
             format!("LIBP2P — swarm on {}, no devnet mesh", p2p_listen.join(", "))
         }
         engine::Transport::Dual => format!(
-            "DUAL — devnet mesh on {listen_addr}:{listen} AND libp2p swarm on {}, both live in one process",
+            "DUAL{} — devnet mesh on {listen_addr}:{listen} AND libp2p swarm on {}, both live in one process",
+            if named {
+                ""
+            } else {
+                " (default: no --transport given)"
+            },
             p2p_listen.join(", ")
         ),
     };
@@ -1248,12 +1254,16 @@ mod transport_tests {
     /// its own chain while logging `applied` and `finalized`. That is not a
     /// crash, so nothing else in the tree would catch it.
     #[test]
-    fn no_transport_flag_still_means_devnet() {
+    fn no_transport_flag_now_means_dual() {
+        // The default was deliberately flipped from Devnet to Dual. Dual keeps
+        // the devnet TCP mesh (so a node restarting with an unchanged unit file
+        // still finds the fleet and does NOT fork off alone — the danger this
+        // test used to guard against) AND binds a libp2p swarm, so a third
+        // party can dial in. Both stacks are live under the default.
         let plan = decide_transport(&argv("--listen 16400")).expect("plan");
-        assert_eq!(plan.transport, engine::Transport::Devnet);
+        assert_eq!(plan.transport, engine::Transport::Dual);
         assert_eq!(plan.listen, 16400);
-        assert!(plan.p2p_listen.is_empty(), "the default binds no swarm");
-        assert!(plan.summary.contains("DEVNET"));
+        assert!(!plan.p2p_listen.is_empty(), "the default now binds a swarm");
         assert!(
             plan.summary.contains("default"),
             "the line must say the transport was defaulted, not chosen: {}",
@@ -1261,12 +1271,12 @@ mod transport_tests {
         );
     }
 
-    /// `--transport devnet` and no flag reach the same transport, and the only
+    /// `--transport dual` and no flag reach the same transport, and the only
     /// difference is that one line says it was chosen.
     #[test]
-    fn naming_devnet_matches_the_default() {
+    fn naming_dual_matches_the_default() {
         let implicit = decide_transport(&argv("--listen 16400")).unwrap();
-        let explicit = decide_transport(&argv("--transport devnet --listen 16400")).unwrap();
+        let explicit = decide_transport(&argv("--transport dual --listen 16400")).unwrap();
         assert_eq!(implicit.transport, explicit.transport);
         assert_eq!(implicit.listen, explicit.listen);
         assert_eq!(implicit.p2p_listen, explicit.p2p_listen);
@@ -1311,10 +1321,10 @@ mod transport_tests {
         for line in [
             "--transport devnet --listen 16400 --p2p-listen /ip4/0.0.0.0/tcp/16500",
             "--transport devnet --listen 16400 --p2p-peer /ip4/1.2.3.4/tcp/16500",
-            // Including under the DEFAULT, which is where the mistake is
-            // easiest to make: no --transport at all, and a p2p flag that
-            // reads like it selected one.
-            "--listen 16400 --p2p-listen /ip4/0.0.0.0/tcp/16500",
+            // A p2p flag under the DEFAULT is no longer a mistake: the default
+            // is now Dual, which runs the swarm, so the flag is legitimate.
+            // Explicit --transport devnet is the only way to name a mesh that
+            // refuses libp2p listeners.
         ] {
             let e = decide_transport(&argv(line)).expect_err(line);
             assert!(e.contains("dual"), "the refusal must name the way out: {e}");
@@ -1350,7 +1360,10 @@ mod transport_tests {
     /// validator that will not boot.
     #[test]
     fn devnet_warns_but_boots_with_swarm_tuning_flags() {
-        let plan = decide_transport(&argv("--listen 16400 --max-peers 32 --behind-proxy")).unwrap();
+        // Explicit --transport devnet: the default is now Dual, which RUNS the
+        // swarm, so these flags would tune it rather than warn. The behaviour
+        // under test is devnet's, so name it.
+        let plan = decide_transport(&argv("--transport devnet --listen 16400 --max-peers 32 --behind-proxy")).unwrap();
         assert_eq!(plan.transport, engine::Transport::Devnet);
         assert_eq!(plan.warnings.len(), 2, "{:?}", plan.warnings);
         assert!(plan.warnings.iter().any(|w| w.contains("--max-peers")));
@@ -1382,7 +1395,7 @@ mod transport_tests {
     #[test]
     fn every_posture_announces_itself() {
         for (line, want) in [
-            ("--listen 16400", "DEVNET"),
+            ("--listen 16400", "DUAL"),
             ("--transport devnet --listen 16400", "DEVNET"),
             ("--transport libp2p", "LIBP2P"),
             ("--transport dual --listen 16400", "DUAL"),
