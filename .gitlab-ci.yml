@@ -276,6 +276,26 @@ cargo-geiger:
     - cargo geiger --all-features --output-format Ascii || true
   allow_failure: true
 
+# fuzz-build — the harness must COMPILE. Blocking, on stable, no nightly and no
+# libFuzzer runtime needed: `cargo check` is enough to prove the manifest
+# resolves and every target still type-checks against the modules it fuzzes.
+#
+# This job exists because `fuzz-smoke` below cannot be the gate. It needs
+# nightly, skips soft when the runner has none, and is `allow_failure` — so
+# when `fuzz/Cargo.toml` still read `bloch = { path = ".." }` after the repo
+# root became a virtual manifest, all eleven targets failed to resolve and the
+# pipeline stayed green for as long as that lasted. A harness that does not
+# build looks exactly like a harness that builds and finds nothing.
+#
+# NOT `allow_failure`. If this goes red the fuzzers are not running, whatever
+# the smoke job says.
+fuzz-build:
+  stage: test
+  before_script: []
+  script:
+    - cargo check --manifest-path fuzz/Cargo.toml --bins --locked
+  timeout: 60m
+
 # cargo-fuzz smoke — links the fuzz harness against the REAL bloch API and runs
 # each scanner-priority target for a few seconds to prove it does not fault on
 # shallow input. NON-BLOCKING: a bounded smoke run is a build/link + no-shallow-
@@ -295,7 +315,9 @@ fuzz-smoke:
       fi
     - cargo install cargo-fuzz --locked 2>/dev/null || true
     - |
-      for t in block_parse tx_parse sha256d_pow ghostdag_order sig_verify; do
+      for t in block_parse tx_parse sha256d_pow ghostdag_order sig_verify \
+               pos_envelope_decode pos_attestation_decode pos_header_decode \
+               pos_carryover_snapshot; do
         echo "== fuzz smoke: $t =="
         cargo +nightly fuzz run "$t" -- -max_total_time=20 -runs=100000
       done
