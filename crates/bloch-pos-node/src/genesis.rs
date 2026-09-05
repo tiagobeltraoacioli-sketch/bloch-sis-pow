@@ -1206,13 +1206,19 @@ impl Manifest {
     /// The beacon mix genesis opens with.
     ///
     /// Under [`ManifestFormat::V2Bound`] this is one §6.3 mixing step over the
-    /// carryover digest — `SHA3-256(DS_RANDAO ‖ 0 ‖ carryover_digest)`, the
-    /// same expression `genesis4-ceremony::genesis_header` uses — so the
-    /// beacon's origin entropy is pinned to the artifact the chain opens with
-    /// instead of being a constant an operator can reuse across networks. A
-    /// manifest with no carryover (a devnet) mixes over a zero digest: the
-    /// ledger binding then rests entirely on `state_root`, which is where it
-    /// belongs anyway.
+    /// carryover digest AND the chain's clock:
+    /// `SHA3-256(DS_RANDAO ‖ 0 ‖ carryover_digest ‖ genesis_time_ms ‖ slot_ms)`.
+    /// The beacon's origin entropy is then pinned to the artifact the chain
+    /// opens with and to the cadence it opens at, instead of being a constant
+    /// an operator can reuse across networks. A manifest with no carryover (a
+    /// devnet) mixes over a zero digest: the ledger binding then rests
+    /// entirely on `state_root`, which is where it belongs anyway, and the
+    /// clock terms still separate two devnets launched at different times.
+    ///
+    /// The two clock terms are the gap the first cut of this fix left open
+    /// (see the body). Any published ceremony tool that assembles a `BPOSMAN2`
+    /// header must mix them in too — no such manifest exists yet, which is
+    /// the only reason this expression is still free to be corrected.
     ///
     /// Under [`ManifestFormat::V1Unbound`] it is [`GENESIS_MIX`], unchanged.
     pub fn genesis_mix(&self) -> [u8; 32] {
@@ -1224,6 +1230,30 @@ impl Manifest {
                 h.update(bloch_pos_committee::params::DS_RANDAO);
                 h.update(GENESIS_MIX);
                 h.update(digest);
+                // The CLOSED GAP. The first cut of this fix mixed over the
+                // carryover digest alone, which binds the ledger and stops
+                // there. `state_root` binds the ledger too, so between them
+                // the ONLY manifest fields left out of the genesis id were
+                // these two -- and they are the two that define the chain's
+                // clock. Measured on the b2 branch: two manifests differing
+                // only in `slot_ms` produced the SAME genesis block id under
+                // the bound format, and so did two differing only in
+                // `genesis_time_ms`.
+                //
+                // That is the finding's own sentence unfulfilled. A node on
+                // `slot_ms = 1_000` and a node on `slot_ms = 30_000` compute
+                // different slots for the same instant, therefore different
+                // epochs, committees and duties: they are not one network
+                // that disagrees, they are two networks. Leaving them sharing
+                // a genesis id reproduces exactly what C5 exists to close --
+                // a substituted manifest that pairs at height 0 and diverges
+                // later, as somebody else's block being blamed.
+                //
+                // Fixed widths, little-endian, declaration order: the same
+                // encoding `Manifest::encode` writes them in, so there is one
+                // reading of these bytes in the codebase and not two.
+                h.update(self.genesis_time_ms.to_le_bytes());
+                h.update(self.slot_ms.to_le_bytes());
                 h.finalize().into()
             }
         }
@@ -2113,6 +2143,77 @@ mod tests {
         assert_ne!(a.genesis_header().state_root, b.genesis_header().state_root);
     }
 
+    /// **The gap the first cut left open.** Two manifests that differ only in
+    /// the clock they run describe two different networks, and must not share
+    /// a genesis block id.
+    ///
+    /// `state_root` binds the ledger and the mix binds the carryover artifact,
+    /// so before the clock terms went into the mix these two fields were the
+    /// entire set of manifest inputs that `genesis_id` did not see. A node on
+    /// `slot_ms = 1_000` and one on `slot_ms = 30_000` map the same instant to
+    /// different slots, therefore different epochs, committees and duties —
+    /// two chains, pairing at height 0. That is the substitution C5 exists to
+    /// stop, arriving through the one door it had left open.
+    ///
+    /// Fails without the two `h.update` calls in `genesis_mix`: both
+    /// assertions are equalities by construction then.
+    #[test]
+    fn bound_genesis_id_follows_the_clock() {
+        let a = bound(mainnet_sample());
+
+        // Cadence: the same ledger at a different block time is not the same
+        // chain, and consensus reads the difference on every slot.
+        let mut faster = bound(mainnet_sample());
+        faster.slot_ms += 1;
+        assert_ne!(
+            a.genesis_id().as_bytes(),
+            faster.genesis_id().as_bytes(),
+            "a different slot cadence is a different network"
+        );
+
+        // Launch instant: two networks opened from the identical ledger at
+        // different times are still two networks.
+        let mut later = bound(mainnet_sample());
+        later.genesis_time_ms += 1;
+        assert_ne!(
+            a.genesis_id().as_bytes(),
+            later.genesis_id().as_bytes(),
+            "a different genesis time is a different network"
+        );
+
+        // And it arrives through the MIX, which is the field that carries the
+        // chain's opening parameters.
+        assert_ne!(a.genesis_mix(), faster.genesis_mix());
+        assert_ne!(a.genesis_mix(), later.genesis_mix());
+        assert_ne!(a.genesis_header().randao_mix, faster.genesis_header().randao_mix);
+
+        // The state root moves too, and that is correct rather than
+        // incidental: `CommittedState::genesis` takes the mix as the beacon's
+        // opening value, so the mix is a component OF the state and the clock
+        // reaches the root through it. Worth asserting rather than assuming —
+        // it is what makes the two bindings agree instead of one silently
+        // overwriting the other's answer.
+        assert_ne!(
+            a.genesis_header().state_root,
+            faster.genesis_header().state_root,
+            "the clock reaches the state root through the mix the state opens on"
+        );
+        // The ledger binding is undisturbed by all of this: same balances,
+        // same registry, and the opening supply still closes.
+        assert_eq!(a.genesis_accounted_sat(), faster.genesis_accounted_sat());
+    }
+
+    /// The unbound rule ignores the clock, exactly as it always has. Genesis
+    /// identity under v1 is frozen and the correction above must not reach it.
+    #[test]
+    fn unbound_genesis_id_still_ignores_the_clock() {
+        let a = mainnet_sample();
+        let mut b = mainnet_sample();
+        b.slot_ms += 1;
+        b.genesis_time_ms += 1;
+        assert_eq!(a.genesis_id().as_bytes(), b.genesis_id().as_bytes());
+    }
+
     /// The same claim one level down, and the one that would catch a
     /// `state_root` that commits to the validator set but forgets the money:
     /// the difference is ONLY in the balances.
@@ -2146,6 +2247,12 @@ mod tests {
         h.update(bloch_pos_committee::params::DS_RANDAO);
         h.update([0u8; 32]);
         h.update(m.carryover.as_ref().expect("the mainnet fixture commits to a carryover").digest);
+        // The clock terms, in the widths and order `Manifest::encode` writes
+        // them. Pinned here by hand for the same reason the rest of the
+        // expression is: a formula a test derives through the function it is
+        // checking pins nothing.
+        h.update(m.genesis_time_ms.to_le_bytes());
+        h.update(m.slot_ms.to_le_bytes());
         let want: [u8; 32] = h.finalize().into();
 
         assert_eq!(m.genesis_mix(), want);

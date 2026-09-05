@@ -644,7 +644,7 @@ fn a_backend_without_a_head_still_routes_balance_to_the_loop() {
 
 #[test]
 fn getmempoolinfo_reports_size_capacity_and_the_next_price() {
-    let v = mempool_info_json(7, 4_096, 1_750, 1_000, 12, 34);
+    let v = mempool_info_json(7, 4_096, 1_750, 1_000, 12, 34, 9);
     assert_eq!(v.get("size").unwrap().as_u64(), Some(7));
     assert_eq!(v.get("max").unwrap().as_u64(), Some(4_096));
     assert_eq!(v.get("bytes").unwrap().as_u64(), Some(1_750));
@@ -655,6 +655,10 @@ fn getmempoolinfo_reports_size_capacity_and_the_next_price() {
     // nada real.
     assert_eq!(v.get("barred").unwrap().as_u64(), Some(12));
     assert_eq!(v.get("barred_hits").unwrap().as_u64(), Some(34));
+    // Dropped for AGE, which is none of the above: a pool that shrank because
+    // blocks took things and one the TTL swept clean look identical without
+    // this counter, and only the second is a defect an operator must see.
+    assert_eq!(v.get("expired").unwrap().as_u64(), Some(9));
 }
 
 #[test]

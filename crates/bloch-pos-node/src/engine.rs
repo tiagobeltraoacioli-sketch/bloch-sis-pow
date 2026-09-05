@@ -8382,7 +8382,7 @@ mod slot_horizon {
     /// clock happens to say. Observer mode, empty state, devnet transport on
     /// an ephemeral port with no peers — everything except `ingest_judged` is
     /// scenery.
-    fn engine_at_wall_slot(back_slots: u64) -> Engine {
+    pub(super) fn engine_at_wall_slot(back_slots: u64) -> Engine {
         let slot_ms = 1_000u64;
         let manifest = Manifest {
             genesis_time_ms: now_ms().saturating_sub(back_slots.saturating_mul(slot_ms)),
@@ -8392,6 +8392,10 @@ mod slot_horizon {
             carryover: None,
             allocations: Vec::new(),
             carryover_entries: Vec::new(),
+            // v1: this harness is about the slot horizon, and the frozen
+            // genesis identity keeps `GENESIS_MIX` below the right constant.
+            format: crate::genesis::ManifestFormat::V1Unbound,
+            pre_state_root: std::sync::OnceLock::new(),
         };
         let genesis_id = manifest.genesis_id();
         let state = CommittedState::genesis(
@@ -8983,5 +8987,153 @@ mod ingest_admission_tests {
         assert_eq!(engine.blocks.len(), stored, "no stored block may be dropped");
         assert_eq!(engine.orphans.len(), 1, "and no parked block either");
         assert_eq!(engine.blocks_pruned, 0);
+    }
+}
+
+/// Retention, which is not admission: [`MEMPOOL_TTL_SLOTS`].
+///
+/// The defect these pin is that a transaction the producer can never include
+/// had no way out of the mempool. Admission and retention were one decision —
+/// an entry left only by being included, refused by a proposal, or caught by
+/// `sweep_mempool`'s spent-input scan — so a transfer that is none of those
+/// (stale fee, sub-dust output, an input spent on a branch this node does not
+/// hold) was skipped block after block and stayed forever. Measured on the
+/// live chain 2026-09-05: one held for over 200 blocks, chain healthy.
+///
+/// Every test here drives `evict_stale_mempool` against a HEAD this test
+/// moves, because the head is the clock the rule is written in: the claim is
+/// "this many blocks of chain went by and never took it", not "this much time
+/// passed". Revert the body of `evict_stale_mempool` to a no-op and
+/// `an_unincludable_transaction_does_not_outlive_the_ttl` fails on the first
+/// assertion.
+#[cfg(test)]
+mod mempool_ttl {
+    use super::slot_horizon::engine_at_wall_slot;
+    use super::*;
+    use bloch_pos_committee::transition::{TransferInput, TransferOutput};
+
+    /// A transfer that is never included and never needs to be valid: nothing
+    /// on the retention path parses it. `n` only separates the keys.
+    fn parked_transfer(n: u8) -> PosTransaction {
+        PosTransaction::Transfer {
+            inputs: vec![TransferInput {
+                txid: [n; 32],
+                vout: 0,
+                pubkey: Vec::new(),
+                signature: Vec::new(),
+            }],
+            outputs: vec![TransferOutput { value: 1_000, script_hash: [n; 32] }],
+            tx_bytes: 256,
+            tip_millisat_per_gas: 0,
+        }
+    }
+
+    /// Put `tx` in the pool the way `on_transaction` does, admitted at the
+    /// head the engine is on right now.
+    fn admit(e: &mut Engine, tx: PosTransaction) -> Vec<u8> {
+        let key = tx.canonical_bytes();
+        e.mempool_admitted_at.insert(key.clone(), e.head_slot_now());
+        e.mempool.insert(key.clone(), tx);
+        key
+    }
+
+    /// Move the head `to` without applying anything — the producer skipping
+    /// this transaction for that many blocks, which is the whole scenario.
+    fn head_to(e: &mut Engine, to: u64) {
+        // A real id through the one §5.4 path — `BlockId` has no constructor
+        // from raw bytes, deliberately. Only the slot moves, which is all
+        // `head_slot_now` reads.
+        let mut h = e.manifest.genesis_header();
+        h.slot = to;
+        e.chain.push((to, BlockId::of(&h)));
+    }
+
+    /// **The finding.** An entry the producer never includes must not be
+    /// immortal — and must survive right up to the boundary, so the rule is a
+    /// TTL and not a random sweep.
+    #[test]
+    fn an_unincludable_transaction_does_not_outlive_the_ttl() {
+        let mut e = engine_at_wall_slot(0);
+        let key = admit(&mut e, parked_transfer(1));
+
+        // Exactly at the TTL: still held. `<=` in the comparison, and this is
+        // the assertion that pins it — an off-by-one here is a node that
+        // drops a transaction one block early, every time.
+        head_to(&mut e, MEMPOOL_TTL_SLOTS);
+        e.evict_stale_mempool();
+        assert!(e.mempool.contains_key(&key), "the TTL is a bound, not a deadline before it");
+        assert_eq!(e.mempool_expired, 0);
+
+        // One block past it: gone, and counted.
+        head_to(&mut e, MEMPOOL_TTL_SLOTS + 1);
+        e.evict_stale_mempool();
+        assert!(!e.mempool.contains_key(&key), "unincluded past the TTL must not stay");
+        assert_eq!(e.mempool_expired, 1, "an expiry an operator cannot see is not a fix");
+        // The bookkeeping leaves with it, or this map is a slower leak than
+        // the one the TTL closes.
+        assert!(!e.mempool_admitted_at.contains_key(&key));
+    }
+
+    /// The clock is per-entry, not per-pool: a transaction admitted late must
+    /// not inherit the age of one admitted early. Without the parallel map —
+    /// with a single "last swept" slot, say — this is the test that fails.
+    #[test]
+    fn the_ttl_clock_is_per_transaction() {
+        let mut e = engine_at_wall_slot(0);
+        let old = admit(&mut e, parked_transfer(1));
+
+        head_to(&mut e, MEMPOOL_TTL_SLOTS);
+        let young = admit(&mut e, parked_transfer(2));
+
+        head_to(&mut e, MEMPOOL_TTL_SLOTS + 1);
+        e.evict_stale_mempool();
+        assert!(!e.mempool.contains_key(&old));
+        assert!(e.mempool.contains_key(&young), "a fresh entry must not inherit an old one's age");
+        assert_eq!(e.mempool_expired, 1);
+    }
+
+    /// A reorg can move the head backwards. The honest answer to a negative
+    /// age is zero, not eviction — `saturating_sub` — because the alternative
+    /// is a node that empties its mempool every time it reorgs.
+    #[test]
+    fn a_head_that_moves_backwards_expires_nothing() {
+        let mut e = engine_at_wall_slot(0);
+        head_to(&mut e, 500);
+        let key = admit(&mut e, parked_transfer(1));
+        head_to(&mut e, 400);
+        e.evict_stale_mempool();
+        assert!(e.mempool.contains_key(&key));
+        assert_eq!(e.mempool_expired, 0);
+    }
+
+    /// An entry that left by any of the four OTHER paths (included, refused,
+    /// swept, replaced) takes its clock with it. This is what keeps
+    /// `mempool_admitted_at` from growing without bound while `mempool` stays
+    /// small — the leak a naive TTL introduces while closing another.
+    #[test]
+    fn bookkeeping_does_not_outlive_the_entry_it_times() {
+        let mut e = engine_at_wall_slot(0);
+        let key = admit(&mut e, parked_transfer(1));
+        // The inclusion path: `advance` removes from `mempool` and nothing
+        // else, exactly as the applied-block arm does.
+        e.mempool.remove(&key);
+        e.evict_stale_mempool();
+        assert!(e.mempool_admitted_at.is_empty(), "the clock must leave with the entry");
+        assert_eq!(e.mempool_expired, 0, "an inclusion is not an expiry");
+    }
+
+    /// Dropping for age is NOT a refusal: nothing is barred, so the mesh
+    /// re-offering the transaction gets it admitted again with a fresh clock.
+    /// That is the property that makes this node-local policy rather than
+    /// consensus — the set of blocks this node accepts does not move.
+    #[test]
+    fn an_expiry_bars_nothing() {
+        let mut e = engine_at_wall_slot(0);
+        let key = admit(&mut e, parked_transfer(1));
+        head_to(&mut e, MEMPOOL_TTL_SLOTS + 1);
+        e.evict_stale_mempool();
+        assert!(!e.mempool.contains_key(&key));
+        assert!(!e.rejected.contains_key(&key), "age is not a refusal, and must not bar a re-offer");
+        assert!(!e.mempool_suspect.contains(&key));
     }
 }

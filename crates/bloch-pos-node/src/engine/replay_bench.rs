@@ -669,6 +669,10 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         att_pool: AttestationPool::new(),
         wall_slot: 0,
         mempool: BTreeMap::new(),
+        // The replay harness never proposes, so nothing is ever skipped and
+        // the TTL has nothing to expire; the fields exist for the type.
+        mempool_admitted_at: BTreeMap::new(),
+        mempool_expired: 0,
         // O cache de recusa (2026-08-30): o replay nao propoe, entao nunca
         // bane nada — o campo existe para o tipo, sempre vazio aqui.
         rejected: BTreeMap::new(),
