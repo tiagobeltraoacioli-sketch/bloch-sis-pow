@@ -850,29 +850,116 @@ pub struct RpcCall {
     pub reply: Sender<RpcResult>,
 }
 
-/// The production backend: hand the request to the engine's event loop and wait.
+/// The production backend: hand the request to the engine's event loop and wait
+/// — except for the two ledger reads, which are answered from the published
+/// head (see [`Self::from_head`]).
 ///
-/// Reads go through the consensus thread rather than through a shared snapshot
-/// of state, and that is a deliberate cost. The engine's whole design is "one
-/// thread owns all consensus state; nothing else mutates it"; a cached
-/// state-shaped copy updated alongside is a second source of truth that can
-/// drift, which is the `expected_bits` failure in miniature. Serialising queries
-/// behind the loop means a query can never observe a half-applied block, and it
-/// means no reader can be looking at last epoch's answer.
+/// Nearly everything goes through the consensus thread rather than through a
+/// shared snapshot of state, and that is a deliberate cost. The engine's whole
+/// design is "one thread owns all consensus state; nothing else mutates it"; a
+/// cached state-shaped copy updated alongside is a second source of truth that
+/// can drift, which is the `expected_bits` failure in miniature. Serialising
+/// queries behind the loop means a query can never observe a half-applied
+/// block, and it means no reader can be looking at last epoch's answer.
+///
+/// **The exception, and why it does not reopen that.** `getbalance` and
+/// `getutxos` are served from an `Arc<CommittedState>` the consensus thread
+/// publishes — the identical value it holds, not a copy shaped like it, so
+/// there is nothing to drift and no half-applied state to observe. They earn
+/// the exception because they were the only reads whose cost scaled with the
+/// LEDGER rather than with the answer, and on 2026-08-21 that cost was paid by
+/// the slot loop while the node missed its duties. The `expected_bits` lesson
+/// is about a second *derivation* of a consensus value; this is the same
+/// value, handed over by reference.
 pub struct EngineBackend {
     /// `Mutex` because `mpsc::Sender` only became `Sync` in Rust 1.72 and this
     /// crate pins no MSRV. The lock is held exactly long enough to clone.
     engine: Mutex<Sender<crate::engine::EngineEvent>>,
+    /// The committed head, for the reads listed in [`Self::from_head`].
+    ///
+    /// `Option` because the engine is not the only thing that constructs this
+    /// backend, and a backend with no handle behaves exactly as it did before
+    /// this field existed: everything goes through the loop.
+    head: Option<crate::engine::SharedHead>,
 }
 
 impl EngineBackend {
     pub fn new(engine: Sender<crate::engine::EngineEvent>) -> Self {
-        EngineBackend { engine: Mutex::new(engine) }
+        EngineBackend { engine: Mutex::new(engine), head: None }
+    }
+
+    /// The production constructor: the channel to the loop, plus the handle on
+    /// the committed head the ledger reads are answered from.
+    pub fn with_head(
+        engine: Sender<crate::engine::EngineEvent>,
+        head: crate::engine::SharedHead,
+    ) -> Self {
+        EngineBackend { engine: Mutex::new(engine), head: Some(head) }
+    }
+
+    /// Answer `req` from the published head, or `None` if it is not one of the
+    /// requests that may be answered there.
+    ///
+    /// # Which requests, and why only these
+    ///
+    /// `getbalance` and `getutxos` read the eUTXO set and nothing else. They
+    /// touch no mempool, no block store and no fork-choice store — the three
+    /// things that live only on the consensus thread — so a committed state is
+    /// a complete answer to them.
+    ///
+    /// They are also the only two reads whose cost is set by the size of the
+    /// **ledger** rather than by the size of the answer, which is what makes
+    /// this necessary rather than merely nice: on 2026-08-21 a balance query
+    /// over the founder's 452,726 outputs sat in the slot loop for its whole
+    /// duration, and the node missed duties while an honest holder waited for
+    /// a number. The script index makes that query small; serving it here
+    /// makes a query that is somehow still large stop being the node's
+    /// problem. Both halves are needed — an index alone leaves the loop
+    /// exposed to the next unbounded read, and a snapshot alone leaves the
+    /// query paying for the whole set on a thread that has to answer many of
+    /// them at once.
+    ///
+    /// **Staleness, stated.** The answer is the state at this node's committed
+    /// head at the instant of the read — the same state the loop would have
+    /// used, since the loop applies a block by *replacing* this value. It can
+    /// be one block older than an answer the loop would give if a block lands
+    /// between the clone and the reply, which was already true of the channel
+    /// path (the reply crosses a channel too). No caller can observe a
+    /// half-applied block either way.
+    fn from_head(&self, req: &RpcRequest) -> Option<RpcResult> {
+        let head = self.head.as_ref()?;
+        // Matched BEFORE the state is cloned, so a request that must go to the
+        // loop does not even touch the lock.
+        match req {
+            RpcRequest::Balance(_) | RpcRequest::Utxos { .. } => {}
+            _ => return None,
+        }
+        // The lock is held for one `Arc::clone` and dropped. The query below
+        // runs on a state this thread owns a reference to, so the consensus
+        // thread can replace the published head — and go on proposing —
+        // while the query is still running.
+        let state = {
+            let guard = match head.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            Arc::clone(&guard)
+        };
+        match req {
+            RpcRequest::Balance(script_hash) => Some(Ok(balance_json(&state, script_hash))),
+            RpcRequest::Utxos { script_hash, limit } => {
+                Some(Ok(utxos_json(&state, script_hash, *limit)))
+            }
+            _ => None,
+        }
     }
 }
 
 impl RpcBackend for EngineBackend {
     fn call(&self, req: RpcRequest) -> RpcResult {
+        if let Some(answered) = self.from_head(&req) {
+            return answered;
+        }
         let (tx, rx) = mpsc::channel::<RpcResult>();
         let sender = match self.engine.lock() {
             Ok(guard) => guard.clone(),
@@ -1799,12 +1886,17 @@ fn eutxo_json(e: &EutxoEntry) -> Json {
 }
 
 /// `getbalance` — the summed value of every output locked to `script_hash`.
+///
+/// Two lookups against the script index, and neither walks the set. Until
+/// 2026-09-05 this made **two full passes** over every output that exists —
+/// one to count, one to sum — for an answer about one holder's, on the thread
+/// that proposes blocks. At the carryover's 452,726 outputs that is the
+/// 2026-08-21 stall, reachable by anyone who could ask a node for a balance.
 pub fn balance_json(state: &CommittedState, script_hash: &[u8; 32]) -> Json {
-    let count = state.eutxos().filter(|e| &e.script_hash == script_hash).count();
     Json::obj(vec![
         ("script_hash", Json::hex(script_hash)),
         ("balance_sat", Json::sat(state.balance_sat(script_hash))),
-        ("utxo_count", Json::u(count as u64)),
+        ("utxo_count", Json::u(state.utxo_count_for_script(script_hash) as u64)),
     ])
 }
 
@@ -1813,11 +1905,21 @@ pub fn balance_json(state: &CommittedState, script_hash: &[u8; 32]) -> Json {
 /// `truncated` rather than a cursor: the honest thing for a devnet-stage
 /// surface is to say the page was cut, not to invent a pagination protocol the
 /// OpenAPI V4 freeze has not decided on.
+///
+/// # Cost
+///
+/// `total` comes from the script index without visiting an output, and the
+/// page is built by taking `limit` items from a LAZY iterator over that
+/// holder's outputs — so the work is bounded by the page, not by the holder's
+/// position and not by the size of the ledger. The previous form collected
+/// every matching output into a `Vec` and applied the limit afterwards, which
+/// meant `limit: 1` against the founder's script hash still materialised
+/// hundreds of thousands of references before returning one of them.
 pub fn utxos_json(state: &CommittedState, script_hash: &[u8; 32], limit: usize) -> Json {
-    let matching: Vec<&EutxoEntry> =
-        state.eutxos().filter(|e| &e.script_hash == script_hash).collect();
-    let total = matching.len();
-    let page: Vec<Json> = matching.iter().take(limit).map(|e| eutxo_json(e)).collect();
+    let total = state.utxo_count_for_script(script_hash);
+    // `take(limit)` BEFORE `collect`: the iterator stops at the page.
+    let page: Vec<Json> =
+        state.utxos_for_script(script_hash).take(limit).map(eutxo_json).collect();
     Json::obj(vec![
         ("script_hash", Json::hex(script_hash)),
         ("total", Json::u(total as u64)),
