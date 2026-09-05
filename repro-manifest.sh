@@ -24,6 +24,31 @@ if [ "$#" -ne 1 ]; then
 fi
 ATTR="$1"
 
+# ── Inputs pin: checked FIRST, and fatal ────────────────────────────────────
+# A manifest without the lock hash is not comparable to anything: repro-compare.sh
+# has no way to tell whether the two builders read the same nixpkgs. This used to
+# be `echo "flake.lock: $(sha256sum flake.lock | ...)"` inline, and a missing lock
+# emitted the field EMPTY instead of failing — command substitution inside an
+# argument does not trip `set -e`. The compare script then skipped its input-
+# equality guard on the empty value and could still print REPRODUCIBLE. So the
+# hash is computed up front, into a variable, and a failure here stops the run
+# before the (expensive) build rather than producing an uncomparable manifest.
+if [ ! -r flake.lock ]; then
+  echo "flake.lock missing or unreadable in $(pwd)." >&2
+  echo "Run this from the repo root, and only after the lock is committed —" >&2
+  echo "without a pin the two builders are not building the same inputs and" >&2
+  echo "the comparison cannot mean anything. See REPRO.md §\"#2\"." >&2
+  exit 2
+fi
+# `|| true` so a sha256sum failure lands on the explicit message below rather
+# than on `set -e` + `pipefail` killing the script with a bare exit 1.
+LOCK_SHA=$(sha256sum flake.lock | cut -d' ' -f1 || true)
+if [ -z "$LOCK_SHA" ]; then
+  echo "could not hash flake.lock — refusing to write a manifest without the" >&2
+  echo "inputs fingerprint (it is what makes two manifests comparable)." >&2
+  exit 2
+fi
+
 OUT=$(nix build "$ATTR" --print-out-paths --no-link -L)
 
 MANIFEST="manifest-$(hostname)-$(echo "$ATTR" | tr -c 'A-Za-z0-9' _).txt"
@@ -32,7 +57,7 @@ MANIFEST="manifest-$(hostname)-$(echo "$ATTR" | tr -c 'A-Za-z0-9' _).txt"
   echo "attr:        $ATTR"
   echo "host:        $(uname -mno)"
   echo "nix:         $(nix --version)"
-  echo "flake.lock:  $(sha256sum flake.lock | cut -d' ' -f1)"
+  echo "flake.lock:  $LOCK_SHA"
   echo "outpath:     $OUT"
   # narHash = canonical content hash of the whole build output (arch-agnostic
   # form). Two hosts with the same flake.lock compute the same store-path *name*

@@ -56,7 +56,7 @@ Inputs that define the binary, and where each is pinned:
 |---|---|---|
 | Source | git commit | the stamp (§1) |
 | Compiler | `crates/bloch-pos-node/rust-toolchain.toml` (`1.94.1`) | rustup + a hard assert in `scripts/pos-release-integrity.sh` |
-| Dependency graph | committed `Cargo.lock` in **both** PoS workspaces (`bloch-pos-node`, `bloch-pos-committee` — they are standalone workspaces, the root lock does not cover them) | `cargo … --locked` + post-build `git diff --exit-code` on the locks |
+| Dependency graph | the committed **root** `Cargo.lock`. `bloch-pos-node` and `bloch-pos-committee` are `members` of the root virtual workspace, so cargo resolves them — and every other member — against that one file; a member's own `Cargo.lock` is never read (six such dead files were deleted on 2026-09-04) | `cargo metadata --locked`, resolved from the node crate dir so the toolchain pin still applies, + `git diff --exit-code` on the root lock before **and** after the build |
 | Stamp | `BLOCH_BUILD_COMMIT=<commit-12>` passed explicitly | release script / CI guard |
 | Profile & flags | default `release` profile, no `RUSTFLAGS` | any `RUSTFLAGS` changes the unit hash — a release build must run with `RUSTFLAGS` unset (the guard builds with a clean invocation) |
 | Build path | **canonical `/build` in the release container** | §3 — measured to matter |
@@ -173,10 +173,16 @@ Contents (verified by extracting the test package):
 | File | Purpose |
 |---|---|
 | `bloch-pos` | the known-good canonical binary |
-| `SHA256SUMS`, `STAMP` | its identity; `install.sh` refuses on mismatch |
+| `SHA256SUMS` | manifest over **every** file in the package — the binary, `STAMP`, the drop-in, `README` and `install.sh` itself; all of them reach root |
+| `SHA256SUMS.minisig` | **detached minisign signature over that manifest** (§5.4) — the only thing in the package that a tampered tarball cannot forge |
+| `STAMP` | the release identity; `install.sh` prints it and refuses on hash mismatch |
 | `99-rollback.conf` | systemd drop-in — `ExecStart=` reset + rollback path; named `99-` so it sorts after every stacked drop-in and therefore wins |
-| `install.sh` | verify → stage to `/opt/bloch/releases/rollback-<id>/` → record what WAS running (incident log) → install drop-in → restart → **prove via `/proc` that the running hash equals the packaged hash**, failing loudly if any generator still overrides it |
-| `README` | apply / un-apply instructions |
+| `install.sh` | **verify the detached signature against an out-of-band key → `sha256sum -c` the signed manifest** → stage to `/opt/bloch/releases/rollback-<id>/` → record what WAS running (incident log) → install drop-in → restart → **prove via `/proc` that the running hash equals the packaged hash**, failing loudly if any generator still overrides it. `./install.sh --verify-only` runs the two verification steps and stops |
+| `README` | apply / un-apply instructions, and how to verify the package by hand |
+
+The signing public key is **published beside the tarball, never inside it**
+(`deploy/rollback/dist/bloch-pos-rollback-<id>.pub`) — a key that travels with
+the bytes it authenticates authenticates nothing.
 
 The assembler also refuses a stamp that contradicts the binary's own
 `--version` (when runnable on the assembling host), so a mislabelled rollback
@@ -209,6 +215,15 @@ A package that has not passed this on a scratch host does not count for G8:
 3. Corrupt one byte of the packaged `bloch-pos` and re-run: `install.sh` must
    refuse at the `sha256sum -c` step. (Negative test — a rollback that
    installs corrupt bytes is worse than the outage.)
+3b. Corrupt the binary **and recompute `SHA256SUMS` to match** — the tamper an
+   in-tarball manifest cannot see — and re-run: `install.sh` must refuse at the
+   *signature* step, before staging anything. Then delete
+   `SHA256SUMS.minisig` and re-run: it must refuse rather than fall back to an
+   unauthenticated hash check. Both cases, plus a package signed by an
+   untrusted key and a valid signature pasted from another package, are pinned
+   in `deploy/rollback/make-rollback-package.selftest.sh` and run on every
+   pipeline (§6); the scratch-host drill re-runs them as a smoke check with the
+   real key.
 4. Un-apply (`rm …/99-rollback.conf`, `daemon-reload`, `restart`) and confirm
    via the §4 sweep that the host returned to the current release.
 5. Once the node is consensus-bearing (not the skeleton), add the twin-node
@@ -223,6 +238,48 @@ A package that has not passed this on a scratch host does not count for G8:
 Applying a rollback to the live fleet is an operator decision, made by a
 human, never by CI or automation.
 
+### 5.4 Why the manifest is signed, and where the key lives (audit I-H3)
+
+`SHA256SUMS` travels **inside** the tarball and `install.sh` runs as **root**.
+A manifest that ships next to the bytes it describes proves that the tarball is
+internally consistent and nothing more: whoever can rewrite the tarball — a
+mirror, the R2 bucket, a USB stick, a MITM on the fetch — rewrites the manifest
+with it, and `sha256sum -c` still says `OK`. The whole check was decorative
+against the only adversary it was there for.
+
+So the manifest carries a **detached minisign signature**, and `install.sh`
+verifies it **before** the hash check and long before anything is staged or
+executed:
+
+- **Assembly.** `make-rollback-package.sh` requires `BLOCH_ROLLBACK_SECKEY`
+  (the release minisign secret key) and **fails closed** — there is no
+  `--unsigned` escape hatch, because an unsigned tarball on disk is
+  indistinguishable from a released one once it leaves the directory. It signs
+  a *trusted comment* naming the release and the binary hash, so the signature
+  states which package it is for, and it re-verifies its own output before
+  emitting the tarball.
+- **Trust root.** The public key is pinned on each box **out of band** at
+  `/etc/bloch/rollback-signing.pub` (or `BLOCH_ROLLBACK_PUBKEY=<file>`).
+  `install.sh` never falls back to a key from the package: no key on the box,
+  no minisign installed, or no `.minisig` present are each a hard refusal.
+- **Cross-checks.** `install.sh` carries the signing key and the binary hash
+  baked in at assembly time. These are *not* a trust root — they are inside the
+  tarball like everything else — they exist so that a package signed by the
+  wrong key, or carrying a signature lifted from another package, fails with a
+  sentence an operator can act on at 03:00 instead of a bare crypto error.
+- **What it still does not prove.** `install.sh` verifies its own manifest
+  entry, but it is already running by then: a fully rewritten `install.sh`
+  simply would not run that check. The honest procedure is the one in the
+  package README — verify with `minisign -Vm SHA256SUMS -p <pinned key>` and
+  `sha256sum -c` (or `./install.sh --verify-only`) **before** invoking it as
+  root. The manifest entry for `install.sh` is what makes that pre-flight
+  meaningful.
+
+Key custody: the rollback signing key is the same class of secret as the
+release signing key (§7 step 3) and is held the same way — off the fleet, off
+CI, on the PMO machine. **CI never holds it**: the pipeline job (§6) exercises
+the whole flow with a disposable keypair generated into a temp dir.
+
 ## 6. What CI proves automatically (and what it cannot)
 
 `pos-release-integrity` (`.gitlab-ci.yml`, `check` stage, **blocking**, ~1
@@ -230,12 +287,34 @@ min, script `scripts/pos-release-integrity.sh`, modelled on
 `falcon-clean-guard`) proves on every pipeline:
 
 1. pinned toolchain present and active for the crate directory;
-2. both PoS workspaces resolve `--locked`; the committed lockfiles are not
-   rewritten by the build;
+2. the root `Cargo.lock` resolves `--locked`, is not rewritten by the build,
+   and is not shadowed by a lockfile inside any workspace member;
 3. two clean same-path builds of `bloch-pos` are **bit-identical** (fails =
    nondeterminism regression — catch it before any release is cut);
 4. `bloch-pos --version` contains the exact commit under build (fails = the
    stamp broke, fleet binaries become untraceable again).
+
+Check 2 is itself certified. `scripts/pos-release-integrity.selftest.py` runs
+first in the same job and drives `pos-release-integrity.sh --locks-only`
+against synthetic workspaces, requiring it to go **red** on a rewritten root
+`Cargo.lock`, on a resurrected per-member lockfile, and on a workspace layout
+the guard no longer covers. That certification is not decorative: until
+2026-09-04 this section resolved and diffed
+`crates/bloch-pos-{node,committee}/Cargo.lock`, believing the two crates were
+standalone workspaces. They are members, cargo never opened either file, and
+the drift diff was measured to exit 0 on a root lock a build had rewritten —
+green for its whole life while guarding nothing.
+
+`rollback-package-integrity` (`.gitlab-ci.yml`, `check` stage, **blocking**,
+script `deploy/rollback/make-rollback-package.selftest.sh`) additionally proves
+the §5.4 property on every pipeline: the assembler refuses to emit an unsigned
+package; the manifest covers every file that reaches root; the signature
+verifies; and each tampering case — recomputed manifest, edited `install.sh`,
+stripped signature, missing pinned key, untrusted signing key, signature pasted
+from another package — is **refused with a nonzero exit**. It uses a disposable
+keypair and only ever invokes `install.sh --verify-only`, so it touches no box,
+no service and no release key. Without `minisign` on the runner the job fails
+rather than skipping — it cannot silently stop proving the thing it exists for.
 
 CI cannot prove, by design:
 
@@ -258,7 +337,11 @@ releases.
    `SHA256SUMS` re-signing precedent). The published bytes are the bytes from
    step 2 — never a box's local build.
 4. Assemble the rollback package from release N−1
-   (`make-rollback-package.sh`), pass §5.3 on a scratch host, stage per §5.2.
+   (`make-rollback-package.sh`, with `BLOCH_ROLLBACK_SECKEY` set — it will not
+   produce an unsigned package), publish the signing public key beside it, pass
+   §5.3 on a scratch host, stage per §5.2. Confirm every box that may apply it
+   has that public key pinned at `/etc/bloch/rollback-signing.pub`; a box
+   without it cannot roll back.
 5. Deploy via drop-ins; run the §4 sweep — every host must match the
    published sha256 and stamp; repeat sweep ≥24 h later.
 6. File the sweep tables and hashes in the release notes. G8 is green only
@@ -282,7 +365,17 @@ releases.
    first run.
 4. **The §5.3 rollback drill was not executed on a systemd host** — macOS has
    no systemd. The package was assembled, extracted and content-verified, and
-   `install.sh` is syntax-checked; the drill needs a Linux scratch box.
+   `install.sh` is syntax-checked; the drill needs a Linux scratch box. The
+   §5.4 signature path *is* exercised end-to-end (assemble → tamper → refuse)
+   by the selftest, but only through `--verify-only`: the staging, drop-in and
+   `/proc` half of `install.sh` still has no automated coverage anywhere.
+7. **No release signing key exists yet, and no box has one pinned.** §5.4
+   specifies the custody and `install.sh` enforces it, but generating the
+   keypair and distributing `/etc/bloch/rollback-signing.pub` to the fleet is
+   an operator action that has not been taken. Until it is, a rollback package
+   assembled today cannot be applied by any box — which is the intended
+   fail-closed direction, and is a blocker on the first real release, not a
+   thing to work around by weakening `install.sh`.
 5. **No fleet machine was touched, nothing was deployed, no sweep was run** —
    per the task rules. The §4 runbook is ready to execute.
 6. **The G3 `bloch` binary on `integration/pos-modules` still has no stamp**:

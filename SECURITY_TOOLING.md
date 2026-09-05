@@ -29,10 +29,10 @@
 | Tool | Catches | Cannot catch | Local run |
 |---|---|---|---|
 | **cargo-audit** | Known RustSec advisories in `Cargo.lock` (CVEs, DoS, unsound) | Logic bugs, novel vulns | `cargo audit` (see advisory posture below for the tracked `--ignore` set) |
-| **cargo-deny** | Advisories + **license policy** (permissive only; AGPL allowed for the six first-party crates, copyleft denied for third-party deps) + banned/duplicate crates + untrusted registries | Same as audit for logic | `cargo deny check` |
-| **osv-scanner** | Same `Cargo.lock`, but the **OSV.dev** DB (RustSec **+ GHSA**) — catches GHSA-only advisories cargo-audit's RustSec-only feed misses | Logic bugs, novel vulns | `osv-scanner --lockfile=Cargo.lock` (install: `go install github.com/google/osv-scanner/cmd/osv-scanner@latest`; needs network for the DB — supplementary, not a blocking CI gate) |
+| **cargo-deny** | Advisories + **license policy** (permissive only; AGPL allowed only for the first-party workspace crates named in `deny.toml`, copyleft denied for third-party deps; that list is held equal to the AGPL workspace members by the blocking `deny-license-exceptions` job, `scripts/deny-license-exceptions-guard.py`) + banned/duplicate crates + untrusted registries | Same as audit for logic | `cargo deny check` |
+| **osv-scanner** | Same `Cargo.lock`, but the **OSV.dev** DB (RustSec **+ GHSA**) — catches GHSA-only advisories cargo-audit's RustSec-only feed misses | Logic bugs, novel vulns | `osv-scanner --config=osv-scanner.toml --lockfile=Cargo.lock` (install: `bash scripts/ci-install-scanner.sh osv-scanner`, which pins the version and **fails** if it cannot install; needs network for the DB. **BLOCKING in CI since 2026-09-04** — accepted residuals are named with a rationale and an expiry in `osv-scanner.toml`) |
 | **cargo-geiger** | `unsafe` usage across the dependency tree; flags increases | Whether the unsafe is *correct* | `cargo geiger` |
-| **Clippy (hardened)** | Panics in consensus paths (`unwrap`/`expect`), arithmetic side-effects, pedantic smells. Covers the LIVE Genesis-4 crates (`bloch-pos-committee`, `bloch-pos-node`) and the closed Genesis-3 ones (`bloch`, `bloch-crypto`, `bloch-euvm`). A per-crate **ratchet**: baselines are recorded and the run fails when a count goes up | Semantic/consensus correctness | `./scripts/hardened-clippy.sh` (the script is the definition of the scope and the baselines; do not hand-roll the crate list) |
+| **Clippy (hardened)** | Panics in consensus paths (`unwrap`/`expect`), arithmetic side-effects, pedantic smells. Covers the LIVE Genesis-4 crates (`bloch-pos-committee`, `bloch-pos-node`) and the closed Genesis-3 ones (`bloch`, `bloch-crypto`, `bloch-euvm`). A per-crate **ratchet** with three separately-baselined signals — panics, arithmetic, everything else at error severity — counted by lint name from `--message-format=json`; the run fails when a count goes up | Semantic/consensus correctness | `./scripts/hardened-clippy.sh` (the script is the definition of the scope and the baselines; do not hand-roll the crate list). Prove the scorer first with `bash scripts/hardened-clippy.selftest.sh` — no toolchain needed |
 | **Miri** | Undefined behaviour in the consensus + serialization test suites | Anything not exercised by a test | `cargo +nightly miri test` (consensus/serialization crates) |
 | **cargo-fuzz / libFuzzer** | Panics/UB/DoS on adversarial input to the P2P wire, PoW verifier, DAG ordering, signature parsing | Deep logic bugs, consensus splits | `cargo +nightly fuzz run <target>` (targets below) |
 | **proptest** | Property invariants (deterministic ordering, blue-score monotonicity, emission conservation) | Invariants nobody wrote | `cargo test` (property tests run in-suite) |
@@ -55,13 +55,40 @@ The `clippy-hardened` job is described in both pipelines as BLOCKING. Until 2026
 
 None of the nine in the live consensus crate is a reachable crash: each is a `try_into()` after a length-checked `take(n)`, a slice of a header whose length was validated first, or a `keys().next()` under `len() >= cap > 0`. They are hand-proofs where the lint wants a type-level guarantee, which is exactly why they stay counted. The job is now a **per-crate ratchet** — the recorded number may fall, never rise — rather than a pass/fail gate that was red on every commit and therefore read by nobody.
 
+### Correction (2026-09-05): that table was one signal short
+
+Every number above counts **panics only**. The profile also asks for `-W clippy::arithmetic_side_effects`, and the ratchet counted lines matching `^error` — but a lint requested with `-W` is emitted at *warning* severity. So unchecked arithmetic in consensus, emission and tokenomics was requested, emitted, printed into the job log, and scored as **zero**, for as long as the gate existed. The docstring above the gate said it denied unchecked arithmetic; the counter beneath it could not see any.
+
+Re-measured at `e266a76c` on the pinned toolchain (1.94.1), counting by **lint name** through `--message-format=json`:
+
+| Crate | panics | **arith** | other | Era |
+|---|---|---|---|---|
+| `bloch` | 59 | **205** | 0 | Genesis-3 |
+| `bloch-crypto` | 19 | **77** | 3 | shared; on the Genesis-4 signature path |
+| `bloch-pos-node` | 28 | **105** | 0 | **Genesis-4, live** |
+| `bloch-pos-committee` | 9 | **199** | 3 | **Genesis-4, live consensus** |
+| `bloch-euvm` | 0 | **30** | 0 | Genesis-3 |
+
+**616 unchecked arithmetic operations** across the gated crates, none of them previously counted. `bloch-euvm` is the sharpest illustration: it was documented above as the crate that had already reached 0 and was therefore "a hard gate again" — it has thirty.
+
+The panic column is *not* a relaxation. Split by lint name, four of the five come back exactly as recorded at `8167ceb`, including `bloch-crypto`, whose 22 is 19 panic sites plus 3 non-panic deny-level lints (`absurd_extreme_comparisons`, `erasing_op`, an inherent-method shadow) that now sit in `other` where they belong. The same conflation had pushed `bloch-pos-committee` to a spurious 12 against a correct baseline of 9. One number genuinely moved: `bloch-pos-node` is **28**, against a recorded 27 — a real new panic site that landed while the job was red for unrelated reasons, recorded so the gate can block the 29th, and flagged for review rather than accepted.
+
+Two further changes make the verdict mean something:
+
+- **The toolchain is pinned** to `crates/bloch-pos-node/rust-toolchain.toml`, the channel the release binary is built with. A lint count is a property of *(source, toolchain)*; scoring against the runner's floating `stable` makes the gate's verdict a function of the calendar. The script fails closed if that channel is unavailable.
+- **The counting half has a self-test** (`scripts/hardened-clippy.selftest.sh`, no toolchain required) that runs first and blocks in both pipelines. A gate that miscounts goes green, which is precisely how this one hid 616 findings behind a passing job; the arithmetic case that regressed is pinned by name.
+
 ## EVM / L2 scanners (configured for future Solidity)
 
 No Solidity is deployed yet (the L2 is a Rust revm scaffold). The Solidity toolchain — **Slither**, **Aderyn**, **Mythril**, **Echidna/Medusa**, **Foundry** (`forge test`/`coverage`), **Halmos**, **Semgrep**, **solhint** — is documented + config-scaffolded for when real contracts land. The L2 Rust crates are scanned with the same L1 Rust suite. See the bridge threat model for the highest-risk component.
 
 ## Advisory posture — the honest disposition
 
-`cargo-audit` / `cargo-deny` are green with a **documented ignore set** (full rationale in `deny.toml` + `audit.toml`). Two classes:
+`cargo-audit` / `cargo-deny` carry a **documented ignore set** (full rationale in `deny.toml` + `audit.toml`). Two classes:
+
+> **They are not green today (measured 2026-09-04).** `cargo audit --deny warnings` fails on four advisories that the ignore set does not carry and that no entry here mentions: **RUSTSEC-2026-0220** (ruint, wrong `overflowing_shl`/`shr` flags — fixed in 1.20.0), **RUSTSEC-2026-0221** (event-listener `StackSlot` `Send`/`Sync` — fixed in 5.4.2), **RUSTSEC-2026-0253** (lru `pop()` panic-safety use-after-free — fixed in 0.18.2), **RUSTSEC-2026-0258** (h2 unbounded empty DATA frames — fixed in 0.4.16). Each has a fixed upstream release, so the close is a dependency bump, not an ignore entry. `osv-scanner` reports exactly the same four and nothing else — which is why making it blocking added no new red to the pipeline.
+
+> **Scanner posture, corrected 2026-09-04 (finding I-H4).** Until this date the two scanners that back that claim on the GHSA side could not make it. `osv-scanner` and `secret-scan` were `allow_failure: true` in `.gitlab-ci.yml` / `continue-on-error: true` in `.github/workflows/security.yml`, **and** each opened with `if ! command -v <tool>; then echo skipping; exit 0; fi` — so on a runner without the tool the job went green having scanned nothing, and the log line that said so was informational prose, not a warning. osv-scanner is the only tool here that reads the OSV.dev DB, so the GHSA-only residuals below — yamux included — had no gate at all. Both jobs are now BLOCKING, install a pinned binary via `scripts/ci-install-scanner.sh` (which exits non-zero rather than skipping), and the residuals are explicit and expiring in `osv-scanner.toml`. `scripts/check-scanners-blocking.py` (with a selftest that proves it can still fail) holds both pipelines to that posture.
 
 1. **Unmaintained-notice** (no runtime vuln): the vendored `pqcrypto-*` PQ crates (PQClean archived — frozen under Cargo.lock by design), and SP1/zk host-side toolchain crates (backoff, ansi_term, instant, derivative, lru, …) that never touch the consensus/P2P runtime.
 
@@ -71,8 +98,8 @@ No Solidity is deployed yet (the L2 is a Rust revm scaffold). The Solidity toolc
    - **Why not fixed:** the fix is in hickory 0.26.x (DNSSEC code moved to `hickory-net`); **libp2p 0.56.0 pins hickory-proto 0.25.2** via `libp2p-dns` + `libp2p-mdns`. We cannot bump hickory without a libp2p release that repins it.
    - **Reachability / mitigation:** the DNS surface is `/dns4/` multiaddr resolution and LAN-only mDNS discovery. The node's canonical peering uses `/ip4/` addresses (no DNS resolution), and DNSSEC validation is not enabled — practical exposure is a self-inflicted malicious resolver or a hostile LAN.
    - **Action:** remove both `--ignore` entries the moment a libp2p release pins hickory ≥ 0.26.
-   - **⚠️ GHSA-vxx9-2994-q338 — yamux 0.12.1 (CVSS 8.7):** stream-multiplexer DoS. Surfaced by **osv-scanner** (GHSA-only — cargo-audit's RustSec feed does not carry it). Same upstream block as hickory: `libp2p-yamux 0.47.0` (libp2p 0.56.0) pins yamux 0.12.1; the fix (yamux 0.13/0.14) is unreachable until libp2p repins. Reachability is any connected peer over the yamux muxer — **the most exposed of the open residuals**; noise/`/ip4/` peering does not mitigate it. **Action:** bump the moment libp2p repins yamux; until then this is an accepted-but-tracked P2P DoS risk.
-   - **GHSA-vj64-rjf3-w3v7 — p3-challenger 0.2.2-succinct (CVSS 8.9)** and **GHSA-3g92-f9ch-qjcm — p3-symmetric (2.9):** plonky3 crates pinned by the SP1 4.2.1 prover stack — **host-side proof generation only, never the node consensus/P2P runtime.** Not bumpable without moving off pinned SP1. Tracked; low practical exposure.
+   - **⚠️ GHSA-vxx9-2994-q338 — yamux 0.12.1 (CVSS 8.7):** stream-multiplexer DoS. Surfaced by **osv-scanner** (GHSA-only — cargo-audit's RustSec feed does not carry it). Same upstream block as hickory: `libp2p-yamux 0.47.0` (libp2p 0.56.0) pins yamux 0.12.1; the fix (yamux 0.13/0.14) is unreachable until libp2p repins. Reachability is any connected peer over the yamux muxer — **the most exposed of the open residuals**; noise/`/ip4/` peering does not mitigate it. **Action:** bump the moment libp2p repins yamux; until then this is an accepted-but-tracked P2P DoS risk, carried as a dated `[[IgnoredVulns]]` entry in `osv-scanner.toml` (re-review **2026-12-01**, after which it fails CI again).
+   - **GHSA-vj64-rjf3-w3v7 — p3-challenger 0.2.2-succinct (CVSS 8.9)** and **GHSA-3g92-f9ch-qjcm — p3-symmetric (2.9):** plonky3 crates pinned by the SP1 4.2.1 prover stack — **host-side proof generation only, never the node consensus/P2P runtime.** Not bumpable without moving off pinned SP1. Tracked; low practical exposure. Same disposition, same dated entries in `osv-scanner.toml`.
 
    **Fixes applied this pass (real bumps, in-semver, staged in `Cargo.lock`):**
    - **`spin` 0.9.8 → 0.9.9** — 0.9.8 was **yanked** (would fail `cargo audit --deny warnings` and `deny yanked="deny"`).

@@ -26,6 +26,26 @@ Throughout: the code is **unaudited**, the coin has **no value**, testnet is
 zero-security. A single-host `--rebuild --check` pass is necessary but NOT
 sufficient — it is not the two-builder test.
 
+### Where this repository actually stands: **rung 1**
+
+There is no committed `flake.lock`, and there never has been one on `main`.
+`flake.nix` used to describe revisions "recorded from the committed flake.lock";
+the commit that wrote them down did not add the file, and `os/MOBILE.md`'s
+"Pinned revisions" block below is still placeholders. So `nixpkgs` is a moving
+branch and rung 2 has **not** been reached — not "nearly", not "pending a
+formality".
+
+The tooling used to hide that. `repro-manifest.sh` wrote its `flake.lock:` field
+EMPTY when the lock was missing (a failed command substitution inside an
+argument does not trip `set -e`), and `repro-compare.sh` only checked that field
+`if [ -n "$la" ]` and only *warned* when it differed — so two image builds from
+two different nixpkgs states printed `REPRODUCIBLE` and exited 0, which step #9
+below treats as authority to publish `os_roothash` as a **verified** reference.
+Both now fail closed, and `scripts/check-repro-inputs.py` (CI job
+`repro-inputs-guard`, BLOCKING, no Nix needed) keeps the pipeline red until the
+lock is genuinely committed. That red is the honest state of rung 1, not a
+broken pipeline.
+
 ## Platform caveat (why aarch64 vs x86_64 matters)
 
 `flake.nix` wires the OS/image outputs to `system = "x86_64-linux"`. On the
@@ -73,10 +93,16 @@ git add flake.lock flake.nix os/MOBILE.md
 #   commit body: "Pin all Nix inputs (flake.lock) + mobile-nixos rev.
 #   reproducible-by-design; NOT yet independently verified (see #9)."
 
-# 6. Drift guard (also enforced in CI):
+# 6. Record the revs printed in step 2 into EXPECT_NIXPKGS / EXPECT_MOBILE_NIXOS
+#    at the top of scripts/flake-lock.sh (they ship as UNRECORDED). The CI guard
+#    refuses a lock whose pins nobody has written down, and refuses recorded revs
+#    that contradict the lock.
+
+# 7. Drift guard (also enforced in CI):
 nix flake check --no-build
 nix flake lock --no-update-lock-file    # errors if the lock would need updating
 git diff --exit-code flake.lock         # fails on any drift
+python3 scripts/check-repro-inputs.py   # BLOCKING gate; needs no Nix, run it anywhere
 ```
 
 ## #9 — Determinism (run in repo root on the Nix host)

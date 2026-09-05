@@ -61,9 +61,26 @@ clippy:
 # now a per-crate RATCHET: recorded baselines, and the build fails when a count
 # goes up. See scripts/hardened-clippy.sh for the baselines, why they are not
 # zero, and why --no-deps is required.
+#
+# CHANGED 2026-09-05 (audit finding I-M8): the ratchet counted `^error` lines,
+# but `-W clippy::arithmetic_side_effects` emits at WARNING severity — so the
+# unchecked arithmetic this job claims to deny was requested, emitted, printed
+# and scored as ZERO, 199 of them in live consensus, for as long as the job
+# existed. Counting now goes by LINT NAME through --message-format=json, with
+# a separate baseline for panics, arithmetic and everything else at error
+# severity. The run is also pinned to the toolchain in
+# crates/bloch-pos-node/rust-toolchain.toml: a lint count is a property of
+# (source, toolchain), so scoring on the runner's drifting `stable` makes the
+# verdict a function of the calendar.
+#
+# The self-test runs FIRST and blocks. A gate that miscounts goes green, which
+# is exactly how this one hid 199 findings; its counting half is therefore
+# proven against hand-written logs — including the arithmetic case that
+# regressed — before it is allowed to judge the tree. No toolchain needed.
 clippy-hardened:
   stage: check
   script:
+    - bash scripts/hardened-clippy.selftest.sh
     - rustup component add clippy || true
     - bash scripts/hardened-clippy.sh
 
@@ -154,6 +171,41 @@ comment-constant-guard:
     - python3 scripts/check-comment-constants.py
   allow_failure: false
 
+# Reproducible-inputs guard (roadmap #2). BLOCKING, and RED ON PURPOSE today.
+# flake.nix documents revisions "recorded from the committed flake.lock"; there is
+# no committed flake.lock and there never has been one on main. Every mechanism
+# that should have caught that was soft: the `flake-lock-drift` job was
+# allow_failure with a guard step that kept it green, repro-manifest.sh wrote the
+# `flake.lock:` field EMPTY when the file was missing (command substitution in an
+# argument does not trip `set -e`), and repro-compare.sh only warned on that field
+# `if [ -n "$la" ]` — so it skipped the cross-builder input-equality check in
+# exactly the case the check exists for, and could still print REPRODUCIBLE over
+# two builds from different nixpkgs states.
+#
+# This job asserts the lock exists, pins every declared input to a full 40-hex rev
+# WITH a narHash, agrees with the revs recorded in scripts/flake-lock.sh, and that
+# flake-lock-drift is still blocking. It runs on the default Linux runner with no
+# Nix, so unlike flake-lock-drift it cannot pend its way to silence.
+#
+# It goes green when a human runs scripts/flake-lock.sh on the aarch64 Nix host and
+# commits the lock. Agents do not run Nix and must not hand-write one — a
+# fabricated narHash is a false pin, which reads as verified and is not.
+#
+# The selftest is the reason to trust the verdict: it builds synthetic repos and
+# manifests and asserts every fail-open shape the audit found goes red BY NAME —
+# missing lock, stub lock, branch-not-rev, prose disagreeing with the pin,
+# allow_failure restored, empty/differing flake.lock field in a manifest — and that
+# honest shapes stay green. It also drives repro-manifest.sh and repro-compare.sh
+# directly, so those two cannot regress to warn-only without turning this red.
+# Pure Python 3 + bash, no toolchain, no build, no Nix.
+repro-inputs-guard:
+  stage: check
+  before_script: []
+  script:
+    - python3 scripts/check-repro-inputs.selftest.py
+    - python3 scripts/check-repro-inputs.py
+  allow_failure: false
+
 # Source-in-archive guard. BLOCKING.
 # `tools/staking-cli/integration-merge/merged-consensus-files.tar.gz` is a
 # 276 KB gzip of six consensus and node source files, based six commits behind
@@ -178,6 +230,32 @@ no-source-archives:
     - python3 scripts/check-no-source-archives.py
   allow_failure: false
 
+# Scanner-posture guard (finding I-H4, 2026-09-04). BLOCKING.
+# The regression test for the defect this section was just fixed for: the
+# osv-scanner and secret-scan jobs were `allow_failure: true` AND opened with
+# `command -v <tool> || exit 0`, so on a runner without the tool they printed
+# "skipping (informational)" and went green. osv-scanner is the only tool in the
+# repository that sees GHSA-only advisories (yamux GHSA-vxx9-2994-q338, CVSS
+# 8.7, invisible to cargo-audit's RustSec feed), so the surface nothing else
+# covers had no verdict at all.
+#
+# This guard reads BOTH CI files — .gitlab-ci.yml and .github/workflows/
+# security.yml — and fails if a required scanner job is missing, is allowed to
+# fail, carries an `exit 0` escape, or is `when: manual`. Missing job counts as
+# a failure: a gate that was deleted must not read as a gate that passed.
+#
+# Its selftest runs first and is the reason to trust the verdict — it builds
+# synthetic CI files, asserts every escape shape goes red BY NAME and that the
+# honest shape stays green, including that a legitimately non-blocking job
+# (cargo-geiger) is NOT flagged. Pure Python 3, no toolchain, no build.
+scanners-blocking-guard:
+  stage: check
+  before_script: []
+  script:
+    - python3 scripts/check-scanners-blocking.selftest.py
+    - python3 scripts/check-scanners-blocking.py
+  allow_failure: false
+
 # Falcon constant-time guard (PoS finding F1, BLOCH-FALCON-ONLINE-SIGNING.md
 # §3.2). BLOCKING: fails if the workspace's resolved features for
 # pqcrypto-falcon include "avx2" or "neon" — those dispatch Falcon SIGNING to
@@ -198,8 +276,10 @@ falcon-clean-guard:
 # BLOCKING: the published Genesis-3 release WAS the broken binary (f819e87f,
 # an abandoned branch) while the fixes lived only on the boxes — fresh nodes
 # froze at 10802 and nobody noticed the divergence until they did. This job
-# proves, on every pipeline: (1) both PoS workspaces resolve with --locked and
-# the committed lockfiles do not drift; (2) two clean builds of bloch-pos at
+# proves, on every pipeline: (1) the root Cargo.lock — the ONE lockfile cargo
+# reads for the PoS crates, which are members of the root virtual workspace —
+# resolves with --locked, does not drift across the build, and has no dead
+# per-member lockfile shadowing it; (2) two clean builds of bloch-pos at
 # the same commit are bit-identical (same-path determinism — the path-scoped
 # caveat and the canonical /build rule are deploy/RELEASE-INTEGRITY.md §3);
 # (3) `bloch-pos --version` reports the exact commit being built, so a fleet
@@ -207,11 +287,38 @@ falcon-clean-guard:
 # deploy/RELEASE-INTEGRITY.md. ~1 min: the PoS workspace is small by design.
 # The toolchain is pinned by crates/bloch-pos-node/rust-toolchain.toml; the
 # install line makes a fresh runner self-provision instead of failing.
+# The selftest runs FIRST and is the reason to trust (1): the lockfile section
+# was green for its whole life while diffing two files cargo never opens, so it
+# could not fail. The selftest drives this same script against synthetic
+# workspaces and requires it to go red on root-lock drift, on a resurrected
+# per-member lockfile, and on a layout it no longer covers.
 pos-release-integrity:
   stage: check
   script:
+    - python3 scripts/pos-release-integrity.selftest.py
     - rustup toolchain install "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' crates/bloch-pos-node/rust-toolchain.toml)" --profile minimal || true
     - bash scripts/pos-release-integrity.sh
+  allow_failure: false
+
+# Rollback-package integrity (audit I-H3) — the signing half of G8 §5.
+# BLOCKING. `install.sh` from a rollback package runs as ROOT on a fleet box,
+# and its only integrity check used to be `sha256sum -c SHA256SUMS` over a
+# manifest that ships INSIDE the same tarball: anyone able to rewrite the
+# tarball rewrites the manifest with it and the check still passes. The
+# manifest now carries a detached minisign signature verified against a key
+# pinned out of band, BEFORE the hash check. This job runs the assembler
+# end-to-end with a disposable keypair and replays the tampering cases —
+# including the one the old design could not catch: swap the binary, recompute
+# SHA256SUMS, leave the signature alone. It touches no box, no service and no
+# release key (install.sh is only ever invoked with --verify-only).
+# Fails closed: without minisign the selftest cannot prove the property, so it
+# fails rather than skipping.
+rollback-package-integrity:
+  stage: check
+  before_script: []
+  script:
+    - command -v minisign >/dev/null || sudo apt-get install -y minisign || true
+    - bash deploy/rollback/make-rollback-package.selftest.sh
   allow_failure: false
 
 # Supply-chain — RUSTSEC advisories, permissive-license + no-git-dep policy.
@@ -229,6 +336,23 @@ supply-chain:
     - cargo deny check advisories bans licenses sources
   allow_failure: false
 
+# deny.toml license-exception consistency — audit finding D-H1-deny-agpl.
+# BLOCKING. Same defect as `supply-chain` above catches, but offline and in a
+# second rather than after cargo-deny resolves the whole graph — and it names
+# the exact block to edit. Four AGPL workspace members (bloch-pos-committee, bloch-pos-node,
+# bloch-pq-vault, genesis4-ceremony) were never added to the hand-maintained
+# exceptions list, so the blocking `supply-chain` job above could NOT have been
+# passing as configured. The guard derives the AGPL member set from the
+# workspace manifests, so the list can no longer drift silently: it fails on a
+# member with no exception, on an exception naming no member, and on copyleft
+# smuggled into the global `allow`. No network, no cargo resolution.
+deny-license-exceptions:
+  stage: check
+  before_script: []
+  script:
+    - python3 scripts/deny-license-exceptions-guard.py
+  allow_failure: false
+
 # cargo-audit — narrower RUSTSEC-only backstop to cargo-deny: an independent
 # implementation of the advisory check, so a cargo-deny regression or a
 # deny.toml misconfiguration cannot silently disable advisory scanning.
@@ -243,24 +367,29 @@ cargo-audit:
 
 # osv-scanner — supplementary advisory scan against the OSV.dev DB (RustSec +
 # GHSA). Catches GHSA-only advisories that cargo-audit's RustSec-only feed does
-# NOT carry (e.g. yamux GHSA-vxx9-2994-q338, the plonky3 p3-* crates). Kept
-# NON-BLOCKING: it needs network for the OSV DB and its GHSA set overlaps but is
-# not identical to the deny.toml/audit.toml ignore policy, so it is an early-
-# warning surface, not a hard gate. Findings are triaged in SECURITY_TOOLING.md
-# §Advisory-posture. Local run: osv-scanner --lockfile=Cargo.lock
+# NOT carry (e.g. yamux GHSA-vxx9-2994-q338, the plonky3 p3-* crates).
+#
+# BLOCKING since 2026-09-04 (finding I-H4). It was `allow_failure: true` AND it
+# opened with `command -v osv-scanner || exit 0`, which is two independent ways
+# to be green without scanning — and the silent one was the skip: a runner that
+# never had the tool printed "skipping (informational)" and went green. This is
+# the ONLY job in the pipeline that can see a GHSA-only advisory, so "did not
+# run" and "found nothing" were the same colour on the one surface nothing else
+# covers.
+#
+# Fail-closed now: scripts/ci-install-scanner.sh installs a PINNED osv-scanner
+# and exits non-zero if it cannot, so an absent tool fails the job. The ignore
+# policy that used to be implicit in `allow_failure` is now explicit, dated and
+# expiring in osv-scanner.toml — a new advisory fails the build.
+# Local run: osv-scanner --config=osv-scanner.toml --lockfile=Cargo.lock
 osv-scanner:
   stage: check
   before_script: []
   script:
-    - |
-      if ! command -v osv-scanner >/dev/null; then
-        echo "osv-scanner not installed on this runner — install:"
-        echo "  go install github.com/google/osv-scanner/cmd/osv-scanner@latest"
-        echo "skipping (informational)."
-        exit 0
-      fi
-    - osv-scanner --lockfile=Cargo.lock
-  allow_failure: true
+    - export PATH="$HOME/.local/bin:$PATH"
+    - bash scripts/ci-install-scanner.sh osv-scanner
+    - osv-scanner --config=osv-scanner.toml --lockfile=Cargo.lock
+  allow_failure: false
 
 # cargo-geiger — quantifies `unsafe` across the dependency tree (own code +
 # transitive), so a dependency bump that pulls in new unsafe is visible in the
@@ -326,17 +455,30 @@ fuzz-smoke:
 
 # Secret scanning — catch committed credentials (e.g. a leaked token) before they
 # reach history. Best practice given the project's own PAT-rotation lesson.
+#
+# BLOCKING since 2026-09-04 (finding I-H4), same defect as osv-scanner above: a
+# `command -v gitleaks || exit 0` skip on an `allow_failure: true` job. A secret
+# scanner that reports "not installed — skipping (informational)" in green is
+# worse than no secret scanner, because the pipeline claims the check.
+# scripts/ci-install-scanner.sh installs a PINNED gitleaks and fails if it
+# cannot.
+#
+# Scope, stated rather than implied: `--no-git` scans the WORKING TREE, so the
+# gate is on what a merge would introduce. Measured 2026-09-04 the tree is clean
+# under .gitleaks.toml (nine findings triaged there as doc/type-alias/public-key
+# shapes, each exempted by line pattern, not by muting the file). A full-history
+# scan reports 55 findings across 2,216 commits — history is immutable, so a
+# blocking job over it could never go green; that triage is separate work and is
+# written down in .gitleaks.toml instead of being hidden behind allow_failure.
+# Local run: gitleaks detect --no-git --source . --config .gitleaks.toml --redact
 secret-scan:
   stage: check
   before_script: []
   script:
-    - |
-      if ! command -v gitleaks >/dev/null; then
-        echo "gitleaks not installed on this runner — skipping (informational)."
-        exit 0
-      fi
-    - gitleaks detect --source . --no-banner --redact
-  allow_failure: true
+    - export PATH="$HOME/.local/bin:$PATH"
+    - bash scripts/ci-install-scanner.sh gitleaks
+    - gitleaks detect --no-git --source . --config .gitleaks.toml --no-banner --redact
+  allow_failure: false
 
 # Build + full test suite (the gate).
 build-and-test:
@@ -407,34 +549,31 @@ pow-estimator:
 # rule bars AGPL anywhere (even as a network service); it does not ban GPL dev
 # tooling. See REPRO.md.
 
-# flake.lock drift gate (roadmap #2 — pin all Nix inputs).
+# flake.lock drift gate (roadmap #2 — pin all Nix inputs). BLOCKING.
 # Asserts the lock is COMMITTED and CURRENT: `nix flake lock --no-update-lock-file`
 # errors if the lock would need updating, and `git diff --exit-code flake.lock`
 # fails on any drift. Needs Nix (aarch64 Linux runner), so it lives in the `nix`
 # stage on the same tag as `repro`.
 #
-# allow_failure: TRUE for now, because flake.lock is not yet committed (it is
-# generated by the human on the aarch64 host via scripts/flake-lock.sh — agents do
-# not run Nix). The guard step below fails SOFT with an explicit message until the
-# lock lands. Once flake.lock is committed, remove the guard block AND flip
-# allow_failure -> false to make drift BLOCKING.
+# WAS allow_failure: true, wrapped around a guard step that printed "flake.lock not
+# committed yet" and exited 1 — a soft failure on a file that has never existed on
+# main. Both are gone: a gate that cannot fail is not a gate, and the guard existed
+# only to keep it from failing. The lock's absence is a real finding, and this job
+# is now allowed to say so.
+#
+# NOTE it runs on tag `bloch-nix-aarch64`, so if no Nix runner is registered this
+# job PENDS rather than fails. The pin is therefore also checked, without Nix, by
+# `repro-inputs-guard` in the `check` stage on the default runner. That one is what
+# actually goes red today; this one catches drift once a lock exists.
 flake-lock-drift:
   stage: nix
   tags:
     - bloch-nix-aarch64
   before_script: []
   script:
-    # GUARD (remove once flake.lock is committed): keep this job green-by-design
-    # until the lock exists, rather than red on a file that is not there yet.
-    - |
-      if [ ! -f flake.lock ]; then
-        echo "flake.lock not committed yet — generate it on the aarch64 host with"
-        echo "scripts/flake-lock.sh, commit it, then flip this job to BLOCKING."
-        exit 1
-      fi
     - nix flake lock --no-update-lock-file
     - git diff --exit-code flake.lock
-  allow_failure: true   # TODO: flip to false once flake.lock is committed (remove the guard above).
+  allow_failure: false
 
 # Single-host reproducibility self-check: `--rebuild --check` forces a local
 # rebuild and fails if the output differs from what is already in the store

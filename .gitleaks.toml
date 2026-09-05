@@ -1,0 +1,49 @@
+# gitleaks — secret-scanning policy for Bloch-SIS.
+#
+# Run: gitleaks detect --no-git --source . --config .gitleaks.toml --redact
+#
+# WHY THIS FILE EXISTS (finding I-H4, 2026-09-04)
+# ----------------------------------------------
+# The secret-scan job was `allow_failure: true` and opened with
+# `command -v gitleaks || exit 0`, so it had never had to be right about
+# anything. Making it BLOCKING means the scan must be able to reach zero on a
+# clean tree, and that means the false positives get triaged and named here
+# instead of being absorbed by a green tick.
+#
+# Measured on this tree with gitleaks 8.18.4: nine findings, all four shapes
+# below, zero real credentials. Each allowlist entry is a LINE pattern, not a
+# path — the files stay fully scanned by every rule, and only the specific
+# benign shape is exempt. A real key added to any of those files still fails.
+#
+# WHAT THIS DOES NOT COVER, stated rather than implied: the CI job scans the
+# WORKING TREE (`--no-git`), so it gates what a merge would introduce. A full
+# history scan (`gitleaks detect`, 2,216 commits) reports 55 findings — the
+# same doc/test-vector/public-key shapes plus `catalog-dev.secret.pem`, a
+# postern-store demo signing key that is in history and NOT in the tree.
+# History is immutable, so those cannot be driven to zero by a CI flag; triaging
+# and, where warranted, rotating them is separate work. Scanning the tree is an
+# achievable gate that catches the next leak; claiming the history is clean
+# would be the same lie the `exit 0` told.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Triaged 2026-09-04: benign shapes that the generic-api-key rule reads as secrets."
+regexTarget = "line"
+regexes = [
+  # `.claude/workflows/roadmap-execution.js` — workstream identifiers in agent
+  # prompt objects. The literal word `key` next to a long prompt string, not a
+  # credential.
+  '''\{\s*key:\s*'[A-Za-z0-9._-]+',\s*(label|prompt):''',
+  # `docs/integration/BLOCH-EXCHANGE-INTEGRATION.md` — 20-byte script hashes in
+  # example JSON. A script_pubkey is public by construction; it is what an
+  # explorer prints.
+  '''"script_pubkey"\s*:\s*"[0-9a-f]{40}"''',
+  # `legacy/rfc/RFC-001-ffg-signature-scheme.md` — a Rust type alias. The word
+  # SecretKey names a TYPE; there is no value on the line.
+  '''type\s+Pq[A-Za-z]*Key\s*=\s*MLDSA65[A-Za-z]*Key''',
+  # `services/pq-shield-api/README.md` — compressed secp256k1 PUBLIC keys in a
+  # regtest example (the first is the generator point G).
+  '''"(hot|recovery)_pubkey"\s*:\s*"0[23][0-9a-f]{64}"''',
+]
