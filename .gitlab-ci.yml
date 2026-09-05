@@ -214,6 +214,27 @@ pos-release-integrity:
     - bash scripts/pos-release-integrity.sh
   allow_failure: false
 
+# Rollback-package integrity (audit I-H3) — the signing half of G8 §5.
+# BLOCKING. `install.sh` from a rollback package runs as ROOT on a fleet box,
+# and its only integrity check used to be `sha256sum -c SHA256SUMS` over a
+# manifest that ships INSIDE the same tarball: anyone able to rewrite the
+# tarball rewrites the manifest with it and the check still passes. The
+# manifest now carries a detached minisign signature verified against a key
+# pinned out of band, BEFORE the hash check. This job runs the assembler
+# end-to-end with a disposable keypair and replays the tampering cases —
+# including the one the old design could not catch: swap the binary, recompute
+# SHA256SUMS, leave the signature alone. It touches no box, no service and no
+# release key (install.sh is only ever invoked with --verify-only).
+# Fails closed: without minisign the selftest cannot prove the property, so it
+# fails rather than skipping.
+rollback-package-integrity:
+  stage: check
+  before_script: []
+  script:
+    - command -v minisign >/dev/null || sudo apt-get install -y minisign || true
+    - bash deploy/rollback/make-rollback-package.selftest.sh
+  allow_failure: false
+
 # Supply-chain — RUSTSEC advisories, permissive-license + no-git-dep policy.
 # BLOCKING: a supply-chain violation must fail the pipeline; see deny.toml.
 # S5: flipped from informational to blocking. The old comment's precondition
