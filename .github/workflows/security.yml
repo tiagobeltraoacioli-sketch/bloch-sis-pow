@@ -83,15 +83,39 @@ jobs:
   # job could not have been green on the retired ones either, so it is now a
   # per-crate RATCHET — recorded baselines, fails when a count goes up. See
   # scripts/hardened-clippy.sh.
+  #
+  # CHANGED 2026-09-05 (audit finding I-M8): the ratchet counted `^error`
+  # lines, but `-W clippy::arithmetic_side_effects` emits at WARNING severity —
+  # so the unchecked arithmetic this job claims to deny was requested, emitted,
+  # printed and scored as ZERO, 199 of them in live consensus, for as long as
+  # the job existed. Counting now goes by LINT NAME through
+  # --message-format=json, with a separate baseline for panics, arithmetic and
+  # everything else at error severity.
+  #
+  # The toolchain is PINNED, not `stable`. A lint count is a property of
+  # (source, toolchain): rustc and clippy add and reclassify lints every six
+  # weeks, so a floating `stable` makes this gate's verdict a function of the
+  # calendar rather than of the diff. The pin is read from
+  # crates/bloch-pos-node/rust-toolchain.toml by the script itself, which fails
+  # closed if that channel is unavailable; naming it here too only saves the
+  # script an install.
   clippy-hardened:
     name: clippy-hardened (blocking)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Keep in step with crates/bloch-pos-node/rust-toolchain.toml; the script
+      # re-reads that file and is the authority.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.94.1"
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # A gate that miscounts goes green, which is exactly how this one hid 199
+      # findings. Prove the counting half against hand-written logs before it
+      # is allowed to judge the tree. Pure bash + python3, no toolchain.
+      - name: hardened clippy — self-test
+        run: bash scripts/hardened-clippy.selftest.sh
       - name: Install C toolchain (rocksdb/blst/PQClean)
         run: sudo apt-get update && sudo apt-get install -y clang cmake
       - name: hardened clippy

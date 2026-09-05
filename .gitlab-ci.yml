@@ -61,9 +61,26 @@ clippy:
 # now a per-crate RATCHET: recorded baselines, and the build fails when a count
 # goes up. See scripts/hardened-clippy.sh for the baselines, why they are not
 # zero, and why --no-deps is required.
+#
+# CHANGED 2026-09-05 (audit finding I-M8): the ratchet counted `^error` lines,
+# but `-W clippy::arithmetic_side_effects` emits at WARNING severity — so the
+# unchecked arithmetic this job claims to deny was requested, emitted, printed
+# and scored as ZERO, 199 of them in live consensus, for as long as the job
+# existed. Counting now goes by LINT NAME through --message-format=json, with
+# a separate baseline for panics, arithmetic and everything else at error
+# severity. The run is also pinned to the toolchain in
+# crates/bloch-pos-node/rust-toolchain.toml: a lint count is a property of
+# (source, toolchain), so scoring on the runner's drifting `stable` makes the
+# verdict a function of the calendar.
+#
+# The self-test runs FIRST and blocks. A gate that miscounts goes green, which
+# is exactly how this one hid 199 findings; its counting half is therefore
+# proven against hand-written logs — including the arithmetic case that
+# regressed — before it is allowed to judge the tree. No toolchain needed.
 clippy-hardened:
   stage: check
   script:
+    - bash scripts/hardened-clippy.selftest.sh
     - rustup component add clippy || true
     - bash scripts/hardened-clippy.sh
 
