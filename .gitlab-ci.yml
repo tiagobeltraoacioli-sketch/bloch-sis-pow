@@ -198,8 +198,10 @@ falcon-clean-guard:
 # BLOCKING: the published Genesis-3 release WAS the broken binary (f819e87f,
 # an abandoned branch) while the fixes lived only on the boxes — fresh nodes
 # froze at 10802 and nobody noticed the divergence until they did. This job
-# proves, on every pipeline: (1) both PoS workspaces resolve with --locked and
-# the committed lockfiles do not drift; (2) two clean builds of bloch-pos at
+# proves, on every pipeline: (1) the root Cargo.lock — the ONE lockfile cargo
+# reads for the PoS crates, which are members of the root virtual workspace —
+# resolves with --locked, does not drift across the build, and has no dead
+# per-member lockfile shadowing it; (2) two clean builds of bloch-pos at
 # the same commit are bit-identical (same-path determinism — the path-scoped
 # caveat and the canonical /build rule are deploy/RELEASE-INTEGRITY.md §3);
 # (3) `bloch-pos --version` reports the exact commit being built, so a fleet
@@ -207,9 +209,15 @@ falcon-clean-guard:
 # deploy/RELEASE-INTEGRITY.md. ~1 min: the PoS workspace is small by design.
 # The toolchain is pinned by crates/bloch-pos-node/rust-toolchain.toml; the
 # install line makes a fresh runner self-provision instead of failing.
+# The selftest runs FIRST and is the reason to trust (1): the lockfile section
+# was green for its whole life while diffing two files cargo never opens, so it
+# could not fail. The selftest drives this same script against synthetic
+# workspaces and requires it to go red on root-lock drift, on a resurrected
+# per-member lockfile, and on a layout it no longer covers.
 pos-release-integrity:
   stage: check
   script:
+    - python3 scripts/pos-release-integrity.selftest.py
     - rustup toolchain install "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' crates/bloch-pos-node/rust-toolchain.toml)" --profile minimal || true
     - bash scripts/pos-release-integrity.sh
   allow_failure: false

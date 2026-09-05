@@ -56,7 +56,7 @@ Inputs that define the binary, and where each is pinned:
 |---|---|---|
 | Source | git commit | the stamp (§1) |
 | Compiler | `crates/bloch-pos-node/rust-toolchain.toml` (`1.94.1`) | rustup + a hard assert in `scripts/pos-release-integrity.sh` |
-| Dependency graph | committed `Cargo.lock` in **both** PoS workspaces (`bloch-pos-node`, `bloch-pos-committee` — they are standalone workspaces, the root lock does not cover them) | `cargo … --locked` + post-build `git diff --exit-code` on the locks |
+| Dependency graph | the committed **root** `Cargo.lock`. `bloch-pos-node` and `bloch-pos-committee` are `members` of the root virtual workspace, so cargo resolves them — and every other member — against that one file; a member's own `Cargo.lock` is never read (six such dead files were deleted on 2026-09-04) | `cargo metadata --locked`, resolved from the node crate dir so the toolchain pin still applies, + `git diff --exit-code` on the root lock before **and** after the build |
 | Stamp | `BLOCH_BUILD_COMMIT=<commit-12>` passed explicitly | release script / CI guard |
 | Profile & flags | default `release` profile, no `RUSTFLAGS` | any `RUSTFLAGS` changes the unit hash — a release build must run with `RUSTFLAGS` unset (the guard builds with a clean invocation) |
 | Build path | **canonical `/build` in the release container** | §3 — measured to matter |
@@ -230,12 +230,23 @@ min, script `scripts/pos-release-integrity.sh`, modelled on
 `falcon-clean-guard`) proves on every pipeline:
 
 1. pinned toolchain present and active for the crate directory;
-2. both PoS workspaces resolve `--locked`; the committed lockfiles are not
-   rewritten by the build;
+2. the root `Cargo.lock` resolves `--locked`, is not rewritten by the build,
+   and is not shadowed by a lockfile inside any workspace member;
 3. two clean same-path builds of `bloch-pos` are **bit-identical** (fails =
    nondeterminism regression — catch it before any release is cut);
 4. `bloch-pos --version` contains the exact commit under build (fails = the
    stamp broke, fleet binaries become untraceable again).
+
+Check 2 is itself certified. `scripts/pos-release-integrity.selftest.py` runs
+first in the same job and drives `pos-release-integrity.sh --locks-only`
+against synthetic workspaces, requiring it to go **red** on a rewritten root
+`Cargo.lock`, on a resurrected per-member lockfile, and on a workspace layout
+the guard no longer covers. That certification is not decorative: until
+2026-09-04 this section resolved and diffed
+`crates/bloch-pos-{node,committee}/Cargo.lock`, believing the two crates were
+standalone workspaces. They are members, cargo never opened either file, and
+the drift diff was measured to exit 0 on a root lock a build had rewritten —
+green for its whole life while guarding nothing.
 
 CI cannot prove, by design:
 
