@@ -151,9 +151,55 @@ pub fn randombytes_fill(buf: &mut [u8]) -> Result<(), getrandom::Error> {
     });
 
     if !used_seeded {
+        #[cfg(test)]
+        if FORCE_RNG_FAILURE.load(core::sync::atomic::Ordering::Relaxed) {
+            return Err(getrandom::Error::UNEXPECTED);
+        }
         getrandom::fill(buf)?;
     }
     Ok(())
+}
+
+/// Test-only fault injection for the OS-RNG failure branch of
+/// [`randombytes_fill`].
+///
+/// An actual `getrandom` failure cannot be provoked portably, so the
+/// fail-closed regression tests flip this flag in a re-executed child
+/// process and assert the process dies instead of returning. Compiled out
+/// entirely outside `cfg(test)`.
+#[cfg(test)]
+static FORCE_RNG_FAILURE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Fail closed: report the fault on stderr, then kill the process.
+///
+/// This is the only correct answer at the PQClean boundary. The two
+/// alternatives are both wrong:
+///
+/// - Returning an error code is **fail-open**: every PQClean call site
+///   (`crypto_sign_keypair`, `crypto_sign_signature`, …) calls
+///   `randombytes()` for its return value and discards it, so the caller
+///   would go on to derive a key or a signature nonce from an unwritten
+///   stack buffer.
+/// - Panicking unwinds into `extern "C"` frames.
+///
+/// `process::abort` does neither: no unwinding crosses the FFI boundary,
+/// and no key material is ever produced from unrandomized bytes.
+#[cold]
+#[inline(never)]
+fn abort_rng_failure(what: &str) -> ! {
+    use std::io::Write as _;
+    // A locked-stderr `writeln!` returns its error instead of panicking, so
+    // nothing on the way to abort() can unwind.
+    let mut err = std::io::stderr().lock();
+    let _ = writeln!(
+        err,
+        "FATAL: pqcrypto-internals: {what}. Aborting: PQClean discards the \
+         randombytes() return code, so continuing would derive keys or \
+         signature nonces from an unrandomized buffer."
+    );
+    let _ = err.flush();
+    std::process::abort()
 }
 
 /// Get random bytes; exposed for PQClean implementations.
@@ -161,24 +207,28 @@ pub fn randombytes_fill(buf: &mut [u8]) -> Result<(), getrandom::Error> {
 /// # Behavior
 ///
 /// Delegates to [`randombytes_fill`] (seeded thread-local stream if active,
-/// OS entropy otherwise) and returns `0` on success.
+/// OS entropy otherwise) and returns `0` on success. It returns *only* on
+/// success — every failure aborts the process.
 ///
-/// SECURITY (audit M): this function previously called
-/// `getrandom::fill(buf).expect("RNG Failed")`, which on an OS RNG failure
-/// started an unwind across the `extern "C"` boundary — undefined behavior on
-/// older toolchains and an uncontrolled process abort on current ones. All
-/// failures are now reported as a `-1` error code with no unwinding:
+/// SECURITY (audit K-H1, supersedes audit M): this function must FAIL CLOSED.
+/// Upstream `pqcrypto-internals` writes `getrandom::fill(buf).expect(..)`,
+/// i.e. it dies on an OS RNG failure; an earlier fork of this file relaxed
+/// that to `return -1`, which is fail-OPEN, because the PQClean C sources
+/// call `randombytes(buf, len);` as a statement and never inspect the result.
+/// A `-1` therefore let ML-DSA keygen and hedged signing continue over an
+/// unwritten stack buffer — attacker-predictable key material rather than a
+/// loud crash. Both failure modes now go to [`abort_rng_failure`]:
 ///
-/// - `buf` is NULL → `-1` (checked before any slice is constructed).
-/// - OS RNG failure → `-1`, `buf` contents unspecified (never partially
-///   trusted). NOTE: PQClean call sites that ignore the return code would
-///   proceed with an unfilled buffer; callers of this crate should treat any
-///   nonzero return as fatal for the surrounding key/signature operation.
+/// - OS RNG failure → abort (never a partially filled or untouched `buf`).
+/// - `buf` is NULL with `len > 0` → abort. Checked before any slice is
+///   constructed, since `slice::from_raw_parts_mut` on NULL is itself UB.
+///
+/// `len == 0` is a no-op and returns `0` for any `buf`, NULL included.
 ///
 /// # Safety
 ///
-/// If `buf` is non-NULL it must be valid for writes of `len` bytes and not
-/// aliased by any Rust reference for the duration of the call.
+/// If `len > 0`, `buf` must be non-NULL, valid for writes of `len` bytes, and
+/// not aliased by any Rust reference for the duration of the call.
 ///
 /// # Example
 /// ```rust
@@ -190,22 +240,25 @@ pub fn randombytes_fill(buf: &mut [u8]) -> Result<(), getrandom::Error> {
 /// ```
 #[no_mangle]
 pub unsafe extern "C" fn PQCRYPTO_RUST_randombytes(buf: *mut u8, len: size_t) -> c_int {
-    // Guard BEFORE constructing a slice: `slice::from_raw_parts_mut` on a
-    // NULL pointer is undefined behavior (it aborts under the debug-build
-    // precondition checks). A bad buffer from the C side must become an
-    // error code, not UB.
-    if buf.is_null() {
-        return -1;
-    }
+    // Nothing to write: no buffer is dereferenced, so this is safe even for a
+    // NULL `buf`, and no randomness is owed to the caller.
     if len == 0 {
         return 0;
+    }
+    // Checked BEFORE constructing a slice: `slice::from_raw_parts_mut` on a
+    // NULL pointer is undefined behavior. A NULL buffer means the C side is
+    // broken; there is no way to return randomness, and an error code would
+    // be discarded, so fail closed.
+    if buf.is_null() {
+        abort_rng_failure("randombytes() called with a NULL buffer");
     }
     let buf = slice::from_raw_parts_mut(buf, len);
 
     match randombytes_fill(buf) {
         Ok(()) => 0,
-        // Report failure as a C error code; never unwind into C.
-        Err(_) => -1,
+        // Fail closed; never unwind into C, never hand back a `-1` that the
+        // PQClean call site ignores.
+        Err(_) => abort_rng_failure("the OS RNG failed to fill the buffer"),
     }
 }
 
@@ -267,23 +320,126 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    /// Audit REGRESSION: a NULL buffer from the C side must come back as a
-    /// `-1` error code. Before the fix, `slice::from_raw_parts_mut(NULL, ..)`
-    /// was undefined behavior (an abort under debug-build precondition
-    /// checks) — nothing on the error path could cross the FFI boundary as a
-    /// clean error.
-    #[test]
-    fn null_buffer_returns_error_code_not_ub() {
-        let rc = unsafe { PQCRYPTO_RUST_randombytes(core::ptr::null_mut(), 32) };
-        assert_eq!(rc, -1, "NULL buffer must yield -1, not UB/abort");
-    }
-
-    /// Zero-length fills succeed trivially (nothing to write).
+    /// Zero-length fills succeed trivially — nothing is written and no
+    /// pointer is dereferenced, so even a NULL `buf` is a plain no-op rather
+    /// than a fault.
     #[test]
     fn zero_length_fill_is_ok() {
         let mut buf = [0u8; 1];
         let rc = unsafe { PQCRYPTO_RUST_randombytes(buf.as_mut_ptr(), 0) };
         assert_eq!(rc, 0);
+
+        let rc_null = unsafe { PQCRYPTO_RUST_randombytes(core::ptr::null_mut(), 0) };
+        assert_eq!(
+            rc_null, 0,
+            "zero-length NULL fill must be a no-op, not a fault"
+        );
+    }
+
+    // ---- Audit K-H1: the RNG must FAIL CLOSED --------------------------
+    //
+    // `abort_rng_failure` kills the process, so each failure case is driven
+    // by re-executing THIS test binary against a single filtered child test,
+    // with an env var selecting the case. The child prints `RETURNED_MARKER`
+    // if `PQCRYPTO_RUST_randombytes` returns at all; the parent then asserts
+    // the child died on SIGABRT and never printed that marker.
+    //
+    // Against the pre-fix code (`Err(_) => -1`, NULL → -1) both tests fail:
+    // the child exits 0 with the marker on stdout, which is exactly the
+    // fail-open behavior PQClean would have silently accepted.
+
+    const ABORT_CASE_ENV: &str = "PQCRYPTO_INTERNALS_ABORT_CASE";
+    const RETURNED_MARKER: &str = "RETURNED-INSTEAD-OF-ABORTING";
+
+    fn run_abort_case(case: &str) -> std::process::Output {
+        let exe = std::env::current_exe().expect("path to the running test binary");
+        std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "tests::abort_case_child",
+                "--include-ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(ABORT_CASE_ENV, case)
+            .output()
+            .expect("re-exec the test binary")
+    }
+
+    fn assert_failed_closed(out: &std::process::Output, case: &str) {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        assert!(
+            !stdout.contains(RETURNED_MARKER),
+            "{case}: PQCRYPTO_RUST_randombytes RETURNED instead of aborting — \
+             PQClean discards that code, so this is fail-open.\nstdout:\n{stdout}"
+        );
+        assert!(
+            !out.status.success(),
+            "{case}: child exited successfully; expected an abort.\nstdout:\n{stdout}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            assert_eq!(
+                out.status.signal(),
+                Some(6),
+                "{case}: expected SIGABRT, got {:?}.\nstderr:\n{stderr}",
+                out.status
+            );
+        }
+        assert!(
+            stderr.contains("FATAL: pqcrypto-internals"),
+            "{case}: no fail-closed diagnostic on stderr:\n{stderr}"
+        );
+    }
+
+    /// Child helper: re-executed by [`run_abort_case`], never run by a plain
+    /// `cargo test` (no env var set → returns immediately).
+    #[test]
+    #[ignore = "child process helper for the fail-closed regression tests"]
+    fn abort_case_child() {
+        let Ok(case) = std::env::var(ABORT_CASE_ENV) else {
+            return;
+        };
+        match case.as_str() {
+            // Force the OS-RNG branch to fail, exactly as `getrandom` would
+            // on a kernel entropy-source failure.
+            "os_rng_failure" => {
+                FORCE_RNG_FAILURE.store(true, core::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 32];
+                let rc = unsafe { PQCRYPTO_RUST_randombytes(buf.as_mut_ptr(), buf.len()) };
+                println!("{RETURNED_MARKER} rc={rc} buf={buf:?}");
+            }
+            "null_buffer" => {
+                let rc = unsafe { PQCRYPTO_RUST_randombytes(core::ptr::null_mut(), 32) };
+                println!("{RETURNED_MARKER} rc={rc}");
+            }
+            other => panic!("unknown abort case {other:?}"),
+        }
+    }
+
+    /// Audit K-H1 REGRESSION: an OS RNG failure must abort, not return `-1`.
+    #[test]
+    fn os_rng_failure_aborts_instead_of_failing_open() {
+        assert_failed_closed(&run_abort_case("os_rng_failure"), "os_rng_failure");
+    }
+
+    /// Audit K-H1 REGRESSION: a NULL buffer with `len > 0` must abort too —
+    /// there is no way to return randomness, and an error code is discarded.
+    #[test]
+    fn null_buffer_aborts_instead_of_failing_open() {
+        assert_failed_closed(&run_abort_case("null_buffer"), "null_buffer");
+    }
+
+    /// The injection hook itself must be inert unless a test sets it —
+    /// otherwise the two abort tests above could pass vacuously.
+    #[test]
+    fn fault_injection_is_off_by_default() {
+        assert!(!FORCE_RNG_FAILURE.load(core::sync::atomic::Ordering::SeqCst));
+        let mut buf = [0u8; 32];
+        assert!(randombytes_fill(&mut buf).is_ok());
     }
 
     /// The safe-Rust core reports success via Result (the OS-failure branch
