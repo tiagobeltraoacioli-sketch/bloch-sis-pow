@@ -38,6 +38,41 @@ pub const SLOT_SUBCOMMITTEE_SIZE: usize = 8;
 /// Slots per epoch (§5.1).
 pub const SLOTS_PER_EPOCH: u64 = 32;
 
+/// Hard ceiling on attestations a single block body may carry.
+///
+/// # Why a block-level bound exists at all
+///
+/// Step 8 of `Transition::apply_block` runs a per-attestation loop. Before
+/// 2026-09-04 nothing bounded the length of that loop from inside consensus:
+/// the only cap was `bloch_pos_node::codec::decode_envelope`'s wire limit, a
+/// number written in the *node's* decoder and therefore absent from every
+/// other way a body reaches the transition (RPC, replay of a locally built
+/// body, the producer's own `compute_post_state` probe, a future codec). A
+/// consensus rule that only holds because one particular decoder happens to
+/// enforce it is not a consensus rule.
+///
+/// # Why exactly 4,096 and not something tighter
+///
+/// 4,096 is **the same number the wire decoder already enforced**, chosen for
+/// that reason and no other. It makes this constant provably a no-op for
+/// every block that has ever crossed the network — no historical body can
+/// violate a bound its own decoder already applied — so binding it needs no
+/// flag day and can create no fork. That is the whole of the safety argument.
+///
+/// It is emphatically *not* the tight bound. An honest body can hold at most
+/// one attestation per (validator, vote) pair in the current epoch, so with
+/// today's 64-validator set the honest ceiling is nearer 64 than 4,096. A cap
+/// in that region would be a genuine tightening — it could reject a body an
+/// older producer might build — and tightening a live consensus rule is a
+/// flag day and the founder's call, not a dev's. See the note beside the
+/// check in `transition.rs` step 8.
+///
+/// The DoS this constant was written for is **not** closed by this constant.
+/// It is closed by hoisting the epoch partition out of the loop (same file,
+/// same step): the cost of a body went from `n` shuffles of the whole active
+/// set to one. This bound is the backstop behind that fix, not the fix.
+pub const MAX_ATTESTATIONS_PER_BLOCK: usize = 4_096;
+
 /// Seconds per slot (§5.1) — identical to today's PoW block target, so the
 /// transition adds no new propagation pressure.
 pub const SLOT_DURATION_SECS: u64 = 30;

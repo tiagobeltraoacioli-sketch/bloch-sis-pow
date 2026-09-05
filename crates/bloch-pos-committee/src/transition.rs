@@ -4173,13 +4173,80 @@ impl<V: SignatureVerifier> Transition<V> {
         //    mutated, records never removed, and the Deposit handler rejects a
         //    pubkey already registered), so no two indices can ever hold the
         //    same key and no index can ever change hands.
+        //
+        //    8a. The block-level bound, before the loop that would honour it.
+        //    `MAX_ATTESTATIONS_PER_BLOCK` is the wire decoder's own 4,096
+        //    restated as a consensus rule, so it can reject nothing the
+        //    network has ever carried — see the constant's docs for why it is
+        //    deliberately loose and what a tight cap would cost.
+        if attestations.len() > crate::params::MAX_ATTESTATIONS_PER_BLOCK {
+            return Err(TransitionError::TooManyAttestations);
+        }
+
+        //    8b. The epoch partition, drawn ONCE.
+        //
+        //    This used to be `committees::committee_for_slot(&seed, slot, ..)`
+        //    inside the loop below. That call is not a lookup: it shuffles the
+        //    entire active set with SHAKE-256 Fisher-Yates and cuts it into 32
+        //    chunks, then throws 31 of them away. Calling it per attestation
+        //    made the cost of validating a body quadratic in the set size and
+        //    linear in a number the sender chooses — the measured shape is a
+        //    body of a few thousand attestations costing seconds of CPU on
+        //    every node in the network, for a body whose signatures need never
+        //    be valid.
+        //
+        //    Drawing it once is bit-for-bit the same committee, and the reason
+        //    is the epoch check that follows: every admissible attestation has
+        //    `epoch_of(att.data.slot) == st.epoch`, and `committee_for_slot`
+        //    derives its epoch from the slot by the same division. So one
+        //    partition of `st.epoch` serves every attestation in the body, and
+        //    an attestation from another epoch never reaches the index — it is
+        //    rejected first. The epoch check MUST therefore stay above the
+        //    lookup; moving it below would index this partition with a slot it
+        //    does not describe.
+        let partition = committees::epoch_committees(&seed, st.epoch, &roster);
+        let empty_committee: Vec<u32> = Vec::new();
+
+        //    8c. Duplicate votes, refused.
+        //
+        //    Two identical (validator, signing_root) pairs in one body are
+        //    pure padding: the second writes the same `pending_votes` entry
+        //    and the same participation bit the first did, so it changes no
+        //    committed state — it only buys the sender a second hybrid
+        //    verification, the most expensive operation in the transition.
+        //    Nothing above rejected it, because the map key made it
+        //    idempotent rather than illegal.
+        //
+        //    This is a tightening of a live consensus rule, and it is safe
+        //    for exactly one reason, which is a fact about the producer and
+        //    not an assumption about intent: the node's attestation pool is a
+        //    map keyed by `(validator, signing_root)` (`engine.rs`, both the
+        //    `attest` insert and the `propose` filter read that map's
+        //    values), so a body built by this software cannot contain the
+        //    same pair twice. No honest block loses. Distinct votes from one
+        //    validator are still admitted — equivocation is the slashing
+        //    layer's business, and refusing it here would reject bodies an
+        //    older producer can legitimately build.
+        let mut seen: BTreeSet<(u32, [u8; 32])> = BTreeSet::new();
+
         for (i, att) in attestations.iter().enumerate() {
             let reject = TransitionError::Attestation(i as u32);
             if crate::epoch_of(att.data.slot) != st.epoch {
                 return Err(reject);
             }
-            let committee = committees::committee_for_slot(&seed, att.data.slot, &roster);
-            if attestation::validate(att, &committee, header.slot, &self.verifier, &st.validators)
+            let signing_root = att.data.signing_root();
+            if !seen.insert((att.validator, signing_root)) {
+                return Err(TransitionError::DuplicateAttestation(i as u32));
+            }
+            // Same slice `committee_for_slot` would have returned, from the
+            // partition drawn once above. `unwrap_or` rather than an index:
+            // a consensus path must not panic, and `slot % SLOTS_PER_EPOCH`
+            // is in range for any partition of the expected width only
+            // because `epoch_committees` always returns `SLOTS_PER_EPOCH`
+            // chunks — a fact this line declines to assume.
+            let idx = (att.data.slot % crate::params::SLOTS_PER_EPOCH) as usize;
+            let committee = partition.get(idx).unwrap_or(&empty_committee);
+            if attestation::validate(att, committee, header.slot, &self.verifier, &st.validators)
                 .is_err()
             {
                 return Err(reject);
@@ -4190,7 +4257,7 @@ impl<V: SignatureVerifier> Transition<V> {
             // Collected for the epoch's finality tally. Keyed by content, so
             // the committed set is independent of inclusion order (rule 2);
             // the finality engine is the sole judge of what the votes mean.
-            st.pending_votes.insert((att.validator, att.data.signing_root()), att.data);
+            st.pending_votes.insert((att.validator, signing_root), att.data);
         }
 
         // 9. Fork-choice weight accumulation (forkchoice.rs).
@@ -5496,6 +5563,256 @@ mod tests {
             }
         }
         out
+    }
+
+    // ── H2: attestation limits (2026-09-04) ─────────────────────────────────
+    //
+    // The three facts step 8 gained: the epoch partition is drawn once, a
+    // repeated (validator, signing_root) is refused, and a body has a maximum
+    // length. The first is an equivalence and is proved as one; the other two
+    // are rejections and are proved by bodies that used to apply.
+
+    /// Build a header at `slot` whose commitments cover `atts` and whose
+    /// proposer signature is stamped, but WITHOUT running the post-state — so
+    /// a body the transition is expected to refuse can still be assembled
+    /// (`build_block` would panic on one, because it runs the transition).
+    ///
+    /// `state_root` is left zero, which the transition refuses at step 12
+    /// (`StateRootMismatch`). Every assertion below therefore names an error
+    /// from a step BEFORE 12, and naming it is what proves the check under
+    /// test ran: with the new rules absent, these bodies reach step 12 and the
+    /// test sees `StateRootMismatch` instead.
+    ///
+    /// Consumes one reveal from the drawn proposer's chain, so each call needs
+    /// a chain set that matches `pre` — see `epoch1_fixture`.
+    fn build_header_over(
+        pre: &CommittedState,
+        slot: u64,
+        atts: &[Attestation],
+        chains: &mut [RandaoChain],
+    ) -> ProposalEnvelope {
+        let mut ctx = pre.clone();
+        while ctx.epoch < crate::epoch_of(slot) {
+            ctx = ctx.close_epoch();
+        }
+        let roster = ctx.duty_roster();
+        let seed = ctx.seed_for_epoch(ctx.epoch);
+        let p = schedule::proposer(&seed, slot, &roster).expect("no eligible proposer");
+        let reveal = chains[p as usize].next_reveal().expect("chain spent");
+        let fin = ctx.finality_view();
+        let header = BlockHeaderV4 {
+            version: BLOCK_VERSION_V4,
+            parent: *pre.head.as_bytes(),
+            state_root: [0u8; 32],
+            body_root: crate::derive::body_root(&[]),
+            slot,
+            proposer_index: p,
+            randao_reveal: reveal,
+            randao_mix: beacon::mix_in(&ctx.randao_mix, &reveal),
+            justified_root: fin.justified.root,
+            finalized_root: fin.finalized.root,
+            attestation_root: crate::derive::attestation_root(atts),
+            coherence_root: pre.coherence_root(),
+        };
+        let proposer_sig = match crate::attestation::KeyLookup::pubkey(pre, p) {
+            Some(pk) => toy_sign(pk, &header.proposal_signing_root()),
+            None => vec![0u8; 8],
+        };
+        ProposalEnvelope { header, proposer_sig }
+    }
+
+    /// A fixture parked at the first block of epoch 1, with the chain set in
+    /// step with the state it returns.
+    ///
+    /// Epoch 1 and not genesis because an attestation must satisfy
+    /// `source_epoch < target_epoch`, and in epoch 0 the justified checkpoint
+    /// IS epoch 0 — every vote would die at `NonMonotonicCheckpoints` before
+    /// the rules under test are reached.
+    ///
+    /// Rebuilt per call rather than shared, because `build_header_over` spends
+    /// a RANDAO reveal it never commits: two unapplied headers off one chain
+    /// set would make the second reveal open nothing (`BadRandaoReveal`), and
+    /// the test would "pass" for a reason that has nothing to do with
+    /// attestations.
+    fn epoch1_fixture() -> (Transition<OkVerifier>, CommittedState, Vec<RandaoChain>) {
+        let (t, g, mut chains) = setup(8);
+        let b = build_block(&t, &g, 32, &[], &[], &mut chains);
+        let s = t.apply_block(&g, &b, &[], &[]).expect("first block of epoch 1 rejected");
+        assert_eq!(s.epoch, 1);
+        (t, s, chains)
+    }
+
+    /// A real committee seat of `st`'s epoch, as (slot, member) — preferring
+    /// a slot whose index within the epoch is NOT zero.
+    ///
+    /// The preference is the point. Step 8 indexes the hoisted partition with
+    /// `slot % SLOTS_PER_EPOCH`; a mutation that hardcodes that index to `0`
+    /// is invisible to any test whose only attester happens to sit in slot 0,
+    /// and with 8 validators over 32 slots the first non-empty committee IS
+    /// slot 0. Asserting the preference held would over-constrain the fixture,
+    /// so it falls back — but the fallback is where this helper stops proving
+    /// the index, and `justification_and_finality_advance_across_epochs`
+    /// (every slot of the epoch) is the backstop.
+    fn a_committee_seat(st: &CommittedState) -> (u64, u32) {
+        let roster = st.duty_roster();
+        let seed = st.seed_for_epoch(st.epoch);
+        let partition = committees::epoch_committees(&seed, st.epoch, &roster);
+        let seat = |i: usize, c: &Vec<u32>| {
+            c.first().map(|v| (st.epoch * SLOTS_PER_EPOCH + i as u64, *v))
+        };
+        partition
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find_map(|(i, c)| seat(i, c))
+            .or_else(|| partition.iter().enumerate().find_map(|(i, c)| seat(i, c)))
+            .expect("the fixture must give some slot of this epoch a non-empty committee")
+    }
+
+    /// The hoist is an equivalence, not an optimisation with a caveat.
+    ///
+    /// Step 8 replaced a per-attestation `committee_for_slot` with one
+    /// `epoch_committees` indexed by `slot % SLOTS_PER_EPOCH`. That is only
+    /// legitimate if the two agree for every slot the loop can reach — every
+    /// slot of the block's own epoch, since an attestation from any other
+    /// epoch is rejected above the lookup. This walks all 32 of them, on
+    /// non-zero epochs so a `% SLOTS_PER_EPOCH` written as a bare `slot` would
+    /// be caught.
+    #[test]
+    fn the_hoisted_partition_is_the_same_committee_per_slot() {
+        let (_t, g, _c) = setup(8);
+        let roster = g.duty_roster();
+        for epoch in [0u64, 1, 7, 1400] {
+            let seed = g.seed_for_epoch(epoch);
+            let partition = committees::epoch_committees(&seed, epoch, &roster);
+            assert_eq!(partition.len(), SLOTS_PER_EPOCH as usize);
+            let mut nonempty = 0usize;
+            for i in 0..SLOTS_PER_EPOCH {
+                let slot = epoch * SLOTS_PER_EPOCH + i;
+                let hoisted = &partition[(slot % SLOTS_PER_EPOCH) as usize];
+                let per_call = committees::committee_for_slot(&seed, slot, &roster);
+                assert_eq!(
+                    *hoisted, per_call,
+                    "epoch {epoch} slot {slot}: the hoisted partition and the per-attestation \
+                     draw disagree — the hoist would change which validators may attest"
+                );
+                nonempty += usize::from(!per_call.is_empty());
+            }
+            assert!(
+                nonempty > 0,
+                "epoch {epoch} partitioned 8 validators into 32 empty committees; the \
+                 equivalence above would then hold vacuously and prove nothing"
+            );
+        }
+    }
+
+    /// The same (validator, signing_root) twice in one body is refused.
+    ///
+    /// Without the dedup this body APPLIES: the second copy rewrites the same
+    /// `pending_votes` key and the same participation bit, so it changes no
+    /// committed state — it only costs a second hybrid verification. That is
+    /// why it was invisible, and why the assertion is on the error rather than
+    /// on the resulting state.
+    #[test]
+    fn a_repeated_attestation_in_one_body_is_refused() {
+        // Control: one copy survives step 8 and dies at the zero state_root.
+        // Without it the duplicate case below would prove nothing — a vote
+        // rejected for being unincludable looks the same from the outside.
+        let (t, s, mut chains) = epoch1_fixture();
+        let (att_slot, member) = a_committee_seat(&s);
+        let one = attest(&s, member, att_slot, *s.head.as_bytes());
+        let solo = build_header_over(&s, 63, std::slice::from_ref(&one), &mut chains);
+        assert_eq!(
+            t.apply_block(&s, &solo, std::slice::from_ref(&one), &[]),
+            Err(TransitionError::StateRootMismatch),
+            "control: one copy of this vote must get PAST step 8"
+        );
+
+        let (t, s, mut chains) = epoch1_fixture();
+        let two = vec![one.clone(), one];
+        let dup = build_header_over(&s, 63, &two, &mut chains);
+        assert_eq!(
+            t.apply_block(&s, &dup, &two, &[]),
+            Err(TransitionError::DuplicateAttestation(1)),
+            "a body carrying the same (validator, signing_root) twice must be refused, \
+             naming the SECOND copy"
+        );
+    }
+
+    /// Distinct votes from one validator are still admitted.
+    ///
+    /// The guard rail on the test above: a dedup keyed on the validator alone
+    /// would satisfy it, and would also reject bodies an older producer can
+    /// legitimately build — the node's pool is keyed by the pair, so it can
+    /// hold two conflicting votes from one attester. Equivocation is the
+    /// slashing layer's business, not step 8's.
+    #[test]
+    fn two_different_votes_from_one_validator_are_not_a_duplicate() {
+        let (t, s, mut chains) = epoch1_fixture();
+        let (att_slot, member) = a_committee_seat(&s);
+        let a = attest(&s, member, att_slot, *s.head.as_bytes());
+        let b = attest(&s, member, att_slot, [0xEE; 32]);
+        assert_ne!(
+            a.data.signing_root(),
+            b.data.signing_root(),
+            "the two votes must differ, or this test is the duplicate case in disguise"
+        );
+
+        let both = vec![a, b];
+        let env = build_header_over(&s, 63, &both, &mut chains);
+        assert_eq!(
+            t.apply_block(&s, &env, &both, &[]),
+            Err(TransitionError::StateRootMismatch),
+            "two DIFFERENT votes from one validator must reach step 12, not be refused as \
+             duplicates — refusing them would reject blocks honest producers build"
+        );
+    }
+
+    /// A body longer than `MAX_ATTESTATIONS_PER_BLOCK` is refused as a block,
+    /// before the loop that would have walked it.
+    ///
+    /// The attestations are garbage on purpose: the cap is checked ahead of
+    /// the per-attestation work, so a body over the limit must never be judged
+    /// one attestation at a time. Without the cap this returns
+    /// `Attestation(0)` — the first item failing validation — which is the
+    /// mutation the assertion separates it from, and which the second half
+    /// then pins as the behaviour AT the boundary.
+    #[test]
+    fn a_body_over_the_attestation_cap_is_refused_as_a_block() {
+        let junk = Attestation {
+            data: AttestationData {
+                slot: 0,
+                head: [0u8; 32],
+                source_epoch: 0,
+                source_root: [0u8; 32],
+                target_epoch: 1,
+                target_root: [0u8; 32],
+            },
+            validator: u32::MAX,
+            signature: Vec::new(),
+        };
+
+        let (t, s, mut chains) = epoch1_fixture();
+        let over = vec![junk.clone(); crate::params::MAX_ATTESTATIONS_PER_BLOCK + 1];
+        let env = build_header_over(&s, 63, &over, &mut chains);
+        assert_eq!(
+            t.apply_block(&s, &env, &over, &[]),
+            Err(TransitionError::TooManyAttestations),
+            "a body past the cap must be refused as a BLOCK, not judged attestation by \
+             attestation — `Attestation(0)` here means the cap check is gone"
+        );
+
+        // The boundary is the constant itself, not one either side of it: a
+        // body of exactly the cap clears the length check and is then judged
+        // on its contents (garbage, so the first item is blamed).
+        let (t, s, mut chains) = epoch1_fixture();
+        let at = vec![junk; crate::params::MAX_ATTESTATIONS_PER_BLOCK];
+        let env = build_header_over(&s, 63, &at, &mut chains);
+        assert_eq!(
+            t.apply_block(&s, &env, &at, &[]),
+            Err(TransitionError::Attestation(0)),
+            "a body of exactly MAX_ATTESTATIONS_PER_BLOCK is not over the cap"
+        );
     }
 
     // ── the required test list ──────────────────────────────────────────────
