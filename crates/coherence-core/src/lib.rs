@@ -339,8 +339,20 @@ impl CommitmentTree {
 }
 
 /// Verify a Merkle path: fold `leaf` up with `path` and compare to `root`.
+///
+/// `index` MUST address a leaf of a depth-`TREE_DEPTH` tree, i.e. it must fit
+/// in `TREE_DEPTH` bits. The fold below consumes exactly one bit per level and
+/// would otherwise silently discard everything above bit `TREE_DEPTH`, so
+/// `index` and `index | (1 << TREE_DEPTH)` (and any other setting of the high
+/// bits) would authenticate against the SAME path and root. That is not a
+/// cosmetic laxity: a note's *position* is bound into its nullifier
+/// (`Note::nullifier`, over the full `u64`), so an unconstrained high half
+/// would let one note in the tree be spent under 2^(64-TREE_DEPTH) distinct
+/// nullifiers — unbounded double-spend of the shielded pool. Reject instead.
 pub fn verify_path(leaf: &[u8; 32], index: u64, path: &[[u8; 32]], root: &[u8; 32]) -> bool {
     if path.len() != TREE_DEPTH { return false; }
+    // The fold reads TREE_DEPTH bits; anything above them must be zero.
+    if index >> TREE_DEPTH != 0 { return false; }
     let mut cur = *leaf;
     let mut idx = index;
     for sib in path {
@@ -377,6 +389,11 @@ pub struct SpendWitness {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpendError {
     Membership(usize),
+    /// `inputs[i].position` does not fit in `TREE_DEPTH` bits, so it does not
+    /// name a leaf of the commitment tree. Kept distinct from `Membership` so
+    /// the rejection reason is unambiguous: the witness is malformed, not
+    /// merely non-member. See [`verify_path`] for why this must be rejected.
+    PositionOutOfRange(usize),
     Nullifier(usize),
     OutputCommitment(usize),
     /// public.nullifiers.len() != witness.inputs.len().
@@ -408,6 +425,13 @@ pub fn check_spend(public: &SpendPublic, w: &SpendWitness) -> Result<(), SpendEr
     }
     let mut in_sum: u128 = 0;
     for (i, inp) in w.inputs.iter().enumerate() {
+        // The position is bound into the nullifier over the full u64, but only
+        // its low TREE_DEPTH bits address a leaf. Reject the high half here
+        // (mirroring the same guard inside `verify_path`) so a spend can never
+        // pair one tree leaf with a second, distinct nullifier.
+        if inp.position >> TREE_DEPTH != 0 {
+            return Err(SpendError::PositionOutOfRange(i));
+        }
         let cm = inp.note.commitment();
         if !verify_path(&cm, inp.position, &inp.path, &public.anchor) {
             return Err(SpendError::Membership(i));
@@ -576,6 +600,81 @@ mod tests {
             check_spend(&extra_nf, &w),
             Err(SpendError::NullifierCountMismatch { public: 2, witness: 1 })
         );
+    }
+
+    /// C4 regression: the position must be constrained to TREE_DEPTH bits.
+    ///
+    /// `verify_path` folds exactly `TREE_DEPTH` levels, consuming one bit of
+    /// `index` per level, and used to drop everything above bit `TREE_DEPTH` on
+    /// the floor. `Note::nullifier`, however, hashes the FULL u64 position. So
+    /// `pos` and `pos | (1 << TREE_DEPTH)` authenticated against the identical
+    /// path and anchor while producing DIFFERENT nullifiers: one note in the
+    /// tree, 2^(64-TREE_DEPTH) spendable identities, i.e. unbounded
+    /// double-spend of the shielded pool.
+    ///
+    /// Both assertions below fail without the guard: the first returns `true`,
+    /// the second returns `Ok(())`.
+    #[test]
+    fn position_high_bits_are_rejected_by_path_and_spend() {
+        let mut t = CommitmentTree::new();
+        let inp = note(1000, 7);
+        let pos = t.append(inp.commitment());
+        let anchor = t.root();
+        let path = t.path(pos).unwrap();
+        let nk = [3u8; 32];
+
+        // Sanity: the honest position verifies.
+        assert!(verify_path(&inp.commitment(), pos, &path, &anchor));
+
+        // The aliased position hashes to a DIFFERENT nullifier — that is what
+        // makes the missing bound a double-spend rather than a curiosity.
+        let alias = pos | (1u64 << TREE_DEPTH);
+        assert_ne!(inp.nullifier(&nk, pos), inp.nullifier(&nk, alias));
+
+        // ... and it must NOT authenticate against the same path/anchor.
+        assert!(
+            !verify_path(&inp.commitment(), alias, &path, &anchor),
+            "position {alias} aliases leaf {pos}: high bits above TREE_DEPTH were ignored"
+        );
+
+        // A few more settings of the high half, including the top bit.
+        for extra in [1u64 << 32, 1u64 << 40, 1u64 << 63, u64::MAX << TREE_DEPTH] {
+            assert!(!verify_path(&inp.commitment(), pos | extra, &path, &anchor));
+        }
+
+        // check_spend mirrors the guard with its own distinct error: a spend
+        // that reuses the same leaf under the aliased position is rejected as
+        // malformed, not accepted as a second, independent note.
+        let out = note(900, 8);
+        let public = SpendPublic {
+            anchor,
+            nullifiers: vec![inp.nullifier(&nk, alias)],
+            out_commitments: vec![out.commitment()],
+            fee: 100,
+        };
+        let w = SpendWitness {
+            inputs: vec![SpendInput {
+                note: inp.clone(),
+                position: alias,
+                path: path.clone(),
+                nk,
+            }],
+            outputs: vec![out.clone()],
+        };
+        assert_eq!(check_spend(&public, &w), Err(SpendError::PositionOutOfRange(0)));
+
+        // The honest spend at the same leaf is unaffected.
+        let honest = SpendPublic {
+            anchor,
+            nullifiers: vec![inp.nullifier(&nk, pos)],
+            out_commitments: vec![out.commitment()],
+            fee: 100,
+        };
+        let hw = SpendWitness {
+            inputs: vec![SpendInput { note: inp, position: pos, path, nk }],
+            outputs: vec![out],
+        };
+        assert_eq!(check_spend(&honest, &hw), Ok(()));
     }
 }
 
