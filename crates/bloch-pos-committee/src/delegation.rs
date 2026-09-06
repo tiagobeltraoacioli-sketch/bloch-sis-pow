@@ -209,6 +209,50 @@ pub struct Registry {
     activated: Vec<((u64, u32, u32, u128), u128)>,
 }
 
+/// [`Registry::cap_sat`]'s fixed point over an arbitrary stake vector — the
+/// **own+delegated** form (finding C-R2-2), used by `duty_roster_at` once
+/// [`crate::params::FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH`] binds.
+///
+/// Same [`MAX_VALIDATOR_STAKE_BPS`] share, same monotone iteration, same
+/// [`CAP_FIXPOINT_ROUNDS`] bound, with one addition the registry's form
+/// does not need: a **floor at the equal share** (`total / n` over the
+/// non-zero entries). The registry caps *delegated* stake, which is
+/// sparse; this caps the whole roster, and a roster of `n < 10_000/bps`
+/// uniformly large positions would otherwise iterate the cap toward zero
+/// (each round multiplies it by `n·bps/10_000 < 1`) and zero out
+/// consensus weight entirely. A cap below the equal share is meaningless
+/// anyway — a validator at `total/n` dominates nobody — so the floor
+/// changes nothing about the concentrations the cap exists to clamp: a
+/// 90% whale among 64 validators still lands on `total/64`, not 90%.
+///
+/// Free function of the values alone: deterministic, integer-only,
+/// committed-state-derived — nothing node-local (rule 1).
+pub fn combined_cap_sat(stakes: &[u128]) -> u128 {
+    let n = stakes.iter().filter(|s| **s > 0).count() as u128;
+    if n == 0 {
+        return 0;
+    }
+    let total: u128 = stakes.iter().sum();
+    let mut cap = total * MAX_VALIDATOR_STAKE_BPS / 10_000;
+    let mut round = 0;
+    while round < CAP_FIXPOINT_ROUNDS {
+        let capped_total: u128 =
+            stakes.iter().map(|s| if *s > cap { cap } else { *s }).sum();
+        let next = capped_total * MAX_VALIDATOR_STAKE_BPS / 10_000;
+        if next == cap {
+            break;
+        }
+        cap = next;
+        round += 1;
+    }
+    let floor = total / n;
+    if cap < floor {
+        floor
+    } else {
+        cap
+    }
+}
+
 impl Registry {
     /// Resolve the registry at `epoch`.
     ///

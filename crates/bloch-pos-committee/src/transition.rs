@@ -1324,6 +1324,19 @@ pub struct CommittedState {
     /// `TAG_DELEGATOR_FEE_REWARD`; read by the wallet surface
     /// ([`Self::delegator_fee_reward_sat`]).
     delegator_fee_rewards: BTreeMap<u32, u128>,
+    /// Cumulative **fee** rewards settled to each operator, in satoshis —
+    /// the operator mirror of [`Self::delegator_fee_rewards`] (finding
+    /// C-R2-2, 2026-09-05). Once
+    /// [`crate::params::FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH`] binds, the
+    /// epoch boundary settles the producer's fee share (plus pro-rata dust)
+    /// HERE instead of compounding it into [`ValidatorRecord::staked_sat`]:
+    /// a withdrawable balance, not consensus weight, so a proposer can no
+    /// longer convert liquid coin into bonded supermajority via tips.
+    /// Committed under `TAG_VALIDATOR_FEE_REWARD` — zero leaves while empty,
+    /// and its only writer is behind the gate, so pre-gate roots are
+    /// unchanged. Read by the wallet surface
+    /// ([`Self::validator_fee_reward_sat`]).
+    validator_fee_rewards: BTreeMap<u32, u128>,
     /// The L1 fee market's price, in millisatoshi per gas, that **this**
     /// block's transactions were charged (spec §4.4). Committed, because the
     /// next block's price is derived from it and from the usage below by
@@ -1890,6 +1903,7 @@ impl CommittedState {
             slashing: slashing::SlashingState::new(),
             delegator_slash_losses: BTreeMap::new(),
             delegator_fee_rewards: BTreeMap::new(),
+            validator_fee_rewards: BTreeMap::new(),
             // Genesis opens at the price floor, with no usage behind it: the
             // first block's price is `next_base_fee(floor, {0, 0})`, which
             // clamps back to the floor. A market that opened above its floor
@@ -2124,6 +2138,34 @@ impl CommittedState {
         }
         // The cohort cap's closed form (`s/(1-s) · others`) lives in
         // genesis_cohort.rs; this call is the whole integration.
+        // THE C-R2-2 WEIGHT CAP. From the flag day on, the per-validator
+        // stake cap binds the COMBINED position — own bond plus activated
+        // delegated stake — not delegated stake alone: an operator's own
+        // bond above the cap carries no more weight than a delegation
+        // package of the same size would. Same `MAX_VALIDATOR_STAKE_BPS`
+        // fixed point the registry runs, floored at the equal share so a
+        // roster of uniformly large bonds cannot cap itself toward zero
+        // (see `combined_cap_sat`). Applied BEFORE the cohort cap, matching
+        // where the delegation cap already sat in this pipeline. Inert below
+        // the gate: the roster is byte-identical to the chain as it stands.
+        let roster = if Self::fee_stake_decouple_active(epoch) {
+            let stakes: Vec<u128> =
+                roster.iter().map(|v| v.effective_stake as u128).collect();
+            let cap = delegation::combined_cap_sat(&stakes);
+            roster
+                .into_iter()
+                .map(|v| Validator {
+                    index: v.index,
+                    effective_stake: if (v.effective_stake as u128) > cap {
+                        sat_u64(cap)
+                    } else {
+                        v.effective_stake
+                    },
+                })
+                .collect()
+        } else {
+            roster
+        };
         genesis_cohort::apply_cohort_cap(&roster, &self.genesis_cohort, epoch)
     }
 
@@ -2340,6 +2382,14 @@ impl CommittedState {
                 reward_sat: *reward_sat,
             })
             .collect();
+        let validator_fee_rewards: Vec<crate::state_root::ValidatorFeeRecord> = self
+            .validator_fee_rewards
+            .iter()
+            .map(|(validator, reward_sat)| crate::state_root::ValidatorFeeRecord {
+                validator: *validator,
+                reward_sat: *reward_sat,
+            })
+            .collect();
 
         // The eUTXO component comes in as the subtree the set already holds,
         // not as a cloned vector of entries to re-serialize, re-hash and
@@ -2372,6 +2422,7 @@ impl CommittedState {
                 tx_bytes: self.block_tx_bytes,
             },
             delegator_fee_rewards: &delegator_fee_rewards,
+            validator_fee_rewards: &validator_fee_rewards,
             taint_root: self.taint_root,
             coherence_accumulator_root: self.coherence_accumulator_root,
             coherence_nullifier_root: self.coherence_nullifier_root,
@@ -2454,6 +2505,22 @@ impl CommittedState {
         #[cfg(not(test))]
         let forced = false;
         forced || epoch >= crate::params::DEPOSIT_ACTIVATION_EPOCH
+    }
+
+    /// Is the **fee-to-stake decoupling** (finding C-R2-2) active in `epoch`?
+    ///
+    /// Reads only the epoch and a compile-time constant — committed-derived,
+    /// nothing node-local (rule 1). Inert on the live chain:
+    /// `FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH` is `u64::MAX` until the founder
+    /// names the flag day, so every reachable epoch takes the old
+    /// (compounding, uncapped) branches byte-for-byte. Tests of the new rules
+    /// opt in through the rehearsal guard.
+    fn fee_stake_decouple_active(epoch: u64) -> bool {
+        #[cfg(test)]
+        let forced = crate::params::rehearsal::fee_stake_gate_forced_open();
+        #[cfg(not(test))]
+        let forced = false;
+        forced || epoch >= crate::params::FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH
     }
 
     /// Is the AUTHENTICATED exit rule active in `epoch`?
@@ -3426,6 +3493,14 @@ impl CommittedState {
         self.delegator_fee_rewards.get(&delegator).copied().unwrap_or(0)
     }
 
+    /// Total fee reward settled to one operator, in satoshis — the
+    /// withdrawable balance the fee-to-stake decoupling credits instead of
+    /// the bond. Zero everywhere until
+    /// [`crate::params::FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH`] binds.
+    pub fn validator_fee_reward_sat(&self, validator: u32) -> u128 {
+        self.validator_fee_rewards.get(&validator).copied().unwrap_or(0)
+    }
+
     /// One unspent output, by outpoint — the lookup a wallet needs to build a
     /// spend, and the one a mempool needs to price it.
     ///
@@ -3602,7 +3677,8 @@ impl CommittedState {
             + self.validators.values().map(|r| r.staked_sat).sum::<u128>()
             + self.delegations.iter().map(|d| d.amount_sat).sum::<u128>()
             + self.pending_fee_rewards.values().sum::<u128>()
-            + self.delegator_fee_rewards.values().sum::<u128>();
+            + self.delegator_fee_rewards.values().sum::<u128>()
+            + self.validator_fee_rewards.values().sum::<u128>();
         let burned = self.delegator_slash_losses.values().sum::<u128>();
         held.saturating_sub(burned)
     }
@@ -3985,8 +4061,20 @@ impl CommittedState {
                     *st.delegator_fee_rewards.entry(delegator).or_insert(0) += reward;
                 }
             }
-            if let Some(rec) = st.validators.get_mut(&idx) {
-                rec.staked_sat += payout.operator + dust;
+            // THE C-R2-2 SEAM. Below the flag day the operator's share (plus
+            // the pro-rata dust) compounds into the bond — the chain as it
+            // stands, byte for byte. From the flag day on it settles into the
+            // committed `validator_fee_rewards` withdrawable ledger instead:
+            // the bond, and with it every committee weight, can then grow
+            // only through the deposit path, which checks the per-validator
+            // cap at admission. Fees buy income, never consensus weight.
+            let operator_credit = payout.operator + dust;
+            if Self::fee_stake_decouple_active(closing) {
+                if operator_credit > 0 {
+                    *st.validator_fee_rewards.entry(idx).or_insert(0) += operator_credit;
+                }
+            } else if let Some(rec) = st.validators.get_mut(&idx) {
+                rec.staked_sat += operator_credit;
             }
         }
 
@@ -4624,9 +4712,26 @@ impl<V: SignatureVerifier> Transition<V> {
         //     `close_epoch` — and the burned share is burned by never being
         //     credited to anyone.
         let split = rewards::split_fees_at(base_fees, priority_fees, header.slot);
-        if split.to_producer > 0 {
+        // Per-block ceiling on the producer's credit (C-R2-2), bound to the
+        // same flag day as the decoupling: a proposer stuffing its own block
+        // with self-paid tips accrues at most
+        // `MAX_BLOCK_FEE_TO_PRODUCER_SAT` per block, and the excess is
+        // burned by omission — never credited to anyone, the one-way door
+        // the base-fee burn already uses, safe under the one-sided
+        // conservation rule below. Inert below the gate: the credit is
+        // exactly `split.to_producer`, as it always was.
+        let producer_credit = if CommittedState::fee_stake_decouple_active(block_epoch) {
+            if split.to_producer > rewards::MAX_BLOCK_FEE_TO_PRODUCER_SAT {
+                rewards::MAX_BLOCK_FEE_TO_PRODUCER_SAT
+            } else {
+                split.to_producer
+            }
+        } else {
+            split.to_producer
+        };
+        if producer_credit > 0 {
             *st.pending_fee_rewards.entry(header.proposer_index).or_insert(0) +=
-                split.to_producer;
+                producer_credit;
         }
 
         // The fee-market leaf this block commits: the price it charged and the
@@ -7994,6 +8099,194 @@ mod tests {
         assert!(s2.pending_fee_rewards.is_empty());
     }
 
+    // -- FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH (C-R2-2) -----------------------
+
+    /// TRIPWIRE. `FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH` must stay `u64::MAX`
+    /// until the founder names the flag day: all three rules behind it
+    /// (per-block producer-credit cap, withdrawable boundary crediting, the
+    /// own+delegated stake cap) change committed state evolution or consensus
+    /// weight, and a mixed fleet would split on the first post-gate block.
+    /// The test just above this section is the behavioural half of the pin:
+    /// with the gate closed, the boundary still compounds the fee into the
+    /// bond, byte for byte.
+    #[test]
+    fn fee_stake_gate_is_inert() {
+        assert_eq!(
+            crate::params::FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH,
+            u64::MAX,
+            "arming the fee-to-stake decoupling is a founder flag-day decision, \
+             never a code change"
+        );
+    }
+
+    /// **The C-R2-2 fix, half one.** From the flag day on, the boundary
+    /// settles the producer's fee share into the committed withdrawable
+    /// ledger and the bond does not move: a proposer's tips buy income, not
+    /// consensus weight. Same fixture as the compounding test above — the
+    /// only difference is the gate — so the two tests together ARE the
+    /// old/new rule pair. This test fails on any tree where the boundary
+    /// still runs `rec.staked_sat += payout.operator + dust` unconditionally.
+    #[test]
+    fn decoupled_boundary_credits_fees_withdrawable_not_into_the_bond() {
+        let _gate = crate::params::rehearsal::fee_stake_gate_open_guard();
+        let owner = owner_key(0x31);
+        let coin = opening(0x71, 0, 100_000_000, &owner);
+        let (t, g, mut chains) = setup_funded(4, &[coin.clone()]);
+        let tx = transfer_spending(
+            std::slice::from_ref(&coin),
+            &owner,
+            script_of(&owner_key(0x32)),
+            512,
+            5,
+            g.next_base_fee(),
+        );
+        let b = build_block(&t, &g, 1, &[], std::slice::from_ref(&tx), &mut chains);
+        let s1 = t.apply_block(&g, &b, &[], std::slice::from_ref(&tx)).unwrap();
+        let p = b.header.proposer_index;
+
+        let charge = fee_market::charge(
+            fee_market::TxClass::Eutxo { inputs: 1 },
+            512,
+            g.next_base_fee(),
+            5,
+        );
+        let expected = rewards::split_fees_at(charge.base_fee_sat, charge.priority_fee_sat, 1);
+        assert!(expected.to_producer > 0, "control: a zero fee would prove nothing");
+
+        // Accrual is unchanged by the gate: in-epoch the fee sits in
+        // `pending_fee_rewards` exactly as before.
+        assert_eq!(*s1.pending_fee_rewards.get(&p).unwrap(), expected.to_producer);
+        assert_eq!(s1.validator_fee_reward_sat(p), 0, "nothing settles before the boundary");
+
+        // The boundary: nobody attested, so issuance is fully forfeited and
+        // the ONLY credit in play is the fee. The bond must not move; the
+        // whole producer share (no delegators in this fixture, so the split
+        // hands the operator everything and the dust is zero) lands in the
+        // withdrawable ledger.
+        let s2 = t.process_epoch(&s1).unwrap();
+        assert_eq!(
+            s2.validator_record(p).unwrap().staked_sat,
+            sat(200_000),
+            "a fee compounded into the bond: tips are buying consensus weight again (C-R2-2)"
+        );
+        assert_eq!(
+            s2.validator_fee_reward_sat(p),
+            expected.to_producer,
+            "the operator's share must settle into the withdrawable ledger, not vanish"
+        );
+        assert!(s2.pending_fee_rewards.is_empty());
+
+        // And the settled ledger is committed: two states differing only in
+        // it must commit different roots (the must_move entry pins the
+        // component; this pins the live write reaching it).
+        assert_ne!(s2.state_root(), s1.state_root());
+    }
+
+    /// **The C-R2-2 fix, half two: the per-block ceiling.** A proposer
+    /// stuffing its own block with self-paid tips accrues at most
+    /// `MAX_BLOCK_FEE_TO_PRODUCER_SAT` per block once the gate binds; the
+    /// excess is burned by omission. Below the gate the credit is the full
+    /// split — the control half, which is also what pins inertness. The two
+    /// halves run the same transaction against the same fixture; the block is
+    /// REBUILT under the gate because the producer's own root computation
+    /// moves with the rule (that the root moves is the point: the cap is
+    /// consensus, not accounting).
+    #[test]
+    fn decoupled_producer_fee_credit_is_capped_per_block() {
+        let owner = owner_key(0x41);
+        // 100,000 BLOCH in one coin, and a tip five orders of magnitude
+        // above the fixture default: the point is a fee total ABOVE the cap.
+        let coin = opening(0x72, 0, 10_000_000_000_000, &owner);
+        let tip: u128 = 100_000_000_000;
+
+        let make = |g: &CommittedState| {
+            transfer_spending(
+                std::slice::from_ref(&coin),
+                &owner,
+                script_of(&owner_key(0x42)),
+                512,
+                tip,
+                g.next_base_fee(),
+            )
+        };
+
+        // Control, gate closed: the credit is the full split, as it always was.
+        let (t, g, mut chains) = setup_funded(4, &[coin.clone()]);
+        let charge = fee_market::charge(
+            fee_market::TxClass::Eutxo { inputs: 1 },
+            512,
+            g.next_base_fee(),
+            tip,
+        );
+        let split = rewards::split_fees_at(charge.base_fee_sat, charge.priority_fee_sat, 1);
+        assert!(
+            split.to_producer > rewards::MAX_BLOCK_FEE_TO_PRODUCER_SAT,
+            "control: this block's fees must exceed the cap or the clamp is untested"
+        );
+        let tx = make(&g);
+        let b = build_block(&t, &g, 1, &[], std::slice::from_ref(&tx), &mut chains);
+        let s1 = t.apply_block(&g, &b, &[], std::slice::from_ref(&tx)).unwrap();
+        assert_eq!(
+            *s1.pending_fee_rewards.get(&b.header.proposer_index).unwrap(),
+            split.to_producer,
+            "below the gate the credit must stay byte-identical to the chain as it stands"
+        );
+
+        // Gate open: same transaction, freshly built block, credit clamped.
+        let _gate = crate::params::rehearsal::fee_stake_gate_open_guard();
+        let (t, g, mut chains) = setup_funded(4, &[coin.clone()]);
+        let tx = make(&g);
+        let b = build_block(&t, &g, 1, &[], std::slice::from_ref(&tx), &mut chains);
+        let s1 = t.apply_block(&g, &b, &[], std::slice::from_ref(&tx)).unwrap();
+        assert_eq!(
+            *s1.pending_fee_rewards.get(&b.header.proposer_index).unwrap(),
+            rewards::MAX_BLOCK_FEE_TO_PRODUCER_SAT,
+            "a self-tipping proposer accrued past the per-block ceiling (C-R2-2)"
+        );
+    }
+
+    /// **The C-R2-2 fix, half three: the stake cap binds own+delegated.**
+    /// Below the gate a validator's own bond is its weight, uncapped — the
+    /// registry's 1% fixed point caps *delegated* stake alone, so a whale
+    /// operator dominates every committee with its own coins. From the flag
+    /// day on `duty_roster_at` clamps the combined position to
+    /// `combined_cap_sat` (the same fixed point, floored at the equal share
+    /// so a uniform roster cannot cap itself toward zero). Fails on any tree
+    /// where `own` still reaches the roster unclamped.
+    #[test]
+    fn decoupled_roster_caps_own_plus_delegated_stake() {
+        let (_t, mut g, _chains) = setup(8);
+        g.validators.get_mut(&0).unwrap().staked_sat = sat(9_000_000);
+
+        // Below the gate: the whale's own bond IS its weight. This half is
+        // the inertness pin for the roster rule.
+        let raw = g.duty_roster_at(g.epoch);
+        let whale_raw = raw.iter().find(|v| v.index == 0).unwrap().effective_stake;
+        assert_eq!(whale_raw as u128, sat(9_000_000), "control: uncapped below the gate");
+
+        // Gate open: clamped to the combined cap, computed over the same
+        // stake vector the roster itself carries.
+        let _gate = crate::params::rehearsal::fee_stake_gate_open_guard();
+        let stakes: Vec<u128> = raw.iter().map(|v| v.effective_stake as u128).collect();
+        let cap = delegation::combined_cap_sat(&stakes);
+        assert!(
+            (cap as u128) < sat(9_000_000),
+            "control: the cap must bind the whale or the clamp is untested"
+        );
+        let capped = g.duty_roster_at(g.epoch);
+        let whale = capped.iter().find(|v| v.index == 0).unwrap();
+        assert_eq!(
+            whale.effective_stake as u128, cap,
+            "an over-cap own bond must be clamped to the combined per-validator cap (C-R2-2)"
+        );
+        // A normal validator sits under the equal-share floor and is untouched.
+        let peer = capped.iter().find(|v| v.index == 1).unwrap();
+        assert_eq!(peer.effective_stake as u128, sat(200_000));
+        // The cap zeroes nobody: every member keeps a positive weight, which
+        // is what the equal-share floor exists to guarantee.
+        assert!(capped.iter().all(|v| v.effective_stake > 0));
+    }
+
     /// **The fee market is wired, and a transaction cannot name its own fee.**
     ///
     /// Two transfers identical in everything the market prices (class, size,
@@ -9877,6 +10170,9 @@ mod tests {
         must_move!("block_tx_bytes", |g: &mut CommittedState| g.block_tx_bytes += 1);
         must_move!("delegator_fee_rewards", |g: &mut CommittedState| {
             g.delegator_fee_rewards.insert(4, 888);
+        });
+        must_move!("validator_fee_rewards", |g: &mut CommittedState| {
+            g.validator_fee_rewards.insert(4, 999);
         });
         // Carried roots.
         must_move!("taint_root", |g: &mut CommittedState| g.taint_root[0] ^= 1);

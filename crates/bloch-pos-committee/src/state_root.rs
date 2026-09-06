@@ -218,6 +218,16 @@ const TAG_BASE_FEE: u8 = 0x15;
 /// that disagreed on it would pay a different amount for the same exit.
 const TAG_DELEGATOR_FEE_REWARD: u8 = 0x16;
 
+/// Cumulative fee rewards credited to one **operator** (2026-09-05, finding
+/// C-R2-2) — the operator mirror of [`TAG_DELEGATOR_FEE_REWARD`]. Once
+/// `params::FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH` binds, the epoch boundary
+/// settles the producer's fee share (plus pro-rata dust) here instead of
+/// compounding it into `ValidatorRecord::staked_sat`, so fees buy withdrawable
+/// income rather than consensus weight. The only writer is behind that gate
+/// and the component contributes zero leaves while empty, which is what keeps
+/// every pre-gate root byte-identical to the chain as it stands.
+const TAG_VALIDATOR_FEE_REWARD: u8 = 0x17;
+
 
 fn sha3(parts: &[&[u8]]) -> [u8; 32] {
     let mut h = Sha3_256::new();
@@ -1585,6 +1595,28 @@ impl DelegatorFeeRecord {
     }
 }
 
+/// Cumulative fee rewards settled to one operator
+/// ([`TAG_VALIDATOR_FEE_REWARD`]) — see the tag's docs. Keyed by validator
+/// index; the index also keys registry and pending-fee leaves, and the
+/// component tag is what keeps the three apart (pinned by the aliasing test).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ValidatorFeeRecord {
+    pub validator: u32,
+    pub reward_sat: u128,
+}
+
+impl ValidatorFeeRecord {
+    fn entry_key(&self) -> Vec<u8> {
+        self.validator.to_le_bytes().to_vec()
+    }
+    fn serialize(&self) -> Vec<u8> {
+        let mut s = Vec::with_capacity(20);
+        s.extend_from_slice(&self.validator.to_le_bytes());
+        s.extend_from_slice(&self.reward_sat.to_le_bytes());
+        s
+    }
+}
+
 /// Everything `state_root` commits, passed **by argument** — this struct is
 /// the §5.5 rule made into a type. A block validator builds it from the
 /// parent block's committed state and from nothing else; there is no way to
@@ -1642,6 +1674,10 @@ pub struct ConsensusState<'a> {
     /// Cumulative fee rewards per delegator account
     /// ([`TAG_DELEGATOR_FEE_REWARD`]).
     pub delegator_fee_rewards: &'a [DelegatorFeeRecord],
+    /// Cumulative fee rewards per operator ([`TAG_VALIDATOR_FEE_REWARD`]).
+    /// Empty — zero leaves — until `FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH`
+    /// binds; its only writer is behind that gate.
+    pub validator_fee_rewards: &'a [ValidatorFeeRecord],
 }
 
 /// How many **closed** epoch boundaries the committed beacon history retains,
@@ -1840,6 +1876,12 @@ fn build_state_tree_inner(state: &ConsensusState<'_>, eutxo_tree: &Smt) -> Smt {
         smt.insert(
             derive_key(TAG_DELEGATOR_FEE_REWARD, &d.entry_key()),
             hash_value(&d.serialize()),
+        );
+    }
+    for v in state.validator_fee_rewards {
+        smt.insert(
+            derive_key(TAG_VALIDATOR_FEE_REWARD, &v.entry_key()),
+            hash_value(&v.serialize()),
         );
     }
     smt
@@ -2833,6 +2875,7 @@ mod tests {
         losses: Vec<DelegatorLossRecord>,
         base_fee: BaseFeeRecord,
         fee_rewards: Vec<DelegatorFeeRecord>,
+        operator_fee_rewards: Vec<ValidatorFeeRecord>,
     }
 
     fn fixture() -> Fx {
@@ -2961,6 +3004,14 @@ mod tests {
             DelegatorFeeRecord { delegator: 1, reward_sat: 55 },
             DelegatorFeeRecord { delegator: 900, reward_sat: 4_321 },
         ];
+        // Validator 1 deliberately collides with a registry key, an
+        // fc-message key, a pending-fee key AND delegator 1's ledgers: the
+        // component tag is what keeps the operator's settled earnings apart
+        // from all of them.
+        let operator_fee_rewards = vec![
+            ValidatorFeeRecord { validator: 1, reward_sat: 77 },
+            ValidatorFeeRecord { validator: 3, reward_sat: 9_876 },
+        ];
         Fx {
             eutxos,
             validators,
@@ -2980,6 +3031,7 @@ mod tests {
             losses,
             base_fee,
             fee_rewards,
+            operator_fee_rewards,
         }
     }
 
@@ -3168,6 +3220,7 @@ mod tests {
             delegator_slash_losses: &f.losses,
             base_fee: f.base_fee,
             delegator_fee_rewards: &f.fee_rewards,
+            validator_fee_rewards: &f.operator_fee_rewards,
         }
     }
 
@@ -3392,6 +3445,16 @@ mod tests {
         let without_loss = state_root(&state(&l));
         assert_ne!(without_loss, base);
         assert_ne!(without_reward, without_loss);
+
+        // Validator 1's settled operator earnings are a fifth leaf under the
+        // same natural key — distinct from the registry record, the pending
+        // fee and delegator 1's two ledgers.
+        let mut m = f.clone();
+        m.operator_fee_rewards.retain(|r| r.validator != 1);
+        let without_op_reward = state_root(&state(&m));
+        assert_ne!(without_op_reward, base);
+        assert_ne!(without_op_reward, without_reward);
+        assert_ne!(without_op_reward, without_loss);
     }
 
     #[test]
