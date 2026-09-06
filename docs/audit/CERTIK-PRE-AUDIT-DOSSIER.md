@@ -114,7 +114,7 @@ references are to this repository at `470b608`.
 | 12 | Whitelist | None at chain level — no allowlist gates participation in transfer, staking, delegation, or block production beyond the public parameter thresholds. (`MembershipList` in `bloch-euvm` is token-scoped and not consensus-wired.) | PASS | §1.3 grep table; `crates/bloch-euvm/src/state.rs:520` |
 | 13 | Hidden ownership | No hidden control mechanism (§1.3 grep). Governance is explicitly **not** ownerless — the earlier "ownerless" claim was formally retracted — and the structure is disclosed: two entities, founder allocates the genesis validator cohort under a consensus-coded taper. Honest limit: beneficial ownership of the 14 non-founder carryover addresses is asserted, not provable on-chain — the tokenomics doc treats the whole non-founder remainder as "independent parties" without attribution. | PASS (disclosed, not hidden) — with the attribution caveat | `docs/adr/ADR-036-*`; `docs/specs/BLOCH-ENTITY-STRUCTURE.md`; `crates/bloch-pos-committee/src/genesis_cohort.rs:29-48` |
 | 14 | Proxy contract (upgradeable logic) | No proxy slot exists. Role played by: node releases — operators choose what to run, and the release-integrity discipline (reproducible builds, published == fleet binary) is the substitute control. That discipline is specified (gate G8, `REPRO.md`) but **G8 is unmeasured** (§4). | N/A — substitute specified, not yet measured | `REPRO.md`; `repro-manifest.sh`; `docs/specs/BLOCH-POS-SHA3-LATTICE-MIGRATION.md` §11 (G8) |
-| 15 | Balance modification (privileged) | No privileged balance write exists. Slashing is the only involuntary balance reduction, and it requires structurally valid evidence validated inside the state transition — invalid evidence rejects the whole block; forged evidence slashes nobody (regression-tested). **CORRECTED 2026-09-01, and it strengthens this row rather than weakening it: no evidence can reach that transition at all.** `PosTransaction::from_canonical_bytes` refuses wire tag `0x05` unconditionally on every ingress path (block body, gossip, `sendrawtransaction`), nothing constructs the transaction outside tests, and no activation constant exists. So there is *no* involuntary balance reduction on the live chain today. The auditor should read this as: the control is sound and inert, and the finality guarantee elsewhere in this dossier and in the node's RPC docs must not be described as slashing-backed (see F-4 below, reopened). | PASS (and inert) | `crates/bloch-pos-committee/src/transition.rs:1177`, `:1186-1188`, `:1482-1489`; `src/transition.rs` tests at `:2198`, `:2372` |
+| 15 | Balance modification (privileged) | No privileged balance write exists. Slashing is the only involuntary balance reduction, and it requires structurally valid evidence validated inside the state transition — invalid evidence rejects the whole block; forged evidence slashes nobody (regression-tested). **CORRECTED 2026-09-01, and it strengthens this row rather than weakening it: no evidence can reach that transition at all.** (Mechanism updated 2026-09-05: wire tag `0x05` now decodes — the envelopes travel whole — and the transition refuses any block carrying evidence below `SLASHING_EVIDENCE_ACTIVATION_EPOCH`, defined and unarmed at `u64::MAX`; nothing constructs the transaction outside tests. The row's verdict is unchanged.) So there is *no* involuntary balance reduction on the live chain today. The auditor should read this as: the control is sound and inert, and the finality guarantee elsewhere in this dossier and in the node's RPC docs must not be described as slashing-backed (see F-4 below, reopened). | PASS (and inert) | `crates/bloch-pos-committee/src/transition.rs:1177`, `:1186-1188`, `:1482-1489`; `src/transition.rs` tests at `:2198`, `:2372` |
 | 16 | Tax modification by privileged roles | The fee split constants have no setter and no role that can change them; the base fee moves only by the in-protocol controller as a function of block usage. Change requires a hard fork. | PASS (via substitute) | `crates/bloch-pos-committee/src/rewards.rs:38`, `:42`, `:65-75`; `src/fee_market.rs:193` |
 | 17 | Transfer cooldown | None on transfers. The delays that exist are stake-scoped, constant, disclosed, and apply equally to everyone — including the founder (`ACTIVATION_DELAY_EPOCHS`, `EXIT_DELAY_EPOCHS`, `WITHDRAWAL_DELAY_EPOCHS`, delegation `COOLDOWN_EPOCHS`). | PASS | `crates/bloch-pos-committee/src/staking.rs:89`, `:99`, `:106`; `src/delegation.rs:110` |
 | 18 | Transfer pausability | No pause authority. The only halt-shaped code is (a) the node-local `HaltForOperator` on a checkpoint conflict, which by test **cannot** override a node's own finality, and (b) the disclosed one-time terminal height (check 8). | PASS — with the terminal-height disclosure | `crates/bloch-pos-committee/src/ws.rs:602-623`, test `:1112` (`published_checkpoint_never_overrides_own_finality`) |
@@ -339,28 +339,29 @@ or reach a different verdict. Fixed in `319c7e6`: three new leaves (tags
 and `ejected_set_is_exactly_the_slashed_registry` (`:2815`).
 
 **What is still open, and why this finding is reopened.** Both fixes above are
-real and both are *downstream of a transaction that cannot arrive*. The wire
-half of "nothing called it" was never closed:
-`PosTransaction::from_canonical_bytes` returns
-`TxDecodeError::EvidenceNotDecodable` for tag `0x05` unconditionally, with no
-gate (`src/transition.rs:782`) — the encoder folds the two nested messages in
-as the signing roots they were signed over, so the envelopes are unrecoverable
-by construction, and the codec documents this as deliberate (`:713-729`). That
-decoder is the only one on every ingress path
-(`bloch-pos-node/src/engine.rs:226`, `p2p.rs:1269`, `net.rs:293`,
-`rpc.rs:911`), so a block carrying evidence is rejected by every peer and a
-proposer that included it would produce an unimportable block. Nothing
-constructs the transaction outside `#[cfg(test)]`; the node logs `EQUIVOCATION
-captured … (slashing pipeline NOT wired — evidence is logged, not prosecuted)`
-(`engine.rs:2241`); and `SLASHING_EVIDENCE_ACTIVATION_EPOCH` is not defined on
-the release lineage — not on tag `g4-node-20260901`, not on fleet commit
-`46133196`, and not on `main`. **It is defined elsewhere in the repository**:
-`d21c3370` ("wip: caminho de submissao de evidencia de slashing"), a direct
-child of the fleet commit and a sibling of the tag, declares it at
-`params.rs:638` as `u64::MAX`, and that commit is reachable from six local
-branches and is pushed to a public remote. So the correct statement of break 4
-is narrower than "absent": on the binary the fleet runs there is no constant to
-arm, and the work that would introduce one exists, unarmed, off-lineage. An
+real and both were, when this finding was reopened, *downstream of a
+transaction that could not arrive*. The wire half of "nothing called it" was
+closed on 2026-09-05 (Round-2 finding F-02): the tag-`0x05` encoder used to
+fold the two nested messages in as the signing roots they were signed over, so
+`PosTransaction::from_canonical_bytes` refused the tag unconditionally and the
+envelopes were unrecoverable by construction. The codec now carries both
+envelopes whole and decodes them, and the refusal moved from the decoder into
+the state transition: `SLASHING_EVIDENCE_ACTIVATION_EPOCH`, defined in
+`bloch-pos-committee/src/params.rs` at exactly `u64::MAX`, makes any block
+carrying evidence consensus-invalid (`TxReject::EvidenceNotActive`) at every
+reachable epoch. (An earlier revision of this paragraph reported the constant
+as defined only off-lineage, on `d21c3370`; the 2026-09-05 change introduced
+it on this lineage, unarmed, together with the decodable format.) That decoder
+is still the only one on every ingress path — block body, gossip,
+`sendrawtransaction` — so every path reaches the same gate, and the released
+fleet binaries, which predate the format, still refuse the tag at decode.
+Nothing constructs the transaction outside `#[cfg(test)]`; the node logs
+`EQUIVOCATION captured … (slashing pipeline NOT wired — evidence is logged,
+not prosecuted)`. So the correct statement of break 4 today: a flag day
+exists, unarmed and unscheduled, and arming it is a founder decision whose
+hard precondition is a full fleet rollout of the evidence decoder. Until that
+day no stake can be slashed on the live chain, and this finding stays
+reopened. An
 earlier draft of this dossier said the constant "does not exist in this
 repository" and that it was "absent, not set to `u64::MAX`" — both halves were
 wrong, and wrong in the specific direction of being more reassuring than the

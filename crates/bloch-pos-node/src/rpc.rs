@@ -1538,31 +1538,38 @@ pub fn chain_info_json(
 /// Genesis-4 can be slashed at all**, for four independent reasons, any one of
 /// which is sufficient on its own:
 ///
-/// 1. **Evidence cannot be decoded.**
-///    `PosTransaction::from_canonical_bytes` returns
+/// 1. **Evidence could not be decoded — CORRECTED 2026-09-05: it decodes,
+///    and the block is still refused.** As first stated,
+///    `PosTransaction::from_canonical_bytes` returned
 ///    `TxDecodeError::EvidenceNotDecodable` for wire tag `0x05`
-///    unconditionally, with no gate (`transition.rs:782`; the codec documents
-///    the reason at `:713-729`). The encoder folds the nested messages in as
-///    the signing roots they were signed over — hashes — so the envelopes are
-///    unrecoverable by construction, not by omission.
-/// 2. **That decoder is the only one on every ingress path**: block body
-///    (`engine.rs:226`), gossip (`p2p.rs:1269`, `net.rs:293`) and
-///    `sendrawtransaction` (this file, `:911`). A block carrying evidence is
-///    therefore rejected by every peer, and a proposer that included it would
-///    produce an unimportable block.
+///    unconditionally, with no gate: the encoder folded the nested messages
+///    in as the signing roots they were signed over — hashes — so the
+///    envelopes were unrecoverable by construction (Round-2 finding F-02).
+///    The codec now carries both envelopes whole and decodes them, and what
+///    refuses the transaction moved from the decoder to the transition:
+///    every epoch below `SLASHING_EVIDENCE_ACTIVATION_EPOCH` answers
+///    `TxReject::EvidenceNotActive`. Break 1 is closed as a wire format;
+///    break 4 (the unarmed flag day) is now the load-bearing one.
+/// 2. **That decoder is the only one on every ingress path**: block body,
+///    gossip and `sendrawtransaction`. Before 2026-09-05 that meant a block
+///    carrying evidence was rejected by every peer at decode; it now means
+///    every ingress path reaches the same transition gate, and the released
+///    fleet binaries — which predate the format — still refuse at decode.
+///    Either way a proposer that included evidence today would produce a
+///    block its peers refuse.
 /// 3. **Nothing constructs the transaction outside tests.** The node captures
 ///    an equivocating pair and prints it; the log line itself reads "slashing
-///    pipeline NOT wired — evidence is logged, not prosecuted"
-///    (`engine.rs:2241`).
-/// 4. **There is no activation constant to arm on the release lineage.**
-///    `SLASHING_EVIDENCE_ACTIVATION_EPOCH` is not defined on tag
-///    `g4-node-20260901`, on fleet commit `46133196`, or on `main`. It IS
-///    defined off-lineage — `d21c3370:params.rs:638`, `u64::MAX`, unarmed — on
-///    a direct child of the fleet commit that is pushed to a public remote.
-///    An earlier draft said it "does not exist in this repository" and was
-///    "absent, not set to `u64::MAX`". Both halves were false: the constant
-///    exists and its value is exactly `u64::MAX`. The claim was measured on the
-///    release lineage and stated about the repository.
+///    pipeline NOT wired — evidence is logged, not prosecuted".
+/// 4. **The activation constant exists on this lineage and is not armed.**
+///    An earlier draft of this break said no such constant existed on the
+///    release lineage, while one sat off-lineage at `d21c3370:params.rs:638`.
+///    Since 2026-09-05 `SLASHING_EVIDENCE_ACTIVATION_EPOCH` is defined in
+///    `bloch-pos-committee::params`, value exactly `u64::MAX`: no epoch any
+///    chain reaches activates it, so there is no flag day SCHEDULED — but
+///    there is now, for the first time on this lineage, a flag day to
+///    schedule. Arming it is a founder decision with a hard precondition
+///    (full fleet rollout of the evidence decoder), and until that day this
+///    break keeps the retraction below in force on its own.
 ///
 /// Read from the live chain on 2026-09-02 at height 34,665, epoch 1736, from
 /// two keyless archival observers whose responses were byte-for-byte
@@ -1586,8 +1593,8 @@ pub fn chain_info_json(
 /// `"slashed": false`, and the registry an exchange can query will agree with
 /// the retraction while disagreeing with the forensics. A figure the reader
 /// cannot verify does not belong in a document they are meant to act on.
-/// Nothing above depends on it. `slashing.rs` is complete; nothing can reach
-/// it.
+/// Nothing above depends on it. `slashing.rs` is complete; nothing reaches it
+/// below the unarmed flag day.
 ///
 /// So Genesis-4 finality today is **economic by intent and cryptographic by
 /// nothing**. Reverting a finalised checkpoint costs an attacker no bonded

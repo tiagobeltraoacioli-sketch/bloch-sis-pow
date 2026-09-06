@@ -201,22 +201,29 @@ not estimate it from a confirmation count.
 >    exactly that. **On Genesis-4 today no stake can be slashed at all**, for four
 >    independent reasons, any one of them sufficient:
 >
->    - Slashing evidence rides on wire tag `0x05`, and
->      `PosTransaction::from_canonical_bytes` refuses that tag unconditionally
->      (`crates/bloch-pos-committee/src/transition.rs:782`). The encoder folds the two
->      nested messages in as the *signing roots* they were signed over — hashes — so the
->      envelopes cannot be recovered. This is by construction, not by omission, and the
->      codec documents it as such (`:713-729`).
+>    - Slashing evidence rides on wire tag `0x05`. As first stated (2026-09-01),
+>      `PosTransaction::from_canonical_bytes` refused that tag unconditionally — the
+>      encoder folded the two nested messages in as the *signing roots* they were signed
+>      over, hashes, so the envelopes could not be recovered. **Corrected 2026-09-05:**
+>      the codec now carries both envelopes whole and the tag decodes; what refuses the
+>      transaction moved into the state transition, which rejects any block carrying
+>      evidence below the unarmed flag day (next bullet). The verdict you integrate
+>      against is unchanged.
 >    - That decoder is the only one on **every** ingress path — block body, gossip, and
->      `sendrawtransaction`. A block carrying evidence is rejected by every peer; a
->      proposer that included it would produce a block no one can import.
+>      `sendrawtransaction` — so every path reaches the same refusal; and the released
+>      fleet binaries, which predate the 2026-09-05 format, still refuse the tag at
+>      decode. A proposer that included evidence today would produce a block its peers
+>      reject either way.
 >    - Nothing constructs the transaction outside tests. The node detects an equivocating
 >      pair and logs it, with a line that says the pipeline is not wired.
->    - There is no activation constant to arm **in the binary you are integrating
->      against**. `SLASHING_EVIDENCE_ACTIVATION_EPOCH` is not defined on the release
->      lineage. It is defined off-lineage, unarmed at `u64::MAX`, on preserved work
->      that no released binary contains. Treat break 4 as "no flag day exists on the
->      release", not as "no such constant has ever been written".
+>    - The activation constant is defined and **not armed** in the binary you are
+>      integrating against. Since 2026-09-05, `SLASHING_EVIDENCE_ACTIVATION_EPOCH` is
+>      defined in the release lineage's `params.rs` at exactly `u64::MAX`: no epoch any
+>      chain reaches activates it, so no flag day is scheduled. (An earlier revision said
+>      the constant was not defined on the release lineage at all — true when written,
+>      superseded by the same change that made the tag decodable.) Arming it is a founder
+>      decision with a fleet-rollout precondition; until then this bullet alone keeps the
+>      retraction above in force.
 >
 >    Read on 2026-09-02 at height 34,665, epoch 1736, from two keyless archival
 >    observers returning byte-for-byte identical responses: 64 validators, 64 active,
@@ -224,7 +231,7 @@ not estimate it from a confirmation count.
 >    `active`. Equivocation on this fleet is **detected** and **never prosecuted**. So
 >    reverting a finalised checkpoint costs an attacker no bonded stake — only the
 >    coordination of the validators who would have to do it. `slashing.rs` is complete;
->    nothing can reach it.
+>    nothing reaches it below the unarmed flag day.
 >
 >    Read `slashed: false` correctly: on this network it is the **expected** reading,
 >    not a clean bill of health. No RPC method exposes equivocation evidence, so the

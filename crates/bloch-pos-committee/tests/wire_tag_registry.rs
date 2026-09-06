@@ -171,13 +171,23 @@ const NO_RIVALS: &[Claim] = &[];
 /// them, the decoder refuses them.
 ///
 /// This list exists to close a blind spot that was live in the first draft of
-/// this file. `0x05`'s registered name is `SlashingEvidence` — the name the
-/// ENCODER gives the variant. Six tips make `0x05` *decode* to a
-/// `PosTransaction::SlashingEvidence`, and the decoded variant name would then
-/// EQUAL the registered name, so the released-tag check would pass on exactly
-/// the re-pointing it exists to catch. Naming the one-way tags explicitly makes
-/// the refusal itself the pinned property.
-const ONE_WAY_TX_TAGS: &[u8] = &[0x05];
+/// this file: for a tag whose decoded variant name EQUALS its registered
+/// (encoder-side) name, the released-tag check passes on exactly the
+/// re-pointing it exists to catch, so a one-way tag has to pin the refusal
+/// itself as the property.
+///
+/// EMPTY since 2026-09-05, and the emptiness is a record, not a cleanup:
+/// `0x05` (`SlashingEvidence`) sat here from this file's first draft — its
+/// encoder folded the nested messages in as signing roots, which do not
+/// invert, so the decoder refused it unconditionally and §7.3 was enforced
+/// nowhere (Round-2 finding F-02, Critical). The founder-directed fix made
+/// the tag decodable: the encoder now carries both envelopes whole, the
+/// registered sub-namespace below (`EVIDENCE_SUBTAGS`) is live, and the
+/// transition refuses the transaction below the INERT
+/// `SLASHING_EVIDENCE_ACTIVATION_EPOCH` — so on the wire, nothing changes
+/// until that flag day. `evidence_tag_decodes_to_its_released_meaning` pins
+/// the adopted behaviour the way `evidence_tag_stays_one_way` pinned the old.
+const ONE_WAY_TX_TAGS: &[u8] = &[];
 
 // ---------------------------------------------------------------------------
 // §1 — PosTransaction wire tags. First byte of `canonical_bytes`.
@@ -187,16 +197,21 @@ const TX_TAGS: &[(u8, Status)] = &[
     (0x02, Status::Released { name: "Deposit", rivals: NO_RIVALS }),
     (0x03, Status::Released { name: "Exit", rivals: NO_RIVALS }),
     (0x04, Status::Released { name: "Delegate", rivals: NO_RIVALS }),
-    // Released and ONE-WAY: the decoder returns `EvidenceNotDecodable`
-    // unconditionally (see ONE_WAY_TX_TAGS). `SlashingEvidence` is the
-    // encoder-side name. Six tips make it decodable — that is a released-space
-    // re-pointing, listed as a rival, not as a separate byte.
+    // Released; DECODABLE since 2026-09-05 (F-02). The byte and its name are
+    // unchanged — what changed is the payload layout (whole envelopes, no
+    // longer un-invertible signing roots) and the decoder answering. Safe for
+    // history because no finalised block can carry this tag: every node's
+    // decoder refused it, so no such block was ever accepted. The rival row
+    // records the six PRE-ADOPTION decodable tips: their layout was NEVER
+    // verified byte-compatible with the adopted one, so a merge from any of
+    // them into the codec is still a collision, not a fast-forward.
     (
         0x05,
         Status::Released {
             name: "SlashingEvidence",
             rivals: &[Claim {
-                name: "SlashingEvidence (DECODABLE — released tree refuses it)",
+                name: "SlashingEvidence (pre-adoption decodable layout, UNVERIFIED \
+                       against the adopted envelope format)",
                 tips: 6,
                 heads: 6,
                 example: "refs/heads/pmo/wire-namespace-registry",
@@ -677,25 +692,62 @@ fn released_tags_with_live_rivals_still_hold_the_released_meaning() {
     }
 }
 
-/// Tag `0x05` is the special case: a recognised tag that never produces a
-/// transaction. Pinned separately so a merge cannot quietly turn the
-/// one-way evidence tag into a decodable format.
+/// Tag `0x05` was the special case — a recognised tag that never produced a
+/// transaction — until 2026-09-05, when the decodable format was adopted to
+/// close F-02 (see `ONE_WAY_TX_TAGS`). This is that pin's successor, guarding
+/// the same byte from the other side:
+///
+/// * the tag decodes, and decodes to its RELEASED name — a merge from one of
+///   the six pre-adoption decodable tips that changed the payload layout
+///   would break the round-trip below, because their layouts were never
+///   verified against the adopted one;
+/// * garbage under the tag still refuses: an unregistered offence family is
+///   `NotCanonical`, a bare tag is `Truncated` — never a decoded transaction,
+///   and never a decoder that skips what it does not know.
+///
+/// Constructing the sample here pins the byte, not the arithmetic: the codec
+/// round-trip tests in `transition.rs` (`evidence_round_trips_both_families`)
+/// own field order and widths.
 #[test]
-fn evidence_tag_stays_one_way() {
-    for pad in [0usize, 1, 4, 8, 32] {
-        let mut bytes = vec![0x05u8];
-        bytes.extend(std::iter::repeat(0u8).take(pad));
-        assert_eq!(
-            PosTransaction::from_canonical_bytes(&bytes),
-            Err(TxDecodeError::EvidenceNotDecodable),
-            "\n\n  Wire tag 0x05 must be one-way (EvidenceNotDecodable) for every\n  \
-             payload. Six tips already decode it (see the 0x05 rival in TX_TAGS);\n  \
-             a tree that does has adopted the nested sub-namespace inside 0x05,\n  \
-             whose two sub-discriminants are bare literals bound to no constant\n  \
-             and therefore invisible to any `const NAME: u8` sweep. Register it\n  \
-             (EVIDENCE_SUBTAGS) before merging.\n"
-        );
-    }
+fn evidence_tag_decodes_to_its_released_meaning() {
+    let attest = |head: u8, sig: u8| bloch_pos_committee::Attestation {
+        data: bloch_pos_committee::AttestationData {
+            slot: 32,
+            head: [head; 32],
+            source_epoch: 0,
+            source_root: [1; 32],
+            target_epoch: 1,
+            target_root: [head; 32],
+        },
+        validator: 2,
+        signature: vec![sig; 8],
+    };
+    let tx = PosTransaction::SlashingEvidence(
+        bloch_pos_committee::interfaces::SlashingEvidence::AttestationOffence {
+            first: attest(0xAA, 0x11),
+            second: attest(0xBB, 0x22),
+        },
+    );
+    let bytes = tx.canonical_bytes();
+    assert_eq!(bytes[0], 0x05, "the released byte for SlashingEvidence moved");
+    let back = PosTransaction::from_canonical_bytes(&bytes).expect(
+        "\n\n  Wire tag 0x05 stopped decoding. Since 2026-09-05 (F-02) the released\n  \
+         meaning of this byte INCLUDES decodability — a one-way 0x05 makes §7.3\n  \
+         structurally unreachable again (equivocation with no economic cost).\n",
+    );
+    assert_eq!(back, tx, "0x05 must decode to exactly what was encoded");
+
+    // The refusals that survive the adoption.
+    assert_eq!(
+        PosTransaction::from_canonical_bytes(&[0x05, 0x03]),
+        Err(TxDecodeError::NotCanonical(0x03)),
+        "an offence family outside EVIDENCE_SUBTAGS must refuse, never skip",
+    );
+    assert_eq!(
+        PosTransaction::from_canonical_bytes(&[0x05]),
+        Err(TxDecodeError::Truncated),
+        "a bare evidence tag is not a transaction",
+    );
 }
 
 /// **The merge-time assertion.** Every contested byte must be REFUSED by this
@@ -741,8 +793,9 @@ fn contested_transaction_tags_are_refused() {
 ///
 /// `SlashingEvidence` is absent: constructing one needs signed proposal
 /// envelopes, and a hand-rolled fake would pin this test to the envelope
-/// layout rather than to the tag. It is covered by `evidence_tag_stays_one_way`
-/// and by the `0x05` arm of the match above.
+/// layout rather than to the tag. It is covered by
+/// `evidence_tag_decodes_to_its_released_meaning` and by the `0x05` arm of
+/// the match above.
 #[test]
 fn the_exhaustive_match_agrees_with_the_table() {
     let samples: Vec<PosTransaction> = vec![

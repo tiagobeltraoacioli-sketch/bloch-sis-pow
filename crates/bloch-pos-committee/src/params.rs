@@ -686,6 +686,41 @@ pub mod rehearsal {
         Restore(prev)
     }
 
+    thread_local! {
+        static SLASHING_GATE_OPEN_TL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Test-only: treat [`super::SLASHING_EVIDENCE_ACTIVATION_EPOCH`] as
+    /// already bound.
+    ///
+    /// Its own switch for the same reason `EXIT_AUTH_GATE_OPEN` is: this
+    /// gate's inert value selects a REFUSAL of the evidence transaction, so
+    /// folding it into `GATES_OPEN` would silently start slashing inside every
+    /// test that only wanted a post-ancestry-seed roster.
+    ///
+    /// Default CLOSED, deliberately: an unadorned `cargo test` exercises the
+    /// configuration the fleet actually runs today, in which a block carrying
+    /// tag `0x05` is refused at the transition at every reachable epoch.
+    /// Tests of the post-flag-day rules — evidence slashes, forged evidence
+    /// rejects the block — opt in with the guard below.
+    pub fn slashing_gate_forced_open() -> bool {
+        SLASHING_GATE_OPEN_TL.with(|c| c.get())
+    }
+
+    /// Opens the slashing-evidence gate for this thread until the guard
+    /// drops, including on unwind, so a failing assertion cannot leave the
+    /// slashing rules mutated for the rest of the thread.
+    pub fn slashing_gate_open_guard() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                SLASHING_GATE_OPEN_TL.with(|c| c.set(self.0));
+            }
+        }
+        let prev = SLASHING_GATE_OPEN_TL.with(|c| c.replace(true));
+        Restore(prev)
+    }
+
     /// Test-only: treat [`super::ANCESTRY_SEED_ACTIVATION_EPOCH`] and
     /// [`super::LEAK_RECOVERY_ACTIVATION_EPOCH`] as if they had already bound.
     ///
@@ -1062,6 +1097,53 @@ pub const EXIT_AUTH_ACTIVATION_EPOCH: u64 = u64::MAX;
 ///
 /// `fee_stake_gate_is_inert` pins the value.
 pub const FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Flag day for the **slashing-evidence transaction** (§7.3), wire tag `0x05`.
+/// `u64::MAX` = INERT: no epoch reaches it, so on every node running this
+/// crate today a block that carries tag `0x05` is refused by the transition
+/// (`TxReject::EvidenceNotActive`) at every reachable epoch — exactly the
+/// verdict an older binary reaches at its decoder, so a mixed fleet agrees on
+/// every block until the day.
+///
+/// # The hole it exists to close (F-02, Round 2)
+///
+/// §7.3's slashing rules (`slashing.rs`) and the transition's
+/// `apply_slashing_evidence` were complete and mutation-tested, and
+/// unreachable: the tag-`0x05` encoder used to fold the two conflicting
+/// messages in as the *signing roots* they were signed over — hashes, which
+/// do not invert — so the decoder answered `EvidenceNotDecodable`
+/// unconditionally and no ingress path (block body, gossip, RPC) could carry
+/// a proof of equivocation to a verifier. Equivocation therefore had no
+/// economic cost, and the Casper security argument did not hold on the live
+/// chain. The wire format now carries both envelopes whole (the header or
+/// attestation plus its signature, re-verified by every node), so evidence
+/// decodes — and THIS constant is what keeps the change inert until the
+/// founder schedules it.
+///
+/// # What the gate switches at one epoch
+///
+/// - **below** (every epoch today): a block carrying a `SlashingEvidence`
+///   transaction is consensus-INVALID (`EvidenceNotActive`), and the node's
+///   mempool refuses to admit or relay one (`admissible`);
+/// - **at and above**: the evidence transaction becomes valid where the pair
+///   proves an offence, and `apply_slashing_evidence` burns the offender's
+///   stake, ejects it from the roster and pays the whistleblower's 1/32 —
+///   the rules that have been in the tree, tested, since Genesis-4 launch.
+///
+/// The gate reads the block's own epoch as rolled by `compute_post_state`'s
+/// boundary walk — committed state, never a clock. The 2026-08-08
+/// `expected_bits` fork is the standing reason.
+///
+/// # ARMING THIS IS A FOUNDER DECISION, AND IT HAS A PRECONDITION
+///
+/// The whole fleet must already run a binary whose decoder understands the
+/// evidence wire format: below the gate old and new binaries agree (both
+/// refuse the block, one at decode and one at the transition), but the first
+/// post-gate block that carries evidence is accepted only by nodes that can
+/// decode it. Same rollout discipline as `LEAKED_ROSTER_ACTIVATION_EPOCH`.
+///
+/// `slashing_evidence_gate_is_inert` pins the value.
+pub const SLASHING_EVIDENCE_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.
