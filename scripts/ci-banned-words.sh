@@ -59,14 +59,27 @@ fi
 # All are currently absent from the tree; this gate keeps them out.
 EARNED_RE='fully attested|externally audited|has been audited|security[ -]audited|fully reproducible|independently reproduced|proven[ -]secure|production[ -]ready and secure'
 
-# Negation post-filter: skip lines that are honest DISCLAIMERS (the banned phrase
-# appears in a negated context). Trademark above gets no such exemption.
+# Negation post-filter: skip a HIT that is an honest DISCLAIMER (the banned
+# phrase appears in a negated context). Trademark above gets no such exemption.
+#
+# WINDOWED, not whole-line (finding LOW-7, Round 1): the negation word must
+# appear in the ~40 characters IMMEDIATELY BEFORE the matched phrase, not
+# merely somewhere on the same line. The original whole-line filter dropped
+# "Bloch is fully attested; no other chain is." outright — "no" is real, but
+# it negates "other chain", not "fully attested", so the line still reads as
+# an affirmative unearned claim and must NOT pass. Delegated to a separate
+# python3 script (scripts/ci-banned-words-negation-filter.py, not inlined
+# here as a heredoc): bash/grep have no clean way to test "N chars before
+# THIS match" without capturing match offsets, and a heredoc on the same
+# command as a stdin PIPE silently discards the piped data (the heredoc wins
+# the stdin assignment) — the exact bug an earlier draft of this fix had.
 NEGATION_RE='\b(not|no|never|without|nothing|isn.?t|aren.?t|cannot|can.?t)\b'
+NEGATION_WINDOW=40
+NEGATION_FILTER="$(dirname "${BASH_SOURCE[0]}")/ci-banned-words-negation-filter.py"
 
-ew_hits="$(git grep -iInE -- "$EARNED_RE" -- . ':!scripts/ci-banned-words.sh' || true)"
+ew_hits="$(git grep -iInE -- "$EARNED_RE" -- . ':!scripts/ci-banned-words.sh' ':!scripts/ci-banned-words-negation-filter.py' || true)"
 if [ -n "$ew_hits" ]; then
-  # Drop disclaimer lines; keep only affirmative unearned claims.
-  ew_hits="$(printf '%s\n' "$ew_hits" | grep -viE "$NEGATION_RE" || true)"
+  ew_hits="$(printf '%s\n' "$ew_hits" | python3 "$NEGATION_FILTER" "$EARNED_RE" "$NEGATION_RE" "$NEGATION_WINDOW")"
 fi
 if [ -n "$ew_hits" ]; then
   echo "❌ EARNED-WORD / attestation-bleed VIOLATION — an unearned claim is present."

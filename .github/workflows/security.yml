@@ -41,6 +41,14 @@ on:
   pull_request:
   workflow_dispatch:
 
+# LOW-2 (Round 1): no top-level `permissions:` meant GITHUB_TOKEN inherited the
+# repo/org default, which on an older repo can be read-WRITE across contents,
+# packages and issues — far more than any job here needs. Default to
+# read-only; escalate per-job only where a step genuinely writes (none do
+# today — verified: zero `permissions:` overrides needed below).
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
@@ -68,11 +76,15 @@ jobs:
     name: cargo-audit (blocking)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch tip 2026-09; this action has no version tags — LOW-1)
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        # PINNED (finding I-M12, Round 1): `--locked` only pins cargo-audit's
+        # own transitive deps, never the TOOL's version, so every run took
+        # whatever crates.io had today. Mirrors .gitlab-ci.yml's cargo-audit
+        # job — bump this version deliberately.
+        run: cargo install cargo-audit --version 0.22.2 --locked
       - name: cargo audit (all workspace lockfiles)
         run: bash scripts/audit-all-lockfiles.sh
 
@@ -83,11 +95,12 @@ jobs:
     name: cargo-deny (blocking)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch tip 2026-09; this action has no version tags — LOW-1)
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+        # PINNED (I-M12): see cargo-audit job above; mirrors .gitlab-ci.yml.
+        run: cargo install cargo-deny --version 0.20.2 --locked
       - name: cargo deny check
         run: cargo deny check advisories bans licenses sources
 
@@ -121,14 +134,14 @@ jobs:
     name: clippy-hardened (blocking)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Keep in step with crates/bloch-pos-node/rust-toolchain.toml; the script
       # re-reads that file and is the authority.
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master (branch tip 2026-09; no version tags — LOW-1)
         with:
           toolchain: "1.94.1"
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # A gate that miscounts goes green, which is exactly how this one hid 199
       # findings. Prove the counting half against hand-written logs before it
       # is allowed to judge the tree. Pure bash + python3, no toolchain.
@@ -151,12 +164,12 @@ jobs:
     name: osv-scanner (blocking)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Every workspace lockfile, mirroring scripts/audit-all-lockfiles.sh
       # (finding SC2-sharks-shamir): the standalone workspaces are invisible
       # to a root-only scan.
       - name: Run osv-scanner
-        uses: google/osv-scanner-action/osv-scanner-action@v1.9.2
+        uses: google/osv-scanner-action/osv-scanner-action@764c91816374ff2d8fc2095dab36eecd42d61638 # v1.9.2
         with:
           scan-args: |-
             --config=osv-scanner.toml
@@ -186,7 +199,7 @@ jobs:
     name: gitleaks (blocking)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install gitleaks (pinned; fails if it cannot)
         run: |
           bash scripts/ci-install-scanner.sh gitleaks
@@ -202,7 +215,7 @@ jobs:
     name: scanners-blocking guard (blocking)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: selftest (the guard must be able to fail)
         run: python3 scripts/check-scanners-blocking.selftest.py
       - name: guard
@@ -216,11 +229,11 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch tip 2026-09; this action has no version tags — LOW-1)
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install C toolchain
         run: sudo apt-get update && sudo apt-get install -y clang cmake
       - run: cargo clippy --all-targets
@@ -234,13 +247,14 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch tip 2026-09; this action has no version tags — LOW-1)
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install C toolchain
         run: sudo apt-get update && sudo apt-get install -y clang cmake
       - name: Install cargo-geiger
-        run: cargo install cargo-geiger --locked
+        # PINNED (I-M12): see cargo-audit job above.
+        run: cargo install cargo-geiger --version 0.13.0 --locked
       - run: cargo geiger --all-features --output-format Ascii
 
   # miri — UB / provenance / uninit-read on the pure-Rust consensus + emission
@@ -259,11 +273,11 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly (branch tip 2026-09; no version tags — LOW-1)
         with:
           components: miri, rust-src
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: cargo miri test (tokenomics/emission)
         run: cargo +nightly miri test -p bloch-crypto --lib tokenomics
 
@@ -282,13 +296,14 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly (branch tip 2026-09; no version tags — LOW-1)
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install C toolchain + cargo-fuzz
+        # cargo-fuzz PINNED (I-M12): see cargo-audit job above.
         run: |
           sudo apt-get update && sudo apt-get install -y clang cmake
-          cargo install cargo-fuzz --locked
+          cargo install cargo-fuzz --version 0.13.2 --locked
       - name: fuzz smoke (priority surfaces)
         run: |
           for t in block_parse tx_parse sha256d_pow ghostdag_order sig_verify; do

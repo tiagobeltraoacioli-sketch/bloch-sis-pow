@@ -58,6 +58,7 @@ LIVE_CRATES = (
     "bloch-sis-pow",
     "bloch-pq-vault",
     "pqcrypto-internals",
+    "genesis4-ceremony",
 )
 
 ESCAPES = (

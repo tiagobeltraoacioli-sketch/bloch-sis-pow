@@ -34,7 +34,7 @@ primary_region = "gru"
 # than the default 50 inbound peers or newcomers get dropped once it fills up
 # (the "~50-node wall"). Non-consensus operator knob (feature/peering-ux).
 [processes]
-  app = "--rpc-bind 0.0.0.0 --rpc-port 16210 --listen /ip4/0.0.0.0/tcp/16110 --data-dir /bloch-data --mine --miner-address bloch1qe986db5149cff7499b282a048272a09aff0af4ff84242073 --max-peers 500 --peer /ip4/45.32.154.137/tcp/16110"
+  app = "--rpc-bind 127.0.0.1 --rpc-port 16210 --listen /ip4/0.0.0.0/tcp/16110 --data-dir /bloch-data --mine --miner-address bloch1qe986db5149cff7499b282a048272a09aff0af4ff84242073 --max-peers 500 --peer /ip4/45.32.154.137/tcp/16110"
 
 # Persistent chain data. Create the volume once (see README):
 #   flyctl volumes create bloch_data --size 30 --region iad
@@ -42,21 +42,17 @@ primary_region = "gru"
   source = "bloch_data"
   destination = "/bloch-data"
 
-# RPC (JSON-RPC over HTTP). Reachable at https://<app>.fly.dev
-[[services]]
-  protocol = "tcp"
-  internal_port = 16210
-  processes = ["app"]
-  auto_stop_machines = false   # a miner must stay up
-  auto_start_machines = true
-  min_machines_running = 1
-  [[services.ports]]
-    port = 443
-    handlers = ["tls", "http"]
-  [[services.ports]]
-    port = 80
-    handlers = ["http"]
-
+# RPC [[services]] block REMOVED, and `--rpc-bind` above changed from
+# 0.0.0.0 to 127.0.0.1, 2026-09-06 (MED-6, Round 1). This used to publish
+# unauthenticated JSON-RPC — including `sendrawtransaction`, a write surface,
+# per crates/bloch-pos-node/src/main.rs:873's stated reasoning for the live
+# node's own safe default — on the open internet at :443/:80, with no
+# `--rpc-api-key` anywhere in this file. This chain is RETIRED (see banner at
+# the top of this file); nothing needs to reach this RPC port from outside
+# the fly.io private network any more. If a future retired-chain audit trail
+# needs the RPC reachable again, gate it behind `--rpc-api-key` FIRST, in the
+# `[processes]` line above, before restoring a `[[services]]` block for it.
+#
 # P2P (libp2p gossipsub + sync). Raw TCP on the app's public IP.
 [[services]]
   protocol = "tcp"

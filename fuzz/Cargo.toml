@@ -45,8 +45,16 @@ sha3 = "0.10"
 bincode = { version = "2", features = ["serde"] }
 
 # Vendored PQ fork (same as the node) — [patch] applies from the build root.
+# libp2p-yamux likewise: `fuzz` is its OWN `[workspace]` root (see above), so
+# the ROOT Cargo.toml's `[patch.crates-io] libp2p-yamux = { path =
+# "crates/libp2p-yamux" }` does not apply here — this workspace needs its own
+# copy of the same patch, or the vulnerable dual-backend yamux 0.12.1
+# (GHSA-vxx9-2994-q338, CVSS 8.7) comes back in through `bloch` (legacy
+# genesis3-node) -> libp2p 0.56.0, exactly as it did before this fix (N-4,
+# Round 3). See crates/libp2p-yamux/Cargo.toml for the fork's rationale.
 [patch.crates-io]
 pqcrypto-internals = { path = "../crates/pqcrypto-internals" }
+libp2p-yamux = { path = "../crates/libp2p-yamux" }
 
 [[bin]]
 name = "block_parse"

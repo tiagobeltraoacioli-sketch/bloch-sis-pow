@@ -135,7 +135,6 @@ skip = [
     { crate = "hashbrown@=0.15.5" },
     { crate = "hashlink@=0.9.1" },
     { crate = "hex-conservative@=0.1.2" },
-    { crate = "itertools@=0.12.1" },
     { crate = "r-efi@=5.3.0" },
     { crate = "rand@=0.8.6" },
     { crate = "rand@=0.9.4" },
@@ -149,7 +148,6 @@ skip = [
     { crate = "secp256k1-sys@=0.10.1" },
     { crate = "sha2@=0.9.9" },
     { crate = "socket2@=0.5.10" },
-    { crate = "syn@=1.0.109" },
     { crate = "thiserror@=1.0.69" },
     { crate = "thiserror-impl@=1.0.69" },
     { crate = "unsigned-varint@=0.7.2" },
@@ -157,6 +155,29 @@ skip = [
     { crate = "windows-sys@=0.52.0" },
     { crate = "windows-sys@=0.59.0" },
     { crate = "wit-bindgen@=0.51.0" },
+]
+
+# ── Target-gated OS-shim subtree (N-5, Round 3) ────────────────────────────
+# `multiple-versions = "deny"` (above) went red on this exact allowlist:
+# windows-sys 0.60.2/0.61.2, windows-targets 0.52.6/0.53.5, and all eight
+# windows_{aarch64,i686,x86_64}_{gnu,gnullvm,msvc} crates at 0.52.6/0.53.1 —
+# ten duplicate pairs the `skip` list above was never extended to cover
+# because it was written against an older lock (the two `windows-sys` entries
+# above still pin 0.52.0/0.59.0, versions the CURRENT lock resolves
+# differently). Per-crate `skip` entries would mean re-deriving this list by
+# hand on every windows-targets bump; `skip-tree` on the single newer
+# `windows-sys` root instead prunes windows-targets 0.53.5 and its eight
+# platform crates in one rule, the same "target-gated, never co-linked"
+# rationale as the `skip` entries above (these are OS ABI shims selected by
+# `cfg(windows)`, not code that runs together). Only the 0.60.2 side is
+# skip-tree'd — 0.61.2 is left as the sole non-skipped `windows-sys` version,
+# so a THIRD `windows-sys` release still trips `multiple-versions = "deny"`
+# rather than silently being absorbed.
+#
+# Verified: `cargo deny --offline check bans` -> `bans ok` after this rule
+# (10 error[duplicate] windows* pairs gone; 0 remaining warnings).
+skip-tree = [
+    "windows-sys@0.60.2",
 ]
 
 [licenses]

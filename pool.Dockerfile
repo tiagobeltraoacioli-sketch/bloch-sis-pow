@@ -23,4 +23,25 @@ FROM debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8
 RUN apt-get update && apt-get install -y ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/pool/target/release/bloch-pool /usr/local/bin/bloch-pool
-ENTRYPOINT ["/usr/local/bin/bloch-pool"]
+
+# ── Hardening (MED-5, Round 1) ────────────────────────────────────────────────
+# This image used to run as root with no non-root user, no core-dump
+# disabling and no data-dir ownership — despite pool.fly.toml running it as a
+# network-facing service (`--listen 0.0.0.0:3335` Stratum, `--dashboard
+# 0.0.0.0:8650`) holding the PPLNS journal AND a payout address. Ported
+# verbatim from Dockerfile:79-101 (the node image), same UID/GID, same
+# rationale: a core dump from this process is a real leak (payout address +
+# in-memory share ledger), the same THREAT_MODEL the node entrypoint states.
+RUN echo 'bloch:x:10001:10001::/home/bloch:/usr/sbin/nologin' >> /etc/passwd \
+ && echo 'bloch:x:10001:' >> /etc/group \
+ && mkdir -p /pool-data /home/bloch \
+ && chown -R 10001:10001 /pool-data /home/bloch
+RUN printf '#!/bin/sh\nulimit -c 0\nexec bloch-pool "$@"\n' > /usr/local/bin/bloch-pool-entrypoint \
+ && chmod +x /usr/local/bin/bloch-pool-entrypoint
+
+# Ports: 3335 Stratum, 8650 dashboard (see pool.fly.toml).
+EXPOSE 3335 8650
+VOLUME ["/pool-data"]
+
+USER 10001:10001
+ENTRYPOINT ["/usr/local/bin/bloch-pool-entrypoint"]

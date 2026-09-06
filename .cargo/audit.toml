@@ -53,4 +53,41 @@ ignore = [
     # ── Accepted vulnerabilities, no upstream bump path (mirrors deny.toml) ─────
     "RUSTSEC-2026-0118", # hickory-proto NSEC3 unbounded loop — libp2p 0.56-pinned
     "RUSTSEC-2026-0119", # hickory-proto O(n^2) name compression — libp2p-pinned
+    # ── crates/coherence-prover/{script,service} ONLY (N-3, Round 3) ───────────
+    # This config also governs `scripts/audit-all-lockfiles.sh`'s scan of the two
+    # coherence-prover lockfiles (added by finding P123-sp1-verifier and, until
+    # this fix, missing from that script's LOCKFILES list — see N-3). The root
+    # Cargo.lock is NOT affected by any of the three entries below: root already
+    # resolves ruint 1.20.0 / time 0.3.47 (verified via `grep -A2 'name =
+    # "ruint"|"time"' Cargo.lock`), so these ignores can never mask a root
+    # regression — an advisory ID only fires against a version its range
+    # actually covers.
+    #
+    # EXCEPTION added 2026-09-06, re-review by 2026-12-01. Attempted fix: `cargo
+    # update -p ruint --precise 1.20.0` / `-p time --precise 0.3.47` inside both
+    # crates/coherence-prover/script and crates/coherence-prover/service. Both
+    # fail identically:
+    #   error: failed to select a version for `serde_derive`.
+    #       ... required by package `serde_core v1.0.220`
+    #       ... which satisfies dependency `serde_core = "^1.0.211"` of ruint v1.20.0
+    #       (or `serde_core = "^1.0.220"` of time v0.3.47)
+    #       ... conflicts with `serde = "=1.0.219"` pinned in
+    #       crates/coherence-prover/{script,service}/Cargo.toml, whose own comment
+    #       explains why: "serde >=1.0.221 removed serde::__private, breaking
+    #       alloy-consensus 0.14 (sp1-sdk dep)". serde_core did not exist as a
+    #       separate crate before that serde split, so no ruint/time release new
+    #       enough to fix these advisories can resolve against serde=1.0.219.
+    # Fixing this requires bumping the sp1-sdk 4.2.1 / alloy-consensus 0.14 pin
+    # itself (a Cargo.toml change in crates/coherence-prover, owned by the
+    # SP1-verifier work, not this CI/supply-chain pass) — tracked as an action
+    # item in SECURITY_TOOLING.md. REMOVE these three entries the moment that
+    # pin moves and `cargo update -p ruint -p time` resolves cleanly.
+    "RUSTSEC-2026-0220", # ruint 1.16.0: Uint shift ops incorrect overflow flags —
+                         # coherence-prover/script+service only; fix is >=1.20.0
+    "RUSTSEC-2025-0137", # ruint 1.16.0: unsound safe `reciprocal_mg10` —
+                         # coherence-prover/script+service only; fix is >=1.17.1
+    "RUSTSEC-2026-0009", # time 0.3.44 (script)/0.3.44 (service): DoS via stack
+                         # exhaustion — coherence-prover/script+service only;
+                         # fix is >=0.3.47. Host-side SP1 tracing dep, not the
+                         # node consensus/mempool/P2P runtime.
 ]

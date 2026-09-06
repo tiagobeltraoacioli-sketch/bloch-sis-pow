@@ -26,7 +26,11 @@ COPY tests ./tests
 # the committed Cargo.lock (fails on drift) — required for reproducibility.
 # SOURCE_DATE_EPOCH (passed as a build arg) clamps build timestamps.
 ARG SOURCE_DATE_EPOCH
-RUN cargo build --release --features euvm --bin bloch
+# --locked (MED-3, Round 1): the comment above already claimed this; the flag
+# itself was missing, so the build silently resolved whatever the lockfile
+# drifted to instead of failing closed on drift, unlike Dockerfile:61 and
+# pool.Dockerfile:19, which both had it.
+RUN cargo build --release --locked --features euvm --bin bloch
 
 # ─── Runtime ─────────────────────────────────────────────────
 FROM debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df
@@ -67,6 +71,12 @@ VOLUME ["/bloch-data"]
 
 USER 10001:10001
 ENTRYPOINT ["/usr/local/bin/bloch-entrypoint"]
-# Default: a public node (P2P + RPC bound to all interfaces). Add "--mine" to
-# run a miner, or "--peer <multiaddr>" to bootstrap from a known peer.
-CMD ["--rpc-bind", "0.0.0.0", "--rpc-port", "16210", "--listen", "/ip4/0.0.0.0/tcp/16110", "--data-dir", "/bloch-data"]
+# Default: RPC on loopback only (MED-6, Round 1) — the RPC surface accepts
+# `sendrawtransaction`, so an exposed bind is a WRITE surface, not only a
+# read one (crates/bloch-pos-node/src/main.rs:873 states the same reasoning
+# for the PoS node's own default). P2P still listens on all interfaces, which
+# is the node's actual job. Operators who need remote RPC pass
+# `--rpc-bind 0.0.0.0 --rpc-api-key <key>` explicitly; a published image
+# should not default to a routable write surface. Add "--mine" to run a
+# miner, or "--peer <multiaddr>" to bootstrap from a known peer.
+CMD ["--rpc-bind", "127.0.0.1", "--rpc-port", "16210", "--listen", "/ip4/0.0.0.0/tcp/16110", "--data-dir", "/bloch-data"]

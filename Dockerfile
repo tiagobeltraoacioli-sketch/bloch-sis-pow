@@ -99,6 +99,12 @@ VOLUME ["/bloch-data"]
 
 USER 10001:10001
 ENTRYPOINT ["/usr/local/bin/bloch-entrypoint"]
-# Default: a public node (P2P + RPC bound to all interfaces). Add "--mine" to
-# run a miner, or "--peer <multiaddr>" to bootstrap from a known peer.
-CMD ["--rpc-bind", "0.0.0.0", "--rpc-port", "16210", "--listen", "/ip4/0.0.0.0/tcp/16110", "--data-dir", "/bloch-data"]
+# Default: RPC on loopback only (MED-6, Round 1) — the RPC surface accepts
+# `sendrawtransaction`, so an exposed bind is a WRITE surface, not only a
+# read one (crates/bloch-pos-node/src/main.rs:873 states the same reasoning
+# for the PoS node's own default). P2P still listens on all interfaces, which
+# is the node's actual job. Operators who need remote RPC pass
+# `--rpc-bind 0.0.0.0 --rpc-api-key <key>` explicitly; a published image
+# should not default to a routable write surface. Add "--mine" to run a
+# miner, or "--peer <multiaddr>" to bootstrap from a known peer.
+CMD ["--rpc-bind", "127.0.0.1", "--rpc-port", "16210", "--listen", "/ip4/0.0.0.0/tcp/16110", "--data-dir", "/bloch-data"]

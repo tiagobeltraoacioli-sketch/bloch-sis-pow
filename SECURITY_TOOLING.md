@@ -106,6 +106,69 @@ No Solidity is deployed yet (the L2 is a Rust revm scaffold). The Solidity toolc
    - **`spin` 0.9.8 → 0.9.9** — 0.9.8 was **yanked** (would fail `cargo audit --deny warnings` and `deny yanked="deny"`).
    - **`rpassword` 7.4.0 → 7.5.4** — clears **GHSA-2p6r-x3vv-xqm2**; `rpassword` is a **direct** node dependency (CLI passphrase entry), so this is a first-party surface, not transitive.
 
+> **`pool/` — sharks → blahaj (finding SC2, biased Shamir).** `sharks` 0.5.0
+> (RUSTSEC-2024-0398: Shamir polynomial coefficients drawn from `[1, 255]`
+> instead of `[0, 255]`, a measurable secret-recovery bias) is gone from
+> `pool/Cargo.lock`. `bloch-pool-keyshard`'s M-of-N field math now runs on
+> `blahaj` 0.6.0, migration documented in `pool/README.md` — same share wire
+> format, so shares dealt by the sharks-era binary still reconstruct. `cargo
+> deny check advisories` in `pool/`: **ok**.
+
+## Round 3 (2026-09-06) — CI/supply-chain gate coverage, corrected
+
+Three gates were re-tooled or extended this round; none changed a consensus
+constant or Rust source.
+
+- **`cargo deny check bans` (finding N-5) — was FAILING, now `bans ok`.**
+  `deny.toml`'s `multiple-versions = "deny"` allowlist (added closing
+  SC3-yamux-dedupe) was written against a lock that has since moved:
+  `windows-sys` 0.60.2/0.61.2, `windows-targets` 0.52.6/0.53.5, and all eight
+  `windows_{aarch64,i686,x86_64}_{gnu,gnullvm,msvc}` platform crates at
+  0.52.6/0.53.1 were ten unlisted duplicate pairs. Fixed with a single
+  `[bans] skip-tree = ["windows-sys@0.60.2"]` rule — these are target-gated
+  OS ABI shims selected by `cfg(windows)`, never co-linked, the identical
+  rationale the pre-existing `skip` entries already state — instead of
+  hand-listing ten more exact-version pairs that would need re-deriving on
+  every `windows-targets` bump. Two stale `skip` entries the lock no longer
+  matches (`itertools@0.12.1`, `syn@1.0.109`) were also removed. Verified:
+  `cargo deny --offline check bans` → `bans ok`, zero warnings.
+
+- **`cargo audit` lockfile coverage (finding N-3) — two lockfiles were
+  missing from the scan entirely.** `crates/coherence-prover/{script,
+  service}/Cargo.lock`, committed by the SP1-verifier fix wave, were absent
+  from both `scripts/audit-all-lockfiles.sh`'s `LOCKFILES` list and the
+  `osv-scanner` job's `--lockfile` flags — the **entire pinned SP1
+  dependency stack** (sp1-sdk 4.2.1, alloy-consensus, arkworks, …) was
+  unscanned by every gate. Both are now covered by both scanners. Doing so
+  surfaced four advisories in that stack — **ruint** (RUSTSEC-2026-0220,
+  RUSTSEC-2025-0137), **time** (RUSTSEC-2026-0009), and **serde_with**
+  (GHSA-7gcf-g7xr-8hxj, GHSA-only) — all four blocked on the SAME upstream
+  conflict: every fix version needs the `serde_core` crate, and
+  `crates/coherence-prover/{script,service}/Cargo.toml` pin `serde =
+  "=1.0.219"` (own comment: *"serde >=1.0.221 removed serde::__private,
+  breaking alloy-consensus 0.14"*) — `serde_core` did not exist before that
+  split. Verified by attempting the bump (`cargo update -p ruint --precise
+  1.20.0` etc. in both directories; all four fail identically on `serde`).
+  Dated exceptions (re-review 2026-12-01) are in `.cargo/audit.toml` (RUSTSEC
+  ids) and `osv-scanner.toml` (all four, including the GHSA-only one
+  cargo-audit cannot see) — **remove them the moment the sp1-sdk /
+  alloy-consensus pin moves.** Root `Cargo.lock` is unaffected (already
+  `ruint` 1.20.0 / `time` 0.3.47). Verified: `cargo audit -n --deny warnings`
+  exit 0 on both lockfiles; `bash scripts/audit-all-lockfiles.sh` exit 0
+  across all 13 tracked lockfiles; `osv-scanner --config=osv-scanner.toml`
+  across all 13 → **No issues found**.
+
+- **`fuzz/Cargo.lock` (finding N-4) — stale since SC3-yamux-dedupe, now
+  regenerated.** `fuzz/` is its own `[workspace]` root, so the root
+  `[patch.crates-io] libp2p-yamux = { path = "crates/libp2p-yamux" }` never
+  applied there — the fuzz targets still linked the vulnerable dual-backend
+  `libp2p-yamux 0.47.0` from the registry, with `yamux 0.12.1`
+  (GHSA-vxx9-2994-q338, CVSS 8.7) reachable underneath it. Fixed the same way
+  as root: added the identical `[patch.crates-io]` entry to `fuzz/Cargo.toml`
+  and regenerated the lock (`cargo update` in `fuzz/`). `yamux 0.12.1` is
+  gone; only the fixed 0.13.10 remains. `cargo metadata` and `cargo audit -n
+  --deny warnings` on `fuzz/Cargo.lock`: clean.
+
 ## bloch-euvm — internally audited + remediated
 
 The native eUTXO contract VM had a dedicated internal adversarial audit (`crates/bloch-euvm/audit/INTERNAL-AUDIT-2026-07.md`). Verdict: proceed to consensus-wiring engineering, **hard block on activation** until the blockers close. **0 critical** (the crate is inert/feature-off), **2 HIGH** integration blockers + **1 MEDIUM** — **all remediated**, each with a passing regression test:

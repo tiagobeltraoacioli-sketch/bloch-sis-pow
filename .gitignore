@@ -31,6 +31,16 @@ deploy/rollback/dist/
 *.minisign.key
 rollback-signing.key
 
+# Image-signing / TLS private key material (Round-1 finding MED-11):
+# cosign.key is the root of trust for deploy/attestation/image-security-
+# policy.json and, through it, the SEV-SNP HOSTDATA binding — a private key
+# created by a convenience `cosign generate-key-pair` run in the repo and
+# swept up by `git add -A` is a signing key nobody decided to publish. Same
+# reasoning as bench/ above for BPOSKEY1: this is prevention, not cleanup.
+cosign.key
+*.pem
+*.p12
+
 # Personal session journal (not versioned)
 journal.txt
 
@@ -69,3 +79,14 @@ bench/
 
 # SP1 guest build artifact (cargo prove build) — bake the vkey, not the ELF
 crates/coherence-prover/program/elf/
+
+# LOW-6 (Round 1): the blanket `*.log` and `.claude/` rules above have
+# force-added tracked members — `git status` was blind to edits-by-deletion
+# in these paths, and a new file added there was silently ignored instead of
+# staged. Explicit negations, not a directory-wide re-inclusion, so nothing
+# else under `.claude/` (agent scratch state, not project content) comes
+# back. (os/boot-harness/fixtures/ ALSO carries its own nested .gitignore
+# with `!*.log` for the same reason — this negation is the belt to that
+# suspenders, matching what `git ls-files` shows is actually tracked there.)
+!os/boot-harness/fixtures/*.log
+!.claude/workflows/

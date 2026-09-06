@@ -34,7 +34,7 @@ CHECKER = os.path.join(HERE, "check-tests-blocking.py")
 CRATE_ARGS = (
     "    - cargo test --locked -p bloch-pos-committee -p bloch-pos-node"
     " -p bloch-crypto -p coherence-core -p bloch-sis-pow -p bloch-pq-vault"
-    " -p pqcrypto-internals\n"
+    " -p pqcrypto-internals -p genesis4-ceremony\n"
 )
 
 GOOD_GITLAB = """\
@@ -73,7 +73,8 @@ jobs:
             -p coherence-core \\
             -p bloch-sis-pow \\
             -p bloch-pq-vault \\
-            -p pqcrypto-internals
+            -p pqcrypto-internals \\
+            -p genesis4-ceremony
 
   tests-blocking-guard:
     runs-on: ubuntu-latest

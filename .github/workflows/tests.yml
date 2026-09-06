@@ -20,10 +20,14 @@
 #   bloch-sis-pow         pulled by bloch-crypto (consensus path)
 #   bloch-pq-vault        PQ-shield vault (commit-delay-reveal + clawback)
 #   pqcrypto-internals    vendored PQClean bindings everything signs with
+#   genesis4-ceremony     assembled the live genesis block (F21's fixture
+#                         re-pin landed 2026-09-06 — 28 passed, 0 failed —
+#                         and it joined this list the same day, finding N-6,
+#                         Round 3: it had gone green but stayed outside every
+#                         blocking gate)
 #
-# NOT gated here: tools/genesis4-ceremony (its fixture re-pin is finding F21's
-# own change; it joins this list when F21 lands), legacy/genesis3-node and the
-# Genesis-3 crates (closed chain, exercised by GitLab's workspace-tests job).
+# NOT gated here: legacy/genesis3-node and the Genesis-3 crates (closed chain,
+# exercised by GitLab's workspace-tests job).
 #
 # The toolchain is PINNED to crates/bloch-pos-node/rust-toolchain.toml — the
 # same reasoning as clippy-hardened in security.yml: a test verdict is a
@@ -38,6 +42,12 @@ on:
     branches: [main, "euvm/**"]
   pull_request:
   workflow_dispatch:
+
+# LOW-2 (Round 1, mirrored from security.yml): no top-level `permissions:`
+# meant GITHUB_TOKEN inherited the repo/org default. Default read-only; no
+# job here writes anything.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -60,7 +70,7 @@ jobs:
     # gate by luck on a 2-core hosted runner.
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Pinned toolchain (crates/bloch-pos-node/rust-toolchain.toml)
         id: pin
         run: |
@@ -71,7 +81,7 @@ jobs:
           fi
           rustup toolchain install "$ch" --profile minimal --no-self-update
           echo "toolchain=$ch" >> "$GITHUB_OUTPUT"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install C toolchain (rocksdb bindgen, blst, PQClean)
         run: sudo apt-get update && sudo apt-get install -y clang cmake
       - name: cargo test (live crates)
@@ -83,7 +93,8 @@ jobs:
             -p coherence-core \
             -p bloch-sis-pow \
             -p bloch-pq-vault \
-            -p pqcrypto-internals
+            -p pqcrypto-internals \
+            -p genesis4-ceremony
 
   # tests-blocking guard — the regression test for finding TEST1 itself. Fails
   # if this workflow or GitLab's build-and-test loses a live crate, loses its
@@ -93,7 +104,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: selftest (the guard must be able to fail)
         run: python3 scripts/check-tests-blocking.selftest.py
       - name: guard

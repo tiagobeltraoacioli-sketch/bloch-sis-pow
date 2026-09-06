@@ -1,4 +1,7 @@
 # MINER node (phase 1 = sync as relay, then --mine is enabled once it reaches
+# RPC bound to loopback, not 0.0.0.0 (MED-6, Round 1): no [[services]] block
+# publishes 16210 here, and no --rpc-api-key is set anywhere in this file, so
+# a routable bind was an avoidable write-surface widening for a retired chain.
 # the network tip). Peers to the primary over Fly's PRIVATE 6PN address —
 # same-org Fly machines can't reach the primary's PUBLIC ip (hairpin NAT), which
 # is why the older followers islanded. HONESTY: Postern-operated on Fly = ONE
@@ -7,7 +10,7 @@ app = "blochv-node-9"
 primary_region = "gru"
 
 [processes]
-  app = "--rpc-bind 0.0.0.0 --rpc-port 16210 --listen /ip4/0.0.0.0/tcp/16110 --data-dir /bloch-data --testnet --mine --dns-seed blochv-node.internal --peer /ip4/45.32.154.137/tcp/16110 --allow-private-peers"
+  app = "--rpc-bind 127.0.0.1 --rpc-port 16210 --listen /ip4/0.0.0.0/tcp/16110 --data-dir /bloch-data --testnet --mine --dns-seed blochv-node.internal --peer /ip4/45.32.154.137/tcp/16110 --allow-private-peers"
 
 [mounts]
   source = "bloch_data"

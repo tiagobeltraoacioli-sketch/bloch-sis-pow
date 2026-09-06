@@ -46,6 +46,13 @@ files. Not "is large", not "is binary" — the test is specifically: does a
 versioned archive carry the kind of file that version control is supposed to
 be the single source of truth for.
 
+It ALSO fails on any tracked .pyc/.pyo/.class/.o/.so — a compiled artifact
+committed directly, no archive needed, same class of invisible-diff hazard in
+miniature (Round-1 finding LOW-9). Caught here:
+`tools/genesis4-carryover/__pycache__/build_carryover.cpython-314.pyc`,
+force-added past `.gitignore`'s own `__pycache__/` + `*.pyc` rules — removed
+from the index in the same commit that added this check.
+
 Deliberately also fails on an archive it cannot open. An opaque versioned blob
 that will not list is the same hazard with less evidence, and "the guard could
 not read it" must not read as "the guard passed".
@@ -81,6 +88,23 @@ SOURCE_EXTS = (
     ".c", ".h", ".cc", ".cpp", ".hpp", ".go", ".js", ".ts", ".sql",
     ".lock", ".proto",
 )
+
+# TRACKED COMPILED ARTIFACTS — a second, narrower check alongside the archive
+# scan above (Round-1 finding LOW-9 / the tracked `__pycache__` escape). A
+# compiled .pyc/.pyo/.class/.o/.so committed directly (no archive needed) is
+# the same hazard in miniature: it is a binary blob that can silently diverge
+# from the source that produced it, `git diff` on it prints "Binary files
+# differ", and unlike an archive it is not even labelled as a bundle of
+# something — it just looks like build noise nobody meant to commit. Caught
+# in the wild here: `tools/genesis4-carryover/__pycache__/
+# build_carryover.cpython-314.pyc`, force-added despite `.gitignore`'s
+# `__pycache__/` + `*.pyc` rules (removed from the index in the same commit
+# that added this check).
+COMPILED_ARTIFACT_EXTS = (".pyc", ".pyo", ".class", ".o", ".so")
+
+
+def compiled_artifacts(paths: list[str]) -> list[str]:
+    return [p for p in paths if p.lower().endswith(COMPILED_ARTIFACT_EXTS)]
 
 # path -> reason. Empty on purpose. Adding an entry is a review decision.
 ALLOWLIST: dict[str, str] = {}
@@ -132,10 +156,22 @@ def main() -> int:
     ).stdout.strip()
     os.chdir(root)
 
-    archives = [p for p in tracked_files() if is_archive(p)]
-    print(f"check-no-source-archives: {len(archives)} tracked archive(s) found")
+    all_tracked = tracked_files()
+    archives = [p for p in all_tracked if is_archive(p)]
+    compiled = compiled_artifacts(all_tracked)
+    print(f"check-no-source-archives: {len(archives)} tracked archive(s), "
+          f"{len(compiled)} tracked compiled artifact(s) found")
 
     findings: list[str] = []
+    for path in sorted(compiled):
+        if path in ALLOWLIST:
+            print(f"  ALLOWED  {path}\n           reason: {ALLOWLIST[path]}")
+            continue
+        findings.append(
+            f"{path}\n    a tracked compiled artifact "
+            f"({os.path.splitext(path)[1] or path}) — build output, not source, "
+            f"and it can silently diverge from whatever produced it."
+        )
     for path in sorted(archives):
         if path in ALLOWLIST:
             print(f"  ALLOWED  {path}\n           reason: {ALLOWLIST[path]}")
@@ -165,19 +201,20 @@ def main() -> int:
 
     print()
     print("=" * 74)
-    print("REFUSED: a binary archive of source files is under version control.")
+    print("REFUSED: a binary archive or compiled artifact is under version control.")
     print("=" * 74)
     for f in findings:
         print(f"\n  {f}")
     print(
         "\n  Source files belong in the tree, where git diff, review, clippy and\n"
-        "  every test can read them. Inside an archive they are versioned but\n"
-        "  unreadable: they can be unpacked over a checkout and silently replace\n"
-        "  the tree's own code with an older copy, and no reading tool this\n"
-        "  project owns will show the change.\n"
-        "\n  Delete the archive and reconstruct from branches, or, if the bytes\n"
-        "  must be kept, add the path to ALLOWLIST in this script with a written\n"
-        "  reason. There is no third option that leaves the pipeline green.\n"
+        "  every test can read them. Inside an archive, or compiled into a\n"
+        "  .pyc/.pyo/.class/.o/.so, they are versioned but unreadable: they can\n"
+        "  silently replace or diverge from the tree's own source with no\n"
+        "  reading tool this project owns showing the change.\n"
+        "\n  Delete the archive or compiled artifact and reconstruct from source,\n"
+        "  or, if the bytes must be kept, add the path to ALLOWLIST in this\n"
+        "  script with a written reason. There is no third option that leaves\n"
+        "  the pipeline green.\n"
     )
     return 1
 

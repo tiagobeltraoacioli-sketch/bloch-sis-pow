@@ -1,4 +1,7 @@
 # ── Genesis-2 MINER node (peers to the fleet over Fly private DNS) ────────────
+# RPC bound to loopback, not 0.0.0.0 (MED-6, Round 1): no [[services]] block
+# publishes 16210 here, and no --rpc-api-key is set anywhere in this file, so
+# a routable bind was an avoidable write-surface widening for a retired chain.
 # Fresh SHA-256d chain: ingests the carry-over ledger at first boot, syncs off
 # the fleet, and mines. HONESTY: Postern-operated miners = ONE operator; this
 # concentrates hashrate and does NOT decentralize.
@@ -6,7 +9,7 @@ app = "blochv-node-2"
 primary_region = "gru"
 
 [processes]
-  app = "--rpc-bind 0.0.0.0 --rpc-port 16210 --listen /ip4/0.0.0.0/tcp/16110 --data-dir /bloch-data --genesis2 --carryover-snapshot /carryover.tsv --mine --dns-seed blochv-node.internal --allow-private-peers"
+  app = "--rpc-bind 127.0.0.1 --rpc-port 16210 --listen /ip4/0.0.0.0/tcp/16110 --data-dir /bloch-data --genesis2 --carryover-snapshot /carryover.tsv --mine --dns-seed blochv-node.internal --allow-private-peers"
 
 [mounts]
   source = "bloch_data"

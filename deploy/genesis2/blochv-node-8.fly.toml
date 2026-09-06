@@ -1,4 +1,7 @@
 # ── Genesis-2 BOOTSTRAP + ARCHIVAL node ──────────────────────────────────────
+# RPC bound to loopback, not 0.0.0.0 (MED-6, Round 1): no [[services]] block
+# publishes 16210 here, and no --rpc-api-key is set anywhere in this file, so
+# a routable bind was an avoidable write-surface widening for a retired chain.
 # The one node that (a) mines the first blocks so the fresh chain starts, and
 # (b) --archive keeps every block body so new nodes can bootstrap (a pruned node
 # cannot). NO --dns-seed/--peer: it does not wait to "see the network tip", so it
@@ -7,7 +10,7 @@ app = "blochv-node-8"
 primary_region = "gru"
 
 [processes]
-  app = "--rpc-bind 0.0.0.0 --rpc-port 16210 --listen /ip6/::/tcp/16110 --data-dir /bloch-data --genesis2 --carryover-snapshot /carryover.tsv --archive --mine --allow-private-peers"
+  app = "--rpc-bind 127.0.0.1 --rpc-port 16210 --listen /ip6/::/tcp/16110 --data-dir /bloch-data --genesis2 --carryover-snapshot /carryover.tsv --archive --mine --allow-private-peers"
 
 [mounts]
   source = "bloch_data"

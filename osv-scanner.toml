@@ -168,3 +168,39 @@ reason = "hickory-proto NSEC3 unbounded loop (DoS), libp2p-pinned; mirrors deny.
 id = "RUSTSEC-2026-0119"
 ignoreUntil = 2026-12-01
 reason = "hickory-proto O(n^2) name-compression CPU exhaustion (DoS), libp2p-pinned; mirrors deny.toml. Same reachability note as RUSTSEC-2026-0118."
+
+# ── crates/coherence-prover/{script,service} ONLY (N-3, Round 3) ─────────────
+# Adding these two lockfiles to this job's --lockfile list (they were missing
+# entirely — finding N-3) surfaces four advisories, all in the pinned SP1 4.2.1
+# / alloy-consensus 0.14 dependency stack, all sharing ONE blocker: every fix
+# version needs `serde_core`, and crates/coherence-prover/{script,service}
+# pin `serde = "=1.0.219"` (comment: "serde >=1.0.221 removed
+# serde::__private, breaking alloy-consensus 0.14 (sp1-sdk dep)") — serde_core
+# did not exist as a crate before that serde split. Verified: `cargo update -p
+# ruint --precise 1.20.0` / `-p time --precise 0.3.47` / `-p serde_with
+# --precise 3.21.0` in both directories all fail with the identical
+# "failed to select a version for `serde`/`serde_derive`" conflict against the
+# `=1.0.219` pin. Mirrored in .cargo/audit.toml (RUSTSEC ids only — GHSA-only
+# entries below cannot live there, cargo-audit is RustSec-only). Fixing this
+# means moving the sp1-sdk/alloy-consensus pin, a crates/coherence-prover
+# Cargo.toml change owned by the SP1-verifier work, tracked in
+# SECURITY_TOOLING.md. REMOVE the moment that pin moves.
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0137"   # ruint 1.16.0: unsound safe `reciprocal_mg10`
+ignoreUntil = 2026-12-01
+reason = "coherence-prover/{script,service} only, serde=1.0.219-pinned (see block comment above); fix is ruint >=1.17.1. Root Cargo.lock is unaffected (already ruint 1.20.0)."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0220"   # ruint 1.16.0: Uint shift ops incorrect overflow flags
+ignoreUntil = 2026-12-01
+reason = "coherence-prover/{script,service} only, serde=1.0.219-pinned; fix is ruint >=1.20.0. Root Cargo.lock is unaffected (already ruint 1.20.0)."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0009"   # time 0.3.44: DoS via stack exhaustion
+ignoreUntil = 2026-12-01
+reason = "coherence-prover/{script,service} only, serde=1.0.219-pinned; fix is time >=0.3.47. Root Cargo.lock is unaffected (already time 0.3.47). Host-side SP1 tracing dep, not the node consensus/mempool/P2P runtime."
+
+[[IgnoredVulns]]
+id = "GHSA-7gcf-g7xr-8hxj"   # serde_with 3.14.1, via alloy-consensus 0.14 (SP1)
+ignoreUntil = 2026-12-01
+reason = "coherence-prover/{script,service} only, serde=1.0.219-pinned; fix (serde_with >=3.21.0) pulls serde_json >=1.0.145, which needs serde_core >=1.0.220 — same conflict as the ruint/time entries above. GHSA-only (no RUSTSEC id), so cargo-audit cannot see it; osv-scanner is the only gate that does."

@@ -198,12 +198,76 @@ comment-constant-guard:
 # honest shapes stay green. It also drives repro-manifest.sh and repro-compare.sh
 # directly, so those two cannot regress to warn-only without turning this red.
 # Pure Python 3 + bash, no toolchain, no build, no Nix.
+#
+# STAGE: `nix` (terminal), NOT `check` — moved here 2026-09-06 (finding N-2,
+# Round 3). GitLab stages run sequentially and a non-`allow_failure` job that
+# fails blocks every later stage from starting at all: this job is red ON
+# PURPOSE (no committed flake.lock) until a human runs scripts/flake-lock.sh on
+# the aarch64 Nix host, which on `check` meant `test` — and with it
+# `build-and-test`, the whole TEST1 gate (scripts/check-tests-blocking.py) —
+# NEVER RAN, on every single pipeline, silently. That is the identical failure
+# shape TEST1 itself exists to name ("ran tests but was permanently red, so the
+# stage behind it never ran and its verdict carried no information"),
+# reintroduced one stage earlier by this guard's own placement. `nix` already
+# runs last and already hosts other honestly-red-until-Nix jobs
+# (flake-lock-drift, repro below); putting this one there too means its honest
+# red no longer hides the test verdict, while it keeps blocking (no
+# `allow_failure`) so the release-integrity claim it makes is still enforced.
 repro-inputs-guard:
-  stage: check
+  stage: nix
   before_script: []
   script:
     - python3 scripts/check-repro-inputs.selftest.py
     - python3 scripts/check-repro-inputs.py
+  allow_failure: false
+
+# Stale-doc sweep — catches a doc/spec page that still states a superseded
+# number (a supply split, a vesting schedule, a validator share) as current
+# fact, by diffing named phrases against the live constants in
+# tokenomics_v4.rs. tools/doc-sweep/check_stale.py owns the row list (another
+# workstream's fix, tracked separately); this job only wires it into CI so a
+# newly-reintroduced stale figure is a red build, not a paragraph nobody
+# rereads.
+#
+# STAGE: `nix` (terminal), same placement reasoning as repro-inputs-guard
+# just above (finding N-2) — this job is RED ON THIS REVISION (four
+# occurrences: the Genesis-3 halt announcement, the CERTIK dossier, and two
+# whitepaper pages, each a superseded figure with no historical-context
+# marker) until those doc pages are corrected, and putting a currently-red,
+# non-`allow_failure` job in `check` or `test` would block every job behind
+# it — exactly the defect N-2 exists to name. Pure Python 3, no toolchain, no
+# build, no Nix (the `nix` stage is just where this pipeline puts "honestly
+# red today, terminal so it cannot mask another gate's verdict").
+# Local run: python3 tools/doc-sweep/check_stale.py --ci
+doc-sweep:
+  stage: nix
+  before_script: []
+  script:
+    - python3 tools/doc-sweep/check_stale.py --ci
+  allow_failure: false
+
+# Deploy-image pin guard (finding MED-7, Round 1). Every Dockerfile in this
+# repo pins its base images by digest ("Update the digest deliberately, never
+# float the tag" — Dockerfile:27); the deploy/ Akash SDLs and docker-compose
+# files that pull the BUILT node/pool image do not: `bloch:latest`,
+# `docker.io/blochv/bloch:0.1`, and similar bare, mutable tags. This job wires
+# the check in; it does not itself pin anything, and pinning deploy/ YAML is
+# NOT this workstream's ownership (CI/supply-chain) — it belongs to whoever
+# owns the deployment/ops configs. See scripts/check-deploy-image-pins.py's
+# own docstring for that boundary stated the same way.
+#
+# STAGE: `nix` (terminal), same reasoning as doc-sweep and repro-inputs-guard
+# just above (finding N-2) — this job is RED ON THIS REVISION (12 unpinned
+# images across deploy/) and a currently-red, non-`allow_failure` job in
+# `check` or `test` would block every job behind it. Pure Python 3, no
+# toolchain, no build, no Nix.
+# Local run: python3 scripts/check-deploy-image-pins.py
+deploy-image-pins:
+  stage: nix
+  before_script: []
+  script:
+    - python3 scripts/check-deploy-image-pins.selftest.py
+    - python3 scripts/check-deploy-image-pins.py
   allow_failure: false
 
 # Source-in-archive guard. BLOCKING.
@@ -223,10 +287,17 @@ repro-inputs-guard:
 # An archive that will not list is also refused — a guard that cannot read a
 # file must not report the file as fine. Verified by violation both ways on
 # 2026-09-02. Pure Python 3, no toolchain, no build.
+#
+# EXTENDED 2026-09-06 (finding LOW-9, Round 1): also refuses any tracked
+# compiled artifact (.pyc/.pyo/.class/.o/.so) — the same invisible-diff
+# hazard without needing an archive. Caught: a force-added
+# `tools/genesis4-carryover/__pycache__/build_carryover.cpython-314.pyc`,
+# removed from the index in the same commit that added this check.
 no-source-archives:
   stage: check
   before_script: []
   script:
+    - python3 scripts/check-no-source-archives.selftest.py
     - python3 scripts/check-no-source-archives.py
   allow_failure: false
 
@@ -364,7 +435,20 @@ rollback-package-integrity:
 supply-chain:
   stage: check
   script:
-    - cargo install cargo-deny --locked 2>/dev/null || true
+    # PINNED (finding I-M12, Round 1): `--locked` only pins cargo-deny's OWN
+    # transitive deps, never the tool's own version — every prior run took
+    # whatever was newest on crates.io, so the gate that decides the chain's
+    # dependency posture ran unreviewed, unpinned code. `2>/dev/null || true`
+    # is also gone: it used to mean "if cargo-deny is already installed on
+    # this runner, swallow the (expected) error and keep whatever binary is
+    # already there" — a stale pinned-nothing binary silently ran the gate.
+    # An exact-version `cargo install` when that exact version is already
+    # present exits 0 on its own ("already installed", verified locally), so
+    # dropping `|| true` costs nothing on a warm runner and fails loudly on a
+    # genuinely broken install. Bump this version deliberately, the same
+    # discipline crates/bloch-pos-node/rust-toolchain.toml states for the
+    # compiler pin.
+    - cargo install cargo-deny --version 0.20.2 --locked
     - cargo deny check advisories bans licenses sources
   allow_failure: false
 
@@ -399,7 +483,9 @@ deny-license-exceptions:
 cargo-audit:
   stage: check
   script:
-    - cargo install cargo-audit --locked 2>/dev/null || true
+    # PINNED (I-M12): see supply-chain job above for why the version pin AND
+    # the removed `|| true` both matter.
+    - cargo install cargo-audit --version 0.22.2 --locked
     - bash scripts/audit-all-lockfiles.sh
   allow_failure: false
 
@@ -435,6 +521,8 @@ osv-scanner:
         --lockfile=pool-proxy/Cargo.lock
         --lockfile=services/pq-shield-api/Cargo.lock
         --lockfile=euvm-tooling/Cargo.lock
+        --lockfile=crates/coherence-prover/script/Cargo.lock
+        --lockfile=crates/coherence-prover/service/Cargo.lock
         --lockfile=fuzz/Cargo.lock
         --lockfile=spikes/prover-cost/Cargo.lock
         --lockfile=spikes/prover-cost/rv32/Cargo.lock
@@ -453,7 +541,8 @@ osv-scanner:
 cargo-geiger:
   stage: check
   script:
-    - cargo install cargo-geiger --locked 2>/dev/null || true
+    # PINNED (I-M12): see supply-chain job above.
+    - cargo install cargo-geiger --version 0.13.0 --locked
     - cargo geiger --all-features --output-format Ascii || true
   allow_failure: true
 
@@ -494,7 +583,8 @@ fuzz-smoke:
         echo "install: rustup toolchain install nightly && cargo install cargo-fuzz"
         exit 0
       fi
-    - cargo install cargo-fuzz --locked 2>/dev/null || true
+    # PINNED (I-M12): see supply-chain job above.
+    - cargo install cargo-fuzz --version 0.13.2 --locked
     - |
       for t in block_parse tx_parse sha256d_pow ghostdag_order sig_verify \
                pos_envelope_decode pos_attestation_decode pos_header_decode \
@@ -535,36 +625,42 @@ secret-scan:
 # Build + full test suite (the gate).
 # build-and-test — BLOCKING gate on the LIVE crates (Round-2 audit finding
 # TEST1-ci-runs-tests). This job used to run `cargo test --workspace` and was
-# permanently red — the genesis4-ceremony fixture drifted from the re-measured
-# carryover (finding F21, its own change) — so the nix stage behind it never
-# ran and a red pipeline stopped carrying information. A gate that always
-# fails gates nothing.
+# permanently red — the genesis4-ceremony fixture had drifted from the
+# re-measured carryover (finding F21) — so the nix stage behind it never ran
+# and a red pipeline stopped carrying information. A gate that always fails
+# gates nothing.
+#
+# F21's re-pin LANDED (`c75ad37` + `4bad227`: KAT2_TEXT/KAT2_DIGEST,
+# VALIDATOR_EMISSION_BLOCH, CARRYOVER_TOTAL_BLOCH and the founder schedule
+# re-pinned to the live constants) — genesis4-ceremony's own suite is green
+# (28 passed, 0 failed). It joined LIVE_CRATES / this list 2026-09-06 (finding
+# N-6, Round 3): the crate that assembled the live genesis block had gone
+# green but stayed outside every blocking gate, on the strength of a comment
+# that was no longer true.
 #
 # It now gates what must be green on EVERY commit: the Genesis-4 consensus
-# crates and the shared protocol crates on their path — the same seven crates
-# .github/workflows/tests.yml gates, held to the same posture by
-# scripts/check-tests-blocking.py (tests-blocking-guard, check stage): drop a
-# crate from either side, remove the timeout, or add an escape hatch and the
-# guard fails the pipeline. tools/genesis4-ceremony joins the list when F21's
-# re-pin lands; until then, and for the closed Genesis-3 crates, the full
-# suite runs in workspace-tests below.
+# crates and the shared protocol crates on their path, PLUS genesis4-ceremony
+# — the same eight crates .github/workflows/tests.yml gates, held to the same
+# posture by scripts/check-tests-blocking.py (tests-blocking-guard, check
+# stage): drop a crate from either side, remove the timeout, or add an escape
+# hatch and the guard fails the pipeline. The closed Genesis-3 crates still
+# run only in workspace-tests below.
 build-and-test:
   stage: test
   script:
     - cargo build --workspace --all-targets
-    - cargo test --locked -p bloch-pos-committee -p bloch-pos-node -p bloch-crypto -p coherence-core -p bloch-sis-pow -p bloch-pq-vault -p pqcrypto-internals
+    - cargo test --locked -p bloch-pos-committee -p bloch-pos-node -p bloch-crypto -p coherence-core -p bloch-sis-pow -p bloch-pq-vault -p pqcrypto-internals -p genesis4-ceremony
   # Memory-hard (Argon2) wallet tests + a testnet Module-SIS mining test;
   # measured 2026-09-05: ~51 min of test wall time alone in a debug build
   # (two ~23 min suites), before compile. 60m gated by luck.
   timeout: 120m
 
-# workspace-tests — the FULL suite: everything build-and-test gates PLUS
-# tools/genesis4-ceremony (red until finding F21's fixture re-pin lands) and
-# the closed Genesis-3 crates (bloch, bloch-euvm, bloch-ffg, bloch-btc-wallet).
-# allow_failure until it is proven green on the runner — the honest label for
-# a job whose red is already explained — and the tests-blocking guard refuses
-# this escape on build-and-test itself, so the gate cannot quietly become
-# this job. When F21 lands and this goes green, fold it back into blocking.
+# workspace-tests — the FULL suite: everything build-and-test gates (now
+# including genesis4-ceremony, see above) PLUS the closed Genesis-3 crates
+# (bloch, bloch-euvm, bloch-ffg, bloch-btc-wallet). allow_failure remains here
+# for those closed-chain crates, not because anything on the live-crate list
+# is expected to be red — the tests-blocking guard refuses this escape on
+# build-and-test itself, so the gate cannot quietly become this job.
 workspace-tests:
   stage: test
   script:
@@ -702,18 +798,14 @@ repro:
   allow_failure: true
   timeout: 120m
 
-# mainnet-guard (PLACEHOLDER — TODO, gated on Dev-A's `mainnet` feature landing).
-# Once Dev-A's `cargo test --features mainnet` guard is merged (the test that
-# refuses to build/run mainnet while security preconditions are unmet), enable
-# this job by removing the `when: never` rule and the guard below. Until then it
-# is inert so the pipeline neither runs nor fails on a feature that does not yet
-# exist.
-mainnet-guard:
-  stage: check
-  script:
-    # TODO(dev-a): replace with `cargo test --features mainnet --workspace` once
-    # the `mainnet` feature + guard test exist. Keeping it a no-op until then.
-    - 'echo "mainnet-guard: TODO — enable once Dev-A merges the mainnet feature guard"'
-  rules:
-    - when: never   # TODO: remove this rule when the mainnet feature exists
-  allow_failure: true
+# `mainnet-guard` REMOVED 2026-09-06 (finding INFO-1, Round 1). It was a
+# `when: never` placeholder ("TODO — enable once Dev-A merges the mainnet
+# feature guard") that could never run: no `mainnet` Cargo feature exists
+# anywhere in the workspace today (verified: no crate declares `mainnet =
+# [...]` under any `[features]` table). A job with that name sitting in the
+# pipeline listing read as coverage this repository does not have, on the
+# chain this file's own header says is "GENESIS-4, PROOF OF STAKE, live since
+# 2026-08-13" — exactly the kind of gap the finding warns reads as reassurance
+# rather than a gap. Deleting an inert placeholder is not lowering coverage;
+# re-add it, properly wired (no `when: never`), the day the `mainnet` feature
+# and its guard test actually land.

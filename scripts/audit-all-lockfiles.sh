@@ -39,6 +39,10 @@ LOCKFILES=(
   pool-proxy/Cargo.lock           # stratum proxy / mini-pool (network-facing)
   services/pq-shield-api/Cargo.lock
   euvm-tooling/Cargo.lock
+  crates/coherence-prover/script/Cargo.lock   # SP1 zkVM guest driver (N-3, Round 3:
+                                               # added by the P123-sp1-verifier fix
+                                               # wave and left off this list)
+  crates/coherence-prover/service/Cargo.lock  # SP1 prover HTTP service (same commit)
   fuzz/Cargo.lock
   spikes/prover-cost/Cargo.lock
   spikes/prover-cost/rv32/Cargo.lock  # SP1 guest workspaces (rv32*)
