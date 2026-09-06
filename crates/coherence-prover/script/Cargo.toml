@@ -5,5 +5,7 @@ edition = "2021"
 # Host prover/verifier — run with `cargo run --release` where SP1 is installed.
 
 [dependencies]
-sp1-sdk = "4"
+sp1-sdk = "=4.2.1"  # EXACT pin: prover + node verifier must agree on SP1_CIRCUIT_VERSION
 coherence-core = { path = "../../coherence-core" }
+bincode = "1"
+serde = { version = "=1.0.219", features = ["derive"] }  # =pin: serde >=1.0.221 removed serde::__private, breaking alloy-consensus 0.14 (sp1-sdk dep)

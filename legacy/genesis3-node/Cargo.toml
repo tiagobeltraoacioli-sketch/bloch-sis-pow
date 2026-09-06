@@ -95,11 +95,16 @@ sev-snp = ["dep:sev"]
 mobile  = ["dep:x509-parser", "dep:ciborium"]
 # Coherence P1: verify shielded-spend FRI proofs with SP1 (heavy sp1-sdk dep,
 # off by default). Enables ShieldedVerifier::Sp1 + BLOCH_SHIELDED_VERIFY=sp1.
+# KNOWN BUILD BLOCKER (upstream, 2026-09): sp1-sdk 4.2.1 -> alloy-consensus
+# 0.14.0 uses `serde::__private`, removed in serde >=1.0.221; the workspace
+# lock has serde 1.0.228, so this feature only builds with serde pinned to
+# 1.0.219 (see crates/coherence-prover/*/Cargo.toml for the working pin). The
+# feature-gated code itself compiles + its tests pass against sp1-sdk 4.2.1.
 sp1-verify = ["dep:sp1-sdk"]
 
 [dependencies]
 # Optional — only pulled with the `sp1-verify` feature (see [features]).
-sp1-sdk = { version = "4", optional = true }
+sp1-sdk = { version = "=4.2.1", optional = true }  # EXACT pin: must match crates/coherence-prover (SP1_CIRCUIT_VERSION)
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing = "0.1"
 blst = "0.3"

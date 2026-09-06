@@ -8,6 +8,19 @@
 #   docker push <registry>/bloch-sp1-prover:latest
 # then set `image:` below. (CPU-only fallback: build with --build-arg CUDA_FEATURE=""
 # and drop the `gpu:` block in the profile.)
+#
+# SECURITY (Round-2 audit P123 P-3) — /prove receives the FULL PRIVATE WITNESS:
+#   * The prover is NOT exposed to the internet. Only the `tls` sidecar (Caddy,
+#     automatic Let's Encrypt) can reach it; Caddy sets x-forwarded-proto: https,
+#     which the service REQUIRES (plaintext requests are rejected with 426).
+#   * No PROVER_AUTH_TOKEN placeholder ships in this file. The service REFUSES
+#     TO START without a real token (and rejects CHANGE_ME…/short values), so a
+#     deploy that forgets the token fails loudly instead of serving open.
+#     At deploy time, add under services.prover.env (Console lets you edit):
+#         - PROVER_AUTH_TOKEN=<output of: openssl rand -hex 32>
+#     and give the same token to the wallet/prover client.
+#   * Point DNS for PROVER_DOMAIN at the leased provider's ingress before
+#     deploying so Caddy can obtain its certificate.
 ---
 version: "2.0"
 
@@ -16,24 +29,49 @@ services:
     # ← replace with your pushed image (Docker Hub / ghcr.io / etc.)
     image: docker.io/YOUR_USER/bloch-sp1-prover:latest
     expose:
+      # Internal only: reachable from the TLS sidecar, never `global`.
       - port: 8080
-        as: 80
         to:
-          - global: true
-      # For HTTPS, front it with your own TLS/reverse-proxy, or expose 443 via a
-      # provider that terminates TLS. The service itself speaks plain HTTP on 8080.
+          - service: tls
     env:
       - RUST_LOG=info
       - PORT=8080
       - SP1_HOME=/data/.sp1
-      # Guards POST /prove. Generate one: `openssl rand -hex 32` and set it here
-      # (and in the wallet/prover client). Do NOT ship this file with a real token.
-      - PROVER_AUTH_TOKEN=CHANGE_ME_openssl_rand_hex_32
+      # PROVER_AUTH_TOKEN: set at deploy time (openssl rand -hex 32) — see the
+      # SECURITY note above. INTENTIONALLY absent here: the service fails closed
+      # (refuses to start) rather than run unauthenticated with a shipped value.
     params:
       storage:
         artifacts:
           mount: /data          # SP1 proving-key / circuit-artifact cache (GBs)
           readOnly: false
+
+  # TLS termination — Caddy with automatic ACME. The ONLY globally exposed
+  # service; forwards to the prover over the deployment-internal network and
+  # sets x-forwarded-proto: https (which the prover requires).
+  tls:
+    image: caddy:2.8-alpine
+    # ← replace prover.example.com with your domain (DNS → provider ingress).
+    command:
+      - caddy
+      - reverse-proxy
+      - --from
+      - https://prover.example.com
+      - --to
+      - http://prover:8080
+    expose:
+      - port: 443
+        as: 443
+        to:
+          - global: true
+        accept:
+          - prover.example.com
+      - port: 80              # ACME HTTP-01 challenge + https redirect only
+        as: 80
+        to:
+          - global: true
+        accept:
+          - prover.example.com
 
 profiles:
   compute:
@@ -60,6 +98,14 @@ profiles:
                 - model: a100
                 - model: h100
                 - model: rtx4090
+    tls:
+      resources:
+        cpu:
+          units: 1
+        memory:
+          size: 512Mi
+        storage:
+          - size: 1Gi
   placement:
     akash:
       # Optional: restrict to audited providers.
@@ -69,9 +115,16 @@ profiles:
         prover:
           denom: uakt
           amount: 100000        # max uAKT/block bid you'll accept; raise if no bids
+        tls:
+          denom: uakt
+          amount: 1000
 
 deployment:
   prover:
     akash:
       profile: prover
+      count: 1
+  tls:
+    akash:
+      profile: tls
       count: 1

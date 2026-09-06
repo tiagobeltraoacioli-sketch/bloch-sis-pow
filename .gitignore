@@ -66,3 +66,6 @@ __pycache__/
 # duas outras — apagar a branch de origem nao as remove. Aquelas duas so podem
 # ser cherry-picked, nunca mescladas.
 bench/
+
+# SP1 guest build artifact (cargo prove build) — bake the vkey, not the ELF
+crates/coherence-prover/program/elf/
