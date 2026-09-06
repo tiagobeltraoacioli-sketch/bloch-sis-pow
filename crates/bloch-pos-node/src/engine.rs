@@ -2679,8 +2679,26 @@ impl Engine {
             if out.len() >= MAX_TXS_PER_BLOCK {
                 break;
             }
-            let n = encoded.len() as u64;
-            if bytes + n > cap {
+            // Budget by what CONSENSUS will count, not by wire length (audit
+            // H-R7-2, 2026-09-05). The transition's byte cap (step 10b) sums
+            // each transfer's DECLARED `tx_bytes` — `charge.tx_bytes`, never
+            // `encoded.len()` — so packing by wire length let one small
+            // transfer declaring a block's worth of bytes make every
+            // selection carrying it over-cap. The probe loop then popped and
+            // barred the innocent tail one transaction at a time
+            // (`REJECTION_TTL_SLOTS` each): a censorship machine costing the
+            // attacker one fee. The `max` keeps the wire length as the floor
+            // — consensus refuses under-declaration (`UnderdeclaredSize`),
+            // and a non-transfer charges zero declared bytes, so the floor
+            // only ever over-budgets, and an over-budgeted block is merely
+            // smaller, never invalid.
+            let declared = match tx {
+                PosTransaction::Transfer { tx_bytes, .. }
+                | PosTransaction::TransferV2 { tx_bytes, .. } => *tx_bytes,
+                _ => 0,
+            };
+            let n = (encoded.len() as u64).max(declared);
+            if bytes.saturating_add(n) > cap {
                 break;
             }
             bytes += n;
@@ -4697,6 +4715,37 @@ fn price_bounds(
     Ok(())
 }
 
+/// The mempool's mirror of the declared-size ceiling (audit H-R7-2): a
+/// transfer whose declared `tx_bytes` exceeds its own canonical encoding by
+/// more than `fee_market::TX_BYTES_DECLARE_SLACK` is refused at the door.
+///
+/// Node-local POLICY, live today — unlike the consensus half
+/// (`TransferReject::OverdeclaredSize`), which ships gated behind the inert
+/// `params::TX_BYTES_BOUND_ACTIVATION_EPOCH` because it tightens transfer
+/// validity. The two are not redundant, per the `admissible` deposit lesson
+/// above: this door stops the transaction propagating and being SELECTED —
+/// the declared size is what the block byte cap counts, so an unbounded
+/// declaration is a whole block's byte budget consumed by one small, cheap
+/// transaction, and (before `select_transactions` learned to budget by
+/// declared size) an hour of innocent transactions barred by the probe-drop
+/// loop — while the consensus rule is what will stop a patched producer
+/// lifting it for the whole network once armed.
+///
+/// The encode costs one linear pass over bytes the caller already holds,
+/// placed with the free structural checks and long before the hybrid
+/// signature verifications.
+fn declared_size_bound(tx: &PosTransaction, declared: u64) -> Result<(), &'static str> {
+    let encoded = tx.canonical_bytes().len() as u64;
+    if declared > encoded.saturating_add(fee_market::TX_BYTES_DECLARE_SLACK) {
+        return Err(
+            "transfer declares far more bytes than its encoding carries — the declared \
+             size is what the block byte cap counts, so this would crowd honest \
+             transactions out of blocks without carrying anything",
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'static str> {
     match tx {
         // Staking messages are refused outright until bonding is funded from
@@ -4792,6 +4841,7 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
                 *tx_bytes,
                 *tip_millisat_per_gas,
             )?;
+            declared_size_bound(tx, *tx_bytes)?;
             // THE SIGNATURE IS CHECKED HERE, BEFORE THE MEMPOOL, AND THIS IS WHY.
             //
             // The producer prices its own block with `ProbeVerifier`, whose
@@ -4916,6 +4966,7 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
                 *tx_bytes,
                 *tip_millisat_per_gas,
             )?;
+            declared_size_bound(tx, *tx_bytes)?;
             // Stateless mirror of the table disciplines consensus enforces
             // and has mutation-proven (transition.rs:2043–2094 —
             // DuplicateWitnessKey, BadKeyIndex, WitnessKeyUnused). The one
@@ -5780,13 +5831,24 @@ mod admission_authorisation {
             admissible(&priced(0, 0), 0).is_ok(),
             "a normally priced transfer must still reach the mempool"
         );
+        // ...including at the LARGEST declaration the door now allows. This
+        // control used to declare `MAX_BLOCK_TX_BYTES_V2` over a few hundred
+        // wire bytes — which is the exact H-R7-2 censorship shape
+        // (`declared_size_bound` refuses it since 2026-09-05): a declaration
+        // the block byte cap counts but no encoding backs. A genuinely
+        // block-sized transfer is one whose BYTES are block-sized, not one
+        // that merely says so; the honest ceiling for THIS transfer is its
+        // own encoding plus the declared-size slack. Probed 1,024 bytes
+        // inside it because Falcon-1024 signatures are variable-length, so
+        // each `priced` call's encoding can differ by a few bytes.
+        let encoded = priced(0, 0).canonical_bytes().len() as u64;
         assert!(
             admissible(
-                &priced(bloch_pos_committee::fee_market::MAX_BLOCK_TX_BYTES_V2, 1_000),
+                &priced(encoded + fee_market::TX_BYTES_DECLARE_SLACK - 1_024, 1_000),
                 0
             )
             .is_ok(),
-            "a block-sized, normally tipped transfer must still reach the mempool"
+            "a fully-backed, normally tipped declaration must still reach the mempool"
         );
     }
 
@@ -6380,6 +6442,13 @@ mod transfer_v2_end_to_end {
     /// signature — the whole economy of the format. Returns the entries so
     /// the engine's genesis can hold the very outputs being swept.
     fn sweep_fixture(n: u32) -> (Vec<EutxoEntry>, PosTransaction) {
+        sweep_fixture_declaring(n, 0)
+    }
+
+    /// [`sweep_fixture`] with the declared `tx_bytes` as a knob — the
+    /// declared size sits inside the signing root, so it has to be fixed
+    /// BEFORE the hybrid signature is produced, exactly as a wallet does it.
+    fn sweep_fixture_declaring(n: u32, declared: u64) -> (Vec<EutxoEntry>, PosTransaction) {
         let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[42u8; 32])
             .expect("hybrid keypair from a fixed seed");
         let script_hash: [u8; 32] = Sha3_256::digest(&pk).into();
@@ -6409,10 +6478,11 @@ mod transfer_v2_end_to_end {
                 value: 1_000,
                 script_hash,
             }],
-            // Admission is stateless and deliberately does not police the
-            // declared size — that is consensus's UnderdeclaredSize
-            // (transition.rs:2037), exercised by the transition suite.
-            tx_bytes: 0,
+            // Admission polices only the declared size's CEILING
+            // (`declared_size_bound`, audit H-R7-2); the floor is
+            // consensus's UnderdeclaredSize, exercised by the transition
+            // suite.
+            tx_bytes: declared,
             tip_millisat_per_gas: 0,
         };
         let root = tx.spend_signing_root();
@@ -6480,6 +6550,128 @@ mod transfer_v2_end_to_end {
         );
         let selected_rpc = rpc_node.select_transactions(epoch_of(rpc_node.wall_slot()));
         assert_eq!(selected_rpc, vec![tx]);
+    }
+
+    /// **H-R7-2, the mempool door**: a validly-signed transfer declaring far
+    /// more bytes than its encoding carries is refused by `admissible` — the
+    /// declared size is what the block byte cap counts, so admitting it hands
+    /// the sender a block's worth of byte budget for a few real KB.
+    ///
+    /// The signature is REAL (the fixture signs over the inflated
+    /// declaration), which is what makes this a mutation test: remove
+    /// `declared_size_bound` from the arm and the transaction sails through
+    /// every remaining check to `Ok(())`, and the first assertion goes red
+    /// (verified 2026-09-05). The second assertion is the door's other edge:
+    /// an honest wallet declaring inside the slack must still get in.
+    #[test]
+    fn admission_refuses_a_declaration_no_encoding_backs() {
+        // Measure a reference encoding first: the declared size is a
+        // fixed-width field, so the length does not depend on the value
+        // declared — but each fixture build signs afresh and Falcon-1024
+        // signatures are VARIABLE-length, so two builds can differ by a few
+        // bytes. The probes below therefore sit 1,024 bytes clear of the
+        // exact boundary on each side, far past that variance; the
+        // byte-exact edge is pinned by the transition suite
+        // (`a_transfer_cannot_declare_a_blocks_worth_of_bytes_it_does_not_carry`),
+        // whose toy signatures have fixed length.
+        let (_e0, probe) = sweep_fixture_declaring(4, 0);
+        let encoded = probe.canonical_bytes().len() as u64;
+        let slack = fee_market::TX_BYTES_DECLARE_SLACK;
+
+        let (_e1, over) = sweep_fixture_declaring(4, encoded + slack + 1_024);
+        assert!(
+            admissible(&over, V2_FLAG_DAY + 1).is_err(),
+            "a transfer declaring ~{} bytes over its own encoding must be refused \
+             at the mempool door",
+            slack + 1_024,
+        );
+
+        let (_e2, within) = sweep_fixture_declaring(4, encoded + slack - 1_024);
+        assert_eq!(
+            admissible(&within, V2_FLAG_DAY + 1),
+            Ok(()),
+            "a declaration inside the slack must still be admitted — the slack \
+             exists for wallets that fix tx_bytes before their Falcon signatures \
+             exist",
+        );
+    }
+
+    /// **H-R7-2, the proposer**: `select_transactions` must budget by the
+    /// size CONSENSUS will count — each transfer's declared `tx_bytes` — not
+    /// by wire length. Packing by wire length selected one tiny transfer
+    /// declaring the whole byte cap PLUS the honest mempool behind it; the
+    /// transition then refused the block (`BlockByteLimitExceeded`, a
+    /// no-index error), and the probe loop popped and barred the innocent
+    /// tail one transaction at a time for `REJECTION_TTL_SLOTS` each — the
+    /// hour of censorship the audit measured at one ~85 k-sat fee.
+    ///
+    /// Mutation: restore `let n = encoded.len() as u64;` in
+    /// `select_transactions` and the weight assertion below goes red
+    /// (verified 2026-09-05).
+    #[test]
+    fn selection_budgets_by_declared_bytes_not_wire_bytes() {
+        let epoch = V2_FLAG_DAY + 1; // V2-era byte cap, the live one
+        let cap = fee_market::max_block_tx_bytes(epoch);
+        let mut node = engine_at_wall_epoch(epoch, &[]);
+
+        // The attacker: a few hundred wire bytes declaring the ENTIRE cap —
+        // legal today (it clears MAX_TX_GAS by the fee-market const assert)
+        // and fully paid for. Inserted straight into the mempool: the door
+        // now refuses this shape, but a proposer must not depend on every
+        // peer's mempool having been right (the slot-69 lesson).
+        let attacker = PosTransaction::Transfer {
+            inputs: vec![bloch_pos_committee::transition::TransferInput {
+                txid: [0xAAu8; 32],
+                vout: 0,
+                pubkey: vec![1, 2, 3],
+                signature: vec![4, 5, 6],
+            }],
+            outputs: vec![TransferOutput { value: 1, script_hash: [0xBBu8; 32] }],
+            tx_bytes: cap,
+            tip_millisat_per_gas: 0,
+        };
+        // Ten honest transfers, declaring no more than they carry.
+        let mut txs = vec![attacker];
+        for i in 0..10u8 {
+            txs.push(PosTransaction::Transfer {
+                inputs: vec![bloch_pos_committee::transition::TransferInput {
+                    txid: [i; 32],
+                    vout: 0,
+                    pubkey: vec![7],
+                    signature: vec![8],
+                }],
+                outputs: vec![TransferOutput { value: 1, script_hash: [i; 32] }],
+                tx_bytes: 0,
+                tip_millisat_per_gas: 0,
+            });
+        }
+        for tx in &txs {
+            node.mempool.insert(tx.canonical_bytes(), tx.clone());
+        }
+        assert_eq!(node.mempool.len(), 11, "fixture: all eleven must be distinct");
+
+        let selected = node.select_transactions(epoch);
+        assert!(!selected.is_empty(), "an empty selection would prove nothing");
+        // The property the transition enforces at step 10b: the sum of the
+        // sizes consensus counts must fit the cap. `max` mirrors the packer:
+        // declared for transfers, and never less than the wire bytes.
+        let consensus_weight: u64 = selected
+            .iter()
+            .map(|tx| {
+                let declared = match tx {
+                    PosTransaction::Transfer { tx_bytes, .. }
+                    | PosTransaction::TransferV2 { tx_bytes, .. } => *tx_bytes,
+                    _ => 0,
+                };
+                (tx.canonical_bytes().len() as u64).max(declared)
+            })
+            .sum();
+        assert!(
+            consensus_weight <= cap,
+            "the proposer packed {consensus_weight} consensus-counted bytes into a \
+             {cap}-byte cap — that block is BlockByteLimitExceeded on every node, \
+             and the probe loop turns it into an hour of censorship",
+        );
     }
 
     /// **A varredura esta LIGADA no caminho de aplicacao.**

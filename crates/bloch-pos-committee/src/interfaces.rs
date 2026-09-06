@@ -475,6 +475,17 @@ pub enum TransferReject {
     /// the cap advisory. Declaring more than you use is allowed — you simply
     /// pay for it.
     UnderdeclaredSize,
+    /// `tx_bytes` exceeds the transaction's own canonical encoding by more
+    /// than [`crate::fee_market::TX_BYTES_DECLARE_SLACK`], at or above
+    /// [`crate::params::TX_BYTES_BOUND_ACTIVATION_EPOCH`] (audit H-R7-2).
+    ///
+    /// The mirror of `UnderdeclaredSize`, closing the other direction: the
+    /// declared size is also what the block byte cap counts, so with no
+    /// ceiling one small, fully-paid transfer could declare a whole block's
+    /// worth of bytes and crowd every honest transaction out of the block
+    /// while carrying almost nothing. Inert until the flag day — before it,
+    /// over-declaring stays legal and merely over-pays.
+    OverdeclaredSize,
     /// `tip_millisat_per_gas` is above
     /// [`crate::fee_market::MAX_TIP_MILLISAT_PER_GAS`].
     ///

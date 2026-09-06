@@ -14,8 +14,9 @@
 //! `LEAK_RECOVERY_ACTIVATION_EPOCH` is armed at 2700 (2026-09-06);
 //! `ANCESTRY_SEED_ACTIVATION_EPOCH`, `DEPOSIT_ACTIVATION_EPOCH`,
 //! `EXIT_AUTH_ACTIVATION_EPOCH`, `FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH`,
-//! `SLASHING_EVIDENCE_ACTIVATION_EPOCH`, `DUST_RULE_ACTIVATION_EPOCH` and
-//! `RANDAO_RECOMMIT_ACTIVATION_EPOCH` are the ones still at `u64::MAX`.
+//! `SLASHING_EVIDENCE_ACTIVATION_EPOCH`, `DUST_RULE_ACTIVATION_EPOCH`,
+//! `RANDAO_RECOMMIT_ACTIVATION_EPOCH` and `TX_BYTES_BOUND_ACTIVATION_EPOCH`
+//! are the ones still at `u64::MAX`.
 //!
 //! Until 2026-09-02 this header said nothing here was active and that the
 //! crate held no activation height at all because it was not wired into the
@@ -751,6 +752,37 @@ pub mod rehearsal {
         Restore(prev)
     }
 
+    thread_local! {
+        static TX_BYTES_BOUND_OPEN_TL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Test-only: treat [`super::TX_BYTES_BOUND_ACTIVATION_EPOCH`] as already
+    /// bound.
+    ///
+    /// Its own switch for the `BONDING_GATE_OPEN` reason: the gate's inert
+    /// value keeps the OLD permissive rule (over-declaring `tx_bytes` is
+    /// legal), so folding it into `GATES_OPEN` would silently tighten transfer
+    /// validity inside every test that only wanted the post-ancestry-seed
+    /// roster. Default CLOSED: an unadorned `cargo test` runs the fleet's
+    /// rules; tests of the declared-size ceiling opt in.
+    pub fn tx_bytes_bound_forced_open() -> bool {
+        TX_BYTES_BOUND_OPEN_TL.with(|c| c.get())
+    }
+
+    /// Opens the declared-size-ceiling gate for this thread until the guard
+    /// drops, including on unwind, so a failing assertion cannot leave
+    /// transfer validity tightened for the rest of the thread.
+    pub fn tx_bytes_bound_open_guard() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                TX_BYTES_BOUND_OPEN_TL.with(|c| c.set(self.0));
+            }
+        }
+        let prev = TX_BYTES_BOUND_OPEN_TL.with(|c| c.replace(true));
+        Restore(prev)
+    }
+
     /// Test-only: treat [`super::ANCESTRY_SEED_ACTIVATION_EPOCH`] and
     /// [`super::LEAK_RECOVERY_ACTIVATION_EPOCH`] as if they had already bound.
     ///
@@ -1301,6 +1333,42 @@ pub const MAX_TRANSFER_OUTPUTS: usize = 256;
 ///
 /// `randao_recommit_gate_is_inert` pins the value.
 pub const RANDAO_RECOMMIT_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Flag day for the **declared-size ceiling** on transfers (audit H-R7-2,
+/// 2026-09-05): at and above this epoch, a `Transfer`/`TransferV2` whose
+/// declared `tx_bytes` exceeds its own canonical encoding by more than
+/// [`crate::fee_market::TX_BYTES_DECLARE_SLACK`] is consensus-invalid
+/// (`TransferReject::OverdeclaredSize`). Below it, every block is judged
+/// byte for byte as today: declaring more than you carry stays legal, you
+/// simply pay for it.
+///
+/// # The defect this closes
+///
+/// `tx_bytes` is a number the sender writes, bounded below by the encoding
+/// (`UnderdeclaredSize`) and above only by `MAX_TX_GAS` — which a full
+/// block's worth of bytes clears by construction. The block byte cap
+/// (step 10b) sums the DECLARED sizes, while the proposer used to pack by
+/// WIRE length, so one small, fully-paid transfer declaring
+/// `MAX_BLOCK_TX_BYTES_V2` made every selection carrying it over-cap: the
+/// probe loop then popped and BARRED the innocent tail one transaction at a
+/// time (`REJECTION_TTL_SLOTS` each) — up to a block's worth of honest
+/// transactions censored per slot, for about an hour, per ~85 k-sat
+/// transaction. The node side (packing by declared size, refusing gross
+/// over-declaration at the mempool door) shipped live because it is policy;
+/// THIS gate is the consensus half that stops an adversarial *proposer* from
+/// building such a block on purpose.
+///
+/// The gate reads `CommittedState::epoch` — committed state rolled to the
+/// judged block's own `epoch_of(header.slot)`, never a clock. The 2026-08-08
+/// `expected_bits` fork is the standing reason.
+///
+/// # ARMING THIS IS A FOUNDER DECISION
+///
+/// It is a flag day: the first post-gate block changes the verdict on a
+/// transaction shape the old rules accept, so the whole fleet must run a
+/// binary carrying this rule before any epoch is named. Ships INERT at
+/// `u64::MAX`; `tx_bytes_bound_gate_is_inert` pins the value.
+pub const TX_BYTES_BOUND_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.
