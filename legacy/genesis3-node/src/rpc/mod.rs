@@ -36,8 +36,16 @@ const RPC_MAX_CONCURRENCY: usize = 256;
 /// Per-request wall-clock timeout (returns 408). Kills slow-loris / stuck
 /// handlers so they can't hold a concurrency slot forever.
 const RPC_REQUEST_TIMEOUT_SECS: u64 = 30;
+/// L-9 (audit): the dispatch-level timeout `handle_rpc` races its
+/// `spawn_blocking` `JoinHandle` against, strictly SHORTER than
+/// `RPC_REQUEST_TIMEOUT_SECS` so this one fires first and gets the chance to
+/// `abort()` the handle — the outer `TimeoutLayer` only ever dropped the
+/// response future, which never cancelled the underlying blocking task. See
+/// the long comment at the `tokio::select!` call site for what `.abort()`
+/// can and cannot stop.
+const DISPATCH_INNER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(RPC_REQUEST_TIMEOUT_SECS - 5);
 use serde_json::{json, Value};
-use crate::storage::Storage;
+use crate::storage::{Storage, StorageError};
 use crate::mempool::Mempool;
 use crate::consensus::GhostDAG;
 use crate::core::{Transaction, PROTOCOL_VERSION, MAINNET_PREFIX, TESTNET_PREFIX};
@@ -148,6 +156,17 @@ struct AppState {
     // Sprint M additions:
     api_key:                 Option<String>,
     require_auth_for_writes: bool,
+    // M-1 (audit): `--rpc-require-auth-for-reads` mode. This is a
+    // `RpcConfig`/CLI-flag-shaped concern, but the flag parser lives in
+    // `main.rs`, which is outside this change's ownership — read directly
+    // from the environment instead (see `start_rpc_server` below), matching
+    // the same env-var-not-main.rs-touching pattern used for M-6 in
+    // `network/mod.rs`. `BLOCH_RPC_REQUIRE_AUTH_FOR_READS=1` (or `true`)
+    // turns it on; unset/anything else leaves the historical
+    // "reads are public" default untouched. A future change should promote
+    // this to a proper `RpcConfig` field + `--rpc-require-auth-for-reads`
+    // CLI flag wired in `main.rs`, mirroring `require_auth_for_writes`.
+    require_auth_for_reads:  bool,
     rate_limiter:            Arc<auth::RateLimiterSet>,
     trust_private_ranges:    bool,
     // R3-audit H-R3-5: browser gate + loopback-auth policy + heavy-read bound.
@@ -159,22 +178,33 @@ struct AppState {
     submit_block:            Option<Arc<SubmitBlockFn>>,
 }
 
-// ─── R3-audit H-R3-5: bound the unauthenticated heavy read RPCs ─────────────
+// ─── R3-audit H-R3-5 / L-8: bound the expensive analytics + template RPCs ───
 //
-// These five methods do O(chain) work per call — `supply_distribution` and
-// `chain_stats` iterate EVERY block (twice, for the former), and the
-// per-address history walks grow with the chain — on a port with no auth and,
-// for loopback/private callers, no rate limit, so a request loop stacks
-// O(chain) scans without bound. The bound is structural: results are served
-// from a short TTL cache, and at most ONE cache-missing scan runs at a time —
-// a second concurrent caller gets an immediate "busy" error instead of
-// stacking another O(chain) walk.
+// These methods do expensive per-call work — `supply_distribution` and
+// `chain_stats` iterate EVERY block (twice, for the former), the per-address
+// history walks grow with the chain, and `getblocktemplate` (L-8) reads the
+// DAG twice, walks parent ancestry to derive `bits`, and drains + serialises
+// up to 2000 mempool transactions — on a port that, for the analytics
+// methods, has no auth and, for loopback/private callers, no rate limit
+// either, so a request loop stacks that cost without bound. The bound is
+// structural: results are served from a short TTL cache, and at most ONE
+// cache-missing computation runs at a time — a second concurrent caller gets
+// an immediate "busy" error instead of stacking another full computation.
 const HEAVY_READ_METHODS: &[&str] = &[
     "getsupplydistribution",
     "getchainstats",
     "gethashrate",
     "getaddresscount",
     "getaddressbalance_at_height",
+    // L-8 (audit): "expensive, stateful, unauthenticated: getblocktemplate
+    // and createauxblock". `createauxblock` was already privileged
+    // (`WRITE_METHODS`, closed by H-R3-5/H-2) and already has its own
+    // bounded cache (`aux_candidates`, capped at `AUX_CANDIDATE_CAP`).
+    // `getblocktemplate` had neither: it is now ALSO privileged (see
+    // `auth::WRITE_METHODS`) and now shares the same short-TTL/single-flight
+    // discipline as the analytics methods above, closing the "poll it in a
+    // loop and force a fresh mempool drain + ancestry walk every time" cost.
+    "getblocktemplate",
 ];
 
 /// TTL for cached heavy-read results. Analytics freshness of ~1 block is fine.
@@ -282,10 +312,45 @@ pub async fn start_rpc_server(
 ) {
     let addr = format!("{}:{}", config.bind_address, config.port);
 
+    // L-6 (audit): validate the configured key BEFORE it is ever compared
+    // against anything, regardless of how the caller sourced it
+    // (`--rpc-api-key` directly, or `--rpc-api-key-file` read by main.rs).
+    // Nothing previously prevented `--rpc-api-key x` (a one-character
+    // "secret" the constant-time comparison then faithfully protects) or a
+    // key containing control characters (a header-injection primitive
+    // wherever it is later interpolated into raw text — see `bin/bloch-cli.rs`'s
+    // M-11 fix). Refuse to start the RPC service on an invalid key rather
+    // than silently running with one that provides no real protection, or
+    // silently treating it as "no key" (which would DISABLE auth instead).
+    if let Some(k) = &config.api_key {
+        if let Err(reason) = auth::validate_api_key(k) {
+            error!("RPC: configured API key is invalid ({}); refusing to start the RPC service. \
+                    Fix --rpc-api-key / --rpc-api-key-file and restart.", reason);
+            return;
+        }
+    }
+
     let rate_limiter = Arc::new(auth::RateLimiterSet::new(
         config.rate_limit_reads_per_min,
         config.rate_limit_writes_per_min,
     ));
+
+    // M-1: see the field doc on `AppState::require_auth_for_reads`.
+    let require_auth_for_reads = std::env::var("BLOCH_RPC_REQUIRE_AUTH_FOR_READS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if require_auth_for_reads && config.api_key.is_none() {
+        // Fail-safe, loudly: the auth layer itself refuses every
+        // non-trusted read in this configuration (see
+        // `auth::authorize_with_read_policy`'s fail-safe doc), but an
+        // operator who set the flag almost certainly meant to configure a
+        // key too — say so instead of silently locking the RPC surface.
+        log::warn!(
+            "BLOCH_RPC_REQUIRE_AUTH_FOR_READS is set but no --rpc-api-key is \
+             configured: every non-trusted read will be refused (fail-safe, \
+             not a bug) until a key is configured"
+        );
+    }
 
     let app_state = AppState {
         node_state: state,
@@ -295,6 +360,7 @@ pub async fn start_rpc_server(
         outbound_tx,
         api_key:                 config.api_key.clone(),
         require_auth_for_writes: config.require_auth_for_writes,
+        require_auth_for_reads,
         rate_limiter,
         trust_private_ranges:    config.trust_private_ranges,
         allowed_origins:         Arc::new(config.allowed_origins.clone()),
@@ -341,6 +407,58 @@ pub async fn start_rpc_server(
     }
 }
 
+/// L-5 (audit): storage errors used to be returned to RPC callers verbatim
+/// (`json!({ "error": e.to_string() })`) at every one of this file's ~13
+/// `state.store.*` call sites. `StorageError::ReadFailed` / `OpenFailed` /
+/// `WriteFailed` wrap the underlying RocksDB error message
+/// (`storage/mod.rs`'s `From<rocksdb::Error>` / explicit `.map_err`s), which
+/// can include filesystem paths and column-family/engine internals — none of
+/// which an unauthenticated caller (see M-1: reads are public by default) has
+/// any business receiving. INVARIANT (L-5): the detail is logged
+/// server-side, at a level an operator will see; the caller gets a stable,
+/// content-free error code and message, identical across every storage
+/// failure mode so nothing about the underlying condition leaks through
+/// message shape either.
+/// L-10 (audit): max bytes an echoed JSON-RPC `id` string may occupy in the
+/// response. JSON-RPC 2.0 ids are meant to be short correlation tokens, not
+/// payload; nothing legitimate needs anywhere near this much.
+const MAX_ECHOED_ID_LEN: usize = 256;
+
+/// L-10: normalize the request's `id` to a shape and size safe to echo back
+/// unconditionally. A string is truncated (UTF-8-safely — see
+/// `network::truncate_utf8`) rather than rejected outright, so a client
+/// using a slightly-too-long-but-otherwise-legitimate correlation id still
+/// gets a response, just a truncated echo of what it sent (a client cannot
+/// reasonably rely on more than JSON-RPC 2.0 itself promises, which is
+/// "echo the id", not "echo it losslessly at any length"). A `bool`,
+/// `array`, or `object` id is not spec-compliant at all and is replaced with
+/// `null` rather than echoed.
+/// L-11 (audit): the JSON-RPC 2.0 error body for an unsupported batch
+/// (top-level JSON array) request. Extracted so the exact code/shape is
+/// unit-testable without constructing axum extractors.
+fn batch_not_supported_response() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id":      Value::Null,
+        "error":   { "code": -32600, "message": "Invalid Request: batch requests are not supported" },
+    })
+}
+
+fn cap_echoed_id(id: Value) -> Value {
+    match id {
+        Value::String(s) => {
+            Value::String(crate::network::truncate_utf8(&s, MAX_ECHOED_ID_LEN).to_string())
+        }
+        v @ (Value::Number(_) | Value::Null) => v,
+        _ => Value::Null,
+    }
+}
+
+fn storage_err_response(e: &StorageError) -> Value {
+    log::warn!("rpc: storage error (detail withheld from caller): {}", e);
+    json!({ "error": "internal storage error", "code": "STORAGE_ERROR" })
+}
+
 /// Height of the selected tip — the number a confirmation count is relative to.
 ///
 /// # Why this exists as a function
@@ -373,8 +491,27 @@ async fn handle_rpc(
     headers: axum::http::HeaderMap,
     Json(req):    Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    // L-11 (audit): a top-level JSON ARRAY (a JSON-RPC 2.0 batch request,
+    // which this server does not implement) used to fall through silently:
+    // `req["method"]` on a `Value::Array` indexes to `Null` (the `&str`
+    // `Index` impl only matches objects), so `method` became the empty
+    // string and dispatch's catch-all returned `"unknown method: "` with
+    // HTTP 200 — a standards-conformant client sees a "success" response
+    // that is actually nonsensical. Detect the shape explicitly and answer
+    // with the JSON-RPC 2.0 code for it.
+    if req.is_array() {
+        crate::metrics::inc_rpc_request("batch", "invalid_request");
+        log::info!("rpc denied ip={} reason=batch_request_unsupported", addr.ip());
+        return (StatusCode::BAD_REQUEST, Json(batch_not_supported_response()));
+    }
+
     let method = req["method"].as_str().unwrap_or("");
-    let id     = req.get("id").cloned().unwrap_or(json!(null));
+    // L-10 (audit): the `id` used to be echoed back completely unbounded —
+    // a ~1 MiB `id` string in the request produced a ~1 MiB response, at
+    // zero cost to the attacker and real memory pressure for the node.
+    // JSON-RPC 2.0 itself expects `id` to be a string, number, or null;
+    // `cap_echoed_id` enforces exactly that shape and bounds the string case.
+    let id     = cap_echoed_id(req.get("id").cloned().unwrap_or(json!(null)));
     let params = req.get("params");
 
     let client_ip = addr.ip();
@@ -405,12 +542,13 @@ async fn handle_rpc(
         );
     }
 
-    let decision = auth::authorize_with_policy(
+    let decision = auth::authorize_with_read_policy(
         client_ip,
         method,
         presented_key,
         state.api_key.as_deref(),
         state.require_auth_for_writes,
+        state.require_auth_for_reads,
         state.trust_private_ranges,
         state.trust_loopback,
         &state.rate_limiter,
@@ -448,7 +586,7 @@ async fn handle_rpc(
             let d_method = method.to_string();
             let d_params = params.cloned();
             let d_handle = tokio::runtime::Handle::current();
-            let result = tokio::task::spawn_blocking(move || {
+            let join_handle = tokio::task::spawn_blocking(move || {
                 // R3-audit H-R3-5: heavy O(chain) analytics reads go through
                 // the HeavyGate — TTL cache + at most one scan in flight.
                 if HeavyGate::is_heavy(&d_method) {
@@ -463,18 +601,61 @@ async fn handle_rpc(
                 } else {
                     d_handle.block_on(dispatch(&d_method, d_params.as_ref(), &d_state))
                 }
-            })
-                .instrument(tracing::info_span!(
+            });
+            // L-9 (audit): the outer `TimeoutLayer` (tower-http) previously
+            // was the ONLY thing standing between a stuck dispatch and a
+            // permanently-occupied blocking-pool slot — and it drops the
+            // RESPONSE future, which drops the `JoinHandle` value inline
+            // above without ever calling `.abort()`. Dropping a
+            // `tokio::task::JoinHandle` does NOT cancel the task it points
+            // to: for `spawn_blocking`, the closure keeps running on its
+            // blocking thread to completion regardless, so a timed-out
+            // `getsupplydistribution` (H-6) kept loading the chain while a
+            // fresh request was admitted in its place — the exact
+            // "watchdog is papering over an unbounded background cost"
+            // shape this file's own comments elsewhere warn about.
+            //
+            // Fix: race the dispatch against an INNER timeout, strictly
+            // shorter than the outer `RPC_REQUEST_TIMEOUT_SECS`, so this
+            // arm — not the outer layer's unconditional drop — is what
+            // decides the outcome and can act on it. `abort_handle()` is
+            // taken before the handle is consumed by `.instrument()` below,
+            // so it stays independently usable to cancel from the other
+            // `select!` arm.
+            //
+            // HONESTY: `.abort()` on an ALREADY-RUNNING blocking closure
+            // cannot preempt it mid-execution (the OS thread runs the
+            // closure to completion regardless — this is a `spawn_blocking`
+            // limitation, not a bug in this fix); the queued case is where
+            // this has full effect: a task that has not yet started
+            // executing on the blocking pool is guaranteed to never run at
+            // all once aborted. Either way, THIS request's response path
+            // returns immediately at the inner deadline instead of holding
+            // the connection until the outer layer's drop.
+            let abort_handle = join_handle.abort_handle();
+            let result = tokio::select! {
+                r = join_handle.instrument(tracing::info_span!(
                     "rpc_request",
                     method,
                     client_ip = %client_ip,
                     id = %id,
-                ))
-                .await
-                .unwrap_or_else(|e| {
-                    log::error!("rpc dispatch task failed: {}", e);
-                    json!({ "error": "internal dispatch failure" })
-                });
+                )) => {
+                    r.unwrap_or_else(|e| {
+                        log::error!("rpc dispatch task failed: {}", e);
+                        json!({ "error": "internal dispatch failure" })
+                    })
+                }
+                _ = tokio::time::sleep(DISPATCH_INNER_TIMEOUT) => {
+                    abort_handle.abort();
+                    log::warn!(
+                        "rpc dispatch timed out for method={} ip={} after {:?}; aborted \
+                         (queued work is cancelled; already-running work finishes in the \
+                         background but this response does not wait for it)",
+                        method, client_ip, DISPATCH_INNER_TIMEOUT
+                    );
+                    json!({ "error": "internal dispatch timeout" })
+                }
+            };
             let elapsed = start.elapsed();
             let elapsed_ms = elapsed.as_millis();
             crate::metrics::observe_rpc_latency(method, elapsed.as_secs_f64());
@@ -548,7 +729,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             match state.store.get_block_hash_at_height(height) {
                 Ok(Some(h)) => json!(hex::encode(h)),
                 Ok(None)    => json!({ "error": "height not found" }),
-                Err(e)      => json!({ "error": e.to_string() }),
+                Err(e)      => storage_err_response(&e),
             }
         }
 
@@ -583,7 +764,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                         result
                     },
                     Ok(None)  => json!({ "error": "not found" }),
-                    Err(e)    => json!({ "error": e.to_string() }),
+                    Err(e)    => storage_err_response(&e),
                 },
                 None => json!({ "error": "invalid hash" }),
             }
@@ -620,10 +801,10 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                         result
                     },
                     Ok(None)  => json!({ "error": "block data not found" }),
-                    Err(e)    => json!({ "error": e.to_string() }),
+                    Err(e)    => storage_err_response(&e),
                 },
                 Ok(None) => json!({ "error": "height not found" }),
-                Err(e)   => json!({ "error": e.to_string() }),
+                Err(e)   => storage_err_response(&e),
             }
         }
 
@@ -683,11 +864,11 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                             }
                         },
                         Ok(None) => json!({ "error": "block not found" }),
-                        Err(e)   => json!({ "error": e.to_string() }),
+                        Err(e)   => storage_err_response(&e),
                     }
                 },
                 Ok(None) => json!({ "error": "transaction not found" }),
-                Err(e)   => json!({ "error": e.to_string() }),
+                Err(e)   => storage_err_response(&e),
             }
         }
 
@@ -707,7 +888,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                         "utxo_count": utxo_count,
                         "address":    addr,
                     }),
-                    Err(e) => json!({ "error": e.to_string() }),
+                    Err(e) => storage_err_response(&e),
                 },
                 None => json!({ "error": "invalid address" }),
             }
@@ -721,7 +902,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     "utxo_entries":           utxos,
                     "note": "distinct addresses currently holding >=1 UTXO (on-chain wallets with a non-zero balance); addresses that spent to zero or never held a UTXO are not counted",
                 }),
-                Err(e) => json!({ "error": e.to_string() }),
+                Err(e) => storage_err_response(&e),
             }
         }
 
@@ -760,7 +941,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                             "utxos":      list,
                         })
                     },
-                    Err(e) => json!({ "error": e.to_string() }),
+                    Err(e) => storage_err_response(&e),
                 },
                 None => json!({ "error": "invalid address" }),
             }
@@ -801,6 +982,10 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                             Ok(fee)  => {
                                 let txid = tx.txid();
                                 match state.mempool.add(tx, fee) {
+                                    // Not L-5: this is MempoolError, a validation
+                                    // outcome (e.g. double-spend, fee too low) the
+                                    // caller needs to see to fix their transaction —
+                                    // not an internal/filesystem detail to withhold.
                                     Err(e) => json!({ "error": e.to_string() }),
                                     Ok(_)  => {
                                         let _ = state.outbound_tx.try_send(NetworkMessage::NewTransaction {
@@ -1239,7 +1424,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                                 "transactions":    txs,
                             })
                         }
-                        Err(e) => json!({ "error": e.to_string() }),
+                        Err(e) => storage_err_response(&e),
                     }
                 }
                 None => json!({ "error": "invalid address" }),
@@ -1695,7 +1880,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                             })
                         }
                         Ok(None) => json!({ "error": "block not found" }),
-                        Err(e) => json!({ "error": e.to_string() }),
+                        Err(e) => storage_err_response(&e),
                     }
                 }
                 None => json!({ "error": "invalid block identifier (expected hex hash or height)" }),
@@ -1729,7 +1914,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                                 "tx_count_up_to_height": tx_count,
                             })
                         }
-                        Err(e) => json!({ "error": e.to_string() }),
+                        Err(e) => storage_err_response(&e),
                     }
                 }
                 None => json!({ "error": "invalid address" }),
@@ -1773,15 +1958,25 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
 /// mainnet until AUXPOW_ACTIVATION_HEIGHT and the accept path re-validates.
 const AUX_CANDIDATE_CAP: usize = 64;
 
+// L-2 (audit): this used `std::sync::Mutex`, whose lock poisons on any panic
+// while held. A panic inside `aux_candidate_put`/`_get` (or in a future
+// caller that runs more code under the lock) would permanently disable
+// `createauxblock`/`submitauxblock` for the process lifetime — `.lock()`
+// returns `Err(PoisonError)` on every subsequent call, and `.unwrap()`
+// propagates that as a fresh panic, over and over. `parking_lot::Mutex`
+// (already the mutex type used throughout this codebase, e.g. `HeavyGate`
+// above) does not poison: a panic while held simply unlocks it, so the next
+// caller proceeds normally. `.lock()` returns the guard directly (no
+// `Result`), so `aux_candidate_put`/`_get` need no `.unwrap()` at all.
 #[allow(clippy::type_complexity)]
-fn aux_candidates() -> &'static std::sync::Mutex<std::collections::VecDeque<([u8; 32], crate::core::Block)>> {
-    static C: std::sync::OnceLock<std::sync::Mutex<std::collections::VecDeque<([u8; 32], crate::core::Block)>>> =
+fn aux_candidates() -> &'static parking_lot::Mutex<std::collections::VecDeque<([u8; 32], crate::core::Block)>> {
+    static C: std::sync::OnceLock<parking_lot::Mutex<std::collections::VecDeque<([u8; 32], crate::core::Block)>>> =
         std::sync::OnceLock::new();
-    C.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
+    C.get_or_init(|| parking_lot::Mutex::new(std::collections::VecDeque::new()))
 }
 
 fn aux_candidate_put(hash: [u8; 32], block: crate::core::Block) {
-    let mut c = aux_candidates().lock().unwrap();
+    let mut c = aux_candidates().lock();
     if let Some(pos) = c.iter().position(|(h, _)| *h == hash) {
         c.remove(pos);
     }
@@ -1792,7 +1987,7 @@ fn aux_candidate_put(hash: [u8; 32], block: crate::core::Block) {
 }
 
 fn aux_candidate_get(hash: &[u8; 32]) -> Option<crate::core::Block> {
-    aux_candidates().lock().unwrap().iter().find(|(h, _)| h == hash).map(|(_, b)| b.clone())
+    aux_candidates().lock().iter().find(|(h, _)| h == hash).map(|(_, b)| b.clone())
 }
 
 /// Parse a bloch1q/bloch1t address to 20-byte pubkey hash
@@ -2037,6 +2232,130 @@ pub(crate) fn euvm_admit_tx_standalone(
 // `format_tx` is the shared output formatter behind getblock / gettransaction /
 // decoderawtransaction, so pinning it pins those three response shapes.
 // ─────────────────────────────────────────────────────────────────────────────
+// ── L-10 / L-11 regressions ─────────────────────────────────────────────────
+
+#[cfg(test)]
+mod l10_l11_id_and_batch_tests {
+    use super::*;
+
+    /// L-10 core regression: an oversized `id` string must be truncated,
+    /// never echoed at full length.
+    #[test]
+    fn oversized_string_id_is_truncated() {
+        let huge = "x".repeat(MAX_ECHOED_ID_LEN * 10);
+        let capped = cap_echoed_id(Value::String(huge));
+        match capped {
+            Value::String(s) => assert!(
+                s.len() <= MAX_ECHOED_ID_LEN,
+                "capped id is {} bytes, expected <= {}", s.len(), MAX_ECHOED_ID_LEN
+            ),
+            other => panic!("expected a String, got {:?}", other),
+        }
+    }
+
+    /// A short, legitimate id passes through unchanged.
+    #[test]
+    fn short_string_id_is_unchanged() {
+        assert_eq!(cap_echoed_id(json!("req-42")), json!("req-42"));
+    }
+
+    /// Numbers and null are the spec-legitimate id shapes and pass through.
+    #[test]
+    fn number_and_null_ids_pass_through() {
+        assert_eq!(cap_echoed_id(json!(42)), json!(42));
+        assert_eq!(cap_echoed_id(json!(null)), json!(null));
+    }
+
+    /// A non-spec id shape (bool/array/object) is replaced with null rather
+    /// than echoed — nothing legitimate sends these, and echoing an
+    /// attacker-shaped structure back verbatim is unnecessary surface.
+    #[test]
+    fn non_scalar_ids_become_null() {
+        assert_eq!(cap_echoed_id(json!(true)), json!(null));
+        assert_eq!(cap_echoed_id(json!([1, 2, 3])), json!(null));
+        assert_eq!(cap_echoed_id(json!({"a": 1})), json!(null));
+    }
+
+    /// Truncation must never split a multi-byte UTF-8 character — reusing
+    /// `network::truncate_utf8` is what guarantees this; pin it here too so a
+    /// future change to this call site cannot silently regress to a raw
+    /// byte-index slice.
+    #[test]
+    fn truncation_is_utf8_safe() {
+        // 300 copies of a 3-byte character comfortably straddles a naive
+        // byte-256 cut point.
+        let s: String = "€".repeat(300);
+        let capped = cap_echoed_id(Value::String(s));
+        match capped {
+            Value::String(s) => {
+                assert!(s.len() <= MAX_ECHOED_ID_LEN);
+                assert!(std::str::from_utf8(s.as_bytes()).is_ok(), "must remain valid UTF-8");
+            }
+            other => panic!("expected a String, got {:?}", other),
+        }
+    }
+
+    /// L-11 core regression: the batch-request response must be the
+    /// JSON-RPC 2.0 Invalid Request code, not a 200 with a garbled method name.
+    #[test]
+    fn batch_response_is_invalid_request_code() {
+        let v = batch_not_supported_response();
+        assert_eq!(v["error"]["code"], json!(-32600));
+        assert_eq!(v["jsonrpc"], json!("2.0"));
+    }
+}
+
+// ── L-5 regression: storage errors never reach the caller verbatim ─────────
+
+#[cfg(test)]
+mod l5_storage_error_sanitization_tests {
+    use super::*;
+
+    /// The core L-5 property: whatever detail `StorageError` carries (here, a
+    /// fabricated RocksDB-shaped message with a filesystem path, mirroring
+    /// what `storage/mod.rs`'s real `.map_err(|e| StorageError::ReadFailed(e.to_string()))`
+    /// sites would actually produce) must NOT appear anywhere in the JSON
+    /// handed back to the RPC caller.
+    #[test]
+    fn caller_response_never_contains_the_storage_detail() {
+        let sensitive = StorageError::ReadFailed(
+            "IO error: /var/lib/bloch-data/CF_BLOCKS/000123.sst: No such file or directory".into(),
+        );
+        let resp = storage_err_response(&sensitive);
+        let rendered = resp.to_string();
+        assert!(
+            !rendered.contains("/var/lib/bloch-data"),
+            "filesystem path from the underlying storage error leaked into the RPC response: {}",
+            rendered
+        );
+        assert!(
+            !rendered.contains("CF_BLOCKS"),
+            "column-family internal name leaked into the RPC response: {}",
+            rendered
+        );
+    }
+
+    /// Every `StorageError` variant must produce the SAME stable response —
+    /// nothing about which failure mode occurred (open/read/write/serialize)
+    /// should be distinguishable from the response shape either.
+    #[test]
+    fn every_storage_error_variant_yields_the_identical_stable_response() {
+        let variants = [
+            StorageError::OpenFailed("detail a".into()),
+            StorageError::CfNotFound("detail b".into()),
+            StorageError::SerializeFailed("detail c".into()),
+            StorageError::DeserializeFailed("detail d".into()),
+            StorageError::WriteFailed("detail e".into()),
+            StorageError::ReadFailed("detail f".into()),
+        ];
+        let responses: Vec<Value> = variants.iter().map(storage_err_response).collect();
+        for r in &responses {
+            assert_eq!(*r, responses[0], "every StorageError variant must map to the identical sanitized response");
+        }
+        assert_eq!(responses[0], json!({ "error": "internal storage error", "code": "STORAGE_ERROR" }));
+    }
+}
+
 #[cfg(test)]
 mod r3_amount_encoding_tests {
     use super::*;

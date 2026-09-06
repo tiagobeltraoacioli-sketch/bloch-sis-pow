@@ -48,12 +48,31 @@ impl PeerStateTable {
         e.last_seen = now;
     }
 
-    /// P4: on `SwarmEvent::ConnectionClosed`. Retains the row but marks it
-    /// disconnected so it drops out of servable/connected queries.
+    /// P4: on `SwarmEvent::ConnectionClosed`.
+    ///
+    /// M-3 (audit): this used to RETAIN the row (only flip `connected =
+    /// false`), so the table grew by one entry per distinct `PeerId` ever
+    /// seen and NEVER shrank. A libp2p identity is a freshly generated
+    /// keypair — free to an attacker — so "connect, send one `Tips` frame
+    /// (up to `MAX_ADVERTISED_TIPS` = 256 hashes, ~8 KB), disconnect, repeat
+    /// with a new identity" grew this table without bound (unlike
+    /// `WirePenaltyTracker`, which the same module comparison in the audit
+    /// notes was explicitly capped for exactly this threat and this map was
+    /// not).
+    ///
+    /// INVARIANT (M-3): a disconnected peer contributes NOTHING to this
+    /// table's steady-state size. The state kept here is a cache serving
+    /// `servable_blue_work` / `best_announced_blue_score` /
+    /// `connected_advertised_tips`, all of which already filter on
+    /// `connected` — dropping the row outright removes no behavior a
+    /// currently-connected-peer query could observe, and a peer that
+    /// reconnects re-announces its tips/blue_score immediately via
+    /// `observe`/`on_connect`, which reinserts a fresh row. Table size is
+    /// therefore bounded by however many connections libp2p's own
+    /// connection-limits behaviour (`max_established_incoming`, wired in
+    /// `network::mod::run`) currently allows, not by every identity ever seen.
     pub fn on_disconnect(&self, peer: &PeerId) {
-        if let Some(e) = self.inner.write().get_mut(peer) {
-            e.connected = false;
-        }
+        self.inner.write().remove(peer);
     }
 
     /// P4: on decode of `Tips` / `PeerTip` / `Version`. For `PeerTip`/`Version`

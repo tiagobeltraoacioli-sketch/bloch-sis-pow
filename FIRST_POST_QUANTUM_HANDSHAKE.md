@@ -16,7 +16,23 @@
 > handshakes on Bloch-SIS Protocol mainnet (post-Phase 6) will be
 > recorded as separate Era 2 milestones.
 >
-> Original document follows verbatim.
+> **Correction (audit finding M-4).** The KEM primitive named below as
+> "ML-KEM-768 (NIST FIPS 203)" is **not** ML-KEM / FIPS 203. It is
+> **Kyber-768, CRYSTALS round 3** (PQClean's reference implementation,
+> wrapped by the Rust crate `pqcrypto-kyber` 0.8.1 — see
+> `src/transport/mod.rs` / `src/transport/upgrade.rs` in the Genesis-3
+> node source this document describes). The public-key and ciphertext
+> sizes coincide (1184 / 1088 bytes) because ML-KEM's parameter set
+> descends from round-3 Kyber, but the two schemes diverge in the KEM's
+> key-derivation step (round-3 Kyber additionally hashes the ciphertext
+> into the shared secret; ML-KEM does not) and are **not
+> wire-interoperable**: a peer built against `pqcrypto-mlkem` (PQClean's
+> separate ML-KEM implementation) cannot complete a handshake with the
+> Kyber-768 implementation this document describes. The claims below are
+> preserved as originally written (this is a historical record), with
+> inline corrections added at each point where the mislabeling appears.
+>
+> Original document follows verbatim, with the above corrections annotated inline.
 
 ---
 
@@ -30,6 +46,8 @@
 ## What happened
 
 At 21:58:42 UTC on 2026-04-20, two GroundState nodes completed a successful libp2p connection using the ML-KEM-768 (Kyber) hybrid post-quantum transport upgrade. This is, to our knowledge, the first production blockchain P2P connection established over a NIST FIPS 203 post-quantum key-encapsulation mechanism on an operational mainnet.
+
+> **[M-4 correction]** The mechanism was **Kyber-768 (CRYSTALS round 3, via `pqcrypto-kyber` 0.8.1)**, not ML-KEM-768 and not NIST FIPS 203. See the correction note at the top of this document.
 
 The handshake itself is cryptographically unremarkable — ML-KEM-768 is a standardized primitive with a published transcript protocol. What is novel is the integration context: a live blockchain network with consensus, mining, and gossipsub message propagation running over a PQ-secured transport layer, not a lab benchmark or protocol demo.
 
@@ -51,7 +69,7 @@ The handshake itself is cryptographically unremarkable — ML-KEM-768 is a stand
 
 ## Cryptographic stack
 
-- **Key exchange**: ML-KEM-768 (NIST FIPS 203, previously known as CRYSTALS-Kyber)
+- **Key exchange**: Kyber-768 (CRYSTALS round 3, PQClean reference implementation via `pqcrypto-kyber` 0.8.1). **[M-4 correction]** This was originally labeled "ML-KEM-768 (NIST FIPS 203, previously known as CRYSTALS-Kyber)" — that description is incorrect. Kyber round 3 is the predecessor NIST FIPS 203 (ML-KEM) was finalized from, not another name for it, and the two are not wire-interoperable (see the correction note at the top of this document).
 - **Session encryption**: ChaCha20-Poly1305 (RFC 7539) with counter-derived 96-bit nonces
 - **Key derivation**: HKDF-SHA256 over the Kyber shared secret
 - **Peer identity / authentication**: libp2p Ed25519 signatures over the transcript. This is classical, not post-quantum — see "Hybrid model" below for the threat-model reasoning.
@@ -68,7 +86,7 @@ The transport is a *hybrid* design, not a fully post-quantum one:
 
 | Property | Primitive | Post-quantum? |
 | --- | --- | --- |
-| Key exchange (confidentiality) | ML-KEM-768 | ✅ |
+| Key exchange (confidentiality) | Kyber-768 (round 3; **not** ML-KEM-768 / FIPS 203 — see correction note above) | ✅ |
 | Peer identity (authentication) | libp2p Ed25519 | ❌ classical |
 | Session cipher | ChaCha20-Poly1305 | ❌ classical, but symmetric |
 | Transcript binding | SHA3-256 | — |

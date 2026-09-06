@@ -524,13 +524,22 @@ pub enum ColoringMode {
 /// if height >= CORRECTED_COLORING_ACTIVATION_HEIGHT { Fast } else { Legacy }
 /// ```
 ///
-/// **Defaulted to `u64::MAX` = DISABLED.** With this value the comparison is
-/// false for every reachable height, so `Legacy` is the effective mode
-/// everywhere and this constant changes ZERO live behavior. Historical blocks
-/// are additionally never recolored: they are loaded from CF_DAG verbatim
-/// (`load_persisted` / `load_persisted_validated` insert stored data without
-/// recomputation), so their coloring — and therefore every already-mined
-/// block, balance, and the entire token supply — is preserved unconditionally.
+/// **CORRECTED (was stale as of the original writing of this paragraph):**
+/// this comment used to say the constant "defaults to `u64::MAX` = DISABLED"
+/// and "changes ZERO live behavior". That was true only until WS-A
+/// (2026-08-05) armed it — see the "Coordinated-release sentinel" and
+/// "FLAG-DAY LOWERED" notes below, which were added at that time but never
+/// reconciled against this paragraph. The constant has been `21_430`, not
+/// `u64::MAX`, since the flag day, and roughly 46% of the Genesis-3 chain's
+/// eventual terminal height (39,918, reached 2026-08-24) was mined AT OR
+/// ABOVE this gate, i.e. under `Fast` coloring, not `Legacy`. Historical
+/// blocks are never *recolored* after the fact regardless of where the gate
+/// sits: they are loaded from CF_DAG verbatim (`load_persisted` /
+/// `load_persisted_validated` insert stored data without recomputation), so
+/// each block's coloring — decided once, at the height it was mined, by
+/// comparing that height against whatever this constant was AT THE TIME — is
+/// preserved unconditionally. "Preserved" here means "frozen as originally
+/// computed", not "computed under `Legacy`".
 ///
 /// ## Setting a real activation height (founder action only)
 ///
@@ -549,16 +558,19 @@ pub enum ColoringMode {
 /// everywhere, `Fast` is a transparent speedup and no activation is needed at
 /// all.
 ///
-/// ## Coordinated-release sentinel (Phase 3)
+/// ## Coordinated-release sentinel (Phase 3) — SUPERSEDED, see WS-A below
 ///
-/// This value is intentionally left at `u64::MAX` = `TBD_COORDINATED_RELEASE` on
-/// this branch. Setting a real height is a **coordinated soft-fork owned by the
-/// operator/network**, not a code-review decision: all nodes must adopt the same
-/// future height simultaneously. The dev/test env override
-/// (`BLOCH_GHOSTDAG_COLORING=fast`, see [`GhostDAG::with_default_k_env`]) exists
-/// to exercise `Fast` on a throwaway datadir; it is node-local and is NOT and
-/// cannot be a substitute for setting this height. Until this constant changes,
-/// every live node stays byte-for-byte on the `Legacy` coloring.
+/// This paragraph originally left the value at `u64::MAX` =
+/// `TBD_COORDINATED_RELEASE` and said "every live node stays byte-for-byte on
+/// the `Legacy` coloring until this constant changes". That description is
+/// **no longer current**: WS-A armed the gate at a real height (`21_430`,
+/// later documented below) as exactly the coordinated soft-fork this
+/// paragraph called for — all fleet nodes adopted the same future height
+/// simultaneously, per this constant's own rule. The general principle still
+/// holds for any FUTURE re-arming (a real height is a coordinated soft-fork
+/// decision, never a code-review default, and the dev/test env override
+/// `BLOCH_GHOSTDAG_COLORING=fast` remains node-local and not a substitute for
+/// it); only the "still disabled" conclusion is stale.
 ///
 /// WS-A (2026-08-05): armed to a FUTURE flag-day height. The replay-snapshot
 /// proof (h18532) showed `Fast` is NOT byte-identical to `Legacy` — it diverges
@@ -1566,13 +1578,54 @@ impl GhostDAG {
         }
     }
 
-    /// Ordered block hashes from blue_score `from` for IBD sync
+    /// Ordered block hashes from blue_score `from` for IBD sync.
+    ///
+    /// H-R3-1: this used to `.collect()` every `GhostdagData` with
+    /// `blue_score >= from_blue_score` into a `Vec`, `sort_by_key` the WHOLE
+    /// thing, and only then `take(limit)` — an O(n log n) time, O(n) memory
+    /// operation charged in full for every request regardless of `limit`
+    /// (on the historical Genesis-3 datadir, n ~= 50,600). The directed-sync
+    /// server (`network/mod.rs::serve_sync_request`) calls this inline on the
+    /// swarm event loop with an attacker-supplied, unclamped `limit`, so an
+    /// unbounded `limit` (e.g. `u32::MAX`) forced a full-DAG sort per 13-byte
+    /// request on the very thread that also drives block propagation.
+    ///
+    /// INVARIANT (H-R3-1): this call is O(n) time — a HashMap keyed by hash
+    /// gives no cheaper way to find "blue_score >= from" without an
+    /// auxiliary index — but MUST be O(limit) memory, never O(n) memory. A
+    /// max-heap bounded to capacity `limit` gives both: keep only the
+    /// `limit` smallest qualifying blue_scores seen so far, evicting the
+    /// current maximum whenever a smaller candidate arrives and the heap is
+    /// already full. Ties break on hash for a deterministic result (the
+    /// previous `sort_by_key` broke ties on HashMap iteration order, which is
+    /// not consensus-critical but was needlessly nondeterministic).
     pub fn ordered_hashes_from(&self, from_blue_score: u64, limit: usize) -> Vec<BlockHash> {
-        let mut blocks: Vec<(&BlockHash, &GhostdagData)> = self.store.data.iter()
-            .filter(|(_, d)| d.blue_score >= from_blue_score)
-            .collect();
-        blocks.sort_by_key(|(_, d)| d.blue_score);
-        blocks.iter().take(limit).map(|(h, _)| **h).collect()
+        if limit == 0 {
+            return Vec::new();
+        }
+        use std::collections::BinaryHeap;
+
+        // `BinaryHeap` is a max-heap: `peek()`/`pop()` always return the
+        // LARGEST retained entry — exactly the one to evict when a smaller
+        // candidate shows up and the heap is already at `limit` capacity.
+        let cap = limit.min(self.store.data.len().saturating_add(1));
+        let mut heap: BinaryHeap<(u64, BlockHash)> = BinaryHeap::with_capacity(cap);
+        for (h, d) in self.store.data.iter() {
+            if d.blue_score < from_blue_score {
+                continue;
+            }
+            if heap.len() < limit {
+                heap.push((d.blue_score, *h));
+            } else if let Some(&(max_score, max_hash)) = heap.peek() {
+                if (d.blue_score, *h) < (max_score, max_hash) {
+                    heap.pop();
+                    heap.push((d.blue_score, *h));
+                }
+            }
+        }
+        let mut out: Vec<(u64, BlockHash)> = heap.into_vec();
+        out.sort_unstable();
+        out.into_iter().map(|(_, h)| h).collect()
     }
 
     pub fn get_node(&self, hash: &BlockHash) -> Option<&GhostdagData> {
@@ -1673,6 +1726,66 @@ mod tests {
         let b3 = make_hash(3);
         dag.add_block(b3, vec![b2], 3, 1000).unwrap();
         assert_eq!(dag.store.get(&b3).unwrap().blue_score, 3);
+    }
+
+    /// H-R3-1 regression: `ordered_hashes_from` must return exactly the
+    /// `limit` smallest qualifying blue_scores, in ascending order — the same
+    /// observable result the old "collect everything, sort, take(limit)"
+    /// implementation produced, but via the O(n)/O(limit) bounded-heap path.
+    /// Reverting to a naive `.filter().collect()` without the `limit`
+    /// respected before materialising would still pass this on correctness,
+    /// but the point of the invariant is memory/CPU, not just the return
+    /// value — see `ordered_hashes_from_never_returns_more_than_limit` below
+    /// for the bound this test's sibling pins.
+    #[test]
+    fn ordered_hashes_from_ascending_and_correct() {
+        let mut dag = GhostDAG::with_k(3);
+        let g = make_hash(0);
+        dag.add_genesis(g, 0);
+        let mut prev = g;
+        for i in 1..=10u8 {
+            let b = make_hash(i);
+            dag.add_block(b, vec![prev], i as u64, 1000u128 + i as u128).unwrap();
+            prev = b;
+        }
+        // blue_scores present: 0..=10. Ask from 3, limit 4 -> expect the four
+        // smallest qualifying scores: 3,4,5,6 (hashes 3,4,5,6), ascending.
+        let got = dag.ordered_hashes_from(3, 4);
+        assert_eq!(
+            got,
+            vec![make_hash(3), make_hash(4), make_hash(5), make_hash(6)],
+            "must return the smallest `limit` qualifying blue_scores, ascending"
+        );
+    }
+
+    /// H-R3-1 regression: `limit` bounds the OUTPUT (and, by construction of
+    /// the fix, the heap's peak memory) regardless of how many blocks in the
+    /// DAG satisfy `blue_score >= from_blue_score`. This is the property a
+    /// naive revert-to-full-sort would still satisfy for correctness of the
+    /// truncation itself, but pairs with the doc-invariant above: the fix is
+    /// that the heap here never holds more than `limit` entries at any point
+    /// during the scan, not merely that the final `Vec` is short.
+    #[test]
+    fn ordered_hashes_from_never_returns_more_than_limit() {
+        let mut dag = GhostDAG::with_k(3);
+        let g = make_hash(0);
+        dag.add_genesis(g, 0);
+        let mut prev = g;
+        for i in 1..=50u8 {
+            let b = make_hash(i);
+            dag.add_block(b, vec![prev], i as u64, 1000u128 + i as u128).unwrap();
+            prev = b;
+        }
+        let got = dag.ordered_hashes_from(0, 5);
+        assert_eq!(got.len(), 5, "limit must bound the result even with 51 qualifying blocks");
+        assert_eq!(got, vec![make_hash(0), make_hash(1), make_hash(2), make_hash(3), make_hash(4)]);
+
+        // limit larger than the qualifying set returns everything, still ascending.
+        let all = dag.ordered_hashes_from(48, 100);
+        assert_eq!(all, vec![make_hash(48), make_hash(49), make_hash(50)]);
+
+        // limit == 0 returns empty without touching the store.
+        assert_eq!(dag.ordered_hashes_from(0, 0), Vec::<BlockHash>::new());
     }
 
     #[test]

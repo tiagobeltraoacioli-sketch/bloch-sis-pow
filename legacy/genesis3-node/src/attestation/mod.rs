@@ -184,21 +184,66 @@ pub struct Expected {
 /// Result of verifying a report against `Expected` + a freshness nonce.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
-    /// Report is attested, fresh, and bound to the expected identity.
+    /// Report is attested, fresh, bound to the expected identity, AND its raw
+    /// quote was cryptographically verified against the vendor's signing key
+    /// by a [`QuoteVerifier`] — never granted on self-reported fields alone.
     Trusted,
-    /// Structurally/semantically rejected, with a reason. NOTE: cryptographic
-    /// signature verification of the quote is provider-specific and, for
-    /// SEV-SNP, done via `virtee/sev` under the `sev-snp` feature; this
-    /// function performs the environment/freshness/binding checks that are
-    /// platform-independent.
+    /// Structurally/semantically rejected, or no cryptographic quote check
+    /// was available/passed, with a reason.
     Rejected(String),
 }
 
-/// Verify the platform-independent invariants: attested, right TEE, fresh nonce,
-/// and bound to the expected reproducible image (via digest + hostdata + boot
-/// measurement). The provider-specific quote-signature check is layered on top
-/// where the hardware/feature is available.
-pub fn verify(report: &AttestationReport, expected: &Expected, want_nonce: Option<&str>) -> Verdict {
+/// HIGH-5 (audit): a pluggable, provider-specific cryptographic check of a
+/// raw attestation quote. `AttestationReport` carries `quote_b64` precisely
+/// so this check can exist, but before this fix nothing in [`verify`] ever
+/// read that field — every other field (`attested`, `tee`, `measurement`,
+/// `hostdata`, `image_digest`, `os_roothash`) is plain, self-reported data on
+/// the wire, and `verify` returned `Trusted` from string equality on those
+/// alone. A compromised node, a lying operator, or (were the report ever
+/// relayed over an unauthenticated channel) a MITM could set `attested: true`
+/// and copy matching strings into every other field with no hardware backing
+/// them at all, and be trusted.
+///
+/// A real implementation (e.g. SEV-SNP: parse `quote_b64` as a signed
+/// attestation report, verify its signature chains to AMD's VCEK/ARK root,
+/// and confirm the report's OWN `measurement`/`host_data`/`report_data`
+/// fields — not the ones self-reported in `AttestationReport` — match what
+/// is claimed) lives behind this trait so `verify` can enforce it uniformly
+/// across TEE backends without hard-coding any one vendor's quote format.
+pub trait QuoteVerifier {
+    /// Which TEE this verifier can cryptographically check.
+    fn tee(&self) -> Tee;
+    /// Verify that `report.quote_b64` is a genuine, vendor-signed quote whose
+    /// OWN measured fields (not merely the self-reported ones alongside it)
+    /// are consistent with `report` and bind `want_nonce` for freshness.
+    /// `Ok(())` only on a full cryptographic pass.
+    fn verify_quote(&self, report: &AttestationReport, want_nonce: Option<&str>) -> Result<(), String>;
+}
+
+/// Verify a report against `Expected` + a freshness nonce.
+///
+/// INVARIANT (HIGH-5): this function MUST NOT return `Verdict::Trusted`
+/// unless (a) every self-reported field passes the platform-independent
+/// checks below AND (b) a [`QuoteVerifier`] matching `report.tee` is present
+/// in `verifiers` and its `verify_quote` returns `Ok(())`. With no matching
+/// verifier — which is the case for EVERY backend in this tree today, since
+/// `sev_snp::SevSnpProvider::report` is a stub that always returns `None`
+/// (see `sev_snp.rs`) and the mobile verifiers in `mobile.rs` are themselves
+/// unwired stubs — the answer is `Rejected` with an explicit reason. Fail
+/// closed: a missing cryptographic check is a REJECTION, never a silent
+/// `Trusted` on the strength of self-reported strings matching.
+///
+/// The self-reported checks still run first and in cheapest-first order
+/// (string/bool comparisons before the caller pays for the more expensive
+/// cryptographic quote check), because a report failing them tells the
+/// caller something concrete (TEE mismatch, stale nonce, wrong image) that
+/// "no quote verifier available" would otherwise hide.
+pub fn verify(
+    report: &AttestationReport,
+    expected: &Expected,
+    want_nonce: Option<&str>,
+    verifiers: &[&dyn QuoteVerifier],
+) -> Verdict {
     if !report.attested {
         return Verdict::Rejected("report is not attested (no TEE / unattested node)".into());
     }
@@ -246,7 +291,19 @@ pub fn verify(report: &AttestationReport, expected: &Expected, want_nonce: Optio
             None => return Verdict::Rejected("report carries no os_roothash (OS not verity-measured)".into()),
         }
     }
-    Verdict::Trusted
+    // HIGH-5: everything above is self-reported. Only a matching
+    // QuoteVerifier's cryptographic pass over the raw quote may grant Trusted.
+    match verifiers.iter().find(|v| v.tee() == report.tee) {
+        Some(v) => match v.verify_quote(report, want_nonce) {
+            Ok(()) => Verdict::Trusted,
+            Err(reason) => Verdict::Rejected(format!("quote verification failed: {reason}")),
+        },
+        None => Verdict::Rejected(format!(
+            "no cryptographic quote verifier available for {} — self-reported \
+             fields alone are never sufficient to trust a node (fail-closed)",
+            report.tee.as_str()
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -285,37 +342,103 @@ mod tests {
         assert!(r.note.contains("UNATTESTED"));
     }
 
+    /// A [`QuoteVerifier`] whose verdict is fixed at construction, for
+    /// testing both the "no verifier available" fail-closed path and the
+    /// "verifier present and passes/fails" paths without any real hardware.
+    struct MockVerifier {
+        tee: Tee,
+        result: Result<(), &'static str>,
+    }
+    impl QuoteVerifier for MockVerifier {
+        fn tee(&self) -> Tee {
+            self.tee
+        }
+        fn verify_quote(&self, _report: &AttestationReport, _want_nonce: Option<&str>) -> Result<(), String> {
+            self.result.map_err(|e| e.to_string())
+        }
+    }
+
+    /// HIGH-5 regression: this is THE finding. A report whose self-reported
+    /// fields match `Expected` EXACTLY (nonce fresh, digest/hostdata/
+    /// measurement all correct) must still be REJECTED, not Trusted, when no
+    /// cryptographic `QuoteVerifier` is supplied — self-reported strings are
+    /// never sufficient on their own. Before the fix, this exact input
+    /// returned `Verdict::Trusted`.
     #[test]
-    fn verify_accepts_a_matching_attested_report() {
-        assert_eq!(verify(&good_report("n1"), &expected(), Some("n1")), Verdict::Trusted);
+    fn verify_never_trusts_self_reported_fields_alone() {
+        let v = verify(&good_report("n1"), &expected(), Some("n1"), &[]);
+        assert!(
+            matches!(v, Verdict::Rejected(_)),
+            "a perfectly-matching but cryptographically unverified report must be Rejected, got {:?}", v
+        );
+    }
+
+    /// The complementary positive case: Trusted IS reachable, but only when a
+    /// matching QuoteVerifier is present and its cryptographic check passes.
+    #[test]
+    fn verify_trusts_only_with_a_passing_quote_verifier() {
+        let ok_verifier = MockVerifier { tee: Tee::SevSnp, result: Ok(()) };
+        assert_eq!(
+            verify(&good_report("n1"), &expected(), Some("n1"), &[&ok_verifier]),
+            Verdict::Trusted
+        );
+    }
+
+    /// A verifier for the WRONG tee must not be picked up — Trusted must come
+    /// from a verifier that actually matches `report.tee`.
+    #[test]
+    fn verify_ignores_a_verifier_for_a_different_tee() {
+        let wrong_tee_verifier = MockVerifier { tee: Tee::Tdx, result: Ok(()) };
+        let v = verify(&good_report("n1"), &expected(), Some("n1"), &[&wrong_tee_verifier]);
+        assert!(matches!(v, Verdict::Rejected(_)));
+    }
+
+    /// A matching verifier that FAILS the cryptographic check must reject,
+    /// even though every self-reported field matched.
+    #[test]
+    fn verify_rejects_when_quote_verifier_fails() {
+        let failing = MockVerifier { tee: Tee::SevSnp, result: Err("bad VCEK signature") };
+        let v = verify(&good_report("n1"), &expected(), Some("n1"), &[&failing]);
+        match v {
+            Verdict::Rejected(reason) => assert!(reason.contains("bad VCEK signature")),
+            other => panic!("expected Rejected, got {:?}", other),
+        }
     }
 
     #[test]
     fn verify_rejects_unattested() {
         let r = current_report(Some("n1".into()));
-        assert!(matches!(verify(&r, &expected(), Some("n1")), Verdict::Rejected(_)));
+        let ok_verifier = MockVerifier { tee: Tee::None, result: Ok(()) };
+        assert!(matches!(verify(&r, &expected(), Some("n1"), &[&ok_verifier]), Verdict::Rejected(_)));
     }
 
     #[test]
     fn verify_rejects_wrong_image_digest() {
         let mut r = good_report("n1");
         r.image_digest = Some("deadbeef".into());
-        assert!(matches!(verify(&r, &expected(), Some("n1")), Verdict::Rejected(_)));
+        let ok_verifier = MockVerifier { tee: Tee::SevSnp, result: Ok(()) };
+        assert!(matches!(verify(&r, &expected(), Some("n1"), &[&ok_verifier]), Verdict::Rejected(_)));
     }
 
     #[test]
     fn verify_rejects_stale_nonce() {
-        assert!(matches!(verify(&good_report("OLD"), &expected(), Some("FRESH")), Verdict::Rejected(_)));
+        let ok_verifier = MockVerifier { tee: Tee::SevSnp, result: Ok(()) };
+        assert!(matches!(
+            verify(&good_report("OLD"), &expected(), Some("FRESH"), &[&ok_verifier]),
+            Verdict::Rejected(_)
+        ));
     }
 
     #[test]
     fn verify_rejects_tee_and_hostdata_mismatch() {
+        let ok_verifier = MockVerifier { tee: Tee::Tdx, result: Ok(()) };
         let mut r = good_report("n1");
         r.tee = Tee::Tdx;
-        assert!(matches!(verify(&r, &expected(), Some("n1")), Verdict::Rejected(_)));
+        assert!(matches!(verify(&r, &expected(), Some("n1"), &[&ok_verifier]), Verdict::Rejected(_)));
+        let ok_verifier2 = MockVerifier { tee: Tee::SevSnp, result: Ok(()) };
         let mut r2 = good_report("n1");
         r2.hostdata = Some("00".repeat(32));
-        assert!(matches!(verify(&r2, &expected(), Some("n1")), Verdict::Rejected(_)));
+        assert!(matches!(verify(&r2, &expected(), Some("n1"), &[&ok_verifier2]), Verdict::Rejected(_)));
     }
 
     #[test]
@@ -328,16 +451,17 @@ mod tests {
 
     #[test]
     fn verify_checks_os_roothash_when_expected() {
+        let ok_verifier = MockVerifier { tee: Tee::SevSnp, result: Ok(()) };
         let mut exp = expected();
         exp.os_roothash = Some("cc".repeat(32)); // matches good_report
-        assert_eq!(verify(&good_report("n1"), &exp, Some("n1")), Verdict::Trusted);
+        assert_eq!(verify(&good_report("n1"), &exp, Some("n1"), &[&ok_verifier]), Verdict::Trusted);
 
         let mut r = good_report("n1");
         r.os_roothash = Some("ff".repeat(32));
-        assert!(matches!(verify(&r, &exp, Some("n1")), Verdict::Rejected(_)));
+        assert!(matches!(verify(&r, &exp, Some("n1"), &[&ok_verifier]), Verdict::Rejected(_)));
 
         let mut r2 = good_report("n1");
         r2.os_roothash = None;
-        assert!(matches!(verify(&r2, &exp, Some("n1")), Verdict::Rejected(_)));
+        assert!(matches!(verify(&r2, &exp, Some("n1"), &[&ok_verifier]), Verdict::Rejected(_)));
     }
 }

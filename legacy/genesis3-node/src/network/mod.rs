@@ -153,15 +153,36 @@ pub enum NetworkMessage {
 
 
 impl NetworkMessage {
-    /// Variant name for diagnostics. Derived from Debug so a new variant can
-    /// never silently log as something else — the previous log named only the
-    /// topic and that ambiguity sent a fix to the wrong message.
+    /// Variant name for diagnostics.
+    ///
+    /// H-R3-3: this used to `Box::leak(format!("{:?}", self))` on every call —
+    /// a fresh, permanent, unfreed allocation per invocation, sized to the
+    /// `Debug` rendering of the WHOLE message (for `NewBlock` that is every
+    /// byte of `block_data` printed as decimal, i.e. ~5x the block size). The
+    /// function is called from `forward_to_processor`'s drop path, which is
+    /// attacker-reachable (fill the bounded ingest channel with cheap frames,
+    /// then send large `NewBlock` frames): each drop leaked megabytes,
+    /// unbounded and irreclaimable short of a restart.
+    ///
+    /// INVARIANT (H-R3-3): naming a message variant must be an allocation-free,
+    /// leak-free, `&'static str` lookup — a plain match, so the compiler (not a
+    /// runtime string scan) forces every new variant to be classified.
     pub fn kind_name(&self) -> &'static str {
-        // Debug prints "Variant { .. }" or "Variant"; take the leading ident.
-        let s: &'static str = Box::leak(format!("{:?}", self).into_boxed_str());
-        match s.find(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
-            Some(i) => &s[..i],
-            None => s,
+        match self {
+            NetworkMessage::NewBlock { .. } => "NewBlock",
+            NetworkMessage::NewTransaction { .. } => "NewTransaction",
+            NetworkMessage::PeerTip { .. } => "PeerTip",
+            NetworkMessage::PeerExchange { .. } => "PeerExchange",
+            NetworkMessage::PeerRequest => "PeerRequest",
+            NetworkMessage::PeerCount { .. } => "PeerCount",
+            NetworkMessage::GetHeaders { .. } => "GetHeaders",
+            NetworkMessage::Headers { .. } => "Headers",
+            NetworkMessage::GetBlock { .. } => "GetBlock",
+            NetworkMessage::BlockNotFound { .. } => "BlockNotFound",
+            NetworkMessage::GetTips => "GetTips",
+            NetworkMessage::Tips { .. } => "Tips",
+            NetworkMessage::Version { .. } => "Version",
+            NetworkMessage::VersionAck => "VersionAck",
         }
     }
 }
@@ -393,20 +414,29 @@ impl WirePenaltyTracker {
         match decode_wire_message(data) {
             Ok(msg) => WireReaction::Accept(msg),
             Err(e) if e.is_protocol_violation() => {
-                let score = if self.penalties.len() >= WIRE_PENALTY_TRACK_CAP
-                    && !self.penalties.contains_key(&peer)
-                {
-                    // Tracking map is full: apply a one-shot penalty
-                    // without growing the map.
-                    WIRE_VIOLATION_PENALTY
-                } else {
-                    let s = self.penalties.entry(peer).or_insert(0.0);
-                    *s = (*s + WIRE_VIOLATION_PENALTY).max(WIRE_PENALTY_FLOOR);
-                    *s
-                };
+                let score = self.record_violation(peer);
                 WireReaction::Penalize { error: e, score }
             }
             Err(e) => WireReaction::IgnoreMalformed(format!("{:?}", e)),
+        }
+    }
+
+    /// H-R3-4: apply one [`WIRE_VIOLATION_PENALTY`] to `peer` and return its
+    /// new cumulative score, WITHOUT going through [`decode_wire_message`] —
+    /// this is the entry point for protocol violations detected on the
+    /// directed `/bloch/sync/1` protocol (`sync_rr`), which has its own codec
+    /// and therefore its own decode/bounds errors, but shares one peer-score
+    /// reputation with the gossip path: an attacker cannot escape scoring by
+    /// switching which protocol it sends violations on. Same cap/floor
+    /// discipline as `classify`.
+    pub fn record_violation(&mut self, peer: PeerId) -> f64 {
+        if self.penalties.len() >= WIRE_PENALTY_TRACK_CAP && !self.penalties.contains_key(&peer) {
+            // Tracking map is full: apply a one-shot penalty without growing it.
+            WIRE_VIOLATION_PENALTY
+        } else {
+            let s = self.penalties.entry(peer).or_insert(0.0);
+            *s = (*s + WIRE_VIOLATION_PENALTY).max(WIRE_PENALTY_FLOOR);
+            *s
         }
     }
 
@@ -430,7 +460,11 @@ impl WirePenaltyTracker {
 /// address strings are attacker-controlled, so a single crafted multiaddr
 /// containing multi-byte characters at the right offset crashed the whole
 /// network event loop. This walks back to the nearest char boundary instead.
-pub(crate) fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+/// L-4 (audit): made `pub` (was `pub(crate)`) so `bin/bloch-cli.rs` — a
+/// separate crate within this package — can call the same UTF-8-safe
+/// truncation instead of hand-rolling a byte-index slice on a node-response
+/// string (which panics if a multi-byte character straddles the cut point).
+pub fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
     }
@@ -836,11 +870,39 @@ impl NetworkNode {
             .map_err(|e| NetworkError::StartFailed(format!("addr: {}", e)))?)
             .map_err(|e| NetworkError::StartFailed(e.to_string()))?;
 
-        // WebSocket listener on port 16111
-        if let Ok(ws_addr) = "/ip4/0.0.0.0/tcp/16111/ws".parse::<libp2p::Multiaddr>() {
-            match swarm.listen_on(ws_addr) {
-                Ok(_) => info!("WS listening on 0.0.0.0:16111"),
-                Err(e) => warn!("WS listen failed (non-fatal): {}", e),
+        // M-6 (audit): this used to hard-code `/ip4/0.0.0.0/tcp/16111/ws` —
+        // an all-interfaces listener that ignored `--listen` entirely. An
+        // operator who bound P2P to a private interface
+        // (`--listen /ip4/10.0.0.5/tcp/16110`) still got a second, fully
+        // functional, all-interfaces P2P listener, with nothing but an
+        // `info!` line to notice it by. Two independent fixes, both applied:
+        //
+        // 1. The WS listen address is now DERIVED from `--listen` (same host
+        //    component, TCP port + 1, `/ws` appended) instead of a literal
+        //    `0.0.0.0` — an operator's interface choice is now honored on
+        //    both listeners, not just the primary one.
+        // 2. The listener is OPT-IN via `BLOCH_ENABLE_WS_LISTENER=1` (unset
+        //    = off), matching the finding's alternative fix
+        //    ("`--ws-listen` that defaults to off"). A CLI flag would need a
+        //    `NetworkConfig` field wired from `main.rs`'s arg parser, which
+        //    is outside this file's ownership for this change — an env var
+        //    achieves the same default-closed posture without touching it;
+        //    see this patch's notes for the `main.rs` flag wiring a future
+        //    change should add.
+        let ws_enabled = std::env::var("BLOCH_ENABLE_WS_LISTENER")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if ws_enabled {
+            match ws_listen_addr_from(&self.config.listen_addr) {
+                Some(ws_addr) => match swarm.listen_on(ws_addr.clone()) {
+                    Ok(_) => info!("WS listening on {}", ws_addr),
+                    Err(e) => warn!("WS listen failed (non-fatal): {}", e),
+                },
+                None => warn!(
+                    "BLOCH_ENABLE_WS_LISTENER set but --listen ('{}') has no /tcp/<port> \
+                     component to derive a WS port from — WS listener not started",
+                    self.config.listen_addr
+                ),
             }
         }
 
@@ -868,6 +930,10 @@ impl NetworkNode {
         // the map + reaction logic moved into WirePenaltyTracker so the
         // reaction is unit-testable without a live swarm; behavior unchanged.
         let mut wire_tracker = WirePenaltyTracker::new();
+
+        // H-R3-1 fix #4: per-peer token bucket bounding the RATE of served
+        // inbound directed-sync requests. See `sync_rr::SyncRequestLimiter`.
+        let mut sync_limiter = sync_rr::SyncRequestLimiter::new();
 
         // Add hardcoded default seeds
         let mut all_seeds: Vec<String> = crate::core::DEFAULT_SEEDS.iter().map(|s| s.to_string()).collect();
@@ -1045,11 +1111,14 @@ impl NetworkNode {
                                     }
                                     NetworkMessage::PeerTip { peer_id, blue_score, height } => {
                                         debug!("← tip from {} score={}", peer_id, blue_score);
+                                        // M-9: clamp before this untrusted hint is stored anywhere.
+                                        let our_score = dag.read().tip_blue_score();
+                                        let clamped = clamp_announced_blue_score(*blue_score, our_score);
                                         // Phase-2: record the untrusted announced hint (no tips).
-                                        peer_state.observe(propagation_source, *blue_score, *height, &[], Instant::now());
+                                        peer_state.observe(propagation_source, clamped, *height, &[], Instant::now());
                                         // Announce-then-pull: track highest announced score
                                         // for directed-pull peer selection.
-                                        track_peer_score(&mut peer_sync, propagation_source, *blue_score);
+                                        track_peer_score(&mut peer_sync, propagation_source, clamped);
                                     }
                                     NetworkMessage::Headers { entries } =>
                                         info!("← {} headers", entries.len()),
@@ -1061,6 +1130,9 @@ impl NetworkNode {
                                             .map(|e| (e.blue_score, e.height))
                                             .max_by_key(|(s, _)| *s)
                                             .unwrap_or((0, 0));
+                                        // M-9: clamp before this untrusted hint is stored anywhere.
+                                        let our_score = dag.read().tip_blue_score();
+                                        let bs = clamp_announced_blue_score(bs, our_score);
                                         peer_state.observe(propagation_source, bs, ht, &hashes, Instant::now());
                                         track_peer_score(&mut peer_sync, propagation_source, bs);
                                     }
@@ -1070,9 +1142,12 @@ impl NetworkNode {
                                         } else {
                                             debug!("← version {} ({})", version, user_agent);
                                         }
+                                        // M-9: clamp before this untrusted hint is stored anywhere.
+                                        let our_score = dag.read().tip_blue_score();
+                                        let clamped = clamp_announced_blue_score(*blue_score, our_score);
                                         // Phase-2: record the untrusted announced hint (no tips).
-                                        peer_state.observe(propagation_source, *blue_score, *height, &[], Instant::now());
-                                        track_peer_score(&mut peer_sync, propagation_source, *blue_score);
+                                        peer_state.observe(propagation_source, clamped, *height, &[], Instant::now());
+                                        track_peer_score(&mut peer_sync, propagation_source, clamped);
                                     }
                                     NetworkMessage::PeerRequest => {
                                         // PROPAGAÇÃO-CHURN fix: never put an entry on the wire
@@ -1291,12 +1366,20 @@ impl NetworkNode {
                                     info!("on-connect PeerTip publish failed ({}); will re-announce when {} subscribes to sync", e, peer_id);
                                 }
                             }
-                            // PEX: request peer list from new connection
-                            if let Ok(d) = bincode::serde::encode_to_vec(&NetworkMessage::PeerRequest, bincode::config::standard()) {
-                                if let Err(e) = swarm.behaviour_mut().gossipsub.publish(sync_t.clone(), d) {
-                                    debug!("on-connect PeerRequest publish failed: {}", e);
-                                }
-                            }
+                            // M-10 (audit): PEX request is now a DIRECTED
+                            // pull to the peer that just connected, not a
+                            // broadcast to the whole gossip mesh. The old
+                            // behavior made every mesh member — not just the
+                            // new peer — see the request and independently
+                            // publish their full peer table mesh-wide in
+                            // reply: a broadcast-amplifying answer to a
+                            // broadcast question. Falls back to gossip on
+                            // `OutboundFailure` (mixed fleet: an old binary
+                            // doesn't speak `/bloch/sync/1`), exactly like
+                            // the `outbound_rx` directed-pull path.
+                            let req_id = swarm.behaviour_mut().sync_rr
+                                .send_request(&peer_id, sync_rr::SyncRequest::GetPeers);
+                            inflight_pull.insert(req_id, NetworkMessage::PeerRequest);
                         }
                         // Mesh fix (fresh-joiner IBD): the on-connect announce
                         // above races the remote peer's Subscribe — until the
@@ -1450,9 +1533,31 @@ impl NetworkNode {
                                 // us. Serve it from our DAG + block store and
                                 // reply to THAT peer only (no gossip fan-out).
                                 libp2p::request_response::Message::Request { request, channel, .. } => {
-                                    let resp = serve_sync_request(&dag, &store, &request);
-                                    if swarm.behaviour_mut().sync_rr.send_response(channel, resp).is_err() {
-                                        debug!("sync_rr: response channel closed for {}", peer);
+                                    // H-R3-1 fix #4: bound the RATE of served
+                                    // requests per peer, independent of any
+                                    // single request's now-bounded cost. A
+                                    // peer that exceeds its bucket gets no
+                                    // response — the channel is dropped and
+                                    // its 30s request timeout fires on its
+                                    // side, which is the same degradation an
+                                    // overloaded honest peer would cause.
+                                    if !sync_limiter.allow(peer) {
+                                        debug!("sync_rr: rate-limited request from {}", peer);
+                                    } else if matches!(request, sync_rr::SyncRequest::GetPeers) {
+                                        // M-10: directed peer-exchange — a
+                                        // bounded random sample, answered to
+                                        // THIS peer only (no gossip fan-out).
+                                        let external: Vec<Multiaddr> =
+                                            swarm.external_addresses().cloned().collect();
+                                        let resp = serve_get_peers(&known_peers, &external, &self.peer_id, allow_private);
+                                        if swarm.behaviour_mut().sync_rr.send_response(channel, resp).is_err() {
+                                            debug!("sync_rr: response channel closed for {}", peer);
+                                        }
+                                    } else {
+                                        let resp = serve_sync_request(&dag, &store, &request);
+                                        if swarm.behaviour_mut().sync_rr.send_response(channel, resp).is_err() {
+                                            debug!("sync_rr: response channel closed for {}", peer);
+                                        }
                                     }
                                 }
                                 // We are the CLIENT: our directed pull was
@@ -1469,10 +1574,44 @@ impl NetworkNode {
                             // gracefully — re-publish the request on the gossip
                             // sync topic so an OLD-binary peer can still answer.
                             libp2p::request_response::Event::OutboundFailure { peer, request_id, error, .. } => {
+                                // H-R3-4: a peer's ANSWER to our pull failed to
+                                // decode/pass bounds (sync_rr::decode_response /
+                                // validate_sync_response_bounds returned an
+                                // `io::ErrorKind::InvalidData`) — that is a
+                                // deliberate protocol violation by the ANSWERING
+                                // peer, not an ordinary transport failure, and
+                                // must feed the same peer-score reputation the
+                                // gossip path uses (`is_sync_protocol_violation`
+                                // is exactly the gossip/directed-sync boundary
+                                // for this decision: timeouts/resets are never
+                                // penalized).
+                                if let libp2p::request_response::OutboundFailure::Io(e) = &error {
+                                    if sync_rr::is_sync_protocol_violation(e) {
+                                        let score = wire_tracker.record_violation(peer);
+                                        swarm.behaviour_mut().gossipsub.set_application_score(&peer, score);
+                                        warn!("sync_rr wire violation (outbound) from {}: {} (app score → {})",
+                                            peer, e, score);
+                                    }
+                                }
                                 if let Some(m) = inflight_pull.remove(&request_id) {
                                     debug!("directed pull [{}] to {} failed ({}); falling back to gossip",
                                         m.kind_name(), peer, error);
                                     publish_gossip(&mut swarm, &sync_t, &m);
+                                }
+                            }
+                            // H-R3-4: a REQUEST we received failed to decode or
+                            // violated wire bounds (`decode_request` /
+                            // `validate_sync_request_bounds`) — the requesting
+                            // peer sent a malformed or oversized directed pull.
+                            // Same reputation channel as above.
+                            libp2p::request_response::Event::InboundFailure { peer, error, .. } => {
+                                if let libp2p::request_response::InboundFailure::Io(e) = &error {
+                                    if sync_rr::is_sync_protocol_violation(e) {
+                                        let score = wire_tracker.record_violation(peer);
+                                        swarm.behaviour_mut().gossipsub.set_application_score(&peer, score);
+                                        warn!("sync_rr wire violation (inbound) from {}: {} (app score → {})",
+                                            peer, e, score);
+                                    }
                                 }
                             }
                             _ => {}
@@ -1842,6 +1981,57 @@ fn track_peer_score(
     }
 }
 
+/// M-9 (audit): bound on how far ahead of our OWN locally-verified tip an
+/// announced blue_score is allowed to be before it is clamped. A single
+/// crafted `PeerTip`/`Version`/`Tips` frame claiming `blue_score = u64::MAX`
+/// used to be stored and trusted verbatim as `announced_blue_score`, which
+/// (in `main.rs`) latches `is_syncing = true` for the connection's lifetime:
+/// `caught_up = our_score + IBD_EXIT_LAG >= best_announced` can never hold
+/// against `u64::MAX`, pausing the miner and freezing the finality
+/// checkpoint. The entire historical Genesis-3 chain never exceeded
+/// ~50,600 in blue_score; this bound is chosen to be generously larger than
+/// any plausible real growth burst while remaining astronomically smaller
+/// than `u64::MAX`, so it clamps only implausible/malicious announcements,
+/// never an honest peer that is genuinely far ahead.
+const MAX_ANNOUNCED_LOOKAHEAD: u64 = 1_000_000;
+
+/// M-9: clamp a peer-announced blue_score to at most
+/// `our_verified_score + MAX_ANNOUNCED_LOOKAHEAD` before it is ever stored in
+/// [`crate::sync::peer_state::PeerStateTable`] or fed to
+/// [`sync_rr::PeerSync`]/`track_peer_score`. `our_verified_score` MUST be a
+/// LOCALLY-VERIFIED quantity (e.g. `dag.tip_blue_score()`) — clamping against
+/// an already-untrusted ceiling (another peer's announcement) would let one
+/// lie authorize the next.
+fn clamp_announced_blue_score(announced: u64, our_verified_score: u64) -> u64 {
+    announced.min(our_verified_score.saturating_add(MAX_ANNOUNCED_LOOKAHEAD))
+}
+
+/// M-6: derive the WebSocket listen multiaddr from the primary `--listen`
+/// address — same host/interface component, TCP port + 1, `/ws` appended —
+/// instead of a hard-coded `/ip4/0.0.0.0/tcp/16111/ws`. Returns `None` if
+/// `listen_addr` doesn't parse or carries no `/tcp/<port>` component (nothing
+/// to derive a WS port from).
+fn ws_listen_addr_from(listen_addr: &str) -> Option<Multiaddr> {
+    use libp2p::multiaddr::Protocol;
+    let base: Multiaddr = listen_addr.parse().ok()?;
+    let mut out = Multiaddr::empty();
+    let mut saw_tcp = false;
+    for proto in base.iter() {
+        match proto {
+            Protocol::Tcp(port) => {
+                out.push(Protocol::Tcp(port.checked_add(1)?));
+                saw_tcp = true;
+            }
+            other => out.push(other),
+        }
+    }
+    if !saw_tcp {
+        return None;
+    }
+    out.push(Protocol::Ws(std::borrow::Cow::Borrowed("/")));
+    Some(out)
+}
+
 /// Publish a message on the gossip sync topic (used for the very-early-boot and
 /// mixed-fleet graceful-degradation fallbacks of the directed pull path).
 fn publish_gossip(
@@ -1856,11 +2046,58 @@ fn publish_gossip(
     }
 }
 
+/// M-10: max peer addresses returned in one `GetPeers` answer — a bounded
+/// RANDOM SAMPLE of `known_peers`, never the whole table. Mirrors the
+/// rationale Bitcoin's `getaddr` uses (return a fraction of the table, not
+/// all of it): a requester wanting more addresses simply asks again (and, on
+/// this transport, asks a DIFFERENT peer next time via `select_pull_peer`),
+/// while a single answer can never hand over the complete peer table in one
+/// shot — the reconnaissance value of one answer is bounded regardless of
+/// how large `known_peers` (capped at `KNOWN_PEERS_CAP`, 1000) has grown.
+const PEX_RESPONSE_SAMPLE_SIZE: usize = 30;
+
+/// M-10: build the bounded, randomly-sampled peer list answer to a directed
+/// `GetPeers` request. Same address-validity filter and self-advertisement
+/// logic the (now-removed) gossip `PeerRequest` broadcast handler used —
+/// only the transport and the "return everything" -> "return a sample"
+/// change are new.
+fn serve_get_peers(
+    known_peers:     &std::collections::HashSet<String>,
+    external_addrs:  &[Multiaddr],
+    self_peer_id:    &PeerId,
+    allow_private:   bool,
+) -> sync_rr::SyncResponse {
+    use rand::seq::SliceRandom;
+
+    let mut candidates: Vec<String> = known_peers.iter()
+        .filter(|a| is_valid_public_multiaddr(a, allow_private))
+        .cloned().collect();
+    // PRINCIPLES.md #2 ("every node is a seed"): advertise our own reachable
+    // address(es) too, so a node nobody else knows about can still be
+    // gossiped onward through this answer.
+    for addr in external_addrs {
+        let self_addr = canonical_peer_addr(addr, self_peer_id);
+        if !candidates.contains(&self_addr) {
+            candidates.push(self_addr);
+        }
+    }
+    let mut rng = rand::rng();
+    candidates.shuffle(&mut rng);
+    candidates.truncate(PEX_RESPONSE_SAMPLE_SIZE);
+    sync_rr::SyncResponse::Peers { peers: candidates }
+}
+
 /// Serve an inbound directed `SyncRequest` from our DAG + block store. This is
 /// the SERVER side of announce-then-pull: block bodies live in the store (not
 /// the DAG), headers/tips come from the DAG — exactly the same sources the
 /// legacy gossip responders in `main.rs` read, so the answers are identical;
 /// only the transport (directed request-response vs. gossip broadcast) differs.
+///
+/// `GetPeers` (M-10) is handled by the caller via [`serve_get_peers`] instead
+/// of here, because it needs `known_peers` / the swarm's external addresses /
+/// this node's own `PeerId` — none of which this function otherwise needs —
+/// so this match still covers it (exhaustiveness) but never actually reaches
+/// this arm in the real event loop.
 fn serve_sync_request(
     dag:   &std::sync::Arc<parking_lot::RwLock<crate::consensus::GhostDAG>>,
     store: &std::sync::Arc<crate::storage::Storage>,
@@ -1868,6 +2105,16 @@ fn serve_sync_request(
 ) -> sync_rr::SyncResponse {
     use sync_rr::{SyncRequest, SyncResponse};
     match req {
+        SyncRequest::GetPeers => {
+            // See the function doc comment: unreachable via the real
+            // dispatch (the caller special-cases GetPeers before calling
+            // this function), kept only so this match stays exhaustive.
+            // Answering with an empty, well-formed response here — rather
+            // than `unreachable!()` — means a future refactor that DID
+            // route GetPeers here by mistake would get an empty PEX answer
+            // instead of a panic on the swarm event loop.
+            SyncResponse::Peers { peers: Vec::new() }
+        }
         SyncRequest::GetBlock { block_hash } => match store.get_block(block_hash) {
             Ok(Some(block)) => SyncResponse::Block {
                 block_hash: *block_hash,
@@ -1880,9 +2127,18 @@ fn serve_sync_request(
             _ => SyncResponse::BlockNotFound { block_hash: *block_hash },
         },
         SyncRequest::GetHeaders { from_blue_score, limit } => {
+            // H-R3-1: defense in depth. `sync_rr::decode_request` already
+            // rejects any wire `limit` above `MAX_WIRE_GETHEADERS_LIMIT`
+            // before a request reaches here, so this clamp is normally a
+            // no-op — but this function's OWN contract must not trust that
+            // upstream check alone: bound the work unconditionally, so a
+            // future caller (or a future codec change) cannot reintroduce
+            // the "peer asks for u32::MAX headers" cost on the strength of a
+            // check that lives in a different module.
+            let bounded_limit = (*limit as usize).min(MAX_WIRE_GETHEADERS_LIMIT as usize);
             let d = dag.read();
             let entries: Vec<SyncEntry> = d
-                .ordered_hashes_from(*from_blue_score, *limit as usize)
+                .ordered_hashes_from(*from_blue_score, bounded_limit)
                 .iter()
                 .filter_map(|h| d.get_node(h).map(|n| SyncEntry {
                     hash: *h, blue_score: n.blue_score, height: n.height,
@@ -1910,6 +2166,135 @@ fn serve_sync_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── M-10 regressions: bounded random-sample PEX answer ──────────────────
+
+    /// THE M-10 regression: the answer must never exceed
+    /// `PEX_RESPONSE_SAMPLE_SIZE`, even when `known_peers` holds far more —
+    /// before this fix, the (gossip-broadcast) answer was the WHOLE table.
+    #[test]
+    fn get_peers_response_is_bounded_even_with_a_large_table() {
+        let known: std::collections::HashSet<String> = (0..500)
+            .map(|i| format!("/ip4/10.0.{}.{}/tcp/16110/p2p/{}", i / 256, i % 256, PeerId::random()))
+            .collect();
+        let resp = serve_get_peers(&known, &[], &PeerId::random(), true);
+        match resp {
+            sync_rr::SyncResponse::Peers { peers } => {
+                assert!(
+                    peers.len() <= PEX_RESPONSE_SAMPLE_SIZE,
+                    "answer carried {} peers, expected <= {}", peers.len(), PEX_RESPONSE_SAMPLE_SIZE
+                );
+            }
+            other => panic!("expected Peers, got {:?}", other),
+        }
+    }
+
+    /// A table smaller than the sample size is returned (minus any
+    /// invalid/filtered entries) without padding or fabrication.
+    #[test]
+    fn get_peers_response_returns_all_of_a_small_table() {
+        let known: std::collections::HashSet<String> = [
+            format!("/ip4/45.76.1.1/tcp/16110/p2p/{}", PeerId::random()),
+            format!("/ip4/45.76.2.2/tcp/16110/p2p/{}", PeerId::random()),
+        ].into_iter().collect();
+        let resp = serve_get_peers(&known, &[], &PeerId::random(), true);
+        match resp {
+            sync_rr::SyncResponse::Peers { peers } => assert_eq!(peers.len(), 2),
+            other => panic!("expected Peers, got {:?}", other),
+        }
+    }
+
+    /// Our own external address is offered too (PRINCIPLES.md #2 — every
+    /// node is a seed), de-duplicated against `known_peers`.
+    #[test]
+    fn get_peers_response_includes_self_external_address() {
+        let known: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let self_id = PeerId::random();
+        let ext: Multiaddr = "/ip4/1.2.3.4/tcp/16110".parse().unwrap();
+        let resp = serve_get_peers(&known, std::slice::from_ref(&ext), &self_id, true);
+        match resp {
+            sync_rr::SyncResponse::Peers { peers } => {
+                assert_eq!(peers.len(), 1);
+                assert!(peers[0].contains(&self_id.to_string()));
+            }
+            other => panic!("expected Peers, got {:?}", other),
+        }
+    }
+
+    // ── M-9 regressions: announced blue_score clamp ─────────────────────────
+
+    /// THE M-9 regression: a peer claiming `blue_score = u64::MAX` must be
+    /// clamped down to a bounded value relative to what we have locally
+    /// verified, never stored/propagated verbatim. Before this fix, this
+    /// exact value latched `is_syncing` in `main.rs` for the connection's
+    /// lifetime because `our_score + IBD_EXIT_LAG >= best_announced` can
+    /// never hold against `u64::MAX`.
+    #[test]
+    fn u64_max_announcement_is_clamped_to_bounded_lookahead() {
+        let our_score = 100u64;
+        let clamped = clamp_announced_blue_score(u64::MAX, our_score);
+        assert_eq!(clamped, our_score + MAX_ANNOUNCED_LOOKAHEAD);
+        assert!(clamped < u64::MAX, "must never pass through an unbounded announcement");
+    }
+
+    /// An honest peer announcement within the lookahead window passes through unchanged.
+    #[test]
+    fn honest_announcement_within_lookahead_is_unclamped() {
+        let our_score = 100u64;
+        assert_eq!(clamp_announced_blue_score(150, our_score), 150);
+        assert_eq!(clamp_announced_blue_score(our_score, our_score), our_score);
+    }
+
+    /// An announcement below our own score is never inflated — the clamp is
+    /// a ceiling, not a floor.
+    #[test]
+    fn announcement_below_our_score_is_unaffected() {
+        let our_score = 100_000u64;
+        assert_eq!(clamp_announced_blue_score(5, our_score), 5);
+    }
+
+    /// The clamp must not overflow/panic even at u64::MAX on both sides
+    /// (checked arithmetic: `saturating_add`).
+    #[test]
+    fn clamp_does_not_overflow_at_extremes() {
+        assert_eq!(clamp_announced_blue_score(u64::MAX, u64::MAX), u64::MAX);
+        assert_eq!(clamp_announced_blue_score(0, u64::MAX), 0);
+    }
+
+    // ── M-6 regressions: WS listen address derivation ───────────────────────
+
+    /// The core M-6 fix: the WS address must follow the SAME interface as
+    /// `--listen`, not a hard-coded `0.0.0.0` — an operator binding to a
+    /// private interface must get the WS listener on that interface too.
+    #[test]
+    fn ws_listen_addr_follows_listen_interface_not_hardcoded_any() {
+        let ws = ws_listen_addr_from("/ip4/10.0.0.5/tcp/16110").unwrap();
+        assert_eq!(ws.to_string(), "/ip4/10.0.0.5/tcp/16111/ws");
+    }
+
+    /// Default `--listen` (0.0.0.0) still derives correctly — the fix must
+    /// not change behavior for the common case, only the private-interface one.
+    #[test]
+    fn ws_listen_addr_derives_port_plus_one_on_default_listen() {
+        let ws = ws_listen_addr_from("/ip4/0.0.0.0/tcp/16110").unwrap();
+        assert_eq!(ws.to_string(), "/ip4/0.0.0.0/tcp/16111/ws");
+    }
+
+    /// IPv6 interfaces must be preserved too, not silently dropped/rewritten to v4.
+    #[test]
+    fn ws_listen_addr_preserves_ipv6_host() {
+        let ws = ws_listen_addr_from("/ip6/::1/tcp/16110").unwrap();
+        assert_eq!(ws.to_string(), "/ip6/::1/tcp/16111/ws");
+    }
+
+    /// A listen address with no `/tcp/<port>` component gives nothing to
+    /// derive a WS port from — must return `None`, not panic or guess.
+    #[test]
+    fn ws_listen_addr_none_when_no_tcp_component() {
+        assert!(ws_listen_addr_from("/ip4/10.0.0.5").is_none());
+        assert!(ws_listen_addr_from("not a multiaddr").is_none());
+        assert!(ws_listen_addr_from("").is_none());
+    }
 
     /// M-11 regression: addresses that don't need DNS must be returned
     /// unchanged without touching the resolver. This exercises the

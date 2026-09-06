@@ -13,7 +13,7 @@
 //!
 //! See docs/THREAT_MODEL.md section 4 for threat analysis.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -32,6 +32,40 @@ const RL_IDLE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// on every request (keeps `check` ~O(1) between sweeps).
 const RL_GC_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
+/// M-2 (audit): hard cap on distinct rate-limit buckets tracked at once
+/// (post `/64` aggregation for IPv6 — see [`rate_limit_key`]). The map was
+/// previously bounded ONLY by the 24h idle TTL, swept at most every
+/// [`RL_GC_INTERVAL`] (10 minutes) — far too slow a window against a fast
+/// churn attacker minting a fresh source on every request (a routed IPv6
+/// `/64` is 2^64 addresses; even a single spoofed-source-per-request flood
+/// reaches this cap in well under a second at any realistic request rate).
+/// Once at capacity, a brand-new key is NOT inserted — see `check`'s
+/// overflow-bucket fallback — so the map's peak size is this constant, not
+/// "however many distinct sources an attacker can mint before the next GC".
+const MAX_TRACKED_KEYS: usize = 100_000;
+
+/// M-2 (audit): normalize a source IP to its rate-limit key. IPv4 is
+/// unchanged — a single address IS the smallest unit an operator can be
+/// assigned (`/32`). IPv6 is aggregated to its `/64` network prefix: `/64`
+/// is the STANDARD allocation an ISP/VPS/cloud provider hands to a single
+/// customer, so per-`/128` limiting (the previous behavior) let one
+/// attacker holding a routed `/64` mint 2^64 fresh, individually-unlimited
+/// rate-limit buckets from addresses it legitimately controls. Aggregating
+/// to `/64` means every address within one customer's allocation shares one
+/// bucket, matching the real-world cost of acquiring that allocation.
+fn rate_limit_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => {
+            let mut octets = v6.octets();
+            for b in &mut octets[8..] {
+                *b = 0;
+            }
+            IpAddr::V6(Ipv6Addr::from(octets))
+        }
+    }
+}
+
 /// Methods we treat as "writes" (mutating, gossipped to peers).
 /// Anything else is a read-only query of chain state.
 /// `submitblock` is the B5f pool seam (see rpc::SubmitBlockFn).
@@ -42,12 +76,20 @@ const RL_GC_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// `submitauxblock` injects a merged-mined block into consensus and
 /// `createauxblock` mints/caches full candidate blocks (CPU + memory) — both
 /// are the AuxPoW pool seam (R3-audit H-R3-5): auth + the write bucket apply.
+/// `getblocktemplate` (L-8) does not mutate consensus state, but it is
+/// listed here anyway: it is EXPENSIVE (dual DAG reads, an ancestry walk for
+/// `bits`, draining + serialising up to 2000 mempool transactions) and was
+/// previously unauthenticated at the loose read bucket, letting a poll loop
+/// force that cost repeatedly for free. `rpc::mod::HEAVY_READ_METHODS` adds
+/// the matching short-TTL/single-flight cache on top of the stricter auth +
+/// rate limit this listing gives it.
 pub const WRITE_METHODS: &[&str] = &[
     "sendrawtransaction",
     "submitblock",
     "euvm_buildtx",
     "submitauxblock",
     "createauxblock",
+    "getblocktemplate",
 ];
 
 /// Type alias for a direct (non-keyed) in-memory rate limiter.
@@ -65,6 +107,13 @@ struct IpEntry {
 struct Inner {
     buckets: HashMap<IpAddr, IpEntry>,
     last_gc: Instant,
+    /// M-2: shared fallback buckets used ONLY once `buckets` is at
+    /// [`MAX_TRACKED_KEYS`] and a request arrives from a key not already
+    /// tracked. Every such "overflow" source shares these two buckets, so
+    /// the map's memory is bounded by the cap regardless of how many
+    /// distinct (post-aggregation) sources actually show up.
+    overflow_reads:  Arc<IpRateLimiter>,
+    overflow_writes: Arc<IpRateLimiter>,
 }
 
 /// Per-IP rate-limit state. Each IP gets two buckets: one for reads, one for
@@ -82,12 +131,16 @@ pub struct RateLimiterSet {
 
 impl RateLimiterSet {
     pub fn new(reads_per_min: u32, writes_per_min: u32) -> Self {
+        let reads = Quota::per_minute(NonZeroU32::new(reads_per_min.max(1)).unwrap());
+        let writes = Quota::per_minute(NonZeroU32::new(writes_per_min.max(1)).unwrap());
         Self {
             reads_per_min,
             writes_per_min,
             inner: Mutex::new(Inner {
                 buckets: HashMap::new(),
                 last_gc: Instant::now(),
+                overflow_reads:  Arc::new(RateLimiter::direct(reads)),
+                overflow_writes: Arc::new(RateLimiter::direct(writes)),
             }),
         }
     }
@@ -101,6 +154,9 @@ impl RateLimiterSet {
             return true;
         }
 
+        // M-2: aggregate IPv6 to its /64 allocation before using it as a key.
+        let key = rate_limit_key(ip);
+
         let now = Instant::now();
         let mut inner = self.inner.lock();
 
@@ -110,8 +166,19 @@ impl RateLimiterSet {
             inner.last_gc = now;
         }
 
+        // M-2: hard cap, independent of and tighter than the idle-TTL sweep
+        // above. A brand-new key arriving once the map is already at
+        // capacity is NOT inserted — it is routed through a single shared
+        // overflow bucket instead, so the map can never grow past
+        // MAX_TRACKED_KEYS regardless of source churn between GC sweeps.
+        if !inner.buckets.contains_key(&key) && inner.buckets.len() >= MAX_TRACKED_KEYS {
+            let limiter = if is_write { inner.overflow_writes.clone() } else { inner.overflow_reads.clone() };
+            drop(inner);
+            return limiter.check().is_ok();
+        }
+
         let (reads_pm, writes_pm) = (self.reads_per_min, self.writes_per_min);
-        let entry = inner.buckets.entry(ip).or_insert_with(|| {
+        let entry = inner.buckets.entry(key).or_insert_with(|| {
             let reads = Quota::per_minute(
                 NonZeroU32::new(reads_pm.max(1)).unwrap()
             );
@@ -304,6 +371,77 @@ pub fn authorize_with_trust(
     }
 }
 
+/// M-1 (audit): `authorize_with_policy` — like every function in this file
+/// before this one — only ever required a key for WRITE methods; there was
+/// no configuration in which a read could be denied for lacking a key. That
+/// was a deliberate default ("reads remain public (explorers need them)",
+/// `main.rs`'s CLI help), but it left an operator with NO way to actually
+/// close the endpoint: the read surface is not innocuous (`getutxos`,
+/// `getbalance`, `listtransactions`, `getaddressinfo` are a complete
+/// chain-analysis toolkit against any address; `getrawmempool verbose`
+/// exposes first-seen mempool contents — the input Dandelion++ exists to
+/// deny; `getpeers` returns the full peer list, the reconnaissance step for
+/// an eclipse attempt — see `SECURITY.md`'s explicit in-scope privacy list).
+///
+/// This function adds `require_auth_for_reads`, orthogonal to
+/// `require_auth_for_writes`: when true, a read is authorized under EXACTLY
+/// the same rule writes already use — present the configured key, or be
+/// refused. Same fail-safe as the write rule: if the operator sets this true
+/// but no `configured_key` exists at all, every non-trusted read is refused
+/// rather than silently staying public (an operator cannot accidentally
+/// believe reads are locked down while they remain open because no key was
+/// configured).
+///
+/// The reads-are-public DEFAULT is unchanged — this is strictly additive;
+/// passing `require_auth_for_reads = false` reproduces `authorize_with_policy`
+/// exactly.
+pub fn authorize_with_read_policy(
+    ip: IpAddr,
+    method: &str,
+    presented_key: Option<&str>,
+    configured_key: Option<&str>,
+    require_auth_for_writes: bool,
+    require_auth_for_reads: bool,
+    trust_private_ranges: bool,
+    trust_loopback_auth: bool,
+    rate_limiter: &RateLimiterSet,
+) -> AuthDecision {
+    let fully_trusted = if ip.is_loopback() {
+        trust_loopback_auth
+    } else {
+        is_trusted_local_ip(ip, trust_private_ranges)
+    };
+    if fully_trusted {
+        return AuthDecision::Allow;
+    }
+
+    let is_write = WRITE_METHODS.contains(&method);
+
+    if !ip.is_loopback() && !rate_limiter.check(ip, is_write) {
+        return AuthDecision::RateLimited;
+    }
+
+    let requires_key =
+        (is_write && require_auth_for_writes) || (!is_write && require_auth_for_reads);
+
+    if requires_key {
+        match (presented_key, configured_key) {
+            (Some(p), Some(c)) if p.as_bytes().ct_eq(c.as_bytes()).unwrap_u8() == 1 => {
+                AuthDecision::Allow
+            }
+            _ => AuthDecision::Unauthorized,
+        }
+    } else if let (Some(p), Some(c)) = (presented_key, configured_key) {
+        if p.as_bytes().ct_eq(c.as_bytes()).unwrap_u8() == 1 {
+            AuthDecision::Allow
+        } else {
+            AuthDecision::Unauthorized
+        }
+    } else {
+        AuthDecision::Allow
+    }
+}
+
 /// Apply auth + rate-limit checks to an incoming request.
 ///
 /// Parameters:
@@ -333,6 +471,40 @@ pub fn authorize(
         false,
         rate_limiter,
     )
+}
+
+/// L-6 (audit): minimum acceptable configured API key length, in bytes.
+/// `--rpc-api-key x` was previously accepted outright — the constant-time
+/// comparison in this file then faithfully protects a one-character secret,
+/// which is security theater. 16 bytes (128 bits) is a floor, not a
+/// recommendation; operators should prefer a CSPRNG-generated key well past
+/// this length.
+pub const MIN_API_KEY_LEN: usize = 16;
+
+/// L-6 (audit): validate a configured API key BEFORE it is used for any
+/// comparison. Two properties, both about the key's LOADING, not its use:
+///
+/// 1. **No control characters.** The key travels into at least one
+///    hand-built HTTP header context (`bin/bloch-cli.rs`'s `x-api-key: {}`
+///    interpolation — see the M-11 fix there) and potentially others. A key
+///    containing `\r`/`\n`/other control bytes is a header-injection
+///    primitive wherever it is later interpolated into raw text, and no
+///    legitimate secret needs one.
+/// 2. **Minimum length.** See [`MIN_API_KEY_LEN`].
+///
+/// This does not (and cannot, from here) check the file permissions of a
+/// `--rpc-api-key-file` — that requires the file PATH, which is consumed by
+/// `main.rs` before the key ever reaches this module. Call this at load time
+/// (main.rs) AND defensively at server start (`start_rpc_server` does, on
+/// `RpcConfig.api_key`, regardless of how the caller sourced it).
+pub fn validate_api_key(key: &str) -> Result<(), &'static str> {
+    if key.chars().any(|c| c.is_control()) {
+        return Err("API key contains a control character (e.g. CR/LF) — refusing to use it");
+    }
+    if key.len() < MIN_API_KEY_LEN {
+        return Err("API key is shorter than the minimum acceptable length");
+    }
+    Ok(())
 }
 
 /// Extract API key from either `X-API-Key` header or `Authorization: Bearer <key>`.
@@ -624,6 +796,238 @@ mod tests {
         assert_eq!(d3, AuthDecision::Unauthorized);
     }
 
+    // ── L-6: API key validation ──────────────────────────────────────
+
+    #[test]
+    fn valid_key_is_accepted() {
+        assert!(validate_api_key("a-reasonably-long-random-secret-key-1234").is_ok());
+    }
+
+    #[test]
+    fn key_with_crlf_is_rejected() {
+        assert!(validate_api_key("goodlength_key\r\nX-Evil: 1").is_err());
+        assert!(validate_api_key("goodlength_key\n").is_err());
+        assert!(validate_api_key("goodlength_key\r").is_err());
+    }
+
+    #[test]
+    fn key_with_other_control_chars_is_rejected() {
+        assert!(validate_api_key("goodlength_key\0nul").is_err());
+        assert!(validate_api_key("goodlength_key\tvalue").is_err());
+    }
+
+    #[test]
+    fn too_short_key_is_rejected() {
+        assert!(validate_api_key("x").is_err());
+        assert!(validate_api_key("short").is_err());
+        assert_eq!(MIN_API_KEY_LEN, 16, "test assumes the documented floor");
+        assert!(validate_api_key(&"a".repeat(MIN_API_KEY_LEN - 1)).is_err());
+        assert!(validate_api_key(&"a".repeat(MIN_API_KEY_LEN)).is_ok());
+    }
+
+    // ── M-1: --rpc-require-auth-for-reads ───────────────────────────
+
+    /// THE M-1 regression: with `require_auth_for_reads = true` and a key
+    /// configured, an unauthenticated remote read must be refused. Before
+    /// this function existed, there was no way to express this at all — a
+    /// read was unconditionally `Allow` regardless of any flag.
+    #[test]
+    fn read_without_key_refused_when_required() {
+        let r = rl();
+        let remote: IpAddr = Ipv4Addr::new(1, 2, 3, 4).into();
+        let d = authorize_with_read_policy(
+            remote, "getutxos", None, Some("secret"),
+            false, true, false, false, &r,
+        );
+        assert_eq!(d, AuthDecision::Unauthorized);
+    }
+
+    #[test]
+    fn read_with_correct_key_allowed_when_required() {
+        let r = rl();
+        let remote: IpAddr = Ipv4Addr::new(1, 2, 3, 4).into();
+        let d = authorize_with_read_policy(
+            remote, "getutxos", Some("secret"), Some("secret"),
+            false, true, false, false, &r,
+        );
+        assert_eq!(d, AuthDecision::Allow);
+    }
+
+    #[test]
+    fn read_with_wrong_key_unauthorized_when_required() {
+        let r = rl();
+        let remote: IpAddr = Ipv4Addr::new(1, 2, 3, 4).into();
+        let d = authorize_with_read_policy(
+            remote, "getutxos", Some("wrong"), Some("secret"),
+            false, true, false, false, &r,
+        );
+        assert_eq!(d, AuthDecision::Unauthorized);
+    }
+
+    /// The default (require_auth_for_reads = false) is UNCHANGED: reads stay
+    /// public even with a key configured, exactly like `authorize_with_policy`.
+    #[test]
+    fn read_default_stays_public_when_not_required() {
+        let r = rl();
+        let remote: IpAddr = Ipv4Addr::new(1, 2, 3, 4).into();
+        let d = authorize_with_read_policy(
+            remote, "getutxos", None, Some("secret"),
+            false, false, false, false, &r,
+        );
+        assert_eq!(d, AuthDecision::Allow);
+    }
+
+    /// Fail-safe: require_auth_for_reads = true with NO key configured at
+    /// all must refuse every non-trusted read, not silently fall through to
+    /// public — an operator who sets the flag but forgets the key must not
+    /// believe reads are locked down while they are actually still open.
+    #[test]
+    fn read_required_but_no_key_configured_refuses_everything() {
+        let r = rl();
+        let remote: IpAddr = Ipv4Addr::new(1, 2, 3, 4).into();
+        let d = authorize_with_read_policy(
+            remote, "getutxos", None, None,
+            false, true, false, false, &r,
+        );
+        assert_eq!(d, AuthDecision::Unauthorized);
+    }
+
+    /// Write policy is unaffected by the new read flag — both can be
+    /// configured independently.
+    #[test]
+    fn write_policy_independent_of_read_policy() {
+        let r = rl();
+        let remote: IpAddr = Ipv4Addr::new(1, 2, 3, 4).into();
+        // Reads required, writes NOT required, no key presented on a write:
+        // the write must still pass under its own (looser) policy.
+        let d = authorize_with_read_policy(
+            remote, "sendrawtransaction", None, Some("secret"),
+            false, true, false, false, &r,
+        );
+        assert_eq!(d, AuthDecision::Allow);
+    }
+
+    /// Loopback trust still bypasses everything, same as `authorize_with_policy`.
+    #[test]
+    fn loopback_still_bypasses_read_auth_requirement_with_flag() {
+        let r = rl();
+        let loopback: IpAddr = Ipv4Addr::LOCALHOST.into();
+        let d = authorize_with_read_policy(
+            loopback, "getutxos", None, Some("secret"),
+            false, true, false, true, &r,
+        );
+        assert_eq!(d, AuthDecision::Allow);
+    }
+
+    // ── M-2: IPv6 /64 aggregation + tracked-key cap ─────────────────
+
+    /// Two IPv6 addresses in the SAME /64 must share one rate-limit bucket —
+    /// the core M-2 fix. Before it, per-/128 keying let one attacker with a
+    /// routed /64 (a standard single-customer allocation) mint an
+    /// unbounded number of individually-fresh buckets.
+    #[test]
+    fn ipv6_addresses_in_same_64_share_one_bucket() {
+        let r = RateLimiterSet::new(3, 2);
+        let a: IpAddr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).into();
+        let b: IpAddr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0xffff, 0xffff, 0xffff, 0xffff).into();
+        assert_eq!(rate_limit_key(a), rate_limit_key(b), "same /64 must normalize to the same key");
+
+        // Draining `a`'s reads must also drain `b`'s — they are the SAME bucket.
+        for _ in 0..3 {
+            authorize(a, "getblockcount", None, None, false, &r);
+        }
+        let d = authorize(b, "getblockcount", None, None, false, &r);
+        assert_eq!(d, AuthDecision::RateLimited, "addresses in the same /64 must share the exhausted bucket");
+    }
+
+    /// IPv6 addresses in DIFFERENT /64s must NOT share a bucket — the
+    /// aggregation must not be so coarse it merges unrelated allocations.
+    #[test]
+    fn ipv6_addresses_in_different_64_do_not_share_a_bucket() {
+        let r = RateLimiterSet::new(1, 1);
+        let a: IpAddr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).into();
+        let b: IpAddr = Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 1).into();
+        assert_ne!(rate_limit_key(a), rate_limit_key(b));
+
+        authorize(a, "getblockcount", None, None, false, &r); // exhausts a's 1/min
+        let d = authorize(b, "getblockcount", None, None, false, &r);
+        assert_eq!(d, AuthDecision::Allow, "a different /64 must have its own fresh bucket");
+    }
+
+    /// IPv4 keying is unchanged: two different IPv4 addresses never share a
+    /// bucket, and an address maps to itself (no aggregation).
+    #[test]
+    fn ipv4_key_is_unaggregated() {
+        let a: IpAddr = Ipv4Addr::new(1, 2, 3, 4).into();
+        assert_eq!(rate_limit_key(a), a);
+    }
+
+    /// M-2 regression — THE core memory-bound property: flooding the
+    /// limiter with far more distinct sources than `MAX_TRACKED_KEYS` must
+    /// never grow the tracked-key map past that cap. Before the fix, the map
+    /// was bounded only by a 24h idle TTL swept at most every 10 minutes, so
+    /// this exact flood (one request per distinct new IPv4) grew it without
+    /// bound. `MAX_TRACKED_KEYS` is scaled down via a second, small-capacity
+    /// `RateLimiterSet` is not possible (the cap is a fixed constant, not a
+    /// constructor parameter) — so this test drives the REAL constant
+    /// directly with `MAX_TRACKED_KEYS + 1000` distinct sources and asserts
+    /// the map never exceeds it, proving the cap holds at the scale it is
+    /// actually defined for.
+    #[test]
+    fn tracked_key_map_never_exceeds_max_tracked_keys_under_source_flood() {
+        let r = RateLimiterSet::new(60, 5);
+        let flood = MAX_TRACKED_KEYS + 1_000;
+        for i in 0..flood {
+            // Distinct IPv4 addresses: walk the whole u32 space starting an
+            // offset in so we never touch 127.0.0.0/8 (loopback bypasses the
+            // limiter entirely and would not exercise this path) or 0.0.0.0.
+            let addr = u32::from(Ipv4Addr::new(1, 0, 0, 0)) + i as u32;
+            let ip: IpAddr = Ipv4Addr::from(addr).into();
+            authorize(ip, "getblockcount", None, None, false, &r);
+        }
+        assert!(
+            r.tracked_ips() <= MAX_TRACKED_KEYS,
+            "tracked key count {} exceeded MAX_TRACKED_KEYS {} after a {}-source flood",
+            r.tracked_ips(), MAX_TRACKED_KEYS, flood
+        );
+    }
+
+    /// Overflow sources (arriving after the map is full) must still be rate
+    /// limited, not silently always-allowed — the shared overflow bucket has
+    /// its own finite quota. This complements the memory-bound test above:
+    /// that test proves the map stays small; this one proves the sources
+    /// routed around the map are still governed, not given a free pass.
+    #[test]
+    fn overflow_sources_are_still_rate_limited_not_always_allowed() {
+        let r = RateLimiterSet::new(60, 5);
+        // Fill the map to capacity first.
+        for i in 0..MAX_TRACKED_KEYS {
+            let addr = u32::from(Ipv4Addr::new(1, 0, 0, 0)) + i as u32;
+            let ip: IpAddr = Ipv4Addr::from(addr).into();
+            authorize(ip, "getblockcount", None, None, false, &r);
+        }
+        assert_eq!(r.tracked_ips(), MAX_TRACKED_KEYS, "test premise: map is exactly at capacity");
+
+        // Now flood the SHARED overflow bucket (60/min) with brand-new
+        // never-tracked sources — it must start rejecting once its own
+        // quota is spent, exactly like any single per-IP bucket would.
+        let mut allowed = 0usize;
+        let mut rate_limited = 0usize;
+        for i in 0..200u32 {
+            let addr = u32::from(Ipv4Addr::new(2, 0, 0, 0)) + i;
+            let ip: IpAddr = Ipv4Addr::from(addr).into();
+            match authorize(ip, "getblockcount", None, None, false, &r) {
+                AuthDecision::Allow => allowed += 1,
+                AuthDecision::RateLimited => rate_limited += 1,
+                other => panic!("unexpected decision for an overflow source: {:?}", other),
+            }
+        }
+        assert!(rate_limited > 0, "the shared overflow bucket must eventually reject — it is not unlimited");
+        assert!(allowed > 0, "the overflow bucket must still allow some requests before its quota is spent");
+        // And the map itself must not have grown from serving overflow traffic.
+        assert_eq!(r.tracked_ips(), MAX_TRACKED_KEYS, "overflow sources must never be inserted into the map");
+    }
+
     // ── Sprint M-patch1: trust_private_ranges tests ─────────────────
 
     #[test]
@@ -761,6 +1165,15 @@ mod tests {
             "submitauxblock injects blocks into consensus; it must be a write method");
         assert!(WRITE_METHODS.contains(&"createauxblock"),
             "createauxblock mints/caches candidate blocks; it must be a write method");
+    }
+
+    /// L-8 mutation guard: `getblocktemplate` is expensive (dual DAG reads,
+    /// an ancestry walk, up to a 2000-tx mempool drain) and must stay
+    /// privileged — removing it from WRITE_METHODS fails here.
+    #[test]
+    fn getblocktemplate_is_privileged() {
+        assert!(WRITE_METHODS.contains(&"getblocktemplate"),
+            "getblocktemplate is expensive and must require auth like the AuxPoW seam");
     }
 
     // ── R3-audit H-R3-5: loopback auth bypass is now an explicit opt-in ──

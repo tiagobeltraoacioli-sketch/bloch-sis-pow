@@ -3,14 +3,40 @@
 //! # Scope
 //!
 //! This module implements hardened cryptographic primitives for a
-//! post-quantum secure channel: an authenticated ML-KEM-768 + ML-DSA-65
-//! handshake, followed by a ChaCha20-Poly1305 stream cipher with
-//! monotonic nonce counters and domain-separated key schedule.
+//! post-quantum secure channel: an authenticated Kyber-768 (round 3,
+//! PQClean via `pqcrypto-kyber` 0.8.1) + ML-DSA-65 handshake, followed
+//! by a ChaCha20-Poly1305 stream cipher with monotonic nonce counters
+//! and domain-separated key schedule.
 //!
-//! **Status:** primitives only. These are NOT wired into libp2p in
-//! Sprint A1 — the P2P transport continues to use classical libp2p
-//! Noise (Curve25519/Ed25519). Sprint A2 will implement the libp2p
-//! `InboundConnectionUpgrade` / `OutboundConnectionUpgrade` traits.
+//! M-4 (audit): the KEM here is **Kyber-768, NOT ML-KEM-768 / NIST
+//! FIPS 203**. The two schemes are not the same thing and are **NOT
+//! interoperable** — the key/ciphertext sizes coincide (1184/1088
+//! bytes) because ML-KEM's parameter set descends from round-3 Kyber,
+//! but round-3 Kyber additionally hashes the ciphertext into the
+//! shared secret during encapsulation, which ML-KEM (finalized as
+//! FIPS 203) does not; a node built against `pqcrypto-mlkem` cannot
+//! complete a handshake with this one. This doc comment previously
+//! called the KEM "ML-KEM-768" and its constants "(FIPS 203)" — see the
+//! corrected constant docs below — which was simply wrong: `pqcrypto-kyber`
+//! wraps PQClean's `kyber768`, a distinct (and, since FIPS 203 finalized,
+//! superseded) implementation; PQClean ships ML-KEM separately, wrapped by
+//! the different crate `pqcrypto-mlkem`. Migrating to `pqcrypto-mlkem` is a
+//! wire-breaking flag day, not a rename, and is not scheduled by anything in
+//! this tree.
+//!
+//! **Status:** the handshake primitives BELOW (`Initiator` /
+//! `PendingResponder` / `SessionConfirm`, ML-DSA-65-authenticated) are
+//! DEAD CODE outside this module's own tests — nothing in the tree
+//! constructs them (`grep -rn 'Initiator::new\|PendingResponder::' src/`
+//! outside this file returns nothing). The libp2p transport that is
+//! ACTUALLY wired in (`transport::upgrade`, which this crate's `network`
+//! module uses) authenticates peers with the **libp2p identity key
+//! (Ed25519)**, not ML-DSA-65 — `upgrade.rs` documents this correctly;
+//! this module's header did not, which is corrected here. Kept for
+//! reference / possible future replacement of the Ed25519 peer-identity
+//! authentication with a PQ one; not on any live path. Sprint A2's actual
+//! libp2p `InboundConnectionUpgrade` / `OutboundConnectionUpgrade`
+//! implementation lives in `transport::upgrade`.
 //!
 //! Keeping primitives separate from transport integration lets us
 //! audit, test, and fuzz the cryptographic core in isolation.
@@ -95,9 +121,17 @@ pub const LABEL_R2I: &[u8] = b"BLOCH-PQ-v1 r->i stream";
 /// HKDF label for the session confirmation key.
 pub const LABEL_CONFIRM: &[u8] = b"BLOCH-PQ-v1 confirm";
 
-/// Kyber768 public key size (FIPS 203).
+/// Kyber768 public key size.
+///
+/// M-4 (audit): this is CRYSTALS-Kyber round 3 (PQClean, via `pqcrypto-kyber`
+/// 0.8.1), NOT ML-KEM-768 / NIST FIPS 203. The sizes happen to coincide
+/// (ML-KEM-768 also uses 1184-byte public keys) because ML-KEM's parameter
+/// set descends from round-3 Kyber, but the two schemes differ in the KEM's
+/// key-derivation step and are NOT wire-interoperable. This constant was
+/// previously (incorrectly) annotated "(FIPS 203)".
 pub const KYBER768_PK_SIZE: usize = 1184;
-/// Kyber768 ciphertext size (FIPS 203).
+/// Kyber768 ciphertext size. Same FIPS-203 caveat as [`KYBER768_PK_SIZE`]:
+/// this is round-3 Kyber's ciphertext, not ML-KEM's.
 pub const KYBER768_CT_SIZE: usize = 1088;
 /// Peer-identity public-key size. Sprint B6b: identity signatures now use the
 /// hybrid ML-DSA-65 ‖ Falcon-1024 scheme (via `crypto::sign`/`verify`), so the
@@ -122,8 +156,20 @@ pub const TRANSCRIPT_SIZE: usize = 32;
 pub const CONFIRM_MAC_SIZE: usize = 32;
 
 // ── Wire messages ───────────────────────────────────────────────────────────
+//
+// M-4 (audit): everything below in this module — `HandshakeInit`,
+// `HandshakeResp`, `SessionConfirm`, `Initiator`, `InitiatorCompleted`,
+// `PendingResponder` — is UNUSED outside this module's own `#[cfg(test)]`
+// code. The libp2p transport actually wired into the node
+// (`transport::upgrade`) implements its own Kyber-768 handshake
+// authenticated by the libp2p Ed25519 identity key, not this ML-DSA-65
+// path. Kept for reference / a possible future PQ peer-identity scheme;
+// deliberately not deleted (it is exercised by tests and a correct,
+// working reference implementation), but it must not be read as "the"
+// transport — see the module doc comment at the top of this file.
 
-/// Initiator's first message.
+/// Initiator's first message. UNUSED outside this module's own tests — see
+/// the "Wire messages" section banner above.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HandshakeInit {
     pub version:     u8,
@@ -523,6 +569,17 @@ pub fn frame_seal(tx: &mut TxStream, payload: &[u8]) -> Result<Vec<u8>, Transpor
 pub fn frame_open(rx: &mut RxStream, buf: &[u8]) -> Result<(usize, Vec<u8>), TransportError> {
     if buf.len() < 4 { return Err(TransportError::IncompleteFrame); }
     let ct_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    // M-8 (audit): this function had NO ceiling on `ct_len` at all — up to
+    // `u32::MAX` — unlike `stream::RxStream::poll_read`'s `MAX_FRAME_PAYLOAD`
+    // clamp on the exact same wire shape. Not directly exploitable through
+    // THIS entry point today (it is unused by the libp2p path, and `ct` below
+    // is a slice into a buffer the caller already holds, not a fresh
+    // allocation sized from the declared length) — kept in sync anyway so a
+    // future caller of this public function inherits the same bound the
+    // streaming path enforces, rather than a silently more permissive one.
+    if ct_len > crate::transport::stream::MAX_FRAME_PAYLOAD + TAG_SIZE {
+        return Err(TransportError::DecryptFailed);
+    }
     if buf.len() < 4 + ct_len { return Err(TransportError::IncompleteFrame); }
     let ct = &buf[4..4 + ct_len];
     let plaintext_len = ct_len.checked_sub(TAG_SIZE).ok_or(TransportError::DecryptFailed)?;

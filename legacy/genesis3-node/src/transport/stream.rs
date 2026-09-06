@@ -55,7 +55,26 @@ use crate::transport::{TxStream, RxStream, TransportError, TAG_SIZE};
 /// larger than this are rejected at open time — prevents a malicious peer
 /// from triggering unbounded memory allocation by sending a fake length
 /// prefix of u32::MAX.
-pub const MAX_FRAME_PAYLOAD: usize = 8 * 1024 * 1024; // 8 MiB
+///
+/// M-8 (audit): this was 8 MiB — 2x gossipsub's `max_transmit_size` (4 MiB,
+/// `network::mod::run`'s `gs_cfg`) and `network::MAX_WIRE_BYTES`, i.e. at
+/// least 2x larger than anything an honest peer (gossipsub itself splits at
+/// 4 MiB; yamux multiplexes into far smaller frames in practice) could ever
+/// legitimately send. A peer needed only complete the handshake and send a
+/// 4-byte length prefix declaring close to this value to make the node
+/// reserve that much memory per connection — see the incremental-allocation
+/// fix in `RxStream::poll_read`'s `Ciphertext` arm below for the other half
+/// of this finding. Lowered to match the gossipsub cap exactly: still
+/// generous headroom over real traffic, no longer a multiplier above the
+/// thing it is meant to bound.
+pub const MAX_FRAME_PAYLOAD: usize = 4 * 1024 * 1024; // 4 MiB — matches gossipsub max_transmit_size
+
+/// M-8: ciphertext buffer growth increment. The `Ciphertext` read-state arm
+/// grows its buffer by this much at a time (capped at the frame's declared
+/// length) instead of allocating the whole declared length up front, so a
+/// peer that sends a valid length prefix and then stalls commits us to at
+/// most one chunk of memory, not the full (up to `MAX_FRAME_PAYLOAD`) frame.
+const CIPHERTEXT_GROWTH_CHUNK: usize = 64 * 1024; // 64 KiB
 
 // ── Read state ───────────────────────────────────────────────────────────────
 
@@ -241,8 +260,20 @@ where
                             format!("invalid frame length {}", ct_len),
                         )));
                     }
+                    // M-8 (audit): this used to `vec![0u8; ct_len]` HERE —
+                    // reserving the full declared ciphertext length up front,
+                    // before a single ciphertext byte had actually arrived.
+                    // A peer that completes the handshake, sends a valid
+                    // 4-byte length prefix up to `MAX_FRAME_PAYLOAD`, and
+                    // then stalls (or trickles bytes in slowly) forced this
+                    // connection to hold that allocation for as long as the
+                    // connection lived. Start empty; the `Ciphertext` arm
+                    // below now grows the buffer incrementally, in
+                    // [`CIPHERTEXT_GROWTH_CHUNK`]-sized steps, so committed
+                    // memory tracks BYTES ACTUALLY RECEIVED, not the
+                    // attacker-declared length.
                     *this.read_state = ReadState::Ciphertext {
-                        buf:  vec![0u8; ct_len],
+                        buf:  Vec::new(),
                         have: 0,
                         want: ct_len,
                     };
@@ -250,7 +281,15 @@ where
 
                 ReadState::Ciphertext { buf, have, want } => {
                     while *have < *want {
-                        let slot = &mut buf[*have..*want];
+                        // Grow the buffer only as far as needed for the next
+                        // read attempt, capped at `want`. On a stalled/slow
+                        // peer this caps our commitment at one chunk instead
+                        // of the whole declared frame.
+                        let target = (*have + CIPHERTEXT_GROWTH_CHUNK).min(*want);
+                        if buf.len() < target {
+                            buf.resize(target, 0);
+                        }
+                        let slot = &mut buf[*have..target];
                         match this.inner.as_mut().poll_read(cx, slot) {
                             Poll::Pending => return Poll::Pending,
                             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -582,5 +621,100 @@ mod seal_once_tests {
             assert_eq!(&frames[i], p, "frame {} delivered in order, once", i);
         }
         assert_eq!(rx.counter(), 3, "sequence advanced exactly once per write");
+    }
+}
+
+// ── M-8 regressions: bounded frame cap + incremental ciphertext allocation ──
+
+#[cfg(test)]
+mod m8_frame_bound_tests {
+    use super::*;
+    use crate::transport::{RxStream, TxStream, STREAM_KEY_SIZE};
+    use futures::task::noop_waker;
+
+    /// A reader that serves `data` and then STALLS — returns `Pending`
+    /// forever without registering the waker (fine: the test polls exactly
+    /// once and never awaits further) — simulating a peer that sent a valid
+    /// length prefix plus a little ciphertext, then went silent.
+    struct StallingReader {
+        data: Vec<u8>,
+        pos:  usize,
+    }
+    impl AsyncRead for StallingReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            out: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.pos < self.data.len() {
+                let n = out.len().min(self.data.len() - self.pos);
+                out[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Poll::Ready(Ok(n))
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    /// M-8 fix #1: the frame cap must not exceed gossipsub's
+    /// `max_transmit_size` (4 MiB, `network::mod::run`'s `gs_cfg`) — it was
+    /// 8 MiB, a 2x multiplier above anything an honest peer could send.
+    #[test]
+    fn max_frame_payload_does_not_exceed_gossipsub_transmit_size() {
+        const GOSSIPSUB_MAX_TRANSMIT_SIZE: usize = 4 * 1024 * 1024;
+        assert!(
+            MAX_FRAME_PAYLOAD <= GOSSIPSUB_MAX_TRANSMIT_SIZE,
+            "MAX_FRAME_PAYLOAD ({}) must not exceed gossipsub's max_transmit_size ({})",
+            MAX_FRAME_PAYLOAD, GOSSIPSUB_MAX_TRANSMIT_SIZE
+        );
+    }
+
+    /// M-8 fix #2 — THE regression: a peer that sends a valid length prefix
+    /// declaring a frame at the (now 4 MiB) cap, then delivers only a
+    /// handful of ciphertext bytes and stalls, must NOT force this node to
+    /// have allocated anywhere near the full declared length. Before the
+    /// fix, `ReadState::Ciphertext` was constructed with
+    /// `buf: vec![0u8; ct_len]` — the WHOLE declared length, up front, on
+    /// the very first read of a single byte.
+    #[test]
+    fn stalled_peer_does_not_force_full_frame_allocation() {
+        let declared_len: u32 = (MAX_FRAME_PAYLOAD + TAG_SIZE) as u32; // legal: at the cap
+        let mut wire = declared_len.to_be_bytes().to_vec();
+        wire.extend_from_slice(&[0xAAu8; 1024]); // far short of declared_len, then silence
+
+        let inner = StallingReader { data: wire, pos: 0 };
+        let mut stream =
+            KyberStream::new(inner, TxStream::new([0u8; STREAM_KEY_SIZE]), RxStream::new([0u8; STREAM_KEY_SIZE]));
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut out = [0u8; 4096];
+        let poll = Pin::new(&mut stream).poll_read(&mut cx, &mut out);
+        assert!(matches!(poll, Poll::Pending), "a stalled peer must yield Pending, not an error or bogus data");
+
+        match &stream.read_state {
+            ReadState::Ciphertext { buf, have, want } => {
+                assert_eq!(*want, declared_len as usize, "the declared length must still be tracked accurately");
+                assert!(*have < *want, "only the delivered prefix should be recorded as received");
+                // The core M-8 property: committed memory tracks bytes
+                // actually received (bounded by a small multiple of
+                // CIPHERTEXT_GROWTH_CHUNK), never the attacker-declared length.
+                assert!(
+                    buf.len() <= 2 * CIPHERTEXT_GROWTH_CHUNK,
+                    "buffer grew to {} bytes for only {} bytes actually received — \
+                     not bounded to the incremental growth chunk",
+                    buf.len(), have
+                );
+                assert!(
+                    buf.len() < declared_len as usize / 10,
+                    "M-8 regression: buffer ({} bytes) must be nowhere near the full \
+                     attacker-declared frame length ({} bytes)",
+                    buf.len(), declared_len
+                );
+            }
+            other => panic!("expected ReadState::Ciphertext after the 4-byte length prefix, got {:?}",
+                std::mem::discriminant(other)),
+        }
     }
 }

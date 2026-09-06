@@ -27,9 +27,12 @@ SEV-SNP / TDX launch measurement  ───────────▶  Attestat
                                                       image_digest,  // L1
                                                       hostdata }     // policy binding
         │
-        ▼  attestation::verify(report, Expected { .. }, nonce)
+        ▼  attestation::verify(report, Expected { .. }, nonce, verifiers)
 Verdict::Trusted  ⇔  right TEE + fresh nonce + audited image_digest
                      + expected boot measurement + expected os_roothash
+                     + a QuoteVerifier for `report.tee` cryptographically
+                       confirms `quote_b64` (HIGH-5: no verifier ⇒ Rejected,
+                       never Trusted on self-reported fields alone)
 ```
 
 ## What each layer contributes
@@ -41,9 +44,25 @@ Verdict::Trusted  ⇔  right TEE + fresh nonce + audited image_digest
 | **L2** hardening | least-privilege runtime (systemd service) | — (posture) |
 | **L3** TEE | all of the above ran in a genuine SEV-SNP/TDX VM | `tee`, `measurement`, `hostdata` |
 
-`os_roothash` is the new, TEE-independent rung: even a bare-metal / non-TEE node
-can now prove it boots the exact immutable image (its verity roothash), and a
-verifier requires it by setting `Expected.os_roothash`.
+`os_roothash` is the new, TEE-independent rung: a bare-metal / non-TEE node can
+report the verity roothash of the immutable image it claims to boot, and a
+verifier can require it by setting `Expected.os_roothash`.
+
+**HIGH-5 correction:** the sentence above previously said such a node "can now
+**prove**" this. That overstated it. `read_os_roothash()` reads
+`/proc/cmdline` — a plain, self-reported value with **no hardware root of
+trust behind it on a non-TEE host**: anything that can influence what the
+process reads there (a compromised node, a spoofed report, a MITM on an
+unauthenticated channel it is relayed over) can make `os_roothash` say
+anything. On a bare-metal node there is no TPM quote or other hardware
+attestation over the boot chain wired in here to bind that string to reality
+— so `os_roothash` alone is a **claim**, not a proof. It becomes
+verifier-meaningful only inside the SEV-SNP/TDX branch of this chain, where
+[`attestation::verify`]'s `QuoteVerifier` cryptographically checks the launch
+measurement the roothash rides alongside; `verify` now fails closed
+(`Verdict::Rejected`) whenever no such cryptographic check is available,
+specifically so a self-reported `os_roothash` on its own can never produce
+`Verdict::Trusted`.
 
 ## For a verifier
 
@@ -56,7 +75,13 @@ let expected = Expected {
     hostdata: Some(POLICY_HASH.into()),
     os_roothash: Some(AUDITED_IMAGE_ROOTHASH.into()), // ← from `nix build .#attested-image`
 };
-assert_eq!(verify(&report, &expected, Some(nonce)), Verdict::Trusted);
+// `verifiers` MUST contain a QuoteVerifier that matches `report.tee` and
+// cryptographically checks `report.quote_b64` — otherwise `verify` fails
+// closed with `Verdict::Rejected`, by design (HIGH-5). There is no such
+// verifier wired in this tree yet (SEV-SNP quote verification remains
+// unimplemented — see `sev_snp.rs`), so this example is aspirational until
+// one is.
+assert_eq!(verify(&report, &expected, Some(nonce), &[&sev_snp_quote_verifier]), Verdict::Trusted);
 ```
 
 The reference `os_roothash` is deterministic output of `nix build

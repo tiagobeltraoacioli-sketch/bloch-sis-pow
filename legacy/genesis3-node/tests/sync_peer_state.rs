@@ -31,9 +31,35 @@ fn connect_and_disconnect_toggle_connected_count() {
 
     t.on_disconnect(&p);
     assert_eq!(t.connected_count(), 0);
-    // Row is retained (snapshot still sees it), just marked disconnected.
-    assert_eq!(t.snapshot().len(), 1);
-    assert!(!t.snapshot()[0].1.connected);
+    // M-3 (audit) fix: the row is now DROPPED on disconnect, not merely
+    // flagged. See `disconnect_drops_the_row_instead_of_retaining_it` below
+    // for the dedicated regression test on this exact property.
+    assert!(t.snapshot().is_empty());
+}
+
+/// M-3 regression: before the fix, `on_disconnect` retained the row
+/// (flipping only `connected = false`), so the table grew by one entry per
+/// distinct `PeerId` ever seen and never shrank — a free, unbounded-growth
+/// primitive for an attacker cycling libp2p identities (connect, announce,
+/// disconnect, repeat with a fresh keypair). This test pins the fix
+/// directly: after N distinct peers each connect-then-disconnect, the table
+/// must be EMPTY, not sized N.
+#[test]
+fn disconnect_drops_the_row_instead_of_retaining_it() {
+    let t = PeerStateTable::new();
+    let now = Instant::now();
+    let peers: Vec<PeerId> = (0..50).map(|_| PeerId::random()).collect();
+    for p in &peers {
+        t.on_connect(*p, now);
+        t.observe(*p, 1, 1, &[h(1)], now); // also exercise the observe() insertion path
+        t.on_disconnect(p);
+    }
+    assert_eq!(
+        t.snapshot().len(),
+        0,
+        "the table must not retain a row per historical identity — each disconnect must free it"
+    );
+    assert_eq!(t.connected_count(), 0);
 }
 
 #[test]
