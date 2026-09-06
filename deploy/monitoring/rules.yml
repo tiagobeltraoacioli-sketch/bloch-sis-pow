@@ -1,0 +1,170 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Alerting rules for a Bloch validator/archival node. Metric names below are
+# read from crates/bloch-pos-node/src/metrics.rs as shipped (verify against
+# that file if this rule set and the binary ever drift). Where an alert needs
+# a metric the node does not export today, it is marked "expected from patch
+# node-b" and left disabled (or best-effort approximated) rather than
+# silently referencing a series that will never fire.
+#
+# SLOTS_PER_EPOCH = 32 (crates/bloch-pos-committee/src/params.rs), block time
+# target 30s (crates/bloch-crypto/src/core/mod.rs; also
+# crates/bloch-pos-committee/src/tokenomics_v4.rs SLOTS_PER_DAY = 2,880) =>
+# one epoch ~= 32 * 30s = 960s = 16 min. "3 epochs" below = 2,880s = 48 min;
+# "2 epochs" = 1,920s / 64 slots.
+
+groups:
+  - name: bloch-pos-node.rules
+    rules:
+      # ── Finality stall: finalized_epoch not advancing for > 3 epochs ──
+      # bloch_pos_last_finality_advance_unix is stamped at boot to boot time
+      # and updated whenever finalized_epoch advances (metrics.rs doc
+      # comment). time() - that gauge is therefore exactly "seconds since
+      # finality last moved," with no rate()/increase() needed.
+      - alert: BlochFinalityStalled
+        expr: (time() - bloch_pos_last_finality_advance_unix) > (3 * 32 * 30)
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Finalized epoch has not advanced in over 3 epochs (~48 min) on {{ $labels.host_id }}"
+          description: >
+            bloch_pos_last_finality_advance_unix has not moved for more than
+            3 epochs. Cross-check bloch_pos_finalized_epoch against a second,
+            independently-operated node before assuming this is local — a
+            fleet-wide stall and a local one look identical from here alone.
+
+      # ── Finality rewinds refused > 0 ──
+      # NOT YET EXPORTED. Round-3 audit M-1: the engine's downward finality
+      # ratchet counts `finality_rewinds_refused` internally
+      # (engine.rs:2958) but metrics.rs does not export it. This is exactly
+      # the counter that would reveal a silent, permanent, self-inflicted
+      # partition (M-1's failure mode) — until it exists, this alert cannot
+      # fire and that gap is itself a finding, not a config oversight.
+      # Metric name expected from patch node-b: bloch_pos_finality_rewinds_refused_total
+      - alert: BlochFinalityRewindRefused
+        expr: increase(bloch_pos_finality_rewinds_refused_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          status: "DISABLED — metric does not exist yet (expected from patch node-b)"
+        annotations:
+          summary: "A finality rewind was refused on {{ $labels.host_id }} (M-1)"
+          description: >
+            The engine's downward finality ratchet refused a rewind — per
+            Round-3 audit M-1, this can mean the node has deleted blocks from
+            its own canonical branch and will refuse them again on re-sync, a
+            silent permanent partition. THIS RULE IS INERT until
+            bloch_pos_finality_rewinds_refused_total is exported; do not
+            assume coverage here without confirming the metric exists on the
+            running binary.
+
+      # ── Equivocations observed > 0 ──
+      # NOT YET EXPORTED. Round-3 audit NEW-1: no counter exists for
+      # attestation equivocations observed (whether accepted, held, or
+      # rejected). Metric name expected from patch node-b:
+      # bloch_pos_equivocations_observed_total
+      - alert: BlochEquivocationObserved
+        expr: increase(bloch_pos_equivocations_observed_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          status: "DISABLED — metric does not exist yet (expected from patch node-b)"
+        annotations:
+          summary: "An equivocation was observed on {{ $labels.host_id }}"
+          description: >
+            A validator produced two conflicting attestations/proposals for
+            the same slot — the exact condition slashing exists to punish and
+            the 2026-08-21 double-sign incident produced. THIS RULE IS INERT
+            until bloch_pos_equivocations_observed_total is exported.
+
+      # ── Head slot lagging wall slot by > 2 epochs ──
+      - alert: BlochHeadLaggingWallClock
+        expr: bloch_pos_behind_by_slots > (2 * 32)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.host_id }} is more than 2 epochs (64 slots) behind the wall clock"
+          description: >
+            bloch_pos_behind_by_slots > 64. On a healthy node this gauge is
+            0-1 (metrics.rs). Check bloch_pos_is_syncing — if 1, this may be
+            an expected catch-up; if 0 and lagging, the slot loop may be
+            wedged without having crossed the /health staleness threshold yet.
+
+      # ── Peer count < 2 ──
+      - alert: BlochPeerCountLow
+        expr: bloch_pos_peer_count < 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.host_id }} has fewer than 2 peers"
+          description: >
+            bloch_pos_peer_count < 2 for 10 minutes. A node with 0-1 peers
+            cannot reliably distinguish "the network is fine and I am
+            isolated" from "the network has a problem" — treat as urgent if
+            it persists alongside BlochHeadLaggingWallClock or a finality
+            stall.
+
+      # ── Disk free < 10% ──
+      # bloch_pos_data_dir_fs_free_bytes has no matching *_size_bytes series
+      # (metrics.rs exports free bytes only), so a percentage cannot be
+      # computed from the node's own metric — use node_exporter's filesystem
+      # collector for the mountpoint holding the data directory instead. The
+      # mountpoint placeholder MUST be set to the data dir's actual mount.
+      - alert: BlochDiskFreeBelow10Percent
+        expr: >
+          (node_filesystem_avail_bytes{mountpoint="REPLACE_ME_DATA_DIR_MOUNTPOINT"}
+           / node_filesystem_size_bytes{mountpoint="REPLACE_ME_DATA_DIR_MOUNTPOINT"}) < 0.10
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Disk free below 10% on {{ $labels.host_id }} (data dir mountpoint)"
+          description: >
+            The disk-full incident (metrics.rs module doc: "disk-full") is
+            fatal by design — the node exits rather than diverging RAM from
+            disk on a failed append. This alert exists to fire well before
+            that exit. Also watch bloch_pos_store_append_failures_total > 0
+            as the point-of-no-return signal if this alert was missed.
+        # Supplementary, node-reported, no percentage available:
+        # bloch_pos_data_dir_fs_free_bytes (gauge, bytes only).
+
+      # ── Clock drift (node_exporter NTP metrics) ──
+      - alert: BlochClockDrift
+        expr: abs(node_timex_offset_seconds) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Clock offset on {{ $labels.host_id }} exceeds 500ms"
+          description: >
+            node_timex_offset_seconds from node_exporter's NTP collector.
+            Slot assignment and attestation timing are wall-clock-relative;
+            drift here degrades bloch_pos_behind_by_slots readings and can
+            cause a validator to miss its slot even while otherwise healthy.
+
+      # ── keystore_sealed == 0 ──
+      # NOT YET EXPORTED. No gauge exists today distinguishing a sealed
+      # (BPOSKEY2) from a plaintext (BPOSKEY1) keystore at runtime — the node
+      # already refuses to load plaintext without an explicit opt-in
+      # (keys.rs), but that refusal is a boot-time exit, not an exported
+      # fact an already-running node's metrics can be alerted on. Metric name
+      # expected from patch node-b: bloch_pos_keystore_sealed (1=sealed,
+      # 0=plaintext-opt-in).
+      - alert: BlochKeystoreNotSealed
+        expr: bloch_pos_keystore_sealed == 0
+        for: 0m
+        labels:
+          severity: critical
+          status: "DISABLED — metric does not exist yet (expected from patch node-b)"
+        annotations:
+          summary: "{{ $labels.host_id }} is running with an unsealed (plaintext) keystore"
+          description: >
+            Relevant ahead of the epoch-2700 flag day
+            (deploy/FLAG-DAY-EPOCH-2700.md) — every fleet keystore is
+            plaintext today. THIS RULE IS INERT until
+            bloch_pos_keystore_sealed is exported; until then, confirm
+            sealed status by reading validator.key's magic bytes directly
+            per that runbook.

@@ -35,14 +35,24 @@ Genesis-4 started at epoch 0. So:
 | **before epoch 2016** — i.e. before **2026-09-05 07:07:19 UTC** | the genesis manifest and nothing else. The genesis block is its own trust anchor. |
 | **after** that instant | a **signed checkpoint** (`--ws-checkpoint` + `--ws-signer-set`) |
 
-**No signed checkpoint exists today.** The signing keys have not been
-generated — the ceremony is Phase A of `docs/specs/BLOCH-WEAK-SUBJECTIVITY.md`
-§6.1 and it has not happened. A node started after the deadline with no
-checkpoint **refuses to sync and says so**; it does not quietly follow a peer.
+**No signed checkpoint exists today, and — updated 2026-09-06 — the deadline
+above has already passed.** The signing keys have not been generated — the
+ceremony is Phase A of `docs/specs/BLOCH-WEAK-SUBJECTIVITY.md` §6.1 and it has
+not happened, on this date or before it. Said plainly, because the paragraph
+below used to be forward-looking advice and no longer is: **a third party
+attempting a first sync today (or any day after 2026-09-05 07:07:19 UTC)
+cannot independently join Genesis-4.** A node started after the deadline
+with no checkpoint **refuses to sync and says so**; it does not quietly
+follow a peer, which is correct behavior — but the practical result is that
+until the WS signing ceremony actually happens and a checkpoint is
+published, there is no supported way for a new node to establish trust in
+the chain from scratch. This is not a hypothetical edge case this document
+is being cautious about; it is the current state of every third party
+reading this section right now.
 
-A node that completes its first sync *before* the deadline keeps its own
-finality as its anchor from then on and never needs a checkpoint. **If you
-intend to run a node in 2026, start it before 5 September.** This is the single
+A node that completed its first sync *before* the deadline keeps its own
+finality as its anchor from then on and never needed a checkpoint — that
+window is now closed for anyone who has not already done so. This is the single
 time-sensitive item in this document.
 
 That instant is `genesis + 2016 × 32 × 30 s`, and you should derive it
@@ -171,10 +181,27 @@ consensus build can serve reads that disagree with the network.
 git clone https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow.git bloch-pos
 cd bloch-pos
 git checkout g4-node-20260901            # the release tag — NOT `main`, see below
-cargo build --locked --release -p bloch-pos-node
+# Corrected 2026-09-06: build FROM crates/bloch-pos-node/, not the repo root.
+# rustup resolves rust-toolchain.toml by walking UP from the current
+# directory — it does not look into subdirectories, and `--manifest-path`
+# does not change the process's working directory, so neither a plain
+# `cargo build -p bloch-pos-node` NOR `cargo build --manifest-path
+# crates/bloch-pos-node/Cargo.toml`, run from the repo ROOT, ever finds
+# crates/bloch-pos-node/rust-toolchain.toml (whose own header says it is
+# "deliberately scoped to this crate, NOT the repo root" for exactly this
+# reason). `cd` into the crate first, so rustup actually resolves the pin:
+(cd crates/bloch-pos-node && cargo build --locked --release)
+rustc --version                          # run from crates/bloch-pos-node/ — confirm 1.94.1
 ./target/release/bloch-pos --version    # must NOT say "+dirty"
 ./target/release/bloch-pos selfcheck    # verifies the frozen consensus params
 ```
+
+`crates/bloch-pos-node` is a normal member of the repo's ROOT workspace (it
+used to carry its own private `[workspace]`; it no longer does), so the
+build above still resolves the single root `Cargo.lock` and still places
+the binary at `target/release/bloch-pos` **relative to the repo root** — the
+`cd` only changes which directory `cargo` and `rustc` are invoked from, for
+toolchain resolution; it does not create a second, separate build output.
 
 > ### Build the release tag, not `main`
 >
@@ -245,10 +272,17 @@ Three caveats that will otherwise waste your afternoon:
   or a source export rather than a `git` checkout yields a *different* digest,
   because the embedded identifier differs. Reproduce our build the way §2
   describes it — clone, checkout the tag — or the comparison is meaningless.
-- **The toolchain is part of the input.** We build with **Rust 1.94.0**, the
-  version `Dockerfile` pins, targeting `x86_64-unknown-linux-gnu`. A different
-  Rust version gives a different digest. That is not a tampering signal on its
-  own; it means you have not reproduced our build.
+- **The toolchain is part of the input.** We build with **Rust 1.94.1** —
+  `crates/bloch-pos-node/rust-toolchain.toml` pins it exactly, and
+  `deploy/RELEASE-INTEGRITY.md` states it twice (corrected 2026-09-06; this
+  paragraph previously said 1.94.0, which was simply wrong and would have
+  sent you debugging the wrong variable after a mismatch) — targeting
+  `x86_64-unknown-linux-gnu`. A different Rust version gives a different
+  digest. That is not a tampering signal on its own; it means you have not
+  reproduced our build. Run `rustc --version` right after the build below and
+  confirm it printed `1.94.1` — the toolchain file only takes effect if
+  rustup resolves it from the right directory, which is exactly what the next
+  fix is about.
 - A digest match proves you built the same source we did. It does **not** prove
   that source is correct — for that, the check that matters is the ancestry one
   at the top of this section.
@@ -595,12 +629,29 @@ measured 2026-09-01 06:58 UTC, both bootnodes at finalized height 32356
 If the two finalized heights differ, you have not learned anything yet — the
 roots are only comparable at equal height. Re-read both and compare again.
 
-> **You cannot run this comparison against our bootnodes, and the guide used to
-> tell you to.** The published bootnodes bind their RPC to loopback — which §0
-> tells you to do too, and which is correct — so `getchaininfo` on
-> `139.180.166.5:16400` from your machine gets no answer. The worked example
-> above was collected *on* those hosts. Verified 2026-09-01: from a third-party
-> box, neither bootnode answers RPC.
+> **You cannot run this comparison against our bootnodes on the P2P/RPC port
+> named above, and the guide used to say you could.** Reconciled here rather
+> than left as two sections that read as contradicting each other (MED-14,
+> R6 audit):
+>
+> - **`:16400` (the node's own `--rpc-port`, what `getchaininfo` above uses):
+>   loopback-only, as designed.** From a third-party box, neither bootnode
+>   answers on this port. The worked example above was collected *on* those
+>   hosts, not against them from outside. Verified 2026-09-01.
+> - **`:8080` (a separate, exposed port on the same two hosts): OPEN to the
+>   open internet as of 2026-09-01/02**, serving the full unauthenticated RPC
+>   including `sendrawtransaction` — see the correction earlier in this
+>   document (§ "Bind it to 127.0.0.1"). Whether `:8080` should stay open is
+>   an operational decision that had **not been taken as of that
+>   measurement** — re-check `deploy/bootnodes/bootnodes.txt` and re-run
+>   `verify-bootnodes.sh --deep` for the current state before relying on
+>   either statement being still true; both are point-in-time measurements,
+>   not standing guarantees.
+>
+> Two different ports on the same hosts answering differently is not
+> actually a contradiction once named this way — it was written as one
+> because earlier revisions of this document said "RPC" without a port
+> number in both places.
 >
 > `./deploy/bootnodes/verify-bootnodes.sh --deep` is therefore an **operator**
 > tool, not a third-party one: it also tries to `ssh` into each host to confirm

@@ -1,13 +1,35 @@
 # Bloch-SIS-PoW — principles
 
-> **Genesis-3-era document — sealed 2026-08-12.** Bloch's proof-of-work
-> chain halts by consensus rule at the terminal height (50,000) and
-> Genesis-4 relaunches as proof of stake; the ownerless thesis was
+> **Genesis-3-era document — sealed 2026-08-12, extended 2026-09-06.**
+> Bloch's proof-of-work chain halted by consensus rule at the terminal
+> height (`GENESIS3_TERMINAL_HEIGHT` = 50,000; the chain actually stopped
+> and was snapshotted at height 39,918) and Genesis-4 has been running as
+> proof of stake since 2026-08-13 21:31:19 UTC; the ownerless thesis was
 > retracted (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
 >
-> The preâmbulo and principles 2, 3, 6 and the honesty discipline in 8 stand.
+> The preâmbulo and principles 3, 6 and the honesty discipline in 8 stand.
 > Principle 1 ("ownerless") is retracted; the proof-of-work content of
-> principles 4, 5 and 7 describes a consensus that is ending.
+> principles 4 and 5 describes a consensus that has ended.
+>
+> **Two further retractions, added 2026-09-06:**
+>
+> - **Principle 2 ("every node is a seed") is retracted.** Genesis-4
+>   launched with a founder-controlled bootnode set and a fleet the
+>   founder/Postern Labs operates and can revoke access to
+>   (`deploy/SSH-ROLE-SEPARATION.md`); it did not launch from a
+>   permissionless swarm every participant seeds symmetrically. The gap
+>   between that reality and this principle's text is a fact, not an
+>   aspiration to preserve unedited.
+> - **Principle 7's no-sale, no-listing, no-promoter commitments are
+>   retracted.** Genesis-4's tokenomics allocate 10% of supply to VC
+>   investors sold under vesting terms and 4% to marketing, a quarter of
+>   which is liquid at genesis "for listing fees and launch spend"
+>   (`docs/specs/BLOCH-TOKENOMICS-V4.md` §4A and its `VC_BLOCH` /
+>   `MARKETING_BLOCH` constants in `tokenomics_v4.rs`) — a private sale and
+>   a listing budget both exist, which principle 7 as written says will
+>   never happen. Read §4A for the concentration consequences of that
+>   change, not this file, which no longer states current policy on the
+>   point.
 
 ## Preâmbulo
 

@@ -157,7 +157,7 @@ change any rule, so "impossible to change" would be false.
 | eUTXO VM (`crates/bloch-euvm`) | yes | yes | ran — consensus-wired at Genesis-3 height 0; **not** wired into Genesis-4 |
 | Coherence shielded pool (C1 frozen) | yes | verifier present | never used; the mainnet pool is provably empty |
 | PoS consensus core (`crates/bloch-pos-committee`) | yes | yes — 366 tests green, measured 2026-08-13 | **yes — live** |
-| PoS node (`crates/bloch-pos-node`) | yes | yes | **yes — mainnet since 2026-08-13 21:31:19 UTC**, 64 validators on five servers, justifying and finalising |
+| PoS node (`crates/bloch-pos-node`) | yes | yes | **yes — mainnet since 2026-08-13 21:31:19 UTC**, 64 validators, justifying and finalising (current host distribution: [`deploy/FLEET-INVENTORY.md`](deploy/FLEET-INVENTORY.md) — not restated here as a round number this table cannot keep current) |
 | Tokenomics V4 | yes | constants + const-asserts in the crate | yes — it is the live emission |
 | Weak-subjectivity checkpoints | yes | no | no |
 | EVM at L1 | proposal; direction accepted (`docs/adr/ADR-040-evm-and-ustav-at-l1.md`) | **no code exists** — the authorization model is an open founder decision | no |
@@ -233,49 +233,38 @@ cargo test --workspace                              # everything
 cargo test -p bloch-pos-committee -p bloch-pos-node # Genesis-4 consensus only
 ```
 
-**`cargo test --workspace` is red, and was red before the workspace was
-reorganised.** Stated here rather than discovered by the next person who runs
-it. Measured 2026-08-13 on a clean checkout, `--release`:
+**Regenerated 2026-09-06 from the Round-3 remediation audit's dynamic
+verification pass** (that pass ran the command below against `b9d50db`;
+this table restates its result rather than re-running it here, since a
+routine documentation pass does not re-execute the full workspace suite —
+re-run the command yourself to reproduce it):
 
-| Suite | Result |
+```bash
+cargo test --workspace --all-targets   # measured 2026-09-06, commit b9d50db, exit 0
+```
+
+| Crates covered | Result |
 | --- | --- |
-| `bloch-pos-committee` — the live consensus core | **366 passed, 0 failed, 1 ignored** (+2 doc-tests) |
-| `bloch-pos-node` | 93 passed, 0 failed — **but see the flake below** |
-| `genesis4-ceremony` | 10 passed, **18 failed** |
-| `bloch` (Genesis-3, retired) | 304 passed, **1 failed** |
+| `bloch-pos-committee`, `bloch-pos-node`, `bloch-crypto`, `bloch-sis-pow`, `coherence-core`, `bloch-pq-vault`, `pqcrypto-internals`, `genesis4-ceremony`, `bloch-euvm`, `bloch-ffg`, `bloch-btc-wallet` (11 crates, 56 suites) | **1,469 passed, 0 failed, 36 ignored** (exit 0) |
 
-Every one of these reproduces on `e17faef`, the commit before the
-reorganisation. The move introduced none of them. The `bloch-pos-node` entry
-was counted as a failure when this table was first written; re-running it on
-2026-08-13 showed it is a flaky test harness, and it is described as such
-below.
+`genesis4-ceremony` — red at 19 failures when this table was last written
+(2026-08-13, `10 passed, 18 failed`) — is now green: the ceremony tests were
+re-pinned to the live tokenomics constants (carryover 18,146,400,000; 2-yr
+cliff / 8-yr linear founder vest) and now pass 28/28 on their own, folded
+into the 56-suite total above. The `bloch-pos-node` ephemeral-port flake
+this table used to describe (`cold_start.rs`, `free_port()` + `listen + 1000`
+overflowing above macOS's high ephemeral-port range) is not confirmed fixed
+by this pass — re-check `crates/bloch-pos-node/tests/cold_start.rs` if a
+`cargo test --workspace` run reproduces an intermittent failure there.
+The legacy `bloch` crate's 757 tests were **not** included in the
+2026-09-06 measurement (disk allowance on the run that produced it) —
+run `cargo test -p bloch` separately if a Genesis-3-affecting change needs
+that coverage.
 
-- The `bloch` failure is `pow::tests::k4_mined_block_rejected_at_canonical_height`,
-  a probabilistic assertion about the k=4→k=8 proof-of-work gate. It fails
-  identically on the commit before the reorganisation, so it is inherited, not
-  introduced — and it is a test of a chain that has stopped.
-- The `genesis4-ceremony` failures are **pre-existing and were simply never
-  run.** The crate used to declare its own `[workspace]`, which made
-  `cargo test --workspace` skip it; running it inside its old private
-  workspace at the previous commit produces the same 10/18 split. The tool
-  that assembled the live genesis block had failing tests and nothing
-  reported it. That is the whole argument for the membership change.
-- The `bloch-pos-node` failure is
-  `a_cold_node_builds_the_same_chain_from_genesis_without_a_donated_datadir`,
-  and it is a **flake, not a failure** — diagnosed 2026-08-13. It failed on one
-  run and passed on the next from the same clean checkout. The cause is in the
-  test harness, not the node: `free_port()` asks the kernel for an ephemeral
-  port, and the RPC port is then derived as `listen + 1000` on a `u16`
-  (`crates/bloch-pos-node/tests/cold_start.rs:151`). macOS hands out ephemeral
-  ports from 49152–65535, so any draw above 64535 overflows — and
-  `overflow-checks = true` in the workspace profile turns that into a panic
-  rather than a wrap. Three nodes per run, roughly a 6% chance each, so about
-  one run in six dies before a node ever starts. The fix is to draw the RPC
-  port with `free_port()` too instead of deriving it by addition; it is left to
-  whoever owns that file.
-
-None of these are consensus changes and none were fixed here — this commit
-moves files and fixes build wiring. Fixing them is separate work.
+None of the above claims a consensus change — see the current remediation
+audit for what is fixed-and-armed versus fixed-but-gated-inert on the live
+chain (most of it is still the latter; `deploy/FLAG-DAY-EPOCH-2700.md` and
+`SECURITY.md`'s Status section have the current gate picture).
 
 ## Prebuilt binaries
 
@@ -349,9 +338,20 @@ provide a service over a network — must release its complete corresponding
 source under the same license. A commercial license without the AGPL
 obligations is available from the author.
 
-One deliberate exception: `crates/bloch-sis-pow` stays `MIT OR Apache-2.0`.
-It is the reference implementation of the proof of work, published as a
-specification, and it dies with the Genesis-3 halt
-(`docs/adr/ADR-039-agpl-license-pos-crates.md`).
+**Not everything in this repository is AGPL.** `deny.toml`'s license policy
+(enforced in CI, `cargo deny check licenses`) names each exception rather
+than allowing copyleft-vs-permissive to be decided ad hoc; the table below
+is the current list, current as of 2026-09-06 (re-derive it from
+`grep -rn '^license' --include=Cargo.toml .` and the two `tools/*/package.json`
+files if this table and the repository ever disagree — the source files win):
+
+| Component | License | Why it is not AGPL |
+|---|---|---|
+| `crates/bloch-sis-pow` | `MIT OR Apache-2.0` | Reference implementation of the proof of work, published as a specification; dies with the Genesis-3 halt (`docs/adr/ADR-039-agpl-license-pos-crates.md`). |
+| `crates/pqcrypto-internals` | `MIT OR Apache-2.0` | A vendored fork of the upstream PQClean-based `pqcrypto` crates, carrying their original permissive license — not this project's own code. |
+| `crates/libp2p-yamux` | `MIT` | A vendored fork of upstream `yamux`/`libp2p-yamux` (purged from the dependency graph to remove a vulnerable version, GHSA-vxx9-2994-q338), carrying the upstream permissive license. |
+| `anchoring/` | `MIT OR Apache-2.0` | Standalone anchoring tooling, not part of the consensus-critical workspace. |
+| `tools/faucet/`, `tools/indexer/` | `MIT OR Apache-2.0` | Genesis-3-era JS/TS tooling that declares its own license independently of the Rust workspace's AGPL policy; whether these should move to AGPL is an open founder/PMO decision (`tools/doc-sweep/check_stale.py`'s `SKIP` list notes the same open question) and this table states the license as it is today, not as it may become. |
+| Everything else under `crates/`, `pool/`, `pool-proxy/`, `legacy/genesis3-node/`, `tools/genesis4-ceremony/` | `AGPL-3.0-or-later` | This project's own consensus, node, wallet, and tooling code. |
 
 "Bloch", "Bloch Protocol" and "Postern Labs" are trademarks of the author.

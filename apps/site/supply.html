@@ -1,15 +1,18 @@
 <!DOCTYPE html>
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
-<!-- Bloch Protocol site — supply page. Every figure carries its repo source in
-     a comment next to it. Constants: crates/bloch-pos-committee/src/tokenomics_v4.rs
-     (Tokenomics V4, spec docs/specs/BLOCH-TOKENOMICS-V4.md).
+<!-- Bloch Protocol site — supply page. Every figure cites the constant NAME in
+     crates/bloch-pos-committee/src/tokenomics_v4.rs it comes from (never a line
+     number — the file is edited far more often than this page). Spec:
+     docs/specs/BLOCH-TOKENOMICS-V4.md.
 
-     DELIBERATE OMISSION: a supply redenomination is settled 2026-08-12
-     (docs/FLEET-BRIEF-CERTIK-2026-08-12.md item 1) and is blocked on an open
-     arithmetic question. This page quotes ONLY the constants compiled into the
-     repo today — TOTAL_SUPPLY_BLOCH = 100,000,000,000 (tokenomics_v4.rs:33) —
-     and marks the total "settled 2026-08-12". Do not add the redenominated figures
-     here until the constants change. -->
+     STATUS (2026-09-06): Genesis-4 is LIVE mainnet, launched 2026-08-13
+     21:31:19 UTC. The split (x100/21) and the carryover re-measurement at
+     CARRYOVER_MEASURED_HEIGHT = 39,918 are both final and compiled in — there
+     is no "pending redenomination" left to caveat. What remains open is
+     concentration, not hashrate: this page states the founder's combined
+     position and the mechanisms that bound it (see "The supply is
+     concentrated" below) rather than a proof-of-work caveat that no longer
+     applies to a proof-of-stake chain. -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -71,20 +74,17 @@
   <p class="eyebrow">Supply &mdash; Tokenomics V4</p>
   <h1>100 billion, hard-capped.</h1>
   <p class="lede">
-    <!-- TOTAL_SUPPLY_BLOCH = 100,000,000,000, fixed (no perpetual tail):
-         crates/bloch-pos-committee/src/tokenomics_v4.rs:26-33.
-         Cap-as-consensus-invariant framing: docs/FLEET-BRIEF-CERTIK-2026-08-12.md item 2. -->
-    Genesis-4 fixes total supply at 100,000,000,000 BLCH. The cap is a consensus
-    invariant: every node refuses a block whose cumulative issuance would exceed it,
-    and no mechanism <em>inside the protocol</em> &mdash; no vote, no key, no governance
-    path &mdash; can raise it. Said precisely: a hard fork adopted by every operator can
-    change any rule; nothing short of that can change this one.
+    <!-- TOTAL_SUPPLY_BLOCH, fixed (no perpetual tail): tokenomics_v4.rs. -->
+    Genesis-4 fixes total supply at 100,000,000,000 BLCH (<code>TOTAL_SUPPLY_BLOCH</code>).
+    The cap is a consensus invariant: every node refuses a block whose cumulative issuance
+    would exceed it, and no mechanism <em>inside the protocol</em> &mdash; no vote, no key,
+    no governance path &mdash; can raise it. Said precisely: a hard fork adopted by every
+    operator can change any rule; nothing short of that can change this one.
   </p>
   <p class="lede">
-    A redenomination of the unit is settled 2026-08-12 and is not final. If it happens it
-    will be a pure split &mdash; every balance multiplied by the same factor, every
-    percentage unchanged, nobody diluted. Until it is decided, this page quotes only
-    the constants compiled into the code today.
+    Genesis-4 mainnet has been live since <strong>2026-08-13 21:31:19 UTC</strong>. The
+    100/21 split and the Genesis-3 carryover re-measurement below are both final and
+    compiled into every figure on this page &mdash; there is nothing pending to caveat.
   </p>
 </div></header>
 
@@ -93,7 +93,10 @@
     <p class="eyebrow">Allocations</p>
     <h2>Where all 100 billion go.</h2>
     <p class="sub">The seven buckets sum to the cap exactly &mdash; the build fails if they do not.</p>
-    <!-- Compile-time sum assertion: tokenomics_v4.rs:217-227. -->
+    <!-- Compile-time sum assertion in tokenomics_v4.rs binds
+         CARRYOVER_TOTAL_BLOCH + FOUNDER_BLOCH + VC_BLOCH + TEAM_BLOCH +
+         MARKETING_BLOCH + LIQUIDITY_BLOCH + VALIDATOR_EMISSION_BLOCH ==
+         TOTAL_SUPPLY_BLOCH. -->
   </div>
 
   <!-- Pizza interativa. Canvas e nao SVG porque o hit-test e por angulo, que e
@@ -110,28 +113,29 @@
       </div>
     </div>
     <ul class="pie-legend" id="pieLegend"></ul>
-    <figcaption>Hover or tap a slice. Every figure is the compiled constant in
-      <code>tokenomics_v4.rs</code>; the seven add to exactly 100,000,000,000.</figcaption>
+    <figcaption>Hover or tap a slice. Every figure is a named constant in
+      <code>tokenomics_v4.rs</code> (see the table below for which); the seven add to
+      exactly <code>TOTAL_SUPPLY_BLOCH</code> = 100,000,000,000.</figcaption>
   </figure>
   <div class="tablewrap"><table>
-    <caption>Genesis-4 allocation &mdash; tokenomics_v4.rs, planned</caption>
+    <caption>Genesis-4 allocation &mdash; tokenomics_v4.rs, live mainnet</caption>
     <thead><tr><th scope="col">Allocation</th><th scope="col" class="num">BLCH</th><th scope="col" class="num">Share</th><th scope="col" style="width:30%"><span style="position:absolute;left:-999px">Relative size</span>&nbsp;</th></tr></thead>
     <tbody>
-      <!-- VALIDATOR_EMISSION_BLOCH = 43,029,120,000 (remainder, pinned by
-           assertion at tokenomics_v4.rs:229-232). -->
-      <tr><td>Validator emission &mdash; 40 years</td><td class="num">43,029,120,000</td><td class="num">43.03%</td><td><div class="bar" style="width:100%" aria-hidden="true"></div></td></tr>
-      <!-- CARRYOVER_TOTAL_BLOCH = 17,970,880,000: tokenomics_v4.rs:100.
-           Measured at height 43,172, 448,337 UTXOs, 15 addresses: :75-77. -->
-      <tr><td>Carried over from Genesis-3</td><td class="num">17,970,880,000</td><td class="num">17.97%</td><td><div class="bar" style="width:41.8%" aria-hidden="true"></div></td></tr>
-      <!-- FOUNDER_BLOCH = 10,000,000,000: tokenomics_v4.rs:46. -->
-      <tr><td>Founder &mdash; 10-year cliff, 40-year vest</td><td class="num">10,000,000,000</td><td class="num">10.00%</td><td><div class="bar" style="width:23.2%" aria-hidden="true"></div></td></tr>
-      <!-- VC_BLOCH = 10,000,000,000: tokenomics_v4.rs:49. -->
-      <tr><td>Investors (VC)</td><td class="num">10,000,000,000</td><td class="num">10.00%</td><td><div class="bar" style="width:23.2%" aria-hidden="true"></div></td></tr>
-      <!-- TEAM_BLOCH = 10,000,000,000: tokenomics_v4.rs:53. -->
-      <tr><td>Team</td><td class="num">10,000,000,000</td><td class="num">10.00%</td><td><div class="bar" style="width:23.2%" aria-hidden="true"></div></td></tr>
-      <!-- LIQUIDITY_BLOCH = 5,000,000,000: tokenomics_v4.rs:59. -->
-      <tr><td>Liquidity</td><td class="num">5,000,000,000</td><td class="num">5.00%</td><td><div class="bar" style="width:11.6%" aria-hidden="true"></div></td></tr>
-      <!-- MARKETING_BLOCH = 4,000,000,000: tokenomics_v4.rs:56. -->
+      <!-- VALIDATOR_EMISSION_BLOCH (the remainder after the six buckets below;
+           pinned by a compile-time assertion against TOTAL_SUPPLY_BLOCH). -->
+      <tr><td>Validator emission &mdash; 40 years</td><td class="num">42,853,600,000</td><td class="num">42.85%</td><td><div class="bar" style="width:100%" aria-hidden="true"></div></td></tr>
+      <!-- CARRYOVER_TOTAL_BLOCH — re-measured 2026-08-11 at
+           CARRYOVER_MEASURED_HEIGHT = 39,918, CARRYOVER_MEASURED_UTXOS = 452,726. -->
+      <tr><td>Carried over from Genesis-3</td><td class="num">18,146,400,000</td><td class="num">18.15%</td><td><div class="bar" style="width:42.4%" aria-hidden="true"></div></td></tr>
+      <!-- FOUNDER_BLOCH -->
+      <tr><td>Founder &mdash; 2-year cliff, 8-year vest</td><td class="num">10,000,000,000</td><td class="num">10.00%</td><td><div class="bar" style="width:23.3%" aria-hidden="true"></div></td></tr>
+      <!-- VC_BLOCH -->
+      <tr><td>Investors (VC)</td><td class="num">10,000,000,000</td><td class="num">10.00%</td><td><div class="bar" style="width:23.3%" aria-hidden="true"></div></td></tr>
+      <!-- TEAM_BLOCH -->
+      <tr><td>Team</td><td class="num">10,000,000,000</td><td class="num">10.00%</td><td><div class="bar" style="width:23.3%" aria-hidden="true"></div></td></tr>
+      <!-- LIQUIDITY_BLOCH -->
+      <tr><td>Liquidity</td><td class="num">5,000,000,000</td><td class="num">5.00%</td><td><div class="bar" style="width:11.7%" aria-hidden="true"></div></td></tr>
+      <!-- MARKETING_BLOCH -->
       <tr><td>Marketing</td><td class="num">4,000,000,000</td><td class="num">4.00%</td><td><div class="bar" style="width:9.3%" aria-hidden="true"></div></td></tr>
     </tbody>
   </table></div>
@@ -150,21 +154,24 @@
          per-slot linear instead of tranches: :141-153. -->
   </div>
   <div class="tablewrap"><table>
-    <caption>Unlock schedules &mdash; tokenomics_v4.rs, planned</caption>
+    <caption>Unlock schedules &mdash; tokenomics_v4.rs, live mainnet</caption>
     <thead><tr><th scope="col">Bucket</th><th scope="col">Liquid at genesis</th><th scope="col">Cliff</th><th scope="col">Linear vest</th><th scope="col">Fully vested</th></tr></thead>
     <tbody>
-      <!-- Founder: 10-year cliff + 40-year linear: tokenomics_v4.rs:128-139. -->
-      <tr><td>Founder</td><td>None</td><td class="num">10 years</td><td class="num">40 years</td><td class="num">year 50</td></tr>
-      <!-- Team: 18-month cliff + 36-month linear: tokenomics_v4.rs:272-277. -->
+      <!-- Founder: FOUNDER_CLIFF_SLOTS (2 yr) + FOUNDER_VESTING_SLOTS (8 yr),
+           decided 2026-08-21 (founder decision; an earlier draft read 10yr/40yr). -->
+      <tr><td>Founder</td><td>None</td><td class="num">2 years</td><td class="num">8 years</td><td class="num">year 10</td></tr>
+      <!-- Team: TEAM_CLIFF_SLOTS (18 mo) + TEAM_VESTING_SLOTS (36 mo). -->
       <tr><td>Team</td><td>None</td><td class="num">18 months</td><td class="num">36 months</td><td class="num">year 4.5</td></tr>
-      <!-- VC: 12-month cliff + 24-month linear: tokenomics_v4.rs:267-270. -->
+      <!-- VC: VC_CLIFF_SLOTS (12 mo) + VC_VESTING_SLOTS (24 mo). -->
       <tr><td>Investors (VC)</td><td>None</td><td class="num">12 months</td><td class="num">24 months</td><td class="num">year 3</td></tr>
-      <!-- Marketing: 25% at TGE (210,000,000), rest 24-month linear:
-           tokenomics_v4.rs:54-56,279-284. -->
-      <tr><td>Marketing</td><td>25% &mdash; 210,000,000</td><td class="num">&mdash;</td><td class="num">24 months</td><td class="num">year 2</td></tr>
-      <!-- Liquidity: 100% at genesis, deliberately: tokenomics_v4.rs:57-59,313-317. -->
+      <!-- Marketing: MARKETING_TGE_NUMERATOR/DENOMINATOR = 25% at TGE
+           (1,000,000,000 of MARKETING_BLOCH), rest over MARKETING_VESTING_SLOTS
+           (24 mo) linear. -->
+      <tr><td>Marketing</td><td>25% &mdash; 1,000,000,000</td><td class="num">&mdash;</td><td class="num">24 months</td><td class="num">year 2</td></tr>
+      <!-- Liquidity: 100% at genesis, deliberately. -->
       <tr><td>Liquidity</td><td>100%</td><td class="num">&mdash;</td><td class="num">&mdash;</td><td class="num">genesis</td></tr>
-      <!-- Carryover: ordinary liquid balance, stakeable: tokenomics_v4.rs:75-99. -->
+      <!-- Carryover: ordinary liquid balance, stakeable (decided 2026-08-11,
+           BLOCH-TOKENOMICS-V4.md §4A.1). -->
       <tr><td>Carryover</td><td>100% &mdash; ordinary liquid balance</td><td class="num">&mdash;</td><td class="num">&mdash;</td><td class="num">genesis</td></tr>
     </tbody>
   </table></div>
@@ -175,16 +182,21 @@
     <p class="eyebrow">Emission</p>
     <h2>Forty years of smooth disinflation, then fees only.</h2>
     <p class="sub">
-      <!-- Recommended decay curve: 10%/year decline, sums exactly to the
-           validator allocation, no tail: tokenomics_v4.rs:371-418.
-           Inflation figures: annual_inflation_bps — year 1 = 4.37% of total
-           supply, year 5 = 2.86%, year 10 = 1.69%: tokenomics_v4.rs:383-385. -->
+      <!-- Recommended decay curve (validator_reward_decay_sat): 10%/year
+           decline (DECAY_NUMERATOR/DECAY_DENOMINATOR = 9/10), sums to the
+           validator allocation minus EMISSION_DUST_SAT (irreducible, not
+           zero — see the constant's doc comment).
+           Inflation figures: annual_inflation_bps(0)=434 bps=4.34%,
+           annual_inflation_bps(4)=285 bps=2.85%, annual_inflation_bps(9)=168
+           bps=1.68% — recomputed against the current VALIDATOR_EMISSION_BLOCH,
+           not restated from an earlier allocation. -->
       The recommended curve declines 10% per year with no halving dates &mdash; a halving
       is a scheduled day on which every validator&rsquo;s revenue drops by half at once,
-      and marginal operators leave together. Annual issuance is 4.37% of total supply in
-      year one, 2.86% by year five, 1.69% by year ten, and the forty-year total lands on
-      the validator allocation with zero residual. After year forty, validators earn
-      fees only.
+      and marginal operators leave together. Annual issuance is 4.34% of total supply in
+      year one, 2.85% by year five, 1.68% by year ten, and the forty-year total lands on
+      the validator allocation with a fixed, irreducible residual of
+      <code>EMISSION_DUST_SAT</code> (855,280 sat &mdash; 0.0086 BLCH, permanently
+      unissued). After year forty, validators earn fees only.
     </p>
   </div>
   <div class="card plain wide">
@@ -207,17 +219,19 @@
   </div>
   <div class="card c wide">
     <h3>The numbers, plainly</h3>
-    <!-- Largest carried-over address: 16,886,549,523 BLCH of 17,970,880,000
-         carryover (~94%): tokenomics_v4.rs:96-99,234-237.
-         Founder total incl. new grant = 26.89% of supply, pinned by assertion:
-         tokenomics_v4.rs:239-241. -->
+    <!-- LARGEST_CARRYOVER_ADDRESS_BLOCH of CARRYOVER_TOTAL_BLOCH = 93.94% of
+         the carryover. FOUNDER_TOTAL_BLOCH (= LARGEST_CARRYOVER_ADDRESS_BLOCH
+         + FOUNDER_BLOCH) is pinned at 2,704 bps = 27.04% of TOTAL_SUPPLY_BLOCH
+         by a compile-time assertion. -->
     <p style="max-width:var(--measure)">
-      The largest carried-over address holds 16,886,549,523 BLCH &mdash; roughly 94% of
-      the carryover &mdash; liquid from slot 0. It belongs to the founder, who mined it
-      on the same chain, under the same rules as everyone else. With the new vested
-      grant on top, the founder&rsquo;s combined position is 26.89% of total supply.
-      Relabelling changes no balance, so the number is stated here rather than
-      discovered later.
+      The largest carried-over address holds 17,046,829,380 BLCH &mdash; 93.94% of
+      the carryover (<code>LARGEST_CARRYOVER_ADDRESS_BLOCH</code> /
+      <code>CARRYOVER_TOTAL_BLOCH</code>) &mdash; liquid from slot 0. It belongs to the
+      founder, who mined it on the same chain, under the same rules as everyone else.
+      With the new vested grant on top, the founder&rsquo;s combined position is 27.04%
+      of total supply (<code>FOUNDER_TOTAL_BLOCH</code>, pinned by assertion at 2,704
+      basis points). Relabelling changes no balance, so the number is stated here
+      rather than discovered later.
     </p>
     <h3 style="margin-top:1rem">What bounds it &mdash; and what does not</h3>
     <p style="max-width:var(--measure)">
@@ -261,8 +275,8 @@
   var ctx=c.getContext('2d'), DPR=Math.min(window.devicePixelRatio||1,2);
   // Fonte unica: os mesmos numeros que a tabela abaixo cita.
   var SEG=[
-    {n:'Validator emission',   v:43029120000, k:'--accent'},
-    {n:'Carried over from G3', v:17970880000, k:'--violet'},
+    {n:'Validator emission',   v:42853600000, k:'--accent'},
+    {n:'Carried over from G3', v:18146400000, k:'--violet'},
     {n:'Founder grant',        v:10000000000, k:'--signal'},
     {n:'Ecosystem & investors',v:10000000000, k:'--accent'},
     {n:'Team',                 v:10000000000, k:'--violet'},

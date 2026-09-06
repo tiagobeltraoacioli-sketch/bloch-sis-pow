@@ -27,10 +27,22 @@ ledger should have been; a finding that only affects mining or block
 production on a chain nobody is producing on has no live impact.
 
 The live network is **unaudited**, and stake is heavily concentrated: the
-founder holds roughly 94% of the carried-over balance and it is stakeable, so
-a naive Nakamoto coefficient is 1. The genesis validator cohort was allocated
-by the founder and sits on five servers. Running a live mainnet is a
-designation, not a security claim, and no security property is claimed.
+founder holds 93.94% of the carried-over balance
+(`LARGEST_CARRYOVER_ADDRESS_BLOCH` / `CARRYOVER_TOTAL_BLOCH`,
+`tokenomics_v4.rs`) and it is stakeable, so a naive Nakamoto coefficient is 1.
+The genesis validator cohort was allocated by the founder; its current host
+distribution is tracked in [`deploy/FLEET-INVENTORY.md`](./deploy/FLEET-INVENTORY.md)
+rather than restated here as a round number this file cannot keep current.
+Running a live mainnet is a designation, not a security claim, and no
+security property is claimed.
+
+**The epoch-2700 flag day (2026-09-12 21:31 UTC) is the next scheduled
+consensus change** — it arms the gate that closes the 2026-08-24
+finality-divergence finding. See
+[`deploy/FLAG-DAY-EPOCH-2700.md`](./deploy/FLAG-DAY-EPOCH-2700.md) for the
+prerequisites, verification steps, and abort criteria; a report against a
+finding that flag day closes should note whether it was filed before or
+after the gate armed.
 **No external security audit has been contracted to date**; if any other page
 or document suggests otherwise, this statement is the accurate one. The
 posture we are building toward — and its open gates — is in
@@ -70,8 +82,14 @@ will not pursue reporters acting in good faith.
   Genesis-4 opened from — the balance set at height 39,918. GhostDAG ordering,
   SHA-256d and AuxPoW verification, difficulty retargeting and reorg on a
   chain that has stopped producing are historical, not live.
-- The Coherence privacy layer (shielded pool, spend proofs) and network-layer
-  metadata privacy (Dandelion++).
+- The Coherence privacy layer (shielded pool, spend proofs). Network-layer
+  metadata privacy (Dandelion++) is **roadmap, not shipped** — the code
+  present in the tree is dead/unwired (see the Round-3 remediation audit's
+  legacy-network findings), so a report against "Dandelion++" as a live
+  protection is out of scope until it is actually wired into a transport
+  path; a report that the *absence* of Dandelion++ makes a specific
+  deanonymization attack cheaper is in scope under the privacy-findings
+  bullet below.
 - Node, wallet, keystore, RPC, and the attestation layer (L1–L3).
 - **Privacy findings are explicitly in scope** — deanonymization, metadata leaks,
   address linkability, and any way the protocol could surveil or link users (it
@@ -99,8 +117,15 @@ will not pursue reporters acting in good faith.
   (`crates/pqcrypto-internals`) so the workspace is self-contained. `cargo deny
   check` (`deny.toml`) enforces permissive licenses (no copyleft), no external
   git deps, and RUSTSEC advisories — run in CI.
-- **Secret scanning:** `gitleaks` runs in CI to catch committed credentials.
-  Rotate any credential that ever touches a shell or history.
+- **Secret scanning:** `gitleaks` runs as a **blocking** CI job (fixed
+  2026-09-04, finding I-H4 — it and `osv-scanner` used to `allow_failure`/
+  `continue-on-error` and silently skip when the binary was missing on a
+  runner, going green having scanned nothing; both now install a pinned
+  binary via `scripts/ci-install-scanner.sh` and fail the pipeline on a
+  hit, held to that posture by `scripts/check-scanners-blocking.py`).
+  Rotate any credential that ever touches a shell or history regardless —
+  a blocking scanner catches what gets committed going forward, not
+  history that predates it.
 - **Reproducible builds:** the node image is byte-reproducible (L1); releases
   should be signed. The OS images (Postern OS) are reproducible by construction.
 - **Least privilege:** the node runs hardened (L2 container hardening / the NixOS
@@ -116,3 +141,39 @@ will not pursue reporters acting in good faith.
 We do not claim any security or privacy property before its audit gate clears
 (S1/S2 for security, P2/C4 for privacy). No "100% private" claim, ever, before an
 external audit.
+
+## Guidance for integrators: when to treat a block as settled
+
+An integrator (exchange, bridge, custody provider, another chain's light
+client) asking "when is a Genesis-4 transaction safe to credit" should use
+**finality plus a margin, confirmed by more than one independently-operated
+node**, not raw confirmation depth:
+
+- Wait for the transaction's block to be **finalized** (Casper-style FFG;
+  `finalized_epoch` in `getchaininfo`/the RPC surface), not merely included —
+  an included-but-unfinalized block can still be reorganized under this
+  fork-choice rule.
+- Then wait roughly **30 further, uninterrupted epochs** before treating a
+  large or irreversible credit as final. This margin exists because the
+  finality ratchet itself is new and its edge cases are still being found in
+  audit (the Round-3 remediation audit's M-1 finding describes a scenario
+  where the engine's own downward finality ratchet can refuse a legitimate
+  rewind and silently partition a node from the honest branch) — 30 epochs
+  of continued, uninterrupted agreement between independently-operated nodes
+  is meant to be well past the window in which that class of defect would
+  surface as a visible disagreement, not a guarantee derived from a formal
+  bound.
+- **Query at least two nodes you do not operate as a single point of
+  observation** — i.e., nodes that do not share an operator, a keystore, or
+  (ideally) a network path — and require them to agree on the same
+  finalized root at the same finalized epoch before treating the answer as
+  authoritative. A single node's `getchaininfo` answer proves only that one
+  node's view, and the whole reason two-node cross-checks appear repeatedly
+  in this repository's own runbooks (`deploy/bootnodes/verify-bootnodes.sh`'s
+  fork check, `deploy/FLAG-DAY-EPOCH-2700.md`'s verification section) is that
+  a single node's self-report is not independent evidence of anything.
+- Re-read the current Round-3 (or later) remediation audit before relying on
+  any specific consensus gate — several fixes exist in code but are not yet
+  armed on the live chain (§4.2 of that audit); a defect a report names may
+  be "fixed" in a sense that does not yet apply to blocks being produced
+  today.

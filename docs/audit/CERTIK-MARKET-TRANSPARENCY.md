@@ -146,7 +146,7 @@ holder's liquid balance:
    their owner voluntarily bonded, and every parameter is a public constant.
    **Legitimate.**
 2. **Vesting — restricts allocation recipients, not holders.** Founder
-   grant: 10-year cliff + 40-year per-slot linear vest
+   grant: 2-year cliff + 8-year per-slot linear vest
    (`tokenomics_v4.rs:137–139`); VC 12-month cliff + 24 linear
    (`tokenomics_v4.rs:269`); team 18 + 36 (`tokenomics_v4.rs:276`);
    marketing 25% at TGE + 24 months (`tokenomics_v4.rs:282`); liquidity
@@ -234,8 +234,8 @@ stake across many validators and keep economic control; beneficial ownership
 is invisible on-chain (`delegation.rs:80–84`, `genesis_cohort.rs:41–48`).
 The cohort cap binds only the genesis addresses — nothing prevents funding
 new validators outside the cohort. And the concentration these caps operate
-against is severe: the largest carried-over address holds 16,886,549,523 of
-17,970,880,000 BLCH — 93.97% of the carryover — and if staked would be ~94%
+against is severe: the largest carried-over address holds 17,046,829,380 of
+18,146,400,000 BLCH — 93.94% of the carryover — and if staked would be ~94%
 of active stake, Nakamoto coefficient 1
 (`docs/specs/BLOCH-TOKENOMICS-V4.md` §4A/§4A.1;
 `tokenomics_v4.rs::LARGEST_CARRYOVER_ADDRESS_BLOCH`, line 236). §4A.1's

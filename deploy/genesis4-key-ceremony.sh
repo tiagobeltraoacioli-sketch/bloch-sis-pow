@@ -29,17 +29,86 @@ COUNT="${3:-64}"
 
 [ -x "$BIN" ] || { echo "FATAL: $BIN is not executable"; exit 1; }
 
+# MED-10: COUNT must be a plain positive decimal integer, checked before it
+# drives `seq`/array sizing below. An unvalidated COUNT accepts things like
+# "64; rm -rf /" nowhere here (there is no eval), but it also accepted
+# "0", "-1", "abc", or a huge number silently misbehaving in `seq` — a
+# ceremony that silently generates 0 or the wrong number of keys is exactly
+# the "ran differently and wrong" failure mode this script exists to prevent.
+case "$COUNT" in
+    ''|*[!0-9]*)
+        echo "FATAL: count must be a positive integer (got: '$COUNT')"
+        exit 1
+        ;;
+esac
+if [ "$COUNT" -lt 1 ] || [ "$COUNT" -gt 9999 ]; then
+    echo "FATAL: count out of sane range (got: $COUNT, expected 1-9999)"
+    exit 1
+fi
+
 # ── Refuse to run networked ────────────────────────────────────────────────
 #
 # Not theatre. A ceremony on a machine that can reach the internet has the one
 # property it was supposed to eliminate. Checked rather than trusted, because
 # "I disconnected it" is exactly the kind of thing people are sure about and
-# wrong about.
+# wrong about. Layered, because any single probe is defeatable: ICMP alone
+# misses a network that blocks ping but permits TCP/DNS; a TCP-connect probe
+# alone misses one that blocks that port but resolves DNS; and a machine with
+# no default route can still have live link-local/LAN reachability that a
+# probe to a public IP never exercises, so the route table is checked too.
+NET_SIGNS=""
+
 if ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 || ping -c1 -t2 1.1.1.1 >/dev/null 2>&1; then
+    NET_SIGNS="${NET_SIGNS}ICMP to 1.1.1.1 answered. "
+fi
+
+# TCP-connect probe, no external tool required: bash's /dev/tcp pseudo-device.
+# Short timeout — this must fail FAST on a truly air-gapped host, not hang.
+if timeout 3 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null; then
+    NET_SIGNS="${NET_SIGNS}TCP connect to 1.1.1.1:443 succeeded. "
+fi
+
+# DNS resolution probe — a host can be air-gapped from the wider internet but
+# still reach an internal resolver that leaks the ceremony's activity/timing;
+# any answer at all here is a signal this host is not isolated.
+if command -v getent >/dev/null 2>&1 && getent hosts cloudflare.com >/dev/null 2>&1; then
+    NET_SIGNS="${NET_SIGNS}DNS resolution of cloudflare.com succeeded. "
+elif command -v host >/dev/null 2>&1 && host -W2 cloudflare.com >/dev/null 2>&1; then
+    NET_SIGNS="${NET_SIGNS}DNS resolution of cloudflare.com succeeded. "
+fi
+
+# No-default-route assertion: a host with no default route cannot reach the
+# public internet at all regardless of what any single probe above measured
+# at this instant (a probe result is a point-in-time sample; the absence of a
+# route is closer to a structural guarantee against the same host reaching
+# out a minute later). This is a POSITIVE check (must show NO route), unlike
+# the three probes above (must show no answer) — record it separately so a
+# platform where `ip`/`route` are unavailable does not silently pass by
+# omission.
+ROUTE_CHECK="not performed (neither 'ip' nor 'route' available)"
+if command -v ip >/dev/null 2>&1; then
+    if ip route show default 2>/dev/null | grep -q .; then
+        NET_SIGNS="${NET_SIGNS}A default route exists (ip route show default). "
+    fi
+    ROUTE_CHECK="performed via 'ip route'"
+elif command -v route >/dev/null 2>&1; then
+    if route -n 2>/dev/null | awk '$1=="0.0.0.0"{f=1} END{exit !f}'; then
+        NET_SIGNS="${NET_SIGNS}A default route exists (route -n). "
+    fi
+    ROUTE_CHECK="performed via 'route -n'"
+fi
+
+if [ -n "$NET_SIGNS" ]; then
     echo "FATAL: this machine has network access."
+    echo "       Signal(s): $NET_SIGNS"
     echo "       The whole point of the ceremony is that it does not."
     echo "       Disconnect it — physically, not by disabling an interface — and re-run."
     exit 1
+fi
+echo "  network isolation: ICMP/TCP/DNS probes clean; no-default-route check $ROUTE_CHECK"
+if [ "$ROUTE_CHECK" = "not performed (neither 'ip' nor 'route' available)" ]; then
+    echo "  WARNING: could not check for a default route on this host (no 'ip' or 'route')."
+    echo "           The three probes above are the only isolation evidence this run has."
 fi
 
 # ── Refuse to overwrite ────────────────────────────────────────────────────
@@ -132,14 +201,52 @@ echo "  all $COUNT keystores present, sealed (BPOSKEY2), mode 0600"
     done
 } > "$OUT/cohort.tsv"
 
+# Portable sha256 of a FILE. Prefers sha256sum, falls back to shasum (macOS
+# has no sha256sum by default), falls back to openssl. Prints the hex digest
+# alone.
+sha256_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        openssl dgst -sha256 "$1" | awk '{print $NF}'
+    fi
+}
+
+# Portable sha256 of STDIN, for the per-row digests below (no temp file).
+sha256_stdin() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 | awk '{print $1}'
+    else
+        openssl dgst -sha256 | awk '{print $NF}'
+    fi
+}
+
 # ── Digests, so the carry-out can be checked on arrival ────────────────────
+#
+# A single whole-file digest tells you the file changed; it does not tell you
+# WHICH row, so a corrupted or tampered single validator entry is indistin-
+# guishable from a clean transfer gone wrong until every row is hand-diffed
+# against a second copy. A per-row digest, over that row's own bytes, means a
+# single bad entry is caught and named without needing a second reference
+# copy of the whole file to diff against.
 {
     echo "Bloch Genesis-4 ceremony digests"
     echo "date(UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "count    : $COUNT"
     echo
     echo "sha256(cohort.tsv):"
-    (sha256sum "$OUT/cohort.tsv" 2>/dev/null || shasum -a 256 "$OUT/cohort.tsv") | awk '{print "  "$1}'
+    echo "  $(sha256_file "$OUT/cohort.tsv")"
+    echo
+    echo "per-keystore public digest (sha256 of that index's cohort.tsv row, tab-separated fields, exact bytes):"
+    tail -n +2 "$OUT/cohort.tsv" | while IFS= read -r row; do
+        idx=$(printf '%s' "$row" | cut -f1)
+        rowdigest=$(printf '%s' "$row" | sha256_stdin)
+        printf '  v%02d  %s\n' "$idx" "$rowdigest"
+    done
 } > "$OUT/DIGESTS.txt"
 
 echo

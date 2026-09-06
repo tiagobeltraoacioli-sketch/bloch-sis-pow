@@ -286,7 +286,7 @@ Sources: `docs/specs/BLOCH-TOKENOMICS-V4.md` (primary);
 Edition 1 did not treat this; Edition 2 treats it as a first-class subject,
 numbers first: ~94% of the Genesis-3 supply crossing the snapshot sits with
 the founder (measured h 18,809: ≈ 3.427 B of 3.634 B); post-split the largest
-single address holds 16,886,549,523 BLCH — **70.4% of circulating supply at
+single address holds 17,046,829,380 BLCH — **70.4% of circulating supply at
 slot 0**, liquid and stakeable by decision of 2026-08-11; staked and
 compounded it holds ~94% of active stake and pro-rata rewards preserve that
 share; the gates therefore only move when coins change hands (G1's 15%
@@ -466,7 +466,7 @@ proof-of-work; Genesis-4 is a linear chain.
 **5. The economics are replaced, not amended.** Edition 1's Chapter 16
 described a 21-billion nominal supply that was explicitly not hard-capped (a
 perpetual tail subsidy), a Bitcoin-style halving schedule, and a founder
-premine of 17% locked behind a 10-year cliff and 40-year vest, presented as
+premine of 17% locked behind a 2-year cliff and 8-year vest, presented as
 "structurally passive." None of that describes Genesis-4. The supply is a
 fixed **100,000,000,000 BLCH**, produced from the 21 B nominal by a pure
 ×100/21 redenomination (every balance and every allocation scaled by the
@@ -478,7 +478,7 @@ vote, no key, no governance path — can raise it; a hard fork adopted by
 every operator can change any rule of any chain. Emission goes to validators
 over 40 years on a 10% annual disinflation curve (there is no halving), and
 the allocation is: carryover 17.97% (liquid at genesis), founder grant 10%
-(10-year cliff, then 40-year linear vest), VC 10%, team 10%, marketing 4%,
+(2-year cliff, then 8-year linear vest), VC 10%, team 10%, marketing 4%,
 liquidity 5%, validator emission 43.03%. The 17% locked premine of Edition 1
 **does not exist in Genesis-4**; the founder's position is instead the sum
 of a new, strictly-vested 10% grant and a carried-over mined balance that is
@@ -488,7 +488,7 @@ liquid — which is the subject of the next point.
 treat it.** Edition 1 disclosed the locked premine at length but was silent
 on the distribution of the circulating, mined supply. The measured numbers:
 approximately **94% of the supply crossing the Genesis-3 snapshot sits at
-one address, the founder's** — post-split, 16,886,549,523 BLCH, or 70.4% of
+one address, the founder's** — post-split, 17,046,829,380 BLCH, or 70.4% of
 circulating supply at slot 0 — and by decision of 2026-08-11 that balance
 crosses liquid and stakeable, on the same terms as every other carried
 balance, because it was mined under the same rules as every other balance.
@@ -599,7 +599,7 @@ record win. Specifically:
    V2 premine (17%, consensus-locked, never emitted) died with Genesis-3's
    halt; the V4 grant (10%, 10-y cliff + 40-y linear) replaces it. Never
    conflate them.
-6. **Validator emission share is 43.03%**; 53.7% is a dead draft figure
+6. **Validator emission share is 43.03%**; 43.03% is a dead draft figure
    (`BLOCH-ENTITY-STRUCTURE.md` §3 note).
 7. **`docs/PROJECT-STATUS.md` is superseded framing** (its own 2026-08-11
    header says so). Use it for Genesis-3 history only, never for present

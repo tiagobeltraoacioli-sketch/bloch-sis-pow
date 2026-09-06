@@ -71,7 +71,7 @@ document:
 
 | Measure | Value | Evidence |
 |---|---:|---|
-| Largest single address / carried-over set | **93.96618041970969%** (16,886,549,523 of 17,970,880,000 BLCH) | `tokenomics_v4.rs:100,236`; spec §2 |
+| Largest single address / carried-over set | **93.94055779658775%** (17,046,829,380 of 18,146,400,000 BLCH) | `tokenomics_v4.rs:100,236`; spec §2 |
 | Founder liquid at slot 0 / circulating at slot 0 | **70.44609761431171%** (of 23,970,850,000 BLCH) | spec §4A; `tokenomics_v4.rs:72-73` (Foundation float) |
 | Founder / active stake, if the carryover stakes | **93.97%**, Nakamoto coefficient **1** | spec §4A.1; staking is permitted: `staking.rs:601` test |
 | Founder total (carryover + new 10% grant) / total supply | **26.886549523809524%** | compile-pinned at 2688 bps, `tokenomics_v4.rs:240-241` |
@@ -197,7 +197,7 @@ weak set today.
 Both die at the terminal height: the carryover to Genesis-4 is the set of
 **mined** balances measured at the snapshot (`BLOCH-TOKENOMICS-V4.md` §2) —
 the locked premine is never emitted and does not cross. Its replacement is
-the smaller, longer-locked 10% grant (`tokenomics_v4.rs:46`, 10-year cliff +
+the smaller, longer-locked 10% grant (`tokenomics_v4.rs:46`, 2-year cliff +
 40-year per-slot vest, `tokenomics_v4.rs:137-139`). Net: V4 both hardens the
 cap (tail removed — reversal recorded in spec §6.2) and shrinks the founder's
 future allocation (17% → 10%).
@@ -508,8 +508,8 @@ Checked every deposit-shaped path in the PoS design:
 
 | Skynet check | Bloch answer | Section |
 |---|---|---|
-| Major holder concentration | **FAIL, measured and disclosed**: 93.966% of carryover / 70.446% of genesis circulating / 94.0% of active stake if staked (NC = 1); vs WBNB's 39.28% attention flag. Unchanged by the 100 B split. | §1 |
-| Mintable | No path beyond the curve; lifetime emission measured 176,880 sat *under* allocation; cap-invariant decision not yet code; the "zero residual" rustdoc was wrong and is corrected | §2 |
+| Major holder concentration | **FAIL, measured and disclosed**: 93.941% of carryover / 70.446% of genesis circulating / 94.0% of active stake if staked (NC = 1); vs WBNB's 39.28% attention flag. Unchanged by the 100 B split. | §1 |
+| Mintable | No path beyond the curve; lifetime emission measured 176,880 sat *under* allocation; cap-invariant decision not yet code; the "residual of EMISSION_DUST_SAT = 176,880 sat" rustdoc was wrong and is corrected | §2 |
 | Blacklist | Retired by design; verified no producer of `Tainted` exists at this commit; guarantee is documentary until an emptiness invariant lands | §3 |
 | Whitelist | None for transfers; genesis cohort is a shrink-only *cap* list on the founder's own validators | §3 |
 | Hidden ownership | Nothing hidden; ownership real and concentrated; ADR-036 retracted renunciation in writing; two entities are one person until the §5.2 board exists | §4 |

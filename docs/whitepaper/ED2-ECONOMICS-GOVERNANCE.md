@@ -95,7 +95,7 @@ What replaced them:
   time of writing this is a *planned* sale — an allocation and a vesting
   schedule exist in code; no round has closed.
 - **A founder grant** replacing ADR-034's relinquishment: a new 10%-of-supply
-  grant under a 10-year cliff and 40-year linear vest (`FOUNDER_BLOCH`,
+  grant under a 2-year cliff and 8-year linear vest (`FOUNDER_BLOCH`,
   `founder_vested_sat` in `tokenomics_v4.rs`), on top of the founder's
   carried-over balance. ADR-036 is explicit that this "should be described as
   what it is."
@@ -225,7 +225,7 @@ A compile-time assertion pins the sum to `TOTAL_SUPPLY_BLOCH`. The Foundation
 holds the VC, team, marketing, and liquidity buckets — 29% of supply
 (`FOUNDATION_HELD_BLOCH`) — making it the largest single holder for the first
 decade (`BLOCH-ENTITY-STRUCTURE.md` §3). The founder's total position is the
-carried-over balance plus the new grant: 26.89% of supply
+carried-over balance plus the new grant: 27.04% of supply
 (`FOUNDER_TOTAL_BLOCH`, pinned by assertion). The grant was cut from 17% to
 10% on 2026-08-11 with the difference reallocated to validators — the only
 reallocation to date that moved supply *away* from an insider bucket
@@ -250,7 +250,7 @@ The founder's vest is linear **per slot**, not in monthly tranches: a step
 function would create hundreds of scheduled moments where a block of stake
 becomes spendable at once, each a visible, game-able date.
 
-The founder grant's 10-year cliff and 40-year vest is far beyond any market
+The founder grant's 2-year cliff and 8-year vest is far beyond any market
 benchmark, and deliberately so — the carried-over balance arrives liquid, so
 the grant is the part of the founder's position that can still be made to
 wait. It is not, however, the whole position, and Edition 1's description of
@@ -267,7 +267,7 @@ The validator allocation is emitted over 40 years
 **smooth disinflation at 10% per year** (`BLOCH-TOKENOMICS-V4.md` §6.1):
 year-one issuance is 4.36–4.37% of total supply, declining every year, summing
 to the allocation minus an irreducible dust residual (`EMISSION_DUST_SAT` —
-under the allocation, never over; an earlier claim of a zero residual was
+under the allocation, never over; an earlier claim of a residual of EMISSION_DUST_SAT = 176,880 sat was
 arithmetically impossible and is corrected in the file rather than repeated).
 The code provides three curves (`validator_reward_flat_sat`,
 `validator_reward_halving_sat`, `validator_reward_decay_sat`) with the decay

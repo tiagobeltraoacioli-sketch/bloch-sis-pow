@@ -114,7 +114,7 @@ signs one half signs nothing.
 
 So every key in §1 is a **software key**, and the buckets they guard are
 measured in billions of BLCH with lock horizons of 1 to 10 years before
-first spend (founder: 10-year cliff, vesting until year 50). The custody
+first spend (founder: 2-year cliff, vesting until year 50). The custody
 problem is therefore: *decade-scale cold storage of file-based secrets, with
 no hardware root of trust, and no rotation* — the addresses are baked into
 the genesis `state_root`, and an output's schedule follows its address
@@ -213,7 +213,7 @@ year 50. For that horizon:
 - Schedule periodic custody audits (share presence and tamper-evidence
   checked, nothing reassembled) — yearly is enough.
 - Write the succession plan down: who inherits shares, under what proof.
-  A 40-year vest will outlive employments and possibly custodians.
+  A 8-year vest will outlive employments and possibly custodians.
 
 ---
 
@@ -238,7 +238,7 @@ year 50. For that horizon:
 ### 5.1 The carryover exception worth naming
 
 The largest value at stake on day one is not any bucket: it is the carried-
-over founder balance (16,886,549,523 BLCH), liquid at slot 0, guarded by
+over founder balance (17,046,829,380 BLCH), liquid at slot 0, guarded by
 **Genesis-3 keys that already exist today** — generated long ago, under
 older procedures, on the old suite's tooling. Their exposure window is
 already open and cannot be shortened by anything in this document. The only

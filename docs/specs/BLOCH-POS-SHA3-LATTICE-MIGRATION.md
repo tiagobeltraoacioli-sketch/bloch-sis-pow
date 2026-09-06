@@ -193,7 +193,7 @@ Not coin marking. Three things, in descending order of how much they actually
 do:
 
 1. **The allocation itself.** The founder's new grant is 10% under a 10-year
-   cliff and 40-year linear vest — the strictest schedule on the chain, far
+   cliff and 8-year linear vest — the strictest schedule on the chain, far
    beyond any market benchmark.
 2. **Vesting on the Foundation buckets.** VC and team hold nothing liquid at
    genesis; marketing releases a quarter; liquidity is liquid by function
@@ -206,7 +206,7 @@ do:
 ### 4.2 What that does not fix, stated plainly
 
 The carried-over balance is **liquid at genesis**, and the largest single
-address holds 16,886,549,523 BLCH — 70.4% of the circulating supply at slot 0.
+address holds 17,046,829,380 BLCH — 70.4% of the circulating supply at slot 0.
 Gate G2 requires the largest holder under 25%, which this schedule does not
 reach until roughly **year five**.
 
@@ -1159,7 +1159,7 @@ carried-over balance that is liquid is also stakeable — the founder's
 included (§4.2). The arithmetic consequence, worked in
 `BLOCH-TOKENOMICS-V4.md` §4A.1: rewards are pro-rata, so stake shares are
 conserved under compounding. If the founder stakes the carried-over
-16,886,549,523 BLCH, independent stake is pinned at ~6.03% of active stake —
+17,046,829,380 BLCH, independent stake is pinned at ~6.03% of active stake —
 and active stake never exceeds circulating supply, so it can never reach G1's
 15% of circulating: not by year five, not ever, from emission alone. If the
 founder keeps the balance out of stake voluntarily, the earliest arithmetic G1

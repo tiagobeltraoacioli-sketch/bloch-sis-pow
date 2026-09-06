@@ -18,9 +18,23 @@ built on, now at the OS level.
 - The `bloch` node (+ `bloch-wallet`/`bloch-cli`) as a reproducible Nix package
   (`os/package.nix`) — built from the self-contained workspace (vendored
   pqcrypto, committed `Cargo.lock`), no network/git fetches.
-- A **hardened systemd service** (`os/bloch-node.nix`) — dedicated user,
-  `ProtectSystem=strict`, `NoNewPrivileges`, `MemoryDenyWriteExecute`, syscall
-  filtering, no core dumps (mirrors the L2 container hardening).
+- A **hardened systemd service** (`os/bloch-node.nix`) for the RETIRED
+  Genesis-3 binary (`bloch`) — dedicated user, `ProtectSystem=strict`,
+  `NoNewPrivileges`, `MemoryDenyWriteExecute`, syscall filtering,
+  `MemoryMax`/`TasksMax` containment, an `IPAddressDeny=any` perimeter with
+  an operator-filled allowlist, no core dumps (mirrors the L2 container
+  hardening).
+- A **hardened systemd service** (`os/bloch-pos-node.nix`) for the LIVE
+  Genesis-4 proof-of-stake binary (`bloch-pos`) — the same hardening spine,
+  plus loopback-only RPC and metrics, and the sealed keystore passphrase
+  delivered via systemd `LoadCredential=` rather than an environment
+  variable. **Its package default does not yet resolve to a real
+  `bloch-pos` build** — see the TODO in that file; wiring the actual
+  derivation is a follow-up, not done in this pass.
+- An **interim health watchdog** (`os/health-watchdog.nix`) — polls
+  `/health` and restarts the target unit on sustained (not single-blip)
+  failure. `deploy/monitoring/`'s Prometheus alerts are the primary fix;
+  this is the backstop for a host without that stack running.
 - A minimal live/installer config (`os/configuration.nix`) that mines on boot.
 
 ## Build & run (on a Linux host with Nix + flakes)

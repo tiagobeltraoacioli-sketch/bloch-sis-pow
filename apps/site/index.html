@@ -62,19 +62,17 @@
 </div></header>
 
 <div class="status"><div class="wrap">
-  <!-- Terminal height 50,000: docs/FLEET-BRIEF-CERTIK-2026-08-12.md:79
-       ("Genesis-3 halts at height 50,000, not 50,000 — lowered 2026-08-12").
-       The constant GENESIS3_TERMINAL_HEIGHT in crates/bloch-crypto/src/core/mod.rs:438
-       still reads 50,000 and is superseded by that decision. -->
-  <dl class="stat"><dt>Genesis-3 halts at</dt><dd>50,000</dd><div class="sub">consensus rule &mdash; blocks above it are invalid</div></dl>
-  <!-- Target block time 30 s: crates/bloch-crypto/src/core/mod.rs:262 (TARGET_BLOCK_TIME);
-       Genesis-4 slot time is also 30 s: crates/bloch-pos-committee/src/tokenomics_v4.rs:120 (SLOTS_PER_DAY = 2,880). -->
+  <!-- Genesis-3 stopped producing blocks under GENESIS3_TERMINAL_HEIGHT = 50,000
+       (crates/bloch-crypto/src/core/mod.rs); the chain actually reached and was
+       snapshotted at height 39,918 (CARRYOVER_MEASURED_HEIGHT, tokenomics_v4.rs). -->
+  <dl class="stat"><dt>Genesis-4 mainnet</dt><dd>live</dd><div class="sub">since 2026-08-13 21:31:19 UTC</div></dl>
+  <!-- Target block time 30 s: crates/bloch-crypto/src/core/mod.rs (TARGET_BLOCK_TIME);
+       Genesis-4 slot time is also 30 s: SLOTS_PER_DAY = 2,880 (tokenomics_v4.rs). -->
   <dl class="stat"><dt>Block time</dt><dd>30<span style="font-size:1rem"> s</span></dd><div class="sub">protocol target, today and after</div></dl>
-  <!-- Hybrid signature: crates/bloch-crypto/src/core/mod.rs:321-330. -->
+  <!-- Hybrid signature: crates/bloch-crypto/src/core/mod.rs. -->
   <dl class="stat"><dt>Signature</dt><dd style="font-size:1.05rem;font-family:var(--mono)">ML-DSA-65 &#8214; Falcon-1024</dd><div class="sub">both must verify</div></dl>
-  <!-- Fixed supply 100,000,000,000: crates/bloch-pos-committee/src/tokenomics_v4.rs:33
-       (TOTAL_SUPPLY_BLOCH, founder decision 2026-08-11). A redenomination is
-       settled 2026-08-12 and is deliberately NOT quoted here. -->
+  <!-- Fixed supply: TOTAL_SUPPLY_BLOCH (tokenomics_v4.rs), founder decision
+       2026-08-11. The 100/21 split is final and compiled in. -->
   <dl class="stat"><dt>Fixed supply</dt><dd>100B</dd><div class="sub">hard cap, Genesis-4</div></dl>
 </div></div>
 
@@ -102,10 +100,10 @@
     </div>
     <div class="card c">
       <span class="tag">Consensus</span>
-      <h3>Moving to proof of stake</h3>
-      <!-- Slots/epochs/LMD-GHOST/Casper-style finality: crates/bloch-pos-committee/src/lib.rs:21,
-           params.rs:30, finality.rs:3-25. Cohort taper clock: genesis_cohort.rs:13,63-64. -->
-      <p>Slots, epochs, LMD-GHOST, Casper-style finality &mdash; with the same post-quantum signatures.</p>
+      <h3>Proof of stake, live</h3>
+      <!-- Slots/epochs/LMD-GHOST/Casper-style finality: crates/bloch-pos-committee/src/lib.rs,
+           params.rs, finality.rs. Cohort taper clock: genesis_cohort.rs. -->
+      <p>Slots, epochs, LMD-GHOST, Casper-style finality &mdash; with the same post-quantum signatures. Live since 2026-08-13.</p>
       <p><strong>The cost:</strong> the validator set starts concentrated, and the rules that reduce that are on a one-year clock.</p>
     </div>
   </div>
@@ -119,36 +117,34 @@
   </div>
   <ol class="phases">
     <li>
+      <span class="marker">done</span>
+      <div class="phase-body">
+        <h3>Proof of work <span class="state">halted</span></h3>
+        <!-- Genesis-3 halted at GENESIS3_TERMINAL_HEIGHT = 50,000 (consensus rule,
+             crates/bloch-crypto/src/core/mod.rs); the chain actually stopped and
+             was snapshotted at height 39,918 (CARRYOVER_MEASURED_HEIGHT). -->
+        <p>The chain produced blocks under SHA-256d with merged mining until it halted by consensus rule. It actually stopped, and was snapshotted, at height 39,918.</p>
+      </div>
+    </li>
+    <li>
+      <span class="marker">done</span>
+      <div class="phase-body">
+        <h3>Snapshot signed and published</h3>
+        <p>Blocks above the terminal height are invalid on every node. Mining revenue ended there. The signed snapshot of every balance at height 39,918 is the canonical carryover record.</p>
+      </div>
+    </li>
+    <li>
+      <span class="marker">done</span>
+      <div class="phase-body">
+        <h3>The gap</h3>
+        <p>Balances sat in the snapshot while the explorer kept serving history. That review period is over.</p>
+      </div>
+    </li>
+    <li>
       <span class="marker">now</span>
       <div class="phase-body">
-        <h3>Proof of work, running <span class="state now">live</span></h3>
-        <!-- SHA-256d + merged mining with Bitcoin (AuxPoW since local h=8,500):
-             docs/PROJECT-STATUS.md, "Live network — Genesis-3 mainnet" block. -->
-        <p>The chain produces blocks under SHA-256d with merged mining. Nothing about it changes until height 50,000.</p>
-      </div>
-    </li>
-    <li>
-      <span class="marker">height 50,000</span>
-      <div class="phase-body">
-        <h3>The chain halts <span class="state next">days away</span></h3>
-        <!-- Halt-as-consensus-rule: crates/bloch-crypto/src/core/mod.rs:415-438.
-             Height lowered to 50,000: docs/FLEET-BRIEF-CERTIK-2026-08-12.md:79-81. -->
-        <p>Blocks above 50,000 are invalid &mdash; it is a consensus rule compiled into every node, not a switch anyone throws. Mining revenue ends here. A signed snapshot of every balance is taken at that height.</p>
-      </div>
-    </li>
-    <li>
-      <span class="marker">the gap</span>
-      <div class="phase-body">
-        <h3>Months with no chain</h3>
-        <!-- "about six months later": crates/bloch-crypto/src/core/mod.rs:415-417. -->
-        <p>Balances sit in the snapshot; the explorer keeps serving history. This is the plan, not a failure &mdash; the time is for review before a chain restarts with different consensus.</p>
-      </div>
-    </li>
-    <li>
-      <span class="marker">genesis-4</span>
-      <div class="phase-body">
-        <h3>Proof of stake, from the snapshot</h3>
-        <p>Balances carry across untouched. No claim to file, no contract to interact with, nobody to send anything to. Anyone asking you to migrate tokens is stealing them.</p>
+        <h3>Proof of stake, from the snapshot <span class="state now">live</span></h3>
+        <p>Genesis-4 has been running since 2026-08-13 21:31:19 UTC. Balances carried across untouched — no claim was filed, no contract interacted with, nobody sent anything to anyone. Anyone asking you to migrate tokens today is stealing them.</p>
       </div>
     </li>
   </ol>
@@ -200,23 +196,28 @@
   <div class="cards">
     <div class="card c">
       <span class="tag">Security</span>
-      <h3>Unaudited, low-hashrate</h3>
-      <!-- docs/PROJECT-STATUS.md "Hard caveat" block: nascent, low-hashrate,
-           51%-attackable, unaudited. -->
-      <p>The network is nascent: few nodes, low hashrate, 51%-attackable. Mainnet is a designation, not a security claim.</p>
+      <h3>Stake, not hashrate &mdash; still concentrated</h3>
+      <!-- Genesis-4 is proof-of-stake; a hashrate caveat no longer applies.
+           The live risk is stake concentration: the founder's carried-over
+           address alone is ~94% of the carryover (see the Supply card below),
+           and the genesis validator cohort tapers to one third of consensus
+           weight only after one year (genesis_cohort.rs). -->
+      <p>The network is nascent and unaudited. The risk that matters for a proof-of-stake chain is stake concentration, not hashrate: the genesis validator cohort starts concentrated, and the rules that taper it run on a one-year clock. Mainnet is a designation, not a security claim.</p>
     </div>
     <div class="card c">
       <span class="tag">Supply</span>
       <h3>Concentrated</h3>
-      <!-- Largest carried-over address 16,886,549,523 BLCH of 17,970,880,000 total
-           (~94%): crates/bloch-pos-committee/src/tokenomics_v4.rs:100,236. -->
-      <p>Roughly 94% of the carried-over balance belongs to one holder &mdash; the founder, who mined it. The numbers are on the <a href="supply.html">supply page</a>, not in a footnote.</p>
+      <!-- LARGEST_CARRYOVER_ADDRESS_BLOCH of CARRYOVER_TOTAL_BLOCH = 93.94%
+           (crates/bloch-pos-committee/src/tokenomics_v4.rs). -->
+      <p>93.94% of the carried-over balance belongs to one holder &mdash; the founder, who mined it. The numbers are on the <a href="supply.html">supply page</a>, not in a footnote.</p>
     </div>
     <div class="card c">
       <span class="tag">Genesis-4</span>
-      <h3>No launch date</h3>
-      <!-- Devnet stage: crates/bloch-pos-node/src/main.rs:3-13. -->
-      <p>The proof-of-stake node is devnet software. There is no Genesis-4 launch date, and anyone quoting one is guessing.</p>
+      <h3>Live, with most safety upgrades still inert</h3>
+      <!-- Round-3 remediation audit, 2026-09-06: seven of eight new consensus
+           gates ship at u64::MAX (unarmed) — see docs/audit for the current
+           gate status before relying on any of them. -->
+      <p>Genesis-4 mainnet has been live since 2026-08-13 21:31:19 UTC. Several consensus fixes shipped in code ship behind activation-epoch gates that are not yet armed on the live chain &mdash; check the current audit status before assuming a named fix is in force.</p>
     </div>
   </div>
 </div></section>

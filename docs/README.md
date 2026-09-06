@@ -19,9 +19,18 @@ Two standing rules apply to everything below.
 - **Never restate a constant.** Cite the path. Where a document and the code
   disagree, the code is the truth. `tools/doc-sweep/check_stale.py` exists
   because five tokenomics revisions left stale numbers in prose.
-- **`designed ≠ built ≠ booted`.** Most of what is described here is
-  designed. Very little of the proof-of-stake work is booted, and none of it
-  on mainnet.
+- **`designed ≠ built ≠ booted`.** Genesis-4 proof-of-stake mainnet has been
+  live since 2026-08-13 21:31:19 UTC — the node-local fixes (slot bound,
+  slashing protection, sealed keystore, RPC indexing) are running and
+  correct. But most of the design in `specs/BLOCH-POS-SHA3-LATTICE-MIGRATION.md`
+  is not yet in force on the live chain: seven of the eight consensus gates
+  that close known findings still ship at `u64::MAX` (unarmed), and several
+  documented protocol behaviors (exit authentication, RANDAO recommit, the
+  dust and tx-bytes rules) are compiled but inert until a coordinated flag
+  day arms them — see the current Round-3 remediation audit for the
+  up-to-date gate status before assuming a described behavior is live.
+  `designed ≠ built ≠ armed` is now the more precise version of this
+  warning.
 
 ---
 

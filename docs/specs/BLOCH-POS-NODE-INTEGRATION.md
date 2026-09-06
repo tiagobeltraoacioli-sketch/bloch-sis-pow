@@ -26,7 +26,7 @@ running Genesis-4 node, without touching the chain that is about to halt.
 ## 0. The hard rule, restated as architecture
 
 **The Genesis-3 validation path does not change.** The chain the repo-root
-`src/main.rs` validates halts at height 80,000 (`BLOCH-TOKENOMICS-V4.md`
+`src/main.rs` validates halts at height 50,000 (`GENESIS3_TERMINAL_HEIGHT`, lowered from 80,000 on 2026-08-12; the chain actually stopped at 39,918) (`BLOCH-TOKENOMICS-V4.md`
 §3.2); its one remaining consensus job is to stop correctly. Genesis-4 is a
 **new binary built from a fresh genesis**, not a patch, not a feature flag,
 not a flag-day inside the old process. Any plan step that would require
@@ -48,7 +48,7 @@ The rule is made structural rather than disciplinary, three ways:
    two chains share no storage, so no schema change here can corrupt the
    chain that must halt cleanly.
 
-What Genesis-3 *does* need before height 80,000 — the terminal-height
+What Genesis-3 *does* need before height 50,000 (actual stop: 39,918) — the terminal-height
 consensus rule and the signed snapshot artifact (§3.2.1–3.2.2 of the
 tokenomics doc) — is a **separate, minimal work item on the old tree**, owned
 outside this plan precisely so this plan never has a reason to touch that
@@ -273,7 +273,7 @@ must not preclude it, and this one doesn't.
 The `genesis/` loader consumes one file (the "genesis manifest"), reviewed
 and published ahead of launch:
 
-- the **signed snapshot artifact digest** (the height-80,000 balance set —
+- the **signed snapshot artifact digest** (the balance set at the terminal height, 50,000 by rule / 39,918 actual —
   the artifact is canonical, not the halted chain; the digest is embedded in
   the genesis block per tokenomics §3.2.2),
 - the carryover balance set itself (as `carryover.tsv`-style data, verified

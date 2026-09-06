@@ -331,7 +331,7 @@ Cards are soft fills with no border and no shadow. A card states a commitment
   <thead><tr><th>Allocation</th><th class="num-h">Genesis-4 (BLCH)</th><th class="num-h">Share</th><th style="width:32%"></th></tr></thead>
   <tbody>
     <tr><td>Validator emission — 40 years</td><td class="num">43,029,120,000</td><td class="num">43.03%</td><td><div class="bar" style="width:100%"></div></td></tr>
-    <tr><td>Carried over from Genesis-3</td><td class="num">17,970,880,000</td><td class="num">17.97%</td><td><div class="bar" style="width:41.8%"></div></td></tr>
+    <tr><td>Carried over from Genesis-3</td><td class="num">18,146,400,000</td><td class="num">17.97%</td><td><div class="bar" style="width:41.8%"></div></td></tr>
   </tbody>
 </table></div>
 ```

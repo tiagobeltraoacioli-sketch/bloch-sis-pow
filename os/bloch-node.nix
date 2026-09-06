@@ -33,10 +33,65 @@ in
       description = "JSON-RPC port.";
     };
 
+    # MED-6: fixed, safe default bind. Previously no --rpc-bind was passed at
+    # all, so the port bound whatever the node binary itself defaults to.
+    # Loopback unless openFirewall is explicitly set, matching the same
+    # reasoning bloch-pos-node/src/main.rs applies to its own RPC listener
+    # ("a routable bind is a deliberate act plus a firewall").
+    rpcBindAddress = lib.mkOption {
+      type = lib.types.str;
+      default = if cfg.openFirewall then "0.0.0.0" else "127.0.0.1";
+      defaultText = lib.literalExpression ''if cfg.openFirewall then "0.0.0.0" else "127.0.0.1"'';
+      description = "Address the JSON-RPC listener binds. Defaults to loopback unless openFirewall is set.";
+    };
+
     openFirewall = lib.mkOption {
       type = lib.types.bool;
       default = false;
       description = "Open the RPC port in the firewall (LAN exposure — off by default).";
+    };
+
+    # HIGH-1: the node has no egress control today. IPAddressDeny=any plus
+    # this allowlist IS the perimeter — there is no other firewall boundary
+    # assumed around this unit. An empty list means only loopback traffic and
+    # anything the kernel itself needs (DNS/NTP are NOT auto-allowed; add
+    # them explicitly here if this host's node needs outbound peers beyond
+    # loopback, e.g. a devnet/libp2p transport dialing out).
+    allowedPeerCIDRs = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "203.0.113.0/24" "198.51.100.7/32" ];
+      description = ''
+        Additional IPAddressAllow= entries (CIDRs or single addresses) beyond
+        localhost. This list IS the network perimeter for this unit — there
+        is no other firewall assumed. Left empty by default (loopback-only);
+        the operator must fill it in for any host that needs to dial or
+        accept from specific peers.
+      '';
+    };
+
+    memoryMax = lib.mkOption {
+      type = lib.types.str;
+      default = "75%";
+      description = ''
+        systemd MemoryMax=. 2026-08-21 incident: 22 validators OOM-killed at
+        7.9 GB on 8 GB machines when 60 peers answered a get-blocks burst at
+        once during replay (Annex-R6). A cgroup limit turns "the kernel
+        OOM-killer picks a victim on the box" into "this service restarts,
+        everything else on the host survives".
+      '';
+    };
+
+    memoryHigh = lib.mkOption {
+      type = lib.types.str;
+      default = "60%";
+      description = "systemd MemoryHigh= — soft throttle before MemoryMax kills.";
+    };
+
+    tasksMax = lib.mkOption {
+      type = lib.types.int;
+      default = 512;
+      description = "systemd TasksMax= — bounds thread/process explosion under load.";
     };
 
     extraArgs = lib.mkOption {
@@ -67,6 +122,7 @@ in
           "${cfg.package}/bin/bloch"
           "--data-dir" cfg.dataDir
           "--rpc-port" (toString cfg.rpcPort)
+          "--rpc-bind" cfg.rpcBindAddress
         ] ++ lib.optional cfg.mine "--mine" ++ cfg.extraArgs);
 
         User = "bloch";
@@ -74,6 +130,19 @@ in
         StateDirectory = "bloch";
         Restart = "on-failure";
         RestartSec = 5;
+
+        # HIGH-2/MED-1: resource containment (2026-08-21 OOM incident — see
+        # the memoryMax option doc above for the citation).
+        MemoryMax = cfg.memoryMax;
+        MemoryHigh = cfg.memoryHigh;
+        TasksMax = cfg.tasksMax;
+        LimitNOFILE = 8192;
+
+        # HIGH-1: no other egress/ingress control exists for this unit — this
+        # allowlist IS the perimeter, not a supplement to one. Loopback is
+        # always allowed; allowedPeerCIDRs is the operator-filled extension.
+        IPAddressDeny = "any";
+        IPAddressAllow = [ "localhost" ] ++ cfg.allowedPeerCIDRs;
 
         # L2-style hardening (mirrors deploy/hardening): least privilege.
         NoNewPrivileges = true;
@@ -88,7 +157,13 @@ in
         ProtectControlGroups = true;
         ProtectClock = true;
         ProtectHostname = true;
-        RestrictAddressFamilies = [ "AF_INET" "AF_INET6" ];
+        # ProtectProc=invisible + ProcSubset=pid: this process cannot see any
+        # other process's /proc entry at all, not even that it exists — closes
+        # the BLOCH_KEYSTORE_PASSPHRASE-in-/proc/<pid>/environ exposure class
+        # for every OTHER process on the host reading THIS one, and vice versa.
+        ProtectProc = "invisible";
+        ProcSubset = "pid";
+        RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
         RestrictNamespaces = true;
         RestrictRealtime = true;
         RestrictSUIDSGID = true;
@@ -96,6 +171,9 @@ in
         MemoryDenyWriteExecute = true;
         SystemCallArchitectures = "native";
         SystemCallFilter = [ "@system-service" "~@privileged" "~@resources" ];
+        # No capabilities at all — this is a plain user-space TCP/RPC service,
+        # not anything that ever needs to bind <1024, trace, or touch devices.
+        CapabilityBoundingSet = [ ];
         UMask = "0077";
         # No core dumps (matches the container entrypoint ulimit -c 0).
         LimitCORE = 0;

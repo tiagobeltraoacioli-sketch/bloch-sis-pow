@@ -289,8 +289,8 @@ total under review as above.*
 | Allocation | BLCH | Share | Unlock |
 |---|---:|---:|---|
 | Validator emission — 40 years | 43,029,120,000 | 43.03% | emitted per slot, declining 10%/year |
-| Carried over from Genesis-3 | 17,970,880,000 | 17.97% | liquid at genesis |
-| Founder — new grant | 10,000,000,000 | 10.00% | 10-year cliff, then 40-year linear vest |
+| Carried over from Genesis-3 | 18,146,400,000 | 17.97% | liquid at genesis |
+| Founder — new grant | 10,000,000,000 | 10.00% | 2-year cliff, then 8-year linear vest |
 | VC / crypto funds | 10,000,000,000 | 10.00% | 12-month cliff, then 24-month linear |
 | Team | 10,000,000,000 | 10.00% | 18-month cliff, then 36-month linear |
 | Liquidity | 5,000,000,000 | 5.00% | liquid at genesis |
@@ -304,9 +304,9 @@ height 50,000, so the final figures will differ slightly from these.*
 ## Card: Say it before you are asked — the supply is concentrated
 
 **93.96% of the carried-over balance sits at one address: the founder's,
-who mined it.** That is 16,886,549,523 of 17,970,880,000 BLCH measured at
+who mined it.** That is 17,046,829,380 of 18,146,400,000 BLCH measured at
 height 43,172. Counting the new grant, the founder's total allocation is
-26.89% of supply — 16.89% liquid at genesis plus 10% locked for a decade.
+27.04% of supply — 16.89% liquid at genesis plus 10% locked for a decade.
 
 It is worse than that at the start, and here is the arithmetic rather than the
 framing: at slot 0, circulating supply is about 5.03 billion BLCH (carryover
@@ -714,7 +714,7 @@ network to at most 0.3% of the new one — roughly 17× less relative share —
 because Genesis-4 issues new allocations around the carried balances. Both
 halves are true; either alone would mislead. This is that rare table where
 the founder's row and yours move the same direction: the founder's 94% of the
-old supply becomes 26.89% of the new one.
+old supply becomes 27.04% of the new one.
 
 **Q: Why is the total supply "under review"? That seems basic.**
 Because the alternative was publishing a number with a known unresolved

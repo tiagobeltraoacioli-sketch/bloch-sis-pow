@@ -8,10 +8,21 @@
 # volume + a /tmp tmpfs are writable), and enforces core=0 at the runtime too.
 services:
   bloch:
+    # TODO(MED-10, supply-chain): once you replace `bloch:local` with a
+    # published image, pin it by digest (`your/repo:tag@sha256:<digest>`),
+    # not by a mutable tag — a tag can be repointed after you have verified
+    # its content once, a digest cannot.
     image: bloch:local            # replace with your published image
     command:
+      # MED-10 fix: RPC bound to loopback INSIDE the container, not
+      # 0.0.0.0. This is the "hardened" reference compose — a node whose RPC
+      # is reachable from any address that can reach the P2P port defeats the
+      # point of everything else in this file. If a specific caller genuinely
+      # needs RPC (a co-located explorer/monitoring process), reach it via
+      # `docker exec`, a shared network namespace, or an explicit reverse
+      # proxy you control — never by widening this bind back to 0.0.0.0.
       - "--rpc-bind"
-      - "0.0.0.0"
+      - "127.0.0.1"
       - "--rpc-port"
       - "16210"
       - "--listen"
@@ -33,12 +44,30 @@ services:
       # - seccomp=deploy/hardening/seccomp-default.json
     ulimits:
       core: 0                      # no core dumps (key-leak defense, THREAT_MODEL)
+    # HIGH-2/MED-1: resource containment (2026-08-21 OOM incident — 22
+    # validators OOM-killed when a peer-list correction made 60 peers answer
+    # a get-blocks burst at once during replay; see Annex-R6 / os/bloch-node.nix's
+    # memoryMax option doc for the same citation). A container-level limit is
+    # the same control systemd's MemoryMax/TasksMax provide for the NixOS
+    # units — "this container restarts, the host survives" instead of
+    # whatever the kernel OOM-killer picks.
+    mem_limit: 6g
+    pids_limit: 512
+    cpus: 2.0
     volumes:
       - bloch_data:/bloch-data
     ports:
-      - "16110:16110"             # P2P
-      - "16210:16210"             # RPC
-    restart: unless-stopped
+      - "16110:16110"             # P2P — the only port this compose exposes to
+                                   # the host; RPC is loopback-only inside the
+                                   # container (see --rpc-bind above) and is
+                                   # deliberately NOT published here — a
+                                   # published 16210 mapping would only reach a
+                                   # process that never listens on it, which is
+                                   # confusing at best.
+    restart: on-failure:5          # bounded retries with a backoff, not an
+                                   # infinite unless-stopped loop that can mask
+                                   # a crash-looping node as "running" in a
+                                   # dashboard that only checks container status
 
 volumes:
   bloch_data:

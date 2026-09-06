@@ -38,8 +38,10 @@ pure ×100/21 split of the V2 nominal, decided 2026-08-12.
 Those coins were mined, on the same chain, under the same rules as everyone
 else's — so they are carried the same way, as ordinary liquid balance, and
 liquid includes stakeable (decided 2026-08-11, §4A.1). The founder additionally
-receives a new 10% grant under a 10-year cliff and 40-year linear vest — the V2
-premine schedule, at 10% rather than the V2 17%.
+receives a new 10% grant under a 2-year cliff and 8-year linear vest
+(`FOUNDER_CLIFF_SLOTS` / `FOUNDER_VESTING_SLOTS`, founder decision 2026-08-21)
+— at 10% rather than the V2 17%, and on a far shorter schedule than the V2
+premine's 10-year cliff / 40-year vest, which this section superseded.
 
 100 billion costs two things, both accepted with eyes open and both now
 resolved rather than tolerated (see §8.1 and
@@ -55,7 +57,7 @@ what Go does.
 | Destination | BLCH | Share | Unlock |
 |---|---:|---:|---|
 | Carryover — the whole ledger | 18,146,400,000 | 17.97% | **liquid at genesis** |
-| Founder — new grant | 10,000,000,000 | 10.00% | 10-year cliff, then 40-year linear |
+| Founder — new grant | 10,000,000,000 | 10.00% | 2-year cliff, then 8-year linear |
 | VC / crypto hedge funds | 10,000,000,000 | 10.00% | 12-month cliff, then 24-month linear |
 | Development team | 10,000,000,000 | 10.00% | 18-month cliff, then 36-month linear |
 | Marketing | 4,000,000,000 | 4.00% | 25% at genesis, remainder linear over 24 months |
@@ -517,7 +519,7 @@ founder. Where V4 now lands:
 | | Genesis-3 today | V4 at genesis | V4 at year 50 |
 |---|---:|---:|---:|
 | Founder — spendable | 94.3% | **16.89%** (carryover, liquid) | 27.04% |
-| Founder — locked | — | 10.00% (10-yr cliff, 40-yr vest) | 0% |
+| Founder — locked | — | 10.00% (2-yr cliff, 8-yr vest) | 0% |
 | Insiders total | 94.3% | 25.0% liquid (Foundation) + 16.89% | 55.97% |
 | Validators (earned) | — | 0%, growing | 43.03% |
 
@@ -766,7 +768,7 @@ Schedules follow prevailing market practice for recent L1 launches.
 
 | Bucket | Genesis | Cliff | Linear | Total | Market basis |
 |---|---:|---:|---:|---:|---|
-| Founder — new grant (10%) | 0% | **120 mo** (10 yr) | **480 mo** (40 yr) | 50 yr | The V2 premine schedule, restored. Far beyond any market benchmark and the strictest on the chain — deliberately, since the carried-over balance arrives liquid and this grant is the part that can still be made to wait |
+| Founder — new grant (10%) | 0% | **24 mo** (2 yr) | **96 mo** (8 yr) | 10 yr | `FOUNDER_CLIFF_SLOTS` / `FOUNDER_VESTING_SLOTS`, founder decision 2026-08-21. An earlier draft restored the V2 premine schedule (120 mo / 480 mo / 50 yr) — that draft was superseded before shipping; the code has run 2yr/8yr since before the Round-2 baseline. Still the strictest schedule on the chain, since the carried-over balance arrives liquid and this grant is the part that can still be made to wait |
 | VC / hedge funds | 0% | **12 mo** | 24 mo | 3 yr | 12-month cliff is the standard among recent L1s (Sui Series A and B both cliff at 12 months); investor vests typically run 2–3 years |
 | Team | 0% | **18 mo** | 36 mo | 4.5 yr | Institutional standard is 12-month cliff + 36-month linear; 18 months is "defensible and increasingly expected" where institutional investors participate, and it keeps the team cliff off the VC cliff month |
 | Marketing | **25%** | — | 24 mo | 2 yr | Listing and launch spend is commonly unlocked at TGE for launch momentum; ongoing programmes vest over ~24–25 months |
@@ -806,7 +808,7 @@ hold their own. **Nothing liquid at genesis**: 18-month cliff, then 36 months
 linear, fully vested at year 4.5. The cliff sits 6 months after the VC cliff on
 purpose — the *cliff wall*, several buckets unlocking in the same month, is the
 most cited failure mode in vesting design, so VC (12), team (18) and founder
-(120) never share a month.
+(24) never share a month. (An earlier draft of this section said "founder (120)" here — the V2 premine's 10-year cliff, an earlier draft's figure — while §7 above already said "founder (24)" two pages earlier; the two rows contradicted each other. The live value, matching `FOUNDER_CLIFF_SLOTS`, is 24 months.)
 
 ### Marketing — 4,000,000,000 (4.00%)
 

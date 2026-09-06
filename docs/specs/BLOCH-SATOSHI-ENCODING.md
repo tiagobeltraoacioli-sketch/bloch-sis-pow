@@ -71,7 +71,7 @@ $ node -e 'console.log(JSON.stringify(JSON.parse(`{"v":"9999999999999999999"}`))
 ```
 
 This is not a hypothetical about the cap. The largest single carried-over
-address holds `"1688654952300000000"` sat — 16,886,549,523 BLCH,
+address holds `"1688654952300000000"` sat — 17,046,829,380 BLCH,
 `LARGEST_CARRYOVER_ADDRESS_BLOCH` — already **187x** past the JavaScript exact
 limit. Any browser wallet, explorer, or exchange front-end that reads that
 balance as a JSON number reads a wrong number today, and reads it wrongly and

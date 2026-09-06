@@ -24,3 +24,20 @@ Tiago Acioli <tiagobeltraoacioli@gmail.com> Bloch-SIS PoW <bloch-sis-main@proton
 Tiago Acioli <tiagobeltraoacioli@gmail.com> Bloch-SIS Protocol <protocol@bloch-sis>
 Tiago Acioli <tiagobeltraoacioli@gmail.com> postern-pmo <pmo@posternlabs.com>
 Tiago Acioli <tiagobeltraoacioli@gmail.com> postern-build <build@postern.local>
+
+# 2026-09-06: seven more author-name variants found uncovered by the six
+# entries above (`git log --format='%an <%ae>' | sort | uniq -c | sort -rn`
+# on the full, unshallowed history) — all committing under one of the two
+# emails already used above, just with a different recorded NAME. The
+# single-field form below ("Proper Name <email>", no second bracket group)
+# normalizes EVERY commit with that exact email to the given name,
+# regardless of what name string the commit object actually recorded — see
+# AUTHORS for why these two buckets (same person, same AI tool) are
+# consolidated rather than left as apparent separate contributors:
+#
+#   tiagobeltraoacioli@gmail.com, recorded as one of:
+#     "PMO", "perf-bench", "Tiago", "Dev A", "Claude"
+#   noreply@anthropic.com, recorded as one of:
+#     "Claude Code (agente)", "Claude (audit2)", "Claude (Fable 5)"
+Tiago Acioli <tiagobeltraoacioli@gmail.com>
+Claude <noreply@anthropic.com>

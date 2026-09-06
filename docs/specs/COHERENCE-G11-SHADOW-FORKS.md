@@ -12,7 +12,7 @@
 
 ## What the seam is
 
-Genesis-3 halts at the terminal height (80,000). Genesis-4 launches ~6 months
+Genesis-3 halts at the terminal height (`GENESIS3_TERMINAL_HEIGHT` = 50,000, lowered from 80,000 on 2026-08-12; the chain actually stopped at height 39,918, where the snapshot was taken). Genesis-4 launches ~6 months
 later from signed artifacts. Balances cross through the carryover TSV; the
 shielded pool **cannot** — a note is a commitment at a consensus leaf position
 (`nf = SHAKE256(DOM_NF ‖ nk ‖ rho ‖ LE64(position))`, C1 §1.3), so the pool

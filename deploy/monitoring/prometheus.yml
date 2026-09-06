@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Per-host Prometheus config for a Bloch validator/archival node.
+#
+# WHY LOCAL, NOT CENTRAL. The node's `/metrics` and `/health` bind loopback by
+# default and are off unless explicitly enabled (crates/bloch-pos-node/src/
+# metrics.rs — "loopback default, off by default"). That is correct: a
+# validator host's metrics endpoint is not something a remote scraper should
+# ever reach directly, because reachability from outside is itself the attack
+# surface HIGH-1 (no egress control) and the os/*.nix hardening
+# (IPAddressDeny=any + an operator-filled allowlist) are closing. Prometheus
+# therefore runs ON the same host, scrapes loopback only, and evaluates
+# alerts locally — see rules.yml. Getting alerts OFF the host (to a central
+# Alertmanager / paging system) is a remote_write or Alertmanager peering
+# concern for the operator's own infrastructure, deliberately left as an
+# operator-filled placeholder below rather than a guess at whichever backend
+# a given fleet uses.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    # TO BE FILLED by the operator: an opaque host id, matching the one used
+    # in deploy/FLEET-INVENTORY.md — never a real hostname/IP in a label that
+    # could leave this host (Alertmanager, a remote_write target, a shared
+    # dashboard).
+    host_id: "REPLACE_ME_OPAQUE_HOST_ID"
+    role: "REPLACE_ME_validator_or_archival"
+
+rule_files:
+  - "rules.yml"
+
+scrape_configs:
+  # The node's own Prometheus exposition. Loopback only — this file must
+  # never be adapted to scrape a node's metrics port over anything but
+  # 127.0.0.1, on any host. If the metrics port is ever bound beyond
+  # loopback, that is itself the incident, not a target to add here.
+  - job_name: "bloch-pos-node"
+    metrics_path: /metrics
+    static_configs:
+      # --metrics-port has NO default (crates/bloch-pos-node/src/main.rs: the
+      # endpoint is off unless a port is explicitly given). 9600 here is a
+      # placeholder — it MUST match whatever --metrics-port this host's unit
+      # file actually passes (os/bloch-pos-node.nix), or this scrape config
+      # silently scrapes nothing and every alert below goes dark rather than
+      # firing. Confirm with `systemctl cat bloch-pos-node | grep metrics-port`.
+      - targets: ["127.0.0.1:9600"]   # TO BE FILLED / CONFIRMED by the operator
+    scrape_interval: 15s
+    scrape_timeout: 10s
+
+  # node_exporter, for the metrics the bloch node does not and should not
+  # export itself: filesystem capacity (bloch_pos_data_dir_fs_free_bytes has
+  # no matching *_size_bytes to compute a percentage from) and NTP clock
+  # offset (node_timex_offset_seconds — the node has no business measuring
+  # its own clock drift; that is an OS-level fact).
+  - job_name: "node-exporter"
+    static_configs:
+      - targets: ["127.0.0.1:9100"]
+    scrape_interval: 15s
+
+# Alertmanager peering: left to the operator's own paging infrastructure.
+# Do not point this at a remote Alertmanager over a public address without
+# the same IPAddressAllow-style perimeter thinking applied to egress here as
+# to the node's own ingress (os/bloch-pos-node.nix).
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []   # TO BE FILLED by the operator

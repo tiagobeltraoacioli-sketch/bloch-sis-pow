@@ -30,7 +30,7 @@ references. Where something is absent, its absence was verified too.
 Two decisions upstream of this document change its shape:
 
 1. **This is a relaunch, not an in-place fork.** §8 of the migration spec is
-   superseded: the current chain **halts at height 80,000**, a signed balance
+   superseded: the current chain **halts at height 50,000** (`GENESIS3_TERMINAL_HEIGHT`, lowered from 80,000 on 2026-08-12 — the terminal-height *rule*; the chain actually stopped at height 39,918, where the snapshot was taken), a signed balance
    snapshot becomes the canonical record, and Genesis-4 launches from it about
    six months later (`BLOCH-TOKENOMICS-V4.md` §3.2). For the ecosystem this
    means there is **no DAG→linear seam for any consumer to handle** — the
@@ -379,7 +379,7 @@ and Go to near zero).
 > extended. What survives from this section: the finding that nothing in the
 > L2 stack verifies L1 consensus (still true, and now an argument for
 > retiring it), and the operational duty to **drain/settle the live L2 before
-> the height-80,000 halt** — the deposits already made are real and must exit.
+> the height-50,000 halt** (rule; actual stop 39,918) — the deposits already made are real and must exit.
 > The anchor re-point, finality predicate and chain-id unification work items
 > are dead. See the 2026-08-11 fleet brief.
 
@@ -438,7 +438,7 @@ still match it. One test to port, not a mechanism.
 
 ### 5.3 Two decisions the migration forces
 
-1. **The dead-period problem.** Between the halt at 80,000 and the Genesis-4
+1. **The dead-period problem.** Between the halt at 50,000 (actual stop: 39,918) and the Genesis-4
    launch there is **no L1 at all** for ~6 months. Any L2 state anchored to
    the old chain must be settled and withdrawals drained **before** the halt;
    the L2 either pauses or runs unanchored (sequencer-trust only) during the
@@ -478,11 +478,11 @@ simply dies" list; none of it gets a V4 port):
 | Hardware | Antminer S19j Pro (100 TH/s) + miner-box/auxpow-box roles | ASIC fleet | disposition decision (Appendix B) |
 
 **Sequencing is the only subtlety.** Mining is what *produces* the chain until
-the halt, and third-party PoW issuance until 80,000 is part of the non-founder
+the halt, and third-party PoW issuance until height 50,000 (actual stop 39,918) is part of the non-founder
 allocation story (tokenomics §3.1). So:
 
-1. **Nothing above is turned off before height 80,000.** The halt release
-   (tokenomics §3.2.1 — blocks above 80,000 invalid) is the **last PoW
+1. **Nothing above is turned off before height 50,000.** The halt release
+   (tokenomics §3.2.1 — blocks above 50,000 invalid, actual stop 39,918) is the **last PoW
    release**, and the pool/ASICs run right up to it.
 2. **At the halt:** snapshot artifact produced and signed; pool, proxies,
    stratum endpoints, and ASIC fleet decommissioned; `stratum.posternpool.com`
@@ -551,7 +551,7 @@ tooling; `genesis4-carryover` already exists and is tested).
 
 | When | Ecosystem actions |
 |---|---|
-| **Before h 80,000** (~2 weeks) | Halt release on the fleet (last PoW release); taint/founder list published; explorer repointed off `g2rpc.posternpool.com`; L2 drained/settled + pause announced; snapshot tooling rehearsed |
+| **Before h 50,000** (rule; actual stop 39,918) (~2 weeks) | Halt release on the fleet (last PoW release); taint/founder list published; explorer repointed off `g2rpc.posternpool.com`; L2 drained/settled + pause announced; snapshot tooling rehearsed |
 | **At the halt** | Snapshot artifact signed + digest published wide; pool/stratum/ASIC decommission; pool site tombstoned; G3 explorer flipped to archive mode (static or frozen-RPC) |
 | **Gap (~6 months)** | V4 OpenAPI spec frozen → SDKs regenerated; RPC surface built (DEV-3); explorer V4 build; wallet staking/taint UX built against devnet/testnet; L2 finality predicate + chain-id decision; onboarding runbooks written |
 | **G4 launch** | Everything repoints to the new chain; Foundation begins checkpoint publication; new SDK majors released; old majors documented as archive clients |
@@ -560,7 +560,7 @@ tooling; `genesis4-carryover` already exists and is tested).
 
 The halted chain still has users' history in it. Minimum viable archive: one
 frozen archival node (read-only RPC) + the G3 explorer in archive mode with a
-banner ("chain halted at 80,000; canonical record is the signed snapshot
+banner ("chain halted at height 50,000 (rule; reached and snapshotted at 39,918); canonical record is the signed snapshot
 <digest>; balances carried into Genesis-4"). Cheap, and it is what makes the
 "your balance was preserved" claim auditable by anyone.
 
@@ -572,7 +572,7 @@ banner ("chain halted at 80,000; canonical record is the signed snapshot
 | Commission disclosure under-built → §6.3's no-cap bet fails silently | §2.3 | MUST-level acceptance criteria on explorer + wallet delegation screens |
 | Amount overflow (10^19 sats vs int64 / 2^53) ships into V4 clients | §1.4/§4 | CLOSED — all satoshi fields are decimal strings, decided once in OpenAPI (`BLOCH-SATOSHI-ENCODING.md`); Go `Satoshis` is `uint64` + string codec; explorer/TS BigInt |
 | Explorer dies with the pool (shared `g2rpc.posternpool.com`) | §2.4/§6 | Repoint before decommission; it is one constant |
-| L2 users stranded at the halt | §5.3 | Published drain deadline well before h 80,000 |
+| L2 users stranded at the halt | §5.3 | Published drain deadline well before h 50,000 (actual stop 39,918) |
 | `getattestation` name collision produces two meanings of "attestation" in one API | §1.4 | Rename in the V4 major, document both |
 
 ### 8.4 Effort summary

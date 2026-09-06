@@ -44,6 +44,14 @@
   # Headless: serial console for provider-side boot diagnostics only — nothing
   # secret is ever printed there (the host can read it).
   boot.kernelParams = [ "console=ttyS0" ];
+  # MED-5: `console=ttyS0` alone makes NixOS auto-enable a LOGIN getty on the
+  # serial console (systemd's kernel-command-line generator does this by
+  # default) — an interactive shell prompt reachable by anyone with hypervisor
+  # serial-console access, which for a confidential-VM guest is precisely the
+  # host operator this whole design distrusts. Kernel boot diagnostics on
+  # ttyS0 stay (the line above); the LOGIN PROMPT on it does not.
+  systemd.services."serial-getty@ttyS0".enable = lib.mkForce false;
+  systemd.services."getty@tty1".enable = lib.mkForce false; # headless: no local console login either
 
   # Deliberately ABSENT: provider guest agents / cloud-init-style tooling with
   # host-writable command channels. The only launch-time input consumed is the
@@ -90,6 +98,21 @@
       DeviceAllow = [ "/dev/sev-guest rw" ];
       PrivateDevices = false; # must see /dev/sev-guest — everything else is denied above
 
+      # Resource containment (HIGH-2/MED-1 spine, same rationale as
+      # os/bloch-node.nix — a single-connection-handler gate does not need
+      # much, but an unbounded one is still a host-wide DoS surface).
+      MemoryMax = "25%";
+      MemoryHigh = "20%";
+      TasksMax = 256;
+      LimitNOFILE = 4096;
+
+      # DELIBERATE EXCEPTION to the IPAddressDeny=any pattern used elsewhere
+      # in this tree: this is the pre-attestation listener by design (spec
+      # §4) — it must accept a connection from a client whose address is not
+      # known in advance, before any tunnel or allowlist exists. Restricting
+      # its address family instead (below) is the applicable control here,
+      # not a source-address allowlist.
+
       # os/bloch-node.nix hardening spine, verbatim discipline.
       NoNewPrivileges = true;
       ProtectSystem = "strict";
@@ -102,7 +125,9 @@
       ProtectControlGroups = true;
       ProtectClock = true;
       ProtectHostname = true;
-      RestrictAddressFamilies = [ "AF_INET" "AF_INET6" ];
+      ProtectProc = "invisible";
+      ProcSubset = "pid";
+      RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
       RestrictNamespaces = true;
       RestrictRealtime = true;
       RestrictSUIDSGID = true;
@@ -110,6 +135,7 @@
       MemoryDenyWriteExecute = true;
       SystemCallArchitectures = "native";
       SystemCallFilter = [ "@system-service" "~@privileged" "~@resources" ];
+      CapabilityBoundingSet = [ ];
       UMask = "0077";
       LimitCORE = 0;
     };
@@ -180,10 +206,12 @@
 
   # ── State: /persist is a separate LUKS volume (spec §4.2) ──────────────────
   # Rootfs is verity-sealed read-only (./attested.nix). Mutable state lives on
-  # /persist, LUKS-keyed in-guest (TEE-random, first boot) — the provider holds
-  # ciphertext only. Fleet variant: key release via org-hosted KBS (Trustee)
-  # gated on a Trusted verdict. Provisioned at first boot; device set at deploy.
-  # boot.initrd.luks.devices."persist".device = "/dev/disk/by-partlabel/persist";
+  # /persist — the partition + `boot.initrd.luks.devices."persist"` +
+  # `fileSystems."/persist"` definitions now live in ./attested.nix (imported
+  # above), TPM2-sealed rather than passphrase-keyed. UNTESTED-IN-THIS-SESSION
+  # — see the notice and validation commands in attested.nix before trusting
+  # this on real CVM hardware. Fleet variant: key release via org-hosted KBS
+  # (Trustee) gated on a Trusted verdict is a follow-up, not yet wired here.
 
   # The node is available but not mining by default on a workstation seat.
   services.bloch.enable = lib.mkDefault false;

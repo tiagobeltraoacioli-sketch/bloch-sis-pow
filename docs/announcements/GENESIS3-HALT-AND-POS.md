@@ -22,8 +22,9 @@
 - Between the halt and the Genesis-4 launch there will be a period of
   **several months with no running chain**. The explorer at
   [blochl1.com](https://blochl1.com) stays online serving history.
-- On Genesis-4 the total supply is redenominated from 21,000,000,000 to
-  **100,000,000,000 BLCH as a pure split (×4.7619)**. Every balance is
+- On Genesis-4 the total supply is redenominated from its pre-split figure of 21,000,000,000
+  to **100,000,000,000 BLCH as a pure split (×100/21, i.e.
+  ×4.7619)**. Every balance is
   multiplied by the same factor; every percentage stays identical. Nobody
   gains, nobody is diluted. It is not new money.
 - Genesis-4 replaces mining with **proof-of-stake**. The planned validator
@@ -159,25 +160,28 @@ emission runs over 40 years, and allocations to the foundation, team, and
 other buckets vest on published schedules. So a balance's share of *total
 eventual supply* is what the split preserves; its share of *circulating*
 supply will change over time as emission proceeds, exactly as it did under
-mining. The carried-over Genesis-3 supply is **17.97% of the eventual 100 B**.
-The full allocation, in post-split terms:
+mining. The carried-over Genesis-3 supply is **18.15% of the eventual 100 B**
+(`CARRYOVER_TOTAL_BLOCH`, re-measured 2026-08-11 at height 39,918 —
+`CARRYOVER_MEASURED_HEIGHT`/`CARRYOVER_MEASURED_UTXOS`).
+The full allocation, in post-split terms (`tokenomics_v4.rs`):
 
 | Allocation | BLCH | Share | Terms |
 |---|---:|---:|---|
-| Carryover (all Genesis-3 balances) | 17,970,880,000 | 17.97% | liquid at genesis |
-| Validator emission | 43,029,120,000 | 43.03% | issued over 40 years |
-| Founder grant | 10,000,000,000 | 10% | 10-year cliff, then 40-year linear vest |
+| Carryover (all Genesis-3 balances) | 18,146,400,000 | 18.15% | liquid at genesis |
+| Validator emission | 42,853,600,000 | 42.85% | issued over 40 years |
+| Founder grant | 10,000,000,000 | 10% | 2-year cliff, then 8-year linear vest |
 | VC | 10,000,000,000 | 10% | vesting |
 | Team | 10,000,000,000 | 10% | vesting |
 | Liquidity | 5,000,000,000 | 5% | — |
 | Marketing | 4,000,000,000 | 4% | — |
 
 **On concentration, because it should come from us and not be found:** the
-founder's carried-over balance is by far the largest — roughly 94% of the
-Genesis-3 supply crossing the snapshot — and, like every carried-over
-balance, it is liquid and stakeable in Genesis-4. The mechanisms that bound
-it over time (the founder grant's 10-year cliff and 40-year vest, the
-declining cap on the genesis validator cohort, per-validator stake limits)
+founder's carried-over balance is by far the largest — 93.94% of the
+carryover set (`LARGEST_CARRYOVER_ADDRESS_BLOCH` / `CARRYOVER_TOTAL_BLOCH`)
+— and, like every carried-over balance, it is liquid and stakeable in
+Genesis-4. The mechanisms that bound it over time (the founder grant's
+2-year cliff and 8-year vest — `FOUNDER_CLIFF_SLOTS` / `FOUNDER_VESTING_SLOTS`,
+the declining cap on the genesis validator cohort, per-validator stake limits)
 are published in the tokenomics specification, along with what each does and
 does not achieve. We publish the numbers as they are.
 

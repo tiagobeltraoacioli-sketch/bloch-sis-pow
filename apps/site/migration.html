@@ -7,7 +7,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Migration — Bloch Protocol</title>
-<meta name="description" content="Genesis-3 halts at height 50,000 by consensus rule. Genesis-4 relaunches as proof of stake from a signed snapshot. What happens to balances, and what to refuse.">
+<meta name="description" content="Genesis-3 halted at height 50,000 by consensus rule. Genesis-4 has relaunched as proof of stake from a signed snapshot, live since 2026-08-13. What happened to balances, and what to refuse.">
 <link rel="stylesheet" href="assets/site.css">
 </head>
 <body>
@@ -38,26 +38,24 @@
 
 <header class="pagehead"><div class="wrap">
   <p class="eyebrow">Migration</p>
-  <h1>The chain that stops on purpose.</h1>
+  <h1>The chain that stopped on purpose.</h1>
   <p class="lede">
-    Genesis-3 ends at a height written into consensus. Genesis-4 starts months later,
-    as proof of stake, from a signed snapshot of every balance. Between the two there
-    is deliberately nothing &mdash; and nothing is what you should do with your coins.
+    Genesis-3 ended at a height written into consensus. Genesis-4 has been running
+    since 2026-08-13 21:31:19 UTC, as proof of stake, from a signed snapshot of every
+    balance. There was deliberately no action for holders to take, and there still
+    isn&rsquo;t &mdash; the carryover already happened.
   </p>
 </div></header>
 
 <div class="status"><div class="wrap">
-  <!-- 50,000: docs/FLEET-BRIEF-CERTIK-2026-08-12.md:79 (lowered from 50,000 on
-       2026-08-12; the 50,000 constant at crates/bloch-crypto/src/core/mod.rs:438
-       is superseded by that decision). -->
-  <dl class="stat"><dt>Last valid height</dt><dd>50,000</dd><div class="sub">blocks above it are invalid</div></dl>
-  <!-- Snapshot measured for carryover at height 43,172: 448,337 UTXOs across
-       15 addresses — crates/bloch-pos-committee/src/tokenomics_v4.rs:77. -->
-  <dl class="stat"><dt>UTXOs to carry</dt><dd>448,337</dd><div class="sub">measured at height 43,172</div></dl>
-  <!-- ~6 months: crates/bloch-crypto/src/core/mod.rs:415-417 ("Genesis-4
-       launches from that artifact about six months later"). -->
-  <dl class="stat"><dt>The gap</dt><dd>~6 <span style="font-size:1rem">months</span></dd><div class="sub">planned, no chain running</div></dl>
-  <dl class="stat"><dt>Your action</dt><dd>None</dd><div class="sub">balances carry automatically</div></dl>
+  <!-- GENESIS3_TERMINAL_HEIGHT = 50,000 (consensus rule, crates/bloch-crypto/src/core/mod.rs);
+       the chain actually stopped at height 39,918 (CARRYOVER_MEASURED_HEIGHT). -->
+  <dl class="stat"><dt>Terminal height (rule)</dt><dd>50,000</dd><div class="sub">blocks above it are invalid; actual stop 39,918</div></dl>
+  <!-- CARRYOVER_MEASURED_UTXOS = 452,726 at CARRYOVER_MEASURED_HEIGHT = 39,918 —
+       tokenomics_v4.rs. -->
+  <dl class="stat"><dt>UTXOs carried</dt><dd>452,726</dd><div class="sub">measured at height 39,918</div></dl>
+  <dl class="stat"><dt>Genesis-4</dt><dd>live</dd><div class="sub">since 2026-08-13 21:31:19 UTC</div></dl>
+  <dl class="stat"><dt>Your action</dt><dd>None</dd><div class="sub">balances carried automatically</div></dl>
 </div></div>
 
 <section id="phases"><div class="wrap">
@@ -68,40 +66,40 @@
   </div>
   <ol class="phases">
     <li>
+      <span class="marker">done</span>
+      <div class="phase-body">
+        <h3>Proof of work <span class="state">halted</span></h3>
+        <!-- SHA-256d + AuxPoW merged mining, historical: the chain halted by
+             consensus rule and actually stopped at height 39,918
+             (CARRYOVER_MEASURED_HEIGHT). -->
+        <p>The chain produced blocks under SHA-256d with merged mining until it halted by consensus rule. It actually stopped, and was snapshotted, at height 39,918.</p>
+      </div>
+    </li>
+    <li>
+      <span class="marker">done</span>
+      <div class="phase-body">
+        <h3>The chain halted</h3>
+        <!-- Invalid-above-terminal as a consensus rule, and why "unwanted" is
+             not enough: crates/bloch-crypto/src/core/mod.rs. -->
+        <p>Blocks above the terminal height (50,000) are <strong>invalid</strong> &mdash; a consensus rule compiled into every node, not a switch anyone threw. A chain does not stop because it was announced; if late blocks were merely unwanted, miners would keep producing them and the &ldquo;halt&rdquo; would be a fork nobody agreed to. Making them invalid is what actually ended the chain.</p>
+        <p>Mining revenue ended there. The signed snapshot of every balance, taken at height 39,918, is the canonical carryover record.</p>
+      </div>
+    </li>
+    <li>
+      <span class="marker">done</span>
+      <div class="phase-body">
+        <h3>The gap</h3>
+        <p>Balances sat in the snapshot; the <a href="https://blochl1.com">explorer</a> kept serving history. That review period is over.</p>
+        <p>One consequence stated plainly: once mining stopped, the old chain&rsquo;s history stopped being evidence &mdash; proof-of-work security was bought with ongoing hashrate. That is why the canonical artifact was the signed snapshot, whose digest is embedded in the Genesis-4 genesis block, and not whatever chain had the most work afterwards.</p>
+      </div>
+    </li>
+    <li>
       <span class="marker">now</span>
       <div class="phase-body">
-        <h3>Proof of work, running <span class="state now">live</span></h3>
-        <!-- SHA-256d + AuxPoW merged mining: docs/PROJECT-STATUS.md,
-             "Live network — Genesis-3 mainnet". -->
-        <p>The chain produces blocks under SHA-256d with merged mining. Nothing about it changes until height 50,000: transactions confirm, the explorer indexes, miners are paid.</p>
-      </div>
-    </li>
-    <li>
-      <span class="marker">height 50,000</span>
-      <div class="phase-body">
-        <h3>The chain halts <span class="state next">days away</span></h3>
-        <!-- Invalid-above-terminal as a consensus rule, and why "unwanted" is
-             not enough: crates/bloch-crypto/src/core/mod.rs:415-438. -->
-        <p>Blocks above 50,000 are <strong>invalid</strong> &mdash; a consensus rule compiled into every node, not a switch anyone throws. A chain does not stop because it was announced; if late blocks were merely unwanted, miners would keep producing them and the &ldquo;halt&rdquo; would be a fork nobody agreed to. Making them invalid is what actually ends the chain.</p>
-        <p>Mining revenue ends here. A signed snapshot of every balance is taken at this height.</p>
-      </div>
-    </li>
-    <li>
-      <span class="marker">the gap</span>
-      <div class="phase-body">
-        <h3>About six months with no chain</h3>
-        <!-- ~6 months and snapshot-digest-in-genesis: crates/bloch-crypto/src/core/mod.rs:415-435. -->
-        <p>Balances sit in the snapshot; the <a href="https://blochl1.com">explorer</a> keeps serving history. This is the plan, not a failure &mdash; the time is for review before a chain restarts with different consensus.</p>
-        <p>One consequence stated plainly: once mining stops, the old chain&rsquo;s history stops being evidence &mdash; proof-of-work security is bought with ongoing hashrate. That is why the canonical artifact is the signed snapshot, whose digest goes into the Genesis-4 genesis block, and not whatever chain has the most work afterwards.</p>
-      </div>
-    </li>
-    <li>
-      <span class="marker">genesis-4</span>
-      <div class="phase-body">
-        <h3>Proof of stake, from the snapshot</h3>
+        <h3>Proof of stake, from the snapshot <span class="state now">live</span></h3>
         <!-- Carryover as ordinary liquid balance, one balance set:
-             crates/bloch-pos-committee/src/tokenomics_v4.rs:75-100. -->
-        <p>Every Genesis-3 balance crosses as an ordinary liquid balance &mdash; 448,337 UTXOs, carried automatically. Carried-over coins can be staked and delegated like any other coin.</p>
+             crates/bloch-pos-committee/src/tokenomics_v4.rs. -->
+        <p>Genesis-4 has been running since 2026-08-13 21:31:19 UTC. Every Genesis-3 balance crossed as an ordinary liquid balance &mdash; 452,726 UTXOs, carried automatically. Carried-over coins can be staked and delegated like any other coin.</p>
       </div>
     </li>
   </ol>
@@ -126,9 +124,11 @@
     </div>
     <div class="card c">
       <span class="tag">Scam shape 3</span>
-      <h3>&ldquo;Launch is on this date&rdquo;</h3>
-      <!-- No launch date: crates/bloch-pos-node/src/main.rs:3-13 (devnet stage). -->
-      <p>There is no Genesis-4 launch date. The gap is measured in months and ends when review does &mdash; anyone quoting a date is guessing or baiting.</p>
+      <h3>&ldquo;There&rsquo;s a second migration coming&rdquo;</h3>
+      <!-- Genesis-4 launched 2026-08-13 21:31:19 UTC; the carryover already
+           happened automatically at that launch. There is no further
+           migration event to wait for or act on. -->
+      <p>Genesis-4 launched 2026-08-13 21:31:19 UTC and the carryover already happened, automatically, at that launch. There is no second migration, no further snapshot, and nothing left to do &mdash; anyone telling you otherwise is baiting a theft.</p>
     </div>
   </div>
 </div></section>

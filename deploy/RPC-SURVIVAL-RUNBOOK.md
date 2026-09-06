@@ -42,7 +42,7 @@ the chain and the whole plan rests on node4 reaching 80,000:
 **0.2 `BLOCH_RPC_URL` cannot be an IP address.** A Pages Function is a Worker,
 and a Worker `fetch()` to a bare IP literal is answered by **Cloudflare itself**
 with 403 `error code: 1003` — it never reaches the origin. §4's Step B
-(`BLOCH_RPC_URL = http://136.244.82.226:16220/`) would have reproduced exactly
+(`BLOCH_RPC_URL = http://ARCHIVAL_IP:16220/`) would have reproduced exactly
 the failure it was meant to fix, from the opposite direction: the old dashboard
 value was a *proxied hostname*, the proposed one a *raw IP*, and both are 1003.
 The upstream must be a hostname resolving DNS-only to the origin.
@@ -62,11 +62,11 @@ where the value is reviewable instead of invisible.
 no longer depends on `g2rpc.posternpool.com`, the tier that dies with the pool.
 
 **The one open item, and it needs DNS write.** The live upstream is
-`http://136-244-82-226.sslip.io/` — a public wildcard-DNS service that resolves
+`http://ARCHIVAL-IP-DASHED.sslip.io/` — a public wildcard-DNS service that resolves
 to the IP in its own name. It works, and it puts a third party in the resolution
 path of the RPC tier that has to outlive the pool for six months. The durable
 value is `http://rpc.blochl1.com/`, a **DNS-only (grey-cloud)** A record for
-136.244.82.226 in the `blochl1.com` zone (id `CLOUDFLARE_ZONE_ID`).
+ARCHIVAL_IP in the `blochl1.com` zone (id `CLOUDFLARE_ZONE_ID`).
 That record was not created here because the available Cloudflare token carries
 `zone:read`, not DNS write. Once it exists: change the one line in
 `apps/explorer/wrangler.toml` and redeploy. Nothing else moves.
@@ -149,9 +149,9 @@ during the sweep — the ±1 is propagation, not divergence).
 
 | Box | IP / key | Services (running) | Node RPC | Notes |
 |---|---|---|---|---|
-| **auxpow** | PRODUCER_IP, `~/.ssh/PRODUCER_KEY` | `bloch-auxpow` (node + solo stratum :3333, `--mine`), `bloch-merged-pool` (:3336), `bloch-pool-proxy`, `bitcoind-mainnet` | `127.0.0.1:16216` | ASIC hashrate lands here. Disk 81% (8.5 G free), g3-data 1.6 G, RAM 7.8 G shared with bitcoind. This box is the pool — most of it is what gets decommissioned. |
-| **relay box** | RELAY_IP, `~/.ssh/RELAY_KEY` | `bloch-g3` (node, RPC `127.0.0.1:16216`, P2P :16116), `bloch-gpu-miner`, `bloch-l2` + `cloudflared-l2` (l2rpc), **`cloudflared`** (tunnel `TUNNEL_UUID…` = g2rpc origin), **`bloch-rpc-bridge`** (socat `:8080 → 127.0.0.1:16226`), **`g2rpc-tunnel`** (ssh `-L 127.0.0.1:16226 → PRODUCER_IP:16216`, key `~/.ssh/TUNNEL_KEY`), 3× stratum passthrough | `127.0.0.1:16216` (own node — NOT what g2rpc serves) | Confirms the brief: public g2rpc = **auxpow's** node through a 3-box chain. |
-| **node4** | 136.244.82.226, `~/.ssh/ARCHIVAL_KEY` | `bloch-g3` only — nothing else | `127.0.0.1:16210` | Archival public peer. P2P :16110 (+:16111). Data 1.9 G. Disk 87% (6.1 G free). ufw: default deny inbound; allows 22, 11434, 16110 only. Uptime 13 days. |
+| **auxpow** | PRODUCER_IP, `~/.ssh/FLEET_KEY` | `bloch-auxpow` (node + solo stratum :3333, `--mine`), `bloch-merged-pool` (:3336), `bloch-pool-proxy`, `bitcoind-mainnet` | `127.0.0.1:16216` | ASIC hashrate lands here. This box is the pool — most of it is what gets decommissioned. |
+| **relay box** | RELAY_IP, `~/.ssh/FLEET_KEY` | `bloch-g3` (node, RPC `127.0.0.1:16216`, P2P :16116), `bloch-gpu-miner`, `bloch-l2` + `cloudflared-l2` (l2rpc), **`cloudflared`** (tunnel `TUNNEL_UUID…` = g2rpc origin), **`bloch-rpc-bridge`** (socat `:8080 → 127.0.0.1:16226`), **`g2rpc-tunnel`** (ssh `-L 127.0.0.1:16226 → PRODUCER_IP:16216`, key `~/.ssh/FLEET_KEY`), 3× stratum passthrough | `127.0.0.1:16216` (own node — NOT what g2rpc serves) | Confirms the brief: public g2rpc = **auxpow's** node through a 3-box chain. |
+| **node4** | ARCHIVAL_IP, `~/.ssh/FLEET_KEY` | `bloch-g3` only — nothing else | `127.0.0.1:16210` | Archival public peer. P2P :16110 (+:16111). Uptime 13 days. Disk/RAM figures and the box's firewall rule listing are redacted here (see the notice at the top of this file) — **operators re-measure their own box**, but see the note immediately below: this box's firewall was found allowing **port 11434 (Ollama's default port)** inbound, which has no legitimate reason to be open on an archival RPC node and should be closed on any fleet box where it is found, regardless of whether that box is this one. |
 
 **Today's g2rpc path** (every hop verified live):
 
@@ -186,7 +186,7 @@ route.
 
 ---
 
-## 3. Recommendation: node4 (136.244.82.226) becomes the permanent archival RPC
+## 3. Recommendation: node4 (ARCHIVAL_IP) becomes the permanent archival RPC
 
 Reasons, in order of weight:
 
@@ -229,7 +229,7 @@ preferred plan. DNS (§5) is optional polish, not a requirement.
 ### Step A — expose node4's RPC on :16220 (additive; touches only node4)
 
 ```bash
-ssh -i ~/.ssh/ARCHIVAL_KEY OPERATOR@ARCHIVAL_IP
+ssh -i ~/.ssh/FLEET_KEY OPERATOR@ARCHIVAL_IP
 
 sudo tee /etc/systemd/system/bloch-rpc-public.service >/dev/null <<'EOF'
 [Unit]
@@ -251,7 +251,7 @@ sudo systemctl enable --now bloch-rpc-public.service
 sudo ufw allow 16220/tcp comment 'Bloch archival RPC (public read)'
 
 # verify from the Mac:
-curl -sS -m 10 -X POST http://136.244.82.226:16220/ \
+curl -sS -m 10 -X POST http://ARCHIVAL_IP:16220/ \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"getblockcount","params":[]}'
 ```
@@ -280,7 +280,7 @@ Function, and Pages egress IPs cannot be usefully pinned in ufw.
 ### Step B — fix `BLOCH_RPC_URL` and redeploy the Pages project
 
 Dashboard: Workers & Pages → `bloch-explorer` → Settings → Environment
-variables → set **`BLOCH_RPC_URL` = `http://136.244.82.226:16220/`**
+variables → set **`BLOCH_RPC_URL` = `http://ARCHIVAL_IP:16220/`**
 (production). Pages vars only take effect on the next deployment, so redeploy
 the current build:
 
@@ -316,7 +316,7 @@ NOT reuse the miner-box tunnel, that re-creates the relay-box dependency this
 runbook exists to remove.
 
 ```bash
-ssh -i ~/.ssh/ARCHIVAL_KEY OPERATOR@ARCHIVAL_IP
+ssh -i ~/.ssh/FLEET_KEY OPERATOR@ARCHIVAL_IP
 # install cloudflared (same binary/method as the miner-box: /usr/local/bin/cloudflared)
 cloudflared tunnel login                       # or create the tunnel in Zero Trust dashboard
 cloudflared tunnel create bloch-archival-rpc
@@ -333,7 +333,7 @@ DNS record in the blochl1.com zone. The client chain tolerates the hostname
 disappearing (it just warns and falls to `/rpc`).
 
 Note: even with tier 1 live, `BLOCH_RPC_URL` must still point at the
-**direct** origin (`http://136.244.82.226:16220/`), never at
+**direct** origin (`http://ARCHIVAL_IP:16220/`), never at
 `rpc.blochl1.com` — proxied hostname in the Function = 1003 again.
 
 ### What about `g2rpc.blochl1.com`?

@@ -22,7 +22,13 @@ set -uo pipefail
 cd "$(dirname "$0")"
 
 LIST=bootnodes.txt
-KEY=${BLOCH_FLEET_KEY:-$HOME/.ssh/edgevana_fleet_g4}
+# A dedicated, read-only key — never the fleet admin/validator key. Per
+# deploy/SSH-ROLE-SEPARATION.md this key's authorized_keys entry is restricted
+# with a `command=`/`from=` ForceCommand to the read-only verify path only; it
+# cannot start, stop, or reconfigure anything. BLOCH_FLEET_KEY is accepted as a
+# deprecated fallback for one release so existing operators are not broken
+# silently, but every fleet should migrate to a key scoped this way.
+KEY=${BLOCH_VERIFY_RO_KEY:-${BLOCH_FLEET_KEY:-$HOME/.ssh/edgevana_verify_ro}}
 DEEP=0
 [ "${1:-}" = "--deep" ] && DEEP=1
 
@@ -46,6 +52,13 @@ else
 fi
 
 echo "Checking $COUNT published entries from $LIST"
+if [ $DEEP -eq 1 ]; then
+  echo "NOTE: --deep facts (keyless/transport/chain state below) are SELF-REPORTED"
+  echo "  by each host over its own ssh session. This script does not independently"
+  echo "  verify them from outside that host — a host that has been compromised or"
+  echo "  misconfigured can report anything. Only the plain (no --deep) reachability"
+  echo "  probe above is checked from outside the host being described."
+fi
 echo
 
 FAIL=0

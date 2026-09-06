@@ -584,7 +584,7 @@ same-origin `/rpc` Pages Function → `https://g2rpc.posternpool.com/`
   explicitly: "OPS ACTION REQUIRED before the halt — route it (tunnel
   ingress + DNS + edge cert) to the surviving archival node's RPC"). The
   deprecated pool tunnel is currently the only live endpoint and dies with
-  the pool at the height-80,000 halt. Wiring `rpc.blochl1.com` is already
+  the pool at the halt (terminal height 50,000, actual stop 39,918). Wiring `rpc.blochl1.com` is already
   a pre-halt ops obligation; when the G4 node ships `eth_*` on the shared
   dispatcher, the same hostname serves the EVM surface for free.
 - The same-origin proxy (`apps/explorer/functions/rpc.js`) enforces a
