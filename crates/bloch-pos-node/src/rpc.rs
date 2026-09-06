@@ -1644,9 +1644,13 @@ pub fn chain_info_json(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Finality {
     /// At or below the finalised checkpoint. The strongest classification
-    /// this node offers — and NOT irreversible: it is backed by no slashing
-    /// cost (none can be applied on this network) and it is not a latch. Read
-    /// the retraction on [`Finality`] before crediting anything on it.
+    /// this node offers. Since 2026-09-05 (finding F-03) it IS a latch on
+    /// the answering node: the engine refuses any reorg below its own
+    /// highest finalized checkpoint, so a block this node once reported
+    /// `finalized` never later leaves ITS canonical chain. It is still
+    /// backed by no slashing cost (none can be applied on this network), so
+    /// it is not an economic guarantee across nodes. Read the retraction on
+    /// [`Finality`] before crediting anything on it.
     Finalized,
     /// At or below the justified checkpoint but above the finalised one. One
     /// epoch away from finality in the normal case; still reversible.

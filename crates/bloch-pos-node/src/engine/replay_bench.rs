@@ -699,6 +699,8 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         ws_anchor_hard: false,
         ws_conflict_reported: false,
         fc_covered_removals: 0,
+        finalized_latch: None,
+        finality_rewinds_refused: 0,
         manifest,
     }
 }

@@ -53,13 +53,22 @@
 //! unfinalised suffix instead of the whole chain.
 //!
 //! This sentence used to read "finalised history can never be reorganised
-//! out". CORRECTED 2026-09-01: that is false, and it is false in normal
-//! operation, not under attack. The walk starts at the *justified* root, and
-//! the state committed there finalises two epochs below the head — so the
-//! deepest cut this algorithm may legitimately propose is itself a finality
-//! rewind. It has been measured: finalized epoch 6 -> 4 -> 2 -> 0 in three
-//! in-rules cuts. `finalized` is not a latch, and `rpc.rs`'s `Finality` doc
-//! carries the retraction an integrator needs.
+//! out". CORRECTED 2026-09-01: that is false as a property of the WALK, and
+//! it is false in normal operation, not under attack. The walk starts at the
+//! *justified* root, and the state committed there finalises two epochs below
+//! the head — so the deepest cut the walk may legitimately propose is itself
+//! a finality rewind. It has been measured: finalized epoch 6 -> 4 -> 2 -> 0
+//! in three in-rules cuts.
+//!
+//! CLOSED 2026-09-05 (finding F-03): the walk still proposes such cuts, but
+//! the node no longer takes them. `Engine::finalized_latch` is an
+//! engine-owned downward ratchet — the highest finalized checkpoint this
+//! node has ever adopted — and both `advance` and `do_reorg` refuse any
+//! reorg whose fork point sits below it, dropping the demanding branch. The
+//! latch is deliberately NOT read from replayed state (a reorg replaces that
+//! state; that substitution WAS the bug). `rpc.rs`'s `Finality` doc still
+//! carries the slashing-cost retraction an integrator needs: the latch stops
+//! THIS node rewinding itself; it is not an economic guarantee across nodes.
 //!
 //! The store is **rebuilt from scratch on every head computation** rather than
 //! carried as mutable node state. That is the §5.5 posture applied where it is
@@ -918,6 +927,22 @@ struct Engine {
     /// that kind of pool shrinkage apart from the epoch `retain`, which fork
     /// choice very much can see. See the argument there.
     fc_covered_removals: u64,
+    /// The finality latch (finding F-03): the highest finalized checkpoint
+    /// this node has EVER adopted, as `(canonical height, root)`. Ratcheted
+    /// forward by [`Engine::ratchet_finalized`], never lowered, and consulted
+    /// by [`Engine::cut_below_finalized_latch`] before any reorg.
+    ///
+    /// This is deliberately NOT `self.state.finality().finalized`: that value
+    /// lives in replayed state, so a reorg REPLACES it — which is exactly how
+    /// the measured finalized 6 -> 4 -> 2 -> 0 rewind happened. The latch is
+    /// engine-owned and survives every state swap. In-memory only: on boot it
+    /// is rebuilt by the replay of this node's own log, which re-finalizes
+    /// the same checkpoints in the same order.
+    finalized_latch: Option<(u64, [u8; 32])>,
+    /// Reorgs refused because they would have cut canonical history below
+    /// the latch. A rewind an operator cannot see is a rewind that gets
+    /// diagnosed as "sync trouble"; this makes it a measurement.
+    finality_rewinds_refused: u64,
     /// Blocks whose parent this node has never seen, oldest first, with their
     /// ids so a repeat gossip is recognised without re-hashing.
     ///
@@ -2289,6 +2314,16 @@ impl Engine {
                 if !progressed {
                     continue;
                 }
+            } else if self.cut_below_finalized_latch(&ancestor) {
+                // Finality latch (F-03): the heaviest branch demands cutting
+                // below this node's finalized checkpoint. Refuse it, drop the
+                // branch, and stop here — the canonical chain this node has
+                // already finalized is the answer, not the branch. Ending the
+                // loop (rather than `continue`) matters for the empty-branch
+                // give-back case, where there is nothing to drop and retrying
+                // would spin against the same refusal until the bound.
+                self.refuse_finality_rewind(&branch);
+                return;
             } else if !self.do_reorg(ancestor, branch) {
                 continue; // offending block removed; recompute
             }
@@ -2677,6 +2712,10 @@ impl Engine {
                 self.chain.push((env.header.slot, id));
                 self.head_slot.store(env.header.slot, Ordering::Relaxed);
                 self.last_applied_ms = now_ms();
+                // Finality latch (F-03): arm/raise the floor the moment the
+                // adopted state finalizes something new. Outside `if live` on
+                // purpose — boot replay must rebuild the latch too.
+                self.ratchet_finalized();
                 // Counted, because `advance` needs to tell this shrinkage
                 // apart from the `retain` four lines down. These attestations
                 // leave the loose pool and stay visible to fork choice, which
@@ -2836,6 +2875,67 @@ impl Engine {
         st
     }
 
+    // ── The finality latch (finding F-03) ───────────────────────────────────
+
+    /// Ratchet [`Engine::finalized_latch`] up to the state's current
+    /// finalized checkpoint. Called after every canonical adoption — apply
+    /// and reorg — and it only ever moves the latch UP: a branch whose
+    /// replayed state reports a lower finalized epoch (every reorg's state
+    /// does, transiently) leaves the latch where it was. That asymmetry is
+    /// the entire fix for the finalized 6 -> 4 -> 2 -> 0 rewind.
+    fn ratchet_finalized(&mut self) {
+        let fin = self.state.finality().finalized;
+        // Genesis is trivially final and imposes no floor; and a root this
+        // node cannot place on its canonical chain cannot define one either.
+        let Some(h) = self.height_of(&fin.root) else {
+            return;
+        };
+        if h == 0 {
+            return;
+        }
+        match self.finalized_latch {
+            Some((floor, _)) if floor >= h => {}
+            _ => self.finalized_latch = Some((h, fin.root)),
+        }
+    }
+
+    /// Would truncating the canonical chain at `ancestor` cut below the
+    /// latch? `ancestor` at the latch height itself is fine — the finalized
+    /// block stays canonical — so the comparison is strict.
+    fn cut_below_finalized_latch(&self, ancestor: &[u8; 32]) -> bool {
+        match self.finalized_latch {
+            Some((floor, _)) => self.height_of(ancestor).is_some_and(|h| h < floor),
+            None => false,
+        }
+    }
+
+    /// Refuse a reorg that would rewind this node below its own finalized
+    /// checkpoint, and drop the branch that demanded it.
+    ///
+    /// The drop is the "refuse blocks that would" half of the rule: a branch
+    /// that conflicts with this node's finality can never legitimately be
+    /// adopted later (adopting it IS the rewind), so keeping its blocks would
+    /// only let the heaviest-branch walk keep proposing the same refused
+    /// head and freeze fork choice. Removing them lets the next `advance`
+    /// converge on the heaviest branch that respects finality.
+    fn refuse_finality_rewind(&mut self, branch: &[BlockEnvelope]) {
+        self.finality_rewinds_refused += 1;
+        let (floor, root) = self.finalized_latch.expect("only called when latched");
+        if self.live {
+            eprintln!(
+                "FINALITY_LATCH: refused a reorg below this node's finalized checkpoint \
+                 (height {floor}, {}); dropping the {} conflicting block(s). \
+                 Refusals so far: {}.",
+                crate::codec::hex8(&root),
+                branch.len(),
+                self.finality_rewinds_refused,
+            );
+        }
+        for env in branch {
+            self.blocks.remove(env.block_id().as_bytes());
+        }
+    }
+
     /// Adopt `branch`, attached at canonical `ancestor`. True if adopted;
     /// false if a branch block failed validation (it is removed).
     ///
@@ -2857,6 +2957,18 @@ impl Engine {
             .iter()
             .position(|(_, id)| id.as_bytes() == &ancestor)
             .expect("ancestor is canonical");
+
+        // Finality latch (F-03): `finalized` is a downward ratchet. A reorg
+        // whose fork point sits below this node's own highest finalized
+        // checkpoint would truncate finalized history, so it is refused
+        // BEFORE any replay is paid for it — however heavy the branch, and
+        // whatever the branch's own state claims about finality. `advance`
+        // screens the same predicate earlier; this is the authoritative check
+        // on the only path that can truncate `self.chain`.
+        if self.cut_below_finalized_latch(&ancestor) {
+            self.refuse_finality_rewind(&branch);
+            return false;
+        }
 
         let base = self.state_at_canonical(ancestor);
         // Post-states of the branch, so the ring is refilled for the branch
@@ -2918,6 +3030,11 @@ impl Engine {
         self.head_slot
             .store(self.head_slot_now(), Ordering::Relaxed);
         self.last_applied_ms = now_ms();
+        // Finality latch (F-03): the adopted branch's state may finalize
+        // FURTHER than the old branch did — ratchet up if so. It may equally
+        // report LESS (a fork-point state always does); the ratchet ignores
+        // that, which is what keeps the latch monotone across reorgs.
+        self.ratchet_finalized();
         let cur_e = epoch_of(self.state.slot());
         self.pool.retain(|_, a| epoch_of(a.data.slot) >= cur_e);
         if self.live {
@@ -3942,6 +4059,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
         ws_anchor_hard: false,
         ws_conflict_reported: false,
         fc_covered_removals: 0,
+        finalized_latch: None,
+        finality_rewinds_refused: 0,
         manifest,
     };
 
@@ -5914,6 +6033,8 @@ mod transfer_v2_end_to_end {
             ws_anchor_hard: false,
             ws_conflict_reported: false,
             fc_covered_removals: 0,
+            finalized_latch: None,
+            finality_rewinds_refused: 0,
         }
     }
 
@@ -6753,6 +6874,8 @@ mod perf_support {
             // offset the very first comparison against a pool that really is
             // empty.
             fc_covered_removals: 0,
+            finalized_latch: None,
+            finality_rewinds_refused: 0,
         };
         (engine, TestDir(dir))
     }
@@ -8291,6 +8414,8 @@ mod duty_view_anchor {
             ws_anchor_hard: false,
             ws_conflict_reported: false,
             fc_covered_removals: 0,
+            finalized_latch: None,
+            finality_rewinds_refused: 0,
         };
         (engine, dir)
     }
@@ -8536,6 +8661,8 @@ mod slot_horizon {
             ws_anchor_hard: false,
             ws_conflict_reported: false,
             fc_covered_removals: 0,
+            finalized_latch: None,
+            finality_rewinds_refused: 0,
             orphans: VecDeque::new(),
             orphans_evicted: 0,
             orphans_admitted: 0,
@@ -9313,5 +9440,174 @@ mod mempool_ttl {
         assert!(!e.mempool.contains_key(&key));
         assert!(!e.rejected.contains_key(&key), "age is not a refusal, and must not bar a re-offer");
         assert!(!e.mempool_suspect.contains(&key));
+    }
+}
+
+/// The finality latch (finding F-03): `finalized` is a downward ratchet, and
+/// fork choice may never move this node's head below it.
+///
+/// The defect these pin: the finalized checkpoint lived ONLY in replayed
+/// state, so a reorg — including the in-rules empty-branch "give the chain
+/// back" cut that LMD-GHOST legitimately proposes from the justified root —
+/// simply REPLACED it with an older one. Measured on the live network:
+/// finalized epoch 6 -> 4 -> 2 -> 0 in three cuts, on nodes running identical
+/// binaries. An exchange crediting on `finality == "finalized"` loses funds
+/// on exactly that move.
+///
+/// Mutation targets, each of which fails a test here:
+/// - delete the `cut_below_finalized_latch` check in `do_reorg` →
+///   `a_reorg_below_the_finalized_latch_is_refused` adopts the rewind;
+/// - delete the `ratchet_finalized` calls → the latch stays `None` and
+///   `own_finality_arms_the_latch` fails;
+/// - weaken the strict `<` to `<=` in `cut_below_finalized_latch` →
+///   `a_cut_at_the_latch_itself_stays_legal` fails.
+#[cfg(test)]
+mod finality_latch_tests {
+    use super::*;
+
+    /// Drive the one-validator devnet engine to real finality the same way
+    /// `run`'s slot loop does: attest, then propose, every slot. Local
+    /// proposals are not wall-clock bounded (`Source::Local`), so the test
+    /// walks epochs as fast as it can sign. This is the expensive fixture —
+    /// a couple of epochs of real hybrid signatures — so only the ratchet
+    /// test pays for it; the refusal tests arm the latch by hand instead.
+    fn engine_with_own_finality() -> (Engine, perf_support::TestDir) {
+        let (mut engine, dir) = perf_support::proposing_engine();
+        for slot in 1..=(4 * SLOTS_PER_EPOCH) {
+            engine.attest(slot);
+            engine.propose(slot);
+            if engine.state.finality().finalized.epoch >= 1 {
+                break;
+            }
+        }
+        assert!(
+            engine.state.finality().finalized.epoch >= 1,
+            "harness must reach finality on its own votes; got e{} at head slot {}",
+            engine.state.finality().finalized.epoch,
+            engine.head_slot_now(),
+        );
+        (engine, dir)
+    }
+
+    /// Three real proposed blocks and the latch armed by hand at height 2 —
+    /// the state the ratchet test proves is reachable, without paying for
+    /// two epochs of signatures in every test. Only `finalized_latch` is
+    /// forged; every block, state and reorg below runs the production code.
+    fn latched_engine() -> (Engine, perf_support::TestDir, u64, [u8; 32]) {
+        let (mut engine, dir) = perf_support::proposing_engine();
+        for slot in 1..=3 {
+            engine.propose(slot);
+        }
+        assert_eq!(engine.chain.len(), 4, "three blocks over genesis");
+        let (floor, root) = (2u64, *engine.chain[2].1.as_bytes());
+        engine.finalized_latch = Some((floor, root));
+        (engine, dir, floor, root)
+    }
+
+    /// **The ratchet arms itself from this node's OWN finality** — no
+    /// operator input, no checkpoint file — and records exactly the state's
+    /// finalized checkpoint at its canonical height.
+    #[test]
+    fn own_finality_arms_the_latch() {
+        let (engine, _dir) = engine_with_own_finality();
+        let fin = engine.state.finality().finalized;
+        let (floor, root) = engine
+            .finalized_latch
+            .expect("finalizing must arm the latch");
+        assert_eq!(
+            root, fin.root,
+            "the latch must name the finalized checkpoint itself"
+        );
+        assert_eq!(
+            Some(floor),
+            engine.height_of(&fin.root),
+            "and pin it at its canonical height"
+        );
+        assert!(floor > 0, "genesis is no floor");
+    }
+
+    /// **An attempt to move the head below finalized is rejected.** The
+    /// empty-branch give-back to genesis is the exact shape of the measured
+    /// live rewind, and `an_orphan_is_admitted_when_its_parent_lands` (which
+    /// gives a PRE-finality chain back to genesis and asserts it succeeds) is
+    /// the standing control — so what refuses it here is the latch and only
+    /// the latch.
+    #[test]
+    fn a_reorg_below_the_finalized_latch_is_refused() {
+        let (mut engine, _dir, _floor, _root) = latched_engine();
+        let genesis = *engine.chain[0].1.as_bytes();
+        let head_before = engine.head_id();
+        let chain_before = engine.chain.len();
+        let latch_before = engine.finalized_latch;
+
+        assert!(
+            !engine.do_reorg(genesis, Vec::new()),
+            "a reorg below this node's own finalized checkpoint must be refused"
+        );
+
+        assert_eq!(engine.head_id(), head_before, "the head must not move");
+        assert_eq!(engine.chain.len(), chain_before, "no canonical block may be cut");
+        assert_eq!(engine.finalized_latch, latch_before, "the latch must not move either");
+        assert_eq!(
+            engine.finality_rewinds_refused, 1,
+            "a refusal an operator cannot count is a rewind diagnosed as sync trouble"
+        );
+    }
+
+    /// **The floor is strict** — a cut AT the latch height keeps the
+    /// finalized block canonical and must stay legal, or the latch would be
+    /// quietly widening into a freeze of ordinary fork choice above finality.
+    #[test]
+    fn a_cut_at_the_latch_itself_stays_legal() {
+        let (mut engine, _dir, floor, root) = latched_engine();
+        let fin_block = *engine.chain[floor as usize].1.as_bytes();
+        assert_eq!(fin_block, root, "the latch names the block at its height");
+
+        assert!(
+            engine.do_reorg(fin_block, Vec::new()),
+            "giving back everything ABOVE the finalized checkpoint is still \
+             ordinary fork choice and must not be refused"
+        );
+        assert_eq!(
+            engine.finalized_latch,
+            Some((floor, root)),
+            "the latch survives the reorg even though the fork-point state \
+             reports older finality — that asymmetry IS the fix"
+        );
+        assert!(
+            engine.canonical.contains(&root),
+            "the finalized block itself stays canonical"
+        );
+        assert_eq!(engine.finality_rewinds_refused, 0);
+    }
+
+    /// **A conflicting branch that demands the rewind is dropped, not kept.**
+    /// Keeping its blocks would let the heaviest-branch walk re-propose the
+    /// same refused head forever; dropping them is the "refuse blocks that
+    /// would" half of the rule and what lets `advance` converge afterwards.
+    #[test]
+    fn the_branch_demanding_a_rewind_is_dropped() {
+        let (mut engine, _dir, _floor, _root) = latched_engine();
+        // A fake sibling of block 1: forks below the latch. It only needs to
+        // exist in `blocks` — `refuse_finality_rewind` judges the cut, not
+        // the signatures.
+        let genesis = *engine.chain[0].1.as_bytes();
+        let mut env = engine
+            .blocks
+            .get(engine.chain[1].1.as_bytes())
+            .expect("block 1 stored")
+            .clone();
+        env.header.parent = genesis;
+        env.header.randao_mix = [0xEE; 32]; // any header change: new identity
+        let evil_id = *env.block_id().as_bytes();
+        engine.blocks.insert(evil_id, env.clone());
+
+        engine.refuse_finality_rewind(&[env]);
+
+        assert!(
+            !engine.blocks.contains_key(&evil_id),
+            "the refused branch must leave the fork-choice inputs"
+        );
+        assert_eq!(engine.finality_rewinds_refused, 1);
     }
 }
