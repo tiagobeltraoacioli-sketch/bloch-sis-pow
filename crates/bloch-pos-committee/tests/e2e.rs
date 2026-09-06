@@ -456,6 +456,10 @@ mod harness {
             },
             delegator_fee_rewards: &[],
             validator_fee_rewards: &[],
+            // Same reason as the other empty ledgers above: this harness pays
+            // no issuance to delegators, so this stays empty too.
+            delegator_issuance_rewards: &[],
+            current_proposed: &[],
         })
     }
 

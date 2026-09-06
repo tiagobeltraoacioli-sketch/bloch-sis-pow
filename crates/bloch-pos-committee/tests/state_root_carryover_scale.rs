@@ -310,6 +310,8 @@ fn state<'a>(f: &'a Fixture, e: &'a [EutxoEntry]) -> ConsensusState<'a> {
         },
         delegator_fee_rewards: &[],
         validator_fee_rewards: &[],
+        delegator_issuance_rewards: &[],
+        current_proposed: &[],
     }
 }
 

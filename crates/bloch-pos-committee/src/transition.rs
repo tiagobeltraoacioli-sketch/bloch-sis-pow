@@ -713,6 +713,82 @@ impl PosTransaction {
         h.finalize().into()
     }
 
+    /// This chain's own network-binding value (A2-3 / R7 M2): folded into
+    /// [`Self::checked_signing_root`] under `DS_SPEND2` once
+    /// [`crate::params::SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH`] arms — see
+    /// that constant's docs for the carryover-replay hole this closes.
+    ///
+    /// Fixed content, not `CommittedState`: this chain's genesis identity
+    /// does not evolve over its life, so it needs no Merkle commitment of
+    /// its own any more than `DS_SPEND` itself does — a node compiled
+    /// against a different value computes a different
+    /// `checked_signing_root` for every transfer from the instant the gate
+    /// arms and diverges at the very first activation-epoch block, exactly
+    /// as a bugged hardcoded domain tag would. The exact bytes are
+    /// arbitrary; only their being distinct from whatever OTHER network is
+    /// built from this same source is load-bearing, which is why they name
+    /// Genesis-4 by label rather than by anything computed.
+    pub const fn network_binding() -> [u8; 32] {
+        const LABEL: &[u8] = b"BLCH4:GENESIS-4:MAINNET";
+        let mut out = [0u8; 32];
+        let mut i = 0;
+        while i < LABEL.len() {
+            out[i] = LABEL[i];
+            i += 1;
+        }
+        out
+    }
+
+    /// The fold [`Self::checked_signing_root`] applies once the gate is
+    /// active, factored out so tests can drive it with two distinct binding
+    /// values directly — proving the fold is SENSITIVE to the binding (the
+    /// property that makes it a network binding at all) without needing two
+    /// live networks to observe it.
+    fn fold_network_binding(base: [u8; 32], binding: [u8; 32]) -> [u8; 32] {
+        let mut h = Sha3_256::new();
+        h.update(crate::params::DS_SPEND2);
+        h.update(binding);
+        h.update(base);
+        h.finalize().into()
+    }
+
+    /// The value a transfer's witnesses are actually checked against.
+    ///
+    /// Below [`CommittedState::sighash_network_binding_active`] this is
+    /// exactly [`Self::spend_signing_root`] — unchanged, so every signing
+    /// root this crate has ever computed replays identically. At and above
+    /// it, the base root is folded again ([`Self::fold_network_binding`])
+    /// under `DS_SPEND2` with [`Self::network_binding`] — a NEW 16-byte tag
+    /// that is neither a prefix of `DS_SPEND` nor prefixed by it (both are
+    /// exactly 16 bytes with different content), so the result cannot
+    /// collide with any digest `DS_SPEND` alone ever produced.
+    ///
+    /// `spend_signing_root` itself is UNTOUCHED — its signature and its
+    /// value are exactly what they always were, on every call site
+    /// including `bloch-pos-node`'s wallets — so nothing outside this
+    /// crate's own signature CHECK need change before the gate arms.
+    /// Wallets adopt this fold only once the founder announces it, per
+    /// `SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH`'s docs; until then, arming
+    /// with no wallet-side change simply makes every existing signature
+    /// invalid (fail-closed, not fail-open).
+    ///
+    /// V1 and V2 share this fold because both already share
+    /// `spend_signing_root`'s fold (one function, both callers), so the two
+    /// formats cannot drift into different network-binding rules the way
+    /// two independent implementations could.
+    ///
+    /// `epoch` is the caller's `self.epoch`: committed state rolled to the
+    /// judged block's own `epoch_of(header.slot)`, never a clock — the
+    /// 2026-08-08 `expected_bits` fork is the standing reason every gate
+    /// predicate in this crate reads epoch the same way.
+    pub fn checked_signing_root(&self, epoch: u64) -> [u8; 32] {
+        let base = self.spend_signing_root();
+        if !CommittedState::sighash_network_binding_active(epoch) {
+            return base;
+        }
+        Self::fold_network_binding(base, Self::network_binding())
+    }
+
     /// The canonical wire encoding of a consensus transaction — the bytes the
     /// header's `body_root` is a Merkle root over.
     ///
@@ -1338,23 +1414,35 @@ pub static BOUNDARY_VOTE_DROPS: AtomicU64 = AtomicU64::new(0);
 ///
 /// # Why this is a detector and not a `consensus_invariant!`
 ///
-/// A panic here would halt the node, which is the right trade for a condition
-/// that can only fire on an internal code bug — and this one cannot make that
-/// claim. `apply_slashing_evidence` sets `slashed = true` and
-/// `exit_epoch = epoch` MID-EPOCH, and `duty_roster_at` filters on exactly
-/// that predicate, so the roster's index set legitimately shrinks between two
-/// blocks of one epoch. Votes admitted against the wider partition are then
-/// tallied against the narrower one and dropped, by the rule as written.
-/// Anyone who can get valid equivocation evidence included can cause it, so an
-/// unconditional panic at this site would be a remotely triggerable halt of
-/// every node that applied the same block. See
-/// `mid_epoch_slashing_changes_the_roster_index_set_within_one_epoch`.
+/// A panic here would halt the node, which would have been the wrong trade
+/// while a REMOTELY TRIGGERABLE cause existed: until R1 M7,
+/// `apply_slashing_evidence` set `slashed = true` and `exit_epoch = epoch`
+/// MID-EPOCH, and `duty_roster_at` filtered on exactly that predicate, so the
+/// roster's index set legitimately shrank between two blocks of one epoch —
+/// anyone who could get valid equivocation evidence included could cause it.
+/// An unconditional panic at this site would then have been a remotely
+/// triggerable halt of every node that applied the same block.
 ///
-/// So the requirement behind the guard — *production must be able to SEE this,
-/// which today it cannot* — is met without the fatality: an unconditional,
-/// loud, structured, rate-limited line on stderr plus a counter. The
-/// `debug_assert_eq!` at the call site stays, because in a test build the
-/// condition IS a bug and should stop the run.
+/// **R1 M7 closes that specific cause**: `apply_slashing_evidence` now writes
+/// `exit_epoch = (slash epoch) + 1`, and `duty_roster_at`'s predicate reads
+/// `exit_epoch` alone (see its docs), so the index set no longer moves within
+/// the epoch a slash lands in. This function and the `debug_assert_eq!` at
+/// its call site are kept anyway, downgraded from "the only defence against a
+/// known, live cause" to "a defense-in-depth tripwire for a class of bug this
+/// crate has already paid for once" — a coverage check with a real,
+/// self-inflicted mutation behind it
+/// (`mid_epoch_slashing_no_longer_moves_the_partition_within_the_slash_epoch`, which
+/// now proves the FIX rather than the defect) is worth more than one deleted
+/// after the cause it was written for was closed. Should some future change
+/// reopen a way for the index set to move mid-epoch, an unconditional panic
+/// here would still be the wrong trade until that new cause is understood —
+/// hence non-fatal in release, fatal in a test build.
+///
+/// So the requirement behind the guard — *production must be able to SEE this
+/// class of divergence if it ever recurs* — is met without the fatality: an
+/// unconditional, loud, structured, rate-limited line on stderr plus a
+/// counter. The `debug_assert_eq!` at the call site stays, because in a test
+/// build the condition IS a bug and should stop the run.
 ///
 /// Rate-limited by power-of-two backoff rather than by a clock: this crate has
 /// no time source and must not acquire one (§5.5), and a replaying node can
@@ -1498,6 +1586,34 @@ pub struct CommittedState {
     /// unchanged. Read by the wallet surface
     /// ([`Self::validator_fee_reward_sat`]).
     validator_fee_rewards: BTreeMap<u32, u128>,
+    /// Cumulative **issuance** rewards settled to each delegator account, in
+    /// satoshis (audit R1 M4) — the issuance mirror of
+    /// [`Self::delegator_fee_rewards`], for exactly the same ledger reason:
+    /// crediting a delegation record's `amount_sat` directly would
+    /// retroactively reshuffle every later warm-up admission under the
+    /// shared churn budget. Below
+    /// [`crate::params::REWARDS_V2_ACTIVATION_EPOCH`] the issuance loop
+    /// calls `rewards::distribute` with `delegated_stake: 0`, so
+    /// `Payout::delegators` is always zero and this map is never written —
+    /// it contributes ZERO leaves under `TAG_DELEGATOR_ISSUANCE_REWARD`
+    /// while empty, so every pre-gate root is unchanged by its mere
+    /// existence. At and above the gate, `close_epoch` settles each
+    /// validator's `payout.delegators` here, split pro-rata by activated
+    /// stake (mirroring the fee path's `split_delegator_fees`). Read by the
+    /// wallet surface ([`Self::delegator_issuance_reward_sat`]).
+    delegator_issuance_rewards: BTreeMap<u32, u128>,
+    /// Whether each validator produced at least one of its scheduled slots
+    /// in the OPEN epoch (audit R7 M5) — the block-production half of
+    /// [`Self::current_participation`]'s attestation half. Reset to empty at
+    /// every epoch boundary (there is no "previous" mirror: it is read only
+    /// by the SAME `close_epoch` call that then rolls the epoch, unlike
+    /// participation, which an external reader — RPC — wants for the epoch
+    /// that just closed). Below
+    /// [`crate::params::REWARDS_V2_ACTIVATION_EPOCH`] nothing writes this
+    /// map (`apply_block`'s only writer is behind that gate), so it
+    /// contributes ZERO leaves under `TAG_PROPOSED_CURRENT` and every
+    /// pre-gate root is unchanged by its mere existence.
+    current_proposed: BTreeMap<u32, bool>,
     /// The L1 fee market's price, in millisatoshi per gas, that **this**
     /// block's transactions were charged (spec §4.4). Committed, because the
     /// next block's price is derived from it and from the usage below by
@@ -2065,6 +2181,8 @@ impl CommittedState {
             delegator_slash_losses: BTreeMap::new(),
             delegator_fee_rewards: BTreeMap::new(),
             validator_fee_rewards: BTreeMap::new(),
+            delegator_issuance_rewards: BTreeMap::new(),
+            current_proposed: BTreeMap::new(),
             // Genesis opens at the price floor, with no usage behind it: the
             // first block's price is `next_base_fee(floor, {0, 0})`, which
             // clamps back to the floor. A market that opened above its floor
@@ -2262,22 +2380,63 @@ impl CommittedState {
     ///
     /// Since `committees::epoch_committees` stopped filtering on stake
     /// (2026-08-24), **the index set this function returns IS committee
-    /// membership.** The predicate is `!slashed && activation_epoch <= epoch
-    /// && epoch < exit_epoch` — the same three clauses
-    /// `derive::active_validators` applies to the registry, which is what lets
-    /// four independent roster producers agree on one partition. Anything
+    /// membership.** The predicate is `activation_epoch <= epoch && epoch <
+    /// exit_epoch` (see the R1 M7 note below for why `slashed` is not an
+    /// independent third clause here any more), matching the three clauses
+    /// `derive::active_validators` applies to the registry, which is what
+    /// lets independent roster producers agree on one partition. Anything
     /// added to it here — in particular any stake threshold — silently
     /// un-agrees them, because `derive` has neither delegation, nor the cohort
     /// cap, nor the leak to compare against. Stake belongs in the
     /// `effective_stake` field, which decides weight; not in the filter, which
     /// decides membership.
     ///
-    /// # Caveat: the index set is NOT frozen for the epoch
+    /// (`derive::active_validators` — the shadow derivation `produce.rs` uses,
+    /// itself a standing, documented defect, A1-H3, and unreachable from the
+    /// live node — still tests `!slashed` directly rather than through
+    /// `exit_epoch` alone. It is not read on any path this crate's
+    /// `Transition::apply_block` reaches, so the R1 M7 fix below does not
+    /// widen that pre-existing gap on the live chain; closing it belongs to
+    /// whoever owns `derive.rs`/`produce.rs`.)
     ///
-    /// The stake is, but the membership is not: `apply_slashing_evidence` sets
-    /// `slashed` mid-epoch, so a validator can leave this roster between two
-    /// blocks of the same epoch and re-sort the partition under votes already
-    /// admitted. See the comment on the `debug_assert_eq!` in `close_epoch`.
+    /// # R1 M7 — the index set IS frozen for the epoch, via `exit_epoch` alone
+    ///
+    /// A slash used to remove a validator from this roster the INSTANT
+    /// `apply_slashing_evidence` set `rec.slashed = true`, via an independent
+    /// `rec.slashed ||` clause in this predicate. Since this function is
+    /// re-evaluated FRESH on every block within an epoch (rule 2: nothing
+    /// here may cache a partition), that shrank the index set
+    /// `committees::epoch_committees` partitions against between two blocks
+    /// of ONE epoch: attestations step 8 had already admitted against the
+    /// wider partition were then tallied — by this same function, called from
+    /// `close_epoch` — against the narrower one, a different Fisher-Yates
+    /// permutation everywhere, dropping votes the chain had already accepted
+    /// (see `report_boundary_vote_drop`).
+    ///
+    /// The fix is that `apply_slashing_evidence` now writes `exit_epoch =
+    /// (slash epoch) + 1`, never the slash's own epoch (see its docs), and
+    /// this predicate reads `exit_epoch` ALONE for exclusion — `rec.slashed`
+    /// is committed and read elsewhere (RPC, the state root, `is_ejected`-style
+    /// queries) but no longer independently gates membership. That is sound
+    /// because the two writes are inseparable: the ONLY place that sets
+    /// `rec.slashed = true` also sets `rec.exit_epoch` to at most one epoch
+    /// later in the same step, so `slashed == true` always implies a finite,
+    /// correctly-delayed `exit_epoch`. The upshot: a slashed validator keeps
+    /// its (already-penalised, now zero-upside) seat through the boundary of
+    /// the epoch it was slashed in — the same trade the inactivity leak
+    /// already makes for a fully-leaked validator (seat survives, weight does
+    /// not) — and is excluded from every later epoch, exactly as before.
+    ///
+    /// # Caveat superseded
+    ///
+    /// The paragraph that used to stand here said the index set was NOT
+    /// frozen for the epoch and pointed at the `debug_assert_eq!` in
+    /// `close_epoch` as the open half of that defect. Both halves are closed
+    /// by the fix above; the `debug_assert_eq!` and its release-mode
+    /// companion (`report_boundary_vote_drop`) stay in place as a
+    /// defense-in-depth detector for a DIFFERENT future bug, not because this
+    /// one is still reachable through the real evidence-processing path — see
+    /// the updated docs on both.
     fn duty_roster_at(&self, epoch: u64) -> Vec<Validator> {
         // Delegated stake resolved by the delegation module's own fold; its
         // per-validator cap uses the fixed-point form (rule 3 — the cap is
@@ -2287,7 +2446,7 @@ impl CommittedState {
 
         let mut roster: Vec<Validator> = Vec::new();
         for (idx, rec) in &self.validators {
-            if rec.slashed || rec.activation_epoch > epoch || epoch >= rec.exit_epoch {
+            if rec.activation_epoch > epoch || epoch >= rec.exit_epoch {
                 continue;
             }
             let own = sat_u64(rec.staked_sat);
@@ -2551,6 +2710,22 @@ impl CommittedState {
                 reward_sat: *reward_sat,
             })
             .collect();
+        let delegator_issuance_rewards: Vec<crate::state_root::DelegatorIssuanceRecord> = self
+            .delegator_issuance_rewards
+            .iter()
+            .map(|(delegator, reward_sat)| crate::state_root::DelegatorIssuanceRecord {
+                delegator: *delegator,
+                reward_sat: *reward_sat,
+            })
+            .collect();
+        let current_proposed: Vec<crate::state_root::ProposedRecord> = self
+            .current_proposed
+            .iter()
+            .map(|(validator_index, proposed)| crate::state_root::ProposedRecord {
+                validator_index: *validator_index,
+                proposed: *proposed,
+            })
+            .collect();
 
         // The eUTXO component comes in as the subtree the set already holds,
         // not as a cloned vector of entries to re-serialize, re-hash and
@@ -2584,6 +2759,8 @@ impl CommittedState {
             },
             delegator_fee_rewards: &delegator_fee_rewards,
             validator_fee_rewards: &validator_fee_rewards,
+            delegator_issuance_rewards: &delegator_issuance_rewards,
+            current_proposed: &current_proposed,
             taint_root: self.taint_root,
             coherence_accumulator_root: self.coherence_accumulator_root,
             coherence_nullifier_root: self.coherence_nullifier_root,
@@ -2665,7 +2842,14 @@ impl CommittedState {
         let forced = crate::params::rehearsal::bonding_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        forced || epoch >= crate::params::DEPOSIT_ACTIVATION_EPOCH
+        // `DEPOSIT_ACTIVATION_EPOCH` is `u64::MAX` (an inert, permanently-closed
+        // gate — see the constant's docs), so this comparison is always false
+        // outside the `forced` rehearsal path; that is the intended, documented
+        // shape of the gate, not a bug for clippy to flag.
+        #[allow(clippy::absurd_extreme_comparisons)]
+        {
+            forced || epoch >= crate::params::DEPOSIT_ACTIVATION_EPOCH
+        }
     }
 
     /// Is the **fee-to-stake decoupling** (finding C-R2-2) active in `epoch`?
@@ -2681,7 +2865,13 @@ impl CommittedState {
         let forced = crate::params::rehearsal::fee_stake_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        forced || epoch >= crate::params::FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH
+        // `FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH` is `u64::MAX` today (inert gate,
+        // founder's to arm) — the comparison is always false outside `forced`,
+        // by design, not a bug.
+        #[allow(clippy::absurd_extreme_comparisons)]
+        {
+            forced || epoch >= crate::params::FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH
+        }
     }
 
     /// Is the AUTHENTICATED exit rule active in `epoch`?
@@ -2698,7 +2888,12 @@ impl CommittedState {
         let forced = crate::params::rehearsal::exit_auth_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        forced || epoch >= crate::params::EXIT_AUTH_ACTIVATION_EPOCH
+        // `EXIT_AUTH_ACTIVATION_EPOCH` is `u64::MAX` today (inert gate, founder's
+        // to arm) — the comparison is always false outside `forced`, by design.
+        #[allow(clippy::absurd_extreme_comparisons)]
+        {
+            forced || epoch >= crate::params::EXIT_AUTH_ACTIVATION_EPOCH
+        }
     }
 
     /// Is the slashing-evidence transaction (tag `0x05`, §7.3) active in
@@ -2716,7 +2911,13 @@ impl CommittedState {
         let forced = crate::params::rehearsal::slashing_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        forced || epoch >= crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH
+        // `SLASHING_EVIDENCE_ACTIVATION_EPOCH` is `u64::MAX` today (inert gate,
+        // founder's to arm) — the comparison is always false outside `forced`,
+        // by design.
+        #[allow(clippy::absurd_extreme_comparisons)]
+        {
+            forced || epoch >= crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH
+        }
     }
 
     /// Is the transfer dust rule active in `epoch`? Same shape as the two
@@ -2730,7 +2931,12 @@ impl CommittedState {
         let forced = crate::params::rehearsal::dust_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        forced || epoch >= crate::params::DUST_RULE_ACTIVATION_EPOCH
+        // `DUST_RULE_ACTIVATION_EPOCH` is `u64::MAX` today (inert gate, founder's
+        // to arm) — the comparison is always false outside `forced`, by design.
+        #[allow(clippy::absurd_extreme_comparisons)]
+        {
+            forced || epoch >= crate::params::DUST_RULE_ACTIVATION_EPOCH
+        }
     }
 
     /// H-R7-3, the consensus half: refuse outputs below
@@ -2769,7 +2975,13 @@ impl CommittedState {
         let forced = crate::params::rehearsal::randao_recommit_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        forced || epoch >= crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH
+        // `RANDAO_RECOMMIT_ACTIVATION_EPOCH` is `u64::MAX` today (inert gate,
+        // founder's to arm) — the comparison is always false outside `forced`,
+        // by design.
+        #[allow(clippy::absurd_extreme_comparisons)]
+        {
+            forced || epoch >= crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH
+        }
     }
 
     /// Is the declared-size ceiling (`TransferReject::OverdeclaredSize`)
@@ -2785,7 +2997,181 @@ impl CommittedState {
         let forced = crate::params::rehearsal::tx_bytes_bound_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        forced || epoch >= crate::params::TX_BYTES_BOUND_ACTIVATION_EPOCH
+        // `TX_BYTES_BOUND_ACTIVATION_EPOCH` is `u64::MAX` today (inert gate,
+        // founder's to arm) — the comparison is always false outside `forced`,
+        // by design.
+        #[allow(clippy::absurd_extreme_comparisons)]
+        {
+            forced || epoch >= crate::params::TX_BYTES_BOUND_ACTIVATION_EPOCH
+        }
+    }
+
+    /// Is the **duplicate-attestation refusal** (R3 M-2) active in `epoch`?
+    /// One reader for one gate, same shape as every other predicate here.
+    /// `epoch` is the caller's `self.epoch`: committed state rolled to the
+    /// judged block's own `epoch_of(header.slot)`, never a clock. Ships
+    /// inert — `params::ATTESTATION_DEDUP_ACTIVATION_EPOCH` is `u64::MAX` —
+    /// and the rehearsal switch exists so the tightened rule's tests are not
+    /// dead code until the founder arms it.
+    fn attestation_dedup_active(epoch: u64) -> bool {
+        #[cfg(test)]
+        let forced = crate::params::rehearsal::attestation_dedup_gate_forced_open();
+        #[cfg(not(test))]
+        let forced = false;
+        // `ATTESTATION_DEDUP_ACTIVATION_EPOCH` is `u64::MAX` today (inert
+        // gate, founder's to arm) — the comparison is always false outside
+        // `forced`, by design.
+        #[allow(clippy::absurd_extreme_comparisons)]
+        {
+            forced || epoch >= crate::params::ATTESTATION_DEDUP_ACTIVATION_EPOCH
+        }
+    }
+
+    /// Is **rewards v2** (R1 M1 + M3 + M4, R7 M5) active in `epoch`? One
+    /// reader for the four rules bound together under
+    /// [`crate::params::REWARDS_V2_ACTIVATION_EPOCH`] — see that constant's
+    /// docs for why they share one gate. `epoch` is the caller's
+    /// `self.epoch`: committed state rolled to the judged block's own
+    /// `epoch_of(header.slot)`, never a clock. Ships inert — the constant is
+    /// `u64::MAX` — and the rehearsal switch exists so the new rules' tests
+    /// are not dead code until the founder arms it.
+    fn rewards_v2_active(epoch: u64) -> bool {
+        #[cfg(test)]
+        let forced = crate::params::rehearsal::rewards_v2_gate_forced_open();
+        #[cfg(not(test))]
+        let forced = false;
+        // `REWARDS_V2_ACTIVATION_EPOCH` is `u64::MAX` today (inert gate,
+        // founder's to arm) — the comparison is always false outside
+        // `forced`, by design.
+        #[allow(clippy::absurd_extreme_comparisons)]
+        {
+            forced || epoch >= crate::params::REWARDS_V2_ACTIVATION_EPOCH
+        }
+    }
+
+    /// Is **staking-transaction metering** (R7 M1) active in `epoch`? One
+    /// reader for the charge every staking variant reads.
+    /// [`crate::params::STAKING_TX_METERING_ACTIVATION_EPOCH`]'s docs record
+    /// a second half of R7 M1 — a transaction-COUNT cap — that this pass
+    /// could NOT wire in (it needs a new `TransitionError` variant, and
+    /// `TransitionError` lives in the unowned `interfaces.rs`), so this
+    /// predicate gates only the metering charge, not a count check that does
+    /// not exist. `epoch` is the caller's `self.epoch`: committed state
+    /// rolled to the judged block's own `epoch_of(header.slot)`, never a
+    /// clock. Ships inert — `params::STAKING_TX_METERING_ACTIVATION_EPOCH`
+    /// is `u64::MAX` — and the rehearsal switch exists so the metering
+    /// rule's tests are not dead code until the founder arms it.
+    fn staking_tx_metering_active(epoch: u64) -> bool {
+        #[cfg(test)]
+        let forced = crate::params::rehearsal::staking_tx_metering_gate_forced_open();
+        #[cfg(not(test))]
+        let forced = false;
+        // `STAKING_TX_METERING_ACTIVATION_EPOCH` is `u64::MAX` today (inert
+        // gate, founder's to arm) — the comparison is always false outside
+        // `forced`, by design.
+        #[allow(clippy::absurd_extreme_comparisons)]
+        {
+            forced || epoch >= crate::params::STAKING_TX_METERING_ACTIVATION_EPOCH
+        }
+    }
+
+    /// R7 M1: the charge a staking-class transaction owes for its own bytes
+    /// and its own signature-verification cost. `free` (all zero) below
+    /// [`Self::staking_tx_metering_active`] — matching the chain as it
+    /// stands, since every staking variant today consumes neither block cap
+    /// regardless of its real size or how many hybrid signatures a node
+    /// must verify to admit it.
+    ///
+    /// `n_hybrid_sigs` is the number of hybrid verifications the CALLER's
+    /// own admission logic actually performs for this variant (0 for the
+    /// unauthenticated `Exit`/`Delegate`, 1 for `Deposit`'s proof of
+    /// possession, `ExitV2` and `RandaoRecommit`, 2 for `SlashingEvidence`'s
+    /// pair) — passed in rather than re-derived from `tx`, so this function
+    /// cannot drift from what each arm actually checks.
+    fn staking_tx_charge(
+        epoch: u64,
+        n_hybrid_sigs: u32,
+        canonical_len: usize,
+    ) -> fee_market::TxCharge {
+        if !Self::staking_tx_metering_active(epoch) {
+            return fee_market::TxCharge { gas: 0, tx_bytes: 0, base_fee_sat: 0, priority_fee_sat: 0 };
+        }
+        let tx_bytes = canonical_len as u64;
+        // `TxClass::Eutxo{ inputs }` is reused deliberately: its cost SHAPE
+        // (flat + bytes*GAS_PER_BYTE + `inputs` hybrid verifications) is
+        // exactly a staking transaction's shape too. `fee_market` has no
+        // dedicated staking class, and inventing one would mean editing a
+        // file this pass does not own for a difference that is cosmetic
+        // (a name), not arithmetic (the cost model).
+        let gas =
+            fee_market::intrinsic_gas(fee_market::TxClass::Eutxo { inputs: n_hybrid_sigs }, tx_bytes);
+        // No base fee, no priority fee: these messages carry no tip field
+        // and spend no eUTXO input to draw a fee from, so charging money
+        // here would be inventing a price nobody specified — the same
+        // reason the ORIGINAL (ungated) `free` charge gave for zero. Only
+        // the two CAPACITY terms change; the block's fee accounting, and
+        // therefore the producer's revenue, is untouched.
+        fee_market::TxCharge { gas, tx_bytes, base_fee_sat: 0, priority_fee_sat: 0 }
+    }
+
+    /// Is the **withdrawal transaction** (R7 M4) active in `epoch`? One
+    /// reader for one gate, mirroring [`Self::exit_auth_active`]. `epoch` is
+    /// the caller's `self.epoch`: committed state rolled to the judged
+    /// block's own `epoch_of(header.slot)`, never a clock. Ships inert —
+    /// `params::WITHDRAWAL_ACTIVATION_EPOCH` is `u64::MAX` — and the
+    /// rehearsal switch exists so the withdrawal rules' tests are not dead
+    /// code until the founder arms it.
+    ///
+    /// # No call site yet — this is the honest state, not an oversight
+    ///
+    /// `PosTransaction` cannot gain a `Withdraw` variant from this pass: the
+    /// crate's variant space is frozen by an EXHAUSTIVE match with no
+    /// wildcard arm in the unowned `tests/wire_tag_registry.rs`
+    /// (`frozen_variant_space`), by explicit design — its own doc comment
+    /// records having verified that adding any new `PosTransaction` variant,
+    /// under any name or byte, makes that file stop compiling with
+    /// `error[E0004]`, specifically so this exact change requires the
+    /// founder's edit rather than a silent merge. Editing that file is
+    /// outside this pass's ownership, and leaving the tree unable to
+    /// compile is not an option either, so the variant, its apply arm, and
+    /// its eUTXO-creation logic are not implemented here. The gate and its
+    /// rehearsal switch are kept as ready-made, harmless scaffolding for
+    /// whoever lands the variant once the founder rules on the byte.
+    #[allow(dead_code)] // inert gate with no reachable call site yet — see above
+    fn withdrawal_active(epoch: u64) -> bool {
+        #[cfg(test)]
+        let forced = crate::params::rehearsal::withdrawal_gate_forced_open();
+        #[cfg(not(test))]
+        let forced = false;
+        // `WITHDRAWAL_ACTIVATION_EPOCH` is `u64::MAX` today (inert gate,
+        // founder's to arm) — the comparison is always false outside
+        // `forced`, by design.
+        #[allow(clippy::absurd_extreme_comparisons)]
+        {
+            forced || epoch >= crate::params::WITHDRAWAL_ACTIVATION_EPOCH
+        }
+    }
+
+    /// Is the **network-bound sighash fold** (A2-3 / R7 M2) active in
+    /// `epoch`? One reader for the two transfer formats that share the fold
+    /// (`spend_signing_root`'s only two callers). `epoch` is the caller's
+    /// `self.epoch`: committed state rolled to the judged block's own
+    /// `epoch_of(header.slot)`, never a clock. Ships inert —
+    /// `params::SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH` is `u64::MAX` —
+    /// and the rehearsal switch exists so the bound fold's tests are not
+    /// dead code until the founder arms it.
+    fn sighash_network_binding_active(epoch: u64) -> bool {
+        #[cfg(test)]
+        let forced = crate::params::rehearsal::sighash_network_binding_gate_forced_open();
+        #[cfg(not(test))]
+        let forced = false;
+        // `SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH` is `u64::MAX` today
+        // (inert gate, founder's to arm) — the comparison is always false
+        // outside `forced`, by design.
+        #[allow(clippy::absurd_extreme_comparisons)]
+        {
+            forced || epoch >= crate::params::SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH
+        }
     }
 
     fn apply_transaction(
@@ -2795,12 +3181,6 @@ impl CommittedState {
         base_fee_millisat_per_gas: u128,
         verifier: &dyn SignatureVerifier,
     ) -> Result<fee_market::TxCharge, TxReject> {
-        let free = fee_market::TxCharge {
-            gas: 0,
-            tx_bytes: 0,
-            base_fee_sat: 0,
-            priority_fee_sat: 0,
-        };
         match tx {
             PosTransaction::Transfer { .. } => self
                 .apply_transfer(tx, base_fee_millisat_per_gas, verifier)
@@ -2923,7 +3303,9 @@ impl CommittedState {
                     deposit_epoch: self.epoch,
                     amount_sat: *amount_sat,
                 });
-                Ok(free)
+                // R7 M1: one hybrid verification (`proof_of_possession`, just
+                // paid above via `validate_wire_deposit`).
+                Ok(Self::staking_tx_charge(self.epoch, 1, tx.canonical_bytes().len()))
             }
             PosTransaction::Exit { validator } => {
                 // THE FLAG-DAY GATE, FIRST — same discipline as the Deposit
@@ -2955,7 +3337,8 @@ impl CommittedState {
                 rec.exit_epoch = exit_epoch;
                 rec.withdrawable_epoch =
                     exit_epoch.saturating_add(staking::WITHDRAWAL_DELAY_EPOCHS);
-                Ok(free)
+                // R7 M1: unauthenticated — no signature is verified here.
+                Ok(Self::staking_tx_charge(self.epoch, 0, tx.canonical_bytes().len()))
             }
             PosTransaction::ExitV2 { pubkey_hash, epoch, signature } => {
                 // The gate first, before the registry is consulted and long
@@ -2963,7 +3346,11 @@ impl CommittedState {
                 if !Self::exit_auth_active(self.epoch) {
                     return Err(TxReject::StakingNotActive);
                 }
-                self.apply_exit_v2(pubkey_hash, *epoch, signature, verifier).map(|()| free)
+                // R7 M1: one hybrid verification, paid inside `apply_exit_v2`.
+                let epoch_for_charge = self.epoch;
+                self.apply_exit_v2(pubkey_hash, *epoch, signature, verifier).map(|()| {
+                    Self::staking_tx_charge(epoch_for_charge, 1, tx.canonical_bytes().len())
+                })
             }
             PosTransaction::RandaoRecommit { validator, new_commitment, epoch, signature } => {
                 // THE FLAG-DAY GATE, FIRST — same discipline as every other
@@ -2976,8 +3363,13 @@ impl CommittedState {
                 if !Self::randao_recommit_active(self.epoch) {
                     return Err(TxReject::StakingNotActive);
                 }
+                // R7 M1: one hybrid verification, paid inside
+                // `apply_randao_recommit`.
+                let epoch_for_charge = self.epoch;
                 self.apply_randao_recommit(*validator, new_commitment, *epoch, signature, verifier)
-                    .map(|()| free)
+                    .map(|()| {
+                        Self::staking_tx_charge(epoch_for_charge, 1, tx.canonical_bytes().len())
+                    })
             }
             PosTransaction::Delegate { delegator, validator, amount_sat, eligible } => {
                 // Same gate, same constant, and it must be the same constant:
@@ -3010,7 +3402,8 @@ impl CommittedState {
                     deactivate_epoch: None,
                     eligible: *eligible,
                 });
-                Ok(free)
+                // R7 M1: unauthenticated — no signature is verified here.
+                Ok(Self::staking_tx_charge(self.epoch, 0, tx.canonical_bytes().len()))
             }
             // Evidence needs the injected signature verifier, which lives on
             // the Transition, not on the state — compute_post_state routes it
@@ -3413,8 +3806,10 @@ impl CommittedState {
         //
         // One signing root for the whole transfer, so N inputs cost N
         // verifications and not N roots. The root excludes the witnesses (see
-        // `spend_signing_root`), which is what lets a signature exist at all.
-        let signing_root = tx.spend_signing_root();
+        // `spend_signing_root`). Below `SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH`
+        // (A2-3 / R7 M2) `checked_signing_root` returns exactly that root;
+        // see its docs for what changes once the gate arms.
+        let signing_root = tx.checked_signing_root(self.epoch);
         for i in inputs {
             if !verifier.verify_with_key(&i.pubkey, &signing_root, &i.signature) {
                 return Err(TransferReject::BadSignature);
@@ -3669,8 +4064,10 @@ impl CommittedState {
         // The whole point of the format: the signing root covers every spend
         // point, so one signature per key authorises all of that key's
         // inputs. k verifications instead of n; each is the SAME check a V1
-        // input would get.
-        let signing_root = tx.spend_signing_root();
+        // input would get. Same `checked_signing_root` as V1 — one fold,
+        // shared by both callers, so the two formats cannot drift into
+        // different network-binding rules once the gate arms (A2-3 / R7 M2).
+        let signing_root = tx.checked_signing_root(self.epoch);
         for k in keys {
             if !verifier.verify_with_key(&k.pubkey, &signing_root, &k.signature) {
                 return Err(TransferReject::BadSignature);
@@ -3737,27 +4134,37 @@ impl CommittedState {
         };
         let own_bond_sat = offender_rec.staked_sat;
 
-        // The exposure view apply_slash prices against: index 0 is a
-        // synthetic record for the operator's own bond (so operator and
-        // delegators are priced by the same arithmetic, in one call), the
-        // rest mirrors the committed delegation list in order, with
-        // withdrawn (post-cool-down) delegations masked ineligible — their
-        // coins have left the bond and are no longer reachable.
+        // The exposure view `apply_slash` prices against: the committed
+        // delegation list in order, with withdrawn (post-cool-down)
+        // delegations masked ineligible — their coins have left the bond and
+        // are no longer reachable. The operator's own bond is no longer a
+        // synthetic entry smuggled into this vector at index 0 (R1 H4): it is
+        // priced separately, as `own_bond_sat`, and reported back as its own
+        // field (`SlashingOutcome::operator_loss_sat`) so the whistleblower
+        // reward can be bounded to what this transition actually debits from
+        // a real balance. See that field's docs for why conflating the two
+        // was the over-mint.
         let registry = delegation::Registry::resolve(&self.delegations, self.epoch);
-        let mut exposure: Vec<Delegation> = Vec::with_capacity(self.delegations.len() + 1);
-        exposure.push(Delegation {
-            delegator: offender,
-            validator: offender,
-            amount_sat: own_bond_sat,
-            requested_epoch: 0,
-            deactivate_epoch: None,
-            eligible: true,
-        });
+        let mut exposure: Vec<Delegation> = Vec::with_capacity(self.delegations.len());
         for d in &self.delegations {
             let mut view = *d;
             if registry.state_of(d) == delegation::StakeState::Inactive {
                 view.eligible = false;
             }
+            // R1 M6: price the penalty on ACTIVATED stake, never the nominal
+            // committed amount. `Registry::activated_sat` is at most
+            // `d.amount_sat` (partial activation warms up in slices — see
+            // `Registry::resolve`'s per-epoch budget) and is exactly the
+            // satoshi figure that carries consensus weight: it is what
+            // `duty_roster_at`/`Registry::validators` sum into a committee's
+            // effective stake, and therefore what an equivocation or a
+            // surrounded vote actually put at risk. Stake still queued
+            // behind the warm-up rate limit has cast no vote, backed no
+            // proposer draw and shared no committee seat; slashing it at the
+            // nominal amount would burn coins for a risk they never carried,
+            // and would let an operator's priced exposure be inflated by
+            // stake the warm-up budget has not yet admitted.
+            view.amount_sat = registry.activated_sat(d);
             exposure.push(view);
         }
 
@@ -3784,6 +4191,7 @@ impl CommittedState {
                 self.slashing.process(
                     &pair,
                     self.epoch,
+                    own_bond_sat,
                     &exposure,
                     total_active_sat,
                     including_proposer,
@@ -3796,6 +4204,7 @@ impl CommittedState {
                     first,
                     second,
                     self.epoch,
+                    own_bond_sat,
                     &exposure,
                     total_active_sat,
                     including_proposer,
@@ -3809,11 +4218,38 @@ impl CommittedState {
         let epoch = self.epoch;
         if let Some(rec) = self.validators.get_mut(&offender) {
             rec.slashed = true;
-            rec.staked_sat = rec.staked_sat.saturating_sub(outcome.delegation_losses_sat[0]);
-            // Ejection: duties stop now. min(), because a validator already
-            // exiting must not have its exit pushed later by the slash.
-            if epoch < rec.exit_epoch {
-                rec.exit_epoch = epoch;
+            rec.staked_sat = rec.staked_sat.saturating_sub(outcome.operator_loss_sat);
+            // R1 M7: ejection lands at the epoch AFTER the one the slash
+            // landed in, never the same one. `duty_roster_at` reads
+            // `exit_epoch` alone to decide membership (see its docs), and
+            // that predicate is re-evaluated FRESH on every block within an
+            // epoch (rule 2: nothing here may cache a partition) — so
+            // writing THIS epoch would shrink the index set
+            // `committees::epoch_committees` partitions against the moment
+            // this transaction lands, and every later block of the SAME
+            // epoch, plus the boundary tally (`close_epoch`, which queries
+            // the identical epoch), would then draw a different Fisher-Yates
+            // permutation over a different index set than the block(s) that
+            // already admitted this epoch's attestations — dropping
+            // already-admitted votes by a rule that only LOOKS unrelated to
+            // slashing. Delaying the ejection by one epoch keeps the index
+            // set stable for the rest of the epoch the slash lands in: the
+            // validator keeps its (now zero-upside, already-penalised) seat
+            // through the boundary, and duties actually stop at the next
+            // epoch, one boundary later than "immediately" — the same trade
+            // the inactivity leak already makes for a fully-leaked validator
+            // (seat survives, weight does not). `min()`, because a validator
+            // already exiting earlier (or at exactly this epoch, via its own
+            // voluntary exit) must not have its exit pushed LATER by a slash.
+            //
+            // Replay-safety: this path is reachable only once
+            // `SLASHING_EVIDENCE_ACTIVATION_EPOCH` (still `u64::MAX`) is
+            // armed, so no historical block has ever executed this write —
+            // changing it needs no gate of its own (`params.rs`'s doc on that
+            // constant covers the argument).
+            let effective_exit = epoch.saturating_add(1);
+            if effective_exit < rec.exit_epoch {
+                rec.exit_epoch = effective_exit;
             }
             // The residue stays reachable through the weak-subjectivity
             // margin, and a slash never *shortens* a scheduled lock
@@ -3825,11 +4261,7 @@ impl CommittedState {
                 rec.withdrawable_epoch.max(lock)
             };
         }
-        for (d, loss) in self
-            .delegations
-            .iter()
-            .zip(outcome.delegation_losses_sat.iter().skip(1))
-        {
+        for (d, loss) in self.delegations.iter().zip(outcome.delegation_losses_sat.iter()) {
             if *loss > 0 {
                 *self.delegator_slash_losses.entry(d.delegator).or_insert(0) += *loss;
             }
@@ -3865,6 +4297,14 @@ impl CommittedState {
     /// [`crate::params::FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH`] binds.
     pub fn validator_fee_reward_sat(&self, validator: u32) -> u128 {
         self.validator_fee_rewards.get(&validator).copied().unwrap_or(0)
+    }
+
+    /// Total issuance reward settled to one delegator account, in satoshis
+    /// (audit R1 M4) — the issuance mirror of [`Self::delegator_fee_reward_sat`].
+    /// Zero everywhere until [`crate::params::REWARDS_V2_ACTIVATION_EPOCH`]
+    /// binds.
+    pub fn delegator_issuance_reward_sat(&self, delegator: u32) -> u128 {
+        self.delegator_issuance_rewards.get(&delegator).copied().unwrap_or(0)
     }
 
     /// One unspent output, by outpoint — the lookup a wallet needs to build a
@@ -3939,9 +4379,9 @@ impl CommittedState {
     /// **Every satoshi this state says someone holds**, in satoshis: the sum
     /// of every place a coin can sit in committed state.
     ///
-    /// Six terms, and the list is exhaustive by construction — a coin that
+    /// Eight terms, and the list is exhaustive by construction — a coin that
     /// sat anywhere else could not be committed, because the state root has no
-    /// other value-bearing component (`state_root`'s tag list). Five are
+    /// other value-bearing component (`state_root`'s tag list). Seven are
     /// places a coin sits:
     ///
     /// 1. the unspent-output set (`TAG_EUTXO`) — spendable coins;
@@ -3957,11 +4397,18 @@ impl CommittedState {
     ///    invariant that skipped it would misread as a mint;
     /// 5. the delegator fee ledger (`TAG_DELEGATOR_FEE_REWARD`) — the
     ///    delegators' settled share, which lives in a ledger rather than in
-    ///    their delegation records for the reason those docs give.
+    ///    their delegation records for the reason those docs give;
+    /// 6. the operator fee ledger (`TAG_VALIDATOR_FEE_REWARD`) — the
+    ///    operator's own withdrawable fee share once
+    ///    `FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH` binds; zero everywhere until
+    ///    then;
+    /// 7. the delegator issuance ledger (`TAG_DELEGATOR_ISSUANCE_REWARD`,
+    ///    audit R1 M4) — the issuance mirror of term 5, settled once
+    ///    `REWARDS_V2_ACTIVATION_EPOCH` binds; zero everywhere until then.
     ///
-    /// and **minus** the sixth term, which is a debit and not a holding:
+    /// and **minus** the eighth term, which is a debit and not a holding:
     ///
-    /// 6. `delegator_slash_losses` (`TAG_DELEGATOR_SLASH_LOSS`) — satoshis a
+    /// 8. `delegator_slash_losses` (`TAG_DELEGATOR_SLASH_LOSS`) — satoshis a
     ///    slash destroyed out of delegated bonds.
     ///
     /// # Why the slash ledger is subtracted, and why getting this wrong was a
@@ -4044,7 +4491,8 @@ impl CommittedState {
             + self.delegations.iter().map(|d| d.amount_sat).sum::<u128>()
             + self.pending_fee_rewards.values().sum::<u128>()
             + self.delegator_fee_rewards.values().sum::<u128>()
-            + self.validator_fee_rewards.values().sum::<u128>();
+            + self.validator_fee_rewards.values().sum::<u128>()
+            + self.delegator_issuance_rewards.values().sum::<u128>();
         let burned = self.delegator_slash_losses.values().sum::<u128>();
         held.saturating_sub(burned)
     }
@@ -4244,44 +4692,40 @@ impl CommittedState {
                 &st.seed_for_epoch(closing),
                 &mut accepted,
             );
-            // DELIBERATELY STILL A `debug_assert!`, and this is the one place
-            // in the crate where that is a decision rather than an omission.
+            // STILL A test-build-only guard, deliberately, even after R1 M7
+            // closed the one KNOWN remotely-triggerable cause.
             //
-            // The brief for the 2026-08-24 roster unification asked for this to
-            // become a `consensus_invariant!` so it would survive into the
-            // release binary. It must not, because **untrusted input can drive
-            // it**, and an unconditional panic here would therefore be a
-            // remotely triggerable halt:
+            // Before R1 M7, `apply_slashing_evidence` set `rec.slashed = true`
+            // and `rec.exit_epoch = epoch` the moment a valid
+            // `SlashingEvidence` transaction was applied — mid-epoch — and
+            // `duty_roster_at` filtered on exactly that predicate, so the
+            // roster's INDEX SET shrank between one block of the epoch and
+            // the next. Step 8 of every later block then partitioned a
+            // 63-member set while the votes already in `pending_votes` were
+            // admitted against the 64-member one, and this boundary tally
+            // partitioned the 63-member set too — a different Fisher-Yates
+            // permutation everywhere, dropping already-admitted votes.
+            // ANYONE who could get valid equivocation evidence included could
+            // cause it, which is why an unconditional panic here would have
+            // been a remotely triggerable halt.
             //
-            //   `apply_slashing_evidence` sets `rec.slashed = true` and
-            //   `rec.exit_epoch = epoch` the moment a valid `SlashingEvidence`
-            //   transaction is applied — mid-epoch. `duty_roster_at` filters on
-            //   exactly that predicate, so the roster's INDEX SET shrinks
-            //   between one block of the epoch and the next. Step 8 of every
-            //   later block then partitions a 63-member set while the votes
-            //   already in `pending_votes` were admitted against the 64-member
-            //   one, and this boundary tally partitions the 63-member set too.
-            //   A Fisher-Yates over a different length is a different
-            //   permutation everywhere, so those earlier votes are dropped here
-            //   — legitimately, by the rule as written — and the counts differ.
-            //   Anyone who can get valid equivocation evidence included can
-            //   cause it.
-            //
-            // Removing the `effective_stake > 0` filter from
-            // `epoch_committees` closed the LEAK half of this divergence (the
-            // two rosters now carry the same index set whatever the leak does).
-            // It does not close the SLASHING half, which is a membership change
-            // in committed state, not a stake change — fixing that means
-            // freezing the epoch's roster at its first slot, which is a
-            // consensus rule change and needs its own flag day and rollout.
-            // Until that lands, this stays a test-build guard, and the
-            // divergence is pinned by
-            // `mid_epoch_slashing_changes_the_roster_index_set_within_one_epoch`.
-            // The unconditional half of the guard: present in the release
-            // binary, never fatal. See `report_boundary_vote_drop` for why
-            // fatal is wrong here and what would have to change to make it
-            // right. Runs BEFORE the debug_assert so a test build records the
-            // occurrence before it stops.
+            // R1 M7 closes it: `apply_slashing_evidence` now writes
+            // `exit_epoch = (slash epoch) + 1`, never the slash's own epoch,
+            // and `duty_roster_at` reads `exit_epoch` alone (its own docs have
+            // the full argument), so the index set no longer moves within the
+            // epoch a slash lands in — freezing the epoch's roster at its
+            // first slot without needing a flag day, since the write is
+            // reachable only behind `SLASHING_EVIDENCE_ACTIVATION_EPOCH`
+            // (still `u64::MAX`) and therefore replays every historical block
+            // unchanged. This guard stays anyway, downgraded to
+            // defense-in-depth for a class of bug this crate has already paid
+            // for once, per `report_boundary_vote_drop`'s updated docs; the
+            // mutation that proves it can still fail is
+            // `mid_epoch_slashing_no_longer_moves_the_partition_within_the_slash_epoch`,
+            // which now asserts the FIX rather than the defect. The
+            // unconditional half of the guard: present in the release binary,
+            // never fatal. Runs BEFORE the debug_assert so a test build
+            // records the occurrence before it stops.
             if epoch_votes.attestations.len() != votes.len() {
                 report_boundary_vote_drop(closing, votes.len(), epoch_votes.attestations.len());
             }
@@ -4319,23 +4763,119 @@ impl CommittedState {
         // committed counter, not the curve.
         let headroom = tokenomics_v4::TOTAL_SUPPLY_SAT.saturating_sub(st.issued_sat);
         let epoch_issuance = if epoch_issuance > headroom { headroom } else { epoch_issuance };
-        let total_stake: u128 = roster.iter().map(|v| v.effective_stake as u128).sum();
+
+        // R1 M1 + M3 + M4, R7 M5 — behind ONE gate; see
+        // `REWARDS_V2_ACTIVATION_EPOCH`'s docs for why all four are bound
+        // together. Below it every branch below takes the ORIGINAL arm,
+        // byte for byte the chain as it stands.
+        let rewards_v2 = Self::rewards_v2_active(closing);
+
+        // R1 M1: participation credit, scoped to what can actually justify.
+        // A vote counts only if it is the validator's ONE vote this epoch —
+        // a partition seats each validator in exactly one committee
+        // (`committees::epoch_committees`'s docs), so a SECOND distinct
+        // signing root from the same validator is in-block equivocation,
+        // not a second honest vote, and earns nothing either way — its
+        // `target_epoch` names the epoch actually closing, and its
+        // `source_epoch` names the checkpoint that was ACTUALLY justified
+        // before this epoch began (`st.previous_justified.epoch`, rolled in
+        // step 1 — the checkpoint an honest voter reads all epoch, so a vote
+        // naming any other source could not have been cast against this
+        // chain's own history).
+        let mut valid_credit: BTreeMap<u32, bool> = BTreeMap::new();
+        if rewards_v2 {
+            let mut seen_root: BTreeMap<u32, [u8; 32]> = BTreeMap::new();
+            let mut equivocated: BTreeSet<u32> = BTreeSet::new();
+            for ((validator, root), data) in &st.pending_votes {
+                match seen_root.get(validator) {
+                    Some(prior) if prior != root => {
+                        equivocated.insert(*validator);
+                    }
+                    Some(_) => {}
+                    None => {
+                        seen_root.insert(*validator, *root);
+                        let ok = data.target_epoch == closing
+                            && data.source_epoch == st.previous_justified.epoch;
+                        valid_credit.insert(*validator, ok);
+                    }
+                }
+            }
+            for v in &equivocated {
+                valid_credit.insert(*v, false);
+            }
+        }
+
+        // R1 M3: issuance basis reads the LEAK-ADJUSTED roster —
+        // `consensus_roster_at`, the same roster the proposer draw and the
+        // committee partition already read — instead of `duty_roster_at`'s
+        // unleaked view. Below the gate this is exactly `roster` (a
+        // reference, not a clone), so nothing changes.
+        let leaked_roster;
+        let issuance_roster: &[Validator] = if rewards_v2 {
+            leaked_roster = st.consensus_roster_at(closing);
+            &leaked_roster
+        } else {
+            &roster
+        };
+
+        // R1 M4: the delegation registry, resolved once, used both to price
+        // each validator's delegated stake/commission and to split the
+        // delegators' share pro-rata by ACTIVATED stake. Only computed
+        // behind the gate — `Registry::resolve` is provably a no-op below it
+        // anyway (nothing reads its result), but there is no reason to pay
+        // even the short-circuited cost of R1 M5 on a live chain that will
+        // not use it.
+        let issuance_registry =
+            if rewards_v2 { Some(delegation::Registry::resolve(&st.delegations, closing)) } else { None };
+
+        // R7 M5: which validators were SCHEDULED to propose at least one
+        // slot of the closing epoch, off the same seed and the same
+        // (leak-adjusted) roster the live schedule draws from — a
+        // validator's credit denominator only grows if it was actually
+        // handed a slot to forfeit.
+        let mut scheduled_to_propose: BTreeSet<u32> = BTreeSet::new();
+        if rewards_v2 {
+            let seed = st.seed_for_epoch(closing);
+            for s in first_slot..first_slot + SLOTS_PER_EPOCH {
+                if let Some(p) = schedule::proposer(&seed, s, issuance_roster) {
+                    scheduled_to_propose.insert(p);
+                }
+            }
+        }
+
+        let total_stake: u128 = issuance_roster.iter().map(|v| v.effective_stake as u128).sum();
         if total_stake > 0 {
-            for v in &roster {
-                let attested = *st.current_participation.get(&v.index).unwrap_or(&false);
+            for v in issuance_roster {
                 // Stake basis is the CAPPED effective stake: stake above the
                 // per-validator or cohort cap carries no weight and earns
-                // nothing — the caps would be decorative otherwise. The
-                // operator/delegator split of this payout happens where
+                // nothing — the caps would be decorative otherwise.
+                let (attested, delegated_stake, commission_bps, extra_credit, extra_max) =
+                    if rewards_v2 {
+                        let attested = valid_credit.get(&v.index).copied().unwrap_or(false);
+                        let registry = issuance_registry.as_ref().expect("gated above");
+                        let delegated_stake = registry.stake_of(v.index);
+                        let commission_bps =
+                            st.validators.get(&v.index).map_or(0, |r| r.commission_bps);
+                        let scheduled = scheduled_to_propose.contains(&v.index);
+                        let produced = *st.current_proposed.get(&v.index).unwrap_or(&false);
+                        (attested, delegated_stake, commission_bps, u64::from(scheduled && produced), u64::from(scheduled))
+                    } else {
+                        let attested = *st.current_participation.get(&v.index).unwrap_or(&false);
+                        (attested, 0u128, 0u128, 0u64, 0u64)
+                    };
+                // The operator/delegator split below the gate happens where
                 // per-delegator accounts exist (DEV-3's wallet surface);
-                // consensus commits only the total, into the bond.
+                // consensus commits only the total, into the bond. At and
+                // above the gate the split is real (R1 M4) and the credit
+                // denominator can include a forfeitable proposer slice
+                // (R7 M5).
                 let payout = rewards::distribute(
                     &StakeAccount {
                         self_stake: v.effective_stake as u128,
-                        delegated_stake: 0,
-                        commission_bps: 0,
-                        credits: u64::from(attested),
-                        max_credits: 1,
+                        delegated_stake,
+                        commission_bps,
+                        credits: u64::from(attested) + extra_credit,
+                        max_credits: 1 + extra_max,
                     },
                     epoch_issuance,
                     total_stake,
@@ -4353,6 +4893,47 @@ impl CommittedState {
                         // cap (pinned by `emission_stops_at_the_cap`).
                         if !mutation_mints_from_nothing() {
                             st.issued_sat += payout.operator;
+                        }
+                    }
+                }
+                // R1 M4: settle the delegators' share into the per-delegator
+                // issuance ledger, pro-rata by ACTIVATED stake — mirroring
+                // the fee path's `split_delegator_fees` below (reused as-is:
+                // the arithmetic is a generic pro-rata split, not specific to
+                // fees). Below the gate `delegated_stake` is always 0 above,
+                // so `payout.delegators` is always 0 and this never runs.
+                if payout.delegators > 0 {
+                    let registry = issuance_registry.as_ref().expect("gated above: payout.delegators > 0 implies delegated_stake > 0, which is only ever non-zero when rewards_v2 is active");
+                    let mut by_account: BTreeMap<u32, u128> = BTreeMap::new();
+                    for d in &st.delegations {
+                        if d.validator != v.index {
+                            continue;
+                        }
+                        let activated = registry.activated_sat(d);
+                        if activated > 0 {
+                            *by_account.entry(d.delegator).or_insert(0) += activated;
+                        }
+                    }
+                    let stakes: Vec<(u32, u128)> = by_account.into_iter().collect();
+                    let (shares, dust) =
+                        fee_market::split_delegator_fees(&stakes, payout.delegators);
+                    for (delegator, reward) in shares {
+                        if reward > 0 {
+                            *st.delegator_issuance_rewards.entry(delegator).or_insert(0) += reward;
+                        }
+                    }
+                    // Truncation dust compounds into the operator's bond —
+                    // some account must hold it, and the operator is the one
+                    // whose stake earned the issuance (same destination the
+                    // fee path's dust takes). Still bounded by
+                    // `epoch_issuance <= headroom`: `dust < stakes.len()` and
+                    // `dust <= payout.delegators <= gross <= epoch_issuance`.
+                    if dust > 0 {
+                        if let Some(rec) = st.validators.get_mut(&v.index) {
+                            rec.staked_sat += dust;
+                            if !mutation_mints_from_nothing() {
+                                st.issued_sat += dust;
+                            }
                         }
                     }
                 }
@@ -4477,6 +5058,12 @@ impl CommittedState {
         for v in &roster_next {
             st.current_participation.insert(v.index, false);
         }
+        // R7 M5: the closing epoch's production record has already been
+        // read by the issuance loop above; clear it rather than carry it
+        // into E+1, where every entry would be stale (no block of E+1 has
+        // been produced yet). No "previous" mirror is needed — nothing
+        // outside this function reads last epoch's record.
+        st.current_proposed.clear();
 
         // 6. The next epoch's committee partition. Derived, not stored — a
         //    stored partition is a cache (§5.5) — but computed once here to
@@ -4860,6 +5447,18 @@ impl<V: SignatureVerifier> Transition<V> {
             return Err(TransitionError::Proposal(ProposalReject::BadSignature));
         }
 
+        // R7 M5 (behind REWARDS_V2_ACTIVATION_EPOCH): the proposer named
+        // here has just cleared the schedule check (step 4) AND the
+        // signature check above, so this is an authenticated record that
+        // THIS validator produced its scheduled slot this epoch — record it
+        // so a withheld proposal can cost a measurable slice of this
+        // epoch's issuance credit at the boundary (`close_epoch`'s step 2).
+        // Gated so a pre-gate root is unaffected by this component's mere
+        // existence; see `current_proposed`'s field docs.
+        if CommittedState::rewards_v2_active(st.epoch) {
+            st.current_proposed.insert(header.proposer_index, true);
+        }
+
         // 8. Attestations, against the slot committee (committees.rs +
         //    attestation.rs). Only current-epoch slots are decidable from
         //    retained state (the 2-epoch mix window), so only they are
@@ -4926,16 +5525,30 @@ impl<V: SignatureVerifier> Transition<V> {
         //    Nothing above rejected it, because the map key made it
         //    idempotent rather than illegal.
         //
-        //    This is a tightening of a live consensus rule, and it is safe
-        //    for exactly one reason, which is a fact about the producer and
-        //    not an assumption about intent: the node's attestation pool is a
-        //    map keyed by `(validator, signing_root)` (`engine.rs`, both the
-        //    `attest` insert and the `propose` filter read that map's
-        //    values), so a body built by this software cannot contain the
-        //    same pair twice. No honest block loses. Distinct votes from one
-        //    validator are still admitted — equivocation is the slashing
-        //    layer's business, and refusing it here would reject bodies an
-        //    older producer can legitimately build.
+        //    This was an UNGATED tightening of a live consensus rule until
+        //    R3 M-2 (audit round 3): the argument that it is safe rests
+        //    entirely on a fact about the REFERENCE PRODUCER's mempool (keyed
+        //    by `(validator, signing_root)`, so a body it builds cannot
+        //    contain the same pair twice) — a fact about one implementation's
+        //    admission policy, not a property this crate can check against
+        //    the historical block log the way
+        //    `crate::params::MAX_ATTESTATIONS_PER_BLOCK`'s no-op argument
+        //    can. A hand-built body, a different producer, or a future codec
+        //    could carry a duplicate an ungated rule would newly reject,
+        //    forking a mixed fleet. See
+        //    [`crate::params::ATTESTATION_DEDUP_ACTIVATION_EPOCH`]'s docs for
+        //    the full argument. Below the gate a duplicate pair is accepted
+        //    exactly as it was before `02fdbd5` introduced this check — the
+        //    second copy overwrites the same `pending_votes` entry and the
+        //    same participation bit the first wrote, idempotent rather than
+        //    illegal — so `seen` is not even populated pre-activation
+        //    (short-circuited by `&&`), keeping this byte-identical to a
+        //    build that never carried the check. Distinct votes from one
+        //    validator are always admitted regardless of the gate —
+        //    equivocation is the slashing layer's business, and refusing it
+        //    here would reject bodies an older producer can legitimately
+        //    build.
+        let dedup_active = CommittedState::attestation_dedup_active(st.epoch);
         let mut seen: BTreeSet<(u32, [u8; 32])> = BTreeSet::new();
 
         for (i, att) in attestations.iter().enumerate() {
@@ -4944,7 +5557,7 @@ impl<V: SignatureVerifier> Transition<V> {
                 return Err(reject);
             }
             let signing_root = att.data.signing_root();
-            if !seen.insert((att.validator, signing_root)) {
+            if dedup_active && !seen.insert((att.validator, signing_root)) {
                 return Err(TransitionError::DuplicateAttestation(i as u32));
             }
             // Same slice `committee_for_slot` would have returned, from the
@@ -5019,11 +5632,11 @@ impl<V: SignatureVerifier> Transition<V> {
                         total_active,
                         &self.verifier,
                     )
-                    .map(|()| fee_market::TxCharge {
-                        gas: 0,
-                        tx_bytes: 0,
-                        base_fee_sat: 0,
-                        priority_fee_sat: 0,
+                    // R7 M1: two hybrid verifications — `apply_slashing_evidence`
+                    // pays exactly two, whichever offence form it is (both
+                    // attestations, or both headers).
+                    .map(|()| {
+                        CommittedState::staking_tx_charge(st.epoch, 2, tx.canonical_bytes().len())
                     })
                     .map_err(|()| TxReject::StakingRule),
                 _ => st.apply_transaction(tx, total_active, base_fee, &self.verifier),
@@ -6269,7 +6882,16 @@ mod tests {
         while ctx.epoch < crate::epoch_of(slot) {
             ctx = ctx.close_epoch();
         }
-        let roster = ctx.duty_roster();
+        // LEAK-ADJUSTED, matching exactly what `compute_post_state`'s own
+        // proposer check reads (`consensus_roster_at`, step 4) — below
+        // `LEAKED_ROSTER_ACTIVATION_EPOCH` this is byte-identical to
+        // `duty_roster()`, so no existing (low-epoch) fixture using this
+        // helper is affected; above it (e.g. a fixture that rolls past
+        // epoch 1400, already armed on the live chain), using the unleaked
+        // roster here would draw a different proposer than the real
+        // validation does and every such block would spuriously fail with
+        // `NotScheduledProposer`.
+        let roster = ctx.consensus_roster_at(ctx.epoch);
         let seed = ctx.seed_for_epoch(ctx.epoch);
         let p = schedule::proposer(&seed, slot, &roster).expect("no eligible proposer");
         let reveal = chains[p as usize].next_reveal().expect("chain spent");
@@ -6513,7 +7135,9 @@ mod tests {
         }
     }
 
-    /// The same (validator, signing_root) twice in one body is refused.
+    /// The same (validator, signing_root) twice in one body is refused, ONCE
+    /// [`crate::params::ATTESTATION_DEDUP_ACTIVATION_EPOCH`] binds (R3 M-2 —
+    /// this rejection shipped ungated in `02fdbd5` and is gated here).
     ///
     /// Without the dedup this body APPLIES: the second copy rewrites the same
     /// `pending_votes` key and the same participation bit, so it changes no
@@ -6522,6 +7146,7 @@ mod tests {
     /// on the resulting state.
     #[test]
     fn a_repeated_attestation_in_one_body_is_refused() {
+        let _gate = crate::params::rehearsal::attestation_dedup_gate_open_guard();
         // Control: one copy survives step 8 and dies at the zero state_root.
         // Without it the duplicate case below would prove nothing — a vote
         // rejected for being unincludable looks the same from the outside.
@@ -6543,6 +7168,548 @@ mod tests {
             Err(TransitionError::DuplicateAttestation(1)),
             "a body carrying the same (validator, signing_root) twice must be refused, \
              naming the SECOND copy"
+        );
+    }
+
+    /// R3 M-2, the control half: BELOW the flag day a duplicate pair is
+    /// accepted exactly as it was before `02fdbd5` introduced the rejection —
+    /// the second copy is idempotent, so the body reaches step 12 like any
+    /// other and dies only at the zero state_root the probe stamps. If this
+    /// ever returns `DuplicateAttestation` without the rehearsal guard open,
+    /// the R3 M-2 gate has gone live un-armed.
+    #[test]
+    fn below_the_attestation_dedup_gate_a_repeated_attestation_is_accepted() {
+        let (t, s, mut chains) = epoch1_fixture();
+        let (att_slot, member) = a_committee_seat(&s);
+        let one = attest(&s, member, att_slot, *s.head.as_bytes());
+        let two = vec![one.clone(), one];
+        let dup = build_header_over(&s, 63, &two, &mut chains);
+        assert_eq!(
+            t.apply_block(&s, &dup, &two, &[]),
+            Err(TransitionError::StateRootMismatch),
+            "below the gate a duplicate pair must reach step 12 like any other body — \
+             DuplicateAttestation here would mean the tightening is still ungated"
+        );
+    }
+
+    // -- ATTESTATION_DEDUP_ACTIVATION_EPOCH (audit R3 M-2) -------------------
+
+    /// TRIPWIRE. `ATTESTATION_DEDUP_ACTIVATION_EPOCH` must stay `u64::MAX`
+    /// until the founder names an epoch: it tightens body validity (a
+    /// duplicate pair goes from accepted to refused), so the first post-gate
+    /// block splits any fleet that is not already running this rule. Whoever
+    /// arms it deletes this test first, and reads the constant's docs while
+    /// doing so.
+    #[test]
+    fn attestation_dedup_gate_is_inert() {
+        assert_eq!(
+            crate::params::ATTESTATION_DEDUP_ACTIVATION_EPOCH,
+            u64::MAX,
+            "arming the duplicate-attestation refusal is a flag day; read the constant's docs",
+        );
+    }
+
+    /// Same shape as every other gate's function-of-the-epoch-alone test: the
+    /// verdict is a function of the BLOCK's committed epoch and the constant,
+    /// and of nothing else.
+    #[test]
+    fn the_dedup_gate_is_a_function_of_the_block_epoch_alone() {
+        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1] {
+            assert!(!CommittedState::attestation_dedup_active(e), "epoch {e} must be below");
+        }
+        assert!(CommittedState::attestation_dedup_active(
+            crate::params::ATTESTATION_DEDUP_ACTIVATION_EPOCH
+        ));
+    }
+
+    // -- REWARDS_V2_ACTIVATION_EPOCH (audit R1 M1 + M3 + M4, R7 M5) ----------
+
+    /// TRIPWIRE. `REWARDS_V2_ACTIVATION_EPOCH` must stay `u64::MAX` until the
+    /// founder names an epoch: it changes committed issuance amounts, so the
+    /// first post-gate block bonds a different figure than a fleet not yet
+    /// running this rule would compute. Whoever arms it deletes this test
+    /// first, and reads the constant's docs while doing so.
+    #[test]
+    fn rewards_v2_gate_is_inert() {
+        assert_eq!(
+            crate::params::REWARDS_V2_ACTIVATION_EPOCH,
+            u64::MAX,
+            "arming rewards v2 changes committed issuance; read the constant's docs",
+        );
+    }
+
+    /// Same shape as every other gate's function-of-the-epoch-alone test.
+    #[test]
+    fn the_rewards_v2_gate_is_a_function_of_the_block_epoch_alone() {
+        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1] {
+            assert!(!CommittedState::rewards_v2_active(e), "epoch {e} must be below");
+        }
+        assert!(CommittedState::rewards_v2_active(crate::params::REWARDS_V2_ACTIVATION_EPOCH));
+    }
+
+    /// R1 M1 regression: a vote naming a `target_epoch` other than the one
+    /// actually closing must earn no issuance credit, even though
+    /// `current_participation` (set unconditionally by step 8 on ANY admitted
+    /// vote) says this validator "attested". Reverting the fix (reading
+    /// `current_participation` again instead of re-checking `pending_votes`)
+    /// makes this go red: the control half already proves the OLD behaviour
+    /// credits it.
+    #[test]
+    fn rewards_v2_denies_credit_for_a_vote_naming_the_wrong_target_epoch() {
+        let (_t, s, _chains) = epoch1_fixture();
+        let (att_slot, member) = a_committee_seat(&s);
+
+        let mut st = s.clone();
+        let fin = st.finality_view();
+        let bad = AttestationData {
+            slot: att_slot,
+            head: [0x11; 32],
+            source_epoch: fin.justified.epoch,
+            source_root: fin.justified.root,
+            target_epoch: st.epoch + 5, // WRONG: does not name the closing epoch
+            target_root: [0x11; 32],
+        };
+        st.pending_votes.insert((member, bad.signing_root()), bad);
+        // Exactly what step 8 sets, unconditionally, on any admitted vote —
+        // see `current_participation`'s field docs and step 8's comment.
+        st.current_participation.insert(member, true);
+
+        let own_before = st.validator_record(member).unwrap().staked_sat;
+
+        // Control: below the gate, this is the bug — full credit regardless.
+        let closed = st.clone().close_epoch();
+        assert!(
+            closed.validator_record(member).unwrap().staked_sat > own_before,
+            "control failed: below the gate this validator must still be credited \
+             (that is R1 M1's bug, and the fixture must reproduce it to be meaningful)"
+        );
+
+        // Fixed: at and above the gate, no credit.
+        let _gate = crate::params::rehearsal::rewards_v2_gate_open_guard();
+        let closed_fixed = st.close_epoch();
+        assert_eq!(
+            closed_fixed.validator_record(member).unwrap().staked_sat,
+            own_before,
+            "R1 M1: a vote naming the wrong target_epoch must earn no issuance credit"
+        );
+    }
+
+    /// R1 M1 regression, the source-epoch half: a vote whose `source_epoch`
+    /// does not name the checkpoint actually justified before this epoch
+    /// must also earn nothing, for the same reason — such a vote could not
+    /// have been cast in good faith against this chain's own history.
+    #[test]
+    fn rewards_v2_denies_credit_for_a_vote_naming_the_wrong_source_epoch() {
+        let (_t, s, _chains) = epoch1_fixture();
+        let (att_slot, member) = a_committee_seat(&s);
+
+        let mut st = s.clone();
+        let fin = st.finality_view();
+        let bad = AttestationData {
+            slot: att_slot,
+            head: [0x11; 32],
+            source_epoch: fin.justified.epoch + 1, // WRONG: not the justified checkpoint
+            source_root: fin.justified.root,
+            target_epoch: st.epoch,
+            target_root: [0x11; 32],
+        };
+        st.pending_votes.insert((member, bad.signing_root()), bad);
+        st.current_participation.insert(member, true);
+        let own_before = st.validator_record(member).unwrap().staked_sat;
+
+        let closed = st.clone().close_epoch();
+        assert!(
+            closed.validator_record(member).unwrap().staked_sat > own_before,
+            "control failed: below the gate this validator must still be credited"
+        );
+
+        let _gate = crate::params::rehearsal::rewards_v2_gate_open_guard();
+        let closed_fixed = st.close_epoch();
+        assert_eq!(
+            closed_fixed.validator_record(member).unwrap().staked_sat,
+            own_before,
+            "R1 M1: a vote naming the wrong source_epoch must earn no issuance credit"
+        );
+    }
+
+    /// R1 M1 regression, the equivocation half: two DISTINCT signing roots
+    /// from one validator in one epoch must earn nothing, on EITHER side —
+    /// a partition seats each validator in exactly one committee, so a
+    /// second distinct vote is in-block equivocation, not a second honest
+    /// vote (`committees::epoch_committees`'s docs).
+    #[test]
+    fn rewards_v2_denies_credit_to_an_in_epoch_equivocator() {
+        let (_t, s, _chains) = epoch1_fixture();
+        let (att_slot, member) = a_committee_seat(&s);
+
+        let mut st = s.clone();
+        let fin = st.finality_view();
+        let good = AttestationData {
+            slot: att_slot,
+            head: [0x11; 32],
+            source_epoch: fin.justified.epoch,
+            source_root: fin.justified.root,
+            target_epoch: st.epoch,
+            target_root: [0x11; 32],
+        };
+        let mut other = good;
+        other.target_root = [0x22; 32]; // distinct signing root, same validator
+        st.pending_votes.insert((member, good.signing_root()), good);
+        st.pending_votes.insert((member, other.signing_root()), other);
+        st.current_participation.insert(member, true);
+        let own_before = st.validator_record(member).unwrap().staked_sat;
+
+        let _gate = crate::params::rehearsal::rewards_v2_gate_open_guard();
+        let closed = st.close_epoch();
+        assert_eq!(
+            closed.validator_record(member).unwrap().staked_sat,
+            own_before,
+            "R1 M1: an in-epoch equivocator must earn no issuance credit"
+        );
+    }
+
+    /// R1 M4 regression: a delegator's pro-rata share of issuance must be
+    /// settled into the committed ledger, not silently discarded. Reverting
+    /// the fix (feeding `rewards::distribute` `delegated_stake: 0` again)
+    /// makes this go red.
+    #[test]
+    fn rewards_v2_settles_delegator_issuance_share() {
+        let (_t, s, _chains) = epoch1_fixture();
+        let (att_slot, member) = a_committee_seat(&s);
+
+        let mut st = s.clone();
+        let fin = st.finality_view();
+        let good = AttestationData {
+            slot: att_slot,
+            head: [0x11; 32],
+            source_epoch: fin.justified.epoch,
+            source_root: fin.justified.root,
+            target_epoch: st.epoch,
+            target_root: [0x11; 32],
+        };
+        st.pending_votes.insert((member, good.signing_root()), good);
+        st.current_participation.insert(member, true);
+        // A real, FULLY activated delegation behind `member` — requested at
+        // epoch 0, where `Registry::resolve`'s warm-up is unlimited.
+        st.delegations.push(delegation::Delegation {
+            delegator: 900,
+            validator: member,
+            amount_sat: delegation::MIN_DELEGATION_SAT * 100,
+            requested_epoch: 0,
+            deactivate_epoch: None,
+            eligible: true,
+        });
+
+        let _gate = crate::params::rehearsal::rewards_v2_gate_open_guard();
+        let closed = st.close_epoch();
+        assert!(
+            closed.delegator_issuance_reward_sat(900) > 0,
+            "R1 M4: a delegator behind an attesting, capped-eligible validator must earn a \
+             pro-rata share of issuance"
+        );
+    }
+
+    /// R7 M5 regression: a validator scheduled to propose but that produced
+    /// NONE of its slots must earn strictly less than an otherwise-identical
+    /// validator that did — a withheld proposal must cost a measurable
+    /// slice of the epoch's issuance credit. Reverting the fix (dropping the
+    /// proposer term from `max_credits`/`credits`) makes the two payouts
+    /// equal, which turns the final assertion red.
+    #[test]
+    fn rewards_v2_prices_a_withheld_proposal() {
+        let (_t, s, _chains) = epoch1_fixture();
+        let seed = s.seed_for_epoch(s.epoch);
+        let roster = s.duty_roster_at(s.epoch);
+
+        // Two validators both scheduled to propose at least one slot of this
+        // epoch (the fixture's 8-validator, 32-slot partition guarantees
+        // every validator gets at least one slot).
+        let mut scheduled: Vec<u32> = Vec::new();
+        for slot in s.epoch * SLOTS_PER_EPOCH..(s.epoch + 1) * SLOTS_PER_EPOCH {
+            if let Some(p) = schedule::proposer(&seed, slot, &roster) {
+                if !scheduled.contains(&p) {
+                    scheduled.push(p);
+                }
+            }
+        }
+        assert!(scheduled.len() >= 2, "fixture premise: at least two validators are scheduled");
+        let (producer, withheld) = (scheduled[0], scheduled[1]);
+
+        // Build a common base state: both validators attest honestly (equal
+        // attestation credit), neither is capped or leaked, same stake.
+        let mut st = s.clone();
+        for idx in [producer, withheld] {
+            let (att_slot, seat) = {
+                let partition = committees::epoch_committees(&seed, st.epoch, &roster);
+                let idx_slot = partition
+                    .iter()
+                    .position(|c| c.contains(&idx))
+                    .expect("every roster member has a seat");
+                (st.epoch * SLOTS_PER_EPOCH + idx_slot as u64, idx)
+            };
+            let fin = st.finality_view();
+            let data = AttestationData {
+                slot: att_slot,
+                head: [0x11; 32],
+                source_epoch: fin.justified.epoch,
+                source_root: fin.justified.root,
+                target_epoch: st.epoch,
+                target_root: [0x11; 32],
+            };
+            st.pending_votes.insert((seat, data.signing_root()), data);
+            st.current_participation.insert(seat, true);
+        }
+        // `producer` actually produced a slot this epoch; `withheld` did not.
+        st.current_proposed.insert(producer, true);
+
+        let _gate = crate::params::rehearsal::rewards_v2_gate_open_guard();
+        let closed = st.close_epoch();
+        let producer_gain = closed.validator_record(producer).unwrap().staked_sat
+            - st.validator_record(producer).unwrap().staked_sat;
+        let withheld_gain = closed.validator_record(withheld).unwrap().staked_sat
+            - st.validator_record(withheld).unwrap().staked_sat;
+        assert!(
+            producer_gain > withheld_gain,
+            "R7 M5: a validator that produced its scheduled slot must out-earn an \
+             otherwise-identical one that did not (producer={producer_gain}, \
+             withheld={withheld_gain})"
+        );
+    }
+
+    /// R1 M3 regression: the issuance basis must be the LEAK-ADJUSTED
+    /// roster, not the unleaked one — an absent validator's income must
+    /// shrink with its consensus weight. The leak here is REAL, accrued by
+    /// driving `process_epoch` over epochs in which nobody attests (the only
+    /// way a leak comes into existence anywhere in this system — the same
+    /// technique `the_two_call_sites_agree_on_the_index_set_with_a_real_leak`
+    /// uses), never fabricated. `LEAKED_ROSTER_ACTIVATION_EPOCH` (1400) is
+    /// itself already armed and unrelated to this gate; using it directly is
+    /// what makes the two bases OBSERVABLY differ under `close_epoch`.
+    #[test]
+    fn rewards_v2_issuance_basis_is_leak_adjusted() {
+        let _h = crate::params::rehearsal::HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::params::rehearsal::LEAK_DROPS_ZEROED.store(false, std::sync::atomic::Ordering::Relaxed);
+
+        let (_t, mut g, _c) = setup(8);
+        let roster0 = g.duty_roster_at(0);
+
+        // Accrue a real leak: nobody attests, epoch after epoch, until
+        // someone is driven fully to zero.
+        let mut zeroed = None;
+        for epoch in 1..400u64 {
+            let mut accepted = Vec::new();
+            let votes = finality::votes_from_partition(
+                epoch,
+                &roster0,
+                &roster0,
+                &[],
+                &g.seed_for_epoch(0),
+                &mut accepted,
+            );
+            if g.finality_engine.process_epoch(&votes).is_err() {
+                break;
+            }
+            if let Some(v) =
+                roster0.iter().find(|v| g.finality_engine.leaked_of(v.index) >= v.effective_stake)
+            {
+                zeroed = Some(v.index);
+                break;
+            }
+        }
+        let zeroed = zeroed.expect(
+            "the fold never drove anybody to zero, so this test would be vacuous — the \
+             leak rule or its threshold changed",
+        );
+
+        // Move to the epoch at which the leak reaches the duty roster —
+        // already armed, unrelated to REWARDS_V2 — so the two bases differ.
+        g.epoch = crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH;
+        let duty = g.duty_roster_at(g.epoch);
+        let consensus = g.consensus_roster_at(g.epoch);
+        assert_ne!(
+            consensus, duty,
+            "control failed: the two rosters agree value-for-value, so the leak never \
+             reached consensus_roster_at and the comparison below is vacuous"
+        );
+        assert_eq!(
+            consensus.iter().find(|v| v.index == zeroed).map(|v| v.effective_stake),
+            Some(0),
+            "control failed: the fully-leaked validator is not at zero on the consensus side"
+        );
+
+        // Give the zeroed validator a real, committee-admissible vote THIS
+        // epoch too, so it earns full ATTESTATION credit and the only
+        // remaining variable is which roster prices its STAKE.
+        let seed = g.seed_for_epoch(g.epoch);
+        let partition = committees::epoch_committees(&seed, g.epoch, &duty);
+        let idx_slot = partition
+            .iter()
+            .position(|c| c.contains(&zeroed))
+            .expect("the zeroed validator keeps its (inert) committee seat");
+        let fin = g.finality_view();
+        let data = AttestationData {
+            slot: g.epoch * SLOTS_PER_EPOCH + idx_slot as u64,
+            head: [0x11; 32],
+            source_epoch: fin.justified.epoch,
+            source_root: fin.justified.root,
+            target_epoch: g.epoch,
+            target_root: [0x11; 32],
+        };
+        g.pending_votes.insert((zeroed, data.signing_root()), data);
+        g.current_participation.insert(zeroed, true);
+        let own_before = g.validator_record(zeroed).unwrap().staked_sat;
+
+        // Below the gate: the bug — full (unleaked) stake still earns issuance.
+        let closed = g.clone().close_epoch();
+        assert!(
+            closed.validator_record(zeroed).unwrap().staked_sat > own_before,
+            "control failed: below the gate the fully-leaked validator must still earn \
+             issuance on its full stake"
+        );
+
+        // At and above the gate: zero weight, zero issuance, despite attesting.
+        let _gate = crate::params::rehearsal::rewards_v2_gate_open_guard();
+        let closed_fixed = g.close_epoch();
+        assert_eq!(
+            closed_fixed.validator_record(zeroed).unwrap().staked_sat,
+            own_before,
+            "R1 M3: a fully-leaked validator's issuance share must be zero under the \
+             leak-adjusted basis, even though it attested this epoch"
+        );
+    }
+
+    // -- STAKING_TX_METERING_ACTIVATION_EPOCH (audit R7 M1) ------------------
+
+    /// TRIPWIRE. `STAKING_TX_METERING_ACTIVATION_EPOCH` must stay `u64::MAX`
+    /// until the founder names an epoch: it makes a body the old rules
+    /// accepted free of charge newly consume block capacity, so the first
+    /// post-gate block can hit `BlockGasLimitExceeded`/`BlockByteLimitExceeded`
+    /// on a shape that used to be free. Whoever arms it deletes this test
+    /// first, and reads the constant's docs while doing so.
+    #[test]
+    fn staking_tx_metering_gate_is_inert() {
+        assert_eq!(
+            crate::params::STAKING_TX_METERING_ACTIVATION_EPOCH,
+            u64::MAX,
+            "arming staking-tx metering is a flag day; read the constant's docs",
+        );
+    }
+
+    /// Same shape as every other gate's function-of-the-epoch-alone test.
+    #[test]
+    fn the_staking_tx_metering_gate_is_a_function_of_the_block_epoch_alone() {
+        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1] {
+            assert!(!CommittedState::staking_tx_metering_active(e), "epoch {e} must be below");
+        }
+        assert!(CommittedState::staking_tx_metering_active(
+            crate::params::STAKING_TX_METERING_ACTIVATION_EPOCH
+        ));
+    }
+
+    /// R7 M1 regression, the unauthenticated arms: below the gate a
+    /// `Delegate` (or legacy `Exit`) is free; at and above it, it is charged
+    /// intrinsic gas for its own bytes and NOTHING for verification (it
+    /// verifies no signature). Reverting the fix (routing back through the
+    /// old `free` charge) makes the "armed" half go red.
+    #[test]
+    fn staking_tx_metering_charges_bytes_but_not_verification_for_delegate() {
+        let _bonding = crate::params::rehearsal::bonding_gate_open_guard();
+        let (_t, g, _c) = setup(4);
+        let tx = PosTransaction::Delegate {
+            delegator: 900,
+            validator: 0,
+            amount_sat: delegation::MIN_DELEGATION_SAT,
+            eligible: true,
+        };
+
+        let mut below = g.clone();
+        let charge = below
+            .apply_transaction(&tx, 1_000_000, fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS, &OkVerifier)
+            .unwrap();
+        assert_eq!(charge.gas, 0, "control failed: below the gate this must stay free");
+        assert_eq!(charge.tx_bytes, 0, "control failed: below the gate this must stay free");
+
+        let _gate = crate::params::rehearsal::staking_tx_metering_gate_open_guard();
+        let mut above = g.clone();
+        let charge = above
+            .apply_transaction(&tx, 1_000_000, fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS, &OkVerifier)
+            .unwrap();
+        assert_eq!(
+            charge.tx_bytes,
+            tx.canonical_bytes().len() as u64,
+            "R7 M1: tx_bytes must equal the transaction's own canonical length"
+        );
+        assert_eq!(
+            charge.gas,
+            fee_market::intrinsic_gas(fee_market::TxClass::Eutxo { inputs: 0 }, charge.tx_bytes),
+            "R7 M1: an unauthenticated staking arm must be charged flat + bytes, no \
+             verification gas"
+        );
+        assert_eq!(charge.base_fee_sat, 0, "R7 M1: no tip field exists to draw a fee from");
+        assert_eq!(charge.priority_fee_sat, 0, "R7 M1: no tip field exists to draw a fee from");
+    }
+
+    /// R7 M1 regression, an authenticated arm: `Deposit` verifies one hybrid
+    /// signature (its proof of possession), so the armed charge must include
+    /// exactly one `HYBRID_VERIFY_GAS` term on top of flat + bytes.
+    #[test]
+    fn staking_tx_metering_charges_one_verification_for_deposit() {
+        let _bonding = crate::params::rehearsal::bonding_gate_open_guard();
+        let (_t, g, _c) = setup(4);
+        let tx = toy_deposit(vec![0xAB; staking::HYBRID_PK_BYTES], [0xCD; 32], vec![0xEF; 4], 500);
+
+        let mut below = g.clone();
+        let charge = below
+            .apply_transaction(&tx, 1_000_000, fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS, &OkVerifier)
+            .unwrap();
+        assert_eq!(charge.gas, 0, "control failed: below the gate this must stay free");
+
+        let _gate = crate::params::rehearsal::staking_tx_metering_gate_open_guard();
+        let mut above = g.clone();
+        let charge = above
+            .apply_transaction(&tx, 1_000_000, fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS, &OkVerifier)
+            .unwrap();
+        assert_eq!(
+            charge.tx_bytes,
+            tx.canonical_bytes().len() as u64,
+            "R7 M1: tx_bytes must equal the transaction's own canonical length"
+        );
+        assert_eq!(
+            charge.gas,
+            fee_market::intrinsic_gas(fee_market::TxClass::Eutxo { inputs: 1 }, charge.tx_bytes),
+            "R7 M1: Deposit's proof-of-possession check must be charged one verification"
+        );
+    }
+
+    /// R7 M1 regression, `SlashingEvidence`: two hybrid verifications (both
+    /// sides of the offending pair), driven through a real block so the
+    /// block-level accumulation (`block_gas_used`) is exercised too, not
+    /// just the per-transaction charge.
+    #[test]
+    fn staking_tx_metering_charges_two_verifications_for_slashing_evidence() {
+        let _gate_slash = crate::params::rehearsal::slashing_gate_open_guard();
+        let (t, g, mut chains) = setup(4);
+        let seed = g.seed_for_epoch(0);
+        let p2 = schedule::proposer(&seed, 2, &g.duty_roster()).unwrap();
+        let offender = (p2 + 1) % 4;
+        let ev = PosTransaction::SlashingEvidence(double_vote_evidence(offender));
+
+        let b_below = build_block(&t, &g, 1, &[], std::slice::from_ref(&ev), &mut chains);
+        let s_below = t.apply_block(&g, &b_below, &[], std::slice::from_ref(&ev)).unwrap();
+        assert_eq!(s_below.block_gas_used, 0, "control failed: below the gate this must stay free");
+
+        let _gate_meter = crate::params::rehearsal::staking_tx_metering_gate_open_guard();
+        let (t2, g2, mut chains2) = setup(4);
+        let b_above = build_block(&t2, &g2, 1, &[], std::slice::from_ref(&ev), &mut chains2);
+        let s_above = t2.apply_block(&g2, &b_above, &[], std::slice::from_ref(&ev)).unwrap();
+        assert_eq!(s_above.block_tx_bytes, ev.canonical_bytes().len() as u64);
+        assert_eq!(
+            s_above.block_gas_used,
+            fee_market::intrinsic_gas(
+                fee_market::TxClass::Eutxo { inputs: 2 },
+                ev.canonical_bytes().len() as u64
+            ),
+            "R7 M1: SlashingEvidence must be charged for both hybrid verifications it pays"
         );
     }
 
@@ -7144,6 +8311,168 @@ mod tests {
         );
     }
 
+    /// B6: conservation over a SYNTHETIC multi-epoch history exercising every
+    /// source of committed-value movement at once — a fee-paying transfer, an
+    /// issuance-paying boundary, several genuinely non-finalizing boundaries
+    /// (so the inactivity leak accrues for real), and finally one block that
+    /// jumps the remaining distance past
+    /// [`crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH`] (2,700 — already
+    /// armed). Every step runs through the REAL block path
+    /// (`Transition::apply_block`), which stamps its `state_root` by running
+    /// `compute_post_state` — the same, UNGATED step-11b check every other
+    /// block in this crate is judged by. A conservation violation anywhere in
+    /// this history would refuse the block that contains it, not merely fail
+    /// an assertion here; this test's job is to prove that stays true across
+    /// a long, varied history, not just the short fixtures the other B6 tests
+    /// use.
+    #[test]
+    fn supply_is_conserved_across_a_synthetic_multi_epoch_history_with_fees_and_the_2700_recovery() {
+        let owner = owner_key(0x90);
+        let coin = opening(0x91, 0, 1_000_000_000_000, &owner);
+        let (t, g, mut chains) = setup_funded(8, std::slice::from_ref(&coin));
+
+        // A fee-paying transfer: the base-fee burn and the producer credit
+        // both move committed value.
+        let price = g.next_base_fee();
+        let to = script_of(&owner_key(0x92));
+        let fee_tx = transfer_spending(std::slice::from_ref(&coin), &owner, to, 500, 5, price);
+        let b1 = build_block(&t, &g, 1, &[], std::slice::from_ref(&fee_tx), &mut chains);
+        let s1 = t
+            .apply_block(&g, &b1, &[], std::slice::from_ref(&fee_tx))
+            .expect("a fee-paying block must conserve supply");
+
+        // Roll to epoch 1 first (empty block) — `full_epoch_attestations`
+        // builds votes for the state's OWN current epoch, so it must be
+        // called only after the epoch it targets has actually opened.
+        let b_roll = build_block(&t, &s1, 32, &[], &[], &mut chains);
+        let s1b = t
+            .apply_block(&s1, &b_roll, &[], &[])
+            .expect("rolling into epoch 1 must conserve supply");
+        assert_eq!(s1b.epoch, 1, "fixture premise: this block actually opened epoch 1");
+
+        // Epoch 1's full quorum, recorded against it (still epoch 1 — slot
+        // 63 is the last slot of epoch 1)...
+        let atts = full_epoch_attestations(&s1b, *s1b.head().as_bytes());
+        let b2 = build_block(&t, &s1b, 63, &atts, &[], &mut chains);
+        let s2 = t
+            .apply_block(&s1b, &b2, &atts, &[])
+            .expect("recording a full quorum must conserve supply");
+        assert_eq!(s2.epoch, 1, "fixture premise: this block is still inside epoch 1");
+
+        // ...then the block that crosses into epoch 2, closing epoch 1 and
+        // therefore minting issuance behind the quorum just recorded.
+        let b3 = build_block(&t, &s2, 64, &[], &[], &mut chains);
+        let mut st = t
+            .apply_block(&s2, &b3, &[], &[])
+            .expect("an honest quorum boundary must conserve supply");
+        assert_eq!(st.epoch, 2, "fixture premise: the quorum boundary actually rolled");
+
+        // Several boundaries with NO participation: the inactivity leak
+        // accrues for real, through the real block path, so step 11b runs at
+        // every one of these boundaries too.
+        let start_epoch = st.epoch;
+        for _ in 0..6 {
+            // Next epoch's first slot: guarantees this block crosses exactly
+            // one epoch boundary and that consecutive slots stay monotonic.
+            let slot = (st.epoch + 1) * SLOTS_PER_EPOCH + 1;
+            let b = build_block(&t, &st, slot, &[], &[], &mut chains);
+            st = t
+                .apply_block(&st, &b, &[], &[])
+                .expect("a non-finalizing boundary must still conserve supply");
+        }
+        assert!(st.epoch >= start_epoch + 6, "fixture premise: several epochs actually rolled");
+
+        // Skip most of the distance to the flag day with a direct epoch
+        // poke, rather than one block whose internal boundary walk would
+        // close ~2,690 epochs of zero participation for real: every one of
+        // those would genuinely leak (there is no way to supply
+        // attestations for an epoch a block only PASSES THROUGH — a body
+        // carries votes for its own target epoch alone), and quadratic decay
+        // over that many consecutive bites drives every validator's stake to
+        // zero, leaving no eligible proposer for the next real block. The
+        // poke does not touch conservation at all (it moves no coin and
+        // mints nothing); what it skips is `finality_engine`'s own
+        // bookkeeping, and `Transition::process_epoch`'s docs are the
+        // argument for why that is safe to leave behind: every intervening
+        // `close_epoch` this test's remaining blocks trigger becomes a
+        // silent, no-op `OutOfOrderEpoch` (the finality engine's `next_epoch`
+        // counter no longer matches), so no further leak accrues and no
+        // finality state changes — only the epoch NUMBER moves, which is
+        // exactly the fixture this test needs: real conservation checks on
+        // real blocks, at and after the already-armed flag day, without an
+        // impossible 2,690-epoch real history.
+        st.epoch = crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH - 5;
+
+        // The last few boundaries, for real, crossing the flag day itself.
+        let start_epoch2 = st.epoch;
+        for _ in 0..6 {
+            let slot = (st.epoch + 1) * SLOTS_PER_EPOCH + 1;
+            let b = build_block(&t, &st, slot, &[], &[], &mut chains);
+            st = t.apply_block(&st, &b, &[], &[]).expect(
+                "a boundary crossing the leak-recovery flag day must still conserve supply",
+            );
+        }
+        assert!(st.epoch >= start_epoch2 + 6, "fixture premise: several epochs actually rolled");
+        assert!(st.epoch > crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH);
+    }
+
+    /// B6, the slash case: a slash must not violate supply conservation, now
+    /// that R1 H4 (the whistleblower reward is bounded to the operator's own
+    /// DEDUCTED stake) and R1 M6 (a delegation's exposure is priced on
+    /// ACTIVATED stake) are fixed — a large delegated position behind a
+    /// small operator bond is exactly the shape H4's fix exists for.
+    /// Exercises the real block path, which runs the same ungated step-11b
+    /// check as every other block; an unconserved slash would refuse the
+    /// block containing it, not merely fail an assertion here.
+    #[test]
+    fn supply_is_conserved_across_a_slash() {
+        let _gate = crate::params::rehearsal::slashing_gate_open_guard();
+        let (t, g, mut chains) = setup(4);
+        let seed = g.seed_for_epoch(0);
+        let p2 = schedule::proposer(&seed, 2, &g.duty_roster()).unwrap();
+        let offender = (p2 + 1) % 4;
+
+        // A large, FULLY ACTIVE delegated position behind a small operator
+        // bond — requested at epoch 0 directly (not through a `Delegate`
+        // transaction, which would request from epoch + 1 and leave it
+        // unactivated for this whole fixture — see the R1 M6 tests), so
+        // `Registry::resolve`'s epoch-0 unlimited budget admits it whole.
+        let mut g2 = g.clone();
+        g2.delegations.push(delegation::Delegation {
+            delegator: 900,
+            validator: offender,
+            amount_sat: delegation::MIN_DELEGATION_SAT * 1_000,
+            requested_epoch: 0,
+            deactivate_epoch: None,
+            eligible: true,
+        });
+
+        let ev = PosTransaction::SlashingEvidence(double_vote_evidence(offender));
+        let b = build_block(&t, &g2, 1, &[], std::slice::from_ref(&ev), &mut chains);
+        let s1 = t
+            .apply_block(&g2, &b, &[], std::slice::from_ref(&ev))
+            .expect("a slash must not violate supply conservation and get the block refused");
+
+        // Fixture premise: the slash actually did something (delegator loss
+        // recorded, operator bond reduced) — otherwise the assertion below
+        // would hold vacuously.
+        assert!(s1.delegator_slash_loss_sat(900) > 0, "fixture premise: the delegator was slashed");
+        assert!(
+            s1.validator_record(offender).unwrap().staked_sat < g2.validator_record(offender).unwrap().staked_sat,
+            "fixture premise: the operator's own bond was actually reduced"
+        );
+
+        // The explicit form of the property: a slash must never INCREASE
+        // accounted supply. It burns stake (operator bond directly, delegator
+        // exposure via the ledger subtraction) and pays a whistleblower
+        // reward bounded to the operator's own deduction (R1 H4) — never
+        // more than what it burns.
+        assert!(
+            s1.accounted_supply_sat() <= g2.accounted_supply_sat(),
+            "a slash must never increase accounted supply"
+        );
+    }
+
     #[test]
     fn replay_is_delivery_order_independent() {
         // Pre-gate fixture: this test bonds through the legacy unfunded
@@ -7309,6 +8638,158 @@ mod tests {
                 &OkVerifier
             ),
             Err(TxReject::StakingRule)
+        );
+    }
+
+    // -- WITHDRAWAL_ACTIVATION_EPOCH (audit R7 M4) ---------------------------
+
+    /// TRIPWIRE. `WITHDRAWAL_ACTIVATION_EPOCH` must stay `u64::MAX` until
+    /// the founder both rules on the withdrawal transaction's wire byte
+    /// (see [`CommittedState::withdrawal_active`]'s docs — this pass could
+    /// not add the `PosTransaction` variant itself, since ANY new variant
+    /// makes the unowned `tests/wire_tag_registry.rs`'s frozen, wildcard-
+    /// free match stop compiling) and arms this constant. Whoever arms it
+    /// deletes this test first, and reads the constant's docs while doing
+    /// so.
+    #[test]
+    fn withdrawal_gate_is_inert() {
+        assert_eq!(
+            crate::params::WITHDRAWAL_ACTIVATION_EPOCH,
+            u64::MAX,
+            "arming withdrawal is a flag day gated on a wire-byte ruling; read the constant's docs",
+        );
+    }
+
+    /// Same shape as every other gate's function-of-the-epoch-alone test —
+    /// pinned even with no call site yet, so the predicate and its
+    /// rehearsal switch cannot silently regress before the day they are
+    /// wired to an actual transaction arm.
+    #[test]
+    fn the_withdrawal_gate_is_a_function_of_the_block_epoch_alone() {
+        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1] {
+            assert!(!CommittedState::withdrawal_active(e), "epoch {e} must be below");
+        }
+        assert!(CommittedState::withdrawal_active(crate::params::WITHDRAWAL_ACTIVATION_EPOCH));
+        let _g = crate::params::rehearsal::withdrawal_gate_open_guard();
+        assert!(CommittedState::withdrawal_active(0), "the rehearsal switch must force it open too");
+    }
+
+    // -- SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH (audit A2-3 / R7 M2) -------
+
+    /// TRIPWIRE. `SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH` must stay
+    /// `u64::MAX` until the founder names an epoch AND announces it to
+    /// wallets: arming it moves the value every UNSPENT output's signature
+    /// is checked against, invalidating any pre-signed transaction nobody
+    /// has broadcast yet. Whoever arms it deletes this test first, and
+    /// reads the constant's docs while doing so.
+    #[test]
+    fn sighash_network_binding_gate_is_inert() {
+        assert_eq!(
+            crate::params::SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH,
+            u64::MAX,
+            "arming the network-bound sighash fold invalidates every unspent output's pending \
+             signature; read the constant's docs",
+        );
+    }
+
+    /// Same shape as every other gate's function-of-the-epoch-alone test.
+    #[test]
+    fn the_sighash_network_binding_gate_is_a_function_of_the_block_epoch_alone() {
+        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1] {
+            assert!(!CommittedState::sighash_network_binding_active(e), "epoch {e} must be below");
+        }
+        assert!(CommittedState::sighash_network_binding_active(
+            crate::params::SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH
+        ));
+    }
+
+    /// KAT: below the gate, `checked_signing_root` is byte-identical to
+    /// `spend_signing_root` for a fixed sample transaction — pinned so a
+    /// regression that folds in the binding a LITTLE (rather than not at
+    /// all) below the flag day cannot hide behind "the root only changed a
+    /// bit".
+    #[test]
+    fn below_the_network_binding_gate_the_checked_root_is_the_plain_spend_root() {
+        let tx = PosTransaction::Transfer {
+            inputs: vec![TransferInput {
+                txid: [7u8; 32],
+                vout: 0,
+                pubkey: vec![1u8; 4],
+                signature: vec![2u8; 4],
+            }],
+            outputs: vec![TransferOutput { value: 100, script_hash: [9u8; 32] }],
+            tx_bytes: 64,
+            tip_millisat_per_gas: 0,
+        };
+        assert_eq!(tx.checked_signing_root(0), tx.spend_signing_root());
+        assert_eq!(tx.checked_signing_root(u64::MAX - 1), tx.spend_signing_root());
+    }
+
+    /// The fold is sensitive to the binding: two distinct 32-byte "network
+    /// ids" folded onto the SAME base root produce distinct results, and
+    /// neither equals the pre-activation (plain) root. This is the property
+    /// that makes it a NETWORK binding at all — proved on the fold function
+    /// directly (`PosTransaction::fold_network_binding`), so the test does
+    /// not need two live chains to observe it, only two arbitrary bindings.
+    #[test]
+    fn the_network_binding_fold_differs_across_two_network_ids() {
+        let tx = PosTransaction::Transfer {
+            inputs: vec![TransferInput {
+                txid: [7u8; 32],
+                vout: 0,
+                pubkey: vec![1u8; 4],
+                signature: vec![2u8; 4],
+            }],
+            outputs: vec![TransferOutput { value: 100, script_hash: [9u8; 32] }],
+            tx_bytes: 64,
+            tip_millisat_per_gas: 0,
+        };
+        let base = tx.spend_signing_root();
+        let a = PosTransaction::fold_network_binding(base, [0xAA; 32]);
+        let b = PosTransaction::fold_network_binding(base, [0xBB; 32]);
+        assert_ne!(a, b, "two networks must not agree on what a signature means");
+        assert_ne!(a, base, "a bound root must not equal the plain pre-activation root");
+        assert_ne!(b, base, "a bound root must not equal the plain pre-activation root");
+    }
+
+    /// **Wired, not just computed.** With the gate forced open, the real
+    /// verification call sites in `apply_transfer` must actually route
+    /// through `checked_signing_root` rather than the plain
+    /// `spend_signing_root` every other fixture in this module signs
+    /// against: a signature over the OLD root is refused, and the SAME
+    /// transaction re-signed over the bound root is accepted. This is the
+    /// mutation-switch half — it fails if the gate is ever read but not
+    /// actually consulted at the check.
+    #[test]
+    fn the_network_binding_gate_is_actually_checked_at_verification_not_only_computed() {
+        let _open = crate::params::rehearsal::sighash_network_binding_gate_open_guard();
+        let alice = owner_key(0x91);
+        let to = script_of(&owner_key(0x92));
+        let coin = opening(0x9A, 0, 50_000_000, &alice);
+        let (_t, g, _c) = setup_funded(4, &[coin.clone()]);
+        let price = g.next_base_fee();
+
+        let tx = transfer_spending(std::slice::from_ref(&coin), &alice, to, 512, 1, price);
+        // Control: `transfer_spending`'s signature is over the PLAIN root
+        // (every other fixture's assumption) — refused once the gate is
+        // forced open, because the verification root has moved.
+        assert_eq!(
+            g.clone().apply_transfer(&tx, price, &ToyVerifier),
+            Err(TransferReject::BadSignature),
+            "a signature over the plain root must not satisfy the bound check",
+        );
+
+        // Re-sign over the value `checked_signing_root` actually demands.
+        let mut bound_tx = tx.clone();
+        let bound_root = bound_tx.checked_signing_root(g.epoch);
+        if let PosTransaction::Transfer { inputs, .. } = &mut bound_tx {
+            for i in inputs.iter_mut() {
+                i.signature = toy_sign(&alice, &bound_root);
+            }
+        }
+        assert!(
+            g.clone().apply_transfer(&bound_tx, price, &ToyVerifier).is_ok(),
+            "a signature over the bound root must satisfy the check once the gate is open",
         );
     }
 
@@ -8377,18 +9858,21 @@ mod tests {
     }
 
     /// The budget counts VOLUNTARY exits only. A slashing ejection sets
-    /// `exit_epoch = self.epoch` (no delay), so it can neither exhaust the
-    /// voluntary budget nor be blocked by it — otherwise an attacker could
-    /// buy immunity from ejection by spending the epoch's exits, or a wave of
-    /// ejections could freeze honest exits.
+    /// `exit_epoch` to (since R1 M7) `self.epoch + 1` — never the voluntary
+    /// exit's `self.epoch + EXIT_DELAY_EPOCHS` marker `voluntary_exits_this_
+    /// epoch` looks for — so it can neither exhaust the voluntary budget nor
+    /// be blocked by it — otherwise an attacker could buy immunity from
+    /// ejection by spending the epoch's exits, or a wave of ejections could
+    /// freeze honest exits.
     #[test]
     fn a_slashing_ejection_does_not_spend_the_exit_budget() {
         let _guard = crate::params::rehearsal::exit_auth_gate_open_guard();
         let (_t, g, _c) = setup(4);
         let mut st = g.clone();
-        // The shape slashing writes, applied directly: same epoch, no delay.
+        // The shape slashing writes (R1 M7): the epoch AFTER the slash, never
+        // the voluntary-exit marker.
         st.validators.get_mut(&3).unwrap().slashed = true;
-        st.validators.get_mut(&3).unwrap().exit_epoch = st.epoch;
+        st.validators.get_mut(&3).unwrap().exit_epoch = st.epoch.saturating_add(1);
         assert_eq!(
             st.voluntary_exits_this_epoch(),
             0,
@@ -10810,28 +12294,45 @@ mod tests {
         let s2 = t.apply_block(&s1, &b2, &[], std::slice::from_ref(&ev)).unwrap();
         assert_eq!(p2, b2.header.proposer_index, "test premise: whistleblower is p2");
 
-        // Operator: 5% of the bond burned, record marked, ejected now, stake
-        // locked through the weak-subjectivity margin.
+        // Operator: 5% of the bond burned, record marked, stake locked
+        // through the weak-subjectivity margin.
         let own_loss = sat(200_000) * slashing::SLASH_PROPOSER_EQUIV_BPS / 10_000;
         let rec = s2.validator_record(offender).unwrap();
         assert!(rec.slashed);
         assert_eq!(rec.staked_sat, sat(200_000) - own_loss);
-        assert_eq!(rec.exit_epoch, 0, "duties stop in the epoch of the slash");
+        // R1 M7: ejection lands the epoch AFTER the slash, not the same one
+        // — both blocks here are epoch 0, so `exit_epoch` is 1, not 0.
+        assert_eq!(rec.exit_epoch, 1, "duties stop starting the epoch AFTER the slash (R1 M7)");
         assert_eq!(rec.withdrawable_epoch, staking::WITHDRAWAL_DELAY_EPOCHS);
         assert!(
-            !s2.active_validators().iter().any(|v| v.index == offender),
-            "a slashed validator must leave the duty roster at once"
+            s2.active_validators().iter().any(|v| v.index == offender),
+            "a slashed validator keeps its (already-penalised) seat through the epoch it was \
+             slashed in (R1 M7) — otherwise the committee partition for the rest of this epoch \
+             would move under attestations step 8 already admitted"
         );
 
-        // Delegator: pro-rata loss (delegation.rs rule 3), committed to the
-        // ledger a wallet reads — still exposed even though the delegation
-        // was warming up, because bonded is slashable.
-        let del_loss = delegation::MIN_DELEGATION_SAT * slashing::SLASH_PROPOSER_EQUIV_BPS / 10_000;
-        assert_eq!(s2.delegator_slash_loss_sat(900), del_loss);
+        // Delegator: R1 M6 — a `Delegate` transaction requests from
+        // `self.epoch + 1` (see `params::DEPOSIT_ACTIVATION_EPOCH`'s docs),
+        // so this delegation, requested in block 1 at epoch 0, has not
+        // started activating AT ALL by block 2 (still epoch 0):
+        // `Registry::activated_sat` is 0 for it. Zero activated stake means
+        // it carried zero consensus weight and zero risk when the offence
+        // happened, so it must lose NOTHING — before the fix, pricing on the
+        // nominal `amount_sat` instead burned it in full despite backing no
+        // vote, no proposer draw and no committee seat. See the dedicated
+        // `slashing_prices_delegations_on_activated_stake_not_nominal_amount`
+        // for the partially-activated case.
+        assert_eq!(
+            s2.delegator_slash_loss_sat(900),
+            0,
+            "a delegation that has not activated at all must not be slashed (R1 M6)"
+        );
         assert_eq!(s2.delegator_slash_loss_sat(901), 0, "other accounts untouched");
 
-        // Whistleblower: 1/32 of the total, accrued in-epoch...
-        let whistle = (own_loss + del_loss) / slashing::WHISTLEBLOWER_QUOTIENT;
+        // Whistleblower: 1/32 of the OPERATOR's own loss only (R1 H4) — not
+        // of the operator's loss plus the delegator's, which is the over-mint
+        // the fix closes. Accrued in-epoch...
+        let whistle = own_loss / slashing::WHISTLEBLOWER_QUOTIENT;
         assert_eq!(*s2.pending_fee_rewards.get(&p2).unwrap(), whistle);
         assert_eq!(s2.validator_record(p2).unwrap().staked_sat, sat(200_000));
         // ...and compounded into the bond only at the boundary (nobody
@@ -10839,6 +12340,11 @@ mod tests {
         let s3 = t.process_epoch(&s2).unwrap();
         assert_eq!(s3.validator_record(p2).unwrap().staked_sat, sat(200_000) + whistle);
         assert!(s3.pending_fee_rewards.is_empty());
+        // The boundary is where ejection actually takes effect (R1 M7).
+        assert!(
+            !s3.active_validators().iter().any(|v| v.index == offender),
+            "the slashed validator must be gone from the roster by the next epoch"
+        );
     }
 
     #[test]
@@ -10886,7 +12392,60 @@ mod tests {
             rec.staked_sat,
             sat(200_000) - sat(200_000) * slashing::SLASH_PROPOSER_EQUIV_BPS / 10_000,
         );
-        assert!(!s1.active_validators().iter().any(|v| v.index == offender));
+        assert_eq!(rec.exit_epoch, 1, "R1 M7: ejection lands the epoch after the slash");
+        // R1 M7: still a member for the rest of the epoch the slash landed in.
+        assert!(s1.active_validators().iter().any(|v| v.index == offender));
+        // ... and gone from the roster from the next epoch on.
+        let s2 = t.process_epoch(&s1).unwrap();
+        assert!(!s2.active_validators().iter().any(|v| v.index == offender));
+    }
+
+    /// R1 M6 regression: a delegation still queued behind the warm-up rate
+    /// limit must be priced by what it has ACTUALLY ACTIVATED, never by its
+    /// nominal committed amount. Reverting the fix (feeding `apply_slash`'s
+    /// exposure vector `d.amount_sat` again instead of
+    /// `Registry::activated_sat`) makes this go red: the delegator's
+    /// recorded loss would double, pricing a risk half of this stake never
+    /// carried (it had cast no vote, backed no proposer draw, and shared no
+    /// committee seat).
+    #[test]
+    fn slashing_prices_delegations_on_activated_stake_not_nominal_amount() {
+        let (_t, g, _c) = setup(4);
+        let offender = 0u32;
+        let mut st = g.clone();
+        st.epoch = 1;
+        // Requested at epoch 1, not epoch 0 (where `Registry::resolve`'s
+        // warm-up is unlimited — see its docs — so anything requested there
+        // would activate whole regardless of size). At epoch 1 no other
+        // delegation has activated yet, so the proportional 25 bps rate is
+        // zero and the budget floors at `MIN_CHURN_SAT`; a delegation TWICE
+        // that size therefore activates exactly half.
+        let big = 2 * delegation::MIN_CHURN_SAT;
+        st.delegations.push(delegation::Delegation {
+            delegator: 900,
+            validator: offender,
+            amount_sat: big,
+            requested_epoch: 1,
+            deactivate_epoch: None,
+            eligible: true,
+        });
+
+        let registry = delegation::Registry::resolve(&st.delegations, 1);
+        let activated = registry.activated_sat(&st.delegations[0]);
+        assert_eq!(activated, delegation::MIN_CHURN_SAT, "fixture premise: exactly half activates");
+        assert!(activated < big, "fixture premise: the delegation is still partially queued");
+
+        st.apply_slashing_evidence(&double_vote_evidence(offender), 1, sat(1_000_000), &OkVerifier)
+            .unwrap();
+
+        let expected_loss = activated * slashing::SLASH_PROPOSER_EQUIV_BPS / 10_000;
+        let over_priced_if_unfixed = big * slashing::SLASH_PROPOSER_EQUIV_BPS / 10_000;
+        assert!(expected_loss < over_priced_if_unfixed, "fixture premise: the two prices differ");
+        assert_eq!(
+            st.delegator_slash_loss_sat(900),
+            expected_loss,
+            "must be priced on ACTIVATED stake (R1 M6), not the nominal amount"
+        );
     }
 
     #[test]
@@ -11276,6 +12835,12 @@ mod tests {
         });
         must_move!("validator_fee_rewards", |g: &mut CommittedState| {
             g.validator_fee_rewards.insert(4, 999);
+        });
+        must_move!("delegator_issuance_rewards", |g: &mut CommittedState| {
+            g.delegator_issuance_rewards.insert(4, 555);
+        });
+        must_move!("current_proposed", |g: &mut CommittedState| {
+            g.current_proposed.insert(4, true);
         });
         // Carried roots.
         must_move!("taint_root", |g: &mut CommittedState| g.taint_root[0] ^= 1);
@@ -12127,13 +13692,19 @@ mod tests {
     /// The boundary-divergence DETECTOR fires, and it is in the release
     /// binary.
     ///
-    /// Drives the real `close_epoch` over a real mid-epoch slash: votes are
-    /// admitted against the 8-member partition, validator 3 is then removed
-    /// from the roster exactly the way `apply_slashing_evidence` removes it,
-    /// and the boundary tallies against the 7-member partition. The counter
-    /// must move. The `debug_assert_eq!` beside it must ALSO still fire in a
-    /// test build, so the close is run under `catch_unwind` — a test build is
-    /// supposed to stop on this, production is supposed to log it and carry on.
+    /// Drives the real `close_epoch` over an ARTIFICIAL mid-epoch roster
+    /// shrink: votes are admitted against the 8-member partition, validator 3
+    /// is then removed from the roster by poking `exit_epoch` directly to the
+    /// CURRENT epoch — since R1 M7, `apply_slashing_evidence` itself no
+    /// longer produces this state (it writes `exit_epoch = epoch + 1`, see
+    /// its docs, precisely so this cannot happen through the real evidence
+    /// path any more) — and the boundary tallies against the 7-member
+    /// partition. The counter must still move: this test is no longer
+    /// pinning a live, remotely-triggerable defect, but the DETECTOR must
+    /// keep working for whatever future bug reopens this class of divergence.
+    /// The `debug_assert_eq!` beside it must ALSO still fire in a test build,
+    /// so the close is run under `catch_unwind` — a test build is supposed to
+    /// stop on this, production is supposed to log it and carry on.
     #[test]
     fn the_boundary_divergence_detector_fires_on_a_mid_epoch_slash() {
         use std::panic::AssertUnwindSafe;
@@ -12165,8 +13736,10 @@ mod tests {
         }
         assert_eq!(st.pending_votes.len(), 8, "fixture must actually carry votes");
 
-        // The mid-epoch slash, written the way apply_slashing_evidence writes
-        // it — the unit seam, so the test does not need valid PQ evidence.
+        // The artificial mid-epoch roster shrink (see the doc comment above:
+        // the REAL evidence path no longer produces this after R1 M7). Poked
+        // directly so the detector's continued coverage does not depend on
+        // any one write site.
         {
             let rec = st.validators.get_mut(&3).unwrap();
             rec.slashed = true;
@@ -12268,30 +13841,19 @@ mod tests {
         assert!(fired.is_err(), "consensus_invariant! did not panic on a false condition");
     }
 
-    /// **The divergence the roster unification does NOT close, pinned so it is
-    /// not mistaken for closed.**
+    /// **R1 M7 — a mid-epoch slash no longer re-partitions the epoch it lands
+    /// in, and still ejects starting the next one.**
     ///
-    /// Removing the `effective_stake > 0` filter from `epoch_committees` makes
-    /// the partition invariant under *stake* changes, which is what the leak
-    /// is. It cannot make it invariant under *membership* changes, and
-    /// `apply_slashing_evidence` performs one MID-EPOCH: it sets
-    /// `slashed = true` and `exit_epoch = epoch` the moment valid evidence is
-    /// applied, and `duty_roster_at` filters on exactly that.
-    ///
-    /// So within one epoch the roster's INDEX SET can shrink between two
-    /// blocks. Attestations admitted by step 8 against the 64-member partition
-    /// are then tallied at the boundary against the 63-member one, which is a
-    /// different Fisher-Yates permutation everywhere — the same mechanism as
-    /// the leak defect, from a different cause, and reachable by anyone who can
-    /// get valid equivocation evidence included.
-    ///
-    /// This is why the guard in `close_epoch` is deliberately still a
-    /// `debug_assert!` and NOT a `consensus_invariant!`: an unconditional panic
-    /// there would be a remotely triggerable halt. Closing it properly means
-    /// freezing the epoch's roster at its first slot — a consensus rule change
-    /// with its own flag day, out of scope for the 2026-08-24 unification.
+    /// Before this fix, `apply_slashing_evidence` wrote `exit_epoch = epoch`
+    /// (the slash's OWN epoch) and `duty_roster_at` filtered on `slashed`
+    /// directly, so the roster's INDEX SET shrank between one block of the
+    /// epoch and the next — a different Fisher-Yates permutation everywhere,
+    /// dropping attestations step 8 had already admitted. Reverting either
+    /// half of the fix (the `exit_epoch = epoch + 1` write in
+    /// `apply_slashing_evidence`, or `duty_roster_at` reading `exit_epoch`
+    /// alone instead of also checking `slashed`) makes this go red.
     #[test]
-    fn mid_epoch_slashing_changes_the_roster_index_set_within_one_epoch() {
+    fn mid_epoch_slashing_no_longer_moves_the_partition_within_the_slash_epoch() {
         // Same reason as above: the control half builds a fully-leaked roster.
         let _h = crate::params::rehearsal::HOOK.lock().unwrap_or_else(|e| e.into_inner());
         let (_t, g, _c) = setup(8);
@@ -12299,48 +13861,57 @@ mod tests {
         let before = g.duty_roster_at(g.epoch);
         assert_eq!(before.len(), 8);
 
-        // Exactly what `apply_slashing_evidence` writes, minus the evidence
-        // plumbing — the unit seam, the same pattern `with_leak_applied` is
-        // tested at.
+        // Exactly what `apply_slashing_evidence` writes today — the unit
+        // seam, the same pattern `with_leak_applied` is tested at.
         let mut after_state = g.clone();
         {
             let rec = after_state.validators.get_mut(&3).unwrap();
             rec.slashed = true;
-            rec.exit_epoch = after_state.epoch;
+            rec.exit_epoch = after_state.epoch.saturating_add(1);
         }
-        let after = after_state.duty_roster_at(after_state.epoch);
 
-        assert_eq!(after.len(), 7, "a slash must remove the record from the duty roster");
-        assert!(!after.iter().any(|v| v.index == 3));
+        // Queried at the SLASH'S OWN epoch: the index set must be unchanged
+        // — validator 3 keeps its seat (with whatever stake the slash left
+        // it, already reduced by the penalty) through the rest of this
+        // epoch, and the partition step 8 would draw is bit-identical.
+        let after_same_epoch = after_state.duty_roster_at(after_state.epoch);
+        assert_eq!(
+            after_same_epoch.len(),
+            8,
+            "a mid-epoch slash must not remove the record from the epoch it lands in"
+        );
+        assert!(
+            after_same_epoch.iter().any(|v| v.index == 3),
+            "the slashed validator must keep its seat through the boundary (R1 M7)"
+        );
+        let p_before = committees::epoch_committees(&seed, g.epoch, &before);
+        let p_same_epoch = committees::epoch_committees(&seed, g.epoch, &after_same_epoch);
+        assert_eq!(
+            p_before, p_same_epoch,
+            "the partition for the slash's own epoch must be bit-identical before and after \
+             (R1 M7) — otherwise step 8 and the boundary tally can disagree about who was in \
+             which committee, dropping votes already admitted"
+        );
 
-        // Control: the leak, which changes only stake, does NOT move the
-        // partition. If this half ever fails, the unification has regressed and
-        // the assertion below is measuring the wrong thing.
+        // Control: the leak (a pure stake change) never moved the partition
+        // either — if this half ever fails, the 2026-08-24 unification has
+        // regressed and the assertion above is measuring the wrong thing.
         let leaked = with_leak_applied(before.clone(), |i| if i == 3 { u64::MAX } else { 0 });
         assert_eq!(
             committees::epoch_committees(&seed, g.epoch, &leaked),
-            committees::epoch_committees(&seed, g.epoch, &before),
+            p_before,
             "control: a pure stake change must not move the partition"
         );
 
-        // The membership change, however, does.
-        let p_before = committees::epoch_committees(&seed, g.epoch, &before);
-        let p_after = committees::epoch_committees(&seed, g.epoch, &after);
-        assert_ne!(
-            p_before, p_after,
-            "if a mid-epoch slash stopped re-sorting the partition, this residual is closed \
-             and the debug_assert in close_epoch can be promoted to consensus_invariant!"
+        // Queried at the NEXT epoch: ejection has actually happened.
+        let next_epoch = after_state.epoch + 1;
+        let after_next_epoch = after_state.duty_roster_at(next_epoch);
+        assert_eq!(
+            after_next_epoch.len(),
+            7,
+            "the slash must still eject the validator, one epoch later than immediately"
         );
-        let moved = p_before
-            .iter()
-            .zip(p_after.iter())
-            .map(|(a, b)| a.iter().filter(|v| **v != 3 && b.binary_search(*v).is_err()).count())
-            .sum::<usize>();
-        println!(
-            "MID-EPOCH SLASH: one validator removed from an 8-member roster moved {moved} of \
-             the remaining 7 into a different slot. Stake changes are invariant; membership \
-             changes are not."
-        );
+        assert!(!after_next_epoch.iter().any(|v| v.index == 3));
     }
 
     // ── TransferV2: deduplicated witnesses behind their own flag day ────────

@@ -264,6 +264,27 @@ impl Registry {
     pub fn resolve(delegations: &[Delegation], epoch: u64) -> Registry {
         let mut queue: Vec<&Delegation> =
             delegations.iter().filter(|d| d.eligible && d.amount_sat >= MIN_DELEGATION_SAT).collect();
+        // R1 M5 (perf, ungated, behaviour-identical): with nothing eligible
+        // to admit, every one of the `epoch + 1` iterations below finds no
+        // `d` to activate or deactivate — the loop is `for e in 0..=epoch`
+        // over a `queue` it never indexes into productively, so its ONLY
+        // effect on an empty queue is burning CPU. Skipping it changes
+        // nothing about the RESULT (every field below is what the loop
+        // would have produced from an empty `queue` and `activated`), only
+        // the cost: at today's epoch (~2,000+) this call site is walked from
+        // `duty_roster_at` on every block, and `self.delegations` is
+        // provably empty on the live chain today (`DEPOSIT_ACTIVATION_EPOCH`
+        // is `u64::MAX`, so `Delegate` — the only writer — has never
+        // applied; see that constant's docs).
+        if queue.is_empty() {
+            return Registry {
+                epoch,
+                stakes: Vec::new(),
+                total_active: 0,
+                admitted: Vec::new(),
+                activated: Vec::new(),
+            };
+        }
         queue.sort_by_key(|d| d.queue_key());
 
         let mut active: Vec<(u32, u128)> = Vec::new();

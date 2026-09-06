@@ -228,6 +228,32 @@ const TAG_DELEGATOR_FEE_REWARD: u8 = 0x16;
 /// every pre-gate root byte-identical to the chain as it stands.
 const TAG_VALIDATOR_FEE_REWARD: u8 = 0x17;
 
+/// Cumulative **issuance** rewards credited to one delegator account (audit
+/// R1 M4, 2026-09-06) — the issuance mirror of [`TAG_DELEGATOR_FEE_REWARD`].
+/// Below `params::REWARDS_V2_ACTIVATION_EPOCH` the issuance loop's only
+/// writer is unreachable (`rewards::distribute` is always called with
+/// `delegated_stake: 0`, so `Payout::delegators` is always zero), so this
+/// component contributes ZERO leaves and every pre-gate root is unchanged by
+/// its mere existence — the same "zero leaves while empty" argument
+/// `TAG_VALIDATOR_FEE_REWARD` makes for its own gate. A fresh tag, not a
+/// reuse of `TAG_DELEGATOR_FEE_REWARD`: the two ledgers answer different
+/// questions (issuance share vs fee share) and must be able to hold
+/// different values for the same delegator without one silently overwriting
+/// the other's leaf.
+const TAG_DELEGATOR_ISSUANCE_REWARD: u8 = 0x18;
+
+/// One validator's block-production record for the OPEN epoch (audit R7 M5,
+/// 2026-09-06) — whether it produced at least one of its scheduled slots
+/// this epoch. Below `params::REWARDS_V2_ACTIVATION_EPOCH` nothing writes
+/// this map (`Transition::apply_block`'s only writer is behind the same
+/// gate), so it contributes ZERO leaves and every pre-gate root is
+/// unchanged by its mere existence — same argument as
+/// [`TAG_DELEGATOR_ISSUANCE_REWARD`]. Its own tag and its own component,
+/// not folded into [`TAG_PARTICIPATION_CURRENT`]: attesting and proposing
+/// are different facts about a validator, and conflating them would let one
+/// silently stand in for the other.
+const TAG_PROPOSED_CURRENT: u8 = 0x19;
+
 
 fn sha3(parts: &[&[u8]]) -> [u8; 32] {
     let mut h = Sha3_256::new();
@@ -1162,6 +1188,29 @@ impl ParticipationRecord {
     }
 }
 
+/// One validator's block-production record for the open epoch
+/// ([`TAG_PROPOSED_CURRENT`], audit R7 M5) — see the tag's docs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProposedRecord {
+    /// Index into the validator registry.
+    pub validator_index: u32,
+    /// Whether this validator produced at least one of its scheduled slots
+    /// this epoch.
+    pub proposed: bool,
+}
+
+impl ProposedRecord {
+    fn entry_key(&self) -> Vec<u8> {
+        self.validator_index.to_le_bytes().to_vec()
+    }
+    fn serialize(&self) -> Vec<u8> {
+        let mut s = Vec::with_capacity(5);
+        s.extend_from_slice(&self.validator_index.to_le_bytes());
+        s.push(self.proposed as u8);
+        s
+    }
+}
+
 /// The randao mix for one epoch. State commits the last 2 (§5.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RandaoMix {
@@ -1617,6 +1666,28 @@ impl ValidatorFeeRecord {
     }
 }
 
+/// Cumulative issuance rewards settled to one delegator account
+/// ([`TAG_DELEGATOR_ISSUANCE_REWARD`]) — see the tag's docs. Keyed by
+/// delegator index, same shape as [`DelegatorFeeRecord`] (a distinct type,
+/// not a reuse, so the two ledgers can never be confused at a call site).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DelegatorIssuanceRecord {
+    pub delegator: u32,
+    pub reward_sat: u128,
+}
+
+impl DelegatorIssuanceRecord {
+    fn entry_key(&self) -> Vec<u8> {
+        self.delegator.to_le_bytes().to_vec()
+    }
+    fn serialize(&self) -> Vec<u8> {
+        let mut s = Vec::with_capacity(20);
+        s.extend_from_slice(&self.delegator.to_le_bytes());
+        s.extend_from_slice(&self.reward_sat.to_le_bytes());
+        s
+    }
+}
+
 /// Everything `state_root` commits, passed **by argument** — this struct is
 /// the §5.5 rule made into a type. A block validator builds it from the
 /// parent block's committed state and from nothing else; there is no way to
@@ -1678,6 +1749,16 @@ pub struct ConsensusState<'a> {
     /// Empty — zero leaves — until `FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH`
     /// binds; its only writer is behind that gate.
     pub validator_fee_rewards: &'a [ValidatorFeeRecord],
+    /// Cumulative issuance rewards per delegator
+    /// ([`TAG_DELEGATOR_ISSUANCE_REWARD`], audit R1 M4). Empty — zero leaves
+    /// — until `REWARDS_V2_ACTIVATION_EPOCH` binds; its only writer is
+    /// behind that gate.
+    pub delegator_issuance_rewards: &'a [DelegatorIssuanceRecord],
+    /// Block-production record for the open epoch
+    /// ([`TAG_PROPOSED_CURRENT`], audit R7 M5). Empty — zero leaves — until
+    /// `REWARDS_V2_ACTIVATION_EPOCH` binds; its only writer is behind that
+    /// gate.
+    pub current_proposed: &'a [ProposedRecord],
 }
 
 /// How many **closed** epoch boundaries the committed beacon history retains,
@@ -1883,6 +1964,15 @@ fn build_state_tree_inner(state: &ConsensusState<'_>, eutxo_tree: &Smt) -> Smt {
             derive_key(TAG_VALIDATOR_FEE_REWARD, &v.entry_key()),
             hash_value(&v.serialize()),
         );
+    }
+    for d in state.delegator_issuance_rewards {
+        smt.insert(
+            derive_key(TAG_DELEGATOR_ISSUANCE_REWARD, &d.entry_key()),
+            hash_value(&d.serialize()),
+        );
+    }
+    for p in state.current_proposed {
+        smt.insert(derive_key(TAG_PROPOSED_CURRENT, &p.entry_key()), hash_value(&p.serialize()));
     }
     smt
 }
@@ -2876,6 +2966,8 @@ mod tests {
         base_fee: BaseFeeRecord,
         fee_rewards: Vec<DelegatorFeeRecord>,
         operator_fee_rewards: Vec<ValidatorFeeRecord>,
+        issuance_rewards: Vec<DelegatorIssuanceRecord>,
+        proposed: Vec<ProposedRecord>,
     }
 
     fn fixture() -> Fx {
@@ -3012,6 +3104,19 @@ mod tests {
             ValidatorFeeRecord { validator: 1, reward_sat: 77 },
             ValidatorFeeRecord { validator: 3, reward_sat: 9_876 },
         ];
+        // Delegator 1 deliberately collides with the slash-loss AND fee-reward
+        // keys too: three per-delegator ledgers must be three leaves, not one
+        // (R1 M4's issuance ledger is the newest of the three).
+        let issuance_rewards = vec![
+            DelegatorIssuanceRecord { delegator: 1, reward_sat: 314 },
+            DelegatorIssuanceRecord { delegator: 900, reward_sat: 2_718 },
+        ];
+        // Validator 1 collides here too: a fourth per-validator-index leaf,
+        // this one boolean rather than a satoshi amount.
+        let proposed = vec![
+            ProposedRecord { validator_index: 1, proposed: true },
+            ProposedRecord { validator_index: 2, proposed: false },
+        ];
         Fx {
             eutxos,
             validators,
@@ -3032,6 +3137,8 @@ mod tests {
             base_fee,
             fee_rewards,
             operator_fee_rewards,
+            issuance_rewards,
+            proposed,
         }
     }
 
@@ -3221,6 +3328,8 @@ mod tests {
             base_fee: f.base_fee,
             delegator_fee_rewards: &f.fee_rewards,
             validator_fee_rewards: &f.operator_fee_rewards,
+            delegator_issuance_rewards: &f.issuance_rewards,
+            current_proposed: &f.proposed,
         }
     }
 
@@ -3247,6 +3356,9 @@ mod tests {
         g.delegations.reverse();
         g.pending_fees.reverse();
         g.fee_rewards.reverse();
+        g.operator_fee_rewards.reverse();
+        g.issuance_rewards.reverse();
+        g.proposed.reverse();
         let root_b = state_root(&state(&g));
 
         assert_eq!(root_a, root_b);
@@ -3346,6 +3458,17 @@ mod tests {
         mutated!(|g: &mut Fx| g.fee_rewards[0].delegator += 1);
         mutated!(|g: &mut Fx| g.fee_rewards[0].reward_sat += 1);
         mutated!(|g: &mut Fx| g.fee_rewards.pop().map(|_| ()).unwrap());
+        mutated!(|g: &mut Fx| g.operator_fee_rewards[0].validator += 1);
+        mutated!(|g: &mut Fx| g.operator_fee_rewards[0].reward_sat += 1);
+        mutated!(|g: &mut Fx| g.operator_fee_rewards.pop().map(|_| ()).unwrap());
+        // The R1 M4 issuance ledger.
+        mutated!(|g: &mut Fx| g.issuance_rewards[0].delegator += 1);
+        mutated!(|g: &mut Fx| g.issuance_rewards[0].reward_sat += 1);
+        mutated!(|g: &mut Fx| g.issuance_rewards.pop().map(|_| ()).unwrap());
+        // The R7 M5 block-production record.
+        mutated!(|g: &mut Fx| g.proposed[0].validator_index += 10);
+        mutated!(|g: &mut Fx| g.proposed[0].proposed = !g.proposed[0].proposed);
+        mutated!(|g: &mut Fx| g.proposed.pop().map(|_| ()).unwrap());
 
         // Singleton roots and the issued-supply counter.
         for i in 0..4 {
@@ -3455,6 +3578,27 @@ mod tests {
         assert_ne!(without_op_reward, base);
         assert_ne!(without_op_reward, without_reward);
         assert_ne!(without_op_reward, without_loss);
+
+        // Delegator 1's R1 M4 issuance ledger is a sixth leaf under the same
+        // key — the fee-reward and issuance-reward ledgers answer different
+        // questions and must never alias each other's leaf.
+        let mut n = f.clone();
+        n.issuance_rewards.retain(|r| r.delegator != 1);
+        let without_issuance_reward = state_root(&state(&n));
+        assert_ne!(without_issuance_reward, base);
+        assert_ne!(without_issuance_reward, without_reward);
+        assert_ne!(without_issuance_reward, without_loss);
+        assert_ne!(without_issuance_reward, without_op_reward);
+
+        // Validator 1's R7 M5 block-production record is a seventh leaf under
+        // the same key — distinct from the registry record, the fc-message
+        // key, the pending fee and the operator's settled earnings.
+        let mut o = f.clone();
+        o.proposed.retain(|r| r.validator_index != 1);
+        let without_proposed = state_root(&state(&o));
+        assert_ne!(without_proposed, base);
+        assert_ne!(without_proposed, without_msg);
+        assert_ne!(without_proposed, without_op_reward);
     }
 
     #[test]

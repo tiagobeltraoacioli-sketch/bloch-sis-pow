@@ -232,15 +232,48 @@ pub struct SlashingOutcome {
     pub offense: SlashableOffense,
     /// Effective penalty after correlation amplification, in basis points.
     pub penalty_bps: u128,
-    /// Loss per delegation, aligned with the `delegations` slice passed in —
+    /// The operator's OWN loss: `own_bond_sat * penalty_bps / 10_000`. The
+    /// only slash proceeds this crate can prove were actually removed from a
+    /// real, spendable balance — see [`Self::whistleblower_reward_sat`].
+    pub operator_loss_sat: u128,
+    /// Loss per DELEGATION, aligned with the `delegations` slice passed to
+    /// [`SlashingState::process`] / [`SlashingState::process_proposer`] —
     /// pro-rata via [`apply_slash`], because delegators sharing the downside
     /// is what makes delegation a security signal (delegation.rs rule 3).
+    /// Does **not** include the operator's own bond any more (R1 H4) — that
+    /// is [`Self::operator_loss_sat`], reported separately, because the two
+    /// are backed by different things: the operator's loss is debited from
+    /// `ValidatorRecord::staked_sat` the instant this outcome is applied, and
+    /// the delegator losses are recorded in a ledger
+    /// (`CommittedState::delegator_slash_losses`) that nothing yet enforces
+    /// against a spendable balance or against consensus weight (there is no
+    /// withdrawal path — R7 M4 — and a delegation's own `amount_sat` is never
+    /// mutated by a slash).
     pub delegation_losses_sat: Vec<u128>,
-    /// Sum of all losses — the amount burned plus the whistleblower cut.
+    /// Sum of every loss — the operator's own plus every delegation's —
+    /// reported for observability (correlation-window accounting reads it).
+    /// **Not** the basis for [`Self::whistleblower_reward_sat`]; see R1 H4.
     pub total_slashed_sat: u128,
-    /// `total / 32`, owed to `including_proposer`. A validator reporting its
-    /// own offence just nets 31/32 of the penalty — still a penalty — so
-    /// self-reporting needs no special case.
+    /// `operator_loss_sat / 32`, owed to `including_proposer`.
+    ///
+    /// # R1 H4 — priced from what was ACTUALLY deducted, not from the total
+    ///
+    /// This crate's earlier form paid `(operator_loss + Σ delegation_losses) /
+    /// 32`. That over-credits: the operator's loss is a real debit against
+    /// `ValidatorRecord::staked_sat`, applied the moment this outcome is
+    /// used, but the delegator losses are only a LEDGER entry
+    /// (`CommittedState::delegator_slash_losses`) — nothing in this crate
+    /// enforces it against a spendable balance or against the delegation's
+    /// own consensus weight, because there is no withdrawal transaction yet
+    /// (R7 M4) and a slash never mutates `Delegation::amount_sat`. Paying the
+    /// whistleblower out of value that has not actually left the live,
+    /// weight-bearing economy is a mint: `pending_fee_rewards` grows by more
+    /// than any real balance shrinks. Bounding the reward to the operator's
+    /// own (truly debited) loss keeps the credit no larger than what this
+    /// transition actually destroys, invariant: `whistleblower_reward_sat <=
+    /// operator_loss_sat` always (checked by a `debug_assert!` at the
+    /// construction site, and true by construction here since it is an
+    /// integer division of that same quantity).
     pub whistleblower_reward_sat: u128,
     /// The proposer that included the evidence, echoed back so the caller
     /// credits the right account.
@@ -347,10 +380,12 @@ impl SlashingState {
     /// combined, so garbage must die before reaching them. Replay is checked
     /// before ejection so a resubmitted evidence is reported as the replay it
     /// is, not as a fresh offence against an ejected validator.
+    #[allow(clippy::too_many_arguments)]
     pub fn process(
         &mut self,
         evidence: &SlashingEvidence,
         epoch: u64,
+        own_bond_sat: u128,
         delegations: &[Delegation],
         total_active_sat: u128,
         including_proposer: u32,
@@ -397,6 +432,7 @@ impl SlashingState {
             validator,
             offense,
             epoch,
+            own_bond_sat,
             delegations,
             total_active_sat,
             including_proposer,
@@ -425,6 +461,7 @@ impl SlashingState {
         first: &ProposalEnvelope,
         second: &ProposalEnvelope,
         epoch: u64,
+        own_bond_sat: u128,
         delegations: &[Delegation],
         total_active_sat: u128,
         including_proposer: u32,
@@ -486,6 +523,7 @@ impl SlashingState {
             validator,
             SlashableOffense::ProposerEquivocation,
             epoch,
+            own_bond_sat,
             delegations,
             total_active_sat,
             including_proposer,
@@ -504,6 +542,7 @@ impl SlashingState {
         validator: u32,
         offense: SlashableOffense,
         epoch: u64,
+        own_bond_sat: u128,
         delegations: &[Delegation],
         total_active_sat: u128,
         including_proposer: u32,
@@ -511,14 +550,36 @@ impl SlashingState {
         // 5. Price the offence from the window as it stood before this slash.
         let penalty_bps = self.penalty_bps(offense.base_penalty_bps(), epoch, total_active_sat);
 
-        // 6. Burn pro-rata across the operator's delegators.
+        // 6. Burn pro-rata across the operator's delegators, and separately
+        //    across the operator's own bond — `own_bond_sat` is priced by the
+        //    same `penalty_bps`, but kept OUT of `apply_slash`'s delegation
+        //    vector (R1 H4): the two losses are backed by different things,
+        //    see `SlashingOutcome::delegation_losses_sat`'s docs, and
+        //    conflating them into one total is exactly the mistake that let
+        //    the whistleblower reward outrun what a slash actually destroys.
+        let operator_loss_sat = own_bond_sat.saturating_mul(penalty_bps.min(10_000)) / 10_000;
         let delegation_losses_sat = apply_slash(delegations, validator, penalty_bps);
-        let total_slashed_sat: u128 = delegation_losses_sat.iter().sum();
-        let whistleblower_reward_sat = total_slashed_sat / WHISTLEBLOWER_QUOTIENT;
+        let total_slashed_sat: u128 =
+            operator_loss_sat.saturating_add(delegation_losses_sat.iter().sum());
+        // R1 H4: reward the whistleblower ONLY out of the operator's own
+        // loss — the one component of `total_slashed_sat` this transition
+        // actually removes from a real, spendable balance
+        // (`ValidatorRecord::staked_sat`) rather than merely recording in a
+        // not-yet-enforced ledger. See `SlashingOutcome::whistleblower_reward_sat`.
+        let whistleblower_reward_sat = operator_loss_sat / WHISTLEBLOWER_QUOTIENT;
+        debug_assert!(
+            whistleblower_reward_sat <= operator_loss_sat,
+            "R1 H4 invariant: the whistleblower reward must never exceed the stake actually \
+             deducted from the offender's own bond ({whistleblower_reward_sat} > {operator_loss_sat})",
+        );
 
         // 7. Commit: mark the evidence spent, eject the validator, feed the
         //    window so the *next* correlated offence costs more, and prune
-        //    entries the window can no longer see (bounded state).
+        //    entries the window can no longer see (bounded state). The
+        //    correlation window is still fed the FULL total — correlation
+        //    amplification prices how much stake was put at risk across the
+        //    network, which is the pro-rata sum, not only what this crate can
+        //    prove was already debited.
         self.applied.insert(id);
         self.ejected.insert(validator);
         *self.window.entry(epoch).or_insert(0) += total_slashed_sat;
@@ -528,6 +589,7 @@ impl SlashingState {
         SlashingOutcome {
             offense,
             penalty_bps,
+            operator_loss_sat,
             delegation_losses_sat,
             total_slashed_sat,
             whistleblower_reward_sat,
@@ -611,14 +673,14 @@ mod tests {
         ev.second.signature = vec![0u8; 32]; // not the signing root: forged
         let mut st = SlashingState::new();
         let dels = [delegation(1, 7, 100_000)];
-        let r = st.process(&ev, 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey);
+        let r = st.process(&ev, 10, 0, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey);
         assert_eq!(r.unwrap_err(), EvidenceError::BadSignature);
         assert!(!st.is_ejected(7));
         assert_eq!(st.slashed_in_window(10), 0);
         // The forged submission must not have burned the id: the honest
         // version of the same evidence still applies.
         let ok = double_vote(7);
-        assert!(st.process(&ok, 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey).is_ok());
+        assert!(st.process(&ok, 10, 0, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey).is_ok());
     }
 
     #[test]
@@ -628,7 +690,7 @@ mod tests {
             second: signed(8, data(1, 2, 0xBB)),
         };
         let mut st = SlashingState::new();
-        let r = st.process(&ev, 10, &[], TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey);
+        let r = st.process(&ev, 10, 0, &[], TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey);
         assert_eq!(r.unwrap_err(), EvidenceError::DifferentValidators);
     }
 
@@ -657,7 +719,7 @@ mod tests {
             delegation(3, 8, 600_000), // other validator: untouched
         ];
         let mut st = SlashingState::new();
-        let out = st.process(&double_vote(7), 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey).unwrap();
+        let out = st.process(&double_vote(7), 10, 0, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey).unwrap();
         assert_eq!(out.offense, SlashableOffense::DoubleVote);
         assert_eq!(out.penalty_bps, 500); // empty window: base only
         assert_eq!(out.delegation_losses_sat, vec![5_000, 15_000, 0]); // 5% each
@@ -678,13 +740,49 @@ mod tests {
     }
 
     #[test]
-    fn whistleblower_gets_one_thirty_second() {
+    fn whistleblower_gets_one_thirty_second_of_the_operators_own_loss() {
+        // own_bond_sat is reported and priced SEPARATELY from the delegation
+        // vector now (R1 H4) — see `SlashingOutcome::operator_loss_sat`.
+        let own_bond_sat = 640_000;
         let dels = [delegation(1, 7, 640_000)];
         let mut st = SlashingState::new();
-        let out = st.process(&double_vote(7), 10, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey).unwrap();
-        assert_eq!(out.total_slashed_sat, 32_000); // 5% of 640k
-        assert_eq!(out.whistleblower_reward_sat, 1_000); // exactly 1/32
+        let out = st
+            .process(&double_vote(7), 10, own_bond_sat, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey)
+            .unwrap();
+        assert_eq!(out.operator_loss_sat, 32_000); // 5% of the operator's own 640k
+        assert_eq!(out.delegation_losses_sat, vec![32_000]); // 5% of the delegator's 640k
+        assert_eq!(out.total_slashed_sat, 64_000); // both losses summed
+        assert_eq!(out.whistleblower_reward_sat, 1_000); // 1/32 of the OPERATOR's loss only
         assert_eq!(out.including_proposer, 42);
+    }
+
+    /// R1 H4 regression. Before the fix, the reward was `(operator_loss +
+    /// Σ delegation_losses) / 32` — priced off the delegator ledger too, even
+    /// though nothing in this crate enforces that ledger against a spendable
+    /// balance (there is no withdrawal transaction yet — R7 M4) or against the
+    /// delegation's own consensus weight (a slash never mutates
+    /// `Delegation::amount_sat`). A small operator bond behind a much larger
+    /// delegated position is exactly where that over-credit is largest.
+    /// Reverting the fix (pricing the reward off `total_slashed_sat` again)
+    /// turns this red: the old formula pays 5,001 sat here, 100x the
+    /// operator's own loss.
+    #[test]
+    fn whistleblower_reward_never_exceeds_the_operators_own_deducted_stake() {
+        let own_bond_sat = 1_000; // a small operator bond ...
+        let dels = [delegation(1, 7, 3_200_000)]; // ... behind a much larger delegated position
+        let mut st = SlashingState::new();
+        let out = st
+            .process(&double_vote(7), 10, own_bond_sat, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey)
+            .unwrap();
+        assert_eq!(out.operator_loss_sat, 50); // 5% of 1,000
+        assert_eq!(out.delegation_losses_sat, vec![160_000]); // 5% of 3,200,000
+        assert_eq!(out.total_slashed_sat, 160_050);
+        assert_eq!(out.whistleblower_reward_sat, 1); // 50 / 32, floored -- NOT 160_050 / 32 = 5_001
+        assert!(
+            out.whistleblower_reward_sat <= out.operator_loss_sat,
+            "R1 H4: the whistleblower must never be paid more than the stake actually \
+             deducted from the offender's own bond"
+        );
     }
 
     #[test]
@@ -694,11 +792,11 @@ mod tests {
         // pays 500 + 3 × 10000 × 15000/1000000 = 950 bps, not 500.
         let dels = [delegation(1, 7, 300_000), delegation(2, 8, 100_000)];
         let mut st = SlashingState::new();
-        let first = st.process(&double_vote(7), 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey).unwrap();
+        let first = st.process(&double_vote(7), 10, 0, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey).unwrap();
         assert_eq!(first.penalty_bps, 500);
         assert_eq!(first.total_slashed_sat, 15_000);
 
-        let second = st.process(&double_vote(8), 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey).unwrap();
+        let second = st.process(&double_vote(8), 10, 0, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey).unwrap();
         assert_eq!(second.penalty_bps, 950);
         assert!(second.penalty_bps > first.penalty_bps);
         assert_eq!(second.total_slashed_sat, 9_500); // 9.5% of 100k
@@ -718,7 +816,7 @@ mod tests {
     fn slashes_outside_the_window_stop_amplifying() {
         let dels = [delegation(1, 7, 300_000), delegation(2, 8, 100_000)];
         let mut st = SlashingState::new();
-        st.process(&double_vote(7), 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey).unwrap();
+        st.process(&double_vote(7), 10, 0, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey).unwrap();
         // Just inside the window: still amplified.
         let inside = 10 + CORRELATION_WINDOW_EPOCHS - 1;
         assert_eq!(st.penalty_bps(500, inside, TOTAL_ACTIVE), 950);
@@ -731,14 +829,14 @@ mod tests {
         let dels = [delegation(1, 7, 100_000)];
         let mut st = SlashingState::new();
         let ev = double_vote(7);
-        st.process(&ev, 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey).unwrap();
+        st.process(&ev, 10, 0, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey).unwrap();
 
-        let replay = st.process(&ev, 11, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey);
+        let replay = st.process(&ev, 11, 0, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey);
         assert_eq!(replay.unwrap_err(), EvidenceError::AlreadyApplied);
 
         // Swapping first/second must not mint a fresh identity.
         let swapped = SlashingEvidence { first: ev.second.clone(), second: ev.first.clone() };
-        let r = st.process(&swapped, 11, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey);
+        let r = st.process(&swapped, 11, 0, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey);
         assert_eq!(r.unwrap_err(), EvidenceError::AlreadyApplied);
 
         // And the window recorded the slash exactly once.
@@ -749,13 +847,13 @@ mod tests {
     fn an_ejected_validator_is_not_punished_again() {
         let dels = [delegation(1, 7, 100_000)];
         let mut st = SlashingState::new();
-        st.process(&double_vote(7), 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey).unwrap();
+        st.process(&double_vote(7), 10, 0, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey).unwrap();
 
         // Genuinely different evidence (a surround, new messages) against the
         // same validator: rejected, and neither delegators nor the window are
         // touched a second time.
         let other = surround(7);
-        let r = st.process(&other, 11, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey);
+        let r = st.process(&other, 11, 0, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey);
         assert_eq!(r.unwrap_err(), EvidenceError::AlreadySlashed);
         assert_eq!(st.slashed_in_window(11), 5_000);
     }
@@ -787,16 +885,21 @@ mod tests {
 
     #[test]
     fn proposer_equivocation_slashes_and_ejects() {
+        let own_bond_sat = 100_000;
         let dels = [delegation(1, 7, 100_000), delegation(2, 8, 100_000)];
         let (a, b) = (signed_header(5, 7, 0xAA), signed_header(5, 7, 0xBB));
         let mut st = SlashingState::new();
         let out = st
-            .process_proposer(&a, &b, 10, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey)
+            .process_proposer(&a, &b, 10, own_bond_sat, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey)
             .unwrap();
         assert_eq!(out.offense, SlashableOffense::ProposerEquivocation);
         assert_eq!(out.penalty_bps, SLASH_PROPOSER_EQUIV_BPS); // empty window: base only
+        assert_eq!(out.operator_loss_sat, 5_000); // 5% of the operator's own 100k
         assert_eq!(out.delegation_losses_sat, vec![5_000, 0]); // validator 8 untouched
-        assert_eq!(out.whistleblower_reward_sat, out.total_slashed_sat / WHISTLEBLOWER_QUOTIENT);
+        assert_eq!(out.total_slashed_sat, 10_000); // operator loss + delegator loss
+        // R1 H4: 1/32 of the OPERATOR's own loss only, not of the total.
+        assert_eq!(out.whistleblower_reward_sat, out.operator_loss_sat / WHISTLEBLOWER_QUOTIENT);
+        assert_eq!(out.whistleblower_reward_sat, 156);
         assert!(st.is_ejected(7));
         assert!(!st.is_ejected(8));
     }
@@ -806,7 +909,7 @@ mod tests {
         // Re-gossiping your own block must never be punishable.
         let a = signed_header(5, 7, 0xAA);
         let mut st = SlashingState::new();
-        let r = st.process_proposer(&a, &a.clone(), 10, &[], TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey);
+        let r = st.process_proposer(&a, &a.clone(), 10, 0, &[], TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey);
         assert_eq!(r.unwrap_err(), EvidenceError::NotConflicting);
     }
 
@@ -815,7 +918,7 @@ mod tests {
         // One proposer legitimately proposes in many slots over time.
         let (a, b) = (signed_header(5, 7, 0xAA), signed_header(6, 7, 0xBB));
         let mut st = SlashingState::new();
-        let r = st.process_proposer(&a, &b, 10, &[], TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey);
+        let r = st.process_proposer(&a, &b, 10, 0, &[], TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey);
         assert_eq!(r.unwrap_err(), EvidenceError::NotConflicting);
     }
 
@@ -826,13 +929,13 @@ mod tests {
         b.proposer_sig = vec![0u8; 32]; // not the signing root: forged
         let dels = [delegation(1, 7, 100_000)];
         let mut st = SlashingState::new();
-        let r = st.process_proposer(&a, &b, 10, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey);
+        let r = st.process_proposer(&a, &b, 10, 0, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey);
         assert_eq!(r.unwrap_err(), EvidenceError::BadSignature);
         assert!(!st.is_ejected(7));
         assert_eq!(st.slashed_in_window(10), 0);
         // The honest version of the same pair still applies.
         let b_ok = signed_header(5, 7, 0xBB);
-        assert!(st.process_proposer(&a, &b_ok, 10, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey).is_ok());
+        assert!(st.process_proposer(&a, &b_ok, 10, 0, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey).is_ok());
     }
 
     #[test]
@@ -840,8 +943,8 @@ mod tests {
         let dels = [delegation(1, 7, 100_000)];
         let (a, b) = (signed_header(5, 7, 0xAA), signed_header(5, 7, 0xBB));
         let mut st = SlashingState::new();
-        st.process_proposer(&a, &b, 10, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey).unwrap();
-        let r = st.process_proposer(&b, &a, 11, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey);
+        st.process_proposer(&a, &b, 10, 0, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey).unwrap();
+        let r = st.process_proposer(&b, &a, 11, 0, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey);
         assert_eq!(r.unwrap_err(), EvidenceError::AlreadyApplied);
         assert_eq!(st.slashed_in_window(11), 5_000); // recorded exactly once
     }
@@ -852,9 +955,9 @@ mod tests {
         // later proposer-equivocation evidence — the stake was already burned.
         let dels = [delegation(1, 7, 100_000)];
         let mut st = SlashingState::new();
-        st.process(&double_vote(7), 10, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey).unwrap();
+        st.process(&double_vote(7), 10, 0, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey).unwrap();
         let (a, b) = (signed_header(5, 7, 0xAA), signed_header(5, 7, 0xBB));
-        let r = st.process_proposer(&a, &b, 11, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey);
+        let r = st.process_proposer(&a, &b, 11, 0, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier, &AnyKey);
         assert_eq!(r.unwrap_err(), EvidenceError::AlreadySlashed);
         assert_eq!(st.slashed_in_window(11), 5_000);
     }
@@ -868,7 +971,7 @@ mod tests {
         tainted.eligible = false;
         let dels = [delegation(1, 7, 100_000), tainted];
         let mut st = SlashingState::new();
-        let out = st.process(&double_vote(7), 10, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey).unwrap();
+        let out = st.process(&double_vote(7), 10, 0, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier, &AnyKey).unwrap();
         assert_eq!(out.delegation_losses_sat, vec![5_000, 0]);
     }
 }

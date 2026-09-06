@@ -881,6 +881,164 @@ pub mod rehearsal {
         Restore(prev)
     }
 
+    thread_local! {
+        static ATTESTATION_DEDUP_GATE_OPEN_TL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Test-only: treat [`super::ATTESTATION_DEDUP_ACTIVATION_EPOCH`] as
+    /// already bound.
+    ///
+    /// Its own switch, NOT folded into `GATES_OPEN`, for the same reason the
+    /// dust and tx-bytes gates have theirs: this gate's inert value selects
+    /// the OLD (duplicate-tolerant) rule, so folding it into `GATES_OPEN`
+    /// would silently tighten body validity inside every test that only
+    /// wanted the post-ancestry-seed roster. Default CLOSED: an unadorned
+    /// `cargo test` runs the fleet's rules; tests of the tightened rule opt
+    /// in.
+    pub fn attestation_dedup_gate_forced_open() -> bool {
+        ATTESTATION_DEDUP_GATE_OPEN_TL.with(|c| c.get())
+    }
+
+    /// Opens the attestation-dedup gate for this thread until the guard
+    /// drops, including on unwind, so a failing assertion cannot leave body
+    /// validity tightened for the rest of the thread.
+    pub fn attestation_dedup_gate_open_guard() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                ATTESTATION_DEDUP_GATE_OPEN_TL.with(|c| c.set(self.0));
+            }
+        }
+        let prev = ATTESTATION_DEDUP_GATE_OPEN_TL.with(|c| c.replace(true));
+        Restore(prev)
+    }
+
+    thread_local! {
+        static REWARDS_V2_GATE_OPEN_TL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Test-only: treat [`super::REWARDS_V2_ACTIVATION_EPOCH`] as already
+    /// bound.
+    ///
+    /// Its own switch, NOT folded into `GATES_OPEN`, for the same reason the
+    /// fee-stake-decouple gate has one: the leak-era tests that open
+    /// `GATES_OPEN` pin issuance figures computed under the OLD reward rules,
+    /// and silently switching the credit/basis/delegator-split rules inside
+    /// them would turn every one into a fixture lying about the chain it
+    /// models. Default CLOSED: an unadorned `cargo test` runs the fleet's
+    /// rules; tests of rewards v2 opt in here and nowhere else.
+    pub fn rewards_v2_gate_forced_open() -> bool {
+        REWARDS_V2_GATE_OPEN_TL.with(|c| c.get())
+    }
+
+    /// Opens the rewards-v2 gate for this thread until the guard drops,
+    /// including on unwind, so a failing assertion cannot leave the reward
+    /// rules mutated for the rest of the thread.
+    pub fn rewards_v2_gate_open_guard() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                REWARDS_V2_GATE_OPEN_TL.with(|c| c.set(self.0));
+            }
+        }
+        let prev = REWARDS_V2_GATE_OPEN_TL.with(|c| c.replace(true));
+        Restore(prev)
+    }
+
+    thread_local! {
+        static STAKING_TX_METERING_GATE_OPEN_TL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Test-only: treat [`super::STAKING_TX_METERING_ACTIVATION_EPOCH`] as
+    /// already bound.
+    ///
+    /// Its own switch for the `dust_gate_forced_open` reason: the gate's
+    /// inert value keeps staking transactions FREE and
+    /// `MAX_TRANSACTIONS_PER_BLOCK` unconsulted (today's fleet configuration),
+    /// so an unadorned `cargo test` must exercise exactly that, and tests of
+    /// the post-flag-day metering opt in.
+    pub fn staking_tx_metering_gate_forced_open() -> bool {
+        STAKING_TX_METERING_GATE_OPEN_TL.with(|c| c.get())
+    }
+
+    /// Opens the staking-tx-metering gate for this thread until the guard
+    /// drops, including on unwind, so a failing assertion cannot leave the
+    /// fee rules mutated for the rest of the thread.
+    pub fn staking_tx_metering_gate_open_guard() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                STAKING_TX_METERING_GATE_OPEN_TL.with(|c| c.set(self.0));
+            }
+        }
+        let prev = STAKING_TX_METERING_GATE_OPEN_TL.with(|c| c.replace(true));
+        Restore(prev)
+    }
+
+    thread_local! {
+        static WITHDRAWAL_GATE_OPEN_TL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Test-only: treat [`super::WITHDRAWAL_ACTIVATION_EPOCH`] as already
+    /// bound.
+    ///
+    /// Kept for symmetry with every other gate even though — see that
+    /// constant's docs — nothing reads this switch today: there is no
+    /// `Withdraw` transaction to un-refuse, only the orphaned predicate
+    /// [`crate::transition::CommittedState::withdrawal_active`], forcing
+    /// which open changes no observable behaviour anywhere in this crate
+    /// yet. Not folded into `GATES_OPEN`, matching every other gate's own
+    /// switch, so that the day this IS wired the same isolation applies
+    /// without a second decision.
+    pub fn withdrawal_gate_forced_open() -> bool {
+        WITHDRAWAL_GATE_OPEN_TL.with(|c| c.get())
+    }
+
+    /// Opens the withdrawal gate for this thread until the guard drops,
+    /// including on unwind, so a failing assertion cannot leave the
+    /// withdrawal rules mutated for the rest of the thread.
+    pub fn withdrawal_gate_open_guard() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                WITHDRAWAL_GATE_OPEN_TL.with(|c| c.set(self.0));
+            }
+        }
+        let prev = WITHDRAWAL_GATE_OPEN_TL.with(|c| c.replace(true));
+        Restore(prev)
+    }
+
+    thread_local! {
+        static SIGHASH_NETWORK_BINDING_GATE_OPEN_TL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Test-only: treat [`super::SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH`]
+    /// as already bound.
+    ///
+    /// Its own switch, NOT folded into `GATES_OPEN`: this gate's inert value
+    /// keeps every existing KAT root computed under the OLD, unbound
+    /// `DS_SPEND` fold, so folding it into `GATES_OPEN` would silently change
+    /// every signing root pinned by every OTHER test in the crate that
+    /// spends anything. Default CLOSED: an unadorned `cargo test` runs the
+    /// fleet's rules; tests of the network-bound fold opt in.
+    pub fn sighash_network_binding_gate_forced_open() -> bool {
+        SIGHASH_NETWORK_BINDING_GATE_OPEN_TL.with(|c| c.get())
+    }
+
+    /// Opens the sighash-network-binding gate for this thread until the
+    /// guard drops, including on unwind, so a failing assertion cannot leave
+    /// the signing-root fold mutated for the rest of the thread.
+    pub fn sighash_network_binding_gate_open_guard() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                SIGHASH_NETWORK_BINDING_GATE_OPEN_TL.with(|c| c.set(self.0));
+            }
+        }
+        let prev = SIGHASH_NETWORK_BINDING_GATE_OPEN_TL.with(|c| c.replace(true));
+        Restore(prev)
+    }
+
     /// Serializes every test that flips a switch in this module. The switches
     /// are process-global and `cargo test` runs test functions on threads, so
     /// without this a mutation test would silently corrupt an unrelated one.
@@ -1370,6 +1528,287 @@ pub const RANDAO_RECOMMIT_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// `u64::MAX`; `tx_bytes_bound_gate_is_inert` pins the value.
 pub const TX_BYTES_BOUND_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+/// Flag day for refusing a **duplicate** `(validator, signing_root)`
+/// attestation pair within one block body (audit R3 M-2, 2026-09-06).
+/// `u64::MAX` = INERT: no epoch reaches it, so on every node running this
+/// crate today a body carrying the same pair twice is accepted exactly as it
+/// always has been — the second copy simply overwrites the same
+/// `pending_votes` entry and the same participation bit the first wrote,
+/// which is idempotent, not illegal.
+///
+/// # The defect this closes, and why it needed a gate at all
+///
+/// Commit `02fdbd5` (§ step 8 of `Transition::apply_block`) added a
+/// consensus-level refusal of a duplicate pair, ungated, alongside the
+/// (correctly ungated) hoist of the epoch partition out of the
+/// per-attestation loop and the (correctly ungated)
+/// [`MAX_ATTESTATIONS_PER_BLOCK`] cap. The cap is provably a no-op on every
+/// historical block (see that constant's docs: it equals the wire decoder's
+/// own pre-existing bound). **The duplicate refusal carries no such proof.**
+/// It rejects a BODY SHAPE — two identical `(validator, signing_root)`
+/// entries — that nothing before `02fdbd5` ever forbade in consensus; the
+/// argument for its safety rests entirely on "the reference producer's
+/// mempool is keyed so it cannot build one", which is a fact about ONE
+/// implementation's admission policy, not a consensus rule, and not
+/// something this crate can verify against the actual historical block log
+/// the way the cap's argument can be checked against the decoder's own
+/// constant. A hand-built body, a different producer, or a future codec
+/// change could carry a duplicate that an un-gated rule newly rejects,
+/// forking a mixed fleet exactly the way every other gate in this file
+/// exists to prevent.
+///
+/// # What the gate switches at one epoch
+///
+/// - **below** (every epoch today): a body carrying the same `(validator,
+///   signing_root)` pair twice is accepted, byte for byte as before
+///   `02fdbd5` — the second copy is idempotent, not rejected;
+/// - **at and above**: [`crate::interfaces::TransitionError::DuplicateAttestation`]
+///   refuses the block, exactly as `02fdbd5` shipped it.
+///
+/// The gate reads `CommittedState::epoch` — committed state rolled to the
+/// judged block's own `epoch_of(header.slot)`, never a clock. The 2026-08-08
+/// `expected_bits` fork is the standing reason.
+///
+/// # ARMING THIS IS A FOUNDER DECISION
+///
+/// It is a flag day like every other tightening in this file: the whole
+/// fleet must run a binary carrying this rule before any epoch is named.
+/// Ships INERT at `u64::MAX`; `attestation_dedup_gate_is_inert` pins the
+/// value.
+pub const ATTESTATION_DEDUP_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Flag day for **rewards v2** (audit R1 M1 + M3 + M4, R7 M5, 2026-09-06):
+/// one constant, four rules that all change committed state and therefore
+/// cannot ship enabled on a mixed fleet. `u64::MAX` = INERT: below it every
+/// rule is byte-for-byte the chain as it stands today.
+///
+/// 1. **Participation credit is scoped to what can actually justify (R1
+///    M1).** Below the gate `process_epoch`'s only epoch check on an
+///    attestation is `epoch_of(att.data.slot) == st.epoch`; nothing requires
+///    `att.data.target_epoch == st.epoch` or `att.data.source_epoch` to name
+///    the CURRENT justified checkpoint, and a validator with two DISTINCT
+///    signing roots in the epoch (an in-block equivocator, caught by
+///    [`SLASHING_EVIDENCE_ACTIVATION_EPOCH`] once THAT arms, not by the
+///    reward pass) still earns full credit for whichever landed last. At and
+///    above the gate, `close_epoch`'s credit loop additionally requires the
+///    target/source binding and withholds credit from a two-signing-root
+///    validator.
+/// 2. **Issuance basis reads the LEAK-ADJUSTED roster (R1 M3).** Below the
+///    gate the issuance loop prices every validator's share off
+///    `duty_roster_at` — the same roster [`LEAKED_ROSTER_ACTIVATION_EPOCH`]
+///    deliberately does NOT touch, because `consensus_roster_at` (leaked) is
+///    reserved for the proposer draw and the committee partition. That
+///    reservation is right for WEIGHT but wrong for INCOME: it means the
+///    leak costs a validator its committee seat's weight and its proposer
+///    slots but not one satoshi of issuance, so a fully-leaked, absent
+///    validator earns exactly as much as a fully-present one. At and above
+///    the gate, the issuance loop's stake basis is `consensus_roster_at`
+///    instead — the same roster the proposer draw already reads, so a
+///    leaked validator's income shrinks with its weight.
+/// 3. **Delegators earn their pro-rata share of issuance (R1 M4).** Below the
+///    gate `close_epoch` calls `rewards::distribute` with `delegated_stake:
+///    0, commission_bps: 0` hard-coded, so `Payout::delegators` is always
+///    zero and 100% of issuance compounds into the operator's own bond —
+///    correct arithmetic fed a wrong question. At and above the gate the
+///    call carries the REAL delegated stake (activated satoshis,
+///    [`crate::delegation::Registry::activated_sat`]) and the operator's
+///    commission, and `Payout::delegators` settles into a new committed
+///    ledger, [`crate::transition::CommittedState::delegator_issuance_rewards`]
+///    — the issuance mirror of the fee path's `delegator_fee_rewards`,
+///    contributing ZERO SMT leaves while empty (every writer is behind this
+///    gate) and reachable through its own fresh state-root tag,
+///    `state_root::TAG_DELEGATOR_ISSUANCE_REWARD`, which does not alias any
+///    tag `0x00..=0x17` already assigned.
+/// 4. **Block production earns a measurable slice of the epoch's credit (R7
+///    M5).** Below the gate a validator's credit is 1 bit — did its vote
+///    land — regardless of whether it produced every block it was
+///    scheduled for; `beacon.rs`'s "withholding is priced at the cost of the
+///    forfeited proposer reward" argument does not hold on THIS chain,
+///    because there is no separate proposer reward to forfeit. At and above
+///    the gate, a validator's `max_credits` also counts the epoch's slots it
+///    was SCHEDULED to propose (`schedule::proposer` over the closing
+///    epoch's own seed and roster — the same draw `apply_block`'s step 7
+///    already re-derives to check the header, so this adds no new trust
+///    input) and its `credits` counts how many of those it actually
+///    produced, so a withheld proposal forfeits a real, measurable slice of
+///    that epoch's issuance rather than nothing.
+///
+/// # Why one constant for four rules
+///
+/// All four touch the same loop (`close_epoch`'s issuance pass) and the same
+/// committed quantities (`current_participation`, `issued_sat`,
+/// `ValidatorRecord::staked_sat`); arming them independently would let a
+/// fleet run some combination no one designed or tested, and — per the same
+/// argument [`EXIT_AUTH_ACTIVATION_EPOCH`] and `DEPOSIT_ACTIVATION_EPOCH`
+/// give for their own pairing — every rule that changes issuance is one
+/// mixed-fleet fork waiting for one flag day, not several.
+///
+/// `rewards_v2_gate_is_inert` pins the value.
+pub const REWARDS_V2_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Flag day for **staking-transaction metering** (audit R7 M1, 2026-09-06):
+/// `u64::MAX` = INERT, below it every staking variant (`Deposit`, `Exit`,
+/// `Delegate`, `ExitV2`, `RandaoRecommit`, `SlashingEvidence`) is charged
+/// `fee_market::TxCharge { gas: 0, tx_bytes: 0, .. }` exactly as today, and
+/// no transaction-COUNT cap exists to consult (see "Not yet closed by this
+/// gate" below).
+///
+/// # The hole this closes
+///
+/// A body made entirely of staking transactions consumes zero of the block
+/// gas cap and zero of the block byte cap — real bytes (the wire decoder's
+/// own per-body limit is the only bound today) and real state (a `Deposit`
+/// inserts a 3,749-byte pubkey; every variant grows `pending_votes`-adjacent
+/// or registry-adjacent maps this crate must serialize into the state root
+/// on every later block) priced at nothing. Combined with
+/// [`MAX_EPOCH_ADVANCE`]'s docs on the wire decoder being the only bound on
+/// body length, a producer that ignores mempool policy (which already
+/// refuses most of these — see e.g. [`DEPOSIT_ACTIVATION_EPOCH`]'s docs on
+/// `admissible`) could build a body of thousands of these transactions for
+/// free.
+///
+/// # What the gate switches at one epoch
+///
+/// - **below**: unmetered, byte for byte the chain as it stands;
+/// - **at and above**: each staking variant (including `SlashingEvidence`)
+///   is charged `fee_market::intrinsic_gas` — flat overhead plus its own
+///   `canonical_bytes().len()` plus one `HYBRID_VERIFY_GAS` term per hybrid
+///   signature the arm actually verifies (reusing `TxClass::Eutxo{ inputs }`
+///   for the shape, since `fee_market` has no dedicated staking class and
+///   the cost SHAPE — flat + bytes + N verifications — is identical) — at
+///   the block's base fee like a transfer's gas component (no priority
+///   fee: nothing here names a tip, and none of these messages spend an
+///   eUTXO input to draw one from). Both existing per-block caps
+///   (`BlockGasLimitExceeded`, `BlockByteLimitExceeded`) already sum every
+///   transaction's charge (step 10b), so making this charge non-zero is
+///   what makes them bind on a staking-only body; no new cap is needed for
+///   that half.
+///
+/// **Not yet closed by this gate**: a consensus `MAX_TRANSACTIONS_PER_BLOCK`
+/// bound on transaction COUNT (of any kind), independent of the two byte/gas
+/// caps. That needs a new `TransitionError` variant, and `TransitionError`
+/// is defined in `interfaces.rs`, outside this pass's ownership; the
+/// metering half above is complete and gated, the count half is not — flagged
+/// here rather than silently dropped.
+///
+/// The gate reads `CommittedState::epoch` — committed state rolled to the
+/// judged block's own `epoch_of(header.slot)`, never a clock. The 2026-08-08
+/// `expected_bits` fork is the standing reason.
+///
+/// # ARMING THIS IS A FOUNDER DECISION
+///
+/// It is a flag day: the first post-gate block changes the verdict (a body
+/// the old rules accepted may now hit `BlockGasLimitExceeded` or
+/// `BlockByteLimitExceeded` on staking bytes alone) on a body the old rules
+/// accept, so the whole fleet must run a binary carrying this rule before
+/// any epoch is named. Ships INERT at `u64::MAX`;
+/// `staking_tx_metering_gate_is_inert` pins the value.
+pub const STAKING_TX_METERING_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Flag day for the **withdrawal transaction** (audit R7 M4, 2026-09-06).
+/// `u64::MAX` = INERT, and — unusually for this file — INERT is ALL this
+/// constant is today: there is no `PosTransaction::Withdraw` variant and no
+/// call site reads this gate. Recorded here rather than left undone.
+///
+/// # The hole this closes, and it is still open
+///
+/// `Exit`/`ExitV2` set `withdrawable_epoch`, that field is committed and
+/// hashed into the state root, and nothing has ever read it: every genesis
+/// bond (1,600,000 BLCH) and the entire validator emission this chain will
+/// ever mint (42.85% of total supply, minted directly into `staked_sat`,
+/// never into an eUTXO output) is permanently illiquid until a withdrawal
+/// path exists.
+///
+/// # Why this pass ships the gate but not the transaction, in two parts
+///
+/// 1. **The wire byte.** `PosTransaction`'s variant space is frozen by an
+///    EXHAUSTIVE match with no wildcard arm in the unowned
+///    `tests/wire_tag_registry.rs` (`frozen_variant_space`) — by design: its
+///    own doc comment records having verified that adding ANY new
+///    `PosTransaction` variant, under any name or byte, stops that file
+///    compiling with `error[E0004]`. `Withdraw` is additionally already a
+///    three-way live-branch naming collision in that file's own sweep
+///    (claimed at `0x07`, `0x08`, and `0x09` by different unmerged tips) —
+///    a second, independent reason the byte is the founder's to assign, not
+///    this pass's to guess around.
+/// 2. **The record itself has no field for it.** The type `CommittedState`
+///    actually stores per validator is `crate::interfaces::ValidatorRecord`
+///    (`activation_epoch`, `exit_epoch`, `withdrawable_epoch`,
+///    `staked_sat`, `withdrawal_credentials`, …) — and `interfaces.rs` is
+///    outside this pass's ownership. It has no `withdrawn` flag, so even
+///    with a byte in hand, marking a withdrawal PAID (so it cannot be
+///    replayed) would need a field this pass cannot add to the struct
+///    consensus actually reads.
+///
+/// [`crate::staking::validate_withdrawal`] and its own
+/// `crate::staking::ValidatorRecord` (a self-contained, fully-tested
+/// predicate — exited, past `withdrawable_epoch`, not already withdrawn —
+/// returning `(withdrawal_addr, amount_sat)`) exist as ready-made logic for
+/// whoever lands both of the above: they operate on staking.rs's OWN record
+/// shape, not on `interfaces::ValidatorRecord`, precisely because this pass
+/// cannot commit a `withdrawn` bit to the real one. Wiring them in means
+/// resolving (1) and (2) first, in a pass that owns `interfaces.rs` and
+/// `tests/wire_tag_registry.rs`.
+///
+/// # ARMING THIS IS A FOUNDER DECISION, AND IT HAS A PRECONDITION
+///
+/// This constant gates NOTHING today (see above) — arming it changes no
+/// behaviour on its own. Ships INERT at `u64::MAX`; `withdrawal_gate_is_inert`
+/// pins the value, and `the_withdrawal_gate_is_a_function_of_the_block_epoch_alone`
+/// pins the (currently orphaned) predicate against regressing before the
+/// day it is actually wired to a transaction arm.
+pub const WITHDRAWAL_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Flag day for **network-bound transfer signing** (audit A2-3 / R7 M2,
+/// 2026-09-06): `u64::MAX` = INERT, below it `DS_SPEND`'s preimage is
+/// unchanged and every signing root this crate has ever computed replays
+/// identically.
+///
+/// # The hole this closes
+///
+/// `DS_SPEND` is a PROTOCOL-VERSION tag, identical on every network built
+/// from this crate — no chain id, no genesis root, no nonce. A2 §3 argued
+/// cross-chain replay of ordinary transfers is blocked in practice because
+/// `parent`/`state_root`/`head` diverge across chains, but that argument
+/// does not reach a CARRYOVER outpoint: `Manifest::allocation_outputs`
+/// derives allocation txids as a pure function of the manifest, so any two
+/// networks opened from the same Genesis-3 snapshot share hundreds of
+/// thousands of IDENTICAL outpoints with identical `script_hash`es, and a
+/// transfer signed on one is byte-for-byte valid on the other for as long as
+/// the outpoint is unspent on both — the classic ETH/ETC replay shape,
+/// reachable by any contentious fork, testnet, or re-launch from the same
+/// carryover artifact.
+///
+/// # What the gate switches at one epoch
+///
+/// - **below**: `spend_signing_root`'s fold is unchanged — the same
+///   `(n_spends, spend points, outputs, tx_bytes, tip)` preimage under
+///   `DS_SPEND`, byte for byte;
+/// - **at and above**: the fold additionally covers a network-binding value
+///   (see [`crate::transition::PosTransaction::network_binding`]) under a NEW, distinct
+///   16-byte tag, `DS_SPEND2` (`b"BLCH4:SPEND2\0\0\0\0"` — not a prefix of
+///   `DS_SPEND` and not prefixed by it, since both are exactly 16 bytes with
+///   different content), so a signature becomes a statement about one
+///   transfer on ONE chain. V1 and V2 share the fold (one function, both
+///   callers), so `txid` — derived from the witness-free signing root —
+///   stays witness-free in both formats.
+///
+/// The gate reads `CommittedState::epoch` — committed state rolled to the
+/// judged block's own `epoch_of(header.slot)`, never a clock. The 2026-08-08
+/// `expected_bits` fork is the standing reason.
+///
+/// # ARMING THIS IS A FOUNDER DECISION, AND IT MUST BE ANNOUNCED
+///
+/// Unlike every other gate in this file, arming this one does not merely
+/// change which NEW transactions are valid — it changes the signing root of
+/// every UNSPENT output as of the flag day, invalidating any pre-signed
+/// transaction nobody has broadcast yet. It is a flag day in the same
+/// mixed-fleet sense as the others (the whole fleet must run a binary
+/// carrying the new fold first), plus a wallet-facing announcement the
+/// others do not need. Ships INERT at `u64::MAX`;
+/// `sighash_network_binding_gate_is_inert` pins the value.
+pub const SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH: u64 = u64::MAX;
+
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.
 pub const DS_SORTITION: [u8; 16] = *b"BLCH4:SORTIT\0\0\0\0";
@@ -1397,6 +1836,16 @@ pub const DS_DEPOSIT: [u8; 16] = *b"BLCH4:DEPOSIT\0\0\0";
 /// the outputs, the declared size and the tip — everything except the
 /// witnesses, which cannot be inside a root they are produced over.
 pub const DS_SPEND: [u8; 16] = *b"BLCH4:SPEND\0\0\0\0\0";
+/// The network-bound spend signing root domain (audit A2-3 / R7 M2), used
+/// once [`SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH`] binds instead of
+/// [`DS_SPEND`] — its own tag, not a suffix or a reuse of `DS_SPEND`'s bytes,
+/// because a fold under one domain must never collide with a fold under
+/// another even when one is a strict superset of the other's preimage
+/// fields (the same reasoning `DS_SPEND` itself documents). 16 bytes, and
+/// distinct from every other tag in this table at the twelfth byte
+/// (`'2'` vs `DS_SPEND`'s trailing `\0`), so neither can ever be mistaken
+/// for the other.
+pub const DS_SPEND2: [u8; 16] = *b"BLCH4:SPEND2\0\0\0\0";
 /// Transaction identity: `txid = SHA3-256(DS_TXID ‖ spend signing root)`.
 ///
 /// Derived from the witness-free signing root, so a transaction's id — and

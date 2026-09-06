@@ -604,6 +604,18 @@ pub fn resolve_activations(
     deposits: &[QueuedDeposit],
     epoch: u64,
 ) -> Vec<([u8; 32], u64)> {
+    // R1 M5 (perf, ungated, behaviour-identical): with an empty queue the
+    // loop below does exactly `epoch + 1` iterations of nothing — no `d` ever
+    // exists to admit, so `activated` stays empty on every path regardless of
+    // `epoch`. Short-circuiting is therefore not an approximation of the
+    // rule, it IS the rule for this input, computed without the O(epoch)
+    // walk: replay at today's epoch (~2,000+) pays that walk on every one of
+    // the (several) call sites in `close_epoch` for a chain whose deposit
+    // queue is provably empty (`DEPOSIT_ACTIVATION_EPOCH` is `u64::MAX`, so
+    // nothing has ever queued a deposit — see that constant's docs).
+    if deposits.is_empty() {
+        return Vec::new();
+    }
     let mut queue: Vec<&QueuedDeposit> = deposits.iter().collect();
     // Sorting here is what makes the result independent of slice order.
     queue.sort_by_key(|d| d.queue_key());

@@ -127,6 +127,10 @@ fn state<'a>(f: &'a Fixture, e: &'a [EutxoEntry]) -> ConsensusState<'a> {
         deposit_queue: &[],
         delegations: &[],
         pending_fees: &[],
+        // Round-4 REWARDS_V2 components (state_root.rs): empty until the gate arms,
+        // exactly as on every historical block this benchmark replays.
+        delegator_issuance_rewards: &[],
+        current_proposed: &[],
         taint_root: h32(101),
         coherence_accumulator_root: h32(102),
         coherence_nullifier_root: h32(103),
