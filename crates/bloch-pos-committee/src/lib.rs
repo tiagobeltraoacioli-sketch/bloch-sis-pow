@@ -128,7 +128,14 @@ pub mod perf;
 // shipped binary. Entry point: `scripts/prova-relanca.sh`.
 #[cfg(test)]
 mod prova;
-pub mod produce;
+// `pub mod produce;` stood here: a block-builder over a second, drifted
+// derivation of the state root and proposer schedule (`derive::ChainState`,
+// `derive::ParentState`, and the functions built on them). Deleted 2026-09-06
+// (R1 H3) — the comparison and the replay-safety argument are in `derive.rs`,
+// at the deletion site (search "deleted 2026-09-06, R1 H3"). No non-test
+// caller existed anywhere in the repository (verified by grepping `crates/`,
+// `tools/`, `legacy/`), the same standing `derive::validate_block` had when
+// it was deleted on 2026-08-12.
 pub mod tokenomics_v4;
 pub mod rewards;
 pub mod sample;
@@ -147,7 +154,22 @@ pub use gossip::{
     AttestationPool, BlockLookup, CommitteeLookup, GossipDecision, IgnoreReason,
     ATTESTATION_WINDOW_SLOTS, MAX_EQUIVOCATIONS_PER_DUTY, MAX_PENDING_ATTESTATIONS,
 };
-pub use params::{COMMITTEE_SIZE, RANDAO_CHAIN_LENGTH, SLOTS_PER_EPOCH, SLOT_SUBCOMMITTEE_SIZE};
+pub use params::{RANDAO_CHAIN_LENGTH, SLOTS_PER_EPOCH};
+// `COMMITTEE_SIZE` / `SLOT_SUBCOMMITTEE_SIZE` used to be re-exported flat here
+// too (R4 F-14). The live committee mechanism is the partition
+// (`committees.rs`, called from `transition.rs`), never the sampled draw
+// these two constants size — so flattening them into this crate's top-level
+// namespace, alongside the genuinely live constants above, invited exactly
+// the confusion F-14 named: a downstream caller reading
+// `bloch_pos_committee::COMMITTEE_SIZE` has no signal that it sizes a
+// superseded, non-consensus code path. They still exist — `params.rs` is not
+// this file's to edit — reachable at their real address,
+// `params::COMMITTEE_SIZE` / `params::SLOT_SUBCOMMITTEE_SIZE`, which at least
+// tells a reader where they come from. [`slot_subcommittee`] and
+// [`epoch_committee`] below are untouched: unlike this re-export, they are
+// still exercised by this crate's own committee/property test suite (not
+// merely reachable — actually reachable), so deleting them would be deleting
+// tested behaviour, not dead surface.
 pub use sample::{is_selected, sample, Role, Validator};
 pub use schedule::{epoch_schedule, proposer, EpochSchedule};
 pub use slashing::{
@@ -174,17 +196,27 @@ pub use fee_market::{
     MIN_BASE_FEE_MILLISAT_PER_GAS,
 };
 pub use finality::{EpochOutcome, EpochVotes, FinalityError};
-pub use produce::{produce, ProduceError, ProducerRandao, ProposerSigner};
 // `validate_block` used to be re-exported here. It was a second, uncalled
 // block validator; the node runs `transition::Transition::apply_block`, and
 // two validation stacks with divergent error orders is the condition that
 // produced this week's defects. Deleted 2026-08-12 — the comparison of the two
-// checklists is in `derive.rs` where the function stood. The derivations it
-// composed are still `pub` in `derive` and still shared with `produce`.
-pub use derive::{ChainState, ParentState, RandaoRejection};
+// checklists is in `derive.rs` where the function stood.
+//
+// `produce::{produce, ProduceError, ProducerRandao, ProposerSigner}` and
+// `derive::{ChainState, ParentState, RandaoRejection}` were re-exported here
+// too, on the claim that the derivations they composed were "still shared
+// with `produce`". R1 H3 (2026-09-06) found the sharing had already lapsed —
+// see `derive.rs` at "deleted 2026-09-06, R1 H3" for the comparison — so both
+// the module and these re-exports are gone with it.
 pub use transition::{CommittedState, GenesisValidator, PosTransaction, Transition};
 pub use ws::{
     accept, anchor, boot_decision, cross_check, genesis_anchor, reconcile, verify_envelope,
+    // NEW-2: `verify_envelope` alone never checks the signer set's shape
+    // against the release's §6 policy; this wraps it with that check,
+    // fail-closed and first. `ws_boot::boot` (bloch-pos-node, a different
+    // crate) should call this instead of `verify_envelope` directly — noted
+    // for whoever owns that file, since this crate cannot make it do so.
+    verify_envelope_with_shape_policy,
     Acceptance, BootDecision, CheckpointEnvelope, CrossCheck, EnvelopeOk, EnvelopeReject,
     Reconciliation, Signer, SignerSet, WeakSubjectivityCheckpoint, WS_FRESH_EPOCHS,
     WS_PERIOD_EPOCHS, WS_PUBLICATION_INTERVAL_EPOCHS,
@@ -235,12 +267,12 @@ pub use ws::{
 
 /// Draw the per-slot fork-choice subcommittee.
 pub fn slot_subcommittee(beacon_mix: &[u8; 32], slot: u64, validators: &[Validator]) -> Vec<u32> {
-    sample(beacon_mix, slot, Role::SlotSubcommittee, validators, SLOT_SUBCOMMITTEE_SIZE)
+    sample(beacon_mix, slot, Role::SlotSubcommittee, validators, params::SLOT_SUBCOMMITTEE_SIZE)
 }
 
 /// Draw the epoch finality committee.
 pub fn epoch_committee(beacon_mix: &[u8; 32], epoch: u64, validators: &[Validator]) -> Vec<u32> {
-    sample(beacon_mix, epoch, Role::EpochCommittee, validators, COMMITTEE_SIZE)
+    sample(beacon_mix, epoch, Role::EpochCommittee, validators, params::COMMITTEE_SIZE)
 }
 
 /// Epoch containing `slot`.

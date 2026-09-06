@@ -329,10 +329,13 @@ pub enum TransitionError {
     /// quorum the body carries.
     AttestationRootMismatch,
     /// Header `coherence_root` is not the §6.6.2 mirror binding of the
-    /// parent's **committed** accumulator and nullifier-set roots
-    /// (`derive::expected_coherence` — derived from parent state, which
-    /// carries the pool's roots unchanged; the pool itself is never
-    /// re-rooted, §6.6.1).
+    /// state's **committed** accumulator and nullifier-set roots
+    /// (`derive::coherence_binding`, called by `CommittedState::coherence_root`
+    /// over the roots the transition actually committed; the pool itself is
+    /// never re-rooted, §6.6.1). `derive::expected_coherence`, an older
+    /// wrapper of the same binding over a second, uncalled state
+    /// representation, was deleted 2026-09-06 (R1 H3) — the binding itself
+    /// did not move.
     CoherenceRootMismatch,
     /// The committed cumulative issuance would exceed the hard cap
     /// (`tokenomics_v4::TOTAL_SUPPLY_SAT`) — founder decision, 2026-08-12:

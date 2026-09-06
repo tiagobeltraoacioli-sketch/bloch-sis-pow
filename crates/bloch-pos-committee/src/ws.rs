@@ -414,6 +414,13 @@ pub enum EnvelopeReject {
     /// signature must verify — a mixture of valid and junk signatures is
     /// malformed, not "enough valid ones".
     BadSignature { index: u8 },
+    /// The signer set's own shape does not match the declared §6 policy
+    /// (NEW-2). Fail-closed *before* any signature runs: a set that does not
+    /// match its phase's `(threshold, n, min_external)` — or that could never
+    /// satisfy its own `min_external` even if every signer signed — makes
+    /// every subsequent check meaningless, whether the mismatch under- or
+    /// over-shoots the policy.
+    SignerSetShapeMismatch { threshold: usize, signers: usize, min_external: usize },
 }
 
 /// What a successful verification reports beyond "valid".
@@ -506,6 +513,61 @@ pub fn verify_envelope(
     }
 
     Ok(EnvelopeOk { arrangement_past_review: cp.epoch > set.review_deadline() })
+}
+
+/// [`verify_envelope`], with the §6 signer-set *shape* enforced first
+/// (NEW-2/A3-M6).
+///
+/// ## The gap this closes
+///
+/// `verify_envelope` checks an envelope against whatever `threshold` /
+/// `min_external` the supplied [`SignerSet`] **declares of itself**
+/// (`set.threshold`, `set.min_external`) — it has no opinion on whether that
+/// declaration matches the Phase-A/Phase-B policy this release ships
+/// ([`WS_PHASE_A_THRESHOLD`]/[`WS_PHASE_B_THRESHOLD`] etc.). [`SignerSet::
+/// matches_policy`] is the function that checks that, and before this fix it
+/// had no caller outside this module's own tests: `verify_envelope` alone
+/// would happily verify a checkpoint against a self-declared `1-of-1,
+/// min_external=0` arrangement — a single founder key — while the module's
+/// own docs promise "at least one external witness". It would also accept a
+/// set whose declared `min_external` no `external`-flagged signer could ever
+/// reach, which is not merely permissive but self-defeating: every envelope
+/// against such a set fails `ExternalQuorumNotReached` forever, and doing
+/// that check only after signatures start arriving turns a release-time
+/// configuration bug into a silent, un-diagnosable boot failure in the field.
+///
+/// ## Fail-closed, cheapest-first
+///
+/// The shape check runs BEFORE `verify_envelope` — before the version,
+/// network, genesis-root and quorum checks, all of which are cheaper still,
+/// but none of which can be trusted to mean anything against a set that does
+/// not match its own policy. A shape mismatch is therefore the very first
+/// thing rejected, at zero verification cost, and it is impossible to reach
+/// any of `verify_envelope`'s Accept path without passing it.
+///
+/// ## Replay-safety / consensus status
+///
+/// Not consensus-relevant and needs no activation gate: weak-subjectivity
+/// verification is boot-time, node-local trust bootstrapping (the module doc
+/// — "obtained out of band"), never a committed value, never replayed from
+/// `blocks.log`, and no two nodes are required to agree on when or whether
+/// they call this. `(threshold, signers, min_external)` are release-baked
+/// constants, not attacker input, so this only ever rejects a
+/// misconfigured *release*, never a legitimate one that shipped correctly.
+pub fn verify_envelope_with_shape_policy(
+    env: &CheckpointEnvelope,
+    set: &SignerSet,
+    expected_network_id: u32,
+    expected_genesis_root: &[u8; 32],
+    verifier: &dyn HybridKeyVerifier,
+    threshold: usize,
+    signers: usize,
+    min_external: usize,
+) -> Result<EnvelopeOk, EnvelopeReject> {
+    if !set.matches_policy(threshold, signers, min_external) {
+        return Err(EnvelopeReject::SignerSetShapeMismatch { threshold, signers, min_external });
+    }
+    verify_envelope(env, set, expected_network_id, expected_genesis_root, verifier)
 }
 
 // ---------------------------------------------------------------------------
@@ -958,6 +1020,181 @@ mod tests {
         assert_eq!(
             verify_envelope(&envelope(&[2, 2]), &phase_a_set(), NET, &GEN, &accept_all()),
             Err(EnvelopeReject::DuplicateSigner { index: 2 })
+        );
+    }
+
+    // -- NEW-2: signer-set shape policy enforcement ------------------------
+
+    /// **Fails before the fix, passes after.** Before NEW-2,
+    /// `verify_envelope` had no way to refuse a self-declared `1-of-1,
+    /// min_external=0` arrangement — a single founder key — because it only
+    /// ever checks a set against ITS OWN declared fields, never against the
+    /// release's actual policy. This constructs exactly that set and shows a
+    /// bare `verify_envelope` call would accept a lone signature over it,
+    /// while `verify_envelope_with_shape_policy` refuses it before the
+    /// signature is ever checked (poisoned verifier: a `BadSignature` result
+    /// would mean the shape check did not run first).
+    #[test]
+    fn single_founder_key_arrangement_is_refused_by_shape_policy_but_not_by_verify_envelope_alone() {
+        let lone = SignerSet {
+            id: 1,
+            signers: vec![signer(10, false)], // one key, not flagged external
+            threshold: 1,
+            min_external: 0,
+            adopted_epoch: 0,
+        };
+        assert!(
+            !lone.matches_policy(WS_PHASE_A_THRESHOLD, WS_PHASE_A_SIGNERS, WS_PHASE_A_MIN_EXTERNAL),
+            "fixture bug: this set must NOT match Phase A, or the test proves nothing"
+        );
+
+        // The gap NEW-2 closes, shown directly: plain `verify_envelope`
+        // accepts this single-founder-key quorum outright.
+        assert!(
+            verify_envelope(&envelope(&[0]), &lone, NET, &GEN, &accept_all()).is_ok(),
+            "if this is not Ok, verify_envelope alone already refuses malformed sets and \
+             NEW-2 no longer applies — re-check this test against the current code"
+        );
+
+        // The fix: the policy-checked entry point refuses it, fail-closed,
+        // and does so BEFORE any signature verification (a poisoned verifier
+        // that would report BadSignature on any real check never gets that
+        // far — the error is the shape mismatch, not a signature failure).
+        let poison_all = MarkerVerifier { poison: 10 };
+        assert_eq!(
+            verify_envelope_with_shape_policy(
+                &envelope(&[0]),
+                &lone,
+                NET,
+                &GEN,
+                &poison_all,
+                WS_PHASE_A_THRESHOLD,
+                WS_PHASE_A_SIGNERS,
+                WS_PHASE_A_MIN_EXTERNAL,
+            ),
+            Err(EnvelopeReject::SignerSetShapeMismatch {
+                threshold: WS_PHASE_A_THRESHOLD,
+                signers: WS_PHASE_A_SIGNERS,
+                min_external: WS_PHASE_A_MIN_EXTERNAL,
+            })
+        );
+    }
+
+    /// A set that cannot even satisfy its OWN declared `min_external` (not
+    /// enough `external`-flagged signers exist to reach it) is refused the
+    /// same way — the "bricks fresh sync with no early diagnostic" half of
+    /// NEW-2. `decode_signer_set_file` (bloch-pos-node, not this crate) does
+    /// not catch this either; this is the one place in-tree that can.
+    #[test]
+    fn an_unsatisfiable_min_external_is_refused_by_shape_policy() {
+        let unsatisfiable = SignerSet {
+            id: 1,
+            signers: vec![signer(10, false), signer(11, false), signer(12, false)], // NO external
+            threshold: WS_PHASE_A_THRESHOLD,
+            min_external: WS_PHASE_A_MIN_EXTERNAL, // requires 1, has 0
+            adopted_epoch: 0,
+        };
+        assert!(!unsatisfiable.matches_policy(
+            WS_PHASE_A_THRESHOLD,
+            WS_PHASE_A_SIGNERS,
+            WS_PHASE_A_MIN_EXTERNAL
+        ));
+        assert_eq!(
+            verify_envelope_with_shape_policy(
+                &envelope(&[0, 1]),
+                &unsatisfiable,
+                NET,
+                &GEN,
+                &accept_all(),
+                WS_PHASE_A_THRESHOLD,
+                WS_PHASE_A_SIGNERS,
+                WS_PHASE_A_MIN_EXTERNAL,
+            ),
+            Err(EnvelopeReject::SignerSetShapeMismatch {
+                threshold: WS_PHASE_A_THRESHOLD,
+                signers: WS_PHASE_A_SIGNERS,
+                min_external: WS_PHASE_A_MIN_EXTERNAL,
+            })
+        );
+    }
+
+    /// The positive case: a set that DOES match the declared policy passes
+    /// the shape check and behaves exactly like a bare `verify_envelope`
+    /// call from then on — the wrapper adds a gate, not a second opinion on
+    /// verification itself.
+    #[test]
+    fn a_conforming_set_verifies_identically_through_either_entry_point() {
+        let set = phase_a_set();
+        let env = envelope(&[0, 2]);
+        let direct = verify_envelope(&env, &set, NET, &GEN, &accept_all());
+        let wrapped = verify_envelope_with_shape_policy(
+            &env,
+            &set,
+            NET,
+            &GEN,
+            &accept_all(),
+            WS_PHASE_A_THRESHOLD,
+            WS_PHASE_A_SIGNERS,
+            WS_PHASE_A_MIN_EXTERNAL,
+        );
+        assert!(direct.is_ok());
+        assert_eq!(direct, wrapped);
+    }
+
+    /// Phase B is a distinct, equally valid policy — the wrapper must not be
+    /// hard-coded to Phase A's numbers.
+    #[test]
+    fn phase_b_shape_is_accepted_under_its_own_policy_and_refused_under_phase_a() {
+        let set = SignerSet {
+            id: 2,
+            signers: vec![
+                signer(20, false),
+                signer(21, false),
+                signer(22, false),
+                signer(23, true),
+                signer(24, true),
+            ],
+            threshold: WS_PHASE_B_THRESHOLD,
+            min_external: WS_PHASE_B_MIN_EXTERNAL,
+            adopted_epoch: 0,
+        };
+        assert!(set.matches_policy(WS_PHASE_B_THRESHOLD, WS_PHASE_B_SIGNERS, WS_PHASE_B_MIN_EXTERNAL));
+
+        let env = CheckpointEnvelope {
+            checkpoint: WeakSubjectivityCheckpoint { signer_set_id: 2, ..checkpoint() },
+            signatures: [0u8, 3, 4].iter().map(|i| (*i, sig())).collect(),
+        };
+        assert!(verify_envelope_with_shape_policy(
+            &env,
+            &set,
+            NET,
+            &GEN,
+            &accept_all(),
+            WS_PHASE_B_THRESHOLD,
+            WS_PHASE_B_SIGNERS,
+            WS_PHASE_B_MIN_EXTERNAL,
+        )
+        .is_ok());
+
+        // The identical set, checked against Phase A's numbers, does not fit
+        // (5 signers vs 3) and must be refused rather than silently verified
+        // under the wrong policy.
+        assert_eq!(
+            verify_envelope_with_shape_policy(
+                &env,
+                &set,
+                NET,
+                &GEN,
+                &accept_all(),
+                WS_PHASE_A_THRESHOLD,
+                WS_PHASE_A_SIGNERS,
+                WS_PHASE_A_MIN_EXTERNAL,
+            ),
+            Err(EnvelopeReject::SignerSetShapeMismatch {
+                threshold: WS_PHASE_A_THRESHOLD,
+                signers: WS_PHASE_A_SIGNERS,
+                min_external: WS_PHASE_A_MIN_EXTERNAL,
+            })
         );
     }
 

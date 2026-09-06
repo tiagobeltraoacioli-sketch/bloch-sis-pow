@@ -3,6 +3,12 @@
 //! Properties the committee layer must hold for consensus not to split.
 
 use bloch_pos_committee::*;
+// R4 F-14: these two are no longer part of the crate's flat re-export
+// (`bloch_pos_committee::COMMITTEE_SIZE` invited mistaking the superseded
+// sampled draw for the live committee mechanism, which is the partition in
+// `committees.rs`) — imported qualified here because this suite still tests
+// the sampled draw itself, deliberately, as documented in `lib.rs`.
+use bloch_pos_committee::params::{COMMITTEE_SIZE, SLOT_SUBCOMMITTEE_SIZE};
 use std::collections::HashMap;
 
 fn uniform_set(n: u32, stake: u64) -> Vec<Validator> {

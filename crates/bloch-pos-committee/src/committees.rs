@@ -56,8 +56,9 @@ use crate::params::{DS_SORTITION, SLOTS_PER_EPOCH};
 use crate::sample::Validator;
 use sha3::{
     digest::{ExtendableOutput, Update, XofReader},
-    Shake256,
+    Digest, Sha3_256, Shake256,
 };
+use std::cell::RefCell;
 
 /// Role tag for the epoch partition. Distinct from the sortition roles so the
 /// partition can never coincide with a proposer draw.
@@ -225,11 +226,18 @@ fn mutation_restores_zero_stake_filter() -> bool {
 ///    map from whatever roster it is handed, so feeding it a leak-applied
 ///    roster double-charges the quorum denominator. More risk, less coverage,
 ///    in the exact arithmetic that decides finality.
-/// 4. **It fixes the class, not the instance.** `derive::active_validators`
-///    is a fourth roster producer: registry stake only, no delegation, no
-///    cohort cap, no leak, and no zero-stake filter. No amount of leak
-///    bookkeeping can make it agree with `transition.rs`, because it has no
-///    leak information at all. With the filter gone, all four producers
+/// 4. **It fixes the class, not the instance.** At the time of this fix,
+///    `derive::active_validators` was a fourth roster producer: registry
+///    stake only, no delegation, no cohort cap, no leak, and no zero-stake
+///    filter. No amount of leak bookkeeping could have made it agree with
+///    `transition.rs`, because it had no leak information at all. (That
+///    fourth producer no longer exists — R1 H3, 2026-09-06, deleted
+///    `derive::active_validators` along with the rest of the divergent
+///    second state-root/schedule derivation it belonged to; see `derive.rs`.
+///    This point is kept for the historical record: it is why the fix below
+///    targets the *predicate*, not a specific caller, which is what let the
+///    predicate keep holding after one of the four producers it names was
+///    later deleted entirely.) With the filter gone, the remaining producers
 ///    compute the same membership predicate — `activation_epoch <= epoch
 ///    && epoch < exit_epoch && !slashed` — and therefore the same partition.
 ///
@@ -277,6 +285,37 @@ pub fn epoch_committees(
     epoch: u64,
     validators: &[Validator],
 ) -> Vec<Vec<u32>> {
+    // R1 M8: memoised. `committee_for_slot` — the live per-block call
+    // (`transition.rs` step 8, once per block) — used to call straight
+    // through to the uncached body below and throw away 31 of every 32
+    // slot-chunks the Fisher-Yates shuffle produced, because the beacon mix
+    // and the active roster are BOTH fixed for an entire epoch
+    // (`seed_for_epoch`/`consensus_roster_at` do not change mid-block), so
+    // the same shuffle was recomputed from scratch on every one of an
+    // epoch's 32 blocks. See [`partition_cache_get`]/[`partition_cache_put`]
+    // for the replay-safety argument; the short version is that a cache hit
+    // is required to be byte-identical to a fresh computation (proved by
+    // `partition_cache_matches_uncached_computation` below), so this changes
+    // latency only, never a state root, and needs no activation gate.
+    let key = partition_cache_key(beacon_mix, epoch, validators);
+    if let Some(hit) = partition_cache_get(&key) {
+        return hit;
+    }
+    let out = epoch_committees_uncached(beacon_mix, epoch, validators);
+    partition_cache_put(key, out.clone());
+    out
+}
+
+/// The Fisher-Yates partition itself, with no cache in front of it — kept
+/// as its own function so [`epoch_committees`]'s memoisation and the
+/// underlying computation can each be read (and tested against each other)
+/// without the other in the way.
+fn epoch_committees_uncached(
+    beacon_mix: &[u8; 32],
+    epoch: u64,
+    validators: &[Validator],
+) -> Vec<Vec<u32>> {
+    PARTITION_RECOMPUTATIONS.with(|c| c.set(c.get().wrapping_add(1)));
     let n_slots = SLOTS_PER_EPOCH as usize;
 
     // Canonicalise before anything else. The order the caller happened to hold
@@ -353,6 +392,127 @@ pub fn epoch_committees(
     out
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Epoch-partition memoisation (R1 M8)
+// ────────────────────────────────────────────────────────────────────────────
+//
+// INVARIANT (R1 M8): a cache hit MUST be byte-identical to what
+// `epoch_committees_uncached` would have returned for the same arguments —
+// this cache may change how many times the shuffle runs, never what any
+// shuffle produces. That is enforced by construction (a hit is only ever a
+// stored, previously-computed output, verbatim) and pinned by
+// `partition_cache_matches_uncached_computation` (a differential property
+// test) and `partition_cache_hit_is_identical_to_a_fresh_miss` (a unit test
+// that fails if the cache ever returns anything but the fresh value).
+//
+// REPLAY-SAFETY: this cache holds no committed or cross-node state — it is a
+// per-OS-thread, in-process memo (`thread_local!`), never serialized, never
+// read by any other node, and empty again the moment the process restarts.
+// The node's consensus engine is documented (`lib.rs`, `engine.rs`) to run on
+// one dedicated thread, so this cache sees exactly the sequence of calls that
+// thread makes — typically 32 calls per epoch sharing one (seed, epoch,
+// roster) key, since both are fixed for the whole epoch — and returns exactly
+// what each of those 32 calls would have computed alone. Two nodes, or two
+// threads on one node, therefore compute identical partitions regardless of
+// whether either one's cache happens to hit; only wall-clock time differs,
+// never the value, so this needs no `*_ACTIVATION_EPOCH` gate — there is no
+// new consensus RULE here, only a faster path to the existing one.
+//
+// KEY: (beacon_mix, epoch, a fingerprint of `validators`, and — test builds
+// only — the state of the `PARTITION_DUPLICATES_AN_INDEX` rehearsal switch,
+// because that switch changes `epoch_committees_uncached`'s OUTPUT and a
+// cache that ignored it could serve a pre-mutation result to a post-mutation
+// call on the same thread, or vice versa, silently defeating the mutation
+// test the switch exists for).
+
+/// Cheap, order- and stake-sensitive fingerprint of a roster for use ONLY as
+/// a cache key — never a consensus digest, so it needs no `params::DS_*`
+/// domain tag (nothing here is ever serialized, compared across nodes, or
+/// folded into a state root).
+///
+/// `epoch_committees_uncached` canonicalises its input (sorts, dedups, drops
+/// stake) before it matters to the output, which means two DIFFERENT
+/// `validators` slices can legitimately produce the SAME partition. This
+/// fingerprint deliberately does not attempt to recognise that — reproducing
+/// the canonicalisation just to build a cache key would spend close to the
+/// work the cache exists to avoid paying twice. Hashing the literal input
+/// order and stake instead is strictly conservative: it can only ever cause
+/// an extra cache MISS (recomputed correctly) on an equivalent-but
+/// differently-shaped input, never a wrong HIT — the property the whole
+/// cache depends on.
+fn roster_fingerprint(validators: &[Validator]) -> [u8; 32] {
+    // `Digest::update`, qualified: this module also imports `Update` (for the
+    // Shake256 XOF above), and `Digest: Update` makes plain `h.update(..)`
+    // genuinely ambiguous between the two trait methods — not a style choice.
+    let mut h = Sha3_256::new();
+    Digest::update(&mut h, (validators.len() as u64).to_le_bytes());
+    for v in validators {
+        Digest::update(&mut h, v.index.to_le_bytes());
+        Digest::update(&mut h, v.effective_stake.to_le_bytes());
+    }
+    h.finalize().into()
+}
+
+type PartitionCacheKey = ([u8; 32], u64, [u8; 32], bool);
+
+fn partition_cache_key(beacon_mix: &[u8; 32], epoch: u64, validators: &[Validator]) -> PartitionCacheKey {
+    #[cfg(test)]
+    let mutation = crate::params::rehearsal::PARTITION_DUPLICATES_AN_INDEX
+        .load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(test))]
+    let mutation = false;
+    (*beacon_mix, epoch, roster_fingerprint(validators), mutation)
+}
+
+thread_local! {
+    // Single most-recent entry, not a map: consensus replay is a strictly
+    // sequential walk of one chain on one thread, so "the previous call's key"
+    // is the only key worth remembering — it is what every call after the
+    // first of an epoch's 32 will match, and an epoch boundary is exactly one
+    // guaranteed miss either way. A map would grow without the bound this
+    // single slot gets for free and would need an eviction policy to reason
+    // about; this needs none.
+    static PARTITION_CACHE: RefCell<Option<(PartitionCacheKey, Vec<Vec<u32>>)>> =
+        const { RefCell::new(None) };
+}
+
+fn partition_cache_get(key: &PartitionCacheKey) -> Option<Vec<Vec<u32>>> {
+    PARTITION_CACHE.with(|c| match &*c.borrow() {
+        Some((k, v)) if k == key => Some(v.clone()),
+        _ => None,
+    })
+}
+
+fn partition_cache_put(key: PartitionCacheKey, value: Vec<Vec<u32>>) {
+    PARTITION_CACHE.with(|c| *c.borrow_mut() = Some((key, value)));
+}
+
+thread_local! {
+    /// How many times [`epoch_committees_uncached`] — the Fisher-Yates
+    /// shuffle itself — actually ran on this thread.
+    ///
+    /// **Observability only** (same device as `transition::eutxo_map_deep_copies`
+    /// / `root_computations`): no consensus rule reads it, nothing branches on
+    /// it, never committed. It exists because R1 M8 is a pure latency change —
+    /// the cache's whole point is that its presence is unobservable in any
+    /// OUTPUT — so the only way to write a test that goes red if the
+    /// memoisation is ever deleted is to count the expensive step directly,
+    /// the way the eUTXO instrumentation above already does for the same
+    /// reason.
+    static PARTITION_RECOMPUTATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The calling thread's [`PARTITION_RECOMPUTATIONS`]. Observability only.
+pub fn partition_recomputations() -> u64 {
+    PARTITION_RECOMPUTATIONS.with(|c| c.get())
+}
+
+/// Zero the calling thread's [`PARTITION_RECOMPUTATIONS`], so a measurement
+/// can be taken across one test rather than across a whole test binary.
+pub fn reset_partition_recomputations() {
+    PARTITION_RECOMPUTATIONS.with(|c| c.set(0));
+}
+
 /// The committee serving `slot` within its epoch.
 ///
 /// Same seed contract as [`epoch_committees`]: `beacon_mix` is the F6-selected
@@ -402,7 +562,7 @@ pub fn is_supermajority(stake_for: u128, total_active_stake: u128) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::params::rehearsal::{HOOK, RESTORE_ZERO_STAKE_FILTER};
+    use crate::params::rehearsal::{HOOK, PARTITION_DUPLICATES_AN_INDEX, RESTORE_ZERO_STAKE_FILTER};
     use std::sync::atomic::Ordering::Relaxed;
 
     const STAKE: u64 = 32_000 * 100_000_000;
@@ -634,5 +794,217 @@ mod tests {
         let empty = epoch_committees(&[0x11u8; 32], 3, &[]);
         assert!(empty.iter().all(Vec::is_empty));
         assert_eq!(empty.len(), SLOTS_PER_EPOCH as usize);
+    }
+
+    // ── R1 M8: epoch-partition memoisation ──────────────────────────────────
+
+    /// **Fails before the fix, passes after it.** Before R1 M8,
+    /// `committee_for_slot` (and any direct `epoch_committees` caller) paid
+    /// one full Fisher-Yates shuffle PER CALL even when the immediately
+    /// preceding call used the identical (seed, epoch, roster) — the shape of
+    /// `transition.rs` step 8, called once per block, 32 times an epoch, off
+    /// an epoch-constant seed and roster. Reverting the fix — making
+    /// `epoch_committees` call `epoch_committees_uncached` directly, with no
+    /// cache in front of it — makes this test RED: the second, third and
+    /// fourth calls below would each recompute, and the assertion that only
+    /// the first one does would fail.
+    #[test]
+    fn repeated_calls_with_the_same_key_recompute_only_once() {
+        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        RESTORE_ZERO_STAKE_FILTER.store(false, Relaxed);
+        reset_partition_recomputations();
+        let seed = [0x33u8; 32];
+        let roster = set(64);
+
+        let first = epoch_committees(&seed, 12, &roster);
+        assert_eq!(partition_recomputations(), 1, "the first call must be a real computation");
+
+        for _ in 0..3 {
+            let again = epoch_committees(&seed, 12, &roster);
+            assert_eq!(again, first, "a cache hit must equal the original computation");
+        }
+        assert_eq!(
+            partition_recomputations(),
+            1,
+            "R1 M8 regressed: a repeat call with an unchanged (seed, epoch, roster) \
+             recomputed the Fisher-Yates shuffle instead of hitting the cache"
+        );
+
+        // A genuinely different key (new epoch) must still recompute — the
+        // cache is one entry, not a black hole that stops all future work.
+        let _ = epoch_committees(&seed, 13, &roster);
+        assert_eq!(
+            partition_recomputations(),
+            2,
+            "a call with a different epoch must still trigger a real computation"
+        );
+    }
+
+    /// Deterministic splitmix64 PRNG — same device `tests/properties.rs` uses
+    /// crate-wide, so this differential test is replayable from its seed
+    /// rather than a flake generator.
+    struct Rng(u64);
+    impl Rng {
+        fn new(seed: u64) -> Rng {
+            Rng(seed)
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn next_u32(&mut self) -> u32 {
+            self.next_u64() as u32
+        }
+        fn below(&mut self, n: u32) -> u32 {
+            self.next_u32() % n.max(1)
+        }
+    }
+
+    fn random_roster(rng: &mut Rng, n: u32) -> Vec<Validator> {
+        // Duplicate-index-free by construction (`0..n`), matching every real
+        // registry-derived roster (§ real callers dedup upstream); indices
+        // shuffled and stakes randomised so two rosters covering the same set
+        // rarely share a byte-for-byte representation, which is exactly the
+        // case the fingerprint-based cache key must still get right.
+        let mut idx: Vec<u32> = (0..n).collect();
+        for i in (1..idx.len()).rev() {
+            let j = rng.below((i + 1) as u32) as usize;
+            idx.swap(i, j);
+        }
+        idx.into_iter()
+            .map(|index| Validator { index, effective_stake: 1 + rng.next_u64() % 1_000_000 })
+            .collect()
+    }
+
+    /// **The R1 M8 invariant, stated as code**: the memoised entry point and
+    /// the uncached computation must agree for every input, whether the call
+    /// is a cache miss (first call with a key) or a cache hit (a repeat).
+    /// Randomised over seed, epoch, and roster shape/order/stake so this is
+    /// not just re-checking the one fixture the unit tests already use.
+    ///
+    /// Reverting the fix (deleting the memoisation and calling
+    /// `epoch_committees_uncached` directly) makes this test PASS, not fail —
+    /// a differential test can only go red against a BROKEN cache, so the
+    /// complementary `partition_cache_hit_is_identical_to_a_fresh_miss` and
+    /// `stale_cache_entry_is_never_served_for_a_different_roster` tests below
+    /// are written to fail if the caching logic itself regresses (e.g. a key
+    /// that forgets to include the roster or the mutation switch).
+    #[test]
+    fn partition_cache_matches_uncached_computation() {
+        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        RESTORE_ZERO_STAKE_FILTER.store(false, Relaxed);
+        let mut rng = Rng::new(0xC0FF_EE00_1234_5678);
+        for _ in 0..200 {
+            let mut seed = [0u8; 32];
+            for b in seed.iter_mut() {
+                *b = rng.next_u32() as u8;
+            }
+            let epoch = rng.next_u64() % 5_000;
+            let n = 1 + rng.below(40);
+            let roster = random_roster(&mut rng, n);
+
+            let expected = epoch_committees_uncached(&seed, epoch, &roster);
+            // First call: necessarily a miss (fresh seed/epoch/roster nearly
+            // every iteration; a rare accidental repeat only exercises the
+            // hit path too, which is still a valid check).
+            let first = epoch_committees(&seed, epoch, &roster);
+            assert_eq!(first, expected, "cache miss produced a different partition");
+            // Second call, identical arguments: must be a hit, and the hit
+            // must be byte-identical to the uncached value.
+            let second = epoch_committees(&seed, epoch, &roster);
+            assert_eq!(second, expected, "cache hit produced a different partition");
+        }
+    }
+
+    /// Focused version of the property above: construct an exact cache hit
+    /// (same seed, epoch, and roster slice) and check the two calls are not
+    /// merely "both correct" but literally `==`, catching any drift a
+    /// probabilistic property test could in principle miss.
+    #[test]
+    fn partition_cache_hit_is_identical_to_a_fresh_miss() {
+        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        RESTORE_ZERO_STAKE_FILTER.store(false, Relaxed);
+        let seed = [0x77u8; 32];
+        let roster = set(64);
+        let miss = epoch_committees(&seed, 42, &roster);
+        let hit = epoch_committees(&seed, 42, &roster);
+        assert_eq!(miss, hit);
+        assert_eq!(hit, epoch_committees_uncached(&seed, 42, &roster));
+    }
+
+    /// A cache keyed on the wrong thing would serve validator set A's
+    /// partition to a same-(seed, epoch) call for validator set B. This test
+    /// fails if the roster fingerprint is ever dropped from, or weakened in,
+    /// the cache key: call with roster A (populates the cache), then
+    /// immediately with a DIFFERENT roster B at the identical (seed, epoch),
+    /// and require the second call to answer for B, not to replay A's cached
+    /// result.
+    #[test]
+    fn stale_cache_entry_is_never_served_for_a_different_roster() {
+        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        RESTORE_ZERO_STAKE_FILTER.store(false, Relaxed);
+        let seed = [0x88u8; 32];
+        let a = set(64);
+        let b: Vec<Validator> =
+            (0..64u32).map(|index| Validator { index: index + 1000, effective_stake: STAKE }).collect();
+
+        let expected_a = epoch_committees_uncached(&seed, 9, &a);
+        let expected_b = epoch_committees_uncached(&seed, 9, &b);
+        assert_ne!(expected_a, expected_b, "fixture bug: A and B must partition differently");
+
+        let got_a = epoch_committees(&seed, 9, &a); // populates the cache under A's key
+        assert_eq!(got_a, expected_a);
+        let got_b = epoch_committees(&seed, 9, &b); // same (seed, epoch), different roster
+        assert_eq!(got_b, expected_b, "the cache served roster A's partition for roster B");
+    }
+
+    /// **Mutation-switch test for the cache key itself.** `epoch_committees`'s
+    /// OUTPUT depends on `PARTITION_DUPLICATES_AN_INDEX` in test builds (the
+    /// switch `rehearsal_restoring_the_filter_reopens_the_roster_split`'s
+    /// sibling exercises). If the cache key ever stopped including that
+    /// switch's state, flipping it between two calls with the same (seed,
+    /// epoch, roster) would silently serve the PRE-flip result post-flip —
+    /// exactly the kind of stale-cache bug this test exists to catch. Same
+    /// `HOOK` discipline as the other rehearsal tests: the switch is global
+    /// per thread, so only one test may drive it at a time.
+    #[test]
+    fn mutation_switch_state_is_part_of_the_cache_key() {
+        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        RESTORE_ZERO_STAKE_FILTER.store(false, Relaxed);
+        PARTITION_DUPLICATES_AN_INDEX.store(false, Relaxed);
+        let seed = [0x99u8; 32];
+        let roster = set(64);
+
+        let clean = epoch_committees(&seed, 5, &roster);
+        assert_eq!(clean, epoch_committees_uncached(&seed, 5, &roster));
+
+        PARTITION_DUPLICATES_AN_INDEX.store(true, Relaxed);
+        let mutated = epoch_committees(&seed, 5, &roster);
+        // Comparison value computed WHILE the switch is still on — comparing
+        // against a value computed after flipping it back off would compare
+        // a mutated result against an unmutated one and fail for the wrong
+        // reason (that bug shipped in an earlier draft of this test).
+        let mutated_expected = epoch_committees_uncached(&seed, 5, &roster);
+        PARTITION_DUPLICATES_AN_INDEX.store(false, Relaxed);
+        assert_eq!(
+            mutated, mutated_expected,
+            "post-flip call did not recompute — the cache ignored the mutation switch"
+        );
+        // Guard against a vacuous test: the mutation must actually have
+        // changed something, or the assertion above is trivially true.
+        // (`with_leak`/`assert_the_two_rosters_partition_identically`'s own
+        // mutation test already measures the magnitude; this only checks the
+        // cache did not paper over the difference.)
+        PARTITION_DUPLICATES_AN_INDEX.store(true, Relaxed);
+        let mutated_uncached_only = epoch_committees_uncached(&seed, 5, &roster);
+        PARTITION_DUPLICATES_AN_INDEX.store(false, Relaxed);
+        assert_ne!(
+            clean, mutated_uncached_only,
+            "fixture bug: PARTITION_DUPLICATES_AN_INDEX did not change the uncached output \
+             either, so this test cannot tell a correct cache from a broken one"
+        );
     }
 }

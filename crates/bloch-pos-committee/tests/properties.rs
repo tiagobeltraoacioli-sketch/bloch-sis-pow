@@ -31,6 +31,9 @@ use bloch_pos_committee::delegation::{self, Delegation, Registry, StakeState};
 use bloch_pos_committee::rewards::{self, StakeAccount};
 use bloch_pos_committee::tokenomics_v4 as tk;
 use bloch_pos_committee::*;
+// R4 F-14: no longer part of the flat re-export (see `lib.rs`); imported
+// qualified because these properties are about the sampled draw itself.
+use bloch_pos_committee::params::{COMMITTEE_SIZE, SLOT_SUBCOMMITTEE_SIZE};
 use std::collections::HashMap;
 
 // ── Deterministic PRNG (splitmix64) — std only, fixed seed, reproducible ────

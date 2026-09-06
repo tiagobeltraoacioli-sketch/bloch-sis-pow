@@ -249,3 +249,138 @@ pub fn validate(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::header::{BlockHeaderV4, BlockId, VERSION_G4};
+    use crate::state_root::EvmCommitment;
+    use crate::transition::{CommittedState, GenesisValidator};
+
+    fn genesis_header() -> BlockHeaderV4 {
+        BlockHeaderV4 {
+            version: VERSION_G4,
+            parent: [0u8; 32],
+            state_root: [0u8; 32],
+            body_root: [0u8; 32],
+            slot: 0,
+            proposer_index: 0,
+            randao_reveal: [0u8; 32],
+            randao_mix: [0u8; 32],
+            justified_root: [0u8; 32],
+            finalized_root: [0u8; 32],
+            attestation_root: [0u8; 32],
+            coherence_root: [0u8; 32],
+        }
+    }
+
+    /// Distinct, deterministic fixture pubkey per index — length matches the
+    /// registry's real hybrid public key so a reader cannot mistake this for
+    /// exercising a degenerate (empty-key) path.
+    fn genesis_validator(index: u32, marker: u8) -> GenesisValidator {
+        GenesisValidator {
+            index,
+            pubkey: vec![marker; crate::staking::HYBRID_PK_BYTES],
+            staked_sat: 25_000u128 * 100_000_000,
+            randao_commitment: [marker; 32],
+            withdrawal_credentials: vec![0xAA; 20],
+            commission_bps: 0,
+        }
+    }
+
+    /// **A2 §7 (informational): the attestation signing root does not bind
+    /// the validator index** ([`AttestationData::signing_root`] covers only
+    /// slot/head/source/target — see its doc). That omission is sound *only*
+    /// because the registry `keys: &dyn KeyLookup` resolves against is
+    /// append-only: index → key is injective, permanent, and total once
+    /// assigned, so two registry snapshots can differ only in whether an
+    /// index is PRESENT, never in what key it holds at that index (this
+    /// module's `KeyLookup` doc spells out the three reasons: monotonic
+    /// allocation, no post-insertion mutation, no removal). If that ever
+    /// stopped holding, `validate`'s `keys.pubkey(att.validator)` lookup
+    /// above would resolve the SAME index to two different keys across two
+    /// states, and the missing index binding in `signing_root` would become
+    /// an attestation-forgery surface: a signature valid under validator A's
+    /// key would misattribute to index A even if a later registry rebound
+    /// that index to validator B's key.
+    ///
+    /// This test pins the part of that invariant reachable from this crate's
+    /// owned files without touching `transition.rs` (registry index
+    /// allocation, `transition.rs:2902`'s `keys().next_back() + 1`, is not
+    /// this crate's ownership boundary to edit — see the fix-wave notes).
+    /// Using ONLY the public API (`CommittedState::genesis`, the
+    /// `KeyLookup` impl `transition.rs` provides for it), it proves the base
+    /// case every later append rests on: the founding registry commits
+    /// EXACTLY the (index, pubkey) pairs it was handed, each index resolves
+    /// to its own key and no other, and an index nobody registered resolves
+    /// to nothing — never a stand-in. Post-genesis growth (deposits) is
+    /// exercised, more completely than this crate's ownership split allows
+    /// here, by `transition.rs`'s own suite (e.g.
+    /// `replay_is_delivery_order_independent`, built through
+    /// `params::rehearsal::bonding_gate_open_guard` since
+    /// `DEPOSIT_ACTIVATION_EPOCH` is inert on the live chain).
+    ///
+    /// Deliberately NOT changing `signing_root` — that is a consensus
+    /// encoding, out of scope for this fix (binding the index would need a
+    /// coordinated flag day, since every existing signed attestation's root
+    /// would change).
+    #[test]
+    fn registry_resolves_each_genesis_index_to_its_own_key_and_nothing_else() {
+        let validators: Vec<GenesisValidator> =
+            (0..8u32).map(|i| genesis_validator(i, i as u8 + 1)).collect();
+        let header = genesis_header();
+        let genesis_id = BlockId::of(&header);
+        let st = CommittedState::genesis(
+            genesis_id,
+            [0u8; 32],
+            &validators,
+            &[],
+            [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
+            EvmCommitment {
+                account_root: [0u8; 32],
+                receipts_root: [0u8; 32],
+                gas_used: 0,
+                base_fee_per_gas: 0,
+            },
+            &[],
+        );
+
+        // Injective and total: every registered index resolves to EXACTLY
+        // the key it was registered with.
+        for v in &validators {
+            let resolved = st.pubkey(v.index).expect("registered index must resolve");
+            assert_eq!(
+                resolved,
+                v.pubkey.as_slice(),
+                "index {} resolved to a different key than it was registered with",
+                v.index
+            );
+        }
+
+        // Absence, not a stand-in: an index nobody registered must be None —
+        // never some other validator's key, never a zeroed placeholder that
+        // `verify_with_key` might accidentally treat as "no one".
+        assert!(st.pubkey(validators.len() as u32).is_none());
+        assert!(st.pubkey(u32::MAX).is_none());
+
+        // Injective the OTHER direction: no two distinct indices resolve to
+        // the same key (asserted against the live registry, not just the
+        // input fixture, so a bug in `genesis` that collapsed two entries
+        // would still be caught here).
+        for a in &validators {
+            for b in &validators {
+                if a.index != b.index {
+                    assert_ne!(
+                        st.pubkey(a.index),
+                        st.pubkey(b.index),
+                        "indices {} and {} resolved to the same key",
+                        a.index,
+                        b.index
+                    );
+                }
+            }
+        }
+    }
+}

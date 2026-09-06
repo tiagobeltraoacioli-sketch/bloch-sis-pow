@@ -116,6 +116,19 @@ pub enum IgnoreReason {
     /// immutable pubkeys, so two states can differ only in whether an index is
     /// present, never in what key it holds. Absence means "behind", full stop.
     UnknownValidator,
+    /// This duty already has [`MAX_EQUIVOCATIONS_PER_DUTY`] entries parked in
+    /// the pending (unknown-head) pool.
+    ///
+    /// **R3 NEW-1.** Distinct from [`Self::EquivocationLimit`], which bounds
+    /// *accepted* variants: this bounds *pending* ones, so a single duty
+    /// cannot monopolise the shared FIFO pool with many differently-headed,
+    /// validly-signed variants while its block is still missing. It is
+    /// reachable only by a frame whose signature already verified (see the
+    /// signature-before-hold ordering in [`AttestationPool::process`]), so —
+    /// unlike the other cheap Ignore paths above — every occurrence already
+    /// cost one hybrid verification; that is the intended trade (a bounded,
+    /// self-funded cost, not a free one).
+    PendingDutyLimit,
 }
 
 /// The decision on one arriving attestation. The node maps this onto
@@ -211,6 +224,15 @@ pub struct AttestationPool {
     /// Exact-duplicate guard for parked entries: holding the same attestation
     /// twice would double-count it on release and waste pool capacity.
     pending_keys: BTreeSet<SeenKey>,
+    /// Count of currently-parked entries per duty (R3 NEW-1). Bounds a single
+    /// `(slot, validator)` duty's footprint in the shared pending pool to
+    /// [`MAX_EQUIVOCATIONS_PER_DUTY`], independently of — and in addition to
+    /// — the global FIFO cap ([`MAX_PENDING_ATTESTATIONS`]) and the
+    /// accepted-side cap (`DutyRecord::accepted`, same limit). Entries are
+    /// removed from this map the moment they leave `pending` (release or
+    /// eviction), in [`AttestationPool::evict`], so it never drifts from
+    /// `pending`'s actual contents.
+    pending_by_duty: BTreeMap<DutyKey, usize>,
     /// Monotone insertion counter. Never reused, so FIFO order is total and
     /// deterministic across identical histories.
     next_seq: u64,
@@ -223,11 +245,12 @@ impl AttestationPool {
 
     /// Decide on one arriving attestation.
     ///
-    /// Pipeline order is the spec's (§6.1), cheapest test first, signature
-    /// last — everything before the signature is nanoseconds, the hybrid
-    /// verify is the only expensive step, and the ordering is itself the DoS
-    /// defense: the only way to make this node burn a 4.6 KB hybrid verify is
-    /// an in-window, novel, member-indexed attestation whose head we hold.
+    /// Pipeline order is cheapest test first, with ONE deliberate exception
+    /// (R3 NEW-1, see below): everything before the signature is nanoseconds,
+    /// the hybrid verify is the only expensive step, and for every outcome
+    /// *other* than Hold the ordering is exactly the spec's — the only way to
+    /// make this node burn a 4.6 KB hybrid verify is an in-window, novel,
+    /// member-indexed attestation.
     ///
     ///   1. slot window          → outside: Ignore (stale/skewed ≠ hostile)
     ///   2. checkpoint sanity    → source ≥ target: Reject (provably malformed)
@@ -235,14 +258,54 @@ impl AttestationPool {
     ///   4. duty membership      → non-member: Reject (cannot be honest skew:
     ///      membership is a deterministic function of committed state both
     ///      sides can compute)
-    ///   5. head/target known?   → unknown: Hold
-    ///   6. hybrid signature     → bad: Reject; good: Accept
+    ///   5. hybrid signature     → bad: Reject; unresolvable key: Ignore
+    ///   6. head/target known?   → unknown: Hold (capped per duty)
+    ///   7. Accept
     ///
-    /// Note Hold happens *before* signature verification (spec order): parked
-    /// entries are unverified, which is why the pending pool is small, FIFO,
-    /// and gated behind the membership check — only committee-member-indexed
-    /// frames can occupy it, and the per-peer token buckets at the transport
-    /// layer bound how fast anyone can try.
+    /// ## R3 NEW-1 — why signature verification moved *before* Hold
+    ///
+    /// The original spec order held first and verified only on release
+    /// (`on_block`), because Hold is "free" for an honest race (the block is
+    /// simply not here yet) and the hybrid verify is the expensive step to
+    /// defer. That reasoning silently assumed a parked entry costs the
+    /// *attacker* something too. It does not: `MAX_EQUIVOCATIONS_PER_DUTY`
+    /// counted only *accepted* attestations, so an attacker who merely knows
+    /// a real committee-member index (public via [`crate::schedule`]) could
+    /// send [`MAX_PENDING_ATTESTATIONS`] frames with no signature at all, one
+    /// per duty slot, and evict every honest boundary-race vote already
+    /// parked — at zero cost to the attacker and zero peer-score cost
+    /// (Hold → Ignore is, correctly, never a penalty).
+    ///
+    /// The fix verifies the signature first whenever the key is resolvable,
+    /// which is always safe to do *before* knowing whether the referenced
+    /// blocks are known: `keys` is a registry projection at a fixed epoch
+    /// (`rolled_to(epoch)`, or the block's pre-state) that does not depend on
+    /// `att.data.head` or `att.data.target_root` having been imported — i.e.
+    /// key resolution and signature verification are head-independent. So
+    /// this reordering cannot turn an honest race into a Reject: a bad
+    /// signature was always going to be Reject once checked (step 6 in the
+    /// old order), and a good signature was always going to reach Hold; only
+    /// *which pool state* an unverifiable frame can occupy changes — from
+    /// "parked, unverified" to "never parked". An unresolvable key (this
+    /// node is behind — see [`IgnoreReason::UnknownValidator`]) still cannot
+    /// be checked, so it still cannot be parked; it Ignores exactly as
+    /// before, just one step earlier.
+    ///
+    /// This is *not* a consensus-relevant change and needs no activation
+    /// gate: `AttestationPool` is node-local, ephemeral relay/scoring state
+    /// (see the module doc — "a verdict here is a relay/scoring decision, not
+    /// a validity verdict"). It is never part of `state_root`, never
+    /// serialized into `blocks.log`, and no two honest nodes are required to
+    /// agree on it. Replaying `blocks.log` is therefore byte-identical
+    /// whether or not this fix is present; only in-flight gossip scoring
+    /// changes, on every node simultaneously since the change is compiled in,
+    /// not epoch-triggered.
+    ///
+    /// Independently, a per-duty cap on *pending* entries (also
+    /// `MAX_EQUIVOCATIONS_PER_DUTY`, mirroring the accepted-side cap) stops a
+    /// duty's own key — the only key that can now reach Hold for that duty —
+    /// from flooding the pool with many distinct, differently-headed,
+    /// validly-signed variants while genuinely undecided which one is real.
     pub fn process(
         &mut self,
         att: Attestation,
@@ -304,22 +367,14 @@ impl AttestationPool {
             return GossipDecision::Reject(RejectReason::NotInCommittee);
         }
 
-        // 5. Referenced blocks. The attestation votes for the head produced
-        //    in its own slot, so arriving before that block is *guaranteed*
-        //    ordinary propagation timing — milliseconds of race, every
-        //    boundary. Hold, count nothing against anyone. The target root
-        //    gets the same treatment: at an epoch boundary the target IS the
-        //    block just produced, and it races too.
-        for root in [att.data.head, att.data.target_root] {
-            if !blocks.is_known(&root) {
-                return self.hold(att, root);
-            }
-        }
-
-        // 6. Signature, last. Both halves of the hybrid suite, via the
-        //    injected verifier. Only verified attestations are recorded, so
-        //    every equivocation pair we hand to slashing already carries two
-        //    valid signatures — a forger cannot frame a validator here.
+        // 5. Signature — moved before the head/target check (R3 NEW-1; see
+        //    the long comment on this function for the replay-safety and
+        //    ordering argument). Both halves of the hybrid suite, via the
+        //    injected verifier. Only verified attestations are ever recorded
+        //    or parked, so every equivocation pair we hand to slashing
+        //    already carries two valid signatures — a forger cannot frame a
+        //    validator here.
+        //
         //    The key comes from the SAME state snapshot that drew the
         //    committee checked in step 4 — `rolled_to(epoch)` at the node.
         //    That is deliberate and it is the only defensible pairing: an
@@ -346,17 +401,43 @@ impl AttestationPool {
             // would penalise the peer that relayed a perfectly valid
             // attestation and graylist honest peers during exactly the window
             // when a new validator joins: the mesh-collapse failure this
-            // module exists to prevent.
+            // module exists to prevent. It also cannot be parked (R3 NEW-1):
+            // an unresolvable key means this node cannot verify it, ever,
+            // from this projection, so holding it would occupy a pending slot
+            // that can never be cashed in by this node.
             return GossipDecision::Ignore(IgnoreReason::UnknownValidator);
         };
         if !verifier.verify_with_key(pubkey, &data_hash, &att.signature) {
             return GossipDecision::Reject(RejectReason::BadSignature);
         }
 
-        // Record. Second distinct data for the duty = equivocation: capture
-        // the pair for the slashing pool but still Accept — both messages
-        // must propagate, because the rest of the network needs the same
-        // evidence (spec §6.2: "both are needed as slashing evidence").
+        // 6. Referenced blocks. The attestation votes for the head produced
+        //    in its own slot, so arriving before that block is *guaranteed*
+        //    ordinary propagation timing — milliseconds of race, every
+        //    boundary. Hold, count nothing against anyone — but only up to
+        //    the per-duty cap (R3 NEW-1): a frame reaching this point already
+        //    carries a signature that verified for `duty`, so a further
+        //    distinct variant beyond the cap can only come from `duty`'s own
+        //    key, not from an outside attacker; it is bounded exactly like
+        //    the accepted side to stop that key from monopolising shared pool
+        //    capacity. The target root gets the same treatment as the head:
+        //    at an epoch boundary the target IS the block just produced, and
+        //    it races too.
+        for root in [att.data.head, att.data.target_root] {
+            if !blocks.is_known(&root) {
+                let pending_for_duty = *self.pending_by_duty.get(&duty).unwrap_or(&0);
+                if pending_for_duty >= MAX_EQUIVOCATIONS_PER_DUTY {
+                    return GossipDecision::Ignore(IgnoreReason::PendingDutyLimit);
+                }
+                return self.hold(duty, att, root, data_hash);
+            }
+        }
+
+        // 7. Record. Second distinct data for the duty = equivocation:
+        //    capture the pair for the slashing pool but still Accept — both
+        //    messages must propagate, because the rest of the network needs
+        //    the same evidence (spec §6.2: "both are needed as slashing
+        //    evidence").
         let rec = self.seen.entry(duty).or_default();
         let slashing_candidate = rec.accepted.first().map(|(_, first)| {
             Box::new(SlashingEvidence { first: first.clone(), second: att.clone() })
@@ -446,7 +527,19 @@ impl AttestationPool {
     /// "reject new": under a flood the newest entries are the ones most
     /// likely to still matter, and determinism requires the evictee to be a
     /// function of state, not of memory pressure or timing.
-    fn hold(&mut self, att: Attestation, missing_root: [u8; 32]) -> GossipDecision {
+    ///
+    /// Callers must have already (a) verified `att`'s signature and (b)
+    /// checked the per-duty pending cap (R3 NEW-1) — this function only
+    /// records the entry and its indexes, it does not re-check either,
+    /// because both checks need the pre-hold state (the count *before* this
+    /// insertion) that only the caller still has cheaply in hand.
+    fn hold(
+        &mut self,
+        duty: DutyKey,
+        att: Attestation,
+        missing_root: [u8; 32],
+        data_hash: [u8; 32],
+    ) -> GossipDecision {
         while self.pending.len() >= MAX_PENDING_ATTESTATIONS {
             // Oldest first. `keys().next()` on a BTreeMap is the smallest
             // sequence number ever still present — insertion order, exactly.
@@ -455,15 +548,26 @@ impl AttestationPool {
         }
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.pending_keys.insert((att.data.slot, att.validator, att.data.signing_root()));
+        self.pending_keys.insert((att.data.slot, att.validator, data_hash));
         self.pending_by_root.entry(missing_root).or_default().insert(seq);
+        *self.pending_by_duty.entry(duty).or_insert(0) += 1;
         self.pending.insert(seq, PendingEntry { att, missing_root });
         GossipDecision::Hold { missing_root }
     }
 
-    /// Remove one pending entry and every index pointing at it.
+    /// Remove one pending entry and every index pointing at it, including the
+    /// per-duty pending count (R3 NEW-1) — recomputed from the entry itself
+    /// rather than threaded through, so `evict` stays the single place that
+    /// can never leave `pending_by_duty` out of sync with `pending`.
     fn evict(&mut self, seq: u64) {
         if let Some(entry) = self.pending.remove(&seq) {
+            let duty: DutyKey = (entry.att.data.slot, entry.att.validator);
+            if let Some(count) = self.pending_by_duty.get_mut(&duty) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.pending_by_duty.remove(&duty);
+                }
+            }
             self.pending_keys.remove(&(
                 entry.att.data.slot,
                 entry.att.validator,
@@ -686,21 +790,127 @@ mod tests {
     }
 
     #[test]
-    fn held_forgery_is_rejected_on_release_not_on_hold() {
-        // Hold precedes signature verification (spec order: verify last), so
-        // a parked forgery must die at release time instead.
+    fn forged_signature_is_rejected_before_parking_not_after() {
+        // R3 NEW-1: signature verification now runs BEFORE the head/target
+        // check, precisely so a forgery can never occupy a pending slot —
+        // the opposite of this test's pre-fix name and premise. A forged
+        // frame with an unknown head must Reject immediately, and the pool
+        // must stay empty (nothing was ever parked to release later).
         let mut pool = AttestationPool::new();
-        let mut blocks = [root(0x22)].into_iter().collect::<BTreeSet<_>>();
+        let blocks = [root(0x22)].into_iter().collect::<BTreeSet<_>>(); // head 0xAA unknown
         let mut a = att(1, CURRENT_SLOT, 0xAA);
         a.signature = vec![0u8; 32];
+        let d = pool.process(a, CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
+        assert!(matches!(d, GossipDecision::Reject(RejectReason::BadSignature)));
+        assert_eq!(pool.pending_len(), 0);
+        assert!(pool.accepted_hashes(CURRENT_SLOT, 1).is_empty());
+    }
+
+    #[test]
+    fn unsigned_frames_for_one_duty_never_park_and_evict_nothing() {
+        // R3 NEW-1 core exploit, closed: 256 crafted frames for a SINGLE
+        // duty, every one with an unknown head and a signature that fails
+        // verification, must not occupy even one pending slot — because
+        // signature verification now runs before Hold. Before the fix these
+        // were free Holds that evicted the oldest 8 of a full FIFO pool
+        // (see `pending_pool_is_bounded_with_deterministic_fifo_eviction`);
+        // after the fix they cannot reach `hold` at all.
+        let mut pool = AttestationPool::new();
+        let blocks = BTreeSet::new(); // head/target both unknown either way
+
+        // Fill the pool with 8 genuinely held, honestly-signed attestations
+        // from OTHER duties first, so we can prove the attack evicts none of
+        // them — not merely that the pool "stays small".
+        for v in 1u32..=8 {
+            let d0 = data(CURRENT_SLOT, 0xAA);
+            let dec = pool.process(signed(v, d0), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
+            assert!(matches!(dec, GossipDecision::Hold { .. }));
+        }
+        assert_eq!(pool.pending_len(), 8);
+        let victim_seqs: Vec<u64> = pool.pending.keys().copied().collect();
+
+        // Now the attack: 256 frames for one single duty (validator 1, this
+        // same slot — already parked above, so use a validator NOT already
+        // holding to isolate the per-duty accounting, and a fresh distinct
+        // head per frame so none is an exact-duplicate Ignore either).
+        for i in 0u64..256 {
+            let mut d0 = data(CURRENT_SLOT, 0xAA);
+            d0.head = {
+                let mut h = [0u8; 32];
+                h[..8].copy_from_slice(&i.to_le_bytes());
+                h
+            };
+            let mut forged = signed(9, d0); // 9 is not in the test committee (1..=8)
+            forged.signature = vec![0xEEu8; 32]; // never equals any signing_root
+            let d = pool.process(forged, CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
+            // Validator 9 is rejected at the membership check (step 4), before
+            // signature or hold are even reached — still proves the point:
+            // nothing this loop sends ever becomes `Hold`.
+            assert!(matches!(d, GossipDecision::Reject(RejectReason::NotInCommittee)));
+        }
+        assert_eq!(pool.pending_len(), 8, "the attack evicted nothing");
+        assert_eq!(pool.pending.keys().copied().collect::<Vec<_>>(), victim_seqs);
+
+        // Repeat with a real committee member (so membership passes) but a
+        // signature that still fails verification under its own key: the
+        // case the finding actually names ("a real committee-member index").
+        for i in 0u64..256 {
+            let mut d0 = data(CURRENT_SLOT, 0xBB); // distinct head from validator 1's other data
+            d0.head = {
+                let mut h = [0u8; 32];
+                h[..8].copy_from_slice(&(i + 1000).to_le_bytes());
+                h
+            };
+            let mut forged = signed(2, d0); // validator 2: real committee member, no hold yet
+            forged.signature = vec![0xEEu8; 32];
+            let d = pool.process(forged, CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
+            assert!(matches!(d, GossipDecision::Reject(RejectReason::BadSignature)));
+        }
+        assert_eq!(pool.pending_len(), 8, "a real-index-but-forged flood evicted nothing either");
+        assert_eq!(pool.pending.keys().copied().collect::<Vec<_>>(), victim_seqs);
+    }
+
+    #[test]
+    fn signed_unknown_head_attestation_still_parks() {
+        // The fix must not turn Hold into dead code: a properly signed
+        // attestation for an unknown head is exactly the honest boundary
+        // race the module exists to tolerate, and it must still park.
+        let mut pool = AttestationPool::new();
+        let blocks = [root(0x22)].into_iter().collect::<BTreeSet<_>>(); // head 0xAA unknown
+        let a = att(1, CURRENT_SLOT, 0xAA);
+        let d = pool.process(a, CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
+        assert!(matches!(d, GossipDecision::Hold { missing_root } if missing_root == root(0xAA)));
+        assert_eq!(pool.pending_len(), 1);
+    }
+
+    #[test]
+    fn pending_pool_caps_per_duty_footprint() {
+        // R3 NEW-1: even with a valid signature, one duty cannot occupy more
+        // than MAX_EQUIVOCATIONS_PER_DUTY pending slots — the complement of
+        // the accepted-side cap, closing the "own validator floods the pool
+        // with many distinct held variants" residual.
+        let mut pool = AttestationPool::new();
+        let blocks = BTreeSet::new(); // nothing known: every distinct variant would hold
+        let heads = [0xAAu8, 0xBB, 0xCC, 0xDD, 0xEE];
+        let mut parked = 0usize;
+        for &h in &heads {
+            let a = att(1, CURRENT_SLOT, h);
+            let d = pool.process(a, CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
+            if matches!(d, GossipDecision::Hold { .. }) {
+                parked += 1;
+            } else {
+                assert!(matches!(d, GossipDecision::Ignore(IgnoreReason::PendingDutyLimit)), "unexpected: {d:?}");
+            }
+        }
+        assert_eq!(parked, MAX_EQUIVOCATIONS_PER_DUTY);
+        assert_eq!(pool.pending_len(), MAX_EQUIVOCATIONS_PER_DUTY);
+        // A completely different duty is unaffected by validator 1's cap.
+        let other = att(2, CURRENT_SLOT, 0xAA);
         assert!(matches!(
-            pool.process(a, CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey),
+            pool.process(other, CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey),
             GossipDecision::Hold { .. }
         ));
-        blocks.insert(root(0xAA));
-        let released = pool.on_block(&root(0xAA), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
-        assert!(matches!(released[0].1, GossipDecision::Reject(RejectReason::BadSignature)));
-        assert!(pool.accepted_hashes(CURRENT_SLOT, 1).is_empty());
+        assert_eq!(pool.pending_len(), MAX_EQUIVOCATIONS_PER_DUTY + 1);
     }
 
     #[test]
@@ -742,12 +952,22 @@ mod tests {
     fn pending_pool_is_bounded_with_deterministic_fifo_eviction() {
         let mut pool = AttestationPool::new();
         let blocks = BTreeSet::new(); // nothing known: everything holds
-        // Give every committee member its own slot so each entry is a
-        // distinct duty (slot n → epoch committees of 1..=8 here).
+        // Each entry must be a genuinely distinct DUTY (slot, validator), not
+        // just a distinct signing root — since R3 NEW-1 caps pending entries
+        // per duty at MAX_EQUIVOCATIONS_PER_DUTY, reusing a duty here would
+        // test that cap instead of the FIFO one this test targets (that cap
+        // has its own test, `pending_pool_caps_per_duty_footprint`). The
+        // window admits `ATTESTATION_WINDOW_SLOTS + 1` distinct slots and the
+        // test committee has 8 validators, so `slot` cycles fastest and
+        // `validator` increments only once per full slot cycle: every i in
+        // range yields a fresh (slot, validator) pair.
+        let window = ATTESTATION_WINDOW_SLOTS + 1;
         for i in 0..(MAX_PENDING_ATTESTATIONS as u64 + 8) {
-            let v = (i % 8) as u32 + 1;
-            let slot = CURRENT_SLOT - (i % ATTESTATION_WINDOW_SLOTS);
-            // Distinct head per i → distinct data → distinct pending key.
+            let v = 1 + (i / window) as u32;
+            assert!(v <= 8, "test committee only has 8 members");
+            let slot = CURRENT_SLOT - (i % window);
+            // Distinct head per i too, belt-and-suspenders against collapsing
+            // any two entries into one dedup key.
             let mut d0 = data(slot, 0xAA);
             d0.head = {
                 let mut h = [0u8; 32];
