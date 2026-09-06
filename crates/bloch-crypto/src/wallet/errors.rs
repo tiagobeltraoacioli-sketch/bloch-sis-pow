@@ -25,6 +25,13 @@ pub enum WalletError {
     #[error("unsupported keyfile version: {0}")]
     UnsupportedVersion(u32),
 
+    /// K-M3: `Wallet::recover_resolved` derived under every known
+    /// [`super::seed::SeedVersion`] but none matched the caller's hint (an
+    /// expected address, or on-chain history) — the caller must supply more
+    /// information rather than have one version guessed for them.
+    #[error("cannot determine which seed version created this wallet — no candidate matched")]
+    AmbiguousSeedVersion,
+
     // ── Transaction building errors ──────────────────────────────────────────
 
     #[error("insufficient funds: need {needed} sats, have {have}")]

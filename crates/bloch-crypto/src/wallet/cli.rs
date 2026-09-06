@@ -79,8 +79,17 @@ enum Cmd {
         #[arg(long, default_value_t = 0.0001)]
         fee:      f64,
     },
-    /// Sign arbitrary message
+    /// Sign a message (domain-separated digest — see `verify-message`)
     Sign { keystore: PathBuf, message: String },
+    /// Verify a signature produced by `sign` against a public key
+    VerifyMessage {
+        /// Signer's public key, hex-encoded (see the `pubkey` command).
+        pubkey: String,
+        /// The exact message text that was signed.
+        message: String,
+        /// The signature, hex-encoded.
+        signature: String,
+    },
     /// P4.3 — Create a signed selective-disclosure bundle (view/audit key).
     /// Prompts for the BIP39 seed phrase; discloses ONLY the given receive
     /// indices (0 = base address). The bundle contains public data + signatures
@@ -365,12 +374,17 @@ pub fn main() {
         }
 
         Cmd::Sign { keystore, message } => {
-            let kp  = load_kp(&keystore);
-            let msg = hex::decode(&message)
-                .unwrap_or_else(|_| message.into_bytes());
-
-            print!("  {}signing {} bytes...{}\r", MUTED, msg.len(), RESET);
-            match kp.sign(&msg) {
+            let kp = load_kp(&keystore);
+            // A4-M-4 FIX: sign a DOMAIN-SEPARATED digest of the message's raw
+            // bytes — NEVER hex-decode user-supplied text first. The old
+            // code's `hex::decode(&message).unwrap_or_else(|_| message.into_bytes())`
+            // meant a 64-hex-character "message" signed the raw 32 decoded
+            // bytes directly: indistinguishable at the signature layer from a
+            // tx sighash / disclosure digest / PoS signing root. A "prove you
+            // own this address by signing this challenge" phishing prompt
+            // could then harvest a valid transaction signature.
+            print!("  {}signing message ({} bytes)...{}\r", MUTED, message.len(), RESET);
+            match kp.sign_message(message.as_bytes()) {
                 Ok(sig) => {
                     ok(&format!("Signature ({} bytes)", sig.len()));
                     println!();
@@ -379,6 +393,24 @@ pub fn main() {
                     println!("  {}...{}", DIM, RESET);
                 }
                 Err(e) => err(&format!("Sign failed: {}", e)),
+            }
+        }
+
+        Cmd::VerifyMessage { pubkey, message, signature } => {
+            let pk = match hex::decode(&pubkey) {
+                Ok(b) => b,
+                Err(e) => { err(&format!("Invalid pubkey hex: {}", e)); unreachable!() }
+            };
+            let sig = match hex::decode(&signature) {
+                Ok(b) => b,
+                Err(e) => { err(&format!("Invalid signature hex: {}", e)); unreachable!() }
+            };
+            // Same domain-separated digest `sign` uses — never hex-decode
+            // `message` either; verification must mirror signing exactly.
+            if crate::wallet::Keypair::verify_message(&pk, message.as_bytes(), &sig) {
+                ok("signature verifies for this message and public key");
+            } else {
+                err("signature does NOT verify for this message and public key");
             }
         }
     }
@@ -421,6 +453,13 @@ fn prompt_new_password() -> String {
             &format!("  {}new password:{} ", MUTED, RESET)
         ).unwrap_or_default();
         if let Err(e) = crate::wallet::validate_password(&pw) {
+            println!("  {} {}", red("✗"), muted(&format!("weak password: {}", e)));
+            continue;
+        }
+        // `save_encrypted` also enforces `encryption::validate_password_strength`
+        // (length + breach denylist) — check it here too so a rejected
+        // password re-prompts instead of failing the whole `New` command.
+        if let Err(e) = crate::wallet::encryption::validate_password_strength(&pw) {
             println!("  {} {}", red("✗"), muted(&format!("weak password: {}", e)));
             continue;
         }

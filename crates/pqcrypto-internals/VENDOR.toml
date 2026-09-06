@@ -1,0 +1,120 @@
+# VENDOR.toml — hash pin for the vendored PQClean C sources (audit finding G3).
+#
+# This crate is a fork of upstream `pqcrypto-internals` 0.2.11 (rustpq/pqcrypto)
+# that changes ONLY `src/lib.rs` (see README.md "What changes"). Everything
+# under `cfiles/` and `include/` is claimed to be byte-for-byte identical to
+# upstream 0.2.11's vendored copy of the PQClean reference/optimized C sources.
+#
+# That claim was previously undocumented and unverified in-tree — nothing
+# would notice if one of these files were edited, replaced, or corrupted by a
+# future change. This file pins a SHA-256 of every file under `cfiles/` and
+# `include/` at the point the fork was taken; `tests/vendor_pin.rs` recomputes
+# them on every `cargo test` and fails if any file's hash (or the file list
+# itself) has drifted.
+#
+# This is a TRIPWIRE, not a provenance guarantee: it proves "this checkout's
+# vendored C is byte-identical to what this repository recorded", not "these
+# hashes match some external upstream release" (this sandbox has no network
+# access to re-verify against crates.io/GitHub). If a hash legitimately needs
+# to change (a deliberate upstream sync), update BOTH the file and this
+# manifest in the same commit, with the reason in the commit message.
+#
+# Format: one [[file]] table per vendored path, relative to this crate's root.
+
+[meta]
+# Upstream this fork is based on (see README.md).
+upstream_crate = "pqcrypto-internals"
+upstream_version = "0.2.11"
+generated_by = "scripted sha256 over cfiles/ and include/, recorded in this file"
+
+[[file]]
+path = "cfiles/aes.c"
+sha256 = "3770ac6719eb9a596365af07b1eb8e65948dfc71d31bd9ad6acfe608cd398b72"
+
+[[file]]
+path = "cfiles/fips202.c"
+sha256 = "b82b36f7302a0325c8de0dc299733ae97f4c6f81d1fb8e42ecf2c4301ccc575e"
+
+[[file]]
+path = "cfiles/keccak2x/feat.S"
+sha256 = "a61e2583e4759a15316c6c92f10236c384867bcbe3e76f4ca4255eba005dff60"
+
+[[file]]
+path = "cfiles/keccak2x/fips202x2.c"
+sha256 = "35abe92de15fc34e4847aaa04df1076d4b79dbebec5d814732dd9210d11528d3"
+
+[[file]]
+path = "cfiles/keccak2x/fips202x2.h"
+sha256 = "496aca3480ebebba13740208b6bf5023f1a42178a9f42efa665e74ac16fbc298"
+
+[[file]]
+path = "cfiles/keccak4x/KeccakP-1600-times4-SIMD256.c"
+sha256 = "904bd88c30e4c67467a1714460581195ea238acae27682188cd16e1169c5ce30"
+
+[[file]]
+path = "cfiles/keccak4x/KeccakP-1600-times4-SnP.h"
+sha256 = "82b498f8e116b736cd77e1d1665300aa75606b354e02a90cb764c28936c7c0cb"
+
+[[file]]
+path = "cfiles/keccak4x/KeccakP-1600-unrolling.macros"
+sha256 = "0bf1a7910e7cf01cdb68d2f8f0886cf1ec306ad341f567f7bf9979f812a856df"
+
+[[file]]
+path = "cfiles/keccak4x/Makefile"
+sha256 = "c63354b32a2da854886670020d6c7ddefeaf4073ce6b1c41eb037c6b489435e5"
+
+[[file]]
+path = "cfiles/keccak4x/Makefile.Microsoft_nmake"
+sha256 = "e376fc0964afc949e54b82fe25d75298a8cf12ac696d2b7f69eab3729c159091"
+
+[[file]]
+path = "cfiles/keccak4x/SIMD256-config.h"
+sha256 = "2118d0bf6aa447bae934789610f2b1b61c29ed28702d470a64dc6b0d522bdb28"
+
+[[file]]
+path = "cfiles/keccak4x/align.h"
+sha256 = "5033313cf7203ce3514cc22d8ce113b430237e8b15a6c66a79d3ee8b5e3d80b5"
+
+[[file]]
+path = "cfiles/keccak4x/brg_endian.h"
+sha256 = "5fbc8e476a28827e0fb764db47b4e94947fd9138cd9f26fce114cbc1ee507aa9"
+
+[[file]]
+path = "cfiles/nistseedexpander.c"
+sha256 = "b34355951ec666aa686dea37f639b0b097a043d1c365bfbf31de4705f5f6a898"
+
+[[file]]
+path = "cfiles/randombytes.c"
+sha256 = "5d229e881bf8bca764214a775a0c0fc3cfc0c4e07f320787fa328602e5b7fcd7"
+
+[[file]]
+path = "cfiles/sha2.c"
+sha256 = "4ad19915f2ef4d3d6820dea8f7ca54f48b35b203fd7e493e28a361d78483a79a"
+
+[[file]]
+path = "cfiles/sp800-185.c"
+sha256 = "5c3cdcdba50b74824dd069d3aa8799ee168cccdc9b68eea60e342095e34b0897"
+
+[[file]]
+path = "include/aes.h"
+sha256 = "c734be3e4129d0d15d941826d3a6594915c00130c7989d933a6842f7bf9d565a"
+
+[[file]]
+path = "include/fips202.h"
+sha256 = "a9ee9ff84a0dd2731f26daa6466b0cb2ebac69bb53e7989127cb80ff423b26b9"
+
+[[file]]
+path = "include/nistseedexpander.h"
+sha256 = "d82eb6d857c05604bd7672bd6c59759f6d28924bdf73acc2887906fded4e469c"
+
+[[file]]
+path = "include/randombytes.h"
+sha256 = "3f0f763ac053e8b4992379e96a45198c7a91f3d10c993e4aba84669157934593"
+
+[[file]]
+path = "include/sha2.h"
+sha256 = "4779bf324a6497faa7e779914130df0cd2c3b603a97e869739da14e6eb1aa76b"
+
+[[file]]
+path = "include/sp800-185.h"
+sha256 = "51bdcf0b6d92b8d66fd9ffa783d48fab130d2597393e35370bfd902f33b604d3"

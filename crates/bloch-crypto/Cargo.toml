@@ -49,7 +49,14 @@ auxpow-rehearsal = []
 
 [dependencies]
 # Post-quantum signatures (hybrid ML-DSA-65 ‖ Falcon-1024) + seeded keygen.
-pqcrypto-mldsa     = "0.1"
+# I-4: pinned to an EXACT version (not a caret range) — this crate's keygen
+# determinism (`generate_keypair_from_seed`, the seeded-RNG override in
+# `pqcrypto-internals`) and the KATs pinned against it are only guaranteed
+# stable within one exact upstream release; a transparent minor-version bump
+# could silently change keygen's internal byte consumption and rotate every
+# derived key. Bumping this pin is a deliberate, reviewed action, not
+# something `cargo update` should ever do on its own.
+pqcrypto-mldsa     = "=0.1.2"
 # F1 (BLOCH-FALCON-ONLINE-SIGNING.md §3.2): default features ("avx2","neon")
 # dispatch Falcon SIGNING to PQClean's native floating-point variants — forbidden
 # for a PoS validator that signs on a public schedule. `default-features = false`
@@ -57,7 +64,8 @@ pqcrypto-mldsa     = "0.1"
 # bit-exact on every platform. Guarded by the
 # `falcon_native_fp_variants_are_not_linked` tripwire test in crypto/mod.rs and
 # by scripts/falcon-clean-guard.sh in CI. Do not re-enable avx2/neon.
-pqcrypto-falcon    = { version = "0.4", default-features = false, features = ["std"] }
+# I-4: pinned exact for the same reason as pqcrypto-mldsa above.
+pqcrypto-falcon    = { version = "=0.4.1", default-features = false, features = ["std"] }
 pqcrypto-traits    = "0.3"
 pqcrypto-internals = "0.2"
 

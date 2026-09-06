@@ -65,18 +65,20 @@ type size_t = usize;
 use core::ffi::c_int;
 
 thread_local! {
-    /// Per-thread seeded RNG override for `PQCRYPTO_RUST_randombytes`.
-    /// When `Some`, PQClean `randombytes` calls pull bytes from this
-    /// deterministic stream instead of OS entropy. When `None`, upstream
-    /// behavior (OS RNG via getrandom) is preserved.
-    static SEEDED_RNG: RefCell<Option<ChaCha20Rng>> = const { RefCell::new(None) };
+    /// Per-thread seeded RNG override STACK for `PQCRYPTO_RUST_randombytes`
+    /// (I-2: a LIFO stack, not a single `Option`, so nesting is well-defined
+    /// — see `with_seeded_rng`'s "Nesting" section). `randombytes_fill`
+    /// always draws from the TOP of the stack; empty ⇒ upstream OS-RNG
+    /// behavior is preserved.
+    static SEEDED_RNG_STACK: RefCell<Vec<ChaCha20Rng>> = const { RefCell::new(Vec::new()) };
 }
 
-/// RAII guard that clears the thread-local seeded RNG when dropped.
+/// RAII guard that pops this call's seeded RNG off the thread-local stack
+/// when dropped, restoring whatever was active before it (I-2).
 ///
 /// Returned by [`with_seeded_rng`]. Hold this for the duration of any
 /// PQClean call that should consume deterministic bytes.
-#[must_use = "guard must remain in scope — dropping it restores OS RNG"]
+#[must_use = "guard must remain in scope — dropping it restores the previous RNG (or OS RNG)"]
 pub struct SeededRngGuard {
     // Private field prevents external construction — the only way to get
     // this guard is via `with_seeded_rng` or the equivalent public API.
@@ -85,8 +87,12 @@ pub struct SeededRngGuard {
 
 impl Drop for SeededRngGuard {
     fn drop(&mut self) {
-        SEEDED_RNG.with(|cell| {
-            cell.borrow_mut().take();
+        // Pop exactly ONE entry — the one this guard pushed. Popping (not
+        // clearing) is what makes nesting a well-defined no-op for the OUTER
+        // scope: the entry below it on the stack, if any, is left untouched
+        // and becomes active again.
+        SEEDED_RNG_STACK.with(|stack| {
+            stack.borrow_mut().pop();
         });
     }
 }
@@ -116,16 +122,26 @@ impl Drop for SeededRngGuard {
 /// // Same seed → same keypair bytes.
 /// ```
 ///
-/// # Nesting
+/// # Nesting (I-2)
 ///
-/// Calling `with_seeded_rng` while a guard is already active REPLACES the
-/// active seed for the duration of the new guard. The previous guard's
-/// drop will then clear the state. In practice, do not nest — it is
-/// almost certainly a bug.
+/// `with_seeded_rng` PUSHES onto a per-thread stack; `randombytes_fill`
+/// always reads the TOP entry; dropping a guard POPS exactly the entry it
+/// pushed. So calling `with_seeded_rng` while a guard is already active is a
+/// well-defined, DOCUMENTED no-op for the outer scope: the inner seed is
+/// active only until the inner guard drops, at which point the outer seed's
+/// stream resumes EXACTLY where it left off — the inner scope does not
+/// consume any of the outer stream's bytes and does not revert the thread to
+/// OS RNG. (The pre-fix implementation stored a single `Option`, so an inner
+/// guard's drop unconditionally cleared it — silently reverting the OUTER
+/// scope to OS entropy for anything between the inner drop and the outer
+/// drop. See `nested_seeded_rng_is_a_documented_noop_for_the_outer_scope`.)
+///
+/// Still not recommended as a matter of style (a nested call SHOULD have a
+/// reason), but it can no longer corrupt an enclosing scope's determinism.
 pub fn with_seeded_rng(seed: &[u8; 32]) -> SeededRngGuard {
     let rng = ChaCha20Rng::from_seed(*seed);
-    SEEDED_RNG.with(|cell| {
-        *cell.borrow_mut() = Some(rng);
+    SEEDED_RNG_STACK.with(|stack| {
+        stack.borrow_mut().push(rng);
     });
     SeededRngGuard { _priv: () }
 }
@@ -138,10 +154,12 @@ pub fn with_seeded_rng(seed: &[u8; 32]) -> SeededRngGuard {
 ///   identical to upstream pqcrypto-internals — and propagates any OS RNG
 ///   failure as `Err` instead of panicking.
 pub fn randombytes_fill(buf: &mut [u8]) -> Result<(), getrandom::Error> {
-    // Fast path: no seeded RNG → upstream behavior exactly.
-    let used_seeded = SEEDED_RNG.with(|cell| {
-        let mut opt = cell.borrow_mut();
-        match opt.as_mut() {
+    // Fast path: no seeded RNG active (empty stack) → upstream behavior
+    // exactly. Otherwise draw from the TOP of the stack (I-2) — the most
+    // recently pushed, still-active guard.
+    let used_seeded = SEEDED_RNG_STACK.with(|stack| {
+        let mut s = stack.borrow_mut();
+        match s.last_mut() {
             Some(rng) => {
                 rng.fill_bytes(buf);
                 true
@@ -497,5 +515,60 @@ mod tests {
 
         // Two reads from the SAME stream should differ — the RNG advances.
         assert_ne!(first_call, second_call);
+    }
+
+    /// I-2 regression: nesting `with_seeded_rng` must be a well-defined
+    /// no-op for the OUTER scope — the outer stream must pick up EXACTLY
+    /// where it left off once the inner guard drops, not fall back to OS
+    /// entropy.
+    ///
+    /// Against the pre-fix single-`Option` implementation this test FAILS:
+    /// the inner guard's `Drop` unconditionally cleared the thread-local, so
+    /// the outer's second read went through the OS-RNG branch instead of any
+    /// seeded stream, and would (with overwhelming probability) differ from
+    /// the un-nested baseline.
+    #[test]
+    fn nested_seeded_rng_is_a_documented_noop_for_the_outer_scope() {
+        let outer_seed = [0x10u8; 32];
+        let inner_seed = [0x20u8; 32];
+
+        // Baseline: two consecutive reads from the outer stream, no nesting.
+        let (baseline_1, baseline_2) = {
+            let _g = with_seeded_rng(&outer_seed);
+            let mut a = [0u8; 32];
+            let mut b = [0u8; 32];
+            randombytes_fill(&mut a).unwrap();
+            randombytes_fill(&mut b).unwrap();
+            (a, b)
+        };
+
+        // Same two reads, but with an inner nested guard in between.
+        let (nested_1, nested_2, inner_bytes) = {
+            let _outer = with_seeded_rng(&outer_seed);
+            let mut a = [0u8; 32];
+            randombytes_fill(&mut a).unwrap();
+
+            let inner_bytes = {
+                let _inner = with_seeded_rng(&inner_seed);
+                let mut i = [0u8; 32];
+                randombytes_fill(&mut i).unwrap();
+                i
+            }; // inner guard dropped here — must restore the OUTER seed, not OS RNG
+
+            let mut b = [0u8; 32];
+            randombytes_fill(&mut b).unwrap();
+            (a, b, inner_bytes)
+        };
+
+        assert_eq!(baseline_1, nested_1, "the outer stream's first read is unaffected by nesting");
+        assert_eq!(
+            baseline_2, nested_2,
+            "the outer stream must resume EXACTLY where it left off after the \
+             inner guard drops — nesting must be a no-op for the outer scope"
+        );
+        // Sanity: the inner scope really was seeded differently (not equal to
+        // either outer read), confirming the inner guard was genuinely active.
+        assert_ne!(inner_bytes, baseline_1);
+        assert_ne!(inner_bytes, baseline_2);
     }
 }

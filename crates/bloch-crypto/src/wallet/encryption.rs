@@ -566,7 +566,7 @@ fn derive_key(
 ///
 /// The denylist is checked after lowercasing and trimming surrounding whitespace
 /// to catch "PASSWORD123" and "  password123  " as equivalents.
-fn validate_password_strength(password: &str) -> Result<(), WalletError> {
+pub(crate) fn validate_password_strength(password: &str) -> Result<(), WalletError> {
     const MIN_LEN: usize = 12;
 
     // Denylist: top ~50 most-breached passwords per public leak corpora.

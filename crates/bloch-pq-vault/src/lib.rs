@@ -57,6 +57,8 @@
 //!    real fix is BIP-360 (P2QRH); this is a stopgap on unmodified Bitcoin. Designed ≠
 //!    built ≠ booted.
 
+#![forbid(unsafe_code)]
+
 pub mod anchor;
 pub mod preimage;
 pub mod script_eval;
@@ -66,6 +68,35 @@ use bitcoin::bip32::{DerivationPath, Xpriv};
 use bitcoin::secp256k1::{Secp256k1, SecretKey};
 use bitcoin::{Address, NetworkKind, PublicKey};
 use std::str::FromStr;
+
+/// A4-M-5: which BIP-32 branch derives a vault's `hot`/`recovery` keys.
+///
+/// The pre-fix derivation reused `bloch_btc_wallet`'s ordinary BIP-84 receive
+/// chain (`m/84'/coin'/0'/0/{0,1}`) — `hot_pubkey` IS the wallet's normal
+/// first receive address (`derive_identity`'s `btc_p2wpkh`), and `recovery_pubkey`
+/// is the SECOND address the wallet hands out next. The vault's own HONEST
+/// LIMITS (§4/§9.4) require the recovery key to be "distinct, unexposed" —
+/// contradicted by deriving it from a chain any wallet UI will show the user
+/// receive funds on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultKeyDerivation {
+    /// Pre-A4-M-5 (default, for compatibility with existing vaults/callers):
+    /// `m/84'/coin'/0'/0/{0,1}` — the SAME path as the wallet's ordinary BIP-84
+    /// receive chain. Kept so an EXISTING vault keeps deriving the keys it was
+    /// built with; never used for a new vault going forward.
+    V1SharedReceiveChain,
+    /// A4-M-5 fix: a dedicated hardened BRANCH no ordinary receive/change
+    /// address ever touches — `m/1998'/coin'/0'/0/{0,1}`. Purpose `1998'` is
+    /// not assigned by any BIP (the `*_44/49/84/86` family are the only
+    /// purpose values `bloch_btc_wallet` or any standard wallet UI derives
+    /// under), so this path can never collide with a receive/change address,
+    /// present or future, however many accounts the wallet creates.
+    V2DedicatedHardenedBranch,
+}
+
+/// Purpose field for [`VaultKeyDerivation::V2DedicatedHardenedBranch`] —
+/// documented here as the single source of truth for the path.
+const VAULT_PURPOSE_V2: &str = "1998'";
 
 /// The on-chain (secp256k1) and post-quantum keys a vault owner derives from ONE seed.
 /// The BTC `hot`/`recovery` keys guard the Bitcoin spend paths; the PQ key produces the
@@ -83,12 +114,23 @@ pub struct VaultKeys {
     pub pq_pubkey: Vec<u8>,
     /// Enveloped PQ secret key — produces `r` and signs the anchor. Keep secret.
     pub pq_secret: Vec<u8>,
+    /// A4-M-5: which BIP-32 branch produced `hot_sk`/`recovery_sk`. Carried so
+    /// a caller that persists vault key material also records how to
+    /// re-derive it — a vault built under one version must always be
+    /// re-derived under that SAME version.
+    pub key_derivation: VaultKeyDerivation,
 }
 
-/// Derive [`VaultKeys`] from a seed. The BTC hot key is BIP-84 index 0, the recovery key
-/// index 1 (a distinct, unexposed key — spec §9.4), on the same account; the PQ keypair
-/// is `bloch_crypto::generate_keypair_from_seed(seed)` (the exact companion key
-/// [`bloch_btc_wallet::derive_identity`] exposes the public half of).
+/// Derive [`VaultKeys`] from a seed under [`VaultKeyDerivation::V1SharedReceiveChain`]
+/// (the historical, UNVERSIONED derivation — BTC hot key at BIP-84 index 0,
+/// recovery at index 1, both on the wallet's ordinary receive chain). The PQ
+/// keypair is `bloch_crypto::generate_keypair_from_seed(seed)` (the exact
+/// companion key [`bloch_btc_wallet::derive_identity`]'s default, V1, PQ
+/// derivation exposes the public half of).
+///
+/// A4-M-5: kept EXACTLY as-is (including panicking on a malformed seed) for
+/// compatibility with existing callers and vaults built under it — see
+/// [`derive_vault_keys_v2`] for the fix (a dedicated, unexposed key branch).
 pub fn derive_vault_keys(seed: &[u8], mainnet: bool) -> VaultKeys {
     let secp = Secp256k1::new();
     let net = if mainnet { NetworkKind::Main } else { NetworkKind::Test };
@@ -108,7 +150,64 @@ pub fn derive_vault_keys(seed: &[u8], mainnet: bool) -> VaultKeys {
     let (pq_pubkey, pq_secret) =
         bloch_crypto::crypto::generate_keypair_from_seed(seed).expect("pq keygen from seed");
 
-    VaultKeys { hot_sk, hot_pubkey, recovery_sk, recovery_pubkey, pq_pubkey, pq_secret }
+    VaultKeys {
+        hot_sk, hot_pubkey, recovery_sk, recovery_pubkey, pq_pubkey, pq_secret,
+        key_derivation: VaultKeyDerivation::V1SharedReceiveChain,
+    }
+}
+
+/// A4-M-5 fix: derive [`VaultKeys`] on a DEDICATED hardened branch
+/// (`m/1998'/coin'/0'/0/{0,1}` — see [`VaultKeyDerivation::V2DedicatedHardenedBranch`])
+/// that no ordinary wallet receive/change address ever touches, so `hot_pubkey`
+/// and especially `recovery_pubkey` are never the same key a wallet UI shows
+/// the user as a deposit address. The PQ keypair also uses
+/// `bloch_btc_wallet::PqSeedKdf::V2DomainSeparated` (I-13), so the vault's PQ
+/// identity no longer shares raw seed material with the BTC leg either.
+///
+/// Fails closed (`Err`) on a malformed seed instead of panicking — new code,
+/// no back-compat constraint to preserve the old `.expect()` behavior.
+pub fn derive_vault_keys_v2(seed: &[u8], mainnet: bool) -> Result<VaultKeys, String> {
+    // I-13/A4-M-5: reject a too-short seed up front. `Xpriv::new_master`
+    // (HMAC-SHA512 over arbitrary-length input) and the SHA3-256 domain
+    // separator for the PQ leg would both formally "succeed" on a tiny seed,
+    // silently deriving low-entropy keys — fail closed instead, matching
+    // `generate_keypair_from_seed`'s own >=32-byte floor.
+    const MIN_SEED_LEN: usize = 32;
+    if seed.len() < MIN_SEED_LEN {
+        return Err(format!("seed too short: {} bytes (need at least {})", seed.len(), MIN_SEED_LEN));
+    }
+
+    let secp = Secp256k1::new();
+    let net = if mainnet { NetworkKind::Main } else { NetworkKind::Test };
+    let coin = if mainnet { "0'" } else { "1'" };
+    let master = Xpriv::new_master(net, seed).map_err(|e| format!("bip32 master: {e}"))?;
+
+    let derive = |idx: u32| -> Result<(SecretKey, PublicKey), String> {
+        let path = DerivationPath::from_str(&format!("m/{VAULT_PURPOSE_V2}/{coin}/0'/0/{idx}"))
+            .map_err(|e| format!("bip32 path: {e}"))?;
+        let xpriv = master.derive_priv(&secp, &path).map_err(|e| format!("bip32 derive: {e}"))?;
+        let sk = xpriv.private_key;
+        let pk = PublicKey::new(sk.public_key(&secp));
+        Ok((sk, pk))
+    };
+    let (hot_sk, hot_pubkey) = derive(0)?;
+    let (recovery_sk, recovery_pubkey) = derive(1)?;
+
+    // Validate seed length + BTC-side reachability the same way
+    // `derive_identity_versioned` does, then derive the PQ keypair directly —
+    // `derive_identity*` deliberately exposes only the PUBLIC half (it is an
+    // identity helper), and the vault needs the secret key too. Sharing
+    // `pq_seed_for` (rather than re-hashing the domain tag here) keeps this
+    // byte-for-byte identical to `derive_identity_versioned`'s PQ pubkey.
+    let pq_seed = bloch_btc_wallet::pq_seed_for(seed, bloch_btc_wallet::PqSeedKdf::V2DomainSeparated)
+        .ok_or_else(|| format!("seed too short: {} bytes (need at least {})", seed.len(), MIN_SEED_LEN))?;
+    let (pq_pubkey, pq_secret) = bloch_crypto::crypto::generate_keypair_from_seed(&pq_seed)
+        .map_err(|e| format!("pq keygen: {e}"))?;
+
+    Ok(VaultKeys {
+        hot_sk, hot_pubkey, recovery_sk, recovery_pubkey, pq_pubkey, pq_secret,
+        key_derivation: VaultKeyDerivation::V2DedicatedHardenedBranch,
+    })
 }
 
 /// Produce a Bitcoin `<DER-sig ‖ SIGHASH_ALL>` witness push: sign `sighash` with `sk`.
@@ -302,7 +401,7 @@ mod e2e_tests {
         let (keys, p, r) = setup(vault_id);
 
         // (1) hybrid identity is real: same seed → the wallet's PQ pubkey matches ours
-        let id = bloch_btc_wallet::derive_identity(&seed(), false);
+        let id = bloch_btc_wallet::derive_identity(&seed(), false).unwrap();
         assert_eq!(id.pq_pubkey, keys.pq_pubkey);
 
         // (2) build the vault
@@ -396,6 +495,66 @@ mod e2e_tests {
         assert!(validate_destination("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", NET).is_err());
         // garbage is rejected
         assert!(validate_destination("not-an-address", NET).is_err());
+    }
+
+    // ── A4-M-5: vault key derivation versioning ─────────────────────────────
+
+    /// A4-M-5 KAT: `derive_vault_keys` (V1) must remain byte-for-byte what it
+    /// always was for the canonical seed — the SAME hot/recovery pubkeys the
+    /// pre-fix code produced. Pins the exact BIP-84 receive-chain keys so an
+    /// existing vault built under V1 never silently re-derives to different
+    /// keys.
+    #[test]
+    fn v1_vault_keys_are_pinned_and_unchanged() {
+        let keys = derive_vault_keys(&seed(), false);
+        assert_eq!(keys.key_derivation, VaultKeyDerivation::V1SharedReceiveChain);
+        assert_eq!(
+            keys.hot_pubkey.to_string(),
+            "02e7ab2537b5d49e970309aae06e9e49f36ce1c9febbd44ec8e0d1cca0b4f9c319",
+            "V1 hot key must stay pinned to the historical BIP-84 m/84'/1'/0'/0/0 derivation"
+        );
+        assert_eq!(
+            keys.recovery_pubkey.to_string(),
+            "03eeed205a69022fed4a62a02457f3699b19c06bf74bf801acc6d9ae84bc16a9e1",
+            "V1 recovery key must stay pinned to m/84'/1'/0'/0/1"
+        );
+    }
+
+    /// A4-M-5: V1 (shared receive chain) and V2 (dedicated hardened branch)
+    /// must derive DIFFERENT hot/recovery keys for the identical seed — this
+    /// is the entire point of the fix (the vault's recovery key must not be
+    /// the wallet's ordinary next receive address).
+    #[test]
+    fn v1_and_v2_vault_keys_diverge() {
+        let v1 = derive_vault_keys(&seed(), false);
+        let v2 = derive_vault_keys_v2(&seed(), false).unwrap();
+        assert_eq!(v2.key_derivation, VaultKeyDerivation::V2DedicatedHardenedBranch);
+        assert_ne!(v1.hot_pubkey, v2.hot_pubkey, "hot key must differ between V1 and V2");
+        assert_ne!(v1.recovery_pubkey, v2.recovery_pubkey, "recovery key must differ between V1 and V2");
+        assert_ne!(v1.hot_pubkey, v1.recovery_pubkey);
+        assert_ne!(v2.hot_pubkey, v2.recovery_pubkey);
+        // The PQ leg also diverges (I-13's domain-separated seed for V2).
+        assert_ne!(v1.pq_pubkey, v2.pq_pubkey);
+    }
+
+    /// A4-M-5: V2's hot/recovery keys must NOT equal the wallet's ordinary
+    /// BIP-84 receive-chain keys (index 0/1) that `bloch_btc_wallet::derive_identity`
+    /// and V1 both expose — the concrete "distinct, unexposed" requirement
+    /// the finding reported as violated.
+    #[test]
+    fn v2_vault_keys_are_not_the_wallet_receive_chain() {
+        let v2 = derive_vault_keys_v2(&seed(), false).unwrap();
+        let identity = bloch_btc_wallet::derive_identity(&seed(), false).unwrap();
+        // The wallet's normal first receive address's pubkey is exactly V1's
+        // hot_pubkey (compressed secp256k1 bytes) — confirm V2 is different.
+        assert_ne!(v2.hot_pubkey.to_bytes(), identity.btc_pubkey);
+    }
+
+    /// A4-M-5: `derive_vault_keys_v2` must fail closed on a short seed rather
+    /// than panic — new code, no back-compat panic behavior to preserve.
+    #[test]
+    fn v2_fails_closed_on_short_seed() {
+        assert!(derive_vault_keys_v2(&[0x11u8; 8], false).is_err());
     }
 
     // ── helpers ──

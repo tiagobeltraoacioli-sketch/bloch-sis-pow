@@ -131,6 +131,42 @@ pub fn generate_keypair_from_seed(seed: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Cry
         wrap_envelope(SUITE_MLDSA65_FALCON1024, &sk)))
 }
 
+// ── Signed-message domain (A4-M-4) ──────────────────────────────────────────
+//
+// `crypto::sign` signs its `message` argument verbatim. Every OTHER caller in
+// the codebase signs a 32-byte digest whose PREIMAGE is domain-tagged (tx
+// sighash, disclosure digest, PoS signing root, transport handshake). A
+// "sign arbitrary user-supplied text" CLI/API flow that fed raw text straight
+// into `crypto::sign` had no such tag: a 64-hex-character "message" is a raw
+// 32-byte digest, indistinguishable at the signature layer from an attacker-
+// chosen tx sighash preimage — a "prove you own this address by signing this
+// challenge" flow could silently produce a valid transaction/disclosure
+// signature. `signed_message_digest` closes that: length-prefixed AND
+// domain-tagged, so no choice of `message` bytes (hex-looking or otherwise)
+// can ever collide with another domain's preimage.
+
+/// Domain tag for the "sign an arbitrary message" flow. Distinct from every
+/// other signing domain in the codebase; not a prefix of any of them and none
+/// of them are a prefix of this one.
+pub const SIGNED_MESSAGE_DOMAIN: &[u8] = b"BLOCH-SIGNED-MESSAGE-v1";
+
+/// The digest a "sign this message" flow actually signs: SHA3-256(
+/// `SIGNED_MESSAGE_DOMAIN` ‖ `message.len() as u64 LE` ‖ `message`).
+///
+/// Callers MUST pass the message's raw bytes as the user typed/supplied them
+/// — NEVER hex-decode user-supplied text first. Hex-decoding a 64-character
+/// message before this point is exactly the bug this function exists to
+/// close: it would turn a "sign this challenge" phishing prompt back into
+/// "sign this raw 32-byte digest", regardless of what digest gets computed
+/// afterwards.
+pub fn signed_message_digest(message: &[u8]) -> [u8; 32] {
+    let mut h = Sha3_256::new();
+    h.update(SIGNED_MESSAGE_DOMAIN);
+    h.update((message.len() as u64).to_le_bytes());
+    h.update(message);
+    h.finalize().into()
+}
+
 pub fn sign(secret_key_bytes: &[u8], message: &[u8]) -> Result<Vec<u8>, CryptoError> {
     // Parse the suite envelope on the secret key, then produce a signature
     // enveloped under the SAME suite. Parse failure ⇒ Err (never a panic).
@@ -166,10 +202,9 @@ pub fn sign(secret_key_bytes: &[u8], message: &[u8]) -> Result<Vec<u8>, CryptoEr
 /// carry-over wallets created before the 4-byte header (their address is
 /// `SHA3-256(raw hybrid pubkey)`) present a bare `mldsa ‖ falcon` body with no
 /// magic. Treat a no-magic object as suite 0x0001 (hybrid), the only suite the
-/// old chain produced. A genuine hybrid pubkey/sig never starts with `B1 0C`
-/// (those are ML-DSA bytes), so this is unambiguous; a mismatch still ⇒ verify
-/// false via the body checks. This restores spendability of pre-envelope
-/// carry-over funds without weakening enveloped verification. CONSENSUS-CRITICAL.
+/// old chain produced. A mismatch still ⇒ verify false via the body checks.
+/// This restores spendability of pre-envelope carry-over funds without
+/// weakening enveloped verification. CONSENSUS-CRITICAL.
 fn parse_envelope_or_legacy(b: &[u8]) -> (u16, &[u8]) {
     match parse_envelope(b) {
         Some((suite, body)) => (suite, body),
@@ -177,12 +212,43 @@ fn parse_envelope_or_legacy(b: &[u8]) -> (u16, &[u8]) {
     }
 }
 
+/// Exact byte length of a raw (non-enveloped) legacy hybrid ML-DSA-65 ‖
+/// Falcon-1024 PUBLIC key — `MLDSA_PUBKEY_LEN` plus the Falcon-1024 public-key
+/// length, both fixed. An ENVELOPED pubkey of the same suite is always
+/// exactly `SUITE_HEADER_LEN` bytes LONGER, so length alone disambiguates
+/// legacy-vs-enveloped with no ambiguity — see [`parse_pubkey_envelope_or_legacy`].
+fn legacy_hybrid_pubkey_len() -> usize {
+    MLDSA_PUBKEY_LEN + falcon::pubkey_len()
+}
+
+/// Public-key-specific version of [`parse_envelope_or_legacy`] (audit A4
+/// lows / legacy pubkey fallback).
+///
+/// A raw legacy pubkey has a `1/65536` chance of happening to start with the
+/// two-byte magic `[0xB1, 0x0C]` — plain hybrid key material, not a crafted
+/// attack. `parse_envelope_or_legacy` would then misclassify it as enveloped
+/// (treating its bytes 2..4 as a bogus suite id), corrupting the suite
+/// dispatch in `verify` and permanently locking those funds even though the
+/// key and signature are both genuine.
+///
+/// Length resolves this with no heuristics: an ENVELOPED hybrid pubkey is
+/// *exactly* `SUITE_HEADER_LEN` (4) bytes longer than the raw legacy
+/// encoding, so the two encodings can never collide on length. Checking the
+/// exact legacy length FIRST — before the magic-byte heuristic — means a
+/// legacy pubkey is classified correctly regardless of its leading bytes.
+fn parse_pubkey_envelope_or_legacy(b: &[u8]) -> (u16, &[u8]) {
+    if b.len() == legacy_hybrid_pubkey_len() {
+        return (SUITE_MLDSA65_FALCON1024, b);
+    }
+    parse_envelope_or_legacy(b)
+}
+
 pub fn verify(public_key_bytes: &[u8], message: &[u8], signature_bytes: &[u8]) -> bool {
     // Suite-ID dispatch (design §2.3). Accepts enveloped objects AND legacy
     // pre-envelope (raw hybrid) objects from the carry-over. A pk of one suite
     // must not verify a sig of another. Any body parse failure ⇒ false, never a
     // panic (consensus rule). NO security is claimed.
-    let (pk_suite, pk_body) = parse_envelope_or_legacy(public_key_bytes);
+    let (pk_suite, pk_body) = parse_pubkey_envelope_or_legacy(public_key_bytes);
     let (sig_suite, sig_body) = parse_envelope_or_legacy(signature_bytes);
     if pk_suite != sig_suite {
         debug!("crypto::verify: suite mismatch (pk={:#06x}, sig={:#06x})", pk_suite, sig_suite);
@@ -712,6 +778,52 @@ mod kat {
         );
         // Sanity: a different message must fail (the wrapper really checks it).
         assert!(!verify(&pk, b"other", &sig));
+    }
+
+    /// A genuine LEGACY (non-enveloped) hybrid object — no magic, no header,
+    /// exactly the carry-over encoding — must still verify through the public
+    /// `verify()` entry point via the length-based classification.
+    #[test]
+    fn genuine_legacy_raw_hybrid_verifies_through_bloch() {
+        let msg = b"legacy-carry-over-raw-hybrid";
+        let (mpk, msk) = mldsa65::keypair();
+        let (fpk, fsk) = falcon1024::keypair();
+
+        let mut pk_raw = mpk.as_bytes().to_vec();
+        pk_raw.extend_from_slice(fpk.as_bytes());
+        let mut sig_raw = mldsa65::detached_sign(msg, &msk).as_bytes().to_vec();
+        sig_raw.extend_from_slice(falcon1024::detached_sign(msg, &fsk).as_bytes());
+
+        assert_eq!(pk_raw.len(), legacy_hybrid_pubkey_len());
+        assert!(verify(&pk_raw, msg, &sig_raw), "genuine raw legacy hybrid must verify");
+        assert!(!verify(&pk_raw, b"other", &sig_raw));
+    }
+
+    /// A4 lows (legacy pubkey fallback): a raw legacy pubkey that happens to
+    /// start with the 4-byte suite header's magic `[0xB1, 0x0C]` must NOT be
+    /// misclassified as an enveloped object. A genuine collision is a
+    /// 1-in-65536 event over real key material — far too rare to brute-force
+    /// a real ML-DSA-65 keypair for in a test — so this constructs the
+    /// SHAPE directly: a buffer of exactly `legacy_hybrid_pubkey_len()` bytes
+    /// leading with the magic. Length alone must win the classification.
+    #[test]
+    fn legacy_pubkey_starting_with_envelope_magic_is_not_misclassified() {
+        let len = legacy_hybrid_pubkey_len();
+        let mut raw_pk = vec![0xABu8; len];
+        raw_pk[0] = 0xB1;
+        raw_pk[1] = 0x0C;
+
+        let (suite, body) = parse_pubkey_envelope_or_legacy(&raw_pk);
+        assert_eq!(suite, SUITE_MLDSA65_FALCON1024, "exact legacy length must win over the magic heuristic");
+        assert_eq!(body.len(), len, "the WHOLE buffer is the body — no header may be stripped");
+
+        // Contrast: the magic-only heuristic (`parse_envelope_or_legacy`, still
+        // used for signatures, whose length is not fixed) DOES misread this
+        // buffer as enveloped and strips 4 bytes — demonstrating the bug this
+        // pubkey-specific fix closes.
+        let (old_suite, old_body) = parse_envelope_or_legacy(&raw_pk);
+        assert_eq!(old_body.len(), len - SUITE_HEADER_LEN, "sanity: the naive heuristic strips a header here");
+        assert_ne!(old_suite, suite, "sanity: the naive heuristic derives a bogus suite id from key bytes");
     }
 
     // ─── (A) Reference-equivalence: Bloch-built halves parse as upstream prims ─

@@ -24,9 +24,49 @@
 
 use super::errors::WalletError;
 use zeroize::{Zeroize, ZeroizeOnDrop};
+use serde::{Serialize, Deserialize};
 use sha2::Sha512;
 use hmac::Hmac;
 use pbkdf2::pbkdf2;
+
+/// Which PRF turns a BIP39 mnemonic into the 64-byte seed (finding K-M3).
+///
+/// `to_seed_bytes` was originally PBKDF2-HMAC-**SHA256** — not BIP39, but it
+/// still returned 64 deterministic bytes, so nothing failed loudly. Fixing the
+/// PRF to the correct HMAC-**SHA512** means every wallet created under the old
+/// code silently derives a DIFFERENT key from the same mnemonic the moment the
+/// fix ships, with no error — pure data loss unless the derivation itself is
+/// made an explicit, persisted choice instead of a single hardcoded function.
+///
+/// FOUNDER DECISION (recorded here, not merely in a comment):
+///   - Every NEW wallet defaults to [`SeedVersion::V2Bip39Sha512`].
+///   - Any wallet already created under V1 keeps deriving under V1 FOREVER —
+///     there is no automatic migration or sweep. Moving funds derived under
+///     one version to the other without the owner's explicit action would
+///     mean silently retargeting a spend to an address the owner did not
+///     choose, which is worse than doing nothing.
+///   - `recover`/`from_seed`-style entry points must therefore take an
+///     explicit version. When the caller does not know which version created
+///     a given mnemonic backup, derive under BOTH and let the caller resolve
+///     the ambiguity (a matching address the user typed, or on-chain history
+///     — see [`crate::wallet::Wallet::recover_resolved`]), never guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SeedVersion {
+    /// Pre-K-M3: PBKDF2-HMAC-**SHA256**. NOT BIP39. Kept only so a wallet
+    /// created before the fix can still be reopened under the SAME key it was
+    /// created with — never used for a new wallet.
+    #[serde(rename = "v1-pbkdf2-sha256")]
+    V1LegacyPbkdf2Sha256,
+    /// K-M3 fix: PBKDF2-HMAC-**SHA512**, the standard BIP39 seed. Default for
+    /// every new wallet.
+    #[serde(rename = "v2-bip39-sha512")]
+    V2Bip39Sha512,
+}
+
+impl Default for SeedVersion {
+    /// New wallets default to V2 — see the founder decision above.
+    fn default() -> Self { SeedVersion::V2Bip39Sha512 }
+}
 
 // English BIP39 wordlist — 2048 words
 // In production, this should be loaded from a file; for simplicity we include
@@ -87,42 +127,74 @@ impl SeedPhrase {
     ///
     /// These bytes are the starting material for key derivation. For ML-DSA-65,
     /// we use the first 32 bytes as the keygen seed.
+    ///
+    /// Equivalent to `to_seed_bytes_versioned(SeedVersion::V2Bip39Sha512, "")`.
+    /// Kept for source compatibility with callers written before the
+    /// versioned API existed. The `.expect` below asserts an algorithm
+    /// invariant, not something derived from untrusted input: PBKDF2-HMAC
+    /// only reports `InvalidLength` when the requested output exceeds
+    /// `(2^32 - 1) * hash_output_len` bytes, which a fixed 64-byte output can
+    /// never hit.
     pub fn to_seed_bytes(&self) -> [u8; 64] {
+        self.to_seed_bytes_versioned(SeedVersion::V2Bip39Sha512, "")
+            .expect("PBKDF2-HMAC-SHA512 with a 64-byte output cannot fail")
+    }
+
+    /// Derive the 64-byte seed under an EXPLICIT `version` and BIP39
+    /// `passphrase` (the "25th word"; pass `""` when none is set).
+    ///
+    /// K-M3: this is the only entry point that can reproduce a PRE-fix (V1)
+    /// wallet — callers that must reopen an existing wallet whose version is
+    /// unknown should derive under both variants (see
+    /// [`crate::wallet::Wallet::recover_ambiguous`]) rather than assume V2.
+    ///
+    /// Propagates the KDF crate's `Result` instead of discarding it (K-M3
+    /// lows) — for these fixed-size, non-empty parameters PBKDF2-HMAC cannot
+    /// actually fail, but a future change to the output length or PRF must
+    /// not be able to silently swallow a real error into wrong key bytes.
+    pub fn to_seed_bytes_versioned(
+        &self,
+        version: SeedVersion,
+        passphrase: &str,
+    ) -> Result<[u8; 64], WalletError> {
+        // BIP39 salt = "mnemonic" || passphrase (empty passphrase == plain
+        // "mnemonic", matching every external BIP39 tool and the pinned
+        // vectors below).
+        let mut salt = Vec::with_capacity(8 + passphrase.len());
+        salt.extend_from_slice(b"mnemonic");
+        salt.extend_from_slice(passphrase.as_bytes());
+
         let mut out = [0u8; 64];
-        let _ = pbkdf2::<Hmac<Sha512>>(
-            self.phrase.as_bytes(),
-            b"mnemonic",
-            2048,
-            &mut out,
-        );
-        out
+        match version {
+            SeedVersion::V2Bip39Sha512 => {
+                pbkdf2::<Hmac<Sha512>>(self.phrase.as_bytes(), &salt, 2048, &mut out)
+                    .map_err(|e| WalletError::Crypto(format!("pbkdf2 (seed v2): {}", e)))?;
+            }
+            SeedVersion::V1LegacyPbkdf2Sha256 => {
+                use sha2::Sha256;
+                pbkdf2::<Hmac<Sha256>>(self.phrase.as_bytes(), &salt, 2048, &mut out)
+                    .map_err(|e| WalletError::Crypto(format!("pbkdf2 (seed v1): {}", e)))?;
+            }
+        }
+        Ok(out)
     }
 
     /// The pre-K-M3, non-BIP39 seed: PBKDF2-**HMAC-SHA256**, same salt and
-    /// iteration count.
+    /// iteration count. Equivalent to
+    /// `to_seed_bytes_versioned(SeedVersion::V1LegacyPbkdf2Sha256, "")`.
     ///
-    /// Kept ONLY so migration/sweep tooling can re-derive a wallet that was
-    /// created while `to_seed_bytes` used SHA-256 and move its funds to the
-    /// corrected address. It is not BIP39 and must never seed a new wallet.
-    ///
-    /// NEEDS-FOUNDER-DECISION: whether any wallet in the wild was derived
-    /// through the SHA-256 path, and if so whether the fix ships with an
-    /// automatic sweep, a manual recovery tool, or an explicit refusal to
-    /// support the old derivation. Until that is answered this function is the
-    /// only code in the tree that can reach those keys, so it stays.
+    /// FOUNDER DECISION (resolved — see [`SeedVersion`]): NOT swept or
+    /// migrated automatically. A wallet created under V1 keeps deriving under
+    /// V1 forever; `SeedVersion` makes that an explicit, callable choice
+    /// instead of leaving this the only path to the old keys. It is not
+    /// BIP39 and must never seed a NEW wallet.
     #[deprecated(
-        note = "not BIP39 (SHA-256 PRF); migration/sweep tooling only, never for new wallets"
+        note = "not BIP39 (SHA-256 PRF); use SeedVersion::V1LegacyPbkdf2Sha256 via \
+                to_seed_bytes_versioned. Never for new wallets."
     )]
     pub fn to_seed_bytes_legacy_sha256(&self) -> [u8; 64] {
-        use sha2::Sha256;
-        let mut out = [0u8; 64];
-        let _ = pbkdf2::<Hmac<Sha256>>(
-            self.phrase.as_bytes(),
-            b"mnemonic",
-            2048,
-            &mut out,
-        );
-        out
+        self.to_seed_bytes_versioned(SeedVersion::V1LegacyPbkdf2Sha256, "")
+            .expect("PBKDF2-HMAC-SHA256 with a 64-byte output cannot fail")
     }
 
     /// Returns the phrase as words. For display purposes only.
@@ -299,6 +371,45 @@ mod tests {
             ),
             "legacy derivation moved — wallets created before K-M3 would become unreachable"
         );
+    }
+
+    /// K-M3: `to_seed_bytes_versioned` must exactly reproduce both the V2
+    /// (BIP39-correct) and V1 (pre-fix) KATs pinned above via the explicit
+    /// version parameter, and the two must disagree — this is the whole
+    /// point of making the version an explicit, callable choice instead of
+    /// one hardcoded function.
+    #[test]
+    fn to_seed_bytes_versioned_matches_both_kats() {
+        let seed = SeedPhrase::parse(&phrase(ABANDON_12)).unwrap();
+
+        let v2 = seed.to_seed_bytes_versioned(SeedVersion::V2Bip39Sha512, "").unwrap();
+        assert_eq!(v2.to_vec(), hex(ABANDON_12_SEED), "V2 must match the official BIP39 vector");
+        assert_eq!(v2, seed.to_seed_bytes(), "to_seed_bytes must equal explicit V2");
+
+        #[allow(deprecated)]
+        let legacy = seed.to_seed_bytes_legacy_sha256();
+        let v1 = seed.to_seed_bytes_versioned(SeedVersion::V1LegacyPbkdf2Sha256, "").unwrap();
+        assert_eq!(v1, legacy, "V1 must match the deprecated legacy function byte-for-byte");
+        assert_ne!(v1, v2, "K-M3: the two seed versions must never collide");
+    }
+
+    /// K-M3 lows: the BIP39 passphrase ("25th word") must actually change the
+    /// derived seed, and do so identically to the `bip39` crate's own
+    /// `to_seed(passphrase)` — before this fix `to_seed_bytes` had no
+    /// passphrase parameter at all, so a passphrase-protected mnemonic was
+    /// unrecoverable through this API.
+    #[test]
+    fn passphrase_changes_the_seed_and_matches_bip39_crate() {
+        let seed = SeedPhrase::parse(&phrase(ABANDON_12)).unwrap();
+        let mnemonic = bip39::Mnemonic::parse(&phrase(ABANDON_12)).unwrap();
+
+        let no_pass = seed.to_seed_bytes_versioned(SeedVersion::V2Bip39Sha512, "").unwrap();
+        let with_pass = seed
+            .to_seed_bytes_versioned(SeedVersion::V2Bip39Sha512, "TREZOR")
+            .unwrap();
+        assert_ne!(no_pass, with_pass, "a non-empty passphrase must change the seed");
+        assert_eq!(with_pass.to_vec(), mnemonic.to_seed("TREZOR").to_vec());
+        assert_eq!(no_pass.to_vec(), mnemonic.to_seed("").to_vec());
     }
 
     #[test]

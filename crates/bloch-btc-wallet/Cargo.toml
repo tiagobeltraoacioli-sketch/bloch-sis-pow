@@ -12,3 +12,7 @@ license = "AGPL-3.0-or-later"
 bitcoin = "0.32"
 bloch-crypto = { path = "../bloch-crypto" }
 bloch-euvm = { path = "../bloch-euvm" }
+# I-13: domain-separate the companion PQ keygen seed from the raw BTC master
+# seed instead of reusing it verbatim.
+sha3 = "0.10"
+thiserror = "2"

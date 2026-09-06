@@ -7,6 +7,10 @@
 //! Merkle accumulator, and `check_spend` — the exact statement the ZK circuit
 //! proves. No node/std-heavy dependencies, so it compiles for the zkVM target.
 
+// I-4: no `unsafe` is needed anywhere in this crate (including the zkVM
+// guest target), so forbid it outright rather than merely avoid it.
+#![forbid(unsafe_code)]
+
 use serde::{Serialize, Deserialize};
 use sha3::{Shake256, digest::{Update, ExtendableOutput, XofReader}};
 

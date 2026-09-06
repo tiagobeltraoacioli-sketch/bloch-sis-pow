@@ -21,7 +21,7 @@ use crate::crypto;
 use crate::wallet::{Keypair, KdfParams, KeystoreCrypto};
 use crate::core::TESTNET_PREFIX;
 use serde::{Serialize, Deserialize};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, KeyInit}};
 use argon2::{Argon2, Algorithm, Version, Params};
 use base64::{Engine as _, engine::general_purpose as b64};
@@ -68,7 +68,10 @@ struct KeypairPayload { private_key_hex: String, public_key_hex: String }
 
 pub struct HdWallet {
     pub mnemonic: Mnemonic,
-    pub master_key: Vec<u8>,      // derived from mnemonic + passphrase + password
+    // SECURITY (A4 lows): never read outside this module — no legitimate
+    // external consumer needs the raw derived encryption key (unlike
+    // `mnemonic`, which `bloch-cli` displays to the user for backup).
+    master_key: Vec<u8>,      // derived from mnemonic + passphrase + password
     /// BIP39 seed (mnemonic + passphrase). Master seed for key DERIVATION —
     /// no password in it, so the mnemonic alone recovers the keys.
     seed: Vec<u8>,
@@ -77,6 +80,16 @@ pub struct HdWallet {
     /// every address of a pre-v3 random-key wallet).
     imported: BTreeSet<u32>,
     pub network:  String,
+    /// A4 H-1: the wallet-FILE version this instance was created or loaded
+    /// under (1 = constant salt, 2/3 = per-wallet salt — see
+    /// `derive_master_key`). `save()` re-encrypts with `master_key`, which was
+    /// derived using THIS version's salt; writing a DIFFERENT version number
+    /// while keeping the same key would make the file permanently
+    /// undecryptable (`load` would derive the salt for the wrong version).
+    /// `create`/`recover` always start a brand-new file at the CURRENT
+    /// `WALLET_VERSION`; `load` preserves whatever version the file already
+    /// had, so re-saving a v1/v2 file never breaks it.
+    file_version: u32,
 }
 
 impl Drop for HdWallet {
@@ -112,6 +125,7 @@ impl HdWallet {
             addresses: vec![(0, kp, "primary".to_string())],
             imported: BTreeSet::new(),
             network,
+            file_version: WALLET_VERSION,
         })
     }
 
@@ -146,6 +160,7 @@ impl HdWallet {
             addresses,
             imported: BTreeSet::new(),
             network: if testnet { "testnet" } else { "mainnet" }.to_string(),
+            file_version: WALLET_VERSION,
         })
     }
 
@@ -210,9 +225,17 @@ impl HdWallet {
         }
 
         let wallet = HdWalletFile {
-            // v3: seed-derived keys + per-address `derived` flag. v2 (per-wallet
-            // Argon2 salt) and v1 (constant salt) files still load unchanged.
-            version: WALLET_VERSION,
+            // A4 H-1 FIX: write the version THIS instance's `master_key` was
+            // actually derived under (`self.file_version`), never the
+            // hardcoded current `WALLET_VERSION`. `create`/`recover` set
+            // `file_version = WALLET_VERSION` for a brand-new file, so new
+            // wallets are unaffected; `load` preserves whatever version an
+            // existing v1/v2 file already carried, so re-saving it keeps the
+            // SAME salt on the NEXT load instead of silently becoming
+            // undecryptable (the exact bug this replaces: the old code always
+            // wrote `WALLET_VERSION` here while still encrypting with the
+            // key derived under the file's ORIGINAL version/salt).
+            version: self.file_version,
             format: "hd-wallet-v1".into(),
             network: self.network.clone(),
             mnemonic_crypto,
@@ -240,8 +263,10 @@ impl HdWallet {
         // constant salt, v2+ per-wallet), so existing wallets still decrypt.
         let master_key = derive_master_key(&mnemonic.to_string(), passphrase.unwrap_or(""), password, wallet.version)?;
 
-        // Verify mnemonic matches (by decrypting and comparing)
-        let mnemonic_bytes = decrypt_with_key(&master_key, &wallet.mnemonic_crypto)?;
+        // Verify mnemonic matches (by decrypting and comparing). Wrapped in
+        // Zeroizing (A4 lows): this plaintext carries the full mnemonic in
+        // JSON form and must not linger in memory after the comparison below.
+        let mnemonic_bytes = Zeroizing::new(decrypt_with_key(&master_key, &wallet.mnemonic_crypto)?);
         let payload: MnemonicPayload = serde_json::from_slice(&mnemonic_bytes)
             .map_err(|e| format!("mnemonic decrypt failed — wrong password/passphrase/mnemonic ({})", e))?;
         if payload.mnemonic != mnemonic.to_string() {
@@ -254,7 +279,9 @@ impl HdWallet {
         let mut addresses = Vec::new();
         let mut imported = BTreeSet::new();
         for addr in &wallet.addresses {
-            let bytes = decrypt_with_key(&master_key, &addr.keypair_crypto)?;
+            // Zeroizing (A4 lows): plaintext JSON containing the hex-encoded
+            // private key — must not survive past the parse below.
+            let bytes = Zeroizing::new(decrypt_with_key(&master_key, &addr.keypair_crypto)?);
             let mut kpp: KeypairPayload = serde_json::from_slice(&bytes)
                 .map_err(|e| format!("keypair {} decrypt failed: {}", addr.index, e))?;
             let priv_key = hex::decode(&kpp.private_key_hex).map_err(|e| e.to_string())?;
@@ -278,7 +305,14 @@ impl HdWallet {
         }
 
         let seed = mnemonic.to_seed(passphrase.unwrap_or("")).to_vec();
-        Ok(HdWallet { mnemonic, master_key, seed, addresses, imported, network: wallet.network })
+        // A4 H-1 FIX: preserve the file's OWN version — `master_key` above
+        // was derived under `wallet.version`'s salt, so `save()` must write
+        // that SAME version back, not the current `WALLET_VERSION`.
+        Ok(HdWallet {
+            mnemonic, master_key, seed, addresses, imported,
+            network: wallet.network,
+            file_version: wallet.version,
+        })
     }
 
     /// List all addresses (for display).
@@ -358,6 +392,24 @@ fn encrypt_with_key(key: &[u8], plaintext: &[u8]) -> Result<KeystoreCrypto, Stri
 fn decrypt_with_key(key: &[u8], crypto: &KeystoreCrypto) -> Result<Vec<u8>, String> {
     let nonce_b = b64::STANDARD.decode(&crypto.nonce).map_err(|e| e.to_string())?;
     let ct = b64::STANDARD.decode(&crypto.ciphertext).map_err(|e| e.to_string())?;
+    // SECURITY (A4 lows): `Nonce::from_slice` PANICS on any length other than
+    // 12 bytes. `nonce_b` comes from an untrusted wallet file — guard the
+    // length BEFORE it reaches the fixed-size AES-GCM nonce so a truncated or
+    // corrupt file returns an error instead of crashing the process.
+    const NONCE_LEN: usize = 12;
+    const GCM_TAG_LEN: usize = 16;
+    if nonce_b.len() != NONCE_LEN {
+        return Err(format!(
+            "wallet-file nonce has invalid length: expected {} bytes, got {}",
+            NONCE_LEN, nonce_b.len()
+        ));
+    }
+    if ct.len() < GCM_TAG_LEN {
+        return Err(format!(
+            "wallet-file ciphertext too short: {} bytes, need at least the {}-byte GCM tag",
+            ct.len(), GCM_TAG_LEN
+        ));
+    }
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     cipher.decrypt(Nonce::from_slice(&nonce_b), ct.as_ref())
         .map_err(|_| "decrypt failed — wrong credentials".to_string())
@@ -471,5 +523,110 @@ mod tests {
         assert!(!loaded.is_derived(1));
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// A4 H-1 regression: a genuine v1-shaped file (constant Argon2 salt)
+    /// must remain decryptable through `load → new_address → save → load`.
+    ///
+    /// Before the fix, `save()` unconditionally stamped `version:
+    /// WALLET_VERSION` (3) into the file while still encrypting with
+    /// `self.master_key` — which for a v1-loaded wallet was derived under the
+    /// v1 CONSTANT salt. The next `load()` would then read `version: 3`,
+    /// derive the v2+ per-wallet salt for this mnemonic, and decryption would
+    /// fail PERMANENTLY (wrong key). This test fails on the pre-fix code at
+    /// the second `load()` with a "wrong password/passphrase/mnemonic" error
+    /// — reverting the `file_version` field / `save()`'s `self.file_version`
+    /// write turns this red again.
+    #[test]
+    fn v1_file_survives_load_new_address_save_load_roundtrip() {
+        let tmp = std::env::temp_dir().join("bloch-hd-v1-roundtrip-test.json");
+        let _ = std::fs::remove_file(&tmp);
+
+        let password = "test-password-12345!";
+        let mnemonic = Mnemonic::from_entropy(&[0x11u8; 32]).unwrap();
+        let mnemonic_str = mnemonic.to_string();
+
+        let v1_file = build_raw_file(&mnemonic, &mnemonic_str, password, 1);
+        std::fs::write(&tmp, serde_json::to_string_pretty(&v1_file).unwrap()).unwrap();
+
+        let mut w = HdWallet::load(&tmp, &mnemonic_str, None, password).unwrap();
+        assert_eq!(w.file_version, 1, "loaded instance must remember it came from a v1 file");
+        w.new_address("second").unwrap();
+        w.save(&tmp).unwrap();
+
+        let w2 = HdWallet::load(&tmp, &mnemonic_str, None, password)
+            .expect("v1 file must remain decryptable after a save — A4 H-1 regression");
+        assert_eq!(w2.addresses.len(), 2);
+        assert_eq!(w2.file_version, 1, "re-saved file must still be recorded/read back as v1");
+
+        // A second round trip (save → load → save → load) must also hold.
+        w2.save(&tmp).unwrap();
+        let w3 = HdWallet::load(&tmp, &mnemonic_str, None, password).unwrap();
+        assert_eq!(w3.addresses.len(), 2);
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Same regression, for a v2-shaped file (per-wallet salt, no `derived`
+    /// flags) — the version-persistence fix must not be special-cased to v1.
+    #[test]
+    fn v2_file_survives_load_new_address_save_load_roundtrip() {
+        let tmp = std::env::temp_dir().join("bloch-hd-v2-roundtrip-test.json");
+        let _ = std::fs::remove_file(&tmp);
+
+        let password = "test-password-12345!";
+        let mnemonic = Mnemonic::from_entropy(&[0x22u8; 32]).unwrap();
+        let mnemonic_str = mnemonic.to_string();
+
+        let v2_file = build_raw_file(&mnemonic, &mnemonic_str, password, 2);
+        std::fs::write(&tmp, serde_json::to_string_pretty(&v2_file).unwrap()).unwrap();
+
+        let mut w = HdWallet::load(&tmp, &mnemonic_str, None, password).unwrap();
+        assert_eq!(w.file_version, 2);
+        w.new_address("second").unwrap();
+        w.save(&tmp).unwrap();
+
+        let w2 = HdWallet::load(&tmp, &mnemonic_str, None, password)
+            .expect("v2 file must remain decryptable after a save");
+        assert_eq!(w2.addresses.len(), 2);
+        assert_eq!(w2.file_version, 2);
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Hand-build a genuine `HdWalletFile` at an explicit `version`, with its
+    /// single address's `keypair_crypto` encrypted under the master key THAT
+    /// version's salt scheme produces — exactly what a real pre-v3 file looks
+    /// like on disk, without going through `HdWallet::save` (which always
+    /// writes the CURRENT `WALLET_VERSION`).
+    fn build_raw_file(mnemonic: &Mnemonic, mnemonic_str: &str, password: &str, version: u32) -> HdWalletFile {
+        let master_key = derive_master_key(mnemonic_str, "", password, version).unwrap();
+        let seed = mnemonic.to_seed("").to_vec();
+        let kp0 = derive_at(&seed, 0, true).unwrap();
+
+        let mnemonic_crypto = encrypt_with_key(
+            &master_key,
+            &serde_json::to_vec(&MnemonicPayload { mnemonic: mnemonic_str.to_string() }).unwrap(),
+        ).unwrap();
+        let keypair_crypto = encrypt_with_key(
+            &master_key,
+            &serde_json::to_vec(&KeypairPayload {
+                private_key_hex: hex::encode(&kp0.private_key),
+                public_key_hex: hex::encode(&kp0.public_key),
+            }).unwrap(),
+        ).unwrap();
+
+        HdWalletFile {
+            version,
+            format: "hd-wallet-v1".into(),
+            network: "testnet".into(),
+            mnemonic_crypto,
+            addresses: vec![HdAddress {
+                index: 0, address: kp0.address.clone(), label: "primary".into(),
+                keypair_crypto, derived: true,
+            }],
+            created_at: chrono::Utc::now().to_rfc3339(),
+            description: "test fixture".into(),
+        }
     }
 }

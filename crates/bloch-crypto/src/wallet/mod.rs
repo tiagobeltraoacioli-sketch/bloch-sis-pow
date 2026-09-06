@@ -35,7 +35,7 @@ use crate::address::{Address, Network};
 use crate::core::{Transaction, TxInput, TxOutput, TESTNET_PREFIX};
 use crate::crypto;
 use sha3::{Sha3_256, Digest};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use serde::{Serialize, Deserialize};
 
 pub mod seed;
@@ -45,7 +45,7 @@ pub mod client;
 pub mod errors;
 pub mod disclosure;
 
-pub use seed::SeedPhrase;
+pub use seed::{SeedPhrase, SeedVersion};
 pub use errors::WalletError;
 pub use disclosure::{DisclosureBundle, DisclosureEntry, VerifiedDisclosure, DisclosureError};
 
@@ -103,17 +103,43 @@ impl Wallet {
     ///
     /// Returns `(wallet, seed_phrase)`. The caller MUST display the seed
     /// phrase to the user for backup and MUST NOT persist it unencrypted.
+    /// Always derives under the CURRENT default seed version
+    /// ([`SeedVersion::V2Bip39Sha512`]) — a brand-new mnemonic has no prior
+    /// version to preserve.
     pub fn generate(network: Network) -> Result<(Self, SeedPhrase), WalletError> {
         let seed = SeedPhrase::generate()?;
-        let wallet = Self::from_seed(&seed, network)?;
+        let wallet = Self::from_seed_versioned(&seed, "", SeedVersion::V2Bip39Sha512, network)?;
         Ok((wallet, seed))
     }
 
-    /// Deterministically derive a wallet from a seed phrase.
+    /// Deterministically derive a wallet from a seed phrase under the CURRENT
+    /// default seed version ([`SeedVersion::V2Bip39Sha512`]) and no BIP39
+    /// passphrase.
     ///
-    /// This is pure — same seed always produces same wallet.
+    /// K-M3: kept for source compatibility with callers written before the
+    /// versioned API existed. This can only reopen a wallet created under
+    /// V2 (every wallet created after the K-M3 fix). To reopen a wallet that
+    /// might predate the fix, use [`Self::from_seed_versioned`] with an
+    /// explicit version, or [`Self::recover_ambiguous`] /
+    /// [`Self::recover_resolved`] when the version is not known.
     pub fn from_seed(seed: &SeedPhrase, network: Network) -> Result<Self, WalletError> {
-        let seed_bytes = seed.to_seed_bytes();
+        Self::from_seed_versioned(seed, "", SeedVersion::V2Bip39Sha512, network)
+    }
+
+    /// Deterministically derive a wallet from a seed phrase under an
+    /// EXPLICIT [`SeedVersion`] and BIP39 passphrase (`""` for none).
+    ///
+    /// This is pure — same (seed, passphrase, version) always produces the
+    /// same wallet. It is the only path that can reopen a PRE-K-M3 (V1)
+    /// wallet: the caller must know (or resolve, see
+    /// [`Self::recover_resolved`]) which version created it.
+    pub fn from_seed_versioned(
+        seed: &SeedPhrase,
+        passphrase: &str,
+        version: SeedVersion,
+        network: Network,
+    ) -> Result<Self, WalletError> {
+        let seed_bytes = seed.to_seed_bytes_versioned(version, passphrase)?;
         // ML-DSA-65 keygen from 32-byte seed
         let (public, secret) = crypto::generate_keypair_from_seed(&seed_bytes[..32])
             .map_err(|e| WalletError::Crypto(e.to_string()))?;
@@ -128,6 +154,62 @@ impl Wallet {
             address: addr,
             network,
         })
+    }
+
+    /// K-M3: recover every candidate wallet a mnemonic COULD produce when the
+    /// seed version that created it is NOT known (e.g. restoring from a paper
+    /// backup with no other record). Derives under every [`SeedVersion`] and
+    /// returns all of them, tagged by version, instead of silently picking
+    /// one — picking wrong derives the WRONG keys with no error at all.
+    pub fn recover_ambiguous(
+        seed: &SeedPhrase,
+        passphrase: &str,
+        network: Network,
+    ) -> Result<Vec<(SeedVersion, Self)>, WalletError> {
+        let mut out = Vec::with_capacity(2);
+        for version in [SeedVersion::V2Bip39Sha512, SeedVersion::V1LegacyPbkdf2Sha256] {
+            out.push((version, Self::from_seed_versioned(seed, passphrase, version, network)?));
+        }
+        Ok(out)
+    }
+
+    /// K-M3: resolve the seed-version ambiguity from a hint instead of
+    /// guessing. Tries, in order:
+    ///   1. `expected_address` — a string the caller already trusts (typed by
+    ///      the user, read from an old keyfile's `meta.address`, etc.).
+    ///   2. `has_history` — a caller-supplied SEAM for an on-chain-history
+    ///      lookup (e.g. `WalletClient::balance`/`history`), so this
+    ///      network-free module never dials out itself; pass `|_| false`
+    ///      when no such lookup is available.
+    ///
+    /// Returns [`WalletError::AmbiguousSeedVersion`] if neither resolves it —
+    /// never silently returns one of the two candidates.
+    pub fn recover_resolved(
+        seed: &SeedPhrase,
+        passphrase: &str,
+        network: Network,
+        expected_address: Option<&str>,
+        mut has_history: impl FnMut(&Address) -> bool,
+    ) -> Result<(SeedVersion, Self), WalletError> {
+        let mut candidates = Self::recover_ambiguous(seed, passphrase, network)?;
+
+        // Cheapest check first: a string comparison against a caller-supplied
+        // hint, before ever calling into `has_history` (which may dial a
+        // node). `position` (not `into_iter().find`) so `candidates` is not
+        // consumed — falling through to the history seam below must not
+        // re-derive (expensive PQ keygen) every candidate a second time.
+        if let Some(addr) = expected_address {
+            if let Some(idx) = candidates.iter().position(|(_, w)| w.address().to_string() == addr) {
+                return Ok(candidates.remove(idx));
+            }
+        }
+
+        for (v, w) in candidates {
+            if has_history(w.address()) {
+                return Ok((v, w));
+            }
+        }
+        Err(WalletError::AmbiguousSeedVersion)
     }
 
     /// Load an encrypted keyfile from disk and unlock with password.
@@ -307,6 +389,78 @@ mod tests {
         assert_eq!(sat_u64(&serde_json::Value::Null), None);
     }
 
+    // ── K-M3: versioned seed derivation ──────────────────────────────────────
+
+    /// `from_seed_versioned` under the two versions must produce DIFFERENT
+    /// wallets for the identical mnemonic — this is the exact bug K-M3
+    /// reported (the PRF changed with no way to ask for the old one back).
+    #[test]
+    fn from_seed_versioned_v1_and_v2_diverge() {
+        let (_, seed) = Wallet::generate(Network::Mainnet).unwrap();
+        let v1 = Wallet::from_seed_versioned(
+            &seed, "", SeedVersion::V1LegacyPbkdf2Sha256, Network::Mainnet).unwrap();
+        let v2 = Wallet::from_seed_versioned(
+            &seed, "", SeedVersion::V2Bip39Sha512, Network::Mainnet).unwrap();
+        assert_ne!(v1.address().to_string(), v2.address().to_string());
+        // from_seed()/generate() must be the V2 default, never silently V1.
+        let default = Wallet::from_seed(&seed, Network::Mainnet).unwrap();
+        assert_eq!(default.address().to_string(), v2.address().to_string());
+    }
+
+    /// K-M3: `recover_ambiguous` must return BOTH candidates, never guess.
+    #[test]
+    fn recover_ambiguous_returns_both_versions() {
+        let (_, seed) = Wallet::generate(Network::Mainnet).unwrap();
+        let candidates = Wallet::recover_ambiguous(&seed, "", Network::Mainnet).unwrap();
+        assert_eq!(candidates.len(), 2);
+        let versions: Vec<SeedVersion> = candidates.iter().map(|(v, _)| *v).collect();
+        assert!(versions.contains(&SeedVersion::V1LegacyPbkdf2Sha256));
+        assert!(versions.contains(&SeedVersion::V2Bip39Sha512));
+        assert_ne!(candidates[0].1.address().to_string(), candidates[1].1.address().to_string());
+    }
+
+    /// K-M3: `recover_resolved` must pick the candidate matching a supplied
+    /// address — this is the "never silently choosing" contract: given a
+    /// hint, resolve it; given none, fail rather than guess.
+    #[test]
+    fn recover_resolved_matches_expected_address() {
+        let (_, seed) = Wallet::generate(Network::Mainnet).unwrap();
+        let v1 = Wallet::from_seed_versioned(
+            &seed, "", SeedVersion::V1LegacyPbkdf2Sha256, Network::Mainnet).unwrap();
+        let v1_addr = v1.address().to_string();
+
+        let (resolved_version, resolved_wallet) = Wallet::recover_resolved(
+            &seed, "", Network::Mainnet, Some(&v1_addr), |_| false,
+        ).unwrap();
+        assert_eq!(resolved_version, SeedVersion::V1LegacyPbkdf2Sha256);
+        assert_eq!(resolved_wallet.address().to_string(), v1_addr);
+    }
+
+    /// K-M3: the on-chain-history seam resolves the ambiguity when no
+    /// address hint is given.
+    #[test]
+    fn recover_resolved_uses_history_seam() {
+        let (_, seed) = Wallet::generate(Network::Mainnet).unwrap();
+        let v1 = Wallet::from_seed_versioned(
+            &seed, "", SeedVersion::V1LegacyPbkdf2Sha256, Network::Mainnet).unwrap();
+        let v1_hash = *v1.address().hash();
+
+        let (resolved_version, _) = Wallet::recover_resolved(
+            &seed, "", Network::Mainnet, None,
+            |addr| *addr.hash() == v1_hash,
+        ).unwrap();
+        assert_eq!(resolved_version, SeedVersion::V1LegacyPbkdf2Sha256);
+    }
+
+    /// K-M3: with NO matching hint at all, resolution must fail closed
+    /// rather than default to either version.
+    #[test]
+    fn recover_resolved_fails_closed_with_no_match() {
+        let (_, seed) = Wallet::generate(Network::Mainnet).unwrap();
+        let result = Wallet::recover_resolved(&seed, "", Network::Mainnet, None, |_| false);
+        assert!(matches!(result, Err(WalletError::AmbiguousSeedVersion)));
+    }
+
     #[test]
     fn sign_tx_script_sig_is_length_prefixed_and_verifies() {
         // Regression: Wallet::sign_tx must emit the canonical length-prefixed
@@ -459,11 +613,30 @@ struct KeystorePayload { private_key_hex: String, public_key_hex: String }
 
 // ── Keypair ───────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Keypair {
     pub private_key: Vec<u8>,
     pub public_key:  Vec<u8>,
     pub address:     String,
+}
+
+/// SECURITY (A4 lows): hand-written so the private key can NEVER reach a
+/// `serde_json::to_*`/`to_vec`/etc. call on `Keypair` — a careless log line,
+/// debug endpoint, or accidental persist that serializes a `Keypair` must not
+/// be able to leak the secret key. Only the address and public key travel;
+/// encrypted persistence goes through `KeystorePayload`/`EncryptedKeyfile`,
+/// which are separate types with their own AEAD, not this impl.
+impl Serialize for Keypair {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("Keypair", 2)?;
+        s.serialize_field("public_key", &hex::encode(&self.public_key))?;
+        s.serialize_field("address", &self.address)?;
+        s.end()
+    }
 }
 
 impl Drop for Keypair {
@@ -492,6 +665,24 @@ impl Keypair {
         crypto::verify(pk, msg, sig)
     }
 
+    /// A4-M-4: sign an arbitrary user-supplied MESSAGE (never a raw digest).
+    /// Signs `crypto::signed_message_digest(message)`, not `message` itself —
+    /// the caller must pass the message's raw bytes, never hex-decoded text,
+    /// so a 64-hex-character message can never be reinterpreted as a raw
+    /// 32-byte tx sighash / disclosure digest / PoS signing root. Pair with
+    /// [`Self::verify_message`].
+    pub fn sign_message(&self, message: &[u8]) -> Result<Vec<u8>, String> {
+        let digest = crypto::signed_message_digest(message);
+        self.sign(&digest)
+    }
+
+    /// Verify a signature produced by [`Self::sign_message`] over `message`
+    /// under public key `pk`.
+    pub fn verify_message(pk: &[u8], message: &[u8], sig: &[u8]) -> bool {
+        let digest = crypto::signed_message_digest(message);
+        crypto::verify(pk, &digest, sig)
+    }
+
     pub fn address_bytes(&self) -> Vec<u8> {
         use sha3::{Sha3_256, Digest};
         Sha3_256::digest(&self.public_key)[..20].to_vec()
@@ -500,6 +691,12 @@ impl Keypair {
     // ── Keystore ──────────────────────────────────────────────────────────────
 
     pub fn save_encrypted(&self, path: &Path, password: &str) -> Result<(), String> {
+        // SECURITY (A4 lows): enforce the SAME blocking password policy as
+        // the new-style `EncryptedKeyfile` (length + breach denylist) here
+        // too — this legacy path is reachable directly (e.g. the CLI's `New`
+        // command), and Argon2 hardening is moot behind a weak password.
+        encryption::validate_password_strength(password).map_err(|e| e.to_string())?;
+
         let mut salt = vec![0u8; 32];
         rand::rng().fill_bytes(&mut salt);
         let mut enc_key = derive_key(password, &salt)?;
@@ -542,13 +739,44 @@ impl Keypair {
         if ks.version != 2 { return Err("unsupported keystore version".into()); }
 
         let salt      = b64::STANDARD.decode(&ks.crypto.kdf_params.salt).map_err(|e| e.to_string())?;
-        let mut enc_k = derive_key(password, &salt)?;
         let nonce_b   = b64::STANDARD.decode(&ks.crypto.nonce).map_err(|e| e.to_string())?;
         let ct        = b64::STANDARD.decode(&ks.crypto.ciphertext).map_err(|e| e.to_string())?;
 
+        // SECURITY (A4 lows): `Nonce::from_slice` PANICS on any length other
+        // than 12 bytes. `nonce_b` comes from an untrusted keystore file, so
+        // guard the length BEFORE it reaches the fixed-size AES-GCM nonce —
+        // a truncated/corrupt file must return an error, never crash the
+        // process.
+        const NONCE_LEN: usize = 12;
+        const GCM_TAG_LEN: usize = 16;
+        if nonce_b.len() != NONCE_LEN {
+            return Err(format!(
+                "keystore nonce has invalid length: expected {} bytes, got {}",
+                NONCE_LEN, nonce_b.len()
+            ));
+        }
+        if ct.len() < GCM_TAG_LEN {
+            return Err(format!(
+                "keystore ciphertext too short: {} bytes, need at least the {}-byte GCM tag",
+                ct.len(), GCM_TAG_LEN
+            ));
+        }
+
+        // SECURITY (A4 lows): honour the KDF params the keystore file
+        // actually carries (a change to the default cost in `save_encrypted`
+        // must not break decrypting an older file) but BOUND them first — an
+        // untrusted file with e.g. `memory_cost` near `u32::MAX` (KiB) would
+        // otherwise force a multi-terabyte Argon2 allocation (OOM) on unlock,
+        // and `output_len != 32` would panic the AES-256 key conversion below.
+        let mut enc_k = derive_key_with_params(password, &salt, &ks.crypto.kdf_params)?;
+
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&enc_k));
-        let plain  = cipher.decrypt(Nonce::from_slice(&nonce_b), ct.as_ref())
-            .map_err(|_| "decryption failed — wrong password or corrupted file".to_string())?;
+        // Zeroizing (A4 lows): this plaintext carries the hex-encoded private
+        // key — must not linger in memory past the parse below.
+        let plain = Zeroizing::new(
+            cipher.decrypt(Nonce::from_slice(&nonce_b), ct.as_ref())
+                .map_err(|_| "decryption failed — wrong password or corrupted file".to_string())?
+        );
         enc_k.zeroize();
 
         let mut payload: KeystorePayload = serde_json::from_slice(&plain).map_err(|e| e.to_string())?;
@@ -690,12 +918,168 @@ fn derive_key(pw: &str, salt: &[u8]) -> Result<Vec<u8>, String> {
     Ok(key)
 }
 
+/// Bounds mirrored from `encryption::EncryptedKeyfile::decrypt` (audit L1):
+/// an untrusted keystore file's `kdf_params` must be sanity-checked BEFORE
+/// they drive an Argon2 allocation. `memory_cost` near `u32::MAX` (KiB) forces
+/// a multi-terabyte allocation (OOM-kills the process on unlock); a huge
+/// `time_cost` is a CPU slow-loris. `output_len` is pinned to exactly 32 —
+/// this keystore format always feeds the result straight into AES-256-GCM,
+/// whose `Key::from_slice` panics on anything but 32 bytes.
+const MAX_M_COST_KIB: u32 = 1024 * 1024; // 1 GiB
+const MAX_T_COST: u32 = 16;
+const MAX_P_COST: u32 = 16;
+
+fn derive_key_with_params(pw: &str, salt: &[u8], p: &KdfParams) -> Result<Vec<u8>, String> {
+    if p.memory_cost > MAX_M_COST_KIB || p.time_cost > MAX_T_COST || p.parallelism > MAX_P_COST {
+        return Err(format!(
+            "KDF params out of bounds (memory_cost={} KiB, time_cost={}, parallelism={})",
+            p.memory_cost, p.time_cost, p.parallelism
+        ));
+    }
+    if p.output_len != 32 {
+        return Err(format!(
+            "KDF output_len must be 32 (AES-256 key), got {}", p.output_len
+        ));
+    }
+    let params = Params::new(p.memory_cost, p.time_cost, p.parallelism, Some(32))
+        .map_err(|e| e.to_string())?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut key = vec![0u8; 32];
+    argon2.hash_password_into(pw.as_bytes(), salt, &mut key).map_err(|e| e.to_string())?;
+    Ok(key)
+}
+
 // Terminal CLI (clap + rpassword) — gated so the pure wallet/crypto subset
 // cross-compiles to wasm32 for the mobile WASM wallet. Native CLI builds enable
 // `wallet-cli` (the `postern-wallet` bin already requires it).
 #[cfg(feature = "wallet-cli")]
 pub mod cli;
 
+
+#[cfg(test)]
+mod legacy_keystore_tests {
+    use super::*;
+
+    /// A4 lows: `Keypair::save_encrypted` must enforce the same blocking
+    /// password policy as the new-style keyfile — a weak password must never
+    /// produce a keystore file at all.
+    #[test]
+    fn save_encrypted_rejects_weak_password() {
+        let kp = generate_keypair(false);
+        let tmp = std::env::temp_dir().join("bloch-kp-weak-pw-test.json");
+        let _ = std::fs::remove_file(&tmp);
+        let result = kp.save_encrypted(&tmp, "short");
+        assert!(result.is_err(), "a short password must be rejected");
+        assert!(!tmp.exists(), "no keystore file must be written on a rejected password");
+    }
+
+    /// A4 lows: a keystore with a corrupt/truncated nonce must return an
+    /// error, not panic. `Nonce::from_slice` panics on any length other than
+    /// 12 bytes; before the length guard this crashed the process.
+    #[test]
+    fn load_encrypted_corrupt_nonce_returns_error_not_panic() {
+        let kp = generate_keypair(false);
+        let tmp = std::env::temp_dir().join("bloch-kp-corrupt-nonce-test.json");
+        let _ = std::fs::remove_file(&tmp);
+        kp.save_encrypted(&tmp, "correct-horse-battery-9!").unwrap();
+
+        let json = std::fs::read_to_string(&tmp).unwrap();
+        let mut ks: serde_json::Value = serde_json::from_str(&json).unwrap();
+        ks["crypto"]["nonce"] = serde_json::json!(b64::STANDARD.encode([0u8; 4]));
+        std::fs::write(&tmp, serde_json::to_string(&ks).unwrap()).unwrap();
+
+        let result = Keypair::load_encrypted(&tmp, "correct-horse-battery-9!");
+        assert!(result.is_err(), "a truncated nonce must be a clean error");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// A4 lows: an out-of-bounds `kdf_params.memory_cost` in an untrusted
+    /// keystore file must be rejected BEFORE it reaches Argon2 (which would
+    /// otherwise attempt a multi-terabyte allocation).
+    #[test]
+    fn load_encrypted_rejects_out_of_bounds_kdf_params() {
+        let kp = generate_keypair(false);
+        let tmp = std::env::temp_dir().join("bloch-kp-bad-kdf-test.json");
+        let _ = std::fs::remove_file(&tmp);
+        kp.save_encrypted(&tmp, "correct-horse-battery-9!").unwrap();
+
+        let json = std::fs::read_to_string(&tmp).unwrap();
+        let mut ks: serde_json::Value = serde_json::from_str(&json).unwrap();
+        ks["crypto"]["kdf_params"]["memory_cost"] = serde_json::json!(u32::MAX - 1);
+        std::fs::write(&tmp, serde_json::to_string(&ks).unwrap()).unwrap();
+
+        let result = Keypair::load_encrypted(&tmp, "correct-horse-battery-9!");
+        assert!(result.is_err(), "an absurd memory_cost must be rejected, not attempted");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// A4 lows: `Keypair`'s hand-written `Serialize` must never emit the
+    /// private key, however the type is serialized.
+    #[test]
+    fn keypair_serialize_never_emits_private_key() {
+        let kp = generate_keypair(false);
+        let json = serde_json::to_string(&kp).unwrap();
+        let hex_priv = hex::encode(&kp.private_key);
+        assert!(!json.contains(&hex_priv), "serialized Keypair must not contain the private key hex");
+        assert!(json.contains(&kp.address), "serialized Keypair must still carry the address");
+    }
+
+    /// A4-M-4 regression: signing a 64-hex-character MESSAGE must NOT produce
+    /// a signature valid over the raw 32 bytes that hex decodes to — the
+    /// exact phishing shape the finding reported ("sign this challenge",
+    /// where the challenge is secretly a tx sighash / disclosure digest
+    /// preimage). Before the fix, the CLI auto-hex-decoded the message and
+    /// signed those raw bytes directly, so this assertion would have failed
+    /// (the signature over the digest string via the OLD path IS a valid
+    /// signature over the raw bytes).
+    #[test]
+    fn sign_message_of_64_hex_chars_does_not_forge_a_raw_digest_signature() {
+        let kp = generate_keypair(false);
+
+        // A 64-hex-char "message" a phishing flow could ask the user to sign
+        // — it decodes to exactly 32 bytes, the same shape as a tx sighash.
+        let hex_message = "ab".repeat(32);
+        assert_eq!(hex_message.len(), 64);
+        let raw_digest = hex::decode(&hex_message).unwrap();
+        assert_eq!(raw_digest.len(), 32);
+
+        let sig = kp.sign_message(hex_message.as_bytes()).unwrap();
+
+        // The new signed-message API verifies over the message bytes.
+        assert!(Keypair::verify_message(&kp.public_key, hex_message.as_bytes(), &sig));
+
+        // But the OLD vulnerable path — treat `sig` as a signature over the
+        // raw hex-decoded 32 bytes (e.g. a tx sighash preimage) — must fail.
+        assert!(
+            !crypto::verify(&kp.public_key, &raw_digest, &sig),
+            "a signed MESSAGE must never verify as a signature over the raw \
+             hex-decoded digest — that would let a signed challenge double as \
+             a transaction/disclosure signature"
+        );
+
+        // And a genuine raw-digest signature (the tx-sighash-style path) must
+        // NOT verify as a signed message over the hex string either — the two
+        // domains are symmetric-safe, not just one-directional.
+        let raw_sig = crypto::sign(&kp.private_key, &raw_digest).unwrap();
+        assert!(!Keypair::verify_message(&kp.public_key, hex_message.as_bytes(), &raw_sig));
+    }
+
+    /// Sanity: normal save/load with a strong password still round-trips —
+    /// the new guards must not break the legitimate path.
+    #[test]
+    fn save_load_roundtrip_still_works() {
+        let kp = generate_keypair(false);
+        let tmp = std::env::temp_dir().join("bloch-kp-roundtrip-test.json");
+        let _ = std::fs::remove_file(&tmp);
+        kp.save_encrypted(&tmp, "correct-horse-battery-9!").unwrap();
+        let loaded = Keypair::load_encrypted(&tmp, "correct-horse-battery-9!").unwrap();
+        assert_eq!(loaded.address, kp.address);
+        assert_eq!(loaded.private_key, kp.private_key);
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
 
 #[cfg(test)]
 mod legacy_sign_tests {
