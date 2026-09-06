@@ -73,6 +73,7 @@
 //! inside bloch-crypto (default-features = false on pqcrypto-falcon plus its
 //! tripwire test), not re-decided here.
 
+use std::fmt;
 use std::fs;
 use std::io::{self};
 use std::path::Path;
@@ -97,6 +98,20 @@ const KDF_ARGON2ID: u8 = 1;
 /// attacker may hand us; without a cap, `m_cost = u32::MAX` is a 4 TiB
 /// allocation request from a header field.
 const KDF_MAX_M_COST_KIB: u32 = 1_048_576; // 1 GiB
+
+/// Same idea for the other two Argon2 parameters (audit round 3, keystore
+/// lows). `t_cost` multiplies the work per open — `u32::MAX` passes over even
+/// a small block is a boot that never finishes — and `p_cost` is the number of
+/// lanes the implementation allocates for. Production is t=3 / p=1; these caps
+/// leave an order of magnitude of headroom for a deliberately hardened
+/// keystore and refuse everything an attacker-supplied header could ask for.
+const KDF_MAX_T_COST: u32 = 64;
+const KDF_MAX_P_COST: u32 = 16;
+
+/// Shortest passphrase `keys seal` will seal under. Argon2id makes guessing
+/// expensive per attempt, not impossible; a validator identity behind eight
+/// characters is still a dictionary away.
+pub const MIN_SEAL_PASSPHRASE_CHARS: usize = 12;
 
 /// Argon2id cost parameters, written into every sealed keystore.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,6 +139,18 @@ impl KdfParams {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "keystore KDF memory cost is over this node's cap",
+            ));
+        }
+        if self.t_cost > KDF_MAX_T_COST {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "keystore KDF time cost is over this node's cap",
+            ));
+        }
+        if self.p_cost > KDF_MAX_P_COST {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "keystore KDF parallelism is over this node's cap",
             ));
         }
         let params = argon2::Params::new(self.m_cost, self.t_cost, self.p_cost, Some(32))
@@ -200,11 +227,24 @@ impl Unlock {
     /// that quietly read a plaintext key because nobody configured anything
     /// is the defect this function exists to close.
     pub fn from_env() -> io::Result<Unlock> {
-        Self::from_sources(
-            std::env::var_os("BLOCH_KEYSTORE_PASSPHRASE_FILE"),
-            std::env::var("BLOCH_KEYSTORE_PASSPHRASE").ok(),
-            plaintext_opt_in(),
-        )
+        let pass_file = std::env::var_os("BLOCH_KEYSTORE_PASSPHRASE_FILE");
+        let pass = std::env::var("BLOCH_KEYSTORE_PASSPHRASE").ok();
+        if pass_file.is_none() && pass.as_deref().is_some_and(|p| !p.is_empty()) {
+            // Said once, loudly, and not fixable from here: a process cannot
+            // scrub its own environment block from `/proc/<pid>/environ`,
+            // which any process of the same user (and every `ps eww`,
+            // core dump and crash reporter) can read. The file / tty paths
+            // exist so that this warning can be made to go away.
+            eprintln!(
+                "WARNING: the keystore passphrase is being read from the BLOCH_KEYSTORE_PASSPHRASE \
+                 environment variable. It is visible in /proc/{}/environ for the lifetime of this \
+                 process and in the shell history that set it. Prefer \
+                 BLOCH_KEYSTORE_PASSPHRASE_FILE=<0600 file> (systemd: LoadCredential=) or \
+                 `bloch-pos keys seal` with --passphrase-file / an interactive tty.",
+                std::process::id()
+            );
+        }
+        Self::from_sources(pass_file, pass, plaintext_opt_in())
     }
 
     /// The whole of [`Unlock::from_env`]'s decision, with the three inputs
@@ -350,8 +390,10 @@ impl Keystore {
     /// for plaintext.
     pub fn save_with(&self, dir: &Path, unlock: &Unlock) -> io::Result<()> {
         fs::create_dir_all(dir)?;
-        let out = match unlock {
-            Unlock::Passphrase { pass, kdf } => self.seal(pass, *kdf)?,
+        // `Zeroizing` on both arms: the plaintext encoding IS the secret, and
+        // the sealed bytes cost nothing to wipe (audit round 3, keystore lows).
+        let out: Zeroizing<Vec<u8>> = match unlock {
+            Unlock::Passphrase { pass, kdf } => Zeroizing::new(self.seal(pass, *kdf)?),
             Unlock::PlaintextOptIn => self.encode_plaintext(),
         };
         let path = dir.join("validator.key");
@@ -384,8 +426,8 @@ impl Keystore {
 
     /// The legacy `BPOSKEY1` body: the secret key in the clear. Reachable
     /// only through `Unlock::PlaintextOptIn`.
-    fn encode_plaintext(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+    fn encode_plaintext(&self) -> Zeroizing<Vec<u8>> {
+        let mut out = Zeroizing::new(Vec::new());
         out.extend_from_slice(KEYSTORE_MAGIC_V1);
         out.extend_from_slice(&self.index.to_le_bytes());
         crate::codec::put_bytes(&mut out, &self.pubkey);
@@ -442,14 +484,14 @@ impl Keystore {
     /// once a file actually exists, so a node with no key does not fail to
     /// boot over an unconfigured passphrase.
     pub fn load(dir: &Path) -> io::Result<Keystore> {
-        let bytes = Zeroizing::new(fs::read(dir.join("validator.key"))?);
+        let bytes = read_keystore_file(&dir.join("validator.key"))?;
         Self::decode(&bytes, &Unlock::from_env()?)
     }
 
     /// [`Keystore::load`] with the policy passed in rather than read from the
     /// environment.
     pub fn load_with(dir: &Path, unlock: &Unlock) -> io::Result<Keystore> {
-        let bytes = Zeroizing::new(fs::read(dir.join("validator.key"))?);
+        let bytes = read_keystore_file(&dir.join("validator.key"))?;
         Self::decode(&bytes, unlock)
     }
 
@@ -492,8 +534,8 @@ impl Keystore {
 
     fn load_optional_inner(dir: &Path, unlock: Option<&Unlock>) -> io::Result<Option<Keystore>> {
         let path = dir.join("validator.key");
-        let bytes = match fs::read(&path) {
-            Ok(b) => Zeroizing::new(b),
+        let bytes = match read_keystore_file(&path) {
+            Ok(b) => b,
             // The one and only observer signal.
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             // Present but unreadable (mode, ACL, I/O error) is NOT observer
@@ -641,6 +683,374 @@ impl Keystore {
         bloch_crypto::crypto::sign(&self.secret, signing_root)
             .expect("hybrid signing over a well-formed keystore key cannot fail")
     }
+}
+
+/// Read `validator.key`, refusing a file that anyone but its owner can read.
+///
+/// Mode bits are not a confidentiality boundary (module docs), but a keystore
+/// that is group- or world-readable is a keystore that has *already* leaked
+/// to every local account, and loading it anyway just makes the leak look
+/// normal. `NotFound` is passed through unchanged: it is the observer signal
+/// `load_optional` depends on, and `fs::metadata` reports it with the same
+/// kind `fs::read` did.
+fn read_keystore_file(path: &Path) -> io::Result<Zeroizing<Vec<u8>>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path)?.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} is mode {mode:04o}: readable by group or others. A keystore is loaded \
+                     only at mode 0600 — run `chmod 0600 {}` after confirming who could have \
+                     read it (audit round 3)",
+                    path.display(),
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(Zeroizing::new(fs::read(path)?))
+}
+
+/// Which on-disk format a keystore file is in. Public information.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeystoreFormat {
+    /// `BPOSKEY1` — the secret key in the clear behind mode 0600.
+    PlaintextV1,
+    /// `BPOSKEY2` — Argon2id + XChaCha20-Poly1305.
+    SealedV2,
+}
+
+impl fmt::Display for KeystoreFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            KeystoreFormat::PlaintextV1 => "plaintext (BPOSKEY1)",
+            KeystoreFormat::SealedV2 => "sealed (BPOSKEY2, Argon2id + XChaCha20-Poly1305)",
+        })
+    }
+}
+
+/// The PUBLIC facts about a keystore file, for `bloch-pos keys inspect`.
+///
+/// Built from the header only: no KDF is run, no ciphertext is opened, and
+/// for a plaintext file the secret bytes are skipped over, never copied. The
+/// type derives `Debug` because there is nothing in it that must not print.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeystoreInfo {
+    pub format: KeystoreFormat,
+    /// Validator index recorded in the file.
+    pub index: u32,
+    /// SHA3-256 of the suite-enveloped public key — the same identifier
+    /// `keygen` prints and `getvalidators`-style tooling uses.
+    pub pubkey_sha3: [u8; 32],
+    /// Length of the enveloped public key, in bytes.
+    pub pubkey_len: usize,
+    /// KDF cost the file was sealed under; `None` for plaintext.
+    pub kdf: Option<KdfParams>,
+    /// File mode bits (unix), so the operator sees what `inspect` saw.
+    pub mode: Option<u32>,
+    pub file_len: u64,
+}
+
+/// What [`Keystore::seal_in_place`] did. Public information only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SealReport {
+    pub index: u32,
+    pub pubkey_sha3: [u8; 32],
+    pub kdf: KdfParams,
+    /// Bytes of the old plaintext inode overwritten with zeros before it was
+    /// released. Best effort — see the method docs.
+    pub plaintext_bytes_overwritten: u64,
+}
+
+impl Keystore {
+    /// Header-only description of `dir/validator.key`. Never derives a key,
+    /// never decrypts, never returns a secret byte.
+    pub fn inspect(dir: &Path) -> io::Result<KeystoreInfo> {
+        let path = dir.join("validator.key");
+        let meta = fs::metadata(&path)?;
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            Some(meta.permissions().mode() & 0o777)
+        };
+        #[cfg(not(unix))]
+        let mode = None;
+        let bytes = Zeroizing::new(fs::read(&path)?);
+        let bad = |m: &'static str| io::Error::new(io::ErrorKind::InvalidData, m);
+        if bytes.len() < 8 {
+            return Err(bad("truncated keystore"));
+        }
+        let mut r = crate::codec::Reader::new(&bytes);
+        let magic = r.take(8).map_err(|_| bad("truncated keystore"))?;
+        let (format, kdf) = if magic == KEYSTORE_MAGIC_V2 {
+            let kdf_id = r.u8().map_err(|_| bad("truncated keystore"))?;
+            if kdf_id != KDF_ARGON2ID {
+                return Err(bad("keystore uses a KDF this binary does not implement"));
+            }
+            let kdf = KdfParams {
+                m_cost: r.u32().map_err(|_| bad("truncated keystore"))?,
+                t_cost: r.u32().map_err(|_| bad("truncated keystore"))?,
+                p_cost: r.u32().map_err(|_| bad("truncated keystore"))?,
+            };
+            r.take(32 + 24).map_err(|_| bad("truncated keystore"))?; // salt ‖ nonce
+            (KeystoreFormat::SealedV2, Some(kdf))
+        } else if magic == KEYSTORE_MAGIC_V1 {
+            (KeystoreFormat::PlaintextV1, None)
+        } else {
+            return Err(bad("not a bloch-pos keystore"));
+        };
+        let index = r.u32().map_err(|_| bad("truncated keystore"))?;
+        let pubkey = r.bytes().map_err(|_| bad("truncated keystore"))?;
+        // Deliberately NOT reading further: for V1 the next field is the
+        // secret key, and this function has no business touching it.
+        use sha3::{Digest, Sha3_256};
+        Ok(KeystoreInfo {
+            format,
+            index,
+            pubkey_sha3: Sha3_256::digest(&pubkey).into(),
+            pubkey_len: pubkey.len(),
+            kdf,
+            mode,
+            file_len: meta.len(),
+        })
+    }
+
+    /// Re-seal a PLAINTEXT `BPOSKEY1` keystore under `pass`, in place —
+    /// `bloch-pos keys seal`. The flag-day prerequisite: the live fleet's 64
+    /// keystores are `BPOSKEY1`, the loader refuses them without the opt-in,
+    /// and until this existed there was no tool to move a validator across.
+    ///
+    /// ## Ordering, and what each step buys
+    ///
+    /// 1. Take the data-dir lock ([`crate::store::DirLock`]). A running node
+    ///    holds it, so this refuses to rewrite the keystore under a live
+    ///    process — the same double-identity hazard the lock exists for.
+    /// 2. Read the plaintext file (mode-checked) and decode it. Reading
+    ///    plaintext here is the operator's explicit decision — this is the
+    ///    command whose purpose is to read it once and end it — so it does
+    ///    not require the global opt-in. An already-sealed file is a refusal:
+    ///    a passphrase rotation is a different operation with a different
+    ///    proof obligation, and this tool does not pretend to be it.
+    /// 3. Seal to `validator.key.sealed.tmp`, created 0600, fsync'd.
+    /// 4. **Verify before replacing**: decode the sealed bytes under `pass`
+    ///    and compare every field (constant-time on the secret) with what was
+    ///    read. A seal that does not open is never installed.
+    /// 5. Open the plaintext inode for writing (a handle that survives the
+    ///    rename), then `rename` the sealed file over the path — atomic: at
+    ///    every instant the path names either the plaintext or the sealed
+    ///    key, never zeros or a partial file — and fsync the directory.
+    /// 6. Overwrite the OLD inode's bytes with zeros through the surviving
+    ///    handle and fsync it. Best effort by nature: on journaling or
+    ///    copy-on-write filesystems (ext4 with data=journal, btrfs, ZFS) and
+    ///    on SSDs with wear levelling the previous blocks may persist; the
+    ///    operator's runbook says so, and the durable defence is that the
+    ///    new file is sealed, not that the old one was wiped.
+    /// 7. Re-load from the final path under `pass` as a last check.
+    pub fn seal_in_place(dir: &Path, pass: &Zeroizing<String>, kdf: KdfParams) -> io::Result<SealReport> {
+        use std::io::{Seek, SeekFrom, Write};
+        if pass.chars().count() < MIN_SEAL_PASSPHRASE_CHARS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to seal under a passphrase shorter than {MIN_SEAL_PASSPHRASE_CHARS} \
+                     characters"
+                ),
+            ));
+        }
+        // 1. Nobody may be running over this dir.
+        let lock = crate::store::DirLock::acquire(dir).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "keys seal: cannot take the data-dir lock ({e}). If a node is running over \
+                     this data dir, stop it first; sealing the keystore underneath a live \
+                     validator is refused"
+                ),
+            )
+        })?;
+        let path = dir.join("validator.key");
+        // 2. Read + decode the plaintext.
+        let bytes = read_keystore_file(&path)?;
+        if bytes.len() >= 8 && &bytes[..8] == KEYSTORE_MAGIC_V2 {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} is already sealed (BPOSKEY2); nothing to do. Passphrase rotation is not \
+                     what this command does",
+                    path.display()
+                ),
+            ));
+        }
+        let ks = Self::decode(&bytes, &Unlock::PlaintextOptIn)?;
+        let plaintext_len = bytes.len() as u64;
+        drop(bytes);
+
+        // 3. Seal to a sibling temp file, 0600 from creation, fsync'd.
+        let sealed = ks.seal(pass, kdf)?;
+        let tmp = dir.join("validator.key.sealed.tmp");
+        {
+            let mut opts = fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp)?;
+            f.write_all(&sealed)?;
+            f.sync_all()?;
+        }
+        // 4. Verify the bytes we are about to install actually open, and open
+        //    to the same identity. A failure here removes the temp file and
+        //    leaves the plaintext untouched.
+        let check = (|| -> io::Result<()> {
+            let back = Self::decode(&sealed, &Unlock::passphrase_with(pass.as_str(), kdf))?;
+            let same = back.index == ks.index
+                && back.pubkey == ks.pubkey
+                && ct_eq(&back.secret, &ks.secret)
+                && ct_eq(&back.randao_seed, &ks.randao_seed);
+            if !same {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "sealed keystore did not round-trip to the same key; not installing it",
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(e) = check {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        // 5. Keep a handle on the plaintext inode, then replace the path.
+        let mut old = fs::OpenOptions::new().write(true).open(&path)?;
+        fs::rename(&tmp, &path)?;
+        crate::store::fsync_dir(dir)?;
+        // 6. Best-effort wipe of the released inode.
+        let zeros = vec![0u8; plaintext_len as usize];
+        old.seek(SeekFrom::Start(0))?;
+        old.write_all(&zeros)?;
+        old.sync_all()?;
+        drop(old);
+        // 7. The installed file opens.
+        let reloaded = Self::load_with(dir, &Unlock::passphrase_with(pass.as_str(), kdf))?;
+        if reloaded.index != ks.index || reloaded.pubkey != ks.pubkey {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "installed keystore does not report the identity that was sealed",
+            ));
+        }
+        drop(lock);
+        use sha3::{Digest, Sha3_256};
+        Ok(SealReport {
+            index: ks.index,
+            pubkey_sha3: Sha3_256::digest(&ks.pubkey).into(),
+            kdf,
+            plaintext_bytes_overwritten: plaintext_len,
+        })
+    }
+}
+
+/// Constant-time equality over two byte strings of any length. The length
+/// comparison leaks only the length, which is public here (format constants).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        acc |= x ^ y;
+    }
+    acc == 0
+}
+
+/// A passphrase from a file, for `keys seal --passphrase-file`.
+///
+/// The file must be mode 0600 (unix): a world-readable passphrase file is the
+/// same leak as a world-readable key. One trailing newline is stripped, the
+/// bytes are held in `Zeroizing`, and an empty result is an error.
+pub fn read_passphrase_file(path: &Path) -> io::Result<Zeroizing<String>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path)?.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "passphrase file {} is mode {mode:04o}: readable by group or others; \
+                     refusing (chmod 0600 it)",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    let raw = Zeroizing::new(fs::read(path)?);
+    let mut s = Zeroizing::new(String::from_utf8(raw.to_vec()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "passphrase file is not valid UTF-8")
+    })?);
+    while s.ends_with('\n') || s.ends_with('\r') {
+        s.pop();
+    }
+    if s.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "passphrase file is empty"));
+    }
+    Ok(s)
+}
+
+/// A passphrase typed at the controlling terminal, echo off. Refuses when
+/// stdin is not a tty (a pipe is a file; use `--passphrase-file`). Never reads
+/// from argv: a command line is in `ps`, in shell history and in the audit
+/// log of every jump host in between.
+#[cfg(unix)]
+pub fn read_passphrase_from_tty(prompt: &str) -> io::Result<Zeroizing<String>> {
+    use std::io::{BufRead, Write};
+    let fd = libc::STDIN_FILENO;
+    // SAFETY: isatty only inspects the descriptor.
+    if unsafe { libc::isatty(fd) } != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "stdin is not a terminal; supply the passphrase with --passphrase-file <0600 file>",
+        ));
+    }
+    let mut err = io::stderr();
+    err.write_all(prompt.as_bytes())?;
+    err.flush()?;
+    // SAFETY: `term` is a plain C struct we own; tcgetattr fills it for `fd`.
+    let mut term: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut term) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let saved = term;
+    term.c_lflag &= !libc::ECHO;
+    // SAFETY: applying a termios struct we just read and modified to our own stdin.
+    if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &term) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut line = Zeroizing::new(String::new());
+    let read = io::stdin().lock().read_line(&mut line);
+    // Restore echo whatever happened, then report the read.
+    // SAFETY: restoring the exact struct tcgetattr produced.
+    unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &saved) };
+    let _ = err.write_all(b"\n");
+    read?;
+    while line.ends_with('\n') || line.ends_with('\r') {
+        line.pop();
+    }
+    if line.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty passphrase"));
+    }
+    Ok(line)
+}
+
+#[cfg(not(unix))]
+pub fn read_passphrase_from_tty(_prompt: &str) -> io::Result<Zeroizing<String>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "interactive passphrase entry is unix-only; use --passphrase-file",
+    ))
 }
 
 /// The real `SignatureVerifier`: bloch-crypto verify over a key the CALLER
@@ -1150,5 +1560,211 @@ mod tests {
                 assert!(Keystore::decode(&bad, &policy).is_err());
             }
         }
+    }
+
+    // ----- audit round 3: keystore hardening + `keys seal` / `keys inspect` -----
+
+    fn expect_err_kind<T>(r: io::Result<T>, kind: io::ErrorKind, what: &str) -> io::Error {
+        let e = err_of(r, what);
+        assert_eq!(e.kind(), kind, "{what}: {e}");
+        e
+    }
+
+    /// Header-supplied Argon2 time cost and parallelism are capped like the
+    /// memory cost already was. Lift either cap and the corresponding assert
+    /// fails (the KDF would run, and for t_cost it would run for a very long
+    /// time).
+    #[test]
+    fn absurd_kdf_time_cost_and_parallelism_are_refused() {
+        let over_t = KdfParams { m_cost: 8, t_cost: KDF_MAX_T_COST + 1, p_cost: 1 };
+        let e = expect_err_kind(over_t.to_argon2(), io::ErrorKind::InvalidData, "t_cost cap");
+        assert!(e.to_string().contains("time cost"), "{e}");
+        let over_p = KdfParams { m_cost: 8, t_cost: 1, p_cost: KDF_MAX_P_COST + 1 };
+        let e = expect_err_kind(over_p.to_argon2(), io::ErrorKind::InvalidData, "p_cost cap");
+        assert!(e.to_string().contains("parallelism"), "{e}");
+        // At the caps the parameters are accepted (the cap is inclusive).
+        assert!(KdfParams { m_cost: 8, t_cost: KDF_MAX_T_COST, p_cost: 1 }.to_argon2().is_ok());
+        assert!(KdfParams::PRODUCTION.to_argon2().is_ok());
+    }
+
+    /// A keystore anyone but its owner can read is refused, loudly, and the
+    /// refusal is not `NotFound` (so it can never select observer mode).
+    #[cfg(unix)]
+    #[test]
+    fn a_group_or_world_readable_keystore_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp_dir("mode");
+        let unlock = Unlock::passphrase_with("pp", CHEAP);
+        Keystore::generate_with(&dir, 7, &unlock).expect("generate");
+        let path = dir.join("validator.key");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).expect("chmod");
+        let e = expect_err_kind(
+            Keystore::load_with(&dir, &unlock),
+            io::ErrorKind::PermissionDenied,
+            "0640 keystore",
+        );
+        assert!(e.to_string().contains("0640"), "{e}");
+        let e = expect_loud(Keystore::load_optional_with(&dir, &unlock), "0640 via load_optional");
+        assert_ne!(e.kind(), io::ErrorKind::NotFound);
+        // Back to 0600 and it loads.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
+        assert_eq!(Keystore::load_with(&dir, &unlock).expect("0600 loads").index, 7);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `inspect` reports the public header and nothing else. Driven on BOTH
+    /// formats; for the plaintext one the assertion is that the Debug output
+    /// of the report contains no byte-run of the secret.
+    #[test]
+    fn inspect_reports_public_fields_only_on_both_formats() {
+        let dir = tmp_dir("inspect");
+        let ks = Keystore::generate_with(&dir, 21, &Unlock::PlaintextOptIn).expect("plaintext");
+        let info = Keystore::inspect(&dir).expect("inspect plaintext");
+        assert_eq!(info.format, KeystoreFormat::PlaintextV1);
+        assert_eq!(info.index, 21);
+        assert_eq!(info.kdf, None);
+        use sha3::{Digest, Sha3_256};
+        let pkh: [u8; 32] = Sha3_256::digest(&ks.pubkey).into();
+        assert_eq!(info.pubkey_sha3, pkh);
+        let shown = format!("{info:?}");
+        assert!(!contains(shown.as_bytes(), &ks.randao_seed));
+        assert!(!contains(shown.as_bytes(), &ks.secret));
+
+        let dir2 = tmp_dir("inspect-sealed");
+        Keystore::generate_with(&dir2, 22, &Unlock::passphrase_with("pp", CHEAP)).expect("sealed");
+        let info = Keystore::inspect(&dir2).expect("inspect sealed");
+        assert_eq!(info.format, KeystoreFormat::SealedV2);
+        assert_eq!(info.index, 22);
+        assert_eq!(info.kdf, Some(CHEAP));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir2);
+    }
+
+    /// THE migration path: a fleet `BPOSKEY1` file becomes `BPOSKEY2` in
+    /// place, opens under the passphrase, signs with the same key, and the
+    /// plaintext opt-in no longer opens it.
+    #[test]
+    fn seal_in_place_migrates_a_plaintext_keystore_and_keeps_the_identity() {
+        let dir = tmp_dir("seal");
+        let before = Keystore::generate_with(&dir, 33, &Unlock::PlaintextOptIn).expect("plaintext");
+        let pass = Zeroizing::new("a long enough passphrase".to_string());
+        let report = Keystore::seal_in_place(&dir, &pass, CHEAP).expect("seal in place");
+        assert_eq!(report.index, 33);
+        assert_eq!(report.kdf, CHEAP);
+        assert!(report.plaintext_bytes_overwritten > 8);
+
+        let raw = fs::read(dir.join("validator.key")).expect("read");
+        assert_eq!(&raw[..8], KEYSTORE_MAGIC_V2, "the file is now sealed");
+        assert!(!contains(&raw, &before.randao_seed), "the RANDAO seed is gone from disk");
+        // The whole secret, not a prefix: the enveloped hybrid secret key
+        // shares its leading bytes (suite header, ML-DSA rho) with the public
+        // key, which the sealed header legitimately carries.
+        assert!(!contains(&raw, &before.secret), "the secret key is gone from disk");
+        assert!(!dir.join("validator.key.sealed.tmp").exists(), "no temp file left behind");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dir.join("validator.key")).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let after = Keystore::load_with(&dir, &Unlock::passphrase_with(pass.as_str(), CHEAP))
+            .expect("the sealed file opens");
+        assert_eq!(after.index, before.index);
+        assert_eq!(after.pubkey, before.pubkey);
+        assert_eq!(after.randao_seed, before.randao_seed);
+        let root = [0x77u8; 32];
+        assert!(HybridVerifier::new().verify_with_key(&before.pubkey, &root, &after.sign(&root)));
+
+        // And the plaintext opt-in no longer opens it: the migration is real.
+        expect_err_kind(
+            Keystore::load_with(&dir, &Unlock::PlaintextOptIn),
+            io::ErrorKind::PermissionDenied,
+            "plaintext opt-in against a sealed file",
+        );
+        // Wrong passphrase fails loud.
+        expect_err_kind(
+            Keystore::load_with(&dir, &Unlock::passphrase_with("not the passphrase", CHEAP)),
+            io::ErrorKind::InvalidData,
+            "wrong passphrase",
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A node running over the data dir holds the lock; sealing under it is
+    /// refused and the plaintext file is untouched.
+    #[test]
+    fn seal_in_place_refuses_while_a_node_holds_the_data_dir() {
+        let dir = tmp_dir("seal-locked");
+        Keystore::generate_with(&dir, 34, &Unlock::PlaintextOptIn).expect("plaintext");
+        let raw_before = fs::read(dir.join("validator.key")).expect("read");
+        let held = crate::store::DirLock::acquire(&dir).expect("the 'node' takes the lock");
+        let pass = Zeroizing::new("a long enough passphrase".to_string());
+        let e = expect_err_kind(
+            Keystore::seal_in_place(&dir, &pass, CHEAP),
+            io::ErrorKind::AddrInUse,
+            "seal under a live lock",
+        );
+        assert!(e.to_string().contains("stop it first"), "{e}");
+        assert_eq!(fs::read(dir.join("validator.key")).unwrap(), raw_before, "untouched");
+        drop(held);
+        Keystore::seal_in_place(&dir, &pass, CHEAP).expect("after the node stops it seals");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Already sealed → refusal (not a silent re-seal), and a short passphrase
+    /// is refused before anything is read.
+    #[test]
+    fn seal_in_place_refuses_a_sealed_file_and_a_short_passphrase() {
+        let dir = tmp_dir("seal-twice");
+        Keystore::generate_with(&dir, 35, &Unlock::passphrase_with("pp", CHEAP)).expect("sealed");
+        let pass = Zeroizing::new("a long enough passphrase".to_string());
+        expect_err_kind(
+            Keystore::seal_in_place(&dir, &pass, CHEAP),
+            io::ErrorKind::AlreadyExists,
+            "sealing a sealed file",
+        );
+        let short = Zeroizing::new("short".to_string());
+        expect_err_kind(
+            Keystore::seal_in_place(&dir, &short, CHEAP),
+            io::ErrorKind::InvalidInput,
+            "short passphrase",
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `keygen` cannot emit plaintext by default: with no passphrase and no
+    /// opt-in the policy is an error, and a passphrase yields the sealed magic.
+    #[test]
+    fn keygen_cannot_write_plaintext_without_the_explicit_opt_in() {
+        assert!(Unlock::from_sources(None, None, false).is_err());
+        let dir = tmp_dir("keygen-sealed");
+        Keystore::generate_with(&dir, 1, &Unlock::passphrase_with("pp", CHEAP)).expect("generate");
+        let raw = fs::read(dir.join("validator.key")).expect("read");
+        assert_eq!(&raw[..8], KEYSTORE_MAGIC_V2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The passphrase-file reader enforces the mode it says it does.
+    #[cfg(unix)]
+    #[test]
+    fn a_world_readable_passphrase_file_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp_dir("passfile");
+        let p = dir.join("pass");
+        fs::write(&p, b"a long enough passphrase\n").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+        expect_err_kind(read_passphrase_file(&p), io::ErrorKind::PermissionDenied, "0644 pass file");
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_passphrase_file(&p).unwrap().as_str(), "a long enough passphrase");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ct_eq_is_an_equality() {
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"ab"));
+        assert!(ct_eq(b"", b""));
     }
 }

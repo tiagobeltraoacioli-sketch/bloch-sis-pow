@@ -358,6 +358,43 @@ pub struct Store {
 ///    process conflict under `flock` too (the lock belongs to the open file
 ///    description), so this refuses a second `Store::open` in-process as well
 ///    — which is what the test can actually drive.
+///
+/// ## The lock file is never unlinked on unix (audit round 3, H-1)
+///
+/// An earlier revision removed `dir/LOCK` in `Drop` "on clean shutdown". That
+/// re-opened the hazard the lock exists for, through a three-process race:
+///
+/// ```text
+///   A holds LOCK (inode X, flocked).
+///   B opens the existing path            -> descriptor on inode X, not yet flocked
+///   A shuts down cleanly: unlink(LOCK)   -> X is now an orphan inode
+///   B flock(X)                            -> succeeds: nobody holds X any more
+///   C create_new(LOCK)                    -> succeeds: the path is free -> inode Y
+///   C flock(Y)                            -> succeeds
+///   B and C both run over one keystore.
+/// ```
+///
+/// The invariant that closes it: **the lock is the inode the path names, and
+/// this module never unlinks that inode.** `flock` already gives clean release
+/// (the descriptor closes) and crash release (the kernel drops it), so there
+/// was nothing for the unlink to add except the race. A stale file after a
+/// crash is not stale under `flock`; it is simply free.
+///
+/// Belt and braces: after a successful `flock`, `acquire` compares the inode
+/// it locked with the inode the path names *now*. If they differ (an operator
+/// ran `rm LOCK` while a node was up, or an older binary's `Drop` ran), the
+/// lock it holds is on an orphan that no future process can contend for, so it
+/// is dropped and the acquisition retried against the file that the path now
+/// names. Bounded retries; a path that keeps changing underneath us is a
+/// refusal, not a spin.
+///
+/// ## Non-unix (documented degrade)
+///
+/// Without `flock` the `O_EXCL` file *is* the lock. There it is removed on a
+/// clean `Drop` (otherwise every restart would be refused), and a crash leaves
+/// a file the operator must remove by hand after confirming no node runs. The
+/// fleet is Linux; this arm exists so the crate keeps compiling elsewhere, not
+/// as a supported posture.
 pub struct DirLock {
     path: PathBuf,
     /// Held open because `flock` lives on the open file description: closing
@@ -369,47 +406,120 @@ pub struct DirLock {
     file: File,
 }
 
+/// How many open → `flock` → verify rounds [`DirLock::acquire`] makes before
+/// it gives up. Each round only repeats when the path was replaced underneath
+/// this process, which takes another actor doing so on purpose.
+const LOCK_ACQUIRE_ATTEMPTS: u32 = 8;
+
+/// What one round of open → `flock` → verify established.
+enum Locked {
+    /// The descriptor holds the lock on the inode the path names.
+    Held(File),
+    /// The descriptor holds a lock on an inode the path no longer names
+    /// (unlinked or replaced after we opened it). Worthless: drop it, retry.
+    Orphaned,
+}
+
 impl DirLock {
     /// Take the lock, or fail with the message an operator needs.
     pub fn acquire(dir: &Path) -> io::Result<DirLock> {
         let path = dir.join("LOCK");
-        // Fresh dir (or a previous holder that shut down cleanly): O_EXCL
-        // creates the file and we take flock on it.
-        let (file, fresh) = match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(f) => (f, true),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                // A LOCK file exists. Whether it MEANS anything is what flock
-                // answers below; without flock we have to assume it does.
-                if !cfg!(unix) {
-                    return Err(held(&path));
+        for _attempt in 0..LOCK_ACQUIRE_ATTEMPTS {
+            let (file, fresh) = match open_lock_file(&path)? {
+                Some(opened) => opened,
+                // Vanished between `create_new` failing and `open`: someone
+                // unlinked it in that window. Start over against the path.
+                None => continue,
+            };
+            match lock_and_verify(file, &path, fresh)? {
+                Locked::Held(mut file) => {
+                    file.set_len(0)?;
+                    file.write_all(format!("{}\n", std::process::id()).as_bytes())?;
+                    file.sync_all()?;
+                    return Ok(DirLock { path, file });
                 }
-                (OpenOptions::new().write(true).open(&path)?, false)
-            }
-            Err(e) => return Err(e),
-        };
-        let _ = fresh; // read only under `cfg(unix)`, below.
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            // SAFETY: `file` is an open, owned descriptor for the duration of
-            // this call; flock(2) touches nothing else.
-            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if rc != 0 {
-                let e = io::Error::last_os_error();
-                if !fresh {
-                    // Someone else holds it. This is the case the lock exists
-                    // for; say so, and do NOT remove their file.
-                    return Err(held(&path));
-                }
-                return Err(e);
+                Locked::Orphaned => continue,
             }
         }
-        let mut file = file;
-        file.set_len(0)?;
-        file.write_all(format!("{}\n", std::process::id()).as_bytes())?;
-        file.sync_all()?;
-        Ok(DirLock { path, file })
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "could not settle the data-dir lock {} after {LOCK_ACQUIRE_ATTEMPTS} attempts: \
+                 the file keeps being replaced underneath this process. Refusing to start.",
+                path.display()
+            ),
+        ))
     }
+
+    /// Where the lock file lives. Public so a tool that must refuse to run
+    /// beside a live node (`bloch-pos keys seal`) can name it in its refusal.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Open `path` for locking. `Ok(Some((file, fresh)))` where `fresh` says
+/// whether this call created the file; `Ok(None)` when the file existed at
+/// `create_new` time and was gone by `open` time (retry).
+fn open_lock_file(path: &Path) -> io::Result<Option<(File, bool)>> {
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(f) => Ok(Some((f, true))),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            // A LOCK file exists. Whether it MEANS anything is what flock
+            // answers below; without flock we have to assume it does.
+            if !cfg!(unix) {
+                return Err(held(path));
+            }
+            match OpenOptions::new().write(true).open(path) {
+                Ok(f) => Ok(Some((f, false))),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `flock` the descriptor, then confirm it is the inode the path names.
+///
+/// The verification is what makes an external unlink harmless: a lock on an
+/// orphan inode cannot exclude anyone, so it is reported as [`Locked::Orphaned`]
+/// and never returned as held.
+#[cfg(unix)]
+fn lock_and_verify(file: File, path: &Path, fresh: bool) -> io::Result<Locked> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: `file` is an open, owned descriptor for the duration of this
+    // call; flock(2) touches nothing else.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let e = io::Error::last_os_error();
+        if e.kind() == io::ErrorKind::WouldBlock || !fresh {
+            // Someone else holds it. This is the case the lock exists for;
+            // say so, and do NOT remove their file.
+            return Err(held(path));
+        }
+        return Err(e);
+    }
+    let locked = file.metadata()?;
+    match fs::metadata(path) {
+        Ok(named) if named.ino() == locked.ino() && named.dev() == locked.dev() => {
+            Ok(Locked::Held(file))
+        }
+        // The path now names another inode, or nothing at all: our lock is
+        // on an orphan.
+        Ok(_) => Ok(Locked::Orphaned),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Locked::Orphaned),
+        Err(e) => Err(e),
+    }
+}
+
+/// Non-unix: `O_EXCL` creation is the whole lock, so a successfully created
+/// file is held by definition (an existing one was already refused in
+/// [`open_lock_file`]).
+#[cfg(not(unix))]
+fn lock_and_verify(file: File, _path: &Path, _fresh: bool) -> io::Result<Locked> {
+    Ok(Locked::Held(file))
 }
 
 fn held(path: &Path) -> io::Error {
@@ -430,12 +540,28 @@ fn held(path: &Path) -> io::Error {
     )
 }
 
+/// Non-unix only: without `flock` the file is the lock, so a clean shutdown
+/// must remove it or every restart is refused. On unix there is deliberately
+/// NO `Drop` — see the type docs (H-1): the descriptor closing releases the
+/// `flock`, and unlinking the path is exactly the race that let two nodes run.
+#[cfg(not(unix))]
 impl Drop for DirLock {
-    /// Clean shutdown removes the file. A crash does not, and does not need
-    /// to: `flock` dies with the process and the next boot reclaims it.
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
+}
+
+/// `fsync` a directory, so a `rename` into it is durable.
+///
+/// `rename` is atomic with respect to readers but not with respect to a
+/// crash: until the directory's own metadata reaches the disk, a power loss
+/// can bring back the old name → old inode mapping. For the block log that
+/// means a reorg that was applied, announced and built on could be undone by
+/// a reboot, and the node would come back on the branch it had abandoned
+/// (audit round 3, M-6). Callers do the write-to-temp + fsync(file) + rename,
+/// then this.
+pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
+    File::open(dir)?.sync_all()
 }
 
 impl Store {
@@ -574,6 +700,9 @@ impl Store {
             f.sync_data()?;
         }
         fs::rename(&tmp, self.dir.join("blocks.log"))?;
+        // The rename must be durable too, or a crash can resurrect the
+        // pre-reorg log (M-6). Same discipline as slashprot's watermark write.
+        fsync_dir(&self.dir)?;
         self.log = OpenOptions::new()
             .create(true)
             .append(true)
@@ -883,9 +1012,18 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "got: {err}");
 
         // Releasing it makes the dir usable again — a lock that never lets go
-        // would just be a different outage.
+        // would just be a different outage. On unix the FILE stays: the lock
+        // is the flock on its inode, and unlinking the path was the H-1 race
+        // (see the next test). Reopening must therefore succeed WITH the
+        // file present.
         drop(first);
-        assert!(!dir.join("LOCK").exists(), "a clean shutdown removes the lock file");
+        if cfg!(unix) {
+            assert!(
+                dir.join("LOCK").exists(),
+                "H-1: a clean shutdown must NOT unlink the lock file on unix — the unlink is \
+                 what let a pre-opened descriptor flock an orphan inode"
+            );
+        }
         let reopened = Store::open(&dir, &[3u8; 32]).expect("reopen after a clean release");
         drop(reopened);
 
@@ -966,6 +1104,99 @@ mod tests {
         let store = Store::open(&dir, &[4u8; 32]).expect("a stale lock must be reclaimed");
         drop(store);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// **THE regression test for H-1 (audit round 3).** The open-then-unlink
+    /// race, driven with two descriptors in one process, which is exactly the
+    /// shape `flock` sees across processes.
+    ///
+    /// Process B opens the existing `LOCK` while A holds it (B has not yet
+    /// flocked). A shuts down cleanly. B now takes the flock. C boots. With
+    /// the old `Drop` (unlink on clean shutdown) A's release orphaned the
+    /// inode B holds, so C's `create_new` made a fresh inode and C's flock
+    /// succeeded: B and C both ran over one keystore. Without the unlink, C
+    /// opens the same inode B holds and is refused.
+    ///
+    /// Restore `fs::remove_file(&self.path)` in a unix `Drop` and this test
+    /// fails at the last assertion.
+    #[cfg(unix)]
+    #[test]
+    fn a_pre_opened_descriptor_cannot_outlive_the_holder_into_a_second_node() {
+        use std::os::unix::io::AsRawFd;
+        let dir = std::env::temp_dir().join(format!("bloch-pos-h1-race-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("LOCK");
+
+        let a = DirLock::acquire(&dir).expect("A takes the lock");
+        // B: opened the existing path while A holds it, not yet flocked.
+        let b = OpenOptions::new().write(true).open(&path).expect("B opens the live lock path");
+        drop(a); // A shuts down cleanly.
+        // B flocks whatever inode it opened. Under the old design this was an
+        // orphan; under the new one it is the inode the path still names.
+        let rc = unsafe { libc::flock(b.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "B takes the flock after A released it");
+
+        // C boots. It must see B.
+        let c = DirLock::acquire(&dir);
+        let err = match c {
+            Ok(_) => panic!(
+                "H-1 regression: a third node acquired the data dir while a second holds the \
+                 flock — the lock file was unlinked and re-created"
+            ),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "got: {err}");
+
+        drop(b);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A lock taken on an inode the path no longer names is worthless and is
+    /// reported as such, so `acquire` retries against the current file rather
+    /// than returning a "lock" nobody else can contend for.
+    ///
+    /// Drives the verification step directly: open, then unlink underneath
+    /// it (an operator's `rm LOCK`, or an older binary's `Drop`), then lock.
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_on_an_unlinked_inode_is_reported_orphaned_and_reacquired() {
+        let dir = std::env::temp_dir().join(format!("bloch-pos-h1-orphan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("LOCK");
+
+        let (file, fresh) = open_lock_file(&path).expect("open").expect("present");
+        assert!(fresh);
+        fs::remove_file(&path).expect("unlink underneath the open descriptor");
+        match lock_and_verify(file, &path, fresh).expect("flock itself succeeds") {
+            Locked::Held(_) => panic!("a flock on an orphan inode must not count as held"),
+            Locked::Orphaned => {}
+        }
+
+        // And the public entry point recovers by itself: the path is free, so
+        // the retry creates and locks a fresh inode that the path DOES name.
+        let lock = DirLock::acquire(&dir).expect("acquire recovers from the orphan");
+        assert!(path.exists());
+        drop(lock);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The lock file is a stable artifact across releases (unix): two clean
+    /// shutdowns in a row leave it in place and both reacquisitions succeed.
+    #[cfg(unix)]
+    #[test]
+    fn the_lock_file_persists_across_clean_releases() {
+        let dir = std::env::temp_dir().join(format!("bloch-pos-h1-persist-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("mkdir");
+        for _ in 0..3 {
+            let lock = DirLock::acquire(&dir).expect("acquire");
+            assert!(lock.path().exists());
+            drop(lock);
+            assert!(dir.join("LOCK").exists(), "clean release keeps the file (H-1)");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

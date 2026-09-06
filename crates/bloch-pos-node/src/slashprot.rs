@@ -79,10 +79,16 @@ use sha3::digest::{ExtendableOutput, Update, XofReader};
 /// File name inside the data dir.
 pub const FILE_NAME: &str = "slashing_protection.bin";
 
-const MAGIC: &[u8; 8] = b"BPOSSLP1";
-const VERSION: u32 = 1;
+/// Unbound record: what every fleet node wrote before the binding existed.
+const MAGIC_V1: &[u8; 8] = b"BPOSSLP1";
+const VERSION_V1: u32 = 1;
 /// magic ‖ version ‖ 4 × u64 ‖ 32-byte digest.
-const RECORD_LEN: usize = 8 + 4 + 8 * 4 + 32;
+const RECORD_LEN_V1: usize = 8 + 4 + 8 * 4 + 32;
+/// Bound record (audit round 3, M-8): magic ‖ version ‖ 4 × u64 ‖
+/// validator pubkey sha3 ‖ genesis digest ‖ 32-byte digest.
+const MAGIC_V2: &[u8; 8] = b"BPOSSLP2";
+const VERSION_V2: u32 = 2;
+const RECORD_LEN_V2: usize = RECORD_LEN_V1 + 32 + 32;
 /// `None`, on disk. No real slot or epoch can reach it.
 const NONE: u64 = u64::MAX;
 
@@ -145,27 +151,71 @@ impl fmt::Display for Refusal {
     }
 }
 
+/// Whose watermarks these are (audit round 3, M-8).
+///
+/// A watermark file that is not bound to an identity protects the wrong
+/// thing in two ordinary operator moves: a data dir restored from another
+/// validator's backup (its watermarks are *lower* than this validator's, so
+/// the guard admits a duty this key already signed) and a data dir carried
+/// across a network reset (the same slot numbers mean different duties). With
+/// the binding, either move is a loud refusal at boot naming the mismatch,
+/// instead of a signature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Binding {
+    /// SHA3-256 of the validator's suite-enveloped public key — the same
+    /// identifier `keygen` and `keys inspect` print.
+    pub validator_pubkey_sha3: [u8; 32],
+    /// The network digest the data dir was initialised for (`Store::open`).
+    pub genesis_digest: [u8; 32],
+}
+
 /// The watermark file, loaded, plus the durable write that must precede any
 /// signature this node makes.
 ///
-/// `Debug` is derivable and derived: nothing here is secret — two paths and
-/// four integers — and tests need it to report a refusal.
+/// `Debug` is derivable and derived: nothing here is secret — two paths,
+/// four integers and two public digests — and tests need it to report a
+/// refusal.
 #[derive(Debug)]
 pub struct SlashingProtection {
     path: PathBuf,
     dir: PathBuf,
     wm: Watermarks,
+    /// Identity the file is (or will be, on the next commit) bound to.
+    /// `None` only for a caller that supplied none over a legacy file.
+    binding: Option<Binding>,
 }
 
 impl SlashingProtection {
-    /// Load (or initialize) `dir/slashing_protection.bin`.
+    /// Load (or initialize) `dir/slashing_protection.bin` without checking
+    /// whose it is. Kept for callers that have no identity to check against
+    /// (an observer, tooling, tests); a validator boots through
+    /// [`SlashingProtection::open_bound`]. A bound file opened this way keeps
+    /// its binding on every write, so this path can never *strip* one.
     ///
     /// A missing file is a fresh validator: all watermarks `None`. A file
     /// that does not decode is an error, never a reset.
     pub fn open(dir: &Path) -> io::Result<SlashingProtection> {
+        Self::open_with(dir, None)
+    }
+
+    /// Load (or initialize) the watermarks **for this validator on this
+    /// network**, refusing a file written for any other.
+    ///
+    /// - A `BPOSSLP2` file bound to a different key or network → error naming
+    ///   which of the two differs (and both digests, truncated).
+    /// - A legacy `BPOSSLP1` file (unbound) → adopted as-is, and bound on its
+    ///   next commit; the upgrade is announced on stdout. Nothing about the
+    ///   watermarks themselves changes, so the fleet's existing files keep
+    ///   protecting exactly what they protected.
+    /// - No file → fresh watermarks, bound on first commit.
+    pub fn open_bound(dir: &Path, binding: Binding) -> io::Result<SlashingProtection> {
+        Self::open_with(dir, Some(binding))
+    }
+
+    fn open_with(dir: &Path, want: Option<Binding>) -> io::Result<SlashingProtection> {
         fs::create_dir_all(dir)?;
         let path = dir.join(FILE_NAME);
-        let wm = match fs::read(&path) {
+        let (wm, on_disk) = match fs::read(&path) {
             Ok(bytes) => decode(&bytes).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -177,10 +227,58 @@ impl SlashingProtection {
                     ),
                 )
             })?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Watermarks::default(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (Watermarks::default(), None),
             Err(e) => return Err(e),
         };
-        Ok(SlashingProtection { path, dir: dir.to_path_buf(), wm })
+        let binding = match (on_disk, want) {
+            (Some(file), Some(mine)) if file != mine => {
+                let what = match (
+                    file.validator_pubkey_sha3 == mine.validator_pubkey_sha3,
+                    file.genesis_digest == mine.genesis_digest,
+                ) {
+                    (false, true) => "a DIFFERENT VALIDATOR KEY",
+                    (true, false) => "a DIFFERENT NETWORK",
+                    _ => "a different validator key AND a different network",
+                };
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{} was written for {what}: file has validator key {} on network {}, this \
+                         node is validator key {} on network {}. Refusing to sign: another \
+                         validator's watermarks say nothing about what THIS key has signed. \
+                         If this data dir was restored from another box's backup, restore this \
+                         validator's own slashing_protection.bin (or accept the double-signing \
+                         risk explicitly by removing the file).",
+                        path.display(),
+                        crate::codec::hex8(&file.validator_pubkey_sha3),
+                        crate::codec::hex8(&file.genesis_digest),
+                        crate::codec::hex8(&mine.validator_pubkey_sha3),
+                        crate::codec::hex8(&mine.genesis_digest),
+                    ),
+                ));
+            }
+            (Some(file), _) => Some(file),
+            (None, Some(mine)) => {
+                if path.exists() {
+                    println!(
+                        "slashing protection: {} is a legacy unbound record; it will be bound to \
+                         validator key {} / network {} on its next write",
+                        path.display(),
+                        crate::codec::hex8(&mine.validator_pubkey_sha3),
+                        crate::codec::hex8(&mine.genesis_digest),
+                    );
+                }
+                Some(mine)
+            }
+            (None, None) => None,
+        };
+        Ok(SlashingProtection { path, dir: dir.to_path_buf(), wm, binding })
+    }
+
+    /// The identity the file is bound to (or will be bound to on the next
+    /// commit). `None` only for an unbound legacy file opened without one.
+    pub fn binding(&self) -> Option<Binding> {
+        self.binding
     }
 
     /// The loaded watermarks. Read-only: the only writer is a guarded sign.
@@ -259,7 +357,7 @@ impl SlashingProtection {
         let tmp = self.path.with_extension("bin.tmp");
         {
             let mut f = File::create(&tmp)?;
-            f.write_all(&encode(&next))?;
+            f.write_all(&encode(&next, self.binding.as_ref()))?;
             f.sync_all()?;
         }
         fs::rename(&tmp, &self.path)?;
@@ -270,23 +368,43 @@ impl SlashingProtection {
     }
 }
 
-fn encode(wm: &Watermarks) -> Vec<u8> {
-    let mut out = Vec::with_capacity(RECORD_LEN);
-    out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&VERSION.to_le_bytes());
+fn encode(wm: &Watermarks, binding: Option<&Binding>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(RECORD_LEN_V2);
+    match binding {
+        Some(_) => {
+            out.extend_from_slice(MAGIC_V2);
+            out.extend_from_slice(&VERSION_V2.to_le_bytes());
+        }
+        None => {
+            out.extend_from_slice(MAGIC_V1);
+            out.extend_from_slice(&VERSION_V1.to_le_bytes());
+        }
+    }
     for v in [wm.proposal_slot, wm.attestation_slot, wm.source_epoch, wm.target_epoch] {
         out.extend_from_slice(&v.unwrap_or(NONE).to_le_bytes());
+    }
+    if let Some(b) = binding {
+        out.extend_from_slice(&b.validator_pubkey_sha3);
+        out.extend_from_slice(&b.genesis_digest);
     }
     out.extend_from_slice(&digest(&out));
     out
 }
 
-fn decode(bytes: &[u8]) -> Option<Watermarks> {
-    if bytes.len() != RECORD_LEN
-        || &bytes[..8] != MAGIC
-        || bytes[8..12] != VERSION.to_le_bytes()
-        || bytes[RECORD_LEN - 32..] != digest(&bytes[..RECORD_LEN - 32])
-    {
+/// Both record versions. Length, magic and version must agree with each
+/// other AND with the digest, so a V1 body wearing a V2 magic (or the reverse)
+/// is corrupt, not a downgrade.
+fn decode(bytes: &[u8]) -> Option<(Watermarks, Option<Binding>)> {
+    let (body_len, bound) = match bytes.len() {
+        RECORD_LEN_V1 if &bytes[..8] == MAGIC_V1 && bytes[8..12] == VERSION_V1.to_le_bytes() => {
+            (RECORD_LEN_V1 - 32, false)
+        }
+        RECORD_LEN_V2 if &bytes[..8] == MAGIC_V2 && bytes[8..12] == VERSION_V2.to_le_bytes() => {
+            (RECORD_LEN_V2 - 32, true)
+        }
+        _ => return None,
+    };
+    if bytes[body_len..] != digest(&bytes[..body_len]) {
         return None;
     }
     let field = |i: usize| {
@@ -294,12 +412,22 @@ fn decode(bytes: &[u8]) -> Option<Watermarks> {
         let v = u64::from_le_bytes(bytes[at..at + 8].try_into().ok()?);
         Some((v != NONE).then_some(v))
     };
-    Some(Watermarks {
+    let wm = Watermarks {
         proposal_slot: field(0)?,
         attestation_slot: field(1)?,
         source_epoch: field(2)?,
         target_epoch: field(3)?,
-    })
+    };
+    let binding = if bound {
+        let at = 12 + 4 * 8;
+        Some(Binding {
+            validator_pubkey_sha3: bytes[at..at + 32].try_into().ok()?,
+            genesis_digest: bytes[at + 32..at + 64].try_into().ok()?,
+        })
+    } else {
+        None
+    };
+    Some((wm, binding))
 }
 
 /// SHAKE-256/32 over the record body — a torn write is detected, not adopted.
@@ -342,7 +470,7 @@ mod tests {
         let mut f = File::open(path).expect("the watermark file must exist by now");
         let mut bytes = Vec::new();
         f.read_to_end(&mut bytes).expect("read");
-        decode(&bytes).expect("decode")
+        decode(&bytes).expect("decode").0
     }
 
     /// **The ordering claim.** The watermark is durable BEFORE the signature
@@ -494,7 +622,106 @@ mod tests {
                 target_epoch: Some(7),
             },
         ] {
-            assert_eq!(decode(&encode(&wm)), Some(wm));
+            assert_eq!(decode(&encode(&wm, None)), Some((wm, None)));
+            let b = Binding { validator_pubkey_sha3: [0xAB; 32], genesis_digest: [0xCD; 32] };
+            assert_eq!(decode(&encode(&wm, Some(&b))), Some((wm, Some(b))));
         }
+    }
+
+    // ----- audit round 3, M-8: the watermark file is bound to an identity -----
+
+    const KEY_A: Binding = Binding { validator_pubkey_sha3: [0xA1; 32], genesis_digest: [0x44; 32] };
+    const KEY_B: Binding = Binding { validator_pubkey_sha3: [0xB2; 32], genesis_digest: [0x44; 32] };
+    const KEY_A_OTHER_NET: Binding =
+        Binding { validator_pubkey_sha3: [0xA1; 32], genesis_digest: [0x55; 32] };
+
+    /// THE regression test for M-8. A watermark file written for validator A
+    /// is refused by validator B and by A on another network, and the refusal
+    /// names which of the two differs. A itself reopens it with the watermarks
+    /// intact.
+    #[test]
+    fn a_watermark_file_bound_to_another_identity_is_refused_naming_the_mismatch() {
+        let d = dir("bound");
+        {
+            let mut sp = SlashingProtection::open_bound(&d.0, KEY_A).expect("fresh, bound");
+            assert_eq!(sp.binding(), Some(KEY_A));
+            sp.guard_proposal(5, || ()).expect("first commit writes a V2 record");
+        }
+        let raw = fs::read(d.0.join(FILE_NAME)).unwrap();
+        assert_eq!(&raw[..8], MAGIC_V2);
+
+        let e = SlashingProtection::open_bound(&d.0, KEY_B).err().expect("B must be refused");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("DIFFERENT VALIDATOR KEY"), "{e}");
+
+        let e = SlashingProtection::open_bound(&d.0, KEY_A_OTHER_NET).err().expect("other net refused");
+        assert!(e.to_string().contains("DIFFERENT NETWORK"), "{e}");
+
+        let sp = SlashingProtection::open_bound(&d.0, KEY_A).expect("the owner reopens it");
+        assert_eq!(sp.watermarks().proposal_slot, Some(5));
+    }
+
+    /// The fleet's existing files are unbound `BPOSSLP1`. They are adopted
+    /// with their watermarks, and the first commit binds them; from then on
+    /// another identity is refused.
+    #[test]
+    fn a_legacy_unbound_record_is_adopted_and_bound_on_its_next_commit() {
+        let d = dir("legacy");
+        let legacy = Watermarks {
+            proposal_slot: Some(100),
+            attestation_slot: Some(101),
+            source_epoch: Some(2),
+            target_epoch: Some(3),
+        };
+        fs::create_dir_all(&d.0).unwrap();
+        fs::write(d.0.join(FILE_NAME), encode(&legacy, None)).unwrap();
+
+        let mut sp = SlashingProtection::open_bound(&d.0, KEY_A).expect("legacy file adopted");
+        assert_eq!(sp.watermarks(), legacy, "watermarks are preserved exactly");
+        assert_eq!(sp.binding(), Some(KEY_A));
+        // Still refuses what it refused before the binding existed.
+        assert!(sp.guard_attestation(101, 2, 3, || ()).is_err());
+        sp.guard_attestation(102, 3, 4, || ()).expect("a later duty commits");
+
+        let raw = fs::read(d.0.join(FILE_NAME)).unwrap();
+        assert_eq!(&raw[..8], MAGIC_V2, "the commit upgraded the record");
+        assert!(SlashingProtection::open_bound(&d.0, KEY_B).is_err());
+        assert!(SlashingProtection::open_bound(&d.0, KEY_A).is_ok());
+    }
+
+    /// The unbound `open` can never strip a binding: a bound file opened
+    /// without an identity keeps its binding on every write.
+    #[test]
+    fn an_unbound_open_preserves_an_existing_binding() {
+        let d = dir("preserve");
+        SlashingProtection::open_bound(&d.0, KEY_A)
+            .unwrap()
+            .guard_proposal(1, || ())
+            .unwrap();
+        let mut sp = SlashingProtection::open(&d.0).expect("unbound open of a bound file");
+        assert_eq!(sp.binding(), Some(KEY_A));
+        sp.guard_proposal(2, || ()).unwrap();
+        assert!(SlashingProtection::open_bound(&d.0, KEY_B).is_err(), "binding survived");
+        assert_eq!(
+            SlashingProtection::open_bound(&d.0, KEY_A).unwrap().watermarks().proposal_slot,
+            Some(2)
+        );
+    }
+
+    /// A V1 body wearing the V2 magic (or the reverse) is corrupt, not a
+    /// downgrade — the digest covers the header, so neither decodes.
+    #[test]
+    fn a_relabelled_record_is_corrupt_not_a_version_change() {
+        let wm = Watermarks { proposal_slot: Some(9), ..Default::default() };
+        let mut v1 = encode(&wm, None);
+        v1[..8].copy_from_slice(MAGIC_V2);
+        assert_eq!(decode(&v1), None);
+        let mut v2 = encode(&wm, Some(&KEY_A));
+        v2[..8].copy_from_slice(MAGIC_V1);
+        assert_eq!(decode(&v2), None);
+        // And flipping one byte of the binding is detected.
+        let mut v2 = encode(&wm, Some(&KEY_A));
+        v2[12 + 32] ^= 1;
+        assert_eq!(decode(&v2), None);
     }
 }

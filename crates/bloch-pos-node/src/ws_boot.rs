@@ -261,11 +261,24 @@ pub fn load_latest(
     Ok(Some(cp))
 }
 
-/// Persist `ws_latest` (write-to-temp + rename, like the block-log rewrite).
+/// Persist `ws_latest` (write-to-temp + fsync + rename + fsync(dir), like the
+/// block-log rewrite and the slashing-protection watermark).
+///
+/// The directory fsync is not optional (audit round 3, M-6): `ws_latest` is
+/// what the next boot refuses to rewind below. A rename that a crash can undo
+/// would let the node come back trusting an older checkpoint than the one it
+/// had already announced, which is the weak-subjectivity window re-opening by
+/// itself.
 pub fn save_latest(dir: &Path, cp: &WeakSubjectivityCheckpoint) -> io::Result<()> {
+    use std::io::Write;
     let tmp = dir.join("ws_latest.bin.tmp");
-    fs::write(&tmp, cp.canonical_serialize())?;
-    fs::rename(&tmp, dir.join(WS_LATEST_FILE))
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(&cp.canonical_serialize())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, dir.join(WS_LATEST_FILE))?;
+    crate::store::fsync_dir(dir)
 }
 
 // ---------------------------------------------------------------------------

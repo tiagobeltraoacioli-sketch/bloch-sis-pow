@@ -132,6 +132,7 @@ fn main() {
         }
         Some("keygen") => keygen(&args[1..]),
         Some("keygen-public") => keygen_public(&args[1..]),
+        Some("keys") => keys_cmd(&args[1..]),
         Some("genesis") => genesis_cmd(&args[1..]),
         Some("genesis-mainnet") => genesis_mainnet(&args[1..]),
         Some("submit-tx") => submit_tx(&args[1..]),
@@ -175,6 +176,20 @@ fn print_help() {
                Print one TSV row of a keystore's PUBLIC halves — the only
                thing that leaves the air-gapped ceremony machine. Secret
                material is unreachable from this command.\n\
+           bloch-pos keys seal --dir <datadir> [--passphrase-file <0600 file>]\n\
+               Re-seal a PLAINTEXT (BPOSKEY1) validator.key in place as a\n\
+               sealed (BPOSKEY2) keystore. The passphrase comes from the\n\
+               0600 file or, without the flag, from the terminal (no echo);\n\
+               NEVER from the command line. Refuses while a node holds the\n\
+               data dir lock. Writes a temp file, verifies it opens, then\n\
+               renames it over validator.key and zero-fills the old bytes\n\
+               (best effort on journaling/CoW filesystems). The flag-day\n\
+               prerequisite: run it on every host BEFORE the sealed-only\n\
+               binary is rolled out.\n\
+           bloch-pos keys inspect --dir <datadir>\n\
+               Print the PUBLIC header of validator.key: format, index,\n\
+               pubkey sha3, KDF cost, file mode. Opens nothing, prints no\n\
+               secret. Also reports whether the data dir lock is free.\n\
            bloch-pos submit-tx --to <host:port> --pubkey <hex>\n\
                                --spend <txid-hex>:<vout> [--spend ...]\n\
                                --pay <script-hash-hex>:<sat> [--pay ...]\n\
@@ -232,7 +247,8 @@ fn print_help() {
          \n\
              libp2p transport:\n\
                          [--p2p-listen <multiaddr>[,...]] (default\n\
-                          /ip4/0.0.0.0/tcp/16400)\n\
+                          /ip4/127.0.0.1/tcp/16400 — loopback; an\n\
+                          all-interfaces swarm is an explicit choice)\n\
                          [--p2p-peer <multiaddr>[,...]]\n\
                          [--max-peers <n>] [--behind-proxy]\n\
                Peers are dialled as /ip4/<host>/tcp/<port>/p2p/<peer-id>.\n\
@@ -568,6 +584,140 @@ fn hex_lower(b: &[u8]) -> String {
     s
 }
 
+/// `keys seal | inspect` — the keystore migration family (audit round 3,
+/// flag-day prerequisite).
+///
+/// Passphrase sourcing, in order: `--passphrase-file <path>` (mode-checked
+/// 0600), else the controlling terminal with echo off. There is deliberately
+/// no `--passphrase <text>`: argv is world-readable in `ps`, lands in shell
+/// history and in every jump host's audit log. The environment variable the
+/// node itself reads (`BLOCH_KEYSTORE_PASSPHRASE`) is honoured here too, with
+/// the same loud warning `Unlock::from_env` prints, so an operator who has
+/// already wired `LoadCredential=` can seal with exactly the passphrase the
+/// unit will use.
+fn keys_cmd(args: &[String]) {
+    match args.first().map(String::as_str) {
+        Some("seal") => keys_seal(&args[1..]),
+        Some("inspect") => keys_inspect(&args[1..]),
+        _ => {
+            eprintln!("keys: expected `seal` or `inspect` (see --help)");
+            exit(2);
+        }
+    }
+}
+
+fn keys_seal(args: &[String]) {
+    let Some(dir) = arg_value(args, "--dir") else {
+        eprintln!("keys seal: --dir <datadir> is required");
+        exit(2);
+    };
+    if arg_value(args, "--passphrase").is_some() {
+        eprintln!(
+            "keys seal: --passphrase <text> is not accepted (a command line is visible in `ps` \
+             and shell history). Use --passphrase-file <0600 file> or type it at the prompt."
+        );
+        exit(2);
+    }
+    let pass = if let Some(f) = arg_value(args, "--passphrase-file") {
+        match keys::read_passphrase_file(&PathBuf::from(&f)) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("keys seal: {e}");
+                exit(1);
+            }
+        }
+    } else if let Some(f) = std::env::var_os("BLOCH_KEYSTORE_PASSPHRASE_FILE") {
+        match keys::read_passphrase_file(&PathBuf::from(&f)) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("keys seal: BLOCH_KEYSTORE_PASSPHRASE_FILE: {e}");
+                exit(1);
+            }
+        }
+    } else {
+        let first = match keys::read_passphrase_from_tty("New keystore passphrase: ") {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("keys seal: {e}");
+                exit(1);
+            }
+        };
+        let again = match keys::read_passphrase_from_tty("Repeat passphrase: ") {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("keys seal: {e}");
+                exit(1);
+            }
+        };
+        if first.as_str() != again.as_str() {
+            eprintln!("keys seal: passphrases do not match; nothing was written");
+            exit(1);
+        }
+        first
+    };
+    match keys::Keystore::seal_in_place(&PathBuf::from(&dir), &pass, keys::KdfParams::PRODUCTION) {
+        Ok(r) => {
+            // Public information only — never a secret byte.
+            println!(
+                "sealed {dir}/validator.key: validator {}, pubkey sha3 {}, Argon2id m={} KiB t={} p={}, \
+                 {} plaintext bytes zero-filled (best effort). Set BLOCH_KEYSTORE_PASSPHRASE_FILE \
+                 in the unit before the next start; the plaintext opt-in no longer opens this file.",
+                r.index,
+                codec::hex8(&r.pubkey_sha3),
+                r.kdf.m_cost,
+                r.kdf.t_cost,
+                r.kdf.p_cost,
+                r.plaintext_bytes_overwritten
+            );
+        }
+        Err(e) => {
+            eprintln!("keys seal failed: {e}");
+            exit(1);
+        }
+    }
+}
+
+fn keys_inspect(args: &[String]) {
+    let Some(dir) = arg_value(args, "--dir") else {
+        eprintln!("keys inspect: --dir <datadir> is required");
+        exit(2);
+    };
+    let dir = PathBuf::from(&dir);
+    match keys::Keystore::inspect(&dir) {
+        Ok(info) => {
+            println!("file      : {}", dir.join("validator.key").display());
+            println!("format    : {}", info.format);
+            println!("index     : {}", info.index);
+            println!("pubkey    : sha3-256 {} ({} bytes)", codec::hex8(&info.pubkey_sha3), info.pubkey_len);
+            match info.kdf {
+                Some(k) => println!("kdf       : Argon2id m={} KiB t={} p={}", k.m_cost, k.t_cost, k.p_cost),
+                None => println!("kdf       : none (PLAINTEXT — run `bloch-pos keys seal`)"),
+            }
+            if let Some(m) = info.mode {
+                println!(
+                    "mode      : {m:04o}{}",
+                    if m & 0o077 != 0 { "  <-- readable by group/others: the loader will refuse it" } else { "" }
+                );
+            }
+            println!("length    : {} bytes", info.file_len);
+        }
+        Err(e) => {
+            eprintln!("keys inspect: cannot read {}: {e}", dir.display());
+            exit(1);
+        }
+    }
+    // Whether a node is running over the dir, via the same lock the node
+    // takes. Taking and releasing it here is harmless: without a running node
+    // nothing else contends for it, and with one it is refused.
+    match store::DirLock::acquire(&dir) {
+        Ok(lock) => println!("data dir  : lock free ({})", lock.path().display()),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            println!("data dir  : IN USE by a running node — `keys seal` will refuse until it stops")
+        }
+        Err(e) => println!("data dir  : lock check failed ({e})"),
+    }
+}
+
 fn keygen(args: &[String]) {
     let Some(dir) = arg_value(args, "--dir") else {
         eprintln!("keygen: --dir is required");
@@ -883,7 +1033,15 @@ fn genesis_cmd(args: &[String]) {
 
 /// The default libp2p listen address, used when a plan runs a swarm and the
 /// operator named no `--p2p-listen`.
-const DEFAULT_P2P_LISTEN: &str = "/ip4/0.0.0.0/tcp/16400";
+///
+/// **Loopback, deliberately** (audit round 3, H-2). A swarm that binds every
+/// interface is an exposure decision — firewall rules, the published bootnode
+/// list, the fleet inventory all change with it — and a decision like that is
+/// made by the operator typing `--p2p-listen /ip4/0.0.0.0/tcp/16400`, never by
+/// a compiled-in default that a rebuild silently turns on. Loopback keeps the
+/// swarm reachable for local tooling and for `dual` experiments on one box
+/// while exposing nothing.
+const DEFAULT_P2P_LISTEN: &str = "/ip4/127.0.0.1/tcp/16400";
 
 /// What [`decide_transport`] decided: the transport, the listener settings
 /// that follow from it, and the line the node prints about it.
@@ -948,12 +1106,20 @@ pub(crate) struct TransportPlan {
 /// knob it does not read would trade a real outage for a cosmetic one.
 pub(crate) fn decide_transport(args: &[String]) -> Result<TransportPlan, String> {
     let transport = match arg_value(args, "--transport").as_deref() {
-        // Unchanged, and load-bearing: see the section above.
-        Some("devnet") => engine::Transport::Devnet,
+        // Unchanged, and load-bearing: see the section above. `None` IS
+        // `Devnet`: it is what `--help`, `net.rs`, the README, the bootnode
+        // verifier (`deploy/bootnodes/verify-bootnodes.sh`) and the refusal
+        // messages below all say, and what every unit file on the live fleet
+        // was written against. A revision briefly mapped `None` to `Dual`
+        // while leaving all of those documents saying devnet; every rebuilt
+        // node then opened an all-interfaces libp2p listener that nobody had
+        // asked for (audit round 3, H-2). Moving the fleet to `dual` is a
+        // runbook change — an explicit `--transport dual --p2p-listen ...` in
+        // the unit file, rolled host by host — not a silent compiled-in flip.
+        None | Some("devnet") => engine::Transport::Devnet,
         Some("libp2p") => engine::Transport::Libp2p,
-        // Dual is reachable ONLY by naming it. `None` is still `Devnet`, so a
-        // command line that worked yesterday selects the same transport today.
-        None | Some("dual") => engine::Transport::Dual,
+        // Dual is reachable ONLY by naming it.
+        Some("dual") => engine::Transport::Dual,
         Some(other) => {
             return Err(format!(
                 "--transport must be `devnet`, `libp2p` or `dual`, not `{other}`"
@@ -1078,12 +1244,7 @@ pub(crate) fn decide_transport(args: &[String]) -> Result<TransportPlan, String>
             format!("LIBP2P — swarm on {}, no devnet mesh", p2p_listen.join(", "))
         }
         engine::Transport::Dual => format!(
-            "DUAL{} — devnet mesh on {listen_addr}:{listen} AND libp2p swarm on {}, both live in one process",
-            if named {
-                ""
-            } else {
-                " (default: no --transport given)"
-            },
+            "DUAL — devnet mesh on {listen_addr}:{listen} AND libp2p swarm on {}, both live in one process",
             p2p_listen.join(", ")
         ),
     };
@@ -1332,24 +1493,22 @@ mod transport_tests {
         s.split_whitespace().map(String::from).collect()
     }
 
-    /// **The default is not being changed, and this test is what says so.**
+    /// **The default is devnet, and this test is what says so.**
     ///
-    /// The live Genesis-4 fleet runs the devnet mesh. If a future edit flips
-    /// the `None` arm, every node that restarts with an unchanged unit file
-    /// comes up on a transport nobody else speaks, finds no peers, and builds
-    /// its own chain while logging `applied` and `finalized`. That is not a
-    /// crash, so nothing else in the tree would catch it.
+    /// The live Genesis-4 fleet runs the devnet mesh and every document in the
+    /// tree says so. A revision flipped the `None` arm to `Dual` without
+    /// touching any of them, so every node rebuilt from it bound an
+    /// all-interfaces libp2p listener that no operator had configured a
+    /// firewall for (audit round 3, H-2). This test pins the documented
+    /// default; a deliberate move to `dual` changes the unit files, this
+    /// test, `--help`, `net.rs` and the bootnode verifier together, in one
+    /// reviewed change.
     #[test]
-    fn no_transport_flag_now_means_dual() {
-        // The default was deliberately flipped from Devnet to Dual. Dual keeps
-        // the devnet TCP mesh (so a node restarting with an unchanged unit file
-        // still finds the fleet and does NOT fork off alone — the danger this
-        // test used to guard against) AND binds a libp2p swarm, so a third
-        // party can dial in. Both stacks are live under the default.
+    fn no_transport_flag_means_devnet() {
         let plan = decide_transport(&argv("--listen 16400")).expect("plan");
-        assert_eq!(plan.transport, engine::Transport::Dual);
+        assert_eq!(plan.transport, engine::Transport::Devnet);
         assert_eq!(plan.listen, 16400);
-        assert!(!plan.p2p_listen.is_empty(), "the default now binds a swarm");
+        assert!(plan.p2p_listen.is_empty(), "the default binds no swarm");
         assert!(
             plan.summary.contains("default"),
             "the line must say the transport was defaulted, not chosen: {}",
@@ -1357,16 +1516,30 @@ mod transport_tests {
         );
     }
 
-    /// `--transport dual` and no flag reach the same transport, and the only
+    /// `--transport devnet` and no flag reach the same transport, and the only
     /// difference is that one line says it was chosen.
     #[test]
-    fn naming_dual_matches_the_default() {
+    fn naming_devnet_matches_the_default() {
         let implicit = decide_transport(&argv("--listen 16400")).unwrap();
-        let explicit = decide_transport(&argv("--transport dual --listen 16400")).unwrap();
+        let explicit = decide_transport(&argv("--transport devnet --listen 16400")).unwrap();
         assert_eq!(implicit.transport, explicit.transport);
         assert_eq!(implicit.listen, explicit.listen);
         assert_eq!(implicit.p2p_listen, explicit.p2p_listen);
         assert!(!explicit.summary.contains("default"));
+    }
+
+    /// The compiled-in swarm address is loopback (H-2). An all-interfaces
+    /// swarm is typed by the operator, never defaulted.
+    #[test]
+    fn the_default_swarm_address_is_loopback() {
+        assert!(
+            DEFAULT_P2P_LISTEN.starts_with("/ip4/127.0.0.1/"),
+            "H-2: the default libp2p listener must be loopback, got {DEFAULT_P2P_LISTEN}"
+        );
+        let plan = decide_transport(&argv("--transport libp2p")).unwrap();
+        assert_eq!(plan.p2p_listen, vec![DEFAULT_P2P_LISTEN.to_string()]);
+        let named = decide_transport(&argv("--transport libp2p --p2p-listen /ip4/0.0.0.0/tcp/16400")).unwrap();
+        assert_eq!(named.p2p_listen, vec!["/ip4/0.0.0.0/tcp/16400".to_string()]);
     }
 
     #[test]
@@ -1407,13 +1580,16 @@ mod transport_tests {
         for line in [
             "--transport devnet --listen 16400 --p2p-listen /ip4/0.0.0.0/tcp/16500",
             "--transport devnet --listen 16400 --p2p-peer /ip4/1.2.3.4/tcp/16500",
-            // A p2p flag under the DEFAULT is no longer a mistake: the default
-            // is now Dual, which runs the swarm, so the flag is legitimate.
-            // Explicit --transport devnet is the only way to name a mesh that
-            // refuses libp2p listeners.
+            // Under the DEFAULT too: no --transport is devnet, so a libp2p
+            // flag there is the same mistake, and the refusal must say the
+            // default was taken so the operator knows what to type.
+            "--listen 16400 --p2p-listen /ip4/0.0.0.0/tcp/16500",
         ] {
             let e = decide_transport(&argv(line)).expect_err(line);
             assert!(e.contains("dual"), "the refusal must name the way out: {e}");
+            if !line.contains("--transport") {
+                assert!(e.contains("devnet default"), "{e}");
+            }
         }
     }
 
@@ -1446,9 +1622,6 @@ mod transport_tests {
     /// validator that will not boot.
     #[test]
     fn devnet_warns_but_boots_with_swarm_tuning_flags() {
-        // Explicit --transport devnet: the default is now Dual, which RUNS the
-        // swarm, so these flags would tune it rather than warn. The behaviour
-        // under test is devnet's, so name it.
         let plan = decide_transport(&argv("--transport devnet --listen 16400 --max-peers 32 --behind-proxy")).unwrap();
         assert_eq!(plan.transport, engine::Transport::Devnet);
         assert_eq!(plan.warnings.len(), 2, "{:?}", plan.warnings);
@@ -1481,7 +1654,7 @@ mod transport_tests {
     #[test]
     fn every_posture_announces_itself() {
         for (line, want) in [
-            ("--listen 16400", "DUAL"),
+            ("--listen 16400", "DEVNET"),
             ("--transport devnet --listen 16400", "DEVNET"),
             ("--transport libp2p", "LIBP2P"),
             ("--transport dual --listen 16400", "DUAL"),
