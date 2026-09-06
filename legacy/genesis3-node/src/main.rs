@@ -140,6 +140,22 @@ struct Cli {
     /// Kubernetes, shared VLANs, or any multi-tenant network, leave this off.
     #[arg(long)]                                         rpc_trust_private_ranges: bool,
 
+    // ── R3-audit H-R3-5: browser gate + loopback-auth policy ────────
+    /// Browser origin allowed to call the RPC (repeatable), as exact
+    /// `scheme://host[:port]`. Default: none — no CORS grants are emitted and
+    /// any request carrying an Origin header is refused. `*` allows any
+    /// origin for READ methods only; write methods never honour the wildcard.
+    #[arg(long = "rpc-allow-origin")]                    rpc_allow_origins: Vec<String>,
+    /// Extra hostname accepted in the Host header (repeatable),
+    /// anti-DNS-rebinding. IP literals and `localhost` always pass; list your
+    /// reverse-proxy / tunnel hostname here. `*` disables the check.
+    #[arg(long = "rpc-allow-host")]                      rpc_allow_hosts: Vec<String>,
+    /// Restore the pre-R3 "loopback bypasses auth" behaviour. Off by
+    /// default: 127.0.0.1/::1 keep their rate-limit exemption but must
+    /// present the API key like everyone else (a browser on this machine
+    /// connects from loopback — the blanket bypass let any web page write).
+    #[arg(long)]                                         rpc_trust_loopback: bool,
+
     // ── Sprint D: Prometheus metrics ─────────────────────────────────
     /// Enable Prometheus metrics server. Off by default (opt-in).
     /// Convention follows Geth: endpoint at /debug/metrics/prometheus.
@@ -307,6 +323,15 @@ async fn main() {
         eprintln!("⚠  --rpc-trust-private-ranges: RFC1918 and IPv6 ULA ranges");
         eprintln!("   will bypass auth and rate limits. Only safe on trusted");
         eprintln!("   single-tenant hosts. DO NOT use on Kubernetes or shared VLANs.");
+    }
+    if cli.rpc_trust_loopback {
+        eprintln!("⚠  --rpc-trust-loopback: 127.0.0.1/::1 will bypass API-key auth.");
+        eprintln!("   Any local process — including a web page in a browser on this");
+        eprintln!("   machine — can then call write methods without the key.");
+    }
+    if cli.rpc_allow_origins.iter().any(|o| o == "*") {
+        eprintln!("⚠  --rpc-allow-origin '*': any web page may issue READ calls.");
+        eprintln!("   Write methods still refuse wildcard origins.");
     }
 
     // ── Sprint D: resolve metrics bind, print warnings ───────────────
@@ -2225,6 +2250,9 @@ async fn main() {
                     rate_limit_reads_per_min:  cli.rpc_rate_limit_reads,
                     rate_limit_writes_per_min: cli.rpc_rate_limit_writes,
                     trust_private_ranges:      cli.rpc_trust_private_ranges,
+                    allowed_origins:           cli.rpc_allow_origins.clone(),
+                    allowed_hosts:             cli.rpc_allow_hosts.clone(),
+                    trust_loopback:            cli.rpc_trust_loopback,
                 },
                 node_state.clone(), store.clone(), mempool.clone(), dag.clone(), outbound_tx.clone(),
                 // B5f pool seam: submitblock hook (see rpc::SubmitBlockFn).

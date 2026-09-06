@@ -39,7 +39,16 @@ const RL_GC_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// but it may carry SECRET KEYS for server-side signing and does CPU-heavy PQ
 /// signing/VM work — auth + the tighter write rate limit apply. Listing the
 /// name here is harmless when the feature is off (the method never registers).
-pub const WRITE_METHODS: &[&str] = &["sendrawtransaction", "submitblock", "euvm_buildtx"];
+/// `submitauxblock` injects a merged-mined block into consensus and
+/// `createauxblock` mints/caches full candidate blocks (CPU + memory) — both
+/// are the AuxPoW pool seam (R3-audit H-R3-5): auth + the write bucket apply.
+pub const WRITE_METHODS: &[&str] = &[
+    "sendrawtransaction",
+    "submitblock",
+    "euvm_buildtx",
+    "submitauxblock",
+    "createauxblock",
+];
 
 /// Type alias for a direct (non-keyed) in-memory rate limiter.
 type IpRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
@@ -182,11 +191,78 @@ pub fn is_trusted_local_ip(ip: IpAddr, trust_private_ranges: bool) -> bool {
     }
 }
 
+/// Apply auth + rate-limit checks with explicit control over BOTH trust
+/// bypasses (R3-audit H-R3-5).
+///
+/// `trust_loopback_auth` gates the historical "127.0.0.1 / ::1 bypasses
+/// everything" behaviour. That blanket bypass let ANY local process — and,
+/// critically, any web page running in a browser on the operator's machine
+/// (the browser connects from 127.0.0.1) — call write methods without the
+/// configured API key. It is now an explicit opt-in (`--rpc-trust-loopback`).
+/// With it off, loopback still skips the per-IP rate limiter (localhost
+/// cannot be spoofed remotely and operator tooling / the co-located pool
+/// hammer the port), but must satisfy the same API-key policy as any remote
+/// caller.
+pub fn authorize_with_policy(
+    ip: IpAddr,
+    method: &str,
+    presented_key: Option<&str>,
+    configured_key: Option<&str>,
+    require_auth_for_writes: bool,
+    trust_private_ranges: bool,
+    trust_loopback_auth: bool,
+    rate_limiter: &RateLimiterSet,
+) -> AuthDecision {
+    let fully_trusted = if ip.is_loopback() {
+        trust_loopback_auth
+    } else {
+        is_trusted_local_ip(ip, trust_private_ranges)
+    };
+    if fully_trusted {
+        return AuthDecision::Allow;
+    }
+
+    let is_write = WRITE_METHODS.contains(&method);
+
+    // Loopback keeps its rate-limit exemption (see doc comment) but falls
+    // through to the key checks below. `RateLimiterSet::check` already
+    // returns true for loopback, so calling it would be a no-op; skip it to
+    // keep the exemption in one obvious place.
+    if !ip.is_loopback() && !rate_limiter.check(ip, is_write) {
+        return AuthDecision::RateLimited;
+    }
+
+    if is_write && require_auth_for_writes {
+        match (presented_key, configured_key) {
+            (Some(p), Some(c)) => {
+                if p.as_bytes().ct_eq(c.as_bytes()).unwrap_u8() == 1 {
+                    AuthDecision::Allow
+                } else {
+                    AuthDecision::Unauthorized
+                }
+            }
+            _ => AuthDecision::Unauthorized,
+        }
+    } else if let (Some(p), Some(c)) = (presented_key, configured_key) {
+        if p.as_bytes().ct_eq(c.as_bytes()).unwrap_u8() == 1 {
+            AuthDecision::Allow
+        } else {
+            AuthDecision::Unauthorized
+        }
+    } else {
+        AuthDecision::Allow
+    }
+}
+
 /// Apply auth + rate-limit checks to an incoming request, with explicit
 /// control over whether private IP ranges are trusted.
 ///
 /// This is the Sprint M-patch1 signature. The older `authorize()` wraps
 /// this with `trust_private_ranges = false` for backward compatibility.
+///
+/// NOTE (H-R3-5): keeps the historical blanket loopback bypass
+/// (`trust_loopback_auth = true`). The server path uses
+/// `authorize_with_policy` and only passes true behind `--rpc-trust-loopback`.
 pub fn authorize_with_trust(
     ip: IpAddr,
     method: &str,
@@ -274,6 +350,120 @@ pub fn extract_api_key<'a>(headers: &'a axum::http::HeaderMap) -> Option<&'a str
         }
     }
     None
+}
+
+// ── Browser-request gate: Host + Origin checks (R3-audit H-R3-5) ──────
+//
+// CORS alone does not stop a hostile web page from *sending* requests to the
+// RPC port — it only stops the page from reading responses, and
+// `sendrawtransaction` does its damage on send. Two header checks close the
+// browser as an attack vector:
+//
+//   Host   — defeats DNS rebinding. A page at evil.example that rebinds its
+//            hostname to 127.0.0.1 makes the browser send `Host: evil.example`
+//            with a request that reaches this port. Legitimate clients either
+//            connect by IP literal / localhost (Host is the address they
+//            dialed) or by an operator-allowlisted hostname.
+//   Origin — defeats cross-site request forgery. Browsers ALWAYS attach
+//            `Origin` to cross-origin POSTs; non-browser clients (curl, the
+//            pool, wallets) send none. A request carrying an Origin that the
+//            operator did not allowlist is browser-borne and refused. The
+//            wildcard entry "*" is honoured for READ methods only — write
+//            methods never accept a wildcard (the finding's exact ask).
+
+/// Reason a request was refused by the browser gate. Stable strings so the
+/// handler can log/metric them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserGateRefusal {
+    MissingHost,
+    HostNotAllowed,
+    OriginNotAllowed,
+}
+
+/// Strip the port from an HTTP Host header value. Handles `[v6]:port`,
+/// `[v6]`, `host:port`, `host`.
+fn host_without_port(host: &str) -> &str {
+    let host = host.trim();
+    if let Some(rest) = host.strip_prefix('[') {
+        // Bracketed IPv6: everything up to the closing bracket.
+        match rest.find(']') {
+            Some(i) => &rest[..i],
+            None => host, // malformed; will fail the literal parse below
+        }
+    } else {
+        // At most one ':' means host[:port]; more than one is an unbracketed
+        // IPv6 literal (no port possible in a Host header without brackets).
+        match (host.find(':'), host.rfind(':')) {
+            (Some(f), Some(l)) if f == l => &host[..f],
+            _ => host,
+        }
+    }
+}
+
+/// Host-header policy: IP literals and localhost are always fine (rebinding
+/// requires a DNS *name*), any other hostname must be operator-allowlisted.
+/// `"*"` in the allowlist disables the check (explicit opt-out).
+pub fn host_allowed(host_header: Option<&str>, allowed_hosts: &[String]) -> Result<(), BrowserGateRefusal> {
+    let raw = match host_header {
+        Some(h) if !h.trim().is_empty() => h,
+        _ => return Err(BrowserGateRefusal::MissingHost),
+    };
+    if allowed_hosts.iter().any(|h| h == "*") {
+        return Ok(());
+    }
+    let host = host_without_port(raw);
+    if host.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
+    let host_lc = host.to_ascii_lowercase();
+    if host_lc == "localhost" {
+        return Ok(());
+    }
+    if allowed_hosts.iter().any(|h| h.to_ascii_lowercase() == host_lc) {
+        return Ok(());
+    }
+    Err(BrowserGateRefusal::HostNotAllowed)
+}
+
+/// Origin-header policy. `is_write` selects the stricter rule: the wildcard
+/// allowlist entry `"*"` never applies to write methods.
+pub fn origin_allowed(
+    origin_header: Option<&str>,
+    allowed_origins: &[String],
+    is_write: bool,
+) -> Result<(), BrowserGateRefusal> {
+    let origin = match origin_header {
+        None => return Ok(()), // not a cross-origin browser request
+        Some(o) => o.trim(),
+    };
+    // "null" is what browsers send for sandboxed iframes, file:// pages and
+    // some redirects — never allowlistable.
+    if origin.is_empty() || origin.eq_ignore_ascii_case("null") {
+        return Err(BrowserGateRefusal::OriginNotAllowed);
+    }
+    let origin_lc = origin.to_ascii_lowercase();
+    let listed_exact = allowed_origins
+        .iter()
+        .any(|o| o.trim_end_matches('/').to_ascii_lowercase() == origin_lc);
+    let listed_wildcard = allowed_origins.iter().any(|o| o == "*");
+    if listed_exact || (listed_wildcard && !is_write) {
+        Ok(())
+    } else {
+        Err(BrowserGateRefusal::OriginNotAllowed)
+    }
+}
+
+/// Combined gate, applied BEFORE auth/rate-limit so refused browser traffic
+/// never touches the buckets. Pure so it is unit-testable without a server.
+pub fn gate_browser_request(
+    host_header: Option<&str>,
+    origin_header: Option<&str>,
+    method: &str,
+    allowed_hosts: &[String],
+    allowed_origins: &[String],
+) -> Result<(), BrowserGateRefusal> {
+    host_allowed(host_header, allowed_hosts)?;
+    origin_allowed(origin_header, allowed_origins, WRITE_METHODS.contains(&method))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -560,5 +750,179 @@ mod tests {
             true, false, &r,
         );
         assert_eq!(d, AuthDecision::Unauthorized);
+    }
+
+    // ── R3-audit H-R3-5: WRITE_METHODS must cover the AuxPoW pool seam ──
+
+    #[test]
+    fn aux_pool_seam_methods_are_writes() {
+        // Mutation guard: removing either name from WRITE_METHODS fails here.
+        assert!(WRITE_METHODS.contains(&"submitauxblock"),
+            "submitauxblock injects blocks into consensus; it must be a write method");
+        assert!(WRITE_METHODS.contains(&"createauxblock"),
+            "createauxblock mints/caches candidate blocks; it must be a write method");
+    }
+
+    // ── R3-audit H-R3-5: loopback auth bypass is now an explicit opt-in ──
+
+    #[test]
+    fn loopback_write_without_key_refused_unless_flag() {
+        let r = rl();
+        let loopback: IpAddr = Ipv4Addr::LOCALHOST.into();
+        // Key configured, writes require auth, no key presented, loopback NOT
+        // trusted for auth: must be Unauthorized. This is the browser-CSRF
+        // hole — with the blanket bypass this was Allow.
+        let d = authorize_with_policy(
+            loopback, "sendrawtransaction", None, Some("secret"),
+            true, false, false, &r,
+        );
+        assert_eq!(d, AuthDecision::Unauthorized);
+        // Same for the AuxPoW seam.
+        let d = authorize_with_policy(
+            loopback, "submitauxblock", None, Some("secret"),
+            true, false, false, &r,
+        );
+        assert_eq!(d, AuthDecision::Unauthorized);
+        // With the explicit flag the old operator-tooling behaviour returns.
+        let d = authorize_with_policy(
+            loopback, "sendrawtransaction", None, Some("secret"),
+            true, false, true, &r,
+        );
+        assert_eq!(d, AuthDecision::Allow);
+    }
+
+    #[test]
+    fn loopback_with_correct_key_allowed_without_flag() {
+        let r = rl();
+        let loopback: IpAddr = Ipv4Addr::LOCALHOST.into();
+        let d = authorize_with_policy(
+            loopback, "sendrawtransaction", Some("secret"), Some("secret"),
+            true, false, false, &r,
+        );
+        assert_eq!(d, AuthDecision::Allow);
+    }
+
+    #[test]
+    fn loopback_never_rate_limited_even_without_trust() {
+        // Availability: the co-located pool polls fast; loopback keeps its
+        // rate-limit exemption even when its AUTH bypass is off.
+        let r = RateLimiterSet::new(1, 1);
+        let loopback: IpAddr = Ipv4Addr::LOCALHOST.into();
+        for _ in 0..50 {
+            let d = authorize_with_policy(
+                loopback, "getblockcount", None, None, false, false, false, &r,
+            );
+            assert_eq!(d, AuthDecision::Allow);
+        }
+    }
+
+    #[test]
+    fn loopback_no_key_configured_still_works_without_flag() {
+        // Default deployment (no API key): behaviour unchanged.
+        let r = rl();
+        let loopback: IpAddr = Ipv4Addr::LOCALHOST.into();
+        let d = authorize_with_policy(
+            loopback, "sendrawtransaction", None, None, false, false, false, &r,
+        );
+        assert_eq!(d, AuthDecision::Allow);
+    }
+
+    // ── R3-audit H-R3-5: Host / Origin browser gate ─────────────────
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn host_ip_literals_and_localhost_allowed() {
+        for h in ["127.0.0.1:16210", "127.0.0.1", "45.76.89.225:16210",
+                  "[::1]:16210", "[2001:db8::1]", "localhost:16210", "LOCALHOST"] {
+            assert_eq!(host_allowed(Some(h), &[]), Ok(()), "host {h:?} should pass");
+        }
+    }
+
+    #[test]
+    fn host_dns_name_refused_unless_allowlisted() {
+        // DNS rebinding: evil.example resolves to this node's IP; the browser
+        // sends the attacker's hostname in Host.
+        assert_eq!(host_allowed(Some("evil.example"), &[]),
+                   Err(BrowserGateRefusal::HostNotAllowed));
+        assert_eq!(host_allowed(Some("evil.example:16210"), &[]),
+                   Err(BrowserGateRefusal::HostNotAllowed));
+        // Operator allowlists their tunnel hostname → allowed (any case).
+        let allow = v(&["g2rpc.posternpool.com"]);
+        assert_eq!(host_allowed(Some("G2RPC.posternpool.com:443"), &allow), Ok(()));
+        // Allowlisting one name does not open others.
+        assert_eq!(host_allowed(Some("evil.example"), &allow),
+                   Err(BrowserGateRefusal::HostNotAllowed));
+    }
+
+    #[test]
+    fn host_missing_or_empty_refused() {
+        assert_eq!(host_allowed(None, &[]), Err(BrowserGateRefusal::MissingHost));
+        assert_eq!(host_allowed(Some(""), &[]), Err(BrowserGateRefusal::MissingHost));
+        assert_eq!(host_allowed(Some("   "), &[]), Err(BrowserGateRefusal::MissingHost));
+    }
+
+    #[test]
+    fn origin_absent_is_not_a_browser_request() {
+        // curl / pool / wallet clients send no Origin: always pass.
+        assert_eq!(origin_allowed(None, &[], true), Ok(()));
+        assert_eq!(origin_allowed(None, &[], false), Ok(()));
+    }
+
+    #[test]
+    fn origin_refused_by_default_even_for_reads() {
+        assert_eq!(origin_allowed(Some("https://evil.example"), &[], false),
+                   Err(BrowserGateRefusal::OriginNotAllowed));
+        assert_eq!(origin_allowed(Some("https://evil.example"), &[], true),
+                   Err(BrowserGateRefusal::OriginNotAllowed));
+        assert_eq!(origin_allowed(Some("null"), &v(&["*"]), false),
+                   Err(BrowserGateRefusal::OriginNotAllowed));
+    }
+
+    #[test]
+    fn origin_wildcard_never_applies_to_writes() {
+        let allow = v(&["*"]);
+        // Reads: wildcard OK (public explorers).
+        assert_eq!(origin_allowed(Some("https://explorer.example"), &allow, false), Ok(()));
+        // Writes: wildcard MUST NOT open the door (the finding's exact ask).
+        assert_eq!(origin_allowed(Some("https://explorer.example"), &allow, true),
+                   Err(BrowserGateRefusal::OriginNotAllowed));
+        // An exact allowlisted origin can still write.
+        let allow = v(&["https://wallet.posternlabs.com"]);
+        assert_eq!(origin_allowed(Some("https://wallet.posternlabs.com"), &allow, true), Ok(()));
+    }
+
+    #[test]
+    fn gate_refuses_rebinding_and_csrf_shapes() {
+        // DNS-rebinding shape: attacker hostname in Host, no Origin needed.
+        assert_eq!(
+            gate_browser_request(Some("evil.example"), None, "getblockcount", &[], &[]),
+            Err(BrowserGateRefusal::HostNotAllowed)
+        );
+        // CSRF shape: legitimate Host (browser connected to 127.0.0.1) but a
+        // web-page Origin, on a write method.
+        assert_eq!(
+            gate_browser_request(
+                Some("127.0.0.1:16210"), Some("https://evil.example"),
+                "sendrawtransaction", &[], &v(&["*"]),
+            ),
+            Err(BrowserGateRefusal::OriginNotAllowed)
+        );
+        // The AuxPoW seam gets write-strictness (fails if the two methods are
+        // ever dropped from WRITE_METHODS).
+        assert_eq!(
+            gate_browser_request(
+                Some("127.0.0.1:16210"), Some("https://evil.example"),
+                "submitauxblock", &[], &v(&["*"]),
+            ),
+            Err(BrowserGateRefusal::OriginNotAllowed)
+        );
+        // Non-browser operator curl on loopback: passes untouched.
+        assert_eq!(
+            gate_browser_request(Some("127.0.0.1:16210"), None, "sendrawtransaction", &[], &[]),
+            Ok(())
+        );
     }
 }
