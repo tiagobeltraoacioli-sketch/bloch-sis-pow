@@ -4728,6 +4728,34 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
             }
             exit_v2_structural_rules(*epoch, signature, wall_epoch)
         }
+        // Slashing evidence (tag 0x05) became DECODABLE on 2026-09-05 (F-02),
+        // which is exactly when it started being able to reach this catch-all
+        // — before that the wire decoder refused it and no gossip or RPC
+        // ingress could construct one. Named explicitly for the reason the
+        // `ExitV2` arm states: a variant that reaches `_` is a variant the
+        // mempool admits, and consensus refuses this one at every epoch below
+        // the INERT `SLASHING_EVIDENCE_ACTIVATION_EPOCH`
+        // (`TxReject::EvidenceNotActive`), so admitting it pre-gate would
+        // relay transactions no block can carry — the mempool-stuffing class.
+        //
+        // Post-gate this arm admits: the pair's two hybrid signatures need
+        // the offender's REGISTERED key, resolved through the committed
+        // registry, and this function is deliberately stateless — the
+        // verification lives in consensus (`apply_slashing_evidence`), which
+        // re-judges every included evidence against the block's pre-state and
+        // makes garbage evidence forfeit the whole block. Wall-clock epoch on
+        // the mempool side, committed epoch on the consensus side — the
+        // TransferV2 arm's asymmetry argument, unchanged.
+        PosTransaction::SlashingEvidence(_) => {
+            if wall_epoch < bloch_pos_committee::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH {
+                return Err(
+                    "slashing evidence (tag 0x05) is not active: the transaction ships \
+                     behind a flag day (SLASHING_EVIDENCE_ACTIVATION_EPOCH) that this \
+                     chain has not reached, so no block could carry it",
+                );
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -4910,6 +4938,42 @@ mod forkchoice_tests {
             admissible(&empty, 0).is_err(),
             "a transfer with no inputs must not be admitted"
         );
+    }
+
+    /// Tag 0x05 decodes since 2026-09-05 (F-02), so it can now arrive at the
+    /// mempool door — and below the inert flag day consensus refuses it
+    /// (`TxReject::EvidenceNotActive`), so admission would relay a
+    /// transaction no block can carry. Goes red if the arm falls back into
+    /// the `_ => Ok(())` catch-all, and goes red at any wall epoch below the
+    /// gate if someone arms the constant without revisiting this door.
+    #[test]
+    fn slashing_evidence_is_refused_at_the_door_below_its_flag_day() {
+        let attest = |head: u8| bloch_pos_committee::Attestation {
+            data: bloch_pos_committee::AttestationData {
+                slot: 32,
+                head: [head; 32],
+                source_epoch: 0,
+                source_root: [1; 32],
+                target_epoch: 1,
+                target_root: [head; 32],
+            },
+            validator: 2,
+            signature: vec![0u8; 8],
+        };
+        let ev = PosTransaction::SlashingEvidence(
+            bloch_pos_committee::interfaces::SlashingEvidence::AttestationOffence {
+                first: attest(0xAA),
+                second: attest(0xBB),
+            },
+        );
+        for wall_epoch in [0u64, 2_700, u64::MAX - 1] {
+            let err = admissible(&ev, wall_epoch)
+                .expect_err("evidence must not be admitted below its flag day");
+            assert!(
+                err.contains("SLASHING_EVIDENCE_ACTIVATION_EPOCH"),
+                "the refusal must name the gate: {err}"
+            );
+        }
     }
 
     /// **The reason this fork choice was changed.** A branch three blocks long

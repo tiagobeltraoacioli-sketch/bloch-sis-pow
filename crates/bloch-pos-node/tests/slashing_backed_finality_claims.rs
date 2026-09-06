@@ -10,26 +10,33 @@
 //! with **"Credit here."** The public block explorer said reversing a
 //! finalised block *"would require burning a third of the bonded stake"*.
 //!
-//! No stake on Genesis-4 can be slashed. Four independent breaks, any one of
-//! them sufficient:
+//! No stake on Genesis-4 can be slashed. Four independent breaks when first
+//! written; on 2026-09-05 (Round-2 finding F-02) break 1 was closed and break
+//! 4 changed shape, and the verdict — no stake can be slashed on the live
+//! chain — did not move:
 //!
-//! 1. `PosTransaction::from_canonical_bytes` returns
+//! 1. ~~Evidence cannot be decoded~~ **closed 2026-09-05**:
+//!    `PosTransaction::from_canonical_bytes` used to return
 //!    `TxDecodeError::EvidenceNotDecodable` for wire tag `0x05`
-//!    **unconditionally, with no gate**. The encoder folds the two nested
-//!    messages in as the *signing roots* they were signed over — hashes — so
-//!    the envelopes are unrecoverable by construction, not by omission.
+//!    unconditionally, because the encoder folded the two nested messages in
+//!    as the *signing roots* they were signed over — hashes, unrecoverable by
+//!    construction. The codec now carries both envelopes whole and decodes
+//!    them, and [`reachability`] measures exactly that.
 //! 2. That decoder is the only one on every ingress path: block body
 //!    (`engine::body_transactions`), gossip (`p2p.rs`, `net.rs`) and
-//!    `sendrawtransaction` (`rpc.rs`). A block carrying evidence is rejected
-//!    by every peer; a proposer that included it would produce an unimportable
-//!    block.
+//!    `sendrawtransaction` (`rpc.rs`). Every path therefore reaches the same
+//!    transition gate (break 4), and the released fleet binaries — which
+//!    predate the format — still refuse the tag at decode.
 //! 3. Nothing constructs the transaction outside tests. The node captures an
 //!    equivocating pair and prints that the pipeline is not wired.
-//! 4. `SLASHING_EVIDENCE_ACTIVATION_EPOCH` is not defined **on the release
-//!    lineage**. It IS defined off-lineage at `d21c3370:params.rs:638` as
-//!    `u64::MAX`, unarmed, on a direct child of fleet commit `46133196` that is
-//!    pushed to a public remote. So there is no flag day in the shipped binary,
-//!    which is what break 4 means; there is no claim here about every ref.
+//! 4. `SLASHING_EVIDENCE_ACTIVATION_EPOCH` **is now defined on this lineage,
+//!    inert at `u64::MAX`** — the same change that made the tag decodable
+//!    introduced it, and gates the evidence transaction on it in the state
+//!    transition (`TxReject::EvidenceNotActive` below the flag day). An
+//!    earlier revision of this break said the constant existed only
+//!    off-lineage (`d21c3370:params.rs:638`); that was true when written.
+//!    Unarmed, no flag day is scheduled, and THIS break alone now carries the
+//!    verdict: evidence can travel in format and still no block may carry it.
 //!
 //! # Why a test, and why this shape
 //!
@@ -292,15 +299,30 @@ enum Reachability {
 }
 
 fn reachability() -> Reachability {
-    // A minimally well-formed attestation-offence body, so a refusal cannot be
-    // mistaken for `Truncated`: tag, sub-tag, then two (validator, root,
-    // signature) triples with empty signatures.
-    let mut bytes = vec![0x05u8, 0x02];
-    for _ in 0..2 {
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // validator
-        bytes.extend_from_slice(&[0u8; 32]); // signing root
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // signature length
-    }
+    // A well-formed attestation-offence pair, encoded by the codec's own
+    // encoder so this probe measures the DECODER and not a hand-kept byte
+    // layout. (The first revision of this probe hand-rolled the retired
+    // signing-root layout, which would have answered `Changed(Truncated)`
+    // forever once the envelope format landed.)
+    let attest = |head: u8| bloch_pos_committee::Attestation {
+        data: bloch_pos_committee::AttestationData {
+            slot: 32,
+            head: [head; 32],
+            source_epoch: 0,
+            source_root: [1; 32],
+            target_epoch: 1,
+            target_root: [head; 32],
+        },
+        validator: 2,
+        signature: vec![0u8; 8],
+    };
+    let bytes = PosTransaction::SlashingEvidence(
+        bloch_pos_committee::interfaces::SlashingEvidence::AttestationOffence {
+            first: attest(0xAA),
+            second: attest(0xBB),
+        },
+    )
+    .canonical_bytes();
     match PosTransaction::from_canonical_bytes(&bytes) {
         Err(TxDecodeError::EvidenceNotDecodable) => Reachability::RefusedByConstruction,
         Ok(PosTransaction::SlashingEvidence(_)) => Reachability::EvidenceDecodes,
@@ -308,22 +330,35 @@ fn reachability() -> Reachability {
     }
 }
 
-/// Break 1, measured: the decoder refuses tag `0x05` unconditionally.
+/// Whether the penalty can actually land on the live chain: evidence must
+/// BOTH decode and be consensus-valid in some reachable epoch. The flag day
+/// (`SLASHING_EVIDENCE_ACTIVATION_EPOCH`) is inert at `u64::MAX`, so today
+/// this is false, and every retraction in this file is judged against THIS —
+/// not against decodability alone, which since 2026-09-05 is necessary but
+/// not sufficient.
+fn penalty_appliable() -> bool {
+    reachability() == Reachability::EvidenceDecodes
+        && bloch_pos_committee::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH != u64::MAX
+}
+
+/// Break 1, measured — and since 2026-09-05 (F-02) measured the other way
+/// round: tag `0x05` DECODES, and the flag day is what stands between the
+/// wire and the penalty.
 ///
 /// This is the fact every other assertion in this file is judged against, so
 /// it is established by *calling* the codec. It is deliberately separate from
 /// the text tests: if the codec changes, this is the test that says so first.
 #[test]
-fn evidence_cannot_reach_a_verifier_from_the_network() {
+fn evidence_decodes_and_only_the_inert_flag_day_stands_in_the_way() {
     match reachability() {
-        Reachability::RefusedByConstruction => {}
-        Reachability::EvidenceDecodes => panic!(
-            "tag 0x05 now DECODES. Slashing evidence can travel on the wire.\n\n\
-             That is good news and this test is the wrong place to celebrate it: \
-             every retraction listed in RETRACTION_SITES now understates the \
-             guarantee, and the sibling tests in this file will say the same. \
-             Update the text and this file together — that pairing is the whole \
-             point of the file."
+        Reachability::EvidenceDecodes => {}
+        Reachability::RefusedByConstruction => panic!(
+            "tag 0x05 stopped decoding — F-02 has REGRESSED. §7.3 slashing is \
+             structurally unreachable again (equivocation with no economic \
+             cost), every document corrected on 2026-09-05 overstates the \
+             mechanism, and the retractions of 2026-09-01 are the accurate \
+             text once more. Restore the envelope codec, or update text and \
+             this file together — that pairing is the whole point of the file."
         ),
         Reachability::Changed(what) => panic!(
             "the tag-0x05 codec changed in a way this test does not understand: \
@@ -331,15 +366,39 @@ fn evidence_cannot_reach_a_verifier_from_the_network() {
              adjusting this test, not after."
         ),
     }
+    assert!(
+        !penalty_appliable(),
+        "SLASHING_EVIDENCE_ACTIVATION_EPOCH is no longer u64::MAX: the flag \
+         day is ARMED. If the founder scheduled it, every retraction in \
+         RETRACTION_SITES is now an understatement and the sibling tests will \
+         say so — update the text first, then this file. If the founder did \
+         not schedule it, revert the constant NOW: arming activates §7.3 \
+         network-wide and forks every node that cannot decode tag 0x05."
+    );
 }
 
-/// Break 4, measured: there is no activation constant to arm.
+/// Break 4, measured — in its post-2026-09-05 shape: the activation constant
+/// EXISTS on this lineage (the "different and much better world" the first
+/// revision of this test described: a flag day exists, it is simply not
+/// scheduled), it is declared in exactly one place, and it is not armed.
 ///
-/// A gated-but-present constant would be a different (and much better) world:
-/// a flag day exists, it is simply not scheduled. There is not one here, and
-/// the difference is exactly what an integrator would want to know.
+/// The declaration scan is UNCONDITIONAL, for the reason the first revision
+/// learned the hard way: a guard that disables itself when its subject
+/// changes is worse than no guard, because a passing run reads as evidence.
 #[test]
-fn there_is_no_slashing_activation_constant_to_arm() {
+fn the_activation_constant_exists_in_one_place_and_is_not_armed() {
+    // The value, read from the crate rather than from text: arming is a
+    // founder decision with a fleet-rollout precondition, and this file is
+    // one of the tripwires in front of it (transition.rs has another,
+    // `slashing_evidence_gate_is_inert`).
+    assert_eq!(
+        bloch_pos_committee::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH,
+        u64::MAX,
+        "the slashing flag day is ARMED. If the founder scheduled it, the \
+         retraction sites understate the guarantee and must move first; if \
+         not, revert now — arming forks every node that cannot decode 0x05.",
+    );
+
     let files = prose_files();
     assert!(
         files.len() >= MIN_FILES_SCANNED,
@@ -347,9 +406,9 @@ fn there_is_no_slashing_activation_constant_to_arm() {
          reading nothing",
         files.len(),
     );
-    // A *declaration*, not a mention: the retractions in this repo name the
-    // constant in order to say it is absent, and a bare substring search would
-    // fire on the very text it is guarding.
+    // A *declaration*, not a mention: the corrected retractions name the
+    // constant in order to say it is unarmed, and a bare substring search
+    // would fire on the very text it is guarding.
     let hits: Vec<&String> = files
         .iter()
         .filter(|(path, text)| {
@@ -359,24 +418,17 @@ fn there_is_no_slashing_activation_constant_to_arm() {
         })
         .map(|(path, _)| path)
         .collect();
-    // UNCONDITIONAL, and it did not used to be. This assertion was wrapped in
-    // `if reachability() == Reachability::RefusedByConstruction { .. }`, which
-    // meant it stopped checking at exactly the moment it mattered: the codec
-    // becoming able to decode evidence is the same event that would bring the
-    // constant in, so the guard went silent on the transition it exists to
-    // catch, while still reporting green. A guard that disables itself when its
-    // subject changes is worse than no guard, because a passing run reads as
-    // evidence. The reachability verdict is still reported — in the failure
-    // message, where it explains the hit rather than suppressing it.
-    assert!(
-        hits.is_empty(),
-        "`SLASHING_EVIDENCE_ACTIVATION_EPOCH` is declared in the CHECKED-OUT TREE, \
-         in:\n  {}\n\nCodec reachability right now: {:?}.\n\n\
-         The retraction sites say there is no activation constant to arm ON THE \
-         RELEASE LINEAGE. If one is now in this tree, that sentence has to move \
-         before this test does. Update `rpc.rs` break 4, the CertiK dossier and \
-         BLOCH-GENESIS4-EXCHANGE-INTEGRATION.md first.",
-        hits.iter().map(|p| p.as_str()).collect::<Vec<_>>().join("\n  "),
+    assert_eq!(
+        hits,
+        vec!["crates/bloch-pos-committee/src/params.rs"],
+        "`SLASHING_EVIDENCE_ACTIVATION_EPOCH` must be declared in params.rs and \
+         ONLY there — a second declaration is the two-spellings hazard the \
+         wire-namespace registry records (`_ACTIVATION_SPELLINGS`), and zero \
+         declarations means the flag day vanished while the decoder stayed, \
+         which would make evidence consensus-valid nowhere or everywhere \
+         depending on who still compiles the gate. Codec reachability right \
+         now: {:?}. Text sites to keep in step: rpc.rs break 4, the CertiK \
+         dossier, BLOCH-GENESIS4-EXCHANGE-INTEGRATION.md.",
         reachability(),
     );
 }
@@ -401,9 +453,13 @@ fn there_is_no_slashing_activation_constant_to_arm() {
 /// the only thing standing between "captured" and "silently dropped".
 #[test]
 fn the_node_still_admits_it_does_not_prosecute() {
-    if reachability() != Reachability::RefusedByConstruction {
-        return; // covered, and interpreted, by the reachability test above
+    if penalty_appliable() {
+        return; // prosecution is live; the sibling tests handle that world
     }
+    // Not gated on decodability: since 2026-09-05 evidence decodes and the
+    // penalty STILL cannot land (inert flag day), and in that world too the
+    // captured-equivocation log line is the only thing standing between
+    // "captured" and "silently dropped".
     let engine = repo_root().join("crates/bloch-pos-node/src/engine.rs");
     let text = normalise(&std::fs::read_to_string(&engine).expect("engine.rs is readable"));
     assert!(
@@ -450,13 +506,19 @@ fn no_text_promises_a_slashing_backed_finality() {
         }
     }
 
-    match reachability() {
-        Reachability::RefusedByConstruction => assert!(
+    if let Reachability::Changed(what) = reachability() {
+        panic!("codec changed in an uninterpretable way ({what}); see the reachability test");
+    }
+    if !penalty_appliable() {
+        assert!(
             violations.is_empty(),
-            "Text promises a slashing penalty that CANNOT BE APPLIED. Tag 0x05 is \
-             still refused by `PosTransaction::from_canonical_bytes`, so no evidence \
-             can reach a verifier through any ingress path, nothing constructs the \
-             transaction outside tests, and no activation constant exists.\n\n{}\n\n\
+            "Text promises a slashing penalty that CANNOT BE APPLIED. Since \
+             2026-09-05 tag 0x05 decodes, but the evidence transaction is \
+             consensus-refused at every epoch below \
+             SLASHING_EVIDENCE_ACTIVATION_EPOCH, which is inert at u64::MAX — \
+             and nothing constructs the transaction outside tests. (Before \
+             2026-09-05 the decoder itself refused the tag; either way the \
+             penalty cannot land.)\n\n{}\n\n\
              This is the claim retracted on 2026-09-01 across rpc.rs, the \
              exchange integration book, the CertiK dossier, the whitepaper and \
              the block explorer. If it is genuinely true again, the retractions \
@@ -465,19 +527,18 @@ fn no_text_promises_a_slashing_backed_finality() {
              the *designed* mechanism, mark it: a RETRACTION_MARKERS phrase within \
              {RETRACTION_WINDOW} characters is what tells a reader which way it cuts.",
             violations.join("\n\n"),
-        ),
-        Reachability::EvidenceDecodes => panic!(
-            "Tag 0x05 decodes: evidence can travel. Every retraction this repo \
-             published is now an understatement, and the guidance built on it \
-             (credit at finalized + 3 epochs, no depth provably safe) was written \
-             for a chain where the penalty did not exist.\n\n\
+        )
+    } else {
+        panic!(
+            "The slashing flag day is ARMED and evidence decodes: the penalty \
+             can land. Every retraction this repo published is now an \
+             understatement, and the guidance built on it (credit at \
+             finalized + 3 epochs, no depth provably safe) was written for a \
+             chain where the penalty did not exist.\n\n\
              Revisit RETRACTION_SITES, then this test. {} promise phrase(s) are \
              currently un-marked, which may be correct now.",
             violations.len(),
-        ),
-        Reachability::Changed(what) => {
-            panic!("codec changed in an uninterpretable way ({what}); see the reachability test")
-        }
+        )
     }
 }
 
@@ -488,7 +549,12 @@ fn no_text_promises_a_slashing_backed_finality() {
 #[test]
 fn the_retraction_is_published_wherever_the_promise_was() {
     let root = repo_root();
-    let reach = reachability();
+    // Keyed on the penalty being appliable — NOT on decodability. Since
+    // 2026-09-05 evidence decodes while the flag day stays inert, and in that
+    // world the retractions are still the accurate text: no stake can be
+    // slashed on the live chain. They become stale only when the penalty can
+    // actually land.
+    let appliable = penalty_appliable();
     let mut missing: Vec<String> = Vec::new();
     let mut lingering: Vec<String> = Vec::new();
 
@@ -498,29 +564,27 @@ fn the_retraction_is_published_wherever_the_promise_was() {
             .unwrap_or_else(|e| panic!("{rel} is a guarded retraction site and must exist: {e}"));
         let text = normalise(&raw);
         let present = text.contains(&normalise(marker));
-        match reach {
-            Reachability::RefusedByConstruction if !present => {
-                missing.push(format!("  {rel}\n    lost: {marker:?}"));
-            }
-            Reachability::EvidenceDecodes if present => {
-                lingering.push(format!("  {rel}\n    stale: {marker:?}"));
-            }
-            _ => {}
+        if !appliable && !present {
+            missing.push(format!("  {rel}\n    lost: {marker:?}"));
+        }
+        if appliable && present {
+            lingering.push(format!("  {rel}\n    stale: {marker:?}"));
         }
     }
 
     assert!(
         missing.is_empty(),
         "A published retraction disappeared while the penalty is still \
-         unappliable (tag 0x05 refused):\n\n{}\n\nAn integrator reads these. \
-         Removing the withdrawal restores the promise by silence, which is how \
-         the claim survived in four places at once the first time.",
+         unappliable (the flag day is inert):\n\n{}\n\nAn integrator reads \
+         these. Removing the withdrawal restores the promise by silence, which \
+         is how the claim survived in four places at once the first time.",
         missing.join("\n\n"),
     );
     assert!(
         lingering.is_empty(),
-        "Tag 0x05 decodes now, but these retractions still tell readers no stake \
-         can be slashed:\n\n{}\n\nThat is the reverse regression this file exists \
+        "The penalty can land now (evidence decodes AND the flag day is \
+         armed), but these retractions still tell readers no stake can be \
+         slashed:\n\n{}\n\nThat is the reverse regression this file exists \
          to catch — enforcement arriving and the documents staying behind.",
         lingering.join("\n\n"),
     );
