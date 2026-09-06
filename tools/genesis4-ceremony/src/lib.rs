@@ -1277,14 +1277,15 @@ mod tests {
 
     #[test]
     fn schedules_are_the_spec_schedules_in_slots() {
-        // §1/§7 tables. Founder: 10-year cliff, 40-year linear (the V2 premine
-        // schedule, restored 2026-08-11 — NOT the 24/120-month draft). The
-        // Foundation buckets convert at 87,660 slots/month.
+        // §1/§7 tables. Founder: 2-year cliff, 8-year linear — fully vested
+        // at year 10 (founder decision 2026-08-21, superseding the restored
+        // 10/40 V2 premine schedule). The Foundation buckets convert at
+        // 87,660 slots/month.
         assert_eq!(v4::MONTH_SLOTS, 87_660);
         let f = founder_schedule();
         assert_eq!(
             (f.cliff_slots, f.linear_slots),
-            (10 * v4::SLOTS_PER_YEAR, 40 * v4::SLOTS_PER_YEAR)
+            (2 * v4::SLOTS_PER_YEAR, 8 * v4::SLOTS_PER_YEAR)
         );
         let vc = vc_schedule();
         assert_eq!((vc.cliff_slots, vc.linear_slots), (12 * v4::MONTH_SLOTS, 24 * v4::MONTH_SLOTS));
