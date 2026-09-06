@@ -48,6 +48,7 @@ mod codec;
 mod engine;
 mod genesis;
 mod keys;
+mod metrics;
 mod net;
 mod p2p;
 mod rpc;
@@ -251,6 +252,7 @@ fn print_help() {
                total — before a single balance is admitted. A devnet\n\
                manifest commits to none and the flag is then refused.\n\
                          [--rpc-bind <ip>] [--rpc-port <n>|off]\n\
+                         [--metrics-bind <ip>] [--metrics-port <n>]\n\
                Run a validator node. <dir> must hold validator.key; chain\n\
                data persists in <dir> and is replayed on restart.\n\
                \n\
@@ -258,6 +260,14 @@ fn print_help() {
                default 127.0.0.1:16310 (`--rpc-port off` disables it). It\n\
                answers for THIS node's own validated state — run your own\n\
                node and query it rather than trusting someone else's.\n\
+               \n\
+               Observability (`--metrics-port <n>`, off by default): serves\n\
+               GET /health (200 ok|syncing, 503 starting|stalled — probe\n\
+               this from systemd/monitoring) and GET /metrics (Prometheus\n\
+               text: restarts, disk space, finality stalls, peers,\n\
+               behind-by-slots, is-syncing, validator-active) on\n\
+               --metrics-bind (default 127.0.0.1). Read-only, GET-only,\n\
+               unauthenticated — firewall it like the RPC.\n\
                  Methods: getbuildinfo, getchaininfo, getblockcount,\n\
                  getblockbyslot, getblockbyid, getvalidator,\n\
                  getvalidatorcount, getbalance, gettxout, getutxos (alias\n\
@@ -1162,6 +1172,23 @@ fn run_cmd(args: &[String]) {
         },
     };
 
+    // Metrics/health (audit C-R6-2). OPT-IN: no flag, no listener, so an
+    // unflagged fleet binary behaves byte-for-byte as before. Same refusal
+    // rule as --rpc-port: a malformed port stops the boot rather than
+    // silently running unobserved — which is the exact failure mode this
+    // endpoint exists to end.
+    let metrics_port = match arg_value(args, "--metrics-port") {
+        None => None,
+        Some(s) if s == "off" || s == "0" => None,
+        Some(s) => match s.parse::<u16>() {
+            Ok(p) => Some(p),
+            Err(_) => {
+                eprintln!("run: --metrics-port must be a port number 1-65535, or `off` (got `{s}`)");
+                exit(2);
+            }
+        },
+    };
+
     let cfg = engine::Config {
         data_dir: PathBuf::from(data_dir),
         genesis_path: PathBuf::from(genesis_path),
@@ -1187,6 +1214,11 @@ fn run_cmd(args: &[String]) {
         // exposed port is a write surface, not only a read one.
         rpc_bind: arg_value(args, "--rpc-bind").unwrap_or_else(|| "127.0.0.1".to_string()),
         rpc_port,
+        // Loopback unless asked otherwise, like the RPC: /metrics is
+        // read-only but still maps the node's peers, lag and validator
+        // status for anyone who can reach it.
+        metrics_bind: arg_value(args, "--metrics-bind").unwrap_or_else(|| "127.0.0.1".to_string()),
+        metrics_port,
     };
     if let Err(e) = engine::run(cfg) {
         eprintln!("bloch-pos: {e}");

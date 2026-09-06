@@ -165,6 +165,12 @@ pub struct Config {
     /// the server entirely.
     pub rpc_bind: String,
     pub rpc_port: Option<u16>,
+    /// Address the metrics/health server binds (audit C-R6-2). Same loopback
+    /// default and same reasoning as `rpc_bind`; read-only either way.
+    pub metrics_bind: String,
+    /// Port for `GET /health` + `GET /metrics`. `None` (the default — the
+    /// flag is opt-in) starts no listener at all.
+    pub metrics_port: Option<u16>,
 }
 
 fn now_ms() -> u64 {
@@ -2710,8 +2716,15 @@ impl Engine {
                 // observer it is the ONLY thing that ever empties the pool.
                 self.sweep_mempool(cur_e);
 
+                crate::metrics::NodeMetrics::inc(&crate::metrics::NODE.blocks_applied_total);
                 if self.live {
                     if let Err(e) = self.store.append(env) {
+                        // Counted before the exit: a scrape racing the
+                        // shutdown, or the operator curl-ing /metrics from
+                        // the crash loop, sees WHY (ENOSPC = disk full).
+                        crate::metrics::NodeMetrics::inc(
+                            &crate::metrics::NODE.store_append_failures_total,
+                        );
                         eprintln!("FATAL: block log append failed: {e}");
                         std::process::exit(1);
                     }
@@ -2748,6 +2761,10 @@ impl Engine {
                         );
                     }
                     if after.finalized.epoch > before.finalized.epoch {
+                        crate::metrics::NodeMetrics::set(
+                            &crate::metrics::NODE.last_finality_advance_unix,
+                            crate::metrics::now_unix(),
+                        );
                         println!(
                             "*** FINALIZED epoch {} ({})",
                             after.finalized.epoch,
@@ -2760,6 +2777,7 @@ impl Engine {
                 true
             }
             Err(err) => {
+                crate::metrics::NodeMetrics::inc(&crate::metrics::NODE.blocks_rejected_total);
                 if self.live {
                     eprintln!(
                         "reject {} at slot {}: {err:?}",
@@ -3687,6 +3705,31 @@ fn start_libp2p(
 }
 
 pub fn run(cfg: Config) -> io::Result<()> {
+    // Metrics FIRST, before the manifest is even read (audit C-R6-2): the
+    // replay window is the one stretch where the node is alive, mute, and
+    // indistinguishable from wedged (2026-08-21), so the health endpoint must
+    // exist before replay starts. Until the slot loop stamps its first
+    // heartbeat, `/health` answers `503 {"status":"starting"}` — visible
+    // progress where there used to be silence.
+    {
+        use crate::metrics::{NodeMetrics, NODE};
+        NodeMetrics::inc(&NODE.process_starts_total);
+        NodeMetrics::set(&NODE.process_start_unix, crate::metrics::now_unix());
+        NodeMetrics::set(&NODE.data_dir_fs_free_bytes, crate::metrics::fs_free_bytes(&cfg.data_dir));
+        if let Some(port) = cfg.metrics_port {
+            match crate::metrics::serve(&cfg.metrics_bind, port, &NODE) {
+                Ok(addr) => println!("metrics: /health and /metrics on http://{addr}"),
+                Err(e) => {
+                    // Same rule as the RPC bind below: an operator who asked
+                    // for observability must not silently run without it.
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!("cannot bind the metrics server to {}:{port}: {e}", cfg.metrics_bind),
+                    ));
+                }
+            }
+        }
+    }
     let (mut manifest, digest) = Manifest::load(&cfg.genesis_path)?;
 
     // The opening ledger, before anything else touches the manifest. A
@@ -4019,6 +4062,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
             keys.randao_seed,
         ) {
             RegistryIdentity::Active => {
+                crate::metrics::NodeMetrics::set(&crate::metrics::NODE.validator_active, 1);
                 println!(
                     "validator {} is registered and its key matches the committed \
                      registry at head slot {}",
@@ -4027,6 +4071,12 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 );
             }
             RegistryIdentity::PendingActivation => {
+                // The "validator was down and nothing said so" incident, as a
+                // counter: a keystore is present but this node will sign
+                // nothing. `validator_active` stays 0.
+                crate::metrics::NodeMetrics::inc(
+                    &crate::metrics::NODE.validator_not_started_total,
+                );
                 println!(
                     "validator {} is NOT in the committed registry at head slot {} — \
                      pending activation. This node follows the chain and signs nothing \
@@ -4190,6 +4240,20 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let mut last_built: u64 = engine.state.slot();
     let mut last_sync_req: u64 = 0;
 
+    // Metrics baseline (C-R6-2). The finality clock starts NOW: replay stamps
+    // nothing (it re-finalizes the past), and a `last_finality_advance_unix`
+    // of 0 would read as an eternal stall on every fresh boot. The stall
+    // window is wall time for 4 epochs — long enough that one missed
+    // justification round is not an incident, short enough that the
+    // 2026-08-25 class of stall fires well before an operator's patience.
+    crate::metrics::NodeMetrics::set(
+        &crate::metrics::NODE.last_finality_advance_unix,
+        crate::metrics::now_unix(),
+    );
+    let finality_stall_secs: u64 = (4 * SLOTS_PER_EPOCH * slot_ms / 1000).max(60);
+    let mut finality_stalled = false;
+    let mut metrics_sampled_slot: u64 = 0;
+
     loop {
         let now = now_ms();
         if now < genesis_ms {
@@ -4259,6 +4323,51 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 .broadcast(net::get_blocks_frame(engine.state.slot()));
             engine.needs_sync = false;
             last_sync_req = now;
+        }
+
+        // ── Metrics turn (C-R6-2): pure exports of state already computed ──
+        // Every turn is bounded (`recv_timeout` ≤ 500 ms below), so the
+        // heartbeat is the liveness proof `/health` runs on. Nothing here is
+        // read back by consensus.
+        {
+            use crate::metrics::{NodeMetrics, NODE};
+            let head = engine.state.slot();
+            NodeMetrics::set(&NODE.heartbeat_unix, crate::metrics::now_unix());
+            NodeMetrics::set(&NODE.head_slot, head);
+            NodeMetrics::set(&NODE.wall_slot, slot);
+            NodeMetrics::set(&NODE.behind_by_slots, slot.saturating_sub(head));
+            let fin = engine.state.finality();
+            NodeMetrics::set(&NODE.finalized_epoch, fin.finalized.epoch);
+            NodeMetrics::set(&NODE.justified_epoch, fin.justified.epoch);
+            NodeMetrics::set(&NODE.mempool_size, engine.mempool.len() as u64);
+            NodeMetrics::set(&NODE.is_syncing, u64::from(behind || engine.needs_sync));
+            let (devnet_peers, p2p_peers) = engine.net.peer_counts();
+            NodeMetrics::set(
+                &NODE.peer_count,
+                (devnet_peers.unwrap_or(0) + p2p_peers.unwrap_or(0)) as u64,
+            );
+            // Once per slot, not per turn: `peer_counts` is cheap but
+            // `statvfs` is a syscall against the data volume.
+            if slot != metrics_sampled_slot {
+                metrics_sampled_slot = slot;
+                NodeMetrics::set(
+                    &NODE.data_dir_fs_free_bytes,
+                    crate::metrics::fs_free_bytes(&cfg.data_dir),
+                );
+            }
+            // Finality stall: count the EDGE into the stalled condition, so a
+            // three-hour stall is one incident, not ten thousand scrapes.
+            let advance_age = crate::metrics::now_unix()
+                .saturating_sub(NODE.last_finality_advance_unix.load(std::sync::atomic::Ordering::Relaxed));
+            let stalled_now = advance_age > finality_stall_secs;
+            if stalled_now && !finality_stalled {
+                NodeMetrics::inc(&NODE.finality_stalls_total);
+                eprintln!(
+                    "WARNING: finalized epoch has not advanced for {advance_age}s \
+                     (threshold {finality_stall_secs}s) — finality stall"
+                );
+            }
+            finality_stalled = stalled_now;
         }
 
         let next_deadline = if slot > last_built && now < propose_at {
