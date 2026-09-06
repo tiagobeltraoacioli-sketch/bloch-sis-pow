@@ -50,7 +50,9 @@ pub const SAT_PER_BLOCH:                u64 = 100_000_000;
 pub const NOMINAL_TOTAL_SUPPLY_SAT:    u64 = 21_000_000_000 * SAT_PER_BLOCH;
 pub const MINING_EMISSION_NOMINAL_SAT: u64 = 17_430_000_000 * SAT_PER_BLOCH;
 pub const FOUNDER_PREMINE_TOTAL_SAT:   u64 =  3_570_000_000 * SAT_PER_BLOCH;
-pub const VALIDATOR_ORACLE_POOL_SAT:   u64 =             0 * SAT_PER_BLOCH;
+// Zero BLOCH by decision (written as a literal: `0 * SAT_PER_BLOCH` is clippy's
+// deny-level `erasing_op`, and the CI clippy gate stops on it).
+pub const VALIDATOR_ORACLE_POOL_SAT:   u64 =             0;
 
 const _: () = assert!(
     FOUNDER_PREMINE_TOTAL_SAT + VALIDATOR_ORACLE_POOL_SAT + MINING_EMISSION_NOMINAL_SAT

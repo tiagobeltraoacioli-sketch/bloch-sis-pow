@@ -117,20 +117,24 @@ impl Address {
         matches!(self.network, Network::Testnet)
     }
 
-    /// User-facing string form with checksum.
-    pub fn to_string(&self) -> String {
+}
+
+/// User-facing string form with checksum: `prefix ‖ hex(hash ‖ SHA3d(hash)[..4])`.
+///
+/// This is the ONE definition of the address string. It used to live in an
+/// inherent `to_string(&self)` that `Display` called, which shadowed the
+/// blanket `ToString` impl (clippy `inherent_to_string_shadow_display`, a
+/// deny-level lint that the CI clippy gate stops on). `addr.to_string()`
+/// still works everywhere and produces byte-identical output, now through
+/// `Display`.
+impl std::fmt::Display for Address {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let inner = Sha3_256::digest(&self.hash);
         let outer = Sha3_256::digest(&inner);
         let checksum = &outer[..4];
         let mut payload = self.hash.to_vec();
         payload.extend_from_slice(checksum);
-        format!("{}{}", self.network.prefix(), hex::encode(&payload))
-    }
-}
-
-impl std::fmt::Display for Address {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_string())
+        write!(f, "{}{}", self.network.prefix(), hex::encode(&payload))
     }
 }
 
