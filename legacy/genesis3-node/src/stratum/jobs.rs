@@ -433,7 +433,17 @@ mod tests {
         fn dsha(b: &[u8]) -> [u8; 32] {
             Sha256::digest(Sha256::digest(b)).into()
         }
-        let bits = 0x20ff_ffffu32; // easy parent target — no mining in the test
+        // Legacy C-1: `0x20ff_ffff` has the compact-format sign flag (bit 23
+        // of the mantissa) SET. `core::bits_to_target` used to fold that flag
+        // into the mantissa's magnitude, decoding it to a target covering
+        // nearly the whole hash space (any parent header validated
+        // unconditionally). Now that the sign flag is correctly rejected
+        // (mapping to the impossible, all-zero target — the fix this file's
+        // tests must keep passing under), the largest LEGAL sibling
+        // `0x207f_ffff` (mantissa 0x7fffff, the largest without the flag)
+        // only covers about half of all hashes, so the parent header's nonce
+        // is ground below instead of assumed free.
+        let bits = 0x207f_ffffu32; // largest legal (non-sign-flagged) parent target
         let template = Template::build(
             vec![[0u8; 32]], // one parent
             5_600,           // height
@@ -463,9 +473,24 @@ mod tests {
         coinbase.extend_from_slice(&crate::core::auxpow::merge_mining_commitment(aux_hash));
         coinbase.extend_from_slice(b"btc-cb-suffix");
         let coinbase_txid = dsha(&coinbase); // single-tx parent → root == txid
+        // Grind the parent header's nonce until its SHA-256d PoW meets
+        // `bits`'s target (little-endian convention) — see the comment on
+        // `bits` above for why this is no longer free.
+        let parent_target = crate::core::bits_to_target(bits);
         let mut parent_header = [0u8; 80];
-        parent_header[36..68].copy_from_slice(&coinbase_txid);
-        parent_header[72..76].copy_from_slice(&bits.to_le_bytes());
+        let mut found = false;
+        for nonce in 0u32..10_000 {
+            parent_header[36..68].copy_from_slice(&coinbase_txid);
+            parent_header[72..76].copy_from_slice(&bits.to_le_bytes());
+            parent_header[76..80].copy_from_slice(&nonce.to_le_bytes());
+            let mut le_pow = dsha(&parent_header);
+            le_pow.reverse();
+            if crate::core::hash_meets_target(&le_pow, &parent_target) {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "could not grind a parent header meeting the target within 10_000 nonces");
         let aux = crate::core::auxpow::AuxPow {
             parent_header: parent_header.to_vec(),
             coinbase_tx: coinbase,

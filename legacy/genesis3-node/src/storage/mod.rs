@@ -318,10 +318,33 @@ impl Storage {
         let mut out: Vec<(Vec<u8>, u32, u64, Vec<u8>)> = Vec::new();
         for item in self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
             let (key, val) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
-            // key = txid ‖ vout (4B BE); anything else is not ours — skip rather
-            // than guess, so a malformed row can never silently enter a commitment.
+            // Anything shorter than txid(32) ‖ vout(4) is not ours — skip
+            // rather than guess, so a malformed row can never silently enter
+            // a commitment.
             if key.len() < 36 { continue; }
             let txid = key[..key.len() - 4].to_vec();
+            // DOC-DRIFT FIX (Legacy M-3): this used to say "key = txid ‖ vout
+            // (4B BE)" — describing what a reader SHOULD do, not what
+            // `utxo_key` (below) actually writes: `index.to_le_bytes()`,
+            // LITTLE-endian. This decode has always been (and, for
+            // reproducibility, MUST stay) big-endian anyway —
+            // `derive_carryover_root` (below) rebuilds the published
+            // carry-over snapshot's exact commitment via this function, and
+            // `bloch-snapshot-utxo`'s default (non-`--canonical-vout`) mode
+            // uses the identical big-endian misread — so any vout whose LE
+            // and BE byte-swaps differ (any vout != 0 that isn't a byte
+            // palindrome) is reported as the WRONG number here (38 live
+            // outpoints with real vout 1 read back as 16_777_216). This does
+            // NOT affect consensus correctness: `get_utxo`/`delete_utxo`
+            // both build and look up the SAME key via `utxo_key`, so the
+            // encoding round-trips correctly there — only code that parses
+            // the raw key bytes back into a vout NUMBER (this function, and
+            // `bloch-snapshot-utxo`) sees the mismatch. See
+            // `legacy/README.md` and `bloch-snapshot-utxo.rs`'s
+            // `--canonical-vout` flag for a correctly-decoding path for NEW
+            // exports (which the shared carry-over-verification path here
+            // deliberately does NOT take, so it keeps matching the tool's
+            // default).
             let vout = u32::from_be_bytes([key[key.len()-4], key[key.len()-3],
                                            key[key.len()-2], key[key.len()-1]]);
             // Same codec every other UTXO read in this file uses — never a
@@ -1249,6 +1272,16 @@ fn parse_carryover_line(line: &[u8]) -> Option<(Vec<u8>, u32, TxOutput)> {
     Some((txid, vout, TxOutput { value, script_pubkey }))
 }
 
+/// `txid ‖ vout`, vout encoded LITTLE-endian. Every consensus read/write of a
+/// UTXO goes through this SAME function on both sides (`get_utxo`,
+/// `put_utxo`, `delete_utxo`), so the encoding round-trips correctly for
+/// consensus purposes. Code that instead parses the RAW key bytes back into
+/// a vout number for display/export (`iter_utxos_sorted`,
+/// `bloch-snapshot-utxo`) has historically decoded that suffix BIG-endian —
+/// a doc-drift bug documented at `iter_utxos_sorted` (Legacy M-3) — do not
+/// "fix" this function's endianness without reading that comment first: the
+/// published carry-over snapshot's SHAKE-256 root depends on the mismatch
+/// staying exactly as it is today.
 fn utxo_key(txid: &[u8], index: u32) -> Vec<u8> {
     let mut k = txid.to_vec(); k.extend_from_slice(&index.to_le_bytes()); k
 }

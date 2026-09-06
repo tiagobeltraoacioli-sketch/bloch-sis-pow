@@ -80,6 +80,10 @@ pub enum AuxPowError {
     InsufficientPow,
     /// `parent_header` is not exactly 80 bytes.
     BadParentHeaderLen,
+    /// `chain_branch` is too deep to compute a merkle slot from without
+    /// overflowing a `u32` left-shift (Legacy H-1). Fail closed rather than
+    /// panic.
+    BranchTooDeep,
 }
 
 /// SHA-256d (Bitcoin's double SHA-256), raw internal byte order.
@@ -109,12 +113,27 @@ fn merkle_fold(leaf: [u8; 32], branch: &[[u8; 32]], mut index: u32) -> [u8; 32] 
 /// The anti-collision expected slot for an aux chain (Namecoin `getExpectedIndex`):
 /// a deterministic PRNG of `(nonce, chain_id, merkle_height)` prevents an
 /// attacker from placing one commitment at a chosen slot for many chains.
+///
+/// SECURITY (Legacy H-1): `merkle_height` is caller-controlled
+/// (`chain_branch.len()`, wire-decoded). `1u32 << merkle_height` panics
+/// ("attempt to shift left with overflow") once `merkle_height >= 32` under
+/// `overflow-checks=true` — the workspace's build setting — rather than
+/// merely wrapping, so a crafted AuxPoW trailer with a deep `chain_branch`
+/// crashed every verifying node. `verify` below re-checks the bound before
+/// calling this (the authoritative fail-closed gate, since `AuxPow` can be
+/// constructed directly and not only via the bounded `from_bytes` decoder);
+/// `checked_shl` here is defense in depth so this function can never panic
+/// even if that invariant is ever bypassed elsewhere.
 fn expected_index(nonce: u32, chain_id: u32, merkle_height: u32) -> u32 {
     let mut rand = nonce as u64;
     rand = rand.wrapping_mul(1_103_515_245).wrapping_add(12_345);
     rand = rand.wrapping_add(chain_id as u64);
     rand = rand.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-    ((rand >> 16) as u32) & ((1u32 << merkle_height) - 1)
+    // `checked_shl` is `None` only for `merkle_height >= 32`; treat that as
+    // "cannot compute a slot" and mask nothing out (mask = 0) rather than
+    // panic — the caller's bound check makes this branch unreachable today.
+    let mask = 1u32.checked_shl(merkle_height).map(|v| v.wrapping_sub(1)).unwrap_or(0);
+    ((rand >> 16) as u32) & mask
 }
 
 /// Find the single occurrence of `needle` in `hay`; error if absent or repeated.
@@ -170,7 +189,23 @@ impl AuxPow {
         if committed_root != aux_root {
             return Err(AuxPowError::AuxRootMismatch);
         }
+        // SECURITY (Legacy H-1): `height` feeds two `1u32 << height` shifts
+        // (immediately below, and inside `expected_index` via the call a few
+        // lines down). A `chain_branch` of length >= 32 shifts by an amount
+        // >= the type's bit width, which panics ("attempt to shift left with
+        // overflow") under `overflow-checks=true` rather than merely
+        // wrapping — a crash reachable by ANY caller that constructs an
+        // `AuxPow` directly (this `verify` is the single authoritative gate;
+        // `from_bytes`'s own `MAX_BRANCH` cap is a decode-time bound that
+        // does not protect callers who build the struct in memory). Reject
+        // BEFORE either shift executes, fail closed. 32 is a generous ceiling
+        // in its own right — Namecoin's practical merge-mining depth never
+        // approaches it, and `from_bytes` caps `chain_branch` at the tighter
+        // `MAX_BRANCH` (30) below.
         let height = self.chain_branch.len() as u32;
+        if height >= 32 {
+            return Err(AuxPowError::BranchTooDeep);
+        }
         if merkle_size != (1u32 << height) {
             return Err(AuxPowError::BadMerkleSize);
         }
@@ -218,7 +253,17 @@ impl AuxPow {
     /// number of bytes consumed. Sane caps guard against a malformed trailer.
     pub fn from_bytes(b: &[u8]) -> Result<(Self, usize), String> {
         const MAX_TX: usize = 1 << 20; // 1 MiB coinbase cap
-        const MAX_BRANCH: usize = 64; // merkle depth cap
+        // Legacy H-1: was 64. `chain_branch.len()` (bounded by this constant)
+        // feeds a `1u32 << height` shift in `verify` and in `expected_index`,
+        // which panics for a shift amount >= 32 under `overflow-checks=true`.
+        // `verify` itself now rejects any `chain_branch` of length >= 32
+        // regardless of this decode-time cap (defense in depth — `AuxPow` can
+        // be built directly, bypassing `from_bytes`), but the *decoder's* own
+        // bound should not sit at the edge of that panic either. 30 is
+        // Namecoin's practical merge-mining depth ceiling (2^30 aux-chain
+        // slots is already far beyond any realistic merge-mining deployment)
+        // and leaves headroom below the hard 32-bit shift limit.
+        const MAX_BRANCH: usize = 30; // merkle depth cap
         let mut p = 0usize;
         fn take<'a>(b: &'a [u8], p: &mut usize, n: usize) -> Result<&'a [u8], String> {
             if *p + n > b.len() {
@@ -334,17 +379,45 @@ mod tests {
         tx
     }
 
-    /// A parent header with a chosen merkle_root and an easy target so its PoW
-    /// validates without mining. `bits` 0x2100ffff is a near-maximal target.
+    /// The largest compact-format target these tests can legally claim
+    /// (Legacy C-1): exponent 32 (the top of `bits_to_target`'s valid
+    /// range) with mantissa 0x7f_ffff — the largest mantissa that does NOT
+    /// set bit 23, the compact-format sign flag. This tops out at roughly
+    /// half the full 256-bit space; that ceiling is inherent to the format
+    /// once sign-flagged encodings are correctly rejected (Bitcoin's own
+    /// `nBits` has the identical ceiling for the identical reason), not a
+    /// test shortcut.
+    const TEST_EASY_BITS: u32 = 0x207f_ffff;
+
+    /// A parent header with a chosen merkle_root, GROUND (nonce incremented)
+    /// until its SHA-256d PoW meets [`TEST_EASY_BITS`] under the
+    /// little-endian convention `AuxPow::verify` checks against.
+    ///
+    /// Legacy C-1: this file used to embed a FIXED (un-ground) nonce against
+    /// `bits = TEST_EASY_BITS`, which has the compact-format sign flag SET —
+    /// `bits_to_target` folded that flag into the mantissa's magnitude,
+    /// decoding it to a target covering essentially the entire hash space
+    /// (any header passed unconditionally, no grinding needed). Now that the
+    /// sign flag is correctly rejected (mapping to the impossible, all-zero
+    /// target instead), the largest LEGAL target covers only about half of
+    /// all hashes, so a fixed nonce is no longer guaranteed to pass — hence
+    /// the small grind here, exactly like a real (trivial-difficulty) miner.
     fn parent_header_with_merkle(merkle_root: [u8; 32]) -> Vec<u8> {
-        let mut h = [0u8; 80];
-        h[0..4].copy_from_slice(&2i32.to_le_bytes()); // version
-        // prev_hash [4..36] left zero
-        h[36..68].copy_from_slice(&merkle_root);
-        h[68..72].copy_from_slice(&1_700_000_000u32.to_le_bytes()); // time
-        h[72..76].copy_from_slice(&0x20ff_ffffu32.to_le_bytes()); // bits (easy)
-        // nonce [76..80] left zero
-        h.to_vec()
+        for nonce in 0u32..10_000 {
+            let mut h = [0u8; 80];
+            h[0..4].copy_from_slice(&2i32.to_le_bytes()); // version
+            // prev_hash [4..36] left zero
+            h[36..68].copy_from_slice(&merkle_root);
+            h[68..72].copy_from_slice(&1_700_000_000u32.to_le_bytes()); // time
+            h[72..76].copy_from_slice(&TEST_EASY_BITS.to_le_bytes());
+            h[76..80].copy_from_slice(&nonce.to_le_bytes());
+            let mut le_pow = sha256d(&h);
+            le_pow.reverse();
+            if hash_meets_target(&le_pow, &bits_to_target(TEST_EASY_BITS)) {
+                return h.to_vec();
+            }
+        }
+        panic!("could not grind a parent header meeting TEST_EASY_BITS within 10_000 nonces");
     }
 
     #[test]
@@ -370,7 +443,7 @@ mod tests {
             chain_branch: vec![],
             chain_index: 0,
         };
-        assert_eq!(aux.verify(aux_hash, 0x20ff_ffff), Ok(()));
+        assert_eq!(aux.verify(aux_hash, TEST_EASY_BITS), Ok(()));
     }
 
     #[test]
@@ -388,9 +461,9 @@ mod tests {
             chain_index: 0,
         };
         // A DIFFERENT Bloch block hash must not verify against this commitment.
-        assert_eq!(aux.verify([0xCDu8; 32], 0x20ff_ffff), Err(AuxPowError::AuxRootMismatch));
+        assert_eq!(aux.verify([0xCDu8; 32], TEST_EASY_BITS), Err(AuxPowError::AuxRootMismatch));
         // The correct one does.
-        assert_eq!(aux.verify(aux_hash, 0x20ff_ffff), Ok(()));
+        assert_eq!(aux.verify(aux_hash, TEST_EASY_BITS), Ok(()));
     }
 
     #[test]
@@ -405,7 +478,7 @@ mod tests {
             chain_branch: vec![],
             chain_index: 0,
         };
-        assert_eq!(no_marker.verify(aux_hash, 0x20ff_ffff), Err(AuxPowError::MissingMarker));
+        assert_eq!(no_marker.verify(aux_hash, TEST_EASY_BITS), Err(AuxPowError::MissingMarker));
 
         // Two markers.
         let mut dup = coinbase_with_commitment(aux_hash, 0);
@@ -418,7 +491,7 @@ mod tests {
             chain_branch: vec![],
             chain_index: 0,
         };
-        assert_eq!(aux.verify(aux_hash, 0x20ff_ffff), Err(AuxPowError::DuplicateMarker));
+        assert_eq!(aux.verify(aux_hash, TEST_EASY_BITS), Err(AuxPowError::DuplicateMarker));
     }
 
     #[test]
@@ -496,9 +569,9 @@ mod tests {
         };
 
         // NODE accepts it — the pool↔node merged-mining contract holds.
-        assert_eq!(aux.verify(bloch_hash, 0x20ff_ffff), Ok(()));
+        assert_eq!(aux.verify(bloch_hash, TEST_EASY_BITS), Ok(()));
         // ...but only for THIS Bloch block (the commitment binds it).
-        assert_eq!(aux.verify([0x00u8; 32], 0x20ff_ffff), Err(AuxPowError::AuxRootMismatch));
+        assert_eq!(aux.verify([0x00u8; 32], TEST_EASY_BITS), Err(AuxPowError::AuxRootMismatch));
     }
 
     #[test]
@@ -515,7 +588,7 @@ mod tests {
             chain_branch: vec![],
             chain_index: 0,
         };
-        assert_eq!(aux.verify(aux_hash, 0x20ff_ffff), Err(AuxPowError::CoinbaseNotFirst));
+        assert_eq!(aux.verify(aux_hash, TEST_EASY_BITS), Err(AuxPowError::CoinbaseNotFirst));
 
         // valid structure but an IMPOSSIBLE target (all-zero) → insufficient PoW.
         let ok = AuxPow {
@@ -528,5 +601,94 @@ mod tests {
         };
         // bits 0x03000001 → target ~0x000001000...0 (astronomically hard).
         assert_eq!(ok.verify(aux_hash, 0x0300_0001), Err(AuxPowError::InsufficientPow));
+    }
+
+    /// Legacy H-1 regression: a `chain_branch` at/above 32 entries must be
+    /// rejected CLEANLY (`BranchTooDeep`), never PANIC via `1u32 << height`.
+    /// Reverting the `height >= 32` guard in `verify` (or the `checked_shl`
+    /// in `expected_index`) makes this test panic instead of returning an
+    /// `Err`, which `#[test]` reports as a failure either way — but the
+    /// panic is the actual DoS this finding is about, so this is the
+    /// red-before/green-after regression for it.
+    #[test]
+    fn deep_chain_branch_rejects_without_panicking() {
+        let aux_hash = [0x03u8; 32];
+        for &depth in &[32usize, 64] {
+            let chain_branch = vec![[0u8; 32]; depth];
+            // The committed root must fold correctly for THIS chain_branch —
+            // otherwise AuxRootMismatch fires before the depth guard is ever
+            // reached, and the test would not exercise `verify`'s height
+            // check at all.
+            let committed_root = merkle_fold(aux_hash, &chain_branch, 0);
+            let coinbase = coinbase_with_commitment(committed_root, 0);
+            let coinbase_txid = sha256d(&coinbase);
+            let aux = AuxPow {
+                parent_header: parent_header_with_merkle(coinbase_txid),
+                coinbase_tx: coinbase,
+                coinbase_branch: vec![],
+                coinbase_index: 0,
+                // A chain_branch this deep used to reach `1u32 << depth` and
+                // panic before returning any Err at all.
+                chain_branch,
+                chain_index: 0,
+            };
+            assert_eq!(
+                aux.verify(aux_hash, TEST_EASY_BITS),
+                Err(AuxPowError::BranchTooDeep),
+                "depth={depth} must clean-reject, not panic",
+            );
+        }
+    }
+
+    /// A `chain_branch` just BELOW the panic boundary (31 entries, one under
+    /// the `height >= 32` gate) must still take the ordinary validation path
+    /// — reaching (and cleanly failing) the merkle-size check, not the
+    /// depth guard — proving the guard's boundary is exactly at 32 and does
+    /// not over-reject legal-shaped (if cryptographically wrong) proofs.
+    #[test]
+    fn branch_one_below_the_panic_boundary_clean_rejects_on_merkle_size() {
+        let aux_hash = [0x04u8; 32];
+        let chain_branch = vec![[0u8; 32]; 31];
+        // Correct committed root for THIS chain_branch, so the test reaches
+        // the merkle-size check (not an earlier AuxRootMismatch).
+        let committed_root = merkle_fold(aux_hash, &chain_branch, 0);
+        let coinbase = coinbase_with_commitment(committed_root, 0);
+        let coinbase_txid = sha256d(&coinbase);
+        let aux = AuxPow {
+            parent_header: parent_header_with_merkle(coinbase_txid),
+            coinbase_tx: coinbase,
+            coinbase_branch: vec![],
+            coinbase_index: 0,
+            chain_branch,
+            chain_index: 0,
+        };
+        // merkle_size in the commitment is 1 (single-chain, see
+        // coinbase_with_commitment), but a 31-deep branch expects 2^31 —
+        // mismatch, rejected via the ordinary (non-panicking) size check.
+        assert_eq!(aux.verify(aux_hash, TEST_EASY_BITS), Err(AuxPowError::BadMerkleSize));
+    }
+
+    /// `from_bytes`'s own depth cap (Legacy H-1: lowered from 64 to 30) must
+    /// reject a `chain_branch` at 31 entries at decode time, before `verify`
+    /// is ever called.
+    #[test]
+    fn from_bytes_rejects_chain_branch_above_max_branch() {
+        let aux = AuxPow {
+            parent_header: vec![0u8; 80],
+            coinbase_tx: b"\xfa\xbe\x6d\x6d coinbase".to_vec(),
+            coinbase_branch: vec![],
+            coinbase_index: 0,
+            chain_branch: vec![[0u8; 32]; 31],
+            chain_index: 0,
+        };
+        let bytes = aux.to_bytes();
+        assert!(
+            AuxPow::from_bytes(&bytes).is_err(),
+            "a 31-deep chain_branch must be rejected by from_bytes's MAX_BRANCH cap"
+        );
+        // One below the cap decodes fine.
+        let aux30 = AuxPow { chain_branch: vec![[0u8; 32]; 30], ..aux };
+        let bytes30 = aux30.to_bytes();
+        assert!(AuxPow::from_bytes(&bytes30).is_ok());
     }
 }

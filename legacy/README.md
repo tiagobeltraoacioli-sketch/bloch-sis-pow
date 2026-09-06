@@ -116,7 +116,7 @@ here say 80,000; the constant on the trunk says 50,000; the chain stopped at
 | `MERGED-MINING.md`, `MERGED-MINING-ACTIVATION.md` | AuxPoW / merged mining with Bitcoin: the protocol and the flag-day runbook, including the honest note that merged mining only secures Bloch with the fraction of BTC hashrate that opts in. |
 | `MIGRATION-TOKENOMICS-V1-TO-V2.md` | The completed 2026-05 code migration off V1 tokenomics. Its embedded shell transcripts and before/after listings are preserved verbatim as a record of what was run; the `docs/specs/…` paths inside those fenced blocks are the paths *as they were then*, deliberately not rewritten. |
 | `MAINNET-DEV-CHECKLIST.md`, `STRESS-TEST-PLAN.md`, `INTERNAL-AUDIT-PLAN.md` | The 2026-05 pre-mainnet gate trilogy. Scoped to subsystems that are gone (Stratum V1/V2, DKG, BLS FFG). |
-| `BLOCH-UPGRADE-REACHABILITY.md` | Durable reachability index for GhostDAG coloring. Never activated (`CORRECTED_COLORING_ACTIVATION_HEIGHT = u64::MAX`); the flag-day it needed can no longer be taken. |
+| `BLOCH-UPGRADE-REACHABILITY.md` | Durable reachability index for GhostDAG coloring. **Correction (this entry previously said it never activated — that was wrong):** it activated at local height 21,430 (`CORRECTED_COLORING_ACTIVATION_HEIGHT = 21_430` in `consensus/mod.rs`, not `u64::MAX`) and stayed active until the chain stopped at 39,918 — roughly 46% of the chain's total height (18,488 of 39,918 blocks) ran under the corrected (`Fast`) coloring rule, not the legacy one. |
 | `CALL-FOR-REVIEW.md` | The reviewers-and-testers call. Its ask was PoW cryptanalysis. |
 | `BLOCH_DEVELOPMENT_PLAN.md` | The founding fork-divergence plan. Its decision D2 — "remove Casper-FFG finality and the validator committee; Bloch is pure PoW" — is exactly what Genesis-4 reverses. |
 | `FEATURES.md` | Genesis-2 feature summary. Superseded twice: by Genesis-3, then by the PoS relaunch. |
@@ -140,6 +140,49 @@ Stated rather than hidden, because an auditor will find them anyway.
   `docs/`) say 80,000. See above: 50,000 is the decision. This was not
   bulk-corrected, because in some places 80,000 is quoted as the historical
   value that was later lowered, and a blind replace would falsify that.
+- **Terminal-height facts, stated together because they disagree.** Three
+  numbers describe "where Genesis-3 ends" and none of them are the same
+  thing: the RULE is `GENESIS3_TERMINAL_HEIGHT = 50_000` (the height above
+  which a block is consensus-invalid, `crates/bloch-crypto/src/core/mod.rs`);
+  the chain actually STOPPED at height **39,918** (mining ceased well before
+  the rule would have refused anything — the rule was never the binding
+  constraint); and the ledger the carry-over snapshot was taken from is **one
+  subsidy short of what the emission schedule would predict** for a chain
+  that mined every block up to 39,918 continuously. That gap has not been
+  reconciled — it is an OPEN QUESTION, not a known-benign rounding artifact:
+  candidate explanations include a single missed/orphaned block near the
+  stop, a genesis-anchoring off-by-one in the emission-height carry-over
+  arithmetic, or a stale/short-by-one snapshot height, and no one of these
+  has been confirmed against the other independently. Anyone reconciling a
+  Genesis-3 balance or auditing the carry-over should treat "the schedule
+  says X, the snapshot says X minus one subsidy" as expected until this is
+  resolved, not as evidence the snapshot is wrong.
+- **Legacy H-2 (`--strict-maturity`).** `genesis3-node`'s coinbase-maturity
+  check historically used `dag.block_count()` — a per-node bookkeeping
+  count (orphans and retained fork-losers included) with no consensus
+  meaning — as the "current height" fed into the 100-block maturity rule,
+  so two honest nodes with different orphan/sync history could disagree
+  about whether a referenced coinbase was mature. The binary now supports
+  `--strict-maturity`, which uses the block's own consensus-checked
+  `height` instead. It defaults to OFF (the historical `block_count()`
+  behaviour) for parity with the 39,918 already-accepted historical blocks;
+  turning it on is safe for a fresh chain or once a coordinated flag-day has
+  confirmed no historical block's acceptance actually depended on the two
+  quantities diverging.
+- **Legacy M-3 (UTXO-key vout endianness).** `storage::utxo_key` encodes a
+  UTXO's vout LITTLE-endian; every place that instead parses the raw key
+  bytes back into a vout NUMBER for display or export
+  (`Storage::iter_utxos_sorted`, `bloch-snapshot-utxo`) has always decoded
+  that suffix BIG-endian. Consensus reads/writes are unaffected (`get_utxo`/
+  `put_utxo`/`delete_utxo` all build and look up the identical key via
+  `utxo_key`, round-tripping correctly), but the published carry-over
+  snapshot's TSV file and SHAKE-256 root report 38 live outpoints whose real
+  vout is 1 as vout = 16,777,216 (`1u32.to_le_bytes()` misread big-endian).
+  The published artifact is NOT being changed — reproducing it depends on
+  reproducing this exact misread, so `bloch-snapshot-utxo`'s default
+  behaviour is unchanged. A new `--canonical-vout` flag on that tool decodes
+  vout correctly (`from_le_bytes`) for anyone taking a fresh export who wants
+  the real numbers; its root will differ from the historical one, by design.
 - **Code comments still point at the old paths.** Doc comments in `src/`,
   `crates/`, `deploy/` and `apps/` cite paths such as
   `docs/research/POW-CANONICAL-frontier.md`, `docs/specs/POW-HARDNESS.md`,

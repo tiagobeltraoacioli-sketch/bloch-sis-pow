@@ -104,6 +104,20 @@ struct Cli {
     /// node chain-id is set once. This is the explicit node selector the
     /// ChainId::Genesis3Mainnet doc mandates ("never by for_network").
     #[arg(long)]                                         genesis3: bool,
+    /// Legacy H-2: use the block's own consensus-checked `height` (rather
+    /// than this node's LOCAL `dag.block_count()`, a per-node bookkeeping
+    /// value that can differ between honest nodes depending on orphan/
+    /// fork-loser retention and sync history) as `current_height` for the
+    /// coinbase-maturity check. OFF by default — PARITY with every block
+    /// mined and accepted on the historical Genesis-3 chain, which was
+    /// validated under the `block_count()` rule; some historical blocks may
+    /// have been accepted only because `block_count()` and `height`
+    /// happened to diverge on the accepting node, so flipping this
+    /// unconditionally could reject a block that was, historically, valid.
+    /// Pass this flag to opt into the corrected (consensus-height) rule on a
+    /// fresh chain or once a coordinated flag-day has confirmed no
+    /// historical divergence. See `legacy/README.md`.
+    #[arg(long)]                                         strict_maturity: bool,
     #[arg(long, default_value = "./bloch-data")]          data_dir: String,
     /// RPC bind address. SECURITY: defaults to 127.0.0.1 (local only).
     /// Use --rpc-public to bind 0.0.0.0, which exposes RPC to the internet.
@@ -200,14 +214,37 @@ struct Cli {
     /// Enable the stratum V1 mining server. Miners can connect at
     /// stratum+tcp://<host>:<stratum_port>. See docs/operations/stratum.md.
     #[arg(long)]                                         stratum: bool,
-    /// Bind address for the stratum server.
-    #[arg(long, default_value = "0.0.0.0:3333")]         stratum_addr: String,
+    /// Bind address for the stratum server. Legacy M-12: SECURITY — defaults
+    /// to 127.0.0.1 (local only; the same convention as --rpc-bind). The
+    /// stratum protocol has no transport encryption and, absent
+    /// --stratum-password, `mining.authorize` accepts ANY password for a
+    /// syntactically valid address — do not bind this to a public interface
+    /// without also setting --stratum-password, and prefer a reverse proxy /
+    /// firewall allowlist even then. Use --stratum-public to bind 0.0.0.0.
+    #[arg(long, default_value = "127.0.0.1:3333")]       stratum_addr: String,
+    /// Override stratum_addr's host to 0.0.0.0. DANGEROUS without
+    /// --stratum-password: the wire protocol is plaintext and unauthenticated
+    /// share submission from the public internet can waste CPU/bandwidth
+    /// and, in `pool` mode, misattribute payouts.
+    #[arg(long)]                                         stratum_public: bool,
     /// Stratum operating mode: 'solo' only for now. 'pool' is Sprint AA.2.
     #[arg(long, default_value = "solo")]                 stratum_mode: String,
     /// Max concurrent stratum sessions.
     #[arg(long, default_value = "256")]                  stratum_max_sessions: usize,
     /// Coinbase tag written into mined block coinbases for attribution.
     #[arg(long, default_value = "bloch-sis/v0.1")] stratum_coinbase_tag: String,
+    /// Legacy M-12: shared password `mining.authorize` requires in its
+    /// `[username, password]` params (constant-time compared). Takes
+    /// precedence over --stratum-password-file. Passing via CLI leaks the
+    /// password into `ps aux`; prefer --stratum-password-file in production.
+    /// UNSET (default) preserves the historical behaviour: any password (or
+    /// none) is accepted for a syntactically valid `username` address — this
+    /// is a real exposure on a public bind and is why --stratum-public warns
+    /// loudly when this is unset.
+    #[arg(long)]                                         stratum_password: Option<String>,
+    /// File containing the stratum password (first line, trimmed). Safer
+    /// than --stratum-password. Suggested permissions: 0600.
+    #[arg(long)]                                         stratum_password_file: Option<std::path::PathBuf>,
 
     // ── Sprint 10-alpha: stratum V2 mining server ─────────────────────
     /// Enable the stratum V2 mining server. Miners connect at
@@ -232,15 +269,70 @@ struct Cli {
 // the founder only) — NOT the old public dev seed.
 const FOUNDER_ADDRESS_HEX: &str = "bloch1qe986db5149cff7499b282a048272a09aff0af4ff84242073";
 
-/// FIX #8: Extract the 20-byte pubkey hash from a bloch1q/bloch1t address string.
-/// Address format: prefix (6 chars) + 40 hex chars (20-byte hash) + 8 hex chars (4-byte checksum)
-fn address_to_script_pubkey(addr: &str) -> Vec<u8> {
-    let stripped = addr
-        .trim_start_matches(core::MAINNET_PREFIX)
-        .trim_start_matches(core::TESTNET_PREFIX);
-    // First 40 hex chars = 20-byte pubkey hash
-    let hash_hex = &stripped[..40.min(stripped.len())];
-    hex::decode(hash_hex).unwrap_or_else(|_| addr.as_bytes().to_vec())
+/// FIX #8 / SECURITY (Legacy L-3): parse a bloch1q/bloch1t address string
+/// into its 20-byte pubkey-hash script_pubkey.
+///
+/// This used to byte-slice the input directly
+/// (`&stripped[..40.min(stripped.len())]`) — a panic hazard on any string
+/// whose byte 40 is not a UTF-8 char boundary, i.e. indexing untrusted input
+/// — and, on ANY parse failure (bad hex, wrong length, bad checksum),
+/// silently fell back to `addr.as_bytes().to_vec()`: the RAW STRING BYTES of
+/// the address, used as-is as a script_pubkey. That is neither a valid
+/// P2PKH hash nor an error signal — it is an unspendable script that would
+/// silently swallow every coinbase reward a miner earns under a mistyped
+/// `--miner-address`, with no warning ever surfaced. Routes through the real
+/// address parser (`Address::parse`: prefix, hex, length, AND checksum, none
+/// of which does any raw indexing) and fails closed — every caller below
+/// exits loudly instead of constructing a block that pays a burned address.
+fn address_to_script_pubkey(addr: &str) -> Result<Vec<u8>, address::AddressError> {
+    Ok(address::Address::parse(addr)?.hash().to_vec())
+}
+
+#[cfg(test)]
+mod address_to_script_pubkey_tests {
+    use super::*;
+
+    /// The compiled-in founder constant must actually be a valid address —
+    /// exercised directly so a future edit to the constant that breaks its
+    /// checksum is caught by `cargo test`, not only at node startup.
+    #[test]
+    fn founder_address_hex_parses() {
+        let spk = address_to_script_pubkey(FOUNDER_ADDRESS_HEX)
+            .expect("FOUNDER_ADDRESS_HEX must be a valid, checksum-correct address");
+        assert_eq!(spk.len(), 20);
+    }
+
+    /// Legacy L-3 regression: a malformed address (bad checksum) must be
+    /// REJECTED, not silently converted into some other byte string used as
+    /// a script_pubkey. Reverting the fix (restoring the raw byte-slice +
+    /// `unwrap_or_else(|_| addr.as_bytes().to_vec())` fallback) makes this
+    /// test fail — it would return `Ok(_)` with the raw ASCII bytes of the
+    /// (invalid) address instead of an `Err`.
+    #[test]
+    fn malformed_address_is_rejected_not_silently_converted() {
+        // Same address as FOUNDER_ADDRESS_HEX with the last hex digit of the
+        // checksum flipped — still the right length and valid hex, but the
+        // checksum no longer matches.
+        let mut bad = FOUNDER_ADDRESS_HEX.to_string();
+        let last = bad.pop().unwrap();
+        let flipped = if last == '0' { '1' } else { '0' };
+        bad.push(flipped);
+        assert!(address_to_script_pubkey(&bad).is_err(),
+            "a bad-checksum address must be rejected, never silently accepted");
+    }
+
+    /// A garbage string (not even address-shaped) must also be rejected,
+    /// never panic (the old code indexed the input directly) and never
+    /// silently accepted as a script_pubkey.
+    #[test]
+    fn garbage_input_is_rejected_not_panicking() {
+        assert!(address_to_script_pubkey("not-an-address").is_err());
+        assert!(address_to_script_pubkey("").is_err());
+        // Shorter than the old code's hardcoded byte-40 slice point — this
+        // used to panic ("byte index 40 is out of bounds"); it must now
+        // return a clean Err instead.
+        assert!(address_to_script_pubkey("bloch1q").is_err());
+    }
 }
 
 // Floor the worker count at 4. The default is the core count, and the
@@ -258,6 +350,18 @@ async fn main() {
     ).init();
 
     let cli = Cli::parse();
+
+    // Legacy H-2: latch the coinbase-maturity height rule ONCE at startup.
+    // Default (false) preserves the historical `dag.block_count()` behaviour
+    // for parity with the closed Genesis-3 chain; `--strict-maturity` opts
+    // into the corrected, consensus-height (`block.height`) rule. Loud
+    // either way, so an operator always sees which rule is running.
+    STRICT_MATURITY.store(cli.strict_maturity, std::sync::atomic::Ordering::Relaxed);
+    if cli.strict_maturity {
+        info!("H-2: --strict-maturity is ON — coinbase maturity uses the block's consensus-checked height, not this node's local block_count().");
+    } else {
+        warn!("H-2: --strict-maturity is OFF (default) — coinbase maturity uses this node's LOCAL dag.block_count(), which two honest nodes can compute differently. This is the historical Genesis-3 behaviour, kept for parity; see legacy/README.md.");
+    }
 
     // Roadmap #8: wire the node-level chain-id ONCE at startup from the runtime
     // network selection, before any validation runs. The miner and every
@@ -288,6 +392,31 @@ async fn main() {
 
     // FIX v0.5.1 BLK-3: apply --rpc-public escape hatch.
     let rpc_bind = if cli.rpc_public { "0.0.0.0".to_string() } else { cli.rpc_bind.clone() };
+
+    // Legacy M-12: resolve the stratum password (CLI takes precedence over
+    // file), same pattern as the RPC API key below. Hoisted to top-level
+    // scope so both the V1 and V2 stratum server setups (below) can share
+    // it. UNSET preserves the historical behaviour: `mining.authorize`
+    // accepts any password for a syntactically valid address.
+    let stratum_password: Option<String> = match (&cli.stratum_password, &cli.stratum_password_file) {
+        (Some(p), _) => Some(p.clone()),
+        (None, Some(path)) => match std::fs::read_to_string(path) {
+            Ok(contents) => {
+                let p = contents.lines().next().unwrap_or("").trim().to_string();
+                if p.is_empty() {
+                    eprintln!("⚠  --stratum-password-file {:?} is empty; ignoring.", path);
+                    None
+                } else {
+                    Some(p)
+                }
+            }
+            Err(e) => {
+                eprintln!("⚠  failed to read --stratum-password-file {:?}: {}", path, e);
+                None
+            }
+        },
+        (None, None) => None,
+    };
 
     // ── Sprint M: load API key (CLI takes precedence over file) ────
     let api_key: Option<String> = match (&cli.rpc_api_key, &cli.rpc_api_key_file) {
@@ -517,7 +646,11 @@ async fn main() {
         // VERIFIES it (validate_pow dispatches on the node chain-id), refusing to
         // start if it does not check out.
         info!("Initialising canonical genesis (pre-mined PoW) and verifying...");
-        let founder_spk = address_to_script_pubkey(FOUNDER_ADDRESS_HEX);
+        let founder_spk = address_to_script_pubkey(FOUNDER_ADDRESS_HEX)
+            .unwrap_or_else(|e| {
+                eprintln!("❌ FOUNDER_ADDRESS_HEX is not a valid Bloch address: {e}. This is a compiled-in constant — refusing to construct a genesis that would pay a burned address.");
+                std::process::exit(1);
+            });
         let genesis = match core::node_chain_id() {
             core::ChainId::Genesis2Devnet => {
                 // The carry-over UTXO set was ingested above; this writes only block 0.
@@ -1582,8 +1715,14 @@ async fn main() {
         let shielded_m = shielded.clone(); // LEG1: accept_block needs the shielded pool
         let miner_addr = cli.miner_address.clone()
             .unwrap_or_else(|| FOUNDER_ADDRESS_HEX.to_string());
-        // FIX #8: Convert miner address to proper 20-byte script_pubkey
-        let miner_spk = address_to_script_pubkey(&miner_addr);
+        // FIX #8 / Legacy L-3: convert miner address to a proper 20-byte
+        // script_pubkey, or exit loudly — never silently mine into an
+        // unspendable script built from the raw --miner-address bytes.
+        let miner_spk = address_to_script_pubkey(&miner_addr)
+            .unwrap_or_else(|e| {
+                eprintln!("❌ --miner-address {miner_addr:?} is not a valid Bloch address: {e}. Refusing to mine into an address that cannot be parsed back — every coinbase reward would be unspendable.");
+                std::process::exit(1);
+            });
 
         // Capacity: grind the SIS search across all logical CPUs by default
         // (result-identical — see pow::mine_sis_pow_parallel). Override with
@@ -1810,17 +1949,10 @@ async fn main() {
                         (txs, None)
                     };
 
-                // FIX VULN-05: Compute fees and include in coinbase
-                let total_fees: u64 = txs.iter().map(|tx| {
-                    let total_in: u64 = tx.inputs.iter()
-                        .filter_map(|inp| store_m.get_utxo(&inp.prev_txid, inp.prev_index).ok().flatten())
-                        .map(|out| out.value)
-                        .sum();
-                    let total_out: u64 = tx.outputs.iter()
-                        .try_fold(0u64, |acc, o| acc.checked_add(o.value))
-                        .unwrap_or(u64::MAX); // overflow → caller will reject
-                    total_in.saturating_sub(total_out)
-                }).sum();
+                // FIX VULN-05: Compute fees and include in coinbase. See
+                // `miner_template_total_fees`'s doc comment for N-7 (the
+                // duplicate-outpoint fee-inflation fix).
+                let total_fees: u64 = miner_template_total_fees(&txs, &store_m);
 
                 // eUTXO fee mirror (D3): when the VM is active, the coinbase
                 // claims the mirror's burn-aware fee total for the SAME kept
@@ -2072,13 +2204,25 @@ async fn main() {
         }
         if cli.stratum && stratum_sha256d {
         // Parse + validate CLI params
-        let bind_addr: std::net::SocketAddr = match cli.stratum_addr.parse() {
+        let mut bind_addr: std::net::SocketAddr = match cli.stratum_addr.parse() {
             Ok(a)  => a,
             Err(e) => {
                 error!("invalid --stratum-addr '{}': {}", cli.stratum_addr, e);
                 std::process::exit(1);
             }
         };
+        // Legacy M-12: --stratum-public overrides the HOST only (keeping
+        // whatever port --stratum-addr specified), mirroring --rpc-public.
+        if cli.stratum_public {
+            bind_addr.set_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        }
+
+        if !bind_addr.ip().is_loopback() && stratum_password.is_none() {
+            warn!("stratum: binding {} (not loopback) with NO --stratum-password set — \
+                   mining.authorize accepts ANY password for a syntactically valid address. \
+                   Set --stratum-password / --stratum-password-file or restrict access at \
+                   the network layer.", bind_addr);
+        }
 
         let mode: stratum::StratumMode = match cli.stratum_mode.parse() {
             Ok(m)  => m,
@@ -2107,6 +2251,7 @@ async fn main() {
                 store:        store.clone(),
                 mempool:      mempool.clone(),
                 coinbase_tag: cli.stratum_coinbase_tag.clone(),
+                stratum_password: stratum_password.clone(),
             })),
         };
 
@@ -2179,6 +2324,7 @@ async fn main() {
             store:        store.clone(),
             mempool:      mempool.clone(),
             coinbase_tag: cli.stratum_coinbase_tag.clone(),
+            stratum_password: stratum_password.clone(),
         }));
 
         // Sprint 10-epsilon Phase 5.a: share the hoisted accept_block_cb
@@ -2470,6 +2616,51 @@ const HEADERS_SOLICITED_WINDOW_MS: u64 = 60_000;
 static FINALITY_FROZEN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Legacy H-2: which height `accept_block` uses for the coinbase-maturity
+/// check. `false` (default) = historical `dag.block_count()` (parity with
+/// the closed Genesis-3 chain); `true` (`--strict-maturity`) = the block's
+/// own consensus-checked `height`. Latched once at startup from the CLI flag
+/// — see the `main()` call site and `legacy/README.md`.
+static STRICT_MATURITY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Legacy H-2: the `current_height` `accept_block` feeds into
+/// `core::check_coinbase_maturity`, chosen by the `--strict-maturity` flag.
+/// A tiny pure function so the decision is unit-testable without any global
+/// state or DAG/store setup. `local_block_count` is this node's own
+/// `dag.block_count()` (per-node, NOT consensus-agreed — see the call
+/// site's doc comment); `block_height` is the block's own consensus-checked
+/// height.
+fn maturity_check_height(strict: bool, block_height: u64, local_block_count: u64) -> u64 {
+    if strict { block_height } else { local_block_count }
+}
+
+#[cfg(test)]
+mod maturity_check_height_tests {
+    use super::*;
+
+    /// Legacy H-2 regression: with `--strict-maturity` OFF (the historical,
+    /// parity-preserving default), the per-node `block_count()` must be
+    /// used, even when it diverges from the block's own height — exactly
+    /// the two-honest-nodes-disagree scenario this finding is about.
+    /// Reverting the fix (always returning `block_height`, or always
+    /// `local_block_count`) makes one of these two assertions fail.
+    #[test]
+    fn default_uses_local_block_count_not_block_height() {
+        assert_eq!(maturity_check_height(false, 500, 300), 300);
+        assert_eq!(maturity_check_height(false, 100, 100), 100);
+    }
+
+    /// With `--strict-maturity` ON, the block's own consensus-checked
+    /// height must be used, NOT the per-node `block_count()` — the fix this
+    /// finding asks for.
+    #[test]
+    fn strict_uses_block_height_not_local_block_count() {
+        assert_eq!(maturity_check_height(true, 500, 300), 500);
+        assert_eq!(maturity_check_height(true, 100, 100), 100);
+    }
+}
+
 /// Set once from `--archive` at startup. Same static-flag shape as
 /// FINALITY_FROZEN above: accept_block runs far from the CLI struct and
 /// threading a bool through every caller would be noise for a value that is
@@ -2657,10 +2848,27 @@ fn accept_block(
     }
 
     // ── Validate non-coinbase TXs + compute fees ─────────────────────
-    let current_height = {
-        let d = dag.read();
-        d.block_count() as u64
-    };
+    //
+    // SECURITY (Legacy H-2): `dag.block_count()` is a per-node bookkeeping
+    // value (how many blocks THIS node has stored — orphans and retained
+    // fork-losers included, see the "Inert fork-losers are retained" note
+    // above) with NO consensus meaning: two honest nodes with different
+    // orphan/fork-loser retention or sync history can compute different
+    // `block_count()` values for blocks at the identical selected-chain
+    // position, so they can disagree about whether a referenced coinbase is
+    // mature. `block.height` is already consensus-checked a few lines above
+    // (the `expected_height` match) and is identical on every honest node.
+    //
+    // PARITY: default (`--strict-maturity` unset) keeps the historical
+    // `block_count()` rule so the 39,918 already-accepted historical blocks
+    // stay valid without re-verification; `--strict-maturity` opts into the
+    // corrected `block.height` rule (see `STRICT_MATURITY`'s doc comment and
+    // `legacy/README.md`).
+    let current_height = maturity_check_height(
+        STRICT_MATURITY.load(std::sync::atomic::Ordering::Relaxed),
+        block.height,
+        dag.read().block_count() as u64,
+    );
     let mut spent_in_block: HashSet<([u8; 32], u32)> = HashSet::new();
     let mut total_fees: u64 = 0;
 
@@ -2866,9 +3074,25 @@ fn accept_block(
             // Apply this block's mutations forward. Uses the shared helper
             // (src/reorg.rs) so extension and reorg re-apply go through
             // identical code — they must produce byte-identical UndoData.
+            // Legacy L-1: `apply_block_utxo_mutations` now propagates every
+            // write error instead of silently discarding it (previously
+            // only `put_undo_data` failures were even visible here). This
+            // call site does NOT yet roll back or abort on failure — doing
+            // so safely requires the atomic single-WriteBatch commit and
+            // startup reconciliation check tracked as Legacy M-7 (not yet
+            // implemented: mid-block failure here can already leave the
+            // UTXO set, block body, and tip in different states, and
+            // returning early now — without a rollback path — would not
+            // fix that, only change WHICH state is inconsistent). Until
+            // M-7 lands, a failure here is a fleet-visible, actionable
+            // signal (error!, not warn!) that this node's UTXO set may have
+            // diverged and needs `--verify-carryover`-style reconciliation.
             if let Err(e) = reorg::apply_block_utxo_mutations(store, block) {
-                warn!(
-                    "U.4: apply_block_utxo_mutations returned partial failure for h={}: {}",
+                error!(
+                    "U.4/L-1: apply_block_utxo_mutations FAILED for h={}: {} — this node's \
+                     UTXO set may now be inconsistent with its block/DAG state (Legacy M-7: \
+                     atomic commit + startup reconciliation not yet implemented). Investigate \
+                     storage health immediately.",
                     block.height, e
                 );
             }
@@ -3394,6 +3618,53 @@ fn validate_tx_inputs(
     Ok(total_in - total_out)
 }
 
+/// Compute the total fee the miner's OWN block template may claim across
+/// `txs` (the candidate set selected from the mempool), reading prevout
+/// values from the persistent UTXO set.
+///
+/// SECURITY (Legacy N-7): counts each of a transaction's outpoints ONCE —
+/// insert-as-check, mirroring the C-R3-2 duplicate-outpoint rejection real
+/// admission applies (`validate_tx_inputs`'s `local_spent`). This used to
+/// `filter_map`+`sum` over `tx.inputs` unconditionally, so a transaction
+/// listing the SAME outpoint N times had that outpoint's value summed N
+/// times, inflating the fee the coinbase this template builds is allowed to
+/// claim. Such a transaction is rejected outright by real consensus
+/// validation (the identical insert-as-check, re-run when this self-mined
+/// block is committed through the normal `accept_block` path) — it can never
+/// legitimately contribute ANY fee, so this estimate must not act as if it
+/// could either. Concretely: without this fix, a template that included such
+/// a transaction would build a coinbase `validate_coinbase_value` then
+/// rejects when the self-mined block is committed — wasting the mined block
+/// (a liveness bug) rather than minting anything (accept_block's real,
+/// non-inflating fee computation is still the actual consensus gate) — but
+/// the template must not rely on that backstop to compute a correct number.
+fn miner_template_total_fees(
+    txs:   &[core::Transaction],
+    store: &storage::Storage,
+) -> u64 {
+    txs.iter().map(|tx| {
+        let mut seen_outpoints: HashSet<([u8; 32], u32)> = HashSet::new();
+        let mut has_duplicate_outpoint = false;
+        let mut total_in: u64 = 0;
+        for inp in &tx.inputs {
+            if !seen_outpoints.insert((inp.prev_txid, inp.prev_index)) {
+                has_duplicate_outpoint = true;
+                continue;
+            }
+            if let Ok(Some(out)) = store.get_utxo(&inp.prev_txid, inp.prev_index) {
+                total_in = total_in.saturating_add(out.value);
+            }
+        }
+        if has_duplicate_outpoint {
+            return 0;
+        }
+        let total_out: u64 = tx.outputs.iter()
+            .try_fold(0u64, |acc, o| acc.checked_add(o.value))
+            .unwrap_or(u64::MAX); // overflow → caller (validate_coinbase_value) will reject
+        total_in.saturating_sub(total_out)
+    }).sum()
+}
+
 /// Validate a transaction within a block context.
 /// Uses both in-block outputs and persistent UTXO set, with double-spend tracking.
 fn validate_tx_in_block(
@@ -3415,8 +3686,39 @@ fn validate_tx_in_block_with_maturity(
     spent_in_block: &mut HashSet<([u8; 32], u32)>,
     current_height: u64,
 ) -> Result<u64, String> {
-    // Build lookup map from block's own transaction outputs
-    let block_utxos: std::collections::HashMap<([u8; 32], u32), core::TxOutput> = block.transactions
+    // SECURITY (Legacy C-2): build the in-block prevout map from ONLY the
+    // transactions STRICTLY BEFORE `tx` in `block.transactions` — never from
+    // the whole block. This used to `flat_map` over ALL of
+    // `block.transactions` unconditionally, so a transaction could spend the
+    // output of a LATER transaction in the same block: `tx[i]` validates
+    // (and is fee-accounted, and its own outputs get created) as if it had
+    // genuinely spent `tx[j]`'s (j > i) output, while the actual UTXO
+    // application (`reorg::apply_block_utxo_mutations`) writes each
+    // transaction's outputs THEN deletes its inputs, walking the block IN
+    // ORDER — so `tx[j]`'s output is written to storage only AFTER `tx[i]`'s
+    // (no-op, not-yet-existent-key) delete already ran, leaving it
+    // permanently unspent. The value tx[i] was credited for spending is
+    // never actually removed from the UTXO set: a supply-inflating mint,
+    // out-of-order-block-only, requiring no signature forgery.
+    //
+    // A transaction MAY legitimately spend an EARLIER same-block
+    // transaction's output (ordinary same-block chaining, e.g. a miner
+    // including a child of a transaction it also included) — that is
+    // exactly what the apply-order above expects and this preserves. It may
+    // never spend its own or a later transaction's not-yet-created output.
+    //
+    // `tx` is identified by TXID (content hash) rather than by reference
+    // identity so this is correct whether the caller passes a reference
+    // borrowed from `block.transactions` (the real consensus path) or an
+    // owned clone with identical content (as some call sites do); if `tx`'s
+    // txid is not found in `block.transactions` at all (a misuse this
+    // function's real callers never trigger), this falls back to the full
+    // block — permissive only for that out-of-invariant case.
+    let tx_txid = tx.txid();
+    let cutoff = block.transactions.iter()
+        .position(|t| t.txid() == tx_txid)
+        .unwrap_or(block.transactions.len());
+    let block_utxos: std::collections::HashMap<([u8; 32], u32), core::TxOutput> = block.transactions[..cutoff]
         .iter()
         .flat_map(|t| {
             let txid = t.txid();
@@ -3535,10 +3837,22 @@ fn validate_tx_in_block_euvm(
             .map_err(|e| format!("euvm: tx output {} invalid: {}", oi, e))?;
     }
 
-    // (b) Resolve prevouts through the SAME lookup as the legacy path:
-    // this block's own outputs first, then the persistent UTXO set.
+    // (b) Resolve prevouts through the SAME lookup as the legacy path: THIS
+    // block's own EARLIER outputs first, then the persistent UTXO set.
+    //
+    // SECURITY (Legacy C-2): mirrors the fix in
+    // `validate_tx_in_block_with_maturity` — restrict the in-block prevout
+    // map to transactions STRICTLY BEFORE `tx` (by txid), never the whole
+    // block, or a transaction could spend a LATER transaction's not-yet-
+    // applied output (see that function's doc comment for the full
+    // out-of-order-mint mechanism; this eUVM-path lookup fed by
+    // `block.transactions` unconditionally had the identical bug).
+    let tx_txid = tx.txid();
+    let cutoff = block.transactions.iter()
+        .position(|t| t.txid() == tx_txid)
+        .unwrap_or(block.transactions.len());
     let block_utxos: std::collections::HashMap<([u8; 32], u32), core::TxOutput> =
-        block.transactions
+        block.transactions[..cutoff]
             .iter()
             .flat_map(|t| {
                 let txid = t.txid();
@@ -4965,6 +5279,208 @@ mod intra_tx_dup_tests {
         let tx = dup_input_tx(&store, 1, 90_000);
         let fee = validate_tx_standalone(&tx, &store, 0)
             .expect("valid single-input spend must be admitted");
+        assert_eq!(fee, 10_000);
+    }
+
+    /// Legacy N-7 regression: the MINER's OWN block-template fee estimate
+    /// (`miner_template_total_fees`) must not inflate a duplicate-outpoint
+    /// transaction's fee contribution. A 2-duplicate-input tx spending a
+    /// 100k outpoint and emitting 150k has NO legitimate fee at all (such a
+    /// tx is rejected outright by real admission) — but before the fix,
+    /// summing every input's resolved value unconditionally would have
+    /// counted the 100k outpoint TWICE (200k in, 150k out => 50k "fee").
+    /// Reverting the fix (dropping the insert-as-check) makes this test
+    /// fail (asserting 0 would fail; it would instead read 50_000).
+    #[test]
+    fn miner_template_does_not_inflate_duplicate_outpoint_fee() {
+        let (_tmp, store) = mk_store();
+        let dup_tx = dup_input_tx(&store, 2, 150_000);
+        let total = miner_template_total_fees(std::slice::from_ref(&dup_tx), &store);
+        assert_eq!(total, 0, "a duplicate-outpoint tx must contribute zero fee to the template");
+    }
+
+    /// Control: an honest, non-duplicated single-input tx still contributes
+    /// its real fee to the template estimate, and a mixed set (one honest,
+    /// one duplicate-outpoint) counts only the honest one.
+    #[test]
+    fn miner_template_counts_honest_fees_normally() {
+        let (_tmp, store) = mk_store();
+        let honest_tx = dup_input_tx(&store, 1, 90_000);
+        assert_eq!(
+            miner_template_total_fees(std::slice::from_ref(&honest_tx), &store),
+            10_000,
+        );
+
+        let (_tmp2, store2) = mk_store();
+        let honest_tx2 = dup_input_tx(&store2, 1, 90_000);
+        let dup_tx2 = dup_input_tx(&store2, 2, 150_000);
+        assert_eq!(
+            miner_template_total_fees(&[honest_tx2, dup_tx2], &store2),
+            10_000,
+            "the mixed batch's total must equal the honest tx's fee alone",
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Legacy C-2 — a transaction may spend an EARLIER same-block transaction's
+// output, but never a LATER one. `reorg::apply_block_utxo_mutations` applies
+// each transaction's outputs THEN its inputs, walking `block.transactions` IN
+// ORDER, so a later transaction's output does not exist in storage yet when
+// an earlier transaction is applied. Before the fix,
+// `validate_tx_in_block_with_maturity` (and the `euvm`-feature
+// `validate_tx_in_block_euvm`) built their in-block prevout map from ALL of
+// `block.transactions` unconditionally, so an out-of-order spend validated —
+// and would have minted supply on acceptance (the spent value credited to
+// the earlier tx's fee accounting was never actually removed from the UTXO
+// set, since the later tx's `put_utxo` for that same output ran AFTER the
+// earlier tx's no-op `delete_utxo` on a not-yet-existent key).
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod out_of_order_spend_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn mk_store() -> (TempDir, Arc<storage::Storage>) {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = Arc::new(storage::Storage::open(&tmp.path().join("db")).expect("storage"));
+        (tmp, store)
+    }
+
+    fn coinbase() -> core::Transaction {
+        core::Transaction {
+            version: 1,
+            inputs: vec![core::TxInput {
+                prev_txid: [0u8; 32], prev_index: u32::MAX,
+                script_sig: vec![], sequence: u32::MAX,
+            }],
+            outputs: vec![core::TxOutput { value: 1_000, script_pubkey: vec![0xABu8; 20] }],
+            locktime: 0,
+        }
+    }
+
+    /// Regression: block index 1 ("early") claims to spend block index 2's
+    /// ("late") not-yet-applied output. Reverting the Legacy C-2 fix
+    /// (restoring the unconditional `block.transactions.iter()` prevout map)
+    /// makes this test fail — the spend would validate (and return a fee)
+    /// instead of being rejected.
+    #[test]
+    fn cannot_spend_a_later_transactions_output_in_the_same_block() {
+        use sha3::{Digest as _, Sha3_256};
+        let (_tmp, store) = mk_store();
+        let (pk, sk) = crypto::generate_keypair();
+        let pk_hash = Sha3_256::digest(&pk)[..20].to_vec();
+
+        // tx_late (block index 2): an ordinary spend of an already-confirmed
+        // UTXO, producing a fresh output paying `pk_hash`. Its own inputs are
+        // irrelevant to this test — only the attempted spend of ITS output
+        // (by tx_early, below) is under test.
+        let late_prev_txid = [0x77u8; 32];
+        store.put_utxo(&late_prev_txid, 0,
+            &core::TxOutput { value: 100_000, script_pubkey: vec![9u8; 20] })
+            .expect("put_utxo");
+        let tx_late = core::Transaction {
+            version: 1,
+            inputs: vec![core::TxInput {
+                prev_txid: late_prev_txid, prev_index: 0,
+                script_sig: vec![], sequence: u32::MAX,
+            }],
+            outputs: vec![core::TxOutput { value: 90_000, script_pubkey: pk_hash }],
+            locktime: 0,
+        };
+        let late_txid = tx_late.txid();
+
+        // tx_early (block index 1): a VALIDLY-SIGNED spend of tx_late's
+        // output 0 — which does not exist anywhere (not in the block-applied
+        // prefix, not in storage) at the point tx_early is validated/applied.
+        let mut tx_early = core::Transaction {
+            version: 1,
+            inputs: vec![core::TxInput {
+                prev_txid: late_txid, prev_index: 0,
+                script_sig: vec![], sequence: u32::MAX,
+            }],
+            outputs: vec![core::TxOutput { value: 80_000, script_pubkey: vec![1u8; 20] }],
+            locktime: 0,
+        };
+        let sighash = tx_early.sighash(0, core::node_chain_id());
+        let sig = crypto::sign(&sk, &sighash).expect("sign");
+        tx_early.inputs[0].script_sig = core::Transaction::build_script_sig(&sig, &pk);
+
+        let block = core::Block {
+            header: core::BlockHeader {
+                version: 1, parents: vec![], merkle_root: core::MerkleRoot::ZERO,
+                timestamp: 0, bits: core::GENESIS_BITS, nonce: 0,
+            },
+            transactions: vec![coinbase(), tx_early, tx_late],
+            blue_score: 0, height: 1, pow_solution: Vec::new(),
+            shielded_transactions: Vec::new(),
+            auxpow: None,
+        };
+
+        let mut spent = HashSet::new();
+        let err = validate_tx_in_block_with_maturity(
+            &block, &block.transactions[1], &store, &mut spent, 0,
+        ).expect_err("a transaction must never validate against a LATER transaction's output");
+        assert!(err.contains("not found"), "expected a prevout-not-found error, got: {err}");
+    }
+
+    /// Control: the SAME shape, but tx_early spends tx_late's output when
+    /// tx_late sits EARLIER in the block (index 1, before tx_early at index
+    /// 2) — ordinary, legitimate same-block chaining, which must still
+    /// validate (the fix must not over-reject legal same-block spends).
+    #[test]
+    fn can_spend_an_earlier_transactions_output_in_the_same_block() {
+        use sha3::{Digest as _, Sha3_256};
+        let (_tmp, store) = mk_store();
+        let (pk, sk) = crypto::generate_keypair();
+        let pk_hash = Sha3_256::digest(&pk)[..20].to_vec();
+
+        let early_prev_txid = [0x88u8; 32];
+        store.put_utxo(&early_prev_txid, 0,
+            &core::TxOutput { value: 100_000, script_pubkey: vec![9u8; 20] })
+            .expect("put_utxo");
+        // This transaction now sits EARLIER in the block (index 1).
+        let tx_funding = core::Transaction {
+            version: 1,
+            inputs: vec![core::TxInput {
+                prev_txid: early_prev_txid, prev_index: 0,
+                script_sig: vec![], sequence: u32::MAX,
+            }],
+            outputs: vec![core::TxOutput { value: 90_000, script_pubkey: pk_hash }],
+            locktime: 0,
+        };
+        let funding_txid = tx_funding.txid();
+
+        // This transaction sits LATER (index 2) and spends the funding tx's
+        // output — a legitimate same-block chained spend.
+        let mut tx_spend = core::Transaction {
+            version: 1,
+            inputs: vec![core::TxInput {
+                prev_txid: funding_txid, prev_index: 0,
+                script_sig: vec![], sequence: u32::MAX,
+            }],
+            outputs: vec![core::TxOutput { value: 80_000, script_pubkey: vec![1u8; 20] }],
+            locktime: 0,
+        };
+        let sighash = tx_spend.sighash(0, core::node_chain_id());
+        let sig = crypto::sign(&sk, &sighash).expect("sign");
+        tx_spend.inputs[0].script_sig = core::Transaction::build_script_sig(&sig, &pk);
+
+        let block = core::Block {
+            header: core::BlockHeader {
+                version: 1, parents: vec![], merkle_root: core::MerkleRoot::ZERO,
+                timestamp: 0, bits: core::GENESIS_BITS, nonce: 0,
+            },
+            transactions: vec![coinbase(), tx_funding, tx_spend],
+            blue_score: 0, height: 1, pow_solution: Vec::new(),
+            shielded_transactions: Vec::new(),
+            auxpow: None,
+        };
+
+        let mut spent = HashSet::new();
+        let fee = validate_tx_in_block_with_maturity(
+            &block, &block.transactions[2], &store, &mut spent, 0,
+        ).expect("a transaction MAY spend an earlier same-block transaction's output");
         assert_eq!(fee, 10_000);
     }
 }

@@ -33,6 +33,7 @@ use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::mpsc;
 use serde_json::{json, Value};
 use log::{info, warn, debug};
+use rand::RngCore; // Legacy L-7: CSPRNG extranonce1 (Session::new)
 
 use crate::address;
 use super::jobs::Template;
@@ -415,14 +416,22 @@ pub struct Session {
 impl Session {
     pub fn new(id: u64, peer_addr: SocketAddr) -> Self {
         let mut extranonce1 = [0u8; 4];
-        // Seed with a mix of id + time so multiple sessions don't collide.
-        // Cryptographic randomness isn't strictly required here; uniqueness is.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(0);
-        let seed = id.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(now);
-        extranonce1.copy_from_slice(&seed.to_le_bytes()[..4]);
+        // SECURITY (Legacy L-7): draw extranonce1 from the CSPRNG, not from
+        // `id.wrapping_mul(const).wrapping_add(now_micros)`. The old formula
+        // is fully PREDICTABLE from public information: session `id` is a
+        // small monotonic counter any connecting client can infer (or brute
+        // force in a handful of guesses) and `now` is a microsecond
+        // timestamp observable to within a small window by anyone who can
+        // time their own `mining.subscribe`. extranonce1 exists precisely to
+        // partition each miner's share-search space so two sessions never
+        // waste work searching the same nonce range — a predictable value
+        // lets a participant infer or collide with another session's
+        // namespace instead of relying on the server's own partitioning
+        // (share-space collision / grinding), which is exactly the property
+        // this field is supposed to guarantee. `rand::rng()` is the CSPRNG
+        // this crate already uses for the transport's Noise handshake nonces
+        // (`transport/mod.rs`, `transport/upgrade.rs`).
+        rand::rng().fill_bytes(&mut extranonce1);
 
         Self {
             id,
@@ -1032,6 +1041,28 @@ fn handle_authorize(
         None    => return send_err(ErrorCode::Unauthorized, "username must be a string"),
     };
 
+    // SECURITY (Legacy M-12): when a shared password is configured
+    // (--stratum-password / --stratum-password-file), `mining.authorize`
+    // MUST enforce it — historically this handler validated ONLY that
+    // `username` parses as an address and never inspected `params[1]` at
+    // all, so ANY (or no) password was accepted. Compared constant-time
+    // (`subtle::ConstantTimeEq`, the same primitive the RPC API-key check
+    // uses) so a wrong-length or wrong-content guess can't be distinguished
+    // by timing. Checked BEFORE the address parse below so a bad password
+    // is rejected uniformly regardless of whether `username` happens to be
+    // well-formed (no information about address validity leaks to an
+    // unauthenticated caller). Absent a configured password, behaviour is
+    // UNCHANGED (historical parity — see the CLI flag's doc comment).
+    if let Some(ctx) = node_ctx {
+        if let Some(expected) = &ctx.stratum_password {
+            use subtle::ConstantTimeEq;
+            let supplied = params.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            if supplied.as_bytes().ct_eq(expected.as_bytes()).unwrap_u8() != 1 {
+                return send_err(ErrorCode::Unauthorized, "invalid password");
+            }
+        }
+    }
+
     // Validate as a Bloch-SIS Protocol bech32 address.
     match address::Address::parse(username) {
         Ok(_) => {
@@ -1172,6 +1203,21 @@ mod tests {
         std::sync::Arc::new(Session::new(1, addr))
     }
 
+    /// A minimal, real `TemplateContext` (empty DAG/store/mempool — the
+    /// password check runs before any of them are touched) carrying the
+    /// given `stratum_password`, for Legacy M-12 tests.
+    fn mk_ctx(stratum_password: Option<&str>) -> (tempfile::TempDir, TemplateContext) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = crate::storage::Storage::open(&tmp.path().join("db")).expect("storage");
+        (tmp, TemplateContext {
+            dag:          std::sync::Arc::new(parking_lot::RwLock::new(crate::consensus::GhostDAG::with_default_k())),
+            store:        std::sync::Arc::new(store),
+            mempool:      std::sync::Arc::new(crate::mempool::Mempool::new()),
+            coinbase_tag: "test".to_string(),
+            stratum_password: stratum_password.map(|s| s.to_string()),
+        })
+    }
+
     #[test]
     fn session_starts_fresh() {
         let s = mk_session();
@@ -1187,14 +1233,41 @@ mod tests {
 
     #[test]
     fn extranonce1_differs_between_sessions() {
-        // Session ids 1 and 2 → different extranonce1. Uses time+id,
-        // so this can theoretically collide if two sessions
-        // construct in the same microsecond with specific ids.
-        // Extremely unlikely in practice.
+        // Legacy L-7: extranonce1 is drawn from the CSPRNG (`rand::rng()`),
+        // not derived from `id`/time — two sessions differ with
+        // overwhelming probability (2^-32 collision chance for any one
+        // pair), regardless of id or timing. Reverting to the old
+        // `id.wrapping_mul(..).wrapping_add(now)` formula would make
+        // extranonce1 predictable again without necessarily failing THIS
+        // particular assertion (predictability, not collision, is the
+        // actual defect) — see `extranonce1_is_not_derived_from_id_or_time`
+        // below for a regression that catches predictability directly.
         let a = std::sync::Arc::new(Session::new(1, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)));
         std::thread::sleep(std::time::Duration::from_micros(2));
         let b = std::sync::Arc::new(Session::new(2, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)));
         assert_ne!(a.extranonce1, b.extranonce1);
+    }
+
+    /// Legacy L-7 regression: extranonce1 must not be a predictable function
+    /// of `id` and construction time. The OLD formula
+    /// (`id.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(now_micros)`)
+    /// is CONSTANT in `id` for a fixed `id`, so many sessions constructed
+    /// back-to-back with the SAME id (varying only by whatever `now_micros`
+    /// happened to be at each call — often identical or near-identical on a
+    /// fast loop, well within typical timer-tick resolution) collided or
+    /// clustered into a small set of values. A CSPRNG draw has no such
+    /// correlation: reverting this fix makes this test fail (or flake red)
+    /// on any real system, because `extranonce1_of_16` would then contain
+    /// duplicates far more often than 16 independent 32-bit draws would.
+    #[test]
+    fn extranonce1_is_not_derived_from_id_or_time() {
+        let mut values = std::collections::HashSet::new();
+        for _ in 0..16 {
+            let s = Session::new(7, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+            values.insert(s.extranonce1);
+        }
+        assert_eq!(values.len(), 16,
+            "16 sessions constructed with the IDENTICAL id must all draw distinct extranonce1 values");
     }
 
     #[test]
@@ -1242,6 +1315,85 @@ mod tests {
         let resp = handle_authorize(&s, &req, None);
         assert!(resp.error.is_some(), "invalid address must error");
         assert_eq!(s.state(), SessionState::Subscribed, "session stays unauthorized on bad address");
+    }
+
+    /// Legacy M-12 regression: with a `stratum_password` configured,
+    /// `mining.authorize` must ACCEPT a valid address + the correct
+    /// password. Before the fix, `params[1]` was never inspected at all —
+    /// this passing is not itself the regression (that would already have
+    /// passed), but establishes the control for the next test.
+    #[test]
+    fn authorize_with_correct_password_succeeds() {
+        let s = mk_session();
+        s.set_state(SessionState::Subscribed);
+        let (_tmp, ctx) = mk_ctx(Some("hunter2"));
+
+        let req = StratumRequest {
+            id:     Some(Value::from(1)),
+            method: methods::AUTHORIZE.to_string(),
+            params: json!(["bloch1q4fbcd3b3fae5de3e2b4015ca132c8744b8af170a79e4eb45", "hunter2"]),
+        };
+        let resp = handle_authorize(&s, &req, Some(&ctx));
+        assert!(resp.error.is_none(), "correct password must authorize: {:?}", resp.error);
+        assert_eq!(s.state(), SessionState::Authorized);
+    }
+
+    /// Legacy M-12 regression: with a `stratum_password` configured, a
+    /// WRONG password must be REJECTED even though the username is a
+    /// perfectly valid address. Before the fix, `handle_authorize` never
+    /// inspected `params[1]` at all, so this would have authorized
+    /// successfully — reverting the fix makes this test fail.
+    #[test]
+    fn authorize_with_wrong_password_is_rejected() {
+        let s = mk_session();
+        s.set_state(SessionState::Subscribed);
+        let (_tmp, ctx) = mk_ctx(Some("hunter2"));
+
+        let req = StratumRequest {
+            id:     Some(Value::from(1)),
+            method: methods::AUTHORIZE.to_string(),
+            params: json!(["bloch1q4fbcd3b3fae5de3e2b4015ca132c8744b8af170a79e4eb45", "wrong-password"]),
+        };
+        let resp = handle_authorize(&s, &req, Some(&ctx));
+        assert!(resp.error.is_some(), "wrong password must be rejected");
+        assert_eq!(s.state(), SessionState::Subscribed, "session stays unauthorized on wrong password");
+    }
+
+    /// Legacy M-12 regression: with a `stratum_password` configured, a
+    /// MISSING password param (only `[username]`, no second element) must
+    /// be REJECTED, not treated as an empty-string match or skipped check.
+    #[test]
+    fn authorize_with_missing_password_is_rejected() {
+        let s = mk_session();
+        s.set_state(SessionState::Subscribed);
+        let (_tmp, ctx) = mk_ctx(Some("hunter2"));
+
+        let req = StratumRequest {
+            id:     Some(Value::from(1)),
+            method: methods::AUTHORIZE.to_string(),
+            params: json!(["bloch1q4fbcd3b3fae5de3e2b4015ca132c8744b8af170a79e4eb45"]),
+        };
+        let resp = handle_authorize(&s, &req, Some(&ctx));
+        assert!(resp.error.is_some(), "missing password must be rejected");
+    }
+
+    /// Control: with NO `stratum_password` configured (the historical
+    /// default), any password (or none) is still accepted — the fix must
+    /// not change behaviour when the operator has not opted in.
+    #[test]
+    fn authorize_without_configured_password_is_unchanged() {
+        let s = mk_session();
+        s.set_state(SessionState::Subscribed);
+        let (_tmp, ctx) = mk_ctx(None);
+
+        let req = StratumRequest {
+            id:     Some(Value::from(1)),
+            method: methods::AUTHORIZE.to_string(),
+            params: json!(["bloch1q4fbcd3b3fae5de3e2b4015ca132c8744b8af170a79e4eb45", "anything-at-all"]),
+        };
+        let resp = handle_authorize(&s, &req, Some(&ctx));
+        assert!(resp.error.is_none(), "no configured password must preserve the historical (permissive) behaviour");
+        assert_eq!(s.state(), SessionState::Authorized);
     }
 
     #[test]

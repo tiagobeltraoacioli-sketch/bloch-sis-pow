@@ -13,13 +13,18 @@ pub mod tokenomics_v2;
 /// Merged-mining (AuxPoW) verifier — dual-mine Bloch with Bitcoin (SHA-256d).
 pub mod auxpow;
 
-/// Height at/above which merged-mining (AuxPoW) blocks are accepted. DISABLED
-/// by default (`u64::MAX`): merged mining is plumbed but INERT until a
-/// coordinated flag-day sets a real activation height (exactly like the earlier
-/// SHA-256d-LE fork). A block carrying an `auxpow` below this height is invalid
-/// (fail closed), and it never affects `block_hash`.
+/// Height at/above which merged-mining (AuxPoW) blocks are accepted.
+///
+/// DOC-DRIFT FIX (Round-1 A7 M-6): this comment used to say the gate was
+/// DISABLED by default at `u64::MAX`, "INERT until a coordinated flag-day".
+/// That described an EARLIER state of this constant, not the value actually
+/// shipped below — the flag day already happened: merged mining ACTIVATED at
+/// height 8500 on 2026-08-01 (G3 mainnet; the chain was ~7503 at the
+/// coordinated fleet upgrade). Below 8500 the binary is behaviour-identical
+/// to the pre-AuxPoW node; a block carrying an `auxpow` below 8500 stays
+/// invalid (fail closed), and `auxpow` never affects `block_hash`.
 #[cfg(not(feature = "auxpow-rehearsal"))]
-pub const AUXPOW_ACTIVATION_HEIGHT: u64 = 8500; // FLAG-DAY 2026-08-01 (G3 mainnet): merged mining activates at height 8500 (chain was ~7503 at the coordinated fleet upgrade). Below this the binary is behaviour-identical to the pre-AuxPoW node; a block carrying an `auxpow` below 8500 stays fail-closed.
+pub const AUXPOW_ACTIVATION_HEIGHT: u64 = 8500;
 /// REGTEST / REHEARSAL ONLY — enabled by the `auxpow-rehearsal` cargo feature,
 /// which a MAINNET artifact never sets. Activating at height 0 lets a local,
 /// off-mainnet build actually ACCEPT merged-mined blocks (validate_pow's active
@@ -389,11 +394,17 @@ pub fn emission_height(local_height: u64) -> u64 {
 
 /// Whether `id` REQUIRES the carry-over snapshot to be ingested before the
 /// node may run. Deliberately an exhaustive match with no wildcard arm: when a
-/// Genesis-2 chain-id variant is added (g2/T1 adds `Genesis2Devnet`), this
-/// stops compiling until someone makes the explicit decision — silently
-/// defaulting a new chain to "no carry-over needed" is exactly the fail-open
-/// this migration exists to remove. Today no shipped chain requires it; the
-/// loader is still exercisable via the explicit `--carryover-snapshot` flag.
+/// new chain-id variant is added, this stops compiling until someone makes
+/// the explicit decision — silently defaulting a new chain to "no carry-over
+/// needed" is exactly the fail-open this migration exists to remove.
+///
+/// DOC-DRIFT FIX (Round-1 A7 M-6): this used to say "today no shipped chain
+/// requires it", written before `Genesis3Mainnet` existed. That is no longer
+/// true and the match below says so: `Genesis3Mainnet` is the shipped,
+/// closed chain, and it DOES require the carry-over (`true`, same as
+/// `Genesis2Devnet`) — a Genesis-3 node started without
+/// `--carryover-snapshot` must refuse to run rather than silently produce an
+/// empty-ledger chain.
 pub const fn chain_requires_carryover(id: ChainId) -> bool {
     match id {
         ChainId::Mainnet => false,
@@ -511,9 +522,15 @@ pub const CANONICAL_K_ACTIVATION_HEIGHT: u64 = 40_320;
 
 /// The clearly-future placeholder value. Kept as a named constant so the
 /// `mainnet`-feature CI guard below can assert the real height has been moved
-/// off it. There is NO live mainnet, so `CANONICAL_K_ACTIVATION_HEIGHT` above
-/// deliberately STAYS at this placeholder for now; the guard bites only when a
-/// mainnet artifact is cut (see the `mainnet_release_guard` test).
+/// off it.
+///
+/// DOC-DRIFT FIX (Round-1 A7 M-6): this used to say
+/// `CANONICAL_K_ACTIVATION_HEIGHT` "deliberately STAYS at this placeholder
+/// for now" — true when it was written, but the constant above has SINCE
+/// moved off the placeholder (to 40_320, per the ADR recorded on it) and this
+/// comment was never updated to match. The `mainnet_release_guard` test below
+/// still exists to catch any FUTURE regression back to this placeholder
+/// value on a mainnet-feature build.
 pub const PLACEHOLDER_ACTIVATION_HEIGHT: u64 = 1_000_000;
 
 /// Height BELOW which the difficulty-driven k-ramp does NOT yet apply. A FUTURE
@@ -1846,7 +1863,23 @@ impl Block {
         }
 
         // output[0] = miner (full subsidy + fees, address is miner's choice)
-        if cb.outputs[0].value > subsidy.saturating_add(total_fees) {
+        //
+        // SECURITY (Legacy L-2): this used to be `subsidy.saturating_add(total_fees)`.
+        // Saturating means an overflowing sum CLAMPS to `u64::MAX`, and the
+        // check above then reads "value > u64::MAX" — never true, so an
+        // attacker who can force `subsidy + total_fees` to overflow (e.g. via
+        // a version of the same duplicate-outpoint fee double-count this
+        // module's caller must otherwise reject) would make this check pass
+        // for ANY coinbase value, silently authorizing unlimited over-mint.
+        // `checked_add` + explicit rejection fails closed instead: a total
+        // this call is asked to validate against can never legitimately
+        // overflow (bounded by the ~3.47B BLCH carried-over supply, many
+        // orders of magnitude below u64::MAX in sat), so treating an overflow
+        // as invalid rather than "anything goes" cannot reject any
+        // legitimately-producible block.
+        let max_allowed = subsidy.checked_add(total_fees)
+            .ok_or("coinbase reward computation overflowed (subsidy + fees)")?;
+        if cb.outputs[0].value > max_allowed {
             return Err("miner coinbase output exceeds allowed amount");
         }
 
@@ -1930,6 +1963,84 @@ impl Block {
 
     pub fn size_bytes(&self) -> usize {
         bincode::serde::encode_to_vec(self, bincode::config::standard()).map(|v| v.len()).unwrap_or(usize::MAX)
+    }
+}
+
+#[cfg(test)]
+mod validate_coinbase_value_overflow_tests {
+    use super::*;
+
+    /// One coinbase output, no founder vesting (height 0, before any
+    /// vesting cliff on the default `Mainnet` chain id — `emission_height`
+    /// is the identity there, so `founder_vesting_delta_sat(0) == 0` and
+    /// `validate_coinbase_value` expects exactly 1 output).
+    fn one_output_coinbase_block(miner_value: u64) -> Block {
+        Block {
+            header: BlockHeader {
+                version: 1,
+                parents: vec![],
+                merkle_root: MerkleRoot([0u8; 32]),
+                timestamp: 0,
+                bits: 0,
+                nonce: 0,
+            },
+            transactions: vec![Transaction {
+                version: 1,
+                inputs: vec![TxInput {
+                    prev_txid: [0u8; 32],
+                    prev_index: u32::MAX,
+                    script_sig: vec![],
+                    sequence: u32::MAX,
+                }],
+                outputs: vec![TxOutput { value: miner_value, script_pubkey: vec![0u8; 20] }],
+                locktime: 0,
+            }],
+            blue_score: 0,
+            height: 0,
+            pow_solution: vec![],
+            shielded_transactions: vec![],
+            auxpow: None,
+        }
+    }
+
+    /// Legacy L-2 regression: `subsidy + total_fees` overflowing `u64` must be
+    /// REJECTED, not silently accepted via a saturating clamp. Before the fix,
+    /// `subsidy.saturating_add(total_fees)` clamped an overflowing sum to
+    /// `u64::MAX`, so `cb.outputs[0].value > u64::MAX` was never true — ANY
+    /// miner output value would pass, however large. Reverting the
+    /// `checked_add` fix (restoring `saturating_add`) makes this test fail
+    /// (the block would validate instead of being rejected).
+    #[test]
+    fn overflowing_subsidy_plus_fees_is_rejected_not_clamped() {
+        let subsidy_h0 = tokenomics_v2::block_subsidy_sat(0);
+        assert!(subsidy_h0 > 0, "test assumes a positive genesis-height subsidy");
+        // Any positive subsidy plus u64::MAX overflows a u64 sum.
+        let total_fees = u64::MAX;
+        // An absurdly large miner output — under the old saturating_add bug
+        // this would have passed (subsidy + fees clamped to u64::MAX, and no
+        // value exceeds u64::MAX). Under the fix it must be rejected on the
+        // overflow itself, before even comparing to the output value.
+        let block = one_output_coinbase_block(u64::MAX);
+        assert_eq!(
+            block.validate_coinbase_value(total_fees),
+            Err("coinbase reward computation overflowed (subsidy + fees)"),
+        );
+    }
+
+    /// Sanity check: an ordinary, non-overflowing total still validates
+    /// exactly as before (no regression for the common case).
+    #[test]
+    fn ordinary_fees_still_validate_normally() {
+        let subsidy_h0 = tokenomics_v2::block_subsidy_sat(0);
+        let total_fees = 1_000u64;
+        let block = one_output_coinbase_block(subsidy_h0 + total_fees);
+        assert_eq!(block.validate_coinbase_value(total_fees), Ok(()));
+        // One sat over the allowed amount is still rejected.
+        let over = one_output_coinbase_block(subsidy_h0 + total_fees + 1);
+        assert_eq!(
+            over.validate_coinbase_value(total_fees),
+            Err("miner coinbase output exceeds allowed amount"),
+        );
     }
 }
 
@@ -2120,15 +2231,23 @@ pub const GENESIS2_RETARGET_WINDOW: u64 = 60;
 
 /// The mined Genesis-2 nonce (bloch-mine-genesis2 ceremony output). Upper 32
 /// bits are zero — only the low 32 enter the 80-byte mining header.
-/// PLACEHOLDER 0 until the devnet ceremony bakes the real value; the pinned
-/// test genesis2_genesis_block.rs FAILS while this is stale, and the node's
-/// startup check must exit(1) — fail closed, never fail open.
+///
+/// DOC-DRIFT FIX (Round-1 A7 M-6): this used to say "PLACEHOLDER 0 until the
+/// devnet ceremony bakes the real value" — true before the ceremony ran, but
+/// the value below has SINCE been baked in by the ceremony and this comment
+/// was never updated. `create_genesis2_block`'s fail-closed PoW/hash assert
+/// (see there) still refuses to construct the block if this ever drifts from
+/// what actually satisfies GENESIS2_BITS — that safety net is unaffected by
+/// this comment being stale.
 pub const GENESIS2_NONCE: u64 = 1_798_023_308;
 
 /// Expected canonical Genesis-2 block hash, for operator verification and the
 /// fail-closed startup check. Canonical = miner script_pubkey
-/// GENESIS2_MINER_SCRIPT_PUBKEY, all constants above. PLACEHOLDER (all-zero)
-/// until the ceremony bakes the real value — see GENESIS2_NONCE.
+/// GENESIS2_MINER_SCRIPT_PUBKEY, all constants above.
+///
+/// DOC-DRIFT FIX (Round-1 A7 M-6): this used to say "PLACEHOLDER (all-zero)
+/// until the ceremony bakes the real value" — the ceremony has since run and
+/// baked in the non-zero hash below; this comment was never updated to match.
 pub const GENESIS2_EXPECTED_HASH: [u8; 32] = [
     0xa7, 0xb3, 0xde, 0x01, 0x09, 0x88, 0xac, 0xcb,
     0x58, 0x7a, 0x98, 0x71, 0x5c, 0x18, 0x1c, 0x8a,
@@ -2297,16 +2416,21 @@ const _: () = assert!(GENESIS3_BITS == GENESIS2_BITS);
 
 /// The mined Genesis-3 nonce (grind_genesis3 ceremony output).
 ///
-/// ⚠ PLACEHOLDER 0 until the ceremony bakes the real value: run
-/// `cargo run --release --bin grind_genesis3` and paste the printed
-/// constants here. While stale, `create_genesis3_block` PANICS (fail closed)
-/// and a `--genesis3` node cannot start — never fail open.
+/// DOC-DRIFT FIX (Round-1 A7 M-6): this used to say "⚠ PLACEHOLDER 0 until
+/// the ceremony bakes the real value" — true before `grind_genesis3` ran, but
+/// the value below has SINCE been baked in by that ceremony and this comment
+/// was never updated. `create_genesis3_block`'s fail-closed PoW assert (see
+/// there) still refuses to construct the block if this ever drifts from what
+/// actually satisfies GENESIS3_BITS under the little-endian-from-height-0
+/// rule — that safety net is unaffected by this comment being stale.
 pub const GENESIS3_NONCE: u64 = 10_751_391;
 
 /// Expected canonical Genesis-3 block hash for the fail-closed startup check.
-/// ⚠ PLACEHOLDER (all-zero) until the grind_genesis3 ceremony bakes the real
-/// value. While all-zero, the hash pin is SKIPPED (the PoW check above still
-/// fail-closes on the placeholder nonce); once nonzero it is ENFORCED.
+///
+/// DOC-DRIFT FIX (Round-1 A7 M-6): this used to say "⚠ PLACEHOLDER (all-zero)
+/// until the grind_genesis3 ceremony bakes the real value" — the ceremony has
+/// since run and baked in the non-zero hash below (ENFORCED, not skipped);
+/// this comment was never updated to match.
 pub const GENESIS3_EXPECTED_HASH: [u8; 32] = [
     0xc7, 0x52, 0x2d, 0x0e, 0xf2, 0x9f, 0xe6, 0x74,
     0x63, 0xbe, 0x45, 0xa8, 0x09, 0x5d, 0xb7, 0xf5,
@@ -2442,10 +2566,49 @@ pub fn create_genesis3_block(miner_addr: &[u8]) -> Block {
 
 // ── Difficulty ────────────────────────────────────────────────────────────────
 
+/// Decode a compact "bits" difficulty encoding into a 256-bit big-endian target.
+///
+/// SECURITY (Legacy C-1): bit 23 (`0x0080_0000`) of the compact format is a
+/// SIGN FLAG, not a magnitude bit — the same convention Bitcoin's `nBits` uses
+/// and the one `bloch_sis_pow::try_bits_to_target` already enforces. This
+/// decoder used to fold that flag straight into the mantissa's numeric value
+/// (masking with `0x00ff_ffff` instead of `0x007f_ffff`), so a `bits` word with
+/// the flag set decoded to a spuriously large-but-"valid" target here instead
+/// of being rejected. That mattered because `Block::validate_pow`'s SHA-256d
+/// arm (Genesis-2 / Genesis-3) calls THIS function, while `pow::work_from_bits`
+/// (which scores the block's contribution to `blue_work`) always calls the
+/// crate-level `bloch_sis_pow::bits_to_target`, which already maps a
+/// sign-flagged `bits` to `Target::MIN` (all-zero, "impossible"). A block with
+/// a sign-flagged `bits` could therefore pass validation here against a real,
+/// non-null target, then be re-scored downstream as `work_from_bits ==
+/// u128::MAX` — enough to overflow the `blue_work` accumulator in GhostDAG's
+/// `add_block` and panic every node under `overflow-checks=true`.
+///
+/// Fail closed instead: a sign-flagged (or zero-mantissa — already the
+/// pre-existing, unchanged behaviour below) `bits` decodes to the all-zero
+/// target, exactly like the crate decoder, so `hash_meets_target` can never
+/// pass for it and `validate_pow` rejects the block outright, before it ever
+/// reaches `add_block`/`work_from_bits`.
+///
+/// PARITY (Legacy C-1): every block ever mined and accepted on Genesis-2 /
+/// Genesis-3 was produced and validated by a binary that would have PANICKED
+/// on a sign-flagged `bits` (the overflow above) rather than recorded it, so
+/// no historical block can carry one — rejecting it now cannot invalidate
+/// anything that was ever actually valid.
 pub fn bits_to_target(bits: u32) -> [u8; 32] {
-    let exp  = (bits >> 24) as usize;
-    let mant = bits & 0x00ff_ffff;
+    let exp = (bits >> 24) as usize;
+    // Mask out bit 23 (the sign flag) rather than folding it into the
+    // mantissa's magnitude. For every `bits` value where the flag is unset
+    // this is byte-identical to the old `0x00ff_ffff` mask, so no
+    // historically-valid `bits` decodes differently.
+    let mant = bits & 0x007f_ffff;
     let mut t = [0u8; 32];
+    // Sign-flagged `bits` is not a representable target at all: fail closed
+    // to the impossible (all-zero) target instead of treating the flag as
+    // extra mantissa magnitude.
+    if (bits & 0x0080_0000) != 0 {
+        return t;
+    }
     if (3..=32).contains(&exp) {
         let s = 32 - exp;
         t[s]                               = ((mant >> 16) & 0xff) as u8;
@@ -2453,6 +2616,60 @@ pub fn bits_to_target(bits: u32) -> [u8; 32] {
         if s + 2 < 32 { t[s + 2] = (mant & 0xff) as u8; }
     }
     t
+}
+
+#[cfg(test)]
+mod bits_to_target_sign_bit_tests {
+    use super::*;
+
+    /// Legacy C-1 regression: a sign-flagged compact `bits` (0x0080_0000 set)
+    /// must decode to the all-zero (impossible) target, not to a real target
+    /// built from the flag bit folded into the mantissa. Before the fix,
+    /// `0x1D80FFFF` decoded to a non-zero target (mantissa 0xFFFFFF wrongly
+    /// including the flag), which — combined with `pow::work_from_bits`
+    /// (routed through the crate decoder, which already maps this bits value
+    /// to `Target::MIN`) — let a block validate here yet score as
+    /// `u128::MAX` work downstream, overflowing `blue_work`. Reverting the
+    /// fix (restoring the `0x00ff_ffff` mask and dropping the sign check)
+    /// makes this test fail.
+    #[test]
+    fn sign_flagged_bits_decode_to_impossible_target() {
+        // 0x1D80FFFF: exponent 0x1D (=29, in-range), mantissa bits
+        // 0x80FFFF — bit 23 (0x800000) of that IS the sign flag.
+        let target = bits_to_target(0x1D80_FFFF);
+        assert_eq!(target, [0u8; 32],
+            "sign-flagged bits must decode to the impossible (all-zero) target");
+        // The impossible target can never be met by any real hash: a hash
+        // with a single low-order 1 bit (the "easiest" non-zero hash) still
+        // fails against an all-zero target.
+        let mut near_zero_hash = [0u8; 32];
+        near_zero_hash[31] = 1;
+        assert!(!hash_meets_target(&near_zero_hash, &target));
+        // Even the all-zero hash only TIES the all-zero target (every byte
+        // equal), which `hash_meets_target`'s `<=` fold treats as "meets" —
+        // that is an intentional, harmless edge case (no real SHA-256d
+        // preimage of an 80-byte header is the all-zero hash), not a way to
+        // mine against the impossible target with a chosen non-zero hash.
+    }
+
+    /// The same exponent/mantissa bit pattern WITHOUT the sign flag must keep
+    /// decoding exactly as before — this fix must not change any
+    /// historically-valid `bits` value's target.
+    #[test]
+    fn unflagged_bits_unaffected_by_the_sign_check() {
+        // 0x1D00FFFF is the historical Genesis-2/3 pow-limit-style bits
+        // (exponent 0x1D, mantissa 0x00FFFF, no sign flag) — must still
+        // decode to a non-zero target exactly as before this fix.
+        let target = bits_to_target(0x1D00_FFFF);
+        assert_ne!(target, [0u8; 32],
+            "an ordinary historical bits value must still decode to a real target");
+        // And every other historical-style bits value used elsewhere in this
+        // module (diff-1, and a harder mid-chain value) round-trips too.
+        for &bits in &[0x1d00ffff_u32, 0x1c3acb93, 0x1e00ffff] {
+            assert_ne!(bits_to_target(bits), [0u8; 32],
+                "historical-style bits={:#x} must not be treated as invalid", bits);
+        }
+    }
 }
 
 pub fn hash_meets_target(hash: &[u8; 32], target: &[u8; 32]) -> bool {
@@ -2835,7 +3052,18 @@ mod sf1_tests {
         // pow_solution, so validate_pow routes to the Sha256d arm.
         let mut blk = create_genesis2_block(&[0u8; 20]);
         blk.height = 5_600; // a post-activation height (rehearsal semantics)
-        blk.header.bits = 0x20ff_ffff; // easy parent target → no mining needed
+        // Legacy C-1: `0x20ff_ffff` has the compact-format sign flag (bit 23
+        // of the mantissa) SET. `bits_to_target` used to fold that flag into
+        // the mantissa's magnitude, decoding it to a target covering nearly
+        // the whole hash space (any parent header validated unconditionally
+        // — the "no mining needed" this comment used to promise). Now that
+        // the sign flag is correctly rejected (mapping to the impossible,
+        // all-zero target instead — the fix this file's tests exist to
+        // pin), `0x2000_ffff`'s largest LEGAL sibling is `0x207f_ffff`
+        // (mantissa 0x7fffff, the largest without the flag) — which covers
+        // only about half of all hashes, so the parent header's nonce is
+        // ground below instead of assumed free.
+        blk.header.bits = 0x207f_ffff; // largest legal (non-sign-flagged) parent target
         let aux_hash = blk.block_hash(); // the REAL Bloch block identity
 
         // POOL: embed the merge-mining commitment in the parent Bitcoin coinbase.
@@ -2845,11 +3073,26 @@ mod sf1_tests {
         let coinbase_txid = dsha(&coinbase);
         // Single-tx parent: merkle root == coinbase txid, empty branch.
         assert!(coinbase_merkle_branch(&[coinbase_txid], 0).is_empty());
+        // Grind the parent header's nonce until its SHA-256d PoW meets
+        // `blk.header.bits`'s target (little-endian convention) — see the
+        // comment on `blk.header.bits` above for why this is no longer free.
+        let parent_target = bits_to_target(blk.header.bits);
         let mut parent_header = [0u8; 80];
-        parent_header[0..4].copy_from_slice(&2i32.to_le_bytes()); // version
-        parent_header[36..68].copy_from_slice(&coinbase_txid); // merkle root
-        parent_header[68..72].copy_from_slice(&1_700_000_000u32.to_le_bytes()); // time
-        parent_header[72..76].copy_from_slice(&0x20ff_ffffu32.to_le_bytes()); // bits
+        let mut found = false;
+        for nonce in 0u32..10_000 {
+            parent_header[0..4].copy_from_slice(&2i32.to_le_bytes()); // version
+            parent_header[36..68].copy_from_slice(&coinbase_txid); // merkle root
+            parent_header[68..72].copy_from_slice(&1_700_000_000u32.to_le_bytes()); // time
+            parent_header[72..76].copy_from_slice(&blk.header.bits.to_le_bytes());
+            parent_header[76..80].copy_from_slice(&nonce.to_le_bytes());
+            let mut le_pow = dsha(&parent_header);
+            le_pow.reverse();
+            if hash_meets_target(&le_pow, &parent_target) {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "could not grind a parent header meeting the target within 10_000 nonces");
 
         let aux = AuxPow {
             parent_header: parent_header.to_vec(),

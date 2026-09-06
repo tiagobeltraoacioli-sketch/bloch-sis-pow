@@ -242,9 +242,18 @@ pub fn compute_reorg_plan(
 ///
 /// # Errors
 ///
-/// Returns Err only if `put_undo_data` fails. Individual UTXO writes use
-/// `let _ =` to stay best-effort consistent with accept_block's semantics
-/// (errors there are logged but don't abort the block).
+/// SECURITY (Legacy L-1): every write below used to be `let _ =` — a RocksDB
+/// error (disk full, I/O failure, corruption) was silently swallowed, and
+/// the function returned `Ok(())` as if the block had been fully applied
+/// even when some of its UTXO mutations never happened. Since this function
+/// is NOT atomic across its own writes (that is Legacy M-7, tracked
+/// separately — see `ReorgBatch` below for the atomic alternative used by
+/// reorg), silently continuing past a failed write already risked a
+/// half-applied block; silently RETURNING SUCCESS on top of that hid the
+/// failure from every caller, including the startup/health checks that
+/// might otherwise have caught it. Every write now propagates its error
+/// immediately (fail closed, stop at the first failure) instead of being
+/// discarded.
 pub fn apply_block_utxo_mutations(
     store: &Storage,
     block: &Block,
@@ -255,16 +264,22 @@ pub fn apply_block_utxo_mutations(
     for tx in &block.transactions {
         let txid = tx.txid();
 
-        let _ = store.put_tx_index(&txid, &block_hash, block.height);
+        store.put_tx_index(&txid, &block_hash, block.height)
+            .map_err(|e| format!("apply_block_utxo_mutations: put_tx_index failed for {}: {}",
+                hex::encode(txid), e))?;
         undo.tx_index_keys.push(txid);
 
         for (j, out) in tx.outputs.iter().enumerate() {
-            let _ = store.put_utxo(&txid, j as u32, out);
+            store.put_utxo(&txid, j as u32, out)
+                .map_err(|e| format!("apply_block_utxo_mutations: put_utxo failed for {}:{}: {}",
+                    hex::encode(txid), j, e))?;
             undo.created_utxo_keys.push((txid, j as u32));
         }
 
         if tx.is_coinbase() {
-            let _ = store.put_coinbase_info(&txid, block.height);
+            store.put_coinbase_info(&txid, block.height)
+                .map_err(|e| format!("apply_block_utxo_mutations: put_coinbase_info failed for {}: {}",
+                    hex::encode(txid), e))?;
             undo.coinbase_txids.push(txid);
         } else {
             for inp in &tx.inputs {
@@ -276,7 +291,9 @@ pub fn apply_block_utxo_mutations(
                         output,
                     });
                 }
-                let _ = store.delete_utxo(&inp.prev_txid, inp.prev_index);
+                store.delete_utxo(&inp.prev_txid, inp.prev_index)
+                    .map_err(|e| format!("apply_block_utxo_mutations: delete_utxo failed for {}:{}: {}",
+                        hex::encode(inp.prev_txid), inp.prev_index, e))?;
             }
         }
     }
@@ -983,6 +1000,32 @@ mod reorg_hardening_unit_tests {
                 name,
             );
         }
+    }
+
+    /// Legacy L-1 regression: every write inside `apply_block_utxo_mutations`
+    /// must propagate ITS OWN error, not just the final `put_undo_data`
+    /// call. A read-only-opened store rejects every mutating call
+    /// deterministically, so `put_tx_index` (the FIRST write in the loop)
+    /// fails before `put_undo_data` is ever reached. Under the old
+    /// `let _ =`-everywhere code, EVERY earlier failure was silently
+    /// swallowed and the function only ever surfaced `put_undo_data`'s own
+    /// failure — so this error message would never mention `put_tx_index`.
+    /// Reverting the fix makes this test fail (the message would only ever
+    /// contain "put_undo_data failed", never "put_tx_index failed").
+    #[test]
+    fn apply_block_utxo_mutations_propagates_the_first_failing_write() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("db");
+        { let _ = Storage::open(&db_path).unwrap(); } // create the CFs once, then drop the handle
+        let ro_store = Storage::open_read_only(&db_path).unwrap();
+
+        let cb = mk_coinbase(0xAA, 1_000, 1, 0);
+        let block = mk_block_at(1, 0, vec![cb]);
+
+        let err = apply_block_utxo_mutations(&ro_store, &block)
+            .expect_err("every write must fail against a read-only store");
+        assert!(err.contains("put_tx_index failed"),
+            "expected the FIRST failing write (put_tx_index) to be named in the error, got: {err}");
     }
 
     /// Depth cap regression: a plan rolling back MAX_REORG_DEPTH + 1 blocks

@@ -80,6 +80,11 @@ pub struct TemplateContext {
     pub store:        Arc<crate::storage::Storage>,
     pub mempool:      Arc<crate::mempool::Mempool>,
     pub coinbase_tag: String,
+    /// Legacy M-12: shared password `mining.authorize` requires in its
+    /// `[username, password]` params, compared constant-time. `None`
+    /// (default) preserves the historical behaviour: any password (or
+    /// none) is accepted for a syntactically valid `username` address.
+    pub stratum_password: Option<String>,
 }
 
 /// Stratum operating mode. Solo pays 100% of found blocks to the
