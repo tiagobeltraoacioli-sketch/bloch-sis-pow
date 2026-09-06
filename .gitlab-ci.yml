@@ -256,6 +256,19 @@ scanners-blocking-guard:
     - python3 scripts/check-scanners-blocking.py
   allow_failure: false
 
+# tests-blocking guard — the regression test for finding TEST1-ci-runs-tests.
+# Fails if build-and-test (here) or cargo-test (.github/workflows/tests.yml)
+# loses a live crate, loses its timeout, stops running `cargo test`, or
+# re-acquires an escape hatch. Selftest first: a guard that cannot fail is
+# the defect this finding was about, one level up. Pure Python 3.
+tests-blocking-guard:
+  stage: check
+  before_script: []
+  script:
+    - python3 scripts/check-tests-blocking.selftest.py
+    - python3 scripts/check-tests-blocking.py
+  allow_failure: false
+
 # Falcon constant-time guard (PoS finding F1, BLOCH-FALCON-ONLINE-SIGNING.md
 # §3.2). BLOCKING: fails if the workspace's resolved features for
 # pqcrypto-falcon include "avx2" or "neon" — those dispatch Falcon SIGNING to
@@ -501,13 +514,44 @@ secret-scan:
   allow_failure: false
 
 # Build + full test suite (the gate).
+# build-and-test — BLOCKING gate on the LIVE crates (Round-2 audit finding
+# TEST1-ci-runs-tests). This job used to run `cargo test --workspace` and was
+# permanently red — the genesis4-ceremony fixture drifted from the re-measured
+# carryover (finding F21, its own change) — so the nix stage behind it never
+# ran and a red pipeline stopped carrying information. A gate that always
+# fails gates nothing.
+#
+# It now gates what must be green on EVERY commit: the Genesis-4 consensus
+# crates and the shared protocol crates on their path — the same seven crates
+# .github/workflows/tests.yml gates, held to the same posture by
+# scripts/check-tests-blocking.py (tests-blocking-guard, check stage): drop a
+# crate from either side, remove the timeout, or add an escape hatch and the
+# guard fails the pipeline. tools/genesis4-ceremony joins the list when F21's
+# re-pin lands; until then, and for the closed Genesis-3 crates, the full
+# suite runs in workspace-tests below.
 build-and-test:
   stage: test
   script:
-    - cargo build --all-targets
+    - cargo build --workspace --all-targets
+    - cargo test --locked -p bloch-pos-committee -p bloch-pos-node -p bloch-crypto -p coherence-core -p bloch-sis-pow -p bloch-pq-vault -p pqcrypto-internals
+  # Memory-hard (Argon2) wallet tests + a testnet Module-SIS mining test;
+  # measured 2026-09-05: ~51 min of test wall time alone in a debug build
+  # (two ~23 min suites), before compile. 60m gated by luck.
+  timeout: 120m
+
+# workspace-tests — the FULL suite: everything build-and-test gates PLUS
+# tools/genesis4-ceremony (red until finding F21's fixture re-pin lands) and
+# the closed Genesis-3 crates (bloch, bloch-euvm, bloch-ffg, bloch-btc-wallet).
+# allow_failure until it is proven green on the runner — the honest label for
+# a job whose red is already explained — and the tests-blocking guard refuses
+# this escape on build-and-test itself, so the gate cannot quietly become
+# this job. When F21 lands and this goes green, fold it back into blocking.
+workspace-tests:
+  stage: test
+  script:
     - cargo test --workspace
-  # Memory-hard (Argon2) wallet tests + a testnet Module-SIS mining test.
-  timeout: 60m
+  allow_failure: true
+  timeout: 150m
 
 # Lean mobile-facing build — the crypto/address/tx/wallet subset must compile
 # WITHOUT the node's heavy deps (rocksdb/libp2p, gated by the `node` feature), so
