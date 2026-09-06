@@ -136,6 +136,30 @@ pub const TX_FLAT_GAS: u64 = 5_000;
 /// (`BLOCH-POS-SHA3-LATTICE-MIGRATION.md` §6.5).
 pub const HYBRID_SIG_BYTES: u64 = 4_589;
 
+/// How far a transfer's declared `tx_bytes` may sit ABOVE its own canonical
+/// encoding once `params::TX_BYTES_BOUND_ACTIVATION_EPOCH` binds (audit
+/// H-R7-2, 2026-09-05).
+///
+/// Why any slack at all: `tx_bytes` sits INSIDE the spend signing root, so a
+/// wallet must fix it BEFORE the signatures exist — and Falcon-1024
+/// signatures are variable-length, so the exact encoded size is unknowable at
+/// signing time. Zero slack would make honest signing a guessing game whose
+/// wrong guesses are `UnderdeclaredSize` refusals after the fee was already
+/// planned. One hybrid signature's worth is generous cover for that variance
+/// plus the CLI's default envelope (`submit-tx`, main.rs: 1,024 bytes plus a
+/// per-input margin).
+///
+/// Why not MORE: the declared size is what the block byte cap counts
+/// (`transition.rs` step 10b sums `charge.tx_bytes`, never wire length), so
+/// every byte of over-declaration is block capacity a transaction consumes
+/// without carrying. Unbounded, one small transaction could declare a whole
+/// block's worth (`MAX_BLOCK_TX_BYTES_V2` clears `MAX_TX_GAS` by
+/// construction — see the const assert below it) and censor every honest
+/// transaction behind it for the price of its own fee — the H-R7-2 shape.
+/// Bounded to one signature, a proposer must carry ~real bytes to fill the
+/// cap.
+pub const TX_BYTES_DECLARE_SLACK: u64 = HYBRID_SIG_BYTES;
+
 /// Measured cost of one hybrid verification: 7,274,849 RV32IM instructions
 /// (`spikes/prover-cost/RESULTS.md`, 2026-08-10, PQClean verifiers).
 pub const HYBRID_VERIFY_INSTRUCTIONS: u64 = 7_274_849;

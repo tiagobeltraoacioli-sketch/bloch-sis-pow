@@ -2473,6 +2473,22 @@ impl CommittedState {
         forced || epoch >= crate::params::EXIT_AUTH_ACTIVATION_EPOCH
     }
 
+    /// Is the declared-size ceiling (`TransferReject::OverdeclaredSize`)
+    /// active in `epoch`? One reader for the two arms that enforce it
+    /// (`apply_transfer`, `apply_transfer_v2`), so V1 and V2 can never drift
+    /// into different eras. `epoch` is the caller's `self.epoch`: committed
+    /// state rolled to the judged block's own `epoch_of(header.slot)`, never
+    /// a clock. Ships inert — `params::TX_BYTES_BOUND_ACTIVATION_EPOCH` is
+    /// `u64::MAX` — and the rehearsal switch exists so the ceiling's tests
+    /// are not dead code until the founder arms it.
+    fn tx_bytes_bound_active(epoch: u64) -> bool {
+        #[cfg(test)]
+        let forced = crate::params::rehearsal::tx_bytes_bound_forced_open();
+        #[cfg(not(test))]
+        let forced = false;
+        forced || epoch >= crate::params::TX_BYTES_BOUND_ACTIVATION_EPOCH
+    }
+
     fn apply_transaction(
         &mut self,
         tx: &PosTransaction,
@@ -2890,8 +2906,20 @@ impl CommittedState {
         // The declared size must cover the transaction's own bytes: it is what
         // the market charges and what the block's byte cap counts, and the
         // witnesses are the bulk of a PQ-signed transfer.
-        if *tx_bytes < tx.canonical_bytes().len() as u64 {
+        let encoded_len = tx.canonical_bytes().len() as u64;
+        if *tx_bytes < encoded_len {
             return Err(TransferReject::UnderdeclaredSize);
+        }
+        // ...and must not sit far ABOVE them either, once the flag day binds
+        // (audit H-R7-2): the byte cap counts declared sizes, so an unbounded
+        // declaration lets one small transfer fill a whole block's byte
+        // budget and crowd every honest transaction out. Gated — inert today
+        // — because it tightens transfer validity; see
+        // `params::TX_BYTES_BOUND_ACTIVATION_EPOCH`.
+        if Self::tx_bytes_bound_active(self.epoch)
+            && *tx_bytes > encoded_len.saturating_add(fee_market::TX_BYTES_DECLARE_SLACK)
+        {
+            return Err(TransferReject::OverdeclaredSize);
         }
 
         // The class term is the *actual* input count, not a number the
@@ -3075,8 +3103,17 @@ impl CommittedState {
         }
         // Same floor as V1, against THIS encoding's own length — the table is
         // most of a real transfer's bytes and must be paid for and counted.
-        if *tx_bytes < tx.canonical_bytes().len() as u64 {
+        let encoded_len = tx.canonical_bytes().len() as u64;
+        if *tx_bytes < encoded_len {
             return Err(TransferReject::UnderdeclaredSize);
+        }
+        // Same ceiling as V1, same gate, same reason (audit H-R7-2): the
+        // block byte cap counts the declared size, and a declaration no
+        // encoding backs is block capacity consumed without being carried.
+        if Self::tx_bytes_bound_active(self.epoch)
+            && *tx_bytes > encoded_len.saturating_add(fee_market::TX_BYTES_DECLARE_SLACK)
+        {
+            return Err(TransferReject::OverdeclaredSize);
         }
 
         // The class term is the TABLE length — see the charge below. Fixed
@@ -8407,6 +8444,128 @@ mod tests {
         assert_eq!(
             probe.apply_transfer(&tx, g.next_base_fee(), &ToyVerifier),
             Err(TransferReject::UnderdeclaredSize),
+        );
+    }
+
+    // -- TX_BYTES_BOUND_ACTIVATION_EPOCH (audit H-R7-2) -----------------------
+
+    /// TRIPWIRE. `TX_BYTES_BOUND_ACTIVATION_EPOCH` must stay `u64::MAX` until
+    /// the founder names an epoch: it tightens transfer validity, so the first
+    /// post-gate block splits any fleet that is not already running this rule.
+    /// Whoever arms it deletes this test first, and reads the constant's docs
+    /// while doing so.
+    #[test]
+    fn tx_bytes_bound_gate_is_inert() {
+        assert_eq!(
+            crate::params::TX_BYTES_BOUND_ACTIVATION_EPOCH,
+            u64::MAX,
+            "arming the declared-size ceiling is a flag day; read the constant's docs",
+        );
+    }
+
+    /// The size rule's OTHER direction (audit H-R7-2), both sides of its flag
+    /// day, on the V1 apply path.
+    ///
+    /// The defect: `tx_bytes` had a floor (`UnderdeclaredSize`) but no
+    /// ceiling short of `MAX_TX_GAS` — which a whole block's worth of bytes
+    /// clears by construction — while the block byte cap (step 10b) counts
+    /// the DECLARED size. One small, fully-paid transfer declaring
+    /// `MAX_BLOCK_TX_BYTES_V2` therefore consumed a block's entire byte
+    /// budget while carrying a few KB, censoring every honest transaction
+    /// behind it.
+    ///
+    /// Mutation log (2026-09-05): with the `OverdeclaredSize` check removed
+    /// from `apply_transfer`, the gate-open arm below applies the
+    /// over-declared transfer and the first assertion fails — this test is
+    /// red exactly when the fix is absent. The gate-closed arm is the
+    /// control: it pins today's fleet behaviour (over-declaring is legal and
+    /// merely over-pays), which is what "ships inert" means.
+    #[test]
+    fn a_transfer_cannot_declare_a_blocks_worth_of_bytes_it_does_not_carry() {
+        let owner = owner_key(0x7A);
+        let to = script_of(&owner_key(0x7B));
+        // Funded far past the fee a block-sized declaration charges, so the
+        // verdict below can only come from the size rule.
+        let coins: Vec<_> =
+            (0..4u32).map(|i| opening(0x78, i, 500_000_000_000, &owner)).collect();
+        let (_t, g, _chains) = setup_funded(4, &coins);
+        let price = g.next_base_fee();
+
+        // The honest declaration: the helper raises a zero request to the
+        // encoding's own length, so this measures `encoded_len` exactly.
+        let honest = transfer_spending(&coins, &owner, to, 0, 0, price);
+        let PosTransaction::Transfer { tx_bytes, .. } = &honest else { unreachable!() };
+        let encoded = *tx_bytes;
+        assert_eq!(
+            encoded,
+            honest.canonical_bytes().len() as u64,
+            "fixture premise: the zero-request declaration IS the encoded length"
+        );
+
+        let slack = fee_market::TX_BYTES_DECLARE_SLACK;
+        let over = transfer_spending(&coins, &owner, to, encoded + slack + 1, 0, price);
+        let at_ceiling = transfer_spending(&coins, &owner, to, encoded + slack, 0, price);
+
+        // ── Gate OPEN: one byte past the slack is refused... ───────────────
+        {
+            let _gate = crate::params::rehearsal::tx_bytes_bound_open_guard();
+            assert_eq!(
+                g.clone().apply_transfer(&over, price, &ToyVerifier),
+                Err(TransferReject::OverdeclaredSize),
+                "a declaration past encoded + slack must be refused once the gate binds",
+            );
+            // ...and the ceiling itself is VALID — an off-by-one here would
+            // strand every wallet that budgets exactly one signature of
+            // headroom.
+            assert!(
+                g.clone().apply_transfer(&at_ceiling, price, &ToyVerifier).is_ok(),
+                "encoded + slack exactly must stay legal: the slack exists for wallets \
+                 that must fix tx_bytes before their Falcon signatures exist",
+            );
+        }
+
+        // ── Gate CLOSED (the fleet today): the control must not move ───────
+        assert!(
+            g.clone().apply_transfer(&over, price, &ToyVerifier).is_ok(),
+            "below the flag day an over-declared transfer applies exactly as today — \
+             the ceiling ships inert",
+        );
+    }
+
+    /// The same ceiling on the V2 apply path, through the same gate — one
+    /// reader (`tx_bytes_bound_active`) serves both arms, and this is the
+    /// test that would catch the arms drifting apart. Same mutation
+    /// behaviour as the V1 test above: remove the check from
+    /// `apply_transfer_v2` and the first assertion goes red.
+    #[test]
+    fn the_declared_size_ceiling_holds_on_the_v2_path_too() {
+        let owner = owner_key(0x7C);
+        let to = script_of(&owner_key(0x7D));
+        let coins: Vec<_> =
+            (0..4u32).map(|i| opening(0x79, i, 500_000_000_000, &owner)).collect();
+        let (_t, g, _chains) = setup_funded(4, &coins);
+        let price = g.next_base_fee();
+
+        let honest = transfer_v2_raw(&coins, &[&owner], &[0, 0, 0, 0], to, 0, 0, price);
+        let PosTransaction::TransferV2 { tx_bytes, .. } = &honest else { unreachable!() };
+        let encoded = *tx_bytes;
+        assert_eq!(encoded, honest.canonical_bytes().len() as u64);
+
+        let slack = fee_market::TX_BYTES_DECLARE_SLACK;
+        let over =
+            transfer_v2_raw(&coins, &[&owner], &[0, 0, 0, 0], to, encoded + slack + 1, 0, price);
+
+        {
+            let _gate = crate::params::rehearsal::tx_bytes_bound_open_guard();
+            assert_eq!(
+                g.clone().apply_transfer_v2(&over, price, &ToyVerifier),
+                Err(TransferReject::OverdeclaredSize),
+                "the V2 arm must enforce the same ceiling as V1",
+            );
+        }
+        assert!(
+            g.clone().apply_transfer_v2(&over, price, &ToyVerifier).is_ok(),
+            "below the flag day the V2 control must not move either",
         );
     }
 
