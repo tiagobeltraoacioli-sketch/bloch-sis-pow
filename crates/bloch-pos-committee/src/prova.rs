@@ -28,7 +28,7 @@
 //!   the fleet shrinks its own denominator until that handful is two thirds of
 //!   it, and finalizes alone. Three partitions did it at once, on one epoch,
 //!   under three roots. This is **live in every shipped binary today**, because
-//!   [`crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH`] is `u64::MAX`.
+//!   [`crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH`] is 2700 (armed 2026-09-06); below it the incident arithmetic still runs.
 //! - **Scenarios 1 to 4 are the roster split**, described below. It is a real
 //!   defect, it was fixed on 2026-08-24, and it was **provably inert at the
 //!   time of the incident** — mainnet was at ~epoch 986 and the rule that
@@ -485,7 +485,7 @@ mod tests {
     ///
     /// Nothing in this test touches a mutation switch. **It runs the arithmetic
     /// a shipped binary runs today**, because
-    /// [`crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH`] is `u64::MAX`, so
+    /// [`crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH`] is 2700 (armed); below that epoch
     /// `process_epoch` takes the unfloored `leak_adjusted` branch on every
     /// epoch a real chain can reach. The floor and the leak recovery that
     /// landed on 2026-08-25 are correct and are NOT in force. That is the
@@ -566,8 +566,8 @@ mod tests {
             "INCIDENT (s0): 3 disjoint partitions of 4 of 64 validators (6.25% each) EACH \
              finalized checkpoint epoch {ce} at epoch {e0}, on 3 DIFFERENT roots \
              ({:02x?}, {:02x?}, {:02x?}), after the leak destroyed {:.1}% of network stake. \
-             No mutation switch was touched: this is the arithmetic a shipped binary runs, \
-             because LEAK_RECOVERY_ACTIVATION_EPOCH is u64::MAX.",
+             No mutation switch was touched: this is the arithmetic a shipped binary runs \
+             below epoch 2700 (LEAK_RECOVERY_ACTIVATION_EPOCH, armed 2026-09-06).",
             &roots[0][..2],
             &roots[1][..2],
             &roots[2][..2],
@@ -605,41 +605,44 @@ mod tests {
         println!(
             "CURE (s0): with the floor at {}/{} of the unleaked total in force, all 3 \
              partitions of 4 of 64 failed to finalize in {INCIDENT_HORIZON} epochs. The \
-             floor is GATED INERT in production (LEAK_RECOVERY_ACTIVATION_EPOCH = u64::MAX); \
-             arming it is the founder's decision.",
+             floor binds in production at epoch 2700 (LEAK_RECOVERY_ACTIVATION_EPOCH, \
+             armed by founder decision on 2026-09-06).",
             crate::params::MIN_QUORUM_DENOMINATOR_NUM,
             crate::params::MIN_QUORUM_DENOMINATOR_DEN
         );
     }
 
-    /// **The ratchet is live: the shipped default IS the incident arithmetic.**
+    /// **The flag day is set: the floor and the leak recovery bind at 2700.**
     ///
-    /// Scenario 0 above proves it behaviourally. This states it as a fact about
-    /// the constant, so that the day somebody arms the flag day, exactly one
-    /// test tells them that scenario 0 has changed meaning.
+    /// This test fired on 2026-09-06, exactly as designed, when the founder
+    /// armed the gate at epoch 2700. It now states the ARMED fact, so the day
+    /// somebody moves the epoch again (or disarms it), exactly one test tells
+    /// them that scenario 0 has changed meaning a second time.
     ///
-    /// It does NOT assert that the gate should be armed. It asserts that while
-    /// it reads `u64::MAX`, no epoch any chain can reach takes the floored
-    /// branch — which is the difference between "the fix landed" and "the fix
-    /// is in force", and the difference the audit could not settle.
+    /// Meaning today: BELOW epoch 2700 the shipped arithmetic is unchanged —
+    /// `s0_three_partitions_finalize_three_different_roots_at_the_same_epoch`
+    /// still describes what a shipped binary does before the flag day. AT AND
+    /// AFTER 2700 the floored branch is live, and the cure test
+    /// (`s0_cure_the_denominator_floor_stops_all_three_partitions`) describes
+    /// the arithmetic instead. The settlement guarantee in
+    /// docs/post-mortems/2026-08-24-finality-divergence.md must be read with
+    /// the armed epoch in mind before telling an integrator anything about
+    /// finality.
     #[test]
-    fn the_quorum_floor_is_shipped_but_not_in_force() {
+    fn the_quorum_floor_binds_at_epoch_2700() {
         assert_eq!(
             crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH,
-            u64::MAX,
-            "LEAK_RECOVERY_ACTIVATION_EPOCH has been armed. The denominator floor and the \
-             leak recovery are now in force from that epoch, so \
-             `s0_three_partitions_finalize_three_different_roots_at_the_same_epoch` no \
-             longer describes what a shipped binary does after it. Re-read both scenario 0 \
-             tests, and re-read the settlement guarantee in \
-             docs/post-mortems/2026-08-24-finality-divergence.md before telling an \
-             integrator anything about finality."
+            2_700,
+            "LEAK_RECOVERY_ACTIVATION_EPOCH moved again. Whoever changed it: scenario 0's \
+             two tests change meaning at this boundary, and the fleet must run the new \
+             binary BEFORE the armed epoch or it splits. Re-read both scenario 0 tests and \
+             docs/post-mortems/2026-08-24-finality-divergence.md, and update this test to \
+             the new value only as part of a coordinated flag-day decision."
         );
         println!(
-            "RATCHET: LEAK_RECOVERY_ACTIVATION_EPOCH = u64::MAX. The floor \
-             ({}/{}) and the leak recovery are compiled in and UNREACHABLE; every epoch a \
-             real chain can reach takes the unfloored, leak-adjusted denominator — the \
-             arithmetic of 2026-08-24.",
+            "RATCHET: LEAK_RECOVERY_ACTIVATION_EPOCH = 2700 (armed 2026-09-06). Below \
+             2700 the unfloored, leak-adjusted denominator of 2026-08-24 still runs; at \
+             and after 2700 the floor ({}/{}) and the leak recovery are in force.",
             crate::params::MIN_QUORUM_DENOMINATOR_NUM,
             crate::params::MIN_QUORUM_DENOMINATOR_DEN
         );

@@ -10380,9 +10380,11 @@ mod tests {
     /// write-off that never fired.
     #[test]
     fn the_replay_compatibility_gates_are_inert_until_armed() {
+        // LEAK_RECOVERY_ACTIVATION_EPOCH left this list on 2026-09-06, when it
+        // was armed at 2700 — see `leak_recovery_armed_epoch_matches_the_runbook`
+        // below, which took over its tripwire duty in the armed form.
         for (name, value) in [
             ("ANCESTRY_SEED_ACTIVATION_EPOCH", crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH),
-            ("LEAK_RECOVERY_ACTIVATION_EPOCH", crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH),
         ] {
             assert_eq!(
                 value,
@@ -10395,6 +10397,25 @@ mod tests {
                  versioned in docs/. Update this test in the same commit that arms it."
             );
         }
+    }
+
+    /// Armed on 2026-09-06 at epoch 2700 (founder decision; chain was at
+    /// ~epoch 2075, ≈6 days of lead for the coordinated fleet rollout).
+    ///
+    /// Until then this constant sat in
+    /// `the_replay_compatibility_gates_are_inert_until_armed` pinned at
+    /// `u64::MAX`. Arming flips the tripwire's job, not its nature — exactly as
+    /// `leaked_roster_armed_epoch_matches_the_runbook` above: it now guards
+    /// against a SECOND silent change of the epoch, which would be a new flag
+    /// day needing its own fleet rollout, announcement and runbook. The value
+    /// here must equal the one recorded in `docs/LEAK-RECOVERY-FLAG-DAY.md`.
+    #[test]
+    fn leak_recovery_armed_epoch_matches_the_runbook() {
+        assert_eq!(
+            crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH,
+            2_700,
+            "the armed epoch must match docs/LEAK-RECOVERY-FLAG-DAY.md; changing it again is a new flag day"
+        );
     }
 
     /// Below its flag day, `seed_for_epoch` must be the ORIGINAL rule, mix of

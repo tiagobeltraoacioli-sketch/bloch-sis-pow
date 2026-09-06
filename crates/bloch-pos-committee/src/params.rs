@@ -11,8 +11,8 @@
 //! below are bound, not inert: `LEAKED_ROSTER_ACTIVATION_EPOCH` (1400),
 //! `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` (800) and
 //! `BLOCK_BYTES_V2_ACTIVATION_EPOCH` (800) are all epochs the chain is past.
-//! `ANCESTRY_SEED_ACTIVATION_EPOCH` and `LEAK_RECOVERY_ACTIVATION_EPOCH` are
-//! the ones still at `u64::MAX`.
+//! `LEAK_RECOVERY_ACTIVATION_EPOCH` is armed at 2700 (2026-09-06);
+//! `ANCESTRY_SEED_ACTIVATION_EPOCH` is the one still at `u64::MAX`.
 //!
 //! Until 2026-09-02 this header said nothing here was active and that the
 //! crate held no activation height at all because it was not wired into the
@@ -846,8 +846,17 @@ pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// that never leaked, so blocks before the first bite replay unchanged and the
 /// break point is the first epoch boundary that accrues one.
 ///
-/// `u64::MAX` means INERT. Same arming rules as above.
-pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = u64::MAX;
+/// **ARMED at epoch 2700** (founder decision, 2026-09-06; ≈2026-09-12 wall
+/// clock at 90 epochs/day from epoch ~2070). Below 2700 the shipped arithmetic
+/// is unchanged — the unfloored, leak-adjusted denominator of the 2026-08-24
+/// incident. At and after 2700 the denominator floor and the leak recovery are
+/// in force.
+///
+/// DEPLOYMENT DEADLINE: every validator must run a binary carrying this value
+/// BEFORE epoch 2700. A fleet split across old/new binaries at that boundary
+/// diverges — this is a flag day, and the coordinated rebuild is the
+/// operational half of the decision.
+pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = 2_700;
 
 /// Flag day for **unfunded bonding**: the epoch at and after which the legacy
 /// `Deposit` and `Delegate` messages are valid. Below it they are refused by

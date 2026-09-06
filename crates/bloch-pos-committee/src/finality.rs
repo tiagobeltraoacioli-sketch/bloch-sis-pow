@@ -69,8 +69,8 @@
 //! heard different subsets hold different denominators, so "two disjoint 2/3
 //! quorums out of one total" never has to happen — each side is a 2/3 quorum
 //! out of its OWN, smaller total. With no floor on that denominator (which is
-//! the shipped configuration: `params::LEAK_RECOVERY_ACTIVATION_EPOCH` is
-//! `u64::MAX`) a set of any size finalizes alone once the stall is long enough:
+//! the shipped configuration BELOW epoch 2700; the gate was armed at 2700 on
+//! 2026-09-06) a set of any size finalizes alone once the stall is long enough:
 //! one node needs 28 epochs, four need 25.
 //!
 //! That is not a hypothetical — it is the 2026-08-24 incident, three nodes
