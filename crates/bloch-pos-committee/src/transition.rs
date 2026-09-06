@@ -2473,6 +2473,44 @@ impl CommittedState {
         forced || epoch >= crate::params::EXIT_AUTH_ACTIVATION_EPOCH
     }
 
+    /// Is the transfer dust rule active in `epoch`? Same shape as the two
+    /// gates above: `epoch` is the caller's `self.epoch` — committed state
+    /// rolled to the judged block's own `epoch_of(header.slot)`, never a
+    /// clock (the 2026-08-08 `expected_bits` fork is the standing reason).
+    /// Inert today: `DUST_RULE_ACTIVATION_EPOCH` is `u64::MAX`, arming it is
+    /// a founder decision.
+    fn dust_rule_active(epoch: u64) -> bool {
+        #[cfg(test)]
+        let forced = crate::params::rehearsal::dust_gate_forced_open();
+        #[cfg(not(test))]
+        let forced = false;
+        forced || epoch >= crate::params::DUST_RULE_ACTIVATION_EPOCH
+    }
+
+    /// H-R7-3, the consensus half: refuse outputs below
+    /// [`crate::params::MIN_TRANSFER_OUTPUT_SAT`] (zero included) and more
+    /// than [`crate::params::MAX_TRANSFER_OUTPUTS`] outputs per transfer.
+    /// One checker called by BOTH transfer formats, so the two arms cannot
+    /// drift; count first, then values, cheapest-first like everything else
+    /// in the frozen check order. Behind [`Self::dust_rule_active`] because
+    /// both refusals change the verdict on bodies that are valid today —
+    /// pre-activation this function refuses nothing.
+    fn check_transfer_outputs(
+        epoch: u64,
+        outputs: &[TransferOutput],
+    ) -> Result<(), TransferReject> {
+        if !Self::dust_rule_active(epoch) {
+            return Ok(());
+        }
+        if outputs.len() > crate::params::MAX_TRANSFER_OUTPUTS {
+            return Err(TransferReject::TooManyOutputs);
+        }
+        if outputs.iter().any(|o| o.value < crate::params::MIN_TRANSFER_OUTPUT_SAT) {
+            return Err(TransferReject::DustOutput);
+        }
+        Ok(())
+    }
+
     fn apply_transaction(
         &mut self,
         tx: &PosTransaction,
@@ -2893,6 +2931,10 @@ impl CommittedState {
         if *tx_bytes < tx.canonical_bytes().len() as u64 {
             return Err(TransferReject::UnderdeclaredSize);
         }
+        // H-R7-3: dust/zero-value outputs and the output-count cap — free
+        // arithmetic, placed with the structural rules. Inert until the
+        // dust flag day binds (`DUST_RULE_ACTIVATION_EPOCH`, u64::MAX).
+        Self::check_transfer_outputs(self.epoch, outputs)?;
 
         // The class term is the *actual* input count, not a number the
         // transaction asserts: gas buys node CPU, and one hybrid verification
@@ -3078,6 +3120,10 @@ impl CommittedState {
         if *tx_bytes < tx.canonical_bytes().len() as u64 {
             return Err(TransferReject::UnderdeclaredSize);
         }
+        // H-R7-3: the same dust/output-count rule as V1, from the same
+        // checker, behind the same flag day — a bound on one encoding of a
+        // transfer is not a bound on the transfer.
+        Self::check_transfer_outputs(self.epoch, outputs)?;
 
         // The class term is the TABLE length — see the charge below. Fixed
         // here because the gas ceiling is checked before anything is priced.
@@ -8407,6 +8453,181 @@ mod tests {
         assert_eq!(
             probe.apply_transfer(&tx, g.next_base_fee(), &ToyVerifier),
             Err(TransferReject::UnderdeclaredSize),
+        );
+    }
+
+    /// **H-R7-3: dust and zero-value outputs are refused once the rule
+    /// binds.** Every output is a permanent `EutxoEntry` on every node;
+    /// without a floor, ~37.7M zero-value entries/day cost ~2.4 BLCH and
+    /// grow boot time and memory forever.
+    ///
+    /// Gate forced open (`dust_gate_open_guard`): the rule ships INERT
+    /// behind `DUST_RULE_ACTIVATION_EPOCH = u64::MAX` — see
+    /// `dust_rule_is_inert` for the other half.
+    ///
+    /// Mutation (run 2026-09-05, observed): neuter `check_transfer_outputs`
+    /// (unconditional `Ok`) — this test, the count-cap test and the V2 test
+    /// all die while `dust_rule_is_inert` survives.
+    #[test]
+    fn dust_and_zero_value_outputs_are_refused_once_the_rule_binds() {
+        let _gate = crate::params::rehearsal::dust_gate_open_guard();
+        let owner = owner_key(0x51);
+        let coin = opening(0x91, 0, 1_000_000_000_000_000, &owner);
+        let (_t, g, _chains) = setup_funded(4, std::slice::from_ref(&coin));
+        let price = g.next_base_fee();
+        let to = script_of(&owner_key(0x52));
+
+        for dust in [0u64, 1, crate::params::MIN_TRANSFER_OUTPUT_SAT - 1] {
+            // Declared bytes inflated well past the encoding so adding an
+            // output cannot trip the size floor ("declaring more than you
+            // use is allowed — you simply pay for it"); value moved from the
+            // change output so conservation still holds; then re-signed, so
+            // the verdict is the dust rule and not a stale witness.
+            let mut tx =
+                transfer_spending(std::slice::from_ref(&coin), &owner, to, 20_000, 0, price);
+            if let PosTransaction::Transfer { outputs, .. } = &mut tx {
+                outputs[0].value -= dust;
+                outputs.push(TransferOutput { value: dust, script_hash: to });
+            }
+            resign(&mut tx, &owner);
+            assert_eq!(
+                g.clone().apply_transfer(&tx, price, &ToyVerifier),
+                Err(TransferReject::DustOutput),
+                "an output of {dust} sat must be refused as dust once the rule binds"
+            );
+        }
+
+        // The boundary: exactly the minimum is not dust. The same shape,
+        // at the floor, applies — so the cases above fail for the rule and
+        // not for the shape.
+        let min = crate::params::MIN_TRANSFER_OUTPUT_SAT;
+        let mut tx = transfer_spending(std::slice::from_ref(&coin), &owner, to, 20_000, 0, price);
+        if let PosTransaction::Transfer { outputs, .. } = &mut tx {
+            outputs[0].value -= min;
+            outputs.push(TransferOutput { value: min, script_hash: to });
+        }
+        resign(&mut tx, &owner);
+        assert!(
+            g.clone().apply_transfer(&tx, price, &ToyVerifier).is_ok(),
+            "an output at exactly MIN_TRANSFER_OUTPUT_SAT must still apply"
+        );
+    }
+
+    /// **H-R7-3: the per-transaction output-count cap.** The block byte
+    /// ceiling bounds outputs per block; this bounds what ONE fee-paying
+    /// transaction may add to the permanent set. Every extra output here is
+    /// at the minimum value, so only the count rule can be what refuses the
+    /// over-cap shape — the at-cap control proves it.
+    ///
+    /// Mutation (2026-09-05, observed via the checker neuter): the over-cap
+    /// transfer applies and this test dies on the `TooManyOutputs` assertion.
+    #[test]
+    fn an_output_count_above_the_cap_is_refused_once_the_rule_binds() {
+        let _gate = crate::params::rehearsal::dust_gate_open_guard();
+        let owner = owner_key(0x53);
+        let coin = opening(0x92, 0, 1_000_000_000_000_000, &owner);
+        let (_t, g, _chains) = setup_funded(4, std::slice::from_ref(&coin));
+        let price = g.next_base_fee();
+        let to = script_of(&owner_key(0x54));
+        let min = crate::params::MIN_TRANSFER_OUTPUT_SAT;
+        let cap = crate::params::MAX_TRANSFER_OUTPUTS;
+
+        let with_extras = |n: usize| -> PosTransaction {
+            let mut tx =
+                transfer_spending(std::slice::from_ref(&coin), &owner, to, 40_000, 0, price);
+            if let PosTransaction::Transfer { outputs, .. } = &mut tx {
+                outputs[0].value -= min * n as u64;
+                for _ in 0..n {
+                    outputs.push(TransferOutput { value: min, script_hash: to });
+                }
+            }
+            resign(&mut tx, &owner);
+            tx
+        };
+
+        // cap + 1 outputs in total: refused by the count rule.
+        assert_eq!(
+            g.clone().apply_transfer(&with_extras(cap), price, &ToyVerifier),
+            Err(TransferReject::TooManyOutputs),
+            "{} outputs must exceed the {cap}-output cap",
+            cap + 1
+        );
+        // Exactly at the cap: applies. The control that pins the boundary.
+        assert!(
+            g.clone().apply_transfer(&with_extras(cap - 1), price, &ToyVerifier).is_ok(),
+            "exactly {cap} outputs must still apply"
+        );
+    }
+
+    /// The V2 arm shares the rule from the same checker — a bound on one
+    /// encoding of a transfer is not a bound on the transfer.
+    ///
+    /// Mutation (2026-09-05, observed via the checker neuter): the
+    /// zero-value output applies through the V2 arm and this test dies.
+    #[test]
+    fn v2_shares_the_dust_rule_once_it_binds() {
+        let _gate = crate::params::rehearsal::dust_gate_open_guard();
+        let owner = owner_key(0x55);
+        let coin = opening(0x93, 0, 1_000_000_000_000_000, &owner);
+        let (_t, g, _chains) = setup_funded(4, std::slice::from_ref(&coin));
+        let price = g.next_base_fee();
+        let to = script_of(&owner_key(0x56));
+
+        let mut tx = transfer_v2_raw(
+            std::slice::from_ref(&coin),
+            &[&owner],
+            &[0],
+            to,
+            20_000,
+            0,
+            price,
+        );
+        if let PosTransaction::TransferV2 { outputs, .. } = &mut tx {
+            // A zero-value output: conservation is untouched, only the dust
+            // rule can be what refuses it.
+            outputs.push(TransferOutput { value: 0, script_hash: to });
+        }
+        resign_v2(&mut tx);
+        assert_eq!(
+            g.clone().apply_transfer_v2(&tx, price, &ToyVerifier),
+            Err(TransferReject::DustOutput),
+            "the V2 arm must refuse a zero-value output once the rule binds"
+        );
+    }
+
+    /// **The other half, and the one the fleet runs today: the rule is
+    /// INERT.** `DUST_RULE_ACTIVATION_EPOCH` is `u64::MAX` — arming it is a
+    /// founder decision — and pre-activation a zero-value output still
+    /// APPLIES, because the refusal changes the verdict on bodies that are
+    /// valid today and may already be in the historical log. Referenced by
+    /// the constant's docs as `dust_rule_is_inert`.
+    ///
+    /// Mutation (run 2026-09-05, observed): force `dust_rule_active` to
+    /// `true` — the ungated-consensus-change guard — and this test dies
+    /// while the four gated tests stay green.
+    #[test]
+    fn dust_rule_is_inert() {
+        assert_eq!(
+            crate::params::DUST_RULE_ACTIVATION_EPOCH,
+            u64::MAX,
+            "arming the dust flag day is a founder decision, not a code change"
+        );
+        // NO gate guard here, deliberately: this is the fleet's configuration.
+        let owner = owner_key(0x57);
+        let coin = opening(0x94, 0, 1_000_000_000_000_000, &owner);
+        let (_t, g, _chains) = setup_funded(4, std::slice::from_ref(&coin));
+        let price = g.next_base_fee();
+        let to = script_of(&owner_key(0x58));
+
+        let mut tx = transfer_spending(std::slice::from_ref(&coin), &owner, to, 20_000, 0, price);
+        if let PosTransaction::Transfer { outputs, .. } = &mut tx {
+            outputs.push(TransferOutput { value: 0, script_hash: to });
+        }
+        resign(&mut tx, &owner);
+        assert!(
+            g.clone().apply_transfer(&tx, price, &ToyVerifier).is_ok(),
+            "pre-activation, a zero-value output must still apply — \
+             the consensus half of H-R7-3 must not ship ungated"
         );
     }
 

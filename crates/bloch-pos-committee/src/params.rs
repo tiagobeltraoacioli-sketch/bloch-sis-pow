@@ -685,6 +685,34 @@ pub mod rehearsal {
         Restore(prev)
     }
 
+    thread_local! {
+        static DUST_GATE_OPEN_TL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Test-only: treat [`super::DUST_RULE_ACTIVATION_EPOCH`] as already
+    /// bound. Its own switch, not folded into `GATES_OPEN`, for the
+    /// `exit_auth_gate_forced_open` reason: this gate's inert value keeps
+    /// dust outputs VALID (the fleet's configuration today), so an
+    /// unadorned `cargo test` must exercise exactly that, and tests of the
+    /// post-flag-day refusals opt in.
+    pub fn dust_gate_forced_open() -> bool {
+        DUST_GATE_OPEN_TL.with(|c| c.get())
+    }
+
+    /// Opens the dust gate for this thread until the guard drops, including
+    /// on unwind, so a failing assertion cannot leave the transfer rules
+    /// mutated for the rest of the thread.
+    pub fn dust_gate_open_guard() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                DUST_GATE_OPEN_TL.with(|c| c.set(self.0));
+            }
+        }
+        let prev = DUST_GATE_OPEN_TL.with(|c| c.replace(true));
+        Restore(prev)
+    }
+
     /// Test-only: treat [`super::ANCESTRY_SEED_ACTIVATION_EPOCH`] and
     /// [`super::LEAK_RECOVERY_ACTIVATION_EPOCH`] as if they had already bound.
     ///
@@ -995,6 +1023,53 @@ pub const DEPOSIT_ACTIVATION_EPOCH: u64 = u64::MAX;
 ///
 /// `exit_auth_gate_is_inert` pins the value.
 pub const EXIT_AUTH_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// **Flag day for the transfer dust rule — SHIPS INERT (`u64::MAX`).**
+///
+/// H-R7-3: the transfer arms accept zero-value outputs, outputs of any
+/// value down to 1 sat, and any number of outputs the byte/gas ceilings
+/// permit. Every output becomes a PERMANENT `EutxoEntry` (~76 bytes of
+/// state each) that every node holds in memory and replays at boot, priced
+/// only by the one-time fee on its bytes (~6.4 sat per output at the
+/// floor) — unbounded state growth for negligible cost.
+///
+/// From this epoch the transition refuses, in both transfer formats:
+/// - any output below [`MIN_TRANSFER_OUTPUT_SAT`] (zero included) —
+///   [`crate::interfaces::TransferReject::DustOutput`];
+/// - more than [`MAX_TRANSFER_OUTPUTS`] outputs in one transaction —
+///   [`crate::interfaces::TransferReject::TooManyOutputs`].
+///
+/// Why a flag day at all: both refusals change the verdict on bodies that
+/// are VALID today. The historical log may already carry such outputs, and
+/// a mixed fleet where only some nodes refuse them is a fork on the first
+/// dust transfer after the rollout — the same reasoning as every other
+/// gate in this file. The mempool half of the rule
+/// (`bloch-pos-node/src/engine.rs`, `admissible`) is node-local policy and
+/// is already live ungated: it stops NEW dust propagating without changing
+/// any block's validity.
+///
+/// ARMING THIS (and the two values below) IS A FOUNDER DECISION.
+/// `dust_rule_is_inert` pins the inert value.
+pub const DUST_RULE_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Minimum value of a single transfer output once
+/// [`DUST_RULE_ACTIVATION_EPOCH`] binds — outputs below it (zero included)
+/// are refused. 1,000 sat (10 µBLCH at 8 decimals): well above the ~6.4 sat
+/// byte-fee of creating the entry, so an output must carry at least two
+/// orders of magnitude more value than the fee its creation paid, and small
+/// real payments remain untouched. Value subject to the same founder
+/// decision that arms the gate.
+pub const MIN_TRANSFER_OUTPUT_SAT: u64 = 1_000;
+
+/// Maximum number of outputs one transfer may create once
+/// [`DUST_RULE_ACTIVATION_EPOCH`] binds. The byte ceiling already bounds
+/// the count indirectly (~6,500 forty-byte outputs in a 262,144-byte
+/// block); this bounds what ONE fee-paying transaction may add to the
+/// permanent set, so state growth is priced per transaction and not only
+/// per block. 256 is far above any observed honest fan-out (the wallet
+/// writes 2). Value subject to the same founder decision that arms the
+/// gate.
+pub const MAX_TRANSFER_OUTPUTS: usize = 256;
 
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.
