@@ -41,7 +41,7 @@ Two entities, because a third has to earn its existence:
 
 | Allocation | Custody | Note |
 |---|---|---|
-| Founder grant 10% | Founder personally, or a holding company | Vesting is consensus-enforced either way; the wrapper is a tax question, not a protocol one. (An earlier draft said 17%; cut 2026-08-11, difference to validators) |
+| Founder grant 10% | Founder personally, or a holding company | The vesting schedule is published **policy, not consensus** — genesis records `unlock_epoch` but no consensus path reads it (`genesis.rs`, `vesting_is_not_enforced`); either wrapper is a tax question, not a protocol one. (An earlier draft said 17%; cut 2026-08-11, difference to validators. An earlier revision of this row claimed consensus enforcement) |
 | VC 10% | **Foundation**, until sold | The Foundation is the counterparty of the round |
 | Team 10% | **Foundation**, distributed to individuals on grant | Individuals hold their own once granted |
 | Marketing 4% | **Foundation** | |
@@ -49,7 +49,9 @@ Two entities, because a third has to earn its existence:
 | Carryover 17.97% | Holders themselves — the founder's carried-over balance is ~16.89 points of it | Nobody else's to hold |
 | Validators 43.03% | Nobody — emitted | Never in anyone's custody, which is the point. (An earlier draft said 53.7%, a 100-billion-era figure) |
 
-The Foundation therefore holds **29% of supply** at genesis, most of it vesting.
+The Foundation therefore holds **29% of supply** at genesis, most of it on a
+published vesting schedule (kept by Foundation custody — see the row note
+above: schedules are policy, not consensus).
 It is the largest single holder for the entire first decade. Everything in §5
 follows from that.
 

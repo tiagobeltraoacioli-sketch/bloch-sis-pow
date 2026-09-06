@@ -540,7 +540,7 @@ years locked, forty vesting, fully vested at year 50.
 
 - Validator allocation: **42,853,600,000 BLCH** over **40 years**.
 - At 30 s slots: 42,076,800 slots in 40 years.
-- **Average 1,022 BLCH per block.**
+- **Average 1,018.46 BLCH per block** (42,853,600,000 / 42,076,800).
 
 ### 6.1 Curve — decided: 10% annual disinflation
 
@@ -549,25 +549,35 @@ decentralisation requirement from §7A, that pins the curve almost exactly.
 
 | Curve | Year-1 inflation | Decentralisation gate |
 |---|---:|---|
-| Flat, 1,022 BLCH/block | 1.08% | **Fails** — validators never outpace insider unlocks |
+| Flat, 1,018.46 BLCH/block | 1.07% | **Fails** — validators never outpace insider unlocks |
 | Halving every 4 years | 5.38% | Passes, but revenue halves on scheduled dates |
 | Decay, 8%/year decline | 3.56% | **Fails at month 36** — too flat |
-| **Decay, 10%/year decline** | **4.37%** | **Passes** |
+| **Decay, 10%/year decline** | **4.35%** | **Passes** |
 | Decay, 12%/year decline | 5.19% | Passes, but the shape, not the ceiling, is what rules it out |
 
 **Adopted: reward declines 10% per year**, constant within each year, summing
-to exactly the 42,853,600,000 allocation across 40 years.
+to the 42,853,600,000 allocation across 40 years minus an irreducible
+truncation residual (below).
+
+The figures are the **shipped integer arithmetic** — `INITIAL_ANNUAL_SAT =
+434,965,169,252,191,762`, `annual[n] = annual[n-1] * 9 / 10` (truncating),
+per-slot reward `annual[n] / 1,051,920` (`tokenomics_v4::validator_reward_decay_sat`).
+An earlier revision of this table was computed from a closed-form curve
+~0.41% above the shipped one (year 1 read ~4,152 where the chain pays
+4,134.96); any implementer or explorer reproducing emission must use the
+integer recurrence, not a formula.
 
 | Year | BLCH/block | Inflation (of total supply) |
 |---:|---:|---:|
-| 1 | 4,151.90 | 4.37% |
-| 5 | 2,724.05 | 2.87% |
-| 10 | 1,608.52 | 1.69% |
-| 20 | 560.86 | 0.59% |
-| 40 | 68.19 | 0.07% |
+| 1 | 4,134.96 | 4.35% |
+| 5 | 2,712.95 | 2.85% |
+| 10 | 1,601.97 | 1.69% |
+| 20 | 558.57 | 0.59% |
+| 40 | 67.91 | 0.07% |
 
-Truncation residual across the whole 40-year schedule: **889,200 sat
-(0.0089 BLCH)** — under the allocation, never over.
+Truncation residual across the whole 40-year schedule: **855,280 sat
+(0.0086 BLCH)** — permanently unissued (`tokenomics_v4::EMISSION_DUST_SAT`,
+pinned by a compile-time assertion), under the allocation, never over.
 
 **The denominator is load-bearing.** These figures are issuance over **total
 supply**, which is how Solana and Ethereum report inflation. Measured against
@@ -623,11 +633,11 @@ explorer must surface the rate prominently.
 
 **Yield versus inflation.** These are different numbers and both get quoted. At
 year-1 issuance with two thirds of supply staked — Solana's rough ratio — the
-nominal staking yield is **6.55%**, against **4.37%** inflation. A staker's
+nominal staking yield is **6.52%**, against **4.35%** inflation. A staker's
 real position is what remains after dilution; a non-staker is diluted by the
-full 4.37%.
+full 4.35%.
 
-For reference, Bloch's year-1 inflation of 4.37% sits just below Solana's
+For reference, Bloch's year-1 inflation of 4.35% sits just below Solana's
 current 5.5–5.9%.
 
 ### 6.3.1 Delegation — implemented (`crates/bloch-pos-committee/src/delegation.rs`)
@@ -801,7 +811,7 @@ most cited failure mode in vesting design, so VC (12), team (18) and founder
 ### Marketing — 4,000,000,000 (4.00%)
 
 **1,000,000,000 liquid at genesis** (25%), for listing fees and launch spend; the
-remaining 630,000,000 vests linearly over 24 months. The split follows ordinary
+remaining 3,000,000,000 vests linearly over 24 months. The split follows ordinary
 practice: launch spend is immediate by nature, ongoing programmes are not.
 
 ### Liquidity — 5,000,000,000 (5.00%)
@@ -921,12 +931,29 @@ danger zone. This is the same discipline already applied in
 `crates/bloch-pos-committee/src/sample.rs`, where cumulative stake is `u128`
 for exactly this reason.
 
-### 8.2 Genesis allocation outputs
+### 8.2 Genesis allocation outputs — schedules are policy, not consensus
 
-Six allocations must appear in the genesis block as consensus-recognised
-outputs with their unlock schedules enforced by consensus, not by promise —
-the same standard §4.1 of the migration design applies to the old premine. A
-vesting schedule that lives in a spreadsheet is not a vesting schedule.
+An earlier revision of this section demanded that the six allocations appear
+with unlock schedules the chain itself enforces, "not by promise". **That is
+not what shipped, and this document must not claim otherwise.** As built
+(`crates/bloch-pos-node/src/genesis.rs`, `GenesisAllocation`):
+
+- the six allocations do appear as genesis outputs, and each carries an
+  `unlock_epoch` field that is encoded in the manifest and hashed into the
+  allocation's txid — every node agrees on the *number*;
+- **no consensus path reads that field to authorise or refuse a spend.**
+  `unlock_epoch` appears nowhere in `bloch-pos-committee`, the crate that
+  authorises spends, and the shipped `genesis-mainnet` path writes `0` for
+  every bucket. This is pinned by the node's `vesting_is_not_enforced` test.
+
+Every allocation is therefore **liquid from slot 0**; the §7 schedules bind as
+published policy kept by whoever holds the keys (the Foundation for its four
+buckets, the founder for the grant) — a public commitment verified by watching
+the chain, not a rule the chain enforces. Enforcing them later would be a
+consensus change, and coins already liquid cannot be re-locked by a rule
+adopted after the fact. The §4 concentration analysis and the §7A gates must
+be read accordingly: "locked" in those tables means *scheduled*, not
+*unspendable*.
 
 ---
 

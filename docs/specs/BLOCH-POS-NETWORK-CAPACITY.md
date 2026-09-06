@@ -96,7 +96,7 @@ Per-slot attestation bytes, at 4,717 B per attestation **[estimate]**:
 | 1,000 | 32 | 151.0 KB | 146.8 KB |
 | 4,096 (ceiling, `committees.rs`) | 128 | 603.8 KB | **587.4 KB ≈ "588 KB"** |
 
-Fixed per-block overhead on top (`header.rs`): header 248 B + proposer
+Fixed per-block overhead on top (`header.rs`): header 304 B + proposer
 hybrid signature in the envelope ≈ 4,589 B ≈ **4.8 KB** — noise against the
 attestation term.
 

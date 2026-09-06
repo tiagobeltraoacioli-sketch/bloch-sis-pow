@@ -8,7 +8,11 @@ Status:     ACCEPTED AND APPLIED (founder decision, 2026-08-11) — the
             recommendation below landed in delegation.rs: WARMUP_RATE_BPS
             900 -> 25 and churn floor MIN_DELEGATION_SAT -> MIN_CHURN_SAT
             (= MIN_DEPOSIT_SAT). The 900-bps figures in the body are the
-            OLD values, kept as the record of why they were retired
+            OLD values, kept as the record of why they were retired.
+            UNITS NOTE (2026-09-05): the body's "100,000 BLCH" floor figures
+            are pre-split; since the 2026-08-12 split MIN_DEPOSIT_SAT is
+            25,000 BLCH (staking.rs:97) — the floor is symbolic
+            (MIN_CHURN_SAT = MIN_DEPOSIT_SAT) and tracks the code
 Created:    2026-08-11
 Owner:      A6
 Responds:   BLOCH-POS-THREAT-MODEL.md §F8

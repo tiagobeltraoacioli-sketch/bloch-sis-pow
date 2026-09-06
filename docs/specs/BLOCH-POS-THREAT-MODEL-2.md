@@ -5,7 +5,8 @@
 > **Premissa de churn SUPERADA — 2026-08-11.** Este passe foi escrito com
 > `WARMUP_RATE_BPS = 900` e piso `MIN_DELEGATION_SAT`. Depois dele o fundador
 > aceitou a proposta de `BLOCH-POS-STAKE-CHURN.md`: hoje `WARMUP_RATE_BPS =
-> 25` e o piso e `MIN_CHURN_SAT` (= `MIN_DEPOSIT_SAT`, 100k BLCH) em
+> 25` e o piso e `MIN_CHURN_SAT` (= `MIN_DEPOSIT_SAT`, hoje 25k BLCH
+> pos-split — `staking.rs:97`; o rascunho pre-split dizia 100k) em
 > `delegation.rs`. O achado **G4** muda de natureza, nao desaparece: a
 > observacao estrutural (o piso domina a taxa em rede pequena) agora vale por
 > DESENHO na escala de 100k BLCH — custo de liveness aceito e itemizado no

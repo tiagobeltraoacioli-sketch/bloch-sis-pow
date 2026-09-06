@@ -236,7 +236,7 @@ schema below encodes the lesson as two rules:
 | CF | Key | Value | Class |
 |---|---|---|---|
 | `meta` | ascii string | schema version, network version, genesis digest, weak-subjectivity checkpoint consumed at boot | node |
-| `headers` | block_id 32B | `BlockHeaderV4`, canonical 248 B | consensus |
+| `headers` | block_id 32B | `BlockHeaderV4`, canonical 304 B | consensus |
 | `bodies` | block_id 32B | proposer_sig + transactions + attestation quorum | consensus |
 | `state_roots` | block_id 32B | `StateRoots` (7×32 B + the 80 B `EvmCommitment`, per `BLOCH-L1-EVM-STATE-MODEL.md` §2) + `FinalityState` at that block | consensus |
 | `state_nodes` | node hash 32B | SMT node, content-addressed — structural sharing means a block's state costs only its delta | consensus |
@@ -278,8 +278,10 @@ and published ahead of launch:
   the genesis block per tokenomics §3.2.2),
 - the carryover balance set itself (as `carryover.tsv`-style data, verified
   against the digest at load),
-- the six allocation outputs with consensus-enforced vesting locks
-  (tokenomics §8.2 — a schedule in a spreadsheet is not a schedule),
+- the six allocation outputs, each carrying its `unlock_epoch` as committed
+  manifest data — hashed into the allocation's txid, but **not** read by any
+  spend-authorisation path: vesting is policy, not consensus (tokenomics
+  §8.2; `genesis.rs`, `vesting_is_not_enforced`),
 - the genesis validator set + the **genesis cohort** list
   (`genesis_cohort.rs` caps its combined weight, 100% → 33.3% over year one),
 - `genesis_time` (slot-0 timestamp) and network version.

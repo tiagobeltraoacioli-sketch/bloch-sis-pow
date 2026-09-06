@@ -238,7 +238,7 @@ that share, so G1/G2 move only when coins change hands.
 | `SLOT_DURATION_SECS` | **30** | Deliberately identical to today's PoW block target — see below |
 | `SLOTS_PER_EPOCH` | 32 | 16 min/epoch |
 | `EPOCHS_PER_CHECKPOINT` | 1 | Justification per epoch; finality ≈ 32 min |
-| `MIN_DEPOSIT_BLCH` | 100,000 | Sized so a validator set of ~1,000 is reachable from realistic float |
+| `MIN_DEPOSIT_BLCH` | 25,000 | As shipped (`staking.rs:97`, 2026-08-12 split decision; a pre-split draft said 100,000). Sized so a validator set of ~1,000 is reachable from realistic float |
 | `MAX_VALIDATOR_STAKE` | 1% of active stake | 1% cap, resolved by fixed point — `delegation.rs` |
 | ~~`COMMITTEE_SIZE`~~ | **removed** | Replaced by partitioning — see §6.5.3 |
 | ~~`SLOT_SUBCOMMITTEE_SIZE`~~ | **removed** | Same |
@@ -278,9 +278,13 @@ With one designated proposer per slot, concurrency is an anomaly, not the
 norm. Genesis-4 is a **linear chain**:
 
 - `BlockHeader.parents` narrows from `Vec<[u8;32]>` to a single
-  `parent: [u8;32]`. The field is kept as a vector in the wire format with a
-  consensus rule `parents.len() == 1` so that serialisation code, explorers and
-  SDKs need a smaller diff.
+  `parent: [u8;32]` — **in the wire format too**. An earlier draft of this
+  bullet kept the field as a vector on the wire with a consensus rule
+  `parents.len() == 1`; that was **not** what shipped, and an implementer who
+  follows it forks at the first header. As built
+  (`crates/bloch-pos-committee/src/header.rs`), `parent` is a bare 32-byte
+  field at offset 4 of the canonical encoding: no length prefix, no varint,
+  no vector framing of any kind (§5.3 has the byte-exact layout).
 - Fork choice becomes **LMD-GHOST over attestation weight**, with the latest
   justified checkpoint as the root — not blue score.
 - `reachability.rs` and the DAG anticone machinery are retained but demoted to
@@ -320,11 +324,37 @@ Removed relative to V3: `bits`, `nonce`, `timestamp` (derived from `slot`),
 `parents: Vec<_>`. Removing `bits` is what deletes the order-dependent
 difficulty bug class described in §2.
 
+**Byte-exact canonical encoding** (normative; `BlockHeaderV4::canonical_serialize`,
+`crates/bloch-pos-committee/src/header.rs`). Fields in declaration order,
+integers **little-endian**, hashes as raw bytes; total length is exactly
+**304 bytes** (`BlockHeaderV4::ENCODED_LEN`). The decoder rejects any input
+that is not exactly 304 bytes — trailing bytes are an error, not slack
+(tolerating them once produced the block-10802 fleet stall).
+
+| Offset | Bytes | Field | Encoding |
+|---:|---:|---|---|
+| 0 | 4 | `version` | `u32` LE (`0xB10C_0005`) |
+| 4 | 32 | `parent` | raw |
+| 36 | 32 | `state_root` | raw |
+| 68 | 32 | `body_root` | raw |
+| 100 | 8 | `slot` | `u64` LE |
+| 108 | 4 | `proposer_index` | `u32` LE |
+| 112 | 32 | `randao_reveal` | raw |
+| 144 | 32 | `randao_mix` | raw |
+| 176 | 32 | `justified_root` | raw |
+| 208 | 32 | `finalized_root` | raw |
+| 240 | 32 | `attestation_root` | raw |
+| 272 | 32 | `coherence_root` | raw |
+
+`block_id = SHA3-256(DS_BLOCK ‖ these 304 bytes)`; the proposer signs
+`SHA3-256(DS_PROPOSE ‖ the same 304 bytes)` — same preimage, different
+16-byte tag, so the two digests can never collide (§5.4, §6.1).
+
 The proposer signature sits in the **envelope, not the header**. With a 4.6 KB
 hybrid signature, an in-header signature would make the header itself larger
 than a typical Bitcoin block's worth of headers, and every light-client and
 header-sync path would carry it. Keeping the signed object small (`header` is
-248 B) means header chains stay cheap and only full validation pays for the
+304 B) means header chains stay cheap and only full validation pays for the
 signature.
 
 ### 5.4 Block identity — the one change that touches everything
@@ -493,18 +523,80 @@ merge blocker for DEV-1, and A4 audits for it explicitly.
 ### 6.1 SHA-3 domain separation
 
 One hash function, many uses; every use gets a tag. Tags are ASCII, fixed
-length 16, right-padded with `0x00`:
+length 16, right-padded with `0x00` (so no tag can be a prefix of another).
+The table below is the **complete** registry as shipped
+(`crates/bloch-pos-committee/src/params.rs`); an earlier revision listed only
+the first eight and an independent implementer would have derived incompatible
+digests for every message in the missing six domains. Each `\0` below is one
+zero byte; every tag is exactly 16 bytes.
 
-| Tag | Use |
+| Constant | Tag (16 bytes) | Use |
+|---|---|---|
+| `DS_BLOCK` | `BLCH4:BLOCK\0\0\0\0\0` | Block identity (§5.4) |
+| `DS_BODY` | `BLCH4:BODY\0\0\0\0\0\0` | Transaction Merkle tree (`body_root`) |
+| `DS_STATE` | `BLCH4:STATE\0\0\0\0\0` | State SMT nodes (`state_root`; see marker bytes below) |
+| `DS_ATTEST` | `BLCH4:ATTEST\0\0\0\0` | Attestation signing root |
+| `DS_RANDAO` | `BLCH4:RANDAO\0\0\0\0` | Beacon mixing (§6.3) |
+| `DS_SORTITION` | `BLCH4:SORTIT\0\0\0\0` | Sortition draw |
+| `DS_DEPOSIT` | `BLCH4:DEPOSIT\0\0\0` | Deposit proof-of-possession signing root (§7.1) |
+| `DS_SLASH` | `BLCH4:SLASH\0\0\0\0\0` | Slashing-evidence signing roots (§7.3) |
+| `DS_SPEND` | `BLCH4:SPEND\0\0\0\0\0` | eUTXO spend-authorisation signing root (witness-free) |
+| `DS_TXID` | `BLCH4:TXID\0\0\0\0\0\0` | Transaction identity: `txid = SHA3-256(DS_TXID ‖ spend signing root)` |
+| `DS_PROPOSE` | `BLCH4:PROPOSE\0\0\0` | Proposer signature over the header — deliberately **not** the block-id domain |
+| `DS_EXIT` | `BLCH4:EXIT\0\0\0\0\0\0` | Voluntary-exit signing root (§7.2) |
+| `DS_WSCKPT` | `BLCH4:WSCKPT\0\0\0\0` | Weak-subjectivity checkpoint digest (`BLOCH-WEAK-SUBJECTIVITY.md` §2.1) |
+| `DS_COHERENCE` | `BLCH4:COHERE\0\0\0\0` | Header `coherence_root` mirror binding (§6.6.2) |
+
+The Coherence pool's internal domains are unchanged: the accumulator stays
+SHAKE-256 under the C1-frozen `bloch:coherence:*:v1` tags
+(`crates/coherence-core`) — `DS_COHERENCE` tags only the header-side binding
+of the two pool roots.
+
+**State-tree preimage markers and component tags** (normative;
+`crates/bloch-pos-committee/src/state_root.rs`). Every SHA3 invocation inside
+the state SMT starts with `DS_STATE` and then **one marker byte**, so the five
+preimage shapes can never collide with each other or with any other protocol
+hash:
+
+| Marker | Preimage |
 |---|---|
-| `BLCH4:BLOCK\0…` | Block identity |
-| `BLCH4:BODY\0…` | Transaction Merkle tree |
-| `BLCH4:STATE\0…` | State SMT nodes |
-| `BLCH4:ATTEST\0…` | Attestation signing root |
-| `BLCH4:RANDAO\0…` | Beacon mixing |
-| `BLCH4:SORTIT\0…` | Sortition draw |
-| `BLCH4:DEPOSIT\0…` | Deposit message |
-| `BLCH4:SLASH\0…` | Slashing evidence |
+| `0x00` `MARK_LEAF` | `SHA3(DS_STATE ‖ 0x00 ‖ key ‖ value_hash)` |
+| `0x01` `MARK_NODE` | `SHA3(DS_STATE ‖ 0x01 ‖ left ‖ right)` |
+| `0x02` `MARK_EMPTY` | `SHA3(DS_STATE ‖ 0x02)` — the defined empty-slot value |
+| `0x03` `MARK_KEY` | `SHA3(DS_STATE ‖ 0x03 ‖ component_tag ‖ entry_key_bytes)` |
+| `0x04` `MARK_VALUE` | `SHA3(DS_STATE ‖ 0x04 ‖ canonical_serialization)` |
+
+Leaf keys are derived with `MARK_KEY` over a **component tag** — one byte per
+state component, mixed into key derivation so entries from different
+components can never occupy the same leaf even when their natural keys
+coincide. The registry is **append-only** (reusing or renumbering a tag
+silently re-keys every leaf of the component it named) and is, as shipped,
+exactly these 22:
+
+| Tag | Component |
+|---:|---|
+| `0x01` | `TAG_EUTXO` — transparent eUTXO set |
+| `0x02` | `TAG_VALIDATOR` — validator registry |
+| `0x03` | `TAG_PARTICIPATION_CURRENT` — current-epoch participation |
+| `0x04` | `TAG_PARTICIPATION_PREVIOUS` — previous-epoch participation |
+| `0x05` | `TAG_RANDAO` — beacon state |
+| `0x06` | `TAG_TAINT_ROOT` — reserved all-zero slot (taint retired, §4) |
+| `0x07` | `TAG_COHERENCE_ACCUMULATOR` — shielded-pool accumulator root |
+| `0x08` | `TAG_COHERENCE_NULLIFIERS` — shielded-pool nullifier root |
+| `0x09` | `TAG_FINALITY` — finality bookkeeping (§5.5 extension, 2026-08-11) |
+| `0x0A` | `TAG_PENDING_VOTE` — pending FFG vote |
+| `0x0B` | `TAG_FC_MESSAGE` — latest fork-choice message per validator |
+| `0x0C` | `TAG_FC_EQUIVOCATOR` — fork-choice equivocator set |
+| `0x0D` | `TAG_DEPOSIT_QUEUE` — activation queue |
+| `0x0E` | `TAG_DELEGATION` — delegation records |
+| `0x0F` | `TAG_PENDING_FEE` — pending fee credits |
+| `0x10` | `TAG_EVM_COMMITMENT` — L1 EVM execution commitment (singleton) |
+| `0x11` | `TAG_SLASH_APPLIED` — applied-evidence set (anti-replay, 2026-08-12) |
+| `0x12` | `TAG_SLASH_WINDOW` — correlated-slashing window |
+| `0x13` | `TAG_DELEGATOR_SLASH_LOSS` — delegator slash-loss ledger |
+| `0x14` | `TAG_ISSUED_SUPPLY` — cumulative issued supply (hard-cap counter, singleton) |
+| `0x15` | `TAG_BASE_FEE` — L1 fee-market price leaf (singleton) |
+| `0x16` | `TAG_DELEGATOR_FEE_REWARD` — delegator fee-reward ledger |
 
 Fixed-length digests use SHA3-256. Variable-length or multi-output derivation
 uses SHAKE-256. SHA-256d survives **only** in the historical verification path
@@ -840,16 +932,29 @@ punished no more than an unlucky solo operator.
 
 ### 7.4 Rewards
 
-Issuance per Emission V3 is unchanged in *quantity*. The recipient split
-becomes: 7/8 to attesters pro-rata to participation, 1/8 to the proposer, with
-the inclusion-delay weighting standard to Casper-style designs. Transaction
-fees follow the existing endowment split (`ENDOW_FEE_SHARE_BPS = 1000`).
-
-`MINER_SHARE_BPS` / `VALIDATOR_SHARE_BPS` in `tokenomics_v2.rs:119-121`, today
-100/0, invert at the transition. Note that this file currently asserts
-`VALIDATOR_SHARE_BPS == 0` with the comment "removed (no BFT)" — the constants
-and their comments are consensus-adjacent documentation and must be corrected
-in the same commit, not later.
+> **SUPERSEDED 2026-09-05.** This section's original text specified the
+> Ethereum shape — 7/8 of issuance to attesters, 1/8 to the proposer, with
+> inclusion-delay weighting — and an endowment fee split
+> (`ENDOW_FEE_SHARE_BPS`). None of that shipped. The implemented rule is the
+> **Solana model** (`crates/bloch-pos-committee/src/rewards.rs`,
+> `BLOCH-TOKENOMICS-V4.md` §6.3), and the two are not compatible: an
+> implementer following the old paragraph computes different balances at the
+> first epoch boundary. The as-built rule, normatively:
+>
+> - **Issuance goes to stake, not to proposers.** Each validator's slice of an
+>   epoch's issuance is pro-rata to its stake (self + delegated) over total
+>   active stake, scaled by attestation credits earned over the maximum
+>   attainable (`rewards::distribute`; the unearned remainder is forfeited —
+>   never minted). The operator takes a commission, uncapped by consensus,
+>   on the delegated side only.
+> - **Base fees:** while emission runs (`slot < EMISSION_SLOTS`), 50% burned,
+>   50% to the block producer; **after emission ends, nothing is burned** —
+>   100% of every fee to the producer (`rewards::split_fees_at`).
+> - **Priority fees:** 100% to the block producer in both eras.
+>
+> The `tokenomics_v2.rs` `MINER_SHARE_BPS`/`VALIDATOR_SHARE_BPS` inversion the
+> old text ordered belongs to the abandoned in-place transition (§8 superseded
+> note); Genesis-4 is a fresh genesis and V2 constants do not apply.
 
 ---
 
@@ -1195,7 +1300,7 @@ crate to preserve a permissive licence nobody asked for. `bloch-pos-committee`,
 | `SIGNATURE_SUITE` | `0x0001` ML-DSA-65 ‖ Falcon-1024 (unchanged) | 6.2 |
 | `SLOT_DURATION_SECS` | 30 | 5.1 |
 | `SLOTS_PER_EPOCH` | 32 | 5.1 |
-| `MIN_DEPOSIT_BLCH` | 100,000 | 5.1 |
+| `MIN_DEPOSIT_BLCH` | 25,000 (`staking.rs:97`; pre-split draft said 100,000) | 5.1 |
 | `MAX_VALIDATOR_STAKE` | 1% of active stake | 4.1 |
 | `MAX_ACTIVATIONS_PER_EPOCH` | 4 | 4.1 |
 | `COMMITTEE_SIZE` | 128 (voto na fronteira de época) | 5.1, 6.5 |

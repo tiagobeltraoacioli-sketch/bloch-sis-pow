@@ -177,11 +177,14 @@ path". Nothing has started.
 
 - `reveals_used` is `u32` in `beacon.rs:188`/`transition.rs:197` but `u64`
   in the frozen `interfaces.rs:561` (`is_exhausted`).
-- `rewards.rs` implements the Solana split while migration spec §7.4 still
-  specifies the Ethereum 7/8‖1/8 shape — interfaces doc §4.4, open. Code
-  merged against a normative spec that says otherwise.
-- `DS_PROPOSE` exists in `params.rs:89-97` but the §6.1 domain-tag table
-  in the spec has no row for it (interfaces doc §4.1).
+- `rewards.rs` implements the Solana split while migration spec §7.4
+  specified the Ethereum 7/8‖1/8 shape — interfaces doc §4.4.
+  **Resolved 2026-09-05:** §7.4 superseded in place; the spec now records the
+  implemented Solana rule.
+- `DS_PROPOSE` exists in `params.rs` but the §6.1 domain-tag table in the
+  spec had no row for it (interfaces doc §4.1). **Resolved 2026-09-05:** §6.1
+  now carries the complete 14-tag registry plus the state-tree marker bytes
+  and all 22 component tags.
 - `params.rs:98-108`: orphan doc-comments (merge residue), and
   `SLOT_SUBCOMMITTEE_SIZE`/`COMMITTEE_SIZE` are dead constants under the
   partition model; `sample.rs` is the retained legacy mechanism with no
