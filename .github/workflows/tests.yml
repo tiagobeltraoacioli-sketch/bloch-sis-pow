@@ -1,0 +1,100 @@
+# Bloch Protocol — Tests (GitHub Actions)
+#
+# WHY THIS FILE EXISTS (Round-2 audit finding TEST1-ci-runs-tests): the GitHub
+# pipeline ran security scanners and nothing else — not one `cargo test`. On
+# the GitLab side, `build-and-test` did run tests but was permanently red, so
+# the nix stage behind it never ran. Between the two, no pipeline anywhere had
+# a green-able job whose failure meant "a test broke". This one does.
+#
+# WHAT IS GATED — the LIVE crates: the Genesis-4 consensus and the crates on
+# its path, plus the shared protocol crates every era leans on. The list is
+# duplicated, on purpose, in scripts/check-tests-blocking.py; the guard fails
+# the pipeline if a crate is dropped from here or an escape hatch
+# (continue-on-error, exit 0, a removed timeout) is added. Change the list
+# there and here together, with a written reason.
+#
+#   bloch-pos-committee   frozen Genesis-4 consensus math
+#   bloch-pos-node        the `bloch-pos` binary the fleet runs
+#   bloch-crypto          hybrid ML-DSA-65 ‖ Falcon-1024, on the consensus path
+#   coherence-core        pulled by bloch-crypto (consensus path)
+#   bloch-sis-pow         pulled by bloch-crypto (consensus path)
+#   bloch-pq-vault        PQ-shield vault (commit-delay-reveal + clawback)
+#   pqcrypto-internals    vendored PQClean bindings everything signs with
+#
+# NOT gated here: tools/genesis4-ceremony (its fixture re-pin is finding F21's
+# own change; it joins this list when F21 lands), legacy/genesis3-node and the
+# Genesis-3 crates (closed chain, exercised by GitLab's workspace-tests job).
+#
+# The toolchain is PINNED to crates/bloch-pos-node/rust-toolchain.toml — the
+# same reasoning as clippy-hardened in security.yml: a test verdict is a
+# property of (source, toolchain), and a floating `stable` makes the gate's
+# verdict a function of the calendar. The step fails closed if the pin cannot
+# be read.
+
+name: tests
+
+on:
+  push:
+    branches: [main, "euvm/**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # cargo test over the live crates — BLOCKING. One invocation, so a failure
+  # in any crate fails the job; --locked so the gate tests the committed
+  # dependency graph, not whatever resolves on the runner today.
+  cargo-test:
+    name: cargo test — live crates (blocking)
+    runs-on: ubuntu-latest
+    # Measured 2026-09-05 on an 8-core dev machine: ~51 min of test wall time
+    # alone (the committee's 8,192-step SHAKE reveal chains and the Module-SIS
+    # mining test are ~23 min EACH in a debug build) before compile. 60 would
+    # gate by luck on a 2-core hosted runner.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pinned toolchain (crates/bloch-pos-node/rust-toolchain.toml)
+        id: pin
+        run: |
+          ch="$(sed -n 's/^channel *= *"\(.*\)".*/\1/p' crates/bloch-pos-node/rust-toolchain.toml)"
+          if [ -z "$ch" ]; then
+            echo "cannot read the toolchain pin — refusing to test on a floating toolchain" >&2
+            exit 1
+          fi
+          rustup toolchain install "$ch" --profile minimal --no-self-update
+          echo "toolchain=$ch" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@v2
+      - name: Install C toolchain (rocksdb bindgen, blst, PQClean)
+        run: sudo apt-get update && sudo apt-get install -y clang cmake
+      - name: cargo test (live crates)
+        run: |
+          cargo +${{ steps.pin.outputs.toolchain }} test --locked \
+            -p bloch-pos-committee \
+            -p bloch-pos-node \
+            -p bloch-crypto \
+            -p coherence-core \
+            -p bloch-sis-pow \
+            -p bloch-pq-vault \
+            -p pqcrypto-internals
+
+  # tests-blocking guard — the regression test for finding TEST1 itself. Fails
+  # if this workflow or GitLab's build-and-test loses a live crate, loses its
+  # timeout, or re-acquires an escape hatch. Pure Python 3, no toolchain.
+  tests-blocking-guard:
+    name: tests-blocking guard (blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: selftest (the guard must be able to fail)
+        run: python3 scripts/check-tests-blocking.selftest.py
+      - name: guard
+        run: python3 scripts/check-tests-blocking.py
