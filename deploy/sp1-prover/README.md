@@ -28,8 +28,16 @@ node   ── verifies the FRI proof locally (sp1-sdk verifier) ── no trust 
 - **Artifact cache on a volume** (`/data`, `SP1_HOME`). SP1 downloads circuit
   artifacts / proving keys (GBs) on first use; the volume keeps them across cold
   starts so wakes are fast.
-- **Bearer-token auth** on `/prove` (`PROVER_AUTH_TOKEN` secret) so the GPU isn't
-  an open compute faucet. `/health` and `/verify` are cheap and unauthenticated.
+- **Bearer-token auth, FAIL-CLOSED** on `/prove` (`PROVER_AUTH_TOKEN` secret):
+  the service REFUSES TO START without a real token (placeholders like
+  `CHANGE_ME…` and tokens shorter than 32 chars are rejected). `/health` and
+  `/verify` are cheap and unauthenticated.
+- **TLS required**: `/prove` carries the FULL PRIVATE WITNESS, so requests
+  whose `x-forwarded-proto` isn't `https` are rejected (426). Fly's
+  `force_https` edge satisfies this; on Akash the SDL fronts the prover with a
+  Caddy TLS sidecar and never exposes plaintext 8080 globally.
+- **No mock proving**: the prover backend is chosen explicitly (`.cpu()` /
+  `.cuda()`); `SP1_PROVER=mock` in the environment aborts startup.
 - **Concurrency 1/machine** — one proving job per GPU; scale out with more
   machines, not by overloading one.
 

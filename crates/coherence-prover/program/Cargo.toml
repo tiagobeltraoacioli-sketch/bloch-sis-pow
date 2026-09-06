@@ -6,6 +6,6 @@ edition = "2021"
 
 [dependencies]
 # Pin to the SP1 version you install with sp1up; check current SDK docs.
-sp1-zkvm = "4"
+sp1-zkvm = "=4.2.1"  # EXACT pin: match sp1-sdk in script/service
 # Lean coherence primitives (to be extracted from src/coherence — see README).
 coherence-core = { path = "../../coherence-core" }
