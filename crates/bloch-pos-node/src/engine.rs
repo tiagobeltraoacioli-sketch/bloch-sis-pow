@@ -92,12 +92,13 @@ use bloch_pos_committee::fee_market;
 use bloch_pos_committee::forkchoice::{BlockTree, LatestMessage, Store as FcStore};
 use bloch_pos_committee::gossip::{AttestationPool, GossipDecision};
 use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, VERSION_G4};
-use bloch_pos_committee::interfaces::{ProposalEnvelope, StateReader, StateTransition};
+use bloch_pos_committee::interfaces::{ProposalEnvelope, StateReader, StateTransition, ValidatorRecord};
 use bloch_pos_committee::params::{MAX_ATTESTATIONS_PER_BLOCK, SLOTS_PER_EPOCH};
 use bloch_pos_committee::schedule::first_slot_of_epoch;
 use bloch_pos_committee::transition::{CommittedState, PosTransaction, Transition};
 use bloch_pos_committee::interfaces::TransitionError;
 use bloch_pos_committee::{committees, derive, epoch_of, schedule};
+use sha3::{Digest, Sha3_256};
 
 use crate::genesis::Manifest;
 #[cfg(test)]
@@ -191,10 +192,53 @@ fn now_ms() -> u64 {
 
 const NO_TXS: [PosTransaction; 0] = [];
 
-/// Ceiling on mempool entries. Not a policy — a bound, so an unauthenticated
-/// devnet transport cannot turn into unbounded memory. Real admission control
-/// (fees, per-sender limits, eviction by price) is `gossip.rs` work.
+/// Ceiling on mempool entries. Past this, [`Engine::on_transaction`] evicts
+/// the lowest [`tx_tip_rate`] entry rather than refusing outright — see
+/// [`MEMPOOL_MAX_PER_SOURCE`] and R7 M6's fixes generally.
 const MEMPOOL_MAX: usize = 4_096;
+
+/// Mempool entries one SOURCE (by [`tx_source_hash`] — the first input's
+/// spend-authority hash) may occupy at once (R7 M6).
+///
+/// Without this, one script could fill the ENTIRE mempool: `admissible`
+/// checks a spend signature, not that the outpoints it names are distinct
+/// from another pending transaction's, so nothing before this stopped one
+/// signer from submitting [`MEMPOOL_MAX`] transactions and starving every
+/// other sender out of [`Engine::select_transactions`]'s budget regardless
+/// of fee rate — the fee-rate fix alone does not help a sender who is
+/// willing to pay top rate on every one of its own flood, since the mempool
+/// would then be full of ONE source's transactions, all paying well, all
+/// ahead of everyone else's.
+///
+/// 64 is generous headroom over an ordinary wallet's legitimate queue (a
+/// consolidation sweep aside — see the founder's own hundred-thousand-output
+/// sweep noted elsewhere in this file, which pushes transactions in one at a
+/// time as parents confirm, not all at once) while still bounding one
+/// source's worst case to 64 / 4,096 ≈ 1.6% of total mempool capacity.
+const MEMPOOL_MAX_PER_SOURCE: usize = 64;
+
+/// Doppelgänger protection window (R6 HIGH-8, node half): slots this node
+/// observes the network for its OWN validator index attesting or proposing
+/// before it will start duties itself.
+///
+/// **Two epochs**, matching the convention other proof-of-stake clients
+/// (e.g. Lighthouse's default doppelganger-protection window) settled on for
+/// the same reason: one epoch guarantees this validator would have had
+/// exactly one attestation duty if it were live elsewhere — no margin at
+/// all against ordinary startup jitter (this node's own boot racing the
+/// other instance's shutdown, or simply this being a restart landing
+/// mid-epoch). Two epochs guarantees a FULL epoch of margin after the first
+/// possible sighting, at the direct cost of this validator missing up to two
+/// epochs of its own duties on every boot — the finding's tradeoff, stated
+/// plainly: false negatives (a live duplicate that goes undetected) cost
+/// this fleet a slashing; false positives (an honest restart delayed by two
+/// epochs) cost it nothing but freshness.
+///
+/// 48/64 fleet validators have ALREADY double-signed historically (HIGH-8's
+/// own finding) — this exists because "restart the validator" and "a second
+/// copy of the key is still running" were, on this fleet, indistinguishable
+/// from outside until now.
+const DOPPELGANGER_OBSERVE_SLOTS: u64 = 2 * SLOTS_PER_EPOCH;
 
 /// How long a transaction may sit in the mempool without ever being included
 /// before the node drops it, measured in slots of head progress.
@@ -326,6 +370,25 @@ const REORG_STATE_WINDOW: usize = 2;
 /// which is why evicting here costs a round trip and never a fork.
 const ORPHAN_MAX: usize = 256;
 
+/// Cap on [`Engine::parked_refused_finality`] (R3 M-1). Same order as
+/// [`ORPHAN_MAX`] and the same FIFO-eviction shape, for the same reason:
+/// remembering a refusal must cost this node a bounded amount of memory, not
+/// one entry per byte a peer chooses to keep re-sending. 512 rather than 256
+/// because a refused BRANCH can be several blocks deep, where an orphan is
+/// always exactly one.
+const MAX_PARKED_REFUSED_FINALITY: usize = 512;
+
+/// Cap on [`Engine::tx_slot_index`] (R4 F-11, `gettxstatus`). A public chain
+/// accumulates transactions without bound over its lifetime; remembering
+/// where every one landed, forever, would be an unbounded index by another
+/// name. Same order of magnitude as [`MEMPOOL_MAX`], for the same reason —
+/// this is the same "have we ever heard of this transaction" question,
+/// asked about the canonical chain instead of about pending admission. A
+/// `gettxstatus` query for a transaction old enough to have aged out reports
+/// `unknown` rather than a fabricated answer — see `Engine::serve_rpc`'s
+/// `TxStatus` arm.
+const MAX_TX_SLOT_INDEX: usize = 65_536;
+
 /// How far past this node's wall-clock slot a *gossiped* block's slot may sit
 /// and still be stored.
 ///
@@ -409,6 +472,51 @@ fn body_transactions(env: &BlockEnvelope) -> Result<Vec<PosTransaction>, String>
                 .map_err(|e| format!("undecodable transaction in block body: {e}"))
         })
         .collect()
+}
+
+/// This transaction's fee rate, in millisatoshi per gas, for mempool
+/// ordering and eviction (R7 M6).
+///
+/// `tip_millisat_per_gas` is ALREADY a per-gas price — comparing it directly
+/// across transactions of different sizes is valid without computing gas at
+/// all, the same way comparing two quoted unit prices needs no further
+/// division. Staking messages (`Deposit`/`Delegate`/`Exit`/…) carry no such
+/// field and report `0`: R7 M1 (a separate, open finding) already names
+/// "staking txs pay zero gas", so treating them as lowest-priority here is
+/// consistent with the chain's own current pricing, not a new judgement this
+/// fix invents.
+fn tx_tip_rate(tx: &PosTransaction) -> u128 {
+    match tx {
+        PosTransaction::Transfer { tip_millisat_per_gas, .. }
+        | PosTransaction::TransferV2 { tip_millisat_per_gas, .. } => *tip_millisat_per_gas,
+        _ => 0,
+    }
+}
+
+/// The spend-authority hash of this transaction's FIRST input — its "source"
+/// for [`MEMPOOL_MAX_PER_SOURCE`] (R7 M6). `None` for a transaction with no
+/// eUTXO inputs (every non-transfer message, and a structurally-empty
+/// transfer `admissible` would refuse anyway), which exempts it from the
+/// per-source cap entirely rather than grouping every such message under one
+/// shared bucket — a bucket that shape would make USELESS as a spam bound
+/// the moment two unrelated staking messages arrived close together.
+///
+/// Hashed exactly like every other script-hash site in this codebase
+/// (`Sha3_256::digest(pubkey)`) — see `rpc.rs`'s `validator_json` and this
+/// file's own `sweep_fixture_declaring` for the same convention.
+fn tx_source_hash(tx: &PosTransaction) -> Option<[u8; 32]> {
+    match tx {
+        PosTransaction::Transfer { inputs, .. } => {
+            let pk = &inputs.first()?.pubkey;
+            Some(Sha3_256::digest(pk).into())
+        }
+        PosTransaction::TransferV2 { keys, inputs, .. } => {
+            let key_index = inputs.first()?.key_index as usize;
+            let pk = &keys.get(key_index)?.pubkey;
+            Some(Sha3_256::digest(pk).into())
+        }
+        _ => None,
+    }
 }
 
 /// The canonical committed state, plus the memo of epoch-rolled copies of it.
@@ -821,19 +929,25 @@ struct Engine {
     /// Transactions waiting for a block, keyed by canonical bytes so a
     /// duplicate gossip collapses instead of being included twice.
     ///
-    /// Devnet mempool, and the limitations are the point: no fee ordering, no
-    /// per-sender limit, no eviction beyond `MEMPOOL_MAX`. A public network
-    /// needs all three; `gossip.rs` in the pure crate is where that belongs
-    /// and it is still not wired.
+    /// **R7 M6 fixed all three gaps this used to describe.** It used to read:
+    /// "no fee ordering, no per-sender limit, no eviction beyond
+    /// `MEMPOOL_MAX`" — and the container's own natural order made the first
+    /// gap actively harmful rather than merely absent: a `BTreeMap` keyed by
+    /// canonical bytes, walked with `iter()`, made inclusion order
+    /// **lexicographic over the encoded transaction** (A3 I3) — a sender who
+    /// re-encoded until the bytes sorted low bought priority for nothing.
     ///
-    /// Ordering has to be stated precisely, because this comment used to call
-    /// it insertion order and that is not what happens. The container is a
-    /// `BTreeMap` keyed by the canonical transaction bytes, and
-    /// [`Engine::select_transactions`] walks it with `iter()` — so inclusion
-    /// order is **lexicographic over the encoded transaction**, not arrival
-    /// order. That is worse than merely absent: a sender who re-encodes until
-    /// the bytes sort low buys priority for nothing, so inclusion order here
-    /// is grindable.
+    /// Now: [`Engine::select_transactions`] orders by
+    /// [`tx_tip_rate`] descending (breaking ties on canonical bytes, so the
+    /// order stays deterministic without reintroducing a grindable primary
+    /// key); [`Engine::on_transaction`] refuses a source past
+    /// [`MEMPOOL_MAX_PER_SOURCE`] (by [`tx_source_hash`] — the first input's
+    /// spend-authority hash); and at [`MEMPOOL_MAX`] capacity, an incoming
+    /// transaction that outbids the pool's current lowest [`tx_tip_rate`]
+    /// evicts it rather than being refused outright. This is still node-local
+    /// devnet policy, not a consensus rule: two nodes with different mempool
+    /// contents cannot fork, because a proposal is judged by the transition,
+    /// never by what a node's own mempool happened to hold.
     ///
     /// Admission is not "the bytes decode" either. `on_transaction` calls
     /// `admissible`, which refuses deposits, delegations and exits, refuses a
@@ -843,19 +957,28 @@ struct Engine {
     /// Head slot at which each live mempool key was admitted, for
     /// [`MEMPOOL_TTL_SLOTS`].
     ///
-    /// A parallel map rather than widening `mempool`'s value, because the
-    /// mempool's key order IS the proposer's selection order (see
-    /// `select_transactions`) and its value type is what the transition is
-    /// handed; neither should acquire a retention concern. The two maps are
+    /// A parallel map rather than widening `mempool`'s value, because
+    /// `mempool`'s value type is what the transition is handed and should not
+    /// acquire a retention concern. (Its KEY order no longer decides
+    /// selection either, since R7 M6 — `select_transactions` sorts by fee
+    /// rate — so there are now two independent reasons not to fold this in.)
+    /// The two maps are
     /// reconciled in `evict_stale_mempool`, which is the ONLY place either the
-    /// TTL or the bookkeeping is enforced — so the four other paths that drop
-    /// a transaction (included, refused by the proposal, swept, RPC) need no
-    /// change and cannot leak an entry here by forgetting one.
+    /// TTL or the bookkeeping is enforced — so the other paths that drop a
+    /// transaction (included, refused by the proposal, swept, RPC, and now —
+    /// R7 M6 — evicted for a higher-fee arrival at capacity) must each remove
+    /// their own entry here too, exactly as `evict_stale_mempool` would have,
+    /// or this leaks one entry per drop.
     mempool_admitted_at: BTreeMap<Vec<u8>, u64>,
     /// Transactions dropped for age alone. Counted for `getmempoolinfo`,
     /// because "the mempool is smaller" and "the mempool is working" look
     /// identical from outside without it.
     mempool_expired: u64,
+    /// Transactions evicted to make room for a higher-fee arrival at
+    /// [`MEMPOOL_MAX`] capacity (R7 M6). Same reasoning as `mempool_expired`:
+    /// a mempool under fee pressure and a mempool simply not receiving
+    /// transactions both look like "it got smaller" without this.
+    mempool_evicted_low_fee: u64,
     /// Transactions the proposer's drop loop refused, keyed exactly like
     /// [`Self::mempool`] and mapping to `(slot the bar lifts at, times it has
     /// barred a re-offer)`.
@@ -947,8 +1070,76 @@ struct Engine {
     finalized_latch: Option<(u64, [u8; 32])>,
     /// Reorgs refused because they would have cut canonical history below
     /// the latch. A rewind an operator cannot see is a rewind that gets
-    /// diagnosed as "sync trouble"; this makes it a measurement.
+    /// diagnosed as "sync trouble"; this makes it a measurement. Exported at
+    /// `/metrics` as `bloch_pos_finality_rewinds_refused_total` and in
+    /// `getchaininfo` (finding R3 M-1 — previously neither).
     finality_rewinds_refused: u64,
+    /// Blocks refused by the finality latch, PARKED rather than deleted (R3
+    /// M-1).
+    ///
+    /// The pre-fix behaviour deleted a refused branch's blocks from
+    /// `self.blocks` outright. If the block(s) ever arrived again — and
+    /// nothing stops a peer relaying, or this node's own periodic sync
+    /// request, from handing back exactly the branch this node just
+    /// refused — deletion meant re-authenticating them from scratch and
+    /// running the whole `advance` cycle again, only to refuse and delete
+    /// them again: a silent, unbounded-in-time loop with no trace beyond the
+    /// refusal counter. Parking them here means [`Engine::ingest_one`] can
+    /// recognise a re-offer BEFORE any signature work and drop it at the
+    /// door — the refusal becomes a fact this node remembers cheaply,
+    /// instead of a verdict it re-derives expensively, forever.
+    ///
+    /// Bounded FIFO like [`Engine::orphans`] — see
+    /// [`MAX_PARKED_REFUSED_FINALITY`] — for the identical reason: unbounded
+    /// memory is not an acceptable price for remembering a refusal, and the
+    /// oldest one is the least likely to still be re-offered.
+    ///
+    /// Removed from `self.blocks` regardless (not left there): leaving a
+    /// refused branch in the fork-choice input map would make `advance`
+    /// re-select and re-refuse it on every subsequent tick even with NO new
+    /// bytes arriving, which is exactly the busy-loop deletion was trying to
+    /// avoid — parking fixes the re-authentication cost without
+    /// reintroducing that one.
+    parked_refused_finality: VecDeque<([u8; 32], BlockEnvelope)>,
+    /// Set once at boot from `BLOCH_ALLOW_FINALITY_REWIND=1` /
+    /// `--allow-finality-rewind` (R3 M-1): an operator's explicit,
+    /// deliberate acknowledgement that a rewind below this node's own
+    /// finalized checkpoint is expected right now and should be allowed
+    /// rather than refused. Every time it actually changes the outcome, this
+    /// node logs loudly (`cut_below_finalized_latch`) — the override exists
+    /// so a legitimate divergence is not indistinguishable from an attack
+    /// from the outside, not so it can be left on quietly.
+    finality_rewind_override: bool,
+    /// Transaction id -> the slot it was included at, on the CURRENT
+    /// canonical chain (R4 F-11 — `gettxstatus`). Maintained by
+    /// [`Engine::note_tx_slots`] on every canonical apply (`apply_canonical`,
+    /// and `do_reorg`'s winning branch) and cleaned up by
+    /// [`Engine::forget_tx_slots_if_stale`] for a block that LEAVES
+    /// canonical history in a reorg, so a stale slot from a losing branch is
+    /// never reported as "included".
+    ///
+    /// This is not a transaction archive: it names a SLOT, and
+    /// `Engine::serve_rpc`'s `TxStatus` arm still has to compare that slot's
+    /// epoch against the justified/finalized checkpoints to answer
+    /// `included` vs `justified` vs `finalized`. Bounded FIFO — see
+    /// [`MAX_TX_SLOT_INDEX`] — the same shape as `Engine::orphans`.
+    tx_slot_index: BTreeMap<[u8; 32], u64>,
+    tx_slot_index_order: VecDeque<[u8; 32]>,
+    /// Doppelgänger protection (R6 HIGH-8): `Some(deadline wall slot)` while
+    /// this node is still observing for its own validator index before
+    /// starting duties, set once at boot from `BLOCH_NO_DOPPELGANGER` /
+    /// `--no-doppelganger-check`. `None` means "no protection is active" —
+    /// either the bypass was set, this is an observer with no keystore (see
+    /// [`Engine::run`]), or a test constructed this `Engine` directly, which
+    /// must not gain a suppression window it never asked for.
+    doppelganger_observe_until: Option<u64>,
+    /// Set once, permanently, the instant this node's OWN validator index is
+    /// seen attesting or proposing while `doppelganger_observe_until` says it
+    /// should not yet be live anywhere. Never cleared without a restart: a
+    /// live duplicate having been seen once is a fact about the key, not
+    /// about the moment, and the window closing on its own must not un-halt
+    /// duties this node has good reason to believe are unsafe.
+    doppelganger_halted: bool,
     /// Blocks whose parent this node has never seen, oldest first, with their
     /// ids so a repeat gossip is recognised without re-hashing.
     ///
@@ -991,21 +1182,25 @@ struct ForkChoiceInputs {
 
 /// Why a transaction was turned away at the door.
 ///
-/// The distinction is load-bearing, not cosmetic: two of these mean "ask me
-/// again in a moment" and the third means "these bytes will never be
-/// admitted, stop sending them". Collapsing them into one RPC code is how an
-/// operator ends up growing the mempool to fix a bad signature — or, the way
-/// it actually happened, how an exchange told "never resubmit after -32008"
+/// The distinction is load-bearing, not cosmetic: three of these mean "ask me
+/// again in a moment" and one means "these bytes will never be admitted,
+/// stop sending them". Collapsing them into one RPC code is how an operator
+/// ends up growing the mempool to fix a bad signature — or, the way it
+/// actually happened, how an exchange told "never resubmit after -32008"
 /// writes off transactions that a self-lifting bar would have admitted an
 /// hour later.
 ///
 /// The RPC boundary now preserves the variant rather than only its sentence:
 /// `AtCapacity` -> `MEMPOOL_FULL`, `PreviouslyRefused` ->
 /// `TX_REFUSED_RETRYABLE` (with `error.data.until_slot`), `Invalid` ->
-/// `TX_REFUSED`. See `Engine::serve_rpc`.
+/// `TX_REFUSED`, `TooManyFromSource` -> `TX_REFUSED_SOURCE_CAP`. See
+/// `Engine::serve_rpc`.
 #[derive(Debug, PartialEq, Eq)]
 enum Refusal {
-    /// The mempool is full. The transaction was NOT judged invalid.
+    /// The mempool is full, and the incoming transaction's [`tx_tip_rate`]
+    /// did not outbid the pool's current lowest (R7 M6) — otherwise it would
+    /// have been admitted by evicting that entry instead of refusing. The
+    /// transaction was NOT judged invalid.
     AtCapacity,
     /// `admissible` refused it on its merits. Retrying is pointless.
     Invalid(&'static str),
@@ -1017,6 +1212,13 @@ enum Refusal {
     /// [`REJECTION_TTL_SLOTS`]. Carries the slot it lifts at, so a caller with
     /// someone to answer to can say when to try again.
     PreviouslyRefused { until_slot: u64 },
+    /// This source (by [`tx_source_hash`]) already has
+    /// [`MEMPOOL_MAX_PER_SOURCE`] transactions pending (R7 M6). Distinct from
+    /// `AtCapacity`: the MEMPOOL is not full, this ONE source's share of it
+    /// is — the correct advice is "wait for one of your own pending
+    /// transactions to clear", not "retry later" (which reads as "the whole
+    /// network is busy") and not "these bytes are invalid" (they are not).
+    TooManyFromSource,
 }
 
 impl Refusal {
@@ -1028,6 +1230,9 @@ impl Refusal {
             Refusal::Invalid(why) => why,
             Refusal::PreviouslyRefused { .. } => {
                 "this node's proposer already had the transition refuse this transaction"
+            }
+            Refusal::TooManyFromSource => {
+                "this source already has MEMPOOL_MAX_PER_SOURCE transactions pending"
             }
         }
     }
@@ -1454,9 +1659,57 @@ impl Engine {
         (rec.pubkey == keys.pubkey).then_some(keys.index)
     }
 
+    /// Doppelgänger protection (R6 HIGH-8): true if `attest`/`propose` must
+    /// refuse to act right now — either a live duplicate of this key was
+    /// actually SEEN (permanent, until a restart), or this node is still
+    /// inside its observation window and has not earned the right to find
+    /// out yet. `false` the instant either the window has never been armed
+    /// (bypassed, or an observer with no keys — see `Engine::run`) or has
+    /// closed clean.
+    fn doppelganger_blocks_duties(&self, slot: u64) -> bool {
+        if self.doppelganger_halted {
+            return true;
+        }
+        matches!(self.doppelganger_observe_until, Some(until) if slot < until)
+    }
+
+    /// A duty-bearing message (an attestation or a proposed block) under
+    /// `index` was just ACCEPTED. If that index is this node's own and the
+    /// observation window says this node has not itself started duties yet,
+    /// that is unambiguous evidence of a live duplicate of this key
+    /// somewhere on the network — this process has been refusing to produce
+    /// anything under `index` this whole window, so it did not produce this.
+    ///
+    /// Checked against `self.wall_slot` — the slot THIS sighting happened
+    /// at, not any slot the message itself claims — because the window's own
+    /// deadline is defined in this node's wall-clock terms and a message's
+    /// own `slot` field is attacker-influenced input on the gossip path.
+    fn note_possible_doppelganger(&mut self, index: u32) {
+        let Some(my_index) = self.keys.as_ref().map(|k| k.index) else { return };
+        if index != my_index || self.doppelganger_halted {
+            return;
+        }
+        if !matches!(self.doppelganger_observe_until, Some(until) if self.wall_slot < until) {
+            return; // window not armed, or already closed: this node may be live itself now
+        }
+        self.doppelganger_halted = true;
+        eprintln!(
+            "DOPPELGANGER DETECTED: validator {index} produced a duty at wall slot {} while \
+             this process was still inside its {DOPPELGANGER_OBSERVE_SLOTS}-slot observation \
+             window and had not yet started its own duties — another instance of this key is \
+             signing on the network right now. REFUSING to start duties. This requires an \
+             operator to confirm only one instance of this key is running before restarting; \
+             bypass with --no-doppelganger-check or BLOCH_NO_DOPPELGANGER=1 (NOT recommended).",
+            self.wall_slot,
+        );
+    }
+
     fn attest(&mut self, slot: u64) {
         // An observer holds no key and therefore has no duty.
         if self.keys.is_none() {
+            return;
+        }
+        if self.doppelganger_blocks_duties(slot) {
             return;
         }
         let e = epoch_of(slot);
@@ -1527,6 +1780,9 @@ impl Engine {
 
     fn propose(&mut self, slot: u64) {
         if self.keys.is_none() {
+            return;
+        }
+        if self.doppelganger_blocks_duties(slot) {
             return;
         }
         let e = epoch_of(slot);
@@ -1934,6 +2190,15 @@ impl Engine {
             // and it is not this node's job to relay it a second time.
             return (Verdict::Ignore, None);
         }
+        // R3 M-1: already judged and refused by the finality latch. Dropped
+        // here, before any signature work, so a peer that keeps re-offering
+        // an already-refused branch cannot make this node pay to re-derive
+        // the same verdict — this is what turns "sync re-fetches and
+        // re-refuses forever" into a bounded, cheap no-op. See
+        // `Engine::parked_refused_finality`'s doc.
+        if self.parked_refused_finality.iter().any(|(seen, _)| *seen == id) {
+            return (Verdict::Ignore, None);
+        }
         // A cheap early reject before the block reaches the transition, using
         // the same `derive::*` functions the transition checks with — one
         // definition, called twice, not two definitions. The transition is the
@@ -2107,7 +2372,13 @@ impl Engine {
                     .any(|tx| matches!(tx, PosTransaction::Deposit { .. }))
             })
             .unwrap_or(false);
+        // Read before `env` moves — R6 HIGH-8: an authenticated (this door's
+        // signature check already ran, above) proposal by `proposer_index`
+        // is exactly the class of sighting doppelgänger protection exists to
+        // catch, symmetric with the attestation hook in `apply_decision`.
+        let proposer_index = env.header.proposer_index;
         self.blocks.insert(id, env);
+        self.note_possible_doppelganger(proposer_index);
         self.advance();
         // The block is queryable now, so attestations parked on it can be
         // re-run. `advance()` first: an attestation released here votes on
@@ -2176,6 +2447,68 @@ impl Engine {
         let before = self.orphans.len();
         self.orphans.retain(|(_, env)| env.header.slot >= floor);
         self.orphans_evicted += (before - self.orphans.len()) as u64;
+    }
+
+    // ── Transaction-status index (R4 F-11, `gettxstatus`) ───────────────────
+
+    /// Record `txid -> slot` for every transaction `txs` carries, called once
+    /// per block from the canonical-apply paths (`apply_canonical`,
+    /// `do_reorg`'s winning branch). Overwrites any earlier entry for the
+    /// same txid — a transaction included again at a new slot on a winning
+    /// branch is exactly the case where the newer slot is the true answer.
+    fn note_tx_slots(&mut self, slot: u64, txs: &[PosTransaction]) {
+        for tx in txs {
+            let id = tx.txid();
+            if self.tx_slot_index.insert(id, slot).is_none() {
+                self.tx_slot_index_order.push_back(id);
+            }
+        }
+        while self.tx_slot_index_order.len() > MAX_TX_SLOT_INDEX {
+            if let Some(oldest) = self.tx_slot_index_order.pop_front() {
+                self.tx_slot_index.remove(&oldest);
+            }
+        }
+    }
+
+    /// A block at `slot` carrying `txs` just left canonical history (the
+    /// losing side of a reorg). Remove any index entry that STILL points at
+    /// `slot` — one that does not has already been overwritten by
+    /// `note_tx_slots` for the same txid re-included on the winning branch,
+    /// and must not be clobbered back to a slot that is no longer canonical.
+    fn forget_tx_slots_if_stale(&mut self, slot: u64, txs: &[PosTransaction]) {
+        for tx in txs {
+            let id = tx.txid();
+            if self.tx_slot_index.get(&id) == Some(&slot) {
+                self.tx_slot_index.remove(&id);
+                // Left in `tx_slot_index_order`: the FIFO eviction loop in
+                // `note_tx_slots` tolerates a stale id there (it is simply a
+                // no-op removal when its turn comes), and the order queue's
+                // OWN length is what bounds memory, so this costs nothing
+                // beyond one wasted future eviction slot.
+            }
+        }
+    }
+
+    /// `pending | included | justified | finalized | unknown` for `txid`
+    /// (R4 F-11). Cheapest check first: the bounded index (`O(log n)`
+    /// lookup) before the mempool (`O(mempool_len)` scan, since the mempool
+    /// is keyed by canonical bytes, not by txid).
+    fn tx_status(&self, txid: &[u8; 32]) -> &'static str {
+        if let Some(&slot) = self.tx_slot_index.get(txid) {
+            let fin = self.state.finality();
+            let e = epoch_of(slot);
+            return if e <= fin.finalized.epoch {
+                "finalized"
+            } else if e <= fin.justified.epoch {
+                "justified"
+            } else {
+                "included"
+            };
+        }
+        if self.mempool.values().any(|tx| &tx.txid() == txid) {
+            return "pending";
+        }
+        "unknown"
     }
 
     // ── Fork choice: LMD-GHOST ──────────────────────────────────────────────
@@ -2601,9 +2934,53 @@ impl Engine {
             self.note_bar(&key, until_slot);
             return Err(Refusal::PreviouslyRefused { until_slot });
         }
-        if self.mempool.len() >= MEMPOOL_MAX {
-            return Err(Refusal::AtCapacity);
+        // R7 M6: per-source cap, before capacity — a source at its own cap
+        // must be refused as such even when the mempool overall has room,
+        // and must not instead be told to look at the (irrelevant) overall
+        // capacity.
+        if let Some(source) = tx_source_hash(&tx) {
+            let from_source =
+                self.mempool.values().filter(|t| tx_source_hash(t) == Some(source)).count();
+            if from_source >= MEMPOOL_MAX_PER_SOURCE {
+                return Err(Refusal::TooManyFromSource);
+            }
         }
+        // R7 M6: at capacity, decide WHETHER an eviction is even possible —
+        // read-only, cheap, no crypto paid — but do not COMMIT it yet. The
+        // incoming transaction must still pass `admissible` below before any
+        // real entry is actually removed: otherwise a transaction that
+        // CLAIMS a high `tip_millisat_per_gas` but carries a garbage
+        // signature would evict a real, paying transaction for free and
+        // then itself be refused as `Invalid` — a targeted eviction that
+        // costs the attacker nothing, since `tip_millisat_per_gas` sits
+        // inside the signed root and checking it against the signature is
+        // exactly the expensive step this ordering must not skip.
+        let evict_at_capacity: Option<Vec<u8>> = if self.mempool.len() >= MEMPOOL_MAX {
+            // `min_by_key` breaks ties by iteration order (`BTreeMap`,
+            // ascending canonical bytes) — deterministic, and irrelevant to
+            // security: a tie for LOWEST fee is the one place grinding buys
+            // nothing, since every tied candidate is equally eligible for
+            // eviction regardless of which one this picks.
+            let lowest = self
+                .mempool
+                .iter()
+                .min_by_key(|(_, t)| tx_tip_rate(t))
+                .map(|(k, t)| (k.clone(), tx_tip_rate(t)));
+            match lowest {
+                // Strictly greater, not `>=`: a flood of minimum-fee
+                // transactions must not be able to evict a real payer merely
+                // by arriving. Today's `AtCapacity` at least costs such a
+                // flood nothing extra; letting a TIE evict would make it
+                // actively clear out everyone who already paid, which is
+                // strictly worse than the refusal it replaces.
+                Some((lowest_key, lowest_rate)) if tx_tip_rate(&tx) > lowest_rate => {
+                    Some(lowest_key)
+                }
+                _ => return Err(Refusal::AtCapacity),
+            }
+        } else {
+            None
+        };
         // Refuse the shapes consensus can never apply.
         //
         // Admission used to check duplicate-and-capacity only, so anything
@@ -2637,6 +3014,13 @@ impl Engine {
         // feeds. Gossip (`NetEvent::Transaction`) and RPC both land in this
         // one call, so one call site carries the whole decision.
         admissible(&tx, epoch_of(self.wall_slot())).map_err(Refusal::Invalid)?;
+        // R7 M6: only now, with the incoming transaction confirmed
+        // admissible, actually commit the eviction decided above.
+        if let Some(lowest_key) = evict_at_capacity {
+            self.mempool.remove(&lowest_key);
+            self.mempool_admitted_at.remove(&lowest_key);
+            self.mempool_evicted_low_fee += 1;
+        }
         let mut frame = vec![net::FRAME_TX];
         frame.extend_from_slice(&key);
         // The retention clock starts at the head this node is on, not at the
@@ -2653,18 +3037,17 @@ impl Engine {
     /// Transactions for the block this node is about to propose.
     ///
     /// Bounded by both [`MAX_TXS_PER_BLOCK`] and the consensus byte cap, and
-    /// taken in the mempool's own key order — **lexicographic over the
-    /// canonical transaction bytes**, because the mempool is a `BTreeMap` keyed
-    /// by exactly those bytes. Not insertion order, whatever this comment used
-    /// to say.
+    /// ordered by [`tx_tip_rate`] DESCENDING (R7 M6), ties broken on
+    /// canonical bytes ascending.
     ///
-    /// That is not a fee market, and it is not neutral either: a sender who
-    /// re-encodes until the bytes sort low is included first, for free, so
-    /// inclusion order is grindable. The material for a real ordering is
-    /// already on the wire — a `Transfer` carries `outputs` with values and a
-    /// `tip_millisat_per_gas`, which `submit-tx` sets on every transaction it
-    /// builds (main.rs) — so sorting by what the transaction pays is a change
-    /// that can be made; it simply has not been made here.
+    /// **This used to be the mempool's own key order** — lexicographic over
+    /// the canonical transaction bytes, because the mempool is a `BTreeMap`
+    /// keyed by exactly those bytes — which was not a fee market and was not
+    /// neutral either: a sender who re-encoded until the bytes sorted low was
+    /// included first, for free (A3 I3). The material for a real ordering
+    /// was already on the wire the whole time: a `Transfer` carries `outputs`
+    /// with values and a `tip_millisat_per_gas`, which `submit-tx` sets on
+    /// every transaction it builds (main.rs).
     ///
     /// `epoch` is the epoch of the slot being produced, because the byte cap
     /// is flag-day gated. Packing against the wrong era is not symmetric: the
@@ -2675,7 +3058,22 @@ impl Engine {
         let cap = bloch_pos_committee::fee_market::max_block_tx_bytes(epoch);
         let mut out = Vec::new();
         let mut bytes = 0u64;
-        for (encoded, tx) in self.mempool.iter() {
+        // R7 M6: ordered by `tx_tip_rate` DESCENDING — not the mempool's
+        // natural `BTreeMap` order (ascending canonical bytes), which made
+        // inclusion order lexicographic over the encoded transaction and
+        // therefore grindable for free (A3 I3: re-encode until the bytes
+        // sort low, buy priority for nothing). Ties broken on canonical
+        // bytes ascending — the SAME tie-break the old order used
+        // exclusively — so the result is still fully deterministic and a
+        // tie at the lowest-value end of the ordering (where grinding could
+        // matter) is exactly where two proposers can disagree for free
+        // without it costing security: candidates tied on fee are
+        // interchangeable by construction.
+        let mut ordered: Vec<(&Vec<u8>, &PosTransaction)> = self.mempool.iter().collect();
+        ordered.sort_by(|(ka, ta), (kb, tb)| {
+            tx_tip_rate(tb).cmp(&tx_tip_rate(ta)).then_with(|| ka.cmp(kb))
+        });
+        for (encoded, tx) in ordered {
             if out.len() >= MAX_TXS_PER_BLOCK {
                 break;
             }
@@ -2761,6 +3159,11 @@ impl Engine {
                 for encoded in &env.body.transactions {
                     self.mempool.remove(encoded);
                 }
+                // R4 F-11: record where each transaction landed, for
+                // `gettxstatus`. After the mempool drop (a transaction is
+                // "included", not "pending", the instant this runs) and
+                // before anything below could return early.
+                self.note_tx_slots(env.header.slot, &txs);
                 // AFTER the inclusion drop above and BEFORE the epoch
                 // sweep: the head has just moved, so this is the moment the
                 // TTL is measured against, and anything this block carried is
@@ -2938,37 +3341,79 @@ impl Engine {
     /// Would truncating the canonical chain at `ancestor` cut below the
     /// latch? `ancestor` at the latch height itself is fine — the finalized
     /// block stays canonical — so the comparison is strict.
+    ///
+    /// R3 M-1: `finality_rewind_override` does not silently disable the
+    /// latch — it is checked here, once, and every instant it actually
+    /// changes the answer (a cut that WOULD have been refused is instead
+    /// allowed) is logged loudly, naming the exact condition. An operator who
+    /// set the override sees, in the log, exactly when and why it fired —
+    /// which is the difference between "an acknowledged flag day" and "a
+    /// silent hole in the safety property the latch exists for".
     fn cut_below_finalized_latch(&self, ancestor: &[u8; 32]) -> bool {
-        match self.finalized_latch {
+        let would_cut = match self.finalized_latch {
             Some((floor, _)) => self.height_of(ancestor).is_some_and(|h| h < floor),
             None => false,
+        };
+        if would_cut && self.finality_rewind_override {
+            if self.live {
+                let (floor, root) = self.finalized_latch.expect("would_cut implies latched");
+                eprintln!(
+                    "FINALITY_LATCH: BLOCH_ALLOW_FINALITY_REWIND is set — ALLOWING a reorg \
+                     below this node's finalized checkpoint (height {floor}, {}) that would \
+                     otherwise have been refused. This must only happen with a human \
+                     operator's deliberate, informed consent.",
+                    crate::codec::hex8(&root),
+                );
+            }
+            return false;
         }
+        would_cut
     }
 
     /// Refuse a reorg that would rewind this node below its own finalized
-    /// checkpoint, and drop the branch that demanded it.
+    /// checkpoint, and park the branch that demanded it (R3 M-1).
     ///
-    /// The drop is the "refuse blocks that would" half of the rule: a branch
-    /// that conflicts with this node's finality can never legitimately be
-    /// adopted later (adopting it IS the rewind), so keeping its blocks would
-    /// only let the heaviest-branch walk keep proposing the same refused
-    /// head and freeze fork choice. Removing them lets the next `advance`
-    /// converge on the heaviest branch that respects finality.
+    /// The branch is removed from `self.blocks` — the fork-choice input map —
+    /// regardless: a branch that conflicts with this node's finality can
+    /// never legitimately be adopted later (adopting it IS the rewind), so
+    /// leaving it there would let the heaviest-branch walk keep re-selecting
+    /// and re-refusing the same head on every tick, forever, even with no new
+    /// bytes arriving. That much is unchanged from before this fix.
+    ///
+    /// What changes is that the blocks are not simply dropped: they are
+    /// parked in [`Engine::parked_refused_finality`], bounded and FIFO, so a
+    /// re-offer of the SAME branch is recognised and refused at the door
+    /// (`ingest_one`) before any signature work — never re-authenticated,
+    /// never re-run through a whole `advance` cycle, never silently
+    /// re-refused in a way this node cannot distinguish from the first time.
     fn refuse_finality_rewind(&mut self, branch: &[BlockEnvelope]) {
         self.finality_rewinds_refused += 1;
         let (floor, root) = self.finalized_latch.expect("only called when latched");
         if self.live {
             eprintln!(
                 "FINALITY_LATCH: refused a reorg below this node's finalized checkpoint \
-                 (height {floor}, {}); dropping the {} conflicting block(s). \
-                 Refusals so far: {}.",
+                 (height {floor}, {}); parking the {} conflicting block(s) (cap {}, {} \
+                 currently parked) instead of deleting them, so a re-offer is refused at \
+                 the door rather than re-judged from scratch. Refusals so far: {}. If this \
+                 rewind is EXPECTED, restart with --allow-finality-rewind or \
+                 BLOCH_ALLOW_FINALITY_REWIND=1.",
                 crate::codec::hex8(&root),
                 branch.len(),
+                MAX_PARKED_REFUSED_FINALITY,
+                self.parked_refused_finality.len(),
                 self.finality_rewinds_refused,
             );
         }
         for env in branch {
-            self.blocks.remove(env.block_id().as_bytes());
+            let id = *env.block_id().as_bytes();
+            self.blocks.remove(&id);
+            if self.parked_refused_finality.iter().any(|(seen, _)| *seen == id) {
+                continue;
+            }
+            while self.parked_refused_finality.len() >= MAX_PARKED_REFUSED_FINALITY {
+                self.parked_refused_finality.pop_front();
+            }
+            self.parked_refused_finality.push_back((id, env.clone()));
         }
     }
 
@@ -3027,7 +3472,16 @@ impl Engine {
                 .tr
                 .apply_block(pre, &envelope, &env.body.attestations, &txs)
             {
-                Ok(post) => applied.push((*env.block_id().as_bytes(), Arc::new(post))),
+                Ok(post) => {
+                    // R4 F-11: the whole branch is guaranteed adopted from
+                    // here — every remaining block in it either validates
+                    // too or this function returns `false` before any of
+                    // this is observable — so recording now, rather than in
+                    // a second pass after `self.chain` is rebuilt below, does
+                    // not risk indexing a branch that never lands.
+                    self.note_tx_slots(env.header.slot, &txs);
+                    applied.push((*env.block_id().as_bytes(), Arc::new(post)));
+                }
                 Err(err) => {
                     eprintln!(
                         "reorg candidate {} invalid at slot {}: {err:?}",
@@ -3038,6 +3492,19 @@ impl Engine {
                     return false;
                 }
             }
+        }
+        // R4 F-11: the OLD canonical tail is about to leave canonical
+        // history (below). Any transaction it included that is NOT
+        // re-included by the winning branch above must stop being reported
+        // as "included" at a slot this node's chain no longer contains —
+        // BEFORE the truncate, while these blocks are still reachable by id.
+        let stale: Vec<(u64, Vec<PosTransaction>)> = self.chain[cut + 1..]
+            .iter()
+            .filter_map(|(_, id)| self.blocks.get(id.as_bytes()))
+            .filter_map(|env| body_transactions(env).ok().map(|txs| (env.header.slot, txs)))
+            .collect();
+        for (slot, txs) in stale {
+            self.forget_tx_slots_if_stale(slot, &txs);
         }
         let st = applied
             .last()
@@ -3229,7 +3696,16 @@ impl Engine {
                          (slashing pipeline NOT wired — evidence is logged, not prosecuted)",
                         ev.second.validator, ev.second.data.slot,
                     );
+                    // Metrics gap (R3): the log line above was the only trace
+                    // of this. An alert cannot page on a grep pattern.
+                    crate::metrics::NodeMetrics::inc(
+                        &crate::metrics::NODE.equivocations_observed_total,
+                    );
                 }
+                // R6 HIGH-8: an accepted attestation is a real, signature-
+                // checked duty by `att.validator` — exactly the class of
+                // sighting doppelgänger protection exists to catch.
+                self.note_possible_doppelganger(att.validator);
                 self.pool
                     .insert((att.validator, att.data.signing_root()), att);
                 self.net.report(origin, Verdict::Accept);
@@ -3595,6 +4071,17 @@ impl Engine {
                     format!("{why} — this transaction cannot be admitted; retrying \
                              the same bytes will not help"),
                 )),
+                // R7 M6: a third, distinct shape — see `rpc::TX_REFUSED_SOURCE_CAP`'s
+                // own doc for why this is neither `MEMPOOL_FULL` nor `TX_REFUSED`.
+                Err(Refusal::TooManyFromSource) => Err(RpcError::new(
+                    rpc::TX_REFUSED_SOURCE_CAP,
+                    format!(
+                        "{} pending transactions already sharing this source \
+                         (MEMPOOL_MAX_PER_SOURCE); wait for one to clear before \
+                         submitting another",
+                        MEMPOOL_MAX_PER_SOURCE,
+                    ),
+                )),
             },
 
             // Identity of the binary, not of the chain: no state read, no
@@ -3608,7 +4095,25 @@ impl Engine {
                 self.rejected.len(),
                 self.rejected_hits,
                 self.mempool_expired,
+                self.mempool_evicted_low_fee,
             )),
+
+            // R4 F-11.
+            RpcRequest::Validators => {
+                let active = self.state.active_validators();
+                let current_epoch = epoch_of(self.state.slot());
+                let entries: Vec<(ValidatorRecord, Option<u64>)> = (0..self.state.validator_count()
+                    as u32)
+                    .filter_map(|i| {
+                        let rec = self.state.validator_record(i)?;
+                        let effective = active.iter().find(|v| v.index == i).map(|v| v.effective_stake);
+                        Some((rec, effective))
+                    })
+                    .collect();
+                Ok(rpc::validators_json(&entries, current_epoch))
+            }
+
+            RpcRequest::TxStatus(txid) => Ok(rpc::tx_status_json(self.tx_status(&txid))),
         }
     }
 }
@@ -3928,6 +4433,21 @@ pub fn run(cfg: Config) -> io::Result<()> {
             None
         }
     };
+    // Metrics gap (R3): `keystore_sealed`. Peeked from the raw file's magic
+    // rather than a new API on `Keystore` — that module is owned by a
+    // parallel workstream, and the magic bytes are the whole of what "sealed"
+    // means (`BPOSKEY2` vs the plaintext `BPOSKEY1`). 0 on an observer too:
+    // there is nothing to seal. This matters ahead of the `LEAK_RECOVERY`
+    // flag day, which refuses a plaintext keystore outright — an operator
+    // needs to see "still plaintext" BEFORE that day, not discover it as a
+    // boot failure on it.
+    crate::metrics::NodeMetrics::set(
+        &crate::metrics::NODE.keystore_sealed,
+        u64::from(
+            std::fs::read(cfg.data_dir.join("validator.key"))
+                .is_ok_and(|bytes| bytes.starts_with(b"BPOSKEY2")),
+        ),
+    );
     // Stateless now: it holds no key table. Keys are resolved per call from
     // the committed registry by whichever consensus site is asking.
     let verifier = HybridVerifier::new();
@@ -3966,7 +4486,22 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // Loaded before anything can sign. A corrupt watermark file stops the node
     // here, on purpose: a validator that cannot prove which duties it already
     // signed must not sign.
-    let slashprot = SlashingProtection::open(&cfg.data_dir)?;
+    //
+    // Bound to THIS validator key on THIS network when a keystore is present
+    // (audit round 3, M-8): a watermark file restored from another
+    // validator's backup, or carried across a network reset, is refused at
+    // boot naming the mismatch instead of admitting a duty this key already
+    // signed. An observer has nothing to bind and opens unbound.
+    let slashprot = match keys.as_ref() {
+        Some(k) => {
+            let pkh: [u8; 32] = <sha3::Sha3_256 as sha3::Digest>::digest(&k.pubkey).into();
+            SlashingProtection::open_bound(
+                &cfg.data_dir,
+                crate::slashprot::Binding { validator_pubkey_sha3: pkh, genesis_digest: digest },
+            )?
+        }
+        None => SlashingProtection::open(&cfg.data_dir)?,
+    };
     if let Some(wm) = slashprot.watermarks().attestation_slot {
         println!(
             "slashing protection: last attested slot {wm}, last proposed slot {}",
@@ -4082,6 +4617,52 @@ pub fn run(cfg: Config) -> io::Result<()> {
         }
     );
 
+    // R3 M-1: read once, at boot — env is fixed for the life of a process,
+    // so there is no correctness reason to re-read it per reorg, and caching
+    // means a value that could not change mid-run is not treated as though
+    // it might. Logged loudly HERE too (not only when it fires): an operator
+    // who set this should see it confirmed immediately, not only discover it
+    // was armed the first time a rewind actually happens.
+    let allow_finality_rewind = std::env::var_os("BLOCH_ALLOW_FINALITY_REWIND")
+        .is_some_and(|v| v == "1" || v == "true");
+    if allow_finality_rewind {
+        println!(
+            "FINALITY_LATCH: BLOCH_ALLOW_FINALITY_REWIND is set — this node will ALLOW a \
+             reorg below its own finalized checkpoint if one is ever offered, instead of \
+             refusing it. This should only be set with a human operator's deliberate, \
+             informed consent."
+        );
+    }
+
+    // R6 HIGH-8 (doppelgänger protection, node half): only a validator (has
+    // a keystore) needs this — an observer performs no duties to protect.
+    // Disabled by BLOCH_NO_DOPPELGANGER / --no-doppelganger-check (main.rs
+    // sets the same env var). Computed from the manifest directly, the same
+    // arithmetic `Engine::wall_slot` uses, because the engine does not exist
+    // yet to ask.
+    let no_doppelganger_check = std::env::var_os("BLOCH_NO_DOPPELGANGER").is_some();
+    let doppelganger_observe_until = if keys.is_some() && !no_doppelganger_check {
+        let boot_wall_slot =
+            now_ms().saturating_sub(manifest.genesis_time_ms) / manifest.slot_ms.max(1);
+        let until = boot_wall_slot.saturating_add(DOPPELGANGER_OBSERVE_SLOTS);
+        println!(
+            "DOPPELGANGER PROTECTION: observing for this node's own validator index through \
+             wall slot {until} ({DOPPELGANGER_OBSERVE_SLOTS} slots) before starting duties. \
+             Disable with --no-doppelganger-check or BLOCH_NO_DOPPELGANGER=1 (NOT recommended \
+             on a live validator key)."
+        );
+        Some(until)
+    } else {
+        if keys.is_some() {
+            println!(
+                "DOPPELGANGER PROTECTION: DISABLED (BLOCH_NO_DOPPELGANGER is set). This node \
+                 will start duties immediately without checking whether another instance of \
+                 this key is already signing."
+            );
+        }
+        None
+    };
+
     let mut engine = Engine {
         state: StateCell::new(genesis_state),
         tr: Transition::new(verifier.clone()),
@@ -4098,6 +4679,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         mempool: BTreeMap::new(),
         mempool_admitted_at: BTreeMap::new(),
         mempool_expired: 0,
+        mempool_evicted_low_fee: 0,
         rejected: BTreeMap::new(),
         rejected_hits: 0,
         mempool_suspect: BTreeSet::new(),
@@ -4122,6 +4704,12 @@ pub fn run(cfg: Config) -> io::Result<()> {
         fc_covered_removals: 0,
         finalized_latch: None,
         finality_rewinds_refused: 0,
+        parked_refused_finality: VecDeque::new(),
+        finality_rewind_override: allow_finality_rewind,
+        tx_slot_index: BTreeMap::new(),
+        tx_slot_index_order: VecDeque::new(),
+        doppelganger_observe_until,
+        doppelganger_halted: false,
         manifest,
     };
 
@@ -4482,6 +5070,31 @@ pub fn run(cfg: Config) -> io::Result<()> {
             NodeMetrics::set(
                 &NODE.peer_count,
                 (devnet_peers.unwrap_or(0) + p2p_peers.unwrap_or(0)) as u64,
+            );
+            // Per-transport (metrics gap): `None` (transport not running) and
+            // `Some(0)` (running, no peers) both read as 0 here — a gauge has
+            // no absent state — but `getchaininfo`'s `transport` block still
+            // carries the distinction for an operator who needs it.
+            NodeMetrics::set(&NODE.peer_count_devnet, devnet_peers.unwrap_or(0) as u64);
+            NodeMetrics::set(&NODE.peer_count_p2p, p2p_peers.unwrap_or(0) as u64);
+            // R3 M-1: mirrors `Engine::finality_rewinds_refused` every turn —
+            // cheap (one more atomic store) and correct either way, since the
+            // counter only ever goes up.
+            NodeMetrics::set(&NODE.finality_rewinds_refused_total, engine.finality_rewinds_refused);
+            // R3 M-5: the slot-progress signal `/health` corroborates the
+            // heartbeat with. `genesis_unix`/`slot_secs` are effectively
+            // constants of this manifest; setting them every turn costs one
+            // more atomic store each and keeps this block free of a
+            // "set only once" special case.
+            NodeMetrics::set(&NODE.genesis_unix, engine.manifest.genesis_time_ms / 1000);
+            NodeMetrics::set(&NODE.slot_secs, (engine.manifest.slot_ms / 1000).max(1));
+            NodeMetrics::set(&NODE.last_applied_unix, engine.last_applied_ms / 1000);
+            // Blocks parked rather than admitted: orphans waiting on a
+            // missing parent, plus branches the finality latch refused (R3
+            // M-1) rather than deleted.
+            NodeMetrics::set(
+                &NODE.blocks_parked,
+                (engine.orphans.len() + engine.parked_refused_finality.len()) as u64,
             );
             // Once per slot, not per turn: `peer_counts` is cheap but
             // `statvfs` is a syscall against the data volume.
@@ -6409,6 +7022,7 @@ mod transfer_v2_end_to_end {
             mempool: BTreeMap::new(),
             mempool_admitted_at: BTreeMap::new(),
             mempool_expired: 0,
+            mempool_evicted_low_fee: 0,
             rejected: BTreeMap::new(),
         rejected_hits: 0,
         mempool_suspect: BTreeSet::new(),
@@ -6433,6 +7047,12 @@ mod transfer_v2_end_to_end {
             fc_covered_removals: 0,
             finalized_latch: None,
             finality_rewinds_refused: 0,
+            parked_refused_finality: VecDeque::new(),
+            finality_rewind_override: false,
+            tx_slot_index: BTreeMap::new(),
+            tx_slot_index_order: VecDeque::new(),
+            doppelganger_observe_until: None,
+            doppelganger_halted: false,
         }
     }
 
@@ -7250,9 +7870,22 @@ mod transfer_v2_end_to_end {
         // and there "retry later" is the correct advice. Without this half,
         // the assertion above could be satisfied by never reporting a full
         // mempool at all.
+        //
+        // Each filler entry gets a DISTINCT source (R7 M6's per-source cap,
+        // `MEMPOOL_MAX_PER_SOURCE` = 64, is far below `MEMPOOL_MAX` = 4,096):
+        // without this, every filler shares `tx`'s one source and the fill
+        // trips the per-source cap at 64 entries rather than ever reaching
+        // real capacity, which is a different, more specific refusal
+        // (`TX_REFUSED_SOURCE_CAP`) than the one this control is for.
         let mut full = node;
         for i in 0..MEMPOOL_MAX {
-            full.mempool.insert(vec![0xEE, (i >> 8) as u8, i as u8], tx.clone());
+            let mut filler = tx.clone();
+            if let PosTransaction::TransferV2 { keys, .. } = &mut filler {
+                if let Some(k) = keys.first_mut() {
+                    k.pubkey = (i as u32).to_le_bytes().to_vec();
+                }
+            }
+            full.mempool.insert(vec![0xEE, (i >> 8) as u8, i as u8], filler);
         }
         let RpcResult::Err(e2) = full.serve_rpc(RpcRequest::SendRawTransaction(tx.clone()))
         else {
@@ -7374,6 +8007,7 @@ mod perf_support {
             mempool: BTreeMap::new(),
             mempool_admitted_at: BTreeMap::new(),
             mempool_expired: 0,
+            mempool_evicted_low_fee: 0,
             rejected: BTreeMap::new(),
         rejected_hits: 0,
         mempool_suspect: BTreeSet::new(),
@@ -7404,8 +8038,146 @@ mod perf_support {
             fc_covered_removals: 0,
             finalized_latch: None,
             finality_rewinds_refused: 0,
+            parked_refused_finality: VecDeque::new(),
+            finality_rewind_override: false,
+            tx_slot_index: BTreeMap::new(),
+            tx_slot_index_order: VecDeque::new(),
+            doppelganger_observe_until: None,
+            doppelganger_halted: false,
         };
         (engine, TestDir(dir))
+    }
+}
+
+/// Doppelgänger protection (R6 HIGH-8, node half): `Engine::note_possible_doppelganger`
+/// and `Engine::doppelganger_blocks_duties`.
+#[cfg(test)]
+mod doppelganger_tests {
+    use super::*;
+
+    fn sample_attestation_for(validator: u32) -> Attestation {
+        Attestation {
+            data: AttestationData {
+                slot: 1,
+                head: [0u8; 32],
+                source_epoch: 0,
+                source_root: [0u8; 32],
+                target_epoch: 0,
+                target_root: [0u8; 32],
+            },
+            validator,
+            signature: Vec::new(),
+        }
+    }
+
+    /// **The finding's own scenario.** A synthetic gossip attestation
+    /// carrying this node's own validator index, accepted during the
+    /// observation window, is unambiguous evidence of a live duplicate: this
+    /// process refuses ALL duties throughout the window (`attest`/`propose`
+    /// both check `doppelganger_blocks_duties` first), so it did not produce
+    /// this itself.
+    #[test]
+    fn a_synthetic_gossip_attestation_from_own_index_is_detected() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let my_index = engine.keys.as_ref().expect("fixture: has a keystore").index;
+        engine.doppelganger_observe_until = Some(1_000);
+        engine.wall_slot = 5; // well inside the window
+
+        assert!(!engine.doppelganger_halted, "must not start halted");
+        engine.apply_decision(
+            sample_attestation_for(my_index),
+            GossipDecision::Accept { slashing_candidate: None },
+            &Origin::none(),
+        );
+        assert!(
+            engine.doppelganger_halted,
+            "an attestation from this node's own index, during the observation window, \
+             must be detected as a live duplicate"
+        );
+    }
+
+    /// A duty under SOMEONE ELSE'S index proves nothing about this key.
+    #[test]
+    fn an_attestation_from_another_index_is_not_a_doppelganger() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let my_index = engine.keys.as_ref().expect("fixture: has a keystore").index;
+        engine.doppelganger_observe_until = Some(1_000);
+        engine.wall_slot = 5;
+
+        engine.apply_decision(
+            sample_attestation_for(my_index + 1),
+            GossipDecision::Accept { slashing_candidate: None },
+            &Origin::none(),
+        );
+        assert!(!engine.doppelganger_halted, "another validator's duty must not trip the halt");
+    }
+
+    /// Once the window has closed, THIS node may itself be producing duties
+    /// under its own index — seeing that index attest is then the expected
+    ///, ordinary case, not evidence of a duplicate.
+    #[test]
+    fn own_index_after_the_window_closes_is_not_flagged() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let my_index = engine.keys.as_ref().expect("fixture: has a keystore").index;
+        engine.doppelganger_observe_until = Some(10);
+        engine.wall_slot = 50; // past the window
+
+        engine.apply_decision(
+            sample_attestation_for(my_index),
+            GossipDecision::Accept { slashing_candidate: None },
+            &Origin::none(),
+        );
+        assert!(!engine.doppelganger_halted, "past the window, this node's own index is expected");
+    }
+
+    /// The whole point of a PERMANENT halt: once detected, duties stay
+    /// blocked even past the window's own original deadline — the halt is a
+    /// fact about the key having a live duplicate, not about the moment it
+    /// was first seen, and must survive the window closing.
+    #[test]
+    fn once_detected_duties_stay_blocked_past_the_original_deadline() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let my_index = engine.keys.as_ref().expect("fixture: has a keystore").index;
+        engine.doppelganger_observe_until = Some(10);
+        engine.wall_slot = 5;
+        engine.apply_decision(
+            sample_attestation_for(my_index),
+            GossipDecision::Accept { slashing_candidate: None },
+            &Origin::none(),
+        );
+        assert!(engine.doppelganger_halted, "fixture: must have detected the duplicate");
+        assert!(
+            engine.doppelganger_blocks_duties(9_999),
+            "a detected duplicate must block duties indefinitely, not just until the window"
+        );
+    }
+
+    /// No window armed (bypassed via `--no-doppelganger-check` /
+    /// `BLOCH_NO_DOPPELGANGER`, or an observer with no keys) means no
+    /// suppression at all — the default every OTHER test's engine relies on,
+    /// since none of them arm the window.
+    #[test]
+    fn no_window_means_duties_are_never_blocked() {
+        let (engine, _dir) = perf_support::proposing_engine();
+        assert!(engine.doppelganger_observe_until.is_none(), "fixture: window must start unarmed");
+        assert!(!engine.doppelganger_blocks_duties(0));
+        assert!(!engine.doppelganger_blocks_duties(u64::MAX));
+    }
+
+    /// Inside the window but nothing has been seen yet: duties are blocked
+    /// (observe-only mode), silently — this is the expected, ordinary state
+    /// for every slot of a normal boot, not an error condition.
+    #[test]
+    fn inside_the_window_with_nothing_seen_duties_are_blocked_without_halting() {
+        let (engine, _dir) = perf_support::proposing_engine();
+        let mut engine = engine;
+        engine.doppelganger_observe_until = Some(1_000);
+        assert!(engine.doppelganger_blocks_duties(5), "still observing: duties must wait");
+        assert!(!engine.doppelganger_halted, "observing alone is not a detected duplicate");
+        assert!(
+            !engine.doppelganger_blocks_duties(1_000),
+            "at the deadline slot itself, the window has closed"
+        );
     }
 }
 
@@ -8920,6 +9692,7 @@ mod duty_view_anchor {
             mempool: BTreeMap::new(),
             mempool_admitted_at: BTreeMap::new(),
             mempool_expired: 0,
+            mempool_evicted_low_fee: 0,
             rejected: BTreeMap::new(),
         rejected_hits: 0,
         mempool_suspect: BTreeSet::new(),
@@ -8944,6 +9717,12 @@ mod duty_view_anchor {
             fc_covered_removals: 0,
             finalized_latch: None,
             finality_rewinds_refused: 0,
+            parked_refused_finality: VecDeque::new(),
+            finality_rewind_override: false,
+            tx_slot_index: BTreeMap::new(),
+            tx_slot_index_order: VecDeque::new(),
+            doppelganger_observe_until: None,
+            doppelganger_halted: false,
         };
         (engine, dir)
     }
@@ -9174,6 +9953,7 @@ mod slot_horizon {
             mempool: BTreeMap::new(),
             mempool_admitted_at: BTreeMap::new(),
             mempool_expired: 0,
+            mempool_evicted_low_fee: 0,
             rejected: BTreeMap::new(),
             rejected_hits: 0,
             mempool_suspect: BTreeSet::new(),
@@ -9191,6 +9971,12 @@ mod slot_horizon {
             fc_covered_removals: 0,
             finalized_latch: None,
             finality_rewinds_refused: 0,
+            parked_refused_finality: VecDeque::new(),
+            finality_rewind_override: false,
+            tx_slot_index: BTreeMap::new(),
+            tx_slot_index_order: VecDeque::new(),
+            doppelganger_observe_until: None,
+            doppelganger_halted: false,
             orphans: VecDeque::new(),
             orphans_evicted: 0,
             orphans_admitted: 0,
@@ -9847,7 +10633,11 @@ mod mempool_ttl {
 
     /// A transfer that is never included and never needs to be valid: nothing
     /// on the retention path parses it. `n` only separates the keys.
-    fn parked_transfer(n: u8) -> PosTransaction {
+    ///
+    /// `pub(super)`: also reused by `tx_status_tests` (R4 F-11), a sibling
+    /// module under `engine` that needs a cheap, distinct transaction and no
+    /// reason to duplicate this one.
+    pub(super) fn parked_transfer(n: u8) -> PosTransaction {
         PosTransaction::Transfer {
             inputs: vec![TransferInput {
                 txid: [n; 32],
@@ -9862,8 +10652,8 @@ mod mempool_ttl {
     }
 
     /// Put `tx` in the pool the way `on_transaction` does, admitted at the
-    /// head the engine is on right now.
-    fn admit(e: &mut Engine, tx: PosTransaction) -> Vec<u8> {
+    /// head the engine is on right now. `pub(super)` — see `parked_transfer`.
+    pub(super) fn admit(e: &mut Engine, tx: PosTransaction) -> Vec<u8> {
         let key = tx.canonical_bytes();
         e.mempool_admitted_at.insert(key.clone(), e.head_slot_now());
         e.mempool.insert(key.clone(), tx);
@@ -9968,6 +10758,146 @@ mod mempool_ttl {
         assert!(!e.mempool.contains_key(&key));
         assert!(!e.rejected.contains_key(&key), "age is not a refusal, and must not bar a re-offer");
         assert!(!e.mempool_suspect.contains(&key));
+    }
+}
+
+/// `gettxstatus`'s bookkeeping (finding R4 F-11): `Engine::tx_slot_index`,
+/// `note_tx_slots`, `forget_tx_slots_if_stale` and `tx_status`.
+#[cfg(test)]
+mod tx_status_tests {
+    use super::mempool_ttl::{admit, parked_transfer};
+    use super::slot_horizon::engine_at_wall_slot;
+    use super::*;
+
+    /// A slot safely past epoch 0 — `tx_status` compares an epoch against
+    /// the finality checkpoints, and a fresh engine's `finalized`/`justified`
+    /// both sit at epoch 0, so testing AT epoch 0 could not tell "included"
+    /// apart from "finalized" (`0 <= 0`). Epoch 1 can.
+    fn epoch1_slot() -> u64 {
+        SLOTS_PER_EPOCH
+    }
+
+    #[test]
+    fn unknown_when_never_seen() {
+        let e = engine_at_wall_slot(0);
+        let tx = parked_transfer(1);
+        assert_eq!(e.tx_status(&tx.txid()), "unknown");
+    }
+
+    #[test]
+    fn pending_when_only_in_the_mempool() {
+        let mut e = engine_at_wall_slot(0);
+        let tx = parked_transfer(1);
+        let txid = tx.txid();
+        admit(&mut e, tx);
+        assert_eq!(e.tx_status(&txid), "pending");
+    }
+
+    /// The whole point of the index: a status query does not need to scan
+    /// the mempool at all once a transaction is noted as included, and it
+    /// reports a real chain fact (`included`, since epoch 1 is past neither
+    /// checkpoint on a fresh engine) rather than falling through to
+    /// `pending`/`unknown`.
+    #[test]
+    fn included_once_noted_even_if_never_admitted_to_the_mempool() {
+        let mut e = engine_at_wall_slot(0);
+        let tx = parked_transfer(1);
+        let txid = tx.txid();
+        e.note_tx_slots(epoch1_slot(), std::slice::from_ref(&tx));
+        assert_eq!(e.tx_status(&txid), "included");
+    }
+
+    /// The index lookup is CHEAPER than the mempool scan and must win: a
+    /// transaction that is somehow (a stale entry) in both must report the
+    /// chain fact, not `pending`.
+    #[test]
+    fn the_index_takes_precedence_over_a_stale_mempool_entry() {
+        let mut e = engine_at_wall_slot(0);
+        let tx = parked_transfer(1);
+        let txid = tx.txid();
+        admit(&mut e, tx.clone());
+        e.note_tx_slots(epoch1_slot(), std::slice::from_ref(&tx));
+        assert_eq!(e.tx_status(&txid), "included");
+    }
+
+    /// Re-noting the SAME txid at a later slot overwrites, not duplicates —
+    /// the newer slot is the one a reorg's winning branch actually landed it
+    /// at.
+    #[test]
+    fn renoting_the_same_txid_overwrites_the_slot() {
+        let mut e = engine_at_wall_slot(0);
+        let tx = parked_transfer(1);
+        let txid = tx.txid();
+        e.note_tx_slots(epoch1_slot(), std::slice::from_ref(&tx));
+        assert_eq!(e.tx_slot_index.get(&txid), Some(&epoch1_slot()));
+        e.note_tx_slots(epoch1_slot() + 5, std::slice::from_ref(&tx));
+        assert_eq!(
+            e.tx_slot_index.get(&txid),
+            Some(&(epoch1_slot() + 5)),
+            "a later inclusion must overwrite the earlier slot"
+        );
+    }
+
+    /// `forget_tx_slots_if_stale` removes an entry only if it STILL points at
+    /// the slot being forgotten — the reorg-cleanup contract that keeps a
+    /// winning branch's re-inclusion (a newer `note_tx_slots` call) from
+    /// being clobbered by cleanup for the losing branch it came from.
+    #[test]
+    fn forget_only_removes_a_still_matching_slot() {
+        let mut e = engine_at_wall_slot(0);
+        let tx = parked_transfer(1);
+        let txid = tx.txid();
+
+        // Case 1: the entry still points at the slot being forgotten — it
+        // must be removed, and the status must fall back (here: unknown,
+        // since it was never admitted to the mempool either).
+        e.note_tx_slots(epoch1_slot(), std::slice::from_ref(&tx));
+        e.forget_tx_slots_if_stale(epoch1_slot(), std::slice::from_ref(&tx));
+        assert_eq!(e.tx_status(&txid), "unknown");
+
+        // Case 2: the entry has ALREADY been overwritten with a newer slot
+        // (the winning branch re-included it) — forgetting the OLD slot must
+        // not touch it.
+        e.note_tx_slots(epoch1_slot(), std::slice::from_ref(&tx));
+        e.note_tx_slots(epoch1_slot() + 1, std::slice::from_ref(&tx));
+        e.forget_tx_slots_if_stale(epoch1_slot(), std::slice::from_ref(&tx));
+        assert_eq!(
+            e.tx_slot_index.get(&txid),
+            Some(&(epoch1_slot() + 1)),
+            "forgetting a stale slot must not clobber a newer one for the same txid"
+        );
+    }
+
+    /// R4 F-11's own bound: [`MAX_TX_SLOT_INDEX`] caps the index, FIFO —
+    /// remembering where a transaction landed must not become an unbounded
+    /// archive over the chain's lifetime.
+    #[test]
+    fn the_index_is_bounded_fifo() {
+        let mut e = engine_at_wall_slot(0);
+        // Distinct txids: vary `tx_bytes`, which the signing root and
+        // therefore the txid covers.
+        let make = |n: u64| PosTransaction::Transfer {
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            tx_bytes: n,
+            tip_millisat_per_gas: 0,
+        };
+        let first = make(0);
+        let first_id = first.txid();
+        e.note_tx_slots(1, std::slice::from_ref(&first));
+        for n in 1..=(MAX_TX_SLOT_INDEX as u64) {
+            let tx = make(n);
+            e.note_tx_slots(1, std::slice::from_ref(&tx));
+        }
+        assert_eq!(
+            e.tx_slot_index_order.len(),
+            MAX_TX_SLOT_INDEX,
+            "the order queue must never exceed the cap"
+        );
+        assert!(
+            !e.tx_slot_index.contains_key(&first_id),
+            "the oldest entry must be evicted once the cap is exceeded"
+        );
     }
 }
 
@@ -10136,6 +11066,115 @@ mod finality_latch_tests {
             !engine.blocks.contains_key(&evil_id),
             "the refused branch must leave the fork-choice inputs"
         );
+        assert_eq!(engine.finality_rewinds_refused, 1);
+    }
+
+    // ── R3 M-1: park, don't delete; refuse re-offers at the door; override ──
+
+    /// A refused branch is PARKED, not merely removed. Before this fix the
+    /// only trace of a refusal was the counter — the blocks themselves were
+    /// gone, so nothing distinguished "refused once" from "refused, deleted,
+    /// and about to be refused again from scratch the next time this exact
+    /// branch arrives".
+    #[test]
+    fn refused_branch_is_parked_not_only_deleted() {
+        let (mut engine, _dir, _floor, _root) = latched_engine();
+        let genesis = *engine.chain[0].1.as_bytes();
+        let mut env = engine
+            .blocks
+            .get(engine.chain[1].1.as_bytes())
+            .expect("block 1 stored")
+            .clone();
+        env.header.parent = genesis;
+        env.header.randao_mix = [0xEE; 32];
+        let evil_id = *env.block_id().as_bytes();
+        engine.blocks.insert(evil_id, env.clone());
+
+        assert!(engine.parked_refused_finality.is_empty(), "nothing parked yet");
+        engine.refuse_finality_rewind(&[env]);
+
+        assert!(
+            engine.parked_refused_finality.iter().any(|(id, _)| *id == evil_id),
+            "a refused block must be parked, not merely dropped"
+        );
+    }
+
+    /// A re-offer of an already-parked, already-refused block is dropped at
+    /// the door — `Verdict::Ignore`, and none of the LATER admission checks
+    /// (unsigned rejection, future-slot rejection, orphan parking) ever run.
+    /// This is the fix for "sync re-fetches and re-refuses forever": without
+    /// it, the deleted block would fall through to full re-authentication
+    /// every single time it arrived again.
+    #[test]
+    fn a_reoffered_parked_block_is_ignored_before_any_further_check() {
+        let (mut engine, _dir, _floor, _root) = latched_engine();
+        let genesis = *engine.chain[0].1.as_bytes();
+        let mut env = engine
+            .blocks
+            .get(engine.chain[1].1.as_bytes())
+            .expect("block 1 stored")
+            .clone();
+        env.header.parent = genesis;
+        env.header.randao_mix = [0xEE; 32];
+        // An unregistered proposer index: if the door's parked-check did NOT
+        // fire first, this would fall through to `park_orphan` (unknown
+        // parent) or the identity gate, NOT the parked-refusal short-circuit
+        // — so this also proves ORDER, not just outcome.
+        env.header.proposer_index = u32::MAX;
+        let evil_id = *env.block_id().as_bytes();
+        engine.blocks.insert(evil_id, env.clone());
+        engine.refuse_finality_rewind(&[env.clone()]);
+        assert!(!engine.blocks.contains_key(&evil_id), "parking removes it from `blocks`");
+
+        let rejected_unsigned_before = engine.rejected_unsigned;
+        let orphans_before = engine.orphans.len();
+        let (verdict, released) = engine.ingest_one(env, Source::Gossip);
+
+        assert_eq!(verdict, Verdict::Ignore, "a re-offered parked block must be ignored");
+        assert!(released.is_none());
+        assert!(
+            !engine.blocks.contains_key(&evil_id),
+            "a parked block must not be re-admitted to `blocks` by a re-offer"
+        );
+        assert_eq!(
+            engine.rejected_unsigned, rejected_unsigned_before,
+            "the door must refuse BEFORE any signature work, not after failing it"
+        );
+        assert_eq!(
+            engine.orphans.len(), orphans_before,
+            "the door must refuse BEFORE the orphan pool, not park it there instead"
+        );
+    }
+
+    /// `finality_rewind_override` lifts the latch: a cut that would
+    /// otherwise be refused is allowed, and the refusal counter — which an
+    /// operator would otherwise read as "the latch is doing its job" — stays
+    /// at zero, because it never fired.
+    #[test]
+    fn override_lifts_the_latch() {
+        let (mut engine, _dir, _floor, _root) = latched_engine();
+        let genesis = *engine.chain[0].1.as_bytes();
+
+        engine.finality_rewind_override = true;
+        assert!(
+            engine.do_reorg(genesis, Vec::new()),
+            "the override must allow a rewind the latch would otherwise refuse"
+        );
+        assert_eq!(
+            engine.finality_rewinds_refused, 0,
+            "an allowed rewind must not be counted as a refusal"
+        );
+    }
+
+    /// Without the override, the exact same rewind is refused — the standing
+    /// control for the test above, proving the override is what changed the
+    /// outcome and not some other difference between the two tests.
+    #[test]
+    fn without_override_the_same_rewind_is_still_refused() {
+        let (mut engine, _dir, _floor, _root) = latched_engine();
+        let genesis = *engine.chain[0].1.as_bytes();
+        assert!(!engine.finality_rewind_override, "override must default to off");
+        assert!(!engine.do_reorg(genesis, Vec::new()), "unchanged default behaviour: refuse");
         assert_eq!(engine.finality_rewinds_refused, 1);
     }
 }

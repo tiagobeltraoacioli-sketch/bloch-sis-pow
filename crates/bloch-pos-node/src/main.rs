@@ -1276,6 +1276,20 @@ fn run_cmd(args: &[String]) {
         eprintln!("run: --data-dir and --genesis are required");
         exit(2);
     };
+    // Two tiny, self-contained operator-override flags — engine.rs reads
+    // the env var either way, so a flag here is sugar over it and nothing
+    // downstream needs a second code path. SAFETY: single-threaded at this
+    // point in startup, well before any thread that could race a read.
+    // R3 M-1: lifts the finality-rewind ratchet — see `Engine::run`'s own
+    // doc on `BLOCH_ALLOW_FINALITY_REWIND` for what this actually does.
+    if args.iter().any(|a| a == "--allow-finality-rewind") {
+        unsafe { std::env::set_var("BLOCH_ALLOW_FINALITY_REWIND", "1") };
+    }
+    // R6 HIGH-8: disables doppelgänger protection — see `Engine::run`'s doc
+    // on `BLOCH_NO_DOPPELGANGER`.
+    if args.iter().any(|a| a == "--no-doppelganger-check") {
+        unsafe { std::env::set_var("BLOCH_NO_DOPPELGANGER", "1") };
+    }
     // The transport is decided by a pure function (`decide_transport`) and
     // then ANNOUNCED. Nothing below re-derives it, and nothing silently drops
     // a flag: what the operator asked for either becomes the plan or becomes

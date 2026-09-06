@@ -182,6 +182,14 @@ fn spawn_node(
             &rpc.to_string(),
             "--stop-at-slot",
             &STOP_SLOT.to_string(),
+            // R6 HIGH-8: this harness spawns each validator as the sole,
+            // real owner of its own key on one machine — there is no
+            // duplicate to detect, and the observation window (2 epochs)
+            // exceeds STOP_SLOT, so without this every node in the test
+            // would sit silent for its entire run and no block would ever
+            // be produced. A real fleet keeps the protection; this test
+            // harness is exactly the case it does not need to run against.
+            "--no-doppelganger-check",
         ])
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))

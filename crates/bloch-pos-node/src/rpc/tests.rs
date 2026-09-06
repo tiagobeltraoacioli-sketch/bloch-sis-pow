@@ -644,7 +644,7 @@ fn a_backend_without_a_head_still_routes_balance_to_the_loop() {
 
 #[test]
 fn getmempoolinfo_reports_size_capacity_and_the_next_price() {
-    let v = mempool_info_json(7, 4_096, 1_750, 1_000, 12, 34, 9);
+    let v = mempool_info_json(7, 4_096, 1_750, 1_000, 12, 34, 9, 3);
     assert_eq!(v.get("size").unwrap().as_u64(), Some(7));
     assert_eq!(v.get("max").unwrap().as_u64(), Some(4_096));
     assert_eq!(v.get("bytes").unwrap().as_u64(), Some(1_750));
@@ -659,6 +659,9 @@ fn getmempoolinfo_reports_size_capacity_and_the_next_price() {
     // blocks took things and one the TTL swept clean look identical without
     // this counter, and only the second is a defect an operator must see.
     assert_eq!(v.get("expired").unwrap().as_u64(), Some(9));
+    // R7 M6: evictions for a higher-fee arrival at capacity, distinct from
+    // age-based expiry above.
+    assert_eq!(v.get("evicted_low_fee").unwrap().as_u64(), Some(3));
 }
 
 #[test]
@@ -1126,23 +1129,33 @@ fn the_server_binds_loopback_when_asked_for_loopback() {
 fn http_that_is_not_a_json_rpc_post_is_answered_not_dropped() {
     let (addr, _) = test_server();
 
-    // GET is refused with a status, not a hang or a panic.
+    // GET is refused with a status, not a hang or a panic. Refused on the
+    // method check alone, before the browser-request gate even runs — so
+    // `Host: x` (which the gate would refuse on its own) does not matter
+    // here.
     let r = http(addr, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     assert!(r.starts_with("HTTP/1.1 405"), "got {r}");
 
-    // POST with no Content-Length cannot be read.
-    let r = http(addr, "POST / HTTP/1.1\r\nHost: x\r\n\r\n{}");
+    // POST with no Content-Length cannot be read. `Host`/`Content-Type` must
+    // pass the browser-request gate (R1 A3-M4) for this to reach the check
+    // actually under test.
+    let r = http(addr, "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\r\n{}");
     assert!(r.starts_with("HTTP/1.1 411"), "got {r}");
 
     // An over-large declared body is refused before it is read.
     let r = http(
         addr,
-        &format!("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n", MAX_BODY_BYTES + 1),
+        &format!(
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        ),
     );
     assert!(r.starts_with("HTTP/1.1 413"), "got {r}");
 
     // Chunked encoding is not implemented and says so rather than parsing
-    // chunk headers as JSON.
+    // chunk headers as JSON. Checked mid-header-loop, before the gate, so
+    // `Host: x` does not matter here either.
     let r = http(addr, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n");
     assert!(r.starts_with("HTTP/1.1 411"), "got {r}");
 
@@ -1153,13 +1166,175 @@ fn http_that_is_not_a_json_rpc_post_is_answered_not_dropped() {
     assert_eq!(error_code(&v), Some(-32600));
 }
 
+// ─── The browser-request gate (R1 A3-M4): Content-Type + Origin + Host ────
+//
+// The legacy G3 RPC's H-R3-5 fix hardened ONLY that binary's RPC — this one
+// had none of this until now, which is exactly the gap the finding names.
+
+/// A well-behaved, non-browser request (`Host: 127.0.0.1`, no `Origin`,
+/// `Content-Type: application/json`) is unaffected by the gate. The standing
+/// control for every refusal test below: without it, "the gate refuses X"
+/// would be indistinguishable from "the gate refuses everything".
+#[test]
+fn the_gate_admits_an_ordinary_non_browser_request() {
+    let (addr, _spy) = test_server();
+    let r = post(addr, &request("getchaininfo", "[]"));
+    assert!(r.starts_with("HTTP/1.1 200"), "got {r}");
+}
+
+/// A `Host` that does not name this server's bound address (loopback or
+/// `localhost`) is refused — the DNS-rebinding defence. A page at an
+/// attacker-registered public hostname that resolves to 127.0.0.1 makes the
+/// browser send that hostname in `Host`, on a connection that really did
+/// land on loopback; only comparing `Host` itself (not the peer address)
+/// catches that.
+#[test]
+fn a_host_that_does_not_match_the_bind_is_refused() {
+    let (addr, _spy) = test_server();
+    let r = http(
+        addr,
+        &format!(
+            "POST / HTTP/1.1\r\nHost: evil.example\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            request("getchaininfo", "[]").len(),
+            request("getchaininfo", "[]"),
+        ),
+    );
+    assert!(r.starts_with("HTTP/1.1 403"), "got {r}");
+    let v = parse_json(r.split("\r\n\r\n").nth(1).unwrap_or("")).expect("JSON-RPC error body");
+    assert_eq!(error_code(&v), Some(-32600));
+}
+
+/// `localhost` and the loopback IP literal are both accepted — either
+/// spelling a non-browser client or an operator's own tooling might use.
+#[test]
+fn loopback_and_localhost_are_both_accepted_hosts() {
+    let (addr, _spy) = test_server();
+    for host in ["127.0.0.1", "localhost"] {
+        let body = request("getchaininfo", "[]");
+        let r = http(
+            addr,
+            &format!(
+                "POST / HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len(),
+            ),
+        );
+        assert!(r.starts_with("HTTP/1.1 200"), "Host: {host} got {r}");
+    }
+}
+
+/// ANY `Origin` header is refused, regardless of its value — including one
+/// that names this exact server. This RPC has no browser-request use case:
+/// curl, a wallet, a monitoring script never send `Origin` at all, so its
+/// mere presence is refused rather than checked against an allowlist.
+#[test]
+fn a_request_carrying_any_origin_is_refused() {
+    let (addr, _spy) = test_server();
+    for origin in ["http://evil.example", "http://127.0.0.1", "null"] {
+        let body = request("getchaininfo", "[]");
+        let r = http(
+            addr,
+            &format!(
+                "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: {origin}\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            ),
+        );
+        assert!(r.starts_with("HTTP/1.1 403"), "Origin: {origin} got {r}");
+    }
+}
+
+/// `Content-Type` must be `application/json` — a `text/plain` body (or any
+/// other type) is refused even with an otherwise-correct request.
+/// `; charset=utf-8` and similar parameters are still accepted.
+#[test]
+fn content_type_must_be_application_json_ignoring_parameters() {
+    let (addr, _spy) = test_server();
+    let body = request("getchaininfo", "[]");
+
+    let r = http(
+        addr,
+        &format!(
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: text/plain\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len(),
+        ),
+    );
+    assert!(r.starts_with("HTTP/1.1 415"), "got {r}");
+
+    let r = http(
+        addr,
+        &format!(
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             Content-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len(),
+        ),
+    );
+    assert!(r.starts_with("HTTP/1.1 200"), "got {r}");
+}
+
+/// **The CORS "simple request" shape.** A browser sends a cross-origin POST
+/// with NO preflight when its `Content-Type` is one of the three whitelisted
+/// simple values — `text/plain`, `application/x-www-form-urlencoded`, or
+/// `multipart/form-data` — and it ALWAYS attaches `Origin` to a cross-origin
+/// fetch/XHR. This is exactly that shape, from a page at an unrelated
+/// origin, and it must be refused: not because of the CORS response headers
+/// this server does not send (a browser cannot read the body of a
+/// same-origin-policy-blocked response either way — the danger here is a
+/// STATE-CHANGING call like `sendrawtransaction` firing regardless of
+/// whether the attacker's page can read the answer), but because the
+/// request never gets far enough to be admitted at all: `text/plain` fails
+/// the Content-Type gate on its own, and the `Origin` header fails
+/// independently even if a future change ever widened the allowed types.
+#[test]
+fn a_cors_simple_request_shape_is_refused() {
+    let (addr, _spy) = test_server();
+    let body = request("getchaininfo", "[]");
+    let r = http(
+        addr,
+        &format!(
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://attacker.example\r\n\
+             Content-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len(),
+        ),
+    );
+    assert!(
+        r.starts_with("HTTP/1.1 403") || r.starts_with("HTTP/1.1 415"),
+        "a CORS simple-request shape must be refused, got {r}"
+    );
+}
+
+/// The operator allowlist (`BLOCH_RPC_HOST_ALLOWLIST`) accepts an extra
+/// hostname, and only that name — not an arbitrary caller's choice.
+///
+/// Env-var tests share the process, so this constructs [`HostPolicy`]
+/// directly instead of spawning a real server bound under the ambient
+/// (possibly test-polluted) environment.
+#[test]
+fn the_host_allowlist_env_var_adds_exactly_the_named_hosts() {
+    // SAFETY (`set_var`/`remove_var` unsafe since Rust 2024): this test does
+    // not spawn threads that read the environment concurrently with the
+    // mutation below.
+    unsafe {
+        std::env::set_var(RPC_HOST_ALLOWLIST_ENV, " rpc.internal , 10.0.0.5 ");
+    }
+    let hosts = HostPolicy::new("127.0.0.1");
+    assert!(hosts.allows(Some("rpc.internal")), "an allowlisted host must be accepted");
+    assert!(hosts.allows(Some("10.0.0.5:8080")), "allowlist entries ignore a port too");
+    assert!(!hosts.allows(Some("evil.example")), "an unlisted host must still be refused");
+    unsafe {
+        std::env::remove_var(RPC_HOST_ALLOWLIST_ENV);
+    }
+}
+
 #[test]
 fn a_body_that_is_not_utf8_is_a_parse_error_not_a_dropped_connection() {
     let (addr, _) = test_server();
     use std::io::{Read as _, Write as _};
     let mut sock = TcpStream::connect(addr).unwrap();
     sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let head = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\n";
+    let head = "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 3\r\n\r\n";
     sock.write_all(head.as_bytes()).unwrap();
     sock.write_all(&[0xff, 0xfe, 0xfd]).unwrap();
     let mut out = String::new();
@@ -1178,7 +1353,12 @@ fn a_body_split_across_packets_is_reassembled() {
     let mut sock = TcpStream::connect(addr).unwrap();
     sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     sock.write_all(
-        format!("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes(),
+        format!(
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .as_bytes(),
     )
     .unwrap();
     // Deliberately dribble the body in two writes: a reader that assumed one

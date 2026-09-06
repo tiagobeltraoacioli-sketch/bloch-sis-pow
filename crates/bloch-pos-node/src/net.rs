@@ -92,7 +92,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bloch_pos_committee::attestation::Attestation;
 use bloch_pos_committee::header::BlockEnvelope;
@@ -257,10 +257,69 @@ const ENGINE_QUEUE_CAP: usize = 4096;
 /// this trade.
 const INBOUND_QUEUE_DEPTH: usize = 256;
 
+/// Depth of an outbound (dialer) peer's broadcast queue before frames are
+/// dropped (R3 M-4 / R1 A3-M2).
+///
+/// This used to be `mpsc::channel()` — UNBOUNDED. [`DevnetMesh::broadcast`]
+/// pushes one frame per broadcast into EVERY configured peer's queue
+/// regardless of whether that peer is reachable — the dialer thread below
+/// retries a dead address forever and never removes its sender from
+/// `DevnetMesh::peers` while it is down (see that field's own doc: `peers.len()`
+/// "reads the same whether the peer is answering or has been down for a
+/// week"). A single misconfigured or genuinely offline peer address therefore
+/// queued every block and every attestation this node ever broadcast, for the
+/// life of the process, with no bound — the same unbounded-queue-behind-a-
+/// stalled-consumer shape that OOM-killed 22 validators on 2026-08-21 (see
+/// [`ENGINE_QUEUE_CAP`]), just on the send side instead of the receive side.
+/// Bounded identically to the already-bounded inbound queue: a full queue
+/// drops the newest frame rather than growing, and every OTHER connection
+/// this node holds stays unaffected.
+const OUTBOUND_QUEUE_DEPTH: usize = 256;
+
+/// Inbound TCP connections this transport will accept concurrently (R3 M-4 /
+/// R1 A3-M2).
+///
+/// This transport authenticates nothing and admits nothing (see the module
+/// header): binding a routable address is opt-in and, once bound, ANY TCP
+/// connection this node accepts costs two threads (one reader, one writer)
+/// and one bounded queue for as long as it stays open — before this bound,
+/// forever. `engine::Config::max_peers` defaults to 64 configured/dialed
+/// peers; this is double that, generous headroom for inbound connections
+/// from peers that dialed first, past which a new connection is closed
+/// immediately, before either thread is spawned.
+const MAX_INBOUND_CONNECTIONS: usize = 128;
+
+/// Socket read/write timeout for the devnet mesh (R3 M-4 / R1 A3-M2). This
+/// transport had none: a peer that stopped reading its socket could stall
+/// `write_frame` forever once the kernel send buffer filled (one thread
+/// leaked, permanently, per such peer), and a peer that never wrote anything
+/// held its reader thread — and its slot under [`MAX_INBOUND_CONNECTIONS`] —
+/// open forever.
+///
+/// An honest peer's connection is never idle anywhere near this long: the
+/// dialer side below re-asks for history at least every 5 seconds while it
+/// holds a sync slot, and on a live chain a block or attestation broadcast
+/// arrives far more often than that. This is a generous multiple of that
+/// cadence, not a tight bound tuned to it.
+const DEVNET_IO_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Sustained `get-blocks` answers this transport will build per connection,
+/// per second, and the burst above it before the sustained rate binds — same
+/// values and the same reasoning as [`crate::p2p::SYNC_ANSWERS_PER_SEC`] /
+/// [`crate::p2p::SYNC_ANSWER_BURST`] on the production transport, which this
+/// mirrors (R3 M-4 / R1 A3-M2): the devnet serving path had NO rate limit at
+/// all, so a connected peer could issue `get-blocks` back to back forever,
+/// each one paying a `Store::blocks_after` disk read.
+const GET_BLOCKS_ANSWERS_PER_SEC: f64 = 8.0;
+const GET_BLOCKS_BURST: f64 = 32.0;
+
 /// The devnet TCP mesh: one queue per peer we dialed, plus one per peer that
 /// dialed us.
 pub struct DevnetMesh {
-    peers: Vec<Sender<Vec<u8>>>,
+    /// Bounded per [`OUTBOUND_QUEUE_DEPTH`] (R3 M-4 / R1 A3-M2) — see that
+    /// constant's doc for why an unbounded queue here was a memory leak
+    /// waiting on a peer that never connects.
+    peers: Vec<SyncSender<Vec<u8>>>,
     /// Broadcast queues for connections we did NOT dial.
     ///
     /// **Why this exists.** The module header describes a full mesh in which
@@ -328,8 +387,15 @@ impl DevnetMesh {
     /// Broadcast one frame (type byte + payload, no length prefix) to every
     /// peer, dialed or dialing.
     pub fn broadcast(&self, frame: Vec<u8>) {
+        // `try_send`, not `send` (R3 M-4 / R1 A3-M2): the queue is bounded now,
+        // so a peer whose dialer is stuck (unreachable address, or reachable
+        // but not draining fast enough) gets this frame DROPPED rather than
+        // this call blocking or the queue growing without limit. Dropped
+        // frames are recoverable the same way an inbound-side drop is: the
+        // peer's own dialer re-asks for history on its idle tick the moment
+        // it connects or catches up.
         for p in &self.peers {
-            let _ = p.send(frame.clone());
+            let _ = p.try_send(frame.clone());
         }
         // `retain` both sends and prunes: a closed receiver is a connection
         // whose writer thread has exited, and keeping its sender would leak one
@@ -447,6 +513,43 @@ fn decode_event(frame: &[u8]) -> Option<NetEvent> {
     }
 }
 
+/// Per-connection admission for `get-blocks` on the devnet transport (R3 M-4
+/// / R1 A3-M2): a token bucket, same shape and same values as the production
+/// transport's [`crate::p2p::SyncLimiter`], simplified because a devnet
+/// connection has exactly one reader thread and therefore exactly one
+/// `get-blocks` in flight at a time BY CONSTRUCTION — `serve_get_blocks` runs
+/// inline in that thread, so there is no concurrency to cap here, only rate.
+///
+/// Time is a parameter, not a call to `Instant::now()` inside, for the same
+/// reason `SyncLimiter` takes one: testable refill arithmetic without
+/// sleeping.
+struct GetBlocksLimiter {
+    tokens: f64,
+    last: Instant,
+}
+
+impl GetBlocksLimiter {
+    fn new() -> Self {
+        GetBlocksLimiter { tokens: GET_BLOCKS_BURST, last: Instant::now() }
+    }
+
+    /// Admit one request now, or refuse. Refusing costs the peer nothing but
+    /// silence — no frames are read from the log and none are written back,
+    /// so a peer over its budget gets an answer that looks exactly like "the
+    /// tip has not moved", which is indistinguishable from the truth and
+    /// costs this node one comparison.
+    fn admit(&mut self, now: Instant) -> bool {
+        let dt = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + dt * GET_BLOCKS_ANSWERS_PER_SEC).min(GET_BLOCKS_BURST);
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
+
 /// Serve one get-blocks request on `sock` from the local block log.
 /// Answer a peer's `FRAME_GET_BLOCKS` on the socket it asked over.
 ///
@@ -459,8 +562,19 @@ fn decode_event(frame: &[u8]) -> Option<NetEvent> {
 /// The lock is taken per frame, not held across the whole dump: a full history
 /// answer is hundreds of megabytes, and holding it throughout would stall every
 /// broadcast to this peer for the duration.
-fn serve_get_blocks(sock: &Arc<Mutex<TcpStream>>, data_dir: &PathBuf, frame: &[u8]) {
+fn serve_get_blocks(
+    sock: &Arc<Mutex<TcpStream>>,
+    data_dir: &PathBuf,
+    frame: &[u8],
+    limiter: &mut GetBlocksLimiter,
+) {
     if frame.len() != 9 {
+        return;
+    }
+    // R3 M-4 / R1 A3-M2: rate-limited BEFORE the disk is touched — the whole
+    // point is that `Store::blocks_after` below is the expensive step this
+    // guards.
+    if !limiter.admit(Instant::now()) {
         return;
     }
     let after = u64::from_le_bytes(frame[1..9].try_into().unwrap());
@@ -512,15 +626,37 @@ pub fn start(
     let listener = TcpListener::bind((bind_addr, listen_port))?;
     let inbound: Arc<Mutex<Vec<SyncSender<Vec<u8>>>>> = Arc::new(Mutex::new(Vec::new()));
     let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Counted separately from `live` (R3 M-4 / R1 A3-M2): `live` also holds
+    // OUTBOUND connections (this node's own configured peers), and the cap
+    // below must bind INBOUND connections alone — a node with a full
+    // configured peer list must not have its accept path refuse legitimate
+    // inbound peers because of its own outbound count, and a node under an
+    // inbound flood must not have that flood count against the outbound
+    // side's accounting either.
+    let inbound_live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     {
         let events = events.clone();
         let data_dir = data_dir.clone();
         let inbound = inbound.clone();
         let inflight = inflight.clone();
         let live = live.clone();
+        let inbound_live = inbound_live.clone();
         thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(sock) = conn else { continue };
+                // R3 M-4 / R1 A3-M2: past the cap, close the socket immediately
+                // — `sock` drops at the end of this iteration — before either
+                // thread below is spawned and before the socket costs this
+                // node anything beyond the accept itself.
+                if inbound_live.load(Ordering::Acquire) >= MAX_INBOUND_CONNECTIONS {
+                    continue;
+                }
+                // R3 M-4 / R1 A3-M2: bounded so a peer that stops reading or
+                // never writes cannot hold a thread and a queue open forever.
+                // Best-effort — a platform that refuses the option gets an
+                // unbounded-latency socket, not a broken one.
+                let _ = sock.set_read_timeout(Some(DEVNET_IO_TIMEOUT));
+                let _ = sock.set_write_timeout(Some(DEVNET_IO_TIMEOUT));
                 // Reading and writing need separate handles: the reader blocks
                 // in `read_frame` for as long as the peer is quiet, and a
                 // broadcast must not wait behind it.
@@ -551,17 +687,26 @@ pub fn start(
                 let data_dir = data_dir.clone();
                 let inflight = inflight.clone();
                 let mut rsock = rsock;
-                // Counted from here to wherever this thread leaves. The guard
-                // is moved into the closure, so every `return` below and any
-                // unwind releases it.
+                // Counted from here to wherever this thread leaves. The guards
+                // are moved into the closure, so every `return` below and any
+                // unwind releases both.
                 let counted = ConnCount::new(&live);
+                let inbound_counted = ConnCount::new(&inbound_live);
                 thread::spawn(move || {
                     let _counted = counted;
+                    let _inbound_counted = inbound_counted;
+                    // Per-connection (R3 M-4 / R1 A3-M2): see [`GetBlocksLimiter`].
+                    let mut get_blocks_limiter = GetBlocksLimiter::new();
                     loop {
                         match read_frame(&mut rsock) {
                             Ok(frame) => {
                                 if frame.first() == Some(&FRAME_GET_BLOCKS) {
-                                    serve_get_blocks(&wsock, &data_dir, &frame);
+                                    serve_get_blocks(
+                                        &wsock,
+                                        &data_dir,
+                                        &frame,
+                                        &mut get_blocks_limiter,
+                                    );
                                 } else if let Some(ev) = decode_event(&frame) {
                                     if !send_to_engine(&events, &inflight, ev) {
                                         return;
@@ -585,7 +730,9 @@ pub fn start(
     let sync_slots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut peers = Vec::new();
     for addr in peer_addrs {
-        let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = mpsc::channel();
+        // R3 M-4 / R1 A3-M2: bounded — see [`OUTBOUND_QUEUE_DEPTH`].
+        let (tx, rx): (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) =
+            mpsc::sync_channel(OUTBOUND_QUEUE_DEPTH);
         peers.push(tx);
         let events = events.clone();
         let head_slot = head_slot.clone();
@@ -603,6 +750,11 @@ pub fn start(
             // difference between this number and `peers.len()`.
             let _counted = ConnCount::new(&live);
             let mut wsock = sock;
+            // R3 M-4 / R1 A3-M2: same bound as the inbound side — see
+            // [`DEVNET_IO_TIMEOUT`]. Best-effort; a platform that refuses the
+            // option gets an unbounded-latency socket, not a broken one.
+            let _ = wsock.set_read_timeout(Some(DEVNET_IO_TIMEOUT));
+            let _ = wsock.set_write_timeout(Some(DEVNET_IO_TIMEOUT));
             // Reader half: the peer answers our get-blocks on this socket.
             if let Ok(mut rsock) = wsock.try_clone() {
                 let events = events.clone();
@@ -834,5 +986,145 @@ mod tests {
             validator: 0,
             signature: Vec::new(),
         }
+    }
+
+    // ── R3 M-4 / R1 A3-M2 ────────────────────────────────────────────────────
+
+    /// [`GetBlocksLimiter`] bounds the burst and then the sustained rate,
+    /// exactly like `p2p::SyncLimiter` does for the production transport.
+    /// Before this fix `serve_get_blocks` had no rate limit of any kind: this
+    /// test fails against that code because there was no `GetBlocksLimiter`
+    /// to admit or refuse anything, and the equivalent unguarded call would
+    /// have served every one of these requests.
+    #[test]
+    fn get_blocks_limiter_bounds_burst_then_refills() {
+        let mut lim = GetBlocksLimiter::new();
+        let start = Instant::now();
+        let mut admitted = 0u32;
+        for _ in 0..(GET_BLOCKS_BURST as u32 + 10) {
+            if lim.admit(start) {
+                admitted += 1;
+            }
+        }
+        assert_eq!(
+            admitted, GET_BLOCKS_BURST as u32,
+            "burst must admit exactly GET_BLOCKS_BURST requests at one instant, not more"
+        );
+        assert!(!lim.admit(start), "past the burst, the same instant must be refused");
+
+        // One second later, exactly GET_BLOCKS_ANSWERS_PER_SEC tokens refill.
+        let later = start + Duration::from_secs(1);
+        let mut refilled = 0u32;
+        loop {
+            if lim.admit(later) {
+                refilled += 1;
+            } else {
+                break;
+            }
+        }
+        assert_eq!(refilled as f64, GET_BLOCKS_ANSWERS_PER_SEC, "one second must buy exactly the sustained rate");
+    }
+
+    /// R3 M-4 / R1 A3-M2: `DevnetMesh::broadcast`'s outbound queue is bounded.
+    /// Simulates a dialer whose connection loop is stalled (never draining
+    /// its `Receiver`) by simply never calling `rx.recv()`: on the OLD
+    /// unbounded `mpsc::channel()`, every one of these broadcasts would have
+    /// been queued forever, one `Vec<u8>` allocation per call, for as long as
+    /// the process ran. On the bounded channel, the queue fills at
+    /// `OUTBOUND_QUEUE_DEPTH` and every broadcast past that is dropped.
+    #[test]
+    fn devnet_broadcast_outbound_queue_is_bounded() {
+        let (tx, rx): (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) =
+            mpsc::sync_channel(OUTBOUND_QUEUE_DEPTH);
+        let mesh = DevnetMesh {
+            peers: vec![tx],
+            inbound: Arc::new(Mutex::new(Vec::new())),
+            live: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        // Never drain `rx` — the stalled-dialer scenario — and broadcast well
+        // past the bound.
+        for i in 0..(OUTBOUND_QUEUE_DEPTH + 50) {
+            mesh.broadcast(vec![i as u8]);
+        }
+        let queued = std::iter::from_fn(|| rx.try_recv().ok()).count();
+        assert_eq!(
+            queued, OUTBOUND_QUEUE_DEPTH,
+            "the outbound queue must cap at OUTBOUND_QUEUE_DEPTH, not grow with every broadcast"
+        );
+    }
+
+    /// R3 M-4 / R1 A3-M2: the devnet listener accepts at most
+    /// `MAX_INBOUND_CONNECTIONS` at once, and a connection past the cap is
+    /// closed by the server immediately rather than left half-open. This
+    /// transport authenticates nothing, so the cap is the only backstop
+    /// against a connection flood on a routable bind.
+    #[test]
+    fn inbound_connections_are_capped() {
+        // Probe a free loopback port, then hand that exact port to `start` —
+        // `net::start` takes a fixed port, not an ephemeral-port request it
+        // reports back, so this is the standard std::net test pattern. The
+        // TOCTOU window is a loopback address in this process's own test
+        // run; nothing else in this environment is racing for it.
+        let probe = TcpListener::bind(("127.0.0.1", 0)).expect("probe a free port");
+        let port = probe.local_addr().expect("local_addr").port();
+        drop(probe);
+
+        let (events, _rx) = mpsc::channel::<EngineEvent>();
+        let head_slot = Arc::new(AtomicU64::new(0));
+        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mesh = start(
+            "127.0.0.1",
+            port,
+            Vec::new(),
+            events,
+            std::env::temp_dir(),
+            head_slot,
+            inflight,
+        )
+        .expect("bind the devnet transport");
+
+        // Open more connections than the cap allows and HOLD them open — a
+        // dropped `TcpStream` closes the socket, which would silently undo
+        // the very thing this test checks.
+        let total = MAX_INBOUND_CONNECTIONS + 8;
+        let mut conns = Vec::with_capacity(total);
+        for _ in 0..total {
+            conns.push(TcpStream::connect(("127.0.0.1", port)).expect("connect"));
+        }
+
+        // The accept loop runs on its own thread; poll rather than sleep a
+        // fixed amount, so this is fast on an idle box and still correct on
+        // a loaded one.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while mesh.peer_count() < MAX_INBOUND_CONNECTIONS && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        // One quiet moment so the count has settled — proving it never rises
+        // past the cap needs a window, not just a poll exit condition.
+        thread::sleep(Duration::from_millis(200));
+
+        assert_eq!(
+            mesh.peer_count(),
+            MAX_INBOUND_CONNECTIONS,
+            "the transport must accept no more than MAX_INBOUND_CONNECTIONS inbound connections"
+        );
+
+        // And the excess connections were actually refused, not merely
+        // uncounted: the server must have closed them.
+        let over_cap = conns.split_off(MAX_INBOUND_CONNECTIONS);
+        for mut sock in over_cap {
+            sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut buf = [0u8; 1];
+            match sock.read(&mut buf) {
+                Ok(0) => {} // EOF: the server closed it, as expected
+                Ok(n) => panic!("{n} unexpected bytes from a connection past the cap"),
+                Err(e) => panic!("a connection past the cap was not closed by the server: {e}"),
+            }
+        }
+        // The connections WITHIN the cap must still be open: draining
+        // `conns` here (not `over_cap`, already consumed above) merely drops
+        // them at end of scope, which is a normal client-side close and
+        // proves nothing was already closed from the server's side.
+        drop(conns);
     }
 }

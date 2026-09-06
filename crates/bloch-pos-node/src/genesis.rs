@@ -1322,6 +1322,15 @@ impl Manifest {
     /// So `genesis_id` becomes a function of the ledger, which is the whole
     /// point: substituting a manifest now moves the genesis block id, and a
     /// substituted chain no longer pairs at height 0.
+    ///
+    /// **Explicit expectation (R3 low):** this is DERIVED, on every call from
+    /// every node, from `self`'s own committed fields (`validators`,
+    /// `carryover`, the two clock fields) — it is never read off the wire as
+    /// an opaque value one node produced and another must simply believe.
+    /// `pre_state_root` is a memo of exactly this computation, not a second
+    /// source for it: nothing anywhere decodes a `state_root` field off the
+    /// manifest's own bytes into this cache. See
+    /// `v2_bound_state_root_is_independently_recomputed_not_trusted`.
     pub fn genesis_pre_state_root(&self) -> [u8; 32] {
         *self.pre_state_root.get_or_init(|| {
             use bloch_pos_committee::interfaces::StateReader;
@@ -2350,6 +2359,66 @@ mod tests {
         assert_eq!(&v1[..8], b"BPOSMAN1");
         assert_eq!(&v2[..8], b"BPOSMAN2");
         assert_eq!(v1[8..], v2[8..], "only the magic distinguishes the two formats");
+    }
+
+    /// **The R3-low guarantee, made explicit and pinned:** a
+    /// [`ManifestFormat::V2Bound`] genesis header's `state_root` is
+    /// something EVERY node computes for itself from the manifest's own
+    /// committed fields — never a value one node serialises and another
+    /// simply trusts. (The audit's own phrasing: "a v2 genesis header
+    /// commits to a root no node holds" — the concern this closes is that
+    /// nothing stops that root from being an opaque, untrusted blob; this
+    /// proves it is not one.)
+    ///
+    /// Proven by decoding the SAME bytes into two INDEPENDENT `Manifest`
+    /// values — separate `OnceLock` memos, so neither can be silently
+    /// reusing the other's cached answer — and confirming both derive the
+    /// identical root, and therefore the identical genesis id, from nothing
+    /// but the decoded fields. A node that received a substituted manifest
+    /// with a forged `state_root` embedded in some OTHER encoding would
+    /// simply compute a DIFFERENT id than everyone else — it could never
+    /// make its neighbours' nodes agree with the forgery, which is the
+    /// property a "root no node holds" would lack.
+    ///
+    /// **V1 is unaffected** (the finding's own condition): its header
+    /// commits to no root at all — `genesis_header` leaves `state_root`
+    /// zero — which is exactly the "correctly deferred" shape
+    /// `format_round_trips_through_the_manifest_bytes` above already pins
+    /// for both formats; this test only sharpens what "commits" means for
+    /// the bound one.
+    #[test]
+    fn v2_bound_state_root_is_independently_recomputed_not_trusted() {
+        // `bound(sample())`, not `bound(mainnet_sample())`: the mainnet
+        // fixture commits to a carryover that needs `ingest_carryover`
+        // before `genesis_pre_state_root` can run at all (see
+        // `ingesting_the_carryover_invalidates_the_memoised_root` above) —
+        // irrelevant to what THIS test proves, which holds with or without
+        // one.
+        let encoded = bound(sample()).encode();
+        let a = Manifest::decode(&encoded).expect("decode #1");
+        let b = Manifest::decode(&encoded).expect("decode #2");
+        assert_eq!(a.format, ManifestFormat::V2Bound, "fixture: must be the bound format");
+        assert_eq!(
+            a.genesis_pre_state_root(),
+            b.genesis_pre_state_root(),
+            "every node must derive this root itself from the manifest's own fields; \
+             it must never be trusted as an opaque given"
+        );
+        assert_eq!(
+            a.genesis_id().as_bytes(),
+            b.genesis_id().as_bytes(),
+            "an independently-derived root must produce an independently-derived, \
+             matching genesis id"
+        );
+
+        // V1: unchanged, and unaffected by any of the above.
+        let v1 = Manifest::decode(&sample().encode()).expect("decode v1");
+        assert_eq!(v1.format, ManifestFormat::V1Unbound, "fixture: must be the unbound format");
+        assert_eq!(
+            v1.genesis_header().state_root,
+            [0u8; 32],
+            "V1's header commits to nothing — do not change V1 behaviour"
+        );
     }
 
     /// The memo is a cache of a pure function, so ingesting the balance set —

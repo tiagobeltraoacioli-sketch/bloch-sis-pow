@@ -104,6 +104,13 @@ const ROUTED: &[(&str, &str)] = &[
     ("listunspent", "Utxos"),
     ("sendrawtransaction", "SendRawTransaction"),
     ("getmempoolinfo", "MempoolInfo"),
+    // Freeze bump (R4 F-11, 2026-09-06): the RPC surface named `gettxstatus`
+    // and `getvalidators` absent; both land here as new variants (not
+    // aliases of anything existing), registered in BOTH this table and
+    // `src/rpc/method_registry.rs`'s `frozen_method_space`, per this file's
+    // own two-layer discipline.
+    ("getvalidators", "Validators"),
+    ("gettxstatus", "TxStatus"),
 ];
 
 /// Names that are routed and answer with a REFUSAL rather than a variant.

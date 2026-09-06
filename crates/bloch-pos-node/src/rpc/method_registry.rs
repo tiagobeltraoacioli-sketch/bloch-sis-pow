@@ -91,6 +91,15 @@ fn frozen_method_space(req: &RpcRequest) -> &'static str {
         RpcRequest::TxOut { .. } => "gettxout",
         RpcRequest::SendRawTransaction(_) => "sendrawtransaction",
         RpcRequest::MempoolInfo => "getmempoolinfo",
+        // Freeze bump (R4 F-11, 2026-09-06): two new read-only methods —
+        // `getvalidators` (the whole registry, `RpcRequest::Validators`) and
+        // `gettxstatus` (`RpcRequest::TxStatus`) — added to close the RPC
+        // surface gap the audit named (`gettxstatus`/`getvalidators`
+        // absent). Registered here AND in
+        // `crates/bloch-pos-node/tests/rpc_method_registry.rs`'s `ROUTED`
+        // table, per this file's own two-layer discipline.
+        RpcRequest::Validators => "getvalidators",
+        RpcRequest::TxStatus(_) => "gettxstatus",
         // NO wildcard arm. Adding one defeats the entire freeze.
     }
 }
@@ -145,6 +154,7 @@ fn every_frozen_variant_routes_under_its_registered_name() {
         ("getvalidator", "[3]"),
         ("getvalidatorcount", "[]"),
         ("getmempoolinfo", "[]"),
+        ("getvalidators", "[]"),
     ];
     for (name, params) in cases {
         let p = parse_json(params).expect("test params parse");
@@ -160,7 +170,7 @@ fn every_frozen_variant_routes_under_its_registered_name() {
         );
     }
     // The hex-taking ones, kept separate so a bad literal fails loudly.
-    for name in ["getblockbyid", "getbalance", "getutxos"] {
+    for name in ["getblockbyid", "getbalance", "getutxos", "gettxstatus"] {
         let p = parse_json(&format!("[\"{hex32}\"]")).unwrap();
         let req = route(name, Some(&p)).unwrap_or_else(|e| panic!("`{name}`: {e:?}"));
         let registered = frozen_method_space(&req);

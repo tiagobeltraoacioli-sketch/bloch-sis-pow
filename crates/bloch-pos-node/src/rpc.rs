@@ -202,6 +202,18 @@ pub const TX_REFUSED: i64 = -32008;
 /// reworded while the codes are not.
 pub const TX_REFUSED_RETRYABLE: i64 = -32009;
 
+/// One source (by the first spent input's spend-authority hash) already has
+/// `MEMPOOL_MAX_PER_SOURCE` transactions pending (R7 M6).
+///
+/// A third distinct shape, not a reuse of [`MEMPOOL_FULL`] or
+/// [`TX_REFUSED_RETRYABLE`]: the mempool overall is NOT full (that is
+/// `MEMPOOL_FULL`'s claim) and nothing about these bytes is wrong (so
+/// `TX_REFUSED` would be false) — this source's own share of the mempool is
+/// what is full, and it clears as soon as one of ITS pending transactions
+/// leaves (included, expires, or is itself evicted), not on any fixed
+/// schedule this response could name.
+pub const TX_REFUSED_SOURCE_CAP: i64 = -32010;
+
 /// A JSON-RPC error object: a code a client can branch on and a message a human
 /// can act on. Both halves are required — a bare code makes an operator read
 /// this source file, and a bare message makes a client parse English.
@@ -834,6 +846,19 @@ pub enum RpcRequest {
     /// is what makes it testable without standing up a node.
     SendRawTransaction(PosTransaction),
     MempoolInfo,
+    /// `getvalidators` (R4 F-11) — the whole registry, one call. Unlike
+    /// `getvalidator` (one index) this has no cursor and no cap: the live
+    /// validator set is 64 and R4 F-13 already names "the validator set
+    /// cannot grow" as its own open finding, so an unbounded dump here is
+    /// bounded in practice by that ceiling, not by anything this method adds.
+    /// The day the set can grow past a few hundred, this needs pagination —
+    /// not before.
+    Validators,
+    /// `gettxstatus` (R4 F-11) — `pending | included | justified | finalized
+    /// | unknown` for one transaction id. Backed by the mempool (`pending`)
+    /// and `Engine::tx_slot_index` (`included`/`justified`/`finalized`); see
+    /// `Engine::serve_rpc`'s arm for the exact precedence.
+    TxStatus([u8; 32]),
 }
 
 /// Whatever can answer an [`RpcRequest`]. In production this is the channel to
@@ -1119,6 +1144,9 @@ pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError
             RpcRequest::SendRawTransaction(tx)
         }
         "getmempoolinfo" => RpcRequest::MempoolInfo,
+        // R4 F-11.
+        "getvalidators" => RpcRequest::Validators,
+        "gettxstatus" => RpcRequest::TxStatus(want_hex32(params, 0, "txid")?),
         other => return Err(RpcError::method_not_found(other)),
     })
 }
@@ -1225,6 +1253,9 @@ pub fn serve(
     let listener = TcpListener::bind((bind_addr, port))?;
     let local = listener.local_addr()?;
     let live = Arc::new(AtomicUsize::new(0));
+    // Computed once per bind, not per request (R1 A3-M4): env and the bound
+    // address are both fixed for the life of this listener.
+    let hosts = Arc::new(HostPolicy::new(bind_addr));
     thread::spawn(move || {
         for conn in listener.incoming() {
             let Ok(sock) = conn else { continue };
@@ -1238,9 +1269,10 @@ pub fn serve(
             }
             let backend = backend.clone();
             let live = live.clone();
+            let hosts = hosts.clone();
             thread::spawn(move || {
                 let mut sock = sock;
-                serve_connection(&mut sock, backend.as_ref());
+                serve_connection(&mut sock, backend.as_ref(), &hosts);
                 live.fetch_sub(1, Ordering::SeqCst);
             });
         }
@@ -1248,10 +1280,10 @@ pub fn serve(
     Ok(local)
 }
 
-fn serve_connection(sock: &mut TcpStream, backend: &dyn RpcBackend) {
+fn serve_connection(sock: &mut TcpStream, backend: &dyn RpcBackend, hosts: &HostPolicy) {
     let _ = sock.set_read_timeout(Some(IO_TIMEOUT));
     let _ = sock.set_write_timeout(Some(IO_TIMEOUT));
-    match read_request(sock) {
+    match read_request(sock, hosts) {
         Ok(body) => {
             // The body must be text before it can be JSON. Invalid UTF-8 is a
             // parse error with a JSON-RPC shape, not a dropped connection.
@@ -1276,8 +1308,106 @@ fn http_err(status: u16, message: &'static str) -> HttpError {
     HttpError { status, message }
 }
 
-/// Read one HTTP request and return its body.
-fn read_request(sock: &mut TcpStream) -> Result<Vec<u8>, HttpError> {
+// ─── Browser-request gate (R1 A3-M4): Content-Type + Origin + Host ─────────
+//
+// The PoS RPC has never had this. The legacy G3 RPC's H-R3-5 fix
+// (`legacy/genesis3-node/src/rpc/auth.rs`) hardened ONLY that binary's RPC —
+// this one is the gap R1 A3-M4 names. Deliberately simpler than G3's policy
+// (no wildcard Origin for read methods, no read/write split): nothing that
+// calls THIS endpoint over HTTP has a legitimate reason to look like a
+// browser request at all. curl, a wallet, a monitoring script choose their
+// own `Content-Type` and never send `Origin`; anything that looks like a
+// browser's fetch/XHR is refused outright, not merely rate-scored.
+//
+// - **Content-Type** must be `application/json` (parameters after `;`
+//   ignored, matched case-insensitively per RFC 9110 §8.3). This defeats a
+//   "simple request" CSRF: a bare `<form>`/`<img>`-shaped cross-site POST
+//   cannot set an arbitrary Content-Type, so it is stuck with
+//   `text/plain`, `application/x-www-form-urlencoded` or
+//   `multipart/form-data` — none of which pass this gate.
+// - **Origin** must be ABSENT. Every browser this matters for attaches
+//   `Origin` to a cross-origin fetch/XHR — and, in every current browser,
+//   to same-origin POSTs too — so this RPC's only legitimate callers
+//   (non-browser clients) never send one. A present Origin is refused
+//   regardless of its value: this is stricter than G3's wildcard-for-reads
+//   policy on purpose, because a JSON-RPC endpoint has no "read request
+//   from a web page" use case to preserve.
+// - **Host** must name the address this server is actually bound to — a
+//   loopback literal or `localhost` — or a name on the operator's
+//   allowlist. Defeats DNS rebinding: a page at an attacker-registered
+//   public hostname that resolves to 127.0.0.1 makes the browser send
+//   `Host: <attacker's name>` on a connection that really did land on
+//   loopback; comparing Host (not the socket's peer address) is what
+//   catches that.
+
+/// Extra hostnames an operator has explicitly decided to trust in `Host`,
+/// beyond the built-in loopback literals — comma-separated, e.g.
+/// `rpc.internal,10.0.0.5`. Read once per [`HostPolicy::new`] call (once per
+/// `serve`, i.e. once per process), not per request: env is fixed for the
+/// life of a process.
+const RPC_HOST_ALLOWLIST_ENV: &str = "BLOCH_RPC_HOST_ALLOWLIST";
+
+/// The Host values this server will accept, computed once at `serve` time
+/// from the address it actually bound plus any operator-configured extras.
+/// Compared against the request's `Host` header with the port stripped —
+/// see [`host_name_only`] — because the identity that matters for DNS
+/// rebinding is the NAME, not the port a browser filled in from the URL.
+struct HostPolicy {
+    allowed: Vec<String>,
+}
+
+impl HostPolicy {
+    fn new(bind_addr: &str) -> Self {
+        let mut allowed = vec!["127.0.0.1".to_string(), "localhost".to_string(), "::1".to_string()];
+        // An operator who bound a specific, literal address made an explicit
+        // decision to trust that name — `0.0.0.0`/`::` are wildcard BIND
+        // addresses, never values a client would put in `Host`, so they add
+        // nothing here.
+        if bind_addr != "0.0.0.0" && bind_addr != "::" && !allowed.iter().any(|a| a == bind_addr) {
+            allowed.push(bind_addr.to_string());
+        }
+        if let Ok(extra) = std::env::var(RPC_HOST_ALLOWLIST_ENV) {
+            allowed.extend(
+                extra
+                    .split(',')
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty()),
+            );
+        }
+        HostPolicy { allowed }
+    }
+
+    fn allows(&self, host: Option<&str>) -> bool {
+        let Some(h) = host else { return false };
+        let name = host_name_only(h).to_ascii_lowercase();
+        self.allowed.iter().any(|a| *a == name)
+    }
+}
+
+/// The hostname portion of an HTTP `Host` header value, with a trailing
+/// `:<port>` stripped. Handles the IPv6 literal form (`[::1]:8080` or bare
+/// `[::1]`), which a naive split on `:` would mangle into `[` and a garbled
+/// remainder.
+fn host_name_only(host: &str) -> &str {
+    let host = host.trim();
+    if let Some(rest) = host.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    host.split_once(':').map_or(host, |(name, _)| name)
+}
+
+/// `Content-Type`, ignoring `;`-separated parameters (e.g. `; charset=utf-8`)
+/// and matched case-insensitively.
+fn content_type_allowed(ct: Option<&str>) -> bool {
+    match ct {
+        Some(ct) => ct.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("application/json"),
+        None => false,
+    }
+}
+
+/// Read one HTTP request and return its body — after the browser-request
+/// gate above has passed.
+fn read_request(sock: &mut TcpStream, hosts: &HostPolicy) -> Result<Vec<u8>, HttpError> {
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0u8; 4096];
 
@@ -1306,16 +1436,48 @@ fn read_request(sock: &mut TcpStream) -> Result<Vec<u8>, HttpError> {
     }
 
     let mut content_length: Option<usize> = None;
+    let mut content_type: Option<String> = None;
+    let mut origin: Option<String> = None;
+    let mut host: Option<String> = None;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else { continue };
-        if name.trim().eq_ignore_ascii_case("content-length") {
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("content-length") {
             content_length = value.trim().parse::<usize>().ok();
-        } else if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
             // Chunked bodies are not implemented. Saying so beats reading the
             // chunk headers as if they were JSON.
             return Err(http_err(411, "chunked transfer-encoding is not supported; send Content-Length"));
+        } else if name.eq_ignore_ascii_case("content-type") {
+            content_type = Some(value.trim().to_string());
+        } else if name.eq_ignore_ascii_case("origin") {
+            origin = Some(value.trim().to_string());
+        } else if name.eq_ignore_ascii_case("host") {
+            host = Some(value.trim().to_string());
         }
     }
+
+    // R1 A3-M4: the browser-request gate, before Content-Length is even
+    // consulted — three header comparisons are cheaper than anything past
+    // this point, including the size check below.
+    if !hosts.allows(host.as_deref()) {
+        return Err(http_err(
+            403,
+            "Host does not match this server's bound address (or its configured allowlist); \
+             set BLOCH_RPC_HOST_ALLOWLIST if this Host is expected",
+        ));
+    }
+    if origin.is_some() {
+        return Err(http_err(
+            403,
+            "requests carrying an Origin header are refused; this endpoint has no \
+             browser-request use case to preserve",
+        ));
+    }
+    if !content_type_allowed(content_type.as_deref()) {
+        return Err(http_err(415, "Content-Type must be application/json"));
+    }
+
     let Some(len) = content_length else {
         return Err(http_err(411, "Content-Length is required"));
     };
@@ -1347,10 +1509,12 @@ fn respond(sock: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
+        403 => "Forbidden",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
         411 => "Length Required",
         413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
         431 => "Request Header Fields Too Large",
         503 => "Service Unavailable",
         _ => "Error",
@@ -1892,6 +2056,57 @@ pub fn validator_json(
     ])
 }
 
+/// `getvalidators` (R4 F-11) — one entry per registered validator.
+///
+/// Deliberately a NARROWER shape than [`validator_json`], not a wrapper
+/// around it: the finding names exactly five fields (index, pubkey hash,
+/// status, effective stake, commission in basis points) and specifies
+/// `commission_bps` as a **plain JSON number**, not [`Json::sat`]'s decimal
+/// string. `validator_json`'s own `commission_bps` uses `Json::sat` — R3's
+/// convention is for SATOSHI amounts that can exceed a JS double's exact
+/// range, and commission is a basis-points integer capped at 10,000, so that
+/// choice was always a category mismatch there. This method does not repeat
+/// it, and does not "fix" the existing single-validator response either:
+/// that field is part of an already-shipped, already-documented shape
+/// (`docs/specs/BLOCH-RPC-V4.md` §4.2) and changing its JSON type out from
+/// under an existing integrator is its own decision, for someone who owns
+/// that spec section — not a side effect of adding a new method.
+pub fn validators_json(entries: &[(ValidatorRecord, Option<u64>)], current_epoch: u64) -> Json {
+    use sha3::{Digest, Sha3_256};
+    Json::Arr(
+        entries
+            .iter()
+            .map(|(rec, effective_stake_sat)| {
+                let pubkey_hash: [u8; 32] = Sha3_256::digest(&rec.pubkey).into();
+                Json::obj(vec![
+                    ("index", Json::u(u64::from(rec.index))),
+                    ("pubkey_hash", Json::hex(&pubkey_hash)),
+                    ("status", Json::s(validator_state(rec, current_epoch))),
+                    (
+                        "effective_stake_sat",
+                        effective_stake_sat.map_or(Json::Null, |v| Json::sat(u128::from(v))),
+                    ),
+                    // Plain integer (R4 F-11's own words) — see this
+                    // function's doc for why that differs from
+                    // `validator_json`'s `commission_bps`.
+                    (
+                        "commission_bps",
+                        Json::u(u64::try_from(rec.commission_bps).unwrap_or(u64::MAX)),
+                    ),
+                ])
+            })
+            .collect(),
+    )
+}
+
+/// `gettxstatus` (R4 F-11): one of `pending | included | justified |
+/// finalized | unknown`. A bare string result rather than an object — there
+/// is exactly one fact being reported, and wrapping it would invite a caller
+/// to look for fields that do not exist.
+pub fn tx_status_json(status: &'static str) -> Json {
+    Json::obj(vec![("status", Json::s(status))])
+}
+
 fn eutxo_json(e: &EutxoEntry) -> Json {
     Json::obj(vec![
         ("txid", Json::hex(&e.txid)),
@@ -1986,6 +2201,7 @@ pub fn mempool_info_json(
     barred: usize,
     barred_hits: u64,
     expired: u64,
+    evicted_low_fee: u64,
 ) -> Json {
     Json::obj(vec![
         ("size", Json::u(size as u64)),
@@ -2007,6 +2223,10 @@ pub fn mempool_info_json(
         // wedged transaction out look identical from the outside — and the
         // second is the one an operator needs to see.
         ("expired", Json::u(expired)),
+        // R7 M6: transactions evicted for a higher-fee arrival at capacity —
+        // a mempool under genuine fee pressure and one simply idle both
+        // "get smaller" without this counter to tell them apart.
+        ("evicted_low_fee", Json::u(evicted_low_fee)),
     ])
 }
 

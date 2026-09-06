@@ -360,14 +360,57 @@ pub fn boot(
         };
         let set = decode_signer_set_file(&fs::read(set_path)?)
             .map_err(|e| bad(format!("{}: {e}", set_path.display())))?;
-        let ok = ws::verify_envelope(&env, &set, network_id, genesis_root, &WsHybridVerifier)
-            .map_err(|e| {
-                bad(format!(
-                    "checkpoint envelope {} REFUSED: {e:?} (ws digest {})",
-                    path.display(),
-                    hex32(&env.checkpoint.ws_digest())
-                ))
-            })?;
+        // NEW-2 (audit round 3): the signer set's SHAPE is policy, not
+        // operator input. A set file that is not one of the two published
+        // arrangements (BLOCH-WEAK-SUBJECTIVITY.md §6: Phase A 2-of-3 with one
+        // external signer, Phase B 3-of-5 with two) is refused before any
+        // signature is checked — otherwise an operator-supplied 1-of-1 set
+        // would make a single key the root of trust for every node that
+        // trusts this file. Fail closed: neither shape matches → refusal
+        // naming both.
+        let (threshold, signers, min_external) = if set.matches_policy(
+            ws::WS_PHASE_A_THRESHOLD,
+            ws::WS_PHASE_A_SIGNERS,
+            ws::WS_PHASE_A_MIN_EXTERNAL,
+        ) {
+            (ws::WS_PHASE_A_THRESHOLD, ws::WS_PHASE_A_SIGNERS, ws::WS_PHASE_A_MIN_EXTERNAL)
+        } else if set.matches_policy(
+            ws::WS_PHASE_B_THRESHOLD,
+            ws::WS_PHASE_B_SIGNERS,
+            ws::WS_PHASE_B_MIN_EXTERNAL,
+        ) {
+            (ws::WS_PHASE_B_THRESHOLD, ws::WS_PHASE_B_SIGNERS, ws::WS_PHASE_B_MIN_EXTERNAL)
+        } else {
+            return Err(bad(format!(
+                "signer set {} REFUSED: its shape is neither Phase A ({}-of-{}, >= {} external) \
+                 nor Phase B ({}-of-{}, >= {} external); a weak-subjectivity root of trust with \
+                 any other arrangement is not accepted by this node",
+                set_path.display(),
+                ws::WS_PHASE_A_THRESHOLD,
+                ws::WS_PHASE_A_SIGNERS,
+                ws::WS_PHASE_A_MIN_EXTERNAL,
+                ws::WS_PHASE_B_THRESHOLD,
+                ws::WS_PHASE_B_SIGNERS,
+                ws::WS_PHASE_B_MIN_EXTERNAL,
+            )));
+        };
+        let ok = ws::verify_envelope_with_shape_policy(
+            &env,
+            &set,
+            network_id,
+            genesis_root,
+            &WsHybridVerifier,
+            threshold,
+            signers,
+            min_external,
+        )
+        .map_err(|e| {
+            bad(format!(
+                "checkpoint envelope {} REFUSED: {e:?} (ws digest {})",
+                path.display(),
+                hex32(&env.checkpoint.ws_digest())
+            ))
+        })?;
         if ok.arrangement_past_review {
             warnings.push(format!(
                 "WARNING: signer arrangement {} is past its 12-month review deadline \
@@ -880,23 +923,10 @@ mod tests {
         // equivocal "epoch 0" checkpoint signed by a real 1-of-1 arrangement.
         save_latest(&dir, &genesis_anchor()).unwrap();
 
-        let (pk, sk) = bloch_crypto::crypto::generate_keypair();
-        let raw = strip(&pk);
-        let mut pubkey = [0u8; HYBRID_PK_BYTES];
-        pubkey.copy_from_slice(&raw);
-        let set = SignerSet {
-            id: 9,
-            signers: vec![Signer { pubkey, external: true }],
-            threshold: 1,
-            min_external: 1,
-            adopted_epoch: 0,
-        };
         let mut cp = checkpoint(0);
         cp.signer_set_id = 9;
-        let env = CheckpointEnvelope {
-            checkpoint: cp,
-            signatures: vec![(0, strip(&bloch_crypto::crypto::sign(&sk, &cp.ws_digest()).unwrap()))],
-        };
+        let (set, signatures) = phase_a_set_and_signatures(9, &cp.ws_digest());
+        let env = CheckpointEnvelope { checkpoint: cp, signatures };
         let env_path = dir.join("env.bin");
         let set_path = dir.join("set.bin");
         fs::write(&env_path, encode_envelope_file(&env)).unwrap();
@@ -915,29 +945,47 @@ mod tests {
         assert_eq!(load_latest(&dir, NET, &GEN).unwrap().unwrap(), genesis_anchor());
     }
 
+    /// A Phase A signer set (2-of-3, one external) plus two signatures over
+    /// `digest` — signer 0 (external) and signer 1 — the minimum that clears
+    /// both the threshold and `min_external`. NEW-2 made the set's shape
+    /// policy: a 1-of-1 fixture no longer boots (see
+    /// `a_signer_set_outside_the_published_shapes_is_refused`).
+    fn phase_a_set_and_signatures(id: u32, digest: &[u8; 32]) -> (SignerSet, Vec<(u8, Vec<u8>)>) {
+        let mut signers = Vec::new();
+        let mut secrets = Vec::new();
+        for external in [true, false, false] {
+            let (pk, sk) = bloch_crypto::crypto::generate_keypair();
+            let raw = strip(&pk);
+            let mut pubkey = [0u8; HYBRID_PK_BYTES];
+            pubkey.copy_from_slice(&raw);
+            signers.push(Signer { pubkey, external });
+            secrets.push(sk);
+        }
+        let set = SignerSet {
+            id,
+            signers,
+            threshold: ws::WS_PHASE_A_THRESHOLD,
+            min_external: ws::WS_PHASE_A_MIN_EXTERNAL,
+            adopted_epoch: 0,
+        };
+        let sigs = (0..2u8)
+            .map(|i| {
+                (i, strip(&bloch_crypto::crypto::sign(&secrets[i as usize], digest).unwrap()))
+            })
+            .collect();
+        (set, sigs)
+    }
+
     /// A published checkpoint that contradicts OWN finality raises the alarm,
     /// is not admitted as the anchor, and never blocks the node from
     /// resuming on its own finality — the §5 structural limit.
     #[test]
     fn published_checkpoint_never_overrides_own_finality() {
         let dir = tmpdir("cross-check");
-        let (pk, sk) = bloch_crypto::crypto::generate_keypair();
-        let raw = strip(&pk);
-        let mut pubkey = [0u8; HYBRID_PK_BYTES];
-        pubkey.copy_from_slice(&raw);
-        let set = SignerSet {
-            id: 3,
-            signers: vec![Signer { pubkey, external: true }],
-            threshold: 1,
-            min_external: 1,
-            adopted_epoch: 0,
-        };
         let mut cp = checkpoint(64);
         cp.signer_set_id = 3;
-        let env = CheckpointEnvelope {
-            checkpoint: cp,
-            signatures: vec![(0, strip(&bloch_crypto::crypto::sign(&sk, &cp.ws_digest()).unwrap()))],
-        };
+        let (set, signatures) = phase_a_set_and_signatures(3, &cp.ws_digest());
+        let env = CheckpointEnvelope { checkpoint: cp, signatures };
         let env_path = dir.join("env.bin");
         let set_path = dir.join("set.bin");
         fs::write(&env_path, encode_envelope_file(&env)).unwrap();
@@ -959,6 +1007,52 @@ mod tests {
         // Not admitted: the anchor is still the genesis anchor.
         assert_eq!(out.anchor_epoch, 0);
         assert!(!out.anchor_is_hard);
+        assert_eq!(load_latest(&dir, NET, &GEN).unwrap().unwrap(), genesis_anchor());
+    }
+
+    /// **NEW-2 regression.** A signer set whose shape is not one of the two
+    /// published arrangements — here the 1-of-1 fixture the tests above used
+    /// to boot with — is refused BEFORE any signature is checked, naming both
+    /// accepted shapes. Revert the shape check in `boot` and this test fails:
+    /// the envelope verifies under its single key and the boot proceeds.
+    #[test]
+    fn a_signer_set_outside_the_published_shapes_is_refused() {
+        let dir = tmpdir("shape-policy");
+        save_latest(&dir, &genesis_anchor()).unwrap();
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair();
+        let raw = strip(&pk);
+        let mut pubkey = [0u8; HYBRID_PK_BYTES];
+        pubkey.copy_from_slice(&raw);
+        let set = SignerSet {
+            id: 11,
+            signers: vec![Signer { pubkey, external: true }],
+            threshold: 1,
+            min_external: 1,
+            adopted_epoch: 0,
+        };
+        let mut cp = checkpoint(64);
+        cp.signer_set_id = 11;
+        let env = CheckpointEnvelope {
+            checkpoint: cp,
+            signatures: vec![(0, strip(&bloch_crypto::crypto::sign(&sk, &cp.ws_digest()).unwrap()))],
+        };
+        // Control: the envelope itself is valid under its own set — so the
+        // refusal below is the shape rule and nothing else.
+        ws::verify_envelope(&env, &set, NET, &GEN, &WsHybridVerifier).expect("control: verifies");
+        let env_path = dir.join("env.bin");
+        let set_path = dir.join("set.bin");
+        fs::write(&env_path, encode_envelope_file(&env)).unwrap();
+        fs::write(&set_path, encode_signer_set_file(&set)).unwrap();
+        let cfg = WsConfig { checkpoint: Some(env_path), signer_set: Some(set_path) };
+        let err = boot(
+            &cfg, &dir, NET, &GEN, &genesis_anchor(),
+            1, false, (0, GEN), |_| None, |_| false,
+        )
+        .err()
+        .expect("a 1-of-1 signer set must not become a root of trust");
+        let msg = err.to_string();
+        assert!(msg.contains("REFUSED") && msg.contains("Phase A") && msg.contains("Phase B"), "{msg}");
+        // Nothing was adopted.
         assert_eq!(load_latest(&dir, NET, &GEN).unwrap().unwrap(), genesis_anchor());
     }
 }

@@ -673,6 +673,7 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         // the TTL has nothing to expire; the fields exist for the type.
         mempool_admitted_at: BTreeMap::new(),
         mempool_expired: 0,
+        mempool_evicted_low_fee: 0,
         // O cache de recusa (2026-08-30): o replay nao propoe, entao nunca
         // bane nada — o campo existe para o tipo, sempre vazio aqui.
         rejected: BTreeMap::new(),
@@ -701,6 +702,12 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         fc_covered_removals: 0,
         finalized_latch: None,
         finality_rewinds_refused: 0,
+        parked_refused_finality: VecDeque::new(),
+        finality_rewind_override: false,
+        tx_slot_index: BTreeMap::new(),
+        tx_slot_index_order: VecDeque::new(),
+        doppelganger_observe_until: None,
+        doppelganger_halted: false,
         manifest,
     }
 }

@@ -195,7 +195,7 @@
 //!   answer is free; this one is chosen because a syncing node that stalls is
 //!   worse than one that is briefly fat, and it is named rather than assumed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -314,7 +314,31 @@ const SYNC_FANOUT: usize = 3;
 /// blocks that never apply: 64 × 128 = 8,192 blocks of no progress is the most
 /// this node will pull before it stops asking that peer. Any real progress
 /// resets the counter, so a genuine multi-year backfill is unaffected.
+///
+/// PER PEER (R1 A3-M3): the budget used to be one pair of counters shared by
+/// every peer this node ever chased a page from, so a single peer that kept
+/// answering full pages that never advanced the applied head (because they
+/// were all on a branch this node's transition refuses) spent the ENTIRE
+/// budget — the next peer to offer a genuine page found `pages_since_progress`
+/// already at the cap and got nothing chased, even though ITS pages were
+/// making real progress. [`Loop::may_chase_page`] now keys the counters by
+/// [`libp2p::PeerId`] so one stalling peer cannot spend another's budget.
 const MAX_PAGES_WITHOUT_PROGRESS: u32 = 64;
+
+/// Distinct `Multiaddr`s [`Loop::dialed`] will remember, FIFO-evicted past the
+/// cap (R1 A3-M5).
+///
+/// Every address is peer-CONTROLLED: it arrives via identify's
+/// `info.listen_addrs`, which a peer fills in itself, and there is no cap on
+/// how many a well-formed identify message may carry. Without a bound, one
+/// peer advertising many addresses — or many short-lived peers advertising a
+/// few each — grows this map for the life of the process. "A few hundred" is
+/// generous headroom over any real deployment: `--max-peers` defaults to 64
+/// connected peers, so 512 is 8 addresses remembered per peer at the current
+/// default, and the map is ALSO pruned of a peer's own entries the moment its
+/// last connection closes (`Loop::forget_peer`), so a stable mesh never gets
+/// close to the cap at all.
+const MAX_DIALED_ADDRS: usize = 512;
 
 // ── What one peer may make this node do (the serving side) ──────────────────
 //
@@ -378,6 +402,16 @@ struct PeerSync {
     tokens: f64,
     last: Instant,
     inflight: usize,
+    /// Set by [`SyncLimiter::forget`] when it ran while an answer was still
+    /// being built for this peer (R3 M-7). Production calls `forget` exactly
+    /// ONCE, from `ConnectionClosed` — there is no second disconnect event to
+    /// retry the removal on. Without this flag the entry survived every
+    /// disconnect that happened to race an in-flight answer: `forget` kept it
+    /// (correctly, to keep the slot honest) but nothing ever removed it
+    /// afterward, so `SyncLimiter::peers` grew by one per such peer for the
+    /// life of the process. `release` — the only other thing touching
+    /// `inflight` — now finishes the removal `forget` deferred.
+    disconnect_pending: bool,
 }
 
 /// Proof that one `get-blocks` from one peer was **admitted**, and the only
@@ -420,6 +454,7 @@ impl SyncLimiter {
             tokens: SYNC_ANSWER_BURST,
             last: now,
             inflight: 0,
+            disconnect_pending: false,
         });
         // Refill first: `saturating_duration_since` because a caller may hand
         // in a `now` that is not after `last` (it never does in the swarm
@@ -450,18 +485,34 @@ impl SyncLimiter {
     /// the defence paid the attacker. Only a permit can be released now, and
     /// a refusal never gets one.
     pub fn release(&mut self, permit: SyncPermit) {
+        let mut remove = false;
         if let Some(e) = self.peers.get_mut(&permit.peer) {
             e.inflight = e.inflight.saturating_sub(1);
+            // R3 M-7: finish a removal `forget` deferred because this was the
+            // last answer still in flight for a peer that already
+            // disconnected. `forget` cannot wait for this itself — it is not
+            // called again — so this is the only place left to close the leak.
+            remove = e.inflight == 0 && e.disconnect_pending;
+        }
+        if remove {
+            self.peers.remove(&permit.peer);
         }
     }
 
     /// Peer gone. Dropping the record refunds its burst, which is why it is
     /// only done when the last connection closes — a peer cannot reset its
     /// own bucket without paying for a full reconnect.
+    ///
+    /// Called exactly once per peer, from `ConnectionClosed` (R3 M-7): if an
+    /// answer is still being built, the entry is marked rather than dropped —
+    /// dropping it here would refund the peer's budget mid-flight — and
+    /// [`SyncLimiter::release`] removes it the moment the last in-flight slot
+    /// clears, since no second disconnect event will ever arrive to retry.
     pub fn forget(&mut self, peer: &PeerId) {
-        if let Some(e) = self.peers.get(peer) {
+        if let Some(e) = self.peers.get_mut(peer) {
             if e.inflight > 0 {
-                return; // an answer is still being built; keep the slot honest
+                e.disconnect_pending = true;
+                return;
             }
         }
         self.peers.remove(peer);
@@ -1011,11 +1062,11 @@ struct Loop {
     /// Blocks published or received within [`REGOSSIP_SUPPRESS_TTL`]. Pruned
     /// on insert, so it stays bounded by the TTL and not by uptime.
     recent_blocks: HashMap<[u8; 32], Instant>,
-    /// Full sync pages chased since the engine's applied head last moved. See
-    /// [`MAX_PAGES_WITHOUT_PROGRESS`].
-    pages_since_progress: u32,
-    /// The applied head at the last page, so progress can be detected.
-    head_at_last_page: u64,
+    /// Full sync pages chased since the engine's applied head last moved,
+    /// PER PEER (R1 A3-M3 — see [`MAX_PAGES_WITHOUT_PROGRESS`]). Evicted on
+    /// disconnect by [`Loop::forget_peer`], so identity churn cannot grow
+    /// this past the connected-peer count.
+    chase: HashMap<PeerId, PeerChase>,
     /// Address → the peer id reachable there, learned from a successful dial
     /// and from identify's advertised listen addresses. Lets an address-only
     /// `--p2p-peer` be recognised as already connected on the redial tick.
@@ -1026,7 +1077,14 @@ struct Loop {
     /// that peer forever — and libp2p's TCP port reuse makes each of those
     /// dials fail with EADDRINUSE against the connection that already exists,
     /// which reads in the log exactly like a peer that cannot be reached.
+    ///
+    /// Bounded (R1 A3-M5): see [`MAX_DIALED_ADDRS`]. `dialed_order` is the
+    /// FIFO eviction queue — same shape as `Engine::orphans` in `engine.rs`,
+    /// deliberately: oldest-inserted-address-out, not an access-order LRU,
+    /// because the property that matters is "this map cannot outgrow a bound
+    /// regardless of what a peer advertises", not recency.
     dialed: HashMap<Multiaddr, PeerId>,
+    dialed_order: VecDeque<Multiaddr>,
     /// Per-peer admission for the `get-blocks` requests this node ANSWERS.
     /// See [`SyncLimiter`].
     sync_limiter: SyncLimiter,
@@ -1037,6 +1095,13 @@ struct Loop {
     /// `num_established` boundaries, so a peer holding the usual two
     /// connections (both sides dialled) counts once.
     peers_live: Arc<AtomicUsize>,
+}
+
+/// Per-peer sync-chase budget (R1 A3-M3). See [`MAX_PAGES_WITHOUT_PROGRESS`].
+#[derive(Default)]
+struct PeerChase {
+    pages_since_progress: u32,
+    head_at_last_page: u64,
 }
 
 struct Topics {
@@ -1056,19 +1121,62 @@ impl Loop {
         self.events.send(ev).is_ok()
     }
 
-    /// May this node chase another full page? Advancing the applied head is
-    /// what buys the next 64 — see [`MAX_PAGES_WITHOUT_PROGRESS`].
-    fn may_chase_page(&mut self) -> bool {
+    /// May this node chase another full page FROM `peer`? Advancing the
+    /// applied head is what buys the next 64 — see
+    /// [`MAX_PAGES_WITHOUT_PROGRESS`].
+    ///
+    /// PER PEER (R1 A3-M3): the counters used to be one shared pair, so a
+    /// single peer answering full pages that never advance the applied head
+    /// (every one of them on a branch this node's transition refuses) spent
+    /// the entire budget, and the very next honest peer's genuine page found
+    /// nothing left to chase with. Keying by `peer` means one stalling peer
+    /// can only ever exhaust its OWN budget.
+    fn may_chase_page(&mut self, peer: PeerId) -> bool {
         let head = self.head_slot.load(Ordering::Relaxed);
-        if head > self.head_at_last_page {
-            self.head_at_last_page = head;
-            self.pages_since_progress = 0;
+        let e = self.chase.entry(peer).or_default();
+        if head > e.head_at_last_page {
+            e.head_at_last_page = head;
+            e.pages_since_progress = 0;
         }
-        if self.pages_since_progress >= MAX_PAGES_WITHOUT_PROGRESS {
+        if e.pages_since_progress >= MAX_PAGES_WITHOUT_PROGRESS {
             return false;
         }
-        self.pages_since_progress += 1;
+        e.pages_since_progress += 1;
         true
+    }
+
+    /// Remember `addr` as reachable at `peer`, bounded to
+    /// [`MAX_DIALED_ADDRS`] total distinct addresses (R1 A3-M5). A repeat
+    /// address is not re-queued — its position in `dialed_order` is already
+    /// spent, and re-queuing it would let a peer that keeps re-advertising
+    /// the SAME address buy itself a permanent place at the front of the FIFO
+    /// forever, which defeats the bound.
+    fn note_dialed(&mut self, addr: Multiaddr, peer: PeerId) {
+        if self.dialed.insert(addr.clone(), peer).is_none() {
+            self.dialed_order.push_back(addr);
+            while self.dialed_order.len() > MAX_DIALED_ADDRS {
+                if let Some(oldest) = self.dialed_order.pop_front() {
+                    self.dialed.remove(&oldest);
+                }
+            }
+        }
+    }
+
+    /// A peer's last connection just closed: drop everything keyed by its
+    /// identity so churn cannot grow any of these past the connected-peer
+    /// count (R1 A3-M3, R1 A3-M5, R3 M-7's counterpart for the pull side).
+    ///
+    /// One method rather than four inline calls at the `ConnectionClosed`
+    /// site so this is directly unit-testable without synthesising a
+    /// `SwarmEvent`, and so a future new per-peer map has exactly one place
+    /// to be wired into disconnect cleanup.
+    fn forget_peer(&mut self, peer: &PeerId) {
+        self.peer_head.remove(peer);
+        self.chase.remove(peer);
+        self.sync_limiter.forget(peer);
+        self.dialed.retain(|_, p| p != peer);
+        let dialed = &self.dialed;
+        self.dialed_order.retain(|a| dialed.contains_key(a));
     }
 }
 
@@ -1086,9 +1194,9 @@ async fn run_swarm(
         head_slot,
         peer_head: HashMap::new(),
         recent_blocks: HashMap::new(),
-        pages_since_progress: 0,
-        head_at_last_page: 0,
+        chase: HashMap::new(),
         dialed: HashMap::new(),
+        dialed_order: VecDeque::new(),
         sync_limiter: SyncLimiter::default(),
         topics: Topics {
             blocks: IdentTopic::new(TOPIC_BLOCKS),
@@ -1285,7 +1393,7 @@ fn handle_swarm_event(
         SwarmEvent::ConnectionEstablished { peer_id, ref endpoint, num_established, .. } => {
             println!("p2p: connected {peer_id}");
             if let libp2p::core::ConnectedPoint::Dialer { address, .. } = endpoint {
-                st.dialed.insert(address.clone(), peer_id);
+                st.note_dialed(address.clone(), peer_id);
             }
             // DO NOT call `gossipsub.add_explicit_peer()` here — see this
             // module's header. An explicit peer is excluded from mesh
@@ -1335,8 +1443,7 @@ fn handle_swarm_event(
                     Ordering::Acquire,
                     |n| Some(n.saturating_sub(1)),
                 );
-                st.peer_head.remove(&peer_id);
-                st.sync_limiter.forget(&peer_id);
+                st.forget_peer(&peer_id);
                 // The cause is the whole diagnostic value of this line. A bare
                 // "disconnected" is what made the Genesis-3 yamux stream-cap
                 // failure take days to find: the transport was terminating
@@ -1369,7 +1476,7 @@ fn handle_swarm_event(
             ..
         })) => {
             for addr in info.listen_addrs {
-                st.dialed.insert(addr, peer_id);
+                st.note_dialed(addr, peer_id);
             }
         }
         SwarmEvent::Behaviour(G4BehaviourEvent::Gossipsub(gossipsub::Event::Message {
@@ -1415,7 +1522,7 @@ fn handle_swarm_event(
                 // engine's sync timer — that is the difference between "a
                 // request from genesis is accepted" and "a node can actually
                 // sync from genesis". A short page ends the walk.
-                if was_full && highest > 0 && st.may_chase_page() {
+                if was_full && highest > 0 && st.may_chase_page(peer) {
                     swarm.behaviour_mut().sync.send_request(
                         &peer,
                         SyncRequest::GetBlocks {
@@ -1763,6 +1870,172 @@ mod tests {
         lim.release(permit);
         lim.forget(&peer);
         assert_eq!(lim.tracked(), 0, "a disconnected peer's bucket is never released");
+    }
+
+    /// R3 M-7: production calls `forget` exactly ONCE per peer, from
+    /// `ConnectionClosed` — there is no second disconnect event to retry a
+    /// deferred removal the way the test above does. This is the shape that
+    /// actually occurs on the wire: the peer disconnects while its answer is
+    /// still being built (one `forget` call, inflight > 0), and only
+    /// afterward does the blocking task finish and call `release`. Before the
+    /// `disconnect_pending` fix this left the entry in `SyncLimiter::peers`
+    /// forever — one leaked bucket per peer that ever disconnected mid-answer,
+    /// unbounded over the life of the process under normal identity churn.
+    #[test]
+    fn sync_limiter_removes_peer_on_release_after_single_forget() {
+        let mut lim = SyncLimiter::default();
+        let peer = PeerId::random();
+        let now = Instant::now();
+        let permit = lim.begin(peer, now).expect("first request");
+        assert_eq!(lim.tracked(), 1);
+        // The ONE disconnect event, while the answer is still in flight.
+        lim.forget(&peer);
+        assert_eq!(lim.tracked(), 1, "an in-flight answer's slot must survive the disconnect");
+        // The blocking task finishes sometime later; nothing calls `forget`
+        // again for this peer.
+        lim.release(permit);
+        assert_eq!(
+            lim.tracked(),
+            0,
+            "release() must finish the removal forget() deferred, or a peer that \
+             disconnects mid-answer leaks its bucket forever (R3 M-7)"
+        );
+    }
+
+    /// A `Loop` with no swarm attached — every field is a plain value or a
+    /// channel, so the per-peer bookkeeping (`may_chase_page`, `note_dialed`,
+    /// `forget_peer`) is testable without a real libp2p transport.
+    fn test_loop() -> Loop {
+        let (events, _rx) = std::sync::mpsc::channel();
+        Loop {
+            events,
+            data_dir: PathBuf::from("/tmp/bloch-p2p-test"),
+            head_slot: Arc::new(AtomicU64::new(0)),
+            peer_head: HashMap::new(),
+            recent_blocks: HashMap::new(),
+            chase: HashMap::new(),
+            dialed: HashMap::new(),
+            dialed_order: VecDeque::new(),
+            sync_limiter: SyncLimiter::default(),
+            topics: Topics {
+                blocks: IdentTopic::new(TOPIC_BLOCKS),
+                attestations: IdentTopic::new(TOPIC_ATTESTATIONS),
+                txs: IdentTopic::new(TOPIC_TXS),
+            },
+            peers_live: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// R1 A3-M3: the sync-chase budget is PER PEER. A peer that never lets
+    /// this node's head advance exhausts its own [`MAX_PAGES_WITHOUT_PROGRESS`]
+    /// budget and is refused further chases — while a second, honest peer
+    /// (whose pages DO advance the head) is completely unaffected. Before the
+    /// fix both peers shared one pair of counters, so the stalling peer alone
+    /// could zero out the budget every peer drew from.
+    #[test]
+    fn may_chase_page_budget_is_per_peer_not_shared() {
+        let mut st = test_loop();
+        let stalling = PeerId::random();
+        let honest = PeerId::random();
+        // The applied head never moves (stays 0), so `stalling` burns its
+        // entire budget without ever resetting the counter.
+        for _ in 0..MAX_PAGES_WITHOUT_PROGRESS {
+            assert!(st.may_chase_page(stalling), "budget spent before the cap");
+        }
+        assert!(
+            !st.may_chase_page(stalling),
+            "stalling peer must be refused past MAX_PAGES_WITHOUT_PROGRESS"
+        );
+        // The honest peer's very next chase — right after the stalling peer
+        // hit its cap — must still be granted. Under the old, SHARED counter
+        // this would already read false.
+        assert!(
+            st.may_chase_page(honest),
+            "one stalling peer must not be able to exhaust another peer's budget"
+        );
+        // `honest` being granted a chase must not, by itself, lift the
+        // stalling peer's refusal — the applied head (shared, global) has
+        // not moved, so nothing legitimately earned it a fresh budget. This
+        // is the entry point a shared counter would have gotten wrong: one
+        // peer's mere ACTIVITY resetting another's exhausted counter.
+        assert!(
+            !st.may_chase_page(stalling),
+            "another peer being granted a chase must not lift this peer's refusal"
+        );
+        // Only genuine progress on the applied head — which is shared, by
+        // construction: it is this node's own state, not a peer's claim —
+        // legitimately grants every peer a fresh look. That is intended
+        // (a real backfill must not stay punished forever) and distinct from
+        // the bug above: it takes an actual advance of `head_slot`, not
+        // merely another peer being served.
+        st.head_slot.store(1, Ordering::Relaxed);
+        assert!(
+            st.may_chase_page(stalling),
+            "a genuine advance of the applied head must reset every peer's budget"
+        );
+    }
+
+    /// R1 A3-M3, continued: `forget_peer` evicts the per-peer chase budget on
+    /// disconnect, so a churning identity does not grow `Loop::chase` without
+    /// bound and a peer cannot dodge its own refusal by reconnecting under the
+    /// SAME id (a fresh entry only appears for a genuinely new `PeerId`).
+    #[test]
+    fn forget_peer_evicts_chase_entry() {
+        let mut st = test_loop();
+        let peer = PeerId::random();
+        st.may_chase_page(peer);
+        assert!(st.chase.contains_key(&peer));
+        st.forget_peer(&peer);
+        assert!(!st.chase.contains_key(&peer), "disconnect must evict the chase budget");
+    }
+
+    /// R1 A3-M5: `Loop::dialed` is bounded to [`MAX_DIALED_ADDRS`] distinct
+    /// addresses, FIFO-evicted — identify's `listen_addrs` are peer-supplied,
+    /// so without a bound one peer advertising unlimited addresses grows this
+    /// map for the life of the process.
+    #[test]
+    fn dialed_is_bounded_fifo() {
+        let mut st = test_loop();
+        let peer = PeerId::random();
+        for i in 0..MAX_DIALED_ADDRS + 10 {
+            let addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/{}", 20_000 + i).parse().unwrap();
+            st.note_dialed(addr, peer);
+        }
+        assert_eq!(
+            st.dialed.len(),
+            MAX_DIALED_ADDRS,
+            "the map must never exceed MAX_DIALED_ADDRS regardless of how many addresses arrive"
+        );
+        assert_eq!(st.dialed.len(), st.dialed_order.len(), "the two must stay in lockstep");
+        // The FIRST ten addresses were evicted to make room for the rest.
+        let evicted: Multiaddr = "/ip4/127.0.0.1/tcp/20000".parse().unwrap();
+        assert!(!st.dialed.contains_key(&evicted), "oldest address must be evicted, not newest");
+    }
+
+    /// R1 A3-M5, continued: a peer's addresses are dropped the moment its
+    /// last connection closes — the map does not wait for the FIFO bound to
+    /// clear a peer that is already gone.
+    #[test]
+    fn forget_peer_evicts_dialed_addresses() {
+        let mut st = test_loop();
+        let peer = PeerId::random();
+        let other = PeerId::random();
+        let addr_a: Multiaddr = "/ip4/127.0.0.1/tcp/30001".parse().unwrap();
+        let addr_b: Multiaddr = "/ip4/127.0.0.1/tcp/30002".parse().unwrap();
+        let addr_other: Multiaddr = "/ip4/127.0.0.1/tcp/30003".parse().unwrap();
+        st.note_dialed(addr_a.clone(), peer);
+        st.note_dialed(addr_b.clone(), peer);
+        st.note_dialed(addr_other.clone(), other);
+        assert_eq!(st.dialed.len(), 3);
+        st.forget_peer(&peer);
+        assert!(!st.dialed.contains_key(&addr_a), "peer's address must be dropped");
+        assert!(!st.dialed.contains_key(&addr_b), "peer's address must be dropped");
+        assert!(st.dialed.contains_key(&addr_other), "another peer's address must survive");
+        assert_eq!(
+            st.dialed.len(),
+            st.dialed_order.len(),
+            "the FIFO queue must stay in lockstep with the map after a per-peer eviction"
+        );
     }
 
     /// **THE end-to-end regression test for H5**, over the serving path a
