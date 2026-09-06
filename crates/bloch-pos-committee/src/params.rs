@@ -12,7 +12,9 @@
 //! `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` (800) and
 //! `BLOCK_BYTES_V2_ACTIVATION_EPOCH` (800) are all epochs the chain is past.
 //! `LEAK_RECOVERY_ACTIVATION_EPOCH` is armed at 2700 (2026-09-06);
-//! `ANCESTRY_SEED_ACTIVATION_EPOCH` is the one still at `u64::MAX`.
+//! `ANCESTRY_SEED_ACTIVATION_EPOCH`, `DEPOSIT_ACTIVATION_EPOCH`,
+//! `EXIT_AUTH_ACTIVATION_EPOCH` and `RANDAO_RECOMMIT_ACTIVATION_EPOCH` are
+//! the ones still at `u64::MAX`.
 //!
 //! Until 2026-09-02 this header said nothing here was active and that the
 //! crate held no activation height at all because it was not wired into the
@@ -715,6 +717,41 @@ pub mod rehearsal {
         Restore(prev)
     }
 
+    thread_local! {
+        static RANDAO_RECOMMIT_GATE_OPEN_TL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Test-only: treat [`super::RANDAO_RECOMMIT_ACTIVATION_EPOCH`] as
+    /// already bound.
+    ///
+    /// Its own switch, NOT folded into `GATES_OPEN`, for the same reason
+    /// `EXIT_AUTH_GATE_OPEN` has its own: this gate's inert value selects a
+    /// REFUSAL (a re-commit is consensus-invalid at every epoch), and a test
+    /// that only wanted the post-ancestry-seed roster must not silently gain
+    /// a chain where exhausted validators resurrect themselves.
+    ///
+    /// Default CLOSED, deliberately: an unadorned `cargo test` exercises the
+    /// configuration the fleet runs today, in which every RANDAO chain is
+    /// terminal. Tests of the post-flag-day rules — the signature check, the
+    /// exhaustion precondition, the epoch binding — opt in.
+    pub fn randao_recommit_gate_forced_open() -> bool {
+        RANDAO_RECOMMIT_GATE_OPEN_TL.with(|c| c.get())
+    }
+
+    /// Opens the re-commit gate for this thread until the guard drops,
+    /// including on unwind, so a failing assertion cannot leave the beacon
+    /// rules mutated for the rest of the thread.
+    pub fn randao_recommit_gate_open_guard() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                RANDAO_RECOMMIT_GATE_OPEN_TL.with(|c| c.set(self.0));
+            }
+        }
+        let prev = RANDAO_RECOMMIT_GATE_OPEN_TL.with(|c| c.replace(true));
+        Restore(prev)
+    }
+
     /// Serializes every test that flips a switch in this module. The switches
     /// are process-global and `cargo test` runs test functions on threads, so
     /// without this a mutation test would silently corrupt an unrelated one.
@@ -995,6 +1032,51 @@ pub const DEPOSIT_ACTIVATION_EPOCH: u64 = u64::MAX;
 ///
 /// `exit_auth_gate_is_inert` pins the value.
 pub const EXIT_AUTH_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Flag day for the RANDAO **re-commit** transaction
+/// ([`crate::transition::PosTransaction::RandaoRecommit`]) — INERT at
+/// `u64::MAX`. **Do not arm without the founder's ruling.**
+///
+/// # Why this exists: every RANDAO chain is terminal today
+///
+/// A registration buys exactly [`RANDAO_CHAIN_LENGTH`] = 8,192 reveals
+/// (§6.3). One reveal is consumed per **proposed** slot, and when the chain
+/// bottoms out at the seed, [`crate::beacon::RevealState::is_exhausted`]
+/// makes every further reveal a deterministic reject — the validator can
+/// never propose again. `beacon.rs` has said since §6.3 step 4 that the way
+/// back is "a re-commit transaction carrying a fresh `c_0`", and
+/// [`crate::beacon::RevealState::recommit`] has existed for exactly that —
+/// but until this gate landed **no consensus path called it**: no wire tag,
+/// no `apply_transaction` arm, nothing. Chains were terminal, and at the
+/// launch roster's proposal cadence the first validators exhaust around
+/// **2027-02-11** (finding H-R7-1). After the last chain spends, the fleet
+/// stops proposing entirely.
+///
+/// # What arming it enables
+///
+/// At and above this epoch, `RandaoRecommit` applies: a validator whose
+/// chain is EXHAUSTED may install a fresh `c_0`, authorised by a hybrid
+/// signature verified in consensus against the pubkey the registry committed
+/// at registration (never a key carried in the message), over
+/// [`crate::beacon::recommit_signing_root`] — which binds the inclusion
+/// epoch, so a captured re-commit cannot be replayed at a later exhaustion.
+/// Below this epoch the arm refuses before reading any field, exactly like
+/// the `Deposit`/`ExitV2` gates, so today's fleet behaviour is unchanged
+/// byte for byte.
+///
+/// # Arming has the same unmet precondition as `EXIT_AUTH_ACTIVATION_EPOCH`
+///
+/// The transaction's wire byte (`0x0A`) is claimed encode-side only: the
+/// decoder deliberately refuses it until the founder assigns the byte
+/// (`tests/wire_tag_registry.rs`). Arming this constant without that
+/// assignment activates rules nothing on the wire can reach. Both decisions
+/// — the byte and the flag day — are the founder's, and both have a hard
+/// deadline: they must be armed, with the fleet rebuilt, **before the first
+/// chain exhausts (~2027-02-11)**, or proposal liveness starts decaying
+/// validator by validator.
+///
+/// `randao_recommit_gate_is_inert` pins the value.
+pub const RANDAO_RECOMMIT_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.

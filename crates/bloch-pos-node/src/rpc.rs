@@ -1786,6 +1786,11 @@ pub fn submitted_json(tx: &PosTransaction, outcome: Admitted) -> Json {
         PosTransaction::ExitV2 { .. } => "exit_v2",
         PosTransaction::Delegate { .. } => "delegate",
         PosTransaction::SlashingEvidence(_) => "slashing_evidence",
+        // Unreachable today twice over — the wire byte (0x0A) is undecodable
+        // and `admissible` refuses the shape below its flag day — but this
+        // match is exhaustive on purpose, and an operator reading the field
+        // post-activation needs the honest name.
+        PosTransaction::RandaoRecommit { .. } => "randao_recommit",
     };
     Json::obj(vec![
         ("accepted", Json::Bool(true)),

@@ -493,6 +493,76 @@ pub enum PosTransaction {
         /// Hybrid signature (both halves) over the `DS_EXIT` signing root.
         signature: Vec<u8>,
     },
+    /// Install a fresh RANDAO chain head for an EXHAUSTED validator (§6.3
+    /// step 4) — consensus-INVALID until
+    /// [`crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH`], which is
+    /// `u64::MAX`.
+    ///
+    /// # Why this variant exists
+    ///
+    /// A registration buys exactly `RANDAO_CHAIN_LENGTH` = 8,192 reveals, one
+    /// per proposed slot, and an exhausted chain rejects everything
+    /// (`beacon::RevealState::is_exhausted`). `beacon.rs` has promised "a
+    /// re-commit transaction carrying a fresh `c_0`" since §6.3 was written,
+    /// and `RevealState::recommit` sat ready — with **no consensus caller and
+    /// no wire shape**. Every chain on the fleet was therefore terminal, and
+    /// the first ones exhaust around 2027-02-11 (finding H-R7-1). This is
+    /// that transaction.
+    ///
+    /// # The rules, when the gate opens
+    ///
+    /// 1. **Signed epoch must EQUAL the inclusion epoch** — same discipline
+    ///    as [`Self::ExitV2`], and for the same reason: a captured re-commit
+    ///    replayed at the validator's next exhaustion would reset it onto a
+    ///    chain whose reveals are by then all public, i.e. a fully
+    ///    predictable RANDAO contribution.
+    /// 2. **The chain must actually be exhausted**
+    ///    (`reveals_used == RANDAO_CHAIN_LENGTH`). This is the anti-grinding
+    ///    rule: a validator that could re-commit at will would choose a fresh
+    ///    seed *after* seeing the current mix whenever the timing favoured
+    ///    it. Requiring exhaustion caps that choice at once per 8,192
+    ///    proposals — the alternative being a validator that is dead forever
+    ///    — and it also makes a same-epoch replay of the transaction refuse
+    ///    itself (the re-commit resets `reveals_used` to 0, so the copy fails
+    ///    this very check). §6.3's stronger include-one-epoch-early rule
+    ///    needs a pending-commitment field the state root would have to
+    ///    commit, i.e. its own migration; that trade is the founder's to
+    ///    make when arming the gate.
+    /// 3. **A hybrid signature verified IN CONSENSUS** against the pubkey the
+    ///    registry committed at registration — never a key carried in the
+    ///    message — over [`crate::beacon::recommit_signing_root`]
+    ///    (`DS_RANDAO` domain, 60-byte preimage, collision-free with the
+    ///    80-byte mixing preimage).
+    ///
+    /// # The wire byte is claimed but NOT DECODED
+    ///
+    /// `canonical_bytes` writes `0x0A`. The decoder has **no `0x0A` arm** and
+    /// keeps returning [`TxDecodeError::UnknownTag`]: assigning a wire byte
+    /// is the founder's (`tests/wire_tag_registry.rs`), and until the ruling
+    /// this variant is encode-and-apply only — the rules are written,
+    /// compiled, tested under the rehearsal gate, and nothing on the wire can
+    /// reach them. Same honest state as [`Self::ExitV2`], same two-decision
+    /// arming (byte + flag day), with one difference: this one has a
+    /// deadline. Both must land, fleet rebuilt, before the first chain
+    /// exhausts (~2027-02-11), or proposal liveness decays validator by
+    /// validator.
+    RandaoRecommit {
+        /// Registry index of the validator installing a fresh chain. The
+        /// signature check against the *committed* key is what makes naming
+        /// a position (not an identity) safe here: indices are never reused
+        /// and records never removed, so the index resolves identically on
+        /// every node, and only the key holder can authorise it.
+        validator: u32,
+        /// `c_0` of the brand-new SHAKE-256 chain — what
+        /// `beacon::RevealState::register` installs.
+        new_commitment: [u8; 32],
+        /// Epoch the re-commit was signed for; must equal the inclusion
+        /// epoch.
+        epoch: u64,
+        /// Hybrid signature (both halves) over
+        /// [`crate::beacon::recommit_signing_root`].
+        signature: Vec<u8>,
+    },
     /// Bond delegated stake behind an operator.
     Delegate {
         delegator: u32,
@@ -783,6 +853,19 @@ impl PosTransaction {
                 // does not answer this byte yet.
                 b.push(0x08);
                 b.extend_from_slice(pubkey_hash);
+                b.extend_from_slice(&epoch.to_le_bytes());
+                put(&mut b, signature);
+            }
+            PosTransaction::RandaoRecommit { validator, new_commitment, epoch, signature } => {
+                // 0x0A. Same encoding rules as every other tag: fixed-width
+                // LE for the scalars, length-prefixed for the one
+                // variable-length field. See the variant's docs for why the
+                // DECODER does not answer this byte yet — the assignment is
+                // the founder's, and `tests/wire_tag_registry.rs` records the
+                // claim as encode-only until then.
+                b.push(0x0A);
+                b.extend_from_slice(&validator.to_le_bytes());
+                b.extend_from_slice(new_commitment);
                 b.extend_from_slice(&epoch.to_le_bytes());
                 put(&mut b, signature);
             }
@@ -2473,6 +2556,21 @@ impl CommittedState {
         forced || epoch >= crate::params::EXIT_AUTH_ACTIVATION_EPOCH
     }
 
+    /// Is the RANDAO re-commit transaction active in `epoch`?
+    ///
+    /// One reader for one gate, mirroring [`Self::exit_auth_active`].
+    /// `epoch` is the caller's `self.epoch`: COMMITTED state, rolled to the
+    /// judged block's own `epoch_of(header.slot)` by `compute_post_state`'s
+    /// boundary walk — never a clock, never anything node-local (the
+    /// 2026-08-08 `expected_bits` fork is the standing reason).
+    fn randao_recommit_active(epoch: u64) -> bool {
+        #[cfg(test)]
+        let forced = crate::params::rehearsal::randao_recommit_gate_forced_open();
+        #[cfg(not(test))]
+        let forced = false;
+        forced || epoch >= crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH
+    }
+
     fn apply_transaction(
         &mut self,
         tx: &PosTransaction,
@@ -2649,6 +2747,20 @@ impl CommittedState {
                     return Err(TxReject::StakingNotActive);
                 }
                 self.apply_exit_v2(pubkey_hash, *epoch, signature, verifier).map(|()| free)
+            }
+            PosTransaction::RandaoRecommit { validator, new_commitment, epoch, signature } => {
+                // THE FLAG-DAY GATE, FIRST — same discipline as every other
+                // gated arm, read from `self.epoch` (committed state, never
+                // node-local). `RANDAO_RECOMMIT_ACTIVATION_EPOCH` is
+                // `u64::MAX`, so today this refuses at EVERY epoch and the
+                // fleet's behaviour is unchanged: chains stay terminal until
+                // the founder arms the flag day (deadline ~2027-02-11, the
+                // first exhaustion — see the constant's docs).
+                if !Self::randao_recommit_active(self.epoch) {
+                    return Err(TxReject::StakingNotActive);
+                }
+                self.apply_randao_recommit(*validator, new_commitment, *epoch, signature, verifier)
+                    .map(|()| free)
             }
             PosTransaction::Delegate { delegator, validator, amount_sat, eligible } => {
                 // Same gate, same constant, and it must be the same constant:
@@ -2830,6 +2942,81 @@ impl CommittedState {
         let exit_epoch = self.epoch.saturating_add(staking::EXIT_DELAY_EPOCHS);
         rec.exit_epoch = exit_epoch;
         rec.withdrawable_epoch = exit_epoch.saturating_add(staking::WITHDRAWAL_DELAY_EPOCHS);
+        Ok(())
+    }
+
+    /// Apply a RANDAO re-commit. Seam below
+    /// [`crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH`]; the caller holds
+    /// the gate, this function holds the rules.
+    ///
+    /// Runs on the ONE path every block transaction takes:
+    /// `Transition::apply_block` → `compute_post_state` step 10 → the
+    /// transaction loop → `apply_transaction`'s `RandaoRecommit` arm → here.
+    /// Nothing on the fleet executes it today, and nothing can: the gate is
+    /// `u64::MAX` and the wire byte (`0x0A`) is undecodable. What is claimed
+    /// is narrower and checkable — spec-correct, composed with the real
+    /// handler, and tested under the rehearsal gate, so that WHEN it is
+    /// armed it is right.
+    ///
+    /// Check order is cheapest-first: epoch equality, identity, lifecycle,
+    /// the exhaustion precondition, and only then the one hybrid
+    /// verification (~145 µs). Every check runs before any mutation, so a
+    /// refused re-commit leaves the state untouched.
+    fn apply_randao_recommit(
+        &mut self,
+        validator: u32,
+        new_commitment: &[u8; 32],
+        epoch: u64,
+        signature: &[u8],
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<(), TxReject> {
+        // Equality, not `<=` — the ExitV2 rationale verbatim: a message
+        // signed for epoch E and included at E+900 would be a permanent
+        // replay lever, and here the replayed effect (resetting onto a chain
+        // of already-public reveals) is a grinding channel, not just a clock
+        // the signer never chose.
+        if epoch != self.epoch {
+            return Err(TxReject::StakingRule);
+        }
+        let Some(rec) = self.validators.get(&validator) else {
+            return Err(TxReject::StakingRule);
+        };
+        // A slashed validator's registry record is frozen for evidence; its
+        // ejection path must not double as a beacon-reset path. An exited
+        // validator proposes nothing, so a fresh chain would only be a
+        // signature-spam surface.
+        if rec.slashed || rec.exit_epoch <= self.epoch {
+            return Err(TxReject::StakingRule);
+        }
+        // THE EXHAUSTION PRECONDITION — the anti-grinding rule (see the
+        // variant's docs): only a validator whose chain is SPENT may install
+        // a fresh one. `reveals_used` is committed state, folded into the
+        // state root beside the commitment itself, so two nodes cannot
+        // disagree about whether this fires. It also self-refuses a
+        // same-epoch replay: the first application resets the counter to 0.
+        let used = *self.reveals_used.get(&validator).unwrap_or(&0);
+        if used < crate::params::RANDAO_CHAIN_LENGTH {
+            return Err(TxReject::StakingRule);
+        }
+        // THE AUTHORISATION, LAST. Against `rec.pubkey` — the key the
+        // registry committed at registration, the same bytes every node
+        // verifies this validator's blocks against — over the one
+        // `recommit_signing_root` definition. A key carried in the message
+        // would authorise nothing: the signer would be choosing their own
+        // public key.
+        let root = beacon::recommit_signing_root(validator, epoch, new_commitment);
+        if !verifier.verify_with_key(&rec.pubkey, &root, signature) {
+            return Err(TxReject::StakingRule);
+        }
+        // Mutation only after every check has passed. This IS
+        // `beacon::RevealState::recommit` (`register(new_c0)`), written into
+        // the two committed columns that `compute_post_state` reads a
+        // proposer's `RevealState` back out of.
+        let Some(rec) = self.validators.get_mut(&validator) else {
+            return Err(TxReject::StakingRule);
+        };
+        rec.randao_commitment = *new_commitment;
+        self.reveals_used.insert(validator, 0);
         Ok(())
     }
 
@@ -7356,6 +7543,274 @@ mod tests {
         );
     }
 
+    // -- RANDAO_RECOMMIT_ACTIVATION_EPOCH (H-R7-1) --------------------------
+
+    /// TRIPWIRE. `RANDAO_RECOMMIT_ACTIVATION_EPOCH` must stay `u64::MAX`.
+    ///
+    /// Arming it activates the re-commit rules on every node — and today
+    /// nothing on the wire can reach them, because the transaction's byte
+    /// (`0x0A`) is still unassigned and this tree's decoder refuses it.
+    /// Arming is the founder's, it is TWO decisions (the byte and the flag
+    /// day), and unlike every other gate in this file it has a deadline:
+    /// both must land, fleet rebuilt, before the first RANDAO chain
+    /// exhausts (~2027-02-11), or proposal liveness decays validator by
+    /// validator. Whoever arms it has to delete this test first, and read
+    /// this while doing so.
+    #[test]
+    fn randao_recommit_gate_is_inert() {
+        assert_eq!(
+            crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH,
+            u64::MAX,
+            "arming this activates re-commit rules whose wire byte is still \
+             unassigned; the ruling and the decoder arm must land together — read the docs",
+        );
+    }
+
+    /// Build the signed re-commit a validator would actually send, under
+    /// [`ToyVerifier`]'s one-key-one-root rule.
+    fn signed_recommit(validator: u32, epoch: u64, new_c0: [u8; 32]) -> PosTransaction {
+        let pk = vec![validator as u8; 8];
+        let root = beacon::recommit_signing_root(validator, epoch, &new_c0);
+        PosTransaction::RandaoRecommit {
+            validator,
+            new_commitment: new_c0,
+            epoch,
+            signature: toy_sign(&pk, &root),
+        }
+    }
+
+    /// The control half of the flag day: below the gate a PERFECTLY signed
+    /// re-commit for a genuinely exhausted validator is consensus-invalid,
+    /// so today's fleet behaviour — chains are terminal — is unchanged.
+    #[test]
+    fn below_the_gate_a_perfectly_signed_recommit_is_consensus_invalid() {
+        let (_t, g, _chains) = setup(4);
+        let mut probe = g.clone();
+        probe.reveals_used.insert(1, crate::params::RANDAO_CHAIN_LENGTH);
+        assert_eq!(
+            probe.apply_transaction(
+                &signed_recommit(1, 0, [0xA5; 32]),
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &ToyVerifier,
+            ),
+            Err(TxReject::StakingNotActive),
+            "a re-commit must be consensus-INVALID below the flag day",
+        );
+    }
+
+    /// THE RULES, above the gate — each check shown to refuse something,
+    /// so deleting any one of them turns this test red.
+    #[test]
+    fn recommit_requires_exhaustion_epoch_binding_and_the_validators_own_signature() {
+        let _open = crate::params::rehearsal::randao_recommit_gate_open_guard();
+        let (_t, g, _chains) = setup(4);
+
+        // Exhausted fixture: validator 1's committed chain is spent.
+        let mut ex = g.clone();
+        ex.reveals_used.insert(1, crate::params::RANDAO_CHAIN_LENGTH);
+        let fresh = RandaoChain::generate([0xEE; 32]);
+
+        // The genuine article applies and resets the two committed columns.
+        let mut probe = ex.clone();
+        assert!(
+            probe
+                .apply_transaction(
+                    &signed_recommit(1, 0, fresh.commitment()),
+                    0,
+                    fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                    &ToyVerifier,
+                )
+                .is_ok(),
+            "a correctly signed re-commit for an exhausted validator must apply",
+        );
+        assert_eq!(
+            probe.validator_record(1).unwrap().randao_commitment,
+            fresh.commitment(),
+            "the fresh c_0 must be the committed chain head",
+        );
+        assert_eq!(*probe.reveals_used.get(&1).unwrap(), 0, "the chain position must reset");
+
+        // Replay of the SAME transaction in the same epoch refuses itself:
+        // the first application reset `reveals_used`, so the copy fails the
+        // exhaustion precondition.
+        assert_eq!(
+            probe.apply_transaction(
+                &signed_recommit(1, 0, fresh.commitment()),
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &ToyVerifier,
+            ),
+            Err(TxReject::StakingRule),
+            "a same-epoch replay must refuse itself via the exhaustion precondition",
+        );
+
+        // NOT exhausted: the anti-grinding rule. Validator 2 still has its
+        // whole chain, so a fresh seed chosen after seeing the mix is
+        // exactly the re-commit-at-will grinding the precondition exists to
+        // refuse.
+        let mut probe = ex.clone();
+        assert_eq!(
+            probe.apply_transaction(
+                &signed_recommit(2, 0, fresh.commitment()),
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &ToyVerifier,
+            ),
+            Err(TxReject::StakingRule),
+            "a validator with reveals remaining must not be able to re-commit",
+        );
+
+        // Wrong epoch, both directions: a captured re-commit must not be
+        // replayable at a time its signer never chose.
+        for wrong in [1u64, 7] {
+            let mut probe = ex.clone();
+            assert_eq!(
+                probe.apply_transaction(
+                    &signed_recommit(1, wrong, fresh.commitment()),
+                    0,
+                    fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                    &ToyVerifier,
+                ),
+                Err(TxReject::StakingRule),
+                "the signed epoch must EQUAL the inclusion epoch",
+            );
+        }
+
+        // Validator 2's own key over validator 1's message: the signature is
+        // real, it just does not authorise THIS re-commit.
+        let root = beacon::recommit_signing_root(1, 0, &fresh.commitment());
+        let wrong_signer = PosTransaction::RandaoRecommit {
+            validator: 1,
+            new_commitment: fresh.commitment(),
+            epoch: 0,
+            signature: toy_sign(&vec![2u8; 8], &root),
+        };
+        let mut probe = ex.clone();
+        assert_eq!(
+            probe.apply_transaction(
+                &wrong_signer,
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &ToyVerifier,
+            ),
+            Err(TxReject::StakingRule),
+            "one validator must not be able to reset another's beacon chain",
+        );
+
+        // No signature at all.
+        let unsigned = PosTransaction::RandaoRecommit {
+            validator: 1,
+            new_commitment: fresh.commitment(),
+            epoch: 0,
+            signature: Vec::new(),
+        };
+        let mut probe = ex.clone();
+        assert_eq!(
+            probe.apply_transaction(
+                &unsigned,
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &ToyVerifier,
+            ),
+            Err(TxReject::StakingRule),
+            "a re-commit with no signature authorises nothing",
+        );
+
+        // A commitment swapped by a relay under the real signature: the root
+        // binds `new_c0`, so the swap dies on the signature check.
+        let swapped = PosTransaction::RandaoRecommit {
+            validator: 1,
+            new_commitment: [0xBB; 32],
+            epoch: 0,
+            signature: toy_sign(&vec![1u8; 8], &root),
+        };
+        let mut probe = ex.clone();
+        assert_eq!(
+            probe.apply_transaction(
+                &swapped,
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &ToyVerifier,
+            ),
+            Err(TxReject::StakingRule),
+            "the signing root must bind the commitment, or a relay chooses the chain",
+        );
+    }
+
+    /// **THE H-R7-1 CLAIM, END TO END:** an exhausted validator stops
+    /// proposing, lands a re-commit (carried in another validator's block,
+    /// through `apply_block` — the one path every transaction takes), and
+    /// then PROPOSES AGAIN past its original chain length, with the reveal
+    /// coming off the brand-new chain.
+    #[test]
+    fn an_exhausted_validator_recommits_and_proposes_past_its_original_chain_length() {
+        let _open = crate::params::rehearsal::randao_recommit_gate_open_guard();
+        let (t, mut g, mut chains) = setup(4);
+
+        // Pick a victim that proposes at some slot s2, and an earlier slot
+        // s1 in the SAME epoch with a different proposer to carry the
+        // re-commit. The draw is seed-dependent, so scan rather than assume.
+        let roster = g.duty_roster();
+        let seed = g.seed_for_epoch(g.epoch);
+        let mut pair = None;
+        'outer: for s1 in 1..crate::params::SLOTS_PER_EPOCH {
+            let p1 = schedule::proposer(&seed, s1, &roster).expect("no proposer");
+            for s2 in (s1 + 1)..crate::params::SLOTS_PER_EPOCH {
+                let p2 = schedule::proposer(&seed, s2, &roster).expect("no proposer");
+                if p2 != p1 {
+                    pair = Some((s1, p1, s2, p2));
+                    break 'outer;
+                }
+            }
+        }
+        let (s1, _carrier, s2, victim) = pair.expect("4 validators, 32 slots: a pair must exist");
+
+        // Exhaust the victim's COMMITTED chain — the state every node agrees
+        // on, the thing H-R7-1 says becomes terminal.
+        g.reveals_used.insert(victim, crate::params::RANDAO_CHAIN_LENGTH);
+
+        // Proposing is now impossible for the victim: the reveal path is a
+        // deterministic ChainExhausted, which is the fleet-stops-proposing
+        // half of the finding.
+        let spent = RevealState {
+            commitment: g.validator_record(victim).unwrap().randao_commitment,
+            reveals_used: crate::params::RANDAO_CHAIN_LENGTH,
+        };
+        assert_eq!(
+            beacon::process_reveal(&spent, &g.randao_mix, &[0u8; 32]),
+            Err(beacon::BeaconError::ChainExhausted),
+            "fixture must model a genuinely terminal chain, or the rest is vacuous",
+        );
+
+        // Another validator's block carries the victim's re-commit.
+        let fresh = RandaoChain::generate([0xD7; 32]);
+        let txs = vec![signed_recommit(victim, crate::epoch_of(s1), fresh.commitment())];
+        let b1 = build_block(&t, &g, s1, &[], &txs, &mut chains);
+        let after = t.apply_block(&g, &b1, &[], &txs).expect("the carrier block must apply");
+        assert_eq!(
+            after.validator_record(victim).unwrap().randao_commitment,
+            fresh.commitment(),
+            "apply_block must install the fresh chain head",
+        );
+        assert_eq!(*after.reveals_used.get(&victim).unwrap(), 0);
+
+        // And the victim proposes again — one reveal PAST the 8,192 its
+        // original chain could ever produce, off the new chain.
+        chains[victim as usize] = fresh;
+        let b2 = build_block(&t, &after, s2, &[], &[], &mut chains);
+        assert_eq!(b2.header.proposer_index, victim, "s2 must be the victim's slot");
+        let done = t.apply_block(&after, &b2, &[], &[]).expect(
+            "the recommitted validator's next proposal must be valid — this is the \
+             continue-proposing half of H-R7-1",
+        );
+        assert_eq!(
+            *done.reveals_used.get(&victim).unwrap(),
+            1,
+            "the reveal must have come off the NEW chain's counter",
+        );
+    }
+
     /// Build the signed exit a validator would actually send, under
     /// [`ToyVerifier`]'s one-key-one-root rule.
     fn signed_exit(validator: u8, epoch: u64) -> PosTransaction {
@@ -10266,6 +10721,11 @@ mod tests {
             PosTransaction::ExitV2 { .. } => {}
             PosTransaction::Delegate { .. } => {}
             PosTransaction::SlashingEvidence(_) => {}
+            // The RANDAO re-commit rewrites exactly two registry columns —
+            // `randao_commitment` and the `reveals_used` counter — and moves
+            // no satoshi in either direction. Beacon state, not value state;
+            // it cannot touch the cap.
+            PosTransaction::RandaoRecommit { .. } => {}
         }
 
         // Monotone under blocks and boundaries, and never above the cap.

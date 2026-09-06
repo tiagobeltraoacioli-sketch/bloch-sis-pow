@@ -825,7 +825,16 @@ pub trait RandomnessBeacon {
     /// Signing root for the re-commit message that installs a fresh chain
     /// head. Fixed-width fields under `DS_RANDAO`; the input length differs
     /// from the mixing preimage, so the two uses cannot collide.
-    fn recommit_signing_root(&self, validator: u32, new_commitment: &[u8; 32]) -> [u8; 32];
+    ///
+    /// `epoch` is the inclusion epoch and is REQUIRED in the root: a
+    /// re-commit that did not bind it would be replayable at the validator's
+    /// next exhaustion, resetting it onto a chain whose reveals are all
+    /// public by then — a fully predictable RANDAO contribution. The one
+    /// definition is [`crate::beacon::recommit_signing_root`]; the consensus
+    /// caller is `apply_transaction`'s `RandaoRecommit` arm, gated behind
+    /// [`crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH`].
+    fn recommit_signing_root(&self, validator: u32, epoch: u64, new_commitment: &[u8; 32])
+        -> [u8; 32];
 }
 
 // ─── Boundary 4: justification and finality ─────────────────────────────────

@@ -4728,6 +4728,22 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
             }
             exit_v2_structural_rules(*epoch, signature, wall_epoch)
         }
+        // The RANDAO re-commit (H-R7-1) — named explicitly for the same
+        // reason ExitV2 is: a variant that reaches `_` is a variant the
+        // mempool ADMITS, and this shape is consensus-refused at every epoch
+        // (`RANDAO_RECOMMIT_ACTIVATION_EPOCH` is `u64::MAX`) with its wire
+        // byte (0x0A) unassigned besides. Pre-activation the refusal is
+        // unconditional; post-activation the signature half still belongs to
+        // consensus alone (this function is stateless — no registry to
+        // resolve the validator's committed key against).
+        PosTransaction::RandaoRecommit { .. } => {
+            if wall_epoch < bloch_pos_committee::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH {
+                return Err(
+                    "RANDAO re-commits (tag 0x0A) are not active: the format ships                      behind a flag day (RANDAO_RECOMMIT_ACTIVATION_EPOCH) that this                      chain has not reached, and the wire byte is not assigned",
+                );
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
