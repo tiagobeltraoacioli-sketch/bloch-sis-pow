@@ -1554,6 +1554,7 @@ async fn main() {
         let mem_m    = mempool.clone();
         let otx_m    = outbound_tx.clone();
         let tip_tx_m = tip_tx.clone();  // Sprint 2.c: tip broadcast for stratum
+        let shielded_m = shielded.clone(); // LEG1: accept_block needs the shielded pool
         let miner_addr = cli.miner_address.clone()
             .unwrap_or_else(|| FOUNDER_ADDRESS_HEX.to_string());
         // FIX #8: Convert miner address to proper 20-byte script_pubkey
@@ -1916,121 +1917,37 @@ async fn main() {
                         let hash = block.block_hash();
                         info!("⛏  Block found! h={} {}", block.height, hex::encode(&hash[..8]));
 
-                        let ts      = block.header.timestamp;
-                        let parents = block.header.parents.clone();
-                        if let Err(e) = store_m.put_block(&block) {
-                            warn!("store mined block: {}", e);
-                            continue;
-                        }
-                        store_m.put_meta("tip_hash", &hash).ok();
-
-                        // Sprint DD (PR-2 fix): capture undo data during mutation.
-                        //
-                        // The pre-DD code applied UTXO/tx_index/coinbase mutations
-                        // inline here (written before Sprint U landed) but never
-                        // recorded UndoData. Any locally-mined block was therefore
-                        // unrollback-able — a fatal problem the moment IBD arrived
-                        // from a peer with a heavier chain, because the resulting
-                        // reorg plan would fail on the first rollback_block call
-                        // with "no undo data for block ..". Observed in production
-                        // 2026-04-21: Akash worker minered h=1 locally, seed IBD
-                        // delivered multiple competing h=1 blocks, reorg aborted,
-                        // worker stuck at height=1.
-                        //
-                        // Routing through apply_block_utxo_mutations gives us the
-                        // byte-identical mutation sequence this branch had before,
-                        // plus the UndoData record required by reorg.
-                        if let Err(e) = reorg::apply_block_utxo_mutations(&store_m, &block) {
-                            warn!("DD: apply_block_utxo_mutations for mined block h={}: {}",
-                                block.height, e);
-                            // Keep going — partial mutation is still better than
-                            // erroring out of the miner loop and freezing the node.
-                        }
-
-                        let work = pow::work_from_bits(block.header.bits);
-                        // Sprint 2.c: snapshot old tip so we can detect and
-                        // broadcast when our mined block advances the chain.
-                        let old_tip_mined = { dag_m.read().selected_tip() };
-                        if let Err(e) = dag_m.write().add_block(hash, parents, ts, work) {
-                            // M-9: a locally-mined block should never hit these
-                            // preconditions — no-parents or duplicate-hash here
-                            // would indicate a miner bug, not a peer attack. Log
-                            // loud and skip this block so the miner doesn't spin.
+                        // ── Round-2 audit LEG1-selfmine-accept ──────────
+                        // Route the self-mined block through the SAME
+                        // accept_block pipeline every other ingress uses
+                        // (network gossip, RPC submitblock, stratum submit).
+                        // The old inline put_block/apply path here committed
+                        // the block with NO consensus validation, so a miner
+                        // bug the mempool can miss (coinbase over-claim, dust
+                        // tx, wrong expected bits, below-finality height, ...)
+                        // was persisted locally and only rejected by PEERS —
+                        // silently forking the producer off its own network.
+                        // accept_block handles the DAG insert, storage,
+                        // UTXO/undo mutations (Sprint DD), retarget meta
+                        // ("current_bits"), mempool cleanup and the stratum
+                        // tip notification; commit_self_mined_block adds the
+                        // structural gate + RPC-state refresh, mirroring the
+                        // stratum/RPC submission callbacks exactly.
+                        if let Err(e) = commit_self_mined_block(
+                            &block,
+                            &dag_m, &store_m, &mem_m, &state_m,
+                            Some(&tip_tx_m), &shielded_m,
+                        ) {
+                            // A locally-mined block should never be rejected
+                            // by our own acceptor — this indicates a miner
+                            // bug, not a peer attack. Log loud, do NOT
+                            // broadcast, and skip so the miner doesn't spin
+                            // on (or propagate) an invalid block.
                             log::error!(
-                                "mining: DAG rejected our own block {}: {}. Skipping.",
+                                "mining: our own block {} was rejected by accept_block: {} — discarding (miner bug)",
                                 hex::encode(hash), e,
                             );
                             continue;
-                        }
-                        // Persist DAG data + integrity hash (Sprint Y, M-2).
-                        // Phase 1: fold the reachability delta into the same
-                        // atomic write when the index is maintained; live Legacy
-                        // path is byte-for-byte unchanged.
-                        // Bind in a `let` first so the read guard drops before
-                        // `dag_m.write()` below — parking_lot RwLock is not
-                        // reentrant, and holding the read across the write
-                        // deadlocks once the reachability gate is armed.
-                        let ddata_opt = dag_m.read().get_block_data(&hash).cloned();
-                        if let Some(ddata) = ddata_opt {
-                            if dag_m.read().maintains_reachability_index() {
-                                let (upserts, removals) = dag_m.write().reach_take_delta();
-                                store_m.put_dag_with_integrity_and_reach(&hash, &ddata, &upserts, &removals).ok();
-                            } else {
-                                store_m.put_dag_with_integrity(&hash, &ddata).ok();
-                            }
-                        }
-                        {
-                            let mut s = state_m.write();
-                            s.tip_blue_score = dag_m.read().tip_blue_score();
-                            s.block_count    = dag_m.read().block_count() as u64;
-                            s.mempool_size   = mem_m.size();
-                        }
-
-                        // Difficulty is per-block ASERT-Lattice (B5c) on the SIS
-                        // chains — no current_bits write. The SHA-256d chains
-                        // (Genesis-2, Genesis-3) use a Bitcoin-style windowed
-                        // retarget whose in-force value is cached in
-                        // current_bits; self-mined blocks don't route through
-                        // accept_block, so persist it HERE too or the
-                        // difficulty resets to the anchor every window.
-                        if matches!(core::pow_algorithm(core::node_chain_id()),
-                                    core::PowAlgorithm::Sha256d) {
-                            let _ = store_m.put_meta("current_bits", &block.header.bits.to_le_bytes());
-                        }
-
-                        let confirmed: Vec<[u8;32]> = block.transactions.iter().map(|t| t.txid()).collect();
-                        mem_m.remove_confirmed(&confirmed);
-
-                        // Sprint 2.c: broadcast tip change so stratum sessions
-                        // get fresh templates. Mined blocks almost always
-                        // extend the tip, but we still guard with the
-                        // old_tip != new_tip check — during a network-driven
-                        // reorg racing our add_block, the tip may not actually
-                        // be our block.
-                        {
-                            // Bodied tip only: a header-only tip is unmineable,
-                            // so notify stratum on the best BODIED tip / parents.
-                            let has_body = |h: &[u8; 32]| store_m.get_block(h).ok().flatten().is_some();
-                            let new_tip = { dag_m.read().best_bodied_tip(has_body) };
-                            if new_tip != old_tip_mined {
-                                if let Some(tip_hash) = new_tip {
-                                    let d = dag_m.read();
-                                    if let Some(data) = d.get_block_data(&tip_hash).cloned() {
-                                        let tips_parents: Vec<[u8; 32]> = d.bodied_tips(has_body);
-                                        drop(d);
-                                        let bits = store_m.get_meta("current_bits").ok().flatten()
-                                            .and_then(|b| b.as_slice().try_into().ok().map(u32::from_le_bytes))
-                                            .unwrap_or(0x1d00ffff_u32);
-                                        let _ = tip_tx_m.send(stratum::TipChanged {
-                                            hash:       tip_hash,
-                                            height:     data.height,
-                                            blue_score: data.blue_score,
-                                            parents:    tips_parents,
-                                            bits,
-                                        });
-                                    }
-                                }
-                            }
                         }
 
                         // Sprint 1.c: Bitcoin-format wire (replaces bincode).
@@ -2401,6 +2318,52 @@ fn make_stratum_accept_block_cb(
 
         Ok(hex::encode(block_hash))
     })
+}
+
+/// Commit a block THIS node just mined (Round-2 audit LEG1-selfmine-accept).
+///
+/// Self-mined blocks MUST take the same acceptance pipeline as every other
+/// ingress: structural gate first (same call + error shape as
+/// `make_rpc_submit_block_cb` / `make_stratum_accept_block_cb`), then the
+/// shared `accept_block` (consensus validation, DAG insert, storage,
+/// UTXO/undo mutations, retarget meta, mempool cleanup, finality, stratum
+/// tip notification), then the RPC-visible state refresh. Broadcasting to
+/// the network stays with the caller — the miner loop only gossips a block
+/// its OWN acceptor has admitted.
+///
+/// Returns the block hash on acceptance; any rejection here means the miner
+/// produced a block its own validator refuses (a miner bug), and the caller
+/// must discard it WITHOUT broadcasting.
+fn commit_self_mined_block(
+    block:      &core::Block,
+    dag:        &Arc<RwLock<consensus::GhostDAG>>,
+    store:      &Arc<storage::Storage>,
+    mempool:    &Arc<mempool::Mempool>,
+    node_state: &Arc<RwLock<rpc::NodeState>>,
+    tip_tx:     Option<&broadcast::Sender<stratum::TipChanged>>,
+    shielded:   &Arc<RwLock<crate::coherence::ShieldedPool>>,
+) -> Result<[u8; 32], String> {
+    // Same structural gate as external submissions (audit H2): the producer
+    // grants itself no bypass.
+    block.validate_structure()
+        .map_err(|e| format!("structural validation: {}", e))?;
+
+    let block_hash = block.block_hash();
+    accept_block(
+        block, block_hash, block.height,
+        dag, store, mempool, node_state,
+        tip_tx, shielded,
+    )?;
+
+    // Refresh RPC-visible state (mirrors the stratum/RPC accept callbacks).
+    {
+        let mut s = node_state.write();
+        s.tip_blue_score = dag.read().tip_blue_score();
+        s.block_count    = dag.read().block_count() as u64;
+        s.mempool_size   = mempool.size();
+    }
+
+    Ok(block_hash)
 }
 
 /// Build the RPC `submitblock` hook (B5f pool seam). Behavior is unchanged
@@ -3939,6 +3902,154 @@ mod external_submission_tests {
         let rpc_res = (node_b.rpc_cb())(good);
         assert!(rpc_res.is_ok(), "rpc submitblock must accept a valid block: {:?}", rpc_res);
         assert_eq!(node_b.dag.read().block_count(), 2);
+    }
+
+    // ── LEG1-selfmine-accept regressions (Round-2 audit) ────────────────────
+    //
+    // Self-mined blocks must go through `commit_self_mined_block` →
+    // `accept_block`, the SAME pipeline as network/RPC/stratum ingress. The
+    // pre-fix miner loop committed its own block inline (put_block +
+    // apply_block_utxo_mutations + dag.add_block) with NO consensus
+    // validation, so a block violating an invariant the mempool cannot catch
+    // (e.g. a coinbase over-claim) was persisted locally and only rejected by
+    // peers — forking the producer off its own network. These tests FAIL if
+    // that inline commit path is ever restored.
+
+    /// Like `mk_child(mine = true)` but with an arbitrary coinbase value:
+    /// real SIS witness + binding merkle root, so `validate_structure()`
+    /// passes and only `accept_block`'s consensus checks can stop it.
+    fn mk_mined_child_with_coinbase(
+        node: &TestNode,
+        genesis: &core::Block,
+        cb_value: u64,
+    ) -> core::Block {
+        let gh = genesis.block_hash();
+        let parent_ts = node.store.get_timestamp_at_height(0)
+            .expect("ts read").expect("genesis ts present");
+        let bits = pow::next_bits(
+            core::GENESIS_BITS, core::GENESIS_TIMESTAMP, parent_ts, 1,
+        );
+        assert_eq!(
+            core::tokenomics_v2::founder_vesting_delta_sat(1), 0,
+            "fixture assumes no founder vesting output at height 1",
+        );
+        let all_txs = vec![mk_coinbase(1, cb_value)];
+        let merkle  = core::Transaction::merkle_root(&all_txs);
+        let mut block = core::Block {
+            header: core::BlockHeader {
+                version:     1,
+                parents:     vec![gh],
+                merkle_root: merkle,
+                timestamp:   parent_ts + 30,
+                bits,
+                nonce:       0,
+            },
+            transactions: all_txs,
+            blue_score: 1,
+            height: 1,
+            pow_solution: Vec::new(),
+            shielded_transactions: Vec::new(),
+            auxpow: None,
+        };
+        let preimage = block.header.pow_preimage();
+        let (nonce, solution) =
+            pow::mine_sis_pow(&preimage, bits, block.height, 0, 50_000_000)
+                .expect("SIS solve within attempt budget");
+        block.header.nonce = nonce;
+        block.pow_solution = solution.to_vec();
+        assert!(
+            block.validate_structure().is_ok(),
+            "fixture must be structurally valid — the rejection under test \
+             is consensus-level, which only accept_block performs",
+        );
+        block
+    }
+
+    fn commit_mined(node: &TestNode, block: &core::Block) -> Result<[u8; 32], String> {
+        commit_self_mined_block(
+            block,
+            &node.dag, &node.store, &node.mempool, &node.node_state,
+            Some(&node.tip_tx), &node.shielded,
+        )
+    }
+
+    /// C-R3-1 core regression: a self-mined block violating a
+    /// mempool-missable invariant (coinbase over-claims subsidy by 1 sat —
+    /// the coinbase never passes through the mempool) must be rejected by
+    /// the PRODUCER ITSELF and leave no trace in DAG or storage. On the
+    /// pre-fix inline path this block was committed unconditionally.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn self_mined_block_violating_consensus_is_rejected_by_producer() {
+        let genesis = mk_genesis(unix_now());
+        let node    = node_with_genesis(&genesis);
+        let subsidy = core::tokenomics_v2::block_subsidy_sat(1);
+        let bad     = mk_mined_child_with_coinbase(&node, &genesis, subsidy + 1);
+        let hash    = bad.block_hash();
+
+        let res = commit_mined(&node, &bad);
+        assert!(
+            res.is_err(),
+            "LEG1: producer must reject its own consensus-invalid block, \
+             got acceptance: {:?}", res,
+        );
+        let msg = res.unwrap_err();
+        assert!(
+            msg.contains("coinbase"),
+            "rejection must come from the coinbase-value consensus check, got: {}", msg,
+        );
+        // The pre-fix path persisted the block BEFORE any validation — the
+        // whole point of the fix is that a rejected block leaves no trace.
+        assert!(
+            node.store.get_block(&hash).expect("store read").is_none(),
+            "rejected self-mined block must NOT be persisted",
+        );
+        assert!(
+            node.dag.read().get_block_data(&hash).is_none(),
+            "rejected self-mined block must NOT enter the DAG",
+        );
+        assert_eq!(node.dag.read().block_count(), 1, "DAG must contain only genesis");
+    }
+
+    /// Structural gate parity: the self-miner gets no structural bypass
+    /// either (same H2 gate as stratum/RPC submissions).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn self_mined_structure_invalid_block_is_rejected_by_producer() {
+        let genesis = mk_genesis(unix_now());
+        let node    = node_with_genesis(&genesis);
+        let bad     = mk_child(&node, &genesis, false);
+        let hash    = bad.block_hash();
+
+        let msg = commit_mined(&node, &bad)
+            .expect_err("structure-invalid self-mined block must be rejected");
+        assert!(
+            msg.contains("structural validation"),
+            "rejection must come from the structural gate, got: {}", msg,
+        );
+        assert!(node.store.get_block(&hash).expect("store read").is_none());
+        assert_eq!(node.dag.read().block_count(), 1);
+    }
+
+    /// Positive control: a genuinely valid self-mined block flows through
+    /// the shared pipeline, is committed, advances the selected tip and
+    /// refreshes the RPC-visible state — the fix does not over-reject.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn self_mined_valid_block_is_committed_through_accept_block() {
+        let genesis = mk_genesis(unix_now());
+        let node    = node_with_genesis(&genesis);
+        let good    = mk_child(&node, &genesis, true);
+        let hash    = good.block_hash();
+
+        let res = commit_mined(&node, &good);
+        assert_eq!(
+            res.expect("valid self-mined block must be accepted"), hash,
+        );
+        assert_eq!(node.dag.read().block_count(), 2);
+        assert_eq!(node.dag.read().selected_tip(), Some(hash));
+        assert!(
+            node.store.get_block(&hash).expect("store read").is_some(),
+            "accepted self-mined block must be persisted",
+        );
+        assert_eq!(node.node_state.read().block_count, 2, "RPC state must be refreshed");
     }
 
     // ── CONSENSUS-HALT regression (DAG-vs-UTXO ordering) ────────────────────
