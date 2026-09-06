@@ -447,7 +447,7 @@ the reorg cost when the whole subcommittee for a slot is offline.
 - **But the cap is Sybil-bypassed** `[CONFIRMED, and acknowledged in §4.1]`.
   Split that 90% across 900 identities of 0.001·T each; none exceeds the ~0.01·T
   cap, so nothing is clamped and the Sybil controls ~90% of effective weight.
-  Cost is ~`MIN_DEPOSIT` per identity (`MIN_DEPOSIT_BLCH = 100,000`) or
+  Cost is ~`MIN_DEPOSIT` per identity (`MIN_DEPOSIT_BLCH = 25,000` — `staking.rs:97`, post-split; this pass was written against the pre-split 100,000) or
   `MIN_DELEGATION_SAT = 10 BLCH` per delegation (`delegation.rs:50`) — trivial
   for a whale spending its own coins.
 

@@ -257,12 +257,13 @@ the node cannot: one curve must be named canonical, and §7A re-run against it.
 
 ### 4.4 Reward split: migration spec §7.4 contradicts the adopted model
 
-§7.4 still specifies the Ethereum shape (7/8 attesters, 1/8 proposer);
+§7.4 specified the Ethereum shape (7/8 attesters, 1/8 proposer);
 `rewards.rs` and Tokenomics V4 §6.3 implement the Solana model (pro-rata to
-stake scaled by credits, commission, fee split with burn). The migration spec
-text needs the §7.4 paragraph superseded explicitly — two specs disagreeing on
-who gets paid is how a "consensus-adjacent documentation" bug becomes a real
-one (the `VALIDATOR_SHARE_BPS` comment precedent).
+stake scaled by credits, commission, fee split with burn). Two specs
+disagreeing on who gets paid is how a "consensus-adjacent documentation" bug
+becomes a real one (the `VALIDATOR_SHARE_BPS` comment precedent).
+**Resolved 2026-09-05:** migration spec §7.4 now carries a superseded seal
+and records the implemented Solana rule normatively.
 
 ### 4.5 Address / withdrawal-credential format
 
@@ -280,9 +281,12 @@ decision (§8 superseded note; chain halts at 80,000, Genesis-4 launches ~6
 months later). The ruling this section left pending is now made (founder
 decision, 2026-08-11): **the taint set does not survive into Genesis-4, and it
 is not repurposed.** It starts empty and stays empty — a carried-over balance
-that is liquid is also stakeable, the founder's included, and the vesting
-locks on the founder/VC/team/marketing allocations are enforced as
-spendability of the genesis outputs, not as a coin class. For this contract
+that is liquid is also stakeable, the founder's included. (A previous
+revision of this paragraph added that the founder/VC/team/marketing vesting
+locks "are enforced as spendability of the genesis outputs" — they are not:
+`unlock_epoch` is recorded in the genesis manifest but no consensus path
+reads it, so the schedules bind as policy, not as spendability and not as a
+coin class — tokenomics §8.2; `genesis.rs`, `vesting_is_not_enforced`.) For this contract
 that means: conforming `StakeEligibility` implementations never return
 `Tainted` (the variant stays, frozen and inert), `StateRoots::taint_root` is a
 reserved all-zero slot, and `DepositReject::TaintedInput` is unreachable in
