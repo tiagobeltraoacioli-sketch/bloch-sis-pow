@@ -96,7 +96,11 @@ fn main() {
     // single source of truth (never hard-coded here): LE fork height 0 ⇒
     // little-endian from genesis.
     let le_fork_height = sha256d_le_fork_height_for(ChainId::Genesis3Mainnet);
-    let little_endian = 0u64 >= le_fork_height;
+    // The genesis block (height 0) is little-endian exactly when the LE fork
+    // height is 0. Spelled as equality: `0u64 >= x` is clippy's deny-level
+    // `absurd_extreme_comparisons` (the CI clippy gate stops on it) and means
+    // the same thing for an unsigned value.
+    let little_endian = le_fork_height == 0;
     assert!(
         little_endian,
         "Genesis-3 must be little-endian from height 0 (sha256d_le_fork_height_for == {le_fork_height}); \
