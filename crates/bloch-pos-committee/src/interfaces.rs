@@ -569,6 +569,20 @@ pub enum TransferReject {
     /// same `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` gate — no second flag
     /// day.
     WitnessTableNotCanonical,
+    /// An output's value is below `params::MIN_TRANSFER_OUTPUT_SAT` (zero
+    /// included). Every output is a PERMANENT entry in the committed unspent
+    /// set — ~76 bytes of state on every node, forever, priced only by the
+    /// one-time fee on its bytes — so an output that carries (almost) no
+    /// value is unbounded state growth sold at ~6.4 sat per entry (H-R7-3).
+    /// Gated on `params::DUST_RULE_ACTIVATION_EPOCH` (inert, `u64::MAX`):
+    /// such outputs are valid today and may exist in the historical log, so
+    /// the refusal must arrive by flag day.
+    DustOutput,
+    /// The transfer creates more than `params::MAX_TRANSFER_OUTPUTS`
+    /// outputs. Same rationale and same flag-day gate as [`Self::DustOutput`]:
+    /// the block byte ceiling bounds outputs per BLOCK, this bounds what one
+    /// fee-paying transaction may add to the permanent set.
+    TooManyOutputs,
 }
 
 /// Why a deposit was rejected (§7.1, §4.1, §6.6.3).

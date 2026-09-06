@@ -4760,6 +4760,31 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
             if outputs.is_empty() {
                 return Err("transfer has no outputs — it pays no one and cannot apply");
             }
+            // H-R7-3, the mempool half — NODE-LOCAL POLICY, live ungated.
+            // Every output is a permanent ~76-byte `EutxoEntry` on every
+            // node, priced only by the one-time fee on its bytes (~6.4 sat
+            // per output at the floor): dust and zero-value outputs are
+            // unbounded state growth sold for nothing, and this door is
+            // what stops NEW ones propagating. The consensus half of the
+            // same rule lives in `apply_transfer`/`apply_transfer_v2`
+            // behind `params::DUST_RULE_ACTIVATION_EPOCH` (inert,
+            // u64::MAX — arming it is a founder decision), because there
+            // the refusal changes the verdict on bodies that are valid
+            // today. Here it changes only what this node relays, which no
+            // block's validity depends on — the deposit lesson's inverse.
+            if outputs.len() > bloch_pos_committee::params::MAX_TRANSFER_OUTPUTS {
+                return Err(
+                    "transfer creates more outputs than the per-transaction cap —                      each output is a permanent ledger entry on every node",
+                );
+            }
+            if outputs
+                .iter()
+                .any(|o| o.value < bloch_pos_committee::params::MIN_TRANSFER_OUTPUT_SAT)
+            {
+                return Err(
+                    "transfer creates a dust or zero-value output — below the minimum                      output value, it grows the permanent ledger for (almost) nothing",
+                );
+            }
             price_bounds(
                 fee_market::TxClass::Eutxo {
                     inputs: inputs.len() as u32,
@@ -4845,6 +4870,31 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
             }
             if outputs.is_empty() {
                 return Err("transfer has no outputs — it pays no one and cannot apply");
+            }
+            // H-R7-3, the mempool half — NODE-LOCAL POLICY, live ungated.
+            // Every output is a permanent ~76-byte `EutxoEntry` on every
+            // node, priced only by the one-time fee on its bytes (~6.4 sat
+            // per output at the floor): dust and zero-value outputs are
+            // unbounded state growth sold for nothing, and this door is
+            // what stops NEW ones propagating. The consensus half of the
+            // same rule lives in `apply_transfer`/`apply_transfer_v2`
+            // behind `params::DUST_RULE_ACTIVATION_EPOCH` (inert,
+            // u64::MAX — arming it is a founder decision), because there
+            // the refusal changes the verdict on bodies that are valid
+            // today. Here it changes only what this node relays, which no
+            // block's validity depends on — the deposit lesson's inverse.
+            if outputs.len() > bloch_pos_committee::params::MAX_TRANSFER_OUTPUTS {
+                return Err(
+                    "transfer creates more outputs than the per-transaction cap —                      each output is a permanent ledger entry on every node",
+                );
+            }
+            if outputs
+                .iter()
+                .any(|o| o.value < bloch_pos_committee::params::MIN_TRANSFER_OUTPUT_SAT)
+            {
+                return Err(
+                    "transfer creates a dust or zero-value output — below the minimum                      output value, it grows the permanent ledger for (almost) nothing",
+                );
             }
             // An empty witness table would make the signature loop below
             // pass VACUOUSLY — zero verifications, admitted, gossiped — so a
@@ -5813,6 +5863,103 @@ mod admission_authorisation {
         let err = admissible(&PosTransaction::Exit { validator: 0 }, 0)
             .expect_err("Exit carries no signature and must not be admitted");
         assert!(err.contains("not authenticated"), "got: {err}");
+    }
+
+    /// **H-R7-3, the mempool half — node-local policy, live ungated.** A
+    /// zero-value, sub-minimum, or over-fan-out transfer must be refused at
+    /// the door: every output it would create is a permanent `EutxoEntry`
+    /// on every node (~76 bytes, forever, ~6.4 sat each at the old floor),
+    /// and this door is what stops NEW dust propagating while the consensus
+    /// half waits for its flag day
+    /// (`params::DUST_RULE_ACTIVATION_EPOCH`, inert at `u64::MAX`).
+    ///
+    /// The dust checks run BEFORE the signature loop (cheap-first), so the
+    /// mutated transfers below need no re-signing — and the refusal costs
+    /// an attacker zero hybrid verifications.
+    ///
+    /// Mutation: delete the two output checks from the Transfer arm of
+    /// `admissible` and every case here is admitted — the dust and count
+    /// halves die on their message assertions independently.
+    #[test]
+    fn dust_and_overcount_transfers_are_refused_at_the_mempool_door() {
+        use bloch_pos_committee::params::{MAX_TRANSFER_OUTPUTS, MIN_TRANSFER_OUTPUT_SAT};
+
+        // CONTROL: the fixture's output is exactly the minimum value, and
+        // it is admitted — the floor is a floor, not a step.
+        let (good, _) = signed_transfer();
+        if let PosTransaction::Transfer { outputs, .. } = &good {
+            assert_eq!(
+                outputs[0].value, MIN_TRANSFER_OUTPUT_SAT,
+                "fixture premise: the control sits exactly on the floor"
+            );
+        }
+        assert!(
+            admissible(&good, 0).is_ok(),
+            "control: an output at exactly the minimum must be admitted"
+        );
+
+        // Zero, one sat, and one-below-the-floor: all refused, by name.
+        for v in [0u64, 1, MIN_TRANSFER_OUTPUT_SAT - 1] {
+            let mut dusty = good.clone();
+            if let PosTransaction::Transfer { outputs, .. } = &mut dusty {
+                outputs[0].value = v;
+            }
+            let err = admissible(&dusty, 0)
+                .expect_err("a dust output must not reach the mempool");
+            assert!(
+                err.contains("dust"),
+                "the refusal must name the rule, got: {err}"
+            );
+        }
+
+        // One output past the cap: refused, by name; at the cap: past the
+        // dust checks (it dies later, on the signature made stale by the
+        // added outputs — proving the count rule itself let it through).
+        let fan_out = |n: usize| -> PosTransaction {
+            let mut tx = good.clone();
+            if let PosTransaction::Transfer { outputs, .. } = &mut tx {
+                let o = outputs[0].clone();
+                outputs.extend(std::iter::repeat(o).take(n - 1));
+            }
+            tx
+        };
+        let err = admissible(&fan_out(MAX_TRANSFER_OUTPUTS + 1), 0)
+            .expect_err("more outputs than the cap must not reach the mempool");
+        assert!(
+            err.contains("cap"),
+            "the refusal must name the rule, got: {err}"
+        );
+        let err = admissible(&fan_out(MAX_TRANSFER_OUTPUTS), 0)
+            .expect_err("the stale signature is the expected later refusal");
+        assert!(
+            err.contains("signature"),
+            "exactly at the cap the output rules must be silent, got: {err}"
+        );
+    }
+
+    /// The V2 arm shares the mempool dust rule — a bound on one encoding of
+    /// a transfer is not a bound on the transfer. Same before-the-signature
+    /// placement, so the mutation needs no re-signing.
+    ///
+    /// Mutation: delete the two output checks from the TransferV2 arm alone
+    /// and this dies while the V1 test above stays green.
+    #[test]
+    fn v2_shares_the_mempool_dust_rule() {
+        let good = signed_transfer_v2(2);
+        assert!(
+            admissible(&good, V2_FLAG_DAY).is_ok(),
+            "control: the untouched V2 transfer is admitted"
+        );
+        let mut dusty = good.clone();
+        if let PosTransaction::TransferV2 { outputs, .. } = &mut dusty {
+            outputs[0].value = 0;
+        }
+        let err = admissible(&dusty, V2_FLAG_DAY)
+            .expect_err("a zero-value V2 output must not reach the mempool");
+        assert!(
+            err.contains("dust"),
+            "the refusal must name the rule, got: {err}"
+        );
     }
 
     // ── TransferV2 admission: the flag-day arm ──────────────────────────────
