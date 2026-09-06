@@ -323,6 +323,27 @@ const TX_TAGS: &[(u8, Status)] = &[
             },
         ]),
     ),
+    // Single-claimant and unreleased, like frame byte 0x07: claimed by this
+    // tree alone, still NOT assigned. `RandaoRecommit` (the H-R7-1 fix: the
+    // re-commit transaction that un-terminates an exhausted RANDAO chain)
+    // encodes to 0x0A and is deliberately NOT decodable — the byte stays
+    // out of the released space and the decoder stays silent on it until
+    // the founder assigns it. 0x0A was chosen because it is the lowest byte
+    // with NO claimant anywhere in the 2026-09-02 sweep (0x07-0x09 all have
+    // rivals); a fresh byte cannot silently merge into an existing
+    // claimant's meaning. It becomes `Released` when the founder rules, and
+    // the decoder arm lands in the same diff — which must happen, along
+    // with arming `RANDAO_RECOMMIT_ACTIVATION_EPOCH`, before the first
+    // chain exhausts (~2027-02-11).
+    (
+        0x0A,
+        Status::Contested(&[Claim {
+            name: "RandaoRecommit (ENCODE-ONLY — this tree refuses to decode it)",
+            tips: 1,
+            heads: 1,
+            example: "refs/heads/r2b/hr71-randao-recommit",
+        }]),
+    ),
 ];
 
 /// Three lineages that all intend the SAME flag day disagree on all three
@@ -519,6 +540,12 @@ fn frozen_variant_space(tx: &PosTransaction) -> u8 {
         // exactly the freeze working: the variant could not be added without
         // this file being edited and the byte being stated out loud.
         PosTransaction::ExitV2 { .. } => 0x08,
+        // ENCODED at 0x0A, NOT DECODED at 0x0A — the ExitV2 pattern again.
+        // The RANDAO re-commit transaction (H-R7-1) took the first byte with
+        // no rival claimant anywhere in the sweep, and
+        // `contested_transaction_tags_are_refused` holds the line until the
+        // founder assigns the byte.
+        PosTransaction::RandaoRecommit { .. } => 0x0A,
         // NO wildcard arm. Adding one defeats the entire freeze.
     }
 }

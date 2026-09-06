@@ -262,6 +262,46 @@ pub fn mix_in(randao_mix: &[u8; 32], reveal: &[u8; 32]) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// Signing root for the re-commit transaction that installs a fresh chain
+/// head ([`crate::transition::PosTransaction::RandaoRecommit`], gated behind
+/// [`crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH`]).
+///
+/// `SHA3-256(DS_RANDAO ‖ validator LE-4 ‖ epoch LE-8 ‖ new_c0)` — all fields
+/// fixed-width, so no two distinct inputs serialize identically. The preimage
+/// is 16 + 4 + 8 + 32 = **60 bytes**, which differs from [`mix_in`]'s
+/// 16 + 32 + 32 = 80, so the two uses of `DS_RANDAO` cannot collide — the
+/// property `interfaces::RandomnessBeacon::recommit_signing_root` promises.
+///
+/// # Every field is load-bearing
+///
+/// * `validator` — the registry index whose committed key must verify the
+///   signature. In the root so a signature cannot be moved onto another
+///   validator's re-commit (they would share a root otherwise only if the
+///   commitment and epoch also matched, and the key check would still refuse;
+///   binding it here makes the refusal a property of the message, not of a
+///   later check's ordering).
+/// * `epoch` — the inclusion epoch, which the transition requires to EQUAL
+///   the epoch of the block carrying the transaction. Without it, a captured
+///   re-commit would be replayable at the validator's NEXT exhaustion,
+///   resetting it onto a chain whose reveals are by then all public — and a
+///   chain of public reveals is a fully predictable RANDAO contribution,
+///   which is the §6.4 grinding surface reopened by replay.
+/// * `new_c0` — the fresh commitment itself, obviously: an unbound
+///   commitment would let a relay swap in its own chain head under a real
+///   validator's signature.
+///
+/// One definition, used by consensus (`apply_transaction`'s `RandaoRecommit`
+/// arm) and by any client building the message; a second derivation of this
+/// root anywhere is the drift this crate exists to refuse.
+pub fn recommit_signing_root(validator: u32, epoch: u64, new_c0: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha3_256::new();
+    Digest::update(&mut h, DS_RANDAO);
+    Digest::update(&mut h, validator.to_le_bytes());
+    Digest::update(&mut h, epoch.to_le_bytes());
+    Digest::update(&mut h, new_c0);
+    h.finalize().into()
+}
+
 /// Full per-slot processing on the consensus side: verify the proposer's
 /// reveal against its committed [`RevealState`], and fold it into the global
 /// mix. Returns `(new_state, new_mix)`; on error nothing changed and the
