@@ -16,9 +16,10 @@
 #     attack surface on the node, each with a written rationale.
 #
 # NOTE: `cargo audit` (RUSTSEC-only) does NOT flag the GHSA-only advisories that
-# osv-scanner surfaces — yamux 0.12.1 (GHSA-vxx9-2994-q338, CVSS 8.7, libp2p-yamux
-# 0.47-pinned) and the SP1 plonky3 p3-challenger/p3-symmetric crates. Those remain
-# OPEN residuals documented in SECURITY_TOOLING.md; run osv-scanner to see them.
+# osv-scanner surfaces — e.g. the SP1 plonky3 p3-challenger/p3-symmetric crates
+# (still open residuals), or yamux 0.12.1 (GHSA-vxx9-2994-q338, CVSS 8.7), which
+# was CLOSED 2026-09-05 by the vendored crates/libp2p-yamux fork (finding
+# SC3-yamux-dedupe). Residuals live in SECURITY_TOOLING.md; run osv-scanner to see them.
 [advisories]
 ignore = [
     # ── Post-quantum crypto: vendored, intentionally pinned (PQClean archived) ──

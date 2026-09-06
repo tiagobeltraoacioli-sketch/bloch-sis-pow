@@ -1,0 +1,47 @@
+# VENDORED FORK of libp2p-yamux 0.47.0 (rust-libp2p, MIT) — audit finding
+# SC3-yamux-dedupe (Round 2).
+#
+# WHY THIS EXISTS: upstream libp2p-yamux 0.47.0 depends on BOTH yamux 0.13.x
+# and yamux 0.12.1, and — verified in its own `config_set_switches_to_v012`
+# test — ANY config setter (including `set_max_num_streams`, which
+# bloch-pos-node/src/p2p.rs calls to raise the substream cap to 4096)
+# silently switches the live muxer backend to yamux 0.12.1. yamux 0.12.1 is
+# vulnerable to GHSA-vxx9-2994-q338 (CVSS 8.7, reachable by any peer), fixed
+# only on the 0.13 line (>= 0.13.10). So the "fixed" 0.13.10 copy in the old
+# graph was the one NOT running.
+#
+# THE FORK: src/lib.rs is upstream's lib.rs with the entire yamux 0.12
+# backend removed. `Config::set_max_num_streams` now configures yamux 0.13
+# directly (0.13 has grown the setter since upstream froze the dual-backend
+# shim). Wire protocol is unchanged (/yamux/1.0.0); this is a local backend
+# choice, not a fork of the protocol.
+#
+# The workspace root `[patch.crates-io]` points libp2p-yamux here, which
+# removes yamux 0.12.1 from Cargo.lock entirely. deny.toml pins the outcome:
+# `[bans] multiple-versions = "deny"` with an exact-version allowlist that
+# deliberately does NOT include yamux, and
+# tests/lockfile_guard.rs fails the build if a second yamux (or any yamux
+# < 0.13.10) ever reappears in the lock.
+#
+# DELETE THIS CRATE (and the [patch]) the moment an upstream libp2p release
+# drops the yamux 0.12 dependency.
+[package]
+name = "libp2p-yamux"
+edition = "2021"
+rust-version = "1.83.0"
+# Same version upstream publishes so the [patch.crates-io] entry satisfies
+# libp2p 0.56.0's `libp2p-yamux = "0.47.0"` requirement.
+version = "0.47.0"
+authors = ["Parity Technologies <admin@parity.io>"]
+description = "Yamux multiplexing protocol for libp2p (vendored, yamux-0.12 backend removed)"
+license = "MIT"
+repository = "https://github.com/libp2p/rust-libp2p"
+
+[dependencies]
+futures = "0.3.30"
+libp2p-core = "0.43.0"
+thiserror = "2"
+tracing = "0.1.41"
+# THE POINT OF THE FORK: one yamux, and the floor is the GHSA-vxx9-2994-q338
+# fix. Keep the `>= 0.13.10` — relaxing it re-opens the advisory.
+yamux = { version = ">=0.13.10, <0.14" }

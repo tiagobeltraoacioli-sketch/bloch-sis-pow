@@ -89,9 +89,75 @@ ignore = [
 ]
 
 [bans]
-multiple-versions = "warn"
+# Audit finding SC3-yamux-dedupe (Round 2): "warn" let yamux 0.12.1
+# (GHSA-vxx9-2994-q338, CVSS 8.7, reachable by any peer) sit in the graph next
+# to the fixed 0.13.10 — an advisory fixed in one copy stayed live in the
+# other, and libp2p-yamux actually RAN the 0.12 copy. Duplicates now FAIL the
+# blocking `supply-chain` CI job unless allowlisted below.
+multiple-versions = "deny"
 wildcards = "warn"          # avoid `*` version reqs
 allow-wildcard-paths = true # path deps in the workspace are fine
+
+# ── Known-benign duplicate allowlist ──────────────────────────────────────
+# REVIEW BY 2026-12-05 (quarterly): re-run `cargo deny check bans` after any
+# dependency bump; delete entries cargo-deny reports as unmatched.
+#
+# Every entry pins the EXACT older version present today, so this list cannot
+# silently absorb a new vulnerable copy: any duplicate pair not literally
+# listed here — yamux deliberately is not, and must never be — fails the
+# pipeline, and a graph move that resolves a duplicate leaves an unmatched
+# skip warning telling us to prune the entry.
+#
+# Why these exist (all semver-major splits, not unifiable by `cargo update`;
+# the pins live in dependencies this workspace deliberately does not move):
+#   * secp256k1(-sys), bitcoin_hashes, hex-conservative — rust-bitcoin
+#     lineages pinned by stratum-sv2 (legacy Genesis-3 pool, kept buildable
+#     for audit) vs bitcoin 0.32 (bloch-btc-wallet / bloch-pq-vault).
+#   * sha2/digest/block-buffer, rand/rand_core/rand_chacha/getrandom —
+#     RustCrypto & rand ecosystem splits dragged in by the frozen Genesis-3
+#     node and the sv2 stack. NOTE: none of these old copies is on the
+#     Genesis-4 consensus path — bloch-pos-committee is sha3-only and
+#     bloch-crypto's ML-DSA/Falcon use the vendored pqcrypto-internals.
+#   * windows-sys, r-efi — OS shims, target-gated, never co-linked.
+#   * the rest — ordinary ecosystem major-version lag (thiserror 1/2, syn
+#     1/2, itertools, hashbrown, ...) with no network- or crypto-facing
+#     surface shared between the copies.
+skip = [
+    { crate = "bindgen@=0.69.5" },
+    { crate = "bitcoin_hashes@=0.13.1" },
+    { crate = "block-buffer@=0.9.0" },
+    { crate = "block-buffer@=0.10.4" },
+    { crate = "digest@=0.9.0" },
+    { crate = "digest@=0.10.7" },
+    { crate = "getrandom@=0.2.17" },
+    { crate = "getrandom@=0.3.4" },
+    { crate = "hashbrown@=0.14.5" },
+    { crate = "hashbrown@=0.15.5" },
+    { crate = "hashlink@=0.9.1" },
+    { crate = "hex-conservative@=0.1.2" },
+    { crate = "itertools@=0.12.1" },
+    { crate = "r-efi@=5.3.0" },
+    { crate = "rand@=0.8.6" },
+    { crate = "rand@=0.9.4" },
+    { crate = "rand_chacha@=0.3.1" },
+    { crate = "rand_core@=0.6.4" },
+    { crate = "rand_core@=0.9.5" },
+    { crate = "rustc-hash@=1.1.0" },
+    { crate = "secp256k1@=0.28.2" },
+    { crate = "secp256k1@=0.29.1" },
+    { crate = "secp256k1-sys@=0.9.2" },
+    { crate = "secp256k1-sys@=0.10.1" },
+    { crate = "sha2@=0.9.9" },
+    { crate = "socket2@=0.5.10" },
+    { crate = "syn@=1.0.109" },
+    { crate = "thiserror@=1.0.69" },
+    { crate = "thiserror-impl@=1.0.69" },
+    { crate = "unsigned-varint@=0.7.2" },
+    { crate = "webpki-roots@=0.26.11" },
+    { crate = "windows-sys@=0.52.0" },
+    { crate = "windows-sys@=0.59.0" },
+    { crate = "wit-bindgen@=0.51.0" },
+]
 
 [licenses]
 version = 2
