@@ -1094,16 +1094,17 @@ mod tests {
     /// row is the measured largest address, 3,546,175,400 BLCH). Digest is a
     /// KAT generated with CPython's hashlib.shake_256 — the digest
     /// build_carryover.py would publish for these bytes.
-    // Post-split satoshis (2026-08-12): row `a` is the largest-address G3
-    // measurement under `split_g3_sat` (354,617,540,000,000,000 x 100/21,
-    // truncated), row `b` absorbs the remainder so the file sums to exactly
-    // `CARRYOVER_TOTAL_BLOCH` — the same close-the-total dust rule the real
-    // builder must state.
+    // Post-split satoshis (2026-08-12, re-balanced 2026-09-06 for the
+    // terminal re-measurement 18,146,400,000 BLOCH): row `a` is the
+    // largest-address G3 measurement under `split_g3_sat`
+    // (354,617,540,000,000,000 x 100/21, truncated), row `b` absorbs the
+    // remainder so the file sums to exactly `CARRYOVER_TOTAL_BLOCH` — the
+    // same close-the-total dust rule the real builder must state.
     const KAT2_TEXT: &str = concat!(
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t1688654952380952380\n",
-        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t108433047619047620\n",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t125985047619047620\n",
     );
-    const KAT2_DIGEST: &str = "310669067dedad1c6a33e251cb0f424bdaf7ca2c7aa48331417b639bbc3845ce";
+    const KAT2_DIGEST: &str = "a705d95b7edb4180071bad7db641fed0589e66c25577789e99c96b5dcf013fc5";
 
     /// The canonical empty-pool artifact — what the (provably empty) mainnet
     /// pool publishes.
@@ -1162,7 +1163,7 @@ mod tests {
         // longer matches and the build refuses.
         let tampered = KAT2_TEXT
             .replace("1688654952380952380", "1688654952380952381")
-            .replace("108433047619047620", "108433047619047619");
+            .replace("125985047619047620", "125985047619047619");
         let good = read_carryover(KAT2_TEXT).unwrap();
         let bad = read_carryover(&tampered).unwrap();
         assert_eq!(good.total_sat, bad.total_sat, "fixture must keep the total fixed");
@@ -1230,8 +1231,8 @@ mod tests {
         // Liquidity funds the cohort (§3.3.1): output + bonded stake is the
         // whole bucket.
         assert_eq!(get("liquidity") + g.cohort_stake_sat, sat(5_000_000_000));
-        assert_eq!(v4::VALIDATOR_EMISSION_BLOCH, 43_029_120_000);
-        assert_eq!(v4::CARRYOVER_TOTAL_BLOCH, 17_970_880_000);
+        assert_eq!(v4::VALIDATOR_EMISSION_BLOCH, 42_853_600_000);
+        assert_eq!(v4::CARRYOVER_TOTAL_BLOCH, 18_146_400_000);
     }
 
     #[test]
@@ -1240,7 +1241,7 @@ mod tests {
         // with any other total (one extra satoshi here) is not the record the
         // constants were balanced around. The ceremony stops — it never
         // scales, pads, or truncates.
-        let text = KAT2_TEXT.replace("108433047619047620", "108433047619047621");
+        let text = KAT2_TEXT.replace("125985047619047620", "125985047619047621");
         let carry = read_carryover(&text).unwrap();
         let digest = carry.digest;
         let err = build(&carry, &addrs(), &test_cohort(), &digest).unwrap_err();
