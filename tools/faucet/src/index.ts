@@ -7,8 +7,13 @@ import { ExternalCommandSigner, StubSigner, type Signer } from "./signer.js";
 import { Faucet } from "./faucet.js";
 import { RateLimiter } from "./ratelimit.js";
 import { createFaucetServer } from "./server.js";
+import { assertJsonSourceAccessAvailable } from "./sats.js";
 
 function main(): void {
+  // T-6 fix (audit finding): fail loudly at startup, not on the first oversized
+  // amount later, if this runtime cannot parse >2^53 satoshi amounts exactly.
+  assertJsonSourceAccessAvailable();
+
   const cfg = loadConfig();
 
   const transport: JsonRpcTransport = cfg.dryRun

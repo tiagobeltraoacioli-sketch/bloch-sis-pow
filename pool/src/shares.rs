@@ -346,7 +346,17 @@ impl ShareLedger {
         finder:     &str,
         contribs:   &[(String, u128)],
     ) -> Payout {
-        let payout = split_reward(contribs, reward_sat, self.fee_bps);
+        // L-14 fix: `split_reward` no longer panics on an out-of-range
+        // `fee_bps` (validated at startup in `main.rs`, but this ledger's
+        // own `new`/constructor does not re-check it, so treat a violation
+        // here as a defensive degrade — the whole reward becomes pool take,
+        // the same conservative fallback the "no contributors" branch
+        // already uses — rather than take the process down over a
+        // configuration invariant this function does not itself enforce.
+        let payout = split_reward(contribs, reward_sat, self.fee_bps).unwrap_or_else(|e| {
+            log::error!("record_block_pending: {e}; crediting nothing, full reward to pool_take");
+            Payout { miners: Vec::new(), pool_take: reward_sat }
+        });
         let unix = now_unix();
         self.apply_block_pending(FoundBlock {
             height,

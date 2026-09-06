@@ -40,6 +40,7 @@
 //! compress default siblings. Designed ≠ audited ≠ booted.
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use sha3::digest::{ExtendableOutput, Update, XofReader};
 use sha3::Shake256;
@@ -119,15 +120,42 @@ fn bit_at(h: &Hash, depth: usize) -> u8 {
 
 /// The empty-subtree ladder: `empty[256]` is the empty leaf; `empty[d]` is the hash
 /// of a fully-empty subtree rooted at depth `d`. An empty tree's root is `empty[0]`.
-fn empty_hashes() -> [Hash; TREE_DEPTH + 1] {
-    let mut e = [[0u8; 32]; TREE_DEPTH + 1];
-    e[TREE_DEPTH] = EMPTY_LEAF;
-    let mut d = TREE_DEPTH;
-    while d > 0 {
-        d -= 1;
-        e[d] = node_hash(&e[d + 1], &e[d + 1]);
-    }
-    e
+///
+/// S-3 fix (Annex R2 §3 Findings): this ladder is a constant — a pure function of
+/// the domain tags and `TREE_DEPTH`, with no dependency on any tree's contents —
+/// yet `root()`/`prove()` each recomputed it from scratch (256 SHAKE-256 calls) on
+/// every invocation. `Registry::set`, `HolderSet::set_balance`,
+/// `MembershipList::add`/`remove` all call `root()`, so a 1000-entry build did
+/// ~256,000 avoidable hashes. Memoised once per process via `OnceLock`: the first
+/// caller pays the 256 hashes, every subsequent call is a cache hit. Not a security
+/// fix (the module header already notes "not size-optimized" as an invited
+/// improvement) — purely the perf half of that same note.
+fn empty_hashes() -> &'static [Hash; TREE_DEPTH + 1] {
+    static CACHE: OnceLock<[Hash; TREE_DEPTH + 1]> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let mut e = [[0u8; 32]; TREE_DEPTH + 1];
+        e[TREE_DEPTH] = EMPTY_LEAF;
+        let mut d = TREE_DEPTH;
+        while d > 0 {
+            d -= 1;
+            e[d] = node_hash(&e[d + 1], &e[d + 1]);
+        }
+        e
+    })
+}
+
+/// **S-1 fix** (Annex R2 §3 Findings): the empty tree's root, i.e.
+/// `SparseMerkleTree::default().root()` — 256 iterated [`node_hash`] applications
+/// over the empty-subtree ladder, NOT `[0u8; 32]`. [`EMPTY_LEAF`] is an internal
+/// per-slot sentinel (what an ABSENT key's leaf hashes to) and is never itself a
+/// tree root; a consumer that treats `root == [0u8; 32]` or `root == EMPTY_LEAF` as
+/// "this tree is empty" is wrong for every tree, empty or not — and
+/// `root_as_val`/`val_as_root` exist specifically so a *validator* can compare a
+/// datum root against a ctx root, which is exactly where that wrong comparison
+/// becomes a spendability bug. Memoised the same way as [`empty_hashes`] (it is
+/// literally `empty_hashes()[0]`, computed once).
+pub fn empty_root() -> Hash {
+    empty_hashes()[0]
 }
 
 /// `entries` is sorted by key hash (big-endian), so at any `depth` the bit-0 keys
@@ -260,7 +288,7 @@ impl SparseMerkleTree {
     /// The 32-byte root committing to the whole map. Pure function of the entry set.
     pub fn root(&self) -> Hash {
         let empty = empty_hashes();
-        subtree_hash(&self.entries(), 0, &empty)
+        subtree_hash(&self.entries(), 0, empty)
     }
 
     /// A proof for `key`: membership if present, non-membership otherwise.
@@ -269,7 +297,7 @@ impl SparseMerkleTree {
         let entries = self.entries();
         let target = key_hash(key);
         let mut siblings = Vec::with_capacity(TREE_DEPTH);
-        gen_siblings(&entries, &target, 0, &empty, &mut siblings);
+        gen_siblings(&entries, &target, 0, empty, &mut siblings);
         Proof {
             key: key.to_vec(),
             value: self.map.get(key).cloned(),
@@ -370,6 +398,13 @@ pub enum StateError {
     HolderLimitExceeded { max: u64, attempted: u64 },
     /// A count or sum overflowed its integer type.
     CountOverflow,
+    /// S-2 fix: [`Snapshot::dividend_share`] was asked about a holder the
+    /// snapshot does not contain. Distinct from [`StateError::CountOverflow`] —
+    /// the old `Option<u128>` return conflated "this holder owns nothing because
+    /// they are not in the snapshot" with "the multiplication overflowed and the
+    /// true answer is unknown", which is exactly the distinction dividend
+    /// accounting cannot afford to lose.
+    UnknownHolder,
 }
 
 // ── (b) HolderSet: a deterministic max_holders bound ─────────────────────────────
@@ -486,16 +521,34 @@ impl Snapshot {
     }
 
     /// The pro-rata dividend for `holder` from a `pool`: `floor(balance * pool /
-    /// total)`. Deterministic floor division, checked multiply. `None` if the holder
-    /// is absent or the total is zero. (Any floor remainder — "dust" — is left to the
-    /// caller's rounding policy; this returns only the exact per-holder floor.)
-    pub fn dividend_share(&self, holder: &[u8], pool: u128) -> Option<u128> {
+    /// total)`. Deterministic floor division, checked multiply. (Any floor
+    /// remainder — "dust" — is left to the caller's rounding policy; this returns
+    /// only the exact per-holder floor.)
+    ///
+    /// ## S-2 fix (Annex R2 §3 Findings)
+    ///
+    /// The previous signature was `Option<u128>`, and BOTH failure modes —
+    /// "`holder` is not in this snapshot" (owns nothing, by construction) and "the
+    /// `balance * pool` multiplication overflowed `u128` (the true answer is
+    /// unknown)" — collapsed to the same `None`. For dividend accounting that
+    /// distinction is the whole point: a caller cannot tell "pay this holder zero,
+    /// correctly" from "this computation is unsound, do not pay anyone from this
+    /// pool until the amounts are fixed". Now `Err(StateError::UnknownHolder)` and
+    /// `Err(StateError::CountOverflow)` are told apart.
+    ///
+    /// `total == 0` is handled by checking holder presence FIRST: if `holder` is
+    /// absent, `UnknownHolder` regardless of `total`. If `holder` IS present with
+    /// `total == 0`, their own balance must also be `0` (`total` is the checked sum
+    /// of every balance in the snapshot, and balances are non-negative `u64`s), so
+    /// their exact, well-defined share of nothing is `Ok(0)` — no division by zero
+    /// is ever attempted.
+    pub fn dividend_share(&self, holder: &[u8], pool: u128) -> Result<u128, StateError> {
+        let bal = self.balance_of(holder).ok_or(StateError::UnknownHolder)? as u128;
         if self.total == 0 {
-            return None;
+            return Ok(0);
         }
-        let bal = self.balance_of(holder)? as u128;
-        let numerator = bal.checked_mul(pool)?;
-        Some(numerator / self.total)
+        let numerator = bal.checked_mul(pool).ok_or(StateError::CountOverflow)?;
+        Ok(numerator / self.total)
     }
 
     pub fn root(&self) -> Hash {
@@ -614,10 +667,25 @@ mod tests {
     fn empty_tree_root_is_empty_ladder() {
         let t = SparseMerkleTree::new();
         assert_eq!(t.root(), empty_hashes()[0]);
+        assert_eq!(t.root(), empty_root());
         // A non-membership proof for any key verifies against the empty root.
         let p = t.prove(b"nobody");
         assert!(!p.is_membership());
         assert!(verify(&t.root(), &p));
+    }
+
+    /// S-1 regression: `empty_root()` (the real empty-tree root) must never equal
+    /// `EMPTY_LEAF` (the internal absent-slot sentinel) — they are different
+    /// constants for a different purpose, and a consumer that conflates them would
+    /// treat every non-empty tree's proof machinery as if the tree were empty, or
+    /// vice versa.
+    #[test]
+    fn empty_root_is_not_the_empty_leaf_sentinel() {
+        assert_ne!(empty_root(), EMPTY_LEAF);
+        assert_eq!(empty_root(), SparseMerkleTree::new().root());
+        assert_eq!(empty_root(), SparseMerkleTree::default().root());
+        // Memoisation (S-3): repeated calls return the identical value.
+        assert_eq!(empty_root(), empty_root());
     }
 
     #[test]
@@ -785,15 +853,16 @@ mod tests {
         assert_eq!(snap.total_supply(), 1000);
 
         // pool of 1_000_000 → shares 100k / 300k / 600k
-        assert_eq!(snap.dividend_share(b"a", 1_000_000), Some(100_000));
-        assert_eq!(snap.dividend_share(b"b", 1_000_000), Some(300_000));
-        assert_eq!(snap.dividend_share(b"c", 1_000_000), Some(600_000));
+        assert_eq!(snap.dividend_share(b"a", 1_000_000), Ok(100_000));
+        assert_eq!(snap.dividend_share(b"b", 1_000_000), Ok(300_000));
+        assert_eq!(snap.dividend_share(b"c", 1_000_000), Ok(600_000));
 
         // floor division: pool 999 → a gets floor(100*999/1000)=99
-        assert_eq!(snap.dividend_share(b"a", 999), Some(99));
+        assert_eq!(snap.dividend_share(b"a", 999), Ok(99));
 
-        // absent holder → None; the snapshot root is a stable commitment
-        assert_eq!(snap.dividend_share(b"z", 1000), None);
+        // absent holder → UnknownHolder (S-2 fix: distinct from CountOverflow);
+        // the snapshot root is still a stable commitment regardless
+        assert_eq!(snap.dividend_share(b"z", 1000), Err(StateError::UnknownHolder));
         assert!(verify(&snap.root(), &snap.prove(b"a")));
         assert!(!snap.prove(b"z").is_membership());
     }
@@ -1149,7 +1218,42 @@ mod tests {
         let snap = Snapshot::freeze(&BTreeMap::new()).unwrap();
         assert_eq!(snap.total_supply(), 0);
         assert_eq!(snap.root(), empty_hashes()[0]);
-        assert_eq!(snap.dividend_share(b"anyone", 100), None); // total==0 guard
+        // "anyone" is not in the (empty) snapshot: UnknownHolder, not a silent zero.
+        assert_eq!(snap.dividend_share(b"anyone", 100), Err(StateError::UnknownHolder));
+    }
+
+    /// S-2 regression: a holder who IS present but whose snapshot has `total == 0`
+    /// (only reachable with an all-zero-balance snapshot) gets `Ok(0)` — a
+    /// well-defined answer — never a division by zero and never confused with
+    /// `UnknownHolder`.
+    #[test]
+    fn dividend_share_present_holder_in_zero_total_snapshot_is_ok_zero() {
+        let mut balances = BTreeMap::new();
+        balances.insert(b"a".to_vec(), 0u64);
+        balances.insert(b"b".to_vec(), 0u64);
+        let snap = Snapshot::freeze(&balances).unwrap();
+        assert_eq!(snap.total_supply(), 0);
+        assert_eq!(snap.dividend_share(b"a", 1_000_000), Ok(0));
+        assert_eq!(snap.dividend_share(b"z", 1_000_000), Err(StateError::UnknownHolder));
+    }
+
+    /// S-2 regression: red before the fix (overflow and absence both collapsed to
+    /// `None`), green after (`CountOverflow` is distinguishable from
+    /// `UnknownHolder` for a holder that IS present).
+    #[test]
+    fn dividend_share_overflow_is_distinguishable_from_unknown_holder() {
+        let mut balances = BTreeMap::new();
+        balances.insert(b"whale".to_vec(), u64::MAX);
+        let snap = Snapshot::freeze(&balances).unwrap();
+        // balance(u128::from(u64::MAX)) * pool(u128::MAX) overflows u128.
+        assert_eq!(
+            snap.dividend_share(b"whale", u128::MAX),
+            Err(StateError::CountOverflow)
+        );
+        assert_eq!(
+            snap.dividend_share(b"nobody", u128::MAX),
+            Err(StateError::UnknownHolder)
+        );
     }
 
     // ── (d) gate_allows: the identity binding is IN the gate (regression) ──

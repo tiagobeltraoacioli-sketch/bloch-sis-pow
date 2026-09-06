@@ -18,6 +18,27 @@ use tokio::net::TcpListener;
 
 use crate::state::PoolState;
 
+/// L-13 fix (audit finding): `/api/stats` is served with NO authentication
+/// (default bind `127.0.0.1:8650`, but the module docs reference a public
+/// deployment, `posternpool.com`), and used to publish every miner's FULL
+/// payout address alongside their share count, cumulative weight, credited
+/// sats, and expected/actual block finds — a complete, de-anonymised payout
+/// ledger for anyone who can reach the port.
+///
+/// Replaces the raw address in the JSON response with a stable, truncated
+/// SHA-256 pseudonym: SAME address always maps to the SAME pseudonym (so a
+/// miner, or the operator, can still track one identity's stats across
+/// polls and across the historical blocks list), but the pseudonym does not
+/// itself reveal a spendable address. 8 bytes (16 hex chars) of SHA-256 is
+/// far more collision-resistant than this pool's realistic miner count
+/// needs (a public dashboard operator does not need to worry about two
+/// distinct payout addresses colliding to the same displayed pseudonym).
+fn address_pseudonym(addr: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(addr.as_bytes());
+    format!("addr:{}", hex::encode(&digest[..8]))
+}
+
 /// RFC 9116 security.txt, served at /.well-known/security.txt so researchers
 /// have a clear disclosure path (Cloudflare Security Insights flagged its
 /// absence on this origin). NOTE: refresh `Expires` before it lapses; a stale
@@ -103,14 +124,22 @@ fn stats_json(pool: &Arc<PoolState>) -> Value {
     // do approximate arithmetic on debts (weight already does this).
     let contribs = ledger.window_contributions();
     let reward = job.as_ref().map(|j| j.reward_sat).unwrap_or(0);
-    let est = crate::payout::split_reward(&contribs, reward, ledger.fee_bps);
+    // L-14 fix: this used to panic (assert) on an out-of-range `fee_bps` —
+    // reachable on every unauthenticated `/api/stats` request, unlike
+    // `main.rs`'s one-time startup validation. Degrade to "nothing
+    // estimated yet" rather than take the whole dashboard endpoint down.
+    let est = crate::payout::split_reward(&contribs, reward, ledger.fee_bps).unwrap_or_else(|e| {
+        log::error!("stats_json: {e}; est_next_block_sat will read 0 for every miner");
+        crate::payout::Payout { miners: Vec::new(), pool_take: reward }
+    });
     let est_map: Value = est.miners.iter()
         .map(|(a, v)| (a.clone(), json!(v.to_string())))
         .collect::<serde_json::Map<String, Value>>()
         .into();
 
     let miners: Vec<Value> = ledger.miners.iter().map(|(addr, st)| json!({
-        "address":          addr,
+        // L-13 fix: hash-truncated pseudonym, not the spendable address.
+        "address":          address_pseudonym(addr),
         "shares":           st.shares,
         "weight":           st.weight.to_string(),
         "last_share_unix":  st.last_share_unix,
@@ -379,3 +408,40 @@ setInterval(refresh, 3000);
 </body>
 </html>
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// L-13 regression: red before the fix (`stats_json` embedded the raw
+    /// address verbatim), green after (`address_pseudonym` is what the JSON
+    /// field carries — deterministic per address, and never equal to, nor
+    /// containing, the input address itself).
+    #[test]
+    fn address_pseudonym_is_deterministic_and_does_not_leak_the_address() {
+        let a = "bloch1qexampleaddressfor000000000000000000000001";
+        let b = "bloch1qexampleaddressfor000000000000000000000002";
+
+        assert_eq!(address_pseudonym(a), address_pseudonym(a), "must be deterministic");
+        assert_ne!(address_pseudonym(a), address_pseudonym(b), "distinct addresses -> distinct pseudonyms");
+
+        let p = address_pseudonym(a);
+        assert_ne!(p, a, "the pseudonym must not equal the raw address");
+        assert!(!p.contains(a), "the pseudonym must not embed the raw address as a substring");
+        // Fixed, predictable shape: "addr:" + 16 hex chars (8 bytes).
+        assert!(p.starts_with("addr:"));
+        assert_eq!(p.len(), "addr:".len() + 16);
+        assert!(p["addr:".len()..].chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn address_pseudonym_matches_known_vector() {
+        // Pin the exact hash function/truncation so a future refactor that
+        // silently changes it (e.g. swaps in a shorter/weaker hash) is caught.
+        use sha2::{Digest, Sha256};
+        let addr = "bloch1test";
+        let full = Sha256::digest(addr.as_bytes());
+        let expected = format!("addr:{}", hex::encode(&full[..8]));
+        assert_eq!(address_pseudonym(addr), expected);
+    }
+}

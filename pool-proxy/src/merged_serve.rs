@@ -112,8 +112,27 @@ impl MergedWorker {
         match method {
             "mining.subscribe" => WorkerReaction::Send(vec![self.subscribe_reply(&id)]),
             "mining.authorize" => {
-                self.authorized = true; // solo/merged: node owns payout addr, any worker ok
-                WorkerReaction::Send(vec![ok_true(&id)])
+                // H-3 fix (audit finding): this used to accept ANY username
+                // unconditionally. `addr::parse_worker_username` documents
+                // its own contract — "the caller must then refuse
+                // mining.authorize ... rather than serve jobs whose reward
+                // has no owner" — but nothing here ever called it. Wiring the
+                // full non-custodial payout redirect into the round builder
+                // (L-10) is a separate, larger change; this fix closes the
+                // narrower, concrete gap: an authorize with no parseable
+                // `bloch1…` address is refused rather than silently accepted.
+                let username = params.first().and_then(Value::as_str).unwrap_or("");
+                match crate::addr::parse_worker_username(username) {
+                    Some(_payout) => {
+                        self.authorized = true;
+                        WorkerReaction::Send(vec![ok_true(&id)])
+                    }
+                    None => WorkerReaction::Send(vec![err(
+                        &id,
+                        24,
+                        "authorize requires a bloch1... payout address in the username",
+                    )]),
+                }
             }
             "mining.submit" => self.handle_submit(&id, &params),
             // Version-rolling negotiation: accept a permissive mask so ASICs proceed.
@@ -148,6 +167,26 @@ impl MergedWorker {
         let en2 = get(2);
         let ntime = get(3);
         let nonce = get(4);
+
+        // L-11 fix (audit finding): `classify_merged_share` splices `en1 ‖ en2`
+        // into the coinbase with no length check against the extranonce size
+        // the round's coinbase scriptSig actually reserved
+        // (`MergedWorker::extranonce_total_len()`, see `btc_coinbase_parts`). A
+        // short or long `en2` yields a structurally invalid coinbase that the
+        // proxy would still hash and, on a lucky target hit, submit to the
+        // node and to `bitcoind`. `self.extranonce1_hex` is always exactly
+        // `EN1_LEN` bytes (derived from `worker_id`, never attacker input), so
+        // only `en2` needs checking here.
+        match hex::decode(en2) {
+            Ok(b) if b.len() == EN2_SIZE => {}
+            _ => {
+                return WorkerReaction::Send(vec![err(
+                    id,
+                    20,
+                    &format!("bad submit: extranonce2 must be exactly {EN2_SIZE} bytes"),
+                )])
+            }
+        }
         let version = params
             .get(5)
             .and_then(Value::as_str)
@@ -183,8 +222,17 @@ fn ok_true(id: &Value) -> String {
     format!(r#"{{"id":{id},"result":true,"error":null}}"#)
 }
 
+/// H-3 fix (audit finding): `msg` used to be spliced into the JSON literal
+/// verbatim (`"{msg}"`), and `msg` can carry client-controlled content (e.g.
+/// `format!("bad submit: {e}")` where `e` is derived from attacker-supplied
+/// hex/JSON). A `"` or embedded newline in that path produced malformed or
+/// split output. `serde_json::Value::String`'s own `Display` escapes the
+/// string exactly per JSON's grammar, so this is correct for any `msg`.
 fn err(id: &Value, code: i64, msg: &str) -> String {
-    format!(r#"{{"id":{id},"result":null,"error":[{code},"{msg}",null]}}"#)
+    format!(
+        r#"{{"id":{id},"result":null,"error":[{code},{msg_json},null]}}"#,
+        msg_json = Value::String(msg.to_string())
+    )
 }
 
 /// The live async loop: serve one merged worker over `stream`. Owns the round
@@ -345,9 +393,28 @@ mod tests {
     fn authorize_marks_authorized_and_replies_true() {
         let mut w = MergedWorker::new([0; 4], 1.0);
         assert!(!w.is_authorized());
-        let r = w.handle_line(r#"{"id":2,"method":"mining.authorize","params":["addr","x"]}"#);
+        let r = w.handle_line(
+            r#"{"id":2,"method":"mining.authorize","params":["bloch1qe986db5149cff7499b282a048272a09aff0af4ff84242073","x"]}"#,
+        );
         assert!(matches!(r, WorkerReaction::Send(l) if l[0].contains("\"result\":true")));
         assert!(w.is_authorized());
+    }
+
+    /// H-3 regression: red before the fix (`mining.authorize` accepted ANY
+    /// username unconditionally), green after (a username with no parseable
+    /// `bloch1…` payout address is refused, `is_authorized()` stays false).
+    #[test]
+    fn authorize_without_a_bloch_address_is_refused() {
+        for bad_user in ["addr", "x", "", "bc1qjpnqq4f6hjh2n39tzwy8ttrj4h78yx22retkyk"] {
+            let mut w = MergedWorker::new([0; 4], 1.0);
+            let line = format!(r#"{{"id":2,"method":"mining.authorize","params":["{bad_user}"]}}"#);
+            let r = w.handle_line(&line);
+            assert!(
+                matches!(&r, WorkerReaction::Send(l) if l[0].contains("\"result\":null")),
+                "username {bad_user:?} without a bloch1 address must be refused, got {r:?}"
+            );
+            assert!(!w.is_authorized(), "must NOT be authorized for {bad_user:?}");
+        }
     }
 
     #[test]
@@ -378,10 +445,32 @@ mod tests {
     fn submit_below_worker_target_is_rejected() {
         // Impossible everything (worker target 0 is unmeetable) → error, no win.
         let mut w = worker_with_round(0x0300_0001, 0x0300_0001, f64::MAX);
+        // en2 is exactly EN2_SIZE (4) bytes so this exercises the target check,
+        // not the L-11 extranonce2-length guard (covered separately below).
         let r = w.handle_line(
-            r#"{"id":9,"method":"mining.submit","params":["a","m1","00","66000000","00000000"]}"#,
+            r#"{"id":9,"method":"mining.submit","params":["a","m1","00000000","66000000","00000000"]}"#,
         );
         assert!(matches!(r, WorkerReaction::Send(l) if l[0].contains("above target")));
+    }
+
+    /// L-11 regression: red before the fix (a short/long/non-hex extranonce2
+    /// reached `classify_merged_share`, which spliced it straight into the
+    /// coinbase with no length check against what the round's coinbase
+    /// scriptSig actually reserved), green after (rejected with a clear
+    /// error before the coinbase is ever built).
+    #[test]
+    fn submit_with_wrong_length_extranonce2_is_rejected() {
+        for bad_en2 in ["00", "0011223344", "not-hex", ""] {
+            let mut w = worker_with_round(0x20ff_ffff, 0x0300_0001, 1e-9);
+            let line = format!(
+                r#"{{"id":9,"method":"mining.submit","params":["a","m1","{bad_en2}","66000000","00000000"]}}"#
+            );
+            let r = w.handle_line(&line);
+            assert!(
+                matches!(&r, WorkerReaction::Send(l) if l[0].contains("extranonce2")),
+                "extranonce2={bad_en2:?} must be rejected with a length error, got {r:?}"
+            );
+        }
     }
 
     // ── Framing: the socket loop's read is bounded and deadlined ─────────

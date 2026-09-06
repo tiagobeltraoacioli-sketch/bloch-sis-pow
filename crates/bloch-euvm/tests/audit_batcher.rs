@@ -104,8 +104,11 @@ fn settlement_old_k_panics_on_large_reserves_debug() {
 /// Fixed: the reserve update is `checked_add`/`checked_sub`; an order whose fill would
 /// overflow u64 is DROPPED and REFUNDED (reserves untouched), like every other rejection.
 /// So `new0` is always the true, un-clamped reserve. This test fails if saturation returns.
+// H-6b fix (Annex A6 §2): renamed from `settle_reserve_update_saturates_instead_of_failing_closed`
+// — the body asserts the FIXED behaviour (checked arithmetic, overflowing order
+// refunded, no saturation). Finding text preserved in the doc comment above.
 #[test]
-fn settle_reserve_update_saturates_instead_of_failing_closed() {
+fn settle_refunds_overflowing_order_instead_of_saturating_reserve() {
     let mut value = Value::new();
     value.insert(A, u64::MAX - 10);
     value.insert(B, 1_000_000);

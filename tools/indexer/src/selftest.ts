@@ -118,10 +118,14 @@ async function reorgSuite(): Promise<void> {
 // ── The satoshi-encoding suite: the point of the bigint migration ─────────────
 //
 // Pinned, measured on node v22.16.0:
-//   $ node -e 'console.log(JSON.stringify(JSON.parse(`{"v":354617540000000001}`)))'
-//   {"v":354617540000000000}      # 1 satoshi gone, silently
-//   $ node -e 'console.log(JSON.stringify(JSON.parse(`{"v":"354617540000000001"}`)))'
-//   {"v":"354617540000000001"}    # string form: byte-identical
+//   $ node -e 'console.log(JSON.stringify(JSON.parse(`{"satoshis":354617540000000001}`)))'
+//   {"satoshis":354617540000000000}      # 1 satoshi gone, silently
+//   $ node -e 'console.log(JSON.stringify(JSON.parse(`{"satoshis":"354617540000000001"}`)))'
+//   {"satoshis":"354617540000000001"}    # string form: byte-identical
+//
+// Uses "satoshis" (a real recognized amount key, T-6) rather than a synthetic
+// "v" — `parseJsonExactIntegers` only rewrites known amount keys now, so the
+// vector below must use one to actually exercise the fixed reviver.
 async function largeValueSuite(): Promise<void> {
   console.log("\n── large-value suite (balance past Number.MAX_SAFE_INTEGER) ───");
 
@@ -241,19 +245,38 @@ function encodingSuite(): void {
 
   // Fixed vector (spec test obligation 5): the numeric form corrupts, the string
   // form does not, and parseJsonExactIntegers recovers the raw digits.
-  const numericForm = JSON.stringify(JSON.parse(`{"v":354617540000000001}`));
-  assert(numericForm === `{"v":354617540000000000}`, `numeric JSON form loses 1 sat (got ${numericForm})`);
-  const stringForm = JSON.stringify(JSON.parse(`{"v":"354617540000000001"}`));
-  assert(stringForm === `{"v":"354617540000000001"}`, `string JSON form is byte-identical (got ${stringForm})`);
-  const recovered = parseJsonExactIntegers(`{"v":354617540000000001}`) as { v: unknown };
+  const numericForm = JSON.stringify(JSON.parse(`{"satoshis":354617540000000001}`));
   assert(
-    parseSats(recovered.v) === 354617540000000001n,
-    `raw-source reader recovers the exact digits of a legacy oversized literal (got ${String(recovered.v)})`,
+    numericForm === `{"satoshis":354617540000000000}`,
+    `numeric JSON form loses 1 sat (got ${numericForm})`,
   );
-  const smallLiteral = parseJsonExactIntegers(`{"height":8500,"v":50}`) as { height: unknown; v: unknown };
+  const stringForm = JSON.stringify(JSON.parse(`{"satoshis":"354617540000000001"}`));
   assert(
-    typeof smallLiteral.height === "number" && smallLiteral.height === 8500 && typeof smallLiteral.v === "number",
+    stringForm === `{"satoshis":"354617540000000001"}`,
+    `string JSON form is byte-identical (got ${stringForm})`,
+  );
+  const recovered = parseJsonExactIntegers(`{"satoshis":354617540000000001}`) as { satoshis: unknown };
+  assert(
+    parseSats(recovered.satoshis) === 354617540000000001n,
+    `raw-source reader recovers the exact digits of a legacy oversized literal (got ${String(recovered.satoshis)})`,
+  );
+  const smallLiteral = parseJsonExactIntegers(`{"height":8500,"satoshis":50}`) as {
+    height: unknown;
+    satoshis: unknown;
+  };
+  assert(
+    typeof smallLiteral.height === "number" &&
+      smallLiteral.height === 8500 &&
+      typeof smallLiteral.satoshis === "number",
     "raw-source reader leaves safe integers (heights, small amounts) as numbers",
+  );
+  // T-6: an oversized integer under an unrecognized key (e.g. `height`) is left
+  // as a number, never silently retyped to a string — only known amount keys
+  // (`isAmountKey`, sats.ts) are rewritten.
+  const oversizedHeight = parseJsonExactIntegers(`{"height":99999999999999999999}`) as { height: unknown };
+  assert(
+    typeof oversizedHeight.height === "number",
+    `an oversized value under an unrecognized key must stay a number (got ${typeof oversizedHeight.height})`,
   );
 }
 

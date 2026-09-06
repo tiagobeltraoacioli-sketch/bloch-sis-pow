@@ -5,6 +5,18 @@ edition = "2021"
 # HTTP prover service — deployed on a server (Fly.io GPU) where the SP1 toolchain
 # is installed. NOT built by the node's cargo build (not a path-dep of bloch).
 
+# Own workspace root, mirroring `euvm-tooling`'s convention for the same reason:
+# the root manifest already lists this crate's parent (`crates/coherence-prover`)
+# in `[workspace] exclude`, but that only stops the NEAREST ancestor workspace
+# from claiming it — if that ancestor itself sits inside a larger directory tree
+# with a further-out `Cargo.toml` that also declares `[workspace]` (as happens
+# under a nested `git worktree` checkout) and does not know about this path,
+# Cargo keeps walking up and can mis-resolve the workspace root to that
+# unrelated outer manifest ("current package believes it's in a workspace when
+# it's not"). An explicit empty table makes this crate unambiguously
+# self-contained regardless of where it is checked out.
+[workspace]
+
 [dependencies]
 sp1-sdk = "=4.2.1"  # EXACT pin: prover + node verifier must agree on SP1_CIRCUIT_VERSION
 coherence-core = { path = "../../coherence-core" }
@@ -16,6 +28,11 @@ base64 = "0.22"
 bincode = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# P-4/P-5/P-8 fix (audit finding): per-request timeout + a per-token concurrency
+# limiter, so one caller (or one hung request) cannot monopolise the GPU / wake
+# the scale-to-zero machine indefinitely.
+tower = { version = "0.4", features = ["limit"] }
+tower-http = { version = "0.6", features = ["timeout"] }
 
 [features]
 # GPU proving via SP1's CUDA backend — enable in the GPU Docker build.

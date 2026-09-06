@@ -302,11 +302,16 @@ fn relative_timelock_zero_min_age_always_open() {
 #[test]
 fn relative_timelock_fail_closed_missing_creation_datum() {
     // Run the raw program with an EMPTY stack: it needs the creation height seeded first
-    // (CtxField(HEIGHT) then Swap over two elements) → StackUnderflow, never a silent pass.
+    // (CtxField(HEIGHT) then Swap over two elements) → fault, never a silent pass.
+    //
+    // E-1 regression fix: `relative_timelock`'s `Op::ExpectDepth(1)` arity pin (added
+    // for E-1) now runs before the datum is ever touched, so an empty stack is caught
+    // one instruction earlier than it used to be — `Err(Assert)`, not `StackUnderflow`.
+    // Still fail-closed either way; this only tightens WHICH fault fires first.
     let prog = examples::relative_timelock(20);
     let v = MockVerifier::never();
     let r = run(&prog, vec![], &ctx_h(SIGHASH, 130), &v);
-    assert!(matches!(r.result, Err(VmError::StackUnderflow)), "got {:?}", r.result);
+    assert!(matches!(r.result, Err(VmError::Assert)), "got {:?}", r.result);
 }
 
 #[test]
@@ -337,9 +342,17 @@ fn charter_shape_supply_then_governance() {
     let compiled = examples::compile_minimal_ustav_charter("USTAV", 1_000_000, issuer(), governors());
     let kinds: Vec<&str> = compiled.validators.iter().map(|m| m.kind).collect();
     assert_eq!(kinds, vec!["supply", "governance"]);
-    // policy id is the Supply validator's hash.
+    // K-1 fix: policy id is SHA-256d(charter_id || supply_validator_hash), NOT the
+    // raw Supply validator hash alone (that formula collided across unrelated
+    // charters sharing a Supply config — see bloch_euvm::modules::CompiledToken::policy_id).
     let supply = compiled.validators.iter().find(|m| m.kind == "supply").unwrap();
-    assert_eq!(compiled.policy_id(), Some(supply.validator_hash));
+    assert_ne!(compiled.policy_id(), Some(supply.validator_hash));
+    use sha2::{Digest, Sha256};
+    let mut pre = [0u8; 64];
+    pre[..32].copy_from_slice(&compiled.charter_id);
+    pre[32..].copy_from_slice(&supply.validator_hash);
+    let expected: [u8; 32] = Sha256::digest(Sha256::digest(pre)).into();
+    assert_eq!(compiled.policy_id(), Some(expected));
 }
 
 #[test]
@@ -369,27 +382,51 @@ fn supply_program(cap: u64) -> Vec<Op> {
     compiled.validators.into_iter().find(|m| m.kind == "supply").unwrap().program
 }
 
+/// Ctx binding a Supply-module mint. `MINT_CTX_SIGHASH=0`, `MINT_CTX_DELTA=1`,
+/// index 2 is the unused `new_supply` slot, `MINT_CTX_PRIOR_SUPPLY=3` — the exact
+/// field layout `bloch_euvm::modules::compile_supply` reads via `Op::CtxField`.
+///
+/// E-1 regression fix: these three tests pre-date `modules.rs`'s "HIGH severity
+/// fix, 2026-08-11", which moved the mint amount from the REDEEMER
+/// (`requested:Int`) to this ctx (`prior`/`delta`) and pinned the seed to `[sig]`
+/// only (`Op::ExpectDepth(1)`). Before this fix the tests still passed a 3-element
+/// `[datum, requested, sig]` redeemer, which the `ExpectDepth(1)` pin now rejects
+/// with `Err(Assert)` regardless of cap/signature — silently testing nothing about
+/// the cap gate or the signature check. Ported to `ctx_for_mint` + `[sig]`-only,
+/// same shape already used by `demo_ustav_charter` (see `src/examples.rs`).
+fn ctx_for_mint(sighash: &[u8], prior: i128, delta: i128) -> Ctx {
+    Ctx {
+        fields: vec![
+            Val::Bytes(sighash.to_vec()),
+            Val::Int(delta),
+            Val::Int(prior + delta),
+            Val::Int(prior),
+        ],
+        ..Default::default()
+    }
+}
+
 #[test]
 fn charter_supply_accepts_within_cap_and_at_boundary() {
     let sig = b"issuer-sig".to_vec();
     let v = MockVerifier::accepting(vec![(SIGHASH.to_vec(), issuer(), sig.clone())]);
     let prog = supply_program(1_000_000);
-    // seed [datum, requested:Int, sig:Bytes]
-    let within = vec![Val::Int(0), Val::Int(500_000), Val::Bytes(sig.clone())];
-    assert_eq!(run(&prog, within, &ctx_sig(SIGHASH), &v).result, Ok(true));
-    // requested == cap passes (<=)
-    let boundary = vec![Val::Int(0), Val::Int(1_000_000), Val::Bytes(sig)];
-    assert_eq!(run(&prog, boundary, &ctx_sig(SIGHASH), &v).result, Ok(true));
+    // Supply seed is `[sig]` only; prior/delta are bound via ctx, not the redeemer.
+    let within = vec![Val::Bytes(sig.clone())];
+    assert_eq!(run(&prog, within, &ctx_for_mint(SIGHASH, 0, 500_000), &v).result, Ok(true));
+    // prior + delta == cap passes (<=)
+    let boundary = vec![Val::Bytes(sig)];
+    assert_eq!(run(&prog, boundary, &ctx_for_mint(SIGHASH, 0, 1_000_000), &v).result, Ok(true));
 }
 
 #[test]
 fn charter_supply_fail_closed_over_cap() {
-    // requested = cap + 1 → the cap-gate Verify aborts (a FAULT, not a silent false).
+    // prior + delta = cap + 1 → the cap-gate Verify aborts (a FAULT, not a silent false).
     let prog = supply_program(1_000_000);
     let sig = b"issuer-sig".to_vec();
     let v = MockVerifier::accepting(vec![(SIGHASH.to_vec(), issuer(), sig.clone())]);
-    let over = vec![Val::Int(0), Val::Int(1_000_001), Val::Bytes(sig)];
-    let r = run(&prog, over, &ctx_sig(SIGHASH), &v);
+    let over = vec![Val::Bytes(sig)];
+    let r = run(&prog, over, &ctx_for_mint(SIGHASH, 0, 1_000_001), &v);
     assert_eq!(r.result, Err(VmError::Assert), "over-cap mint must abort, got {:?}", r.result);
 }
 
@@ -398,8 +435,8 @@ fn charter_supply_rejects_forged_issuer_sig() {
     // Within cap, but the issuer signature does not verify → clean reject.
     let prog = supply_program(1_000_000);
     let v = MockVerifier::never();
-    let redeemer = vec![Val::Int(0), Val::Int(1), Val::Bytes(b"forged".to_vec())];
-    assert_eq!(run(&prog, redeemer, &ctx_sig(SIGHASH), &v).result, Ok(false));
+    let redeemer = vec![Val::Bytes(b"forged".to_vec())];
+    assert_eq!(run(&prog, redeemer, &ctx_for_mint(SIGHASH, 0, 1), &v).result, Ok(false));
 }
 
 fn gov_program() -> Vec<Op> {
@@ -466,10 +503,14 @@ fn p2pkh_fail_closed_wrong_pubkey() {
 
 #[test]
 fn p2pkh_fail_closed_missing_witness() {
+    // E-1 regression fix: `p2pkh`'s `Op::ExpectDepth(2)` arity pin now checks the
+    // stack depth before either witness element is popped, so an empty stack
+    // faults there (`Err(Assert)`) rather than reaching the deeper pop that used
+    // to underflow first. Still fail-closed — never a silent accept.
     let prog = examples::p2pkh(sha256d(b"pk"));
     let v = MockVerifier::never();
     let r = run(&prog, vec![], &ctx_sig(SIGHASH), &v);
-    assert!(matches!(r.result, Err(VmError::StackUnderflow)), "got {:?}", r.result);
+    assert!(matches!(r.result, Err(VmError::Assert)), "got {:?}", r.result);
 }
 
 // ── Hash-lock / HTLC ─────────────────────────────────────────────────────────
@@ -500,10 +541,14 @@ fn hashlock_fail_closed_non_bytes_preimage() {
 
 #[test]
 fn hashlock_fail_closed_empty_stack() {
+    // E-1 regression fix: `hashlock`'s `Op::ExpectDepth(1)` arity pin now checks the
+    // stack depth before the preimage is popped, so an empty stack faults there
+    // (`Err(Assert)`) rather than reaching the pop that used to underflow first.
+    // Still fail-closed — never a silent accept.
     let prog = examples::hashlock(sha256d(b"x"));
     let v = MockVerifier::never();
     let r = run(&prog, vec![], &Ctx::default(), &v);
-    assert!(matches!(r.result, Err(VmError::StackUnderflow)), "got {:?}", r.result);
+    assert!(matches!(r.result, Err(VmError::Assert)), "got {:?}", r.result);
 }
 
 #[test]

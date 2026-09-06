@@ -53,11 +53,27 @@ async function run(): Promise<void> {
 
   // Rate limiter: one drip per address per window.
   const ip = "203.0.113.7";
-  const ok = limiter.check(testAddr, ip);
-  assert(ok.allowed, "first request allowed");
-  limiter.record(testAddr, ip);
-  const blocked = limiter.check(testAddr, ip);
+  const now = Date.now();
+  const ok = limiter.reserve(testAddr, ip, now);
+  assert(ok.allowed, "first reservation allowed");
+  const blocked = limiter.check(testAddr, ip, now + 1);
   assert(!blocked.allowed, "second request for same address blocked by cooldown");
+
+  // T-3 regression: a SECOND concurrent reservation for the same address
+  // (before the first has been released) must ALSO be refused — this is
+  // the exact race the fix closes: `reserve` is synchronous, so no
+  // concurrent request can slip in between a check and a record.
+  const addr2 = "bloch1tconcurrent0000000000000000000000000001";
+  const r1 = limiter.reserve(addr2, "203.0.113.8", now);
+  assert(r1.allowed, "first reservation for addr2 allowed");
+  const r2 = limiter.reserve(addr2, "203.0.113.8", now);
+  assert(!r2.allowed, "a second concurrent reservation for the SAME address must be refused (in-flight)");
+
+  // Releasing a failed drip's reservation frees the address again — an
+  // address whose payment never went out must not be charged a cooldown.
+  limiter.release(addr2, "203.0.113.8", now);
+  const r3 = limiter.reserve(addr2, "203.0.113.9", now + 1);
+  assert(r3.allowed, "released reservation must be re-reservable");
 
   console.log("\nAll self-tests passed (offline, dry-run, no network).");
 }

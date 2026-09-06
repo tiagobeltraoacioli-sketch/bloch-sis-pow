@@ -50,8 +50,11 @@ fn anyone_tx(value: u64, fee: u64) -> EuTx {
     }
 }
 
+// H-6b fix (Annex A6 §2): renamed from `finding_a_committed_bytes_do_not_bind_eutxo_state`
+// — the body asserts `assert_ne!` on committed_bytes (they DO bind/diverge), the FIXED
+// behaviour, not the vulnerability the old name describes. Finding text preserved above.
 #[test]
-fn finding_a_committed_bytes_do_not_bind_eutxo_state() {
+fn committed_bytes_bind_eutxo_state_differing_value_diverges() {
     struct Noop;
     impl SigVerifier for Noop {
         fn verify(&self, _m: &[u8], _p: &[u8], _s: &[u8]) -> bool { false }

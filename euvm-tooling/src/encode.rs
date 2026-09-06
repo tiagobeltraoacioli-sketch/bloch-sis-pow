@@ -261,6 +261,12 @@ pub fn op_to_string(op: &Op) -> String {
         Op::Dup => "Dup".into(),
         Op::Drop => "Drop".into(),
         Op::Swap => "Swap".into(),
+        // Pre-existing gap fixed while addressing E-1/E-2/E-3: `bloch_euvm::Op`
+        // gained `ExpectDepth` (the modules.rs stack-depth-pin fix) but this
+        // disassembler match was never updated, so `euvm-tooling` failed to build
+        // at all (`E0004: non-exhaustive patterns`) — every example that emits the
+        // pin (all of them, after the E-1 fix below) would have hit this.
+        Op::ExpectDepth(n) => format!("ExpectDepth {n}"),
         Op::Pick(n) => format!("Pick {n}"),
         Op::Add => "Add".into(),
         Op::Sub => "Sub".into(),

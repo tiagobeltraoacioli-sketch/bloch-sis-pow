@@ -45,8 +45,12 @@ fn two_asset_pool(a: u64, b: u64) -> ExtOutput {
 /// Fixed: both helpers now use `checked_mul` and return `Option<i128>`, matching the VM's
 /// own `Op::Mul` (-> `VmError::Overflow`). They return `None` (fail-closed) instead of
 /// panicking. No `catch_unwind` needed — a direct call must not panic.
+// H-6b fix (Annex A6 §2): renamed from `settlement_k_overflows_i128_and_panics_on_large_reserves`
+// — a `cargo test` reader who only sees the test NAME pass would conclude the panic is
+// still live; the body actually asserts the FIXED behaviour (fails closed to `None`).
+// The original finding text is preserved in the doc comment above.
 #[test]
-fn settlement_k_overflows_i128_and_panics_on_large_reserves() {
+fn settlement_k_at_u64_max_reserves_fails_closed_to_none_not_panic() {
     // A structurally valid two-asset pool with maxed reserves; empty batch is a no-op
     // so new0/new1 == old0/old1 == u64::MAX.
     let pool = two_asset_pool(u64::MAX, u64::MAX);
@@ -166,8 +170,11 @@ fn dup_amplifies_memory_to_a_multiple_of_gas_via_validate_tx() {
 /// emits `new_supply <= cap` as `!(cap < new_supply)` with `cap` pushed unmodified.
 /// This regression test asserts it does NOT panic on the boundary argument and yields
 /// a well-formed policy program. It FAILS if the `cap + 1` overflow is reintroduced.
+// H-6b fix (Annex A6 §2): renamed from `fixed_supply_cap_policy_panics_on_max_cap` —
+// the body asserts the opposite of what the old name says (no panic, well-formed
+// policy). Finding text preserved in the doc comment above.
 #[test]
-fn fixed_supply_cap_policy_panics_on_max_cap() {
+fn fixed_supply_cap_policy_does_not_panic_on_max_cap() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let built = std::panic::catch_unwind(|| {

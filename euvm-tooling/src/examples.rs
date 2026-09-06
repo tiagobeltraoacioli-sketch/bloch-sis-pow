@@ -22,7 +22,7 @@
 //! `fields[FIELD_SIGHASH=0]` = the tx sighash (Bytes); `fields[FIELD_HEIGHT=1]` = the
 //! current block height (Int). A host running these validators must populate them so.
 
-use crate::euvm::{blch, validator_hash, AssetId, Ctx, ExtOutput, Op, Val, Value};
+use crate::euvm::{blch, validator_hash, AssetId, Ctx, ExtOutput, Op, Val, Value, BLCH};
 use crate::euvm::modules::{
     self, CompiledToken, FIELD_HEIGHT, FIELD_SIGHASH, GovernanceConfig, ModuleKind, SupplyConfig,
     TokenCharter,
@@ -73,6 +73,15 @@ pub fn multisig_n_of_m(signer_pubkeys: &[Vec<u8>], threshold: u32) -> Vec<Op> {
     }
 
     let mut p = Vec::new();
+    // E-1 fix (audit finding): pin the stack depth to exactly M, mirroring
+    // `euvm::modules::compile_governance`'s `ExpectDepth`. Without this, a spender
+    // who pads the redeemer with k extra leading values shifts every `Pick(depth)`
+    // below by k, so signer i's slot is checked against redeemer slot i+k instead
+    // of its own — the exact class of bug `modules.rs`'s `compile_transfer_policy`
+    // fix documents as having been exploited (a padded redeemer bypassing a freeze
+    // gate). `m <= 253` is guaranteed above (the `m > 253` arm already returned),
+    // so `m as u8` never truncates.
+    p.push(Op::ExpectDepth(m as u8));
     // acc := 0. Per-iteration invariant: stack = [sig_0 … sig_{M-1}, acc].
     p.push(Op::PushInt(0));
     for (i0, pk) in signer_pubkeys.iter().enumerate() {
@@ -103,6 +112,11 @@ pub fn multisig_n_of_m(signer_pubkeys: &[Vec<u8>], threshold: u32) -> Vec<Op> {
 /// **Stack seed:** none required (`[]`). Finishes with `Int(height >= unlock_height)`.
 pub fn absolute_timelock(unlock_height: i128) -> Vec<Op> {
     vec![
+        // E-1 fix: pin the (empty) seed. No `Pick` reads past the top here, so a
+        // padded redeemer cannot mis-address a signer slot the way it can in
+        // `multisig_n_of_m` — but pinning it costs nothing and keeps every example
+        // in the gallery consistent with the "always pin your stack shape" rule.
+        Op::ExpectDepth(0),
         Op::CtxField(FIELD_HEIGHT),   // [height]
         Op::PushInt(unlock_height),   // [height, unlock]
         Op::Lt,                       // (height < unlock)
@@ -119,6 +133,9 @@ pub fn absolute_timelock(unlock_height: i128) -> Vec<Op> {
 /// `Int(age >= min_age)`.
 pub fn relative_timelock(min_age: i128) -> Vec<Op> {
     vec![
+        // E-1 fix: pin the seed to exactly [datum]. `Swap` below assumes a
+        // specific 1-element seed under the pushed height.
+        Op::ExpectDepth(1),
         Op::CtxField(FIELD_HEIGHT), // [creation, height]
         Op::Swap,                   // [height, creation]
         Op::Sub,                    // [height - creation] = age
@@ -184,6 +201,10 @@ pub fn compile_minimal_ustav_charter(
 /// **Stack seed:** `[pubkey, sig]` (both from the redeemer).
 pub fn p2pkh(pubkey_hash: [u8; 32]) -> Vec<Op> {
     vec![
+        // E-1 fix: pin the seed to exactly [pubkey, sig]. Every `Pick` below is a
+        // fixed offset (1 or 2) computed for THIS seed shape; a padded redeemer
+        // would shift them onto attacker-controlled slots without this.
+        Op::ExpectDepth(2),
         Op::Pick(1),                       // copy pubkey to top: [pubkey, sig, pubkey]
         Op::Sha256d,                       // [pubkey, sig, sha256d(pubkey)]
         Op::PushBytes(pubkey_hash.to_vec()), // [.., h, pkh]
@@ -203,6 +224,8 @@ pub fn p2pkh(pubkey_hash: [u8; 32]) -> Vec<Op> {
 /// `Int(sha256d(preimage) == lock)`.
 pub fn hashlock(lock: [u8; 32]) -> Vec<Op> {
     vec![
+        // E-1 fix: pin the seed to exactly [preimage].
+        Op::ExpectDepth(1),
         Op::Sha256d,               // [sha256d(preimage)]
         Op::PushBytes(lock.to_vec()),
         Op::Eq,                    // [(hash == lock)]
@@ -216,6 +239,8 @@ pub fn hashlock(lock: [u8; 32]) -> Vec<Op> {
 /// **Stack seed (spend model):** `[datum = counter]`. Reads `ctx.tx_outputs[0]`.
 pub fn continuation_counter() -> Vec<Op> {
     vec![
+        // E-1 fix: pin the seed to exactly [datum=counter].
+        Op::ExpectDepth(1),
         Op::TxOutValidator(0), // [datum, outVH]
         Op::SelfValidator,     // [datum, outVH, selfVH]
         Op::Eq,
@@ -230,29 +255,55 @@ pub fn continuation_counter() -> Vec<Op> {
 /// **Constant-product AMM pool validator.** A pool eUTXO holds two native assets
 /// (`asset_a`, `asset_b`) as reserves. A swap consumes it and must re-create the same
 /// contract (`tx_outputs[0]`) such that `new_a·new_b ≥ old_a·old_b` — Uniswap's core
-/// invariant, so no transaction may drain the pool.
+/// invariant — **and** must not reduce the pool's BLCH balance (E-2 fix: the pool
+/// UTXO must carry BLCH to be spendable and pay fees, and without this check that
+/// BLCH — and any third native asset the pool happens to hold — could be swept
+/// freely while the two-asset invariant still passes).
+///
+/// **Scope of the guarantee (E-2 fix, was previously overstated):** this validator
+/// protects `asset_a`, `asset_b`, and BLCH only. A pool holding a FOURTH native
+/// asset beyond these three is not protected by this reference implementation; a
+/// production AMM should either enumerate every asset it holds or use a datum-
+/// committed asset list.
 ///
 /// **Stack seed (spend model):** `[datum]` (unused by the invariant). Reads the spent
 /// output's reserves via `SelfAsset` and the continuation's via `TxOutAsset(0)`.
 pub fn constant_product_amm(asset_a: AssetId, asset_b: AssetId) -> Vec<Op> {
     vec![
+        // E-1 fix: pin the (unused) datum seed.
+        Op::ExpectDepth(1),
         Op::TxOutValidator(0),
         Op::SelfValidator,
         Op::Eq,
-        Op::Verify, // same contract continues
+        Op::Verify, // same contract continues (unconditional precondition, as before)
+        // E-2 fix: the continuation must not hold LESS BLCH than the spent pool did
+        // — `TxOutValue(0)` reads the continuation's BLCH balance directly (the
+        // dedicated op for it), `SelfAsset` over `BLCH` reads the spent output's.
+        // Left on the stack as a 0/1 value (`blch_ok`) rather than asserted with
+        // `Verify`, so a BLCH drain is reported the same way the k-invariant
+        // failure is — a falsy final verdict (`Ok(false)`), not an abort — keeping
+        // the module's documented contract ("finishes with a single truthy/falsy
+        // Int") uniform across every failure mode.
+        Op::TxOutValue(0),          // [datum, new_blch]
+        Op::PushBytes(BLCH.to_vec()),
+        Op::SelfAsset,              // [datum, new_blch, old_blch]
+        Op::Lt,                     // [datum, (new_blch < old_blch)]     1 == drained
+        Op::Not,                    // [datum, blch_ok]                  1 == NOT drained
         Op::PushBytes(asset_a.to_vec()),
         Op::SelfAsset, // old_a
         Op::PushBytes(asset_b.to_vec()),
         Op::SelfAsset,
-        Op::Mul, // old_k = old_a * old_b
+        Op::Mul, // [datum, blch_ok, old_k]   old_k = old_a * old_b
         Op::PushBytes(asset_a.to_vec()),
         Op::TxOutAsset(0), // new_a
         Op::PushBytes(asset_b.to_vec()),
         Op::TxOutAsset(0),
-        Op::Mul, // new_k = new_a * new_b
-        Op::Swap,
-        Op::Lt,
-        Op::Not, // new_k >= old_k
+        Op::Mul,  // [datum, blch_ok, old_k, new_k]   new_k = new_a * new_b
+        Op::Swap, // [datum, blch_ok, new_k, old_k]
+        Op::Lt,   // [datum, blch_ok, (new_k < old_k)]
+        Op::Not,  // [datum, blch_ok, k_ok]           k_ok: new_k >= old_k
+        // final verdict = blch_ok AND k_ok (both are 0/1, so Mul is a boolean AND)
+        Op::Mul,
     ]
 }
 
@@ -278,6 +329,34 @@ fn ctx_with_sighash(sighash: &[u8]) -> Ctx {
 fn ctx_with_height(sighash: &[u8], height: i128) -> Ctx {
     Ctx {
         fields: vec![Val::Bytes(sighash.to_vec()), Val::Int(height)],
+        ..Default::default()
+    }
+}
+
+/// A `ctx` carrying the fields `euvm::modules::compile_supply` reads: the sighash at
+/// `MINT_CTX_SIGHASH` (== `FIELD_SIGHASH`, slot 0), `delta` at `MINT_CTX_DELTA` (slot
+/// 1), and `prior` at `MINT_CTX_PRIOR_SUPPLY` (slot 3). Slot 2 (`MINT_CTX_NEW_SUPPLY`)
+/// is unused by the Supply guard itself but must be present so `CtxField` indexing
+/// does not fault.
+///
+/// Pre-existing bug fixed alongside E-1/E-2/E-3: the Supply emitter's HIGH-severity
+/// fix (`modules.rs`, "2026-08-11") moved the mint amount from the REDEEMER
+/// (`requested:Int`) to the transaction CONTEXT (`prior`/`delta`), and changed its
+/// seed to `[sig]` only (`Op::ExpectDepth(1)`) — but this gallery's Ustav demo/tests
+/// were never updated to match, so they called `sim::run_program` with a 3-element
+/// redeemer (`[Int(0), Int(500_000), Bytes(sig)]`) against a program that now expects
+/// exactly 1. Every call aborted with `VmError::Assert` (caught by the same
+/// `ExpectDepth` pin this crate's own E-1 fix relies on elsewhere), so this was
+/// invisible only because `euvm-tooling` has zero reverse dependencies and is not
+/// wired into CI (Annex R2 §4.0).
+fn ctx_for_mint(sighash: &[u8], prior: i128, delta: i128) -> Ctx {
+    Ctx {
+        fields: vec![
+            Val::Bytes(sighash.to_vec()), // MINT_CTX_SIGHASH
+            Val::Int(delta),              // MINT_CTX_DELTA
+            Val::Int(prior + delta),      // MINT_CTX_NEW_SUPPLY (unused by the guard)
+            Val::Int(prior),              // MINT_CTX_PRIOR_SUPPLY
+        ],
         ..Default::default()
     }
 }
@@ -342,14 +421,11 @@ pub fn demo_ustav_charter() -> SimResult {
         .find(|m| m.kind == "supply")
         .expect("charter has a Supply module");
 
-    let ctx = ctx_with_sighash(&sighash);
+    // Supply seed is `[sig]` only; the mint amount is bound via ctx (prior=0,
+    // delta=500_000 <= cap 1_000_000), not the redeemer.
+    let ctx = ctx_for_mint(&sighash, 0, 500_000);
     let verifier = sim::MockVerifier::accepting(vec![(sighash.clone(), issuer, issuer_sig.clone())]);
-    // Supply seed: [datum, requested:Int, sig:Bytes]; 500_000 <= cap 1_000_000.
-    let redeemer = vec![
-        Val::Int(0),
-        Val::Int(500_000),
-        Val::Bytes(issuer_sig),
-    ];
+    let redeemer = vec![Val::Bytes(issuer_sig)];
     sim::run_program(&supply.program, redeemer, &ctx, &verifier, 50_000)
 }
 
@@ -502,10 +578,10 @@ mod tests {
         let governors = [b"gov-1".to_vec(), b"gov-2".to_vec(), b"gov-3".to_vec()];
         let compiled = compile_minimal_ustav_charter("USTAV", 1_000_000, issuer, governors);
         let supply = compiled.validators.iter().find(|m| m.kind == "supply").unwrap();
-        let ctx = ctx_with_sighash(&sighash);
+        let ctx = ctx_for_mint(&sighash, 0, 500_000);
         // Verifier accepts nothing -> the issuer signature check fails.
         let v = sim::MockVerifier::never();
-        let redeemer = vec![Val::Int(0), Val::Int(500_000), Val::Bytes(b"forged".to_vec())];
+        let redeemer = vec![Val::Bytes(b"forged".to_vec())];
         assert_eq!(sim::run_program(&supply.program, redeemer, &ctx, &v, 50_000).result, Ok(false));
     }
 
@@ -604,5 +680,169 @@ mod tests {
         };
         let v = sim::MockVerifier::never();
         assert_eq!(sim::run_spend(&pool, &program, vec![], &ctx, &v, 50_000).result, Ok(false));
+    }
+
+    /// E-2 regression: red before the fix (BLCH — and any asset other than
+    /// `asset_a`/`asset_b` — was never read by the invariant, so it could be swept
+    /// freely while `new_a*new_b >= old_a*old_b` still held), green after (the
+    /// continuation must carry at least as much BLCH as the spent pool did).
+    #[test]
+    fn amm_rejects_blch_drain_even_when_ab_invariant_holds() {
+        const A: AssetId = [1u8; 32];
+        const B: AssetId = [2u8; 32];
+        let program = constant_product_amm(A, B);
+        let vh = validator_hash(&program);
+        let mut pool_value = value_of(&[(A, 1000), (B, 1000)]);
+        pool_value.insert(BLCH, 500);
+        let pool = ExtOutput { value: pool_value, validator_hash: vh, datum: Val::Int(0) };
+        // A/B invariant unchanged (1000*1000 == 1000*1000), but BLCH swept to 0.
+        let mut drained_value = value_of(&[(A, 1000), (B, 1000)]);
+        drained_value.insert(BLCH, 0);
+        let ctx = Ctx {
+            tx_outputs: vec![ExtOutput {
+                value: drained_value,
+                validator_hash: vh,
+                datum: Val::Int(0),
+            }],
+            ..Default::default()
+        };
+        let v = sim::MockVerifier::never();
+        assert_eq!(
+            sim::run_spend(&pool, &program, vec![], &ctx, &v, 50_000).result,
+            Ok(false),
+            "draining the pool's BLCH must be rejected even when the two named \
+             assets' invariant still holds"
+        );
+
+        // Sanity: preserving (or growing) BLCH alongside the unchanged A/B
+        // invariant is still accepted.
+        let mut preserved_value = value_of(&[(A, 1000), (B, 1000)]);
+        preserved_value.insert(BLCH, 500);
+        let ctx_ok = Ctx {
+            tx_outputs: vec![ExtOutput {
+                value: preserved_value,
+                validator_hash: vh,
+                datum: Val::Int(0),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            sim::run_spend(&pool, &program, vec![], &ctx_ok, &v, 50_000).result,
+            Ok(true)
+        );
+    }
+
+    // ── E-1 regression: every example rejects a padded redeemer ─────────────
+    //
+    // Red before the fix (no `ExpectDepth` pin anywhere in this file): a spender
+    // could pad the redeemer with extra leading values and shift every fixed-offset
+    // `Pick` onto an attacker-controlled slot. Green after: every example's first
+    // op asserts the exact expected depth, so a one-element pad aborts with
+    // `VmError::Assert` instead of silently misreading a slot.
+
+    #[test]
+    fn multisig_rejects_padded_redeemer() {
+        let sighash = demo_sighash();
+        let (pk1, pk2, pk3) = (b"gov-1".to_vec(), b"gov-2".to_vec(), b"gov-3".to_vec());
+        let program = multisig_n_of_m(&[pk1.clone(), pk2.clone(), pk3.clone()], 2);
+        let ctx = ctx_with_sighash(&sighash);
+        let verifier = sim::MockVerifier::accepting(vec![
+            (sighash.clone(), pk1.clone(), b"sig-1".to_vec()),
+            (sighash.clone(), pk3.clone(), b"sig-3".to_vec()),
+        ]);
+        // The normally-accepting redeemer, padded with one extra leading value.
+        let padded = vec![
+            Val::Bytes(b"pad".to_vec()),
+            Val::Bytes(b"sig-1".to_vec()),
+            Val::Bytes(b"placeholder".to_vec()),
+            Val::Bytes(b"sig-3".to_vec()),
+        ];
+        let r = sim::run_program(&program, padded, &ctx, &verifier, 50_000);
+        assert_eq!(r.result, Err(crate::euvm::VmError::Assert));
+    }
+
+    #[test]
+    fn absolute_timelock_rejects_padded_redeemer() {
+        let program = absolute_timelock(100);
+        let ctx = ctx_with_height(&demo_sighash(), 150);
+        let v = sim::MockVerifier::never();
+        let r = sim::run_program(&program, vec![Val::Int(0)], &ctx, &v, 10_000);
+        assert_eq!(r.result, Err(crate::euvm::VmError::Assert));
+    }
+
+    #[test]
+    fn relative_timelock_rejects_padded_redeemer() {
+        let program = relative_timelock(20);
+        let output = ExtOutput {
+            value: blch(10),
+            validator_hash: validator_hash(&program),
+            datum: Val::Int(100),
+        };
+        let ctx = ctx_with_height(&demo_sighash(), 130);
+        let v = sim::MockVerifier::never();
+        // One extra redeemer value beyond the (empty) expected redeemer.
+        let r = sim::run_spend(&output, &program, vec![Val::Int(0)], &ctx, &v, 10_000);
+        assert_eq!(r.result, Err(crate::euvm::VmError::Assert));
+    }
+
+    #[test]
+    fn p2pkh_rejects_padded_redeemer() {
+        let sighash = demo_sighash();
+        let pubkey = b"p2pkh-pubkey".to_vec();
+        let sig = b"p2pkh-sig".to_vec();
+        let program = p2pkh(sha256d(&pubkey));
+        let ctx = ctx_with_sighash(&sighash);
+        let verifier = sim::MockVerifier::accepting(vec![(sighash.clone(), pubkey.clone(), sig.clone())]);
+        let padded = vec![Val::Bytes(b"pad".to_vec()), Val::Bytes(pubkey), Val::Bytes(sig)];
+        let r = sim::run_program(&program, padded, &ctx, &verifier, 10_000);
+        assert_eq!(r.result, Err(crate::euvm::VmError::Assert));
+    }
+
+    #[test]
+    fn hashlock_rejects_padded_redeemer() {
+        let preimage = b"the-secret-preimage".to_vec();
+        let program = hashlock(sha256d(&preimage));
+        let v = sim::MockVerifier::never();
+        let padded = vec![Val::Bytes(b"pad".to_vec()), Val::Bytes(preimage)];
+        let r = sim::run_program(&program, padded, &Ctx::default(), &v, 10_000);
+        assert_eq!(r.result, Err(crate::euvm::VmError::Assert));
+    }
+
+    #[test]
+    fn continuation_counter_rejects_padded_redeemer() {
+        let program = continuation_counter();
+        let vh = validator_hash(&program);
+        let input = ExtOutput { value: blch(10), validator_hash: vh, datum: Val::Int(41) };
+        let ctx = Ctx {
+            tx_outputs: vec![ExtOutput { value: blch(10), validator_hash: vh, datum: Val::Int(42) }],
+            ..Default::default()
+        };
+        let v = sim::MockVerifier::never();
+        let r = sim::run_spend(&input, &program, vec![Val::Int(0)], &ctx, &v, 10_000);
+        assert_eq!(r.result, Err(crate::euvm::VmError::Assert));
+    }
+
+    #[test]
+    fn amm_rejects_padded_redeemer() {
+        const A: AssetId = [1u8; 32];
+        const B: AssetId = [2u8; 32];
+        let program = constant_product_amm(A, B);
+        let vh = validator_hash(&program);
+        let pool = ExtOutput {
+            value: value_of(&[(A, 1000), (B, 1000)]),
+            validator_hash: vh,
+            datum: Val::Int(0),
+        };
+        let ctx = Ctx {
+            tx_outputs: vec![ExtOutput {
+                value: value_of(&[(A, 1100), (B, 910)]),
+                validator_hash: vh,
+                datum: Val::Int(0),
+            }],
+            ..Default::default()
+        };
+        let v = sim::MockVerifier::never();
+        let r = sim::run_spend(&pool, &program, vec![Val::Int(0)], &ctx, &v, 50_000);
+        assert_eq!(r.result, Err(crate::euvm::VmError::Assert));
     }
 }

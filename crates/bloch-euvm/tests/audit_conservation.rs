@@ -130,13 +130,25 @@ fn mint_conservation_scan_is_also_unmetered() {
 
     // The mint mirror (`validate_tx_with_mint`, Lane C) must enforce the same bound by
     // calling `check_tx_resource_limits` and wrapping the breach as
-    // `MintTxError::Tx(TxError::ResourceLimit)`. It must reject the tx fail-closed; once
-    // the shared checker is wired in it surfaces as the wrapped resource ceiling.
+    // `MintTxError::Tx(TxError::ResourceLimit)`.
+    //
+    // M-1 fix (Annex A6 §2, "F2's resource ceiling is absent on the mint-aware
+    // path"): this assertion used to accept a SECOND, unrelated outcome —
+    // `Err(MintTxError::ValueNotConserved { .. })` — as an escape hatch. That `||`
+    // made the test pass whether or not `check_tx_resource_limits` was actually
+    // wired into `validate_tx_with_mint`: an unbounded per-asset conservation fold
+    // over 1500 distinct assets can itself notice non-conservation and reject
+    // first, with no resource ceiling involved at all, so the test was green even
+    // while M-1 was open (the mint path ran the whole unmetered pre-gas scan
+    // before ever hitting a ceiling). `validate_tx_with_mint` now calls
+    // `check_tx_resource_limits` as step (0), before the sighash and conservation
+    // work — assert that exact, single outcome; a regression that removes the
+    // call again must fail this test, not silently pass through the fold.
     let got = validate_tx_with_mint(&tx, &[], &MintCtx::default(), &NoopVerifier, 0);
     assert!(
-        matches!(got, Err(MintTxError::Tx(TxError::ResourceLimit { .. })))
-            || matches!(got, Err(MintTxError::ValueNotConserved { .. })),
-        "mint path must reject the oversized tx fail-closed (resource ceiling), got {got:?}"
+        matches!(got, Err(MintTxError::Tx(TxError::ResourceLimit { .. }))),
+        "mint path must reject the oversized tx via the SHARED resource ceiling \
+         (check_tx_resource_limits), not any other rejection path, got {got:?}"
     );
 }
 

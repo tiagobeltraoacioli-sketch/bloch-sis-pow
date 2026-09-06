@@ -25,8 +25,9 @@
 //! The anchor design assumes a real PQ verifier and datum serialization are wired in the
 //! Integrate phase. Designed ≠ built ≠ booted.
 
+use bloch_euvm::kirpich::AuditReport;
 use bloch_euvm::modules::{
-    compile_charter, GovernanceConfig, ModuleKind, TokenCharter,
+    compile_charter_audited, GovernanceConfig, ModuleKind, TokenCharter,
 };
 use bloch_euvm::Op;
 
@@ -139,6 +140,14 @@ pub enum AnchorError {
     Malformed,
     /// Unknown `target_chain` tag on deserialize.
     UnknownChain(u8),
+    /// K-2 fix: the Kirpich internal audit ([`bloch_euvm::kirpich`]) denied the
+    /// charter used to build an anchor guard program — e.g. an empty or malformed
+    /// `pq_recovery_pubkey` / `btc_pubkey`, which the un-audited `compile_charter`
+    /// path used to accept and silently turn into a real-looking but permanently
+    /// unspendable validator (KRP-045 catches exactly this). Carries the full
+    /// [`AuditReport`] so the caller can see every finding, not just the fact that
+    /// one fired.
+    CharterAuditDenied(AuditReport),
 }
 
 /// Sign a `PqShieldAnchor` with the owner's PQ secret key (ML-DSA-65 ‖ Falcon-1024).
@@ -252,21 +261,56 @@ impl SignedAnchor {
 /// The anchor guard as a `Governance` 1-of-1 over the PQ recovery key (spec §3.2
 /// minimum): only a valid ML-DSA‖Falcon signature updates/rotates the anchor. Returns
 /// the concrete eUTXO validator program (its `bloch_euvm::validator_hash` addresses the
-/// guarded output).
-pub fn anchor_guard_governance(pq_recovery_pubkey: &[u8]) -> Vec<Op> {
-    let ct = compile_charter(&TokenCharter {
+/// guarded output), or the Kirpich [`AuditReport`] if the charter is denied.
+///
+/// ## K-2 fix (audit finding, Kirpich Annex R2 §2.6)
+///
+/// This used to call `compile_charter` directly — the un-audited path — so none of
+/// Kirpich's 23 rules ever ran on the one charter this repo actually compiles in
+/// non-test code. Concretely, `anchor_guard_governance(&[])` (an empty PQ recovery
+/// pubkey, e.g. from a mis-parsed config or a truncated key file) passed every one of
+/// `compile_governance`'s own structural guards (one signer, no duplicate,
+/// `threshold == 1`, `m <= 253`) and compiled to a structurally real but permanently
+/// unsatisfiable program: `VerifySig` against an empty pubkey can never return true,
+/// so the anchor becomes unspendable — a silent, permanent loss of the PQ recovery
+/// path. `KRP-045` (empty signer pubkey) exists precisely to deny this, but only on
+/// the audited path. Switching to `compile_charter_audited` makes that denial reach
+/// this call site.
+pub fn anchor_guard_governance_checked(
+    pq_recovery_pubkey: &[u8],
+) -> Result<Vec<Op>, AnchorError> {
+    let ct = compile_charter_audited(&TokenCharter {
         token_name: b"PQ-SHIELD-ANCHOR".to_vec(),
         modules: vec![ModuleKind::Governance(GovernanceConfig {
             signers: vec![pq_recovery_pubkey.to_vec()],
             threshold: 1,
         })],
-    });
-    ct.validators[0].program.clone()
+    })
+    .map_err(AnchorError::CharterAuditDenied)?;
+    Ok(ct.validators[0].program.clone())
+}
+
+/// Infallible wrapper over [`anchor_guard_governance_checked`], kept for source
+/// compatibility with existing callers that expect a bare `Vec<Op>`
+/// (`bloch_pq_vault::anchor_guard_governance_hash` and any future non-`Result`
+/// call site). **Panics — loudly, with the full [`AuditReport`] in the message —
+/// if the charter is denied**, rather than silently returning the compiled-but-
+/// unspendable program the K-2 defect used to produce. A panic here means a
+/// configuration bug (an empty/malformed recovery key) was caught before an
+/// anchor was ever built from it, which is strictly better than the previous
+/// silent data loss. Prefer [`anchor_guard_governance_checked`] in any new call
+/// site that can propagate a `Result`.
+pub fn anchor_guard_governance(pq_recovery_pubkey: &[u8]) -> Vec<Op> {
+    anchor_guard_governance_checked(pq_recovery_pubkey).unwrap_or_else(|e| {
+        panic!("anchor_guard_governance: charter audit denied: {e:?}")
+    })
 }
 
 /// The anchor guard as the `Custody` 2-of-2 (BTC key AND PQ key), recommended for high
 /// value (spec §3.2 / §7): the same hybrid identity that owns the BTC vault owns its
-/// anchor. Reuses `bloch_btc_wallet::hybrid_wbtc_validator`.
+/// anchor. Reuses `bloch_btc_wallet::hybrid_wbtc_validator`, which is its own
+/// hand-written validator (not a `TokenCharter`/Kirpich compile path), so there is no
+/// audited variant to switch to here — noted for the record, not a K-2 instance.
 pub fn anchor_guard_custody(btc_pubkey: &[u8], pq_recovery_pubkey: &[u8]) -> Vec<Op> {
     bloch_btc_wallet::hybrid_wbtc_validator(btc_pubkey, pq_recovery_pubkey)
 }
@@ -494,5 +538,44 @@ mod tests {
             bloch_euvm::validator_hash(&c1),
             bloch_euvm::validator_hash(&anchor_guard_custody(b"btc-pk", &pk))
         );
+    }
+
+    /// K-2 regression: red before the fix (`anchor_guard_governance(&[])` silently
+    /// compiled to a real-looking but permanently unspendable `Governance` program
+    /// via the un-audited `compile_charter`), green after (the Kirpich-audited path
+    /// denies an empty signer pubkey — `KRP-045` — and the caller gets a `Result`
+    /// carrying the full `AuditReport` instead of a poisoned validator).
+    #[test]
+    fn empty_pq_recovery_pubkey_is_denied_not_silently_compiled() {
+        let err = anchor_guard_governance_checked(&[]).expect_err(
+            "an empty PQ recovery pubkey must be denied by Kirpich (KRP-045), not \
+             silently compiled into an unspendable Governance guard",
+        );
+        match err {
+            AnchorError::CharterAuditDenied(report) => {
+                assert!(report.denied, "report must actually carry a Deny finding");
+                assert!(
+                    report
+                        .by_severity(bloch_euvm::kirpich::Severity::Deny)
+                        .iter()
+                        .any(|f| f.code == "KRP-045"),
+                    "expected KRP-045 (empty signer pubkey) among the Deny findings, got: {:?}",
+                    report.findings
+                );
+            }
+            other => panic!("expected CharterAuditDenied, got {other:?}"),
+        }
+
+        // A non-empty pubkey still compiles cleanly through the audited path.
+        assert!(anchor_guard_governance_checked(b"a-real-pubkey").is_ok());
+    }
+
+    /// The infallible wrapper must fail LOUDLY (panic) rather than silently return the
+    /// poisoned program — this is the fallback the K-2 fix documents for callers
+    /// (`anchor_guard_governance_hash` in `lib.rs`) that cannot propagate a `Result`.
+    #[test]
+    #[should_panic(expected = "charter audit denied")]
+    fn empty_pq_recovery_pubkey_panics_through_infallible_wrapper() {
+        let _ = anchor_guard_governance(&[]);
     }
 }

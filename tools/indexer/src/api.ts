@@ -6,10 +6,11 @@
 // see docs/specs/BLOCH-SATOSHI-ENCODING.md. The `*Bloch` companions are floats,
 // display-only and lossy by construction; they must not be used for accounting.
 
-import { createServer, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { IndexStore } from "./store.js";
 import type { IndexerConfig } from "./config.js";
 import { formatSats, satsToBlochDisplay, bigintReplacer } from "./sats.js";
+import { parseAddress } from "./address.js";
 
 function json(res: ServerResponse, status: number, body: unknown): void {
   // bigintReplacer is a backstop: every amount below is already formatted, but
@@ -20,7 +21,43 @@ function json(res: ServerResponse, status: number, body: unknown): void {
 }
 
 export function createReadApi(cfg: IndexerConfig, store: IndexStore) {
-  return createServer((req, res) => {
+  const server = createServer((req, res) => {
+    // T-1 fix (audit finding): the whole handler used to have NO try/catch.
+    // A synchronous throw inside a `createServer` callback is an uncaught
+    // exception, and Node's default behaviour is to log it and EXIT THE
+    // PROCESS — so any bug reachable from an unauthenticated GET (the
+    // `__proto__` case below among them) took the whole indexer down. This
+    // wrapper is the second, independent layer: even a future accessor that
+    // reintroduces an unguarded lookup degrades to a 500, not a process exit.
+    try {
+      handleRequest(cfg, store, req, res);
+    } catch (e) {
+      console.error(`[bloch-indexer] unhandled API error: ${e instanceof Error ? e.stack ?? e.message : String(e)}`);
+      if (!res.headersSent) {
+        json(res, 500, { error: "internal error" });
+      } else {
+        res.end();
+      }
+    }
+  });
+  // T-1 fix: a throw from an async event handler elsewhere in the process
+  // would otherwise still crash Node by default; this is not a substitute
+  // for the try/catch above (which is the actual fix for THIS server's
+  // synchronous handlers) but a last-resort backstop so a slip anywhere
+  // degrades to a logged error instead of taking the whole process down.
+  process.on("uncaughtException", (e) => {
+    console.error(`[bloch-indexer] uncaughtException (process kept alive): ${e instanceof Error ? e.stack ?? e.message : String(e)}`);
+  });
+  return server;
+}
+
+function handleRequest(
+  cfg: IndexerConfig,
+  store: IndexStore,
+  req: IncomingMessage,
+  res: ServerResponse,
+): void {
+  {
     const url = new URL(req.url ?? "/", "http://localhost");
     const parts = url.pathname.split("/").filter(Boolean);
 
@@ -31,16 +68,24 @@ export function createReadApi(cfg: IndexerConfig, store: IndexStore) {
 
     // GET /health
     if (url.pathname === "/health") {
-      json(res, 200, { ok: true, service: "bloch-reorg-safe-indexer" });
+      // T-7 fix: a corrupt-load-then-silent-empty-state used to report
+      // healthy here too. `indexOk: false` is the externally visible signal
+      // that this instance's answers are not authoritative.
+      const ok = store.indexOk();
+      json(res, ok ? 200 : 503, { ok, indexOk: ok, service: "bloch-reorg-safe-indexer" });
       return;
     }
 
     // GET /status
     if (url.pathname === "/status") {
       const s = store.state;
-      json(res, 200, {
+      const indexOk = store.indexOk();
+      json(res, indexOk ? 200 : 503, {
         service: "bloch-reorg-safe-indexer",
         network: cfg.network,
+        // T-7 fix: surfaced explicitly rather than letting a corrupt load
+        // masquerade as a genuinely empty, healthy chain.
+        indexOk,
         indexedTip: s.indexedTip,
         blocksApplied: s.blocksApplied,
         blocksRolledBack: s.blocksRolledBack,
@@ -56,6 +101,16 @@ export function createReadApi(cfg: IndexerConfig, store: IndexStore) {
     // GET /address/:addr/(balance|utxos|history)
     if (parts[0] === "address" && parts[1]) {
       const addr = decodeURIComponent(parts[1]);
+      // T-1 fix: validate the path segment BEFORE it ever reaches the
+      // store. `parseAddress` already existed (address.ts) and was unused
+      // by the API; a malformed value (including "__proto__" and friends)
+      // now gets a clean 400 instead of a store lookup at all — the
+      // null-prototype maps + Object.hasOwn guards in store.ts are the
+      // second, independent layer if this one is ever bypassed.
+      if (parseAddress(addr) === null) {
+        json(res, 400, { error: "malformed address" });
+        return;
+      }
       const sub = parts[2] ?? "balance";
       if (sub === "balance") {
         const bal = store.getBalance(addr);
@@ -121,5 +176,5 @@ export function createReadApi(cfg: IndexerConfig, store: IndexStore) {
     }
 
     json(res, 404, { error: "not found" });
-  });
+  }
 }

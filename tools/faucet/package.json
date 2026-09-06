@@ -16,7 +16,9 @@
     "typecheck": "tsc --noEmit",
     "start": "node dist/index.js",
     "dev": "tsc && node dist/index.js",
-    "selftest": "tsc && node dist/selftest.js"
+    "selftest": "tsc && node dist/selftest.js",
+    "test:node": "tsc && node --test dist/security.test.js",
+    "test": "npm run selftest && npm run test:node"
   },
   "devDependencies": {
     "typescript": "^5.4.0",

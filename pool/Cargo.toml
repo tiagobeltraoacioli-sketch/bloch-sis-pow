@@ -53,6 +53,13 @@ log          = "0.4"
 env_logger   = "0.11"
 clap         = { version = "4", features = ["derive"] }
 ureq         = { version = "2", features = ["json"] }
+# M-8 fix: zeroize the recovered seed / shares in bloch-pool-keyshard instead
+# of leaving them in freed heap memory. Already a transitive dep (pinned at
+# 1.9.0 in Cargo.lock) — declared directly here so keyshard.rs can use it.
+zeroize      = "1"
+# L-13 fix: hash-truncate payout addresses on the unauthenticated dashboard.
+# Already a transitive dep (pinned at 0.10.9 in Cargo.lock).
+sha2         = "0.10"
 
 # Standalone workspaces do not inherit the node workspace's [patch] table, so
 # the vendored pqcrypto-internals fork (seeded-RNG API used by bloch-crypto)

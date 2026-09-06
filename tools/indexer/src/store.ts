@@ -25,7 +25,7 @@
 // are decimal strings. Load is dual-tolerant: a state file written by the old
 // `number`-typed build still reads back exactly.
 
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, existsSync, renameSync } from "node:fs";
 import { dirname } from "node:path";
 import { parseSats, formatSats, parseJsonExactIntegers } from "./sats.js";
 
@@ -78,19 +78,37 @@ export interface IndexStore {
   getHistory(address: string): HistoryEntry[];
   getUtxo(txid: string, index: number): Utxo | undefined;
   persist(): void;
+  /** T-7 fix: `false` iff the on-disk state file existed but failed to load
+   * (parse error / corruption), in which case this store fell back to an
+   * EMPTY state that must not be presented as an authoritative "zero
+   * balance for every address" answer. Always `true` for a fresh index
+   * (no file yet) or an in-memory/ephemeral store. */
+  indexOk(): boolean;
 }
 
+// T-1 fix (audit finding): every one of these maps is keyed, directly or
+// indirectly, by an ADDRESS — and `address` reaches here straight from an
+// HTTP path segment (`api.ts`'s `req.url` parsing), fully attacker-chosen.
+// A plain `{}` object literal inherits from `Object.prototype`, so a key
+// like `"__proto__"`, `"constructor"`, or `"toString"` resolves to an
+// INHERITED property instead of `undefined` — which is not nullish, so a
+// `?? []`/`?? 0n` default never fires, and the caller gets back a function
+// object where it expected `HistoryEntry[]`/`bigint`/`Utxo`. `Object.create
+// (null)` makes each of these maps have NO prototype at all, so every one
+// of those keys is a plain, ordinary miss (`undefined`) like any other
+// absent key — this is the structural fix; `Object.hasOwn` at each read
+// site (below) is the second, independent layer.
 function emptyState(): StoreState {
   return {
     indexedTip: null,
     reorgsHandled: 0,
     blocksApplied: 0,
     blocksRolledBack: 0,
-    chain: {},
-    utxos: {},
-    balances: {},
-    history: {},
-    undo: {},
+    chain: Object.create(null),
+    utxos: Object.create(null),
+    balances: Object.create(null),
+    history: Object.create(null),
+    undo: Object.create(null),
   };
 }
 
@@ -189,7 +207,10 @@ export function deserializeState(raw: unknown): StoreState {
   s.reorgsHandled = Number(r.reorgsHandled ?? 0);
   s.blocksApplied = Number(r.blocksApplied ?? 0);
   s.blocksRolledBack = Number(r.blocksRolledBack ?? 0);
-  s.chain = (r.chain as Record<number, string>) ?? {};
+  // T-1 fix: do not adopt the raw parsed object as-is (it inherits from
+  // Object.prototype like any JSON.parse result) — copy its OWN keys onto a
+  // null-prototype object instead.
+  s.chain = Object.assign(Object.create(null), (r.chain as Record<number, string>) ?? {});
 
   for (const [k, u] of Object.entries((r.utxos as Record<string, unknown>) ?? {})) {
     s.utxos[k] = deserializeUtxo(u, `utxo ${k}`);
@@ -236,6 +257,14 @@ export function deserializeState(raw: unknown): StoreState {
 
 export class JsonStore implements IndexStore {
   state: StoreState;
+  // T-8 fix: address -> Set of "txid:index" utxo keys, maintained
+  // incrementally alongside `state.utxos` (applyBlock / rollbackBlock).
+  // NOT part of `StoreState` / the persisted format — it is fully derivable
+  // from `state.utxos` and is rebuilt from it on every load, so this adds
+  // no on-disk compatibility surface.
+  private readonly utxosByAddress: Map<string, Set<string>> = new Map();
+  // T-7 fix: false iff the state file existed but failed to parse/load.
+  private loadOk = true;
 
   private constructor(
     private readonly filePath: string,
@@ -243,6 +272,29 @@ export class JsonStore implements IndexStore {
     state: StoreState,
   ) {
     this.state = state;
+    for (const [key, utxo] of Object.entries(state.utxos)) {
+      this.indexUtxo(key, utxo.address);
+    }
+  }
+
+  private indexUtxo(key: string, address: string): void {
+    let set = this.utxosByAddress.get(address);
+    if (!set) {
+      set = new Set();
+      this.utxosByAddress.set(address, set);
+    }
+    set.add(key);
+  }
+
+  private unindexUtxo(key: string, address: string): void {
+    const set = this.utxosByAddress.get(address);
+    if (!set) return;
+    set.delete(key);
+    if (set.size === 0) this.utxosByAddress.delete(address);
+  }
+
+  indexOk(): boolean {
+    return this.loadOk;
   }
 
   static open(
@@ -250,6 +302,7 @@ export class JsonStore implements IndexStore {
     encodeAddress: (scriptPubkeyHex: string) => string,
   ): JsonStore {
     let state = emptyState();
+    let loadOk = true;
     if (existsSync(filePath)) {
       try {
         // parseJsonExactIntegers, not plain JSON.parse: a state file written by
@@ -257,15 +310,23 @@ export class JsonStore implements IndexStore {
         // be read from their raw digits rather than through a double.
         state = deserializeState(parseJsonExactIntegers(readFileSync(filePath, "utf8")));
       } catch (e) {
-        // Corrupt/partial file — start fresh rather than crash, but say so: a
-        // silently discarded index looks identical to an empty chain.
+        // T-7 fix: this used to silently fall back to an empty state that
+        // is indistinguishable, over the API, from a genuinely empty chain
+        // — "a silently discarded index looks identical to an empty chain".
+        // Still start from empty state (refusing to start at all would turn
+        // one corrupt file into a full outage), but the store now KNOWS and
+        // REPORTS (`indexOk()`) that its answers are not authoritative,
+        // instead of confidently serving zero balances for every address.
         console.error(
-          `[bloch-indexer] state file ${filePath} unreadable (${e instanceof Error ? e.message : String(e)}); starting from empty state`,
+          `[bloch-indexer] state file ${filePath} unreadable (${e instanceof Error ? e.message : String(e)}); starting from empty state — indexOk() will report false`,
         );
         state = emptyState();
+        loadOk = false;
       }
     }
-    return new JsonStore(filePath, encodeAddress, state);
+    const store = new JsonStore(filePath, encodeAddress, state);
+    store.loadOk = loadOk;
+    return store;
   }
 
   /** In-memory only, for tests. */
@@ -278,11 +339,16 @@ export class JsonStore implements IndexStore {
   }
 
   getChainHashAt(height: number): string | undefined {
-    return this.state.chain[height];
+    // T-1 fix: `Object.hasOwn` first — belt-and-suspenders alongside the
+    // null-prototype maps (see emptyState's comment): even if some future
+    // caller reconstructs `chain` as an ordinary `{}`, a lookup here can
+    // never resolve to an inherited (non-own) property.
+    return Object.hasOwn(this.state.chain, height) ? this.state.chain[height] : undefined;
   }
 
   getUtxo(txid: string, index: number): Utxo | undefined {
-    return this.state.utxos[`${txid}:${index}`];
+    const key = `${txid}:${index}`;
+    return Object.hasOwn(this.state.utxos, key) ? this.state.utxos[key] : undefined;
   }
 
   private addHistory(address: string, entry: HistoryEntry): void {
@@ -294,33 +360,85 @@ export class JsonStore implements IndexStore {
     deltas[address] = (deltas[address] ?? 0n) + amount;
   }
 
+  // T-2 fix (audit finding): `applyBlock` is now two-phase.
+  //
+  // PHASE 1 (plan) touches `this.state` READ-ONLY and does everything that
+  // can throw (`this.encodeAddress`, previously — see below, no longer
+  // throws either, but the phase split is kept as the structural guarantee
+  // regardless of what a future `encodeAddress` implementation does).
+  // PHASE 2 (apply) replays the plan; nothing in it can throw (delete /
+  // assign / bigint arithmetic / array push on already-validated data).
+  //
+  // Before this fix the two were interleaved: `delete this.state.utxos[key]`
+  // and `this.bump(...)` ran DURING the same loop that could throw on a
+  // later output (`this.encodeAddress` rejects any non-P2PKH-shaped
+  // `script_pubkey`). A throw left the store with partially-applied
+  // balances, spent UTXOs deleted, and history written — but with NEITHER
+  // `chain[height]` NOR an undo record, so nothing could roll it back, and
+  // the linkage guard in `indexer.ts` would not stop `applyBlock` from
+  // running the SAME height again from scratch on the next poll — silently
+  // re-crediting every already-applied output, forever.
   applyBlock(height: number, hash: string, txs: import("./rpc.js").Tx[]): void {
     if (this.state.chain[height] !== undefined) {
       throw new Error(`refusing to apply height ${height}: already indexed (should roll back first)`);
     }
-    const undo: UndoRecord = { height, hash, created: [], spent: [], deltas: {} };
 
+    type PlannedSpend = { kind: "spend"; key: string; utxo: Utxo; txid: string };
+    type PlannedCreate = { kind: "create"; key: string; address: string; value: bigint; txid: string };
+    const plan: Array<PlannedSpend | PlannedCreate> = [];
+
+    // PHASE 1 — plan. Reads `this.state.utxos` but never mutates anything.
     for (const tx of txs) {
-      // Spend inputs (coinbase has none / references we don't track).
       if (!tx.coinbase) {
         for (const inp of tx.inputs) {
           const key = `${inp.prev_txid}:${inp.prev_index}`;
-          const utxo = this.state.utxos[key];
+          const utxo = Object.hasOwn(this.state.utxos, key) ? this.state.utxos[key] : undefined;
           if (!utxo) continue; // input we never indexed (e.g. pre-genesis); skip defensively
-          undo.spent.push({ key, utxo });
-          delete this.state.utxos[key];
-          this.bump(undo.deltas, utxo.address, -utxo.value);
-          this.addHistory(utxo.address, { txid: tx.txid, height, direction: "out", amountSats: utxo.value });
+          plan.push({ kind: "spend", key, utxo, txid: tx.txid });
         }
       }
-      // Create outputs.
       for (const out of tx.outputs) {
-        const address = this.encodeAddress(out.script_pubkey);
-        const key = `${tx.txid}:${out.index}`;
-        this.state.utxos[key] = { address, value: out.value, height };
-        undo.created.push(key);
-        this.bump(undo.deltas, address, out.value);
-        this.addHistory(address, { txid: tx.txid, height, direction: "in", amountSats: out.value });
+        // T-2 fix: an unrecognised script_pubkey (anything not exactly
+        // 20 bytes — an OP_RETURN-style output, an eUVM validator output,
+        // an empty script, an RPC schema change) used to make
+        // `encodeAddress` throw and abort the WHOLE block mid-application.
+        // Indexing a synthetic address instead means one non-P2PKH output
+        // degrades gracefully (that output is tracked under an address no
+        // real key can ever produce) instead of either corrupting the store
+        // (the old interleaved behaviour) or permanently wedging indexing
+        // at this exact height (a purely two-phase fix with a still-
+        // throwing encodeAddress would retry-and-fail this same height
+        // forever, since the block's content does not change between polls).
+        let address: string;
+        try {
+          address = this.encodeAddress(out.script_pubkey);
+        } catch (e) {
+          address = `unknown:${out.script_pubkey}`;
+          console.error(
+            `[bloch-indexer] height ${height} tx ${tx.txid} output ${out.index}: ` +
+              `unrecognised script_pubkey (${e instanceof Error ? e.message : String(e)}); ` +
+              `indexed as ${address}`,
+          );
+        }
+        plan.push({ kind: "create", key: `${tx.txid}:${out.index}`, address, value: out.value, txid: tx.txid });
+      }
+    }
+
+    // PHASE 2 — apply. Every value here was already validated in phase 1.
+    const undo: UndoRecord = { height, hash, created: [], spent: [], deltas: {} };
+    for (const op of plan) {
+      if (op.kind === "spend") {
+        undo.spent.push({ key: op.key, utxo: op.utxo });
+        delete this.state.utxos[op.key];
+        this.unindexUtxo(op.key, op.utxo.address); // T-8: keep the secondary index in sync
+        this.bump(undo.deltas, op.utxo.address, -op.utxo.value);
+        this.addHistory(op.utxo.address, { txid: op.txid, height, direction: "out", amountSats: op.utxo.value });
+      } else {
+        this.state.utxos[op.key] = { address: op.address, value: op.value, height };
+        this.indexUtxo(op.key, op.address); // T-8: keep the secondary index in sync
+        undo.created.push(op.key);
+        this.bump(undo.deltas, op.address, op.value);
+        this.addHistory(op.address, { txid: op.txid, height, direction: "in", amountSats: op.value });
       }
     }
 
@@ -337,9 +455,16 @@ export class JsonStore implements IndexStore {
     const affected = new Set<string>();
 
     // Delete UTXOs this block created.
-    for (const key of undo.created) delete this.state.utxos[key];
+    for (const key of undo.created) {
+      const utxo = this.state.utxos[key];
+      delete this.state.utxos[key];
+      if (utxo) this.unindexUtxo(key, utxo.address); // T-8: keep the secondary index in sync
+    }
     // Restore UTXOs this block spent.
-    for (const { key, utxo } of undo.spent) this.state.utxos[key] = utxo;
+    for (const { key, utxo } of undo.spent) {
+      this.state.utxos[key] = utxo;
+      this.indexUtxo(key, utxo.address); // T-8: keep the secondary index in sync
+    }
     // Reverse balance deltas.
     for (const [addr, delta] of Object.entries(undo.deltas)) {
       this.state.balances[addr] = (this.state.balances[addr] ?? 0n) - delta;
@@ -377,25 +502,53 @@ export class JsonStore implements IndexStore {
   }
 
   getBalance(address: string): bigint {
-    return this.state.balances[address] ?? 0n;
+    // T-1 fix: see getChainHashAt's comment. `address` reaches here straight
+    // from an HTTP path segment (api.ts).
+    const v = Object.hasOwn(this.state.balances, address) ? this.state.balances[address] : undefined;
+    return v ?? 0n;
   }
 
   getUtxosForAddress(address: string): Array<{ key: string; utxo: Utxo }> {
+    // T-8 fix (audit finding): this used to iterate EVERY utxo in the store
+    // on every call — a cheap unauthenticated CPU DoS against
+    // `/address/:addr/utxos` and `/address/:addr/balance` (which calls this
+    // too, for `utxoCount`) once the UTXO set is realistically large. The
+    // secondary `utxosByAddress` index turns this into an O(this address's
+    // own UTXO count) lookup, maintained incrementally in applyBlock /
+    // rollbackBlock rather than rebuilt per request.
+    const keys = this.utxosByAddress.get(address);
+    if (!keys) return [];
     const out: Array<{ key: string; utxo: Utxo }> = [];
-    for (const [key, utxo] of Object.entries(this.state.utxos)) {
-      if (utxo.address === address) out.push({ key, utxo });
+    for (const key of keys) {
+      const utxo = this.state.utxos[key];
+      if (utxo) out.push({ key, utxo });
     }
     return out;
   }
 
   getHistory(address: string): HistoryEntry[] {
-    return this.state.history[address] ?? [];
+    // T-1 fix: this is the exact site the finding's PoC hits
+    // (`GET /address/__proto__/history`) — see getChainHashAt's comment.
+    const v = Object.hasOwn(this.state.history, address) ? this.state.history[address] : undefined;
+    return v ?? [];
   }
 
   persist(): void {
     if (!this.filePath) return; // ephemeral
     mkdirSync(dirname(this.filePath), { recursive: true });
     // JSON.stringify(this.state) would THROW here: the state holds bigints.
-    writeFileSync(this.filePath, JSON.stringify(serializeState(this.state)));
+    const bytes = JSON.stringify(serializeState(this.state));
+    // T-7 fix (audit finding): write-then-rename instead of a bare
+    // writeFileSync onto the live path. A crash or a full disk mid-write
+    // used to leave a TRUNCATED file at the real path — which `open()`
+    // then reads on next start, hits a JSON parse error, and (before the
+    // T-7 `indexOk` fix above) silently substituted an empty state with no
+    // externally visible sign the index was gone. `rename(2)` on the same
+    // filesystem is atomic: the live path either still holds the last
+    // complete write, or holds the new complete write — never a partial
+    // one, regardless of when a crash lands.
+    const tmpPath = `${this.filePath}.tmp`;
+    writeFileSync(tmpPath, bytes);
+    renameSync(tmpPath, this.filePath);
   }
 }

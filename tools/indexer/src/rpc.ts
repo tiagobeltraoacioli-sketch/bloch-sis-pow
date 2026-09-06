@@ -34,6 +34,11 @@ export function unwrapResult(result: unknown, method: string): unknown {
   return result;
 }
 
+/** T-8 fix (audit finding): no request had a timeout, so a node that accepts
+ * the connection and never answers stalled the poll loop indefinitely — no
+ * progress, no error, no log. */
+const RPC_TIMEOUT_MS = 10_000;
+
 export class HttpTransport implements JsonRpcTransport {
   constructor(private readonly url: string, private readonly apiKey?: string) {}
   async call(method: string, params: unknown[]): Promise<unknown> {
@@ -43,6 +48,7 @@ export class HttpTransport implements JsonRpcTransport {
       method: "POST",
       headers,
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      signal: AbortSignal.timeout(RPC_TIMEOUT_MS),
     });
     if (!res.ok) {
       let detail = `${res.status} ${res.statusText}`;

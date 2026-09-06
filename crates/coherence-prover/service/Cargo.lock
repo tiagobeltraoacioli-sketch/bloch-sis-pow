@@ -1189,6 +1189,8 @@ dependencies = [
  "serde_json",
  "sp1-sdk",
  "tokio",
+ "tower 0.4.13",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
 ]
@@ -5632,6 +5634,7 @@ dependencies = [
  "http",
  "http-body",
  "pin-project-lite",
+ "tokio",
  "tower 0.5.3",
  "tower-layer",
  "tower-service",

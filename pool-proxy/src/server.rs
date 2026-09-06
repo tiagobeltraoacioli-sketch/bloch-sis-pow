@@ -11,8 +11,10 @@
 //! This module opens no upstream sockets and speaks no stratum itself — it
 //! is pure wiring. All per-worker logic lives in `router` (module 4).
 
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::net::TcpListener;
 
@@ -22,6 +24,16 @@ use crate::metrics;
 use crate::pplns::PplnsLedger;
 use crate::router;
 use crate::types::{Metrics, PoolError, ProxyConfig, WorkerId};
+
+/// M-9 fix (audit finding): per-source-IP connection ceiling, mirroring
+/// `pool::stratum`'s `MAX_SESSIONS_PER_IP`. Before this fix the only cap was
+/// the GLOBAL `max_workers` (default 4096) — nothing stopped one remote
+/// address from opening a 1:1 unauthenticated downstream connection for
+/// EVERY one of those slots, each of which (`router::run_worker` /
+/// `merged_serve::serve_merged`) immediately opens its own dedicated
+/// upstream Stratum session against the node, amplifying one attacker's
+/// socket budget into an equal number of node-side sessions.
+const MAX_CONNECTIONS_PER_IP: usize = 16;
 
 /// Owns the shared config + metrics and runs the whole proxy process.
 pub struct ProxyServer {
@@ -33,6 +45,32 @@ pub struct ProxyServer {
     /// here so payout-share can be computed across all workers. Shared with
     /// the metrics endpoint, which exposes a `/pplns` query + aggregate gauges.
     ledger: Arc<PplnsLedger>,
+    /// M-9 fix: live connection count per source IP, checked BEFORE any
+    /// per-worker allocation (task spawn, upstream dial). A `std::sync::Mutex`
+    /// is fine here — held only for a map lookup/increment/decrement, never
+    /// across an `.await`.
+    per_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
+}
+
+/// M-9 fix: RAII guard mirroring [`WorkerGuard`] — decrements this peer's
+/// live-connection count on the worker task's normal return, error return, OR
+/// panic, so a per-IP slot can never leak.
+struct PerIpGuard {
+    per_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    addr: IpAddr,
+}
+
+impl Drop for PerIpGuard {
+    fn drop(&mut self) {
+        if let Ok(mut m) = self.per_ip.lock() {
+            if let Some(n) = m.get_mut(&self.addr) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    m.remove(&self.addr);
+                }
+            }
+        }
+    }
 }
 
 /// RAII guard: increments `workers_active`/`workers_total` on construction
@@ -65,6 +103,7 @@ impl ProxyServer {
             metrics: Arc::new(Metrics::new()),
             extranonce_registry: Arc::new(ExtranonceRegistry::new()),
             ledger,
+            per_ip: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -161,6 +200,31 @@ impl ProxyServer {
                         continue;
                     }
 
+                    // M-9 fix: per-IP cap, BEFORE any per-worker allocation
+                    // (task spawn, upstream dial) — mirrors `pool::stratum`'s
+                    // `MAX_SESSIONS_PER_IP`. Checked and reserved atomically
+                    // under one lock so a burst of connections from the same
+                    // IP cannot all read "room" before any of them increments.
+                    let peer_ip = peer.ip();
+                    let per_ip_guard = {
+                        let mut m = match self.per_ip.lock() {
+                            Ok(m) => m,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        let count = m.entry(peer_ip).or_insert(0);
+                        if *count >= MAX_CONNECTIONS_PER_IP {
+                            log::warn!(
+                                "rejecting {} ({} already open from this IP, cap {})",
+                                peer, *count, MAX_CONNECTIONS_PER_IP
+                            );
+                            drop(m);
+                            drop(stream);
+                            continue;
+                        }
+                        *count += 1;
+                        PerIpGuard { per_ip: self.per_ip.clone(), addr: peer_ip }
+                    };
+
                     let id = WorkerId(next_id);
                     next_id = next_id.wrapping_add(1);
 
@@ -192,6 +256,11 @@ impl ProxyServer {
                         let cache = merged_cache.clone();
                         tokio::spawn(async move {
                             let _guard = WorkerGuard::new(metrics.clone());
+                            // M-9 fix: released (decrementing this IP's count)
+                            // on every exit path — normal return, error, or
+                            // panic — same guarantee `WorkerGuard` gives the
+                            // global counter.
+                            let _per_ip_guard = per_ip_guard;
                             match crate::merged_serve::serve_merged(
                                 stream, id.0, node, btc, mcfg, diff, refresh, cache,
                             ).await {
@@ -205,6 +274,8 @@ impl ProxyServer {
                         tokio::spawn(async move {
                             // Guard bumps workers_active now and releases on any exit.
                             let _guard = WorkerGuard::new(metrics.clone());
+                            // M-9 fix: same release guarantee for this IP's count.
+                            let _per_ip_guard = per_ip_guard;
                             // Wrap the accepted stream; the router owns per-worker
                             // session state from here.
                             let down = DownstreamConn::new(stream, id, cfg.clone(), metrics.clone());
@@ -655,5 +726,57 @@ mod tests {
         // Dropped: active back to zero, total remains (monotonic counter).
         assert_eq!(metrics.snapshot().workers_active, 0);
         assert_eq!(metrics.snapshot().workers_total, 1);
+    }
+
+    /// M-9 regression: red before the fix (no per-IP accounting existed at
+    /// all — this whole map/guard mechanism is new), green after: the same
+    /// IP can hold at most `MAX_CONNECTIONS_PER_IP` entries, a distinct IP is
+    /// unaffected, and every count returns to exactly zero (the map entry is
+    /// removed) once every guard for that IP has dropped — mirroring the
+    /// exact reserve/release sequence the accept loop performs.
+    #[test]
+    fn per_ip_guard_caps_and_releases_the_count() {
+        let per_ip: Arc<Mutex<HashMap<IpAddr, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+        let ip_a: IpAddr = "203.0.113.7".parse().unwrap();
+        let ip_b: IpAddr = "203.0.113.9".parse().unwrap();
+
+        // Reserve up to the cap for ip_a; the (cap+1)-th reservation attempt
+        // must be refused — reproducing exactly the accept-loop's check.
+        let mut guards = Vec::new();
+        for _ in 0..MAX_CONNECTIONS_PER_IP {
+            let mut m = per_ip.lock().unwrap();
+            let count = m.entry(ip_a).or_insert(0);
+            assert!(*count < MAX_CONNECTIONS_PER_IP, "must still have room");
+            *count += 1;
+            drop(m);
+            guards.push(PerIpGuard { per_ip: per_ip.clone(), addr: ip_a });
+        }
+        {
+            let m = per_ip.lock().unwrap();
+            assert_eq!(*m.get(&ip_a).unwrap(), MAX_CONNECTIONS_PER_IP);
+            let would_be_rejected = *m.get(&ip_a).unwrap() >= MAX_CONNECTIONS_PER_IP;
+            assert!(would_be_rejected, "the cap+1-th connection from ip_a must be rejected");
+        }
+
+        // A DIFFERENT IP is entirely unaffected by ip_a's saturation.
+        {
+            let mut m = per_ip.lock().unwrap();
+            let count = m.entry(ip_b).or_insert(0);
+            assert_eq!(*count, 0, "ip_b starts fresh regardless of ip_a's count");
+            *count += 1;
+        }
+        let guard_b = PerIpGuard { per_ip: per_ip.clone(), addr: ip_b };
+
+        // Releasing every ip_a guard brings its count back to exactly zero
+        // AND removes the map entry (so the map does not grow unboundedly
+        // over the life of the process for addresses that have since left).
+        drop(guards);
+        {
+            let m = per_ip.lock().unwrap();
+            assert!(m.get(&ip_a).is_none(), "ip_a's entry must be removed once its count hits 0");
+            assert_eq!(*m.get(&ip_b).unwrap(), 1, "ip_b's guard is still held");
+        }
+        drop(guard_b);
+        assert!(per_ip.lock().unwrap().is_empty(), "map must be empty once every guard has dropped");
     }
 }

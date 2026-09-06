@@ -108,6 +108,26 @@ use crate::types::{
 /// misbehaving one that never gets (or ignores) results.
 const PENDING_CAP: usize = 4096;
 
+/// M-6 fix (audit finding): a BYTE cap on `pending`, alongside the existing
+/// count cap. Each entry's `job_id`/`extranonce2`/`ntime`/`nonce` are taken
+/// verbatim from the submit line (`codec.rs`) with no individual length
+/// limit — only the whole line's `MAX_LINE_BYTES` (8 KiB) bounds them. Worst
+/// case per worker was `PENDING_CAP * MAX_LINE_BYTES` ≈ 4096 × 8 KB ≈ 32 MB;
+/// at the default `max_workers = 4096` that is a ≈134 GB ceiling reachable by
+/// pipelining oversized submits faster than the node answers — a client
+/// controls both the rate and the field sizes. 1 MiB is generous headroom
+/// over any real workload (a genuine pending entry is on the order of a few
+/// hundred bytes) while keeping the worst case bounded regardless of field
+/// sizes.
+const PENDING_MAX_BYTES: usize = 1024 * 1024;
+
+/// The byte cost [`PENDING_MAX_BYTES`] charges for one pending entry: the
+/// correlation key plus every attacker-supplied string field on the [`Share`]
+/// that has no individual length bound of its own.
+fn pending_entry_bytes(key: &str, share: &Share) -> usize {
+    key.len() + share.job_id.len() + share.extranonce2.len() + share.ntime.len() + share.nonce.len()
+}
+
 /// Cap on non-`subscribe` lines a miner may send before it subscribes.
 /// Bounds the pre-handshake buffer against a peer that never subscribes.
 const PRE_SUBSCRIBE_CAP: usize = 32;
@@ -382,6 +402,10 @@ pub async fn run_worker(
     // extranonce1 and the announced difficulty are all still current) and
     // carried here until the node's verdict correlates back.
     let mut pending: VecDeque<(String, Share, Option<f64>)> = VecDeque::new();
+    // M-6 fix: running total of `pending_entry_bytes` over every entry
+    // currently in `pending`, kept in lockstep with every push/pop/remove so
+    // enforcing `PENDING_MAX_BYTES` never needs an O(n) rescan.
+    let mut pending_bytes: usize = 0;
     // Full `mining.notify` cache backing `verify_share`.
     let mut jobs = JobStore::new(JOB_CACHE);
 
@@ -495,9 +519,28 @@ pub async fn run_worker(
                             }
 
                             let key = id_key(&extract_request_id(&raw));
-                            if pending.len() >= PENDING_CAP {
-                                pending.pop_front();
+                            let incoming_bytes = pending_entry_bytes(&key, &share);
+                            // M-6 fix: evict oldest entries until BOTH the
+                            // count and the byte budget have room for the
+                            // incoming one — a count-only cap left the byte
+                            // total unbounded (see PENDING_MAX_BYTES).
+                            while pending.len() >= PENDING_CAP
+                                || pending_bytes + incoming_bytes > PENDING_MAX_BYTES
+                            {
+                                match pending.pop_front() {
+                                    Some((k, s, _)) => {
+                                        pending_bytes -= pending_entry_bytes(&k, &s);
+                                    }
+                                    // Nothing left to evict: only possible if a
+                                    // single incoming entry alone exceeds the
+                                    // byte budget. Accept it anyway rather than
+                                    // loop forever — PENDING_CAP still bounds
+                                    // count, and MAX_LINE_BYTES (8 KiB) bounds
+                                    // any one entry's real-world size.
+                                    None => break,
+                                }
                             }
+                            pending_bytes += incoming_bytes;
                             pending.push_back((key, share, credited));
                             keepalive.as_mut().reset(
                                 tokio::time::Instant::now() + cfg.keepalive_idle,
@@ -571,7 +614,11 @@ pub async fn run_worker(
                                     // drive vardiff off the node's acceptance.
                                     down.write(&raw).await?;
                                     metrics.record_outcome(&outcome);
-                                    if let Some((_, share, credited)) = pending.remove(pos) {
+                                    if let Some((rk, share, credited)) = pending.remove(pos) {
+                                        // M-6 fix: keep the running byte total
+                                        // in sync with the deque on every
+                                        // removal path, not just pop_front.
+                                        pending_bytes -= pending_entry_bytes(&rk, &share);
                                         ledger.record(
                                             worker, &share.job_id, credited, &outcome,
                                         );
@@ -795,7 +842,7 @@ async fn read_handshake(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Share, ShareOutcome, WorkerId};
+    use crate::types::{Share, ShareOutcome, WorkerId, MAX_LINE_BYTES};
     use std::time::Instant;
 
     fn mk_share(worker: u64, job: &str, diff: f64) -> Share {
@@ -1002,6 +1049,58 @@ mod tests {
         let ack_key = id_key(&Some(Value::from(99u64)));
         assert!(pending.iter().position(|(k, _, _)| *k == ack_key).is_none());
         assert_eq!(pending.len(), 1);
+    }
+
+    /// M-6 regression: red before the fix (only a COUNT cap existed, so
+    /// `pending` could hold `PENDING_CAP` entries each near `MAX_LINE_BYTES`
+    /// — tens of MB per worker), green after (a byte budget forces eviction
+    /// long before the count cap is anywhere near reached, for entries whose
+    /// string fields are large). Mirrors the push-site logic in the live pump
+    /// (evict-then-insert, tracking a running byte total) at arm's length,
+    /// the same style `submit_result_correlates_to_pending_share_by_id` uses
+    /// for the pop/remove side.
+    #[test]
+    fn pending_is_evicted_on_byte_budget_not_just_count() {
+        let mut pending: VecDeque<(String, Share, Option<f64>)> = VecDeque::new();
+        let mut pending_bytes: usize = 0;
+
+        // Each entry's oversized job_id (just under MAX_LINE_BYTES) simulates
+        // the worst case a single submit line can carry. With
+        // PENDING_MAX_BYTES = 1 MiB, only a handful fit before eviction must
+        // kick in — far fewer than PENDING_CAP (4096).
+        let big_job_id = "j".repeat(MAX_LINE_BYTES - 64);
+        let pushes = (PENDING_MAX_BYTES / (MAX_LINE_BYTES - 64)) + 4;
+        for i in 0..pushes {
+            let key = format!("{i}");
+            let share = mk_share(1, &big_job_id, 8.0);
+            let incoming = pending_entry_bytes(&key, &share);
+            while pending.len() >= PENDING_CAP
+                || pending_bytes + incoming > PENDING_MAX_BYTES
+            {
+                match pending.pop_front() {
+                    Some((k, s, _)) => pending_bytes -= pending_entry_bytes(&k, &s),
+                    None => break,
+                }
+            }
+            pending_bytes += incoming;
+            pending.push_back((key, share, Some(8.0)));
+        }
+
+        assert!(
+            pending.len() < pushes,
+            "the byte budget must have evicted SOME entries well before {pushes} count \
+             (got {} entries still queued)",
+            pending.len()
+        );
+        assert!(
+            pending_bytes <= PENDING_MAX_BYTES,
+            "running byte total ({pending_bytes}) must never exceed PENDING_MAX_BYTES \
+             ({PENDING_MAX_BYTES})"
+        );
+        // Independently recompute the total from the deque contents to prove
+        // the running counter never drifted from reality.
+        let recomputed: usize = pending.iter().map(|(k, s, _)| pending_entry_bytes(k, s)).sum();
+        assert_eq!(recomputed, pending_bytes, "running counter must match the deque exactly");
     }
 
     #[test]

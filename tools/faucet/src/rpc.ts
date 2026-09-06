@@ -11,6 +11,22 @@
 // `HttpTransport` hits a real node; `StubTransport` returns fixtures so the whole
 // getutxos -> build -> sendrawtransaction pipeline is exercisable with no node.
 
+import { parseJsonExactIntegers } from "./sats.js";
+
+//
+// T-4 fix (audit finding): `HttpTransport.call` used to parse both the error
+// body and the success body with `res.json()` — the exact rounding path
+// `sats.ts` exists to avoid (see its module comment). Every satoshi amount
+// from `getutxos` passed through an IEEE-754 double before `parseSats` could
+// ever see it. `parseSats` itself always correctly REJECTED an already-
+// rounded amount (never silent corruption), but the practical consequence
+// was that the faucet could never operate against a funding wallet holding
+// a UTXO above ~9.007e15 sat (~90,071,992 BLCH) — plausible given the
+// Genesis-4 supply (1e19 sat) and the largest carried-over address alone
+// (3.5e17 sat) — and would simply stop working with a confusing error.
+// `parseJsonExactIntegers` (sats.ts) reads such a literal from its raw
+// source text instead of through `JSON.parse`'s default double conversion.
+
 export interface JsonRpcTransport {
   call(method: string, params: unknown[]): Promise<unknown>;
 }
@@ -44,7 +60,7 @@ export class HttpTransport implements JsonRpcTransport {
       // Try to surface the node's structured error (-32001/-32002 etc.).
       let detail = `${res.status} ${res.statusText}`;
       try {
-        const j = (await res.json()) as { error?: { code?: number; message?: string } };
+        const j = parseJsonExactIntegers(await res.text()) as { error?: { code?: number; message?: string } };
         if (j.error?.message) detail = j.error.message;
         throw new RpcError(detail, method, j.error?.code);
       } catch (e) {
@@ -52,7 +68,11 @@ export class HttpTransport implements JsonRpcTransport {
         throw new RpcError(detail, method);
       }
     }
-    const body = (await res.json()) as { result?: unknown; error?: { code?: number; message?: string } };
+    // T-4 fix: NOT res.json() — see the module comment above.
+    const body = parseJsonExactIntegers(await res.text()) as {
+      result?: unknown;
+      error?: { code?: number; message?: string };
+    };
     if (body.error) throw new RpcError(body.error.message ?? "rpc error", method, body.error.code);
     return unwrapResult(body.result, method);
   }
@@ -80,34 +100,18 @@ export function unwrapResult(result: unknown, method: string): unknown {
 export type WireSats = string | number;
 
 /**
- * Parse a wire satoshi amount into an exact bigint.
- *
- * Rejects negatives, non-integers, and the `number` form above
- * Number.MAX_SAFE_INTEGER — such a number is not risky, it is ALREADY WRONG
- * (JSON.parse rounded it before this code ever saw it), so accepting it would
- * launder a corrupted amount into an exact-looking type.
+ * T-5 fix (audit finding): `parseSats` used to be defined here, independently
+ * of `tools/indexer`'s implementation of the SAME normative rule, and the two
+ * had diverged (this one accepted leading zeros and unbounded digit counts,
+ * and enforced no upper bound at all). Re-exported from the vendored
+ * canonical copy (`./sats.js` — see that file's header for why it is
+ * vendored rather than imported across packages) so there is exactly one
+ * satoshi-parsing implementation in this codebase, not two that silently
+ * drift apart. Its signature (`parseSats(raw: unknown, context?: string)`)
+ * is a strict superset of the old one — every existing call site here passes
+ * a `WireSats | bigint`, which is assignable to `unknown`.
  */
-export function parseSats(v: WireSats | bigint, what = "satoshi value"): bigint {
-  let out: bigint;
-  if (typeof v === "bigint") {
-    out = v;
-  } else if (typeof v === "number") {
-    if (!Number.isInteger(v)) throw new RangeError(`${what} is not an integer: ${v}`);
-    if (!Number.isSafeInteger(v)) {
-      throw new RangeError(
-        `${what} ${v} exceeds Number.MAX_SAFE_INTEGER and is already corrupted by ` +
-          `IEEE-754 rounding; the node must send it as a decimal string (RPC-V4 R3)`,
-      );
-    }
-    out = BigInt(v);
-  } else {
-    const s = v.trim();
-    if (!/^-?\d+$/.test(s)) throw new RangeError(`invalid ${what}: ${JSON.stringify(v)}`);
-    out = BigInt(s);
-  }
-  if (out < 0n) throw new RangeError(`negative ${what}: ${out}`);
-  return out;
-}
+export { parseSats } from "./sats.js";
 
 // ── Typed convenience wrappers ────────────────────────────────────────────────
 

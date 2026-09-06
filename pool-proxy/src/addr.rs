@@ -129,7 +129,20 @@ pub fn btc_address_to_spk(addr: &str) -> Option<Vec<u8>> {
     }
     let sep = s.rfind('1')?;
     let (hrp, data_part) = (&s[..sep], &s[sep + 1..]);
-    if hrp.is_empty() || data_part.len() < 6 {
+    // M-3 fix (audit finding): the checksum is exactly 6 symbols, so a data part
+    // of length 6 has ZERO symbols left for the witness version + program below
+    // (`data[0]` for witver, `data[1..data.len()-6]` for the program). The old
+    // `< 6` guard let a 6-symbol data part through, and `data[1..data.len()-6]`
+    // then evaluated `data[1..0]` — start > end — which panics ("slice index
+    // starts at 1 but ends at 0"). A witness program is at least 2 bytes
+    // (BIP141/BIP173), so the data part must carry at least 1 witver symbol +
+    // >=1 program-bearing 5-bit group + 6 checksum symbols; `< 7` is the
+    // correct, still-conservative bound (the `match (witver, program.len())`
+    // arm below would reject an empty program anyway — this just stops the
+    // panic from being reached at all). Reachable from the Stratum
+    // `mining.authorize` username via `parse_worker_username`, fully
+    // attacker-controlled; see the three regression vectors in the tests below.
+    if hrp.is_empty() || data_part.len() < 7 {
         return None;
     }
     let mut data = Vec::with_capacity(data_part.len());
@@ -207,6 +220,35 @@ mod tests {
         // Empty / junk.
         assert!(btc_address_to_spk("bc1").is_none());
         assert!(btc_address_to_spk("not-an-address").is_none());
+    }
+
+    /// M-3 regression (audit finding): each of these is a bech32/bech32m-valid
+    /// string with a data part of exactly 6 symbols (all checksum, zero left for
+    /// a witness version + program) — before the fix, `data[1..data.len()-6]`
+    /// evaluated `data[1..0]` (start > end) and panicked. Covers all three HRPs
+    /// `btc_address_to_spk`'s callers accept (`bc`, `bcrt`, `tb`). Reachable from
+    /// the Stratum `mining.authorize` username, fully attacker-controlled.
+    #[test]
+    fn six_symbol_data_part_does_not_panic() {
+        for addr in ["bc1a8xfp7", "bcrt1tyddyu", "tb1dclvmr"] {
+            // Must return `None` (a program this short is never valid for any
+            // witness version), and — the actual regression — must not panic.
+            assert_eq!(btc_address_to_spk(addr), None, "{addr} must be rejected, not panic");
+        }
+    }
+
+    /// The same three vectors, but through the full Stratum `mining.authorize`
+    /// path (`parse_worker_username`), exactly as they would arrive from an
+    /// unauthenticated remote peer's username. Falls back to no BTC script
+    /// rather than panicking the worker task / process.
+    #[test]
+    fn mining_authorize_username_with_six_symbol_btc_part_does_not_panic() {
+        for bad_btc in ["bc1a8xfp7", "bcrt1tyddyu", "tb1dclvmr"] {
+            let user = format!("bloch1qabc.{bad_btc}");
+            let p = parse_worker_username(&user).expect("bloch part alone is enough to parse");
+            assert_eq!(p.bloch_addr, "bloch1qabc");
+            assert!(p.btc_script.is_none(), "the malformed BTC part must be rejected, not accepted");
+        }
     }
 
     #[test]

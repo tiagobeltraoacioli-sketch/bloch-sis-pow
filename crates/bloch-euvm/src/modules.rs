@@ -427,16 +427,60 @@ pub struct CompiledToken {
 }
 
 impl CompiledToken {
-    /// The token's **policy id** (its native [`crate::AssetId`]): the validator hash of
-    /// the first [`ModuleKind::Supply`] module, if any. In the eUTXO model an asset id
-    /// *is* the hash of its minting policy, so a token's identity derives from its
-    /// Supply module. `None` if the charter has no Supply module.
+    /// The token's **policy id** (its native [`crate::AssetId`]): a digest of the
+    /// Supply module's validator hash **bound to the whole charter** via `charter_id`.
+    /// `None` if the charter has no Supply module.
+    ///
+    /// ## K-1 fix (audit finding, Kirpich Annex R2 §2.6)
+    ///
+    /// The previous formula was `policy_id = supply.validator_hash`, and
+    /// `compile_supply` (see its emitter above) bakes in exactly `(cap,
+    /// issuer_pubkey)` — the token's `token_name` and every other module (governance,
+    /// custody, compliance, vesting, transfer policy) never entered the program. Two
+    /// entirely unrelated charters — say `token_name = b"USDX"` and `token_name =
+    /// b"SCAM"`, with different governance/custody/compliance modules — that happened
+    /// to share a Supply `(cap, issuer_pubkey)` therefore produced the **same
+    /// `AssetId`**. Since `Value = BTreeMap<AssetId, u64>` (`lib.rs`), the eUTXO model
+    /// treats identical asset ids as the *same, mutually fungible* asset: the two
+    /// tokens' guards become swappable and their supplies commingle.
+    ///
+    /// The fix binds the policy id to `charter_id` — which is itself
+    /// `SHA-256d(domain ‖ len(name) ‖ name ‖ Σ(tag_byte ‖ validator_hash))`, i.e. a
+    /// function of `token_name` AND every module's kind and hash, in order. Two
+    /// charters that differ in *any* field (name, module composition, module order,
+    /// or any module's parameters) get distinct `charter_id`s and therefore distinct
+    /// policy ids, even when their Supply configs are byte-identical. This is
+    /// `policy_id = SHA-256d(charter_id ‖ supply_validator_hash)` — the alternative
+    /// fix named in the finding (folding the domain tag into the Supply program
+    /// itself was the other option, but `compile()` is called per-module with no
+    /// charter context, so binding it here — after `charter_id` is already computed —
+    /// is the minimal-surgical change that does not touch the emitted validator
+    /// bytes at all).
+    ///
+    /// No separate Kirpich rule is added for this: unlike the scalar/structural
+    /// defects the 23 KRP rules catch (each a property of ONE charter), "two
+    /// charters collide" is not a predicate a single-charter audit function can
+    /// evaluate — there is no second charter in scope. Binding `charter_id`
+    /// structurally eliminates the collision class (by injectivity of the
+    /// charter-id preimage, proven in `distinct_charters_distinct_hashes` below)
+    /// rather than merely detecting it after the fact, which is the stronger
+    /// guarantee. See `policy_id_binds_whole_charter` for the regression test.
     pub fn policy_id(&self) -> Option<[u8; 32]> {
         self.validators
             .iter()
             .find(|m| m.kind == "supply")
-            .map(|m| m.validator_hash)
+            .map(|m| policy_id_for(&self.charter_id, &m.validator_hash))
     }
+}
+
+/// `SHA-256d(charter_id ‖ supply_validator_hash)` — see the K-1 fix note on
+/// [`CompiledToken::policy_id`]. A fixed-width preimage (32 ‖ 32 bytes): no
+/// length-prefix ambiguity is possible since both fields are fixed-size hashes.
+fn policy_id_for(charter_id: &[u8; 32], supply_validator_hash: &[u8; 32]) -> [u8; 32] {
+    let mut pre = [0u8; 64];
+    pre[..32].copy_from_slice(charter_id);
+    pre[32..].copy_from_slice(supply_validator_hash);
+    sha256d(&pre)
 }
 
 /// Deterministically compile a [`TokenCharter`] into its [`CompiledToken`] validator
@@ -631,8 +675,59 @@ mod tests {
             assert_eq!(m.validator_hash, validator_hash(&m.program));
             assert!(!m.program.is_empty());
         }
-        // policy id is the Supply validator's hash
-        assert_eq!(ct.policy_id(), Some(ct.validators[0].validator_hash));
+        // policy id binds the whole charter (K-1 fix), not just the Supply hash
+        assert_eq!(
+            ct.policy_id(),
+            Some(policy_id_for(&ct.charter_id, &ct.validators[0].validator_hash))
+        );
+        assert_ne!(ct.policy_id(), Some(ct.validators[0].validator_hash));
+    }
+
+    /// K-1 regression: red before the fix (both charters shared a raw Supply hash and
+    /// therefore a policy id), green after. Two charters with an IDENTICAL Supply
+    /// config (same `cap`, same `issuer_pubkey` ⇒ same `validator_hash`) but a
+    /// different `token_name` and different other modules must NOT resolve to the
+    /// same `AssetId` — otherwise the two tokens become the same fungible asset and
+    /// each one's guards are swappable for the other's.
+    #[test]
+    fn policy_id_binds_whole_charter() {
+        let supply = ModuleKind::Supply(SupplyConfig {
+            cap: 1_000_000,
+            issuer_pubkey: b"issuer-pk".to_vec(),
+        });
+
+        let usdx = TokenCharter {
+            token_name: b"USDX".to_vec(),
+            modules: vec![
+                supply.clone(),
+                ModuleKind::Governance(GovernanceConfig {
+                    signers: vec![b"g1".to_vec()],
+                    threshold: 1,
+                }),
+            ],
+        };
+        let scam = TokenCharter {
+            token_name: b"SCAM".to_vec(),
+            modules: vec![
+                supply,
+                ModuleKind::Custody(CustodyConfig {
+                    btc_pubkey: b"btc-pk".to_vec(),
+                    pq_pubkey: b"pq-pk".to_vec(),
+                }),
+            ],
+        };
+
+        let ct_a = compile_charter(&usdx);
+        let ct_b = compile_charter(&scam);
+
+        // The raw Supply validator hash IS shared (same cap + issuer_pubkey) — this
+        // is the exact precondition the finding describes.
+        assert_eq!(ct_a.validators[0].validator_hash, ct_b.validators[0].validator_hash);
+        // ... but the policy id (AssetId) must differ, because charter_id differs.
+        assert_ne!(ct_a.charter_id, ct_b.charter_id);
+        assert_ne!(ct_a.policy_id(), ct_b.policy_id());
+        assert!(ct_a.policy_id().is_some());
+        assert!(ct_b.policy_id().is_some());
     }
 
     /// Determinism: the same charter compiles to a byte-identical program set, identical

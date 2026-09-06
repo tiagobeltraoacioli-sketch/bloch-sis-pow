@@ -5,11 +5,27 @@
 //! parent Bitcoin template and to submit a found Bitcoin block; the Bloch side
 //! stays on [`crate::rpc`]. Needs a live `bitcoind` (`-server -rpcuser -rpcpassword`).
 
+use std::time::Duration;
+
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::types::PoolError;
+
+/// M-2 fix (audit finding): total per-call deadline (connect + write + read),
+/// mirroring `crate::rpc::RPC_TIMEOUT`. Before this fix there was no timeout
+/// anywhere in this file — a `bitcoind` that accepted the TCP connection and
+/// then never responded parked the calling task forever, and since
+/// `merged_engine.rs`'s `TemplateCache` holds its mutex across this call, that
+/// permanently deadlocked every merged worker in the process.
+const BTC_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// M-2 fix: largest response this client will buffer. `getblocktemplate` can
+/// carry a couple thousand transactions; anything larger is treated as a
+/// protocol error rather than read unbounded into memory. Mirrors
+/// `crate::rpc::MAX_RESPONSE_BYTES`.
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Minimal Bitcoin RPC client (`addr = host:port`, HTTP Basic Auth).
 #[derive(Clone)]
@@ -88,9 +104,37 @@ impl BtcRpcClient {
     }
 
     /// JSON-RPC-over-HTTP/1.1 with Basic Auth. Mirrors `crate::rpc` transport.
+    ///
+    /// M-2 fix: the whole call (connect + write + read) is now bounded by
+    /// [`BTC_RPC_TIMEOUT`], mirroring `crate::rpc::RpcClient::call`. Before this
+    /// fix a `bitcoind` that accepted the connection and never answered hung
+    /// the calling task — and every merged worker with it, since the cache
+    /// mutex is held across this call (see `merged_engine.rs`).
     async fn call(&self, method: &str, params: Value) -> Result<Value, PoolError> {
+        match tokio::time::timeout(BTC_RPC_TIMEOUT, self.call_inner(method, params)).await {
+            Ok(res) => res,
+            Err(_) => Err(PoolError::Timeout(format!(
+                "btc rpc {} to {} timed out after {:?}",
+                method, self.addr, BTC_RPC_TIMEOUT
+            ))),
+        }
+    }
+
+    async fn call_inner(&self, method: &str, params: Value) -> Result<Value, PoolError> {
         let body = serde_json::json!({ "jsonrpc": "1.0", "id": "pool", "method": method, "params": params })
             .to_string();
+        // M-10 fix (audit finding): `rpc.rs`'s API-key path already filters
+        // CR/LF from a configured secret before splicing it into a header
+        // ("cheap to be safe"); this file did the equivalent Basic-Auth splice
+        // with no such guard. `user`/`pass` are operator configuration, not
+        // request-derived, but a stray control character in either (a typo, a
+        // misquoted env var) would otherwise corrupt the request line / inject
+        // an extra header — reject rather than silently mis-send credentials.
+        if self.user.contains(['\r', '\n']) || self.pass.contains(['\r', '\n']) {
+            return Err(PoolError::Config(
+                "btc rpc: user/pass must not contain CR or LF".into(),
+            ));
+        }
         let auth = base64(format!("{}:{}", self.user, self.pass).as_bytes());
         let head = format!(
             "POST / HTTP/1.1\r\nHost: {host}\r\nAuthorization: Basic {auth}\r\n\
@@ -105,10 +149,8 @@ impl BtcRpcClient {
         let mut s = TcpStream::connect(&self.addr).await?;
         s.write_all(&wire).await?;
         s.flush().await?;
-        let mut raw = Vec::new();
-        // SCAFFOLD: unbounded read for a scaffold; the live path should reuse
-        // crate::rpc's bounded reader.
-        s.read_to_end(&mut raw).await?;
+        // M-2 fix: bounded read (was `read_to_end` with no cap at all).
+        let raw = read_response_bounded(&mut s).await?;
         let _ = s.shutdown().await;
 
         let split = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or_else(|| {
@@ -123,6 +165,28 @@ impl BtcRpcClient {
         }
         json.get("result").cloned().ok_or_else(|| PoolError::Protocol("btc rpc: no result".into()))
     }
+}
+
+/// M-2 fix: read the full response into a buffer capped at
+/// [`MAX_RESPONSE_BYTES`] (peer sends `Connection: close`, so EOF terminates).
+/// Mirrors `crate::rpc::read_response_bounded`. Replaces the previous
+/// `read_to_end`, which had no cap — a slow-drip or malicious `bitcoind` (or a
+/// misconfigured `BLOCH_POOL_BTC_RPC` pointed at an attacker-controlled host)
+/// could otherwise grow this buffer without bound.
+async fn read_response_bounded(stream: &mut TcpStream) -> Result<Vec<u8>, PoolError> {
+    let mut buf = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        if buf.len() + n > MAX_RESPONSE_BYTES {
+            return Err(PoolError::Protocol("btc rpc: response exceeds size cap".to_string()));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(buf)
 }
 
 fn miss(k: &str) -> PoolError {
@@ -169,6 +233,28 @@ mod tests {
         assert_eq!(base64(b"fo"), "Zm8=");
         assert_eq!(base64(b"foo"), "Zm9v");
         assert_eq!(base64(b"user:pass"), "dXNlcjpwYXNz");
+    }
+
+    /// M-10 regression: a CR or LF in the configured RPC user/pass must be
+    /// refused (a config error) rather than silently spliced into the raw
+    /// HTTP request. Checked BEFORE any network I/O, so this never touches a
+    /// real socket.
+    #[tokio::test]
+    async fn crlf_in_credentials_is_refused_before_any_network_io() {
+        let bad_user = BtcRpcClient::new("127.0.0.1:1".into(), "user\r\nX-Evil: 1".into(), "pass".into());
+        let err = bad_user.call_inner("ping", serde_json::json!([])).await.unwrap_err();
+        assert!(matches!(err, PoolError::Config(_)), "expected Config error, got {err:?}");
+
+        let bad_pass = BtcRpcClient::new("127.0.0.1:1".into(), "user".into(), "pa\nss".into());
+        let err2 = bad_pass.call_inner("ping", serde_json::json!([])).await.unwrap_err();
+        assert!(matches!(err2, PoolError::Config(_)), "expected Config error, got {err2:?}");
+
+        // Sanity: an ordinary user/pass is not rejected by this guard (it
+        // still fails, but for a DIFFERENT reason — the connect to port 1
+        // fails — proving the CR/LF check itself does not false-positive).
+        let ok = BtcRpcClient::new("127.0.0.1:1".into(), "user".into(), "pass".into());
+        let err3 = ok.call_inner("ping", serde_json::json!([])).await.unwrap_err();
+        assert!(!matches!(err3, PoolError::Config(_)), "clean credentials must pass the guard: {err3:?}");
     }
 
     #[test]

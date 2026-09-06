@@ -94,8 +94,14 @@ export function createFaucetServer(cfg: FaucetConfig, faucet: Faucet, limiter: R
           return;
         }
 
-        // Rate limit BEFORE doing work.
-        const decision = limiter.check(address, ip);
+        // T-3 fix: reserve-then-confirm, not check-then-record. `reserve` is
+        // fully synchronous (checks AND provisionally records the hit in one
+        // call, before any `await` below), so no concurrent request for
+        // this same address/IP can observe the pre-reservation state — that
+        // is what actually closes the TOCTOU `check`+`record` had (see
+        // ratelimit.ts's module comment for the full race).
+        const reservedAt = Date.now();
+        const decision = limiter.reserve(address, ip, reservedAt);
         if (!decision.allowed) {
           const retryS = Math.ceil((decision.retryAfterMs ?? 0) / 1000);
           res.setHeader("retry-after", String(retryS));
@@ -108,13 +114,27 @@ export function createFaucetServer(cfg: FaucetConfig, faucet: Faucet, limiter: R
           return;
         }
 
-        const result = await faucet.drip(address);
-        if (result.ok) {
-          limiter.record(address, ip);
-          json(res, 200, result);
-        } else {
-          const status = result.code === "faucet_empty" || result.code === "node_error" ? 503 : 400;
-          json(res, status, result);
+        // T-3 fix: `faucet.drip` itself throwing (not just returning
+        // `{ ok: false }`) must ALSO release the reservation — the outer
+        // catch below still reports the 500, but without this the
+        // reservation would be silently stranded (this address/IP
+        // permanently "in flight" until process restart).
+        try {
+          const result = await faucet.drip(address);
+          if (result.ok) {
+            // Reservation stands — the payment actually went out.
+            json(res, 200, result);
+          } else {
+            // The drip did not pay out, so release the reservation — an
+            // address must not be charged a cooldown (nor an IP a slot in
+            // its window) for a request that sent no funds.
+            limiter.release(address, ip, reservedAt);
+            const status = result.code === "faucet_empty" || result.code === "node_error" ? 503 : 400;
+            json(res, status, result);
+          }
+        } catch (e) {
+          limiter.release(address, ip, reservedAt);
+          throw e; // handled by the outer catch (500 + logged)
         }
         return;
       }

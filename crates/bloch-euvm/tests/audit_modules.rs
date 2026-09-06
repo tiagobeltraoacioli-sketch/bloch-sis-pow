@@ -51,8 +51,12 @@ fn ctx() -> Ctx {
 /// ATTACKER-CONTROLLED redeemer slot. Setting that slot to `Int(0)` makes the validator
 /// believe the output is NOT frozen, so it allows the spend of a FROZEN output with NO
 /// authority signature. The regulated-token freeze/allow control is fully defeated.
+// H-6b fix (Annex A6 §2): renamed from `transfer_policy_freeze_is_bypassed_by_padding_the_redeemer`
+// — the assertion below is `Err(Assert)` (the bypass is CLOSED by `Op::ExpectDepth`),
+// not the live bypass the old name describes. The doc comment above (kept verbatim)
+// already carries the original finding text and the "assertion was inverted" note.
 #[test]
-fn transfer_policy_freeze_is_bypassed_by_padding_the_redeemer() {
+fn transfer_policy_freeze_bypass_via_padded_redeemer_is_closed() {
     let cm = &compile_charter(&TokenCharter {
         token_name: b"REG".to_vec(),
         modules: vec![ModuleKind::TransferPolicy(TransferPolicyConfig {

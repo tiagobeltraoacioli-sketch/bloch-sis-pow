@@ -120,8 +120,11 @@ fn dup_amplifies_memory_independent_of_gas() {
 /// not a DoS, so it passes the structural resource ceilings and the (bounded)
 /// conservation scan runs and reports the imbalance. This pins that the F2 ceilings do
 /// NOT reject legitimate small transactions — they only bound adversarial-scale ones.
+// H-6b fix (Annex A6 §2): renamed from `conservation_scan_is_unmetered_runs_with_zero_gas`
+// — the body pins that a SMALL tx is still correctly bounded/validated (the fixed,
+// non-DoS case), not that scanning is unbounded. Finding text preserved above.
 #[test]
-fn conservation_scan_is_unmetered_runs_with_zero_gas() {
+fn small_tx_within_ceilings_validates_correctly_at_zero_gas() {
     let anyone = vec![Op::PushInt(1)];
     let vh = validator_hash(&anyone);
     let tx = EuTx {

@@ -97,7 +97,7 @@ pub struct Finding {
 /// `findings` is sorted by `(severity, code, index, message)` — a total, deterministic
 /// order with no `HashMap` anywhere — so the same charter always yields a byte-identical
 /// report. `denied` is `true` iff any finding is [`Severity::Deny`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuditReport {
     /// All findings, in canonical `(severity, code, index, message)` order.
     pub findings: Vec<Finding>,

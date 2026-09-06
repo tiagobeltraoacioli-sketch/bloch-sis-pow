@@ -21,6 +21,7 @@
 //!   testing; release builds refuse those overrides.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::{DefaultBodyLimit, State},
@@ -29,9 +30,41 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use bincode::Options as _;
 use coherence_core::{check_spend, SpendPublic, SpendWitness};
 use serde::{Deserialize, Serialize};
 use sp1_sdk::{Prover, ProverClient, SP1Stdin};
+use tower::limit::ConcurrencyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
+
+/// P-4 fix: pre-decode ceiling on the base64 wire form of a `/verify` proof,
+/// checked BEFORE any base64 decode is attempted (cheapest-check-first). Sized
+/// generously above [`MAX_VERIFY_PROOF_BYTES`] to account for base64 expansion
+/// (~4/3) plus JSON/whitespace overhead.
+const MAX_VERIFY_B64_LEN: usize = 24 * 1024 * 1024; // 24 MiB
+/// P-4 fix: ceiling on the DECODED proof bytes handed to `bincode`. bincode 1.x's
+/// default configuration applies no length limit at all, so an attacker-chosen
+/// stream under this cap can still drive large speculative allocations during
+/// decode; `bincode::DefaultOptions::with_limit` bounds that directly. 16 MiB is
+/// generous headroom over a realistic SP1 core proof (P-9: multi-megabyte,
+/// growing with shard count) while still bounding the worst case.
+const MAX_VERIFY_PROOF_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB
+/// P-4 fix: wall-clock deadline for `/verify` — cheap relative to `/prove`, so a
+/// short timeout is appropriate; a hung verify (e.g. a pathological proof shape)
+/// must not hold a connection (and, on `hard_limit = 1`, the whole machine) open
+/// indefinitely.
+const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
+/// P-4 fix: wall-clock deadline for `/prove`. Generous — CPU proving of a real
+/// spend circuit can legitimately take minutes — but finite: an unbounded
+/// `block_in_place` call had no wall-clock cap at all before this fix.
+const PROVE_TIMEOUT: Duration = Duration::from_secs(1800); // 30 min
+/// P-4 fix: per-route concurrency ceiling. `fly.toml` already runs one machine
+/// (`hard_limit = 1`), so this is defence in depth against a future deployment
+/// profile that raises it, and it bounds in-process concurrent GPU/CPU work
+/// regardless of the caller's identity — a coarser, always-on backstop to the
+/// per-token limiting a future iteration could add.
+const MAX_CONCURRENT_PROVES: usize = 2;
+const MAX_CONCURRENT_VERIFIES: usize = 8;
 
 /// The guest ELF, built by `cargo prove build` in ../program (baked at image
 /// build time).
@@ -214,10 +247,23 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
-        .route("/prove", post(prove))
-        .route("/verify", post(verify))
-        // Witnesses + proofs are large; allow a generous body.
-        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+        .route(
+            "/prove",
+            post(prove)
+                // Witnesses + proofs are large; allow a generous body.
+                .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+                .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, PROVE_TIMEOUT))
+                .layer(ConcurrencyLimitLayer::new(MAX_CONCURRENT_PROVES)),
+        )
+        .route(
+            "/verify",
+            post(verify)
+                // P-4 fix: /verify carries no witness, only a proof — a much
+                // smaller body limit than /prove's, scoped to this route only.
+                .layer(DefaultBodyLimit::max(MAX_VERIFY_B64_LEN + 4096))
+                .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, VERIFY_TIMEOUT))
+                .layer(ConcurrencyLimitLayer::new(MAX_CONCURRENT_VERIFIES)),
+        )
         .with_state(state);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
@@ -242,6 +288,12 @@ struct ProveResp {
 #[derive(Deserialize)]
 struct VerifyReq {
     proof_b64: String,
+    /// P-5 fix: which statement the caller is asking about. Without this, the
+    /// endpoint could only answer "some valid spend proof exists for this
+    /// guest", not "this proof authorises the spend you are asking about" —
+    /// any caller gating a decision on `/verify` was trivially fooled by
+    /// replaying any previously issued proof.
+    public: SpendPublic,
 }
 
 #[derive(Serialize)]
@@ -291,13 +343,62 @@ async fn verify(
     if !tls_ok(&state, &headers) {
         return Err((StatusCode::UPGRADE_REQUIRED, "TLS required; use https".into()));
     }
+    // P-4 fix: `/verify` used to have NO auth check at all (`authorized()` was
+    // called only from `prove`), so an unauthenticated caller could reach it —
+    // and on a scale-to-zero deployment, wake a billed GPU machine for free.
+    if !authorized(&state, &headers) {
+        return Err((StatusCode::UNAUTHORIZED, "bad or missing bearer token".into()));
+    }
+    // P-4 fix: cheapest check first — reject an oversized wire payload before
+    // spending a single cycle on base64.
+    if req.proof_b64.len() > MAX_VERIFY_B64_LEN {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("proof_b64 exceeds {MAX_VERIFY_B64_LEN} bytes"),
+        ));
+    }
     let bytes = B64
         .decode(req.proof_b64.as_bytes())
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad base64: {e}")))?;
-    let proof = unbincode_proof(&bytes).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    // Raw core STARK only — a mock/wrapped proof is invalid by shape.
+    // P-4 fix: independent cap on the DECODED bytes (defence in depth — base64
+    // decoding cannot expand, but this keeps the invariant explicit rather than
+    // implied by the encoded-length check above).
+    if bytes.len() as u64 > MAX_VERIFY_PROOF_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("decoded proof exceeds {MAX_VERIFY_PROOF_BYTES} bytes"),
+        ));
+    }
+    let proof = unbincode_proof_bounded(&bytes).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+    // Raw core STARK only — a mock/wrapped proof is invalid by shape (P-6/P-7:
+    // cheap, before the expensive cryptographic verify below).
     let is_core = matches!(&proof.proof, sp1_sdk::SP1Proof::Core(shards) if !shards.is_empty());
-    let valid = is_core && state.client.verify(&proof, &state.vk).is_ok();
+    if !is_core {
+        return Ok(Json(VerifyResp { valid: false }));
+    }
+
+    // P-5 fix: bind the proof to the caller's claimed statement BEFORE running
+    // the expensive cryptographic verify — a byte-exact comparison of the
+    // proof's committed public values against the canonical (bincode) encoding
+    // of `req.public`. This is the SAME encoding `SP1PublicValues::write`
+    // (called by the guest's `sp1_zkvm::io::commit(&public)`) produces, so a
+    // proof that genuinely commits to `req.public` always matches here; nothing
+    // about this comparison is cryptographic on its own (an attacker can put
+    // anything in `proof.public_values`), but the follow-up `client.verify`
+    // call is what actually proves the STARK ties the two together — this
+    // check exists so a MISMATCHED (proof, public) pair is rejected without
+    // ever reaching that expensive call.
+    let expected_public = bincode::serialize(&req.public)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("encode public: {e}")))?;
+    if proof.public_values.as_slice() != expected_public.as_slice() {
+        return Ok(Json(VerifyResp { valid: false }));
+    }
+
+    // The expensive cryptographic check, run LAST (cheapest-check-first): only
+    // reached once the proof has already passed every cheap structural and
+    // statement-identity check above.
+    let valid = state.client.verify(&proof, &state.vk).is_ok();
     Ok(Json(VerifyResp { valid }))
 }
 
@@ -305,8 +406,18 @@ async fn verify(
 fn bincode_proof(p: &sp1_sdk::SP1ProofWithPublicValues) -> Result<Vec<u8>, String> {
     bincode::serialize(p).map_err(|e| format!("serialize proof: {e}"))
 }
-fn unbincode_proof(b: &[u8]) -> Result<sp1_sdk::SP1ProofWithPublicValues, String> {
-    bincode::deserialize(b).map_err(|e| format!("deserialize proof: {e}"))
+
+/// P-4 fix: decode with an explicit size limit. bincode 1.x's default
+/// (`bincode::deserialize`, used here previously) applies NO length limit, so a
+/// crafted stream well under a body-size cap can still drive large speculative
+/// allocations and deep nested decodes during deserialization itself — the body
+/// limit bounds bytes read off the wire, not memory bincode may try to allocate
+/// while interpreting them. `with_limit` bounds the latter directly.
+fn unbincode_proof_bounded(b: &[u8]) -> Result<sp1_sdk::SP1ProofWithPublicValues, String> {
+    bincode::DefaultOptions::new()
+        .with_limit(MAX_VERIFY_PROOF_BYTES)
+        .deserialize(b)
+        .map_err(|e| format!("deserialize proof: {e}"))
 }
 
 #[cfg(test)]

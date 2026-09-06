@@ -612,7 +612,33 @@ async fn landing() -> Html<&'static str> {
     Html(LANDING_HTML)
 }
 
+/// L-16 fix (audit finding): per-request wall-clock deadline. Every route
+/// here does real, CPU-expensive work (P2WSH script assembly and, on
+/// `/anchor/verify`, a hybrid ML-DSA-65 ‖ Falcon-1024 verification) with no
+/// authentication and no rate limiting in front of it (`main.rs` binds
+/// `PQ_SHIELD_BIND`, which accepts `0.0.0.0`). A timeout bounds any single
+/// request's worst case; it does not by itself bound aggregate concurrent
+/// load, which is what [`MAX_CONCURRENT_REQUESTS`] is for.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// L-16 fix: ceiling on requests being handled at once, so a burst of
+/// concurrent callers cannot each start an expensive verify/assembly and
+/// collectively exhaust CPU. This is a non-custodial construction/
+/// verification service with no per-caller identity to rate-limit by, so a
+/// single process-wide ceiling is the appropriate coarse control here — the
+/// L-16 fix also documents that a TLS-terminating reverse proxy in front of
+/// this service (which itself speaks plain HTTP) is a deployment
+/// requirement, not optional hardening.
+const MAX_CONCURRENT_REQUESTS: usize = 64;
+
 /// Build the router. Exposed so integration tests can drive it in-process.
+///
+/// **Deployment note (L-16 fix):** this service speaks plain HTTP and
+/// performs no authentication of its own by design (it is a non-custodial
+/// construction/verification tool, not a secrets-holding service) — running
+/// it reachable from an untrusted network REQUIRES a TLS-terminating
+/// reverse proxy in front of it (the same requirement `coherence-prover`'s
+/// service documents for its own HTTP surface). `PQ_SHIELD_BIND=0.0.0.0`
+/// binds every interface; do this only behind such a proxy.
 pub fn router() -> Router {
     Router::new()
         .route("/", get(landing))
@@ -623,6 +649,11 @@ pub fn router() -> Router {
         .route("/vault/clawback-tx", post(clawback_tx))
         .route("/anchor/commitment", post(anchor_commitment))
         .route("/anchor/verify", post(anchor_verify))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            REQUEST_TIMEOUT,
+        ))
+        .layer(tower::limit::ConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS))
 }
 
 #[cfg(test)]
@@ -914,6 +945,30 @@ mod tests {
         assert!(guard_no_secrets(&json!({"ok": 1, "nested": {"mnemonic": "x"}})).is_err());
         assert!(guard_no_secrets(&json!([{"wif": "x"}])).is_err());
         assert!(guard_no_secrets(&json!({"hot_pubkey":"02..","recovery_hash":"..."})).is_ok());
+    }
+
+    /// L-16 regression: the whole point of the fix is a `TimeoutLayer` +
+    /// `ConcurrencyLimitLayer` wrapping the ENTIRE router (every route, not
+    /// just handlers called directly as in the tests above). This drives a
+    /// real HTTP request through `router()` — layers included — via
+    /// `tower::Service::call`, the same trait axum's `Router` implements
+    /// and the same path a real TCP connection takes. Before this fix there
+    /// was no such layer at all; the regression this guards against is the
+    /// layer composition breaking ordinary request handling (a type
+    /// mismatch or a mis-ordered layer stack would make EVERY request fail,
+    /// not just a slow/concurrent one).
+    #[tokio::test]
+    async fn router_with_timeout_and_concurrency_layers_still_serves_health() {
+        use tower::util::ServiceExt as _;
+
+        let app = router();
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/health")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.expect("router must still serve a request");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
     }
 }
 

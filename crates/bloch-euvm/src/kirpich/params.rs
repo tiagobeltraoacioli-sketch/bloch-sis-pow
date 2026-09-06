@@ -20,6 +20,7 @@
 //! | KRP-043 | Deny     | vesting    | `unlock_height <= 0` — the height gate is open at every real block height |
 //! | KRP-044 | Deny     | supply     | `cap == 0` — no mint can authorise a positive amount; the token can never be issued |
 //! | KRP-045 | Deny     | governance | a signer pubkey is empty — that slot can never verify a signature |
+//! | KRP-046 | Deny     | any        | a pubkey-shaped field exceeds [`MAX_PUBKEY_BYTES`], or the charter's total pubkey bytes exceed [`MAX_TOTAL_PUBKEY_BYTES`] (K-3 fix, see [`pubkey_budget_denied`]) |
 //!
 //! ## Finding / Severity shape (for the Integrate phase)
 //!
@@ -52,6 +53,106 @@ use crate::modules::{ModuleKind, TokenCharter};
 /// the just-pushed pubkey instead of the signature slot — a silent liveness defect.
 const MAX_GOVERNANCE_SIGNERS: usize = 253;
 
+/// K-3 fix: ceiling on any single pubkey-shaped byte field in a charter (governance
+/// signer, issuer/authority/beneficiary/btc/pq pubkey). Real PQ pubkeys are far
+/// smaller — raw Falcon-1024 ~1.8 KiB, raw ML-DSA-65 ~2 KiB, an enveloped hybrid a
+/// few KiB more — so 8 KiB is generous headroom while still bounding the allocation
+/// a malformed or hostile charter can force: every pubkey field is cloned verbatim
+/// into an `Op::PushBytes` when `modules.rs` compiles the charter, so an unbounded
+/// pubkey is an unbounded per-validator allocation.
+const MAX_PUBKEY_BYTES: usize = 8192;
+
+/// K-3 fix: ceiling on the SUM of every pubkey-shaped byte field across the whole
+/// charter. Chosen to mirror `emitted.rs`'s `MAX_TOTAL_BYTES` compiled-program
+/// budget (256 KiB): if the raw pubkeys alone already exceed the total budget a
+/// compiled validator set is allowed to occupy, compiling to find that out is pure
+/// waste. Duplicated as its own constant (not imported from `emitted.rs`) to keep
+/// the two lanes independent, per this module's contract.
+const MAX_TOTAL_PUBKEY_BYTES: usize = 262_144;
+
+/// Every pubkey-shaped byte field this charter carries: `(module_index, label,
+/// bytes)`, in charter order. Governance emits one entry per signer (all sharing the
+/// module's index — KRP-046 does not need per-signer granularity, only per-module).
+fn pubkey_fields(charter: &TokenCharter) -> Vec<(usize, &'static str, &[u8])> {
+    let mut out = Vec::new();
+    for (idx, module) in charter.modules.iter().enumerate() {
+        match module {
+            ModuleKind::Supply(c) => out.push((idx, "issuer_pubkey", c.issuer_pubkey.as_slice())),
+            ModuleKind::TransferPolicy(c) => {
+                out.push((idx, "authority_pubkey", c.authority_pubkey.as_slice()))
+            }
+            ModuleKind::ComplianceKycGate(_) => {}
+            ModuleKind::Vesting(c) => {
+                out.push((idx, "beneficiary_pubkey", c.beneficiary_pubkey.as_slice()))
+            }
+            ModuleKind::Governance(c) => {
+                for s in &c.signers {
+                    out.push((idx, "governance signer pubkey", s.as_slice()));
+                }
+            }
+            ModuleKind::Custody(c) => {
+                out.push((idx, "btc_pubkey", c.btc_pubkey.as_slice()));
+                out.push((idx, "pq_pubkey", c.pq_pubkey.as_slice()));
+            }
+        }
+    }
+    out
+}
+
+/// K-3 fix, cheap pre-flight used by BOTH this lane (to emit KRP-046) and Lane D
+/// (`emitted.rs::audit`, to skip its own compile entirely). Pure length arithmetic
+/// over slice lengths — no allocation, no compile — so it is safe to run even on a
+/// charter engineered to be maximally oversized. `u128` avoids any overflow concern
+/// summing up to `usize::MAX` `usize` lengths on a 32-bit target; `saturating_add`
+/// keeps it total regardless.
+pub(super) fn pubkey_budget_denied(charter: &TokenCharter) -> bool {
+    let mut total: u128 = 0;
+    for (_, _, bytes) in pubkey_fields(charter) {
+        if bytes.len() > MAX_PUBKEY_BYTES {
+            return true;
+        }
+        total = total.saturating_add(bytes.len() as u128);
+    }
+    total > MAX_TOTAL_PUBKEY_BYTES as u128
+}
+
+/// KRP-046: emit the Deny finding(s) backing [`pubkey_budget_denied`]'s verdict, with
+/// full detail (which field, which module, how many bytes over).
+fn audit_pubkey_bytes(charter: &TokenCharter, out: &mut Vec<Finding>) {
+    let fields = pubkey_fields(charter);
+    let mut total: u128 = 0;
+    for (idx, label, bytes) in &fields {
+        total = total.saturating_add(bytes.len() as u128);
+        if bytes.len() > MAX_PUBKEY_BYTES {
+            out.push(deny(
+                "KRP-046",
+                charter.modules[*idx].tag(),
+                *idx,
+                format!(
+                    "{label} is {} bytes (> {MAX_PUBKEY_BYTES}): a charter-supplied \
+                     pubkey this large is a structural foot-gun (unbounded allocation \
+                     when Lane D compiles it into Op::PushBytes), not a real key",
+                    bytes.len()
+                ),
+            ));
+        }
+    }
+    if total > MAX_TOTAL_PUBKEY_BYTES as u128 {
+        out.push(Finding {
+            code: "KRP-046",
+            severity: Severity::Deny,
+            module: None,
+            index: None,
+            message: format!(
+                "sum of all pubkey-shaped fields in this charter is {total} bytes \
+                 (> {MAX_TOTAL_PUBKEY_BYTES}): compiling would already exceed Lane D's \
+                 total emitted-bytes budget (KRP-062), so the charter is denied before \
+                 any compile is attempted"
+            ),
+        });
+    }
+}
+
 /// Build a module-scoped Deny finding. `tag` is `ModuleKind::tag()` (`&'static str`);
 /// `index` is the module's position in `charter.modules`.
 fn deny(code: &'static str, tag: &'static str, index: usize, message: String) -> Finding {
@@ -68,6 +169,9 @@ fn deny(code: &'static str, tag: &'static str, index: usize, message: String) ->
 /// panics. Walks `charter.modules` in order (index-stable) and applies rules
 /// KRP-040..=KRP-045 to each module's scalar config.
 pub(super) fn audit(charter: &TokenCharter, out: &mut Vec<Finding>) {
+    // KRP-046 first, cheapest-check-first: pure length arithmetic, no compile.
+    audit_pubkey_bytes(charter, out);
+
     for (idx, module) in charter.modules.iter().enumerate() {
         let tag = module.tag(); // stable &'static str, e.g. "governance"
         match module {
@@ -613,6 +717,100 @@ mod tests {
         assert_eq!(f.iter().find(|x| x.code == "KRP-043").unwrap().index, Some(4));
         assert_eq!(f.iter().find(|x| x.code == "KRP-041").unwrap().index, Some(5));
         assert_eq!(f.iter().find(|x| x.code == "KRP-042").unwrap().index, Some(5));
+    }
+
+    // ── KRP-046 pubkey size pre-flight (K-3 fix) ──────────────────────────────
+
+    #[test]
+    fn krp046_oversized_single_pubkey_denies() {
+        let big = vec![0u8; MAX_PUBKEY_BYTES + 1];
+        let f = run(vec![ModuleKind::Supply(SupplyConfig {
+            cap: 100,
+            issuer_pubkey: big,
+        })]);
+        assert!(has(&f, "KRP-046"), "{:?}", codes(&f));
+        let d = f.iter().find(|x| x.code == "KRP-046").unwrap();
+        assert_eq!(d.severity, Severity::Deny);
+        assert_eq!(d.index, Some(0));
+        assert!(pubkey_budget_denied(&TokenCharter {
+            token_name: b"T".to_vec(),
+            modules: vec![ModuleKind::Supply(SupplyConfig {
+                cap: 100,
+                issuer_pubkey: vec![0u8; MAX_PUBKEY_BYTES + 1],
+            })],
+        }));
+    }
+
+    #[test]
+    fn krp046_pubkey_at_the_ceiling_passes() {
+        let ok = vec![0u8; MAX_PUBKEY_BYTES];
+        let f = run(vec![ModuleKind::Supply(SupplyConfig {
+            cap: 100,
+            issuer_pubkey: ok,
+        })]);
+        assert!(!has(&f, "KRP-046"), "exactly at the ceiling must pass: {:?}", codes(&f));
+    }
+
+    #[test]
+    fn krp046_total_bytes_over_budget_denies_even_when_each_field_is_small() {
+        // Each signer is well under MAX_PUBKEY_BYTES individually, but there are
+        // enough of them that the SUM exceeds MAX_TOTAL_PUBKEY_BYTES.
+        let n = MAX_TOTAL_PUBKEY_BYTES / 1024 + 8;
+        let signers: Vec<Vec<u8>> = (0..n).map(|_| vec![0xABu8; 1024]).collect();
+        let charter = TokenCharter {
+            token_name: b"T".to_vec(),
+            modules: vec![ModuleKind::Governance(GovernanceConfig {
+                signers,
+                threshold: 1,
+            })],
+        };
+        let mut f = Vec::new();
+        audit(&charter, &mut f);
+        assert!(has(&f, "KRP-046"), "{:?}", codes(&f));
+        // charter-level (spans multiple values), not tied to one module index
+        let d = f.iter().find(|x| x.code == "KRP-046").unwrap();
+        assert_eq!(d.module, None);
+        assert_eq!(d.index, None);
+        assert!(pubkey_budget_denied(&charter));
+    }
+
+    #[test]
+    fn krp046_ordinary_charter_passes() {
+        let f = run(vec![gov(pks(3), 2)]);
+        assert!(!has(&f, "KRP-046"), "{:?}", codes(&f));
+    }
+
+    /// K-3 regression: red before the fix (Lane D compiled the oversized charter
+    /// TWICE, unconditionally, before any budget rule could fire — a charter with
+    /// enough oversized pubkeys could cost gigabytes of transient allocation before
+    /// a single Finding came out), green after (Lane D's `emitted::audit` consults
+    /// the SAME cheap `pubkey_budget_denied` check and returns before compiling —
+    /// see `crate::kirpich::emitted::audit`). We cannot directly observe "did not
+    /// allocate a gigabyte" in a unit test, so this asserts the externally visible
+    /// consequence instead: when the pre-flight denies, none of Lane D's own codes
+    /// (KRP-060..=KRP-064, which require a successful compile to evaluate) appear in
+    /// the full `kirpich_audit` report — proving the compile was skipped, not just
+    /// that its result was discarded.
+    #[test]
+    fn krp046_denial_skips_lane_d_compile_entirely() {
+        let charter = TokenCharter {
+            token_name: b"T".to_vec(),
+            modules: vec![ModuleKind::Supply(SupplyConfig {
+                cap: 100,
+                issuer_pubkey: vec![0u8; MAX_PUBKEY_BYTES + 1],
+            })],
+        };
+        let report = crate::kirpich::kirpich_audit(&charter);
+        assert!(report.denied);
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|f| !f.code.starts_with("KRP-06")),
+            "Lane D must not have run (no KRP-06x finding expected) when KRP-046 \
+             already denies: {:?}",
+            report.findings.iter().map(|f| f.code).collect::<Vec<_>>()
+        );
     }
 
     #[test]

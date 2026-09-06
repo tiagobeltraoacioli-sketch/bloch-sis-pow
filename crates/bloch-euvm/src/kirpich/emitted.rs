@@ -80,6 +80,21 @@ const MAX_GOVERNANCE_SIGNERS: usize = 253;
 /// Lane D audit: compile the charter (twice, to assert determinism) and inspect the
 /// emitted bytes. Append-only into `out`; never panics on any charter input.
 pub(super) fn audit(charter: &TokenCharter, out: &mut Vec<Finding>) {
+    // K-3 fix: skip compilation entirely when Lane C's KRP-046 pre-flight already
+    // denies the charter on pubkey size alone. Before this guard, Lane D compiled
+    // the charter TWICE unconditionally (for the KRP-060 determinism diff below)
+    // regardless of what any other lane found — a charter with, say, 253 governance
+    // signers of 1 MiB each cost ~1 GiB of transient allocation here even though
+    // Lane C's own rule would already deny it. `pubkey_budget_denied` is pure
+    // length arithmetic (no allocation, no compile), so it is safe to run first
+    // unconditionally: cheapest-check-first. Lane C (`params.rs`) has already
+    // pushed the KRP-046 Deny finding(s) with full detail into the shared `out` by
+    // the time this lane runs (`kirpich.rs` calls `params::audit` before
+    // `emitted::audit`), so nothing is lost by returning without compiling.
+    if super::params::pubkey_budget_denied(charter) {
+        return;
+    }
+
     // Two independent compiles of the same charter — the input to KRP-060. This is an
     // acceptable extra deterministic compile on this tests-only audit path.
     let compiled = compile_charter(charter);
@@ -127,23 +142,219 @@ fn program_bytes(program: &[Op]) -> usize {
     encode_program(program).len()
 }
 
-/// Detect a program whose spend verdict is a **compile-time constant**, independent of
-/// datum / redeemer / ctx: it ends in a literal `PushInt(n)` and contains no `Verify`
-/// (so no earlier assertion can abort it). `Some(true)` ⇒ always authorizes (neutered),
-/// `Some(false)` ⇒ never authorizes (structurally unspendable), `None` ⇒ input-dependent.
+// ─────────────────────────────────────────────────────────────────────────────
+// K-4 fix: a small, bounded, straight-line abstract interpreter over the emitted
+// program, replacing the old literal-`PushInt`-tail heuristic.
+//
+// The old `constant_tail_verdict` matched ONLY a literal `PushInt` in the final
+// slot — sound (never a false positive) but not complete: it missed the exact case
+// the finding names, `Governance { signers: [], threshold: 0 }`, whose emitted tail
+// is `PushInt(0), PushInt(0), Lt, Not` (§2.3 of the annex) — a compile-time-constant
+// TRUE verdict expressed through arithmetic, not a literal push. Any future/
+// third-party emitter that bakes a constant verdict through `Add`/`Sub`/`Mul`/`Eq`/
+// `Swap`/`Dup`/`Pick` in any shape was equally invisible to it.
+//
+// `AbsVal` models one stack slot: a compile-time-KNOWN `Int`/`Bytes` value, or
+// `Unknown` (⊤) standing for anything that depends on the datum, the redeemer, or
+// context (`CtxField`, `VerifySig`/`VerifyEcdsa`, `Sha256d`/`Shake256` output, any
+// `TxOut*`/`Self*` read). The programs Kirpich audits are straight-line (no
+// branches, no loops) and bounded (`MAX_PROGRAM_OPS` in `lib.rs`), so a single
+// linear pass with a real stack is a complete, terminating, deterministic
+// evaluation — no fixed point / widening needed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AbsVal {
+    Int(i128),
+    Bytes(Vec<u8>),
+    /// ⊤ — depends on the datum, redeemer, or transaction context; not a
+    /// compile-time constant.
+    Unknown,
+}
+
+impl AbsVal {
+    fn as_known_int(&self) -> Option<i128> {
+        match self {
+            AbsVal::Int(n) => Some(*n),
+            _ => None,
+        }
+    }
+}
+
+/// Evaluate `program` over an abstract stack seeded with `Unknown` values (standing
+/// in for whatever real datum/redeemer the `ExpectDepth` at the head of the program
+/// asserts is present — see below), constant-folding every op the interpreter
+/// understands and falling back to `Unknown` for anything it does not (signature
+/// verification, hashing, context/tx-output reads). Returns:
 ///
-/// This is intentionally *sound, not complete*: it only fires on genuinely constant
-/// tails, so it never false-positives on the six real emitters (each ends in
-/// `VerifySig` / `Lt` / `Eq` / `Not`), while still catching a degenerate/future emitter
-/// that bakes a constant verdict.
+/// * `Some(true)`  — the program's final verdict is a compile-time constant TRUE:
+///   it authorizes every possible spend, regardless of datum/redeemer/ctx.
+/// * `Some(false)` — the program's final verdict is a compile-time constant FALSE,
+///   OR it unconditionally hits an `Op::Verify` on a known-zero value and so always
+///   aborts: it authorizes no spend.
+/// * `None`        — the verdict is genuinely input-dependent (the sound default;
+///   never a false positive by construction, since every arm below only commits to
+///   `Some(_)` when every operand it needs was already `Known`).
+///
+/// **Deliberately conservative, not exhaustive** (documented gaps, same spirit as
+/// the heuristic this replaces): `Sha256d`/`Shake256` always yield `Unknown` even on
+/// a `Known` input (no reason to fold through a hash); `VerifySig`/`VerifyEcdsa`
+/// always yield `Unknown` (their range is `{0,1}` but this pass does no interval
+/// reasoning, so e.g. `threshold > signers.len()` — always-false only because the
+/// summed verdict is bounded by `signers.len()` — is NOT caught; this is the same
+/// documented gap the old heuristic had). A malformed/adversarial program never
+/// panics: every stack access that would underflow is treated as `Unknown` rather
+/// than erroring, matching the "no rule panics on any charter" contract.
 fn constant_tail_verdict(program: &[Op]) -> Option<bool> {
-    if program.iter().any(|op| matches!(op, Op::Verify)) {
-        return None;
+    let mut st: Vec<AbsVal> = Vec::new();
+
+    // Pop helper: an empty/underflowing stack models "a real seed value we do not
+    // track" (e.g. reading below the deepest `ExpectDepth`-asserted slot) — treat it
+    // as Unknown rather than panicking or aborting the analysis.
+    fn pop(st: &mut Vec<AbsVal>) -> AbsVal {
+        st.pop().unwrap_or(AbsVal::Unknown)
     }
-    match program.last() {
-        Some(Op::PushInt(n)) => Some(*n != 0),
-        _ => None,
+    fn pick(st: &[AbsVal], n: usize) -> AbsVal {
+        match st.len().checked_sub(1 + n) {
+            Some(idx) => st[idx].clone(),
+            None => AbsVal::Unknown,
+        }
     }
+
+    for op in program {
+        match op {
+            Op::PushInt(n) => st.push(AbsVal::Int(*n)),
+            Op::PushBytes(b) => st.push(AbsVal::Bytes(b.clone())),
+            Op::Dup => {
+                let top = st.last().cloned().unwrap_or(AbsVal::Unknown);
+                st.push(top);
+            }
+            Op::Drop => {
+                pop(&mut st);
+            }
+            Op::Swap => {
+                let a = pop(&mut st);
+                let b = pop(&mut st);
+                st.push(a);
+                st.push(b);
+            }
+            Op::ExpectDepth(n) => {
+                // Models the implicit seed [datum, redeemer...] this op asserts is
+                // present: pad the BOTTOM of the abstract stack with Unknown up to
+                // depth n, so later Pick/Dup into that region reads Unknown rather
+                // than underflowing. Does not touch an already-deep-enough stack.
+                let n = *n as usize;
+                if st.len() < n {
+                    let pad = n - st.len();
+                    let mut padded = vec![AbsVal::Unknown; pad];
+                    padded.extend(st.drain(..));
+                    st = padded;
+                }
+            }
+            Op::Pick(n) => {
+                let v = pick(&st, *n as usize);
+                st.push(v);
+            }
+            Op::Add | Op::Sub | Op::Mul => {
+                let b = pop(&mut st);
+                let a = pop(&mut st);
+                let r = match (a.as_known_int(), b.as_known_int()) {
+                    (Some(a), Some(b)) => {
+                        let checked = match op {
+                            Op::Add => a.checked_add(b),
+                            Op::Sub => a.checked_sub(b),
+                            Op::Mul => a.checked_mul(b),
+                            _ => unreachable!(),
+                        };
+                        // A checked-arithmetic overflow here is over compile-time
+                        // CONSTANT operands, so it would abort the real program
+                        // deterministically for every input too — but this pass does
+                        // not attempt to represent "always aborts via Overflow" (only
+                        // via a known-zero `Verify`, see below), so fold to Unknown
+                        // rather than over-claim a verdict this analysis is not
+                        // built to justify.
+                        checked.map(AbsVal::Int).unwrap_or(AbsVal::Unknown)
+                    }
+                    _ => AbsVal::Unknown,
+                };
+                st.push(r);
+            }
+            Op::Eq => {
+                let b = pop(&mut st);
+                let a = pop(&mut st);
+                let r = match (&a, &b) {
+                    (AbsVal::Int(x), AbsVal::Int(y)) => AbsVal::Int((x == y) as i128),
+                    (AbsVal::Bytes(x), AbsVal::Bytes(y)) => AbsVal::Int((x == y) as i128),
+                    _ => AbsVal::Unknown,
+                };
+                st.push(r);
+            }
+            Op::Lt => {
+                let b = pop(&mut st);
+                let a = pop(&mut st);
+                let r = match (a.as_known_int(), b.as_known_int()) {
+                    (Some(a), Some(b)) => AbsVal::Int((a < b) as i128),
+                    _ => AbsVal::Unknown,
+                };
+                st.push(r);
+            }
+            Op::Not => {
+                let a = pop(&mut st);
+                let r = match a.as_known_int() {
+                    Some(a) => AbsVal::Int((a == 0) as i128),
+                    None => AbsVal::Unknown,
+                };
+                st.push(r);
+            }
+            Op::Size => {
+                let a = pop(&mut st);
+                let r = match a {
+                    AbsVal::Bytes(b) => AbsVal::Int(b.len() as i128),
+                    _ => AbsVal::Unknown,
+                };
+                st.push(r);
+            }
+            Op::Verify => {
+                let a = pop(&mut st);
+                match a.as_known_int() {
+                    // A known-zero operand means this Verify aborts EVERY time this
+                    // op runs, regardless of datum/redeemer/ctx (the value that fed
+                    // it was itself a compile-time constant) — the whole program is
+                    // therefore unconditionally unspendable.
+                    Some(0) => return Some(false),
+                    // A known-nonzero operand never aborts; continue folding.
+                    Some(_) => {}
+                    // An Unknown operand might or might not abort depending on real
+                    // input — cannot prove either verdict, bail conservatively
+                    // (matches the old heuristic's blanket bail on any `Verify`).
+                    None => return None,
+                }
+            }
+            // Everything below reads real cryptographic material, hashes,
+            // context, or transaction outputs — none of it is a compile-time
+            // constant in this analysis. Pop the declared arity, push Unknown.
+            Op::Sha256d | Op::Shake256 => {
+                pop(&mut st);
+                st.push(AbsVal::Unknown);
+            }
+            Op::CtxField(_) | Op::TxOutDatum(_) | Op::TxOutValidator(_) | Op::TxOutValue(_)
+            | Op::SelfValidator => {
+                st.push(AbsVal::Unknown);
+            }
+            Op::SelfAsset | Op::TxOutAsset(_) => {
+                pop(&mut st);
+                st.push(AbsVal::Unknown);
+            }
+            Op::VerifySig | Op::VerifyEcdsa => {
+                pop(&mut st);
+                pop(&mut st);
+                pop(&mut st);
+                st.push(AbsVal::Unknown);
+            }
+        }
+    }
+
+    st.last().and_then(AbsVal::as_known_int).map(|n| n != 0)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -799,6 +1010,110 @@ mod tests {
                 v.kind
             );
         }
+    }
+
+    /// K-4 regression: red before the fix (the old literal-`PushInt`-tail heuristic
+    /// only matched a bare `PushInt`, so it missed the exact program the finding
+    /// names), green after (the abstract interpreter folds `PushInt(0), PushInt(0),
+    /// Lt, Not` all the way through and correctly reads the always-true verdict).
+    /// `Governance { signers: [], threshold: 0 }` is NOT caught by
+    /// `compile_governance`'s own fail-closed sentinel guard (that guard only fires
+    /// when `!signers.is_empty() && threshold == 0`), so it compiles to a REAL
+    /// program — the one case the finding calls out by name.
+    #[test]
+    fn krp064_bytecode_detector_catches_empty_signers_threshold_zero() {
+        let program = ModuleKind::Governance(GovernanceConfig {
+            signers: vec![],
+            threshold: 0,
+        })
+        .compile();
+        // Exactly the tail the finding describes: no literal PushInt in the last
+        // slot, so the OLD heuristic returned None here. `Op` has no `PartialEq`,
+        // so compare via the canonical encoding (same convention `validator_hash`
+        // and the KRP-060 determinism check use).
+        assert_eq!(
+            encode_program(&program),
+            encode_program(&[Op::ExpectDepth(1), Op::PushInt(0), Op::PushInt(0), Op::Lt, Op::Not])
+        );
+        assert_eq!(
+            constant_tail_verdict(&program),
+            Some(true),
+            "the abstract interpreter must catch the always-true verdict expressed \
+             through Lt/Not arithmetic, not just a literal PushInt tail"
+        );
+    }
+
+    /// A second, independent shape that only arithmetic folding (not a literal
+    /// tail) can catch: `Add`/`Sub`/`Mul`/`Swap`/`Dup`/`Pick`/`Eq` composed into a
+    /// known constant, to make sure the interpreter generalizes beyond the one
+    /// case above rather than special-casing `Governance`.
+    #[test]
+    fn constant_tail_verdict_folds_arithmetic_not_just_literals() {
+        // (2*3 == 6) -> Not(0) -> 1 : always-true, expressed with Mul/Eq/Not, no
+        // literal PushInt in the final slot.
+        let always_true = vec![
+            Op::PushInt(2),
+            Op::PushInt(3),
+            Op::Mul,   // [6]
+            Op::PushInt(6),
+            Op::Eq,    // [1]  (6 == 6)
+            Op::PushInt(0),
+            Op::Eq,    // [0]  (1 == 0)
+            Op::Not,   // [1]  always-true
+        ];
+        assert_eq!(constant_tail_verdict(&always_true), Some(true));
+
+        // Dup a known constant, then Sub it from itself: always zero, always-false.
+        let always_false = vec![
+            Op::PushInt(5), // [5]
+            Op::Dup,        // [5, 5]
+            Op::Sub,        // [5 - 5] = [0]
+        ];
+        assert_eq!(constant_tail_verdict(&always_false), Some(false));
+
+        // Pick reaching into a known constant below the top (no Verify involved):
+        // [9] --Dup--> [9,9] --PushInt(1)--> [9,9,1] --Pick(2)--> copies the bottom
+        // 9 to the top: [9,9,1,9] --Add--> [9,9,10] --Drop,Drop--> [9] : known, truthy.
+        let pick_through_constants = vec![
+            Op::PushInt(9),
+            Op::Dup,
+            Op::PushInt(1),
+            Op::Pick(2),
+            Op::Add,
+            Op::Drop,
+            Op::Drop,
+        ];
+        assert_eq!(constant_tail_verdict(&pick_through_constants), Some(true));
+    }
+
+    /// A program that unconditionally `Verify`s a known-zero value must read as
+    /// constant-false (it always aborts), even when nothing about the emitted
+    /// `Op::Verify` was in scope for the old literal-tail heuristic (which bailed
+    /// on ANY `Verify` in the whole program).
+    #[test]
+    fn constant_tail_verdict_catches_unconditional_verify_zero() {
+        let program = vec![Op::PushInt(0), Op::Verify, Op::PushInt(1)];
+        assert_eq!(
+            constant_tail_verdict(&program),
+            Some(false),
+            "Verify on a known-zero constant always aborts: constant-false"
+        );
+    }
+
+    /// A `Verify` fed by genuinely input-dependent data (e.g. a signature check)
+    /// must still bail to `None` — the interpreter must not over-claim a verdict
+    /// it cannot prove, preserving the "sound, not complete" contract.
+    #[test]
+    fn constant_tail_verdict_does_not_over_claim_through_verifysig_gated_verify() {
+        let program = vec![
+            Op::CtxField(0), // FIELD_SIGHASH (crate::modules), read as the sighash message
+            Op::PushBytes(b"pk".to_vec()),
+            Op::PushBytes(b"sig".to_vec()),
+            Op::VerifySig,
+            Op::Verify,
+            Op::PushInt(1),
+        ];
+        assert_eq!(constant_tail_verdict(&program), None);
     }
 
     // ── cross-cutting: determinism of the audit itself + no-panic ───────────

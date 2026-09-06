@@ -8,8 +8,13 @@ import { Indexer } from "./indexer.js";
 import { createReadApi } from "./api.js";
 import { encodeAddress } from "./address.js";
 import { buildScenario } from "./stubchain.js";
+import { assertJsonSourceAccessAvailable } from "./sats.js";
 
 function main(): void {
+  // T-6 fix (audit finding): fail loudly at startup, not per-block later, if
+  // this runtime cannot parse >2^53 satoshi amounts exactly.
+  assertJsonSourceAccessAvailable();
+
   const cfg = loadConfig();
 
   let transport: JsonRpcTransport;

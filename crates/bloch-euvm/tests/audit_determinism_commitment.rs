@@ -73,8 +73,12 @@ fn smt_root_is_insertion_order_independent() {
 
 // ── FINDING repro: committed bytes do not bind the eUTXO state ──
 
+// H-6b fix (Annex A6 §2): renamed from
+// `committed_bytes_do_not_bind_eutxo_state_two_distinct_blocks_collide` — the body
+// asserts the FIXED behaviour (`assert_ne!` on committed_bytes: they DO diverge).
+// Finding text preserved in the section header/doc comments above and below.
 #[test]
-fn committed_bytes_do_not_bind_eutxo_state_two_distinct_blocks_collide() {
+fn committed_bytes_bind_eutxo_state_distinct_blocks_diverge() {
     let v = NoSig;
     let legacy = b"CANONICAL-LEGACY-PREFIX".to_vec();
 
@@ -110,8 +114,10 @@ fn committed_bytes_do_not_bind_eutxo_state_two_distinct_blocks_collide() {
     );
 }
 
+// H-6b fix (Annex A6 §2): renamed from `distinct_output_datums_produce_the_same_commitment`
+// — the body asserts `assert_ne!` (distinct commitments), the opposite of the old name.
 #[test]
-fn distinct_output_datums_produce_the_same_commitment() {
+fn distinct_output_datums_produce_distinct_commitments() {
     let v = NoSig;
     let legacy = b"L".to_vec();
     let mk = |datum: i128| BlockModel {
