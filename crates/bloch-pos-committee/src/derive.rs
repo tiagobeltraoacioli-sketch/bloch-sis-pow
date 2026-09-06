@@ -126,6 +126,11 @@ pub struct ChainState {
     /// Delegator fee-reward ledger, carried unchanged: it is filled at the
     /// epoch boundary, which is the transition's job.
     pub delegator_fee_rewards: Vec<crate::state_root::DelegatorFeeRecord>,
+    /// Operator fee-reward ledger (C-R2-2), carried unchanged for the same
+    /// reason — its only writer is the epoch boundary, behind
+    /// `FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH`. Empty (zero leaves) on every
+    /// pre-gate chain.
+    pub validator_fee_rewards: Vec<crate::state_root::ValidatorFeeRecord>,
 }
 
 impl ChainState {
@@ -151,6 +156,7 @@ impl ChainState {
             delegator_slash_losses: &self.delegator_slash_losses,
             base_fee: self.base_fee,
             delegator_fee_rewards: &self.delegator_fee_rewards,
+            validator_fee_rewards: &self.validator_fee_rewards,
             taint_root: self.taint_root,
             coherence_accumulator_root: self.coherence_accumulator_root,
             coherence_nullifier_root: self.coherence_nullifier_root,
@@ -682,6 +688,7 @@ mod coherence_tests {
                 tx_bytes: 0,
             },
             delegator_fee_rewards: Vec::new(),
+            validator_fee_rewards: Vec::new(),
             evm: EvmCommitment {
                 account_root: [0u8; 32],
                 receipts_root: [0u8; 32],

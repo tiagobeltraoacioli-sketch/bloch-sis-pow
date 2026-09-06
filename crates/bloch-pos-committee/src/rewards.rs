@@ -42,6 +42,20 @@ pub const BASE_FEE_BURN_BPS: u128 = 5_000;
 /// all of it since SIMD-0096; before that it was a 50/50 burn like the base fee.
 pub const PRIORITY_FEE_PRODUCER_BPS: u128 = 10_000;
 
+/// Per-block ceiling on what the fee split may CREDIT to the producer, in
+/// satoshis, once [`crate::params::FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH`]
+/// binds (inert `u64::MAX` until the founder names the epoch). 100 BLOCH —
+/// two orders of magnitude above any fee total a real block has carried, so
+/// it never touches honest revenue, while bounding what a single
+/// self-tipping block can move into the producer's ledger. The excess above
+/// the cap is burned by omission: never credited to anyone, the same one-way
+/// door [`BASE_FEE_BURN_BPS`] already uses, and consistent with the one-sided
+/// supply-conservation rule (`accounted <= issued`-shaped, never `==`).
+///
+/// The VALUE is a placeholder awaiting founder sign-off alongside the flag
+/// day itself; the mechanism is what C-R2-2 requires.
+pub const MAX_BLOCK_FEE_TO_PRODUCER_SAT: u128 = 100 * SAT_PER_BLOCH;
+
 /// How a block's fees split between the producer and the burn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FeeSplit {

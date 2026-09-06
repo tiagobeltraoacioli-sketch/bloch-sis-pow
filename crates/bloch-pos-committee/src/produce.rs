@@ -399,6 +399,7 @@ mod tests {
                 tx_bytes: 0,
             },
             delegator_fee_rewards: Vec::new(),
+            validator_fee_rewards: Vec::new(),
             evm: EvmCommitment {
                 account_root: [0x14; 32],
                 receipts_root: [0x15; 32],

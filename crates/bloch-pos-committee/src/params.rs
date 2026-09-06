@@ -12,7 +12,8 @@
 //! `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` (800) and
 //! `BLOCK_BYTES_V2_ACTIVATION_EPOCH` (800) are all epochs the chain is past.
 //! `LEAK_RECOVERY_ACTIVATION_EPOCH` is armed at 2700 (2026-09-06);
-//! `ANCESTRY_SEED_ACTIVATION_EPOCH` is the one still at `u64::MAX`.
+//! `ANCESTRY_SEED_ACTIVATION_EPOCH` and `FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH`
+//! are still at `u64::MAX`.
 //!
 //! Until 2026-09-02 this header said nothing here was active and that the
 //! crate held no activation height at all because it was not wired into the
@@ -696,6 +697,39 @@ pub mod rehearsal {
     ///
     /// Default is CLOSED, deliberately: an unadorned `cargo test` exercises the
     /// configuration the fleet actually runs. Tests of the new rules opt in.
+    thread_local! {
+        static FEE_STAKE_GATE_OPEN_TL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Test-only: treat [`super::FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH`] as
+    /// already bound.
+    ///
+    /// Its own switch, NOT folded into `GATES_OPEN`, for the same reason the
+    /// deposit and exit gates have theirs: the leak-era tests that open
+    /// `GATES_OPEN` pin roots and balances computed under the compounding
+    /// rule, and silently decoupling fee crediting inside them would turn
+    /// every one into a fixture lying about the chain it models. Tests of the
+    /// post-flag-day fee rules opt in here and nowhere else.
+    ///
+    /// Default CLOSED: an unadorned `cargo test` runs the fleet's rules.
+    pub fn fee_stake_gate_forced_open() -> bool {
+        FEE_STAKE_GATE_OPEN_TL.with(|c| c.get())
+    }
+
+    /// Opens the fee-to-stake decoupling gate for this thread until the guard
+    /// drops, including on unwind, so a failing assertion cannot leave the
+    /// fee rules mutated for the rest of the thread.
+    pub fn fee_stake_gate_open_guard() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FEE_STAKE_GATE_OPEN_TL.with(|c| c.set(self.0));
+            }
+        }
+        let prev = FEE_STAKE_GATE_OPEN_TL.with(|c| c.replace(true));
+        Restore(prev)
+    }
+
     pub fn gates_are_forced_open() -> bool {
         GATES_OPEN_TL.with(|c| c.get())
     }
@@ -995,6 +1029,39 @@ pub const DEPOSIT_ACTIVATION_EPOCH: u64 = u64::MAX;
 ///
 /// `exit_auth_gate_is_inert` pins the value.
 pub const EXIT_AUTH_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Flag day for the **fee-to-stake decoupling** (finding C-R2-2, 2026-09-05).
+///
+/// Three rules bind together once an epoch reaches this constant; below it,
+/// every one of them is byte-identical to the chain as it stands:
+///
+/// 1. **Producer fee accrual is capped per block** at
+///    [`crate::rewards::MAX_BLOCK_FEE_TO_PRODUCER_SAT`]; the excess is burned
+///    by omission, the same one-way door the base-fee burn already uses.
+/// 2. **The operator's boundary fee share stops compounding into the bond.**
+///    `close_epoch` credits it (plus the pro-rata dust) to the committed
+///    `validator_fee_rewards` withdrawable ledger — the operator mirror of
+///    `delegator_fee_rewards` — instead of adding it to
+///    `ValidatorRecord::staked_sat`. Consensus weight can then grow only
+///    through the deposit path, which checks the per-validator cap at
+///    admission; fees buy income, not weight. Before this gate, a proposer
+///    converts liquid coin into bonded stake at 100% via tips, with no cap —
+///    which is the C-R2-2 finding.
+/// 3. **The per-validator stake cap applies to own+delegated stake** in
+///    `duty_roster_at`, via [`crate::delegation::combined_cap_sat`] — the
+///    same `MAX_VALIDATOR_STAKE_BPS` fixed point the delegation registry
+///    already runs, but over the combined position, floored at the equal
+///    share so a roster of uniformly large bonds cannot cap itself to zero.
+///
+/// All three change either committed state evolution or consensus weight, so
+/// they cannot ship enabled on a mixed fleet: this constant stays `u64::MAX`
+/// until the founder names the epoch, exactly like
+/// [`ANCESTRY_SEED_ACTIVATION_EPOCH`]. The new `validator_fee_rewards` state
+/// component contributes zero SMT leaves while empty, and its only writer is
+/// behind this gate, so pre-gate roots are unchanged by the code carrying it.
+///
+/// `fee_stake_gate_is_inert` pins the value.
+pub const FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.

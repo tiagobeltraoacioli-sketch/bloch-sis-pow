@@ -146,6 +146,7 @@ fn state<'a>(f: &'a Fixture, e: &'a [EutxoEntry]) -> ConsensusState<'a> {
             tx_bytes: 0,
         },
         delegator_fee_rewards: &[],
+        validator_fee_rewards: &[],
     }
 }
 
