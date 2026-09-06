@@ -182,7 +182,12 @@ const RETRACTION_SITES: &[(&str, &str)] = &[
     // index would republish.
     ("crates/bloch-pos-committee/Cargo.toml", "unreachable from the network"),
     // The fork-choice doc that claimed finalised history is unreorganisable.
-    ("crates/bloch-pos-node/src/engine.rs", "finalized is not a latch"),
+    // The marker moved on 2026-09-05 when finding F-03 landed the finality
+    // latch: "finalized is not a latch" stopped being true of the local node
+    // (the engine now refuses to rewind below its own finalized checkpoint),
+    // but the slashing-cost half of the retraction stands and the doc still
+    // carries it — as the phrase guarded here.
+    ("crates/bloch-pos-node/src/engine.rs", "not an economic guarantee across nodes"),
     // The security-tooling overview, which listed slashing as shipped.
     ("SECURITY_TOOLING.md", "cannot be applied on the live chain"),
     // The dossier an external auditor reads.
