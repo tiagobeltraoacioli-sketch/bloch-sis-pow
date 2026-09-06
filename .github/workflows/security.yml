@@ -55,6 +55,15 @@ jobs:
   # cargo-audit — RUSTSEC-only advisory backstop. `--deny warnings` also fails on
   # unmaintained/unsound informational advisories. The tracked ignore set (with
   # rationale) lives in audit.toml / .cargo/audit.toml.
+  #
+  # CHANGED 2026-09-05 (finding SC2-sharks-shamir): runs on EVERY workspace
+  # lockfile, not just the root one. The standalone workspaces (pool/,
+  # pool-proxy/, services/pq-shield-api/, ...) each pin their own Cargo.lock,
+  # and a bare `cargo audit` at the root never read them — which is how pool/
+  # shipped sharks 0.5.0 (RUSTSEC-2024-0398, biased Shamir coefficients in the
+  # seed-recovery tool) through a green pipeline. The script also fails if a
+  # committed lockfile is missing from its list, so a NEW standalone workspace
+  # cannot silently escape the scanner.
   cargo-audit:
     name: cargo-audit (blocking)
     runs-on: ubuntu-latest
@@ -64,8 +73,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
-      - name: cargo audit
-        run: cargo audit --deny warnings
+      - name: cargo audit (all workspace lockfiles)
+        run: bash scripts/audit-all-lockfiles.sh
 
   # cargo-deny — advisories + license policy (permissive only; AGPL allowed for
   # the six first-party crates, copyleft denied for third-party deps) + banned/
@@ -143,12 +152,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Every workspace lockfile, mirroring scripts/audit-all-lockfiles.sh
+      # (finding SC2-sharks-shamir): the standalone workspaces are invisible
+      # to a root-only scan.
       - name: Run osv-scanner
         uses: google/osv-scanner-action/osv-scanner-action@v1.9.2
         with:
           scan-args: |-
             --config=osv-scanner.toml
             --lockfile=Cargo.lock
+            --lockfile=pool/Cargo.lock
+            --lockfile=pool-proxy/Cargo.lock
+            --lockfile=services/pq-shield-api/Cargo.lock
+            --lockfile=euvm-tooling/Cargo.lock
+            --lockfile=fuzz/Cargo.lock
+            --lockfile=spikes/prover-cost/Cargo.lock
+            --lockfile=spikes/prover-cost/rv32/Cargo.lock
+            --lockfile=spikes/prover-cost/rv32f/Cargo.lock
+            --lockfile=spikes/prover-cost/rv32h/Cargo.lock
+            --lockfile=spikes/prover-cost/rv32k/Cargo.lock
 
   # gitleaks — catch committed credentials before they reach history (the
   # project has its own PAT-rotation lesson). BLOCKING since 2026-09-04 (finding

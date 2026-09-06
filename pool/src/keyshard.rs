@@ -13,10 +13,18 @@
 //! *procedural*: sharded recovery + the dual-control disbursement
 //! procedure in the README.
 //!
-//! Field math is NOT hand-rolled: `sharks` implements Shamir over
-//! GF(256).
+//! Field math is NOT hand-rolled: `blahaj` implements Shamir over
+//! GF(256). It replaced `sharks` 0.5.0 (RUSTSEC-2024-0398), whose
+//! dealer drew polynomial coefficients uniformly from [1, 255] — never
+//! 0 — so every share leaked one impossible value per byte of the
+//! seed. `blahaj` is the advisory-recommended fork with the same API
+//! and the SAME share wire format (`x || y_0..y_31`, GF(256) points),
+//! coefficients uniform over [0, 255]. MIGRATION: shares already dealt
+//! by the sharks-era binary recover unchanged (Lagrange interpolation
+//! does not care how the dealer sampled); re-splitting the seed on the
+//! fixed binary is still recommended to shed the historical bias.
 
-use sharks::{Share, Sharks};
+use blahaj::{Share, Sharks};
 
 /// Shares needed to reconstruct the seed.
 pub const THRESHOLD: u8 = 2;
@@ -82,5 +90,56 @@ mod tests {
         assert_ne!(a[0], b[0], "dealer must use a fresh random polynomial");
         assert_eq!(recover_seed(&a[..2].to_vec()).unwrap(), seed);
         assert_eq!(recover_seed(&b[..2].to_vec()).unwrap(), seed);
+    }
+
+    /// Regression test for RUSTSEC-2024-0398 (the `sharks` 0.5.0 bias
+    /// this module shipped with). With THRESHOLD = 2 the dealer's
+    /// polynomial is p(x) = a1*x + s per seed byte, so the share at
+    /// x = 1 satisfies y = s XOR a1 (GF(256) addition is XOR), i.e.
+    /// a1 = y XOR s. A correct dealer draws a1 uniformly from [0, 255];
+    /// sharks drew it from [1, 255], so y could NEVER equal the seed
+    /// byte. Observing a1 = 0 at least once over 600 splits x 32 byte
+    /// positions (19,200 samples) therefore separates the two: under
+    /// the fixed dealer P(never zero) = (255/256)^19200 < 1e-32, while
+    /// under the biased dealer this test fails ALWAYS. Verified
+    /// mutation-style: swapping the dependency back to sharks 0.5.0
+    /// makes this test fail deterministically.
+    #[test]
+    fn coefficients_are_unbiased_rustsec_2024_0398() {
+        assert_eq!(THRESHOLD, 2, "the a1 = y XOR s derivation below assumes threshold 2");
+        let seed = [0u8; 32]; // s = 0 => share-at-x=1 bytes ARE the coefficients
+        let mut saw_zero_coeff = false;
+        'outer: for _ in 0..600 {
+            let shares = split_seed(&seed);
+            let share1 = shares.iter().find(|s| s[0] == 1)
+                .expect("dealer must emit a share with index x = 1");
+            // share layout: x || y_0..y_31 ; with s = 0, y_i == a1 for byte i.
+            if share1[1..].iter().any(|&y| y == 0) {
+                saw_zero_coeff = true;
+                break 'outer;
+            }
+        }
+        assert!(saw_zero_coeff,
+            "polynomial coefficient 0 never observed in 19,200 samples: \
+             the Shamir dealer is biased (RUSTSEC-2024-0398 class bug)");
+    }
+
+    /// Pins the share WIRE FORMAT so custodian shares dealt by the
+    /// pre-fix (sharks) binary keep recovering: 33 bytes = x || 32
+    /// GF(256) points, x starting at 1, recovery driven purely by the
+    /// raw bytes handed back on argv.
+    #[test]
+    fn share_wire_format_is_stable_for_migration() {
+        let seed: [u8; 32] = core::array::from_fn(|i| i as u8);
+        let shares = split_seed(&seed);
+        let mut xs: Vec<u8> = shares.iter().map(|s| s[0]).collect();
+        xs.sort_unstable();
+        assert_eq!(xs, vec![1, 2, 3], "share index bytes must be x = 1..=3");
+        for s in &shares {
+            assert_eq!(s.len(), 33, "share must be x || 32 points");
+        }
+        // Round-trip from raw bytes only (exactly what the CLI does).
+        let raw: Vec<Vec<u8>> = shares[..2].iter().cloned().collect();
+        assert_eq!(recover_seed(&raw).unwrap(), seed);
     }
 }

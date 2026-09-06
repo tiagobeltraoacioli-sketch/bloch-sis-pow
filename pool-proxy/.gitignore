@@ -1,2 +1,6 @@
 /target
-Cargo.lock
+# Cargo.lock IS committed (changed 2026-09-05, finding SC2-sharks-shamir):
+# this is a standalone workspace shipping a network-facing binary, and an
+# uncommitted lockfile is a lockfile the CI advisory scanners never see —
+# exactly how pool/ shipped a vulnerable pin. Repo policy (.gitignore at the
+# root) is lockfiles committed for binary projects.

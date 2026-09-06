@@ -189,7 +189,12 @@ Bloch and what this reference ships:
   for disaster resilience, not threshold signing**. At recovery (and
   at every signing) the seed exists whole in one process on one
   machine. Run both operations offline; clear shell history. The
-  field math is the vetted `sharks` crate, not hand-rolled.
+  field math is the `blahaj` crate, not hand-rolled — it replaced
+  `sharks` 0.5.0 (RUSTSEC-2024-0398: coefficients drawn from [1, 255],
+  never 0, so each share leaked one impossible value per seed byte).
+  Same share wire format: shares dealt by the sharks-era binary still
+  recover, but re-split the seed on the fixed binary when convenient
+  to shed the historical bias.
 
   **2. Dual-control disbursement procedure** (operational guidance,
   deliberately not enforced by code — the daemon is keyless):
