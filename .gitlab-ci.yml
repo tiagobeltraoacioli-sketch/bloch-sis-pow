@@ -230,6 +230,25 @@ no-source-archives:
     - python3 scripts/check-no-source-archives.py
   allow_failure: false
 
+# ISO composition hardening guard (C-R6-1, second pass). BLOCKING.
+# `.#iso`/`.#desktop-iso` import nixos-25.05's installer profile, which enables
+# sshd (PermitRootLogin "yes") and gives root/nixos EMPTY passwords — at the
+# COMPOSED-image level, where editing os/configuration.nix's text changes
+# nothing (that was the first pass's mistake). os/installer-hardening.nix
+# mkForce-overrides the profile in both ISO module lists; this job fails if the
+# module is missing, softened below mkForce, left out of any modules list that
+# imports the installer profile, or if the nix-eval proof stops asserting the
+# composed values. Selftest first: every one of those shapes must go red by
+# name before the guard's ok is trusted. No Nix on this runner — the
+# composed-value evaluation itself runs as iso-hardening-eval in the nix stage.
+iso-hardening-guard:
+  stage: check
+  before_script: []
+  script:
+    - python3 scripts/check-iso-hardening.selftest.py
+    - python3 scripts/check-iso-hardening.py
+  allow_failure: false
+
 # Scanner-posture guard (finding I-H4, 2026-09-04). BLOCKING.
 # The regression test for the defect this section was just fixed for: the
 # osv-scanner and secret-scan jobs were `allow_failure: true` AND opened with
@@ -637,6 +656,22 @@ flake-lock-drift:
   script:
     - nix flake lock --no-update-lock-file
     - git diff --exit-code flake.lock
+  allow_failure: false
+
+# C-R6-1 composed-value proof: `nix eval` the MERGED option values of both ISO
+# configurations (not the module text) — sshd off, root/nixos passwords locked
+# ("!"), mining off, firewall on. This is the assertion the finding asked for;
+# without os/installer-hardening.nix in the flake it fails on every line.
+# Same runner-tag caveat as flake-lock-drift: with no Nix runner registered it
+# PENDS, which is why iso-hardening-guard in the check stage independently
+# refuses the unhardened shapes without Nix.
+iso-hardening-eval:
+  stage: nix
+  tags:
+    - bloch-nix-aarch64
+  before_script: []
+  script:
+    - bash scripts/check-iso-hardening.sh
   allow_failure: false
 
 # Single-host reproducibility self-check: `--rebuild --check` forces a local

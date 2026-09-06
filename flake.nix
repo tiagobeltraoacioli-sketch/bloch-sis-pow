@@ -148,7 +148,16 @@
       nixosModules.bloch = import ./os/bloch-node.nix;
 
       # Postern OS: a minimal NixOS live/installer image that boots straight into a
-      # running (mining) node.
+      # running node (mining OFF on live media — opt-in after install; C-R6-1).
+      #
+      # SECURITY (C-R6-1, composed-image level): installation-cd-minimal.nix
+      # imports profiles/installation-device.nix, which enables sshd
+      # (mkDefault true + PermitRootLogin mkDefault "yes") and gives root and
+      # nixos EMPTY passwords (plain-priority initialHashedPassword = "").
+      # os/installer-hardening.nix mkForce-overrides all of that at the image
+      # composition; it MUST be in this modules list, after the profile.
+      # Static guard: scripts/check-iso-hardening.py (CI, no Nix).
+      # Composed-value proof: scripts/check-iso-hardening.sh (nix eval).
       nixosConfigurations.bloch-os = nixpkgs.lib.nixosSystem {
         inherit system;
         specialArgs = { blochPkg = self.packages.${system}.bloch; };
@@ -156,6 +165,7 @@
           "${nixpkgs}/nixos/modules/installer/cd-dvd/installation-cd-minimal.nix"
           self.nixosModules.bloch
           ./os/configuration.nix
+          ./os/installer-hardening.nix
         ];
       };
 
@@ -197,6 +207,9 @@
           "${nixpkgs}/nixos/modules/installer/cd-dvd/installation-cd-minimal.nix"
           self.nixosModules.bloch
           ./os/desktop.nix
+          # Same composed-image hardening as bloch-os (C-R6-1): the installer
+          # profile's sshd + empty root/nixos passwords are mkForce-overridden.
+          ./os/installer-hardening.nix
           # The live installer ISO must use the SCRIPTED initrd: its ISO9660 +
           # squashfs store mount (/sysroot/iso, /nix/.ro-store) has no equivalent
           # in the systemd initrd that desktop.nix turns on for encrypted installs.
