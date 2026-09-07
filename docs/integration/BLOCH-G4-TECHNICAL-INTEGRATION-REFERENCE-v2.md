@@ -1267,6 +1267,12 @@ node.
 
 </div>
 
+<div class="warn" markdown="1">
+
+**HTTP heads are parsed strictly since the 2026-09-07 security-audit merge (F03/F04, `rpc.rs`).** A request is refused with `400` if it carries a duplicate `Content-Length`, `Host` or `Content-Type` field, a field name that is not an HTTP token, a control byte in a field value, a malformed request line (missing target, unknown HTTP version, extra tokens), or a non-decimal / overflowing `Content-Length`; the 16 KiB head cap now counts the terminating `CRLFCRLF` and is enforced while reading (`431`). The whole request — head and body — must arrive within one monotonic deadline: a client that trickles bytes to renew a per-read timeout is disconnected (`408`). Well-formed clients see no change.
+
+</div>
+
 ### 10.2 Full method reference
 
 Every method in the frozen registry (`method_registry.rs`, `tests/rpc_method_registry.rs`):
