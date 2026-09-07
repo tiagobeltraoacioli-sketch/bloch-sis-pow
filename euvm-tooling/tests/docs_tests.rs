@@ -645,8 +645,8 @@ fn doc_s6_tx_ext_output_binds_hash() {
     assert_eq!(out.datum, Val::Int(7));
 
     // The builder wires every field through, and the revealed validator hashes back.
+    // `build()` never declares a sighash — the verifier computes it.
     let tx = TxBuilder::new()
-        .sighash(b"sighash".to_vec())
         .fee(1)
         .spend_input(out.clone(), program.clone(), vec![Val::Int(42)])
         .output(tx::ext_output_blch(49, &program))
@@ -698,7 +698,6 @@ fn doc_s7_hashlock_lock_and_spend_tx() {
         .spend_input(locked, program.clone(), vec![Val::Bytes(preimage.clone())])
         .output(tx::ext_output(euvm::blch(90), &program, Val::Int(0)))
         .fee(10)
-        .sighash(b"sighash".to_vec())
         .build();
 
     let v = MockVerifier::never();
@@ -721,7 +720,6 @@ fn doc_s8_validator_rejected() {
         .spend_input(locked, program.clone(), vec![])
         .output(tx::ext_output_blch(90, &program))
         .fee(10)
-        .sighash(b"s".to_vec())
         .build();
     let v = MockVerifier::never();
     assert_eq!(sim::simulate_tx(&tx, &v, 50_000), Err(TxError::ValidatorRejected(0)));
@@ -737,7 +735,6 @@ fn doc_s8_vm_error_wraps_input_index() {
         .spend_input(locked, program.clone(), vec![])
         .output(tx::ext_output_blch(90, &program))
         .fee(10)
-        .sighash(b"s".to_vec())
         .build();
     let v = MockVerifier::never();
     assert_eq!(sim::simulate_tx(&tx, &v, 50_000), Err(TxError::Vm(0, VmError::Assert)));
@@ -754,7 +751,6 @@ fn doc_s8_value_not_conserved() {
         .spend_input(locked, program.clone(), vec![])
         .output(tx::ext_output_blch(90, &program))
         .fee(5)
-        .sighash(b"s".to_vec())
         .build();
     let v = MockVerifier::never();
     match sim::simulate_tx(&tx, &v, 50_000) {
@@ -844,14 +840,17 @@ fn doc_examples_hashlock_reference_accepts_and_rejects() {
 #[test]
 fn doc_s9_harness_constants() {
     use euvm_tooling::euvm::harness;
-    assert_eq!(harness::EUVM_ACTIVATION_HEIGHT, 10);
+    // NOTE: this doc-pinning test previously asserted `10` here — stale from before
+    // the real coordinated-fork height was set. The constant itself is never to be
+    // changed to satisfy a test; the test is corrected to the actual value instead.
+    assert_eq!(harness::EUVM_ACTIVATION_HEIGHT, 4320);
     assert_eq!(harness::EUVM_BURN_BPS, 2_000);
     assert_eq!(harness::DEFAULT_GAS_CEILINGS.per_tx, 10_000_000);
     assert_eq!(harness::DEFAULT_GAS_CEILINGS.block, 100_000_000);
     // is_feature_active: height >= EUVM_ACTIVATION_HEIGHT.
-    assert!(!harness::is_feature_active(9));
-    assert!(harness::is_feature_active(10));
-    assert!(harness::is_feature_active(11));
+    assert!(!harness::is_feature_active(harness::EUVM_ACTIVATION_HEIGHT - 1));
+    assert!(harness::is_feature_active(harness::EUVM_ACTIVATION_HEIGHT));
+    assert!(harness::is_feature_active(harness::EUVM_ACTIVATION_HEIGHT + 1));
 }
 
 /// §9: `minting` — a policy's `policy_asset_id` equals its `validator_hash`.

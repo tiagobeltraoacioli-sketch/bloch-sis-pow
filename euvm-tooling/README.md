@@ -48,7 +48,7 @@ part of the node's root workspace). It depends on `bloch-euvm` by path.
 ```bash
 cd euvm-tooling
 cargo build
-cargo test        # 230 tests + 3 doc-tests, all green
+cargo test        # 241 tests + 3 doc-tests, all green
 ```
 
 ---
@@ -135,8 +135,10 @@ use euvm_tooling::tx::{TxBuilder, ext_output, ext_output_blch};
 let locked = ext_output(euvm::blch(100), &program, Val::Int(0));
 
 // SPEND: reveal the program + preimage redeemer, recreate 99 BLCH, pay 1 fee.
+// `build()` leaves the sighash undeclared — a signature-checking validator would
+// see the verifier's own recomputed `tx_sighash`, never a caller-supplied label
+// (there is no builder method for that; see `build_declared()` to embed it explicitly).
 let tx = TxBuilder::new()
-    .sighash(b"tx-sighash".to_vec())
     .fee(1)
     .spend_input(locked, program.clone(), vec![Val::Bytes(preimage.to_vec())])
     .output(ext_output_blch(99, &program))
@@ -205,7 +207,7 @@ assert!(token.policy_id().is_some());
 | **`asm`** | `Asm` chainable builder (one method per opcode) + the `prog![…]` macro. `build()` → `Vec<Op>`, `hash()` → `validator_hash`, `encode()` → canonical bytes. |
 | **`encode`** | hex/text codecs: `program_to_hex` / `hex_to_program`, `decode_program` (the hand-written inverse of `encode_program`), `val_to_string` / `parse_val`, `op_to_string` / `program_to_asm` disassembly, `ext_output_to_string`. All fallible codecs return `EncodeError`. |
 | **`sim`** | `run_program`, `run_spend`, `simulate_tx`; the `SimResult { result, gas_used, gas_limit }` verdict; and the shared `MockVerifier` (`always()` / `never()` / `accepting(triples)` / `.with_triple(…)`). |
-| **`tx`** | `ext_output` / `ext_output_blch` (hash-binding output constructors) and the fluent `TxBuilder` (`sighash`, `fee`, `spend_input`, `output`, `output_blch`, `build`, `build_checked`). |
+| **`tx`** | `ext_output` / `ext_output_blch` (hash-binding output constructors) and the fluent `TxBuilder` (`fee`, `spend_input`, `output`, `output_blch`, `build` / `build_declared`, `build_checked` / `build_checked_declared`). There is no method to set an arbitrary sighash — `build` leaves it empty (verifier-computed) and `build_declared` embeds the canonical `tx_sighash`. |
 | **`examples`** | the worked validator gallery above, plus `demo_*()` green-path runners. |
 
 Because `Op` derives `Clone, Debug` **only** (no `PartialEq`/`Eq`), you cannot `==` two

@@ -27,15 +27,35 @@
 //! let locked = ext_output(euvm::blch(100), &program, euvm::Val::Int(0));
 //!
 //! // SPEND: consume `locked`, revealing the program + an (empty) redeemer, and
-//! // recreate 99 BLCH to a fresh output (1 BLCH goes to fee).
+//! // recreate 99 BLCH to a fresh output (1 BLCH goes to fee). `build()` leaves the
+//! // sighash undeclared (empty) — the verifier fills it in with the canonical
+//! // `tx_sighash` itself, so there is nothing to set here.
 //! let tx = TxBuilder::new()
-//!     .sighash(b"msg".to_vec())
 //!     .fee(1)
 //!     .spend_input(locked, program.clone(), vec![])
 //!     .output(ext_output(euvm::blch(99), &program, euvm::Val::Int(0)))
 //!     .build();
 //! assert_eq!(tx.inputs.len(), 1);
+//! assert!(tx.sighash.is_empty());
 //! ```
+//!
+//! # Declaring the sighash
+//!
+//! [`EuTx::sighash`](euvm::EuTx) is not authoritative: the message a signature-checking
+//! validator actually sees is always [`tx_sighash`](euvm::tx_sighash), recomputed by the
+//! verifier from the transaction's own inputs/outputs/fee. A non-empty `sighash` is a
+//! *declaration* that must equal that canonical value or [`validate_tx`](euvm::validate_tx)
+//! fails closed with `TxError::SighashMismatch` — so **there is no builder method that
+//! accepts an arbitrary label**. The only two shapes this builder can produce are:
+//!
+//! - [`build`](TxBuilder::build) — sighash left empty; the verifier computes it.
+//! - [`build_declared`](TxBuilder::build_declared) — sighash set to exactly
+//!   `tx_sighash(&tx)`, computed over the tx this call itself returns.
+//!
+//! Both round-trip through `validate_tx` cleanly, by construction. A wallet that needs
+//! to sign over the sighash first computes it — `tx_sighash` covers inputs/outputs/fee
+//! only, never the redeemer, so it can be computed before any redeemer is finalized —
+//! then feeds the resulting signature into the redeemer bytes.
 
 use crate::euvm;
 
@@ -68,28 +88,30 @@ pub fn ext_output_blch(amount: u64, program: &[euvm::Op]) -> euvm::ExtOutput {
 /// A fluent builder for [`EuTx`](euvm::EuTx).
 ///
 /// Accumulates inputs (each an `EuTxInput` = consumed output + revealed validator +
-/// redeemer), outputs, a fee, and the sighash message signature-validators read from
-/// `ctx.fields[0]`. Every mutating method takes `self` by value and returns it, so calls
-/// chain; finish with [`build`](TxBuilder::build) or [`build_checked`](TxBuilder::build_checked).
+/// redeemer), outputs, and a fee. Every mutating method takes `self` by value and
+/// returns it, so calls chain; finish with [`build`](TxBuilder::build) (undeclared
+/// sighash) or [`build_declared`](TxBuilder::build_declared) (sighash declared as the
+/// canonical [`tx_sighash`](euvm::tx_sighash)) — or their resource-checked counterparts
+/// [`build_checked`](TxBuilder::build_checked) /
+/// [`build_checked_declared`](TxBuilder::build_checked_declared).
+///
+/// **There is deliberately no method to set an arbitrary sighash.** `EuTx.sighash` is
+/// only ever meaningful as a declaration that must equal `tx_sighash(&tx)` — anything
+/// else is rejected fail-closed by [`validate_tx`](euvm::validate_tx). Rather than
+/// document that constraint on a free-form setter, this builder simply has no such
+/// setter: the two `build*` shapes above are the only sighashes it can produce, and
+/// both are correct by construction.
 #[derive(Clone, Debug, Default)]
 pub struct TxBuilder {
     inputs: Vec<euvm::EuTxInput>,
     outputs: Vec<euvm::ExtOutput>,
     fee: u64,
-    sighash: Vec<u8>,
 }
 
 impl TxBuilder {
-    /// A fresh builder with no inputs/outputs, zero fee, and an empty sighash.
+    /// A fresh builder with no inputs/outputs and zero fee.
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Set the transaction sighash — the message signature-checking validators read from
-    /// `ctx.fields[0]`. Overwrites any previously set value.
-    pub fn sighash(mut self, s: Vec<u8>) -> Self {
-        self.sighash = s;
-        self
     }
 
     /// Set the transaction fee (in base BLCH units). Overwrites any previous value.
@@ -151,27 +173,55 @@ impl TxBuilder {
         self.outputs.len()
     }
 
-    /// Finish and produce the [`EuTx`](euvm::EuTx). Never fails — no validation is run;
-    /// hand the result to [`validate_tx`](euvm::validate_tx) (or
-    /// [`build_checked`](TxBuilder::build_checked)) to enforce consensus rules.
+    /// Finish and produce the [`EuTx`](euvm::EuTx) with its sighash left UNDECLARED
+    /// (`sighash: Vec::new()`). Never fails — no validation is run; hand the result to
+    /// [`validate_tx`](euvm::validate_tx) (or [`build_checked`](TxBuilder::build_checked))
+    /// to enforce consensus rules. An empty declaration always satisfies the verifier's
+    /// sighash check — it simply computes [`tx_sighash`](euvm::tx_sighash) itself and
+    /// uses that.
     pub fn build(self) -> euvm::EuTx {
         euvm::EuTx {
             inputs: self.inputs,
             outputs: self.outputs,
             fee: self.fee,
-            sighash: self.sighash,
+            sighash: Vec::new(),
         }
     }
 
-    /// Finish and produce the [`EuTx`](euvm::EuTx), first checking it against the VM's
-    /// structural resource ceilings (input/output counts, distinct assets, operand
-    /// bytes) via [`check_tx_resource_limits`](euvm::check_tx_resource_limits).
+    /// Finish and produce the [`EuTx`](euvm::EuTx) with its sighash DECLARED: computes
+    /// [`tx_sighash`](euvm::tx_sighash) over the exact inputs/outputs/fee this call
+    /// returns and embeds it in the result's `sighash` field.
+    ///
+    /// Because the embedded value is always the canonical one, a `build_declared()`
+    /// output can never be rejected with `TxError::SighashMismatch` — this is the only
+    /// way this crate produces a non-empty `sighash`, and it is correct by construction.
+    /// Prefer this over `build()` when downstream code (or another party) needs to see
+    /// the tx's sighash carried explicitly on the struct rather than recomputing it.
+    pub fn build_declared(self) -> euvm::EuTx {
+        let mut tx = self.build();
+        tx.sighash = euvm::tx_sighash(&tx).to_vec();
+        tx
+    }
+
+    /// Finish and produce the [`EuTx`](euvm::EuTx) with an undeclared sighash (see
+    /// [`build`](TxBuilder::build)), first checking it against the VM's structural
+    /// resource ceilings (input/output counts, distinct assets, operand bytes) via
+    /// [`check_tx_resource_limits`](euvm::check_tx_resource_limits).
     ///
     /// Returns [`TxError::ResourceLimit`](euvm::TxError) if any ceiling is breached. This
     /// only checks *structure* — it does NOT run validators or check value conservation;
     /// use [`validate_tx`](euvm::validate_tx) for the full spend-time check.
     pub fn build_checked(self) -> Result<euvm::EuTx, euvm::TxError> {
         let tx = self.build();
+        euvm::check_tx_resource_limits(&tx)?;
+        Ok(tx)
+    }
+
+    /// [`build_checked`](TxBuilder::build_checked)'s counterpart for a declared sighash:
+    /// produces the same output as [`build_declared`](TxBuilder::build_declared), first
+    /// checking the identical structural resource ceilings.
+    pub fn build_checked_declared(self) -> Result<euvm::EuTx, euvm::TxError> {
+        let tx = self.build_declared();
         euvm::check_tx_resource_limits(&tx)?;
         Ok(tx)
     }
@@ -196,21 +246,21 @@ mod tests {
     /// A minimal spend tx: consume one locked output, reveal its program + redeemer,
     /// recreate a smaller continuation output, and pay a fee. Confirms every field of the
     /// built `EuTx` wires through, and that the revealed input validator hashes back to
-    /// the consumed output's committed hash.
+    /// the consumed output's committed hash. `build()` never sets a sighash — it always
+    /// comes back empty, ready for the verifier to fill in.
     #[test]
     fn builds_spend_tx_end_to_end() {
         let program = vec![euvm::Op::PushInt(1)];
         let locked = ext_output(euvm::blch(100), &program, euvm::Val::Int(0));
 
         let tx = TxBuilder::new()
-            .sighash(b"sighash-msg".to_vec())
             .fee(1)
             .spend_input(locked.clone(), program.clone(), vec![euvm::Val::Int(42)])
             .output(ext_output_blch(99, &program))
             .build();
 
         assert_eq!(tx.fee, 1);
-        assert_eq!(tx.sighash, b"sighash-msg".to_vec());
+        assert!(tx.sighash.is_empty());
         assert_eq!(tx.inputs.len(), 1);
         assert_eq!(tx.outputs.len(), 1);
 
@@ -222,6 +272,23 @@ mod tests {
             input.prev_output.validator_hash
         );
         assert_eq!(euvm::value_get(&tx.outputs[0].value, &euvm::BLCH), 99);
+    }
+
+    /// `build_declared` embeds exactly `bloch_euvm::tx_sighash(&tx)` — never an
+    /// arbitrary label, because there is no longer any way to supply one.
+    #[test]
+    fn build_declared_embeds_canonical_sighash() {
+        let program = vec![euvm::Op::PushInt(1)];
+        let locked = ext_output(euvm::blch(100), &program, euvm::Val::Int(0));
+
+        let tx = TxBuilder::new()
+            .fee(1)
+            .spend_input(locked, program.clone(), vec![euvm::Val::Int(42)])
+            .output(ext_output_blch(99, &program))
+            .build_declared();
+
+        assert!(!tx.sighash.is_empty());
+        assert_eq!(tx.sighash, euvm::tx_sighash(&tx).to_vec());
     }
 
     /// `output_blch` sets the raw hash and a zero datum without needing the program.

@@ -112,14 +112,14 @@ fn builder_wires_every_field_through() {
     let locked = ext_output(euvm::blch(100), &program, euvm::Val::Int(0));
 
     let tx = TxBuilder::new()
-        .sighash(b"sighash-msg".to_vec())
         .fee(3)
         .spend_input(locked.clone(), program.clone(), vec![euvm::Val::Int(42)])
         .output(ext_output_blch(97, &program))
         .build();
 
     assert_eq!(tx.fee, 3);
-    assert_eq!(tx.sighash, b"sighash-msg".to_vec());
+    // `build()` never declares a sighash — it always comes back empty.
+    assert!(tx.sighash.is_empty());
     assert_eq!(tx.inputs.len(), 1);
     assert_eq!(tx.outputs.len(), 1);
 
@@ -135,15 +135,9 @@ fn builder_wires_every_field_through() {
 }
 
 #[test]
-fn last_fee_and_sighash_win() {
-    let tx = TxBuilder::new()
-        .fee(1)
-        .sighash(b"first".to_vec())
-        .fee(9)
-        .sighash(b"second".to_vec())
-        .build();
+fn last_fee_wins() {
+    let tx = TxBuilder::new().fee(1).fee(9).build();
     assert_eq!(tx.fee, 9);
-    assert_eq!(tx.sighash, b"second".to_vec());
 }
 
 #[test]
@@ -174,6 +168,12 @@ fn counts_track_additions_in_order() {
 // ---------------------------------------------------------------------------
 // Round-trips through the real VM (validate_tx) — ACCEPT
 // ---------------------------------------------------------------------------
+//
+// `EuTx.sighash` is not authoritative: the verifier always recomputes the signed
+// message as `tx_sighash(&tx)` and only accepts a non-empty declaration that equals
+// it exactly (fail-closed `TxError::SighashMismatch` otherwise). `TxBuilder` has no
+// method that can produce anything else — `build()` leaves the field empty and
+// `build_declared()` embeds the canonical value — so both shapes below round-trip.
 
 #[test]
 fn builder_produces_tx_validate_tx_accepts() {
@@ -184,14 +184,64 @@ fn builder_produces_tx_validate_tx_accepts() {
     // Spend: reveal program (empty redeemer), recreate 99 BLCH, pay 1 fee.
     // Conservation: in 100 == out 99 + fee 1.
     let tx = TxBuilder::new()
-        .sighash(b"m".to_vec())
         .fee(1)
         .spend_input(locked, program.clone(), vec![])
         .output(ext_output_blch(99, &program))
         .build();
 
+    // (a) Regression: an undeclared (empty) sighash always passes — the verifier
+    // computes the canonical message itself.
+    assert!(tx.sighash.is_empty());
     let gas_used = euvm::validate_tx(&tx, &RejectAll, 1_000_000).expect("valid spend");
     assert!(gas_used > 0, "a spend must charge some gas");
+}
+
+#[test]
+fn build_declared_tx_validate_tx_accepts_and_matches_tx_sighash() {
+    let program = always_true();
+    let locked = ext_output(euvm::blch(100), &program, euvm::Val::Int(0));
+
+    let tx = TxBuilder::new()
+        .fee(1)
+        .spend_input(locked, program.clone(), vec![])
+        .output(ext_output_blch(99, &program))
+        .build_declared();
+
+    // (b) Regression: `build_declared()`'s sighash is non-empty and exactly the
+    // canonical `tx_sighash`, and the resulting tx still validates.
+    assert!(!tx.sighash.is_empty());
+    assert_eq!(tx.sighash, euvm::tx_sighash(&tx).to_vec());
+
+    let gas_used = euvm::validate_tx(&tx, &RejectAll, 1_000_000).expect("valid declared spend");
+    assert!(gas_used > 0, "a spend must charge some gas");
+}
+
+/// (c) The old failure shape — a builder-produced tx carrying an arbitrary sighash
+/// label that disagrees with `tx_sighash` and so gets rejected with
+/// `TxError::SighashMismatch` — is unreachable through the public API: `TxBuilder`
+/// simply has no method that accepts a caller-supplied sighash any more (a
+/// COMPILE-TIME guarantee, not a runtime check). This test pins the runtime half of
+/// that claim: every sighash either builder method can produce is one `validate_tx`
+/// accepts, for every declared value seen it is exactly the canonical one.
+#[test]
+fn tx_builder_can_only_produce_sighashes_validate_tx_accepts() {
+    let program = always_true();
+    let build_tx = |m: fn(TxBuilder) -> euvm::EuTx| {
+        let locked = ext_output(euvm::blch(10), &program, euvm::Val::Int(0));
+        let b = TxBuilder::new()
+            .fee(1)
+            .spend_input(locked, program.clone(), vec![])
+            .output(ext_output_blch(9, &program));
+        m(b)
+    };
+
+    let undeclared = build_tx(TxBuilder::build);
+    assert!(undeclared.sighash.is_empty());
+    assert!(euvm::validate_tx(&undeclared, &RejectAll, 1_000_000).is_ok());
+
+    let declared = build_tx(TxBuilder::build_declared);
+    assert_eq!(declared.sighash, euvm::tx_sighash(&declared).to_vec());
+    assert!(euvm::validate_tx(&declared, &RejectAll, 1_000_000).is_ok());
 }
 
 #[test]

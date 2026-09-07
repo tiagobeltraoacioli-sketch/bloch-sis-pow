@@ -14,7 +14,8 @@
 //!   - `sim::simulate_tx` — full `EuTx` validation (`validate_tx` wrapper).
 
 use euvm_tooling::euvm::{
-    blch, validator_hash, Ctx, EuTx, EuTxInput, ExtOutput, Op, TxError, Val, Value, VmError, BLCH,
+    blch, tx_sighash, validator_hash, Ctx, EuTx, EuTxInput, ExtOutput, Op, TxError, Val, Value,
+    VmError, BLCH,
 };
 use euvm_tooling::sim::{self, MockVerifier};
 
@@ -478,7 +479,10 @@ fn simulate_tx_conserving_blch_accepts() {
             datum: Val::Int(0),
         }],
         fee: 10, // 90 + 10 == 100
-        sighash: vec![0xab; 32],
+        // Undeclared: the verifier computes the canonical `tx_sighash` itself. An
+        // arbitrary non-empty value here would be a declaration that disagrees with
+        // it and validate_tx would fail closed with SighashMismatch.
+        sighash: vec![],
     };
     let gas = sim::simulate_tx(&tx, &MockVerifier::never(), 1_000_000).expect("should validate");
     assert!(gas > 0);
@@ -639,8 +643,7 @@ fn simulate_tx_reports_gas_used_matching_run_spend() {
     // The gas simulate_tx reports for a single-input tx should equal what run_spend
     // charges for the same output/program under the tx's ctx (sighash in fields[0]).
     let (prog, prev) = accept_output(blch(10));
-    let sighash = vec![0x11; 32];
-    let tx = EuTx {
+    let mut tx = EuTx {
         inputs: vec![EuTxInput {
             prev_output: prev.clone(),
             validator: prog.clone(),
@@ -652,8 +655,14 @@ fn simulate_tx_reports_gas_used_matching_run_spend() {
             datum: Val::Int(0),
         }],
         fee: 0,
-        sighash: sighash.clone(),
+        sighash: vec![], // filled in below with the canonical value
     };
+    // `tx_sighash` covers inputs/outputs/fee only (never the redeemer), so it can be
+    // computed from this otherwise-finished tx and then declared into it — a
+    // non-canonical value here would make validate_tx fail closed instead.
+    let sighash = tx_sighash(&tx).to_vec();
+    tx.sighash = sighash.clone();
+
     let tx_gas = sim::simulate_tx(&tx, &MockVerifier::never(), 1_000_000).unwrap();
 
     // Mirror the ctx validate_tx builds internally: fields[0] = sighash, tx_outputs set.
