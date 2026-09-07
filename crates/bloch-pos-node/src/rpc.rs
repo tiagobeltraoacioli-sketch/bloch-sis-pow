@@ -69,7 +69,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bloch_pos_committee::header::{BlockEnvelope, BlockId};
 use bloch_pos_committee::interfaces::{StateReader, ValidatorRecord};
@@ -91,8 +91,8 @@ const MAX_HEADER_BYTES: usize = 16 * 1024;
 /// consensus thread must survive its RPC port being hammered.
 const MAX_CONNECTIONS: usize = 64;
 
-/// Socket read/write timeout. A client that opens a connection and never
-/// finishes a request must not hold a slot forever.
+/// Total time allowed to receive a request, and per-write response timeout.
+/// Occasional bytes must not renew a connection's request budget.
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long a request waits for the consensus thread to answer before giving
@@ -1408,30 +1408,56 @@ fn content_type_allowed(ct: Option<&str>) -> bool {
 /// Read one HTTP request and return its body — after the browser-request
 /// gate above has passed.
 fn read_request(sock: &mut TcpStream, hosts: &HostPolicy) -> Result<Vec<u8>, HttpError> {
+    let deadline = Instant::now().checked_add(IO_TIMEOUT)
+        .ok_or_else(|| http_err(408, "request deadline out of range"))?;
+    read_request_until(sock, hosts, deadline)
+}
+
+/// One deadline spans both the head and body. A socket timeout alone starts
+/// over on every `read`, allowing a slow sender to reserve a worker forever.
+fn read_request_until(
+    sock: &mut TcpStream,
+    hosts: &HostPolicy,
+    deadline: Instant,
+) -> Result<Vec<u8>, HttpError> {
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0u8; 4096];
 
     // Head: read until CRLFCRLF, bounded.
     let head_end = loop {
         if let Some(p) = find_head_end(&buf) {
+            if p.checked_add(4).is_none_or(|end| end > MAX_HEADER_BYTES) {
+                return Err(http_err(431, "request header too large"));
+            }
             break p;
         }
-        if buf.len() > MAX_HEADER_BYTES {
+        if buf.len() >= MAX_HEADER_BYTES {
             return Err(http_err(431, "request header too large"));
         }
-        match sock.read(&mut chunk) {
+        let want = chunk.len().min(MAX_HEADER_BYTES.saturating_sub(buf.len()));
+        match read_before_deadline(sock, &mut chunk[..want], deadline) {
             Ok(0) => return Err(http_err(400, "connection closed before the request head ended")),
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
             Err(_) => return Err(http_err(408, "timed out reading the request head")),
         }
     };
 
-    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+    let head = std::str::from_utf8(&buf[..head_end])
+        .map_err(|_| http_err(400, "request head is not UTF-8"))?;
     let mut lines = head.split("\r\n");
     let request_line = lines.next().unwrap_or("");
     let mut parts = request_line.split(' ');
     let verb = parts.next().unwrap_or("");
-    if !verb.eq_ignore_ascii_case("POST") {
+    let target = parts.next().unwrap_or("");
+    let version = parts.next().unwrap_or("");
+    if target.is_empty()
+        || target.bytes().any(|b| b <= b' ' || b == 0x7f)
+        || !matches!(version, "HTTP/1.1" | "HTTP/1.0")
+        || parts.next().is_some()
+    {
+        return Err(http_err(400, "malformed request line"));
+    }
+    if verb != "POST" {
         return Err(http_err(405, "this endpoint accepts POST only"));
     }
 
@@ -1440,20 +1466,40 @@ fn read_request(sock: &mut TcpStream, hosts: &HostPolicy) -> Result<Vec<u8>, Htt
     let mut origin: Option<String> = None;
     let mut host: Option<String> = None;
     for line in lines {
-        let Some((name, value)) = line.split_once(':') else { continue };
-        let name = name.trim();
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(http_err(400, "malformed header field"));
+        };
+        // RFC 9112: whitespace before ':' and obsolete line folding must
+        // not be normalized into a different proxy/backend interpretation.
+        if name.is_empty() || !name.bytes().all(http_token_byte)
+            || value.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7f)
+        {
+            return Err(http_err(400, "malformed header field"));
+        }
+        let value = value.trim_matches([' ', '\t']);
         if name.eq_ignore_ascii_case("content-length") {
-            content_length = value.trim().parse::<usize>().ok();
+            if content_length.is_some() {
+                return Err(http_err(400, "duplicate Content-Length"));
+            }
+            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(http_err(400, "invalid Content-Length"));
+            }
+            content_length = Some(value.parse::<usize>()
+                .map_err(|_| http_err(400, "invalid Content-Length"))?);
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
             // Chunked bodies are not implemented. Saying so beats reading the
             // chunk headers as if they were JSON.
             return Err(http_err(411, "chunked transfer-encoding is not supported; send Content-Length"));
         } else if name.eq_ignore_ascii_case("content-type") {
-            content_type = Some(value.trim().to_string());
+            if content_type.replace(value.to_string()).is_some() {
+                return Err(http_err(400, "duplicate Content-Type"));
+            }
         } else if name.eq_ignore_ascii_case("origin") {
-            origin = Some(value.trim().to_string());
+            origin = Some(value.to_string());
         } else if name.eq_ignore_ascii_case("host") {
-            host = Some(value.trim().to_string());
+            if host.replace(value.to_string()).is_some() {
+                return Err(http_err(400, "duplicate Host"));
+            }
         }
     }
 
@@ -1489,7 +1535,8 @@ fn read_request(sock: &mut TcpStream, hosts: &HostPolicy) -> Result<Vec<u8>, Htt
     let mut body = buf[head_end + 4..].to_vec();
     body.truncate(len);
     while body.len() < len {
-        match sock.read(&mut chunk) {
+        let want = chunk.len().min(len.saturating_sub(body.len()));
+        match read_before_deadline(sock, &mut chunk[..want], deadline) {
             Ok(0) => return Err(http_err(400, "connection closed before the body was complete")),
             Ok(n) => {
                 let want = len - body.len();
@@ -1499,6 +1546,25 @@ fn read_request(sock: &mut TcpStream, hosts: &HostPolicy) -> Result<Vec<u8>, Htt
         }
     }
     Ok(body)
+}
+
+fn http_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
+/// Recompute the remaining budget even after an interrupted read. Failure to
+/// install the timeout is an error, never an unbounded socket operation.
+fn read_before_deadline(sock: &mut TcpStream, buf: &mut [u8], deadline: Instant) -> io::Result<usize> {
+    loop {
+        let remaining = deadline.checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "request deadline exceeded"))?;
+        sock.set_read_timeout(Some(remaining))?;
+        match sock.read(buf) {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
 }
 
 fn find_head_end(buf: &[u8]) -> Option<usize> {

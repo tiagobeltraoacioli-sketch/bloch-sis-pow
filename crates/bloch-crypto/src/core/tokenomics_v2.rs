@@ -800,7 +800,21 @@ mod proptest_invariants {
     use super::*;
     use proptest::prelude::*;
 
+    fn invariant_config() -> ProptestConfig {
+        let mut config = ProptestConfig::default();
+        if cfg!(miri) {
+            // File failure persistence asks for the host working directory,
+            // which Miri correctly refuses in isolation. Keep every property
+            // and the default case count, but use reproducible in-memory
+            // cases under Miri; ordinary tests retain failure persistence.
+            config.failure_persistence = None;
+            config.rng_seed = proptest::test_runner::RngSeed::Fixed(0xB10C_2026);
+        }
+        config
+    }
+
     proptest! {
+        #![proptest_config(invariant_config())]
         // Subsidy never exceeds the genesis initial reward and never drops
         // below the perpetual tail floor — the emission envelope.
         //

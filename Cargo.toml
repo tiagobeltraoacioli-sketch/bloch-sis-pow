@@ -51,6 +51,15 @@ opt-level = 3
 [profile.dev.package.blake2]
 opt-level = 3
 
+# The consensus tests walk long SHAKE reveal chains and sparse Merkle paths.
+# Cargo only honors profiles at the workspace root. These dependency-only
+# overrides restore the committee crate's intended test configuration; the
+# protocol crates retain debug checks, and the release profile is unchanged.
+[profile.dev.package.sha3]
+opt-level = 3
+[profile.dev.package.keccak]
+opt-level = 3
+
 [profile.release]
 opt-level      = 3
 lto            = true
