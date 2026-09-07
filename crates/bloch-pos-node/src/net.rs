@@ -521,7 +521,9 @@ fn write_frame(sock: &mut TcpStream, frame: &[u8]) -> std::io::Result<()> {
 }
 
 fn read_frame(sock: &mut TcpStream) -> std::io::Result<Vec<u8>> {
-    read_frame_until(sock, Instant::now() + DEVNET_IO_TIMEOUT)
+    let deadline = Instant::now().checked_add(DEVNET_IO_TIMEOUT)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "frame deadline out of range"))?;
+    read_frame_until(sock, deadline)
 }
 
 fn read_frame_until(sock: &mut TcpStream, deadline: Instant) -> std::io::Result<Vec<u8>> {

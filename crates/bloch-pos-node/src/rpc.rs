@@ -1408,7 +1408,9 @@ fn content_type_allowed(ct: Option<&str>) -> bool {
 /// Read one HTTP request and return its body — after the browser-request
 /// gate above has passed.
 fn read_request(sock: &mut TcpStream, hosts: &HostPolicy) -> Result<Vec<u8>, HttpError> {
-    read_request_until(sock, hosts, Instant::now() + IO_TIMEOUT)
+    let deadline = Instant::now().checked_add(IO_TIMEOUT)
+        .ok_or_else(|| http_err(408, "request deadline out of range"))?;
+    read_request_until(sock, hosts, deadline)
 }
 
 /// One deadline spans both the head and body. A socket timeout alone starts
@@ -1424,7 +1426,7 @@ fn read_request_until(
     // Head: read until CRLFCRLF, bounded.
     let head_end = loop {
         if let Some(p) = find_head_end(&buf) {
-            if p + 4 > MAX_HEADER_BYTES {
+            if p.checked_add(4).is_none_or(|end| end > MAX_HEADER_BYTES) {
                 return Err(http_err(431, "request header too large"));
             }
             break p;
@@ -1432,7 +1434,7 @@ fn read_request_until(
         if buf.len() >= MAX_HEADER_BYTES {
             return Err(http_err(431, "request header too large"));
         }
-        let want = chunk.len().min(MAX_HEADER_BYTES - buf.len());
+        let want = chunk.len().min(MAX_HEADER_BYTES.saturating_sub(buf.len()));
         match read_before_deadline(sock, &mut chunk[..want], deadline) {
             Ok(0) => return Err(http_err(400, "connection closed before the request head ended")),
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
@@ -1533,7 +1535,7 @@ fn read_request_until(
     let mut body = buf[head_end + 4..].to_vec();
     body.truncate(len);
     while body.len() < len {
-        let want = chunk.len().min(len - body.len());
+        let want = chunk.len().min(len.saturating_sub(body.len()));
         match read_before_deadline(sock, &mut chunk[..want], deadline) {
             Ok(0) => return Err(http_err(400, "connection closed before the body was complete")),
             Ok(n) => {
