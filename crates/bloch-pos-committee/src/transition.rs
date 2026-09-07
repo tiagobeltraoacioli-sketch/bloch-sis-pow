@@ -1275,17 +1275,24 @@ impl<'a> TxReader<'a> {
     fn u8(&mut self) -> Result<u8, TxDecodeError> {
         Ok(self.take(1)?[0])
     }
+    // `take(n)` returns exactly `n` bytes or `Truncated`, so none of the
+    // fixed-width conversions below can fail; they are spelled as `?` on
+    // the same error rather than `unwrap()` so the decoder has no panic
+    // site (hardened ratchet, O07). Identical result on every input.
     fn u32(&mut self) -> Result<u32, TxDecodeError> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(u32::from_le_bytes(Self::fixed(self.take(4)?)?))
     }
     fn u64(&mut self) -> Result<u64, TxDecodeError> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(u64::from_le_bytes(Self::fixed(self.take(8)?)?))
     }
     fn u128(&mut self) -> Result<u128, TxDecodeError> {
-        Ok(u128::from_le_bytes(self.take(16)?.try_into().unwrap()))
+        Ok(u128::from_le_bytes(Self::fixed(self.take(16)?)?))
     }
     fn h32(&mut self) -> Result<[u8; 32], TxDecodeError> {
-        Ok(self.take(32)?.try_into().unwrap())
+        Self::fixed(self.take(32)?)
+    }
+    fn fixed<const N: usize>(s: &[u8]) -> Result<[u8; N], TxDecodeError> {
+        <[u8; N]>::try_from(s).map_err(|_| TxDecodeError::Truncated)
     }
     fn bytes(&mut self) -> Result<Vec<u8>, TxDecodeError> {
         let n = self.u32()? as usize;
@@ -5011,10 +5018,13 @@ impl CommittedState {
                 // Stake basis is the CAPPED effective stake: stake above the
                 // per-validator or cohort cap carries no weight and earns
                 // nothing — the caps would be decorative otherwise.
+                // `issuance_registry` is `Some` exactly when `rewards_v2`
+                // (resolved above under that very flag), so binding it here
+                // IS the gate test — with no panic site for the impossible
+                // `rewards_v2 && None` case (hardened ratchet, O07).
                 let (attested, delegated_stake, commission_bps, extra_credit, extra_max) =
-                    if rewards_v2 {
+                    if let Some(registry) = issuance_registry.as_ref() {
                         let attested = valid_credit.get(&v.index).copied().unwrap_or(false);
-                        let registry = issuance_registry.as_ref().expect("gated above");
                         let delegated_stake = registry.stake_of(v.index);
                         let commission_bps =
                             st.validators.get(&v.index).map_or(0, |r| r.commission_bps);
@@ -5064,8 +5074,10 @@ impl CommittedState {
                 // the arithmetic is a generic pro-rata split, not specific to
                 // fees). Below the gate `delegated_stake` is always 0 above,
                 // so `payout.delegators` is always 0 and this never runs.
-                if payout.delegators > 0 {
-                    let registry = issuance_registry.as_ref().expect("gated above: payout.delegators > 0 implies delegated_stake > 0, which is only ever non-zero when rewards_v2 is active");
+                // `payout.delegators > 0` implies `delegated_stake > 0`, which
+                // is only ever non-zero when the registry above is `Some`; the
+                // `filter` binds both facts in one pattern with no panic site.
+                if let Some(registry) = issuance_registry.as_ref().filter(|_| payout.delegators > 0) {
                     let mut by_account: BTreeMap<u32, u128> = BTreeMap::new();
                     for d in &st.delegations {
                         if d.validator != v.index {

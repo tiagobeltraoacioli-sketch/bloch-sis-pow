@@ -129,24 +129,30 @@ impl BlockHeaderV4 {
     /// SHA3-256 collision resistance).
     pub fn canonical_serialize(&self) -> [u8; Self::ENCODED_LEN] {
         let mut out = [0u8; Self::ENCODED_LEN];
-        let mut at = 0usize;
-        let mut put = |src: &[u8]| {
-            out[at..at + src.len()].copy_from_slice(src);
-            at += src.len();
-        };
-        put(&self.version.to_le_bytes());
-        put(&self.parent);
-        put(&self.state_root);
-        put(&self.body_root);
-        put(&self.slot.to_le_bytes());
-        put(&self.proposer_index.to_le_bytes());
-        put(&self.randao_reveal);
-        put(&self.randao_mix);
-        put(&self.justified_root);
-        put(&self.finalized_root);
-        put(&self.attestation_root);
-        put(&self.coherence_root);
-        debug_assert_eq!(at, Self::ENCODED_LEN, "encoding drifted from ENCODED_LEN");
+        {
+            // The write cursor is the not-yet-written tail of `out` rather than
+            // an offset: `split_at_mut` advances it with no index arithmetic,
+            // and exhausts it exactly when the encoding reaches ENCODED_LEN.
+            let mut rest: &mut [u8] = &mut out;
+            let mut put = |src: &[u8]| {
+                let (head, tail) = core::mem::take(&mut rest).split_at_mut(src.len());
+                head.copy_from_slice(src);
+                rest = tail;
+            };
+            put(&self.version.to_le_bytes());
+            put(&self.parent);
+            put(&self.state_root);
+            put(&self.body_root);
+            put(&self.slot.to_le_bytes());
+            put(&self.proposer_index.to_le_bytes());
+            put(&self.randao_reveal);
+            put(&self.randao_mix);
+            put(&self.justified_root);
+            put(&self.finalized_root);
+            put(&self.attestation_root);
+            put(&self.coherence_root);
+            debug_assert!(rest.is_empty(), "encoding drifted from ENCODED_LEN");
+        }
         out
     }
 
@@ -164,22 +170,32 @@ impl BlockHeaderV4 {
         // Offsets are spelled out rather than computed so that a mismatch
         // with the encoder is caught by the round-trip test instead of being
         // reproduced symmetrically on both sides.
-        let arr = |range: core::ops::Range<usize>| -> [u8; 32] {
-            bytes[range].try_into().expect("32-byte slice")
+        //
+        // Every `try_from` below is on a sub-range of a slice whose length was
+        // just checked to be exactly ENCODED_LEN, so none can fail. The `Err`
+        // arm exists so that the decoder has no panic site at all: were the
+        // length check and these offsets ever to disagree, the header would be
+        // refused as malformed (the caller already treats `WrongLength` as
+        // "block invalid") instead of halting the node — strictly safer.
+        let fail = || DecodeError::WrongLength { got: bytes.len() };
+        let arr = |range: core::ops::Range<usize>| -> Result<[u8; 32], DecodeError> {
+            <[u8; 32]>::try_from(&bytes[range]).map_err(|_| fail())
         };
         Ok(Self {
-            version: u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes")),
-            parent: arr(4..36),
-            state_root: arr(36..68),
-            body_root: arr(68..100),
-            slot: u64::from_le_bytes(bytes[100..108].try_into().expect("8 bytes")),
-            proposer_index: u32::from_le_bytes(bytes[108..112].try_into().expect("4 bytes")),
-            randao_reveal: arr(112..144),
-            randao_mix: arr(144..176),
-            justified_root: arr(176..208),
-            finalized_root: arr(208..240),
-            attestation_root: arr(240..272),
-            coherence_root: arr(272..304),
+            version: u32::from_le_bytes(<[u8; 4]>::try_from(&bytes[0..4]).map_err(|_| fail())?),
+            parent: arr(4..36)?,
+            state_root: arr(36..68)?,
+            body_root: arr(68..100)?,
+            slot: u64::from_le_bytes(<[u8; 8]>::try_from(&bytes[100..108]).map_err(|_| fail())?),
+            proposer_index: u32::from_le_bytes(
+                <[u8; 4]>::try_from(&bytes[108..112]).map_err(|_| fail())?,
+            ),
+            randao_reveal: arr(112..144)?,
+            randao_mix: arr(144..176)?,
+            justified_root: arr(176..208)?,
+            finalized_root: arr(208..240)?,
+            attestation_root: arr(240..272)?,
+            coherence_root: arr(272..304)?,
         })
     }
 

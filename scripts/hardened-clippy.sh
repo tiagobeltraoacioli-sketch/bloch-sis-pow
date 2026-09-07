@@ -95,6 +95,26 @@
 # documented as the crate that had already reached 0 and was a hard gate again
 # — it has 30.
 #
+# UPDATE 2026-09-07 (O07, bloch-pos-committee only): the four `expect()`s in
+# header.rs's decoder (an infallible `try_into` after the length was already
+# checked) became a `Result` path returning the existing `WrongLength` error;
+# gossip.rs's hold-queue eviction (`keys().next()` under a `len() >= cap > 0`
+# invariant) became a pattern that cannot panic; transition.rs's TxReader
+# `try_into().unwrap()`s (after a `take(n)` that returns exactly n bytes) became
+# `?` on the decoder's own `Truncated`, and the two REWARDS_V2 `expect("gated
+# above")`s became `if let Some(registry)` bindings on the option that IS the
+# gate. Panics 9 -> 0: the live consensus crate is a hard panic gate again,
+# with `bloch-euvm`. Twenty-four
+# arithmetic_side_effects sites in beacon.rs, finality.rs, gossip.rs, header.rs,
+# schedule.rs, staking.rs and ws.rs became either a checked/saturating op
+# (saturating only on bounds/counters, never on a value that could enter a
+# committed root) or a targeted `#[allow(clippy::arithmetic_side_effects)]`
+# with a proof naming the bound. Arith 199 -> 186. `other` was already 0.
+# Every transformation is behaviour-preserving on every input the chain has
+# ever seen; where a panic became an error return, the error is one the
+# caller already treated as "block invalid". Re-measured by this script;
+# full `cargo test -p bloch-pos-committee` green.
+#
 # bloch-pos-node is the one number that genuinely moved: 28 panic sites against
 # a recorded 27, a real regression that landed between 8167ceb and e266a76c
 # while the job was red for unrelated reasons and nobody could read it. It is
@@ -187,7 +207,7 @@ ratchet() {
 
 # ── LIVE: Genesis-4 ──────────────────────────────────────────────────────────
 ratchet "bloch-pos-committee — Genesis-4 consensus, LIVE" \
-  bloch-pos-committee 9 199 3 --lib --no-deps
+  bloch-pos-committee 0 186 0 --lib --no-deps
 
 # No lib target: this crate is a binary. --bins, not --lib.
 ratchet "bloch-pos-node — the bloch-pos binary, LIVE" \

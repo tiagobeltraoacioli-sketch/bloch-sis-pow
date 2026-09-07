@@ -185,9 +185,12 @@ impl EpochSchedule {
             return None;
         }
         // epoch_of(slot) == self.epoch implies first_slot_of_epoch cannot
-        // have overflowed, so the subtraction is in range.
+        // have overflowed and that slot >= first, so the subtraction is in
+        // range; `checked_sub` makes the (unreachable) alternative a `None`
+        // rather than a panic, on the Option path this function already has.
         let first = first_slot_of_epoch(self.epoch)?;
-        self.proposers[(slot - first) as usize]
+        let offset = slot.checked_sub(first)?;
+        self.proposers[offset as usize]
     }
 }
 
@@ -218,7 +221,11 @@ pub fn epoch_schedule(
         // draws, not 32 reads of one shuffled list. A validator's chance in
         // slot n is therefore independent of who got slot n-1 — with heavily
         // skewed stake the same validator legitimately repeats.
-        *p = proposer(beacon_mix, first + i as u64, validators);
+        //
+        // `first + i` is in range because `last_slot_of_epoch` above proved
+        // `first + SLOTS_PER_EPOCH - 1` is; `checked_add` keeps the
+        // unreachable alternative a `None` instead of a panic.
+        *p = proposer(beacon_mix, first.checked_add(i as u64)?, validators);
     }
     Some(EpochSchedule { epoch, proposers })
 }

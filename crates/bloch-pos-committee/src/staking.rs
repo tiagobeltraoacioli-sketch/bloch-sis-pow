@@ -633,7 +633,12 @@ pub fn resolve_activations(
                 continue;
             }
             done[i] = true;
-            admitted_this_epoch += 1;
+            // Cannot overflow: the `== MAX_ACTIVATIONS_PER_EPOCH` break above
+            // means `admitted_this_epoch < MAX_ACTIVATIONS_PER_EPOCH` (4) here.
+            #[allow(clippy::arithmetic_side_effects)]
+            {
+                admitted_this_epoch += 1;
+            }
             activated.push((d.pubkey_hash, e));
         }
     }

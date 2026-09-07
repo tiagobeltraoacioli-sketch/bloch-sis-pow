@@ -244,20 +244,27 @@ impl WeakSubjectivityCheckpoint {
     /// declared order, integers little-endian, nothing optional.
     pub fn canonical_serialize(&self) -> [u8; WS_CHECKPOINT_BYTES] {
         let mut out = [0u8; WS_CHECKPOINT_BYTES];
-        let mut at = 0usize;
-        let mut put = |bytes: &[u8]| {
-            out[at..at + bytes.len()].copy_from_slice(bytes);
-            at += bytes.len();
-        };
-        put(&self.version.to_le_bytes());
-        put(&self.network_id.to_le_bytes());
-        put(&self.genesis_root);
-        put(&self.epoch.to_le_bytes());
-        put(&self.block_root);
-        put(&self.state_root);
-        put(&self.validator_set_root);
-        put(&self.issued_at.to_le_bytes());
-        put(&self.signer_set_id.to_le_bytes());
+        {
+            // The write cursor is the not-yet-written tail of `out` rather than
+            // an offset: `split_at_mut` advances it with no index arithmetic,
+            // and exhausts it exactly when the encoding reaches the pinned size.
+            let mut rest: &mut [u8] = &mut out;
+            let mut put = |bytes: &[u8]| {
+                let (head, tail) = core::mem::take(&mut rest).split_at_mut(bytes.len());
+                head.copy_from_slice(bytes);
+                rest = tail;
+            };
+            put(&self.version.to_le_bytes());
+            put(&self.network_id.to_le_bytes());
+            put(&self.genesis_root);
+            put(&self.epoch.to_le_bytes());
+            put(&self.block_root);
+            put(&self.state_root);
+            put(&self.validator_set_root);
+            put(&self.issued_at.to_le_bytes());
+            put(&self.signer_set_id.to_le_bytes());
+            debug_assert!(rest.is_empty(), "encoding drifted from WS_CHECKPOINT_BYTES");
+        }
         out
     }
 

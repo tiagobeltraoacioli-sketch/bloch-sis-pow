@@ -458,6 +458,9 @@ impl FinalityState {
 
         // ── 2. Justify / finalize ──────────────────────────────────────────
         let mut tally: BTreeMap<[u8; 32], u128> = BTreeMap::new();
+        // Cannot overflow: `valid` is keyed by u32 validator index, so a tally
+        // sums at most 2^32 distinct u64 stakes — under 2^96 in u128.
+        #[allow(clippy::arithmetic_side_effects)]
         for (validator, data) in &valid {
             *tally.entry(data.target_root).or_insert(0) += stake[validator] as u128;
         }
@@ -465,7 +468,12 @@ impl FinalityState {
         // ≥ 2/3 as 3·w ≥ 2·total: exact in integers, so the boundary case is
         // the same on every node. `total_active > 0` guards the degenerate
         // fully-leaked committee, where 0 ≥ 0 would "justify" an empty vote.
+        //
+        // Cannot overflow: `weight` < 2^96 (see the tally above) so 3·weight
+        // < 2^98; `total_active` is at most `unleaked_total`, a u128 sum of
+        // fewer than 2^63 u64 stakes, so it is < 2^127 and 2·total < 2^128.
         let mut justified_now: Option<Checkpoint> = None;
+        #[allow(clippy::arithmetic_side_effects)]
         for (root, weight) in &tally {
             if total_active > 0 && weight * 3 >= total_active * 2 {
                 // Two roots both reaching 2/3 is arithmetically impossible
@@ -490,7 +498,12 @@ impl FinalityState {
             // reporting it as new would make "finalized this epoch" fire on
             // every first epoch. Same-epoch-different-root cannot occur: only
             // one root is ever justified per epoch.
-            if cp.epoch == source.epoch + 1 && source.epoch > self.finalized.epoch {
+            // `checked_add`: identical verdict whenever `source.epoch + 1`
+            // is representable; the (unreachable) overflow case compares
+            // unequal instead of panicking.
+            if source.epoch.checked_add(1) == Some(cp.epoch)
+                && source.epoch > self.finalized.epoch
+            {
                 self.finalized = source;
                 finalized_now = Some(source);
             }
@@ -508,6 +521,9 @@ impl FinalityState {
             // classic Casper shape: the longer the stall, the faster absent
             // stake evaporates, so recovery time is bounded instead of
             // drifting with the size of the absent fraction.
+            // Cannot underflow: `leaking` is exactly
+            // `since_finality > INACTIVITY_LEAK_THRESHOLD_EPOCHS`.
+            #[allow(clippy::arithmetic_side_effects)]
             let t = (since_finality - INACTIVITY_LEAK_THRESHOLD_EPOCHS) as u128;
             for v in votes.active_set {
                 if valid.contains_key(&v.index) {
@@ -519,9 +535,19 @@ impl FinalityState {
                 }
                 // max(·, 1): integer division must not let a small stake sit
                 // out the leak forever; min(·, remaining): never underflow.
+                //
+                // Cannot overflow: `remaining` and `t` are both u64 values, so
+                // their u128 product is < 2^128.
+                #[allow(clippy::arithmetic_side_effects)]
                 let bite = ((remaining as u128 * t) / INACTIVITY_LEAK_QUOTIENT).max(1) as u64;
                 let bite = bite.min(remaining);
-                *self.leaked.entry(v.index).or_insert(0) += bite;
+                // Cannot overflow: `remaining = effective_stake - leaked` (the
+                // `stake` map, saturating; a zero skipped above), and
+                // `bite <= remaining`, so `leaked + bite <= effective_stake`.
+                #[allow(clippy::arithmetic_side_effects)]
+                {
+                    *self.leaked.entry(v.index).or_insert(0) += bite;
+                }
             }
         }
 
@@ -579,7 +605,11 @@ impl FinalityState {
                 }
                 if let Some(leaked) = self.leaked.get_mut(&v.index) {
                     let back = (*leaked / INACTIVITY_LEAK_RECOVERY_QUOTIENT).max(1).min(*leaked);
-                    *leaked -= back;
+                    // Cannot underflow: `back <= *leaked` by the `.min(*leaked)`.
+                    #[allow(clippy::arithmetic_side_effects)]
+                    {
+                        *leaked -= back;
+                    }
                     if *leaked == 0 {
                         drained.push(v.index);
                     }

@@ -321,8 +321,18 @@ impl AttestationPool {
         //    node replaying its view, ahead is clock skew. Neither is
         //    provable hostility, and penalizing either graylists honest
         //    peers — the exact failure this module exists to prevent.
-        if slot + ATTESTATION_WINDOW_SLOTS < current_slot
-            || slot > current_slot + CLOCK_SKEW_SLOTS
+        //
+        //    Saturating on purpose: these are window BOUNDS, and a bound that
+        //    saturates at u64::MAX is still the same bound. `slot` is
+        //    peer-supplied, so an attestation claiming a slot within
+        //    ATTESTATION_WINDOW_SLOTS of u64::MAX used to trip overflow-checks
+        //    here and abort the node; it is now Ignored like any other
+        //    out-of-window slot (a saturated `slot + W` is >= current_slot,
+        //    and such a slot exceeds `current_slot + skew` for every
+        //    current_slot the chain can reach). For every non-overflowing
+        //    input the decision is unchanged.
+        if slot.saturating_add(ATTESTATION_WINDOW_SLOTS) < current_slot
+            || slot > current_slot.saturating_add(CLOCK_SKEW_SLOTS)
         {
             return GossipDecision::Ignore(IgnoreReason::OutsideWindow);
         }
@@ -543,14 +553,25 @@ impl AttestationPool {
         while self.pending.len() >= MAX_PENDING_ATTESTATIONS {
             // Oldest first. `keys().next()` on a BTreeMap is the smallest
             // sequence number ever still present — insertion order, exactly.
-            let oldest = *self.pending.keys().next().expect("non-empty: len >= cap > 0");
+            // The map is non-empty here (`len() >= cap > 0`), so the `else`
+            // arm is unreachable; it is a `break` rather than a panic so that
+            // the hold queue has no panic site — if the invariant were ever
+            // broken the pool would simply stop evicting for this call.
+            let Some(&oldest) = self.pending.keys().next() else { break };
             self.evict(oldest);
         }
         let seq = self.next_seq;
         self.next_seq += 1;
         self.pending_keys.insert((att.data.slot, att.validator, data_hash));
         self.pending_by_root.entry(missing_root).or_default().insert(seq);
-        *self.pending_by_duty.entry(duty).or_insert(0) += 1;
+        // Cannot overflow: this count is the number of pending entries for one
+        // duty (incremented here, decremented in `evict` for the same entry),
+        // so it is <= pending.len() < MAX_PENDING_ATTESTATIONS (256) after the
+        // eviction loop above.
+        #[allow(clippy::arithmetic_side_effects)]
+        {
+            *self.pending_by_duty.entry(duty).or_insert(0) += 1;
+        }
         self.pending.insert(seq, PendingEntry { att, missing_root });
         GossipDecision::Hold { missing_root }
     }

@@ -123,12 +123,17 @@ impl RandaoChain {
     /// client draws it from the OS RNG); this function is deterministic so
     /// that a chain can be rebuilt from a backed-up seed.
     pub fn generate(seed: [u8; 32]) -> Self {
-        let k = RANDAO_CHAIN_LENGTH as usize;
-        let mut values = Vec::with_capacity(k + 1);
-        values.push(seed);
-        for j in 1..=k {
-            let next = chain_step(&values[j - 1]);
-            values.push(next);
+        // Compile-time constant: the chain holds the seed plus one value per
+        // step, so any overflow here is a build error rather than a runtime one.
+        const CHAIN_VALUES: usize = RANDAO_CHAIN_LENGTH as usize + 1;
+        let mut values = Vec::with_capacity(CHAIN_VALUES);
+        // Each value is the image of the previous one; carrying `cur` forward
+        // is the same recurrence as indexing `values[j - 1]`, without the index.
+        let mut cur = seed;
+        values.push(cur);
+        for _ in 0..RANDAO_CHAIN_LENGTH {
+            cur = chain_step(&cur);
+            values.push(cur);
         }
         RandaoChain { values, revealed: 0 }
     }
@@ -141,7 +146,10 @@ impl RandaoChain {
 
     /// Reveals still available before the chain is spent.
     pub fn remaining(&self) -> u32 {
-        RANDAO_CHAIN_LENGTH - self.revealed
+        // `revealed <= RANDAO_CHAIN_LENGTH` always (`next_reveal` only advances
+        // while `peek_reveal` succeeds), so this never actually saturates; a
+        // remaining-count is a bound, for which saturating is the right shape.
+        RANDAO_CHAIN_LENGTH.saturating_sub(self.revealed)
     }
 
     /// Non-consuming view of the value [`Self::next_reveal`] would return.
@@ -156,7 +164,12 @@ impl RandaoChain {
         if self.revealed >= RANDAO_CHAIN_LENGTH {
             return None;
         }
-        Some(self.values[RANDAO_CHAIN_LENGTH as usize - 1 - self.revealed as usize])
+        // The guard above gives `revealed <= RANDAO_CHAIN_LENGTH - 1`, so the
+        // subtraction is in range; `checked_sub` keeps the unreachable
+        // alternative a `None` on the Option path this function already has.
+        const LAST: usize = RANDAO_CHAIN_LENGTH as usize - 1;
+        let idx = LAST.checked_sub(self.revealed as usize)?;
+        Some(self.values[idx])
     }
 
     /// Produce the next reveal — the preimage one step below the last value
@@ -168,7 +181,12 @@ impl RandaoChain {
     /// slot this validator does not propose in touches nothing here.
     pub fn next_reveal(&mut self) -> Option<[u8; 32]> {
         let reveal = self.peek_reveal()?;
-        self.revealed += 1;
+        // Cannot overflow: `peek_reveal` returned `Some`, so
+        // `revealed < RANDAO_CHAIN_LENGTH` (8,192) here.
+        #[allow(clippy::arithmetic_side_effects)]
+        {
+            self.revealed += 1;
+        }
         Some(reveal)
     }
 }
@@ -226,7 +244,13 @@ impl RevealState {
         if chain_step(reveal) != self.commitment {
             return Err(BeaconError::InvalidReveal);
         }
-        Ok(RevealState { commitment: *reveal, reveals_used: self.reveals_used + 1 })
+        // `is_exhausted()` was false, so `reveals_used < RANDAO_CHAIN_LENGTH`
+        // and the increment cannot overflow. The `checked_add` is there so the
+        // transition has no panic site: were the invariant ever broken, the
+        // reveal is refused as `ChainExhausted` — an error the caller already
+        // treats as "block invalid" — instead of halting the node.
+        let reveals_used = self.reveals_used.checked_add(1).ok_or(BeaconError::ChainExhausted)?;
+        Ok(RevealState { commitment: *reveal, reveals_used })
     }
 
     /// Apply a re-commit transaction: a fresh `c_0` from a brand-new chain.
