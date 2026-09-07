@@ -43,11 +43,20 @@ impl<'a> Reader<'a> {
     }
 
     pub fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeErr> {
-        if self.buf.len() - self.at < n {
-            return Err(DecodeErr("truncated"));
-        }
-        let s = &self.buf[self.at..self.at + n];
-        self.at += n;
+        // Removed by construction: `self.at` never exceeds `self.buf.len()`
+        // (it is only ever advanced here, by exactly the amount checked
+        // below), but a plain `buf.len() - at` still asks clippy to trust
+        // that invariant across the whole module. `checked_add` instead
+        // proves the bound locally, and a length field large enough to
+        // overflow `usize` now takes the same "truncated" refusal as one
+        // that is merely too long — an untrusted input that would have
+        // panicked is refused instead.
+        let end = match self.at.checked_add(n) {
+            Some(end) if end <= self.buf.len() => end,
+            _ => return Err(DecodeErr("truncated")),
+        };
+        let s = &self.buf[self.at..end];
+        self.at = end;
         Ok(s)
     }
 
@@ -56,23 +65,46 @@ impl<'a> Reader<'a> {
     }
 
     pub fn u16(&mut self) -> Result<u16, DecodeErr> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+        // `take(2)` returns a slice of exactly 2 bytes or an `Err` above, so
+        // the length check `try_into` performs can never fail; the `else`
+        // arm is unreachable but keeps the conversion panic-free by
+        // construction rather than by an `unwrap`.
+        let Ok(a) = self.take(2)?.try_into() else {
+            return Err(DecodeErr("truncated"));
+        };
+        Ok(u16::from_le_bytes(a))
     }
 
     pub fn u32(&mut self) -> Result<u32, DecodeErr> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        // See `u16`: `take(4)` guarantees exactly 4 bytes.
+        let Ok(a) = self.take(4)?.try_into() else {
+            return Err(DecodeErr("truncated"));
+        };
+        Ok(u32::from_le_bytes(a))
     }
 
     pub fn u64(&mut self) -> Result<u64, DecodeErr> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+        // See `u16`: `take(8)` guarantees exactly 8 bytes.
+        let Ok(a) = self.take(8)?.try_into() else {
+            return Err(DecodeErr("truncated"));
+        };
+        Ok(u64::from_le_bytes(a))
     }
 
     pub fn u128(&mut self) -> Result<u128, DecodeErr> {
-        Ok(u128::from_le_bytes(self.take(16)?.try_into().unwrap()))
+        // See `u16`: `take(16)` guarantees exactly 16 bytes.
+        let Ok(a) = self.take(16)?.try_into() else {
+            return Err(DecodeErr("truncated"));
+        };
+        Ok(u128::from_le_bytes(a))
     }
 
     pub fn h32(&mut self) -> Result<[u8; 32], DecodeErr> {
-        Ok(self.take(32)?.try_into().unwrap())
+        // See `u16`: `take(32)` guarantees exactly 32 bytes.
+        let Ok(a) = self.take(32)?.try_into() else {
+            return Err(DecodeErr("truncated"));
+        };
+        Ok(a)
     }
 
     pub fn bytes(&mut self) -> Result<Vec<u8>, DecodeErr> {
@@ -126,7 +158,12 @@ pub fn decode_attestation(r: &mut Reader<'_>) -> Result<Attestation, DecodeErr> 
 // ── Block envelope ──────────────────────────────────────────────────────────
 
 pub fn encode_envelope(env: &BlockEnvelope) -> Vec<u8> {
-    let mut out = Vec::with_capacity(512 + env.proposer_sig.len());
+    // `with_capacity` is a size hint, not a correctness bound: saturating is
+    // the intended semantics here (the alternative to saturation is "guess
+    // low", not "refuse to encode"), and `proposer_sig` is capped at
+    // `MAX_FIELD_LEN` (8 MiB) everywhere it is produced, far below
+    // `usize::MAX - 512`, so saturation is not reachable in practice either.
+    let mut out = Vec::with_capacity(512usize.saturating_add(env.proposer_sig.len()));
     out.extend_from_slice(&env.header.canonical_serialize());
     put_bytes(&mut out, &env.proposer_sig);
     out.extend_from_slice(&(env.body.attestations.len() as u32).to_le_bytes());
@@ -195,7 +232,11 @@ pub fn unhex(s: &str) -> Result<Vec<u8>, String> {
     for pair in b.chunks(2) {
         let hi = (pair[0] as char).to_digit(16).ok_or_else(|| format!("bad hex digit {:?}", pair[0] as char))?;
         let lo = (pair[1] as char).to_digit(16).ok_or_else(|| format!("bad hex digit {:?}", pair[1] as char))?;
-        out.push((hi * 16 + lo) as u8);
+        // `to_digit(16)` guarantees hi, lo ∈ 0..=15, so hi*16+lo ∈ 0..=255:
+        // cannot overflow u32 and fits u8 exactly.
+        #[allow(clippy::arithmetic_side_effects)]
+        let byte = hi * 16 + lo;
+        out.push(byte as u8);
     }
     Ok(out)
 }

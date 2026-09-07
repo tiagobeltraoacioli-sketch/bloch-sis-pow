@@ -434,6 +434,11 @@ impl CarryoverSnapshot {
     }
 }
 
+// Each arm's pattern guarantees the subtraction (and, for `'a'..='f'`, the
+// following `+ 10`) stays within its match-arm bound: `b'0'..=b'9' => 0..=9`,
+// `b'a'..=b'f' => (0..=5) + 10 == 10..=15` — always in-range for `u8`, never
+// underflowing or overflowing.
+#[allow(clippy::arithmetic_side_effects)]
 fn hex_nibble(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -577,13 +582,18 @@ pub fn read_carryover_snapshot<R: BufRead>(
         // file with no newline in it would otherwise pull the whole thing into
         // memory before the cap below could object — which is the allocation
         // the cap exists to prevent.
-        let read = std::io::Read::take(&mut src, MAX_SNAPSHOT_LINE as u64 + 1)
+        // `MAX_SNAPSHOT_LINE` is a fixed 4_096-byte constant; `+ 1` (one byte
+        // over the cap, so a too-long line is detected rather than silently
+        // truncated at the boundary) cannot approach u64::MAX.
+        let read = std::io::Read::take(&mut src, (MAX_SNAPSHOT_LINE as u64).saturating_add(1))
             .read_until(b'\n', &mut line)
             .map_err(CarryoverError::Io)?;
         if read == 0 {
             break;
         }
-        n += 1;
+        // Line counter, used only for the cap check just below and in error
+        // messages: saturating is the intended semantics.
+        n = n.saturating_add(1);
         // Hash the raw bytes, before any interpretation of them: the file
         // digest must be over the file as it sits on disk, or "these exact
         // bytes" silently becomes "these bytes as this parser understood
@@ -722,8 +732,20 @@ pub fn read_carryover_snapshot<R: BufRead>(
                 what: format!("{value} sat becomes {split} sat under the split, past u64"),
             });
         };
-        g3_total_sat += u128::from(value); // u128 over u64 rows: cannot overflow
-        split_total += split;
+        // u128 accumulator over at most MAX_CARRYOVER_ENTRIES (16,000,000)
+        // rows, each at most u64::MAX: the sum is bounded by
+        // 16_000_000 * u64::MAX ≈ 2.95e26, far below u128::MAX ≈ 3.4e38.
+        #[allow(clippy::arithmetic_side_effects)]
+        {
+            g3_total_sat += u128::from(value);
+        }
+        // `split` is `split_g3_sat(value)` — the split of one row never
+        // exceeds the row (§ the dust-rule comment below) — so this sum is
+        // bounded by the same 16,000,000 × u64::MAX argument as above.
+        #[allow(clippy::arithmetic_side_effects)]
+        {
+            split_total += split;
+        }
 
         entries.push(EutxoEntry {
             // The Genesis-3 outpoint crosses unchanged. It is what wallets,
@@ -750,6 +772,9 @@ pub fn read_carryover_snapshot<R: BufRead>(
     // ledger is worth; the rows sum to that or just under it, never over
     // (a sum of floors never exceeds the floor of the sum).
     let exact = tokenomics_v4::split_g3_sat(g3_total_sat);
+    // Per the comment above: a sum of floors never exceeds the floor of the
+    // sum, so `split_total <= exact` always.
+    #[allow(clippy::arithmetic_side_effects)]
     let dust_sat = exact - split_total;
     if dust_sat > 0 {
         // Highest value; ties to the lowest (txid, vout). The strict `>` is
@@ -955,10 +980,22 @@ impl Manifest {
         }
         let mut allocations = Vec::with_capacity(na);
         for _ in 0..na {
+            let purpose = r.u8()?;
+            let script_hash = r.h32()?;
+            let amount_sat = r.u128()?;
+            // Refused here, at decode, rather than left to panic later: every
+            // real node reaches `amount_sat` only through this function
+            // (`Manifest::load`), and `allocation_outputs` converts it to
+            // `u64` to build the genesis eUTXO set on every boot. A manifest
+            // whose allocation cannot be committed truthfully as u64
+            // satoshis is a malformed manifest, not a node crash.
+            if u64::try_from(amount_sat).is_err() {
+                return Err(DecodeErr("allocation amount exceeds u64 satoshis"));
+            }
             allocations.push(GenesisAllocation {
-                purpose: r.u8()?,
-                script_hash: r.h32()?,
-                amount_sat: r.u128()?,
+                purpose,
+                script_hash,
+                amount_sat,
                 unlock_epoch: r.u64()?,
             });
         }
@@ -1019,8 +1056,16 @@ impl Manifest {
     /// [`Self::genesis_unfunded_bonded_sat`] — is the supply gap Genesis-4
     /// opened with.
     pub fn genesis_issued_sat(&self) -> u128 {
-        self.carryover.as_ref().map_or(0, |c| c.total_sat)
-            + self.allocations.iter().map(|a| a.amount_sat).sum::<u128>()
+        // For every real supply this chain has ever had or could plausibly
+        // have, this is far below u128::MAX; `saturating_add` matters only
+        // for a manifest so malformed its total already exceeds u128 range,
+        // in which case saturating to u128::MAX makes `check_supply`'s
+        // `issued > TOTAL_SUPPLY_SAT` comparison refuse it for certain,
+        // rather than wrapping into a value that could look small.
+        self.carryover
+            .as_ref()
+            .map_or(0, |c| c.total_sat)
+            .saturating_add(self.allocations.iter().map(|a| a.amount_sat).sum::<u128>())
     }
 
     /// Every satoshi that exists the instant this manifest's genesis block is
@@ -1033,7 +1078,10 @@ impl Manifest {
     /// Pinned against the committed state by
     /// `genesis_accounting_matches_the_committed_state`.
     pub fn genesis_accounted_sat(&self) -> u128 {
-        self.genesis_issued_sat() + self.genesis_bonded_sat()
+        // Same reasoning as `genesis_issued_sat`: saturating only matters for
+        // an already-malformed manifest, and saturating makes it read as
+        // over-supply (refused downstream) rather than wrapping small.
+        self.genesis_issued_sat().saturating_add(self.genesis_bonded_sat())
     }
 
     /// Coins this manifest bonds that its issuance never accounted for —
@@ -1170,7 +1218,9 @@ impl Manifest {
                 self.genesis_issued_sat(),
                 self.genesis_bonded_sat(),
                 t::GENESIS_ISSUED_SAT,
-                unfunded - t::GENESIS_UNFUNDED_BONDED_CEILING_SAT,
+                // Guarded by `unfunded > ...CEILING_SAT` just above:
+                // `saturating_sub` is exact here, not merely assumed.
+                unfunded.saturating_sub(t::GENESIS_UNFUNDED_BONDED_CEILING_SAT),
                 t::GENESIS_UNFUNDED_BONDED_CEILING_SAT,
             ));
         }
@@ -1439,7 +1489,8 @@ impl Manifest {
             );
         }
         let allocs = self.allocation_outputs();
-        let mut out = Vec::with_capacity(self.carryover_entries.len() + allocs.len());
+        // Capacity hint only: saturating is the intended semantics.
+        let mut out = Vec::with_capacity(self.carryover_entries.len().saturating_add(allocs.len()));
         out.extend_from_slice(&self.carryover_entries);
         out.extend(allocs);
         // O(n log n) on 452k entries, once per genesis synthesis. Worth it:
@@ -1488,8 +1539,18 @@ impl Manifest {
                     // Values are u64 in the entry; an allocation above u64 is
                     // a manifest that could not be committed truthfully, so it
                     // is refused rather than truncated into a smaller number.
+                    // Every manifest a real node loads passes through
+                    // `Manifest::decode`, which now refuses (`DecodeErr`) any
+                    // allocation whose `amount_sat` does not fit u64 before a
+                    // `Manifest` value can exist at all — so this cannot fail
+                    // on that path. (A `Manifest` built directly via a struct
+                    // literal, as some tests do, bypasses that check; this
+                    // matches the rest of this crate's existing posture of
+                    // trusting values it assembled for itself in-process.)
+                    // Left COUNTED by the hardened ratchet on purpose: a
+                    // panic site with a hand proof is what it exists to track.
                     value: u64::try_from(a.amount_sat)
-                        .expect("allocation exceeds u64 satoshis — see check_supply"),
+                        .expect("allocation exceeds u64 satoshis — see Manifest::decode"),
                     script_hash: a.script_hash,
                 }
             })

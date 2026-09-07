@@ -115,6 +115,35 @@
 # caller already treated as "block invalid". Re-measured by this script;
 # full `cargo test -p bloch-pos-committee` green.
 #
+# Same day, bloch-pos-node (O07, measured 35 / 141 / 0 at e70bfbd against
+# 28 / 105 / 0): every unchecked-arithmetic site is gone — counters and
+# capacity hints saturate, deadlines and thresholds saturate, index/cursor
+# arithmetic is checked or carries a one-line proof under a targeted allow,
+# the JSON parser advances its cursor through one proven helper — and 27 of
+# the 35 panic sites became `let … else` / `Option`-returning shapes whose
+# unreachable arm refuses the input or logs and returns instead of aborting
+# (`Manifest::decode` now refuses an allocation that does not fit u64
+# satoshis at load, where it used to panic on every boot). The EIGHT that
+# remain are left COUNTED on purpose, each with its proof beside it:
+# `replay_to`'s four canonical-chain invariants (no state to fall back to),
+# `process_epoch` (infallible by the committee crate's construction), the
+# reorg-log rewrite `.expect("stored")` (a silent fallback would write a log
+# missing a canonical block), `allocation_outputs` (guarded by the decode
+# refusal above) and `Keystore::sign` (a private, always well-formed secret).
+# No `#[allow(clippy::expect_used)]` / `unwrap_used` is used anywhere in the
+# two live crates: a panic site with a hand proof is exactly what this
+# ratchet exists to keep in view. Panics 28 -> 8, arith 105 -> 0.
+#
+# Same day, the closed crates: bloch-crypto's three odd-level Merkle
+# `last().expect/unwrap()`s under a `len() > 1` loop guard became `if let`
+# (panics 19 -> 18 after one was re-counted under --all-features), and its
+# one deny-level `absurd_extreme_comparisons` (the `auxpow-rehearsal`
+# activation height of 0) carries a scoped allow, so `other` is 0 and the
+# --all-features build no longer fails under clippy. bloch (reorg.rs: a
+# capacity hint and two report counters) and bloch-euvm (`words()` as
+# `div_ceil`, `verify_gas()` as a compile-time constant) are back AT their
+# baselines, not below: those numbers were over by 3 and 2.
+#
 # bloch-pos-node is the one number that genuinely moved: 28 panic sites against
 # a recorded 27, a real regression that landed between 8167ceb and e266a76c
 # while the job was red for unrelated reasons and nobody could read it. It is
@@ -211,14 +240,14 @@ ratchet "bloch-pos-committee — Genesis-4 consensus, LIVE" \
 
 # No lib target: this crate is a binary. --bins, not --lib.
 ratchet "bloch-pos-node — the bloch-pos binary, LIVE" \
-  bloch-pos-node 28 105 0 --bins --no-deps
+  bloch-pos-node 8 0 0 --bins --no-deps
 
 # ── CLOSED: Genesis-3 ────────────────────────────────────────────────────────
 ratchet "bloch — Genesis-3 consensus/pow/reorg, closed chain" \
   bloch 59 205 0 --lib --no-deps --no-default-features --features node
 
 ratchet "bloch-crypto — tokenomics/emission/sighash" \
-  bloch-crypto 19 77 3 --lib --no-deps --all-features
+  bloch-crypto 18 77 0 --lib --no-deps --all-features
 
 ratchet "bloch-euvm — eUTXO VM, Genesis-3, never wired into Genesis-4" \
   bloch-euvm 0 30 0 --lib --no-deps

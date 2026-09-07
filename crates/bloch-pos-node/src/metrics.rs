@@ -578,6 +578,8 @@ impl NodeMetrics {
         // deliberately NOT read from the `wall_slot` gauge, which a wedged
         // engine thread would freeze at the same instant it stops updating
         // `head_slot`, hiding the very lag this is meant to catch.
+        // cannot divide by zero: slot_secs is `.max(1)` above.
+        #[allow(clippy::arithmetic_side_effects)]
         let wall_now = now_unix.saturating_sub(genesis) / slot_secs;
         let behind_slots = wall_now.saturating_sub(self.get(&self.head_slot));
         let last_applied = self.get(&self.last_applied_unix);

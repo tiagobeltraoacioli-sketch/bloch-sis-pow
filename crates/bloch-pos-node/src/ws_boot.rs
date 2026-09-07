@@ -98,7 +98,9 @@ impl HybridKeyVerifier for WsHybridVerifier {
 /// format — a superset that does not exist yet — will carry an explicit,
 /// published network id instead.
 pub fn network_id_of(genesis_digest: &[u8; 32]) -> u32 {
-    u32::from_le_bytes(genesis_digest[..4].try_into().unwrap())
+    // Destructuring a fixed-size array: no length check, nothing to fail.
+    let [b0, b1, b2, b3, ..] = *genesis_digest;
+    u32::from_le_bytes([b0, b1, b2, b3])
 }
 
 // ---------------------------------------------------------------------------

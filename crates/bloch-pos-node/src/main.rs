@@ -377,7 +377,7 @@ fn submit_tx(args: &[String]) {
         if a != "--spend" {
             continue;
         }
-        let Some(spec) = args.get(i + 1) else {
+        let Some(spec) = arg_after(args, i) else {
             bail("--spend needs <txid-hex>:<vout>".into())
         };
         let Some((txid_hex, vout)) = spec.rsplit_once(':') else {
@@ -415,7 +415,7 @@ fn submit_tx(args: &[String]) {
         if a != "--pay" {
             continue;
         }
-        let Some(spec) = args.get(i + 1) else {
+        let Some(spec) = arg_after(args, i) else {
             bail("--pay needs <script-hash-hex>:<sat>".into())
         };
         let Some((sh_hex, value)) = spec.rsplit_once(':') else {
@@ -446,8 +446,17 @@ fn submit_tx(args: &[String]) {
     // signature per input (`HYBRID_SIG_BYTES`) plus a generous envelope; an
     // exact figure is what `--tx-bytes` is for.
     let n_inputs = inputs.len() as u64;
-    let default_bytes = 1_024
-        + n_inputs * (bloch_pos_committee::fee_market::HYBRID_SIG_BYTES + pubkey.len() as u64 + 64);
+    // `1_024 + n_inputs * (HYBRID_SIG_BYTES + pubkey.len() + 64)`, checked:
+    // this value is inside the signing root, so an overflow is refused rather
+    // than signed over.
+    let Some(default_bytes) = bloch_pos_committee::fee_market::HYBRID_SIG_BYTES
+        .checked_add(pubkey.len() as u64)
+        .and_then(|per_input| per_input.checked_add(64))
+        .and_then(|per_input| per_input.checked_mul(n_inputs))
+        .and_then(|inputs_bytes| inputs_bytes.checked_add(1_024))
+    else {
+        bail("too many --spend inputs: the default --tx-bytes does not fit in u64".into())
+    };
     let mut tx = bloch_pos_committee::transition::PosTransaction::Transfer {
         inputs,
         outputs,
@@ -514,9 +523,48 @@ fn bloch_pos_node_net_send(addr: &str, bytes: &[u8]) -> std::io::Result<()> {
 fn arg_value(args: &[String], name: &str) -> Option<String> {
     args.iter()
         .position(|a| a == name)
-        .and_then(|i| args.get(i + 1))
+        .and_then(|i| arg_after(args, i))
         .cloned()
 }
+
+/// The argument following position `i`, if any — `args.get(i + 1)` without
+/// the addition (`i` is an index into `args`, so `get(i..)` is `Some`).
+fn arg_after(args: &[String], i: usize) -> Option<&String> {
+    args.get(i..).and_then(|rest| rest.get(1))
+}
+
+/// `now + start_in seconds` as Unix milliseconds, for a manifest's
+/// `genesis_time_ms`. A system clock before 1970, or a `--start-in` that puts
+/// genesis past u64 milliseconds, is refused here — where it used to be a
+/// panic (clock) or an unchecked add (start_in) — because a wrong genesis
+/// time is a manifest every node then disagrees with.
+fn genesis_time_from_now(start_in_secs: u64) -> u64 {
+    let now_ms = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as u64,
+        Err(_) => {
+            eprintln!(
+                "genesis: the system clock is before the Unix epoch; refusing to stamp a genesis time"
+            );
+            exit(2);
+        }
+    };
+    match start_in_secs.checked_mul(1000).and_then(|ms| now_ms.checked_add(ms)) {
+        Some(t) => t,
+        None => {
+            eprintln!("genesis: --start-in {start_in_secs} puts genesis_time_ms past u64");
+            exit(2);
+        }
+    }
+}
+
+/// Devnet stakes by cohort position: 1x/2x/3x of 200k BLCH, so stake
+/// weighting is load-bearing in every devnet run (same pattern the e2e test
+/// uses). Indexed by `i % 3`.
+const DEVNET_STAKES_SAT: [u128; 3] = [
+    200_000 * SAT_PER_BLOCH,
+    400_000 * SAT_PER_BLOCH,
+    600_000 * SAT_PER_BLOCH,
+];
 
 /// Which genesis-binding rule to stamp into a manifest this command emits.
 ///
@@ -577,7 +625,7 @@ fn keygen_public(args: &[String]) {
 }
 
 fn hex_lower(b: &[u8]) -> String {
-    let mut s = String::with_capacity(b.len() * 2);
+    let mut s = String::with_capacity(b.len().saturating_mul(2));
     for byte in b {
         s.push_str(&format!("{byte:02x}"));
     }
@@ -792,10 +840,16 @@ fn genesis_mainnet(args: &[String]) {
             eprintln!("genesis-mainnet: row {row}: {what} is not hex");
             exit(1);
         }
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
+        // The check above already refused anything `unhex` would (including a
+        // `0x` prefix, since `x` is not a hex digit), so this cannot fail; the
+        // arm exists so that no input reaches a panic.
+        match codec::unhex(s) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("genesis-mainnet: row {row}: {what} is not hex ({e})");
+                exit(1);
+            }
+        }
     };
 
     let mut validators = Vec::new();
@@ -866,7 +920,11 @@ fn genesis_mainnet(args: &[String]) {
             h[..20].copy_from_slice(&t::FOUNDER_WITHDRAWAL_H160);
             h
         },
-        amount_sat: bloch * t::SAT_PER_BLOCH,
+        amount_sat: bloch.checked_mul(t::SAT_PER_BLOCH).unwrap_or_else(|| {
+            // Constants from tokenomics_v4; cannot overflow u128. Refused, not wrapped.
+            eprintln!("genesis-mainnet: allocation of {bloch} BLOCH overflows u128 sat");
+            exit(1)
+        }),
         unlock_epoch,
     };
     use genesis::alloc_purpose as ap;
@@ -880,11 +938,7 @@ fn genesis_mainnet(args: &[String]) {
 
     let cohort: Vec<u32> = validators.iter().map(|v| v.index).collect();
     let manifest = genesis::Manifest {
-        genesis_time_ms: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64
-            + start_in * 1000,
+        genesis_time_ms: genesis_time_from_now(start_in),
         slot_ms: 30_000,
         validators,
         cohort,
@@ -978,7 +1032,7 @@ fn genesis_cmd(args: &[String]) {
         }
         // Uneven stakes (1x/2x/3x of 200k BLCH) so stake weighting is
         // load-bearing in every devnet run — same pattern the e2e test uses.
-        let stake_sat: u128 = (i as u128 % 3 + 1) * 200_000 * SAT_PER_BLOCH;
+        let stake_sat: u128 = DEVNET_STAKES_SAT[i % 3];
         validators.push(genesis::ManifestValidator {
             index: ks.index,
             stake_sat,
@@ -993,11 +1047,7 @@ fn genesis_cmd(args: &[String]) {
         });
     }
     let manifest = genesis::Manifest {
-        genesis_time_ms: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64
-            + start_in * 1000,
+        genesis_time_ms: genesis_time_from_now(start_in),
         slot_ms,
         validators,
         cohort: Vec::new(),
@@ -1422,7 +1472,8 @@ fn self_check() {
             ta.starts_with(b"BLCH4:"),
             "{na}: domain tag outside the BLCH4 namespace"
         );
-        for (nb, tb) in tags.iter().skip(i + 1) {
+        // `skip(i).skip(1)` is `skip(i + 1)`: every tag after this one.
+        for (nb, tb) in tags.iter().skip(i).skip(1) {
             assert_ne!(ta, tb, "domain tags {na} and {nb} collide");
         }
     }
@@ -1487,13 +1538,16 @@ fn self_check() {
         ("FRAME_GET_BLOCKS", net::FRAME_GET_BLOCKS),
         ("FRAME_TX", net::FRAME_TX),
     ];
-    for (i, (na, a)) in frames.iter().enumerate() {
+    // Allocations are 1-based: frame `i` (0-based) must carry the byte `i + 1`,
+    // which is what the 1-based counter zipped in here is.
+    for (n, (na, a)) in (1u8..).zip(frames.iter()) {
         assert_eq!(
             *a,
-            (i + 1) as u8,
+            n,
             "{na} is not on its registered allocation (§2 of the wire namespace registry)"
         );
-        for (nb, b) in frames.iter().skip(i + 1) {
+        // Every frame after this one (`skip(n)` == `skip(i + 1)`).
+        for (nb, b) in frames.iter().skip(usize::from(n)) {
             assert_ne!(a, b, "frame bytes {na} and {nb} collide — silent chain split");
         }
     }

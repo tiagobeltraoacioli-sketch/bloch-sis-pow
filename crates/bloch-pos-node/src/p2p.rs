@@ -471,7 +471,11 @@ impl SyncLimiter {
             return Err(SyncRefusal::RateLimited);
         }
         e.tokens -= 1.0;
-        e.inflight += 1;
+        // Guarded by `e.inflight >= MAX_INFLIGHT_SYNC_PER_PEER` returning
+        // above: `e.inflight` is a small per-peer in-flight counter, always
+        // below that cap here — saturating is the intended semantics for a
+        // counter regardless.
+        e.inflight = e.inflight.saturating_add(1);
         Ok(SyncPermit { peer })
     }
 
@@ -628,7 +632,12 @@ pub fn decode_sync_request(buf: &[u8]) -> Result<SyncRequest, crate::codec::Deco
 pub fn encode_sync_response(resp: &SyncResponse) -> Vec<u8> {
     match resp {
         SyncResponse::Blocks { envelopes } => {
-            let mut out = Vec::with_capacity(5 + envelopes.iter().map(|e| e.len() + 4).sum::<usize>());
+            // Capacity hint only: saturating is the intended semantics.
+            let cap = envelopes
+                .iter()
+                .map(|e| e.len().saturating_add(4))
+                .fold(5usize, |acc, n| acc.saturating_add(n));
+            let mut out = Vec::with_capacity(cap);
             out.push(SYNC_TAG_BLOCKS);
             out.extend_from_slice(&(envelopes.len() as u32).to_le_bytes());
             for e in envelopes {
@@ -1147,7 +1156,9 @@ impl Loop {
         if e.pages_since_progress >= MAX_PAGES_WITHOUT_PROGRESS {
             return false;
         }
-        e.pages_since_progress += 1;
+        // Guarded by `>= MAX_PAGES_WITHOUT_PROGRESS` returning `false` above:
+        // a small counter, always below that cap here.
+        e.pages_since_progress = e.pages_since_progress.saturating_add(1);
         true
     }
 
@@ -1324,7 +1335,13 @@ fn handle_command(swarm: &mut Swarm, st: &mut Loop, cmd: Command) {
                     if payload.len() != 8 {
                         return;
                     }
-                    let after = u64::from_le_bytes(payload.try_into().unwrap());
+                    // `payload.len() != 8` already returned above, so this
+                    // conversion cannot fail; the `else` arm keeps it
+                    // panic-free by construction rather than by an `unwrap`.
+                    let Ok(after_bytes) = payload.try_into() else {
+                        return;
+                    };
+                    let after = u64::from_le_bytes(after_bytes);
                     request_blocks(swarm, st, after);
                 }
                 _ => {}
@@ -1712,10 +1729,18 @@ fn read_sync_page(
             for b in all.into_iter() {
                 // Byte cap as well as block cap: one answer must never become
                 // a history dump. Leave slack for the framing.
-                if bytes + b.len() + 4 > (MAX_SYNC_FRAME as usize) - 1024 {
+                // `bytes` only ever accumulates `b.len() + 4` for blocks that
+                // passed this same check, so it stays far below
+                // `MAX_SYNC_FRAME` (8 MiB); saturating keeps a pathological
+                // single block (larger than `usize::MAX`, impossible in
+                // practice) failing this check safely instead of wrapping
+                // small and passing it.
+                if bytes.saturating_add(b.len()).saturating_add(4)
+                    > (MAX_SYNC_FRAME as usize).saturating_sub(1024)
+                {
                     break;
                 }
-                bytes += b.len() + 4;
+                bytes = bytes.saturating_add(b.len()).saturating_add(4);
                 out.push(b);
             }
             out

@@ -724,14 +724,16 @@ pub fn get_blocks_frame(after_slot: u64) -> Vec<u8> {
 /// Confirmation is seeing the transaction land in a block.
 pub fn send_transaction(addr: &str, tx_bytes: &[u8]) -> std::io::Result<()> {
     let mut sock = TcpStream::connect(addr)?;
-    let mut frame = Vec::with_capacity(1 + tx_bytes.len());
+    // Capacity hint only: saturating is the intended semantics.
+    let mut frame = Vec::with_capacity(1usize.saturating_add(tx_bytes.len()));
     frame.push(FRAME_TX);
     frame.extend_from_slice(tx_bytes);
     write_frame(&mut sock, &frame)
 }
 
 fn write_frame(sock: &mut TcpStream, frame: &[u8]) -> std::io::Result<()> {
-    let mut buf = Vec::with_capacity(4 + frame.len());
+    // Capacity hint only: saturating is the intended semantics.
+    let mut buf = Vec::with_capacity(4usize.saturating_add(frame.len()));
     buf.extend_from_slice(&(frame.len() as u32).to_le_bytes());
     buf.extend_from_slice(frame);
     sock.write_all(&buf)
@@ -864,7 +866,13 @@ fn serve_get_blocks(
     if !limiter.admit(Instant::now()) {
         return;
     }
-    let after = u64::from_le_bytes(frame[1..9].try_into().unwrap());
+    // `frame.len() != 9` already returned above, so `frame[1..9]` is always
+    // exactly 8 bytes and the conversion cannot fail; the `else` arm keeps it
+    // panic-free by construction rather than by an `unwrap`.
+    let Ok(after_bytes) = frame[1..9].try_into() else {
+        return;
+    };
+    let after = u64::from_le_bytes(after_bytes);
     // Paged at `SYNC_PAGE_BLOCKS`. This used to answer `usize::MAX` — the whole
     // chain in one burst — under a comment calling that deliberate, since "a
     // restarting node's single request must be answered in full or it never
@@ -875,7 +883,8 @@ fn serve_get_blocks(
     match crate::store::Store::blocks_after(data_dir, after, SYNC_PAGE_BLOCKS) {
         Ok(blocks) => {
             for b in blocks {
-                let mut f = Vec::with_capacity(1 + b.len());
+                // Capacity hint only: saturating is the intended semantics.
+                let mut f = Vec::with_capacity(1usize.saturating_add(b.len()));
                 f.push(FRAME_BLOCK);
                 f.extend_from_slice(&b);
                 let Ok(mut w) = sock.lock() else { return };
@@ -1070,7 +1079,14 @@ pub fn start(
             // copy of the chain to a node that may still be replaying.
             let holds_slot = sync_slots
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                    (n < SYNC_FANOUT).then_some(n + 1)
+                    // `n` only ever takes small values near `SYNC_FANOUT`
+                    // (== 2): this same closure is the only place that
+                    // increments it, and only when `n < SYNC_FANOUT`; the
+                    // rest of this module only decrements it. Nowhere near
+                    // overflowing `usize`.
+                    #[allow(clippy::arithmetic_side_effects)]
+                    let next = n + 1;
+                    (n < SYNC_FANOUT).then_some(next)
                 })
                 .is_ok();
             if holds_slot

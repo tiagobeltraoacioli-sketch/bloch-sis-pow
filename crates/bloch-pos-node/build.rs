@@ -137,7 +137,12 @@ fn source_digest(root: &Path) -> Option<(String, usize, u64)> {
     let mut bytes_total: u64 = 0;
     for (rel, path) in &files {
         let body = std::fs::read(path).ok()?;
-        bytes_total += body.len() as u64;
+        // `bytes_total` is a build-time diagnostic counter (printed into the
+        // source-digest stamp), not a value that feeds consensus or a state
+        // root: saturation is the intended semantics for a total this size
+        // could never realistically reach (it would require exabytes of
+        // source under `crates/`).
+        bytes_total = bytes_total.saturating_add(body.len() as u64);
         h.update(rel.as_bytes());
         h.update([0u8]);
         h.update((body.len() as u64).to_le_bytes());

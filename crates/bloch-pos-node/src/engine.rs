@@ -184,10 +184,12 @@ pub struct Config {
 }
 
 fn now_ms() -> u64 {
+    // A host clock before the Unix epoch is a misconfigured machine, not a
+    // time. It reads as 0 ms — before any genesis, so every duty and the
+    // slot loop simply wait for the clock — where it used to abort the node.
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 const NO_TXS: [PosTransaction; 0] = [];
@@ -798,7 +800,11 @@ mod state_cell {
             }
             while cur_epoch < epoch {
                 cur = Arc::new(roll(&cur));
-                cur_epoch += 1;
+                // cannot overflow: cur_epoch < epoch <= u64::MAX.
+                #[allow(clippy::arithmetic_side_effects)]
+                {
+                    cur_epoch += 1;
+                }
                 memo.push(Entry {
                     generation: self.generation,
                     epoch: cur_epoch,
@@ -1275,18 +1281,24 @@ fn culprit_index(err: &TransitionError, len: usize) -> Option<usize> {
 impl Engine {
     // ── Derivations over the canonical chain ────────────────────────────────
 
+    // `chain` always holds genesis at index 0 (built that way in `run`, and
+    // `do_reorg` truncates to `cut + 1 >= 1`), so `last()` is `Some`. The
+    // fallbacks below are what an empty chain WOULD contain — genesis, at
+    // slot 0, height 0 — evaluated lazily, so the invariant costs nothing on
+    // the path that always runs and nothing can panic if it ever broke.
     fn head_id(&self) -> BlockId {
         self.chain
             .last()
-            .expect("chain contains at least genesis")
-            .1
+            .map_or_else(|| self.manifest.genesis_id(), |(_, id)| *id)
     }
 
     fn head_slot_now(&self) -> u64 {
-        self.chain
-            .last()
-            .expect("chain contains at least genesis")
-            .0
+        self.chain.last().map_or(0, |(slot, _)| *slot)
+    }
+
+    /// Canonical height of the head: `chain.len() - 1`, genesis being height 0.
+    fn head_height(&self) -> u64 {
+        (self.chain.len() as u64).saturating_sub(1)
     }
 
     /// The committed state root at the head, READ rather than recomputed.
@@ -1620,13 +1632,9 @@ impl Engine {
     /// from what the committed state expects the next reveal to open.
     ///
     /// Only ever called from the proposing path, which an observer never
-    /// reaches — hence the expect rather than an Option return threaded
-    /// through a caller that cannot be in this state.
-    fn randao_positioned(&self) -> RandaoChain {
-        let keys = self
-            .keys
-            .as_ref()
-            .expect("randao_positioned is proposer-only");
+    /// reaches — the caller hands in the keys it has already resolved, so
+    /// there is no key-less state for this function to be in.
+    fn randao_positioned(&self, keys: &Keystore) -> RandaoChain {
         let mine = self.chain.iter().skip(1).filter(|(_, id)| {
             self.blocks
                 .get(id.as_bytes())
@@ -1713,10 +1721,15 @@ impl Engine {
     }
 
     fn attest(&mut self, slot: u64) {
-        // An observer holds no key and therefore has no duty.
-        if self.keys.is_none() {
+        // An observer holds no key and therefore has no duty. Bound here, once,
+        // and used to sign below — nothing between reads `keys` mutably.
+        //
+        // Borrow shape: `keys` is read inside the signing closure while
+        // `slashprot` is borrowed mutably, so the key is resolved to a local
+        // rather than through `self`.
+        let Some(keys) = self.keys.as_ref() else {
             return;
-        }
+        };
         if self.doppelganger_blocks_duties(slot) {
             return;
         }
@@ -1755,9 +1768,6 @@ impl Engine {
         // already signed", including after an NTP step backwards or a restart
         // inside the same slot.
         //
-        // Borrow shape: `keys` is read inside the closure while `slashprot` is
-        // borrowed mutably, so the key is resolved to a local first.
-        let keys = self.keys.as_ref().expect("checked above");
         let root = data.signing_root();
         let signature = match self.slashprot.guard_attestation(
             slot,
@@ -1846,7 +1856,13 @@ impl Engine {
         atts.sort_by_key(|a| (a.data.slot, a.validator, a.data.signing_root()));
         atts.truncate(MAX_ATTESTATIONS_PER_BLOCK);
 
-        let randao = self.randao_positioned();
+        // `keys.is_none()` returned at the top of `propose`, and a duty never
+        // writes `keys`, so this arm is unreachable; returning without a
+        // block is what an observer does.
+        let Some(keys) = self.keys.as_ref() else {
+            return;
+        };
+        let randao = self.randao_positioned(keys);
         let Some(reveal) = randao.peek_reveal() else {
             eprintln!(
                 "[slot {slot}] RANDAO chain spent — cannot propose (re-commit path not wired)"
@@ -1979,7 +1995,12 @@ impl Engine {
         // proposer offence, and everything above this line — the post-state,
         // the transaction selection — is discardable work; the signature is
         // not.
-        let keys = self.keys.as_ref().expect("checked above");
+        // `keys.is_none()` returned at the top of this function and nothing
+        // in between writes `keys`; the arm is unreachable and returning
+        // without a block is the observer's behaviour.
+        let Some(keys) = self.keys.as_ref() else {
+            return;
+        };
         let root = header.proposal_signing_root();
         let proposer_sig = match self.slashprot.guard_proposal(slot, || keys.sign(&root)) {
             Ok(sig) => sig,
@@ -2036,11 +2057,17 @@ impl Engine {
             }
             return;
         }
-        let env = self
-            .blocks
-            .get(id.as_bytes())
-            .expect("just ingested")
-            .clone();
+        // `head_id() == id` was just checked, and every canonical block is in
+        // `blocks` (`prune` never removes a canonical id), so this is `Some`.
+        // If it were not, the slot is lost the same way as the case above —
+        // loudly, and without killing the node.
+        let Some(env) = self.blocks.get(id.as_bytes()).cloned() else {
+            eprintln!(
+                "[slot {slot}] own block {} adopted as head but not stored — not broadcast",
+                crate::codec::hex8(id.as_bytes()),
+            );
+            return;
+        };
         self.net.broadcast(net::block_frame(&env));
     }
 
@@ -2160,11 +2187,19 @@ impl Engine {
             let mut i = 0;
             while i < self.orphans.len() {
                 if grew_registry || self.orphans[i].1.header.parent == landed {
-                    let (_, env) = self.orphans.remove(i).expect("index in range");
-                    self.orphans_admitted += 1;
+                    // `i < len` (loop guard), so `remove` is `Some`; the
+                    // `else` is unreachable and ends the sweep.
+                    let Some((_, env)) = self.orphans.remove(i) else {
+                        break;
+                    };
+                    self.orphans_admitted = self.orphans_admitted.saturating_add(1);
                     queue.push_back(env);
                 } else {
-                    i += 1;
+                    // cannot overflow: i < self.orphans.len().
+                    #[allow(clippy::arithmetic_side_effects)]
+                    {
+                        i += 1;
+                    }
                 }
             }
         }
@@ -2295,7 +2330,7 @@ impl Engine {
             && self.live
             && env.header.slot > self.wall_slot().saturating_add(FUTURE_SLOT_TOLERANCE)
         {
-            self.rejected_future += 1;
+            self.rejected_future = self.rejected_future.saturating_add(1);
             eprintln!(
                 "reject {}: slot {} is more than {FUTURE_SLOT_TOLERANCE} ahead of wall slot {}",
                 crate::codec::hex8(&id),
@@ -2378,7 +2413,7 @@ impl Engine {
                 self.park_orphan(id, env);
                 return (Verdict::Ignore, None);
             }
-            self.rejected_unsigned += 1;
+            self.rejected_unsigned = self.rejected_unsigned.saturating_add(1);
             eprintln!(
                 "reject {}: proposer {} signature does not verify",
                 crate::codec::hex8(&id),
@@ -2433,7 +2468,7 @@ impl Engine {
         // longest to arrive and has not.
         while self.orphans.len() >= ORPHAN_MAX {
             if self.orphans.pop_front().is_some() {
-                self.orphans_evicted += 1;
+                self.orphans_evicted = self.orphans_evicted.saturating_add(1);
             }
         }
         self.orphans.push_back((id, env));
@@ -2472,13 +2507,17 @@ impl Engine {
             .collect();
         for id in doomed {
             self.blocks.remove(&id);
-            self.blocks_pruned += 1;
+            self.blocks_pruned = self.blocks_pruned.saturating_add(1);
         }
         // Parked blocks under the floor can never connect to a branch that
         // could win, so holding them only costs slots other orphans need.
         let before = self.orphans.len();
         self.orphans.retain(|(_, env)| env.header.slot >= floor);
-        self.orphans_evicted += (before - self.orphans.len()) as u64;
+        // `retain` only shrinks, so `before - len` is the eviction count; both
+        // are counters, saturating by design.
+        self.orphans_evicted = self
+            .orphans_evicted
+            .saturating_add(before.saturating_sub(self.orphans.len()) as u64);
     }
 
     // ── Transaction-status index (R4 F-11, `gettxstatus`) ───────────────────
@@ -2582,7 +2621,8 @@ impl Engine {
     fn forkchoice_inputs(&self) -> ForkChoiceInputs {
         ForkChoiceInputs {
             blocks: self.blocks.len(),
-            pool: self.pool.len() as u64 + self.fc_covered_removals,
+            // A memo key over two counters; saturating like the counters are.
+            pool: (self.pool.len() as u64).saturating_add(self.fc_covered_removals),
             justified: self.state.finality().justified.root,
             validators: self.state.active_validators(),
         }
@@ -2655,7 +2695,7 @@ impl Engine {
         let mut memo: Option<(ForkChoiceInputs, [u8; 32])> = None;
         // Bounded: every iteration either advances the canonical head or
         // deletes an invalid block, and both are finite.
-        for _ in 0..=(self.blocks.len().saturating_mul(2) + 2) {
+        for _ in 0..=self.blocks.len().saturating_mul(2).saturating_add(2) {
             let inputs = self.forkchoice_inputs();
             let target = match &memo {
                 Some((seen, head)) if *seen == inputs => *head,
@@ -2685,7 +2725,7 @@ impl Engine {
                 if !progressed {
                     continue;
                 }
-            } else if self.cut_below_finalized_latch(&ancestor) {
+            } else if let Some(latch) = self.cut_below_finalized_latch(&ancestor) {
                 // Finality latch (F-03): the heaviest branch demands cutting
                 // below this node's finalized checkpoint. Refuse it, drop the
                 // branch, and stop here — the canonical chain this node has
@@ -2693,7 +2733,7 @@ impl Engine {
                 // loop (rather than `continue`) matters for the empty-branch
                 // give-back case, where there is nothing to drop and retrying
                 // would spin against the same refusal until the bound.
-                self.refuse_finality_rewind(&branch);
+                self.refuse_finality_rewind(latch, &branch);
                 return;
             } else if !self.do_reorg(ancestor, branch) {
                 continue; // offending block removed; recompute
@@ -2792,11 +2832,11 @@ impl Engine {
             }
             pool.remove(key);
             suspect.remove(key);
-            expired += 1;
+            expired = expired.saturating_add(1); // counter
             false
         });
         if expired > 0 {
-            self.mempool_expired += expired;
+            self.mempool_expired = self.mempool_expired.saturating_add(expired);
             eprintln!(
                 "[slot {now}] mempool TTL: dropped {expired} transaction(s) unincluded for \
                  more than {MEMPOOL_TTL_SLOTS} slots ({} left, {} dropped for age so far)",
@@ -3051,7 +3091,7 @@ impl Engine {
         if let Some(lowest_key) = evict_at_capacity {
             self.mempool.remove(&lowest_key);
             self.mempool_admitted_at.remove(&lowest_key);
-            self.mempool_evicted_low_fee += 1;
+            self.mempool_evicted_low_fee = self.mempool_evicted_low_fee.saturating_add(1);
         }
         let mut frame = vec![net::FRAME_TX];
         frame.extend_from_slice(&key);
@@ -3131,7 +3171,7 @@ impl Engine {
             if bytes.saturating_add(n) > cap {
                 break;
             }
-            bytes += n;
+            bytes = bytes.saturating_add(n); // checked against `cap` just above
             out.push(tx.clone());
         }
         out
@@ -3183,7 +3223,7 @@ impl Engine {
                         .remove(&(a.validator, a.data.signing_root()))
                         .is_some()
                     {
-                        self.fc_covered_removals += 1;
+                        self.fc_covered_removals = self.fc_covered_removals.saturating_add(1);
                     }
                 }
                 // Included is included — drop them from the mempool by the
@@ -3315,6 +3355,12 @@ impl Engine {
     /// now the fallback for a reorg deeper than [`REORG_STATE_WINDOW`], and
     /// it is also the reference the snapshot path is tested against — the
     /// slow path staying correct is what lets the fast path be small.
+    // The four `expect`s below each name a canonical-chain invariant — the
+    // target is canonical, canonical blocks are stored (`prune` skips them),
+    // their bodies decoded and applied when they were adopted — and there is
+    // no state to fall back to when replaying a prefix that already applied.
+    // They stay COUNTED by the hardened ratchet on purpose: a panic site with
+    // a hand proof is exactly what the ratchet exists to keep in view.
     fn replay_to(&self, id: [u8; 32]) -> CommittedState {
         let cut = self
             .chain
@@ -3381,14 +3427,15 @@ impl Engine {
     /// set the override sees, in the log, exactly when and why it fired —
     /// which is the difference between "an acknowledged flag day" and "a
     /// silent hole in the safety property the latch exists for".
-    fn cut_below_finalized_latch(&self, ancestor: &[u8; 32]) -> bool {
-        let would_cut = match self.finalized_latch {
-            Some((floor, _)) => self.height_of(ancestor).is_some_and(|h| h < floor),
-            None => false,
-        };
+    ///
+    /// Returns the latch `(height, root)` the cut would violate — `Some` is
+    /// "refuse", and it carries exactly what `refuse_finality_rewind` needs
+    /// to say so, which is why no caller ever has to re-read the latch.
+    fn cut_below_finalized_latch(&self, ancestor: &[u8; 32]) -> Option<(u64, [u8; 32])> {
+        let (floor, root) = self.finalized_latch?;
+        let would_cut = self.height_of(ancestor).is_some_and(|h| h < floor);
         if would_cut && self.finality_rewind_override {
             if self.live {
-                let (floor, root) = self.finalized_latch.expect("would_cut implies latched");
                 eprintln!(
                     "FINALITY_LATCH: BLOCH_ALLOW_FINALITY_REWIND is set — ALLOWING a reorg \
                      below this node's finalized checkpoint (height {floor}, {}) that would \
@@ -3397,9 +3444,9 @@ impl Engine {
                     crate::codec::hex8(&root),
                 );
             }
-            return false;
+            return None;
         }
-        would_cut
+        would_cut.then_some((floor, root))
     }
 
     /// Refuse a reorg that would rewind this node below its own finalized
@@ -3418,9 +3465,9 @@ impl Engine {
     /// (`ingest_one`) before any signature work — never re-authenticated,
     /// never re-run through a whole `advance` cycle, never silently
     /// re-refused in a way this node cannot distinguish from the first time.
-    fn refuse_finality_rewind(&mut self, branch: &[BlockEnvelope]) {
-        self.finality_rewinds_refused += 1;
-        let (floor, root) = self.finalized_latch.expect("only called when latched");
+    fn refuse_finality_rewind(&mut self, latch: (u64, [u8; 32]), branch: &[BlockEnvelope]) {
+        self.finality_rewinds_refused = self.finality_rewinds_refused.saturating_add(1);
+        let (floor, root) = latch;
         if self.live {
             eprintln!(
                 "FINALITY_LATCH: refused a reorg below this node's finalized checkpoint \
@@ -3465,11 +3512,19 @@ impl Engine {
         // that since the fold now starts at the fork point, the replay this
         // used to charge here is mostly gone rather than moved.
         let _perf = bloch_pos_committee::perf::span(bloch_pos_committee::perf::Phase::Reorg);
-        let cut = self
-            .chain
-            .iter()
-            .position(|(_, id)| id.as_bytes() == &ancestor)
-            .expect("ancestor is canonical");
+        // `ancestor` was found by walking the canonical chain, so it is on it.
+        // The `else` is unreachable; it refuses the reorg (the caller's
+        // "invalid branch" answer) instead of killing the node.
+        let Some(cut) = self.chain.iter().position(|(_, id)| id.as_bytes() == &ancestor) else {
+            eprintln!(
+                "reorg refused: ancestor {} is not on the canonical chain",
+                crate::codec::hex8(&ancestor)
+            );
+            return false;
+        };
+        // cannot overflow: cut < chain.len() (it is a position in it).
+        #[allow(clippy::arithmetic_side_effects)]
+        let after_cut = cut + 1;
 
         // Finality latch (F-03): `finalized` is a downward ratchet. A reorg
         // whose fork point sits below this node's own highest finalized
@@ -3478,8 +3533,8 @@ impl Engine {
         // whatever the branch's own state claims about finality. `advance`
         // screens the same predicate earlier; this is the authoritative check
         // on the only path that can truncate `self.chain`.
-        if self.cut_below_finalized_latch(&ancestor) {
-            self.refuse_finality_rewind(&branch);
+        if let Some(latch) = self.cut_below_finalized_latch(&ancestor) {
+            self.refuse_finality_rewind(latch, &branch);
             return false;
         }
 
@@ -3530,7 +3585,7 @@ impl Engine {
         // re-included by the winning branch above must stop being reported
         // as "included" at a slot this node's chain no longer contains —
         // BEFORE the truncate, while these blocks are still reachable by id.
-        let stale: Vec<(u64, Vec<PosTransaction>)> = self.chain[cut + 1..]
+        let stale: Vec<(u64, Vec<PosTransaction>)> = self.chain[after_cut..]
             .iter()
             .filter_map(|(_, id)| self.blocks.get(id.as_bytes()))
             .filter_map(|env| body_transactions(env).ok().map(|txs| (env.header.slot, txs)))
@@ -3553,7 +3608,7 @@ impl Engine {
         for (id, post) in applied {
             self.remember_state(id, post);
         }
-        self.chain.truncate(cut + 1);
+        self.chain.truncate(after_cut);
         let mut canonical: BTreeSet<[u8; 32]> =
             self.chain.iter().map(|(_, id)| *id.as_bytes()).collect();
         for env in &branch {
@@ -3632,7 +3687,7 @@ impl Engine {
         // Reconstructing past-epoch committees (the pool would then accept the
         // full 64-slot window) needs per-epoch seed/roster history, which is
         // storage work, not policy work.
-        if e != wall_epoch && e != wall_epoch + 1 {
+        if e != wall_epoch && e != wall_epoch.saturating_add(1) {
             self.net.report(&origin, Verdict::Ignore);
             return;
         }
@@ -3834,6 +3889,8 @@ impl Engine {
     /// manifest must not turn a query into a division-by-zero panic. The slot
     /// loop would reach the same division first, but "would panic elsewhere" is
     /// not a reason for this path to panic here.
+    // cannot divide by zero: the divisor is `.max(1)`.
+    #[allow(clippy::arithmetic_side_effects)]
     fn wall_slot(&self) -> u64 {
         now_ms().saturating_sub(self.manifest.genesis_time_ms) / self.manifest.slot_ms.max(1)
     }
@@ -3941,7 +3998,7 @@ impl Engine {
                 &self.state,
                 &self.head_id(),
                 self.head_state_root(),
-                self.chain.len() as u64 - 1,
+                self.head_height(),
                 self.finalized_height(),
                 self.wall_slot(),
                 self.state.validator_count(),
@@ -3957,7 +4014,7 @@ impl Engine {
             RpcRequest::BlockCount => {
                 let fin = self.state.finality();
                 Ok(rpc::block_count_json(
-                    self.chain.len() as u64 - 1,
+                    self.head_height(),
                     self.head_slot_now(),
                     self.finalized_height(),
                     fin.justified.epoch,
@@ -4686,6 +4743,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // yet to ask.
     let no_doppelganger_check = std::env::var_os("BLOCH_NO_DOPPELGANGER").is_some();
     let doppelganger_observe_until = if keys.is_some() && !no_doppelganger_check {
+        // cannot divide by zero: the divisor is `.max(1)`.
+        #[allow(clippy::arithmetic_side_effects)]
         let boot_wall_slot =
             now_ms().saturating_sub(manifest.genesis_time_ms) / manifest.slot_ms.max(1);
         let until = boot_wall_slot.saturating_add(DOPPELGANGER_OBSERVE_SLOTS);
@@ -4789,10 +4848,11 @@ pub fn run(cfg: Config) -> io::Result<()> {
         // count reports in bursts and then goes quiet exactly when the work is
         // heaviest — the opposite of what an operator needs.
         if last_report.elapsed() >= REPLAY_PROGRESS_INTERVAL {
-            let done = i + 1;
+            // Progress display only: `i < n_logged`, so neither saturates.
+            let done = i.saturating_add(1);
             let elapsed = replay_started.elapsed().as_secs_f64();
             let rate = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
-            let left = n_logged - done;
+            let left = n_logged.saturating_sub(done);
             println!(
                 "replay {done}/{n_logged} ({:.1}%) — head slot {}, {rate:.1} blocks/s, ~{} min left",
                 100.0 * done as f64 / n_logged as f64,
@@ -4901,6 +4961,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
     {
         let genesis_ms = engine.manifest.genesis_time_ms;
         let slot_ms = engine.manifest.slot_ms;
+        // cannot divide by zero: `Manifest::decode` refuses `slot_ms == 0`.
+        #[allow(clippy::arithmetic_side_effects)]
         let wall_slot = now_ms().saturating_sub(genesis_ms) / slot_ms;
         let wall_epoch = epoch_of(wall_slot);
         let fin = engine.state.finality().finalized;
@@ -5020,18 +5082,30 @@ pub fn run(cfg: Config) -> io::Result<()> {
         &crate::metrics::NODE.last_finality_advance_unix,
         crate::metrics::now_unix(),
     );
-    let finality_stall_secs: u64 = (4 * SLOTS_PER_EPOCH * slot_ms / 1000).max(60);
+    // A threshold: saturating on an absurd slot_ms is still a threshold.
+    let finality_stall_secs: u64 = ((4 * SLOTS_PER_EPOCH).saturating_mul(slot_ms) / 1000).max(60);
+    // Two slots of wall time, the grace/sync/rate-limit window used below.
+    let two_slots_ms = slot_ms.saturating_mul(2);
     let mut finality_stalled = false;
     let mut metrics_sampled_slot: u64 = 0;
 
     loop {
         let now = now_ms();
         if now < genesis_ms {
-            std::thread::sleep(Duration::from_millis((genesis_ms - now).min(200)));
+            // cannot underflow: now < genesis_ms.
+            #[allow(clippy::arithmetic_side_effects)]
+            let wait = (genesis_ms - now).min(200);
+            std::thread::sleep(Duration::from_millis(wait));
             continue;
         }
-        let slot = (now - genesis_ms) / slot_ms;
-        let slot_start = genesis_ms + slot * slot_ms;
+        // cannot underflow: now >= genesis_ms; cannot divide by zero:
+        // `Manifest::decode` refuses `slot_ms == 0`; and
+        // `genesis_ms + slot * slot_ms <= now` by the division that made `slot`.
+        #[allow(clippy::arithmetic_side_effects)]
+        let (slot, slot_start) = {
+            let slot = (now - genesis_ms) / slot_ms;
+            (slot, genesis_ms + slot * slot_ms)
+        };
         let wall_epoch = epoch_of(slot);
         if slot != engine.wall_slot {
             engine.wall_slot = slot;
@@ -5047,7 +5121,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 println!(
                     "STOP at slot {stop}: head slot {}, {} blocks, state root {}, justified e{} ({}), finalized e{} ({})",
                     engine.state.slot(),
-                    engine.chain.len() - 1,
+                    engine.head_height(),
                     crate::codec::hex32(&engine.state.state_root()),
                     fin.justified.epoch,
                     crate::codec::hex8(&fin.justified.root),
@@ -5060,7 +5134,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
 
         // Boot grace: give the mesh one round of sync before performing
         // duties, so a restarted proposer does not build on a stale head.
-        let in_grace = now.saturating_sub(engine.booted_ms) < 2 * slot_ms;
+        let in_grace = now.saturating_sub(engine.booted_ms) < two_slots_ms;
 
         // `slot` here IS `wall_slot()` — same expression, computed once per
         // turn above. It is what reaches the slashing-protection watermark, so
@@ -5077,7 +5151,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
             engine.attest(slot);
             last_attested = slot;
         }
-        let propose_at = slot_start + slot_ms / 3;
+        let propose_at = slot_start.saturating_add(slot_ms / 3); // a deadline
         if !in_grace && now >= propose_at && slot > last_built {
             engine.propose(slot);
             last_built = slot;
@@ -5085,9 +5159,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
 
         // Sync when behind or when a stored branch has holes. Rate-limited;
         // idempotent on the receiving side (dedup discards repeats).
-        let behind = engine.state.slot() + 1 < slot
-            && now.saturating_sub(engine.last_applied_ms) > 2 * slot_ms;
-        if (behind || engine.needs_sync) && now.saturating_sub(last_sync_req) > 2 * slot_ms {
+        let behind = engine.state.slot().saturating_add(1) < slot
+            && now.saturating_sub(engine.last_applied_ms) > two_slots_ms;
+        if (behind || engine.needs_sync) && now.saturating_sub(last_sync_req) > two_slots_ms {
             engine
                 .net
                 .broadcast(net::get_blocks_frame(engine.state.slot()));
@@ -5114,7 +5188,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
             let (devnet_peers, p2p_peers) = engine.net.peer_counts();
             NodeMetrics::set(
                 &NODE.peer_count,
-                (devnet_peers.unwrap_or(0) + p2p_peers.unwrap_or(0)) as u64,
+                devnet_peers.unwrap_or(0).saturating_add(p2p_peers.unwrap_or(0)) as u64,
             );
             // Per-transport (metrics gap): `None` (transport not running) and
             // `Some(0)` (running, no peers) both read as 0 here — a gauge has
@@ -5139,7 +5213,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
             // M-1) rather than deleted.
             NodeMetrics::set(
                 &NODE.blocks_parked,
-                (engine.orphans.len() + engine.parked_refused_finality.len()) as u64,
+                engine.orphans.len().saturating_add(engine.parked_refused_finality.len()) as u64,
             );
             // Once per slot, not per turn: `peer_counts` is cheap but
             // `statvfs` is a syscall against the data volume.
@@ -5168,7 +5242,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         let next_deadline = if slot > last_built && now < propose_at {
             propose_at
         } else {
-            slot_start + slot_ms
+            slot_start.saturating_add(slot_ms) // a deadline
         };
         let wait = next_deadline.saturating_sub(now_ms()).clamp(1, 500);
         match rx.recv_timeout(Duration::from_millis(wait)) {
@@ -11166,7 +11240,8 @@ mod finality_latch_tests {
         let evil_id = *env.block_id().as_bytes();
         engine.blocks.insert(evil_id, env.clone());
 
-        engine.refuse_finality_rewind(&[env]);
+        let latch = engine.finalized_latch.expect("fixture is latched");
+        engine.refuse_finality_rewind(latch, &[env]);
 
         assert!(
             !engine.blocks.contains_key(&evil_id),
@@ -11197,7 +11272,8 @@ mod finality_latch_tests {
         engine.blocks.insert(evil_id, env.clone());
 
         assert!(engine.parked_refused_finality.is_empty(), "nothing parked yet");
-        engine.refuse_finality_rewind(&[env]);
+        let latch = engine.finalized_latch.expect("fixture is latched");
+        engine.refuse_finality_rewind(latch, &[env]);
 
         assert!(
             engine.parked_refused_finality.iter().any(|(id, _)| *id == evil_id),
@@ -11229,7 +11305,8 @@ mod finality_latch_tests {
         env.header.proposer_index = u32::MAX;
         let evil_id = *env.block_id().as_bytes();
         engine.blocks.insert(evil_id, env.clone());
-        engine.refuse_finality_rewind(&[env.clone()]);
+        let latch = engine.finalized_latch.expect("fixture is latched");
+        engine.refuse_finality_rewind(latch, &[env.clone()]);
         assert!(!engine.blocks.contains_key(&evil_id), "parking removes it from `blocks`");
 
         let rejected_unsigned_before = engine.rejected_unsigned;

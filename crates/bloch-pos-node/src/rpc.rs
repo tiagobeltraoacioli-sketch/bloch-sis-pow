@@ -531,9 +531,19 @@ pub fn parse_json(text: &str) -> Result<Json, &'static str> {
 }
 
 impl<'a> Parser<'a> {
+    /// Move the cursor `n` bytes forward. The one place the cursor is added
+    /// to: every caller has just observed `n` bytes at `i` (a `peek`/`get`
+    /// that returned `Some`, a `starts_with` that matched, a `get(i..i + 4)`
+    /// that was in range), so `i + n <= b.len() <= isize::MAX` and the add
+    /// cannot overflow.
+    #[allow(clippy::arithmetic_side_effects)]
+    fn advance(&mut self, n: usize) {
+        self.i += n;
+    }
+
     fn ws(&mut self) {
         while matches!(self.b.get(self.i), Some(b' ' | b'\t' | b'\n' | b'\r')) {
-            self.i += 1;
+            self.advance(1);
         }
     }
 
@@ -543,7 +553,7 @@ impl<'a> Parser<'a> {
 
     fn eat(&mut self, lit: &[u8]) -> bool {
         if self.b[self.i..].starts_with(lit) {
-            self.i += lit.len();
+            self.advance(lit.len());
             true
         } else {
             false
@@ -551,7 +561,8 @@ impl<'a> Parser<'a> {
     }
 
     fn value(&mut self) -> Result<Json, &'static str> {
-        self.depth += 1;
+        // Same refusal for the (unreachable) u32 overflow as for the depth cap.
+        self.depth = self.depth.checked_add(1).ok_or("nesting too deep")?;
         if self.depth > MAX_DEPTH {
             return Err("nesting too deep");
         }
@@ -583,16 +594,21 @@ impl<'a> Parser<'a> {
             b'-' | b'0'..=b'9' => self.number(),
             _ => Err("unexpected character"),
         };
-        self.depth -= 1;
+        // cannot underflow: incremented at the top of this call, and every
+        // nested `value` leaves `depth` at least where it found it.
+        #[allow(clippy::arithmetic_side_effects)]
+        {
+            self.depth -= 1;
+        }
         v
     }
 
     fn object(&mut self) -> Result<Json, &'static str> {
-        self.i += 1; // '{'
+        self.advance(1); // '{'
         let mut fields = Vec::new();
         self.ws();
         if self.peek() == Some(b'}') {
-            self.i += 1;
+            self.advance(1);
             return Ok(Json::Obj(fields));
         }
         loop {
@@ -605,15 +621,15 @@ impl<'a> Parser<'a> {
             if self.peek() != Some(b':') {
                 return Err("expected ':' after object key");
             }
-            self.i += 1;
+            self.advance(1);
             self.ws();
             let v = self.value()?;
             fields.push((k, v));
             self.ws();
             match self.peek() {
-                Some(b',') => self.i += 1,
+                Some(b',') => self.advance(1),
                 Some(b'}') => {
-                    self.i += 1;
+                    self.advance(1);
                     return Ok(Json::Obj(fields));
                 }
                 _ => return Err("expected ',' or '}' in object"),
@@ -622,11 +638,11 @@ impl<'a> Parser<'a> {
     }
 
     fn array(&mut self) -> Result<Json, &'static str> {
-        self.i += 1; // '['
+        self.advance(1); // '['
         let mut items = Vec::new();
         self.ws();
         if self.peek() == Some(b']') {
-            self.i += 1;
+            self.advance(1);
             return Ok(Json::Arr(items));
         }
         loop {
@@ -634,9 +650,9 @@ impl<'a> Parser<'a> {
             items.push(self.value()?);
             self.ws();
             match self.peek() {
-                Some(b',') => self.i += 1,
+                Some(b',') => self.advance(1),
                 Some(b']') => {
-                    self.i += 1;
+                    self.advance(1);
                     return Ok(Json::Arr(items));
                 }
                 _ => return Err("expected ',' or ']' in array"),
@@ -645,16 +661,18 @@ impl<'a> Parser<'a> {
     }
 
     fn string(&mut self) -> Result<String, &'static str> {
-        self.i += 1; // opening quote
+        self.advance(1); // opening quote
         let mut s = String::new();
         loop {
+            // Where this byte starts, for the raw-UTF-8 arm below.
+            let start = self.i;
             let c = *self.b.get(self.i).ok_or("unterminated string")?;
-            self.i += 1;
+            self.advance(1);
             match c {
                 b'"' => return Ok(s),
                 b'\\' => {
                     let e = *self.b.get(self.i).ok_or("unterminated escape")?;
-                    self.i += 1;
+                    self.advance(1);
                     match e {
                         b'"' => s.push('"'),
                         b'\\' => s.push('\\'),
@@ -673,10 +691,15 @@ impl<'a> Parser<'a> {
                             let cp = if (0xD800..0xDC00).contains(&hi) {
                                 if self.b[self.i..].starts_with(b"\\u") {
                                     let save = self.i;
-                                    self.i += 2;
+                                    self.advance(2);
                                     let lo = self.hex4()?;
                                     if (0xDC00..0xE000).contains(&lo) {
-                                        0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
+                                        // cannot overflow: hi in D800..DC00 and lo in
+                                        // DC00..E000 (both checked), so this is < 0x110000.
+                                        #[allow(clippy::arithmetic_side_effects)]
+                                        {
+                                            0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
+                                        }
                                     } else {
                                         self.i = save;
                                         0xFFFD
@@ -700,9 +723,8 @@ impl<'a> Parser<'a> {
                 // input is a `&str`, so it is already valid UTF-8 and the
                 // boundary walk cannot land mid-character.
                 _ => {
-                    let start = self.i - 1;
                     while self.b.get(self.i).is_some_and(|b| b & 0xC0 == 0x80) {
-                        self.i += 1;
+                        self.advance(1);
                     }
                     match std::str::from_utf8(&self.b[start..self.i]) {
                         Ok(chunk) => s.push_str(chunk),
@@ -714,17 +736,22 @@ impl<'a> Parser<'a> {
     }
 
     fn hex4(&mut self) -> Result<u32, &'static str> {
-        let bytes = self.b.get(self.i..self.i + 4).ok_or("truncated \\u escape")?;
+        // An end offset that does not fit is as truncated as one past the buffer.
+        let bytes = self
+            .i
+            .checked_add(4)
+            .and_then(|end| self.b.get(self.i..end))
+            .ok_or("truncated \\u escape")?;
         let text = std::str::from_utf8(bytes).map_err(|_| "invalid \\u escape")?;
         let v = u32::from_str_radix(text, 16).map_err(|_| "invalid \\u escape")?;
-        self.i += 4;
+        self.advance(4);
         Ok(v)
     }
 
     fn number(&mut self) -> Result<Json, &'static str> {
         let start = self.i;
         if self.peek() == Some(b'-') {
-            self.i += 1;
+            self.advance(1);
         }
         // The integer part is `0` or `[1-9][0-9]*` — JSON forbids leading
         // zeros, and accepting `01` would make this parser more permissive than
@@ -734,7 +761,7 @@ impl<'a> Parser<'a> {
         // request id and an amount must round-trip as written.
         match self.peek() {
             Some(b'0') => {
-                self.i += 1;
+                self.advance(1);
                 if matches!(self.peek(), Some(b'0'..=b'9')) {
                     return Err("number has a leading zero");
                 }
@@ -745,15 +772,15 @@ impl<'a> Parser<'a> {
             _ => return Err("number has no integer part"),
         }
         if self.peek() == Some(b'.') {
-            self.i += 1;
+            self.advance(1);
             if self.digits() == 0 {
                 return Err("number has no fractional digits");
             }
         }
         if matches!(self.peek(), Some(b'e' | b'E')) {
-            self.i += 1;
+            self.advance(1);
             if matches!(self.peek(), Some(b'+' | b'-')) {
-                self.i += 1;
+                self.advance(1);
             }
             if self.digits() == 0 {
                 return Err("number has no exponent digits");
@@ -766,9 +793,13 @@ impl<'a> Parser<'a> {
     fn digits(&mut self) -> usize {
         let start = self.i;
         while matches!(self.peek(), Some(b'0'..=b'9')) {
-            self.i += 1;
+            self.advance(1);
         }
-        self.i - start
+        // cannot underflow: the cursor only moved forward from `start`.
+        #[allow(clippy::arithmetic_side_effects)]
+        {
+            self.i - start
+        }
     }
 }
 
@@ -786,7 +817,8 @@ pub fn from_hex(s: &str) -> Option<Vec<u8>> {
     for pair in b.chunks_exact(2) {
         let hi = (pair[0] as char).to_digit(16)?;
         let lo = (pair[1] as char).to_digit(16)?;
-        out.push((hi * 16 + lo) as u8);
+        // `to_digit(16)` yields 0..=15, so `hi << 4 | lo` is exactly `hi * 16 + lo` and fits a u8.
+        out.push(((hi << 4) | lo) as u8);
     }
     Some(out)
 }
@@ -1532,13 +1564,17 @@ fn read_request_until(
     }
 
     // Body: whatever already arrived with the head, plus the rest.
-    let mut body = buf[head_end + 4..].to_vec();
+    // Everything after the CRLFCRLF: `buf[head_end..]` starts with the 4-byte
+    // terminator `find_head_end` located, so `[4..]` of it is `buf[head_end + 4..]`.
+    let mut body = buf[head_end..][4..].to_vec();
     body.truncate(len);
     while body.len() < len {
         let want = chunk.len().min(len.saturating_sub(body.len()));
         match read_before_deadline(sock, &mut chunk[..want], deadline) {
             Ok(0) => return Err(http_err(400, "connection closed before the body was complete")),
             Ok(n) => {
+                // cannot underflow: the loop runs while body.len() < len.
+                #[allow(clippy::arithmetic_side_effects)]
                 let want = len - body.len();
                 body.extend_from_slice(&chunk[..n.min(want)]);
             }

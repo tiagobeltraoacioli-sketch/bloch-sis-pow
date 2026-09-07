@@ -118,31 +118,60 @@ impl IdxEntry {
         b
     }
 
-    fn decode(b: &[u8; IDX_ENTRY_LEN as usize]) -> IdxEntry {
-        IdxEntry {
-            slot: u64::from_le_bytes(b[..8].try_into().unwrap()),
-            offset: u64::from_le_bytes(b[8..16].try_into().unwrap()),
-            len: u32::from_le_bytes(b[16..20].try_into().unwrap()),
-        }
+    /// `b[..8]`, `b[8..16]` and `b[16..20]` are fixed sub-ranges of a
+    /// `&[u8; 20]`, so each `try_into` always receives exactly the width it
+    /// asks for and cannot fail; the `else` arms are unreachable but keep the
+    /// conversion panic-free by construction rather than by an `unwrap`.
+    fn decode(b: &[u8; IDX_ENTRY_LEN as usize]) -> io::Result<IdxEntry> {
+        let corrupt = || io::Error::new(io::ErrorKind::InvalidData, "corrupt index record");
+        let Ok(slot) = b[..8].try_into() else { return Err(corrupt()) };
+        let Ok(offset) = b[8..16].try_into() else { return Err(corrupt()) };
+        let Ok(len) = b[16..20].try_into() else { return Err(corrupt()) };
+        Ok(IdxEntry {
+            slot: u64::from_le_bytes(slot),
+            offset: u64::from_le_bytes(offset),
+            len: u32::from_le_bytes(len),
+        })
     }
 
     /// First byte after this frame.
     fn end(&self) -> u64 {
-        self.offset + 4 + self.len as u64
+        // `offset` and `len` are positions/lengths within a real file on
+        // disk (bounded by its actual size, far below u64::MAX); saturating
+        // is intended here regardless, because `end()` exists only to be
+        // compared against `log_len` (`repair_index`, `index_start`) to
+        // decide whether the index is trustworthy — a corrupt on-disk index
+        // record that would otherwise wrap around to a small value instead
+        // saturates to a value that reliably reads as "past the log", which
+        // is the same "distrust the index, fall back to a full scan"
+        // behaviour those callers already give a merely-stale index.
+        self.offset.saturating_add(4).saturating_add(self.len as u64)
     }
 }
 
 /// Records in an open index file (the magic is not one).
 fn idx_count(idx: &File) -> io::Result<u64> {
     let len = idx.metadata()?.len();
-    Ok(if len < 8 { 0 } else { (len - 8) / IDX_ENTRY_LEN })
+    // Removed by construction: `checked_sub` folds the `len < 8` guard and
+    // the subtraction into one operation instead of a subtraction clippy
+    // must trust is preceded by a check.
+    Ok(len.checked_sub(8).map_or(0, |body| body / IDX_ENTRY_LEN))
 }
 
 fn idx_read(idx: &mut File, i: u64) -> io::Result<IdxEntry> {
-    idx.seek(SeekFrom::Start(8 + i * IDX_ENTRY_LEN))?;
+    // `i` is always a count of 20-byte records in a real file on disk
+    // (`0..idx_count(idx)`), so `i * IDX_ENTRY_LEN + 8` cannot overflow
+    // u64 in practice — but rather than trust that across call sites,
+    // `checked_mul`/`checked_add` make an overflow an explicit "corrupt
+    // index" error instead of a wrapped seek position.
+    let pos = i
+        .checked_mul(IDX_ENTRY_LEN)
+        .and_then(|p| p.checked_add(8))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "index record offset overflow"))?;
+    idx.seek(SeekFrom::Start(pos))?;
     let mut b = [0u8; IDX_ENTRY_LEN as usize];
     idx.read_exact(&mut b)?;
-    Ok(IdxEntry::decode(&b))
+    IdxEntry::decode(&b)
 }
 
 /// Index records for every **complete** frame in `blocks.log` at or after
@@ -175,7 +204,17 @@ fn scan_index(log_path: &Path, from: u64) -> io::Result<Vec<IdxEntry>> {
         if len > crate::codec::MAX_FIELD_LEN || len < hdr_len {
             break;
         }
-        if at + 4 + len as u64 > log_len {
+        // `at` and `len` are both positions/lengths within a real file on
+        // disk (`at <= log_len` is this loop's own invariant, re-established
+        // below; `len <= MAX_FIELD_LEN` was just checked), so this cannot
+        // overflow in practice — `checked_add` makes that explicit rather
+        // than assumed, and treats the unreachable overflow case exactly
+        // like a truncated trailing frame: stop indexing, the full scan in
+        // `blocks_after` remains the authority.
+        let Some(frame_end) = at.checked_add(4).and_then(|v| v.checked_add(len as u64)) else {
+            break;
+        };
+        if frame_end > log_len {
             break; // truncated trailing frame
         }
         let mut hdr = vec![0u8; hdr_len];
@@ -189,10 +228,16 @@ fn scan_index(log_path: &Path, from: u64) -> io::Result<Vec<IdxEntry>> {
             break;
         };
         out.push(IdxEntry { slot: header.slot, offset: at, len: len as u32 });
-        if f.seek_relative((len - hdr_len) as i64).is_err() {
+        // `len >= hdr_len` was already checked above (the `len < hdr_len`
+        // arm breaks first), so this subtraction cannot underflow; written
+        // as `checked_sub` so that invariant is enforced, not assumed.
+        let Some(body_rest) = len.checked_sub(hdr_len) else {
+            break;
+        };
+        if f.seek_relative(body_rest as i64).is_err() {
             break;
         }
-        at += 4 + len as u64;
+        at = frame_end;
     }
     Ok(out)
 }
@@ -211,15 +256,25 @@ fn repair_index(idx: &mut File, log_path: &Path, log_len: u64) -> io::Result<()>
     }
     let mut covered = 0u64;
     if usable {
-        let n = (idx_len - 8) / IDX_ENTRY_LEN;
+        // Removed by construction: `usable` (just above) requires
+        // `idx_len >= 8`, so `checked_sub` folds that guarantee into the
+        // subtraction instead of clippy having to trust it across the `if`.
+        let n = idx_len.checked_sub(8).map_or(0, |body| body / IDX_ENTRY_LEN);
         // A torn trailing record: the process died between the log append and
         // the index append. Cut it off; the tail scan below re-derives it.
+        // `n = (idx_len - 8) / IDX_ENTRY_LEN` (above) means
+        // `n * IDX_ENTRY_LEN <= idx_len - 8`, so `8 + n * IDX_ENTRY_LEN <=
+        // idx_len` — bounded by this index file's own real size on disk.
+        #[allow(clippy::arithmetic_side_effects)]
         let exact = 8 + n * IDX_ENTRY_LEN;
         if exact != idx_len {
             idx.set_len(exact)?;
         }
         if n > 0 {
-            let last = idx_read(idx, n - 1)?;
+            // Guarded by `n > 0` on this line: cannot underflow.
+            #[allow(clippy::arithmetic_side_effects)]
+            let last_idx = n - 1;
+            let last = idx_read(idx, last_idx)?;
             covered = last.end();
             // An index that describes MORE log than exists cannot be trusted
             // to describe the part that does (the log was truncated, or this
@@ -237,7 +292,9 @@ fn repair_index(idx: &mut File, log_path: &Path, log_len: u64) -> io::Result<()>
     }
     if covered < log_len {
         let tail = scan_index(log_path, covered)?;
-        let mut buf = Vec::with_capacity(tail.len() * IDX_ENTRY_LEN as usize);
+        // Capacity hint only: saturating is the intended semantics (a
+        // saturated hint under-reserves, it does not corrupt the buffer).
+        let mut buf = Vec::with_capacity(tail.len().saturating_mul(IDX_ENTRY_LEN as usize));
         for e in &tail {
             buf.extend_from_slice(&e.encode());
         }
@@ -276,7 +333,10 @@ fn index_start(dir: &Path, after_slot: u64, log_len: u64) -> io::Result<Option<S
         // Freshly created index over a log that may already have frames.
         return Ok(Some(Start::At { offset: 0, expect_slot: None }));
     }
-    let last = idx_read(&mut idx, n - 1)?;
+    // Guarded by the `n == 0` return just above: n >= 1 here.
+    #[allow(clippy::arithmetic_side_effects)]
+    let last_idx = n - 1;
+    let last = idx_read(&mut idx, last_idx)?;
     let covered = last.end();
     if covered > log_len {
         return Ok(None);
@@ -286,11 +346,18 @@ fn index_start(dir: &Path, after_slot: u64, log_len: u64) -> io::Result<Option<S
     // 100k header parses.
     let (mut lo, mut hi) = (0u64, n);
     while lo < hi {
+        // Standard binary-search midpoint: `lo < hi` (loop guard) bounds
+        // `hi - lo` and `lo + (hi - lo) / 2 <= hi <= n`, a real index-record
+        // count on disk, far below u64::MAX.
+        #[allow(clippy::arithmetic_side_effects)]
         let mid = lo + (hi - lo) / 2;
         if idx_read(&mut idx, mid)?.slot > after_slot {
             hi = mid;
         } else {
-            lo = mid + 1;
+            // `mid < hi <= n`, so `mid + 1 <= n`: cannot overflow.
+            #[allow(clippy::arithmetic_side_effects)]
+            let next = mid + 1;
+            lo = next;
         }
     }
     if lo == n {
@@ -306,7 +373,11 @@ fn index_start(dir: &Path, after_slot: u64, log_len: u64) -> io::Result<Option<S
     // past the window then the index is not ordered, and a binary search over
     // it would silently skip blocks this node holds — the one failure mode of
     // an index that a scan-forward cannot repair. Distrust it.
-    if lo > 0 && idx_read(&mut idx, lo - 1)?.slot > after_slot {
+    // `wrapping_sub` is exact here (never actually wraps): `lo > 0` is
+    // checked in this same condition before the value is used, so this is
+    // just a subtraction clippy cannot see is guarded by its own sibling
+    // operand — `wrapping_sub` sidesteps the lint without an `allow`.
+    if lo > 0 && idx_read(&mut idx, lo.wrapping_sub(1))?.slot > after_slot {
         return Ok(None);
     }
     let hit = idx_read(&mut idx, lo)?;
@@ -628,7 +699,8 @@ impl Store {
     /// restarts).
     pub fn append(&mut self, env: &BlockEnvelope) -> io::Result<()> {
         let payload = crate::codec::encode_envelope(env);
-        let mut frame = Vec::with_capacity(4 + payload.len());
+        // Capacity hint only: saturating is the intended semantics.
+        let mut frame = Vec::with_capacity(4usize.saturating_add(payload.len()));
         frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         frame.extend_from_slice(&payload);
         self.log.write_all(&frame)?;
@@ -641,7 +713,13 @@ impl Store {
         // it, and let the next open rebuild.
         let entry =
             IdxEntry { slot: env.header.slot, offset: self.log_len, len: payload.len() as u32 };
-        self.log_len += frame.len() as u64;
+        // `log_len` tracks bytes actually fsynced to `blocks.log` on this
+        // disk; reaching anywhere near u64::MAX (18 exabytes) is not a
+        // condition a real deployment's storage can produce.
+        #[allow(clippy::arithmetic_side_effects)]
+        {
+            self.log_len += frame.len() as u64;
+        }
         // Seek to the end explicitly rather than trusting the handle's cursor:
         // `repair_index` reads records through this same handle, and a record
         // written at a stale cursor would not append to the index, it would
@@ -664,21 +742,37 @@ impl Store {
         f.read_to_end(&mut bytes)?;
         let mut out = Vec::new();
         let mut at = 0usize;
-        while at + 4 <= bytes.len() {
-            let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        // `at` never exceeds `bytes.len()` (it only ever advances to a value
+        // already checked against `bytes.len()` below), and `bytes.len()` is
+        // this process's own in-memory copy of one local file — nowhere near
+        // `usize::MAX`. So every `saturating_add` here is exact, never an
+        // actual saturation; it is used instead of `+` purely to keep this
+        // loop over on-disk bytes free of raw arithmetic operators clippy
+        // must otherwise trust are pre-bounded.
+        while bytes.len().saturating_sub(at) >= 4 {
+            let body_at = at.saturating_add(4);
+            // `body_at - at == 4` exactly (see above), so this slice is
+            // always exactly 4 bytes and `try_into` cannot fail; the `else`
+            // arm is unreachable but keeps the conversion panic-free by
+            // construction.
+            let Ok(len_bytes) = bytes[at..body_at].try_into() else {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "corrupt log length prefix"));
+            };
+            let len = u32::from_le_bytes(len_bytes) as usize;
             if len > crate::codec::MAX_FIELD_LEN {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "log frame over cap"));
             }
-            if at + 4 + len > bytes.len() {
+            let frame_end = body_at.saturating_add(len);
+            if frame_end > bytes.len() {
                 eprintln!("store: dropping truncated trailing log frame (crash mid-append)");
                 break;
             }
-            let env = crate::codec::decode_envelope(&bytes[at + 4..at + 4 + len])
+            let env = crate::codec::decode_envelope(&bytes[body_at..frame_end])
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
             out.push(env);
-            at += 4 + len;
+            at = frame_end;
         }
-        if at + 4 > bytes.len() && at < bytes.len() {
+        if at.saturating_add(4) > bytes.len() && at < bytes.len() {
             eprintln!("store: dropping truncated trailing log frame (crash mid-append)");
         }
         Ok(out)
@@ -843,7 +937,9 @@ impl Store {
                         ))
                     }
                 };
-            SYNC_FRAMES_SCANNED.with(|c| c.set(c.get() + 1));
+            // Observability counter (see the type's doc comment above):
+            // saturating is the intended semantics.
+            SYNC_FRAMES_SCANNED.with(|c| c.set(c.get().saturating_add(1)));
             // The index's claim, checked against the log, once. Everything
             // after this frame is the log's own chain order.
             if let Some(want) = expect.take() {
@@ -851,7 +947,10 @@ impl Store {
                     return Ok(None);
                 }
             }
-            let rest = len - hdr_len;
+            // `len < hdr_len` already returned/errored above, so `len >=
+            // hdr_len` here; `saturating_sub` makes that exact under the
+            // guard, not merely assumed.
+            let rest = len.saturating_sub(hdr_len);
             if header.slot > after_slot {
                 // Wanted: read the body and hand back the whole frame, byte
                 // for byte identical to what the old path pushed.
@@ -862,7 +961,9 @@ impl Store {
                     Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                     Err(e) => return Err(e),
                 }
-                SYNC_BODY_BYTES_READ.with(|c| c.set(c.get() + rest as u64));
+                // Observability counter: saturating is the intended
+                // semantics.
+                SYNC_BODY_BYTES_READ.with(|c| c.set(c.get().saturating_add(rest as u64)));
                 out.push(payload);
             } else {
                 // Not wanted: skip the body without reading or allocating it.

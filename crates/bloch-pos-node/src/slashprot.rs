@@ -407,9 +407,13 @@ fn decode(bytes: &[u8]) -> Option<(Watermarks, Option<Binding>)> {
     if bytes[body_len..] != digest(&bytes[..body_len]) {
         return None;
     }
+    // Field `i` is the i-th 8-byte word after the 12-byte preamble — the
+    // same bytes `12 + i * 8 .. 12 + i * 8 + 8` named, walked without the
+    // arithmetic. `bytes.len()` is one of the two RECORD_LENs matched above,
+    // so every field the record defines is present.
     let field = |i: usize| {
-        let at = 12 + i * 8;
-        let v = u64::from_le_bytes(bytes[at..at + 8].try_into().ok()?);
+        let word = bytes.get(12..)?.chunks_exact(8).nth(i)?;
+        let v = u64::from_le_bytes(word.try_into().ok()?);
         Some((v != NONE).then_some(v))
     };
     let wm = Watermarks {

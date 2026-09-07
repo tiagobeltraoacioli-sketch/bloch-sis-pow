@@ -627,14 +627,22 @@ impl Keystore {
             p_cost: r.u32().map_err(|_| bad("truncated keystore"))?,
         };
         let salt = r.h32().map_err(|_| bad("truncated keystore"))?;
-        let nonce: [u8; 24] = r
-            .take(24)
-            .map_err(|_| bad("truncated keystore"))?
-            .try_into()
-            .unwrap();
+        // `take(24)` returns a slice of exactly 24 bytes or an `Err` above,
+        // so the conversion cannot fail; the `else` arm keeps it panic-free
+        // by construction rather than by an `unwrap`.
+        let Ok(nonce): Result<[u8; 24], _> =
+            r.take(24).map_err(|_| bad("truncated keystore"))?.try_into()
+        else {
+            return Err(bad("truncated keystore"));
+        };
         let index = r.u32().map_err(|_| bad("truncated keystore"))?;
         let pubkey = r.bytes().map_err(|_| bad("truncated keystore"))?;
-        // Everything read so far is the AAD, byte for byte as written.
+        // Everything read so far is the AAD, byte for byte as written. The
+        // constant part (magic + kdf id + kdf params + salt + nonce + index +
+        // pubkey length prefix) is a fixed 85; `pubkey.len()` is capped at
+        // `codec::MAX_FIELD_LEN` (8 MiB) by `Reader::bytes`. Nowhere near
+        // overflowing `usize`.
+        #[allow(clippy::arithmetic_side_effects)]
         let header_len = 8 + 1 + 12 + 32 + 24 + 4 + 4 + pubkey.len();
         let header = &bytes[..header_len];
         let sealed = r.bytes().map_err(|_| bad("truncated keystore"))?;
@@ -679,6 +687,14 @@ impl Keystore {
     /// Sign a 32-byte consensus signing root with both halves of the hybrid
     /// suite. The domain tag is already inside the root (DS_PROPOSE /
     /// DS_ATTEST), per the pure crate's derivations.
+    // `self.secret` is private to this module and every constructor of a
+    // `Keystore` (generation, or `load`'s decrypt-then-decode above) produces
+    // it in the one well-formed shape `bloch_crypto::crypto::sign` accepts;
+    // there is no path that stores anything else there. Changing this
+    // function's return type to a `Result` would push that same
+    // never-actually-fails error through every proposer/attester call site
+    // in `engine.rs`, for a case this module's own construction paths
+    // already rule out. Left COUNTED by the hardened ratchet on purpose.
     pub fn sign(&self, signing_root: &[u8; 32]) -> Vec<u8> {
         bloch_crypto::crypto::sign(&self.secret, signing_root)
             .expect("hybrid signing over a well-formed keystore key cannot fail")
