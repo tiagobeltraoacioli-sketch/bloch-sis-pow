@@ -153,7 +153,7 @@ use crate::slashing;
 use crate::staking::{self, QueuedDeposit};
 use crate::fee_market;
 use crate::state_root::{
-    AppliedEvidenceRecord, BaseFeeRecord, CheckpointRecord, ConsensusState, DelegatorFeeRecord, DelegatorLossRecord, SlashWindowRecord, DelegationRecord, DepositQueueRecord, EvmCommitment, FcEquivocatorRecord, FcMessageRecord, FinalityRecord, LeakRecord, ParticipationRecord, PendingFeeRecord, PendingVoteRecord, RandaoMix, ValidatorRecord as CommittedValidatorRecord,
+    AppliedEvidenceRecord, BaseFeeRecord, CheckpointRecord, ConsensusState, DelegatorFeeRecord, DelegatorLossRecord, SlashWindowRecord, DelegationRecord, DepositQueueRecord, EvmCommitment, FcEquivocatorRecord, FcMessageRecord, FcRecentVoteRecord, FinalityRecord, LeakRecord, ParticipationRecord, PendingFeeRecord, PendingVoteRecord, RandaoMix, ValidatorRecord as CommittedValidatorRecord,
 };
 use crate::tokenomics_v4;
 use sha3::{Digest, Sha3_256};
@@ -1522,6 +1522,23 @@ pub struct CommittedState {
     latest_messages: BTreeMap<u32, (u64, [u8; 32])>,
     /// Validators barred from fork-choice weight for equivocating. Monotone.
     fc_equivocators: BTreeSet<u32>,
+    /// Per-validator votes of the most recent
+    /// [`crate::params::FORKCHOICE_EQUIVOCATION_HORIZON_SLOTS`] slots
+    /// (validator → slot → head root): the bounded history same-slot
+    /// equivocation is judged against once
+    /// [`crate::params::FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH`]
+    /// binds (external audit 2026-09-07, O01 — `Store::observe` alone misses
+    /// a same-slot pair in four of its six arrival orders). Committed under
+    /// `state_root::TAG_FC_RECENT_VOTE`, one leaf per (validator, slot).
+    ///
+    /// EMPTY below the gate — its only writer is `accumulate_forkchoice`'s
+    /// gated arm — so the component commits zero leaves and every pre-gate
+    /// root is untouched. Pruned at every block to the horizon below the
+    /// block's slot, and a validator whose history empties is removed
+    /// outright, so it holds at most `validators × horizon` entries and
+    /// never an empty holder. BTreeMap at both levels: it is iterated into
+    /// the root.
+    fc_recent_votes: BTreeMap<u32, BTreeMap<u64, [u8; 32]>>,
     /// Attestation inclusion per validator, current epoch. Feeds rewards
     /// (credits) and the committed participation component.
     current_participation: BTreeMap<u32, bool>,
@@ -2171,6 +2188,7 @@ impl CommittedState {
             pending_votes: BTreeMap::new(),
             latest_messages: BTreeMap::new(),
             fc_equivocators: BTreeSet::new(),
+            fc_recent_votes: BTreeMap::new(),
             current_participation: BTreeMap::new(),
             previous_participation: BTreeMap::new(),
             deposit_history: Vec::new(),
@@ -2643,6 +2661,20 @@ impl CommittedState {
             .iter()
             .map(|validator| FcEquivocatorRecord { validator: *validator })
             .collect();
+        // O01 retained-vote window: one leaf per (validator, slot). Empty —
+        // no leaves — until `FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH`
+        // binds, which is what keeps every pre-gate root byte-identical.
+        let fc_recent_votes: Vec<FcRecentVoteRecord> = self
+            .fc_recent_votes
+            .iter()
+            .flat_map(|(validator, votes)| {
+                votes.iter().map(move |(slot, root)| FcRecentVoteRecord {
+                    validator: *validator,
+                    slot: *slot,
+                    root: *root,
+                })
+            })
+            .collect();
         let deposit_queue: Vec<DepositQueueRecord> = self
             .deposit_history
             .iter()
@@ -2746,6 +2778,7 @@ impl CommittedState {
             pending_votes: &pending_votes,
             fc_messages: &fc_messages,
             fc_equivocators: &fc_equivocators,
+            fc_recent_votes: &fc_recent_votes,
             deposit_queue: &deposit_queue,
             delegations: &delegations,
             pending_fees: &pending_fees,
@@ -2780,7 +2813,46 @@ impl CommittedState {
     /// re-decides them. Rebuilding per block instead of holding a live Store
     /// is deliberate: a long-lived store on the node is exactly the mutable
     /// local state rule 1 bans from the transition.
-    fn accumulate_forkchoice(&mut self, roster: &[Validator], attestations: &[Attestation]) {
+    ///
+    /// ## The O01 gap and the gated horizon (external audit 2026-09-07)
+    ///
+    /// "Single definition" is true of which message WINS. It is not a
+    /// complete definition of equivocation: `observe` compares a vote only
+    /// against the one latest message it keeps, so once a later-slot vote
+    /// from a validator is its latest, an older same-slot conflict arriving
+    /// afterwards is dismissed as stale and never compared. Because this
+    /// method seeds the store with exactly one committed message per
+    /// validator, the committed `fc_equivocators` set (a state-root
+    /// component) then depends on the order blocks carried the votes in —
+    /// four of the six arrival orders of {(s, x), (s, y), (s + 1, z)} miss
+    /// the pair. Today step 8's own-epoch rule and the committee partition
+    /// keep that unreachable through `apply_block` (a validator has one
+    /// includable slot per epoch); the fold must not depend on it.
+    ///
+    /// From `FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH` every admitted
+    /// vote is first judged against `fc_recent_votes` — the validator's
+    /// retained votes of the last `FORKCHOICE_EQUIVOCATION_HORIZON_SLOTS`
+    /// slots — and a same-slot conflict bars it whatever its latest message
+    /// is. Invariant post-gate: a validator is barred iff two of its admitted
+    /// votes name one slot with two roots. Proof sketch: the first half of
+    /// any such pair is retained when admitted (or the validator was already
+    /// barred), the horizon covers every includable slot (see the constant's
+    /// docs), so the second half finds it. Weight semantics are exactly
+    /// `observe`'s, unchanged; the pre-gate path is the code as it was,
+    /// statement for statement — `horizon` is `false` and every arm it
+    /// guards is skipped.
+    ///
+    /// `block_slot` is the judged block's own `header.slot`, the key the
+    /// horizon prunes on; below the gate it is not read.
+    fn accumulate_forkchoice(
+        &mut self,
+        roster: &[Validator],
+        attestations: &[Attestation],
+        block_slot: u64,
+    ) {
+        // Gate read once, from committed state rolled to the judged block's
+        // epoch — never a clock (2026-08-08 `expected_bits`).
+        let horizon = Self::forkchoice_equivocation_horizon_active(self.epoch);
         let mut store = Store::new();
         for v in roster {
             store.set_stake(v.index, v.effective_stake);
@@ -2798,18 +2870,87 @@ impl CommittedState {
                 continue;
             }
             let msg = LatestMessage { slot: att.data.slot, root: att.data.head };
+            // O01, gated: the retained history is consulted BEFORE the store,
+            // so the verdict cannot depend on what the store happens to hold
+            // as this validator's latest. Cheapest check first — two BTreeMap
+            // probes, no hashing — and fail-closed: a conflict bars now,
+            // removes the validator's weight and its history, and the vote
+            // never reaches `observe`.
+            if horizon && self.record_recent_vote_conflicts(att.validator, msg) {
+                self.fc_equivocators.insert(att.validator);
+                self.latest_messages.remove(&att.validator);
+                self.fc_recent_votes.remove(&att.validator);
+                continue;
+            }
             if store.observe(att.validator, msg) {
                 self.latest_messages.insert(att.validator, (msg.slot, msg.root));
             }
         }
         // Whatever observe classified as equivocation is barred and its
         // weight removed — both halves of the pair, so arrival order cannot
-        // decide the outcome (the forkchoice.rs 2026-08-11 finding).
+        // decide the outcome (the forkchoice.rs 2026-08-11 finding) FOR THE
+        // SINGLE-SLOT PAIR CASE; the general case is the gated arm above.
         let newly: Vec<u32> = store.equivocators().copied().collect();
         for e in newly {
             self.fc_equivocators.insert(e);
             self.latest_messages.remove(&e);
+            if horizon {
+                // A barred validator's history is evidence the slashing
+                // pipeline reads elsewhere, not a window this fold needs:
+                // the bar is monotone and short-circuits every later vote.
+                self.fc_recent_votes.remove(&e);
+            }
         }
+        if horizon {
+            self.prune_recent_votes(block_slot);
+        }
+    }
+
+    /// O01, gated: record `msg` in `validator`'s retained history and report
+    /// whether a DIFFERENT root is already retained for the same slot.
+    ///
+    /// Returns `true` (conflict) without recording — the caller bars the
+    /// validator and drops its whole history, so nothing is left half-written.
+    /// A repeat of an identical vote is a no-op `false`: the same message twice
+    /// is padding, not equivocation, exactly as `observe` treats it.
+    fn record_recent_vote_conflicts(&mut self, validator: u32, msg: LatestMessage) -> bool {
+        let votes = self.fc_recent_votes.entry(validator).or_default();
+        match votes.get(&msg.slot) {
+            Some(prev) => *prev != msg.root,
+            None => {
+                votes.insert(msg.slot, msg.root);
+                false
+            }
+        }
+    }
+
+    /// O01, gated: drop every retained vote older than the horizon below
+    /// `block_slot`, and every validator whose history empties.
+    ///
+    /// Deterministic and total: a pure function of the map and the block's
+    /// slot, applied once per block, with no dependence on how many blocks
+    /// were skipped — a gap of a thousand slots prunes exactly as a gap of
+    /// one does. Bound: every includable vote names a slot `<= block_slot`
+    /// (`attestation::validate`, `FutureSlot`), so after this call each
+    /// validator holds at most `FORKCHOICE_EQUIVOCATION_HORIZON_SLOTS`
+    /// distinct slots, and the component at most `validators × horizon`
+    /// entries — `fc_horizon_retained_votes_are_pruned_and_bounded` measures
+    /// it.
+    fn prune_recent_votes(&mut self, block_slot: u64) {
+        let floor = Self::recent_vote_floor(block_slot);
+        self.fc_recent_votes.retain(|_, votes| {
+            // Keep `floor..`; `split_off` returns exactly the keys `>= floor`.
+            *votes = votes.split_off(&floor);
+            !votes.is_empty()
+        });
+    }
+
+    /// Oldest slot retained after the block at `block_slot`:
+    /// `block_slot - (HORIZON - 1)`, saturating so the chain's first slots
+    /// keep everything rather than underflow (overflow-checks are on).
+    fn recent_vote_floor(block_slot: u64) -> u64 {
+        block_slot
+            .saturating_sub(crate::params::FORKCHOICE_EQUIVOCATION_HORIZON_SLOTS.saturating_sub(1))
     }
 
     // ── Transactions ────────────────────────────────────────────────────────
@@ -2936,6 +3077,27 @@ impl CommittedState {
         #[allow(clippy::absurd_extreme_comparisons)]
         {
             forced || epoch >= crate::params::DUST_RULE_ACTIVATION_EPOCH
+        }
+    }
+
+    /// Is the fork-choice equivocation retention horizon (external audit
+    /// 2026-09-07, O01) active in `epoch`? Same shape as the gates above:
+    /// `epoch` is the caller's `self.epoch` — committed state rolled to the
+    /// judged block's own `epoch_of(header.slot)`, never a clock (the
+    /// 2026-08-08 `expected_bits` fork is the standing reason). Inert today:
+    /// `FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH` is `u64::MAX`,
+    /// arming it is a founder decision.
+    fn forkchoice_equivocation_horizon_active(epoch: u64) -> bool {
+        #[cfg(test)]
+        let forced = crate::params::rehearsal::forkchoice_equivocation_horizon_gate_forced_open();
+        #[cfg(not(test))]
+        let forced = false;
+        // `FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH` is `u64::MAX`
+        // today (inert gate, founder's to arm) — the comparison is always
+        // false outside `forced`, by design.
+        #[allow(clippy::absurd_extreme_comparisons)]
+        {
+            forced || epoch >= crate::params::FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH
         }
     }
 
@@ -5582,8 +5744,9 @@ impl<V: SignatureVerifier> Transition<V> {
             st.pending_votes.insert((att.validator, signing_root), att.data);
         }
 
-        // 9. Fork-choice weight accumulation (forkchoice.rs).
-        st.accumulate_forkchoice(&roster, attestations);
+        // 9. Fork-choice weight accumulation (forkchoice.rs). The block's own
+        //    slot keys the O01 retention horizon (gated; unread below it).
+        st.accumulate_forkchoice(&roster, attestations, header.slot);
 
         // 10. Transactions — cheap state-dependent rules, except slashing
         //     evidence, which is routed here because it needs the injected
@@ -7245,6 +7408,331 @@ mod tests {
             assert!(!CommittedState::rewards_v2_active(e), "epoch {e} must be below");
         }
         assert!(CommittedState::rewards_v2_active(crate::params::REWARDS_V2_ACTIVATION_EPOCH));
+    }
+
+    // -- FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH (external audit -----
+    //    2026-09-07, O01: "general order-independence claim is too strong")
+
+    /// TRIPWIRE. `FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH` must stay
+    /// `u64::MAX` until the founder names an epoch: it changes a committed
+    /// component (`fc_equivocators`) on bodies that apply today and adds
+    /// leaves (`fc_recent_votes`), so the first post-gate block commits a
+    /// root a fleet not yet running this rule would reject. Whoever arms it
+    /// deletes this test first, and reads the constant's docs while doing so.
+    #[test]
+    fn forkchoice_equivocation_horizon_gate_is_inert() {
+        assert_eq!(
+            crate::params::FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH,
+            u64::MAX,
+            "arming the fork-choice horizon changes committed state; read the constant's docs",
+        );
+    }
+
+    /// Same shape as every other gate's function-of-the-epoch-alone test.
+    #[test]
+    fn the_forkchoice_equivocation_horizon_gate_is_a_function_of_the_block_epoch_alone() {
+        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1] {
+            assert!(
+                !CommittedState::forkchoice_equivocation_horizon_active(e),
+                "epoch {e} must be below"
+            );
+        }
+        assert!(CommittedState::forkchoice_equivocation_horizon_active(
+            crate::params::FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH
+        ));
+    }
+
+    /// The O01 model: one validator, A = (s, x), B = (s, y) conflicting at
+    /// one slot, C = (s + 1, z) a later vote. Each vote lands in its OWN
+    /// block, in the given order, so the committed `latest_messages` is what
+    /// carries the verdict from block to block — the shape the finding
+    /// describes, on the real fold. Returns the post-state.
+    ///
+    /// Driven through `accumulate_forkchoice` directly rather than
+    /// `apply_block`, and honestly so: step 8 and the committee partition
+    /// make a validator's second includable slot in one epoch unreachable
+    /// today (`a_validator_has_one_seat_per_epoch_so_apply_block_cannot_reach_the_gap`
+    /// below pins the invariant), which is exactly why the fold cannot be
+    /// allowed to depend on them.
+    fn fold_votes_in_blocks(pre: &CommittedState, v: u32, order: &[AttestationData]) -> CommittedState {
+        let mut st = pre.clone();
+        let roster = st.duty_roster();
+        // Blocks at consecutive slots after every vote's own slot, as a real
+        // chain would carry them.
+        let first_block = order.iter().map(|d| d.slot).max().unwrap_or(0) + 1;
+        for (i, data) in order.iter().enumerate() {
+            let att = Attestation { data: *data, validator: v, signature: Vec::new() };
+            st.accumulate_forkchoice(&roster, std::slice::from_ref(&att), first_block + i as u64);
+        }
+        st
+    }
+
+    /// The six permutations of {A, B, C}, each as a fresh vote sequence.
+    fn six_orders(s: u64) -> Vec<(&'static str, [AttestationData; 3])> {
+        let vote = |slot: u64, head: u8| AttestationData {
+            slot,
+            head: [head; 32],
+            source_epoch: 0,
+            source_root: [0; 32],
+            target_epoch: crate::epoch_of(slot),
+            target_root: [head; 32],
+        };
+        let a = vote(s, 0xA1);
+        let b = vote(s, 0xB2);
+        let c = vote(s + 1, 0xC3);
+        vec![
+            ("ABC", [a, b, c]),
+            ("BAC", [b, a, c]),
+            ("ACB", [a, c, b]),
+            ("BCA", [b, c, a]),
+            ("CAB", [c, a, b]),
+            ("CBA", [c, b, a]),
+        ]
+    }
+
+    /// O01, the byte-identity witness for TODAY's behaviour: with the gate
+    /// closed, exactly ABC and BAC bar the validator and the other four
+    /// orders keep C as its latest message — the very miss the finding
+    /// reports — and the retained-vote component stays empty. This test
+    /// passes on the tree before the fix and must keep passing after it: if
+    /// it ever goes red, pre-activation behaviour changed.
+    #[test]
+    fn fc_horizon_pre_activation_bars_exactly_abc_and_bac() {
+        let (_t, s, _chains) = epoch1_fixture();
+        let v = 0u32;
+        let slot = s.epoch * SLOTS_PER_EPOCH + 1;
+        for (name, order) in six_orders(slot) {
+            let post = fold_votes_in_blocks(&s, v, &order);
+            let barred = post.fc_equivocators.contains(&v);
+            let expect = matches!(name, "ABC" | "BAC");
+            assert_eq!(barred, expect, "pre-activation order {name}: barred={barred}, expected {expect}");
+            if !barred {
+                assert_eq!(
+                    post.latest_messages.get(&v),
+                    Some(&(slot + 1, [0xC3; 32])),
+                    "pre-activation order {name}: C must stand as the latest message"
+                );
+            }
+            assert!(post.fc_recent_votes.is_empty(), "pre-activation: nothing may write fc_recent_votes");
+        }
+    }
+
+    /// O01, the fix: with the gate armed (rehearsal), ALL six orders bar the
+    /// validator, remove its weight and its history, and leave an honest
+    /// bystander untouched. Red before the gated arm existed (four orders
+    /// kept C), green with it.
+    #[test]
+    fn fc_horizon_post_activation_bars_all_six_orders() {
+        let _gate = crate::params::rehearsal::forkchoice_equivocation_horizon_gate_open_guard();
+        let (_t, s, _chains) = epoch1_fixture();
+        let v = 0u32;
+        let bystander = 1u32;
+        let slot = s.epoch * SLOTS_PER_EPOCH + 1;
+        for (name, order) in six_orders(slot) {
+            // The bystander votes honestly at the same slots so that a fix
+            // which barred "anyone with two retained votes" would be caught.
+            let mut pre = s.clone();
+            let roster = pre.duty_roster();
+            let honest = Attestation {
+                data: AttestationData { slot, head: [0xEE; 32], target_root: [0xEE; 32], ..order[0] },
+                validator: bystander,
+                signature: Vec::new(),
+            };
+            pre.accumulate_forkchoice(&roster, std::slice::from_ref(&honest), slot);
+            let post = fold_votes_in_blocks(&pre, v, &order);
+            assert!(post.fc_equivocators.contains(&v), "post-activation order {name} must bar the equivocator");
+            assert!(!post.latest_messages.contains_key(&v), "order {name}: a barred validator keeps no weight");
+            assert!(!post.fc_recent_votes.contains_key(&v), "order {name}: a barred validator keeps no history");
+            assert!(!post.fc_equivocators.contains(&bystander), "order {name}: the honest voter must not be barred");
+            assert_eq!(post.latest_messages.get(&bystander), Some(&(slot, [0xEE; 32])));
+            assert_eq!(
+                post.fc_recent_votes.get(&bystander).and_then(|m| m.get(&slot)),
+                Some(&[0xEE; 32]),
+                "order {name}: the honest vote is retained inside the horizon"
+            );
+        }
+        // And the verdict is now a function of the SET of votes: every order
+        // commits the same fork-choice components.
+        let roots: std::collections::BTreeSet<[u8; 32]> = six_orders(slot)
+            .into_iter()
+            .map(|(_, order)| fold_votes_in_blocks(&s, v, &order).compute_root())
+            .collect();
+        assert_eq!(roots.len(), 1, "post-activation, all six orders must commit one root");
+    }
+
+    /// O01 control for the control: the same six orders committed today are
+    /// NOT one root — two distinct roots, the barred outcome and the kept-C
+    /// outcome — which is the finding stated as a state-root fact.
+    #[test]
+    fn fc_horizon_pre_activation_commits_two_distinct_roots_across_the_six_orders() {
+        let (_t, s, _chains) = epoch1_fixture();
+        let slot = s.epoch * SLOTS_PER_EPOCH + 1;
+        let roots: std::collections::BTreeSet<[u8; 32]> = six_orders(slot)
+            .into_iter()
+            .map(|(_, order)| fold_votes_in_blocks(&s, 0, &order).compute_root())
+            .collect();
+        assert_eq!(roots.len(), 2, "today's fold commits an order-dependent root; O01 as measured");
+    }
+
+    /// The in-block variant: all three votes in ONE body, in each of the six
+    /// orders. Post-activation the retained history is written per vote, not
+    /// per block, so C between A and B inside a body is caught too.
+    #[test]
+    fn fc_horizon_post_activation_catches_the_pair_split_within_one_block() {
+        let _gate = crate::params::rehearsal::forkchoice_equivocation_horizon_gate_open_guard();
+        let (_t, s, _chains) = epoch1_fixture();
+        let slot = s.epoch * SLOTS_PER_EPOCH + 1;
+        for (name, order) in six_orders(slot) {
+            let mut st = s.clone();
+            let roster = st.duty_roster();
+            let atts: Vec<Attestation> = order
+                .iter()
+                .map(|d| Attestation { data: *d, validator: 0, signature: Vec::new() })
+                .collect();
+            st.accumulate_forkchoice(&roster, &atts, slot + 2);
+            assert!(st.fc_equivocators.contains(&0), "in-block order {name} must bar");
+            assert!(!st.fc_recent_votes.contains_key(&0));
+        }
+    }
+
+    /// The horizon constant is exactly the includability window, and tight.
+    /// For every block slot `S` in the first five epochs and every slot `s`
+    /// step 8 + `validate` can admit at `S` (`epoch_of(s) == epoch_of(S)`,
+    /// `s <= S`), `s` survives the prune at `S`; and some includable `s` sits
+    /// exactly on the floor, so one slot less would not be complete. Goes red
+    /// if step 8 is widened to previous-epoch votes without growing the
+    /// constant — that is the coupling it exists to pin.
+    #[test]
+    fn fc_horizon_covers_every_includable_slot() {
+        assert_eq!(crate::params::FORKCHOICE_EQUIVOCATION_HORIZON_SLOTS, SLOTS_PER_EPOCH);
+        let mut tight = false;
+        for block_slot in 0..(5 * SLOTS_PER_EPOCH) {
+            let floor = CommittedState::recent_vote_floor(block_slot);
+            let epoch_start = crate::epoch_of(block_slot) * SLOTS_PER_EPOCH;
+            for s in epoch_start..=block_slot {
+                assert!(
+                    s >= floor,
+                    "slot {s} is includable at block {block_slot} but pruned (floor {floor})"
+                );
+                tight |= s == floor;
+            }
+            // Nothing from the previous epoch is includable at this block, so
+            // the window need not reach it once the block is past slot 31.
+            if block_slot >= SLOTS_PER_EPOCH {
+                assert!(floor >= epoch_start.saturating_sub(SLOTS_PER_EPOCH - 1));
+            }
+        }
+        assert!(tight, "the horizon must be tight: some includable slot sits exactly on the floor");
+        // Saturation at the chain's first slots: no underflow, everything kept.
+        assert_eq!(CommittedState::recent_vote_floor(0), 0);
+        assert_eq!(CommittedState::recent_vote_floor(SLOTS_PER_EPOCH - 1), 0);
+        assert_eq!(CommittedState::recent_vote_floor(SLOTS_PER_EPOCH), 1);
+    }
+
+    /// (c) Bounds: over 200 blocks with every validator voting at its block's
+    /// slot AND re-submitting every slot still inside the window, the
+    /// component never exceeds `validators × horizon` entries, every retained
+    /// slot lies in `[floor, block_slot]`, no validator holds an empty history,
+    /// pruning is deterministic across two independent folds, and a block far
+    /// ahead with no votes prunes everything (total).
+    #[test]
+    fn fc_horizon_retained_votes_are_pruned_and_bounded() {
+        let _gate = crate::params::rehearsal::forkchoice_equivocation_horizon_gate_open_guard();
+        let (_t, s, _chains) = epoch1_fixture();
+        let roster = s.duty_roster();
+        let validators: Vec<u32> = roster.iter().map(|v| v.index).collect();
+        let h = crate::params::FORKCHOICE_EQUIVOCATION_HORIZON_SLOTS;
+        let bound = validators.len() as u64 * h;
+
+        let mut a = s.clone();
+        let mut b = s.clone();
+        let first = s.epoch * SLOTS_PER_EPOCH;
+        for block_slot in first..first + 200 {
+            let floor = CommittedState::recent_vote_floor(block_slot);
+            let mut atts = Vec::new();
+            for &v in &validators {
+                // Same root per slot every time, so no vote is an equivocation.
+                for slot in floor..=block_slot {
+                    let head = [(slot % 251) as u8; 32];
+                    atts.push(Attestation {
+                        data: AttestationData {
+                            slot,
+                            head,
+                            source_epoch: 0,
+                            source_root: [0; 32],
+                            target_epoch: crate::epoch_of(slot),
+                            target_root: head,
+                        },
+                        validator: v,
+                        signature: Vec::new(),
+                    });
+                }
+            }
+            a.accumulate_forkchoice(&roster, &atts, block_slot);
+            b.accumulate_forkchoice(&roster, &atts, block_slot);
+
+            let entries: u64 = a.fc_recent_votes.values().map(|m| m.len() as u64).sum();
+            assert!(entries <= bound, "block {block_slot}: {entries} entries exceeds V×H = {bound}");
+            for (v, votes) in &a.fc_recent_votes {
+                assert!(!votes.is_empty(), "validator {v} holds an empty history");
+                assert!(votes.len() as u64 <= h, "validator {v} holds more than H slots");
+                for slot in votes.keys() {
+                    assert!(
+                        (floor..=block_slot).contains(slot),
+                        "block {block_slot}: retained slot {slot} outside [{floor}, {block_slot}]"
+                    );
+                }
+            }
+            assert!(a.fc_equivocators.is_empty(), "consistent re-votes are not equivocation");
+            assert_eq!(a.fc_recent_votes, b.fc_recent_votes, "pruning must be deterministic");
+        }
+        // The window actually fills: with every slot voted, each validator
+        // holds exactly H slots, so the bound above was measured, not slack.
+        let entries: u64 = a.fc_recent_votes.values().map(|m| m.len() as u64).sum();
+        assert_eq!(entries, bound);
+
+        // Total: a block far ahead with an empty body leaves nothing behind.
+        a.accumulate_forkchoice(&roster, &[], first + 200 + 10 * h);
+        assert!(a.fc_recent_votes.is_empty(), "pruning must be total");
+    }
+
+    /// The root of `state_with_live_bookkeeping()` as computed on the tree
+    /// BEFORE `fc_recent_votes` existed (commit 5856087, external audit
+    /// 2026-09-07 O01): epoch 1, slot 40, every pre-gate component live.
+    const PRE_RECENT_VOTE_LIVE_ROOT: &str =
+        "f08523c03ac44cc2b04fca533bd0eb7cb90a33e15e40d8b7cd23b23d0df42f30";
+
+    /// O01 byte-identity on a state produced by the REAL `apply_block` (three
+    /// blocks with deposits, a transfer and a full attestation quorum): with
+    /// the gate closed the fold writes no retained votes and the committed
+    /// root is exactly the one this fixture committed before the component
+    /// existed. The constant was computed once on the unmodified tree, not
+    /// derived here.
+    #[test]
+    fn fc_horizon_pre_activation_committed_root_is_the_golden_root() {
+        let (_t, st, _) = state_with_live_bookkeeping();
+        assert!(st.fc_recent_votes.is_empty(), "pre-activation: apply_block must not write fc_recent_votes");
+        let hex: String = st.compute_root().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, PRE_RECENT_VOTE_LIVE_ROOT, "a pre-activation committed root moved");
+    }
+
+    /// The invariant that makes the gap unreachable through `apply_block`
+    /// today, pinned so that a change to the partition (or to step 8's
+    /// own-epoch rule) is seen next to the fold that stopped relying on it:
+    /// in the fixture's epoch, no validator is seated in two slots.
+    #[test]
+    fn a_validator_has_one_seat_per_epoch_so_apply_block_cannot_reach_the_gap() {
+        let (_t, s, _chains) = epoch1_fixture();
+        let roster = s.duty_roster();
+        let seed = s.seed_for_epoch(s.epoch);
+        let partition = committees::epoch_committees(&seed, s.epoch, &roster);
+        let mut seen = BTreeSet::new();
+        for committee in &partition {
+            for v in committee {
+                assert!(seen.insert(*v), "validator {v} is seated in two slots of epoch {}", s.epoch);
+            }
+        }
+        assert_eq!(seen.len(), roster.len(), "every validator is seated exactly once");
     }
 
     /// R1 M1 regression: a vote naming a `target_epoch` other than the one
@@ -12782,6 +13270,12 @@ mod tests {
         });
         must_move!("fc_equivocators", |g: &mut CommittedState| {
             g.fc_equivocators.insert(6);
+        });
+        // O01 retained-vote window: empty in this pre-gate fixture (asserted
+        // by `fc_horizon_pre_activation_committed_root_is_the_golden_root`),
+        // so the mutation is an insertion.
+        must_move!("fc_recent_votes", |g: &mut CommittedState| {
+            g.fc_recent_votes.entry(0).or_default().insert(40, [0xF0; 32]);
         });
         // Staking queues and fees.
         must_move!("deposit_history", |g: &mut CommittedState| {

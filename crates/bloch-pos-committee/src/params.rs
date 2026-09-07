@@ -976,6 +976,37 @@ pub mod rehearsal {
     }
 
     thread_local! {
+        static FC_HORIZON_GATE_OPEN_TL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Test-only: treat
+    /// [`super::FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH`] as already
+    /// bound (external audit 2026-09-07, O01).
+    ///
+    /// Its own switch for the `dust_gate_forced_open` reason: the inert
+    /// value keeps today's one-message fork-choice fold — the fleet's
+    /// configuration, and the four-of-six miss it carries — so an unadorned
+    /// `cargo test` must exercise exactly that, and tests of the retained
+    /// horizon opt in here and nowhere else.
+    pub fn forkchoice_equivocation_horizon_gate_forced_open() -> bool {
+        FC_HORIZON_GATE_OPEN_TL.with(|c| c.get())
+    }
+
+    /// Opens the fork-choice horizon gate for this thread until the guard
+    /// drops, including on unwind, so a failing assertion cannot leave the
+    /// fork-choice fold mutated for the rest of the thread.
+    pub fn forkchoice_equivocation_horizon_gate_open_guard() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FC_HORIZON_GATE_OPEN_TL.with(|c| c.set(self.0));
+            }
+        }
+        let prev = FC_HORIZON_GATE_OPEN_TL.with(|c| c.replace(true));
+        Restore(prev)
+    }
+
+    thread_local! {
         static WITHDRAWAL_GATE_OPEN_TL: Cell<bool> = const { Cell::new(false) };
     }
 
@@ -1645,6 +1676,94 @@ pub const ATTESTATION_DEDUP_ACTIVATION_EPOCH: u64 = u64::MAX;
 ///
 /// `rewards_v2_gate_is_inert` pins the value.
 pub const REWARDS_V2_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Flag day for the **fork-choice equivocation retention horizon** (external
+/// audit 2026-09-07, O01 — "general order-independence claim is too
+/// strong"): `u64::MAX` = INERT, below it the transition keeps a bounded
+/// per-validator vote history and judges same-slot equivocation against it.
+///
+/// # The gap
+///
+/// [`crate::forkchoice::Store::observe`] compares an incoming vote against
+/// ONE retained message per validator — the latest. For votes A = (slot 1,
+/// head x), B = (slot 1, head y) and C = (slot 2, head z) from one
+/// validator, (A, B) is an equivocation; but if C is observed between them
+/// the second old vote is dismissed as merely stale (`prev.slot >=
+/// msg.slot`) and the pair is never seen. Of the six arrival orders, ABC and
+/// BAC bar the validator; ACB, BCA, CAB and CBA keep C and miss it.
+/// `CommittedState::accumulate_forkchoice` rebuilds a `Store` every block
+/// from the committed `latest_messages` — one per validator — plus the
+/// block's votes, so the committed `fc_equivocators` set (a state-root
+/// component) is, in general, a function of the ORDER blocks carried the
+/// votes in, not only of which votes exist. The `observe` doc comment
+/// claimed the opposite; it is corrected in the same change.
+///
+/// Today the transition's own admission rules leave that gap unreachable
+/// through `apply_block`: step 8 admits only votes of the block's own epoch
+/// (`epoch_of(att.data.slot) == st.epoch`) and `committees::epoch_committees`
+/// PARTITIONS the roster, seating each validator in exactly one slot per
+/// epoch — so a validator has no includable second slot to move its latest
+/// message past. That is an invariant of two OTHER modules, not a property
+/// of the fork-choice fold, and O01 is right that the fold must not lean on
+/// it: the node's own fork choice (`bloch-pos-node/src/engine.rs`) feeds the
+/// same `Store` blocks in root order and pool votes in arrival order, where
+/// the miss is live today (node-local weight, not committed state).
+///
+/// # What arming changes
+///
+/// From this epoch, `accumulate_forkchoice` additionally:
+/// 1. retains, per validator, every admitted vote of the most recent
+///    [`FORKCHOICE_EQUIVOCATION_HORIZON_SLOTS`] slots in the committed
+///    `fc_recent_votes` component (`state_root::TAG_FC_RECENT_VOTE`, one
+///    leaf per (validator, slot));
+/// 2. bars a validator whose vote names a slot it already has a retained
+///    vote for with a DIFFERENT root — regardless of whether a later-slot
+///    message has since become its latest — dropping its weight and its
+///    history, so the barred set is a function of which votes exist;
+/// 3. prunes the history to the horizon below the block's slot, so the
+///    component holds at most `validators × horizon` entries.
+///
+/// Weight semantics are untouched: the latest message still decides weight,
+/// exactly as `Store::observe` computes it, and `observe` itself is not
+/// changed. Below the gate nothing writes `fc_recent_votes`, so it commits
+/// ZERO leaves and every pre-gate root is byte-identical to the chain as it
+/// stands — pinned against roots computed on the tree BEFORE this change by
+/// `state_root::tests::pre_activation_root_is_byte_identical_with_the_recent_vote_component_present`
+/// and `transition::tests::fc_horizon_pre_activation_committed_root_is_the_golden_root`.
+///
+/// Why a flag day: rule 2 changes a committed component (`fc_equivocators`)
+/// on bodies that apply today and rule 1 adds leaves; a mixed fleet forks on
+/// the first block after the rollout either way.
+///
+/// ARMING THIS IS A FOUNDER DECISION.
+/// `forkchoice_equivocation_horizon_gate_is_inert` pins the inert value.
+pub const FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// How many slots of per-validator vote history the committed
+/// `fc_recent_votes` component retains once
+/// [`FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH`] binds: after the
+/// block at slot `S` is applied, exactly the slots `S - HORIZON + 1 ..= S`
+/// survive (saturating at the chain's first slots).
+///
+/// One epoch, and one epoch is exactly enough. A vote is includable in the
+/// block at slot `S` only if `epoch_of(vote.slot) == epoch_of(S)`
+/// (transition.rs step 8) and `vote.slot <= S` (`attestation::validate`,
+/// `FutureSlot`), i.e. `vote.slot ∈ [epoch_start(S), S]`; and
+/// `S - epoch_start(S) <= SLOTS_PER_EPOCH - 1` for every `S`. So for any
+/// block `S'` that could carry a vote for slot `s` — same epoch as `s`,
+/// `S' >= s` — `s >= S' - (SLOTS_PER_EPOCH - 1)`, and `s` survives the prune
+/// at `S'`. A same-slot conflict can therefore only ever be admitted while
+/// the first vote is still retained, which is what makes the detection
+/// complete for every includable vote; `fc_horizon_covers_every_includable_slot`
+/// walks the claim over the first five epochs, and also shows the bound is
+/// tight (an includable slot sits exactly on the floor), so nothing shorter
+/// is complete. Anything longer retains votes no block can conflict with
+/// any more — the two-epoch figure the finding floats would double the
+/// bound for zero detections. If step 8 is ever widened to admit
+/// previous-epoch votes (the `previous_participation` window is the obvious
+/// temptation), this must grow to `2 * SLOTS_PER_EPOCH` in the same change,
+/// and that test is what goes red.
+pub const FORKCHOICE_EQUIVOCATION_HORIZON_SLOTS: u64 = SLOTS_PER_EPOCH;
 
 /// Flag day for **staking-transaction metering** (audit R7 M1, 2026-09-06):
 /// `u64::MAX` = INERT, below it every staking variant (`Deposit`, `Exit`,

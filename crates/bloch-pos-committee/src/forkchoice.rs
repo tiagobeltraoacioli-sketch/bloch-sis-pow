@@ -7,6 +7,34 @@
 //! weight purposes. Weight of a block = total effective stake of validators
 //! whose latest message is that block or any of its descendants. The head is
 //! found by walking from the justified root, always taking the heaviest child.
+//!
+//! ## What this store does NOT guarantee (external audit 2026-09-07, O01)
+//!
+//! [`Store::observe`] keeps ONE message per validator — the latest — and
+//! judges equivocation only against that message. That makes the verdict on
+//! a same-slot pair order-independent *when nothing later intervenes*, and
+//! order-DEPENDENT in general: for A = (slot 1, x), B = (slot 1, y),
+//! C = (slot 2, z) from one validator, the arrivals ABC and BAC bar the
+//! validator, while ACB, BCA, CAB and CBA retain C and dismiss the second old
+//! vote as stale (`prev.slot >= msg.slot`), so the pair is never compared.
+//! `observe_alone_misses_a_same_slot_pair_split_by_a_later_vote_in_four_of_six_orders`
+//! below pins that count. An earlier doc comment here claimed the discard was
+//! order-independent "by construction"; it was not, and the comment is
+//! corrected — the history of the 2026-08-11 finding is kept because it is
+//! what the single-slot case DOES get right.
+//!
+//! The fix is not in this file, and `observe` is deliberately unchanged: the
+//! node's fork choice (`bloch-pos-node/src/engine.rs`) builds this store from
+//! blocks and its pool and must keep compiling and behaving as it does. The
+//! committed fold, `CommittedState::accumulate_forkchoice` (transition.rs),
+//! is where the verdict becomes consensus state, and from
+//! `params::FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH` it retains a
+//! bounded per-(validator, slot) vote history
+//! (`params::FORKCHOICE_EQUIVOCATION_HORIZON_SLOTS`) and judges every vote
+//! against THAT before handing it to `observe` — so a same-slot conflict is
+//! found whichever of the six orders the blocks carried it in. Below the
+//! gate (its value today) the fold is byte-identical to what this file
+//! alone computes. Arming it is a founder decision; see the constant's docs.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -76,12 +104,23 @@ impl Store {
     /// set each kept whichever arrived first and computed *different heads* —
     /// found by property test, 2026-08-11.
     ///
-    /// Discarding the equivocator is order-independent by construction: the
-    /// outcome depends on whether a conflicting pair exists in the set, never on
-    /// which half arrived first. It also matches the finality gadget, which
-    /// drops equivocators from both tallies, and it is the honest posture —
-    /// equivocation is slashable (§7.3), so the validator is about to be ejected
-    /// regardless. Its votes are evidence, not weight.
+    /// Discarding the equivocator is order-independent for the case that
+    /// finding covered — a conflicting pair at one slot with no later message
+    /// from the same validator between the two halves: both halves are
+    /// refused whichever arrived first. It also matches the finality gadget,
+    /// which drops equivocators from both tallies, and it is the honest
+    /// posture — equivocation is slashable (§7.3), so the validator is about
+    /// to be ejected regardless. Its votes are evidence, not weight.
+    ///
+    /// It is NOT order-independent in general (external audit 2026-09-07,
+    /// O01). This method compares against the single retained latest message,
+    /// so once a LATER-slot vote from the validator has been retained, an
+    /// older vote arriving afterwards is dismissed by the `prev.slot >=
+    /// msg.slot` arm below without ever being compared to its same-slot
+    /// sibling: of the six arrival orders of {A = (s, x), B = (s, y),
+    /// C = (s + 1, z)}, only ABC and BAC bar the validator. The claim this
+    /// comment used to make — order-independent "by construction" — was
+    /// false; the module docs say where the complete, gated check lives.
     pub fn observe(&mut self, validator: u32, msg: LatestMessage) -> bool {
         if self.equivocators.contains(&validator) {
             return false;
@@ -348,4 +387,74 @@ fn is_descendant_or_self(tree: &BlockTree<'_>, node: &[u8; 32], ancestor: &[u8; 
     };
     FORKCHOICE_STEPS.fetch_add(steps as u64, Ordering::Relaxed);
     verdict
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three votes of the O01 model: A and B conflict at one slot, C is a
+    /// later honest-looking vote from the same validator.
+    fn abc() -> [LatestMessage; 3] {
+        [
+            LatestMessage { slot: 1, root: [0xAA; 32] },
+            LatestMessage { slot: 1, root: [0xBB; 32] },
+            LatestMessage { slot: 2, root: [0xCC; 32] },
+        ]
+    }
+
+    /// Feed one arrival order into a fresh store; is validator 7 barred after?
+    fn barred_after(order: [usize; 3]) -> bool {
+        let votes = abc();
+        let mut store = Store::new();
+        store.set_stake(7, 1);
+        for i in order {
+            store.observe(7, votes[i]);
+        }
+        // Bound first: `equivocators()` borrows the store, and a tail
+        // expression would outlive it.
+        let barred = store.equivocators().any(|v| *v == 7);
+        barred
+    }
+
+    /// External audit 2026-09-07, O01: the exact count the module docs and
+    /// the `observe` docs now state. This is a pin on the DOCUMENTED gap in
+    /// the bare store, not a test of the fix — the fix lives in
+    /// `transition::CommittedState::accumulate_forkchoice` behind its gate and
+    /// is tested there on the real fold. If `observe` is ever changed so that
+    /// this goes red, the node's fork choice changed too, and the doc comments
+    /// here are stale.
+    #[test]
+    fn observe_alone_misses_a_same_slot_pair_split_by_a_later_vote_in_four_of_six_orders() {
+        // Indices into abc(): 0 = A, 1 = B, 2 = C.
+        let bars = [[0, 1, 2], [1, 0, 2]];
+        let misses = [[0, 2, 1], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+        for order in bars {
+            assert!(barred_after(order), "order {order:?} must bar: the pair meets before C");
+        }
+        for order in misses {
+            assert!(
+                !barred_after(order),
+                "order {order:?} is documented as a MISS of the bare store; if it now bars, \
+                 observe changed and the O01 docs must be rewritten"
+            );
+        }
+    }
+
+    /// What the 2026-08-11 finding DID establish, and what the corrected doc
+    /// comment still claims: a same-slot pair with nothing later between its
+    /// halves is barred in either order, and neither half keeps weight.
+    #[test]
+    fn a_same_slot_pair_alone_is_barred_in_either_order() {
+        let [a, b, _] = abc();
+        for order in [[a, b], [b, a]] {
+            let mut store = Store::new();
+            store.set_stake(7, 1);
+            for msg in order {
+                store.observe(7, msg);
+            }
+            assert!(store.equivocators().any(|v| *v == 7));
+            assert_eq!(store.voters(), 0, "a barred validator's message must not remain");
+        }
+    }
 }

@@ -124,6 +124,9 @@ fn state<'a>(f: &'a Fixture, e: &'a [EutxoEntry]) -> ConsensusState<'a> {
         pending_votes: &[],
         fc_messages: &[],
         fc_equivocators: &[],
+        // O01 retained-vote window (state_root.rs): empty until its gate arms,
+        // exactly as on every historical block this benchmark replays.
+        fc_recent_votes: &[],
         deposit_queue: &[],
         delegations: &[],
         pending_fees: &[],

@@ -254,6 +254,24 @@ const TAG_DELEGATOR_ISSUANCE_REWARD: u8 = 0x18;
 /// silently stand in for the other.
 const TAG_PROPOSED_CURRENT: u8 = 0x19;
 
+/// One retained fork-choice vote — (validator, slot) → head root — of the
+/// bounded window same-slot equivocation is judged against (external audit
+/// 2026-09-07, O01; see
+/// `params::FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH`). Below that
+/// gate nothing writes the component (`CommittedState::accumulate_forkchoice`'s
+/// only writer is behind it), so it contributes ZERO leaves and every
+/// pre-gate root is unchanged by its mere existence — the same argument as
+/// [`TAG_PROPOSED_CURRENT`], and pinned against a root computed on the tree
+/// BEFORE the component existed by
+/// `pre_activation_root_is_byte_identical_with_the_recent_vote_component_present`.
+/// Its own tag, keyed by (validator, slot), not folded into
+/// [`TAG_FC_MESSAGE`] (keyed by validator alone): the latest message answers
+/// "what does v's weight rest on", this answers "what did v say at slot s",
+/// and one validator legitimately holds several of the latter at once. The
+/// next free byte after `0x19`; it aliases no tag `0x00..=0x19`
+/// (`component_tags_are_pairwise_distinct`).
+const TAG_FC_RECENT_VOTE: u8 = 0x1A;
+
 
 fn sha3(parts: &[&[u8]]) -> [u8; 32] {
     let mut h = Sha3_256::new();
@@ -1393,6 +1411,39 @@ impl FcEquivocatorRecord {
     }
 }
 
+/// One retained fork-choice vote, committed per (validator, slot) under
+/// [`TAG_FC_RECENT_VOTE`] (external audit 2026-09-07, O01). Empty — zero
+/// leaves — below `params::FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH`.
+///
+/// Keyed by the fixed-width pair `validator ‖ slot` (12 bytes), so two
+/// votes of one validator at different slots are different leaves and a
+/// validator's several retained votes cannot overwrite each other; the
+/// value is the same 44-byte `validator ‖ slot ‖ root` layout
+/// [`FcMessageRecord`] uses, under a different tag, so the two components
+/// can never produce the same key for the same bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FcRecentVoteRecord {
+    pub validator: u32,
+    pub slot: u64,
+    pub root: [u8; 32],
+}
+
+impl FcRecentVoteRecord {
+    fn entry_key(&self) -> Vec<u8> {
+        let mut k = Vec::with_capacity(12);
+        k.extend_from_slice(&self.validator.to_le_bytes());
+        k.extend_from_slice(&self.slot.to_le_bytes());
+        k
+    }
+    fn serialize(&self) -> Vec<u8> {
+        let mut s = Vec::with_capacity(44);
+        s.extend_from_slice(&self.validator.to_le_bytes());
+        s.extend_from_slice(&self.slot.to_le_bytes());
+        s.extend_from_slice(&self.root);
+        s
+    }
+}
+
 /// One deposit in the permanent activation queue, committed per entry under
 /// [`TAG_DEPOSIT_QUEUE`]. Keyed by pubkey hash — unique by the
 /// one-deposit-per-key rule — so the committed queue is order-free; the
@@ -1714,6 +1765,12 @@ pub struct ConsensusState<'a> {
     pub fc_messages: &'a [FcMessageRecord],
     /// Validators barred from fork-choice weight.
     pub fc_equivocators: &'a [FcEquivocatorRecord],
+    /// Retained per-(validator, slot) fork-choice votes of the equivocation
+    /// window ([`TAG_FC_RECENT_VOTE`], external audit 2026-09-07 O01).
+    /// Empty — zero leaves — until
+    /// `FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH` binds; its only
+    /// writer is behind that gate.
+    pub fc_recent_votes: &'a [FcRecentVoteRecord],
     /// The permanent deposit/activation queue.
     pub deposit_queue: &'a [DepositQueueRecord],
     /// The permanent delegation history, positionally keyed.
@@ -1902,6 +1959,9 @@ fn build_state_tree_inner(state: &ConsensusState<'_>, eutxo_tree: &Smt) -> Smt {
     }
     for e in state.fc_equivocators {
         smt.insert(derive_key(TAG_FC_EQUIVOCATOR, &e.entry_key()), hash_value(&e.serialize()));
+    }
+    for v in state.fc_recent_votes {
+        smt.insert(derive_key(TAG_FC_RECENT_VOTE, &v.entry_key()), hash_value(&v.serialize()));
     }
     for d in state.deposit_queue {
         smt.insert(derive_key(TAG_DEPOSIT_QUEUE, &d.entry_key()), hash_value(&d.serialize()));
@@ -2956,6 +3016,7 @@ mod tests {
         pending_votes: Vec<PendingVoteRecord>,
         fc_messages: Vec<FcMessageRecord>,
         fc_equivocators: Vec<FcEquivocatorRecord>,
+        fc_recent_votes: Vec<FcRecentVoteRecord>,
         deposit_queue: Vec<DepositQueueRecord>,
         delegations: Vec<DelegationRecord>,
         pending_fees: Vec<PendingFeeRecord>,
@@ -3057,6 +3118,14 @@ mod tests {
             FcMessageRecord { validator: 1, slot: 1371, root: val(0x71) },
         ];
         let fc_equivocators = vec![FcEquivocatorRecord { validator: 2 }];
+        // Two slots for one validator on purpose: the (validator, slot) key
+        // is the whole point of the component, and a key that dropped the
+        // slot would collapse these two leaves into one.
+        let fc_recent_votes = vec![
+            FcRecentVoteRecord { validator: 0, slot: 1369, root: val(0x72) },
+            FcRecentVoteRecord { validator: 0, slot: 1370, root: val(0x70) },
+            FcRecentVoteRecord { validator: 1, slot: 1371, root: val(0x71) },
+        ];
         let deposit_queue = vec![DepositQueueRecord {
             pubkey_hash: val(0x80),
             deposit_epoch: 41,
@@ -3127,6 +3196,7 @@ mod tests {
             pending_votes,
             fc_messages,
             fc_equivocators,
+            fc_recent_votes,
             deposit_queue,
             delegations,
             pending_fees,
@@ -3311,6 +3381,7 @@ mod tests {
             pending_votes: &f.pending_votes,
             fc_messages: &f.fc_messages,
             fc_equivocators: &f.fc_equivocators,
+            fc_recent_votes: &f.fc_recent_votes,
             deposit_queue: &f.deposit_queue,
             delegations: &f.delegations,
             pending_fees: &f.pending_fees,
@@ -3352,6 +3423,7 @@ mod tests {
         g.pending_votes.reverse();
         g.fc_messages.reverse();
         g.fc_equivocators.reverse();
+        g.fc_recent_votes.reverse();
         g.deposit_queue.reverse();
         g.delegations.reverse();
         g.pending_fees.reverse();
@@ -3362,6 +3434,75 @@ mod tests {
         let root_b = state_root(&state(&g));
 
         assert_eq!(root_a, root_b);
+    }
+
+    /// The root of `fixture()` as computed by this file BEFORE the
+    /// [`TAG_FC_RECENT_VOTE`] component existed (commit 5856087, external
+    /// audit 2026-09-07 O01), with the fixture otherwise exactly as it stands.
+    const PRE_RECENT_VOTE_FIXTURE_ROOT: &str =
+        "7c969ff14b8c854b0ffb414578a21a49379be6076e253dce7c4fb00e9b7342cb";
+
+    /// O01, the byte-identity half. Below
+    /// `params::FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH` the
+    /// `fc_recent_votes` component is empty, and an empty component must
+    /// contribute nothing: this pins the root of the fixture with the
+    /// component present-but-empty to the root the tree produced when the
+    /// component did not exist in the type at all. The value was computed
+    /// once, on the unmodified tree, and is not derived here — deriving it
+    /// from the current code would prove nothing.
+    #[test]
+    fn pre_activation_root_is_byte_identical_with_the_recent_vote_component_present() {
+        let mut f = fixture();
+        f.fc_recent_votes.clear();
+        let hex: String = state_root(&state(&f)).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex, PRE_RECENT_VOTE_FIXTURE_ROOT,
+            "an EMPTY fc_recent_votes component changed the root: pre-gate roots are no longer \
+             byte-identical to the chain as it stands"
+        );
+        // Control: the same fixture with the component populated commits a
+        // different root, so the pin above is not passing vacuously.
+        let full: String = state_root(&state(&fixture())).iter().map(|b| format!("{b:02x}")).collect();
+        assert_ne!(full, PRE_RECENT_VOTE_FIXTURE_ROOT, "control: a populated component must move the root");
+    }
+
+    /// Every component tag is a distinct byte. Two components sharing a tag
+    /// would let a leaf of one silently stand in for a leaf of the other
+    /// whenever their entry keys coincide — the collision the
+    /// [`TAG_FC_RECENT_VOTE`] docs rule out by choosing the next free byte.
+    #[test]
+    fn component_tags_are_pairwise_distinct() {
+        let tags = [
+            TAG_EUTXO,
+            TAG_VALIDATOR,
+            TAG_PARTICIPATION_CURRENT,
+            TAG_PARTICIPATION_PREVIOUS,
+            TAG_RANDAO,
+            TAG_TAINT_ROOT,
+            TAG_COHERENCE_ACCUMULATOR,
+            TAG_COHERENCE_NULLIFIERS,
+            TAG_FINALITY,
+            TAG_PENDING_VOTE,
+            TAG_FC_MESSAGE,
+            TAG_FC_EQUIVOCATOR,
+            TAG_DEPOSIT_QUEUE,
+            TAG_DELEGATION,
+            TAG_PENDING_FEE,
+            TAG_EVM_COMMITMENT,
+            TAG_SLASH_APPLIED,
+            TAG_SLASH_WINDOW,
+            TAG_DELEGATOR_SLASH_LOSS,
+            TAG_ISSUED_SUPPLY,
+            TAG_BASE_FEE,
+            TAG_DELEGATOR_FEE_REWARD,
+            TAG_VALIDATOR_FEE_REWARD,
+            TAG_DELEGATOR_ISSUANCE_REWARD,
+            TAG_PROPOSED_CURRENT,
+            TAG_FC_RECENT_VOTE,
+        ];
+        let distinct: std::collections::BTreeSet<u8> = tags.iter().copied().collect();
+        assert_eq!(distinct.len(), tags.len(), "two state-root components share a tag byte");
+        assert_eq!(TAG_FC_RECENT_VOTE, 0x1A, "the O01 component takes the next free byte after 0x19");
     }
 
     #[test]
@@ -3430,6 +3571,12 @@ mod tests {
         mutated!(|g: &mut Fx| g.fc_messages.pop().map(|_| ()).unwrap());
         mutated!(|g: &mut Fx| g.fc_equivocators[0].validator += 1);
         mutated!(|g: &mut Fx| g.fc_equivocators.pop().map(|_| ()).unwrap());
+        // Retained fork-choice votes (O01). Every field of the key and the
+        // value, and removal.
+        mutated!(|g: &mut Fx| g.fc_recent_votes[0].validator += 1);
+        mutated!(|g: &mut Fx| g.fc_recent_votes[0].slot += 1);
+        mutated!(|g: &mut Fx| g.fc_recent_votes[0].root[0] ^= 1);
+        mutated!(|g: &mut Fx| g.fc_recent_votes.pop().map(|_| ()).unwrap());
         // Staking queues.
         mutated!(|g: &mut Fx| g.deposit_queue[0].pubkey_hash[0] ^= 1);
         mutated!(|g: &mut Fx| g.deposit_queue[0].deposit_epoch += 1);

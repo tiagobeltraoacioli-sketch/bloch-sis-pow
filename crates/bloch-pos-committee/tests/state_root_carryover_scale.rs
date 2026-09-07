@@ -287,6 +287,7 @@ fn state<'a>(f: &'a Fixture, e: &'a [EutxoEntry]) -> ConsensusState<'a> {
         pending_votes: &[],
         fc_messages: &[],
         fc_equivocators: &[],
+        fc_recent_votes: &[],
         deposit_queue: &[],
         delegations: &[],
         pending_fees: &[],

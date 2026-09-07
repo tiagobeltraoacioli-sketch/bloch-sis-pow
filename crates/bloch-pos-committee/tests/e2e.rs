@@ -433,6 +433,9 @@ mod harness {
             // committed as empty, not omitted.
             fc_messages: &[],
             fc_equivocators: &[],
+            // O01 retained-vote window: empty until its gate arms, and empty
+            // here regardless — this harness has no LMD store.
+            fc_recent_votes: &[],
             deposit_queue: &[],
             delegations: &[],
             pending_fees: &[],
