@@ -239,8 +239,9 @@ jobs:
       - run: cargo clippy --all-targets
 
   # cargo-geiger — quantifies `unsafe` in the live node's dependency tree.
-  # Select the package explicitly: the root is a virtual manifest and geiger
-  # otherwise exits before scanning. Non-blocking:
+  # Select both its manifest and package: geiger rejects the virtual root
+  # even when the package selector is supplied.
+  # Non-blocking:
   # geiger's cargo-metadata pass mismatches the workspace path-dep bloch-euvm and
   # emits "Failed to match" noise instead of a clean table (known geiger path-dep
   # limitation). First-party crates are separately held unsafe-free.
@@ -257,7 +258,7 @@ jobs:
       - name: Install cargo-geiger
         # PINNED (I-M12): see cargo-audit job above.
         run: cargo install cargo-geiger --version 0.13.0 --locked
-      - run: cargo geiger --package bloch-pos-node --all-features --output-format Ascii
+      - run: cargo geiger --manifest-path crates/bloch-pos-node/Cargo.toml --package bloch-pos-node --all-features --output-format Ascii
 
   # miri — UB / provenance / uninit-read on the pure-Rust consensus + emission
   # unit tests. Scoped to FFI-free crates (the node's C FFI — PQClean, rocksdb,
