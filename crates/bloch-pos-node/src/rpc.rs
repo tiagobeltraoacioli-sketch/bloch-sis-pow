@@ -1777,15 +1777,25 @@ pub fn chain_info_json(
 ///   and the state committed there finalises two epochs below the head, so the
 ///   deepest cut the algorithm may legitimately propose is itself a finality
 ///   rewind (finalized epoch 6 -> 4 -> 2 -> 0 in three in-rules cuts).
-/// - **The quorum denominator has no floor.** It is leak-adjusted
-///   unconditionally; the floor and the recovery rule are written but gated
-///   behind `LEAK_RECOVERY_ACTIVATION_EPOCH`, which is `u64::MAX`
-///   (`bloch-pos-committee/src/params.rs:610`). A partitioned minority holding
-///   6.25% of stake has been shown to self-finalise once the absent majority
-///   leaked away.
+/// - **The quorum denominator has no floor until epoch 2700.** It is
+///   leak-adjusted unconditionally today; the floor and the recovery rule are
+///   written and gated behind `LEAK_RECOVERY_ACTIVATION_EPOCH`, which was
+///   **armed at epoch 2_700 (2026-09-12 21:31 UTC)** — an earlier revision of
+///   this note said `u64::MAX`, which was true when written and is not any
+///   more (`bloch-pos-committee/src/params.rs`, `LEAK_RECOVERY_ACTIVATION_EPOCH`).
+///   Below 2700 a partitioned minority holding 6.25% of stake has been shown
+///   to self-finalise once the absent majority leaked away. The per-node
+///   finality latch (`Engine::ratchet_finalized`, audit round 3 F-03 and
+///   round 4 M-1) now refuses a downward move of this node's own finalized
+///   checkpoint and counts the refusals in `finality_rewinds_refused`; it is
+///   node-local and does not make finality a cross-node guarantee.
 ///
 /// **Current honest guidance**, until this note is withdrawn: credit at
-/// **`finalized` plus a margin of 3 epochs**, require **two independently
+/// **`finalized` plus a margin** — this note's original figure was 3 epochs;
+/// `SECURITY.md` ("Guidance for integrators", 2026-09-06) and
+/// `docs/integration/BLOCH-G4-TECHNICAL-INTEGRATION-REFERENCE-v2.md` §11.3
+/// now recommend ~30 epochs for large or irreversible credits, and are the
+/// documents to hand an integrator — require **two independently
 /// operated nodes to agree on the same finalized root AND epoch** — the epoch
 /// alone is not enough — and **re-verify immediately before releasing funds**.
 /// Two nodes agreeing does not mitigate the rewind, because both rewind

@@ -1,5 +1,17 @@
 # Bloch Genesis-4 — Exchange & Integrator Guide
 
+> **Superseded for integrators (2026-09-07).** The current, code-verified exchange
+> documentation is edition 2: [`BLOCH-G4-TECHNICAL-INTEGRATION-REFERENCE-v2.md`](./BLOCH-G4-TECHNICAL-INTEGRATION-REFERENCE-v2.md)
+> (complete method/field/error reference, transaction and address rules, node
+> operation, settlement rule), [`BLOCH-G4-INTEGRATION-READINESS-CONFIRMATION-v2.md`](./BLOCH-G4-INTEGRATION-READINESS-CONFIRMATION-v2.md)
+> and [`CHANGES-FOR-THE-ENDPOINT-OPERATOR-2026-09-07.md`](./CHANGES-FOR-THE-ENDPOINT-OPERATOR-2026-09-07.md).
+> This page is kept for its history and its settlement caveats; where the two
+> disagree, edition 2 is current. Known stale statements here: the RPC error
+> codes for `gettransaction`/`getnewaddress` (the node answers `-32005`/`-32006`,
+> not `-32601`), `getutxos` has no `offset` parameter, `-32010` at the node is
+> the per-source mempool cap, `LEAK_RECOVERY_ACTIVATION_EPOCH` is armed at 2700
+> (not `u64::MAX`), and the crediting margin is now ~30 epochs per `SECURITY.md`.
+
 **Chain:** Bloch Genesis-4 · **Ticker:** BLCH · **Consensus:** Proof of Stake
 **Status:** live mainnet · **This document describes the implemented surface**, verified
 against a live archival node.
@@ -247,7 +259,7 @@ not estimate it from a confirmation count.
 >
 > 2. **The quorum denominator shrinks with no floor.** It is leak-adjusted
 >    unconditionally; the floor and the recovery rule are written but gated behind
->    `LEAK_RECOVERY_ACTIVATION_EPOCH`, which is `u64::MAX`. A partitioned minority
+>    `LEAK_RECOVERY_ACTIVATION_EPOCH`, armed at epoch 2700 (2026-09-12 21:31 UTC; this line said `u64::MAX` before that arming). Until then a partitioned minority
 >    holding 6.25% of stake has been shown to self-finalise once the absent majority
 >    has leaked away.
 > 3. **`finalized` is not a latch across a reorg.** Fork choice walks from the
