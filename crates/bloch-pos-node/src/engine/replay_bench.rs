@@ -640,7 +640,7 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
     let genesis_id = manifest.genesis_id();
     let verifier = HybridVerifier::new();
     let head_slot = Arc::new(AtomicU64::new(0));
-    let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let inflight = net::QueueBudget::new();
     let (tx, rx) = std::sync::mpsc::channel();
     // The receiver is leaked on purpose: dropping it would make the mesh's
     // sender fail, and nothing in this benchmark reads a network event anyway.
@@ -652,6 +652,7 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
             .expect("loopback devnet transport"),
     );
     Engine {
+        genesis_validator_count: manifest.validators.len() as u32,
         state: StateCell::new(genesis_state),
         tr: Transition::new(verifier.clone()),
         tr_probe: Transition::new(ProbeVerifier),

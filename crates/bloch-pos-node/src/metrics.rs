@@ -218,6 +218,24 @@ pub struct NodeMetrics {
     /// caught-up node; sustained growth is the same "sync trouble" the
     /// orphan pool's own counters diagnose, made visible without a log grep.
     pub blocks_parked: AtomicU64,
+    /// Network events reserved in the engine queue budget and not yet handled
+    /// (`net::QueueBudget`, external audit 2026-09-07 O06). Bounded by
+    /// `net::ENGINE_QUEUE_CAP`; sustained at the cap means the engine is not
+    /// keeping up with its transports.
+    pub net_queue_inflight: AtomicU64,
+    /// Bytes reserved in the engine queue budget and not yet handled. Bounded
+    /// by `net::ENGINE_QUEUE_BYTES_CAP` (64 MiB): the queue's whole
+    /// contribution to resident memory, by construction.
+    pub net_queue_bytes: AtomicU64,
+    /// Blocks shed at admission because the budget was full. Any non-zero
+    /// rate on a caught-up node is worth a look; on a replaying node it is
+    /// expected and harmless (the sync pump asks again).
+    pub net_shed_blocks_total: AtomicU64,
+    /// Attestations shed at admission (re-gossiped by their authors).
+    pub net_shed_attestations_total: AtomicU64,
+    /// Transactions shed at admission (re-broadcast by their wallets). The
+    /// first class to be shed under pressure, by policy.
+    pub net_shed_transactions_total: AtomicU64,
 }
 
 impl NodeMetrics {
@@ -251,6 +269,11 @@ impl NodeMetrics {
             slot_secs: AtomicU64::new(0),
             keystore_sealed: AtomicU64::new(0),
             blocks_parked: AtomicU64::new(0),
+            net_queue_inflight: AtomicU64::new(0),
+            net_queue_bytes: AtomicU64::new(0),
+            net_shed_blocks_total: AtomicU64::new(0),
+            net_shed_attestations_total: AtomicU64::new(0),
+            net_shed_transactions_total: AtomicU64::new(0),
         }
     }
 
@@ -443,6 +466,36 @@ impl NodeMetrics {
             "gauge",
             "Blocks parked rather than admitted: orphans plus finality-latch-refused branches (R3 M-1)",
             self.get(&self.blocks_parked),
+        );
+        series(
+            "bloch_pos_net_queue_inflight",
+            "gauge",
+            "Network events reserved in the engine queue budget and not yet handled (cap 4096; audit 2026-09-07 O06)",
+            self.get(&self.net_queue_inflight),
+        );
+        series(
+            "bloch_pos_net_queue_bytes",
+            "gauge",
+            "Bytes reserved in the engine queue budget and not yet handled (cap 64 MiB; audit 2026-09-07 O06)",
+            self.get(&self.net_queue_bytes),
+        );
+        series(
+            "bloch_pos_net_shed_blocks_total",
+            "counter",
+            "Blocks shed at queue admission because the budget was full (recoverable: the sync pump asks again)",
+            self.get(&self.net_shed_blocks_total),
+        );
+        series(
+            "bloch_pos_net_shed_attestations_total",
+            "counter",
+            "Attestations shed at queue admission because the budget was full (recoverable: re-gossiped)",
+            self.get(&self.net_shed_attestations_total),
+        );
+        series(
+            "bloch_pos_net_shed_transactions_total",
+            "counter",
+            "Transactions shed at queue admission because the budget was full (recoverable: re-broadcast); shed first by policy",
+            self.get(&self.net_shed_transactions_total),
         );
         out
     }
@@ -706,6 +759,11 @@ mod tests {
             "bloch_pos_keystore_sealed",
             "bloch_pos_blocks_parked",
             "bloch_pos_last_applied_unix",
+            "bloch_pos_net_queue_inflight",
+            "bloch_pos_net_queue_bytes",
+            "bloch_pos_net_shed_blocks_total",
+            "bloch_pos_net_shed_attestations_total",
+            "bloch_pos_net_shed_transactions_total",
         ] {
             assert!(text.contains(name), "missing series {name}");
             assert!(text.contains(&format!("# TYPE {name}")), "missing TYPE for {name}");

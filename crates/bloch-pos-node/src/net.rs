@@ -245,7 +245,225 @@ const SYNC_PAGE_BLOCKS: usize = 512;
 /// queue in front of a consumer that is asleep is just a slower way to run out
 /// of memory. Blocks and attestations are both recoverable (asked for again,
 /// gossiped again), so shedding beats dying.
-const ENGINE_QUEUE_CAP: usize = 4096;
+pub const ENGINE_QUEUE_CAP: usize = 4096;
+
+/// Byte budget for network events queued in front of the engine (external
+/// audit 2026-09-07, O06 "bounded counts do not establish a safe memory
+/// budget").
+///
+/// [`ENGINE_QUEUE_CAP`] bounds a COUNT. A count of 4,096 events whose frames
+/// may each be [`crate::codec::MAX_FIELD_LEN`] (8 MiB) bounds nothing useful:
+/// the product is 32 GiB of wire payload a stalled consumer could be made to
+/// hold. This second budget bounds the BYTES of every event that has been
+/// reserved and not yet handled, on both transports, so that the queue's
+/// contribution to resident memory is `ENGINE_QUEUE_BYTES_CAP` plus the
+/// allocator's slack — independent of how large individual frames are.
+///
+/// 64 MiB: a maximal Genesis-4 block body is 512 KiB
+/// (`fee_market::MAX_BLOCK_TX_BYTES_V2`), so the budget holds four epochs of
+/// maximal blocks (4 × 32 × 512 KiB) — far more than an engine that is
+/// merely busy falls behind by, and exactly the situation (a replaying
+/// engine that consumes nothing for hours) in which shedding is the correct
+/// outcome. Shed events are recoverable by construction: blocks are asked
+/// for again by the sync pump, attestations are re-gossiped, transactions
+/// are re-broadcast by their wallets.
+pub const ENGINE_QUEUE_BYTES_CAP: usize = 64 << 20;
+
+/// Which class of event a [`NetEvent`] is, for the per-class quota below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventClass {
+    Block,
+    Attestation,
+    Transaction,
+}
+
+/// The class of `ev`.
+pub fn class_of(ev: &NetEvent) -> EventClass {
+    match ev {
+        NetEvent::Block(..) => EventClass::Block,
+        NetEvent::Attestation(..) => EventClass::Attestation,
+        NetEvent::Transaction(..) => EventClass::Transaction,
+    }
+}
+
+/// The bytes an event is charged to the budget: its canonical wire size.
+///
+/// A PURE function of the event value, evaluated identically at reservation
+/// (`try_reserve`) and at release (`release`). That is the whole accounting
+/// invariant: because both sides compute the same number from the same value,
+/// `bytes` after a release equals `bytes` before the matching reservation,
+/// with no ticket to thread through the engine's event type. Encoding a block
+/// costs one allocation the size of the block; the engine already encodes
+/// every block it stores, and the hybrid signature check it runs on each is
+/// four orders of magnitude more expensive, so this is not on the critical
+/// path.
+pub fn queued_bytes(ev: &NetEvent) -> usize {
+    match ev {
+        NetEvent::Block(env, _) => crate::codec::encode_envelope(env).len(),
+        NetEvent::Attestation(att, _) => {
+            let mut b = Vec::new();
+            crate::codec::encode_attestation(&mut b, att);
+            b.len()
+        }
+        NetEvent::Transaction(tx) => tx.canonical_bytes().len(),
+    }
+}
+
+/// Per-class share of [`ENGINE_QUEUE_BYTES_CAP`] a class may fill.
+///
+/// The overload policy the audit asked for, stated as three numbers: blocks
+/// may use the WHOLE budget (they are what sync progress and control traffic
+/// consist of, and a node that sheds blocks while queuing transactions has its
+/// priorities inverted); attestations up to three quarters; transactions up to
+/// half. So under memory pressure transactions are shed first, attestations
+/// second, blocks last — and a flood of one class can never exclude a higher
+/// class from the budget.
+fn class_bytes_cap(class: EventClass, bytes_cap: usize) -> usize {
+    match class {
+        EventClass::Block => bytes_cap,
+        // Integer arithmetic on a compile-time constant: `bytes_cap / 4 * 3`
+        // cannot overflow (it only shrinks) and is exact to the byte for any
+        // cap divisible by 4, which the constant is.
+        EventClass::Attestation => bytes_cap.checked_div(4).unwrap_or(0).saturating_mul(3),
+        EventClass::Transaction => bytes_cap.checked_div(2).unwrap_or(0),
+    }
+}
+
+/// The admission budget shared by every transport that feeds the engine.
+///
+/// Two invariants, each maintained by an atomic compare-and-swap rather than
+/// by a `load` followed by an `increment` (the race the audit named: N
+/// concurrent readers could each observe `count < CAP` and all increment, so
+/// the stated cap was exceeded by up to N − 1):
+///
+/// 1. `count <= ENGINE_QUEUE_CAP` at every instant;
+/// 2. `bytes <= ENGINE_QUEUE_BYTES_CAP` at every instant, and for each class
+///    `c`, the bytes reserved by events of class `c` never push the total past
+///    `class_bytes_cap(c)`.
+///
+/// A reservation that passes the count check but fails the byte check gives
+/// the count back before returning, so a refusal leaves both counters exactly
+/// as it found them. Releases are saturating: a double release cannot wrap a
+/// counter to `usize::MAX`, which is the failure that once made a dual-
+/// transport node shed every frame forever (see `engine::run`).
+pub struct QueueBudget {
+    count: std::sync::atomic::AtomicUsize,
+    bytes: std::sync::atomic::AtomicUsize,
+    count_cap: usize,
+    bytes_cap: usize,
+    shed_blocks: AtomicU64,
+    shed_attestations: AtomicU64,
+    shed_transactions: AtomicU64,
+}
+
+impl QueueBudget {
+    /// The production budget: [`ENGINE_QUEUE_CAP`] events, [`ENGINE_QUEUE_BYTES_CAP`] bytes.
+    pub fn new() -> Arc<QueueBudget> {
+        Arc::new(Self::with_caps(ENGINE_QUEUE_CAP, ENGINE_QUEUE_BYTES_CAP))
+    }
+
+    /// A budget with explicit caps. Tests use small caps so every branch of
+    /// the policy is reachable in milliseconds; production never calls this
+    /// with anything but the two constants.
+    pub fn with_caps(count_cap: usize, bytes_cap: usize) -> QueueBudget {
+        QueueBudget {
+            count: std::sync::atomic::AtomicUsize::new(0),
+            bytes: std::sync::atomic::AtomicUsize::new(0),
+            count_cap,
+            bytes_cap,
+            shed_blocks: AtomicU64::new(0),
+            shed_attestations: AtomicU64::new(0),
+            shed_transactions: AtomicU64::new(0),
+        }
+    }
+
+    /// Reserve room for `ev`, or record a shed and return `false`.
+    ///
+    /// Count first (cheap, and the invariant everything else already relies
+    /// on), then bytes under the class cap; the count is handed back if the
+    /// bytes are refused. Both steps are compare-and-swap loops, so the
+    /// invariants hold under any interleaving of any number of callers.
+    pub fn try_reserve(&self, ev: &NetEvent) -> bool {
+        let class = class_of(ev);
+        let size = queued_bytes(ev);
+        let admitted = self.reserve_raw(class, size);
+        if !admitted {
+            self.shed_counter(class).fetch_add(1, Ordering::Relaxed);
+        }
+        admitted
+    }
+
+    fn reserve_raw(&self, class: EventClass, size: usize) -> bool {
+        let count_cap = self.count_cap;
+        if self
+            .count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                if n < count_cap { n.checked_add(1) } else { None }
+            })
+            .is_err()
+        {
+            return false;
+        }
+        let class_cap = class_bytes_cap(class, self.bytes_cap);
+        let reserved = self
+            .bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |b| {
+                b.checked_add(size).filter(|total| *total <= class_cap)
+            })
+            .is_ok();
+        if !reserved {
+            // Give the count back: a refusal must leave the budget as it was.
+            let _ = self.count.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                Some(n.saturating_sub(1))
+            });
+        }
+        reserved
+    }
+
+    /// Release the reservation made for `ev` — the same pure size function,
+    /// so the two calls cancel exactly.
+    pub fn release(&self, ev: &NetEvent) {
+        self.release_raw(queued_bytes(ev));
+    }
+
+    /// Release a reservation whose event has already been moved away (the
+    /// send-failure path), given the size that was reserved for it.
+    pub fn release_raw(&self, size: usize) {
+        let _ = self.count.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            Some(n.saturating_sub(1))
+        });
+        let _ = self.bytes.fetch_update(Ordering::AcqRel, Ordering::Acquire, |b| {
+            Some(b.saturating_sub(size))
+        });
+    }
+
+    fn shed_counter(&self, class: EventClass) -> &AtomicU64 {
+        match class {
+            EventClass::Block => &self.shed_blocks,
+            EventClass::Attestation => &self.shed_attestations,
+            EventClass::Transaction => &self.shed_transactions,
+        }
+    }
+
+    /// Events reserved and not yet handled.
+    pub fn inflight(&self) -> usize {
+        self.count.load(Ordering::Acquire)
+    }
+
+    /// Bytes reserved and not yet handled.
+    pub fn inflight_bytes(&self) -> usize {
+        self.bytes.load(Ordering::Acquire)
+    }
+
+    /// Events shed since start, per class: (blocks, attestations, transactions).
+    pub fn shed(&self) -> (u64, u64, u64) {
+        (
+            self.shed_blocks.load(Ordering::Relaxed),
+            self.shed_attestations.load(Ordering::Relaxed),
+            self.shed_transactions.load(Ordering::Relaxed),
+        )
+    }
+}
 
 /// Depth of an inbound peer's broadcast queue before frames are dropped.
 ///
@@ -465,17 +683,16 @@ impl DevnetMesh {
 /// a round trip. Keeping all of them costs the process.
 ///
 /// Returns false when the engine is gone, so callers can stop their thread.
-fn send_to_engine(
-    events: &Sender<EngineEvent>,
-    inflight: &Arc<std::sync::atomic::AtomicUsize>,
-    ev: NetEvent,
-) -> bool {
-    if inflight.load(Ordering::Acquire) >= ENGINE_QUEUE_CAP {
+fn send_to_engine(events: &Sender<EngineEvent>, budget: &QueueBudget, ev: NetEvent) -> bool {
+    // Atomic reservation of BOTH the count and the bytes (O06): the old
+    // `load >= CAP` followed by `fetch_add` let concurrent readers overshoot
+    // the cap, and no byte budget existed at all.
+    if !budget.try_reserve(&ev) {
         return true; // shed, but the connection stays healthy
     }
-    inflight.fetch_add(1, Ordering::AcqRel);
+    let size = queued_bytes(&ev);
     if events.send(EngineEvent::Net(ev)).is_err() {
-        inflight.fetch_sub(1, Ordering::AcqRel);
+        budget.release_raw(size);
         return false;
     }
     true
@@ -689,7 +906,7 @@ pub fn start(
     events: Sender<EngineEvent>,
     data_dir: PathBuf,
     head_slot: Arc<AtomicU64>,
-    inflight: Arc<std::sync::atomic::AtomicUsize>,
+    inflight: Arc<QueueBudget>,
 ) -> std::io::Result<DevnetMesh> {
     // Inbound: accept, then per-connection: read frames; data frames go to
     // the engine, get-blocks is answered in place from the log.
@@ -1085,55 +1302,108 @@ mod tests {
     /// invisible. On `--transport dual` the devnet half reads it, and a node
     /// would come up connected on both transports, log nothing, and receive
     /// nothing on one of them.
+    /// The wrap that once shed every frame forever is unreachable through the
+    /// budget: releases saturate at zero instead of wrapping.
     #[test]
-    fn one_uncounted_event_wraps_the_counter_into_permanent_shedding() {
-        use std::sync::atomic::AtomicUsize;
-        let n = AtomicUsize::new(0);
-        // Exactly what the engine loop does for an event nobody counted in.
-        n.fetch_sub(1, Ordering::AcqRel);
-        assert_eq!(n.load(Ordering::Acquire), usize::MAX);
+    fn a_release_without_a_reservation_saturates_instead_of_wrapping() {
+        let b = QueueBudget::with_caps(4, 1 << 20);
+        b.release(&NetEvent::Attestation(sample_attestation(), Origin::none()));
+        assert_eq!(b.inflight(), 0);
+        assert_eq!(b.inflight_bytes(), 0);
         assert!(
-            n.load(Ordering::Acquire) >= ENGINE_QUEUE_CAP,
-            "a wrapped counter is above the shed threshold, i.e. shed everything, forever"
+            b.try_reserve(&NetEvent::Attestation(sample_attestation(), Origin::none())),
+            "the budget must still admit after a spurious release"
         );
     }
 
-    /// `send_to_engine` sheds above the cap and delivers below it — the two
-    /// halves of the behaviour the counter drives.
     #[test]
     fn send_to_engine_sheds_above_the_cap_and_delivers_below_it() {
-        use std::sync::atomic::AtomicUsize;
         let (tx, rx) = mpsc::channel::<EngineEvent>();
 
-        // Below the cap: delivered, and counted in.
-        let inflight = Arc::new(AtomicUsize::new(0));
-        assert!(send_to_engine(
-            &tx,
-            &inflight,
-            NetEvent::Attestation(sample_attestation(), Origin::none())
-        ));
-        assert_eq!(inflight.load(Ordering::Acquire), 1);
+        let budget = QueueBudget::with_caps(1, 1 << 20);
+        assert!(send_to_engine(&tx, &budget, NetEvent::Attestation(sample_attestation(), Origin::none())));
+        assert_eq!(budget.inflight(), 1);
         assert!(rx.try_recv().is_ok(), "an event below the cap must reach the engine");
 
-        // At (or above) the cap: shed, silently, and the connection stays
-        // healthy — `send_to_engine` returns true.
-        let full = Arc::new(AtomicUsize::new(ENGINE_QUEUE_CAP));
-        assert!(send_to_engine(
-            &tx,
-            &full,
-            NetEvent::Attestation(sample_attestation(), Origin::none())
-        ));
-        assert_eq!(full.load(Ordering::Acquire), ENGINE_QUEUE_CAP, "shedding must not count");
+        // At the count cap: shed, and the counters do not move.
+        let bytes_before = budget.inflight_bytes();
+        assert!(send_to_engine(&tx, &budget, NetEvent::Attestation(sample_attestation(), Origin::none())));
+        assert_eq!(budget.inflight(), 1, "shedding must not count");
+        assert_eq!(budget.inflight_bytes(), bytes_before, "shedding must not charge bytes");
         assert!(rx.try_recv().is_err(), "an event at the cap must be shed");
+        assert_eq!(budget.shed(), (0, 1, 0));
+    }
 
-        // And the wrapped counter sheds too — this is the dual-stack failure.
-        let wrapped = Arc::new(AtomicUsize::new(usize::MAX));
-        assert!(send_to_engine(
-            &tx,
-            &wrapped,
-            NetEvent::Attestation(sample_attestation(), Origin::none())
-        ));
-        assert!(rx.try_recv().is_err(), "a wrapped counter sheds every frame");
+    /// O06 — the invariant `count <= cap` holds under contention. Eight
+    /// threads race the reservation with nothing consuming; the old
+    /// `load`-then-`fetch_add` could admit up to seven over the cap, the
+    /// compare-and-swap cannot admit one.
+    #[test]
+    fn concurrent_reservations_never_exceed_the_count_cap() {
+        let cap = 100usize;
+        let budget = Arc::new(QueueBudget::with_caps(cap, usize::MAX));
+        let admitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let budget = budget.clone();
+            let admitted = admitted.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..1_000 {
+                    if budget.reserve_raw(EventClass::Attestation, 1) {
+                        admitted.fetch_add(1, Ordering::Relaxed);
+                    }
+                    assert!(budget.inflight() <= cap, "count exceeded the cap");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("racer");
+        }
+        assert_eq!(admitted.load(Ordering::Relaxed), cap, "exactly cap reservations succeed");
+        assert_eq!(budget.inflight(), cap);
+    }
+
+    /// O06 — the per-class byte quotas: transactions stop at half the
+    /// budget, attestations at three quarters, blocks may use all of it; a
+    /// refusal on bytes hands the count back.
+    #[test]
+    fn byte_quotas_shed_transactions_first_and_blocks_last() {
+        let bytes_cap = 1_000usize;
+        let b = QueueBudget::with_caps(1_000, bytes_cap);
+        // Transactions: admitted while total <= 500.
+        assert!(b.reserve_raw(EventClass::Transaction, 400));
+        assert!(b.reserve_raw(EventClass::Transaction, 100));
+        assert!(!b.reserve_raw(EventClass::Transaction, 1), "transactions stop at half");
+        assert_eq!(b.inflight(), 2, "the refused reservation returned its count");
+        assert_eq!(b.inflight_bytes(), 500);
+        // Attestations may still use up to 750.
+        assert!(b.reserve_raw(EventClass::Attestation, 250));
+        assert!(!b.reserve_raw(EventClass::Attestation, 1), "attestations stop at three quarters");
+        // Blocks may use the whole budget, and not a byte more.
+        assert!(b.reserve_raw(EventClass::Block, 250));
+        assert!(!b.reserve_raw(EventClass::Block, 1), "blocks stop at the cap");
+        assert_eq!(b.inflight_bytes(), bytes_cap);
+        assert_eq!(b.inflight(), 4);
+        // Releasing the same sizes restores both counters exactly.
+        for size in [400, 100, 250, 250] {
+            b.release_raw(size);
+        }
+        assert_eq!((b.inflight(), b.inflight_bytes()), (0, 0));
+    }
+
+    /// The size charged at reservation is the size released — the accounting
+    /// is a pure function of the event value, so a full cycle is a no-op on
+    /// both counters for every event class.
+    #[test]
+    fn reserve_then_release_is_a_no_op_for_every_class() {
+        let b = QueueBudget::with_caps(8, 1 << 24);
+        let att = NetEvent::Attestation(sample_attestation(), Origin::none());
+        let size = queued_bytes(&att);
+        assert!(size > 0);
+        assert!(b.try_reserve(&att));
+        assert_eq!((b.inflight(), b.inflight_bytes()), (1, size));
+        b.release(&att);
+        assert_eq!((b.inflight(), b.inflight_bytes()), (0, 0));
     }
 
     fn sample_attestation() -> Attestation {
@@ -1234,7 +1504,7 @@ mod tests {
 
         let (events, _rx) = mpsc::channel::<EngineEvent>();
         let head_slot = Arc::new(AtomicU64::new(0));
-        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let inflight = QueueBudget::new();
         let mesh = start(
             "127.0.0.1",
             port,

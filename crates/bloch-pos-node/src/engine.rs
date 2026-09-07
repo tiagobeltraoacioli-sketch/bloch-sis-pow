@@ -850,6 +850,14 @@ mod replay_bench;
 
 struct Engine {
     manifest: Manifest,
+    /// Validator indices below this were registered AT GENESIS and are
+    /// therefore identical on every branch of every fork; indices at or above
+    /// it were (or would be) added by an on-chain `Deposit`, whose
+    /// index-to-key mapping is a property of ONE branch. `ingest_judged` uses
+    /// the line to decide whether a signature failure against this node's
+    /// head registry is a provable forgery (`Reject`) or merely a key this
+    /// node may not hold (`Ignore`, parked) — external audit 2026-09-07, O04.
+    genesis_validator_count: u32,
     state: StateCell,
     tr: Transition<HybridVerifier>,
     tr_probe: Transition<ProbeVerifier>,
@@ -2315,12 +2323,29 @@ impl Engine {
         // miniature.
         //
         // So:
-        //   * registered index, signature fails → REFUSED, and `Reject`:
-        //     registry records are append-only per index (transition step 7's
-        //     note: "records never removed"), so the key this node holds at
-        //     `i` is the key every branch holds at `i`, and this is a forgery
-        //     the transition would have rejected too — provable, and safe to
-        //     charge to the peer that relayed it.
+        //   * GENESIS index (`i < genesis_validator_count`), signature fails
+        //     → REFUSED, and `Reject`: the genesis registry is in the manifest
+        //     every node booted from, records are append-only per index
+        //     (transition step 7's note: "records never removed"), so the key
+        //     this node holds at `i` is the key EVERY branch holds at `i`, and
+        //     this is a forgery the transition would have rejected too —
+        //     provable, and safe to charge to the peer that relayed it.
+        //   * DEPOSIT-ADDED index (`i >= genesis_validator_count`), signature
+        //     fails against the HEAD's key → PARKED, `Ignore`, never `Reject`
+        //     (external audit 2026-09-07, O04). "Append-only per index" is a
+        //     fact about one branch: two branches that each admit a different
+        //     `Deposit` as their next registration assign the same index to
+        //     two different keys. A block signed with the other branch's key
+        //     is not a forgery, and refusing it — worse, charging the relaying
+        //     peer for it — would partition this node from a branch it has
+        //     simply not applied yet. The transition judges it against the
+        //     parent-derived registry when the branch is applied; until then
+        //     it may not weigh on fork choice, which is exactly what parking
+        //     buys. Today `genesis_validator_count` is the whole registry
+        //     (`DEPOSIT_ACTIVATION_EPOCH` is `u64::MAX`, so no index above it
+        //     exists on any branch) and this arm is unreachable; it is here so
+        //     that opening deposits does not silently turn the head-registry
+        //     shortcut into a fork.
         //   * unregistered index → PARKED, never stored, `Ignore`. No verdict
         //     is passed on it: it simply may not weigh on fork choice under an
         //     identity this node cannot check, and the orphan pool is
@@ -2346,6 +2371,13 @@ impl Engine {
             }
         };
         if !authenticated {
+            if env.header.proposer_index >= self.genesis_validator_count {
+                // O04: a deposit-added identity whose key this branch may not
+                // hold. Not a verdict on the block, and not a charge on the
+                // peer — hold it and let the transition judge it in context.
+                self.park_orphan(id, env);
+                return (Verdict::Ignore, None);
+            }
             self.rejected_unsigned += 1;
             eprintln!(
                 "reject {}: proposer {} signature does not verify",
@@ -4288,7 +4320,7 @@ fn start_devnet(
     cfg: &Config,
     tx: mpsc::Sender<EngineEvent>,
     head_slot: &Arc<AtomicU64>,
-    inflight: &Arc<std::sync::atomic::AtomicUsize>,
+    inflight: &Arc<net::QueueBudget>,
 ) -> io::Result<net::DevnetMesh> {
     net::start(
         &cfg.listen_addr,
@@ -4530,7 +4562,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // decide when to shed rather than queue — see `net::send_to_engine`. It is
     // decremented below, after each event is actually processed, so "in flight"
     // means exactly that and not "ever sent".
-    let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let inflight = net::QueueBudget::new();
     let (tx, rx) = mpsc::channel::<EngineEvent>();
     // The transports speak NetEvent and know nothing about the RPC; the engine
     // consumes one channel. Rather than teach both transports the engine's
@@ -4561,13 +4593,25 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 // for the life of the process — a node that looks connected,
                 // logs nothing, and receives nothing.
                 //
-                // This does NOT add shedding to the libp2p path. That channel
-                // stays unbounded on purpose (see the `p2p` module header on
-                // why a syncing node that stalls is worse than a fat one);
-                // counting only makes the number true.
-                inflight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                // Since the 2026-09-07 audit (O06) the libp2p path is
+                // admitted through the SAME byte-weighted budget as the
+                // devnet path. It used to stay unbounded on purpose (the
+                // `p2p` module header's argument: a syncing node that stalls
+                // is worse than a fat one). The budget answers that argument
+                // rather than ignoring it: blocks — the class sync progress
+                // consists of — may use the whole 64 MiB, so a block is shed
+                // only when the engine already holds four epochs of maximal
+                // blocks it has not applied, i.e. when it is replaying and
+                // would not have applied a fifth for hours anyway; and every
+                // shed event is re-requested or re-gossiped. What the budget
+                // removes is the unbounded case: a consumer that is asleep
+                // can no longer be handed memory without limit.
+                if !inflight.try_reserve(&ev) {
+                    continue; // shed and counted; the transport stays healthy
+                }
+                let size = net::queued_bytes(&ev);
                 if tx.send(EngineEvent::Net(ev)).is_err() {
-                    inflight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                    inflight.release_raw(size);
                     return; // engine gone; nothing left to deliver to
                 }
             }
@@ -4710,6 +4754,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         tx_slot_index_order: VecDeque::new(),
         doppelganger_observe_until,
         doppelganger_halted: false,
+        genesis_validator_count: manifest.validators.len() as u32,
         manifest,
     };
 
@@ -5132,13 +5177,27 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 while let Ok(more) = rx.try_recv() {
                     pending.push(more);
                 }
+                // Queue telemetry, before the batch is worked: what the
+                // transports hold for this engine right now, and what they
+                // have shed since start (O06).
+                {
+                    use crate::metrics::{NodeMetrics, NODE};
+                    NodeMetrics::set(&NODE.net_queue_inflight, inflight.inflight() as u64);
+                    NodeMetrics::set(&NODE.net_queue_bytes, inflight.inflight_bytes() as u64);
+                    let (sb, sa, st) = inflight.shed();
+                    NodeMetrics::set(&NODE.net_shed_blocks_total, sb);
+                    NodeMetrics::set(&NODE.net_shed_attestations_total, sa);
+                    NodeMetrics::set(&NODE.net_shed_transactions_total, st);
+                }
                 for ev in pending {
-                    // Every `EngineEvent::Net` was counted into `inflight` by
-                    // the transport; releasing it here — after handling, not on
-                    // dequeue — is what makes the cap mean "work the engine has
-                    // not done yet".
-                    if matches!(ev, EngineEvent::Net(_)) {
-                        inflight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                    // Every `EngineEvent::Net` was reserved in the budget by
+                    // the transport; releasing it here — after handling, not
+                    // on dequeue — is what makes the cap mean "work the engine
+                    // has not done yet". The release charges the same pure
+                    // size function the reservation did, so the two cancel
+                    // exactly (see `net::queued_bytes`).
+                    if let EngineEvent::Net(ref net_ev) = ev {
+                        inflight.release(net_ev);
                     }
                     match ev {
                         EngineEvent::Net(NetEvent::Block(env, origin)) => {
@@ -6991,7 +7050,7 @@ mod transfer_v2_end_to_end {
         // `_rx` drops here: nothing dials this node, and the accept loop
         // exits quietly on a closed channel.
         let head_slot = Arc::new(AtomicU64::new(0));
-        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let inflight = net::QueueBudget::new();
         let net = net::Net::Devnet(
             net::start(
                 "127.0.0.1",
@@ -7006,6 +7065,7 @@ mod transfer_v2_end_to_end {
         );
         let verifier = HybridVerifier::new();
         Engine {
+            genesis_validator_count: manifest.validators.len() as u32,
             manifest,
             state: StateCell::new(state),
             tr: Transition::new(verifier.clone()),
@@ -7976,7 +8036,7 @@ mod perf_support {
         let store = Store::open(&dir, &[0u8; 32]).expect("open the test store");
         let (events, _rx) = mpsc::channel::<EngineEvent>();
         let head_slot = Arc::new(AtomicU64::new(0));
-        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let inflight = net::QueueBudget::new();
         let net = net::Net::Devnet(
             net::start(
                 "127.0.0.1",
@@ -7991,6 +8051,7 @@ mod perf_support {
         );
         let verifier = HybridVerifier::new();
         let engine = Engine {
+            genesis_validator_count: manifest.validators.len() as u32,
             manifest,
             state: StateCell::new(state),
             tr: Transition::new(verifier.clone()),
@@ -9659,7 +9720,7 @@ mod duty_view_anchor {
         let store = Store::open(&dir.0, &[0u8; 32]).expect("open the test store");
         let (events, _rx) = mpsc::channel::<EngineEvent>();
         let head_slot = Arc::new(AtomicU64::new(0));
-        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let inflight = net::QueueBudget::new();
         let net = net::Net::Devnet(
             net::start(
                 "127.0.0.1",
@@ -9676,6 +9737,7 @@ mod duty_view_anchor {
         let ks0 = Keystore::load_with(&dir.0.join("v0"), &crate::keys::Unlock::PlaintextOptIn)
             .expect("re-load validator 0");
         let engine = Engine {
+            genesis_validator_count: manifest.validators.len() as u32,
             manifest,
             state: StateCell::new(state),
             tr: Transition::new(verifier.clone()),
@@ -9930,13 +9992,14 @@ mod slot_horizon {
         let store = Store::open(&dir, &[0u8; 32]).expect("open the test store");
         let (events, _rx) = mpsc::channel::<EngineEvent>();
         let head_slot = Arc::new(AtomicU64::new(0));
-        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let inflight = net::QueueBudget::new();
         let net = net::Net::Devnet(
             net::start("127.0.0.1", 0, Vec::new(), events, dir.clone(), head_slot.clone(), inflight)
                 .expect("bind the devnet transport on an ephemeral port"),
         );
         let verifier = HybridVerifier::new();
         Engine {
+            genesis_validator_count: manifest.validators.len() as u32,
             manifest,
             state: StateCell::new(state),
             tr: Transition::new(verifier.clone()),
@@ -10333,6 +10396,49 @@ mod ingest_admission_tests {
             "a provable forgery must not consume a slot the honest gap needs"
         );
         assert_eq!(engine.rejected_unsigned, 1, "and it must be counted");
+    }
+
+    /// **O04 (external audit 2026-09-07): a signature failure under a
+    /// DEPOSIT-ADDED index is not a provable forgery, so it is parked, not
+    /// refused, and the relaying peer is not charged.**
+    ///
+    /// Two branches that each admit a different `Deposit` as their next
+    /// registration assign the same index to two different keys; this node's
+    /// head holds one of them, and a block signed by the other is honest on
+    /// its own branch. The genesis registry has no such ambiguity — it is in
+    /// the manifest every node booted from — which is why the previous test
+    /// still holds for genesis indices.
+    ///
+    /// The fixture's registry is entirely genesis-registered, so the branch
+    /// is simulated by lowering `genesis_validator_count` to zero: every index
+    /// is then "deposit-added" from the engine's point of view. Before the fix
+    /// this block was `Reject`ed and counted as unsigned; now it is `Ignore`d
+    /// and parked.
+    #[test]
+    fn a_failed_signature_under_a_deposit_added_index_is_parked_not_refused() {
+        let (mut engine, _dir, template, stored) = fixture();
+        engine.genesis_validator_count = 0;
+
+        let mut other_key = repointed(&engine, &template, [0x9A; 32], 2);
+        let n = other_key.proposer_sig.len();
+        other_key.proposer_sig = vec![0u8; n];
+        let verdict = engine.ingest_judged(other_key);
+
+        assert!(matches!(verdict, Verdict::Ignore), "no verdict on a key this branch may not hold");
+        assert_eq!(engine.blocks.len(), stored, "not stored: it may not weigh on fork choice");
+        assert_eq!(engine.orphans.len(), 1, "parked, awaiting the branch that can judge it");
+        assert_eq!(engine.rejected_unsigned, 0, "not a forgery, not counted as one");
+
+        // The genesis line restored, the identical envelope IS a provable
+        // forgery again — the two rules meet exactly at `genesis_validator_count`.
+        let (mut engine, _dir, template, stored) = fixture();
+        assert!(engine.genesis_validator_count > template.header.proposer_index);
+        let mut forged = repointed(&engine, &template, [0x9A; 32], 2);
+        forged.proposer_sig = vec![0u8; n];
+        let verdict = engine.ingest_judged(forged);
+        assert!(matches!(verdict, Verdict::Reject));
+        assert_eq!(engine.blocks.len(), stored);
+        assert_eq!(engine.rejected_unsigned, 1);
     }
 
     /// **A slot the clock will not reach for hours is refused.** Otherwise a
