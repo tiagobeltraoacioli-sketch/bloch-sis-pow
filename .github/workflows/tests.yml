@@ -86,6 +86,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y clang cmake
       - name: Input-boundary regressions (before the full suite)
         run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-node --bin bloch-pos audit_
+      - name: Entropy guard regressions and thread-affinity doctests
+        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p pqcrypto-internals
       - name: cargo test (live crates)
         run: |
           cargo +${{ steps.pin.outputs.toolchain }} test --locked \

@@ -86,11 +86,11 @@
 //! by the peer's inbound handler on the same socket.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -341,14 +341,14 @@ pub struct DevnetMesh {
     ///
     /// Pushing on inbound connections costs nothing — the socket is already
     /// open and the peer is already reading it.
-    inbound: Arc<Mutex<Vec<SyncSender<Vec<u8>>>>>,
+    inbound: Arc<Mutex<Vec<InboundPeer>>>,
     /// TCP connections up **right now**, inbound and outbound together.
     ///
     /// Not `peers.len()`: that is one entry per *configured* peer address and
     /// its dialer thread retries forever, so it reads the same whether the
     /// peer is answering or has been down for a week. This counter is
     /// incremented when a socket is established and decremented when its
-    /// reader thread ends, by [`ConnCount`], so it is a fact about the
+    /// connection workers end, by [`ConnCount`], so it is a fact about the
     /// network rather than about the command line.
     ///
     /// It exists so `getchaininfo` can say which stacks a node is actually
@@ -378,6 +378,51 @@ impl Drop for ConnCount {
     }
 }
 
+struct InboundPeer {
+    frames: SyncSender<Vec<u8>>,
+    connection: Weak<InboundConnection>,
+}
+
+impl InboundPeer {
+    fn is_open(&self) -> bool {
+        self.connection.upgrade().is_some_and(|c| !c.closed.load(Ordering::Acquire))
+    }
+}
+
+/// Both workers share one counted lifetime. Exiting either half shuts down
+/// the socket; capacity is released only after BOTH workers have stopped.
+struct InboundConnection {
+    socket: TcpStream,
+    closed: AtomicBool,
+    _counts: (ConnCount, ConnCount),
+}
+
+struct InboundHalf(Arc<InboundConnection>);
+
+impl Drop for InboundHalf {
+    fn drop(&mut self) {
+        self.0.closed.store(true, Ordering::Release);
+        let _ = self.0.socket.shutdown(Shutdown::Both);
+    }
+}
+
+fn run_inbound_writer(
+    rx: Receiver<Vec<u8>>,
+    socket: Arc<Mutex<TcpStream>>,
+    half: InboundHalf,
+) {
+    while !half.0.closed.load(Ordering::Acquire) {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(frame) => {
+                let Ok(mut writer) = socket.lock() else { return };
+                if write_frame(&mut writer, &frame).is_err() { return; }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
 impl DevnetMesh {
     /// TCP connections established right now. See [`DevnetMesh::live`].
     pub fn peer_count(&self) -> usize {
@@ -401,7 +446,8 @@ impl DevnetMesh {
         // whose writer thread has exited, and keeping its sender would leak one
         // entry per reconnect for as long as the node runs.
         if let Ok(mut inbound) = self.inbound.lock() {
-            inbound.retain(|p| !matches!(p.try_send(frame.clone()), Err(TrySendError::Disconnected(_))));
+            inbound.retain(|p| p.is_open()
+                && !matches!(p.frames.try_send(frame.clone()), Err(TrySendError::Disconnected(_))));
         }
     }
 }
@@ -475,15 +521,37 @@ fn write_frame(sock: &mut TcpStream, frame: &[u8]) -> std::io::Result<()> {
 }
 
 fn read_frame(sock: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    read_frame_until(sock, Instant::now() + DEVNET_IO_TIMEOUT)
+}
+
+fn read_frame_until(sock: &mut TcpStream, deadline: Instant) -> std::io::Result<Vec<u8>> {
     let mut len4 = [0u8; 4];
-    sock.read_exact(&mut len4)?;
+    read_exact_until(sock, &mut len4, deadline)?;
     let len = u32::from_le_bytes(len4) as usize;
     if len == 0 || len > crate::codec::MAX_FIELD_LEN {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad frame length"));
     }
     let mut buf = vec![0u8; len];
-    sock.read_exact(&mut buf)?;
+    read_exact_until(sock, &mut buf, deadline)?;
     Ok(buf)
+}
+
+/// A single frame budget covers both its length prefix and payload. `read_exact`
+/// with a fixed socket timeout would renew the budget on every partial read.
+fn read_exact_until(sock: &mut TcpStream, mut buf: &mut [u8], deadline: Instant) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        let remaining = deadline.checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "frame deadline exceeded"))?;
+        sock.set_read_timeout(Some(remaining))?;
+        match sock.read(buf) {
+            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "incomplete frame")),
+            Ok(n) => buf = &mut buf[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Decode a data frame into an engine event. Get-blocks is handled by the
@@ -624,7 +692,7 @@ pub fn start(
     // Inbound: accept, then per-connection: read frames; data frames go to
     // the engine, get-blocks is answered in place from the log.
     let listener = TcpListener::bind((bind_addr, listen_port))?;
-    let inbound: Arc<Mutex<Vec<SyncSender<Vec<u8>>>>> = Arc::new(Mutex::new(Vec::new()));
+    let inbound: Arc<Mutex<Vec<InboundPeer>>> = Arc::new(Mutex::new(Vec::new()));
     let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // Counted separately from `live` (R3 M-4 / R1 A3-M2): `live` also holds
     // OUTBOUND connections (this node's own configured peers), and the cap
@@ -644,6 +712,11 @@ pub fn start(
         thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(sock) = conn else { continue };
+                // A quiet mesh may never broadcast. Prune on accept too, so
+                // connection churn cannot retain one dead sender per dial.
+                if let Ok(mut reg) = inbound.lock() {
+                    reg.retain(InboundPeer::is_open);
+                }
                 // R3 M-4 / R1 A3-M2: past the cap, close the socket immediately
                 // — `sock` drops at the end of this iteration — before either
                 // thread below is spawned and before the socket costs this
@@ -653,14 +726,21 @@ pub fn start(
                 }
                 // R3 M-4 / R1 A3-M2: bounded so a peer that stops reading or
                 // never writes cannot hold a thread and a queue open forever.
-                // Best-effort — a platform that refuses the option gets an
-                // unbounded-latency socket, not a broken one.
-                let _ = sock.set_read_timeout(Some(DEVNET_IO_TIMEOUT));
-                let _ = sock.set_write_timeout(Some(DEVNET_IO_TIMEOUT));
+                if sock.set_read_timeout(Some(DEVNET_IO_TIMEOUT)).is_err()
+                    || sock.set_write_timeout(Some(DEVNET_IO_TIMEOUT)).is_err()
+                {
+                    continue;
+                }
                 // Reading and writing need separate handles: the reader blocks
                 // in `read_frame` for as long as the peer is quiet, and a
                 // broadcast must not wait behind it.
                 let Ok(rsock) = sock.try_clone() else { continue };
+                let Ok(shutdown_socket) = sock.try_clone() else { continue };
+                let connection = Arc::new(InboundConnection {
+                    socket: shutdown_socket,
+                    closed: AtomicBool::new(false),
+                    _counts: (ConnCount::new(&live), ConnCount::new(&inbound_live)),
+                });
                 let wsock = Arc::new(Mutex::new(sock));
 
                 // One writer thread per connection, fed by a bounded queue, so
@@ -669,18 +749,13 @@ pub fn start(
                 let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(INBOUND_QUEUE_DEPTH);
                 {
                     let wsock = wsock.clone();
+                    let half = InboundHalf(connection.clone());
                     thread::spawn(move || {
-                        for frame in rx {
-                            let Ok(mut w) = wsock.lock() else { return };
-                            if write_frame(&mut w, &frame).is_err() {
-                                return; // dropping `rx` disconnects the sender,
-                                        // which `broadcast` prunes on its next pass
-                            }
-                        }
+                        run_inbound_writer(rx, wsock, half);
                     });
                 }
                 if let Ok(mut reg) = inbound.lock() {
-                    reg.push(tx);
+                    reg.push(InboundPeer { frames: tx, connection: Arc::downgrade(&connection) });
                 }
 
                 let events = events.clone();
@@ -690,11 +765,9 @@ pub fn start(
                 // Counted from here to wherever this thread leaves. The guards
                 // are moved into the closure, so every `return` below and any
                 // unwind releases both.
-                let counted = ConnCount::new(&live);
-                let inbound_counted = ConnCount::new(&inbound_live);
+                let half = InboundHalf(connection);
                 thread::spawn(move || {
-                    let _counted = counted;
-                    let _inbound_counted = inbound_counted;
+                    let _half = half;
                     // Per-connection (R3 M-4 / R1 A3-M2): see [`GetBlocksLimiter`].
                     let mut get_blocks_limiter = GetBlocksLimiter::new();
                     loop {
@@ -858,6 +931,94 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_inbound_reader_exit_reclaims_idle_writer_and_capacity() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let inbound_live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let connection = Arc::new(InboundConnection {
+            socket: socket.try_clone().unwrap(),
+            closed: AtomicBool::new(false),
+            _counts: (ConnCount::new(&live), ConnCount::new(&inbound_live)),
+        });
+        let reader = InboundHalf(connection.clone());
+        let writer = InboundHalf(connection.clone());
+        let (frames, rx) = mpsc::sync_channel(INBOUND_QUEUE_DEPTH);
+        let peer = InboundPeer { frames, connection: Arc::downgrade(&connection) };
+        drop(connection);
+        assert!(peer.is_open());
+        assert_eq!(inbound_live.load(Ordering::Acquire), 1);
+        // Keep the registry's sender alive and never broadcast: the exact
+        // condition that previously stranded `for frame in rx` forever.
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            run_inbound_writer(rx, Arc::new(Mutex::new(socket)), writer);
+            done_tx.send(()).unwrap();
+        });
+        drop(reader);
+        done_rx.recv_timeout(Duration::from_secs(5)).expect("idle writer leaked after reader exit");
+        worker.join().unwrap();
+        assert!(!peer.is_open());
+        assert_eq!(live.load(Ordering::Acquire), 0);
+        assert_eq!(inbound_live.load(Ordering::Acquire), 0);
+        assert!(matches!(peer.frames.try_send(vec![1]), Err(TrySendError::Disconnected(_))));
+    }
+
+    #[test]
+    fn audit_inbound_writer_exit_interrupts_reader_without_releasing_early() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut socket, _) = listener.accept().unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let connection = Arc::new(InboundConnection {
+            socket: socket.try_clone().unwrap(),
+            closed: AtomicBool::new(false),
+            _counts: (ConnCount::new(&live), ConnCount::new(&live)),
+        });
+        let reader = InboundHalf(connection.clone());
+        let writer = InboundHalf(connection);
+        drop(writer);
+        assert_eq!(live.load(Ordering::Acquire), 2, "reader still owns capacity");
+        // Closing either half shuts down every clone of this socket.
+        assert_eq!(socket.read(&mut [0; 1]).unwrap(), 0);
+        drop(reader);
+        assert_eq!(live.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn audit_devnet_frame_deadline_covers_prefix_and_payload() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        client.write_all(&1000u32.to_le_bytes()).unwrap();
+        let writer = thread::spawn(move || {
+            for _ in 0..40 {
+                thread::sleep(Duration::from_millis(20));
+                if client.write_all(&[1]).is_err() { break; }
+            }
+            let _ = client.shutdown(Shutdown::Write);
+        });
+        let result = read_frame_until(&mut server, Instant::now() + Duration::from_millis(300));
+        drop(server);
+        writer.join().unwrap();
+        let error = result.unwrap_err();
+        // Linux reports SO_RCVTIMEO as WouldBlock; other platforms use TimedOut.
+        assert!(matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock));
+    }
+
+    #[test]
+    fn audit_devnet_complete_frame_survives_deadline_enforcement() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let frame = get_blocks_frame(42);
+        write_frame(&mut client, &frame).unwrap();
+        assert_eq!(read_frame(&mut server).unwrap(), frame);
+    }
 
     /// Freeze every allocated frame byte at its registered value.
     ///

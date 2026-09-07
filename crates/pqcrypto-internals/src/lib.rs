@@ -56,6 +56,7 @@
 
 use core::slice;
 use std::cell::RefCell;
+use std::rc::Rc;
 
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
@@ -64,35 +65,54 @@ use rand_core::{RngCore, SeedableRng};
 type size_t = usize;
 use core::ffi::c_int;
 
+struct SeededEntry {
+    id: Rc<()>,
+    rng: ChaCha20Rng,
+}
+
 thread_local! {
     /// Per-thread seeded RNG override STACK for `PQCRYPTO_RUST_randombytes`
     /// (I-2: a LIFO stack, not a single `Option`, so nesting is well-defined
     /// — see `with_seeded_rng`'s "Nesting" section). `randombytes_fill`
     /// always draws from the TOP of the stack; empty ⇒ upstream OS-RNG
     /// behavior is preserved.
-    static SEEDED_RNG_STACK: RefCell<Vec<ChaCha20Rng>> = const { RefCell::new(Vec::new()) };
+    static SEEDED_RNG_STACK: RefCell<Vec<SeededEntry>> = const { RefCell::new(Vec::new()) };
 }
 
-/// RAII guard that pops this call's seeded RNG off the thread-local stack
-/// when dropped, restoring whatever was active before it (I-2).
+/// RAII guard that removes this call's seeded RNG from the thread-local stack.
 ///
 /// Returned by [`with_seeded_rng`]. Hold this for the duration of any
 /// PQClean call that should consume deterministic bytes.
+///
+/// The guard is neither `Send` nor `Sync`: its destructor must run on the
+/// thread whose entropy source it changed. Moving the old zero-sized guard
+/// to another thread left the original thread deterministically seeded.
+///
+/// ```compile_fail
+/// let guard = pqcrypto_internals::with_seeded_rng(&[7; 32]);
+/// std::thread::spawn(move || drop(guard));
+/// ```
+///
+/// ```compile_fail
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<pqcrypto_internals::SeededRngGuard>();
+/// ```
 #[must_use = "guard must remain in scope — dropping it restores the previous RNG (or OS RNG)"]
 pub struct SeededRngGuard {
-    // Private field prevents external construction — the only way to get
-    // this guard is via `with_seeded_rng` or the equivalent public API.
-    _priv: (),
+    // Rc both binds the guard to its thread and identifies its exact entry.
+    id: Rc<()>,
 }
 
 impl Drop for SeededRngGuard {
     fn drop(&mut self) {
-        // Pop exactly ONE entry — the one this guard pushed. Popping (not
-        // clearing) is what makes nesting a well-defined no-op for the OUTER
-        // scope: the entry below it on the stack, if any, is left untouched
-        // and becomes active again.
+        // Explicit drop can destroy an outer guard before an inner one.
+        // Remove by identity: popping would remove the inner RNG instead,
+        // then reactivate an outer seed whose owner had already been dropped.
         SEEDED_RNG_STACK.with(|stack| {
-            stack.borrow_mut().pop();
+            let mut stack = stack.borrow_mut();
+            if let Some(index) = stack.iter().position(|entry| Rc::ptr_eq(&entry.id, &self.id)) {
+                stack.remove(index);
+            }
         });
     }
 }
@@ -125,8 +145,9 @@ impl Drop for SeededRngGuard {
 /// # Nesting (I-2)
 ///
 /// `with_seeded_rng` PUSHES onto a per-thread stack; `randombytes_fill`
-/// always reads the TOP entry; dropping a guard POPS exactly the entry it
-/// pushed. So calling `with_seeded_rng` while a guard is already active is a
+/// always reads the TOP surviving entry; dropping a guard removes exactly
+/// the entry it owns, even when guards are dropped out of order. Calling
+/// `with_seeded_rng` while a guard is already active is a
 /// well-defined, DOCUMENTED no-op for the outer scope: the inner seed is
 /// active only until the inner guard drops, at which point the outer seed's
 /// stream resumes EXACTLY where it left off — the inner scope does not
@@ -140,10 +161,11 @@ impl Drop for SeededRngGuard {
 /// reason), but it can no longer corrupt an enclosing scope's determinism.
 pub fn with_seeded_rng(seed: &[u8; 32]) -> SeededRngGuard {
     let rng = ChaCha20Rng::from_seed(*seed);
+    let id = Rc::new(());
     SEEDED_RNG_STACK.with(|stack| {
-        stack.borrow_mut().push(rng);
+        stack.borrow_mut().push(SeededEntry { id: id.clone(), rng });
     });
-    SeededRngGuard { _priv: () }
+    SeededRngGuard { id }
 }
 
 /// Fill `buf` with random bytes — safe-Rust core of the FFI entry point.
@@ -160,8 +182,8 @@ pub fn randombytes_fill(buf: &mut [u8]) -> Result<(), getrandom::Error> {
     let used_seeded = SEEDED_RNG_STACK.with(|stack| {
         let mut s = stack.borrow_mut();
         match s.last_mut() {
-            Some(rng) => {
-                rng.fill_bytes(buf);
+            Some(entry) => {
+                entry.rng.fill_bytes(buf);
                 true
             }
             None => false,
@@ -570,5 +592,38 @@ mod tests {
         // either outer read), confirming the inner guard was genuinely active.
         assert_ne!(inner_bytes, baseline_1);
         assert_ne!(inner_bytes, baseline_2);
+    }
+
+    #[test]
+    fn audit_out_of_order_drop_preserves_the_live_inner_entropy_source() {
+        let seed = [0x42; 32];
+        let mut expected = [0; 64];
+        ChaCha20Rng::from_seed(seed).fill_bytes(&mut expected);
+        let outer = with_seeded_rng(&[0x11; 32]);
+        let inner = with_seeded_rng(&seed);
+        let mut actual = [0; 64];
+        randombytes_fill(&mut actual[..32]).unwrap();
+        drop(outer);
+        randombytes_fill(&mut actual[32..]).unwrap();
+        assert_eq!(actual, expected, "dropping an outer guard changed the inner stream");
+        drop(inner);
+        SEEDED_RNG_STACK.with(|stack| assert!(stack.borrow().is_empty()));
+    }
+
+    #[test]
+    fn audit_dropping_middle_guard_never_reactivates_its_seed() {
+        let outer_seed = [0x11; 32];
+        let mut expected = [0; 32];
+        ChaCha20Rng::from_seed(outer_seed).fill_bytes(&mut expected);
+        let outer = with_seeded_rng(&outer_seed);
+        let middle = with_seeded_rng(&[0x22; 32]);
+        let inner = with_seeded_rng(&[0x33; 32]);
+        drop(middle);
+        drop(inner);
+        let mut actual = [0; 32];
+        randombytes_fill(&mut actual).unwrap();
+        assert_eq!(actual, expected, "a destroyed scope's seed became active again");
+        drop(outer);
+        SEEDED_RNG_STACK.with(|stack| assert!(stack.borrow().is_empty()));
     }
 }
