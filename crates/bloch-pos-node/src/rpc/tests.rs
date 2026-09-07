@@ -1094,6 +1094,108 @@ fn test_server() -> (SocketAddr, Arc<Spy>) {
 }
 
 #[test]
+fn audit_http_rejects_ambiguous_framing_before_dispatch() {
+    let (addr, spy) = test_server();
+    let body = request("getchaininfo", "[]");
+    let base = format!(
+        "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+        body.len()
+    );
+    for extra in [
+        "Content-Length: 0\r\n",
+        "content-length: 1\r\n",
+        "Host: attacker.example\r\n",
+        "Content-Type: text/plain\r\n",
+        "Content-Length : 0\r\n",
+        " folded: value\r\n",
+        "missing-colon\r\n",
+        "X-Invalid: control\x01\r\n",
+    ] {
+        let response = http(addr, &format!("{base}{extra}\r\n{body}"));
+        assert!(response.starts_with("HTTP/1.1 400"), "{extra:?}: {response}");
+        assert_eq!(spy.last(), None, "malformed HTTP reached the backend");
+    }
+    // Positive control: the same body with ordinary framing still dispatches.
+    assert!(http(addr, &format!("{base}\r\n{body}")).starts_with("HTTP/1.1 200"));
+    assert_eq!(spy.last(), Some(RpcRequest::ChainInfo));
+}
+
+#[test]
+fn audit_http_content_length_uses_decimal_digits_only() {
+    let (addr, spy) = test_server();
+    for length in ["+2", "-1", "2, 2", "", "184467440737095516160", "two"] {
+        let response = http(addr, &format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {length}\r\n\r\n{{}}"
+        ));
+        assert!(response.starts_with("HTTP/1.1 400"), "{length:?}: {response}");
+        assert_eq!(spy.last(), None);
+    }
+}
+
+#[test]
+fn audit_http_header_limit_includes_the_terminator() {
+    let (addr, spy) = test_server();
+    let body = request("getchaininfo", "[]");
+    let prefix = format!(
+        "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Padding: ",
+        body.len()
+    );
+    let padding = MAX_HEADER_BYTES - prefix.len() - 4;
+    let exact = format!("{prefix}{}\r\n\r\n{body}", "a".repeat(padding));
+    assert!(http(addr, &exact).starts_with("HTTP/1.1 200"));
+    assert_eq!(spy.last(), Some(RpcRequest::ChainInfo));
+    let oversized = format!("{prefix}{}\r\n\r\n{body}", "a".repeat(padding + 1));
+    assert!(http(addr, &oversized).starts_with("HTTP/1.1 431"));
+}
+
+#[test]
+fn audit_http_request_line_must_be_complete() {
+    let (addr, spy) = test_server();
+    for line in ["POST", "POST /", "POST / HTTP/9.9", "POST / HTTP/1.1 extra", "POST  HTTP/1.1"] {
+        let response = http(addr, &format!(
+            "{line}\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}"
+        ));
+        assert!(response.starts_with("HTTP/1.1 400"), "{line:?}: {response}");
+        assert_eq!(spy.last(), None);
+    }
+}
+
+#[test]
+fn audit_rpc_trickling_body_cannot_renew_request_deadline() {
+    use std::net::{Shutdown, TcpListener};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut server, _) = listener.accept().unwrap();
+    // The head completes immediately, then the peer keeps making progress
+    // more frequently than the timeout. A per-read timeout accepts this until
+    // the peer closes; one shared deadline returns 408 while it is trickling.
+    client.write_all(b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n ").unwrap();
+    let writer = thread::spawn(move || {
+        for _ in 0..40 {
+            thread::sleep(Duration::from_millis(20));
+            if client.write_all(b" ").is_err() { break; }
+        }
+        let _ = client.shutdown(Shutdown::Write);
+    });
+    let policy = HostPolicy { allowed: vec!["localhost".into()] };
+    let result = read_request_until(&mut server, &policy, Instant::now() + Duration::from_millis(300));
+    drop(server);
+    writer.join().unwrap();
+    assert!(matches!(result, Err(HttpError { status: 408, .. })), "a slow body renewed its budget");
+}
+
+#[test]
+fn audit_rpc_expired_deadline_refuses_even_buffered_input() {
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut server, _) = listener.accept().unwrap();
+    client.write_all(b"already buffered").unwrap();
+    let error = read_before_deadline(&mut server, &mut [0; 1], Instant::now()).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+}
+
+#[test]
 fn a_real_post_gets_a_real_json_rpc_response() {
     let (addr, spy) = test_server();
     let response = post(addr, &request("getchaininfo", "[]"));

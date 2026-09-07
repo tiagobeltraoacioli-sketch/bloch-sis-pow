@@ -712,7 +712,13 @@ impl RrCodec for SyncCodec {
 
 async fn read_capped<T: AsyncRead + Unpin + Send>(io: &mut T) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    io.take(MAX_SYNC_FRAME).read_to_end(&mut buf).await?;
+    // `take(cap)` manufactures EOF at the cap. A valid cap-sized prefix
+    // followed by junk would therefore decode successfully. Read one sentinel
+    // byte so only actual EOF can terminate an accepted frame.
+    io.take(MAX_SYNC_FRAME + 1).read_to_end(&mut buf).await?;
+    if buf.len() as u64 > MAX_SYNC_FRAME {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "sync frame over byte cap"));
+    }
     Ok(buf)
 }
 
@@ -1726,6 +1732,39 @@ fn read_sync_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_sync_cap_requires_actual_eof() {
+        futures::executor::block_on(async {
+            // A syntactically valid response that ends exactly at the cap.
+            // The envelope is opaque at this framing layer (decoded later).
+            let response = SyncResponse::Blocks {
+                envelopes: vec![vec![0; MAX_SYNC_FRAME as usize - 9]],
+            };
+            let mut wire = encode_sync_response(&response);
+            assert_eq!(wire.len() as u64, MAX_SYNC_FRAME);
+            let accepted = read_capped(&mut futures::io::Cursor::new(&wire)).await.unwrap();
+            assert!(decode_sync_response(&accepted).is_ok());
+
+            // Previously both distinct streams produced the same accepted
+            // bytes: `take(cap)` hid this trailing byte from strict decoding.
+            wire.push(0xA5);
+            let error = read_capped(&mut futures::io::Cursor::new(&wire)).await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        });
+    }
+
+    #[test]
+    fn audit_sync_short_frames_still_use_strict_decoding() {
+        futures::executor::block_on(async {
+            let mut wire = encode_sync_response(&SyncResponse::Blocks { envelopes: Vec::new() });
+            let accepted = read_capped(&mut futures::io::Cursor::new(&wire)).await.unwrap();
+            assert!(decode_sync_response(&accepted).is_ok());
+            wire.push(0);
+            let accepted = read_capped(&mut futures::io::Cursor::new(&wire)).await.unwrap();
+            assert!(decode_sync_response(&accepted).is_err());
+        });
+    }
 
     /// THE regression test for mesh defect (b) of 2026-08-07.
     ///

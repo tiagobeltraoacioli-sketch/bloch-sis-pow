@@ -84,6 +84,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install C toolchain (rocksdb bindgen, blst, PQClean)
         run: sudo apt-get update && sudo apt-get install -y clang cmake
+      - name: Input-boundary regressions (before the full suite)
+        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-node --bin bloch-pos audit_
       - name: cargo test (live crates)
         run: |
           cargo +${{ steps.pin.outputs.toolchain }} test --locked \
