@@ -219,7 +219,9 @@ pub fn gas_cost(op: &Op) -> u64 {
 /// `len <= MAX_OPERAND_BYTES`.
 #[inline]
 fn words(len: u64) -> u64 {
-    len / 32 + if len % 32 != 0 { 1 } else { 0 }
+    // ceil(len / 32), spelled as the std method so it carries no arithmetic
+    // site; identical to `len / 32 + (len % 32 != 0) as u64` for every u64.
+    len.div_ceil(32)
 }
 
 /// **The real, length-proportional gas cost of `op` given the current `stack`** (F2).

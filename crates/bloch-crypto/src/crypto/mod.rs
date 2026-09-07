@@ -54,7 +54,9 @@ pub(crate) fn parse_envelope(b: &[u8]) -> Option<(u16, &[u8])> {
 
 /// Prepend the 4-byte suite header (`magic ‖ suite_id LE`) to a body.
 pub(crate) fn wrap_envelope(suite: u16, body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(SUITE_HEADER_LEN + body.len());
+    // Capacity hint only: saturating is exact for every real body and merely
+    // a smaller-than-ideal hint in the impossible overflow case.
+    let mut out = Vec::with_capacity(SUITE_HEADER_LEN.saturating_add(body.len()));
     out.extend_from_slice(&SUITE_MAGIC);
     out.extend_from_slice(&suite.to_le_bytes());
     out.extend_from_slice(body);

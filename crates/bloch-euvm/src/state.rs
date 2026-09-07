@@ -76,7 +76,10 @@ pub const SHAKE256_GAS: u64 = 60;
 /// (the leaf hash is folded into the first node hash). Membership adds one leaf
 /// hash. This is advisory — the caller meters it against its own budget.
 pub const fn verify_gas() -> u64 {
-    SHAKE256_GAS * (TREE_DEPTH as u64 + 2)
+    // Evaluated at compile time: an overflow here is a build error, not a
+    // runtime one, so the constant carries no arithmetic site.
+    const VERIFY_GAS: u64 = SHAKE256_GAS * (TREE_DEPTH as u64 + 2);
+    VERIFY_GAS
 }
 
 // ── core hashing (identical discipline to lib.rs Op::Shake256) ──────────────────

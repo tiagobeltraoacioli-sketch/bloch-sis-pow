@@ -345,8 +345,10 @@ pub fn coinbase_merkle_branch(txids: &[[u8; 32]], index: u32) -> Vec<[u8; 32]> {
     let mut idx = index as usize;
     while level.len() > 1 {
         if level.len() % 2 == 1 {
-            let last = *level.last().unwrap();
-            level.push(last); // Bitcoin duplicates the last node on an odd level
+            // `len() > 1` in the loop guard: `last()` is `Some` (hardened ratchet).
+            if let Some(last) = level.last().copied() {
+                level.push(last); // Bitcoin duplicates the last node on an odd level
+            }
         }
         branch.push(level[idx ^ 1]);
         let mut next = Vec::with_capacity(level.len() / 2);

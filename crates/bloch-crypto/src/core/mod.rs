@@ -878,7 +878,11 @@ pub fn parents_commitment(parents: &[[u8; 32]]) -> [u8; 32] {
     let mut level: Vec<[u8; 32]> = sorted;
     while level.len() > 1 {
         if level.len() % 2 != 0 {
-            level.push(*level.last().expect("non-empty"));
+            // `len() > 1` in the loop guard: `last()` is `Some`; the `if let`
+            // spells that without a panic site (hardened ratchet).
+            if let Some(last) = level.last().copied() {
+                level.push(last);
+            }
         }
         level = level.chunks(2).map(|pair| {
             let mut buf = [0u8; 64];
@@ -1376,7 +1380,12 @@ impl Transaction {
         if txs.is_empty() { return MerkleRoot::ZERO; }
         let mut hashes: Vec<[u8; 32]> = txs.iter().map(|t| t.txid()).collect();
         while hashes.len() > 1 {
-            if hashes.len() % 2 != 0 { hashes.push(*hashes.last().expect("non-empty vec")); }
+            // `len() > 1` in the loop guard: `last()` is `Some` (hardened ratchet).
+            if hashes.len() % 2 != 0 {
+                if let Some(last) = hashes.last().copied() {
+                    hashes.push(last);
+                }
+            }
             hashes = hashes.chunks(2).map(|p| {
                 let mut buf = [0u8; 64];
                 buf[..32].copy_from_slice(&p[0]);
@@ -1777,6 +1786,11 @@ impl Block {
                     // MERGED-MINING (AuxPoW): the PoW comes from a parent Bitcoin
                     // block that commits to THIS block's hash and meets Bloch's
                     // own target. Same SHA-256d work secures both chains.
+                    // Under `auxpow-rehearsal` the activation height is 0 and
+                    // this guard is always true; clippy's deny-level
+                    // `absurd_extreme_comparisons` would otherwise refuse to
+                    // build that (off-mainnet) feature set. Mainnet: 8500.
+                    #[allow(clippy::absurd_extreme_comparisons)]
                     Some(aux) if self.height >= AUXPOW_ACTIVATION_HEIGHT => {
                         aux.verify(self.block_hash(), self.header.bits).is_ok()
                     }

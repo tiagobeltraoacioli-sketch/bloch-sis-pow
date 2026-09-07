@@ -347,7 +347,8 @@ fn utxo_key(txid: &[u8; 32], index: u32) -> Vec<u8> {
 /// Address-index key: `[script_pubkey][txid][4B index LE]` — mirrors
 /// `storage::addr_utxo_key` (which receives the full script_pubkey).
 fn addr_utxo_key(script_pubkey: &[u8], txid: &[u8; 32], index: u32) -> Vec<u8> {
-    let mut k = Vec::with_capacity(script_pubkey.len() + 36);
+    // Capacity hint only; saturating is exact for every real script.
+    let mut k = Vec::with_capacity(script_pubkey.len().saturating_add(36));
     k.extend_from_slice(script_pubkey);
     k.extend_from_slice(txid);
     k.extend_from_slice(&index.to_le_bytes());
@@ -893,13 +894,15 @@ fn execute_reorg_inner(
     // Phase 3: Reinject valid, validate-rejected txs into mempool.
     // UTXO set now reflects the new chain (the batch above is committed);
     // any tx whose inputs survive is still spendable.
-    let mut txs_reinjected = 0;
-    let mut txs_discarded  = 0;
+    let mut txs_reinjected: usize = 0;
+    let mut txs_discarded: usize = 0;
     for tx in candidate_txs {
+        // Report counters (bounded by the candidate count); saturating so the
+        // reorg path carries no unchecked arithmetic (hardened ratchet).
         if try_reinject(store, mempool, &tx) {
-            txs_reinjected += 1;
+            txs_reinjected = txs_reinjected.saturating_add(1);
         } else {
-            txs_discarded  += 1;
+            txs_discarded = txs_discarded.saturating_add(1);
         }
     }
 
