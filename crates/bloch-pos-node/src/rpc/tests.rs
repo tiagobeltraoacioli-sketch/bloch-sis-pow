@@ -1610,7 +1610,7 @@ fn getbuildinfo_leaks_nothing_operational() {
             continue;
         }
         assert!(
-            !json.contains(comp),
+            !contains_path_component(&json, comp),
             "getbuildinfo leaked build-path component {comp:?}: {json}"
         );
     }
@@ -1621,6 +1621,27 @@ fn getbuildinfo_leaks_nothing_operational() {
             "getbuildinfo mentions {probe}: {json}"
         );
     }
+}
+
+// Compare tokens, not substrings: GitHub builds under /home/runner/work,
+// while the public source_digest_scope legitimately contains "workspace".
+// Substring matching made the full CI suite fail on every such runner.
+fn contains_path_component(text: &str, component: &str) -> bool {
+    let is_component_char = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.');
+    text.match_indices(component).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + component.len()..].chars().next();
+        !before.is_some_and(is_component_char) && !after.is_some_and(is_component_char)
+    })
+}
+
+#[test]
+fn audit_build_path_detection_uses_whole_components() {
+    assert!(!contains_path_component("workspace crates dir", "work"));
+    assert!(contains_path_component("/home/runner/work/repo", "work"));
+    assert!(contains_path_component(r#"{"builder":"runner"}"#, "runner"));
+    assert!(contains_path_component("/Users/First Last/repo", "First Last"));
+    assert!(!contains_path_component("a1b2c3d4", "b2c3"));
 }
 
 /// The identity survives the round trip a partner actually makes.
