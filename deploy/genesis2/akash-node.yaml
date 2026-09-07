@@ -13,7 +13,7 @@ version: "2.0"
 
 services:
   node:
-    image: docker.io/blochv/bloch-node:fork-n2400-2
+    image: docker.io/blochv/bloch-node:fork-n2400-2@sha256:ae6202a7313e0346c99c2dcc7b3684083452e31bae0e03536e16cb3351ed9d56
     # Args are passed to the bloch entrypoint. Linked to OVH from the start so it
     # syncs the CANONICAL little-endian chain (not an isolated fork), and mines.
     args:

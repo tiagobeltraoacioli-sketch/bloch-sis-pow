@@ -50,7 +50,7 @@ services:
   # service; forwards to the prover over the deployment-internal network and
   # sets x-forwarded-proto: https (which the prover requires).
   tls:
-    image: caddy:2.8-alpine
+    image: caddy:2.8-alpine@sha256:af32e97399febea808609119bb21544d0265c58a02836576e32a2d082c262c17
     # ← replace prover.example.com with your domain (DNS → provider ingress).
     command:
       - caddy

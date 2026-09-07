@@ -59,7 +59,17 @@ DIGEST_RE = re.compile(r"@sha256:[0-9a-fA-F]{64}\b")
 # image at all until edited. Recognised ONLY by an exact, deliberately narrow
 # marker so this can never quietly swallow a real unpinned production image:
 # the line must ALSO carry one of these comment markers, not just any word.
-PLACEHOLDER_MARKERS = ("YOUR_USER", "TODO:", "replace with your published image")
+PLACEHOLDER_MARKERS = (
+    "YOUR_USER",
+    "TODO:",
+    "replace with your published image",
+    # An image that the compose file BUILDS from this repository (a `build:`
+    # block beside it) and never pulls from a registry has no digest to pin:
+    # its identity is the source tree that built it. The marker must be
+    # spelled out on the line, and it exists for exactly one file today
+    # (deploy/docker-compose.yml, the Genesis-3 local testnet record).
+    "local build only",
+)
 
 
 def find_yaml_files(root: Path) -> list[Path]:

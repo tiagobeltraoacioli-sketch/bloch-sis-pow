@@ -25,7 +25,7 @@ changes the calculus:
 1. **No restated numbers.** This crate imports every constant and every
    vesting curve from `crates/bloch-pos-committee` — the tokenomics from
    `tokenomics_v4.rs` (whose compile-time assertions pin the 100 B total — the pure x100/21
-   split of 2026-08-12 — and the 43,029,120,000 validator remainder), the key and deposit parameters from
+   split of 2026-08-12 — and the 42,853,600,000 validator remainder), the key and deposit parameters from
    `staking.rs`, the cohort-floor inputs from `params.rs`. A Python ceremony
    would be a second copy of the tokenomics that could drift from the one
    consensus compiles in.
@@ -50,15 +50,15 @@ live validation path.
 
 | Output | BLCH | Schedule (consensus-enforced) |
 |---|---:|---|
-| Carryover holders | 17,970,880,000 — the whole measured ledger, founder included, post-split | fully liquid, from the signed artifact |
-| Founder (new grant) | 10,000,000,000 | 10-year cliff, 40-year linear |
+| Carryover holders | 18,146,400,000 — the whole measured ledger, founder included, post-split (an earlier draft carried 17,970,880,000 from the first measurement; superseded by the second) | fully liquid, from the signed artifact |
+| Founder (new grant) | 10,000,000,000 | 2-year cliff, 8-year linear (`FOUNDER_CLIFF_SLOTS`, `FOUNDER_VESTING_SLOTS`; an earlier draft said 10-year cliff / 40-year linear — superseded on 2026-08-21) |
 | VC | 10,000,000,000 | 12-month cliff, 24-month linear |
 | Team | 10,000,000,000 | 18-month cliff, 36-month linear |
 | Marketing | 4,000,000,000 | 25% at genesis, 24-month linear |
 | Liquidity | 5,000,000,000 − cohort stake | fully liquid |
 | Genesis cohort (bonded stake) | ≥ 64 × 25,000 minimum, out of liquidity | staked from slot 0, exit via the ordinary path |
 
-Plus the validator emission (43,029,120,000 over 40 years), so the accounting
+Plus the validator emission (42,853,600,000 over 40 years, `VALIDATOR_EMISSION_BLOCH`), so the accounting
 closes to **exactly** 100,000,000,000 BLCH — outputs + bonded cohort stake +
 emission, not "at most". Each output's schedule is part of its leaf hash, so
 `state_root` — and therefore `block_id` — commits to the locks: a genesis
@@ -66,7 +66,7 @@ without them is a visibly different chain, not a broken promise (§8.2's
 standard).
 
 The **carryover cap is retired** (§3): the artifact must total exactly
-17,970,880,000 BLCH — the measured G3 ledger under the split, the figure the
+18,146,400,000 BLCH (`CARRYOVER_TOTAL_BLOCH`) — the measured G3 ledger under the split, the figure the
 constants were balanced around (per-balance `split_g3_sat`, with the
 builder's stated dust rule closing the total).
 The ceremony never scales, pads, or truncates; any other total stops it.
@@ -214,7 +214,7 @@ cargo test
 
 The tests cover: the sum of allocations + bonded stake + emission is
 exactly 100,000,000,000 BLCH; the bucket values and schedules match the §1
-table (founder 10-year cliff / 40-year linear); no lock absent; slot-exact
+table (founder 2-year cliff / 8-year linear); no lock absent; slot-exact
 agreement between the carried schedules and the `tokenomics_v4` closed forms;
 the carryover digest KAT against CPython; refusal on digest mismatch,
 tampered artifacts, wrong-total artifacts, non-canonical encodings and

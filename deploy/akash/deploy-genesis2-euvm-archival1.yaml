@@ -24,7 +24,7 @@ services:
     # an @sha256 digest (flagging any that lack one, this line included)
     # is the follow-up this TODO exists for other agents to wire -- do not
     # remove this comment until that guard exists AND this line is pinned.
-    image: docker.io/blochv/bloch:0.3-genesis2-euvm
+    image: docker.io/blochv/bloch:0.3-genesis2-euvm@sha256:bc893b78c1ecb9443cd86f6b3c582d3d11d4d8a63f333bd9a9e9e94f1d6eb358
     args:
       - "--genesis2"
       - "--archive"

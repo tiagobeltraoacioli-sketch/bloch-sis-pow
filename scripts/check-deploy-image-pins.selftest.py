@@ -39,6 +39,13 @@ services:
     image: docker.io/blochv/bloch:0.1
 """
 
+LOCAL_BUILD_COMPOSE = """\
+services:
+  node1:
+    build: { context: .., dockerfile: Dockerfile }
+    image: bloch:latest  # local build only: docker build -t bloch . — never pulled from a registry
+"""
+
 PLACEHOLDER_COMPOSE = """\
 services:
   node:
@@ -105,6 +112,7 @@ def case_pinned_passes() -> str | None:
 def case_placeholder_passes() -> str | None:
     with tempfile.TemporaryDirectory() as tmp:
         write_deploy(tmp, "docker-compose.yml", PLACEHOLDER_COMPOSE)
+        write_deploy(tmp, "docker-compose.local.yml", LOCAL_BUILD_COMPOSE)
         r = run_checker(tmp)
         if r.returncode != 0:
             return "recognised placeholder was rejected:\n%s%s" % (r.stdout, r.stderr)

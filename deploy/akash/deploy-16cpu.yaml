@@ -17,7 +17,7 @@ services:
     # an @sha256 digest (flagging any that lack one, this line included)
     # is the follow-up this TODO exists for other agents to wire -- do not
     # remove this comment until that guard exists AND this line is pinned.
-    image: docker.io/blochv/bloch:0.1
+    image: docker.io/blochv/bloch:0.1@sha256:7aee5ddfb51f1f8b764abcafc31f4f355ca259fc903d8873640cd605efd19657
     args:
       - "--rpc-bind"
       - "0.0.0.0"
