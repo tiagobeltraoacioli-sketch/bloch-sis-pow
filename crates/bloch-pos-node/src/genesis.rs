@@ -1420,7 +1420,8 @@ impl Manifest {
                 commission_bps: v.commission_bps,
             })
             .collect();
-        CommittedState::genesis(
+        CommittedState::genesis_with_network_domain(
+            Sha3_256::digest(self.encode()).into(),
             anchor,
             self.genesis_mix(),
             &vals,

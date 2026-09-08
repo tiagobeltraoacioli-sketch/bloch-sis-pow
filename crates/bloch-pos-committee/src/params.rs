@@ -2017,3 +2017,28 @@ pub const DS_COHERENCE: [u8; 16] = *b"BLCH4:COHERE\0\0\0\0";
 /// a predictable subset of the epoch committee.
 pub(crate) const ROLE_SLOT: u8 = 0x01;
 pub(crate) const ROLE_EPOCH: u8 = 0x02;
+
+/// Independent flag day for funded validator admission (wire 0x0B).
+/// Deliberately unarmed pending a coordinated consensus release. This never
+/// enables the unfunded legacy Deposit/Delegate formats. No runtime override.
+pub const FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+pub fn funded_validator_admission_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if funded_admission_rehearsal::enabled() { return true; }
+    FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH != u64::MAX
+        && epoch.checked_sub(FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH).is_some()
+}
+
+#[cfg(test)]
+pub(crate) mod funded_admission_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn run<T>(f: impl FnOnce() -> T) -> T {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        let _restore = Restore(ENABLED.with(|v| v.replace(true)));
+        f()
+    }
+}

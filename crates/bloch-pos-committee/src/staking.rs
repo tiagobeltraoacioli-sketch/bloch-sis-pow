@@ -604,43 +604,28 @@ pub fn resolve_activations(
     deposits: &[QueuedDeposit],
     epoch: u64,
 ) -> Vec<([u8; 32], u64)> {
-    // R1 M5 (perf, ungated, behaviour-identical): with an empty queue the
-    // loop below does exactly `epoch + 1` iterations of nothing — no `d` ever
-    // exists to admit, so `activated` stays empty on every path regardless of
-    // `epoch`. Short-circuiting is therefore not an approximation of the
-    // rule, it IS the rule for this input, computed without the O(epoch)
-    // walk: replay at today's epoch (~2,000+) pays that walk on every one of
-    // the (several) call sites in `close_epoch` for a chain whose deposit
-    // queue is provably empty (`DEPOSIT_ACTIVATION_EPOCH` is `u64::MAX`, so
-    // nothing has ever queued a deposit — see that constant's docs).
-    if deposits.is_empty() {
-        return Vec::new();
-    }
+    // Sort once, then jump directly to each eligibility/churn boundary. This
+    // produces the same schedule as scanning every elapsed epoch, including
+    // long empty gaps, without an O(epoch * deposits) replay cost.
     let mut queue: Vec<&QueuedDeposit> = deposits.iter().collect();
-    // Sorting here is what makes the result independent of slice order.
     queue.sort_by_key(|d| d.queue_key());
-
-    let mut activated: Vec<([u8; 32], u64)> = Vec::new();
-    let mut done = vec![false; queue.len()];
-
-    for e in 0..=epoch {
-        let mut admitted_this_epoch = 0usize;
-        for (i, d) in queue.iter().enumerate() {
-            if admitted_this_epoch == MAX_ACTIVATIONS_PER_EPOCH {
-                break;
-            }
-            if done[i] || d.deposit_epoch.saturating_add(ACTIVATION_DELAY_EPOCHS) > e {
-                continue;
-            }
-            done[i] = true;
-            // Cannot overflow: the `== MAX_ACTIVATIONS_PER_EPOCH` break above
-            // means `admitted_this_epoch < MAX_ACTIVATIONS_PER_EPOCH` (4) here.
-            #[allow(clippy::arithmetic_side_effects)]
-            {
-                admitted_this_epoch += 1;
-            }
-            activated.push((d.pubkey_hash, e));
+    let mut activated = Vec::new();
+    let mut activation_epoch = 0u64;
+    let mut admitted = 0usize;
+    for deposit in queue {
+        let eligible = deposit.deposit_epoch.saturating_add(ACTIVATION_DELAY_EPOCHS);
+        if eligible > activation_epoch {
+            activation_epoch = eligible;
+            admitted = 0;
         }
+        if admitted == MAX_ACTIVATIONS_PER_EPOCH {
+            let Some(next) = activation_epoch.checked_add(1) else { break };
+            activation_epoch = next;
+            admitted = 0;
+        }
+        if activation_epoch > epoch { break; }
+        activated.push((deposit.pubkey_hash, activation_epoch));
+        admitted = admitted.saturating_add(1);
     }
     activated
 }

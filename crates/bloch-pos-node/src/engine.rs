@@ -491,6 +491,7 @@ fn tx_tip_rate(tx: &PosTransaction) -> u128 {
     match tx {
         PosTransaction::Transfer { tip_millisat_per_gas, .. }
         | PosTransaction::TransferV2 { tip_millisat_per_gas, .. } => *tip_millisat_per_gas,
+        PosTransaction::FundedDeposit(tx) => tx.tip_millisat_per_gas,
         _ => 0,
     }
 }
@@ -517,6 +518,7 @@ fn tx_source_hash(tx: &PosTransaction) -> Option<[u8; 32]> {
             let pk = &keys.get(key_index)?.pubkey;
             Some(Sha3_256::digest(pk).into())
         }
+        PosTransaction::FundedDeposit(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
         _ => None,
     }
 }
@@ -1635,12 +1637,10 @@ impl Engine {
     /// reaches — the caller hands in the keys it has already resolved, so
     /// there is no key-less state for this function to be in.
     fn randao_positioned(&self, keys: &Keystore) -> RandaoChain {
-        let mine = self.chain.iter().skip(1).filter(|(_, id)| {
-            self.blocks
-                .get(id.as_bytes())
-                .is_some_and(|e| e.header.proposer_index == keys.index)
-        });
-        let count = mine.count();
+        // Resolve the key on this branch and use the committed reveal count.
+        // A reorganization may assign an auto-index key a different index.
+        let count = self.state.validator_index_by_pubkey(&keys.pubkey)
+            .and_then(|index| self.state.validator_reveals_used(index)).unwrap_or(0);
         let mut chain = RandaoChain::generate(keys.randao_seed);
         for _ in 0..count {
             chain.next_reveal();
@@ -1671,6 +1671,9 @@ impl Engine {
     /// nothing beside the hybrid signature it guards.
     fn duty_index(&self, rolled: &CommittedState) -> Option<u32> {
         let keys = self.keys.as_ref()?;
+        if keys.index == crate::keys::AUTO_VALIDATOR_INDEX {
+            return rolled.validator_index_by_pubkey(&keys.pubkey);
+        }
         let rec = rolled.validator_record(keys.index)?;
         (rec.pubkey == keys.pubkey).then_some(keys.index)
     }
@@ -1701,7 +1704,7 @@ impl Engine {
     /// deadline is defined in this node's wall-clock terms and a message's
     /// own `slot` field is attacker-influenced input on the gossip path.
     fn note_possible_doppelganger(&mut self, index: u32) {
-        let Some(my_index) = self.keys.as_ref().map(|k| k.index) else { return };
+        let Some(my_index) = self.duty_index(&self.state) else { return };
         if index != my_index || self.doppelganger_halted {
             return;
         }
@@ -2436,7 +2439,7 @@ impl Engine {
         let grew_registry = body_transactions(&env)
             .map(|txs| {
                 txs.iter()
-                    .any(|tx| matches!(tx, PosTransaction::Deposit { .. }))
+                    .any(|tx| matches!(tx, PosTransaction::Deposit { .. } | PosTransaction::FundedDeposit(_)))
             })
             .unwrap_or(false);
         // Read before `env` moves — R6 HIGH-8: an authenticated (this door's
@@ -2757,6 +2760,7 @@ impl Engine {
             PosTransaction::TransferV2 { inputs, .. } => {
                 Some(inputs.iter().map(|i| (i.txid, i.vout)).collect())
             }
+            PosTransaction::FundedDeposit(tx) => Some(tx.inputs.iter().map(|i| (i.txid, i.vout)).collect()),
             _ => None,
         }
     }
@@ -3085,6 +3089,11 @@ impl Engine {
         // the TransferV2 arm of `admissible` itself, next to the gate it
         // feeds. Gossip (`NetEvent::Transaction`) and RPC both land in this
         // one call, so one call site carries the whole decision.
+        if let PosTransaction::FundedDeposit(deposit) = &tx {
+            if self.state.admission_network_domain() != Some(deposit.network_domain) {
+                return Err(Refusal::Invalid("funded deposit belongs to a different genesis manifest"));
+            }
+        }
         admissible(&tx, epoch_of(self.wall_slot())).map_err(Refusal::Invalid)?;
         // R7 M6: only now, with the incoming transaction confirmed
         // admissible, actually commit the eviction decided above.
@@ -3165,6 +3174,7 @@ impl Engine {
             let declared = match tx {
                 PosTransaction::Transfer { tx_bytes, .. }
                 | PosTransaction::TransferV2 { tx_bytes, .. } => *tx_bytes,
+                PosTransaction::FundedDeposit(tx) => tx.tx_bytes,
                 _ => 0,
             };
             let n = (encoded.len() as u64).max(declared);
@@ -4059,6 +4069,12 @@ impl Engine {
                 Ok(self.block_reply(&env))
             }
 
+            RpcRequest::ValidatorByKey(hash) => {
+                let index = self.state.validator_index_by_hash(&hash).ok_or_else(||
+                    RpcError::new(rpc::VALIDATOR_NOT_FOUND, "validator public-key hash is not registered"))?;
+                self.serve_rpc(RpcRequest::Validator(index))
+            }
+            RpcRequest::ValidatorAdmission => Ok(rpc::validator_admission_json(&self.state)),
             RpcRequest::Validator(index) => {
                 let rec = self.state.validator_record(index).ok_or_else(|| {
                     RpcError::new(
@@ -4373,6 +4389,22 @@ pub(crate) fn check_registry_identity(
 
 /// Start the devnet TCP mesh. Called by the `Devnet` and `Dual` arms of
 /// [`run`] with identical arguments.
+fn check_joining_registry_identity(
+    state: &CommittedState, index: u32, pubkey: &[u8], randao_seed: [u8; 32],
+) -> RegistryIdentity {
+    let Some(rec) = state.validator_record(index) else { return RegistryIdentity::PendingActivation };
+    if rec.pubkey != pubkey { return RegistryIdentity::WrongValidator; }
+    let mut chain = RandaoChain::generate(randao_seed);
+    let mut commitment = chain.commitment();
+    for _ in 0..state.validator_reveals_used(index).unwrap_or(0) {
+        let Some(reveal) = chain.next_reveal() else { return RegistryIdentity::RandaoMismatch };
+        commitment = reveal;
+    }
+    if commitment != rec.randao_commitment { return RegistryIdentity::RandaoMismatch; }
+    if rec.activation_epoch > epoch_of(state.slot()) { return RegistryIdentity::PendingActivation; }
+    RegistryIdentity::Active
+}
+
 fn start_devnet(
     cfg: &Config,
     tx: mpsc::Sender<EngineEvent>,
@@ -4885,18 +4917,20 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // the duty path (`Engine::duty_index`) re-checks the key each slot, so
     // the node arms itself the moment the registry says it may.
     if let Some(keys) = engine.keys.as_ref() {
-        match check_registry_identity(
-            &*engine.state,
-            keys.index,
-            &keys.pubkey,
-            keys.randao_seed,
-        ) {
+        let registered_index = if keys.index == crate::keys::AUTO_VALIDATOR_INDEX {
+            engine.state.validator_index_by_pubkey(&keys.pubkey)
+        } else { Some(keys.index) };
+        let identity = match registered_index {
+            Some(index) => check_joining_registry_identity(&engine.state, index, &keys.pubkey, keys.randao_seed),
+            None => RegistryIdentity::PendingActivation,
+        };
+        match identity {
             RegistryIdentity::Active => {
                 crate::metrics::NodeMetrics::set(&crate::metrics::NODE.validator_active, 1);
                 println!(
                     "validator {} is registered and its key matches the committed \
                      registry at head slot {}",
-                    keys.index,
+                    registered_index.unwrap_or(keys.index),
                     engine.state.slot()
                 );
             }
@@ -4908,9 +4942,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
                     &crate::metrics::NODE.validator_not_started_total,
                 );
                 println!(
-                    "validator {} is NOT in the committed registry at head slot {} — \
-                     pending activation. This node follows the chain and signs nothing \
-                     until its deposit is applied; no restart is needed when it is.",
+                    "validator key (local index hint {}) is unregistered or queued at head slot {}. \
+                     This node follows the chain and waits for registration and activation; \
+                     no restart is needed.",
                     keys.index,
                     engine.state.slot()
                 );
@@ -5494,6 +5528,15 @@ fn declared_size_bound(tx: &PosTransaction, declared: u64) -> Result<(), &'stati
 
 pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'static str> {
     match tx {
+        PosTransaction::FundedDeposit(deposit) => {
+            if !bloch_pos_committee::params::funded_validator_admission_active(wall_epoch) {
+                return Err("funded validator admission is not active: FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH is unarmed or not reached");
+            }
+            if wall_epoch > deposit.valid_until_epoch { return Err("funded deposit has expired"); }
+            deposit.verify_authorizations(&HybridVerifier::new())
+                .map_err(|_| "invalid funded deposit shape or hybrid PQ authorization")
+        }
+
         // Staking messages are refused outright until bonding is funded from
         // the eUTXO set.
         //
@@ -11361,3 +11404,7 @@ mod finality_latch_tests {
         assert_eq!(engine.finality_rewinds_refused, 1);
     }
 }
+
+#[cfg(test)]
+#[path = "engine/validator_admission_tests.rs"]
+mod validator_admission_tests;

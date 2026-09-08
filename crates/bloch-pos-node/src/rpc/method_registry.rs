@@ -86,6 +86,8 @@ fn frozen_method_space(req: &RpcRequest) -> &'static str {
         RpcRequest::BlockById(_) => "getblockbyid",
         RpcRequest::Validator(_) => "getvalidator",
         RpcRequest::ValidatorCount => "getvalidatorcount",
+        RpcRequest::ValidatorByKey(_) => "getvalidatorbykey",
+        RpcRequest::ValidatorAdmission => "getvalidatoradmission",
         RpcRequest::Balance(_) => "getbalance",
         RpcRequest::Utxos { .. } => "getutxos",
         RpcRequest::TxOut { .. } => "gettxout",
@@ -153,6 +155,8 @@ fn every_frozen_variant_routes_under_its_registered_name() {
         ("getblockbyslot", "[7]"),
         ("getvalidator", "[3]"),
         ("getvalidatorcount", "[]"),
+        ("getvalidatorbykey", "[\"0000000000000000000000000000000000000000000000000000000000000000\"]"),
+        ("getvalidatoradmission", "[]"),
         ("getmempoolinfo", "[]"),
         ("getvalidators", "[]"),
     ];
