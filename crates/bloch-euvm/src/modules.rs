@@ -8,7 +8,7 @@
 //! validator — a concrete `Vec<Op>` program with a stable `validator_hash` that guards
 //! the token's outputs.
 //!
-//! This is the historical per-module compiler API. The executable v2 native-token
+//! This is the historical per-module compiler API. The executable v3 native-token
 //! lifecycle is [`crate::ustav`], which resolves registered policies, supplies their
 //! contexts and uses subject-bound SMT proofs instead of the legacy KYC commitment.
 //!
@@ -17,7 +17,7 @@
 //! - [`ModuleKind`] — the six first-class module kinds, each with a small typed config:
 //!   * [`ModuleKind::Supply`]         → a **minting-policy** program (fixed cap +
 //!     authorized issuer). Its hash identifies the raw minting program; charter
-//!     policy IDs and v2 registration IDs are separate namespaces.
+//!     policy IDs and v3 registration IDs are separate namespaces.
 //!   * [`ModuleKind::TransferPolicy`] → a **spend validator** asserting an allow-gate
 //!     (a freeze switch guarded by a transfer authority).
 //!   * [`ModuleKind::ComplianceKycGate`] → a validator requiring a **membership

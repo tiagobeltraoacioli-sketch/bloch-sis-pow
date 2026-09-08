@@ -1,14 +1,13 @@
-//! Bloch cryptographic host for the Ustav v2 reference transition kernel.
+//! PQ-only cryptographic host for the Ustav v3 reference transition kernel.
 //!
 //! No permissive crypto defaults and no node activation. Only suite 0x0001
-//! (ML-DSA-65 AND Falcon-1024) is admitted. Custody uses compressed secp256k1
-//! public keys and compact, low-S ECDSA signatures over the 32-byte signing hash.
-//! This does not validate a Bitcoin deposit or constitute a BTC bridge.
+//! (ML-DSA-65 AND Falcon-1024) is admitted. Native custody uses PQ Governance
+//! quorums. Classical wallet compatibility belongs to the separate bloch-l2-evm
+//! repository; it supplies no native L1 Verifier implementation.
+#![forbid(unsafe_code)]
 pub use bloch_euvm::ustav::*;
 
 use bloch_crypto::crypto;
-use bloch_euvm::SigVerifier;
-use k256::ecdsa::{signature::hazmat::PrehashVerifier, Signature, VerifyingKey};
 
 /// Concrete verifier; signature generation remains in bloch-crypto / the wallet.
 #[derive(Clone, Copy, Debug, Default)]
@@ -45,32 +44,12 @@ impl Verifier for BlochVerifier {
         })
     }
 
-    fn valid_ecdsa_key(&self, key: &[u8]) -> bool {
-        key.len() == 33 && matches!(key[0], 2 | 3) && VerifyingKey::from_sec1_bytes(key).is_ok()
-    }
-}
-
-impl SigVerifier for BlochVerifier {
-    fn verify(&self, message: &[u8], key: &[u8], signature: &[u8]) -> bool {
+    fn verify_pq(&self, message: &[u8], key: &[u8], signature: &[u8]) -> bool {
         message.len() == 32
             && signature.len() <= MAX_SIGNATURE_BYTES
             && self.valid_pq_key(key)
             && crypto::split_envelope(signature)
                 .is_some_and(|(suite, _)| suite == crypto::SUITE_MLDSA65_FALCON1024)
             && crypto::verify(key, message, signature)
-    }
-
-    fn verify_ecdsa(&self, message: &[u8], key: &[u8], signature: &[u8]) -> bool {
-        if message.len() != 32 || signature.len() != 64 || !self.valid_ecdsa_key(key) {
-            return false;
-        }
-        let Ok(key) = VerifyingKey::from_sec1_bytes(key) else {
-            return false;
-        };
-        let Ok(signature) = Signature::from_slice(signature) else {
-            return false;
-        };
-        // Canonical signatures: accepting both s and -s admits a second encoding.
-        signature.normalize_s().is_none() && key.verify_prehash(message, &signature).is_ok()
     }
 }

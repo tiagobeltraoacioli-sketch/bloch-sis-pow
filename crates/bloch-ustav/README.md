@@ -1,13 +1,23 @@
-# Ustav v2 reference kernel
+# Ustav v3: PQ-only native authorization
 
 `bloch-ustav` connects the sealed native-token ledger in `bloch-euvm::ustav`
-to Bloch's existing ML-DSA-65/Falcon-1024 verifier and secp256k1 custody checks.
+to Bloch's existing ML-DSA-65/Falcon-1024 verifier. Every native authorization
+requires both PQ signatures. Native custody uses PQ Governance quorums.
+The host interface has no ECDSA callback, and the native crate has no k256 dependency.
 Registration, minting, transfers, burns and policy updates are executable locally.
 This crate is a workspace member; it is not a dependency of the live Genesis-4 node.
+
+ECDSA wallet compatibility belongs to the separate
+[bloch-l2-evm](https://github.com/tiagobeltraoacioli-sketch/bloch-l2-evm) repository.
+MetaMask/EVM accounts on L2 have classical security; using L2 does not make those
+keys post-quantum. Historical EUVM classical scripts cannot enter this ledger.
+Version 2 snapshots and classical Custody charters are rejected, without an
+automatic conversion that could remove a required co-signer.
 
 ```sh
 cargo +1.94.1 test --locked -p bloch-euvm -p bloch-ustav
 cargo +1.94.1 run --locked -p bloch-ustav --example lifecycle
+python3 scripts/check-ustav-pq-boundary.py cargo +1.94.1
 ```
 
 The example uses fresh ephemeral keys and demonstrates supply conservation,

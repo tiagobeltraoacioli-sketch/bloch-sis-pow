@@ -1,6 +1,27 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 
-# ADR-040 — EVM at L1 with no L2, and Ustav at L1
+# ADR-040 — Native PQ authorization at L1; ECDSA wallet compatibility at L2
+
+## Amendment — 2026-09-08
+
+The user explicitly selected ECDSA compatibility in `bloch-l2-evm`, with a path
+for MetaMask and other EVM wallets, while retaining PQ native authorization at L1.
+This resolves the authorization choice below and supersedes the earlier direction
+to sunset the L2. The August text is retained as historical context.
+
+- Native L1 Ustav authorization requires ML-DSA-65 AND Falcon-1024. Custody uses
+  PQ Governance quorums. Classical signatures cannot replace a native signature.
+- Standard Ethereum EOA signatures and wallet compatibility belong to L2. Its
+  ECDSA accounts have classical security, which the network integration must state.
+- A separate SDK/Snap may connect an application to L1 only by obtaining a valid
+  PQ signature; wrapping ECDSA in an adapter does not satisfy that requirement.
+- L1 kernel v3 rejects classical Custody charters and v2 snapshots. The reference
+  kernel remains unactivated; consensus, persistence, bridging and node/RPC work
+  retain their own integration requirements.
+
+See `crates/bloch-euvm/docs/ustav-kernel.md` and the L2 wallet compatibility design.
+
+## Historical direction — 2026-08-11
 
 - **Status:** Accepted in direction (founder decision, 2026-08-11) —
   **design and consequences under development**; the execution vehicle is

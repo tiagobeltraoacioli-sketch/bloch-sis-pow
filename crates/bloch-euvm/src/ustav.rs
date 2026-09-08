@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 mod encoding;
 use encoding::HashWriter;
 
-pub const KERNEL_VERSION: u32 = 2;
+pub const KERNEL_VERSION: u32 = 3;
 pub const MAX_INPUTS: usize = 128;
 pub const MAX_OUTPUTS: usize = 128;
 pub const MAX_WITNESS_BYTES: usize = 1024 * 1024;
@@ -28,11 +28,21 @@ pub const MAX_LEDGER_TOKENS: usize = 1024;
 pub const MAX_LEDGER_OUTPUTS: usize = 65_536;
 const SIGNATURE_GAS: u64 = 1000;
 
-/// Required key admission as well as signature verification. There is deliberately
-/// no permissive default. `bloch-ustav` supplies the concrete Bloch hybrid adapter.
-pub trait Verifier: SigVerifier {
+/// Native authorization is PQ-only. This interface deliberately has no ECDSA
+/// callback and does not inherit the historical VM's `SigVerifier` interface.
+/// `bloch-ustav` supplies the concrete ML-DSA-65 AND Falcon-1024 implementation.
+pub trait Verifier {
     fn valid_pq_key(&self, key: &[u8]) -> bool;
-    fn valid_ecdsa_key(&self, key: &[u8]) -> bool;
+    fn verify_pq(&self, message: &[u8], key: &[u8], signature: &[u8]) -> bool;
+}
+
+// The historical VM also supports classical scripts. Native execution can only
+// reach this private adapter: VerifyEcdsa retains SigVerifier's rejecting default.
+struct NativeVmVerifier<'a>(&'a dyn Verifier);
+impl SigVerifier for NativeVmVerifier<'_> {
+    fn verify(&self, message: &[u8], key: &[u8], signature: &[u8]) -> bool {
+        self.0.verify_pq(message, key, signature)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,6 +50,7 @@ pub enum Error {
     Audit(AuditReport),
     ResourceLimit(&'static str),
     InvalidCharter(&'static str),
+    ClassicalPolicyNotAllowed,
     InvalidKey,
     InvalidSignature,
     AlreadyRegistered,
@@ -82,7 +93,7 @@ impl Registration {
         }
         Ok(encoding::registration_hash(domain, self))
     }
-    /// The only native identity used by this v2 ledger. It binds the domain, full
+    /// The only native identity used by this v3 ledger. It binds the domain, full
     /// charter, nonce, kernel version and audit ruleset version. The initial root
     /// is bound by the registration signature, not identity: KYC leaf keys use
     /// the asset ID, so including that root here would create a circular hash.
@@ -343,7 +354,7 @@ impl Ledger {
         }
         let message = token.registration.signing_hash(&self.domain)?;
         charge(&mut gas, SIGNATURE_GAS)?;
-        if !verifier.verify(&message, issuer(&token), signature) {
+        if !verifier.verify_pq(&message, issuer(&token), signature) {
             return Err(Error::InvalidSignature);
         }
         self.tokens.insert(asset, token);
@@ -388,7 +399,7 @@ impl Ledger {
                 .checked_add(i128::from(input.output.amount))
                 .ok_or(Error::ArithmeticOverflow)?;
             charge(&mut gas, SIGNATURE_GAS)?;
-            if !verifier.verify(&message, &input.output.owner, signature) {
+            if !verifier.verify_pq(&message, &input.output.owner, signature) {
                 return Err(Error::InvalidSignature);
             }
             subjects.insert(eligibility_key(
@@ -480,8 +491,8 @@ impl Ledger {
         })
     }
 
-    /// Policy updates require the transfer authority AND any declared Governance
-    /// and Custody gates. They never replace charter bytes, keys or the supply cap.
+    /// Policy updates require the transfer authority AND any declared PQ Governance
+    /// quorum. They never replace charter bytes, keys or the supply cap.
     pub fn update_policy(
         &mut self,
         update: &PolicyUpdate,
@@ -634,7 +645,7 @@ impl Ledger {
     /// should implement an equivalent incremental store and meter persistence.
     pub fn state_root(&self) -> [u8; 32] {
         let mut tree = SparseMerkleTree::new();
-        let mut config = HashWriter::new(b"USTAV-LEDGER-v2");
+        let mut config = HashWriter::new(b"USTAV-LEDGER-v3");
         config.fixed(&self.domain);
         config.u32(KERNEL_VERSION);
         config.u32(RULESET_VERSION);
@@ -642,7 +653,7 @@ impl Ledger {
         for (asset, token) in &self.tokens {
             let mut key = vec![1];
             key.extend_from_slice(asset);
-            let mut value = HashWriter::new(b"USTAV-TOKEN-STATE-v2");
+            let mut value = HashWriter::new(b"USTAV-TOKEN-STATE-v3");
             // Commit initial authorization state as well as the emitted artifact.
             value.fixed(&encoding::registration_hash(
                 &self.domain,
@@ -660,7 +671,7 @@ impl Ledger {
             let mut key = vec![2];
             key.extend_from_slice(&id.transaction);
             key.extend_from_slice(&id.index.to_le_bytes());
-            let mut value = HashWriter::new(b"USTAV-OUTPUT-v2");
+            let mut value = HashWriter::new(b"USTAV-OUTPUT-v3");
             value.fixed(&output.asset);
             value.bytes(&output.output.owner);
             value.u64(output.output.amount);
@@ -677,12 +688,17 @@ fn validate_registration(
     if let Some((_, reason)) = limits::resource_error(&registration.charter) {
         return Err(Error::ResourceLimit(reason));
     }
-    // Kernel v2 has one module of each kind, an issuance policy, and a named token.
+    // Kernel v3 has one module of each kind, an issuance policy, and a named token.
     if registration.charter.token_name.is_empty() {
         return Err(Error::InvalidCharter("empty token name"));
     }
     let mut tags = BTreeSet::new();
     for module in &registration.charter.modules {
+        // A caller cannot re-enable classical custody by supplying a different
+        // verifier or restoring a snapshot. PQ custody is expressed by Governance.
+        if matches!(module, ModuleKind::Custody(_)) {
+            return Err(Error::ClassicalPolicyNotAllowed);
+        }
         if !tags.insert(module.tag()) {
             return Err(Error::InvalidCharter("duplicate module"));
         }
@@ -692,12 +708,10 @@ fn validate_registration(
             ));
         }
         limits::visit_keys(module, |ecdsa, key| {
-            let valid = if ecdsa {
-                verifier.valid_ecdsa_key(key)
-            } else {
-                verifier.valid_pq_key(key)
-            };
-            if valid {
+            if ecdsa {
+                return Err(Error::ClassicalPolicyNotAllowed);
+            }
+            if verifier.valid_pq_key(key) {
                 Ok(())
             } else {
                 Err(Error::InvalidKey)
@@ -717,6 +731,14 @@ fn validate_registration(
     }
     let (compiled, audit) =
         compile_charter_with_report(&registration.charter).map_err(Error::Audit)?;
+    if compiled.validators.iter().any(|module| {
+        module
+            .program
+            .iter()
+            .any(|op| matches!(op, crate::Op::VerifyEcdsa))
+    }) {
+        return Err(Error::ClassicalPolicyNotAllowed);
+    }
     Ok(Token {
         kyc_root: registration.initial_kyc_root,
         registration,
@@ -796,6 +818,7 @@ fn run_modules(
         .enumerate()
     {
         let applicable = match module {
+            ModuleKind::Custody(_) => return Err(Error::ClassicalPolicyNotAllowed),
             ModuleKind::Supply(_) => delta != 0 && !admin,
             ModuleKind::ComplianceKycGate(_) => false, // authenticated SMT check below
             ModuleKind::Vesting(_) => spends && !admin,
@@ -809,7 +832,6 @@ fn run_modules(
         }
         let arity = match module {
             ModuleKind::Governance(c) => c.signers.len(),
-            ModuleKind::Custody(_) => 2,
             _ => 1,
         };
         if redeemer.len() != arity {
@@ -833,7 +855,13 @@ fn run_modules(
             initial.push(Val::Int(i128::from(token.frozen || admin)));
         }
         initial.extend_from_slice(redeemer);
-        match crate::run(&compiled.program, initial, &ctx, verifier, gas) {
+        match crate::run(
+            &compiled.program,
+            initial,
+            &ctx,
+            &NativeVmVerifier(verifier),
+            gas,
+        ) {
             Ok(true) => {}
             Ok(false) => return Err(Error::ModuleRejected(index)),
             Err(VmError::OutOfGas) => return Err(Error::OutOfGas),
@@ -846,7 +874,7 @@ fn run_modules(
 /// Public KYC leaf key. Registration nonce and network are transitively bound by
 /// the asset; domain is explicit too. Values are valid-until heights in u64 LE.
 pub fn eligibility_key(domain: &[u8; 32], asset: &AssetId, owner: &[u8]) -> [u8; 32] {
-    let mut h = HashWriter::new(b"USTAV-ELIGIBILITY-v2");
+    let mut h = HashWriter::new(b"USTAV-ELIGIBILITY-v3");
     h.fixed(domain);
     h.fixed(asset);
     h.bytes(owner);
@@ -886,4 +914,38 @@ fn check_eligibility(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod native_vm_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_ecdsa_opcode_cannot_reach_native_pq_callback() {
+        struct PqOnly;
+        impl Verifier for PqOnly {
+            fn valid_pq_key(&self, _: &[u8]) -> bool {
+                true
+            }
+            fn verify_pq(&self, _: &[u8], _: &[u8], _: &[u8]) -> bool {
+                panic!("ECDSA must not dispatch to PQ")
+            }
+        }
+        let mut gas = 100_000;
+        let values = vec![
+            Val::Bytes(vec![1; 32]),
+            Val::Bytes(vec![2; 33]),
+            Val::Bytes(vec![3; 64]),
+        ];
+        assert_eq!(
+            crate::run(
+                &[crate::Op::VerifyEcdsa],
+                values,
+                &Ctx::default(),
+                &NativeVmVerifier(&PqOnly),
+                &mut gas
+            ),
+            Ok(false)
+        );
+    }
 }

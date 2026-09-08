@@ -1,8 +1,7 @@
 use bloch_crypto::crypto;
 use bloch_euvm::modules::*;
-use bloch_euvm::{SigVerifier, Val};
+use bloch_euvm::Val;
 use bloch_ustav::*;
-use k256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey};
 use std::sync::OnceLock;
 
 const DOMAIN: [u8; 32] = [31; 32];
@@ -102,7 +101,7 @@ fn malformed_keys_suites_and_each_tampered_signature_leg_fail() {
     let message = [22; 32];
     let sig = signed(&message);
     assert!(verifier.valid_pq_key(pk));
-    assert!(verifier.verify(&message, pk, &sig));
+    assert!(verifier.verify_pq(&message, pk, &sig));
     for len in [0, 1, 4, 1952, pk.len() - 1, pk.len() + 1] {
         assert!(!verifier.valid_pq_key(&vec![0; len]));
     }
@@ -123,28 +122,25 @@ fn malformed_keys_suites_and_each_tampered_signature_leg_fail() {
     ] {
         let mut bad = sig.clone();
         bad[offset] ^= 1;
-        assert!(!verifier.verify(&message, pk, &bad));
+        assert!(!verifier.verify_pq(&message, pk, &bad));
     }
     let mut bad = sig.clone();
     bad[2] = 2;
-    assert!(!verifier.verify(&message, pk, &bad));
-    assert!(!verifier.verify(&[23; 32], pk, &sig));
-    assert!(!verifier.verify(b"short", pk, &sig));
+    assert!(!verifier.verify_pq(&message, pk, &bad));
+    assert!(!verifier.verify_pq(&[23; 32], pk, &sig));
+    assert!(!verifier.verify_pq(b"short", pk, &sig));
 }
 
 #[test]
-fn custody_requires_both_real_ecdsa_and_pq_signatures() {
-    let ecdsa = SigningKey::from_bytes((&[3; 32]).into()).unwrap();
-    let pk = ecdsa
-        .verifying_key()
-        .to_encoded_point(true)
-        .as_bytes()
-        .to_vec();
+fn native_custody_requires_two_real_pq_custodians_plus_owner() {
+    let custodian = crypto::generate_keypair_from_seed(&[18; 32]).unwrap();
     let mut r = registration();
-    r.charter.modules.push(ModuleKind::Custody(CustodyConfig {
-        btc_pubkey: pk,
-        pq_pubkey: keys().0.clone(),
-    }));
+    r.charter
+        .modules
+        .push(ModuleKind::Governance(GovernanceConfig {
+            threshold: 2,
+            signers: vec![keys().0.clone(), custodian.0.clone()],
+        }));
     let mut ledger = Ledger::new(DOMAIN);
     let asset = ledger
         .register(
@@ -164,43 +160,85 @@ fn custody_requires_both_real_ecdsa_and_pq_signatures() {
         delta: 10,
         mint_nonce: 0,
         policy_revision: 0,
-        valid_until: 10,
+        valid_until: 100,
     };
     let message = tx.signing_hash(&DOMAIN).unwrap();
-    let pq = signed(&message);
-    let ec: Signature = ecdsa.sign_prehash(&message).unwrap();
+    let first = signed(&message);
+    let second = crypto::sign(&custodian.1, &message).unwrap();
     let w = Witnesses {
         modules: vec![
-            vec![Val::Bytes(pq.clone())],
-            vec![Val::Bytes(ec.to_bytes().to_vec()), Val::Bytes(pq)],
+            vec![Val::Bytes(first.clone())],
+            vec![Val::Bytes(first), Val::Bytes(second)],
         ],
         ..Witnesses::default()
     };
     for slot in [0, 1] {
-        let mut bad = w.clone();
-        bad.modules[1][slot] = Val::Bytes(vec![]);
+        let mut missing = w.clone();
+        missing.modules[1][slot] = Val::Bytes(vec![]);
         let before = ledger.snapshot();
-        assert!(ledger.apply(&tx, &bad, 1, &BlochVerifier, GAS).is_err());
+        assert!(ledger.apply(&tx, &missing, 1, &BlochVerifier, GAS).is_err());
         assert_eq!(ledger.snapshot(), before);
     }
-    ledger.apply(&tx, &w, 1, &BlochVerifier, GAS).unwrap();
+    let minted = ledger.apply(&tx, &w, 1, &BlochVerifier, GAS).unwrap();
+    let transfer = Transaction {
+        inputs: minted.outputs,
+        delta: 0,
+        ..tx
+    };
+    let message = transfer.signing_hash(&DOMAIN).unwrap();
+    let w = Witnesses {
+        owners: vec![signed(&message)],
+        modules: vec![
+            vec![],
+            vec![
+                Val::Bytes(signed(&message)),
+                Val::Bytes(crypto::sign(&custodian.1, &message).unwrap()),
+            ],
+        ],
+        ..Witnesses::default()
+    };
+    let mut missing_owner = w.clone();
+    missing_owner.owners[0].clear();
+    assert_eq!(
+        ledger.apply(&transfer, &missing_owner, 1, &BlochVerifier, GAS),
+        Err(Error::InvalidSignature)
+    );
+    ledger.apply(&transfer, &w, 1, &BlochVerifier, GAS).unwrap();
+    assert_eq!(ledger.supply(&asset), Some(10));
 }
 
 #[test]
-fn ecdsa_rejects_high_s_uncompressed_keys_and_wrong_messages() {
-    let ecdsa = SigningKey::from_bytes((&[5; 32]).into()).unwrap();
-    let message = [6; 32];
-    let pk = ecdsa.verifying_key().to_encoded_point(true);
-    let sig: Signature = ecdsa.sign_prehash(&message).unwrap();
-    assert!(BlochVerifier.verify_ecdsa(&message, pk.as_bytes(), &sig.to_bytes()));
-    assert!(!BlochVerifier.verify_ecdsa(&[7; 32], pk.as_bytes(), &sig.to_bytes()));
-    assert!(
-        !BlochVerifier.valid_ecdsa_key(ecdsa.verifying_key().to_encoded_point(false).as_bytes())
+fn classical_shaped_owner_key_is_not_native_authorization() {
+    let mut ledger = Ledger::new(DOMAIN);
+    let r = registration();
+    let asset = ledger
+        .register(
+            r.clone(),
+            &signed(&r.signing_hash(&DOMAIN).unwrap()),
+            &BlochVerifier,
+            GAS,
+        )
+        .unwrap();
+    let tx = Transaction {
+        asset,
+        inputs: vec![],
+        outputs: vec![Output {
+            owner: vec![2; 33],
+            amount: 10,
+        }],
+        delta: 10,
+        mint_nonce: 0,
+        policy_revision: 0,
+        valid_until: 100,
+    };
+    let w = Witnesses {
+        modules: vec![vec![Val::Bytes(signed(&tx.signing_hash(&DOMAIN).unwrap()))]],
+        ..Witnesses::default()
+    };
+    let before = ledger.snapshot();
+    assert_eq!(
+        ledger.apply(&tx, &w, 1, &BlochVerifier, GAS),
+        Err(Error::InvalidKey)
     );
-    let mut invalid = [0xff; 33];
-    invalid[0] = 2;
-    assert!(!BlochVerifier.valid_ecdsa_key(&invalid));
-    let high = Signature::from_scalars(sig.r().to_bytes(), (-sig.s()).to_bytes()).unwrap();
-    assert!(high.normalize_s().is_some());
-    assert!(!BlochVerifier.verify_ecdsa(&message, pk.as_bytes(), &high.to_bytes()));
+    assert_eq!(ledger.snapshot(), before);
 }
