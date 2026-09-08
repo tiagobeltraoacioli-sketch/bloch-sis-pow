@@ -404,10 +404,10 @@ expect_refusal "a FORGED signer-set whose adopted_epoch saturates" "saturates" -
 # (r) ONE KEY IN TWO SLOTS — the arrangement that is a 1-of-3 wearing a
 #     2-of-3's clothes. `verify_envelope` counts distinct INDICES, not
 #     distinct KEYS, so its holder signs once, lists the identical signature
-#     at both indices, and every counting rule passes. The consensus rule
-#     that closes it ships INERT (ws::WS_DISTINCT_KEYS_ENFORCED_FROM_EPOCH =
-#     u64::MAX); what refuses it today is the tooling, at the point where an
-#     arrangement is born.
+#     at both indices, and every counting rule passes. No consensus-side
+#     distinct-keys rule exists (`verify_envelope` is frozen); what refuses it
+#     is the tooling where an arrangement is born (`ws-signer-set`) and every
+#     node's decoder (`ws_boot::decode_signer_set_file`) when one is loaded.
 expect_refusal "an arrangement seating ONE key in TWO slots" "SAME public key" -- \
   "$BIN" ws-signer-set --id 1 --threshold 2 --min-external 1 \
     --adopted-epoch 0 --current-epoch 1771 \

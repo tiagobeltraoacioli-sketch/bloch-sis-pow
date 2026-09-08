@@ -25,9 +25,10 @@ rules) and `ws_boot.rs` (file framings) are normative; the spec is
 - `signer-set-<id>.bin` — the signer arrangement `--ws-signer-set` takes.
   **Exists only after the signer keys exist** (see the ceremony below).
   Publish its SHA3-256 fingerprint the way you publish the ws digest: this
-  file carries the quorum RULE, not just the keys, and every node enforces
-  the `threshold` and `min_external` *it* states. Nothing on the acceptance
-  path compares them against §6, so an attacker who can substitute this file
+  file carries the quorum RULE, not just the keys. A node now refuses at
+  boot any arrangement whose shape is not §6's (the NEW-2 shape gate), but
+  within a conforming shape it trusts the KEYS this file lists — so an
+  attacker who can substitute a same-shaped file with different keys still
   does not need to forge a signature. See `docs/CHECKPOINT-RUNBOOK.md` §2.
 
 **One-way door:** the first artifact published for an epoch is the only one

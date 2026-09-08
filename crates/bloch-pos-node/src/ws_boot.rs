@@ -187,7 +187,8 @@ pub fn decode_envelope_file(bytes: &[u8]) -> Result<CheckpointEnvelope, DecodeEr
 /// checkpoint: a partial is a statement about a digest, and the coordinator
 /// must already hold the 154 bytes it refers to.
 pub fn encode_partial_file(p: &PartialSignature) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + 32 + 1 + 4 + p.signature.len());
+    // Capacity hint only: saturation costs at most a reallocation.
+    let mut out = Vec::with_capacity(p.signature.len().saturating_add(8 + 32 + 1 + 4));
     out.extend_from_slice(WS_PARTIAL_MAGIC);
     out.extend_from_slice(&p.digest);
     out.push(p.signer_index);
@@ -379,6 +380,54 @@ pub enum CombineReject {
     ExternalQuorumNotReached { got: usize, need: usize },
 }
 
+/// Which §6 phase's numbers this arrangement matches, if any.
+///
+/// The signer-set file carries the quorum RULE and reaches a node over an
+/// unauthenticated channel, so its shape is POLICY, not operator input: the
+/// only arrangements a node (or the ceremony tooling, which must refuse
+/// whatever a node would refuse) accepts are the two
+/// BLOCH-WEAK-SUBJECTIVITY.md §6 describes — Phase A 2-of-3 with one external
+/// signer, Phase B 3-of-5 with two. `None` means neither matches and the
+/// caller must fail closed.
+pub fn shape_policy_of(set: &SignerSet) -> Option<(usize, usize, usize)> {
+    if set.matches_policy(
+        ws::WS_PHASE_A_THRESHOLD,
+        ws::WS_PHASE_A_SIGNERS,
+        ws::WS_PHASE_A_MIN_EXTERNAL,
+    ) {
+        Some((ws::WS_PHASE_A_THRESHOLD, ws::WS_PHASE_A_SIGNERS, ws::WS_PHASE_A_MIN_EXTERNAL))
+    } else if set.matches_policy(
+        ws::WS_PHASE_B_THRESHOLD,
+        ws::WS_PHASE_B_SIGNERS,
+        ws::WS_PHASE_B_MIN_EXTERNAL,
+    ) {
+        Some((ws::WS_PHASE_B_THRESHOLD, ws::WS_PHASE_B_SIGNERS, ws::WS_PHASE_B_MIN_EXTERNAL))
+    } else {
+        None
+    }
+}
+
+/// The refusal text for a set `shape_policy_of` matched to neither phase —
+/// one wording for the boot gate and the ceremony tool, so an operator sees
+/// the same sentence at `ws-verify` time as a stranger's node prints at boot.
+pub fn shape_policy_refusal(set: &SignerSet, origin: &str) -> String {
+    format!(
+        "signer set {origin} REFUSED: its shape ({}-of-{}, >= {} external) is neither \
+         Phase A ({}-of-{}, >= {} external) nor Phase B ({}-of-{}, >= {} external); a \
+         weak-subjectivity root of trust with any other arrangement is not accepted by \
+         this node",
+        set.threshold,
+        set.signers.len(),
+        set.min_external,
+        ws::WS_PHASE_A_THRESHOLD,
+        ws::WS_PHASE_A_SIGNERS,
+        ws::WS_PHASE_A_MIN_EXTERNAL,
+        ws::WS_PHASE_B_THRESHOLD,
+        ws::WS_PHASE_B_SIGNERS,
+        ws::WS_PHASE_B_MIN_EXTERNAL,
+    )
+}
+
 /// The epochs an arrangement may attest: `[adopted_epoch, hard_stop()]`.
 ///
 /// The upper bound is `ws::SignerSet::hard_stop` — §6.3's dead-man's switch,
@@ -488,7 +537,9 @@ pub fn combine(
 /// because it defeats `min_external` as well as `threshold`.
 pub fn duplicate_key_slots(signers: &[Signer]) -> Option<(u8, u8)> {
     for i in 0..signers.len() {
-        for j in (i + 1)..signers.len() {
+        // `i + 1` cannot overflow (i < len), but the ratchet wants the proof
+        // in the type: saturating_add is identical on every reachable value.
+        for j in i.saturating_add(1)..signers.len() {
             if signers[i].pubkey == signers[j].pubkey {
                 return Some((i as u8, j as u8));
             }
@@ -662,31 +713,8 @@ pub fn boot(
         // naming both. (The ceremony branch shipped this as a warning; the
         // audited gate on main is a refusal, and the refusal wins — a node
         // never boots from an arrangement §6 does not describe.)
-        let (threshold, signers, min_external) = if set.matches_policy(
-            ws::WS_PHASE_A_THRESHOLD,
-            ws::WS_PHASE_A_SIGNERS,
-            ws::WS_PHASE_A_MIN_EXTERNAL,
-        ) {
-            (ws::WS_PHASE_A_THRESHOLD, ws::WS_PHASE_A_SIGNERS, ws::WS_PHASE_A_MIN_EXTERNAL)
-        } else if set.matches_policy(
-            ws::WS_PHASE_B_THRESHOLD,
-            ws::WS_PHASE_B_SIGNERS,
-            ws::WS_PHASE_B_MIN_EXTERNAL,
-        ) {
-            (ws::WS_PHASE_B_THRESHOLD, ws::WS_PHASE_B_SIGNERS, ws::WS_PHASE_B_MIN_EXTERNAL)
-        } else {
-            return Err(bad(format!(
-                "signer set {} REFUSED: its shape is neither Phase A ({}-of-{}, >= {} external) \
-                 nor Phase B ({}-of-{}, >= {} external); a weak-subjectivity root of trust with \
-                 any other arrangement is not accepted by this node",
-                set_path.display(),
-                ws::WS_PHASE_A_THRESHOLD,
-                ws::WS_PHASE_A_SIGNERS,
-                ws::WS_PHASE_A_MIN_EXTERNAL,
-                ws::WS_PHASE_B_THRESHOLD,
-                ws::WS_PHASE_B_SIGNERS,
-                ws::WS_PHASE_B_MIN_EXTERNAL,
-            )));
+        let Some((threshold, signers, min_external)) = shape_policy_of(&set) else {
+            return Err(bad(shape_policy_refusal(&set, &set_path.display().to_string())));
         };
         let ok = ws::verify_envelope_with_shape_policy(
             &env,
@@ -1651,16 +1679,27 @@ mod tests {
     #[test]
     fn boot_refuses_an_arrangement_adopted_after_the_checkpoint() {
         let dir = tmpdir("window");
-        let (pk, sk) = bloch_crypto::crypto::generate_keypair();
-        let mut pubkey = [0u8; HYBRID_PK_BYTES];
-        pubkey.copy_from_slice(&strip(&pk));
-
+        // A Phase-A-SHAPED arrangement, so the NEW-2 shape gate passes it and
+        // the refusal under test is attributable to the window and nothing
+        // else. (The original fixture was a 1-of-1; that shape is now refused
+        // earlier, by the shape gate — see
+        // `a_signer_set_outside_the_published_shapes_is_refused`.)
         let far = 10u64.pow(12);
+        let mut signers = Vec::new();
+        let mut secrets = Vec::new();
+        for external in [true, false, false] {
+            let (pk, sk) = bloch_crypto::crypto::generate_keypair();
+            let raw = strip(&pk);
+            let mut pubkey = [0u8; HYBRID_PK_BYTES];
+            pubkey.copy_from_slice(&raw);
+            signers.push(Signer { pubkey, external });
+            secrets.push(sk);
+        }
         let set = SignerSet {
             id: 9,
-            signers: vec![Signer { pubkey, external: true }],
-            threshold: 1,
-            min_external: 1,
+            signers,
+            threshold: ws::WS_PHASE_A_THRESHOLD,
+            min_external: ws::WS_PHASE_A_MIN_EXTERNAL,
             adopted_epoch: far,
         };
         // The clock does not saturate, so the decoder admits it...
@@ -1669,10 +1708,12 @@ mod tests {
 
         let mut cp = checkpoint(256);
         cp.signer_set_id = 9;
-        let env = CheckpointEnvelope {
-            checkpoint: cp,
-            signatures: vec![(0, strip(&bloch_crypto::crypto::sign(&sk, &cp.ws_digest()).unwrap()))],
-        };
+        let signatures = (0..2u8)
+            .map(|i| {
+                (i, strip(&bloch_crypto::crypto::sign(&secrets[i as usize], &cp.ws_digest()).unwrap()))
+            })
+            .collect();
+        let env = CheckpointEnvelope { checkpoint: cp, signatures };
         // ...and the frozen verifier accepts the envelope outright, because
         // `cp.epoch > hard_stop()` is false and always will be.
         ws::verify_envelope(&env, &set, NET, &GEN, &WsHybridVerifier)

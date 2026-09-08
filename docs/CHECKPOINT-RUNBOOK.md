@@ -56,15 +56,18 @@ now. `EXPIRED` means new nodes are already being turned away.
   founder-adjacent keys are deliberately not a quorum — `verify_envelope`
   returns `ExternalQuorumNotReached` for that combination.
 
-  **Read that claim precisely, because it is weaker than it sounds.** Every
-  client enforces the numbers stated in the *arrangement file it was given*,
-  not the numbers §6 states. `ws::matches_policy` is the function that compares
-  the two, and no acceptance path calls it — a fact confirmed by grep, not
-  assumed. So an arrangement file declaring `min_external = 0`, or seating one
-  key in two slots, produces a "2-of-3" that one founder-adjacent holder can
-  satisfy alone, and every client accepts it without comment. §2 below says
-  what to do about that; the short version is that the arrangement file is part
-  of the trust anchor and must be checked across channels exactly like the
+  **Read that claim precisely.** Every client enforces the numbers stated in
+  the *arrangement file it was given* — but since the NEW-2 audit round the
+  boot path also compares that file's SHAPE against §6
+  (`ws::verify_envelope_with_shape_policy` via `ws_boot::shape_policy_of`):
+  an arrangement that is not Phase A (2-of-3, ≥1 external) or Phase B
+  (3-of-5, ≥2) is **refused at boot** before any signature is checked, and
+  `ws-envelope`/`ws-verify` refuse the same shapes. What no shape check can
+  catch is one key seated in two slots (`matches_policy` counts slots, not
+  distinct keys) — that is refused where the file is decoded
+  (`ws_boot::decode_signer_set_file`) — or a *different set of keys* in a
+  perfectly §6-shaped file. So the arrangement file is still part of the
+  trust anchor and must be checked across channels exactly like the
   checkpoint.
 - The arrangement has a review clock. Twelve months after `--adopted-epoch`
   envelopes start warning; three months after that they are **refused**
@@ -145,10 +148,11 @@ ceremony that cannot say what epoch it is running at is not ready to sign.
 ### Two things this file can silently be, and neither is visible later
 
 **`signer-set-1.bin` carries the quorum RULE, not just the keys**, and it
-reaches a node over the same unauthenticated channel as the envelope. Every
-node enforces the numbers *this file states*. Nothing on the acceptance path
-compares them against §6 — `ws::matches_policy` exists and, until this work,
-was called only from tests.
+reaches a node over the same unauthenticated channel as the envelope. A node
+now refuses at boot any arrangement whose shape is not §6's Phase A or
+Phase B (`ws::verify_envelope_with_shape_policy`, the NEW-2 audit gate) — but
+within a conforming shape, it enforces the numbers and the KEYS *this file
+states*.
 
 1. **`--min-external 0`** produces a file that says "no outside witness
    required". A Foundation + Postern quorum then verifies on every client and
@@ -160,12 +164,13 @@ was called only from tests.
    rule passes. Seat the duplicate once `internal` and once `external` and the
    external minimum falls in the same stroke.
 
-`ws-signer-set` refuses to write either; `ws_boot::decode_signer_set_file` now
+`ws-signer-set` refuses to write either; `ws_boot::decode_signer_set_file`
 refuses to *load* a duplicate-key arrangement at all, which covers every node
-rather than only ceremonies run with this tool; and a node that loads an
-arrangement matching neither §6 phase now says so loudly at boot, naming
-`min_external = 0` when that is the reason. **None of that helps anyone who
-was handed a different file.** That is what the fingerprint is for.
+rather than only ceremonies run with this tool; and a node handed an
+arrangement matching neither §6 phase now **refuses to boot** (and
+`ws-envelope`/`ws-verify` refuse the same file), which retires hazard 1
+outright. **None of that helps anyone who was handed a different file with a
+conforming shape and different keys.** That is what the fingerprint is for.
 
 It prints `policy: matches the §6.1 Phase A policy (2-of-3, ≥1 external)`. If
 it prints `MATCHES NEITHER §6.1 PHASE`, stop: that is fine for a drill and

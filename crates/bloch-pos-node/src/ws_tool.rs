@@ -123,15 +123,25 @@ fn read_hex_file(path: &str) -> Result<Vec<u8>, String> {
 }
 
 fn write_file(path: &str, bytes: &[u8], secret: bool) -> Result<(), String> {
-    fs::write(path, bytes).map_err(|e| format!("cannot write {path}: {e}"))?;
     if secret {
+        // The file must never exist with wider permissions, even between two
+        // syscalls: create it 0600 from the first byte instead of chmodding
+        // after the write.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-                .map_err(|e| format!("cannot chmod {path}: {e}"))?;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .map_err(|e| format!("cannot create {path}: {e}"))?;
+            f.write_all(bytes).map_err(|e| format!("cannot write {path}: {e}"))?;
+            return Ok(());
         }
     }
+    #[cfg_attr(unix, allow(unreachable_code))]
+    fs::write(path, bytes).map_err(|e| format!("cannot write {path}: {e}"))?;
     Ok(())
 }
 
@@ -327,6 +337,9 @@ fn view_of(addr: &str, epoch: u64) -> Result<ChainView, String> {
 fn keygen(args: &[String]) -> Result<(), String> {
     let prefix = req(args, "--out")?;
     let (pk, sk) = bloch_crypto::crypto::generate_keypair();
+    // The secret exists in this process only long enough to be hex-encoded
+    // and written; both copies are wiped on every exit path.
+    let sk = zeroize::Zeroizing::new(sk);
     // Fail on a malformed key before anything touches disk.
     let raw = strip_suite(&pk, "generated pubkey")?;
     if raw.len() != HYBRID_PK_BYTES {
@@ -341,7 +354,8 @@ fn keygen(args: &[String]) -> Result<(), String> {
         return Err(format!("{sk_path} already exists; refusing to overwrite a signer key"));
     }
     write_file(&pk_path, hex(&pk).as_bytes(), false)?;
-    write_file(&sk_path, hex(&sk).as_bytes(), true)?;
+    let sk_hex = zeroize::Zeroizing::new(hex(&sk));
+    write_file(&sk_path, sk_hex.as_bytes(), true)?;
     println!("wrote {pk_path} (public — hand this to the signer-set assembler)");
     println!("wrote {sk_path} (SECRET, 0600 — never leaves this machine)");
     println!(
@@ -369,7 +383,8 @@ fn keygen(args: &[String]) -> Result<(), String> {
 /// arrangement is public, so this is a check every reader can also run.
 fn distinct_signer_keys(set: &SignerSet) -> Result<(), String> {
     for i in 0..set.signers.len() {
-        for j in (i + 1)..set.signers.len() {
+        // `i + 1` cannot overflow (i < len); saturating_add carries the proof.
+        for j in i.saturating_add(1)..set.signers.len() {
             if set.signers[i].pubkey == set.signers[j].pubkey {
                 return Err(format!(
                     "slots {i} and {j} hold the SAME public key.\n  \
@@ -708,7 +723,7 @@ fn sign(args: &[String]) -> Result<(), String> {
     let cp = decode_checkpoint(&cp_bytes).map_err(|e| format!("{cp_path}: {e}"))?;
     let digest = cp.ws_digest();
 
-    let sk = read_hex_file(&key_path)?;
+    let sk = zeroize::Zeroizing::new(read_hex_file(&key_path)?);
     let enveloped = bloch_crypto::crypto::sign(&sk, &digest)
         .map_err(|e| format!("signing failed: {e:?}"))?;
     let raw = strip_suite(&enveloped, "produced signature")?;
@@ -895,7 +910,17 @@ fn envelope(args: &[String]) -> Result<(), String> {
     })?;
 
     // THE GATE. Not a re-implementation of the acceptance rules — the rules.
-    ws::verify_envelope(&env, &set, network_id, &genesis_root, &WsHybridVerifier).map_err(
+    // A booting node checks the arrangement's SHAPE against the §6 policy
+    // before any signature (`ws_boot::boot`, NEW-2), so the assembler must
+    // refuse the same arrangements or it writes an artifact only the writer
+    // accepts.
+    let Some((p_threshold, p_signers, p_min_external)) = ws_boot::shape_policy_of(&set) else {
+        return Err(format!(
+            "REFUSING to write an envelope the network would reject.\n  {}",
+            ws_boot::shape_policy_refusal(&set, &set_path),
+        ));
+    };
+    ws::verify_envelope_with_shape_policy(&env, &set, network_id, &genesis_root, &WsHybridVerifier, p_threshold, p_signers, p_min_external).map_err(
         |reject| {
             format!(
                 "REFUSING to write an envelope the network would reject.\n  \
@@ -911,7 +936,7 @@ fn envelope(args: &[String]) -> Result<(), String> {
     let back = decode_envelope_file(&bytes).map_err(|e| format!("assembled envelope is malformed: {e}"))?;
     // Verify the DECODED form too. A framing bug that survives the in-memory
     // check and not the file would otherwise ship as a valid-looking artifact.
-    ws::verify_envelope(&back, &set, network_id, &genesis_root, &WsHybridVerifier).map_err(
+    ws::verify_envelope_with_shape_policy(&back, &set, network_id, &genesis_root, &WsHybridVerifier, p_threshold, p_signers, p_min_external).map_err(
         |reject| {
             format!(
                 "self-check FAILED: the envelope verifies in memory but NOT after the file \
@@ -1067,6 +1092,14 @@ fn explain_reject(r: &ws::EnvelopeReject, set: &SignerSet) -> String {
              verify — that is the entire point of the external minimum (§2.2 rule 4). The \
              external signer has to sign.",
             set.id
+        ),
+        E::SignerSetShapeMismatch { threshold, signers, min_external } => format!(
+            "the arrangement's shape does not match the release policy it was checked \
+             against ({threshold}-of-{signers}, at least {min_external} external). The \
+             quorum rule travels in the arrangement file over an unauthenticated channel, \
+             so a node only accepts the §6 shapes — Phase A 2-of-3 with one external \
+             signer, Phase B 3-of-5 with two. Rebuild the arrangement with §2's flags; \
+             more signatures cannot fix its shape."
         ),
         E::BadSignature { index } => format!(
             "the signature at index {index} does not verify over this checkpoint's ws digest \
@@ -1258,6 +1291,18 @@ fn verify(args: &[String]) -> Result<(), String> {
         println!();
     }
 
+    // The same shape gate a booting node runs (`ws_boot::boot`, NEW-2): the
+    // §6 phases are policy, and an arrangement matching neither is refused
+    // before any signature is read. The fields above are still printed so the
+    // operator can see WHAT was refused.
+    let Some((p_threshold, p_signers, p_min_external)) = ws_boot::shape_policy_of(&set) else {
+        return Err(format!(
+            "VERDICT: REFUSED — {}\n  A node given this arrangement refuses at boot before \
+             checking any signature. Do not publish it.",
+            ws_boot::shape_policy_refusal(&set, &set_path),
+        ));
+    };
+
     println!("SIGNATURES  ({} listed)", env.signatures.len());
     let verdicts = probe_signatures(&env, &set, network_id, &genesis_root);
     for (index, external, valid) in &verdicts {
@@ -1315,7 +1360,16 @@ fn verify(args: &[String]) -> Result<(), String> {
     }
     println!();
 
-    match ws::verify_envelope(&env, &set, network_id, &genesis_root, &WsHybridVerifier) {
+    match ws::verify_envelope_with_shape_policy(
+        &env,
+        &set,
+        network_id,
+        &genesis_root,
+        &WsHybridVerifier,
+        p_threshold,
+        p_signers,
+        p_min_external,
+    ) {
         Ok(ok) => {
             if ok.arrangement_past_review {
                 println!(
