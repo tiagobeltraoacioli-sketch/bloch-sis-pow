@@ -4,11 +4,11 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="color-scheme" content="dark light" />
-<title>Postern Pool — Bloch SHA-256d mining</title>
-<meta name="description" content="Postern Pool — a non-custodial SHA-256d mining pool for Bloch, the post-quantum, pure-proof-of-work base chain. Point any Bitcoin ASIC, GPU, or CPU at it and mine to your own bloch1q… address." />
+<title>Postern Pool — Genesis-3 mining archive</title>
+<meta name="description" content="Historical Postern Pool interface for the retired Bloch Genesis-3 network. Genesis-4 is proof of stake; this archive is not a current mining offer." />
 <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-<meta property="og:title" content="Postern Pool — Bloch SHA-256d mining" />
-<meta property="og:description" content="Non-custodial SHA-256d pool for Bloch. Same hashing as Bitcoin — mine to your own address. Do povo, para o povo." />
+<meta property="og:title" content="Postern Pool — Genesis-3 mining archive" />
+<meta property="og:description" content="The historical Genesis-3 mining interface, preserved as a record." />
 <meta property="og:type" content="website" />
 
 <style>
@@ -201,6 +201,217 @@ pre .fl{color:var(--brass);}
 .foot-links{display:flex;gap:1.2rem;font-family:var(--font-mono);font-size:.8rem;letter-spacing:.04em;margin:.8rem 0 0;flex-wrap:wrap;}
 .postern-footer .wordmark{font-size:1.1rem;}
 @media (max-width:560px){.postern-footer{flex-direction:column;align-items:flex-start;gap:1.4rem;}}
+/* POSTERN VISUAL STANDARD v1 — approved 2026-09-08.
+   Shared palette aliases preserve each product's existing components.
+   Dark is the default; an explicit light preference remains available.
+   Status colors remain distinct from the lime brand accent. */
+:root, :root:not([data-theme="light"]), :root[data-theme="dark"] {
+  --ground: #101211;
+  --panel: #161916;
+  --surface: #161916;
+  --surface-2: #1d221c;
+  --surface-3: #263020;
+  --bg: #101211;
+  --bg0: #101211;
+  --bg1: #161916;
+  --bg2: #161916;
+  --bg3: #1d221c;
+  --bg4: #263020;
+  --bg-alt: #161916;
+  --bg-code: #0c0f0b;
+  --bg-elev: #161916;
+  --bg-elev-2: #1d221c;
+  --bg-glow: #1b2316;
+  --bg-deep: #0c0f0b;
+  --fg: #f2f0e7;
+  --text: #f2f0e7;
+  --ink: #f2f0e7;
+  --fg-2: #cad1c3;
+  --ink-2: #cad1c3;
+  --text-dim: #cad1c3;
+  --muted: #a5ada6;
+  --faint: #93a08c;
+  --text-faint: #93a08c;
+  --line: #30382f;
+  --line-strong: #526049;
+  --line-soft: #252d22;
+  --accent: #c8fa72;
+  --accent-strong: #d6ff96;
+  --accent-hover: #d6ff96;
+  --accent-soft: rgba(200,250,114,.10);
+  --brass: #c8fa72;
+  --brass-bright: #d6ff96;
+  --brass-hi: #d6ff96;
+  --brass-deep: #b7e660;
+  --brass-ink: #142009;
+  --brass-dim: rgba(200,250,114,.10);
+  --brass-line: rgba(200,250,114,.32);
+  --brass-glow: rgba(200,250,114,.12);
+  --on-accent: #142009;
+  --link: #c8fa72;
+  --link-hover: #d6ff96;
+  --focus: #c8fa72;
+  --ok: #82b4ee;
+  --ok-dim: rgba(130,180,238,.12);
+  --ok-soft: #172331;
+  --ok-bg: #172331;
+  --ok-border: #82b4ee;
+  --warn: #e8be84;
+  --warn-dim: rgba(232,190,132,.12);
+  --signal: #e8be84;
+  --signal-text: #e8be84;
+  --signal-soft: #2b2419;
+  --warn-bg: #2b2419;
+  --warn-border: #9a774b;
+  --warn-bord: #9a774b;
+  --crit: #ff8e83;
+  --crit-dim: rgba(255,142,131,.12);
+  --danger: #ff8e83;
+  --danger-bg: #321d19;
+  --danger-border: #c27569;
+  --err: #ff8e83;
+  --err-soft: #321d19;
+  --info: #b8a9ee;
+  --info-dim: rgba(184,169,238,.12);
+  --violet: #b8a9ee;
+  --violet-soft: #211d30;
+  --badge-live-bg: #172331;
+  --badge-live-fg: #a1c9f7;
+  --badge-next-bg: #2b2419;
+  --badge-next-fg: #e8be84;
+  --badge-refused-bg: #321d19;
+  --badge-refused-fg: #ffaaa1;
+  --globe-dot: #d6ff96;
+  --globe-dot-back: rgba(200,250,114,.28);
+  --globe-line: rgba(242,240,231,.10);
+  --globe-glow: rgba(200,250,114,.16);
+  --globe-arc: rgba(200,250,114,.5);
+  --notice-bg: #23321b;
+  --notice-ink: #f2f0e7;
+  --shadow: 0 12px 32px -24px rgba(0,0,0,.5);
+  --glow: 0 0 0 1px var(--brass-line);
+  --font-ui: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-display: var(--font-ui);
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --display: var(--font-ui); --body: var(--font-ui); --sans: var(--font-ui); --mono: var(--font-mono);
+  --r-sm: 6px; --r-md: 8px; --r-lg: 12px; --r-xl: 16px;
+  --radius-card: 12px; --radius-table: 8px; --radius-pill: 5px;
+  color-scheme: dark;
+}
+:root[data-theme="light"] {
+  --ground: #f7faf4;
+  --panel: #ffffff;
+  --surface: #ffffff;
+  --surface-2: #edf3e7;
+  --surface-3: #e2eadb;
+  --bg: #f7faf4;
+  --bg0: #f7faf4;
+  --bg1: #ffffff;
+  --bg2: #ffffff;
+  --bg3: #edf3e7;
+  --bg4: #e2eadb;
+  --bg-alt: #edf3e7;
+  --bg-code: #edf3e7;
+  --bg-elev: #ffffff;
+  --bg-elev-2: #edf3e7;
+  --bg-glow: #ffffff;
+  --bg-deep: #edf3e7;
+  --fg: #17200f;
+  --text: #17200f;
+  --ink: #17200f;
+  --fg-2: #35432b;
+  --ink-2: #35432b;
+  --text-dim: #35432b;
+  --muted: #526348;
+  --faint: #596951;
+  --text-faint: #596951;
+  --line: #d2ddc8;
+  --line-strong: #8b9f7d;
+  --line-soft: #e1e9d9;
+  --accent: #446719;
+  --accent-strong: #314e0e;
+  --accent-hover: #314e0e;
+  --accent-soft: #e8f1dc;
+  --brass: #446719;
+  --brass-bright: #314e0e;
+  --brass-hi: #314e0e;
+  --brass-deep: #314e0e;
+  --brass-ink: #ffffff;
+  --brass-dim: #e8f1dc;
+  --brass-line: #9bb875;
+  --brass-glow: rgba(68,103,25,.12);
+  --on-accent: #ffffff;
+  --link: #446719;
+  --link-hover: #314e0e;
+  --focus: #446719;
+  --ok: #1d5fae;
+  --ok-dim: #e3edf9;
+  --ok-soft: #e3edf9;
+  --ok-bg: #e3edf9;
+  --ok-border: #1d5fae;
+  --warn: #855013;
+  --warn-dim: #fbefdd;
+  --signal: #855013;
+  --signal-text: #855013;
+  --signal-soft: #fbefdd;
+  --warn-bg: #fbefdd;
+  --warn-border: #855013;
+  --warn-bord: #855013;
+  --crit: #a3231b;
+  --crit-dim: #f9e6e3;
+  --danger: #a3231b;
+  --danger-bg: #f9e6e3;
+  --danger-border: #a3231b;
+  --err: #a3231b;
+  --err-soft: #f9e6e3;
+  --info: #574293;
+  --info-dim: #eee8f9;
+  --violet: #574293;
+  --violet-soft: #eee8f9;
+  --badge-live-bg: #e3edf9;
+  --badge-live-fg: #1d5fae;
+  --badge-next-bg: #fbefdd;
+  --badge-next-fg: #855013;
+  --badge-refused-bg: #f9e6e3;
+  --badge-refused-fg: #a3231b;
+  --globe-dot: #446719;
+  --globe-dot-back: rgba(68,103,25,.28);
+  --globe-line: rgba(23,32,15,.12);
+  --globe-glow: rgba(68,103,25,.12);
+  --globe-arc: rgba(68,103,25,.5);
+  --notice-bg: #e8f1dc;
+  --notice-ink: #17200f;
+  --shadow: 0 12px 30px -24px rgba(23,32,15,.2);
+  --glow: 0 0 0 1px var(--brass-line);
+  color-scheme: light;
+}
+
+/* Product typography and interaction finish. Data and code retain mono faces. */
+body { font-family: var(--font-ui); }
+h1, h2, h3 { font-family: var(--font-ui); letter-spacing: -.035em; }
+.wordmark, .wm-a, .wm-b { font-family: var(--font-ui); letter-spacing: -.045em; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+::selection { color: var(--on-accent); background: var(--accent); }
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+}
+
+:root { --border: var(--line); --border-hi: var(--line-strong); --tracking-wordmark: -.04em; --tracking-eyebrow: .08em; }
+body { background: var(--bg); color: var(--text-dim); }
+.wrap { max-width: 1320px; }
+.postern-header { padding-block: 21px; }
+.wordmark { font-size: 24px; font-weight: 550; }
+.header-nav { font-family: var(--font-ui); font-size: 14px; letter-spacing: 0; text-transform: none; }
+.hero { padding-top: 50px; }
+.hero h1 { font-size: clamp(2.8rem,5.5vw,5rem); font-weight: 500; letter-spacing: -.055em; line-height: 1.1; }
+.hero-art { color: var(--accent); filter: none; }
+.btn { border-radius: 6px; font-family: var(--font-ui); letter-spacing: 0; min-height: 46px; }
+.card { border-radius: 10px; }
+.archive-notice { border: 1px solid var(--warn-bord); background: var(--warn-bg); color: var(--warn); padding: 20px 24px; border-radius: 8px; margin-top: 32px; }
+.archive-notice p { margin: 6px 0 0; max-width: 85ch; }
+.kicker::before { display: none; }
+@media (max-width:640px) { .postern-header { align-items: flex-start; flex-direction: column; gap: 15px; } .header-nav { display: flex; flex-wrap: wrap; gap: 5px; } }
+
 </style>
 </head>
 
@@ -209,15 +420,7 @@ pre .fl{color:var(--brass);}
 <header class="postern-header">
   <a class="wordmark-lockup" href="/" aria-label="Postern Labs — home">
     <span class="postern-mark" aria-hidden="true">
-      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120">
-        <polygon points="60,14 104,92 16,92" fill="none" stroke="#D2955C" stroke-width="3" stroke-linejoin="round"/>
-        <line x1="60" y1="14" x2="60" y2="92" stroke="#3A4657" stroke-width="2"/>
-        <line x1="38" y1="53" x2="82" y2="53" stroke="#3A4657" stroke-width="2"/>
-        <circle cx="38" cy="92" r="4.5" fill="#D2955C"/>
-        <circle cx="60" cy="92" r="4.5" fill="#D2955C"/>
-        <circle cx="82" cy="92" r="4.5" fill="#D2955C"/>
-        <circle cx="60" cy="14" r="6" fill="#E0A870"/>
-      </svg>
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40"><path d="M10 32V17a10 10 0 0 1 20 0v15h-6V17a4 4 0 0 0-8 0v15Z" fill="var(--accent)"/></svg>
     </span>
     <span class="wordmark"><span class="wm-postern">postern</span><span class="wm-mid">·</span><span class="wm-labs">labs</span></span>
   </a>
@@ -229,29 +432,21 @@ pre .fl{color:var(--brass);}
   </nav>
 </header>
 
-<main class="wrap">
+<main class="wrap"><aside class="archive-notice" aria-label="Historical network notice"><strong>Genesis-3 archive</strong><p>Bloch proof-of-work mining ended at height 39,918 on 13 August 2026. Genesis-4 uses proof of stake. The instructions and readouts below document the former network and are not a current mining offer.</p></aside>
 
   <!-- ============ HERO ============ -->
   <section class="hero" aria-labelledby="hero-title">
     <div>
       <p class="kicker">Postern Pool · Bloch mining</p>
-      <h1 id="hero-title">SHA-256d mining for the <span class="brass">post-quantum</span> base chain.</h1>
-      <p class="lede">Bloch hashes exactly like Bitcoin — double-SHA-256. Point any BTC ASIC, GPU, or CPU miner at Postern Pool and mine straight to your own <code style="font-family:var(--font-mono);color:var(--brass-hi)">bloch1q…</code> address. Non-custodial by construction: the pool never holds your coins.</p>
+      <h1 id="hero-title">A record of<br><span class="brass">the first genesis.</span></h1>
+      <p class="lede">Bloch hashes exactly like Bitcoin — double-SHA-256. Genesis-3 used BTC ASIC, GPU, or CPU miners at Postern Pool, paying to a <code style="font-family:var(--font-mono);color:var(--brass-hi)">bloch1q…</code> address. Non-custodial by construction: the pool never holds your coins.</p>
       <div class="btns">
         <a class="btn btn--primary" href="#connect">How to connect</a>
         <a class="btn" href="#why">Why SHA-256d</a>
       </div>
     </div>
     <span class="postern-mark hero-art" aria-hidden="true">
-      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120">
-        <polygon points="60,14 104,92 16,92" fill="none" stroke="#D2955C" stroke-width="3" stroke-linejoin="round"/>
-        <line x1="60" y1="14" x2="60" y2="92" stroke="#3A4657" stroke-width="2"/>
-        <line x1="38" y1="53" x2="82" y2="53" stroke="#3A4657" stroke-width="2"/>
-        <circle cx="38" cy="92" r="4.5" fill="#D2955C"/>
-        <circle cx="60" cy="92" r="4.5" fill="#D2955C"/>
-        <circle cx="82" cy="92" r="4.5" fill="#D2955C"/>
-        <circle cx="60" cy="14" r="6" fill="#E0A870"/>
-      </svg>
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40"><path d="M10 32V17a10 10 0 0 1 20 0v15h-6V17a4 4 0 0 0-8 0v15Z" fill="var(--accent)"/></svg>
     </span>
   </section>
 

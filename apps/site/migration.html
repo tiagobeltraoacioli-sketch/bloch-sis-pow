@@ -1,156 +1,26 @@
-<!DOCTYPE html>
-<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
-<!-- Bloch Protocol site — migration page. Every figure carries its repo source
-     in a comment next to it. -->
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Migration — Bloch Protocol</title>
-<meta name="description" content="Genesis-3 halted at height 50,000 by consensus rule. Genesis-4 has relaunched as proof of stake from a signed snapshot, live since 2026-08-13. What happened to balances, and what to refuse.">
-<link rel="stylesheet" href="assets/site.css">
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; connect-src 'none'">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101211">
+  <meta name="description" content="Genesis-3 ended at its terminal height. Genesis-4 opened from a signed snapshot, carrying holders’ balances forward automatically.">
+  <title>A new genesis. No action required. — Postern Labs</title>
+  <link rel="icon" type="image/svg+xml" href="assets/postern.svg">
+  <link rel="stylesheet" href="assets/site.css">
+  <script src="assets/site.js" defer></script>
 </head>
 <body>
-<a class="skip" href="#main">Skip to content</a>
-
-<nav aria-label="Main"><div class="wrap">
-  <a class="logo" href="./">
-    <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true">
-      <circle cx="13" cy="13" r="11.2" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
-      <ellipse cx="13" cy="13" rx="11.2" ry="4.2" fill="none" stroke="var(--accent)" stroke-width="1.1" opacity="0.55"/>
-      <line x1="13" y1="13" x2="19.6" y2="7.2" stroke="var(--ink)" stroke-width="1.6" stroke-linecap="round"/>
-      <circle cx="19.6" cy="7.2" r="2.1" fill="var(--accent)"/>
-    </svg>
-    Bloch Protocol
-  </a>
-  <span class="navlinks">
-    <a href="protocol.html">Protocol</a>
-    <a href="migration.html" aria-current="page">Migration</a>
-    <a href="supply.html">Supply</a>
-    <a href="brand.html">Brand</a>
-    <a href="build.html">Build</a>
-    <a href="docs.html">Docs</a>
-    <a class="ext" href="https://blochl1.com">Explorer</a>
-  </span>
-</div></nav>
-
-<main id="main">
-
-<header class="pagehead"><div class="wrap">
-  <p class="eyebrow">Migration</p>
-  <h1>The chain that stopped on purpose.</h1>
-  <p class="lede">
-    Genesis-3 ended at a height written into consensus. Genesis-4 has been running
-    since 2026-08-13 21:31:19 UTC, as proof of stake, from a signed snapshot of every
-    balance. There was deliberately no action for holders to take, and there still
-    isn&rsquo;t &mdash; the carryover already happened.
-  </p>
-</div></header>
-
-<div class="status"><div class="wrap">
-  <!-- GENESIS3_TERMINAL_HEIGHT = 50,000 (consensus rule, crates/bloch-crypto/src/core/mod.rs);
-       the chain actually stopped at height 39,918 (CARRYOVER_MEASURED_HEIGHT). -->
-  <dl class="stat"><dt>Terminal height (rule)</dt><dd>50,000</dd><div class="sub">blocks above it are invalid; actual stop 39,918</div></dl>
-  <!-- CARRYOVER_MEASURED_UTXOS = 452,726 at CARRYOVER_MEASURED_HEIGHT = 39,918 —
-       tokenomics_v4.rs. -->
-  <dl class="stat"><dt>UTXOs carried</dt><dd>452,726</dd><div class="sub">measured at height 39,918</div></dl>
-  <dl class="stat"><dt>Genesis-4</dt><dd>live</dd><div class="sub">since 2026-08-13 21:31:19 UTC</div></dl>
-  <dl class="stat"><dt>Your action</dt><dd>None</dd><div class="sub">balances carried automatically</div></dl>
-</div></div>
-
-<section id="phases"><div class="wrap">
-  <div class="sec-head">
-    <p class="eyebrow">The sequence</p>
-    <h2>Four phases, in order.</h2>
-    <p class="sub">Each one only begins when the one above it has finished.</p>
-  </div>
-  <ol class="phases">
-    <li>
-      <span class="marker">done</span>
-      <div class="phase-body">
-        <h3>Proof of work <span class="state">halted</span></h3>
-        <!-- SHA-256d + AuxPoW merged mining, historical: the chain halted by
-             consensus rule and actually stopped at height 39,918
-             (CARRYOVER_MEASURED_HEIGHT). -->
-        <p>The chain produced blocks under SHA-256d with merged mining until it halted by consensus rule. It actually stopped, and was snapshotted, at height 39,918.</p>
-      </div>
-    </li>
-    <li>
-      <span class="marker">done</span>
-      <div class="phase-body">
-        <h3>The chain halted</h3>
-        <!-- Invalid-above-terminal as a consensus rule, and why "unwanted" is
-             not enough: crates/bloch-crypto/src/core/mod.rs. -->
-        <p>Blocks above the terminal height (50,000) are <strong>invalid</strong> &mdash; a consensus rule compiled into every node, not a switch anyone threw. A chain does not stop because it was announced; if late blocks were merely unwanted, miners would keep producing them and the &ldquo;halt&rdquo; would be a fork nobody agreed to. Making them invalid is what actually ended the chain.</p>
-        <p>Mining revenue ended there. The signed snapshot of every balance, taken at height 39,918, is the canonical carryover record.</p>
-      </div>
-    </li>
-    <li>
-      <span class="marker">done</span>
-      <div class="phase-body">
-        <h3>The gap</h3>
-        <p>Balances sat in the snapshot; the <a href="https://blochl1.com">explorer</a> kept serving history. That review period is over.</p>
-        <p>One consequence stated plainly: once mining stopped, the old chain&rsquo;s history stopped being evidence &mdash; proof-of-work security was bought with ongoing hashrate. That is why the canonical artifact was the signed snapshot, whose digest is embedded in the Genesis-4 genesis block, and not whatever chain had the most work afterwards.</p>
-      </div>
-    </li>
-    <li>
-      <span class="marker">now</span>
-      <div class="phase-body">
-        <h3>Proof of stake, from the snapshot <span class="state now">live</span></h3>
-        <!-- Carryover as ordinary liquid balance, one balance set:
-             crates/bloch-pos-committee/src/tokenomics_v4.rs. -->
-        <p>Genesis-4 has been running since 2026-08-13 21:31:19 UTC. Every Genesis-3 balance crossed as an ordinary liquid balance &mdash; 452,726 UTXOs, carried automatically. Carried-over coins can be staked and delegated like any other coin.</p>
-      </div>
-    </li>
-  </ol>
-</div></section>
-
-<section id="refuse" class="alt"><div class="wrap">
-  <div class="sec-head">
-    <p class="eyebrow">Refuse these</p>
-    <h2>There is no migration action. None.</h2>
-    <p class="sub">The carryover is automatic, which makes every &ldquo;migration step&rdquo; someone offers you a theft attempt by definition.</p>
-  </div>
-  <div class="cards">
-    <div class="card c">
-      <span class="tag">Scam shape 1</span>
-      <h3>&ldquo;Claim your Genesis-4 tokens&rdquo;</h3>
-      <p>There is no claim to file. Balances carry across in the snapshot without any action from you.</p>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <div class="container header-inner">
+      <a class="wordmark" href="index.html" aria-label="Postern Labs home"><img src="assets/postern.svg" width="38" height="38" alt=""><span>postern<span class="wordmark-light">labs</span></span></a>
+      <nav class="desktop-nav" aria-label="Main navigation"><a href="index.html#ecosystem">Ecosystem</a><a href="protocol.html">Protocol</a><a href="docs.html">Research &amp; docs</a><a href="build.html">Developers</a></nav>
+      <a class="header-cta" href="https://blochl1.com/">Explore Bloch <span aria-hidden="true">↗</span></a>
+      <details class="mobile-menu"><summary aria-label="Open navigation"><span>Menu</span><span aria-hidden="true">☰</span></summary><nav aria-label="Mobile navigation"><a href="index.html#ecosystem">Ecosystem</a><a href="protocol.html">Protocol</a><a href="docs.html">Research &amp; docs</a><a href="build.html">Developers</a><a href="https://blochl1.com/">Bloch Explorer ↗</a></nav></details>
     </div>
-    <div class="card c">
-      <span class="tag">Scam shape 2</span>
-      <h3>&ldquo;Send coins to the bridge&rdquo;</h3>
-      <p>There is no bridge, no contract to interact with, nobody to send anything to. Anyone asking you to move tokens to migrate them is stealing them.</p>
-    </div>
-    <div class="card c">
-      <span class="tag">Scam shape 3</span>
-      <h3>&ldquo;There&rsquo;s a second migration coming&rdquo;</h3>
-      <!-- Genesis-4 launched 2026-08-13 21:31:19 UTC; the carryover already
-           happened automatically at that launch. There is no further
-           migration event to wait for or act on. -->
-      <p>Genesis-4 launched 2026-08-13 21:31:19 UTC and the carryover already happened, automatically, at that launch. There is no second migration, no further snapshot, and nothing left to do &mdash; anyone telling you otherwise is baiting a theft.</p>
-    </div>
-  </div>
-</div></section>
-
-</main>
-
-<footer><div class="wrap">
-  <div>
-    <span class="logo" style="font-size:1rem">
-      <svg width="22" height="22" viewBox="0 0 26 26" aria-hidden="true">
-        <circle cx="13" cy="13" r="11.2" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
-        <ellipse cx="13" cy="13" rx="11.2" ry="4.2" fill="none" stroke="var(--accent)" stroke-width="1.1" opacity="0.55"/>
-        <line x1="13" y1="13" x2="19.6" y2="7.2" stroke="var(--ink)" stroke-width="1.6" stroke-linecap="round"/>
-        <circle cx="19.6" cy="7.2" r="2.1" fill="var(--accent)"/>
-      </svg>
-      Bloch Protocol
-    </span>
-    <p style="margin-top:0.7rem">Postern Labs Ltda. &middot; AGPL-3.0-or-later</p>
-    <p style="margin-top:0.35rem;font-size:0.86rem">Source: <a href="https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow">GitHub</a> &middot; <a href="https://gitlab.com/blochsispow-group/bloch-pos">GitLab</a></p>
-  </div>
-  <p style="max-width:34ch">Every figure on this site is either measured and labelled as such, or planned and labelled as such.</p>
-</div>
-
+  </header>
+<main id="main"><div class="container"><header class="page-hero"><p class="breadcrumb"><a href="index.html">Postern Labs</a> / Migration</p><p class="eyebrow">MIGRATION / COMPLETED 13 AUG 2026</p><h1>A new genesis. No action required.</h1><p class="page-lead">Genesis-3 ended at its terminal height. Genesis-4 opened from a signed snapshot, carrying holders’ balances forward automatically.</p><p class="page-meta">PUBLISHED RECORD REVIEWED 08 SEP 2026 · NOT A LIVE NETWORK FEED</p></header><div class="article-layout"><nav class="page-index" aria-label="On this page"><p>ON THIS PAGE</p><a href="#record">The migration record.</a><a href="#sequence">From proof of work to proof of stake.</a><a href="#holders">Your balance did not need a claim.</a></nav><div class="article-content"><section id="record" aria-labelledby="record-title"><h2 id="record-title">The migration record.</h2><div class="table-scroll" tabindex="0" role="region" aria-label="Historical migration facts"><table><caption>Historical figures from the published migration record</caption><thead><tr><th scope="col">Milestone</th><th scope="col">Recorded result</th></tr></thead><tbody><tr><th scope="row">Genesis-3 terminal height</th><td>39,918</td></tr><tr><th scope="row">Snapshot outputs</th><td>452,726</td></tr><tr><th scope="row">Snapshot addresses</th><td>16</td></tr><tr><th scope="row">Carried balance in Genesis-4 units</th><td>18,146,400,000 BLCH</td></tr><tr><th scope="row">Genesis-4 launch</th><td>13 August 2026, 21:31 UTC</td></tr><tr><th scope="row">Initial issuance</th><td>57,146,400,000 BLCH</td></tr></tbody></table></div></section><section id="sequence" aria-labelledby="sequence-title"><h2 id="sequence-title">From proof of work to proof of stake.</h2><ol><li><strong>Genesis-3 stopped.</strong> Blocks above height 39,918 are invalid under its terminal-height rule.</li><li><strong>A snapshot preserved the ledger.</strong> The published record reports byte-identical outputs produced independently on two nodes.</li><li><strong>Genesis-4 opened.</strong> The opening ledger included the carryover and genesis allocations.</li></ol></section><section id="holders" aria-labelledby="holders-title"><h2 id="holders-title">Your balance did not need a claim.</h2><div class="callout"><h3>No token migration payment.</h3><p>The carryover happened automatically. It did not require a claim, a swap, a bridge transfer, or disclosure of a recovery phrase.</p></div><p>Genesis-3 mining ended with that chain. Genesis-4 uses proof of stake. The old proof-of-work history remains a historical record.</p><a class="text-link" href="https://blochl1.com/">Explore the chain record ↗</a></section></div></div></div></main>  <footer class="site-footer container"><div class="footer-top"><div><a class="wordmark" href="index.html"><img src="assets/postern.svg" width="38" height="38" alt=""><span>postern<span class="wordmark-light">labs</span></span></a><p>Building beyond the classical.</p></div><div class="footer-links"><a href="brand.html">Brand</a><a href="docs.html">Documentation</a><a href="https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow">GitHub ↗</a><a href="https://x.com/posternlabs">X ↗</a><a href="https://t.me/posternlabs">Telegram ↗</a></div></div><div class="footer-bottom"><span>© 2026 Postern Labs Ltda.</span><span>Protocol parameters and historical records · reviewed 08 Sep 2026</span><a href="#main">Back to top ↑</a></div></footer>
 </body>
 </html>

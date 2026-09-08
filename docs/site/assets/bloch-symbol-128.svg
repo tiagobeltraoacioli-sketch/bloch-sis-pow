@@ -6,9 +6,9 @@
      at 41.3°, length 0.785 R, dot r = 0.19 R. Scales losslessly above 128. -->
 <svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-label="The Bloch sphere — symbol of Bloch Protocol">
   <style>
-    .s { stroke: #0e6e5a; } .v { stroke: #0d1b17; } .d { fill: #0e6e5a; }
+    .s { stroke: #446719; } .v { stroke: #17200f; } .d { fill: #446719; }
     @media (prefers-color-scheme: dark) {
-      .s { stroke: #4fc0a4; } .v { stroke: #eaf2ef; } .d { fill: #4fc0a4; }
+      .s { stroke: #c8fa72; } .v { stroke: #f2f0e7; } .d { fill: #c8fa72; }
     }
   </style>
   <circle class="s" cx="64" cy="64" r="54" fill="none" stroke-width="3"/>

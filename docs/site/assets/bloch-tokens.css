@@ -1,90 +1,185 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
-/* Bloch Protocol — design tokens. The single source for color, type and
-   spacing across every Bloch surface. No webfonts, no imports, no URLs:
-   this file has zero external dependencies by rule, not by accident.
-   Every text/background pair here was measured against WCAG AA — the
-   numbers are in docs/site/BRAND-KIT.md. */
-
-:root {
-  /* ground & ink — light theme is the definition, dark overrides */
-  --ground:       #ffffff;
-  --surface:      #f1f4f3;
-  --surface-2:    #e6ecea;
-  --ink:          #0d1b17;
-  --ink-2:        #33463f;
-  --muted:        #5d6f68;   /* smallest ink allowed for text; 5.33:1 on ground */
-  --line:         #d5dedb;
-
-  /* accent — the brand's one voice. Spent on links, primary actions,
-     the mark, and the protocol's own "live/now" state. Nothing else. */
-  --accent:       #0e6e5a;
-  --accent-soft:  #e2f0ec;
-
-  /* quantum violet — the second voice, for the quantum/cryptography frame */
-  --violet:       #4b3fa8;
-  --violet-soft:  #ebe9f7;
-
-  /* semantic states — deliberately NOT green. See BRAND-KIT.md §2. */
-  --ok:           #1d5fae;   /* confirmed, finalized, verified */
-  --ok-soft:      #e3edf9;
-  --signal:       #b4630f;   /* attention — LARGE text & graphics only (4.44:1) */
-  --signal-text:  #8a4a06;   /* attention at body size (6.86:1 on ground) */
-  --signal-soft:  #fbeee0;
-  --err:          #a8362b;   /* failed, invalid, halted-in-error */
-  --err-soft:     #f9e6e3;
-
-  /* type — system stacks only; rationale in BRAND-KIT.md §3 */
-  --display: Charter, "Bitstream Charter", "Iowan Old Style", "Source Serif Pro", Georgia, serif;
-  --body: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-
-  /* rhythm */
-  --measure: 66ch;
-  --pad: clamp(1.25rem, 4vw, 3rem);
-  --radius-card: 18px;
-  --radius-table: 14px;
-  --radius-pill: 5px;
+/* POSTERN VISUAL STANDARD v1 — approved 2026-09-08.
+   Shared palette aliases preserve each product's existing components.
+   Dark is the default; an explicit light preference remains available.
+   Status colors remain distinct from the lime brand accent. */
+:root, :root:not([data-theme="light"]), :root[data-theme="dark"] {
+  --ground: #101211;
+  --panel: #161916;
+  --surface: #161916;
+  --surface-2: #1d221c;
+  --surface-3: #263020;
+  --bg: #101211;
+  --bg0: #101211;
+  --bg1: #161916;
+  --bg2: #161916;
+  --bg3: #1d221c;
+  --bg4: #263020;
+  --bg-alt: #161916;
+  --bg-code: #0c0f0b;
+  --bg-elev: #161916;
+  --bg-elev-2: #1d221c;
+  --bg-glow: #1b2316;
+  --bg-deep: #0c0f0b;
+  --fg: #f2f0e7;
+  --text: #f2f0e7;
+  --ink: #f2f0e7;
+  --fg-2: #cad1c3;
+  --ink-2: #cad1c3;
+  --text-dim: #cad1c3;
+  --muted: #a5ada6;
+  --faint: #93a08c;
+  --text-faint: #93a08c;
+  --line: #30382f;
+  --line-strong: #526049;
+  --line-soft: #252d22;
+  --accent: #c8fa72;
+  --accent-strong: #d6ff96;
+  --accent-hover: #d6ff96;
+  --accent-soft: rgba(200,250,114,.10);
+  --brass: #c8fa72;
+  --brass-bright: #d6ff96;
+  --brass-hi: #d6ff96;
+  --brass-deep: #b7e660;
+  --brass-ink: #142009;
+  --brass-dim: rgba(200,250,114,.10);
+  --brass-line: rgba(200,250,114,.32);
+  --brass-glow: rgba(200,250,114,.12);
+  --on-accent: #142009;
+  --link: #c8fa72;
+  --link-hover: #d6ff96;
+  --focus: #c8fa72;
+  --ok: #82b4ee;
+  --ok-dim: rgba(130,180,238,.12);
+  --ok-soft: #172331;
+  --ok-bg: #172331;
+  --ok-border: #82b4ee;
+  --warn: #e8be84;
+  --warn-dim: rgba(232,190,132,.12);
+  --signal: #e8be84;
+  --signal-text: #e8be84;
+  --signal-soft: #2b2419;
+  --warn-bg: #2b2419;
+  --warn-border: #9a774b;
+  --warn-bord: #9a774b;
+  --crit: #ff8e83;
+  --crit-dim: rgba(255,142,131,.12);
+  --danger: #ff8e83;
+  --danger-bg: #321d19;
+  --danger-border: #c27569;
+  --err: #ff8e83;
+  --err-soft: #321d19;
+  --info: #b8a9ee;
+  --info-dim: rgba(184,169,238,.12);
+  --violet: #b8a9ee;
+  --violet-soft: #211d30;
+  --badge-live-bg: #172331;
+  --badge-live-fg: #a1c9f7;
+  --badge-next-bg: #2b2419;
+  --badge-next-fg: #e8be84;
+  --badge-refused-bg: #321d19;
+  --badge-refused-fg: #ffaaa1;
+  --globe-dot: #d6ff96;
+  --globe-dot-back: rgba(200,250,114,.28);
+  --globe-line: rgba(242,240,231,.10);
+  --globe-glow: rgba(200,250,114,.16);
+  --globe-arc: rgba(200,250,114,.5);
+  --notice-bg: #23321b;
+  --notice-ink: #f2f0e7;
+  --shadow: 0 12px 32px -24px rgba(0,0,0,.5);
+  --glow: 0 0 0 1px var(--brass-line);
+  --font-ui: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-display: var(--font-ui);
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --display: var(--font-ui); --body: var(--font-ui); --sans: var(--font-ui); --mono: var(--font-mono);
+  --r-sm: 6px; --r-md: 8px; --r-lg: 12px; --r-xl: 16px;
+  --radius-card: 12px; --radius-table: 8px; --radius-pill: 5px;
+  color-scheme: dark;
 }
-
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --ground:       #0b1411;
-    --surface:      #101d19;
-    --surface-2:    #172b24;
-    --ink:          #eaf2ef;
-    --ink-2:        #c3d3cd;
-    --muted:        #8ea49c;
-    --line:         #22352e;
-    --accent:       #4fc0a4;
-    --accent-soft:  #102c25;
-    --violet:       #a89ef0;
-    --violet-soft:  #1b1930;
-    --ok:           #82b4ee;
-    --ok-soft:      #132238;
-    --signal:       #e0a05c;
-    --signal-text:  #e0a05c;  /* passes at body size in dark: 8.33:1 */
-    --signal-soft:  #2a1f12;
-    --err:          #ec8b7d;
-    --err-soft:     #33150f;
-  }
-}
-:root[data-theme="dark"] {
-  --ground:       #0b1411;
-  --surface:      #101d19;
-  --surface-2:    #172b24;
-  --ink:          #eaf2ef;
-  --ink-2:        #c3d3cd;
-  --muted:        #8ea49c;
-  --line:         #22352e;
-  --accent:       #4fc0a4;
-  --accent-soft:  #102c25;
-  --violet:       #a89ef0;
-  --violet-soft:  #1b1930;
-  --ok:           #82b4ee;
-  --ok-soft:      #132238;
-  --signal:       #e0a05c;
-  --signal-text:  #e0a05c;
-  --signal-soft:  #2a1f12;
-  --err:          #ec8b7d;
-  --err-soft:     #33150f;
+:root[data-theme="light"] {
+  --ground: #f7faf4;
+  --panel: #ffffff;
+  --surface: #ffffff;
+  --surface-2: #edf3e7;
+  --surface-3: #e2eadb;
+  --bg: #f7faf4;
+  --bg0: #f7faf4;
+  --bg1: #ffffff;
+  --bg2: #ffffff;
+  --bg3: #edf3e7;
+  --bg4: #e2eadb;
+  --bg-alt: #edf3e7;
+  --bg-code: #edf3e7;
+  --bg-elev: #ffffff;
+  --bg-elev-2: #edf3e7;
+  --bg-glow: #ffffff;
+  --bg-deep: #edf3e7;
+  --fg: #17200f;
+  --text: #17200f;
+  --ink: #17200f;
+  --fg-2: #35432b;
+  --ink-2: #35432b;
+  --text-dim: #35432b;
+  --muted: #526348;
+  --faint: #596951;
+  --text-faint: #596951;
+  --line: #d2ddc8;
+  --line-strong: #8b9f7d;
+  --line-soft: #e1e9d9;
+  --accent: #446719;
+  --accent-strong: #314e0e;
+  --accent-hover: #314e0e;
+  --accent-soft: #e8f1dc;
+  --brass: #446719;
+  --brass-bright: #314e0e;
+  --brass-hi: #314e0e;
+  --brass-deep: #314e0e;
+  --brass-ink: #ffffff;
+  --brass-dim: #e8f1dc;
+  --brass-line: #9bb875;
+  --brass-glow: rgba(68,103,25,.12);
+  --on-accent: #ffffff;
+  --link: #446719;
+  --link-hover: #314e0e;
+  --focus: #446719;
+  --ok: #1d5fae;
+  --ok-dim: #e3edf9;
+  --ok-soft: #e3edf9;
+  --ok-bg: #e3edf9;
+  --ok-border: #1d5fae;
+  --warn: #855013;
+  --warn-dim: #fbefdd;
+  --signal: #855013;
+  --signal-text: #855013;
+  --signal-soft: #fbefdd;
+  --warn-bg: #fbefdd;
+  --warn-border: #855013;
+  --warn-bord: #855013;
+  --crit: #a3231b;
+  --crit-dim: #f9e6e3;
+  --danger: #a3231b;
+  --danger-bg: #f9e6e3;
+  --danger-border: #a3231b;
+  --err: #a3231b;
+  --err-soft: #f9e6e3;
+  --info: #574293;
+  --info-dim: #eee8f9;
+  --violet: #574293;
+  --violet-soft: #eee8f9;
+  --badge-live-bg: #e3edf9;
+  --badge-live-fg: #1d5fae;
+  --badge-next-bg: #fbefdd;
+  --badge-next-fg: #855013;
+  --badge-refused-bg: #f9e6e3;
+  --badge-refused-fg: #a3231b;
+  --globe-dot: #446719;
+  --globe-dot-back: rgba(68,103,25,.28);
+  --globe-line: rgba(23,32,15,.12);
+  --globe-glow: rgba(68,103,25,.12);
+  --globe-arc: rgba(68,103,25,.5);
+  --notice-bg: #e8f1dc;
+  --notice-ink: #17200f;
+  --shadow: 0 12px 30px -24px rgba(23,32,15,.2);
+  --glow: 0 0 0 1px var(--brass-line);
+  color-scheme: light;
 }
