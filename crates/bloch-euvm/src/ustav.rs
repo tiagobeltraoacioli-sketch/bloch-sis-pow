@@ -16,6 +16,7 @@ use crate::{AssetId, Ctx, SigVerifier, Val, VmError};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod encoding;
+pub mod chameleon;
 use encoding::HashWriter;
 
 pub const KERNEL_VERSION: u32 = 3;
