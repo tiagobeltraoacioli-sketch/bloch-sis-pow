@@ -25,6 +25,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shipping-tests", action="store_true",
                         help="also run the full shipping node suite before the isolated activation")
+    parser.add_argument("--audit-mempool", action="store_true",
+                        help="reproduce the documented unfunded-mempool gap instead of the positive rehearsal")
     args = parser.parse_args()
     source = (ROOT / PARAMS).read_text()
     if source.count(OLD) != 1:
@@ -59,14 +61,25 @@ def main():
                 cwd=checkout, env=env, check=True,
             )
         (checkout / PARAMS).write_text(source.replace(OLD, NEW))
+        test_name = TEST
+        test_options = ["--ignored", "--exact"]
+        if args.audit_mempool:
+            target = checkout / "crates/bloch-pos-node/src/engine/validator_admission_tests.rs"
+            reproducer = ROOT / "docs/audit/reproducers/validator-admission-mempool.rs"
+            target.write_text(target.read_text() + "\n" + reproducer.read_text())
+            test_name = "engine::validator_admission_tests::audit_unfunded_signed_deposit_reaches_mempool"
+            test_options = ["--exact", "--nocapture"]
         subprocess.run(
             ["cargo", f"+{pin.group(1)}", "test", "--locked", "-p", "bloch-pos-node",
-             "--bin", "bloch-pos", TEST, "--", "--ignored", "--exact"],
+             "--bin", "bloch-pos", test_name, "--", *test_options],
             cwd=checkout, env=env, check=True,
         )
     if (ROOT / PARAMS).read_text() != source:
         raise SystemExit("Shipping activation source changed during the rehearsal")
-    print("Admission rehearsal passed; the shipping source remains unarmed.")
+    if args.audit_mempool:
+        print("Audit gap reproduced: unfunded input reached the mempool but consensus refused it. Shipping source remains unarmed.")
+    else:
+        print("Admission rehearsal passed; the shipping source remains unarmed.")
 
 
 if __name__ == "__main__":
