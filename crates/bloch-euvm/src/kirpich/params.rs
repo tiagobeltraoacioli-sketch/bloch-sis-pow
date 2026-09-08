@@ -60,15 +60,14 @@ const MAX_GOVERNANCE_SIGNERS: usize = 253;
 /// a malformed or hostile charter can force: every pubkey field is cloned verbatim
 /// into an `Op::PushBytes` when `modules.rs` compiles the charter, so an unbounded
 /// pubkey is an unbounded per-validator allocation.
-const MAX_PUBKEY_BYTES: usize = 8192;
+const MAX_PUBKEY_BYTES: usize = super::limits::MAX_KEY_BYTES;
 
 /// K-3 fix: ceiling on the SUM of every pubkey-shaped byte field across the whole
 /// charter. Chosen to mirror `emitted.rs`'s `MAX_TOTAL_BYTES` compiled-program
 /// budget (256 KiB): if the raw pubkeys alone already exceed the total budget a
 /// compiled validator set is allowed to occupy, compiling to find that out is pure
-/// waste. Duplicated as its own constant (not imported from `emitted.rs`) to keep
-/// the two lanes independent, per this module's contract.
-const MAX_TOTAL_PUBKEY_BYTES: usize = 262_144;
+/// waste. Shares its ceiling with the dispatcher's allocation-free preflight.
+const MAX_TOTAL_PUBKEY_BYTES: usize = super::limits::MAX_KEY_BYTES_TOTAL;
 
 /// Every pubkey-shaped byte field this charter carries: `(module_index, label,
 /// bytes)`, in charter order. Governance emits one entry per signer (all sharing the
@@ -102,18 +101,24 @@ fn pubkey_fields(charter: &TokenCharter) -> Vec<(usize, &'static str, &[u8])> {
 /// K-3 fix, cheap pre-flight used by BOTH this lane (to emit KRP-046) and Lane D
 /// (`emitted.rs::audit`, to skip its own compile entirely). Pure length arithmetic
 /// over slice lengths — no allocation, no compile — so it is safe to run even on a
-/// charter engineered to be maximally oversized. `u128` avoids any overflow concern
-/// summing up to `usize::MAX` `usize` lengths on a 32-bit target; `saturating_add`
-/// keeps it total regardless.
+/// charter engineered to be maximally oversized. Saturating arithmetic and early
+/// rejection keep byte counting total, including on a 32-bit target.
 pub(super) fn pubkey_budget_denied(charter: &TokenCharter) -> bool {
-    let mut total: u128 = 0;
-    for (_, _, bytes) in pubkey_fields(charter) {
-        if bytes.len() > MAX_PUBKEY_BYTES {
+    let mut total = 0usize;
+    for module in &charter.modules {
+        let result = super::limits::visit_keys(module, |_, bytes| {
+            total = total.saturating_add(bytes.len());
+            if bytes.len() > MAX_PUBKEY_BYTES || total > MAX_TOTAL_PUBKEY_BYTES {
+                Err(())
+            } else {
+                Ok(())
+            }
+        });
+        if result.is_err() {
             return true;
         }
-        total = total.saturating_add(bytes.len() as u128);
     }
-    total > MAX_TOTAL_PUBKEY_BYTES as u128
+    false
 }
 
 /// KRP-046: emit the Deny finding(s) backing [`pubkey_budget_denied`]'s verdict, with

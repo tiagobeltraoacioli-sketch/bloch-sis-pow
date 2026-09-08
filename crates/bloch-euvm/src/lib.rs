@@ -15,8 +15,8 @@
 //! - **Gas-metered:** every op costs gas from a caller-set budget; a runaway program
 //!   aborts at the ceiling (DoS bound).
 //! - **Post-quantum signature verification is a HOST callback** ([`SigVerifier`]),
-//!   so the VM stays pure and testable; the real ML-DSA-65‖Falcon-1024 verifier
-//!   (from `bloch-crypto`) plugs in later without changing the VM.
+//!   so the VM stays pure and testable. `bloch-ustav` supplies the concrete
+//!   ML-DSA-65‖Falcon-1024 adapter for the versioned [`ustav`] ledger.
 //!
 //! What it already demonstrates (see tests): a P2PKH validator (the current fixed
 //! script as a trivial contract), an n-of-m multisig validator (the bridge custody
@@ -878,6 +878,7 @@ pub fn fee_burn(fee: u64, burn_bps: u16) -> (u64, u64) {
 pub mod batcher;
 pub mod harness;
 pub mod kirpich;
+pub mod ustav;
 pub mod minting;
 pub mod modules;
 pub mod state;
