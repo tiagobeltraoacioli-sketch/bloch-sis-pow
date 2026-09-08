@@ -57,6 +57,7 @@ mod conflicts;
 mod emitted;
 mod params;
 pub mod limits;
+pub mod chameleon;
 
 /// Version of the bounded audit rules, bound into v3 native-asset identities.
 /// This is not a live consensus activation flag.

@@ -1536,6 +1536,7 @@ dependencies = [
 name = "bloch-euvm"
 version = "0.0.1"
 dependencies = [
+ "serde_json",
  "sha2 0.10.9",
  "sha3 0.10.9",
 ]
@@ -1606,6 +1607,8 @@ version = "0.2.0"
 dependencies = [
  "bloch-crypto",
  "bloch-euvm",
+ "serde_json",
+ "sha3 0.10.9",
 ]
 
 [[package]]

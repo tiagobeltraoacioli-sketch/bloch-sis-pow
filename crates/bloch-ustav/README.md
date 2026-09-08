@@ -7,6 +7,12 @@ The host interface has no ECDSA callback, and the native crate has no k256 depen
 Registration, minting, transfers, burns and policy updates are executable locally.
 This crate is a workspace member; it is not a dependency of the live Genesis-4 node.
 
+[Color-Changing Chameleon v1](../bloch-euvm/docs/chameleon-v1.md) adds sealed
+PQ-native escrow, an explicit Kirpich ERC-20 compatibility profile and an
+executable Rust/EVM/Rust roundtrip with an unrestricted Ustav test asset.
+It uses explicitly trusted local checkpoints; production finality verification,
+native BLCH, Solana and live-node activation remain separate work.
+
 ECDSA wallet compatibility belongs to the separate
 [bloch-l2-evm](https://github.com/tiagobeltraoacioli-sketch/bloch-l2-evm) repository.
 MetaMask/EVM accounts on L2 have classical security; using L2 does not make those

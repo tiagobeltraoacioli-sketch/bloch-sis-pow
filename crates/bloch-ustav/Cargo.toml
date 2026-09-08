@@ -8,3 +8,7 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 bloch-euvm = { path = "../bloch-euvm" }
 bloch-crypto = { path = "../bloch-crypto", default-features = false }
+
+[dev-dependencies]
+serde_json = "1.0"
+sha3 = "0.10"

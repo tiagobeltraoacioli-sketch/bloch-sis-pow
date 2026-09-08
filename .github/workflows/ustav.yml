@@ -27,7 +27,7 @@ jobs:
       - name: Existing EUVM suite and Ustav regressions
         run: cargo +1.94.1 test --locked -p bloch-euvm -p bloch-ustav
       - name: Transition and cryptographic regressions in release profile
-        run: cargo +1.94.1 test --locked --release -p bloch-euvm -p bloch-ustav --test ustav_kernel --test crypto_kernel
+        run: cargo +1.94.1 test --locked --release -p bloch-euvm -p bloch-ustav --test ustav_kernel --test crypto_kernel --test chameleon --test chameleon_crypto
       - name: Concrete adapter lint
         run: cargo +1.94.1 clippy --locked -p bloch-ustav --all-targets --no-deps -- -D warnings
       - name: Executable lifecycle
