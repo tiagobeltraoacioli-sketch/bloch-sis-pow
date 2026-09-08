@@ -1,6 +1,14 @@
 # ADR-041 — Validator exit and withdrawal lifecycle
 
-Status: **PROPOSED — FOUNDER DECISION.** Nothing in this document changes a
+Status: **ACCEPTED — founder decisions recorded 2026-09-08.**
+(1) epoch **L**: best technical choice, targeted THIS WEEK — the concrete epoch is
+fixed at release cut, not in this document; (2) the genesis principal write-off
+(~1.6M BLCH, the founder's own never-issued principal) is explicitly reaffirmed;
+(3) the RandaoRecommit rider ships at L; (4) `MAX_EXITS_PER_EPOCH = 4` stands,
+revisit at roster >256; (5) crank policy: each node auto-cranks its own matured
+withdrawal.
+
+Originally: Nothing in this document changes a
 running node. Every constant it names ships inert until the founder signs the
 activation epoch, and every wire byte it assigns is unreleased until the
 registry rows in `tests/wire_tag_registry.rs` are edited in the same commit
