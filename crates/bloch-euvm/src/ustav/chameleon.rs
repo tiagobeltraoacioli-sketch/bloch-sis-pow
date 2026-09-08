@@ -333,10 +333,14 @@ impl ChameleonLedger {
             authorization,
         };
         let native_gas = gas.checked_sub(EXPORT_GAS).ok_or(NativeError::OutOfGas)?;
+        let state = self
+            .routes
+            .get_mut(&request.route)
+            .ok_or(Error::UnknownRoute)?;
         let mut receipt = self
             .native
             .apply(tx, witnesses, height, &scoped, native_gas)?;
-        receipt.gas_used += EXPORT_GAS; // Bounded above by the supplied gas limit.
+        receipt.gas_used = receipt.gas_used.saturating_add(EXPORT_GAS); // Bounded above by the supplied gas limit.
         let record = Export {
             route: request.route,
             nonce: request.expected_nonce,
@@ -346,19 +350,16 @@ impl ChameleonLedger {
         };
         self.locks
             .insert(receipt.outputs[request.lock_output as usize], request.route);
-        let state = self
-            .routes
-            .get_mut(&request.route)
-            .expect("validated route");
+
         state.next_export_nonce = next_nonce;
         state.locked = locked;
         self.exports.push(record.clone());
         Ok((record, receipt))
     }
-    pub fn export_root(&self) -> ([u8; 32], u64) {
+    pub fn export_root(&self) -> Result<([u8; 32], u64), Error> {
         let ids: Vec<_> = self.exports.iter().map(Export::id).collect();
-        let (root, _) = wire::root_and_proof(&ids, None).expect("bounded exports");
-        (root, ids.len() as u64)
+        let (root, _) = wire::root_and_proof(&ids, None).ok_or(Error::ResourceLimit)?;
+        Ok((root, ids.len() as u64))
     }
     pub fn export_proof(&self, index: usize) -> Option<InclusionProof> {
         let ids: Vec<_> = self.exports.iter().map(Export::id).collect();
@@ -383,10 +384,10 @@ impl ChameleonLedger {
         // Fixed-depth proof hashing, key hashing and bounded escrow lookups are
         // charged in addition to the PQ verification. These are protocol units,
         // not a claim about calibrated live-node execution costs.
-        let work = 100
-            + 10 * wire::TREE_DEPTH as u64
-            + claim.pq_recipient.len().div_ceil(32) as u64
-            + 32 * claim.escrow_inputs.len() as u64;
+        let work = 100u64
+            .saturating_add(10u64.saturating_mul(wire::TREE_DEPTH as u64))
+            .saturating_add(claim.pq_recipient.len().div_ceil(32) as u64)
+            .saturating_add(32u64.saturating_mul(claim.escrow_inputs.len() as u64));
         check_auth_budget(signature, gas, work)?;
         let burn = &claim.burn;
         let state = self.routes.get(&burn.route).ok_or(Error::UnknownRoute)?;
@@ -457,7 +458,14 @@ impl ChameleonLedger {
         {
             return Err(NativeError::OutputCollision.into());
         }
-        if self.native.outputs.len() - claim.escrow_inputs.len() + 1 + usize::from(change > 0)
+        if self
+            .native
+            .outputs
+            .len()
+            .checked_sub(claim.escrow_inputs.len())
+            .and_then(|n| n.checked_add(1))
+            .and_then(|n| n.checked_add(usize::from(change > 0)))
+            .ok_or(Error::ArithmeticOverflow)?
             > MAX_LEDGER_OUTPUTS
         {
             return Err(Error::ResourceLimit);
@@ -465,6 +473,10 @@ impl ChameleonLedger {
         let asset = state.config.asset;
         // All fallible checks precede commit. The recipient owns change too,
         // but the wrapper keeps it locked and forbids ordinary spending.
+        let state = self
+            .routes
+            .get_mut(&burn.route)
+            .ok_or(Error::UnknownRoute)?;
         for id in &claim.escrow_inputs {
             self.native.outputs.remove(id);
             self.locks.remove(id);
@@ -492,7 +504,7 @@ impl ChameleonLedger {
             );
             self.locks.insert(change_id, burn.route);
         }
-        let state = self.routes.get_mut(&burn.route).expect("validated route");
+
         state.locked = locked;
         state.returned = returned;
         self.claimed.insert(nullifier);
@@ -653,7 +665,11 @@ fn check_auth_budget(signature: &[u8], gas: u64, work: u64) -> Result<(), Error>
     if signature.len() > MAX_SIGNATURE_BYTES {
         return Err(Error::ResourceLimit);
     }
-    if gas < AUTH_GAS + signature.len().div_ceil(32) as u64 + work {
+    if gas
+        < AUTH_GAS
+            .saturating_add(signature.len().div_ceil(32) as u64)
+            .saturating_add(work)
+    {
         return Err(NativeError::OutOfGas.into());
     }
     Ok(())
