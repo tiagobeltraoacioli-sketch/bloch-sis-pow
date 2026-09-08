@@ -1,151 +1,26 @@
-<!DOCTYPE html>
-<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
-<!-- Bloch Protocol site — docs page. Structure only, by design: every document
-     is reviewed by the founder before it is published here. No fake links. -->
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Docs — Bloch Protocol</title>
-<meta name="description" content="The documentation index for Bloch Protocol. Documents appear here after fosettled 2026-08-12 — nothing is published unreviewed.">
-<link rel="stylesheet" href="assets/site.css">
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; connect-src 'none'">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101211">
+  <meta name="description" content="Protocol notes, historical records, and the published institutional dossier. Understand what is designed, what is implemented, and what has been reviewed.">
+  <title>Read the work behind the network. — Postern Labs</title>
+  <link rel="icon" type="image/svg+xml" href="assets/postern.svg">
+  <link rel="stylesheet" href="assets/site.css">
+  <script src="assets/site.js" defer></script>
 </head>
 <body>
-<a class="skip" href="#main">Skip to content</a>
-
-<nav aria-label="Main"><div class="wrap">
-  <a class="logo" href="./">
-    <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true">
-      <circle cx="13" cy="13" r="11.2" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
-      <ellipse cx="13" cy="13" rx="11.2" ry="4.2" fill="none" stroke="var(--accent)" stroke-width="1.1" opacity="0.55"/>
-      <line x1="13" y1="13" x2="19.6" y2="7.2" stroke="var(--ink)" stroke-width="1.6" stroke-linecap="round"/>
-      <circle cx="19.6" cy="7.2" r="2.1" fill="var(--accent)"/>
-    </svg>
-    Bloch Protocol
-  </a>
-  <span class="navlinks">
-    <a href="protocol.html">Protocol</a>
-    <a href="migration.html">Migration</a>
-    <a href="supply.html">Supply</a>
-    <a href="brand.html">Brand</a>
-    <a href="build.html">Build</a>
-    <a href="docs.html" aria-current="page">Docs</a>
-    <a class="ext" href="https://blochl1.com">Explorer</a>
-  </span>
-</div></nav>
-
-<main id="main">
-
-<header class="pagehead"><div class="wrap">
-  <p class="eyebrow">Documentation</p>
-  <h1>Published after review, not before.</h1>
-  <p class="lede">
-    The repository holds specifications, threat models, decision records and
-    post-mortems. Each document appears here only after the founder has reviewed it
-    for publication &mdash; so this page is currently a table of contents for material
-    that exists but is not yet public. An empty slot below means exactly that, and
-    nothing more.
-  </p>
-</div></header>
-
-<section class="tight"><div class="wrap">
-  <div class="sec-head" style="margin-top:0">
-    <p class="eyebrow">Available now</p>
-    <h2>The institutional dossier.</h2>
-    <p style="color:var(--ink-2)">Version 2.0 &mdash; the complete technical and institutional account:
-      what is designed, what is built, what is actually running, and where those three are not the
-      same thing. It opens with a chapter recording every claim Edition 1 made that no longer
-      stands, and why.</p>
-  </div>
-  <ul class="doclist" style="margin-bottom:3rem">
-    <li>
-      <div>
-        <h3><a href="Bloch-SIS-PoW-Institutional-Dossier-EN.pdf">Institutional Dossier 2.0 &mdash; PDF</a></h3>
-        <p>Consensus, economics and supply, governance, cryptography and security, plus the
-           pre-audit dossier as an appendix. Served at the Edition&nbsp;1 URL so existing links
-           resolve to the current document.</p>
-      </div>
-    </li>
-    <li>
-      <div>
-        <h3><a href="Bloch-SIS-PoW-Institutional-Dossier-EN-Edition1-archived.pdf">Edition 1 &mdash; archived</a></h3>
-        <p>The superseded 2026 edition, kept because 2.0&rsquo;s opening chapter is a record of what
-           changed from it &mdash; and a record you cannot check against the original is not a record.</p>
-      </div>
-    </li>
-  </ul>
-
-  <div class="sec-head">
-    <p class="eyebrow">Index &mdash; under review</p>
-    <h2>What is coming, in what order it matters.</h2>
-  </div>
-  <ul class="doclist">
-    <li>
-      <div>
-        <h3>Tokenomics V4 specification</h3>
-        <p>Supply, allocations, vesting, the emission curve, and the activation gates &mdash; the source behind the <a href="supply.html">supply page</a>.</p>
-      </div>
-    </li>
-    <li>
-      <div>
-        <h3>Proof-of-stake design</h3>
-        <p>Slots, epochs, committees, the finality gadget, stake churn, and the threat models written against them.</p>
-      </div>
-    </li>
-    <li>
-      <div>
-        <h3>Migration &amp; carryover</h3>
-        <p>The terminal-height rule, the snapshot format, and how Genesis-3 balances become Genesis-4 balances.</p>
-      </div>
-    </li>
-    <li>
-      <div>
-        <h3>Coherence &mdash; the shielded pool</h3>
-        <p>SHAKE-256 commitments, nullifiers, the STARK proving scaffold, and the audit status (currently: unaudited).</p>
-      </div>
-    </li>
-    <li>
-      <div>
-        <h3>Merged mining (AuxPoW)</h3>
-        <p>How one unit of Bitcoin ASIC work secured both chains during Genesis-3, kept as historical record after the halt.</p>
-      </div>
-    </li>
-    <li>
-      <div>
-        <h3>Decision records &amp; post-mortems</h3>
-        <p>ADRs and incident write-ups. The failures are part of the record; publishing them is the point.</p>
-      </div>
-    </li>
-  </ul>
-  <div class="card plain wide" style="margin-top:2.5rem">
-    <span class="tag">Why this page is honest instead of full</span>
-    <p style="max-width:var(--measure)">
-      It would be easy to publish everything at once and impressive-looking. It would
-      also mean publishing documents whose numbers may still change. The rule here is
-      the same as everywhere on this site: nothing goes public before it is checked,
-      and gaps are labelled as gaps.
-    </p>
-  </div>
-</div></section>
-
-</main>
-
-<footer><div class="wrap">
-  <div>
-    <span class="logo" style="font-size:1rem">
-      <svg width="22" height="22" viewBox="0 0 26 26" aria-hidden="true">
-        <circle cx="13" cy="13" r="11.2" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
-        <ellipse cx="13" cy="13" rx="11.2" ry="4.2" fill="none" stroke="var(--accent)" stroke-width="1.1" opacity="0.55"/>
-        <line x1="13" y1="13" x2="19.6" y2="7.2" stroke="var(--ink)" stroke-width="1.6" stroke-linecap="round"/>
-        <circle cx="19.6" cy="7.2" r="2.1" fill="var(--accent)"/>
-      </svg>
-      Bloch Protocol
-    </span>
-    <p style="margin-top:0.7rem">Postern Labs Ltda. &middot; AGPL-3.0-or-later</p>
-    <p style="margin-top:0.35rem;font-size:0.86rem">Source: <a href="https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow">GitHub</a> &middot; <a href="https://gitlab.com/blochsispow-group/bloch-pos">GitLab</a></p>
-  </div>
-  <p style="max-width:34ch">Every figure on this site is either measured and labelled as such, or planned and labelled as such.</p>
-</div>
-
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <div class="container header-inner">
+      <a class="wordmark" href="index.html" aria-label="Postern Labs home"><img src="assets/postern.svg" width="38" height="38" alt=""><span>postern<span class="wordmark-light">labs</span></span></a>
+      <nav class="desktop-nav" aria-label="Main navigation"><a href="index.html#ecosystem">Ecosystem</a><a href="protocol.html">Protocol</a><a href="docs.html" aria-current="page">Research &amp; docs</a><a href="build.html">Developers</a></nav>
+      <a class="header-cta" href="https://blochl1.com/">Explore Bloch <span aria-hidden="true">↗</span></a>
+      <details class="mobile-menu"><summary aria-label="Open navigation"><span>Menu</span><span aria-hidden="true">☰</span></summary><nav aria-label="Mobile navigation"><a href="index.html#ecosystem">Ecosystem</a><a href="protocol.html">Protocol</a><a href="docs.html" aria-current="page">Research &amp; docs</a><a href="build.html">Developers</a><a href="https://blochl1.com/">Bloch Explorer ↗</a></nav></details>
+    </div>
+  </header>
+<main id="main"><div class="container"><header class="page-hero"><p class="breadcrumb"><a href="index.html">Postern Labs</a> / Docs</p><p class="eyebrow">RESEARCH &amp; DOCUMENTATION</p><h1>Read the work behind the network.</h1><p class="page-lead">Protocol notes, historical records, and the published institutional dossier. Understand what is designed, what is implemented, and what has been reviewed.</p><p class="page-meta">PUBLISHED RECORD REVIEWED 08 SEP 2026 · NOT A LIVE NETWORK FEED</p></header><div class="article-layout"><nav class="page-index" aria-label="On this page"><p>ON THIS PAGE</p><a href="#dossier">The institutional dossier.</a><a href="#reference">Reference pages.</a><a href="#security">Review status, stated precisely.</a><a href="#wallet">Wallet resources.</a></nav><div class="article-content"><section id="dossier" aria-labelledby="dossier-title"><h2 id="dossier-title">The institutional dossier.</h2><div class="resource-grid"><article class="resource"><span class="badge">PDF / EDITION 2.0</span><h3>Institutional dossier</h3><p>The published technical and institutional account of the Bloch ecosystem, including its limitations.</p><a class="text-link" href="https://posternlabs.com/Bloch-SIS-PoW-Institutional-Dossier-EN.pdf">Read the dossier ↗</a></article><article class="resource"><span class="badge">DEVELOPER RESOURCES</span><h3>Developer portal</h3><p>Continue to the dedicated technical portal for developer resources.</p><a class="text-link" href="https://blochprotocol.dev/">Open the portal ↗</a></article></div></section><section id="reference" aria-labelledby="reference-title"><h2 id="reference-title">Reference pages.</h2><div class="resource-grid"><article class="resource"><h3>Protocol</h3><p>Hybrid authorization, consensus parameters, and Coherence’s research status.</p><a class="text-link" href="protocol.html">Read protocol notes →</a></article><article class="resource"><h3>Supply</h3><p>Genesis allocations and the published correction to vesting claims.</p><a class="text-link" href="supply.html">Read supply notes →</a></article><article class="resource"><h3>Migration</h3><p>The terminal height, signed snapshot, and automatic carryover.</p><a class="text-link" href="migration.html">Read the historical record →</a></article><article class="resource"><h3>Node operation</h3><p>What to verify before running a node or joining the validator set.</p><a class="text-link" href="build.html">Read participation notes →</a></article></div></section><section id="security" aria-labelledby="security-title"><h2 id="security-title">Review status, stated precisely.</h2><div class="callout caution"><h3>An automated scan is not a completed audit.</h3><p>The published documentation records an automated vulnerability scan and internal security work. It does not establish a completed independent audit of the chain or wallet.</p></div><p>A report refers to a particular code revision. Findings, fixes, and deployment status need to be read together.</p></section><section id="wallet" aria-labelledby="wallet-title"><h2 id="wallet-title">Wallet resources.</h2><p>The native wallet is available as a browser app. Its published extension is a developer build distributed outside the Chrome Web Store.</p><div class="resource-grid"><article class="resource"><span class="badge">PUBLIC BETA</span><h3>Postern Wallet</h3><p>Open the existing wallet service. Check its current release and network status before use.</p><a class="text-link" href="https://posternlabs.com/apps/postern/">Open wallet ↗</a></article><article class="resource"><span class="badge badge-amber">ARCHIVED BUILD / 23 AUG 2026</span><h3>Browser extension 0.1.0</h3><p>Historical developer build. Verify the publisher’s checksum; this listing is not a recommendation to install an older release.</p><a class="text-link" href="https://posternlabs.com/dl/bloch-wallet-extension-0.1.0-20260823.zip">Download archive ↗</a><a class="text-link" href="https://posternlabs.com/dl/bloch-wallet-extension-SHA256SUMS">Publisher’s checksums ↗</a></article></div></section></div></div></div></main>  <footer class="site-footer container"><div class="footer-top"><div><a class="wordmark" href="index.html"><img src="assets/postern.svg" width="38" height="38" alt=""><span>postern<span class="wordmark-light">labs</span></span></a><p>Building beyond the classical.</p></div><div class="footer-links"><a href="brand.html">Brand</a><a href="docs.html">Documentation</a><a href="https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow">GitHub ↗</a><a href="https://x.com/posternlabs">X ↗</a><a href="https://t.me/posternlabs">Telegram ↗</a></div></div><div class="footer-bottom"><span>© 2026 Postern Labs Ltda.</span><span>Protocol parameters and historical records · reviewed 08 Sep 2026</span><a href="#main">Back to top ↑</a></div></footer>
 </body>
 </html>

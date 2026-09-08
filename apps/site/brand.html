@@ -1,179 +1,26 @@
-<!DOCTYPE html>
-<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
-<!-- Bloch Protocol site — brand page. Tokens and typography are the
-     founder-approved preview (bloch-site.html), verbatim. -->
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Brand — Bloch Protocol</title>
-<meta name="description" content="The Bloch Protocol brand kit: palette, typography, the Bloch-sphere mark, and how to use them.">
-<link rel="stylesheet" href="assets/site.css">
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; connect-src 'none'">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101211">
+  <meta name="description" content="The Postern Labs website shares the Postern DEX visual language: deep green-black surfaces, warm white typography, and a deliberate lime accent.">
+  <title>One family. A clear identity. — Postern Labs</title>
+  <link rel="icon" type="image/svg+xml" href="assets/postern.svg">
+  <link rel="stylesheet" href="assets/site.css">
+  <script src="assets/site.js" defer></script>
 </head>
 <body>
-<a class="skip" href="#main">Skip to content</a>
-
-<nav aria-label="Main"><div class="wrap">
-  <a class="logo" href="./">
-    <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true">
-      <circle cx="13" cy="13" r="11.2" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
-      <ellipse cx="13" cy="13" rx="11.2" ry="4.2" fill="none" stroke="var(--accent)" stroke-width="1.1" opacity="0.55"/>
-      <line x1="13" y1="13" x2="19.6" y2="7.2" stroke="var(--ink)" stroke-width="1.6" stroke-linecap="round"/>
-      <circle cx="19.6" cy="7.2" r="2.1" fill="var(--accent)"/>
-    </svg>
-    Bloch Protocol
-  </a>
-  <span class="navlinks">
-    <a href="protocol.html">Protocol</a>
-    <a href="migration.html">Migration</a>
-    <a href="supply.html">Supply</a>
-    <a href="brand.html" aria-current="page">Brand</a>
-    <a href="build.html">Build</a>
-    <a href="docs.html">Docs</a>
-    <a class="ext" href="https://blochl1.com">Explorer</a>
-  </span>
-</div></nav>
-
-<main id="main">
-
-<header class="pagehead"><div class="wrap">
-  <p class="eyebrow">Brand kit</p>
-  <h1>Bloch Protocol</h1>
-  <p class="lede">
-    White ground, one accent spent deliberately, and a serif that signals a project
-    which publishes specifications rather than slogans.
-  </p>
-</div></header>
-
-<section id="mark"><div class="wrap">
-  <div class="sec-head">
-    <p class="eyebrow">The mark</p>
-    <h2>A sphere, an equator, a state vector.</h2>
-    <p class="sub">
-      The Bloch sphere is the geometric picture of a single qubit &mdash; every possible
-      state on one surface. The mark is that picture reduced to three strokes. It is
-      drawn as inline SVG in protocol colors, so it inherits light and dark themes
-      without a second asset.
-    </p>
-  </div>
-  <div class="cards two">
-    <div class="card plain" style="align-items:center; padding-block:3rem">
-      <svg width="120" height="120" viewBox="0 0 26 26" role="img" aria-label="The Bloch Protocol mark: a circle with an elliptical equator and a state vector pointing to the upper right.">
-        <circle cx="13" cy="13" r="11.2" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
-        <ellipse cx="13" cy="13" rx="11.2" ry="4.2" fill="none" stroke="var(--accent)" stroke-width="1.1" opacity="0.55"/>
-        <line x1="13" y1="13" x2="19.6" y2="7.2" stroke="var(--ink)" stroke-width="1.6" stroke-linecap="round"/>
-        <circle cx="19.6" cy="7.2" r="2.1" fill="var(--accent)"/>
-      </svg>
-      <p style="text-align:center">The mark at display size.</p>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <div class="container header-inner">
+      <a class="wordmark" href="index.html" aria-label="Postern Labs home"><img src="assets/postern.svg" width="38" height="38" alt=""><span>postern<span class="wordmark-light">labs</span></span></a>
+      <nav class="desktop-nav" aria-label="Main navigation"><a href="index.html#ecosystem">Ecosystem</a><a href="protocol.html">Protocol</a><a href="docs.html">Research &amp; docs</a><a href="build.html">Developers</a></nav>
+      <a class="header-cta" href="https://blochl1.com/">Explore Bloch <span aria-hidden="true">↗</span></a>
+      <details class="mobile-menu"><summary aria-label="Open navigation"><span>Menu</span><span aria-hidden="true">☰</span></summary><nav aria-label="Mobile navigation"><a href="index.html#ecosystem">Ecosystem</a><a href="protocol.html">Protocol</a><a href="docs.html">Research &amp; docs</a><a href="build.html">Developers</a><a href="https://blochl1.com/">Bloch Explorer ↗</a></nav></details>
     </div>
-    <div class="card plain">
-      <span class="tag">Rules</span>
-      <h3>Three, only</h3>
-      <p>Keep the vector pointing up-right &mdash; it is a state, not a clock hand. Do not fill the sphere. Do not add a wordmark inside the circle; the name sits beside it, in the display serif.</p>
-      <pre><code>&lt;svg viewBox="0 0 26 26"&gt;
-  &lt;circle cx="13" cy="13" r="11.2" .../&gt;
-  &lt;ellipse cx="13" cy="13" rx="11.2" ry="4.2" .../&gt;
-  &lt;line x1="13" y1="13" x2="19.6" y2="7.2" .../&gt;
-  &lt;circle cx="19.6" cy="7.2" r="2.1" .../&gt;
-&lt;/svg&gt;</code></pre>
-    </div>
-  </div>
-</div></section>
-
-<section id="palette" class="alt"><div class="wrap">
-  <div class="sec-head">
-    <p class="eyebrow">Palette &mdash; light</p>
-    <h2>Six colors, each with a job.</h2>
-    <p class="sub">The neutrals carry a green bias so they read as chosen next to the emerald accent rather than as default grey.</p>
-  </div>
-  <div class="swatches">
-    <div class="sw"><div class="chip" style="background:#0e6e5a"></div><div class="meta"><strong>Emerald</strong>#0E6E5A &middot; accent</div></div>
-    <div class="sw"><div class="chip" style="background:#0d1b17"></div><div class="meta"><strong>Ink</strong>#0D1B17 &middot; text</div></div>
-    <div class="sw"><div class="chip" style="background:#4b3fa8"></div><div class="meta"><strong>Violet</strong>#4B3FA8 &middot; quantum</div></div>
-    <div class="sw"><div class="chip" style="background:#b4630f"></div><div class="meta"><strong>Amber</strong>#B4630F &middot; caution</div></div>
-    <div class="sw"><div class="chip" style="background:#f1f4f3;border-bottom:1px solid #d5dedb"></div><div class="meta"><strong>Surface</strong>#F1F4F3 &middot; sections</div></div>
-    <div class="sw"><div class="chip" style="background:#ffffff;border-bottom:1px solid #d5dedb"></div><div class="meta"><strong>Ground</strong>#FFFFFF &middot; page</div></div>
-  </div>
-
-  <div class="sec-head" style="margin-top:3rem">
-    <p class="eyebrow">Palette &mdash; dark</p>
-    <h2 style="font-size:1.4rem">The same six jobs, re-lit.</h2>
-    <p class="sub">Dark is not inverted light: the accent brightens to keep contrast, the grounds go deep green-black, and the soft tints become shadows of their hue.</p>
-  </div>
-  <div class="swatches">
-    <div class="sw"><div class="chip" style="background:#4fc0a4"></div><div class="meta"><strong>Emerald</strong>#4FC0A4 &middot; accent</div></div>
-    <div class="sw"><div class="chip" style="background:#eaf2ef;border-bottom:1px solid #d5dedb"></div><div class="meta"><strong>Ink</strong>#EAF2EF &middot; text</div></div>
-    <div class="sw"><div class="chip" style="background:#a89ef0"></div><div class="meta"><strong>Violet</strong>#A89EF0 &middot; quantum</div></div>
-    <div class="sw"><div class="chip" style="background:#e0a05c"></div><div class="meta"><strong>Amber</strong>#E0A05C &middot; caution</div></div>
-    <div class="sw"><div class="chip" style="background:#101d19"></div><div class="meta"><strong>Surface</strong>#101D19 &middot; sections</div></div>
-    <div class="sw"><div class="chip" style="background:#0b1411"></div><div class="meta"><strong>Ground</strong>#0B1411 &middot; page</div></div>
-  </div>
-</div></section>
-
-<section id="type"><div class="wrap">
-  <div class="sec-head">
-    <p class="eyebrow">Typography</p>
-    <h2>Three voices, zero webfonts.</h2>
-    <p class="sub">Every face is a system font stack &mdash; no font file is ever downloaded, from anywhere. The pages load with nothing but their own HTML and one stylesheet.</p>
-  </div>
-  <div class="typespec">
-    <div class="typerow"><span class="lbl">Display</span><span style="font-family:var(--display);font-size:1.6rem">Charter &mdash; a chain you can read the source of</span></div>
-    <div class="typerow"><span class="lbl">Body</span><span style="font-size:1.05rem">System sans &mdash; set at 17px, 66 characters, for pages people actually finish</span></div>
-    <div class="typerow"><span class="lbl">Data</span><span style="font-family:var(--mono);font-size:0.98rem">ML-DSA-65 &#8214; Falcon-1024 &middot; 100,000,000,000 &middot; height 50,000</span></div>
-  </div>
-  <div class="tablewrap" style="margin-top:2.5rem"><table>
-    <caption>Font stacks</caption>
-    <thead><tr><th scope="col">Role</th><th scope="col">Stack</th></tr></thead>
-    <tbody>
-      <tr><td>Display</td><td><code>Charter, "Bitstream Charter", "Iowan Old Style", "Source Serif Pro", Georgia, serif</code></td></tr>
-      <tr><td>Body</td><td><code>system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif</code></td></tr>
-      <tr><td>Data</td><td><code>ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace</code></td></tr>
-    </tbody>
-  </table></div>
-</div></section>
-
-<section id="voice" class="alt"><div class="wrap">
-  <div class="sec-head">
-    <p class="eyebrow">Voice</p>
-    <h2>The rule that writes every page.</h2>
-  </div>
-  <div class="cards">
-    <div class="card a">
-      <span class="tag">Do</span>
-      <h3>State the cost</h3>
-      <p>Every claimed benefit ships with its trade-off attached. A protocol page that only lists benefits is marketing.</p>
-    </div>
-    <div class="card b">
-      <span class="tag">Do</span>
-      <h3>Label every figure</h3>
-      <p>Measured and labelled as such, or planned and labelled as such. A number with no label is a rumor with typography.</p>
-    </div>
-    <div class="card c">
-      <span class="tag">Don&rsquo;t</span>
-      <h3>Promise dates or prices</h3>
-      <p>No launch dates, no price talk, no &ldquo;soon&rdquo;. Nothing on this site is investment advice, and the copy never forgets it.</p>
-    </div>
-  </div>
-</div></section>
-
-</main>
-
-<footer><div class="wrap">
-  <div>
-    <span class="logo" style="font-size:1rem">
-      <svg width="22" height="22" viewBox="0 0 26 26" aria-hidden="true">
-        <circle cx="13" cy="13" r="11.2" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
-        <ellipse cx="13" cy="13" rx="11.2" ry="4.2" fill="none" stroke="var(--accent)" stroke-width="1.1" opacity="0.55"/>
-        <line x1="13" y1="13" x2="19.6" y2="7.2" stroke="var(--ink)" stroke-width="1.6" stroke-linecap="round"/>
-        <circle cx="19.6" cy="7.2" r="2.1" fill="var(--accent)"/>
-      </svg>
-      Bloch Protocol
-    </span>
-    <p style="margin-top:0.7rem">Postern Labs Ltda. &middot; AGPL-3.0-or-later</p>
-    <p style="margin-top:0.35rem;font-size:0.86rem">Source: <a href="https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow">GitHub</a> &middot; <a href="https://gitlab.com/blochsispow-group/bloch-pos">GitLab</a></p>
-  </div>
-  <p style="max-width:34ch">Every figure on this site is either measured and labelled as such, or planned and labelled as such.</p>
-</div>
-
+  </header>
+<main id="main"><div class="container"><header class="page-hero"><p class="breadcrumb"><a href="index.html">Postern Labs</a> / Brand</p><p class="eyebrow">POSTERN LABS / BRAND</p><h1>One family. A clear identity.</h1><p class="page-lead">The Postern Labs website shares the Postern DEX visual language: deep green-black surfaces, warm white typography, and a deliberate lime accent.</p><p class="page-meta">PUBLISHED RECORD REVIEWED 08 SEP 2026 · NOT A LIVE NETWORK FEED</p></header><div class="article-layout"><nav class="page-index" aria-label="On this page"><p>ON THIS PAGE</p><a href="#mark">The Postern mark.</a><a href="#palette">Color with a purpose.</a><a href="#voice">Specific words. Verifiable claims.</a></nav><div class="article-content"><section id="mark" aria-labelledby="mark-title"><h2 id="mark-title">The Postern mark.</h2><div class="brand-lockup"><a class="wordmark" href="assets/postern.svg" download="postern.svg" aria-label="Download the Postern SVG mark"><img src="assets/postern.svg" width="68" height="68" alt=""><span>postern<span class="wordmark-light">labs</span></span></a></div><p>The arch is the existing Postern DEX mark. Keep its proportions intact, leave clear space, and pair it with the Postern Labs name.</p><a class="text-link" href="assets/postern.svg" download="postern.svg">Download SVG mark ↓</a></section><section id="palette" aria-labelledby="palette-title"><h2 id="palette-title">Color with a purpose.</h2><div class="swatches"><div class="swatch"><div class="swatch-color color-ground"></div><div class="swatch-text">Ground<code>#101211</code></div></div><div class="swatch"><div class="swatch-color color-panel"></div><div class="swatch-text">Surface<code>#161916</code></div></div><div class="swatch"><div class="swatch-color color-accent"></div><div class="swatch-text">Accent<code>#C8FA72</code></div></div><div class="swatch"><div class="swatch-color color-text"></div><div class="swatch-text">Primary text<code>#F2F0E7</code></div></div><div class="swatch"><div class="swatch-color color-muted"></div><div class="swatch-text">Secondary text<code>#A5ADA6</code></div></div><div class="swatch"><div class="swatch-color color-line"></div><div class="swatch-text">Borders<code>#30382F</code></div></div></div></section><section id="voice" aria-labelledby="voice-title"><h2 id="voice-title">Specific words. Verifiable claims.</h2><p>Label protocol parameters, historical figures, and live measurements differently. Keep security limitations close to the relevant claim. Do not turn a roadmap, code change, or interface preview into a statement that a service is deployed.</p><p>Postern Labs and Bloch Protocol are related identities. The protocol’s sphere mark remains distinct from the Postern arch.</p></section></div></div></div></main>  <footer class="site-footer container"><div class="footer-top"><div><a class="wordmark" href="index.html"><img src="assets/postern.svg" width="38" height="38" alt=""><span>postern<span class="wordmark-light">labs</span></span></a><p>Building beyond the classical.</p></div><div class="footer-links"><a href="brand.html">Brand</a><a href="docs.html">Documentation</a><a href="https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow">GitHub ↗</a><a href="https://x.com/posternlabs">X ↗</a><a href="https://t.me/posternlabs">Telegram ↗</a></div></div><div class="footer-bottom"><span>© 2026 Postern Labs Ltda.</span><span>Protocol parameters and historical records · reviewed 08 Sep 2026</span><a href="#main">Back to top ↑</a></div></footer>
 </body>
 </html>

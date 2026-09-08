@@ -1,5 +1,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 
+> Historical planning reference. The September 2026 visual standard is in [BRAND-KIT.md](BRAND-KIT.md); the current institutional implementation and content notes are in `apps/site/`.
+
 # Bloch Protocol — site copy
 
 ```
