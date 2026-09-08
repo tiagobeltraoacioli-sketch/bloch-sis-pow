@@ -327,6 +327,9 @@ fn funded_multiblock_replay_activation_churn_and_new_proposer() {
             saw_new |= b.header.proposer_index >= 8;
         }
         assert!(saw_new, "a funded, activated key must be able to propose");
+        // VAD-02: this fixture supplies no attestations. Activation is a delay,
+        // not proof that the registration has finalized (see the audit report).
+        assert_eq!(state.finality().finalized.epoch, 0);
         assert!(state.supply_gap_sat() <= gap);
     });
 }
