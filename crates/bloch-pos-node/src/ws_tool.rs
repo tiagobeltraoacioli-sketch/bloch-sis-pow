@@ -1755,6 +1755,46 @@ mod tests {
         assert!(!Path::new(&out).exists(), "a refused envelope must not reach disk");
     }
 
+    /// A NON-§6-SHAPED arrangement is refused by the assembler and the
+    /// verifier, mirroring the NEW-2 boot gate: an artifact only its writer
+    /// can boot from must never reach disk. The set here is the honest
+    /// degraded variant the 2026-09-02 decisions doc priced — a 2-of-2
+    /// internal quorum — encoded by hand, exactly as an operator determined
+    /// to publish one would. VIOLATION: remove the `shape_policy_of` gate in
+    /// `envelope` and this goes red at the second assert (checked 2026-09-08:
+    /// replacing the gate with a fall-through to the set's own numbers turns
+    /// this exact test red and nothing else in the ws suite).
+    #[test]
+    fn envelope_and_verify_refuse_a_non_phase_shaped_arrangement() {
+        let f = fixture("neg-shape", 1);
+        // A 2-of-2, min_external 0 arrangement over the fixture's first two
+        // keys. The decoder admits it (its numbers are coherent and its keys
+        // distinct); only the shape policy stands between it and an artifact.
+        let two = SignerSet {
+            id: 1,
+            signers: f.set.signers[..2].to_vec(),
+            threshold: 2,
+            min_external: 0,
+            adopted_epoch: 0,
+        };
+        let set_path = format!("{}/set-2of2.bin", f.dir);
+        fs::write(&set_path, encode_signer_set_file(&two)).unwrap();
+        decode_signer_set_file(&fs::read(&set_path).unwrap())
+            .expect("a coherent 2-of-2 decodes; the shape gate is the only refusal");
+
+        let out = format!("{}/env-2of2.bin", f.dir);
+        let e = envelope(&[
+            s("--checkpoint"), format!("{}/cp.bin", f.dir),
+            s("--signer-set"), set_path.clone(),
+            s("--sig"), format!("0:{}/sig0", f.dir),
+            s("--sig"), format!("1:{}/sig1", f.dir),
+            s("--out"), out.clone(),
+        ])
+        .unwrap_err();
+        assert!(e.contains("neither"), "the refusal must name the §6 phases: {e}");
+        assert!(!Path::new(&out).exists(), "a refused envelope must not reach disk");
+    }
+
     /// Two internal keys reach the threshold but not the external minimum —
     /// §2.2 rule 4, the rule that stops a founder-only quorum.
     #[test]
