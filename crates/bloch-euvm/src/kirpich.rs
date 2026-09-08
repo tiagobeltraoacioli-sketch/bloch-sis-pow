@@ -5,16 +5,17 @@
 //! [`TokenCharter`](crate::modules::TokenCharter) **before** it is compiled into an
 //! eUTXO validator set by [`crate::modules::compile_charter`]. It is the internal-audit
 //! gate over the Ustav charter compile path: a charter that carries a `Deny`-severity
-//! defect must never reach the compiler on the audited build path
+//! defect must never yield a usable artifact on the audited build path
 //! ([`crate::modules::compile_charter_audited`]).
 //!
 //! ## Isolation / honesty
 //!
 //! Like the rest of `bloch-euvm`, Kirpich is **FOUNDATION, tests-only, NOT
 //! consensus-wired**. It lives behind the off-by-default `euvm` feature and is not
-//! compiled into the node binary. It never mutates a charter, never runs consensus, and
+//! compiled into the live Genesis-4 node binary. It never mutates a charter, never runs consensus, and
 //! never blocks the un-audited [`crate::modules::compile_charter`] (which is preserved
-//! as-is). The audited path is opt-in.
+//! as-is). The historical audited compiler is opt-in; the v2 [`crate::ustav`]
+//! registration and restore paths always require it.
 //!
 //! ## Determinism (sacred, shared by every lane)
 //!
@@ -34,7 +35,8 @@
 //! |------|------|-------|---------|
 //! | A — module conflicts       | [`conflicts`]    | KRP-001..=KRP-005 | composition contradictions (multiple Supply, duplicate governance signer, custody btc==pq, cross-role key reuse, duplicate module kind) |
 //! | B — compliance completeness| [`completeness`] | KRP-020..=KRP-026 | structurally unfinishable modules (empty charter, empty authority keys, KYC gate with no transfer control, empty token name) |
-//! | C — unsafe params          | [`params`]       | KRP-040..=KRP-045 | scalar foot-guns (0-of-m / unsatisfiable / >253-signer governance, non-positive vesting height, zero supply cap, empty signer key) |
+//! | C — unsafe params          | [`params`]       | KRP-040..=KRP-046 | scalar foot-guns and public-key byte budgets |
+//! | Preflight                  | [`limits`]       | KRP-046..=KRP-047 | key bytes, token name, module/signer counts and charter byte budget, before any lane allocates |
 //! | D — emitted programs       | [`emitted`]      | KRP-060..=KRP-064 | defects in the *compiled bytes* (non-deterministic recompile, incomplete emit, gas/size budget, Supply hash==BLCH, always-true / neutered guard) |
 //!
 //! ## Public API
@@ -54,6 +56,11 @@ mod completeness;
 mod conflicts;
 mod emitted;
 mod params;
+pub mod limits;
+
+/// Version of the bounded audit rules, bound into v2 native-asset identities.
+/// This is not a live consensus activation flag.
+pub const RULESET_VERSION: u32 = 2;
 
 /// Severity of a [`Finding`]. Ordered **most-severe first** (`Deny < Warn < Info`), so a
 /// canonical ascending sort surfaces the blocking findings at the top and the derived
@@ -130,18 +137,42 @@ impl AuditReport {
 /// Run the full Kirpich internal audit over `charter` and return its canonical
 /// [`AuditReport`]. Pure, deterministic, and panic-free for any charter.
 ///
-/// Every lane is invoked and its findings collected into one sink, then sorted into the
+/// Admission bounds run first; a resource violation returns one Deny immediately.
+/// Otherwise every lane's findings are collected into one sink, then sorted into the
 /// canonical `(severity, code, index, message)` order. `denied` is set iff any finding
 /// is [`Severity::Deny`]. This is the audit half of
 /// [`crate::modules::compile_charter_audited`].
 pub fn kirpich_audit(charter: &TokenCharter) -> AuditReport {
+    audit_and_compile(charter).0
+}
+
+pub(crate) fn audit_and_compile(
+    charter: &TokenCharter,
+) -> (AuditReport, Option<crate::modules::CompiledToken>) {
     let mut findings: Vec<Finding> = Vec::new();
+
+    // Must precede every lane: Lane A copies keys into conflict maps.
+    if let Some((code, message)) = limits::resource_error(charter) {
+        return (
+            AuditReport {
+                denied: true,
+                findings: vec![Finding {
+                    code,
+                    severity: Severity::Deny,
+                    module: None,
+                    index: None,
+                    message: message.to_owned(),
+                }],
+            },
+            None,
+        );
+    }
 
     // Every lane appends in its own rule order; ordering is imposed once, below.
     conflicts::audit(charter, &mut findings); // Lane A — KRP-001..=KRP-005
     completeness::audit(charter, &mut findings); // Lane B — KRP-020..=KRP-026
-    params::audit(charter, &mut findings); // Lane C — KRP-040..=KRP-045
-    emitted::audit(charter, &mut findings); // Lane D — KRP-060..=KRP-064
+    params::audit(charter, &mut findings); // Lane C — KRP-040..=KRP-046
+    let compiled = emitted::audit_and_compile(charter, &mut findings); // Lane D — KRP-060..=KRP-064
 
     // Canonical, deterministic ordering: primarily by (severity, code, index) as the
     // integration contract requires; `message` is the final tiebreak so two findings
@@ -156,7 +187,7 @@ pub fn kirpich_audit(charter: &TokenCharter) -> AuditReport {
     });
 
     let denied = findings.iter().any(|f| f.severity == Severity::Deny);
-    AuditReport { findings, denied }
+    (AuditReport { findings, denied }, compiled)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

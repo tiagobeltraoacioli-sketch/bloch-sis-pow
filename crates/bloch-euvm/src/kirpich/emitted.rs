@@ -79,7 +79,16 @@ const MAX_GOVERNANCE_SIGNERS: usize = 253;
 
 /// Lane D audit: compile the charter (twice, to assert determinism) and inspect the
 /// emitted bytes. Append-only into `out`; never panics on any charter input.
+#[cfg(test)]
 pub(super) fn audit(charter: &TokenCharter, out: &mut Vec<Finding>) {
+    let _ = audit_and_compile(charter, out);
+}
+
+/// Return the already audited artifact so the caller does not compile a third time.
+pub(super) fn audit_and_compile(
+    charter: &TokenCharter,
+    out: &mut Vec<Finding>,
+) -> Option<CompiledToken> {
     // K-3 fix: skip compilation entirely when Lane C's KRP-046 pre-flight already
     // denies the charter on pubkey size alone. Before this guard, Lane D compiled
     // the charter TWICE unconditionally (for the KRP-060 determinism diff below)
@@ -92,7 +101,7 @@ pub(super) fn audit(charter: &TokenCharter, out: &mut Vec<Finding>) {
     // the time this lane runs (`kirpich.rs` calls `params::audit` before
     // `emitted::audit`), so nothing is lost by returning without compiling.
     if super::params::pubkey_budget_denied(charter) {
-        return;
+        return None;
     }
 
     // Two independent compiles of the same charter — the input to KRP-060. This is an
@@ -105,6 +114,7 @@ pub(super) fn audit(charter: &TokenCharter, out: &mut Vec<Finding>) {
     audit_budget(&compiled, out); // KRP-062
     audit_supply_blch(charter, &compiled, out); // KRP-063
     audit_neuter(charter, &compiled, out); // KRP-064
+    Some(compiled)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -8,11 +8,16 @@
 //! validator — a concrete `Vec<Op>` program with a stable `validator_hash` that guards
 //! the token's outputs.
 //!
+//! This is the historical per-module compiler API. The executable v2 native-token
+//! lifecycle is [`crate::ustav`], which resolves registered policies, supplies their
+//! contexts and uses subject-bound SMT proofs instead of the legacy KYC commitment.
+//!
 //! ## What this file gives you
 //!
 //! - [`ModuleKind`] — the six first-class module kinds, each with a small typed config:
 //!   * [`ModuleKind::Supply`]         → a **minting-policy** program (fixed cap +
-//!     authorized issuer). Its hash IS the token's `AssetId` / policy id.
+//!     authorized issuer). Its hash identifies the raw minting program; charter
+//!     policy IDs and v2 registration IDs are separate namespaces.
 //!   * [`ModuleKind::TransferPolicy`] → a **spend validator** asserting an allow-gate
 //!     (a freeze switch guarded by a transfer authority).
 //!   * [`ModuleKind::ComplianceKycGate`] → a validator requiring a **membership
@@ -74,12 +79,12 @@ pub const FIELD_KYC_ROOT: u8 = 2;
 // Typed module configs
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// **Supply** module config — a minting policy. `cap` is the hard maximum issuable in
-/// one mint (a fixed cap); `issuer_pubkey` is the sole authorized issuer whose PQ
+/// **Supply** module config — a minting policy. `cap` bounds total outstanding
+/// supply; `issuer_pubkey` is the sole authorized issuer whose PQ
 /// signature over the sighash the mint requires.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SupplyConfig {
-    /// Fixed maximum amount authorizable by a single mint spend.
+    /// Fixed maximum outstanding supply, including the requested mint/burn delta.
     pub cap: u64,
     /// The authorized issuer's public key (PQ; verified via [`crate::SigVerifier`]).
     pub issuer_pubkey: Vec<u8>,
@@ -198,8 +203,8 @@ impl ModuleKind {
 // sit under the datum. Every emitter below is annotated with the stack it assumes.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Supply → minting policy. Stack seed `[datum, requested:Int, sig:Bytes]`.
-/// Asserts `requested <= cap`, then verifies the issuer signed the sighash.
+/// Supply → minting policy. Stack seed `[sig:Bytes]`.
+/// Asserts `prior_supply + delta <= cap`, then verifies the issuer's signature.
 fn compile_supply(c: &SupplyConfig) -> Vec<Op> {
     // ── HIGH severity fix, 2026-08-11 ────────────────────────────────────────
     //
@@ -458,7 +463,7 @@ impl CompiledToken {
     /// bytes at all).
     ///
     /// No separate Kirpich rule is added for this: unlike the scalar/structural
-    /// defects the 23 KRP rules catch (each a property of ONE charter), "two
+    /// defects the KRP rules catch (each a property of ONE charter), "two
     /// charters collide" is not a predicate a single-charter audit function can
     /// evaluate — there is no second charter in scope. Binding `charter_id`
     /// structurally eliminates the collision class (by injectivity of the
@@ -514,24 +519,33 @@ pub fn compile_charter(charter: &TokenCharter) -> CompiledToken {
 }
 
 /// **Fail-closed audited compile.** Run the [`crate::kirpich`] internal audit over
-/// `charter` *first*; if the audit denies (any [`crate::kirpich::Severity::Deny`]
-/// finding), refuse to compile and return the full [`crate::kirpich::AuditReport`] as the
-/// error. Otherwise compile exactly as [`compile_charter`] does.
+/// `charter`; if the audit denies (any [`crate::kirpich::Severity::Deny`]
+/// finding), return the full [`crate::kirpich::AuditReport`] as the error. Otherwise
+/// return the artifact already compiled and inspected by the emitted-program lane.
 ///
 /// This is the gated build entry point: a charter with a hard defect (an ambiguous
 /// minting policy, an unsatisfiable quorum, a permanently-locked custody leg, a corrupt
-/// emitted validator, …) never reaches the compiler. `Warn`/`Info` findings do not block
+/// emitted validator, …) never returns a usable artifact. The audit itself performs
+/// two bounded compilations to compare emitted bytes. `Warn`/`Info` findings do not block
 /// and are not surfaced on the `Ok` path; a caller that wants the advisories should call
-/// [`crate::kirpich::kirpich_audit`] directly. [`compile_charter`] itself is left
+/// [`compile_charter_with_report`]. [`compile_charter`] itself is left
 /// untouched (un-audited) for callers that opt out of the gate.
 pub fn compile_charter_audited(
     charter: &TokenCharter,
 ) -> Result<CompiledToken, crate::kirpich::AuditReport> {
-    let report = crate::kirpich::kirpich_audit(charter);
-    if report.denied {
-        return Err(report);
+    compile_charter_with_report(charter).map(|(compiled, _)| compiled)
+}
+
+/// Audited compilation with advisories retained. Registration in the Ustav
+/// kernel uses this entry point; callers cannot substitute a precompiled token.
+pub fn compile_charter_with_report(
+    charter: &TokenCharter,
+) -> Result<(CompiledToken, crate::kirpich::AuditReport), crate::kirpich::AuditReport> {
+    let (report, compiled) = crate::kirpich::audit_and_compile(charter);
+    match compiled {
+        Some(compiled) if !report.denied => Ok((compiled, report)),
+        _ => Err(report),
     }
-    Ok(compile_charter(charter))
 }
 
 /// SHA-256d (double SHA-256), matching the VM's [`crate::Op::Sha256d`] and
