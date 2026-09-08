@@ -182,7 +182,7 @@ fn main() {
         .export(&request, &export_w, 2, &BlochVerifier, GAS)
         .unwrap();
     assert_eq!(record, prepared);
-    assert_eq!(ledger.export_root(), (prepared_root, 1));
+    assert_eq!(ledger.export_root(), Ok((prepared_root, 1)));
     fixture["phase"] = json!(1);
     fixture["adapter_code_hash"] = json!(hex(&route.adapter_code_hash));
     let destination = evm(&bridge, &input, &output, &fixture);

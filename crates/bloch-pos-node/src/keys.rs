@@ -335,10 +335,13 @@ fn plaintext_opt_in() -> bool {
         )
 }
 
+/// Auto-index keystores bind duties to their registered public key.
+pub const AUTO_VALIDATOR_INDEX: u32 = u32::MAX;
+
 /// A loaded validator keystore. Secret material lives only in this struct;
 /// nothing here implements `Debug`/`Display` for the secret fields.
 pub struct Keystore {
-    /// Validator index this key was registered under at genesis.
+    /// Fixed registry index, or AUTO_VALIDATOR_INDEX for a joining validator.
     pub index: u32,
     /// Suite-enveloped hybrid public key.
     pub pubkey: Vec<u8>,

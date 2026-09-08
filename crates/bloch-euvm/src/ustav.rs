@@ -15,8 +15,8 @@ use crate::state::{self, Proof, SparseMerkleTree};
 use crate::{AssetId, Ctx, SigVerifier, Val, VmError};
 use std::collections::{BTreeMap, BTreeSet};
 
-mod encoding;
 pub mod chameleon;
+mod encoding;
 use encoding::HashWriter;
 
 pub const KERNEL_VERSION: u32 = 3;
@@ -165,7 +165,7 @@ impl Transaction {
         if self.inputs.is_empty() && self.delta <= 0 {
             return Err(Error::InvalidAmount);
         }
-        if self.delta > i128::from(u64::MAX) || self.delta < -i128::from(u64::MAX) {
+        if self.delta.unsigned_abs() > u128::from(u64::MAX) {
             return Err(Error::SupplyOutOfRange);
         }
         if self.delta <= 0 && self.mint_nonce != 0 {
@@ -355,7 +355,7 @@ impl Ledger {
         }
         let message = token.registration.signing_hash(&self.domain)?;
         charge(&mut gas, SIGNATURE_GAS)?;
-        if !verifier.verify_pq(&message, issuer(&token), signature) {
+        if !verifier.verify_pq(&message, issuer(&token)?, signature) {
             return Err(Error::InvalidSignature);
         }
         self.tokens.insert(asset, token);
@@ -380,13 +380,17 @@ impl Ledger {
         }
         let witness_bytes = witnesses.check(token.compiled.validators.len(), tx.inputs.len())?;
         let mut gas = gas_limit;
-        let output_bytes: usize = tx.outputs.iter().map(|o| o.owner.len() + 16).sum();
+        let output_bytes: usize = tx.outputs.iter().fold(0usize, |n, o| {
+            n.saturating_add(o.owner.len()).saturating_add(16)
+        });
         if witness_bytes.saturating_add(output_bytes) > MAX_WITNESS_BYTES {
             return Err(Error::ResourceLimit("transaction and witness bytes"));
         }
         charge(
             &mut gas,
-            100 + words(witness_bytes + output_bytes) + tx.inputs.len() as u64,
+            100u64
+                .saturating_add(words(witness_bytes.saturating_add(output_bytes)))
+                .saturating_add(tx.inputs.len() as u64),
         )?;
         let message = tx.signing_hash(&self.domain)?;
         let mut total_in = 0i128;
@@ -411,7 +415,7 @@ impl Ledger {
         }
         let mut total_out = 0i128;
         for output in &tx.outputs {
-            charge(&mut gas, words(output.owner.len()) + 1)?;
+            charge(&mut gas, words(output.owner.len()).saturating_add(1))?;
             if !verifier.valid_pq_key(&output.owner) {
                 return Err(Error::InvalidKey);
             }
@@ -426,7 +430,7 @@ impl Ledger {
         let supply = i128::from(token.supply)
             .checked_add(tx.delta)
             .ok_or(Error::ArithmeticOverflow)?;
-        if supply < 0 || supply > i128::from(cap(token)) {
+        if supply < 0 || supply > i128::from(cap(token)?) {
             return Err(Error::SupplyOutOfRange);
         }
         let next_nonce = if tx.delta > 0 {
@@ -461,10 +465,18 @@ impl Ledger {
         if ids.iter().any(|id| self.outputs.contains_key(id)) {
             return Err(Error::OutputCollision);
         }
-        if self.outputs.len() - tx.inputs.len() + tx.outputs.len() > MAX_LEDGER_OUTPUTS {
+        if self
+            .outputs
+            .len()
+            .checked_sub(tx.inputs.len())
+            .and_then(|n| n.checked_add(tx.outputs.len()))
+            .ok_or(Error::ArithmeticOverflow)?
+            > MAX_LEDGER_OUTPUTS
+        {
             return Err(Error::ResourceLimit("ledger output count"));
         }
 
+        let token = self.tokens.get_mut(&tx.asset).ok_or(Error::UnknownAsset)?;
         // All fallible validation and checked arithmetic precedes the commit.
         for id in &tx.inputs {
             self.outputs.remove(id);
@@ -478,17 +490,14 @@ impl Ledger {
                 },
             );
         }
-        let token = self
-            .tokens
-            .get_mut(&tx.asset)
-            .expect("validated registry entry");
+
         token.supply = supply as u64;
         token.mint_nonce = next_nonce;
         Ok(Receipt {
             transaction: message,
             outputs: ids,
             supply: supply as u64,
-            gas_used: gas_limit - gas,
+            gas_used: gas_limit.saturating_sub(gas),
         })
     }
 
@@ -530,7 +539,7 @@ impl Ledger {
             .checked_add(1)
             .ok_or(Error::ArithmeticOverflow)?;
         let mut gas = gas_limit;
-        charge(&mut gas, 100 + words(bytes))?;
+        charge(&mut gas, 100u64.saturating_add(words(bytes)))?;
         run_modules(
             token,
             witnesses,
@@ -545,13 +554,13 @@ impl Ledger {
         let token = self
             .tokens
             .get_mut(&update.asset)
-            .expect("validated registry entry");
+            .ok_or(Error::UnknownAsset)?;
         match update.action {
             PolicyAction::SetFrozen(frozen) => token.frozen = frozen,
             PolicyAction::SetKycRoot(root) => token.kyc_root = Some(root),
         }
         token.revision = next;
-        Ok(gas_limit - gas)
+        Ok(gas_limit.saturating_sub(gas))
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -603,7 +612,7 @@ impl Ledger {
         for (asset, state) in snapshot.tokens {
             let mut token = validate_registration(state.registration, verifier)?;
             if token.registration.asset_id(&ledger.domain)? != asset
-                || state.supply > cap(&token)
+                || state.supply > cap(&token)?
                 || token.kyc_root.is_some() != state.kyc_root.is_some()
                 || (state.revision == 0 && (state.frozen || state.kyc_root != token.kyc_root))
             {
@@ -752,7 +761,7 @@ fn validate_registration(
     })
 }
 
-fn issuer(token: &Token) -> &[u8] {
+fn issuer(token: &Token) -> Result<&[u8], Error> {
     token
         .registration
         .charter
@@ -762,9 +771,9 @@ fn issuer(token: &Token) -> &[u8] {
             ModuleKind::Supply(c) => Some(c.issuer_pubkey.as_slice()),
             _ => None,
         })
-        .expect("registered Supply")
+        .ok_or(Error::InvalidCharter("missing Supply module"))
 }
-fn cap(token: &Token) -> u64 {
+fn cap(token: &Token) -> Result<u64, Error> {
     token
         .registration
         .charter
@@ -774,7 +783,7 @@ fn cap(token: &Token) -> u64 {
             ModuleKind::Supply(c) => Some(c.cap),
             _ => None,
         })
-        .expect("registered Supply")
+        .ok_or(Error::InvalidCharter("missing Supply module"))
 }
 fn charge(gas: &mut u64, cost: u64) -> Result<(), Error> {
     *gas = gas.checked_sub(cost).ok_or(Error::OutOfGas)?;
@@ -792,7 +801,9 @@ fn registration_cost(registration: &Registration) -> u64 {
         });
     }
     // Reference units only: bounds the cost before compilation, not a mainnet fee.
-    1000 + words(bytes).saturating_mul(16) + registration.charter.modules.len() as u64 * 100
+    1000u64
+        .saturating_add(words(bytes).saturating_mul(16))
+        .saturating_add((registration.charter.modules.len() as u64).saturating_mul(100))
 }
 
 // Each module gets its own typed host context and stack; never concatenate

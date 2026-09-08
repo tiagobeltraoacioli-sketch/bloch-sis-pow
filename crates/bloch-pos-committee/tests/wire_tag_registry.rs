@@ -153,7 +153,8 @@ struct Claim {
 /// invites an editor to mark a contested byte free instead of ruling on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
-    /// Shipped in tag `g4-node-20260901` and on the live chain. Canonical.
+    /// Assigned canonical decoder format. Historical rows name the first
+    /// shipped tag; new formats may have an independent, unarmed flag day.
     ///
     /// `rivals` names branches that give this SAME released byte a DIFFERENT
     /// meaning. A released byte with a live rival is the most dangerous row in
@@ -193,6 +194,8 @@ const ONE_WAY_TX_TAGS: &[u8] = &[];
 // §1 — PosTransaction wire tags. First byte of `canonical_bytes`.
 // ---------------------------------------------------------------------------
 const TX_TAGS: &[(u8, Status)] = &[
+    // Fresh assignment for funded admission. Contested 0x07-0x0A remain closed.
+    (0x0B, Status::Released { name: "FundedDeposit", rivals: NO_RIVALS }),
     (0x01, Status::Released { name: "Transfer", rivals: NO_RIVALS }),
     (0x02, Status::Released { name: "Deposit", rivals: NO_RIVALS }),
     (0x03, Status::Released { name: "Exit", rivals: NO_RIVALS }),
@@ -546,6 +549,7 @@ fn frozen_variant_space(tx: &PosTransaction) -> u8 {
         // `contested_transaction_tags_are_refused` holds the line until the
         // founder assigns the byte.
         PosTransaction::RandaoRecommit { .. } => 0x0A,
+        PosTransaction::FundedDeposit(_) => 0x0B,
         // NO wildcard arm. Adding one defeats the entire freeze.
     }
 }
@@ -605,8 +609,9 @@ fn decoded_variant_name(tag: u8) -> Option<String> {
     None
 }
 
-/// The released space is exactly `0x01`-`0x06`. Verified against tag
+/// The historical released space is `0x01`-`0x06`. Verified against tag
 /// `g4-node-20260901` by object id: no `0x07`/`0x08`/`0x09` has ever shipped.
+/// Fresh `0x0B` adds funded admission; its activation is independent and unarmed.
 ///
 /// Three ways a merge can break a released tag, and all three are checked:
 ///   * it stops being recognised (renumbered or dropped) — this build could

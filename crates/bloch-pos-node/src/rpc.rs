@@ -848,6 +848,8 @@ pub enum RpcRequest {
     BlockById([u8; 32]),
     Validator(u32),
     ValidatorCount,
+    ValidatorByKey([u8; 32]),
+    ValidatorAdmission,
     Balance([u8; 32]),
     Utxos { script_hash: [u8; 32], limit: usize },
     /// `gettxout` — is this ONE output still unspent?
@@ -1118,6 +1120,8 @@ pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError
         "getblockbyid" => RpcRequest::BlockById(want_hex32(params, 0, "block_id")?),
         "getvalidator" => RpcRequest::Validator(want_u32(params, 0, "index")?),
         "getvalidatorcount" => RpcRequest::ValidatorCount,
+        "getvalidatorbykey" => RpcRequest::ValidatorByKey(want_hex32(params, 0, "pubkey_hash")?),
+        "getvalidatoradmission" => RpcRequest::ValidatorAdmission,
         "getbalance" => RpcRequest::Balance(want_hex32(params, 0, "script_hash")?),
         // Refused on purpose, and permanently for this build. See the doc
         // comments on the two constructors for the full reasoning.
@@ -2066,6 +2070,7 @@ pub fn submitted_json(tx: &PosTransaction, outcome: Admitted) -> Json {
         PosTransaction::Transfer { .. } => "transfer",
         PosTransaction::TransferV2 { .. } => "transfer_v2",
         PosTransaction::Deposit { .. } => "deposit",
+        PosTransaction::FundedDeposit(_) => "funded_deposit",
         PosTransaction::Exit { .. } => "exit",
         // Distinct from "exit" on purpose: the two are different messages with
         // different rules (one authenticated, one not) and an operator reading
@@ -2492,3 +2497,27 @@ mod tests;
 // this declaration is still here, so deleting it goes red rather than quiet.
 #[cfg(test)]
 mod method_registry;
+
+/// Network-bound admission terms. Null activation means the binary is unarmed.
+pub fn validator_admission_json(state: &bloch_pos_committee::transition::CommittedState) -> Json {
+    use bloch_pos_committee::{params, staking};
+    use bloch_pos_committee::interfaces::StateReader;
+    let activation = params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH;
+    let epoch = bloch_pos_committee::epoch_of(state.slot());
+    let cap = state.total_active_stake_sat().saturating_mul(bloch_pos_committee::delegation::MAX_VALIDATOR_STAKE_BPS)
+        .checked_div(10_000).unwrap_or(0).max(staking::MIN_DEPOSIT_SAT);
+    Json::obj(vec![
+        ("active", Json::Bool(params::funded_validator_admission_active(epoch))),
+        ("activation_epoch", if activation == u64::MAX { Json::Null } else { Json::u(activation) }),
+        ("network_domain", state.admission_network_domain().map_or(Json::Null, |v| Json::hex(&v))),
+        ("epoch", Json::u(epoch)),
+        ("wire_tag", Json::s("0x0b")),
+        ("signature_suite", Json::s("ML-DSA-65 AND Falcon-1024 (0x0001)")),
+        ("minimum_stake_sat", Json::sat(staking::MIN_DEPOSIT_SAT)),
+        ("maximum_stake_sat", Json::sat(cap)),
+        ("activation_delay_epochs", Json::u(staking::ACTIVATION_DELAY_EPOCHS)),
+        ("maximum_activations_per_epoch", Json::u(staking::MAX_ACTIVATIONS_PER_EPOCH as u64)),
+        ("next_base_fee_millisat_per_gas", Json::sat(state.next_base_fee())),
+        ("legacy_unfunded_deposit_enabled", Json::Bool(false)),
+    ])
+}

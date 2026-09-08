@@ -98,6 +98,8 @@ const ROUTED: &[(&str, &str)] = &[
     ("getblockbyid", "BlockById"),
     ("getvalidator", "Validator"),
     ("getvalidatorcount", "ValidatorCount"),
+    ("getvalidatorbykey", "ValidatorByKey"),
+    ("getvalidatoradmission", "ValidatorAdmission"),
     ("getbalance", "Balance"),
     ("gettxout", "TxOut"),
     ("getutxos", "Utxos"),

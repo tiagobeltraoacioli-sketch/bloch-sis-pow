@@ -307,7 +307,7 @@ fn export_signature_binds_destination_nonce_transaction_and_lock_selection() {
     assert!(ledger.is_locked(&receipt.outputs[0]));
     assert!(!ledger.is_locked(&receipt.outputs[1]));
     assert_eq!(ledger.native().supply(&route.asset), Some(100));
-    let (root, count) = ledger.export_root();
+    let (root, count) = ledger.export_root().unwrap();
     assert!(wire::verify_inclusion(
         &record.id(),
         &ledger.export_proof(0).unwrap(),

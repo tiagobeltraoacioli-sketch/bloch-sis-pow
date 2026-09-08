@@ -238,6 +238,9 @@ allow = ["AGPL-3.0-or-later"]
 name = "bloch-crypto"
 allow = ["AGPL-3.0-or-later"]
 [[licenses.exceptions]]
+name = "bloch-ustav"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
 name = "coherence-core"
 allow = ["AGPL-3.0-or-later"]
 [[licenses.exceptions]]

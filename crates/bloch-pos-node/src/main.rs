@@ -24,7 +24,7 @@
 //! (`docs/specs/BLOCH-POS-NODE-INTEGRATION.md`): no RocksDB store, no
 //! post-quantum transport handshake (the p2p layer uses Noise; consensus
 //! signatures are hybrid PQ regardless), no peer persistence or peer
-//! exchange, no deposits/exits, no slashing-evidence pipeline, no
+//! exchange, no activated deposit/exit or slashing-evidence pipeline, no
 //! checkpoint-sync **state download** (the weak-subjectivity boot gate itself
 //! IS wired — `ws_boot`). RPC and the mainnet genesis manifest were on this
 //! list and have since been wired: `mod rpc` is served from the engine once the
@@ -55,6 +55,7 @@ mod rpc;
 mod slashprot;
 mod store;
 mod ws_boot;
+mod validator_deposit;
 
 use std::path::PathBuf;
 use std::process::exit;
@@ -136,6 +137,12 @@ fn main() {
         Some("genesis") => genesis_cmd(&args[1..]),
         Some("genesis-mainnet") => genesis_mainnet(&args[1..]),
         Some("submit-tx") => submit_tx(&args[1..]),
+        Some("validator-deposit") => {
+            if let Err(error) = validator_deposit::run(&args[1..]) {
+                eprintln!("validator-deposit: {error}");
+                exit(2);
+            }
+        }
         Some("run") => run_cmd(&args[1..]),
         Some(other) => {
             eprintln!("{NAME}: unknown command `{other}` (see --help)");
@@ -190,6 +197,12 @@ fn print_help() {
                Print the PUBLIC header of validator.key: format, index,\n\
                pubkey sha3, KDF cost, file mode. Opens nothing, prints no\n\
                secret. Also reports whether the data dir lock is free.\n\
+           bloch-pos validator-deposit --help
+\
+               Prepare, inspect and separately sign a funded PQ deposit offline.
+\
+               Use keygen --index auto for a joining devnet validator.
+\
            bloch-pos submit-tx --to <host:port> --pubkey <hex>\n\
                                --spend <txid-hex>:<vout> [--spend ...]\n\
                                --pay <script-hash-hex>:<sat> [--pay ...]\n\
@@ -771,8 +784,8 @@ fn keygen(args: &[String]) {
         eprintln!("keygen: --dir is required");
         exit(2);
     };
-    let Some(index) = arg_value(args, "--index").and_then(|s| s.parse::<u32>().ok()) else {
-        eprintln!("keygen: --index <u32> is required");
+    let Some(index) = arg_value(args, "--index").and_then(|s| if s == "auto" { Some(keys::AUTO_VALIDATOR_INDEX) } else { s.parse::<u32>().ok() }) else {
+        eprintln!("keygen: --index <u32|auto> is required");
         exit(2);
     };
     match keys::Keystore::generate(&PathBuf::from(&dir), index) {

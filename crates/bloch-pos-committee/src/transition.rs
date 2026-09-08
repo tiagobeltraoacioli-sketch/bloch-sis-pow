@@ -145,6 +145,9 @@ use crate::interfaces::{
     TransitionError, ValidatorRecord,
 };
 use crate::params::SLOTS_PER_EPOCH;
+
+pub mod funded;
+pub use funded::{FundedDeposit, FundedDepositReject, FundingInput};
 use crate::rewards::{self, StakeAccount};
 use crate::sample::Validator;
 use crate::schedule;
@@ -300,6 +303,8 @@ pub struct TransferOutput {
 /// not receive.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PosTransaction {
+    /// PQ-authorized, UTXO-funded validator registration (wire 0x0B).
+    FundedDeposit(FundedDeposit),
     /// A value transfer against the committed eUTXO set, priced by the L1 fee
     /// market: **gas × price**, where the gas is derived (class + size,
     /// `fee_market::intrinsic_gas`) and the price is the base fee this block's
@@ -687,6 +692,7 @@ impl PosTransaction {
                     *tip_millisat_per_gas,
                 );
             }
+            PosTransaction::FundedDeposit(tx) => return tx.intent_root(),
             other => h.update(other.canonical_bytes()),
         }
         h.finalize().into()
@@ -843,6 +849,7 @@ impl PosTransaction {
             b.extend_from_slice(bytes);
         };
         match self {
+            PosTransaction::FundedDeposit(tx) => return tx.canonical_bytes(),
             PosTransaction::Transfer { inputs, outputs, tx_bytes, tip_millisat_per_gas } => {
                 b.push(0x01);
                 // Counts are length prefixes like every other variable-length
@@ -1025,6 +1032,7 @@ impl PosTransaction {
         let mut r = TxReader { b: bytes, i: 0 };
         let tag = r.u8()?;
         let tx = match tag {
+            funded::FUNDED_DEPOSIT_TAG => PosTransaction::FundedDeposit(FundedDeposit::decode(&mut r)?),
             0x01 => {
                 // Counts are read from untrusted bytes, so nothing is
                 // preallocated from them: a 4-billion-input header on a 40-byte
@@ -1232,6 +1240,7 @@ impl core::fmt::Display for TxDecodeError {
 /// refuses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TxReject {
+    FundedDeposit(FundedDepositReject),
     /// A value transfer broke one of the eUTXO rules.
     Transfer(TransferReject),
     /// A deposit, exit or delegation failed its state-dependent rule.
@@ -1478,6 +1487,8 @@ fn report_boundary_vote_drop(closing: u64, admitted: usize, tallied: usize) {
 /// transition itself — there is no constructor that reads a database.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CommittedState {
+    // Immutable genesis-manifest context; deliberately outside historical state-root encoding.
+    admission_network_domain: Option<[u8; 32]>,
     /// Slot of the block whose post-state this is.
     slot: u64,
     /// Epoch whose accounting context is current. Blocks may only apply in
@@ -2178,6 +2189,7 @@ impl CommittedState {
 
         let genesis_cp = Checkpoint { epoch: 0, root: *genesis_block.as_bytes() };
         let mut st = CommittedState {
+            admission_network_domain: None,
             slot: 0,
             epoch: 0,
             head: genesis_block,
@@ -2277,6 +2289,22 @@ impl CommittedState {
         );
 
         st
+    }
+
+    /// Construct a genesis state bound to its canonical manifest digest for
+    /// funded validator admission. The digest must be independently derived by
+    /// every node from its trusted genesis manifest, including the chain clock.
+    #[allow(clippy::too_many_arguments)]
+    pub fn genesis_with_network_domain(
+        network_domain: [u8; 32], genesis_block: BlockId, genesis_mix: [u8; 32],
+        validators: &[GenesisValidator], cohort: &[u32], taint_root: [u8; 32],
+        coherence_accumulator_root: [u8; 32], coherence_nullifier_root: [u8; 32],
+        evm: EvmCommitment, opening_balances: &[crate::state_root::EutxoEntry],
+    ) -> Self {
+        let mut state = Self::genesis(genesis_block, genesis_mix, validators, cohort,
+            taint_root, coherence_accumulator_root, coherence_nullifier_root, evm, opening_balances);
+        state.admission_network_domain = Some(network_domain);
+        state
     }
 
     /// Id of the block that produced this state.
@@ -3351,6 +3379,9 @@ impl CommittedState {
         verifier: &dyn SignatureVerifier,
     ) -> Result<fee_market::TxCharge, TxReject> {
         match tx {
+            PosTransaction::FundedDeposit(deposit) => self
+                .apply_funded_deposit(deposit, total_active_sat, base_fee_millisat_per_gas, verifier)
+                .map_err(TxReject::FundedDeposit),
             PosTransaction::Transfer { .. } => self
                 .apply_transfer(tx, base_fee_millisat_per_gas, verifier)
                 .map_err(TxReject::Transfer),
@@ -3485,7 +3516,9 @@ impl CommittedState {
                 // dead and `ExitV2` is the only voluntary exit; the constant
                 // is `u64::MAX`, so today this never fires and everything
                 // below is byte-for-byte the behaviour that shipped.
-                if Self::exit_auth_active(self.epoch) {
+                if Self::exit_auth_active(self.epoch)
+                    || crate::params::funded_validator_admission_active(self.epoch)
+                {
                     return Err(TxReject::StakingNotActive);
                 }
                 let Some(rec) = self.validators.get_mut(validator) else {
@@ -6336,6 +6369,10 @@ mod tx_codec_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod funded_admission {
+        use super::*;
+        include!("transition/funded/tests.rs");
+    }
     use crate::header::BlockHeaderV4;
 
     /// The genesis id, derived rather than invented.
@@ -13745,6 +13782,8 @@ mod tests {
             // no satoshi in either direction. Beacon state, not value state;
             // it cannot touch the cap.
             PosTransaction::RandaoRecommit { .. } => {}
+            // Funded admission transfers UTXO value into bonded stake and fees.
+            PosTransaction::FundedDeposit(_) => {}
         }
 
         // Monotone under blocks and boundaries, and never above the cap.

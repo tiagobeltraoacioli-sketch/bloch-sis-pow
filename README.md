@@ -164,6 +164,11 @@ change any rule, so "impossible to change" would be false.
 | Ustav (PSTRN-1) charter at L1 | proposal | no — nothing wired | no |
 | Third-party audit | scoped | pre-audit dossier written | **not performed** |
 
+Funded validator admission is implemented behind an **unarmed consensus flag
+day**. The [protocol and operator guide](docs/specs/BLOCH-FUNDED-VALIDATOR-ADMISSION.md)
+covers PQ funding/possession signatures, offline signing, automatic registry
+index discovery and the lifecycle dependencies required before mainnet activation.
+
 ## Where things are
 
 The repository root is a **virtual manifest** — it is a workspace, not a
