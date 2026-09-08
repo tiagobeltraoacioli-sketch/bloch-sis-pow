@@ -22,6 +22,8 @@ jobs:
       - name: Pinned toolchain
         run: rustup toolchain install 1.94.1 --profile minimal --component clippy --no-self-update
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Native PQ dependency boundary
+        run: python3 scripts/check-ustav-pq-boundary.py cargo +1.94.1
       - name: Existing EUVM suite and Ustav regressions
         run: cargo +1.94.1 test --locked -p bloch-euvm -p bloch-ustav
       - name: Transition and cryptographic regressions in release profile

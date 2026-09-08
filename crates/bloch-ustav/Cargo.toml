@@ -1,11 +1,10 @@
 [package]
 name = "bloch-ustav"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Versioned Ustav native-token kernel with Bloch hybrid signature verification (not consensus-wired)"
+description = "PQ-only Ustav native-token authorization kernel (not consensus-wired)"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
 bloch-euvm = { path = "../bloch-euvm" }
 bloch-crypto = { path = "../bloch-crypto", default-features = false }
-k256 = { version = "=0.13.4", default-features = false, features = ["ecdsa", "std"] }

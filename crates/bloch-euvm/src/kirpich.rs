@@ -14,7 +14,7 @@
 //! consensus-wired**. It lives behind the off-by-default `euvm` feature and is not
 //! compiled into the live Genesis-4 node binary. It never mutates a charter, never runs consensus, and
 //! never blocks the un-audited [`crate::modules::compile_charter`] (which is preserved
-//! as-is). The historical audited compiler is opt-in; the v2 [`crate::ustav`]
+//! as-is). The historical audited compiler is opt-in; the v3 [`crate::ustav`]
 //! registration and restore paths always require it.
 //!
 //! ## Determinism (sacred, shared by every lane)
@@ -58,7 +58,7 @@ mod emitted;
 mod params;
 pub mod limits;
 
-/// Version of the bounded audit rules, bound into v2 native-asset identities.
+/// Version of the bounded audit rules, bound into v3 native-asset identities.
 /// This is not a live consensus activation flag.
 pub const RULESET_VERSION: u32 = 2;
 

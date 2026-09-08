@@ -2,6 +2,13 @@
 
 # Bloch L1 Execution Plan — EVM at L1 and Ustav at L1
 
+**2026-09-08 authorization amendment:** ADR-040 now assigns ECDSA/EVM wallet
+compatibility to `bloch-l2-evm` and requires PQ-only native L1 authorization.
+The earlier "no L2" direction and unresolved E0 authorization choice below are
+historical. Ustav's executable v3 reference kernel is in `bloch-euvm::ustav`, with
+its concrete PQ host in `bloch-ustav`; live-node integration remains pending.
+Applications accessing L1 through an SDK/Snap must obtain a PQ signature.
+
 ```
 Document:   BLOCH-L1-EXECUTION-PLAN
 Status:     DRAFT — milestone plan for review; no code exists for either track

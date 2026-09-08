@@ -43,7 +43,7 @@ impl HashWriter {
 }
 
 pub(super) fn asset_hash(domain: &[u8; 32], registration: &Registration) -> [u8; 32] {
-    let mut h = HashWriter::new(b"USTAV-ASSET-v2");
+    let mut h = HashWriter::new(b"USTAV-ASSET-v3");
     h.fixed(domain);
     h.u32(KERNEL_VERSION);
     h.u32(RULESET_VERSION);
@@ -86,14 +86,14 @@ pub(super) fn asset_hash(domain: &[u8; 32], registration: &Registration) -> [u8;
 }
 
 pub(super) fn registration_hash(domain: &[u8; 32], registration: &Registration) -> [u8; 32] {
-    let mut h = HashWriter::new(b"USTAV-REGISTER-v2");
+    let mut h = HashWriter::new(b"USTAV-REGISTER-v3");
     h.fixed(&asset_hash(domain, registration));
     h.optional_hash(registration.initial_kyc_root);
     h.finish()
 }
 
 pub(super) fn transaction_hash(domain: &[u8; 32], tx: &Transaction) -> [u8; 32] {
-    let mut h = HashWriter::new(b"USTAV-TRANSACTION-v2");
+    let mut h = HashWriter::new(b"USTAV-TRANSACTION-v3");
     h.fixed(domain);
     h.u32(KERNEL_VERSION);
     h.fixed(&tx.asset);
@@ -115,7 +115,7 @@ pub(super) fn transaction_hash(domain: &[u8; 32], tx: &Transaction) -> [u8; 32] 
 }
 
 pub(super) fn update_hash(domain: &[u8; 32], update: &PolicyUpdate) -> [u8; 32] {
-    let mut h = HashWriter::new(b"USTAV-POLICY-UPDATE-v2");
+    let mut h = HashWriter::new(b"USTAV-POLICY-UPDATE-v3");
     h.fixed(domain);
     h.u32(KERNEL_VERSION);
     h.fixed(&update.asset);

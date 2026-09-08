@@ -1,9 +1,9 @@
 //! Adversarial transition tests. The deterministic test verifier binds both key
-//! and message; real ML-DSA/Falcon/ECDSA coverage lives in bloch-ustav.
+//! and message; real ML-DSA/Falcon coverage lives in bloch-ustav.
 use bloch_euvm::modules::*;
 use bloch_euvm::state::{self, SparseMerkleTree};
 use bloch_euvm::ustav::*;
-use bloch_euvm::{SigVerifier, Val};
+use bloch_euvm::Val;
 use sha2::{Digest, Sha256};
 
 const DOMAIN: [u8; 32] = [42; 32];
@@ -18,20 +18,12 @@ fn sign(message: &[u8], key: &[u8]) -> Vec<u8> {
     hash.update(message);
     hash.finalize().to_vec()
 }
-impl SigVerifier for TestVerifier {
-    fn verify(&self, msg: &[u8], pk: &[u8], sig: &[u8]) -> bool {
-        self.valid_pq_key(pk) && sig == sign(msg, pk)
-    }
-    fn verify_ecdsa(&self, msg: &[u8], pk: &[u8], sig: &[u8]) -> bool {
-        self.valid_ecdsa_key(pk) && sig == sign(msg, pk)
-    }
-}
 impl Verifier for TestVerifier {
     fn valid_pq_key(&self, key: &[u8]) -> bool {
         key.len() == 32 && key[0] != 0
     }
-    fn valid_ecdsa_key(&self, key: &[u8]) -> bool {
-        key.len() == 33 && key[0] == 2
+    fn verify_pq(&self, msg: &[u8], pk: &[u8], sig: &[u8]) -> bool {
+        self.valid_pq_key(pk) && sig == sign(msg, pk)
     }
 }
 fn basic() -> Registration {
@@ -61,10 +53,6 @@ fn full() -> Registration {
         ModuleKind::Governance(GovernanceConfig {
             threshold: 2,
             signers: vec![key(4), key(5), key(6)],
-        }),
-        ModuleKind::Custody(CustodyConfig {
-            btc_pubkey: vec![2; 33],
-            pq_pubkey: key(7),
         }),
     ]);
     r.initial_kyc_root = Some(state::empty_root());
@@ -116,7 +104,7 @@ fn module_witnesses(
                 ModuleKind::Vesting(c) if spends && !admin => vec![bytes(&c.beneficiary_pubkey)],
                 ModuleKind::Vesting(_) => vec![],
                 ModuleKind::Governance(c) => c.signers.iter().map(|k| bytes(k)).collect(),
-                ModuleKind::Custody(c) => vec![bytes(&c.btc_pubkey), bytes(&c.pq_pubkey)],
+                ModuleKind::Custody(_) => panic!("classical custody is not a native module"),
             })
             .collect(),
         ..Witnesses::default()
@@ -280,7 +268,7 @@ fn callers_cannot_omit_or_pad_registered_policies() {
 }
 
 #[test]
-fn all_six_modules_use_authenticated_context_and_subject_proofs() {
+fn all_native_modules_use_authenticated_context_and_subject_proofs() {
     let mut r = full();
     let asset = r.asset_id(&DOMAIN).unwrap();
     let tree = membership(&asset, &[key(8), key(10)], 100);
@@ -291,7 +279,7 @@ fn all_six_modules_use_authenticated_context_and_subject_proofs() {
     let mint = mint(asset, 60);
     let mut w = witnesses(&ledger, &mint);
     add_proofs(&mut w, &tree, &asset, &[key(8)]);
-    for (module, slot) in [(0, 0), (4, 0), (5, 0), (5, 1)] {
+    for (module, slot) in [(0, 0), (4, 0)] {
         let mut bad = w.clone();
         bad.modules[module][slot] = Val::Bytes(vec![]);
         // Governance is 2-of-3: remove two distinct signatures to miss quorum.
@@ -388,7 +376,7 @@ fn kyc_proofs_bind_asset_recipient_expiry_and_current_root() {
 }
 
 #[test]
-fn policy_updates_require_authority_governance_custody_and_fresh_revision() {
+fn policy_updates_require_authority_pq_quorum_and_fresh_revision() {
     let r = full();
     let (mut ledger, asset) = registered(&r);
     let update = PolicyUpdate {
@@ -398,7 +386,7 @@ fn policy_updates_require_authority_governance_custody_and_fresh_revision() {
         action: PolicyAction::SetFrozen(true),
     };
     let w = module_witnesses(&r, &update.signing_hash(&DOMAIN), 0, false, true);
-    for module in [1, 4, 5] {
+    for module in [1, 4] {
         let mut bad = w.clone();
         bad.modules[module].fill(Val::Bytes(vec![]));
         let before = ledger.snapshot();
@@ -736,19 +724,19 @@ fn signing_vectors_pin_the_independent_canonical_encoding() {
     };
     assert_eq!(
         hex(&asset),
-        "a224ab5ed1ed42cd4501c30a49ff049e30225b13b83a5f1b6bfacf7322d1e299"
+        "a49f10360a96d493c8879ee8776846e166da53acd1aaf08eb822935a21ce7878"
     );
     assert_eq!(
         hex(&r.signing_hash(&DOMAIN).unwrap()),
-        "2a2e8346c79916ba0b092d318ba0fbb2b3f3ac22c3821f89dcb35d1f88ca10ab"
+        "3d407cc8bd171b01cb2c7c789c712992b51a88a7f36c76dcf87201e80b0b16ff"
     );
     assert_eq!(
         hex(&tx.signing_hash(&DOMAIN).unwrap()),
-        "b144919303a8486658de648f6149bfa1e5ebf136d865fe5d02d401d4946088e1"
+        "1a5a4c40a85dc724d16ae9294bc12d6b6c5759dceb0e016e44a0eaf66ef3be96"
     );
     assert_eq!(
         hex(&update.signing_hash(&DOMAIN)),
-        "f05031709c50427edf39af2bc35cd788dfbc1128ef084aa3703396b456b154c0"
+        "a79a91aa26f7cb6d5ae2473d90f80bd4d8cfca5ac9ed2a0d5c09f2cd894baa8f"
     );
 }
 
@@ -776,4 +764,63 @@ fn unreachable_vesting_and_kyc_without_authority_cannot_register() {
         Err(Error::InvalidCharter(_))
     ));
     assert!(ledger.snapshot().tokens.is_empty());
+}
+
+#[test]
+fn classical_custody_is_rejected_even_with_a_permissive_host() {
+    struct Permissive;
+    impl Verifier for Permissive {
+        fn valid_pq_key(&self, _: &[u8]) -> bool {
+            true
+        }
+        fn verify_pq(&self, _: &[u8], _: &[u8], _: &[u8]) -> bool {
+            true
+        }
+    }
+    for classical_key in [vec![2; 33], key(7)] {
+        let mut r = basic();
+        r.charter.modules.push(ModuleKind::Custody(CustodyConfig {
+            btc_pubkey: classical_key,
+            pq_pubkey: key(8),
+        }));
+        let mut ledger = Ledger::new(DOMAIN);
+        let before = ledger.snapshot();
+        assert_eq!(
+            ledger.register(r.clone(), b"any signature", &Permissive, GAS),
+            Err(Error::ClassicalPolicyNotAllowed)
+        );
+        assert_eq!(ledger.snapshot(), before);
+        // Relabeling legacy state as v3 cannot revive its classical module.
+        let snapshot = Snapshot {
+            version: KERNEL_VERSION,
+            domain: DOMAIN,
+            tokens: vec![(
+                r.asset_id(&DOMAIN).unwrap(),
+                TokenSnapshot {
+                    registration: r,
+                    supply: 0,
+                    mint_nonce: 0,
+                    revision: 0,
+                    frozen: false,
+                    kyc_root: None,
+                },
+            )],
+            outputs: vec![],
+        };
+        assert!(matches!(
+            Ledger::restore(snapshot, [0; 32], &Permissive),
+            Err(Error::ClassicalPolicyNotAllowed)
+        ));
+    }
+}
+
+#[test]
+fn v2_state_is_not_silently_reinterpreted_as_pq_only() {
+    let mut snapshot = Ledger::new(DOMAIN).snapshot();
+    snapshot.version = 2;
+    assert!(matches!(
+        Ledger::restore(snapshot, [0; 32], &TestVerifier),
+        Err(Error::InvalidSnapshot)
+    ));
+    assert_eq!(KERNEL_VERSION, 3);
 }
