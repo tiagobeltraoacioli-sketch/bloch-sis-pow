@@ -122,7 +122,8 @@ pub enum NetEvent {
     /// `report_message_validation_result`; on the devnet mesh it is
     /// [`Origin::none`] and reporting is a no-op.
     Attestation(Attestation, Origin),
-    Transaction(bloch_pos_committee::transition::PosTransaction),
+    /// Relay is deferred until the engine validates against its committed state.
+    Transaction(bloch_pos_committee::transition::PosTransaction, Origin),
 }
 
 /// The transport the engine holds, chosen at startup.
@@ -305,7 +306,7 @@ pub fn queued_bytes(ev: &NetEvent) -> usize {
             crate::codec::encode_attestation(&mut b, att);
             b.len()
         }
-        NetEvent::Transaction(tx) => tx.canonical_bytes().len(),
+        NetEvent::Transaction(tx, _) => tx.canonical_bytes().len(),
     }
 }
 
@@ -796,7 +797,7 @@ fn decode_event(frame: &[u8]) -> Option<NetEvent> {
             // bytes it would later commit to and fail to reproduce.
             bloch_pos_committee::transition::PosTransaction::from_canonical_bytes(&frame[1..])
                 .ok()
-                .map(NetEvent::Transaction)
+                .map(|tx| NetEvent::Transaction(tx, Origin::none()))
         }
         _ => None,
     }

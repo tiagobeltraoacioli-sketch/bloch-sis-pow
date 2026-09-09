@@ -100,6 +100,8 @@ use bloch_pos_committee::interfaces::TransitionError;
 use bloch_pos_committee::{committees, derive, epoch_of, schedule};
 use sha3::{Digest, Sha3_256};
 
+mod validator_lifecycle;
+
 use crate::genesis::Manifest;
 #[cfg(test)]
 use crate::genesis::GENESIS_MIX;
@@ -909,6 +911,7 @@ struct Engine {
     /// own size, not an attacker's budget, and it is the honest remaining
     /// limitation.
     blocks: BTreeMap<[u8; 32], BlockEnvelope>,
+    observed_proposals: BTreeMap<(u64, u32), ProposalEnvelope>,
     /// Canonical chain, ascending slot, genesis first.
     chain: Vec<(u64, BlockId)>,
     /// Canonical ids (incl. genesis).
@@ -1641,7 +1644,10 @@ impl Engine {
         // A reorganization may assign an auto-index key a different index.
         let count = self.state.validator_index_by_pubkey(&keys.pubkey)
             .and_then(|index| self.state.validator_reveals_used(index)).unwrap_or(0);
-        let mut chain = RandaoChain::generate(keys.randao_seed);
+        let generation = self.state.validator_index_by_pubkey(&keys.pubkey)
+            .map_or(0, |index| self.state.validator_randao_generation(index));
+        let network = self.state.admission_network_domain().unwrap_or([0; 32]);
+        let mut chain = RandaoChain::generate(keys.randao_seed_for(&network, generation));
         for _ in 0..count {
             chain.next_reveal();
         }
@@ -1868,7 +1874,7 @@ impl Engine {
         let randao = self.randao_positioned(keys);
         let Some(reveal) = randao.peek_reveal() else {
             eprintln!(
-                "[slot {slot}] RANDAO chain spent — cannot propose (re-commit path not wired)"
+                "[slot {slot}] RANDAO chain spent — waiting for an included renewal"
             );
             return;
         };
@@ -2121,6 +2127,21 @@ impl Engine {
     /// charged to anyone, which is why it maps to `Ignore`.
     fn ingest_judged(&mut self, env: BlockEnvelope) -> Verdict {
         self.ingest_from_judged(env, Source::Gossip)
+    }
+
+    /// Repair a missing branch ancestor, not just a missing newer block.
+    /// Asking only after our head can never retrieve a competing branch
+    /// whose missing parent is older than that head. Start a bounded window
+    /// before the earliest orphan; successive pages can move that window
+    /// backwards until they connect, without rewinding consensus state.
+    fn sync_after_slot(&self) -> u64 {
+        if !self.needs_sync && self.orphans.is_empty() { return self.state.slot(); }
+        let missing_before = self.orphans.iter().map(|(_, env)| env.header.slot.saturating_sub(1))
+            .min().unwrap_or(self.state.slot()).min(self.state.slot());
+        let finalized = self.state.finality().finalized.root;
+        let floor = self.chain.iter().rev().find(|(_, id)| *id.as_bytes() == finalized)
+            .map_or(0, |(slot, _)| *slot);
+        missing_before.saturating_sub(SLOTS_PER_EPOCH.saturating_mul(2)).max(floor)
     }
 
     /// Ingest `env` and then everything it unblocks, discarding the verdict.
@@ -2447,6 +2468,7 @@ impl Engine {
         // is exactly the class of sighting doppelgänger protection exists to
         // catch, symmetric with the attestation hook in `apply_decision`.
         let proposer_index = env.header.proposer_index;
+        self.observe_proposer_equivocation(&env);
         self.blocks.insert(id, env);
         self.note_possible_doppelganger(proposer_index);
         self.advance();
@@ -3095,6 +3117,10 @@ impl Engine {
             }
         }
         admissible(&tx, epoch_of(self.wall_slot())).map_err(Refusal::Invalid)?;
+        if self.funded_mempool_conflict(&tx) {
+            return Err(Refusal::Invalid("funded deposit conflicts with a pending input or validator key"));
+        }
+        self.validate_lifecycle_admission(&tx)?;
         // R7 M6: only now, with the incoming transaction confirmed
         // admissible, actually commit the eviction decided above.
         if let Some(lowest_key) = evict_at_capacity {
@@ -3250,6 +3276,7 @@ impl Engine {
                 // sweep: the head has just moved, so this is the moment the
                 // TTL is measured against, and anything this block carried is
                 // already out of the pool and must not be counted as expired.
+                self.revalidate_lifecycle_mempool();
                 self.evict_stale_mempool();
                 let cur_e = epoch_of(self.state.slot());
                 self.pool.retain(|_, a| epoch_of(a.data.slot) >= cur_e);
@@ -3637,6 +3664,7 @@ impl Engine {
         self.ratchet_finalized();
         let cur_e = epoch_of(self.state.slot());
         self.pool.retain(|_, a| epoch_of(a.data.slot) >= cur_e);
+        self.revalidate_lifecycle_mempool();
         if self.live {
             let canonical_envs: Vec<BlockEnvelope> = self.chain[1..]
                 .iter()
@@ -3784,20 +3812,7 @@ impl Engine {
         match decision {
             GossipDecision::Accept { slashing_candidate } => {
                 if let Some(ev) = slashing_candidate {
-                    // Captured, not processed. The slashing pipeline
-                    // (`SlashingState::process`, evidence transactions) is not
-                    // wired in this binary — saying so here beats a silent
-                    // drop that looks like nothing happened.
-                    eprintln!(
-                        "EQUIVOCATION captured: validator {} signed two attestations for slot {} \
-                         (slashing pipeline NOT wired — evidence is logged, not prosecuted)",
-                        ev.second.validator, ev.second.data.slot,
-                    );
-                    // Metrics gap (R3): the log line above was the only trace
-                    // of this. An alert cannot page on a grep pattern.
-                    crate::metrics::NodeMetrics::inc(
-                        &crate::metrics::NODE.equivocations_observed_total,
-                    );
+                    self.report_equivocation((*ev).into());
                 }
                 // R6 HIGH-8: an accepted attestation is a real, signature-
                 // checked duty by `att.validator` — exactly the class of
@@ -3902,6 +3917,8 @@ impl Engine {
     // cannot divide by zero: the divisor is `.max(1)`.
     #[allow(clippy::arithmetic_side_effects)]
     fn wall_slot(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(slot) = validator_lifecycle::test_wall_slot() { return slot; }
         now_ms().saturating_sub(self.manifest.genesis_time_ms) / self.manifest.slot_ms.max(1)
     }
 
@@ -4091,11 +4108,7 @@ impl Engine {
                     .iter()
                     .find(|v| v.index == index)
                     .map(|v| v.effective_stake);
-                Ok(rpc::validator_json(
-                    &rec,
-                    effective,
-                    epoch_of(self.state.slot()),
-                ))
+                Ok(rpc::validator_lifecycle_json(&self.state, &rec, effective))
             }
 
             RpcRequest::ValidatorCount => Ok(Json::obj(vec![
@@ -4313,6 +4326,9 @@ pub(crate) enum RegistryIdentity {
     /// keystore's key, and the local RANDAO chain opens its committed
     /// commitment. Duties are armed.
     Active,
+    /// Registered identity, but its exit has taken effect. Keep following
+    /// the chain so automatic withdrawal can run when the lock matures.
+    Inactive,
     /// The registry has no such index *yet*. Not an error: it is what a
     /// deposit-added validator looks like before its deposit is applied.
     /// Boot, follow the chain, sign nothing, re-check every slot.
@@ -4402,6 +4418,7 @@ fn check_joining_registry_identity(
     }
     if commitment != rec.randao_commitment { return RegistryIdentity::RandaoMismatch; }
     if rec.activation_epoch > epoch_of(state.slot()) { return RegistryIdentity::PendingActivation; }
+    if epoch_of(state.slot()) >= rec.exit_epoch { return RegistryIdentity::Inactive; }
     RegistryIdentity::Active
 }
 
@@ -4805,6 +4822,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         verifier,
         keys,
         blocks: BTreeMap::new(),
+            observed_proposals: BTreeMap::new(),
         chain: vec![(0, genesis_id)],
         canonical: BTreeSet::from([*genesis_id.as_bytes()]),
         recent_states: VecDeque::new(),
@@ -4921,7 +4939,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
             engine.state.validator_index_by_pubkey(&keys.pubkey)
         } else { Some(keys.index) };
         let identity = match registered_index {
-            Some(index) => check_joining_registry_identity(&engine.state, index, &keys.pubkey, keys.randao_seed),
+            Some(index) => check_joining_registry_identity(&engine.state, index, &keys.pubkey,
+                keys.randao_seed_for(&engine.state.admission_network_domain().unwrap_or([0; 32]),
+                    engine.state.validator_randao_generation(index))),
             None => RegistryIdentity::PendingActivation,
         };
         match identity {
@@ -4933,6 +4953,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
                     registered_index.unwrap_or(keys.index),
                     engine.state.slot()
                 );
+            }
+            RegistryIdentity::Inactive => {
+                crate::metrics::NodeMetrics::set(&crate::metrics::NODE.validator_active, 0);
+                println!("validator {} has exited; following the chain for withdrawal", registered_index.unwrap_or(keys.index));
             }
             RegistryIdentity::PendingActivation => {
                 // The "validator was down and nothing said so" incident, as a
@@ -5182,6 +5206,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         // duplicate work within one run; `slashprot` is what stops a second
         // signature across runs and across processes.
         if !in_grace && slot > last_attested {
+            engine.maintain_validator_lifecycle(wall_epoch);
             engine.attest(slot);
             last_attested = slot;
         }
@@ -5198,7 +5223,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         if (behind || engine.needs_sync) && now.saturating_sub(last_sync_req) > two_slots_ms {
             engine
                 .net
-                .broadcast(net::get_blocks_frame(engine.state.slot()));
+                .broadcast(net::get_blocks_frame(engine.sync_after_slot()));
             engine.needs_sync = false;
             last_sync_req = now;
         }
@@ -5318,10 +5343,15 @@ pub fn run(cfg: Config) -> io::Result<()> {
                         EngineEvent::Net(NetEvent::Attestation(att, origin)) => {
                             engine.on_attestation(att, origin, wall_epoch)
                         }
-                        EngineEvent::Net(NetEvent::Transaction(tx)) => {
-                            // Gossip has nobody to answer to; the verdict is the
-                            // RPC's concern, not a peer's.
-                            let _ = engine.on_transaction(tx);
+                        EngineEvent::Net(NetEvent::Transaction(tx, origin)) => {
+                            let verdict = match engine.on_transaction(tx) {
+                                Ok(_) => Verdict::Accept,
+                                // A peer may have a different head, fee, epoch
+                                // or pending input. Refuse relay without scoring
+                                // that local-state difference as misconduct.
+                                Err(_) => Verdict::Ignore,
+                            };
+                            engine.net.report(&origin, verdict);
                         }
                         EngineEvent::Rpc(call) => {
                             let result = engine.serve_rpc(call.req);
@@ -5837,11 +5867,11 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
         // relaying one is free propagation of garbage every proposer then pays
         // to drop.
         PosTransaction::ExitV2 { epoch, signature, .. } => {
-            if wall_epoch < bloch_pos_committee::params::EXIT_AUTH_ACTIVATION_EPOCH {
+            if !bloch_pos_committee::params::epoch_gate_active(wall_epoch, bloch_pos_committee::params::EXIT_AUTH_ACTIVATION_EPOCH) {
                 return Err(
-                    "authenticated exits (tag 0x08) are not active: the format ships \
+                    "authenticated exits (tag 0x0C) are not active: the format ships \
                      behind a flag day (EXIT_AUTH_ACTIVATION_EPOCH) that this chain has \
-                     not reached, and the wire byte is not assigned",
+                     not reached, and lifecycle activation remains disabled",
                 );
             }
             exit_v2_structural_rules(*epoch, signature, wall_epoch)
@@ -5864,8 +5894,14 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
         // makes garbage evidence forfeit the whole block. Wall-clock epoch on
         // the mempool side, committed epoch on the consensus side — the
         // TransferV2 arm's asymmetry argument, unchanged.
+        PosTransaction::Withdraw { .. } => {
+            if !bloch_pos_committee::params::epoch_gate_active(wall_epoch, bloch_pos_committee::params::WITHDRAWAL_ACTIVATION_EPOCH) {
+                return Err("validator withdrawals (tag 0x0D) are not active");
+            }
+            Ok(())
+        }
         PosTransaction::SlashingEvidence(_) => {
-            if wall_epoch < bloch_pos_committee::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH {
+            if !bloch_pos_committee::params::epoch_gate_active(wall_epoch, bloch_pos_committee::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH) {
                 return Err(
                     "slashing evidence (tag 0x05) is not active: the transaction ships \
                      behind a flag day (SLASHING_EVIDENCE_ACTIVATION_EPOCH) that this \
@@ -5883,14 +5919,13 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
         // consensus alone (this function is stateless — no registry to
         // resolve the validator's committed key against).
         PosTransaction::RandaoRecommit { .. } => {
-            if wall_epoch < bloch_pos_committee::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH {
+            if !bloch_pos_committee::params::epoch_gate_active(wall_epoch, bloch_pos_committee::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH) {
                 return Err(
-                    "RANDAO re-commits (tag 0x0A) are not active: the format ships                      behind a flag day (RANDAO_RECOMMIT_ACTIVATION_EPOCH) that this                      chain has not reached, and the wire byte is not assigned",
+                    "RANDAO re-commits (tag 0x0A) are not active: the format ships                      behind a flag day (RANDAO_RECOMMIT_ACTIVATION_EPOCH) that this                      chain has not reached, and lifecycle activation remains disabled",
                 );
             }
             Ok(())
         }
-        _ => Ok(()),
     }
 }
 
@@ -7190,6 +7225,7 @@ mod transfer_v2_end_to_end {
             verifier,
             keys: None,
             blocks: BTreeMap::new(),
+            observed_proposals: BTreeMap::new(),
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
@@ -8176,6 +8212,7 @@ mod perf_support {
             verifier,
             keys: Some(ks),
             blocks: BTreeMap::new(),
+            observed_proposals: BTreeMap::new(),
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
@@ -9862,6 +9899,7 @@ mod duty_view_anchor {
             verifier,
             keys: Some(ks0),
             blocks: BTreeMap::new(),
+            observed_proposals: BTreeMap::new(),
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
@@ -10124,6 +10162,7 @@ mod slot_horizon {
             verifier,
             keys: None,
             blocks: BTreeMap::new(),
+            observed_proposals: BTreeMap::new(),
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
@@ -11408,3 +11447,32 @@ mod finality_latch_tests {
 #[cfg(test)]
 #[path = "engine/validator_admission_tests.rs"]
 mod validator_admission_tests;
+
+#[cfg(test)]
+mod branch_gap_repair_tests {
+    use super::*;
+
+    #[test]
+    fn missing_branch_sync_walks_behind_the_head_without_rewinding_state() {
+        let (mut node, _dir) = perf_support::proposing_engine();
+        let _clock = validator_lifecycle::clock_at(201);
+        node.wall_slot = 201;
+        node.propose(200);
+        assert_eq!(node.state.slot(), 200);
+        assert_eq!(node.sync_after_slot(), 200);
+        let head = node.head_id();
+        let root = node.state.state_root();
+        let original = node.blocks[head.as_bytes()].clone();
+        for (slot, expected) in [(201, 136), (137, 72), (73, 8), (9, 0)] {
+            let mut orphan = original.clone();
+            orphan.header.slot = slot;
+            orphan.header.parent = [slot as u8; 32];
+            orphan.proposer_sig = node.keys.as_ref().unwrap().sign(&orphan.header.proposal_signing_root());
+            node.ingest(orphan);
+            assert!(node.needs_sync);
+            assert_eq!(node.sync_after_slot(), expected);
+            assert_eq!(node.head_id(), head);
+            assert_eq!(node.state.state_root(), root);
+        }
+    }
+}

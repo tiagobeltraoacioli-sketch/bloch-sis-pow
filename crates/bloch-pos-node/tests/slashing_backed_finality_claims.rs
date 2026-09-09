@@ -27,8 +27,9 @@
 //!    `sendrawtransaction` (`rpc.rs`). Every path therefore reaches the same
 //!    transition gate (break 4), and the released fleet binaries — which
 //!    predate the format — still refuse the tag at decode.
-//! 3. Nothing constructs the transaction outside tests. The node captures an
-//!    equivocating pair and prints that the pipeline is not wired.
+//! 3. Closed by ADR-041 implementation: observed equivocations now enter
+//!    state-aware admission and report whether submission succeeded. The
+//!    activation gate remains closed, so the live-chain retraction stands.
 //! 4. `SLASHING_EVIDENCE_ACTIVATION_EPOCH` **is now defined on this lineage,
 //!    inert at `u64::MAX`** — the same change that made the tag decodable
 //!    introduced it, and gates the evidence transaction on it in the state
@@ -452,29 +453,19 @@ fn the_activation_constant_exists_in_one_place_and_is_not_armed() {
 // that only covered one lineage. No test in a tree can close that gap; only a
 // narrower sentence can, which is why the sentences now say "release lineage".
 
-/// Break 3, measured: the node still says out loud that it does not prosecute.
-///
-/// This is the line an operator sees when a validator equivocates, and it is
-/// the only thing standing between "captured" and "silently dropped".
+/// The observation hook must submit evidence and report a gated refusal;
+/// silently dropping an observed pair must not return during integration.
 #[test]
-fn the_node_still_admits_it_does_not_prosecute() {
-    if penalty_appliable() {
-        return; // prosecution is live; the sibling tests handle that world
-    }
-    // Not gated on decodability: since 2026-09-05 evidence decodes and the
-    // penalty STILL cannot land (inert flag day), and in that world too the
-    // captured-equivocation log line is the only thing standing between
-    // "captured" and "silently dropped".
-    let engine = repo_root().join("crates/bloch-pos-node/src/engine.rs");
-    let text = normalise(&std::fs::read_to_string(&engine).expect("engine.rs is readable"));
-    assert!(
-        text.contains("slashing pipeline not wired"),
-        "engine.rs no longer prints that the slashing pipeline is unwired, but \
-         tag 0x05 is still undecodable. Either the log line was removed while \
-         the gap remained — which turns a captured equivocation back into a \
-         silent drop — or prosecution landed and every retraction in this repo \
-         needs revisiting."
-    );
+fn observed_evidence_is_submitted_with_an_explicit_gated_outcome() {
+    let root = repo_root();
+    let engine = normalise(&std::fs::read_to_string(root.join("crates/bloch-pos-node/src/engine.rs")).expect("engine source"));
+    let lifecycle = normalise(&std::fs::read_to_string(root.join("crates/bloch-pos-node/src/engine/validator_lifecycle.rs")).expect("lifecycle source"));
+    assert!(engine.contains("self.report_equivocation((*ev).into())"), "attestation observation hook was disconnected");
+    assert!(engine.contains("self.observe_proposer_equivocation(&env)"), "proposer observation hook was disconnected");
+    assert!(lifecycle.contains("self.on_transaction(postransaction::slashingevidence(evidence))"), "evidence bypasses ordinary admission or is only logged");
+    assert!(lifecycle.contains("not submitted:"), "a gate refusal must be visible to the operator");
+    assert_eq!(bloch_pos_committee::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH, u64::MAX,
+        "implemented observation does not authorize mainnet activation");
 }
 
 /// **The lock.** No text in this tree may assert a slashing-backed finality

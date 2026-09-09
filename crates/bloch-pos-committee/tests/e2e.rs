@@ -421,6 +421,7 @@ mod harness {
             .collect();
         mixes.push(RandaoMix { epoch: s.current_epoch + 1, mix: s.mix });
         compute_state_root(&ConsensusState {
+            written_off_sat: 0, funded_validators: &[], stake_low_water: &[], randao_generations: &[],
             eutxos: &eutxos,
             validators: &validators,
             current_participation: &cur,

@@ -364,6 +364,22 @@ impl Drop for Keystore {
 }
 
 impl Keystore {
+    /// Deterministic private RANDAO generations survive restarts and reorgs
+    /// without rewriting the keystore. Generation zero preserves genesis.
+    /// The last reveal exposes the original seed, so future seeds must also
+    /// depend on the signing secret, never just on a previous RANDAO seed.
+    pub fn randao_seed_for(&self, network: &[u8; 32], generation: u32) -> [u8; 32] {
+        if generation == 0 { return self.randao_seed; }
+        use sha3::{Digest, Sha3_256};
+        let mut h = Sha3_256::new();
+        h.update(b"BLOCH/PRIVATE-RANDAO-GENERATION/v1");
+        h.update(network);
+        h.update(generation.to_le_bytes());
+        h.update(self.randao_seed);
+        h.update(&*self.secret);
+        h.finalize().into()
+    }
+
     /// Generate a throwaway devnet keystore at `dir/validator.key`, sealed
     /// according to the environment ([`Unlock::from_env`]).
     ///
@@ -1785,5 +1801,24 @@ mod tests {
         assert!(!ct_eq(b"abc", b"abd"));
         assert!(!ct_eq(b"abc", b"ab"));
         assert!(ct_eq(b"", b""));
+    }
+
+    #[test]
+    fn private_randao_generations_survive_reload_and_need_more_than_the_revealed_seed() {
+        let dir = tmp_dir("randao-generation");
+        let key = Keystore::generate_with(&dir, 0, &Unlock::PlaintextOptIn).unwrap();
+        let loaded = Keystore::load_with(&dir, &Unlock::PlaintextOptIn).unwrap();
+        let network = [9; 32];
+        assert_eq!(key.randao_seed_for(&network, 0), key.randao_seed);
+        let next = key.randao_seed_for(&network, 1);
+        assert_eq!(next, loaded.randao_seed_for(&network, 1));
+        assert_ne!(next, key.randao_seed_for(&[10; 32], 1));
+        assert_ne!(next, key.randao_seed_for(&network, 2));
+        let dir2 = tmp_dir("randao-other-secret");
+        let mut other = Keystore::generate_with(&dir2, 1, &Unlock::PlaintextOptIn).unwrap();
+        other.randao_seed = key.randao_seed; // the last reveal is public
+        assert_ne!(next, other.randao_seed_for(&network, 1));
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(dir2);
     }
 }

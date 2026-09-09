@@ -272,13 +272,13 @@ impl CommittedState {
         self.pubkey_index.get(hash).copied()
     }
 
-    pub(super) fn apply_funded_deposit(
-        &mut self,
+    pub(crate) fn validate_funded_deposit(
+        &self,
         tx: &FundedDeposit,
         total_active: u128,
         base_fee: u128,
         verifier: &dyn SignatureVerifier,
-    ) -> Result<fee_market::TxCharge, FundedDepositReject> {
+    ) -> Result<(fee_market::TxCharge, u32, [u8; 32], [u8; 32], u64), FundedDepositReject> {
         use FundedDepositReject as R;
         if !crate::params::funded_validator_admission_active(self.epoch) {
             return Err(R::NotActive);
@@ -349,6 +349,15 @@ impl CommittedState {
         }
         tx.verify_authorizations(verifier)?;
 
+        Ok((charge, index, hash, id, value))
+    }
+
+    pub(super) fn apply_funded_deposit(&mut self, tx: &FundedDeposit,
+        total_active: u128, base_fee: u128, verifier: &dyn SignatureVerifier)
+        -> Result<fee_market::TxCharge, FundedDepositReject>
+    {
+        let (charge, index, hash, id, value) =
+            self.validate_funded_deposit(tx, total_active, base_fee, verifier)?;
         // All fallible work is complete. The outer transition also applies on
         // an isolated candidate state, preserving atomic block rejection.
         for input in &tx.inputs {
@@ -376,6 +385,7 @@ impl CommittedState {
             },
         );
         self.pubkey_index.insert(hash, index);
+        self.funded_validators.insert(index);
         self.reveals_used.insert(index, 0);
         self.deposit_history.push(QueuedDeposit {
             pubkey_hash: hash,

@@ -22,7 +22,7 @@ prepare --genesis FILE --funding-pubkey HEX_FILE --validator-pubkey HEX_FILE
         --input TXID:VOUT:SAT [--input ...] --max-base-fee MILLISAT_PER_GAS
         --tip MILLISAT_PER_GAS --expiry EPOCH --commission BPS --out FILE
 inspect --tx FILE
-sign --tx FILE --role funding|validator --dir KEYSTORE_DIR --out NEW_FILE
+sign --genesis TRUSTED_FILE --tx FILE --role funding|validator --dir KEYSTORE_DIR --out NEW_FILE
 
 The prepare input values are estimates; consensus resolves the actual UTXOs.
 Inspect the complete intent on each signing machine before signing. Key files
@@ -251,8 +251,13 @@ fn inspect(tx: &FundedDeposit) {
 }
 
 fn sign(args: &[String]) -> Result<(), String> {
-    let a = Args::parse(args, &["--tx", "--role", "--dir", "--out"])?;
+    let a = Args::parse(args, &["--genesis", "--tx", "--role", "--dir", "--out"])?;
     let mut tx = read_tx(a.get("--tx")?)?;
+    let (manifest, _) = Manifest::load(Path::new(a.get("--genesis")?)).map_err(error)?;
+    let trusted_domain: [u8; 32] = Sha3_256::digest(manifest.encode()).into();
+    if tx.network_domain != trusted_domain {
+        return Err("transaction does not match the signer's trusted genesis manifest".into());
+    }
     let role = a.get("--role")?;
     if role != "funding" && role != "validator" {
         return Err("role must be funding or validator".into());

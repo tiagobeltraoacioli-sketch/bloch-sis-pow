@@ -306,10 +306,15 @@ fn funded_multiblock_replay_activation_churn_and_new_proposer() {
         let mut replay = genesis;
         replay = transition.apply_block(&replay, &b, &[], &txs).unwrap();
         let mut saw_new = false;
+        let mut target_root = [0; 32];
         for slot in 2..=450 {
-            let b = build_block(&transition, &state, slot, &[], &[], &mut chains);
-            state = transition.apply_block(&state, &b, &[], &[]).unwrap();
-            replay = transition.apply_block(&replay, &b, &[], &[]).unwrap();
+            let atts = if slot % SLOTS_PER_EPOCH == SLOTS_PER_EPOCH - 1 && state.epoch >= 1 {
+                full_epoch_attestations(&state, target_root)
+            } else { Vec::new() };
+            let b = build_block(&transition, &state, slot, &atts, &[], &mut chains);
+            state = transition.apply_block(&state, &b, &atts, &[]).unwrap();
+            replay = transition.apply_block(&replay, &b, &atts, &[]).unwrap();
+            if slot % SLOTS_PER_EPOCH == 0 { target_root = *state.head.as_bytes(); }
             assert_eq!(
                 state.state_root(),
                 replay.state_root(),
@@ -327,9 +332,7 @@ fn funded_multiblock_replay_activation_churn_and_new_proposer() {
             saw_new |= b.header.proposer_index >= 8;
         }
         assert!(saw_new, "a funded, activated key must be able to propose");
-        // VAD-02: this fixture supplies no attestations. Activation is a delay,
-        // not proof that the registration has finalized (see the audit report).
-        assert_eq!(state.finality().finalized.epoch, 0);
+        assert!(state.finality().finalized.epoch > 0, "activation requires finalized funding");
         assert!(state.supply_gap_sat() <= gap);
     });
 }
@@ -475,5 +478,45 @@ fn funded_multiple_inputs_use_committed_values_and_one_funding_authority() {
             apply(&mut full, &tx),
             Err(TxReject::FundedDeposit(FundedDepositReject::RegistryFull))
         );
+    });
+}
+
+#[test]
+fn unfinalized_funding_never_activates_even_after_the_delay() {
+    crate::params::funded_admission_rehearsal::run(|| {
+        let tx = deposit(47);
+        let (t, mut state, _) = fixture(std::slice::from_ref(&tx));
+        apply(&mut state, &tx).unwrap();
+        for _ in 0..20 { state = t.process_epoch(&state).unwrap(); }
+        assert_eq!(state.finality().finalized.epoch, 0);
+        assert_eq!(state.validator_record(8).unwrap().activation_epoch, u64::MAX);
+        assert_eq!(state.active_validators().len(), 8);
+    });
+}
+
+#[test]
+fn finality_recovery_activates_without_backdating_or_bypassing_churn() {
+    run(|| {
+        let deposits: Vec<_> = (50..55).map(deposit).collect();
+        let (t, mut state, mut chains) = fixture(&deposits);
+        for tx in &deposits { apply(&mut state, tx).unwrap(); }
+        for _ in 0..20 { state = t.process_epoch(&state).unwrap(); }
+        assert!(state.validators.values().filter(|v| v.index >= 8)
+            .all(|v| v.activation_epoch == u64::MAX));
+        for tag in 50..55 { chains.push(RandaoChain::generate([tag; 32])); }
+        let mut target = [0; 32];
+        for slot in (20 * SLOTS_PER_EPOCH)..=(23 * SLOTS_PER_EPOCH) {
+            let atts = if slot % SLOTS_PER_EPOCH == SLOTS_PER_EPOCH - 1 {
+                full_epoch_attestations(&state, target)
+            } else { Vec::new() };
+            let b = build_block(&t, &state, slot, &atts, &[], &mut chains);
+            state = t.apply_block(&state, &b, &atts, &[]).unwrap();
+            if slot % SLOTS_PER_EPOCH == 0 { target = *state.head.as_bytes(); }
+        }
+        let epochs: Vec<_> = state.validators.values().filter(|v| v.index >= 8)
+            .map(|v| v.activation_epoch).collect();
+        assert_eq!(epochs.iter().filter(|e| **e == 22).count(), 4);
+        assert_eq!(epochs.iter().filter(|e| **e == 23).count(), 1);
+        assert!(state.finality().finalized.epoch >= 20);
     });
 }

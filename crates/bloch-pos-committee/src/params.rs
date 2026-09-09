@@ -1013,14 +1013,7 @@ pub mod rehearsal {
     /// Test-only: treat [`super::WITHDRAWAL_ACTIVATION_EPOCH`] as already
     /// bound.
     ///
-    /// Kept for symmetry with every other gate even though — see that
-    /// constant's docs — nothing reads this switch today: there is no
-    /// `Withdraw` transaction to un-refuse, only the orphaned predicate
-    /// [`crate::transition::CommittedState::withdrawal_active`], forcing
-    /// which open changes no observable behaviour anywhere in this crate
-    /// yet. Not folded into `GATES_OPEN`, matching every other gate's own
-    /// switch, so that the day this IS wired the same isolation applies
-    /// without a second decision.
+    /// Test-only control for ADR-041 withdrawal. Production has no override.
     pub fn withdrawal_gate_forced_open() -> bool {
         WITHDRAWAL_GATE_OPEN_TL.with(|c| c.get())
     }
@@ -1824,58 +1817,12 @@ pub const FORKCHOICE_EQUIVOCATION_HORIZON_SLOTS: u64 = SLOTS_PER_EPOCH;
 /// `staking_tx_metering_gate_is_inert` pins the value.
 pub const STAKING_TX_METERING_ACTIVATION_EPOCH: u64 = u64::MAX;
 
-/// Flag day for the **withdrawal transaction** (audit R7 M4, 2026-09-06).
-/// `u64::MAX` = INERT, and — unusually for this file — INERT is ALL this
-/// constant is today: there is no `PosTransaction::Withdraw` variant and no
-/// call site reads this gate. Recorded here rather than left undone.
-///
-/// # The hole this closes, and it is still open
-///
-/// `Exit`/`ExitV2` set `withdrawable_epoch`, that field is committed and
-/// hashed into the state root, and nothing has ever read it: every genesis
-/// bond (1,600,000 BLCH) and the entire validator emission this chain will
-/// ever mint (42.85% of total supply, minted directly into `staked_sat`,
-/// never into an eUTXO output) is permanently illiquid until a withdrawal
-/// path exists.
-///
-/// # Why this pass ships the gate but not the transaction, in two parts
-///
-/// 1. **The wire byte.** `PosTransaction`'s variant space is frozen by an
-///    EXHAUSTIVE match with no wildcard arm in the unowned
-///    `tests/wire_tag_registry.rs` (`frozen_variant_space`) — by design: its
-///    own doc comment records having verified that adding ANY new
-///    `PosTransaction` variant, under any name or byte, stops that file
-///    compiling with `error[E0004]`. `Withdraw` is additionally already a
-///    three-way live-branch naming collision in that file's own sweep
-///    (claimed at `0x07`, `0x08`, and `0x09` by different unmerged tips) —
-///    a second, independent reason the byte is the founder's to assign, not
-///    this pass's to guess around.
-/// 2. **The record itself has no field for it.** The type `CommittedState`
-///    actually stores per validator is `crate::interfaces::ValidatorRecord`
-///    (`activation_epoch`, `exit_epoch`, `withdrawable_epoch`,
-///    `staked_sat`, `withdrawal_credentials`, …) — and `interfaces.rs` is
-///    outside this pass's ownership. It has no `withdrawn` flag, so even
-///    with a byte in hand, marking a withdrawal PAID (so it cannot be
-///    replayed) would need a field this pass cannot add to the struct
-///    consensus actually reads.
-///
-/// [`crate::staking::validate_withdrawal`] and its own
-/// `crate::staking::ValidatorRecord` (a self-contained, fully-tested
-/// predicate — exited, past `withdrawable_epoch`, not already withdrawn —
-/// returning `(withdrawal_addr, amount_sat)`) exist as ready-made logic for
-/// whoever lands both of the above: they operate on staking.rs's OWN record
-/// shape, not on `interfaces::ValidatorRecord`, precisely because this pass
-/// cannot commit a `withdrawn` bit to the real one. Wiring them in means
-/// resolving (1) and (2) first, in a pass that owns `interfaces.rs` and
-/// `tests/wire_tag_registry.rs`.
-///
-/// # ARMING THIS IS A FOUNDER DECISION, AND IT HAS A PRECONDITION
-///
-/// This constant gates NOTHING today (see above) — arming it changes no
-/// behaviour on its own. Ships INERT at `u64::MAX`; `withdrawal_gate_is_inert`
-/// pins the value, and `the_withdrawal_gate_is_a_function_of_the_block_epoch_alone`
-/// pins the (currently orphaned) predicate against regressing before the
-/// day it is actually wired to a transaction arm.
+/// ADR-041 lifecycle release epoch for withdrawals (tag 0x0D).
+/// Disabled at u64::MAX. Must equal funded admission, authenticated exit,
+/// slashing evidence and RANDAO renewal; compile-time assertions enforce it.
+/// Withdrawal pays the registered script, writes off unissued genesis
+/// principal, and consumes block capacity even with legacy metering disabled.
+/// Arming requires the release ceremony and rehearsals in ADR-041.
 pub const WITHDRAWAL_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// Flag day for **network-bound transfer signing** (audit A2-3 / R7 M2,
@@ -2042,3 +1989,18 @@ pub(crate) mod funded_admission_rehearsal {
         f()
     }
 }
+
+/// MAX is always an unarmed sentinel, including on synthetic boundary inputs.
+pub const fn epoch_gate_active(epoch: u64, activation: u64) -> bool {
+    activation != u64::MAX && epoch >= activation
+}
+
+// ADR-041: one lifecycle release. A partially armed build must not compile.
+const _: () = {
+    assert!(FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH == EXIT_AUTH_ACTIVATION_EPOCH);
+    assert!(EXIT_AUTH_ACTIVATION_EPOCH == WITHDRAWAL_ACTIVATION_EPOCH);
+    assert!(WITHDRAWAL_ACTIVATION_EPOCH == SLASHING_EVIDENCE_ACTIVATION_EPOCH);
+    assert!(SLASHING_EVIDENCE_ACTIVATION_EPOCH == RANDAO_RECOMMIT_ACTIVATION_EPOCH);
+    assert!(DEPOSIT_ACTIVATION_EPOCH == u64::MAX);
+    assert!(crate::slashing::CORRELATION_WINDOW_EPOCHS >= 2 * crate::staking::WITHDRAWAL_DELAY_EPOCHS);
+};
