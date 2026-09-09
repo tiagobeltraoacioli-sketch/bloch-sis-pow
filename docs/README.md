@@ -23,12 +23,15 @@ Two standing rules apply to everything below.
   live since 2026-08-13 21:31:19 UTC — the node-local fixes (slot bound,
   slashing protection, sealed keystore, RPC indexing) are running and
   correct. But most of the design in `specs/BLOCH-POS-SHA3-LATTICE-MIGRATION.md`
-  is not yet in force on the live chain: seven of the eight consensus gates
-  that close known findings still ship at `u64::MAX` (unarmed), and several
-  documented protocol behaviors (exit authentication, RANDAO recommit, the
-  dust and tx-bytes rules) are compiled but inert until a coordinated flag
-  day arms them — see the current Round-3 remediation audit for the
-  up-to-date gate status before assuming a described behavior is live.
+  is not yet in force on the live chain: several consensus gates that close
+  known findings still ship at `u64::MAX` (unarmed), and the dust and
+  tx-bytes rules are compiled but inert until a coordinated flag day arms
+  them. Two flag days ARE armed at epoch 2700 (≈2026-09-12): the leak
+  recovery (`LEAK-RECOVERY-FLAG-DAY.md`) and the five-gate validator
+  lifecycle — funded admission, exit authentication, withdrawal, slashing
+  evidence, RANDAO recommit (`VALIDATOR-LIFECYCLE-FLAG-DAY.md`); below 2700
+  none of it is live. Check `params.rs` for the up-to-date gate status before
+  assuming a described behavior is live.
   `designed ≠ built ≠ armed` is now the more precise version of this
   warning.
 

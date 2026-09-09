@@ -10,10 +10,13 @@
 //! with **"Credit here."** The public block explorer said reversing a
 //! finalised block *"would require burning a third of the bonded stake"*.
 //!
-//! No stake on Genesis-4 can be slashed. Four independent breaks when first
-//! written; on 2026-09-05 (Round-2 finding F-02) break 1 was closed and break
-//! 4 changed shape, and the verdict — no stake can be slashed on the live
-//! chain — did not move:
+//! No stake on Genesis-4 can be slashed **below epoch 2700**. Four
+//! independent breaks when first written; on 2026-09-05 (Round-2 finding
+//! F-02) break 1 was closed and break 4 changed shape; on 2026-09-09 the
+//! founder ARMED break 4 at epoch 2700 (`docs/VALIDATOR-LIFECYCLE-FLAG-DAY.md`).
+//! The verdict for every block the chain had produced at that decision
+//! (~epoch 2413) — no stake can be slashed — did not move; from 2700 on it
+//! does, and this file's job changed shape with it (see "After arming"):
 //!
 //! 1. ~~Evidence cannot be decoded~~ **closed 2026-09-05**:
 //!    `PosTransaction::from_canonical_bytes` used to return
@@ -28,16 +31,44 @@
 //!    transition gate (break 4), and the released fleet binaries — which
 //!    predate the format — still refuse the tag at decode.
 //! 3. Closed by ADR-041 implementation: observed equivocations now enter
-//!    state-aware admission and report whether submission succeeded. The
-//!    activation gate remains closed, so the live-chain retraction stands.
-//! 4. `SLASHING_EVIDENCE_ACTIVATION_EPOCH` **is now defined on this lineage,
-//!    inert at `u64::MAX`** — the same change that made the tag decodable
-//!    introduced it, and gates the evidence transaction on it in the state
-//!    transition (`TxReject::EvidenceNotActive` below the flag day). An
-//!    earlier revision of this break said the constant existed only
+//!    state-aware admission and report whether submission succeeded. Below
+//!    the flag day the gate refuses them, so the live-chain retraction stands
+//!    for every epoch below 2700.
+//! 4. `SLASHING_EVIDENCE_ACTIVATION_EPOCH` **is defined on this lineage and
+//!    ARMED at epoch 2700** — it was introduced at `u64::MAX` by the same
+//!    change that made the tag decodable, and gates the evidence transaction
+//!    in the state transition (`TxReject::EvidenceNotActive` below the flag
+//!    day). An earlier revision of this break said the constant existed only
 //!    off-lineage (`d21c3370:params.rs:638`); that was true when written.
-//!    Unarmed, no flag day is scheduled, and THIS break alone now carries the
-//!    verdict: evidence can travel in format and still no block may carry it.
+//!    Between 2026-09-05 and 2026-09-09 it was unarmed and this break alone
+//!    carried the verdict. Since 2026-09-09 it carries a DATE instead: below
+//!    2700 evidence can travel in format and still no block may carry it; at
+//!    and after 2700 a block may, and `apply_slashing_evidence` runs.
+//!
+//! # After arming (2026-09-09): what this file locks now
+//!
+//! The constant being a real epoch does not make the promise true. Three
+//! things stand between "armed" and "a slashing-backed finality":
+//!
+//! - **the chain has to get there** — every block below 2700 has no penalty,
+//!   and at the decision the head was ~2413;
+//! - **the penalty has never landed** — no prosecution has been observed on
+//!   mainnet, no mainnet withdrawal has settled, and no third party has
+//!   audited §7.3 (the runbook's "still open" list records all three);
+//! - **the mechanism is narrower than the ADR** — ADR-041 T-6 is NOT
+//!   reconciled with `SlashingState`'s one-prosecution rule; the
+//!   implementation keeps the one-prosecution rule.
+//!
+//! So the lock keeps BOTH halves in force in the armed state: no text may
+//! assert an unqualified slashing-backed finality, and every retraction site
+//! must still carry its withdrawal. What changes is a third check: a
+//! retraction site that describes the constant as unarmed / inert /
+//! `u64::MAX` is now a false statement, and it must name the armed epoch in
+//! the same breath (`the_retraction_sites_do_not_call_the_armed_gate_inert`).
+//! The human step this test cannot take — deciding, once the chain is past
+//! 2700 and a prosecution has landed, that the retractions may be withdrawn
+//! and the promise restated — is recorded in the runbook, and whoever takes
+//! it edits RETRACTION_SITES and this file together.
 //!
 //! # Why a test, and why this shape
 //!
@@ -60,15 +91,19 @@
 //! matters. Getting them out of step is bad either way round:
 //!
 //! - **Enforcement absent, promise present** → [`no_text_promises_a_slashing_backed_finality`]
-//!   fails. That is today's defect, and the direction it can regress in.
-//! - **Enforcement arrives, retraction still standing** → the same test and
-//!   [`the_retraction_is_published_wherever_the_promise_was`] both fail, and
-//!   say so: once evidence can travel, every retraction here *understates*
-//!   the guarantee, which is its own kind of wrong document.
+//!   fails. That was the 2026-09-01 defect, and the direction it can regress
+//!   in at any epoch.
+//! - **Enforcement scheduled, retraction claims it is not** →
+//!   [`the_retraction_sites_do_not_call_the_armed_gate_inert`] fails: a
+//!   withdrawal that says "unarmed" after 2026-09-09 misleads in the other
+//!   direction.
+//! - **Retraction deleted while the penalty has not landed** →
+//!   [`the_retraction_is_published_wherever_the_promise_was`] fails.
 //!
 //! So the reachability of the slashing path is measured — by **calling the
-//! decoder**, not by grepping for it — and the text is judged against that
-//! measurement rather than against a hardcoded expectation.
+//! decoder**, not by grepping for it — the constant is read from the crate,
+//! and the text is judged against both rather than against a hardcoded
+//! expectation.
 //!
 //! # The contract for writing about slashing
 //!
@@ -336,26 +371,43 @@ fn reachability() -> Reachability {
     }
 }
 
-/// Whether the penalty can actually land on the live chain: evidence must
-/// BOTH decode and be consensus-valid in some reachable epoch. The flag day
-/// (`SLASHING_EVIDENCE_ACTIVATION_EPOCH`) is inert at `u64::MAX`, so today
-/// this is false, and every retraction in this file is judged against THIS —
-/// not against decodability alone, which since 2026-09-05 is necessary but
-/// not sufficient.
-fn penalty_appliable() -> bool {
-    reachability() == Reachability::EvidenceDecodes
-        && bloch_pos_committee::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH != u64::MAX
+/// The epoch the founder armed the flag day at (2026-09-09), as recorded in
+/// `docs/VALIDATOR-LIFECYCLE-FLAG-DAY.md`. `transition.rs`'s
+/// `slashing_evidence_armed_epoch_matches_the_runbook` pins the same value
+/// from the committee side; this is the node side of the same tripwire.
+const ARMED_EPOCH: u64 = 2_700;
+
+/// From which epoch the penalty can actually land on the live chain, if any:
+/// evidence must BOTH decode and be consensus-valid from some epoch. `None`
+/// means "at no epoch" — the state this file was written in (decoder refused
+/// the tag) and the state it was in from 2026-09-05 to 2026-09-09 (decodes,
+/// gate at `u64::MAX`). `Some(2700)` is the armed state. Every retraction in
+/// this file is judged against THIS — not against decodability alone, which
+/// since 2026-09-05 is necessary but not sufficient, and not against the
+/// constant alone, which without a decoder would gate nothing.
+fn penalty_scheduled_at() -> Option<u64> {
+    if reachability() != Reachability::EvidenceDecodes {
+        return None;
+    }
+    let epoch = bloch_pos_committee::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH;
+    (epoch != u64::MAX).then_some(epoch)
 }
+
+/// Words that describe the constant as not in force. A retraction site may
+/// use them only while also naming the armed epoch in the same window — the
+/// sentence "was inert at `u64::MAX` until armed at 2700" is a correct
+/// history; the sentence "is inert at `u64::MAX`" is a false present.
+const UNARMED_WORDS: &[&str] = &["u64::max", "unarmed", "not armed", "inert", "no flag day is scheduled"];
 
 /// Break 1, measured — and since 2026-09-05 (F-02) measured the other way
 /// round: tag `0x05` DECODES, and the flag day is what stands between the
-/// wire and the penalty.
+/// wire and the penalty. Since 2026-09-09 that flag day is a date.
 ///
 /// This is the fact every other assertion in this file is judged against, so
 /// it is established by *calling* the codec. It is deliberately separate from
 /// the text tests: if the codec changes, this is the test that says so first.
 #[test]
-fn evidence_decodes_and_only_the_inert_flag_day_stands_in_the_way() {
+fn evidence_decodes_and_the_flag_day_is_armed_at_the_runbook_epoch() {
     match reachability() {
         Reachability::EvidenceDecodes => {}
         Reachability::RefusedByConstruction => panic!(
@@ -372,37 +424,42 @@ fn evidence_decodes_and_only_the_inert_flag_day_stands_in_the_way() {
              adjusting this test, not after."
         ),
     }
-    assert!(
-        !penalty_appliable(),
-        "SLASHING_EVIDENCE_ACTIVATION_EPOCH is no longer u64::MAX: the flag \
-         day is ARMED. If the founder scheduled it, every retraction in \
-         RETRACTION_SITES is now an understatement and the sibling tests will \
-         say so — update the text first, then this file. If the founder did \
-         not schedule it, revert the constant NOW: arming activates §7.3 \
-         network-wide and forks every node that cannot decode tag 0x05."
+    assert_eq!(
+        penalty_scheduled_at(),
+        Some(ARMED_EPOCH),
+        "SLASHING_EVIDENCE_ACTIVATION_EPOCH moved away from the armed epoch 2700 \
+         (2026-09-09). If it was DISARMED (u64::MAX): the retractions become the \
+         whole truth again at every epoch, and this file's armed-state prose has \
+         to say so — revert to the 2026-09-05..09 wording. If it was MOVED: that \
+         is a new flag day, needing its own fleet rollout, announcement and \
+         runbook; update docs/VALIDATOR-LIFECYCLE-FLAG-DAY.md, transition.rs's \
+         slashing_evidence_armed_epoch_matches_the_runbook and this constant in \
+         ONE commit. Either way: arming activates §7.3 network-wide and forks \
+         every node that cannot decode tag 0x05, so the fleet must be on the new \
+         binary BEFORE the epoch."
     );
 }
 
-/// Break 4, measured — in its post-2026-09-05 shape: the activation constant
-/// EXISTS on this lineage (the "different and much better world" the first
-/// revision of this test described: a flag day exists, it is simply not
-/// scheduled), it is declared in exactly one place, and it is not armed.
+/// Break 4, measured — in its post-2026-09-09 shape: the activation constant
+/// EXISTS on this lineage, it is declared in exactly one place, and it is
+/// armed at the epoch the runbook records.
 ///
 /// The declaration scan is UNCONDITIONAL, for the reason the first revision
 /// learned the hard way: a guard that disables itself when its subject
 /// changes is worse than no guard, because a passing run reads as evidence.
 #[test]
-fn the_activation_constant_exists_in_one_place_and_is_not_armed() {
-    // The value, read from the crate rather than from text: arming is a
+fn the_activation_constant_exists_in_one_place_and_is_armed_at_the_runbook_epoch() {
+    // The value, read from the crate rather than from text: arming was a
     // founder decision with a fleet-rollout precondition, and this file is
-    // one of the tripwires in front of it (transition.rs has another,
-    // `slashing_evidence_gate_is_inert`).
+    // one of the tripwires behind it (transition.rs has another,
+    // `slashing_evidence_armed_epoch_matches_the_runbook`).
     assert_eq!(
         bloch_pos_committee::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH,
-        u64::MAX,
-        "the slashing flag day is ARMED. If the founder scheduled it, the \
-         retraction sites understate the guarantee and must move first; if \
-         not, revert now — arming forks every node that cannot decode 0x05.",
+        ARMED_EPOCH,
+        "the slashing flag day moved from 2700. A second change is a new flag \
+         day (own rollout, announcement, runbook) or a disarm (retractions \
+         become the whole truth again); update the runbook, transition.rs and \
+         this file in one commit.",
     );
 
     let files = prose_files();
@@ -464,12 +521,18 @@ fn observed_evidence_is_submitted_with_an_explicit_gated_outcome() {
     assert!(engine.contains("self.observe_proposer_equivocation(&env)"), "proposer observation hook was disconnected");
     assert!(lifecycle.contains("self.on_transaction(postransaction::slashingevidence(evidence))"), "evidence bypasses ordinary admission or is only logged");
     assert!(lifecycle.contains("not submitted:"), "a gate refusal must be visible to the operator");
-    assert_eq!(bloch_pos_committee::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH, u64::MAX,
-        "implemented observation does not authorize mainnet activation");
+    // Implementing the observation hook never authorised activation; the
+    // epoch is the founder's, and it must be the one the runbook records.
+    assert_eq!(bloch_pos_committee::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH, ARMED_EPOCH,
+        "the observation hook's gate must be the runbook's armed epoch (docs/VALIDATOR-LIFECYCLE-FLAG-DAY.md)");
 }
 
-/// **The lock.** No text in this tree may assert a slashing-backed finality
-/// while no stake can be slashed.
+/// **The lock.** No text in this tree may assert an unqualified
+/// slashing-backed finality — while no stake can be slashed (every epoch
+/// below 2700), and while the armed penalty has not landed, been audited, or
+/// had ADR-041 T-6 reconciled with the one-prosecution rule. A sentence
+/// about slashing has to say which way it cuts (a RETRACTION_MARKERS phrase
+/// within RETRACTION_WINDOW), in every state this file knows.
 #[test]
 fn no_text_promises_a_slashing_backed_finality() {
     let files = prose_files();
@@ -505,83 +568,132 @@ fn no_text_promises_a_slashing_backed_finality() {
     if let Reachability::Changed(what) = reachability() {
         panic!("codec changed in an uninterpretable way ({what}); see the reachability test");
     }
-    if !penalty_appliable() {
-        assert!(
+    match penalty_scheduled_at() {
+        None => assert!(
             violations.is_empty(),
-            "Text promises a slashing penalty that CANNOT BE APPLIED. Since \
-             2026-09-05 tag 0x05 decodes, but the evidence transaction is \
-             consensus-refused at every epoch below \
-             SLASHING_EVIDENCE_ACTIVATION_EPOCH, which is inert at u64::MAX — \
-             and nothing constructs the transaction outside tests. (Before \
-             2026-09-05 the decoder itself refused the tag; either way the \
-             penalty cannot land.)\n\n{}\n\n\
+            "Text promises a slashing penalty that CANNOT BE APPLIED at any epoch: \
+             either tag 0x05 does not decode, or SLASHING_EVIDENCE_ACTIVATION_EPOCH \
+             is back at u64::MAX.\n\n{}\n\n\
              This is the claim retracted on 2026-09-01 across rpc.rs, the \
              exchange integration book, the CertiK dossier, the whitepaper and \
-             the block explorer. If it is genuinely true again, the retractions \
-             in RETRACTION_SITES have to go first — this test is the thing that \
-             keeps the two in step. If the sentence is a legitimate description of \
+             the block explorer. If the sentence is a legitimate description of \
              the *designed* mechanism, mark it: a RETRACTION_MARKERS phrase within \
              {RETRACTION_WINDOW} characters is what tells a reader which way it cuts.",
             violations.join("\n\n"),
-        )
-    } else {
-        panic!(
-            "The slashing flag day is ARMED and evidence decodes: the penalty \
-             can land. Every retraction this repo published is now an \
-             understatement, and the guidance built on it (credit at \
-             finalized + 3 epochs, no depth provably safe) was written for a \
-             chain where the penalty did not exist.\n\n\
-             Revisit RETRACTION_SITES, then this test. {} promise phrase(s) are \
-             currently un-marked, which may be correct now.",
-            violations.len(),
-        )
+        ),
+        Some(epoch) => assert!(
+            violations.is_empty(),
+            "Text asserts an UNQUALIFIED slashing-backed finality. The flag day is \
+             armed at epoch {epoch} (2026-09-09), and that is not the same thing: \
+             every block below {epoch} has no penalty in it; no prosecution has \
+             landed on mainnet and none has been audited; ADR-041 T-6 is not \
+             reconciled with the one-prosecution rule. The guidance built on the \
+             2026-09-01 retraction (credit at finalized + 3 epochs, no depth \
+             provably safe) still stands until a human withdraws it in \
+             RETRACTION_SITES and this file together, after the chain is past \
+             {epoch} and a prosecution has been observed.\n\n{}\n\n\
+             Until then a sentence about slashing must say which way it cuts: a \
+             RETRACTION_MARKERS phrase within {RETRACTION_WINDOW} characters. \
+             Naming the armed epoch is not a marker on its own.",
+            violations.join("\n\n"),
+        ),
     }
 }
 
-/// The other half of the lock: while the penalty cannot be applied, every
-/// surface that carried the promise must carry the withdrawal. Deleting a
-/// retraction is as much a regression as re-asserting the claim, and it is the
-/// quieter of the two.
+/// The other half of the lock: every surface that carried the promise must
+/// carry the withdrawal — while the penalty cannot be applied at any epoch,
+/// AND while it is armed but has not landed (below 2700 the retraction is
+/// the literal truth of every block; from 2700 it stays until a human
+/// withdraws it, see the module docs). Deleting a retraction is as much a
+/// regression as re-asserting the claim, and it is the quieter of the two.
+///
+/// The first revision of this test had a "lingering" branch that failed the
+/// moment the constant left `u64::MAX`, on the theory that arming makes every
+/// retraction an understatement. Arming at a FUTURE epoch does not: at the
+/// decision the chain was ~290 epochs short of it. That branch was replaced
+/// by `the_retraction_sites_do_not_call_the_armed_gate_inert`, which catches
+/// the actual staleness arming introduces.
 #[test]
 fn the_retraction_is_published_wherever_the_promise_was() {
     let root = repo_root();
-    // Keyed on the penalty being appliable — NOT on decodability. Since
-    // 2026-09-05 evidence decodes while the flag day stays inert, and in that
-    // world the retractions are still the accurate text: no stake can be
-    // slashed on the live chain. They become stale only when the penalty can
-    // actually land.
-    let appliable = penalty_appliable();
     let mut missing: Vec<String> = Vec::new();
-    let mut lingering: Vec<String> = Vec::new();
 
     for (rel, marker) in RETRACTION_SITES {
         let path = root.join(rel);
         let raw = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("{rel} is a guarded retraction site and must exist: {e}"));
         let text = normalise(&raw);
-        let present = text.contains(&normalise(marker));
-        if !appliable && !present {
+        if !text.contains(&normalise(marker)) {
             missing.push(format!("  {rel}\n    lost: {marker:?}"));
-        }
-        if appliable && present {
-            lingering.push(format!("  {rel}\n    stale: {marker:?}"));
         }
     }
 
     assert!(
         missing.is_empty(),
-        "A published retraction disappeared while the penalty is still \
-         unappliable (the flag day is inert):\n\n{}\n\nAn integrator reads \
-         these. Removing the withdrawal restores the promise by silence, which \
-         is how the claim survived in four places at once the first time.",
+        "A published retraction disappeared while the penalty has not landed \
+         (scheduled at: {:?}):\n\n{}\n\nAn integrator reads these. Removing \
+         the withdrawal restores the promise by silence, which is how the claim \
+         survived in four places at once the first time. Withdrawing a \
+         retraction is a decision taken after the chain is past the armed epoch \
+         and a prosecution has been observed, and it edits RETRACTION_SITES and \
+         this file together.",
+        penalty_scheduled_at(),
         missing.join("\n\n"),
     );
+}
+
+/// The staleness arming DOES introduce: a retraction site that still says
+/// the constant is unarmed / inert / `u64::MAX` is a false statement after
+/// 2026-09-09, and it is false in the direction that hides a consensus
+/// change from the people who most need to know about it (a fleet operator
+/// reading `slashing.rs`, an exchange reading the integration book). Every
+/// occurrence of the constant's name in a retraction site whose window also
+/// contains an UNARMED_WORDS phrase must name the armed epoch in that same
+/// window — history ("was inert until armed at 2700") passes, a stale present
+/// ("is inert at u64::MAX") fails.
+///
+/// Scoped to RETRACTION_SITES on purpose: dated audit reports elsewhere in
+/// `docs/audit/` record what was true at their base commit and are not
+/// rewritten.
+#[test]
+fn the_retraction_sites_do_not_call_the_armed_gate_inert() {
+    let Some(epoch) = penalty_scheduled_at() else {
+        // Not armed: "unarmed" is the truth, and the sibling tests carry the lock.
+        return;
+    };
+    let root = repo_root();
+    let needle = "slashing_evidence_activation_epoch";
+    let epoch_text = epoch.to_string();
+    let mut stale: Vec<String> = Vec::new();
+    for (rel, _) in RETRACTION_SITES {
+        let raw = std::fs::read_to_string(root.join(rel))
+            .unwrap_or_else(|e| panic!("{rel} is a guarded retraction site and must exist: {e}"));
+        let text = normalise(&raw);
+        let mut from = 0usize;
+        while let Some(offset) = text[from..].find(needle) {
+            let at = from + offset;
+            let window_start = at.saturating_sub(RETRACTION_WINDOW);
+            let window_end = (at + needle.len() + RETRACTION_WINDOW).min(text.len());
+            let around = &text[window_start..window_end];
+            let says_unarmed = UNARMED_WORDS.iter().any(|w| around.contains(w));
+            // `2_700` in a Rust literal and `2700` in prose are the same epoch.
+            let names_epoch = around.replace('_', "").contains(&epoch_text);
+            if says_unarmed && !names_epoch {
+                let end = (at + needle.len() + 120).min(text.len());
+                stale.push(format!(
+                    "  {rel}\n    context: …{}…",
+                    &text[at.saturating_sub(120)..end]
+                ));
+            }
+            from = at + needle.len();
+        }
+    }
     assert!(
-        lingering.is_empty(),
-        "The penalty can land now (evidence decodes AND the flag day is \
-         armed), but these retractions still tell readers no stake can be \
-         slashed:\n\n{}\n\nThat is the reverse regression this file exists \
-         to catch — enforcement arriving and the documents staying behind.",
-        lingering.join("\n\n"),
+        stale.is_empty(),
+        "These retraction sites describe SLASHING_EVIDENCE_ACTIVATION_EPOCH as \
+         unarmed / inert / u64::MAX without naming the armed epoch ({epoch}) in \
+         the same window. That was true until 2026-09-09 and is false now; say \
+         'was … until armed at {epoch}' or drop the word.\n\n{}",
+        stale.join("\n\n"),
     );
 }

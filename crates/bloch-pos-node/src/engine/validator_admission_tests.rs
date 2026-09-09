@@ -138,8 +138,10 @@ fn funded_mempool_gate_source_outpoints_and_budget_are_wired() {
         .serve_rpc(RpcRequest::ValidatorAdmission)
         .unwrap()
         .to_string();
+    // Epoch 0 is below the armed flag day (2700, 2026-09-09): not active,
+    // and the terms name the epoch rather than answering null.
     assert!(terms.contains("\"active\":false"));
-    assert!(terms.contains("\"activation_epoch\":null"));
+    assert!(terms.contains("\"activation_epoch\":2700"));
     assert!(terms.contains(&crate::codec::hex(&tx.network_domain)));
 }
 

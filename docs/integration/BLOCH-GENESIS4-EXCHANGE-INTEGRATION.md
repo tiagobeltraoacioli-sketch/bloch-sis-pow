@@ -228,14 +228,17 @@ not estimate it from a confirmation count.
 >      reject either way.
 >    - Nothing constructs the transaction outside tests. The node detects an equivocating
 >      pair and logs it, with a line that says the pipeline is not wired.
->    - The activation constant is defined and **not armed** in the binary you are
->      integrating against. Since 2026-09-05, `SLASHING_EVIDENCE_ACTIVATION_EPOCH` is
->      defined in the release lineage's `params.rs` at exactly `u64::MAX`: no epoch any
->      chain reaches activates it, so no flag day is scheduled. (An earlier revision said
->      the constant was not defined on the release lineage at all — true when written,
->      superseded by the same change that made the tag decodable.) Arming it is a founder
->      decision with a fleet-rollout precondition; until then this bullet alone keeps the
->      retraction above in force.
+>    - The activation constant is defined and **armed at epoch 2700** (founder
+>      decision 2026-09-09; ≈2026-09-12 21:31 UTC; `docs/VALIDATOR-LIFECYCLE-FLAG-DAY.md`).
+>      From 2026-09-05 to 2026-09-09 `SLASHING_EVIDENCE_ACTIVATION_EPOCH` sat in the
+>      release lineage's `params.rs` at `u64::MAX` and no flag day was scheduled. (An
+>      earlier revision said the constant was not defined on the release lineage at all —
+>      true when written, superseded by the same change that made the tag decodable.)
+>      Below epoch 2700 — every block that existed at the decision — this bullet keeps
+>      the retraction above in force on its own. From 2700 on, evidence is applied by
+>      every node running the armed binary; the retraction stays published until a
+>      prosecution has actually been observed on mainnet, and the penalty remains
+>      unaudited by any third party.
 >
 >    Read on 2026-09-02 at height 34,665, epoch 1736, from two keyless archival
 >    observers returning byte-for-byte identical responses: 64 validators, 64 active,

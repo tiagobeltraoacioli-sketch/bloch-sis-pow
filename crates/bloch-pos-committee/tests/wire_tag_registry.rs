@@ -186,9 +186,10 @@ const NO_RIVALS: &[Claim] = &[];
 /// nowhere (Round-2 finding F-02, Critical). The founder-directed fix made
 /// the tag decodable: the encoder now carries both envelopes whole, the
 /// registered sub-namespace below (`EVIDENCE_SUBTAGS`) is live, and the
-/// transition refuses the transaction below the INERT
-/// `SLASHING_EVIDENCE_ACTIVATION_EPOCH` — so on the wire, nothing changes
-/// until that flag day. `evidence_tag_decodes_to_its_released_meaning` pins
+/// transition refuses the transaction below
+/// `SLASHING_EVIDENCE_ACTIVATION_EPOCH` (armed at 2700 on 2026-09-09) — so
+/// on the wire, nothing changes until that flag day.
+/// `evidence_tag_decodes_to_its_released_meaning` pins
 /// the adopted behaviour the way `evidence_tag_stays_one_way` pinned the old.
 const ONE_WAY_TX_TAGS: &[u8] = &[];
 

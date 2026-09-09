@@ -1819,7 +1819,8 @@ pub fn chain_info_json(
 ///    refuses the transaction moved from the decoder to the transition:
 ///    every epoch below `SLASHING_EVIDENCE_ACTIVATION_EPOCH` answers
 ///    `TxReject::EvidenceNotActive`. Break 1 is closed as a wire format;
-///    break 4 (the unarmed flag day) is now the load-bearing one.
+///    break 4 (the flag day, armed at 2700 on 2026-09-09) is now the
+///    load-bearing one.
 /// 2. **That decoder is the only one on every ingress path**: block body,
 ///    gossip and `sendrawtransaction`. Before 2026-09-05 that meant a block
 ///    carrying evidence was rejected by every peer at decode; it now means
@@ -1828,18 +1829,25 @@ pub fn chain_info_json(
 ///    Either way a proposer that included evidence today would produce a
 ///    block its peers refuse.
 /// 3. ADR-041 connects observed proposer/attestation evidence to ordinary
-///    admission. The node reports a refusal while activation remains disabled;
-///    implementing the observation hook does not activate penalties.
-/// 4. **The activation constant exists on this lineage and is not armed.**
+///    admission. The node reports a refusal below the flag day; implementing
+///    the observation hook does not by itself activate penalties.
+/// 4. **The activation constant exists on this lineage and is ARMED at epoch
+///    2700 (founder decision 2026-09-09, `docs/VALIDATOR-LIFECYCLE-FLAG-DAY.md`).**
 ///    An earlier draft of this break said no such constant existed on the
-///    release lineage, while one sat off-lineage at `d21c3370:params.rs:638`.
-///    Since 2026-09-05 `SLASHING_EVIDENCE_ACTIVATION_EPOCH` is defined in
-///    `bloch-pos-committee::params`, value exactly `u64::MAX`: no epoch any
-///    chain reaches activates it, so there is no flag day SCHEDULED — but
-///    there is now, for the first time on this lineage, a flag day to
-///    schedule. Arming it is a founder decision with a hard precondition
-///    (full fleet rollout of the evidence decoder), and until that day this
-///    break keeps the retraction below in force on its own.
+///    release lineage, while one sat off-lineage at `d21c3370:params.rs:638`;
+///    from 2026-09-05 to 2026-09-09 it was defined here at `u64::MAX`, so no
+///    flag day was scheduled. Now one is: below epoch 2700 — every block the
+///    chain had produced when the decision was taken (~epoch 2413) — the
+///    evidence transaction is consensus-refused and the retraction below is
+///    the accurate text; at and after 2700 evidence is applied
+///    (`apply_slashing_evidence`) by every node running a binary that carries
+///    the constant. What arming does NOT do: audit the penalty (no third
+///    party has), reconcile ADR-041 T-6 with the one-prosecution rule (the
+///    implementation keeps the one-prosecution rule), or settle a slash on
+///    mainnet (none has been observed). The retraction stays in force until
+///    the chain is past 2700 AND a prosecution has actually landed;
+///    `tests/slashing_backed_finality_claims.rs` keeps the text, the codec
+///    and the constant in step.
 ///
 /// Read from the live chain on 2026-09-02 at height 34,665, epoch 1736, from
 /// two keyless archival observers whose responses were byte-for-byte

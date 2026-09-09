@@ -11,12 +11,16 @@
 //! below are bound, not inert: `LEAKED_ROSTER_ACTIVATION_EPOCH` (1400),
 //! `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` (800) and
 //! `BLOCK_BYTES_V2_ACTIVATION_EPOCH` (800) are all epochs the chain is past.
-//! `LEAK_RECOVERY_ACTIVATION_EPOCH` is armed at 2700 (2026-09-06);
-//! `ANCESTRY_SEED_ACTIVATION_EPOCH`, `DEPOSIT_ACTIVATION_EPOCH`,
-//! `EXIT_AUTH_ACTIVATION_EPOCH`, `FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH`,
-//! `SLASHING_EVIDENCE_ACTIVATION_EPOCH`, `DUST_RULE_ACTIVATION_EPOCH`,
-//! `RANDAO_RECOMMIT_ACTIVATION_EPOCH` and `TX_BYTES_BOUND_ACTIVATION_EPOCH`
-//! are the ones still at `u64::MAX`.
+//! `LEAK_RECOVERY_ACTIVATION_EPOCH` is armed at 2700 (2026-09-06), and the
+//! five ADR-041 validator-lifecycle gates —
+//! `FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH`, `EXIT_AUTH_ACTIVATION_EPOCH`,
+//! `WITHDRAWAL_ACTIVATION_EPOCH`, `SLASHING_EVIDENCE_ACTIVATION_EPOCH` and
+//! `RANDAO_RECOMMIT_ACTIVATION_EPOCH` — are armed at the SAME epoch 2700
+//! (2026-09-09, `docs/VALIDATOR-LIFECYCLE-FLAG-DAY.md`), so the fleet gets one
+//! combined flag day. `ANCESTRY_SEED_ACTIVATION_EPOCH`,
+//! `DEPOSIT_ACTIVATION_EPOCH` (permanent by design),
+//! `FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH`, `DUST_RULE_ACTIVATION_EPOCH` and
+//! `TX_BYTES_BOUND_ACTIVATION_EPOCH` are the ones still at `u64::MAX`.
 //!
 //! Until 2026-09-02 this header said nothing here was active and that the
 //! crate held no activation height at all because it was not wired into the
@@ -1293,8 +1297,9 @@ pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = 2_700;
 pub const DEPOSIT_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// Flag day for the **authenticated voluntary exit** (§7.2) and the per-epoch
-/// exit churn cap. `u64::MAX` = INERT: no epoch reaches it, so on every node
-/// running this crate today the rule below is written down and does nothing.
+/// exit churn cap. **ARMED at epoch 2700** — see the record at the end of
+/// this comment. Below 2700 the rule is written down and does nothing; at
+/// and after 2700 it is consensus.
 ///
 /// # The hole it closes
 ///
@@ -1329,20 +1334,29 @@ pub const DEPOSIT_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// block's own header slot by `compute_post_state`'s boundary walk, never
 /// node-local. The 2026-08-08 `expected_bits` fork is the standing reason.
 ///
-/// # ARMING THIS IS A FOUNDER DECISION, AND IT HAS A PRECONDITION
+/// # ARMED 2026-09-09 by founder decision at epoch 2700
 ///
-/// Two, actually. (1) The whole fleet must already be running a binary that
-/// carries this rule, because the first post-gate block changes the verdict on
-/// legacy `Exit` — a node without the rule accepts what a node with it
-/// refuses. (2) `ExitV2` has **no decoder arm**: wire byte `0x08` is
-/// CONTESTED across live lineages (`SignedExit`, `Withdraw`, `ExitV2` all
-/// claim it — see `tests/wire_tag_registry.rs`), and this tree refuses to
-/// decode it until the founder rules on the byte. Arming this constant
-/// without that ruling retires the legacy message and puts nothing in its
-/// place: voluntary exit would simply stop existing.
+/// Decision taken at ~epoch 2413; epoch 2700 lands ≈2026-09-12 21:30 UTC
+/// (90 epochs/day), ≈3 days of lead. The two preconditions this comment
+/// used to list are met: (1) the fleet rollout is the operational half of
+/// the decision and is recorded in `docs/VALIDATOR-LIFECYCLE-FLAG-DAY.md`;
+/// (2) `ExitV2` moved off the contested `0x08` to the released `0x0C`
+/// (ADR-041 D1, `tests/wire_tag_registry.rs`) and has a decoder arm, so
+/// arming retires the legacy message AND puts the authenticated one in its
+/// place. Same three tripwire requirements as
+/// [`LEAK_RECOVERY_ACTIVATION_EPOCH`]: strictly in the future when armed,
+/// after the fleet rollout completes, matching the runbook. One of the five
+/// ADR-041 gates armed together (compile-time ordering block below), and it
+/// shares the epoch with `LEAK_RECOVERY_ACTIVATION_EPOCH` on purpose — one
+/// fleet rebuild, one boundary to watch.
 ///
-/// `exit_auth_gate_is_inert` pins the value.
-pub const EXIT_AUTH_ACTIVATION_EPOCH: u64 = u64::MAX;
+/// DEPLOYMENT DEADLINE: every validator must run a binary carrying this value
+/// BEFORE epoch 2700. A fleet split across old/new binaries at that boundary
+/// diverges on the first block that carries a lifecycle transaction, or a
+/// legacy `Exit`.
+///
+/// `exit_auth_armed_epoch_matches_the_runbook` pins the value.
+pub const EXIT_AUTH_ACTIVATION_EPOCH: u64 = 2_700;
 
 /// Flag day for the **fee-to-stake decoupling** (finding C-R2-2, 2026-09-05).
 ///
@@ -1413,16 +1427,31 @@ pub const FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// boundary walk — committed state, never a clock. The 2026-08-08
 /// `expected_bits` fork is the standing reason.
 ///
-/// # ARMING THIS IS A FOUNDER DECISION, AND IT HAS A PRECONDITION
+/// # ARMED 2026-09-09 by founder decision at epoch 2700
 ///
-/// The whole fleet must already run a binary whose decoder understands the
-/// evidence wire format: below the gate old and new binaries agree (both
-/// refuse the block, one at decode and one at the transition), but the first
-/// post-gate block that carries evidence is accepted only by nodes that can
-/// decode it. Same rollout discipline as `LEAKED_ROSTER_ACTIVATION_EPOCH`.
+/// Decision taken at ~epoch 2413; epoch 2700 lands ≈2026-09-12 21:30 UTC
+/// (90 epochs/day), ≈3 days of lead. Same three tripwire requirements as
+/// [`LEAK_RECOVERY_ACTIVATION_EPOCH`]: strictly in the future when armed,
+/// after the fleet rollout completes, matching the runbook
+/// (`docs/VALIDATOR-LIFECYCLE-FLAG-DAY.md`). The precondition this comment
+/// used to state is now the deployment deadline: the whole fleet must run a
+/// binary whose decoder understands the evidence wire format BEFORE epoch
+/// 2700 — below the gate old and new binaries agree (both refuse the block,
+/// one at decode and one at the transition), but the first post-gate block
+/// that carries evidence is accepted only by nodes that can decode it. Same
+/// rollout discipline as `LEAKED_ROSTER_ACTIVATION_EPOCH`. The fleet at the
+/// time of the decision runs `46133196`, which has NO armed gate at all —
+/// not even the leak recovery — so the rollout is not optional.
 ///
-/// `slashing_evidence_gate_is_inert` pins the value.
-pub const SLASHING_EVIDENCE_ACTIVATION_EPOCH: u64 = u64::MAX;
+/// What this does NOT claim: the penalty is unaudited by any third party,
+/// `SlashingState`'s one-prosecution rule is preserved as-is (ADR-041 T-6
+/// is not reconciled with it), and no mainnet slash has been observed. The
+/// prose lock in `bloch-pos-node/tests/slashing_backed_finality_claims.rs`
+/// keeps every published retraction in force below 2700 and forbids an
+/// unqualified slashing-backed finality claim at any epoch.
+///
+/// `slashing_evidence_armed_epoch_matches_the_runbook` pins the value.
+pub const SLASHING_EVIDENCE_ACTIVATION_EPOCH: u64 = 2_700;
 
 /// **Flag day for the transfer dust rule — SHIPS INERT (`u64::MAX`).**
 ///
@@ -1502,19 +1531,23 @@ pub const MAX_TRANSFER_OUTPUTS: usize = 256;
 /// the `Deposit`/`ExitV2` gates, so today's fleet behaviour is unchanged
 /// byte for byte.
 ///
-/// # Arming has the same unmet precondition as `EXIT_AUTH_ACTIVATION_EPOCH`
+/// # ARMED 2026-09-09 by founder decision at epoch 2700
 ///
-/// The transaction's wire byte (`0x0A`) is claimed encode-side only: the
-/// decoder deliberately refuses it until the founder assigns the byte
-/// (`tests/wire_tag_registry.rs`). Arming this constant without that
-/// assignment activates rules nothing on the wire can reach. Both decisions
-/// — the byte and the flag day — are the founder's, and both have a hard
-/// deadline: they must be armed, with the fleet rebuilt, **before the first
-/// chain exhausts (~2027-02-11)**, or proposal liveness starts decaying
-/// validator by validator.
+/// Decision taken at ~epoch 2413; epoch 2700 lands ≈2026-09-12 21:30 UTC
+/// (90 epochs/day), ≈3 days of lead — well inside the hard deadline this
+/// comment used to carry (first chain exhausts ~2027-02-11). The wire byte
+/// `0x0A` is released and decodes (ADR-041 D1, `tests/wire_tag_registry.rs`),
+/// so the rules armed here are reachable from the wire. Same three tripwire
+/// requirements as [`LEAK_RECOVERY_ACTIVATION_EPOCH`]: strictly in the future
+/// when armed, after the fleet rollout completes, matching the runbook
+/// (`docs/VALIDATOR-LIFECYCLE-FLAG-DAY.md`). The severable ADR-041 rider,
+/// armed together with the other four at the same epoch.
 ///
-/// `randao_recommit_gate_is_inert` pins the value.
-pub const RANDAO_RECOMMIT_ACTIVATION_EPOCH: u64 = u64::MAX;
+/// DEPLOYMENT DEADLINE: every validator must run a binary carrying this value
+/// BEFORE epoch 2700.
+///
+/// `randao_recommit_armed_epoch_matches_the_runbook` pins the value.
+pub const RANDAO_RECOMMIT_ACTIVATION_EPOCH: u64 = 2_700;
 
 /// Flag day for the **declared-size ceiling** on transfers (audit H-R7-2,
 /// 2026-09-05): at and above this epoch, a `Transfer`/`TransferV2` whose
@@ -1818,12 +1851,31 @@ pub const FORKCHOICE_EQUIVOCATION_HORIZON_SLOTS: u64 = SLOTS_PER_EPOCH;
 pub const STAKING_TX_METERING_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// ADR-041 lifecycle release epoch for withdrawals (tag 0x0D).
-/// Disabled at u64::MAX. Must equal funded admission, authenticated exit,
-/// slashing evidence and RANDAO renewal; compile-time assertions enforce it.
-/// Withdrawal pays the registered script, writes off unissued genesis
-/// principal, and consumes block capacity even with legacy metering disabled.
-/// Arming requires the release ceremony and rehearsals in ADR-041.
-pub const WITHDRAWAL_ACTIVATION_EPOCH: u64 = u64::MAX;
+/// Must equal funded admission, authenticated exit, slashing evidence and
+/// RANDAO renewal; compile-time assertions enforce it. Withdrawal pays the
+/// registered script, writes off unissued genesis principal, and consumes
+/// block capacity even with legacy metering disabled.
+///
+/// # ARMED 2026-09-09 by founder decision at epoch 2700
+///
+/// Decision taken at ~epoch 2413; epoch 2700 lands ≈2026-09-12 21:30 UTC
+/// (90 epochs/day), ≈3 days of lead. Same three tripwire requirements as
+/// [`LEAK_RECOVERY_ACTIVATION_EPOCH`]: strictly in the future when armed,
+/// after the fleet rollout completes, matching the runbook
+/// (`docs/VALIDATOR-LIFECYCLE-FLAG-DAY.md`). No withdrawal can mature before
+/// epoch 2700 + [`crate::staking::EXIT_DELAY_EPOCHS`] +
+/// [`crate::staking::WITHDRAWAL_DELAY_EPOCHS`] anyway (an exit signed at
+/// 2700 matures at 4780), so the first `Withdraw` a mainnet block can carry
+/// is ≈23 days after the flag day. The ADR-041 rehearsals ran
+/// (`docs/audit/VALIDATOR-LIFECYCLE-IMPLEMENTATION-2026-09-09.md`); the
+/// weak-subjectivity signing ceremony and the external audit it lists have
+/// NOT — that is recorded in the runbook, not hidden by this constant.
+///
+/// DEPLOYMENT DEADLINE: every validator must run a binary carrying this value
+/// BEFORE epoch 2700.
+///
+/// `withdrawal_armed_epoch_matches_the_runbook` pins the value.
+pub const WITHDRAWAL_ACTIVATION_EPOCH: u64 = 2_700;
 
 /// Flag day for **network-bound transfer signing** (audit A2-3 / R7 M2,
 /// 2026-09-06): `u64::MAX` = INERT, below it `DS_SPEND`'s preimage is
@@ -1965,10 +2017,30 @@ pub const DS_COHERENCE: [u8; 16] = *b"BLCH4:COHERE\0\0\0\0";
 pub(crate) const ROLE_SLOT: u8 = 0x01;
 pub(crate) const ROLE_EPOCH: u8 = 0x02;
 
-/// Independent flag day for funded validator admission (wire 0x0B).
-/// Deliberately unarmed pending a coordinated consensus release. This never
-/// enables the unfunded legacy Deposit/Delegate formats. No runtime override.
-pub const FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH: u64 = u64::MAX;
+/// Flag day for funded validator admission (wire 0x0B). This never enables
+/// the unfunded legacy Deposit/Delegate formats ([`DEPOSIT_ACTIVATION_EPOCH`]
+/// stays `u64::MAX`, permanently). No runtime override.
+///
+/// # ARMED 2026-09-09 by founder decision at epoch 2700
+///
+/// Decision taken at ~epoch 2413; epoch 2700 lands ≈2026-09-12 21:30 UTC
+/// (90 epochs/day), ≈3 days of lead. Same three tripwire requirements as
+/// [`LEAK_RECOVERY_ACTIVATION_EPOCH`]: strictly in the future when armed,
+/// after the fleet rollout completes, matching the runbook
+/// (`docs/VALIDATOR-LIFECYCLE-FLAG-DAY.md`). Armed together with the other
+/// four ADR-041 gates (the ordering block below refuses a partial arming),
+/// which closes VAD-01 of
+/// `docs/audit/VALIDATOR-ADMISSION-REVIEW-2026-09-08.md` (admission armed
+/// alone). Arming is NOT the announcement of public validator admission: the
+/// admission spec's "not for public funds" sentence discharges only after
+/// one full withdrawal has settled on mainnet, and the runbook lists what is
+/// still open.
+///
+/// DEPLOYMENT DEADLINE: every validator must run a binary carrying this value
+/// BEFORE epoch 2700.
+///
+/// `funded_admission_armed_epoch_matches_the_runbook` pins the value.
+pub const FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH: u64 = 2_700;
 
 pub fn funded_validator_admission_active(epoch: u64) -> bool {
     #[cfg(test)]

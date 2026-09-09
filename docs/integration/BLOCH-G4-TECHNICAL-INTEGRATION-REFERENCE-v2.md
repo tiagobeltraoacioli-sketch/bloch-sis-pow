@@ -2,6 +2,19 @@
 
 **Edition 2 · 2026-09-07 · Code revision `72e5525` (branch `main`)**
 
+> **Correction 2026-09-09.** Two days after this edition, ADR-041 landed the
+> validator lifecycle (`ExitV2` = `0x0C`, `Withdraw` = `0x0D`,
+> `RandaoRecommit` = `0x0A`, all decodable; `0x07`–`0x09` tombstoned) and the
+> founder ARMED its five gates — `FUNDED_VALIDATOR_ADMISSION`, `EXIT_AUTH`,
+> `WITHDRAWAL`, `SLASHING_EVIDENCE`, `RANDAO_RECOMMIT` — at **epoch 2700**,
+> the same boundary as `LEAK_RECOVERY` (§3.1). Every statement below that
+> calls one of those five "inert", "`u64::MAX`", "unwired" or "no such
+> transaction exists" was true at `72e5525` and is superseded: below 2700 the
+> behaviour is as described here; from 2700 on read
+> `docs/VALIDATOR-LIFECYCLE-FLAG-DAY.md` and
+> `docs/specs/BLOCH-VALIDATOR-LIFECYCLE.md`. Nothing on Genesis-4 can be
+> slashed below epoch 2700; no withdrawal can settle before epoch ≈4780.
+
 Postern Labs · Bloch Genesis-4, a post-quantum proof-of-stake Layer-1 with an
 extended-UTXO ledger and explicit Casper-FFG finality.
 
@@ -395,7 +408,8 @@ the full flag-day table and what changes for an integrator.
 
 ### 2.8 Slashing — exists in code, structurally inert today
 
-`SLASHING_EVIDENCE_ACTIVATION_EPOCH = u64::MAX` — **inert**. Genesis-4's own
+`SLASHING_EVIDENCE_ACTIVATION_EPOCH = u64::MAX` at `72e5525` — **inert**
+(armed at 2700 on 2026-09-09; see the correction at the top). Genesis-4's own
 RPC source states plainly, in the single most consequential doc comment in
 this tree for an exchange: **"No stake on Genesis-4 can be slashed at all"**,
 for four independent reasons, any one of which is alone sufficient

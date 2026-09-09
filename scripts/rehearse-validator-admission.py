@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Run the funded-admission node test in an isolated, compile-time devnet.
 
-The checked-out source is never edited. The shipping activation remains
-unarmed; there is no feature, environment variable or node option that can
-change consensus on a running network. CI tests the positive path by compiling
-a disposable copy with the five co-activated ADR-041 constants changed to epoch zero.
+The checked-out source is never edited. The shipping activation is whatever
+params.rs says (u64::MAX until 2026-09-09, epoch 2700 since); there is no
+feature, environment variable or node option that can change consensus on a
+running network. CI tests the positive path by compiling a disposable copy
+with the five co-activated ADR-041 constants changed to epoch zero.
 """
 import argparse
 import os
@@ -34,10 +35,13 @@ def main():
     source = (ROOT / PARAMS).read_text()
     armed = source
     for gate in GATES:
-        old = f"pub const {gate}_ACTIVATION_EPOCH: u64 = u64::MAX;"
-        if source.count(old) != 1:
-            raise SystemExit(f"Expected exactly one unarmed {gate} constant; review the rehearsal.")
-        armed = armed.replace(old, f"pub const {gate}_ACTIVATION_EPOCH: u64 = 0;")
+        # The shipping value is either the unarmed sentinel or an armed epoch
+        # literal (2_700 since the 2026-09-09 flag day); the disposable copy
+        # sets it to zero either way so the rehearsal runs from epoch 0.
+        pattern = re.compile(rf"^pub const {gate}_ACTIVATION_EPOCH: u64 = (?:u64::MAX|\d[\d_]*);$", re.M)
+        if len(pattern.findall(source)) != 1:
+            raise SystemExit(f"Expected exactly one {gate} constant declaration; review the rehearsal.")
+        armed = pattern.sub(f"pub const {gate}_ACTIVATION_EPOCH: u64 = 0;", armed)
     pin = re.search(r'^channel\s*=\s*"([^"]+)"', (ROOT / "crates/bloch-pos-node/rust-toolchain.toml").read_text(), re.M)
     if not pin:
         raise SystemExit("Missing pinned toolchain")
@@ -90,9 +94,9 @@ def main():
     if (ROOT / PARAMS).read_text() != source:
         raise SystemExit("Shipping activation source changed during the rehearsal")
     if args.audit_mempool:
-        print("Mempool regression passed: invalid funding refused before relay. Shipping source remains unarmed.")
+        print("Mempool regression passed: invalid funding refused before relay. Shipping source unchanged.")
     else:
-        print("Validator lifecycle rehearsal passed; the shipping source remains unarmed.")
+        print("Validator lifecycle rehearsal passed; the shipping source is unchanged.")
 
 
 if __name__ == "__main__":

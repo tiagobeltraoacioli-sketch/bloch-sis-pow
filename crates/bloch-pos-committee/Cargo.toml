@@ -3,7 +3,7 @@ name = "bloch-pos-committee"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
-description = "Bloch Genesis-4 consensus core — the state transition, LMD-GHOST fork choice, FFG finality, epoch committees and proposer schedule, RANDAO, staking, slashing rules that are complete but still UNREACHABLE from the network until an unarmed flag day (since 2026-09-05 evidence decodes, and the transaction is consensus-refused below SLASHING_EVIDENCE_ACTIVATION_EPOCH = u64::MAX), and tokenomics V4. This is the live chain's consensus, running mainnet since 2026-08-13. UNAUDITED by any third party."
+description = "Bloch Genesis-4 consensus core — the state transition, LMD-GHOST fork choice, FFG finality, epoch committees and proposer schedule, RANDAO, staking, slashing rules that are complete but UNREACHABLE from the network below the flag day (since 2026-09-05 evidence decodes, and the transaction is consensus-refused below SLASHING_EVIDENCE_ACTIVATION_EPOCH, armed at epoch 2700 on 2026-09-09), and tokenomics V4. This is the live chain's consensus, running mainnet since 2026-08-13. UNAUDITED by any third party."
 publish = false
 
 # Member of the root workspace since Genesis-4 became the trunk. It was

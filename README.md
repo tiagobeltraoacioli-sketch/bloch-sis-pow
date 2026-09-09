@@ -164,10 +164,16 @@ change any rule, so "impossible to change" would be false.
 | Ustav (PSTRN-1) charter at L1 | proposal | no — nothing wired | no |
 | Third-party audit | scoped | pre-audit dossier written | **not performed** |
 
-Funded validator admission is implemented behind an **unarmed consensus flag
-day**. The [protocol and operator guide](docs/specs/BLOCH-FUNDED-VALIDATOR-ADMISSION.md)
+Funded validator admission and the ADR-041 lifecycle (authenticated exit,
+withdrawal, slashing evidence, RANDAO re-commit) are implemented behind a
+consensus flag day **armed at epoch 2700 (≈2026-09-12 21:31 UTC) by founder
+decision on 2026-09-09** — runbook
+[`docs/VALIDATOR-LIFECYCLE-FLAG-DAY.md`](docs/VALIDATOR-LIFECYCLE-FLAG-DAY.md),
+which also lists what the flag day does not do (no public-admission
+announcement, no external audit, no mainnet withdrawal settled yet). The
+[protocol and operator guide](docs/specs/BLOCH-FUNDED-VALIDATOR-ADMISSION.md)
 covers PQ funding/possession signatures, offline signing, automatic registry
-index discovery and the lifecycle dependencies required before mainnet activation.
+index discovery and the lifecycle dependencies.
 
 ## Where things are
 

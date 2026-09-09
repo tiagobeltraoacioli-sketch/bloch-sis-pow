@@ -1,9 +1,11 @@
 # Funded validator admission
 
-Status: implemented, **not activated on mainnet**. The independent
-`FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH` is `u64::MAX`. This work prepares
-registration and node onboarding for a coordinated consensus release; merging
-it does not open deposits on the running network.
+Status: implemented; `FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH` **armed at
+epoch 2700** (founder decision 2026-09-09, together with the four other
+ADR-041 lifecycle gates — `docs/VALIDATOR-LIFECYCLE-FLAG-DAY.md`). Below 2700
+nothing is active on the running network; from 2700 on, funded registration
+is consensus-valid. Arming is not the announcement of public admission — see
+the release boundaries below and the runbook's open items.
 
 The legacy `Deposit` (0x02) and `Delegate` (0x04) create bonds without consuming
 UTXOs. Their gate remains closed. New registration uses **0x0B**, a fresh wire
@@ -104,8 +106,9 @@ keystore, its RANDAO seed and the withdrawal authority's backups secure.
 Withdrawals must name a script whose PQ spending key the intended recipient
 actually controls; registration does not establish that control for them.
 
-1. Query `getvalidatoradmission`. An unarmed build reports `active: false` and
-   `activation_epoch: null`, plus its network domain, head epoch, stake bounds,
+1. Query `getvalidatoradmission`. Below the flag day a build reports
+   `active: false` and `activation_epoch: 2700` (an unarmed build would say
+   `null`), plus its network domain, head epoch, stake bounds,
    queue limits and next base fee. These are quotes from the current head;
    consensus rechecks them at inclusion.
 2. Gather spendable UTXOs with `listunspent` for the funding authority. Export
@@ -184,12 +187,13 @@ rehearse the same activation boundary. No runtime option enables the format.
 Historical roots and pre-activation validity remain unchanged.
 
 The admission flag day also refuses unauthenticated legacy `Exit` messages
-for every validator. **This PR does not activate authenticated exits,
-withdrawals, slashing evidence or RANDAO recommit.** Those paths have their own
-unarmed gates, and some still have contested wire assignments. Admission must
-not be opened for public funds until the operator-approved lifecycle and those
-existing release dependencies are resolved. Otherwise bonds have no activated
-withdrawal path and validator RANDAO chains remain finite. This is a concrete
+for every validator. **The admission PR alone did not activate authenticated
+exits, withdrawals, slashing evidence or RANDAO recommit**; those paths have
+their own gates, and since 2026-09-09 all five are armed at the same epoch
+2700 (`docs/specs/BLOCH-VALIDATOR-LIFECYCLE.md`), so admission cannot go live
+without them. Admission must not be opened for public funds until the
+lifecycle's release dependencies in the runbook are resolved — in
+particular, no withdrawal can settle before epoch ≈4780. This is a concrete
 limitation of the current code, not a promise of a complete staking lifecycle.
 
 Coverage includes funding conservation/refunds, atomic failures, replay,

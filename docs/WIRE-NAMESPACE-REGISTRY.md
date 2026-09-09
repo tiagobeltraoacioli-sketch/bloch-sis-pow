@@ -200,8 +200,8 @@ constants would edit consensus code, and the guard may not do that.
 
 | Sub-tag | Meaning | Status | Owner | Frozen by |
 | --- | --- | --- | --- | --- |
-| `0x01` | `SlashingEvidence::ProposerEquivocation { first, second }` | Encoder + decoder on the release lineage since 2026-09-05 (F-02); the transaction is consensus-refused below the unarmed `SLASHING_EVIDENCE_ACTIVATION_EPOCH`. | slashing | `wire_tag_registry.rs::evidence_subtags_match_the_frozen_registry` |
-| `0x02` | `SlashingEvidence::AttestationOffence { first, second }` | Encoder + decoder on the release lineage since 2026-09-05 (F-02); the transaction is consensus-refused below the unarmed `SLASHING_EVIDENCE_ACTIVATION_EPOCH`. | slashing | `wire_tag_registry.rs::evidence_subtags_match_the_frozen_registry` |
+| `0x01` | `SlashingEvidence::ProposerEquivocation { first, second }` | Encoder + decoder on the release lineage since 2026-09-05 (F-02); the transaction is consensus-refused below `SLASHING_EVIDENCE_ACTIVATION_EPOCH` (armed at 2700 on 2026-09-09). | slashing | `wire_tag_registry.rs::evidence_subtags_match_the_frozen_registry` |
+| `0x02` | `SlashingEvidence::AttestationOffence { first, second }` | Encoder + decoder on the release lineage since 2026-09-05 (F-02); the transaction is consensus-refused below `SLASHING_EVIDENCE_ACTIVATION_EPOCH` (armed at 2700 on 2026-09-09). | slashing | `wire_tag_registry.rs::evidence_subtags_match_the_frozen_registry` |
 | `0x03`–`0xFF` | free | — | — | — |
 
 **Next free evidence sub-tag: `0x03`.**
@@ -237,11 +237,12 @@ A bare literal in a nested match is not a claimable allocation.
 **Related — a transport-level gate, not a namespace, recorded so it is not
 mistaken for one:** the same commit adds a gossipsub relay verdict for evidence
 at `crates/bloch-pos-node/src/p2p.rs`, keyed on
-`SLASHING_EVIDENCE_ACTIVATION_EPOCH` (`params.rs:638`). **Verified inert:
-`u64::MAX`.** It is the only activation constant this branch adds, and it is not
-armed. `main` did not define it when this was written; since 2026-09-05 `main`'s
-`params.rs` defines it, also inert at `u64::MAX` (the F-02 decode fix ships
-gated behind it).
+`SLASHING_EVIDENCE_ACTIVATION_EPOCH` (`params.rs:638`). **Verified inert at
+`u64::MAX` when this was written.** It is the only activation constant that
+branch adds. `main` did not define it when this was written; since 2026-09-05
+`main`'s `params.rs` defines it (the F-02 decode fix ships gated behind it),
+and since 2026-09-09 it is ARMED at epoch 2700 together with the other four
+ADR-041 lifecycle gates (`docs/VALIDATOR-LIFECYCLE-FLAG-DAY.md`).
 
 ## 2. Frame bytes — `u8`, first byte of a devnet-transport frame **[re-verified 2026-09-02]**
 

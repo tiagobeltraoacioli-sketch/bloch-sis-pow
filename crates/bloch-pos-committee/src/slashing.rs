@@ -13,12 +13,16 @@
 //! > 2026-09-05 the tag DECODES (the envelopes travel whole), and what stands
 //! > in the way is the flag day: the transition refuses the evidence
 //! > transaction at every epoch below
-//! > `params::SLASHING_EVIDENCE_ACTIVATION_EPOCH`, which ships INERT at
-//! > `u64::MAX` and is the founder's to arm — after a full fleet rollout of
-//! > the decoder, since the released binaries still refuse the tag at decode.
-//! > Nothing constructs the transaction outside tests. Read the penalties
-//! > below as a *design*, and do not let them back a finality guarantee
-//! > anywhere: the retraction on `bloch-pos-node`'s `rpc::Finality` says why,
+//! > `params::SLASHING_EVIDENCE_ACTIVATION_EPOCH`, which shipped inert at
+//! > `u64::MAX` until 2026-09-09 and is now ARMED at epoch 2700 by founder
+//! > decision (`docs/VALIDATOR-LIFECYCLE-FLAG-DAY.md`), after the fleet
+//! > rollout of the decoder that the released `46133196` binaries still lack.
+//! > Below 2700 nothing in this module can run on the live chain; at and
+//! > after 2700 it is consensus, unaudited by any third party and with the
+//! > one-prosecution rule (`an_ejected_validator_is_not_punished_again`)
+//! > preserved as-is. Do not let the penalties below back a finality
+//! > guarantee anywhere until the chain is past 2700 and a prosecution has
+//! > landed: the retraction on `bloch-pos-node`'s `rpc::Finality` says why,
 //! > and `crates/bloch-pos-node/tests/slashing_backed_finality_claims.rs`
 //! > keeps this note, that codec and that gate in step.
 //!

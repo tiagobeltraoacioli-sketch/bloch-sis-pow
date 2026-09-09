@@ -5850,9 +5850,9 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
         //
         // The gate first, and pre-activation the refusal is unconditional —
         // exactly the `TransferV2` arm's discipline. `EXIT_AUTH_ACTIVATION_EPOCH`
-        // is `u64::MAX`, so this refuses at every epoch any chain can reach,
-        // which is what keeps this node's mempool in step with the transition
-        // arm it fronts for (`apply_exit_v2`).
+        // is armed at 2700 (2026-09-09), so this refuses at every wall epoch
+        // below it, which is what keeps this node's mempool in step with the
+        // transition arm it fronts for (`apply_exit_v2`).
         //
         // What this arm CANNOT do, stated rather than left to be discovered:
         // verify the hybrid signature. The signature is over the validator's
@@ -5870,8 +5870,8 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
             if !bloch_pos_committee::params::epoch_gate_active(wall_epoch, bloch_pos_committee::params::EXIT_AUTH_ACTIVATION_EPOCH) {
                 return Err(
                     "authenticated exits (tag 0x0C) are not active: the format ships \
-                     behind a flag day (EXIT_AUTH_ACTIVATION_EPOCH) that this chain has \
-                     not reached, and lifecycle activation remains disabled",
+                     behind a flag day (EXIT_AUTH_ACTIVATION_EPOCH, armed at epoch 2700) \
+                     that this chain has not reached",
                 );
             }
             exit_v2_structural_rules(*epoch, signature, wall_epoch)
@@ -5882,8 +5882,8 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
         // ingress could construct one. Named explicitly for the reason the
         // `ExitV2` arm states: a variant that reaches `_` is a variant the
         // mempool admits, and consensus refuses this one at every epoch below
-        // the INERT `SLASHING_EVIDENCE_ACTIVATION_EPOCH`
-        // (`TxReject::EvidenceNotActive`), so admitting it pre-gate would
+        // `SLASHING_EVIDENCE_ACTIVATION_EPOCH` (armed at 2700, 2026-09-09;
+        // `TxReject::EvidenceNotActive`), so admitting it pre-gate would
         // relay transactions no block can carry — the mempool-stuffing class.
         //
         // Post-gate this arm admits: the pair's two hybrid signatures need
@@ -5913,15 +5913,17 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
         // The RANDAO re-commit (H-R7-1) — named explicitly for the same
         // reason ExitV2 is: a variant that reaches `_` is a variant the
         // mempool ADMITS, and this shape is consensus-refused at every epoch
-        // (`RANDAO_RECOMMIT_ACTIVATION_EPOCH` is `u64::MAX`) with its wire
-        // byte (0x0A) unassigned besides. Pre-activation the refusal is
+        // below `RANDAO_RECOMMIT_ACTIVATION_EPOCH` (armed at 2700, 2026-09-09;
+        // the wire byte 0x0A is released, ADR-041). Pre-activation the refusal is
         // unconditional; post-activation the signature half still belongs to
         // consensus alone (this function is stateless — no registry to
         // resolve the validator's committed key against).
         PosTransaction::RandaoRecommit { .. } => {
             if !bloch_pos_committee::params::epoch_gate_active(wall_epoch, bloch_pos_committee::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH) {
                 return Err(
-                    "RANDAO re-commits (tag 0x0A) are not active: the format ships                      behind a flag day (RANDAO_RECOMMIT_ACTIVATION_EPOCH) that this                      chain has not reached, and lifecycle activation remains disabled",
+                    "RANDAO re-commits (tag 0x0A) are not active: the format ships \
+                     behind a flag day (RANDAO_RECOMMIT_ACTIVATION_EPOCH, armed at epoch \
+                     2700) that this chain has not reached",
                 );
             }
             Ok(())
@@ -5932,10 +5934,10 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
 /// The structural half of admitting an [`PosTransaction::ExitV2`], split out
 /// of `admissible` so it can be TESTED.
 ///
-/// It cannot be tested through `admissible` itself, and that is not an
-/// oversight in the test: `EXIT_AUTH_ACTIVATION_EPOCH` is `u64::MAX`, so the
-/// flag-day check in front of these rules refuses at every epoch any chain can
-/// reach, and no argument to `admissible` ever gets past it. Rules that only
+/// It was extracted when `EXIT_AUTH_ACTIVATION_EPOCH` was `u64::MAX` and the
+/// flag-day check in front of these rules refused at every epoch any chain
+/// could reach, so no argument to `admissible` ever got past it (the gate is
+/// armed at 2700 since 2026-09-09; the extraction stays). Rules that only
 /// run after a flag day are exactly the rules that get to the flag day
 /// unexercised. Extracting them makes them a pure function of three values and
 /// therefore checkable today, on the tree the fleet runs, without arming
@@ -6110,11 +6112,12 @@ mod forkchoice_tests {
     }
 
     /// Tag 0x05 decodes since 2026-09-05 (F-02), so it can now arrive at the
-    /// mempool door — and below the inert flag day consensus refuses it
-    /// (`TxReject::EvidenceNotActive`), so admission would relay a
-    /// transaction no block can carry. Goes red if the arm falls back into
-    /// the `_ => Ok(())` catch-all, and goes red at any wall epoch below the
-    /// gate if someone arms the constant without revisiting this door.
+    /// mempool door — and below the flag day (armed at 2700, 2026-09-09)
+    /// consensus refuses it (`TxReject::EvidenceNotActive`), so admission
+    /// would relay a transaction no block can carry. Goes red if the arm
+    /// falls back into the `_ => Ok(())` catch-all, and goes red if the door
+    /// and the constant ever disagree in either direction: refused below
+    /// 2700 by name, admitted at and after it.
     #[test]
     fn slashing_evidence_is_refused_at_the_door_below_its_flag_day() {
         let attest = |head: u8| bloch_pos_committee::Attestation {
@@ -6135,12 +6138,20 @@ mod forkchoice_tests {
                 second: attest(0xBB),
             },
         );
-        for wall_epoch in [0u64, 2_700, u64::MAX - 1] {
+        for wall_epoch in [0u64, 1, 2_413, 2_699] {
             let err = admissible(&ev, wall_epoch)
                 .expect_err("evidence must not be admitted below its flag day");
             assert!(
                 err.contains("SLASHING_EVIDENCE_ACTIVATION_EPOCH"),
                 "the refusal must name the gate: {err}"
+            );
+        }
+        for wall_epoch in [2_700u64, 100_000, u64::MAX - 1] {
+            assert_eq!(
+                admissible(&ev, wall_epoch),
+                Ok(()),
+                "at and after the armed epoch the door admits evidence; consensus \
+                 (`apply_slashing_evidence`) judges the pair against the pre-state"
             );
         }
     }
@@ -6682,10 +6693,11 @@ mod admission_authorisation {
     ///
     /// That distinction is the whole test. `admissible` ends in `_ => Ok(())`,
     /// so a new `PosTransaction` variant is admitted by default; a variant
-    /// consensus refuses (`EXIT_AUTH_ACTIVATION_EPOCH` is `u64::MAX`, so
-    /// `apply_exit_v2`'s gate never opens) but the mempool relays would be a
-    /// proposer building blocks nobody accepts. The `u64::MAX - 1` case is the
-    /// point: no reachable epoch admits it.
+    /// consensus refuses (`EXIT_AUTH_ACTIVATION_EPOCH` is armed at 2700, so
+    /// `apply_exit_v2`'s gate is shut below it) but the mempool relays would
+    /// be a proposer building blocks nobody accepts. The `2_699` case is the
+    /// point: the last epoch below the flag day still refuses by name, and
+    /// from 2700 the gate steps aside for the structural rules.
     #[test]
     fn authenticated_exits_are_refused_until_the_flag_day() {
         let tx = PosTransaction::ExitV2 {
@@ -6693,14 +6705,29 @@ mod admission_authorisation {
             epoch: 0,
             signature: vec![1u8; 64],
         };
-        for epoch in [0u64, 1, 800, 1400, u64::MAX - 1] {
+        for epoch in [0u64, 1, 800, 1400, 2_699] {
             let err = admissible(&tx, epoch)
-                .expect_err("ExitV2 is consensus-invalid at every reachable epoch");
+                .expect_err("ExitV2 is consensus-invalid at every epoch below the flag day");
             assert!(
                 err.contains("EXIT_AUTH_ACTIVATION_EPOCH"),
                 "the refusal must name the gate that causes it, got: {err}"
             );
         }
+        // At and after 2700 the gate no longer answers; the structural rules
+        // do (this exit is signed for epoch 0, so it is stale at 2700).
+        let err = admissible(&tx, 2_700).expect_err("a stale exit is still refused post-gate");
+        assert!(
+            !err.contains("EXIT_AUTH_ACTIVATION_EPOCH") && err.contains("different epoch"),
+            "post-gate the refusal must come from the structural rules, got: {err}"
+        );
+        assert_eq!(
+            admissible(
+                &PosTransaction::ExitV2 { pubkey_hash: [9u8; 32], epoch: 2_700, signature: vec![1u8; 64] },
+                2_700,
+            ),
+            Ok(()),
+            "a well-formed exit for the inclusion epoch is admitted at the flag day"
+        );
         // And the legacy message stays refused beside it — closing one door
         // must not open the other.
         assert!(

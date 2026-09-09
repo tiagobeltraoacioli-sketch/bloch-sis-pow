@@ -130,9 +130,14 @@ fn funded_decoder_bounds_lengths_before_allocating() {
     assert!(PosTransaction::from_canonical_bytes(&tx.canonical_bytes()).is_err());
 }
 
+/// Armed at 2700 on 2026-09-09 (`docs/VALIDATOR-LIFECYCLE-FLAG-DAY.md`):
+/// closed at every epoch below, open from the flag day on. Until then this
+/// test pinned the gate closed even at `u64::MAX`.
 #[test]
-fn funded_gate_is_closed_even_at_maximum_epoch_and_legacy_stays_closed() {
-    assert!(!crate::params::funded_validator_admission_active(u64::MAX));
+fn funded_gate_is_closed_below_the_flag_day_and_legacy_stays_closed() {
+    assert!(!crate::params::funded_validator_admission_active(2_699));
+    assert!(crate::params::funded_validator_admission_active(2_700));
+    assert!(crate::params::funded_validator_admission_active(u64::MAX));
     let tx = deposit(22);
     let (_, mut state, _) = fixture(std::slice::from_ref(&tx));
     let root = state.state_root();

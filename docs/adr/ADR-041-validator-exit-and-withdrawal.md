@@ -1,6 +1,9 @@
 # ADR-041 — Validator exit and withdrawal lifecycle
 
-Status: **ACCEPTED — founder decisions recorded 2026-09-08.**
+Status: **ACCEPTED — founder decisions recorded 2026-09-08. ARMED 2026-09-09:
+`L = 2700`** (≈2026-09-12 21:31 UTC), runbook `docs/VALIDATOR-LIFECYCLE-FLAG-DAY.md`.
+The `= u64::MAX` values quoted below describe main as measured on `6e4b5323`,
+when this ADR was written; the five constants now carry `2_700`.
 (1) epoch **L**: best technical choice, targeted THIS WEEK — the concrete epoch is
 fixed at release cut, not in this document; (2) the genesis principal write-off
 (~1.6M BLCH, the founder's own never-issued principal) is explicitly reaffirmed;
