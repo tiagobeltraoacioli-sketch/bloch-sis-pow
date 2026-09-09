@@ -118,6 +118,8 @@ fn sealed_offline_roles_prepare_sign_inspect_and_refuse_overwrite() {
     assert!(!invoke(&[
         "validator-deposit",
         "sign",
+        "--genesis",
+        path(&genesis),
         "--tx",
         path(&draft),
         "--role",
@@ -133,6 +135,8 @@ fn sealed_offline_roles_prepare_sign_inspect_and_refuse_overwrite() {
     ok(&[
         "validator-deposit",
         "sign",
+        "--genesis",
+        path(&genesis),
         "--tx",
         path(&draft),
         "--role",
@@ -145,6 +149,8 @@ fn sealed_offline_roles_prepare_sign_inspect_and_refuse_overwrite() {
     ok(&[
         "validator-deposit",
         "sign",
+        "--genesis",
+        path(&genesis),
         "--tx",
         path(&signed),
         "--role",
@@ -174,10 +180,32 @@ fn sealed_offline_roles_prepare_sign_inspect_and_refuse_overwrite() {
         &tx.possession_root(),
         &tx.proof_of_possession
     ));
+    // A signer's own manifest is checked before its keystore is opened.
+    let other_genesis = dir.0.join("other-genesis.bin");
+    ok(&["genesis", "--keys", path(&funding), "--out", path(&other_genesis), "--slot-ms", "1234"]);
+    let refused = invoke(&["validator-deposit", "sign", "--genesis", path(&other_genesis),
+        "--tx", path(&draft), "--role", "funding", "--dir", "missing-keystore",
+        "--out", path(&dir.0.join("wrong-network.hex"))]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("trusted genesis manifest"));
+
+    let exit_file = dir.0.join("exit.hex");
+    ok(&["validator-lifecycle", "exit", "--dir", path(&joining), "--epoch", "7", "--out", path(&exit_file)]);
+    let PosTransaction::ExitV2 { pubkey_hash, epoch, signature } = decode(&exit_file) else { panic!("expected ExitV2"); };
+    assert_eq!(epoch, 7);
+    let root = bloch_pos_committee::staking::ExitTx { pubkey_hash, epoch, signature: Vec::new() }.signing_root();
+    assert!(bloch_crypto::crypto::verify(&unhex(&j[1]), &root, &signature));
+    let withdraw_file = dir.0.join("withdraw.hex");
+    ok(&["validator-lifecycle", "withdraw", "--validator", "71", "--out", path(&withdraw_file)]);
+    assert_eq!(decode(&withdraw_file), PosTransaction::Withdraw { validator: 71 });
+    assert!(!invoke(&["validator-lifecycle", "withdraw", "--validator", "71", "--out", path(&withdraw_file)]).status.success());
+
     let saved = std::fs::read(&ready).unwrap();
     assert!(!invoke(&[
         "validator-deposit",
         "sign",
+        "--genesis",
+        path(&genesis),
         "--tx",
         path(&signed),
         "--role",

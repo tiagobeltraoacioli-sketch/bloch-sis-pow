@@ -147,6 +147,7 @@ use crate::interfaces::{
 use crate::params::SLOTS_PER_EPOCH;
 
 pub mod funded;
+mod lifecycle;
 pub use funded::{FundedDeposit, FundedDepositReject, FundingInput};
 use crate::rewards::{self, StakeAccount};
 use crate::sample::Validator;
@@ -458,6 +459,8 @@ pub enum PosTransaction {
     /// Below the flag day this arm behaves exactly as it always has (it is the
     /// control); at and above it, it is invalid.
     Exit { validator: u32 },
+    /// ADR-041: permissionless, metered withdrawal to the registered script.
+    Withdraw { validator: u32 },
     /// Authenticated voluntary exit (§7.2) — consensus-INVALID until
     /// [`crate::params::EXIT_AUTH_ACTIVATION_EPOCH`], which is `u64::MAX`.
     ///
@@ -473,21 +476,7 @@ pub enum PosTransaction {
     ///    Authentication alone still lets one operator holding many keys
     ///    retire the roster in a single block; see that constant's docs.
     ///
-    /// # The wire byte is claimed but NOT DECODED
-    ///
-    /// `canonical_bytes` writes `0x08`. The decoder has **no `0x08` arm** and
-    /// deliberately keeps returning [`TxDecodeError::UnknownTag`]: that byte
-    /// is CONTESTED across live lineages — `SignedExit`, `Withdraw` and
-    /// `ExitV2` all claim it (`tests/wire_tag_registry.rs`, and the two
-    /// meanings are semantically incompatible, so whichever lands second
-    /// splits the chain at decode). Assigning it is the founder's, and the
-    /// registry test refuses contested bytes until they are assigned.
-    ///
-    /// So this variant is, today, encode-and-apply only: the rules are
-    /// written, compiled, tested and wired into the production dispatcher,
-    /// and nothing on the wire can reach them. Closing that last gap is a
-    /// one-line decoder arm plus a `Contested` → `Released` edit, and both
-    /// wait on the same ruling.
+    /// ADR-041 assigns wire tag 0x0C; 0x07–0x09 remain tombstoned.
     ExitV2 {
         /// SHA3-256 of the exiting validator's **registered** pubkey. The
         /// index is resolved from this through `pubkey_index`, so the message
@@ -539,18 +528,10 @@ pub enum PosTransaction {
     ///    (`DS_RANDAO` domain, 60-byte preimage, collision-free with the
     ///    80-byte mixing preimage).
     ///
-    /// # The wire byte is claimed but NOT DECODED
-    ///
-    /// `canonical_bytes` writes `0x0A`. The decoder has **no `0x0A` arm** and
-    /// keeps returning [`TxDecodeError::UnknownTag`]: assigning a wire byte
-    /// is the founder's (`tests/wire_tag_registry.rs`), and until the ruling
-    /// this variant is encode-and-apply only — the rules are written,
-    /// compiled, tested under the rehearsal gate, and nothing on the wire can
-    /// reach them. Same honest state as [`Self::ExitV2`], same two-decision
-    /// arming (byte + flag day), with one difference: this one has a
-    /// deadline. Both must land, fleet rebuilt, before the first chain
-    /// exhausts (~2027-02-11), or proposal liveness decays validator by
-    /// validator.
+    /// ADR-041 releases wire tag 0x0A together with exit and withdrawal.
+    /// The node derives a fresh private generation deterministically from
+    /// its keystore; consensus commits the generation and resets the count.
+    /// Activation remains disabled until the coordinated lifecycle release.
     RandaoRecommit {
         /// Registry index of the validator installing a fresh chain. The
         /// signature check against the *committed* key is what makes naming
@@ -928,24 +909,22 @@ impl PosTransaction {
                 b.push(0x03);
                 b.extend_from_slice(&validator.to_le_bytes());
             }
+            PosTransaction::Withdraw { validator } => {
+                b.push(0x0D);
+                b.extend_from_slice(&validator.to_le_bytes());
+            }
             PosTransaction::ExitV2 { pubkey_hash, epoch, signature } => {
-                // 0x08. Same encoding rules as every other tag: fixed-width
+                // ADR-041 tag 0x0C. Same encoding rules as every other tag: fixed-width
                 // LE for the scalars, length-prefixed for the one
                 // variable-length field, so no two byte strings decode to one
-                // transaction. See the variant's docs for why the DECODER
-                // does not answer this byte yet.
-                b.push(0x08);
+                // transaction. The decoder accepts exactly this layout.
+                b.push(0x0C);
                 b.extend_from_slice(pubkey_hash);
                 b.extend_from_slice(&epoch.to_le_bytes());
                 put(&mut b, signature);
             }
             PosTransaction::RandaoRecommit { validator, new_commitment, epoch, signature } => {
-                // 0x0A. Same encoding rules as every other tag: fixed-width
-                // LE for the scalars, length-prefixed for the one
-                // variable-length field. See the variant's docs for why the
-                // DECODER does not answer this byte yet — the assignment is
-                // the founder's, and `tests/wire_tag_registry.rs` records the
-                // claim as encode-only until then.
+                // ADR-041: fixed-width fields, then a length-prefixed signature.
                 b.push(0x0A);
                 b.extend_from_slice(&validator.to_le_bytes());
                 b.extend_from_slice(new_commitment);
@@ -1085,17 +1064,15 @@ impl PosTransaction {
                     other => return Err(TxDecodeError::NotCanonical(other)),
                 },
             },
-            // NO `0x08` ARM, ON PURPOSE. `PosTransaction::ExitV2` ENCODES to
-            // 0x08 (`canonical_bytes`), and this decoder still answers
-            // `UnknownTag(0x08)`. The byte is contested across live lineages
-            // — `SignedExit`, `Withdraw` and `ExitV2` each claim it, and the
-            // first two are semantically incompatible with the third, so
-            // whichever landed second would split the chain at decode. The
-            // assignment is the founder's; `tests/wire_tag_registry.rs`
-            // refuses contested bytes until it is made, and adding an arm here
-            // is what would make that test go red. Until then no wire byte can
-            // reach the ExitV2 rules, which is the honest state of this
-            // feature and not an oversight.
+            // ADR-041: the contested 0x07–0x09 bytes have no decoder.
+            0x0C => PosTransaction::ExitV2 {
+                pubkey_hash: r.h32()?, epoch: r.u64()?, signature: r.bytes()?,
+            },
+            0x0D => PosTransaction::Withdraw { validator: r.u32()? },
+            0x0A => PosTransaction::RandaoRecommit {
+                validator: r.u32()?, new_commitment: r.h32()?,
+                epoch: r.u64()?, signature: r.bytes()?,
+            },
             0x05 => {
                 // Exact inverse of the evidence arm of `canonical_bytes`:
                 // envelopes whole, so the transition can recompute the
@@ -1518,6 +1495,14 @@ pub struct CommittedState {
     /// The genesis cohort (sorted): the founder-operated launch set whose
     /// combined weight [`genesis_cohort::apply_cohort_cap`] tapers to 1/3.
     genesis_cohort: Vec<u32>,
+    /// Immutable launch principal, derived from the authenticated manifest.
+    genesis_principal_sat: BTreeMap<u32, u128>,
+    /// ADR-041 audit counter and historical bond floors; empty before L.
+    written_off_sat: u128,
+    funded_validators: BTreeSet<u32>,
+    stake_low_water: BTreeMap<u32, u128>,
+    /// Completed RANDAO generations. Zero is represented by absence.
+    randao_generations: BTreeMap<u32, u32>,
     /// The justification/finality fold (finality.rs). Kept whole so this
     /// state remains bit-identical to a from-scratch replay of the votes.
     finality_engine: finality::FinalityState,
@@ -2199,6 +2184,11 @@ impl CommittedState {
             boundary_mixes: BTreeMap::new(),
             genesis_mix,
             genesis_cohort: cohort_sorted,
+            genesis_principal_sat: validators.iter().map(|v| (v.index, v.staked_sat)).collect(),
+            written_off_sat: 0,
+            funded_validators: BTreeSet::new(),
+            stake_low_water: BTreeMap::new(),
+            randao_generations: BTreeMap::new(),
             finality_engine: finality::FinalityState::new(finality::Checkpoint {
                 epoch: 0,
                 root: *genesis_block.as_bytes(),
@@ -2804,6 +2794,10 @@ impl CommittedState {
         // supplied it, and nothing did: every block from genesis committed an
         // empty balance component. Hence the emphasis.)
         crate::state_root::state_root_with_eutxo_tree(&ConsensusState {
+            written_off_sat: self.written_off_sat,
+            funded_validators: &self.funded_validators.iter().copied().collect::<Vec<_>>(),
+            stake_low_water: &self.stake_low_water.iter().map(|(k,v)| (*k,*v)).collect::<Vec<_>>(),
+            randao_generations: &self.randao_generations.iter().map(|(k,v)| (*k,*v)).collect::<Vec<_>>(),
             eutxos: &[],
             validators: &validators,
             current_participation: &current,
@@ -3068,7 +3062,7 @@ impl CommittedState {
         // to arm) — the comparison is always false outside `forced`, by design.
         #[allow(clippy::absurd_extreme_comparisons)]
         {
-            forced || epoch >= crate::params::EXIT_AUTH_ACTIVATION_EPOCH
+            forced || crate::params::epoch_gate_active(epoch, crate::params::EXIT_AUTH_ACTIVATION_EPOCH)
         }
     }
 
@@ -3092,7 +3086,7 @@ impl CommittedState {
         // by design.
         #[allow(clippy::absurd_extreme_comparisons)]
         {
-            forced || epoch >= crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH
+            forced || crate::params::epoch_gate_active(epoch, crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH)
         }
     }
 
@@ -3177,7 +3171,7 @@ impl CommittedState {
         // by design.
         #[allow(clippy::absurd_extreme_comparisons)]
         {
-            forced || epoch >= crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH
+            forced || crate::params::epoch_gate_active(epoch, crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH)
         }
     }
 
@@ -3290,7 +3284,7 @@ impl CommittedState {
         n_hybrid_sigs: u32,
         canonical_len: usize,
     ) -> fee_market::TxCharge {
-        if !Self::staking_tx_metering_active(epoch) {
+        if !Self::staking_tx_metering_active(epoch) && !Self::withdrawal_active(epoch) {
             return fee_market::TxCharge { gas: 0, tx_bytes: 0, base_fee_sat: 0, priority_fee_sat: 0 };
         }
         let tx_bytes = canonical_len as u64;
@@ -3319,22 +3313,6 @@ impl CommittedState {
     /// rehearsal switch exists so the withdrawal rules' tests are not dead
     /// code until the founder arms it.
     ///
-    /// # No call site yet — this is the honest state, not an oversight
-    ///
-    /// `PosTransaction` cannot gain a `Withdraw` variant from this pass: the
-    /// crate's variant space is frozen by an EXHAUSTIVE match with no
-    /// wildcard arm in the unowned `tests/wire_tag_registry.rs`
-    /// (`frozen_variant_space`), by explicit design — its own doc comment
-    /// records having verified that adding any new `PosTransaction` variant,
-    /// under any name or byte, makes that file stop compiling with
-    /// `error[E0004]`, specifically so this exact change requires the
-    /// founder's edit rather than a silent merge. Editing that file is
-    /// outside this pass's ownership, and leaving the tree unable to
-    /// compile is not an option either, so the variant, its apply arm, and
-    /// its eUTXO-creation logic are not implemented here. The gate and its
-    /// rehearsal switch are kept as ready-made, harmless scaffolding for
-    /// whoever lands the variant once the founder rules on the byte.
-    #[allow(dead_code)] // inert gate with no reachable call site yet — see above
     fn withdrawal_active(epoch: u64) -> bool {
         #[cfg(test)]
         let forced = crate::params::rehearsal::withdrawal_gate_forced_open();
@@ -3345,7 +3323,7 @@ impl CommittedState {
         // `forced`, by design.
         #[allow(clippy::absurd_extreme_comparisons)]
         {
-            forced || epoch >= crate::params::WITHDRAWAL_ACTIVATION_EPOCH
+            forced || crate::params::epoch_gate_active(epoch, crate::params::WITHDRAWAL_ACTIVATION_EPOCH)
         }
     }
 
@@ -3379,6 +3357,7 @@ impl CommittedState {
         verifier: &dyn SignatureVerifier,
     ) -> Result<fee_market::TxCharge, TxReject> {
         match tx {
+            PosTransaction::Withdraw { validator } => self.apply_withdrawal(*validator, tx),
             PosTransaction::FundedDeposit(deposit) => self
                 .apply_funded_deposit(deposit, total_active_sat, base_fee_millisat_per_gas, verifier)
                 .map_err(TxReject::FundedDeposit),
@@ -3676,14 +3655,8 @@ impl CommittedState {
     /// the reason `derive::validate_block` exists as a warning: a rule
     /// exercised only at its own seam can be correct and unreachable at once.
     ///
-    /// And it is reachable in exactly the sense that matters and no further.
-    /// **Nothing on the fleet executes this today**, and nothing can: the gate
-    /// is `u64::MAX`, so the caller refuses before this function is entered,
-    /// and the wire byte is unassigned so no gossiped message could carry an
-    /// `ExitV2` even if it were open. Arming is the founder's, and it has an
-    /// unmet precondition. What is claimed here is narrower and checkable:
-    /// spec-correct, composed with the real handler, and tested under a
-    /// rehearsal gate, so that WHEN it is armed it is right.
+    /// ADR-041 assigns tag 0x0C. The decoder and node admission are wired;
+    /// the common lifecycle activation epoch remains unarmed.
     ///
     /// Check order is cheapest-first, the discipline the whole crate keeps:
     /// epoch equality, identity resolution, lifecycle, the churn budget, and
@@ -3764,11 +3737,8 @@ impl CommittedState {
     /// Runs on the ONE path every block transaction takes:
     /// `Transition::apply_block` → `compute_post_state` step 10 → the
     /// transaction loop → `apply_transaction`'s `RandaoRecommit` arm → here.
-    /// Nothing on the fleet executes it today, and nothing can: the gate is
-    /// `u64::MAX` and the wire byte (`0x0A`) is undecodable. What is claimed
-    /// is narrower and checkable — spec-correct, composed with the real
-    /// handler, and tested under the rehearsal gate, so that WHEN it is
-    /// armed it is right.
+    /// Tag 0x0A is decodable under ADR-041. Consensus still refuses it
+    /// until the common lifecycle activation epoch is armed.
     ///
     /// Check order is cheapest-first: epoch equality, identity, lifecycle,
     /// the exhaustion precondition, and only then the one hybrid
@@ -3820,6 +3790,8 @@ impl CommittedState {
         if !verifier.verify_with_key(&rec.pubkey, &root, signature) {
             return Err(TxReject::StakingRule);
         }
+        let generation = self.validator_randao_generation(validator)
+            .checked_add(1).ok_or(TxReject::StakingRule)?;
         // Mutation only after every check has passed. This IS
         // `beacon::RevealState::recommit` (`register(new_c0)`), written into
         // the two committed columns that `compute_post_state` reads a
@@ -3829,6 +3801,7 @@ impl CommittedState {
         };
         rec.randao_commitment = *new_commitment;
         self.reveals_used.insert(validator, 0);
+        self.randao_generations.insert(validator, generation);
         Ok(())
     }
 
@@ -4335,6 +4308,10 @@ impl CommittedState {
             return Err(());
         };
         let own_bond_sat = offender_rec.staked_sat;
+        // Refuse unknown historical backing; repeated evidence must not erase
+        // an indeterminate classification by manufacturing a newer floor.
+        if self.is_write_off_indeterminate(offender) { return Err(()); }
+        let unbacked_before = self.unbacked_principal_sat(offender).min(own_bond_sat);
 
         // The exposure view `apply_slash` prices against: the committed
         // delegation list in order, with withdrawn (post-cool-down)
@@ -4421,6 +4398,8 @@ impl CommittedState {
         if let Some(rec) = self.validators.get_mut(&offender) {
             rec.slashed = true;
             rec.staked_sat = rec.staked_sat.saturating_sub(outcome.operator_loss_sat);
+            let old_floor = self.stake_low_water.get(&offender).copied().unwrap_or(rec.staked_sat);
+            self.stake_low_water.insert(offender, old_floor.min(rec.staked_sat));
             // R1 M7: ejection lands at the epoch AFTER the one the slash
             // landed in, never the same one. `duty_roster_at` reads
             // `exit_epoch` alone to decide membership (see its docs), and
@@ -4468,11 +4447,17 @@ impl CommittedState {
                 *self.delegator_slash_losses.entry(d.delegator).or_insert(0) += *loss;
             }
         }
-        if outcome.whistleblower_reward_sat > 0 {
+        // Slashing consumes unissued principal first. Only a loss of issued
+        // value can fund an issued whistleblower reward (ADR-041/A7).
+        let backed_loss = outcome.operator_loss_sat.saturating_sub(unbacked_before);
+        let reward = if Self::withdrawal_active(self.epoch) {
+            outcome.whistleblower_reward_sat.min(backed_loss)
+        } else { outcome.whistleblower_reward_sat };
+        if reward > 0 {
             *self
                 .pending_fee_rewards
                 .entry(including_proposer)
-                .or_insert(0) += outcome.whistleblower_reward_sat;
+                .or_insert(0) += reward;
         }
         Ok(())
     }
@@ -4589,8 +4574,8 @@ impl CommittedState {
     /// 1. the unspent-output set (`TAG_EUTXO`) — spendable coins;
     /// 2. bonded stake, `ValidatorRecord::staked_sat` summed over the whole
     ///    registry, exited and slashed records included (an exited bond is
-    ///    still a bond until a withdrawal path pays it out, and there is no
-    ///    such path yet — see `staking::apply_exit`);
+    ///    still a bond until the lifecycle withdrawal pays its backed part
+    ///    and writes off the remaining unissued principal);
     /// 3. delegated stake (`TAG_DELEGATION`) — bonded by someone who is not
     ///    the operator, and just as real;
     /// 4. fee rewards accrued during the open epoch and not yet compounded
@@ -5247,12 +5232,15 @@ impl CommittedState {
         {
             if activation_epoch == next_epoch {
                 if let Some(idx) = st.pubkey_index.get(&pubkey_hash) {
-                    if let Some(rec) = st.validators.get_mut(idx) {
-                        rec.activation_epoch = next_epoch;
+                    if !st.funded_validators.contains(idx) {
+                        if let Some(rec) = st.validators.get_mut(idx) {
+                            rec.activation_epoch = next_epoch;
+                        }
                     }
                 }
             }
         }
+        st.activate_finalized_deposits(next_epoch);
         // Exits need no active step: the roster filter
         // (activation ≤ e < exit) retires them at their recorded epoch.
 
@@ -6182,34 +6170,26 @@ mod tx_codec_tests {
         ]
     }
 
-    /// `ExitV2` ENCODES to `0x08` and this tree DOES NOT DECODE `0x08`.
-    ///
-    /// Both halves are deliberate and both are pinned here, because "the
-    /// decoder happens not to know this byte yet" and "the decoder must not
-    /// know this byte yet" look identical in a diff. `0x08` is contested
-    /// across live lineages (`SignedExit`, `Withdraw`, `ExitV2` — see
-    /// `tests/wire_tag_registry.rs`); two of those meanings are incompatible,
-    /// so whichever landed second would split the chain at decode. The byte is
-    /// the founder's to assign, and until it is assigned an authenticated exit
-    /// cannot travel on the wire at all.
-    ///
-    /// Deliberately NOT in `samples()`: `canonical_bytes_round_trips` requires
-    /// every sample to decode, which is exactly what this one must not do.
+    /// ADR-041 releases fresh tags and permanently retires the contested ones.
     #[test]
-    fn exit_v2_encodes_to_an_unassigned_byte_it_cannot_decode() {
-        let tx = PosTransaction::ExitV2 {
-            pubkey_hash: [0xAB; 32],
-            epoch: 7,
-            signature: vec![0xCD; 96],
-        };
-        let bytes = tx.canonical_bytes();
-        assert_eq!(bytes[0], 0x08, "the encoder claims 0x08");
-        assert_eq!(
-            PosTransaction::from_canonical_bytes(&bytes),
-            Err(TxDecodeError::UnknownTag(0x08)),
-            "0x08 is CONTESTED: adding a decoder arm before the founder assigns \
-             the byte is what splits the chain, and is what this pins against",
-        );
+    fn lifecycle_wire_roundtrips_without_reusing_tombstoned_tags() {
+        let samples = [
+            PosTransaction::ExitV2 { pubkey_hash: [0xAB; 32], epoch: 7, signature: vec![0xCD; 96] },
+            PosTransaction::Withdraw { validator: 7 },
+            PosTransaction::RandaoRecommit { validator: 7, epoch: 8, new_commitment: [9; 32], signature: vec![10; 96] },
+        ];
+        for (tx, tag) in samples.into_iter().zip([0x0C, 0x0D, 0x0A]) {
+            let bytes = tx.canonical_bytes();
+            assert_eq!(bytes[0], tag);
+            assert_eq!(PosTransaction::from_canonical_bytes(&bytes), Ok(tx));
+            for n in 0..bytes.len() { assert!(PosTransaction::from_canonical_bytes(&bytes[..n]).is_err()); }
+            let mut extra = bytes;
+            extra.push(0);
+            assert_eq!(PosTransaction::from_canonical_bytes(&extra), Err(TxDecodeError::TrailingBytes));
+        }
+        for tag in [0x07, 0x08, 0x09] {
+            assert_eq!(PosTransaction::from_canonical_bytes(&[tag]), Err(TxDecodeError::UnknownTag(tag)));
+        }
     }
 
     #[test]
@@ -6369,6 +6349,11 @@ mod tx_codec_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod validator_lifecycle {
+        use super::*;
+        include!("transition/lifecycle/tests.rs");
+    }
+
     mod funded_admission {
         use super::*;
         include!("transition/funded/tests.rs");
@@ -9206,7 +9191,7 @@ mod tests {
         for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1] {
             assert!(!CommittedState::withdrawal_active(e), "epoch {e} must be below");
         }
-        assert!(CommittedState::withdrawal_active(crate::params::WITHDRAWAL_ACTIVATION_EPOCH));
+        assert!(!CommittedState::withdrawal_active(u64::MAX), "unarmed is closed even at the sentinel");
         let _g = crate::params::rehearsal::withdrawal_gate_open_guard();
         assert!(CommittedState::withdrawal_active(0), "the rehearsal switch must force it open too");
     }
@@ -9927,9 +9912,7 @@ mod tests {
         }
         // Reached only by moving the constant, which
         // `slashing_evidence_gate_is_inert` forbids — covered, not open.
-        assert!(CommittedState::slashing_evidence_active(
-            crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH
-        ));
+        assert!(!CommittedState::slashing_evidence_active(u64::MAX));
     }
 
     /// The unauthenticated message is STILL VALID today. This is the control
@@ -13769,6 +13752,7 @@ mod tests {
             PosTransaction::TransferV2 { .. } => {}
             PosTransaction::Deposit { .. } => {}
             PosTransaction::Exit { .. } => {}
+            PosTransaction::Withdraw { .. } => {}
             // The authenticated exit schedules epochs on a record — an
             // `exit_epoch` and a `withdrawable_epoch` — and moves no satoshi
             // in either direction, so it cannot touch the cap either. What it

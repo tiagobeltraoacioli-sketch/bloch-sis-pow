@@ -659,6 +659,7 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         verifier,
         keys: None, // observer: replay proposes nothing and attests nothing
         blocks: BTreeMap::new(),
+        observed_proposals: BTreeMap::new(),
         chain: vec![(0, genesis_id)],
         canonical: BTreeSet::from([*genesis_id.as_bytes()]),
         // Both of these mirror `boot`'s literal exactly, and they have to:

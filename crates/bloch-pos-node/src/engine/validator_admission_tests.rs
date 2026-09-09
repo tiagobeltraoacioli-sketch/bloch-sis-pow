@@ -39,7 +39,7 @@ fn fixture() -> (
         validator_pubkey: joining.pubkey.clone(),
         amount_sat: staking::MIN_DEPOSIT_SAT,
         randao_commitment: RandaoChain::generate(joining.randao_seed).commitment(),
-        withdrawal_credentials: [0x81; 32],
+        withdrawal_credentials: Sha3_256::digest(&funding.pubkey).into(),
         commission_bps: 500,
         change: TransferOutput {
             value: 50_000,
@@ -166,7 +166,7 @@ fn admission_domain_distinguishes_legacy_geneses_with_different_clocks() {
 }
 
 /// Compiled and executed by scripts/rehearse-validator-admission.py in an
-/// isolated source copy with only the new activation constant set to epoch 0.
+/// isolated source copy with the five lifecycle constants set to epoch 0.
 /// The shipping binary has no runtime switch that could enable this path.
 #[test]
 #[ignore = "requires isolated compile-time activation rehearsal"]
@@ -202,9 +202,24 @@ fn funded_validator_two_nodes_rehearsal() {
     let mut saw_joiner_propose = false;
     let mut saw_joiner_attest = false;
     let mut history = Vec::new();
-    for slot in 1..=410u64 {
+    let mut exit_slot = None;
+    // Selection is stake-weighted and uses fresh keys. Wait for an actual
+    // joining proposer instead of assuming one appears in a fixed 154-slot
+    // window. The bound remains below one full RANDAO chain.
+    for slot in 1..=4096u64 {
+        let _clock = super::validator_lifecycle::clock_at(slot);
         founder.wall_slot = slot;
         joiner.wall_slot = slot;
+        // Exchange real signed attestations so funding becomes finalized
+        // before the new key is permitted to join the active roster.
+        founder.attest(slot);
+        joiner.attest(slot);
+        let votes: Vec<_> = founder.pool.values().chain(joiner.pool.values()).cloned().collect();
+        saw_joiner_attest |= votes.iter().any(|att| att.validator == 1);
+        for att in votes {
+            founder.on_attestation(att.clone(), Origin::none(), epoch_of(slot));
+            joiner.on_attestation(att, Origin::none(), epoch_of(slot));
+        }
         let before = founder.head_id();
         founder.propose(slot);
         if founder.head_id() != before {
@@ -234,12 +249,19 @@ fn funded_validator_two_nodes_rehearsal() {
                 .iter()
                 .any(|v| v.index == 1));
         }
-        if slot >= 8 * SLOTS_PER_EPOCH {
-            joiner.attest(slot);
-            saw_joiner_attest |= joiner.pool.values().any(|a| a.validator == 1);
+        if slot >= 410
+            && slot % SLOTS_PER_EPOCH < SLOTS_PER_EPOCH - 2
+            && history.last().is_some_and(|env| env.header.slot == slot && env.header.proposer_index == 1)
+            && history.iter().any(|env| env.body.attestations.iter().any(|att| att.validator == 1))
+        {
+            exit_slot = Some(slot + 1);
+            break;
         }
     }
+    let exit_slot = exit_slot.expect("joining validator must propose and have an included attestation");
     assert!(saw_joiner_propose && saw_joiner_attest);
+    assert!(history.iter().any(|env| env.body.attestations.iter().any(|att| att.validator == 1)),
+        "a new validator's real PQ attestation must be included, not merely produced");
     assert_eq!(joiner.duty_index(&joiner.state), Some(1));
     let hash: [u8; 32] = Sha3_256::digest(&tx.validator_pubkey).into();
     let by_key = joiner
@@ -248,6 +270,80 @@ fn funded_validator_two_nodes_rehearsal() {
         .to_string();
     assert!(by_key.contains("\"index\":1"));
     assert!(by_key.contains("\"state\":\"active\""));
+    // Exit is authorized by both PQ algorithms and is valid only for the
+    // current inclusion epoch. Funding authority cannot sign a validator exit.
+    let _clock = super::validator_lifecycle::clock_at(exit_slot);
+    let exit_epoch = epoch_of(exit_slot);
+    let root = staking::ExitTx { pubkey_hash: hash, epoch: exit_epoch, signature: Vec::new() }.signing_root();
+    let exit = PosTransaction::ExitV2 { pubkey_hash: hash, epoch: exit_epoch,
+        signature: joiner.keys.as_ref().unwrap().sign(&root) };
+    for offset in [14, 4 + 3309 + 10] {
+        let mut forged = exit.clone();
+        if let PosTransaction::ExitV2 { signature, .. } = &mut forged { signature[offset] ^= 1; }
+        assert!(founder.on_transaction(forged).is_err());
+    }
+    founder.on_transaction(exit.clone()).unwrap();
+    joiner.on_transaction(exit).unwrap();
+    drive_pair(&mut founder, &mut joiner, exit_slot, &mut history);
+    let rec = founder.state.validator_record(1).unwrap();
+    assert_eq!(rec.exit_epoch, exit_epoch + staking::EXIT_DELAY_EPOCHS);
+    let maturity = rec.withdrawable_epoch;
+    let stake_before_slash = rec.staked_sat;
+    // Observe a genuine proposer equivocation through the network handler.
+    // The second header is signed by the offender but has a conflicting
+    // state root; its invalid block must still expose the signed offence.
+    let mut conflicting = history.iter().rev().find(|env| env.header.proposer_index == 1).unwrap().clone();
+    conflicting.header.state_root[0] ^= 1;
+    conflicting.proposer_sig = joiner.keys.as_ref().unwrap().sign(&conflicting.header.proposal_signing_root());
+    let _ = founder.ingest_judged(conflicting);
+    assert!(founder.mempool.values().any(|tx| matches!(tx, PosTransaction::SlashingEvidence(_))));
+    drive_pair(&mut founder, &mut joiner, exit_slot + 1, &mut history);
+    let rec = founder.state.validator_record(1).unwrap();
+    assert!(rec.slashed);
+    assert!(rec.staked_sat < stake_before_slash);
+    assert_eq!(rec.withdrawable_epoch, maturity, "slashing cannot shorten the voluntary-exit lock");
+    let bonded_residue = rec.staked_sat;
+    drive_pair(&mut founder, &mut joiner, rec.exit_epoch * SLOTS_PER_EPOCH, &mut history);
+    assert!(!founder.state.active_validators().iter().any(|v| v.index == 1));
+    let withdrawal = PosTransaction::Withdraw { validator: 1 };
+    // Keep finality progressing through the real 2,048-epoch withdrawal
+    // delay. Skipping the entire interval without votes would deliberately
+    // leak the only remaining validator to zero under the existing rules.
+    for epoch in (rec.exit_epoch + 1)..maturity {
+        drive_pair(&mut founder, &mut joiner, epoch * SLOTS_PER_EPOCH, &mut history);
+    }
+    drive_pair(&mut founder, &mut joiner, maturity * SLOTS_PER_EPOCH - 1, &mut history);
+    assert!(founder.on_transaction(withdrawal.clone()).is_err());
+    drive_pair(&mut founder, &mut joiner, maturity * SLOTS_PER_EPOCH, &mut history);
+    // The operator's node creates the crank automatically once its adopted
+    // head reaches maturity; the ordinary transaction path relays it.
+    drive_pair(&mut founder, &mut joiner, maturity * SLOTS_PER_EPOCH + 1, &mut history);
+    let paid = founder.state.utxo(&withdrawal.txid(), 0).expect("funded bond paid").clone();
+    assert!(u128::from(paid.value) >= bonded_residue);
+    assert_eq!(paid.script_hash, tx.withdrawal_credentials);
+    assert_eq!(founder.state.validator_record(1).unwrap().staked_sat, 0);
+    assert!(founder.on_transaction(withdrawal.clone()).is_err());
+    let mut spend = PosTransaction::TransferV2 {
+        keys: vec![bloch_pos_committee::transition::WitnessKey {
+            pubkey: funding.pubkey.clone(), signature: vec![0; ADMISSION_PQ_SIGNATURE_MAX],
+        }],
+        inputs: vec![bloch_pos_committee::transition::TransferInputV2 { txid: withdrawal.txid(), vout: 0, key_index: 0 }],
+        outputs: vec![TransferOutput { value: paid.value, script_hash: [0x94; 32] }],
+        tx_bytes: 0, tip_millisat_per_gas: 5,
+    };
+    let reserved = spend.canonical_bytes().len() as u64;
+    let charge = fee_market::charge(fee_market::TxClass::Eutxo { inputs: 1 }, reserved, founder.state.next_base_fee(), 5);
+    if let PosTransaction::TransferV2 { tx_bytes, outputs, .. } = &mut spend {
+        *tx_bytes = reserved;
+        outputs[0].value -= u64::try_from(charge.base_fee_sat + charge.priority_fee_sat).unwrap();
+    }
+    let root = spend.spend_signing_root();
+    if let PosTransaction::TransferV2 { keys, .. } = &mut spend { keys[0].signature = funding.sign(&root); }
+    let _clock = super::validator_lifecycle::clock_at(maturity * SLOTS_PER_EPOCH + 2);
+    founder.on_transaction(spend.clone()).unwrap();
+    drive_pair(&mut founder, &mut joiner, maturity * SLOTS_PER_EPOCH + 2, &mut history);
+    assert!(founder.state.utxo(&withdrawal.txid(), 0).is_none());
+    assert!(founder.state.utxo(&spend.txid(), 0).is_some());
     let (mut replay, _replay_dir) = perf_support::proposing_engine();
     replay.manifest = Manifest::decode(&founder.manifest.encode()).unwrap();
     replay.state = StateCell::new(replay.manifest.genesis_state());
@@ -261,7 +357,7 @@ fn funded_validator_two_nodes_rehearsal() {
     let keys = joiner.keys.as_ref().unwrap();
     assert_eq!(
         check_joining_registry_identity(&replay.state, 1, &keys.pubkey, keys.randao_seed),
-        RegistryIdentity::Active
+        RegistryIdentity::Inactive
     );
     let wm = joiner.slashprot.watermarks();
     let mut restored = SlashingProtection::open_bound(&joiner_dir.0, binding).unwrap();
@@ -272,4 +368,136 @@ fn funded_validator_two_nodes_rehearsal() {
     let mut other_binding = binding;
     other_binding.validator_pubkey_sha3[0] ^= 1;
     assert!(SlashingProtection::open_bound(&joiner_dir.0, other_binding).is_err());
+}
+
+/// Advance two separate engine states through actual encoded blocks, signed
+/// attestations and the same admission/automatic-action paths as the runtime.
+fn drive_pair(a: &mut Engine, b: &mut Engine, slot: u64, history: &mut Vec<BlockEnvelope>) {
+    assert!(try_drive_pair(a, b, slot, history), "a proposer must remain live at {slot}");
+}
+
+fn try_drive_pair(a: &mut Engine, b: &mut Engine, slot: u64, history: &mut Vec<BlockEnvelope>) -> bool {
+    let _clock = super::validator_lifecycle::clock_at(slot);
+    a.wall_slot = slot;
+    b.wall_slot = slot;
+    a.maintain_validator_lifecycle(epoch_of(slot));
+    b.maintain_validator_lifecycle(epoch_of(slot));
+    a.attest(slot);
+    b.attest(slot);
+    let votes: Vec<_> = a.pool.values().chain(b.pool.values()).cloned().collect();
+    for att in votes {
+        a.on_attestation(att.clone(), Origin::none(), epoch_of(slot));
+        b.on_attestation(att, Origin::none(), epoch_of(slot));
+    }
+    let txs: Vec<_> = a.mempool.values().chain(b.mempool.values()).cloned().collect();
+    for tx in txs { let _ = a.on_transaction(tx.clone()); let _ = b.on_transaction(tx); }
+    let before = a.head_id();
+    a.propose(slot);
+    if a.head_id() != before {
+        let env = a.blocks[a.head_id().as_bytes()].clone();
+        history.push(env.clone());
+        b.ingest(env);
+    } else {
+        b.propose(slot);
+        if b.head_id() == before { return false; }
+        let env = b.blocks[b.head_id().as_bytes()].clone();
+        history.push(env.clone());
+        a.ingest(env);
+    }
+    assert_eq!(a.state.slot(), slot);
+    assert_eq!(a.head_id(), b.head_id());
+    assert_eq!(a.state.state_root(), b.state.state_root());
+    true
+}
+
+#[test]
+#[ignore = "requires isolated compile-time activation rehearsal"]
+fn funded_mempool_rejects_invalid_state_rehearsal() {
+    let (mut engine, _dir, funding, joining, tx) = fixture();
+    for change in 0..3 {
+        let mut attack = tx.clone();
+        match change {
+            0 => attack.inputs[0].txid[0] ^= 1,
+            1 => attack.change.value += 1,
+            _ => attack.max_base_fee_millisat_per_gas = 0,
+        }
+        authorize(&mut attack, &funding, &joining);
+        assert!(engine.on_transaction(PosTransaction::FundedDeposit(attack)).is_err());
+        assert!(engine.mempool.is_empty());
+    }
+    // Capacity sentinels are never proposed: this isolates whether a signed
+    // but unfunded high-tip intent can evict entries before state validation.
+    for validator in 0..MEMPOOL_MAX as u32 {
+        let held = PosTransaction::Exit { validator };
+        engine.mempool.insert(held.canonical_bytes(), held);
+    }
+    let held: Vec<_> = engine.mempool.keys().cloned().collect();
+    let mut missing = tx.clone();
+    missing.inputs[0].txid[0] ^= 1;
+    authorize(&mut missing, &funding, &joining);
+    assert!(engine.on_transaction(PosTransaction::FundedDeposit(missing)).is_err());
+    assert_eq!(held, engine.mempool.keys().cloned().collect::<Vec<_>>());
+    assert_eq!(engine.mempool_evicted_low_fee, 0);
+    engine.mempool.clear();
+    engine.on_transaction(PosTransaction::FundedDeposit(tx.clone())).unwrap();
+    let mut rival = tx.clone();
+    rival.withdrawal_credentials[0] ^= 1;
+    authorize(&mut rival, &funding, &joining);
+    assert!(engine.on_transaction(PosTransaction::FundedDeposit(rival)).is_err());
+    assert_eq!(engine.mempool.len(), 1);
+    // Revalidation drops previously valid intents after their UTXO is consumed.
+    let _clock = super::validator_lifecycle::clock_at(1);
+    engine.wall_slot = 1;
+    engine.propose(1);
+    assert_eq!(engine.state.validator_count(), 2);
+    engine.mempool.insert(tx.canonical_bytes(), PosTransaction::FundedDeposit(tx));
+    engine.revalidate_lifecycle_mempool();
+    assert!(engine.mempool.is_empty());
+}
+
+#[test]
+#[ignore = "requires isolated compile-time activation and short RANDAO chains"]
+fn randao_automatic_recommit_rehearsal() {
+    assert_eq!(bloch_pos_committee::params::RANDAO_CHAIN_LENGTH, 16);
+    let (mut first, _dir, _funding, joining, _) = fixture();
+    let mut record = first.manifest.validators[0].clone();
+    record.index = 1;
+    record.pubkey = joining.pubkey.clone();
+    record.randao_commitment = RandaoChain::generate(joining.randao_seed).commitment();
+    first.manifest.validators.push(record);
+    first.genesis_validator_count = 2;
+    first.state = StateCell::new(first.manifest.genesis_state());
+    first.chain = vec![(0, first.manifest.genesis_id())];
+    first.canonical = BTreeSet::from([*first.manifest.genesis_id().as_bytes()]);
+    let (mut second, _second_dir) = perf_support::proposing_engine();
+    second.manifest = Manifest::decode(&first.manifest.encode()).unwrap();
+    second.genesis_validator_count = 2;
+    second.state = StateCell::new(second.manifest.genesis_state());
+    second.chain = first.chain.clone();
+    second.canonical = first.canonical.clone();
+    second.keys = Some(joining);
+    let mut history = Vec::new();
+    let mut produced = 0;
+    for slot in 1..=160 { produced += usize::from(try_drive_pair(&mut first, &mut second, slot, &mut history)); }
+    // An exhausted validator can miss its draw while another proposer
+    // includes its renewal. The network must recover and keep producing.
+    assert!(produced >= 120, "renewal must preserve sustained block production");
+    assert!(first.state.slot() >= 150);
+    for index in [0, 1] {
+        assert!(first.state.validator_randao_generation(index) >= 2, "multiple rotations required");
+    }
+    let mut replay = first.manifest.genesis_state();
+    let transition = Transition::new(HybridVerifier::new());
+    for env in &history {
+        let proposal = ProposalEnvelope { header: env.header.clone(), proposer_sig: env.proposer_sig.clone() };
+        replay = transition.apply_block(&replay, &proposal, &env.body.attestations, &body_transactions(env).unwrap()).unwrap();
+    }
+    assert_eq!(replay.state_root(), first.state.state_root());
+    for engine in [&first, &second] {
+        let keys = engine.keys.as_ref().unwrap();
+        let index = replay.validator_index_by_pubkey(&keys.pubkey).unwrap();
+        let seed = keys.randao_seed_for(&replay.admission_network_domain().unwrap(), replay.validator_randao_generation(index));
+        assert_eq!(check_joining_registry_identity(&replay, index, &keys.pubkey, seed), RegistryIdentity::Active);
+        assert_eq!(check_joining_registry_identity(&replay, index, &keys.pubkey, keys.randao_seed), RegistryIdentity::RandaoMismatch);
+    }
 }

@@ -1827,9 +1827,9 @@ pub fn chain_info_json(
 ///    fleet binaries — which predate the format — still refuse at decode.
 ///    Either way a proposer that included evidence today would produce a
 ///    block its peers refuse.
-/// 3. **Nothing constructs the transaction outside tests.** The node captures
-///    an equivocating pair and prints it; the log line itself reads "slashing
-///    pipeline NOT wired — evidence is logged, not prosecuted".
+/// 3. ADR-041 connects observed proposer/attestation evidence to ordinary
+///    admission. The node reports a refusal while activation remains disabled;
+///    implementing the observation hook does not activate penalties.
 /// 4. **The activation constant exists on this lineage and is not armed.**
 ///    An earlier draft of this break said no such constant existed on the
 ///    release lineage, while one sat off-lineage at `d21c3370:params.rs:638`.
@@ -2076,6 +2076,7 @@ pub fn submitted_json(tx: &PosTransaction, outcome: Admitted) -> Json {
         // different rules (one authenticated, one not) and an operator reading
         // this field needs to see which one the chain took.
         PosTransaction::ExitV2 { .. } => "exit_v2",
+        PosTransaction::Withdraw { .. } => "withdraw",
         PosTransaction::Delegate { .. } => "delegate",
         PosTransaction::SlashingEvidence(_) => "slashing_evidence",
         // Unreachable today twice over — the wire byte (0x0A) is undecodable
@@ -2123,7 +2124,10 @@ pub fn submitted_json(tx: &PosTransaction, outcome: Admitted) -> Json {
 /// slashed validator whose exit epoch has not arrived is not "exiting" in any
 /// sense a client should display.
 pub fn validator_state(rec: &ValidatorRecord, current_epoch: u64) -> &'static str {
-    if rec.slashed {
+    if rec.staked_sat == 0 && rec.exit_epoch != u64::MAX
+        && rec.withdrawable_epoch != u64::MAX && current_epoch >= rec.withdrawable_epoch {
+        "withdrawn"
+    } else if rec.slashed {
         "slashed"
     } else if rec.exit_epoch != u64::MAX && current_epoch >= rec.exit_epoch {
         "exited"
@@ -2171,6 +2175,24 @@ pub fn validator_json(
         ("exit_epoch", never(rec.exit_epoch)),
         ("withdrawable_epoch", never(rec.withdrawable_epoch)),
     ])
+}
+
+/// Enrich the existing registry response with committed lifecycle accounting.
+pub fn validator_lifecycle_json(state: &CommittedState, rec: &ValidatorRecord, effective: Option<u64>) -> Json {
+    let mut result = validator_json(rec, effective, bloch_pos_committee::epoch_of(state.slot()));
+    if let Json::Obj(fields) = &mut result {
+        fields.extend([
+            ("withdrawal_credentials".into(), Json::s(crate::codec::hex(&rec.withdrawal_credentials))),
+            ("funded".into(), Json::Bool(state.is_funded_validator(rec.index))),
+            ("withdrawal_payout_sat".into(), if state.is_write_off_indeterminate(rec.index) { Json::Null }
+                else { Json::sat(state.withdrawable_sat(rec.index)) }),
+            ("unbacked_principal_sat".into(), if state.is_write_off_indeterminate(rec.index) { Json::Null }
+                else { Json::sat(state.unbacked_principal_sat(rec.index)) }),
+            ("randao_generation".into(), Json::u(u64::from(state.validator_randao_generation(rec.index)))),
+            ("randao_reveals_used".into(), Json::u(u64::from(state.validator_reveals_used(rec.index).unwrap_or(0)))),
+        ]);
+    }
+    result
 }
 
 /// `getvalidators` (R4 F-11) — one entry per registered validator.
@@ -2516,6 +2538,14 @@ pub fn validator_admission_json(state: &bloch_pos_committee::transition::Committ
         ("minimum_stake_sat", Json::sat(staking::MIN_DEPOSIT_SAT)),
         ("maximum_stake_sat", Json::sat(cap)),
         ("activation_delay_epochs", Json::u(staking::ACTIVATION_DELAY_EPOCHS)),
+        ("activation_requires_finalized_deposit", Json::Bool(true)),
+        ("exit_wire_tag", Json::s("0x0c")),
+        ("withdrawal_wire_tag", Json::s("0x0d")),
+        ("randao_recommit_wire_tag", Json::s("0x0a")),
+        ("exit_delay_epochs", Json::u(staking::EXIT_DELAY_EPOCHS)),
+        ("withdrawal_delay_epochs", Json::u(staking::WITHDRAWAL_DELAY_EPOCHS)),
+        ("maximum_exits_per_epoch", Json::u(staking::MAX_EXITS_PER_EPOCH as u64)),
+        ("written_off_sat", Json::sat(state.written_off_sat())),
         ("maximum_activations_per_epoch", Json::u(staking::MAX_ACTIVATIONS_PER_EPOCH as u64)),
         ("next_base_fee_millisat_per_gas", Json::sat(state.next_base_fee())),
         ("legacy_unfunded_deposit_enabled", Json::Bool(false)),

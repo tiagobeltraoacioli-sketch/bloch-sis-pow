@@ -1605,8 +1605,10 @@ fn getbuildinfo_leaks_nothing_operational() {
     for comp in manifest.split('/').filter(|c| c.len() > 3) {
         // Every component of the build path — the username among them — must
         // be absent. `crates` and `bloch-pos-node` are repository-relative
-        // names, not machine facts, so they are exempt.
-        if ["crates", "bloch-pos-node"].contains(&comp) {
+        // names, not machine facts. "workspace" is also a fixed public word
+        // in source_digest_scope, including when the checkout is /workspace.
+        // Full absolute paths remain forbidden by the assertion above.
+        if ["crates", "bloch-pos-node", "workspace"].contains(&comp) {
             continue;
         }
         assert!(

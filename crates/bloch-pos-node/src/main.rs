@@ -56,6 +56,7 @@ mod slashprot;
 mod store;
 mod ws_boot;
 mod validator_deposit;
+mod validator_lifecycle;
 mod ws_tool;
 
 use std::path::PathBuf;
@@ -144,6 +145,12 @@ fn main() {
                 exit(2);
             }
         }
+        Some("validator-lifecycle") => {
+            if let Err(error) = validator_lifecycle::run(&args[1..]) {
+                eprintln!("validator-lifecycle: {error}");
+                exit(2);
+            }
+        }
         Some("run") => run_cmd(&args[1..]),
         Some(
             cmd @ ("ws-keygen" | "ws-signer-set" | "ws-checkpoint" | "ws-sign" | "ws-envelope"
@@ -203,6 +210,7 @@ fn print_help() {
                pubkey sha3, KDF cost, file mode. Opens nothing, prints no\n\
                secret. Also reports whether the data dir lock is free.\n\
            bloch-pos validator-deposit --help
+           bloch-pos validator-lifecycle --help
 \
                Prepare, inspect and separately sign a funded PQ deposit offline.
 \

@@ -1641,8 +1641,10 @@ fn on_gossip(
     } else if topic == st.topics.txs.hash() {
         match bloch_pos_committee::transition::PosTransaction::from_canonical_bytes(&message.data) {
             Ok(tx) => {
-                report(swarm, Verdict::Accept);
-                return st.emit(NetEvent::Transaction(tx));
+                // Decode is not authorization. In particular, funded admission
+                // needs the engine's UTXO view before gossipsub may relay it.
+                let origin = Origin { inner: Some((message_id, source)) };
+                return st.emit(NetEvent::Transaction(tx, origin));
             }
             Err(e) => {
                 eprintln!("p2p: undecodable transaction from {source}: {e}");

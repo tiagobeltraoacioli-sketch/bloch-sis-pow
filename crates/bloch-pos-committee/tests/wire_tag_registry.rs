@@ -164,6 +164,8 @@ enum Status {
     /// Claimed by two or more unmerged branches that do not agree. NOT
     /// assigned. The decoder must refuse it until the founder rules.
     Contested(&'static [Claim]),
+    /// ADR-041 permanently retires these transaction assignments.
+    Tombstoned(&'static [Claim]),
 }
 
 const NO_RIVALS: &[Claim] = &[];
@@ -194,7 +196,7 @@ const ONE_WAY_TX_TAGS: &[u8] = &[];
 // §1 — PosTransaction wire tags. First byte of `canonical_bytes`.
 // ---------------------------------------------------------------------------
 const TX_TAGS: &[(u8, Status)] = &[
-    // Fresh assignment for funded admission. Contested 0x07-0x0A remain closed.
+    // ADR-041: 0x07–0x09 are permanent tombstones; 0x0A/0x0C/0x0D released.
     (0x0B, Status::Released { name: "FundedDeposit", rivals: NO_RIVALS }),
     (0x01, Status::Released { name: "Transfer", rivals: NO_RIVALS }),
     (0x02, Status::Released { name: "Deposit", rivals: NO_RIVALS }),
@@ -241,7 +243,7 @@ const TX_TAGS: &[(u8, Status)] = &[
     // -------- unreleased, contested --------
     (
         0x07,
-        Status::Contested(&[
+        Status::Tombstoned(&[
             Claim {
                 name: "FundedDeposit",
                 tips: 10,
@@ -276,7 +278,7 @@ const TX_TAGS: &[(u8, Status)] = &[
     ),
     (
         0x08,
-        Status::Contested(&[
+        Status::Tombstoned(&[
             Claim {
                 name: "SignedExit",
                 tips: 10,
@@ -295,12 +297,7 @@ const TX_TAGS: &[(u8, Status)] = &[
                 heads: 8,
                 example: "refs/heads/dev4/writeoff-memo",
             },
-            // THIS TREE. `ExitV2` encodes to 0x08 here (see
-            // `frozen_variant_space`) and is NOT decodable here — the byte
-            // stays Contested and the decoder stays silent on it, so this is a
-            // fourth claim on the encode side only, recorded rather than
-            // resolved. It becomes `Released` when the founder assigns the
-            // byte, and the decoder arm lands in the same diff.
+            // Historical encode-only claim, retained as tombstone provenance.
             Claim {
                 name: "ExitV2 (ENCODE-ONLY — this tree refuses to decode it)",
                 tips: 1,
@@ -311,7 +308,7 @@ const TX_TAGS: &[(u8, Status)] = &[
     ),
     (
         0x09,
-        Status::Contested(&[
+        Status::Tombstoned(&[
             Claim {
                 name: "Withdraw",
                 tips: 14,
@@ -326,27 +323,10 @@ const TX_TAGS: &[(u8, Status)] = &[
             },
         ]),
     ),
-    // Single-claimant and unreleased, like frame byte 0x07: claimed by this
-    // tree alone, still NOT assigned. `RandaoRecommit` (the H-R7-1 fix: the
-    // re-commit transaction that un-terminates an exhausted RANDAO chain)
-    // encodes to 0x0A and is deliberately NOT decodable — the byte stays
-    // out of the released space and the decoder stays silent on it until
-    // the founder assigns it. 0x0A was chosen because it is the lowest byte
-    // with NO claimant anywhere in the 2026-09-02 sweep (0x07-0x09 all have
-    // rivals); a fresh byte cannot silently merge into an existing
-    // claimant's meaning. It becomes `Released` when the founder rules, and
-    // the decoder arm lands in the same diff — which must happen, along
-    // with arming `RANDAO_RECOMMIT_ACTIVATION_EPOCH`, before the first
-    // chain exhausts (~2027-02-11).
-    (
-        0x0A,
-        Status::Contested(&[Claim {
-            name: "RandaoRecommit (ENCODE-ONLY — this tree refuses to decode it)",
-            tips: 1,
-            heads: 1,
-            example: "refs/heads/r2b/hr71-randao-recommit",
-        }]),
-    ),
+    // ADR-041 accepted 2026-09-08. Decodable but consensus-gated at L.
+    (0x0A, Status::Released { name: "RandaoRecommit", rivals: NO_RIVALS }),
+    (0x0C, Status::Released { name: "ExitV2", rivals: NO_RIVALS }),
+    (0x0D, Status::Released { name: "Withdraw", rivals: NO_RIVALS }),
 ];
 
 /// Three lineages that all intend the SAME flag day disagree on all three
@@ -534,20 +514,8 @@ fn frozen_variant_space(tx: &PosTransaction) -> u8 {
         PosTransaction::Delegate { .. } => 0x04,
         PosTransaction::SlashingEvidence(_) => 0x05,
         PosTransaction::TransferV2 { .. } => 0x06,
-        // ENCODED at 0x08, NOT DECODED at 0x08. This tree gained an `ExitV2`
-        // variant (authenticated voluntary exit + per-epoch churn cap) whose
-        // `canonical_bytes` writes 0x08, and deliberately did NOT add a
-        // decoder arm: 0x08 is still `Contested` in the table above, and
-        // `contested_transaction_tags_are_refused` is what holds that line.
-        // The arm exists here because the freeze has no wildcard — which is
-        // exactly the freeze working: the variant could not be added without
-        // this file being edited and the byte being stated out loud.
-        PosTransaction::ExitV2 { .. } => 0x08,
-        // ENCODED at 0x0A, NOT DECODED at 0x0A — the ExitV2 pattern again.
-        // The RANDAO re-commit transaction (H-R7-1) took the first byte with
-        // no rival claimant anywhere in the sweep, and
-        // `contested_transaction_tags_are_refused` holds the line until the
-        // founder assigns the byte.
+        PosTransaction::ExitV2 { .. } => 0x0C,
+        PosTransaction::Withdraw { .. } => 0x0D,
         PosTransaction::RandaoRecommit { .. } => 0x0A,
         PosTransaction::FundedDeposit(_) => 0x0B,
         // NO wildcard arm. Adding one defeats the entire freeze.
@@ -789,7 +757,7 @@ fn evidence_tag_decodes_to_its_released_meaning() {
 fn contested_transaction_tags_are_refused() {
     let mut landed: Vec<(u8, &[Claim], String)> = Vec::new();
     for (tag, status) in TX_TAGS {
-        let Status::Contested(claims) = status else { continue };
+        let (Status::Contested(claims) | Status::Tombstoned(claims)) = status else { continue };
         // Several payload shapes, deliberately: a variant with one `u32`
         // field decodes happily from a 5-byte input while a bare tag byte
         // still fails as `Truncated`, and a zero-field variant decodes from
@@ -995,7 +963,7 @@ fn frame_bytes_match_the_frozen_registry() {
     // (b) a contested byte must not be bound at all. This is the half the
     //     sibling in-file guard cannot express.
     for (tag, status) in FRAME_TAGS {
-        let Status::Contested(claims) = status else { continue };
+        let (Status::Contested(claims) | Status::Tombstoned(claims)) = status else { continue };
         let actual: Vec<&String> = found.iter().filter(|(_, v)| v == tag).map(|(n, _)| n).collect();
         assert!(
             actual.is_empty(),

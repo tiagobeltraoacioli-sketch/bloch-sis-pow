@@ -271,6 +271,12 @@ const TAG_PROPOSED_CURRENT: u8 = 0x19;
 /// next free byte after `0x19`; it aliases no tag `0x00..=0x19`
 /// (`component_tags_are_pairwise_distinct`).
 const TAG_FC_RECENT_VOTE: u8 = 0x1A;
+// ADR-041: zero written-off supply and generation zero have no leaf;
+// a recorded zero low-water mark is a real leaf, distinct from absence.
+const TAG_WRITTEN_OFF: u8 = 0x1B;
+const TAG_STAKE_LOW_WATER: u8 = 0x1C;
+const TAG_RANDAO_GENERATION: u8 = 0x1D;
+const TAG_FUNDED_VALIDATOR: u8 = 0x1E;
 
 
 fn sha3(parts: &[&[u8]]) -> [u8; 32] {
@@ -1746,6 +1752,10 @@ impl DelegatorIssuanceRecord {
 /// such entry point exists.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConsensusState<'a> {
+    pub written_off_sat: u128,
+    pub funded_validators: &'a [u32],
+    pub stake_low_water: &'a [(u32, u128)],
+    pub randao_generations: &'a [(u32, u32)],
     /// The eUTXO set. Order is irrelevant; duplicates by (txid, vout) resolve
     /// last-wins, deterministically.
     pub eutxos: &'a [EutxoEntry],
@@ -1962,6 +1972,20 @@ fn build_state_tree_inner(state: &ConsensusState<'_>, eutxo_tree: &Smt) -> Smt {
     }
     for v in state.fc_recent_votes {
         smt.insert(derive_key(TAG_FC_RECENT_VOTE, &v.entry_key()), hash_value(&v.serialize()));
+    }
+    if state.written_off_sat != 0 {
+        smt.insert(derive_key(TAG_WRITTEN_OFF, &[]), hash_value(&state.written_off_sat.to_le_bytes()));
+    }
+    for validator in state.funded_validators {
+        smt.insert(derive_key(TAG_FUNDED_VALIDATOR, &validator.to_le_bytes()), hash_value(&[1]));
+    }
+    for (validator, floor) in state.stake_low_water {
+        smt.insert(derive_key(TAG_STAKE_LOW_WATER, &validator.to_le_bytes()), hash_value(&floor.to_le_bytes()));
+    }
+    for (validator, generation) in state.randao_generations {
+        if *generation != 0 {
+            smt.insert(derive_key(TAG_RANDAO_GENERATION, &validator.to_le_bytes()), hash_value(&generation.to_le_bytes()));
+        }
     }
     for d in state.deposit_queue {
         smt.insert(derive_key(TAG_DEPOSIT_QUEUE, &d.entry_key()), hash_value(&d.serialize()));
@@ -3372,6 +3396,7 @@ mod tests {
 
     fn state(f: &Fx) -> ConsensusState<'_> {
         ConsensusState {
+            written_off_sat: 0, funded_validators: &[], stake_low_water: &[], randao_generations: &[],
             eutxos: &f.eutxos,
             validators: &f.validators,
             current_participation: &f.current,
@@ -3499,6 +3524,7 @@ mod tests {
             TAG_DELEGATOR_ISSUANCE_REWARD,
             TAG_PROPOSED_CURRENT,
             TAG_FC_RECENT_VOTE,
+            TAG_WRITTEN_OFF, TAG_STAKE_LOW_WATER, TAG_RANDAO_GENERATION, TAG_FUNDED_VALIDATOR,
         ];
         let distinct: std::collections::BTreeSet<u8> = tags.iter().copied().collect();
         assert_eq!(distinct.len(), tags.len(), "two state-root components share a tag byte");
