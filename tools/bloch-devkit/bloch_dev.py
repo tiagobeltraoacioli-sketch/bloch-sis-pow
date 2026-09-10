@@ -11,7 +11,7 @@ import subprocess
 import sys
 import urllib.request
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 DOMAIN = b"BLOCH-DEVKIT-OBSERVATION-V1\x00"
 MAX_BYTES = 16 * 1024 * 1024
 ROOT = Path(__file__).resolve().parent
@@ -107,10 +107,12 @@ def observe(config):
     return {"genesis_hash": genesis, "slot": slot, "block": block}
 
 
-def export_observation(config, output):
+def export_observation(config, output, source=None):
     payload = {"schema": "bloch.vm.observation/1", "vm": config["vm"],
                "runtime": "anvil" if config["vm"] == "evm" else "agave-test-validator",
                "mode": "local-development", "observation": observe(config)}
+    if source is not None:
+        payload["bloch_source"] = source
     digest = hashlib.sha256(DOMAIN + canonical(payload)).hexdigest()
     artifact = {"payload": payload, "sha256": digest}
     with Path(output).open("x") as stream:
@@ -150,11 +152,13 @@ def main(argv=None):
     init.add_argument("vm", choices=["evm", "svm"])
     init.add_argument("directory")
     init.add_argument("--port", type=port_number)
-    for name in ("run", "status", "export"):
+    for name in ("run", "status", "export", "network-sync"):
         child = sub.add_parser(name)
         child.add_argument("--project", type=Path, default=Path.cwd())
         if name == "export":
             child.add_argument("--output", required=True)
+            child.add_argument("--bloch-source", action="store_true",
+                               help="Refresh and attach a Genesis-4 source checkpoint")
     verify = sub.add_parser("verify", help="Verify exported file integrity offline")
     verify.add_argument("file", type=Path)
     args = parser.parse_args(argv)
@@ -179,7 +183,11 @@ def main(argv=None):
         else:
             project = args.project.resolve()
             config = load_config(project)
-            if args.action == "run":
+            if args.action == "network-sync":
+                import bloch_network
+                result = bloch_network.sync(project / ".bloch-dev/bloch-source.json")
+                print(json.dumps(result, indent=2))
+            elif args.action == "run":
                 ports = [config["port"]] if config["vm"] == "evm" else [config["port"], config["port"] + 1, config["port"] + 2]
                 for port in ports:
                     with socket.socket() as check:
@@ -192,9 +200,13 @@ def main(argv=None):
             elif args.action == "status":
                 print(json.dumps(observe(config), indent=2))
             else:
-                export_observation(config, args.output)
+                source = None
+                if args.bloch_source:
+                    import bloch_network
+                    source = bloch_network.sync(project / ".bloch-dev/bloch-source.json")
+                export_observation(config, args.output, source)
         return 0
-    except (OSError, ValueError, KeyError, TypeError) as error:
+    except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
         print(f"bloch-dev: {error}", file=sys.stderr)
         return 1
 

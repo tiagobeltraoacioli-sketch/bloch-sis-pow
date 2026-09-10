@@ -9,7 +9,8 @@ source = Path(__file__).resolve().parent
 destination = Path.home() / ".local/share/bloch-dev/kit"
 destination.mkdir(parents=True, exist_ok=True)
 shutil.copy2(source / "bloch_dev.py", destination / "bloch_dev.py")
-for name in ("README.md", "INTEGRATION.md", "COMMUNITY.md"):
+shutil.copy2(source / "bloch_network.py", destination / "bloch_network.py")
+for name in ("README.md", "INTEGRATION.md", "COMMUNITY.md", "NETWORK.md", "VALIDATION.md"):
     shutil.copy2(source / name, destination / name)
 shutil.copytree(source / "templates", destination / "templates", dirs_exist_ok=True)
 binary = Path.home() / ".local/bin/bloch-dev"

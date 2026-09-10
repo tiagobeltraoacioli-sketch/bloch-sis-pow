@@ -1,5 +1,8 @@
 # Bloch DevKit
 
+Version 0.2.0 adds the [Genesis-4 source connector](NETWORK.md) and a companion
+native EVM replay adapter. Network data is connected; contract settlement is not.
+
 Installable developer tooling for EVM and Solana SVM applications, with a
 versioned export interface for future Bloch network adapters.
 

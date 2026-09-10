@@ -24,3 +24,15 @@ for custom heap/panic feature names. Compilation and execution still pass.
 The optional Solana JavaScript client has moderate transitive npm advisories;
 see its README. This release has not been validated on Apple Silicon or Linux.
 Network settlement, native Bloch replay and bridges are not implemented or tested.
+
+## 0.2.0 source connector increment
+
+- Fifteen Python regressions pass, including the exact canonical hash of a
+  real Genesis-4 checkpoint, source freshness, RPC corroboration, failed-sync
+  persistence, duplicate JSON and checkpoint changes during reads.
+- Both EVM and SVM projects synchronized with the real Genesis-4 RPC.
+- The companion native EVM runner executed and statelessly re-verified an
+  empty batch bound to source slot 80351, block
+  `6900088f293b4de4f8ad79cbb3e261d01df521a786922c2fea2d261b9dd716fc`.
+- No mainnet transaction was submitted. The SVM execution adapter and EVM/SVM
+  settlement remain pending; this increment validates source-data integration.
