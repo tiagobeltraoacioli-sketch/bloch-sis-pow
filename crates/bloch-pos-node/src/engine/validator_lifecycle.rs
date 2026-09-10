@@ -165,7 +165,10 @@ impl Engine {
             Some(PosTransaction::Withdraw { validator: index })
         } else if params::epoch_gate_active(wall_epoch, params::RANDAO_RECOMMIT_ACTIVATION_EPOCH)
             && !rec.slashed
-            && rec.exit_epoch == u64::MAX
+            // Exit schedules duties to stop later. Renew throughout that
+            // delay, matching consensus, or an exhausted exiting key can
+            // stop proposing while its stake still carries active weight.
+            && rec.exit_epoch > wall_epoch
             && self.state.validator_reveals_used(index) == Some(params::RANDAO_CHAIN_LENGTH)
         {
             let Some(generation) = self.state.validator_randao_generation(index).checked_add(1)

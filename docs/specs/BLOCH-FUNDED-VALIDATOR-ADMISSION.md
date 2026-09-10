@@ -138,10 +138,10 @@ bloch-pos validator-deposit prepare \
   --expiry <inclusive-epoch> --commission <basis-points> --out draft.hex
 
 bloch-pos validator-deposit inspect --tx draft.hex
-bloch-pos validator-deposit sign --tx draft.hex --role funding \
+bloch-pos validator-deposit sign --genesis genesis.bin --tx draft.hex --role funding \
   --dir funding-keystore --out funded.hex
 bloch-pos validator-deposit inspect --tx funded.hex
-bloch-pos validator-deposit sign --tx funded.hex --role validator \
+bloch-pos validator-deposit sign --genesis genesis.bin --tx funded.hex --role validator \
   --dir validator-keystore --out ready.hex
 ```
 

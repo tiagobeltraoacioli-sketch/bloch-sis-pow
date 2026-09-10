@@ -1705,17 +1705,22 @@ impl Engine {
     /// somewhere on the network — this process has been refusing to produce
     /// anything under `index` this whole window, so it did not produce this.
     ///
-    /// Checked against `self.wall_slot` — the slot THIS sighting happened
-    /// at, not any slot the message itself claims — because the window's own
-    /// deadline is defined in this node's wall-clock terms and a message's
-    /// own `slot` field is attacker-influenced input on the gossip path.
-    fn note_possible_doppelganger(&mut self, index: u32) {
+    /// The deadline uses the local wall clock. The authenticated message's
+    /// slot must also lie after observation began: delayed historical duties
+    /// are not evidence of a duplicate currently signing. Replay/local blocks
+    /// never reach this hook, and message time cannot extend the deadline.
+    fn note_possible_doppelganger(&mut self, index: u32, message_slot: u64) {
         let Some(my_index) = self.duty_index(&self.state) else { return };
         if index != my_index || self.doppelganger_halted {
             return;
         }
-        if !matches!(self.doppelganger_observe_until, Some(until) if self.wall_slot < until) {
-            return; // window not armed, or already closed: this node may be live itself now
+        let Some(until) = self.doppelganger_observe_until else { return };
+        let started = until.saturating_sub(DOPPELGANGER_OBSERVE_SLOTS);
+        if self.wall_slot >= until || message_slot < started {
+            // Delayed historical duties do not prove another process is live.
+            // Both timestamps are needed: an old message cannot manufacture a
+            // duplicate, and a message cannot extend the wall-clock window.
+            return;
         }
         self.doppelganger_halted = true;
         eprintln!(
@@ -2172,6 +2177,24 @@ impl Engine {
         self.ingest_from(env, Source::Replay);
     }
 
+    /// Replay is a canonical sequence, not best-effort gossip. A complete
+    /// logged frame that no longer validates must stop boot, preserving the
+    /// original log for diagnosis instead of signing above a shortened state.
+    fn replay_committed(&mut self, env: BlockEnvelope) -> io::Result<()> {
+        let expected = env.block_id();
+        let slot = env.header.slot;
+        if env.header.parent != *self.head_id().as_bytes() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("block log replay refused at slot {slot}: parent does not extend the replayed head")));
+        }
+        self.ingest_replay(env);
+        if self.head_id() != expected {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("block log replay refused at slot {slot}: logged block was not applied as the canonical head")));
+        }
+        Ok(())
+    }
+
     /// Ingest `env` and then everything it unblocks.
     ///
     /// The orphan pool means one arrival can connect a chain of parked
@@ -2468,9 +2491,12 @@ impl Engine {
         // is exactly the class of sighting doppelgänger protection exists to
         // catch, symmetric with the attestation hook in `apply_decision`.
         let proposer_index = env.header.proposer_index;
+        let proposal_slot = env.header.slot;
         self.observe_proposer_equivocation(&env);
         self.blocks.insert(id, env);
-        self.note_possible_doppelganger(proposer_index);
+        if matches!(src, Source::Gossip) {
+            self.note_possible_doppelganger(proposer_index, proposal_slot);
+        }
         self.advance();
         // The block is queryable now, so attestations parked on it can be
         // re-run. `advance()` first: an attestation released here votes on
@@ -3817,7 +3843,7 @@ impl Engine {
                 // R6 HIGH-8: an accepted attestation is a real, signature-
                 // checked duty by `att.validator` — exactly the class of
                 // sighting doppelgänger protection exists to catch.
-                self.note_possible_doppelganger(att.validator);
+                self.note_possible_doppelganger(att.validator, att.data.slot);
                 self.pool
                     .insert((att.validator, att.data.signing_root()), att);
                 self.net.report(origin, Verdict::Accept);
@@ -4787,33 +4813,12 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // R6 HIGH-8 (doppelgänger protection, node half): only a validator (has
     // a keystore) needs this — an observer performs no duties to protect.
     // Disabled by BLOCH_NO_DOPPELGANGER / --no-doppelganger-check (main.rs
-    // sets the same env var). Computed from the manifest directly, the same
-    // arithmetic `Engine::wall_slot` uses, because the engine does not exist
-    // yet to ask.
+    // sets the same env var). The deadline is armed after replay, using
+    // Engine::wall_slot, so replay work never consumes observation time.
     let no_doppelganger_check = std::env::var_os("BLOCH_NO_DOPPELGANGER").is_some();
-    let doppelganger_observe_until = if keys.is_some() && !no_doppelganger_check {
-        // cannot divide by zero: the divisor is `.max(1)`.
-        #[allow(clippy::arithmetic_side_effects)]
-        let boot_wall_slot =
-            now_ms().saturating_sub(manifest.genesis_time_ms) / manifest.slot_ms.max(1);
-        let until = boot_wall_slot.saturating_add(DOPPELGANGER_OBSERVE_SLOTS);
-        println!(
-            "DOPPELGANGER PROTECTION: observing for this node's own validator index through \
-             wall slot {until} ({DOPPELGANGER_OBSERVE_SLOTS} slots) before starting duties. \
-             Disable with --no-doppelganger-check or BLOCH_NO_DOPPELGANGER=1 (NOT recommended \
-             on a live validator key)."
-        );
-        Some(until)
-    } else {
-        if keys.is_some() {
-            println!(
-                "DOPPELGANGER PROTECTION: DISABLED (BLOCH_NO_DOPPELGANGER is set). This node \
-                 will start duties immediately without checking whether another instance of \
-                 this key is already signing."
-            );
-        }
-        None
-    };
+    // Replay must not consume the live observation window or classify this
+    // data directory's own historical signatures as a running duplicate.
+    let doppelganger_observe_until = None;
 
     let mut engine = Engine {
         state: StateCell::new(genesis_state),
@@ -4892,7 +4897,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         // `ingest_replay`, not `ingest`: these blocks are this node's own
         // committed log, and must not be judged against a wall clock the log
         // knows nothing about. See `Engine::ingest_replay`.
-        engine.ingest_replay(env);
+        engine.replay_committed(env)?;
         // Time-based, not every-N-blocks: block cost varies by an order of
         // magnitude with how many transactions a block carries, so a fixed
         // count reports in bursts and then goes quiet exactly when the work is
@@ -4913,6 +4918,14 @@ pub fn run(cfg: Config) -> io::Result<()> {
         }
     }
     engine.live = true;
+    engine.wall_slot = engine.wall_slot();
+    if engine.keys.is_some() && !no_doppelganger_check {
+        let until = engine.wall_slot.saturating_add(DOPPELGANGER_OBSERVE_SLOTS);
+        engine.doppelganger_observe_until = Some(until);
+        println!("DOPPELGANGER PROTECTION: replay complete; observing live duties through wall slot {until} before signing.");
+    } else if engine.keys.is_some() {
+        println!("DOPPELGANGER PROTECTION: DISABLED by explicit operator override.");
+    }
     if n_logged > 0 {
         println!(
             "replayed {} blocks: head slot {}, state root {}, justified e{}, finalized e{}",
@@ -8295,7 +8308,7 @@ mod doppelganger_tests {
     fn a_synthetic_gossip_attestation_from_own_index_is_detected() {
         let (mut engine, _dir) = perf_support::proposing_engine();
         let my_index = engine.keys.as_ref().expect("fixture: has a keystore").index;
-        engine.doppelganger_observe_until = Some(1_000);
+        engine.doppelganger_observe_until = Some(DOPPELGANGER_OBSERVE_SLOTS);
         engine.wall_slot = 5; // well inside the window
 
         assert!(!engine.doppelganger_halted, "must not start halted");
@@ -8316,7 +8329,7 @@ mod doppelganger_tests {
     fn an_attestation_from_another_index_is_not_a_doppelganger() {
         let (mut engine, _dir) = perf_support::proposing_engine();
         let my_index = engine.keys.as_ref().expect("fixture: has a keystore").index;
-        engine.doppelganger_observe_until = Some(1_000);
+        engine.doppelganger_observe_until = Some(DOPPELGANGER_OBSERVE_SLOTS);
         engine.wall_slot = 5;
 
         engine.apply_decision(
@@ -8386,14 +8399,47 @@ mod doppelganger_tests {
     fn inside_the_window_with_nothing_seen_duties_are_blocked_without_halting() {
         let (engine, _dir) = perf_support::proposing_engine();
         let mut engine = engine;
-        engine.doppelganger_observe_until = Some(1_000);
+        engine.doppelganger_observe_until = Some(DOPPELGANGER_OBSERVE_SLOTS);
         assert!(engine.doppelganger_blocks_duties(5), "still observing: duties must wait");
         assert!(!engine.doppelganger_halted, "observing alone is not a detected duplicate");
         assert!(
-            !engine.doppelganger_blocks_duties(1_000),
+            !engine.doppelganger_blocks_duties(DOPPELGANGER_OBSERVE_SLOTS),
             "at the deadline slot itself, the window has closed"
         );
     }
+    #[test]
+    fn delayed_own_attestation_before_observation_is_not_a_live_duplicate() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let index = engine.keys.as_ref().unwrap().index;
+        engine.wall_slot = 100;
+        engine.doppelganger_observe_until = Some(100 + DOPPELGANGER_OBSERVE_SLOTS);
+        engine.apply_decision(sample_attestation_for(index),
+            GossipDecision::Accept { slashing_candidate: None }, &Origin::none());
+        assert!(!engine.doppelganger_halted);
+        let mut fresh = sample_attestation_for(index);
+        fresh.data.slot = 100;
+        engine.apply_decision(fresh,
+            GossipDecision::Accept { slashing_candidate: None }, &Origin::none());
+        assert!(engine.doppelganger_halted, "fresh duplicate must still halt duties");
+    }
+
+    #[test]
+    fn historical_own_proposal_replay_never_triggers_doppelganger() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        engine.propose(1);
+        let env = engine.blocks[engine.head_id().as_bytes()].clone();
+        engine.state = StateCell::new(engine.manifest.genesis_state());
+        engine.chain = vec![(0, engine.manifest.genesis_id())];
+        engine.canonical = BTreeSet::from([*engine.manifest.genesis_id().as_bytes()]);
+        engine.blocks.clear();
+        engine.recent_states.clear();
+        engine.wall_slot = 0;
+        engine.doppelganger_observe_until = Some(DOPPELGANGER_OBSERVE_SLOTS);
+        engine.ingest_replay(env.clone());
+        assert_eq!(engine.head_id(), env.block_id());
+        assert!(!engine.doppelganger_halted);
+    }
+
 }
 
 /// **Win 3's proof.** A proposer used to compute the whole committed state
@@ -11474,5 +11520,44 @@ mod branch_gap_repair_tests {
             assert_eq!(node.head_id(), head);
             assert_eq!(node.state.state_root(), root);
         }
+    }
+}
+
+#[cfg(test)]
+mod replay_integrity_tests {
+    use super::*;
+
+    #[test]
+    fn committed_replay_refuses_a_signed_but_invalid_state_root() {
+        let (mut node, _dir) = perf_support::proposing_engine();
+        let genesis = node.head_id();
+        node.propose(1);
+        assert_eq!(node.head_slot_now(), 1);
+        let valid = node.blocks[node.head_id().as_bytes()].clone();
+        let valid_id = valid.block_id();
+        assert!(node.do_reorg(*genesis.as_bytes(), Vec::new()));
+        node.blocks.remove(valid_id.as_bytes());
+        node.live = false;
+
+        let mut invalid = valid.clone();
+        invalid.header.state_root[0] ^= 1;
+        invalid.proposer_sig = node.keys.as_ref().unwrap()
+            .sign(&invalid.header.proposal_signing_root());
+        // This is a complete, decodable frame, not torn storage or an
+        // unauthenticated block. Only replay's consensus check rejects it.
+        let bytes = crate::codec::encode_envelope(&invalid);
+        let decoded = crate::codec::decode_envelope(&bytes).unwrap();
+        let error = node.replay_committed(decoded).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("was not applied"));
+        assert_eq!(node.head_id(), genesis);
+
+        // Valid history still reconstructs the head, while a repeated frame
+        // is refused as nonsequential rather than silently skipped.
+        node.replay_committed(valid.clone()).unwrap();
+        assert_eq!(node.head_id(), valid_id);
+        let error = node.replay_committed(valid).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("parent does not extend"));
     }
 }
