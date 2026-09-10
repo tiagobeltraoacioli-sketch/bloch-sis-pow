@@ -458,6 +458,12 @@ fn funded_mempool_rejects_invalid_state_rehearsal() {
 #[test]
 #[ignore = "requires isolated compile-time activation and short RANDAO chains"]
 fn randao_automatic_recommit_rehearsal() {
+    for exiting in [false, true] {
+        rehearse_randao_rotation(exiting);
+    }
+}
+
+fn rehearse_randao_rotation(exiting: bool) {
     assert_eq!(bloch_pos_committee::params::RANDAO_CHAIN_LENGTH, 16);
     let (mut first, _dir, _funding, joining, _) = fixture();
     let mut record = first.manifest.validators[0].clone();
@@ -476,6 +482,23 @@ fn randao_automatic_recommit_rehearsal() {
     second.chain = first.chain.clone();
     second.canonical = first.canonical.clone();
     second.keys = Some(joining);
+    if exiting {
+        // A voluntary exit leaves duties active for 32 epochs. Exhausting a
+        // chain during that delay must not disable renewal while still active.
+        let _clock = super::validator_lifecycle::clock_at(1);
+        let keys = first.keys.as_ref().unwrap();
+        let mut exit = staking::ExitTx {
+            pubkey_hash: Sha3_256::digest(&keys.pubkey).into(),
+            epoch: 0,
+            signature: Vec::new(),
+        };
+        exit.signature = keys.sign(&exit.signing_root());
+        first.on_transaction(PosTransaction::ExitV2 {
+            pubkey_hash: exit.pubkey_hash,
+            epoch: exit.epoch,
+            signature: exit.signature,
+        }).unwrap();
+    }
     let mut history = Vec::new();
     let mut produced = 0;
     for slot in 1..=160 { produced += usize::from(try_drive_pair(&mut first, &mut second, slot, &mut history)); }
