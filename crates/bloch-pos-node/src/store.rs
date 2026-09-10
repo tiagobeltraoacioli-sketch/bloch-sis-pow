@@ -635,6 +635,40 @@ pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
+/// Repair only an incomplete final frame while the exclusive directory lock
+/// is held. Merely ignoring it during replay leaves those bytes in front of
+/// the next append, turning a recoverable crash into a corrupt interior frame.
+/// Complete frame bodies are still validated by `read_all`; this operation
+/// never drops a complete frame, even when its envelope is invalid.
+fn repair_torn_log_tail(log: &mut File) -> io::Result<()> {
+    let physical_len = log.metadata()?.len();
+    let mut at = 0u64;
+    while at < physical_len {
+        if physical_len.saturating_sub(at) < 4 {
+            break;
+        }
+        log.seek(SeekFrom::Start(at))?;
+        let mut prefix = [0u8; 4];
+        log.read_exact(&mut prefix)?;
+        let len = u32::from_le_bytes(prefix);
+        if len as usize > crate::codec::MAX_FIELD_LEN {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "log frame over cap"));
+        }
+        let end = at.checked_add(4).and_then(|n| n.checked_add(u64::from(len)))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "log frame offset overflow"))?;
+        if end > physical_len {
+            break;
+        }
+        at = end;
+    }
+    if at < physical_len {
+        log.set_len(at)?;
+        log.sync_all()?;
+        eprintln!("store: removed incomplete trailing log frame before reopening for append");
+    }
+    Ok(())
+}
+
 impl Store {
     /// Open (or initialize) a data dir for the network identified by
     /// `genesis_digest`. A dir initialized for any other genesis — or holding
@@ -674,11 +708,12 @@ impl Store {
             }
             Err(e) => return Err(e),
         }
-        let log = OpenOptions::new()
+        let mut log = OpenOptions::new()
             .create(true)
             .append(true)
             .read(true)
             .open(dir.join("blocks.log"))?;
+        repair_torn_log_tail(&mut log)?;
         let log_len = log.metadata()?.len();
         // The index is rebuilt (or caught up) here, on the same boot that
         // already replays the whole log. A data dir written by a binary that
@@ -985,6 +1020,59 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn torn_tail_is_removed_before_new_appends_survive_restart() {
+        for tail_len in [1, 3, 4, 17] {
+            let dir = std::env::temp_dir().join(format!(
+                "bloch-pos-torn-tail-{}-{tail_len}", std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            let first = sample_envelope(1);
+            let second = sample_envelope(2);
+            let mut store = Store::open(&dir, &[31; 32]).unwrap();
+            store.append(&first).unwrap();
+            drop(store);
+            let payload = crate::codec::encode_envelope(&second);
+            let mut torn = (payload.len() as u32).to_le_bytes().to_vec();
+            torn.extend_from_slice(&payload);
+            let path = dir.join("blocks.log");
+            let good_len = fs::metadata(&path).unwrap().len();
+            OpenOptions::new().append(true).open(&path).unwrap()
+                .write_all(&torn[..tail_len]).unwrap();
+            let mut store = Store::open(&dir, &[31; 32]).unwrap();
+            assert_eq!(fs::metadata(&path).unwrap().len(), good_len,
+                "recovery must physically remove the torn tail before appending");
+            assert_eq!(store.read_all().unwrap().len(), 1);
+            store.append(&second).unwrap();
+            drop(store);
+            let store = Store::open(&dir, &[31; 32]).unwrap();
+            let replay = store.read_all().unwrap();
+            assert_eq!(replay.len(), 2);
+            assert_eq!(replay[1].block_id(), second.block_id());
+            assert_eq!(Store::blocks_after(&dir, 1, 10).unwrap(), vec![payload]);
+            drop(store);
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn complete_corrupt_frame_is_not_discarded_as_a_torn_tail() {
+        let dir = std::env::temp_dir().join(format!("bloch-pos-corrupt-frame-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[32; 32]).unwrap();
+        store.append(&sample_envelope(1)).unwrap();
+        drop(store);
+        let path = dir.join("blocks.log");
+        OpenOptions::new().append(true).open(&path).unwrap()
+            .write_all(&[1, 0, 0, 0, 0xff]).unwrap();
+        let before = fs::read(&path).unwrap();
+        let store = Store::open(&dir, &[32; 32]).unwrap();
+        assert!(store.read_all().is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        drop(store);
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// The from-genesis path, at the store level: `after_slot = 0` must return
     /// the chain from its beginning, and the cap must be a cap.
