@@ -636,9 +636,30 @@ class Harness:
         block = self.block_at(others[0], slot)
         self.check("step5: getblockbyslot.proposer_index == joiner", block is not None and as_int(block["proposer_index"]) == idx,
                    {"slot": slot, "block": block and {k: block[k] for k in ("proposer_index", "attestation_count", "tx_count")}})
-        counts = [as_int(b["attestation_count"]) for s in range(slot - 8, slot + 1) if (b := self.block_at(others[0], s))]
-        self.check("step5: some block after activation carries ≥ 4 attestations", bool(counts) and max(counts) >= N_GENESIS + 1, counts)
-        self.record("step5_duties", **obs, block=block)
+        # Attestations are packed once per epoch: measured 2026-09-11, every
+        # block of an epoch carries attestation_count 0 except the first few
+        # slots of the NEXT epoch, one vote per block (slots 544-547 and
+        # 576-579 carried one each with four validators). So the evidence
+        # that the joiner votes is the per-epoch TOTAL rising from N_GENESIS
+        # to N_GENESIS + 1 after activation — with the epoch before
+        # activation as the control at N_GENESIS. RPC lists no attesters
+        # (block JSON has only attestation_count), which is why this is a
+        # sum and the joiner's own `attested` lines are the other half.
+        activation = as_int((self.validator(others[0], dep["pkh"]) or {}).get("activation_epoch", 0))
+
+        def epoch_votes(epoch: int) -> int:
+            return sum(as_int(b["attestation_count"]) for s in range(epoch * lib.SLOTS_PER_EPOCH, (epoch + 1) * lib.SLOTS_PER_EPOCH)
+                       if (b := self.block_at(others[0], s)))
+        # Votes for epoch E land in the first blocks of E + 1, so the last
+        # complete epoch whose votes are fully on chain is slot // 32 - 2.
+        after = slot // lib.SLOTS_PER_EPOCH - 2
+        votes_after = epoch_votes(after) if after > activation else 0
+        votes_before = epoch_votes(activation - 2) if activation >= 2 else -1
+        self.check("step5: per-epoch attestation total is N_GENESIS + 1 after activation (control: N_GENESIS before)",
+                   votes_after >= N_GENESIS + 1 and 0 <= votes_before <= N_GENESIS,
+                   {"activation_epoch": activation, "epoch_after": after, "votes_after": votes_after,
+                    "epoch_before": activation - 2, "votes_before": votes_before})
+        self.record("step5_duties", **obs, block=block, votes_after=votes_after, votes_before=votes_before)
 
     def step_restart(self, dep: dict) -> None:
         joiner, idx, v0 = self.nodes["joiner"], dep["index"], self.node_at(0)
@@ -654,11 +675,17 @@ class Harness:
         self.check("step6: SIGTERM stopped the joiner cleanly", outcome.startswith("terminated"), outcome)
         joiner.start()
         self.wait_ready([joiner])
-        text = joiner.log_text()[old_size:]
-        replayed = lib.REPLAYED_RE.search(text)
-        self.check("step6: restart replayed > 0 blocks and re-resolved an Active identity",
-                   replayed is not None and int(replayed.group(1)) > 0 and "registered and its key matches" in text,
-                   {"replayed": replayed.group(0) if replayed else None, "pid": joiner.pids})
+        # The RPC answers before the boot replay finishes writing its
+        # summary (measured 2026-09-11: `replayed 603 blocks …` and the
+        # identity line landed after the first successful getchaininfo), so
+        # the log is polled for both lines instead of read once.
+
+        def boot_lines():
+            text = joiner.log_text()[old_size:]
+            replayed = lib.REPLAYED_RE.search(text)
+            ok = replayed is not None and int(replayed.group(1)) > 0 and "registered and its key matches" in text
+            return ok, {"replayed": replayed.group(0) if replayed else None, "pid": joiner.pids}
+        self.poll("step6: restart replayed > 0 blocks and re-resolved an Active identity", boot_lines, epochs=2)
         self.check("step6: slashing_protection.bin retained", (joiner.data_dir / "slashing_protection.bin").exists(), str(joiner.data_dir))
         target = as_int(before["randao_reveals_used"]) + 1
         after = self.poll(f"step6: proposes again after restart (reveals ≥ {target})", lambda: reveals_at_least(target), epochs=14)
