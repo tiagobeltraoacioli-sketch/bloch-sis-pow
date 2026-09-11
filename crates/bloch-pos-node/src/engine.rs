@@ -101,6 +101,8 @@ use bloch_pos_committee::{committees, derive, epoch_of, schedule};
 use sha3::{Digest, Sha3_256};
 
 mod validator_lifecycle;
+#[cfg(test)]
+mod devnet_tools_tests;
 
 use crate::genesis::Manifest;
 #[cfg(test)]

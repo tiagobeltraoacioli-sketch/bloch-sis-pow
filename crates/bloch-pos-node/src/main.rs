@@ -45,6 +45,7 @@
 //! rule once integration review starts).
 
 mod codec;
+mod devnet_tools;
 mod engine;
 mod genesis;
 mod keys;
@@ -151,6 +152,21 @@ fn main() {
                 exit(2);
             }
         }
+        // Devnet-only, non-consensus tooling for the lifecycle harness
+        // (`devnet_tools`): an offline TransferV2 signer and a proposer
+        // equivocation injector that refuses non-devnet manifests.
+        Some("transfer-v2") => {
+            if let Err(error) = devnet_tools::transfer_v2(&args[1..]) {
+                eprintln!("transfer-v2: {error}");
+                exit(2);
+            }
+        }
+        Some("devnet-equivocate") => {
+            if let Err(error) = devnet_tools::equivocate(&args[1..]) {
+                eprintln!("devnet-equivocate: {error}");
+                exit(2);
+            }
+        }
         Some("run") => run_cmd(&args[1..]),
         Some(
             cmd @ ("ws-keygen" | "ws-signer-set" | "ws-checkpoint" | "ws-sign" | "ws-envelope"
@@ -216,6 +232,17 @@ fn print_help() {
 \
                Use keygen --index auto for a joining devnet validator.
 \
+           bloch-pos transfer-v2 --help\n\
+               Build and SIGN one TransferV2 offline with a keystore (devnet\n\
+               tooling): one witness key, one output, priced exactly as\n\
+               consensus prices it at inclusion. Writes hex for\n\
+               sendrawtransaction; never broadcasts.\n\
+           bloch-pos devnet-equivocate --help\n\
+               DEVNET ONLY. Re-sign a block this keystore proposed with one\n\
+               state_root byte flipped and send it to a running node, to\n\
+               rehearse the proposer-equivocation slashing path against\n\
+               your own devnet validator. Refuses any manifest that is not\n\
+               devnet-shaped (non-empty cohort or a carryover commitment).\n\
            bloch-pos submit-tx --to <host:port> --pubkey <hex>\n\
                                --spend <txid-hex>:<vout> [--spend ...]\n\
                                --pay <script-hash-hex>:<sat> [--pay ...]\n\
@@ -278,8 +305,15 @@ fn print_help() {
            bloch-pos genesis --keys <dir1,dir2,...> --out <file>\n\
                              [--slot-ms <ms>] [--start-in <secs>]\n\
                              [--bind-genesis]\n\
+                             [--alloc <script-hash-hex64>:<sat> ...]\n\
                Build a devnet genesis manifest from the keystores' public\n\
                parts. Slot 0 starts <secs> from now (default 5).\n\
+               --alloc (repeatable, at most 64) adds a liquid opening\n\
+               balance of <sat> owned by <script-hash-hex64> — the SHA3-256\n\
+               of an enveloped public key (keygen-public column 2), which is\n\
+               what a funded deposit or a transfer-v2 then spends. Each\n\
+               allocation's outpoint (txid, vout 0) is printed after the\n\
+               manifest is written, as gettxout will report it.\n\
                --bind-genesis writes the BPOSMAN2 format, whose genesis\n\
                header commits to the genesis state root and seeds the\n\
                RANDAO mix from the carryover digest, so the block id at\n\
@@ -1119,17 +1153,28 @@ fn genesis_cmd(args: &[String]) {
             commission_bps: 0,
         });
     }
+    // `--alloc` opening balances (devnet_tools): liquid LIQUIDITY-purpose
+    // allocations, the one funding path a fresh devnet has. Refused past the
+    // manifest's decode cap or with an amount that does not fit a u64 UTXO.
+    let allocations = match devnet_tools::parse_allocs(args) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("genesis: {e}");
+            exit(2);
+        }
+    };
     let manifest = genesis::Manifest {
         genesis_time_ms: genesis_time_from_now(start_in),
         slot_ms,
         validators,
         cohort: Vec::new(),
-        // `genesis` builds devnet manifests: no carried balances, no vested
-        // allocations. The mainnet manifest is assembled by a separate path
+        // `genesis` builds devnet manifests: no carried balances, and only
+        // the `--alloc` balances given on the command line (empty by
+        // default). The mainnet manifest is assembled by a separate path
         // that takes the signed Genesis-3 snapshot as input, because its
         // inputs come from a ceremony and not from a command line.
         carryover: None,
-        allocations: Vec::new(),
+        allocations,
         carryover_entries: Vec::new(),
         format: manifest_format(args),
         pre_state_root: std::sync::OnceLock::new(),
@@ -1152,6 +1197,12 @@ fn genesis_cmd(args: &[String]) {
         codec::hex8(manifest.genesis_id().as_bytes()),
         codec::hex32(&digest)
     );
+    // One line per opening balance, with the outpoint genesis materialises
+    // for it — derived by the same function `genesis_state` uses, so the
+    // harness reads it instead of re-deriving the txid.
+    for line in devnet_tools::allocation_report(&manifest) {
+        println!("{line}");
+    }
 }
 
 /// The default libp2p listen address, used when a plan runs a swarm and the
