@@ -659,10 +659,16 @@ class Harness:
         def epoch_votes(epoch: int) -> int:
             return sum(as_int(b["attestation_count"]) for s in range(epoch * lib.SLOTS_PER_EPOCH, (epoch + 1) * lib.SLOTS_PER_EPOCH)
                        if (b := self.block_at(others[0], s)))
-        # Votes for epoch E land in the first blocks of E + 1, so the last
-        # complete epoch whose votes are fully on chain is slot // 32 - 2.
-        after = slot // lib.SLOTS_PER_EPOCH - 2
-        votes_after = epoch_votes(after) if after > activation else 0
+        # Votes for epoch E land in the first blocks of E + 1, so E's total is
+        # complete once the wall clock is at E + 2. The joiner's first landed
+        # block can come in its activation epoch itself (measured 2026-09-11:
+        # activation 11, proposal at e11/s24), so wait for the first full
+        # post-activation epoch (activation + 1) to be fully on chain before
+        # counting, instead of counting whatever slot // 32 - 2 happens to be.
+        after = activation + 1
+        self.poll(f"step5: epoch {after}'s attestations are fully on chain (wall epoch ≥ {after + 2})",
+                  lambda: (self.clock.wall_epoch() >= after + 2, {"wall_epoch": self.clock.wall_epoch()}), epochs=4)
+        votes_after = epoch_votes(after)
         votes_before = epoch_votes(activation - 2) if activation >= 2 else -1
         self.check("step5: per-epoch attestation total is N_GENESIS + 1 after activation (control: N_GENESIS before)",
                    votes_after >= N_GENESIS + 1 and 0 <= votes_before <= N_GENESIS,
