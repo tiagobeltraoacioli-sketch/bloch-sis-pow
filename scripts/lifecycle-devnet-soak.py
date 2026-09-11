@@ -605,10 +605,17 @@ class Harness:
         self.wait_ready([observer])
         self.wait_synced(observer, epochs=4)
         text = observer.log_text()
+        # A fresh data dir has nothing to replay: the node prints no
+        # `replayed N blocks` line at all (measured 2026-09-11, observer/run.log)
+        # and announces itself with `fresh node: syncing under the genesis
+        # anchor (age A of P epochs)`. A `replayed` line here would mean the
+        # dir was NOT empty — the copied-data-dir trap — so its absence, or a
+        # count of 0, is the required evidence together with the anchor line.
         replayed = lib.REPLAYED_RE.search(text)
-        self.check("observer: replayed 0 blocks and synced under the genesis anchor",
-                   replayed is not None and replayed.group(1) == "0" and "fresh node: syncing under the genesis anchor" in text,
-                   {"replayed": replayed.group(0) if replayed else None})
+        fresh = "fresh node: syncing under the genesis anchor" in text
+        self.check("observer: nothing to replay (empty dir) and synced under the genesis anchor",
+                   (replayed is None or replayed.group(1) == "0") and fresh,
+                   {"replayed": replayed.group(0) if replayed else None, "fresh_anchor_line": fresh})
         self.registry_equal("observer")
         self.record("observer_join", pid=observer.pids, snapshot=self.snapshot("observer"))
 
