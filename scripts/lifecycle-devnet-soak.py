@@ -64,9 +64,14 @@ What a passing run proves
 
 What it does NOT prove
   * Anything about the shipping binary's consensus: the copy is armed at
-    epoch 0 with EXIT/WITHDRAWAL delays of 4/64, RANDAO_CHAIN_LENGTH 256 and
-    the epoch-800/1400/2700 rules active from genesis. The unarmed-control
-    arm proves only that the SHIPPING binary refuses the deposit.
+    epoch 0 with EXIT/WITHDRAWAL delays of 4/64 and the epoch-800/1400/2700
+    rules active from genesis. The unarmed-control arm proves only that the
+    SHIPPING binary refuses the deposit.
+  * Automatic RANDAO renewal, unless run with `--randao-chain 256`: at the
+    shipping chain length nothing exhausts in a run this long. (The 2026-09-11
+    run with 256 did observe one renewal included over the real transport —
+    generation 1 on every node — before the second exhaustion stalled a
+    partition half; the in-process rehearsal covers renewal deterministically.)
   * Attester-offence slashing (only proposer equivocation is exercised), the
     per-source mempool quota (8 candidates have 8 funders), the correlation
     penalty, delegation, the libp2p transport, or a partition under real
@@ -252,7 +257,11 @@ class Harness:
             if self.armed:
                 lib.copy_tree(ROOT, copy)
                 sources = {f: (copy / f).read_text() for f in (lib.PARAMS, lib.STAKING)}
-                rewritten, changes = lib.rewrite_constants(sources)
+                armed_constants = list(lib.ARMED_CONSTANTS)
+                if self.args.randao_chain != lib.RANDAO_CHAIN_LENGTH_SHIPPING:
+                    # Opt-in only: see the note beside ARMED_CONSTANTS in the lib.
+                    armed_constants.append((lib.PARAMS, "RANDAO_CHAIN_LENGTH", "u32", str(self.args.randao_chain)))
+                rewritten, changes = lib.rewrite_constants(sources, armed_constants)
                 for f, text in rewritten.items():
                     (copy / f).write_text(text)
                 src_tree, target = copy, ROOT / "target" / "lifecycle-devnet-soak"
@@ -1119,12 +1128,20 @@ def main() -> int:
     parser.add_argument("--build-timeout-minutes", type=int, default=45)
     parser.add_argument("--port-base", type=int, default=17610)
     parser.add_argument("--split-epochs", type=int, default=9, help="must exceed ACTIVATION_DELAY_EPOCHS (8)")
+    parser.add_argument("--allow-short-split", action="store_true",
+                        help="experiment only: permit --split-epochs <= 8 (e.g. 3, below INACTIVITY_LEAK_THRESHOLD_EPOCHS = 4) "
+                             "to discriminate WHY a long partition does not heal; such a run does not discharge VAD-04")
     parser.add_argument("--observer-epoch", type=int, default=10, help="fresh late join at this wall epoch (< W − X = 60)")
     parser.add_argument("--start-in", type=int, default=20, help="genesis --start-in seconds")
     parser.add_argument("--load", type=int, default=8, help="independently funded load candidates")
+    parser.add_argument("--randao-chain", type=int, default=lib.RANDAO_CHAIN_LENGTH_SHIPPING,
+                        help="RANDAO_CHAIN_LENGTH in the armed copy (default: the shipping 8192, i.e. unchanged; "
+                             "256 reproduces the automatic-renewal observation of 2026-09-11 but stalls a partition "
+                             "half whose only proposer has spent its chain)")
     args = parser.parse_args()
-    if args.split_epochs <= 8:
-        parser.error("--split-epochs must exceed ACTIVATION_DELAY_EPOCHS (8)")
+    if args.split_epochs <= 8 and not args.allow_short_split:
+        parser.error("--split-epochs must exceed ACTIVATION_DELAY_EPOCHS (8); pass --allow-short-split for a "
+                     "partition-length experiment, which the verdict then labels as such")
     if not 1 <= args.load <= 32:
         parser.error("--load must be 1..32 (idle active stake must stay < 1/3)")
     harness = Harness(args)
