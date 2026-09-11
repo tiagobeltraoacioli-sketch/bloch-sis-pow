@@ -34,6 +34,7 @@ import stat
 import struct
 import sys
 import tempfile
+import types
 import threading
 from pathlib import Path
 
@@ -218,6 +219,17 @@ def test_small_helpers(tmp: Path) -> None:
     clock = lib.Clock(lib.Clock.now_ms() - 500 * 70, 500)
     expect("wall slot/epoch/slot_in_epoch arithmetic", clock.wall_slot() in (70, 71) and clock.wall_epoch() == 2 and clock.slot_in_epoch() in (6, 7))
     expect("before genesis the wall slot is 0", lib.Clock(lib.Clock.now_ms() + 60_000, 500).wall_slot() == 0)
+    print("log slicing after a restart")
+    log = tmp / "run.log"
+    first = "[slot 1] applied ab — head root cd, justified e0, finalized e0\n" * 40
+    log.write_text(first)
+    offset = log.stat().st_size
+    log.write_text(first + "replayed 491 blocks: head slot 491, state root 2b6c0727\n")
+    holder = types.SimpleNamespace(log_path=log)
+    expect("byte offset + str slice would miss the restart line (the 2026-09-11 bug)",
+           "replayed" not in log.read_text()[offset:])
+    expect("log_text_from slices bytes and finds it", "replayed 491 blocks" in lib.Node.log_text_from(holder, offset))
+    expect("log_text_from on a missing file is empty", lib.Node.log_text_from(types.SimpleNamespace(log_path=tmp / "none.log"), 0) == "")
     print("as_int / metrics / outpoints")
     expect("Json::sat strings and Json::u numbers both coerce", lib.as_int("2500000000000") == 2_500_000_000_000 and lib.as_int(7) == 7)
     expect_raises("a float string is refused", lambda: lib.as_int("1.5"), "expected an integer")
