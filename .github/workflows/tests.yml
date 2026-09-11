@@ -102,6 +102,45 @@ jobs:
             -p pqcrypto-internals \
             -p genesis4-ceremony
 
+  # ADR-041 lifecycle flag-day guards (deploy/FLAG-DAY-LIFECYCLE.md). Three
+  # things, each blocking, none of which the cargo-test job above measures:
+  #   1. the arming tool's selftest — the tool that will edit five consensus
+  #      constants must be shown to refuse every wrong arming BEFORE the day
+  #      it is run for real;
+  #   2. `--verify` — the five constants agree with each other, with
+  #      `DEPOSIT_ACTIVATION_EPOCH = u64::MAX`, and with the runbook's
+  #      `LIFECYCLE_EPOCH` line, on every push (unarmed today; the same check
+  #      holds the armed value to the runbook after the flag day);
+  #   3. the withdrawal-guard mutation run — eight deletions of a guard in
+  #      transition/lifecycle.rs, each of which must kill a test. The script
+  #      existed since PR #11 but no workflow ran it, so a guard could have
+  #      been weakened with the tests still green.
+  # Its own job because the mutation run rebuilds the committee test binary
+  # nine times; adding that to cargo-test's ~51 min would gate by timeout.
+  lifecycle-flag-day-guards:
+    name: lifecycle flag-day guards (blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: arming tool selftest (the tool must be able to refuse)
+        run: python3 scripts/arm-lifecycle-epoch.selftest.py
+      - name: constants, runbook and tripwires agree
+        run: python3 scripts/arm-lifecycle-epoch.py --verify
+      - name: Pinned toolchain (crates/bloch-pos-node/rust-toolchain.toml)
+        run: |
+          ch="$(sed -n 's/^channel *= *"\(.*\)".*/\1/p' crates/bloch-pos-node/rust-toolchain.toml)"
+          if [ -z "$ch" ]; then
+            echo "cannot read the toolchain pin — refusing to test on a floating toolchain" >&2
+            exit 1
+          fi
+          rustup toolchain install "$ch" --profile minimal --no-self-update
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install C toolchain (rocksdb bindgen, blst, PQClean)
+        run: sudo apt-get update && sudo apt-get install -y clang cmake
+      - name: ADR-041 withdrawal guard mutations (each must kill a test)
+        run: python3 scripts/check-validator-lifecycle-mutations.py
+
   # tests-blocking guard — the regression test for finding TEST1 itself. Fails
   # if this workflow or GitLab's build-and-test loses a live crate, loses its
   # timeout, or re-acquires an escape hatch. Pure Python 3, no toolchain.
