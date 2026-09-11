@@ -732,6 +732,16 @@ pub fn send_transaction(addr: &str, tx_bytes: &[u8]) -> std::io::Result<()> {
     write_frame(&mut sock, &frame)
 }
 
+/// Send one block envelope to a running node and disconnect — the
+/// `FRAME_BLOCK` twin of [`send_transaction`], for the devnet equivocation
+/// injector (`devnet_tools::equivocate`). Same contract: the node judges it
+/// through `ingest_judged` exactly as a gossiped block, and nothing is
+/// acknowledged.
+pub fn send_block(addr: &str, env: &BlockEnvelope) -> std::io::Result<()> {
+    let mut sock = TcpStream::connect(addr)?;
+    write_frame(&mut sock, &block_frame(env))
+}
+
 fn write_frame(sock: &mut TcpStream, frame: &[u8]) -> std::io::Result<()> {
     // Capacity hint only: saturating is the intended semantics.
     let mut buf = Vec::with_capacity(4usize.saturating_add(frame.len()));
