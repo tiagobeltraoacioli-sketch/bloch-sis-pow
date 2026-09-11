@@ -67,6 +67,7 @@ def jdump(value: Any) -> str:
 
 PARAMS = "crates/bloch-pos-committee/src/params.rs"
 STAKING = "crates/bloch-pos-committee/src/staking.rs"
+RANDAO_CHAIN_LENGTH_SHIPPING = 8192  # params.rs:153 — the value the copy keeps unless --randao-chain says otherwise
 
 # (file, name, rust type, armed value). The compile-time asserts at
 # params.rs:1999-2005 need the five ADR-041 gates equal, DEPOSIT at u64::MAX
@@ -81,7 +82,15 @@ ARMED_CONSTANTS: list[tuple[str, str, str, str]] = [
     (PARAMS, "LEAKED_ROSTER_ACTIVATION_EPOCH", "u64", "0"),
     (PARAMS, "TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH", "u64", "0"),
     (PARAMS, "BLOCK_BYTES_V2_ACTIVATION_EPOCH", "u64", "0"),
-    (PARAMS, "RANDAO_CHAIN_LENGTH", "u32", "256"),
+    # RANDAO_CHAIN_LENGTH is NOT shortened by default. Measured 2026-09-11
+    # with 256: the 600k-stake genesis validator (≈49% proposer share) spent
+    # a whole chain every ≈520 slots; its first renewal was included on the
+    # mesh (generation 1 on every node — the recommit rider working over the
+    # real transport), but the second exhaustion fell inside the partition,
+    # where the only other proposer on its half held 2%, so that half stalled
+    # for epochs waiting for a renewal nobody could include. That is a devnet
+    # artefact of a 49%-share validator on a 256-reveal chain, not a property
+    # under test. `--randao-chain 256` reproduces the renewal observation.
     (STAKING, "WITHDRAWAL_DELAY_EPOCHS", "u64", "64"),
     (STAKING, "EXIT_DELAY_EPOCHS", "u64", "4"),
 ]

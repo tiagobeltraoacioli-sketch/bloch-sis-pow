@@ -186,11 +186,15 @@ def test_rewriter() -> None:
     armed = out[lib.PARAMS] + out[lib.STAKING]
     expect("every armed constant now carries its design value",
            all(f"pub const {name}: {ty} = {new};" in armed for _, name, ty, new in lib.ARMED_CONSTANTS))
-    expect("no shipping value survives", "= 2048;" not in armed and "= 8_192;" not in armed and "= 2_700;" not in armed and "= 1400;" not in armed)
+    expect("no shipping value of an armed constant survives", "= 2048;" not in armed and "= 2_700;" not in armed and "= 1400;" not in armed)
+    expect("RANDAO_CHAIN_LENGTH keeps the shipping value by default", "pub const RANDAO_CHAIN_LENGTH: u32 = 8_192;" in armed)
+    opt_in = list(lib.ARMED_CONSTANTS) + [(lib.PARAMS, "RANDAO_CHAIN_LENGTH", "u32", "256")]
+    out_short, _ = lib.rewrite_constants(synthetic_sources(), opt_in)
+    expect("--randao-chain shortens it only when asked", "pub const RANDAO_CHAIN_LENGTH: u32 = 256;" in out_short[lib.PARAMS])
     expect("pinned constants untouched", "pub const DEPOSIT_ACTIVATION_EPOCH: u64 = u64::MAX;" in armed
            and "pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = u64::MAX;" in armed and "pub const ACTIVATION_DELAY_EPOCHS: u64 = 8;" in armed)
     expect("SLOTS_PER_EPOCH untouched", "pub const SLOTS_PER_EPOCH: u64 = 32;" in armed)
-    expect("changes report from→to for 12 armed + 3 pinned", len(changes) == 15
+    expect("changes report from→to for 11 armed + 3 pinned", len(changes) == 14
            and {c["name"]: c.get("from") for c in changes}["WITHDRAWAL_DELAY_EPOCHS"] == "2048")
     expect_raises("missing constant refuses the rewrite", lambda: lib.rewrite_constants(synthetic_sources(drop="EXIT_DELAY_EPOCHS")),
                   "EXIT_DELAY_EPOCHS must be declared exactly once")
