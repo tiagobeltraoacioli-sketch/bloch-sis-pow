@@ -1128,6 +1128,9 @@ def main() -> int:
     parser.add_argument("--build-timeout-minutes", type=int, default=45)
     parser.add_argument("--port-base", type=int, default=17610)
     parser.add_argument("--split-epochs", type=int, default=9, help="must exceed ACTIVATION_DELAY_EPOCHS (8)")
+    parser.add_argument("--allow-short-split", action="store_true",
+                        help="experiment only: permit --split-epochs <= 8 (e.g. 3, below INACTIVITY_LEAK_THRESHOLD_EPOCHS = 4) "
+                             "to discriminate WHY a long partition does not heal; such a run does not discharge VAD-04")
     parser.add_argument("--observer-epoch", type=int, default=10, help="fresh late join at this wall epoch (< W − X = 60)")
     parser.add_argument("--start-in", type=int, default=20, help="genesis --start-in seconds")
     parser.add_argument("--load", type=int, default=8, help="independently funded load candidates")
@@ -1136,8 +1139,9 @@ def main() -> int:
                              "256 reproduces the automatic-renewal observation of 2026-09-11 but stalls a partition "
                              "half whose only proposer has spent its chain)")
     args = parser.parse_args()
-    if args.split_epochs <= 8:
-        parser.error("--split-epochs must exceed ACTIVATION_DELAY_EPOCHS (8)")
+    if args.split_epochs <= 8 and not args.allow_short_split:
+        parser.error("--split-epochs must exceed ACTIVATION_DELAY_EPOCHS (8); pass --allow-short-split for a "
+                     "partition-length experiment, which the verdict then labels as such")
     if not 1 <= args.load <= 32:
         parser.error("--load must be 1..32 (idle active stake must stay < 1/3)")
     harness = Harness(args)
