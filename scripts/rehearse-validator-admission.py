@@ -34,10 +34,13 @@ def main():
     source = (ROOT / PARAMS).read_text()
     armed = source
     for gate in GATES:
-        old = f"pub const {gate}_ACTIVATION_EPOCH: u64 = u64::MAX;"
-        if source.count(old) != 1:
-            raise SystemExit(f"Expected exactly one unarmed {gate} constant; review the rehearsal.")
-        armed = armed.replace(old, f"pub const {gate}_ACTIVATION_EPOCH: u64 = 0;")
+        # `u64::MAX` before the flag day, the armed epoch after it: the
+        # rehearsal keeps running across the arming commit, since epoch zero
+        # is below any real L and the copy is what changes, never the tree.
+        pattern = re.compile(rf"^pub const {gate}_ACTIVATION_EPOCH: u64 = (u64::MAX|\d[\d_]*);$", re.M)
+        if len(pattern.findall(armed)) != 1:
+            raise SystemExit(f"Expected exactly one {gate} activation constant; review the rehearsal.")
+        armed = pattern.sub(f"pub const {gate}_ACTIVATION_EPOCH: u64 = 0;", armed, count=1)
     pin = re.search(r'^channel\s*=\s*"([^"]+)"', (ROOT / "crates/bloch-pos-node/rust-toolchain.toml").read_text(), re.M)
     if not pin:
         raise SystemExit("Missing pinned toolchain")
