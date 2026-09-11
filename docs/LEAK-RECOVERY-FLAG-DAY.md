@@ -16,8 +16,13 @@ using the unfloored, leak-adjusted quorum denominator — the arithmetic of the
 2026-08-24 incident, in which three disjoint partitions of 4/64 validators each
 finalized different roots at the same epoch — and applies BOTH halves of the
 leak mechanism: the **denominator floor**
-(`MIN_QUORUM_DENOMINATOR_NUM/DEN` of the unleaked total, so a shrunken
-partition can never vote itself a supermajority) and the **leak recovery**
+(`MIN_QUORUM_DENOMINATOR_NUM/DEN` of the unleaked total, so a partition
+holding **less than a third** of the unleaked stake can never vote itself a
+supermajority — the 4-of-64 shape of the incident; a two-way split in which
+BOTH sides hold at least a third can still finalize twice once the leak has
+bitten, the "at most three ways" residual the post-mortem records, and it was
+measured on a devnet on 2026-09-11, `docs/audit/VAD-04-LIFECYCLE-SOAK-2026-09-11.md`)
+and the **leak recovery**
 (the accumulator decreases again once finality resumes, so ejection is no
 longer permanent). Below 2700 the shipped arithmetic is byte-identical to what
 every binary has run since Genesis-4 launch; the change is invisible until the
@@ -66,7 +71,10 @@ E=1400 successfully):
 - Finality continuity across the 2700 boundary (finalized epoch advancing).
 - Leak accumulators shrinking for validators that resumed attesting.
 - No divergence between nodes (same finalized root at the same epoch on
-  independent nodes — the 2026-08-24 failure mode this closes).
+  independent nodes — the sub-third-partition failure mode of 2026-08-24,
+  which this closes; a partition into two sides each holding ≥ ⅓ that lasts
+  past the leak threshold is NOT closed by this constant and must be treated
+  as a fork, see `deploy/FLAG-DAY-LIFECYCLE.md` §3.3).
 
 ## Relationship to the other constants
 
