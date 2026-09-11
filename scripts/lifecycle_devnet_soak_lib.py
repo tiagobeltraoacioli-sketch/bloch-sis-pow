@@ -570,7 +570,23 @@ class Node:
         return self.log_path.read_text(errors="replace") if self.log_path.exists() else ""
 
     def log_size(self) -> int:
+        """Byte offset — pair it with `log_text_from`, never with a str slice."""
         return self.log_path.stat().st_size if self.log_path.exists() else 0
+
+    def log_text_from(self, offset_bytes: int) -> str:
+        """The log written after byte `offset_bytes`, decoded.
+
+        The node's lines are full of multibyte characters (`—` alone is three
+        bytes), so a byte offset from `log_size` slices a decoded str far past
+        the text it meant to skip. Measured 2026-09-11: three runs read an
+        empty post-restart slice and reported `replayed: None` while the log
+        plainly carried `replayed 491 blocks …`. Slice the bytes, then decode.
+        """
+        if not self.log_path.exists():
+            return ""
+        with open(self.log_path, "rb") as fh:
+            fh.seek(max(offset_bytes, 0))
+            return fh.read().decode("utf-8", errors="replace")
 
 
 # ── bloch-pos command wrappers ──────────────────────────────────────────────

@@ -690,7 +690,7 @@ class Harness:
         # the log is polled for both lines instead of read once.
 
         def boot_lines():
-            text = joiner.log_text()[old_size:]
+            text = joiner.log_text_from(old_size)
             replayed = lib.REPLAYED_RE.search(text)
             ok = replayed is not None and int(replayed.group(1)) > 0 and "registered and its key matches" in text
             return ok, {"replayed": replayed.group(0) if replayed else None, "pid": joiner.pids}
@@ -770,7 +770,7 @@ class Harness:
         self.poll("step7: finality resumed on every node", lambda: (all(as_int(i["finalized"]["epoch"]) > f0[k] for k, i in self.rpc_all("getchaininfo").items()),
                                                                      {k: i["finalized"] for k, i in self.rpc_all("getchaininfo").items()}), epochs=10)
         self.check("step7: PIDs unchanged across split/heal", {n.name: n.pid for n in self.live_nodes()} == pids, pids)
-        replays = {n.name: len(lib.REPLAYED_RE.findall(n.log_text()[sizes[n.name]:])) for n in nodes}
+        replays = {n.name: len(lib.REPLAYED_RE.findall(n.log_text_from(sizes[n.name]))) for n in nodes}
         self.check("step7: no node replayed (restarted) inside the phase", not any(replays.values()), replays)
         post = self.snapshot("split-post")
         self.registry_equal("split-post")
