@@ -1,77 +1,75 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 
-# The leak-recovery flag day — `LEAK_RECOVERY_ACTIVATION_EPOCH = 2700`
+# Coordinated leak-recovery replacement — epoch 2880
 
-**ARMED 2026-09-06 by founder decision.** Chain was at ~epoch 2075 when the
-constant was set; epoch 2700 lands ≈2026-09-12 (90 epochs/day), leaving ≈6 days
-for the coordinated fleet rollout. This document is the versioned runbook the
-tripwire test (`leak_recovery_armed_epoch_matches_the_runbook`,
-`transition.rs`) checks the constant against. Changing the epoch again is a new
-flag day and requires updating BOTH in one commit.
+Candidate schedule selected by the operator on 2026-09-13: **Monday,
+2026-09-14 at 21:31:19 UTC (18:31:19 America/Sao_Paulo)**, epoch 2880.
+The ADR-041 lifecycle follows at epoch 2884, 22:35:19 UTC (19:35:19 local).
+These are release targets, not claims of completed deployment. Qualification
+and complete fleet readiness are prerequisites; postpone the coordinated
+schedule before the boundary if they are not satisfied.
 
-## What activates, in one paragraph
+## Why the old date cannot be reused
 
-From the first vote tally at which `votes.epoch >= 2700`, `finality.rs` stops
-using the unfloored, leak-adjusted quorum denominator — the arithmetic of the
-2026-08-24 incident, in which three disjoint partitions of 4/64 validators each
-finalized different roots at the same epoch — and applies BOTH halves of the
-leak mechanism: the **denominator floor**
-(`MIN_QUORUM_DENOMINATOR_NUM/DEN` of the unleaked total, so a shrunken
-partition can never vote itself a supermajority) and the **leak recovery**
-(the accumulator decreases again once finality resumes, so ejection is no
-longer permanent). Below 2700 the shipped arithmetic is byte-identical to what
-every binary has run since Genesis-4 launch; the change is invisible until the
-armed epoch and total at it.
+The epoch-2700 deadline, selected on September 6, was missed by the legacy
+signing fleet. Seven-host inspection on September 13 found the same older
+binary throughout. A keyless replay of 63,683 canonical input blocks with the
+epoch-2700 candidate accepted only 63,234, stopping at slot 86,431. It did not
+know the operator-approved epoch-2713 checkpoint. Reusing 2700 would change
+already committed history and does not implement the approved recovery.
 
-Measured effect (prova.rs, scenario 0 pair): with the gates open, all three
-incident partitions fail to finalize over the full horizon — the exact
-behaviour the floor buys. `s0_three_partitions_finalize_three_different_roots`
-describes the pre-2700 arithmetic; `s0_cure_the_denominator_floor_stops_all
-_three_partitions` describes the post-2700 arithmetic.
+The replacement keeps historical arithmetic before 2880 and applies the same
+leak-recovery and **one-half denominator floor** policy prospectively. It does
+not select a new genesis, erase signing watermarks, change the floor to another
+fraction, or enable legacy unfunded deposit/delegation. Exact-history control
+replay and release qualification are recorded in the
+[activation preflight](audit/VALIDATOR-ACTIVATION-PREFLIGHT-2026-09-13.md).
+The test `leak_recovery_armed_epoch_matches_the_runbook` pins this replacement.
 
-## Why this epoch
+## Rules at the boundary
 
-- **Strictly in the future at tag time** (tripwire requirement 1): armed at
-  ~epoch 2075, binds at 2700 — 625 epochs of margin. An epoch already past
-  would arm silently against the whole history.
-- **After the rollout completes** (requirement 2): ≈6 days at 90 epochs/day.
-  The fleet is 64 validators on 7 hosts; the 2026-08-30/31 migration moved all
-  64 in under two days, so 6 days is 3× the demonstrated rollout time.
-- **Matches this runbook** (requirement 3): 2700, here and in
-  `params.rs::LEAK_RECOVERY_ACTIVATION_EPOCH`.
+At the configured boundary, quorum accounting uses the approved denominator
+floor and finalized progress can recover previously leaked balances. Both are
+committed consensus behavior; this cannot be changed by a runtime option.
+Every validator and serving archival must carry the same schedule beforehand.
+A fleet divided between old and new schedules can compute different roots.
 
-## Deployment deadline — the one hard rule
+The `prova.rs` scenario tests show that the floor prevents the particular
+small partitions in the August 24 reproduction from justifying independently.
+They do **not** prove that every partition becomes safe. The residual
+conflicting-quorum limitation of the founder-selected one-half floor remains
+as documented in `finality.rs`. Scheduling evidence penalties at lifecycle
+epoch 2884 on 2026-09-14 does not turn a local finalized label into a universal
+settlement guarantee.
 
-**Every validator MUST be running a binary carrying this constant BEFORE
-epoch 2700.** At the boundary, an armed binary and an un-armed binary compute
-different quorum denominators and therefore justify different checkpoints: a
-fleet split across the two DIVERGES. There is no partial rollout; this is a
-flag day.
+## Release and rollout
 
-Rollout order (same procedure as `LEAKED-ROSTER-FLAG-DAY.md`, which rolled
-E=1400 successfully):
+1. Verify exact replay against the approved history and qualify the candidate
+   with the actual finite schedule. Include the corrected post-replay
+   duplicate-instance observation and durable signing protection.
+2. Record the source revision, complete patch, build provenance and binary
+   digest. Distribute an immutable artifact and verify it on each host.
+3. Recover canary 35 first. Preserve its own key and signing protection,
+   stop every old instance before replacement, and retain conflicting public
+   history. Never borrow a donor's key or signing journal.
+4. Validate canary recovery and duties, then migrate in the approved batches
+   of 11, 11, 11, 11, 10 and 10, retaining the seven-server placement. Before
+   each batch, recheck available effective stake, including already absent
+   validators. Healthy nodes retain their canonical histories.
+5. Activate the existing correct key for validator 63 on HOST-006; leave its
+   inactive classic copy fenced. The placement becomes ten validators on
+   HOST-006 and nine on each other host.
+6. Verify all 64 signers and both archivals, independent finalized checkpoints,
+   and at least three epochs of consistent progress. Complete this before
+   epoch 2880. A scheduled constant alone is not fleet readiness.
+7. Watch finality and roots across 2880, then across lifecycle epoch 2884.
+   Keep the real withdrawal delay unchanged. Broad external-validator opening
+   requires the controlled withdrawal-and-spend evidence specified by ADR-041.
 
-1. Build the release binary from the armed commit; record its hash.
-2. Distribute to all 7 hosts; verify the hash on each box.
-3. Restart the validators host by host (`bloch-nNN` units), confirming each
-   node rejoins, replays, and attests before moving to the next host.
-4. All 64 restarted and attesting = rollout complete. Confirm well before
-   epoch 2700 (target: ≥1 day of margin).
-5. At epoch 2700, watch the first boundaries: finalized epoch must keep
-   advancing; `leaked` accumulators begin to DECREASE for recovering
-   validators (the recovery half), and no minority partition may justify.
+## Incomplete rollout or disagreement
 
-## What to watch afterwards
-
-- Finality continuity across the 2700 boundary (finalized epoch advancing).
-- Leak accumulators shrinking for validators that resumed attesting.
-- No divergence between nodes (same finalized root at the same epoch on
-  independent nodes — the 2026-08-24 failure mode this closes).
-
-## Relationship to the other constants
-
-`LEAKED_ROSTER_ACTIVATION_EPOCH` (1400, long bound) armed the half that
-REMOVES weight; this flag day arms the half that GIVES IT BACK plus the floor
-that makes partitions safe. The two were designed to move together; from 2700
-they finally do. `ANCESTRY_SEED_ACTIVATION_EPOCH` remains `u64::MAX` (inert)
-and keeps its own tripwire.
+Do not let a partially upgraded fleet cross either finite boundary. If the
+qualification or available time is insufficient, prepare and verify a common
+later schedule and replace every installed candidate **before** its existing
+boundary. Record the new decision and each node's acceptance. Never assume a
+pre-boundary binary is a safe rollback after a boundary has been crossed.

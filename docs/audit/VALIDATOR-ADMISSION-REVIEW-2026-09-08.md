@@ -1,5 +1,11 @@
 # Validator admission: focused second-pass review
 
+Historical review: the findings below apply to `6e4b5323`. Commit `21a9311`
+subsequently implemented the unarmed lifecycle, finalized-funding activation,
+state-aware mempool admission and trusted-manifest signing. See the current
+[opening checklist](../VALIDATOR-OPENING.md) for remaining release evidence.
+This note does not change the original review or claim mainnet activation.
+
 Reviewed base: `6e4b5323ed40631a8c847fa06bbb4c4eab38acbd`, the merge of PR #6.
 Its tree is identical to PR head `1fb019b678d249bd41378461c270d5467024c7aa`.
 Scope: funded registration, transaction authorization, accounting, mempool

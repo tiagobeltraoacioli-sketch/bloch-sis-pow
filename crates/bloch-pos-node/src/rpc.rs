@@ -1789,145 +1789,26 @@ pub fn chain_info_json(
 
 /// How a block stands relative to this node's own checkpoints.
 ///
-/// # This is the field an exchange reads — and what it does NOT buy
+/// The coordinated release schedules lifecycle epoch 2884 for 2026-09-14
+/// 22:35:19 UTC. Before that epoch, slashing evidence is consensus-invalid.
+/// At and after it, valid evidence can apply the configured penalties. A
+/// scheduled source constant does not prove that deployed nodes have upgraded,
+/// that a particular proof was included, or that a payment has settled.
 ///
-/// The integration question was "how many confirmations should we require, and
-/// what does the guarantee rest on". Under PoS there is no answer in that
-/// currency: depth is not security (R1), and a chain with no difficulty cannot
-/// price a reorg in work. [`Finality::Finalized`] is the right field to read.
-/// What it rests on is far narrower than an earlier revision of this comment
-/// claimed, and the difference is the one that decides customer money.
+/// Historical retraction: an earlier revision said "Credit here" and called
+/// finality "economic by intent and cryptographic by nothing". Neither slogan
+/// describes the scheduled release. The node's finalized latch refuses a
+/// protocol reorg below its own finalized checkpoint. It does not establish
+/// agreement between independent nodes or a universal one-third-stake cost.
+/// The one-half quorum-denominator floor retains the limitations documented
+/// in `finality.rs`; an epoch schedule does not remove them.
 ///
-/// ## RETRACTION (2026-09-01): finality here is NOT backed by a slashing cost
-///
-/// This comment used to say that "a finalised checkpoint cannot be reverted
-/// unless at least one third of the total stake is slashed, which is a bonded,
-/// attributable, on-chain cost rather than a probabilistic one", and
-/// [`Finality::Finalized`] used to be annotated "Credit here". That is
-/// Casper's guarantee on paper. It is not this binary's. **No stake on
-/// Genesis-4 can be slashed at all**, for four independent reasons, any one of
-/// which is sufficient on its own:
-///
-/// 1. **Evidence could not be decoded — CORRECTED 2026-09-05: it decodes,
-///    and the block is still refused.** As first stated,
-///    `PosTransaction::from_canonical_bytes` returned
-///    `TxDecodeError::EvidenceNotDecodable` for wire tag `0x05`
-///    unconditionally, with no gate: the encoder folded the nested messages
-///    in as the signing roots they were signed over — hashes — so the
-///    envelopes were unrecoverable by construction (Round-2 finding F-02).
-///    The codec now carries both envelopes whole and decodes them, and what
-///    refuses the transaction moved from the decoder to the transition:
-///    every epoch below `SLASHING_EVIDENCE_ACTIVATION_EPOCH` answers
-///    `TxReject::EvidenceNotActive`. Break 1 is closed as a wire format;
-///    break 4 (the unarmed flag day) is now the load-bearing one.
-/// 2. **That decoder is the only one on every ingress path**: block body,
-///    gossip and `sendrawtransaction`. Before 2026-09-05 that meant a block
-///    carrying evidence was rejected by every peer at decode; it now means
-///    every ingress path reaches the same transition gate, and the released
-///    fleet binaries — which predate the format — still refuse at decode.
-///    Either way a proposer that included evidence today would produce a
-///    block its peers refuse.
-/// 3. ADR-041 connects observed proposer/attestation evidence to ordinary
-///    admission. The node reports a refusal while activation remains disabled;
-///    implementing the observation hook does not activate penalties.
-/// 4. **The activation constant exists on this lineage and is not armed.**
-///    An earlier draft of this break said no such constant existed on the
-///    release lineage, while one sat off-lineage at `d21c3370:params.rs:638`.
-///    Since 2026-09-05 `SLASHING_EVIDENCE_ACTIVATION_EPOCH` is defined in
-///    `bloch-pos-committee::params`, value exactly `u64::MAX`: no epoch any
-///    chain reaches activates it, so there is no flag day SCHEDULED — but
-///    there is now, for the first time on this lineage, a flag day to
-///    schedule. Arming it is a founder decision with a hard precondition
-///    (full fleet rollout of the evidence decoder), and until that day this
-///    break keeps the retraction below in force on its own.
-///
-/// Read from the live chain on 2026-09-02 at height 34,665, epoch 1736, from
-/// two keyless archival observers whose responses were byte-for-byte
-/// identical: `getvalidatorcount` 64 total and 64 active; zero records with
-/// `"slashed": true`; zero with a non-null `"exit_epoch"`; 64 of 64 in state
-/// `active`. Equivocation on this fleet is *detected* — the node captures each
-/// pair and logs it — and none of it has ever been prosecuted.
-///
-/// The scale of that is larger than the registry can show. Replay of
-/// `blocks.log` puts **48 validators** with provable double-signing, derived
-/// seven independent ways: two forensic pipelines written separately (one
-/// producing the pair table with slot, both roots, and the blocks carrying
-/// each half), the committed state reproduced, and six independently kept
-/// logs deriving the same set in slot order. The two indices recorded in
-/// `deploy/FLAG-DAY-EPOCH-800.md` (16 and 35) are *within* that set — an
-/// earlier incident, not a competing count.
-///
-/// **Do not put that number in integrator-facing material.** Not because it is
-/// doubtful, but because no RPC method exposes equivocation evidence, so the
-/// recipient has no way to check it: every one of those 48 reads
-/// `"slashed": false`, and the registry an exchange can query will agree with
-/// the retraction while disagreeing with the forensics. A figure the reader
-/// cannot verify does not belong in a document they are meant to act on.
-/// Nothing above depends on it. `slashing.rs` is complete; nothing reaches it
-/// below the unarmed flag day.
-///
-/// So Genesis-4 finality today is **economic by intent and cryptographic by
-/// nothing**. Reverting a finalised checkpoint costs an attacker no bonded
-/// stake — only the coordination of the validators who would have to do it.
-///
-/// ## What an integrator can actually rely on
-///
-/// `Finalized` still carries real information: it is this node's own
-/// judgement, computed from a chain it validated itself, and it is strictly
-/// stronger than `Justified` or `Canonical`. It is not a settlement guarantee.
-/// Three limits bound it, and they compound:
-///
-/// - **No slashing cost**, per the retraction above.
-/// - **`finalized` is not a latch.** It has been measured *descending* across
-///   reorgs that break no rule: fork choice walks from the *justified* root
-///   and the state committed there finalises two epochs below the head, so the
-///   deepest cut the algorithm may legitimately propose is itself a finality
-///   rewind (finalized epoch 6 -> 4 -> 2 -> 0 in three in-rules cuts).
-/// - **The quorum denominator has no floor until epoch 2700.** It is
-///   leak-adjusted unconditionally today; the floor and the recovery rule are
-///   written and gated behind `LEAK_RECOVERY_ACTIVATION_EPOCH`, which was
-///   **armed at epoch 2_700 (2026-09-12 21:31 UTC)** — an earlier revision of
-///   this note said `u64::MAX`, which was true when written and is not any
-///   more (`bloch-pos-committee/src/params.rs`, `LEAK_RECOVERY_ACTIVATION_EPOCH`).
-///   Below 2700 a partitioned minority holding 6.25% of stake has been shown
-///   to self-finalise once the absent majority leaked away. The per-node
-///   finality latch (`Engine::ratchet_finalized`, audit round 3 F-03 and
-///   round 4 M-1) now refuses a downward move of this node's own finalized
-///   checkpoint and counts the refusals in `finality_rewinds_refused`; it is
-///   node-local and does not make finality a cross-node guarantee.
-///
-/// **Current honest guidance**, until this note is withdrawn: credit at
-/// **`finalized` plus a margin** — this note's original figure was 3 epochs;
-/// `SECURITY.md` ("Guidance for integrators", 2026-09-06) and
-/// `docs/integration/BLOCH-G4-TECHNICAL-INTEGRATION-REFERENCE-v2.md` §11.3
-/// now recommend ~30 epochs for large or irreversible credits, and are the
-/// documents to hand an integrator — require **two independently
-/// operated nodes to agree on the same finalized root AND epoch** — the epoch
-/// alone is not enough — and **re-verify immediately before releasing funds**.
-/// Two nodes agreeing does not mitigate the rewind, because both rewind
-/// independently; it catches divergence, which is a different failure. The
-/// margin of 3 bounds a single legal cut with one epoch to spare. It does not
-/// bound a repeated ratchet: **no depth is provably safe today**, and saying
-/// so is worth more than quoting a number that sounds like it is. This is the
-/// same rule as `docs/integration/BLOCH-GENESIS4-EXCHANGE-INTEGRATION.md` §5,
-/// and that document is the one an integrator should be handed.
-///
-/// There is no machine-readable form of this note on this release: the node
-/// serves no `getcapabilities` method, so a client cannot branch on a
-/// `slashing_enforced` flag and must be told in prose. Do not synthesise one.
-///
-/// This note is withdrawn when evidence has a wire shape that survives the
-/// codec, the slashing path is reachable from the network and armed, the
-/// finality latch ships, and the denominator floor is armed. The promise
-/// returning and enforcement arriving are kept in step by
-/// `tests/slashing_backed_finality_claims.rs`, which fails either way round.
-///
-/// One caveat, stated because it bounds the guarantee: this is **this node's**
-/// view, computed from the chain it has validated itself. That is the property
-/// an integrator wants — it means the answer does not depend on trusting the
-/// producer, and it is why running your own node and reading its RPC is the
-/// correct deployment. It also means a node that is not synced reports its own
-/// staleness, which `getchaininfo`'s `behind_by_slots` is there to expose.
+/// `finalized: true` is this node's classification, not a settlement guarantee.
+/// Compare the release and independent finalized checkpoints, and follow the
+/// controlled withdrawal-and-spend qualification in ADR-041 before broad
+/// external-validator opening. Historical retractions in the integration
+/// documents apply to the earlier unarmed release.
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Finality {
     /// At or below the finalised checkpoint. The strongest classification
@@ -1935,8 +1816,8 @@ pub enum Finality {
     /// the answering node: the engine refuses any reorg below its own
     /// highest finalized checkpoint, so a block this node once reported
     /// `finalized` never later leaves ITS canonical chain. It is still
-    /// backed by no slashing cost (none can be applied on this network), so
-    /// it is not an economic guarantee across nodes. Read the retraction on
+    /// not an economic guarantee across nodes. Evidence is refused before
+    /// lifecycle epoch 2884 and protocol-gated afterwards. Read the status on
     /// [`Finality`] before crediting anything on it.
     Finalized,
     /// At or below the justified checkpoint but above the finalised one. One
@@ -2110,8 +1991,8 @@ pub fn submitted_json(tx: &PosTransaction, outcome: Admitted) -> Json {
                 "this transport does not confirm: watch for the transaction in a \
                  block via `getblockbyslot`. `finalized: true` on that block is \
                  the strongest signal this chain offers, but it is NOT a \
-                 settlement guarantee — no slashing penalty backs it and it is \
-                 not a latch; see `docs/integration/\
+                 settlement guarantee across nodes; evidence penalties depend on \
+                 the activated protocol rules. See `docs/integration/\
                  BLOCH-GENESIS4-EXCHANGE-INTEGRATION.md` \u{a7}5",
             ),
         ),

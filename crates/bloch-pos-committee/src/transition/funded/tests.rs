@@ -131,8 +131,12 @@ fn funded_decoder_bounds_lengths_before_allocating() {
 }
 
 #[test]
-fn funded_gate_is_closed_even_at_maximum_epoch_and_legacy_stays_closed() {
-    assert!(!crate::params::funded_validator_admission_active(u64::MAX));
+fn funded_gate_obeys_the_scheduled_boundary_and_legacy_stays_closed() {
+    let gate = crate::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH;
+    assert!(!crate::params::funded_validator_admission_active(gate - 1));
+    assert!(crate::params::funded_validator_admission_active(gate));
+    assert!(crate::params::funded_validator_admission_active(u64::MAX));
+    assert!(!CommittedState::unfunded_bonding_active(u64::MAX / crate::params::SLOTS_PER_EPOCH));
     let tx = deposit(22);
     let (_, mut state, _) = fixture(std::slice::from_ref(&tx));
     let root = state.state_root();

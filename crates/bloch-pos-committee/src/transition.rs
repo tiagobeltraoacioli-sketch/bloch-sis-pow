@@ -9165,35 +9165,27 @@ mod tests {
 
     // -- WITHDRAWAL_ACTIVATION_EPOCH (audit R7 M4) ---------------------------
 
-    /// TRIPWIRE. `WITHDRAWAL_ACTIVATION_EPOCH` must stay `u64::MAX` until
-    /// the founder both rules on the withdrawal transaction's wire byte
-    /// (see [`CommittedState::withdrawal_active`]'s docs — this pass could
-    /// not add the `PosTransaction` variant itself, since ANY new variant
-    /// makes the unowned `tests/wire_tag_registry.rs`'s frozen, wildcard-
-    /// free match stop compiling) and arms this constant. Whoever arms it
-    /// deletes this test first, and reads the constant's docs while doing
-    /// so.
+    /// Pin the operator-scheduled ADR-041 release boundary. Moving it requires
+    /// another coordinated release; implementing a decoder alone is insufficient.
     #[test]
-    fn withdrawal_gate_is_inert() {
-        assert_eq!(
-            crate::params::WITHDRAWAL_ACTIVATION_EPOCH,
-            u64::MAX,
-            "arming withdrawal is a flag day gated on a wire-byte ruling; read the constant's docs",
-        );
+    fn withdrawal_gate_matches_the_lifecycle_schedule() {
+        assert_eq!(crate::params::WITHDRAWAL_ACTIVATION_EPOCH, 2_884);
+        assert_eq!(crate::params::WITHDRAWAL_ACTIVATION_EPOCH,
+            crate::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH);
     }
 
-    /// Same shape as every other gate's function-of-the-epoch-alone test —
-    /// pinned even with no call site yet, so the predicate and its
-    /// rehearsal switch cannot silently regress before the day they are
-    /// wired to an actual transaction arm.
+    /// The boundary follows committed block epochs, never an operator clock.
     #[test]
     fn the_withdrawal_gate_is_a_function_of_the_block_epoch_alone() {
-        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1] {
-            assert!(!CommittedState::withdrawal_active(e), "epoch {e} must be below");
+        let gate = crate::params::WITHDRAWAL_ACTIVATION_EPOCH;
+        for epoch in [0, 1, 1_766, gate - 1] {
+            assert!(!CommittedState::withdrawal_active(epoch));
         }
-        assert!(!CommittedState::withdrawal_active(u64::MAX), "unarmed is closed even at the sentinel");
+        for epoch in [gate, gate + 1, u64::MAX] {
+            assert!(CommittedState::withdrawal_active(epoch));
+        }
         let _g = crate::params::rehearsal::withdrawal_gate_open_guard();
-        assert!(CommittedState::withdrawal_active(0), "the rehearsal switch must force it open too");
+        assert!(CommittedState::withdrawal_active(0));
     }
 
     // -- SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH (audit A2-3 / R7 M2) -------
@@ -9858,61 +9850,36 @@ mod tests {
 
     // -- EXIT_AUTH_ACTIVATION_EPOCH -----------------------------------------
 
-    /// TRIPWIRE. `EXIT_AUTH_ACTIVATION_EPOCH` must stay `u64::MAX`.
-    ///
-    /// Arming it retires the legacy `Exit` message on every node — and puts
-    /// nothing in its place, because `ExitV2`'s wire byte (`0x08`) is still
-    /// contested and this tree's decoder refuses it. Voluntary exit would stop
-    /// existing rather than become authenticated. Whoever arms it has to
-    /// delete this test first, and read this while doing so.
+    /// Pin the operator-scheduled ADR-041 release boundary. Moving it requires
+    /// another coordinated release; implementing a decoder alone is insufficient.
     #[test]
-    fn exit_auth_gate_is_inert() {
-        assert_eq!(
-            crate::params::EXIT_AUTH_ACTIVATION_EPOCH,
-            u64::MAX,
-            "arming this retires legacy Exit while ExitV2 is still undecodable; read the docs",
-        );
+    fn exit_auth_gate_matches_the_lifecycle_schedule() {
+        assert_eq!(crate::params::EXIT_AUTH_ACTIVATION_EPOCH, 2_884);
+        assert_eq!(crate::params::EXIT_AUTH_ACTIVATION_EPOCH,
+            crate::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH);
     }
 
     // -- SLASHING_EVIDENCE_ACTIVATION_EPOCH ---------------------------------
 
-    /// TRIPWIRE. `SLASHING_EVIDENCE_ACTIVATION_EPOCH` must stay `u64::MAX`
-    /// until the founder schedules the flag day.
-    ///
-    /// Arming it is not a code change, it is a NETWORK change with a hard
-    /// precondition: every node must already run a binary whose decoder
-    /// understands the tag-0x05 evidence wire format. Below the gate old and
-    /// new binaries agree on every block (both refuse one carrying evidence —
-    /// one at its decoder, one at the transition); the first post-gate block
-    /// that carries evidence is accepted only by nodes that can decode it, so
-    /// arming ahead of a complete rollout forks the fleet exactly the way the
-    /// 2026-08-08 `expected_bits` divergence did. Same discipline as
-    /// `LEAK_RECOVERY_ACTIVATION_EPOCH`: rollout first, flag day second.
-    /// Whoever arms it has to delete this test, and read this while doing so.
+    /// Pin the operator-scheduled ADR-041 release boundary. Moving it requires
+    /// another coordinated release; implementing a decoder alone is insufficient.
     #[test]
-    fn slashing_evidence_gate_is_inert() {
-        assert_eq!(
-            crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH,
-            u64::MAX,
-            "arming this activates §7.3 slashing network-wide and needs a full \
-             fleet rollout of the evidence decoder first; read the test docs",
-        );
+    fn slashing_evidence_gate_matches_the_lifecycle_schedule() {
+        assert_eq!(crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH, 2_884);
+        assert_eq!(crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH,
+            crate::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH);
     }
 
-    /// Same shape as the deposit gate's test: the verdict is a function of
-    /// the BLOCK's committed epoch and the constant, and of nothing else —
-    /// two nodes handed the same block cannot disagree about it.
+    /// Evidence becomes admissible at the committed lifecycle epoch only.
     #[test]
     fn the_evidence_gate_is_a_function_of_the_block_epoch_alone() {
-        for e in [0u64, 1, 1_766, 2_700, 100_000, u64::MAX - 1] {
-            assert!(
-                !CommittedState::slashing_evidence_active(e),
-                "epoch {e} must be below the inert gate",
-            );
+        let gate = crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH;
+        for epoch in [0, 1, 1_766, 2_700, gate - 1] {
+            assert!(!CommittedState::slashing_evidence_active(epoch));
         }
-        // Reached only by moving the constant, which
-        // `slashing_evidence_gate_is_inert` forbids — covered, not open.
-        assert!(!CommittedState::slashing_evidence_active(u64::MAX));
+        for epoch in [gate, gate + 1, u64::MAX] {
+            assert!(CommittedState::slashing_evidence_active(epoch));
+        }
     }
 
     /// The unauthenticated message is STILL VALID today. This is the control
@@ -9952,25 +9919,13 @@ mod tests {
 
     // -- RANDAO_RECOMMIT_ACTIVATION_EPOCH (H-R7-1) --------------------------
 
-    /// TRIPWIRE. `RANDAO_RECOMMIT_ACTIVATION_EPOCH` must stay `u64::MAX`.
-    ///
-    /// Arming it activates the re-commit rules on every node — and today
-    /// nothing on the wire can reach them, because the transaction's byte
-    /// (`0x0A`) is still unassigned and this tree's decoder refuses it.
-    /// Arming is the founder's, it is TWO decisions (the byte and the flag
-    /// day), and unlike every other gate in this file it has a deadline:
-    /// both must land, fleet rebuilt, before the first RANDAO chain
-    /// exhausts (~2027-02-11), or proposal liveness decays validator by
-    /// validator. Whoever arms it has to delete this test first, and read
-    /// this while doing so.
+    /// Pin the operator-scheduled ADR-041 release boundary. Moving it requires
+    /// another coordinated release; implementing a decoder alone is insufficient.
     #[test]
-    fn randao_recommit_gate_is_inert() {
-        assert_eq!(
-            crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH,
-            u64::MAX,
-            "arming this activates re-commit rules whose wire byte is still \
-             unassigned; the ruling and the decoder arm must land together — read the docs",
-        );
+    fn randao_recommit_gate_matches_the_lifecycle_schedule() {
+        assert_eq!(crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH, 2_884);
+        assert_eq!(crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH,
+            crate::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH);
     }
 
     /// Build the signed re-commit a validator would actually send, under
@@ -13901,23 +13856,11 @@ mod tests {
         }
     }
 
-    /// Armed on 2026-09-06 at epoch 2700 (founder decision; chain was at
-    /// ~epoch 2075, ≈6 days of lead for the coordinated fleet rollout).
-    ///
-    /// Until then this constant sat in
-    /// `the_replay_compatibility_gates_are_inert_until_armed` pinned at
-    /// `u64::MAX`. Arming flips the tripwire's job, not its nature — exactly as
-    /// `leaked_roster_armed_epoch_matches_the_runbook` above: it now guards
-    /// against a SECOND silent change of the epoch, which would be a new flag
-    /// day needing its own fleet rollout, announcement and runbook. The value
-    /// here must equal the one recorded in `docs/LEAK-RECOVERY-FLAG-DAY.md`.
+    /// The missed epoch-2700 deadline is replaced prospectively, preserving
+    /// the approved epoch-2713 history. See docs/LEAK-RECOVERY-FLAG-DAY.md.
     #[test]
     fn leak_recovery_armed_epoch_matches_the_runbook() {
-        assert_eq!(
-            crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH,
-            2_700,
-            "the armed epoch must match docs/LEAK-RECOVERY-FLAG-DAY.md; changing it again is a new flag day"
-        );
+        assert_eq!(crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH, 2_880);
     }
 
     /// Below its flag day, `seed_for_epoch` must be the ORIGINAL rule, mix of

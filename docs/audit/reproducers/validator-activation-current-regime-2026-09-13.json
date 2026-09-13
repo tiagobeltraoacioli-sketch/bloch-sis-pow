@@ -1,0 +1,1188 @@
+{
+  "date_utc": "2026-09-13",
+  "source_commit": "4eec48b",
+  "regime": "Existing finite gates at epoch 1, ADR-041 gates at epoch 4; other unarmed gates unchanged.",
+  "boundary_and_compatibility": {
+    "status": "passed",
+    "activation_epoch": 4,
+    "regime": "finite shipping gates compressed to epoch one",
+    "source_commit": "4eec48be5bb063969e148c6986dc356698a35492",
+    "shipping_params_sha256": "b51409e4dd3df6f05d79cd0e95f73773fdb5d59fddc82929edbd31eb5051725e",
+    "completed": [
+      "finite-boundary-and-replay",
+      "unarmed-build-pre-activation-compatibility"
+    ],
+    "network": false,
+    "shipping_source_unchanged": true
+  },
+  "params_diff": "--- shipping/params.rs\n+++ devnet/params.rs\n@@ -364,7 +364,7 @@\n /// a literal `1400` in the test source \u2014 a copy of itself. That catches a\n /// SILENT change of the epoch. It cannot catch the epoch having been wrong from\n /// the start, which is exactly what happened here and why this note exists.\n-pub const LEAKED_ROSTER_ACTIVATION_EPOCH: u64 = 1400;\n+pub const LEAKED_ROSTER_ACTIVATION_EPOCH: u64 = 1;\n \n /// Flag-day epoch at which the deduplicated transfer format (`TransferV2`,\n /// wire tag `0x06`) becomes acceptable in blocks.\n@@ -414,7 +414,7 @@\n /// epoch (`CommittedState::epoch`, already rolled to the block's epoch),\n /// never node-local state \u2014 the 2026-08-08 `expected_bits` fork is the\n /// standing reason.\n-pub const TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH: u64 = 800;\n+pub const TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH: u64 = 1;\n \n /// Flag day for the 512 KiB block payload cap\n /// ([`crate::fee_market::MAX_BLOCK_TX_BYTES_V2`]).\n@@ -440,7 +440,7 @@\n /// [`LEAKED_ROSTER_ACTIVATION_EPOCH`], and the gate reads the epoch derived\n /// from the block's own header slot \u2014 never node-local state, which is what\n /// the 2026-08-08 `expected_bits` fork cost us.\n-pub const BLOCK_BYTES_V2_ACTIVATION_EPOCH: u64 = 800;\n+pub const BLOCK_BYTES_V2_ACTIVATION_EPOCH: u64 = 1;\n \n /// **Superseded \u2014 read [`ANCESTRY_SEED_ACTIVATION_EPOCH`] below instead.**\n ///\n@@ -1204,7 +1204,7 @@\n /// BEFORE epoch 2700. A fleet split across old/new binaries at that boundary\n /// diverges \u2014 this is a flag day, and the coordinated rebuild is the\n /// operational half of the decision.\n-pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = 2_700;\n+pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = 1;\n \n /// Flag day for **unfunded bonding**: the epoch at and after which the legacy\n /// `Deposit` and `Delegate` messages are valid. Below it they are refused by\n@@ -1342,7 +1342,7 @@\n /// place: voluntary exit would simply stop existing.\n ///\n /// `exit_auth_gate_is_inert` pins the value.\n-pub const EXIT_AUTH_ACTIVATION_EPOCH: u64 = u64::MAX;\n+pub const EXIT_AUTH_ACTIVATION_EPOCH: u64 = 4;\n \n /// Flag day for the **fee-to-stake decoupling** (finding C-R2-2, 2026-09-05).\n ///\n@@ -1422,7 +1422,7 @@\n /// decode it. Same rollout discipline as `LEAKED_ROSTER_ACTIVATION_EPOCH`.\n ///\n /// `slashing_evidence_gate_is_inert` pins the value.\n-pub const SLASHING_EVIDENCE_ACTIVATION_EPOCH: u64 = u64::MAX;\n+pub const SLASHING_EVIDENCE_ACTIVATION_EPOCH: u64 = 4;\n \n /// **Flag day for the transfer dust rule \u2014 SHIPS INERT (`u64::MAX`).**\n ///\n@@ -1514,7 +1514,7 @@\n /// validator by validator.\n ///\n /// `randao_recommit_gate_is_inert` pins the value.\n-pub const RANDAO_RECOMMIT_ACTIVATION_EPOCH: u64 = u64::MAX;\n+pub const RANDAO_RECOMMIT_ACTIVATION_EPOCH: u64 = 4;\n \n /// Flag day for the **declared-size ceiling** on transfers (audit H-R7-2,\n /// 2026-09-05): at and above this epoch, a `Transfer`/`TransferV2` whose\n@@ -1823,7 +1823,7 @@\n /// Withdrawal pays the registered script, writes off unissued genesis\n /// principal, and consumes block capacity even with legacy metering disabled.\n /// Arming requires the release ceremony and rehearsals in ADR-041.\n-pub const WITHDRAWAL_ACTIVATION_EPOCH: u64 = u64::MAX;\n+pub const WITHDRAWAL_ACTIVATION_EPOCH: u64 = 4;\n \n /// Flag day for **network-bound transfer signing** (audit A2-3 / R7 M2,\n /// 2026-09-06): `u64::MAX` = INERT, below it `DS_SPEND`'s preimage is\n@@ -1968,7 +1968,7 @@\n /// Independent flag day for funded validator admission (wire 0x0B).\n /// Deliberately unarmed pending a coordinated consensus release. This never\n /// enables the unfunded legacy Deposit/Delegate formats. No runtime override.\n-pub const FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH: u64 = u64::MAX;\n+pub const FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH: u64 = 4;\n \n pub fn funded_validator_admission_active(epoch: u64) -> bool {\n     #[cfg(test)]\n",
+  "network": {
+    "control": {
+      "rpc_snapshots": {
+        "phase1-mesh": [
+          {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+              "block_id": "16909676be2d3fc8f65aaa2c017b44b4662baaf35355d6ad97ece25558ce0c1a",
+              "slot": 29,
+              "height": 29,
+              "finalized_height": 0,
+              "epoch": 0,
+              "slot_in_epoch": 29,
+              "slots_per_epoch": 32,
+              "state_root": "bb917f24b2df7858e77f7a5c1dc8bbd3abba637514aefa7d962e63d0290e4490",
+              "justified": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "finalized": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "previous_justified": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "validators": {
+                "total": 4,
+                "active": 4
+              },
+              "total_active_stake_sat": "140000000000000",
+              "base_fee_millisat_per_gas": "10",
+              "next_base_fee_millisat_per_gas": "10",
+              "mempool": 0,
+              "blocks_known": 29,
+              "wall_slot": 29,
+              "behind_by_slots": 0,
+              "transport": {
+                "name": "devnet",
+                "peers": {
+                  "devnet": 6,
+                  "libp2p": null
+                }
+              }
+            }
+          },
+          {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+              "block_id": "16909676be2d3fc8f65aaa2c017b44b4662baaf35355d6ad97ece25558ce0c1a",
+              "slot": 29,
+              "height": 29,
+              "finalized_height": 0,
+              "epoch": 0,
+              "slot_in_epoch": 29,
+              "slots_per_epoch": 32,
+              "state_root": "bb917f24b2df7858e77f7a5c1dc8bbd3abba637514aefa7d962e63d0290e4490",
+              "justified": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "finalized": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "previous_justified": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "validators": {
+                "total": 4,
+                "active": 4
+              },
+              "total_active_stake_sat": "140000000000000",
+              "base_fee_millisat_per_gas": "10",
+              "next_base_fee_millisat_per_gas": "10",
+              "mempool": 0,
+              "blocks_known": 29,
+              "wall_slot": 29,
+              "behind_by_slots": 0,
+              "transport": {
+                "name": "devnet",
+                "peers": {
+                  "devnet": 6,
+                  "libp2p": null
+                }
+              }
+            }
+          },
+          {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+              "block_id": "16909676be2d3fc8f65aaa2c017b44b4662baaf35355d6ad97ece25558ce0c1a",
+              "slot": 29,
+              "height": 29,
+              "finalized_height": 0,
+              "epoch": 0,
+              "slot_in_epoch": 29,
+              "slots_per_epoch": 32,
+              "state_root": "bb917f24b2df7858e77f7a5c1dc8bbd3abba637514aefa7d962e63d0290e4490",
+              "justified": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "finalized": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "previous_justified": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "validators": {
+                "total": 4,
+                "active": 4
+              },
+              "total_active_stake_sat": "140000000000000",
+              "base_fee_millisat_per_gas": "10",
+              "next_base_fee_millisat_per_gas": "10",
+              "mempool": 0,
+              "blocks_known": 29,
+              "wall_slot": 29,
+              "behind_by_slots": 0,
+              "transport": {
+                "name": "devnet",
+                "peers": {
+                  "devnet": 6,
+                  "libp2p": null
+                }
+              }
+            }
+          },
+          {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+              "block_id": "16909676be2d3fc8f65aaa2c017b44b4662baaf35355d6ad97ece25558ce0c1a",
+              "slot": 29,
+              "height": 29,
+              "finalized_height": 0,
+              "epoch": 0,
+              "slot_in_epoch": 29,
+              "slots_per_epoch": 32,
+              "state_root": "bb917f24b2df7858e77f7a5c1dc8bbd3abba637514aefa7d962e63d0290e4490",
+              "justified": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "finalized": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "previous_justified": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "validators": {
+                "total": 4,
+                "active": 4
+              },
+              "total_active_stake_sat": "140000000000000",
+              "base_fee_millisat_per_gas": "10",
+              "next_base_fee_millisat_per_gas": "10",
+              "mempool": 0,
+              "blocks_known": 29,
+              "wall_slot": 29,
+              "behind_by_slots": 0,
+              "transport": {
+                "name": "devnet",
+                "peers": {
+                  "devnet": 6,
+                  "libp2p": null
+                }
+              }
+            }
+          }
+        ],
+        "phase2": [
+          {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+              "block_id": "901036c1ca731559231fce02007938608bee1ee2d5b090cd8161f8914cff672a",
+              "slot": 326,
+              "height": 317,
+              "finalized_height": 246,
+              "epoch": 10,
+              "slot_in_epoch": 6,
+              "slots_per_epoch": 32,
+              "state_root": "4e2a8bc611867c77988b6e3827507567a0f4a02714a7ae813ac37227a4d82633",
+              "justified": {
+                "epoch": 9,
+                "root": "8f30377c1d192baff219f44a139b47e4cde584cdc45ae83a84dbe659ad9f03fe"
+              },
+              "finalized": {
+                "epoch": 8,
+                "root": "1e988610a2e8f1048ee6ac9b4a8bdd8f23c4568b4a468b741fe07d71b94b9c85"
+              },
+              "previous_justified": {
+                "epoch": 8,
+                "root": "1e988610a2e8f1048ee6ac9b4a8bdd8f23c4568b4a468b741fe07d71b94b9c85"
+              },
+              "validators": {
+                "total": 4,
+                "active": 4
+              },
+              "total_active_stake_sat": "245855087201024",
+              "base_fee_millisat_per_gas": "10",
+              "next_base_fee_millisat_per_gas": "10",
+              "mempool": 0,
+              "blocks_known": 317,
+              "wall_slot": 326,
+              "behind_by_slots": 0,
+              "transport": {
+                "name": "devnet",
+                "peers": {
+                  "devnet": 6,
+                  "libp2p": null
+                }
+              }
+            }
+          },
+          {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+              "block_id": "901036c1ca731559231fce02007938608bee1ee2d5b090cd8161f8914cff672a",
+              "slot": 326,
+              "height": 317,
+              "finalized_height": 246,
+              "epoch": 10,
+              "slot_in_epoch": 6,
+              "slots_per_epoch": 32,
+              "state_root": "4e2a8bc611867c77988b6e3827507567a0f4a02714a7ae813ac37227a4d82633",
+              "justified": {
+                "epoch": 9,
+                "root": "8f30377c1d192baff219f44a139b47e4cde584cdc45ae83a84dbe659ad9f03fe"
+              },
+              "finalized": {
+                "epoch": 8,
+                "root": "1e988610a2e8f1048ee6ac9b4a8bdd8f23c4568b4a468b741fe07d71b94b9c85"
+              },
+              "previous_justified": {
+                "epoch": 8,
+                "root": "1e988610a2e8f1048ee6ac9b4a8bdd8f23c4568b4a468b741fe07d71b94b9c85"
+              },
+              "validators": {
+                "total": 4,
+                "active": 4
+              },
+              "total_active_stake_sat": "245855087201024",
+              "base_fee_millisat_per_gas": "10",
+              "next_base_fee_millisat_per_gas": "10",
+              "mempool": 0,
+              "blocks_known": 317,
+              "wall_slot": 326,
+              "behind_by_slots": 0,
+              "transport": {
+                "name": "devnet",
+                "peers": {
+                  "devnet": 6,
+                  "libp2p": null
+                }
+              }
+            }
+          },
+          {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+              "block_id": "901036c1ca731559231fce02007938608bee1ee2d5b090cd8161f8914cff672a",
+              "slot": 326,
+              "height": 317,
+              "finalized_height": 246,
+              "epoch": 10,
+              "slot_in_epoch": 6,
+              "slots_per_epoch": 32,
+              "state_root": "4e2a8bc611867c77988b6e3827507567a0f4a02714a7ae813ac37227a4d82633",
+              "justified": {
+                "epoch": 9,
+                "root": "8f30377c1d192baff219f44a139b47e4cde584cdc45ae83a84dbe659ad9f03fe"
+              },
+              "finalized": {
+                "epoch": 8,
+                "root": "1e988610a2e8f1048ee6ac9b4a8bdd8f23c4568b4a468b741fe07d71b94b9c85"
+              },
+              "previous_justified": {
+                "epoch": 8,
+                "root": "1e988610a2e8f1048ee6ac9b4a8bdd8f23c4568b4a468b741fe07d71b94b9c85"
+              },
+              "validators": {
+                "total": 4,
+                "active": 4
+              },
+              "total_active_stake_sat": "245855087201024",
+              "base_fee_millisat_per_gas": "10",
+              "next_base_fee_millisat_per_gas": "10",
+              "mempool": 0,
+              "blocks_known": 317,
+              "wall_slot": 326,
+              "behind_by_slots": 0,
+              "transport": {
+                "name": "devnet",
+                "peers": {
+                  "devnet": 6,
+                  "libp2p": null
+                }
+              }
+            }
+          },
+          {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+              "block_id": "901036c1ca731559231fce02007938608bee1ee2d5b090cd8161f8914cff672a",
+              "slot": 326,
+              "height": 317,
+              "finalized_height": 246,
+              "epoch": 10,
+              "slot_in_epoch": 6,
+              "slots_per_epoch": 32,
+              "state_root": "4e2a8bc611867c77988b6e3827507567a0f4a02714a7ae813ac37227a4d82633",
+              "justified": {
+                "epoch": 9,
+                "root": "8f30377c1d192baff219f44a139b47e4cde584cdc45ae83a84dbe659ad9f03fe"
+              },
+              "finalized": {
+                "epoch": 8,
+                "root": "1e988610a2e8f1048ee6ac9b4a8bdd8f23c4568b4a468b741fe07d71b94b9c85"
+              },
+              "previous_justified": {
+                "epoch": 8,
+                "root": "1e988610a2e8f1048ee6ac9b4a8bdd8f23c4568b4a468b741fe07d71b94b9c85"
+              },
+              "validators": {
+                "total": 4,
+                "active": 4
+              },
+              "total_active_stake_sat": "245855087201024",
+              "base_fee_millisat_per_gas": "10",
+              "next_base_fee_millisat_per_gas": "10",
+              "mempool": 0,
+              "blocks_known": 317,
+              "wall_slot": 326,
+              "behind_by_slots": 0,
+              "transport": {
+                "name": "devnet",
+                "peers": {
+                  "devnet": 6,
+                  "libp2p": null
+                }
+              }
+            }
+          }
+        ],
+        "phase3-heal": [
+          {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+              "block_id": "f5ef5acbbc25bfaeb0eff4e897b4dcce948ecc3903c4740ea306769df15a6711",
+              "slot": 485,
+              "height": 467,
+              "finalized_height": 397,
+              "epoch": 15,
+              "slot_in_epoch": 5,
+              "slots_per_epoch": 32,
+              "state_root": "a3ef5ccb9562e213926565822691536391d18f1c13e6de8b12d27bba04488f67",
+              "justified": {
+                "epoch": 14,
+                "root": "d1011f5eda4e20591459231f89adac9474f05ecfb59877edc372bd0dd1688c29"
+              },
+              "finalized": {
+                "epoch": 13,
+                "root": "0a6f16fde41b563d3d208dd04dbd2729ae0a36e25ef11d741e398967b25be709"
+              },
+              "previous_justified": {
+                "epoch": 13,
+                "root": "0a6f16fde41b563d3d208dd04dbd2729ae0a36e25ef11d741e398967b25be709"
+              },
+              "validators": {
+                "total": 4,
+                "active": 4
+              },
+              "total_active_stake_sat": "312014516701664",
+              "base_fee_millisat_per_gas": "10",
+              "next_base_fee_millisat_per_gas": "10",
+              "mempool": 0,
+              "blocks_known": 467,
+              "wall_slot": 486,
+              "behind_by_slots": 1,
+              "transport": {
+                "name": "devnet",
+                "peers": {
+                  "devnet": 6,
+                  "libp2p": null
+                }
+              }
+            }
+          },
+          {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+              "block_id": "f5ef5acbbc25bfaeb0eff4e897b4dcce948ecc3903c4740ea306769df15a6711",
+              "slot": 485,
+              "height": 467,
+              "finalized_height": 397,
+              "epoch": 15,
+              "slot_in_epoch": 5,
+              "slots_per_epoch": 32,
+              "state_root": "a3ef5ccb9562e213926565822691536391d18f1c13e6de8b12d27bba04488f67",
+              "justified": {
+                "epoch": 14,
+                "root": "d1011f5eda4e20591459231f89adac9474f05ecfb59877edc372bd0dd1688c29"
+              },
+              "finalized": {
+                "epoch": 13,
+                "root": "0a6f16fde41b563d3d208dd04dbd2729ae0a36e25ef11d741e398967b25be709"
+              },
+              "previous_justified": {
+                "epoch": 13,
+                "root": "0a6f16fde41b563d3d208dd04dbd2729ae0a36e25ef11d741e398967b25be709"
+              },
+              "validators": {
+                "total": 4,
+                "active": 4
+              },
+              "total_active_stake_sat": "312014516701664",
+              "base_fee_millisat_per_gas": "10",
+              "next_base_fee_millisat_per_gas": "10",
+              "mempool": 0,
+              "blocks_known": 467,
+              "wall_slot": 486,
+              "behind_by_slots": 1,
+              "transport": {
+                "name": "devnet",
+                "peers": {
+                  "devnet": 6,
+                  "libp2p": null
+                }
+              }
+            }
+          },
+          {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+              "block_id": "313786639df4b3c24c7533b390bd013543abc86d68966caccb747bc30c2dab5c",
+              "slot": 486,
+              "height": 468,
+              "finalized_height": 397,
+              "epoch": 15,
+              "slot_in_epoch": 6,
+              "slots_per_epoch": 32,
+              "state_root": "1f80cc4e66564aef9f98cdf90d63ed61dbd123bd9cd117cae7c7d45d2989445d",
+              "justified": {
+                "epoch": 14,
+                "root": "d1011f5eda4e20591459231f89adac9474f05ecfb59877edc372bd0dd1688c29"
+              },
+              "finalized": {
+                "epoch": 13,
+                "root": "0a6f16fde41b563d3d208dd04dbd2729ae0a36e25ef11d741e398967b25be709"
+              },
+              "previous_justified": {
+                "epoch": 13,
+                "root": "0a6f16fde41b563d3d208dd04dbd2729ae0a36e25ef11d741e398967b25be709"
+              },
+              "validators": {
+                "total": 4,
+                "active": 4
+              },
+              "total_active_stake_sat": "312014516701664",
+              "base_fee_millisat_per_gas": "10",
+              "next_base_fee_millisat_per_gas": "10",
+              "mempool": 0,
+              "blocks_known": 468,
+              "wall_slot": 486,
+              "behind_by_slots": 0,
+              "transport": {
+                "name": "devnet",
+                "peers": {
+                  "devnet": 6,
+                  "libp2p": null
+                }
+              }
+            }
+          },
+          {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+              "block_id": "313786639df4b3c24c7533b390bd013543abc86d68966caccb747bc30c2dab5c",
+              "slot": 486,
+              "height": 468,
+              "finalized_height": 397,
+              "epoch": 15,
+              "slot_in_epoch": 6,
+              "slots_per_epoch": 32,
+              "state_root": "1f80cc4e66564aef9f98cdf90d63ed61dbd123bd9cd117cae7c7d45d2989445d",
+              "justified": {
+                "epoch": 14,
+                "root": "d1011f5eda4e20591459231f89adac9474f05ecfb59877edc372bd0dd1688c29"
+              },
+              "finalized": {
+                "epoch": 13,
+                "root": "0a6f16fde41b563d3d208dd04dbd2729ae0a36e25ef11d741e398967b25be709"
+              },
+              "previous_justified": {
+                "epoch": 13,
+                "root": "0a6f16fde41b563d3d208dd04dbd2729ae0a36e25ef11d741e398967b25be709"
+              },
+              "validators": {
+                "total": 4,
+                "active": 4
+              },
+              "total_active_stake_sat": "312014516701664",
+              "base_fee_millisat_per_gas": "10",
+              "next_base_fee_millisat_per_gas": "10",
+              "mempool": 0,
+              "blocks_known": 468,
+              "wall_slot": 486,
+              "behind_by_slots": 0,
+              "transport": {
+                "name": "devnet",
+                "peers": {
+                  "devnet": 6,
+                  "libp2p": null
+                }
+              }
+            }
+          }
+        ]
+      },
+      "terminal_logs": {
+        "phase1-mesh": [
+          [
+            "STOP at slot 30: head slot 29, 29 blocks, state root bb917f24b2df7858e77f7a5c1dc8bbd3abba637514aefa7d962e63d0290e4490, justified e0 (9953da73), finalized e0 (9953da73)"
+          ],
+          [
+            "STOP at slot 30: head slot 29, 29 blocks, state root bb917f24b2df7858e77f7a5c1dc8bbd3abba637514aefa7d962e63d0290e4490, justified e0 (9953da73), finalized e0 (9953da73)"
+          ],
+          [
+            "STOP at slot 30: head slot 29, 29 blocks, state root bb917f24b2df7858e77f7a5c1dc8bbd3abba637514aefa7d962e63d0290e4490, justified e0 (9953da73), finalized e0 (9953da73)"
+          ],
+          [
+            "STOP at slot 30: head slot 29, 29 blocks, state root bb917f24b2df7858e77f7a5c1dc8bbd3abba637514aefa7d962e63d0290e4490, justified e0 (9953da73), finalized e0 (9953da73)"
+          ]
+        ],
+        "phase2": [
+          [
+            "STOP at slot 330: head slot 329, 320 blocks, state root afe02ef197fea45bfd00f006d104b3deee36ea387ad32949360d2fdd6163db4f, justified e9 (8f30377c), finalized e8 (1e988610)"
+          ],
+          [
+            "STOP at slot 330: head slot 329, 320 blocks, state root afe02ef197fea45bfd00f006d104b3deee36ea387ad32949360d2fdd6163db4f, justified e9 (8f30377c), finalized e8 (1e988610)"
+          ],
+          [
+            "STOP at slot 330: head slot 329, 320 blocks, state root afe02ef197fea45bfd00f006d104b3deee36ea387ad32949360d2fdd6163db4f, justified e9 (8f30377c), finalized e8 (1e988610)"
+          ],
+          [
+            "STOP at slot 330: head slot 329, 320 blocks, state root afe02ef197fea45bfd00f006d104b3deee36ea387ad32949360d2fdd6163db4f, justified e9 (8f30377c), finalized e8 (1e988610)"
+          ]
+        ],
+        "phase3-heal": [
+          [
+            "STOP at slot 490: head slot 489, 471 blocks, state root 9dc84124f0314a06ecacb43198641994867f6317ca62883e40d8b4b124ba874e, justified e14 (d1011f5e), finalized e13 (0a6f16fd)"
+          ],
+          [
+            "STOP at slot 490: head slot 489, 471 blocks, state root 9dc84124f0314a06ecacb43198641994867f6317ca62883e40d8b4b124ba874e, justified e14 (d1011f5e), finalized e13 (0a6f16fd)"
+          ],
+          [
+            "STOP at slot 490: head slot 489, 471 blocks, state root 9dc84124f0314a06ecacb43198641994867f6317ca62883e40d8b4b124ba874e, justified e14 (d1011f5e), finalized e13 (0a6f16fd)"
+          ],
+          [
+            "STOP at slot 490: head slot 489, 471 blocks, state root 9dc84124f0314a06ecacb43198641994867f6317ca62883e40d8b4b124ba874e, justified e14 (d1011f5e), finalized e13 (0a6f16fd)"
+          ]
+        ]
+      },
+      "verdict": "terminal states agree in all phases; moving RPC samples alone yielded a false negative in the original report"
+    },
+    "split": {
+      "rpc_snapshots": {
+        "phase1-mesh": [
+          {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+              "block_id": "24b07237b1ce94471c62a52eb49256235b3a147ad8916c0bb35e51943ee816be",
+              "slot": 29,
+              "height": 29,
+              "finalized_height": 0,
+              "epoch": 0,
+              "slot_in_epoch": 29,
+              "slots_per_epoch": 32,
+              "state_root": "0051806e94ebd085f447f23969bbc760e831a537433bba7da3bef5a49366a077",
+              "justified": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "finalized": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "previous_justified": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "validators": {
+                "total": 4,
+                "active": 4
+              },
+              "total_active_stake_sat": "140000000000000",
+              "base_fee_millisat_per_gas": "10",
+              "next_base_fee_millisat_per_gas": "10",
+              "mempool": 0,
+              "blocks_known": 29,
+              "wall_slot": 29,
+              "behind_by_slots": 0,
+              "transport": {
+                "name": "devnet",
+                "peers": {
+                  "devnet": 6,
+                  "libp2p": null
+                }
+              }
+            }
+          },
+          {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+              "block_id": "24b07237b1ce94471c62a52eb49256235b3a147ad8916c0bb35e51943ee816be",
+              "slot": 29,
+              "height": 29,
+              "finalized_height": 0,
+              "epoch": 0,
+              "slot_in_epoch": 29,
+              "slots_per_epoch": 32,
+              "state_root": "0051806e94ebd085f447f23969bbc760e831a537433bba7da3bef5a49366a077",
+              "justified": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "finalized": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "previous_justified": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "validators": {
+                "total": 4,
+                "active": 4
+              },
+              "total_active_stake_sat": "140000000000000",
+              "base_fee_millisat_per_gas": "10",
+              "next_base_fee_millisat_per_gas": "10",
+              "mempool": 0,
+              "blocks_known": 29,
+              "wall_slot": 29,
+              "behind_by_slots": 0,
+              "transport": {
+                "name": "devnet",
+                "peers": {
+                  "devnet": 6,
+                  "libp2p": null
+                }
+              }
+            }
+          },
+          {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+              "block_id": "24b07237b1ce94471c62a52eb49256235b3a147ad8916c0bb35e51943ee816be",
+              "slot": 29,
+              "height": 29,
+              "finalized_height": 0,
+              "epoch": 0,
+              "slot_in_epoch": 29,
+              "slots_per_epoch": 32,
+              "state_root": "0051806e94ebd085f447f23969bbc760e831a537433bba7da3bef5a49366a077",
+              "justified": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "finalized": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "previous_justified": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "validators": {
+                "total": 4,
+                "active": 4
+              },
+              "total_active_stake_sat": "140000000000000",
+              "base_fee_millisat_per_gas": "10",
+              "next_base_fee_millisat_per_gas": "10",
+              "mempool": 0,
+              "blocks_known": 29,
+              "wall_slot": 29,
+              "behind_by_slots": 0,
+              "transport": {
+                "name": "devnet",
+                "peers": {
+                  "devnet": 6,
+                  "libp2p": null
+                }
+              }
+            }
+          },
+          {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+              "block_id": "24b07237b1ce94471c62a52eb49256235b3a147ad8916c0bb35e51943ee816be",
+              "slot": 29,
+              "height": 29,
+              "finalized_height": 0,
+              "epoch": 0,
+              "slot_in_epoch": 29,
+              "slots_per_epoch": 32,
+              "state_root": "0051806e94ebd085f447f23969bbc760e831a537433bba7da3bef5a49366a077",
+              "justified": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "finalized": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "previous_justified": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "validators": {
+                "total": 4,
+                "active": 4
+              },
+              "total_active_stake_sat": "140000000000000",
+              "base_fee_millisat_per_gas": "10",
+              "next_base_fee_millisat_per_gas": "10",
+              "mempool": 0,
+              "blocks_known": 29,
+              "wall_slot": 29,
+              "behind_by_slots": 0,
+              "transport": {
+                "name": "devnet",
+                "peers": {
+                  "devnet": 6,
+                  "libp2p": null
+                }
+              }
+            }
+          }
+        ],
+        "phase2": [
+          {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+              "block_id": "c66668a7676279b3eb9cb1ef6e0f9d6fcf75d0ee730c0d8d69b7b12f8dad48e5",
+              "slot": 328,
+              "height": 172,
+              "finalized_height": 0,
+              "epoch": 10,
+              "slot_in_epoch": 8,
+              "slots_per_epoch": 32,
+              "state_root": "4398afc864451bb49e0e6fc3f5ed7671236cc12c059f87a578edd0638a77fe63",
+              "justified": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "finalized": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "previous_justified": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "validators": {
+                "total": 4,
+                "active": 4
+              },
+              "total_active_stake_sat": "193077513873818",
+              "base_fee_millisat_per_gas": "10",
+              "next_base_fee_millisat_per_gas": "10",
+              "mempool": 0,
+              "blocks_known": 172,
+              "wall_slot": 329,
+              "behind_by_slots": 1,
+              "transport": {
+                "name": "devnet",
+                "peers": {
+                  "devnet": 2,
+                  "libp2p": null
+                }
+              }
+            }
+          },
+          {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+              "block_id": "dc792bf7f9a1d3090135b67f567d00d9ac3184619a471076104ec038c54b83df",
+              "slot": 329,
+              "height": 173,
+              "finalized_height": 0,
+              "epoch": 10,
+              "slot_in_epoch": 9,
+              "slots_per_epoch": 32,
+              "state_root": "e31eac85b31ceb1a3a63b8400919fbfe2a71a5f8f8a21f2c26cb8b6ed11b5664",
+              "justified": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "finalized": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "previous_justified": {
+                "epoch": 0,
+                "root": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+              },
+              "validators": {
+                "total": 4,
+                "active": 4
+              },
+              "total_active_stake_sat": "193077513873818",
+              "base_fee_millisat_per_gas": "10",
+              "next_base_fee_millisat_per_gas": "10",
+              "mempool": 0,
+              "blocks_known": 173,
+              "wall_slot": 329,
+              "behind_by_slots": 0,
+              "transport": {
+                "name": "devnet",
+                "peers": {
+                  "devnet": 2,
+                  "libp2p": null
+                }
+              }
+            }
+          },
+          {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+              "block_id": "b65225acd120bdae3a703ab3e5368e6336d051ecf7774eff431e08a19985d553",
+              "slot": 329,
+              "height": 210,
+              "finalized_height": 157,
+              "epoch": 10,
+              "slot_in_epoch": 9,
+              "slots_per_epoch": 32,
+              "state_root": "3476dfc0ce3b52999871b23eebe94317fd540aa9bf50210f83289007887b26ec",
+              "justified": {
+                "epoch": 9,
+                "root": "3cac4efbdac93a96540b4ae474270e4e4f5fcc901853cb76e9086a719a986f85"
+              },
+              "finalized": {
+                "epoch": 8,
+                "root": "0c4e0a39d8ec6947f2f882aa805fdc996edede539ec3ba2b4543838f1c1b05a4"
+              },
+              "previous_justified": {
+                "epoch": 8,
+                "root": "0c4e0a39d8ec6947f2f882aa805fdc996edede539ec3ba2b4543838f1c1b05a4"
+              },
+              "validators": {
+                "total": 4,
+                "active": 4
+              },
+              "total_active_stake_sat": "207630968791193",
+              "base_fee_millisat_per_gas": "10",
+              "next_base_fee_millisat_per_gas": "10",
+              "mempool": 0,
+              "blocks_known": 210,
+              "wall_slot": 329,
+              "behind_by_slots": 0,
+              "transport": {
+                "name": "devnet",
+                "peers": {
+                  "devnet": 2,
+                  "libp2p": null
+                }
+              }
+            }
+          },
+          {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+              "block_id": "b65225acd120bdae3a703ab3e5368e6336d051ecf7774eff431e08a19985d553",
+              "slot": 329,
+              "height": 210,
+              "finalized_height": 157,
+              "epoch": 10,
+              "slot_in_epoch": 9,
+              "slots_per_epoch": 32,
+              "state_root": "3476dfc0ce3b52999871b23eebe94317fd540aa9bf50210f83289007887b26ec",
+              "justified": {
+                "epoch": 9,
+                "root": "3cac4efbdac93a96540b4ae474270e4e4f5fcc901853cb76e9086a719a986f85"
+              },
+              "finalized": {
+                "epoch": 8,
+                "root": "0c4e0a39d8ec6947f2f882aa805fdc996edede539ec3ba2b4543838f1c1b05a4"
+              },
+              "previous_justified": {
+                "epoch": 8,
+                "root": "0c4e0a39d8ec6947f2f882aa805fdc996edede539ec3ba2b4543838f1c1b05a4"
+              },
+              "validators": {
+                "total": 4,
+                "active": 4
+              },
+              "total_active_stake_sat": "207630968791193",
+              "base_fee_millisat_per_gas": "10",
+              "next_base_fee_millisat_per_gas": "10",
+              "mempool": 0,
+              "blocks_known": 210,
+              "wall_slot": 329,
+              "behind_by_slots": 0,
+              "transport": {
+                "name": "devnet",
+                "peers": {
+                  "devnet": 2,
+                  "libp2p": null
+                }
+              }
+            }
+          }
+        ],
+        "phase3-heal": [
+          {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+              "block_id": "0e303f2fd9c7b1401dedd2c065b2c7d7b7291e6189bc6705afc4420d61040634",
+              "slot": 485,
+              "height": 271,
+              "finalized_height": 222,
+              "epoch": 15,
+              "slot_in_epoch": 5,
+              "slots_per_epoch": 32,
+              "state_root": "249860b06c010553a33e38788d398b92a7dda40b71c8d0767b13654674156a9f",
+              "justified": {
+                "epoch": 14,
+                "root": "393263a60dc7141319602d81dfce0c9de699bfb78c0ac38137addb4360cd13ec"
+              },
+              "finalized": {
+                "epoch": 13,
+                "root": "c4366e58b153a34d4b57d4c1669859544e0136c4b46cd2d1fe75c0d72ac932a8"
+              },
+              "previous_justified": {
+                "epoch": 13,
+                "root": "c4366e58b153a34d4b57d4c1669859544e0136c4b46cd2d1fe75c0d72ac932a8"
+              },
+              "validators": {
+                "total": 4,
+                "active": 4
+              },
+              "total_active_stake_sat": "233835877071642",
+              "base_fee_millisat_per_gas": "10",
+              "next_base_fee_millisat_per_gas": "10",
+              "mempool": 0,
+              "blocks_known": 322,
+              "wall_slot": 487,
+              "behind_by_slots": 2,
+              "transport": {
+                "name": "devnet",
+                "peers": {
+                  "devnet": 6,
+                  "libp2p": null
+                }
+              }
+            }
+          },
+          {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+              "block_id": "0e303f2fd9c7b1401dedd2c065b2c7d7b7291e6189bc6705afc4420d61040634",
+              "slot": 485,
+              "height": 271,
+              "finalized_height": 222,
+              "epoch": 15,
+              "slot_in_epoch": 5,
+              "slots_per_epoch": 32,
+              "state_root": "249860b06c010553a33e38788d398b92a7dda40b71c8d0767b13654674156a9f",
+              "justified": {
+                "epoch": 14,
+                "root": "393263a60dc7141319602d81dfce0c9de699bfb78c0ac38137addb4360cd13ec"
+              },
+              "finalized": {
+                "epoch": 13,
+                "root": "c4366e58b153a34d4b57d4c1669859544e0136c4b46cd2d1fe75c0d72ac932a8"
+              },
+              "previous_justified": {
+                "epoch": 13,
+                "root": "c4366e58b153a34d4b57d4c1669859544e0136c4b46cd2d1fe75c0d72ac932a8"
+              },
+              "validators": {
+                "total": 4,
+                "active": 4
+              },
+              "total_active_stake_sat": "233835877071642",
+              "base_fee_millisat_per_gas": "10",
+              "next_base_fee_millisat_per_gas": "10",
+              "mempool": 0,
+              "blocks_known": 322,
+              "wall_slot": 487,
+              "behind_by_slots": 2,
+              "transport": {
+                "name": "devnet",
+                "peers": {
+                  "devnet": 6,
+                  "libp2p": null
+                }
+              }
+            }
+          },
+          {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+              "block_id": "b7504c581fd5315031c6fea744eb4f75dfb539966bd8ad12bd9a2165e703d5d3",
+              "slot": 486,
+              "height": 316,
+              "finalized_height": 265,
+              "epoch": 15,
+              "slot_in_epoch": 6,
+              "slots_per_epoch": 32,
+              "state_root": "1921931fc18b0bf2b5087986ab9cb89c9a84a0ed158cab9593dd90b88941468a",
+              "justified": {
+                "epoch": 14,
+                "root": "fd5de3f09f6e93a9cda8e246dc954a7f243ff2b3f6d880a937136cab3d15c8b1"
+              },
+              "finalized": {
+                "epoch": 13,
+                "root": "91544cdd14c7ab7f26ba62bbb10510709d57a886d58946c8f78e3d2324bed269"
+              },
+              "previous_justified": {
+                "epoch": 13,
+                "root": "91544cdd14c7ab7f26ba62bbb10510709d57a886d58946c8f78e3d2324bed269"
+              },
+              "validators": {
+                "total": 4,
+                "active": 4
+              },
+              "total_active_stake_sat": "256221757842754",
+              "base_fee_millisat_per_gas": "10",
+              "next_base_fee_millisat_per_gas": "10",
+              "mempool": 0,
+              "blocks_known": 316,
+              "wall_slot": 487,
+              "behind_by_slots": 1,
+              "transport": {
+                "name": "devnet",
+                "peers": {
+                  "devnet": 6,
+                  "libp2p": null
+                }
+              }
+            }
+          },
+          {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+              "block_id": "b7504c581fd5315031c6fea744eb4f75dfb539966bd8ad12bd9a2165e703d5d3",
+              "slot": 486,
+              "height": 316,
+              "finalized_height": 265,
+              "epoch": 15,
+              "slot_in_epoch": 6,
+              "slots_per_epoch": 32,
+              "state_root": "1921931fc18b0bf2b5087986ab9cb89c9a84a0ed158cab9593dd90b88941468a",
+              "justified": {
+                "epoch": 14,
+                "root": "fd5de3f09f6e93a9cda8e246dc954a7f243ff2b3f6d880a937136cab3d15c8b1"
+              },
+              "finalized": {
+                "epoch": 13,
+                "root": "91544cdd14c7ab7f26ba62bbb10510709d57a886d58946c8f78e3d2324bed269"
+              },
+              "previous_justified": {
+                "epoch": 13,
+                "root": "91544cdd14c7ab7f26ba62bbb10510709d57a886d58946c8f78e3d2324bed269"
+              },
+              "validators": {
+                "total": 4,
+                "active": 4
+              },
+              "total_active_stake_sat": "256221757842754",
+              "base_fee_millisat_per_gas": "10",
+              "next_base_fee_millisat_per_gas": "10",
+              "mempool": 0,
+              "blocks_known": 316,
+              "wall_slot": 487,
+              "behind_by_slots": 1,
+              "transport": {
+                "name": "devnet",
+                "peers": {
+                  "devnet": 6,
+                  "libp2p": null
+                }
+              }
+            }
+          }
+        ]
+      },
+      "terminal_logs": {
+        "phase1-mesh": [
+          [
+            "STOP at slot 30: head slot 29, 29 blocks, state root 0051806e94ebd085f447f23969bbc760e831a537433bba7da3bef5a49366a077, justified e0 (9953da73), finalized e0 (9953da73)"
+          ],
+          [
+            "STOP at slot 30: head slot 29, 29 blocks, state root 0051806e94ebd085f447f23969bbc760e831a537433bba7da3bef5a49366a077, justified e0 (9953da73), finalized e0 (9953da73)"
+          ],
+          [
+            "STOP at slot 30: head slot 29, 29 blocks, state root 0051806e94ebd085f447f23969bbc760e831a537433bba7da3bef5a49366a077, justified e0 (9953da73), finalized e0 (9953da73)"
+          ],
+          [
+            "STOP at slot 30: head slot 29, 29 blocks, state root 0051806e94ebd085f447f23969bbc760e831a537433bba7da3bef5a49366a077, justified e0 (9953da73), finalized e0 (9953da73)"
+          ]
+        ],
+        "phase2": [
+          [
+            "STOP at slot 330: head slot 329, 173 blocks, state root e31eac85b31ceb1a3a63b8400919fbfe2a71a5f8f8a21f2c26cb8b6ed11b5664, justified e0 (9953da73), finalized e0 (9953da73)"
+          ],
+          [
+            "STOP at slot 330: head slot 329, 173 blocks, state root e31eac85b31ceb1a3a63b8400919fbfe2a71a5f8f8a21f2c26cb8b6ed11b5664, justified e0 (9953da73), finalized e0 (9953da73)"
+          ],
+          [
+            "STOP at slot 330: head slot 329, 210 blocks, state root 3476dfc0ce3b52999871b23eebe94317fd540aa9bf50210f83289007887b26ec, justified e9 (3cac4efb), finalized e8 (0c4e0a39)"
+          ],
+          [
+            "STOP at slot 330: head slot 329, 210 blocks, state root 3476dfc0ce3b52999871b23eebe94317fd540aa9bf50210f83289007887b26ec, justified e9 (3cac4efb), finalized e8 (0c4e0a39)"
+          ]
+        ],
+        "phase3-heal": [
+          [
+            "STOP at slot 490: head slot 489, 274 blocks, state root 0bf6ad0efd8e49cac93c43b3322e898909a2cf9abea88a0bf9448e21268995ce, justified e14 (393263a6), finalized e13 (c4366e58)"
+          ],
+          [
+            "STOP at slot 490: head slot 489, 274 blocks, state root 0bf6ad0efd8e49cac93c43b3322e898909a2cf9abea88a0bf9448e21268995ce, justified e14 (393263a6), finalized e13 (c4366e58)"
+          ],
+          [
+            "STOP at slot 490: head slot 489, 318 blocks, state root d57f67d61a28a3adc5436f47b7291dcdc6a9aece63661d97b57825855add0ad0, justified e14 (fd5de3f0), finalized e13 (91544cdd)"
+          ],
+          [
+            "STOP at slot 490: head slot 489, 318 blocks, state root d57f67d61a28a3adc5436f47b7291dcdc6a9aece63661d97b57825855add0ad0, justified e14 (fd5de3f0), finalized e13 (91544cdd)"
+          ]
+        ]
+      },
+      "verdict": "conflicting terminal states after reconnect; not qualified for partition recovery"
+    }
+  },
+  "test_source_sha256": "f65bef4f3521b10b8c18829a413cb4dbba3cf3606ef7be6561ffeffac48c41c8"
+}

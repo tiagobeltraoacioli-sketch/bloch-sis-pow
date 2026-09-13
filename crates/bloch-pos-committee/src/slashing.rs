@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+//! Candidate schedule: lifecycle epoch 2884, 2026-09-14 22:35:19 UTC.
+//! Evidence is refused before that epoch; valid evidence can apply penalties
+//! at and after it. A source schedule does not establish deployed readiness
+//! or an economic settlement guarantee. The following retraction records the
+//! historical, unarmed release and must be read in that scope.
+//!
 //! Slashing execution — the state machine behind §7.3.
 //!
 //! > **NOT REACHABLE FROM THE NETWORK (stated 2026-09-01; mechanism changed

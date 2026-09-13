@@ -1,0 +1,327 @@
+{
+  "active_signing_identities": [
+    {
+      "host_id": "HOST-001",
+      "index": 0,
+      "pubkey_hash": "f396b7333e20dc1c449f6c25baed028ce4c297db12f32f30957e4b07ffccddc1"
+    },
+    {
+      "host_id": "HOST-001",
+      "index": 7,
+      "pubkey_hash": "5db15e205cf1b741f70b70e4a97b1a41b917cefeaf8dd8aef765411d6a6fc7a7"
+    },
+    {
+      "host_id": "HOST-001",
+      "index": 14,
+      "pubkey_hash": "23628ff057860a88be1326cbbe4dd20f15b629f92da449742408ba661456bd06"
+    },
+    {
+      "host_id": "HOST-001",
+      "index": 21,
+      "pubkey_hash": "617866b5d0ad2dcd1300279c381e674b68514b3fe4cbb542e6325e25a6c5328e"
+    },
+    {
+      "host_id": "HOST-001",
+      "index": 28,
+      "pubkey_hash": "fa7c660e454735badbdfd19079932993e6dd8bd3a8490d87c26c3e979fa4bfbc"
+    },
+    {
+      "host_id": "HOST-001",
+      "index": 35,
+      "pubkey_hash": "30ecb02eb56fcab9d83bc77442609207f376d32293c2caffee9b80b35b91bb22"
+    },
+    {
+      "host_id": "HOST-001",
+      "index": 42,
+      "pubkey_hash": "4be8af4a6a9f26aaa8a432e8e4c289ec47ab5dc59d90877f4c0e7f14f3b0bfe2"
+    },
+    {
+      "host_id": "HOST-001",
+      "index": 49,
+      "pubkey_hash": "1e321557041997d79e55130f768d8362aafd80b454a254478b8d7223ff62c74d"
+    },
+    {
+      "host_id": "HOST-001",
+      "index": 56,
+      "pubkey_hash": "c3b0a4d7ed53832bc122ca2085c74fd99fd8028ac3c0e179f4b3f59e42f1c1f3"
+    },
+    {
+      "host_id": "HOST-002",
+      "index": 1,
+      "pubkey_hash": "a4e505be3b0385c3750bfb29b50f88c2c766c71af66b4d929d0ed8a80b452c3d"
+    },
+    {
+      "host_id": "HOST-002",
+      "index": 8,
+      "pubkey_hash": "577848a056801daf7b23095cc12d7450928d7ef2f9f6a16a890bbfcb122cecd6"
+    },
+    {
+      "host_id": "HOST-002",
+      "index": 15,
+      "pubkey_hash": "ce113d2d444478988fe9f33efde5de2552914fa3c12507e73ee118f2451bce13"
+    },
+    {
+      "host_id": "HOST-002",
+      "index": 22,
+      "pubkey_hash": "cdb094ec9e7b22ce24f36bd6d4ff665b8f331fa74b45dd1f57ac1edff34dac72"
+    },
+    {
+      "host_id": "HOST-002",
+      "index": 29,
+      "pubkey_hash": "2e77b7a62c1603c03485ce057c0962a0af29790f04addd5c9b7aacd990b6916d"
+    },
+    {
+      "host_id": "HOST-002",
+      "index": 36,
+      "pubkey_hash": "86984c1f194a792f468b00adfe37815d70b2a7dd8e564629a930bccecdc14905"
+    },
+    {
+      "host_id": "HOST-002",
+      "index": 43,
+      "pubkey_hash": "99b10c5c3a470a6128900e3cf3217bb089ad75d9d396f8b1f9ee2f05149895d2"
+    },
+    {
+      "host_id": "HOST-002",
+      "index": 50,
+      "pubkey_hash": "e4fc901047073ef3e19c0e27c0bf8c91640e14cd85f3724f1d2b539b70a8c794"
+    },
+    {
+      "host_id": "HOST-002",
+      "index": 57,
+      "pubkey_hash": "edc09c07a34ee4b348efd931e746f2456786da42528a0c759c5d59ffb6281e82"
+    },
+    {
+      "host_id": "HOST-003",
+      "index": 2,
+      "pubkey_hash": "8163b5f622dbe0d0f487c1cfee4292f7a9065bc8396dd43b0218321711f679a9"
+    },
+    {
+      "host_id": "HOST-003",
+      "index": 9,
+      "pubkey_hash": "97945ae2815aac80b4624ae877354f566f6c52aebeed13873c009c9eb30081fc"
+    },
+    {
+      "host_id": "HOST-003",
+      "index": 16,
+      "pubkey_hash": "414d8f280373e8afa56259c670967cefb51a625ce475a0ae25929740151055c2"
+    },
+    {
+      "host_id": "HOST-003",
+      "index": 23,
+      "pubkey_hash": "a2461d3daa652bd4f9d6310549fd76b7401f713791183c10979354ec30cbe47e"
+    },
+    {
+      "host_id": "HOST-003",
+      "index": 30,
+      "pubkey_hash": "f33e859cda44d08b754c41d8c9d424d2fb98aa70155c3f9d27b1ff5d8b8da883"
+    },
+    {
+      "host_id": "HOST-003",
+      "index": 37,
+      "pubkey_hash": "1fc2cabbfaedf0599df99c233eada6e261354b061a9391ddd0c75465b18670fe"
+    },
+    {
+      "host_id": "HOST-003",
+      "index": 44,
+      "pubkey_hash": "8738f9fe210c272eb2aaca0d0302bef3a260379214f3012b13b073f93de3e213"
+    },
+    {
+      "host_id": "HOST-003",
+      "index": 51,
+      "pubkey_hash": "761410b16411302c2e63e23d44a0fb7213b9b09cb2b26a60aa6b73e804bb593a"
+    },
+    {
+      "host_id": "HOST-003",
+      "index": 58,
+      "pubkey_hash": "2b7aff58002a2c32b00b6b1a0898175d9c38c0037651d40123c4634ce9b9b8af"
+    },
+    {
+      "host_id": "HOST-004",
+      "index": 3,
+      "pubkey_hash": "1419fc81548336a7d9e980be287ae2dc3fd2f47bdffc30e2e9a2970625f294aa"
+    },
+    {
+      "host_id": "HOST-004",
+      "index": 10,
+      "pubkey_hash": "97c9780f931368a57710ceb59bfdaab86c23ace3506be136692ff4d691b4d17d"
+    },
+    {
+      "host_id": "HOST-004",
+      "index": 17,
+      "pubkey_hash": "4e07729761b1b846e6cda6e1f83b3710e6910c4d581079cef9a5d8c13b9cfb5f"
+    },
+    {
+      "host_id": "HOST-004",
+      "index": 24,
+      "pubkey_hash": "7652fcbb0cdc07d338e2a80eb6d9a37b8bf4e2fd8da3a70b163607ada76a4998"
+    },
+    {
+      "host_id": "HOST-004",
+      "index": 31,
+      "pubkey_hash": "64c0c5319bc47b870dc795e797950300a2256724c3bbdf4ff36b052d3c9a87ac"
+    },
+    {
+      "host_id": "HOST-004",
+      "index": 38,
+      "pubkey_hash": "11bd51836aaeff1df3455663da601cc0981cd34d71461f2abc3a2687e7c3d803"
+    },
+    {
+      "host_id": "HOST-004",
+      "index": 45,
+      "pubkey_hash": "462484ffb2efb5cc425f5978f2ae6530aca6fde90cf65949076ca56ad2f020c9"
+    },
+    {
+      "host_id": "HOST-004",
+      "index": 52,
+      "pubkey_hash": "ceabfa13da305ffc0581deee4503c2f8e8e34bbdc341fd2ae69ca71d365128c0"
+    },
+    {
+      "host_id": "HOST-004",
+      "index": 59,
+      "pubkey_hash": "fcd67ff6b411e56f83d87f0c5bf69124fb232c4b4cb3f8b895ffb5a881732eb1"
+    },
+    {
+      "host_id": "HOST-005",
+      "index": 4,
+      "pubkey_hash": "2aa7300481573c4b759d1420f0b6ec9d0d34fe8668675866543fcf5cab807d2d"
+    },
+    {
+      "host_id": "HOST-005",
+      "index": 11,
+      "pubkey_hash": "af87cbf85d779caae6817862321ad66bac7e21df25bda0613a54d9c8622bbdad"
+    },
+    {
+      "host_id": "HOST-005",
+      "index": 18,
+      "pubkey_hash": "fd275e684caed8e40b6f2612781f16abc119656a49b0074432d2913d4a90825e"
+    },
+    {
+      "host_id": "HOST-005",
+      "index": 25,
+      "pubkey_hash": "9808a9f02f974965cd45f57ae2a17338939f164631bf6085de65e8d7d1227495"
+    },
+    {
+      "host_id": "HOST-005",
+      "index": 32,
+      "pubkey_hash": "0bcd516c220bfe192d61d9810a07badc3f8db564680d52aef0bba6445fe557b4"
+    },
+    {
+      "host_id": "HOST-005",
+      "index": 39,
+      "pubkey_hash": "b45aad64c8740b39280d48d47bd60efc33c0af632afce11b4d17a97d2c965932"
+    },
+    {
+      "host_id": "HOST-005",
+      "index": 46,
+      "pubkey_hash": "48b61ef39cf4a7554f538bac7c9d4e6080c300b4a67f90637ce19dd6f175715d"
+    },
+    {
+      "host_id": "HOST-005",
+      "index": 53,
+      "pubkey_hash": "ac70957b3aee98129305287f30b5f17fd7d16a3ec121f5f38cdc193b0dec39b9"
+    },
+    {
+      "host_id": "HOST-005",
+      "index": 60,
+      "pubkey_hash": "4f0bce858eaf577b96fbc6d9a5b07c0115333043cde5c25d8ea91f4543a954a6"
+    },
+    {
+      "host_id": "HOST-006",
+      "index": 5,
+      "pubkey_hash": "3ba046409fbe54892162916942b572f56ac544cf730eb9c469e1a53c83966219"
+    },
+    {
+      "host_id": "HOST-006",
+      "index": 12,
+      "pubkey_hash": "2b1c26a33e1d4786dd664d3c9952254f7144d8beee7a5ef2106ac7f77d4df313"
+    },
+    {
+      "host_id": "HOST-006",
+      "index": 19,
+      "pubkey_hash": "40372a07789f7c896f6ea19ea7167af29f42b0b020643d5d7c62403b6b17ec51"
+    },
+    {
+      "host_id": "HOST-006",
+      "index": 26,
+      "pubkey_hash": "12f41b73d05613c9bbb1508af380849958abb52416b5db3d498b3815c67dc392"
+    },
+    {
+      "host_id": "HOST-006",
+      "index": 33,
+      "pubkey_hash": "08b8c894d633aaac55a993b4c7584b40a00f356c3c03465a9f61ab014cbc6407"
+    },
+    {
+      "host_id": "HOST-006",
+      "index": 40,
+      "pubkey_hash": "3364741b1dd20090a2bf7ca07f76ecb3a67236a831ee80df73c1a314bea58b26"
+    },
+    {
+      "host_id": "HOST-006",
+      "index": 47,
+      "pubkey_hash": "0b3d8597768bc6ad453aa6be7832d32aea2066cfac737d849423b9bc10b3a41f"
+    },
+    {
+      "host_id": "HOST-006",
+      "index": 54,
+      "pubkey_hash": "37ba5dacafa3f747367ba91663a62b0e61618740ce6b294b9d863630f95793fd"
+    },
+    {
+      "host_id": "HOST-006",
+      "index": 61,
+      "pubkey_hash": "736c05a234a0bea57700591a74fcc4d75b9b1c89ee0ebc2c39254fb321f5dde6"
+    },
+    {
+      "host_id": "HOST-007",
+      "index": 6,
+      "pubkey_hash": "e66ea272fbdd9a15f70f693c27fd480ca1f3f650db2fbc89044be9af94e88d11"
+    },
+    {
+      "host_id": "HOST-007",
+      "index": 13,
+      "pubkey_hash": "09cf0b73691404f319df9c3e2860bdf69e397bf3cf367d624e98d02aa2d579a7"
+    },
+    {
+      "host_id": "HOST-007",
+      "index": 20,
+      "pubkey_hash": "9113435a6ff4eb5f1da0bce726a2b4a81ce3e0ff99f3fd8486106f09400fc92f"
+    },
+    {
+      "host_id": "HOST-007",
+      "index": 27,
+      "pubkey_hash": "fdf7cdb2c7085962551fd4836ab32eafd2d119ce404e46b1fd79f971b6b33843"
+    },
+    {
+      "host_id": "HOST-007",
+      "index": 34,
+      "pubkey_hash": "0d9962601602430e991298d15666778dbd2b1cfa1dd3fc7e462270b65b2605cc"
+    },
+    {
+      "host_id": "HOST-007",
+      "index": 41,
+      "pubkey_hash": "0c287b148e7ffc0cec12df762f1d9270c66ce765d479a689d733c7f950defff3"
+    },
+    {
+      "host_id": "HOST-007",
+      "index": 48,
+      "pubkey_hash": "c5b323439adbbe73db54bccd87d8cd2d4afe1688e0d5fac3975095c23db31aed"
+    },
+    {
+      "host_id": "HOST-007",
+      "index": 55,
+      "pubkey_hash": "c253e0ca998cef27517ab03d729de09ec14099cc417f522577ac68eadbcf1b1f"
+    },
+    {
+      "host_id": "HOST-007",
+      "index": 62,
+      "pubkey_hash": "524cac835d2d017444f37b76408b9e0ac7986efefe06081b3a2f7949309c6f0b"
+    }
+  ],
+  "validator63": {
+    "pubkey_hash": "dc5ea934b7954baa791da4abccc707bbe9fe203323d84bb9dd807a9c12d2e90b",
+    "installed_on": "HOST-006",
+    "active": false,
+    "legacy_copy_on": "CLASSIC-003",
+    "legacy_service_masked": true
+  },
+  "scope": "Public headers matched to visible process data directories on seven inventoried fleet hosts; twelve classic hosts also inspected. No private key bytes collected."
+}

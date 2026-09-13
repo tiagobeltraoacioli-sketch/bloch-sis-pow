@@ -7,22 +7,13 @@
 //! (`spikes/prover-cost/RESULTS.md`): 7,274,849 RV32IM instructions per
 //! ML-DSA-65 ‖ Falcon-1024 verification, and a 4,589-byte signature.
 //!
-//! These are LIVE consensus constants, and several of the activation heights
-//! below are bound, not inert: `LEAKED_ROSTER_ACTIVATION_EPOCH` (1400),
-//! `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` (800) and
-//! `BLOCK_BYTES_V2_ACTIVATION_EPOCH` (800) are all epochs the chain is past.
-//! `LEAK_RECOVERY_ACTIVATION_EPOCH` is armed at 2700 (2026-09-06);
-//! `ANCESTRY_SEED_ACTIVATION_EPOCH`, `DEPOSIT_ACTIVATION_EPOCH`,
-//! `EXIT_AUTH_ACTIVATION_EPOCH`, `FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH`,
-//! `SLASHING_EVIDENCE_ACTIVATION_EPOCH`, `DUST_RULE_ACTIVATION_EPOCH`,
-//! `RANDAO_RECOMMIT_ACTIVATION_EPOCH` and `TX_BYTES_BOUND_ACTIVATION_EPOCH`
-//! are the ones still at `u64::MAX`.
-//!
-//! Until 2026-09-02 this header said nothing here was active and that the
-//! crate held no activation height at all because it was not wired into the
-//! node. All three clauses were false: the crate is a path-dependency of
-//! `bloch-pos-node`, and this file has five activation constants, three of
-//! them bound.
+//! These constants are live consensus rules. Epochs 800 and 1400 are already
+//! historical. The coordinated recovery release schedules leak recovery at
+//! epoch 2880 (2026-09-14 21:31:19 UTC), followed by all five ADR-041 lifecycle
+//! gates at epoch 2884 (2026-09-14 22:35:19 UTC). Every validating node must
+//! carry this schedule before the first boundary. Other unarmed gates remain
+//! at `u64::MAX`; in particular, legacy unfunded admission stays disabled.
+//! See `docs/VALIDATOR-OPENING.md` for qualification and rollout requirements.
 
 /// Full committee, voting once at each epoch boundary for justification and
 /// finality. At 4,589 B per signature this is ≈ 588 KB in the epoch-boundary
@@ -1194,17 +1185,17 @@ pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// that never leaked, so blocks before the first bite replay unchanged and the
 /// break point is the first epoch boundary that accrues one.
 ///
-/// **ARMED at epoch 2700** (founder decision, 2026-09-06; ≈2026-09-12 wall
-/// clock at 90 epochs/day from epoch ~2070). Below 2700 the shipped arithmetic
-/// is unchanged — the unfloored, leak-adjusted denominator of the 2026-08-24
-/// incident. At and after 2700 the denominator floor and the leak recovery are
-/// in force.
+/// **Scheduled at epoch 2880**, 2026-09-14 21:31:19 UTC. The epoch-2700
+/// deployment deadline was missed by the legacy signing fleet. Exact replay
+/// with 2700 stops at slot 86431 and cannot reproduce the operator-approved
+/// epoch-2713 checkpoint. This coordinated replacement preserves that history
+/// and applies the same recovery and one-half floor policy prospectively.
+/// See the 2026-09-13 activation preflight for retained replay evidence.
 ///
-/// DEPLOYMENT DEADLINE: every validator must run a binary carrying this value
-/// BEFORE epoch 2700. A fleet split across old/new binaries at that boundary
-/// diverges — this is a flag day, and the coordinated rebuild is the
-/// operational half of the decision.
-pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = 2_700;
+/// Every validator must carry this value BEFORE epoch 2880. Postpone the
+/// coordinated release before that boundary if fleet qualification fails;
+/// a partially upgraded fleet must not cross it.
+pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = 2_880;
 
 /// Flag day for **unfunded bonding**: the epoch at and after which the legacy
 /// `Deposit` and `Delegate` messages are valid. Below it they are refused by
@@ -1282,19 +1273,17 @@ pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = 2_700;
 ///
 /// Deposits open by a different route: a funded, authenticated message that
 /// spends transparent eUTXO inputs and carries a proof of possession — the form
-/// `staking::validate_deposit` and `DepositTx` already describe and nothing
-/// encodes. That form needs a wire tag, the tag space above the released range
-/// is contested across live lineages, and the registry that resolves it is the
-/// founder's to assign. When it lands it brings its OWN activation constant.
-/// This one stays `u64::MAX` and the legacy arm stays refused, permanently.
+/// is implemented by wire tag `0x0B`, with its own activation constant at
+/// lifecycle epoch 2884 (2026-09-14). This constant stays `u64::MAX`, so the
+/// legacy unfunded arm remains refused.
 ///
 /// `deposit_gate_is_inert` pins the value, so arming it means deleting a test
 /// that says all of the above out loud.
 pub const DEPOSIT_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// Flag day for the **authenticated voluntary exit** (§7.2) and the per-epoch
-/// exit churn cap. `u64::MAX` = INERT: no epoch reaches it, so on every node
-/// running this crate today the rule below is written down and does nothing.
+/// exit churn cap, coordinated at lifecycle epoch 2884 (2026-09-14).
+/// The historical rules remain in force before that boundary.
 ///
 /// # The hole it closes
 ///
@@ -1329,20 +1318,11 @@ pub const DEPOSIT_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// block's own header slot by `compute_post_state`'s boundary walk, never
 /// node-local. The 2026-08-08 `expected_bits` fork is the standing reason.
 ///
-/// # ARMING THIS IS A FOUNDER DECISION, AND IT HAS A PRECONDITION
-///
-/// Two, actually. (1) The whole fleet must already be running a binary that
-/// carries this rule, because the first post-gate block changes the verdict on
-/// legacy `Exit` — a node without the rule accepts what a node with it
-/// refuses. (2) `ExitV2` has **no decoder arm**: wire byte `0x08` is
-/// CONTESTED across live lineages (`SignedExit`, `Withdraw`, `ExitV2` all
-/// claim it — see `tests/wire_tag_registry.rs`), and this tree refuses to
-/// decode it until the founder rules on the byte. Arming this constant
-/// without that ruling retires the legacy message and puts nothing in its
-/// place: voluntary exit would simply stop existing.
-///
-/// `exit_auth_gate_is_inert` pins the value.
-pub const EXIT_AUTH_ACTIVATION_EPOCH: u64 = u64::MAX;
+/// ADR-041 assigned ExitV2 the fresh tag `0x0C`; the decoder and signature
+/// verification are implemented. The operator scheduled the coordinated
+/// lifecycle boundary at epoch 2884. All nodes must be upgraded before it:
+/// the legacy exit becomes invalid at the same boundary that enables ExitV2.
+pub const EXIT_AUTH_ACTIVATION_EPOCH: u64 = 2_884;
 
 /// Flag day for the **fee-to-stake decoupling** (finding C-R2-2, 2026-09-05).
 ///
@@ -1378,11 +1358,10 @@ pub const EXIT_AUTH_ACTIVATION_EPOCH: u64 = u64::MAX;
 pub const FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// Flag day for the **slashing-evidence transaction** (§7.3), wire tag `0x05`.
-/// `u64::MAX` = INERT: no epoch reaches it, so on every node running this
-/// crate today a block that carries tag `0x05` is refused by the transition
-/// (`TxReject::EvidenceNotActive`) at every reachable epoch — exactly the
-/// verdict an older binary reaches at its decoder, so a mixed fleet agrees on
-/// every block until the day.
+/// Scheduled with the ADR-041 lifecycle at epoch 2884. Before that epoch,
+/// tag `0x05` is refused by the transition (`TxReject::EvidenceNotActive`).
+/// Scheduling this gate is not evidence that a running fleet has upgraded or
+/// that a particular finalized block carries an economic settlement guarantee.
 ///
 /// # The hole it exists to close (F-02, Round 2)
 ///
@@ -1396,12 +1375,12 @@ pub const FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// economic cost, and the Casper security argument did not hold on the live
 /// chain. The wire format now carries both envelopes whole (the header or
 /// attestation plus its signature, re-verified by every node), so evidence
-/// decodes — and THIS constant is what keeps the change inert until the
-/// founder schedules it.
+/// decodes, and this constant gates its inclusion until the coordinated
+/// lifecycle boundary.
 ///
 /// # What the gate switches at one epoch
 ///
-/// - **below** (every epoch today): a block carrying a `SlashingEvidence`
+/// - **below**: a block carrying a `SlashingEvidence`
 ///   transaction is consensus-INVALID (`EvidenceNotActive`), and the node's
 ///   mempool refuses to admit or relay one (`admissible`);
 /// - **at and above**: the evidence transaction becomes valid where the pair
@@ -1421,8 +1400,8 @@ pub const FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// post-gate block that carries evidence is accepted only by nodes that can
 /// decode it. Same rollout discipline as `LEAKED_ROSTER_ACTIVATION_EPOCH`.
 ///
-/// `slashing_evidence_gate_is_inert` pins the value.
-pub const SLASHING_EVIDENCE_ACTIVATION_EPOCH: u64 = u64::MAX;
+/// The release tests pin this gate to the same epoch as funded admission.
+pub const SLASHING_EVIDENCE_ACTIVATION_EPOCH: u64 = 2_884;
 
 /// **Flag day for the transfer dust rule — SHIPS INERT (`u64::MAX`).**
 ///
@@ -1472,8 +1451,8 @@ pub const MIN_TRANSFER_OUTPUT_SAT: u64 = 1_000;
 pub const MAX_TRANSFER_OUTPUTS: usize = 256;
 
 /// Flag day for the RANDAO **re-commit** transaction
-/// ([`crate::transition::PosTransaction::RandaoRecommit`]) — INERT at
-/// `u64::MAX`. **Do not arm without the founder's ruling.**
+/// ([`crate::transition::PosTransaction::RandaoRecommit`]), scheduled at
+/// epoch 2884 with the other ADR-041 lifecycle gates.
 ///
 /// # Why this exists: every RANDAO chain is terminal today
 ///
@@ -1502,19 +1481,11 @@ pub const MAX_TRANSFER_OUTPUTS: usize = 256;
 /// the `Deposit`/`ExitV2` gates, so today's fleet behaviour is unchanged
 /// byte for byte.
 ///
-/// # Arming has the same unmet precondition as `EXIT_AUTH_ACTIVATION_EPOCH`
-///
-/// The transaction's wire byte (`0x0A`) is claimed encode-side only: the
-/// decoder deliberately refuses it until the founder assigns the byte
-/// (`tests/wire_tag_registry.rs`). Arming this constant without that
-/// assignment activates rules nothing on the wire can reach. Both decisions
-/// — the byte and the flag day — are the founder's, and both have a hard
-/// deadline: they must be armed, with the fleet rebuilt, **before the first
-/// chain exhausts (~2027-02-11)**, or proposal liveness starts decaying
-/// validator by validator.
-///
-/// `randao_recommit_gate_is_inert` pins the value.
-pub const RANDAO_RECOMMIT_ACTIVATION_EPOCH: u64 = u64::MAX;
+/// ADR-041 released the `0x0A` decoder and bound this gate to the lifecycle
+/// epoch. Every validator must upgrade before the boundary and before its
+/// existing RANDAO chain exhausts. The node automatically submits a valid
+/// recommit after exhaustion; this does not reset the old reveal history.
+pub const RANDAO_RECOMMIT_ACTIVATION_EPOCH: u64 = 2_884;
 
 /// Flag day for the **declared-size ceiling** on transfers (audit H-R7-2,
 /// 2026-09-05): at and above this epoch, a `Transfer`/`TransferV2` whose
@@ -1818,12 +1789,12 @@ pub const FORKCHOICE_EQUIVOCATION_HORIZON_SLOTS: u64 = SLOTS_PER_EPOCH;
 pub const STAKING_TX_METERING_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// ADR-041 lifecycle release epoch for withdrawals (tag 0x0D).
-/// Disabled at u64::MAX. Must equal funded admission, authenticated exit,
+/// Scheduled at epoch 2884. Must equal funded admission, authenticated exit,
 /// slashing evidence and RANDAO renewal; compile-time assertions enforce it.
 /// Withdrawal pays the registered script, writes off unissued genesis
 /// principal, and consumes block capacity even with legacy metering disabled.
 /// Arming requires the release ceremony and rehearsals in ADR-041.
-pub const WITHDRAWAL_ACTIVATION_EPOCH: u64 = u64::MAX;
+pub const WITHDRAWAL_ACTIVATION_EPOCH: u64 = 2_884;
 
 /// Flag day for **network-bound transfer signing** (audit A2-3 / R7 M2,
 /// 2026-09-06): `u64::MAX` = INERT, below it `DS_SPEND`'s preimage is
@@ -1965,10 +1936,10 @@ pub const DS_COHERENCE: [u8; 16] = *b"BLCH4:COHERE\0\0\0\0";
 pub(crate) const ROLE_SLOT: u8 = 0x01;
 pub(crate) const ROLE_EPOCH: u8 = 0x02;
 
-/// Independent flag day for funded validator admission (wire 0x0B).
-/// Deliberately unarmed pending a coordinated consensus release. This never
-/// enables the unfunded legacy Deposit/Delegate formats. No runtime override.
-pub const FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH: u64 = u64::MAX;
+/// ADR-041 lifecycle epoch for funded validator admission (wire 0x0B).
+/// Scheduled at epoch 2884, 2026-09-14 22:35:19 UTC. This never enables
+/// unfunded legacy Deposit/Delegate formats. No runtime override exists.
+pub const FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH: u64 = 2_884;
 
 pub fn funded_validator_admission_active(epoch: u64) -> bool {
     #[cfg(test)]

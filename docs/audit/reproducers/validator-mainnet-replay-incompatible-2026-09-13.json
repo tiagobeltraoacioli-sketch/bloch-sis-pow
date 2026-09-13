@@ -1,0 +1,125 @@
+{
+  "observed_utc": "2026-09-13T03:19:50.125396+00:00",
+  "expected": {
+    "input_frames": 63683,
+    "slot": 86916,
+    "block_id": "c5873bb8e6f322ba3bd75bac868511eb9986c65c107cf6db877d2aa8435ec249",
+    "state_root": "f3d175945681996a94ec7a8390f7bb21d5b55fdde3cb21d43ba595b36673e524",
+    "approved_checkpoint_in_log": true,
+    "last_input_block_rpc": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "result": {
+        "block_id": "c5873bb8e6f322ba3bd75bac868511eb9986c65c107cf6db877d2aa8435ec249",
+        "version": 2970353669,
+        "parent": "bb2a2dc78bce313f256d83d09ee243e49906a2692ba0b2733969133aba112a35",
+        "slot": 86916,
+        "epoch": 2716,
+        "height": 63683,
+        "proposer_index": 54,
+        "timestamp": 1789264159,
+        "state_root": "f3d175945681996a94ec7a8390f7bb21d5b55fdde3cb21d43ba595b36673e524",
+        "body_root": "3d272a088c490760c4f7d74cb6c3d2275f884842ad4e6ccb9e40a34a9e5a8400",
+        "randao_reveal": "a9aa7c22cafb101f35706ae9aba4f6c463f3df812a70442082d5bff2dfb000f4",
+        "randao_mix": "a6ac9bdf18bde0e2061cea872d1ecfc2bcdc932b02b217226596edebc02639db",
+        "justified_root": "329be1cc1d61404f85974cbd7027e0fc21e56b7ad885ef7631cd2b86c4b1daa4",
+        "finalized_root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7",
+        "attestation_root": "3f98f1dd4374a61e5909e755885b3c754dfa5192ba62ec18d4e7f80a5a559e4c",
+        "coherence_root": "3ac97a48fe4c1dc2de33022b2473e76e609c85ce0c0bce96540851f682bccb56",
+        "finality": "justified",
+        "finalized": false,
+        "tx_count": 0,
+        "attestation_count": 2
+      }
+    },
+    "approved_checkpoint_rpc": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "result": {
+        "block_id": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1",
+        "version": 2970353669,
+        "parent": "dc1d29d9f9a489216df3f6480556b1d38c3ccbbf20f73b608d74553f7dbbe3e5",
+        "slot": 86814,
+        "epoch": 2712,
+        "height": 63592,
+        "proposer_index": 7,
+        "timestamp": 1789261099,
+        "state_root": "4bde5eec161cf01e82c6a9e4220f98a9162fc5438d62d5c55541cd4d33d9d1ab",
+        "body_root": "3d272a088c490760c4f7d74cb6c3d2275f884842ad4e6ccb9e40a34a9e5a8400",
+        "randao_reveal": "c84375a5b2340cb809dc061cd23b33b76bd0eb003dcbf315ede36666964b7a50",
+        "randao_mix": "9d48a197c00e9287e352c592ffc7051a36b99a73cacc1b90a75e3d911e8313c7",
+        "justified_root": "e6e00471fb3a040a00d95139296fd6aac0261ea6648f135f5654e6c048886370",
+        "finalized_root": "5a7cf00f366100094cbffc16d0eec2bf5b5e1706cb2608dc556adbec38ffdc35",
+        "attestation_root": "37224fd3f6d2ab5a4b20b63616a33dc848dbfc1d39025b4d5294ff5af75fde62",
+        "coherence_root": "3ac97a48fe4c1dc2de33022b2473e76e609c85ce0c0bce96540851f682bccb56",
+        "finality": "finalized",
+        "finalized": true,
+        "tx_count": 0,
+        "attestation_count": 2
+      }
+    }
+  },
+  "rpc": {
+    "getchaininfo": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "result": {
+        "block_id": "07172b0dc451ef933d5480a6c7aa1cdab57fa67dfb20e360d6b762870d2676ba",
+        "slot": 86431,
+        "height": 63234,
+        "finalized_height": 63143,
+        "epoch": 2700,
+        "slot_in_epoch": 31,
+        "slots_per_epoch": 32,
+        "state_root": "f7e54ec1639ebd2a30b0da0d8dd3fc5683051b5de6fe696d5ca4065f068262e9",
+        "justified": {
+          "epoch": 2699,
+          "root": "4028ff40fcafe565be31d03edc6d4eaecfe3bcf02c29246aefcdb97ab3977f94"
+        },
+        "finalized": {
+          "epoch": 2698,
+          "root": "b4ff6d2e14811810e34161896f45cb8bd63de1f96001aee71d1e3eb07b0e1bb6"
+        },
+        "previous_justified": {
+          "epoch": 2698,
+          "root": "b4ff6d2e14811810e34161896f45cb8bd63de1f96001aee71d1e3eb07b0e1bb6"
+        },
+        "validators": {
+          "total": 64,
+          "active": 64
+        },
+        "total_active_stake_sat": "25293810752784888",
+        "base_fee_millisat_per_gas": "10",
+        "next_base_fee_millisat_per_gas": "10",
+        "mempool": 0,
+        "blocks_known": 63234,
+        "wall_slot": 87097,
+        "behind_by_slots": 666,
+        "transport": {
+          "name": "devnet",
+          "peers": {
+            "devnet": 0,
+            "libp2p": null
+          }
+        }
+      }
+    },
+    "getblockbyid": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "error": {
+        "code": -32000,
+        "message": "no block f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1 is known to this node"
+      }
+    }
+  },
+  "replay_end": [
+    "replayed 63683 blocks: head slot 86431, state root f7e54ec1, justified e2699, finalized e2698"
+  ],
+  "status": "failed",
+  "candidate_sha256": "6221e468343436868e205c33b642c173c362d500be95836d35fca61d12719ccf",
+  "source_commit": "22b8b7fdbbe0d69c91d2494b4844d68568fc382f",
+  "leak_recovery_activation_epoch": 2700,
+  "keyless": true,
+  "peers": []
+}

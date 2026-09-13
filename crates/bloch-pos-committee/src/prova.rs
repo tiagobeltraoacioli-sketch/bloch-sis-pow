@@ -612,40 +612,13 @@ mod tests {
         );
     }
 
-    /// **The flag day is set: the floor and the leak recovery bind at 2700.**
-    ///
-    /// This test fired on 2026-09-06, exactly as designed, when the founder
-    /// armed the gate at epoch 2700. It now states the ARMED fact, so the day
-    /// somebody moves the epoch again (or disarms it), exactly one test tells
-    /// them that scenario 0 has changed meaning a second time.
-    ///
-    /// Meaning today: BELOW epoch 2700 the shipped arithmetic is unchanged —
-    /// `s0_three_partitions_finalize_three_different_roots_at_the_same_epoch`
-    /// still describes what a shipped binary does before the flag day. AT AND
-    /// AFTER 2700 the floored branch is live, and the cure test
-    /// (`s0_cure_the_denominator_floor_stops_all_three_partitions`) describes
-    /// the arithmetic instead. The settlement guarantee in
-    /// docs/post-mortems/2026-08-24-finality-divergence.md must be read with
-    /// the armed epoch in mind before telling an integrator anything about
-    /// finality.
+    /// Pin the coordinated replacement of the missed epoch-2700 deadline.
+    /// The one-half floor policy and its documented residual risk are unchanged.
     #[test]
-    fn the_quorum_floor_binds_at_epoch_2700() {
-        assert_eq!(
-            crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH,
-            2_700,
-            "LEAK_RECOVERY_ACTIVATION_EPOCH moved again. Whoever changed it: scenario 0's \
-             two tests change meaning at this boundary, and the fleet must run the new \
-             binary BEFORE the armed epoch or it splits. Re-read both scenario 0 tests and \
-             docs/post-mortems/2026-08-24-finality-divergence.md, and update this test to \
-             the new value only as part of a coordinated flag-day decision."
-        );
-        println!(
-            "RATCHET: LEAK_RECOVERY_ACTIVATION_EPOCH = 2700 (armed 2026-09-06). Below \
-             2700 the unfloored, leak-adjusted denominator of 2026-08-24 still runs; at \
-             and after 2700 the floor ({}/{}) and the leak recovery are in force.",
-            crate::params::MIN_QUORUM_DENOMINATOR_NUM,
-            crate::params::MIN_QUORUM_DENOMINATOR_DEN
-        );
+    fn the_quorum_floor_binds_at_epoch_2880() {
+        assert_eq!(crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH, 2_880);
+        assert_eq!(crate::params::MIN_QUORUM_DENOMINATOR_NUM, 1);
+        assert_eq!(crate::params::MIN_QUORUM_DENOMINATOR_DEN, 2);
     }
 
     // ═══════════════════ SCENARIO 1 — the disease reproduced ═════════════════
