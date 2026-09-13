@@ -367,3 +367,130 @@ Read-only duplicate checks found 58 masked and 38 absent service names on
 inspected paths and services, not a claim about inaccessible containers.
 Production migration remains zero. Native release qualification, canary 35,
 all batches, archival compatibility and fleet readiness are still required.
+
+The final complete committee/node suite at source commit `e7261e6` passed
+with exit code zero: 1015 tests passed, 30 ignored, no failures.
+The native Linux binary SHA256 is
+`a7ab1d0d690d22dd774b091caab766271618bd252f97a036a77e4cb1c89100e7`.
+Its keyless exact-history replay is in progress; it is not qualified for
+production signing yet. No production validator has been migrated.
+
+### Fleet readiness observation and inactive package staging
+
+Local RPC reads on all seven validator hosts confirmed 56 instances on the
+approved lineage, six divergent instances (35, 36, 42, 49, 50, 56), stale
+validator 0, and inactive validator 63. Cross-host RPC timeouts were access
+restrictions; they were not used to classify processes as offline.
+At registry epoch 2726, the canonical online group represented approximately
+93.23% of the current active-validator effective weight. This is an operational
+estimate, not a committee quorum proof: the duty-roster denominator reported
+by chaininfo differs from the current active-validator weight sum.
+
+The same native binary is now staged on all seven validator hosts and both
+archivals. Each destination verified its SHA256. Staging installed no systemd
+unit and restarted no service. The native exact-history replay remains in
+progress, and the canary has not been started.
+
+Both archivals agreed at slot 87304, epoch 2728, finalized epoch 2726, and
+recognized the approved checkpoint as finalized. Their old binary SHA256 is
+`dbd3da297353be899084c34c0353e4cb5f1e9b310f3feaad226bf980f1590a36`.
+Both currently return method-not-found for getvalidatoradmission, so archival
+upgrades remain part of release readiness.
+
+### Observer harness RPC-readiness failure
+
+The native candidate completed replay of 63,683 frames at the expected head
+slot 86,916, logging state-root prefix `f3d17594`, justified 2715 and finalized
+2714. The harness then requested RPC before the post-replay weak-subjectivity
+initialization had finished. Connection refusal escaped the harness, whose
+cleanup stopped the keyless observer. Full RPC qualification was therefore
+not captured; the abbreviated log root is not reported as a full RPC check.
+
+Two independently captured extended canonical histories (64,471 blocks each)
+are being verified on g4-1 and g4-5. Their monitors were replaced without
+stopping the keyless children, and now retry RPC startup failures. They will
+verify full RPC state and the original 895,587,295-byte prefix hash before
+release qualification. No production signing process has been changed.
+
+### Extended native history qualification passed
+
+Both independent extended-history observers passed all five full RPC checks:
+64,471 blocks, slot 87,775, block
+`3bc565f1b0b8d733b5e70fa3bb8d352023db818f560c214a7ce936692e7c6dd6`,
+state root `cd91c4c645b9e8af72803ee9890d1a860d7b4ddb29004fccca663f5f037b7a7b`,
+and the approved checkpoint finalized. Both reproduced the identical original
+895,587,295-byte prefix with SHA256
+`fc7d58c5379e3ea6f6ff11e1afcc408dcd82ea3775bb82ae9d88c5314e8290eb`.
+The extended checks therefore cover the original history as well as its newer
+canonical continuation. Both keyless observers were stopped after success.
+
+The activation binary is ready for guarded canary qualification. Production
+migration is still zero at this observation; restarting validator 35 is next.
+
+
+## RPC repair and archival migration — 2026-09-13 afternoon UTC
+
+The server-0 public witness proxy was changed from stale validator 0 to
+canonical validator 7 at 14:35 UTC, without restarting a validator. Six
+subsequent explorer head reads completed in 1.48–2.39 seconds. The original
+25-second timeout was intermittent; this observation alone does not prove
+that stale witness selection caused every timeout.
+
+Both archivals replayed copies of their own public histories using candidate
+SHA-256 a7ab1d0d690d22dd774b091caab766271618bd252f97a036a77e4cb1c89100e7.
+The first switched at 15:55 UTC after convergence and a finalized epoch.
+External verification then caught a Host-policy incompatibility missed by
+the loopback check: the new binary rejected the public nip.io hostname.
+The second cutover was paused while its old observer continued serving.
+
+A dedicated HAProxy service now listens only on 127.0.0.1:18080 on both
+archival hosts. It accepts each host's explicit public hostname/IP and local
+probe names, rejects unrelated Hosts, and forwards to 127.0.0.1:17400 with
+the local Host. Origin headers remain subject to the node's existing gate.
+The public socat forwarder points through this HTTP proxy after cutover.
+No observer restart was needed for this repair. At 16:38 UTC, external
+verification confirmed the first candidate's build identity and admission
+terms, and blochl1.com again reported two responding, corroborating archivals.
+The second cutover resumed with public-Host checks included in its gate.
+
+Validator 35 reached the canonical chain, finished its 64-slot observation
+window, and by 16:38 UTC logged three attestations and one proposal. Its
+three-finalized-epoch qualification was still pending at that observation.
+The first batch executor waits for that qualification and two publicly
+responding upgraded archivals before starting another signer. Healthy
+signers retain their own history; only approved recovery nodes receive the
+qualified public snapshot. Known duplicate copies are checked inactive,
+keys are sealed locally, signing fences are durable, and each host is
+limited to two concurrent replays. Public witness routing moves outside
+the batch before any affected signer stops.
+
+The explorer client/edge repair is committed locally as 99da93a. All 89
+cross-repository tests and its production build passed. Publishing that
+additional failover and admission-method support awaits Cloudflare login
+on this workstation; it is not claimed deployed.
+
+At 16:43:34 UTC validator 35 passed its three-finalized-epoch production qualification (3 attestations, 1 proposal logged). At 16:43:42 UTC the second archival completed the corrected public-Host cutover. Both archival observers now use the candidate binary; both old archival units are stopped and disabled with their data preserved. See the canary-and-archival qualification reproducer for the exact observations.
+
+### Published archival P2P compatibility restored at 18:13 UTC
+
+The archival replacement units listen on P2P port 19200, while the published
+bootnode addresses use port 19100. Stopping the old units therefore left the
+published P2P ports closed. A dedicated enabled `bloch-p2p-19100.service` now
+forwards TCP 19100 to localhost 19200 on both archival hosts. Neither replacement
+archival process was restarted. External protocol probes requested recent
+blocks and received a valid block frame from both published addresses.
+
+The 18:05 UTC external RPC check confirmed commit `e7261e6c` on both public
+archivals. Both returned the same block and state at height 65,472, with one
+slot of lag. `https://blochl1.com/rpc` corroborated both archival responses and
+a fresh fleet witness. The additional explorer client/proxy code changes are
+committed locally as `99da93a`; their Cloudflare publication remains pending
+account authentication. Operational RPC recovery does not depend on that
+publication.
+
+The first validator batch remains in progress. Eight validator processes have
+switched to the qualified binary, including fully qualified canary 35. The
+other seven are under their per-validator qualification guardians. These are
+process counts, not a claim that the full 64-validator migration has finished.
+The deferred binary is staged on all nine hosts and is undergoing a separate
+keyless, isolated archival replay; it has not been selected for production.

@@ -8,7 +8,17 @@
     "failed": 0,
     "log_sha256": "36a979b8a104a8211597663d8b851462889a0eb93ebeea29c3b2fe34cc549777"
   },
-  "full_suite": "One test-only boundary assertion corrected; targeted rerun passed. Full command initially returned nonzero.",
+  "full_suite": {
+    "status": "passed",
+    "exit_code": 0,
+    "passed": 1015,
+    "failed": 0,
+    "ignored": 30,
+    "targets": 23,
+    "log_sha256": "1567c3f4296303374acfb5d8e13bc6ca57b6d046ca56d385e66fe58b61a89952",
+    "source_commit": "e7261e6c74194662cdec0fa77e2124c5eda9da21",
+    "environment": "Sockets permitted; the sandboxed attempt was rejected by OS socket permissions."
+  },
   "hardened_clippy": "passed",
   "finite_boundary": {
     "status": "passed",

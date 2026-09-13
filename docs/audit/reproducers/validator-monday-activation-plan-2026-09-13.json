@@ -1,5 +1,5 @@
 {
-  "status": "draft-not-deployed",
+  "status": "production-rollout-in-progress",
   "operator_schedule": "Monday 2026-09-14; operator delegated the best technical time",
   "timezone": "America/Sao_Paulo",
   "leak_recovery": {
@@ -24,7 +24,7 @@
     "epoch": 2713,
     "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
   },
-  "production_migrations_completed": 0,
+  "production_migrations_completed": 1,
   "preconditions": [
     "Exact legacy-compatible replay matches approved history",
     "Default restart observation fix in qualified binary",
@@ -33,5 +33,25 @@
     "No conflicting finalized checkpoints; live available stake verified before each batch"
   ],
   "deadline_policy": "Postpone the coordinated activation before the boundary if qualification or fleet readiness is incomplete; never leave a partially upgraded fleet crossing a finite gate.",
-  "external_opening": "Controlled admission after L; broad external opening remains subject to the ADR-041 real withdrawal-and-spend qualification."
+  "external_opening": "Controlled admission after L; broad external opening remains subject to the ADR-041 real withdrawal-and-spend qualification.",
+  "progress_observed_utc": "2026-09-13T18:28:11Z",
+  "qualified_validator_indices": [
+    35
+  ],
+  "new_binary_validator_processes": 8,
+  "started_validator_indices": [
+    2,
+    3,
+    4,
+    35,
+    36,
+    42,
+    49,
+    50
+  ],
+  "serving_archivals_upgraded": 2,
+  "published_bootnodes_verified": 2,
+  "explorer_rpc_operational": true,
+  "explorer_code_deployment": "local-commit-99da93a-awaiting-cloudflare-authentication",
+  "deferred_contingency": "staged-on-nine-hosts-isolated-replay-in-progress-not-selected"
 }
