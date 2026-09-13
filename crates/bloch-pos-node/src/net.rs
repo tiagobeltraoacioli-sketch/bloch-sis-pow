@@ -599,7 +599,7 @@ impl Drop for ConnCount {
 
 struct InboundPeer {
     frames: SyncSender<Vec<u8>>,
-    connection: Weak<InboundConnection>,
+    connection: Weak<Connection>,
 }
 
 impl InboundPeer {
@@ -610,15 +610,15 @@ impl InboundPeer {
 
 /// Both workers share one counted lifetime. Exiting either half shuts down
 /// the socket; capacity is released only after BOTH workers have stopped.
-struct InboundConnection {
+struct Connection {
     socket: TcpStream,
     closed: AtomicBool,
-    _counts: (ConnCount, ConnCount),
+    _counts: (ConnCount, Option<ConnCount>),
 }
 
-struct InboundHalf(Arc<InboundConnection>);
+struct ConnectionHalf(Arc<Connection>);
 
-impl Drop for InboundHalf {
+impl Drop for ConnectionHalf {
     fn drop(&mut self) {
         self.0.closed.store(true, Ordering::Release);
         let _ = self.0.socket.shutdown(Shutdown::Both);
@@ -628,7 +628,7 @@ impl Drop for InboundHalf {
 fn run_inbound_writer(
     rx: Receiver<Vec<u8>>,
     socket: Arc<Mutex<TcpStream>>,
-    half: InboundHalf,
+    half: ConnectionHalf,
 ) {
     while !half.0.closed.load(Ordering::Acquire) {
         match rx.recv_timeout(Duration::from_millis(100)) {
@@ -638,6 +638,28 @@ fn run_inbound_writer(
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+/// A reader ending for any reason closes both socket halves. In particular,
+/// an idle legacy peer can exceed the frame deadline while its TCP connection
+/// still accepts writes; retaining that writer would silently lose all inbound
+/// data and keep a sync permit occupied until the process restarts.
+fn run_outbound_reader(
+    mut socket: TcpStream,
+    events: Sender<EngineEvent>,
+    budget: Arc<QueueBudget>,
+    _half: ConnectionHalf,
+) {
+    loop {
+        match read_frame(&mut socket) {
+            Ok(frame) => {
+                if let Some(event) = decode_event(&frame) {
+                    if !send_to_engine(&events, &budget, event) { return; }
+                }
+            }
+            Err(_) => return,
         }
     }
 }
@@ -965,10 +987,10 @@ pub fn start(
                 // broadcast must not wait behind it.
                 let Ok(rsock) = sock.try_clone() else { continue };
                 let Ok(shutdown_socket) = sock.try_clone() else { continue };
-                let connection = Arc::new(InboundConnection {
+                let connection = Arc::new(Connection {
                     socket: shutdown_socket,
                     closed: AtomicBool::new(false),
-                    _counts: (ConnCount::new(&live), ConnCount::new(&inbound_live)),
+                    _counts: (ConnCount::new(&live), Some(ConnCount::new(&inbound_live))),
                 });
                 let wsock = Arc::new(Mutex::new(sock));
 
@@ -978,7 +1000,7 @@ pub fn start(
                 let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(INBOUND_QUEUE_DEPTH);
                 {
                     let wsock = wsock.clone();
-                    let half = InboundHalf(connection.clone());
+                    let half = ConnectionHalf(connection.clone());
                     thread::spawn(move || {
                         run_inbound_writer(rx, wsock, half);
                     });
@@ -994,7 +1016,7 @@ pub fn start(
                 // Counted from here to wherever this thread leaves. The guards
                 // are moved into the closure, so every `return` below and any
                 // unwind releases both.
-                let half = InboundHalf(connection);
+                let half = ConnectionHalf(connection);
                 thread::spawn(move || {
                     let _half = half;
                     // Per-connection (R3 M-4 / R1 A3-M2): see [`GetBlocksLimiter`].
@@ -1046,11 +1068,18 @@ pub fn start(
                 thread::sleep(Duration::from_millis(300));
                 continue;
             };
-            // Counted from a SUCCESSFUL connect, and released when this
-            // connection's inner loop breaks to reconnect. A dialer retrying a
-            // peer that is down therefore contributes nothing, which is the
-            // difference between this number and `peers.len()`.
-            let _counted = ConnCount::new(&live);
+            // Both halves own one connected lifetime. A read timeout must
+            // close the writer too: otherwise it can keep sending forever
+            // while no worker consumes the peer's blocks or sync replies.
+            let Ok(rsock) = sock.try_clone() else { continue };
+            let Ok(shutdown_socket) = sock.try_clone() else { continue };
+            let connection = Arc::new(Connection {
+                socket: shutdown_socket,
+                closed: AtomicBool::new(false),
+                _counts: (ConnCount::new(&live), None),
+            });
+            let writer_half = ConnectionHalf(connection.clone());
+            let reader_half = ConnectionHalf(connection);
             let mut wsock = sock;
             // R3 M-4 / R1 A3-M2: same bound as the inbound side — see
             // [`DEVNET_IO_TIMEOUT`]. Best-effort; a platform that refuses the
@@ -1058,20 +1087,11 @@ pub fn start(
             let _ = wsock.set_read_timeout(Some(DEVNET_IO_TIMEOUT));
             let _ = wsock.set_write_timeout(Some(DEVNET_IO_TIMEOUT));
             // Reader half: the peer answers our get-blocks on this socket.
-            if let Ok(mut rsock) = wsock.try_clone() {
+            {
                 let events = events.clone();
                 let inflight = inflight.clone();
-                thread::spawn(move || loop {
-                    match read_frame(&mut rsock) {
-                        Ok(frame) => {
-                            if let Some(ev) = decode_event(&frame) {
-                                if !send_to_engine(&events, &inflight, ev) {
-                                    return;
-                                }
-                            }
-                        }
-                        Err(_) => return,
-                    }
+                thread::spawn(move || {
+                    run_outbound_reader(rsock, events, inflight, reader_half);
                 });
             }
             // Claim one of the `SYNC_FANOUT` sync slots before asking for
@@ -1105,6 +1125,10 @@ pub fn start(
             };
             let mut held = holds_slot;
             loop {
+                if writer_half.0.closed.load(Ordering::Acquire) {
+                    drop_slot(&mut held);
+                    break; // the reader exited; reconnect even with an idle queue
+                }
                 match rx.recv_timeout(Duration::from_secs(5)) {
                     Ok(frame) => {
                         if write_frame(&mut wsock, &frame).is_err() {
@@ -1169,19 +1193,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn outbound_reader_failure_reconnects_and_reclaims_sync_permit() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (events, _received) = mpsc::channel();
+        let mesh = start(
+            "127.0.0.1", 0, vec![listener.local_addr().unwrap().to_string()],
+            events, std::env::temp_dir(), Arc::new(AtomicU64::new(42)), QueueBudget::new(),
+        ).unwrap();
+        // More reconnects than the sync fanout: a leaked permit would leave
+        // the third connection without its initial history request.
+        for _ in 0..=SYNC_FANOUT {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "outbound reader exit did not reconnect");
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            assert_eq!(
+                read_frame_until(&mut socket, Instant::now() + Duration::from_secs(2)).unwrap(),
+                get_blocks_frame(42),
+                "each new connection must be able to acquire a sync permit",
+            );
+            // End the reader with an invalid frame while the peer keeps its
+            // TCP read side open. The old writer could keep sending here
+            // indefinitely, even though this connection could receive nothing.
+            socket.write_all(&0u32.to_le_bytes()).unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            assert_eq!(socket.read(&mut [0; 1]).unwrap(), 0,
+                "reader failure left the outbound writer half alive");
+            mesh.broadcast(get_blocks_frame(42)); // wake the idle writer promptly
+        }
+        drop(mesh);
+    }
+
+    #[test]
     fn audit_inbound_reader_exit_reclaims_idle_writer_and_capacity() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (socket, _) = listener.accept().unwrap();
         let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let inbound_live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let connection = Arc::new(InboundConnection {
+        let connection = Arc::new(Connection {
             socket: socket.try_clone().unwrap(),
             closed: AtomicBool::new(false),
-            _counts: (ConnCount::new(&live), ConnCount::new(&inbound_live)),
+            _counts: (ConnCount::new(&live), Some(ConnCount::new(&inbound_live))),
         });
-        let reader = InboundHalf(connection.clone());
-        let writer = InboundHalf(connection.clone());
+        let reader = ConnectionHalf(connection.clone());
+        let writer = ConnectionHalf(connection.clone());
         let (frames, rx) = mpsc::sync_channel(INBOUND_QUEUE_DEPTH);
         let peer = InboundPeer { frames, connection: Arc::downgrade(&connection) };
         drop(connection);
@@ -1210,13 +1275,13 @@ mod tests {
         let (mut socket, _) = listener.accept().unwrap();
         socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let connection = Arc::new(InboundConnection {
+        let connection = Arc::new(Connection {
             socket: socket.try_clone().unwrap(),
             closed: AtomicBool::new(false),
-            _counts: (ConnCount::new(&live), ConnCount::new(&live)),
+            _counts: (ConnCount::new(&live), Some(ConnCount::new(&live))),
         });
-        let reader = InboundHalf(connection.clone());
-        let writer = InboundHalf(connection);
+        let reader = ConnectionHalf(connection.clone());
+        let writer = ConnectionHalf(connection);
         drop(writer);
         assert_eq!(live.load(Ordering::Acquire), 2, "reader still owns capacity");
         // Closing either half shuts down every clone of this socket.
