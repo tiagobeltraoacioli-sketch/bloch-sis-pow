@@ -4,7 +4,7 @@ use super::*;
 use crate::transition::{TransferInputV2, TransferOutput};
 use bloch_euvm::ustav::{Output, Transaction, Witnesses};
 
-fn fixture() -> (State, Request) {
+pub(in crate::transition::native_dex) fn fixture() -> (State, Request) {
     let (mut state, initial) = funded();
     let initialized = state
         .execute_initial_liquidity(&initial, 1, &BoundVerifier, &BoundVerifier)

@@ -31,7 +31,10 @@ Read-only native views and opaque full-state snapshots prevent extracting
 an executable component through the public rehearsal API. See the
 [joint rehearsal contract](BLOCH-JOINT-NATIVE-REHEARSAL.md) for its unit conversion,
 trust boundary and remaining block integration. Pool operations also have a
-bounded native wire dispatcher; this is not a network activation.
+bounded native wire dispatcher. The combined BLCH/native State additionally
+has a [bounded pool lifecycle dispatcher](../../crates/bloch-pos-committee/docs/pool-lifecycle-wire.md)
+covering creation through provider redemption and eligible closing. These local
+dispatchers do not activate the network.
 
 ## Actual ownership and integration boundary
 

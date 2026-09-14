@@ -18,7 +18,7 @@ pub struct QuoteRequest {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Quote {
     pub request: QuoteRequest,

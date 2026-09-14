@@ -2,7 +2,7 @@ use super::super::super::tests::{key, signature, BoundVerifier, DOMAIN};
 use super::super::tests::setup;
 use super::*;
 use crate::transition::{TransferInputV2, TransferOutput};
-fn funded_close() -> (State, CloseRequest) {
+pub(in crate::transition::native_dex) fn funded_close() -> (State, CloseRequest) {
     let (mut state, create) = setup();
     let receipt = state
         .execute_paired_custody(&create, 1, &BoundVerifier, &BoundVerifier)

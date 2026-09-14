@@ -35,7 +35,7 @@ reserves `[1_000_000, 60]`, supply `7_745` and maxima `[1_000_000, 30]` issue
 `add_liquidity::Request` combines the quote request, expected pool root, BLCH
 TransferV2, native transfer envelope and prepaid native work. The `BLCHLPAD`
 frame and distinct add authorization/output hash domains bind the complete
-intent and both funding legs. This frame has no network decoder yet.
+intent and both funding legs. The bounded [`pool_wire`](pool-lifecycle-wire.md) decoder supports this frame.
 
 The sole BLCH key is the depositor and signs the joint authorization. BLCH inputs
 include exactly the current reserve at the private reserve key index and at
@@ -94,5 +94,5 @@ replay/slippage, provider bounds, malformed snapshots, locked inputs, empty
 witness abuse and late-plan rollback.
 
 This implements the local pool lifecycle, not a live USDT market. Bounded network
-transport, wallet integration, block fee settlement, consensus/reorg persistence
+node/RPC admission, wallet integration, block fee settlement, consensus/reorg persistence
 and qualified operational USDT bridge services remain required.

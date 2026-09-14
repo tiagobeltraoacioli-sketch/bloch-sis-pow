@@ -14,6 +14,7 @@ pub mod backend;
 pub mod base_reserves;
 pub mod initial_liquidity;
 pub mod paired_custody;
+pub mod pool_wire;
 pub mod remove_liquidity;
 pub mod swap;
 pub mod swap_quote;

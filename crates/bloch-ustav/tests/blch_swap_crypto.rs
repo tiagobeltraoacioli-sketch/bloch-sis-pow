@@ -9,6 +9,7 @@ use bloch_euvm::ustav::{
 use bloch_euvm::Val;
 use bloch_pos_committee::header::BlockHeaderV4;
 use bloch_pos_committee::state_root::{EutxoEntry, EvmCommitment};
+use bloch_pos_committee::transition::native_dex::pool_wire;
 use bloch_pos_committee::transition::native_dex::State;
 use bloch_pos_committee::transition::{
     CommittedState, PosTransaction, TransferInputV2, TransferOutput, WitnessKey,
@@ -465,9 +466,14 @@ fn stranger_trader_swaps_both_directions_without_pool_owner_signature() {
     let first = swap_request(&state, pool, reserve, ([9; 32], 0), None);
     assert!(first.native.witnesses.owners[0].is_empty());
     let expected = state.quote_blch_swap(&first.quote, 4).unwrap();
+    let mut encoded_state = state.clone();
+    let frame = pool_wire::encode(&pool_wire::Request::Swap(first.clone()), &DOMAIN).unwrap();
+    pool_wire::apply_encoded(&mut encoded_state, &frame, 4, &BaseVerifier, &BlochVerifier).unwrap();
     let receipt = state
         .execute_blch_swap(&first, 4, &BaseVerifier, &BlochVerifier)
         .unwrap();
+    assert_eq!(encoded_state.state_root(), state.state_root());
+    assert_eq!(encoded_state.fee_escrow(), state.fee_escrow());
     assert_eq!(receipt.quote, expected);
     assert_eq!(
         state.blch_pool(&pool).unwrap().reserves(),

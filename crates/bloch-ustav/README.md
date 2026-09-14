@@ -29,7 +29,10 @@ liquidity permanently locked. [Atomic BLCH/native swaps](../bloch-pos-committee/
 and [proportional LP redemption](../bloch-pos-committee/docs/blch-lp-redemption.md)
 now execute in this local rehearsal. [Additional liquidity](../bloch-pos-committee/docs/blch-liquidity-additions.md)
 credits separate PQ-owned positions for up to 128 providers per pool. LP
-transfers remain unimplemented.
+transfers remain unimplemented. The [bounded pool lifecycle transport](../bloch-pos-committee/docs/pool-lifecycle-wire.md)
+dispatches six binary request types through those same atomic methods, with
+real PQ tests comparing encoded and direct execution. Node/RPC admission remains
+separate.
 
 [Color-Changing Chameleon v1](../bloch-euvm/docs/chameleon-v1.md) adds sealed
 PQ-native escrow, an explicit Kirpich ERC-20 compatibility profile and an

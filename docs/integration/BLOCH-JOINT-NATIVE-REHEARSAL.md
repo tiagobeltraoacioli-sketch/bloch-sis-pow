@@ -34,8 +34,11 @@ paired reserves.
 
 Paired reserve creation has its own [bounded binary transport](../../crates/bloch-pos-committee/docs/paired-custody-wire.md),
 preserving the same authorization, full-envelope fees and sealed execution.
-The binary creation dispatcher does not accept closing requests; closing is
-a separate typed State operation. No one-sided native release plan is exposed.
+The creation dispatcher remains creation-only. The separate
+[pool lifecycle transport](../../crates/bloch-pos-committee/docs/pool-lifecycle-wire.md)
+now decodes and dispatches creation, initialization, adds, swaps, provider
+redemptions and eligible closing to the same State methods. No one-sided native
+release plan is exposed. Neither dispatcher registers a live RPC or block type.
 
 ## Atomic authorization and planning
 

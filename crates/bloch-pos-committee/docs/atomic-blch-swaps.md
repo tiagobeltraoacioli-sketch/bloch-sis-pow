@@ -10,8 +10,8 @@ This is a local Rust API, not live node admission, a wallet RPC or bridge activa
 
 `swap::Request` contains a `swap_quote::Request`, the expected pool state root,
 a BLCH `TransferV2`, a native transfer envelope and a prepaid native gas budget.
-The `BLCHSWAP` canonical frame is used for signing/byte accounting; a bounded
-decoder and network dispatcher are not yet supplied. Its joint authorization
+The `BLCHSWAP` canonical frame is used for signing/byte accounting; the bounded
+[`pool_wire`](pool-lifecycle-wire.md) decoder dispatches it to the atomic State API. Its joint authorization
 commits to network domain, pool ID/root/revision, input asset and exact amount,
 minimum output, expiry height, gas and both funding transactions. All trader
 signatures authorize this joint hash. Ordinary transfer or paired custody
@@ -97,6 +97,6 @@ swap, signature corruption, recipient theft, slippage, stale roots, expiry,
 empty witness misuse, malformed vectors, foreign locks and atomic rejection.
 
 Qualified source-chain USDT backing/finality, operational bridge services,
-bounded network transport, wallet signing, block fee settlement, consensus
+node/RPC admission, wallet signing, block fee settlement, consensus
 activation and persistence/reorg integration remain separate required work.
 Local test-token swaps do not establish real USDT backing or production readiness.

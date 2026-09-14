@@ -9,6 +9,7 @@ use bloch_euvm::ustav::{
 use bloch_euvm::Val;
 use bloch_pos_committee::header::BlockHeaderV4;
 use bloch_pos_committee::state_root::{EutxoEntry, EvmCommitment};
+use bloch_pos_committee::transition::native_dex::pool_wire;
 use bloch_pos_committee::transition::native_dex::State;
 use bloch_pos_committee::transition::{
     CommittedState, PosTransaction, TransferInputV2, TransferOutput, WitnessKey,
@@ -571,9 +572,15 @@ fn real_pq_close_returns_both_assets_and_restored_state_rejects_replay() {
     let asset = request.native.transaction.asset;
     let supply = state.native().gateway().native().supply(&asset);
     let quote = state.quote_paired_close(&request).unwrap();
+    let mut encoded_state = state.clone();
+    let frame =
+        pool_wire::encode(&pool_wire::Request::ClosePair(request.clone()), &DOMAIN).unwrap();
+    pool_wire::apply_encoded(&mut encoded_state, &frame, 3, &BaseVerifier, &BlochVerifier).unwrap();
     let receipt = state
         .execute_paired_close(&request, 3, &BaseVerifier, &BlochVerifier)
         .unwrap();
+    assert_eq!(encoded_state.state_root(), state.state_root());
+    assert_eq!(encoded_state.fee_escrow(), state.fee_escrow());
     assert_eq!(receipt.charge, quote);
     assert!(state.paired_custody(&request.reserve).is_none());
     assert!(state.base_reserve(&request.reserve).is_none());

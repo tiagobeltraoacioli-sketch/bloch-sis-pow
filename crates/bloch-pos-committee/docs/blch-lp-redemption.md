@@ -17,7 +17,7 @@ proof and does not authorize execution.
 `Request` adds the expected pool root, both funding transactions and prepaid
 native work. The version-2 `BLCHLPRM` frame and version-2 authorization/output
 hash domains commit the length-prefixed provider key together with the complete
-intent. Older removal signatures are not reused. No network decoder is supplied.
+intent. Older removal signatures are not reused. The bounded [`pool_wire`](pool-lifecycle-wire.md) decoder supports this version.
 
 Both legs require real nonempty provider signatures over joint authorization.
 The BLCH key must match the identified LP provider. The private native verifier
@@ -75,6 +75,6 @@ minimum protection, swaps after redemption, restoration, replay, forged hybrid
 signatures, original-owner theft attempts, redirects, fees and malformed inputs.
 
 [Additional liquidity](blch-liquidity-additions.md) is now implemented. LP transfer,
-network transport, wallet signing, block settlement, consensus/reorg integration
+node/RPC admission, wallet signing, block settlement, consensus/reorg integration
 and an operational qualified USDT bridge remain separate work. Local native
 redemption does not release external USDT or establish source-chain backing.

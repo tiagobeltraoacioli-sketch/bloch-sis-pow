@@ -389,7 +389,7 @@ fn sign_swap(r: &mut super::super::swap::Request) {
         }
     }
 }
-fn swap_fixture() -> (State, super::super::swap::Request) {
+pub(in crate::transition::native_dex) fn swap_fixture() -> (State, super::super::swap::Request) {
     let (mut state, r) = funded();
     let receipt = state
         .execute_initial_liquidity(&r, 1, &BoundVerifier, &BoundVerifier)
@@ -734,7 +734,8 @@ fn sign_remove(r: &mut super::super::remove_liquidity::Request) {
     }
     r.native.witnesses.owners[0] = signature(&authorization, &key(1));
 }
-fn remove_fixture() -> (State, super::super::remove_liquidity::Request) {
+pub(in crate::transition::native_dex) fn remove_fixture(
+) -> (State, super::super::remove_liquidity::Request) {
     let (mut state, initial) = funded();
     let receipt = state
         .execute_initial_liquidity(&initial, 1, &BoundVerifier, &BoundVerifier)

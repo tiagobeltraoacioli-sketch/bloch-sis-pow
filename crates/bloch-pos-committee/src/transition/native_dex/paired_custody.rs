@@ -1,5 +1,7 @@
 //! Atomic paired reserve creation and unconverted closing. Pool swaps use a separate dispatcher.
 mod close;
+#[cfg(test)]
+pub(super) use close::tests::funded_close;
 pub mod wire;
 use super::base_reserves::{reserve_id, reserve_script, Record, MAX_RESERVES};
 use super::*;

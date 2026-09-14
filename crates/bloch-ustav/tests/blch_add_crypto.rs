@@ -230,14 +230,27 @@ fn resign(request: &mut Request) {
 use bloch_euvm::ustav::OutPoint;
 use bloch_pos_committee::transition::native_dex::base_reserves::RESERVE_KEY_INDEX;
 use bloch_pos_committee::transition::native_dex::{
-    add_liquidity, initial_liquidity, remove_liquidity,
+    add_liquidity, initial_liquidity, pool_wire, remove_liquidity,
 };
 
 fn initialized() -> (State, [u8; 32], [u8; 32], OutPoint) {
     let (mut state, creation, funding) = fixture();
+    let mut encoded_state = state.clone();
+    let encoded_request =
+        pool_wire::encode(&pool_wire::Request::CreatePair(creation.clone()), &DOMAIN).unwrap();
+    pool_wire::apply_encoded(
+        &mut encoded_state,
+        &encoded_request,
+        2,
+        &BaseVerifier,
+        &BlochVerifier,
+    )
+    .unwrap();
     let created = state
         .execute_paired_custody(&creation, 2, &BaseVerifier, &BlochVerifier)
         .unwrap();
+    assert_eq!(encoded_state.state_root(), state.state_root());
+    assert_eq!(encoded_state.fee_escrow(), state.fee_escrow());
     let mut init = initial_liquidity::Request {
         reserve: created.reserve.id,
         creation_authorization: created.authorization,
@@ -275,9 +288,22 @@ fn initialized() -> (State, [u8; 32], [u8; 32], OutPoint) {
     if let PosTransaction::TransferV2 { keys, .. } = &mut init.blch {
         keys[0].signature = signature(&auth, &identities()[0].1);
     }
+    let mut encoded_state = state.clone();
+    let encoded_request =
+        pool_wire::encode(&pool_wire::Request::Initialize(init.clone()), &DOMAIN).unwrap();
+    pool_wire::apply_encoded(
+        &mut encoded_state,
+        &encoded_request,
+        3,
+        &BaseVerifier,
+        &BlochVerifier,
+    )
+    .unwrap();
     let initialized = state
         .execute_initial_liquidity(&init, 3, &BaseVerifier, &BlochVerifier)
         .unwrap();
+    assert_eq!(encoded_state.state_root(), state.state_root());
+    assert_eq!(encoded_state.fee_escrow(), state.fee_escrow());
     (state, initialized.pool, created.reserve.id, funding)
 }
 
@@ -394,6 +420,9 @@ fn reject_remove(state: &mut State, request: &remove_liquidity::Request) {
     assert!(state
         .execute_blch_remove(request, 4, &BaseVerifier, &BlochVerifier)
         .is_err());
+    if let Ok(frame) = pool_wire::encode(&pool_wire::Request::Remove(request.clone()), &DOMAIN) {
+        assert!(pool_wire::apply_encoded(state, &frame, 4, &BaseVerifier, &BlochVerifier).is_err());
+    }
     assert_eq!(state.state_root(), root);
     assert_eq!(state.base(), &base);
     assert_eq!(state.native().snapshot(), native);
@@ -536,6 +565,9 @@ fn reject_add(state: &mut State, request: &add_liquidity::Request) {
     assert!(state
         .execute_blch_add(request, 4, &BaseVerifier, &BlochVerifier)
         .is_err());
+    if let Ok(frame) = pool_wire::encode(&pool_wire::Request::Add(request.clone()), &DOMAIN) {
+        assert!(pool_wire::apply_encoded(state, &frame, 4, &BaseVerifier, &BlochVerifier).is_err());
+    }
     assert_eq!(state.state_root(), root);
     assert_eq!(state.base(), &base);
     assert_eq!(state.native().snapshot(), native);
@@ -563,9 +595,22 @@ fn independent_provider_adds_balanced_and_unbalanced_then_redeems_only_own_lp() 
     assert_eq!(expected.amounts_in, [999_993, 6_000]);
     assert_eq!(expected.unused_maximum, [7, 0]);
     assert_eq!(expected.lp_minted, 77_459);
+    let mut encoded_state = state.clone();
+    let encoded_request =
+        pool_wire::encode(&pool_wire::Request::Add(first.clone()), &DOMAIN).unwrap();
+    pool_wire::apply_encoded(
+        &mut encoded_state,
+        &encoded_request,
+        4,
+        &BaseVerifier,
+        &BlochVerifier,
+    )
+    .unwrap();
     let first_receipt = state
         .execute_blch_add(&first, 4, &BaseVerifier, &BlochVerifier)
         .unwrap();
+    assert_eq!(encoded_state.state_root(), state.state_root());
+    assert_eq!(encoded_state.fee_escrow(), state.fee_escrow());
     assert_eq!(first_receipt.quote, expected);
     assert_eq!(
         state.blch_lp_position(&pool, &identities()[2].0),
@@ -641,9 +686,22 @@ fn independent_provider_adds_balanced_and_unbalanced_then_redeems_only_own_lp() 
     }
     stolen.native.witnesses.owners[0] = signature(&auth, &identities()[0].1);
     reject_remove(&mut state, &stolen);
+    let mut encoded_state = state.clone();
+    let encoded_request =
+        pool_wire::encode(&pool_wire::Request::Remove(redeem.clone()), &DOMAIN).unwrap();
+    pool_wire::apply_encoded(
+        &mut encoded_state,
+        &encoded_request,
+        4,
+        &BaseVerifier,
+        &BlochVerifier,
+    )
+    .unwrap();
     let redeemed = state
         .execute_blch_remove(&redeem, 4, &BaseVerifier, &BlochVerifier)
         .unwrap();
+    assert_eq!(encoded_state.state_root(), state.state_root());
+    assert_eq!(encoded_state.fee_escrow(), state.fee_escrow());
     assert_eq!(state.blch_lp_position(&pool, &identities()[2].0), 0);
     assert_eq!(
         state.blch_lp_position(&pool, &identities()[0].0),
