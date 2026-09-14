@@ -15,8 +15,13 @@ use crate::state::{self, Proof, SparseMerkleTree};
 use crate::{AssetId, Ctx, SigVerifier, Val, VmError};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod amm;
 pub mod chameleon;
+pub mod gateway;
+pub mod pairs;
+pub mod transfer_wire;
 mod encoding;
+mod native_wire;
 use encoding::HashWriter;
 
 pub const KERNEL_VERSION: u32 = 3;
