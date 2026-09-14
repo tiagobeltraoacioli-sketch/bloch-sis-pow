@@ -11,6 +11,7 @@ use sha3::{Digest, Sha3_256};
 use std::collections::BTreeMap;
 pub mod backend;
 pub mod base_reserves;
+pub mod initial_liquidity;
 pub mod paired_custody;
 pub mod wire;
 
@@ -130,6 +131,8 @@ pub struct State {
     base_locks: BTreeMap<base_reserves::OutPoint, [u8; 32]>,
     paired_reserves: BTreeMap<[u8; 32], bloch_euvm::ustav::gateway::pools::custody::Record>,
     paired_locks: BTreeMap<bloch_euvm::ustav::OutPoint, [u8; 32]>,
+    initial_pools: BTreeMap<[u8; 32], initial_liquidity::Record>,
+    reserve_pools: BTreeMap<[u8; 32], [u8; 32]>,
 }
 /// Opaque complete-state checkpoint. Only State::restore can consume it.
 /// ```compile_fail
@@ -146,6 +149,7 @@ pub struct Snapshot {
     priority_fees: u128,
     base_reserves: Vec<base_reserves::Record>,
     paired_reserves: Vec<bloch_euvm::ustav::gateway::pools::custody::Record>,
+    initial_pools: Vec<initial_liquidity::Record>,
 }
 #[derive(Clone, Debug)]
 pub struct Execution {
@@ -192,6 +196,8 @@ impl State {
             base_locks: BTreeMap::new(),
             paired_reserves: BTreeMap::new(),
             paired_locks: BTreeMap::new(),
+            initial_pools: BTreeMap::new(),
+            reserve_pools: BTreeMap::new(),
         })
     }
     pub fn base(&self) -> &CommittedState {
@@ -205,7 +211,8 @@ impl State {
     }
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
-            version: 3,
+            version: 4,
+            initial_pools: self.initial_pools.values().cloned().collect(),
             paired_reserves: self.paired_reserves.values().cloned().collect(),
             base: self.base.clone(),
             native: self.native.snapshot(),
@@ -220,7 +227,7 @@ impl State {
         trusted_root: [u8; 32],
         verifier: &dyn Verifier,
     ) -> Result<Self, Error> {
-        if snapshot.version != 3 {
+        if snapshot.version != 4 {
             return Err(Error::InvalidRoot);
         }
         let native = PoolLedger::restore(snapshot.native, snapshot.native_root, verifier)
@@ -232,6 +239,7 @@ impl State {
         state.priority_fees = snapshot.priority_fees;
         state.restore_base_reserves(snapshot.base_reserves, verifier)?;
         state.restore_paired_reserves(snapshot.paired_reserves, verifier)?;
+        state.restore_initial_pools(snapshot.initial_pools)?;
         if state.state_root() != trusted_root {
             return Err(Error::InvalidRoot);
         }
@@ -239,7 +247,7 @@ impl State {
     }
     pub fn state_root(&self) -> [u8; 32] {
         let mut h = Sha3_256::new();
-        h.update(b"BLOCH-JOINT-REHEARSAL-STATE-v3");
+        h.update(b"BLOCH-JOINT-REHEARSAL-STATE-v4");
         h.update(self.domain);
         h.update(self.base.compute_root());
         h.update(self.native.state_root());
@@ -247,6 +255,7 @@ impl State {
         h.update(self.priority_fees.to_le_bytes());
         self.hash_base_reserves(&mut h);
         self.hash_paired_reserves(&mut h);
+        self.hash_initial_pools(&mut h);
         h.finalize().into()
     }
     pub fn quote(&self, request: &Request) -> Result<fee_market::TxCharge, Error> {

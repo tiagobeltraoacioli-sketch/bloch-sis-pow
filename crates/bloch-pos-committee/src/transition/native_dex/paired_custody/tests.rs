@@ -2,7 +2,7 @@ use super::super::tests::{fixture, key, signature, BoundVerifier, COIN, DOMAIN};
 use super::*;
 use crate::transition::{TransferOutput, WitnessKey};
 
-pub(super) fn setup() -> (State, Request) {
+pub(in crate::transition::native_dex) fn setup() -> (State, Request) {
     let (state, joint) = fixture();
     let mut native = state.native.clone();
     let mut envelope = joint.native;

@@ -19,6 +19,7 @@ use bloch_euvm::{
 pub struct NativeSnapshot {
     native: bloch_euvm::ustav::gateway::pools::Snapshot,
     paired: Vec<custody::Record>,
+    pools: Vec<initial_liquidity::Record>,
 }
 /// Queries retain the complete State's custody restrictions.
 /// ```compile_fail
@@ -65,12 +66,14 @@ impl<'a> NativeView<'a> {
         h.update(b"BLOCH-OWNED-NATIVE-v1");
         h.update(self.state.native.state_root());
         self.state.hash_paired_reserves(&mut h);
+        self.state.hash_initial_pools(&mut h);
         h.finalize().into()
     }
     pub fn snapshot(&self) -> NativeSnapshot {
         NativeSnapshot {
             native: self.state.native.snapshot(),
             paired: self.state.paired_reserves.values().cloned().collect(),
+            pools: self.state.initial_pools.values().cloned().collect(),
         }
     }
     pub fn pool(&self, id: &[u8; 32]) -> Option<&'a bloch_euvm::ustav::amm::PoolState> {
@@ -121,7 +124,7 @@ impl State {
         }
         Ok(())
     }
-    fn supported_paired_asset(&self, asset: &AssetId) -> Result<(), Error> {
+    pub(super) fn supported_paired_asset(&self, asset: &AssetId) -> Result<(), Error> {
         let r = self
             .native
             .gateway()

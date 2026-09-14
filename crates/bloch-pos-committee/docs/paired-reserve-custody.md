@@ -2,8 +2,10 @@
 
 The default-off `native-dex-rehearsal` feature supports paired reserve creation
 and owner-authorized closing in local state. It is not live liquidity, an LP
-position, a swap, an external bridge withdrawal or an activated Genesis-4
-transaction. All examples and tests use local funding.
+redemption, a swap, an external bridge withdrawal or an activated Genesis-4
+transaction. The separate [initial liquidity](initial-blch-liquidity.md)
+operation can convert funded reserves into a pool with a sealed LP position.
+All examples and tests use local funding.
 
 ## One concrete settlement boundary
 
@@ -55,7 +57,9 @@ both assets or neither. A distinct close authorization commits to both exact
 legs, fee terms, reserve ID, creation authorization and network domain. A
 creation signature or ordinary transfer signature cannot authorize closing.
 
-The admitted original owner must sign both legs. The native leg consumes
+Only unconverted reserves can close. Once [initial liquidity](initial-blch-liquidity.md)
+has assigned LP ownership, this close path rejects the reserve to preserve the
+locked minimum and LP accounting. The admitted original owner must sign both legs. The native leg consumes
 exactly the recorded reserve and returns its full amount to that owner in one
 output. BLCH output zero returns the full BLCH reserve to the owner's actual
 key commitment. At least one additional ordinary BLCH input pays the fees;
@@ -83,8 +87,9 @@ with custody bookkeeping charged separately. These reference costs are not a
 calibrated production fee schedule. Each asset conserves independently;
 fees are retained in the committed BLCH fee escrow.
 
-Snapshot and outer-root version 3 include paired custody records alongside both
-ledger roots, base reserve metadata and fees. Versions 1 and 2 are rejected;
+Snapshot and outer-root version 4 include paired custody and initial pool/LP
+records alongside both ledger roots, base reserve metadata and fees. Versions
+1, 2 and 3 are rejected;
 no live chain migration is performed. Restore checks canonical record ordering,
 unique locks, admitted owners, exact amounts/assets/outpoints, correspondence
 to the BLCH record and creation authorization, and non-overlap with native AMM
@@ -102,6 +107,7 @@ cargo +1.94.1 test --locked -p bloch-ustav --test paired_custody_crypto --test j
 Tests cover real hybrid PQ signatures, malformed/unauthorized requests,
 independent conservation, reserve locks, partial-settlement refusal, replay and
 complete restoration. Locally issued test tokens are not proof of external
-USDT backing. A production BLCH/USDT market still requires atomic AMM/LP rules,
+USDT backing. Initial LP issuance is implemented; a production BLCH/USDT market
+still requires subsequent liquidity additions, swaps, liquidity removal,
 wallet signing, closing transport, network admission, block fee settlement,
 consensus commitments, replay/reorg integration and independent review.

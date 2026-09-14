@@ -168,6 +168,9 @@ impl ReserveSpend {
         authorization: [u8; 32],
     ) -> Result<Self, Error> {
         let record = state.base_reserves.get(id).ok_or(Error::InvalidReserve)?;
+        if state.reserve_pools.contains_key(id) {
+            return Err(Error::LockedReserve);
+        }
         if !state.paired_reserves.contains_key(id)
             || state.base_locks.get(&record.outpoint) != Some(id)
         {

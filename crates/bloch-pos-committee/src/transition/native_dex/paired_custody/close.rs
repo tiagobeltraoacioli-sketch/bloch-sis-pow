@@ -104,6 +104,9 @@ impl State {
         native_verifier: &dyn Verifier,
     ) -> Result<CloseReceipt, Error> {
         let charge = self.quote_paired_close(request)?;
+        if self.reserve_pools.contains_key(&request.reserve) {
+            return Err(Error::LockedReserve);
+        }
         if height > request.valid_until
             || request.native.transaction.valid_until > request.valid_until
         {

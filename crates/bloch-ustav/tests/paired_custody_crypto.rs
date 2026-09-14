@@ -624,3 +624,217 @@ fn real_pq_close_returns_both_assets_and_restored_state_rejects_replay() {
         .spendable_output(&receipt.native.outputs[0])
         .is_some());
 }
+
+use bloch_pos_committee::transition::native_dex::initial_liquidity::Request as LiquidityRequest;
+
+fn liquidity_fixture() -> (State, LiquidityRequest, CloseRequest) {
+    let (state, close) = close_fixture();
+    let fee_input = match &close.blch {
+        PosTransaction::TransferV2 { inputs, .. } => inputs[1].clone(),
+        _ => unreachable!(),
+    };
+    let mut request = LiquidityRequest {
+        reserve: close.reserve,
+        creation_authorization: close.creation_authorization,
+        fee_bps: 30,
+        minimum_lp: 1,
+        valid_until: 100,
+        blch: PosTransaction::TransferV2 {
+            keys: vec![WitnessKey {
+                pubkey: identities()[0].0.clone(),
+                signature: vec![0; 5500],
+            }],
+            inputs: vec![fee_input],
+            outputs: vec![TransferOutput {
+                value: 1,
+                script_hash: Sha3_256::digest(&identities()[0].0).into(),
+            }],
+            tx_bytes: 0,
+            tip_millisat_per_gas: 2,
+        },
+    };
+    finalize_liquidity(&state, &mut request);
+    (state, request, close)
+}
+fn finalize_liquidity(state: &State, request: &mut LiquidityRequest) {
+    let len = request.canonical_bytes(&DOMAIN).unwrap().len() as u64;
+    if let PosTransaction::TransferV2 { tx_bytes, .. } = &mut request.blch {
+        *tx_bytes = len + 256;
+    }
+    let quote = state.quote_initial_liquidity(request).unwrap();
+    if let PosTransaction::TransferV2 {
+        inputs, outputs, ..
+    } = &mut request.blch
+    {
+        let funding = state
+            .base()
+            .utxo(&inputs[0].txid, inputs[0].vout)
+            .unwrap()
+            .value;
+        outputs[0].value = funding - (quote.base_fee_sat + quote.priority_fee_sat) as u64;
+    }
+    sign_liquidity(request, 0);
+}
+fn sign_liquidity(request: &mut LiquidityRequest, key_index: usize) {
+    let hash = request.authorization(&DOMAIN).unwrap();
+    if let PosTransaction::TransferV2 { keys, .. } = &mut request.blch {
+        keys[0].signature = signature(&hash, &identities()[key_index].1);
+    }
+}
+fn reject_liquidity_unchanged(state: &mut State, request: &LiquidityRequest) {
+    let root = state.state_root();
+    let native = state.native().snapshot();
+    let base = state.base().clone();
+    let fees = state.fee_escrow();
+    assert!(state
+        .execute_initial_liquidity(request, 3, &BaseVerifier, &BlochVerifier)
+        .is_err());
+    assert_eq!(state.state_root(), root);
+    assert_eq!(state.native().snapshot(), native);
+    assert_eq!(state.base(), &base);
+    assert_eq!(state.fee_escrow(), fees);
+}
+#[test]
+fn real_pq_initial_liquidity_conserves_reserves_and_locks_minimum_lp() {
+    let (mut state, request, mut close) = liquidity_fixture();
+    let base_reserve = state.base_reserve(&request.reserve).unwrap().clone();
+    let native_reserve = state.paired_custody(&request.reserve).unwrap().clone();
+    let native_before = state.native().snapshot();
+    let supply_before = state
+        .native()
+        .gateway()
+        .native()
+        .supply(&native_reserve.asset);
+    let native_output_before = state
+        .native()
+        .gateway()
+        .native()
+        .output(&native_reserve.outpoint)
+        .unwrap()
+        .clone();
+    let quote = state.quote_initial_liquidity(&request).unwrap();
+    let fees_before = state.fee_escrow();
+    let receipt = state
+        .execute_initial_liquidity(&request, 3, &BaseVerifier, &BlochVerifier)
+        .unwrap();
+    // Independent integer expectation: floor(sqrt(10_000_000 * 60_000)) = 774596.
+    assert_eq!(receipt.lp_minted, 773_596);
+    let pool = state.blch_pool(&receipt.pool).unwrap();
+    assert_eq!(pool.assets(), [bloch_euvm::BLCH, native_reserve.asset]);
+    assert_eq!(pool.reserves(), [BASE_RESERVE, 60_000]);
+    assert_eq!(pool.lp_supply(), 774_596);
+    assert_eq!(pool.revision(), 1);
+    assert_eq!(pool.fee_bps(), 30);
+    assert_eq!(
+        state.blch_lp_position(&receipt.pool, &identities()[0].0),
+        773_596
+    );
+    assert_eq!(state.blch_lp_position(&receipt.pool, &identities()[2].0), 0);
+    assert_eq!(state.blch_lp_position(&receipt.pool, &[]), 0);
+    assert_eq!(state.base_reserve(&request.reserve), Some(&base_reserve));
+    assert_eq!(
+        state.paired_custody(&request.reserve),
+        Some(&native_reserve)
+    );
+    // Owned native diagnostics now also commit LP authority, even though token
+    // supply and the actual reserved token output remain unchanged.
+    assert_ne!(state.native().snapshot(), native_before);
+    assert_eq!(
+        state
+            .native()
+            .gateway()
+            .native()
+            .supply(&native_reserve.asset),
+        supply_before
+    );
+    assert_eq!(
+        state
+            .native()
+            .gateway()
+            .native()
+            .output(&native_reserve.outpoint),
+        Some(&native_output_before)
+    );
+    assert_eq!(receipt.charge, quote);
+    assert_eq!(
+        state.fee_escrow(),
+        (
+            fees_before.0 + quote.base_fee_sat,
+            fees_before.1 + quote.priority_fee_sat
+        )
+    );
+    let mut restored =
+        State::restore(state.snapshot(), state.state_root(), &BlochVerifier).unwrap();
+    assert_eq!(
+        restored.blch_lp_position(&receipt.pool, &identities()[0].0),
+        receipt.lp_minted
+    );
+    assert_eq!(
+        restored.blch_pool(&receipt.pool),
+        state.blch_pool(&receipt.pool)
+    );
+    // Refresh actual fee funding: this otherwise-valid close must not bypass LP custody.
+    if let PosTransaction::TransferV2 { inputs, .. } = &mut close.blch {
+        inputs[1].txid = receipt.blch_txid;
+        inputs[1].vout = 0;
+    }
+    let quote = restored.quote_paired_close(&close).unwrap();
+    if let PosTransaction::TransferV2 { outputs, .. } = &mut close.blch {
+        outputs[1].value = restored.base().utxo(&receipt.blch_txid, 0).unwrap().value
+            - (quote.base_fee_sat + quote.priority_fee_sat) as u64;
+    }
+    sign_close(&mut close);
+    let root = restored.state_root();
+    assert!(matches!(
+        restored.execute_paired_close(&close, 4, &BaseVerifier, &BlochVerifier),
+        Err(bloch_pos_committee::transition::native_dex::Error::LockedReserve)
+    ));
+    assert_eq!(restored.state_root(), root);
+    // A fresh fee input does not permit a second issuance for the same reserve.
+    let mut duplicate = request.clone();
+    if let PosTransaction::TransferV2 { inputs, .. } = &mut duplicate.blch {
+        inputs[0].txid = receipt.blch_txid;
+        inputs[0].vout = 0;
+    }
+    finalize_liquidity(&restored, &mut duplicate);
+    reject_liquidity_unchanged(&mut restored, &duplicate);
+    assert_eq!(
+        restored.blch_lp_position(&receipt.pool, &identities()[0].0),
+        773_596
+    );
+}
+#[test]
+fn real_pq_initial_liquidity_rejects_forgery_theft_and_minimum_lp_violation() {
+    let (mut state, request, _) = liquidity_fixture();
+    for offset in [
+        crypto::SUITE_HEADER_LEN,
+        crypto::SUITE_HEADER_LEN + crypto::MLDSA_SIG_LEN + 1,
+    ] {
+        let mut bad = request.clone();
+        if let PosTransaction::TransferV2 { keys, .. } = &mut bad.blch {
+            keys[0].signature[offset] ^= 1;
+        }
+        reject_liquidity_unchanged(&mut state, &bad);
+    }
+    let mut bad = request.clone();
+    bad.minimum_lp = 773_597;
+    sign_liquidity(&mut bad, 0);
+    reject_liquidity_unchanged(&mut state, &bad);
+    let mut bad = request.clone();
+    bad.creation_authorization[0] ^= 1;
+    sign_liquidity(&mut bad, 0);
+    reject_liquidity_unchanged(&mut state, &bad);
+    let mut bad = request.clone();
+    if let PosTransaction::TransferV2 { keys, outputs, .. } = &mut bad.blch {
+        keys[0].pubkey = identities()[2].0.clone();
+        outputs[0].script_hash = Sha3_256::digest(&identities()[2].0).into();
+    }
+    sign_liquidity(&mut bad, 2);
+    reject_liquidity_unchanged(&mut state, &bad);
+    let mut bad = request.clone();
+    bad.fee_bps = 31; // The original owner did not sign this fee schedule.
+    reject_liquidity_unchanged(&mut state, &bad);
+    state
+        .execute_initial_liquidity(&request, 3, &BaseVerifier, &BlochVerifier)
+        .unwrap();
+}

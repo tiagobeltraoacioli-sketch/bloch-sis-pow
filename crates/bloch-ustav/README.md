@@ -22,7 +22,10 @@ The test-only joint BLCH/native dependency explicitly enables the consensus
 crate's optional [rehearsal](../../docs/integration/BLOCH-JOINT-NATIVE-REHEARSAL.md).
 It verifies an atomic transfer with real hybrid signatures and committed BLCH
 UTXOs. This does not enable native execution in default node builds or create
-a live BLCH AMM pool.
+a live BLCH AMM pool. The same default-off state now supports
+[initial BLCH/native liquidity](../bloch-pos-committee/docs/initial-blch-liquidity.md):
+existing paired reserves back a sealed initial LP position, with the minimum
+liquidity permanently locked. Swaps and LP redemption remain unimplemented.
 
 [Color-Changing Chameleon v1](../bloch-euvm/docs/chameleon-v1.md) adds sealed
 PQ-native escrow, an explicit Kirpich ERC-20 compatibility profile and an

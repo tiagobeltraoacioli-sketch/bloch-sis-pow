@@ -66,10 +66,10 @@ there is no network decoder or block dispatch for them yet.
 
 ## Persistence and validation
 
-The rehearsal snapshot and outer root use version 3 and commit every
+The rehearsal snapshot and outer root use version 4 and commit every
 reserve's ID, seed, owner, amount, revision and outpoint alongside both ledger
-roots, paired custody records and fee counters. Old version-1 and version-2
-snapshots are refused rather than silently losing custody metadata. Restore reconstructs unique locks and checks the
+roots, paired custody records, initial pool/LP records and fee counters. Old
+version-1, version-2 and version-3 snapshots are refused rather than silently losing custody metadata. Restore reconstructs unique locks and checks the
 actual UTXO, output index zero, amount, protocol script, ID derivation and PQ
 owner admission against an independently authenticated outer root.
 
@@ -88,5 +88,6 @@ The separate [paired reserve creation](paired-reserve-custody.md) operation now
 funds and locks both assets atomically. Reserves created through that operation
 cannot use this standalone continuation path; changing one side independently
 would break the authenticated pairing. The paired closing dispatcher returns
-both assets atomically to their original owner. AMM/LP transitions remain
+both assets atomically to their original owner. The separate initial-liquidity operation issues backed LP positions and blocks
+this closing path for converted reserves. Swaps and liquidity removal remain
 unimplemented.
