@@ -1,6 +1,23 @@
 # Validator opening release checklist
 
-Status: **blocked by conflicting live finalized checkpoints observed on
+Current status, September 14, 2026: **technical admission is active at epoch
+2884; the 64-validator runtime audit and a fresh keyless synchronization have
+passed. Controlled mainnet exit, withdrawal and payout-spend qualification
+and independent production key-generation qualification remain pending.**
+See the [current public evidence](https://blochl1.com/releases/2026-09-14/onboarding-verification.json).
+The historical checklists below retain their original scope; they are not a
+current fleet outage report. Public onboarding availability does not satisfy
+the outstanding ADR-041 settlement criterion.
+
+The September 14 rerun and its retained-log hashes are recorded in
+[source qualification evidence](audit/reproducers/validator-qualification-2026-09-14.json).
+It covers key custody regressions, the offline CLI, withdrawal-guard
+mutations and the isolated full lifecycle. It does not qualify production
+key generation independently or claim a settled mainnet payout.
+The [current operator procedure](https://blochl1.com/docs/validator-qualification.md)
+lists the public funding/identity inputs and settlement evidence still needed.
+
+Historical status, September 13: **blocked by conflicting live finalized checkpoints observed on
 2026-09-13 UTC**. The read-only survey found 56 RPCs on one finalized history,
 six on another and one stale node. Index 63 was subsequently located inactive
 on HOST-006, with an older masked copy on CLASSIC-003. See the

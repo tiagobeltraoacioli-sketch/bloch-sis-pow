@@ -1,0 +1,97 @@
+{
+  "updated_utc": "2026-09-14T23:52:35.569667+00:00",
+  "source_commit": "58da5ce209acb6e293b3b381dfd826dedb8741fd",
+  "toolchain": "rustc 1.94.1",
+  "test_platform": "macOS x86_64; local source-built debug test executables",
+  "published_linux_binary_sha256": "b3171d1227333284d65c7f60ac925d9e49123908d4c5fcb124ede3f1568a1084",
+  "scope": "Source-level regression qualification; not execution of the published Linux binary and not an independent audit.",
+  "identity_helper_tests": {
+    "passed": 4,
+    "scope": "Fake executable and mocked hash command; PTY checks trace/export exposure, terminal restoration, overwrite refusal, weak passphrase refusal and malformed public metadata."
+  },
+  "key_unit_tests": {
+    "passed": 27,
+    "failed": 0
+  },
+  "offline_cli_tests": {
+    "sealed_keystore": 3,
+    "sealed_deposit_roles": 1,
+    "failed": 0
+  },
+  "withdrawal_mutations": {
+    "control": "passed",
+    "killed": 8,
+    "shipping_source_unchanged": true
+  },
+  "isolated_lifecycle": {
+    "status": "passed",
+    "admission_and_invalid_mempool_tests": 2,
+    "automatic_randao_renewal_tests": 1,
+    "scope": "Two in-process engines with disposable keys; lifecycle gates compiled at zero in a copied source tree. Real withdrawal epoch delay retained; short RANDAO chain compiled separately.",
+    "covers": [
+      "funded registration",
+      "finalized activation",
+      "new proposer and included attestation",
+      "authenticated exit",
+      "slashing evidence",
+      "withdrawal maturity",
+      "automatic payout",
+      "duplicate withdrawal refusal",
+      "TransferV2 payout spend",
+      "replay state agreement",
+      "automatic RANDAO renewal"
+    ]
+  },
+  "initial_attempt": {
+    "status": "infrastructure_failure",
+    "reason": "Sandbox refused local socket bind; not counted as a protocol failure or a passing test. Approved retry completed."
+  },
+  "production_actions": {
+    "keys_generated": false,
+    "funds_submitted": false,
+    "fleet_restarted": false
+  },
+  "mainnet_lifecycle": {
+    "status": "not_started",
+    "requires": "Operator-designated public funding inputs and new test identity; human offline signatures, actual maturity and settled payout spend."
+  },
+  "independent_production_key_generation_review": "pending",
+  "logs": {
+    "identity_helper": {
+      "file": "bloch-identity-helper-20260914.log",
+      "sha256": "805c097d3bb2d8bbb0b556a56595aa700be94305e8e46980a36f5ad36e866446",
+      "bytes": 102
+    },
+    "key_unit": {
+      "file": "bloch-key-qualification-20260914.log",
+      "sha256": "206322ac5407f687e3253edf3363227b5358b78fca0d85b6bb5e3c9a0117536e",
+      "bytes": 9217
+    },
+    "offline_cli": {
+      "file": "bloch-offline-cli-qualification-20260914.log",
+      "sha256": "cf219515cfadc90711ec4e339f2ec3b9298e84b10d6610c9988ad38fe285c57e",
+      "bytes": 5191
+    },
+    "withdrawal_guards": {
+      "file": "bloch-withdrawal-guards-20260914.log",
+      "sha256": "8de29f671d36c7ffc4ccaa4b89c32e7e67538c5a8135b7b00d7e47cad9bfce8d",
+      "bytes": 245
+    },
+    "lifecycle": {
+      "file": "bloch-lifecycle-qualification-20260914-retry.log",
+      "sha256": "da9bfd727926d624f5787787a42d2469f39e623924b32d099411fe448589244b",
+      "bytes": 1495892
+    },
+    "initial_sandbox_failure": {
+      "file": "bloch-lifecycle-qualification-20260914.log",
+      "sha256": "709fb22aaf97fa9dc7ac5b3a16d6bb85edfeb756c2c3a5163ab14211951205be",
+      "bytes": 5061
+    }
+  },
+  "commands": [
+    "cargo +1.94.1 test --locked -p bloch-pos-node keys::tests -- --nocapture",
+    "cargo +1.94.1 test --locked -p bloch-pos-node --test keys_seal_cli --test validator_deposit_cli",
+    "python3 scripts/check-validator-lifecycle-mutations.py",
+    "python3 scripts/rehearse-validator-admission.py"
+  ]
+}
