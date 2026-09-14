@@ -22,8 +22,9 @@ asset, issue LP, release a native reserve, or implement a withdrawal operation.
 additionally binds BLCH and registered-token funding in one authenticated
 operation and locks both reserves atomically. The separate
 [initial-liquidity operation](../../crates/bloch-pos-committee/docs/initial-blch-liquidity.md)
-converts funded reserves into a pool and issues a backed LP position. Swaps,
-subsequent liquidity additions and liquidity removal remain unimplemented.
+converts funded reserves into a pool and issues a backed LP position. Separate
+atomic dispatchers now support swaps and owner-authorized proportional LP
+redemption. Subsequent liquidity additions remain unimplemented.
 The separate owner-authorized
 closing operation returns both full reserves atomically before conversion into
 a pool, with fees funded separately. Converted reserves cannot use that close
@@ -100,8 +101,9 @@ rehearsal while discarding its fee escrow.
 query facade does not expose an executable inner ledger, and complete snapshots
 have private fields. `snapshot` and `restore` carry both ledgers, fee counters,
 BLCH reserves, paired records, initial funding and evolving pool/LP ownership
-under version 5; versions 1 through 4 are rejected. Atomic swaps rotate both
-reserve outputs and locks while preserving initial LP ownership.
+under version 6; versions 1 through 5 are rejected. Atomic swaps rotate both
+reserve outputs and locks while preserving LP balances. Redemption burns only
+the owner position and retains the permanently locked minimum.
 Restore rebuilds and validates the locks and complete expected outer root.
 A whole-state clone retains both sides; component extraction is not supported.
 This remains a typed local snapshot; production persistence/network codecs are

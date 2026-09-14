@@ -20,7 +20,8 @@ full-payload fees and a separately committed fee escrow. It does not add a
 live block transaction. The same concrete State now owns paired BLCH/native
 reserve locks, with atomic creation and same-owner closing before pool
 conversion. Initial liquidity now creates a backed LP position; subsequent
-deposits and LP redemption remain open. Exact-input swaps now validate and
+deposits remain open. Owner-authorized LP redemption now burns shares and
+returns both assets while retaining the locked minimum. Exact-input swaps validate and
 commit both reserve legs, trader funding and fees atomically in the rehearsal. Read-only exact-input
 swap quotes recheck actual backing and LP authority, then enforce the pool
 revision, domain, expiry and minimum output. They provide no reserve-spend

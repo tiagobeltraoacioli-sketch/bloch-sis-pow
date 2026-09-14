@@ -3,9 +3,9 @@
 The default-off `native-dex-rehearsal` feature can initialize a BLCH/native pool
 from an existing fully funded paired reserve. This creates an authenticated LP
 position in local state. The separate [atomic swap dispatcher](atomic-blch-swaps.md)
-now trades against those reserves. This does not activate a live market or add
-subsequent deposits, LP transfers or liquidity removal. Use local test funding;
-there is no LP redemption operation for a converted pool in this version.
+trades against those reserves; [LP redemption](blch-lp-redemption.md) returns the
+owner's proportional share. This does not activate a live market or add
+subsequent deposits or LP transfers. Use local test funding.
 
 ## Authorization and funding
 
@@ -69,7 +69,9 @@ Before calculating, the method checks both actual reserve outputs and locks,
 the reserve-to-pool mapping, supported asset rules, creation authorization and
 the preserved initial LP state. Both initial and swapped pools are accepted
 after checking actual current backing, coupled pool/reserve revisions, unchanged
-LP supply and a reserve product at least as large as the initial product.
+LP supply except for authenticated redemption. Before any redemption, the
+reserve product must remain at least as large as the initial product. Current
+reserves must always satisfy the pure AMM's structural liquidity checks.
 
 The result includes exact output units, fee basis points, pool state root,
 height and hypothetical before/after reserves. It uses the same pure AMM
@@ -95,10 +97,12 @@ close capability also rejects it. Owner identity alone no longer authorizes
 returning all backing, because that would bypass LP accounting and the locked
 minimum. No emergency reserve-release API is added.
 
-The complete rehearsal snapshot and root now use version 5; older snapshots
+The complete rehearsal snapshot and root now use version 6; older snapshots
 are rejected. Restore reconstructs each initial AMM state from committed initial
 amounts, then checks current actual paired backing, identity, fee, revision,
-unchanged LP supply/owner/balance and reserve-product invariants. It also
+unchanged owner, bounded remaining LP balance and reserve-product invariants.
+Current LP supply equals the owner's remaining balance plus the locked minimum.
+It also
 rejects duplicate reserve-to-pool mappings. Native diagnostic snapshots also
 commit pool/LP authority. All snapshots
 remain opaque outside the complete state API.
@@ -115,8 +119,8 @@ owner theft attempts, fee/creation-authorization tampering, duplicate issuance,
 closing a converted reserve, fee conservation and complete restoration. The
 existing transfer, close and API-isolation regressions remain required.
 
-Subsequent Add and Remove operations must atomically update actual BLCH
-and native reserve outputs together with LP accounting. Swaps now do so while
-preserving LP ownership and supply. Wallet transport,
+Subsequent Add operations must atomically update actual BLCH and native reserve
+outputs together with LP accounting. Swaps preserve LP ownership and supply;
+redemption atomically burns owner shares and returns both assets. Wallet transport,
 network admission, block fee settlement, consensus commitments, replay/reorg
 integration, qualified USDT bridge services and independent review remain open.

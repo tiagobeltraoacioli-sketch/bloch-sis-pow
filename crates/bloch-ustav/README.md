@@ -26,8 +26,9 @@ a live BLCH AMM pool. The same default-off state now supports
 [initial BLCH/native liquidity](../bloch-pos-committee/docs/initial-blch-liquidity.md):
 existing paired reserves back a sealed initial LP position, with the minimum
 liquidity permanently locked. [Atomic BLCH/native swaps](../bloch-pos-committee/docs/atomic-blch-swaps.md)
-now execute in this local rehearsal; subsequent liquidity deposits, LP transfers
-and redemption remain unimplemented.
+and [proportional LP redemption](../bloch-pos-committee/docs/blch-lp-redemption.md)
+now execute in this local rehearsal. Subsequent liquidity deposits and LP
+transfers remain unimplemented.
 
 [Color-Changing Chameleon v1](../bloch-euvm/docs/chameleon-v1.md) adds sealed
 PQ-native escrow, an explicit Kirpich ERC-20 compatibility profile and an

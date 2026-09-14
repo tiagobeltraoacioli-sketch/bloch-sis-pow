@@ -617,3 +617,329 @@ fn expired_swap_and_foreign_locked_funding_do_not_release_a_reserve() {
     );
     assert_eq!(bad.state_root(), root);
 }
+
+fn remove_request(
+    state: &State,
+    pool: [u8; 32],
+    fee_point: ([u8; 32], u32),
+    lp: u64,
+    template: PosTransaction,
+) -> super::super::remove_liquidity::Request {
+    use super::super::{base_reserves::RESERVE_KEY_INDEX, remove_liquidity};
+    use bloch_euvm::ustav::{Output, Transaction, Witnesses};
+    let record = &state.initial_pools[&pool];
+    let b = &state.base_reserves[&record.reserve];
+    let n = &state.paired_reserves[&record.reserve];
+    let quote_request = remove_liquidity::QuoteRequest {
+        domain: DOMAIN,
+        pool,
+        revision: record.pool.revision(),
+        lp,
+        minimum: [1, 1],
+        valid_until: 100,
+    };
+    let quote = state.quote_blch_remove(&quote_request, 1).unwrap();
+    let mut blch = template;
+    let owner_hash = Sha3_256::digest(key(1)).into();
+    if let PosTransaction::TransferV2 {
+        inputs, outputs, ..
+    } = &mut blch
+    {
+        *inputs = vec![
+            TransferInputV2 {
+                txid: b.outpoint.0,
+                vout: b.outpoint.1,
+                key_index: RESERVE_KEY_INDEX,
+            },
+            TransferInputV2 {
+                txid: fee_point.0,
+                vout: fee_point.1,
+                key_index: 0,
+            },
+        ];
+        *outputs = vec![
+            TransferOutput {
+                value: quote.reserves_after[0],
+                script_hash: super::super::base_reserves::reserve_script(&DOMAIN, &record.reserve),
+            },
+            TransferOutput {
+                value: quote.amounts_out[0],
+                script_hash: owner_hash,
+            },
+            TransferOutput {
+                value: 1,
+                script_hash: owner_hash,
+            },
+        ];
+    }
+    let mut request = remove_liquidity::Request {
+        quote: quote_request,
+        pool_state_root: quote.pool_state_root,
+        blch,
+        native: transfer_wire::Envelope {
+            domain: DOMAIN,
+            transaction: Transaction {
+                asset: n.asset,
+                inputs: vec![n.outpoint],
+                outputs: vec![
+                    Output {
+                        owner: key(1),
+                        amount: quote.reserves_after[1],
+                    },
+                    Output {
+                        owner: key(1),
+                        amount: quote.amounts_out[1],
+                    },
+                ],
+                delta: 0,
+                mint_nonce: 0,
+                policy_revision: 0,
+                valid_until: 100,
+            },
+            witnesses: Witnesses {
+                owners: vec![vec![0; 32]],
+                modules: vec![vec![]],
+                eligibility: vec![],
+            },
+        },
+        native_gas: 100_000,
+    };
+    price_remove(state, &mut request);
+    sign_remove(&mut request);
+    request
+}
+fn price_remove(state: &State, r: &mut super::super::remove_liquidity::Request) {
+    let len = r.canonical_bytes(&DOMAIN).unwrap().len() as u64;
+    if let PosTransaction::TransferV2 { tx_bytes, .. } = &mut r.blch {
+        *tx_bytes = len;
+    }
+    let charge = state.quote_blch_remove_fee(r).unwrap();
+    if let PosTransaction::TransferV2 {
+        inputs, outputs, ..
+    } = &mut r.blch
+    {
+        let funding = state
+            .base
+            .utxo(&inputs[1].txid, inputs[1].vout)
+            .unwrap()
+            .value;
+        outputs[2].value = funding - (charge.base_fee_sat + charge.priority_fee_sat) as u64;
+    }
+}
+fn sign_remove(r: &mut super::super::remove_liquidity::Request) {
+    let authorization = r.authorization(&DOMAIN).unwrap();
+    if let PosTransaction::TransferV2 { keys, .. } = &mut r.blch {
+        keys[0].signature = signature(&authorization, &key(1));
+    }
+    r.native.witnesses.owners[0] = signature(&authorization, &key(1));
+}
+fn remove_fixture() -> (State, super::super::remove_liquidity::Request) {
+    let (mut state, initial) = funded();
+    let receipt = state
+        .execute_initial_liquidity(&initial, 1, &BoundVerifier, &BoundVerifier)
+        .unwrap();
+    let request = remove_request(
+        &state,
+        receipt.pool,
+        (receipt.blch_txid, 0),
+        3000,
+        initial.blch,
+    );
+    (state, request)
+}
+
+#[test]
+fn proportional_redemption_and_full_burn_leave_minimum_locked_and_close_disabled() {
+    let (mut state, first) = remove_fixture();
+    let pool = first.quote.pool;
+    let reserve = state.initial_pools[&pool].reserve;
+    let first_receipt = state
+        .execute_blch_remove(&first, 1, &BoundVerifier, &BoundVerifier)
+        .unwrap();
+    assert_eq!(first_receipt.quote.amounts_out, [387_346, 23]);
+    assert_eq!(first_receipt.quote.reserves_after, [612_654, 37]);
+    assert_eq!(first_receipt.quote.lp_remaining, 3745);
+    assert_eq!(state.blch_pool(&pool).unwrap().lp_supply(), 4745);
+    let mut state = State::restore(state.snapshot(), state.state_root(), &BoundVerifier).unwrap();
+    let last = remove_request(&state, pool, (first_receipt.blch_txid, 2), 3745, first.blch);
+    let receipt = state
+        .execute_blch_remove(&last, 2, &BoundVerifier, &BoundVerifier)
+        .unwrap();
+    assert_eq!(receipt.quote.amounts_out, [483_538, 29]);
+    assert_eq!(receipt.quote.reserves_after, [129_116, 8]);
+    assert_eq!(state.blch_lp_position(&pool, &key(1)), 0);
+    assert_eq!(
+        state.blch_pool(&pool).unwrap().lp_supply(),
+        amm::MINIMUM_LIQUIDITY
+    );
+    assert!(state.base_is_locked(&state.base_reserves[&reserve].outpoint));
+    assert!(state
+        .native()
+        .is_locked(&state.paired_reserves[&reserve].outpoint));
+    let mut more = last.quote.clone();
+    more.revision = state.blch_pool(&pool).unwrap().revision();
+    more.lp = 1;
+    assert!(state.quote_blch_remove(&more, 2).is_err());
+    let close = super::super::paired_custody::CloseRequest {
+        reserve,
+        creation_authorization: state.paired_reserves[&reserve].authorization,
+        blch: last.blch,
+        native: last.native,
+        valid_until: 100,
+        native_gas: 100_000,
+    };
+    let root = state.state_root();
+    assert_eq!(
+        state
+            .execute_paired_close(&close, 2, &BoundVerifier, &BoundVerifier)
+            .unwrap_err(),
+        Error::LockedReserve
+    );
+    assert_eq!(state.state_root(), root);
+    State::restore(state.snapshot(), root, &BoundVerifier).unwrap();
+}
+
+#[test]
+fn redemption_after_swap_uses_current_reserves_and_allows_another_swap() {
+    let (mut state, trade) = swap_fixture();
+    let traded = state
+        .execute_blch_swap(&trade, 1, &BoundVerifier, &BoundVerifier)
+        .unwrap();
+    let remove = remove_request(
+        &state,
+        trade.quote.pool,
+        (traded.blch_txid, 1),
+        3000,
+        trade.blch.clone(),
+    );
+    let reserves = state.blch_pool(&trade.quote.pool).unwrap().reserves();
+    let supply = state.blch_pool(&trade.quote.pool).unwrap().lp_supply();
+    let removed = state
+        .execute_blch_remove(&remove, 2, &BoundVerifier, &BoundVerifier)
+        .unwrap();
+    for i in 0..2 {
+        assert_eq!(
+            removed.quote.amounts_out[i],
+            (u128::from(reserves[i]) * 3000 / u128::from(supply)) as u64
+        );
+    }
+    let mut state = State::restore(state.snapshot(), state.state_root(), &BoundVerifier).unwrap();
+    let next = swap_request(
+        &state,
+        trade.quote.pool,
+        (removed.blch_txid, 2),
+        None,
+        100_000,
+        trade.blch,
+    );
+    state
+        .execute_blch_swap(&next, 3, &BoundVerifier, &BoundVerifier)
+        .unwrap();
+    assert_eq!(state.blch_lp_position(&next.quote.pool, &key(1)), 3745);
+    State::restore(state.snapshot(), state.state_root(), &BoundVerifier).unwrap();
+}
+
+#[test]
+fn redemption_limits_signature_scope_and_late_collision_leave_lp_unchanged() {
+    let (state, r) = remove_fixture();
+    for variant in 0..10 {
+        let mut state = state.clone();
+        let mut bad = r.clone();
+        match variant {
+            0 => bad.quote.lp = 0,
+            1 => bad.quote.lp = 6746,
+            2 => bad.quote.lp = u64::MAX,
+            3 => bad.quote.minimum[0] = u64::MAX,
+            4 => bad.quote.minimum[1] = u64::MAX,
+            5 => bad.pool_state_root[0] ^= 1,
+            6 => state.base_fees = u128::MAX,
+            7 => bad.native_gas = 1,
+            8 => bad.native.transaction.outputs[0].owner = key(2),
+            _ => {
+                state.base.eutxos.insert(crate::state_root::EutxoEntry {
+                    txid: bad.output_txid(&DOMAIN).unwrap(),
+                    vout: 0,
+                    value: 1,
+                    script_hash: [7; 32],
+                });
+            }
+        }
+        sign_remove(&mut bad);
+        let root = state.state_root();
+        assert!(
+            state
+                .execute_blch_remove(&bad, 1, &BoundVerifier, &BoundVerifier)
+                .is_err(),
+            "variant {variant}"
+        );
+        assert_eq!(state.state_root(), root);
+        assert_eq!(state.blch_lp_position(&r.quote.pool, &key(1)), 6745);
+    }
+    let mut state = state;
+    let root = state.state_root();
+    assert!(state
+        .execute_blch_remove(&r, 101, &BoundVerifier, &BoundVerifier)
+        .is_err());
+    assert_eq!(state.state_root(), root);
+}
+
+#[test]
+fn redemption_cannot_use_empty_swap_witness_or_malformed_shapes() {
+    let (state, r) = remove_fixture();
+    for variant in 0..9 {
+        let mut state = state.clone();
+        let mut bad = r.clone();
+        match variant {
+            0 => {
+                bad.native.witnesses.owners[0].clear();
+                price_remove(&state, &mut bad);
+            }
+            1 => bad.native.transaction.outputs.clear(),
+            2 => {
+                bad.native.transaction.outputs.pop();
+            }
+            3 => bad.native.transaction.inputs.clear(),
+            4 => bad.native.witnesses.owners.clear(),
+            5 => bad.native.witnesses.owners.push(vec![]),
+            6 => {
+                if let PosTransaction::TransferV2 { keys, .. } = &mut bad.blch {
+                    keys.clear();
+                }
+            }
+            7 => {
+                if let PosTransaction::TransferV2 { outputs, .. } = &mut bad.blch {
+                    outputs.clear();
+                }
+            }
+            _ => bad.native_gas = u64::MAX,
+        }
+        let root = state.state_root();
+        assert!(
+            state
+                .execute_blch_remove(&bad, 1, &BoundVerifier, &BoundVerifier)
+                .is_err(),
+            "variant {variant}"
+        );
+        assert_eq!(state.state_root(), root);
+    }
+}
+
+#[test]
+fn post_redemption_snapshots_reject_lp_inflation_supply_mismatch_and_old_version() {
+    let (mut state, r) = remove_fixture();
+    state
+        .execute_blch_remove(&r, 1, &BoundVerifier, &BoundVerifier)
+        .unwrap();
+    let root = state.state_root();
+    for variant in 0..5 {
+        let mut bad = state.snapshot();
+        match variant {
+            0 => bad.initial_pools[0].lp_balance += 1,
+            1 => bad.initial_pools[0].lp_balance = u64::MAX,
+            2 => bad.initial_pools[0].owner = key(2),
+            3 => bad.initial_pools[0].initial_reserves[0] += 1,
+            _ => bad.version = 5,
+        }
+        assert!(State::restore(bad, root, &BoundVerifier).is_err());
+    }
+}

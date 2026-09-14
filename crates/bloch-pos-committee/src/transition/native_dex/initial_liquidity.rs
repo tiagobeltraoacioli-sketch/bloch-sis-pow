@@ -1,5 +1,5 @@
 //! Initial BLCH/native LP ownership backed by an existing, completely funded pair.
-//! Subsequent swaps use the separate atomic dispatcher; no Add/Remove or LP transfer.
+//! Swaps and LP redemption use separate atomic dispatchers; no subsequent Add or LP transfer.
 use super::*;
 use bloch_euvm::ustav::amm::{self, PoolState};
 pub const MAX_POOLS: usize = 128;
@@ -316,7 +316,7 @@ impl State {
         }
     }
     /// Structural checks supplement, but do not replace, an authenticated host root.
-    /// Only swaps may evolve these pools; LP balances and initial funding stay fixed.
+    /// Swaps and redemption may evolve pools; initial funding and LP ownership stay fixed.
     pub(super) fn validate_blch_pool(&self, r: &Record) -> Result<(), Error> {
         let b = self
             .base_reserves
@@ -382,13 +382,14 @@ impl State {
         if initial.next.id() != r.pool.id()
             || initial.next.assets() != r.pool.assets()
             || initial.next.domain() != r.pool.domain()
-            || initial.lp_mint != r.lp_balance
-            || initial.next.lp_supply() != r.pool.lp_supply()
+            || r.lp_balance > initial.lp_mint
+            || r.lp_balance.checked_add(amm::MINIMUM_LIQUIDITY) != Some(r.pool.lp_supply())
             || (b.revision == 0
                 && (initial.next != r.pool
                     || b.outpoint != (paired_custody::output_id(&n.authorization), 0)))
-            || u128::from(b.amount) * u128::from(n.amount)
-                < u128::from(r.initial_reserves[0]) * u128::from(r.initial_reserves[1])
+            || (r.lp_balance == initial.lp_mint
+                && u128::from(b.amount) * u128::from(n.amount)
+                    < u128::from(r.initial_reserves[0]) * u128::from(r.initial_reserves[1]))
         {
             return Err(Error::InvalidReserve);
         }

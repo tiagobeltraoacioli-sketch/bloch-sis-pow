@@ -66,10 +66,10 @@ there is no network decoder or block dispatch for them yet.
 
 ## Persistence and validation
 
-The rehearsal snapshot and outer root use version 5 and commit every
+The rehearsal snapshot and outer root use version 6 and commit every
 reserve's ID, seed, owner, amount, revision and outpoint alongside both ledger
 roots, paired custody records, initial pool/LP records and fee counters. Old
-version-1 through version-4 snapshots are refused rather than silently losing custody metadata. Restore reconstructs unique locks and checks the
+version-1 through version-5 snapshots are refused rather than silently losing custody metadata. Restore reconstructs unique locks and checks the
 actual UTXO, output index zero, amount, protocol script, ID derivation and PQ
 owner admission against an independently authenticated outer root.
 
@@ -91,4 +91,5 @@ cannot use this standalone continuation path; changing one side independently
 would break the authenticated pairing. The paired closing dispatcher returns
 both assets atomically to their original owner. The separate initial-liquidity operation issues backed LP positions and blocks
 this closing path for converted reserves. The separate [atomic swap dispatcher](atomic-blch-swaps.md) can rotate both
-reserves under AMM rules; liquidity removal remains unimplemented.
+reserves under AMM rules. [LP redemption](blch-lp-redemption.md) returns the
+owner's proportional shares while keeping minimum liquidity locked.
