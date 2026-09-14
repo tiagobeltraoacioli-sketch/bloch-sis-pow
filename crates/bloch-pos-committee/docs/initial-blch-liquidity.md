@@ -50,6 +50,38 @@ Unknown owners receive zero. These positions are internal ownership records,
 not an ERC-20 token or transferable wallet asset. The separate native/native
 pool queries on `NativeView` do not describe BLCH-backed pools.
 
+## Verified read-only swap quotes
+
+The current design uses a constant-product AMM for BLCH/native-USDT. It makes
+no stable-price relationship assumption between BLCH and USDT. A shared pure
+integer transition supplies the arithmetic for quotes and future settlement;
+settlement must still verify actual funding and custody atomically. Introducing
+concentrated liquidity, an order book or additional price-oracle dependencies
+would require separate accounting and validation work and is outside this step.
+
+`State::quote_blch_swap` accepts `swap_quote::Request`: network domain, pool ID,
+expected revision, input asset ID, exact integer input amount, minimum output
+and inclusive expiry height. Direction is resolved from the asset ID, avoiding
+client assumptions about token ordering. The caller supplies the host height.
+
+Before calculating, the method checks both actual reserve outputs and locks,
+the reserve-to-pool mapping, supported asset rules, creation authorization and
+the reconstructed initial LP state. Only backed bootstrapped pools are currently
+accepted. A later execution implementation must replace this initial-state
+check with authenticated evolving custody; it cannot simply skip validation.
+
+The result includes exact output units, fee basis points, pool state root,
+height and hypothetical before/after reserves. It uses the same pure AMM
+transition arithmetic, including downward output rounding, minimum output,
+revision, expiry and reserve-product checks. The pool fee remains in the input
+reserve; BLCH network fees and wallet funding are not included or validated.
+
+Quotes do not change state or grant spending authority, establish source-USDT
+backing, prove finality or guarantee execution. No RPC or wallet transport is
+added. A future executor must bind funding, recipient, domain, pool state and
+slippage/deadline constraints into the signed intent and revalidate at execution.
+Use a trusted host height and validate the request domain in any future RPC.
+
 ## Custody and persistence
 
 Initialization atomically commits fee spending, the pool and its LP position.

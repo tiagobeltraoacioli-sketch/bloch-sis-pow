@@ -107,7 +107,7 @@ impl State {
             .filter(|r| r.owner == owner)
             .map_or(0, |r| r.lp_balance)
     }
-    fn bootstrap(
+    pub(super) fn bootstrap(
         &self,
         reserve: &[u8; 32],
         creation: &[u8; 32],

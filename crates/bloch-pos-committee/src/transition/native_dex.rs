@@ -13,6 +13,7 @@ pub mod backend;
 pub mod base_reserves;
 pub mod initial_liquidity;
 pub mod paired_custody;
+pub mod swap_quote;
 pub mod wire;
 
 #[cfg(test)]

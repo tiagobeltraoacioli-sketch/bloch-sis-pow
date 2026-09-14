@@ -20,7 +20,11 @@ full-payload fees and a separately committed fee escrow. It does not add a
 live block transaction. The same concrete State now owns paired BLCH/native
 reserve locks, with atomic creation and same-owner closing before pool
 conversion. Initial liquidity now creates a backed LP position; subsequent
-deposits, swaps and LP redemption remain open. Read-only native views and opaque full-state snapshots prevent extracting
+deposits, swap execution and LP redemption remain open. Read-only exact-input
+swap quotes recheck actual backing and LP authority, then enforce the pool
+revision, domain, expiry and minimum output. They provide no reserve-spend
+capability, network fee estimate or source-finality proof.
+Read-only native views and opaque full-state snapshots prevent extracting
 an executable component through the public rehearsal API. See the
 [joint rehearsal contract](BLOCH-JOINT-NATIVE-REHEARSAL.md) for its unit conversion,
 trust boundary and remaining block integration. Pool operations also have a

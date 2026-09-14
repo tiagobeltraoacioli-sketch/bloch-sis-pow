@@ -347,12 +347,8 @@ impl PoolState {
                     return Err(Error::InsufficientLiquidity);
                 }
                 let effective = u128::from(amount) * (BPS - u128::from(self.fee_bps));
-                // Full u64 triple products can exceed u128; reject instead of wrapping.
-                let numerator = effective
-                    .checked_mul(u128::from(self.reserves[o]))
-                    .ok_or(Error::Overflow)?;
                 let denominator = u128::from(self.reserves[i]) * BPS + effective;
-                let out = u64::try_from(numerator / denominator).map_err(|_| Error::Overflow)?;
+                let out = fraction_mul_floor(effective, self.reserves[o], denominator)?;
                 if out == 0 || out >= self.reserves[o] {
                     return Err(Error::InsufficientLiquidity);
                 }
@@ -393,6 +389,29 @@ impl PoolState {
         t.next.revision = self.revision.checked_add(1).ok_or(Error::Overflow)?;
         Ok(t)
     }
+}
+/// floor(n * m / d), for 0 <= n < d. Avoids the up-to-142-bit swap
+/// numerator without adding a wide-integer dependency. Each of 64 fixed steps
+/// extends the multiplier prefix and maintains prefix*n = quotient*d + remainder.
+/// Swap denominators are below 2^79, so 2*remainder+n fits comfortably in u128.
+fn fraction_mul_floor(n: u128, m: u64, d: u128) -> Result<u64, Error> {
+    if d == 0 || n >= d {
+        return Err(Error::InvalidAction);
+    }
+    let mut quotient = 0u128;
+    let mut remainder = 0u128;
+    for bit in (0..64).rev() {
+        let extended = remainder
+            .checked_mul(2)
+            .and_then(|r| r.checked_add(if (m >> bit) & 1 == 1 { n } else { 0 }))
+            .ok_or(Error::Overflow)?;
+        quotient = quotient
+            .checked_mul(2)
+            .and_then(|q| q.checked_add(extended / d))
+            .ok_or(Error::Overflow)?;
+        remainder = extended % d;
+    }
+    u64::try_from(quotient).map_err(|_| Error::Overflow)
 }
 fn mul_div(a: u64, b: u64, d: u64) -> Result<u64, Error> {
     if d == 0 {

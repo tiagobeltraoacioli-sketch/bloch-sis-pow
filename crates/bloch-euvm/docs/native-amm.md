@@ -27,9 +27,15 @@ reserve product. All asset deltas are raw integer units in sorted asset order;
 there is no decimal conversion, peg assumption or price oracle.
 
 Products of two u64 values use u128. The swap's fee-scaled three-factor numerator
-can overflow u128 for otherwise representable large reserves; this deliberately
-returns `Overflow`. No amount is silently truncated, saturated or approximated.
-Supporting the full u64 swap domain would require reviewed wider arithmetic.
+can require 142 bits. Swaps now evaluate that fraction using 64 integer
+quotient/remainder steps without materializing the numerator. Each step
+maintains the exact division identity; the denominator is below 2^79 and all
+intermediate arithmetic is checked. This supports large representable swaps
+without floating-point approximations or a wide-integer dependency.
+This changes previously rejected large-input behavior in the experimental
+library and must not be hot-patched into an activated consensus rule.
+Independent arbitrary-precision vectors cover both directions, extreme fee
+rates and the u64 boundary.
 Addition overflow and dust transitions also fail without changing input state.
 
 ## Custody integration still required

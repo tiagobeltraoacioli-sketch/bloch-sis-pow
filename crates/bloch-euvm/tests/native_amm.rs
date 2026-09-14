@@ -26,6 +26,107 @@ fn funded() -> PoolState {
     .next
 }
 #[test]
+fn full_width_swaps_match_independent_arbitrary_precision_vectors() {
+    // Expected floor(a*(10000-f)*y / (x*10000+a*(10000-f))) values
+    // calculated independently with Python arbitrary-precision integers.
+    let max = u64::MAX;
+    for (x, y, amount, fee, expected) in [
+        (max / 2, max, max / 2, 30, 9_209_516_195_036_766_630),
+        (max - 1, max, 1, 0, 1),
+        (1, max, max - 1, 9999, 18_446_744_073_709_541_615),
+        (max / 4, max / 3, max / 2, 30, 4_095_168_969_380_633_035),
+        (
+            1_000_000_000_000_000_000,
+            1_000_000_000_000_000_000,
+            1_000_000_000_000_000_000,
+            30,
+            499_248_873_309_964_947,
+        ),
+    ] {
+        for direction in 0..2 {
+            let reserves = if direction == 0 { [x, y] } else { [y, x] };
+            let pool = PoolState::new([1; 32], BLCH, [2; 32], fee, [3; 32]).unwrap();
+            let pool = run(
+                &pool,
+                Action::Add {
+                    maximum: reserves,
+                    minimum_lp: 1,
+                },
+            )
+            .unwrap()
+            .next;
+            let t = run(
+                &pool,
+                Action::SwapExactInput {
+                    input_index: direction as u8,
+                    amount,
+                    minimum_out: expected,
+                },
+            )
+            .unwrap();
+            assert_eq!(t.user_credit[1 - direction], expected);
+            assert_eq!(t.next.reserves()[direction], x + amount);
+            assert_eq!(t.next.reserves()[1 - direction], y - expected);
+            assert_eq!(t.next.lp_supply(), pool.lp_supply());
+            assert!(
+                u128::from(t.next.reserves()[0]) * u128::from(t.next.reserves()[1])
+                    >= u128::from(x) * u128::from(y)
+            );
+            assert_eq!(
+                run(
+                    &pool,
+                    Action::SwapExactInput {
+                        input_index: direction as u8,
+                        amount,
+                        minimum_out: expected + 1,
+                    }
+                ),
+                Err(Error::Slippage)
+            );
+        }
+    }
+}
+
+#[test]
+fn bounded_fraction_arithmetic_matches_direct_formula_when_product_fits() {
+    for fee in [0, 1, 30, 100, 9999] {
+        let pool = PoolState::new([1; 32], BLCH, [2; 32], fee, [3; 32]).unwrap();
+        let pool = run(
+            &pool,
+            Action::Add {
+                maximum: [1_000_003, 9_000_019],
+                minimum_lp: 1,
+            },
+        )
+        .unwrap()
+        .next;
+        for direction in 0..2 {
+            for amount in [1, 2, 31, 10_000, 100_003, 1_000_000_000] {
+                let r = pool.reserves();
+                let effective = u128::from(amount) * u128::from(10_000 - fee);
+                let expected = effective * u128::from(r[1 - direction])
+                    / (u128::from(r[direction]) * 10_000 + effective);
+                let result = run(
+                    &pool,
+                    Action::SwapExactInput {
+                        input_index: direction as u8,
+                        amount,
+                        minimum_out: 0,
+                    },
+                );
+                if expected == 0 {
+                    assert_eq!(result, Err(Error::InsufficientLiquidity));
+                } else {
+                    assert_eq!(
+                        u128::from(result.unwrap().user_credit[1 - direction]),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+}
+#[test]
 fn canonical_identity_commits_domain_fee_seed_and_allows_real_blch() {
     let p = empty();
     assert_eq!(
