@@ -19,8 +19,9 @@ BLCH validation plan with a bounded native transfer plan, common authorization,
 full-payload fees and a separately committed fee escrow. It does not add a
 live block transaction. The same concrete State now owns paired BLCH/native
 reserve locks, with atomic creation and same-owner closing before pool
-conversion. Initial liquidity now creates a backed LP position; subsequent
-deposits remain open. Owner-authorized LP redemption now burns shares and
+conversion. Initial liquidity creates a backed LP position; additional deposits
+now credit separate provider positions with exact proportional funding.
+Provider-authorized LP redemption burns shares and
 returns both assets while retaining the locked minimum. Exact-input swaps validate and
 commit both reserve legs, trader funding and fees atomically in the rehearsal. Read-only exact-input
 swap quotes recheck actual backing and LP authority, then enforce the pool

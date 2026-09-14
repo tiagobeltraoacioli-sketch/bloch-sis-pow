@@ -63,7 +63,7 @@ impl<'a> NativeView<'a> {
     }
     pub fn state_root(&self) -> [u8; 32] {
         let mut h = Sha3_256::new();
-        h.update(b"BLOCH-OWNED-NATIVE-v3");
+        h.update(b"BLOCH-OWNED-NATIVE-v4");
         h.update(self.state.native.state_root());
         self.state.hash_paired_reserves(&mut h);
         self.state.hash_initial_pools(&mut h);

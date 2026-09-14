@@ -27,7 +27,8 @@ a live BLCH AMM pool. The same default-off state now supports
 existing paired reserves back a sealed initial LP position, with the minimum
 liquidity permanently locked. [Atomic BLCH/native swaps](../bloch-pos-committee/docs/atomic-blch-swaps.md)
 and [proportional LP redemption](../bloch-pos-committee/docs/blch-lp-redemption.md)
-now execute in this local rehearsal. Subsequent liquidity deposits and LP
+now execute in this local rehearsal. [Additional liquidity](../bloch-pos-committee/docs/blch-liquidity-additions.md)
+credits separate PQ-owned positions for up to 128 providers per pool. LP
 transfers remain unimplemented.
 
 [Color-Changing Chameleon v1](../bloch-euvm/docs/chameleon-v1.md) adds sealed

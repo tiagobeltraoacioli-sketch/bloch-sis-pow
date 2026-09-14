@@ -87,9 +87,9 @@ with custody bookkeeping charged separately. These reference costs are not a
 calibrated production fee schedule. Each asset conserves independently;
 fees are retained in the committed BLCH fee escrow.
 
-Snapshot and outer-root version 6 include paired custody and initial pool/LP
+Snapshot and outer-root version 7 include paired custody and initial pool/LP
 records alongside both ledger roots, base reserve metadata and fees. Versions
-1 through 5 are rejected;
+1 through 6 are rejected;
 no live chain migration is performed. Restore checks canonical record ordering,
 unique locks, admitted owners, exact amounts/assets/outpoints, correspondence
 to the BLCH record and creation authorization, and non-overlap with native AMM
@@ -107,9 +107,8 @@ cargo +1.94.1 test --locked -p bloch-ustav --test paired_custody_crypto --test j
 Tests cover real hybrid PQ signatures, malformed/unauthorized requests,
 independent conservation, reserve locks, partial-settlement refusal, replay and
 complete restoration. Locally issued test tokens are not proof of external
-USDT backing. Initial LP issuance and [atomic local swaps](atomic-blch-swaps.md)
-and [LP redemption](blch-lp-redemption.md) are implemented; a production
-BLCH/USDT market still requires subsequent
-liquidity additions,
-wallet signing, closing transport, network admission, block fee settlement,
+USDT backing. Initial LP issuance, [atomic local swaps](atomic-blch-swaps.md),
+[LP redemption](blch-lp-redemption.md) and [additional deposits](blch-liquidity-additions.md)
+are implemented in the rehearsal. Production operation still requires wallet
+signing, closing transport, network admission, block fee settlement,
 consensus commitments, replay/reorg integration and independent review.

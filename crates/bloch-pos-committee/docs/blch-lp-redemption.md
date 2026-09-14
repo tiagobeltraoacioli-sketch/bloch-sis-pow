@@ -1,91 +1,80 @@
 # Proportional BLCH/native LP redemption
 
-The default-off combined rehearsal now allows the sealed LP owner to redeem
-some or all of their position for BLCH and the paired native asset. The AMM
-computes each payout as `floor(reserve * lp_burn / total_lp_supply)`, using
-integer raw units. The two payouts, reserve rotations, LP burn and separately
-funded BLCH fees commit atomically. This remains a local Rust API, not live
-network admission or wallet transport.
+Each provider can redeem some or all of their own sealed LP position in the
+explicitly enabled combined rehearsal. The pure AMM pays
+`floor(reserve * lp_burn / total_lp_supply)` units of each asset. Reserve
+rotation, payouts, position burn and separately funded BLCH fees commit together.
+This is a local Rust API, not live network admission or wallet transport.
 
-## Ownership and quote
+## Quote and authorization
 
-`remove_liquidity::QuoteRequest` specifies domain, pool, expected revision,
-LP amount, minimum payouts `[BLCH, native]` and inclusive expiry height.
-`State::quote_blch_remove` revalidates both actual reserves, locks, pool state
-and LP accounting. It returns exact payouts, before/after reserves, remaining
-owner LP and the current pool root. An unsigned quote does not prove ownership,
-authorize a transaction or establish source-chain finality.
+`remove_liquidity::QuoteRequest` includes domain, pool, provider PQ key, expected
+revision, LP burn, minimum payouts `[BLCH, native]` and inclusive expiry height.
+`quote_blch_remove` validates actual backing, locks and the provider's position
+before returning payouts and remaining LP. A quote is not an ownership or finality
+proof and does not authorize execution.
 
-`remove_liquidity::Request` adds the expected pool root, the BLCH transaction,
-native transfer envelope and native work budget. The `BLCHLPRM` canonical frame
-and separate authorization domain bind every quote field, both funding legs,
-recipients, expiry and gas. It is distinct from initialization, close, swap and
-ordinary-transfer authorization. There is no removal network decoder yet.
+`Request` adds the expected pool root, both funding transactions and prepaid
+native work. The version-2 `BLCHLPRM` frame and version-2 authorization/output
+hash domains commit the length-prefixed provider key together with the complete
+intent. Older removal signatures are not reused. No network decoder is supplied.
 
-The original LP owner must provide real hybrid PQ signatures on both legs over
-`Request::authorization`. Redemption never uses the swap's empty reserve-witness
-exception. A trader or token issuer holding valid keys cannot redeem someone
-else's LP. LP ownership remains a single sealed position; transfers and additional
-liquidity providers require subsequent work.
+Both legs require real nonempty provider signatures over joint authorization.
+The BLCH key must match the identified LP provider. The private native verifier
+accepts only the exact validated reserve input/hash and verifies its witness
+under that provider's key after the executor has checked the LP position. It does
+not use the swap's empty-witness exception. The original reserve owner's key
+cannot authorize another provider's position.
 
-## Exact funding and commit
+## Exact funding
 
-BLCH inputs contain the current reserve at `RESERVE_KEY_INDEX` and at least one
-ordinary, unlocked owner input at key index zero. Output zero is the exact new
-reserve with its unchanged protocol script; output one is the exact BLCH payout
-to the owner. Remaining outputs are owner fee change. The fee funding equation
-excludes the payout and reserve, so fees cannot reduce the promised return.
+BLCH inputs contain the reserve at `RESERVE_KEY_INDEX` and at least one unlocked
+provider fee input at key index zero. Output zero is the exact new protocol
+reserve, output one is the exact provider payout, and subsequent outputs are
+provider fee change. The fee equation excludes the payout and reserve.
 
-The native leg has exactly one input, the current reserve, and two outputs:
-the exact new reserve and exact owner payout. Both retain the admitted owner
-key. Supply delta is zero, the owner witness is nonempty, and the Supply-only,
-no-KYC asset restriction remains enforced. There is no issuer mint or bridge
-withdrawal in this operation.
+The native leg has exactly the current reserve input and two outputs. Output
+zero retains the original reserve-owner key and exact new reserve amount;
+output one pays the redeeming provider. Delta is zero. Supply-only/no-KYC policy,
+exact witness arity and nonempty real signatures remain required.
 
-`quote_blch_remove_fee` charges full witness-bearing bytes, the existing native
-work multiplier and 5,000 reference gas units for removal validation. These
-costs are rehearsal values, not a calibrated production fee schedule.
-
-`execute_blch_remove` rechecks revision/root/expiry, balance and minimum payouts,
-then validates both existing transfer plans before either commits. The private
-BLCH capability independently recalculates the quote and binds input value,
-new reserve output and joint authorization. Signature, fee, collision or shape
-failure preserves both ledgers and LP accounting. No fallible arithmetic remains
-after commit begins.
+`quote_blch_remove_fee` charges the full witness-bearing frame, existing native
+work multiplier and 5,000 reference gas units. These are not calibrated production
+fees. Both existing transfer plans validate before either commits. Signature,
+fee, collision, shape or LP failures leave all balances and positions unchanged.
 
 ## Permanent minimum and restoration
 
-Only owner LP can be burned. Full owner redemption leaves exactly 1,000 LP with
-no owner and positive reserves backing that minimum. Pool records and both locks
-remain. Neither a subsequent redemption nor paired close can recover the minimum.
-Swaps remain available against those reserves, including after full owner redemption.
-If either rounded payout is zero, redemption rejects rather than burning LP for
-a zero return in one asset. Minima and deadlines remain user-controlled.
+Full redemption of one provider's position leaves all other providers intact.
+When every provider exits, exactly 1,000 unowned LP and positive reserves remain.
+Pool records and locks persist; neither redemption nor paired close can recover
+that minimum. Swaps remain available and new providers can add liquidity again.
+If either rounded payout is zero, redemption rejects rather than burning shares
+for a zero return in one asset.
 
-Combined snapshot/root version 6 rejects versions 1 through 5; it does not migrate
-any live chain. Initial reserve amounts and LP owner stay committed. Remaining
-owner LP cannot exceed initial issuance; current LP supply must equal remaining
-owner LP plus 1,000. Revision coupling and actual output/lock checks remain in
-force. The pre-redemption reserve-product bound is retained when no shares have
-been burned; afterward pure AMM restoration enforces positive reserves and
-`reserve0 * reserve1 >= total_lp_supply²`. These structural checks do not prove
-the full transaction history: restoration still requires an independently
-authenticated complete state root, never one trusted solely because it came
-with the snapshot.
+Snapshot/root version 7 rejects versions 1 through 6 without migrating a live
+chain. Original pool identity and initial funding remain committed. There are
+at most 128 provider slots, including the original creator slot; extra zero
+positions are removed. Restoration bounds positions and key sizes before PQ key
+admission, rejects creator duplicates and invalid keys, and checks
+`sum(provider LP) + 1000 == total_lp_supply`. Additional deposits can legitimately
+increase supply above initial issuance. Current backing/revision checks and pure
+AMM restoration require positive reserves and product at least LP supply squared.
+These structural checks still require an independently authenticated complete
+state root; a root supplied alongside untrusted data is not authentication.
 
-## Validation and remaining work
+## Validation and remaining integration
 
 ```sh
 cargo +1.94.1 test --locked -p bloch-pos-committee --features native-dex-rehearsal --lib native_dex
-cargo +1.94.1 test --locked -p bloch-ustav --test blch_remove_crypto --test blch_swap_crypto --test paired_custody_crypto --test joint_blch_native
+cargo +1.94.1 test --locked -p bloch-ustav --test blch_add_crypto --test blch_remove_crypto --test blch_swap_crypto
 ```
 
-Tests cover partial/full redemption, exact integer rounding, fee separation,
-replay, minimum protection, swaps before/after redemption, restoration,
-forged hybrid signatures, thief signatures, payout redirects, empty witnesses,
-malformed requests, excessive LP burns and failed-plan rollback.
+Tests cover independent providers, partial/full redemption, exact rounding,
+minimum protection, swaps after redemption, restoration, replay, forged hybrid
+signatures, original-owner theft attempts, redirects, fees and malformed inputs.
 
-Subsequent liquidity deposits, LP transfers, network transport, wallet signing,
-block fee settlement, consensus/reorg integration and a qualified operational
-USDT bridge remain open. Returning a native token locally does not release
-external USDT or establish real source-chain backing.
+[Additional liquidity](blch-liquidity-additions.md) is now implemented. LP transfer,
+network transport, wallet signing, block settlement, consensus/reorg integration
+and an operational qualified USDT bridge remain separate work. Local native
+redemption does not release external USDT or establish source-chain backing.

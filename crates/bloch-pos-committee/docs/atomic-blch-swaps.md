@@ -65,23 +65,23 @@ both outpoints and lock maps, increments pool/base revisions, retains the origin
 creation authorization and updates fee counters. No fallible validation remains
 after commit begins. Failure preserves both ledgers, LP positions and fee escrow.
 
-Combined snapshot/root version 6 commits the initial reserve amounts alongside
-the evolving pool. Versions 1 through 5 reject; no live chain migration occurs.
+Combined snapshot/root version 7 commits the initial reserve amounts alongside
+the evolving pool. Versions 1 through 6 reject; no live chain migration occurs.
 Restore verifies authenticated current outputs, scripts, amounts, asset identity,
 owner, lock uniqueness and `pool.revision = base_reserve.revision + 1`. Initial
 amounts reconstruct the original LP supply and permanent minimum. Swaps cannot
-change LP supply or position. The separate redemption dispatcher burns owner LP
-and proportionally reduces both reserves. Before any redemption, current reserve
-product cannot be below the initial product; after redemption, current pool
-structure still requires positive reserves and product at least LP supply squared.
+change LP supply or position. Additional deposits mint provider LP and increase
+both reserves; redemption burns only the signing provider's LP and reduces both
+reserves. Current pool structure requires positive reserves and product at least
+LP supply squared. Total provider positions plus 1,000 must equal LP supply.
 A progressed paired reserve must have a corresponding pool. Structural
 checks supplement the independently authenticated complete state root; a root
 provided by an untrusted snapshot sender is not authentication.
 
 The original owner still cannot close a converted reserve through paired close.
 The separate [LP redemption](blch-lp-redemption.md) dispatcher returns the
-proportional owner share and retains the minimum. Subsequent liquidity deposits
-and LP transfer remain unimplemented.
+proportional provider share and retains the minimum. [Additional liquidity](blch-liquidity-additions.md)
+credits separate positions; LP transfer remains unimplemented.
 
 ## Validation and remaining integration
 

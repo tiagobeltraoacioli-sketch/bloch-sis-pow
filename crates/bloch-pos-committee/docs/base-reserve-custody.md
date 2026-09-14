@@ -66,10 +66,10 @@ there is no network decoder or block dispatch for them yet.
 
 ## Persistence and validation
 
-The rehearsal snapshot and outer root use version 6 and commit every
+The rehearsal snapshot and outer root use version 7 and commit every
 reserve's ID, seed, owner, amount, revision and outpoint alongside both ledger
 roots, paired custody records, initial pool/LP records and fee counters. Old
-version-1 through version-5 snapshots are refused rather than silently losing custody metadata. Restore reconstructs unique locks and checks the
+version-1 through version-6 snapshots are refused rather than silently losing custody metadata. Restore reconstructs unique locks and checks the
 actual UTXO, output index zero, amount, protocol script, ID derivation and PQ
 owner admission against an independently authenticated outer root.
 
@@ -80,9 +80,9 @@ fee overflow, bounded reserve count and snapshot tampering. The `bloch-ustav`
 integration test uses real hybrid PQ signatures for funding and continuation.
 
 Native and base paired custody now share one concrete State backend. Initial LP
-issuance and atomic swaps use separate validated dispatchers. Additional LP
-operations remain required before a complete BLCH/USDT market. No public native
-reserve-release plan is exposed. Consensus admission, full persistence/reorg
+issuance, additional deposits, swaps and redemption use separate validated
+dispatchers. LP transfers and operational integration remain separate work.
+No public native reserve-release plan is exposed. Consensus admission, full persistence/reorg
 integration, wallet signing, fee settlement and independent review remain open.
 
 The separate [paired reserve creation](paired-reserve-custody.md) operation now

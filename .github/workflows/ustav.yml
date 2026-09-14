@@ -32,8 +32,8 @@ jobs:
         run: cargo +1.94.1 test --locked -p bloch-pos-committee --features native-dex-rehearsal --lib native_dex
       - name: Combined custody API isolation
         run: cargo +1.94.1 test --locked -p bloch-pos-committee --features native-dex-rehearsal --doc
-      - name: Paired custody, BLCH swaps and LP redemption with real hybrid signatures
-        run: cargo +1.94.1 test --locked --release -p bloch-ustav --test paired_custody_crypto --test blch_swap_crypto --test blch_remove_crypto
+      - name: Paired custody and BLCH pool operations with real hybrid signatures
+        run: cargo +1.94.1 test --locked --release -p bloch-ustav --test paired_custody_crypto --test blch_swap_crypto --test blch_remove_crypto --test blch_add_crypto
       - name: Joint rehearsal in release profile
         run: cargo +1.94.1 test --locked --release -p bloch-pos-committee --features native-dex-rehearsal --lib native_dex
       - name: Default node excludes native rehearsal execution

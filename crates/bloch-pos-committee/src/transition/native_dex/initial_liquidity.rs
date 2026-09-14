@@ -1,8 +1,9 @@
 //! Initial BLCH/native LP ownership backed by an existing, completely funded pair.
-//! Swaps and LP redemption use separate atomic dispatchers; no subsequent Add or LP transfer.
+//! Adds, swaps and LP redemption use separate atomic dispatchers; no LP transfer.
 use super::*;
 use bloch_euvm::ustav::amm::{self, PoolState};
 pub const MAX_POOLS: usize = 128;
+pub const MAX_LP_PROVIDERS: usize = 128;
 /// Fixed bounded initial arithmetic/record work, additional to full-byte/PQ fees.
 pub const BOOTSTRAP_GAS: u64 = 5000;
 #[derive(Clone, Debug)]
@@ -22,6 +23,32 @@ pub(super) struct Record {
     pub creation_authorization: [u8; 32],
     pub owner: Vec<u8>,
     pub lp_balance: u64,
+    pub positions: BTreeMap<Vec<u8>, u64>,
+}
+impl Record {
+    pub(super) fn position(&self, owner: &[u8]) -> u64 {
+        if owner == self.owner {
+            self.lp_balance
+        } else {
+            self.positions.get(owner).copied().unwrap_or(0)
+        }
+    }
+    pub(super) fn set_position(&mut self, owner: &[u8], balance: u64) -> Result<(), Error> {
+        if owner.is_empty() || owner.len() > MAX_BASE_WITNESS_BYTES {
+            return Err(Error::ResourceLimit);
+        }
+        if owner == self.owner {
+            self.lp_balance = balance;
+        } else if balance == 0 {
+            self.positions.remove(owner);
+        } else {
+            if !self.positions.contains_key(owner) && self.positions.len() >= MAX_LP_PROVIDERS - 1 {
+                return Err(Error::ResourceLimit);
+            }
+            self.positions.insert(owner.to_vec(), balance);
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Debug)]
 pub struct Receipt {
@@ -103,10 +130,7 @@ impl State {
         self.initial_pools.get(id).map(|r| &r.pool)
     }
     pub fn blch_lp_position(&self, id: &[u8; 32], owner: &[u8]) -> u64 {
-        self.initial_pools
-            .get(id)
-            .filter(|r| r.owner == owner)
-            .map_or(0, |r| r.lp_balance)
+        self.initial_pools.get(id).map_or(0, |r| r.position(owner))
     }
     pub(super) fn bootstrap(
         &self,
@@ -181,6 +205,7 @@ impl State {
             creation_authorization: *creation,
             owner: b.owner.clone(),
             lp_balance: transition.lp_mint,
+            positions: BTreeMap::new(),
         })
     }
     pub fn quote_initial_liquidity(
@@ -313,10 +338,16 @@ impl State {
             h.update((r.owner.len() as u64).to_le_bytes());
             h.update(&r.owner);
             h.update(r.lp_balance.to_le_bytes());
+            h.update((r.positions.len() as u64).to_le_bytes());
+            for (owner, balance) in &r.positions {
+                h.update((owner.len() as u64).to_le_bytes());
+                h.update(owner);
+                h.update(balance.to_le_bytes());
+            }
         }
     }
     /// Structural checks supplement, but do not replace, an authenticated host root.
-    /// Swaps and redemption may evolve pools; initial funding and LP ownership stay fixed.
+    /// Adds, swaps and redemption evolve pools; their original identity stays fixed.
     pub(super) fn validate_blch_pool(&self, r: &Record) -> Result<(), Error> {
         let b = self
             .base_reserves
@@ -357,6 +388,21 @@ impl State {
         {
             return Err(Error::InvalidReserve);
         }
+        if r.positions.len() >= MAX_LP_PROVIDERS
+            || r.positions.iter().any(|(owner, balance)| {
+                owner.is_empty()
+                    || owner.len() > MAX_BASE_WITNESS_BYTES
+                    || owner == &r.owner
+                    || *balance == 0
+            })
+        {
+            return Err(Error::InvalidReserve);
+        }
+        let total_lp = r
+            .positions
+            .values()
+            .try_fold(r.lp_balance, |sum, balance| sum.checked_add(*balance))
+            .ok_or(Error::InvalidReserve)?;
         let initial = PoolState::new(
             self.domain,
             bloch_euvm::BLCH,
@@ -382,27 +428,39 @@ impl State {
         if initial.next.id() != r.pool.id()
             || initial.next.assets() != r.pool.assets()
             || initial.next.domain() != r.pool.domain()
-            || r.lp_balance > initial.lp_mint
-            || r.lp_balance.checked_add(amm::MINIMUM_LIQUIDITY) != Some(r.pool.lp_supply())
+            || total_lp.checked_add(amm::MINIMUM_LIQUIDITY) != Some(r.pool.lp_supply())
             || (b.revision == 0
                 && (initial.next != r.pool
+                    || r.lp_balance != initial.lp_mint
+                    || !r.positions.is_empty()
                     || b.outpoint != (paired_custody::output_id(&n.authorization), 0)))
-            || (r.lp_balance == initial.lp_mint
-                && u128::from(b.amount) * u128::from(n.amount)
-                    < u128::from(r.initial_reserves[0]) * u128::from(r.initial_reserves[1]))
         {
             return Err(Error::InvalidReserve);
         }
         PoolState::restore(r.pool.snapshot(), r.pool.state_root()).map_err(amm_error)?;
         Ok(())
     }
-    pub(super) fn restore_initial_pools(&mut self, records: Vec<Record>) -> Result<(), Error> {
+    pub(super) fn restore_initial_pools(
+        &mut self,
+        records: Vec<Record>,
+        verifier: &dyn Verifier,
+    ) -> Result<(), Error> {
         if records.len() > MAX_POOLS || records.windows(2).any(|w| w[0].pool.id() >= w[1].pool.id())
         {
             return Err(Error::InvalidRoot);
         }
         for record in records {
+            // Bound position count/key lengths and validate accounting before
+            // invoking potentially expensive key admission for each provider.
             self.validate_blch_pool(&record)?;
+            if !verifier.valid_pq_key(&record.owner)
+                || record
+                    .positions
+                    .keys()
+                    .any(|owner| !verifier.valid_pq_key(owner))
+            {
+                return Err(Error::InvalidRoot);
+            }
             if self
                 .reserve_pools
                 .insert(record.reserve, record.pool.id())
@@ -416,4 +474,4 @@ impl State {
     }
 }
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

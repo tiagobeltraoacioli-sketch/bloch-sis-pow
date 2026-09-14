@@ -1,31 +1,78 @@
-//! Owner-authorized proportional LP redemption; local rehearsal, not live admission.
+//! Atomic proportional BLCH/native liquidity additions in the default-off combined rehearsal.
+//! Neither a reserve capability nor an executable component leaves this module.
 use super::base_reserves::{ReserveSpend, RESERVE_KEY_INDEX};
 use super::*;
 use bloch_euvm::ustav::{amm, OutPoint};
 
-pub const REMOVE_GAS: u64 = 5_000;
+pub const ADD_GAS: u64 = 5_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QuoteRequest {
     pub domain: [u8; 32],
     pub pool: [u8; 32],
-    pub owner: Vec<u8>,
     pub revision: u64,
-    pub lp: u64,
-    /// Minimum payouts in raw [BLCH, native asset] units.
-    pub minimum: [u64; 2],
+    /// Maximum raw [BLCH, native asset] units the user offers.
+    pub maximum: [u64; 2],
+    pub minimum_lp: u64,
     pub valid_until: u64,
 }
+
+#[cfg(test)]
+mod tests;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Quote {
     pub request: QuoteRequest,
     pub height: u64,
     pub pool_state_root: [u8; 32],
-    pub amounts_out: [u64; 2],
+    pub amounts_in: [u64; 2],
+    /// Unused maxima are not an extra credit; funding minus actual debit is change.
+    pub unused_maximum: [u64; 2],
+    pub lp_minted: u64,
     pub reserves_before: [u64; 2],
     pub reserves_after: [u64; 2],
-    pub lp_remaining: u64,
 }
+impl State {
+    /// Read-only calculation; it does not validate wallet funding or promise admission.
+    pub fn quote_blch_add(&self, request: &QuoteRequest, height: u64) -> Result<Quote, Error> {
+        if request.domain != self.domain {
+            return Err(Error::WrongDomain);
+        }
+        let record = self
+            .initial_pools
+            .get(&request.pool)
+            .ok_or(Error::InvalidReserve)?;
+        if self.reserve_pools.get(&record.reserve) != Some(&request.pool) {
+            return Err(Error::InvalidReserve);
+        }
+        self.validate_blch_pool(record)?;
+        let transition = record
+            .pool
+            .transition(
+                &amm::Request {
+                    pool: request.pool,
+                    revision: request.revision,
+                    valid_until: request.valid_until,
+                    action: amm::Action::Add {
+                        maximum: request.maximum,
+                        minimum_lp: request.minimum_lp,
+                    },
+                },
+                height,
+            )
+            .map_err(|e| Error::Native(PoolError::Amm(e)))?;
+        Ok(Quote {
+            request: request.clone(),
+            height,
+            pool_state_root: record.pool.state_root(),
+            amounts_in: transition.user_debit,
+            unused_maximum: transition.unused_maximum,
+            lp_minted: transition.lp_mint,
+            reserves_before: record.pool.reserves(),
+            reserves_after: transition.next.reserves(),
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Request {
     pub quote: QuoteRequest,
@@ -33,19 +80,6 @@ pub struct Request {
     pub blch: PosTransaction,
     pub native: transfer_wire::Envelope,
     pub native_gas: u64,
-}
-impl QuoteRequest {
-    fn action(&self) -> amm::Request {
-        amm::Request {
-            pool: self.pool,
-            revision: self.revision,
-            valid_until: self.valid_until,
-            action: amm::Action::Remove {
-                lp: self.lp,
-                minimum: self.minimum,
-            },
-        }
-    }
 }
 impl Request {
     fn joint(&self) -> Result<super::Request, Error> {
@@ -59,25 +93,19 @@ impl Request {
     fn intent_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(96);
         bytes.extend_from_slice(&self.quote.pool);
-        bytes.extend_from_slice(&(self.quote.owner.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&self.quote.owner);
         bytes.extend_from_slice(&self.pool_state_root);
         bytes.extend_from_slice(&self.quote.revision.to_le_bytes());
-        bytes.extend_from_slice(&self.quote.lp.to_le_bytes());
-        bytes.extend_from_slice(&self.quote.minimum[0].to_le_bytes());
-        bytes.extend_from_slice(&self.quote.minimum[1].to_le_bytes());
+        bytes.extend_from_slice(&self.quote.maximum[0].to_le_bytes());
+        bytes.extend_from_slice(&self.quote.maximum[1].to_le_bytes());
+        bytes.extend_from_slice(&self.quote.minimum_lp.to_le_bytes());
         bytes
     }
     pub fn canonical_bytes(&self, domain: &[u8; 32]) -> Result<Vec<u8>, Error> {
         if self.quote.domain != *domain {
             return Err(Error::WrongDomain);
         }
-        if self.quote.owner.is_empty() || self.quote.owner.len() > MAX_BASE_WITNESS_BYTES {
-            return Err(Error::ResourceLimit);
-        }
         let mut bytes = self.joint()?.canonical_bytes(domain)?;
-        bytes[..8].copy_from_slice(b"BLCHLPRM");
-        bytes[8..10].copy_from_slice(&2u16.to_le_bytes());
+        bytes[..8].copy_from_slice(b"BLCHLPAD");
         bytes.extend_from_slice(&self.intent_bytes());
         if bytes.len() as u64 > MAX_ENVELOPE_BYTES {
             return Err(Error::ResourceLimit);
@@ -87,18 +115,19 @@ impl Request {
     pub fn authorization(&self, domain: &[u8; 32]) -> Result<[u8; 32], Error> {
         self.canonical_bytes(domain)?;
         let mut h = Sha3_256::new();
-        h.update(b"BLOCH-BLCH-REMOVE-AUTH-v2");
+        h.update(b"BLOCH-BLCH-ADD-AUTH-v1");
         h.update(self.joint()?.authorization(domain)?);
         h.update(self.intent_bytes());
         Ok(h.finalize().into())
     }
     pub fn output_txid(&self, domain: &[u8; 32]) -> Result<[u8; 32], Error> {
         let mut h = Sha3_256::new();
-        h.update(b"BLOCH-BLCH-REMOVE-OUT-v2");
+        h.update(b"BLOCH-BLCH-ADD-OUT-v1");
         h.update(self.authorization(domain)?);
         Ok(h.finalize().into())
     }
 }
+
 #[derive(Clone, Debug)]
 pub struct Receipt {
     pub quote: Quote,
@@ -107,42 +136,33 @@ pub struct Receipt {
     pub native: bloch_euvm::ustav::Receipt,
     pub charge: fee_market::TxCharge,
 }
-impl State {
-    /// An unsigned read-only calculation, not a proof of LP ownership or finality.
-    pub fn quote_blch_remove(&self, request: &QuoteRequest, height: u64) -> Result<Quote, Error> {
-        if request.domain != self.domain {
-            return Err(Error::WrongDomain);
-        }
-        if request.owner.is_empty() || request.owner.len() > MAX_BASE_WITNESS_BYTES {
-            return Err(Error::ResourceLimit);
-        }
-        let record = self
-            .initial_pools
-            .get(&request.pool)
-            .ok_or(Error::InvalidReserve)?;
-        if self.reserve_pools.get(&record.reserve) != Some(&request.pool) {
-            return Err(Error::InvalidReserve);
-        }
-        self.validate_blch_pool(record)?;
-        let lp_remaining = record
-            .position(&request.owner)
-            .checked_sub(request.lp)
-            .ok_or(Error::InvalidReserve)?;
-        let transition = record
-            .pool
-            .transition(&request.action(), height)
-            .map_err(|e| Error::Native(PoolError::Amm(e)))?;
-        Ok(Quote {
-            request: request.clone(),
-            height,
-            pool_state_root: record.pool.state_root(),
-            amounts_out: transition.user_credit,
-            reserves_before: record.pool.reserves(),
-            reserves_after: transition.next.reserves(),
-            lp_remaining,
-        })
+
+/// Empty witnesses denote exactly the one validated custody input. Every other
+/// input is checked nonempty before construction, even when trader == LP owner.
+/// Supply-only/no-KYC admission excludes policy calls that could reuse this
+/// exception. This adapter is private and its transaction hash is fixed.
+struct ReserveVerifier<'a> {
+    inner: &'a dyn Verifier,
+    expected: [u8; 32],
+    authorization: [u8; 32],
+    reserve_owner: &'a [u8],
+}
+impl Verifier for ReserveVerifier<'_> {
+    fn valid_pq_key(&self, key: &[u8]) -> bool {
+        self.inner.valid_pq_key(key)
     }
-    pub fn quote_blch_remove_fee(&self, request: &Request) -> Result<fee_market::TxCharge, Error> {
+    fn verify_pq(&self, message: &[u8], key: &[u8], signature: &[u8]) -> bool {
+        message == self.expected
+            && if signature.is_empty() {
+                key == self.reserve_owner
+            } else {
+                self.inner.verify_pq(&self.authorization, key, signature)
+            }
+    }
+}
+
+impl State {
+    pub fn quote_blch_add_fee(&self, request: &Request) -> Result<fee_market::TxCharge, Error> {
         let length = request.canonical_bytes(&self.domain)?.len() as u64;
         let PosTransaction::TransferV2 {
             tx_bytes,
@@ -167,7 +187,7 @@ impl State {
             .ok_or(Error::ResourceLimit)?;
         let gas = fee_market::intrinsic_gas(fee_market::TxClass::Eutxo { inputs: 1 }, *tx_bytes)
             .checked_add(native_work)
-            .and_then(|g| g.checked_add(REMOVE_GAS))
+            .and_then(|g| g.checked_add(ADD_GAS))
             .filter(|g| *g <= fee_market::MAX_TX_GAS)
             .ok_or(Error::ResourceLimit)?;
         let (base_fee_sat, priority_fee_sat) =
@@ -179,15 +199,16 @@ impl State {
             priority_fee_sat,
         })
     }
-    pub fn execute_blch_remove(
+
+    pub fn execute_blch_add(
         &mut self,
         request: &Request,
         height: u64,
         base_verifier: &dyn SignatureVerifier,
         native_verifier: &dyn Verifier,
     ) -> Result<Receipt, Error> {
-        let charge = self.quote_blch_remove_fee(request)?;
-        let quote = self.quote_blch_remove(&request.quote, height)?;
+        let charge = self.quote_blch_add_fee(request)?;
+        let quote = self.quote_blch_add(&request.quote, height)?;
         if quote.pool_state_root != request.pool_state_root {
             return Err(Error::StaleReserve);
         }
@@ -206,21 +227,20 @@ impl State {
         else {
             return Err(Error::InvalidShape);
         };
-        let owner = &request.quote.owner;
-        let owner_hash: [u8; 32] = Sha3_256::digest(owner).into();
-        if keys[0].pubkey != *owner
-            || !native_verifier.valid_pq_key(owner)
-            || outputs.len() < 2
-            || outputs[0].value != quote.reserves_after[0]
+        let trader = &keys[0].pubkey;
+        if !native_verifier.valid_pq_key(trader) {
+            return Err(Error::InvalidReserve);
+        }
+        let trader_hash: [u8; 32] = Sha3_256::digest(trader).into();
+        if outputs[0].value != quote.reserves_after[0]
             || outputs[0].script_hash != base_reserves::reserve_script(&self.domain, &pool.reserve)
-            || outputs[1].value != quote.amounts_out[0]
-            || outputs[1..].iter().any(|o| o.script_hash != owner_hash)
+            || outputs[1..].iter().any(|o| o.script_hash != trader_hash)
         {
             return Err(Error::InvalidReserve);
         }
-        let mut funding = 0u128;
+        let mut base_funding = 0u128;
         let mut reserve_inputs = 0usize;
-        let mut fee_inputs = 0usize;
+        let mut funding_inputs = 0usize;
         for input in inputs {
             let point = (input.txid, input.vout);
             if point == base_record.outpoint {
@@ -239,44 +259,83 @@ impl State {
                     .base
                     .utxo(&point.0, point.1)
                     .ok_or(Error::InvalidReserve)?;
-                if output.script_hash != owner_hash {
+                if output.script_hash != trader_hash {
                     return Err(Error::InvalidReserve);
                 }
-                funding += u128::from(output.value);
-                fee_inputs += 1;
+                base_funding += u128::from(output.value);
+                funding_inputs += 1;
             }
         }
-        if reserve_inputs != 1 || fee_inputs == 0 {
+        if reserve_inputs != 1 || funding_inputs == 0 {
             return Err(Error::InvalidReserve);
         }
-        let change: u128 = outputs[2..].iter().map(|o| u128::from(o.value)).sum();
-        if funding != change + charge.base_fee_sat + charge.priority_fee_sat {
+        let change: u128 = outputs[1..].iter().map(|o| u128::from(o.value)).sum();
+        if base_funding
+            != change
+                + u128::from(quote.amounts_in[0])
+                + charge.base_fee_sat
+                + charge.priority_fee_sat
+        {
             return Err(Error::Base(TransferReject::ValueNotConserved));
         }
         let tx = &request.native.transaction;
         let w = &request.native.witnesses;
         if tx.asset != native_record.asset
             || tx.delta != 0
-            || tx.inputs.as_slice() != [native_record.outpoint]
-            || tx.outputs.len() != 2
-            || tx.outputs[0].amount != quote.reserves_after[1]
-            || tx.outputs[1].amount != quote.amounts_out[1]
-            || tx.outputs[0].owner != pool.owner
-            || tx.outputs[1].owner != *owner
-            || w.owners.len() != 1
-            || w.owners[0].is_empty()
+            || tx.outputs.is_empty()
+            || w.owners.len() != tx.inputs.len()
             || w.modules.len() != 1
             || !w.modules[0].is_empty()
             || !w.eligibility.is_empty()
+            || tx.outputs[0].owner != native_record.owner
+            || tx.outputs[0].amount != quote.reserves_after[1]
+            || tx.outputs[1..].iter().any(|o| o.owner != *trader)
         {
             return Err(Error::InvalidReserve);
         }
+        let mut native_funding = 0u128;
+        let mut native_reserve_inputs = 0usize;
+        for (point, witness) in tx.inputs.iter().zip(&w.owners) {
+            if *point == native_record.outpoint {
+                if !witness.is_empty() {
+                    return Err(Error::InvalidReserve);
+                }
+                native_reserve_inputs += 1;
+            } else {
+                if self.paired_locks.contains_key(point) || self.native.is_locked(point) {
+                    return Err(Error::LockedReserve);
+                }
+                let output = self
+                    .native
+                    .spendable_output(point)
+                    .ok_or(Error::InvalidReserve)?;
+                if witness.is_empty() || output.output.owner != *trader || output.asset != tx.asset
+                {
+                    return Err(Error::InvalidReserve);
+                }
+                native_funding += u128::from(output.output.amount);
+            }
+        }
+        if native_reserve_inputs != 1 {
+            return Err(Error::InvalidReserve);
+        }
+        let change: u128 = tx.outputs[1..].iter().map(|o| u128::from(o.amount)).sum();
+        if native_funding != change + u128::from(quote.amounts_in[1]) {
+            return Err(Error::InvalidReserve);
+        }
+        // Credit the authenticated depositor only; clone-local changes cannot
+        // escape if later authorization, collision or conservation checks fail.
+        let position = pool
+            .position(trader)
+            .checked_add(quote.lp_minted)
+            .ok_or(Error::ResourceLimit)?;
+        pool.set_position(trader, position)?;
         let authorization = request.authorization(&self.domain)?;
         let output_txid = request.output_txid(&self.domain)?;
         let native_hash = tx
             .signing_hash(&self.domain)
             .map_err(|_| Error::InvalidShape)?;
-        let permit = ReserveSpend::remove_liquidity(self, &quote, authorization)?;
+        let permit = ReserveSpend::add_liquidity(self, &quote, authorization)?;
         let base_fees = self
             .base_fees
             .checked_add(charge.base_fee_sat)
@@ -287,7 +346,18 @@ impl State {
             .ok_or(Error::ResourceLimit)?;
         let next = pool
             .pool
-            .transition(&request.quote.action(), height)
+            .transition(
+                &amm::Request {
+                    pool: request.quote.pool,
+                    revision: request.quote.revision,
+                    valid_until: request.quote.valid_until,
+                    action: amm::Action::Add {
+                        maximum: request.quote.maximum,
+                        minimum_lp: request.quote.minimum_lp,
+                    },
+                },
+                height,
+            )
             .map_err(|e| Error::Native(PoolError::Amm(e)))?;
         let next_revision = base_record
             .revision
@@ -303,14 +373,11 @@ impl State {
             .native_gas
             .checked_sub(decoding_gas)
             .ok_or(Error::ResourceLimit)?;
-        pool.set_position(owner, quote.lp_remaining)?;
-        // Only this exact reserve input can use the LP redeemer signature.
-        let scoped = RedemptionVerifier {
+        let scoped = ReserveVerifier {
             inner: native_verifier,
             expected: native_hash,
             authorization,
-            reserve_owner: &pool.owner,
-            redeemer: owner,
+            reserve_owner: &native_record.owner,
         };
         let native_plan = self
             .native
@@ -331,7 +398,7 @@ impl State {
                 }),
             )
             .map_err(Error::Base)?;
-        // All fallible work precedes both commits, including LP and fee arithmetic.
+        // All validation, arithmetic and collision checks precede both commits.
         let charge = base_plan.commit();
         let mut native = native_plan.commit();
         native.gas_used += decoding_gas;
@@ -346,7 +413,6 @@ impl State {
         };
         native_record.amount = quote.reserves_after[1];
         pool.pool = next.next;
-
         self.base_locks.insert(base_record.outpoint, pool.reserve);
         self.paired_locks
             .insert(native_record.outpoint, pool.reserve);
@@ -362,27 +428,5 @@ impl State {
             native,
             charge,
         })
-    }
-}
-
-/// Private authority for exactly one previously validated locked reserve input.
-struct RedemptionVerifier<'a> {
-    inner: &'a dyn Verifier,
-    expected: [u8; 32],
-    authorization: [u8; 32],
-    reserve_owner: &'a [u8],
-    redeemer: &'a [u8],
-}
-impl Verifier for RedemptionVerifier<'_> {
-    fn valid_pq_key(&self, key: &[u8]) -> bool {
-        self.inner.valid_pq_key(key)
-    }
-    fn verify_pq(&self, message: &[u8], key: &[u8], signature: &[u8]) -> bool {
-        message == self.expected
-            && key == self.reserve_owner
-            && !signature.is_empty()
-            && self
-                .inner
-                .verify_pq(&self.authorization, self.redeemer, signature)
     }
 }

@@ -9,6 +9,7 @@ use bloch_euvm::ustav::{
 };
 use sha3::{Digest, Sha3_256};
 use std::collections::BTreeMap;
+pub mod add_liquidity;
 pub mod backend;
 pub mod base_reserves;
 pub mod initial_liquidity;
@@ -214,7 +215,7 @@ impl State {
     }
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
-            version: 6,
+            version: 7,
             initial_pools: self.initial_pools.values().cloned().collect(),
             paired_reserves: self.paired_reserves.values().cloned().collect(),
             base: self.base.clone(),
@@ -230,7 +231,7 @@ impl State {
         trusted_root: [u8; 32],
         verifier: &dyn Verifier,
     ) -> Result<Self, Error> {
-        if snapshot.version != 6 {
+        if snapshot.version != 7 {
             return Err(Error::InvalidRoot);
         }
         let native = PoolLedger::restore(snapshot.native, snapshot.native_root, verifier)
@@ -242,7 +243,7 @@ impl State {
         state.priority_fees = snapshot.priority_fees;
         state.restore_base_reserves(snapshot.base_reserves, verifier)?;
         state.restore_paired_reserves(snapshot.paired_reserves, verifier)?;
-        state.restore_initial_pools(snapshot.initial_pools)?;
+        state.restore_initial_pools(snapshot.initial_pools, verifier)?;
         if state
             .paired_reserves
             .keys()
@@ -257,7 +258,7 @@ impl State {
     }
     pub fn state_root(&self) -> [u8; 32] {
         let mut h = Sha3_256::new();
-        h.update(b"BLOCH-JOINT-REHEARSAL-STATE-v6");
+        h.update(b"BLOCH-JOINT-REHEARSAL-STATE-v7");
         h.update(self.domain);
         h.update(self.base.compute_root());
         h.update(self.native.state_root());

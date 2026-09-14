@@ -2,7 +2,7 @@ use super::super::paired_custody::tests::setup;
 use super::super::tests::{key, signature, BoundVerifier, DOMAIN};
 use super::*;
 use crate::transition::{TransferInputV2, TransferOutput};
-fn funded() -> (State, Request) {
+pub(in crate::transition::native_dex) fn funded() -> (State, Request) {
     let (mut state, pair) = setup();
     let receipt = state
         .execute_paired_custody(&pair, 1, &BoundVerifier, &BoundVerifier)
@@ -631,6 +631,7 @@ fn remove_request(
     let b = &state.base_reserves[&record.reserve];
     let n = &state.paired_reserves[&record.reserve];
     let quote_request = remove_liquidity::QuoteRequest {
+        owner: key(1),
         domain: DOMAIN,
         pool,
         revision: record.pool.revision(),
@@ -941,5 +942,82 @@ fn post_redemption_snapshots_reject_lp_inflation_supply_mismatch_and_old_version
             _ => bad.version = 5,
         }
         assert!(State::restore(bad, root, &BoundVerifier).is_err());
+    }
+}
+
+#[test]
+fn provider_positions_bound_capacity_update_and_reclaim_empty_slots() {
+    let (mut state, request) = funded();
+    let receipt = state
+        .execute_initial_liquidity(&request, 1, &BoundVerifier, &BoundVerifier)
+        .unwrap();
+    let record = state.initial_pools.get_mut(&receipt.pool).unwrap();
+    for n in 2..=128 {
+        record.set_position(&key(n), 1).unwrap();
+    }
+    let full = record.clone();
+    assert!(record.set_position(&key(129), 1).is_err());
+    assert_eq!(*record, full);
+    record.set_position(&key(2), 2).unwrap();
+    record.set_position(&key(2), 0).unwrap();
+    assert_eq!(record.position(&key(2)), 0);
+    assert!(!record.positions.contains_key(&key(2)));
+    record.set_position(&key(129), 1).unwrap();
+    record.set_position(&key(1), 0).unwrap();
+    assert!(record.set_position(&key(130), 1).is_err());
+    assert!(record.set_position(&[], 1).is_err());
+    assert!(record
+        .set_position(&vec![1; MAX_BASE_WITNESS_BYTES + 1], 1)
+        .is_err());
+}
+
+#[test]
+fn restored_positions_require_valid_keys_canonical_entries_and_total_supply() {
+    // An evolved pool permits multiple providers; authority is still supplied
+    // by the authenticated outer root, never by this structural fixture.
+    let (mut state, request) = remove_fixture();
+    state
+        .execute_blch_remove(&request, 1, &BoundVerifier, &BoundVerifier)
+        .unwrap();
+    let id = request.quote.pool;
+    let record = state.initial_pools.get_mut(&id).unwrap();
+    record.lp_balance -= 1;
+    record.set_position(&key(2), 1).unwrap();
+    let root = state.state_root();
+    let restored = State::restore(state.snapshot(), root, &BoundVerifier).unwrap();
+    assert_eq!(restored.blch_lp_position(&id, &key(2)), 1);
+    for variant in 0..7 {
+        let mut bad = state.clone();
+        let record = bad.initial_pools.get_mut(&id).unwrap();
+        match variant {
+            0 => {
+                record.positions.insert(key(3), 1);
+            }
+            1 => {
+                record.positions.insert(key(3), 0);
+            }
+            2 => {
+                record.positions.insert(key(1), 1);
+            }
+            3 => {
+                record.positions.remove(&key(2));
+                record.positions.insert(key(0), 1);
+            }
+            4 => {
+                record.positions.remove(&key(2));
+                record.positions.insert(vec![], 1);
+            }
+            5 => {
+                record.positions.insert(key(3), u64::MAX);
+            }
+            _ => {
+                for n in 3..=130 {
+                    record.positions.insert(key(n), 1);
+                }
+            }
+        }
+        // Supply a matching root to exercise structural rejection independently.
+        assert!(State::restore(bad.snapshot(), bad.state_root(), &BoundVerifier).is_err());
+        assert_ne!(bad.state_root(), root);
     }
 }

@@ -215,6 +215,32 @@ impl ReserveSpend {
     pub(in crate::transition) fn claims(&self, point: &OutPoint) -> bool {
         self.point == *point
     }
+    pub(super) fn add_liquidity(
+        state: &State,
+        quote: &super::add_liquidity::Quote,
+        authorization: [u8; 32],
+    ) -> Result<Self, Error> {
+        if state.quote_blch_add(&quote.request, quote.height)? != *quote {
+            return Err(Error::InvalidReserve);
+        }
+        let pool = state
+            .initial_pools
+            .get(&quote.request.pool)
+            .ok_or(Error::InvalidReserve)?;
+        let record = state
+            .base_reserves
+            .get(&pool.reserve)
+            .ok_or(Error::InvalidReserve)?;
+        let script = reserve_script(&state.domain, &pool.reserve);
+        Ok(Self {
+            point: record.outpoint,
+            amount: record.amount,
+            output_amount: quote.reserves_after[0],
+            script,
+            output_script: script,
+            authorization,
+        })
+    }
     pub(super) fn remove_liquidity(
         state: &State,
         quote: &super::remove_liquidity::Quote,
