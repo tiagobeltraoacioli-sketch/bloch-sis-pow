@@ -21,12 +21,14 @@ asset, issue LP, release a native reserve, or implement a withdrawal operation.
 [Paired reserve creation](../../crates/bloch-pos-committee/docs/paired-reserve-custody.md)
 additionally binds BLCH and registered-token funding in one authenticated
 operation and locks both reserves atomically. It still creates no LP position
-and offers no swap, withdrawal or reserve continuation. The standalone BLCH
-continuation path rejects reserves belonging to this paired custody.
+and offers no swap or reserve continuation. Its separate owner-authorized
+closing operation returns both full reserves atomically, with fees funded
+separately. The standalone BLCH continuation path rejects paired reserves.
 
 Paired reserve creation has its own [bounded binary transport](../../crates/bloch-pos-committee/docs/paired-custody-wire.md),
 preserving the same authorization, full-envelope fees and sealed execution.
-No closing or one-sided reserve release operation is exposed.
+The binary creation dispatcher does not accept closing requests; closing is
+a separate typed State operation. No one-sided native release plan is exposed.
 
 ## Atomic authorization and planning
 
@@ -89,12 +91,14 @@ authenticated host state; matching roots supplied by the same untrusted sender
 does not prove authenticity. Never use this constructor to resume an existing
 rehearsal while discarding its fee escrow.
 
-`snapshot` and `restore` carry the base state, full sealed native state, both
-fee counters and BLCH reserve records. The rehearsal snapshot/outer root now use
-version 2; old version-1 snapshots are rejected. Restore rebuilds and validates
-reserve locks and the complete expected outer root. Cloning or
-restoring just one component is not an atomic replay/reorg operation. This is
-a typed local snapshot; production persistence/network codecs are not added.
+`State` now owns both paired lock maps and reserve records directly. Its native
+query facade does not expose an executable inner ledger, and complete snapshots
+have private fields. `snapshot` and `restore` carry both ledgers, fee counters,
+BLCH reserves and paired records under version 3; versions 1 and 2 are rejected.
+Restore rebuilds and validates the locks and complete expected outer root.
+A whole-state clone retains both sides; component extraction is not supported.
+This remains a typed local snapshot; production persistence/network codecs are
+not added.
 
 ## Validation and remaining work
 

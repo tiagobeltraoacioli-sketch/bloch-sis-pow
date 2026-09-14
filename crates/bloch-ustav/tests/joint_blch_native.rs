@@ -395,7 +395,6 @@ fn hybrid_joint_blch_native_atomicity_cross_binding_and_fee_restore() {
     assert_eq!(restored.state_root(), state.state_root());
     assert_eq!(restored.fee_escrow(), state.fee_escrow());
     unchanged_after_rejection(&mut restored, &request);
-    let mut forged = state.snapshot();
-    forged.base_fees += 1;
-    assert!(State::restore(forged, state.state_root(), &BlochVerifier).is_err());
+    // The snapshot is opaque; callers cannot edit one leg or its fee escrow.
+    assert!(State::restore(state.snapshot(), [0; 32], &BlochVerifier).is_err());
 }

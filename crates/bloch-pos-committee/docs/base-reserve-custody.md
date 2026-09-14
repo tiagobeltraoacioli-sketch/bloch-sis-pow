@@ -3,7 +3,8 @@
 `native-dex-rehearsal` now exposes `transition::native_dex::base_reserves`.
 It is a local custody substrate over actual `CommittedState` BLCH UTXOs, not a
 BLCH/USDT AMM, LP token, bridge release service, or activated consensus operation.
-There is no withdrawal/close operation in this slice. Do not fund it on a live
+Standalone reserves have no withdrawal/close operation; paired reserves use
+the separate atomic closing dispatcher. Do not fund it on a live
 chain; the node has no admission or settlement integration for these requests.
 
 The owning `native_dex::State` offers `quote_base_reserve`,
@@ -65,10 +66,10 @@ there is no network decoder or block dispatch for them yet.
 
 ## Persistence and validation
 
-The rehearsal snapshot and outer root advance to version 2 and commit every
+The rehearsal snapshot and outer root use version 3 and commit every
 reserve's ID, seed, owner, amount, revision and outpoint alongside both ledger
-roots and fee counters. Old version-1 snapshots are refused rather than silently
-losing custody metadata. Restore reconstructs unique locks and checks the
+roots, paired custody records and fee counters. Old version-1 and version-2
+snapshots are refused rather than silently losing custody metadata. Restore reconstructs unique locks and checks the
 actual UTXO, output index zero, amount, protocol script, ID derivation and PQ
 owner admission against an independently authenticated outer root.
 
@@ -78,12 +79,14 @@ and domains, expiry, revision replay, missing/duplicated funding, output collisi
 fee overflow, bounded reserve count and snapshot tampering. The `bloch-ustav`
 integration test uses real hybrid PQ signatures for funding and continuation.
 
-Before supporting BLCH/USDT, native and base custody must be owned by one fixed
-backend with atomic AMM/LP rules. Do not expose a public native reserve-release
+Native and base paired custody now share one concrete State backend. Before
+supporting a BLCH/USDT market, atomic AMM/LP rules remain required. Do not expose a public native reserve-release
 plan as an intermediate shortcut. Consensus admission, full persistence/reorg
 integration, wallet signing, fee settlement and independent review remain open.
 
 The separate [paired reserve creation](paired-reserve-custody.md) operation now
 funds and locks both assets atomically. Reserves created through that operation
 cannot use this standalone continuation path; changing one side independently
-would break the authenticated pairing. AMM/LP transitions remain unimplemented.
+would break the authenticated pairing. The paired closing dispatcher returns
+both assets atomically to their original owner. AMM/LP transitions remain
+unimplemented.

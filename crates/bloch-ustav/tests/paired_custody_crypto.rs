@@ -330,31 +330,31 @@ fn paired_custody_preserves_supply_locks_both_assets_and_restores_joint_state() 
     assert_eq!(restored.state_root(), state.state_root());
     assert!(restored.native().is_locked(&native_reserve));
     assert!(restored.spendable_base_output(&reserve.outpoint).is_none());
-    // Even the actual PQ owner cannot spend a locked native reserve.
-    let mut ledger = restored.native().clone();
-    let mut tx = request.native.transaction.clone();
-    tx.inputs = vec![native_reserve];
-    tx.outputs = vec![Output {
+    // The real PQ owner must dispatch through the complete state; there is no
+    // clonable inner ledger to extract and spend independently of the BLCH leg.
+    let mut restored = restored;
+    let mut joint = bloch_pos_committee::transition::native_dex::Request {
+        blch: request.blch.clone(),
+        native: request.native.clone(),
+        valid_until: request.valid_until,
+        native_gas: request.native_gas,
+    };
+    joint.native.transaction.inputs = vec![native_reserve];
+    joint.native.transaction.outputs = vec![Output {
         owner: identities()[0].0.clone(),
         amount: 60_000,
     }];
-    let witnesses = Witnesses {
-        owners: vec![signature(
-            &tx.signing_hash(&DOMAIN).unwrap(),
-            &identities()[0].1,
-        )],
-        modules: vec![vec![]],
-        eligibility: vec![],
-    };
-    let before = ledger.state_root();
-    assert!(ledger
-        .apply(&tx, &witnesses, 3, &BlochVerifier, GAS)
-        .is_err());
-    assert_eq!(ledger.state_root(), before);
-    assert!(ledger
-        .plan_transfer(&tx, &witnesses, 3, &BlochVerifier, GAS)
-        .is_err());
-    assert_eq!(ledger.state_root(), before);
+    let hash = joint.authorization(&DOMAIN).unwrap();
+    joint.native.witnesses.owners[0] = signature(&hash, &identities()[0].1);
+    if let PosTransaction::TransferV2 { keys, .. } = &mut joint.blch {
+        keys[0].signature = signature(&hash, &identities()[0].1);
+    }
+    let before = restored.state_root();
+    assert!(matches!(
+        restored.execute(&joint, 3, &BaseVerifier, &BlochVerifier),
+        Err(bloch_pos_committee::transition::native_dex::Error::LockedReserve)
+    ));
+    assert_eq!(restored.state_root(), before);
 }
 
 #[test]
@@ -420,4 +420,207 @@ fn paired_wire_real_pq_matches_typed_execution_and_rejects_replay_and_tampering(
     let mut restored = State::restore(state.snapshot(), root, &BlochVerifier).unwrap();
     assert!(wire::apply_encoded(&mut restored, &bytes, 2, &BaseVerifier, &BlochVerifier).is_err());
     assert_eq!(restored.state_root(), root);
+}
+
+use bloch_pos_committee::transition::native_dex::paired_custody::CloseRequest;
+
+fn close_fixture() -> (State, CloseRequest) {
+    use bloch_pos_committee::transition::native_dex::base_reserves::RESERVE_KEY_INDEX;
+    let (mut state, creation) = fixture();
+    let receipt = state
+        .execute_paired_custody(&creation, 2, &BaseVerifier, &BlochVerifier)
+        .unwrap();
+    let fee_funding = state.base().utxo(&receipt.blch_txid, 1).unwrap().value;
+    let owner = identities()[0].0.clone();
+    let mut request = CloseRequest {
+        reserve: receipt.reserve.id,
+        creation_authorization: receipt.authorization,
+        valid_until: 100,
+        native_gas: 100_000,
+        blch: PosTransaction::TransferV2 {
+            keys: vec![WitnessKey {
+                pubkey: owner.clone(),
+                signature: vec![0; 5500],
+            }],
+            inputs: vec![
+                TransferInputV2 {
+                    txid: receipt.blch_txid,
+                    vout: 0,
+                    key_index: RESERVE_KEY_INDEX,
+                },
+                TransferInputV2 {
+                    txid: receipt.blch_txid,
+                    vout: 1,
+                    key_index: 0,
+                },
+            ],
+            outputs: vec![
+                TransferOutput {
+                    value: BASE_RESERVE,
+                    script_hash: Sha3_256::digest(&owner).into(),
+                },
+                TransferOutput {
+                    value: 1,
+                    script_hash: Sha3_256::digest(&owner).into(),
+                },
+            ],
+            tx_bytes: 0,
+            tip_millisat_per_gas: 2,
+        },
+        native: transfer_wire::Envelope {
+            domain: DOMAIN,
+            transaction: Transaction {
+                inputs: vec![receipt.native.outputs[0]],
+                outputs: vec![Output {
+                    owner,
+                    amount: creation.native_amount,
+                }],
+                ..creation.native.transaction.clone()
+            },
+            witnesses: Witnesses {
+                owners: vec![vec![0; 5500]],
+                modules: vec![vec![]],
+                eligibility: vec![],
+            },
+        },
+    };
+    let length = request.canonical_bytes(&DOMAIN).unwrap().len() as u64;
+    if let PosTransaction::TransferV2 { tx_bytes, .. } = &mut request.blch {
+        *tx_bytes = length + 256;
+    }
+    let quote = state.quote_paired_close(&request).unwrap();
+    if let PosTransaction::TransferV2 { outputs, .. } = &mut request.blch {
+        outputs[1].value = fee_funding - (quote.base_fee_sat + quote.priority_fee_sat) as u64;
+    }
+    sign_close(&mut request);
+    (state, request)
+}
+fn sign_close(request: &mut CloseRequest) {
+    let hash = request.authorization(&DOMAIN).unwrap();
+    if let PosTransaction::TransferV2 { keys, .. } = &mut request.blch {
+        keys[0].signature = signature(&hash, &identities()[0].1);
+    }
+    request.native.witnesses.owners[0] = signature(&hash, &identities()[0].1);
+}
+fn reject_close_unchanged(state: &mut State, request: &CloseRequest) {
+    let root = state.state_root();
+    let base = state.base().clone();
+    let native = state.native().snapshot();
+    let fees = state.fee_escrow();
+    assert!(state
+        .execute_paired_close(request, 3, &BaseVerifier, &BlochVerifier)
+        .is_err());
+    assert_eq!(state.state_root(), root);
+    assert_eq!(state.base(), &base);
+    assert_eq!(state.native().snapshot(), native);
+    assert_eq!(state.fee_escrow(), fees);
+}
+#[test]
+fn real_pq_close_rejects_forgery_redirected_reserves_and_fee_subsidy_atomically() {
+    let (mut state, request) = close_fixture();
+    for offset in [
+        crypto::SUITE_HEADER_LEN,
+        crypto::SUITE_HEADER_LEN + crypto::MLDSA_SIG_LEN + 1,
+    ] {
+        let mut bad = request.clone();
+        if let PosTransaction::TransferV2 { keys, .. } = &mut bad.blch {
+            keys[0].signature[offset] ^= 1;
+        }
+        reject_close_unchanged(&mut state, &bad);
+        let mut bad = request.clone();
+        bad.native.witnesses.owners[0][offset] ^= 1;
+        reject_close_unchanged(&mut state, &bad);
+    }
+    let mut bad = request.clone();
+    bad.creation_authorization[0] ^= 1;
+    sign_close(&mut bad);
+    reject_close_unchanged(&mut state, &bad);
+    // Total BLCH conservation still holds, but reserve value cannot fund fees/change.
+    let mut bad = request.clone();
+    if let PosTransaction::TransferV2 { outputs, .. } = &mut bad.blch {
+        outputs[0].value -= 1;
+        outputs[1].value += 1;
+    }
+    sign_close(&mut bad);
+    reject_close_unchanged(&mut state, &bad);
+    let mut bad = request.clone();
+    bad.native.transaction.outputs[0].owner = identities()[2].0.clone();
+    sign_close(&mut bad);
+    reject_close_unchanged(&mut state, &bad);
+    let mut bad = request.clone();
+    if let PosTransaction::TransferV2 { outputs, .. } = &mut bad.blch {
+        outputs[0].script_hash = Sha3_256::digest(&identities()[2].0).into();
+    }
+    sign_close(&mut bad);
+    reject_close_unchanged(&mut state, &bad);
+    // Correct ordinary owner signatures cannot substitute for joint-close consent.
+    let mut bad = request.clone();
+    let hash = bad.native.transaction.signing_hash(&DOMAIN).unwrap();
+    bad.native.witnesses.owners[0] = signature(&hash, &identities()[0].1);
+    reject_close_unchanged(&mut state, &bad);
+    state
+        .execute_paired_close(&request, 3, &BaseVerifier, &BlochVerifier)
+        .unwrap();
+}
+#[test]
+fn real_pq_close_returns_both_assets_and_restored_state_rejects_replay() {
+    let (mut state, request) = close_fixture();
+    let before_fees = state.fee_escrow();
+    let native_input = request.native.transaction.inputs[0];
+    let base_input = state.base_reserve(&request.reserve).unwrap().outpoint;
+    let asset = request.native.transaction.asset;
+    let supply = state.native().gateway().native().supply(&asset);
+    let quote = state.quote_paired_close(&request).unwrap();
+    let receipt = state
+        .execute_paired_close(&request, 3, &BaseVerifier, &BlochVerifier)
+        .unwrap();
+    assert_eq!(receipt.charge, quote);
+    assert!(state.paired_custody(&request.reserve).is_none());
+    assert!(state.base_reserve(&request.reserve).is_none());
+    assert!(state.base().utxo(&base_input.0, base_input.1).is_none());
+    assert!(state
+        .native()
+        .gateway()
+        .native()
+        .output(&native_input)
+        .is_none());
+    assert!(!state.native().is_locked(&native_input));
+    assert!(!state.base_is_locked(&base_input));
+    let returned = state
+        .spendable_base_output(&(receipt.blch_txid, 0))
+        .unwrap();
+    assert_eq!(returned.value, BASE_RESERVE);
+    assert_eq!(
+        returned.script_hash,
+        <[u8; 32]>::from(Sha3_256::digest(&identities()[0].0))
+    );
+    let native = state
+        .native()
+        .spendable_output(&receipt.native.outputs[0])
+        .unwrap();
+    assert_eq!(native.output.amount, 60_000);
+    assert_eq!(native.output.owner, identities()[0].0);
+    assert_eq!(state.native().gateway().native().supply(&asset), supply);
+    let fees = state.fee_escrow();
+    assert_eq!(
+        fees,
+        (
+            before_fees.0 + quote.base_fee_sat,
+            before_fees.1 + quote.priority_fee_sat
+        )
+    );
+    let coins: u128 = state
+        .base()
+        .utxos()
+        .map(|entry| u128::from(entry.value))
+        .sum();
+    assert_eq!(coins + fees.0 + fees.1, u128::from(COIN));
+    let root = state.state_root();
+    let mut restored = State::restore(state.snapshot(), root, &BlochVerifier).unwrap();
+    reject_close_unchanged(&mut restored, &request);
+    assert_eq!(restored.state_root(), root);
+    assert!(restored
+        .native()
+        .spendable_output(&receipt.native.outputs[0])
+        .is_some());
 }

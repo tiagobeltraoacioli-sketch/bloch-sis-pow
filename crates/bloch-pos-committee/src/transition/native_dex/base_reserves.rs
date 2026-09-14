@@ -158,9 +158,29 @@ pub(in crate::transition) struct ReserveSpend {
     point: OutPoint,
     amount: u64,
     script: [u8; 32],
+    output_script: [u8; 32],
     authorization: [u8; 32],
 }
 impl ReserveSpend {
+    pub(super) fn paired_close(
+        state: &State,
+        id: &[u8; 32],
+        authorization: [u8; 32],
+    ) -> Result<Self, Error> {
+        let record = state.base_reserves.get(id).ok_or(Error::InvalidReserve)?;
+        if !state.paired_reserves.contains_key(id)
+            || state.base_locks.get(&record.outpoint) != Some(id)
+        {
+            return Err(Error::InvalidReserve);
+        }
+        Ok(Self {
+            point: record.outpoint,
+            amount: record.amount,
+            script: reserve_script(&state.domain, id),
+            output_script: Sha3_256::digest(&record.owner).into(),
+            authorization,
+        })
+    }
     pub(in crate::transition) fn claims(&self, point: &OutPoint) -> bool {
         self.point == *point
     }
@@ -178,7 +198,7 @@ impl ReserveSpend {
             && entry.script_hash == self.script
             && self.authorization == *authorization
             && outputs.first().is_some_and(|output| {
-                output.value == self.amount && output.script_hash == self.script
+                output.value == self.amount && output.script_hash == self.output_script
             })
     }
 }
@@ -297,7 +317,7 @@ impl State {
                 )
             }
             Action::Continue { reserve, revision } => {
-                if self.native.custody(&reserve).is_some() {
+                if self.paired_reserves.contains_key(&reserve) {
                     return Err(Error::LockedReserve);
                 }
                 let mut record = self
@@ -384,6 +404,7 @@ impl State {
             point,
             amount: record.amount,
             script,
+            output_script: script,
             authorization,
         });
         let plan = self

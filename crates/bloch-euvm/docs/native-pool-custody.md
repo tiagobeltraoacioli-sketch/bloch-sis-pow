@@ -89,8 +89,9 @@ nothing. This preserves all native charter and reserve-lock checks while
 allowing the joint BLCH/native rehearsal to validate both legs before either
 commits. It does not expose an arbitrary mutable ledger or mint authority.
 
-The separate `custody` module adds authenticated one-way reserve funding for
-the paired BLCH/native rehearsal. Its exclusive plan seals the new reserve in
+The separate `custody` module retains authenticated one-way native reserve
+funding as a reference primitive. The combined BLCH/native State now owns its
+paired reserve locks directly and does not use this primitive for them. Its exclusive plan seals the new reserve in
 the same lock map used by ordinary pool custody. It grants no reserve release
 operation. The pool snapshot/root version is now 2 and commits these records;
 version-1 snapshots are rejected. AMM operations in this ledger still accept

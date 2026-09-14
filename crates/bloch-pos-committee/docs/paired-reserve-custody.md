@@ -1,88 +1,107 @@
 # Paired BLCH/native reserve custody rehearsal
 
-This local, default-off rehearsal prepares the custody boundary needed by a
-BLCH/native-token market. It is not live liquidity, an LP position, a swap,
-a bridge deposit authorization or an activated Genesis-4 transaction.
+The default-off `native-dex-rehearsal` feature supports paired reserve creation
+and owner-authorized closing in local state. It is not live liquidity, an LP
+position, a swap, an external bridge withdrawal or an activated Genesis-4
+transaction. All examples and tests use local funding.
 
-`native_dex::paired_custody::Request` contains the BLCH TransferV2 intent,
-native transfer envelope, seed, two reserve amounts, expiry and native work
-budget. `State::quote_paired_custody` prices the complete operation;
+## One concrete settlement boundary
+
+`native_dex::State` owns the real BLCH state, sealed native pool ledger, both
+paired reserve records, their locks and fee escrow. Its ordinary transfer,
+creation and closing dispatchers enforce the same paired lock map. The native
+ledger's existing native/native AMM locks remain independently enforced.
+
+`State::native()` returns read-only `NativeView`, `GatewayView` and `LedgerView`
+queries. These expose balances, token/route metadata and lock-aware spendable
+outputs, not a clonable executable ledger, mutable references or inner restore
+material. Its diagnostic native snapshot is opaque. The full `State` snapshot
+is also opaque: a caller can clone and restore the complete state against a
+trusted root but cannot extract one component or edit its fee accounting.
+
+This is an API authority boundary, not encryption or protection against a
+malicious host that replaces code or invents its own trusted root. Production
+hosts must authenticate the complete outer root. Compile-fail tests ensure
+external Rust callers cannot obtain the old mutable component through the
+supported query/snapshot API.
+
+## Creation and authorization
+
+`paired_custody::Request` contains the BLCH TransferV2 intent, native transfer
+envelope, seed, two reserve amounts, expiry and native work budget.
+`State::quote_paired_custody` prices the complete operation;
 `execute_paired_custody` validates and commits it. Output zero of each leg is
 the reserve; subsequent outputs are change to the same admitted PQ owner.
 Both legs sign `Request::authorization` with the authenticated network domain.
 
-The [bounded binary transport](paired-custody-wire.md) now provides encoding,
-decoding and local dispatch through the same sealed executor. This is a
-prerequisite for wallet/RPC integration; it does not itself expose a network
-endpoint or enable a wallet to submit live transactions.
-
-The lower-level native funding plan independently requires custody-specific
-consent binding its record and transaction. The paired dispatcher privately
-maps that exact digest to the joint authorization. An ordinary transfer
-signature cannot be reused to impose a permanent reserve lock.
-
-Fees cover the full witness-bearing envelope, the prepaid native budget using
-the existing rehearsal conversion, and 1,000 additional BLCH gas units for
-reserve bookkeeping. The native plan charges 1,000 native units for its own
-custody bookkeeping. These reference costs do not calibrate production fees.
-
 The custody ID uses `base_reserves::reserve_id(domain, seed, owner)`. Its BLCH
-output uses the protocol condition commitment, while its native output keeps
-the real owner key and gains a sealed protocol lock. Read-only custody queries
-do not grant spending authority. The standalone BLCH continuation operation
-cannot advance a reserve that belongs to paired custody.
+output uses the protocol condition commitment, while the native output keeps
+the real owner key. Both gain locks owned by the combined state. Only a
+registered Supply-only native asset without a KYC root is admitted. Native
+funding uses the ordinary zero-delta transfer planner internally, preserving
+owner signatures, charter checks and supply accounting. There is no public
+native reserve-release plan or privileged balance setter.
 
-## Required invariants
+The [bounded binary creation transport](paired-custody-wire.md) delegates to
+that same complete state. It is a prerequisite for wallet/RPC integration,
+not a network endpoint or live wallet submission method.
 
-The same request must bind the network, both real funding intents, reserve
-identity, owner, amounts, expiry and complete BLCH fee terms. Signing one leg
-alone must not authorize paired custody. Both ledgers must validate before
-either commits; a rejected request must preserve the complete state root,
-funding outputs, token supply, bridge accounting and fee escrow.
+## Closing
 
-BLCH funding must independently equal its locked reserve, owner change and
-fees. Native funding must independently equal its locked reserve and owner
-change. Neither a reserve nor a token symbol creates backing. The token must
-already exist in the sealed native ledger; bridged USDT additionally requires
-the separately authorized gateway import process.
+`paired_custody::CloseRequest` identifies the reserve and its original creation
+authorization and contains both settlement intents, expiry and native work
+budget. `State::quote_paired_close` prices it; `execute_paired_close` settles
+both assets or neither. A distinct close authorization commits to both exact
+legs, fee terms, reserve ID, creation authorization and network domain. A
+creation signature or ordinary transfer signature cannot authorize closing.
 
-Both reserve outputs must be unavailable to ordinary transfers, gateway
-withdrawals and unrelated pool operations, even when the caller holds their
-original owner's private key. Recording only the two balances is insufficient:
-custody must bind the actual unspent outpoints and enforce their protocol locks.
+The admitted original owner must sign both legs. The native leg consumes
+exactly the recorded reserve and returns its full amount to that owner in one
+output. BLCH output zero returns the full BLCH reserve to the owner's actual
+key commitment. At least one additional ordinary BLCH input pays the fees;
+all remaining outputs return owner change. Reserve value cannot subsidize
+fees. This is not third-party fee sponsorship or an LP redemption.
 
-Restoring state must authenticate the complete outer root and reconstruct the
-locks from validated records. It must reject missing, duplicated, mismatched
-or independently advanced reserve records. An inner ledger snapshot is not a
-replacement for the complete paired state.
+Only the private closing dispatcher can construct the narrowly scoped BLCH
+spend capability. It binds the actual recorded reserve outpoint, protocol
+condition, amount, joint authorization and equal-value owner payout. No caller
+can construct or deserialize that capability. Native settlement uses the
+ordinary owner-validated planner behind the combined state's private boundary.
 
-## Remaining market integration
+All fallible validation completes before either plan commits. After successful
+settlement, the two consumed reserve records and locks are removed together;
+new owner outputs are spendable. Replay is refused because the original
+records/inputs no longer exist. No token is minted or burned, no bridge source
+liability changes, and no external USDT vault is contacted. Closing is a typed
+local API; the creation-only binary dispatcher does not accept closing frames.
 
-Pair funding alone must not issue LP or authorize withdrawals. A subsequent
-implementation must bind both reserves to the same AMM transition, check each
-asset's conservation, update authenticated LP positions and advance both
-reserve outpoints atomically. BLCH fees require separate funding and cannot
-silently reduce pool backing. Wallet signing, bounded network decoding, block
-fee settlement, consensus commitments and replay/reorg integration remain
-separate requirements before activation.
+## Fees, conservation and persistence
 
-Closing also requires a shared private settlement boundary. `PoolLedger` lives
-in `bloch-euvm`, while the real BLCH planner lives in `bloch-pos-committee`.
-Adding a public native release plan would allow that plan to be committed
-independently of the BLCH leg in a separately restored native state. Before
-adding close, move the privileged planners behind one concrete sealed backend;
-do not substitute a caller-supplied commitment, verifier or callback for that
-ownership boundary. The binary transport deliberately supports creation only.
+Every request binds the full witness-bearing byte budget. Existing BLCH fee
+limits and the conservative prepaid native-work conversion remain in force,
+with custody bookkeeping charged separately. These reference costs are not a
+calibrated production fee schedule. Each asset conserves independently;
+fees are retained in the committed BLCH fee escrow.
 
-## Verification
+Snapshot and outer-root version 3 include paired custody records alongside both
+ledger roots, base reserve metadata and fees. Versions 1 and 2 are rejected;
+no live chain migration is performed. Restore checks canonical record ordering,
+unique locks, admitted owners, exact amounts/assets/outpoints, correspondence
+to the BLCH record and creation authorization, and non-overlap with native AMM
+locks. It reconstructs paired locks rather than trusting a serialized lock map.
+A failed restore exposes no partially validated state.
+
+## Verification and remaining work
 
 ```sh
 cargo +1.94.1 test --locked -p bloch-pos-committee --features native-dex-rehearsal --lib native_dex
-cargo +1.94.1 test --locked -p bloch-ustav --test paired_custody_crypto
+cargo +1.94.1 test --locked -p bloch-pos-committee --features native-dex-rehearsal --doc
+cargo +1.94.1 test --locked -p bloch-ustav --test paired_custody_crypto --test joint_blch_native
 ```
 
-The cryptographic integration tests use ephemeral real hybrid PQ keys and a
-locally issued test token. They exercise both ML-DSA and Falcon signature
-tampering, standalone-leg signatures, signed but unbalanced legs, replay,
-locked-owner spending, exact fee conservation and complete state restoration.
-They neither deposit external USDT nor demonstrate live network readiness.
+Tests cover real hybrid PQ signatures, malformed/unauthorized requests,
+independent conservation, reserve locks, partial-settlement refusal, replay and
+complete restoration. Locally issued test tokens are not proof of external
+USDT backing. A production BLCH/USDT market still requires atomic AMM/LP rules,
+wallet signing, closing transport, network admission, block fee settlement,
+consensus commitments, replay/reorg integration and independent review.

@@ -9,6 +9,7 @@ use bloch_euvm::ustav::{
 };
 use sha3::{Digest, Sha3_256};
 use std::collections::BTreeMap;
+pub mod backend;
 pub mod base_reserves;
 pub mod paired_custody;
 pub mod wire;
@@ -127,16 +128,24 @@ pub struct State {
     priority_fees: u128,
     base_reserves: BTreeMap<[u8; 32], base_reserves::Record>,
     base_locks: BTreeMap<base_reserves::OutPoint, [u8; 32]>,
+    paired_reserves: BTreeMap<[u8; 32], bloch_euvm::ustav::gateway::pools::custody::Record>,
+    paired_locks: BTreeMap<bloch_euvm::ustav::OutPoint, [u8; 32]>,
 }
+/// Opaque complete-state checkpoint. Only State::restore can consume it.
+/// ```compile_fail
+/// use bloch_pos_committee::transition::native_dex::Snapshot;
+/// fn extract(snapshot: Snapshot) { let ledger = snapshot.native; }
+/// ```
 #[derive(Clone, Debug)]
 pub struct Snapshot {
-    pub version: u32,
-    pub base: CommittedState,
-    pub native: bloch_euvm::ustav::gateway::pools::Snapshot,
-    pub native_root: [u8; 32],
-    pub base_fees: u128,
-    pub priority_fees: u128,
-    pub base_reserves: Vec<base_reserves::Record>,
+    version: u32,
+    base: CommittedState,
+    native: bloch_euvm::ustav::gateway::pools::Snapshot,
+    native_root: [u8; 32],
+    base_fees: u128,
+    priority_fees: u128,
+    base_reserves: Vec<base_reserves::Record>,
+    paired_reserves: Vec<bloch_euvm::ustav::gateway::pools::custody::Record>,
 }
 #[derive(Clone, Debug)]
 pub struct Execution {
@@ -181,20 +190,23 @@ impl State {
             priority_fees: 0,
             base_reserves: BTreeMap::new(),
             base_locks: BTreeMap::new(),
+            paired_reserves: BTreeMap::new(),
+            paired_locks: BTreeMap::new(),
         })
     }
     pub fn base(&self) -> &CommittedState {
         &self.base
     }
-    pub fn native(&self) -> &PoolLedger {
-        &self.native
+    pub fn native(&self) -> backend::NativeView<'_> {
+        backend::NativeView::new(self)
     }
     pub fn fee_escrow(&self) -> (u128, u128) {
         (self.base_fees, self.priority_fees)
     }
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
-            version: 2,
+            version: 3,
+            paired_reserves: self.paired_reserves.values().cloned().collect(),
             base: self.base.clone(),
             native: self.native.snapshot(),
             native_root: self.native.state_root(),
@@ -208,7 +220,7 @@ impl State {
         trusted_root: [u8; 32],
         verifier: &dyn Verifier,
     ) -> Result<Self, Error> {
-        if snapshot.version != 2 {
+        if snapshot.version != 3 {
             return Err(Error::InvalidRoot);
         }
         let native = PoolLedger::restore(snapshot.native, snapshot.native_root, verifier)
@@ -219,7 +231,7 @@ impl State {
         state.base_fees = snapshot.base_fees;
         state.priority_fees = snapshot.priority_fees;
         state.restore_base_reserves(snapshot.base_reserves, verifier)?;
-        state.validate_paired_custody()?;
+        state.restore_paired_reserves(snapshot.paired_reserves, verifier)?;
         if state.state_root() != trusted_root {
             return Err(Error::InvalidRoot);
         }
@@ -227,13 +239,14 @@ impl State {
     }
     pub fn state_root(&self) -> [u8; 32] {
         let mut h = Sha3_256::new();
-        h.update(b"BLOCH-JOINT-REHEARSAL-STATE-v2");
+        h.update(b"BLOCH-JOINT-REHEARSAL-STATE-v3");
         h.update(self.domain);
         h.update(self.base.compute_root());
         h.update(self.native.state_root());
         h.update(self.base_fees.to_le_bytes());
         h.update(self.priority_fees.to_le_bytes());
         self.hash_base_reserves(&mut h);
+        self.hash_paired_reserves(&mut h);
         h.finalize().into()
     }
     pub fn quote(&self, request: &Request) -> Result<fee_market::TxCharge, Error> {
@@ -290,6 +303,7 @@ impl State {
         if let PosTransaction::TransferV2 { inputs, .. } = &request.blch {
             self.ensure_base_unlocked(inputs)?;
         }
+        self.ensure_native_unlocked(&request.native.transaction.inputs)?;
         let charge = self.quote(request)?;
         if height > request.valid_until
             || request.native.transaction.valid_until > request.valid_until

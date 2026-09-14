@@ -4,7 +4,9 @@ The default-off `native-dex-rehearsal` feature exposes
 `native_dex::paired_custody::wire::{encode, decode, apply_encoded}`. This is a
 local transport for the existing paired reserve creation operation. It does
 not add an RPC method, wallet connection, block transaction tag, closing
-operation or consensus activation.
+wire operation or consensus activation. Owner-authorized closing is now a
+separate typed API on the same sealed State; this creation format cannot
+select it.
 
 ## Version 1 format
 

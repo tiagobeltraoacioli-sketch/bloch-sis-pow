@@ -4,7 +4,7 @@ use crate::transition::{TransferOutput, WitnessKey};
 
 pub(super) fn setup() -> (State, Request) {
     let (state, joint) = fixture();
-    let mut native = state.native().clone();
+    let mut native = state.native.clone();
     let mut envelope = joint.native;
     let hash = envelope.transaction.signing_hash(&DOMAIN).unwrap();
     envelope.witnesses.owners[0] = signature(&hash, &key(3));
@@ -87,7 +87,7 @@ fn sign(r: &mut Request) {
 #[test]
 fn native_planner_requires_explicit_custody_consent_and_dropped_plan_is_atomic() {
     let (state, r) = setup();
-    let mut native = state.native().clone();
+    let mut native = state.native.clone();
     let tx = &r.native.transaction;
     let hash = tx.signing_hash(&DOMAIN).unwrap();
     let record = custody::Record {
@@ -154,11 +154,11 @@ fn paired_creation_replay_and_tampered_snapshots_fail_closed() {
     for variant in 0..7 {
         let mut bad = snapshot.clone();
         match variant {
-            0 => bad.native.custody.clear(),
-            1 => bad.native.custody[0].authorization[0] ^= 1,
-            2 => bad.native.custody[0].owner = key(2),
-            3 => bad.native.custody[0].amount += 1,
-            4 => bad.native.custody.push(bad.native.custody[0].clone()),
+            0 => bad.paired_reserves.clear(),
+            1 => bad.paired_reserves[0].authorization[0] ^= 1,
+            2 => bad.paired_reserves[0].owner = key(2),
+            3 => bad.paired_reserves[0].amount += 1,
+            4 => bad.paired_reserves.push(bad.paired_reserves[0].clone()),
             5 => bad.base_reserves.clear(),
             _ => bad.base_reserves[0].revision += 1,
         }
@@ -194,21 +194,19 @@ fn paired_continuation_and_joint_native_spend_cannot_escape_locks() {
         Err(Error::LockedReserve)
     ));
     assert_eq!(state.state_root(), root);
-    let mut native = state.native().clone();
-    let mut tx = r.native.transaction.clone();
-    tx.inputs = vec![receipt.native.outputs[0]];
-    tx.outputs.truncate(1);
-    let hash = tx.signing_hash(&DOMAIN).unwrap();
-    let mut w = r.native.witnesses.clone();
-    w.owners[0] = signature(&hash, &key(1));
+    let mut joint = super::super::Request {
+        blch: r.blch.clone(),
+        native: r.native.clone(),
+        valid_until: 100,
+        native_gas: r.native_gas,
+    };
+    joint.native.transaction.inputs = vec![receipt.native.outputs[0]];
+    joint.native.transaction.outputs.truncate(1);
     assert!(matches!(
-        native.apply(&tx, &w, 1, &BoundVerifier, 100_000),
-        Err(PoolError::LockedInput)
+        state.execute(&joint, 1, &BoundVerifier, &BoundVerifier),
+        Err(Error::LockedReserve)
     ));
-    assert!(matches!(
-        native.plan_transfer(&tx, &w, 1, &BoundVerifier, 100_000),
-        Err(PoolError::LockedInput)
-    ));
+    assert_eq!(state.state_root(), root);
 }
 #[test]
 fn expired_wrong_domain_fee_overflow_and_exhausted_gas_leave_both_sides_unchanged() {
