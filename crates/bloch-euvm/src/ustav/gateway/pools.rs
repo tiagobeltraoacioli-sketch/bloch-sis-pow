@@ -1,6 +1,7 @@
 //! Sealed Supply-only native-token pool custody and authenticated LP positions.
 //! Reference integration only: base BLCH requires the real consensus UTXO adapter.
 //! Persist this complete state; never dispatch against an extracted inner ledger.
+pub mod custody;
 pub mod wire;
 use super::{GatewayLedger, ImportRequest, Release, RouteConfig, WithdrawalRequest};
 use crate::modules::ModuleKind;
@@ -13,7 +14,7 @@ use crate::ustav::{
 use crate::{AssetId, BLCH};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const MAX_POOLS: usize = 128;
 pub const MAX_POSITIONS: usize = 65_536;
 
@@ -77,6 +78,7 @@ pub struct Snapshot {
     pub gateway_root: [u8; 32],
     pub pools: Vec<PoolSnapshot>,
     pub positions: Vec<([u8; 32], Vec<u8>, u64)>,
+    pub custody: Vec<custody::Record>,
 }
 #[derive(Clone, Debug)]
 struct Pool {
@@ -89,6 +91,7 @@ pub struct PoolLedger {
     pools: BTreeMap<[u8; 32], Pool>,
     positions: BTreeMap<([u8; 32], Vec<u8>), u64>,
     locks: BTreeMap<OutPoint, [u8; 32]>,
+    custody: BTreeMap<[u8; 32], custody::Record>,
 }
 
 /// A validated zero-supply transfer, exclusively borrowing the sealed ledger.
@@ -222,6 +225,7 @@ impl PoolLedger {
             pools: BTreeMap::new(),
             positions: BTreeMap::new(),
             locks: BTreeMap::new(),
+            custody: BTreeMap::new(),
         }
     }
     /// Read-only query access, not an alternative transition/persistence boundary.
@@ -637,6 +641,7 @@ impl PoolLedger {
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             version: VERSION,
+            custody: self.custody.values().cloned().collect(),
             gateway: self.gateway.snapshot(),
             gateway_root: self.gateway.state_root(),
             pools: self
@@ -656,7 +661,7 @@ impl PoolLedger {
         }
     }
     pub fn state_root(&self) -> [u8; 32] {
-        let mut h = HashWriter::new(b"USTAV-POOL-CUSTODY-v1");
+        let mut h = HashWriter::new(b"USTAV-POOL-CUSTODY-v2");
         h.u32(VERSION);
         h.fixed(&self.gateway.state_root());
         h.u64(self.pools.len() as u64);
@@ -678,6 +683,7 @@ impl PoolLedger {
             h.bytes(key);
             h.u64(*amount);
         }
+        self.hash_custody(&mut h);
         h.finish()
     }
     /// The outer root must come from authenticated host state, never its sender.
@@ -706,6 +712,7 @@ impl PoolLedger {
             pools: BTreeMap::new(),
             positions: BTreeMap::new(),
             locks: BTreeMap::new(),
+            custody: BTreeMap::new(),
         };
         for record in snapshot.pools {
             let state = PoolState::restore(record.state, record.root)?;
@@ -763,6 +770,7 @@ impl PoolLedger {
                 return Err(Error::InvalidSnapshot);
             }
         }
+        ledger.restore_custody(snapshot.custody, verifier)?;
         if ledger.state_root() != trusted_root {
             return Err(Error::InvalidSnapshot);
         }

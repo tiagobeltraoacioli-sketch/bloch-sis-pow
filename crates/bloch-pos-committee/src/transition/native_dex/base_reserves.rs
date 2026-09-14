@@ -297,6 +297,9 @@ impl State {
                 )
             }
             Action::Continue { reserve, revision } => {
+                if self.native.custody(&reserve).is_some() {
+                    return Err(Error::LockedReserve);
+                }
                 let mut record = self
                     .base_reserves
                     .get(&reserve)

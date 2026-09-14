@@ -10,6 +10,7 @@ use bloch_euvm::ustav::{
 use sha3::{Digest, Sha3_256};
 use std::collections::BTreeMap;
 pub mod base_reserves;
+pub mod paired_custody;
 pub mod wire;
 
 #[cfg(test)]
@@ -154,6 +155,17 @@ impl State {
         base_root: [u8; 32],
         native_root: [u8; 32],
     ) -> Result<Self, Error> {
+        if native.custody_records().next().is_some() {
+            return Err(Error::InvalidRoot);
+        }
+        Self::from_parts_for_restore(base, native, base_root, native_root)
+    }
+    fn from_parts_for_restore(
+        base: CommittedState,
+        native: PoolLedger,
+        base_root: [u8; 32],
+        native_root: [u8; 32],
+    ) -> Result<Self, Error> {
         let domain = base.admission_network_domain.ok_or(Error::WrongDomain)?;
         if domain == [0; 32] || domain != *native.gateway().native().domain() {
             return Err(Error::WrongDomain);
@@ -202,10 +214,12 @@ impl State {
         let native = PoolLedger::restore(snapshot.native, snapshot.native_root, verifier)
             .map_err(Error::Native)?;
         let base_root = snapshot.base.compute_root();
-        let mut state = Self::from_parts(snapshot.base, native, base_root, snapshot.native_root)?;
+        let mut state =
+            Self::from_parts_for_restore(snapshot.base, native, base_root, snapshot.native_root)?;
         state.base_fees = snapshot.base_fees;
         state.priority_fees = snapshot.priority_fees;
         state.restore_base_reserves(snapshot.base_reserves, verifier)?;
+        state.validate_paired_custody()?;
         if state.state_root() != trusted_root {
             return Err(Error::InvalidRoot);
         }

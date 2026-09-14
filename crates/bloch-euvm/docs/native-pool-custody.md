@@ -89,6 +89,15 @@ nothing. This preserves all native charter and reserve-lock checks while
 allowing the joint BLCH/native rehearsal to validate both legs before either
 commits. It does not expose an arbitrary mutable ledger or mint authority.
 
+The separate `custody` module adds authenticated one-way reserve funding for
+the paired BLCH/native rehearsal. Its exclusive plan seals the new reserve in
+the same lock map used by ordinary pool custody. It grants no reserve release
+operation. The pool snapshot/root version is now 2 and commits these records;
+version-1 snapshots are rejected. AMM operations in this ledger still accept
+only two registered assets; the new custody record does not create a BLCH pool
+or any LP position. See the
+[paired custody contract](../../bloch-pos-committee/docs/paired-reserve-custody.md).
+
 Run the `native_pool_custody` and `native_pool_crypto` tests and the
 `bloch-ustav --example native_pool` executable. The example uses ephemeral PQ
 keys and local issued test assets, not live BLCH or externally deposited USDT.

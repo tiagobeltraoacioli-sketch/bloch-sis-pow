@@ -82,3 +82,8 @@ Before supporting BLCH/USDT, native and base custody must be owned by one fixed
 backend with atomic AMM/LP rules. Do not expose a public native reserve-release
 plan as an intermediate shortcut. Consensus admission, full persistence/reorg
 integration, wallet signing, fee settlement and independent review remain open.
+
+The separate [paired reserve creation](paired-reserve-custody.md) operation now
+funds and locks both assets atomically. Reserves created through that operation
+cannot use this standalone continuation path; changing one side independently
+would break the authenticated pairing. AMM/LP transitions remain unimplemented.

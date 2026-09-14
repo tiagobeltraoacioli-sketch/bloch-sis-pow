@@ -18,6 +18,12 @@ an admitted owner can fund a locked reserve and continue it at exactly the same
 value, paying fees from separate ordinary inputs. This does not trade either
 asset, issue LP, release a native reserve, or implement a withdrawal operation.
 
+[Paired reserve creation](../../crates/bloch-pos-committee/docs/paired-reserve-custody.md)
+additionally binds BLCH and registered-token funding in one authenticated
+operation and locks both reserves atomically. It still creates no LP position
+and offers no swap, withdrawal or reserve continuation. The standalone BLCH
+continuation path rejects reserves belonging to this paired custody.
+
 ## Atomic authorization and planning
 
 A request combines a bounded TransferV2 intent with a zero-delta native transfer
