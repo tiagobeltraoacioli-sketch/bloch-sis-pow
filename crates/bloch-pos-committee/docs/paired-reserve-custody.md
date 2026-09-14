@@ -11,6 +11,11 @@ budget. `State::quote_paired_custody` prices the complete operation;
 the reserve; subsequent outputs are change to the same admitted PQ owner.
 Both legs sign `Request::authorization` with the authenticated network domain.
 
+The [bounded binary transport](paired-custody-wire.md) now provides encoding,
+decoding and local dispatch through the same sealed executor. This is a
+prerequisite for wallet/RPC integration; it does not itself expose a network
+endpoint or enable a wallet to submit live transactions.
+
 The lower-level native funding plan independently requires custody-specific
 consent binding its record and transaction. The paired dispatcher privately
 maps that exact digest to the joint authorization. An ordinary transfer
@@ -60,6 +65,14 @@ reserve outpoints atomically. BLCH fees require separate funding and cannot
 silently reduce pool backing. Wallet signing, bounded network decoding, block
 fee settlement, consensus commitments and replay/reorg integration remain
 separate requirements before activation.
+
+Closing also requires a shared private settlement boundary. `PoolLedger` lives
+in `bloch-euvm`, while the real BLCH planner lives in `bloch-pos-committee`.
+Adding a public native release plan would allow that plan to be committed
+independently of the BLCH leg in a separately restored native state. Before
+adding close, move the privileged planners behind one concrete sealed backend;
+do not substitute a caller-supplied commitment, verifier or callback for that
+ownership boundary. The binary transport deliberately supports creation only.
 
 ## Verification
 

@@ -3,7 +3,7 @@ name: Ustav and Kirpich
 on:
   pull_request:
   push:
-    branches: [main, "feat/ustav-*"]
+    branches: [main, "feat/ustav-*", "feat/native-*"]
   workflow_dispatch:
 
 permissions:

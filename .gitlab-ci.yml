@@ -16,6 +16,21 @@ stages:
   - test
   - nix
 
+# Explicitly exercise the default-off native custody dispatcher and its real
+# PQ adapter. A normal node build does not enable these rehearsal unit tests.
+native-custody-tests:
+  stage: test
+  timeout: 30m
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH =~ /^feat\/native-/'
+  script:
+    - rustup toolchain install 1.94.1 --profile minimal --component clippy --no-self-update
+    - python3 scripts/check-ustav-pq-boundary.py cargo +1.94.1
+    - cargo +1.94.1 test --locked -p bloch-pos-committee --features native-dex-rehearsal --lib native_dex
+    - cargo +1.94.1 test --locked -p bloch-ustav --test paired_custody_crypto
+    - cargo +1.94.1 clippy --locked -p bloch-ustav --all-targets --no-deps -- -D warnings
+
 variables:
   CARGO_TERM_COLOR: "always"
   RUST_BACKTRACE: "1"

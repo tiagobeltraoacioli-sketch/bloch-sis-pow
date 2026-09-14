@@ -1,4 +1,5 @@
 //! Atomic paired reserve creation only; no LP, swap or withdrawal capability.
+pub mod wire;
 use super::base_reserves::{reserve_id, reserve_script, Record, MAX_RESERVES};
 use super::*;
 use bloch_euvm::ustav::{gateway::pools::custody, OutPoint};

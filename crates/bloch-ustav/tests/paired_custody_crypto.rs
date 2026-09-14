@@ -356,3 +356,68 @@ fn paired_custody_preserves_supply_locks_both_assets_and_restores_joint_state() 
         .is_err());
     assert_eq!(ledger.state_root(), before);
 }
+
+#[test]
+fn paired_wire_real_pq_matches_typed_execution_and_rejects_replay_and_tampering() {
+    use bloch_pos_committee::transition::native_dex::paired_custody::wire;
+    let (mut state, request) = fixture();
+    let bytes = wire::encode(&request, &DOMAIN).unwrap();
+    let decoded = wire::decode(&bytes, &DOMAIN).unwrap();
+    assert_eq!(
+        decoded.authorization(&DOMAIN).unwrap(),
+        request.authorization(&DOMAIN).unwrap()
+    );
+    assert_eq!(wire::encode(&decoded, &DOMAIN).unwrap(), bytes);
+    let root = state.state_root();
+    let base = state.base().clone();
+    let native = state.native().snapshot();
+    let fees = state.fee_escrow();
+    let mut wrong_domain = bytes.clone();
+    wrong_domain[10] ^= 1;
+    let mut bad_tail = bytes.clone();
+    *bad_tail.last_mut().unwrap() ^= 1;
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    for malformed in [
+        wrong_domain,
+        bad_tail,
+        trailing,
+        bytes[..bytes.len() - 1].to_vec(),
+    ] {
+        assert!(
+            wire::apply_encoded(&mut state, &malformed, 2, &BaseVerifier, &BlochVerifier).is_err()
+        );
+        assert_eq!(state.state_root(), root);
+        assert_eq!(state.base(), &base);
+        assert_eq!(state.native().snapshot(), native);
+        assert_eq!(state.fee_escrow(), fees);
+    }
+    // A canonical encoding is not evidence that its real PQ witnesses are valid.
+    for offset in [
+        crypto::SUITE_HEADER_LEN,
+        crypto::SUITE_HEADER_LEN + crypto::MLDSA_SIG_LEN + 1,
+    ] {
+        let mut forged = request.clone();
+        forged.native.witnesses.owners[0][offset] ^= 1;
+        let bad = wire::encode(&forged, &DOMAIN).unwrap();
+        assert!(wire::decode(&bad, &DOMAIN).is_ok());
+        assert!(wire::apply_encoded(&mut state, &bad, 2, &BaseVerifier, &BlochVerifier).is_err());
+        assert_eq!(state.state_root(), root);
+    }
+    let mut direct = state.clone();
+    let expected = direct
+        .execute_paired_custody(&request, 2, &BaseVerifier, &BlochVerifier)
+        .unwrap();
+    let actual = wire::apply_encoded(&mut state, &bytes, 2, &BaseVerifier, &BlochVerifier).unwrap();
+    assert_eq!(actual.charge, expected.charge);
+    assert_eq!(actual.authorization, expected.authorization);
+    assert_eq!(actual.blch_txid, expected.blch_txid);
+    assert_eq!(actual.reserve, expected.reserve);
+    assert_eq!(actual.native, expected.native);
+    assert_eq!(state.state_root(), direct.state_root());
+    assert_eq!(state.fee_escrow(), direct.fee_escrow());
+    let root = state.state_root();
+    let mut restored = State::restore(state.snapshot(), root, &BlochVerifier).unwrap();
+    assert!(wire::apply_encoded(&mut restored, &bytes, 2, &BaseVerifier, &BlochVerifier).is_err());
+    assert_eq!(restored.state_root(), root);
+}

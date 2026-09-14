@@ -24,6 +24,10 @@ operation and locks both reserves atomically. It still creates no LP position
 and offers no swap, withdrawal or reserve continuation. The standalone BLCH
 continuation path rejects reserves belonging to this paired custody.
 
+Paired reserve creation has its own [bounded binary transport](../../crates/bloch-pos-committee/docs/paired-custody-wire.md),
+preserving the same authorization, full-envelope fees and sealed execution.
+No closing or one-sided reserve release operation is exposed.
+
 ## Atomic authorization and planning
 
 A request combines a bounded TransferV2 intent with a zero-delta native transfer

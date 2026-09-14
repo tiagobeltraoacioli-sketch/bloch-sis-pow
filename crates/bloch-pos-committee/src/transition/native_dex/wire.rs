@@ -20,21 +20,21 @@ pub enum Error {
     Native(transfer_wire::Error),
     Joint(super::Error),
 }
-struct Reader<'a> {
-    bytes: &'a [u8],
-    offset: usize,
+pub(super) struct Reader<'a> {
+    pub(super) bytes: &'a [u8],
+    pub(super) offset: usize,
 }
 impl<'a> Reader<'a> {
-    fn take(&mut self, count: usize) -> Result<&'a [u8], Error> {
+    pub(super) fn take(&mut self, count: usize) -> Result<&'a [u8], Error> {
         let end = self.offset.checked_add(count).ok_or(Error::TooLarge)?;
         let slice = self.bytes.get(self.offset..end).ok_or(Error::Truncated)?;
         self.offset = end;
         Ok(slice)
     }
-    fn fixed<const N: usize>(&mut self) -> Result<[u8; N], Error> {
+    pub(super) fn fixed<const N: usize>(&mut self) -> Result<[u8; N], Error> {
         self.take(N)?.try_into().map_err(|_| Error::Truncated)
     }
-    fn section(&mut self, limit: u64) -> Result<&'a [u8], Error> {
+    pub(super) fn section(&mut self, limit: u64) -> Result<&'a [u8], Error> {
         let count = u64::from_le_bytes(self.fixed()?);
         if count > limit {
             return Err(Error::TooLarge);
@@ -46,12 +46,20 @@ impl<'a> Reader<'a> {
 /// item vectors. The shared transaction decoder remains the canonical decoder;
 /// its general-purpose byte bound alone permits much larger tables than this API.
 fn preflight_base(bytes: &[u8]) -> Result<(), Error> {
+    preflight_base_shape(bytes, MAX_BASE_ITEMS, false)
+}
+
+pub(super) fn preflight_base_shape(
+    bytes: &[u8],
+    max_keys: usize,
+    require_outputs: bool,
+) -> Result<(), Error> {
     let mut reader = Reader { bytes, offset: 0 };
     if reader.take(1)? != [0x06] {
         return Err(Error::InvalidOperation);
     }
     let keys = u32::from_le_bytes(reader.fixed()?) as usize;
-    if keys == 0 || keys > MAX_BASE_ITEMS {
+    if keys == 0 || keys > max_keys {
         return Err(Error::TooLarge);
     }
     for _ in 0..keys {
@@ -65,7 +73,7 @@ fn preflight_base(bytes: &[u8]) -> Result<(), Error> {
     }
     for inputs in [true, false] {
         let count = u32::from_le_bytes(reader.fixed()?) as usize;
-        if count > MAX_BASE_ITEMS || (inputs && count == 0) {
+        if count > MAX_BASE_ITEMS || ((inputs || require_outputs) && count == 0) {
             return Err(Error::TooLarge);
         }
         // TransferV2 inputs and outputs each occupy 40 canonical bytes.
