@@ -13,6 +13,7 @@ pub mod backend;
 pub mod base_reserves;
 pub mod initial_liquidity;
 pub mod paired_custody;
+pub mod swap;
 pub mod swap_quote;
 pub mod wire;
 
@@ -212,7 +213,7 @@ impl State {
     }
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
-            version: 4,
+            version: 5,
             initial_pools: self.initial_pools.values().cloned().collect(),
             paired_reserves: self.paired_reserves.values().cloned().collect(),
             base: self.base.clone(),
@@ -228,7 +229,7 @@ impl State {
         trusted_root: [u8; 32],
         verifier: &dyn Verifier,
     ) -> Result<Self, Error> {
-        if snapshot.version != 4 {
+        if snapshot.version != 5 {
             return Err(Error::InvalidRoot);
         }
         let native = PoolLedger::restore(snapshot.native, snapshot.native_root, verifier)
@@ -241,6 +242,13 @@ impl State {
         state.restore_base_reserves(snapshot.base_reserves, verifier)?;
         state.restore_paired_reserves(snapshot.paired_reserves, verifier)?;
         state.restore_initial_pools(snapshot.initial_pools)?;
+        if state
+            .paired_reserves
+            .keys()
+            .any(|id| state.base_reserves[id].revision > 0 && !state.reserve_pools.contains_key(id))
+        {
+            return Err(Error::InvalidRoot);
+        }
         if state.state_root() != trusted_root {
             return Err(Error::InvalidRoot);
         }
@@ -248,7 +256,7 @@ impl State {
     }
     pub fn state_root(&self) -> [u8; 32] {
         let mut h = Sha3_256::new();
-        h.update(b"BLOCH-JOINT-REHEARSAL-STATE-v4");
+        h.update(b"BLOCH-JOINT-REHEARSAL-STATE-v5");
         h.update(self.domain);
         h.update(self.base.compute_root());
         h.update(self.native.state_root());

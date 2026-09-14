@@ -99,8 +99,9 @@ rehearsal while discarding its fee escrow.
 `State` now owns both paired lock maps and reserve records directly. Its native
 query facade does not expose an executable inner ledger, and complete snapshots
 have private fields. `snapshot` and `restore` carry both ledgers, fee counters,
-BLCH reserves, paired records and initial pool/LP ownership under version 4;
-versions 1, 2 and 3 are rejected.
+BLCH reserves, paired records, initial funding and evolving pool/LP ownership
+under version 5; versions 1 through 4 are rejected. Atomic swaps rotate both
+reserve outputs and locks while preserving initial LP ownership.
 Restore rebuilds and validates the locks and complete expected outer root.
 A whole-state clone retains both sides; component extraction is not supported.
 This remains a typed local snapshot; production persistence/network codecs are

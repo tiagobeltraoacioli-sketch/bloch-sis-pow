@@ -1,4 +1,4 @@
-//! Atomic paired reserve creation only; no LP, swap or withdrawal capability.
+//! Atomic paired reserve creation and unconverted closing. Pool swaps use a separate dispatcher.
 mod close;
 pub mod wire;
 use super::base_reserves::{reserve_id, reserve_script, Record, MAX_RESERVES};
@@ -15,7 +15,7 @@ pub struct Request {
     pub valid_until: u64,
     pub native_gas: u64,
 }
-fn bounded_joint(
+pub(super) fn bounded_joint(
     blch: &PosTransaction,
     native: &transfer_wire::Envelope,
     valid_until: u64,

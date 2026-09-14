@@ -1,5 +1,5 @@
 //! Initial BLCH/native LP ownership backed by an existing, completely funded pair.
-//! No subsequent Add, Swap, Remove or public reserve release exists here.
+//! Subsequent swaps use the separate atomic dispatcher; no Add/Remove or LP transfer.
 use super::*;
 use bloch_euvm::ustav::amm::{self, PoolState};
 pub const MAX_POOLS: usize = 128;
@@ -17,6 +17,7 @@ pub struct Request {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Record {
     pub pool: PoolState,
+    pub initial_reserves: [u64; 2],
     pub reserve: [u8; 32],
     pub creation_authorization: [u8; 32],
     pub owner: Vec<u8>,
@@ -175,6 +176,7 @@ impl State {
         }
         Ok(Record {
             pool: transition.next,
+            initial_reserves: [b.amount, n.amount],
             reserve: *reserve,
             creation_authorization: *creation,
             owner: b.owner.clone(),
@@ -304,6 +306,8 @@ impl State {
         h.update((self.initial_pools.len() as u64).to_le_bytes());
         for r in self.initial_pools.values() {
             h.update(r.pool.state_root());
+            h.update(r.initial_reserves[0].to_le_bytes());
+            h.update(r.initial_reserves[1].to_le_bytes());
             h.update(r.reserve);
             h.update(r.creation_authorization);
             h.update((r.owner.len() as u64).to_le_bytes());
@@ -311,23 +315,97 @@ impl State {
             h.update(r.lp_balance.to_le_bytes());
         }
     }
+    /// Structural checks supplement, but do not replace, an authenticated host root.
+    /// Only swaps may evolve these pools; LP balances and initial funding stay fixed.
+    pub(super) fn validate_blch_pool(&self, r: &Record) -> Result<(), Error> {
+        let b = self
+            .base_reserves
+            .get(&r.reserve)
+            .ok_or(Error::InvalidReserve)?;
+        let n = self
+            .paired_reserves
+            .get(&r.reserve)
+            .ok_or(Error::InvalidReserve)?;
+        self.supported_paired_asset(&n.asset)?;
+        let bo = self
+            .base
+            .utxo(&b.outpoint.0, b.outpoint.1)
+            .ok_or(Error::InvalidReserve)?;
+        let no = self
+            .native
+            .gateway()
+            .native()
+            .output(&n.outpoint)
+            .ok_or(Error::InvalidReserve)?;
+        if n.authorization != r.creation_authorization
+            || b.owner != r.owner
+            || n.owner != r.owner
+            || b.id != r.reserve
+            || n.id != r.reserve
+            || b.outpoint.1 != 0
+            || n.outpoint.index != 0
+            || self.base_locks.get(&b.outpoint) != Some(&r.reserve)
+            || self.paired_locks.get(&n.outpoint) != Some(&r.reserve)
+            || bo.value != b.amount
+            || bo.script_hash != base_reserves::reserve_script(&self.domain, &r.reserve)
+            || no.asset != n.asset
+            || no.output.owner != n.owner
+            || no.output.amount != n.amount
+            || self.native.is_locked(&n.outpoint)
+            || r.pool.reserves() != [b.amount, n.amount]
+            || b.revision.checked_add(1) != Some(r.pool.revision())
+        {
+            return Err(Error::InvalidReserve);
+        }
+        let initial = PoolState::new(
+            self.domain,
+            bloch_euvm::BLCH,
+            n.asset,
+            r.pool.fee_bps(),
+            r.reserve,
+        )
+        .map_err(amm_error)?;
+        let initial = initial
+            .transition(
+                &amm::Request {
+                    pool: initial.id(),
+                    revision: 0,
+                    valid_until: u64::MAX,
+                    action: amm::Action::Add {
+                        maximum: r.initial_reserves,
+                        minimum_lp: 0,
+                    },
+                },
+                0,
+            )
+            .map_err(amm_error)?;
+        if initial.next.id() != r.pool.id()
+            || initial.next.assets() != r.pool.assets()
+            || initial.next.domain() != r.pool.domain()
+            || initial.lp_mint != r.lp_balance
+            || initial.next.lp_supply() != r.pool.lp_supply()
+            || (b.revision == 0
+                && (initial.next != r.pool
+                    || b.outpoint != (paired_custody::output_id(&n.authorization), 0)))
+            || u128::from(b.amount) * u128::from(n.amount)
+                < u128::from(r.initial_reserves[0]) * u128::from(r.initial_reserves[1])
+        {
+            return Err(Error::InvalidReserve);
+        }
+        PoolState::restore(r.pool.snapshot(), r.pool.state_root()).map_err(amm_error)?;
+        Ok(())
+    }
     pub(super) fn restore_initial_pools(&mut self, records: Vec<Record>) -> Result<(), Error> {
         if records.len() > MAX_POOLS || records.windows(2).any(|w| w[0].pool.id() >= w[1].pool.id())
         {
             return Err(Error::InvalidRoot);
         }
         for record in records {
-            let expected = self.bootstrap(
-                &record.reserve,
-                &record.creation_authorization,
-                record.pool.fee_bps(),
-                0,
-            )?;
-            if expected != record
-                || self
-                    .reserve_pools
-                    .insert(record.reserve, record.pool.id())
-                    .is_some()
+            self.validate_blch_pool(&record)?;
+            if self
+                .reserve_pools
+                .insert(record.reserve, record.pool.id())
+                .is_some()
             {
                 return Err(Error::InvalidRoot);
             }

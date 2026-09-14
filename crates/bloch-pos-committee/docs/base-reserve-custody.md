@@ -66,10 +66,10 @@ there is no network decoder or block dispatch for them yet.
 
 ## Persistence and validation
 
-The rehearsal snapshot and outer root use version 4 and commit every
+The rehearsal snapshot and outer root use version 5 and commit every
 reserve's ID, seed, owner, amount, revision and outpoint alongside both ledger
 roots, paired custody records, initial pool/LP records and fee counters. Old
-version-1, version-2 and version-3 snapshots are refused rather than silently losing custody metadata. Restore reconstructs unique locks and checks the
+version-1 through version-4 snapshots are refused rather than silently losing custody metadata. Restore reconstructs unique locks and checks the
 actual UTXO, output index zero, amount, protocol script, ID derivation and PQ
 owner admission against an independently authenticated outer root.
 
@@ -79,9 +79,10 @@ and domains, expiry, revision replay, missing/duplicated funding, output collisi
 fee overflow, bounded reserve count and snapshot tampering. The `bloch-ustav`
 integration test uses real hybrid PQ signatures for funding and continuation.
 
-Native and base paired custody now share one concrete State backend. Before
-supporting a BLCH/USDT market, atomic AMM/LP rules remain required. Do not expose a public native reserve-release
-plan as an intermediate shortcut. Consensus admission, full persistence/reorg
+Native and base paired custody now share one concrete State backend. Initial LP
+issuance and atomic swaps use separate validated dispatchers. Additional LP
+operations remain required before a complete BLCH/USDT market. No public native
+reserve-release plan is exposed. Consensus admission, full persistence/reorg
 integration, wallet signing, fee settlement and independent review remain open.
 
 The separate [paired reserve creation](paired-reserve-custody.md) operation now
@@ -89,5 +90,5 @@ funds and locks both assets atomically. Reserves created through that operation
 cannot use this standalone continuation path; changing one side independently
 would break the authenticated pairing. The paired closing dispatcher returns
 both assets atomically to their original owner. The separate initial-liquidity operation issues backed LP positions and blocks
-this closing path for converted reserves. Swaps and liquidity removal remain
-unimplemented.
+this closing path for converted reserves. The separate [atomic swap dispatcher](atomic-blch-swaps.md) can rotate both
+reserves under AMM rules; liquidity removal remains unimplemented.

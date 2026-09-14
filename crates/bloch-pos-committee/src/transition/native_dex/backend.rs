@@ -63,7 +63,7 @@ impl<'a> NativeView<'a> {
     }
     pub fn state_root(&self) -> [u8; 32] {
         let mut h = Sha3_256::new();
-        h.update(b"BLOCH-OWNED-NATIVE-v1");
+        h.update(b"BLOCH-OWNED-NATIVE-v2");
         h.update(self.state.native.state_root());
         self.state.hash_paired_reserves(&mut h);
         self.state.hash_initial_pools(&mut h);
@@ -206,8 +206,8 @@ impl State {
                 || n.output.owner != r.owner
                 || n.output.amount != r.amount
                 || b.owner != r.owner
-                || b.revision != 0
-                || b.outpoint != (super::paired_custody::output_id(&r.authorization), 0)
+                || (b.revision == 0
+                    && b.outpoint != (super::paired_custody::output_id(&r.authorization), 0))
                 || self.native.is_locked(&r.outpoint)
                 || self.paired_locks.insert(r.outpoint, r.id).is_some()
             {

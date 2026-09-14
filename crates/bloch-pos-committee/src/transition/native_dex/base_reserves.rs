@@ -157,6 +157,7 @@ impl Request {
 pub(in crate::transition) struct ReserveSpend {
     point: OutPoint,
     amount: u64,
+    output_amount: u64,
     script: [u8; 32],
     output_script: [u8; 32],
     authorization: [u8; 32],
@@ -179,8 +180,35 @@ impl ReserveSpend {
         Ok(Self {
             point: record.outpoint,
             amount: record.amount,
+            output_amount: record.amount,
             script: reserve_script(&state.domain, id),
             output_script: Sha3_256::digest(&record.owner).into(),
+            authorization,
+        })
+    }
+    pub(super) fn swap(
+        state: &State,
+        quote: &super::swap_quote::Quote,
+        authorization: [u8; 32],
+    ) -> Result<Self, Error> {
+        if state.quote_blch_swap(&quote.request, quote.height)? != *quote {
+            return Err(Error::InvalidReserve);
+        }
+        let pool = state
+            .initial_pools
+            .get(&quote.request.pool)
+            .ok_or(Error::InvalidReserve)?;
+        let record = state
+            .base_reserves
+            .get(&pool.reserve)
+            .ok_or(Error::InvalidReserve)?;
+        let script = reserve_script(&state.domain, &pool.reserve);
+        Ok(Self {
+            point: record.outpoint,
+            amount: record.amount,
+            output_amount: quote.reserves_after[0],
+            script,
+            output_script: script,
             authorization,
         })
     }
@@ -201,7 +229,7 @@ impl ReserveSpend {
             && entry.script_hash == self.script
             && self.authorization == *authorization
             && outputs.first().is_some_and(|output| {
-                output.value == self.amount && output.script_hash == self.output_script
+                output.value == self.output_amount && output.script_hash == self.output_script
             })
     }
 }
@@ -406,6 +434,7 @@ impl State {
         let permit = old_point.map(|point| ReserveSpend {
             point,
             amount: record.amount,
+            output_amount: record.amount,
             script,
             output_script: script,
             authorization,

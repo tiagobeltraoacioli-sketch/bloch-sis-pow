@@ -45,17 +45,7 @@ impl State {
         if self.reserve_pools.get(&record.reserve) != Some(&request.pool) {
             return Err(Error::InvalidReserve);
         }
-        // Only bootstrapped pools exist today. Do not silently accept later
-        // revisions without the corresponding atomic custody implementation.
-        let backed = self.bootstrap(
-            &record.reserve,
-            &record.creation_authorization,
-            record.pool.fee_bps(),
-            0,
-        )?;
-        if backed != *record {
-            return Err(Error::InvalidReserve);
-        }
+        self.validate_blch_pool(record)?;
         let assets = record.pool.assets();
         let input_index = assets
             .iter()
