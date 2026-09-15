@@ -40,7 +40,9 @@ checks advertised final roots through independent receiver execution, including
 real PQ tests for false-result rollback.
 The optional `native-dex-host` feature adds a [durable candidate journal](docs/dex-journal.md)
 with exclusive locking, synchronized writes, production PQ verification and
-replay against independently trusted checkpoints. It is disabled by default.
+replay against independently trusted checkpoints. Its append path uses an
+exclusive prepared operation and installs state only after synchronization,
+avoiding a redundant full-State copy. It is disabled by default.
 
 [Color-Changing Chameleon v1](../bloch-euvm/docs/chameleon-v1.md) adds sealed
 PQ-native escrow, an explicit Kirpich ERC-20 compatibility profile and an

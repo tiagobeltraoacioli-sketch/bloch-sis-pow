@@ -221,13 +221,13 @@ pub(super) struct Expected {
     pub height: u64,
 }
 /// Untrusted advertised roots are compared before installation, never after it.
-pub(super) fn apply_expected(
-    state: &mut State,
+pub(super) fn stage_expected(
+    state: &State,
     expected: &Expected,
     frames: &[&[u8]],
     base_verifier: &dyn SignatureVerifier,
     native_verifier: &dyn Verifier,
-) -> Result<Outcome, Error> {
+) -> Result<(State, Outcome), Error> {
     let (staged, outcome) = stage(
         state,
         &expected.parent,
@@ -242,8 +242,7 @@ pub(super) fn apply_expected(
     if outcome.post_root != expected.post {
         return Err(Error::PostStateMismatch);
     }
-    *state = staged;
-    Ok(outcome)
+    Ok((staged, outcome))
 }
 
 #[cfg(test)]

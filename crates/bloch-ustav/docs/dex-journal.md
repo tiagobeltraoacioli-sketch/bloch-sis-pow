@@ -19,7 +19,8 @@ ML-DSA-65/Falcon-1024 suite, including PQ public-key admission for BLCH signatur
 The API does not accept a caller-supplied permissive verifier.
 
 Append checks resource limits and increasing host height, reexecutes the
-candidate against a private state clone, writes the length and exact candidate,
+candidate through an opaque prepared operation with an exclusive State borrow,
+writes the length and exact validated candidate bytes,
 and calls `sync_all`. Only after synchronization succeeds does it install the
 new in-memory State and return success. Invalid signatures, incorrect roots or
 other candidate failures leave the file and state unchanged. Any write or sync
@@ -58,6 +59,12 @@ and the 32-byte anchor root. Each record is a four-byte little-endian candidate
 length followed by the unchanged `BLCHPCAN` bytes. Candidate validation supplies
 the ordered body commitment and independently verified resulting state; the log
 does not duplicate a second state encoding or accept receipt claims.
+
+The append path no longer makes an outer full-State clone before the candidate
+executor creates its staged State. It retains the original plus one complete
+staged State, rather than the original plus two complete clones. This removes a
+redundant copy; no measured RSS or throughput improvement is claimed. Internal
+ledger planning and replay costs still need production-scale calibration.
 
 The journal is limited to 64 MiB and 4,096 records, checked before allocating
 payload buffers. Individual records retain the candidate limit of 263,316 bytes.

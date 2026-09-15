@@ -130,9 +130,81 @@ pub fn apply(
     base_verifier: &dyn SignatureVerifier,
     native_verifier: &dyn Verifier,
 ) -> Result<pool_batch::Outcome, Error> {
+    Ok(prepare(state, bytes, height, base_verifier, native_verifier)?.commit())
+}
+
+/// Fully verified candidate whose exclusive State borrow prevents intervening
+/// mutation. Dropping it aborts; commit consumes it exactly once. No executable
+/// component can be extracted. The original bytes stay immutably borrowed.
+///
+/// ```compile_fail
+/// use bloch_pos_committee::transition::native_dex::pool_candidate::Prepared;
+/// fn extract(p: Prepared<'_, '_>) { let state = p.staged; }
+/// ```
+/// ```compile_fail
+/// use bloch_pos_committee::transition::native_dex::pool_candidate::Prepared;
+/// fn twice(p: Prepared<'_, '_>) { p.commit(); p.commit(); }
+/// ```
+/// ```compile_fail
+/// use bloch_pos_committee::{SignatureVerifier, transition::native_dex::{State, pool_candidate}};
+/// use bloch_euvm::ustav::Verifier;
+/// fn change_state(s: &mut State, bytes: &[u8], base: &dyn SignatureVerifier, native: &dyn Verifier) {
+///     let pending = pool_candidate::prepare(s, bytes, 1, base, native).unwrap();
+///     let snapshot = s.snapshot();
+///     pending.commit();
+/// }
+/// ```
+/// ```compile_fail
+/// use bloch_pos_committee::{SignatureVerifier, transition::native_dex::{State, pool_candidate}};
+/// use bloch_euvm::ustav::Verifier;
+/// fn change_bytes(s: &mut State, bytes: &mut Vec<u8>, base: &dyn SignatureVerifier, native: &dyn Verifier) {
+///     let pending = pool_candidate::prepare(s, bytes, 1, base, native).unwrap();
+///     bytes.clear();
+///     pending.commit();
+/// }
+/// ```
+#[must_use = "dropping a prepared candidate aborts the state update"]
+pub struct Prepared<'state, 'bytes> {
+    target: &'state mut State,
+    staged: State,
+    outcome: pool_batch::Outcome,
+    bytes: &'bytes [u8],
+}
+impl Prepared<'_, '_> {
+    /// Exact bytes that were validated; a persistence host must write these.
+    pub fn candidate(&self) -> &[u8] {
+        self.bytes
+    }
+    pub fn outcome(&self) -> &pool_batch::Outcome {
+        &self.outcome
+    }
+    /// Install the complete validated state. A persistence host calls this only
+    /// after successfully writing and synchronizing candidate().
+    pub fn commit(self) -> pool_batch::Outcome {
+        *self.target = self.staged;
+        self.outcome
+    }
+}
+
+/// Prepare once for a persistence boundary, without a second full-state clone.
+/// The host still supplies trusted height/domain context and real verifiers.
+pub fn prepare<'state, 'bytes>(
+    state: &'state mut State,
+    bytes: &'bytes [u8],
+    height: u64,
+    base_verifier: &dyn SignatureVerifier,
+    native_verifier: &dyn Verifier,
+) -> Result<Prepared<'state, 'bytes>, Error> {
     let (expected, frames) = decode(bytes, &state.domain, height)?;
-    pool_batch::apply_expected(state, &expected, &frames, base_verifier, native_verifier)
-        .map_err(Error::Batch)
+    let (staged, outcome) =
+        pool_batch::stage_expected(state, &expected, &frames, base_verifier, native_verifier)
+            .map_err(Error::Batch)?;
+    Ok(Prepared {
+        target: state,
+        staged,
+        outcome,
+        bytes,
+    })
 }
 
 #[cfg(test)]

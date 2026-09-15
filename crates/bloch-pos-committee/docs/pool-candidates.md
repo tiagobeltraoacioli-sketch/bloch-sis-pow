@@ -14,6 +14,26 @@ both the commitment and advertised final state **before** installing any change.
 A producer preview, including one using permissive signature checks, supplies
 no authority to the receiver.
 
+## Preparation across a persistence boundary
+
+`prepare` performs the same full verification as `apply`, including the expected
+final root, and returns an opaque `Prepared` handle. It holds an exclusive borrow
+of the target State, one staged State and an immutable borrow of the exact
+validated candidate bytes. The original state cannot be changed while the
+handle is live, and the candidate bytes cannot be replaced after validation.
+`outcome()` exposes read-only result information; `candidate()` exposes the
+original bytes without copying them.
+
+Dropping the handle aborts the entire update. `commit()` consumes it once and
+installs the complete validated state; it cannot be reused or redirected to
+another State. `apply` is the immediate prepare-and-commit convenience path.
+No partial ledger or executable staged State is publicly extractable.
+
+A durable host writes `candidate()`, synchronizes its storage and calls `commit`
+only after success. A write/sync failure drops the preparation and leaves the
+original state intact. The core handle does not perform or certify disk I/O;
+the host remains responsible for persistence and authenticated chain context.
+
 ## Canonical framing
 
 All integers are unsigned little-endian. The header is 148 bytes:
@@ -53,7 +73,9 @@ Tests reject every truncated prefix, unknown versions, wrong domain/height,
 oversized lengths/counts, trailing bytes, altered bodies and false commitments.
 They verify rollback after an incorrect final-state claim, independent rejection
 of a permissive producer's bad signature, replay rejection and deterministic
-execution after restoring the complete parent. Real hybrid PQ tests exercise a
+execution after restoring the complete parent. Preparation tests verify abort
+and commit behavior; compile-fail tests prohibit staged-state extraction, double
+commit and mutation of the target or bytes while a preparation remains live. Real hybrid PQ tests exercise a
 candidate containing two dependent deposits followed by a provider redemption,
 including rejection of a forged final root without changing reserves or fees.
 

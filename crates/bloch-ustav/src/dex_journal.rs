@@ -222,17 +222,16 @@ impl Journal {
             .checked_add(4 + candidate.len() as u64)
             .filter(|n| *n <= MAX_JOURNAL_BYTES)
             .ok_or(Error::ResourceLimit)?;
-        let mut staged = self.state.clone();
-        let result = pool_candidate::apply(
-            &mut staged,
+        let prepared = pool_candidate::prepare(
+            &mut self.state,
             candidate,
             height,
             &BaseVerifier,
             &BlochVerifier,
         )
         .map_err(Error::Candidate)?;
-        persist_record(&mut self.file, candidate, &mut self.poisoned)?;
-        self.state = staged;
+        persist_record(&mut self.file, prepared.candidate(), &mut self.poisoned)?;
+        let result = prepared.commit();
         self.head = Checkpoint {
             height,
             root: result.post_root,

@@ -272,6 +272,16 @@ fn check_durable_journal(anchor: &State, candidate: &[u8], final_state: &State, 
             0o600
         );
     }
+    // Dropping a fully PQ-validated preparation must not release any reserve.
+    let mut aborted = anchor.clone();
+    let prepared =
+        pool_candidate::prepare(&mut aborted, candidate, 4, &BaseVerifier, &BlochVerifier).unwrap();
+    assert_eq!(prepared.outcome().post_root, final_state.state_root());
+    assert_eq!(prepared.candidate().as_ptr(), candidate.as_ptr());
+    drop(prepared);
+    assert_eq!(aborted.state_root(), start.root);
+    assert_eq!(aborted.native().snapshot(), anchor.native().snapshot());
+    assert_eq!(aborted.fee_escrow(), anchor.fee_escrow());
     let before = fs::read(&path).unwrap();
     let mut false_root = candidate.to_vec();
     false_root[82] ^= 1;

@@ -14,6 +14,29 @@ fn fixture() -> (State, Vec<u8>, State) {
 }
 
 #[test]
+fn prepared_candidate_can_abort_or_commit_without_changing_validated_bytes() {
+    let (mut state, bytes, direct) = fixture();
+    let root = state.state_root();
+    let fees = state.fee_escrow();
+    let pending = prepare(&mut state, &bytes, 1, &BoundVerifier, &BoundVerifier).unwrap();
+    assert_eq!(pending.candidate(), bytes);
+    assert_eq!(pending.candidate().as_ptr(), bytes.as_ptr());
+    assert_eq!(pending.outcome().parent_root, root);
+    assert_eq!(pending.outcome().post_root, direct.state_root());
+    drop(pending);
+    assert_eq!(state.state_root(), root);
+    assert_eq!(state.fee_escrow(), fees);
+    let pending = prepare(&mut state, &bytes, 1, &BoundVerifier, &BoundVerifier).unwrap();
+    let expected_charge = pending.outcome().charge;
+    let committed = pending.commit();
+    assert_eq!(committed.charge, expected_charge);
+    assert_eq!(state.state_root(), direct.state_root());
+    assert_eq!(state.base(), direct.base());
+    assert_eq!(state.native().snapshot(), direct.native().snapshot());
+    assert_eq!(state.fee_escrow(), direct.fee_escrow());
+}
+
+#[test]
 fn exchange_reexecutes_identically_without_mutating_producer_and_rejects_replay() {
     let (mut state, bytes, direct) = fixture();
     let root = state.state_root();
