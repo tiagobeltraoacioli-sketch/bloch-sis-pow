@@ -1,5 +1,5 @@
-import json, urllib.request
-base='http://127.0.0.1:8090/'
+import json, os, urllib.request
+base=os.environ.get('BLOCH_INDEXER_URL', 'http://127.0.0.1:8091/')
 def get(path):
     with urllib.request.urlopen(base+path,timeout=20) as r:return json.load(r)
 def rpc(method,params):
