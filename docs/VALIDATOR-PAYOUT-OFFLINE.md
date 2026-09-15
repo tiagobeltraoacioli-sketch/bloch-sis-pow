@@ -215,3 +215,36 @@ Run the synthetic, network-free regression tests with:
 ```sh
 python3 scripts/test-verify-validator-payout.py
 ```
+
+
+## Bind observations to the signed payout
+
+The source verifier also supports `--signed-tx`. Use the already verified
+local offline payout executable; the helper neither downloads nor authenticates
+that executable. Only the signed public transaction moves to the observation
+machine. No keystore or password is needed.
+
+Add these options to the two-RPC command above, preserving the same approved
+observations used during signing:
+
+```sh
+  --signed-tx payout-signed.hex --payout-bin ./bloch-pos \
+  --validator INDEX --input-value VALUE_SAT \
+  --withdrawal-script WITHDRAWAL_HASH32 \
+  --base-fee SIGNING_BASE_FEE --epoch SIGNING_EPOCH --max-fee APPROVED_FEE_CAP_SAT
+```
+
+Use the signing observations here, rather than replacing them with a later
+base fee. Before any RPC request, the helper invokes `validator-payout inspect`
+on a bounded, stable copy of the signed file. The offline CLI verifies the
+signature and consensus encoding. Its reported withdrawal input, transaction
+ID, destination and output amount must equal the explicitly requested RPC
+observations, and its signature-present field must be true. Failure stops
+without querying either node.
+
+Successful evidence includes `signed_transaction_inspection`, the signed
+file's SHA-256 and the signing root. Without `--signed-tx`, that field is null
+and the original RPC-only limitations still apply. A trusted CLI inspection
+links the signed intent to the observed IDs; RPC answers remain observations,
+not independently verified inclusion proofs. Synthetic tests cover this
+integration boundary; they do not establish a mainnet payout.

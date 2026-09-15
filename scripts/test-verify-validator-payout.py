@@ -6,6 +6,10 @@ import io
 import json
 import pathlib
 import unittest
+import tempfile
+import subprocess
+from unittest import mock
+import hashlib
 
 spec = importlib.util.spec_from_file_location('payout', pathlib.Path(__file__).with_name('verify-validator-payout.py'))
 m = importlib.util.module_from_spec(spec)
@@ -118,6 +122,39 @@ class VerificationTests(unittest.TestCase):
             with self.subTest(failure=failure), self.assertRaises(ValueError):
                 m.observe(a, Node(), W, S, D, 1000, pause=pauses.append)
             self.assertEqual(pauses, [])
+
+
+    def test_signed_inspection_binds_stable_bytes_and_expected_intent(self):
+        output = '\n'.join(['Payout input: '+W+':0', 'Transaction id: '+S,
+                            'Destination: '+D, 'Output value (sat): 1000',
+                            'Signature present: true', 'Signing root: '+'77'*32])
+        with tempfile.TemporaryDirectory() as directory:
+            tx = pathlib.Path(directory) / 'signed.hex'; tx.write_text('06abcd')
+            def inspect(command, **kwargs):
+                self.assertEqual(command[1:3], ['validator-payout', 'inspect'])
+                self.assertEqual(pathlib.Path(command[4]).read_bytes(), b'06abcd')
+                tx.write_text('changed-after-snapshot')
+                return subprocess.CompletedProcess(command, 0, output, '')
+            with mock.patch.object(m.subprocess, 'run', side_effect=inspect):
+                result = m.inspect_signed('/trusted/bloch-pos', tx, ['--epoch', '3000'], W, S, D, 1000)
+            self.assertEqual(result['signed_file_sha256'], hashlib.sha256(b'06abcd').hexdigest())
+
+    def test_signed_inspection_refuses_invalid_unsigned_or_substituted_intent(self):
+        fields = {'Payout input': W+':0', 'Transaction id': S, 'Destination': D,
+                  'Output value (sat)': '1000', 'Signature present': 'true', 'Signing root': '77'*32}
+        with tempfile.TemporaryDirectory() as directory:
+            tx = pathlib.Path(directory) / 'signed.hex'; tx.write_text('06abcd')
+            for field in fields:
+                changed = dict(fields); changed[field] = 'invalid'
+                output = '\n'.join(k+': '+v for k, v in changed.items())
+                with self.subTest(field=field), mock.patch.object(m.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, output, '')):
+                    with self.assertRaises(ValueError): m.inspect_signed('/trusted/bloch-pos', tx, [], W, S, D, 1000)
+            with mock.patch.object(m.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, '', 'invalid signature')):
+                with self.assertRaises(ValueError): m.inspect_signed('/trusted/bloch-pos', tx, [], W, S, D, 1000)
+            tx.write_bytes(b'x'*32769)
+            with mock.patch.object(m.subprocess, 'run') as runner:
+                with self.assertRaises(ValueError): m.inspect_signed('/trusted/bloch-pos', tx, [], W, S, D, 1000)
+                runner.assert_not_called()
 
 
     def test_input_bounds_and_nonlocal_endpoints_fail(self):
