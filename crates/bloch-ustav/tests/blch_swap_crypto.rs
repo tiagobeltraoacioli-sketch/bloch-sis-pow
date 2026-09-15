@@ -630,3 +630,110 @@ fn swap_funding_review_binds_real_trader_and_rejects_post_execution_state() {
         Err(Error::StateChanged)
     ));
 }
+
+#[test]
+fn signed_swap_preflight_predicts_execution_without_mutating_state() {
+    use bloch_pos_committee::transition::native_dex::pool_submission::SubmissionReview;
+    let (mut state, pool, reserve, funding) = initialized();
+    let request = swap_request(&state, pool, reserve, ([9; 32], 0), Some(funding));
+    let bytes = request.canonical_bytes(&DOMAIN).unwrap();
+    let payer = &identities()[2].0;
+    let before = state.state_root();
+    let review =
+        SubmissionReview::prepare(&state, &bytes, payer, 4, &BaseVerifier, &BlochVerifier).unwrap();
+    assert_eq!(state.state_root(), before);
+    let predicted = review.predicted_root();
+    assert_ne!(predicted, before);
+    let pool_wire::Receipt::Swap(simulated) = review.receipt() else {
+        panic!("wrong receipt")
+    };
+    let simulated_fee = simulated.charge;
+    assert_eq!(simulated_fee, *review.funding().charge());
+    let checked = review.finish(&state, payer, 4, &bytes).unwrap();
+    assert!(checked.matches_packet(&bytes));
+    let actual = state
+        .execute_blch_swap(&request, 4, &BaseVerifier, &BlochVerifier)
+        .unwrap();
+    assert_eq!(actual.charge, simulated_fee);
+    assert_eq!(state.state_root(), predicted);
+}
+
+#[test]
+fn signed_swap_preflight_rejects_bad_signatures_and_execution_constraints() {
+    use bloch_pos_committee::transition::native_dex::pool_review::FundingReview;
+    use bloch_pos_committee::transition::native_dex::pool_submission::{Error, SubmissionReview};
+    let (state, pool, reserve, funding) = initialized();
+    let request = swap_request(&state, pool, reserve, ([9; 32], 0), Some(funding));
+    let payer = &identities()[2].0;
+    let before = state.state_root();
+    let mut invalid = Vec::new();
+    let mut bad = request.clone();
+    if let PosTransaction::TransferV2 { keys, .. } = &mut bad.blch {
+        keys[0].signature[0] ^= 1;
+    }
+    invalid.push(bad);
+    let mut bad = request.clone();
+    bad.native
+        .witnesses
+        .owners
+        .iter_mut()
+        .find(|w| !w.is_empty())
+        .unwrap()[0] ^= 1;
+    invalid.push(bad);
+    let mut bad = request.clone();
+    bad.quote.minimum_out = u64::MAX;
+    sign_swap(&mut bad);
+    invalid.push(bad);
+    let mut bad = request;
+    bad.pool_state_root[0] ^= 1;
+    sign_swap(&mut bad);
+    invalid.push(bad);
+    for bad in invalid {
+        let bytes = bad.canonical_bytes(&DOMAIN).unwrap();
+        // Funding inspection alone deliberately accepts these signed envelopes.
+        FundingReview::prepare(&state, &bytes, payer, 4).unwrap();
+        assert!(matches!(
+            SubmissionReview::prepare(&state, &bytes, payer, 4, &BaseVerifier, &BlochVerifier),
+            Err(Error::Execution(_))
+        ));
+        assert_eq!(state.state_root(), before);
+    }
+}
+
+#[test]
+fn signed_swap_preflight_requires_exact_submission_context() {
+    use bloch_pos_committee::transition::native_dex::pool_review;
+    use bloch_pos_committee::transition::native_dex::pool_submission::{Error, SubmissionReview};
+    let (mut state, pool, reserve, funding) = initialized();
+    let request = swap_request(&state, pool, reserve, ([9; 32], 0), Some(funding));
+    let bytes = request.canonical_bytes(&DOMAIN).unwrap();
+    let payer = &identities()[2].0;
+    let prepare = || {
+        SubmissionReview::prepare(&state, &bytes, payer, 4, &BaseVerifier, &BlochVerifier).unwrap()
+    };
+    for height in [3, 5, 101] {
+        assert!(matches!(
+            prepare().finish(&state, payer, height, &bytes),
+            Err(Error::HeightChanged)
+        ));
+    }
+    assert!(matches!(
+        prepare().finish(&state, &identities()[1].0, 4, &bytes),
+        Err(Error::Review(pool_review::Error::AccountChanged))
+    ));
+    let mut altered = bytes.clone();
+    let last = altered.len() - 1;
+    altered[last] ^= 1;
+    assert!(matches!(
+        prepare().finish(&state, payer, 4, &altered),
+        Err(Error::Review(pool_review::Error::PacketChanged))
+    ));
+    let outstanding = prepare();
+    state
+        .execute_blch_swap(&request, 4, &BaseVerifier, &BlochVerifier)
+        .unwrap();
+    assert!(matches!(
+        outstanding.finish(&state, payer, 4, &bytes),
+        Err(Error::Review(pool_review::Error::StateChanged))
+    ));
+}

@@ -115,3 +115,41 @@ unknown pool references, changed state/account/packet, height regression and
 inclusive inner/outer expiry. A compile-fail test prevents reuse after finishing.
 Real-PQ integration tests additionally exercise a trader swap and a sponsored
 bridge import/withdrawal, including the import certificate's shorter deadline.
+
+## Fully signed submission preflight
+
+`pool_submission::SubmissionReview::prepare` accepts the complete signed packet,
+selected BLCH payer, trusted state, execution height and host signature verifiers.
+It first performs `FundingReview`, then runs the existing operation executor on a
+private clone of the state. The original state is never changed, on either success
+or failure. No alternate signature checks, fee rules or AMM formulas are introduced.
+All eight decoded operation kinds use the same dispatcher as ordinary execution.
+
+A successful review exposes the immutable funding review, typed simulated receipt
+and predicted resulting state root. These are simulation results, not a committed
+receipt or proof of inclusion. Filling or changing witnesses requires a new
+preflight of the final packet. Unsigned or forged packets must be refused by the
+host's real verifiers; supplying permissive test verifiers invalidates that claim.
+
+`finish` consumes the review and requires the exact original execution height,
+selected payer, packet bytes and parent state root. Even an advancing height still
+inside the expiry interval requires another preflight, since execution effects
+can depend on height. A failed attempt also consumes the review. This does not
+approve, sign, reserve funds, enqueue, broadcast or install the simulated state.
+Submission and inclusion must still use the executor and durable host commit path.
+The caller remains responsible for authenticated state, real signature verifiers,
+account authorization and human review. External source finality remains dependent
+on the configured gateway attestation model.
+
+Preflight clones the complete local state and runs full cryptography. It is intended
+for a bounded local host integration; this change adds no public simulation RPC.
+A service exposing it would need its own concurrency and resource limits. The
+existing single-BLCH-payer restriction remains in force, including on gateway
+transactions; this is not an issuer-only or committee-only signing interface.
+
+Real-PQ regression fixtures compare predicted and actually executed roots for swap,
+import and withdrawal, verify that successful and failed preparation leave the
+source state unchanged, and reject corrupted witnesses, impossible slippage,
+stale pool roots and changes of account, bytes, height or parent state. A compile-
+fail doctest prevents reuse after finishing. These checks run in the existing
+native feature jobs; there is no browser export or live consensus activation.

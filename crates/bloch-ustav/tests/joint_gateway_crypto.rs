@@ -775,3 +775,66 @@ fn gateway_funding_review_binds_real_sponsor_and_import_certificate_deadline() {
         Err(Error::InvalidExpiry)
     ));
 }
+
+#[test]
+fn signed_gateway_preflight_predicts_import_and_withdraw_and_rejects_forgery() {
+    use bloch_pos_committee::transition::native_dex::{
+        pool_submission::{Error, SubmissionReview},
+        pool_wire,
+    };
+    let (mut state, import) = fixture();
+    let payer = &keys()[0].0;
+    let bytes = import.canonical_bytes(&DOMAIN).unwrap();
+    let before = state.state_root();
+    let review =
+        SubmissionReview::prepare(&state, &bytes, payer, 4, &BaseVerifier, &BlochVerifier).unwrap();
+    assert_eq!(state.state_root(), before);
+    let predicted = review.predicted_root();
+    assert!(matches!(review.receipt(), pool_wire::Receipt::Gateway(_)));
+    review.finish(&state, payer, 4, &bytes).unwrap();
+    let imported = state
+        .execute_gateway(&import, 4, &BaseVerifier, &BlochVerifier)
+        .unwrap();
+    assert_eq!(state.state_root(), predicted);
+    let burn = withdrawal(&state, &import, &imported);
+    let bytes = burn.canonical_bytes(&DOMAIN).unwrap();
+    let before = state.state_root();
+    let review =
+        SubmissionReview::prepare(&state, &bytes, payer, 5, &BaseVerifier, &BlochVerifier).unwrap();
+    assert_eq!(state.state_root(), before);
+    let predicted = review.predicted_root();
+    review.finish(&state, payer, 5, &bytes).unwrap();
+    state
+        .execute_gateway(&burn, 5, &BaseVerifier, &BlochVerifier)
+        .unwrap();
+    assert_eq!(state.state_root(), predicted);
+
+    let (state, import) = fixture();
+    let before = state.state_root();
+    for authority in 0..4 {
+        let mut bad = import.clone();
+        match authority {
+            0 => {
+                if let PosTransaction::TransferV2 { keys, .. } = &mut bad.blch {
+                    keys[0].signature[crypto::SUITE_HEADER_LEN] ^= 1;
+                }
+            }
+            1 => {
+                let Val::Bytes(signature) = &mut bad.gateway.witnesses.modules[0][0] else {
+                    panic!("missing module signature")
+                };
+                signature[crypto::SUITE_HEADER_LEN] ^= 1;
+            }
+            2 => bad.gateway.approvals[0][crypto::SUITE_HEADER_LEN] ^= 1,
+            _ => {
+                bad.gateway.approvals[1][crypto::SUITE_HEADER_LEN + crypto::MLDSA_SIG_LEN + 1] ^= 1
+            }
+        }
+        let bytes = bad.canonical_bytes(&DOMAIN).unwrap();
+        assert!(matches!(
+            SubmissionReview::prepare(&state, &bytes, payer, 4, &BaseVerifier, &BlochVerifier),
+            Err(Error::Execution(_))
+        ));
+        assert_eq!(state.state_root(), before);
+    }
+}

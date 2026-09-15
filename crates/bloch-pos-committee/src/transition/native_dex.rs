@@ -19,6 +19,7 @@ pub mod pool_batch;
 pub mod pool_candidate;
 pub mod pool_intent;
 pub mod pool_review;
+pub mod pool_submission;
 pub mod pool_wire;
 pub mod remove_liquidity;
 pub mod swap;
