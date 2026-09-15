@@ -894,3 +894,138 @@ fn sponsor_account_attachment_preserves_other_owner_and_gateway_authorities() {
         .unwrap();
     assert_eq!(state.state_root(), predicted);
 }
+
+#[cfg(feature = "native-dex-host")]
+#[test]
+fn reviewed_account_admission_uses_pending_state_and_commits_through_journal() {
+    use bloch_ustav::{
+        dex_admission::{Error as AdmissionError, PendingBatch},
+        dex_journal::{Journal, TailRecovery},
+    };
+    let (anchor, import) = fixture();
+    let mut expected = anchor.clone();
+    let imported = expected
+        .execute_gateway(&import, 5, &BaseVerifier, &BlochVerifier)
+        .unwrap();
+    let burn = withdrawal(&expected, &import, &imported);
+    let mut pending_burn = burn.clone();
+    let PosTransaction::TransferV2 {
+        keys: witnesses, ..
+    } = &mut pending_burn.blch
+    else {
+        unreachable!()
+    };
+    let payer_signature = witnesses[0].signature.clone();
+    witnesses[0].signature.fill(0);
+    let frame = pending_burn.canonical_bytes(&DOMAIN).unwrap();
+    let import_frame = import.canonical_bytes(&DOMAIN).unwrap();
+    let payer = &keys()[0].0;
+    let path = std::env::temp_dir().join(format!(
+        "bloch-account-admission-{}-{}.log",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut journal = Journal::create(&path, anchor.clone(), 3).unwrap();
+    let parent = journal.checkpoint();
+    let mut queue = PendingBatch::new(&journal, 5).unwrap();
+    // The withdrawal spends outputs produced by the pending import.
+    assert!(queue
+        .prepare_account_review(&journal, &frame, payer, 5)
+        .is_err());
+    assert!(queue.is_empty());
+    queue.admit(&journal, &import_frame, 5).unwrap();
+    let review = queue
+        .prepare_account_review(&journal, &frame, payer, 5)
+        .unwrap();
+    assert_eq!(review.funding().state_root(), expected.state_root());
+    assert_eq!(journal.checkpoint(), parent);
+    assert_eq!(queue.len(), 1);
+    queue.retain_prefix(&journal, 0, 5).unwrap();
+    assert!(matches!(
+        queue.admit_account_signature(&journal, review, payer, &payer_signature, 5),
+        Err(AdmissionError::ReviewContextChanged)
+    ));
+    assert!(queue.is_empty());
+    queue.admit(&journal, &import_frame, 5).unwrap();
+
+    let review = queue
+        .prepare_account_review(&journal, &frame, payer, 5)
+        .unwrap();
+    assert!(matches!(
+        queue.admit_account_signature(&journal, review, &keys()[1].0, &payer_signature, 5),
+        Err(AdmissionError::Review(_))
+    ));
+    let review = queue
+        .prepare_account_review(&journal, &frame, payer, 5)
+        .unwrap();
+    let mut damaged = payer_signature.clone();
+    damaged[crypto::SUITE_HEADER_LEN] ^= 1;
+    assert!(matches!(
+        queue.admit_account_signature(&journal, review, payer, &damaged, 5),
+        Err(AdmissionError::Review(_))
+    ));
+    assert_eq!(queue.len(), 1);
+    assert_eq!(journal.checkpoint(), parent);
+
+    let mut drifting = PendingBatch::new(&journal, 5).unwrap();
+    drifting.admit(&journal, &import_frame, 5).unwrap();
+    let review = drifting
+        .prepare_account_review(&journal, &frame, payer, 5)
+        .unwrap();
+    assert!(matches!(
+        drifting.admit_account_signature(&journal, review, payer, &payer_signature, 6),
+        Err(AdmissionError::ReviewContextChanged)
+    ));
+    assert_eq!(drifting.len(), 1);
+    assert_eq!(drifting.height(), 6);
+
+    // The payer signature cannot authenticate another account's owner witness.
+    let mut forged = pending_burn;
+    forged.gateway.witnesses.owners[0][crypto::SUITE_HEADER_LEN] ^= 1;
+    let forged_frame = forged.canonical_bytes(&DOMAIN).unwrap();
+    let review = queue
+        .prepare_account_review(&journal, &forged_frame, payer, 5)
+        .unwrap();
+    assert!(matches!(
+        queue.admit_account_signature(&journal, review, payer, &payer_signature, 5),
+        Err(AdmissionError::Batch(_))
+    ));
+    assert_eq!(queue.len(), 1);
+    assert_eq!(journal.checkpoint(), parent);
+
+    let stale = queue
+        .prepare_account_review(&journal, &frame, payer, 5)
+        .unwrap();
+    let review = queue
+        .prepare_account_review(&journal, &frame, payer, 5)
+        .unwrap();
+    let result = queue
+        .admit_account_signature(&journal, review, payer, &payer_signature, 5)
+        .unwrap();
+    assert_eq!(queue.len(), 2);
+    assert!(matches!(
+        queue.admit_account_signature(&journal, stale, payer, &payer_signature, 5),
+        Err(AdmissionError::ReviewContextChanged)
+    ));
+    expected
+        .execute_gateway(&burn, 5, &BaseVerifier, &BlochVerifier)
+        .unwrap();
+    assert_eq!(result.post_root, expected.state_root());
+    assert_eq!(journal.checkpoint(), parent);
+    queue.commit(&mut journal, 5).unwrap();
+    assert!(queue.is_closed());
+    let checkpoint = journal.checkpoint();
+    assert_eq!(checkpoint.root, expected.state_root());
+    let mut stale_queue = PendingBatch::new(&journal, 6).unwrap();
+    assert!(stale_queue
+        .prepare_account_review(&journal, &frame, payer, 6)
+        .is_err());
+    drop(journal);
+    let restored = Journal::open(&path, anchor, 3, checkpoint, TailRecovery::Reject).unwrap();
+    assert_eq!(restored.state().state_root(), expected.state_root());
+    drop(restored);
+    std::fs::remove_file(path).unwrap();
+}

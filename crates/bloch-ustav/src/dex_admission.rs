@@ -3,7 +3,7 @@ use crate::{
     dex_journal::{self, BaseVerifier, Checkpoint, Journal},
     BlochVerifier,
 };
-use bloch_pos_committee::transition::native_dex::{pool_batch, pool_candidate};
+use bloch_pos_committee::transition::native_dex::{pool_batch, pool_candidate, pool_review, State};
 use std::io::{self, Read};
 
 #[derive(Debug)]
@@ -14,11 +14,32 @@ pub enum Error {
     Closed,
     Duplicate,
     InvalidPrefix,
+    ReviewContextChanged,
+    Review(pool_review::Error),
     ResourceLimit,
     LengthMismatch,
     Io(io::Error),
     Batch(pool_batch::Error),
     Candidate(pool_candidate::Error),
+}
+
+/// Local account review bound to an exact pending prefix and execution height.
+/// Not user consent or a signing capability. Finishing consumes it on all paths.
+/// Prefix storage is bounded by the existing candidate byte/operation limits.
+/// ```compile_fail
+/// use bloch_ustav::dex_admission::AccountReview;
+/// fn duplicate(review: AccountReview) { let _copy = review.clone(); }
+/// ```
+pub struct AccountReview {
+    funding: pool_review::FundingReview,
+    parent: Checkpoint,
+    prefix: Vec<Vec<u8>>,
+    height: u64,
+}
+impl AccountReview {
+    pub fn funding(&self) -> &pool_review::FundingReview {
+        &self.funding
+    }
 }
 
 /// A volatile candidate queue bound to one trusted parent and host height.
@@ -108,6 +129,69 @@ impl PendingBatch {
         self.frames.push(frame.to_vec());
         self.wire_bytes = next_bytes;
         Ok(outcome)
+    }
+
+    fn reviewed_prefix_state(&self, journal: &Journal) -> Result<State, Error> {
+        let mut state = journal.state().clone();
+        if !self.frames.is_empty() {
+            let refs: Vec<_> = self.frames.iter().map(Vec::as_slice).collect();
+            pool_batch::apply(
+                &mut state,
+                &self.parent.root,
+                self.height,
+                &refs,
+                &BaseVerifier,
+                &BlochVerifier,
+            )
+            .map_err(Error::Batch)?;
+        }
+        Ok(state)
+    }
+
+    /// Review against the state AFTER the pending prefix using fixed real PQ
+    /// verifiers. No frame is admitted and no journal state is changed.
+    /// The host supplies the selected wallet key and trusted execution height.
+    pub fn prepare_account_review(
+        &mut self,
+        journal: &Journal,
+        frame: &[u8],
+        payer: &[u8],
+        height: u64,
+    ) -> Result<AccountReview, Error> {
+        self.check_context(journal, height)?;
+        next_size(self.frames.len(), self.wire_bytes, frame.len() as u64)?;
+        let state = self.reviewed_prefix_state(journal)?;
+        let funding = pool_review::FundingReview::prepare(&state, frame, payer, height)
+            .map_err(Error::Review)?;
+        Ok(AccountReview {
+            funding,
+            parent: self.parent,
+            prefix: self.frames.clone(),
+            height,
+        })
+    }
+
+    /// Attach only the account's signature to its retained review and perform
+    /// ordinary full-prefix admission. Other-party witnesses must already be
+    /// valid. Does not invoke a signer, grant consent, broadcast or commit.
+    pub fn admit_account_signature(
+        &mut self,
+        journal: &Journal,
+        review: AccountReview,
+        payer: &[u8],
+        signature: &[u8],
+        height: u64,
+    ) -> Result<pool_batch::Outcome, Error> {
+        self.check_context(journal, height)?;
+        if review.parent != self.parent || review.height != height || review.prefix != self.frames {
+            return Err(Error::ReviewContextChanged);
+        }
+        let state = self.reviewed_prefix_state(journal)?;
+        let signed = review
+            .funding
+            .finish_with_account_signature(&state, payer, height, signature, &BaseVerifier)
+            .map_err(Error::Review)?;
+        self.admit(journal, signed.canonical_bytes(), height)
     }
 
     /// Read one request BODY with a bounded allocation before PQ validation.

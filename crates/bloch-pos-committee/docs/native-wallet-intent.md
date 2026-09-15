@@ -224,3 +224,44 @@ the deterministic test verifier, including native reserves whose recorded owner
 is the payer. Reattaching the existing account signature preserves the complete
 canonical packet and its execution behavior. This structural test is distinct
 from the real-PQ integration checks above.
+
+## Local host review and admission
+
+With `bloch-ustav/native-dex-host`, `PendingBatch::prepare_account_review` connects
+funding review to the existing candidate queue. It verifies and executes the
+current ordered prefix on a private state copy using the host's fixed real PQ
+verifiers, then reviews the proposed packet against that resulting state. Thus a
+review can spend outputs of an earlier pending operation without treating those
+outputs as already committed. The original journal and pending frames are unchanged.
+The queue's existing monotonic height watermark may advance even on rejection.
+
+The returned non-cloneable `AccountReview` exposes an immutable funding review for
+the caller's approval UI. It retains the parent checkpoint, execution height and
+exact pending prefix. After the caller obtains explicit consent and a signature
+from its own trusted signer, `PendingBatch::admit_account_signature` consumes the
+review, rechecks that context, rebuilds the pending state and attaches the account
+signature to the retained packet. It then uses ordinary full-prefix admission,
+with fixed BLCH and native PQ verifiers. Invalid other-party signatures or
+execution constraints still prevent admission. Failed attempts consume the review
+without changing pending frames or journal state.
+
+Context equality checks the current exact prefix and checkpoint, not a history of
+all edits or a unique queue identity. Restoring an identical prefix at the same
+height and parent is equivalent. Advancing the execution height requires a new
+review even if the packet is not expired. The prefix retained by each review is
+bounded by the existing operation/byte limits; the host must separately limit
+outstanding reviews and concurrent simulations. Full-state copies and repeated
+cryptographic verification make this a local integration boundary, not an
+unlimited public simulation service.
+
+Admission is volatile. Only the existing `PendingBatch::commit` path validates,
+writes and syncs the candidate into the journal. No browser provider method, HTTP
+endpoint, signer, user-consent UI, live consensus activation or external USDT
+payout is introduced here. Queue, state, height and selected account must remain
+under trusted host/wallet control.
+
+The real-PQ gateway regression reviews a withdrawal against a pending import,
+rejects changed prefixes, heights, accounts, damaged payer signatures and forged
+native owner witnesses, then admits, commits and reopens the resulting journal.
+The restored state root matches direct execution. The existing host feature CI
+commands include this regression and the review ownership doctest.
