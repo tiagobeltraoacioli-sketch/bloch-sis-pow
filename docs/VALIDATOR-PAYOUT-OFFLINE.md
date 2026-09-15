@@ -172,3 +172,42 @@ does not distinguish a spent output from one that never existed. Retain its
 earlier inclusion/value/credential evidence and verify the new output under
 the expected spend ID, destination and value. Compare nodes at a common
 block before interpreting differing observations as a divergence.
+
+
+## Read-only settlement observation helper
+
+`scripts/verify-validator-payout.py` compares observations from two nodes.
+Expose each node through a different loopback SSH tunnel, then run:
+
+```sh
+python3 scripts/verify-validator-payout.py \
+  --rpc-a http://127.0.0.1:16400/ \
+  --rpc-b http://127.0.0.1:26400/ \
+  --withdrawal-txid WITHDRAWAL_TXID \
+  --spend-txid PAYOUT_SPEND_TXID \
+  --destination DESTINATION_HASH32 --value-sat EXPECTED_OUTPUT_SAT
+```
+
+Use the consensus IDs and output amount from the inspected signed payout,
+not a submission's local `tx_hash`. The helper requires both transactions
+to be reported finalized, the old output absent, and the new output present
+with the exact destination and value. It checks the mainnet network domain
+and requires both nodes to remain on the same block/state/finalized checkpoint
+throughout observation. A moving head or differing observation exits nonzero;
+retry rather than treating that as proof of network failure. An already spent
+destination output cannot pass this intentionally narrow check.
+
+The helper prints JSON only on success and never submits transactions or
+reads keys. Loopback HTTP only, disabled environment proxies, refused
+redirects, response size limits and timeouts bound RPC access. Different
+URLs do not establish independent operators: configure the tunnels yourself.
+RPC agreement is not a cryptographic proof, and this helper does not decode
+the signed spend to establish its linkage to the withdrawal. Retain the
+CLI's inspected intent and earlier withdrawal inclusion evidence alongside
+the JSON. This helper does not complete mainnet lifecycle qualification.
+
+Run the synthetic, network-free regression tests with:
+
+```sh
+python3 scripts/test-verify-validator-payout.py
+```
