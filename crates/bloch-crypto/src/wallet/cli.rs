@@ -155,9 +155,8 @@ pub fn main() {
         Cmd::Pubkey { keystore } => {
             let kp = load_kp(&keystore);
             let hex = hex::encode(&kp.public_key);
-            println!("  {}", muted(&hex[..32]));
-            println!("  {}", muted(&hex[32..64]));
-            println!("  {}... ({} bytes total){}", DIM, kp.public_key.len(), RESET);
+            // Public-key export must include every byte for native script hashing.
+            println!("{hex}");
         }
 
         Cmd::Balance { address } => {
