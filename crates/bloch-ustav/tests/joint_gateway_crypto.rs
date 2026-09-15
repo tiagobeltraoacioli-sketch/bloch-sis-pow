@@ -1029,3 +1029,94 @@ fn reviewed_account_admission_uses_pending_state_and_commits_through_journal() {
     drop(restored);
     std::fs::remove_file(path).unwrap();
 }
+
+#[cfg(feature = "native-dex-host")]
+#[test]
+fn account_reviews_are_bounded_released_and_bound_to_the_original_queue() {
+    use bloch_ustav::{
+        dex_admission::{Error as AdmissionError, PendingBatch, MAX_ACCOUNT_REVIEWS},
+        dex_journal::Journal,
+    };
+    let (state, import) = fixture();
+    let frame = import.canonical_bytes(&DOMAIN).unwrap();
+    let payer = &keys()[0].0;
+    let PosTransaction::TransferV2 {
+        keys: witnesses, ..
+    } = &import.blch
+    else {
+        unreachable!()
+    };
+    let signature = &witnesses[0].signature;
+    let path = std::env::temp_dir().join(format!(
+        "bloch-review-quota-{}-{}.log",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let journal = Journal::create(&path, state, 3).unwrap();
+    let checkpoint = journal.checkpoint();
+    let mut original = PendingBatch::new(&journal, 4).unwrap();
+    let mut held: Vec<_> = (0..MAX_ACCOUNT_REVIEWS)
+        .map(|_| {
+            original
+                .prepare_account_review(&journal, &frame, payer, 4)
+                .unwrap()
+        })
+        .collect();
+    assert!(matches!(
+        original.prepare_account_review(&journal, &frame, payer, 4),
+        Err(AdmissionError::ResourceLimit)
+    ));
+    // A full quota is refused before even decoding this malformed frame.
+    assert!(matches!(
+        original.prepare_account_review(&journal, &[0], payer, 4),
+        Err(AdmissionError::ResourceLimit)
+    ));
+    held.pop();
+    assert!(matches!(
+        original.prepare_account_review(&journal, &[0], payer, 4),
+        Err(AdmissionError::Review(_))
+    ));
+    let review = original
+        .prepare_account_review(&journal, &frame, payer, 4)
+        .unwrap();
+    let mut identical = PendingBatch::new(&journal, 4).unwrap();
+    assert!(matches!(
+        identical.admit_account_signature(&journal, review, payer, signature, 4),
+        Err(AdmissionError::ReviewContextChanged)
+    ));
+    // Refusing a cross-queue review returns its slot to the issuing queue.
+    let review = original
+        .prepare_account_review(&journal, &frame, payer, 4)
+        .unwrap();
+    assert!(matches!(
+        original.admit_account_signature(&journal, review, payer, &[], 4),
+        Err(AdmissionError::Review(_))
+    ));
+    let review = original
+        .prepare_account_review(&journal, &frame, payer, 4)
+        .unwrap();
+    original
+        .admit_account_signature(&journal, review, payer, signature, 4)
+        .unwrap();
+    // Successful consumption also frees capacity, even with seven old handles.
+    assert!(matches!(
+        original.prepare_account_review(&journal, &[0], payer, 4),
+        Err(AdmissionError::Review(_))
+    ));
+    assert_eq!(original.len(), 1);
+    assert!(identical.is_empty());
+    assert_eq!(journal.checkpoint(), checkpoint);
+    drop(original);
+    // Outstanding handles keep their old queue identity alive after queue drop.
+    let old = held.pop().unwrap();
+    assert!(matches!(
+        identical.admit_account_signature(&journal, old, payer, signature, 4),
+        Err(AdmissionError::ReviewContextChanged)
+    ));
+    drop(held);
+    drop(journal);
+    std::fs::remove_file(path).unwrap();
+}

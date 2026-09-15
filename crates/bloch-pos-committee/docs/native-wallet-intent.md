@@ -245,12 +245,14 @@ with fixed BLCH and native PQ verifiers. Invalid other-party signatures or
 execution constraints still prevent admission. Failed attempts consume the review
 without changing pending frames or journal state.
 
-Context equality checks the current exact prefix and checkpoint, not a history of
-all edits or a unique queue identity. Restoring an identical prefix at the same
-height and parent is equivalent. Advancing the execution height requires a new
+Context equality checks the current exact prefix, checkpoint and issuing queue
+identity, not a history of all edits. Restoring an identical prefix within the same
+queue at the same height and parent is equivalent. Another queue cannot consume
+the review, even with identical contents. Advancing the execution height requires a new
 review even if the packet is not expired. The prefix retained by each review is
-bounded by the existing operation/byte limits; the host must separately limit
-outstanding reviews and concurrent simulations. Full-state copies and repeated
+bounded by the existing operation/byte limits. Each queue admits at most eight
+outstanding reviews; the host must separately limit total queues, reviews across
+queues and concurrent simulations. Full-state copies and repeated
 cryptographic verification make this a local integration boundary, not an
 unlimited public simulation service.
 
@@ -265,3 +267,27 @@ rejects changed prefixes, heights, accounts, damaged payer signatures and forged
 native owner witnesses, then admits, commits and reopens the resulting journal.
 The restored state root matches direct execution. The existing host feature CI
 commands include this regression and the review ownership doctest.
+
+
+### Review capacity and lifetime
+
+`MAX_ACCOUNT_REVIEWS` is eight per queue. A capacity slot is acquired before state
+cloning, packet decoding or prefix signature verification. Preparation failures
+release the slot automatically. Dropping a review, successful admission, or any
+failed admission attempt also releases its slot. A stale review still held by the
+caller occupies capacity until dropped or consumed; the host must discard its
+cancelled/expired UI requests. No background timer or global session manager is
+implied by this local limit.
+
+Each review retains a private shared identity for its issuing queue. A second queue
+cannot consume it even when parent, height and every pending byte match. The
+identity remains alive while any review exists, so dropping a queue cannot let a
+new queue inherit its old reviews. This identity is an in-process binding, not a
+user-visible token or proof of approval. Atomic reservation prevents capacity
+oversubscription if slot requests overlap.
+
+Tests race 32 slot acquisitions against the eight-slot limit, verify capacity is
+restored on drop, and exercise the real gateway review path at capacity. Malformed
+preparation, invalid signatures and cross-queue attempts release their slots;
+successful admission preserves the journal until explicit commit. Reviews from a
+dropped queue remain unusable in another queue.

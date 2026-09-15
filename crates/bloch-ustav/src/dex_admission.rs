@@ -5,6 +5,10 @@ use crate::{
 };
 use bloch_pos_committee::transition::native_dex::{pool_batch, pool_candidate, pool_review, State};
 use std::io::{self, Read};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 #[derive(Debug)]
 pub enum Error {
@@ -23,6 +27,31 @@ pub enum Error {
     Candidate(pool_candidate::Error),
 }
 
+/// Per-queue retained-review limit; transports still need global rate limits.
+pub const MAX_ACCOUNT_REVIEWS: usize = 8;
+
+struct ReviewSlot(Arc<AtomicUsize>);
+impl ReviewSlot {
+    fn acquire(slots: &Arc<AtomicUsize>) -> Result<Self, Error> {
+        slots
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                if used < MAX_ACCOUNT_REVIEWS {
+                    Some(used + 1)
+                } else {
+                    None
+                }
+            })
+            .map_err(|_| Error::ResourceLimit)?;
+        Ok(Self(Arc::clone(slots)))
+    }
+}
+impl Drop for ReviewSlot {
+    fn drop(&mut self) {
+        let previous = self.0.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+    }
+}
+
 /// Local account review bound to an exact pending prefix and execution height.
 /// Not user consent or a signing capability. Finishing consumes it on all paths.
 /// Prefix storage is bounded by the existing candidate byte/operation limits.
@@ -31,6 +60,7 @@ pub enum Error {
 /// fn duplicate(review: AccountReview) { let _copy = review.clone(); }
 /// ```
 pub struct AccountReview {
+    slot: ReviewSlot,
     funding: pool_review::FundingReview,
     parent: Checkpoint,
     prefix: Vec<Vec<u8>>,
@@ -46,6 +76,7 @@ impl AccountReview {
 /// Admission does not reserve balances, persist transactions or promise inclusion.
 /// Only commit confirms the entire batch through the durable journal.
 pub struct PendingBatch {
+    review_slots: Arc<AtomicUsize>,
     parent: Checkpoint,
     height: u64,
     frames: Vec<Vec<u8>>,
@@ -60,6 +91,7 @@ impl PendingBatch {
             return Err(Error::Journal(dex_journal::Error::NonIncreasingHeight));
         }
         Ok(Self {
+            review_slots: Arc::new(AtomicUsize::new(0)),
             parent,
             height,
             frames: Vec::new(),
@@ -160,10 +192,14 @@ impl PendingBatch {
     ) -> Result<AccountReview, Error> {
         self.check_context(journal, height)?;
         next_size(self.frames.len(), self.wire_bytes, frame.len() as u64)?;
+        // Reserve capacity before state cloning, decoding or PQ verification.
+        // Every failure below releases it automatically.
+        let slot = ReviewSlot::acquire(&self.review_slots)?;
         let state = self.reviewed_prefix_state(journal)?;
         let funding = pool_review::FundingReview::prepare(&state, frame, payer, height)
             .map_err(Error::Review)?;
         Ok(AccountReview {
+            slot,
             funding,
             parent: self.parent,
             prefix: self.frames.clone(),
@@ -183,7 +219,11 @@ impl PendingBatch {
         height: u64,
     ) -> Result<pool_batch::Outcome, Error> {
         self.check_context(journal, height)?;
-        if review.parent != self.parent || review.height != height || review.prefix != self.frames {
+        if !Arc::ptr_eq(&review.slot.0, &self.review_slots)
+            || review.parent != self.parent
+            || review.height != height
+            || review.prefix != self.frames
+        {
             return Err(Error::ReviewContextChanged);
         }
         let state = self.reviewed_prefix_state(journal)?;
@@ -322,6 +362,54 @@ fn next_size(count: usize, current: u64, incoming: u64) -> Result<u64, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn review_slots_release_capacity_on_drop() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut held: Vec<_> = (0..MAX_ACCOUNT_REVIEWS)
+            .map(|_| ReviewSlot::acquire(&counter).unwrap())
+            .collect();
+        assert!(matches!(
+            ReviewSlot::acquire(&counter),
+            Err(Error::ResourceLimit)
+        ));
+        held.pop();
+        let replacement = ReviewSlot::acquire(&counter).unwrap();
+        assert_eq!(counter.load(Ordering::Acquire), MAX_ACCOUNT_REVIEWS);
+        drop(held);
+        drop(replacement);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn simultaneous_review_slot_requests_cannot_exceed_capacity() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let acquired = Arc::new(std::sync::Barrier::new(33));
+        let release = Arc::new(std::sync::Barrier::new(33));
+        let threads: Vec<_> = (0..32)
+            .map(|_| {
+                let counter = Arc::clone(&counter);
+                let acquired = Arc::clone(&acquired);
+                let release = Arc::clone(&release);
+                std::thread::spawn(move || {
+                    let slot = ReviewSlot::acquire(&counter).ok();
+                    acquired.wait();
+                    release.wait();
+                    slot.is_some()
+                })
+            })
+            .collect();
+        acquired.wait();
+        let used = counter.load(Ordering::Acquire);
+        release.wait();
+        let accepted = threads
+            .into_iter()
+            .map(|t| usize::from(t.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(used, MAX_ACCOUNT_REVIEWS);
+        assert_eq!(accepted, MAX_ACCOUNT_REVIEWS);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
+
     struct NoRead;
     impl Read for NoRead {
         fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
