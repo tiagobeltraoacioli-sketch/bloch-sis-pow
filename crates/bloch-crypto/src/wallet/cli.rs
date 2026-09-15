@@ -22,10 +22,11 @@ fn dim(s: &str)    -> String { format!("{}{}{}", DIM, s, RESET) }
 
 fn banner() {
     println!();
-    println!("  {}◆{}  {} E N T A N G L E M E N T {}  {}◆{}",
+    println!("  {}◆{}  {} B L O C H {}  {}◆{}",
         AMBER, RESET, BOLD, RESET, AMBER, RESET);
-    println!("  {}ML-DSA-65 · AES-256-GCM · Argon2id{}",
+    println!("  {}Hybrid signatures: ML-DSA-65 + Falcon-1024 · SHA3-256{}",
         MUTED, RESET);
+    println!("  {}Keystore encryption: AES-256-GCM · Argon2id{}", MUTED, RESET);
     println!();
 }
 
@@ -46,7 +47,7 @@ fn label(k: &str, v: &str) {
 
 #[derive(Parser)]
 #[command(name = "bloch-wallet")]
-#[command(about = "Bloch-SIS Protocol Wallet — ML-DSA-65 keypairs")]
+#[command(about = "Bloch Protocol Wallet — hybrid ML-DSA-65 + Falcon-1024 signatures")]
 #[command(version)]
 #[command(disable_help_flag = false)]
 struct Cli {
@@ -119,8 +120,8 @@ pub fn main() {
     match cli.cmd {
 
         Cmd::New { output } => {
-            println!("  {}Generating ML-DSA-65 keypair...{}", MUTED, RESET);
-            println!("  {}(this takes a moment — 4000-byte key generation){}",
+            println!("  {}Generating hybrid ML-DSA-65 + Falcon-1024 keypair...{}", MUTED, RESET);
+            println!("  {}(post-quantum key generation may take a moment){}",
                 DIM, RESET);
             println!();
 
@@ -130,7 +131,7 @@ pub fn main() {
             println!();
             label("pubkey size",  &format!("{} bytes", kp.public_key.len()));
             label("privkey size", &format!("{} bytes (never share!)", kp.private_key.len()));
-            label("algorithm",    "ML-DSA-65 (NIST FIPS 204)");
+            label("algorithm",    "ML-DSA-65 + Falcon-1024 (hybrid)");
             label("network",      if cli.testnet { "testnet" } else { "mainnet" });
             println!();
 
@@ -255,7 +256,7 @@ pub fn main() {
             ok(&format!("Transaction built — txid: {}", amber(&hex::encode(txid))));
             label("inputs",  &format!("{}", tx.inputs.len()));
             label("outputs", &format!("{}", tx.outputs.len()));
-            label("sig size",&format!("{} bytes (ML-DSA-65)", tx.inputs[0].script_sig.len()));
+            label("sig size",&format!("{} bytes", tx.inputs[0].script_sig.len()));
             println!();
 
             // 5. Serialize and broadcast via sendrawtransaction
