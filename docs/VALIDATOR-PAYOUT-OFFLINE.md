@@ -248,3 +248,15 @@ and the original RPC-only limitations still apply. A trusted CLI inspection
 links the signed intent to the observed IDs; RPC answers remain observations,
 not independently verified inclusion proofs. Synthetic tests cover this
 integration boundary; they do not establish a mainnet payout.
+
+
+Run the real CLI integration with the verified local executable:
+
+```sh
+python3 scripts/test-payout-inspection-live-cli.py /absolute/path/to/bloch-pos
+```
+
+This test creates and deletes disposable sealed keys in a temporary directory.
+It accepts a real signed payout and rejects an unsigned draft, substituted
+transaction ID, destination or amount, and malformed wire bytes. It uses no
+RPC and provides no mainnet settlement evidence.
