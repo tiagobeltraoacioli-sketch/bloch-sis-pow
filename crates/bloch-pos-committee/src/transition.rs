@@ -5444,6 +5444,20 @@ impl<V: SignatureVerifier> Transition<V> {
         attestations: &[Attestation],
         transactions: &[PosTransaction],
     ) -> Result<CommittedState, TransitionError> {
+        self.compute_post_state_observed(pre, envelope, attestations, transactions, |_, _, _| {})
+    }
+
+    /// Replay with a read-only receipt observer. Observations are provisional
+    /// until the caller verifies the final state root and this method succeeds.
+    /// The callback cannot mutate consensus state or change transaction charges.
+    pub fn compute_post_state_observed<F: FnMut(usize, &CommittedState, &fee_market::TxCharge)>(
+        &self,
+        pre: &CommittedState,
+        envelope: &ProposalEnvelope,
+        attestations: &[Attestation],
+        transactions: &[PosTransaction],
+        mut observer: F,
+    ) -> Result<CommittedState, TransitionError> {
         let header = &envelope.header;
 
         // 1. Slot must advance (double-apply of a block to its own
@@ -5839,6 +5853,7 @@ impl<V: SignatureVerifier> Transition<V> {
             };
             match applied {
                 Ok(charge) => {
+                    observer(i, &st, &charge);
                     base_fees += charge.base_fee_sat;
                     priority_fees += charge.priority_fee_sat;
                     block_gas = block_gas.saturating_add(charge.gas);
@@ -11902,6 +11917,17 @@ mod tests {
 
         let b = build_block(&t, &g, 1, &[], std::slice::from_ref(&tx), &mut chains);
         let s1 = t.apply_block(&g, &b, &[], std::slice::from_ref(&tx)).unwrap();
+        // Receipt observation must preserve the ordinary consensus result.
+        let mut receipts = Vec::new();
+        let observed = t.compute_post_state_observed(&g, &b, &[], std::slice::from_ref(&tx),
+            |index, state, charge| receipts.push((index, state.utxo(&txid, 0).cloned(),
+                charge.base_fee_sat + charge.priority_fee_sat))).unwrap();
+        assert_eq!(observed.state_root(), s1.state_root());
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].0, 0);
+        assert_eq!(receipts[0].1.as_ref().unwrap().value, paid);
+        assert_eq!(receipts[0].2, u128::from(coin_a.value + coin_b.value - paid));
+        assert!(g.utxo(&coin_a.txid, coin_a.vout).is_some(), "receipt replay mutated pre-state");
 
         // The inputs are gone.
         assert!(

@@ -1,0 +1,22 @@
+[Unit]
+Description=Bloch historical indexer with consensus receipt verification
+After=network-online.target bloch-archival-next.service
+[Service]
+Type=simple
+User=ubuntu
+ExecStart=/home/ubuntu/g4/bloch-indexer-20260915-final serve --log /home/ubuntu/g4/archival-next/blocks.log --manifest /home/ubuntu/g4/mainnet.manifest --carryover /home/ubuntu/g4/carryover.tsv --bind 127.0.0.1:8091 --poll-ms 5000 --undo-depth 128
+Restart=on-failure
+RestartSec=15
+Nice=10
+CPUQuota=200%
+MemoryMax=8G
+TasksMax=64
+LimitNOFILE=1024
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+[Install]
+WantedBy=multi-user.target
