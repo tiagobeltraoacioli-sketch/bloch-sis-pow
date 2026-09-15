@@ -34,7 +34,11 @@ trust boundary and remaining block integration. Pool operations also have a
 bounded native wire dispatcher. The combined BLCH/native State additionally
 has a [bounded pool lifecycle dispatcher](../../crates/bloch-pos-committee/docs/pool-lifecycle-wire.md)
 covering creation through provider redemption and eligible closing. These local
-dispatchers do not activate the network.
+dispatchers do not activate the network. A local
+[atomic candidate batch API](../../crates/bloch-pos-committee/docs/pool-batches.md)
+now binds the parent state and host height, bounds aggregate resources and
+rolls back the full candidate on failure. Live block transition, shared budgets
+and fee settlement remain unimplemented for these operations.
 
 ## Actual ownership and integration boundary
 

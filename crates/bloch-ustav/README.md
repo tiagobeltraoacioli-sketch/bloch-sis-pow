@@ -32,7 +32,9 @@ credits separate PQ-owned positions for up to 128 providers per pool. LP
 transfers remain unimplemented. The [bounded pool lifecycle transport](../bloch-pos-committee/docs/pool-lifecycle-wire.md)
 dispatches six binary request types through those same atomic methods, with
 real PQ tests comparing encoded and direct execution. Node/RPC admission remains
-separate.
+separate. [Atomic candidate batches](../bloch-pos-committee/docs/pool-batches.md)
+now validate ordered dependent operations against one parent and roll back all
+changes on failure, including a forged later provider redemption in PQ tests.
 
 [Color-Changing Chameleon v1](../bloch-euvm/docs/chameleon-v1.md) adds sealed
 PQ-native escrow, an explicit Kirpich ERC-20 compatibility profile and an

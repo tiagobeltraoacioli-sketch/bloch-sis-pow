@@ -284,7 +284,13 @@ pub fn decode(bytes: &[u8], expected_domain: &[u8; 32]) -> Result<Request, Error
 /// Full-frame network fee estimate only; does not authorize or reserve funding.
 pub fn quote_encoded(state: &State, bytes: &[u8]) -> Result<fee_market::TxCharge, Error> {
     let request = decode(bytes, &state.domain)?;
-    match &request {
+    quote_request(state, &request)
+}
+pub(super) fn quote_request(
+    state: &State,
+    request: &Request,
+) -> Result<fee_market::TxCharge, Error> {
+    match request {
         Request::CreatePair(r) => state.quote_paired_custody(r),
         Request::Initialize(r) => state.quote_initial_liquidity(r),
         Request::Add(r) => state.quote_blch_add_fee(r),
@@ -304,7 +310,16 @@ pub fn apply_encoded(
     native_verifier: &dyn Verifier,
 ) -> Result<Receipt, Error> {
     let request = decode(bytes, &state.domain)?;
-    match &request {
+    apply_request(state, &request, height, base_verifier, native_verifier)
+}
+pub(super) fn apply_request(
+    state: &mut State,
+    request: &Request,
+    height: u64,
+    base_verifier: &dyn SignatureVerifier,
+    native_verifier: &dyn Verifier,
+) -> Result<Receipt, Error> {
+    match request {
         Request::CreatePair(r) => state
             .execute_paired_custody(r, height, base_verifier, native_verifier)
             .map(Receipt::CreatePair),

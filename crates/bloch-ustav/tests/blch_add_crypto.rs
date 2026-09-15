@@ -230,7 +230,7 @@ fn resign(request: &mut Request) {
 use bloch_euvm::ustav::OutPoint;
 use bloch_pos_committee::transition::native_dex::base_reserves::RESERVE_KEY_INDEX;
 use bloch_pos_committee::transition::native_dex::{
-    add_liquidity, initial_liquidity, pool_wire, remove_liquidity,
+    add_liquidity, initial_liquidity, pool_batch, pool_wire, remove_liquidity,
 };
 
 fn initialized() -> (State, [u8; 32], [u8; 32], OutPoint) {
@@ -577,6 +577,7 @@ fn reject_add(state: &mut State, request: &add_liquidity::Request) {
 #[test]
 fn independent_provider_adds_balanced_and_unbalanced_then_redeems_only_own_lp() {
     let (mut state, pool, reserve, native_funding) = initialized();
+    let mut batch_state = state.clone();
     let creator_lp = state.blch_lp_position(&pool, &identities()[0].0);
     let supply = state
         .native()
@@ -738,6 +739,53 @@ fn independent_provider_adds_balanced_and_unbalanced_then_redeems_only_own_lp() 
         .is_locked(&state.paired_custody(&reserve).unwrap().outpoint));
     let restored = State::restore(state.snapshot(), state.state_root(), &BlochVerifier).unwrap();
     assert_eq!(restored.state_root(), state.state_root());
+    let frames = [
+        pool_wire::encode(&pool_wire::Request::Add(first), &DOMAIN).unwrap(),
+        pool_wire::encode(&pool_wire::Request::Add(second), &DOMAIN).unwrap(),
+        pool_wire::encode(&pool_wire::Request::Remove(redeem.clone()), &DOMAIN).unwrap(),
+    ];
+    let refs: Vec<_> = frames.iter().map(Vec::as_slice).collect();
+    let parent = batch_state.state_root();
+    let fees_before = batch_state.fee_escrow();
+    let preview = pool_batch::simulate(
+        &batch_state,
+        &parent,
+        4,
+        &refs,
+        &BaseVerifier,
+        &BlochVerifier,
+    )
+    .unwrap();
+    assert_eq!(batch_state.state_root(), parent);
+    assert_eq!(preview.post_root, state.state_root());
+    let forged = pool_wire::encode(&pool_wire::Request::Remove(stolen), &DOMAIN).unwrap();
+    assert!(matches!(
+        pool_batch::apply(
+            &mut batch_state,
+            &parent,
+            4,
+            &[&frames[0], &frames[1], &forged],
+            &BaseVerifier,
+            &BlochVerifier
+        ),
+        Err(pool_batch::Error::Operation { index: 2, .. })
+    ));
+    assert_eq!(batch_state.state_root(), parent);
+    assert_eq!(batch_state.fee_escrow(), fees_before);
+    let applied = pool_batch::apply(
+        &mut batch_state,
+        &parent,
+        4,
+        &refs,
+        &BaseVerifier,
+        &BlochVerifier,
+    )
+    .unwrap();
+    assert_eq!(applied.commitment, preview.commitment);
+    assert_eq!(applied.charge, preview.charge);
+    assert_eq!(batch_state.state_root(), state.state_root());
+    assert_eq!(batch_state.base(), state.base());
+    assert_eq!(batch_state.native().snapshot(), state.native().snapshot());
     reject_remove(&mut state, &redeem);
 }
 

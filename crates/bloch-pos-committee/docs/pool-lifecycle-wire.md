@@ -50,6 +50,10 @@ trailing data, hostile lengths, unknown headers, wrong domains, old removal
 versions and unauthorized canonical mutations. Existing real PQ integration
 tests also compare encoded and direct execution for all six operations.
 
+[`pool_batch`](pool-batches.md) now provides bounded multi-operation simulation
+and all-or-nothing application over these frames, with parent-root binding and
+aggregate byte/gas accounting. It remains a local rehearsal API.
+
 ## Remaining integration
 
 A live host still needs bounded ingress, trusted height/domain configuration,

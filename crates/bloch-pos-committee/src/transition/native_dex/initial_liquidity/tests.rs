@@ -237,7 +237,7 @@ fn quote_rechecks_backing_locks_creation_and_lp_authority() {
     }
 }
 
-fn swap_request(
+pub(in crate::transition::native_dex) fn swap_request(
     state: &State,
     pool: [u8; 32],
     base_point: ([u8; 32], u32),

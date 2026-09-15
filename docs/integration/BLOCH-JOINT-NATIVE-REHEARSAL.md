@@ -40,6 +40,11 @@ now decodes and dispatches creation, initialization, adds, swaps, provider
 redemptions and eligible closing to the same State methods. No one-sided native
 release plan is exposed. Neither dispatcher registers a live RPC or block type.
 
+[Atomic pool batches](../../crates/bloch-pos-committee/docs/pool-batches.md)
+now simulate or apply ordered frames against a trusted parent, cap aggregate
+bytes/gas before cryptography and discard the full candidate on any failure.
+This still does not advance the live chain or settle block rewards.
+
 ## Atomic authorization and planning
 
 A request combines a bounded TransferV2 intent with a zero-delta native transfer
