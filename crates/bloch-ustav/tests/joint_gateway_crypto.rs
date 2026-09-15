@@ -78,12 +78,20 @@ fn base() -> CommittedState {
             gas_used: 0,
             base_fee_per_gas: 0,
         },
-        &[EutxoEntry {
-            txid: [8; 32],
-            vout: 0,
-            value: COIN,
-            script_hash: Sha3_256::digest(&keys()[0].0).into(),
-        }],
+        &[
+            EutxoEntry {
+                txid: [8; 32],
+                vout: 0,
+                value: COIN,
+                script_hash: Sha3_256::digest(&keys()[0].0).into(),
+            },
+            EutxoEntry {
+                txid: [19; 32],
+                vout: 0,
+                value: COIN,
+                script_hash: Sha3_256::digest(&keys()[2].0).into(),
+            },
+        ],
     )
 }
 fn sponsor() -> PosTransaction {
@@ -196,8 +204,11 @@ fn fixture() -> (State, joint::Request) {
     (state, request)
 }
 fn fund_and_sign(state: &State, r: &mut joint::Request, funds: u64) {
+    fund_and_sign_with(state, r, funds, 0);
+}
+fn fund_and_sign_with(state: &State, r: &mut joint::Request, funds: u64, sponsor: usize) {
     // Measure real hybrid witnesses before pricing; re-sign the final fee intent.
-    resign(r);
+    resign_with(r, sponsor);
     let size = r.canonical_bytes(&DOMAIN).unwrap().len() as u64;
     if let PosTransaction::TransferV2 { tx_bytes, .. } = &mut r.blch {
         *tx_bytes = size + 512;
@@ -206,12 +217,15 @@ fn fund_and_sign(state: &State, r: &mut joint::Request, funds: u64) {
     if let PosTransaction::TransferV2 { outputs, .. } = &mut r.blch {
         outputs[0].value = funds - (charge.base_fee_sat + charge.priority_fee_sat) as u64;
     }
-    resign(r);
+    resign_with(r, sponsor);
 }
 fn resign(r: &mut joint::Request) {
+    resign_with(r, 0);
+}
+fn resign_with(r: &mut joint::Request, sponsor: usize) {
     let message = r.authorization(&DOMAIN).unwrap();
     if let PosTransaction::TransferV2 { keys, .. } = &mut r.blch {
-        keys[0].signature = sign(0, &message);
+        keys[0].signature = sign(sponsor, &message);
     }
     r.gateway.witnesses.modules = vec![vec![Val::Bytes(sign(1, &message))]];
     if matches!(&r.gateway.operation, Operation::Withdraw(_)) {
@@ -571,7 +585,7 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
 }
 
 #[test]
-fn imported_asset_can_fund_a_pair_but_gateway_cannot_burn_locked_reserves() {
+fn bridge_import_liquidity_independent_trade_and_redemption_survive_restart() {
     use bloch_euvm::ustav::transfer_wire;
     use bloch_pos_committee::transition::native_dex::{base_reserves, paired_custody, Error};
     let (mut state, mut import) = fixture();
@@ -684,4 +698,9 @@ fn imported_asset_can_fund_a_pair_but_gateway_cannot_burn_locked_reserves() {
         Err(Error::LockedReserve)
     ));
     assert_eq!(restored.state_root(), root);
+    complete_market_roundtrip(anchor, state, import, pair, created);
 }
+
+#[path = "support/bridge_market_roundtrip.rs"]
+mod market_roundtrip;
+use market_roundtrip::complete_market_roundtrip;

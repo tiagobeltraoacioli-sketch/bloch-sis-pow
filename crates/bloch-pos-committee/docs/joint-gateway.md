@@ -107,6 +107,43 @@ to individual records or establish a payout authorization policy.
 
 ## Validation and deployment boundary
 
+The complete market rehearsal is now covered by
+`bridge_import_liquidity_independent_trade_and_redemption_survive_restart` in
+`bloch-ustav/tests/joint_gateway_crypto.rs`, with the continuation implemented
+in `tests/support/bridge_market_roundtrip.rs`. It performs these signed steps:
+
+1. Import the attested test asset to the liquidity provider, paying BLCH fees.
+2. Fund sealed BLCH/native reserves and initialize the LP position.
+3. Buy native units with 100,000 base units of BLCH using an independent trader's
+   real funding output and hybrid signatures, without the LP owner's signature.
+4. Burn exactly the native output received by that trader, funding the bridge
+   fee from the trader's swap change and producing one local release record.
+
+The test checks unchanged LP shares, intact post-swap reserves during the burn,
+native supply reduced by the purchased amount, route liabilities and fee escrow.
+The remaining BLCH reserve and change outputs plus escrowed fees must equal
+the provider's and trader's original combined funding, counting each output once.
+Executing all five frames through receiver candidate validation produces the
+same final state as direct execution. Corrupting the final committee signature
+rejects the entire batch, including its earlier import, liquidity and swap.
+
+With `native-dex-host`, each step is separately admitted and committed at a new
+height, then the journal is closed and replayed before proceeding. Pending
+previews never expose a release through checkpoint-bound journal queries. Only
+the committed final burn produces the expected release; replaying any completed
+step after restart rejects without changing the checkpoint. Final roots and fees
+match the single-candidate execution. This also tests that valid operations can
+be confirmed at later heights without altering their intent.
+
+Run the complete workflow locally with:
+
+```sh
+cargo +1.94.1 test --locked -p bloch-ustav --features native-dex-host --test joint_gateway_crypto
+```
+
+Both repository CI configurations already run this target; their existing
+selection now includes the complete workflow without a new optional job.
+
 `bloch-ustav/tests/joint_gateway_crypto.rs` uses real hybrid signatures with
 test-only keys and simulated source events. It covers sponsored import/burn,
 fees, receiver reexecution, snapshot restore, journal reopen, replay with fresh
