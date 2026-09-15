@@ -193,8 +193,12 @@ not a submission's local `tx_hash`. The helper requires both transactions
 to be reported finalized, the old output absent, and the new output present
 with the exact destination and value. It checks the mainnet network domain
 and requires both nodes to remain on the same block/state/finalized checkpoint
-throughout observation. A moving head or differing observation exits nonzero;
-retry rather than treating that as proof of network failure. An already spent
+throughout each observation. Moving or different heads trigger up to three
+attempts by default, one second apart. Set `--attempts 1` for a single
+observation or choose up to five attempts. Exhaustion exits nonzero; this
+is not proof of network failure. Incorrect network, unfinalized transactions,
+malformed responses and output mismatches stop immediately. The successful
+JSON records `attempts_used`; observations from failed attempts are discarded. An already spent
 destination output cannot pass this intentionally narrow check.
 
 The helper prints JSON only on success and never submits transactions or

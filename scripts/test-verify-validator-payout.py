@@ -93,6 +93,33 @@ class VerificationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             m.NoRedirect().redirect_request(None, None, 302, '', {}, 'http://example.com/')
 
+    def test_moving_head_retries_then_records_successful_attempt(self):
+        a = Node(); a.advance = True
+        pauses = []
+        result = m.observe(a, Node(), W, S, D, 1000, pause=pauses.append)
+        self.assertEqual(result['attempts_used'], 2)
+        self.assertEqual(pauses, [1])
+
+    def test_persistent_head_disagreement_stops_at_bound(self):
+        a = Node(); a.head['state_root'] = '99'*32
+        pauses = []
+        with self.assertRaises(m.ObservationMoved):
+            m.observe(a, Node(), W, S, D, 1000, attempts=3, pause=pauses.append)
+        self.assertEqual(pauses, [1, 1])
+        self.assertEqual(a.calls.count('getchaininfo'), 6)
+
+    def test_semantic_failures_and_missing_fields_do_not_retry(self):
+        for failure in ('network', 'amount', 'missing', 'pending'):
+            a = Node(); pauses = []
+            if failure == 'network': a.domain = '00'*32
+            if failure == 'amount': a.outputs[S]['utxo']['value_sat'] = '999'
+            if failure == 'missing': del a.head['state_root']
+            if failure == 'pending': a.status[S] = {'status': 'pending'}
+            with self.subTest(failure=failure), self.assertRaises(ValueError):
+                m.observe(a, Node(), W, S, D, 1000, pause=pauses.append)
+            self.assertEqual(pauses, [])
+
+
     def test_input_bounds_and_nonlocal_endpoints_fail(self):
         for url in ('https://127.0.0.1/', 'http://example.com/', 'http://user@localhost/', 'http://localhost/?token=x'):
             with self.subTest(url=url), self.assertRaises(ValueError): m.endpoint(url)
