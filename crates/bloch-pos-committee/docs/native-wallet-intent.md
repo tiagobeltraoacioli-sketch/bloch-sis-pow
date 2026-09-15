@@ -153,3 +153,37 @@ source state unchanged, and reject corrupted witnesses, impossible slippage,
 stale pool roots and changes of account, bytes, height or parent state. A compile-
 fail doctest prevents reuse after finishing. These checks run in the existing
 native feature jobs; there is no browser export or live consensus activation.
+
+## Attaching the BLCH payer signature
+
+After a separate human approval and a call to the wallet's trusted signer,
+`FundingReview::finish_with_payer_signature` consumes the retained review. It
+rechecks payer, state and height, bounds the returned signature, and verifies it
+against the reviewed joint authorization digest using the host's signature
+verifier. It accepts a signature only, never a replacement packet from a website.
+
+The method clones the retained typed request and replaces exactly the sole BLCH
+payer witness signature. All outputs, asset and route identifiers, price limits,
+fee declarations, native owner signatures and gateway authority witnesses remain
+unchanged. It encodes and decodes the final packet through the canonical transport,
+checks that the authorization digest is unchanged, and recalculates the charge.
+A changed charge or invalid final size declaration is refused without repricing.
+Declared size slack can accommodate different signature lengths only within the
+existing protocol limits. The method does not manufacture placeholders or choose
+fee declarations for the caller.
+
+The resulting packet has its own full-packet hash. Other witnesses may still be
+missing or invalid: this API verifies only the single BLCH payer signature.
+`SubmissionReview` must check the complete signed packet before submission, and
+inclusion still requires normal execution. A failed attachment consumes the review.
+No private keys, browser provider methods, signing grants or broadcasts are added.
+The selected payer and verifier must originate from trusted wallet/host state;
+this method does not independently establish user consent or key possession before
+receiving the signature.
+
+Real-PQ tests reconstruct a swap packet byte-for-byte from its zeroed payer witness,
+then run full submission preflight. They reject wrong-key, wrong-message, damaged,
+empty and oversized signatures, account changes, height regression, expiry and
+changed state. A valid signature that makes the final packet exceed its reviewed
+size declaration is also refused. Sponsored import and withdrawal exercise the same attachment path
+while preserving every issuer, owner and committee witness byte.

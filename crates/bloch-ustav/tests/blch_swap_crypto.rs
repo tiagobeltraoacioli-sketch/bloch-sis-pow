@@ -737,3 +737,116 @@ fn signed_swap_preflight_requires_exact_submission_context() {
         Err(Error::Review(pool_review::Error::StateChanged))
     ));
 }
+
+#[test]
+fn reviewed_payer_signature_attachment_preserves_every_other_packet_byte() {
+    use bloch_pos_committee::transition::native_dex::{
+        pool_review::FundingReview, pool_submission::SubmissionReview,
+    };
+    let (state, pool, reserve, funding) = initialized();
+    let signed = swap_request(&state, pool, reserve, ([9; 32], 0), Some(funding));
+    let expected = signed.canonical_bytes(&DOMAIN).unwrap();
+    let mut pending = signed.clone();
+    let PosTransaction::TransferV2 { keys, .. } = &mut pending.blch else {
+        unreachable!()
+    };
+    let signature = keys[0].signature.clone();
+    keys[0].signature.fill(0);
+    let bytes = pending.canonical_bytes(&DOMAIN).unwrap();
+    let payer = &identities()[2].0;
+    let before = state.state_root();
+    let review = FundingReview::prepare(&state, &bytes, payer, 4).unwrap();
+    let original_hash = review.intent().packet_hash();
+    let result = review
+        .finish_with_payer_signature(&state, payer, 4, &signature, &BaseVerifier)
+        .unwrap();
+    assert_eq!(result.canonical_bytes(), expected);
+    assert_ne!(result.packet_hash(), original_hash);
+    let preflight = SubmissionReview::prepare(
+        &state,
+        result.canonical_bytes(),
+        payer,
+        4,
+        &BaseVerifier,
+        &BlochVerifier,
+    )
+    .unwrap();
+    assert_ne!(preflight.predicted_root(), before);
+    assert_eq!(state.state_root(), before);
+}
+
+#[test]
+fn reviewed_payer_signature_attachment_refuses_untrusted_signatures_and_context() {
+    use bloch_pos_committee::transition::native_dex::pool_review::{Error, FundingReview};
+    let (mut state, pool, reserve, funding) = initialized();
+    let signed = swap_request(&state, pool, reserve, ([9; 32], 0), Some(funding));
+    let bytes = signed.canonical_bytes(&DOMAIN).unwrap();
+    let payer = &identities()[2].0;
+    let PosTransaction::TransferV2 { keys, .. } = &signed.blch else {
+        unreachable!()
+    };
+    let valid = &keys[0].signature;
+    let prepare = || FundingReview::prepare(&state, &bytes, payer, 4).unwrap();
+    let mut invalid = valid.clone();
+    invalid[crypto::SUITE_HEADER_LEN] ^= 1;
+    for sig in [
+        vec![],
+        vec![0; 8193],
+        invalid,
+        signature(&[0; 32], &identities()[2].1),
+        signature(&signed.authorization(&DOMAIN).unwrap(), &identities()[1].1),
+    ] {
+        assert!(matches!(
+            prepare().finish_with_payer_signature(&state, payer, 4, &sig, &BaseVerifier),
+            Err(Error::InvalidSignature)
+        ));
+    }
+    assert!(matches!(
+        prepare().finish_with_payer_signature(&state, &identities()[1].0, 4, valid, &BaseVerifier),
+        Err(Error::AccountChanged)
+    ));
+    assert!(matches!(
+        prepare().finish_with_payer_signature(&state, payer, 3, valid, &BaseVerifier),
+        Err(Error::HeightRegressed)
+    ));
+    assert!(matches!(
+        prepare().finish_with_payer_signature(&state, payer, u64::MAX, valid, &BaseVerifier),
+        Err(Error::Expired)
+    ));
+    let outstanding = prepare();
+    state
+        .execute_blch_swap(&signed, 4, &BaseVerifier, &BlochVerifier)
+        .unwrap();
+    assert!(matches!(
+        outstanding.finish_with_payer_signature(&state, payer, 4, valid, &BaseVerifier),
+        Err(Error::StateChanged)
+    ));
+}
+
+#[test]
+fn payer_attachment_refuses_final_packet_larger_than_reviewed_declaration() {
+    use bloch_pos_committee::transition::native_dex::pool_review::{Error, FundingReview};
+    let (state, pool, reserve, funding) = initialized();
+    let mut request = swap_request(&state, pool, reserve, ([9; 32], 0), Some(funding));
+    let full_length = request.canonical_bytes(&DOMAIN).unwrap().len();
+    let declared = full_length as u64 - 256;
+    let PosTransaction::TransferV2 { keys, tx_bytes, .. } = &mut request.blch else {
+        unreachable!()
+    };
+    *tx_bytes = declared;
+    let placeholder_length = keys[0].signature.len() - 512;
+    keys[0].signature = vec![0; placeholder_length];
+    let bytes = request.canonical_bytes(&DOMAIN).unwrap();
+    let payer = &identities()[2].0;
+    let before = state.state_root();
+    let review = FundingReview::prepare(&state, &bytes, payer, 4).unwrap();
+    let message = review.intent().authorization();
+    let sig = signature(&message, &identities()[2].1);
+    assert!(BaseVerifier.verify_with_key(payer, &message, &sig));
+    assert!(bytes.len() + sig.len() - placeholder_length > declared as usize);
+    assert!(matches!(
+        review.finish_with_payer_signature(&state, payer, 4, &sig, &BaseVerifier),
+        Err(Error::Wire(_))
+    ));
+    assert_eq!(state.state_root(), before);
+}

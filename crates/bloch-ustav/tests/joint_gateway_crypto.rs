@@ -838,3 +838,59 @@ fn signed_gateway_preflight_predicts_import_and_withdraw_and_rejects_forgery() {
         assert_eq!(state.state_root(), before);
     }
 }
+
+#[test]
+fn sponsor_signature_attachment_preserves_gateway_authorities_and_executes() {
+    use bloch_pos_committee::transition::native_dex::{
+        pool_review::FundingReview, pool_submission::SubmissionReview,
+    };
+    fn attach(state: &State, request: &joint::Request, height: u64) -> Vec<u8> {
+        let original = request.canonical_bytes(&DOMAIN).unwrap();
+        let mut pending = request.clone();
+        let PosTransaction::TransferV2 {
+            keys: witnesses, ..
+        } = &mut pending.blch
+        else {
+            unreachable!()
+        };
+        let signature = witnesses[0].signature.clone();
+        witnesses[0].signature.fill(0);
+        let bytes = pending.canonical_bytes(&DOMAIN).unwrap();
+        let review = FundingReview::prepare(state, &bytes, &keys()[0].0, height).unwrap();
+        let attached = review
+            .finish_with_payer_signature(state, &keys()[0].0, height, &signature, &BaseVerifier)
+            .unwrap();
+        assert_eq!(attached.canonical_bytes(), original);
+        original
+    }
+    let (mut state, import) = fixture();
+    let bytes = attach(&state, &import, 4);
+    SubmissionReview::prepare(
+        &state,
+        &bytes,
+        &keys()[0].0,
+        4,
+        &BaseVerifier,
+        &BlochVerifier,
+    )
+    .unwrap();
+    let imported = state
+        .execute_gateway(&import, 4, &BaseVerifier, &BlochVerifier)
+        .unwrap();
+    let burn = withdrawal(&state, &import, &imported);
+    let bytes = attach(&state, &burn, 5);
+    let checked = SubmissionReview::prepare(
+        &state,
+        &bytes,
+        &keys()[0].0,
+        5,
+        &BaseVerifier,
+        &BlochVerifier,
+    )
+    .unwrap();
+    let predicted = checked.predicted_root();
+    state
+        .execute_gateway(&burn, 5, &BaseVerifier, &BlochVerifier)
+        .unwrap();
+    assert_eq!(state.state_root(), predicted);
+}

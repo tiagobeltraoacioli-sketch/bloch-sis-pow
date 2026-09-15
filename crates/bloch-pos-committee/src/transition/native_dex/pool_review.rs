@@ -2,7 +2,7 @@
 use super::{
     base_reserves::RESERVE_KEY_INDEX, pool_intent::DecodedIntent, pool_wire, PosTransaction, State,
 };
-use crate::fee_market::TxCharge;
+use crate::{fee_market::TxCharge, SignatureVerifier};
 use bloch_euvm::ustav::gateway::wire::Operation;
 use sha3::{Digest, Sha3_256};
 use std::collections::BTreeSet;
@@ -18,6 +18,8 @@ pub enum Error {
     PacketChanged,
     StateChanged,
     HeightRegressed,
+    InvalidSignature,
+    FeeChanged,
 }
 
 /// Exact packet, selected payer, network fee and local state reviewed together.
@@ -214,17 +216,61 @@ impl FundingReview {
         self.wallet_outputs_sats
     }
 
-    /// Recheck local context immediately before the caller's next step.
-    /// Consumes this review even on refusal. Success is not user consent, a
-    /// signature, a state lock, or a promise of future inclusion. The caller must
-    /// still validate context at signing/submission and use the real executor.
-    pub fn finish(
+    /// Attach only the selected BLCH payer's signature to the retained request.
+    /// The caller signs `intent().authorization()` with its own trusted signer
+    /// after human approval. This method neither accesses keys nor grants consent.
+    /// Other witnesses are preserved and still require full submission preflight.
+    /// A changed final network charge requires a new review; no fee is repriced.
+    pub fn finish_with_payer_signature(
         self,
         state: &State,
         payer: &[u8],
         height: u64,
-        bytes: &[u8],
+        signature: &[u8],
+        verifier: &dyn SignatureVerifier,
     ) -> Result<DecodedIntent, Error> {
+        self.check_context(state, payer, height, self.intent.canonical_bytes())?;
+        if signature.is_empty()
+            || signature.len() > super::MAX_BASE_WITNESS_BYTES
+            || !verifier.verify_with_key(payer, &self.intent.authorization(), signature)
+        {
+            return Err(Error::InvalidSignature);
+        }
+        let mut request = self.intent.request().clone();
+        let base = match &mut request {
+            pool_wire::Request::Gateway(r) => &mut r.blch,
+            pool_wire::Request::CreatePair(r) => &mut r.blch,
+            pool_wire::Request::Initialize(r) => &mut r.blch,
+            pool_wire::Request::Add(r) => &mut r.blch,
+            pool_wire::Request::Swap(r) => &mut r.blch,
+            pool_wire::Request::Remove(r) => &mut r.blch,
+            pool_wire::Request::ClosePair(r) => &mut r.blch,
+        };
+        let PosTransaction::TransferV2 { keys, .. } = base else {
+            return Err(Error::UnsupportedPayer);
+        };
+        // Preparation established exactly one matching payer key. Replacing
+        // only this signature leaves all transaction and other witness fields.
+        keys[0].signature = signature.to_vec();
+        let bytes = pool_wire::encode(&request, &self.intent.domain()).map_err(Error::Wire)?;
+        let signed = DecodedIntent::decode(&bytes, &self.intent.domain()).map_err(Error::Wire)?;
+        if signed.authorization() != self.intent.authorization() {
+            return Err(Error::PacketChanged);
+        }
+        let charge = pool_wire::quote_request(state, signed.request()).map_err(Error::Wire)?;
+        if charge != self.charge {
+            return Err(Error::FeeChanged);
+        }
+        Ok(signed)
+    }
+
+    fn check_context(
+        &self,
+        state: &State,
+        payer: &[u8],
+        height: u64,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
         if payer != self.payer.as_ref() {
             return Err(Error::AccountChanged);
         }
@@ -240,6 +286,21 @@ impl FundingReview {
         if state.domain != self.intent.domain() || state.state_root() != self.root {
             return Err(Error::StateChanged);
         }
+        Ok(())
+    }
+
+    /// Recheck local context immediately before the caller's next step.
+    /// Consumes this review even on refusal. Success is not user consent, a
+    /// signature, a state lock, or a promise of future inclusion. The caller must
+    /// still validate context at signing/submission and use the real executor.
+    pub fn finish(
+        self,
+        state: &State,
+        payer: &[u8],
+        height: u64,
+        bytes: &[u8],
+    ) -> Result<DecodedIntent, Error> {
+        self.check_context(state, payer, height, bytes)?;
         Ok(self.intent)
     }
 }
