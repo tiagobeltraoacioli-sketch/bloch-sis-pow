@@ -5,6 +5,7 @@ import datetime
 import json
 import hashlib
 import pathlib
+import os
 import subprocess
 import tempfile
 import re
@@ -155,6 +156,25 @@ def inspect_signed(binary, tx_path, common, withdrawal, spend, destination, amou
             'inspection': fields, 'verifier': 'operator-supplied trusted bloch-pos validator-payout inspect'}
 
 
+def save_report(path, result):
+    """Publish complete JSON without replacing any existing file or symlink."""
+    payload = (json.dumps(result, indent=2, allow_nan=False) + '\n').encode()
+    target = pathlib.Path(path)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=target.parent, prefix='.payout-evidence-', delete=False) as stream:
+            temporary = pathlib.Path(stream.name)
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        # A same-directory hard link publishes complete bytes atomically and
+        # refuses existing targets, including dangling symlinks.
+        os.link(temporary, target)
+    finally:
+        if temporary is not None:
+            temporary.unlink()
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--rpc-a', required=True, type=endpoint)
@@ -167,6 +187,7 @@ def main():
                    help='Retry moving or differing heads only (default: 3, one second apart).')
     p.add_argument('--signed-tx', type=pathlib.Path, help='Optional signed public transaction to verify with the trusted offline CLI before RPC access.')
     p.add_argument('--payout-bin', type=pathlib.Path)
+    p.add_argument('--out', type=pathlib.Path, help='Save complete JSON to a new file; existing paths are refused.')
     for option in ('validator', 'input-value', 'withdrawal-script', 'base-fee', 'epoch', 'max-fee'):
         p.add_argument('--' + option)
     a = p.parse_args()
@@ -182,7 +203,12 @@ def main():
     else:
         require(all(v is None for v in values), 'Inspection options require --signed-tx.')
     result = observe(RPC(a.rpc_a), RPC(a.rpc_b), a.withdrawal_txid, a.spend_txid, a.destination, a.value_sat, a.attempts)
+    result['schema_version'] = 1
+    result['approved_intent'] = {'withdrawal_txid': a.withdrawal_txid, 'spend_txid': a.spend_txid,
+                                 'destination': a.destination, 'value_sat': str(a.value_sat)}
     result['signed_transaction_inspection'] = inspection
+    if a.out is not None:
+        save_report(a.out, result)
     print(json.dumps(result, indent=2))
 
 

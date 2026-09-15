@@ -260,3 +260,21 @@ This test creates and deletes disposable sealed keys in a temporary directory.
 It accepts a real signed payout and rejects an unsigned draft, substituted
 transaction ID, destination or amount, and malformed wire bytes. It uses no
 RPC and provides no mainnet settlement evidence.
+
+
+## Retain settlement evidence
+
+Add `--out payout-evidence.json` to save a successful observation to a new
+file. The helper writes complete JSON before publishing the file and refuses
+existing paths, including symlinks. The parent directory must already exist
+and its filesystem must support hard links. The file uses owner-only access
+(mode 0600). JSON is also printed to standard output after successful saving.
+A failed verification never creates a report; a save failure exits nonzero.
+
+The report includes `schema_version: 1`, the explicitly approved transaction
+IDs, destination and output value, both node observations, and the optional
+signed transaction inspection. Amounts are decimal strings. Retain the signed
+public transaction and its signing observations alongside this report. Keep
+node/operator provenance in your own records; different tunnel URLs do not
+establish independent operators. The report is an observation record, not a
+certificate of cryptographic inclusion or complete mainnet qualification.

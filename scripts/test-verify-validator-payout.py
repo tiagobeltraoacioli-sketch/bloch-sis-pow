@@ -157,6 +157,32 @@ class VerificationTests(unittest.TestCase):
                 runner.assert_not_called()
 
 
+    def test_report_is_complete_private_and_never_overwrites(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = pathlib.Path(directory) / 'evidence.json'
+            m.save_report(target, {'status': 'observed', 'value_sat': '1000'})
+            self.assertEqual(json.loads(target.read_text()), {'status': 'observed', 'value_sat': '1000'})
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+            before = target.read_bytes()
+            with self.assertRaises(FileExistsError): m.save_report(target, {'status': 'replacement'})
+            self.assertEqual(target.read_bytes(), before)
+            link = pathlib.Path(directory) / 'link.json'
+            link.symlink_to(pathlib.Path(directory) / 'missing.json')
+            with self.assertRaises(FileExistsError): m.save_report(link, {})
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(list(pathlib.Path(directory).glob('.payout-evidence-*')), [])
+
+    def test_report_serialization_and_publication_fail_without_partial_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = pathlib.Path(directory) / 'evidence.json'
+            with self.assertRaises(ValueError): m.save_report(target, {'invalid': float('nan')})
+            self.assertFalse(target.exists())
+            with mock.patch.object(m.os, 'link', side_effect=OSError('publication failed')):
+                with self.assertRaises(OSError): m.save_report(target, {'status': 'observed'})
+            self.assertFalse(target.exists())
+            self.assertEqual(list(pathlib.Path(directory).iterdir()), [])
+
+
     def test_input_bounds_and_nonlocal_endpoints_fail(self):
         for url in ('https://127.0.0.1/', 'http://example.com/', 'http://user@localhost/', 'http://localhost/?token=x'):
             with self.subTest(url=url), self.assertRaises(ValueError): m.endpoint(url)
