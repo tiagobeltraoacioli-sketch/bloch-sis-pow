@@ -38,7 +38,10 @@ dispatchers do not activate the network. A local
 [atomic candidate batch API](../../crates/bloch-pos-committee/docs/pool-batches.md)
 now binds the parent state and host height, bounds aggregate resources and
 rolls back the full candidate on failure. Live block transition, shared budgets
-and fee settlement remain unimplemented for these operations.
+and fee settlement remain unimplemented for these operations. A bounded
+[candidate exchange layer](../../crates/bloch-pos-committee/docs/pool-candidates.md)
+now reexecutes with receiver-owned verifiers and rejects an incorrect advertised
+post-state before installing the candidate.
 
 ## Actual ownership and integration boundary
 

@@ -43,7 +43,10 @@ release plan is exposed. Neither dispatcher registers a live RPC or block type.
 [Atomic pool batches](../../crates/bloch-pos-committee/docs/pool-batches.md)
 now simulate or apply ordered frames against a trusted parent, cap aggregate
 bytes/gas before cryptography and discard the full candidate on any failure.
-This still does not advance the live chain or settle block rewards.
+The [candidate exchange layer](../../crates/bloch-pos-committee/docs/pool-candidates.md)
+now verifies bounded framing and independently compares the advertised final
+state before installation. This still does not advance the live chain or settle
+block rewards.
 
 ## Atomic authorization and planning
 

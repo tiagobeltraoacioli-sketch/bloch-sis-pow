@@ -6,7 +6,7 @@ use super::super::{
 };
 use super::*;
 
-fn sequence() -> (State, Vec<Vec<u8>>, State) {
+pub(in crate::transition::native_dex) fn sequence() -> (State, Vec<Vec<u8>>, State) {
     let (state, first) = initial_liquidity::tests::swap_fixture();
     let mut direct = state.clone();
     let receipt = direct
@@ -30,7 +30,7 @@ fn sequence() -> (State, Vec<Vec<u8>>, State) {
     (state, frames, direct)
 }
 
-struct NoCrypto;
+pub(in crate::transition::native_dex) struct NoCrypto;
 impl SignatureVerifier for NoCrypto {
     fn verify_with_key(&self, _: &[u8], _: &[u8; 32], _: &[u8]) -> bool {
         panic!("preflight must precede crypto")

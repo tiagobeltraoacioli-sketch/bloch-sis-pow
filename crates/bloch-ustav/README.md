@@ -35,6 +35,9 @@ real PQ tests comparing encoded and direct execution. Node/RPC admission remains
 separate. [Atomic candidate batches](../bloch-pos-committee/docs/pool-batches.md)
 now validate ordered dependent operations against one parent and roll back all
 changes on failure, including a forged later provider redemption in PQ tests.
+[Candidate exchange](../bloch-pos-committee/docs/pool-candidates.md) additionally
+checks advertised final roots through independent receiver execution, including
+real PQ tests for false-result rollback.
 
 [Color-Changing Chameleon v1](../bloch-euvm/docs/chameleon-v1.md) adds sealed
 PQ-native escrow, an explicit Kirpich ERC-20 compatibility profile and an

@@ -230,7 +230,7 @@ fn resign(request: &mut Request) {
 use bloch_euvm::ustav::OutPoint;
 use bloch_pos_committee::transition::native_dex::base_reserves::RESERVE_KEY_INDEX;
 use bloch_pos_committee::transition::native_dex::{
-    add_liquidity, initial_liquidity, pool_batch, pool_wire, remove_liquidity,
+    add_liquidity, initial_liquidity, pool_batch, pool_candidate, pool_wire, remove_liquidity,
 };
 
 fn initialized() -> (State, [u8; 32], [u8; 32], OutPoint) {
@@ -772,6 +772,33 @@ fn independent_provider_adds_balanced_and_unbalanced_then_redeems_only_own_lp() 
     ));
     assert_eq!(batch_state.state_root(), parent);
     assert_eq!(batch_state.fee_escrow(), fees_before);
+    let candidate =
+        pool_candidate::build(&batch_state, 4, &refs, &BaseVerifier, &BlochVerifier).unwrap();
+    let mut recipient = batch_state.clone();
+    let mut false_result = candidate.clone();
+    false_result[82] ^= 1;
+    assert!(matches!(
+        pool_candidate::apply(
+            &mut recipient,
+            &false_result,
+            4,
+            &BaseVerifier,
+            &BlochVerifier
+        ),
+        Err(pool_candidate::Error::Batch(
+            pool_batch::Error::PostStateMismatch
+        ))
+    ));
+    assert_eq!(recipient.state_root(), parent);
+    assert_eq!(recipient.fee_escrow(), fees_before);
+    let accepted =
+        pool_candidate::apply(&mut recipient, &candidate, 4, &BaseVerifier, &BlochVerifier)
+            .unwrap();
+    assert_eq!(accepted.post_root, state.state_root());
+    assert_eq!(accepted.commitment, preview.commitment);
+    assert_eq!(accepted.charge, preview.charge);
+    assert_eq!(recipient.base(), state.base());
+    assert_eq!(recipient.native().snapshot(), state.native().snapshot());
     let applied = pool_batch::apply(
         &mut batch_state,
         &parent,

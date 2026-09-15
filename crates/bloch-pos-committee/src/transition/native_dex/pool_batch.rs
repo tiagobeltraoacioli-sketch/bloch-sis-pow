@@ -23,6 +23,8 @@ pub enum Error {
         source: pool_wire::Error,
     },
     AccountingMismatch,
+    CommitmentMismatch,
+    PostStateMismatch,
 }
 
 /// A result is information, never a capability to install a previewed state.
@@ -94,12 +96,6 @@ fn stage(
     if state.state_root() != *parent_root {
         return Err(Error::WrongParent);
     }
-    let mut commitment = Sha3_256::new();
-    commitment.update(b"BLOCH-POOL-BATCH-v1");
-    commitment.update(state.domain);
-    commitment.update(parent_root);
-    commitment.update(height.to_le_bytes());
-    commitment.update((frames.len() as u64).to_le_bytes());
     let mut charge = fee_market::TxCharge {
         gas: 0,
         tx_bytes: 0,
@@ -115,8 +111,6 @@ fn stage(
         let fee = pool_wire::quote_request(state, &request)
             .map_err(|source| Error::Operation { index, source })?;
         add_charge(&mut charge, &fee)?;
-        commitment.update((frame.len() as u64).to_le_bytes());
-        commitment.update(frame);
         requests.push((request, fee));
     }
     // All declared bytes/gas and structural limits passed before cryptography.
@@ -148,7 +142,7 @@ fn stage(
     let outcome = Outcome {
         parent_root: *parent_root,
         post_root: staged.state_root(),
-        commitment: commitment.finalize().into(),
+        commitment: commitment(&state.domain, parent_root, height, frames),
         height,
         wire_bytes,
         charge,
@@ -200,5 +194,57 @@ pub fn apply(
     Ok(outcome)
 }
 
+/// Exact candidate identity; no witness or frame ordering is omitted.
+pub(super) fn commitment(
+    domain: &[u8; 32],
+    parent: &[u8; 32],
+    height: u64,
+    frames: &[&[u8]],
+) -> [u8; 32] {
+    let mut hash = Sha3_256::new();
+    hash.update(b"BLOCH-POOL-BATCH-v1");
+    hash.update(domain);
+    hash.update(parent);
+    hash.update(height.to_le_bytes());
+    hash.update((frames.len() as u64).to_le_bytes());
+    for frame in frames {
+        hash.update((frame.len() as u64).to_le_bytes());
+        hash.update(frame);
+    }
+    hash.finalize().into()
+}
+
+pub(super) struct Expected {
+    pub parent: [u8; 32],
+    pub post: [u8; 32],
+    pub commitment: [u8; 32],
+    pub height: u64,
+}
+/// Untrusted advertised roots are compared before installation, never after it.
+pub(super) fn apply_expected(
+    state: &mut State,
+    expected: &Expected,
+    frames: &[&[u8]],
+    base_verifier: &dyn SignatureVerifier,
+    native_verifier: &dyn Verifier,
+) -> Result<Outcome, Error> {
+    let (staged, outcome) = stage(
+        state,
+        &expected.parent,
+        expected.height,
+        frames,
+        base_verifier,
+        native_verifier,
+    )?;
+    if outcome.commitment != expected.commitment {
+        return Err(Error::CommitmentMismatch);
+    }
+    if outcome.post_root != expected.post {
+        return Err(Error::PostStateMismatch);
+    }
+    *state = staged;
+    Ok(outcome)
+}
+
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

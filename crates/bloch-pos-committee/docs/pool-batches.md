@@ -46,6 +46,10 @@ root, little-endian height and operation count, then each little-endian frame
 length and its exact bytes, including witnesses, in execution order. It is a
 rehearsal identifier, not a consensus block ID, signature or finality proof.
 
+[`pool_candidate`](pool-candidates.md) adds bounded candidate exchange and
+independent comparison of the advertised post-state root before installation.
+The receiver always reexecutes with its own verifiers.
+
 ## Validation and remaining node work
 
 Tests cover dependent swaps, nonmutating simulation, stale-parent rejection,
