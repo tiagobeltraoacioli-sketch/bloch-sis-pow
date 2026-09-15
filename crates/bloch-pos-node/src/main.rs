@@ -57,6 +57,7 @@ mod store;
 mod ws_boot;
 mod validator_deposit;
 mod validator_lifecycle;
+mod validator_payout;
 mod ws_tool;
 
 use std::path::PathBuf;
@@ -151,6 +152,12 @@ fn main() {
                 exit(2);
             }
         }
+        Some("validator-payout") => {
+            if let Err(error) = validator_payout::run(&args[1..]) {
+                eprintln!("validator-payout: {error}");
+                exit(2);
+            }
+        }
         Some("run") => run_cmd(&args[1..]),
         Some(
             cmd @ ("ws-keygen" | "ws-signer-set" | "ws-checkpoint" | "ws-sign" | "ws-envelope"
@@ -211,8 +218,9 @@ fn print_help() {
                secret. Also reports whether the data dir lock is free.\n\
            bloch-pos validator-deposit --help
            bloch-pos validator-lifecycle --help
+           bloch-pos validator-payout --help
 \
-               Prepare, inspect and separately sign a funded PQ deposit offline.
+               Prepare, inspect and sign funded deposits or withdrawal payouts offline.
 \
                Use keygen --index auto for a joining devnet validator.
 \
