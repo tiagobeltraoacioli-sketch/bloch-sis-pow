@@ -17,6 +17,7 @@ pub mod initial_liquidity;
 pub mod paired_custody;
 pub mod pool_batch;
 pub mod pool_candidate;
+pub mod pool_intent;
 pub mod pool_wire;
 pub mod remove_liquidity;
 pub mod swap;

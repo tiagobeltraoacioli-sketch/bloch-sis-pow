@@ -131,6 +131,15 @@ A whole-state clone retains both sides; component extraction is not supported.
 This remains a typed local snapshot; production persistence/network codecs are
 not added.
 
+## Wallet review decoding
+
+The optional [immutable intent decoder](../../crates/bloch-pos-committee/docs/native-wallet-intent.md)
+retains the exact canonical pool/gateway packet, exposes its full typed request,
+and obtains the signing digest from the existing operation executor. It separates
+whole-packet identity (including witnesses) from authorization intent. This is
+read-only Rust integration groundwork; it neither approves nor signs operations,
+and does not validate funds, state freshness, deployment or bridge finality.
+
 ## Validation and remaining work
 
 Run:

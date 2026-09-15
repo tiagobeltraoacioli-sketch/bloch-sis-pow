@@ -223,7 +223,17 @@ fn resign(r: &mut joint::Request) {
     resign_with(r, 0);
 }
 fn resign_with(r: &mut joint::Request, sponsor: usize) {
-    let message = r.authorization(&DOMAIN).unwrap();
+    use bloch_pos_committee::transition::native_dex::pool_intent;
+    let bytes = pool_wire::encode(&pool_wire::Request::Gateway(r.clone()), &DOMAIN).unwrap();
+    let intent = pool_intent::DecodedIntent::decode(&bytes, &DOMAIN).unwrap();
+    let expected = match &r.gateway.operation {
+        Operation::Import(_) => pool_intent::Operation::Import,
+        Operation::Withdraw(_) => pool_intent::Operation::Withdraw,
+    };
+    assert_eq!(intent.operation(), expected);
+    assert_eq!(pool_wire::encode(intent.request(), &DOMAIN).unwrap(), bytes);
+    let message = intent.authorization();
+    assert_eq!(message, r.authorization(&DOMAIN).unwrap());
     if let PosTransaction::TransferV2 { keys, .. } = &mut r.blch {
         keys[0].signature = sign(sponsor, &message);
     }

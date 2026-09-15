@@ -206,3 +206,86 @@ fn unsigned_intents_can_decode_but_cannot_execute() {
         assert_eq!(state.state_root(), root);
     }
 }
+
+#[test]
+fn decoded_intent_preserves_all_lifecycle_fields_and_executor_authorizations() {
+    use super::super::pool_intent::{DecodedIntent, Operation};
+    let operations = [
+        Operation::CreatePair,
+        Operation::Initialize,
+        Operation::Add,
+        Operation::Swap,
+        Operation::Remove,
+        Operation::ClosePair,
+    ];
+    for ((_, request), operation) in fixtures().into_iter().zip(operations) {
+        let mut bytes = encode(&request, &DOMAIN).unwrap();
+        let intent = DecodedIntent::decode(&bytes, &DOMAIN).unwrap();
+        assert_eq!(intent.operation(), operation);
+        assert_eq!(intent.domain(), DOMAIN);
+        assert_eq!(encode(intent.request(), &DOMAIN).unwrap(), bytes);
+        let hash = match request {
+            Request::Gateway(r) => r.authorization(&DOMAIN),
+            Request::CreatePair(r) => r.authorization(&DOMAIN),
+            Request::Initialize(r) => r.authorization(&DOMAIN),
+            Request::Add(r) => r.authorization(&DOMAIN),
+            Request::Swap(r) => r.authorization(&DOMAIN),
+            Request::Remove(r) => r.authorization(&DOMAIN),
+            Request::ClosePair(r) => r.authorization(&DOMAIN),
+        }
+        .unwrap();
+        assert_eq!(intent.authorization(), hash);
+        assert!(intent.matches_packet(&bytes));
+        let retained = bytes.clone();
+        bytes[0] ^= 1;
+        assert!(!intent.matches_packet(&bytes));
+        assert_eq!(intent.canonical_bytes(), retained);
+        assert_eq!(
+            intent.packet_hash(),
+            DecodedIntent::decode(&retained, &DOMAIN)
+                .unwrap()
+                .packet_hash()
+        );
+    }
+}
+
+#[test]
+fn decoded_intent_refuses_wrong_domain_truncation_trailing_and_oversized_packets() {
+    use super::super::pool_intent::DecodedIntent;
+    for (_, request) in fixtures() {
+        let bytes = encode(&request, &DOMAIN).unwrap();
+        assert!(DecodedIntent::decode(&bytes, &[0; 32]).is_err());
+        assert!(DecodedIntent::decode(&bytes, &[99; 32]).is_err());
+        for end in 0..bytes.len() {
+            assert!(DecodedIntent::decode(&bytes[..end], &DOMAIN).is_err());
+        }
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(DecodedIntent::decode(&trailing, &DOMAIN).is_err());
+    }
+    assert!(DecodedIntent::decode(&vec![0; MAX_ENVELOPE_BYTES as usize + 1], &DOMAIN).is_err());
+}
+
+#[test]
+fn decoded_intent_distinguishes_signed_intent_from_witness_packet_identity() {
+    use super::super::pool_intent::DecodedIntent;
+    let (_, request) = initial_liquidity::tests::swap_fixture();
+    let original = encode(&Request::Swap(request.clone()), &DOMAIN).unwrap();
+    let intent = DecodedIntent::decode(&original, &DOMAIN).unwrap();
+    let mut changed = request.clone();
+    if let PosTransaction::TransferV2 { keys, .. } = &mut changed.blch {
+        keys[0].signature[0] ^= 1;
+    }
+    let altered = encode(&Request::Swap(changed), &DOMAIN).unwrap();
+    let forged = DecodedIntent::decode(&altered, &DOMAIN).unwrap();
+    // Decode accepts a structurally valid forged witness, never blesses it.
+    assert_eq!(intent.authorization(), forged.authorization());
+    assert_ne!(intent.packet_hash(), forged.packet_hash());
+    assert!(!intent.matches_packet(&altered));
+    let mut changed = request;
+    changed.quote.minimum_out += 1;
+    let altered = encode(&Request::Swap(changed), &DOMAIN).unwrap();
+    let different_trade = DecodedIntent::decode(&altered, &DOMAIN).unwrap();
+    assert_ne!(intent.authorization(), different_trade.authorization());
+    assert_ne!(intent.packet_hash(), different_trade.packet_hash());
+}

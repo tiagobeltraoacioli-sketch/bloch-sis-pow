@@ -430,7 +430,13 @@ fn swap_request(
     request
 }
 fn sign_swap(request: &mut swap::Request) {
-    let hash = request.authorization(&DOMAIN).unwrap();
+    // Exercise the future wallet's immutable decoding path with real PQ signing.
+    use bloch_pos_committee::transition::native_dex::{pool_intent, pool_wire};
+    let bytes = pool_wire::encode(&pool_wire::Request::Swap(request.clone()), &DOMAIN).unwrap();
+    let intent = pool_intent::DecodedIntent::decode(&bytes, &DOMAIN).unwrap();
+    assert_eq!(intent.operation(), pool_intent::Operation::Swap);
+    let hash = intent.authorization();
+    assert_eq!(hash, request.authorization(&DOMAIN).unwrap());
     if let PosTransaction::TransferV2 { keys, .. } = &mut request.blch {
         keys[0].signature = signature(&hash, &identities()[2].1);
     }
