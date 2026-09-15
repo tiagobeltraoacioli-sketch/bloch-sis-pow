@@ -129,10 +129,60 @@ pub(super) fn check(anchor: &State, frames: &[&[u8]], final_state: &State) {
     assert_eq!(journal.state().fee_escrow(), anchor.fee_escrow());
     assert_eq!(fs::read(&path).unwrap(), initial_file);
 
+    // Editing a local prefix must preserve dependency order and exact accounting.
+    let mut editable = PendingBatch::new(&journal, 4).unwrap();
+    for frame in frames {
+        editable.admit(&journal, frame, 4).unwrap();
+    }
+    let full_candidate = editable.build(&journal, 4).unwrap();
+    let full_bytes = editable.wire_bytes();
+    assert!(matches!(
+        editable.retain_prefix(&journal, usize::MAX, 4),
+        Err(Error::InvalidPrefix)
+    ));
+    assert_eq!(editable.wire_bytes(), full_bytes);
+    assert_eq!(editable.build(&journal, 4).unwrap(), full_candidate);
+    editable.retain_prefix(&journal, frames.len(), 4).unwrap();
+    assert_eq!(editable.build(&journal, 4).unwrap(), full_candidate);
+    editable.retain_prefix(&journal, 1, 4).unwrap();
+    assert_eq!(editable.wire_bytes(), frames[0].len() as u64);
+    assert_eq!(editable.build(&journal, 4).unwrap(), first_candidate);
+    // The removed redemption cannot skip its removed dependency.
+    assert!(editable.admit(&journal, frames[2], 4).is_err());
+    assert_eq!(editable.len(), 1);
+    for frame in &frames[1..] {
+        editable.admit(&journal, frame, 4).unwrap();
+    }
+    assert_eq!(editable.build(&journal, 4).unwrap(), full_candidate);
+    editable.retain_prefix(&journal, 0, 6).unwrap();
+    assert!(editable.is_empty());
+    assert_eq!(editable.wire_bytes(), 0);
+    assert_eq!(editable.height(), 6);
+    assert!(!editable.is_closed());
+    assert!(matches!(
+        editable.retain_prefix(&journal, 0, 5),
+        Err(Error::HeightRegression)
+    ));
+    assert!(editable.build(&journal, 6).is_err());
+    editable.admit(&journal, frames[0], 6).unwrap();
+    assert!(matches!(
+        editable.retain_prefix(&journal, 2, 7),
+        Err(Error::InvalidPrefix)
+    ));
+    assert_eq!(editable.height(), 7);
+    assert_eq!(editable.len(), 1);
+    assert_eq!(journal.checkpoint(), parent);
+    assert_eq!(fs::read(&path).unwrap(), initial_file);
+
     // Neither an equal-height foreign root nor an equal-root foreign height fits.
     let other_path = directory.join("other.log");
     let other = Journal::create(&other_path, final_state.clone(), 3).unwrap();
     assert!(matches!(pending.build(&other, 4), Err(Error::StaleParent)));
+    assert!(matches!(
+        editable.retain_prefix(&other, 0, 7),
+        Err(Error::StaleParent)
+    ));
+    assert_eq!(editable.len(), 1);
     drop(other);
     fs::remove_file(&other_path).unwrap();
     let other = Journal::create(&other_path, anchor.clone(), 2).unwrap();
@@ -174,6 +224,15 @@ pub(super) fn check(anchor: &State, frames: &[&[u8]], final_state: &State) {
     ));
     assert_eq!(journal.checkpoint(), parent);
     assert_eq!(fs::read(&path).unwrap(), initial_file);
+    timed_out.retain_prefix(&journal, 0, 101).unwrap();
+    assert!(timed_out.is_empty());
+    assert_eq!(timed_out.wire_bytes(), 0);
+    assert!(matches!(
+        timed_out.admit(&journal, frames[0], 4),
+        Err(Error::HeightRegression)
+    ));
+    assert!(timed_out.admit(&journal, frames[0], 101).is_err());
+    assert!(timed_out.is_empty());
     // A malformed operation cannot roll back the last trusted host height either.
     let mut failed_input = PendingBatch::new(&journal, 4).unwrap();
     failed_input.admit(&journal, frames[0], 4).unwrap();
@@ -205,6 +264,15 @@ pub(super) fn check(anchor: &State, frames: &[&[u8]], final_state: &State) {
     assert!(pending.is_empty());
     assert_eq!(pending.wire_bytes(), 0);
     let durable = fs::read(&path).unwrap();
+    assert!(matches!(
+        pending.retain_prefix(&journal, 0, 5),
+        Err(Error::Closed)
+    ));
+    assert!(matches!(
+        competing.retain_prefix(&journal, 0, 5),
+        Err(Error::StaleParent)
+    ));
+    assert_eq!(competing.len(), 1);
     assert!(durable.len() > initial_file.len());
     assert!(matches!(
         pending.commit(&mut journal, 4),

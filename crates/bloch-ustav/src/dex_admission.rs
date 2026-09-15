@@ -13,6 +13,7 @@ pub enum Error {
     HeightRegression,
     Closed,
     Duplicate,
+    InvalidPrefix,
     ResourceLimit,
     LengthMismatch,
     Io(io::Error),
@@ -125,6 +126,25 @@ impl PendingBatch {
         let remaining = pool_batch::MAX_BYTES - self.wire_bytes;
         let frame = read_body(reader, remaining, declared_length)?;
         self.admit(journal, &frame, height)
+    }
+
+    /// Retain an ordered prefix, discarding its entire dependent suffix.
+    /// This is local queue editing, not transaction cancellation or validation.
+    /// Even clearing the queue preserves its parent and monotonic height.
+    pub fn retain_prefix(
+        &mut self,
+        journal: &Journal,
+        keep: usize,
+        height: u64,
+    ) -> Result<(), Error> {
+        self.check_context(journal, height)?;
+        if keep > self.frames.len() {
+            return Err(Error::InvalidPrefix);
+        }
+        self.frames.truncate(keep);
+        // The retained subset is already bounded by MAX_BYTES.
+        self.wire_bytes = self.frames.iter().map(|frame| frame.len() as u64).sum();
+        Ok(())
     }
 
     /// Build at the current trusted host height without changing pending frames,

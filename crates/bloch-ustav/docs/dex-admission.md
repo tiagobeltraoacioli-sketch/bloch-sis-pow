@@ -35,6 +35,31 @@ the same parent. The host must create a new batch and revalidate resubmitted
 operations; the API does not silently rebase them or trust an earlier preview.
 A successfully committed batch cannot be reused.
 
+## Recovering a pending queue
+
+`retain_prefix(&journal, keep, current_height)` lets the local host discard a
+suffix without rebuilding the retained signed frames. For example, retaining
+one frame from a three-frame queue removes frames two and three together.
+Later operations may consume outputs from earlier ones, so this API never
+deletes a middle frame while retaining its dependents or changes their order.
+The byte quota is recalculated from the retained frames, releasing capacity
+for newly admitted operations. Removed frames may be resubmitted through the
+ordinary full verification path.
+
+The operation checks journal health, the complete parent and the monotonic
+height before editing. An out-of-range prefix returns `InvalidPrefix` without
+changing frames or byte accounting; the trusted height can still advance.
+Keeping the existing length is allowed. Keeping zero empties the queue without
+closing it or resetting its parent or height. Expired signatures cannot become
+valid by clearing the queue and resubmitting at an earlier height.
+
+Editing does not validate the retained prefix, persist anything, cancel an
+on-chain transaction or promise that discarded operations cannot be included
+elsewhere. A retained operation may itself have expired; build and commit still
+revalidate all remaining operations at the current trusted height. This API is
+for host scheduling and must not be exposed as unauthenticated remote control
+over other users' pending operations. Stale or closed batches cannot be edited.
+
 ## Bounded body reading
 
 `admit_from_reader(&journal, &mut reader, declared_length, current_height)` reads
@@ -119,6 +144,9 @@ custody. Capacity tests cover exact byte/count limits and arithmetic overflow.
 Body-reading tests cover known/unknown lengths, bounded overlong input, empty
 and short bodies, fragmentation, interrupted reads and transport errors. Real PQ
 integration exercises body reading through durable commit and journal reopen.
+The same real-PQ fixture checks suffix removal, dependent-operation rejection,
+resubmission, exact candidate preservation, restored capacity, invalid prefixes,
+stale/closed batches and expiry protection after clearing the queue.
 
 No live node dependency, RPC route, block transaction variant, fee settlement,
 wallet connection flow or bridge activation is introduced by this local API.
