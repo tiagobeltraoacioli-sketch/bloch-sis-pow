@@ -43,6 +43,9 @@ with exclusive locking, synchronized writes, production PQ verification and
 replay against independently trusted checkpoints. Its append path uses an
 exclusive prepared operation and installs state only after synchronization,
 avoiding a redundant full-State copy. It is disabled by default.
+The same feature provides [bounded signed-operation admission](docs/dex-admission.md):
+a volatile pending batch validates dependent operations before constructing and
+durably committing a candidate. Admission alone does not reserve or settle funds.
 
 [Color-Changing Chameleon v1](../bloch-euvm/docs/chameleon-v1.md) adds sealed
 PQ-native escrow, an explicit Kirpich ERC-20 compatibility profile and an

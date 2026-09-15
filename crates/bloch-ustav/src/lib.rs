@@ -8,6 +8,8 @@
 pub use bloch_euvm::ustav::*;
 
 #[cfg(feature = "native-dex-host")]
+pub mod dex_admission;
+#[cfg(feature = "native-dex-host")]
 pub mod dex_journal;
 
 use bloch_crypto::crypto;

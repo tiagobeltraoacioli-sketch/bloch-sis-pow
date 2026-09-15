@@ -72,6 +72,10 @@ The complete file is streamed, one bounded candidate at a time. Replay is linear
 in record count and requires the original authenticated anchor. Checkpoint
 rotation/compaction is not implemented.
 
+The optional [admission queue](dex-admission.md) assembles signed operations
+against one journal checkpoint and commits through this same durable boundary.
+Its previews and pending frames do not change the journal.
+
 ## Validation and remaining integration
 
 Real PQ integration tests cover durable append/reopen, dependent appends after

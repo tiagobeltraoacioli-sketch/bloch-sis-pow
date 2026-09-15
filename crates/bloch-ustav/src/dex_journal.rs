@@ -47,7 +47,7 @@ impl From<io::Error> for Error {
     }
 }
 
-struct BaseVerifier;
+pub(super) struct BaseVerifier;
 impl SignatureVerifier for BaseVerifier {
     fn verify_with_key(&self, key: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
         BlochVerifier.verify_pq(root, key, signature)
@@ -198,6 +198,14 @@ impl Journal {
         Ok(journal)
     }
 
+    pub(super) fn ensure_healthy(&self) -> Result<(), Error> {
+        if self.poisoned {
+            Err(Error::Poisoned)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn state(&self) -> &State {
         &self.state
     }
@@ -208,9 +216,7 @@ impl Journal {
     /// The host supplies the authenticated candidate height. Successful return
     /// follows fsync; any write/fsync failure poisons this handle until reopen.
     pub fn append(&mut self, candidate: &[u8], height: u64) -> Result<pool_batch::Outcome, Error> {
-        if self.poisoned {
-            return Err(Error::Poisoned);
-        }
+        self.ensure_healthy()?;
         if height <= self.head.height {
             return Err(Error::NonIncreasingHeight);
         }

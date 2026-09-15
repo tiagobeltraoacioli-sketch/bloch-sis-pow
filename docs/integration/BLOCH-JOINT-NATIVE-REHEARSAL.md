@@ -53,6 +53,11 @@ now persists candidates before confirming in-memory changes and replays with
 production PQ verification against independently trusted anchor/tip checkpoints.
 It remains outside live block storage and canonical fork selection.
 
+The host now has a [bounded admission queue](../../crates/bloch-ustav/docs/dex-admission.md)
+for signed dependent operations. It binds a journal checkpoint and trusted height,
+revalidates before candidate construction, and confirms only through durable
+commit. This local queue is not live mempool or RPC admission.
+
 ## Atomic authorization and planning
 
 A request combines a bounded TransferV2 intent with a zero-delta native transfer

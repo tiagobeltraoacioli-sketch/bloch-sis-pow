@@ -1,5 +1,9 @@
 //! Real PQ multi-provider liquidity deposits against sealed BLCH/native reserves; local rehearsal only.
 //! No block activation, mainnet funds or real external USDT backing.
+#[cfg(feature = "native-dex-host")]
+#[path = "support/dex_admission_checks.rs"]
+mod dex_admission_checks;
+
 use bloch_crypto::crypto;
 use bloch_euvm::modules::{ModuleKind, SupplyConfig, TokenCharter};
 use bloch_euvm::ustav::{
@@ -1001,6 +1005,8 @@ fn independent_provider_adds_balanced_and_unbalanced_then_redeems_only_own_lp() 
     assert_eq!(recipient.native().snapshot(), state.native().snapshot());
     #[cfg(feature = "native-dex-host")]
     check_durable_journal(&batch_state, &candidate, &state, &refs);
+    #[cfg(feature = "native-dex-host")]
+    dex_admission_checks::check(&batch_state, &refs, &state);
     let applied = pool_batch::apply(
         &mut batch_state,
         &parent,
