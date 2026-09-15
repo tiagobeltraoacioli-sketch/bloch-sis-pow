@@ -5,8 +5,8 @@
 //! owner-only transfers. The issuer AND bridge quorum authorize supply changes.
 //! The host must persist this entire sealed state, never only its inner ledger.
 
-pub mod wire;
 pub mod pools;
+pub mod wire;
 
 use super::encoding::HashWriter;
 use super::{
@@ -222,6 +222,9 @@ pub struct ImportRecord {
 }
 type EventKey = ([u8; 32], [u8; 20], [u8; 32], u32);
 
+/// Bound each read-only release query independently of total stored history.
+pub const MAX_RELEASE_PAGE: usize = 128;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub version: u32,
@@ -243,6 +246,47 @@ pub struct GatewayLedger {
     releases: BTreeMap<([u8; 32], u64), Release>,
 }
 impl GatewayLedger {
+    /// A locally executed import record, not independent source-finality proof.
+    pub fn import_record(&self, route: &[u8; 32], nonce: u64) -> Option<&ImportRecord> {
+        self.imports.get(&(*route, nonce))
+    }
+
+    /// A locally executed burn record, not proof of finality or external payment.
+    pub fn release_record(&self, route: &[u8; 32], nonce: u64) -> Option<&Release> {
+        self.releases.get(&(*route, nonce))
+    }
+
+    /// Return a bounded page for exactly one route, in ascending nonce order.
+    /// `after` is exclusive; None starts at nonce zero. No snapshot is cloned.
+    pub fn releases_after(
+        &self,
+        route: &[u8; 32],
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<&Release>, Error> {
+        use std::ops::Bound::{Excluded, Included};
+        if limit == 0 || limit > MAX_RELEASE_PAGE {
+            return Err(Error::ResourceLimit);
+        }
+        if !self.routes.contains_key(route) {
+            return Err(Error::UnknownRoute);
+        }
+        // Avoid both cursor overflow and an empty excluded/included endpoint.
+        if after == Some(u64::MAX) {
+            return Ok(Vec::new());
+        }
+        let start = match after {
+            Some(nonce) => Excluded((*route, nonce)),
+            None => Included((*route, 0)),
+        };
+        Ok(self
+            .releases
+            .range((start, Included((*route, u64::MAX))))
+            .take(limit)
+            .map(|(_, release)| release)
+            .collect())
+    }
+
     pub fn new(domain: [u8; 32]) -> Self {
         Self {
             native: Ledger::new(domain),
@@ -734,11 +778,111 @@ struct ScopedVerifier<'a> {
     native_message: [u8; 32],
     message: [u8; 32],
 }
+
 impl Verifier for ScopedVerifier<'_> {
     fn valid_pq_key(&self, key: &[u8]) -> bool {
         self.verifier.valid_pq_key(key)
     }
     fn verify_pq(&self, message: &[u8], key: &[u8], signature: &[u8]) -> bool {
         message == self.native_message && self.verifier.verify_pq(&self.message, key, signature)
+    }
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+
+    #[test]
+    fn release_pages_are_bounded_route_scoped_and_use_exclusive_cursors() {
+        let mut ledger = GatewayLedger::new([1; 32]);
+        // Query-only table fixtures; authorization is exercised by PQ integration tests.
+        let mut routes = Vec::new();
+        for n in [2, 3] {
+            let config = RouteConfig {
+                route: Route {
+                    source_domain: [n; 32],
+                    native_domain: [1; 32],
+                    native_asset: [4; 32],
+                    token: [5; 20],
+                    vault: [6; 20],
+                    decimals: 6,
+                    cap: 1000,
+                    vault_code_hash: [7; 32],
+                },
+                committee: vec![vec![8; 32], vec![9; 32]],
+                threshold: 2,
+            };
+            let id = config.route.id();
+            ledger.routes.insert(
+                id,
+                RouteState {
+                    config,
+                    imported: 0,
+                    burned: 0,
+                    next_release_nonce: 0,
+                },
+            );
+            routes.push(id);
+        }
+        let route = routes[0];
+        for nonce in (0..130).rev().chain([u64::MAX]) {
+            for id in &routes {
+                ledger.releases.insert(
+                    (*id, nonce),
+                    Release {
+                        route: *id,
+                        nonce,
+                        recipient: [10; 20],
+                        amount: 1,
+                        native_burn: [11; 32],
+                    },
+                );
+            }
+        }
+        let before = ledger.snapshot();
+        let first = ledger
+            .releases_after(&route, None, MAX_RELEASE_PAGE)
+            .unwrap();
+        assert_eq!(first.len(), MAX_RELEASE_PAGE);
+        assert!(first.iter().all(|r| r.route == route));
+        assert_eq!(
+            first.iter().map(|r| r.nonce).collect::<Vec<_>>(),
+            (0..128).collect::<Vec<_>>()
+        );
+        let second = ledger
+            .releases_after(&route, Some(127), MAX_RELEASE_PAGE)
+            .unwrap();
+        assert_eq!(
+            second.iter().map(|r| r.nonce).collect::<Vec<_>>(),
+            vec![128, 129, u64::MAX]
+        );
+        assert_eq!(
+            ledger
+                .releases_after(&route, Some(u64::MAX - 1), 1)
+                .unwrap()[0]
+                .nonce,
+            u64::MAX
+        );
+        assert!(ledger
+            .releases_after(&route, Some(u64::MAX), 1)
+            .unwrap()
+            .is_empty());
+        assert_eq!(ledger.release_record(&route, 0), Some(first[0]));
+        assert!(ledger.release_record(&route, 130).is_none());
+        for limit in [0, MAX_RELEASE_PAGE + 1, usize::MAX] {
+            assert_eq!(
+                ledger.releases_after(&route, None, limit),
+                Err(Error::ResourceLimit)
+            );
+        }
+        assert_eq!(
+            ledger.releases_after(&[0; 32], None, 1),
+            Err(Error::UnknownRoute)
+        );
+        assert_eq!(
+            ledger.releases_after(&[0; 32], Some(u64::MAX), 1),
+            Err(Error::UnknownRoute)
+        );
+        assert_eq!(ledger.snapshot(), before);
     }
 }

@@ -62,6 +62,37 @@ import and its BLCH fee. Existing pool frames and state snapshot/root layouts
 are unchanged. Older receivers cannot decode the new operation: all rehearsal
 participants must update before exchanging candidates or journals containing it.
 
+## Reading locally executed bridge records
+
+`state.native().gateway()` exposes three read-only queries:
+
+- `import_record(&route, nonce)` retrieves the imported deposit and its source
+  transaction/block/event identity, or None when absent.
+- `release_record(&route, nonce)` retrieves the recorded burn/release, or None
+  when absent.
+- `releases_after(&route, after, limit)` returns references to releases in
+  ascending nonce order for exactly that route. None starts at zero; a supplied
+  cursor is exclusive. Limits must be 1 through `MAX_RELEASE_PAGE` (128).
+
+The page API rejects unknown routes and invalid limits. A cursor at `u64::MAX`
+returns an empty page for a known route without overflowing. Queries borrow
+records directly from the ordered maps, so they do not clone the complete
+gateway or expose an executable inner ledger. They do not modify supply,
+liabilities, replay protection or the state root.
+
+For the durable host, query `journal.state()` and associate results with
+`journal.checkpoint()` while holding the same host read lock. Admission previews
+do not appear in that journal state. Persisted import/release records remain
+queryable after replay and reopening against the trusted checkpoint. Queries
+on a separately simulated State describe that simulation, not the journal.
+
+A cursor alone does not bind a chain, state root or finality. A host serving
+multiple pages must pin the complete checkpoint or explicitly restart paging
+when the state changes; do not silently combine pages across a reorganization.
+An import record does not prove source finality, and a release record does not
+prove an external payout occurred. These APIs do not assign execution heights
+to individual records or establish a payout authorization policy.
+
 ## Validation and deployment boundary
 
 `bloch-ustav/tests/joint_gateway_crypto.rs` uses real hybrid signatures with
@@ -70,6 +101,10 @@ fees, receiver reexecution, snapshot restore, journal reopen, replay with fresh
 fee funding, independent signer failures, wrong destinations, underfunding,
 exhausted gas, deadlines, malformed frames, mixed import/pair batches and
 attempted reserve burns before and after restoration.
+It also checks that pending previews are absent from journal queries and that
+record lookups and pages survive committed journal replay. Unit tests cover
+page caps, exclusive cursor boundaries and route isolation; compile-fail tests
+prevent mutation through the read-only gateway view.
 
 No source vault is deployed, no source finality is proven and no external
 payment is made by this implementation. A withdrawal receipt contains a local

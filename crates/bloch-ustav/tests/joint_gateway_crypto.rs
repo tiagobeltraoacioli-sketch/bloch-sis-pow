@@ -473,15 +473,46 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
     ));
     let mut journal = Journal::create(&path, anchor.clone(), 3).unwrap();
     let mut pending = PendingBatch::new(&journal, 4).unwrap();
+    let request = joint::decode(&frames[0], &DOMAIN).unwrap();
+    let Operation::Import(import) = &request.gateway.operation else {
+        unreachable!()
+    };
+    let route = import.deposit.route;
     for frame in frames {
         pending.admit(&journal, frame, 4).unwrap();
     }
+    // An admitted preview must not appear among locally committed records.
+    let view = journal.state().native().gateway();
+    assert!(view.import_record(&route, 0).is_none());
+    assert!(view.release_record(&route, 0).is_none());
+    assert!(view.releases_after(&route, None, 1).unwrap().is_empty());
     assert_eq!(journal.state().state_root(), anchor.state_root());
     assert_eq!(pending.commit(&mut journal, 4).unwrap().post_root, expected);
+    let view = journal.state().native().gateway();
+    let deposit = view.import_record(&route, 0).unwrap().clone();
+    assert_eq!(deposit.deposit, import.deposit);
+    assert_eq!(deposit.source_transaction, import.source_transaction);
+    let release = view.release_record(&route, 0).unwrap().clone();
+    assert_eq!(release.amount, AMOUNT);
+    assert_eq!(
+        view.releases_after(&route, None, 1).unwrap(),
+        vec![&release]
+    );
+    assert!(view.releases_after(&route, Some(0), 1).unwrap().is_empty());
     let head = journal.checkpoint();
     drop(journal);
     let reopened = Journal::open(&path, anchor, 3, head, TailRecovery::Reject).unwrap();
     assert_eq!(reopened.state().state_root(), expected);
+    let view = reopened.state().native().gateway();
+    assert_eq!(view.import_record(&route, 0), Some(&deposit));
+    assert_eq!(view.release_record(&route, 0), Some(&release));
+    assert_eq!(
+        view.releases_after(&route, None, 128).unwrap(),
+        vec![&release]
+    );
+    assert!(view.import_record(&route, 1).is_none());
+    assert!(view.release_record(&route, 1).is_none());
+    assert_eq!(reopened.checkpoint(), head);
     drop(reopened);
     std::fs::remove_file(path).unwrap();
 }

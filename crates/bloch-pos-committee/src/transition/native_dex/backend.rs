@@ -29,6 +29,13 @@ pub struct NativeSnapshot {
 pub struct NativeView<'a> {
     state: &'a State,
 }
+/// Read-only bridge records cannot mutate the committed gateway.
+/// ```compile_fail
+/// use bloch_pos_committee::transition::native_dex::backend::GatewayView;
+/// fn change(view: GatewayView<'_>, route: &[u8; 32]) {
+///     view.release_record(route, 0).unwrap().amount = 1;
+/// }
+/// ```
 pub struct GatewayView<'a> {
     state: &'a State,
 }
@@ -84,6 +91,33 @@ impl<'a> NativeView<'a> {
     }
 }
 impl<'a> GatewayView<'a> {
+    pub fn import_record(
+        &self,
+        route: &[u8; 32],
+        nonce: u64,
+    ) -> Option<&'a bloch_euvm::ustav::gateway::ImportRecord> {
+        self.state.native.gateway().import_record(route, nonce)
+    }
+    pub fn release_record(
+        &self,
+        route: &[u8; 32],
+        nonce: u64,
+    ) -> Option<&'a bloch_euvm::ustav::gateway::Release> {
+        self.state.native.gateway().release_record(route, nonce)
+    }
+    /// Local state records only. A page is not a finality proof or payout permit.
+    pub fn releases_after(
+        &self,
+        route: &[u8; 32],
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<&'a bloch_euvm::ustav::gateway::Release>, bloch_euvm::ustav::gateway::Error>
+    {
+        self.state
+            .native
+            .gateway()
+            .releases_after(route, after, limit)
+    }
     pub fn native(&self) -> LedgerView<'a> {
         LedgerView { state: self.state }
     }
