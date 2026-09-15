@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Offline unsigned self-conversion of one legacy hybrid UTXO to suite-1 funding.
-//! No keys are unlocked and no network request or transaction is submitted.
+//! Offline self-conversion of one legacy hybrid UTXO to suite-1 funding.
+//! Optional human-operated wallet signing; no network requests or submission.
 use bloch_pos_committee::{
     fee_market::{self, TxClass},
     params,
@@ -129,10 +129,88 @@ fn plan(
         fee,
     })
 }
+fn sign_checked<F>(
+    p: &mut Plan,
+    draft: &[u8],
+    epoch: u64,
+    expected: [u8; 32],
+    unlock: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<bloch_crypto::wallet::Keypair, String>,
+{
+    match &p.tx {
+        PosTransaction::TransferV2 { keys, .. }
+            if keys.len() == 1 && keys[0].signature.is_empty() => {}
+        _ => return Err("Expected one unsigned witness".into()),
+    }
+    if draft != p.tx.canonical_bytes() {
+        return Err(
+            "Draft differs from the reconstructed approved intent, or is already signed".into(),
+        );
+    }
+    let root = p.tx.checked_signing_root(epoch);
+    if root != expected {
+        return Err("Signing root differs from independently approved root".into());
+    }
+    let key = unlock()?;
+    let raw = &p.native_key[4..];
+    if key.public_key != raw {
+        return Err("Wallet public key does not match the legacy funding key".into());
+    }
+    let signature = key.sign(&root)?;
+    if signature.len() > ADMISSION_PQ_SIGNATURE_MAX
+        || !bloch_crypto::crypto::verify(raw, &root, &signature)
+    {
+        return Err("Signature failed verification or exceeds reservation".into());
+    }
+    if let PosTransaction::TransferV2 { keys, .. } = &mut p.tx {
+        keys[0].signature = signature;
+    }
+    Ok(())
+}
+fn read_bounded(path: &str, limit: u64) -> Result<String, String> {
+    let mut s = String::new();
+    std::fs::File::open(path)
+        .map_err(|e| e.to_string())?
+        .take(limit + 1)
+        .read_to_string(&mut s)
+        .map_err(|_| "Invalid text file")?;
+    if s.len() as u64 > limit {
+        return Err("File exceeds offline size limit".into());
+    }
+    Ok(s)
+}
+fn unlock_wallet(wallet: &str, passfile: &str) -> Result<bloch_crypto::wallet::Keypair, String> {
+    use zeroize::Zeroizing;
+    let meta =
+        std::fs::symlink_metadata(passfile).map_err(|_| "Cannot read password file metadata")?;
+    if !meta.file_type().is_file() {
+        return Err("Password file must be a regular file".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o077 != 0 {
+            return Err("Password file must have owner-only permissions".into());
+        }
+    }
+    let password = Zeroizing::new(read_bounded(passfile, 4096)?);
+    if password.is_empty() {
+        return Err("Empty password file".into());
+    }
+    let wallet_meta = std::fs::metadata(wallet).map_err(|_| "Cannot read wallet metadata")?;
+    if !wallet_meta.is_file() || wallet_meta.len() > 131072 {
+        return Err("Wallet must be a regular file of at most 128 KiB".into());
+    }
+    bloch_crypto::wallet::Keypair::load_encrypted(std::path::Path::new(wallet), &password).map_err(
+        |_| "Wallet unlock failed: wrong password, unsupported format or damaged wallet".into(),
+    )
+}
 fn run() -> Result<(), String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args == ["--help"] {
-        println!("Offline unsigned legacy-to-native self-conversion\n--pubkey FILE --txid HEX32 --vout N --input-value SAT --amount SAT --base-fee MILLISAT --tip MILLISAT --max-fee SAT --epoch N --out NEW_FILE\nOne input; output 0 is the same key with suite-1 envelope, output 1 returns legacy change. No signing or broadcast. Input observations are not proofs.");
+        println!("Offline unsigned legacy-to-native self-conversion\n--pubkey FILE --txid HEX32 --vout N --input-value SAT --amount SAT --base-fee MILLISAT --tip MILLISAT --max-fee SAT --epoch N --out NEW_FILE\nFor human offline signing, also supply --tx DRAFT --wallet ENCRYPTED_JSON --passphrase-file OWNER_ONLY_FILE --expected-root HEX32.\nOne input; output 0 is the same key with suite-1 envelope, output 1 returns legacy change. No broadcast. Input observations are not proofs.");
         return Ok(());
     }
     let allowed = [
@@ -146,8 +224,12 @@ fn run() -> Result<(), String> {
         "--max-fee",
         "--epoch",
         "--out",
+        "--tx",
+        "--wallet",
+        "--passphrase-file",
+        "--expected-root",
     ];
-    if args.len() != allowed.len() * 2 {
+    if args.len() != 20 && args.len() != 28 {
         return Err("Use --help for required options".into());
     }
     let mut a = BTreeMap::new();
@@ -180,7 +262,7 @@ fn run() -> Result<(), String> {
     let txid: [u8; 32] = unhex(get("--txid")?)?
         .try_into()
         .map_err(|_| "Expected hex32 txid")?;
-    let p = plan(
+    let mut p = plan(
         unhex(text.trim())?,
         txid,
         u32::try_from(number("--vout")?).map_err(|_| "Invalid vout")?,
@@ -190,6 +272,25 @@ fn run() -> Result<(), String> {
         number("--tip")?,
         u64n("--max-fee")?,
     )?;
+    match std::fs::symlink_metadata(get("--out")?) {
+        Ok(_) => return Err("Output already exists; refusing overwrite".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    let signing = ["--tx", "--wallet", "--passphrase-file", "--expected-root"]
+        .iter()
+        .any(|k| a.contains_key(k));
+    if signing {
+        let draft = unhex(read_bounded(get("--tx")?, 32768)?.trim())?;
+        let expected = unhex(get("--expected-root")?)?
+            .try_into()
+            .map_err(|_| "Expected hex32 signing root")?;
+        let wallet = get("--wallet")?;
+        let passfile = get("--passphrase-file")?;
+        sign_checked(&mut p, &draft, epoch, expected, || {
+            unlock_wallet(wallet, passfile)
+        })?;
+    }
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -201,7 +302,8 @@ fn run() -> Result<(), String> {
     writeln!(f, "{}", hex(&p.tx.canonical_bytes())).map_err(|e| e.to_string())?;
     f.sync_all().map_err(|e| e.to_string())?;
     println!("Input outpoint: {}:{}\nObserved input value (sat): {}\nNative amount (sat): {}\nLegacy change (sat): {}",hex(&txid),number("--vout")?,u64n("--input-value")?,u64n("--amount")?,u64n("--input-value")?-u64n("--amount")?-p.fee);
-    println!("Legacy input/change script: {}\nNative funding script: {}\nNative public key: {}\nExact fee (sat): {}\nSigning root: {}\nTransaction id: {}\nUnsigned only; nothing sent. Input value and ownership require independent verification.",hex(&p.legacy),hex(&p.native),hex(&p.native_key),p.fee,hex(&p.tx.checked_signing_root(epoch)),hex(&p.tx.txid()));
+    println!("Legacy input/change script: {}\nNative funding script: {}\nNative public key: {}\nExact fee (sat): {}\nSigning root: {}\nTransaction id: {}\nNothing sent. Input value and ownership require independent verification.",hex(&p.legacy),hex(&p.native),hex(&p.native_key),p.fee,hex(&p.tx.checked_signing_root(epoch)),hex(&p.tx.txid()));
+    println!("Signature present: {signing}");
     Ok(())
 }
 fn main() {
@@ -274,6 +376,88 @@ mod tests {
             assert!(tx_bytes >= length);
             assert!(tx_bytes <= length + fee_market::TX_BYTES_DECLARE_SLACK);
         }
+    }
+    #[test]
+    fn altered_draft_and_root_are_refused_before_unlock() {
+        let mut p = plan(
+            vec![1; 3745],
+            [2; 32],
+            0,
+            4_000_000_000_000,
+            2_500_001_000_000,
+            10,
+            5,
+            1_000_000,
+        )
+        .unwrap();
+        let draft = p.tx.canonical_bytes();
+        let root = p.tx.checked_signing_root(5000);
+        let mut altered = draft.clone();
+        altered[0] ^= 1;
+        assert!(sign_checked(&mut p, &altered, 5000, root, || panic!("must not unlock")).is_err());
+        assert!(sign_checked(&mut p, &draft, 5000, [0; 32], || panic!("must not unlock")).is_err());
+    }
+    #[test]
+    fn encrypted_legacy_wallet_signs_and_stays_unchanged() {
+        use bloch_crypto::{crypto, wallet::Keypair};
+        let (public, secret) = crypto::generate_keypair();
+        let raw = public[4..].to_vec();
+        let key = Keypair {
+            private_key: secret[4..].to_vec(),
+            public_key: raw.clone(),
+            address: crypto::address_from_pubkey(&raw, false),
+        };
+        let dir =
+            std::env::temp_dir().join(format!("bloch-native-sign-test-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let wallet = dir.join("wallet.json");
+        let pass = dir.join("password");
+        let password = "Disposable native conversion test password 2026!";
+        key.save_encrypted(&wallet, password).unwrap();
+        std::fs::write(&pass, password).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&pass, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let before = std::fs::read(&wallet).unwrap();
+        let mut p = plan(
+            raw.clone(),
+            [2; 32],
+            1,
+            4_000_000_000_000,
+            2_500_001_000_000,
+            10,
+            5,
+            1_000_000,
+        )
+        .unwrap();
+        let draft = p.tx.canonical_bytes();
+        let root = p.tx.checked_signing_root(5000);
+        let txid = p.tx.txid();
+        sign_checked(&mut p, &draft, 5000, root, || {
+            unlock_wallet(wallet.to_str().unwrap(), pass.to_str().unwrap())
+        })
+        .unwrap();
+        assert_eq!(p.tx.txid(), txid);
+        if let PosTransaction::TransferV2 { keys, .. } = &p.tx {
+            assert!(crypto::verify(&raw, &root, &keys[0].signature));
+        }
+        assert_eq!(before, std::fs::read(&wallet).unwrap());
+        let signed = p.tx.canonical_bytes();
+        assert!(sign_checked(&mut p, &signed, 5000, root, || Err(
+            "already signed guard".into()
+        ))
+        .is_err());
+        std::fs::write(&pass, "wrong password").unwrap();
+        assert!(unlock_wallet(wallet.to_str().unwrap(), pass.to_str().unwrap()).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&pass, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(unlock_wallet(wallet.to_str().unwrap(), pass.to_str().unwrap()).is_err());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn rejects_wrong_keys_caps_rates_and_insufficient_change() {
