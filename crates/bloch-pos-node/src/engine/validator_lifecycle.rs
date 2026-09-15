@@ -76,11 +76,14 @@ impl Engine {
         let state = &self.state;
         let total = state.total_active_stake_sat();
         let fee = state.next_base_fee();
+        let included = &self.tx_slot_index;
         self.mempool.retain(|_, tx| {
-            !is_lifecycle(tx)
-                || state
-                    .validate_lifecycle_transaction(tx, total, fee, &ProbeVerifier)
-                    .is_ok()
+            // Also covers winning-branch transactions on the reorg path.
+            !included.contains_key(&tx.txid())
+                && (!is_lifecycle(tx)
+                    || state
+                        .validate_lifecycle_transaction(tx, total, fee, &ProbeVerifier)
+                        .is_ok())
         });
         self.mempool_admitted_at
             .retain(|key, _| self.mempool.contains_key(key));

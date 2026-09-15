@@ -3034,6 +3034,11 @@ impl Engine {
     /// full mesh is the normal case rather than a fault.
     fn on_transaction(&mut self, tx: PosTransaction) -> Result<Admitted, Refusal> {
         let key = tx.canonical_bytes();
+        // A recent canonical inclusion remains a duplicate even if gossip
+        // re-offers it after its pending entry was removed.
+        if self.tx_slot_index.contains_key(&tx.txid()) {
+            return Ok(Admitted::Duplicate);
+        }
         if self.mempool.contains_key(&key) {
             return Ok(Admitted::Duplicate);
         }
@@ -11075,6 +11080,33 @@ mod tx_status_tests {
     /// apart from "finalized" (`0 <= 0`). Epoch 1 can.
     fn epoch1_slot() -> u64 {
         SLOTS_PER_EPOCH
+    }
+
+    #[test]
+    fn included_reoffer_does_not_reenter_mempool() {
+        let mut e = engine_at_wall_slot(0);
+        let tx = parked_transfer(1);
+        e.note_tx_slots(epoch1_slot(), std::slice::from_ref(&tx));
+        assert!(matches!(e.on_transaction(tx), Ok(Admitted::Duplicate)));
+        assert!(e.mempool.is_empty());
+        assert!(e.mempool_admitted_at.is_empty());
+    }
+
+    #[test]
+    fn adopted_head_revalidation_removes_included_entries_and_tracking() {
+        let mut e = engine_at_wall_slot(0);
+        let included = parked_transfer(1);
+        let pending = parked_transfer(2);
+        let included_key = admit(&mut e, included.clone());
+        let pending_key = admit(&mut e, pending);
+        e.mempool_suspect.insert(included_key.clone());
+        e.note_tx_slots(epoch1_slot(), std::slice::from_ref(&included));
+        e.revalidate_lifecycle_mempool();
+        assert!(!e.mempool.contains_key(&included_key));
+        assert!(!e.mempool_admitted_at.contains_key(&included_key));
+        assert!(!e.mempool_suspect.contains(&included_key));
+        assert!(e.mempool.contains_key(&pending_key));
+        assert_eq!(e.tx_status(&included.txid()), "included");
     }
 
     #[test]
