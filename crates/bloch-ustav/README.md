@@ -18,7 +18,7 @@ Supply-only token AMM operations with locked reserve outputs and PQ-owned LP
 positions. It preserves gateway liabilities and token supply. This separate
 sealed boundary still rejects base BLCH and remains outside live consensus.
 
-The test-only joint BLCH/native dependency explicitly enables the consensus
+The tests and opt-in persistence host explicitly enable the consensus
 crate's optional [rehearsal](../../docs/integration/BLOCH-JOINT-NATIVE-REHEARSAL.md).
 It verifies an atomic transfer with real hybrid signatures and committed BLCH
 UTXOs. This does not enable native execution in default node builds or create
@@ -38,6 +38,9 @@ changes on failure, including a forged later provider redemption in PQ tests.
 [Candidate exchange](../bloch-pos-committee/docs/pool-candidates.md) additionally
 checks advertised final roots through independent receiver execution, including
 real PQ tests for false-result rollback.
+The optional `native-dex-host` feature adds a [durable candidate journal](docs/dex-journal.md)
+with exclusive locking, synchronized writes, production PQ verification and
+replay against independently trusted checkpoints. It is disabled by default.
 
 [Color-Changing Chameleon v1](../bloch-euvm/docs/chameleon-v1.md) adds sealed
 PQ-native escrow, an explicit Kirpich ERC-20 compatibility profile and an

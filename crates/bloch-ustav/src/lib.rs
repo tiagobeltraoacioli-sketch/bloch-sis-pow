@@ -7,6 +7,9 @@
 #![forbid(unsafe_code)]
 pub use bloch_euvm::ustav::*;
 
+#[cfg(feature = "native-dex-host")]
+pub mod dex_journal;
+
 use bloch_crypto::crypto;
 
 /// Concrete verifier; signature generation remains in bloch-crypto / the wallet.

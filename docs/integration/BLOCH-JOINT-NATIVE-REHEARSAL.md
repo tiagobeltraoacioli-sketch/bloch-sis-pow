@@ -48,6 +48,11 @@ now verifies bounded framing and independently compares the advertised final
 state before installation. This still does not advance the live chain or settle
 block rewards.
 
+The optional [durable host journal](../../crates/bloch-ustav/docs/dex-journal.md)
+now persists candidates before confirming in-memory changes and replays with
+production PQ verification against independently trusted anchor/tip checkpoints.
+It remains outside live block storage and canonical fork selection.
+
 ## Atomic authorization and planning
 
 A request combines a bounded TransferV2 intent with a zero-delta native transfer

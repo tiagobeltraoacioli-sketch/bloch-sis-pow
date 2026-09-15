@@ -233,6 +233,196 @@ use bloch_pos_committee::transition::native_dex::{
     add_liquidity, initial_liquidity, pool_batch, pool_candidate, pool_wire, remove_liquidity,
 };
 
+#[cfg(feature = "native-dex-host")]
+fn check_durable_journal(anchor: &State, candidate: &[u8], final_state: &State, frames: &[&[u8]]) {
+    use bloch_ustav::dex_journal::{Checkpoint, Error, Journal, TailRecovery};
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    let directory = std::env::temp_dir().join(format!(
+        "bloch-dex-journal-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir(&directory).unwrap();
+    let path = directory.join("candidates.log");
+    let start = Checkpoint {
+        height: 3,
+        root: anchor.state_root(),
+    };
+    let tip = Checkpoint {
+        height: 4,
+        root: final_state.state_root(),
+    };
+    let mut journal = Journal::create(&path, anchor.clone(), 3).unwrap();
+    assert!(Journal::create(&path, anchor.clone(), 3).is_err());
+    assert!(matches!(
+        Journal::open(&path, anchor.clone(), 3, start, TailRecovery::Reject),
+        Err(Error::Locked)
+    ));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    let before = fs::read(&path).unwrap();
+    let mut false_root = candidate.to_vec();
+    false_root[82] ^= 1;
+    assert!(journal.append(&false_root, 4).is_err());
+    assert_eq!(journal.checkpoint(), start);
+    assert_eq!(fs::read(&path).unwrap(), before);
+    journal.append(candidate, 4).unwrap();
+    assert_eq!(journal.checkpoint(), tip);
+    assert_eq!(journal.state().state_root(), final_state.state_root());
+    assert!(matches!(
+        journal.append(candidate, 4),
+        Err(Error::NonIncreasingHeight)
+    ));
+    drop(journal);
+    let complete = fs::read(&path).unwrap();
+    let reopened = Journal::open(&path, anchor.clone(), 3, tip, TailRecovery::Reject).unwrap();
+    assert_eq!(reopened.state().base(), final_state.base());
+    assert_eq!(
+        reopened.state().native().snapshot(),
+        final_state.native().snapshot()
+    );
+    assert_eq!(reopened.state().fee_escrow(), final_state.fee_escrow());
+    drop(reopened);
+    assert!(matches!(
+        Journal::open(&path, anchor.clone(), 2, tip, TailRecovery::Reject),
+        Err(Error::WrongAnchor)
+    ));
+    assert!(matches!(
+        Journal::open(&path, anchor.clone(), 3, start, TailRecovery::Reject),
+        Err(Error::WrongHead)
+    ));
+
+    // A valid record removed at its boundary is still a rollback, not recovery.
+    fs::write(&path, &before).unwrap();
+    assert!(matches!(
+        Journal::open(
+            &path,
+            anchor.clone(),
+            3,
+            tip,
+            TailRecovery::DiscardIncomplete
+        ),
+        Err(Error::WrongHead)
+    ));
+    assert_eq!(fs::read(&path).unwrap(), before);
+    let mut record = (candidate.len() as u32).to_le_bytes().to_vec();
+    record.extend_from_slice(candidate);
+    for cut in [1, 3, 4, 40, record.len() - 1] {
+        let mut torn = complete.clone();
+        torn.extend_from_slice(&record[..cut]);
+        fs::write(&path, &torn).unwrap();
+        assert!(matches!(
+            Journal::open(&path, anchor.clone(), 3, tip, TailRecovery::Reject),
+            Err(Error::Incomplete { .. })
+        ));
+        assert!(matches!(
+            Journal::open(
+                &path,
+                anchor.clone(),
+                3,
+                start,
+                TailRecovery::DiscardIncomplete
+            ),
+            Err(Error::WrongHead)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), torn);
+        let repaired = Journal::open(
+            &path,
+            anchor.clone(),
+            3,
+            tip,
+            TailRecovery::DiscardIncomplete,
+        )
+        .unwrap();
+        assert_eq!(repaired.checkpoint(), tip);
+        drop(repaired);
+        assert_eq!(fs::read(&path).unwrap(), complete);
+    }
+    let mut corrupt = complete.clone();
+    *corrupt.last_mut().unwrap() ^= 1;
+    fs::write(&path, &corrupt).unwrap();
+    assert!(matches!(
+        Journal::open(
+            &path,
+            anchor.clone(),
+            3,
+            tip,
+            TailRecovery::DiscardIncomplete
+        ),
+        Err(Error::Candidate(_))
+    ));
+    assert_eq!(fs::read(&path).unwrap(), corrupt);
+    let mut oversized = complete.clone();
+    oversized.extend_from_slice(&u32::MAX.to_le_bytes());
+    fs::write(&path, &oversized).unwrap();
+    assert!(matches!(
+        Journal::open(
+            &path,
+            anchor.clone(),
+            3,
+            tip,
+            TailRecovery::DiscardIncomplete
+        ),
+        Err(Error::InvalidLength)
+    ));
+    assert_eq!(fs::read(&path).unwrap(), oversized);
+    // Reopen between dependent candidates and append at the recovered offset.
+    fs::write(&path, &before).unwrap();
+    let mut journal = Journal::open(&path, anchor.clone(), 3, start, TailRecovery::Reject).unwrap();
+    let first = pool_candidate::build(
+        journal.state(),
+        4,
+        &frames[..1],
+        &BaseVerifier,
+        &BlochVerifier,
+    )
+    .unwrap();
+    journal.append(&first, 4).unwrap();
+    let intermediate = journal.checkpoint();
+    drop(journal);
+    let mut journal =
+        Journal::open(&path, anchor.clone(), 3, intermediate, TailRecovery::Reject).unwrap();
+    let rest = pool_candidate::build(
+        journal.state(),
+        5,
+        &frames[1..],
+        &BaseVerifier,
+        &BlochVerifier,
+    )
+    .unwrap();
+    journal.append(&rest, 5).unwrap();
+    assert_eq!(journal.state().state_root(), final_state.state_root());
+    let last = journal.checkpoint();
+    drop(journal);
+    let journal = Journal::open(&path, anchor.clone(), 3, last, TailRecovery::Reject).unwrap();
+    assert_eq!(journal.state().state_root(), final_state.state_root());
+    drop(journal);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(bloch_ustav::dex_journal::MAX_JOURNAL_BYTES + 1)
+        .unwrap();
+    assert!(matches!(
+        Journal::open(&path, anchor.clone(), 3, last, TailRecovery::Reject),
+        Err(Error::ResourceLimit)
+    ));
+    fs::remove_file(&path).unwrap();
+    fs::remove_dir(&directory).unwrap();
+}
+
 fn initialized() -> (State, [u8; 32], [u8; 32], OutPoint) {
     let (mut state, creation, funding) = fixture();
     let mut encoded_state = state.clone();
@@ -799,6 +989,8 @@ fn independent_provider_adds_balanced_and_unbalanced_then_redeems_only_own_lp() 
     assert_eq!(accepted.charge, preview.charge);
     assert_eq!(recipient.base(), state.base());
     assert_eq!(recipient.native().snapshot(), state.native().snapshot());
+    #[cfg(feature = "native-dex-host")]
+    check_durable_journal(&batch_state, &candidate, &state, &refs);
     let applied = pool_batch::apply(
         &mut batch_state,
         &parent,

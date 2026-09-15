@@ -57,6 +57,10 @@ execution after restoring the complete parent. Real hybrid PQ tests exercise a
 candidate containing two dependent deposits followed by a provider redemption,
 including rejection of a forged final root without changing reserves or fees.
 
+The optional [durable host journal](../../bloch-ustav/docs/dex-journal.md) now
+persists and replays these candidates against independently trusted checkpoints.
+It does not select or activate the canonical chain.
+
 The receiver still needs authenticated chain context and production verifiers.
 This API does not select the canonical parent, advance height, implement a
 mempool, persist/reorganize blocks, change historical roots or settle block fees.
