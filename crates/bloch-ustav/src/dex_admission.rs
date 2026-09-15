@@ -61,6 +61,7 @@ impl Drop for ReviewSlot {
 /// ```
 pub struct AccountReview {
     slot: ReviewSlot,
+    revision: u64,
     funding: pool_review::FundingReview,
     parent: Checkpoint,
     prefix: Vec<Vec<u8>>,
@@ -77,6 +78,7 @@ impl AccountReview {
 /// Only commit confirms the entire batch through the durable journal.
 pub struct PendingBatch {
     review_slots: Arc<AtomicUsize>,
+    review_revision: u64,
     parent: Checkpoint,
     height: u64,
     frames: Vec<Vec<u8>>,
@@ -92,6 +94,7 @@ impl PendingBatch {
         }
         Ok(Self {
             review_slots: Arc::new(AtomicUsize::new(0)),
+            review_revision: 0,
             parent,
             height,
             frames: Vec::new(),
@@ -147,6 +150,10 @@ impl PendingBatch {
         if self.frames.iter().any(|f| f.as_slice() == frame) {
             return Err(Error::Duplicate);
         }
+        let next_revision = self
+            .review_revision
+            .checked_add(1)
+            .ok_or(Error::ResourceLimit)?;
         let mut refs: Vec<_> = self.frames.iter().map(Vec::as_slice).collect();
         refs.push(frame);
         let outcome = pool_batch::simulate(
@@ -160,6 +167,7 @@ impl PendingBatch {
         .map_err(Error::Batch)?;
         self.frames.push(frame.to_vec());
         self.wire_bytes = next_bytes;
+        self.review_revision = next_revision;
         Ok(outcome)
     }
 
@@ -200,6 +208,7 @@ impl PendingBatch {
             .map_err(Error::Review)?;
         Ok(AccountReview {
             slot,
+            revision: self.review_revision,
             funding,
             parent: self.parent,
             prefix: self.frames.clone(),
@@ -220,6 +229,7 @@ impl PendingBatch {
     ) -> Result<pool_batch::Outcome, Error> {
         self.check_context(journal, height)?;
         if !Arc::ptr_eq(&review.slot.0, &self.review_slots)
+            || review.revision != self.review_revision
             || review.parent != self.parent
             || review.height != height
             || review.prefix != self.frames
@@ -265,9 +275,32 @@ impl PendingBatch {
         if keep > self.frames.len() {
             return Err(Error::InvalidPrefix);
         }
-        self.frames.truncate(keep);
+        if keep < self.frames.len() {
+            let next_revision = self
+                .review_revision
+                .checked_add(1)
+                .ok_or(Error::ResourceLimit)?;
+            self.frames.truncate(keep);
+            self.review_revision = next_revision;
+        }
         // The retained subset is already bounded by MAX_BYTES.
         self.wire_bytes = self.frames.iter().map(|frame| frame.len() as u64).sum();
+        Ok(())
+    }
+
+    /// Invalidate all previously issued reviews, e.g. when the host observes
+    /// wallet lock or disconnect. Does not remove admitted frames or free slots
+    /// still held by callers; those handles must also be discarded by the host.
+    pub fn invalidate_account_reviews(
+        &mut self,
+        journal: &Journal,
+        height: u64,
+    ) -> Result<(), Error> {
+        self.check_context(journal, height)?;
+        self.review_revision = self
+            .review_revision
+            .checked_add(1)
+            .ok_or(Error::ResourceLimit)?;
         Ok(())
     }
 

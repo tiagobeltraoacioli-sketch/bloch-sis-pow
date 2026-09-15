@@ -245,10 +245,11 @@ with fixed BLCH and native PQ verifiers. Invalid other-party signatures or
 execution constraints still prevent admission. Failed attempts consume the review
 without changing pending frames or journal state.
 
-Context equality checks the current exact prefix, checkpoint and issuing queue
-identity, not a history of all edits. Restoring an identical prefix within the same
-queue at the same height and parent is equivalent. Another queue cannot consume
-the review, even with identical contents. Advancing the execution height requires a new
+Context equality checks the current exact prefix, checkpoint, issuing queue
+identity and review revision. Every successful admission or actual prefix removal
+advances that revision. Restoring identical contents within the same queue cannot
+revive an earlier review. Another queue cannot consume the review either, even
+with identical contents. Advancing the execution height requires a new
 review even if the packet is not expired. The prefix retained by each review is
 bounded by the existing operation/byte limits. Each queue admits at most eight
 outstanding reviews; the host must separately limit total queues, reviews across
@@ -291,3 +292,24 @@ restored on drop, and exercise the real gateway review path at capacity. Malform
 preparation, invalid signatures and cross-queue attempts release their slots;
 successful admission preserves the journal until explicit commit. Reviews from a
 dropped queue remain unusable in another queue.
+
+
+### Invalidating reviews after queue edits or wallet events
+
+The queue's checked, monotonic review revision prevents a remove-and-restore cycle
+from reactivating an old review, including a cycle back to an empty queue. Failed
+admission, invalid prefix requests and retaining the whole unchanged prefix do not
+advance the revision. The existing height watermark can still advance on failed
+requests, independently invalidating reviews made at an earlier height. Revision
+exhaustion fails closed before an operation changes the pending frames.
+
+`PendingBatch::invalidate_account_reviews` lets a trusted host invalidate all
+outstanding reviews on a wallet lock, account switch, disconnect or cancellation
+policy event. Calling it does not remove admitted transactions, mutate journal
+state, release slots held by callers, or automatically receive browser events.
+The host must wire those events and discard obsolete review handles. Subsequent
+reviews may be prepared against the unchanged queue under the new revision.
+
+The real-PQ gateway regression verifies refusal after an add/remove cycle with
+identical final context, explicit invalidation without queue changes, continued
+validity after no-op/failed edits, and unchanged candidate bytes after invalidation.

@@ -1120,3 +1120,74 @@ fn account_reviews_are_bounded_released_and_bound_to_the_original_queue() {
     drop(journal);
     std::fs::remove_file(path).unwrap();
 }
+
+#[cfg(feature = "native-dex-host")]
+#[test]
+fn queue_edits_and_explicit_invalidation_cannot_revive_old_account_reviews() {
+    use bloch_ustav::{
+        dex_admission::{Error as AdmissionError, PendingBatch},
+        dex_journal::Journal,
+    };
+    let (state, import) = fixture();
+    let frame = import.canonical_bytes(&DOMAIN).unwrap();
+    let payer = &keys()[0].0;
+    let PosTransaction::TransferV2 {
+        keys: witnesses, ..
+    } = &import.blch
+    else {
+        unreachable!()
+    };
+    let signature = &witnesses[0].signature;
+    let path = std::env::temp_dir().join(format!(
+        "bloch-review-revision-{}-{}.log",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let journal = Journal::create(&path, state, 3).unwrap();
+    let parent = journal.checkpoint();
+    let mut queue = PendingBatch::new(&journal, 4).unwrap();
+    let old = queue
+        .prepare_account_review(&journal, &frame, payer, 4)
+        .unwrap();
+    queue.admit(&journal, &frame, 4).unwrap();
+    queue.retain_prefix(&journal, 0, 4).unwrap();
+    // Same queue, parent, height and empty prefix as at preparation.
+    assert!(matches!(
+        queue.admit_account_signature(&journal, old, payer, signature, 4),
+        Err(AdmissionError::ReviewContextChanged)
+    ));
+    assert!(queue.is_empty());
+    let old = queue
+        .prepare_account_review(&journal, &frame, payer, 4)
+        .unwrap();
+    queue.invalidate_account_reviews(&journal, 4).unwrap();
+    assert!(matches!(
+        queue.admit_account_signature(&journal, old, payer, signature, 4),
+        Err(AdmissionError::ReviewContextChanged)
+    ));
+    assert_eq!(journal.checkpoint(), parent);
+    assert!(queue.is_empty());
+    // Non-mutating and rejected edits do not invalidate an otherwise live review.
+    let live = queue
+        .prepare_account_review(&journal, &frame, payer, 4)
+        .unwrap();
+    queue.retain_prefix(&journal, 0, 4).unwrap();
+    assert!(matches!(
+        queue.retain_prefix(&journal, 1, 4),
+        Err(AdmissionError::InvalidPrefix)
+    ));
+    assert!(queue.admit(&journal, &[0], 4).is_err());
+    queue
+        .admit_account_signature(&journal, live, payer, signature, 4)
+        .unwrap();
+    assert_eq!(queue.len(), 1);
+    let before = queue.build(&journal, 4).unwrap();
+    queue.invalidate_account_reviews(&journal, 4).unwrap();
+    assert_eq!(queue.build(&journal, 4).unwrap(), before);
+    assert_eq!(journal.checkpoint(), parent);
+    drop(journal);
+    std::fs::remove_file(path).unwrap();
+}
