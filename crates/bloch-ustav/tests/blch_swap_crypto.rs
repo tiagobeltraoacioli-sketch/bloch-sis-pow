@@ -850,3 +850,103 @@ fn payer_attachment_refuses_final_packet_larger_than_reviewed_declaration() {
     ));
     assert_eq!(state.state_root(), before);
 }
+
+#[test]
+fn account_attachment_signs_both_swap_legs_and_leaves_reserve_witnesses_empty() {
+    use bloch_pos_committee::transition::native_dex::{
+        pool_review::FundingReview, pool_submission::SubmissionReview,
+    };
+    for native_in in [false, true] {
+        let (mut state, pool, reserve, funding) = initialized();
+        let mut expected = swap_request(
+            &state,
+            pool,
+            reserve,
+            ([9; 32], 0),
+            native_in.then_some(funding),
+        );
+        let payer = &identities()[2].0;
+        let PosTransaction::TransferV2 { keys, .. } = &expected.blch else {
+            unreachable!()
+        };
+        let signature = keys[0].signature.clone();
+        for (point, witness) in expected
+            .native
+            .transaction
+            .inputs
+            .iter()
+            .zip(&mut expected.native.witnesses.owners)
+        {
+            if !state.native().is_locked(point) {
+                assert_eq!(
+                    state.native().spendable_output(point).unwrap().output.owner,
+                    *payer
+                );
+                *witness = signature.clone();
+            } else {
+                assert!(witness.is_empty());
+            }
+        }
+        let expected_bytes = expected.canonical_bytes(&DOMAIN).unwrap();
+        let mut pending = expected.clone();
+        if let PosTransaction::TransferV2 { keys, .. } = &mut pending.blch {
+            keys[0].signature.fill(0);
+        }
+        for witness in &mut pending.native.witnesses.owners {
+            witness.fill(0);
+        }
+        let bytes = pending.canonical_bytes(&DOMAIN).unwrap();
+        let before = state.state_root();
+        let review = FundingReview::prepare(&state, &bytes, payer, 4).unwrap();
+        let attached = review
+            .finish_with_account_signature(&state, payer, 4, &signature, &BaseVerifier)
+            .unwrap();
+        assert_eq!(attached.canonical_bytes(), expected_bytes);
+        assert_eq!(state.state_root(), before);
+        let preflight = SubmissionReview::prepare(
+            &state,
+            attached.canonical_bytes(),
+            payer,
+            4,
+            &BaseVerifier,
+            &BlochVerifier,
+        )
+        .unwrap();
+        let predicted = preflight.predicted_root();
+        pool_wire::apply_encoded(
+            &mut state,
+            attached.canonical_bytes(),
+            4,
+            &BaseVerifier,
+            &BlochVerifier,
+        )
+        .unwrap();
+        assert_eq!(state.state_root(), predicted);
+    }
+}
+
+#[test]
+fn account_attachment_refuses_nonexistent_native_input_before_returning_packet() {
+    use bloch_pos_committee::transition::native_dex::pool_review::{Error, FundingReview};
+    let (state, pool, reserve, funding) = initialized();
+    let mut request = swap_request(&state, pool, reserve, ([9; 32], 0), Some(funding));
+    let point = request
+        .native
+        .transaction
+        .inputs
+        .iter_mut()
+        .find(|point| **point == funding)
+        .unwrap();
+    point.index = u32::MAX;
+    request.native.transaction.inputs.sort();
+    let bytes = request.canonical_bytes(&DOMAIN).unwrap();
+    let payer = &identities()[2].0;
+    let before = state.state_root();
+    let review = FundingReview::prepare(&state, &bytes, payer, 4).unwrap();
+    let sig = signature(&review.intent().authorization(), &identities()[2].1);
+    assert!(matches!(
+        review.finish_with_account_signature(&state, payer, 4, &sig, &BaseVerifier),
+        Err(Error::InvalidNativeFunding)
+    ));
+    assert_eq!(state.state_root(), before);
+}

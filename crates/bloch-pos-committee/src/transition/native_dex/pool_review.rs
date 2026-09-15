@@ -19,6 +19,7 @@ pub enum Error {
     StateChanged,
     HeightRegressed,
     InvalidSignature,
+    InvalidNativeFunding,
     FeeChanged,
 }
 
@@ -101,6 +102,54 @@ fn parts(request: &pool_wire::Request) -> Result<(&PosTransaction, u64), Error> 
         return Err(Error::InvalidExpiry);
     }
     Ok((base, outer.min(inner).min(certificate)))
+}
+
+// Fill only positional input-owner witnesses, never policy or committee roles.
+fn attach_native_owners(
+    state: &State,
+    request: &mut pool_wire::Request,
+    payer: &[u8],
+    signature: &[u8],
+) -> Result<(), Error> {
+    let (tx, witnesses) = match request {
+        pool_wire::Request::Gateway(r) => {
+            let tx = match &r.gateway.operation {
+                Operation::Import(g) => &g.transaction,
+                Operation::Withdraw(g) => &g.transaction,
+            };
+            (tx, &mut r.gateway.witnesses)
+        }
+        pool_wire::Request::CreatePair(r) => (&r.native.transaction, &mut r.native.witnesses),
+        pool_wire::Request::Add(r) => (&r.native.transaction, &mut r.native.witnesses),
+        pool_wire::Request::Swap(r) => (&r.native.transaction, &mut r.native.witnesses),
+        pool_wire::Request::Remove(r) => (&r.native.transaction, &mut r.native.witnesses),
+        pool_wire::Request::ClosePair(r) => (&r.native.transaction, &mut r.native.witnesses),
+        pool_wire::Request::Initialize(_) => return Ok(()),
+    };
+    if tx.inputs.len() != witnesses.owners.len() {
+        return Err(Error::InvalidNativeFunding);
+    }
+    let native = state.native();
+    let gateway = native.gateway();
+    let ledger = gateway.native();
+    for (point, witness) in tx.inputs.iter().zip(&mut witnesses.owners) {
+        let output = ledger.output(point).ok_or(Error::InvalidNativeFunding)?;
+        if output.asset != tx.asset {
+            return Err(Error::InvalidNativeFunding);
+        }
+        // Even a reserve whose recorded owner is the payer is not a normal
+        // spendable coin. Its protocol-specific witness must remain untouched.
+        if native.is_locked(point) {
+            continue;
+        }
+        if native.spendable_output(point).is_none() {
+            return Err(Error::InvalidNativeFunding);
+        }
+        if output.output.owner == payer {
+            *witness = signature.to_vec();
+        }
+    }
+    Ok(())
 }
 
 impl FundingReview {
@@ -229,6 +278,33 @@ impl FundingReview {
         signature: &[u8],
         verifier: &dyn SignatureVerifier,
     ) -> Result<DecodedIntent, Error> {
+        self.finish_with_signature(state, payer, height, signature, verifier, false)
+    }
+
+    /// Attach the joint signature to the BLCH payer and its unlocked native
+    /// inputs, identified from trusted state rather than caller-supplied indexes.
+    /// Locked reserve slots and other owners' witnesses remain unchanged. Module
+    /// and gateway committee signatures are never filled by this method.
+    pub fn finish_with_account_signature(
+        self,
+        state: &State,
+        payer: &[u8],
+        height: u64,
+        signature: &[u8],
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<DecodedIntent, Error> {
+        self.finish_with_signature(state, payer, height, signature, verifier, true)
+    }
+
+    fn finish_with_signature(
+        self,
+        state: &State,
+        payer: &[u8],
+        height: u64,
+        signature: &[u8],
+        verifier: &dyn SignatureVerifier,
+        native_owners: bool,
+    ) -> Result<DecodedIntent, Error> {
         self.check_context(state, payer, height, self.intent.canonical_bytes())?;
         if signature.is_empty()
             || signature.len() > super::MAX_BASE_WITNESS_BYTES
@@ -252,6 +328,9 @@ impl FundingReview {
         // Preparation established exactly one matching payer key. Replacing
         // only this signature leaves all transaction and other witness fields.
         keys[0].signature = signature.to_vec();
+        if native_owners {
+            attach_native_owners(state, &mut request, payer, signature)?;
+        }
         let bytes = pool_wire::encode(&request, &self.intent.domain()).map_err(Error::Wire)?;
         let signed = DecodedIntent::decode(&bytes, &self.intent.domain()).map_err(Error::Wire)?;
         if signed.authorization() != self.intent.authorization() {

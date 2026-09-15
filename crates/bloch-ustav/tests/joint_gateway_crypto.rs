@@ -840,7 +840,7 @@ fn signed_gateway_preflight_predicts_import_and_withdraw_and_rejects_forgery() {
 }
 
 #[test]
-fn sponsor_signature_attachment_preserves_gateway_authorities_and_executes() {
+fn sponsor_account_attachment_preserves_other_owner_and_gateway_authorities() {
     use bloch_pos_committee::transition::native_dex::{
         pool_review::FundingReview, pool_submission::SubmissionReview,
     };
@@ -858,7 +858,7 @@ fn sponsor_signature_attachment_preserves_gateway_authorities_and_executes() {
         let bytes = pending.canonical_bytes(&DOMAIN).unwrap();
         let review = FundingReview::prepare(state, &bytes, &keys()[0].0, height).unwrap();
         let attached = review
-            .finish_with_payer_signature(state, &keys()[0].0, height, &signature, &BaseVerifier)
+            .finish_with_account_signature(state, &keys()[0].0, height, &signature, &BaseVerifier)
             .unwrap();
         assert_eq!(attached.canonical_bytes(), original);
         original

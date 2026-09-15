@@ -481,3 +481,31 @@ fn funding_review_honors_inner_deadline_and_refuses_conflicting_expiry() {
         Err(ReviewError::InvalidExpiry)
     ));
 }
+
+#[test]
+fn account_attachment_preserves_all_six_pool_operation_packets() {
+    use super::super::{pool_review::FundingReview, tests::signature};
+    // Structural coverage uses the deterministic test verifier; real PQ swap
+    // and gateway fixtures cover the cryptographic attachment path separately.
+    for (state, request) in fixtures() {
+        let payer = review_payer(&request);
+        let bytes = encode(&request, &DOMAIN).unwrap();
+        let root = state.state_root();
+        let review = FundingReview::prepare(&state, &bytes, &payer, 1).unwrap();
+        let sig = signature(&review.intent().authorization(), &payer);
+        let attached = review
+            .finish_with_account_signature(&state, &payer, 1, &sig, &BoundVerifier)
+            .unwrap();
+        assert_eq!(attached.canonical_bytes(), bytes);
+        assert_eq!(state.state_root(), root);
+        let mut executed = state.clone();
+        apply_encoded(
+            &mut executed,
+            attached.canonical_bytes(),
+            1,
+            &BoundVerifier,
+            &BoundVerifier,
+        )
+        .unwrap();
+    }
+}

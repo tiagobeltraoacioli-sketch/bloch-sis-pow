@@ -187,3 +187,40 @@ empty and oversized signatures, account changes, height regression, expiry and
 changed state. A valid signature that makes the final packet exceed its reviewed
 size declaration is also refused. Sponsored import and withdrawal exercise the same attachment path
 while preserving every issuer, owner and committee witness byte.
+
+## Account signature across BLCH and native inputs
+
+`FundingReview::finish_with_account_signature` extends the payer-only attachment
+with an explicit account-owner path. Both methods share the existing signature,
+context, canonical-packet and unchanged-charge checks; payer-only attachment keeps
+its original behavior. The account method fills the BLCH payer signature and the
+positional native owner witnesses for unlocked inputs owned by that exact payer.
+
+Ownership is resolved from the retained transaction's input outpoints in the
+trusted current state, not from website-supplied indexes, output recipients or
+owner labels. Native inputs must exist, belong to the declared asset and have a
+witness slot. An unlocked input must also be spendable through the combined state's
+custody-aware view. A locked input's witness is preserved even if its recorded
+owner is the selected account; reserve authorization remains executor-owned.
+Other accounts' input witnesses, policy module redeemers, eligibility proofs and
+gateway committee approvals are preserved exactly. An initialization operation
+has no native transaction and uses only the BLCH payer attachment.
+
+This method verifies one account's signature, not every role in the packet. It
+cannot fill issuer/module/committee roles or promise executability. Full signed
+submission preflight and normal execution remain required, including all reserve
+and AMM checks. Missing or invalid other-party witnesses remain invalid. No key
+access, browser export, network submission or consent mechanism is added.
+
+Real-PQ tests clear both payer and native owner signatures, attach the same verified
+joint signature, and execute swaps in both directions. They compare the complete
+resulting packet with the expected bytes, keep reserve witnesses empty, and compare
+preflight roots with actual execution. Sponsored gateway import and withdrawal
+preserve other-owner and issuer/committee signatures byte-for-byte. Missing native
+inputs are refused without altering the source state.
+
+A separate structural regression covers all six pool lifecycle operations with
+the deterministic test verifier, including native reserves whose recorded owner
+is the payer. Reattaching the existing account signature preserves the complete
+canonical packet and its execution behavior. This structural test is distinct
+from the real-PQ integration checks above.
