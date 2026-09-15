@@ -460,6 +460,148 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
+    #[ignore = "requires NATIVE_FUNDING_BIN pointing to the separately built CLI"]
+    fn real_cli_prepares_signs_and_refuses_changed_intent() {
+        use bloch_crypto::{crypto, wallet::Keypair};
+        use std::process::Command;
+        let binary =
+            std::env::var("NATIVE_FUNDING_BIN").expect("build CLI and set NATIVE_FUNDING_BIN");
+        let (public, secret) = crypto::generate_keypair();
+        let raw = public[4..].to_vec();
+        let key = Keypair {
+            private_key: secret[4..].to_vec(),
+            public_key: raw.clone(),
+            address: crypto::address_from_pubkey(&raw, false),
+        };
+        let dir =
+            std::env::temp_dir().join(format!("bloch-native-cli-test-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let wallet = dir.join("wallet.json");
+        let pass = dir.join("password");
+        let pubfile = dir.join("public.hex");
+        let draft = dir.join("draft.hex");
+        let signed = dir.join("signed.hex");
+        let password = "Disposable native CLI test password 2026!";
+        key.save_encrypted(&wallet, password).unwrap();
+        std::fs::write(&pass, password).unwrap();
+        std::fs::write(&pubfile, hex(&raw)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&pass, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let before = std::fs::read(&wallet).unwrap();
+        let common = vec![
+            "--pubkey".to_owned(),
+            pubfile.display().to_string(),
+            "--txid".into(),
+            hex(&[2; 32]),
+            "--vout".into(),
+            "1".into(),
+            "--input-value".into(),
+            "4000000000000".into(),
+            "--amount".into(),
+            "2500001000000".into(),
+            "--base-fee".into(),
+            "10".into(),
+            "--tip".into(),
+            "5".into(),
+            "--max-fee".into(),
+            "1000000".into(),
+            "--epoch".into(),
+            "5000".into(),
+        ];
+        let prepared = Command::new(&binary)
+            .args(&common)
+            .arg("--out")
+            .arg(&draft)
+            .output()
+            .unwrap();
+        assert!(
+            prepared.status.success(),
+            "{}",
+            String::from_utf8_lossy(&prepared.stderr)
+        );
+        let unsigned = unhex(std::fs::read_to_string(&draft).unwrap().trim()).unwrap();
+        let tx = PosTransaction::from_canonical_bytes(&unsigned).unwrap();
+        let root = tx.checked_signing_root(5000);
+        let extra = vec![
+            "--tx".to_owned(),
+            draft.display().to_string(),
+            "--wallet".into(),
+            wallet.display().to_string(),
+            "--passphrase-file".into(),
+            pass.display().to_string(),
+            "--expected-root".into(),
+            hex(&root),
+        ];
+        let result = Command::new(&binary)
+            .args(&common)
+            .args(&extra)
+            .arg("--out")
+            .arg(&signed)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&result.stdout).contains(password));
+        assert!(!String::from_utf8_lossy(&result.stderr).contains(password));
+        let bytes = std::fs::read(&signed).unwrap();
+        let tx_signed = PosTransaction::from_canonical_bytes(
+            &unhex(std::str::from_utf8(&bytes).unwrap().trim()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(tx_signed.txid(), tx.txid());
+        if let PosTransaction::TransferV2 { keys, .. } = tx_signed {
+            assert!(crypto::verify(&raw, &root, &keys[0].signature));
+        } else {
+            panic!("wrong signed type");
+        }
+        let again = Command::new(&binary)
+            .args(&common)
+            .args(&extra)
+            .arg("--out")
+            .arg(&signed)
+            .output()
+            .unwrap();
+        assert!(!again.status.success());
+        assert_eq!(bytes, std::fs::read(&signed).unwrap());
+        // A nonexistent password file makes the failure ordering observable.
+        std::fs::remove_file(&pass).unwrap();
+        let mut changed = common.clone();
+        let index = changed.iter().position(|v| v == "--amount").unwrap() + 1;
+        changed[index] = "2500002000000".into();
+        let rejected = dir.join("rejected.hex");
+        let bad = Command::new(&binary)
+            .args(&changed)
+            .args(&extra)
+            .arg("--out")
+            .arg(&rejected)
+            .output()
+            .unwrap();
+        assert!(!bad.status.success());
+        assert!(String::from_utf8_lossy(&bad.stderr).contains("Draft differs"));
+        assert!(!rejected.exists());
+        let missing = Command::new(&binary)
+            .args(&common)
+            .args(&extra)
+            .arg("--out")
+            .arg(&rejected)
+            .output()
+            .unwrap();
+        assert!(!missing.status.success());
+        assert!(!rejected.exists());
+        assert_eq!(before, std::fs::read(&wallet).unwrap());
+        assert_eq!(
+            unsigned,
+            unhex(std::fs::read_to_string(&draft).unwrap().trim()).unwrap()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn rejects_wrong_keys_caps_rates_and_insufficient_change() {
         assert!(plan(vec![1; 3749], [2; 32], 0, 10000, 1000, 10, 5, 1000).is_err());
         assert!(plan(vec![1; 3745], [2; 32], 0, 10000, 1000, 0, 5, 1000).is_err());

@@ -71,3 +71,22 @@ Tests cover a real disposable encrypted legacy wallet, unchanged wallet bytes,
 signature verification and stable transaction ID, pre-unlock intent/root
 rejection, repeated-signing refusal, wrong password and file permissions.
 These local checks are not a mainnet conversion or an independent audit.
+
+
+## Separate-process CLI integration
+
+The integration test invokes the separately built executable against a
+disposable encrypted legacy wallet. Run it explicitly after building:
+
+```sh
+NATIVE_FUNDING_BIN="$(pwd)/target/debug/examples/native-funding-plan" \
+  cargo +1.94.1 test --locked -p bloch-pos-node --example native-funding-plan \
+  real_cli_prepares_signs_and_refuses_changed_intent -- --ignored
+```
+
+Adjust the executable path if using `CARGO_TARGET_DIR`. A passing run must
+report one executed test, not zero matching tests. The September 15 run
+passed preparation and signing, consensus decoding, signature verification,
+stable transaction ID, output overwrite refusal, changed-amount rejection
+before password access, missing-password refusal and unchanged wallet/draft
+files. It used no production wallet, RPC or transaction submission.
