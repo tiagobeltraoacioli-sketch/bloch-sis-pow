@@ -461,7 +461,7 @@ fn malformed_transport_and_each_authority_failure_preserve_both_ledgers() {
 fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
     use bloch_ustav::{
         dex_admission::PendingBatch,
-        dex_journal::{Journal, TailRecovery},
+        dex_journal::{Checkpoint, Error as JournalError, Journal, TailRecovery},
     };
     let path = std::env::temp_dir().join(format!(
         "bloch-joint-gateway-{}-{}.log",
@@ -478,6 +478,7 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
         unreachable!()
     };
     let route = import.deposit.route;
+    let original_head = journal.checkpoint();
     for frame in frames {
         pending.admit(&journal, frame, 4).unwrap();
     }
@@ -486,6 +487,11 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
     assert!(view.import_record(&route, 0).is_none());
     assert!(view.release_record(&route, 0).is_none());
     assert!(view.releases_after(&route, None, 1).unwrap().is_empty());
+    assert!(journal
+        .release_page(original_head, &route, None, 1)
+        .unwrap()
+        .records()
+        .is_empty());
     assert_eq!(journal.state().state_root(), anchor.state_root());
     assert_eq!(pending.commit(&mut journal, 4).unwrap().post_root, expected);
     let view = journal.state().native().gateway();
@@ -500,6 +506,49 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
     );
     assert!(view.releases_after(&route, Some(0), 1).unwrap().is_empty());
     let head = journal.checkpoint();
+    let bytes_before_queries = std::fs::read(&path).unwrap();
+    for stale in [
+        original_head,
+        Checkpoint {
+            height: head.height - 1,
+            ..head
+        },
+        Checkpoint {
+            root: [0; 32],
+            ..head
+        },
+    ] {
+        assert!(matches!(
+            journal.release_page(stale, &route, None, 1),
+            Err(JournalError::WrongHead)
+        ));
+    }
+    let page = journal.release_page(head, &route, None, 1).unwrap();
+    assert_eq!(page.checkpoint(), head);
+    assert_eq!(page.route(), &route);
+    assert_eq!(page.records(), &[&release]);
+    assert_eq!(page.next_after(), Some(0));
+    let next = journal
+        .release_page(head, &route, page.next_after(), 1)
+        .unwrap();
+    assert!(next.records().is_empty());
+    assert_eq!(next.next_after(), None);
+    assert!(journal
+        .release_page(head, &route, Some(u64::MAX), 1)
+        .unwrap()
+        .records()
+        .is_empty());
+    for limit in [0, 129, usize::MAX] {
+        assert!(matches!(
+            journal.release_page(head, &route, None, limit),
+            Err(JournalError::Gateway(gateway::Error::ResourceLimit))
+        ));
+    }
+    assert!(matches!(
+        journal.release_page(head, &[0; 32], None, 1),
+        Err(JournalError::Gateway(gateway::Error::UnknownRoute))
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), bytes_before_queries);
     drop(journal);
     let reopened = Journal::open(&path, anchor, 3, head, TailRecovery::Reject).unwrap();
     assert_eq!(reopened.state().state_root(), expected);
@@ -513,6 +562,10 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
     assert!(view.import_record(&route, 1).is_none());
     assert!(view.release_record(&route, 1).is_none());
     assert_eq!(reopened.checkpoint(), head);
+    let page = reopened.release_page(head, &route, None, 1).unwrap();
+    assert_eq!(page.records(), &[&release]);
+    assert_eq!(page.checkpoint(), head);
+    assert_eq!(page.next_after(), Some(0));
     drop(reopened);
     std::fs::remove_file(path).unwrap();
 }

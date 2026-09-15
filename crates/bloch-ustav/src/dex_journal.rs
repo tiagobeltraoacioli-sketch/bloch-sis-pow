@@ -1,6 +1,7 @@
 //! Durable candidate replay for an explicitly enabled local DEX host.
 //! No live block integration or authority to derive checkpoints from this log.
 use crate::{BlochVerifier, Verifier};
+use bloch_euvm::ustav::gateway::{self, Release};
 use bloch_pos_committee::{
     transition::native_dex::{pool_batch, pool_candidate, State},
     SignatureVerifier,
@@ -40,6 +41,33 @@ pub enum Error {
     Poisoned,
     Incomplete { offset: u64 },
     Candidate(pool_candidate::Error),
+    Gateway(gateway::Error),
+}
+
+/// One page from a healthy local journal at an exact checkpoint. Records are
+/// borrowed, preventing journal mutation until the page's last use.
+/// This is not consensus finality or an external payout authorization.
+pub struct ReleasePage<'a> {
+    checkpoint: Checkpoint,
+    route: [u8; 32],
+    records: Vec<&'a Release>,
+}
+impl ReleasePage<'_> {
+    pub fn checkpoint(&self) -> Checkpoint {
+        self.checkpoint
+    }
+    pub fn route(&self) -> &[u8; 32] {
+        &self.route
+    }
+    pub fn records(&self) -> &[&Release] {
+        &self.records
+    }
+    /// Use this exclusive cursor with the SAME checkpoint for the next page.
+    /// None means this page is empty; a nonempty last page may require one final
+    /// empty query to establish that traversal is complete at this checkpoint.
+    pub fn next_after(&self) -> Option<u64> {
+        self.records.last().map(|r| r.nonce)
+    }
 }
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
@@ -211,6 +239,42 @@ impl Journal {
     }
     pub fn checkpoint(&self) -> Checkpoint {
         self.head
+    }
+
+    /// Query persisted local releases only at the caller's pinned checkpoint.
+    /// A changed height OR root requires restarting traversal. Failed writes
+    /// disable this API until reopen/reconciliation, even though state() remains
+    /// available for diagnostics.
+    /// ```compile_fail
+    /// use bloch_ustav::dex_journal::{Checkpoint, Journal};
+    /// fn mutate(journal: &mut Journal, head: Checkpoint, route: &[u8; 32]) {
+    ///     let page = journal.release_page(head, route, None, 1).unwrap();
+    ///     journal.append(&[], head.height + 1);
+    ///     println!("{}", page.records().len());
+    /// }
+    /// ```
+    pub fn release_page(
+        &self,
+        expected: Checkpoint,
+        route: &[u8; 32],
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<ReleasePage<'_>, Error> {
+        self.ensure_healthy()?;
+        if self.head != expected {
+            return Err(Error::WrongHead);
+        }
+        let records = self
+            .state
+            .native()
+            .gateway()
+            .releases_after(route, after, limit)
+            .map_err(Error::Gateway)?;
+        Ok(ReleasePage {
+            checkpoint: self.head,
+            route: *route,
+            records,
+        })
     }
 
     /// The host supplies the authenticated candidate height. Successful return

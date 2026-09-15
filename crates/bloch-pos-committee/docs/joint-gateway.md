@@ -80,7 +80,19 @@ records directly from the ordered maps, so they do not clone the complete
 gateway or expose an executable inner ledger. They do not modify supply,
 liabilities, replay protection or the state root.
 
-For the durable host, query `journal.state()` and associate results with
+For the durable host, prefer `journal.release_page(expected_checkpoint, &route,
+after, limit)`. It verifies journal health and the complete expected height/root
+before returning a bounded borrowed page. The page carries that checkpoint and
+route; `next_after()` returns the last nonce, or None for an empty page. Continue
+using the same checkpoint. A changed height or root returns `WrongHead`; restart
+the traversal deliberately instead of silently switching states. A nonempty final
+page may require a final empty query. Queries after a write/sync failure return
+`Poisoned` until the host reopens and reconciles the journal.
+
+The borrowed page prevents mutable access to the journal while its records are
+still in use. A network service must acquire its host read lock before calling
+this API; the library does not install a transport or a global lock. For individual
+import lookups, query `journal.state()` and associate results with
 `journal.checkpoint()` while holding the same host read lock. Admission previews
 do not appear in that journal state. Persisted import/release records remain
 queryable after replay and reopening against the trusted checkpoint. Queries
