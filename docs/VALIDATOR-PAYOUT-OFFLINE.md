@@ -278,3 +278,18 @@ public transaction and its signing observations alongside this report. Keep
 node/operator provenance in your own records; different tunnel URLs do not
 establish independent operators. The report is an observation record, not a
 certificate of cryptographic inclusion or complete mainnet qualification.
+
+
+## HTTP and process integration qualification
+
+Run `python3 scripts/test-payout-rpc-integration.py` to exercise the verifier
+as a child process against two synthetic HTTP servers bound only to loopback.
+The test needs permission to bind local sockets. It verifies saved JSON,
+overwrite refusal, ignored ambient proxies, recovery across a moving head,
+HTML/redirect rejection, unfinalized or mismatched payout rejection, and
+failure before RPC when the signed file is missing.
+
+The September 15 run passed all four test cases against helper bytes identical
+to the distributed script. [Retained scope and source hashes](audit/reproducers/payout-rpc-integration-2026-09-15.json)
+identify that run. These are simulated RPC responses, not independently
+running consensus nodes or a mainnet lifecycle qualification.

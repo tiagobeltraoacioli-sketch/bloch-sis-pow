@@ -1,0 +1,21 @@
+{
+  "utc": "2026-09-15T03:08:20.926119+00:00",
+  "status": "passed",
+  "tests": 4,
+  "scope": "Two synthetic HTTP RPC servers on loopback; verifier runs as a separate child process. No chain nodes, production keys, funds or mainnet requests.",
+  "verified_behaviors": [
+    "success JSON equals saved report",
+    "existing report preserved",
+    "ambient HTTP proxy ignored",
+    "moving head retried",
+    "HTML and redirect refused",
+    "pending spend and wrong destination refused",
+    "missing signed file stops before RPC"
+  ],
+  "files": {
+    "scripts/verify-validator-payout.py": "7db7527c40bea13b32b3bc42a72b1b6a63eea31081779a0d3ca8fc9d4ea23089",
+    "scripts/test-payout-rpc-integration.py": "f149d2d00b5659da3219e395e02cf60e26d28b0056f89c2df1c95f7d2783a0f1",
+    "scripts/test-verify-validator-payout.py": "3757d0bd981d60eca251b63bb7a28e5affcdf2ba4e5b417e3d76789de74a02f2"
+  },
+  "published_helper_matches_tested_bytes": true
+}
