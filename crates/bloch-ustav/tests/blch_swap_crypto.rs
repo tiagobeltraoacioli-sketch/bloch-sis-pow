@@ -605,3 +605,28 @@ fn forged_signatures_theft_slippage_and_stale_roots_reject_atomically() {
         .execute_blch_swap(&valid, 4, &BaseVerifier, &BlochVerifier)
         .unwrap();
 }
+
+#[test]
+fn swap_funding_review_binds_real_trader_and_rejects_post_execution_state() {
+    use bloch_pos_committee::transition::native_dex::pool_review::{Error, FundingReview};
+    let (mut state, pool, reserve, funding) = initialized();
+    let request = swap_request(&state, pool, reserve, ([9; 32], 0), Some(funding));
+    let payer = &identities()[2].0;
+    let bytes = request.canonical_bytes(&DOMAIN).unwrap();
+    let review = FundingReview::prepare(&state, &bytes, payer, 4).unwrap();
+    let outstanding = FundingReview::prepare(&state, &bytes, payer, 4).unwrap();
+    let fee = *review.charge();
+    let checked = review.finish(&state, payer, 4, &bytes).unwrap();
+    assert_eq!(
+        checked.authorization(),
+        request.authorization(&DOMAIN).unwrap()
+    );
+    let receipt = state
+        .execute_blch_swap(&request, 4, &BaseVerifier, &BlochVerifier)
+        .unwrap();
+    assert_eq!(receipt.charge, fee);
+    assert!(matches!(
+        outstanding.finish(&state, payer, 4, &bytes),
+        Err(Error::StateChanged)
+    ));
+}

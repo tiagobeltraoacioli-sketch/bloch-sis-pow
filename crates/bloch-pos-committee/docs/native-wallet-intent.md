@@ -69,3 +69,49 @@ The existing GitHub and GitLab native regression jobs include these commands.
 Local results do not imply remote CI success. Browser delivery, verified chain
 context, account-specific intent review, explicit approval, native DEX signing,
 consensus activation and an operational USDT bridge remain separate work.
+
+## Single-payer funding review
+
+`pool_review::FundingReview::prepare(state, packet, payer, height)` adds a local
+BLCH funding check to the immutable decoder. The state and height must come from
+an authenticated host view, and the selected public key must come from the
+wallet's own signer. Website-supplied copies of those values do not establish
+trust. This API deliberately supports exactly one BLCH payer; bridge issuer,
+committee and multi-payer review flows are outside its scope.
+
+Preparation checks the one encoded BLCH key against that selected key. It checks
+input uniqueness, real UTXO existence and script ownership, refuses ordinary
+spends of locked reserves, and counts only unlocked payer coins as funding.
+A protocol-reserve input is excluded only if it matches the referenced pool or
+close operation's known locked reserve. It is never reported as spendable wallet
+balance. The inputs must cover at least the full packet's network charge.
+
+The charge comes from the existing fee dispatcher and current local state.
+`wallet_outputs_sats()` reports all outputs addressed to the payer, including
+swap proceeds if applicable. It must not be labeled "change" or "net cost".
+The full typed intent remains available for reviewing all other fields.
+
+The review records the complete state root, exact packet, selected key, review
+height and earliest inclusive expiry height across the outer operation, native
+transaction and (for imports) source-event certificate. Inconsistent nested
+expiry is refused. Heights are not wall-clock timestamps.
+
+After the separate human review, `finish` consumes the object and compares the
+current account, exact packet and complete state root, rejects regressing heights
+and expiry, and returns the immutable intent only if those checks pass. A failed
+attempt also consumes it; the same review cannot be retried. A signed packet has
+different bytes, so filling witnesses requires a separate review at submission.
+
+This is an observation of local state, not a state lock, reservation, permission
+token or human-approval system. It does not authenticate the selected key's
+private-key possession, validate signatures, prove source finality, validate the
+complete native leg or establish pool/AMM execution validity. Context must still
+be checked at signing and submission, and the real executor must validate the
+complete transaction. No transfer is sent by preparation or finishing.
+
+Regression tests cover all six pool operations, exact fees settled by execution,
+reserve exclusion, payer mismatch, duplicate/missing/incorrectly indexed coins,
+unknown pool references, changed state/account/packet, height regression and
+inclusive inner/outer expiry. A compile-fail test prevents reuse after finishing.
+Real-PQ integration tests additionally exercise a trader swap and a sponsored
+bridge import/withdrawal, including the import certificate's shorter deadline.

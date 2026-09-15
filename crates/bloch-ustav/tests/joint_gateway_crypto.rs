@@ -714,3 +714,64 @@ fn bridge_import_liquidity_independent_trade_and_redemption_survive_restart() {
 #[path = "support/bridge_market_roundtrip.rs"]
 mod market_roundtrip;
 use market_roundtrip::complete_market_roundtrip;
+
+#[test]
+fn gateway_funding_review_binds_real_sponsor_and_import_certificate_deadline() {
+    use bloch_pos_committee::transition::native_dex::pool_review::{Error, FundingReview};
+    let (mut state, import) = fixture();
+    let payer = &keys()[0].0;
+    let bytes = import.canonical_bytes(&DOMAIN).unwrap();
+    let before = state.state_root();
+    assert!(matches!(
+        FundingReview::prepare(&state, &bytes, &keys()[1].0, 4),
+        Err(Error::UnsupportedPayer)
+    ));
+    let review = FundingReview::prepare(&state, &bytes, payer, 4).unwrap();
+    assert_eq!(review.funding_sats(), u128::from(COIN));
+    let fee = *review.charge();
+    let checked = review.finish(&state, payer, 4, &bytes).unwrap();
+    assert_eq!(
+        checked.authorization(),
+        import.authorization(&DOMAIN).unwrap()
+    );
+    assert_eq!(state.state_root(), before);
+    let receipt = state
+        .execute_gateway(&import, 4, &BaseVerifier, &BlochVerifier)
+        .unwrap();
+    assert_eq!(receipt.charge, fee);
+    let burn = withdrawal(&state, &import, &receipt);
+    let bytes = burn.canonical_bytes(&DOMAIN).unwrap();
+    let review = FundingReview::prepare(&state, &bytes, payer, 5).unwrap();
+    let fee = *review.charge();
+    review.finish(&state, payer, 5, &bytes).unwrap();
+    let receipt = state
+        .execute_gateway(&burn, 5, &BaseVerifier, &BlochVerifier)
+        .unwrap();
+    assert_eq!(receipt.charge, fee);
+
+    let (state, mut import) = fixture();
+    let Operation::Import(r) = &mut import.gateway.operation else {
+        unreachable!()
+    };
+    r.valid_until = 3;
+    let bytes = import.canonical_bytes(&DOMAIN).unwrap();
+    assert_eq!(
+        FundingReview::prepare(&state, &bytes, payer, 3)
+            .unwrap()
+            .valid_until(),
+        3
+    );
+    assert!(matches!(
+        FundingReview::prepare(&state, &bytes, payer, 4),
+        Err(Error::Expired)
+    ));
+    let Operation::Import(r) = &mut import.gateway.operation else {
+        unreachable!()
+    };
+    r.valid_until = import.valid_until + 1;
+    let bytes = import.canonical_bytes(&DOMAIN).unwrap();
+    assert!(matches!(
+        FundingReview::prepare(&state, &bytes, payer, 1),
+        Err(Error::InvalidExpiry)
+    ));
+}

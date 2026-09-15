@@ -289,3 +289,195 @@ fn decoded_intent_distinguishes_signed_intent_from_witness_packet_identity() {
     assert_ne!(intent.authorization(), different_trade.authorization());
     assert_ne!(intent.packet_hash(), different_trade.packet_hash());
 }
+
+fn review_payer(request: &Request) -> Vec<u8> {
+    let base = match request {
+        Request::Gateway(r) => &r.blch,
+        Request::CreatePair(r) => &r.blch,
+        Request::Initialize(r) => &r.blch,
+        Request::Add(r) => &r.blch,
+        Request::Swap(r) => &r.blch,
+        Request::Remove(r) => &r.blch,
+        Request::ClosePair(r) => &r.blch,
+    };
+    let PosTransaction::TransferV2 { keys, .. } = base else {
+        unreachable!()
+    };
+    keys[0].pubkey.clone()
+}
+
+#[test]
+fn funding_review_matches_execution_charge_and_preserves_state_for_all_pool_operations() {
+    use super::super::pool_review::FundingReview;
+    for (state, request) in fixtures() {
+        let payer = review_payer(&request);
+        let bytes = encode(&request, &DOMAIN).unwrap();
+        let root = state.state_root();
+        let review = FundingReview::prepare(&state, &bytes, &payer, 1).unwrap();
+        assert_eq!(review.state_root(), root);
+        assert_eq!(review.height(), 1);
+        assert_eq!(review.payer(), payer);
+        assert!(review.funding_sats() > 0);
+        let expected = quote_encoded(&state, &bytes).unwrap();
+        assert_eq!(review.charge().gas, expected.gas);
+        assert_eq!(review.charge().base_fee_sat, expected.base_fee_sat);
+        assert_eq!(review.charge().priority_fee_sat, expected.priority_fee_sat);
+        let deadline = review.valid_until();
+        // Expiry is an inclusive chain height, not a wall-clock deadline.
+        let intent = review.finish(&state, &payer, deadline, &bytes).unwrap();
+        assert!(intent.matches_packet(&bytes));
+        assert_eq!(state.state_root(), root);
+        let mut executed = state.clone();
+        apply_encoded(&mut executed, &bytes, 1, &BoundVerifier, &BoundVerifier).unwrap();
+        assert_eq!(
+            executed.fee_escrow().0 - state.fee_escrow().0,
+            expected.base_fee_sat
+        );
+        assert_eq!(
+            executed.fee_escrow().1 - state.fee_escrow().1,
+            expected.priority_fee_sat
+        );
+    }
+}
+
+#[test]
+fn funding_review_refuses_changed_context_expiry_and_height_regression() {
+    use super::super::pool_review::{Error as ReviewError, FundingReview};
+    for (state, request) in fixtures() {
+        let payer = review_payer(&request);
+        let bytes = encode(&request, &DOMAIN).unwrap();
+        let prepare = || FundingReview::prepare(&state, &bytes, &payer, 2).unwrap();
+        assert!(matches!(
+            prepare().finish(&state, &[99; 32], 2, &bytes),
+            Err(ReviewError::AccountChanged)
+        ));
+        let mut changed = bytes.clone();
+        changed[0] ^= 1;
+        assert!(matches!(
+            prepare().finish(&state, &payer, 2, &changed),
+            Err(ReviewError::PacketChanged)
+        ));
+        assert!(matches!(
+            prepare().finish(&state, &payer, 1, &bytes),
+            Err(ReviewError::HeightRegressed)
+        ));
+        let deadline = prepare().valid_until();
+        assert!(matches!(
+            prepare().finish(&state, &payer, deadline + 1, &bytes),
+            Err(ReviewError::Expired)
+        ));
+        assert!(matches!(
+            FundingReview::prepare(&state, &bytes, &payer, deadline + 1),
+            Err(ReviewError::Expired)
+        ));
+        let mut advanced = state.clone();
+        apply_encoded(&mut advanced, &bytes, 2, &BoundVerifier, &BoundVerifier).unwrap();
+        assert!(matches!(
+            prepare().finish(&advanced, &payer, 2, &bytes),
+            Err(ReviewError::StateChanged)
+        ));
+    }
+}
+
+#[test]
+fn funding_review_binds_actual_payer_coins_and_excludes_locked_reserve_value() {
+    use super::super::pool_review::{Error as ReviewError, FundingReview};
+    let (state, request) = initial_liquidity::tests::swap_fixture();
+    let bytes = encode(&Request::Swap(request.clone()), &DOMAIN).unwrap();
+    let payer = review_payer(&Request::Swap(request.clone()));
+    assert!(matches!(
+        FundingReview::prepare(&state, &bytes, &[99; 32], 1),
+        Err(ReviewError::UnsupportedPayer)
+    ));
+    let review = FundingReview::prepare(&state, &bytes, &payer, 1).unwrap();
+    let PosTransaction::TransferV2 {
+        inputs, outputs, ..
+    } = &request.blch
+    else {
+        unreachable!()
+    };
+    let mut own = 0u128;
+    let mut reserves = 0u128;
+    for input in inputs {
+        let value = u128::from(state.base().utxo(&input.txid, input.vout).unwrap().value);
+        if state.base_is_locked(&(input.txid, input.vout)) {
+            reserves += value;
+        } else {
+            own += value;
+        }
+    }
+    assert!(reserves > 0);
+    assert_eq!(review.funding_sats(), own);
+    assert!(review.funding_sats() < own + reserves);
+    assert_eq!(
+        review.wallet_outputs_sats(),
+        outputs[1..]
+            .iter()
+            .map(|o| u128::from(o.value))
+            .sum::<u128>()
+    );
+    let mut unaffordable = request.clone();
+    if let PosTransaction::TransferV2 {
+        tip_millisat_per_gas,
+        ..
+    } = &mut unaffordable.blch
+    {
+        *tip_millisat_per_gas = fee_market::MAX_TIP_MILLISAT_PER_GAS;
+    }
+    let expensive = encode(&Request::Swap(unaffordable), &DOMAIN).unwrap();
+    assert!(matches!(
+        FundingReview::prepare(&state, &expensive, &payer, 1),
+        Err(ReviewError::InvalidFunding)
+    ));
+    let mut wrong_pool = request.clone();
+    wrong_pool.quote.pool = [255; 32];
+    let unknown = encode(&Request::Swap(wrong_pool), &DOMAIN).unwrap();
+    assert!(matches!(
+        FundingReview::prepare(&state, &unknown, &payer, 1),
+        Err(ReviewError::InvalidFunding)
+    ));
+    for mode in 0..5 {
+        let mut bad = request.clone();
+        let PosTransaction::TransferV2 { keys, inputs, .. } = &mut bad.blch else {
+            unreachable!()
+        };
+        let i = inputs.iter().position(|i| i.key_index == 0).unwrap();
+        match mode {
+            0 => inputs.push(inputs[i].clone()),
+            1 => inputs[i].txid = [255; 32],
+            2 => inputs[i].key_index = super::super::base_reserves::RESERVE_KEY_INDEX,
+            3 => keys[0].pubkey = vec![99; payer.len()],
+            _ => inputs.retain(|i| i.key_index != 0),
+        }
+        let bad_payer = keys[0].pubkey.clone();
+        let bytes = encode(&Request::Swap(bad), &DOMAIN).unwrap();
+        assert!(
+            matches!(
+                FundingReview::prepare(&state, &bytes, &bad_payer, 1),
+                Err(ReviewError::InvalidFunding)
+            ),
+            "mode {mode}"
+        );
+    }
+}
+
+#[test]
+fn funding_review_honors_inner_deadline_and_refuses_conflicting_expiry() {
+    use super::super::pool_review::{Error as ReviewError, FundingReview};
+    let (state, mut request) = initial_liquidity::tests::swap_fixture();
+    let payer = review_payer(&Request::Swap(request.clone()));
+    request.native.transaction.valid_until = 3;
+    let bytes = encode(&Request::Swap(request.clone()), &DOMAIN).unwrap();
+    let review = FundingReview::prepare(&state, &bytes, &payer, 3).unwrap();
+    assert_eq!(review.valid_until(), 3);
+    assert!(matches!(
+        review.finish(&state, &payer, 4, &bytes),
+        Err(ReviewError::Expired)
+    ));
+    request.native.transaction.valid_until = request.quote.valid_until + 1;
+    let bytes = encode(&Request::Swap(request), &DOMAIN).unwrap();
+    assert!(matches!(
+        FundingReview::prepare(&state, &bytes, &payer, 1),
+        Err(ReviewError::InvalidExpiry)
+    ));
+}
