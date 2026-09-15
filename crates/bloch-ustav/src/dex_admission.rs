@@ -9,6 +9,7 @@ use bloch_pos_committee::transition::native_dex::{pool_batch, pool_candidate};
 pub enum Error {
     Journal(dex_journal::Error),
     StaleParent,
+    HeightRegression,
     Closed,
     Duplicate,
     ResourceLimit,
@@ -54,7 +55,12 @@ impl PendingBatch {
         self.closed
     }
 
-    fn check_parent(&self, journal: &Journal) -> Result<(), Error> {
+    /// Latest trusted host height observed for this parent, not a finalized height.
+    pub fn height(&self) -> u64 {
+        self.height
+    }
+
+    fn check_context(&mut self, journal: &Journal, height: u64) -> Result<(), Error> {
         if self.closed {
             return Err(Error::Closed);
         }
@@ -62,13 +68,24 @@ impl PendingBatch {
         if journal.checkpoint() != self.parent {
             return Err(Error::StaleParent);
         }
+        if height < self.height {
+            return Err(Error::HeightRegression);
+        }
+        // Trusted execution height remains monotonic even when the request fails later.
+        self.height = height;
         Ok(())
     }
 
     /// Fully verify the ordered prefix plus this signed frame with fixed PQ
-    /// verifiers. Copy the new frame only after every validation succeeds.
-    pub fn admit(&mut self, journal: &Journal, frame: &[u8]) -> Result<pool_batch::Outcome, Error> {
-        self.check_parent(journal)?;
+    /// verifiers at the current trusted host height. Copy the new frame only
+    /// after every validation succeeds; the height watermark advances even on rejection.
+    pub fn admit(
+        &mut self,
+        journal: &Journal,
+        frame: &[u8],
+        height: u64,
+    ) -> Result<pool_batch::Outcome, Error> {
+        self.check_context(journal, height)?;
         let next_bytes = next_size(self.frames.len(), self.wire_bytes, frame.len() as u64)?;
         if self.frames.iter().any(|f| f.as_slice() == frame) {
             return Err(Error::Duplicate);
@@ -89,9 +106,10 @@ impl PendingBatch {
         Ok(outcome)
     }
 
-    /// Build a revalidated candidate without changing the queue, journal or state.
-    pub fn build(&self, journal: &Journal) -> Result<Vec<u8>, Error> {
-        self.check_parent(journal)?;
+    /// Build at the current trusted host height without changing pending frames,
+    /// the journal or State. The monotonic height watermark may advance.
+    pub fn build(&mut self, journal: &Journal, height: u64) -> Result<Vec<u8>, Error> {
+        self.check_context(journal, height)?;
         let refs: Vec<_> = self.frames.iter().map(Vec::as_slice).collect();
         pool_candidate::build(
             journal.state(),
@@ -103,11 +121,16 @@ impl PendingBatch {
         .map_err(Error::Candidate)
     }
 
-    /// Commit only through the journal's verification/write/fsync boundary.
+    /// Recheck expiry at the current trusted host height and commit only through
+    /// the journal's verification/write/fsync boundary.
     /// Errors preserve pending frames; I/O errors also poison the journal.
     /// Success closes this batch and releases its buffered frames.
-    pub fn commit(&mut self, journal: &mut Journal) -> Result<pool_batch::Outcome, Error> {
-        let candidate = self.build(journal)?;
+    pub fn commit(
+        &mut self,
+        journal: &mut Journal,
+        height: u64,
+    ) -> Result<pool_batch::Outcome, Error> {
+        let candidate = self.build(journal, height)?;
         let result = journal
             .append(&candidate, self.height)
             .map_err(Error::Journal)?;

@@ -45,7 +45,9 @@ exclusive prepared operation and installs state only after synchronization,
 avoiding a redundant full-State copy. It is disabled by default.
 The same feature provides [bounded signed-operation admission](docs/dex-admission.md):
 a volatile pending batch validates dependent operations before constructing and
-durably committing a candidate. Admission alone does not reserve or settle funds.
+durably committing a candidate. Every step requires the current trusted host
+height; delayed commits recheck expiry and cannot roll back the queue's height
+watermark. Admission alone does not reserve or settle funds.
 
 [Color-Changing Chameleon v1](../bloch-euvm/docs/chameleon-v1.md) adds sealed
 PQ-native escrow, an explicit Kirpich ERC-20 compatibility profile and an
