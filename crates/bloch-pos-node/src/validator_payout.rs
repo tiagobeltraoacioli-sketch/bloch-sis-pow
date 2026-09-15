@@ -199,6 +199,12 @@ fn fee(bytes: u64, tip: u128, o: &Observation) -> Result<u64, String> {
     if total >= o.value {
         return Err("payout cannot cover fee and a positive output".into());
     }
+    if o.value
+        .checked_sub(total)
+        .is_none_or(|value| value < bloch_pos_committee::params::MIN_TRANSFER_OUTPUT_SAT)
+    {
+        return Err("payout output is below the node minimum of 1000 satoshis".into());
+    }
     Ok(total)
 }
 fn reserved_size(tx: &PosTransaction) -> Result<u64, String> {

@@ -380,3 +380,68 @@ fn malformed_arguments_formats_and_extreme_fees_fail_closed() {
         .status
         .success());
 }
+
+#[test]
+fn output_at_relay_minimum_is_allowed_but_one_satoshi_less_is_refused() {
+    let f = Fixture::new();
+    let original = decode(&f.draft);
+    let PosTransaction::TransferV2 {
+        tx_bytes,
+        tip_millisat_per_gas,
+        ..
+    } = original
+    else {
+        unreachable!()
+    };
+    let charge = fee_market::charge(
+        TxClass::Eutxo { inputs: 1 },
+        tx_bytes,
+        10,
+        tip_millisat_per_gas,
+    );
+    let fee = u64::try_from(charge.base_fee_sat + charge.priority_fee_sat).unwrap();
+    for remainder in [999u64, 1000] {
+        let out = f.root.join(format!("minimum-{remainder}.hex"));
+        let mut args = f.args(
+            "prepare",
+            &[
+                "--pubkey".into(),
+                path(&f.root.join("public.hex")),
+                "--tip".into(),
+                "5".into(),
+                "--out".into(),
+                path(&out),
+            ],
+        );
+        replace(&mut args, "--input-value", (fee + remainder).to_string());
+        let response = invoke(&args);
+        if remainder == 999 {
+            assert!(!response.status.success());
+            assert!(String::from_utf8_lossy(&response.stderr).contains("minimum of 1000"));
+            assert!(!out.exists());
+        } else {
+            assert!(
+                response.status.success(),
+                "{}",
+                String::from_utf8_lossy(&response.stderr)
+            );
+            let PosTransaction::TransferV2 { outputs, .. } = decode(&out) else {
+                unreachable!()
+            };
+            assert_eq!(outputs[0].value, 1000);
+        }
+    }
+    let mut modified = decode(&f.draft);
+    if let PosTransaction::TransferV2 { outputs, .. } = &mut modified {
+        outputs[0].value = 999;
+    }
+    let dusty = f.root.join("dusty-draft.hex");
+    std::fs::write(&dusty, hex(&modified.canonical_bytes())).unwrap();
+    let out = f.root.join("must-not-sign.hex");
+    let mut args = f.signing(&dusty, &f.root.join("missing-keystore"), &out);
+    replace(&mut args, "--input-value", (fee + 999).to_string());
+    let response = invoke(&args);
+    assert!(!response.status.success());
+    assert!(String::from_utf8_lossy(&response.stderr).contains("minimum of 1000"));
+    assert!(!out.exists());
+}

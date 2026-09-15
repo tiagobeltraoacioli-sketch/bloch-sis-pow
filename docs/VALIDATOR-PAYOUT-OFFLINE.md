@@ -11,6 +11,8 @@ The command prepares, inspects and signs one TransferV2 (wire `0x06`). Its
 only input is output zero of `Withdraw { validator: INDEX }`; the input ID
 is derived using the consensus codec. It transfers the entire observed
 payout, minus the exact fee, to one explicitly approved destination.
+The remainder must be at least 1,000 satoshis, matching the node's relay
+minimum. An output one satoshi below that minimum is refused before signing.
 It never generates a key, contacts an RPC, broadcasts a transaction, or
 changes the withdrawal credential recorded in the registry.
 
@@ -31,6 +33,30 @@ withdrawal credential, validator, input value, fee, signing root, malformed
 witness tables, wrong keys, existing files, dangling symlinks, excessive
 input files, extreme fees, and plaintext opt-in refusal. This is local
 engineering evidence, not a mainnet spend or an independent custody audit.
+
+The full node rehearsal builds this CLI from the same isolated source copy
+and uses it to prepare, inspect and sign the payout created by the funded
+lifecycle. It checks application by both engines, finality past the spend's
+inclusion epoch, and replay to the same state. Signed intent mutations must
+fail specifically at signature verification. Run it with:
+
+```sh
+CARGO_PROFILE_TEST_OPT_LEVEL=2 python3 scripts/rehearse-validator-admission.py
+```
+
+The optimization setting only affects the test build. The rehearsal changes
+lifecycle activation gates in a disposable source copy, retains the actual
+2,048-epoch withdrawal delay, and uses a separate short-chain build for
+RANDAO renewal. It emits `PAYOUT_CLI_EVIDENCE` with full transaction/block
+IDs and finalized roots, followed by `PAYOUT_CLI_REPLAY_VERIFIED`. Require
+the final passing test result as well as those records; partial logs are
+not a completed qualification. These are two engines in one test process
+and a separate CLI process, not an independent-process partition test.
+
+The September 15 UTC run passed all stages, including finalized payout
+spending and replay. Its [retained evidence and log hashes](audit/reproducers/validator-payout-cli-lifecycle-2026-09-15.json)
+also record the six CLI tests and the deposit regression. Mainnet settlement
+remains a separate outstanding qualification.
 
 ## Obtain and verify public observations
 
@@ -117,3 +143,32 @@ block, finalized checkpoint, and independent confirmation that the old
 payout is spent and the new output exists. The output's transaction ID is
 unchanged by signing. Only settled mainnet evidence completes that stage
 of the controlled validator lifecycle.
+
+## Read-only settlement checks
+
+Replace the placeholders below with the consensus transaction IDs printed
+by the withdrawal encoder and payout CLI. Query your own node, preferably
+also an independently operated node. These requests do not submit anything:
+
+```sh
+curl --fail --show-error --max-time 30 -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getvalidator","params":[INDEX]}' \
+  http://127.0.0.1:16400/
+curl --fail --show-error --max-time 30 -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"gettxout","params":["WITHDRAWAL_TXID",0]}' \
+  http://127.0.0.1:16400/
+curl --fail --show-error --max-time 30 -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"gettxout","params":["PAYOUT_SPEND_TXID",0]}' \
+  http://127.0.0.1:16400/
+curl --fail --show-error --max-time 30 -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"gettxstatus","params":["PAYOUT_SPEND_TXID"]}' \
+  http://127.0.0.1:16400/
+```
+
+`gettxstatus` returns an object with `result.status`; require `finalized`
+for settlement. `unknown` is not a rejection verdict. `gettxout` returns
+`result.unspent`, `result.utxo` and `result.at_slot`. An absent output alone
+does not distinguish a spent output from one that never existed. Retain its
+earlier inclusion/value/credential evidence and verify the new output under
+the expected spend ID, destination and value. Compare nodes at a common
+block before interpreting differing observations as a divergence.

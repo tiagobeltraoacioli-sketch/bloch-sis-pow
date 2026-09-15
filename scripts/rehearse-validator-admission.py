@@ -74,6 +74,12 @@ def main():
                         "--skip", "funded_pre_activation_compatibility_rehearsal",
                         "--skip", "funded_joining_network_fixture",
                         "--skip", "funded_joining_network_evidence"]
+        if not args.randao_only and not args.audit_mempool:
+            subprocess.run(
+                ["cargo", f"+{pin.group(1)}", "build", "--locked", "-p", "bloch-pos-node", "--bin", "bloch-pos"],
+                cwd=checkout, env=env, check=True,
+            )
+            env["BLOCH_PAYOUT_TEST_BIN"] = str(Path(env["CARGO_TARGET_DIR"]) / "debug" / "bloch-pos")
         if not args.randao_only:
             subprocess.run(
                 ["cargo", f"+{pin.group(1)}", "test", "--locked", "-p", "bloch-pos-node",
