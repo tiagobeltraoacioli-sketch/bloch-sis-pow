@@ -4,6 +4,7 @@ use crate::{
     BlochVerifier,
 };
 use bloch_pos_committee::transition::native_dex::{pool_batch, pool_candidate};
+use std::io::{self, Read};
 
 #[derive(Debug)]
 pub enum Error {
@@ -13,6 +14,8 @@ pub enum Error {
     Closed,
     Duplicate,
     ResourceLimit,
+    LengthMismatch,
+    Io(io::Error),
     Batch(pool_batch::Error),
     Candidate(pool_candidate::Error),
 }
@@ -106,6 +109,24 @@ impl PendingBatch {
         Ok(outcome)
     }
 
+    /// Read one request BODY with a bounded allocation before PQ validation.
+    /// The reader must end at the body boundary, not at connection shutdown.
+    /// declared_length is untrusted; None supports bodies without a known length.
+    /// The transport must enforce its own deadline and connection/rate limits.
+    pub fn admit_from_reader(
+        &mut self,
+        journal: &Journal,
+        reader: &mut impl Read,
+        declared_length: Option<u64>,
+        height: u64,
+    ) -> Result<pool_batch::Outcome, Error> {
+        self.check_context(journal, height)?;
+        next_size(self.frames.len(), self.wire_bytes, 0)?;
+        let remaining = pool_batch::MAX_BYTES - self.wire_bytes;
+        let frame = read_body(reader, remaining, declared_length)?;
+        self.admit(journal, &frame, height)
+    }
+
     /// Build at the current trusted host height without changing pending frames,
     /// the journal or State. The monotonic height watermark may advance.
     pub fn build(&mut self, journal: &Journal, height: u64) -> Result<Vec<u8>, Error> {
@@ -141,6 +162,49 @@ impl PendingBatch {
     }
 }
 
+// At most quota+1 bytes are consumed. The extra byte detects an overlong body;
+// a transport must discard/close rejected bodies before handling another request.
+fn read_body(reader: &mut impl Read, quota: u64, declared: Option<u64>) -> Result<Vec<u8>, Error> {
+    if quota == 0 || quota > pool_batch::MAX_BYTES {
+        return Err(Error::ResourceLimit);
+    }
+    if let Some(length) = declared {
+        if length > quota {
+            return Err(Error::ResourceLimit);
+        }
+        if length == 0 {
+            return Err(Error::LengthMismatch);
+        }
+    }
+    let body_limit = declared.unwrap_or(quota);
+    let read_limit = body_limit + 1;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(read_limit as usize)
+        .map_err(|_| Error::ResourceLimit)?;
+    let mut limited = reader.take(read_limit);
+    let mut chunk = [0; 8192];
+    loop {
+        let count = match limited.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(Error::Io(error)),
+        };
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    if bytes.len() as u64 > quota {
+        return Err(Error::ResourceLimit);
+    }
+    if declared.is_some_and(|n| bytes.len() as u64 != n) {
+        return Err(Error::LengthMismatch);
+    }
+    if bytes.is_empty() {
+        return Err(Error::LengthMismatch);
+    }
+    Ok(bytes)
+}
+
 fn next_size(count: usize, current: u64, incoming: u64) -> Result<u64, Error> {
     if count >= pool_batch::MAX_OPERATIONS {
         return Err(Error::ResourceLimit);
@@ -154,6 +218,77 @@ fn next_size(count: usize, current: u64, incoming: u64) -> Result<u64, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct NoRead;
+    impl Read for NoRead {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            panic!("body must not be read")
+        }
+    }
+    #[test]
+    fn invalid_declared_lengths_reject_before_reading() {
+        for (quota, length) in [
+            (0, None),
+            (16, Some(17)),
+            (16, Some(u64::MAX)),
+            (16, Some(0)),
+        ] {
+            assert!(read_body(&mut NoRead, quota, length).is_err());
+        }
+    }
+    #[test]
+    fn known_and_unknown_lengths_consume_at_most_the_limit_plus_one() {
+        let body = vec![7; 100];
+        for declared in [None, Some(16)] {
+            let mut reader = io::Cursor::new(&body);
+            assert!(matches!(
+                read_body(&mut reader, 16, declared),
+                Err(Error::ResourceLimit)
+            ));
+            assert_eq!(reader.position(), 17);
+        }
+        let mut reader = io::Cursor::new(&body);
+        assert!(matches!(
+            read_body(&mut reader, 16, Some(8)),
+            Err(Error::LengthMismatch)
+        ));
+        assert_eq!(reader.position(), 9);
+        assert!(matches!(
+            read_body(&mut io::Cursor::new([1; 7]), 16, Some(8)),
+            Err(Error::LengthMismatch)
+        ));
+        assert!(matches!(
+            read_body(&mut io::empty(), 16, None),
+            Err(Error::LengthMismatch)
+        ));
+        for declared in [None, Some(16)] {
+            assert_eq!(
+                read_body(&mut io::Cursor::new([3; 16]), 16, declared).unwrap(),
+                [3; 16]
+            );
+        }
+    }
+    struct InterruptedThenChunked {
+        interrupted: bool,
+        body: io::Cursor<Vec<u8>>,
+    }
+    impl Read for InterruptedThenChunked {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let end = out.len().min(3);
+            self.body.read(&mut out[..end])
+        }
+    }
+    #[test]
+    fn fragmented_body_and_interrupted_reads_preserve_exact_bytes() {
+        let mut reader = InterruptedThenChunked {
+            interrupted: false,
+            body: io::Cursor::new(vec![9; 32]),
+        };
+        assert_eq!(read_body(&mut reader, 32, Some(32)).unwrap(), [9; 32]);
+    }
     #[test]
     fn capacity_bounds_accept_the_exact_limit_and_reject_overflow() {
         assert_eq!(

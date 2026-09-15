@@ -55,7 +55,14 @@ pub(super) fn check(anchor: &State, frames: &[&[u8]], final_state: &State) {
     assert_eq!(journal.checkpoint(), parent);
     assert_eq!(fs::read(&path).unwrap(), initial_file);
 
-    pending.admit(&journal, frames[0], 4).unwrap();
+    pending
+        .admit_from_reader(
+            &journal,
+            &mut std::io::Cursor::new(frames[0]),
+            Some(frames[0].len() as u64),
+            4,
+        )
+        .unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending.wire_bytes(), frames[0].len() as u64);
     assert!(matches!(
@@ -63,10 +70,36 @@ pub(super) fn check(anchor: &State, frames: &[&[u8]], final_state: &State) {
         Err(Error::Duplicate)
     ));
     let first_candidate = pending.build(&journal, 4).unwrap();
+    assert!(matches!(
+        pending.admit_from_reader(&journal, &mut NoBody, Some(pool_batch::MAX_BYTES), 4),
+        Err(Error::ResourceLimit)
+    ));
+    assert!(matches!(
+        pending.admit_from_reader(
+            &journal,
+            &mut std::io::Cursor::new(&frames[1][..20]),
+            Some(frames[1].len() as u64),
+            4
+        ),
+        Err(Error::LengthMismatch)
+    ));
+    let mut broken = BrokenBody { first: true };
+    assert!(matches!(
+        pending.admit_from_reader(&journal, &mut broken, None, 4),
+        Err(Error::Io(_))
+    ));
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending.wire_bytes(), frames[0].len() as u64);
+    assert_eq!(journal.checkpoint(), parent);
+    assert_eq!(fs::read(&path).unwrap(), initial_file);
+    assert_eq!(pending.build(&journal, 4).unwrap(), first_candidate);
+
     assert!(pending.admit(&journal, &frames[1][..20], 4).is_err());
     assert_eq!(pending.len(), 1);
     assert_eq!(pending.build(&journal, 4).unwrap(), first_candidate);
-    pending.admit(&journal, frames[1], 4).unwrap();
+    pending
+        .admit_from_reader(&journal, &mut std::io::Cursor::new(frames[1]), None, 4)
+        .unwrap();
     let two_candidate = pending.build(&journal, 4).unwrap();
     let mut forged = pool_wire::decode(frames[2], &DOMAIN).unwrap();
     if let pool_wire::Request::Remove(r) = &mut forged {
@@ -78,7 +111,14 @@ pub(super) fn check(anchor: &State, frames: &[&[u8]], final_state: &State) {
     ));
     assert_eq!(pending.len(), 2);
     assert_eq!(pending.build(&journal, 4).unwrap(), two_candidate);
-    let preview = pending.admit(&journal, frames[2], 4).unwrap();
+    let preview = pending
+        .admit_from_reader(
+            &journal,
+            &mut std::io::Cursor::new(frames[2]),
+            Some(frames[2].len() as u64),
+            4,
+        )
+        .unwrap();
     assert_eq!(preview.post_root, final_state.state_root());
     assert_eq!(pending.len(), 3);
     assert_eq!(
@@ -180,6 +220,14 @@ pub(super) fn check(anchor: &State, frames: &[&[u8]], final_state: &State) {
     ));
     assert_eq!(competing.len(), 1);
     assert_eq!(fs::read(&path).unwrap(), durable);
+    assert!(matches!(
+        pending.admit_from_reader(&journal, &mut NoBody, None, 5),
+        Err(Error::Closed)
+    ));
+    assert!(matches!(
+        competing.admit_from_reader(&journal, &mut NoBody, None, 5),
+        Err(Error::StaleParent)
+    ));
     let tip = journal.checkpoint();
     drop(journal);
     let reopened = Journal::open(&path, anchor.clone(), 3, tip, TailRecovery::Reject).unwrap();
@@ -187,4 +235,25 @@ pub(super) fn check(anchor: &State, frames: &[&[u8]], final_state: &State) {
     drop(reopened);
     fs::remove_file(&path).unwrap();
     fs::remove_dir(&directory).unwrap();
+}
+
+struct NoBody;
+impl std::io::Read for NoBody {
+    fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+        panic!("rejected request must not read its body")
+    }
+}
+struct BrokenBody {
+    first: bool,
+}
+impl std::io::Read for BrokenBody {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.first {
+            self.first = false;
+            out[0] = 7;
+            Ok(1)
+        } else {
+            Err(std::io::ErrorKind::TimedOut.into())
+        }
+    }
 }

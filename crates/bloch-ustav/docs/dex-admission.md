@@ -35,6 +35,34 @@ the same parent. The host must create a new batch and revalidate resubmitted
 operations; the API does not silently rebase them or trust an earlier preview.
 A successfully committed batch cannot be reused.
 
+## Bounded body reading
+
+`admit_from_reader(&journal, &mut reader, declared_length, current_height)` reads
+one request body before invoking the same signed-operation admission. It checks
+journal health, parent, monotonic height, operation capacity and remaining byte
+quota before reading. A closed/stale batch or an excessive declared length is
+rejected without consuming the body. The height watermark still advances after
+successful context checks, even if reading or subsequent validation fails.
+
+`declared_length` is optional and untrusted. A nonzero declared size must fit the
+remaining quota and exactly match the body. With no declared size, the reader
+accepts at most the remaining quota. It consumes at most the applicable limit
+plus one byte, using that extra byte to detect an overlong body. Buffer reservation
+is bounded by the same value (at most 262,145 bytes); it does not grow according
+to an unchecked request header. Empty bodies, premature end-of-body, excess bytes
+and I/O errors leave pending frames, confirmed state and journal bytes unchanged.
+Interrupted reads are retried; fragmented reads preserve the exact payload.
+
+The reader must delimit a single decoded request body and return EOF at its end.
+Do not pass a raw keep-alive TCP connection: an HTTP framework must handle message
+framing, conflicting length headers and transfer decoding. After rejection, the
+transport must safely discard the remainder or close the request/connection;
+the reader deliberately does not drain an arbitrarily long malicious body.
+The transport must also impose deadlines and connection/rate limits. This
+synchronous method does not establish its own timeout or register an endpoint.
+A successful read/admission is still only a preview; commit must obtain a fresh
+trusted execution height and revalidate before persistence.
+
 ## Current-height validation
 
 Every admission, build and commit now requires a fresh `current_height` from the
@@ -88,6 +116,9 @@ at the current height, prevent backdating after failure and persist unexpired
 batches at the newer height. Preview and rejection preserve the confirmed state
 and file bytes; commit matches direct execution, fees and
 custody. Capacity tests cover exact byte/count limits and arithmetic overflow.
+Body-reading tests cover known/unknown lengths, bounded overlong input, empty
+and short bodies, fragmentation, interrupted reads and transport errors. Real PQ
+integration exercises body reading through durable commit and journal reopen.
 
 No live node dependency, RPC route, block transaction variant, fee settlement,
 wallet connection flow or bridge activation is introduced by this local API.
