@@ -63,6 +63,7 @@ fn add_charge(total: &mut fee_market::TxCharge, next: &fee_market::TxCharge) -> 
 }
 fn receipt_charge(receipt: &pool_wire::Receipt) -> fee_market::TxCharge {
     match receipt {
+        pool_wire::Receipt::Gateway(r) => r.charge,
         pool_wire::Receipt::CreatePair(r) => r.charge,
         pool_wire::Receipt::Initialize(r) => r.charge,
         pool_wire::Receipt::Add(r) => r.charge,

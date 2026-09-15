@@ -3,7 +3,7 @@
 The default-off `native-dex-rehearsal` feature exposes `native_dex::pool_wire`
 for local binary admission to the existing atomic State methods. This does not
 register an HTTP/RPC endpoint, a block transaction type or a wallet signing API.
-It does not activate consensus or authorize a bridge mint or withdrawal.
+It does not activate consensus or authorize an external bridge payment.
 
 ## Frames and dispatch
 
@@ -21,17 +21,23 @@ the sender cannot select them in the frame.
 | Swap | BLCHSWAP | 1 | execute_blch_swap |
 | Remove | BLCHLPRM | 2 | execute_blch_remove |
 | ClosePair | BLCHPCLS | 1 | execute_paired_close |
+| Gateway | BLCHGWAY | 1 | execute_gateway |
 
 Creation frames remain compatible with `paired_custody::wire`. Removal version 1
 is rejected because it lacks the signed provider identity used by version 2.
 ClosePair only closes eligible uninitialized custody; it cannot bypass LP claims.
+The [gateway operation](joint-gateway.md) adds jointly signed, BLCH-funded imports
+and withdrawals to the same dispatcher. The six original pool encodings remain
+unchanged. Older receivers reject Gateway frames and require an update.
 
 ## Bounds and authorization
 
 Before allocating decoded base witness tables, the decoder checks the total
 envelope limit, section lengths, base transaction shape, operation tail and exact
-end of frame. Base transactions require one key, bounded nonempty inputs and
-bounded outputs; only initialization permits no outputs. Public keys and
+end of frame. Pool base transactions require one key, bounded nonempty inputs and
+bounded outputs; initialization permits no outputs. Gateway permits up to 128
+sponsor keys and zero outputs, and uses the bounded gateway envelope decoder
+instead of the zero-delta transfer decoder. Public keys and
 signatures use the existing 8,192-byte bound. Removal owner bytes are borrowed
 until their nonempty length and complete frame have been checked. Native sections
 use the existing bounded transfer decoder and must match the outer domain.

@@ -30,7 +30,7 @@ and [proportional LP redemption](../bloch-pos-committee/docs/blch-lp-redemption.
 now execute in this local rehearsal. [Additional liquidity](../bloch-pos-committee/docs/blch-liquidity-additions.md)
 credits separate PQ-owned positions for up to 128 providers per pool. LP
 transfers remain unimplemented. The [bounded pool lifecycle transport](../bloch-pos-committee/docs/pool-lifecycle-wire.md)
-dispatches six binary request types through those same atomic methods, with
+dispatches the six pool request types through those same atomic methods, with
 real PQ tests comparing encoded and direct execution. Node/RPC admission remains
 separate. [Atomic candidate batches](../bloch-pos-committee/docs/pool-batches.md)
 now validate ordered dependent operations against one parent and roll back all
@@ -38,6 +38,12 @@ changes on failure, including a forged later provider redemption in PQ tests.
 [Candidate exchange](../bloch-pos-committee/docs/pool-candidates.md) additionally
 checks advertised final roots through independent receiver execution, including
 real PQ tests for false-result rollback.
+[BLCH-funded gateway operations](../bloch-pos-committee/docs/joint-gateway.md)
+now join the same dispatcher and batches: import or withdrawal commits atomically
+with real BLCH fees. The sponsor, issuer, withdrawing owners and committee sign
+one joint intent. Imported assets can fund a subsequent pair creation in the
+same batch; withdrawals cannot consume locked reserves. External finality and
+source-chain payments remain unimplemented in this host.
 The optional `native-dex-host` feature adds a [durable candidate journal](docs/dex-journal.md)
 with exclusive locking, synchronized writes, production PQ verification and
 replay against independently trusted checkpoints. Its append path uses an

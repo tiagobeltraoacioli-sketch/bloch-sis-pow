@@ -30,6 +30,12 @@ fn all_operations_preserve_direct_execution_fees_and_replay_protection() {
         assert_eq!(charge.tx_bytes, bytes.len() as u64);
         let mut direct = state.clone();
         let fee = match &r {
+            Request::Gateway(r) => {
+                direct
+                    .execute_gateway(r, 1, &BoundVerifier, &BoundVerifier)
+                    .unwrap()
+                    .charge
+            }
             Request::CreatePair(r) => {
                 direct
                     .execute_paired_custody(r, 1, &BoundVerifier, &BoundVerifier)
@@ -187,6 +193,7 @@ fn unsigned_intents_can_decode_but_cannot_execute() {
             Request::Swap(r) => &mut r.blch,
             Request::Remove(r) => &mut r.blch,
             Request::ClosePair(r) => &mut r.blch,
+            Request::Gateway(r) => &mut r.blch,
         };
         let PosTransaction::TransferV2 { keys, .. } = blch else {
             panic!("fixture must use TransferV2");

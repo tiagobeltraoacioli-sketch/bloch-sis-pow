@@ -43,6 +43,13 @@ and fee settlement remain unimplemented for these operations. A bounded
 now reexecutes with receiver-owned verifiers and rejects an incorrect advertised
 post-state before installing the candidate.
 
+The rehearsal now also supports [BLCH-funded gateway imports and withdrawals](../../crates/bloch-pos-committee/docs/joint-gateway.md)
+inside the same complete State and candidate/journal path. Joint signatures bind
+the sponsor fee leg and route operation; native staging plus the private BLCH
+plan preserve atomicity. An import can fund a later pair creation in the same
+candidate. These are attested local transitions, not source-finality proofs,
+external payouts or live block activation.
+
 ## Actual ownership and integration boundary
 
 Genesis-4 is the live PoS chain. Base BLCH is held in the private eUTXO set of

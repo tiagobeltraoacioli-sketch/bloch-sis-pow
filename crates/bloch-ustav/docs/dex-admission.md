@@ -5,6 +5,11 @@ It accepts signed `pool_wire` operations, allowing a host to assemble a candidat
 without asking a wallet to construct the final post-state commitment. It is a
 volatile queue for one candidate, not a production mempool or an HTTP endpoint.
 
+The dispatcher also accepts [BLCH-funded gateway operations](../../bloch-pos-committee/docs/joint-gateway.md).
+Gateway imports can fund later pair operations in the queue. Preview release
+records from withdrawals are not payout authority; neither preview nor local
+journal persistence establishes consensus finality.
+
 ## Admission and execution
 
 `PendingBatch::new(&journal, height)` binds the queue to the journal's current

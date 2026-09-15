@@ -11,6 +11,7 @@ use bloch_euvm::ustav::{transfer_wire, Verifier};
 
 #[derive(Clone, Debug)]
 pub enum Request {
+    Gateway(super::gateway::Request),
     CreatePair(paired_custody::Request),
     Initialize(initial_liquidity::Request),
     Add(add_liquidity::Request),
@@ -20,6 +21,7 @@ pub enum Request {
 }
 #[derive(Clone, Debug)]
 pub enum Receipt {
+    Gateway(super::gateway::Receipt),
     CreatePair(paired_custody::Receipt),
     Initialize(initial_liquidity::Receipt),
     Add(add_liquidity::Receipt),
@@ -29,6 +31,7 @@ pub enum Receipt {
 }
 pub fn encode(request: &Request, domain: &[u8; 32]) -> Result<Vec<u8>, Error> {
     match request {
+        Request::Gateway(r) => r.canonical_bytes(domain),
         Request::CreatePair(r) => r.canonical_bytes(domain),
         Request::Initialize(r) => r.canonical_bytes(domain),
         Request::Add(r) => r.canonical_bytes(domain),
@@ -97,6 +100,9 @@ fn finish(request: Request, bytes: &[u8], domain: &[u8; 32]) -> Result<Request, 
 pub fn decode(bytes: &[u8], expected_domain: &[u8; 32]) -> Result<Request, Error> {
     if bytes.len() as u64 > MAX_ENVELOPE_BYTES {
         return Err(Error::TooLarge);
+    }
+    if bytes.starts_with(b"BLCHGWAY") {
+        return super::gateway::decode(bytes, expected_domain).map(Request::Gateway);
     }
     let mut reader = Reader { bytes, offset: 0 };
     let magic: [u8; 8] = reader.fixed()?;
@@ -291,6 +297,7 @@ pub(super) fn quote_request(
     request: &Request,
 ) -> Result<fee_market::TxCharge, Error> {
     match request {
+        Request::Gateway(r) => state.quote_gateway(r),
         Request::CreatePair(r) => state.quote_paired_custody(r),
         Request::Initialize(r) => state.quote_initial_liquidity(r),
         Request::Add(r) => state.quote_blch_add_fee(r),
@@ -320,6 +327,9 @@ pub(super) fn apply_request(
     native_verifier: &dyn Verifier,
 ) -> Result<Receipt, Error> {
     match request {
+        Request::Gateway(r) => state
+            .execute_gateway(r, height, base_verifier, native_verifier)
+            .map(Receipt::Gateway),
         Request::CreatePair(r) => state
             .execute_paired_custody(r, height, base_verifier, native_verifier)
             .map(Receipt::CreatePair),

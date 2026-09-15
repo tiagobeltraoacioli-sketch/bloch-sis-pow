@@ -30,7 +30,7 @@ native-custody-tests:
     - cargo +1.94.1 test --locked -p bloch-euvm
     - cargo +1.94.1 test --locked -p bloch-pos-committee --features native-dex-rehearsal --lib native_dex
     - cargo +1.94.1 test --locked -p bloch-pos-committee --features native-dex-rehearsal --doc
-    - cargo +1.94.1 test --locked -p bloch-ustav --features native-dex-host --lib --test paired_custody_crypto --test blch_swap_crypto --test blch_remove_crypto --test blch_add_crypto
+    - cargo +1.94.1 test --locked -p bloch-ustav --features native-dex-host --lib --test paired_custody_crypto --test blch_swap_crypto --test blch_remove_crypto --test blch_add_crypto --test joint_gateway_crypto
     - cargo +1.94.1 clippy --locked -p bloch-ustav --all-features --all-targets --no-deps -- -D warnings
 
 variables:

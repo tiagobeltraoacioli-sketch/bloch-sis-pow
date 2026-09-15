@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 pub mod add_liquidity;
 pub mod backend;
 pub mod base_reserves;
+pub mod gateway;
 pub mod initial_liquidity;
 pub mod paired_custody;
 pub mod pool_batch;
@@ -45,6 +46,7 @@ pub enum Error {
     Base(TransferReject),
     Native(PoolError),
     Wire(transfer_wire::Error),
+    GatewayWire(bloch_euvm::ustav::gateway::wire::Error),
 }
 #[derive(Clone, Debug)]
 pub struct Request {
