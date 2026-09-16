@@ -723,6 +723,25 @@ impl Journal {
         )
     }
 
+    /// Require this journal to represent the authenticated parent block height,
+    /// then admit its direct child. Hosts with skipped empty blocks must first
+    /// define a complete state transition; this API never invents missing blocks.
+    pub fn append_child_block(
+        &mut self,
+        candidate: &[u8],
+        parent: pool_candidate::BlockParent,
+        context: pool_candidate::BlockContext,
+        roots: pool_candidate::BaseRoots,
+        expected_binding: [u8; 32],
+    ) -> Result<pool_batch::Outcome, Error> {
+        self.ensure_healthy()?;
+        if self.head.height != parent.height {
+            return Err(Error::WrongHead);
+        }
+        pool_candidate::validate_block_parent(parent, context).map_err(Error::Candidate)?;
+        self.append_for_block(candidate, context, roots, expected_binding)
+    }
+
     fn append_checked(
         &mut self,
         candidate: &[u8],

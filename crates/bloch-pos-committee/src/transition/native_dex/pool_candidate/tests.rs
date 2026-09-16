@@ -349,3 +349,49 @@ fn block_binding_matches_independent_python_vector() {
     )
     .is_err());
 }
+
+#[test]
+fn child_block_context_requires_identity_dense_height_and_increasing_slot() {
+    let parent = BlockParent {
+        block_id: [1; 32],
+        height: 10,
+        slot: 12,
+    };
+    let child = BlockContext {
+        parent_block: [1; 32],
+        height: 11,
+        slot: 15,
+    };
+    assert_eq!(validate_block_parent(parent, child), Ok(()));
+    for changed in [
+        BlockContext {
+            parent_block: [2; 32],
+            ..child
+        },
+        BlockContext {
+            height: 10,
+            ..child
+        },
+        BlockContext {
+            height: 12,
+            ..child
+        },
+        BlockContext { slot: 12, ..child },
+        BlockContext { slot: 11, ..child },
+    ] {
+        assert_eq!(
+            validate_block_parent(parent, changed),
+            Err(Error::BlockParentMismatch)
+        );
+    }
+    assert_eq!(
+        validate_block_parent(
+            BlockParent {
+                height: u64::MAX,
+                ..parent
+            },
+            BlockContext { height: 0, ..child }
+        ),
+        Err(Error::BlockParentMismatch)
+    );
+}

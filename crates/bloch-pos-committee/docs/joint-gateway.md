@@ -487,3 +487,22 @@ buffered paths, byte-identical retry, refusal of a second commit, and restart.
 The existing monotonic height watermark, storage checks, and no-live-consensus
 limitations remain in force. Neither this API nor `BLCHDJ02` proves that a signed
 network header included the proposed extension.
+
+### Direct-child host admission
+
+`BlockParent` carries the parent block identifier, slot and height from an
+independently authenticated host chain view. `validate_block_parent` requires
+matching child parent identity, checked `parent.height + 1 == child.height`, and
+strictly increasing slot; skipped slots are allowed, skipped block heights are
+not. Overflow is refused. This verifies one supplied edge, not chain ancestry,
+validator eligibility, signatures on headers or consensus finality.
+
+`Journal::append_child_block` additionally requires the local journal height to
+match the supplied parent height before using the block-binding persistence path.
+Tests reject wrong parents, heights and slots without file/state changes, then
+persist and reopen a valid real-PQ candidate. The journal still does not store
+network block identifiers: callers must authenticate the parent and its mapping
+to the journal state independently. This API cannot skip blocks containing no
+native operations; a production design must define those state transitions and
+header commitments. Existing lower-level rehearsal APIs remain explicit and no
+network activation is performed.

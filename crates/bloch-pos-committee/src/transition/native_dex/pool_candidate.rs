@@ -17,6 +17,7 @@ pub enum Error {
     BaseParentMismatch,
     BasePostMismatch,
     BlockBindingMismatch,
+    BlockParentMismatch,
     InvalidCount,
     CommitmentMismatch,
     Batch(pool_batch::Error),
@@ -246,6 +247,27 @@ pub struct BlockContext {
     pub parent_block: [u8; 32],
     pub slot: u64,
     pub height: u64,
+}
+
+/// Parent block supplied by an independently authenticated host chain view.
+/// Constructing this value alone does not authenticate it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockParent {
+    pub block_id: [u8; 32],
+    pub slot: u64,
+    pub height: u64,
+}
+
+/// Validate child position and identity without inferring finality or ancestry
+/// beyond this one host-supplied edge. Empty slots are allowed; heights are dense.
+pub fn validate_block_parent(parent: BlockParent, child: BlockContext) -> Result<(), Error> {
+    if child.parent_block != parent.block_id
+        || parent.height.checked_add(1) != Some(child.height)
+        || child.slot <= parent.slot
+    {
+        return Err(Error::BlockParentMismatch);
+    }
+    Ok(())
 }
 
 /// Experimental commitment for a future authenticated block extension. The

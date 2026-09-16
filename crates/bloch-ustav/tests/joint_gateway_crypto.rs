@@ -568,6 +568,60 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
     let block_path = path.with_extension("block-bound.log");
     let mut block_journal =
         Journal::create_requiring_base_roots(&block_path, anchor.clone(), 3).unwrap();
+    let parent_block = pool_candidate::BlockParent {
+        block_id: block_context.parent_block,
+        slot: 7,
+        height: 3,
+    };
+    for wrong in [
+        pool_candidate::BlockParent {
+            block_id: [43; 32],
+            ..parent_block
+        },
+        pool_candidate::BlockParent {
+            slot: block_context.slot,
+            ..parent_block
+        },
+        pool_candidate::BlockParent {
+            height: 2,
+            ..parent_block
+        },
+    ] {
+        let original_bytes = std::fs::read(&block_path).unwrap();
+        assert!(block_journal
+            .append_child_block(&candidate, wrong, block_context, roots, block_binding)
+            .is_err());
+        assert_eq!(std::fs::read(&block_path).unwrap(), original_bytes);
+        assert_eq!(block_journal.checkpoint(), original_head);
+    }
+    let child_path = path.with_extension("child-block.log");
+    let mut child_journal =
+        Journal::create_requiring_base_roots(&child_path, anchor.clone(), 3).unwrap();
+    assert_eq!(
+        child_journal
+            .append_child_block(
+                &candidate,
+                parent_block,
+                block_context,
+                roots,
+                block_binding
+            )
+            .unwrap()
+            .post_root,
+        expected
+    );
+    drop(child_journal);
+    let child_journal = Journal::open_requiring_base_roots(
+        &child_path,
+        anchor.clone(),
+        3,
+        head,
+        TailRecovery::Reject,
+    )
+    .unwrap();
+    assert_eq!(child_journal.checkpoint(), head);
+    drop(child_journal);
+    std::fs::remove_file(&child_path).unwrap();
     let untouched = std::fs::read(&block_path).unwrap();
     let mut block_pending = PendingBatch::new(&block_journal, 4).unwrap();
     for frame in frames {
