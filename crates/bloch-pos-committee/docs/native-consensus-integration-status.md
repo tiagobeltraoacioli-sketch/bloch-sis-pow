@@ -2,92 +2,92 @@
 
 ## Current boundary
 
-The native joint execution, PQ authorization, bounded candidate validation and
-durable local journal are implemented under opt-in features. Experimental helpers
-bind candidates to host-provided block contexts and canonical signed headers.
-They do not call the live block transition, authenticate finality, or make their
-candidate bodies valid Genesis4 transactions. No production activation is armed.
+Updated against the local `codex/native-wallet-integration` implementation through
+`5bda798`. These are implementation references, not a claim that this revision is
+pushed or deployed publicly. All six production native activation epochs remain
+`u64::MAX`; no public native activation or custody configuration is selected.
 
-The live path remains `Transition::apply_block` over `CommittedState`, reached by
-the node. The joint rehearsal `State` owns a separate base `CommittedState` plus
-native gateway/pool state. Embedding that entire joint State back inside
-CommittedState would be recursive and is not an integration strategy.
+`CommittedState` owns an optional nonrecursive `NativeState`. The real
+`Transition::apply_block` executes sponsored native operations in the ordinary
+ordered block loop, preserving proposer, signature, RANDAO, attestation, fee and
+final state-root checks. State SMT tag `0x1F` binds the native commitment; absence
+preserves historical roots. The native commitment excludes the base root and must
+not be confused with a rehearsal journal root, canonical state root or block ID.
 
-The opt-in build now gives `CommittedState` direct ownership of an optional
-nonrecursive `NativeState`. The real `compute_post_state` initializes an empty
-component from nonzero genesis-authenticated network context when the native
-state epoch gate is active. That gate remains `u64::MAX` (disabled); only unit
-tests can override it. An active gate cannot compile without the implementation
-feature. No native transaction, populated rehearsal import or payout is enabled.
+Canonical wire assignments are implemented and registered:
 
-State SMT tag `0x1F` is assigned to this domain-separated native commitment;
-it is not a transaction wire tag. Absence contributes no leaf and preserves
-historical roots. The component excludes the base root, avoiding circular
-commitments. The base-only projection remains separate from the complete block
-state root. Real-transition tests cover initialization, subsequent empty and
-ordinary-transfer blocks, replay, fork ancestor clones and invalid header roots.
+| Tag | Operation | Adapter |
+| --- | --- | --- |
+| `0x0E` | Sponsored native transfer | `native_dex/consensus_transfer.rs` |
+| `0x0F` | Zero-supply asset registration and route enablement | `native_dex/bootstrap.rs` |
+| `0x10` | Federated gateway import | `native_dex/consensus_gateway.rs` |
+| `0x11` | Federated gateway withdrawal | `native_dex/consensus_gateway.rs` |
+| `0x12` | Native/BLCH pool lifecycle and swaps | `native_dex/consensus_pool.rs` |
 
-The first sponsored native transfer now dispatches from the real ordered block
-transaction loop through wire tag `0x0E`, under the separate disabled
-`NATIVE_TRANSFER_ACTIVATION_EPOCH`. It conserves an already-issued native asset
-while a BLCH sponsor pays the charge. Execution uses the block's fixed base fee,
-counts the five outer framing bytes and interprets expiry as the current block
-slot (inclusive). A staged adapter commits both ledgers together, returns fees to
-the existing burn/reward step and leaves native fee escrow zero. Ordinary V1/V2
-spends and funded validator deposits also enforce canonical native reserve locks.
-Both sponsor and native-owner witnesses use explicit strict native verifier
-capabilities, including during the producer's proposal probe.
+Each frame is bounded, domain-bound and separately gated. Staged execution
+commits both ledgers atomically, counts the outer framing bytes and sends fees
+through ordinary block settlement once. Canonical native fee escrow remains zero.
+Ordinary spends also enforce native custody locks. Imports use configured issuer
+and committee attestations; they do not independently prove source-chain finality.
+Withdrawals record burns/releases; those records do not themselves pay a source
+recipient.
 
-There is still no production path to populate the initially empty native ledger:
-asset registration, mint/import authority, source proofs and route bootstrap
-remain unimplemented in the block path. Block tests install funded fixtures only
-under `cfg(test)`. Pool lifecycle, swaps and gateway imports/withdrawals remain
-rehearsal operations. Mempool admission for native transfers is deliberately
-refused pending authorization, pricing and conflict integration. No funds can be
-launched by merely arming the transfer gate.
+The separate explicit `native-lab` build and `BPOSLAB1` manifest opt into one
+laboratory transition domain. Official manifests cannot be activated with the
+laboratory flag. Laboratory mempool admission checks authorization, pricing,
+conflicts and current state using the real executors, admits only one pending
+native operation, and revalidates after head changes. Official network admission
+remains disabled. See [node laboratory contract](../../bloch-pos-node/NATIVE-LAB.md).
 
-## Required implementation sequence
+## Completed persistence and wallet integration
 
-1. Ownership, dormant empty-state commitment and a bounded native-component
-   snapshot/restore codec are implemented. The [snapshot format](native-component-snapshot.md)
-   validates complete component data and reconstructs custody indexes against
-   a supplied base projection and trusted component commitment. It is not wired
-   to a populated-state import. Optional node sidecar persistence verifies it
-   only after full canonical replay; accelerated base-state restart remains
-   unimplemented. Complete the remaining execution/accounting integration
-   before activation.
-2. Extend the registered sponsored-transfer encoding to the remaining operations
-   and activate it only at a coordinated,
-   explicit network upgrade. Reserve/register tags through the repository's wire
-   tag process; do not appropriate historical or contested tags.
-3. Extend the sponsored-transfer dispatch to gateway and pool operations. Include
-   their fees, gas, supply conservation, reserves and rewards exactly once. Define
-   empty-native blocks and epoch-boundary behavior. Use the real proposer,
-   RANDAO and attestation validations rather than the rehearsal header helper.
-4. Commit the complete state through the canonical state-root derivation and
-   preserve a single block identity. Update producer, validator, wire codec,
-   storage, replay and snapshots together. Specify inclusion proofs relating a
-   release and native state root to an authenticated block.
-5. Test deterministic replay on independent nodes, corrupted blocks, forks,
-   restart, finality disagreement and upgrade boundaries. Only then deploy a
-   coordinated release and arm activation after review.
-6. Connect the bridge's native trust source to those authenticated proofs, then
-   complete durable settlement, duplicate-payment prevention and source reorg
-   handling. Configure operational custody/authorities and supported asset routes.
+The [snapshot format](native-component-snapshot.md) deterministically serializes
+bounded populated state and validates all commitments and derived custody indexes
+against the matching base projection. Snapshots do not import an arbitrary funded
+ledger into consensus. Node sidecars are checked after complete canonical replay;
+accelerated base-state checkpoint restart remains unimplemented and is not required
+for the existing replay-based restart path.
 
-## Concrete integration contract (proposed, not activated)
+Canonical tests cover populated restoration, wire replay, fork ancestors,
+corruptions, rejected blocks and historical roots. Node reorg validation stages
+branch transaction-index publication until the entire replacement branch passes.
+Real laboratory process runs exercised signed bootstrap/import/withdrawal,
+persistence, restart and replay refusal. See
+`transition/native_snapshot_replay_tests.rs`, `native_bootstrap_blocks_tests.rs`,
+`native_gateway_blocks_tests.rs`, `native_pool_blocks_tests.rs` and node
+`engine/native_replay_tests.rs`; source paths are relative to their respective
+crate `src` directories.
 
-Transaction wire tag `0x0E` is now allocated to `NativeTransfer`: one tag byte,
-a little-endian u32 length and a nonempty opaque joint-transfer payload. The
-complete frame is bounded by `MAX_BLOCK_TX_BYTES` even in feature-disabled
-decoders. The payload constructor guarantees transport size, not native semantic
-validity; the dispatcher must authenticate its domain and canonical inner frame.
-This allocation is not activation. Node mempool admission remains explicitly
-disabled until sponsor pricing, authorization and conflict handling are integrated.
+Bounded laboratory wallet RPCs now expose trusted-host review context, typed pool
+quotes/reads and unsigned withdrawal requests. The isolated hybrid WASM signer
+reviews actual state and signs typed owner intents; issuer and committee
+certification remains a separate step. Browser-signed create, initialize, swaps
+in both directions and a certified withdrawal have been included and reported
+finalized by the local node. Actual Anvil source deposits/releases were verified
+against receipts, vault code/configuration and accounting. These runs use
+synthetic assets and disposable local authorities. They do not qualify public
+custody or provide independent consensus finality proofs.
 
-The following specifies the remaining integration work. The dormant state leaf
-above is implemented and native transfer wire tag `0x0E` is allocated; no active
-epoch or production authority is assigned.
+## Remaining public integration decisions
+
+The missing public work is not snapshot serialization, canonical gateway dispatch
+or a first pool adapter. It is:
+
+1. Select the target native network and coordinate its validator release and
+   activation, retaining explicit domain, gate and historical-root invariants.
+2. Provision and verify the real source route, deployed vault/token/code, asset,
+   caps, issuer/quorum, observation policy, sponsor and protected signing services.
+3. Define and authenticate the release-to-native-commitment-to-state-root-to-finalized-
+   header proof/trust path. A wallet RPC projection and matching node reports do
+   not supply an independent proof. Integrate durable external reconciliation,
+   duplicate-payment prevention and source reorg handling with that trust path.
+4. Integrate the selected public native account, endpoint and custody workflow
+   into the wallet. The loopback laboratory proxy and public test seed are not a
+   production account service. Qualify the selected fleet and upgrade boundaries;
+   do not reinterpret local test success as public operational readiness.
+
+The constraints below remain review requirements for that rollout. No activation
+date, public authority or public source custody address is assigned here.
 
 ### Live paths that must agree
 
@@ -104,22 +104,16 @@ epoch or production authority is assigned.
 
 ### State ownership and commitment
 
-The canonical state now owns components that do not own a base `CommittedState`.
-Only empty initialization and continuity through ordinary blocks are implemented.
-The separate opaque split/rejoin object retains its base-root pin for rehearsal;
-that pin is not part of the canonical native component. Populated rehearsal state
-cannot be imported into canonical state, and rehearsal constructors reject a base
-that already owns canonical native state. A bounded component snapshot codec now
-validates restoration without attaching state or enabling production imports.
-Canonical sponsored-transfer execution is implemented under its disabled gate;
-gateway/pool dispatch and an accelerated complete-state restart remain open.
+The canonical state owns components that do not own a base `CommittedState`.
+Populated execution and bounded snapshot restoration are implemented. The separate
+rehearsal split/rejoin object's base-root pin is not part of the canonical native
+component. Rehearsal constructors reject a base that already owns canonical native
+state, and snapshot restoration does not bypass block execution or activation.
 
-Specify deterministic serialization, allocation limits, restoration checks and
-reconstruction of derived lock indexes. The node's existing snapshot ring stores
-`Arc<CommittedState>`; native state must travel with that state, not with an
-independent journal cursor. Durable restart must reconstruct the same state from
-stored blocks. Any new checkpoint/import format must carry and validate all
-native components as well.
+The node snapshot ring carries native state in `Arc<CommittedState>`. Durable
+restart reconstructs it from stored blocks and validates the optional sidecar.
+Any future accelerated checkpoint format must authenticate the complete base and
+native state together; the current component codec alone is not that checkpoint.
 
 The dormant implementation uses a tagged native subtree-root leaf. Before
 activation, specify and review proof composition from a
@@ -198,7 +192,7 @@ neither the snapshot ring nor a signed-header helper supplies that guarantee.
 
 ## Launch is not only liquidity
 
-Pools and real deposits remain disabled. Beyond consensus integration, release
+Public native pools and real source deposits remain disabled. Public release
 requires verified deployed source vaults, configured bridge authorities and
 custody, current native/source evidence, durable settlement and end-to-end tests
 with the wallet/DEX. BTC, SOL and EVM assets need their own validated custody and

@@ -1,30 +1,27 @@
 # Canonical native bootstrap integration contract
 
-Status: implementation map for the next inactive consensus change, 2026-09-16.
-No wire tag, activation epoch, authority, deployment, custody address or real
-asset backing is assigned by this document.
+Status: implemented under a disabled production gate; updated 2026-09-16.
+The original design below describes the implemented bootstrap contract, not a
+remaining task. Canonical `NativeBootstrap` uses registered tag `0x0F`; import,
+withdrawal and pool operations subsequently use `0x10`–`0x12`. No public epoch,
+authority, custody deployment or backing is assigned by this document.
 
 ## Current boundary
 
-`NativeState` is owned by `CommittedState`; its empty initialization and sponsored
-`NativeTransfer` dispatch are separately epoch-gated and disabled. The new native
-snapshot codec restores a component against the corresponding base projection
-and an independently trusted component commitment. Restoration does not attach a
-new ledger, issue an asset, enable an authority or prove block finality.
+`NativeState` is owned by `CommittedState`. Bounded snapshot restoration validates
+the component against its matching base projection and trusted commitment; it
+does not independently prove finality or activate any authority. Canonical
+bootstrap, gateway and pool adapters now execute through actual `apply_block`.
 
-The canonical transfer can only conserve an existing native asset. The populated
-transfer fixtures in `transition/native_snapshot_replay_tests.rs` are test-only
-registrations and minting. They exercise actual `apply_block`, signed headers,
-RANDAO, wire decoding, fork replay and component restoration, but they are not a
-production bootstrap operation.
+Official-network native admission remains disabled. The separate explicit
+`native-lab` instance has domain-bound admission, real signed populated blocks,
+restart/replay and wallet process coverage. Its `BPOSLAB1` identity and loopback
+transport cannot be substituted for the official network. For current completed
+work and remaining public requirements, see
+[native consensus integration status](native-consensus-integration-status.md)
+and [node laboratory contract](../../bloch-pos-node/NATIVE-LAB.md).
 
-`bloch-pos-node/src/engine.rs::admissible` still refuses every `NativeTransfer`.
-Canonical populated-node restart/reorg qualification therefore remains separate
-from the current committee transition tests. Node regression tests verify the
-real `Engine::do_reorg` refuses a disabled native suffix without publishing its
-valid prefix's state, transaction index or persistent block log.
-
-## First new operation: sponsored registration and route enablement
+## Implemented operation: sponsored registration and route enablement
 
 The minimum bridge bootstrap should register a zero-supply native asset and
 configure its source route atomically. It must not mint funds. Existing reusable
@@ -105,8 +102,8 @@ inside and beyond the node snapshot ring, reject a malformed winning suffix
 atomically, and retain the finalized rewind fence. Repeat historical roots with
 feature/default builds and before each disabled gate.
 
-Only after bootstrap comes canonical import/withdrawal, authenticated source
-proof/finality integration, funded pool lifecycle and swaps. The rehearsal
+Canonical import/withdrawal and funded pool lifecycle/swaps are now implemented.
+Authenticated source proof/finality integration remains a separate public requirement. The rehearsal
 `State::execute_gateway` uses committee attestations, not a source light client
 or external payment receipt. Reusing it requires adapting block-price accounting
 and fee settlement, plus durable external duplicate-payment and reorg handling.
