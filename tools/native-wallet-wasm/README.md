@@ -54,7 +54,8 @@ Request: `{"method":"...","args":{...}}`; response:
   `fundingSats`, `walletOutputsSats`, and exact `packetHex`. Render the typed packet
   and debits, not only its hash/fee. `finalityVerified` is always false.
 - `sign`: same transaction/context/height plus `reviewId` and boolean
-  `confirmed:true`. Returns `transactionHex`. Rechecks state/account/expiry and
+  `confirmed:true`. Returns `transactionHex` and canonical Rust `txid` (not a raw
+  packet hash), allowing a host to journal before broadcast. Rechecks state/account/expiry and
   exact reviewed packet before signing; review is consumed even on refusal.
 - `cancel` clears the pending review; `lock` also clears the key session.
 

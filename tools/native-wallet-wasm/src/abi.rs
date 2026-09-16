@@ -115,7 +115,8 @@ fn dispatch_inner(request: &mut Value) -> Result<Value, &'static str> {
   }else{
    let id=match hash(args,"reviewId"){Ok(id)=>id,Err(e)=>{session.cancel();return Err(e)}};
    let signed=session.sign(id,&state,&packet,height,args.get("confirmed")==Some(&Value::Bool(true)))?;
-   Ok(json!({"transactionHex":hex::encode(signed)}))
+            let txid=PosTransaction::from_canonical_bytes(&signed).map_err(|_|"invalid signed packet")?.txid();
+            Ok(json!({"transactionHex":hex::encode(signed),"txid":hex::encode(txid)}))
   }
  })
 }

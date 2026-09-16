@@ -229,6 +229,14 @@ fn abi_revalidates_snapshot_context_and_consumes_malformed_confirmation() {
     let mut broken = args.clone();
     broken["context"]["nativeCommitmentHex"] = json!(hex::encode([0; 32]));
     assert!(abi::dispatch(json!({"method":"review","args":broken})).is_err());
+    let review = abi::dispatch(json!({"method":"review","args":args})).unwrap();
+    let mut valid = args.clone();
+    valid["reviewId"] = review["id"].clone();
+    valid["confirmed"] = json!(true);
+    let signed = abi::dispatch(json!({"method":"sign","args":valid})).unwrap();
+    let bytes = hex::decode(signed["transactionHex"].as_str().unwrap()).unwrap();
+    let txid = PosTransaction::from_canonical_bytes(&bytes).unwrap().txid();
+    assert_eq!(signed["txid"], hex::encode(txid));
     broken = args.clone();
     broken["context"]["baseFeeMillisatPerGas"] = json!(u128::MAX.to_string());
     assert!(abi::dispatch(json!({"method":"review","args":broken})).is_err());
