@@ -83,6 +83,8 @@ fn frozen_method_space(req: &RpcRequest) -> &'static str {
         #[cfg(feature="native-lab")]
         RpcRequest::NativePoolQuote {..} => "getnativepoolquote",
         #[cfg(feature="native-lab")]
+        RpcRequest::NativeWithdrawalQuote{..} => "getnativewithdrawalquote",
+        #[cfg(feature="native-lab")]
         RpcRequest::NativePool{..} => "getnativepool",
         #[cfg(feature="native-lab")]
         RpcRequest::NativeWalletView => "getnativewalletview",

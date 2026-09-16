@@ -4097,6 +4097,34 @@ impl Engine {
                 Ok(Json::Obj(fields))
             }
             #[cfg(feature="native-lab")]
+            RpcRequest::NativeWithdrawalQuote{expected_head,query} => {
+                if !self.tr.native_lab_matches(&self.state) {
+                    return Err(rpc::RpcError::new(-32601,"native laboratory is not selected"));
+                }
+                if self.head_id().as_bytes()!=&expected_head {
+                    return Err(rpc::RpcError::new(-32000,"laboratory head changed; obtain a fresh view"));
+                }
+                let quote=self.state.native_lab_withdrawal_quote(&query,self.state.slot())
+                    .map_err(|e|rpc::RpcError::new(-32000,e))?;
+                let Json::Obj(mut fields)=self.serve_rpc(RpcRequest::NativeWalletView)? else {unreachable!()};
+                fields.extend(vec![
+                    ("operation".into(),Json::s("withdraw")),
+                    ("transactionHex".into(),Json::s(crate::codec::hex(&quote.transaction))),
+                    ("authorizationHex".into(),Json::hex(&quote.authorization)),("feeSat".into(),Json::sat(quote.fee_sat)),
+                    ("issuerPublicKeyHex".into(),Json::s(crate::codec::hex(&quote.issuer_pubkey))),
+                    ("committeePublicKeysHex".into(),Json::Arr(quote.committee.iter().map(|k|Json::s(crate::codec::hex(k))).collect())),
+                    ("threshold".into(),Json::sat(quote.threshold as u128)),
+                    ("certificateRequired".into(),Json::Bool(true)),("signingAvailable".into(),Json::Bool(false)),
+                    ("request".into(),Json::obj(vec![
+                        ("ownerPublicKeyHex",Json::s(crate::codec::hex(&query.owner))),
+                        ("expectedHead",Json::hex(&expected_head)),("route",Json::hex(&query.route)),
+                        ("amount",Json::sat(query.amount as u128)),("recipientHex20",Json::s(crate::codec::hex(&query.recipient))),
+                        ("nonce",Json::sat(query.nonce as u128)),("validUntil",Json::sat(query.valid_until as u128)),
+                    ])),
+                ]);
+                Ok(Json::Obj(fields))
+            }
+            #[cfg(feature="native-lab")]
             RpcRequest::NativePool{pool} => {
                 if !self.tr.native_lab_matches(&self.state) {
                     return Err(rpc::RpcError::new(-32601,"native laboratory is not selected"));

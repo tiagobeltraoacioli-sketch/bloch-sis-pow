@@ -94,6 +94,7 @@ const ROUTED: &[(&str, &str)] = &[
     ("getchaininfo", "ChainInfo"),
     // Source scan sees the laboratory-only cfg arm; default routing still rejects it.
     ("getnativepoolquote", "NativePoolQuote"),
+    ("getnativewithdrawalquote", "NativeWithdrawalQuote"),
     ("getnativepool", "NativePool"),
     ("getnativewalletview", "NativeWalletView"),
     ("getnativelabstate", "NativeLabState"),

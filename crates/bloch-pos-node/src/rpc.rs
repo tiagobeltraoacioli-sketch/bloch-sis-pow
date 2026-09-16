@@ -845,6 +845,8 @@ pub enum RpcRequest {
     #[cfg(feature="native-lab")]
     NativePoolQuote { expected_head:[u8;32], query:bloch_pos_committee::transition::native_dex::lab_quote::Query },
     #[cfg(feature="native-lab")]
+    NativeWithdrawalQuote {expected_head:[u8;32],query:bloch_pos_committee::transition::native_dex::lab_withdrawal::Query},
+    #[cfg(feature="native-lab")]
     NativePool {pool:[u8;32]},
     #[cfg(feature="native-lab")]
     NativeWalletView,
@@ -1128,6 +1130,11 @@ pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError
         "getnativepoolquote" => {
             let (expected_head,query)=native_quote::parse(params)?;
             RpcRequest::NativePoolQuote{expected_head,query}
+        },
+        #[cfg(feature="native-lab")]
+        "getnativewithdrawalquote" => {
+            let (expected_head,query)=native_quote::parse_withdrawal(params)?;
+            RpcRequest::NativeWithdrawalQuote{expected_head,query}
         },
         #[cfg(feature="native-lab")]
         "getnativepool" => RpcRequest::NativePool{pool:want_hex32(params,0,"pool")?},

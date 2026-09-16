@@ -133,3 +133,61 @@ observation fields, plus `poolId`, `reserveId`, `assets`, `reserves`,
 Unknown pools and non-laboratory instances are refused. Reserve quantities are
 custody balances, not an owner's spendable wallet balance. These reads do not
 establish finality or external backing.
+
+## Withdrawal request and independent certificate
+
+`getnativewithdrawalquote` accepts one object inside the params array:
+`ownerPublicKeyHex`, `expectedHead`, `route`, `amount`, `recipientHex20`, `nonce`,
+and `validUntil`. Integers are canonical decimal strings; the recipient is
+exactly 20 bytes of hex. It returns the trusted-host view and an unsigned
+`transactionHex`, `authorizationHex`, `feeSat`, `issuerPublicKeyHex`, the ordered
+`committeePublicKeysHex`, `threshold`, and an exact `request` echo. It explicitly
+sets `certificateRequired: true` and `signingAvailable: false`. The RPC never
+holds authority keys or signs certificates.
+
+Export `{schema: "postern.native-lab-withdrawal-request.v1", quote: rpcResult}`.
+An operator obtains a fresh `getnativewalletview.result` independently and saves
+it as a separate trusted-view file. The explicit offline authority command is:
+
+```sh
+BLOCH_KEYSTORE_ALLOW_PLAINTEXT=1 target/debug/bloch-pos native-lab-fixture \
+  --kind certify-withdrawal --genesis LAB_DIRECTORY/genesis.blg \
+  --sponsor LAB_DIRECTORY/validator --committee LAB_DIRECTORY/committee \
+  --request request.json --trusted-view trusted-view.json
+```
+
+This laboratory command validates identity, restores the bounded independent
+state projection, rebuilds current funding/nonce/policy, and compares the entire
+unsigned packet plus authorization, fee and authority identities. It signs only
+the issuer and ordered committee slots. Output uses schema
+`postern.native-lab-withdrawal-certificate.v1` with `domain`, `authorizationHex`,
+and `transactionHex`. It never signs as the wallet owner or broadcasts. The
+wallet must preserve all original packet fields except those external witness
+slots, then perform its own typed review, owner consent and signature. Expired
+requests must be prepared again; certificates cannot be moved to new intents.
+
+**`authorizationHex` is not a native burn ID.** It binds the outer sponsored
+request for the external signatures. After canonical inclusion, derive the
+inner native transaction signing hash and verify the committed release record:
+
+```sh
+target/debug/bloch-pos native-lab-fixture --kind inspect-withdrawal \
+  --genesis LAB_DIRECTORY/genesis.blg --request signed-packet.json \
+  --trusted-view post-inclusion-view.json
+```
+
+`signed-packet.json` contains `{ "transactionHex": "..." }`. This inspection
+loads no keys. It derives `native_burn` from the decoded inner transaction and
+requires the trusted snapshot's route/nonce/recipient/amount/burn record to
+match. It also returns the outer `transaction_id` for comparison with the
+submitted transaction. This is not a finality proof: source release still needs
+the independently checked canonical/finalized transaction and the external
+source-vault authorization. `scripts/native-withdrawal-certificate-smoke.py`
+checks preparation/certification and tampered-fee refusal without broadcasting.
+
+`scripts/native-withdrawal-inspect-lab.py` independently fetches the post-inclusion
+view, inspects the exact signed packet from a browser report, verifies finalized
+transaction status, and checks the nonce-1 laboratory rehearsal's amount 40 and
+remaining supply 60. It persists the view, decoded inspection, status and ledger
+without signing, broadcasting, or restarting the node. This scenario-specific
+runner must not be treated as a general source settlement oracle.

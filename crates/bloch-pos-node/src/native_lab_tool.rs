@@ -17,6 +17,8 @@ use bloch_pos_committee::transition::{
 use sha3::{Digest, Sha3_256};
 use std::{collections::BTreeMap, path::Path};
 
+mod certificate;
+
 pub fn run(args: &[String]) -> Result<(), String> {
     let allowed = [
         "--kind",
@@ -39,6 +41,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
         "--mint-nonce",
         "--valid-until",
         "--fund-amount",
+        "--request",
+        "--trusted-view",
     ];
     let mut flags = BTreeMap::new();
     for pair in args.chunks(2) {
@@ -59,7 +63,17 @@ pub fn run(args: &[String]) -> Result<(), String> {
             .ok_or_else(|| format!("missing {key}"))
     };
     let kind = get("--kind")?;
-    if !["info", "bootstrap", "import", "withdraw", "fund-wallet"].contains(&kind) {
+    if ![
+        "info",
+        "bootstrap",
+        "import",
+        "withdraw",
+        "fund-wallet",
+        "certify-withdrawal",
+        "inspect-withdrawal",
+    ]
+    .contains(&kind)
+    {
         return Err("expected info/bootstrap/import/withdraw/fund-wallet".into());
     }
     let (manifest, domain) =
@@ -70,10 +84,24 @@ pub fn run(args: &[String]) -> Result<(), String> {
     {
         return Err("requires isolated BPOSLAB1 genesis".into());
     }
+    if kind == "inspect-withdrawal" {
+        println!(
+            "{}",
+            certificate::inspect(&flags, &manifest, domain)?.to_string()
+        );
+        return Ok(());
+    }
     let sponsor = Keystore::load(Path::new(get("--sponsor")?)).map_err(|e| e.to_string())?;
     let committee = Keystore::load(Path::new(get("--committee")?)).map_err(|e| e.to_string())?;
     if sponsor.pubkey == committee.pubkey {
         return Err("committee keys must differ".into());
+    }
+    if kind == "certify-withdrawal" {
+        println!(
+            "{}",
+            certificate::run(&flags, &manifest, domain, &sponsor, &committee)?.to_string()
+        );
+        return Ok(());
     }
     let fee: u128 = flags
         .get("--base-fee")
