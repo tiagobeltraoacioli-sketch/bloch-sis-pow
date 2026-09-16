@@ -425,3 +425,13 @@ advisory lock to truncate or extend owned test files and verify unchanged bytes,
 unchanged in-memory head and refusal of subsequent writes and release queries.
 This detects extent/cursor changes, not same-length edits, renamed files or all
 races with a malicious writer; operator-controlled storage remains required.
+
+The append checks also compare the complete 48-byte header with the bytes retained
+when the journal was created or successfully opened. This detects same-length
+changes to policy/version, anchor height or anchor root without hashing the whole
+history on every append. The cursor is restored to the validated append position;
+read/seek failures poison the session just like extent mismatches. Tests mutate
+each header region while the journal remains open and require refusal without
+new disk writes or state installation. Same-length candidate payload edits and
+races with an uncooperative writer are still outside this fixed-header check;
+full authenticated replay and controlled storage remain necessary.

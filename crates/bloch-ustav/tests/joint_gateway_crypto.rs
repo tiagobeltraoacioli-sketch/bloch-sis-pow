@@ -825,6 +825,26 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
         drop(changed);
         std::fs::remove_file(&changed_path).unwrap();
     }
+    for offset in [7usize, 8, 16] {
+        let changed_path = path.with_extension(format!("header-{offset}.log"));
+        let mut changed =
+            Journal::create_requiring_base_roots(&changed_path, anchor.clone(), 3).unwrap();
+        let mut altered = std::fs::read(&changed_path).unwrap();
+        altered[offset] ^= 1; // policy/version, anchor height, anchor root
+        std::fs::write(&changed_path, &altered).unwrap();
+        assert!(matches!(
+            changed.append_with_base_roots(&candidate, 4, roots),
+            Err(JournalError::StorageChanged)
+        ));
+        assert_eq!(std::fs::read(&changed_path).unwrap(), altered);
+        assert_eq!(changed.checkpoint(), original_head);
+        assert!(matches!(
+            changed.append_with_base_roots(&candidate, 4, roots),
+            Err(JournalError::Poisoned)
+        ));
+        drop(changed);
+        std::fs::remove_file(&changed_path).unwrap();
+    }
     std::fs::remove_file(&bound_path).unwrap();
     let bytes_before_queries = std::fs::read(&path).unwrap();
     for stale in [

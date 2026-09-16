@@ -367,6 +367,7 @@ impl SignatureVerifier for BaseVerifier {
 /// File paths/directories must be controlled by the operator, not RPC clients.
 pub struct Journal {
     file: File,
+    header: [u8; HEADER_BYTES as usize],
     state: State,
     head: Checkpoint,
     length: u64,
@@ -410,13 +411,15 @@ impl Journal {
             height,
             root: state.state_root(),
         };
-        file.write_all(if require_base_roots {
+        let mut header = [0; HEADER_BYTES as usize];
+        header[..8].copy_from_slice(if require_base_roots {
             BOUND_MAGIC
         } else {
             MAGIC
-        })?;
-        file.write_all(&height.to_le_bytes())?;
-        file.write_all(&head.root)?;
+        });
+        header[8..16].copy_from_slice(&height.to_le_bytes());
+        header[16..].copy_from_slice(&head.root);
+        file.write_all(&header)?;
         file.sync_all()?;
         // Persist creation of the directory entry as well as the file contents.
         let parent = path
@@ -426,6 +429,7 @@ impl Journal {
         File::open(parent)?.sync_all()?;
         Ok(Self {
             file,
+            header,
             state,
             head,
             length: HEADER_BYTES,
@@ -498,6 +502,7 @@ impl Journal {
         }
         let mut journal = Self {
             file,
+            header,
             head: Checkpoint {
                 height: anchor_height,
                 root: anchor.state_root(),
@@ -708,7 +713,12 @@ impl Journal {
             .checked_add(4 + candidate.len() as u64)
             .filter(|n| *n <= MAX_JOURNAL_BYTES)
             .ok_or(Error::ResourceLimit)?;
-        check_storage_extent(&mut self.file, self.length, &mut self.poisoned)?;
+        check_storage_identity(
+            &mut self.file,
+            self.length,
+            &self.header,
+            &mut self.poisoned,
+        )?;
         let prepared = match roots {
             Some(roots) => pool_candidate::prepare_with_base_roots(
                 &mut self.state,
@@ -728,7 +738,12 @@ impl Journal {
         }
         .map_err(Error::Candidate)?;
         // Recheck after potentially expensive PQ verification as well.
-        check_storage_extent(&mut self.file, self.length, &mut self.poisoned)?;
+        check_storage_identity(
+            &mut self.file,
+            self.length,
+            &self.header,
+            &mut self.poisoned,
+        )?;
         persist_record(&mut self.file, prepared.candidate(), &mut self.poisoned)?;
         let result = prepared.commit();
         self.head = Checkpoint {
@@ -750,14 +765,27 @@ fn candidate_height(bytes: &[u8]) -> Result<u64, Error> {
     ))
 }
 
-// Advisory locks cannot stop an uncooperative writer. Detect changed extent or
-// cursor before writing; this does not detect same-length edits or close races.
-fn check_storage_extent(file: &mut File, expected: u64, poisoned: &mut bool) -> Result<(), Error> {
-    let observed =
-        (|| -> io::Result<(u64, u64)> { Ok((file.metadata()?.len(), file.stream_position()?)) })();
+// Advisory locks cannot stop an uncooperative writer. Compare the fixed header
+// and extent; same-length payload edits and concurrent races still need replay.
+fn check_storage_identity(
+    file: &mut File,
+    expected: u64,
+    expected_header: &[u8; HEADER_BYTES as usize],
+    poisoned: &mut bool,
+) -> Result<(), Error> {
+    let observed = (|| -> io::Result<bool> {
+        if file.metadata()?.len() != expected || file.stream_position()? != expected {
+            return Ok(false);
+        }
+        let mut header = [0; HEADER_BYTES as usize];
+        file.seek(SeekFrom::Start(0))?;
+        file.read_exact(&mut header)?;
+        file.seek(SeekFrom::Start(expected))?;
+        Ok(&header == expected_header)
+    })();
     match observed {
-        Ok((length, position)) if length == expected && position == expected => Ok(()),
-        Ok(_) => {
+        Ok(true) => Ok(()),
+        Ok(false) => {
             *poisoned = true;
             Err(Error::StorageChanged)
         }
