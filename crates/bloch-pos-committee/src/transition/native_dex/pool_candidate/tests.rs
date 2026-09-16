@@ -172,3 +172,61 @@ fn permissive_producer_result_is_not_authority_and_snapshot_replay_is_determinis
     assert_eq!(first.commitment, replay.commitment);
     assert_eq!(first.charge, replay.charge);
 }
+
+#[test]
+fn base_projection_binding_rejects_mismatch_without_mutation() {
+    let (mut state, bytes, direct) = fixture();
+    let original = state.state_root();
+    let roots = BaseRoots {
+        parent: state.base.compute_root(),
+        post: direct.base.compute_root(),
+    };
+    let mut wrong_parent = roots;
+    wrong_parent.parent[0] ^= 1;
+    assert!(matches!(
+        prepare_with_base_roots(&mut state, &bytes, 1, wrong_parent, &NoCrypto, &NoCrypto),
+        Err(Error::BaseParentMismatch)
+    ));
+    assert_eq!(state.state_root(), original);
+    let mut wrong_post = roots;
+    wrong_post.post[0] ^= 1;
+    assert!(matches!(
+        prepare_with_base_roots(
+            &mut state,
+            &bytes,
+            1,
+            wrong_post,
+            &BoundVerifier,
+            &BoundVerifier
+        ),
+        Err(Error::BasePostMismatch)
+    ));
+    assert_eq!(state.state_root(), original);
+    let pending =
+        prepare_with_base_roots(&mut state, &bytes, 1, roots, &BoundVerifier, &BoundVerifier)
+            .unwrap();
+    drop(pending);
+    assert_eq!(state.state_root(), original);
+    prepare_with_base_roots(&mut state, &bytes, 1, roots, &BoundVerifier, &BoundVerifier)
+        .unwrap()
+        .commit();
+    assert_eq!(state.state_root(), direct.state_root());
+    assert_eq!(state.base.compute_root(), roots.post);
+    assert_eq!(state.native().snapshot(), direct.native().snapshot());
+}
+
+#[test]
+fn base_projection_binding_cannot_replace_candidate_validation() {
+    let (mut state, mut bytes, direct) = fixture();
+    let roots = BaseRoots {
+        parent: state.base.compute_root(),
+        post: direct.base.compute_root(),
+    };
+    let original = state.state_root();
+    bytes[82] ^= 1;
+    assert!(matches!(
+        prepare_with_base_roots(&mut state, &bytes, 1, roots, &BoundVerifier, &BoundVerifier),
+        Err(Error::Batch(pool_batch::Error::PostStateMismatch))
+    ));
+    assert_eq!(state.state_root(), original);
+}

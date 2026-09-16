@@ -300,3 +300,21 @@ API remains independent of operator-specific freshness limits.
 plus newline without reading stdin. Other arguments are refused. This supports
 the bridge's explicit `check-native-verifier.py` deployment diagnostic; protocol
 compatibility alone is not a cryptographic self-test or operational readiness.
+
+### Binding the BLCH projection during candidate preparation
+
+`pool_candidate::prepare_with_base_roots` adds explicit expected parent and post
+BLCH roots to the existing independently reexecuted candidate preparation. A
+wrong parent is refused before cryptography; a wrong post drops the staged state.
+Only a matching candidate returns the exclusively borrowed `Prepared` handle,
+which must still be durably persisted before commitment. Dropping that handle
+continues to abort without state mutation. Full candidate domain, height, joint
+root, operation and signature checks are retained.
+
+The host must derive `BaseRoots` from its authenticated parent and independently
+validated block expectations. This check links the BLCH projection only: it does
+not prove that a live header commits the combined native gateway root, authenticate
+a header, or supply finality. No live node admission path invokes this API yet.
+A block containing other operations must compose them into one defined transition
+before comparing roots; an arbitrary intermediate candidate root is not a complete
+block state root. Activation and combined-root header encoding remain required.

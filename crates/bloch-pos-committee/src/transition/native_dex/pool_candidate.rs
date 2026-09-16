@@ -14,6 +14,8 @@ pub const MAX_ENCODED_BYTES: usize =
 pub enum Error {
     Wire(wire::Error),
     WrongHeight,
+    BaseParentMismatch,
+    BasePostMismatch,
     InvalidCount,
     CommitmentMismatch,
     Batch(pool_batch::Error),
@@ -205,6 +207,36 @@ pub fn prepare<'state, 'bytes>(
         outcome,
         bytes,
     })
+}
+
+/// Explicit BLCH projection expected by an integrating host. These values must
+/// come from its authenticated parent and validated block context, not candidate
+/// metadata. They do not authenticate the combined gateway state or finality.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BaseRoots {
+    pub parent: [u8; 32],
+    pub post: [u8; 32],
+}
+
+/// Reexecute a candidate and additionally bind both BLCH projections to the
+/// host's expectations. A mismatch drops the staged state without installing it.
+/// This remains opt-in rehearsal; no live node admission path calls it yet.
+pub fn prepare_with_base_roots<'state, 'bytes>(
+    state: &'state mut State,
+    bytes: &'bytes [u8],
+    height: u64,
+    roots: BaseRoots,
+    base_verifier: &dyn SignatureVerifier,
+    native_verifier: &dyn Verifier,
+) -> Result<Prepared<'state, 'bytes>, Error> {
+    if state.base.compute_root() != roots.parent {
+        return Err(Error::BaseParentMismatch);
+    }
+    let prepared = prepare(state, bytes, height, base_verifier, native_verifier)?;
+    if prepared.staged.base.compute_root() != roots.post {
+        return Err(Error::BasePostMismatch);
+    }
+    Ok(prepared)
 }
 
 #[cfg(test)]
