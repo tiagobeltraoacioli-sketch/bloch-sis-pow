@@ -734,3 +734,169 @@ fn typed_signing_refuses_slippage_reserve_owner_and_authority_changes() {
     }
     refuse(&state, request);
 }
+
+#[test]
+fn live_withdrawal_builder_requires_external_authorities_and_preserves_owner_change() {
+    use bloch_pos_committee::transition::native_dex::lab_withdrawal::Query;
+    let (state, _, route) = withdrawal();
+    let query = Query {
+        owner: key(),
+        route,
+        amount: 40,
+        recipient: [15; 20],
+        nonce: 0,
+        valid_until: 100,
+    };
+    let quote = state.lab_build_withdrawal(&query, 1).unwrap();
+    let (_, issuer) = crypto::generate_keypair_from_seed(&[8; 32]).unwrap();
+    let mut committee = vec![
+        crypto::generate_keypair_from_seed(&[9; 32]).unwrap(),
+        crypto::generate_keypair_from_seed(&[10; 32]).unwrap(),
+    ];
+    committee.sort_by(|a, b| a.0.cmp(&b.0));
+    let issuer_sig = crypto::sign(&issuer, &quote.authorization).unwrap();
+    let approvals = committee
+        .iter()
+        .map(|(_, s)| crypto::sign(s, &quote.authorization).unwrap())
+        .collect::<Vec<_>>();
+    for mutated in [
+        Query {
+            nonce: 1,
+            ..query.clone()
+        },
+        Query {
+            recipient: [0; 20],
+            ..query.clone()
+        },
+        Query {
+            amount: 101,
+            ..query.clone()
+        },
+        Query {
+            owner: vec![1; 32],
+            ..query.clone()
+        },
+    ] {
+        assert!(state.lab_build_withdrawal(&mutated, 1).is_err());
+    }
+    for mutated in [
+        Query {
+            amount: 39,
+            ..query.clone()
+        },
+        Query {
+            recipient: [16; 20],
+            ..query.clone()
+        },
+        Query {
+            valid_until: 99,
+            ..query.clone()
+        },
+    ] {
+        assert!(state
+            .lab_certify_withdrawal(
+                &mutated,
+                1,
+                quote.authorization,
+                issuer_sig.clone(),
+                approvals.clone(),
+                &Hybrid
+            )
+            .is_err());
+    }
+    let mut bad = approvals.clone();
+    bad[0][0] ^= 1;
+    assert!(state
+        .lab_certify_withdrawal(
+            &query,
+            1,
+            quote.authorization,
+            issuer_sig.clone(),
+            bad,
+            &Hybrid
+        )
+        .is_err());
+    assert!(state
+        .lab_certify_withdrawal(
+            &query,
+            1,
+            quote.authorization,
+            issuer_sig.clone(),
+            vec![vec![], vec![]],
+            &Hybrid
+        )
+        .is_err());
+    let mut session = Session::open(&SEED, DOMAIN).unwrap();
+    let review = session.prepare(&state, &quote.transaction, 1).unwrap();
+    assert!(session
+        .sign(review.id, &state, &quote.transaction, 1, true)
+        .is_err());
+    let certified = state
+        .lab_certify_withdrawal(
+            &query,
+            1,
+            quote.authorization,
+            issuer_sig,
+            approvals,
+            &Hybrid,
+        )
+        .unwrap();
+    assert_eq!(certified.authorization, quote.authorization);
+    assert_eq!(certified.fee_sat, quote.fee_sat);
+    let review = session.prepare(&state, &certified.transaction, 1).unwrap();
+    let signed = session
+        .sign(review.id, &state, &certified.transaction, 1, true)
+        .unwrap();
+    if let Ok(path) = std::env::var("NATIVE_WASM_WITHDRAWAL_VECTOR_PATH") {
+        let vector = json!({"schema":"postern.native-wasm-vectors.v1","vectors":[{"operation":"withdrawal-builder","publicTestSeedHex":hex::encode(SEED),"domainHex":hex::encode(DOMAIN),"transactionHex":hex::encode(&certified.transaction),"height":"1","context":context(&state),"feeSat":review.fee_sat.to_string()}]});
+        std::fs::write(path, serde_json::to_vec_pretty(&vector).unwrap()).unwrap();
+    }
+    let signed = if let Ok(path) = std::env::var("NATIVE_WASM_WITHDRAWAL_SIGNED_PATH") {
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let row = &value["vectors"][0];
+        assert_eq!(row["operation"], "withdrawal-builder");
+        let bytes = hex::decode(row["signedTransactionHex"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            row["txid"],
+            hex::encode(PosTransaction::from_canonical_bytes(&bytes).unwrap().txid())
+        );
+        bytes
+    } else {
+        signed
+    };
+    let PosTransaction::NativeWithdrawal(payload) =
+        PosTransaction::from_canonical_bytes(&signed).unwrap()
+    else {
+        panic!()
+    };
+    let mut after = state.clone();
+    pool_wire::apply_encoded(&mut after, payload.as_bytes(), 1, &Hybrid, &Hybrid).unwrap();
+    let ledger = after.native().gateway();
+    let release = ledger.release_record(&route, 0).unwrap();
+    assert_eq!(release.amount, 40);
+    assert_eq!(release.recipient, [15; 20]);
+    assert_eq!(ledger.route(&route).unwrap().burned, 40);
+    let asset = ledger.route(&route).unwrap().config.route.native_asset;
+    assert_eq!(ledger.native().supply(&asset), Some(60));
+    let pool_wire::Request::Gateway(request) =
+        pool_wire::decode(payload.as_bytes(), &DOMAIN).unwrap()
+    else {
+        panic!()
+    };
+    let bloch_euvm::ustav::gateway::wire::Operation::Withdraw(withdraw) = request.gateway.operation
+    else {
+        panic!()
+    };
+    assert_eq!(
+        withdraw.transaction.outputs,
+        vec![n::Output {
+            owner: key(),
+            amount: 60
+        }]
+    );
+    let root = after.state_root();
+    assert!(pool_wire::apply_encoded(&mut after, payload.as_bytes(), 1, &Hybrid, &Hybrid).is_err());
+    assert_eq!(root, after.state_root());
+    assert!(after.lab_build_withdrawal(&query, 1).is_err());
+}

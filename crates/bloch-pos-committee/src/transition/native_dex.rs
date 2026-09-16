@@ -798,3 +798,5 @@ mod component_tests {
 mod lab_view;
 #[cfg(feature = "native-lab")]
 pub mod lab_quote;
+#[cfg(feature = "native-lab")]
+pub mod lab_withdrawal;

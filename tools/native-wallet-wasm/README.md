@@ -112,3 +112,15 @@ while preserving every already-debited BLCH UTXO. This is not canonical fee
 settlement or a block replay proof. The production component codec is unchanged;
 the helper is a dev-dependency feature and absent from the release WASM build.
 Canonical node snapshots supplied by RPC require no such normalization.
+
+
+The laboratory withdrawal builder fixes the current route nonce, native owner
+input, BLCH payer, recipient, burn amount, change and fee before external
+certification. It supports one Supply policy and one sufficient unlocked native
+output. Issuer and ordered committee approvals sign the joint authorization;
+the wallet signs only its own payer and native input. Rebuilding against current
+state rejects stale certificates. `live_withdrawal_builder` checks genuine hybrid
+certificates, partial burns, replay, and changed recipient, amount or expiry.
+Use `NATIVE_WASM_WITHDRAWAL_VECTOR_PATH` to export its vector and
+`NATIVE_WASM_WITHDRAWAL_SIGNED_PATH` to execute the crosscheck driver's exact WASM
+result. Laboratory features do not enable production activation gates.
