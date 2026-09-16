@@ -7,12 +7,13 @@ license = "AGPL-3.0-or-later"
 
 [features]
 # Explicit local persistence host; never enabled by default or by the live node.
-native-dex-host = ["dep:bloch-pos-committee"]
+native-dex-host = ["dep:bloch-pos-committee", "dep:sha3"]
 
 [dependencies]
 bloch-euvm = { path = "../bloch-euvm" }
 bloch-pos-committee = { path = "../bloch-pos-committee", features = ["native-dex-rehearsal"], optional = true }
 bloch-crypto = { path = "../bloch-crypto", default-features = false }
+sha3 = { version = "0.10", optional = true }
 
 [dev-dependencies]
 bloch-pos-committee = { path = "../bloch-pos-committee", features = ["native-dex-rehearsal"] }

@@ -133,6 +133,39 @@ remain separate requirements. A committed local burn does not prove external
 payment. The API remains behind `native-dex-host`; no RPC service, consensus
 activation, source transaction or settlement mutation is introduced.
 
+### Redemption review integrity commitment
+
+`RedemptionReview::commitment()` returns SHA3-256 of `commitment_preimage()`.
+This is a versioned integrity identifier for the entire review, not a signature,
+trusted checkpoint certificate, or authorization to pay or settle a redemption.
+The source release ID remains its existing SHA-256 ABI digest; these two hash
+domains must not be confused.
+
+The preimage concatenates these fields without JSON encoding:
+
+1. ASCII `BLOCH-REDEMPTION-REVIEW-v1` followed by one zero byte.
+2. Checkpoint height (8-byte unsigned big-endian), then its 32-byte root.
+3. Native domain and native asset ID (32 bytes each).
+4. Native supply (8 bytes), cumulative imports and burns (16 bytes each).
+5. Source-compatible release ID (32 bytes), binding route, nonce, recipient,
+   amount and native burn through `Release::id()`.
+6. Route count (4-byte unsigned big-endian).
+7. For each route in ascending route-ID order: route ID (32 bytes), source domain
+   (32), token (20), vault (20), cumulative imports (16), cumulative burns (16),
+   outstanding amount (8), and release count (8).
+
+All integers are unsigned big-endian. The query already limits the review to
+32 routes, so the preimage is at most 5,567 bytes. There are no caller-selected
+hash algorithms, ambiguous text numbers or host-endian fields. Changing any
+bound checkpoint, release or accounting field changes the identifier; replaying
+the same persisted journal produces the same identifier.
+
+The commitment can be retained alongside the observer JSON to detect accidental
+mixing of reviews. An attacker can replace an unsigned payload and its hash
+together. Authentication still requires an independently trusted signer/checkpoint
+policy and a verified transport; no such trust is inferred from this commitment.
+Neither the journal format nor source contract route IDs change.
+
 ### Existing integration coverage
 
 The complete market rehearsal is now covered by

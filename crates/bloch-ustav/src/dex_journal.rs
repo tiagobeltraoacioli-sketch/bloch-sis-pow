@@ -62,6 +62,38 @@ pub struct RedemptionReview<'a> {
     liabilities: gateway::AssetLiabilities,
 }
 impl RedemptionReview<'_> {
+    /// Canonical versioned bytes for independent commitment verification.
+    /// This is an integrity identifier, not a certificate or payout permission.
+    pub fn commitment_preimage(&self) -> Vec<u8> {
+        let mut bytes = b"BLOCH-REDEMPTION-REVIEW-v1\0".to_vec();
+        bytes.extend_from_slice(&self.checkpoint.height.to_be_bytes());
+        bytes.extend_from_slice(&self.checkpoint.root);
+        bytes.extend_from_slice(&self.liabilities.native_domain);
+        bytes.extend_from_slice(&self.liabilities.native_asset);
+        bytes.extend_from_slice(&self.liabilities.native_supply.to_be_bytes());
+        bytes.extend_from_slice(&self.liabilities.imported.to_be_bytes());
+        bytes.extend_from_slice(&self.liabilities.burned.to_be_bytes());
+        bytes.extend_from_slice(&self.release.id());
+        // Only the journal constructs reviews; liabilities bounds this to MAX_ROUTES.
+        bytes.extend_from_slice(&(self.liabilities.routes.len() as u32).to_be_bytes());
+        for route in &self.liabilities.routes {
+            bytes.extend_from_slice(&route.route);
+            bytes.extend_from_slice(&route.source_domain);
+            bytes.extend_from_slice(&route.token);
+            bytes.extend_from_slice(&route.vault);
+            bytes.extend_from_slice(&route.imported.to_be_bytes());
+            bytes.extend_from_slice(&route.burned.to_be_bytes());
+            bytes.extend_from_slice(&route.outstanding.to_be_bytes());
+            bytes.extend_from_slice(&route.release_count.to_be_bytes());
+        }
+        bytes
+    }
+    /// SHA3-256 of commitment_preimage; distinct from the source release's SHA-256 ID.
+    pub fn commitment(&self) -> [u8; 32] {
+        use sha3::{Digest, Sha3_256};
+        Sha3_256::digest(self.commitment_preimage()).into()
+    }
+
     pub fn checkpoint(&self) -> Checkpoint {
         self.checkpoint
     }
@@ -433,6 +465,115 @@ fn persist_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn commitment_fixture(release: &Release) -> RedemptionReview<'_> {
+        RedemptionReview {
+            checkpoint: Checkpoint {
+                height: 10,
+                root: [4; 32],
+            },
+            release,
+            liabilities: gateway::AssetLiabilities {
+                native_domain: [5; 32],
+                native_asset: [6; 32],
+                native_supply: 20,
+                imported: 120,
+                burned: 100,
+                routes: vec![gateway::RouteLiabilities {
+                    route: [1; 32],
+                    source_domain: [7; 32],
+                    token: [8; 20],
+                    vault: [9; 20],
+                    imported: 120,
+                    burned: 100,
+                    outstanding: 20,
+                    release_count: 1,
+                }],
+            },
+        }
+    }
+    #[test]
+    fn redemption_commitment_matches_independent_python_sha3_vector() {
+        let release = Release {
+            route: [1; 32],
+            nonce: 7,
+            recipient: [2; 20],
+            amount: 100,
+            native_burn: [3; 32],
+        };
+        let review = commitment_fixture(&release);
+        assert_eq!(review.commitment_preimage().len(), 359);
+        let hex = review
+            .commitment()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            hex,
+            "4634b37856f26dcb28826e93b5a34010532e752cd3d3ef8a5c7efc077b38103f"
+        );
+        assert_eq!(
+            review.commitment(),
+            commitment_fixture(&release).commitment()
+        );
+    }
+    #[test]
+    fn redemption_commitment_binds_checkpoint_release_and_all_accounting_fields() {
+        let release = Release {
+            route: [1; 32],
+            nonce: 7,
+            recipient: [2; 20],
+            amount: 100,
+            native_burn: [3; 32],
+        };
+        let baseline = commitment_fixture(&release).commitment();
+        let changes: &[fn(&mut RedemptionReview<'_>)] = &[
+            |r| r.checkpoint.height += 1,
+            |r| r.checkpoint.root[0] ^= 1,
+            |r| r.liabilities.native_domain[0] ^= 1,
+            |r| r.liabilities.native_asset[0] ^= 1,
+            |r| r.liabilities.native_supply += 1,
+            |r| r.liabilities.imported += 1,
+            |r| r.liabilities.burned += 1,
+            |r| r.liabilities.routes.clear(),
+            |r| r.liabilities.routes[0].route[0] ^= 1,
+            |r| r.liabilities.routes[0].source_domain[0] ^= 1,
+            |r| r.liabilities.routes[0].token[0] ^= 1,
+            |r| r.liabilities.routes[0].vault[0] ^= 1,
+            |r| r.liabilities.routes[0].imported += 1,
+            |r| r.liabilities.routes[0].burned += 1,
+            |r| r.liabilities.routes[0].outstanding += 1,
+            |r| r.liabilities.routes[0].release_count += 1,
+        ];
+        for change in changes {
+            let mut changed = commitment_fixture(&release);
+            change(&mut changed);
+            assert_ne!(changed.commitment(), baseline);
+        }
+        for changed in [
+            Release {
+                route: [10; 32],
+                ..release.clone()
+            },
+            Release {
+                nonce: 8,
+                ..release.clone()
+            },
+            Release {
+                recipient: [10; 20],
+                ..release.clone()
+            },
+            Release {
+                amount: 101,
+                ..release.clone()
+            },
+            Release {
+                native_burn: [10; 32],
+                ..release.clone()
+            },
+        ] {
+            assert_ne!(commitment_fixture(&changed).commitment(), baseline);
+        }
+    }
     #[test]
     fn observer_export_keeps_large_uint64_values_as_exact_decimal_strings() {
         let release = Release {

@@ -570,6 +570,7 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
             .unwrap()
     );
     let exported = review.observer_request_json();
+    let review_commitment = review.commitment();
     let value: serde_json::Value = serde_json::from_str(&exported).unwrap();
     assert_eq!(value.as_object().unwrap().len(), 7);
     assert_eq!(value["nonce"], release.nonce.to_string());
@@ -636,6 +637,7 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
     let page = reopened.release_page(head, &route, None, 1).unwrap();
     let review = reopened.redemption_review(head, &route, 0).unwrap();
     assert_eq!(review.observer_request_json(), exported);
+    assert_eq!(review.commitment(), review_commitment);
     assert_eq!(review.checkpoint(), head);
     assert_eq!(page.records(), &[&release]);
     assert_eq!(page.checkpoint(), head);
