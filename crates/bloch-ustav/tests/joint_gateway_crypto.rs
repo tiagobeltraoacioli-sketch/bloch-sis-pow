@@ -511,6 +511,10 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
     assert!(view.import_record(&route, 0).is_none());
     assert!(view.release_record(&route, 0).is_none());
     assert!(view.releases_after(&route, None, 1).unwrap().is_empty());
+    assert!(matches!(
+        journal.redemption_review(original_head, &route, 0),
+        Err(JournalError::UnknownRelease)
+    ));
     assert!(journal
         .release_page(original_head, &route, None, 1)
         .unwrap()
@@ -546,8 +550,51 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
             journal.release_page(stale, &route, None, 1),
             Err(JournalError::WrongHead)
         ));
+        assert!(matches!(
+            journal.redemption_review(stale, &route, 0),
+            Err(JournalError::WrongHead)
+        ));
     }
     let page = journal.release_page(head, &route, None, 1).unwrap();
+    let review = journal.redemption_review(head, &route, 0).unwrap();
+    assert_eq!(review.checkpoint(), head);
+    assert_eq!(review.release(), &release);
+    let asset = import.transaction.asset;
+    assert_eq!(
+        review.liabilities(),
+        &journal
+            .state()
+            .native()
+            .gateway()
+            .liabilities(&asset)
+            .unwrap()
+    );
+    let exported = review.observer_request_json();
+    let value: serde_json::Value = serde_json::from_str(&exported).unwrap();
+    assert_eq!(value.as_object().unwrap().len(), 7);
+    assert_eq!(value["nonce"], release.nonce.to_string());
+    assert_eq!(value["amount"], release.amount.to_string());
+    for (key, bytes) in [
+        ("native_domain", DOMAIN.as_slice()),
+        ("native_asset", asset.as_slice()),
+        ("route_id", route.as_slice()),
+        ("recipient", release.recipient.as_slice()),
+        ("native_burn", release.native_burn.as_slice()),
+    ] {
+        let expected_hex = format!(
+            "0x{}",
+            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
+        assert_eq!(value[key], expected_hex);
+    }
+    assert!(matches!(
+        journal.redemption_review(head, &route, 1),
+        Err(JournalError::UnknownRelease)
+    ));
+    assert!(matches!(
+        journal.redemption_review(head, &[0; 32], 0),
+        Err(JournalError::Gateway(gateway::Error::UnknownRoute))
+    ));
     assert_eq!(page.checkpoint(), head);
     assert_eq!(page.route(), &route);
     assert_eq!(page.records(), &[&release]);
@@ -587,6 +634,9 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
     assert!(view.release_record(&route, 1).is_none());
     assert_eq!(reopened.checkpoint(), head);
     let page = reopened.release_page(head, &route, None, 1).unwrap();
+    let review = reopened.redemption_review(head, &route, 0).unwrap();
+    assert_eq!(review.observer_request_json(), exported);
+    assert_eq!(review.checkpoint(), head);
     assert_eq!(page.records(), &[&release]);
     assert_eq!(page.checkpoint(), head);
     assert_eq!(page.next_after(), Some(0));

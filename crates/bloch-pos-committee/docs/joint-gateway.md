@@ -107,6 +107,34 @@ to individual records or establish a payout authorization policy.
 
 ## Validation and deployment boundary
 
+### Checkpoint-bound redemption review
+
+The optional local host exposes
+`journal.redemption_review(expected_checkpoint, &route, nonce)`. It checks journal
+health and the exact expected height/root before looking up a committed release.
+Unknown routes or releases are refused. It also reconciles all routes for that
+release's native asset against native supply, returning the release and an
+`AssetLiabilities` report under the same checkpoint and immutable journal borrow.
+Admission previews are never used. A stale height/root or poisoned journal cannot
+produce a review. The query changes neither state nor the durable file.
+
+The review's `observer_request_json()` exports exactly the seven fields consumed
+by the bridge's `inspect-stablecoin-release.py`: native domain, native asset,
+route ID, nonce, recipient, amount and native burn. IDs are fixed-size lowercase
+hex and uint64 fields are decimal strings, preserving values above 2**53.
+The caller can retain `checkpoint()` alongside this request for its own verified
+checkpoint policy. The JSON deliberately contains no settlement authorization.
+
+The exported file alone is not an authenticated proof: another process can alter
+it, and the source observer cannot independently establish native finality from
+those fields. Authentication of the checkpoint and transport, matching source
+payment evidence, source reorg handling and an atomic paid-liability transition
+remain separate requirements. A committed local burn does not prove external
+payment. The API remains behind `native-dex-host`; no RPC service, consensus
+activation, source transaction or settlement mutation is introduced.
+
+### Existing integration coverage
+
 The complete market rehearsal is now covered by
 `bridge_import_liquidity_independent_trade_and_redemption_survive_restart` in
 `bloch-ustav/tests/joint_gateway_crypto.rs`, with the continuation implemented

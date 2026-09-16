@@ -35,6 +35,7 @@ pub enum Error {
     InvalidHeader,
     WrongAnchor,
     WrongHead,
+    UnknownRelease,
     InvalidLength,
     ResourceLimit,
     NonIncreasingHeight,
@@ -51,6 +52,46 @@ pub struct ReleasePage<'a> {
     checkpoint: Checkpoint,
     route: [u8; 32],
     records: Vec<&'a Release>,
+}
+
+/// A committed native release and asset accounting from the same local head.
+/// The checkpoint must be independently trusted; this is not consensus proof.
+pub struct RedemptionReview<'a> {
+    checkpoint: Checkpoint,
+    release: &'a Release,
+    liabilities: gateway::AssetLiabilities,
+}
+impl RedemptionReview<'_> {
+    pub fn checkpoint(&self) -> Checkpoint {
+        self.checkpoint
+    }
+    pub fn release(&self) -> &Release {
+        self.release
+    }
+    pub fn liabilities(&self) -> &gateway::AssetLiabilities {
+        &self.liabilities
+    }
+    /// Exact input schema for inspect-stablecoin-release.py. The exported JSON
+    /// alone is NOT authenticated and contains no permission to settle a claim.
+    /// u64 values remain decimal strings for lossless transport through browsers.
+    pub fn observer_request_json(&self) -> String {
+        fn hex(bytes: &[u8]) -> String {
+            const DIGITS: &[u8; 16] = b"0123456789abcdef";
+            let mut result = String::with_capacity(2 + bytes.len() * 2);
+            result.push_str("0x");
+            for byte in bytes {
+                result.push(DIGITS[usize::from(byte >> 4)] as char);
+                result.push(DIGITS[usize::from(byte & 15)] as char);
+            }
+            result
+        }
+        format!(
+            "{{\"native_domain\":\"{}\",\"native_asset\":\"{}\",\"route_id\":\"{}\",\"nonce\":\"{}\",\"recipient\":\"{}\",\"amount\":\"{}\",\"native_burn\":\"{}\"}}",
+            hex(&self.liabilities.native_domain), hex(&self.liabilities.native_asset),
+            hex(&self.release.route), self.release.nonce, hex(&self.release.recipient),
+            self.release.amount, hex(&self.release.native_burn),
+        )
+    }
 }
 impl ReleasePage<'_> {
     pub fn checkpoint(&self) -> Checkpoint {
@@ -277,6 +318,46 @@ impl Journal {
         })
     }
 
+    /// Return one committed release and all of its asset's route liabilities
+    /// at the SAME expected head. Pending admission previews are not consulted.
+    /// The borrowed review prevents mutation of this journal while in use.
+    /// ```compile_fail
+    /// use bloch_ustav::dex_journal::Journal;
+    /// fn mutate(journal: &mut Journal, route: &[u8; 32], frame: &[u8]) {
+    ///     let head = journal.checkpoint();
+    ///     let review = journal.redemption_review(head, route, 0).unwrap();
+    ///     journal.append(frame, head.height + 1).unwrap();
+    ///     println!("{}", review.observer_request_json());
+    /// }
+    /// ```
+    pub fn redemption_review(
+        &self,
+        expected: Checkpoint,
+        route: &[u8; 32],
+        nonce: u64,
+    ) -> Result<RedemptionReview<'_>, Error> {
+        self.ensure_healthy()?;
+        if self.head != expected {
+            return Err(Error::WrongHead);
+        }
+        let view = self.state.native().gateway();
+        let asset = view
+            .route(route)
+            .ok_or(Error::Gateway(gateway::Error::UnknownRoute))?
+            .config
+            .route
+            .native_asset;
+        let release = view
+            .release_record(route, nonce)
+            .ok_or(Error::UnknownRelease)?;
+        let liabilities = view.liabilities(&asset).map_err(Error::Gateway)?;
+        Ok(RedemptionReview {
+            checkpoint: self.head,
+            release,
+            liabilities,
+        })
+    }
+
     /// The host supplies the authenticated candidate height. Successful return
     /// follows fsync; any write/fsync failure poisons this handle until reopen.
     pub fn append(&mut self, candidate: &[u8], height: u64) -> Result<pool_batch::Outcome, Error> {
@@ -352,6 +433,37 @@ fn persist_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn observer_export_keeps_large_uint64_values_as_exact_decimal_strings() {
+        let release = Release {
+            route: [1; 32],
+            nonce: u64::MAX - 1,
+            recipient: [2; 20],
+            amount: u64::MAX,
+            native_burn: [3; 32],
+        };
+        let review = RedemptionReview {
+            checkpoint: Checkpoint {
+                height: 10,
+                root: [4; 32],
+            },
+            release: &release,
+            liabilities: gateway::AssetLiabilities {
+                native_domain: [5; 32],
+                native_asset: [6; 32],
+                native_supply: 0,
+                imported: u128::from(u64::MAX),
+                burned: u128::from(u64::MAX),
+                routes: vec![],
+            },
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&review.observer_request_json()).unwrap();
+        assert_eq!(value["nonce"].as_str(), Some("18446744073709551614"));
+        assert_eq!(value["amount"].as_str(), Some("18446744073709551615"));
+        assert_eq!(value.as_object().unwrap().len(), 7);
+        assert!(value.get("redemption_settled").is_none());
+    }
     struct FaultyWriter {
         bytes: Vec<u8>,
         remaining: usize,
