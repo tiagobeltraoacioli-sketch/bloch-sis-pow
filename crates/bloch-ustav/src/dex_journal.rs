@@ -443,6 +443,29 @@ impl Journal {
         expected_head: Checkpoint,
         recovery: TailRecovery,
     ) -> Result<Self, Error> {
+        Self::open_with_policy(path, anchor, anchor_height, expected_head, recovery, false)
+    }
+
+    /// Require the bound format from independent host configuration, before any
+    /// replay or tail recovery. Never silently accept a legacy/unbound journal.
+    pub fn open_requiring_base_roots(
+        path: &Path,
+        anchor: State,
+        anchor_height: u64,
+        expected_head: Checkpoint,
+        recovery: TailRecovery,
+    ) -> Result<Self, Error> {
+        Self::open_with_policy(path, anchor, anchor_height, expected_head, recovery, true)
+    }
+
+    fn open_with_policy(
+        path: &Path,
+        anchor: State,
+        anchor_height: u64,
+        expected_head: Checkpoint,
+        recovery: TailRecovery,
+        host_requires_base_roots: bool,
+    ) -> Result<Self, Error> {
         if !std::fs::symlink_metadata(path)?.file_type().is_file() {
             return Err(Error::InvalidFile);
         }
@@ -464,6 +487,9 @@ impl Journal {
         } else {
             return Err(Error::InvalidHeader);
         };
+        if host_requires_base_roots && !require_base_roots {
+            return Err(Error::BaseRootsRequired);
+        }
         if header[8..16] != anchor_height.to_le_bytes() || header[16..48] != anchor.state_root() {
             return Err(Error::WrongAnchor);
         }

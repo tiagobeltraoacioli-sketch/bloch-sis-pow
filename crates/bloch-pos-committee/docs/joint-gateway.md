@@ -391,3 +391,15 @@ and tips. Replay validates the complete joint state but does not reconstruct pas
 host approvals or store their expected BLCH roots. Real PQ tests verify rejection
 before and after restart, inherited queue policy, unchanged disk bytes on refusal,
 and successful bound replay. Production consensus activation remains pending.
+
+A host that requires bound persistence should pair creation with
+`Journal::open_requiring_base_roots`, rather than relying on `open` to infer
+policy from the file alone. The strict opener rejects `BLCHDJ01` before replay,
+anchor hashing or incomplete-tail recovery, even when its candidate history could
+match the expected joint tip. Rejection leaves file bytes untouched and releases
+the lock. Real PQ restart tests replace the bound header with the legacy header
+and append an incomplete tail, require refusal with recovery enabled, then restore
+the test file and reopen successfully. Existing generic `open` remains available
+for intentional legacy compatibility. This prevents silent policy downgrade by
+header substitution when the host selects the strict API; it does not authenticate
+host configuration, historical approvals or consensus finality.

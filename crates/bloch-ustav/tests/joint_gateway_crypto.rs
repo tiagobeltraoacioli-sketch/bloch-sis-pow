@@ -652,8 +652,14 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
     ));
     assert_eq!(std::fs::read(&bound_path).unwrap(), persisted);
     drop(bound);
-    let mut bound =
-        Journal::open(&bound_path, anchor.clone(), 3, head, TailRecovery::Reject).unwrap();
+    let mut bound = Journal::open_requiring_base_roots(
+        &bound_path,
+        anchor.clone(),
+        3,
+        head,
+        TailRecovery::Reject,
+    )
+    .unwrap();
     assert!(bound.requires_base_roots());
     assert!(matches!(
         bound.append(&candidate, 5),
@@ -668,6 +674,37 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
     assert_eq!(bound.state().base_state_root(), roots.post);
     assert_eq!(bound.state().state_root(), expected);
     drop(bound);
+    // A host-pinned policy rejects a downgraded header before tail recovery,
+    // even though the candidate history still matches the trusted joint tip.
+    let mut downgraded = persisted.clone();
+    downgraded[..8].copy_from_slice(b"BLCHDJ01");
+    downgraded.extend_from_slice(&[1, 2]);
+    std::fs::write(&bound_path, &downgraded).unwrap();
+    assert!(matches!(
+        Journal::open_requiring_base_roots(
+            &bound_path,
+            anchor.clone(),
+            3,
+            head,
+            TailRecovery::DiscardIncomplete
+        ),
+        Err(JournalError::BaseRootsRequired)
+    ));
+    assert_eq!(std::fs::read(&bound_path).unwrap(), downgraded);
+    // Failed open releases the lock; restoring the original local test file
+    // permits a successful strict reopen with no changes to the actual state.
+    std::fs::write(&bound_path, &persisted).unwrap();
+    let restored = Journal::open_requiring_base_roots(
+        &bound_path,
+        anchor.clone(),
+        3,
+        head,
+        TailRecovery::Reject,
+    )
+    .unwrap();
+    assert!(restored.requires_base_roots());
+    assert_eq!(restored.checkpoint(), head);
+    drop(restored);
     std::fs::remove_file(&bound_path).unwrap();
     let bytes_before_queries = std::fs::read(&path).unwrap();
     for stale in [
