@@ -16,8 +16,104 @@ fn fixture() -> Scenario {
 }
 
 #[test]
+fn liability_reports_separate_assets_and_do_not_mutate_accounting() {
+    let mut scenario = fixture();
+    scenario.enable_all();
+    let first_asset = scenario.configs[0].route.native_asset;
+    let mut registration = scenario
+        .ledger
+        .native()
+        .registration(&first_asset)
+        .unwrap()
+        .clone();
+    registration.nonce = [199; 32];
+    registration.charter.token_name = b"SECOND-BRIDGED-ASSET-SIMULATION".to_vec();
+    let signature = crypto::sign(
+        &scenario.issuer.1,
+        &registration.signing_hash(&DOMAIN).unwrap(),
+    )
+    .unwrap();
+    let second_asset = scenario
+        .ledger
+        .register(registration, &signature, &BlochVerifier, GAS)
+        .unwrap();
+    let mut config = scenario.configs[0].clone();
+    config.route.native_asset = second_asset;
+    config.route.token = [201; 20];
+    config.route.vault = [202; 20];
+    let message = config.signing_hash();
+    let signature = crypto::sign(&scenario.issuer.1, &message).unwrap();
+    let approvals = scenario.approvals(&message);
+    scenario
+        .ledger
+        .enable(config, &signature, &approvals, &BlochVerifier, GAS)
+        .unwrap();
+    let request = scenario.deposit(0, 0);
+    let message = request.signing_hash(&DOMAIN).unwrap();
+    let witnesses = scenario.issuer_witness(&message);
+    let approvals = scenario.approvals(&message);
+    scenario
+        .ledger
+        .import(&request, &witnesses, &approvals, 1, &BlochVerifier, GAS)
+        .unwrap();
+    let before = scenario.ledger.snapshot();
+    let first = scenario.ledger.liabilities(&first_asset).unwrap();
+    let second = scenario.ledger.liabilities(&second_asset).unwrap();
+    assert_eq!(
+        (first.native_supply, first.imported, first.burned),
+        (100_000_000, 100_000_000, 0)
+    );
+    assert_eq!(
+        (second.native_supply, second.imported, second.burned),
+        (0, 0, 0)
+    );
+    assert_eq!((first.routes.len(), second.routes.len()), (2, 1));
+    assert!(first
+        .routes
+        .iter()
+        .all(|r| r.route != second.routes[0].route));
+    assert_eq!(scenario.ledger.snapshot(), before);
+}
+
+#[test]
 fn real_hybrid_wire_import_transfer_cross_origin_burn_and_snapshot_roundtrip() {
-    simulation::complete(fixture());
+    let scenario = fixture();
+    let asset = scenario.configs[0].route.native_asset;
+    let first_route = scenario.configs[0].route.id();
+    let second_route = scenario.configs[1].route.id();
+    let ledger = simulation::complete(scenario);
+    let before = ledger.snapshot();
+    let report = ledger.liabilities(&asset).unwrap();
+    assert_eq!(report.native_domain, DOMAIN);
+    assert_eq!(report.native_asset, asset);
+    assert_eq!(report.imported, 200_000_000);
+    assert_eq!(report.burned, 100_000_000);
+    assert_eq!(report.native_supply, 100_000_000);
+    assert_eq!(report.routes.len(), 2);
+    let first = report
+        .routes
+        .iter()
+        .find(|r| r.route == first_route)
+        .unwrap();
+    let second = report
+        .routes
+        .iter()
+        .find(|r| r.route == second_route)
+        .unwrap();
+    assert_eq!(
+        (first.outstanding, first.burned, first.release_count),
+        (100_000_000, 0, 0)
+    );
+    assert_eq!(
+        (second.outstanding, second.burned, second.release_count),
+        (0, 100_000_000, 1)
+    );
+    assert_eq!(ledger.liabilities(&[0; 32]), Err(Error::UnknownRoute));
+    assert_eq!(ledger.snapshot(), before);
+    let restored =
+        bloch_ustav::gateway::GatewayLedger::restore(before, ledger.state_root(), &BlochVerifier)
+            .unwrap();
+    assert_eq!(restored.liabilities(&asset).unwrap(), report);
 }
 
 #[test]

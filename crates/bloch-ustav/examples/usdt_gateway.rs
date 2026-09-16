@@ -142,6 +142,15 @@ impl Scenario {
 
 pub(crate) fn complete(mut scenario: Scenario) -> GatewayLedger {
     scenario.enable_all();
+    let initial = scenario
+        .ledger
+        .liabilities(&scenario.configs[0].route.native_asset)
+        .unwrap();
+    assert_eq!(
+        (initial.native_supply, initial.imported, initial.burned),
+        (0, 0, 0)
+    );
+    assert_eq!(initial.routes.len(), 2);
     let first = scenario.deposit(0, 0);
     let second = scenario.deposit(1, 1);
     let mut receipts = Vec::new();

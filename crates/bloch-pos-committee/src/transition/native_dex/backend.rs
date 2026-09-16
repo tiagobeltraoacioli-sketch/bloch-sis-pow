@@ -91,6 +91,15 @@ impl<'a> NativeView<'a> {
     }
 }
 impl<'a> GatewayView<'a> {
+    /// Local supply reconciliation only; no source payout or reserve assertion.
+    pub fn liabilities(
+        &self,
+        asset: &AssetId,
+    ) -> Result<bloch_euvm::ustav::gateway::AssetLiabilities, bloch_euvm::ustav::gateway::Error>
+    {
+        self.state.native.gateway().liabilities(asset)
+    }
+
     pub fn import_record(
         &self,
         route: &[u8; 32],

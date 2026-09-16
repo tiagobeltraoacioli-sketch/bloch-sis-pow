@@ -212,6 +212,31 @@ pub struct RouteState {
     pub burned: u128,
     pub next_release_nonce: u64,
 }
+
+/// Local accounting only. Cumulative burns do not establish external payment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteLiabilities {
+    pub route: [u8; 32],
+    pub source_domain: [u8; 32],
+    pub token: [u8; 20],
+    pub vault: [u8; 20],
+    pub imported: u128,
+    pub burned: u128,
+    pub outstanding: u64,
+    pub release_count: u64,
+}
+
+/// Consistent view of one asset across all enabled routes, not a reserve proof.
+/// External paid/unpaid releases are deliberately unknown to this ledger.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetLiabilities {
+    pub native_domain: [u8; 32],
+    pub native_asset: AssetId,
+    pub native_supply: u64,
+    pub imported: u128,
+    pub burned: u128,
+    pub routes: Vec<RouteLiabilities>,
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImportRecord {
     pub deposit: Deposit,
@@ -246,6 +271,71 @@ pub struct GatewayLedger {
     releases: BTreeMap<([u8; 32], u64), Release>,
 }
 impl GatewayLedger {
+    /// Reconcile all route counters for one asset against its native supply.
+    /// Reads at most MAX_ROUTES entries without cloning history or mutating state.
+    /// A host must separately anchor this local view to an authenticated checkpoint
+    /// and match each release to source payment evidence before subtracting it
+    /// from redemption obligations. A burn is not proof that a payout occurred.
+    pub fn liabilities(&self, asset: &AssetId) -> Result<AssetLiabilities, Error> {
+        if self.routes.len() > MAX_ROUTES {
+            return Err(Error::ResourceLimit);
+        }
+        let mut routes = Vec::new();
+        let (mut imported, mut burned, mut outstanding) = (0u128, 0u128, 0u128);
+        for (id, state) in &self.routes {
+            let route = &state.config.route;
+            if &route.native_asset != asset {
+                continue;
+            }
+            let remaining = state
+                .imported
+                .checked_sub(state.burned)
+                .ok_or(Error::InvalidSnapshot)?;
+            if route.native_domain != *self.native.domain()
+                || route.id() != *id
+                || remaining > u128::from(route.cap)
+            {
+                return Err(Error::InvalidSnapshot);
+            }
+            imported = imported
+                .checked_add(state.imported)
+                .ok_or(Error::InvalidSnapshot)?;
+            burned = burned
+                .checked_add(state.burned)
+                .ok_or(Error::InvalidSnapshot)?;
+            outstanding = outstanding
+                .checked_add(remaining)
+                .ok_or(Error::InvalidSnapshot)?;
+            routes.push(RouteLiabilities {
+                route: *id,
+                source_domain: route.source_domain,
+                token: route.token,
+                vault: route.vault,
+                imported: state.imported,
+                burned: state.burned,
+                outstanding: remaining as u64,
+                release_count: state.next_release_nonce,
+            });
+        }
+        if routes.is_empty() {
+            return Err(Error::UnknownRoute);
+        }
+        let native_supply = self.native.supply(asset).ok_or(Error::InvalidSnapshot)?;
+        if outstanding != u128::from(native_supply)
+            || imported.checked_sub(burned) != Some(outstanding)
+        {
+            return Err(Error::InvalidSnapshot);
+        }
+        Ok(AssetLiabilities {
+            native_domain: *self.native.domain(),
+            native_asset: *asset,
+            native_supply,
+            imported,
+            burned,
+            routes,
+        })
+    }
+
     /// A locally executed import record, not independent source-finality proof.
     pub fn import_record(&self, route: &[u8; 32], nonce: u64) -> Option<&ImportRecord> {
         self.imports.get(&(*route, nonce))
