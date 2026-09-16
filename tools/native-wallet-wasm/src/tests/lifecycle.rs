@@ -120,7 +120,16 @@ fn run(
             .iter()
             .find(|r| r["operation"] == name)
             .unwrap();
-        hex::decode(row["signedTransactionHex"].as_str().unwrap()).unwrap()
+        let signed = hex::decode(row["signedTransactionHex"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            row["txid"].as_str().unwrap(),
+            hex::encode(
+                PosTransaction::from_canonical_bytes(&signed)
+                    .unwrap()
+                    .txid()
+            )
+        );
+        signed
     } else {
         signed
     };
