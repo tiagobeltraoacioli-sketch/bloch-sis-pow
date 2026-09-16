@@ -57,6 +57,9 @@ Request: `{"method":"...","args":{...}}`; response:
   `confirmed:true`. Returns `transactionHex` and canonical Rust `txid` (not a raw
   packet hash), allowing a host to journal before broadcast. Rechecks state/account/expiry and
   exact reviewed packet before signing; review is consumed even on refusal.
+  Before releasing signed bytes, the full typed executor validates signatures,
+  slippage, reserve transitions and gateway roles on an isolated state clone.
+  Declared size must also cover the five-byte canonical outer frame.
 - `cancel` clears the pending review; `lock` also clears the key session.
 
 All integer fields, including UTXO `vout`, are canonical unsigned decimal strings.
@@ -79,11 +82,29 @@ The host must independently authenticate network, head and this context. Matchin
 caller-supplied roots is **not** finality verification. `wallet_projection::base`
 constructs only a review view; its synthetic head and derived root are not a chain
 state root and cannot bootstrap or activate a canonical node. A changed projection
-invalidates consent. Inputs belonging to other owners or locked reserves do not
-receive the account signature. Issuer/module/gateway committee witnesses remain
-untouched and need their own authorities. Final execution validation, pending
-journaling, wallet backup UX and broadcast integration are separate host work.
+invalidates consent. Other owners' inputs are not signed. Locked reserves are
+signed only for an explicit same-owner unconverted-pair close or a validated LP
+redemption by the actual LP holder; swap reserve slots remain untouched.
+Issuer/module/gateway committee witnesses remain untouched and need their own
+authorities. Revalidation against live chain state, pending journaling, wallet
+backup UX and broadcast integration are separate host work.
 
-Current end-to-end signature/executor fixture covers native paired-custody
-creation. The typed parser accepts the existing six pool operations and withdrawal;
-this fixture alone is not evidence of browser end-to-end withdrawal or swap.
+Seven real-hybrid vectors cover create pair, close an unconverted pair,
+initialize LP, add, swap, remove, and withdrawal after a real gateway import.
+The gateway fixture uses distinct issuer, committee and wallet keys. Negative
+tests refuse changed reserve roots, revisions, slippage, LP owners, active-pool
+close, changed context and forged gateway approvals. A separate test signs and
+executes the exact create/initialize/swap packets from the laboratory RPC builder.
+
+```sh
+NATIVE_WASM_VECTORS_PATH=/tmp/vectors.json cargo test --offline -p bloch-native-wallet-wasm --lib full_pool_lifecycle
+node tools/native-wallet-wasm/crosscheck.cjs target/wasm32-wasip1/release/bloch_native_wallet_wasm.wasm /tmp/vectors.json /path/to/postern-wallet/browser/native-core.js /tmp/signed-vectors.json
+NATIVE_WASM_SIGNED_VECTORS_PATH=/tmp/signed-vectors.json cargo test --offline -p bloch-native-wallet-wasm --lib full_pool_lifecycle
+```
+
+The lifecycle harness uses the existing direct executors. Its test-only
+`native-wallet-fixtures` feature clears rehearsal fee escrow between review views,
+while preserving every already-debited BLCH UTXO. This is not canonical fee
+settlement or a block replay proof. The production component codec is unchanged;
+the helper is a dev-dependency feature and absent from the release WASM build.
+Canonical node snapshots supplied by RPC require no such normalization.

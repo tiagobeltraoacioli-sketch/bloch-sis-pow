@@ -110,7 +110,64 @@ fn attach_native_owners(
     request: &mut pool_wire::Request,
     payer: &[u8],
     signature: &[u8],
+    height: u64,
 ) -> Result<(), Error> {
+    // Closing an unconverted pair releases its owner's locked native output.
+    // That close permission ends when the LP pool is initialized. Redemption
+    // below instead requires recorded LP ownership. Neither case authorizes
+    // signing arbitrary locked inputs or signing reserve slots of pool swaps.
+    let authorized_reserve = if let pool_wire::Request::ClosePair(r) = &*request {
+        let base = state
+            .base_reserve(&r.reserve)
+            .ok_or(Error::InvalidNativeFunding)?;
+        let native = state
+            .paired_custody(&r.reserve)
+            .ok_or(Error::InvalidNativeFunding)?;
+        if base.owner != payer
+            || native.owner != payer
+            || base.revision != 0
+            || native.authorization != r.creation_authorization
+            || state.blch_pool_for_reserve(&r.reserve).is_some()
+            || r.native.transaction.inputs.as_slice() != [native.outpoint]
+            || r.native.transaction.outputs.len() != 1
+            || r.native.transaction.outputs[0].owner != payer
+            || r.native.transaction.outputs[0].amount != native.amount
+            || r.native.transaction.delta != 0
+        {
+            return Err(Error::InvalidNativeFunding);
+        }
+        Some(native.outpoint)
+    } else if let pool_wire::Request::Remove(r) = &*request {
+        // LP redemption has its own restricted reserve verifier: the signer is
+        // the proven LP holder, which need not be the original reserve owner.
+        if r.quote.owner != payer {
+            return Err(Error::InvalidNativeFunding);
+        }
+        let pool = state
+            .initial_pools
+            .get(&r.quote.pool)
+            .ok_or(Error::InvalidNativeFunding)?;
+        let reserve = state
+            .paired_custody(&pool.reserve)
+            .ok_or(Error::InvalidNativeFunding)?;
+        let quote = state
+            .quote_blch_remove(&r.quote, height)
+            .map_err(|_| Error::InvalidNativeFunding)?;
+        if quote.pool_state_root != r.pool_state_root
+            || r.native.transaction.inputs.as_slice() != [reserve.outpoint]
+            || r.native.transaction.outputs.len() != 2
+            || r.native.transaction.delta != 0
+            || r.native.transaction.outputs[0].owner != reserve.owner
+            || r.native.transaction.outputs[0].amount != quote.reserves_after[1]
+            || r.native.transaction.outputs[1].owner != payer
+            || r.native.transaction.outputs[1].amount != quote.amounts_out[1]
+        {
+            return Err(Error::InvalidNativeFunding);
+        }
+        Some(reserve.outpoint)
+    } else {
+        None
+    };
     let (tx, witnesses) = match request {
         pool_wire::Request::Gateway(r) => {
             let tx = match &r.gateway.operation {
@@ -137,15 +194,15 @@ fn attach_native_owners(
         if output.asset != tx.asset {
             return Err(Error::InvalidNativeFunding);
         }
-        // Even a reserve whose recorded owner is the payer is not a normal
-        // spendable coin. Its protocol-specific witness must remain untouched.
-        if native.is_locked(point) {
+        // Recorded ownership alone does not authorize spending locked reserves.
+        // Only the two typed permissions checked above can fill those slots.
+        if native.is_locked(point) && authorized_reserve != Some(*point) {
             continue;
         }
-        if native.spendable_output(point).is_none() {
+        if native.spendable_output(point).is_none() && authorized_reserve != Some(*point) {
             return Err(Error::InvalidNativeFunding);
         }
-        if output.output.owner == payer {
+        if output.output.owner == payer || authorized_reserve == Some(*point) {
             *witness = signature.to_vec();
         }
     }
@@ -283,7 +340,8 @@ impl FundingReview {
 
     /// Attach the joint signature to the BLCH payer and its unlocked native
     /// inputs, identified from trusted state rather than caller-supplied indexes.
-    /// Locked reserve slots and other owners' witnesses remain unchanged. Module
+    /// Locked reserve slots remain unchanged except typed owner close / LP redemption;
+    /// other owners' witnesses remain unchanged. Module
     /// and gateway committee signatures are never filled by this method.
     pub fn finish_with_account_signature(
         self,
@@ -329,7 +387,7 @@ impl FundingReview {
         // only this signature leaves all transaction and other witness fields.
         keys[0].signature = signature.to_vec();
         if native_owners {
-            attach_native_owners(state, &mut request, payer, signature)?;
+            attach_native_owners(state, &mut request, payer, signature, height)?;
         }
         let bytes = pool_wire::encode(&request, &self.intent.domain()).map_err(Error::Wire)?;
         let signed = DecodedIntent::decode(&bytes, &self.intent.domain()).map_err(Error::Wire)?;

@@ -103,6 +103,9 @@ impl Session {
         };
         let funding = FundingReview::prepare(state, payload.as_bytes(), &self.public, height)
             .map_err(|_| "typed funding review refused")?;
+        if funding.charge().tx_bytes < transaction.len() as u64 {
+            return Err("outer frame size is underdeclared");
+        }
         if funding.intent().domain() != self.domain
             || (tag == 0x11) != (funding.intent().operation() == Operation::Withdraw)
             || funding.intent().operation() == Operation::Import
@@ -161,6 +164,7 @@ impl Session {
         {
             return Err("stale signing context");
         }
+        let declared_bytes = p.review.charge().tx_bytes;
         let signature = Zeroizing::new(
             crypto::sign(&self.secret, &p.review.intent().authorization())
                 .map_err(|_| "hybrid signature failed")?,
@@ -169,6 +173,18 @@ impl Session {
             .review
             .finish_with_account_signature(state, &self.public, height, &signature, &Hybrid)
             .map_err(|_| "signed ownership/context review refused")?;
+        // A typed wallet must not release a signature for an invalid AMM or
+        // gateway transition. Validate all roles, slippage and reserve locks on
+        // an isolated copy; this commits neither canonical state nor funds.
+        let mut preflight = state.clone();
+        bloch_pos_committee::transition::native_dex::pool_wire::apply_encoded(
+            &mut preflight,
+            intent.canonical_bytes(),
+            height,
+            &Hybrid,
+            &Hybrid,
+        )
+        .map_err(|_| "typed execution preflight refused")?;
         let payload = NativeTransferPayload::new(intent.canonical_bytes().to_vec())
             .map_err(|_| "signed packet too large")?;
         let signed = if p.tag == 0x12 {
@@ -176,6 +192,10 @@ impl Session {
         } else {
             PosTransaction::NativeWithdrawal(payload)
         };
-        Ok(signed.canonical_bytes())
+        let bytes = signed.canonical_bytes();
+        if bytes.len() as u64 > declared_bytes {
+            return Err("signed outer frame size is underdeclared");
+        }
+        Ok(bytes)
     }
 }

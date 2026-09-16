@@ -69,6 +69,15 @@ pub fn base(
     Ok(base)
 }
 impl State {
+    /// Test fixtures only: normalize a rehearsal view for the wallet projection.
+    /// This is NOT settlement or a canonical state transition. Already-debited
+    /// BLCH UTXOs remain debited; no fees are refunded or paid to any account.
+    #[cfg(feature = "native-wallet-fixtures")]
+    pub fn fixture_review_projection(mut self) -> Self {
+        self.base_fees = 0;
+        self.priority_fees = 0;
+        self
+    }
     /// Restore only a bounded wallet projection. Snapshot validation checks all
     /// custody locks against the supplied complete BLCH UTXO projection.
     pub fn wallet_review_projection(

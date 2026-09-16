@@ -16,6 +16,42 @@ use serde_json::json;
 const DOMAIN: [u8; 32] = [42; 32];
 const SEED: [u8; 32] = [7; 32];
 const COIN: u64 = 100_000_000;
+mod lab_builder;
+mod lifecycle;
+#[test]
+fn unsigned_frame_must_reserve_outer_bytes_before_consent() {
+    let (state, bytes, _) = fixture();
+    let PosTransaction::NativePool(payload) = PosTransaction::from_canonical_bytes(&bytes).unwrap()
+    else {
+        panic!()
+    };
+    let pool_wire::Request::CreatePair(mut r) =
+        pool_wire::decode(payload.as_bytes(), &DOMAIN).unwrap()
+    else {
+        panic!()
+    };
+    let inner = r.canonical_bytes(&DOMAIN).unwrap().len() as u64;
+    if let PosTransaction::TransferV2 { tx_bytes, .. } = &mut r.blch {
+        *tx_bytes = inner;
+    }
+    let charge = state.quote_paired_custody(&r).unwrap();
+    if let PosTransaction::TransferV2 { outputs, .. } = &mut r.blch {
+        outputs[1].value = COIN
+            - r.blch_amount
+            - u64::try_from(charge.base_fee_sat + charge.priority_fee_sat).unwrap();
+    }
+    let bytes = PosTransaction::NativePool(
+        NativeTransferPayload::new(r.canonical_bytes(&DOMAIN).unwrap()).unwrap(),
+    )
+    .canonical_bytes();
+    assert_eq!(
+        Session::open(&SEED, DOMAIN)
+            .unwrap()
+            .prepare(&state, &bytes, 1)
+            .unwrap_err(),
+        "outer frame size is underdeclared"
+    );
+}
 fn fixture() -> (State, Vec<u8>, serde_json::Value) {
     let (key, secret) = crypto::generate_keypair_from_seed(&SEED).unwrap();
     // Falcon compressed signatures vary in length. Reserve the maximum hybrid

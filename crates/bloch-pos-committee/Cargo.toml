@@ -17,6 +17,8 @@ native-lab = ["native-dex-rehearsal"]
 # Opt-in native executor and local rehearsal. Canonical component/transfer gates
 # remain disabled; default builds decode the bounded transfer frame but reject it.
 native-dex-rehearsal = ["dep:bloch-euvm"]
+# Test-only wallet view normalization; never canonical fee settlement.
+native-wallet-fixtures = ["native-dex-rehearsal"]
 # Phase timers for the replay benchmark (src/perf.rs). OFF by default and off
 # in every release the fleet runs: with the feature absent the span type is
 # zero-sized with no Drop and every call site disappears. Never enable it on a
