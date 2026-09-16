@@ -376,6 +376,16 @@ pub struct Journal {
     require_base_roots: bool,
     recovered_tail_bytes: u64,
 }
+enum AppendContext {
+    Local,
+    Base(pool_candidate::BaseRoots),
+    Block {
+        context: pool_candidate::BlockContext,
+        roots: pool_candidate::BaseRoots,
+        binding: [u8; 32],
+    },
+}
+
 impl Journal {
     /// Create a new log from an independently authenticated anchor.
     pub fn create(path: &Path, state: State, height: u64) -> Result<Self, Error> {
@@ -677,7 +687,7 @@ impl Journal {
     /// The host supplies the authenticated candidate height. Successful return
     /// follows fsync; any write/fsync failure poisons this handle until reopen.
     pub fn append(&mut self, candidate: &[u8], height: u64) -> Result<pool_batch::Outcome, Error> {
-        self.append_checked(candidate, height, None)
+        self.append_checked(candidate, height, AppendContext::Local)
     }
 
     /// Persist only after the candidate matches both independently supplied BLCH
@@ -689,17 +699,38 @@ impl Journal {
         height: u64,
         roots: pool_candidate::BaseRoots,
     ) -> Result<pool_batch::Outcome, Error> {
-        self.append_checked(candidate, height, Some(roots))
+        self.append_checked(candidate, height, AppendContext::Base(roots))
+    }
+
+    /// Verify an independently authenticated block-extension expectation before
+    /// writing. The current journal retains candidate bytes, not block context;
+    /// this remains a local host interface, not live consensus admission.
+    pub fn append_for_block(
+        &mut self,
+        candidate: &[u8],
+        context: pool_candidate::BlockContext,
+        roots: pool_candidate::BaseRoots,
+        expected_binding: [u8; 32],
+    ) -> Result<pool_batch::Outcome, Error> {
+        self.append_checked(
+            candidate,
+            context.height,
+            AppendContext::Block {
+                context,
+                roots,
+                binding: expected_binding,
+            },
+        )
     }
 
     fn append_checked(
         &mut self,
         candidate: &[u8],
         height: u64,
-        roots: Option<pool_candidate::BaseRoots>,
+        admission: AppendContext,
     ) -> Result<pool_batch::Outcome, Error> {
         self.ensure_healthy()?;
-        if self.require_base_roots && roots.is_none() {
+        if self.require_base_roots && matches!(admission, AppendContext::Local) {
             return Err(Error::BaseRootsRequired);
         }
         if height <= self.head.height {
@@ -719,8 +750,21 @@ impl Journal {
             &self.header,
             &mut self.poisoned,
         )?;
-        let prepared = match roots {
-            Some(roots) => pool_candidate::prepare_with_base_roots(
+        let prepared = match admission {
+            AppendContext::Block {
+                context,
+                roots,
+                binding,
+            } => pool_candidate::prepare_for_block(
+                &mut self.state,
+                candidate,
+                context,
+                roots,
+                &binding,
+                &BaseVerifier,
+                &BlochVerifier,
+            ),
+            AppendContext::Base(roots) => pool_candidate::prepare_with_base_roots(
                 &mut self.state,
                 candidate,
                 height,
@@ -728,7 +772,7 @@ impl Journal {
                 &BaseVerifier,
                 &BlochVerifier,
             ),
-            None => pool_candidate::prepare(
+            AppendContext::Local => pool_candidate::prepare(
                 &mut self.state,
                 candidate,
                 height,

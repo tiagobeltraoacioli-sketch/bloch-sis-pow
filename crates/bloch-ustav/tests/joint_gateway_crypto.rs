@@ -565,6 +565,48 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
     assert_eq!(prepared_block.outcome().post_root, expected);
     drop(prepared_block);
     assert_eq!(block_state.state_root(), anchor.state_root());
+    let block_path = path.with_extension("block-bound.log");
+    let mut block_journal =
+        Journal::create_requiring_base_roots(&block_path, anchor.clone(), 3).unwrap();
+    let untouched = std::fs::read(&block_path).unwrap();
+    for altered in [
+        pool_candidate::BlockContext {
+            slot: block_context.slot + 1,
+            ..block_context
+        },
+        pool_candidate::BlockContext {
+            parent_block: [43; 32],
+            ..block_context
+        },
+    ] {
+        assert!(matches!(
+            block_journal.append_for_block(&candidate, altered, roots, block_binding),
+            Err(JournalError::Candidate(
+                pool_candidate::Error::BlockBindingMismatch
+            ))
+        ));
+        assert_eq!(std::fs::read(&block_path).unwrap(), untouched);
+        assert_eq!(block_journal.checkpoint(), original_head);
+    }
+    assert_eq!(
+        block_journal
+            .append_for_block(&candidate, block_context, roots, block_binding)
+            .unwrap()
+            .post_root,
+        expected
+    );
+    drop(block_journal);
+    let block_journal = Journal::open_requiring_base_roots(
+        &block_path,
+        anchor.clone(),
+        3,
+        head,
+        TailRecovery::Reject,
+    )
+    .unwrap();
+    assert_eq!(block_journal.checkpoint(), head);
+    drop(block_journal);
+    std::fs::remove_file(&block_path).unwrap();
     let before = std::fs::read(&bound_path).unwrap();
     assert!(bound.requires_base_roots());
     assert_eq!(&before[..8], b"BLCHDJ02");

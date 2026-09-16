@@ -459,3 +459,19 @@ joint state transition, and define its composition with other block operations.
 Current block formats, signatures and activation parameters are unchanged.
 Tests cover each bound field, a separately computed Python vector, forged
 candidate claims under a matching digest, and real PQ gateway preparation.
+
+`Journal::append_for_block` connects the experimental block binding to durable
+local persistence with concrete PQ verifiers. Its typed internal admission
+context distinguishes local, BLCH-root-bound and block-bound preparation without
+optional-field combinations. It derives candidate height from the supplied block
+context, checks the expected extension digest, reexecutes, validates BLCH roots,
+and shares the existing storage-identity checks and fsync-before-install path.
+Real PQ tests reject changed slot and parent block without file/state changes,
+then commit the matching context and reopen against the trusted joint tip.
+
+The host must independently authenticate the expected binding and validate block
+ancestry/scheduling. Current journal records still contain only candidate bytes;
+replay authenticates the joint tip but does not reconstruct the historical block
+context or prove inclusion. `BLCHDJ02` requires BLCH roots, not this particular
+block admission mode. A production integration must commit and persist the block
+extension under consensus rules; no live header format or node path changes here.
