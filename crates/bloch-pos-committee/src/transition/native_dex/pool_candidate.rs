@@ -16,6 +16,7 @@ pub enum Error {
     WrongHeight,
     BaseParentMismatch,
     BasePostMismatch,
+    BlockBindingMismatch,
     InvalidCount,
     CommitmentMismatch,
     Batch(pool_batch::Error),
@@ -237,6 +238,65 @@ pub fn prepare_with_base_roots<'state, 'bytes>(
         return Err(Error::BasePostMismatch);
     }
     Ok(prepared)
+}
+
+/// Proposed block-extension context. This is not a live header or finality proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockContext {
+    pub parent_block: [u8; 32],
+    pub slot: u64,
+    pub height: u64,
+}
+
+/// Experimental commitment for a future authenticated block extension. The
+/// signing/header layer must cover the returned digest independently; computing
+/// it from untrusted candidate data alone confers no approval or authority.
+pub fn block_binding(
+    domain: &[u8; 32],
+    context: BlockContext,
+    roots: BaseRoots,
+    candidate: &[u8],
+) -> Result<[u8; 32], Error> {
+    use sha3::{Digest, Sha3_256};
+    if candidate.is_empty() || candidate.len() > MAX_ENCODED_BYTES {
+        return Err(wire::Error::TooLarge.into());
+    }
+    let mut hash = Sha3_256::new();
+    hash.update(b"BLOCH-NATIVE-BLOCK-BINDING-v1\0");
+    hash.update(domain);
+    hash.update(context.parent_block);
+    hash.update(context.slot.to_le_bytes());
+    hash.update(context.height.to_le_bytes());
+    hash.update(roots.parent);
+    hash.update(roots.post);
+    hash.update((candidate.len() as u64).to_le_bytes());
+    hash.update(Sha3_256::digest(candidate));
+    Ok(hash.finalize().into())
+}
+
+/// Check the host's independently authenticated extension commitment, then
+/// reexecute and compare both BLCH roots. No live node calls this prototype yet.
+/// A commitment mismatch fails before signature verification or state cloning.
+pub fn prepare_for_block<'state, 'bytes>(
+    state: &'state mut State,
+    candidate: &'bytes [u8],
+    context: BlockContext,
+    roots: BaseRoots,
+    expected_binding: &[u8; 32],
+    base_verifier: &dyn SignatureVerifier,
+    native_verifier: &dyn Verifier,
+) -> Result<Prepared<'state, 'bytes>, Error> {
+    if block_binding(&state.domain, context, roots, candidate)? != *expected_binding {
+        return Err(Error::BlockBindingMismatch);
+    }
+    prepare_with_base_roots(
+        state,
+        candidate,
+        context.height,
+        roots,
+        base_verifier,
+        native_verifier,
+    )
 }
 
 #[cfg(test)]

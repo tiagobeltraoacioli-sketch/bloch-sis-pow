@@ -544,6 +544,27 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
         parent: anchor.base_state_root(),
         post: journal.state().base_state_root(),
     };
+    let block_context = pool_candidate::BlockContext {
+        parent_block: [42; 32],
+        slot: 8,
+        height: 4,
+    };
+    let block_binding =
+        pool_candidate::block_binding(&DOMAIN, block_context, roots, &candidate).unwrap();
+    let mut block_state = anchor.clone();
+    let prepared_block = pool_candidate::prepare_for_block(
+        &mut block_state,
+        &candidate,
+        block_context,
+        roots,
+        &block_binding,
+        &BaseVerifier,
+        &BlochVerifier,
+    )
+    .unwrap();
+    assert_eq!(prepared_block.outcome().post_root, expected);
+    drop(prepared_block);
+    assert_eq!(block_state.state_root(), anchor.state_root());
     let before = std::fs::read(&bound_path).unwrap();
     assert!(bound.requires_base_roots());
     assert_eq!(&before[..8], b"BLCHDJ02");

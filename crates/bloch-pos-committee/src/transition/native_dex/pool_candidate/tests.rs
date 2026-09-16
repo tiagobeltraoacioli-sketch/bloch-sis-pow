@@ -230,3 +230,122 @@ fn base_projection_binding_cannot_replace_candidate_validation() {
     ));
     assert_eq!(state.state_root(), original);
 }
+
+#[test]
+fn block_binding_covers_parent_slot_height_roots_domain_and_exact_candidate() {
+    let (mut state, bytes, direct) = fixture();
+    let roots = BaseRoots {
+        parent: state.base_state_root(),
+        post: direct.base_state_root(),
+    };
+    let context = BlockContext {
+        parent_block: [9; 32],
+        slot: 5,
+        height: 1,
+    };
+    let binding = block_binding(&DOMAIN, context, roots, &bytes).unwrap();
+    let original = state.state_root();
+    for changed in [
+        BlockContext {
+            parent_block: [8; 32],
+            ..context
+        },
+        BlockContext { slot: 6, ..context },
+        BlockContext {
+            height: 2,
+            ..context
+        },
+    ] {
+        assert!(matches!(
+            prepare_for_block(&mut state, &bytes, changed, roots, &binding, &NoCrypto, &NoCrypto),
+            Err(Error::BlockBindingMismatch)
+        ));
+        assert_eq!(state.state_root(), original);
+    }
+    assert_ne!(
+        block_binding(&[8; 32], context, roots, &bytes).unwrap(),
+        binding
+    );
+    for parent in [true, false] {
+        let mut changed = roots;
+        if parent {
+            changed.parent[0] ^= 1;
+        } else {
+            changed.post[0] ^= 1;
+        }
+        assert_ne!(
+            block_binding(&DOMAIN, context, changed, &bytes).unwrap(),
+            binding
+        );
+    }
+    let mut changed = bytes.clone();
+    changed[82] ^= 1;
+    assert!(matches!(
+        prepare_for_block(&mut state, &changed, context, roots, &binding, &NoCrypto, &NoCrypto),
+        Err(Error::BlockBindingMismatch)
+    ));
+    // Even a matching envelope cannot turn invalid candidate claims into state.
+    let forged_binding = block_binding(&DOMAIN, context, roots, &changed).unwrap();
+    assert!(prepare_for_block(
+        &mut state,
+        &changed,
+        context,
+        roots,
+        &forged_binding,
+        &BoundVerifier,
+        &BoundVerifier
+    )
+    .is_err());
+    assert_eq!(state.state_root(), original);
+    prepare_for_block(
+        &mut state,
+        &bytes,
+        context,
+        roots,
+        &binding,
+        &BoundVerifier,
+        &BoundVerifier,
+    )
+    .unwrap()
+    .commit();
+    assert_eq!(state.state_root(), direct.state_root());
+}
+
+#[test]
+fn block_binding_matches_independent_python_vector() {
+    let actual = block_binding(
+        &[1; 32],
+        BlockContext {
+            parent_block: [2; 32],
+            slot: 3,
+            height: 4,
+        },
+        BaseRoots {
+            parent: [5; 32],
+            post: [6; 32],
+        },
+        &[7, 8, 9],
+    )
+    .unwrap();
+    assert_eq!(
+        actual
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+        "4d6137fba09ca8f945121b52a913b2d97305b95f6b0f37d6fc0dd55ec66f1e99"
+    );
+    assert!(block_binding(
+        &[1; 32],
+        BlockContext {
+            parent_block: [2; 32],
+            slot: 3,
+            height: 4
+        },
+        BaseRoots {
+            parent: [5; 32],
+            post: [6; 32]
+        },
+        &[]
+    )
+    .is_err());
+}

@@ -435,3 +435,27 @@ each header region while the journal remains open and require refusal without
 new disk writes or state installation. Same-length candidate payload edits and
 races with an uncooperative writer are still outside this fixed-header check;
 full authenticated replay and controlled storage remain necessary.
+
+### Experimental candidate-to-block binding
+
+`pool_candidate::block_binding` proposes a digest for a future authenticated
+block extension. Its preimage is `BLOCH-NATIVE-BLOCK-BINDING-v1` plus NUL,
+network domain (32 bytes), parent block identifier (32), slot (u64 LE), height
+(u64 LE), parent BLCH root (32), post BLCH root (32), candidate length (u64 LE),
+and SHA3-256 of the exact candidate bytes (32). SHA3-256 of that preimage is the
+binding. The bounded hashing function alone does not parse or approve a candidate.
+
+`prepare_for_block` compares this digest with the independently authenticated
+host expectation, using the state's network domain, then performs existing
+candidate reexecution and BLCH projection checks. Mismatches do not mutate state;
+the returned prepared handle retains the same abort/commit lifetime guarantees.
+Slot and parent block validity are still the integrating host's responsibility:
+this helper binds their values but does not validate ancestry or the schedule.
+
+No current Genesis4 header carries this field, no live node calls the helper,
+and computing a digest from attacker-supplied inputs is not authentication. A
+future activation must include the extension in the signed header, validate the
+joint state transition, and define its composition with other block operations.
+Current block formats, signatures and activation parameters are unchanged.
+Tests cover each bound field, a separately computed Python vector, forged
+candidate claims under a matching digest, and real PQ gateway preparation.
