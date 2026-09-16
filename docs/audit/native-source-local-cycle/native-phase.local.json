@@ -1,0 +1,13 @@
+{
+  "environment": "isolated-local-laboratory",
+  "operations": [
+    "bootstrap",
+    "import",
+    "withdraw"
+  ],
+  "sourceDepositRechecked": true,
+  "localNativeFinalityObserved": true,
+  "restartLedgerEqual": true,
+  "withdrawReplayRefused": true,
+  "externalReleaseExecuted": false
+}

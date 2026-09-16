@@ -1,0 +1,26 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "block_id": "8795fc1c6c0d3855d38e2cddc0f75d6ef4a35ef4623a6ae161976245fcae721c",
+    "version": 2970353669,
+    "parent": "93726237a7aab2eb0a8db5fd089841df233bca5f36d0e29ea997e813f69bcdf3",
+    "slot": 847,
+    "epoch": 26,
+    "height": 3,
+    "proposer_index": 0,
+    "timestamp": 1789590601,
+    "state_root": "26e3d48632b42d2e6bb6482da7f476d10197aef02885e06b6ed241a49304f583",
+    "body_root": "6d0ef828da3c9a5b5547e909f29c3f27a86b254c817427e3825c2e48fc8fedff",
+    "randao_reveal": "9403c5aeeffcea71f0eda9bb27d84cdf0026a7969a2ddc6aa63d524a8111ea5d",
+    "randao_mix": "37afbc43278be1cddeebb6df45c64c32305cfa99abf67bc632dbdc82c466a6af",
+    "justified_root": "823d58efab559e4c92414ad99738ebda99d62e79ef6add0602fd8f7a05ec58c2",
+    "finalized_root": "823d58efab559e4c92414ad99738ebda99d62e79ef6add0602fd8f7a05ec58c2",
+    "attestation_root": "65617f7b01ac604f1325a4c7d4f87a26ed6278c8f11b20426f8515e7ec477989",
+    "coherence_root": "3ac97a48fe4c1dc2de33022b2473e76e609c85ce0c0bce96540851f682bccb56",
+    "finality": "finalized",
+    "finalized": true,
+    "tx_count": 1,
+    "attestation_count": 0
+  }
+}

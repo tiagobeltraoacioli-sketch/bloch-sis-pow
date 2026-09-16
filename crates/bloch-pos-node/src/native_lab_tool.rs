@@ -367,7 +367,15 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 Json::hex(&g::recipient_hash(&sponsor.pubkey))
             ),
             ("native_burn", Json::hex(&burn)),
-            ("synthetic_source", Json::Bool(true))
+            ("synthetic_assets", Json::Bool(true)),
+            (
+                "source_evidence",
+                Json::s(if flags.contains_key("--source-domain") {
+                    "provided-local-records"
+                } else {
+                    "synthetic-placeholder"
+                })
+            )
         ])
         .to_string()
     );

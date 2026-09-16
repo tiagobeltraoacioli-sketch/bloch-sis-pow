@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32009,
+    "message": "this node's proposer already had the transition refuse this transaction, so it is barred until slot 929. The usual cause is that it spends an output this chain does not have \u2014 either it was built against a node on a different branch, or its parent transaction has not landed yet. This bar lifts on its own: resubmit the same bytes from slot 929, or sooner once the parent confirms. See `error.data.until_slot`.",
+    "data": {
+      "retryable": true,
+      "until_slot": 929
+    }
+  }
+}

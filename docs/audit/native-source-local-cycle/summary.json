@@ -1,0 +1,28 @@
+{
+  "environment": "isolated-local-laboratory",
+  "publicDeployment": false,
+  "source": "Anvil 31337 LOCAL6 token",
+  "nativeFormat": "BPOSLAB1",
+  "nativeOperations": [
+    "bootstrap",
+    "import",
+    "withdraw"
+  ],
+  "nativeSupply": [
+    0,
+    100,
+    0
+  ],
+  "withdrawSlot": 847,
+  "nativeReplayHeadSlot": 928,
+  "nativeFinalizedEpoch": 27,
+  "sourceRecipientDelta": "100",
+  "sourceRemainingLocked": "0",
+  "sourceRemainingReserve": "0",
+  "nativeRestartLedgerEqual": true,
+  "nativeWithdrawalReplayRefused": true,
+  "sourceReleaseReplayRefused": true,
+  "sourceSingleSignatureRefused": true,
+  "sourceConsensusLightClient": false,
+  "walletBrowserExecutionIncluded": false
+}

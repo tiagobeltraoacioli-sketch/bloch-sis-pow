@@ -1,0 +1,18 @@
+{
+  "native_domain": "5891725d15178d25c6ac1b933cc6d21507a95e67b132f5ac0ace325fe9587673",
+  "block_id": "93726237a7aab2eb0a8db5fd089841df233bca5f36d0e29ea997e813f69bcdf3",
+  "state_root": "a0e94f10810c7dfdc0d7174d5c0cd991d98b48f645693644314472a8bc23274a",
+  "slot": 846,
+  "asset": "a23fd48ece6d8617c9cdf6f74b634aff5085e55188cfaebbdbe396440c78a275",
+  "route": "44bc80e7c05bbe7dd2b0a84e4c27af848d8df9f5bdb17ed496ad74409646fa74",
+  "synthetic": true,
+  "settlement": "none",
+  "ledger": {
+    "supply": "100",
+    "imported": "100",
+    "burned": "0",
+    "next_release_nonce": 0,
+    "native_commitment": "7ac03376300436a89adc78f8bef6d4deb3496c288b1f5284b8853afed0258908",
+    "first_release_burn": null
+  }
+}
