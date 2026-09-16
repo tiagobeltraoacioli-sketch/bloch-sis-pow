@@ -366,7 +366,12 @@ pub(in crate::transition) fn assert_imported_pool(base: &CommittedState, swapped
         .snapshot()
         .outputs
         .iter()
-        .filter(|(point, output)| output.asset == asset && output.output.owner == key(1) && !state.paired_locks.contains_key(point) && !state.native.is_locked(point))
+        .filter(|(point, output)| {
+            output.asset == asset
+                && output.output.owner == key(1)
+                && !state.paired_locks.contains_key(point)
+                && !state.native.is_locked(point)
+        })
         .map(|(_, output)| output.output.amount)
         .sum();
     assert_eq!(owned, if swapped { 45 } else { 40 }); // Exact output 5 satisfies signed minimum 5.
@@ -374,4 +379,46 @@ pub(in crate::transition) fn assert_imported_pool(base: &CommittedState, swapped
     assert!(
         u128::from(pool.pool.reserves()[0]) * u128::from(pool.pool.reserves()[1]) >= 60_000_000
     );
+}
+
+/// Regenerate wallet vectors with the real canonical codecs. Toy witnesses are
+/// explicitly fixture-only and cannot authorize a live transaction.
+#[test]
+#[ignore = "fixture export requires NATIVE_WALLET_FIXTURE_PATH"]
+fn export_native_wallet_vectors() {
+    use super::super::{consensus_gateway, pool_intent::DecodedIntent};
+    let path = std::env::var("NATIVE_WALLET_FIXTURE_PATH").expect("fixture output path");
+    let hex = |bytes: &[u8]| bytes.iter().map(|v| format!("{v:02x}")).collect::<String>();
+    let fee = crate::fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+    let mut vectors: Vec<(&str, u8, Vec<u8>)> = [
+        "createPair",
+        "initialize",
+        "add",
+        "swap",
+        "remove",
+        "closePair",
+    ]
+    .into_iter()
+    .zip(fixtures(fee))
+    .map(|(name, (_, payload, _))| (name, 0x12, payload))
+    .collect();
+    let (mut base, import) = consensus_gateway::tests::funded_import(fee);
+    consensus_gateway::apply_import(
+        &mut base,
+        &import.canonical_bytes(&DOMAIN).unwrap(),
+        1,
+        fee,
+        &BoundVerifier,
+        &BoundVerifier,
+    )
+    .unwrap();
+    let withdraw = consensus_gateway::tests::withdrawal_for(&base, import, fee);
+    vectors.push(("withdraw", 0x11, withdraw.canonical_bytes(&DOMAIN).unwrap()));
+    let records: Vec<String> = vectors.into_iter().map(|(name, tag, payload)| {
+        let intent = DecodedIntent::decode(&payload, &DOMAIN).unwrap();
+        let mut transaction = vec![tag]; transaction.extend_from_slice(&(payload.len() as u32).to_le_bytes()); transaction.extend_from_slice(&payload);
+        assert_eq!(PosTransaction::from_canonical_bytes(&transaction).unwrap().canonical_bytes(), transaction);
+        format!("{{\"operation\":\"{name}\",\"domain\":\"{}\",\"payloadHex\":\"{}\",\"transactionHex\":\"{}\",\"authorization\":\"{}\",\"packetHash\":\"{}\"}}", hex(&DOMAIN), hex(&payload), hex(&transaction), hex(&intent.authorization()), hex(&intent.packet_hash()))
+    }).collect();
+    std::fs::write(path, format!("{{\"schema\":\"postern.native-wallet-fixtures.v1\",\"format\":\"BPOSLAB1\",\"fixtureWitnessesOnly\":true,\"vectors\":[{}]}}\n", records.join(","))).unwrap();
 }
