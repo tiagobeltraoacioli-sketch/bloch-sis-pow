@@ -3300,6 +3300,12 @@ impl Engine {
                         eprintln!("FATAL: block log append failed: {e}");
                         std::process::exit(1);
                     }
+                    #[cfg(feature = "native-component-snapshots")]
+                    if let Err(e) = self.store.save_native_component(&self.state) {
+                        // Derived state may lag; restart authenticates against
+                        // complete block replay, never against this sidecar.
+                        eprintln!("native component checkpoint write failed: {e}");
+                    }
                     let after = self.state.finality();
                     // The head root is FREE here, and it used to cost a whole
                     // state-root computation.
@@ -3682,6 +3688,10 @@ impl Engine {
             if let Err(e) = self.store.rewrite(&canonical_envs) {
                 eprintln!("FATAL: block log rewrite failed: {e}");
                 std::process::exit(1);
+            }
+            #[cfg(feature = "native-component-snapshots")]
+            if let Err(e) = self.store.save_native_component(&self.state) {
+                eprintln!("native component checkpoint write after reorg failed: {e}");
             }
             // Free for the same reason as `apply_canonical`'s: every block
             // in `branch` passed `apply_block`, so the adopted head's header
@@ -4920,6 +4930,15 @@ pub fn run(cfg: Config) -> io::Result<()> {
             );
             last_report = std::time::Instant::now();
         }
+    }
+    #[cfg(feature = "native-component-snapshots")]
+    {
+        // Replay supplies both the base state and trusted component commitment.
+        // A checkpoint cannot initialize absent native state or skip validation.
+        if let Some(restored) = engine.store.restore_native_component(&engine.state, &HybridVerifier::new())? {
+            engine.state.set(restored);
+        }
+        engine.store.save_native_component(&engine.state)?;
     }
     engine.live = true;
     if n_logged > 0 {
@@ -11472,6 +11491,9 @@ mod validator_admission_tests;
 
 #[cfg(test)]
 mod native_replay_tests;
+
+#[cfg(all(test, feature = "native-component-snapshots"))]
+mod native_checkpoint_restart_tests;
 
 #[cfg(test)]
 mod branch_gap_repair_tests {

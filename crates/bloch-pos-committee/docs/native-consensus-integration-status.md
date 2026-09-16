@@ -52,8 +52,10 @@ launched by merely arming the transfer gate.
    snapshot/restore codec are implemented. The [snapshot format](native-component-snapshot.md)
    validates complete component data and reconstructs custody indexes against
    a supplied base projection and trusted component commitment. It is not wired
-   to durable node storage or a populated-state import. Complete the remaining
-   node persistence and execution/accounting integration before activation.
+   to a populated-state import. Optional node sidecar persistence verifies it
+   only after full canonical replay; accelerated base-state restart remains
+   unimplemented. Complete the remaining execution/accounting integration
+   before activation.
 2. Extend the registered sponsored-transfer encoding to the remaining operations
    and activate it only at a coordinated,
    explicit network upgrade. Reserve/register tags through the repository's wire
@@ -110,7 +112,7 @@ cannot be imported into canonical state, and rehearsal constructors reject a bas
 that already owns canonical native state. A bounded component snapshot codec now
 validates restoration without attaching state or enabling production imports.
 Canonical sponsored-transfer execution is implemented under its disabled gate;
-gateway and pool transaction dispatch and node snapshot persistence remain open.
+gateway/pool dispatch and an accelerated complete-state restart remain open.
 
 Specify deterministic serialization, allocation limits, restoration checks and
 reconstruction of derived lock indexes. The node's existing snapshot ring stores

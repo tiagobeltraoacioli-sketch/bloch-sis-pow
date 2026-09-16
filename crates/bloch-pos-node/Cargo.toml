@@ -48,6 +48,9 @@ path = "src/main.rs"
 # The benchmark runs the SAME code either way — the feature only decides
 # whether the breakdown is available. Never enable it on a producing node.
 perf-timing = ["bloch-pos-committee/perf-timing"]
+# Optional persistence cross-check after complete canonical block replay.
+# Does not arm native consensus gates or enable populated-state bootstrap.
+native-component-snapshots = ["bloch-pos-committee/native-dex-rehearsal"]
 
 [dependencies]
 # The frozen consensus math (pure, sha3-only).

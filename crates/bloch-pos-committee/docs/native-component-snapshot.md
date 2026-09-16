@@ -4,7 +4,9 @@
 bounded binary transport for the opaque native component behind the opt-in
 `native-dex-rehearsal` feature. They do not change consensus state roots, attach
 restored components, enable populated-state imports or arm activation gates.
-The node's durable store is not wired to this transport by these methods.
+The node's optional `native-component-snapshots` feature persists this transport
+as a derived sidecar and restores it only after complete canonical replay.
+These methods do not provide an accelerated base-state restart format.
 
 Restore takes bytes, a borrowed corresponding `CommittedState`, an independently
 authenticated native component commitment and the native key verifier. It

@@ -29,6 +29,9 @@ use std::path::{Path, PathBuf};
 
 use bloch_pos_committee::header::BlockEnvelope;
 
+#[cfg(feature = "native-component-snapshots")]
+pub mod native_snapshot;
+
 const META_MAGIC: &[u8; 8] = b"BPOSMETA";
 
 thread_local! {
@@ -389,6 +392,8 @@ fn index_start(dir: &Path, after_slot: u64, log_len: u64) -> io::Result<Option<S
 
 pub struct Store {
     dir: PathBuf,
+    #[cfg(feature = "native-component-snapshots")]
+    genesis_digest: [u8; 32],
     log: File,
     /// Append handle for the derived slot → offset index. Written after the
     /// log's own fsync, so it can lag the log and never lead it.
@@ -690,7 +695,10 @@ impl Store {
             .write(true)
             .open(dir.join("blocks.idx"))?;
         repair_index(&mut idx, &dir.join("blocks.log"), log_len)?;
-        Ok(Store { dir: dir.to_path_buf(), log, idx, log_len, _lock })
+        Ok(Store { dir: dir.to_path_buf(), log, idx, log_len, _lock,
+            #[cfg(feature = "native-component-snapshots")]
+            genesis_digest: *genesis_digest,
+        })
     }
 
     /// Append one applied block. One write, then fsync — the block is only
