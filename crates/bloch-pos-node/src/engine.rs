@@ -4076,6 +4076,48 @@ impl Engine {
     fn serve_rpc(&mut self, req: RpcRequest) -> RpcResult {
         match req {
             #[cfg(feature="native-lab")]
+            RpcRequest::NativePoolQuote {expected_head,query} => {
+                if !self.tr.native_lab_matches(&self.state) {
+                    return Err(rpc::RpcError::new(-32601,"native laboratory is not selected"));
+                }
+                if self.head_id().as_bytes()!=&expected_head {
+                    return Err(rpc::RpcError::new(-32000,"laboratory head changed; obtain a fresh view"));
+                }
+                let quote=self.state.native_lab_pool_quote(&query,self.state.slot())
+                    .map_err(|e|rpc::RpcError::new(-32000,e))?;
+                let Json::Obj(mut fields)=self.serve_rpc(RpcRequest::NativeWalletView)? else {unreachable!()};
+                fields.push(("transactionHex".into(),Json::s(crate::codec::hex(&quote.transaction))));
+                fields.push(("feeSat".into(),Json::sat(quote.fee_sat)));
+                fields.push(("reserveId".into(),quote.reserve_id.map_or(Json::Null,|id|Json::hex(&id))));
+                fields.push(("poolId".into(),quote.pool_id.map_or(Json::Null,|id|Json::hex(&id))));
+                use bloch_pos_committee::transition::native_dex::lab_quote::Operation;
+                fields.push(("operation".into(),Json::s(match query.operation {
+                    Operation::CreatePair{..}=>"create-pair",Operation::Initialize{..}=>"initialize",Operation::Swap{..}=>"swap",
+                })));
+                Ok(Json::Obj(fields))
+            }
+            #[cfg(feature="native-lab")]
+            RpcRequest::NativePool{pool} => {
+                if !self.tr.native_lab_matches(&self.state) {
+                    return Err(rpc::RpcError::new(-32601,"native laboratory is not selected"));
+                }
+                let report=self.state.native_lab_pool_report(&pool)
+                    .ok_or_else(||rpc::RpcError::new(-32000,"unknown native laboratory pool"))?;
+                Ok(Json::obj(vec![
+                    ("format",Json::s("BPOSLAB1")),
+                    ("domain",Json::hex(&self.state.admission_network_domain().unwrap())),
+                    ("genesis",Json::hex(self.manifest.genesis_id().as_bytes())),
+                    ("head",Json::hex(self.head_id().as_bytes())),("height",Json::sat(self.state.slot() as u128)),
+                    ("stateRoot",Json::hex(&self.head_state_root())),
+                    ("poolId",Json::hex(&report.pool_id)),("reserveId",Json::hex(&report.reserve_id)),
+                    ("assets",Json::Arr(report.assets.iter().map(Json::hex).collect())),
+                    ("reserves",Json::Arr(report.reserves.iter().map(|n|Json::sat(*n as u128)).collect())),
+                    ("poolStateRoot",Json::hex(&report.pool_root)),("revision",Json::sat(report.revision as u128)),
+                    ("lpTotal",Json::sat(report.lp_total as u128)),("feeBps",Json::sat(report.fee_bps as u128)),
+                    ("custody",Json::s("locked-pool-reserves")),
+                ]))
+            }
+            #[cfg(feature="native-lab")]
             RpcRequest::NativeWalletView => {
                 if !self.tr.native_lab_matches(&self.state) {
                     return Err(rpc::RpcError::new(-32601, "native laboratory is not selected"));

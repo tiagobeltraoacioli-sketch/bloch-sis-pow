@@ -96,3 +96,40 @@ a native snapshot larger than 4 MiB. It never truncates state. This trusted-host
 projection supports typed wallet review; it is not a finality proof. Its UTXOs
 include custody reserves required for snapshot validation and must not be summed
 as a spendable wallet balance. The wallet must apply the restored custody locks.
+
+`getnativepoolquote` takes an array containing one object. Common fields are
+`operation`, `ownerPublicKeyHex`, `expectedHead`, and `validUntil`. The current
+head must match exactly. `validUntil` is a slot decimal string, later than the
+head slot and at most 128 slots ahead. Supported operation fields:
+
+- `create-pair`: `asset`, `seed`, `blchAmount`, `nativeAmount`.
+- `initialize`: `reserve`, `feeBps`, `minimumLp`.
+- `swap`: `pool`, `inputAsset`, `amount`, `minimumOut`; either pool asset may be input. Native input currently requires one sufficient unlocked owner output; fragmented inputs are not automatically aggregated.
+
+All quantities are canonical decimal strings. Hashes are 32-byte hex. Unknown
+or duplicate fields are rejected. The reply extends `getnativewalletview` with
+`transactionHex`, `feeSat`, `operation`, `reserveId`, and `poolId` (null until
+applicable). IDs are calculated by the canonical reserve/bootstrap functions;
+a quote does not establish that the resulting reserve or pool exists on chain.
+Packets contain reserved-size signature placeholders and must pass the typed
+wallet review/signing flow. No keys are held by this endpoint. Builders select
+current spendable funding and refuse locked native/base reserves as payer coins.
+Withdrawals require independent committee approvals; this unsigned builder does
+not manufacture certificates or expose a withdrawal as ready to submit.
+
+For the existing local source cycle, `native-wallet-fund-lab.py` uses the lab
+operator to send a canonical V1 BLCH transfer to a public disposable wallet key.
+`native-wallet-import-lab.py` verifies the second real local source deposit and
+imports it to that same wallet using mint nonce 1. Both save the packet before
+submission, require fresh current funding, and require transaction inclusion
+plus expected state. Their output directory must not already exist, preventing
+blind automatic retries of an unresolved attempt. Source assets remain synthetic.
+
+`getnativepool([poolId])` reads one committed pool. The response includes the
+same `format`, `domain`, `genesis`, `head`, slot-as-`height`, and `stateRoot`
+observation fields, plus `poolId`, `reserveId`, `assets`, `reserves`,
+`poolStateRoot`, `revision`, `lpTotal`, `feeBps`, and
+`custody: "locked-pool-reserves"`. All integer values are decimal strings.
+Unknown pools and non-laboratory instances are refused. Reserve quantities are
+custody balances, not an owner's spendable wallet balance. These reads do not
+establish finality or external backing.

@@ -35,6 +35,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
         "--event-index",
         "--deposit-nonce",
         "--deposit-sender",
+        "--native-recipient-public-key",
+        "--mint-nonce",
+        "--valid-until",
+        "--fund-amount",
     ];
     let mut flags = BTreeMap::new();
     for pair in args.chunks(2) {
@@ -55,8 +59,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
             .ok_or_else(|| format!("missing {key}"))
     };
     let kind = get("--kind")?;
-    if !["info", "bootstrap", "import", "withdraw"].contains(&kind) {
-        return Err("expected bootstrap/import/withdraw".into());
+    if !["info", "bootstrap", "import", "withdraw", "fund-wallet"].contains(&kind) {
+        return Err("expected info/bootstrap/import/withdraw/fund-wallet".into());
     }
     let (manifest, domain) =
         Manifest::load(Path::new(get("--genesis")?)).map_err(|e| e.to_string())?;
@@ -113,6 +117,81 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 .map_err(|_| "invalid input value")?,
         )
     };
+    let recipient = match flags.get("--native-recipient-public-key") {
+        Some(raw) if raw.len() <= 16384 => codec::unhex(raw)?,
+        Some(_) => return Err("recipient key exceeds limit".into()),
+        None => sponsor.pubkey.clone(),
+    };
+    if !bloch_crypto::crypto::valid_native_hybrid_key(&recipient) {
+        return Err("invalid native recipient key".into());
+    }
+    let valid_until: u64 = flags
+        .get("--valid-until")
+        .copied()
+        .unwrap_or("10000")
+        .parse()
+        .map_err(|_| "invalid validity")?;
+    let mint_nonce: u64 = flags
+        .get("--mint-nonce")
+        .copied()
+        .unwrap_or("0")
+        .parse()
+        .map_err(|_| "invalid mint nonce")?;
+    if kind == "withdraw" && recipient != sponsor.pubkey {
+        return Err("operator withdrawal cannot sign a different owner".into());
+    }
+    if kind == "fund-wallet" {
+        use bloch_pos_committee::{fee_market, transition::TransferInput};
+        let amount = get("--fund-amount")?
+            .parse::<u64>()
+            .map_err(|_| "invalid funding amount")?;
+        if amount == 0 {
+            return Err("funding amount must be positive".into());
+        }
+        let charge = fee_market::charge(fee_market::TxClass::Eutxo { inputs: 1 }, 10000, fee, 0);
+        let change = remaining(value, charge)?
+            .checked_sub(amount)
+            .filter(|n| *n > 0)
+            .ok_or("insufficient funding")?;
+        let mut tx = PosTransaction::Transfer {
+            inputs: vec![TransferInput {
+                txid: input.txid,
+                vout: input.vout,
+                pubkey: sponsor.pubkey.clone(),
+                signature: vec![],
+            }],
+            outputs: vec![
+                TransferOutput {
+                    value: change,
+                    script_hash: script,
+                },
+                TransferOutput {
+                    value: amount,
+                    script_hash: Sha3_256::digest(&recipient).into(),
+                },
+            ],
+            tx_bytes: 10000,
+            tip_millisat_per_gas: 0,
+        };
+        let sig = sponsor.sign(&tx.spend_signing_root());
+        if let PosTransaction::Transfer { inputs, .. } = &mut tx {
+            inputs[0].signature = sig;
+        }
+        println!(
+            "{}",
+            Json::obj(vec![
+                ("hex", Json::s(codec::hex(&tx.canonical_bytes()))),
+                ("txid", Json::hex(&tx.txid())),
+                ("output_txid", Json::hex(&tx.txid())),
+                ("output_value", Json::s(change.to_string())),
+                ("wallet_value", Json::s(amount.to_string())),
+                ("wallet_vout", Json::s("1")),
+                ("recipient_hash", Json::hex(&g::recipient_hash(&recipient)))
+            ])
+            .to_string()
+        );
+        return Ok(());
+    }
     let sample = sponsor.sign(&[0; 32]);
     let blch = PosTransaction::TransferV2 {
         keys: vec![WitnessKey {
@@ -176,7 +255,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 ("native_asset", Json::hex(&asset)),
                 (
                     "pq_recipient_hash",
-                    Json::hex(&g::recipient_hash(&sponsor.pubkey))
+                    Json::hex(&g::recipient_hash(&recipient))
                 )
             ])
             .to_string()
@@ -201,13 +280,13 @@ pub fn run(args: &[String]) -> Result<(), String> {
         asset,
         inputs: vec![],
         outputs: vec![n::Output {
-            owner: sponsor.pubkey.clone(),
+            owner: recipient.clone(),
             amount: 100,
         }],
         delta: 100,
-        mint_nonce: 0,
+        mint_nonce,
         policy_revision: 0,
-        valid_until: 10_000,
+        valid_until,
     };
     let mint_id = native.signing_hash(&domain).map_err(|e| format!("{e:?}"))?;
     let mut burn = [0; 32];
@@ -217,7 +296,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             blch,
             registration,
             route: config.clone(),
-            valid_until: 10_000,
+            valid_until,
             native_gas: 100_000,
             issuer_signature: sample.clone(),
             approvals: approvals(&[0; 32]),
@@ -257,7 +336,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
                         .transpose()?
                         .unwrap_or([11; 20]),
                     amount: 100,
-                    pq_recipient_hash: g::recipient_hash(&sponsor.pubkey),
+                    pq_recipient_hash: g::recipient_hash(&recipient),
                 },
                 source_transaction: flags
                     .get("--source-tx")
@@ -275,7 +354,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
                     .unwrap_or("0")
                     .parse()
                     .map_err(|_| "invalid event index")?,
-                valid_until: 10_000,
+                valid_until,
                 transaction: native,
             })
         } else {
@@ -286,6 +365,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 }],
                 outputs: vec![],
                 delta: -100,
+                mint_nonce: 0,
                 ..native
             };
             burn = tx.signing_hash(&domain).map_err(|e| format!("{e:?}"))?;
@@ -312,7 +392,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 },
                 approvals: approvals(&[0; 32]),
             },
-            valid_until: 10_000,
+            valid_until,
             native_gas: 100_000,
         };
         let size = r
@@ -362,10 +442,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             ("native_domain", Json::hex(&domain)),
             ("native_asset", Json::hex(&asset)),
             ("route", Json::hex(&config.route.id())),
-            (
-                "recipient_hash",
-                Json::hex(&g::recipient_hash(&sponsor.pubkey))
-            ),
+            ("recipient_hash", Json::hex(&g::recipient_hash(&recipient))),
             ("native_burn", Json::hex(&burn)),
             ("synthetic_assets", Json::Bool(true)),
             (

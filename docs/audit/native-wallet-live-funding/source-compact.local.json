@@ -1,0 +1,21 @@
+{
+  "environment": "disposable-local-anvil",
+  "source_domain": "0xbf7388d2b2dfd274e046cded2d82e05c3d04c7f95c8b64a2a343d015c9a2a2ae",
+  "native_domain": "0x5891725d15178d25c6ac1b933cc6d21507a95e67b132f5ac0ace325fe9587673",
+  "native_asset": "0xa23fd48ece6d8617c9cdf6f74b634aff5085e55188cfaebbdbe396440c78a275",
+  "token": "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+  "vault": "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512",
+  "route_id": "0x44bc80e7c05bbe7dd2b0a84e4c27af848d8df9f5bdb17ed496ad74409646fa74",
+  "cap": "1000",
+  "decimals": 6,
+  "pq_recipient_hash": "0x7a24d6c86b4badb1393a62968cccb54a060e27063361ef57c6ca3a04333cbe17",
+  "deposit_id": "0x7d1ee0e2cd75f5cf125c268bb7d4bda87b1b6fbf1ea977073dfcd438babf5854",
+  "deposit_nonce": "1",
+  "amount": "100",
+  "source_txid": "0x8033ea84425ceab144a5b100593db0cf68e157623000a8b567fe87c03e0a0719",
+  "source_block_hash": "0x55b95b02a1284ddae29bfa50e291cf1d67f28638fe11962800d7c1120b2ec331",
+  "source_height": "9",
+  "event_index": "1",
+  "deposit_sender": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+  "vault_runtime_sha256": "0xe1f66ae24a27dabcc289f3474da6aeb81917f6c2729cd7148dcf22433892d7b0"
+}

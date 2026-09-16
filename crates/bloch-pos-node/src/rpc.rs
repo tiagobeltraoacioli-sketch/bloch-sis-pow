@@ -837,9 +837,15 @@ fn hex32_from(s: &str) -> Option<[u8; 32]> {
 /// a request reaches the engine, "the slot was not a number" has already been
 /// answered, and by the time a reply reaches the dispatcher, "no such block"
 /// has already been decided.
+#[cfg(feature="native-lab")]
+mod native_quote;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RpcRequest {
     ChainInfo,
+    #[cfg(feature="native-lab")]
+    NativePoolQuote { expected_head:[u8;32], query:bloch_pos_committee::transition::native_dex::lab_quote::Query },
+    #[cfg(feature="native-lab")]
+    NativePool {pool:[u8;32]},
     #[cfg(feature="native-lab")]
     NativeWalletView,
     #[cfg(feature="native-lab")]
@@ -1118,6 +1124,13 @@ fn want_hex32(params: Option<&Json>, pos: usize, name: &str) -> Result<[u8; 32],
 pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError> {
     Ok(match method {
         "getchaininfo" => RpcRequest::ChainInfo,
+        #[cfg(feature="native-lab")]
+        "getnativepoolquote" => {
+            let (expected_head,query)=native_quote::parse(params)?;
+            RpcRequest::NativePoolQuote{expected_head,query}
+        },
+        #[cfg(feature="native-lab")]
+        "getnativepool" => RpcRequest::NativePool{pool:want_hex32(params,0,"pool")?},
         #[cfg(feature="native-lab")]
         "getnativewalletview" => RpcRequest::NativeWalletView,
         #[cfg(feature="native-lab")]

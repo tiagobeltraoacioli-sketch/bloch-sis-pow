@@ -1,0 +1,12 @@
+{
+  "format": "BPOSLAB1",
+  "domain": "5891725d15178d25c6ac1b933cc6d21507a95e67b132f5ac0ace325fe9587673",
+  "genesis": "823d58efab559e4c92414ad99738ebda99d62e79ef6add0602fd8f7a05ec58c2",
+  "head": "7130ec0a267ad523ce2a00a343e44dd09a38fced5b0ef8b5dcd0b11284c0d8f1",
+  "height": "2871",
+  "stateRoot": "284cead3d2ca05bfd93921292d1206cd00088d32f56fa615e56503e9e6e5578e",
+  "feeSat": "77136",
+  "reserveId": "3ecf36498fd81ede8bd5b514ea37c5a8ed64aa65e4d59e5685e4efc859aab8a9",
+  "poolId": null,
+  "operation": "create-pair"
+}

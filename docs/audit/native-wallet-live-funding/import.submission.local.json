@@ -1,0 +1,9 @@
+{
+  "accepted": true,
+  "status": "accepted",
+  "kind": "native_import",
+  "bytes": 26370,
+  "tx_hash": "3f918ce7c3f641f5d5bf002d435547d2f7cc6af992804ec8bfa9ecfe8bd3ee56",
+  "tx_hash_note": "local correlation handle only (SHA3-256 of the canonical bytes); not a consensus transaction id \u2014 no block commits to it",
+  "confirmation": "this transport does not confirm: watch for the transaction in a block via `getblockbyslot`. `finalized: true` on that block is the strongest signal this chain offers, but it is NOT a settlement guarantee \u2014 no slashing penalty backs it and it is not a latch; see `docs/integration/BLOCH-GENESIS4-EXCHANGE-INTEGRATION.md` \u00a75"
+}

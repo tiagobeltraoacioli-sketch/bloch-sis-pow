@@ -170,3 +170,21 @@ impl CommittedState {
         })
     }
 }
+
+/// Current sealed pool reserves, not an owner-spendable balance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolReport {
+    pub pool_id: [u8; 32],
+    pub reserve_id: [u8; 32],
+    pub assets: [[u8; 32]; 2],
+    pub reserves: [u64; 2],
+    pub pool_root: [u8; 32],
+    pub revision: u64,
+    pub lp_total: u64,
+    pub fee_bps: u16,
+}
+impl CommittedState {
+    pub fn native_lab_pool_report(&self, pool: &[u8; 32]) -> Option<PoolReport> {
+        self.native_state.as_ref()?.lab_pool_report(pool)
+    }
+}
