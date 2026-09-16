@@ -115,3 +115,23 @@ impl<V: SignatureVerifier> Transition<V> {
         }
     }
 }
+
+/// Bounded route accounting, not source-vault settlement evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteReport {
+    pub supply: u64,
+    pub imported: u128,
+    pub burned: u128,
+    pub next_release_nonce: u64,
+    pub commitment: [u8; 32],
+    pub first_release_burn: Option<[u8; 32]>,
+}
+impl CommittedState {
+    pub fn native_lab_route_report(
+        &self,
+        asset: &[u8; 32],
+        route: &[u8; 32],
+    ) -> Option<RouteReport> {
+        self.native_state.as_ref()?.lab_route_report(asset, route)
+    }
+}

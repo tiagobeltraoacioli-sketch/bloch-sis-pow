@@ -101,7 +101,7 @@ impl State {
     pub fn quote_gateway(&self, request: &Request) -> Result<fee_market::TxCharge, Error> {
         self.quote_gateway_with_context(request, self.base.next_base_fee(), 0)
     }
-    pub(super) fn quote_gateway_with_context(
+    pub fn quote_gateway_with_context(
         &self,
         request: &Request,
         base_fee: u128,

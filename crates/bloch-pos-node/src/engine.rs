@@ -4075,6 +4075,29 @@ impl Engine {
 
     fn serve_rpc(&mut self, req: RpcRequest) -> RpcResult {
         match req {
+            #[cfg(feature="native-lab")]
+            RpcRequest::NativeLabState {asset,route} => {
+                if !self.tr.native_lab_matches(&self.state) {
+                    Err(rpc::RpcError::new(-32601,"native laboratory is not selected"))
+                } else {
+                    use rpc::Json;
+                    let report=self.state.native_lab_route_report(&asset,&route);
+                    Ok(Json::obj(vec![
+                        ("native_domain",Json::hex(&self.state.admission_network_domain().unwrap())),
+                        ("block_id",Json::hex(self.head_id().as_bytes())),
+                        ("state_root",Json::hex(&self.head_state_root())),
+                        ("slot",Json::u(self.state.slot())),
+                        ("asset",Json::hex(&asset)),("route",Json::hex(&route)),
+                        ("synthetic",Json::Bool(true)),("settlement",Json::s("none")),
+                        ("ledger",report.map_or(Json::Null,|r|Json::obj(vec![
+                            ("supply",Json::sat(r.supply as u128)),("imported",Json::sat(r.imported)),
+                            ("burned",Json::sat(r.burned)),("next_release_nonce",Json::u(r.next_release_nonce)),
+                            ("native_commitment",Json::hex(&r.commitment)),
+                            ("first_release_burn",r.first_release_burn.map_or(Json::Null,|b|Json::hex(&b))),
+                        ]))),
+                    ]))
+                }
+            }
             RpcRequest::ChainInfo => Ok(rpc::chain_info_json(
                 &self.state,
                 &self.head_id(),

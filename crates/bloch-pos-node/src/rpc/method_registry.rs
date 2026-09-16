@@ -80,6 +80,8 @@ use super::*;
 fn frozen_method_space(req: &RpcRequest) -> &'static str {
     match req {
         RpcRequest::ChainInfo => "getchaininfo",
+        #[cfg(feature="native-lab")]
+        RpcRequest::NativeLabState {..} => "getnativelabstate",
         RpcRequest::BuildInfo => "getbuildinfo",
         RpcRequest::BlockCount => "getblockcount",
         RpcRequest::BlockBySlot(_) => "getblockbyslot",

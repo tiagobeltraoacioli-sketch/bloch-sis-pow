@@ -792,3 +792,6 @@ mod component_tests {
         ));
     }
 }
+
+#[cfg(feature="native-lab")]
+mod lab_view;

@@ -92,6 +92,8 @@ use std::path::PathBuf;
 /// without compiling anything.
 const ROUTED: &[(&str, &str)] = &[
     ("getchaininfo", "ChainInfo"),
+    // Source scan sees the laboratory-only cfg arm; default routing still rejects it.
+    ("getnativelabstate", "NativeLabState"),
     ("getbuildinfo", "BuildInfo"),
     ("getblockcount", "BlockCount"),
     ("getblockbyslot", "BlockBySlot"),

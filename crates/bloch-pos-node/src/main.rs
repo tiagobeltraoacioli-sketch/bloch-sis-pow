@@ -151,6 +151,10 @@ fn main() {
                 exit(2);
             }
         }
+        #[cfg(feature="native-lab")]
+        Some("native-lab-fixture") => {
+            if let Err(e)=native_lab_tool::run(&args[1..]) { eprintln!("native-lab-fixture: {e}");exit(2); }
+        }
         Some("run") => run_cmd(&args[1..]),
         Some(
             cmd @ ("ws-keygen" | "ws-signer-set" | "ws-checkpoint" | "ws-sign" | "ws-envelope"
@@ -1829,3 +1833,6 @@ mod transport_tests {
         }
     }
 }
+
+#[cfg(feature="native-lab")]
+mod native_lab_tool;

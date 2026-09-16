@@ -24,9 +24,10 @@ python3 scripts/native-lab-process-smoke.py --binary target/debug/bloch-pos
 ```
 
 The process smoke creates and removes its own temporary keys and genesis, binds
-only localhost, produces blocks, checks RPC rejection of a malformed native
-import, terminates and restarts the real node, and checks recovered chain state
-and native checkpoint persistence. Separate real-crypto node tests exercise
+only localhost, produces blocks, submits real hybrid-signed bootstrap, import and withdrawal over RPC, checks
+supply 0 -> 100 -> 0 and the burn/release record, refuses malformed import,
+terminates and restarts the real node, and checks recovered route accounting,
+withdrawal replay refusal and native checkpoint persistence. Separate real-crypto node tests exercise
 bootstrap admission, production, durable replay and native snapshot restoration:
 
 ```sh
@@ -52,3 +53,30 @@ integration needs a distinct network definition, exact laboratory genesis/domain
 pins, typed native signing and a deliberately selected localhost endpoint. Do not
 reuse the public wallet G4 RPC proxy or the EVM DEX deployment manifest. This
 infrastructure does not deploy a source vault or settle an external asset.
+
+## Offline fixture builder and bounded route query
+
+The feature-scoped `native-lab-fixture` command accepts `--kind info`,
+`bootstrap`, `import` or `withdraw`, plus `--genesis`, `--sponsor` and `--committee`
+paths pointing only to the disposable laboratory. Transaction kinds also take
+`--base-fee` from the local node. After bootstrap, supply `--input-txid` and
+`--input-value` from the preceding builder's `output_txid`/`output_value` fields.
+The output includes typed canonical `hex`, the transaction-status `txid`, sponsor
+change identity/value, native domain/asset/route and withdrawal burn identity.
+Signing stays offline; the caller explicitly submits `hex` through RPC.
+
+These fixtures use an asset cap of 1,000 and mint/burn 100 units. Defaults describe
+synthetic source records, not a deployment. To bind an actual local source-vault
+harness, pass `--source-domain`, `--token`, `--vault`, `--vault-code-hash` (SHA-256
+runtime), then import evidence using `--source-tx`, `--source-block`, `--event-index`,
+`--deposit-nonce` and `--deposit-sender`. Unknown or duplicate options are refused.
+The current withdrawal fixture spends the initial mint output; it is not a general
+coin selector or pool-operation builder. Its external recipient is 20 bytes of
+`0x0f`; no external payment is issued by this command.
+
+`getnativelabstate(asset, route)` is available only in a laboratory build and
+refuses official networks. It returns domain, head ID, root, slot and bounded route
+accounting: supply, imported, burned, next release nonce, native commitment and the
+first release's burn identity. It does not report owner balances, so locked pool
+reserves cannot be mistaken for spendable wallet outputs. Values are explicitly
+synthetic and `settlement` remains `none` even after a native burn.

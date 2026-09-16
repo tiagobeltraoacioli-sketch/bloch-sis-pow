@@ -840,6 +840,8 @@ fn hex32_from(s: &str) -> Option<[u8; 32]> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RpcRequest {
     ChainInfo,
+    #[cfg(feature="native-lab")]
+    NativeLabState { asset: [u8;32], route:[u8;32] },
     /// `getbuildinfo` — which binary is answering. Reads no chain state.
     BuildInfo,
     /// `getblockcount` — the polling method, carrying finality with it.
@@ -1114,6 +1116,8 @@ fn want_hex32(params: Option<&Json>, pos: usize, name: &str) -> Result<[u8; 32],
 pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError> {
     Ok(match method {
         "getchaininfo" => RpcRequest::ChainInfo,
+        #[cfg(feature="native-lab")]
+        "getnativelabstate" => RpcRequest::NativeLabState {asset:want_hex32(params,0,"asset")?,route:want_hex32(params,1,"route")?},
         "getbuildinfo" => RpcRequest::BuildInfo,
         "getblockcount" => RpcRequest::BlockCount,
         "getblockbyslot" => RpcRequest::BlockBySlot(want_u64(params, 0, "slot")?),
