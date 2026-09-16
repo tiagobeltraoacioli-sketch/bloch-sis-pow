@@ -111,3 +111,15 @@ proof/finality integration, funded pool lifecycle and swaps. The rehearsal
 or external payment receipt. Reusing it requires adapting block-price accounting
 and fee settlement, plus durable external duplicate-payment and reorg handling.
 No activation or public funding follows automatically from passing these tests.
+
+## Implemented dormant bootstrap
+
+`native_dex/bootstrap.rs` implements a bounded supply-only registration plus
+route enablement in one staged transaction. The issuer, configured sorted quorum
+and BLCH fee payer bind the same typed authorization, including domain,
+registration, route, expiry, prepaid gas and sponsor outputs. Canonical dispatch
+uses tag `0x0F` and a separate disabled epoch gate. Supply and mint nonce remain
+zero; normal block settlement charges fees once. Tests cover real block replay,
+disabled-gate refusal, every authority, malformed wire and atomic failures.
+This supplies no operator allowlist, source-vault deployment, backing proof or
+production keys.

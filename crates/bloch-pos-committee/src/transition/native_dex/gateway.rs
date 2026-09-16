@@ -99,7 +99,17 @@ pub struct Receipt {
 }
 impl State {
     pub fn quote_gateway(&self, request: &Request) -> Result<fee_market::TxCharge, Error> {
-        let length = request.canonical_bytes(&self.domain)?.len() as u64;
+        self.quote_gateway_with_context(request, self.base.next_base_fee(), 0)
+    }
+    pub(super) fn quote_gateway_with_context(
+        &self,
+        request: &Request,
+        base_fee: u128,
+        outer_bytes: u64,
+    ) -> Result<fee_market::TxCharge, Error> {
+        let length = (request.canonical_bytes(&self.domain)?.len() as u64)
+            .checked_add(outer_bytes)
+            .ok_or(Error::ResourceLimit)?;
         let PosTransaction::TransferV2 {
             keys,
             tx_bytes,
@@ -132,7 +142,7 @@ impl State {
         .filter(|n| *n <= fee_market::MAX_TX_GAS)
         .ok_or(Error::ResourceLimit)?;
         let (base_fee_sat, priority_fee_sat) =
-            fee_market::fee_parts_sat(gas, self.base.next_base_fee(), *tip_millisat_per_gas);
+            fee_market::fee_parts_sat(gas, base_fee, *tip_millisat_per_gas);
         Ok(fee_market::TxCharge {
             gas,
             tx_bytes: *tx_bytes,
@@ -149,7 +159,25 @@ impl State {
         base_verifier: &dyn SignatureVerifier,
         native_verifier: &dyn Verifier,
     ) -> Result<Receipt, Error> {
-        let charge = self.quote_gateway(request)?;
+        self.execute_gateway_with_context(
+            request,
+            height,
+            self.base.next_base_fee(),
+            0,
+            base_verifier,
+            native_verifier,
+        )
+    }
+    pub(super) fn execute_gateway_with_context(
+        &mut self,
+        request: &Request,
+        height: u64,
+        base_fee: u128,
+        outer_bytes: u64,
+        base_verifier: &dyn SignatureVerifier,
+        native_verifier: &dyn Verifier,
+    ) -> Result<Receipt, Error> {
+        let charge = self.quote_gateway_with_context(request, base_fee, outer_bytes)?;
         if height > request.valid_until || request.transaction().valid_until > request.valid_until {
             return Err(Error::Expired);
         }
@@ -171,7 +199,9 @@ impl State {
         }
         let authorization = request.authorization(&self.domain)?;
         let blch_txid = request.output_txid(&self.domain)?;
-        let envelope_bytes = request.canonical_bytes(&self.domain)?.len() as u64;
+        let envelope_bytes = (request.canonical_bytes(&self.domain)?.len() as u64)
+            .checked_add(outer_bytes)
+            .ok_or(Error::ResourceLimit)?;
         let encoded = gateway_wire::encode(&request.gateway).map_err(Error::GatewayWire)?;
         let scoped = NativeVerifier {
             inner: native_verifier,
@@ -190,7 +220,7 @@ impl State {
             .base
             .plan_transfer_v2_with_context(
                 &request.blch,
-                self.base.next_base_fee(),
+                base_fee,
                 base_verifier,
                 Some(JointTransferContext {
                     envelope_bytes,

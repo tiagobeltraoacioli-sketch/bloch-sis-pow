@@ -108,6 +108,22 @@ catches the frame-byte class except this file.**
 
 ---
 
+## Dormant native transaction allocation (2026-09-16)
+
+This worktree additionally freezes `0x0E` NativeTransfer, `0x0F`
+NativeBootstrap, `0x10` NativeImport and `0x11` NativeWithdrawal. These are
+transaction tags, not state-root or frame tags. Each has a bounded opaque
+payload and its own disabled (`u64::MAX`) activation gate; decoding grants no
+execution permission. NativeBootstrap registers a zero-supply asset and enables
+a request-authorized federated route atomically. Import attestations are quorum
+statements, not source-chain consensus proofs. No deployment, source backing,
+or production authority is established by these allocations.
+
+The historical table below is retained as scan evidence, not as the current
+allocation list. The executable `wire_tag_registry.rs` table is authoritative.
+The bootstrap allocation was checked against 274 local/remote refs (240 unique
+tips, 86 distinct transition source blobs), with no pre-existing `0x0F` claim.
+
 ## 1. Transaction tags — `u8`, first byte of an encoded `PosTransaction` **[re-verified 2026-09-02]**
 
 Namespace: single, global. Decoded by the `match` at

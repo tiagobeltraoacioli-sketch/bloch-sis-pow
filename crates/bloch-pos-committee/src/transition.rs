@@ -329,6 +329,12 @@ impl NativeTransferPayload {
 pub enum PosTransaction {
     /// BLCH-sponsored native transfer, independently consensus-gated.
     NativeTransfer(NativeTransferPayload),
+    /// Zero-supply registration and federated route configuration; dormant.
+    NativeBootstrap(NativeTransferPayload),
+    /// Federated attestation import; independently gated and dormant.
+    NativeImport(NativeTransferPayload),
+    /// Native burn and release-record creation; independently gated and dormant.
+    NativeWithdrawal(NativeTransferPayload),
     /// PQ-authorized, UTXO-funded validator registration (wire 0x0B).
     FundedDeposit(FundedDeposit),
     /// A value transfer against the committed eUTXO set, priced by the L1 fee
@@ -860,6 +866,18 @@ impl PosTransaction {
                 b.push(NATIVE_TRANSFER_TAG);
                 put(&mut b, payload.as_bytes());
             }
+            PosTransaction::NativeBootstrap(payload) => {
+                b.push(0x0F);
+                put(&mut b, payload.as_bytes());
+            }
+            PosTransaction::NativeWithdrawal(payload) => {
+                b.push(0x11);
+                put(&mut b, payload.as_bytes());
+            }
+            PosTransaction::NativeImport(payload) => {
+                b.push(0x10);
+                put(&mut b, payload.as_bytes());
+            }
             PosTransaction::Transfer { inputs, outputs, tx_bytes, tip_millisat_per_gas } => {
                 b.push(0x01);
                 // Counts are length prefixes like every other variable-length
@@ -1046,6 +1064,27 @@ impl PosTransaction {
                     return Err(TxDecodeError::InvalidNativePayload);
                 }
                 PosTransaction::NativeTransfer(NativeTransferPayload::new(r.take(length)?.to_vec())?)
+            }
+            0x0F => {
+                let length = r.u32()? as usize;
+                if length == 0 || length > MAX_NATIVE_TRANSFER_PAYLOAD_BYTES {
+                    return Err(TxDecodeError::InvalidNativePayload);
+                }
+                PosTransaction::NativeBootstrap(NativeTransferPayload::new(r.take(length)?.to_vec())?)
+            }
+            0x11 => {
+                let length = r.u32()? as usize;
+                if length == 0 || length > MAX_NATIVE_TRANSFER_PAYLOAD_BYTES {
+                    return Err(TxDecodeError::InvalidNativePayload);
+                }
+                PosTransaction::NativeWithdrawal(NativeTransferPayload::new(r.take(length)?.to_vec())?)
+            }
+            0x10 => {
+                let length = r.u32()? as usize;
+                if length == 0 || length > MAX_NATIVE_TRANSFER_PAYLOAD_BYTES {
+                    return Err(TxDecodeError::InvalidNativePayload);
+                }
+                PosTransaction::NativeImport(NativeTransferPayload::new(r.take(length)?.to_vec())?)
             }
             funded::FUNDED_DEPOSIT_TAG => PosTransaction::FundedDeposit(FundedDeposit::decode(&mut r)?),
             0x01 => {
@@ -3493,7 +3532,10 @@ impl CommittedState {
         match tx {
             // Native transfers need the block's current slot and its fixed
             // price. Only compute_post_state dispatches them with that context.
-            PosTransaction::NativeTransfer(_) => Err(TxReject::StakingRule),
+            PosTransaction::NativeTransfer(_)
+            | PosTransaction::NativeBootstrap(_)
+            | PosTransaction::NativeImport(_)
+            | PosTransaction::NativeWithdrawal(_) => Err(TxReject::StakingRule),
             PosTransaction::Withdraw { validator } => self.apply_withdrawal(*validator, tx),
             PosTransaction::FundedDeposit(deposit) => self
                 .apply_funded_deposit(deposit, total_active_sat, base_fee_millisat_per_gas, verifier)
@@ -6034,6 +6076,60 @@ impl<V: SignatureVerifier> Transition<V> {
                     #[cfg(not(feature = "native-dex-rehearsal"))]
                     { let _ = payload; Err(TxReject::StakingRule) }
                 }
+                PosTransaction::NativeBootstrap(payload) => {
+                    #[cfg(feature = "native-dex-rehearsal")]
+                    {
+                        if !crate::params::native_bootstrap_active(block_epoch)
+                            || !crate::params::native_state_active(block_epoch)
+                        {
+                            Err(TxReject::StakingRule)
+                        } else {
+                            native_dex::bootstrap::apply_bootstrap(
+                                &mut st, payload.as_bytes(), header.slot, base_fee,
+                                &ConsensusNativeVerifier(&self.verifier),
+                                &ConsensusNativeVerifier(&self.verifier),
+                            ).map_err(|_| TxReject::StakingRule)
+                        }
+                    }
+                    #[cfg(not(feature = "native-dex-rehearsal"))]
+                    { let _ = payload; Err(TxReject::StakingRule) }
+                }
+                PosTransaction::NativeImport(payload) => {
+                    #[cfg(feature = "native-dex-rehearsal")]
+                    {
+                        if !crate::params::native_import_active(block_epoch)
+                            || !crate::params::native_state_active(block_epoch)
+                        {
+                            Err(TxReject::StakingRule)
+                        } else {
+                            native_dex::consensus_gateway::apply_import(
+                                &mut st, payload.as_bytes(), header.slot, base_fee,
+                                &ConsensusNativeVerifier(&self.verifier),
+                                &ConsensusNativeVerifier(&self.verifier),
+                            ).map_err(|_| TxReject::StakingRule)
+                        }
+                    }
+                    #[cfg(not(feature = "native-dex-rehearsal"))]
+                    { let _ = payload; Err(TxReject::StakingRule) }
+                }
+                PosTransaction::NativeWithdrawal(payload) => {
+                    #[cfg(feature = "native-dex-rehearsal")]
+                    {
+                        if !crate::params::native_withdrawal_active(block_epoch)
+                            || !crate::params::native_state_active(block_epoch)
+                        {
+                            Err(TxReject::StakingRule)
+                        } else {
+                            native_dex::consensus_gateway::apply_withdrawal(
+                                &mut st, payload.as_bytes(), header.slot, base_fee,
+                                &ConsensusNativeVerifier(&self.verifier),
+                                &ConsensusNativeVerifier(&self.verifier),
+                            ).map_err(|_| TxReject::StakingRule)
+                        }
+                    }
+                    #[cfg(not(feature = "native-dex-rehearsal"))]
+                    { let _ = payload; Err(TxReject::StakingRule) }
+                }
                 // The gate first: below SLASHING_EVIDENCE_ACTIVATION_EPOCH
                 // (u64::MAX today — INERT) a block carrying evidence is
                 // consensus-invalid on every node, byte-for-byte the verdict
@@ -6588,6 +6684,8 @@ mod tests {
     mod native_blocks {
         include!("transition/native_transfer_blocks_tests.rs");
         include!("transition/native_snapshot_replay_tests.rs");
+        include!("transition/native_bootstrap_blocks_tests.rs");
+        include!("transition/native_gateway_blocks_tests.rs");
     }
 
     mod funded_admission {
@@ -14079,7 +14177,10 @@ mod tests {
             PosTransaction::FundedDeposit(_) => {}
             // Sponsored native transfers conserve the native asset and settle
             // BLCH fees through the existing block reward path.
-            PosTransaction::NativeTransfer(_) => {}
+            PosTransaction::NativeTransfer(_)
+            | PosTransaction::NativeBootstrap(_)
+            | PosTransaction::NativeImport(_)
+            | PosTransaction::NativeWithdrawal(_) => {}
         }
 
         // Monotone under blocks and boundaries, and never above the cap.

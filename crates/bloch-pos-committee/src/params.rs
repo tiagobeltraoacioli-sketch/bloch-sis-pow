@@ -2011,6 +2011,88 @@ pub(crate) mod native_transfer_rehearsal {
     }
 }
 
+/// Dormant zero-supply registration and route enablement.
+pub const NATIVE_BOOTSTRAP_ACTIVATION_EPOCH: u64 = u64::MAX;
+const _: () = assert!(NATIVE_BOOTSTRAP_ACTIVATION_EPOCH == u64::MAX
+    || (NATIVE_STATE_ACTIVATION_EPOCH != u64::MAX
+        && NATIVE_BOOTSTRAP_ACTIVATION_EPOCH >= NATIVE_STATE_ACTIVATION_EPOCH));
+pub fn native_bootstrap_active(epoch: u64) -> bool {
+    #[cfg(all(test, feature = "native-dex-rehearsal"))]
+    if native_bootstrap_rehearsal::active(epoch) { return true; }
+    epoch_gate_active(epoch, NATIVE_BOOTSTRAP_ACTIVATION_EPOCH)
+}
+
+#[cfg(all(test, feature = "native-dex-rehearsal"))]
+pub(crate) mod native_bootstrap_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static EPOCH: Cell<u64> = const { Cell::new(u64::MAX) }; }
+    pub fn active(epoch: u64) -> bool {
+        EPOCH.with(|value| super::epoch_gate_active(epoch, value.get()))
+    }
+    pub fn run<T>(epoch: u64, f: impl FnOnce() -> T) -> T {
+        struct Restore(u64);
+        impl Drop for Restore {
+            fn drop(&mut self) { EPOCH.with(|value| value.set(self.0)); }
+        }
+        let _restore = Restore(EPOCH.with(|value| value.replace(epoch)));
+        f()
+    }
+}
+/// Dormant federated import.
+pub const NATIVE_IMPORT_ACTIVATION_EPOCH: u64 = u64::MAX;
+const _: () = assert!(NATIVE_IMPORT_ACTIVATION_EPOCH == u64::MAX
+    || (NATIVE_STATE_ACTIVATION_EPOCH != u64::MAX
+        && NATIVE_IMPORT_ACTIVATION_EPOCH >= NATIVE_STATE_ACTIVATION_EPOCH));
+pub fn native_import_active(epoch: u64) -> bool {
+    #[cfg(all(test, feature = "native-dex-rehearsal"))]
+    if native_import_rehearsal::active(epoch) { return true; }
+    epoch_gate_active(epoch, NATIVE_IMPORT_ACTIVATION_EPOCH)
+}
+
+#[cfg(all(test, feature = "native-dex-rehearsal"))]
+pub(crate) mod native_import_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static EPOCH: Cell<u64> = const { Cell::new(u64::MAX) }; }
+    pub fn active(epoch: u64) -> bool {
+        EPOCH.with(|value| super::epoch_gate_active(epoch, value.get()))
+    }
+    pub fn run<T>(epoch: u64, f: impl FnOnce() -> T) -> T {
+        struct Restore(u64);
+        impl Drop for Restore {
+            fn drop(&mut self) { EPOCH.with(|value| value.set(self.0)); }
+        }
+        let _restore = Restore(EPOCH.with(|value| value.replace(epoch)));
+        f()
+    }
+}
+/// Dormant native withdrawal.
+pub const NATIVE_WITHDRAWAL_ACTIVATION_EPOCH: u64 = u64::MAX;
+const _: () = assert!(NATIVE_WITHDRAWAL_ACTIVATION_EPOCH == u64::MAX
+    || (NATIVE_STATE_ACTIVATION_EPOCH != u64::MAX
+        && NATIVE_WITHDRAWAL_ACTIVATION_EPOCH >= NATIVE_STATE_ACTIVATION_EPOCH));
+pub fn native_withdrawal_active(epoch: u64) -> bool {
+    #[cfg(all(test, feature = "native-dex-rehearsal"))]
+    if native_withdrawal_rehearsal::active(epoch) { return true; }
+    epoch_gate_active(epoch, NATIVE_WITHDRAWAL_ACTIVATION_EPOCH)
+}
+
+#[cfg(all(test, feature = "native-dex-rehearsal"))]
+pub(crate) mod native_withdrawal_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static EPOCH: Cell<u64> = const { Cell::new(u64::MAX) }; }
+    pub fn active(epoch: u64) -> bool {
+        EPOCH.with(|value| super::epoch_gate_active(epoch, value.get()))
+    }
+    pub fn run<T>(epoch: u64, f: impl FnOnce() -> T) -> T {
+        struct Restore(u64);
+        impl Drop for Restore {
+            fn drop(&mut self) { EPOCH.with(|value| value.set(self.0)); }
+        }
+        let _restore = Restore(EPOCH.with(|value| value.replace(epoch)));
+        f()
+    }
+}
+
 #[cfg(all(test, feature = "native-dex-rehearsal"))]
 pub(crate) mod native_state_rehearsal {
     use std::cell::Cell;

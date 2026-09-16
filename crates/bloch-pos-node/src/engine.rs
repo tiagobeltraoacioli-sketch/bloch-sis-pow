@@ -5598,7 +5598,10 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
         // Block validation has its own committed-epoch gate. Mempool support
         // also needs sponsor accounting, conflict detection and pricing; until
         // those are integrated, never relay an opaque native payload as valid.
-        PosTransaction::NativeTransfer(_) => Err("native transfer mempool admission is not enabled"),
+        PosTransaction::NativeTransfer(_)
+        | PosTransaction::NativeBootstrap(_)
+        | PosTransaction::NativeImport(_)
+        | PosTransaction::NativeWithdrawal(_) => Err("native transaction mempool admission is not enabled"),
         PosTransaction::FundedDeposit(deposit) => {
             if !bloch_pos_committee::params::funded_validator_admission_active(wall_epoch) {
                 return Err("funded validator admission is not active: FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH is unarmed or not reached");
