@@ -658,6 +658,65 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
         verify(&preimage, &release, head.height, &[]),
         Err(ReviewCertificateError::InvalidSignature)
     );
+    // Exercise the actual observer-facing process protocol with real PQ signatures.
+    let mut wire = b"BLOCH-REVIEW-VERIFY-v1\0".to_vec();
+    wire.extend_from_slice(&head.height.to_be_bytes());
+    wire.extend_from_slice(&head.root);
+    wire.extend_from_slice(&head.height.to_be_bytes());
+    wire.extend_from_slice(&valid_until.to_be_bytes());
+    for bytes in [
+        source_route.source_domain.as_slice(),
+        source_route.native_domain.as_slice(),
+        source_route.native_asset.as_slice(),
+        source_route.token.as_slice(),
+        source_route.vault.as_slice(),
+    ] {
+        wire.extend_from_slice(bytes);
+    }
+    wire.extend_from_slice(&source_route.cap.to_be_bytes());
+    wire.extend_from_slice(&release.nonce.to_be_bytes());
+    wire.extend_from_slice(&release.recipient);
+    wire.extend_from_slice(&release.amount.to_be_bytes());
+    wire.extend_from_slice(&release.native_burn);
+    for bytes in [
+        review_authority.as_slice(),
+        signature.as_slice(),
+        preimage.as_slice(),
+    ] {
+        wire.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        wire.extend_from_slice(bytes);
+    }
+    let run_verifier = |input: &[u8]| {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new(env!("CARGO_BIN_EXE_verify-redemption-review"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let output = run_verifier(&wire);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!(
+            "{}\n",
+            review_commitment
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        )
+    );
+    for invalid in [&wire[..wire.len() - 1], b"unknown-version".as_slice()] {
+        let output = run_verifier(invalid);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+    }
+    wire.push(0);
+    assert!(!run_verifier(&wire).status.success());
     let value: serde_json::Value = serde_json::from_str(&exported).unwrap();
     assert_eq!(value.as_object().unwrap().len(), 7);
     assert_eq!(value["nonce"], release.nonce.to_string());

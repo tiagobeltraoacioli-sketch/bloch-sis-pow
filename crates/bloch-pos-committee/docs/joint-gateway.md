@@ -211,9 +211,15 @@ and enforces the certificate's height validity window.
 
 The returned commitment authenticates an attestation only. It is not consensus
 finality, external custody evidence, or permission to settle a redemption. Trust
-inputs must never be taken from the untrusted export. The Python source-chain
-observer is not yet wired to this Rust API; operational authority provisioning,
-transport integration, and durable settlement remain separate work.
+inputs must never be taken from the untrusted export. The `verify-redemption-review` executable exposes this API through a bounded,
+versioned stdin protocol for the Python source-chain observer. Build it with
+`cargo build -p bloch-ustav --features native-dex-host --bin verify-redemption-review`.
+It reads at most 65,537 bytes, rejects input over 65,536 bytes and trailing data,
+and returns only the verified lowercase commitment plus newline on success.
+The observer supplies operator-controlled trust separately from the certificate;
+its release-observer documentation defines the wire format. Operational authority
+provisioning, independently authenticated live state, and durable settlement
+remain separate work. The executable performs no network calls or state writes.
 
 ### Existing integration coverage
 

@@ -19,3 +19,8 @@ sha3 = { version = "0.10", optional = true }
 bloch-pos-committee = { path = "../bloch-pos-committee", features = ["native-dex-rehearsal"] }
 serde_json = "1.0"
 sha3 = "0.10"
+
+[[bin]]
+name = "verify-redemption-review"
+path = "src/bin/verify-redemption-review.rs"
+required-features = ["native-dex-host"]
