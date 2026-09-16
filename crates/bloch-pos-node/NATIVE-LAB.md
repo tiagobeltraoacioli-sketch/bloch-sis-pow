@@ -80,3 +80,19 @@ accounting: supply, imported, burned, next release nonce, native commitment and 
 first release's burn identity. It does not report owner balances, so locked pool
 reserves cannot be mistaken for spendable wallet outputs. Values are explicitly
 synthetic and `settlement` remains `none` even after a native burn.
+
+## Wallet review projection RPC
+
+`getnativewalletview` takes no parameters and is available only for the selected
+BPOSLAB1 laboratory instance. It returns `format`, `domain`, `genesis`, `head`,
+`height` (the current consensus slot, as a decimal string), `stateRoot`, `trust`,
+and `context`. The context contains `nativeSnapshotHex`,
+`nativeCommitmentHex`, the complete `utxos` array (`txid`, `vout`, `value`,
+`scriptHash`), `baseFeeMillisatPerGas`, `blockGasUsed`, `blockTxBytes`, and `epoch`.
+All integers in the context are decimal strings; hashes have no `0x` prefix.
+
+The endpoint refuses uninitialized native state, more than 4096 base UTXOs, or
+a native snapshot larger than 4 MiB. It never truncates state. This trusted-host
+projection supports typed wallet review; it is not a finality proof. Its UTXOs
+include custody reserves required for snapshot validation and must not be summed
+as a spendable wallet balance. The wallet must apply the restored custody locks.

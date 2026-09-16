@@ -29,12 +29,14 @@ type Result<T> = std::result::Result<T, SnapshotError>;
 struct Writer {
     bytes: Vec<u8>,
     allocations: usize,
+    limit: usize,
 }
 impl Writer {
-    fn new() -> Self {
+    fn new(limit: usize) -> Self {
         Self {
             bytes: Vec::new(),
             allocations: 0,
+            limit,
         }
     }
     fn put(&mut self, bytes: &[u8]) -> Result<()> {
@@ -42,7 +44,7 @@ impl Writer {
             .bytes
             .len()
             .checked_add(bytes.len())
-            .is_none_or(|n| n > MAX_SNAPSHOT_BYTES)
+            .is_none_or(|n| n > self.limit)
         {
             return Err(SnapshotError::ResourceLimit);
         }
@@ -466,6 +468,14 @@ impl NativeState {
     /// Canonical state has zero rehearsal fee escrow; importing that escrow is
     /// refused rather than silently changing consensus accounting.
     pub fn encode_snapshot(&self) -> Result<Vec<u8>> {
+        self.encode_snapshot_bounded(MAX_SNAPSHOT_BYTES)
+    }
+
+    /// Encode with a stricter caller budget; never return a truncated snapshot.
+    pub fn encode_snapshot_bounded(&self, limit: usize) -> Result<Vec<u8>> {
+        if limit > MAX_SNAPSHOT_BYTES {
+            return Err(SnapshotError::ResourceLimit);
+        }
         if self.base_fees != 0 || self.priority_fees != 0 {
             return Err(SnapshotError::NonCanonicalFees);
         }
@@ -483,7 +493,7 @@ impl NativeState {
             paired_reserves: self.paired_reserves.values().cloned().collect(),
             initial_pools: self.initial_pools.values().cloned().collect(),
         };
-        let mut out = Writer::new();
+        let mut out = Writer::new(limit);
         MAGIC.write(&mut out)?;
         1u16.write(&mut out)?;
         payload.write(&mut out)?;

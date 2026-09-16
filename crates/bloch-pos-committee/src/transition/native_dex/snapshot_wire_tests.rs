@@ -51,6 +51,11 @@ fn deterministic_populated_roundtrip_preserves_native_commitment() {
     let (base, native) = populated();
     let bytes = native.encode_snapshot().unwrap();
     assert_eq!(bytes, native.clone().encode_snapshot().unwrap());
+    assert_eq!(bytes, native.encode_snapshot_bounded(bytes.len()).unwrap());
+    assert_eq!(
+        native.encode_snapshot_bounded(bytes.len() - 1),
+        Err(SnapshotError::ResourceLimit)
+    );
     let restored =
         NativeState::restore_snapshot(&bytes, &base, native.commitment(), &BoundVerifier).unwrap();
     assert_eq!(native, restored);
@@ -136,7 +141,7 @@ fn invalid_native_supply_and_duplicate_output_records_are_rejected() {
         } else {
             payload.native.gateway.native.tokens[0].1.supply += 1;
         }
-        let mut writer = Writer::new();
+        let mut writer = Writer::new(MAX_SNAPSHOT_BYTES);
         MAGIC.write(&mut writer).unwrap();
         1u16.write(&mut writer).unwrap();
         payload.write(&mut writer).unwrap();

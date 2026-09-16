@@ -93,6 +93,7 @@ use std::path::PathBuf;
 const ROUTED: &[(&str, &str)] = &[
     ("getchaininfo", "ChainInfo"),
     // Source scan sees the laboratory-only cfg arm; default routing still rejects it.
+    ("getnativewalletview", "NativeWalletView"),
     ("getnativelabstate", "NativeLabState"),
     ("getbuildinfo", "BuildInfo"),
     ("getblockcount", "BlockCount"),

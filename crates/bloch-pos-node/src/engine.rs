@@ -4076,6 +4076,35 @@ impl Engine {
     fn serve_rpc(&mut self, req: RpcRequest) -> RpcResult {
         match req {
             #[cfg(feature="native-lab")]
+            RpcRequest::NativeWalletView => {
+                if !self.tr.native_lab_matches(&self.state) {
+                    return Err(rpc::RpcError::new(-32601, "native laboratory is not selected"));
+                }
+                let view = self.state.native_lab_wallet_view()
+                    .map_err(|e| rpc::RpcError::new(-32000, e))?;
+                Ok(Json::obj(vec![
+                    ("format", Json::s("BPOSLAB1")),
+                    ("domain", Json::hex(&self.state.admission_network_domain().unwrap())),
+                    ("genesis", Json::hex(self.manifest.genesis_id().as_bytes())),
+                    ("head", Json::hex(self.head_id().as_bytes())),
+                    ("height", Json::sat(self.state.slot() as u128)),
+                    ("stateRoot", Json::hex(&self.head_state_root())),
+                    ("trust", Json::s("trusted-host-projection-not-finality-proof")),
+                    ("context", Json::obj(vec![
+                        ("nativeSnapshotHex", Json::s(crate::codec::hex(&view.snapshot))),
+                        ("nativeCommitmentHex", Json::hex(&view.commitment)),
+                        ("baseFeeMillisatPerGas", Json::sat(view.base_fee)),
+                        ("blockGasUsed", Json::sat(view.block_gas_used as u128)),
+                        ("blockTxBytes", Json::sat(view.block_tx_bytes as u128)),
+                        ("epoch", Json::sat(view.epoch as u128)),
+                        ("utxos", Json::Arr(view.utxos.iter().map(|u| Json::obj(vec![
+                            ("txid", Json::hex(&u.txid)), ("vout", Json::sat(u.vout as u128)),
+                            ("value", Json::sat(u.value as u128)), ("scriptHash", Json::hex(&u.script_hash)),
+                        ])).collect())),
+                    ])),
+                ]))
+            }
+            #[cfg(feature="native-lab")]
             RpcRequest::NativeLabState {asset,route} => {
                 if !self.tr.native_lab_matches(&self.state) {
                     Err(rpc::RpcError::new(-32601,"native laboratory is not selected"))

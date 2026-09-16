@@ -135,3 +135,38 @@ impl CommittedState {
         self.native_state.as_ref()?.lab_route_report(asset, route)
     }
 }
+
+/// Complete trusted-host review context. This is not a finality proof.
+pub struct WalletView {
+    pub snapshot: Vec<u8>,
+    pub commitment: [u8; 32],
+    pub utxos: Vec<crate::state_root::EutxoEntry>,
+    pub base_fee: u128,
+    pub block_gas_used: u64,
+    pub block_tx_bytes: u64,
+    pub epoch: u64,
+}
+impl CommittedState {
+    pub fn native_lab_wallet_view(&self) -> Result<WalletView, &'static str> {
+        let utxos: Vec<_> = self.utxos().take(4097).cloned().collect();
+        if utxos.len() > 4096 {
+            return Err("wallet UTXO projection exceeds limit");
+        }
+        let native = self
+            .native_state
+            .as_ref()
+            .ok_or("native state not initialized")?;
+        let snapshot = native
+            .encode_snapshot_bounded(4 * 1024 * 1024)
+            .map_err(|_| "wallet native snapshot exceeds limit or is noncanonical")?;
+        Ok(WalletView {
+            snapshot,
+            commitment: native.commitment(),
+            utxos,
+            base_fee: self.base_fee_millisat_per_gas,
+            block_gas_used: self.block_gas_used,
+            block_tx_bytes: self.block_tx_bytes,
+            epoch: self.epoch,
+        })
+    }
+}
