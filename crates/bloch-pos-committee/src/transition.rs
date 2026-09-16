@@ -6587,6 +6587,7 @@ mod tests {
     #[cfg(feature = "native-dex-rehearsal")]
     mod native_blocks {
         include!("transition/native_transfer_blocks_tests.rs");
+        include!("transition/native_snapshot_replay_tests.rs");
     }
 
     mod funded_admission {

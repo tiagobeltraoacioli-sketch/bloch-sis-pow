@@ -2553,8 +2553,11 @@ impl Engine {
     /// same txid — a transaction included again at a new slot on a winning
     /// branch is exactly the case where the newer slot is the true answer.
     fn note_tx_slots(&mut self, slot: u64, txs: &[PosTransaction]) {
-        for tx in txs {
-            let id = tx.txid();
+        self.note_tx_ids(slot, txs.iter().map(PosTransaction::txid));
+    }
+
+    fn note_tx_ids(&mut self, slot: u64, ids: impl IntoIterator<Item = [u8; 32]>) {
+        for id in ids {
             if self.tx_slot_index.insert(id, slot).is_none() {
                 self.tx_slot_index_order.push_back(id);
             }
@@ -3579,6 +3582,10 @@ impl Engine {
         // Post-states of the branch, so the ring is refilled for the branch
         // that just won without recomputing anything.
         let mut applied: Vec<([u8; 32], Arc<CommittedState>)> = Vec::with_capacity(branch.len());
+        // Keep transaction observations private until the entire branch passes.
+        // A valid prefix followed by an invalid block must not leak inclusion
+        // status or evict existing entries from the bounded observation index.
+        let mut branch_transactions = Vec::with_capacity(branch.len());
         for env in &branch {
             let envelope = ProposalEnvelope {
                 header: env.header.clone(),
@@ -3597,13 +3604,10 @@ impl Engine {
                 .apply_block(pre, &envelope, &env.body.attestations, &txs)
             {
                 Ok(post) => {
-                    // R4 F-11: the whole branch is guaranteed adopted from
-                    // here — every remaining block in it either validates
-                    // too or this function returns `false` before any of
-                    // this is observable — so recording now, rather than in
-                    // a second pass after `self.chain` is rebuilt below, does
-                    // not risk indexing a branch that never lands.
-                    self.note_tx_slots(env.header.slot, &txs);
+                    branch_transactions.push((
+                        env.header.slot,
+                        txs.iter().map(PosTransaction::txid).collect::<Vec<_>>(),
+                    ));
                     applied.push((*env.block_id().as_bytes(), Arc::new(post)));
                 }
                 Err(err) => {
@@ -3629,6 +3633,11 @@ impl Engine {
             .collect();
         for (slot, txs) in stale {
             self.forget_tx_slots_if_stale(slot, &txs);
+        }
+        // Every block is valid now. Publish after removing the old tail so an
+        // identical transaction re-included at the same slot is retained too.
+        for (slot, ids) in branch_transactions {
+            self.note_tx_ids(slot, ids);
         }
         let st = applied
             .last()
@@ -11460,6 +11469,9 @@ mod finality_latch_tests {
 #[cfg(test)]
 #[path = "engine/validator_admission_tests.rs"]
 mod validator_admission_tests;
+
+#[cfg(test)]
+mod native_replay_tests;
 
 #[cfg(test)]
 mod branch_gap_repair_tests {
