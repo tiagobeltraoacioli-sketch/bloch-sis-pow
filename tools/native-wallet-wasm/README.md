@@ -124,3 +124,25 @@ certificates, partial burns, replay, and changed recipient, amount or expiry.
 Use `NATIVE_WASM_WITHDRAWAL_VECTOR_PATH` to export its vector and
 `NATIVE_WASM_WITHDRAWAL_SIGNED_PATH` to execute the crosscheck driver's exact WASM
 result. Laboratory features do not enable production activation gates.
+
+### Existing encrypted accounts
+
+`open_keypair` accepts the existing canonical hybrid public/secret envelopes only
+inside the dedicated account worker. It signs and verifies an internal,
+domain-bound challenge before installing the account; the proof is never
+returned. `open_mnemonic` resolves the existing crypto library's explicit V1
+PBKDF2-SHA256 and V2 BIP39-SHA512 derivations against the expected public key.
+It never picks a new default or migrates an account. Public 12/24-word fixtures
+match the separately pinned legacy wallet WASM byte-for-byte.
+
+The browser account worker decrypts existing device vaults and CLI simple/HD
+files with their original formats. Only public account metadata and reviewed
+canonical signed transactions leave that worker. Neither raw-key import nor
+mnemonic import is exposed as a host worker command. Host account/domain checks,
+current chain capabilities and explicit confirmation remain required; importing
+an account does not activate consensus operations or prove chain finality.
+
+`NATIVE_ACCOUNT_VECTOR_PATH` exports the public typed test fixture;
+`NATIVE_ACCOUNT_SIGNED_PATH` cross-verifies an actual browser-worker result
+through the Rust executor and its canonical transaction ID. Never use these
+published fixture mnemonics for funds.

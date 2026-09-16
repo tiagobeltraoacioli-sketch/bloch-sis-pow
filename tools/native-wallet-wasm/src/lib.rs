@@ -78,6 +78,63 @@ impl Session {
             pending: None,
         })
     }
+    /// Existing-account import stays inside an isolated custody worker. A proof
+    /// binds the canonical secret to the expected public account before use.
+    pub fn open_keypair(
+        public: Vec<u8>,
+        secret: Vec<u8>,
+        domain: [u8; 32],
+    ) -> Result<Self, &'static str> {
+        let secret = Zeroizing::new(secret);
+        if domain == [0; 32] || !crypto::valid_native_hybrid_key(&public) || secret.len() > 16384 {
+            return Err("invalid existing account");
+        }
+        let mut challenge = Sha3_256::new();
+        challenge.update(b"POSTERN-NATIVE-ACCOUNT-IMPORT-v1");
+        challenge.update(domain);
+        challenge.update(&public);
+        let challenge: [u8; 32] = challenge.finalize().into();
+        let proof = crypto::sign(&secret, &challenge).map_err(|_| "invalid account secret")?;
+        if !crypto::verify(&public, &challenge, &proof) {
+            return Err("account key mismatch");
+        }
+        Ok(Self {
+            domain,
+            public,
+            secret,
+            pending: None,
+        })
+    }
+    /// Resolve historical seed versions by the existing public account, never
+    /// choose a default derivation or migrate funds to another address.
+    pub fn open_mnemonic(
+        phrase: &str,
+        expected: &[u8],
+        domain: [u8; 32],
+    ) -> Result<Self, &'static str> {
+        use bloch_crypto::wallet::seed::{SeedPhrase, SeedVersion};
+        if phrase.len() > 1024 || !crypto::valid_native_hybrid_key(expected) {
+            return Err("invalid existing mnemonic account");
+        }
+        let parsed = SeedPhrase::parse(phrase).map_err(|_| "invalid mnemonic")?;
+        for version in [
+            SeedVersion::V1LegacyPbkdf2Sha256,
+            SeedVersion::V2Bip39Sha512,
+        ] {
+            let seed = Zeroizing::new(
+                parsed
+                    .to_seed_bytes_versioned(version, "")
+                    .map_err(|_| "seed derivation refused")?,
+            );
+            let (public, secret) = crypto::generate_keypair_from_seed(&seed[..32])
+                .map_err(|_| "key derivation refused")?;
+            let secret = Zeroizing::new(secret);
+            if public == expected {
+                return Self::open_keypair(public, secret.to_vec(), domain);
+            }
+        }
+        Err("mnemonic does not match existing account")
+    }
     pub fn public_key(&self) -> &[u8] {
         &self.public
     }

@@ -54,6 +54,9 @@ fn unsigned_frame_must_reserve_outer_bytes_before_consent() {
 }
 fn fixture() -> (State, Vec<u8>, serde_json::Value) {
     let (key, secret) = crypto::generate_keypair_from_seed(&SEED).unwrap();
+    fixture_keypair(key, secret)
+}
+fn fixture_keypair(key: Vec<u8>, secret: Vec<u8>) -> (State, Vec<u8>, serde_json::Value) {
     // Falcon compressed signatures vary in length. Reserve the maximum hybrid
     // witness size before consent; declaration/fee never changes during signing.
     let placeholder = vec![0; 4593];
@@ -281,4 +284,77 @@ fn abi_revalidates_snapshot_context_and_consumes_malformed_confirmation() {
     assert!(abi::dispatch(json!({"method":"review","args":broken})).is_err());
     abi::dispatch(json!({"method":"lock","args":{}})).unwrap();
     assert!(abi::dispatch(json!({"method":"review","args":args})).is_err());
+}
+
+#[test]
+fn existing_account_import_matches_pinned_legacy_core_and_rejects_other_keys() {
+    let vectors: serde_json::Value =
+        serde_json::from_str(include_str!("tests/existing-account-vectors.json")).unwrap();
+    for row in vectors.as_array().unwrap() {
+        let public = hex::decode(row["public_key_hex"].as_str().unwrap()).unwrap();
+        let session =
+            Session::open_mnemonic(row["mnemonic"].as_str().unwrap(), &public, [42; 32]).unwrap();
+        assert_eq!(session.public_key(), public);
+    }
+    let (public, secret) = crypto::generate_keypair_from_seed(&[7; 32]).unwrap();
+    assert!(Session::open_keypair(public.clone(), secret.clone(), [42; 32]).is_ok());
+    assert!(Session::open_keypair(public.clone(), secret.clone(), [0; 32]).is_err());
+    let (_, foreign) = crypto::generate_keypair_from_seed(&[8; 32]).unwrap();
+    assert!(Session::open_keypair(public.clone(), foreign, [42; 32]).is_err());
+    assert!(Session::open_keypair(public.clone(), secret[4..].to_vec(), [42; 32]).is_err());
+    assert!(
+        Session::open_mnemonic(vectors[0]["mnemonic"].as_str().unwrap(), &public, [42; 32])
+            .is_err()
+    );
+}
+
+#[test]
+fn existing_encrypted_account_typed_signature_executes_without_changing_identity() {
+    let vectors: serde_json::Value =
+        serde_json::from_str(include_str!("tests/existing-account-vectors.json")).unwrap();
+    let row = &vectors[0];
+    let public = hex::decode(row["public_key_hex"].as_str().unwrap()).unwrap();
+    let mut session =
+        Session::open_mnemonic(row["mnemonic"].as_str().unwrap(), &public, DOMAIN).unwrap();
+    let (mut state, packet, context) = fixture_keypair(public, session.secret.to_vec());
+    let review = session.prepare(&state, &packet, 1).unwrap();
+    let signed = session.sign(review.id, &state, &packet, 1, true).unwrap();
+    let signed = if let Ok(path) = std::env::var("NATIVE_ACCOUNT_SIGNED_PATH") {
+        let r: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let bytes = hex::decode(r["transactionHex"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            r["txid"],
+            hex::encode(PosTransaction::from_canonical_bytes(&bytes).unwrap().txid())
+        );
+        bytes
+    } else {
+        signed
+    };
+    let PosTransaction::NativePool(payload) =
+        PosTransaction::from_canonical_bytes(&signed).unwrap()
+    else {
+        panic!()
+    };
+    pool_wire::apply_encoded(&mut state, payload.as_bytes(), 1, &Hybrid, &Hybrid).unwrap();
+    if let Ok(path) = std::env::var("NATIVE_ACCOUNT_VECTOR_PATH") {
+        let artifact = json!({"publicFixtureMnemonic":row["mnemonic"],"publicKeyHex":row["public_key_hex"],"address":row["address"],"domainHex":hex::encode(DOMAIN),"transactionHex":hex::encode(packet),"context":context,"height":"1"});
+        std::fs::write(path, serde_json::to_vec_pretty(&artifact).unwrap()).unwrap();
+    }
+}
+
+#[test]
+fn export_public_existing_hd_account_fixture_when_requested() {
+    if let Ok(path) = std::env::var("NATIVE_ACCOUNT_HD_FIXTURE_PATH") {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("tests/existing-account-vectors.json")).unwrap();
+        let wallet = bloch_crypto::hd_wallet::HdWallet::recover(
+            vectors[0]["mnemonic"].as_str().unwrap(),
+            Some("public-passphrase"),
+            "Public-fixture-password-only",
+            false,
+            2,
+        )
+        .unwrap();
+        wallet.save(std::path::Path::new(&path)).unwrap();
+    }
 }

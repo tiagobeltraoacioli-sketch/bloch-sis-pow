@@ -72,8 +72,10 @@ fn context(v: &Value, domain: [u8; 32]) -> Result<State, &'static str> {
 }
 pub(crate) fn dispatch(mut request: Value) -> Result<Value, &'static str> {
     let result = dispatch_inner(&mut request);
-    if let Some(Value::String(seed)) = request.get_mut("args").and_then(|a| a.get_mut("seedHex")) {
-        seed.zeroize();
+    for name in ["seedHex", "secretKeyHex", "mnemonic"] {
+        if let Some(Value::String(secret)) = request.get_mut("args").and_then(|a| a.get_mut(name)) {
+            secret.zeroize();
+        }
     }
     if result.is_err() {
         SESSION.with(|s| {
@@ -87,6 +89,32 @@ pub(crate) fn dispatch(mut request: Value) -> Result<Value, &'static str> {
 fn dispatch_inner(request: &mut Value) -> Result<Value, &'static str> {
     let method = string(&request, "method")?.to_owned();
     let args = request.get_mut("args").ok_or("missing args")?;
+    if method == "open_mnemonic" {
+        SESSION.with(|s| *s.borrow_mut() = None);
+        let domain = hash(args, "domainHex")?;
+        let public = bytes(args, "publicKeyHex", 8192)?;
+        let phrase = Zeroizing::new(string(args, "mnemonic")?.to_owned());
+        if let Some(Value::String(raw)) = args.get_mut("mnemonic") {
+            raw.zeroize();
+        }
+        let session = Session::open_mnemonic(&phrase, &public, domain)?;
+        let result = json!({"publicKeyHex":hex::encode(session.public_key()),"domainHex":hex::encode(domain)});
+        SESSION.with(|s| *s.borrow_mut() = Some(session));
+        return Ok(result);
+    }
+    if method == "open_keypair" {
+        SESSION.with(|s| *s.borrow_mut() = None);
+        let domain = hash(args, "domainHex")?;
+        let public = bytes(args, "publicKeyHex", 8192)?;
+        let secret = Zeroizing::new(bytes(args, "secretKeyHex", 16384)?);
+        if let Some(Value::String(raw)) = args.get_mut("secretKeyHex") {
+            raw.zeroize();
+        }
+        let session = Session::open_keypair(public, secret.to_vec(), domain)?;
+        let result = json!({"publicKeyHex":hex::encode(session.public_key()),"domainHex":hex::encode(domain)});
+        SESSION.with(|s| *s.borrow_mut() = Some(session));
+        return Ok(result);
+    }
     if method == "open" {
         SESSION.with(|s| *s.borrow_mut() = None);
         let domain = hash(args, "domainHex")?;
