@@ -25,13 +25,23 @@ impl<'a> Reader<'a> {
     }
 }
 fn verify(input: &[u8]) -> Result<[u8; 32], ()> {
-    let mut r = Reader(input.strip_prefix(b"BLOCH-REVIEW-VERIFY-v1\0").ok_or(())?);
+    let mut r = Reader(input.strip_prefix(b"BLOCH-REVIEW-VERIFY-v2\0").ok_or(())?);
     let checkpoint = Checkpoint {
         height: r.number()?,
         root: r.fixed()?,
     };
     let current_height = r.number()?;
     let valid_until = r.number()?;
+    let max_checkpoint_age = r.number()?;
+    let max_certificate_lifetime = r.number()?;
+    let age = current_height.checked_sub(checkpoint.height).ok_or(())?;
+    let lifetime = valid_until.checked_sub(checkpoint.height).ok_or(())?;
+    if age > max_checkpoint_age
+        || lifetime > max_certificate_lifetime
+        || current_height > valid_until
+    {
+        return Err(());
+    }
     let route = Route {
         source_domain: r.fixed()?,
         native_domain: r.fixed()?,

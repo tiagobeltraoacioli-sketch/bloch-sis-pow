@@ -659,11 +659,13 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
         Err(ReviewCertificateError::InvalidSignature)
     );
     // Exercise the actual observer-facing process protocol with real PQ signatures.
-    let mut wire = b"BLOCH-REVIEW-VERIFY-v1\0".to_vec();
+    let mut wire = b"BLOCH-REVIEW-VERIFY-v2\0".to_vec();
     wire.extend_from_slice(&head.height.to_be_bytes());
     wire.extend_from_slice(&head.root);
     wire.extend_from_slice(&head.height.to_be_bytes());
     wire.extend_from_slice(&valid_until.to_be_bytes());
+    wire.extend_from_slice(&0u64.to_be_bytes());
+    wire.extend_from_slice(&10u64.to_be_bytes());
     for bytes in [
         source_route.source_domain.as_slice(),
         source_route.native_domain.as_slice(),
@@ -767,6 +769,19 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
             b"native-review-process-probe: 9 cases passed\n"
         );
     }
+    // The executable enforces policy even without the Python caller.
+    let tag_len = b"BLOCH-REVIEW-VERIFY-v2\0".len();
+    let mut excessive_lifetime = wire.clone();
+    let lifetime_offset = tag_len + 8 + 32 + 8 + 8 + 8;
+    excessive_lifetime[lifetime_offset..lifetime_offset + 8].copy_from_slice(&9u64.to_be_bytes());
+    assert!(!run_verifier(&excessive_lifetime).status.success());
+    let mut stale = wire.clone();
+    let current_offset = tag_len + 8 + 32;
+    stale[current_offset..current_offset + 8].copy_from_slice(&(head.height + 1).to_be_bytes());
+    assert!(!run_verifier(&stale).status.success());
+    let mut legacy = wire.clone();
+    legacy[tag_len - 2] = b'1';
+    assert!(!run_verifier(&legacy).status.success());
     wire.push(0);
     assert!(!run_verifier(&wire).status.success());
     let value: serde_json::Value = serde_json::from_str(&exported).unwrap();

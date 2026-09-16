@@ -286,3 +286,12 @@ Committed test reviews and public PQ certificates are sent to that probe over
 stdin; private keys stay inside the native test process. The probe verifies the
 real executable and rejects eight altered inputs per fixture. This check needs
 Python 3 and both repositories and does not run unless explicitly configured.
+
+The verifier process now requires `BLOCH-REVIEW-VERIFY-v2` requests. Two u64
+big-endian operator policy limits follow expiry: maximum checkpoint age and
+maximum certificate lifetime. Rust enforces both limits with checked subtraction
+before signature verification; v1 requests are refused. Upgrade the bridge
+adapter and native executable together. Review commitments and certificate
+signing formats are unchanged. This process policy does not supply authenticated
+live native heights or consensus finality. The lower-level library verification
+API remains independent of operator-specific freshness limits.
