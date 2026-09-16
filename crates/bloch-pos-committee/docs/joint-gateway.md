@@ -357,3 +357,16 @@ never bypass reexecution or signature verification. Real PQ tests remove an
 admitted suffix, reject the stale candidate, restore the suffix, and commit the
 matching candidate; they also reject changed joint-root bytes. Host approval and
 live consensus integration remain external requirements, not inferred trust.
+
+Hosts that require exact candidate approval should create queues with
+`PendingBatch::new_requiring_expected_candidate`. This immutable per-queue policy
+refuses both ordinary `commit` and roots-only `commit_with_base_roots` with
+`ExpectedCandidateRequired`, before rebuilding or writing anything. Only
+`commit_expected_candidate` can persist that queue. Rejection preserves frames,
+height and journal state; the existing closed-batch error takes precedence after
+success. Queue edits do not remove the policy. The ordinary constructor remains
+available for explicitly local rehearsal, and lower-level journal APIs retain
+their documented scope. This is caller-error protection, not a security boundary
+against arbitrary host code or an implementation of consensus authentication.
+Real PQ integration tests exercise refused downgrade attempts followed by root
+mismatch, edited-queue rejection, successful exact commit and restart.

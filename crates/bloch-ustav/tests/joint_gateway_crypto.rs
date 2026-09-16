@@ -571,10 +571,21 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
         assert_eq!(std::fs::read(&bound_path).unwrap(), before);
         assert_eq!(bound.checkpoint(), original_head);
     }
-    let mut bound_pending = PendingBatch::new(&bound, 4).unwrap();
+    let mut bound_pending = PendingBatch::new_requiring_expected_candidate(&bound, 4).unwrap();
     for frame in frames {
         bound_pending.admit(&bound, frame, 4).unwrap();
     }
+    assert!(matches!(
+        bound_pending.commit(&mut bound, 4),
+        Err(bloch_ustav::dex_admission::Error::ExpectedCandidateRequired)
+    ));
+    assert!(matches!(
+        bound_pending.commit_with_base_roots(&mut bound, 4, roots),
+        Err(bloch_ustav::dex_admission::Error::ExpectedCandidateRequired)
+    ));
+    assert_eq!(std::fs::read(&bound_path).unwrap(), before);
+    assert_eq!(bound_pending.len(), frames.len());
+    assert!(!bound_pending.is_closed());
     let queued_bytes = bound_pending.wire_bytes();
     for wrong_parent in [true, false] {
         let mut wrong = roots;
@@ -584,7 +595,7 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
             wrong.post[0] ^= 1;
         }
         assert!(bound_pending
-            .commit_with_base_roots(&mut bound, 4, wrong)
+            .commit_expected_candidate(&mut bound, 4, wrong, &candidate)
             .is_err());
         assert_eq!(bound_pending.len(), frames.len());
         assert_eq!(bound_pending.wire_bytes(), queued_bytes);

@@ -15,6 +15,7 @@ pub enum Error {
     Journal(dex_journal::Error),
     StaleParent,
     CandidateChanged,
+    ExpectedCandidateRequired,
     HeightRegression,
     Closed,
     Duplicate,
@@ -85,6 +86,7 @@ pub struct PendingBatch {
     frames: Vec<Vec<u8>>,
     wire_bytes: u64,
     closed: bool,
+    require_expected_candidate: bool,
 }
 impl PendingBatch {
     pub fn new(journal: &Journal, height: u64) -> Result<Self, Error> {
@@ -101,8 +103,18 @@ impl PendingBatch {
             frames: Vec::new(),
             wire_bytes: 0,
             closed: false,
+            require_expected_candidate: false,
         })
     }
+    /// Create a queue whose commit policy cannot be downgraded during its life.
+    /// Only commit_expected_candidate may persist it; ordinary and roots-only
+    /// commits are refused. Host expectations still need independent validation.
+    pub fn new_requiring_expected_candidate(journal: &Journal, height: u64) -> Result<Self, Error> {
+        let mut batch = Self::new(journal, height)?;
+        batch.require_expected_candidate = true;
+        Ok(batch)
+    }
+
     pub fn len(&self) -> usize {
         self.frames.len()
     }
@@ -364,6 +376,12 @@ impl PendingBatch {
         roots: Option<pool_candidate::BaseRoots>,
         expected: Option<&[u8]>,
     ) -> Result<pool_batch::Outcome, Error> {
+        if self.closed {
+            return Err(Error::Closed);
+        }
+        if self.require_expected_candidate && (roots.is_none() || expected.is_none()) {
+            return Err(Error::ExpectedCandidateRequired);
+        }
         if expected.is_some_and(|bytes| {
             bytes.is_empty() || bytes.len() > pool_candidate::MAX_ENCODED_BYTES
         }) {
