@@ -18,6 +18,8 @@ pub enum Error {
     BasePostMismatch,
     BlockBindingMismatch,
     BlockParentMismatch,
+    HeaderMismatch,
+    HeaderSignature,
     InvalidCount,
     CommitmentMismatch,
     Batch(pool_batch::Error),
@@ -315,6 +317,59 @@ pub fn prepare_for_block<'state, 'bytes>(
         state,
         candidate,
         context.height,
+        roots,
+        base_verifier,
+        native_verifier,
+    )
+}
+
+/// Experimental single-candidate body binding to the existing signed header
+/// encoding. NOT full consensus validation: the host must authenticate proposer
+/// eligibility, parent context, RANDAO, attestations and activation separately.
+/// The live transaction codec does not admit this candidate body format yet.
+pub fn prepare_for_signed_header<'state, 'bytes>(
+    state: &'state mut State,
+    candidate: &'bytes [u8],
+    parent: BlockParent,
+    header: &crate::header::BlockHeaderV4,
+    proposer_key: &[u8],
+    proposer_signature: &[u8],
+    base_verifier: &dyn SignatureVerifier,
+    native_verifier: &dyn Verifier,
+) -> Result<Prepared<'state, 'bytes>, Error> {
+    if candidate.is_empty() || candidate.len() > MAX_ENCODED_BYTES {
+        return Err(wire::Error::TooLarge.into());
+    }
+    let height = parent
+        .height
+        .checked_add(1)
+        .ok_or(Error::BlockParentMismatch)?;
+    let context = BlockContext {
+        parent_block: header.parent,
+        slot: header.slot,
+        height,
+    };
+    validate_block_parent(parent, context)?;
+    if header.version != 4 || header.body_root != crate::derive::body_root(&[candidate.to_vec()]) {
+        return Err(Error::HeaderMismatch);
+    }
+    // The caller supplies an independently resolved proposer key, never a key
+    // taken from untrusted header metadata. No permissive verifier is selected here.
+    if !base_verifier.verify_with_key(
+        proposer_key,
+        &header.proposal_signing_root(),
+        proposer_signature,
+    ) {
+        return Err(Error::HeaderSignature);
+    }
+    let roots = BaseRoots {
+        parent: state.base.compute_root(),
+        post: header.state_root,
+    };
+    prepare_with_base_roots(
+        state,
+        candidate,
+        height,
         roots,
         base_verifier,
         native_verifier,

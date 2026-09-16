@@ -702,6 +702,84 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
     assert_eq!(block_journal.checkpoint(), head);
     drop(block_journal);
     std::fs::remove_file(&block_path).unwrap();
+    // Real hybrid signature covers the canonical header and candidate body.
+    // This tests binding only, not validator scheduling or live block activation.
+    let mut signed_header = BlockHeaderV4 {
+        version: 4,
+        parent: parent_block.block_id,
+        state_root: roots.post,
+        body_root: bloch_pos_committee::derive::body_root(&[candidate.clone()]),
+        slot: block_context.slot,
+        proposer_index: 0,
+        randao_reveal: [0; 32],
+        randao_mix: [0; 32],
+        justified_root: [0; 32],
+        finalized_root: [0; 32],
+        attestation_root: [0; 32],
+        coherence_root: [0; 32],
+    };
+    let header_signature = sign(0, &signed_header.proposal_signing_root());
+    let mut header_state = anchor.clone();
+    let prepared = pool_candidate::prepare_for_signed_header(
+        &mut header_state,
+        &candidate,
+        parent_block,
+        &signed_header,
+        &keys()[0].0,
+        &header_signature,
+        &BaseVerifier,
+        &BlochVerifier,
+    )
+    .unwrap();
+    assert_eq!(prepared.outcome().post_root, expected);
+    drop(prepared);
+    assert_eq!(header_state.state_root(), anchor.state_root());
+    signed_header.proposer_index ^= 1;
+    assert!(matches!(
+        pool_candidate::prepare_for_signed_header(
+            &mut header_state,
+            &candidate,
+            parent_block,
+            &signed_header,
+            &keys()[0].0,
+            &header_signature,
+            &BaseVerifier,
+            &BlochVerifier
+        ),
+        Err(pool_candidate::Error::HeaderSignature)
+    ));
+    signed_header.proposer_index ^= 1;
+    signed_header.body_root[0] ^= 1;
+    assert!(matches!(
+        pool_candidate::prepare_for_signed_header(
+            &mut header_state,
+            &candidate,
+            parent_block,
+            &signed_header,
+            &keys()[0].0,
+            &header_signature,
+            &BaseVerifier,
+            &BlochVerifier
+        ),
+        Err(pool_candidate::Error::HeaderMismatch)
+    ));
+    signed_header.body_root[0] ^= 1;
+    signed_header.state_root[0] ^= 1;
+    let wrong_state_signature = sign(0, &signed_header.proposal_signing_root());
+    assert!(matches!(
+        pool_candidate::prepare_for_signed_header(
+            &mut header_state,
+            &candidate,
+            parent_block,
+            &signed_header,
+            &keys()[0].0,
+            &wrong_state_signature,
+            &BaseVerifier,
+            &BlochVerifier
+        ),
+        Err(pool_candidate::Error::BasePostMismatch)
+    ));
+    assert_eq!(header_state.state_root(), anchor.state_root());
     let before = std::fs::read(&bound_path).unwrap();
     assert!(bound.requires_base_roots());
     assert_eq!(&before[..8], b"BLCHDJ02");

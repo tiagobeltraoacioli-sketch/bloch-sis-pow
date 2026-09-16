@@ -506,3 +506,23 @@ to the journal state independently. This API cannot skip blocks containing no
 native operations; a production design must define those state transitions and
 header commitments. Existing lower-level rehearsal APIs remain explicit and no
 network activation is performed.
+
+### Signed-header binding rehearsal
+
+`prepare_for_signed_header` verifies an existing canonical header signature and
+its body commitment over a single candidate, checks the supplied parent/slot
+edge, reexecutes the candidate and compares the resulting BLCH projection with
+the header's declared state root. It uses the existing `derive::body_root` and
+`proposal_signing_root` rather than creating an alternative block identifier.
+The host supplies an independently resolved eligible proposer key and signature
+verifiers. Real hybrid-PQ tests cover valid binding, altered proposer metadata,
+changed body root, and a correctly signed but incorrect post-state claim.
+
+This is NOT a Genesis4 block validator. The candidate is not a currently admitted
+`PosTransaction`, the root here is a BLCH projection rather than the full live
+transition result, and proposer selection, RANDAO, attestations, rewards, fee
+settlement and activation are not checked by this helper. A header accepted here
+must not be submitted or treated as consensus-valid. No node path invokes it.
+The full integration requires a defined native transaction encoding, consensus
+state commitment and activation before delegating these checks to the real
+`Transition::apply_block` flow.
