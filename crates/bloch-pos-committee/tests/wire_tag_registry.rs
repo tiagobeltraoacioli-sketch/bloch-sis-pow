@@ -331,6 +331,7 @@ const TX_TAGS: &[(u8, Status)] = &[
     // Decodable does not mean network-activated or production-released.
     (0x0E, Status::Released { name: "NativeTransfer", rivals: NO_RIVALS }),
     (0x0F, Status::Released { name: "NativeBootstrap", rivals: NO_RIVALS }),
+    (0x12, Status::Released { name: "NativePool", rivals: NO_RIVALS }),
     (0x11, Status::Released { name: "NativeWithdrawal", rivals: NO_RIVALS }),
     (0x10, Status::Released { name: "NativeImport", rivals: NO_RIVALS }),
 ];
@@ -516,6 +517,7 @@ fn frozen_variant_space(tx: &PosTransaction) -> u8 {
     match tx {
         PosTransaction::NativeTransfer(_) => 0x0E,
         PosTransaction::NativeBootstrap(_) => 0x0F,
+        PosTransaction::NativePool(_) => 0x12,
         PosTransaction::NativeWithdrawal(_) => 0x11,
         PosTransaction::NativeImport(_) => 0x10,
         PosTransaction::Transfer { .. } => 0x01,
@@ -574,7 +576,7 @@ fn contested_msg(space: &str, tag: u8, claims: &[Claim]) -> String {
 /// `None` means no payload of that length decoded (a one-way tag; a released
 /// format may also need structured bytes rather than zeros).
 fn decoded_variant_name(tag: u8) -> Option<String> {
-    if (0x0E..=0x11).contains(&tag) {
+    if (0x0E..=0x12).contains(&tag) {
         // Nonempty opaque payload is required; semantic validity is a separate
         // block-transition check, not a property of this registry probe.
         let tx = PosTransaction::from_canonical_bytes(&[tag, 1, 0, 0, 0, 0]).ok()?;
@@ -815,6 +817,7 @@ fn contested_transaction_tags_are_refused() {
 #[test]
 fn the_exhaustive_match_agrees_with_the_table() {
     let samples: Vec<PosTransaction> = vec![
+        PosTransaction::NativePool(bloch_pos_committee::transition::NativeTransferPayload::new(vec![0]).unwrap()),
         PosTransaction::NativeWithdrawal(bloch_pos_committee::transition::NativeTransferPayload::new(vec![0]).unwrap()),
         PosTransaction::NativeImport(bloch_pos_committee::transition::NativeTransferPayload::new(vec![0]).unwrap()),
         PosTransaction::NativeBootstrap(bloch_pos_committee::transition::NativeTransferPayload::new(vec![0]).unwrap()),

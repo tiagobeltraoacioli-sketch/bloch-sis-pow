@@ -2038,6 +2038,33 @@ pub(crate) mod native_bootstrap_rehearsal {
         f()
     }
 }
+/// Dormant BLCH/native pool lifecycle.
+pub const NATIVE_POOL_ACTIVATION_EPOCH: u64 = u64::MAX;
+const _: () = assert!(NATIVE_POOL_ACTIVATION_EPOCH == u64::MAX
+    || (NATIVE_STATE_ACTIVATION_EPOCH != u64::MAX
+        && NATIVE_POOL_ACTIVATION_EPOCH >= NATIVE_STATE_ACTIVATION_EPOCH));
+pub fn native_pool_active(epoch: u64) -> bool {
+    #[cfg(all(test, feature = "native-dex-rehearsal"))]
+    if native_pool_rehearsal::active(epoch) { return true; }
+    epoch_gate_active(epoch, NATIVE_POOL_ACTIVATION_EPOCH)
+}
+
+#[cfg(all(test, feature = "native-dex-rehearsal"))]
+pub(crate) mod native_pool_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static EPOCH: Cell<u64> = const { Cell::new(u64::MAX) }; }
+    pub fn active(epoch: u64) -> bool {
+        EPOCH.with(|value| super::epoch_gate_active(epoch, value.get()))
+    }
+    pub fn run<T>(epoch: u64, f: impl FnOnce() -> T) -> T {
+        struct Restore(u64);
+        impl Drop for Restore {
+            fn drop(&mut self) { EPOCH.with(|value| value.set(self.0)); }
+        }
+        let _restore = Restore(EPOCH.with(|value| value.replace(epoch)));
+        f()
+    }
+}
 /// Dormant federated import.
 pub const NATIVE_IMPORT_ACTIVATION_EPOCH: u64 = u64::MAX;
 const _: () = assert!(NATIVE_IMPORT_ACTIVATION_EPOCH == u64::MAX

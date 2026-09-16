@@ -143,7 +143,17 @@ impl State {
         })
     }
     pub fn quote_blch_remove_fee(&self, request: &Request) -> Result<fee_market::TxCharge, Error> {
-        let length = request.canonical_bytes(&self.domain)?.len() as u64;
+        self.quote_blch_remove_fee_with_context(request, self.base.next_base_fee(), 0)
+    }
+    pub(in crate::transition::native_dex) fn quote_blch_remove_fee_with_context(
+        &self,
+        request: &Request,
+        base_fee: u128,
+        outer_bytes: u64,
+    ) -> Result<fee_market::TxCharge, Error> {
+        let length = (request.canonical_bytes(&self.domain)?.len() as u64)
+            .checked_add(outer_bytes)
+            .ok_or(Error::ResourceLimit)?;
         let PosTransaction::TransferV2 {
             tx_bytes,
             tip_millisat_per_gas,
@@ -171,7 +181,7 @@ impl State {
             .filter(|g| *g <= fee_market::MAX_TX_GAS)
             .ok_or(Error::ResourceLimit)?;
         let (base_fee_sat, priority_fee_sat) =
-            fee_market::fee_parts_sat(gas, self.base.next_base_fee(), *tip_millisat_per_gas);
+            fee_market::fee_parts_sat(gas, base_fee, *tip_millisat_per_gas);
         Ok(fee_market::TxCharge {
             gas,
             tx_bytes: *tx_bytes,
@@ -186,7 +196,25 @@ impl State {
         base_verifier: &dyn SignatureVerifier,
         native_verifier: &dyn Verifier,
     ) -> Result<Receipt, Error> {
-        let charge = self.quote_blch_remove_fee(request)?;
+        self.execute_blch_remove_with_context(
+            request,
+            height,
+            self.base.next_base_fee(),
+            0,
+            base_verifier,
+            native_verifier,
+        )
+    }
+    pub(in crate::transition::native_dex) fn execute_blch_remove_with_context(
+        &mut self,
+        request: &Request,
+        height: u64,
+        base_fee: u128,
+        outer_bytes: u64,
+        base_verifier: &dyn SignatureVerifier,
+        native_verifier: &dyn Verifier,
+    ) -> Result<Receipt, Error> {
+        let charge = self.quote_blch_remove_fee_with_context(request, base_fee, outer_bytes)?;
         let quote = self.quote_blch_remove(&request.quote, height)?;
         if quote.pool_state_root != request.pool_state_root {
             return Err(Error::StaleReserve);
@@ -293,7 +321,9 @@ impl State {
             .revision
             .checked_add(1)
             .ok_or(Error::ResourceLimit)?;
-        let envelope_bytes = request.canonical_bytes(&self.domain)?.len() as u64;
+        let envelope_bytes = (request.canonical_bytes(&self.domain)?.len() as u64)
+            .checked_add(outer_bytes)
+            .ok_or(Error::ResourceLimit)?;
         let decoding_gas = 100
             + transfer_wire::encode(&request.native)
                 .map_err(Error::Wire)?
@@ -320,7 +350,7 @@ impl State {
             .base
             .plan_transfer_v2_with_context(
                 &request.blch,
-                self.base.next_base_fee(),
+                base_fee,
                 base_verifier,
                 Some(JointTransferContext {
                     envelope_bytes,

@@ -1,7 +1,7 @@
 use super::super::tests::{BoundVerifier, DOMAIN};
 use super::*;
 
-fn fixtures() -> Vec<(State, Request)> {
+pub(in crate::transition::native_dex) fn fixtures() -> Vec<(State, Request)> {
     let (a, ar) = paired_custody::tests::setup();
     let (b, br) = initial_liquidity::tests::funded();
     let (c, cr) = add_liquidity::tests::fixture();

@@ -335,6 +335,8 @@ pub enum PosTransaction {
     NativeImport(NativeTransferPayload),
     /// Native burn and release-record creation; independently gated and dormant.
     NativeWithdrawal(NativeTransferPayload),
+    /// Existing BLCH/native pool lifecycle, independently gated.
+    NativePool(NativeTransferPayload),
     /// PQ-authorized, UTXO-funded validator registration (wire 0x0B).
     FundedDeposit(FundedDeposit),
     /// A value transfer against the committed eUTXO set, priced by the L1 fee
@@ -870,6 +872,10 @@ impl PosTransaction {
                 b.push(0x0F);
                 put(&mut b, payload.as_bytes());
             }
+            PosTransaction::NativePool(payload) => {
+                b.push(0x12);
+                put(&mut b, payload.as_bytes());
+            }
             PosTransaction::NativeWithdrawal(payload) => {
                 b.push(0x11);
                 put(&mut b, payload.as_bytes());
@@ -1071,6 +1077,13 @@ impl PosTransaction {
                     return Err(TxDecodeError::InvalidNativePayload);
                 }
                 PosTransaction::NativeBootstrap(NativeTransferPayload::new(r.take(length)?.to_vec())?)
+            }
+            0x12 => {
+                let length = r.u32()? as usize;
+                if length == 0 || length > MAX_NATIVE_TRANSFER_PAYLOAD_BYTES {
+                    return Err(TxDecodeError::InvalidNativePayload);
+                }
+                PosTransaction::NativePool(NativeTransferPayload::new(r.take(length)?.to_vec())?)
             }
             0x11 => {
                 let length = r.u32()? as usize;
@@ -3535,7 +3548,8 @@ impl CommittedState {
             PosTransaction::NativeTransfer(_)
             | PosTransaction::NativeBootstrap(_)
             | PosTransaction::NativeImport(_)
-            | PosTransaction::NativeWithdrawal(_) => Err(TxReject::StakingRule),
+            | PosTransaction::NativeWithdrawal(_)
+            | PosTransaction::NativePool(_) => Err(TxReject::StakingRule),
             PosTransaction::Withdraw { validator } => self.apply_withdrawal(*validator, tx),
             PosTransaction::FundedDeposit(deposit) => self
                 .apply_funded_deposit(deposit, total_active_sat, base_fee_millisat_per_gas, verifier)
@@ -6094,6 +6108,24 @@ impl<V: SignatureVerifier> Transition<V> {
                     #[cfg(not(feature = "native-dex-rehearsal"))]
                     { let _ = payload; Err(TxReject::StakingRule) }
                 }
+                PosTransaction::NativePool(payload) => {
+                    #[cfg(feature = "native-dex-rehearsal")]
+                    {
+                        if !crate::params::native_pool_active(block_epoch)
+                            || !crate::params::native_state_active(block_epoch)
+                        {
+                            Err(TxReject::StakingRule)
+                        } else {
+                            native_dex::consensus_pool::apply_pool(
+                                &mut st, payload.as_bytes(), header.slot, base_fee,
+                                &ConsensusNativeVerifier(&self.verifier),
+                                &ConsensusNativeVerifier(&self.verifier),
+                            ).map_err(|_| TxReject::StakingRule)
+                        }
+                    }
+                    #[cfg(not(feature = "native-dex-rehearsal"))]
+                    { let _ = payload; Err(TxReject::StakingRule) }
+                }
                 PosTransaction::NativeImport(payload) => {
                     #[cfg(feature = "native-dex-rehearsal")]
                     {
@@ -6686,6 +6718,7 @@ mod tests {
         include!("transition/native_snapshot_replay_tests.rs");
         include!("transition/native_bootstrap_blocks_tests.rs");
         include!("transition/native_gateway_blocks_tests.rs");
+        include!("transition/native_pool_blocks_tests.rs");
     }
 
     mod funded_admission {
@@ -14180,7 +14213,8 @@ mod tests {
             PosTransaction::NativeTransfer(_)
             | PosTransaction::NativeBootstrap(_)
             | PosTransaction::NativeImport(_)
-            | PosTransaction::NativeWithdrawal(_) => {}
+            | PosTransaction::NativeWithdrawal(_)
+            | PosTransaction::NativePool(_) => {}
         }
 
         // Monotone under blocks and boundaries, and never above the cap.

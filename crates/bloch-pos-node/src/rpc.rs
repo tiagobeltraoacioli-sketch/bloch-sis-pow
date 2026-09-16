@@ -2071,6 +2071,7 @@ pub fn submitted_json(tx: &PosTransaction, outcome: Admitted) -> Json {
         PosTransaction::NativeBootstrap(_) => "native_bootstrap",
         PosTransaction::NativeImport(_) => "native_import",
         PosTransaction::NativeWithdrawal(_) => "native_withdrawal",
+        PosTransaction::NativePool(_) => "native_pool",
         PosTransaction::Transfer { .. } => "transfer",
         PosTransaction::TransferV2 { .. } => "transfer_v2",
         PosTransaction::Deposit { .. } => "deposit",

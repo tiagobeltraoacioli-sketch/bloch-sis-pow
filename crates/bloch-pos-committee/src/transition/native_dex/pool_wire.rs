@@ -353,4 +353,4 @@ pub(super) fn apply_request(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

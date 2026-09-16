@@ -111,7 +111,7 @@ catches the frame-byte class except this file.**
 ## Dormant native transaction allocation (2026-09-16)
 
 This worktree additionally freezes `0x0E` NativeTransfer, `0x0F`
-NativeBootstrap, `0x10` NativeImport and `0x11` NativeWithdrawal. These are
+NativeBootstrap, `0x10` NativeImport, `0x11` NativeWithdrawal and `0x12` NativePool. These are
 transaction tags, not state-root or frame tags. Each has a bounded opaque
 payload and its own disabled (`u64::MAX`) activation gate; decoding grants no
 execution permission. NativeBootstrap registers a zero-supply asset and enables
