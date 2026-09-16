@@ -14,6 +14,7 @@ use std::sync::{
 pub enum Error {
     Journal(dex_journal::Error),
     StaleParent,
+    CandidateChanged,
     HeightRegression,
     Closed,
     Duplicate,
@@ -328,7 +329,7 @@ impl PendingBatch {
         journal: &mut Journal,
         height: u64,
     ) -> Result<pool_batch::Outcome, Error> {
-        self.commit_checked(journal, height, None)
+        self.commit_checked(journal, height, None, None)
     }
 
     /// Require independently supplied parent/post BLCH roots at persistence.
@@ -340,7 +341,20 @@ impl PendingBatch {
         height: u64,
         roots: pool_candidate::BaseRoots,
     ) -> Result<pool_batch::Outcome, Error> {
-        self.commit_checked(journal, height, Some(roots))
+        self.commit_checked(journal, height, Some(roots), None)
+    }
+
+    /// Commit only the exact canonical candidate independently approved by the
+    /// host, including its native operations, order, height and joint roots.
+    /// Expected bytes are comparison input, never an alternative execution path.
+    pub fn commit_expected_candidate(
+        &mut self,
+        journal: &mut Journal,
+        height: u64,
+        roots: pool_candidate::BaseRoots,
+        expected: &[u8],
+    ) -> Result<pool_batch::Outcome, Error> {
+        self.commit_checked(journal, height, Some(roots), Some(expected))
     }
 
     fn commit_checked(
@@ -348,8 +362,17 @@ impl PendingBatch {
         journal: &mut Journal,
         height: u64,
         roots: Option<pool_candidate::BaseRoots>,
+        expected: Option<&[u8]>,
     ) -> Result<pool_batch::Outcome, Error> {
+        if expected.is_some_and(|bytes| {
+            bytes.is_empty() || bytes.len() > pool_candidate::MAX_ENCODED_BYTES
+        }) {
+            return Err(Error::ResourceLimit);
+        }
         let candidate = self.build(journal, height)?;
+        if expected.is_some_and(|bytes| bytes != candidate) {
+            return Err(Error::CandidateChanged);
+        }
         let result = match roots {
             Some(roots) => journal.append_with_base_roots(&candidate, self.height, roots),
             None => journal.append(&candidate, self.height),

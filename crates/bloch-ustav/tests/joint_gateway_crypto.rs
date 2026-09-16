@@ -593,9 +593,32 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
         assert_eq!(std::fs::read(&bound_path).unwrap(), before);
         assert_eq!(bound.checkpoint(), original_head);
     }
+    assert!(frames.len() >= 2);
+    bound_pending
+        .retain_prefix(&bound, frames.len() - 1, 4)
+        .unwrap();
+    assert!(matches!(
+        bound_pending.commit_expected_candidate(&mut bound, 4, roots, &candidate),
+        Err(bloch_ustav::dex_admission::Error::CandidateChanged)
+    ));
+    assert_eq!(std::fs::read(&bound_path).unwrap(), before);
+    assert_eq!(bound_pending.len(), frames.len() - 1);
+    bound_pending
+        .admit(&bound, frames.last().unwrap(), 4)
+        .unwrap();
+    let mut changed_candidate = candidate.clone();
+    changed_candidate[82] ^= 1; // Same BLCH expectations, different joint result.
+    assert!(matches!(
+        bound_pending.commit_expected_candidate(&mut bound, 4, roots, &changed_candidate),
+        Err(bloch_ustav::dex_admission::Error::CandidateChanged)
+    ));
+    assert_eq!(std::fs::read(&bound_path).unwrap(), before);
+    assert_eq!(bound_pending.build(&bound, 4).unwrap(), candidate);
+    assert_eq!(bound_pending.len(), frames.len());
+    assert!(!bound_pending.is_closed());
     assert_eq!(
         bound_pending
-            .commit_with_base_roots(&mut bound, 4, roots)
+            .commit_expected_candidate(&mut bound, 4, roots, &candidate)
             .unwrap()
             .post_root,
         expected

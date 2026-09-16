@@ -344,3 +344,16 @@ a second commit is rejected without another disk write. Real PQ round trips
 exercise both parent/post mismatch retries, identical rebuilt bytes, successful
 commit and replay after reopening. This method is opt-in; ordinary local
 `commit` retains its prior behavior and no live node is activated by the API.
+
+For a host that has approved a specific canonical candidate,
+`PendingBatch::commit_expected_candidate` additionally compares the rebuilt
+candidate byte-for-byte with the host's independently supplied bytes before the
+bound journal append. This covers native operations, ordering, domain, height,
+parent and joint post-state claims; BLCH projection roots alone cannot identify
+all gateway changes. Empty or oversized expectations are refused without copying
+them. A mismatch preserves queued frames and journal bytes, while the normal
+monotonic height watermark still applies after rebuilding. The expected bytes
+never bypass reexecution or signature verification. Real PQ tests remove an
+admitted suffix, reject the stale candidate, restore the suffix, and commit the
+matching candidate; they also reject changed joint-root bytes. Host approval and
+live consensus integration remain external requirements, not inferred trust.
