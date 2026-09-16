@@ -536,7 +536,7 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
     let head = journal.checkpoint();
     // Host-bound persistence exercises actual PQ verification and disk replay.
     let bound_path = path.with_extension("base-bound.log");
-    let mut bound = Journal::create(&bound_path, anchor.clone(), 3).unwrap();
+    let mut bound = Journal::create_requiring_base_roots(&bound_path, anchor.clone(), 3).unwrap();
     let references: Vec<_> = frames.iter().map(Vec::as_slice).collect();
     let candidate =
         pool_candidate::build(&anchor, 4, &references, &BaseVerifier, &BlochVerifier).unwrap();
@@ -545,6 +545,14 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
         post: journal.state().base_state_root(),
     };
     let before = std::fs::read(&bound_path).unwrap();
+    assert!(bound.requires_base_roots());
+    assert_eq!(&before[..8], b"BLCHDJ02");
+    assert!(matches!(
+        bound.append(&candidate, 4),
+        Err(JournalError::BaseRootsRequired)
+    ));
+    assert_eq!(std::fs::read(&bound_path).unwrap(), before);
+
     for wrong_parent in [true, false] {
         let mut wrong = roots;
         if wrong_parent {
@@ -571,7 +579,7 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
         assert_eq!(std::fs::read(&bound_path).unwrap(), before);
         assert_eq!(bound.checkpoint(), original_head);
     }
-    let mut bound_pending = PendingBatch::new_requiring_expected_candidate(&bound, 4).unwrap();
+    let mut bound_pending = PendingBatch::new(&bound, 4).unwrap();
     for frame in frames {
         bound_pending.admit(&bound, frame, 4).unwrap();
     }
@@ -644,7 +652,19 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
     ));
     assert_eq!(std::fs::read(&bound_path).unwrap(), persisted);
     drop(bound);
-    let bound = Journal::open(&bound_path, anchor.clone(), 3, head, TailRecovery::Reject).unwrap();
+    let mut bound =
+        Journal::open(&bound_path, anchor.clone(), 3, head, TailRecovery::Reject).unwrap();
+    assert!(bound.requires_base_roots());
+    assert!(matches!(
+        bound.append(&candidate, 5),
+        Err(JournalError::BaseRootsRequired)
+    ));
+    let mut reopened_pending = PendingBatch::new(&bound, 5).unwrap();
+    assert!(matches!(
+        reopened_pending.commit(&mut bound, 5),
+        Err(bloch_ustav::dex_admission::Error::ExpectedCandidateRequired)
+    ));
+    assert_eq!(std::fs::read(&bound_path).unwrap(), persisted);
     assert_eq!(bound.state().base_state_root(), roots.post);
     assert_eq!(bound.state().state_root(), expected);
     drop(bound);

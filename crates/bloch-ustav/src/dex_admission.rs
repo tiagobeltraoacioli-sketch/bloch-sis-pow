@@ -103,7 +103,7 @@ impl PendingBatch {
             frames: Vec::new(),
             wire_bytes: 0,
             closed: false,
-            require_expected_candidate: false,
+            require_expected_candidate: journal.requires_base_roots(),
         })
     }
     /// Create a queue whose commit policy cannot be downgraded during its life.

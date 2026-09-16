@@ -13,6 +13,7 @@ use std::{
 };
 
 const MAGIC: &[u8; 8] = b"BLCHDJ01";
+const BOUND_MAGIC: &[u8; 8] = b"BLCHDJ02";
 const HEADER_BYTES: u64 = 48; // magic, anchor height, anchor combined state root
 pub const MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_RECORDS: usize = 4096;
@@ -29,6 +30,7 @@ pub enum TailRecovery {
 }
 #[derive(Debug)]
 pub enum Error {
+    BaseRootsRequired,
     Io(io::Error),
     Locked,
     InvalidFile,
@@ -369,10 +371,30 @@ pub struct Journal {
     length: u64,
     records: usize,
     poisoned: bool,
+    require_base_roots: bool,
 }
 impl Journal {
     /// Create a new log from an independently authenticated anchor.
     pub fn create(path: &Path, state: State, height: u64) -> Result<Self, Error> {
+        Self::create_with_policy(path, state, height, false)
+    }
+
+    /// Create a new journal that durably requires host BLCH root expectations.
+    /// Existing files are never migrated or overwritten by this constructor.
+    pub fn create_requiring_base_roots(
+        path: &Path,
+        state: State,
+        height: u64,
+    ) -> Result<Self, Error> {
+        Self::create_with_policy(path, state, height, true)
+    }
+
+    fn create_with_policy(
+        path: &Path,
+        state: State,
+        height: u64,
+        require_base_roots: bool,
+    ) -> Result<Self, Error> {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create_new(true);
         #[cfg(unix)]
@@ -386,7 +408,11 @@ impl Journal {
             height,
             root: state.state_root(),
         };
-        file.write_all(MAGIC)?;
+        file.write_all(if require_base_roots {
+            BOUND_MAGIC
+        } else {
+            MAGIC
+        })?;
         file.write_all(&height.to_le_bytes())?;
         file.write_all(&head.root)?;
         file.sync_all()?;
@@ -403,6 +429,7 @@ impl Journal {
             length: HEADER_BYTES,
             records: 0,
             poisoned: false,
+            require_base_roots,
         })
     }
 
@@ -430,9 +457,13 @@ impl Journal {
         }
         let mut header = [0; HEADER_BYTES as usize];
         file.read_exact(&mut header)?;
-        if &header[..8] != MAGIC {
+        let require_base_roots = if &header[..8] == BOUND_MAGIC {
+            true
+        } else if &header[..8] == MAGIC {
+            false
+        } else {
             return Err(Error::InvalidHeader);
-        }
+        };
         if header[8..16] != anchor_height.to_le_bytes() || header[16..48] != anchor.state_root() {
             return Err(Error::WrongAnchor);
         }
@@ -446,6 +477,7 @@ impl Journal {
             length: HEADER_BYTES,
             records: 0,
             poisoned: false,
+            require_base_roots,
         };
         let mut incomplete = false;
         while journal.length < length {
@@ -510,6 +542,11 @@ impl Journal {
         } else {
             Ok(())
         }
+    }
+
+    /// Persisted admission policy, not proof that the file was authenticated.
+    pub fn requires_base_roots(&self) -> bool {
+        self.require_base_roots
     }
 
     pub fn state(&self) -> &State {
@@ -620,6 +657,9 @@ impl Journal {
         roots: Option<pool_candidate::BaseRoots>,
     ) -> Result<pool_batch::Outcome, Error> {
         self.ensure_healthy()?;
+        if self.require_base_roots && roots.is_none() {
+            return Err(Error::BaseRootsRequired);
+        }
         if height <= self.head.height {
             return Err(Error::NonIncreasingHeight);
         }

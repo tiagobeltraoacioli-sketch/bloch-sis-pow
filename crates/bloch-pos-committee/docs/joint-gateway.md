@@ -370,3 +370,24 @@ their documented scope. This is caller-error protection, not a security boundary
 against arbitrary host code or an implementation of consensus authentication.
 Real PQ integration tests exercise refused downgrade attempts followed by root
 mismatch, edited-queue rejection, successful exact commit and restart.
+
+### Persistent local host policy
+
+`Journal::create_requiring_base_roots` creates a new `BLCHDJ02` journal with the
+same anchor and record encoding, but a persistent root-expectation requirement.
+`open` recognizes this header and preserves that requirement across restart.
+Plain `append` is refused; `append_with_base_roots` retains its verified, synced
+write path. `PendingBatch::new` automatically requires exact-candidate commits
+when attached to such a journal, so callers cannot accidentally revert to the
+ordinary queue commit after reopening. Direct journal callers still provide the
+candidate itself and independently validated BLCH root expectations.
+
+Existing `BLCHDJ01` journals keep their previous semantics; no automatic migration
+or rewriting occurs. Older binaries reject the new header rather than opening it
+with weaker semantics. Header policy is local operator configuration, not a
+cryptographically authenticated consensus field: changing or rolling back the
+file can defeat it. Protect journal files and independently authenticate anchors
+and tips. Replay validates the complete joint state but does not reconstruct past
+host approvals or store their expected BLCH roots. Real PQ tests verify rejection
+before and after restart, inherited queue policy, unchanged disk bytes on refusal,
+and successful bound replay. Production consensus activation remains pending.
