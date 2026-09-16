@@ -304,6 +304,9 @@ pub enum TransitionError {
     Transaction(u32),
     /// Header `state_root` does not match the transition's computed root.
     StateRootMismatch,
+    /// Native state is present before its gate, unavailable in this build, or
+    /// cannot be initialized from authenticated nonzero network context.
+    NativeStateUnavailable,
     /// Header slot does not advance past the parent's.
     NonMonotonicSlot,
     /// Header's justified/finalized roots contradict the parent state's

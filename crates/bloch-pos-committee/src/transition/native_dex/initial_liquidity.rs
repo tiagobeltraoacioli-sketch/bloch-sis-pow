@@ -328,23 +328,7 @@ impl State {
         })
     }
     pub(super) fn hash_initial_pools(&self, h: &mut Sha3_256) {
-        h.update((self.initial_pools.len() as u64).to_le_bytes());
-        for r in self.initial_pools.values() {
-            h.update(r.pool.state_root());
-            h.update(r.initial_reserves[0].to_le_bytes());
-            h.update(r.initial_reserves[1].to_le_bytes());
-            h.update(r.reserve);
-            h.update(r.creation_authorization);
-            h.update((r.owner.len() as u64).to_le_bytes());
-            h.update(&r.owner);
-            h.update(r.lp_balance.to_le_bytes());
-            h.update((r.positions.len() as u64).to_le_bytes());
-            for (owner, balance) in &r.positions {
-                h.update((owner.len() as u64).to_le_bytes());
-                h.update(owner);
-                h.update(balance.to_le_bytes());
-            }
-        }
+        hash_initial_pools(&self.initial_pools, h);
     }
     /// Structural checks supplement, but do not replace, an authenticated host root.
     /// Adds, swaps and redemption evolve pools; their original identity stays fixed.
@@ -475,3 +459,26 @@ impl State {
 }
 #[cfg(test)]
 pub(super) mod tests;
+
+pub(super) fn hash_initial_pools(
+    records: &std::collections::BTreeMap<[u8; 32], Record>,
+    h: &mut Sha3_256,
+) {
+    h.update((records.len() as u64).to_le_bytes());
+    for r in records.values() {
+        h.update(r.pool.state_root());
+        h.update(r.initial_reserves[0].to_le_bytes());
+        h.update(r.initial_reserves[1].to_le_bytes());
+        h.update(r.reserve);
+        h.update(r.creation_authorization);
+        h.update((r.owner.len() as u64).to_le_bytes());
+        h.update(&r.owner);
+        h.update(r.lp_balance.to_le_bytes());
+        h.update((r.positions.len() as u64).to_le_bytes());
+        for (owner, balance) in &r.positions {
+            h.update((owner.len() as u64).to_le_bytes());
+            h.update(owner);
+            h.update(balance.to_le_bytes());
+        }
+    }
+}

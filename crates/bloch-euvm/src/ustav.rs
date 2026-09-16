@@ -257,7 +257,7 @@ impl PolicyUpdate {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Token {
     registration: Registration,
     compiled: CompiledToken,
@@ -299,7 +299,7 @@ pub struct Receipt {
 
 /// Sealed state: no balance setter, mutable registry access, external prior_supply
 /// input or caller-selected validator. Rejected operations do not mutate any field.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ledger {
     domain: [u8; 32],
     tokens: BTreeMap<AssetId, Token>,

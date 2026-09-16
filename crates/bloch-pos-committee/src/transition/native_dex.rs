@@ -149,12 +149,10 @@ pub struct State {
 /// Opaque native component storage, without ownership of a `CommittedState`.
 ///
 /// Hosts may store this alongside their base state without recursive ownership.
-/// This boundary does not embed native state into consensus or activate execution.
-/// The base projection is pinned so custody records cannot be rebound to a
-/// different UTXO set. Use `State::from_components` to authenticate reassembly.
-#[derive(Clone, Debug)]
+/// Its commitment contains no base root, head or slot, so a host can commit this
+/// component without recursive hashing. Rehearsal reassembly uses a separate pin.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeState {
-    base_root: [u8; 32],
     native: PoolLedger,
     domain: [u8; 32],
     /// Debited real BLCH retained in committed rehearsal accounting; no payout API.
@@ -167,6 +165,71 @@ pub struct NativeState {
     initial_pools: BTreeMap<[u8; 32], initial_liquidity::Record>,
     reserve_pools: BTreeMap<[u8; 32], [u8; 32]>,
 }
+/// A native component bound to the exact base projection from a rehearsal.
+/// Only `State::from_components` consumes this authenticated reassembly boundary.
+#[derive(Clone, Debug)]
+pub struct PinnedNativeState {
+    base_root: [u8; 32],
+    state: NativeState,
+}
+
+impl NativeState {
+    /// Immutable network binding for the host's canonical-state checks.
+    pub(super) fn domain(&self) -> [u8; 32] {
+        self.domain
+    }
+
+    /// Empty component for the host's explicitly gated initialization path.
+    pub(super) fn empty(domain: [u8; 32]) -> Result<Self, Error> {
+        if domain == [0; 32] {
+            return Err(Error::WrongDomain);
+        }
+        Ok(Self {
+            native: PoolLedger::new(domain),
+            domain,
+            base_fees: 0,
+            priority_fees: 0,
+            base_reserves: BTreeMap::new(),
+            base_locks: BTreeMap::new(),
+            paired_reserves: BTreeMap::new(),
+            paired_locks: BTreeMap::new(),
+            initial_pools: BTreeMap::new(),
+            reserve_pools: BTreeMap::new(),
+        })
+    }
+
+    /// Native component commitment only; neither a finalized root nor a gateway proof.
+    pub(super) fn commitment(&self) -> [u8; 32] {
+        let mut h = Sha3_256::new();
+        h.update(b"BLOCH-NATIVE-COMPONENT-STATE-v1");
+        h.update(self.domain);
+        h.update(self.native.state_root());
+        h.update(self.base_fees.to_le_bytes());
+        h.update(self.priority_fees.to_le_bytes());
+        base_reserves::hash_base_reserves(&self.base_reserves, &mut h);
+        backend::hash_paired_reserves(&self.paired_reserves, &mut h);
+        initial_liquidity::hash_initial_pools(&self.initial_pools, &mut h);
+        h.update((self.base_locks.len() as u64).to_le_bytes());
+        for ((txid, vout), reserve) in &self.base_locks {
+            h.update(txid);
+            h.update(vout.to_le_bytes());
+            h.update(reserve);
+        }
+        h.update((self.paired_locks.len() as u64).to_le_bytes());
+        for (outpoint, reserve) in &self.paired_locks {
+            h.update(outpoint.transaction);
+            h.update(outpoint.index.to_le_bytes());
+            h.update(reserve);
+        }
+        h.update((self.reserve_pools.len() as u64).to_le_bytes());
+        for (reserve, pool) in &self.reserve_pools {
+            h.update(reserve);
+            h.update(pool);
+        }
+        h.finalize().into()
+    }
+}
+
 /// Opaque complete-state checkpoint. Only State::restore can consume it.
 /// ```compile_fail
 /// use bloch_pos_committee::transition::native_dex::Snapshot;
@@ -194,10 +257,9 @@ pub struct Execution {
 impl State {
     /// Separate host-owned base state from opaque native component storage.
     /// No roots, fees, locks or snapshot versions change at this boundary.
-    pub fn into_parts(self) -> (CommittedState, NativeState) {
+    pub fn into_parts(self) -> (CommittedState, PinnedNativeState) {
         let base_root = self.base.compute_root();
         let native = NativeState {
-            base_root,
             native: self.native,
             domain: self.domain,
             base_fees: self.base_fees,
@@ -209,7 +271,13 @@ impl State {
             initial_pools: self.initial_pools,
             reserve_pools: self.reserve_pools,
         };
-        (self.base, native)
+        (
+            self.base,
+            PinnedNativeState {
+                base_root,
+                state: native,
+            },
+        )
     }
 
     /// Reassemble previously separated state against an authenticated joint root.
@@ -218,16 +286,20 @@ impl State {
     /// records from a prior state, even when its network domain is unchanged.
     pub fn from_components(
         base: CommittedState,
-        native: NativeState,
+        pinned: PinnedNativeState,
         trusted_root: [u8; 32],
     ) -> Result<Self, Error> {
+        if base.native_state.is_some() {
+            return Err(Error::InvalidRoot);
+        }
+        let native = pinned.state;
         if native.domain == [0; 32]
             || base.admission_network_domain != Some(native.domain)
             || *native.native.gateway().native().domain() != native.domain
         {
             return Err(Error::WrongDomain);
         }
-        if base.compute_root() != native.base_root {
+        if base.compute_root() != pinned.base_root {
             return Err(Error::InvalidRoot);
         }
         let state = Self {
@@ -269,6 +341,9 @@ impl State {
         base_root: [u8; 32],
         native_root: [u8; 32],
     ) -> Result<Self, Error> {
+        if base.native_state.is_some() {
+            return Err(Error::InvalidRoot);
+        }
         let domain = base.admission_network_domain.ok_or(Error::WrongDomain)?;
         if domain == [0; 32] || domain != *native.gateway().native().domain() {
             return Err(Error::WrongDomain);
@@ -514,6 +589,71 @@ impl Verifier for NativeVerifier<'_> {
 #[cfg(test)]
 mod component_tests {
     use super::*;
+
+    #[test]
+    fn native_component_is_domain_bound_and_commits_every_owned_field() {
+        assert!(matches!(
+            NativeState::empty([0; 32]),
+            Err(Error::WrongDomain)
+        ));
+        let empty = NativeState::empty(tests::DOMAIN).unwrap();
+        assert_eq!(empty, empty.clone());
+        assert_eq!(empty.commitment(), empty.clone().commitment());
+        assert_ne!(
+            empty.commitment(),
+            NativeState::empty([99; 32]).unwrap().commitment()
+        );
+        let (mut state, request) = initial_liquidity::tests::funded();
+        state
+            .execute_initial_liquidity(&request, 1, &tests::BoundVerifier, &tests::BoundVerifier)
+            .unwrap();
+        let (_, pinned) = state.into_parts();
+        let native = pinned.state;
+        let mutations: &[fn(&mut NativeState)] = &[
+            |s| s.domain = [99; 32],
+            |s| s.native = PoolLedger::new(tests::DOMAIN),
+            |s| s.base_fees += 1,
+            |s| s.priority_fees += 1,
+            |s| s.base_reserves.clear(),
+            |s| s.base_locks.clear(),
+            |s| s.paired_reserves.clear(),
+            |s| s.paired_locks.clear(),
+            |s| s.initial_pools.clear(),
+            |s| s.reserve_pools.clear(),
+        ];
+        for (i, mutate) in mutations.iter().enumerate() {
+            let mut changed = native.clone();
+            mutate(&mut changed);
+            assert_ne!(native, changed, "field {i} missing from equality");
+            assert_ne!(
+                native.commitment(),
+                changed.commitment(),
+                "field {i} missing from commitment"
+            );
+        }
+    }
+
+    #[test]
+    fn rehearsal_rejects_an_embedded_canonical_component() {
+        let (state, _) = tests::fixture();
+        let root = state.state_root();
+        let (mut base, pinned) = state.into_parts();
+        base.native_state = Some(NativeState::empty(tests::DOMAIN).unwrap());
+        let ledger = PoolLedger::new(tests::DOMAIN);
+        assert!(matches!(
+            State::from_parts(
+                base.clone(),
+                ledger.clone(),
+                base.compute_root(),
+                ledger.state_root()
+            ),
+            Err(Error::InvalidRoot)
+        ));
+        assert!(matches!(
+            State::from_components(base, pinned, root),
+            Err(Error::InvalidRoot)
+        ));
+    }
 
     #[test]
     fn split_rejoin_preserves_execution_and_snapshot() {

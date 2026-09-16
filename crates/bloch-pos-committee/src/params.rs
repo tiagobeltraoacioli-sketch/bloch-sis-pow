@@ -1970,6 +1970,35 @@ pub(crate) const ROLE_EPOCH: u8 = 0x02;
 /// enables the unfunded legacy Deposit/Delegate formats. No runtime override.
 pub const FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+/// Dormant native state ownership and commitment only. No native transactions
+/// or settlement are enabled by this gate. Arming requires a coordinated upgrade.
+pub const NATIVE_STATE_ACTIVATION_EPOCH: u64 = u64::MAX;
+#[cfg(not(feature = "native-dex-rehearsal"))]
+const _: () = assert!(NATIVE_STATE_ACTIVATION_EPOCH == u64::MAX);
+
+pub fn native_state_active(epoch: u64) -> bool {
+    #[cfg(all(test, feature = "native-dex-rehearsal"))]
+    if native_state_rehearsal::active(epoch) { return true; }
+    epoch_gate_active(epoch, NATIVE_STATE_ACTIVATION_EPOCH)
+}
+
+#[cfg(all(test, feature = "native-dex-rehearsal"))]
+pub(crate) mod native_state_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static EPOCH: Cell<u64> = const { Cell::new(u64::MAX) }; }
+    pub fn active(epoch: u64) -> bool {
+        EPOCH.with(|value| super::epoch_gate_active(epoch, value.get()))
+    }
+    pub fn run<T>(epoch: u64, f: impl FnOnce() -> T) -> T {
+        struct Restore(u64);
+        impl Drop for Restore {
+            fn drop(&mut self) { EPOCH.with(|value| value.set(self.0)); }
+        }
+        let _restore = Restore(EPOCH.with(|value| value.replace(epoch)));
+        f()
+    }
+}
+
 pub fn funded_validator_admission_active(epoch: u64) -> bool {
     #[cfg(test)]
     if funded_admission_rehearsal::enabled() { return true; }

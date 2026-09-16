@@ -206,17 +206,7 @@ impl State {
         Ok(())
     }
     pub(super) fn hash_paired_reserves(&self, h: &mut Sha3_256) {
-        h.update((self.paired_reserves.len() as u64).to_le_bytes());
-        for r in self.paired_reserves.values() {
-            h.update(r.id);
-            h.update(r.authorization);
-            h.update(r.asset);
-            h.update((r.owner.len() as u64).to_le_bytes());
-            h.update(&r.owner);
-            h.update(r.amount.to_le_bytes());
-            h.update(r.outpoint.transaction);
-            h.update(r.outpoint.index.to_le_bytes());
-        }
+        hash_paired_reserves(&self.paired_reserves, h);
     }
     pub(super) fn restore_paired_reserves(
         &mut self,
@@ -259,5 +249,22 @@ impl State {
             self.paired_reserves.insert(r.id, r);
         }
         Ok(())
+    }
+}
+
+pub(super) fn hash_paired_reserves(
+    records: &std::collections::BTreeMap<[u8; 32], custody::Record>,
+    h: &mut Sha3_256,
+) {
+    h.update((records.len() as u64).to_le_bytes());
+    for r in records.values() {
+        h.update(r.id);
+        h.update(r.authorization);
+        h.update(r.asset);
+        h.update((r.owner.len() as u64).to_le_bytes());
+        h.update(&r.owner);
+        h.update(r.amount.to_le_bytes());
+        h.update(r.outpoint.transaction);
+        h.update(r.outpoint.index.to_le_bytes());
     }
 }

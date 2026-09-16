@@ -405,9 +405,8 @@ pub struct TokenCharter {
 /// One compiled module: its kind tag, the concrete validator program, and the program's
 /// `validator_hash` (what an [`crate::ExtOutput::validator_hash`] would commit to).
 ///
-/// (No `PartialEq`/`Eq`: `crate::Op` derives neither, so `Vec<Op>` cannot. Compare the
-/// `validator_hash`, or `crate::encode_program(&program)`, instead.)
-#[derive(Clone, Debug)]
+/// Structural equality includes the emitted program and its recorded hash.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompiledModule {
     /// Stable human-readable kind tag (see [`ModuleKind::tag`]).
     pub kind: &'static str,
@@ -421,9 +420,8 @@ pub struct CompiledModule {
 /// `charter_id` that commits to the whole composition (name + every module's kind and
 /// validator hash, in order).
 ///
-/// (No `PartialEq`/`Eq`: it holds [`CompiledModule`]s, which carry `Vec<Op>`. Compare
-/// `charter_id` for identity.)
-#[derive(Clone, Debug)]
+/// Structural equality includes the charter identity and every compiled module.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompiledToken {
     /// A deterministic digest over the entire charter — same charter ⇒ same id.
     pub charter_id: [u8; 32],

@@ -597,6 +597,27 @@ exactly these 22:
 | `0x14` | `TAG_ISSUED_SUPPLY` — cumulative issued supply (hard-cap counter, singleton) |
 | `0x15` | `TAG_BASE_FEE` — L1 fee-market price leaf (singleton) |
 | `0x16` | `TAG_DELEGATOR_FEE_REWARD` — delegator fee-reward ledger |
+| `0x17` | `TAG_VALIDATOR_FEE_REWARD` — validator fee-reward ledger |
+| `0x18` | `TAG_DELEGATOR_ISSUANCE_REWARD` — delegator issuance-reward ledger |
+| `0x19` | `TAG_PROPOSED_CURRENT` — current-epoch proposal participation |
+| `0x1A` | `TAG_FC_RECENT_VOTE` — recent fork-choice vote history |
+| `0x1B` | `TAG_WRITTEN_OFF` — written-off principal counter |
+| `0x1C` | `TAG_STAKE_LOW_WATER` — historical stake floor |
+| `0x1D` | `TAG_RANDAO_GENERATION` — completed RANDAO generation |
+| `0x1E` | `TAG_FUNDED_VALIDATOR` — funded validator membership |
+| `0x1F` | `TAG_NATIVE_STATE` — optional native component commitment (dormant) |
+
+The native singleton is absent before initialization and contributes **no leaf**
+to historical roots. Its key is `derive_key(0x1F, [])`, and its value hash is
+`hash_value(native_component_commitment)`, using the same state-tree domains and
+markers as the other components. The component commitment excludes the base
+state root, head and slot to avoid circular hashing. Its schema is implemented
+by `transition::native_dex::NativeState::commitment` and described in
+`crates/bloch-pos-committee/docs/native-consensus-integration-status.md`.
+`NATIVE_STATE_ACTIVATION_EPOCH` remains `u64::MAX` (disabled). The opt-in code
+initializes only an empty component through the block transition; it does not
+enable native transactions, import a rehearsal ledger, or authenticate bridge
+payments. This state tag assigns no transaction wire tag.
 
 Fixed-length digests use SHA3-256. Variable-length or multi-output derivation
 uses SHAKE-256. SHA-256d survives **only** in the historical verification path

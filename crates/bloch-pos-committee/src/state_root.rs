@@ -277,6 +277,9 @@ const TAG_WRITTEN_OFF: u8 = 0x1B;
 const TAG_STAKE_LOW_WATER: u8 = 0x1C;
 const TAG_RANDAO_GENERATION: u8 = 0x1D;
 const TAG_FUNDED_VALIDATOR: u8 = 0x1E;
+/// Native component commitment. A missing component contributes no leaf, so
+/// historical roots stay byte-identical. This is a state tag, not a wire tag.
+const TAG_NATIVE_STATE: u8 = 0x1F;
 
 
 fn sha3(parts: &[&[u8]]) -> [u8; 32] {
@@ -1752,6 +1755,8 @@ impl DelegatorIssuanceRecord {
 /// such entry point exists.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConsensusState<'a> {
+    /// Domain-separated native component root; absent before native activation.
+    pub native_state: Option<[u8; 32]>,
     pub written_off_sat: u128,
     pub funded_validators: &'a [u32],
     pub stake_low_water: &'a [(u32, u128)],
@@ -1941,6 +1946,9 @@ pub fn build_state_tree_with_eutxo_tree(
 /// against the eUTXO set's hundreds of thousands.
 fn build_state_tree_inner(state: &ConsensusState<'_>, eutxo_tree: &Smt) -> Smt {
     let mut smt = eutxo_tree.clone();
+    if let Some(root) = state.native_state {
+        smt.insert(derive_key(TAG_NATIVE_STATE, &[]), hash_value(&root));
+    }
     for v in state.validators {
         smt.insert(derive_key(TAG_VALIDATOR, &v.entry_key()), hash_value(&v.serialize()));
     }
@@ -3396,6 +3404,7 @@ mod tests {
 
     fn state(f: &Fx) -> ConsensusState<'_> {
         ConsensusState {
+            native_state: None,
             written_off_sat: 0, funded_validators: &[], stake_low_water: &[], randao_generations: &[],
             eutxos: &f.eutxos,
             validators: &f.validators,
@@ -3427,6 +3436,27 @@ mod tests {
             delegator_issuance_rewards: &f.issuance_rewards,
             current_proposed: &f.proposed,
         }
+    }
+
+    #[test]
+    fn native_commitment_leaf_has_a_canonical_inclusion_proof() {
+        let fixture = fixture();
+        let mut state = state(&fixture);
+        let key = derive_key(TAG_NATIVE_STATE, &[]);
+        let historical = build_state_tree(&state);
+        assert!(historical.prove(&key).is_none());
+        state.native_state = Some([41; 32]);
+        let tree = build_state_tree(&state);
+        let proof = tree.prove(&key).expect("native commitment is in the canonical SMT");
+        let value = hash_value(&[41; 32]);
+        assert!(verify_inclusion(&tree.root(), &key, &value, &proof));
+        assert_ne!(historical.root(), tree.root());
+        state.native_state = Some([42; 32]);
+        let changed = build_state_tree(&state);
+        assert!(!verify_inclusion(&changed.root(), &key, &value, &proof));
+        assert!(!verify_inclusion(&tree.root(), &key, &hash_value(&[42; 32]), &proof));
+        state.native_state = None;
+        assert_eq!(build_state_tree(&state).root(), historical.root());
     }
 
     #[test]

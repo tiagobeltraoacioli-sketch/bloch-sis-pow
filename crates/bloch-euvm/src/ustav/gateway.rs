@@ -262,7 +262,7 @@ pub struct Snapshot {
 
 /// Supply mutation of an enabled bridge asset is reachable only via import/burn.
 /// No mutable ledger accessor, escrow-key exemption, or arbitrary issuer mint.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GatewayLedger {
     native: Ledger,
     routes: BTreeMap<[u8; 32], RouteState>,

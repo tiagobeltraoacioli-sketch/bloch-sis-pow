@@ -525,17 +525,7 @@ impl State {
     }
 
     pub(super) fn hash_base_reserves(&self, hash: &mut Sha3_256) {
-        hash.update((self.base_reserves.len() as u64).to_le_bytes());
-        for record in self.base_reserves.values() {
-            hash.update(record.id);
-            hash.update(record.seed);
-            hash.update((record.owner.len() as u64).to_le_bytes());
-            hash.update(&record.owner);
-            hash.update(record.outpoint.0);
-            hash.update(record.outpoint.1.to_le_bytes());
-            hash.update(record.amount.to_le_bytes());
-            hash.update(record.revision.to_le_bytes());
-        }
+        hash_base_reserves(&self.base_reserves, hash);
     }
 
     pub(super) fn restore_base_reserves(
@@ -572,3 +562,20 @@ impl State {
 
 #[cfg(test)]
 mod tests;
+
+pub(super) fn hash_base_reserves(
+    records: &std::collections::BTreeMap<[u8; 32], Record>,
+    hash: &mut Sha3_256,
+) {
+    hash.update((records.len() as u64).to_le_bytes());
+    for record in records.values() {
+        hash.update(record.id);
+        hash.update(record.seed);
+        hash.update((record.owner.len() as u64).to_le_bytes());
+        hash.update(&record.owner);
+        hash.update(record.outpoint.0);
+        hash.update(record.outpoint.1.to_le_bytes());
+        hash.update(record.amount.to_le_bytes());
+        hash.update(record.revision.to_le_bytes());
+    }
+}

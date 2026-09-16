@@ -278,6 +278,7 @@ fn fixture() -> Fixture {
 
 fn state<'a>(f: &'a Fixture, e: &'a [EutxoEntry]) -> ConsensusState<'a> {
     ConsensusState {
+        native_state: None,
             written_off_sat: 0, funded_validators: &[], stake_low_water: &[], randao_generations: &[],
         eutxos: e,
         validators: &f.validators,

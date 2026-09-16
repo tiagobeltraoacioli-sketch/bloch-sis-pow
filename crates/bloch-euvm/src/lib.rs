@@ -109,7 +109,7 @@ pub trait SigVerifier {
 
 /// The instruction set (minimal but real: arithmetic, comparison, hashing, context,
 /// signatures, and assertion — enough for P2PKH, multisig, and hash-locks).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op {
     PushInt(i128),
     PushBytes(Vec<u8>),

@@ -1510,6 +1510,8 @@ impl ValidatedTransferV2<'_> {
 /// transition itself — there is no constructor that reads a database.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CommittedState {
+    #[cfg(feature = "native-dex-rehearsal")]
+    native_state: Option<native_dex::NativeState>,
     // Immutable genesis-manifest context; deliberately outside historical state-root encoding.
     admission_network_domain: Option<[u8; 32]>,
     /// Slot of the block whose post-state this is.
@@ -2220,6 +2222,8 @@ impl CommittedState {
 
         let genesis_cp = Checkpoint { epoch: 0, root: *genesis_block.as_bytes() };
         let mut st = CommittedState {
+            #[cfg(feature = "native-dex-rehearsal")]
+            native_state: None,
             admission_network_domain: None,
             slot: 0,
             epoch: 0,
@@ -2638,6 +2642,20 @@ impl CommittedState {
     /// gap the 2026-08-11 extension closed, and the field-coverage test at
     /// the bottom of this file exists to make that regression loud.
     fn compute_root(&self) -> [u8; 32] {
+        #[cfg(feature = "native-dex-rehearsal")]
+        let native = self.native_state.as_ref().map(native_dex::NativeState::commitment);
+        #[cfg(not(feature = "native-dex-rehearsal"))]
+        let native = None;
+        self.compute_root_with_native(native)
+    }
+
+    /// Base-only projection for rehearsal checkpoints, never a block state root.
+    #[cfg(all(test, feature = "native-dex-rehearsal"))]
+    fn compute_base_projection_root(&self) -> [u8; 32] {
+        self.compute_root_with_native(None)
+    }
+
+    fn compute_root_with_native(&self, native_state: Option<[u8; 32]>) -> [u8; 32] {
         ROOT_COMPUTATION_COUNT.with(|c| c.set(c.get().wrapping_add(1)));
         // Instrumentation only; compiled out without `perf-timing`.
         let _perf = crate::perf::span(crate::perf::Phase::StateRoot);
@@ -2840,6 +2858,7 @@ impl CommittedState {
         // supplied it, and nothing did: every block from genesis committed an
         // empty balance component. Hence the emphasis.)
         crate::state_root::state_root_with_eutxo_tree(&ConsensusState {
+            native_state,
             written_off_sat: self.written_off_sat,
             funded_validators: &self.funded_validators.iter().copied().collect::<Vec<_>>(),
             stake_low_water: &self.stake_low_water.iter().map(|(k,v)| (*k,*v)).collect::<Vec<_>>(),
@@ -5620,6 +5639,35 @@ impl<V: SignatureVerifier> Transition<V> {
             st = st.close_epoch();
         }
 
+        // Initialize through the live transition, from genesis-authenticated
+        // context only. No rehearsal import, native transaction or payout path.
+        let native_active = crate::params::native_state_active(block_epoch);
+        #[cfg(feature = "native-dex-rehearsal")]
+        {
+            if !native_active && st.native_state.is_some() {
+                return Err(TransitionError::NativeStateUnavailable);
+            }
+            if native_active {
+                let domain = st.admission_network_domain
+                    .filter(|domain| *domain != [0; 32])
+                    .ok_or(TransitionError::NativeStateUnavailable)?;
+                match st.native_state.as_ref() {
+                    Some(native) if native.domain() != domain => {
+                        return Err(TransitionError::NativeStateUnavailable);
+                    }
+                    Some(_) => {}
+                    None => {
+                        st.native_state = Some(native_dex::NativeState::empty(domain)
+                            .map_err(|_| TransitionError::NativeStateUnavailable)?);
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "native-dex-rehearsal"))]
+        if native_active {
+            return Err(TransitionError::NativeStateUnavailable);
+        }
+
         // 3c. THE HARD CAP IS A CONSENSUS INVARIANT (founder decision,
         // 2026-08-12): a block whose committed cumulative issuance exceeds
         // `TOTAL_SUPPLY_SAT` is invalid, on every node, with its own error.
@@ -7141,6 +7189,79 @@ mod tests {
             opening_balances,
         );
         (Transition::new(verifier), st, chains)
+    }
+
+    #[cfg(feature = "native-dex-rehearsal")]
+    #[test]
+    fn native_owned_state_activation_empty_replay_and_forks() {
+        use crate::params::native_state_rehearsal::run;
+        assert!(!crate::params::native_state_active(u64::MAX));
+        let (t, mut genesis, mut chains) = setup(4);
+        genesis.admission_network_domain = Some([41; 32]);
+        let historical = build_block(&t, &genesis, 1, &[], &[], &mut chains);
+        let before = t.apply_block(&genesis, &historical, &[], &[]).unwrap();
+        assert!(before.native_state.is_none());
+        assert_eq!(before.compute_root(), before.compute_base_projection_root());
+        let (activated, child) = run(1, || {
+            assert!(!crate::params::native_state_active(0));
+            let boundary = build_block(&t, &before, crate::SLOTS_PER_EPOCH, &[], &[], &mut chains);
+            let state = t.apply_block(&before, &boundary, &[], &[]).unwrap();
+            assert!(state.native_state.is_some());
+            assert_ne!(state.compute_root(), state.compute_base_projection_root());
+            assert_eq!(before.native_state, None);
+            let child = build_block(&t, &state, crate::SLOTS_PER_EPOCH + 1, &[], &[], &mut chains);
+            let post = t.apply_block(&state, &child, &[], &[]).unwrap();
+            assert_eq!(post.native_state, state.native_state);
+            let replay = t.apply_block(&genesis, &historical, &[], &[]).unwrap();
+            let replay = t.apply_block(&replay, &boundary, &[], &[]).unwrap();
+            assert_eq!(t.apply_block(&replay, &child, &[], &[]).unwrap(), post);
+            // Fork from the ancestor at a skipped boundary, with independent
+            // proposer reveal positions. Reapplying a branch is deterministic.
+            let mut fork_chains = setup(4).2;
+            let _ = build_block(&t, &genesis, 1, &[], &[], &mut fork_chains);
+            let fork = build_block(&t, &before, 2 * crate::SLOTS_PER_EPOCH, &[], &[], &mut fork_chains);
+            let fork_state = t.apply_block(&before, &fork, &[], &[]).unwrap();
+            assert_eq!(fork_state.native_state, state.native_state);
+            assert_eq!(t.apply_block(&before.clone(), &fork, &[], &[]).unwrap(), fork_state);
+            // A changed component changes only the full root, not the base projection.
+            let mut changed = post.clone();
+            changed.native_state = Some(native_dex::NativeState::empty([42; 32]).unwrap());
+            assert_ne!(changed.compute_root(), post.compute_root());
+            assert_eq!(changed.compute_base_projection_root(), post.compute_base_projection_root());
+            let mut wrong_domain = state.clone();
+            wrong_domain.admission_network_domain = Some([42; 32]);
+            assert_eq!(t.apply_block(&wrong_domain, &child, &[], &[]), Err(TransitionError::NativeStateUnavailable));
+            let mut bad = child.clone();
+            bad.header.state_root = changed.compute_root();
+            assert_eq!(t.apply_block(&state, &bad, &[], &[]), Err(TransitionError::StateRootMismatch));
+            (state, child)
+        });
+        assert_eq!(t.apply_block(&activated, &child, &[], &[]), Err(TransitionError::NativeStateUnavailable));
+        assert!(!crate::params::native_state_active(1));
+    }
+
+    #[cfg(feature = "native-dex-rehearsal")]
+    #[test]
+    fn native_owned_state_requires_domain_and_preserves_ordinary_transfers() {
+        use crate::params::native_state_rehearsal::run;
+        let owner = owner_key(0x31);
+        let coin = opening(0x77, 0, 1_000_000_000, &owner);
+        let (t, mut genesis, mut chains) = setup_funded(4, std::slice::from_ref(&coin));
+        let empty = build_block(&t, &genesis, 1, &[], &[], &mut chains);
+        run(0, || {
+            assert_eq!(t.apply_block(&genesis, &empty, &[], &[]), Err(TransitionError::NativeStateUnavailable));
+            genesis.admission_network_domain = Some([0; 32]);
+            assert_eq!(t.apply_block(&genesis, &empty, &[], &[]), Err(TransitionError::NativeStateUnavailable));
+            genesis.admission_network_domain = Some([41; 32]);
+            let mut chains = setup(4).2;
+            let first = build_block(&t, &genesis, 1, &[], &[], &mut chains);
+            let state = t.apply_block(&genesis, &first, &[], &[]).unwrap();
+            let tx = transfer_spending(&[coin], &owner, script_of(&owner_key(0x32)), 256, 0, state.next_base_fee());
+            let block = build_block(&t, &state, 2, &[], std::slice::from_ref(&tx), &mut chains);
+            let post = t.apply_block(&state, &block, &[], std::slice::from_ref(&tx)).unwrap();
+            assert_eq!(post.native_state, state.native_state);
+            assert_ne!(post.compute_base_projection_root(), state.compute_base_projection_root());
+        });
     }
 
     /// Build a valid block at `slot` on top of `pre`, consuming the drawn

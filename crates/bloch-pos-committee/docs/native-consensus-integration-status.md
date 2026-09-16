@@ -13,11 +13,25 @@ the node. The joint rehearsal `State` owns a separate base `CommittedState` plus
 native gateway/pool state. Embedding that entire joint State back inside
 CommittedState would be recursive and is not an integration strategy.
 
+The opt-in build now gives `CommittedState` direct ownership of an optional
+nonrecursive `NativeState`. The real `compute_post_state` initializes an empty
+component from nonzero genesis-authenticated network context when the native
+state epoch gate is active. That gate remains `u64::MAX` (disabled); only unit
+tests can override it. An active gate cannot compile without the implementation
+feature. No native transaction, populated rehearsal import or payout is enabled.
+
+State SMT tag `0x1F` is assigned to this domain-separated native commitment;
+it is not a transaction wire tag. Absence contributes no leaf and preserves
+historical roots. The component excludes the base root, avoiding circular
+commitments. The base-only projection remains separate from the complete block
+state root. Real-transition tests cover initialization, subsequent empty and
+ordinary-transfer blocks, replay, fork ancestor clones and invalid header roots.
+
 ## Required implementation sequence
 
-1. Extract native gateway/pool/accounting components from the joint wrapper so
-   the canonical state can own them without recursively owning itself. Define
-   deterministic serialization, restore validation and bounded resource use.
+1. Ownership and dormant empty-state commitment are implemented. Before allowing
+   populated canonical state, define deterministic serialization, complete restore
+   validation, bounded resource use and the execution/accounting integration.
 2. Define the consensus transaction encoding and activate it at a coordinated,
    explicit network upgrade. Reserve/register tags through the repository's wire
    tag process; do not appropriate historical or contested tags.
@@ -38,8 +52,9 @@ CommittedState would be recursive and is not an integration strategy.
 
 ## Concrete integration contract (proposed, not activated)
 
-The following is an implementation specification for review. It assigns no wire
-tag, activation epoch, production authority or approved root format.
+The following specifies the remaining integration work. The dormant state leaf
+above is implemented; no transaction wire tag, active epoch or production
+authority is assigned.
 
 ### Live paths that must agree
 
@@ -56,12 +71,13 @@ tag, activation epoch, production authority or approved root format.
 
 ### State ownership and commitment
 
-Extract components that do not own a base `CommittedState`, then make the
-canonical state own those components. An opaque split/rejoin object is useful
-for rehearsal ownership, but does not by itself implement live execution,
-serialization or canonical root inclusion. A component pinned to an earlier
-base root cannot simply be rejoined after an ordinary block changes that root;
-live execution needs one coherent mutable state and a defined base projection.
+The canonical state now owns components that do not own a base `CommittedState`.
+Only empty initialization and continuity through ordinary blocks are implemented.
+The separate opaque split/rejoin object retains its base-root pin for rehearsal;
+that pin is not part of the canonical native component. Populated rehearsal state
+cannot be imported into canonical state, and rehearsal constructors reject a base
+that already owns canonical native state. Live native transaction execution and
+serialization remain future work.
 
 Specify deterministic serialization, allocation limits, restoration checks and
 reconstruction of derived lock indexes. The node's existing snapshot ring stores
@@ -70,8 +86,8 @@ independent journal cursor. Durable restart must reconstruct the same state from
 stored blocks. Any new checkpoint/import format must carry and validate all
 native components as well.
 
-Choose and review either individually tagged native SMT leaves or a tagged
-native subtree-root leaf. For the latter, specify proof composition from a
+The dormant implementation uses a tagged native subtree-root leaf. Before
+activation, specify and review proof composition from a
 release record through the native subtree into the canonical state root, then
 into the authenticated header. A signed header alone proves neither valid
 execution nor finality. Never replace `BlockId::of` with a candidate digest.

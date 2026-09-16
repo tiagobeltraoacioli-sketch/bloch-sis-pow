@@ -80,12 +80,12 @@ pub struct Snapshot {
     pub positions: Vec<([u8; 32], Vec<u8>, u64)>,
     pub custody: Vec<custody::Record>,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Pool {
     state: PoolState,
     reserves: Option<[OutPoint; 2]>,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolLedger {
     gateway: GatewayLedger,
     pools: BTreeMap<[u8; 32], Pool>,
