@@ -48,9 +48,12 @@ launched by merely arming the transfer gate.
 
 ## Required implementation sequence
 
-1. Ownership and dormant empty-state commitment are implemented. Before allowing
-   populated canonical state, define deterministic serialization, complete restore
-   validation, bounded resource use and the execution/accounting integration.
+1. Ownership, dormant empty-state commitment and a bounded native-component
+   snapshot/restore codec are implemented. The [snapshot format](native-component-snapshot.md)
+   validates complete component data and reconstructs custody indexes against
+   a supplied base projection and trusted component commitment. It is not wired
+   to durable node storage or a populated-state import. Complete the remaining
+   node persistence and execution/accounting integration before activation.
 2. Extend the registered sponsored-transfer encoding to the remaining operations
    and activate it only at a coordinated,
    explicit network upgrade. Reserve/register tags through the repository's wire
@@ -104,8 +107,10 @@ Only empty initialization and continuity through ordinary blocks are implemented
 The separate opaque split/rejoin object retains its base-root pin for rehearsal;
 that pin is not part of the canonical native component. Populated rehearsal state
 cannot be imported into canonical state, and rehearsal constructors reject a base
-that already owns canonical native state. Live native transaction execution and
-serialization remain future work.
+that already owns canonical native state. A bounded component snapshot codec now
+validates restoration without attaching state or enabling production imports.
+Canonical sponsored-transfer execution is implemented under its disabled gate;
+gateway and pool transaction dispatch and node snapshot persistence remain open.
 
 Specify deterministic serialization, allocation limits, restoration checks and
 reconstruction of derived lock indexes. The node's existing snapshot ring stores

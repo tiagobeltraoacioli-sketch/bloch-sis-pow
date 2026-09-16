@@ -638,6 +638,84 @@ impl PoolLedger {
         })
     }
 
+    /// Checked size of owned collection payloads cloned by `snapshot`, without
+    /// allocating that snapshot. Hosts can refuse oversized exports in advance.
+    /// This excludes allocator metadata and the ledger's existing storage.
+    pub fn snapshot_allocation_bytes(&self) -> Option<usize> {
+        use crate::modules::ModuleKind;
+        let mut total = 0usize;
+        let mut add = |count: usize, width: usize| -> Option<()> {
+            total = total.checked_add(count.checked_mul(width)?)?;
+            Some(())
+        };
+        let native = &self.gateway.native;
+        add(
+            native.tokens.len(),
+            std::mem::size_of::<(AssetId, crate::ustav::TokenSnapshot)>(),
+        )?;
+        for token in native.tokens.values() {
+            let charter = &token.registration.charter;
+            add(charter.token_name.len(), 1)?;
+            add(charter.modules.len(), std::mem::size_of::<ModuleKind>())?;
+            for module in &charter.modules {
+                match module {
+                    ModuleKind::Supply(c) => add(c.issuer_pubkey.len(), 1)?,
+                    ModuleKind::TransferPolicy(c) => add(c.authority_pubkey.len(), 1)?,
+                    ModuleKind::ComplianceKycGate(_) => {}
+                    ModuleKind::Vesting(c) => add(c.beneficiary_pubkey.len(), 1)?,
+                    ModuleKind::Governance(c) => {
+                        add(c.signers.len(), std::mem::size_of::<Vec<u8>>())?;
+                        for key in &c.signers {
+                            add(key.len(), 1)?;
+                        }
+                    }
+                    ModuleKind::Custody(c) => {
+                        add(c.btc_pubkey.len(), 1)?;
+                        add(c.pq_pubkey.len(), 1)?;
+                    }
+                }
+            }
+        }
+        add(
+            native.outputs.len(),
+            std::mem::size_of::<(OutPoint, UnspentOutput)>(),
+        )?;
+        for output in native.outputs.values() {
+            add(output.output.owner.len(), 1)?;
+        }
+        add(
+            self.gateway.routes.len(),
+            std::mem::size_of::<super::RouteState>(),
+        )?;
+        for route in self.gateway.routes.values() {
+            add(route.config.committee.len(), std::mem::size_of::<Vec<u8>>())?;
+            for key in &route.config.committee {
+                add(key.len(), 1)?;
+            }
+        }
+        add(
+            self.gateway.imports.len(),
+            std::mem::size_of::<super::ImportRecord>(),
+        )?;
+        add(
+            self.gateway.releases.len(),
+            std::mem::size_of::<super::Release>(),
+        )?;
+        add(self.pools.len(), std::mem::size_of::<PoolSnapshot>())?;
+        add(
+            self.positions.len(),
+            std::mem::size_of::<([u8; 32], Vec<u8>, u64)>(),
+        )?;
+        for (_, key) in self.positions.keys() {
+            add(key.len(), 1)?;
+        }
+        add(self.custody.len(), std::mem::size_of::<custody::Record>())?;
+        for record in self.custody.values() {
+            add(record.owner.len(), 1)?;
+        }
+        Some(total)
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             version: VERSION,

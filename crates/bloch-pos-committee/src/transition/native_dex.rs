@@ -25,6 +25,7 @@ pub mod pool_wire;
 pub mod remove_liquidity;
 pub mod swap;
 pub mod swap_quote;
+pub mod snapshot_wire;
 pub mod wire;
 
 #[cfg(test)]
