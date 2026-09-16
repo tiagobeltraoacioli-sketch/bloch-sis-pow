@@ -43,7 +43,9 @@ path = "src/main.rs"
 
 [features]
 # Separate BPOSLAB1 network format; never activates official manifests.
-native-lab = ["native-component-snapshots", "bloch-pos-committee/native-lab", "dep:bloch-euvm"]
+native-lab = ["native-wallet-rpc", "bloch-pos-committee/native-lab", "dep:bloch-euvm"]
+# Read-only wallet API, authorized by canonical activation and network identity.
+native-wallet-rpc = ["native-component-snapshots", "bloch-pos-committee/native-wallet-rpc"]
 # Phase timers for the end-to-end replay benchmark (src/replay_bench.rs).
 # OFF by default; with it off every span in engine.rs and in the committee
 # crate is a zero-sized value with no Drop and disappears at compile time.

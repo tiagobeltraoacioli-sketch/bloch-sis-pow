@@ -280,10 +280,10 @@ mod tests {
         let view = e.state.native_lab_wallet_view().unwrap();
         assert_eq!(view.utxos, e.state.utxos().cloned().collect::<Vec<_>>());
         assert!(view.snapshot.len() <= 4 * 1024 * 1024);
-        let reply = e.serve_rpc(RpcRequest::NativeWalletView).unwrap();
+        let reply = e.serve_rpc(RpcRequest::NativeWalletView { owner: None }).unwrap();
         assert!(format!("{reply:?}").contains("trusted-host-projection-not-finality-proof"));
         e.tr = Transition::new(HybridVerifier::new());
-        assert!(e.serve_rpc(RpcRequest::NativeWalletView).is_err());
+        assert!(e.serve_rpc(RpcRequest::NativeWalletView { owner: None }).is_err());
         e.tr = Transition::native_laboratory(HybridVerifier::new(), domain).unwrap();
         let bytes = e.state.native_component_snapshot_bytes().unwrap().unwrap();
         assert_eq!(

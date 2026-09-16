@@ -80,14 +80,16 @@ use super::*;
 fn frozen_method_space(req: &RpcRequest) -> &'static str {
     match req {
         RpcRequest::ChainInfo => "getchaininfo",
-        #[cfg(feature="native-lab")]
+        #[cfg(feature="native-wallet-rpc")]
         RpcRequest::NativePoolQuote {..} => "getnativepoolquote",
-        #[cfg(feature="native-lab")]
+        #[cfg(feature="native-wallet-rpc")]
         RpcRequest::NativeWithdrawalQuote{..} => "getnativewithdrawalquote",
-        #[cfg(feature="native-lab")]
+        #[cfg(feature="native-wallet-rpc")]
         RpcRequest::NativePool{..} => "getnativepool",
-        #[cfg(feature="native-lab")]
-        RpcRequest::NativeWalletView => "getnativewalletview",
+        #[cfg(feature="native-wallet-rpc")]
+        RpcRequest::NativeWalletView { .. } => "getnativewalletview",
+        #[cfg(feature="native-wallet-rpc")]
+        RpcRequest::NativeBridgeState { .. } => "getnativebridgestate",
         #[cfg(feature="native-lab")]
         RpcRequest::NativeLabState {..} => "getnativelabstate",
         RpcRequest::BuildInfo => "getbuildinfo",

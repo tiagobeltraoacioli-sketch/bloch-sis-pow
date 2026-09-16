@@ -1,4 +1,4 @@
-//! Laboratory-only unsigned builders over current committed custody.
+//! Canonical unsigned builders over current committed custody.
 use super::*;
 use crate::transition::{NativeTransferPayload, TransferInputV2, TransferOutput, WitnessKey};
 use bloch_euvm::ustav as n;
@@ -52,12 +52,21 @@ impl CommittedState {
             return Err("invalid owner or validity window");
         }
         // Bound the complete state before cloning a private review projection.
-        self.native_lab_wallet_view()?;
-        let mut base = self.clone();
-        let native = base
+        let view = self.native_wallet_view_for_owner(&query.owner)?;
+        let native = self
             .native_state
-            .take()
-            .ok_or("native state not initialized")?;
+            .as_ref()
+            .ok_or("native state not initialized")?
+            .clone();
+        let base = wallet_projection::base(
+            native.domain,
+            &view.utxos,
+            view.base_fee,
+            view.block_gas_used,
+            view.block_tx_bytes,
+            view.epoch,
+        )
+        .map_err(|_| "invalid wallet base projection")?;
         let state = State {
             base,
             domain: native.domain,
@@ -403,5 +412,11 @@ impl State {
             reserve_id,
             pool_id,
         })
+    }
+}
+
+impl CommittedState {
+    pub fn native_pool_quote(&self, query: &Query, slot: u64) -> Result<Quote, &'static str> {
+        self.native_lab_pool_quote(query, slot)
     }
 }

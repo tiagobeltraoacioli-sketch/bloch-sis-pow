@@ -837,19 +837,21 @@ fn hex32_from(s: &str) -> Option<[u8; 32]> {
 /// a request reaches the engine, "the slot was not a number" has already been
 /// answered, and by the time a reply reaches the dispatcher, "no such block"
 /// has already been decided.
-#[cfg(feature="native-lab")]
+#[cfg(feature="native-wallet-rpc")]
 mod native_quote;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RpcRequest {
     ChainInfo,
-    #[cfg(feature="native-lab")]
+    #[cfg(feature="native-wallet-rpc")]
     NativePoolQuote { expected_head:[u8;32], query:bloch_pos_committee::transition::native_dex::lab_quote::Query },
-    #[cfg(feature="native-lab")]
+    #[cfg(feature="native-wallet-rpc")]
     NativeWithdrawalQuote {expected_head:[u8;32],query:bloch_pos_committee::transition::native_dex::lab_withdrawal::Query},
-    #[cfg(feature="native-lab")]
+    #[cfg(feature="native-wallet-rpc")]
     NativePool {pool:[u8;32]},
-    #[cfg(feature="native-lab")]
-    NativeWalletView,
+    #[cfg(feature="native-wallet-rpc")]
+    NativeWalletView { owner: Option<Vec<u8>> },
+    #[cfg(feature="native-wallet-rpc")]
+    NativeBridgeState { asset: [u8;32], route:[u8;32] },
     #[cfg(feature="native-lab")]
     NativeLabState { asset: [u8;32], route:[u8;32] },
     /// `getbuildinfo` — which binary is answering. Reads no chain state.
@@ -1126,20 +1128,22 @@ fn want_hex32(params: Option<&Json>, pos: usize, name: &str) -> Result<[u8; 32],
 pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError> {
     Ok(match method {
         "getchaininfo" => RpcRequest::ChainInfo,
-        #[cfg(feature="native-lab")]
+        #[cfg(feature="native-wallet-rpc")]
         "getnativepoolquote" => {
             let (expected_head,query)=native_quote::parse(params)?;
             RpcRequest::NativePoolQuote{expected_head,query}
         },
-        #[cfg(feature="native-lab")]
+        #[cfg(feature="native-wallet-rpc")]
         "getnativewithdrawalquote" => {
             let (expected_head,query)=native_quote::parse_withdrawal(params)?;
             RpcRequest::NativeWithdrawalQuote{expected_head,query}
         },
-        #[cfg(feature="native-lab")]
+        #[cfg(feature="native-wallet-rpc")]
         "getnativepool" => RpcRequest::NativePool{pool:want_hex32(params,0,"pool")?},
-        #[cfg(feature="native-lab")]
-        "getnativewalletview" => RpcRequest::NativeWalletView,
+        #[cfg(feature="native-wallet-rpc")]
+        "getnativewalletview" => RpcRequest::NativeWalletView { owner: native_quote::parse_view_owner(params)? },
+        #[cfg(feature="native-wallet-rpc")]
+        "getnativebridgestate" => RpcRequest::NativeBridgeState {asset:want_hex32(params,0,"asset")?,route:want_hex32(params,1,"route")?},
         #[cfg(feature="native-lab")]
         "getnativelabstate" => RpcRequest::NativeLabState {asset:want_hex32(params,0,"asset")?,route:want_hex32(params,1,"route")?},
         "getbuildinfo" => RpcRequest::BuildInfo,
@@ -2583,4 +2587,14 @@ pub fn validator_admission_json(state: &bloch_pos_committee::transition::Committ
         ("next_base_fee_millisat_per_gas", Json::sat(state.next_base_fee())),
         ("legacy_unfunded_deposit_enabled", Json::Bool(false)),
     ])
+}
+
+#[cfg(all(test, not(feature = "native-wallet-rpc")))]
+mod native_wallet_absent_tests {
+    #[test]
+    fn default_build_does_not_expose_native_wallet_or_bridge_methods() {
+        for method in ["getnativewalletview", "getnativepoolquote", "getnativewithdrawalquote", "getnativepool", "getnativebridgestate", "getnativelabstate"] {
+            assert!(super::route(method, None).is_err());
+        }
+    }
 }

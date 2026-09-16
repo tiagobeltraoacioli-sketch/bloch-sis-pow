@@ -1,5 +1,10 @@
 # Isolated native laboratory
 
+Official manifest support is documented separately in
+[NATIVE-WALLET-RPC.md](NATIVE-WALLET-RPC.md). Its shared read/build and admission
+code remains gated by canonical activation; it does not reuse this laboratory
+identity or bypass production gates.
+
 `native-lab` is an explicit, nondefault build feature. It does not alter any
 production activation constant. `Transition::new` keeps all existing rules,
 including when the laboratory feature is compiled. Laboratory activation belongs

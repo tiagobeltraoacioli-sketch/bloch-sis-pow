@@ -1,6 +1,6 @@
-//! Bounded laboratory-only committed route accounting.
+//! Bounded canonical committed route accounting.
 use super::NativeState;
-use crate::transition::native_lab::RouteReport;
+use crate::transition::native_wallet::RouteReport;
 impl NativeState {
     pub(in crate::transition) fn lab_route_report(
         &self,
@@ -27,9 +27,9 @@ impl NativeState {
     pub(in crate::transition) fn lab_pool_report(
         &self,
         id: &[u8; 32],
-    ) -> Option<crate::transition::native_lab::PoolReport> {
+    ) -> Option<crate::transition::native_wallet::PoolReport> {
         let record = self.initial_pools.get(id)?;
-        Some(crate::transition::native_lab::PoolReport {
+        Some(crate::transition::native_wallet::PoolReport {
             pool_id: record.pool.id(),
             reserve_id: record.reserve,
             assets: record.pool.assets(),

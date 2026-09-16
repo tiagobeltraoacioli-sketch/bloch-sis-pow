@@ -492,7 +492,7 @@ fn body_transactions(env: &BlockEnvelope) -> Result<Vec<PosTransaction>, String>
 /// consistent with the chain's own current pricing, not a new judgement this
 /// fix invents.
 fn tx_tip_rate(tx: &PosTransaction) -> u128 {
-        #[cfg(feature = "native-lab")]
+        #[cfg(feature = "native-wallet-rpc")]
         if let Some(sponsor)=bloch_pos_committee::transition::native_lab::sponsor(tx) { return tx_tip_rate(&sponsor); }
     match tx {
         PosTransaction::Transfer { tip_millisat_per_gas, .. }
@@ -514,7 +514,7 @@ fn tx_tip_rate(tx: &PosTransaction) -> u128 {
 /// (`Sha3_256::digest(pubkey)`) — see `rpc.rs`'s `validator_json` and this
 /// file's own `sweep_fixture_declaring` for the same convention.
 fn tx_source_hash(tx: &PosTransaction) -> Option<[u8; 32]> {
-        #[cfg(feature = "native-lab")]
+        #[cfg(feature = "native-wallet-rpc")]
         if let Some(sponsor)=bloch_pos_committee::transition::native_lab::sponsor(tx) { return tx_source_hash(&sponsor); }
     match tx {
         PosTransaction::Transfer { inputs, .. } => {
@@ -2784,7 +2784,7 @@ impl Engine {
     /// the same answer — the sweep may only ever judge transactions that
     /// actually name outpoints.
     fn spent_outpoints(tx: &PosTransaction) -> Option<Vec<([u8; 32], u32)>> {
-        #[cfg(feature = "native-lab")]
+        #[cfg(feature = "native-wallet-rpc")]
         if let Some(sponsor)=bloch_pos_committee::transition::native_lab::sponsor(tx) { return Self::spent_outpoints(&sponsor); }
         match tx {
             PosTransaction::Transfer { inputs, .. } => {
@@ -3127,26 +3127,25 @@ impl Engine {
                 return Err(Refusal::Invalid("funded deposit belongs to a different genesis manifest"));
             }
         }
-        #[cfg(feature = "native-lab")]
+        #[cfg(feature = "native-wallet-rpc")]
         if bloch_pos_committee::transition::native_lab::is_native(&tx) {
-            if !self.tr.native_lab_matches(&self.state) {
-                return Err(Refusal::Invalid("native laboratory network is not selected"));
-            }
-            if bloch_pos_committee::transition::native_lab::sponsor(&tx).is_none() {
-                return Err(Refusal::Invalid("malformed native laboratory sponsor"));
-            }
-            self.tr.validate_native_lab_transaction(&self.state,&tx,self.wall_slot().max(self.state.slot().saturating_add(1)))
+            self.native_wallet_format(bloch_pos_committee::transition::native_wallet::WalletOperation::View)
                 .map_err(|_| Refusal::PreviouslyRefused { until_slot: self.head_slot_now().saturating_add(1) })?;
-            // Serialize native operations in the laboratory pool. This covers
+            if bloch_pos_committee::transition::native_lab::sponsor(&tx).is_none() {
+                return Err(Refusal::Invalid("malformed native sponsor"));
+            }
+            self.tr.validate_native_transaction(&self.state,&tx,self.wall_slot().max(self.state.slot().saturating_add(1)))
+                .map_err(|_| Refusal::PreviouslyRefused { until_slot: self.head_slot_now().saturating_add(1) })?;
+            // Serialize native operations in the conservative admission pool. This covers
             // native inputs, route nonces and pool revisions without claiming
             // support for unconfirmed dependency chains.
             if self.mempool.values().any(bloch_pos_committee::transition::native_lab::is_native) {
                 return Err(Refusal::PreviouslyRefused { until_slot: self.head_slot_now().saturating_add(1) });
             }
         } else { admissible(&tx, epoch_of(self.wall_slot())).map_err(Refusal::Invalid)?; }
-        #[cfg(not(feature = "native-lab"))]
+        #[cfg(not(feature = "native-wallet-rpc"))]
         admissible(&tx, epoch_of(self.wall_slot())).map_err(Refusal::Invalid)?;
-        #[cfg(feature = "native-lab")]
+        #[cfg(feature = "native-wallet-rpc")]
         if self.mempool.values().any(|other| {
             (bloch_pos_committee::transition::native_lab::is_native(&tx) || bloch_pos_committee::transition::native_lab::is_native(other))
             && Self::spent_outpoints(&tx).is_some_and(|a|Self::spent_outpoints(other).is_some_and(|b|a.iter().any(|p|b.contains(p))))
@@ -3237,7 +3236,7 @@ impl Engine {
                 PosTransaction::FundedDeposit(tx) => tx.tx_bytes,
                 _ => 0,
             };
-            #[cfg(feature = "native-lab")]
+            #[cfg(feature = "native-wallet-rpc")]
             let declared = match bloch_pos_committee::transition::native_lab::sponsor(tx) {
                 Some(PosTransaction::TransferV2{tx_bytes,..})=>tx_bytes, _=>declared,
             };
@@ -4073,19 +4072,22 @@ impl Engine {
         )
     }
 
+    #[cfg(feature = "native-wallet-rpc")]
+    fn native_wallet_format(&self, operation: bloch_pos_committee::transition::native_wallet::WalletOperation) -> Result<&'static str, rpc::RpcError> {
+        native_wallet_rpc::format(&self.manifest, &self.state, &self.tr, operation)
+    }
+
     fn serve_rpc(&mut self, req: RpcRequest) -> RpcResult {
         match req {
-            #[cfg(feature="native-lab")]
+            #[cfg(feature="native-wallet-rpc")]
             RpcRequest::NativePoolQuote {expected_head,query} => {
-                if !self.tr.native_lab_matches(&self.state) {
-                    return Err(rpc::RpcError::new(-32601,"native laboratory is not selected"));
-                }
+                self.native_wallet_format(bloch_pos_committee::transition::native_wallet::WalletOperation::Pool)?;
                 if self.head_id().as_bytes()!=&expected_head {
-                    return Err(rpc::RpcError::new(-32000,"laboratory head changed; obtain a fresh view"));
+                    return Err(rpc::RpcError::new(-32000,"canonical head changed; obtain a fresh view"));
                 }
-                let quote=self.state.native_lab_pool_quote(&query,self.state.slot())
+                let quote=self.state.native_pool_quote(&query,self.state.slot())
                     .map_err(|e|rpc::RpcError::new(-32000,e))?;
-                let Json::Obj(mut fields)=self.serve_rpc(RpcRequest::NativeWalletView)? else {unreachable!()};
+                let Json::Obj(mut fields)=self.serve_rpc(RpcRequest::NativeWalletView { owner: Some(query.owner.clone()) })? else {unreachable!()};
                 fields.push(("transactionHex".into(),Json::s(crate::codec::hex(&quote.transaction))));
                 fields.push(("feeSat".into(),Json::sat(quote.fee_sat)));
                 fields.push(("reserveId".into(),quote.reserve_id.map_or(Json::Null,|id|Json::hex(&id))));
@@ -4096,17 +4098,15 @@ impl Engine {
                 })));
                 Ok(Json::Obj(fields))
             }
-            #[cfg(feature="native-lab")]
+            #[cfg(feature="native-wallet-rpc")]
             RpcRequest::NativeWithdrawalQuote{expected_head,query} => {
-                if !self.tr.native_lab_matches(&self.state) {
-                    return Err(rpc::RpcError::new(-32601,"native laboratory is not selected"));
-                }
+                self.native_wallet_format(bloch_pos_committee::transition::native_wallet::WalletOperation::Withdrawal)?;
                 if self.head_id().as_bytes()!=&expected_head {
-                    return Err(rpc::RpcError::new(-32000,"laboratory head changed; obtain a fresh view"));
+                    return Err(rpc::RpcError::new(-32000,"canonical head changed; obtain a fresh view"));
                 }
-                let quote=self.state.native_lab_withdrawal_quote(&query,self.state.slot())
+                let quote=self.state.native_withdrawal_quote(&query,self.state.slot())
                     .map_err(|e|rpc::RpcError::new(-32000,e))?;
-                let Json::Obj(mut fields)=self.serve_rpc(RpcRequest::NativeWalletView)? else {unreachable!()};
+                let Json::Obj(mut fields)=self.serve_rpc(RpcRequest::NativeWalletView { owner: Some(query.owner.clone()) })? else {unreachable!()};
                 fields.extend(vec![
                     ("operation".into(),Json::s("withdraw")),
                     ("transactionHex".into(),Json::s(crate::codec::hex(&quote.transaction))),
@@ -4124,15 +4124,13 @@ impl Engine {
                 ]);
                 Ok(Json::Obj(fields))
             }
-            #[cfg(feature="native-lab")]
+            #[cfg(feature="native-wallet-rpc")]
             RpcRequest::NativePool{pool} => {
-                if !self.tr.native_lab_matches(&self.state) {
-                    return Err(rpc::RpcError::new(-32601,"native laboratory is not selected"));
-                }
-                let report=self.state.native_lab_pool_report(&pool)
-                    .ok_or_else(||rpc::RpcError::new(-32000,"unknown native laboratory pool"))?;
+                let format = self.native_wallet_format(bloch_pos_committee::transition::native_wallet::WalletOperation::View)?;
+                let report=self.state.native_pool_report(&pool)
+                    .ok_or_else(||rpc::RpcError::new(-32000,"unknown canonical native pool"))?;
                 Ok(Json::obj(vec![
-                    ("format",Json::s("BPOSLAB1")),
+                    ("format",Json::s(format)),
                     ("domain",Json::hex(&self.state.admission_network_domain().unwrap())),
                     ("genesis",Json::hex(self.manifest.genesis_id().as_bytes())),
                     ("head",Json::hex(self.head_id().as_bytes())),("height",Json::sat(self.state.slot() as u128)),
@@ -4145,15 +4143,16 @@ impl Engine {
                     ("custody",Json::s("locked-pool-reserves")),
                 ]))
             }
-            #[cfg(feature="native-lab")]
-            RpcRequest::NativeWalletView => {
-                if !self.tr.native_lab_matches(&self.state) {
-                    return Err(rpc::RpcError::new(-32601, "native laboratory is not selected"));
-                }
-                let view = self.state.native_lab_wallet_view()
-                    .map_err(|e| rpc::RpcError::new(-32000, e))?;
+            #[cfg(feature="native-wallet-rpc")]
+            RpcRequest::NativeWalletView { owner } => {
+                let format = self.native_wallet_format(bloch_pos_committee::transition::native_wallet::WalletOperation::View)?;
+                let view = match owner.as_deref() {
+                    Some(key) => self.state.native_wallet_view_for_owner(key),
+                    None if format == "BPOSLAB1" => self.state.native_wallet_view(),
+                    None => Err("official native wallet view requires ownerPublicKeyHex"),
+                }.map_err(|e| rpc::RpcError::new(-32000, e))?;
                 Ok(Json::obj(vec![
-                    ("format", Json::s("BPOSLAB1")),
+                    ("format", Json::s(format)),
                     ("domain", Json::hex(&self.state.admission_network_domain().unwrap())),
                     ("genesis", Json::hex(self.manifest.genesis_id().as_bytes())),
                     ("head", Json::hex(self.head_id().as_bytes())),
@@ -4171,6 +4170,26 @@ impl Engine {
                             ("txid", Json::hex(&u.txid)), ("vout", Json::sat(u.vout as u128)),
                             ("value", Json::sat(u.value as u128)), ("scriptHash", Json::hex(&u.script_hash)),
                         ])).collect())),
+                    ])),
+                ]))
+            }
+            #[cfg(feature="native-wallet-rpc")]
+            RpcRequest::NativeBridgeState { asset, route } => {
+                let format = self.native_wallet_format(bloch_pos_committee::transition::native_wallet::WalletOperation::View)?;
+                let report = self.state.native_lab_route_report(&asset, &route)
+                    .ok_or_else(|| rpc::RpcError::new(-32000, "unknown canonical native asset route"))?;
+                Ok(Json::obj(vec![
+                    ("format", Json::s(format)), ("domain", Json::hex(&self.state.admission_network_domain().unwrap())),
+                    ("genesis", Json::hex(self.manifest.genesis_id().as_bytes())),
+                    ("head", Json::hex(self.head_id().as_bytes())), ("height", Json::sat(self.state.slot() as u128)),
+                    ("stateRoot", Json::hex(&self.head_state_root())),
+                    ("asset", Json::hex(&asset)), ("route", Json::hex(&route)),
+                    ("trust", Json::s("trusted-host-projection-not-finality-proof")),
+                    ("externalSettlementConfirmed", Json::Bool(false)),
+                    ("ledger", Json::obj(vec![
+                        ("supply", Json::sat(report.supply as u128)), ("imported", Json::sat(report.imported)),
+                        ("burned", Json::sat(report.burned)), ("nextReleaseNonce", Json::sat(report.next_release_nonce as u128)),
+                        ("nativeCommitment", Json::hex(&report.commitment)),
                     ])),
                 ]))
             }
@@ -11689,3 +11708,6 @@ mod branch_gap_repair_tests {
 }
 
 mod native_laboratory;
+
+#[cfg(feature = "native-wallet-rpc")]
+mod native_wallet_rpc;

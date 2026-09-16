@@ -246,3 +246,64 @@ mod withdrawal_tests {
         assert!(parse_withdrawal(Some(&Json::Arr(vec![Json::obj(fields)]))).is_err());
     }
 }
+
+pub(super) fn parse_view_owner(params: Option<&Json>) -> Result<Option<Vec<u8>>, RpcError> {
+    let args = match params {
+        None => return Ok(None),
+        Some(Json::Arr(args)) if args.is_empty() => return Ok(None),
+        Some(Json::Arr(args)) => args,
+        _ => return Err(RpcError::invalid_params("expected one owner object")),
+    };
+    let [Json::Obj(fields)] = args.as_slice() else {
+        return Err(RpcError::invalid_params("expected one owner object"));
+    };
+    let [(name, Json::Str(raw))] = fields.as_slice() else {
+        return Err(RpcError::invalid_params("expected ownerPublicKeyHex only"));
+    };
+    if name != "ownerPublicKeyHex" || raw.len() > 16384 {
+        return Err(RpcError::invalid_params("invalid owner field or key bound"));
+    }
+    let owner = from_hex(raw)
+        .filter(|k| bloch_crypto::crypto::valid_native_hybrid_key(k))
+        .ok_or_else(|| RpcError::invalid_params("invalid hybrid owner key"))?;
+    Ok(Some(owner))
+}
+
+#[cfg(test)]
+mod wallet_scope_tests {
+    use super::*;
+    #[test]
+    fn wallet_view_owner_is_a_single_bounded_hybrid_key_not_an_arbitrary_scope() {
+        assert_eq!(parse_view_owner(None).unwrap(), None);
+        assert_eq!(parse_view_owner(Some(&Json::Arr(vec![]))).unwrap(), None);
+        let (key, _) = bloch_crypto::crypto::generate_keypair_from_seed(&[7; 32]).unwrap();
+        let owner = Json::obj(vec![(
+            "ownerPublicKeyHex",
+            Json::s(crate::codec::hex(&key)),
+        )]);
+        assert_eq!(
+            parse_view_owner(Some(&Json::Arr(vec![owner.clone()]))).unwrap(),
+            Some(key)
+        );
+        assert!(parse_view_owner(Some(&Json::Arr(vec![owner.clone(), owner]))).is_err());
+        let duplicate = Json::Obj(vec![
+            ("ownerPublicKeyHex".into(), Json::s("00")),
+            ("ownerPublicKeyHex".into(), Json::s("00")),
+        ]);
+        assert!(parse_view_owner(Some(&Json::Arr(vec![duplicate]))).is_err());
+        assert!(parse_view_owner(Some(&Json::Arr(vec![Json::obj(vec![(
+            "ownerPublicKeyHex",
+            Json::s("00".repeat(8193))
+        )])])))
+        .is_err());
+    }
+    #[cfg(not(feature = "native-lab"))]
+    #[test]
+    fn official_wallet_feature_never_exposes_laboratory_accounting_method() {
+        assert!(route("getnativelabstate", None).is_err());
+        assert!(matches!(
+            route("getnativewalletview", None),
+            Ok(RpcRequest::NativeWalletView { owner: None })
+        ));
+    }
+}

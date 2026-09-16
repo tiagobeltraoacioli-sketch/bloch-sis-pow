@@ -184,6 +184,11 @@ impl NativeState {
         self.base_locks.contains_key(point)
     }
 
+    #[cfg(feature = "native-wallet-rpc")]
+    pub(super) fn base_custody_points(&self) -> impl Iterator<Item = &base_reserves::OutPoint> {
+        self.base_locks.keys()
+    }
+
     #[cfg(test)]
     pub(super) fn test_lock_base(&mut self, point: base_reserves::OutPoint) {
         self.base_locks.insert(point, [1; 32]);
@@ -794,9 +799,12 @@ mod component_tests {
     }
 }
 
-#[cfg(feature="native-lab")]
+#[cfg(feature="native-wallet-rpc")]
 mod lab_view;
-#[cfg(feature = "native-lab")]
+#[cfg(feature = "native-wallet-rpc")]
 pub mod lab_quote;
-#[cfg(feature = "native-lab")]
+#[cfg(feature = "native-wallet-rpc")]
 pub mod lab_withdrawal;
+
+#[cfg(all(test, feature = "native-wallet-rpc"))]
+mod wallet_api_tests;

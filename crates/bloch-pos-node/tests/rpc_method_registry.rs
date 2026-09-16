@@ -92,11 +92,12 @@ use std::path::PathBuf;
 /// without compiling anything.
 const ROUTED: &[(&str, &str)] = &[
     ("getchaininfo", "ChainInfo"),
-    // Source scan sees the laboratory-only cfg arm; default routing still rejects it.
+    // Source scan sees opt-in native wallet cfg arms; default routing rejects them.
     ("getnativepoolquote", "NativePoolQuote"),
     ("getnativewithdrawalquote", "NativeWithdrawalQuote"),
     ("getnativepool", "NativePool"),
     ("getnativewalletview", "NativeWalletView"),
+    ("getnativebridgestate", "NativeBridgeState"),
     ("getnativelabstate", "NativeLabState"),
     ("getbuildinfo", "BuildInfo"),
     ("getblockcount", "BlockCount"),

@@ -1,4 +1,4 @@
-//! Laboratory-only withdrawal preparation. External authorities never sign in the wallet.
+//! Canonical withdrawal preparation. External authorities never sign in the wallet.
 use super::*;
 use crate::transition::{NativeTransferPayload, TransferInputV2, TransferOutput, WitnessKey};
 use bloch_euvm::{ustav as n, ustav::gateway as g};
@@ -28,12 +28,21 @@ impl CommittedState {
         q: &Query,
         height: u64,
     ) -> Result<Quote, &'static str> {
-        self.native_lab_wallet_view()?;
-        let mut base = self.clone();
-        let native = base
+        let view = self.native_wallet_view_for_owner(&q.owner)?;
+        let native = self
             .native_state
-            .take()
-            .ok_or("native state not initialized")?;
+            .as_ref()
+            .ok_or("native state not initialized")?
+            .clone();
+        let base = wallet_projection::base(
+            native.domain,
+            &view.utxos,
+            view.base_fee,
+            view.block_gas_used,
+            view.block_tx_bytes,
+            view.epoch,
+        )
+        .map_err(|_| "invalid wallet base projection")?;
         let state = State {
             base,
             domain: native.domain,
@@ -269,5 +278,11 @@ impl State {
         )
         .canonical_bytes();
         Ok(quote)
+    }
+}
+
+impl CommittedState {
+    pub fn native_withdrawal_quote(&self, query: &Query, slot: u64) -> Result<Quote, &'static str> {
+        self.native_lab_withdrawal_quote(query, slot)
     }
 }

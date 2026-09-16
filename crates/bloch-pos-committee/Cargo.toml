@@ -13,7 +13,9 @@ publish = false
 
 [features]
 # Explicit isolated laboratory only; activation is pinned per Transition instance.
-native-lab = ["native-dex-rehearsal"]
+native-lab = ["native-wallet-rpc"]
+# Read-only native wallet projections/builders; never enables a consensus gate.
+native-wallet-rpc = ["native-dex-rehearsal"]
 # Opt-in native executor and local rehearsal. Canonical component/transfer gates
 # remain disabled; default builds decode the bounded transfer frame but reject it.
 native-dex-rehearsal = ["dep:bloch-euvm"]

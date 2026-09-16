@@ -1,0 +1,29 @@
+{
+  "schema": "bloch.native-mainnet-activation.v1",
+  "network": {
+    "format": "BPOSMAN1",
+    "domain": "f47d3e498ff978e34471dafff5f94fe139fc3ff489b1a00f469c030258311966",
+    "genesis": "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"
+  },
+  "gateEpochs": {
+    "state": null,
+    "transfer": null,
+    "bootstrap": null,
+    "import": null,
+    "withdrawal": null,
+    "pool": null
+  },
+  "minimumLeadEpochs": "4",
+  "release": {
+    "commit": null,
+    "binarySha256": null,
+    "buildProfile": "release",
+    "features": [
+      "native-wallet-rpc"
+    ]
+  },
+  "chainObservation": null,
+  "validatorRoster": null,
+  "validatorReadiness": [],
+  "custodyManifest": null
+}

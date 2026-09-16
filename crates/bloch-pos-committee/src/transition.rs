@@ -16570,5 +16570,8 @@ mod epoch_advance_bound {
     }
 }
 
-#[cfg(feature = "native-lab")]
+#[cfg(feature = "native-wallet-rpc")]
 pub mod native_lab;
+
+#[cfg(feature = "native-wallet-rpc")]
+pub mod native_wallet;
