@@ -64,10 +64,159 @@ pub struct RedemptionReview<'a> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReviewCertificateError {
+    InvalidReview,
     WrongCheckpoint,
     InvalidAuthority,
     InvalidValidity,
     InvalidSignature,
+}
+
+/// Trust inputs must come from the operator's authenticated configuration/state,
+/// never from the exported review or its certificate.
+pub struct ReviewTrust<'a> {
+    pub checkpoint: Checkpoint,
+    pub authority: &'a [u8],
+    pub current_height: u64,
+}
+pub struct ReviewCertificate<'a> {
+    pub valid_until: u64,
+    pub signature: &'a [u8],
+}
+
+/// Verify a bounded canonical export without access to the originating journal.
+/// Returns the authenticated attestation commitment, not a finality/payment proof.
+pub fn verify_exported_review(
+    preimage: &[u8],
+    trust: ReviewTrust<'_>,
+    certificate: ReviewCertificate<'_>,
+    expected_route: &gateway::Route,
+    expected_release: &Release,
+) -> Result<[u8; 32], ReviewCertificateError> {
+    use ReviewCertificateError::InvalidReview;
+    const TAG: &[u8] = b"BLOCH-REDEMPTION-REVIEW-v1\0";
+    const FIXED: usize = TAG.len() + 8 + 32 + 32 + 32 + 8 + 16 + 16 + 32 + 4;
+    const ROUTE_BYTES: usize = 32 + 32 + 20 + 20 + 16 + 16 + 8 + 8;
+    if preimage.len() > FIXED + gateway::MAX_ROUTES * ROUTE_BYTES {
+        return Err(InvalidReview);
+    }
+    struct Reader<'a>(&'a [u8]);
+    impl Reader<'_> {
+        fn take<const N: usize>(&mut self) -> Result<[u8; N], ReviewCertificateError> {
+            let value = self
+                .0
+                .get(..N)
+                .ok_or(InvalidReview)?
+                .try_into()
+                .map_err(|_| InvalidReview)?;
+            self.0 = &self.0[N..];
+            Ok(value)
+        }
+    }
+    let mut reader = Reader(preimage.strip_prefix(TAG).ok_or(InvalidReview)?);
+    let checkpoint = Checkpoint {
+        height: u64::from_be_bytes(reader.take()?),
+        root: reader.take()?,
+    };
+    if checkpoint != trust.checkpoint {
+        return Err(ReviewCertificateError::WrongCheckpoint);
+    }
+    let native_domain = reader.take()?;
+    let native_asset = reader.take()?;
+    let native_supply = u64::from_be_bytes(reader.take()?);
+    let imported = u128::from_be_bytes(reader.take()?);
+    let burned = u128::from_be_bytes(reader.take()?);
+    let release_id: [u8; 32] = reader.take()?;
+    let count = u32::from_be_bytes(reader.take()?) as usize;
+    if count == 0
+        || count > gateway::MAX_ROUTES
+        || reader.0.len() != count * ROUTE_BYTES
+        || native_domain != expected_route.native_domain
+        || native_asset != expected_route.native_asset
+        || expected_route.decimals != 6
+        || expected_route.cap == 0
+        || expected_release.route != expected_route.id()
+        || expected_release.id() != release_id
+        || expected_release.amount == 0
+        || expected_release.amount > expected_route.cap
+        || expected_release.nonce == u64::MAX
+        || expected_release.native_burn == [0; 32]
+        || expected_release.recipient == [0; 20]
+        || expected_release.recipient == expected_route.vault
+        || expected_release.recipient == expected_route.token
+    {
+        return Err(InvalidReview);
+    }
+    let mut routes = Vec::with_capacity(count);
+    let (mut imports, mut burns, mut supply) = (0u128, 0u128, 0u128);
+    let mut previous = None;
+    let mut matched = false;
+    for _ in 0..count {
+        let entry = gateway::RouteLiabilities {
+            route: reader.take()?,
+            source_domain: reader.take()?,
+            token: reader.take()?,
+            vault: reader.take()?,
+            imported: u128::from_be_bytes(reader.take()?),
+            burned: u128::from_be_bytes(reader.take()?),
+            outstanding: u64::from_be_bytes(reader.take()?),
+            release_count: u64::from_be_bytes(reader.take()?),
+        };
+        if previous.is_some_and(|id| entry.route <= id)
+            || entry.imported.checked_sub(entry.burned) != Some(u128::from(entry.outstanding))
+        {
+            return Err(InvalidReview);
+        }
+        previous = Some(entry.route);
+        imports = imports.checked_add(entry.imported).ok_or(InvalidReview)?;
+        burns = burns.checked_add(entry.burned).ok_or(InvalidReview)?;
+        supply = supply
+            .checked_add(u128::from(entry.outstanding))
+            .ok_or(InvalidReview)?;
+        if entry.route == expected_release.route {
+            if entry.source_domain != expected_route.source_domain
+                || entry.token != expected_route.token
+                || entry.vault != expected_route.vault
+                || entry.outstanding > expected_route.cap
+                || entry.burned < u128::from(expected_release.amount)
+                || entry.release_count <= expected_release.nonce
+            {
+                return Err(InvalidReview);
+            }
+            matched = true;
+        }
+        routes.push(entry);
+    }
+    if !matched
+        || imports != imported
+        || burns != burned
+        || supply != u128::from(native_supply)
+        || imported.checked_sub(burned) != Some(supply)
+    {
+        return Err(InvalidReview);
+    }
+    let review = RedemptionReview {
+        checkpoint,
+        release: expected_release,
+        liabilities: gateway::AssetLiabilities {
+            native_domain,
+            native_asset,
+            native_supply,
+            imported,
+            burned,
+            routes,
+        },
+    };
+    if review.commitment_preimage() != preimage {
+        return Err(InvalidReview);
+    }
+    review.verify_certificate(
+        trust.checkpoint,
+        trust.authority,
+        trust.current_height,
+        certificate.valid_until,
+        certificate.signature,
+    )?;
+    Ok(review.commitment())
 }
 
 impl RedemptionReview<'_> {

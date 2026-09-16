@@ -589,6 +589,75 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
             &signature,
         )
         .unwrap();
+    // Verify the transport bytes without giving the verifier access to the journal.
+    use bloch_ustav::dex_journal::{
+        verify_exported_review, ReviewCertificate, ReviewCertificateError, ReviewTrust,
+    };
+    let source_route = &journal
+        .state()
+        .native()
+        .gateway()
+        .route(&route)
+        .unwrap()
+        .config
+        .route;
+    let preimage = review.commitment_preimage();
+    let verify = |bytes: &[u8], expected: &gateway::Release, height, sig: &[u8]| {
+        verify_exported_review(
+            bytes,
+            ReviewTrust {
+                checkpoint: head,
+                authority: &review_authority,
+                current_height: height,
+            },
+            ReviewCertificate {
+                valid_until,
+                signature: sig,
+            },
+            source_route,
+            expected,
+        )
+    };
+    assert_eq!(
+        verify(&preimage, &release, head.height, &signature),
+        Ok(review_commitment)
+    );
+    for length in 0..preimage.len() {
+        assert!(verify(&preimage[..length], &release, head.height, &signature).is_err());
+    }
+    let mut trailing = preimage.clone();
+    trailing.push(0);
+    assert_eq!(
+        verify(&trailing, &release, head.height, &signature),
+        Err(ReviewCertificateError::InvalidReview)
+    );
+    assert_eq!(
+        verify(&vec![0; 5568], &release, head.height, &signature),
+        Err(ReviewCertificateError::InvalidReview)
+    );
+    // Every byte is either structurally checked or covered by the certificate.
+    for index in 0..preimage.len() {
+        let mut changed = preimage.clone();
+        changed[index] ^= 1;
+        assert!(
+            verify(&changed, &release, head.height, &signature).is_err(),
+            "byte {index}"
+        );
+    }
+    let mut other_release = release.clone();
+    other_release.native_burn[0] ^= 1;
+    assert_eq!(
+        verify(&preimage, &other_release, head.height, &signature),
+        Err(ReviewCertificateError::InvalidReview)
+    );
+    assert_eq!(
+        verify(&preimage, &release, valid_until + 1, &signature),
+        Err(ReviewCertificateError::InvalidValidity)
+    );
+    assert_eq!(
+        verify(&preimage, &release, head.height, &[]),
+        Err(ReviewCertificateError::InvalidSignature)
+    );
     let value: serde_json::Value = serde_json::from_str(&exported).unwrap();
     assert_eq!(value.as_object().unwrap().len(), 7);
     assert_eq!(value["nonce"], release.nonce.to_string());

@@ -197,6 +197,24 @@ Python observer still accepts only an unauthenticated release request and does
 not yet verify this certificate. No network certificate transport or live
 authority registry is introduced by these local host methods.
 
+### Detached review verification
+
+`dex_journal::verify_exported_review` verifies canonical exported review bytes
+without opening the originating journal. Callers supply the expected route and
+release, an independently authenticated checkpoint and authority, the current
+native height, and the certificate. The bounded decoder rejects unknown versions,
+truncation, trailing bytes, duplicate or unordered routes, inconsistent accounting,
+and a release that does not match the selected route. It checks the selected
+route's cap; other routes' configurations remain covered by the trusted attestation.
+The existing hybrid PQ verifier authenticates the complete canonical commitment
+and enforces the certificate's height validity window.
+
+The returned commitment authenticates an attestation only. It is not consensus
+finality, external custody evidence, or permission to settle a redemption. Trust
+inputs must never be taken from the untrusted export. The Python source-chain
+observer is not yet wired to this Rust API; operational authority provisioning,
+transport integration, and durable settlement remain separate work.
+
 ### Existing integration coverage
 
 The complete market rehearsal is now covered by
