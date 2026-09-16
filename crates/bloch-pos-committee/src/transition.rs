@@ -294,6 +294,29 @@ pub struct TransferOutput {
     pub script_hash: [u8; 32],
 }
 
+/// Outer native transaction framing is one tag and one u32 payload length.
+pub const NATIVE_TRANSFER_TAG: u8 = 0x0E;
+pub const NATIVE_TRANSFER_FRAME_BYTES: usize = 5;
+pub const MAX_NATIVE_TRANSFER_PAYLOAD_BYTES: usize =
+    fee_market::MAX_BLOCK_TX_BYTES as usize - NATIVE_TRANSFER_FRAME_BYTES;
+
+/// Bounded opaque transport available even without native execution support.
+/// Construction validates size only; the live dispatcher validates the inner
+/// canonical joint frame, domain and authorization before any execution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeTransferPayload(Vec<u8>);
+
+impl NativeTransferPayload {
+    pub fn new(bytes: Vec<u8>) -> Result<Self, TxDecodeError> {
+        if bytes.is_empty() || bytes.len() > MAX_NATIVE_TRANSFER_PAYLOAD_BYTES {
+            return Err(TxDecodeError::InvalidNativePayload);
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] { &self.0 }
+}
+
 /// The transaction shapes this transition interprets. Value transfers move
 /// real coins out of the committed unspent set and into new outputs; deposits,
 /// exits and delegations are the staking-lifecycle messages whose
@@ -304,6 +327,8 @@ pub struct TransferOutput {
 /// not receive.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PosTransaction {
+    /// BLCH-sponsored native transfer, independently consensus-gated.
+    NativeTransfer(NativeTransferPayload),
     /// PQ-authorized, UTXO-funded validator registration (wire 0x0B).
     FundedDeposit(FundedDeposit),
     /// A value transfer against the committed eUTXO set, priced by the L1 fee
@@ -831,6 +856,10 @@ impl PosTransaction {
         };
         match self {
             PosTransaction::FundedDeposit(tx) => return tx.canonical_bytes(),
+            PosTransaction::NativeTransfer(payload) => {
+                b.push(NATIVE_TRANSFER_TAG);
+                put(&mut b, payload.as_bytes());
+            }
             PosTransaction::Transfer { inputs, outputs, tx_bytes, tip_millisat_per_gas } => {
                 b.push(0x01);
                 // Counts are length prefixes like every other variable-length
@@ -1011,6 +1040,13 @@ impl PosTransaction {
         let mut r = TxReader { b: bytes, i: 0 };
         let tag = r.u8()?;
         let tx = match tag {
+            NATIVE_TRANSFER_TAG => {
+                let length = r.u32()? as usize;
+                if length == 0 || length > MAX_NATIVE_TRANSFER_PAYLOAD_BYTES {
+                    return Err(TxDecodeError::InvalidNativePayload);
+                }
+                PosTransaction::NativeTransfer(NativeTransferPayload::new(r.take(length)?.to_vec())?)
+            }
             funded::FUNDED_DEPOSIT_TAG => PosTransaction::FundedDeposit(FundedDeposit::decode(&mut r)?),
             0x01 => {
                 // Counts are read from untrusted bytes, so nothing is
@@ -1173,6 +1209,8 @@ impl PosTransaction {
 /// Why a transaction's canonical bytes could not be decoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TxDecodeError {
+    /// Empty native payload or length exceeding the fixed transport bound.
+    InvalidNativePayload,
     /// Ran out of input mid-field.
     Truncated,
     /// Discriminant this build does not know.
@@ -1193,6 +1231,7 @@ pub enum TxDecodeError {
 impl core::fmt::Display for TxDecodeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            TxDecodeError::InvalidNativePayload => write!(f, "invalid native transfer payload length"),
             TxDecodeError::Truncated => write!(f, "transaction truncated"),
             TxDecodeError::UnknownTag(t) => write!(f, "unknown transaction tag {t:#04x}"),
             TxDecodeError::EvidenceNotDecodable => write!(
@@ -1458,6 +1497,28 @@ fn report_boundary_vote_drop(closing: u64, admitted: usize, tallied: usize) {
 
 #[cfg(feature = "native-dex-rehearsal")]
 pub mod native_dex;
+
+#[cfg(feature = "native-dex-rehearsal")]
+struct ConsensusNativeVerifier<'a>(&'a dyn SignatureVerifier);
+#[cfg(feature = "native-dex-rehearsal")]
+impl SignatureVerifier for ConsensusNativeVerifier<'_> {
+    fn verify_with_key(&self, key: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
+        // The sponsor is a native-operation witness too. In particular, the
+        // producer's permissive proposal probe must not bypass this signature.
+        self.0.valid_native_key(key) && self.0.verify_native_signature(key, root, signature)
+    }
+}
+#[cfg(feature = "native-dex-rehearsal")]
+impl bloch_euvm::ustav::Verifier for ConsensusNativeVerifier<'_> {
+    fn valid_pq_key(&self, key: &[u8]) -> bool {
+        self.0.valid_native_key(key)
+    }
+    fn verify_pq(&self, message: &[u8], key: &[u8], signature: &[u8]) -> bool {
+        let Ok(root) = <&[u8; 32]>::try_from(message) else { return false; };
+        self.0.valid_native_key(key)
+            && self.0.verify_native_signature(key, root, signature)
+    }
+}
 
 /// Internal execution terms derived by the native DEX rehearsal dispatcher.
 /// Never decoded from a client or exposed as public mutation authority. The
@@ -2171,6 +2232,14 @@ fn owns(key_hash: &[u8; 32], script_hash: &[u8; 32]) -> bool {
 }
 
 impl CommittedState {
+    /// Canonical native custody may never be spent through ordinary base paths.
+    fn native_base_is_locked(&self, point: &([u8; 32], u32)) -> bool {
+        #[cfg(feature = "native-dex-rehearsal")]
+        { self.native_state.as_ref().is_some_and(|state| state.base_is_locked(point)) }
+        #[cfg(not(feature = "native-dex-rehearsal"))]
+        { let _ = point; false }
+    }
+
     /// The state committed by the genesis block. Its checkpoint is justified
     /// and finalized by definition — finality needs a root of trust.
     #[allow(clippy::too_many_arguments)]
@@ -3422,6 +3491,9 @@ impl CommittedState {
         verifier: &dyn SignatureVerifier,
     ) -> Result<fee_market::TxCharge, TxReject> {
         match tx {
+            // Native transfers need the block's current slot and its fixed
+            // price. Only compute_post_state dispatches them with that context.
+            PosTransaction::NativeTransfer(_) => Err(TxReject::StakingRule),
             PosTransaction::Withdraw { validator } => self.apply_withdrawal(*validator, tx),
             PosTransaction::FundedDeposit(deposit) => self
                 .apply_funded_deposit(deposit, total_active_sat, base_fee_millisat_per_gas, verifier)
@@ -3993,6 +4065,9 @@ impl CommittedState {
         let mut spent_value: u128 = 0;
         for i in inputs {
             let key = (i.txid, i.vout);
+            if self.native_base_is_locked(&key) {
+                return Err(TransferReject::LockedNativeReserve);
+            }
             if !seen.insert(key) {
                 return Err(TransferReject::DuplicateInput);
             }
@@ -4271,6 +4346,9 @@ impl CommittedState {
         let mut spent_value: u128 = 0;
         for i in inputs {
             let key = (i.txid, i.vout);
+            if self.native_base_is_locked(&key) {
+                return Err(TransferReject::LockedNativeReserve);
+            }
             if !seen.insert(key) {
                 return Err(TransferReject::DuplicateInput);
             }
@@ -5938,6 +6016,24 @@ impl<V: SignatureVerifier> Transition<V> {
         let mut unfunded_bonded: u128 = 0;
         for (i, tx) in transactions.iter().enumerate() {
             let applied = match tx {
+                PosTransaction::NativeTransfer(payload) => {
+                    #[cfg(feature = "native-dex-rehearsal")]
+                    {
+                        if !crate::params::native_transfer_active(block_epoch)
+                            || !crate::params::native_state_active(block_epoch)
+                        {
+                            Err(TxReject::StakingRule)
+                        } else {
+                            native_dex::consensus_transfer::apply_transfer(
+                                &mut st, payload.as_bytes(), header.slot, base_fee,
+                                &ConsensusNativeVerifier(&self.verifier),
+                                &ConsensusNativeVerifier(&self.verifier),
+                            ).map_err(|_| TxReject::StakingRule)
+                        }
+                    }
+                    #[cfg(not(feature = "native-dex-rehearsal"))]
+                    { let _ = payload; Err(TxReject::StakingRule) }
+                }
                 // The gate first: below SLASHING_EVIDENCE_ACTIVATION_EPOCH
                 // (u64::MAX today — INERT) a block carrying evidence is
                 // consensus-invalid on every node, byte-for-byte the verdict
@@ -6480,6 +6576,17 @@ mod tests {
     mod validator_lifecycle {
         use super::*;
         include!("transition/lifecycle/tests.rs");
+    }
+
+    #[cfg(feature = "native-dex-rehearsal")]
+    mod native_locks {
+        use super::*;
+        include!("transition/native_locks_tests.rs");
+    }
+
+    #[cfg(feature = "native-dex-rehearsal")]
+    mod native_blocks {
+        include!("transition/native_transfer_blocks_tests.rs");
     }
 
     mod funded_admission {
@@ -13969,6 +14076,9 @@ mod tests {
             PosTransaction::RandaoRecommit { .. } => {}
             // Funded admission transfers UTXO value into bonded stake and fees.
             PosTransaction::FundedDeposit(_) => {}
+            // Sponsored native transfers conserve the native asset and settle
+            // BLCH fees through the existing block reward path.
+            PosTransaction::NativeTransfer(_) => {}
         }
 
         // Monotone under blocks and boundaries, and never above the cap.

@@ -27,15 +27,35 @@ commitments. The base-only projection remains separate from the complete block
 state root. Real-transition tests cover initialization, subsequent empty and
 ordinary-transfer blocks, replay, fork ancestor clones and invalid header roots.
 
+The first sponsored native transfer now dispatches from the real ordered block
+transaction loop through wire tag `0x0E`, under the separate disabled
+`NATIVE_TRANSFER_ACTIVATION_EPOCH`. It conserves an already-issued native asset
+while a BLCH sponsor pays the charge. Execution uses the block's fixed base fee,
+counts the five outer framing bytes and interprets expiry as the current block
+slot (inclusive). A staged adapter commits both ledgers together, returns fees to
+the existing burn/reward step and leaves native fee escrow zero. Ordinary V1/V2
+spends and funded validator deposits also enforce canonical native reserve locks.
+Both sponsor and native-owner witnesses use explicit strict native verifier
+capabilities, including during the producer's proposal probe.
+
+There is still no production path to populate the initially empty native ledger:
+asset registration, mint/import authority, source proofs and route bootstrap
+remain unimplemented in the block path. Block tests install funded fixtures only
+under `cfg(test)`. Pool lifecycle, swaps and gateway imports/withdrawals remain
+rehearsal operations. Mempool admission for native transfers is deliberately
+refused pending authorization, pricing and conflict integration. No funds can be
+launched by merely arming the transfer gate.
+
 ## Required implementation sequence
 
 1. Ownership and dormant empty-state commitment are implemented. Before allowing
    populated canonical state, define deterministic serialization, complete restore
    validation, bounded resource use and the execution/accounting integration.
-2. Define the consensus transaction encoding and activate it at a coordinated,
+2. Extend the registered sponsored-transfer encoding to the remaining operations
+   and activate it only at a coordinated,
    explicit network upgrade. Reserve/register tags through the repository's wire
    tag process; do not appropriate historical or contested tags.
-3. Compose native and ordinary operations in the single block transition. Include
+3. Extend the sponsored-transfer dispatch to gateway and pool operations. Include
    their fees, gas, supply conservation, reserves and rewards exactly once. Define
    empty-native blocks and epoch-boundary behavior. Use the real proposer,
    RANDAO and attestation validations rather than the rehearsal header helper.
@@ -52,9 +72,17 @@ ordinary-transfer blocks, replay, fork ancestor clones and invalid header roots.
 
 ## Concrete integration contract (proposed, not activated)
 
+Transaction wire tag `0x0E` is now allocated to `NativeTransfer`: one tag byte,
+a little-endian u32 length and a nonempty opaque joint-transfer payload. The
+complete frame is bounded by `MAX_BLOCK_TX_BYTES` even in feature-disabled
+decoders. The payload constructor guarantees transport size, not native semantic
+validity; the dispatcher must authenticate its domain and canonical inner frame.
+This allocation is not activation. Node mempool admission remains explicitly
+disabled until sponsor pricing, authorization and conflict handling are integrated.
+
 The following specifies the remaining integration work. The dormant state leaf
-above is implemented; no transaction wire tag, active epoch or production
-authority is assigned.
+above is implemented and native transfer wire tag `0x0E` is allocated; no active
+epoch or production authority is assigned.
 
 ### Live paths that must agree
 

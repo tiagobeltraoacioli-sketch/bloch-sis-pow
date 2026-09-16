@@ -5556,8 +5556,21 @@ fn declared_size_bound(tx: &PosTransaction, declared: u64) -> Result<(), &'stati
     Ok(())
 }
 
+#[test]
+fn native_payload_is_not_relayed_without_mempool_integration() {
+    let tx = PosTransaction::NativeTransfer(
+        bloch_pos_committee::transition::NativeTransferPayload::new(vec![0]).unwrap(),
+    );
+    assert!(admissible(&tx, 0).is_err());
+    assert!(admissible(&tx, u64::MAX).is_err());
+}
+
 pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'static str> {
     match tx {
+        // Block validation has its own committed-epoch gate. Mempool support
+        // also needs sponsor accounting, conflict detection and pricing; until
+        // those are integrated, never relay an opaque native payload as valid.
+        PosTransaction::NativeTransfer(_) => Err("native transfer mempool admission is not enabled"),
         PosTransaction::FundedDeposit(deposit) => {
             if !bloch_pos_committee::params::funded_validator_admission_active(wall_epoch) {
                 return Err("funded validator admission is not active: FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH is unarmed or not reached");

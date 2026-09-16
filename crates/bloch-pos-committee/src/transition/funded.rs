@@ -52,6 +52,7 @@ pub struct FundedDeposit {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FundedDepositReject {
+    LockedNativeReserve,
     NotActive,
     Network,
     Expired,
@@ -319,6 +320,9 @@ impl CommittedState {
         let mut spent = 0u128;
         let owner: [u8; 32] = Sha3_256::digest(&tx.funding_pubkey).into();
         for input in &tx.inputs {
+            if self.native_base_is_locked(&(input.txid, input.vout)) {
+                return Err(R::LockedNativeReserve);
+            }
             let utxo = self
                 .eutxos
                 .get(&(input.txid, input.vout))

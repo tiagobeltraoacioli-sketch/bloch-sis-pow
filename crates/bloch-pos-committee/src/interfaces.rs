@@ -468,6 +468,8 @@ pub enum TransitionError {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransferReject {
+    /// The input belongs to canonical native custody.
+    LockedNativeReserve,
     /// No inputs. A transfer that spends nothing funds nothing, and its id
     /// would be a function of its outputs alone — two such transfers with the
     /// same outputs would collide in the set.

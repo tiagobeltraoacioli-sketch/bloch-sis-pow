@@ -1128,6 +1128,12 @@ impl Default for HybridVerifier {
 }
 
 impl bloch_pos_committee::attestation::SignatureVerifier for HybridVerifier {
+    fn valid_native_key(&self, pubkey: &[u8]) -> bool {
+        bloch_crypto::crypto::valid_native_hybrid_key(pubkey)
+    }
+    fn verify_native_signature(&self, pubkey: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
+        verify_native_signature(pubkey, root, signature)
+    }
     /// The suite check itself. Robust to arbitrary key bytes by contract:
     /// `bloch_crypto::crypto::verify` documents "any body parse failure ⇒
     /// false, never a panic (consensus rule)" and guards every length before
@@ -1150,9 +1156,25 @@ impl bloch_pos_committee::attestation::SignatureVerifier for HybridVerifier {
 pub struct ProbeVerifier;
 
 impl bloch_pos_committee::attestation::SignatureVerifier for ProbeVerifier {
+    fn valid_native_key(&self, pubkey: &[u8]) -> bool {
+        bloch_crypto::crypto::valid_native_hybrid_key(pubkey)
+    }
+    fn verify_native_signature(&self, pubkey: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
+        // Native witnesses are already supplied when the producer probes the
+        // block. Only the not-yet-created proposal signature needs the probe.
+        verify_native_signature(pubkey, root, signature)
+    }
     fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
         true
     }
+}
+
+fn verify_native_signature(pubkey: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
+    use bloch_crypto::crypto;
+    crypto::valid_native_hybrid_key(pubkey)
+        && crypto::split_envelope(signature)
+            .is_some_and(|(suite, _)| suite == crypto::SUITE_MLDSA65_FALCON1024)
+        && crypto::verify(pubkey, root, signature)
 }
 
 /// Fill `buf` from the OS entropy pool (`/dev/urandom`). Devnet-grade.
@@ -1176,6 +1198,14 @@ mod tests {
         let root = [0x5Au8; 32];
         let sig = bloch_crypto::crypto::sign(&sk, &root).expect("sign");
         assert!(HybridVerifier::new().verify_with_key(&pk, &root, &sig));
+        assert!(HybridVerifier::new().valid_native_key(&pk));
+        assert!(HybridVerifier::new().verify_native_signature(&pk, &root, &sig));
+        assert!(ProbeVerifier.verify_native_signature(&pk, &root, &sig));
+        assert!(!ProbeVerifier.verify_native_signature(&pk, &[0; 32], &sig));
+        assert!(!ProbeVerifier.verify_native_signature(&pk, &root, &[]));
+        assert!(!HybridVerifier::new().valid_native_key(&[0; 32]));
+        let (_, raw) = bloch_crypto::crypto::split_envelope(&pk).unwrap();
+        assert!(!HybridVerifier::new().valid_native_key(raw));
     }
 
     #[test]

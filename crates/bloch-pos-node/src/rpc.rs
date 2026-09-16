@@ -2067,6 +2067,7 @@ pub fn submitted_json(tx: &PosTransaction, outcome: Admitted) -> Json {
     let bytes = tx.canonical_bytes();
     let hash: [u8; 32] = Sha3_256::digest(&bytes).into();
     let kind = match tx {
+        PosTransaction::NativeTransfer(_) => "native_transfer",
         PosTransaction::Transfer { .. } => "transfer",
         PosTransaction::TransferV2 { .. } => "transfer_v2",
         PosTransaction::Deposit { .. } => "deposit",

@@ -327,6 +327,9 @@ const TX_TAGS: &[(u8, Status)] = &[
     (0x0A, Status::Released { name: "RandaoRecommit", rivals: NO_RIVALS }),
     (0x0C, Status::Released { name: "ExitV2", rivals: NO_RIVALS }),
     (0x0D, Status::Released { name: "Withdraw", rivals: NO_RIVALS }),
+    // Explicit allocation for the dormant native dispatch implementation.
+    // Decodable does not mean network-activated or production-released.
+    (0x0E, Status::Released { name: "NativeTransfer", rivals: NO_RIVALS }),
 ];
 
 /// Three lineages that all intend the SAME flag day disagree on all three
@@ -508,6 +511,7 @@ const RELEASED_DS: &[(&str, &str)] = &[
 /// is a freeze nobody has tested.
 fn frozen_variant_space(tx: &PosTransaction) -> u8 {
     match tx {
+        PosTransaction::NativeTransfer(_) => 0x0E,
         PosTransaction::Transfer { .. } => 0x01,
         PosTransaction::Deposit { .. } => 0x02,
         PosTransaction::Exit { .. } => 0x03,
@@ -564,6 +568,12 @@ fn contested_msg(space: &str, tag: u8, claims: &[Claim]) -> String {
 /// `None` means no payload of that length decoded (a one-way tag; a released
 /// format may also need structured bytes rather than zeros).
 fn decoded_variant_name(tag: u8) -> Option<String> {
+    if tag == 0x0E {
+        // Nonempty opaque payload is required; semantic validity is a separate
+        // block-transition check, not a property of this registry probe.
+        let tx = PosTransaction::from_canonical_bytes(&[tag, 1, 0, 0, 0, 0]).ok()?;
+        return Some(format!("{tx:?}").split('(').next()?.to_owned());
+    }
     for pad in 0..=320usize {
         let mut bytes = vec![tag];
         bytes.extend(std::iter::repeat(0u8).take(pad));
@@ -799,6 +809,9 @@ fn contested_transaction_tags_are_refused() {
 #[test]
 fn the_exhaustive_match_agrees_with_the_table() {
     let samples: Vec<PosTransaction> = vec![
+        PosTransaction::NativeTransfer(
+            bloch_pos_committee::transition::NativeTransferPayload::new(vec![0]).unwrap(),
+        ),
         PosTransaction::Transfer {
             inputs: Vec::new(),
             outputs: Vec::new(),

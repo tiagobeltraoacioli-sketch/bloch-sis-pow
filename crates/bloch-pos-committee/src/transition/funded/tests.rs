@@ -14,7 +14,7 @@ fn auth_sign(pk: &[u8], root: &[u8; 32]) -> Vec<u8> {
     sig[4..36].copy_from_slice(&toy_sign(pk, root));
     sig
 }
-struct AuthVerifier;
+pub(super) struct AuthVerifier;
 impl SignatureVerifier for AuthVerifier {
     fn verify_with_key(&self, pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
         // Existing block fixtures use toy_sign; the funded envelope checker
@@ -22,12 +22,12 @@ impl SignatureVerifier for AuthVerifier {
         sig == auth_sign(pk, root) || sig == toy_sign(pk, root)
     }
 }
-fn authorize(tx: &mut FundedDeposit) {
+pub(super) fn authorize(tx: &mut FundedDeposit) {
     tx.tx_bytes = tx.reserved_tx_bytes();
     tx.funding_signature = auth_sign(&tx.funding_pubkey, &tx.funding_root());
     tx.proof_of_possession = auth_sign(&tx.validator_pubkey, &tx.possession_root());
 }
-fn deposit(tag: u8) -> FundedDeposit {
+pub(super) fn deposit(tag: u8) -> FundedDeposit {
     let mut tx = FundedDeposit {
         network_domain: [0x91; 32],
         valid_until_epoch: 50,
@@ -54,7 +54,7 @@ fn deposit(tag: u8) -> FundedDeposit {
     authorize(&mut tx);
     tx
 }
-fn fixture(txs: &[FundedDeposit]) -> (Transition<AuthVerifier>, CommittedState, Vec<RandaoChain>) {
+pub(super) fn fixture(txs: &[FundedDeposit]) -> (Transition<AuthVerifier>, CommittedState, Vec<RandaoChain>) {
     let opening: Vec<_> = txs
         .iter()
         .map(|tx| crate::state_root::EutxoEntry {
@@ -68,7 +68,7 @@ fn fixture(txs: &[FundedDeposit]) -> (Transition<AuthVerifier>, CommittedState, 
     state.admission_network_domain = Some([0x91; 32]);
     (transition, state, chains)
 }
-fn apply(state: &mut CommittedState, tx: &FundedDeposit) -> Result<fee_market::TxCharge, TxReject> {
+pub(super) fn apply(state: &mut CommittedState, tx: &FundedDeposit) -> Result<fee_market::TxCharge, TxReject> {
     state.apply_transaction(
         &PosTransaction::FundedDeposit(tx.clone()),
         sat(1_600_000),

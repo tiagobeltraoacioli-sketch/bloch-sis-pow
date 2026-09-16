@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 pub mod add_liquidity;
 pub mod backend;
 pub mod base_reserves;
+pub(super) mod consensus_transfer;
 pub mod gateway;
 pub mod initial_liquidity;
 pub mod paired_custody;
@@ -174,6 +175,15 @@ pub struct PinnedNativeState {
 }
 
 impl NativeState {
+    pub(super) fn base_is_locked(&self, point: &base_reserves::OutPoint) -> bool {
+        self.base_locks.contains_key(point)
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_lock_base(&mut self, point: base_reserves::OutPoint) {
+        self.base_locks.insert(point, [1; 32]);
+    }
+
     /// Immutable network binding for the host's canonical-state checks.
     pub(super) fn domain(&self) -> [u8; 32] {
         self.domain
@@ -436,7 +446,18 @@ impl State {
         h.finalize().into()
     }
     pub fn quote(&self, request: &Request) -> Result<fee_market::TxCharge, Error> {
-        let length = request.canonical_bytes(&self.domain)?.len() as u64;
+        self.quote_with_context(request, self.base.next_base_fee(), 0)
+    }
+    fn quote_with_context(
+        &self,
+        request: &Request,
+        base_fee: u128,
+        outer_bytes: u64,
+    ) -> Result<fee_market::TxCharge, Error> {
+        let length = (request.canonical_bytes(&self.domain)?.len() as u64)
+            .checked_add(outer_bytes)
+            .filter(|length| *length <= MAX_ENVELOPE_BYTES)
+            .ok_or(Error::ResourceLimit)?;
         let PosTransaction::TransferV2 {
             keys,
             tx_bytes,
@@ -469,7 +490,7 @@ impl State {
         .filter(|n| *n <= fee_market::MAX_TX_GAS)
         .ok_or(Error::ResourceLimit)?;
         let (base_fee_sat, priority_fee_sat) =
-            fee_market::fee_parts_sat(gas, self.base.next_base_fee(), *tip_millisat_per_gas);
+            fee_market::fee_parts_sat(gas, base_fee, *tip_millisat_per_gas);
         Ok(fee_market::TxCharge {
             gas,
             tx_bytes: *tx_bytes,
@@ -477,8 +498,9 @@ impl State {
             priority_fee_sat,
         })
     }
-    /// Validate both plans before consuming either. No proposal/block path calls
-    /// this opt-in rehearsal API, and its fee escrow needs future block integration.
+    /// Validate both plans before consuming either and retain rehearsal fee escrow.
+    /// Canonical block execution uses the private staging adapter, which returns
+    /// the charge to normal block settlement instead of retaining escrow.
     pub fn execute(
         &mut self,
         request: &Request,
@@ -486,11 +508,31 @@ impl State {
         base_verifier: &dyn SignatureVerifier,
         native_verifier: &dyn Verifier,
     ) -> Result<Execution, Error> {
+        self.execute_with_context(
+            request,
+            height,
+            self.base.next_base_fee(),
+            0,
+            base_verifier,
+            native_verifier,
+        )
+    }
+    /// Host-only context: block execution supplies its already-selected price
+    /// and counts the outer transaction tag and length prefix in signed bytes.
+    fn execute_with_context(
+        &mut self,
+        request: &Request,
+        height: u64,
+        base_fee: u128,
+        outer_bytes: u64,
+        base_verifier: &dyn SignatureVerifier,
+        native_verifier: &dyn Verifier,
+    ) -> Result<Execution, Error> {
         if let PosTransaction::TransferV2 { inputs, .. } = &request.blch {
             self.ensure_base_unlocked(inputs)?;
         }
         self.ensure_native_unlocked(&request.native.transaction.inputs)?;
-        let charge = self.quote(request)?;
+        let charge = self.quote_with_context(request, base_fee, outer_bytes)?;
         if height > request.valid_until
             || request.native.transaction.valid_until > request.valid_until
         {
@@ -507,7 +549,7 @@ impl State {
         {
             return Err(Error::InvalidShape);
         }
-        let encoded_len = request.canonical_bytes(&self.domain)?.len() as u64;
+        let encoded_len = request.canonical_bytes(&self.domain)?.len() as u64 + outer_bytes;
         let native_length = transfer_wire::encode(&request.native)
             .map_err(Error::Wire)?
             .len() as u64;
@@ -547,7 +589,7 @@ impl State {
             .base
             .plan_transfer_v2_with_context(
                 &request.blch,
-                self.base.next_base_fee(),
+                base_fee,
                 base_verifier,
                 Some(JointTransferContext {
                     envelope_bytes: encoded_len,

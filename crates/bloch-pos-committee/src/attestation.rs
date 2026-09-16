@@ -124,6 +124,14 @@ pub trait SignatureVerifier {
     /// that checked one half for spending and two for attesting would make
     /// spending cheaper to forge than attesting.
     fn verify_with_key(&self, pubkey: &[u8], signing_root: &[u8; 32], signature: &[u8]) -> bool;
+
+    /// Native execution requires canonical hybrid key admission as well as
+    /// signature verification. Existing consensus-only implementations reject
+    /// native execution until they explicitly supply both capabilities.
+    fn valid_native_key(&self, _pubkey: &[u8]) -> bool { false }
+    fn verify_native_signature(&self, _pubkey: &[u8], _root: &[u8; 32], _signature: &[u8]) -> bool {
+        false
+    }
 }
 
 /// Resolves a validator index to its registered public key.

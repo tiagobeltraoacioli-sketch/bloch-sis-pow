@@ -12,8 +12,8 @@ publish = false
 # consensus layer — the opposite of what an audit needs.
 
 [features]
-# Opt-in local rehearsal only. No PosTransaction variant, block-root change or
-# node activation; default node builds retain their original SHA3-only core.
+# Opt-in native executor and local rehearsal. Canonical component/transfer gates
+# remain disabled; default builds decode the bounded transfer frame but reject it.
 native-dex-rehearsal = ["dep:bloch-euvm"]
 # Phase timers for the replay benchmark (src/perf.rs). OFF by default and off
 # in every release the fleet runs: with the feature absent the span type is

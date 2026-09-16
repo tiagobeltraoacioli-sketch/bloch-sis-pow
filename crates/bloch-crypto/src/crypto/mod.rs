@@ -245,6 +245,25 @@ fn parse_pubkey_envelope_or_legacy(b: &[u8]) -> (u16, &[u8]) {
     parse_envelope_or_legacy(b)
 }
 
+/// Canonical enveloped ML-DSA-65 AND Falcon-1024 key admission for native
+/// execution. Legacy raw keys remain supported by `verify`, not by this API.
+/// Falcon's header and packed mod-q coefficients must be canonical; a
+/// length-only parse by the underlying wrappers is insufficient.
+pub fn valid_native_hybrid_key(key: &[u8]) -> bool {
+    let Some((suite, body)) = split_envelope(key) else { return false; };
+    if suite != SUITE_MLDSA65_FALCON1024 || body.len() != MLDSA_PUBKEY_LEN + 1793 {
+        return false;
+    }
+    let falcon = &body[MLDSA_PUBKEY_LEN..];
+    if falcon[0] != 10 { return false; }
+    falcon[1..].chunks_exact(7).all(|chunk| {
+        let mut bytes = [0u8; 8];
+        bytes[1..].copy_from_slice(chunk);
+        let packed = u64::from_be_bytes(bytes);
+        [42, 28, 14, 0].into_iter().all(|shift| ((packed >> shift) & 0x3fff) < 12_289)
+    })
+}
+
 pub fn verify(public_key_bytes: &[u8], message: &[u8], signature_bytes: &[u8]) -> bool {
     // Suite-ID dispatch (design §2.3). Accepts enveloped objects AND legacy
     // pre-envelope (raw hybrid) objects from the carry-over. A pk of one suite
