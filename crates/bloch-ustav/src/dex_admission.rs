@@ -328,10 +328,33 @@ impl PendingBatch {
         journal: &mut Journal,
         height: u64,
     ) -> Result<pool_batch::Outcome, Error> {
+        self.commit_checked(journal, height, None)
+    }
+
+    /// Require independently supplied parent/post BLCH roots at persistence.
+    /// Root mismatch preserves the queue for retry; success closes it once.
+    /// This does not authenticate block headers or activate live consensus.
+    pub fn commit_with_base_roots(
+        &mut self,
+        journal: &mut Journal,
+        height: u64,
+        roots: pool_candidate::BaseRoots,
+    ) -> Result<pool_batch::Outcome, Error> {
+        self.commit_checked(journal, height, Some(roots))
+    }
+
+    fn commit_checked(
+        &mut self,
+        journal: &mut Journal,
+        height: u64,
+        roots: Option<pool_candidate::BaseRoots>,
+    ) -> Result<pool_batch::Outcome, Error> {
         let candidate = self.build(journal, height)?;
-        let result = journal
-            .append(&candidate, self.height)
-            .map_err(Error::Journal)?;
+        let result = match roots {
+            Some(roots) => journal.append_with_base_roots(&candidate, self.height, roots),
+            None => journal.append(&candidate, self.height),
+        }
+        .map_err(Error::Journal)?;
         self.frames.clear();
         self.wire_bytes = 0;
         self.closed = true;

@@ -571,13 +571,44 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
         assert_eq!(std::fs::read(&bound_path).unwrap(), before);
         assert_eq!(bound.checkpoint(), original_head);
     }
+    let mut bound_pending = PendingBatch::new(&bound, 4).unwrap();
+    for frame in frames {
+        bound_pending.admit(&bound, frame, 4).unwrap();
+    }
+    let queued_bytes = bound_pending.wire_bytes();
+    for wrong_parent in [true, false] {
+        let mut wrong = roots;
+        if wrong_parent {
+            wrong.parent[0] ^= 1;
+        } else {
+            wrong.post[0] ^= 1;
+        }
+        assert!(bound_pending
+            .commit_with_base_roots(&mut bound, 4, wrong)
+            .is_err());
+        assert_eq!(bound_pending.len(), frames.len());
+        assert_eq!(bound_pending.wire_bytes(), queued_bytes);
+        assert!(!bound_pending.is_closed());
+        assert_eq!(bound_pending.build(&bound, 4).unwrap(), candidate);
+        assert_eq!(std::fs::read(&bound_path).unwrap(), before);
+        assert_eq!(bound.checkpoint(), original_head);
+    }
     assert_eq!(
-        bound
-            .append_with_base_roots(&candidate, 4, roots)
+        bound_pending
+            .commit_with_base_roots(&mut bound, 4, roots)
             .unwrap()
             .post_root,
         expected
     );
+    assert!(bound_pending.is_closed());
+    assert!(bound_pending.is_empty());
+    assert_eq!(bound_pending.wire_bytes(), 0);
+    let persisted = std::fs::read(&bound_path).unwrap();
+    assert!(matches!(
+        bound_pending.commit_with_base_roots(&mut bound, 4, roots),
+        Err(bloch_ustav::dex_admission::Error::Closed)
+    ));
+    assert_eq!(std::fs::read(&bound_path).unwrap(), persisted);
     drop(bound);
     let bound = Journal::open(&bound_path, anchor.clone(), 3, head, TailRecovery::Reject).unwrap();
     assert_eq!(bound.state().base_state_root(), roots.post);

@@ -334,3 +334,13 @@ block integration must select the bound path and provide authenticated context;
 this addition does not wire the node, change block formats or activate consensus.
 Real PQ integration tests cover both mismatches, successful persistence and
 restart of the bound journal.
+
+`dex_admission::PendingBatch::commit_with_base_roots` connects the same explicit
+host expectations to buffered admission. It rebuilds the candidate at the trusted
+host height, then uses the journal's bound append path. Rejected roots preserve
+queued frames and byte accounting for retry (the existing monotonic height
+watermark still applies). Success clears and closes the batch exactly once;
+a second commit is rejected without another disk write. Real PQ round trips
+exercise both parent/post mismatch retries, identical rebuilt bytes, successful
+commit and replay after reopening. This method is opt-in; ordinary local
+`commit` retains its prior behavior and no live node is activated by the API.
