@@ -13,7 +13,7 @@ pub mod add_liquidity;
 pub mod backend;
 pub mod base_reserves;
 pub(super) mod consensus_transfer;
-pub(super) mod bootstrap;
+pub mod bootstrap;
 pub(super) mod consensus_gateway;
 pub(super) mod consensus_pool;
 pub mod gateway;

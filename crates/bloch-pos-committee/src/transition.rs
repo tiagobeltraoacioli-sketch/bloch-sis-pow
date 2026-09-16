@@ -5659,11 +5659,26 @@ impl StateReader for CommittedState {
 /// no clock, no cache, no handle to anything mutable.
 pub struct Transition<V: SignatureVerifier> {
     verifier: V,
+    #[cfg(feature = "native-lab")]
+    native_lab_domain: Option<[u8; 32]>,
 }
 
 impl<V: SignatureVerifier> Transition<V> {
+    /// Laboratory activation is scoped to one explicit, nonzero network domain.
+    /// Hosts must obtain this domain from their separate laboratory genesis format.
+    #[cfg(feature = "native-lab")]
+    pub fn native_laboratory(verifier: V, domain: [u8; 32]) -> Result<Self, &'static str> {
+        if domain == [0; 32] { return Err("zero laboratory domain"); }
+        Ok(Self { verifier, native_lab_domain: Some(domain) })
+    }
+    pub fn native_lab_matches(&self, state: &CommittedState) -> bool {
+        #[cfg(feature = "native-lab")]
+        { self.native_lab_domain.is_some() && self.native_lab_domain == state.admission_network_domain }
+        #[cfg(not(feature = "native-lab"))]
+        { let _ = state; false }
+    }
     pub fn new(verifier: V) -> Self {
-        Transition { verifier }
+        Transition { verifier, #[cfg(feature = "native-lab")] native_lab_domain: None }
     }
 
     /// Run the whole transition *except* the final root comparison, returning
@@ -5775,7 +5790,7 @@ impl<V: SignatureVerifier> Transition<V> {
 
         // Initialize through the live transition, from genesis-authenticated
         // context only. No rehearsal import, native transaction or payout path.
-        let native_active = crate::params::native_state_active(block_epoch);
+        let native_active = crate::params::native_state_active(block_epoch) || self.native_lab_matches(&st);
         #[cfg(feature = "native-dex-rehearsal")]
         {
             if !native_active && st.native_state.is_some() {
@@ -6075,8 +6090,8 @@ impl<V: SignatureVerifier> Transition<V> {
                 PosTransaction::NativeTransfer(payload) => {
                     #[cfg(feature = "native-dex-rehearsal")]
                     {
-                        if !crate::params::native_transfer_active(block_epoch)
-                            || !crate::params::native_state_active(block_epoch)
+                        if !(crate::params::native_transfer_active(block_epoch) || self.native_lab_matches(&st))
+                            || !(crate::params::native_state_active(block_epoch) || self.native_lab_matches(&st))
                         {
                             Err(TxReject::StakingRule)
                         } else {
@@ -6093,8 +6108,8 @@ impl<V: SignatureVerifier> Transition<V> {
                 PosTransaction::NativeBootstrap(payload) => {
                     #[cfg(feature = "native-dex-rehearsal")]
                     {
-                        if !crate::params::native_bootstrap_active(block_epoch)
-                            || !crate::params::native_state_active(block_epoch)
+                        if !(crate::params::native_bootstrap_active(block_epoch) || self.native_lab_matches(&st))
+                            || !(crate::params::native_state_active(block_epoch) || self.native_lab_matches(&st))
                         {
                             Err(TxReject::StakingRule)
                         } else {
@@ -6111,8 +6126,8 @@ impl<V: SignatureVerifier> Transition<V> {
                 PosTransaction::NativePool(payload) => {
                     #[cfg(feature = "native-dex-rehearsal")]
                     {
-                        if !crate::params::native_pool_active(block_epoch)
-                            || !crate::params::native_state_active(block_epoch)
+                        if !(crate::params::native_pool_active(block_epoch) || self.native_lab_matches(&st))
+                            || !(crate::params::native_state_active(block_epoch) || self.native_lab_matches(&st))
                         {
                             Err(TxReject::StakingRule)
                         } else {
@@ -6129,8 +6144,8 @@ impl<V: SignatureVerifier> Transition<V> {
                 PosTransaction::NativeImport(payload) => {
                     #[cfg(feature = "native-dex-rehearsal")]
                     {
-                        if !crate::params::native_import_active(block_epoch)
-                            || !crate::params::native_state_active(block_epoch)
+                        if !(crate::params::native_import_active(block_epoch) || self.native_lab_matches(&st))
+                            || !(crate::params::native_state_active(block_epoch) || self.native_lab_matches(&st))
                         {
                             Err(TxReject::StakingRule)
                         } else {
@@ -6147,8 +6162,8 @@ impl<V: SignatureVerifier> Transition<V> {
                 PosTransaction::NativeWithdrawal(payload) => {
                     #[cfg(feature = "native-dex-rehearsal")]
                     {
-                        if !crate::params::native_withdrawal_active(block_epoch)
-                            || !crate::params::native_state_active(block_epoch)
+                        if !(crate::params::native_withdrawal_active(block_epoch) || self.native_lab_matches(&st))
+                            || !(crate::params::native_state_active(block_epoch) || self.native_lab_matches(&st))
                         {
                             Err(TxReject::StakingRule)
                         } else {
@@ -16554,3 +16569,6 @@ mod epoch_advance_bound {
         assert!(MAX_EPOCH_ADVANCE < 1 << 20, "a ceiling that large is not a ceiling");
     }
 }
+
+#[cfg(feature = "native-lab")]
+pub mod native_lab;

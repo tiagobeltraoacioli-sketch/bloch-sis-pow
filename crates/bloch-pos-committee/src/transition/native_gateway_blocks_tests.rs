@@ -91,3 +91,36 @@ fn native_gateway_withdrawal_real_block_and_gate() {
             .is_err())
     });
 }
+
+#[cfg(feature = "native-lab")]
+#[test]
+fn native_lab_instance_is_domain_bound_and_replay_deterministic() {
+    let (_, mut pre, mut chains) = setup(4);
+    pre.admission_network_domain = Some([42; 32]);
+    let (funded, request) =
+        native_dex::consensus_gateway::tests::funded_import(pre.next_base_fee_at(0));
+    for entry in funded.utxos() {
+        pre.eutxos.insert(entry.clone());
+    }
+    pre.native_state = funded.native_state;
+    let tx = PosTransaction::NativeImport(
+        NativeTransferPayload::new(request.canonical_bytes(&[42; 32]).unwrap()).unwrap(),
+    );
+    let lab = Transition::native_laboratory(BlockVerifier, [42; 32]).unwrap();
+    let before = pre.clone();
+    assert!(lab.validate_native_lab_transaction(&pre, &tx, 1).is_ok());
+    assert_eq!(pre, before);
+    let block = build_block(&lab, &pre, 1, &[], &[tx.clone()], &mut chains);
+    let post = lab.apply_block(&pre, &block, &[], &[tx.clone()]).unwrap();
+    assert_eq!(
+        lab.apply_block(&pre, &block, &[], &[tx.clone()]).unwrap(),
+        post
+    );
+    assert!(Transition::new(BlockVerifier)
+        .apply_block(&pre, &block, &[], &[tx.clone()])
+        .is_err());
+    let wrong = Transition::native_laboratory(BlockVerifier, [43; 32]).unwrap();
+    assert!(wrong.validate_native_lab_transaction(&pre, &tx, 1).is_err());
+    assert!(wrong.apply_block(&pre, &block, &[], &[tx]).is_err());
+    assert_eq!(pre, before);
+}

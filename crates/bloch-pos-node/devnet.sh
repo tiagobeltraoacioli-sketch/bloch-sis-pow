@@ -30,12 +30,21 @@ WORKDIR="${1:?usage: devnet.sh <workdir> [n] [slot_ms] [stop_at_slot]}"
 N="${2:-4}"
 SLOT_MS="${3:-500}"
 STOP_AT="${4:-}"
+LAB_ARGS=()
+if [ "${5:-}" = "--native-lab" ]; then
+  LAB_ARGS=(--native-lab)
+elif [ -n "${5:-}" ]; then
+  echo "fifth argument must be --native-lab when present" >&2; exit 2
+fi
 BASE_PORT=19310
+RPC_BASE_PORT=19410
 # Release strongly preferred: the debug-build hybrid/SHAKE crypto is slow
 # enough to push block propagation past the slot time on fast devnets.
 HERE="$(cd "$(dirname "$0")" && pwd)"
-BIN="$HERE/target/release/bloch-pos"
-[ -x "$BIN" ] || BIN="$HERE/target/debug/bloch-pos"
+WORKSPACE="$(cd "$HERE/../.." && pwd)"
+BUILD_TARGET="${CARGO_TARGET_DIR:-$WORKSPACE/target}"
+BIN="${BLOCH_DEVNET_BIN:-$BUILD_TARGET/release/bloch-pos}"
+[ -x "$BIN" ] || BIN="$BUILD_TARGET/debug/bloch-pos"
 [ -x "$BIN" ] || { echo "build first: cargo build --release (in crates/bloch-pos-node)"; exit 1; }
 
 # ── Keystore at rest (audit I-H1) ──────────────────────────────────────────
@@ -63,7 +72,7 @@ done
 
 # 2. Genesis manifest (slot 0 a few seconds out so every node is up first).
 GENESIS="$WORKDIR/genesis.blg"
-[ -f "$GENESIS" ] || "$BIN" genesis --keys "$KEYDIRS" --out "$GENESIS" --slot-ms "$SLOT_MS" --start-in 5
+[ -f "$GENESIS" ] || "$BIN" genesis --keys "$KEYDIRS" --out "$GENESIS" --slot-ms "$SLOT_MS" --start-in 5 "${LAB_ARGS[@]}"
 
 # 3. Launch N real node processes, full mesh.
 PIDS=()
@@ -78,7 +87,7 @@ for i in $(seq 0 $((N - 1))); do
   # script keeps producing the run it has always produced even if the default
   # is ever flipped to libp2p.
   CMD=("$BIN" run --data-dir "$d" --genesis "$GENESIS" --transport devnet \
-       --listen "$((BASE_PORT + i))" --peers "$PEERS")
+       --listen "$((BASE_PORT + i))" --peers "$PEERS" --rpc-port "$((RPC_BASE_PORT + i))" "${LAB_ARGS[@]}")
   [ -n "$STOP_AT" ] && CMD+=(--stop-at-slot "$STOP_AT")
   { echo "# ${CMD[*]}"; } > "$d/node.log"
   "${CMD[@]}" >> "$d/node.log" 2>&1 &

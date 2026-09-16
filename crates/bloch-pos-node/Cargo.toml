@@ -42,6 +42,8 @@ name = "bloch-pos"
 path = "src/main.rs"
 
 [features]
+# Separate BPOSLAB1 network format; never activates official manifests.
+native-lab = ["native-component-snapshots", "bloch-pos-committee/native-lab", "dep:bloch-euvm"]
 # Phase timers for the end-to-end replay benchmark (src/replay_bench.rs).
 # OFF by default; with it off every span in engine.rs and in the committee
 # crate is a zero-sized value with no Drop and disappears at compile time.
@@ -53,6 +55,7 @@ perf-timing = ["bloch-pos-committee/perf-timing"]
 native-component-snapshots = ["bloch-pos-committee/native-dex-rehearsal"]
 
 [dependencies]
+bloch-euvm = { path = "../bloch-euvm", optional = true }
 # The frozen consensus math (pure, sha3-only).
 bloch-pos-committee = { path = "../bloch-pos-committee" }
 # The hybrid ML-DSA-65 ‖ Falcon-1024 suite (M2: keys/ + KeyVerifier). Path

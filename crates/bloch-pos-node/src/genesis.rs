@@ -82,6 +82,9 @@ pub enum ManifestFormat {
     V1Unbound,
     /// `BPOSMAN2` — genesis header bound to the manifest's ledger.
     V2Bound,
+    /// Explicit laboratory format, rejected without the native-lab build feature.
+    #[cfg(feature = "native-lab")]
+    NativeLab,
 }
 
 /// The beacon mix that seeds epoch 0 — fixed before any validator could have
@@ -841,6 +844,8 @@ impl Manifest {
         out.extend_from_slice(match self.format {
             ManifestFormat::V1Unbound => MANIFEST_MAGIC_V1,
             ManifestFormat::V2Bound => MANIFEST_MAGIC_V2,
+            #[cfg(feature = "native-lab")]
+            ManifestFormat::NativeLab => b"BPOSLAB1",
         });
         out.extend_from_slice(&self.genesis_time_ms.to_le_bytes());
         out.extend_from_slice(&self.slot_ms.to_le_bytes());
@@ -883,6 +888,8 @@ impl Manifest {
         let format = match r.take(8)? {
             m if m == MANIFEST_MAGIC_V1 => ManifestFormat::V1Unbound,
             m if m == MANIFEST_MAGIC_V2 => ManifestFormat::V2Bound,
+            #[cfg(feature = "native-lab")]
+            m if m == b"BPOSLAB1" => ManifestFormat::NativeLab,
             _ => return Err(DecodeErr("not a genesis manifest")),
         };
         let genesis_time_ms = r.u64()?;
@@ -1247,7 +1254,7 @@ impl Manifest {
     /// rule is still reachable and what it costs.
     pub fn genesis_header(&self) -> BlockHeaderV4 {
         let mut h = self.anchor_header();
-        if self.format == ManifestFormat::V2Bound {
+        if self.format != ManifestFormat::V1Unbound {
             h.state_root = self.genesis_pre_state_root();
         }
         h
@@ -1289,10 +1296,12 @@ impl Manifest {
     pub fn genesis_mix(&self) -> [u8; 32] {
         match self.format {
             ManifestFormat::V1Unbound => GENESIS_MIX,
-            ManifestFormat::V2Bound => {
+            _ => {
                 let digest = self.carryover.as_ref().map(|c| c.digest).unwrap_or([0u8; 32]);
                 let mut h = Sha3_256::new();
                 h.update(bloch_pos_committee::params::DS_RANDAO);
+                #[cfg(feature = "native-lab")]
+                if self.format == ManifestFormat::NativeLab { h.update(b"BLOCH-NATIVE-LAB-ONLY-v1"); }
                 h.update(GENESIS_MIX);
                 h.update(digest);
                 // The CLOSED GAP. The first cut of this fix mixed over the
@@ -3322,5 +3331,30 @@ mod blp02_hybrid_suite {
             Ok(m) => assert_eq!(m.validators.len(), 64, "the live set is 64 validators"),
             Err(e) => panic!("the live Genesis-4 manifest must decode, got: {}", e.0),
         }
+    }
+}
+
+#[cfg(test)]
+mod native_lab_identity_tests {
+    use super::*;
+    #[test]
+    fn native_lab_magic_is_feature_scoped_and_official_bytes_unchanged() {
+        let official = include_bytes!("../../../genesis/mainnet.manifest");
+        let mut m=Manifest::decode(official).unwrap();
+        assert_eq!(m.encode(),official);
+        let original_id=m.genesis_id();
+        m.carryover=None;m.cohort.clear();m.allocations.clear();
+        let mut altered=m.encode();altered[..8].copy_from_slice(b"BPOSLAB1");
+        #[cfg(not(feature="native-lab"))]
+        assert!(Manifest::decode(&altered).is_err());
+        #[cfg(feature="native-lab")]
+        {
+            let lab=Manifest::decode(&altered).unwrap();
+            assert_eq!(lab.format,ManifestFormat::NativeLab);
+            assert_ne!(lab.genesis_id(),original_id);
+            assert_ne!(Sha3_256::digest(lab.encode()),Sha3_256::digest(official));
+            assert_eq!(lab.encode(),altered);
+        }
+        let _=original_id;
     }
 }

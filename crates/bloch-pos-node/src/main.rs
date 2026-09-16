@@ -652,6 +652,12 @@ const DEVNET_STAKES_SAT: [u128; 3] = [
 /// not an upgrade: no node can adopt it without relaunching from its block 0.
 /// Publishing such a manifest is the founder's decision.
 fn manifest_format(args: &[String]) -> genesis::ManifestFormat {
+    if args.iter().any(|a| a == "--native-lab") {
+        #[cfg(feature = "native-lab")]
+        { return genesis::ManifestFormat::NativeLab; }
+        #[cfg(not(feature = "native-lab"))]
+        { eprintln!("native laboratory requires the explicit native-lab build feature"); exit(2); }
+    }
     if args.iter().any(|a| a == "--bind-genesis") {
         genesis::ManifestFormat::V2Bound
     } else {
@@ -1009,6 +1015,9 @@ fn genesis_mainnet(args: &[String]) {
         alloc(ap::LIQUIDITY, t::LIQUIDITY_BLOCH, 0),
     ];
 
+    if args.iter().any(|a| a == "--native-lab") {
+        eprintln!("genesis-mainnet refuses laboratory configuration"); exit(2);
+    }
     let cohort: Vec<u32> = validators.iter().map(|v| v.index).collect();
     let manifest = genesis::Manifest {
         genesis_time_ms: genesis_time_from_now(start_in),
@@ -1119,6 +1128,20 @@ fn genesis_cmd(args: &[String]) {
             commission_bps: 0,
         });
     }
+    let format = manifest_format(args);
+    #[allow(unused_mut)]
+    let mut allocations = Vec::new();
+    #[cfg(feature = "native-lab")]
+    if format == genesis::ManifestFormat::NativeLab {
+        use sha3::Digest;
+        for validator in &validators {
+            allocations.push(genesis::GenesisAllocation {
+                purpose: genesis::alloc_purpose::LIQUIDITY,
+                script_hash: sha3::Sha3_256::digest(&validator.pubkey).into(),
+                amount_sat: 100_000_000_000, unlock_epoch: 0,
+            });
+        }
+    }
     let manifest = genesis::Manifest {
         genesis_time_ms: genesis_time_from_now(start_in),
         slot_ms,
@@ -1129,9 +1152,9 @@ fn genesis_cmd(args: &[String]) {
         // that takes the signed Genesis-3 snapshot as input, because its
         // inputs come from a ceremony and not from a command line.
         carryover: None,
-        allocations: Vec::new(),
+        allocations,
         carryover_entries: Vec::new(),
-        format: manifest_format(args),
+        format,
         pre_state_root: std::sync::OnceLock::new(),
     };
     if let Err(e) = manifest.check_supply() {
@@ -1488,6 +1511,7 @@ fn run_cmd(args: &[String]) {
     };
 
     let cfg = engine::Config {
+        native_lab: args.iter().any(|a| a == "--native-lab"),
         data_dir: PathBuf::from(data_dir),
         genesis_path: PathBuf::from(genesis_path),
         transport,

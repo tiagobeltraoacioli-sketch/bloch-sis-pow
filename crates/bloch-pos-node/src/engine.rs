@@ -143,6 +143,8 @@ pub enum Transport {
 }
 
 pub struct Config {
+    /// Explicit opt-in, accepted only with a distinct laboratory manifest.
+    pub native_lab: bool,
     pub data_dir: PathBuf,
     pub genesis_path: PathBuf,
     pub transport: Transport,
@@ -490,6 +492,8 @@ fn body_transactions(env: &BlockEnvelope) -> Result<Vec<PosTransaction>, String>
 /// consistent with the chain's own current pricing, not a new judgement this
 /// fix invents.
 fn tx_tip_rate(tx: &PosTransaction) -> u128 {
+        #[cfg(feature = "native-lab")]
+        if let Some(sponsor)=bloch_pos_committee::transition::native_lab::sponsor(tx) { return tx_tip_rate(&sponsor); }
     match tx {
         PosTransaction::Transfer { tip_millisat_per_gas, .. }
         | PosTransaction::TransferV2 { tip_millisat_per_gas, .. } => *tip_millisat_per_gas,
@@ -510,6 +514,8 @@ fn tx_tip_rate(tx: &PosTransaction) -> u128 {
 /// (`Sha3_256::digest(pubkey)`) — see `rpc.rs`'s `validator_json` and this
 /// file's own `sweep_fixture_declaring` for the same convention.
 fn tx_source_hash(tx: &PosTransaction) -> Option<[u8; 32]> {
+        #[cfg(feature = "native-lab")]
+        if let Some(sponsor)=bloch_pos_committee::transition::native_lab::sponsor(tx) { return tx_source_hash(&sponsor); }
     match tx {
         PosTransaction::Transfer { inputs, .. } => {
             let pk = &inputs.first()?.pubkey;
@@ -2778,6 +2784,8 @@ impl Engine {
     /// the same answer — the sweep may only ever judge transactions that
     /// actually name outpoints.
     fn spent_outpoints(tx: &PosTransaction) -> Option<Vec<([u8; 32], u32)>> {
+        #[cfg(feature = "native-lab")]
+        if let Some(sponsor)=bloch_pos_committee::transition::native_lab::sponsor(tx) { return Self::spent_outpoints(&sponsor); }
         match tx {
             PosTransaction::Transfer { inputs, .. } => {
                 Some(inputs.iter().map(|i| (i.txid, i.vout)).collect())
@@ -3119,7 +3127,30 @@ impl Engine {
                 return Err(Refusal::Invalid("funded deposit belongs to a different genesis manifest"));
             }
         }
+        #[cfg(feature = "native-lab")]
+        if bloch_pos_committee::transition::native_lab::is_native(&tx) {
+            if !self.tr.native_lab_matches(&self.state) {
+                return Err(Refusal::Invalid("native laboratory network is not selected"));
+            }
+            if bloch_pos_committee::transition::native_lab::sponsor(&tx).is_none() {
+                return Err(Refusal::Invalid("malformed native laboratory sponsor"));
+            }
+            self.tr.validate_native_lab_transaction(&self.state,&tx,self.wall_slot().max(self.state.slot().saturating_add(1)))
+                .map_err(|_| Refusal::PreviouslyRefused { until_slot: self.head_slot_now().saturating_add(1) })?;
+            // Serialize native operations in the laboratory pool. This covers
+            // native inputs, route nonces and pool revisions without claiming
+            // support for unconfirmed dependency chains.
+            if self.mempool.values().any(bloch_pos_committee::transition::native_lab::is_native) {
+                return Err(Refusal::PreviouslyRefused { until_slot: self.head_slot_now().saturating_add(1) });
+            }
+        } else { admissible(&tx, epoch_of(self.wall_slot())).map_err(Refusal::Invalid)?; }
+        #[cfg(not(feature = "native-lab"))]
         admissible(&tx, epoch_of(self.wall_slot())).map_err(Refusal::Invalid)?;
+        #[cfg(feature = "native-lab")]
+        if self.mempool.values().any(|other| {
+            (bloch_pos_committee::transition::native_lab::is_native(&tx) || bloch_pos_committee::transition::native_lab::is_native(other))
+            && Self::spent_outpoints(&tx).is_some_and(|a|Self::spent_outpoints(other).is_some_and(|b|a.iter().any(|p|b.contains(p))))
+        }) { return Err(Refusal::PreviouslyRefused { until_slot: self.head_slot_now().saturating_add(1) }); }
         if self.funded_mempool_conflict(&tx) {
             return Err(Refusal::Invalid("funded deposit conflicts with a pending input or validator key"));
         }
@@ -3205,6 +3236,10 @@ impl Engine {
                 | PosTransaction::TransferV2 { tx_bytes, .. } => *tx_bytes,
                 PosTransaction::FundedDeposit(tx) => tx.tx_bytes,
                 _ => 0,
+            };
+            #[cfg(feature = "native-lab")]
+            let declared = match bloch_pos_committee::transition::native_lab::sponsor(tx) {
+                Some(PosTransaction::TransferV2{tx_bytes,..})=>tx_bytes, _=>declared,
             };
             let n = (encoded.len() as u64).max(declared);
             if bytes.saturating_add(n) > cap {
@@ -4502,6 +4537,8 @@ fn start_libp2p(
 }
 
 pub fn run(cfg: Config) -> io::Result<()> {
+    // Laboratory policy is checked before any metrics, RPC or mesh bind.
+    native_laboratory::check_transport(&cfg)?;
     // Metrics FIRST, before the manifest is even read (audit C-R6-2): the
     // replay window is the one stretch where the node is alive, mute, and
     // indistinguishable from wedged (2026-08-21), so the health endpoint must
@@ -4528,6 +4565,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         }
     }
     let (mut manifest, digest) = Manifest::load(&cfg.genesis_path)?;
+    native_laboratory::check_config(&cfg, &manifest)?;
 
     // The opening ledger, before anything else touches the manifest. A
     // manifest that commits to a carryover is not usable until the snapshot
@@ -4836,8 +4874,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
 
     let mut engine = Engine {
         state: StateCell::new(genesis_state),
-        tr: Transition::new(verifier.clone()),
-        tr_probe: Transition::new(ProbeVerifier),
+        tr: native_laboratory::transition(verifier.clone(), cfg.native_lab, digest)?,
+        tr_probe: native_laboratory::transition(ProbeVerifier, cfg.native_lab, digest)?,
         verifier,
         keys,
         blocks: BTreeMap::new(),
@@ -11527,3 +11565,5 @@ mod branch_gap_repair_tests {
         }
     }
 }
+
+mod native_laboratory;

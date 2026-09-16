@@ -82,6 +82,11 @@ impl Engine {
                     .validate_lifecycle_transaction(tx, total, fee, &ProbeVerifier)
                     .is_ok()
         });
+        #[cfg(feature = "native-lab")]
+        self.mempool.retain(|_, tx| {
+            !bloch_pos_committee::transition::native_lab::is_native(tx)
+                || self.tr.validate_native_lab_transaction(state, tx, state.slot().saturating_add(1)).is_ok()
+        });
         self.mempool_admitted_at
             .retain(|key, _| self.mempool.contains_key(key));
         self.mempool_suspect
