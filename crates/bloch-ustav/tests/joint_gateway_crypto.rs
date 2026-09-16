@@ -571,6 +571,24 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
     );
     let exported = review.observer_request_json();
     let review_commitment = review.commitment();
+    let (review_authority, review_secret) = crypto::generate_keypair_from_seed(&[243; 32]).unwrap();
+    let valid_until = head.height + 10;
+    let signature = crypto::sign(
+        &review_secret,
+        &review
+            .certificate_message(&review_authority, valid_until)
+            .unwrap(),
+    )
+    .unwrap();
+    review
+        .verify_certificate(
+            head,
+            &review_authority,
+            head.height,
+            valid_until,
+            &signature,
+        )
+        .unwrap();
     let value: serde_json::Value = serde_json::from_str(&exported).unwrap();
     assert_eq!(value.as_object().unwrap().len(), 7);
     assert_eq!(value["nonce"], release.nonce.to_string());
@@ -638,6 +656,15 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
     let review = reopened.redemption_review(head, &route, 0).unwrap();
     assert_eq!(review.observer_request_json(), exported);
     assert_eq!(review.commitment(), review_commitment);
+    review
+        .verify_certificate(
+            head,
+            &review_authority,
+            head.height,
+            valid_until,
+            &signature,
+        )
+        .unwrap();
     assert_eq!(review.checkpoint(), head);
     assert_eq!(page.records(), &[&release]);
     assert_eq!(page.checkpoint(), head);

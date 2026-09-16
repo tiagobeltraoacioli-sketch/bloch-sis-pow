@@ -61,7 +61,63 @@ pub struct RedemptionReview<'a> {
     release: &'a Release,
     liabilities: gateway::AssetLiabilities,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewCertificateError {
+    WrongCheckpoint,
+    InvalidAuthority,
+    InvalidValidity,
+    InvalidSignature,
+}
+
 impl RedemptionReview<'_> {
+    /// Message for an independently configured attestation authority to sign.
+    /// No key is selected, generated or trusted by this method.
+    pub fn certificate_message(
+        &self,
+        authority: &[u8],
+        valid_until: u64,
+    ) -> Result<[u8; 32], ReviewCertificateError> {
+        use sha3::{Digest, Sha3_256};
+        if !BlochVerifier.valid_pq_key(authority) {
+            return Err(ReviewCertificateError::InvalidAuthority);
+        }
+        if valid_until < self.checkpoint.height {
+            return Err(ReviewCertificateError::InvalidValidity);
+        }
+        let mut hash = Sha3_256::new();
+        hash.update(b"BLOCH-REDEMPTION-ATTESTATION-v1\0");
+        hash.update(self.commitment());
+        hash.update(Sha3_256::digest(authority));
+        hash.update(valid_until.to_be_bytes());
+        Ok(hash.finalize().into())
+    }
+
+    /// Verify a review attestation against external trust inputs, not a key or
+    /// checkpoint embedded in an untrusted certificate. The host supplies the
+    /// current native height; validity is inclusive and never before the review.
+    /// Success authenticates this attestation only, NOT finality or payment.
+    pub fn verify_certificate(
+        &self,
+        trusted_checkpoint: Checkpoint,
+        trusted_authority: &[u8],
+        current_height: u64,
+        valid_until: u64,
+        signature: &[u8],
+    ) -> Result<(), ReviewCertificateError> {
+        if self.checkpoint != trusted_checkpoint {
+            return Err(ReviewCertificateError::WrongCheckpoint);
+        }
+        if current_height < self.checkpoint.height || current_height > valid_until {
+            return Err(ReviewCertificateError::InvalidValidity);
+        }
+        let message = self.certificate_message(trusted_authority, valid_until)?;
+        if !BlochVerifier.verify_pq(&message, trusted_authority, signature) {
+            return Err(ReviewCertificateError::InvalidSignature);
+        }
+        Ok(())
+    }
+
     /// Canonical versioned bytes for independent commitment verification.
     /// This is an integrity identifier, not a certificate or payout permission.
     pub fn commitment_preimage(&self) -> Vec<u8> {
@@ -490,6 +546,100 @@ mod tests {
                 }],
             },
         }
+    }
+    #[test]
+    fn hybrid_review_certificate_requires_trust_context_validity_and_both_signatures() {
+        use bloch_crypto::crypto;
+        use ReviewCertificateError::*;
+        let release = Release {
+            route: [1; 32],
+            nonce: 7,
+            recipient: [2; 20],
+            amount: 100,
+            native_burn: [3; 32],
+        };
+        let review = commitment_fixture(&release);
+        let (public, secret) = crypto::generate_keypair_from_seed(&[241; 32]).unwrap();
+        let (other, _) = crypto::generate_keypair_from_seed(&[242; 32]).unwrap();
+        let message = review.certificate_message(&public, 20).unwrap();
+        let signature = crypto::sign(&secret, &message).unwrap();
+        for height in [10, 15, 20] {
+            assert_eq!(
+                review.verify_certificate(review.checkpoint(), &public, height, 20, &signature),
+                Ok(())
+            );
+        }
+        for height in [0, 9, 21, u64::MAX] {
+            assert_eq!(
+                review.verify_certificate(review.checkpoint(), &public, height, 20, &signature),
+                Err(InvalidValidity)
+            );
+        }
+        assert_eq!(review.certificate_message(&public, 9), Err(InvalidValidity));
+        assert_eq!(review.certificate_message(&[], 20), Err(InvalidAuthority));
+        assert_eq!(
+            review.verify_certificate(review.checkpoint(), &[], 15, 20, &signature),
+            Err(InvalidAuthority)
+        );
+        assert_eq!(
+            review.verify_certificate(review.checkpoint(), &other, 15, 20, &signature),
+            Err(InvalidSignature)
+        );
+        assert_eq!(
+            review.verify_certificate(review.checkpoint(), &public, 15, 21, &signature),
+            Err(InvalidSignature)
+        );
+        for checkpoint in [
+            Checkpoint {
+                height: 11,
+                ..review.checkpoint()
+            },
+            Checkpoint {
+                root: [0; 32],
+                ..review.checkpoint()
+            },
+        ] {
+            assert_eq!(
+                review.verify_certificate(checkpoint, &public, 15, 20, &signature),
+                Err(WrongCheckpoint)
+            );
+        }
+        for offset in [
+            crypto::SUITE_HEADER_LEN,
+            crypto::SUITE_HEADER_LEN + crypto::MLDSA_SIG_LEN + 1,
+        ] {
+            let mut damaged = signature.clone();
+            damaged[offset] ^= 1;
+            assert_eq!(
+                review.verify_certificate(review.checkpoint(), &public, 15, 20, &damaged),
+                Err(InvalidSignature)
+            );
+        }
+        for damaged in [
+            vec![],
+            vec![0; crate::MAX_SIGNATURE_BYTES + 1],
+            crypto::sign(&secret, &review.commitment()).unwrap(),
+        ] {
+            assert_eq!(
+                review.verify_certificate(review.checkpoint(), &public, 15, 20, &damaged),
+                Err(InvalidSignature)
+            );
+        }
+        let changed_release = Release {
+            amount: 101,
+            ..release.clone()
+        };
+        let mut changed = commitment_fixture(&changed_release);
+        assert_eq!(
+            changed.verify_certificate(changed.checkpoint(), &public, 15, 20, &signature),
+            Err(InvalidSignature)
+        );
+        changed = commitment_fixture(&release);
+        changed.liabilities.burned += 1;
+        assert_eq!(
+            changed.verify_certificate(changed.checkpoint(), &public, 15, 20, &signature),
+            Err(InvalidSignature)
+        );
     }
     #[test]
     fn redemption_commitment_matches_independent_python_sha3_vector() {

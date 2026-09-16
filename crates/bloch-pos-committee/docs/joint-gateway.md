@@ -166,6 +166,37 @@ together. Authentication still requires an independently trusted signer/checkpoi
 policy and a verified transport; no such trust is inferred from this commitment.
 Neither the journal format nor source contract route IDs change.
 
+### Hybrid PQ review attestations
+
+`RedemptionReview::certificate_message(authority, valid_until)` provides the
+domain-separated digest for an independently configured authority to sign.
+It uses SHA3-256 of ASCII `BLOCH-REDEMPTION-ATTESTATION-v1` plus one zero byte,
+the 32-byte review commitment, SHA3-256 of the complete canonical hybrid public
+key envelope, and the 8-byte unsigned big-endian native expiry height.
+Keys must pass the concrete `BlochVerifier` suite and canonical-key checks;
+expiry cannot precede the review checkpoint. Private keys remain outside the
+review and journal APIs. No operational authority is generated or installed.
+
+`verify_certificate(trusted_checkpoint, trusted_authority, current_height,
+valid_until, signature)` requires the exact independently trusted checkpoint and
+verifies with ML-DSA-65 **and** Falcon-1024 through `BlochVerifier`. The host must
+supply trusted authority policy and native height; taking a public key, root or
+height from an untrusted certificate is not authentication. Accepted heights run
+from checkpoint height through expiry inclusive. A modified expiry, different
+key, substituted review, wrong signature domain, malformed signature, or damage
+to either hybrid component is refused. Signature size remains bounded by the
+native verifier. Callers must define key rotation, revocation, permitted validity
+windows and any additional authority quorum outside this primitive.
+
+Success authenticates an authority's attestation to this local review, not
+consensus finality, a source payout or a completed settlement. It does not replace
+the issuer and bridge quorum required for gateway supply changes. Verification
+does not consume a certificate and may be repeated; durable payment/burn replay
+guards remain necessary for any future settlement transition. The existing
+Python observer still accepts only an unauthenticated release request and does
+not yet verify this certificate. No network certificate transport or live
+authority registry is introduced by these local host methods.
+
 ### Existing integration coverage
 
 The complete market rehearsal is now covered by
