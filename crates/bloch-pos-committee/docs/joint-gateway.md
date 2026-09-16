@@ -413,3 +413,15 @@ cover partial length prefixes and payloads, rejection without modification under
 `Reject`, unchanged bytes when the trusted tip mismatches, exact truncation after
 authenticated-prefix matching, retained policy, and zero on the next clean open.
 A complete invalid length record is refused even with recovery enabled.
+
+Before append, the journal now checks that both its open file length and write
+cursor match its tracked durable extent. It repeats this check after candidate
+verification and before persistence. A changed extent returns `StorageChanged`
+and poisons the handle; metadata/position I/O errors also poison it. No staged
+state is installed or additional bytes written after detection. Reopening and
+reconciling against independent trust is required rather than silently seeking
+past or overwriting unexpected data. Integration tests deliberately bypass the
+advisory lock to truncate or extend owned test files and verify unchanged bytes,
+unchanged in-memory head and refusal of subsequent writes and release queries.
+This detects extent/cursor changes, not same-length edits, renamed files or all
+races with a malicious writer; operator-controlled storage remains required.

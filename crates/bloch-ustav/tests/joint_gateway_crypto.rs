@@ -781,6 +781,50 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
     .unwrap();
     assert_eq!(clean.recovered_tail_bytes(), 0);
     drop(clean);
+    // Non-cooperating external writers must not make the host append over a
+    // changed extent. These owned files intentionally bypass the advisory lock.
+    for truncate in [false, true] {
+        let changed_path = path.with_extension(if truncate {
+            "truncated.log"
+        } else {
+            "extended.log"
+        });
+        let mut changed =
+            Journal::create_requiring_base_roots(&changed_path, anchor.clone(), 3).unwrap();
+        if truncate {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&changed_path)
+                .unwrap()
+                .set_len(47)
+                .unwrap();
+        } else {
+            use std::io::Write;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&changed_path)
+                .unwrap()
+                .write_all(&[1, 2])
+                .unwrap();
+        }
+        let altered = std::fs::read(&changed_path).unwrap();
+        assert!(matches!(
+            changed.append_with_base_roots(&candidate, 4, roots),
+            Err(JournalError::StorageChanged)
+        ));
+        assert_eq!(std::fs::read(&changed_path).unwrap(), altered);
+        assert_eq!(changed.checkpoint(), original_head);
+        assert!(matches!(
+            changed.append_with_base_roots(&candidate, 4, roots),
+            Err(JournalError::Poisoned)
+        ));
+        assert!(matches!(
+            changed.release_page(original_head, &route, None, 1),
+            Err(JournalError::Poisoned)
+        ));
+        drop(changed);
+        std::fs::remove_file(&changed_path).unwrap();
+    }
     std::fs::remove_file(&bound_path).unwrap();
     let bytes_before_queries = std::fs::read(&path).unwrap();
     for stale in [

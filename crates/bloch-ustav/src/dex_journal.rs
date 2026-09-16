@@ -42,6 +42,7 @@ pub enum Error {
     ResourceLimit,
     NonIncreasingHeight,
     Poisoned,
+    StorageChanged,
     Incomplete { offset: u64 },
     Candidate(pool_candidate::Error),
     Gateway(gateway::Error),
@@ -707,6 +708,7 @@ impl Journal {
             .checked_add(4 + candidate.len() as u64)
             .filter(|n| *n <= MAX_JOURNAL_BYTES)
             .ok_or(Error::ResourceLimit)?;
+        check_storage_extent(&mut self.file, self.length, &mut self.poisoned)?;
         let prepared = match roots {
             Some(roots) => pool_candidate::prepare_with_base_roots(
                 &mut self.state,
@@ -725,6 +727,8 @@ impl Journal {
             ),
         }
         .map_err(Error::Candidate)?;
+        // Recheck after potentially expensive PQ verification as well.
+        check_storage_extent(&mut self.file, self.length, &mut self.poisoned)?;
         persist_record(&mut self.file, prepared.candidate(), &mut self.poisoned)?;
         let result = prepared.commit();
         self.head = Checkpoint {
@@ -744,6 +748,24 @@ fn candidate_height(bytes: &[u8]) -> Result<u64, Error> {
     Ok(u64::from_le_bytes(
         value.try_into().map_err(|_| Error::InvalidLength)?,
     ))
+}
+
+// Advisory locks cannot stop an uncooperative writer. Detect changed extent or
+// cursor before writing; this does not detect same-length edits or close races.
+fn check_storage_extent(file: &mut File, expected: u64, poisoned: &mut bool) -> Result<(), Error> {
+    let observed =
+        (|| -> io::Result<(u64, u64)> { Ok((file.metadata()?.len(), file.stream_position()?)) })();
+    match observed {
+        Ok((length, position)) if length == expected && position == expected => Ok(()),
+        Ok(_) => {
+            *poisoned = true;
+            Err(Error::StorageChanged)
+        }
+        Err(error) => {
+            *poisoned = true;
+            Err(Error::Io(error))
+        }
+    }
 }
 
 trait Durable: Write {
