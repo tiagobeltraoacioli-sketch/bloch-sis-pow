@@ -295,3 +295,8 @@ adapter and native executable together. Review commitments and certificate
 signing formats are unchanged. This process policy does not supply authenticated
 live native heights or consensus finality. The lower-level library verification
 API remains independent of operator-specific freshness limits.
+
+`verify-redemption-review --protocol` returns exactly `BLOCH-REVIEW-VERIFY-v2`
+plus newline without reading stdin. Other arguments are refused. This supports
+the bridge's explicit `check-native-verifier.py` deployment diagnostic; protocol
+compatibility alone is not a cryptographic self-test or operational readiness.

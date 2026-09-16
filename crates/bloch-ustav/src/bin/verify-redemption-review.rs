@@ -82,6 +82,15 @@ fn verify(input: &[u8]) -> Result<[u8; 32], ()> {
     .map_err(|_| ())
 }
 fn main() {
+    let mut args = std::env::args_os().skip(1);
+    if let Some(first) = args.next() {
+        if first == "--protocol" && args.next().is_none() {
+            println!("BLOCH-REVIEW-VERIFY-v2");
+            return;
+        }
+        eprintln!("unsupported-verifier-arguments");
+        std::process::exit(1);
+    }
     let mut input = Vec::new();
     let result = io::stdin()
         .take((MAX_REQUEST + 1) as u64)

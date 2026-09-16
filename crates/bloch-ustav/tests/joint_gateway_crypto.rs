@@ -700,6 +700,20 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
         child.stdin.take().unwrap().write_all(input).unwrap();
         child.wait_with_output().unwrap()
     };
+    let protocol = std::process::Command::new(env!("CARGO_BIN_EXE_verify-redemption-review"))
+        .arg("--protocol")
+        .output()
+        .unwrap();
+    assert!(protocol.status.success());
+    assert_eq!(protocol.stdout, b"BLOCH-REVIEW-VERIFY-v2\n");
+    for args in [vec!["--unknown"], vec!["--protocol", "--unknown"]] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_verify-redemption-review"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+    }
     let output = run_verifier(&wire);
     assert!(output.status.success());
     assert_eq!(
