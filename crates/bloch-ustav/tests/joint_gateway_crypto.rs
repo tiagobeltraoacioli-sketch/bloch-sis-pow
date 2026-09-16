@@ -705,6 +705,82 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
     assert!(restored.requires_base_roots());
     assert_eq!(restored.checkpoint(), head);
     drop(restored);
+    // Recovery must keep the bound policy and must not truncate on a wrong tip.
+    assert_eq!(persisted.len(), before.len() + 4 + candidate.len());
+    for suffix in [vec![1], vec![1, 2, 3], {
+        let mut bytes = (candidate.len() as u32).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&candidate[..candidate.len() / 2]);
+        bytes
+    }] {
+        let mut interrupted = persisted.clone();
+        interrupted.extend_from_slice(&suffix);
+        std::fs::write(&bound_path, &interrupted).unwrap();
+        assert!(matches!(
+            Journal::open_requiring_base_roots(
+                &bound_path,
+                anchor.clone(),
+                3,
+                head,
+                TailRecovery::Reject
+            ),
+            Err(JournalError::Incomplete { .. })
+        ));
+        assert_eq!(std::fs::read(&bound_path).unwrap(), interrupted);
+        let wrong_tip = Checkpoint {
+            root: [0; 32],
+            ..head
+        };
+        assert!(matches!(
+            Journal::open_requiring_base_roots(
+                &bound_path,
+                anchor.clone(),
+                3,
+                wrong_tip,
+                TailRecovery::DiscardIncomplete
+            ),
+            Err(JournalError::WrongHead)
+        ));
+        assert_eq!(std::fs::read(&bound_path).unwrap(), interrupted);
+        let recovered = Journal::open_requiring_base_roots(
+            &bound_path,
+            anchor.clone(),
+            3,
+            head,
+            TailRecovery::DiscardIncomplete,
+        )
+        .unwrap();
+        assert_eq!(recovered.recovered_tail_bytes(), suffix.len() as u64);
+        assert!(recovered.requires_base_roots());
+        assert_eq!(recovered.checkpoint(), head);
+        assert_eq!(std::fs::read(&bound_path).unwrap(), persisted);
+        drop(recovered);
+    }
+    // A complete but invalid record is not an interrupted write to discard.
+    let mut invalid = persisted.clone();
+    invalid.extend_from_slice(&0u32.to_le_bytes());
+    std::fs::write(&bound_path, &invalid).unwrap();
+    assert!(matches!(
+        Journal::open_requiring_base_roots(
+            &bound_path,
+            anchor.clone(),
+            3,
+            head,
+            TailRecovery::DiscardIncomplete
+        ),
+        Err(JournalError::InvalidLength)
+    ));
+    assert_eq!(std::fs::read(&bound_path).unwrap(), invalid);
+    std::fs::write(&bound_path, &persisted).unwrap();
+    let clean = Journal::open_requiring_base_roots(
+        &bound_path,
+        anchor.clone(),
+        3,
+        head,
+        TailRecovery::Reject,
+    )
+    .unwrap();
+    assert_eq!(clean.recovered_tail_bytes(), 0);
+    drop(clean);
     std::fs::remove_file(&bound_path).unwrap();
     let bytes_before_queries = std::fs::read(&path).unwrap();
     for stale in [

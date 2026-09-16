@@ -403,3 +403,13 @@ the test file and reopen successfully. Existing generic `open` remains available
 for intentional legacy compatibility. This prevents silent policy downgrade by
 header substitution when the host selects the strict API; it does not authenticate
 host configuration, historical approvals or consensus finality.
+
+`Journal::recovered_tail_bytes` reports the number of physically incomplete tail
+bytes removed during the current successful open. New and clean opens report
+zero; the count is not persisted as consensus state. It is set only after the
+truncation and sync succeed. Hosts can log this local recovery event without
+mistaking it for a payment or finality indication. Bound-format real PQ tests
+cover partial length prefixes and payloads, rejection without modification under
+`Reject`, unchanged bytes when the trusted tip mismatches, exact truncation after
+authenticated-prefix matching, retained policy, and zero on the next clean open.
+A complete invalid length record is refused even with recovery enabled.

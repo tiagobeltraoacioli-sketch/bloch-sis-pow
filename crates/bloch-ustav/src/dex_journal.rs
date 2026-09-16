@@ -372,6 +372,7 @@ pub struct Journal {
     records: usize,
     poisoned: bool,
     require_base_roots: bool,
+    recovered_tail_bytes: u64,
 }
 impl Journal {
     /// Create a new log from an independently authenticated anchor.
@@ -430,6 +431,7 @@ impl Journal {
             records: 0,
             poisoned: false,
             require_base_roots,
+            recovered_tail_bytes: 0,
         })
     }
 
@@ -504,6 +506,7 @@ impl Journal {
             records: 0,
             poisoned: false,
             require_base_roots,
+            recovered_tail_bytes: 0,
         };
         let mut incomplete = false;
         while journal.length < length {
@@ -557,6 +560,7 @@ impl Journal {
         if incomplete {
             journal.file.set_len(journal.length)?;
             journal.file.sync_all()?;
+            journal.recovered_tail_bytes = length - journal.length;
         }
         journal.file.seek(SeekFrom::Start(journal.length))?;
         Ok(journal)
@@ -568,6 +572,12 @@ impl Journal {
         } else {
             Ok(())
         }
+    }
+
+    /// Bytes removed by successful incomplete-tail recovery during this open.
+    /// Zero for a new/clean journal; this is a local diagnostic, not finality.
+    pub fn recovered_tail_bytes(&self) -> u64 {
+        self.recovered_tail_bytes
     }
 
     /// Persisted admission policy, not proof that the file was authenticated.
