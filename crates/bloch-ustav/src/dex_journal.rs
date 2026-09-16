@@ -598,6 +598,27 @@ impl Journal {
     /// The host supplies the authenticated candidate height. Successful return
     /// follows fsync; any write/fsync failure poisons this handle until reopen.
     pub fn append(&mut self, candidate: &[u8], height: u64) -> Result<pool_batch::Outcome, Error> {
+        self.append_checked(candidate, height, None)
+    }
+
+    /// Persist only after the candidate matches both independently supplied BLCH
+    /// roots. The journal format is unchanged: replay authenticates the complete
+    /// joint tip, not historical host root expectations. No consensus activation.
+    pub fn append_with_base_roots(
+        &mut self,
+        candidate: &[u8],
+        height: u64,
+        roots: pool_candidate::BaseRoots,
+    ) -> Result<pool_batch::Outcome, Error> {
+        self.append_checked(candidate, height, Some(roots))
+    }
+
+    fn append_checked(
+        &mut self,
+        candidate: &[u8],
+        height: u64,
+        roots: Option<pool_candidate::BaseRoots>,
+    ) -> Result<pool_batch::Outcome, Error> {
         self.ensure_healthy()?;
         if height <= self.head.height {
             return Err(Error::NonIncreasingHeight);
@@ -610,13 +631,23 @@ impl Journal {
             .checked_add(4 + candidate.len() as u64)
             .filter(|n| *n <= MAX_JOURNAL_BYTES)
             .ok_or(Error::ResourceLimit)?;
-        let prepared = pool_candidate::prepare(
-            &mut self.state,
-            candidate,
-            height,
-            &BaseVerifier,
-            &BlochVerifier,
-        )
+        let prepared = match roots {
+            Some(roots) => pool_candidate::prepare_with_base_roots(
+                &mut self.state,
+                candidate,
+                height,
+                roots,
+                &BaseVerifier,
+                &BlochVerifier,
+            ),
+            None => pool_candidate::prepare(
+                &mut self.state,
+                candidate,
+                height,
+                &BaseVerifier,
+                &BlochVerifier,
+            ),
+        }
         .map_err(Error::Candidate)?;
         persist_record(&mut self.file, prepared.candidate(), &mut self.poisoned)?;
         let result = prepared.commit();

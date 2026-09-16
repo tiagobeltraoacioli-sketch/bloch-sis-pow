@@ -318,3 +318,19 @@ a header, or supply finality. No live node admission path invokes this API yet.
 A block containing other operations must compose them into one defined transition
 before comparing roots; an arbitrary intermediate candidate root is not a complete
 block state root. Activation and combined-root header encoding remain required.
+
+`bloch_ustav::dex_journal::Journal::append_with_base_roots` now exposes that check
+at the durable local host boundary. It accepts independent `BaseRoots`, uses the
+concrete BLCH and native PQ verifiers, and writes candidate bytes only after both
+projections match. It shares the existing fsync-before-state-install path and
+poisons the handle on write/sync failure. Rejected roots leave the file and state
+unchanged; callers can retry with correct independently obtained expectations.
+
+The on-disk candidate format and replay behavior are unchanged. Reopening still
+reexecutes against the independently authenticated joint tip; historical host
+BLCH expectations are not separately stored or reauthenticated. Existing `append`
+and pending-batch callers retain their explicit local-rehearsal semantics. A live
+block integration must select the bound path and provide authenticated context;
+this addition does not wire the node, change block formats or activate consensus.
+Real PQ integration tests cover both mismatches, successful persistence and
+restart of the bound journal.

@@ -215,6 +215,11 @@ impl State {
     pub fn base(&self) -> &CommittedState {
         &self.base
     }
+    /// Recomputed BLCH projection of this rehearsal state, not a finality proof.
+    /// Hosts must authenticate expected roots independently before admission.
+    pub fn base_state_root(&self) -> [u8; 32] {
+        self.base.compute_root()
+    }
     pub fn native(&self) -> backend::NativeView<'_> {
         backend::NativeView::new(self)
     }

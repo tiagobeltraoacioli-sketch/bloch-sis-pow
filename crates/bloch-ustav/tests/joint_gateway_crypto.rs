@@ -534,6 +534,56 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
     );
     assert!(view.releases_after(&route, Some(0), 1).unwrap().is_empty());
     let head = journal.checkpoint();
+    // Host-bound persistence exercises actual PQ verification and disk replay.
+    let bound_path = path.with_extension("base-bound.log");
+    let mut bound = Journal::create(&bound_path, anchor.clone(), 3).unwrap();
+    let references: Vec<_> = frames.iter().map(Vec::as_slice).collect();
+    let candidate =
+        pool_candidate::build(&anchor, 4, &references, &BaseVerifier, &BlochVerifier).unwrap();
+    let roots = pool_candidate::BaseRoots {
+        parent: anchor.base_state_root(),
+        post: journal.state().base_state_root(),
+    };
+    let before = std::fs::read(&bound_path).unwrap();
+    for wrong_parent in [true, false] {
+        let mut wrong = roots;
+        if wrong_parent {
+            wrong.parent[0] ^= 1;
+        } else {
+            wrong.post[0] ^= 1;
+        }
+        let result = bound.append_with_base_roots(&candidate, 4, wrong);
+        if wrong_parent {
+            assert!(matches!(
+                result,
+                Err(JournalError::Candidate(
+                    pool_candidate::Error::BaseParentMismatch
+                ))
+            ));
+        } else {
+            assert!(matches!(
+                result,
+                Err(JournalError::Candidate(
+                    pool_candidate::Error::BasePostMismatch
+                ))
+            ));
+        }
+        assert_eq!(std::fs::read(&bound_path).unwrap(), before);
+        assert_eq!(bound.checkpoint(), original_head);
+    }
+    assert_eq!(
+        bound
+            .append_with_base_roots(&candidate, 4, roots)
+            .unwrap()
+            .post_root,
+        expected
+    );
+    drop(bound);
+    let bound = Journal::open(&bound_path, anchor.clone(), 3, head, TailRecovery::Reject).unwrap();
+    assert_eq!(bound.state().base_state_root(), roots.post);
+    assert_eq!(bound.state().state_root(), expected);
+    drop(bound);
+    std::fs::remove_file(&bound_path).unwrap();
     let bytes_before_queries = std::fs::read(&path).unwrap();
     for stale in [
         original_head,
