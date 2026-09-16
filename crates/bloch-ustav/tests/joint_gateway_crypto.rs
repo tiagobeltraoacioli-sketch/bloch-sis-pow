@@ -569,6 +569,11 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
     let mut block_journal =
         Journal::create_requiring_base_roots(&block_path, anchor.clone(), 3).unwrap();
     let untouched = std::fs::read(&block_path).unwrap();
+    let mut block_pending = PendingBatch::new(&block_journal, 4).unwrap();
+    for frame in frames {
+        block_pending.admit(&block_journal, frame, 4).unwrap();
+    }
+
     for altered in [
         pool_candidate::BlockContext {
             slot: block_context.slot + 1,
@@ -587,14 +592,50 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
         ));
         assert_eq!(std::fs::read(&block_path).unwrap(), untouched);
         assert_eq!(block_journal.checkpoint(), original_head);
+        assert!(matches!(
+            block_pending.commit_for_block(
+                &mut block_journal,
+                altered,
+                roots,
+                block_binding,
+                &candidate
+            ),
+            Err(bloch_ustav::dex_admission::Error::Journal(
+                JournalError::Candidate(pool_candidate::Error::BlockBindingMismatch)
+            ))
+        ));
+        assert_eq!(block_pending.len(), frames.len());
+        assert!(!block_pending.is_closed());
+        assert_eq!(block_pending.build(&block_journal, 4).unwrap(), candidate);
+        assert_eq!(std::fs::read(&block_path).unwrap(), untouched);
     }
     assert_eq!(
-        block_journal
-            .append_for_block(&candidate, block_context, roots, block_binding)
+        block_pending
+            .commit_for_block(
+                &mut block_journal,
+                block_context,
+                roots,
+                block_binding,
+                &candidate
+            )
             .unwrap()
             .post_root,
         expected
     );
+    assert!(block_pending.is_closed());
+    assert!(block_pending.is_empty());
+    let block_bytes = std::fs::read(&block_path).unwrap();
+    assert!(matches!(
+        block_pending.commit_for_block(
+            &mut block_journal,
+            block_context,
+            roots,
+            block_binding,
+            &candidate
+        ),
+        Err(bloch_ustav::dex_admission::Error::Closed)
+    ));
+    assert_eq!(std::fs::read(&block_path).unwrap(), block_bytes);
     drop(block_journal);
     let block_journal = Journal::open_requiring_base_roots(
         &block_path,

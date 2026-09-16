@@ -475,3 +475,15 @@ replay authenticates the joint tip but does not reconstruct the historical block
 context or prove inclusion. `BLCHDJ02` requires BLCH roots, not this particular
 block admission mode. A production integration must commit and persist the block
 extension under consensus rules; no live header format or node path changes here.
+
+`PendingBatch::commit_for_block` connects buffered admission to
+`Journal::append_for_block`. It rebuilds and compares the exact expected candidate
+bytes at the context's height, then checks the authenticated extension expectation
+and BLCH projections through the journal. An explicit internal enum keeps local,
+base-root and block-context admission distinct. Context mismatch preserves the
+queue and file; successful fsync closes and clears the batch exactly once.
+Tests with real PQ operations cover slot/parent changes through both direct and
+buffered paths, byte-identical retry, refusal of a second commit, and restart.
+The existing monotonic height watermark, storage checks, and no-live-consensus
+limitations remain in force. Neither this API nor `BLCHDJ02` proves that a signed
+network header included the proposed extension.

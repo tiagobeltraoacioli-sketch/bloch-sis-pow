@@ -88,6 +88,16 @@ pub struct PendingBatch {
     closed: bool,
     require_expected_candidate: bool,
 }
+enum CommitContext {
+    Local,
+    Base(pool_candidate::BaseRoots),
+    Block {
+        context: pool_candidate::BlockContext,
+        roots: pool_candidate::BaseRoots,
+        binding: [u8; 32],
+    },
+}
+
 impl PendingBatch {
     pub fn new(journal: &Journal, height: u64) -> Result<Self, Error> {
         journal.ensure_healthy().map_err(Error::Journal)?;
@@ -341,7 +351,7 @@ impl PendingBatch {
         journal: &mut Journal,
         height: u64,
     ) -> Result<pool_batch::Outcome, Error> {
-        self.commit_checked(journal, height, None, None)
+        self.commit_checked(journal, height, CommitContext::Local, None)
     }
 
     /// Require independently supplied parent/post BLCH roots at persistence.
@@ -353,7 +363,7 @@ impl PendingBatch {
         height: u64,
         roots: pool_candidate::BaseRoots,
     ) -> Result<pool_batch::Outcome, Error> {
-        self.commit_checked(journal, height, Some(roots), None)
+        self.commit_checked(journal, height, CommitContext::Base(roots), None)
     }
 
     /// Commit only the exact canonical candidate independently approved by the
@@ -366,20 +376,45 @@ impl PendingBatch {
         roots: pool_candidate::BaseRoots,
         expected: &[u8],
     ) -> Result<pool_batch::Outcome, Error> {
-        self.commit_checked(journal, height, Some(roots), Some(expected))
+        self.commit_checked(journal, height, CommitContext::Base(roots), Some(expected))
+    }
+
+    /// Confirm exact host-approved bytes within the supplied block context.
+    /// The binding must be independently authenticated by the integrating host.
+    /// Errors preserve the queue; only durable success closes it.
+    pub fn commit_for_block(
+        &mut self,
+        journal: &mut Journal,
+        context: pool_candidate::BlockContext,
+        roots: pool_candidate::BaseRoots,
+        binding: [u8; 32],
+        expected: &[u8],
+    ) -> Result<pool_batch::Outcome, Error> {
+        self.commit_checked(
+            journal,
+            context.height,
+            CommitContext::Block {
+                context,
+                roots,
+                binding,
+            },
+            Some(expected),
+        )
     }
 
     fn commit_checked(
         &mut self,
         journal: &mut Journal,
         height: u64,
-        roots: Option<pool_candidate::BaseRoots>,
+        admission: CommitContext,
         expected: Option<&[u8]>,
     ) -> Result<pool_batch::Outcome, Error> {
         if self.closed {
             return Err(Error::Closed);
         }
-        if self.require_expected_candidate && (roots.is_none() || expected.is_none()) {
+        if self.require_expected_candidate
+            && (matches!(admission, CommitContext::Local) || expected.is_none())
+        {
             return Err(Error::ExpectedCandidateRequired);
         }
         if expected.is_some_and(|bytes| {
@@ -391,9 +426,16 @@ impl PendingBatch {
         if expected.is_some_and(|bytes| bytes != candidate) {
             return Err(Error::CandidateChanged);
         }
-        let result = match roots {
-            Some(roots) => journal.append_with_base_roots(&candidate, self.height, roots),
-            None => journal.append(&candidate, self.height),
+        let result = match admission {
+            CommitContext::Block {
+                context,
+                roots,
+                binding,
+            } => journal.append_for_block(&candidate, context, roots, binding),
+            CommitContext::Base(roots) => {
+                journal.append_with_base_roots(&candidate, self.height, roots)
+            }
+            CommitContext::Local => journal.append(&candidate, self.height),
         }
         .map_err(Error::Journal)?;
         self.frames.clear();
