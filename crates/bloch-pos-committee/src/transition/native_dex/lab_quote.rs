@@ -31,6 +31,8 @@ pub struct Query {
 pub struct Quote {
     pub transaction: Vec<u8>,
     pub fee_sat: u128,
+    pub reserve_id: Option<[u8; 32]>,
+    pub pool_id: Option<[u8; 32]>,
 }
 fn base_mut(r: &mut pool_wire::Request) -> &mut PosTransaction {
     match r {
@@ -246,10 +248,6 @@ impl State {
                 amount,
                 minimum_out,
             } => {
-                // First bounded live path: BLCH exact-input, native payout.
-                if input_asset != bloch_euvm::BLCH {
-                    return Err("native-input swap builder is not available");
-                }
                 let record = self.initial_pools.get(&pool).ok_or("unknown pool")?;
                 let b = self
                     .base_reserves
@@ -271,37 +269,59 @@ impl State {
                 let quoted = self
                     .quote_blch_swap(&query, height)
                     .map_err(|_| "pool quote refused")?;
+                let blch_in = input_asset == bloch_euvm::BLCH;
+                let mut base_outputs = vec![TransferOutput {
+                    value: quoted.reserves_after[0],
+                    script_hash: base_reserves::reserve_script(&self.domain, &record.reserve),
+                }];
+                let mut native_inputs = vec![n.outpoint];
+                let mut native_outputs = vec![n::Output {
+                    owner: n.owner.clone(),
+                    amount: quoted.reserves_after[1],
+                }];
+                if blch_in {
+                    native_outputs.push(n::Output {
+                        owner: q.owner.clone(),
+                        amount: quoted.amount_out,
+                    });
+                } else {
+                    if input_asset != n.asset {
+                        return Err("input asset does not belong to this pool");
+                    }
+                    // Select one sufficient owner coin. Both native AMM locks
+                    // and paired BLCH/native custody locks exclude candidates.
+                    let ledger = self.native.gateway().native().snapshot();
+                    let (point, coin) = ledger
+                        .outputs
+                        .iter()
+                        .filter(|(p, o)| {
+                            o.asset == n.asset
+                                && o.output.owner == q.owner
+                                && o.output.amount >= amount
+                                && !self.native.is_locked(p)
+                                && !self.paired_locks.contains_key(p)
+                        })
+                        .min_by_key(|(_, o)| o.output.amount)
+                        .ok_or("no sufficient spendable native output")?;
+                    native_inputs.push(*point);
+                    native_inputs.sort();
+                    if coin.output.amount > amount {
+                        native_outputs.push(n::Output {
+                            owner: q.owner.clone(),
+                            amount: coin.output.amount - amount,
+                        });
+                    }
+                    base_outputs.push(TransferOutput {
+                        value: quoted.amount_out,
+                        script_hash: owner_hash,
+                    });
+                }
+                base_outputs.push(change());
                 pool_wire::Request::Swap(swap::Request {
                     quote: query,
                     pool_state_root: quoted.pool_state_root,
-                    blch: make_base(
-                        Some(b.outpoint),
-                        vec![
-                            TransferOutput {
-                                value: quoted.reserves_after[0],
-                                script_hash: base_reserves::reserve_script(
-                                    &self.domain,
-                                    &record.reserve,
-                                ),
-                            },
-                            change(),
-                        ],
-                    ),
-                    native: envelope(
-                        n.asset,
-                        vec![n.outpoint],
-                        vec![
-                            n::Output {
-                                owner: n.owner.clone(),
-                                amount: quoted.reserves_after[1],
-                            },
-                            n::Output {
-                                owner: q.owner.clone(),
-                                amount: quoted.amount_out,
-                            },
-                        ],
-                        Some(n.outpoint),
-                    )?,
+                    blch: make_base(Some(b.outpoint), base_outputs),
+                    native: envelope(n.asset, native_inputs, native_outputs, Some(n.outpoint))?,
                     native_gas: 100_000,
                 })
             }
@@ -342,6 +362,34 @@ impl State {
                 .ok_or("insufficient BLCH funding")?;
             outputs.last_mut().ok_or("missing change")?.value = remaining;
         }
+        let (reserve_id, pool_id) = match &request {
+            pool_wire::Request::CreatePair(r) => (
+                Some(
+                    base_reserves::reserve_id(&self.domain, &r.seed, &q.owner)
+                        .map_err(|_| "invalid reserve")?,
+                ),
+                None,
+            ),
+            pool_wire::Request::Initialize(r) => (
+                Some(r.reserve),
+                Some(
+                    self.bootstrap(
+                        &r.reserve,
+                        &r.creation_authorization,
+                        r.fee_bps,
+                        r.minimum_lp,
+                    )
+                    .map_err(|_| "initial liquidity quote refused")?
+                    .pool
+                    .id(),
+                ),
+            ),
+            pool_wire::Request::Swap(r) => (
+                self.initial_pools.get(&r.quote.pool).map(|p| p.reserve),
+                Some(r.quote.pool),
+            ),
+            _ => unreachable!(),
+        };
         let payload = pool_wire::encode(&request, &self.domain).map_err(|_| "invalid packet")?;
         pool_review::FundingReview::prepare(self, &payload, &q.owner, height)
             .map_err(|_| "funding review refused")?;
@@ -352,6 +400,8 @@ impl State {
         Ok(Quote {
             transaction,
             fee_sat: fee,
+            reserve_id,
+            pool_id,
         })
     }
 }

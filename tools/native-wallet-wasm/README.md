@@ -89,12 +89,16 @@ Issuer/module/gateway committee witnesses remain untouched and need their own
 authorities. Revalidation against live chain state, pending journaling, wallet
 backup UX and broadcast integration are separate host work.
 
-Seven real-hybrid vectors cover create pair, close an unconverted pair,
-initialize LP, add, swap, remove, and withdrawal after a real gateway import.
+Eight real-hybrid vectors cover create pair, close an unconverted pair,
+initialize LP, add, swaps in both directions, remove, and withdrawal after a real gateway import.
 The gateway fixture uses distinct issuer, committee and wallet keys. Negative
 tests refuse changed reserve roots, revisions, slippage, LP owners, active-pool
 close, changed context and forged gateway approvals. A separate test signs and
 executes the exact create/initialize/swap packets from the laboratory RPC builder.
+Native-input swaps select one sufficient unlocked wallet output, preserve native
+change, and pay BLCH separately from fee funding. Tests cover exact consumption,
+locked reserve exclusion, slippage, unchanged LP supply and reserve conservation.
+Fragmented native inputs are not combined by this bounded builder.
 
 ```sh
 NATIVE_WASM_VECTORS_PATH=/tmp/vectors.json cargo test --offline -p bloch-native-wallet-wasm --lib full_pool_lifecycle

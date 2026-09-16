@@ -580,6 +580,40 @@ fn full_pool_lifecycle_real_hybrid_signatures_and_wasm_vectors() {
     let request = swap(&state, reserve, pool);
     run("swap", &mut state, request, &mut vectors);
     assert_eq!(state.blch_pool(&pool).unwrap().reserves(), [1_599_936, 85]);
+    // Export the reverse direction too, using the exact live RPC builder.
+    let mut reverse_state = state.clone();
+    let asset = state.paired_custody(&reserve).unwrap().asset;
+    let reverse = state
+        .lab_build(
+            &bloch_pos_committee::transition::native_dex::lab_quote::Query {
+                owner: key(),
+                valid_until: 100,
+                operation:
+                    bloch_pos_committee::transition::native_dex::lab_quote::Operation::Swap {
+                        pool,
+                        input_asset: asset,
+                        amount: 3,
+                        minimum_out: 54385,
+                    },
+            },
+            1,
+        )
+        .unwrap();
+    let PosTransaction::NativePool(p) =
+        PosTransaction::from_canonical_bytes(&reverse.transaction).unwrap()
+    else {
+        panic!()
+    };
+    let request = pool_wire::decode(p.as_bytes(), &DOMAIN).unwrap();
+    run("swap-native-in", &mut reverse_state, request, &mut vectors);
+    assert_eq!(
+        reverse_state.blch_pool(&pool).unwrap().reserves(),
+        [1_545_551, 88]
+    );
+    assert_eq!(
+        reverse_state.blch_lp_position(&pool, &key()),
+        state.blch_lp_position(&pool, &key())
+    );
     let before_lp = state.blch_lp_position(&pool, &key());
     let request = remove(&state, reserve, pool);
     run("remove", &mut state, request, &mut vectors);
