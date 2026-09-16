@@ -14,6 +14,7 @@ members = [
     # ── Genesis-4, proof of stake. THE LIVE CHAIN. ──
     "crates/bloch-pos-committee",  # frozen consensus math (pure, sha3-only)
     "crates/bloch-pos-node",       # the `bloch-pos` binary the fleet runs
+    "tools/native-wallet-wasm",    # isolated typed native signer feasibility
     "tools/genesis4-ceremony",     # assembled the live genesis block
 
     # ── Shared protocol crates. Used by BOTH eras; not PoW-only. ──

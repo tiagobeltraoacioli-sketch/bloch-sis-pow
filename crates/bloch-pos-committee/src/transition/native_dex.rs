@@ -151,6 +151,7 @@ pub struct State {
     initial_pools: BTreeMap<[u8; 32], initial_liquidity::Record>,
     reserve_pools: BTreeMap<[u8; 32], [u8; 32]>,
 }
+pub mod wallet_projection;
 /// Opaque native component storage, without ownership of a `CommittedState`.
 ///
 /// Hosts may store this alongside their base state without recursive ownership.
