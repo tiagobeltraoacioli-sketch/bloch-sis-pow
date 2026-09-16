@@ -30,3 +30,14 @@ historical duty triggered the doppelganger detector before networking duties
 started. A process-list check confirmed one local instance. Only this isolated
 run was restarted with `--no-doppelganger-check`; production defaults and code
 were unchanged. This test workaround is not a production restart recommendation.
+
+## Pool state after the browser cycle
+
+After the browser create/initialize/swap sequence and another full node restart,
+the live `getnativepool` response at slot 3576 reported pool
+`fe008fe13b1b6e9f1ba5ac08cdb2eed1922c2281af72a1881de133c8fcaf3f60`,
+reserve `eace6f4c59ff7edad68e49a421032d41c269b826576f982d4325a161c44bc034`,
+revision 2, reserves `[1100000, 55]`, LP supply 7745, and fee 30 bps.
+These are locked pool reserves, not the wallet's spendable balance. The raw
+observation is preserved as `pool-after-browser-restart.local.json`.
+`scripts/native-pool-read-lab.py` checks this typed response without submitting.

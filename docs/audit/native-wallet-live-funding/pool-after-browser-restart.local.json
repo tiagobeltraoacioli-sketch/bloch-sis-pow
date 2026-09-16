@@ -1,0 +1,23 @@
+{
+  "format": "BPOSLAB1",
+  "domain": "5891725d15178d25c6ac1b933cc6d21507a95e67b132f5ac0ace325fe9587673",
+  "genesis": "823d58efab559e4c92414ad99738ebda99d62e79ef6add0602fd8f7a05ec58c2",
+  "head": "fe77c8d07e2d726230b5bbb86f5f4816de8604f5b2eaac8c4f5ce4332d010a64",
+  "height": "3576",
+  "stateRoot": "b6291f9a9b0c86c7a41b027bc14f566c24eb15db7fc4d25ac8555bc615667c0b",
+  "poolId": "fe008fe13b1b6e9f1ba5ac08cdb2eed1922c2281af72a1881de133c8fcaf3f60",
+  "reserveId": "eace6f4c59ff7edad68e49a421032d41c269b826576f982d4325a161c44bc034",
+  "assets": [
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "a23fd48ece6d8617c9cdf6f74b634aff5085e55188cfaebbdbe396440c78a275"
+  ],
+  "reserves": [
+    "1100000",
+    "55"
+  ],
+  "poolStateRoot": "b3f09901e079d0b2e5c976f1e72ffceba9cab58549294e47ce2a5c7a4acecf10",
+  "revision": "2",
+  "lpTotal": "7745",
+  "feeBps": "30",
+  "custody": "locked-pool-reserves"
+}
