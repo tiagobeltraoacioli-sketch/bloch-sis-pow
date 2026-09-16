@@ -146,6 +146,27 @@ pub struct State {
     initial_pools: BTreeMap<[u8; 32], initial_liquidity::Record>,
     reserve_pools: BTreeMap<[u8; 32], [u8; 32]>,
 }
+/// Opaque native component storage, without ownership of a `CommittedState`.
+///
+/// Hosts may store this alongside their base state without recursive ownership.
+/// This boundary does not embed native state into consensus or activate execution.
+/// The base projection is pinned so custody records cannot be rebound to a
+/// different UTXO set. Use `State::from_components` to authenticate reassembly.
+#[derive(Clone, Debug)]
+pub struct NativeState {
+    base_root: [u8; 32],
+    native: PoolLedger,
+    domain: [u8; 32],
+    /// Debited real BLCH retained in committed rehearsal accounting; no payout API.
+    base_fees: u128,
+    priority_fees: u128,
+    base_reserves: BTreeMap<[u8; 32], base_reserves::Record>,
+    base_locks: BTreeMap<base_reserves::OutPoint, [u8; 32]>,
+    paired_reserves: BTreeMap<[u8; 32], bloch_euvm::ustav::gateway::pools::custody::Record>,
+    paired_locks: BTreeMap<bloch_euvm::ustav::OutPoint, [u8; 32]>,
+    initial_pools: BTreeMap<[u8; 32], initial_liquidity::Record>,
+    reserve_pools: BTreeMap<[u8; 32], [u8; 32]>,
+}
 /// Opaque complete-state checkpoint. Only State::restore can consume it.
 /// ```compile_fail
 /// use bloch_pos_committee::transition::native_dex::Snapshot;
@@ -171,6 +192,63 @@ pub struct Execution {
     pub charge: fee_market::TxCharge,
 }
 impl State {
+    /// Separate host-owned base state from opaque native component storage.
+    /// No roots, fees, locks or snapshot versions change at this boundary.
+    pub fn into_parts(self) -> (CommittedState, NativeState) {
+        let base_root = self.base.compute_root();
+        let native = NativeState {
+            base_root,
+            native: self.native,
+            domain: self.domain,
+            base_fees: self.base_fees,
+            priority_fees: self.priority_fees,
+            base_reserves: self.base_reserves,
+            base_locks: self.base_locks,
+            paired_reserves: self.paired_reserves,
+            paired_locks: self.paired_locks,
+            initial_pools: self.initial_pools,
+            reserve_pools: self.reserve_pools,
+        };
+        (self.base, native)
+    }
+
+    /// Reassemble previously separated state against an authenticated joint root.
+    /// The caller must obtain `trusted_root` independently; equality alone is
+    /// not a finality proof. A changed base projection must not reuse custody
+    /// records from a prior state, even when its network domain is unchanged.
+    pub fn from_components(
+        base: CommittedState,
+        native: NativeState,
+        trusted_root: [u8; 32],
+    ) -> Result<Self, Error> {
+        if native.domain == [0; 32]
+            || base.admission_network_domain != Some(native.domain)
+            || *native.native.gateway().native().domain() != native.domain
+        {
+            return Err(Error::WrongDomain);
+        }
+        if base.compute_root() != native.base_root {
+            return Err(Error::InvalidRoot);
+        }
+        let state = Self {
+            base,
+            native: native.native,
+            domain: native.domain,
+            base_fees: native.base_fees,
+            priority_fees: native.priority_fees,
+            base_reserves: native.base_reserves,
+            base_locks: native.base_locks,
+            paired_reserves: native.paired_reserves,
+            paired_locks: native.paired_locks,
+            initial_pools: native.initial_pools,
+            reserve_pools: native.reserve_pools,
+        };
+        if state.state_root() != trusted_root {
+            return Err(Error::InvalidRoot);
+        }
+        Ok(state)
+    }
+
     /// Expected roots must come from independently authenticated host state.
     /// Comparing caller-provided roots alone does not authenticate their origin.
     /// Initializes a NEW rehearsal with zero fees; use restore for continuation.
@@ -430,5 +508,101 @@ impl Verifier for NativeVerifier<'_> {
     }
     fn verify_pq(&self, message: &[u8], key: &[u8], signature: &[u8]) -> bool {
         message == self.expected && self.inner.verify_pq(&self.authorization, key, signature)
+    }
+}
+
+#[cfg(test)]
+mod component_tests {
+    use super::*;
+
+    #[test]
+    fn split_rejoin_preserves_execution_and_snapshot() {
+        let (mut state, request) = tests::fixture();
+        state
+            .execute(&request, 1, &tests::BoundVerifier, &tests::BoundVerifier)
+            .unwrap();
+        let root = state.state_root();
+        let fees = state.fee_escrow();
+        let (base, native) = state.into_parts();
+        let restored = State::from_components(base, native, root).unwrap();
+        assert_eq!(restored.state_root(), root);
+        assert_eq!(restored.fee_escrow(), fees);
+        assert_eq!(
+            State::restore(restored.snapshot(), root, &tests::BoundVerifier)
+                .unwrap()
+                .state_root(),
+            root
+        );
+    }
+
+    #[test]
+    fn split_rejoin_preserves_populated_custody_and_pool_indexes() {
+        let (mut state, request) = initial_liquidity::tests::funded();
+        let receipt = state
+            .execute_initial_liquidity(&request, 1, &tests::BoundVerifier, &tests::BoundVerifier)
+            .unwrap();
+        let root = state.state_root();
+        let view = state.native().snapshot();
+        let locks = (
+            state.base_locks.clone(),
+            state.paired_locks.clone(),
+            state.reserve_pools.clone(),
+        );
+        let position = state.blch_lp_position(&receipt.pool, &tests::key(1));
+        let (base, native) = state.into_parts();
+        let restored = State::from_components(base, native, root).unwrap();
+        assert_eq!(restored.native().snapshot(), view);
+        assert_eq!(
+            (
+                &restored.base_locks,
+                &restored.paired_locks,
+                &restored.reserve_pools
+            ),
+            (&locks.0, &locks.1, &locks.2)
+        );
+        assert_eq!(
+            restored.blch_lp_position(&receipt.pool, &tests::key(1)),
+            position
+        );
+        assert_eq!(
+            State::restore(restored.snapshot(), root, &tests::BoundVerifier)
+                .unwrap()
+                .state_root(),
+            root
+        );
+    }
+
+    #[test]
+    fn rejoin_rejects_wrong_root_domain_and_base_projection() {
+        let (state, _) = tests::fixture();
+        let root = state.state_root();
+        let (base, native) = state.into_parts();
+        assert!(matches!(
+            State::from_components(base.clone(), native.clone(), [0; 32]),
+            Err(Error::InvalidRoot)
+        ));
+        let mut foreign_base = base.clone();
+        foreign_base.admission_network_domain = Some([99; 32]);
+        assert!(matches!(
+            State::from_components(foreign_base, native.clone(), root),
+            Err(Error::WrongDomain)
+        ));
+        // A valid same-network transition must not allow old native custody
+        // components to attach to the resulting, different base ledger.
+        let (mut advanced, request) = tests::fixture();
+        advanced
+            .execute(&request, 1, &tests::BoundVerifier, &tests::BoundVerifier)
+            .unwrap();
+        let (advanced_base, _) = advanced.into_parts();
+        assert!(matches!(
+            State::from_components(advanced_base, native.clone(), root),
+            Err(Error::InvalidRoot)
+        ));
+        let mut mismatched = native;
+        mismatched.base_root = [0; 32];
+        assert!(matches!(
+            State::from_components(base, mismatched, root),
+            Err(Error::InvalidRoot)
+        ));
     }
 }
