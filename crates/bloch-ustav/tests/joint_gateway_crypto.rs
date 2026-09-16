@@ -715,6 +715,58 @@ fn durable_roundtrip(anchor: State, frames: &[Vec<u8>], expected: [u8; 32]) {
         assert!(!output.status.success());
         assert!(output.stdout.is_empty());
     }
+    // Optional cross-repository run exercises Python encoding and the real Rust
+    // verifier together. The probe receives public fixtures, never secret keys.
+    if let Some(probe) = std::env::var_os("BLOCH_NATIVE_REVIEW_PROBE") {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let hex = |bytes: &[u8]| {
+            format!(
+                "0x{}",
+                bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            )
+        };
+        let fixture = serde_json::json!({
+            "route": {
+                "source_domain": hex(&source_route.source_domain),
+                "native_domain": hex(&source_route.native_domain),
+                "native_asset": hex(&source_route.native_asset),
+                "token_vm_hex": hex(&source_route.token), "vault_vm_hex": hex(&source_route.vault),
+                "cap": source_route.cap, "route_id": hex(&source_route.id())
+            },
+            "expected": serde_json::from_str::<serde_json::Value>(&exported).unwrap(),
+            "trust": { "checkpoint_height": head.height.to_string(), "checkpoint_root": hex(&head.root),
+                "current_height": head.height.to_string(), "authority": hex(&review_authority),
+                "max_checkpoint_age": "0", "max_certificate_lifetime": "10" },
+            "certificate": { "valid_until": valid_until.to_string(), "signature": hex(&signature),
+                "preimage": hex(&preimage) },
+            "commitment": hex(&review_commitment)
+        });
+        let mut child = Command::new("python3")
+            .arg(probe)
+            .arg(env!("CARGO_BIN_EXE_verify-redemption-review"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&serde_json::to_vec(&fixture).unwrap())
+            .unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            result.stdout,
+            b"native-review-process-probe: 9 cases passed\n"
+        );
+    }
     wire.push(0);
     assert!(!run_verifier(&wire).status.success());
     let value: serde_json::Value = serde_json::from_str(&exported).unwrap();

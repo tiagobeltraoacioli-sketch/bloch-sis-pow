@@ -277,3 +277,12 @@ release record, not an executed payout or consensus finality. Admission previews
 may contain the same record; relayers must never pay from previews. Native block
 integration, authenticated finality, external relayers and live fee settlement
 remain separate work before a funded BLCH/USDT market can operate.
+
+For the optional real Python-to-Rust review integration check, set
+`BLOCH_NATIVE_REVIEW_PROBE` to the bridge checkout's absolute
+`scripts/tests/native_review_process_probe.py` path when running
+`cargo test -p bloch-ustav --features native-dex-host --test joint_gateway_crypto`.
+Committed test reviews and public PQ certificates are sent to that probe over
+stdin; private keys stay inside the native test process. The probe verifies the
+real executable and rejects eight altered inputs per fixture. This check needs
+Python 3 and both repositories and does not run unless explicitly configured.
