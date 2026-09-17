@@ -195,10 +195,12 @@ def parse_sats(value: Union[str, int]) -> int:
         raise ValueError("empty satoshi amount")
     if text.startswith("-"):
         raise ValueError(f"negative satoshi amount rejected (amounts are unsigned): {text!r}")
-    if not text.isdigit():
+    if not text.isascii() or not text.isdigit():
         raise ValueError(f"not a base-10 satoshi amount: {text!r}")
     if len(text) > 1 and text[0] == "0":
         raise ValueError(f"leading zeros are not canonical: {text!r}")
+    if len(text) > len(str(MAX_SATS)):
+        raise ValueError("satoshi amount exceeds the total supply")
     sats = int(text)
     if sats > MAX_SATS:
         raise ValueError(f"satoshi amount {text} exceeds the total supply {MAX_SATS}")
@@ -227,7 +229,7 @@ def bloch_to_sats(bloch: str) -> int:
         whole, frac = s.split(".", 1)
     else:
         whole, frac = s, ""
-    if not (whole + frac).isdigit() and (whole or frac):
+    if not (whole + frac).isascii() or not (whole + frac).isdigit():
         raise ValueError(f"invalid BLCH amount: {bloch!r}")
     if len(frac) > BLOCH_DECIMALS:
         raise ValueError(f"too many decimal places (max {BLOCH_DECIMALS}): {bloch!r}")

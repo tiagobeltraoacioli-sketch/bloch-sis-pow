@@ -240,6 +240,7 @@ impl SignedAnchor {
             .map_err(|_| AnchorError::CsvDelayOutOfRange(wide_delay))?;
         let policy = c.get_bytes()?;
         let signature = c.get_bytes()?;
+        if c.i != bytes.len() { return Err(AnchorError::Malformed); }
         Ok(SignedAnchor {
             anchor: PqShieldAnchor {
                 version,
@@ -518,6 +519,9 @@ mod tests {
         assert!(verify_anchor(&back, &pk).is_ok());
         // deterministic
         assert_eq!(signed.serialize(), back.serialize());
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(matches!(SignedAnchor::deserialize(&trailing), Err(AnchorError::Malformed)));
     }
 
     #[test]

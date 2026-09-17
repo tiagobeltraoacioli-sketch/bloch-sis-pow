@@ -1,0 +1,72 @@
+Validation evidence — 2026-09-17
+Base b066e3c; Rust 1.94.1; local macOS x86_64.
+The older broad log contains a cold-start fixture failure fixed and rerun in node-final.
+Ignored rehearsals are not passing tests.
+
+bloch-audit-pinned-tests-final.log
+SHA256 5973e2a3037ec533b9218c06f07587f1a59241f80646d757bf5c6c71d67d2b31
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.20s
+test result: ok. 424 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 128.84s
+test result: ok. 109 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.96s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 2 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 13.43s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 390 passed; 0 failed; 19 ignored; 0 measured; 0 filtered out; finished in 41.45s
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.20s
+error: test failed, to rerun pass `-p bloch-pos-node --test cold_start`
+
+bloch-audit-node-final.log
+SHA256 69d8e6de4e5e45c5f6dd58049f7c083578658cc6bb086eed802f6ef214e30afa
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 15.19s
+test result: ok. 391 passed; 0 failed; 19 ignored; 0 measured; 0 filtered out; finished in 45.51s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 53.61s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.66s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.13s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.80s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+test result: ok. 0 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.66s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.97s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.59s
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+bloch-audit-api-tests.log
+SHA256 2d4aa646dcf2c0081a5cbde98bd55820e6fe55029f4fdc99d1ad537d2c90ce0f
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 30.15s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+bloch-audit-faucet-tests.log
+SHA256 a16fe67321f2a6595ec7cea0725e8bbc74bd9f8738ae08ad4f5f92ee63a170ea
+ℹ tests 10
+ℹ suites 0
+ℹ pass 10
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 403.275204
+
+bloch-audit-rpc-budget.log
+SHA256 e38f6ea7824df8d97805b78d7c48f1cd8d83ea9631ce947d377322339c57c77f
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.86s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 410 filtered out; finished in 10.00s
+
+bloch-audit-clippy-final.log
+SHA256 d11fdb8f67570cfcc9b9929ec2fc0547a3255053867a6c28e68d947fcc747d80
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 15.12s
+
+bloch-audit-recovery-candidate.log
+SHA256 ae79bbef1ab86a73ec33655d1934868211938599e5126854f34576c62c793777
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.94s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 425 filtered out; finished in 0.32s

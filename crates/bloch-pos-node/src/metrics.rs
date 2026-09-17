@@ -660,7 +660,11 @@ fn serve_connection(sock: &mut TcpStream, metrics: &NodeMetrics) {
     // GET) is ignored: we answer and close.
     let mut buf: Vec<u8> = Vec::with_capacity(512);
     let mut chunk = [0u8; 1024];
+    let deadline = std::time::Instant::now() + IO_TIMEOUT;
     let head_end = loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() { return; }
+        if sock.set_read_timeout(Some(remaining)).is_err() { return; }
         if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
             break p;
         }

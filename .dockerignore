@@ -13,3 +13,14 @@ deploy/
 docs/
 *.md
 flake.nix
+
+# Validator material must never enter a container build context (INF-13).
+**/validator.key
+**/*.sk
+**/*.pem
+**/slashing-protection.bin
+**/passphrase*
+**/.env
+**/.env.*
+**/id_rsa*
+**/id_ed25519*

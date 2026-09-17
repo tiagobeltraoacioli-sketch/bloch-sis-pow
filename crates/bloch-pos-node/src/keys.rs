@@ -269,38 +269,12 @@ impl Unlock {
         plaintext_opt_in: bool,
     ) -> io::Result<Unlock> {
         if let Some(path) = pass_file {
-            let shown = std::path::Path::new(&path).display().to_string();
-            let raw = Zeroizing::new(fs::read(&path).map_err(|e| {
-                // Re-kinded, not just re-worded: see the doc comment. A
-                // missing or unreadable passphrase file is a configuration
-                // refusal, and PermissionDenied is what the engine treats as
-                // fatal.
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "BLOCH_KEYSTORE_PASSPHRASE_FILE={shown} cannot be read ({e}). \
-                         This node has a keystore it cannot open; it will NOT \
-                         fall back to observer mode"
-                    ),
-                )
-            })?);
-            let mut s = String::from_utf8(raw.to_vec()).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "BLOCH_KEYSTORE_PASSPHRASE_FILE is not valid UTF-8",
-                )
+            let pass = read_passphrase_file(Path::new(&path)).map_err(|e| {
+                io::Error::new(io::ErrorKind::PermissionDenied, format!("cannot read protected keystore passphrase file: {e}"))
             })?;
-            while s.ends_with('\n') || s.ends_with('\r') {
-                s.pop();
-            }
-            if s.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "BLOCH_KEYSTORE_PASSPHRASE_FILE is empty",
-                ));
-            }
-            return Ok(Unlock::passphrase(s));
+            return Ok(Unlock::passphrase(pass.as_str()));
         }
+
         if let Some(p) = pass {
             if !p.is_empty() {
                 return Ok(Unlock::passphrase(p));
@@ -392,6 +366,11 @@ impl Keystore {
     /// [`Keystore::generate`] with the policy passed in rather than read from
     /// the environment.
     pub fn generate_with(dir: &Path, index: u32, unlock: &Unlock) -> io::Result<Keystore> {
+        fs::create_dir_all(dir)?;
+        let _lock = crate::store::DirLock::acquire(dir)?;
+        if dir.join("validator.key").try_exists()? {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "validator.key already exists; refusing to replace validator identity"));
+        }
         let (pubkey, secret) = bloch_crypto::crypto::generate_keypair();
         let mut randao_seed = [0u8; 32];
         os_random(&mut randao_seed)?;
@@ -416,30 +395,7 @@ impl Keystore {
             Unlock::PlaintextOptIn => self.encode_plaintext(),
         };
         let path = dir.join("validator.key");
-        // Created 0600, not created-then-chmodded. The old order left a window
-        // in which the whole file already existed under the umask default
-        // (0644 on every fleet host) — small, but it is the same window the
-        // finding is about, and closing it costs one call.
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut f = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&path)?;
-            f.write_all(&out)?;
-            f.sync_all()?;
-            // An existing file keeps its old mode through `.mode()`, which only
-            // applies at creation — so a re-seal over a world-readable key
-            // still gets tightened.
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-        }
-        #[cfg(not(unix))]
-        fs::write(&path, &out)?;
+        crate::store::atomic_private_write(&path, &out)?;
         Ok(())
     }
 
@@ -458,6 +414,9 @@ impl Keystore {
     /// `BPOSKEY2`: Argon2id over a fresh salt, XChaCha20-Poly1305 over
     /// `secret ‖ randao_seed`, public header as AAD.
     fn seal(&self, passphrase: &str, kdf: KdfParams) -> io::Result<Vec<u8>> {
+        if passphrase.chars().count() < MIN_SEAL_PASSPHRASE_CHARS {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "new keystore passphrase must contain at least 12 characters"));
+        }
         let mut salt = [0u8; 32];
         os_random(&mut salt)?;
         let mut nonce = [0u8; 24];
@@ -1323,7 +1282,7 @@ mod tests {
     #[test]
     fn the_wrong_passphrase_fails_closed() {
         let dir = tmp_dir("wrongpass");
-        Keystore::generate_with(&dir, 1, &Unlock::passphrase_with("right", CHEAP)).expect("gen");
+        Keystore::generate_with(&dir, 1, &Unlock::passphrase_with("right passphrase", CHEAP)).expect("gen");
         let e = err_of(
             Keystore::load_with(&dir, &Unlock::passphrase_with("wrong", CHEAP)),
             "a wrong passphrase must not open the keystore",
@@ -1338,7 +1297,7 @@ mod tests {
     #[test]
     fn rewriting_the_validator_index_breaks_the_tag() {
         let dir = tmp_dir("aad");
-        let unlock = Unlock::passphrase_with("pp", CHEAP);
+        let unlock = Unlock::passphrase_with("test passphrase", CHEAP);
         Keystore::generate_with(&dir, 4, &unlock).expect("gen");
         let path = dir.join("validator.key");
         let mut raw = fs::read(&path).expect("read");
@@ -1369,7 +1328,7 @@ mod tests {
         assert_eq!(&raw[..8], KEYSTORE_MAGIC_V1);
 
         let e = err_of(
-            Keystore::load_with(&dir, &Unlock::passphrase_with("pp", CHEAP)),
+            Keystore::load_with(&dir, &Unlock::passphrase_with("test passphrase", CHEAP)),
             "a plaintext keystore must not load under a passphrase policy",
         );
         assert_eq!(
@@ -1391,7 +1350,7 @@ mod tests {
     #[test]
     fn the_plaintext_opt_in_does_not_open_a_sealed_keystore() {
         let dir = tmp_dir("sealedoptin");
-        Keystore::generate_with(&dir, 2, &Unlock::passphrase_with("pp", CHEAP)).expect("gen");
+        Keystore::generate_with(&dir, 2, &Unlock::passphrase_with("test passphrase", CHEAP)).expect("gen");
         let e = err_of(
             Keystore::load_with(&dir, &Unlock::PlaintextOptIn),
             "the plaintext opt-in is not a passphrase",
@@ -1408,7 +1367,7 @@ mod tests {
     fn a_missing_keystore_is_still_not_found_not_a_policy_refusal() {
         let dir = tmp_dir("absent");
         let e = err_of(
-            Keystore::load_with(&dir, &Unlock::passphrase_with("pp", CHEAP)),
+            Keystore::load_with(&dir, &Unlock::passphrase_with("test passphrase", CHEAP)),
             "there is no keystore in this dir",
         );
         assert_eq!(e.kind(), io::ErrorKind::NotFound);
@@ -1480,7 +1439,7 @@ mod tests {
         Keystore::generate_with(&dir, 11, &Unlock::PlaintextOptIn).expect("gen plaintext");
 
         let e = expect_loud(
-            Keystore::load_optional_with(&dir, &Unlock::passphrase_with("pp", CHEAP)),
+            Keystore::load_optional_with(&dir, &Unlock::passphrase_with("test passphrase", CHEAP)),
             "a plaintext keystore under a passphrase policy",
         );
         assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
@@ -1503,7 +1462,7 @@ mod tests {
     #[test]
     fn a_present_keystore_that_will_not_open_is_never_reported_as_absent() {
         let dir = tmp_dir("loudsealed");
-        Keystore::generate_with(&dir, 5, &Unlock::passphrase_with("right", CHEAP)).expect("gen");
+        Keystore::generate_with(&dir, 5, &Unlock::passphrase_with("right passphrase", CHEAP)).expect("gen");
 
         expect_loud(
             Keystore::load_optional_with(&dir, &Unlock::PlaintextOptIn),
@@ -1514,7 +1473,7 @@ mod tests {
             "a sealed keystore and the wrong passphrase",
         );
         let ks = expect_loaded(
-            Keystore::load_optional_with(&dir, &Unlock::passphrase_with("right", CHEAP)),
+            Keystore::load_optional_with(&dir, &Unlock::passphrase_with("right passphrase", CHEAP)),
             "the right passphrase",
         );
         assert_eq!(ks.index, 5);
@@ -1528,7 +1487,7 @@ mod tests {
     fn only_an_absent_file_selects_observer_mode() {
         let dir = tmp_dir("observer");
         expect_absent(
-            Keystore::load_optional_with(&dir, &Unlock::passphrase_with("pp", CHEAP)),
+            Keystore::load_optional_with(&dir, &Unlock::passphrase_with("test passphrase", CHEAP)),
             "no validator.key in this dir",
         );
         expect_absent(
@@ -1570,7 +1529,7 @@ mod tests {
 
         // ...while the configurations that ARE valid still resolve.
         assert!(matches!(
-            Unlock::from_sources(None, Some("pp".into()), false),
+            Unlock::from_sources(None, Some("test passphrase".into()), false),
             Ok(Unlock::Passphrase { .. })
         ));
         assert!(matches!(
@@ -1585,7 +1544,7 @@ mod tests {
     /// Junk is junk under every policy — no panic, no partial key.
     #[test]
     fn a_file_that_is_not_a_keystore_is_refused_under_both_policies() {
-        for policy in [Unlock::PlaintextOptIn, Unlock::passphrase_with("pp", CHEAP)] {
+        for policy in [Unlock::PlaintextOptIn, Unlock::passphrase_with("test passphrase", CHEAP)] {
             for bad in [
                 Vec::new(),
                 b"BPOS".to_vec(),
@@ -1629,7 +1588,7 @@ mod tests {
     fn a_group_or_world_readable_keystore_is_refused() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tmp_dir("mode");
-        let unlock = Unlock::passphrase_with("pp", CHEAP);
+        let unlock = Unlock::passphrase_with("test passphrase", CHEAP);
         Keystore::generate_with(&dir, 7, &unlock).expect("generate");
         let path = dir.join("validator.key");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).expect("chmod");
@@ -1666,7 +1625,7 @@ mod tests {
         assert!(!contains(shown.as_bytes(), &ks.secret));
 
         let dir2 = tmp_dir("inspect-sealed");
-        Keystore::generate_with(&dir2, 22, &Unlock::passphrase_with("pp", CHEAP)).expect("sealed");
+        Keystore::generate_with(&dir2, 22, &Unlock::passphrase_with("test passphrase", CHEAP)).expect("sealed");
         let info = Keystore::inspect(&dir2).expect("inspect sealed");
         assert_eq!(info.format, KeystoreFormat::SealedV2);
         assert_eq!(info.index, 22);
@@ -1752,7 +1711,7 @@ mod tests {
     #[test]
     fn seal_in_place_refuses_a_sealed_file_and_a_short_passphrase() {
         let dir = tmp_dir("seal-twice");
-        Keystore::generate_with(&dir, 35, &Unlock::passphrase_with("pp", CHEAP)).expect("sealed");
+        Keystore::generate_with(&dir, 35, &Unlock::passphrase_with("test passphrase", CHEAP)).expect("sealed");
         let pass = Zeroizing::new("a long enough passphrase".to_string());
         expect_err_kind(
             Keystore::seal_in_place(&dir, &pass, CHEAP),
@@ -1774,7 +1733,7 @@ mod tests {
     fn keygen_cannot_write_plaintext_without_the_explicit_opt_in() {
         assert!(Unlock::from_sources(None, None, false).is_err());
         let dir = tmp_dir("keygen-sealed");
-        Keystore::generate_with(&dir, 1, &Unlock::passphrase_with("pp", CHEAP)).expect("generate");
+        Keystore::generate_with(&dir, 1, &Unlock::passphrase_with("test passphrase", CHEAP)).expect("generate");
         let raw = fs::read(dir.join("validator.key")).expect("read");
         assert_eq!(&raw[..8], KEYSTORE_MAGIC_V2);
         let _ = fs::remove_dir_all(&dir);
@@ -1790,9 +1749,26 @@ mod tests {
         fs::write(&p, b"a long enough passphrase\n").unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
         expect_err_kind(read_passphrase_file(&p), io::ErrorKind::PermissionDenied, "0644 pass file");
+        assert!(Unlock::from_sources(Some(p.clone().into_os_string()), None, false).is_err());
         fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(Unlock::from_sources(Some(p.clone().into_os_string()), None, false).is_ok());
         assert_eq!(read_passphrase_file(&p).unwrap().as_str(), "a long enough passphrase");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audit_keygen_preserves_an_existing_identity_and_refuses_weak_sealing() {
+        let dir = tmp_dir("audit-keygen");
+        Keystore::generate_with(&dir, 7, &Unlock::PlaintextOptIn).unwrap();
+        let before = fs::read(dir.join("validator.key")).unwrap();
+        expect_err_kind(Keystore::generate_with(&dir, 8, &Unlock::PlaintextOptIn),
+            io::ErrorKind::AlreadyExists, "existing identity");
+        assert_eq!(fs::read(dir.join("validator.key")).unwrap(), before);
+        let other = tmp_dir("audit-weak-keygen");
+        assert!(Keystore::generate_with(&other, 9, &Unlock::passphrase_with("short", CHEAP)).is_err());
+        assert!(!other.join("validator.key").exists());
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(other);
     }
 
     #[test]

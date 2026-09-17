@@ -118,7 +118,7 @@ fn all_values(args: &[String], name: &str) -> Vec<String> {
 }
 
 fn read_hex_file(path: &str) -> Result<Vec<u8>, String> {
-    let text = fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let text = zeroize::Zeroizing::new(fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?);
     unhex(text.trim()).map_err(|e| format!("{path}: {e}"))
 }
 
@@ -137,6 +137,9 @@ fn write_file(path: &str, bytes: &[u8], secret: bool) -> Result<(), String> {
                 .open(path)
                 .map_err(|e| format!("cannot create {path}: {e}"))?;
             f.write_all(bytes).map_err(|e| format!("cannot write {path}: {e}"))?;
+            f.sync_all().map_err(|e| format!("cannot sync {path}: {e}"))?;
+            let parent = Path::new(path).parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            crate::store::fsync_dir(parent).map_err(|e| format!("cannot sync signer directory: {e}"))?;
             return Ok(());
         }
     }
@@ -723,6 +726,13 @@ fn sign(args: &[String]) -> Result<(), String> {
     let cp = decode_checkpoint(&cp_bytes).map_err(|e| format!("{cp_path}: {e}"))?;
     let digest = cp.ws_digest();
 
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = fs::metadata(&key_path).map_err(|e| format!("{key_path}: {e}"))?;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
+            return Err("signer secret must be a private regular file (0600 or stricter)".into());
+        }
+    }
     let sk = zeroize::Zeroizing::new(read_hex_file(&key_path)?);
     let enveloped = bloch_crypto::crypto::sign(&sk, &digest)
         .map_err(|e| format!("signing failed: {e:?}"))?;
@@ -1283,13 +1293,7 @@ fn verify(args: &[String]) -> Result<(), String> {
     println!("  hard stop         epoch {} (envelopes REFUSED after this — §6.3)", set.hard_stop());
     println!();
 
-    if let Err(e) = distinct_signer_keys(&set) {
-        println!("!!!! UNSOUND ARRANGEMENT — DO NOT TRUST THIS ENVELOPE");
-        println!("     {e}");
-        println!("     ws::verify_envelope will still ACCEPT it; the flaw is in the");
-        println!("     arrangement, not the signatures. Refuse the arrangement.");
-        println!();
-    }
+    distinct_signer_keys(&set)?;
 
     // The same shape gate a booting node runs (`ws_boot::boot`, NEW-2): the
     // §6 phases are policy, and an arrangement matching neither is refused
@@ -1302,6 +1306,9 @@ fn verify(args: &[String]) -> Result<(), String> {
             ws_boot::shape_policy_refusal(&set, &set_path),
         ));
     };
+
+    ws_boot::arrangement_window(&set, cp.epoch).map_err(|(adopted, stop)|
+        format!("VERDICT: REFUSED — checkpoint epoch {} is outside arrangement window {adopted}..={stop}", cp.epoch))?;
 
     println!("SIGNATURES  ({} listed)", env.signatures.len());
     let verdicts = probe_signatures(&env, &set, network_id, &genesis_root);

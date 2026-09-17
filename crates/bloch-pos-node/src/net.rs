@@ -507,6 +507,7 @@ const OUTBOUND_QUEUE_DEPTH: usize = 256;
 /// from peers that dialed first, past which a new connection is closed
 /// immediately, before either thread is spawned.
 const MAX_INBOUND_CONNECTIONS: usize = 128;
+const MAX_INBOUND_PER_IP: usize = 32;
 
 /// Socket read/write timeout for the devnet mesh (R3 M-4 / R1 A3-M2). This
 /// transport had none: a peer that stopped reading its socket could stall
@@ -614,6 +615,7 @@ struct Connection {
     socket: TcpStream,
     closed: AtomicBool,
     _counts: (ConnCount, Option<ConnCount>),
+    _ip_permit: Option<crate::connection_limit::Permit>,
 }
 
 struct ConnectionHalf(Arc<Connection>);
@@ -838,11 +840,13 @@ fn decode_event(frame: &[u8]) -> Option<NetEvent> {
 struct GetBlocksLimiter {
     tokens: f64,
     last: Instant,
+    rate: f64,
+    capacity: f64,
 }
 
 impl GetBlocksLimiter {
     fn new() -> Self {
-        GetBlocksLimiter { tokens: GET_BLOCKS_BURST, last: Instant::now() }
+        GetBlocksLimiter { tokens: GET_BLOCKS_BURST, last: Instant::now(), rate: GET_BLOCKS_ANSWERS_PER_SEC, capacity: GET_BLOCKS_BURST }
     }
 
     /// Admit one request now, or refuse. Refusing costs the peer nothing but
@@ -853,12 +857,31 @@ impl GetBlocksLimiter {
     fn admit(&mut self, now: Instant) -> bool {
         let dt = now.saturating_duration_since(self.last).as_secs_f64();
         self.last = now;
-        self.tokens = (self.tokens + dt * GET_BLOCKS_ANSWERS_PER_SEC).min(GET_BLOCKS_BURST);
+        self.tokens = (self.tokens + dt * self.rate).min(self.capacity);
         if self.tokens < 1.0 {
             return false;
         }
         self.tokens -= 1.0;
         true
+    }
+}
+
+/// Shared across connections, including reconnects. Idle address records
+/// expire and the map itself is bounded, so IP rotation cannot grow memory.
+struct SyncBudget {
+    addresses: std::collections::BTreeMap<std::net::IpAddr, GetBlocksLimiter>,
+    global: GetBlocksLimiter,
+}
+impl SyncBudget {
+    fn new() -> Self { Self { addresses: Default::default(), global: GetBlocksLimiter { tokens: 128.0, last: Instant::now(), rate: 64.0, capacity: 128.0 } } }
+    fn admit(&mut self, ip: std::net::IpAddr, now: Instant) -> bool {
+        let ip = match ip { std::net::IpAddr::V6(v) => v.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(ip), _ => ip };
+        if !self.addresses.contains_key(&ip) {
+            self.addresses.retain(|_, bucket| now.saturating_duration_since(bucket.last) < Duration::from_secs(60));
+            if self.addresses.len() >= 1024 { return false; }
+        }
+        if !self.addresses.entry(ip).or_insert_with(GetBlocksLimiter::new).admit(now) { return false; }
+        self.global.admit(now)
     }
 }
 
@@ -953,6 +976,8 @@ pub fn start(
     // inbound flood must not have that flood count against the outbound
     // side's accounting either.
     let inbound_live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ip_limits = Arc::new(crate::connection_limit::Limits::default());
+    let sync_budget = Arc::new(Mutex::new(SyncBudget::new()));
     {
         let events = events.clone();
         let data_dir = data_dir.clone();
@@ -975,6 +1000,10 @@ pub fn start(
                 if inbound_live.load(Ordering::Acquire) >= MAX_INBOUND_CONNECTIONS {
                     continue;
                 }
+                let Ok(address) = sock.peer_addr() else { continue };
+                // Accommodate multiple validators per host, but one address
+                // cannot consume the global 128-connection allowance.
+                let Some(ip_permit) = ip_limits.reserve(address.ip(), MAX_INBOUND_PER_IP) else { continue };
                 // R3 M-4 / R1 A3-M2: bounded so a peer that stops reading or
                 // never writes cannot hold a thread and a queue open forever.
                 if sock.set_read_timeout(Some(DEVNET_IO_TIMEOUT)).is_err()
@@ -991,6 +1020,7 @@ pub fn start(
                     socket: shutdown_socket,
                     closed: AtomicBool::new(false),
                     _counts: (ConnCount::new(&live), Some(ConnCount::new(&inbound_live))),
+                    _ip_permit: Some(ip_permit),
                 });
                 let wsock = Arc::new(Mutex::new(sock));
 
@@ -1017,6 +1047,7 @@ pub fn start(
                 // are moved into the closure, so every `return` below and any
                 // unwind releases both.
                 let half = ConnectionHalf(connection);
+                let sync_budget = sync_budget.clone();
                 thread::spawn(move || {
                     let _half = half;
                     // Per-connection (R3 M-4 / R1 A3-M2): see [`GetBlocksLimiter`].
@@ -1025,6 +1056,8 @@ pub fn start(
                         match read_frame(&mut rsock) {
                             Ok(frame) => {
                                 if frame.first() == Some(&FRAME_GET_BLOCKS) {
+                                    let allowed = sync_budget.lock().map(|mut b| b.admit(address.ip(), Instant::now())).unwrap_or(false);
+                                    if !allowed { continue; }
                                     serve_get_blocks(
                                         &wsock,
                                         &data_dir,
@@ -1077,6 +1110,7 @@ pub fn start(
                 socket: shutdown_socket,
                 closed: AtomicBool::new(false),
                 _counts: (ConnCount::new(&live), None),
+                    _ip_permit: None,
             });
             let writer_half = ConnectionHalf(connection.clone());
             let reader_half = ConnectionHalf(connection);
@@ -1190,6 +1224,21 @@ pub fn start(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn audit_sync_budget_is_shared_across_reconnections_and_addresses() {
+        let mut budget = super::SyncBudget::new();
+        let ip = "127.0.0.1".parse().unwrap();
+        let now = std::time::Instant::now();
+        for _ in 0..super::GET_BLOCKS_BURST as usize { assert!(budget.admit(ip, now)); }
+        assert!(!budget.admit(ip, now));
+        for host in 2..=4 {
+            let other = format!("127.0.0.{host}").parse().unwrap();
+            for _ in 0..32 { assert!(budget.admit(other, now)); }
+        }
+        assert!(!budget.admit("127.0.0.5".parse().unwrap(), now));
+        assert!(budget.admit(ip, now + std::time::Duration::from_secs(1)));
+    }
+
     use super::*;
 
     #[test]
@@ -1244,6 +1293,7 @@ mod tests {
             socket: socket.try_clone().unwrap(),
             closed: AtomicBool::new(false),
             _counts: (ConnCount::new(&live), Some(ConnCount::new(&inbound_live))),
+                    _ip_permit: None,
         });
         let reader = ConnectionHalf(connection.clone());
         let writer = ConnectionHalf(connection.clone());
@@ -1279,6 +1329,7 @@ mod tests {
             socket: socket.try_clone().unwrap(),
             closed: AtomicBool::new(false),
             _counts: (ConnCount::new(&live), Some(ConnCount::new(&live))),
+            _ip_permit: None,
         });
         let reader = ConnectionHalf(connection.clone());
         let writer = ConnectionHalf(connection);
@@ -1611,7 +1662,7 @@ mod tests {
         // fixed amount, so this is fast on an idle box and still correct on
         // a loaded one.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while mesh.peer_count() < MAX_INBOUND_CONNECTIONS && Instant::now() < deadline {
+        while mesh.peer_count() < MAX_INBOUND_PER_IP && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
         // One quiet moment so the count has settled — proving it never rises
@@ -1620,7 +1671,7 @@ mod tests {
 
         assert_eq!(
             mesh.peer_count(),
-            MAX_INBOUND_CONNECTIONS,
+            MAX_INBOUND_PER_IP,
             "the transport must accept no more than MAX_INBOUND_CONNECTIONS inbound connections"
         );
 

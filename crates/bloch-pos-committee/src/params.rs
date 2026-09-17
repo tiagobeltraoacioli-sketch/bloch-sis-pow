@@ -113,6 +113,10 @@ pub const SLOT_DURATION_SECS: u64 = 30;
 /// reason the value is 4,096 rather than the ~10 that history alone would
 /// justify. Raising or lowering it is a consensus change and a founder call.
 ///
+/// This bound alone does not guarantee recovery after an outage: before
+/// DUTY_ROSTER_RECOVERY_ACTIVATION_EPOCH, roughly 60 empty epochs can exhaust
+/// every duty weight (FC-01). The 45-day number is only the epoch-walk bound.
+///
 /// # This is the backstop, not the first line
 ///
 /// `bloch-pos-node`'s `Engine::ingest` refuses a gossiped block whose slot is
@@ -1975,3 +1979,25 @@ const _: () = {
     assert!(DEPOSIT_ACTIVATION_EPOCH == u64::MAX);
     assert!(crate::slashing::CORRELATION_WINDOW_EPOCHS >= 2 * crate::staking::WITHDRAWAL_DELAY_EPOCHS);
 };
+
+/// Candidate FC-01 recovery rule, deliberately UNARMED. Activation changes
+/// proposer weights after complete inactivity and requires a coordinated
+/// release, historical replay qualification and a fresh WS checkpoint.
+pub const DUTY_ROSTER_RECOVERY_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+pub(crate) fn duty_roster_recovery_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if audit_recovery_test::forced() { return true; }
+    epoch_gate_active(epoch, DUTY_ROSTER_RECOVERY_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod audit_recovery_test {
+    thread_local! { static ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+    pub fn forced() -> bool { ENABLED.with(|v| v.get()) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}

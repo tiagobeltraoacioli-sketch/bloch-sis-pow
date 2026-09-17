@@ -41,9 +41,10 @@
 // variable can move it, and no assertion by the caller is involved.
 //
 // SCOPE, stated exactly, because a digest whose scope is vague is a digest
-// nobody can compare against: every `.rs`, `.toml`, `.c`, `.h`, `.S` and `.s`
-// file under the workspace `crates/` directory, plus the workspace root
-// `Cargo.toml` and `Cargo.lock`. That covers this binary's whole path-
+// nobody can compare against: every `.rs`, `.toml`, `.c`, `.h`, `.S`, `.s`
+// and `.macros` file under workspace `crates/`, including hidden directories
+// except `.git` and build outputs, plus root `Cargo.toml`, `Cargo.lock` and
+// `rust-toolchain.toml`. That covers this binary's whole path-
 // dependency graph (bloch-pos-committee, bloch-crypto, bloch-sis-pow,
 // coherence-core, pqcrypto-internals) and then some; `Cargo.lock` binds the
 // registry dependencies by version and by the registry's own checksums.
@@ -69,7 +70,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Extensions that are build inputs for this binary.
-const SOURCE_EXT: &[&str] = &["rs", "toml", "c", "h", "S", "s"];
+const SOURCE_EXT: &[&str] = &["rs", "toml", "c", "h", "S", "s", "macros"];
 
 /// Walk from the crate directory to the workspace root: the first ancestor
 /// holding both `Cargo.lock` and a `crates/` directory. Returns `None` when
@@ -96,7 +97,7 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
         // Build outputs and VCS metadata are not source. `target/` in
         // particular is enormous and changes on every build, which would make
         // the digest a random number.
-        if name.starts_with('.') || name == "target" {
+        if name == ".git" || name == "target" {
             continue;
         }
         let Ok(ft) = e.file_type() else { continue };
@@ -118,7 +119,7 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
 fn source_digest(root: &Path) -> Option<(String, usize, u64)> {
     let mut files = Vec::new();
     collect(root, &root.join("crates"), &mut files);
-    for extra in ["Cargo.toml", "Cargo.lock"] {
+    for extra in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
         let p = root.join(extra);
         if p.is_file() {
             files.push((extra.to_string(), p));

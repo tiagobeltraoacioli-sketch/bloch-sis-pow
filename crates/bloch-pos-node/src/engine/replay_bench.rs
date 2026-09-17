@@ -670,7 +670,8 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         pool: BTreeMap::new(),
         att_pool: AttestationPool::new(),
         wall_slot: 0,
-        mempool: BTreeMap::new(),
+        mempool: super::admission::Mempool::default(),
+        future_blocks: BTreeMap::new(),
         // The replay harness never proposes, so nothing is ever skipped and
         // the TTL has nothing to expire; the fields exist for the type.
         mempool_admitted_at: BTreeMap::new(),

@@ -45,6 +45,7 @@
 //! rule once integration review starts).
 
 mod codec;
+mod connection_limit;
 mod engine;
 mod genesis;
 mod keys;

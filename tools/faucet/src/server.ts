@@ -6,6 +6,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { FaucetConfig } from "./config.js";
 import type { Faucet } from "./faucet.js";
 import type { RateLimiter } from "./ratelimit.js";
+import { parseAddress, encodeAddress } from "./address.js";
 import { renderForm } from "./web.js";
 
 // Only honor X-Forwarded-For when explicitly told we sit behind a trusted proxy
@@ -80,6 +81,17 @@ export function createFaucetServer(cfg: FaucetConfig, faucet: Faucet, limiter: R
       }
 
       if (req.method === "POST" && url.pathname === "/api/faucet") {
+        const contentType = req.headers["content-type"]?.split(";")[0]?.trim().toLowerCase();
+        if (contentType !== "application/json") {
+          json(res, 415, { ok: false, error: "application/json required" });
+          return;
+        }
+        // Browser forms cannot submit JSON. Also reject explicit cross-site
+        // fetches while preserving the same-origin faucet form.
+        if (req.headers["sec-fetch-site"] === "cross-site") {
+          json(res, 403, { ok: false, error: "cross-site request refused" });
+          return;
+        }
         let address = "";
         try {
           const raw = await readBody(req);
@@ -93,6 +105,9 @@ export function createFaucetServer(cfg: FaucetConfig, faucet: Faucet, limiter: R
           json(res, 400, { ok: false, error: "missing 'address'", code: "bad_request" });
           return;
         }
+
+        const parsedAddress = parseAddress(address);
+        if (parsedAddress) address = encodeAddress(parsedAddress.hashHex, parsedAddress.network);
 
         // T-3 fix: reserve-then-confirm, not check-then-record. `reserve` is
         // fully synchronous (checks AND provisionally records the hit in one

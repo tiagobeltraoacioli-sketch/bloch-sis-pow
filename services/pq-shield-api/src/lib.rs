@@ -137,6 +137,9 @@ fn parse_guarded<T: DeserializeOwned>(bytes: &Bytes) -> Result<T, ApiError> {
     let value: Value =
         serde_json::from_slice(bytes).map_err(|e| ApiError::bad(format!("invalid JSON: {e}")))?;
     guard_no_secrets(&value)?;
+    if let Some(delay) = value.get("csv_delay").and_then(Value::as_u64) {
+        if delay < 144 { return Err(ApiError::bad("csv_delay must be at least 144 blocks for the vault construction API")); }
+    }
     serde_json::from_value(value).map_err(|e| ApiError::bad(format!("bad request fields: {e}")))
 }
 
@@ -529,7 +532,7 @@ async fn clawback_tx(body: Bytes) -> Result<Json<Value>, ApiError> {
         },
         "notes": [
             "Immediate (no timelock) so you can beat the attacker's delayed branch A within Δ. \
-             RBF-enabled so a watchtower can fee-bump the race.",
+             RBF-enabled; a keyless watchtower needs pre-signed replacements to fee-bump.",
             "safe_destination MUST equal the anchored designated_safe_dest and be a FRESH, \
              unexposed address (spec §9.4).",
         ],
@@ -542,6 +545,9 @@ async fn anchor_commitment(body: Bytes) -> Result<Json<Value>, ApiError> {
     let req: AnchorFields = parse_guarded(&body)?;
     let anchor = req.to_anchor()?;
     let commitment = anchor.commitment_bytes();
+    if anchor.pq_recovery_pubkey.is_empty() || anchor.pq_recovery_pubkey.len() > 8192 {
+        return Err(ApiError::bad("pq_recovery_pubkey must contain 1..8192 bytes"));
+    }
     let gov_hash = vaultlib::anchor_guard_governance_hash(&anchor.pq_recovery_pubkey);
 
     let mut out = json!({
@@ -891,6 +897,17 @@ mod tests {
 
     /// Δ wider than Bitcoin's CSV width is refused at the edge, not truncated: 65_680
     /// would become the honest 144 under `as u16`.
+    #[tokio::test]
+    async fn audit_anchor_refuses_bad_keys_and_unsafe_delay_without_panicking() {
+        for (key, delay) in [(String::new(), 144), ("00".repeat(8193), 144), ("ab".repeat(32), 0)] {
+            let req = json!({"target_chain":"bitcoin", "btc_vault_address":"bcrt1qexample",
+                "recovery_hash":"00".repeat(32), "pq_recovery_pubkey":key,
+                "designated_safe_dest":"bcrt1qsafe", "csv_delay":delay, "policy":"test"});
+            let err = anchor_commitment(body(req)).await.err().expect("must reject");
+            assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        }
+    }
+
     #[tokio::test]
     async fn anchor_rejects_oversized_csv_delay() {
         let (keys, _r, hr) = public_inputs();

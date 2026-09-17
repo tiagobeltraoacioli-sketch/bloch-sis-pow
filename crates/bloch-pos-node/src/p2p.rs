@@ -682,7 +682,10 @@ impl RrCodec for SyncCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        let buf = read_capped(io).await?;
+        // A request is exactly 13 bytes. Read one sentinel to reject junk
+        // without allocating a response-sized buffer for a tiny request.
+        let mut buf = Vec::with_capacity(14);
+        io.take(14).read_to_end(&mut buf).await?;
         decode_sync_request(&buf).map_err(bad_data)
     }
 
@@ -943,12 +946,7 @@ fn load_or_create_identity(path: &std::path::Path) -> io::Result<identity::Keypa
             let bytes = kp
                 .to_protobuf_encoding()
                 .map_err(|e| io::Error::other(format!("p2p identity: {e}")))?;
-            std::fs::write(path, &bytes)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-            }
+            crate::store::atomic_private_write(path, &bytes)?;
             Ok(kp)
         }
         Err(e) => Err(e),
@@ -1010,9 +1008,7 @@ fn build_swarm(keypair: &identity::Keypair, cfg: &Config) -> io::Result<Swarm> {
     let mut gs = gossipsub::Behaviour::new(MessageAuthenticity::Signed(keypair.clone()), gs_cfg)
         .map_err(|e| io::Error::other(format!("gossipsub: {e}")))?;
     if let Err(e) = gs.with_peer_score(peer_score_params(cfg.behind_proxy), peer_score_thresholds()) {
-        // Non-fatal, but say it: with scoring off, every `Reject` this node
-        // reports is log-only and a hostile peer pays nothing.
-        eprintln!("p2p: peer scoring DISABLED ({e}) — rejections carry no penalty");
+        return Err(io::Error::other(format!("peer scoring configuration failed: {e}")));
     }
 
     let max_peers = cfg.max_peers as u32;
@@ -1498,9 +1494,9 @@ fn handle_swarm_event(
             info,
             ..
         })) => {
-            for addr in info.listen_addrs {
-                st.note_dialed(addr, peer_id);
-            }
+            // Identify addresses are untrusted hints, not proof that this
+            // peer owns configured addresses. Do not overwrite redial state.
+            let _ = (peer_id, info);
         }
         SwarmEvent::Behaviour(G4BehaviourEvent::Gossipsub(gossipsub::Event::Message {
             propagation_source,

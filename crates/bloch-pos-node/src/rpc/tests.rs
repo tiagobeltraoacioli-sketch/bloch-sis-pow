@@ -1780,3 +1780,40 @@ fn errors_without_structured_detail_emit_no_data_member() {
 // every local and remote ref, it appeared only in the five files of its own
 // branch, so there is no compatibility claim to honour and an alias would
 // simply re-create the second name.
+
+#[test]
+fn audit_flat_json_amplification_and_composite_ids_are_refused() {
+    let many = format!("[{}0]", "0,".repeat(16_384));
+    assert_eq!(parse_json(&many), Err("too many JSON values"));
+    let backend = Spy::new();
+    for id in ["[]".to_owned(), "{}".to_owned(), format!("\"{}\"", "a".repeat(257))] {
+        let reply = handle_body(&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"getchaininfo\"}}"), backend.as_ref());
+        assert!(reply.contains("-32600"), "{reply}");
+    }
+}
+
+#[test]
+fn audit_timed_out_rpc_work_remains_bounded_until_engine_drops_it() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let backend = std::sync::Arc::new(EngineBackend::new(tx));
+    let mut callers = Vec::new();
+    for _ in 0..16 {
+        let backend = backend.clone();
+        callers.push(std::thread::spawn(move || backend.call(RpcRequest::ChainInfo)));
+    }
+    let pending: Vec<_> = (0..16).map(|_| rx.recv_timeout(Duration::from_secs(5)).unwrap()).collect();
+    let refused = backend.call(RpcRequest::ChainInfo).unwrap_err();
+    assert!(refused.message.contains("queue is full"));
+    for caller in callers { assert!(caller.join().unwrap().is_err()); }
+    assert!(backend.call(RpcRequest::ChainInfo).unwrap_err().message.contains("queue is full"));
+    drop(pending);
+    let next = {
+        let backend = backend.clone();
+        std::thread::spawn(move || backend.call(RpcRequest::ChainInfo))
+    };
+    let crate::engine::EngineEvent::Rpc(call) = rx.recv_timeout(Duration::from_secs(5)).unwrap() else {
+        panic!("expected an RPC request");
+    };
+    call.reply.send(Ok(Json::Null)).unwrap();
+    assert_eq!(next.join().unwrap().unwrap(), Json::Null);
+}

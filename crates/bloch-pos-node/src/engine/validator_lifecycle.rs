@@ -40,7 +40,7 @@ impl Engine {
         self.state
             .validate_lifecycle_transaction(
                 tx,
-                self.state.total_active_stake_sat(),
+                self.state.active_validators().iter().map(|v| u128::from(v.effective_stake)).sum(),
                 self.state.next_base_fee(),
                 &self.verifier,
             )
@@ -74,7 +74,7 @@ impl Engine {
     /// signatures are immutable; only their state-dependent rules need work.
     pub(super) fn revalidate_lifecycle_mempool(&mut self) {
         let state = &self.state;
-        let total = state.total_active_stake_sat();
+        let total = state.active_validators().iter().map(|v| u128::from(v.effective_stake)).sum();
         let fee = state.next_base_fee();
         let included = &self.tx_slot_index;
         self.mempool.retain(|_, tx| {
@@ -141,7 +141,8 @@ impl Engine {
 
     pub(super) fn maintain_validator_lifecycle(&mut self, wall_epoch: u64) {
         // Avoid signing epoch-bound intents while replaying or behind the clock.
-        if epoch_of(self.state.slot()) != wall_epoch {
+        if self.doppelganger_blocks_duties(self.wall_slot)
+            || epoch_of(self.state.slot()) != wall_epoch {
             return;
         }
         let Some(keys) = self.keys.as_ref() else {

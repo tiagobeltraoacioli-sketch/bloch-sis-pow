@@ -516,11 +516,12 @@ struct Parser<'a> {
     b: &'a [u8],
     i: usize,
     depth: u32,
+    values: usize,
 }
 
 /// Parse one JSON value from `text`, which must contain nothing else.
 pub fn parse_json(text: &str) -> Result<Json, &'static str> {
-    let mut p = Parser { b: text.as_bytes(), i: 0, depth: 0 };
+    let mut p = Parser { b: text.as_bytes(), i: 0, depth: 0, values: 0 };
     p.ws();
     let v = p.value()?;
     p.ws();
@@ -561,6 +562,8 @@ impl<'a> Parser<'a> {
     }
 
     fn value(&mut self) -> Result<Json, &'static str> {
+        self.values = self.values.saturating_add(1);
+        if self.values > 16_384 { return Err("too many JSON values"); }
         // Same refusal for the (unreachable) u32 overflow as for the depth cap.
         self.depth = self.depth.checked_add(1).ok_or("nesting too deep")?;
         if self.depth > MAX_DEPTH {
@@ -907,6 +910,7 @@ pub trait RpcBackend: Send + Sync + 'static {
 pub struct RpcCall {
     pub req: RpcRequest,
     pub reply: Sender<RpcResult>,
+    _permit: crate::connection_limit::Permit,
 }
 
 /// The production backend: hand the request to the engine's event loop and wait
@@ -940,11 +944,12 @@ pub struct EngineBackend {
     /// backend, and a backend with no handle behaves exactly as it did before
     /// this field existed: everything goes through the loop.
     head: Option<crate::engine::SharedHead>,
+    pending: Arc<crate::connection_limit::Limits>,
 }
 
 impl EngineBackend {
     pub fn new(engine: Sender<crate::engine::EngineEvent>) -> Self {
-        EngineBackend { engine: Mutex::new(engine), head: None }
+        EngineBackend { engine: Mutex::new(engine), head: None, pending: Arc::default() }
     }
 
     /// The production constructor: the channel to the loop, plus the handle on
@@ -953,7 +958,7 @@ impl EngineBackend {
         engine: Sender<crate::engine::EngineEvent>,
         head: crate::engine::SharedHead,
     ) -> Self {
-        EngineBackend { engine: Mutex::new(engine), head: Some(head) }
+        EngineBackend { engine: Mutex::new(engine), head: Some(head), pending: Arc::default() }
     }
 
     /// Answer `req` from the published head, or `None` if it is not one of the
@@ -990,7 +995,7 @@ impl EngineBackend {
         // Matched BEFORE the state is cloned, so a request that must go to the
         // loop does not even touch the lock.
         match req {
-            RpcRequest::Balance(_) | RpcRequest::Utxos { .. } => {}
+            RpcRequest::Balance(_) | RpcRequest::Utxos { .. } | RpcRequest::TxOut { .. } | RpcRequest::ValidatorAdmission => {}
             _ => return None,
         }
         // The lock is held for one `Arc::clone` and dropped. The query below
@@ -1005,6 +1010,8 @@ impl EngineBackend {
             Arc::clone(&guard)
         };
         match req {
+            RpcRequest::ValidatorAdmission => Some(Ok(validator_admission_json(&state))),
+            RpcRequest::TxOut { txid, vout } => Some(Ok(txout_json(&state, txid, *vout))),
             RpcRequest::Balance(script_hash) => Some(Ok(balance_json(&state, script_hash))),
             RpcRequest::Utxos { script_hash, limit } => {
                 Some(Ok(utxos_json(&state, script_hash, *limit)))
@@ -1019,6 +1026,10 @@ impl RpcBackend for EngineBackend {
         if let Some(answered) = self.from_head(&req) {
             return answered;
         }
+        // Reservation travels with the queued request, so HTTP timeouts do
+        // not free capacity while the consensus thread still owes the work.
+        let permit = self.pending.reserve(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 16)
+            .ok_or_else(|| RpcError::unavailable("RPC engine queue is full; retry later"))?;
         let (tx, rx) = mpsc::channel::<RpcResult>();
         let sender = match self.engine.lock() {
             Ok(guard) => guard.clone(),
@@ -1026,7 +1037,7 @@ impl RpcBackend for EngineBackend {
             // itself is still fine, but saying so honestly beats unwrapping.
             Err(poisoned) => poisoned.into_inner().clone(),
         };
-        if sender.send(crate::engine::EngineEvent::Rpc(RpcCall { req, reply: tx })).is_err() {
+        if sender.send(crate::engine::EngineEvent::Rpc(RpcCall { req, reply: tx, _permit: permit })).is_err() {
             return Err(RpcError::unavailable("node is shutting down"));
         }
         match rx.recv_timeout(ENGINE_TIMEOUT) {
@@ -1248,12 +1259,13 @@ pub fn handle_body(body: &str, backend: &dyn RpcBackend) -> String {
         );
     }
 
-    // Echo the id whatever it is, including absent (null). A client correlating
-    // responses must get its id back even when the rest of the request was
-    // nonsense — that is the only thing tying an error to the call that caused
-    // it. Ids that are objects or arrays are out of spec but are echoed rather
-    // than rewritten, because rewriting one breaks correlation silently.
-    let id = request.get("id").cloned().unwrap_or(Json::Null);
+    // JSON-RPC identifiers are scalar and bounded before cloning/echoing.
+    let id = match request.get("id") {
+        None | Some(Json::Null) => Json::Null,
+        Some(Json::Str(v)) if v.len() <= 256 => Json::Str(v.clone()),
+        Some(Json::Num(v)) if v.len() <= 128 => Json::Num(v.clone()),
+        _ => return envelope(Json::Null, Err(RpcError::invalid_request("invalid or oversized request id"))),
+    };
 
     if let Some(v) = request.get("jsonrpc") {
         if v.as_str() != Some("2.0") {
@@ -1292,21 +1304,23 @@ pub fn serve(
     // Computed once per bind, not per request (R1 A3-M4): env and the bound
     // address are both fixed for the life of this listener.
     let hosts = Arc::new(HostPolicy::new(bind_addr));
+    let ip_limits = Arc::new(crate::connection_limit::Limits::default());
     thread::spawn(move || {
         for conn in listener.incoming() {
             let Ok(sock) = conn else { continue };
+            let Ok(address) = sock.peer_addr() else { continue };
+            let Some(permit) = ip_limits.reserve(address.ip(), 8) else { continue };
             // Reserve a slot before spawning: incrementing inside the thread
             // would let an unbounded burst spawn first and count later.
             if live.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
                 live.fetch_sub(1, Ordering::SeqCst);
-                let mut sock = sock;
-                let _ = respond(&mut sock, 503, "{\"error\":\"too many connections\"}");
                 continue;
             }
             let backend = backend.clone();
             let live = live.clone();
             let hosts = hosts.clone();
             thread::spawn(move || {
+                let _permit = permit;
                 let mut sock = sock;
                 serve_connection(&mut sock, backend.as_ref(), &hosts);
                 live.fetch_sub(1, Ordering::SeqCst);

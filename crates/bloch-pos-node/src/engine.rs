@@ -105,6 +105,7 @@ use bloch_pos_committee::{committees, derive, epoch_of, schedule};
 use sha3::{Digest, Sha3_256};
 
 mod validator_lifecycle;
+mod admission;
 
 use crate::genesis::Manifest;
 #[cfg(test)]
@@ -978,7 +979,8 @@ struct Engine {
     /// `admissible`, which refuses deposits, delegations and exits, refuses a
     /// transfer with no inputs or no outputs, and verifies every spend
     /// signature.
-    mempool: BTreeMap<Vec<u8>, PosTransaction>,
+    mempool: admission::Mempool,
+    future_blocks: BTreeMap<[u8; 32], BlockEnvelope>,
     /// Head slot at which each live mempool key was admitted, for
     /// [`MEMPOOL_TTL_SLOTS`].
     ///
@@ -1229,6 +1231,8 @@ enum Refusal {
     AtCapacity,
     /// `admissible` refused it on its merits. Retrying is pointless.
     Invalid(&'static str),
+    /// Validity may change after synchronization, inclusion, or fee movement.
+    StateDependent(&'static str),
     /// This node's own proposer already tried to build a block with it and the
     /// transition refused. Distinct from `Invalid`, and the difference is not
     /// cosmetic: `Invalid` is a verdict on the bytes, which no passage of time
@@ -1252,7 +1256,7 @@ impl Refusal {
     fn reason(&self) -> &'static str {
         match self {
             Refusal::AtCapacity => "mempool is at capacity",
-            Refusal::Invalid(why) => why,
+            Refusal::Invalid(why) | Refusal::StateDependent(why) => why,
             Refusal::PreviouslyRefused { .. } => {
                 "this node's proposer already had the transition refuse this transaction"
             }
@@ -2459,6 +2463,16 @@ impl Engine {
             );
             return (Verdict::Reject, None);
         }
+        // Authenticated near-future blocks must not enter fork choice until
+        // their signed slot. Bound both count and payload memory (EN-05).
+        if src.bounded_by_wall_clock() && self.live && env.header.slot > self.wall_slot() {
+            let bytes = crate::codec::encode_envelope(&env).len();
+            let held: usize = self.future_blocks.values().map(|b| crate::codec::encode_envelope(b).len()).sum();
+            if self.future_blocks.len() < 32 && held.saturating_add(bytes) <= 16 * 1024 * 1024 {
+                self.future_blocks.insert(id, env);
+            }
+            return (Verdict::Ignore, None);
+        }
         // A block that connects to nothing cannot be judged, so it is parked
         // rather than stored: `blocks` is a fork-choice input and an entry
         // hanging off an unknown root is weight this node cannot validate.
@@ -2604,8 +2618,7 @@ impl Engine {
 
     /// `pending | included | justified | finalized | unknown` for `txid`
     /// (R4 F-11). Cheapest check first: the bounded index (`O(log n)`
-    /// lookup) before the mempool (`O(mempool_len)` scan, since the mempool
-    /// is keyed by canonical bytes, not by txid).
+    /// lookup) before the cached mempool identity index (`O(log n)`).
     fn tx_status(&self, txid: &[u8; 32]) -> &'static str {
         if let Some(&slot) = self.tx_slot_index.get(txid) {
             let fin = self.state.finality();
@@ -2618,7 +2631,7 @@ impl Engine {
                 "included"
             };
         }
-        if self.mempool.values().any(|tx| &tx.txid() == txid) {
+        if self.mempool.has_txid(txid) {
             return "pending";
         }
         "unknown"
@@ -2710,6 +2723,17 @@ impl Engine {
             }
         }
         None
+    }
+
+    /// Release authenticated future blocks only once their slot arrives.
+    fn release_future_blocks(&mut self, slot: u64) {
+        let ready: Vec<_> = self.future_blocks.iter()
+            .filter(|(_, b)| b.header.slot <= slot).map(|(id, _)| *id).collect();
+        for id in ready {
+            if let Some(block) = self.future_blocks.remove(&id) {
+                self.ingest_from_judged(block, Source::Gossip);
+            }
+        }
     }
 
     /// Make the canonical chain equal the LMD-GHOST head.
@@ -3041,7 +3065,7 @@ impl Engine {
         if self.tx_slot_index.contains_key(&tx.txid()) {
             return Ok(Admitted::Duplicate);
         }
-        if self.mempool.contains_key(&key) {
+        if self.mempool.has_txid(&tx.txid()) {
             return Ok(Admitted::Duplicate);
         }
         // Before capacity, and before the structural check: a transaction this
@@ -3054,13 +3078,17 @@ impl Engine {
             self.note_bar(&key, until_slot);
             return Err(Refusal::PreviouslyRefused { until_slot });
         }
+        admission::check_transfer(&self.state, &tx, key.len(), epoch_of(self.wall_slot()))?;
+        if self.mempool.bytes().saturating_add(key.len()) > admission::MAX_MEMPOOL_BYTES {
+            return Err(Refusal::AtCapacity);
+        }
         // R7 M6: per-source cap, before capacity — a source at its own cap
         // must be refused as such even when the mempool overall has room,
         // and must not instead be told to look at the (irrelevant) overall
         // capacity.
         if let Some(source) = tx_source_hash(&tx) {
             let from_source =
-                self.mempool.values().filter(|t| tx_source_hash(t) == Some(source)).count();
+                self.mempool.source_count(&source);
             if from_source >= MEMPOOL_MAX_PER_SOURCE {
                 return Err(Refusal::TooManyFromSource);
             }
@@ -3203,6 +3231,9 @@ impl Engine {
             tx_tip_rate(tb).cmp(&tx_tip_rate(ta)).then_with(|| ka.cmp(kb))
         });
         for (encoded, tx) in ordered {
+            // Legacy unauthenticated exits are never proposed, even if a
+            // caller bypassed ordinary admission (TX-01).
+            if matches!(tx, PosTransaction::Exit { .. }) { continue; }
             if out.len() >= MAX_TXS_PER_BLOCK {
                 break;
             }
@@ -3227,7 +3258,7 @@ impl Engine {
             };
             let n = (encoded.len() as u64).max(declared);
             if bytes.saturating_add(n) > cap {
-                break;
+                continue;
             }
             bytes = bytes.saturating_add(n); // checked against `cap` just above
             out.push(tx.clone());
@@ -3917,6 +3948,7 @@ impl Engine {
         self.att_pool = pool;
         for (att, decision) in released {
             if let GossipDecision::Accept { .. } = decision {
+                self.note_possible_doppelganger(att.validator, att.data.slot);
                 let frame = net::att_frame(&att);
                 self.pool
                     .insert((att.validator, att.data.signing_root()), att);
@@ -4214,6 +4246,9 @@ impl Engine {
                         ),
                     ))
                 }
+                Err(Refusal::StateDependent(why)) => Err(RpcError::tx_refused_retryable(
+                    self.wall_slot().saturating_add(1), why,
+                )),
                 Err(Refusal::Invalid(why)) => Err(RpcError::new(
                     rpc::TX_REFUSED,
                     format!("{why} — this transaction cannot be admitted; retrying \
@@ -4238,7 +4273,7 @@ impl Engine {
             RpcRequest::MempoolInfo => Ok(rpc::mempool_info_json(
                 self.mempool.len(),
                 MEMPOOL_MAX,
-                self.mempool.keys().map(Vec::len).sum(),
+                self.mempool.bytes(),
                 self.state.next_base_fee(),
                 self.rejected.len(),
                 self.rejected_hits,
@@ -4831,7 +4866,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
         pool: BTreeMap::new(),
         att_pool: AttestationPool::new(),
         wall_slot: 0,
-        mempool: BTreeMap::new(),
+        mempool: admission::Mempool::default(),
+            future_blocks: BTreeMap::new(),
         mempool_admitted_at: BTreeMap::new(),
         mempool_expired: 0,
         mempool_evicted_low_fee: 0,
@@ -5210,6 +5246,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
             // reads no clock of its own, so this is the only thing that bounds
             // it — without the call its `seen` map grows with uptime.
             engine.att_pool.prune(slot);
+            engine.release_future_blocks(slot);
         }
 
         if let Some(stop) = cfg.stop_at_slot {
@@ -5346,8 +5383,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
         match rx.recv_timeout(Duration::from_millis(wait)) {
             Ok(ev) => {
                 let mut pending = vec![ev];
-                while let Ok(more) = rx.try_recv() {
-                    pending.push(more);
+                for _ in 1..32 {
+                    match rx.try_recv() { Ok(more) => pending.push(more), Err(_) => break }
                 }
                 // Queue telemetry, before the batch is worked: what the
                 // transports hold for this engine right now, and what they
@@ -7264,7 +7301,8 @@ mod transfer_v2_end_to_end {
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
             wall_slot: 0,
-            mempool: BTreeMap::new(),
+            mempool: admission::Mempool::default(),
+            future_blocks: BTreeMap::new(),
             mempool_admitted_at: BTreeMap::new(),
             mempool_expired: 0,
             mempool_evicted_low_fee: 0,
@@ -7307,7 +7345,7 @@ mod transfer_v2_end_to_end {
     /// signature — the whole economy of the format. Returns the entries so
     /// the engine's genesis can hold the very outputs being swept.
     fn sweep_fixture(n: u32) -> (Vec<EutxoEntry>, PosTransaction) {
-        sweep_fixture_declaring(n, 0)
+        sweep_fixture_declaring(n, 9_000 + u64::from(n) * 40)
     }
 
     /// [`sweep_fixture`] with the declared `tx_bytes` as a knob — the
@@ -7340,7 +7378,9 @@ mod transfer_v2_end_to_end {
             }],
             inputs,
             outputs: vec![TransferOutput {
-                value: 1_000,
+                value: (u64::from(n) * 8_400 * 100_000_000).saturating_sub(
+                    fee_market::charge(fee_market::TxClass::Eutxo { inputs: 1 }, declared,
+                        fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS, 0).base_fee_sat as u64),
                 script_hash,
             }],
             // Admission polices only the declared size's CEILING
@@ -7928,7 +7968,8 @@ mod transfer_v2_end_to_end {
         node.reject_transaction(key, slot);
         // Fill to the cap with anything: the point is which check speaks first.
         for i in 0..MEMPOOL_MAX as u64 {
-            node.mempool.insert(i.to_le_bytes().to_vec(), tx.clone());
+            let filler = PosTransaction::Exit { validator: i as u32 };
+            node.mempool.insert(filler.canonical_bytes(), filler);
         }
         assert!(node.mempool.len() >= MEMPOOL_MAX, "harness: the mempool must be full");
         assert!(
@@ -8125,7 +8166,8 @@ mod transfer_v2_end_to_end {
         let mut full = node;
         for i in 0..MEMPOOL_MAX {
             let mut filler = tx.clone();
-            if let PosTransaction::TransferV2 { keys, .. } = &mut filler {
+            if let PosTransaction::TransferV2 { keys, outputs, .. } = &mut filler {
+                outputs[0].script_hash = Sha3_256::digest((i as u32).to_le_bytes()).into();
                 if let Some(k) = keys.first_mut() {
                     k.pubkey = (i as u32).to_le_bytes().to_vec();
                 }
@@ -8142,6 +8184,69 @@ mod transfer_v2_end_to_end {
             "a full mempool SHOULD advise retrying: {}",
             e2.message
         );
+    }
+    #[test]
+    fn audit_admission_rejects_unowned_missing_duplicate_and_unfunded_spends() {
+        let (entries, good) = sweep_fixture(2);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        for attack in 0..4 {
+            let mut bad = good.clone();
+            if let PosTransaction::TransferV2 { inputs, keys, outputs, .. } = &mut bad {
+                match attack {
+                    0 => keys[0].pubkey[8] ^= 1,
+                    1 => inputs[0].txid = [0xFA; 32],
+                    2 => inputs[1] = inputs[0].clone(),
+                    _ => outputs[0].value += 1,
+                }
+            }
+            assert!(matches!(node.on_transaction(bad), Err(Refusal::Invalid(_) | Refusal::StateDependent(_))));
+            assert!(node.mempool.is_empty());
+        }
+        assert_eq!(node.on_transaction(good), Ok(Admitted::New));
+    }
+
+    #[test]
+    fn audit_signature_variants_share_one_pending_identity() {
+        let (entries, tx) = sweep_fixture(2);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        assert_eq!(node.on_transaction(tx.clone()), Ok(Admitted::New));
+        let bytes = node.mempool.bytes();
+        let mut variant = tx.clone();
+        if let PosTransaction::TransferV2 { keys, .. } = &mut variant { keys[0].signature.push(0); }
+        assert_eq!(node.on_transaction(variant), Ok(Admitted::Duplicate));
+        assert_eq!(node.mempool.bytes(), bytes);
+        assert_eq!(node.mempool.source_count(&tx_source_hash(&tx).unwrap()), 1);
+        node.mempool.remove(&tx.canonical_bytes());
+        assert!(!node.mempool.has_txid(&tx.txid()));
+        assert_eq!(node.mempool.bytes(), 0);
+        assert_eq!(node.mempool.source_count(&tx_source_hash(&tx).unwrap()), 0);
+    }
+
+    #[test]
+    fn audit_byte_limit_refuses_before_count_capacity() {
+        let (entries, tx) = sweep_fixture(2);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let filler = PosTransaction::Exit { validator: 123 };
+        node.mempool.insert(vec![0; admission::MAX_MEMPOOL_BYTES], filler);
+        assert_eq!(node.mempool.len(), 1);
+        assert_eq!(node.on_transaction(tx), Err(Refusal::AtCapacity));
+        assert_eq!(node.mempool.len(), 1);
+    }
+
+    #[test]
+    fn audit_oversized_first_transaction_cannot_censor_the_rest() {
+        let (entries, good) = sweep_fixture(2);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let mut oversized = good.clone();
+        if let PosTransaction::TransferV2 { tx_bytes, tip_millisat_per_gas, .. } = &mut oversized {
+            *tx_bytes = fee_market::max_block_tx_bytes(V2_FLAG_DAY + 1) + 1;
+            *tip_millisat_per_gas = 100;
+        }
+        assert!(matches!(node.on_transaction(oversized.clone()), Err(Refusal::Invalid(_))));
+        // Also defend selection against an old/bypassed admission path.
+        node.mempool.insert(oversized.canonical_bytes(), oversized);
+        node.mempool.insert(good.canonical_bytes(), good.clone());
+        assert_eq!(node.select_transactions(V2_FLAG_DAY + 1), vec![good]);
     }
 }
 
@@ -8251,7 +8356,8 @@ mod perf_support {
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
             wall_slot: 0,
-            mempool: BTreeMap::new(),
+            mempool: admission::Mempool::default(),
+            future_blocks: BTreeMap::new(),
             mempool_admitted_at: BTreeMap::new(),
             mempool_expired: 0,
             mempool_evicted_low_fee: 0,
@@ -9984,7 +10090,8 @@ mod duty_view_anchor {
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
             wall_slot: 0,
-            mempool: BTreeMap::new(),
+            mempool: admission::Mempool::default(),
+            future_blocks: BTreeMap::new(),
             mempool_admitted_at: BTreeMap::new(),
             mempool_expired: 0,
             mempool_evicted_low_fee: 0,
@@ -10247,7 +10354,8 @@ mod slot_horizon {
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
             wall_slot: 0,
-            mempool: BTreeMap::new(),
+            mempool: admission::Mempool::default(),
+            future_blocks: BTreeMap::new(),
             mempool_admitted_at: BTreeMap::new(),
             mempool_expired: 0,
             mempool_evicted_low_fee: 0,
@@ -10525,6 +10633,7 @@ mod ingest_admission_tests {
     /// (`path_to_canonical` → `None`), and nothing ever removed it.
     #[test]
     fn an_unconnected_block_is_parked_not_stored() {
+        let _clock = validator_lifecycle::clock_at(32);
         let (mut engine, _dir, template, stored) = fixture();
         engine.needs_sync = false;
 
@@ -10601,6 +10710,7 @@ mod ingest_admission_tests {
     /// with copies of itself.
     #[test]
     fn the_same_orphan_offered_repeatedly_occupies_one_slot() {
+        let _clock = validator_lifecycle::clock_at(32);
         let (mut engine, _dir, template, _stored) = fixture();
         let orphan = repointed(&engine, &template, [0x9A; 32], 2);
         for _ in 0..16 {
@@ -10719,9 +10829,17 @@ mod ingest_admission_tests {
             [0x9B; 32],
             engine.wall_slot() + FUTURE_SLOT_TOLERANCE,
         );
+        let release_slot = near.header.slot;
         engine.ingest(near);
-        assert_eq!(engine.orphans.len(), 1, "inside the tolerance it is held");
+        assert_eq!(engine.future_blocks.len(), 1, "inside the tolerance it waits for its slot");
+        assert_eq!(engine.blocks.len(), stored, "future gossip cannot enter fork choice");
         assert_eq!(engine.rejected_future, 1, "and nothing more was refused");
+        engine.release_future_blocks(release_slot - 1);
+        assert_eq!(engine.future_blocks.len(), 1);
+        let _clock = validator_lifecycle::clock_at(release_slot);
+        engine.release_future_blocks(release_slot);
+        assert!(engine.future_blocks.is_empty());
+        assert_eq!(engine.orphans.len(), 1, "at its slot the unknown-parent block follows normal ingestion");
     }
 
     /// **The pool is not a black hole.** Out-of-order delivery — the child
@@ -10733,6 +10851,7 @@ mod ingest_admission_tests {
     /// be as strict as it is.
     #[test]
     fn an_orphan_is_admitted_when_its_parent_lands() {
+        let _clock = validator_lifecycle::clock_at(32);
         let (mut engine, _dir) = perf_support::proposing_engine();
         let genesis = *engine.head_id().as_bytes();
 
@@ -10932,6 +11051,7 @@ mod ingest_admission_tests {
     /// cannot start eating a live branch on a chain that has not finalized.
     #[test]
     fn nothing_is_pruned_before_the_chain_finalizes_anything() {
+        let _clock = validator_lifecycle::clock_at(32);
         let (mut engine, _dir, template, stored) = fixture();
         assert_eq!(
             engine.state.finality().finalized.epoch,

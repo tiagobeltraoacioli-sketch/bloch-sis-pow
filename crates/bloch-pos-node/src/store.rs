@@ -635,6 +635,34 @@ pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
+/// Persist a private file without exposing a truncated destination after a crash.
+/// `create_new` prevents following a pre-positioned temporary symlink.
+pub(crate) fn atomic_private_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let dir = path.parent().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent directory"))?;
+    let suffix = format!(".write-{}-{}.tmp", std::process::id(), {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    });
+    let mut name = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing filename"))?.to_os_string();
+    name.push(suffix);
+    let temporary = dir.join(name);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)] {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        fsync_dir(dir)
+    })();
+    if result.is_err() { let _ = fs::remove_file(&temporary); }
+    result
+}
+
 /// A crash can leave an incomplete final frame. Remove only that frame before
 /// any append; merely ignoring it during replay would bury later valid blocks
 /// behind its unfinished length prefix on every subsequent restart.
@@ -712,7 +740,7 @@ impl Store {
                 out.extend_from_slice(META_MAGIC);
                 out.extend_from_slice(&bloch_pos_committee::header::VERSION_G4.to_le_bytes());
                 out.extend_from_slice(genesis_digest);
-                fs::write(&meta_path, out)?;
+                atomic_private_write(&meta_path, &out)?;
             }
             Err(e) => return Err(e),
         }
@@ -923,6 +951,7 @@ impl Store {
         }
         let mut expect = expect_slot;
         let mut out = Vec::new();
+        let mut page_bytes = 0usize;
         let mut len4 = [0u8; 4];
         loop {
             if out.len() >= limit {
@@ -994,6 +1023,8 @@ impl Store {
             // guard, not merely assumed.
             let rest = len.saturating_sub(hdr_len);
             if header.slot > after_slot {
+                if !out.is_empty() && page_bytes.saturating_add(len) > crate::codec::MAX_FIELD_LEN { break; }
+                page_bytes = page_bytes.saturating_add(len);
                 // Wanted: read the body and hand back the whole frame, byte
                 // for byte identical to what the old path pushed.
                 let mut payload = hdr_buf;

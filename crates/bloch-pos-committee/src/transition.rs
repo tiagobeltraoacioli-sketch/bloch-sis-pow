@@ -2572,7 +2572,18 @@ impl CommittedState {
         if epoch < crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH {
             return roster;
         }
-        with_leak_applied(roster, |index| self.finality_engine.leaked_of(index))
+        let leaked = with_leak_applied(roster.clone(), |index| self.finality_engine.leaked_of(index));
+        // Candidate FC-01: a completely empty weighted schedule cannot carry
+        // the votes that restore leaked stake. This candidate restores the
+        // consensus roster without resetting committed leak accumulators.
+        // All roster consumers, including reward-v2, require qualification
+        // before activation; the gate remains unarmed.
+        if crate::params::duty_roster_recovery_active(epoch)
+            && !leaked.iter().any(|v| v.effective_stake > 0)
+        {
+            return roster;
+        }
+        leaked
     }
 
     /// The frozen finality view over the engine's state.
@@ -5823,6 +5834,28 @@ impl<V: SignatureVerifier> Transition<V> {
         // Satoshis this block bonds without spending an output. See the
         // conservation check at step 11b.
         let mut unfunded_bonded: u128 = 0;
+        // Preflight the transfer budgets before executing any spend or
+        // rebuilding any output paths (TX-02). These are the same declared
+        // charges used below; other classes remain covered by the final caps.
+        let mut minimum_bytes = 0u64;
+        let mut minimum_gas = 0u64;
+        for tx in transactions {
+            let (bytes, witnesses) = match tx {
+                PosTransaction::Transfer { inputs, tx_bytes, .. } => (*tx_bytes, inputs.len()),
+                PosTransaction::TransferV2 { keys, tx_bytes, .. } => (*tx_bytes, keys.len()),
+                PosTransaction::FundedDeposit(tx) => (tx.tx_bytes, 2),
+                _ => continue,
+            };
+            minimum_bytes = minimum_bytes.saturating_add(bytes);
+            minimum_gas = minimum_gas.saturating_add(fee_market::intrinsic_gas(
+                fee_market::TxClass::Eutxo { inputs: witnesses as u32 }, bytes));
+        }
+        if minimum_gas > fee_market::BLOCK_GAS_LIMIT {
+            return Err(TransitionError::BlockGasLimitExceeded);
+        }
+        if minimum_bytes > fee_market::max_block_tx_bytes(block_epoch) {
+            return Err(TransitionError::BlockByteLimitExceeded);
+        }
         for (i, tx) in transactions.iter().enumerate() {
             let applied = match tx {
                 // The gate first: below SLASHING_EVIDENCE_ACTIVATION_EPOCH
@@ -5854,6 +5887,12 @@ impl<V: SignatureVerifier> Transition<V> {
             };
             match applied {
                 Ok(charge) => {
+                    if block_gas.saturating_add(charge.gas) > fee_market::BLOCK_GAS_LIMIT {
+                        return Err(TransitionError::BlockGasLimitExceeded);
+                    }
+                    if block_bytes.saturating_add(charge.tx_bytes) > fee_market::max_block_tx_bytes(block_epoch) {
+                        return Err(TransitionError::BlockByteLimitExceeded);
+                    }
                     observer(i, &st, &charge);
                     base_fees += charge.base_fee_sat;
                     priority_fees += charge.priority_fee_sat;
@@ -14129,6 +14168,31 @@ mod tests {
     /// a committee. Without that half the assertions below would pass just as
     /// well against a roster that had lost the validator for some unrelated
     /// reason, which is the failure mode that makes a negative test worthless.
+    #[test]
+    fn audit_complete_inactivity_has_a_gated_recovery_schedule() {
+        let (_t, mut state, _c) = setup(4);
+        let roster = state.duty_roster_at(0);
+        let seed = state.seed_for_epoch(0);
+        for epoch in 1..=80 {
+            let mut accepted = Vec::new();
+            let votes = finality::votes_from_partition(epoch, &roster, &roster, &[], &seed, &mut accepted);
+            state.finality_engine.process_epoch(&votes).unwrap();
+        }
+        let epoch = crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH;
+        state.epoch = epoch;
+        let old = state.consensus_roster_at(epoch);
+        assert!(old.iter().all(|v| v.effective_stake == 0));
+        assert!(schedule::proposer(&seed, epoch * SLOTS_PER_EPOCH, &old).is_none());
+        let _gate = crate::params::audit_recovery_test::open();
+        let recovered = state.consensus_roster_at(epoch);
+        assert_eq!(recovered, state.duty_roster_at(epoch));
+        assert!(schedule::proposer(&seed, epoch * SLOTS_PER_EPOCH, &recovered).is_some());
+        assert_eq!(old.iter().map(|v| v.index).collect::<Vec<_>>(),
+                   recovered.iter().map(|v| v.index).collect::<Vec<_>>());
+        // No rewrite of committed leak accumulators or finality checkpoints.
+        assert!(roster.iter().all(|v| state.finality_engine.leaked_of(v.index) >= v.effective_stake));
+    }
+
     #[test]
     fn a_fully_leaked_validator_leaves_the_schedule() {
         // Holds a roster with a zero-stake member, so it must be excluded from

@@ -246,19 +246,20 @@ fn a_cold_node_builds_the_same_chain_from_genesis_without_a_donated_datadir() {
         ));
     }
 
-    // The cold node joins late. Its data dir holds `validator.key` and nothing
-    // else — no block log, no meta marker, no state. That is the whole point:
+    // The cold node joins late. Key generation leaves its own validator.key
+    // and an advisory LOCK file — no block log, no meta marker, no state. That is the whole point:
     // it is not handed a database, it is handed a genesis manifest and a set of
     // peers, exactly like an exchange standing up a node today.
     std::thread::sleep(Duration::from_secs(COLD_START_DELAY_SECS));
     let cold_dir = root.join("d2");
-    let cold_files: Vec<String> = std::fs::read_dir(&cold_dir)
+    let mut cold_files: Vec<String> = std::fs::read_dir(&cold_dir)
         .expect("read cold dir")
         .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
         .collect();
+    cold_files.sort();
     assert_eq!(
         cold_files,
-        vec!["validator.key".to_string()],
+        vec!["LOCK".to_string(), "validator.key".to_string()],
         "the cold node's data dir must contain only its own keystore, not a donated database"
     );
     fleet.0.push(spawn_node(

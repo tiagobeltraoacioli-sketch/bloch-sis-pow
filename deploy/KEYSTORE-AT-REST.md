@@ -105,10 +105,14 @@ drives the real executable and needs no fleet and no clock.
 
 ## Not covered by this change
 
-- **No re-seal tool.** Sealing an existing plaintext keystore in place needs a
-  command this repo does not have (`keygen` only seals keys it just generated).
-  Until it exists, Option B has no supported procedure and Option A is the only
-  one an operator can actually execute.
+- **Explicit sealing is supported.** `bloch-pos keys inspect` and
+  `bloch-pos keys seal` inspect and seal an existing plaintext keystore.
+  Use the CLI help for the data-directory and passphrase-file arguments;
+  the node must be stopped so the command can acquire the directory lock.
+  Preserve a secure backup and verify the resulting public identity before
+  restarting. `keygen` refuses to replace an existing validator identity.
+  Newly sealed files require at least 12 passphrase characters; existing
+  sealed files remain readable under their original passphrase.
 - **No migration on load.** A loader that re-wrote the file it just read would
   be writing into a directory that may be shared, replicated, or mid-backup.
   Re-sealing is an operator action on an operator's schedule.
