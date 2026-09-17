@@ -221,6 +221,16 @@ hashrate signalling, which no longer exists.
 
 ## 3. Audit and security
 
+### Current — deep internal audit (2026-09-16)
+
+- `audit/DEEP-AUDIT-2026-09-16.md` — eleven-area, tool-assisted adversarial
+  audit of the whole tree at `562e220`: 200 findings (15 High after
+  verification), the inert-gate consequence stated once, a prioritised fix
+  order, and what the codebase does well. Annexes A0–A14 in
+  `audit/deep-audit-2026-09-16/` carry every finding with file:line evidence,
+  the verification verdicts, the dynamic run and the reproducers. Internal;
+  does not change the "unaudited" status.
+
 ### Current — the pre-audit wave (2026-08-12)
 
 - `audit/CERTIK-PRE-AUDIT-DOSSIER.md` — what an auditor asks, answered before
