@@ -115,6 +115,7 @@ fn rejected_native_reorg_suffix_cannot_publish_prefix_state_or_transaction_statu
     // Control: after rejecting the suffix, the identical valid prefix can win.
     assert!(engine.do_reorg(genesis, vec![prefix.clone()]));
     assert_eq!(engine.tx_slot_index.get(&tx.txid()), Some(&1));
+    assert_eq!(engine.tx_status(&tx.txid()), "included");
     assert_eq!(
         *engine.state,
         engine.replay_to(*prefix.block_id().as_bytes())
@@ -123,4 +124,5 @@ fn rejected_native_reorg_suffix_cannot_publish_prefix_state_or_transaction_statu
     // cleanup erase the winning transaction's just-published observation.
     assert!(engine.do_reorg(genesis, vec![prefix]));
     assert_eq!(engine.tx_slot_index.get(&tx.txid()), Some(&1));
+    assert_eq!(engine.tx_status(&tx.txid()), "included");
 }

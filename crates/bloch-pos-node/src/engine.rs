@@ -2600,14 +2600,13 @@ impl Engine {
     /// is keyed by canonical bytes, not by txid).
     fn tx_status(&self, txid: &[u8; 32]) -> &'static str {
         if let Some(&slot) = self.tx_slot_index.get(txid) {
-            let fin = self.state.finality();
-            let e = epoch_of(slot);
-            return if e <= fin.finalized.epoch {
-                "finalized"
-            } else if e <= fin.justified.epoch {
-                "justified"
-            } else {
-                "included"
+            // Epoch labels cover slots after their checkpoint. Only the actual
+            // canonical checkpoint root bounds justified/finalized inclusion.
+            return match self.finality_of(slot, true) {
+                Finality::Finalized => "finalized",
+                Finality::Justified => "justified",
+                Finality::Canonical => "included",
+                Finality::NotCanonical => "unknown",
             };
         }
         if self.mempool.values().any(|tx| &tx.txid() == txid) {
@@ -11255,12 +11254,19 @@ mod tx_status_tests {
     use super::slot_horizon::engine_at_wall_slot;
     use super::*;
 
-    /// A slot safely past epoch 0 — `tx_status` compares an epoch against
-    /// the finality checkpoints, and a fresh engine's `finalized`/`justified`
-    /// both sit at epoch 0, so testing AT epoch 0 could not tell "included"
-    /// apart from "finalized" (`0 <= 0`). Epoch 1 can.
+    /// An ordinary inclusion beyond the genesis checkpoint.
     fn epoch1_slot() -> u64 {
         SLOTS_PER_EPOCH
+    }
+
+    #[test]
+    fn epoch_zero_inclusion_is_not_finalized_by_genesis() {
+        let mut e = engine_at_wall_slot(1);
+        let tx = parked_transfer(1);
+        e.note_tx_slots(1, std::slice::from_ref(&tx));
+        assert_eq!(e.tx_status(&tx.txid()), "included");
+        e.forget_tx_slots_if_stale(1, std::slice::from_ref(&tx));
+        assert_eq!(e.tx_status(&tx.txid()), "unknown");
     }
 
     #[test]
@@ -11431,6 +11437,25 @@ mod finality_latch_tests {
             engine.head_slot_now(),
         );
         (engine, dir)
+    }
+
+    #[test]
+    fn tx_status_uses_checkpoint_slot_before_epoch_boundary() {
+        let (mut engine, _dir) = engine_with_own_finality();
+        let finalized = engine.state.finality().finalized;
+        let slot = engine.slot_of_canonical_root(&finalized.root).unwrap();
+        assert!(slot < finalized.epoch * SLOTS_PER_EPOCH);
+        let at_checkpoint = [0xd1; 32];
+        let after_checkpoint = [0xd2; 32];
+        engine.note_tx_ids(slot, [at_checkpoint]);
+        engine.note_tx_ids(finalized.epoch * SLOTS_PER_EPOCH, [after_checkpoint]);
+        assert_eq!(engine.tx_status(&at_checkpoint), "finalized");
+        assert_ne!(engine.tx_status(&after_checkpoint), "finalized");
+        let justified = engine.state.finality().justified;
+        let justified_slot = engine.slot_of_canonical_root(&justified.root).unwrap();
+        let after_justified = [0xd3; 32];
+        engine.note_tx_ids(justified_slot + 1, [after_justified]);
+        assert_eq!(engine.tx_status(&after_justified), "included");
     }
 
     /// Three real proposed blocks and the latch armed by hand at height 2 —

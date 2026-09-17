@@ -2276,11 +2276,13 @@ pub fn validators_json(entries: &[(ValidatorRecord, Option<u64>)], current_epoch
 }
 
 /// `gettxstatus` (R4 F-11): one of `pending | included | justified |
-/// finalized | unknown`. A bare string result rather than an object — there
-/// is exactly one fact being reported, and wrapping it would invite a caller
-/// to look for fields that do not exist.
+/// finalized | unknown`, with the implemented checkpoint classification rule.
+/// The rule label describes this build; it is not a finality proof.
 pub fn tx_status_json(status: &'static str) -> Json {
-    Json::obj(vec![("status", Json::s(status))])
+    Json::obj(vec![
+        ("status", Json::s(status)),
+        ("finality_rule", Json::s("canonical-checkpoint-slot-v1")),
+    ])
 }
 
 fn eutxo_json(e: &EutxoEntry) -> Json {
@@ -2595,6 +2597,19 @@ mod native_wallet_absent_tests {
     fn default_build_does_not_expose_native_wallet_or_bridge_methods() {
         for method in ["getnativewalletview", "getnativepoolquote", "getnativewithdrawalquote", "getnativepool", "getnativebridgestate", "getnativelabstate"] {
             assert!(super::route(method, None).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tx_status_rule_tests {
+    #[test]
+    fn tx_status_advertises_checkpoint_slot_semantics_for_every_state() {
+        for status in ["unknown", "pending", "included", "justified", "finalized"] {
+            assert_eq!(super::tx_status_json(status), super::Json::obj(vec![
+                ("status", super::Json::s(status)),
+                ("finality_rule", super::Json::s("canonical-checkpoint-slot-v1")),
+            ]));
         }
     }
 }
