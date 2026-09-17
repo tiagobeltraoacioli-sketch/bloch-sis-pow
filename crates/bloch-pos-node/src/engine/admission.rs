@@ -167,7 +167,7 @@ pub(super) fn check_transfer(
             .checked_add(u128::from(entry.value))
             .ok_or(Refusal::Invalid("transfer input sum overflows"))?;
     }
-    let charge = fee_market::charge(class, declared, state.next_base_fee(), tip);
+    let charge = fee_market::charge(class, declared, state.next_base_fee_at(epoch), tip);
     let created = outputs
         .iter()
         .try_fold(0u128, |total, output| {

@@ -14,7 +14,7 @@ The existing published `validator_set_root = 0` encoding means that no independe
 
 Repeat `ws-checkpoint` with the same `--out` prefix to recheck the RPC evidence and reuse the original binary checkpoint. If `--issued-at` is omitted, the original issuance time is retained, preserving its signed digest. Explicitly changing the timestamp, chain identity, epoch, signer arrangement, or either root is refused. The initial binary is created exclusively; a competing publisher cannot silently overwrite it. An incomplete or malformed existing binary is refused for investigation.
 
-The JSON companion can be regenerated from the unchanged binary. Preserve and distribute the original binary throughout the signing ceremony. Do not select another output prefix to bypass a refusal: the tool has no global publication registry and cannot detect an artifact minted in another directory or machine. Same-epoch conflicting envelopes still cause the existing anti-equivocation boot refusal. SR-13 therefore remains partial.
+The JSON companion can be regenerated from the unchanged binary. Preserve and distribute the original binary throughout the signing ceremony. Do not select another output prefix to bypass a refusal. Without a shared `--publication-dir`, the tool cannot detect an artifact minted under another prefix; even with it, independent registries or machines that do not share that registry remain outside coordination. Same-epoch conflicting envelopes still cause the existing anti-equivocation boot refusal. SR-13 therefore remains partial.
 
 ## KS-07: offline log diagnosis
 
@@ -27,3 +27,14 @@ bloch-pos block-log-inspect --data-dir /path/to/offline-copy
 The command reads `blocks.log` one bounded frame at a time without opening the store for mutation, creating a lock/index, or invoking startup tail repair. It reports total bytes, decoded frame count, the byte offset through the decoded prefix, and the first framing/codec issue. Exit 0 means the framing and codec scan completed; exit 1 reports a detected issue; exit 2 reports invocation or I/O failure. It does not inspect private key files or print block payloads.
 
 A successfully decoded prefix is **not** a verified chain. This command does not execute consensus transitions, validate state roots or signatures, or provide missing per-frame checksums. In particular, an incomplete frame can indicate either a torn append or a corrupted earlier length: its offset is not authorization to truncate. Restore from a verified backup and investigate before modifying original bytes. Existing conservative startup handling of incomplete tails is unchanged; no new destructive repair command is introduced. KS-07 remains partial.
+
+
+## SR-13 extension: coordinated output prefixes (2026-09-17)
+
+Pass the same `--publication-dir /path/to/registry` to every `ws-checkpoint` invocation in the publication ceremony. The directory must be owned by the operator and mode 0700; a missing final directory is created privately under an existing parent. Each network/genesis/epoch receives one canonical checkpoint record. A new record is fully written and fsynced before an atomic, non-replacing hard link exposes it. Competing writers compare the winning complete artifact and retain its issuance time when no timestamp was explicitly fixed. Conflicting roots, arrangements, epochs or explicit issuance times are refused, including across different output prefixes.
+
+Keep this registry with the original publication artifacts and backups. A damaged record is refused, never silently repaired or overwritten. Existing output binaries are authoritative for their issuance time; adopting a conflicting registry cannot rewrite an already-created artifact. The registry is local coordination, not a distributed lock or authenticated publication service. Old tooling, another registry, or omission of the option remains outside its protection; the tool prints a warning when it is omitted. SR-13 remains partial until the publication workflow consistently uses one durable registry. No historical signed envelope or boot anti-rollback rule changes.
+
+## TX-22: new genesis operator input (2026-09-17)
+
+Both `genesis` and `genesis-mainnet` now reject duplicate validator indices, duplicate validator public keys, duplicate cohort entries, and cohort members absent from the validator set before writing a new manifest. This prevents the operator creation path from publishing an ambiguous registry. Historical manifest decoding and committed-state construction remain unchanged; this is not a reinterpretation of an existing chain and does not close the underlying consensus-constructor finding for arbitrary programmatic callers.

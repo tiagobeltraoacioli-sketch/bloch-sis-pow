@@ -2,10 +2,30 @@
 
 A standalone reference address / UTXO / history indexer for Bloch. It consumes
 blocks via JSON-RPC (`getblockcount`, `getblockhash`, `getblockbyheight`), tracks
-the selected-chain tip, detects replaced blocks, rolls back the affected height
+the RPC height mapping, detects replaced blocks, rolls back the affected height
 range and re-applies replacement blocks. Offline tests cover these operations.
-Consistency when RPC responses switch branches during one sync remains an open
-production blocker; this reference is not a qualified live balance authority.
+A sync pass stages at most 16 linked blocks before publishing changes, rechecks
+the fork anchor and batch tip, and refuses observed RPC branch shifts without
+changing balances. Concurrent sync callers share one pass. Fork searches stop
+after 2,048 comparisons and require operator reconciliation beyond that bound.
+This is a request-count bound, not a total deadline: slow RPCs can still occupy
+a pass for hours, and shutdown is observed between passes.
+Missing verbose bodies and malformed transaction arrays/identifiers/indices are
+errors, not evidence that indexing is complete. No missing spend/output list is
+silently converted into an empty transaction.
+
+These checks mitigate mixed-branch reads; they do not create an atomic RPC
+snapshot. A reorg after the final check remains possible. DAG parent membership
+does not prove the selected-parent choice. In the legacy node, `put_block`
+overwrites `CF_HEIGHT` for every stored block at a height; the height RPC reads
+that index, while fork choice walks `selected_parent` separately. Therefore even
+stable, linked height responses do not prove canonical selected-chain membership.
+This requires an upstream canonical-chain RPC contract before live qualification. This reference is not a qualified live balance
+authority. Whole-state persistence, history pruning, existing misindexed data
+and live chain qualification remain unresolved. Failed block validation may
+publish a shorter valid staged prefix, with its undo records, before retry.
+At the transport's 8 MiB limit, a full 16-block stage can hold up to 128 MiB of
+raw response-equivalent data plus parsed object overhead.
 
 It persists to a simple embedded JSON store and exposes a small read API.
 

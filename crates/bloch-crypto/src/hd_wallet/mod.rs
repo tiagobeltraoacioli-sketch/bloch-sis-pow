@@ -178,10 +178,21 @@ impl HdWallet {
     /// Import an existing keypair (e.g., from founder.json) into the HD wallet.
     /// An imported key does not come from the seed, so the mnemonic alone will
     /// never bring it back — the wallet file stays part of that key's backup.
-    pub fn import_keypair(&mut self, keypair: Keypair, label: &str) {
-        let next_index = self.addresses.iter().map(|(i, _, _)| *i).max().unwrap_or(0) + 1;
+    /// Returns an error if the address index is exhausted. This method now
+    /// returns `Result` instead of `()`; callers must handle import failure.
+    pub fn import_keypair(&mut self, keypair: Keypair, label: &str) -> Result<(), String> {
+        self.try_import_keypair(keypair, label)
+    }
+
+    /// Fallible import for untrusted or exhausted wallet files. On failure the
+    /// wallet is unchanged; this consumes the supplied keypair. Keep its backup.
+    /// Both import entry points report exhaustion without panicking or wrapping.
+    pub fn try_import_keypair(&mut self, keypair: Keypair, label: &str) -> Result<(), String> {
+        let next_index = self.addresses.iter().map(|(i, _, _)| *i).max().unwrap_or(0)
+            .checked_add(1).ok_or_else(|| "HD address index exhausted".to_string())?;
         self.addresses.push((next_index, keypair, label.to_string()));
         self.imported.insert(next_index);
+        Ok(())
     }
 
     /// True when address `index` is reproducible from the mnemonic alone.
@@ -253,7 +264,7 @@ impl HdWallet {
     pub fn load(path: &Path, mnemonic_str: &str, passphrase: Option<&str>, password: &str) -> Result<Self, String> {
         let json = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         let wallet: HdWalletFile = serde_json::from_str(&json).map_err(|e| e.to_string())?;
-        if wallet.format != "hd-wallet-v1" { return Err("unsupported wallet format".into()); }
+        validate_wallet_structure(&wallet)?;
 
         // Parse mnemonic
         let mnemonic = Mnemonic::parse(mnemonic_str)
@@ -319,6 +330,28 @@ impl HdWallet {
     pub fn list(&self) -> Vec<(u32, String, String)> {
         self.addresses.iter().map(|(i, kp, label): &(u32, Keypair, String)| (*i, kp.address.clone(), label.clone())).collect()
     }
+}
+
+// Reject ambiguous metadata before expensive KDF/decryption. No funded key is
+// re-derived, renumbered or silently repaired during restore.
+fn validate_wallet_structure(wallet: &HdWalletFile) -> Result<(), String> {
+    if wallet.format != "hd-wallet-v1" { return Err("unsupported wallet format".into()); }
+    if !(1..=WALLET_VERSION).contains(&wallet.version) { return Err("unsupported wallet version".into()); }
+    let prefix = match wallet.network.as_str() {
+        "testnet" => TESTNET_PREFIX,
+        "mainnet" => crate::core::MAINNET_PREFIX,
+        _ => return Err("unsupported wallet network".into()),
+    };
+    let mut indices = BTreeSet::new();
+    for address in &wallet.addresses {
+        if !indices.insert(address.index) { return Err("duplicate HD address index".into()); }
+        // Imported/pre-v3 keys may legitimately belong to another network;
+        // preserve those backups. The network promises only future derivations.
+        if address.derived && !address.address.starts_with(prefix) {
+            return Err("derived address and wallet network differ".into());
+        }
+    }
+    Ok(())
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -502,7 +535,7 @@ mod tests {
         let mut w = HdWallet::create("test-password-12345!", None, true).unwrap();
         let random_kp = crate::wallet::generate_keypair(true);
         let random_addr = random_kp.address.clone();
-        w.import_keypair(random_kp, "legacy");
+        w.import_keypair(random_kp, "legacy").unwrap();
         assert!(w.is_derived(0));
         assert!(!w.is_derived(1), "an imported key is not seed-derived");
         w.save(&tmp).unwrap();
@@ -660,6 +693,36 @@ mod audit_wallet_boundaries {
     }
 
     #[test]
+    fn hostile_wallet_metadata_is_refused_without_changing_legacy_versions() {
+        let crypto = encrypt_with_key(&[0; 32], b"fixture").unwrap();
+        let mut file = HdWalletFile {
+            version: 1, format: "hd-wallet-v1".into(), network: "testnet".into(),
+            mnemonic_crypto: crypto.clone(), addresses: vec![HdAddress {
+                index: u32::MAX, address: format!("{}fixture", TESTNET_PREFIX),
+                label: "last".into(), keypair_crypto: crypto, derived: false,
+            }], created_at: String::new(), description: String::new(),
+        };
+        for version in [1, 2, 3] {
+            file.version = version;
+            assert!(validate_wallet_structure(&file).is_ok());
+        }
+        for version in [0, 4, u32::MAX] {
+            file.version = version;
+            assert_eq!(validate_wallet_structure(&file).unwrap_err(), "unsupported wallet version");
+        }
+        file.version = 3;
+        file.addresses.push(file.addresses[0].clone());
+        assert_eq!(validate_wallet_structure(&file).unwrap_err(), "duplicate HD address index");
+        file.addresses.pop();
+        file.network = "mainnet".into();
+        assert!(validate_wallet_structure(&file).is_ok(), "preserve cross-network imported backups");
+        file.addresses[0].derived = true;
+        assert_eq!(validate_wallet_structure(&file).unwrap_err(), "derived address and wallet network differ");
+        file.network = "unrecognized".into();
+        assert_eq!(validate_wallet_structure(&file).unwrap_err(), "unsupported wallet network");
+    }
+
+    #[test]
     fn malformed_aes_keys_and_excessive_recovery_counts_are_refused() {
         assert!(HdWallet::recover("not even a mnemonic", None, "password", true, u32::MAX)
             .err().unwrap().contains("4096"));
@@ -684,6 +747,14 @@ mod audit_wallet_boundaries {
             network:"testnet".into(), file_version:WALLET_VERSION };
         assert!(wallet.new_address("overflow").err().unwrap().contains("exhausted"));
         assert_eq!(wallet.addresses.len(), 1);
+        assert_eq!(wallet.addresses[0].1.address, address);
+        let imported_key = derive_at(&wallet.seed, 1, true).unwrap();
+        assert!(wallet.try_import_keypair(imported_key, "overflow").unwrap_err().contains("exhausted"));
+        let another_key = derive_at(&wallet.seed, 2, true).unwrap();
+        assert!(wallet.import_keypair(another_key, "overflow").unwrap_err().contains("exhausted"));
+        assert_eq!(wallet.addresses.len(), 1);
+        assert!(wallet.imported.is_empty());
+        assert_eq!(wallet.addresses[0].0, u32::MAX);
         assert_eq!(wallet.addresses[0].1.address, address);
     }
 }

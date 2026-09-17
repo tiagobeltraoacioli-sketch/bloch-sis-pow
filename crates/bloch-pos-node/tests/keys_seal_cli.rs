@@ -42,7 +42,8 @@ fn run(args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
     let mut c = Command::new(BIN);
     c.env_remove("BLOCH_KEYSTORE_PASSPHRASE")
         .env_remove("BLOCH_KEYSTORE_PASSPHRASE_FILE")
-        .env_remove("BLOCH_KEYSTORE_ALLOW_PLAINTEXT");
+        .env_remove("BLOCH_KEYSTORE_ALLOW_PLAINTEXT")
+        .env_remove("BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF");
     for (k, v) in env {
         c.env(k, v);
     }

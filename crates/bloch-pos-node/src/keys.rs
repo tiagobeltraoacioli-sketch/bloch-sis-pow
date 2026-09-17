@@ -107,6 +107,9 @@ const KDF_MAX_M_COST_KIB: u32 = 1_048_576; // 1 GiB
 /// keystore and refuse everything an attacker-supplied header could ask for.
 const KDF_MAX_T_COST: u32 = 64;
 const KDF_MAX_P_COST: u32 = 16;
+/// Bound combined memory/pass work before allocation; independent maxima alone
+/// previously admitted 64 GiB-passes. Production uses 192 MiB-passes.
+const KDF_DEFAULT_MAX_WORK_KIB: u64 = 1_048_576;
 
 /// Shortest passphrase `keys seal` will seal under. Argon2id makes guessing
 /// expensive per attempt, not impossible; a validator identity behind eight
@@ -148,6 +151,10 @@ impl KdfParams {
     }
 
     fn to_argon2(self) -> io::Result<argon2::Argon2<'static>> {
+        self.to_argon2_with_legacy_work(false)
+    }
+
+    fn to_argon2_with_legacy_work(self, allow_expensive: bool) -> io::Result<argon2::Argon2<'static>> {
         if self.m_cost > KDF_MAX_M_COST_KIB {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -166,6 +173,11 @@ impl KdfParams {
                 "keystore KDF parallelism is over this node's cap",
             ));
         }
+        let work = u64::from(self.m_cost).saturating_mul(u64::from(self.t_cost));
+        if !allow_expensive && work > KDF_DEFAULT_MAX_WORK_KIB {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                "keystore combined KDF work exceeds the default cap; for a verified authentic legacy file only, explicitly set BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF=1 (original finite parameter caps still apply)"));
+        }
         let params = argon2::Params::new(self.m_cost, self.t_cost, self.p_cost, Some(32))
             .map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "keystore KDF parameters are invalid")
@@ -179,8 +191,12 @@ impl KdfParams {
 
     /// Argon2id(passphrase, salt) → 32-byte AEAD key, zeroized on drop.
     fn derive(self, passphrase: &str, salt: &[u8; 32]) -> io::Result<Zeroizing<[u8; 32]>> {
+        self.derive_with_legacy_work(passphrase, salt, false)
+    }
+
+    fn derive_with_legacy_work(self, passphrase: &str, salt: &[u8; 32], allow_expensive: bool) -> io::Result<Zeroizing<[u8; 32]>> {
         let mut key = Zeroizing::new([0u8; 32]);
-        self.to_argon2()?
+        self.to_argon2_with_legacy_work(allow_expensive)?
             .hash_password_into(passphrase.as_bytes(), salt, key.as_mut())
             .map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "keystore key derivation failed")
@@ -201,6 +217,8 @@ pub enum Unlock {
         /// Cost used when *writing*. Reading always uses the parameters
         /// recorded in the file.
         kdf: KdfParams,
+        /// Recovery opt-in for existing files only; never changes new sealing.
+        allow_expensive_kdf: bool,
     },
     /// Explicit, operator-visible opt-in to PLAINTEXT at rest: read a legacy
     /// `BPOSKEY1` file, or write one. Devnet and tests.
@@ -213,6 +231,7 @@ impl Unlock {
         Unlock::Passphrase {
             pass: Zeroizing::new(pass.into()),
             kdf: KdfParams::PRODUCTION,
+            allow_expensive_kdf: false,
         }
     }
 
@@ -222,7 +241,13 @@ impl Unlock {
         Unlock::Passphrase {
             pass: Zeroizing::new(pass.into()),
             kdf,
+            allow_expensive_kdf: false,
         }
+    }
+
+    fn allow_expensive_existing(mut self, allowed: bool) -> Self {
+        if let Self::Passphrase { allow_expensive_kdf, .. } = &mut self { *allow_expensive_kdf = allowed; }
+        self
     }
 
     /// Resolve the policy from the process environment, in priority order:
@@ -243,6 +268,13 @@ impl Unlock {
     /// that quietly read a plaintext key because nobody configured anything
     /// is the defect this function exists to close.
     pub fn from_env() -> io::Result<Unlock> {
+        let expensive = match std::env::var_os("BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF") {
+            None => false,
+            Some(value) if value == "0" => false,
+            Some(value) if value == "1" => true,
+            Some(_) => return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+                "BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF must be 0 or 1")),
+        };
         if let Some(raw) = std::env::var_os("BLOCH_KEYSTORE_PASSPHRASE_FD") {
             if std::env::var_os("BLOCH_KEYSTORE_PASSPHRASE_FILE").is_some()
                 || std::env::var_os("BLOCH_KEYSTORE_PASSPHRASE").is_some()
@@ -259,7 +291,7 @@ impl Unlock {
                 "invalid passphrase descriptor number"))?;
             let pass = read_passphrase_fd(descriptor, std::time::Duration::from_secs(3))
                 .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, format!("cannot read inherited passphrase pipe: {e}")))?;
-            return Ok(Unlock::passphrase(pass.as_str()));
+            return Ok(Unlock::passphrase(pass.as_str()).allow_expensive_existing(expensive));
         }
         let pass_file = std::env::var_os("BLOCH_KEYSTORE_PASSPHRASE_FILE");
         let pass = std::env::var("BLOCH_KEYSTORE_PASSPHRASE").ok();
@@ -278,7 +310,7 @@ impl Unlock {
                 std::process::id()
             );
         }
-        Self::from_sources(pass_file, pass, plaintext_opt_in())
+        Self::from_sources(pass_file, pass, plaintext_opt_in()).map(|unlock| unlock.allow_expensive_existing(expensive))
     }
 
     /// The whole of [`Unlock::from_env`]'s decision, with the three inputs
@@ -469,7 +501,7 @@ impl Keystore {
         // `Zeroizing` on both arms: the plaintext encoding IS the secret, and
         // the sealed bytes cost nothing to wipe (audit round 3, keystore lows).
         let out: Zeroizing<Vec<u8>> = match unlock {
-            Unlock::Passphrase { pass, kdf } => Zeroizing::new(self.seal(pass, *kdf)?),
+            Unlock::Passphrase { pass, kdf, .. } => Zeroizing::new(self.seal(pass, *kdf)?),
             Unlock::PlaintextOptIn => self.encode_plaintext(),
         };
         let path = dir.join("validator.key");
@@ -671,7 +703,7 @@ impl Keystore {
 
     fn decode_sealed(bytes: &[u8], unlock: &Unlock) -> io::Result<Keystore> {
         let bad = |m: &'static str| io::Error::new(io::ErrorKind::InvalidData, m);
-        let Unlock::Passphrase { pass, .. } = unlock else {
+        let Unlock::Passphrase { pass, allow_expensive_kdf, .. } = unlock else {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "validator.key is sealed and no passphrase is configured: set \
@@ -711,7 +743,10 @@ impl Keystore {
         let sealed = r.bytes().map_err(|_| bad("truncated keystore"))?;
         r.finish().map_err(|_| bad("trailing bytes in keystore"))?;
 
-        let key = kdf.derive(pass, &salt)?;
+        if *allow_expensive_kdf && u64::from(kdf.m_cost).saturating_mul(u64::from(kdf.t_cost)) > KDF_DEFAULT_MAX_WORK_KIB {
+            eprintln!("WARNING: explicit legacy KDF recovery permits expensive derivation from an unauthenticated header; original memory/time/lane caps remain enforced");
+        }
+        let key = kdf.derive_with_legacy_work(pass, &salt, *allow_expensive_kdf)?;
         let cipher = XChaCha20Poly1305::new_from_slice(key.as_ref())
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "AEAD key length"))?;
         let plain = Zeroizing::new(
@@ -1382,6 +1417,24 @@ mod tests {
         assert_eq!(fs::read(&target).unwrap(), b"must remain unchanged");
         assert_eq!(fs::read(dir.join("validator.key")).unwrap(), before);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn audit_combined_kdf_work_is_bounded_before_allocation_and_recovery_stays_finite() {
+        let hostile = KdfParams { m_cost: KDF_MAX_M_COST_KIB, t_cost: KDF_MAX_T_COST, p_cost: 1 };
+        let error = hostile.to_argon2().err().unwrap();
+        assert!(error.to_string().contains("combined KDF work"));
+        assert!(hostile.to_argon2_with_legacy_work(true).is_ok(), "explicit recovery preserves historical bounded costs without executing them in this test");
+        assert!(KdfParams { t_cost: u32::MAX, ..hostile }.to_argon2_with_legacy_work(true).is_err());
+        assert!(KdfParams { m_cost: u32::MAX, ..hostile }.to_argon2_with_legacy_work(true).is_err());
+        assert!(KdfParams::PRODUCTION.to_argon2().is_ok());
+        let key = Keystore { index: 1, pubkey: vec![1], secret: Zeroizing::new(vec![2]), randao_seed: [3; 32] };
+        let mut bytes = key.seal_payload("disposable fixture", KdfParams { m_cost: 8, t_cost: 1, p_cost: 1 }).unwrap();
+        bytes[9..13].copy_from_slice(&hostile.m_cost.to_le_bytes());
+        bytes[13..17].copy_from_slice(&hostile.t_cost.to_le_bytes());
+        let error = Keystore::decode_sealed(&bytes, &Unlock::passphrase("disposable fixture")).err().unwrap();
+        assert!(error.to_string().contains("combined KDF work"), "header must be refused before hash/decryption");
+        assert!(hostile.validate_new_sealing().is_err(), "recovery cannot authorize new expensive files");
     }
 
     #[test]

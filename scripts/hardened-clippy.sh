@@ -248,8 +248,9 @@ ratchet "bloch-pos-node — the bloch-pos binary, LIVE" \
 ratchet "bloch — Genesis-3 consensus/pow/reorg, closed chain" \
   bloch 59 200 0 --manifest-path legacy/genesis3-node/Cargo.toml --lib --no-deps --no-default-features --features node
 
+# 2026-09-17: checked wallet import indices remove three arithmetic findings.
 ratchet "bloch-crypto — tokenomics/emission/sighash" \
-  bloch-crypto 18 77 0 --lib --no-deps --all-features
+  bloch-crypto 18 74 0 --lib --no-deps --all-features
 
 ratchet "bloch-euvm — eUTXO VM, Genesis-3, never wired into Genesis-4" \
   bloch-euvm 0 30 0 --lib --no-deps

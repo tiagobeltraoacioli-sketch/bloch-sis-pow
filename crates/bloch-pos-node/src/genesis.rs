@@ -833,6 +833,27 @@ pub fn load_carryover(
 }
 
 impl Manifest {
+    /// Validate newly assembled operator input before publication. Historical
+    /// decoding and state construction intentionally retain their old meaning.
+    pub fn validate_new_validator_set(&self) -> Result<(), String> {
+        let mut indices = std::collections::BTreeSet::new();
+        let mut public_keys = std::collections::BTreeSet::new();
+        for validator in &self.validators {
+            if !indices.insert(validator.index) {
+                return Err(format!("duplicate genesis validator index {}", validator.index));
+            }
+            if !public_keys.insert(validator.pubkey.as_slice()) {
+                return Err(format!("duplicate genesis validator public key at index {}", validator.index));
+            }
+        }
+        let mut cohort = std::collections::BTreeSet::new();
+        for index in &self.cohort {
+            if !indices.contains(index) { return Err(format!("genesis cohort names unknown validator index {index}")); }
+            if !cohort.insert(*index) { return Err(format!("duplicate genesis cohort index {index}")); }
+        }
+        Ok(())
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         // The magic IS the format: everything after it is byte-identical
@@ -1708,6 +1729,23 @@ mod tests {
             format: ManifestFormat::V1Unbound,
             pre_state_root: std::sync::OnceLock::new(),
         }
+    }
+
+    #[test]
+    fn audit_new_genesis_refuses_aliasing_without_reinterpreting_historical_bytes() {
+        let mut manifest = sample();
+        assert!(manifest.validate_new_validator_set().is_ok());
+        manifest.validators[1].index = manifest.validators[0].index;
+        assert!(manifest.validate_new_validator_set().unwrap_err().contains("duplicate genesis validator index"));
+        assert!(Manifest::decode(&manifest.encode()).is_ok(), "historical decode remains unchanged");
+        manifest = sample();
+        manifest.validators[1].pubkey = manifest.validators[0].pubkey.clone();
+        assert!(manifest.validate_new_validator_set().unwrap_err().contains("duplicate genesis validator public key"));
+        manifest = sample();
+        manifest.cohort = vec![0, 0];
+        assert!(manifest.validate_new_validator_set().unwrap_err().contains("duplicate genesis cohort"));
+        manifest.cohort = vec![99];
+        assert!(manifest.validate_new_validator_set().unwrap_err().contains("unknown validator"));
     }
 
     // ── Carryover fixtures ──────────────────────────────────────────────

@@ -1,11 +1,11 @@
 //! # pq-shield-api — a NON-CUSTODIAL developer HTTP API over `bloch-pq-vault`
 //!
-//! ## THE INVARIANT: the server never handles a private key and never signs.
+//! ## The server constructs and verifies public artifacts; it never signs.
 //!
 //! Every route does **construction + verification only**. It returns UNSIGNED
 //! artifacts — a vault address, a witnessScript, an unsigned transaction, a
 //! BIP-143 sighash, or the anchor commitment bytes — for the client to sign
-//! **locally**. All secret material stays 100% client-side:
+//! **locally**. Clients must keep all secret material client-side:
 //!
 //! - the BTC hot/recovery secp256k1 **private keys** (sign the sighashes),
 //! - the **PQ secret key** (ML-DSA-65 ‖ Falcon-1024 — signs the anchor commitment),
@@ -77,8 +77,8 @@ impl IntoResponse for ApiError {
 }
 
 impl From<JsonRejection> for ApiError {
-    fn from(r: JsonRejection) -> Self {
-        ApiError::bad(format!("invalid JSON body: {r}"))
+    fn from(_r: JsonRejection) -> Self {
+        ApiError::bad("invalid JSON body")
     }
 }
 
@@ -111,7 +111,7 @@ pub fn guard_no_secrets(v: &Value) -> Result<(), ApiError> {
                     return Err(ApiError {
                         status: StatusCode::BAD_REQUEST,
                         message: format!(
-                            "rejected: field `{k}` looks like secret material. This API is \
+                            "rejected: a field name looks like secret material. This API is \
                              NON-CUSTODIAL — never send a private key, seed, or the preimage \
                              r. Send only public keys and the hash H(r). {SIGN_LOCALLY}"
                         ),
@@ -136,12 +136,12 @@ pub fn guard_no_secrets(v: &Value) -> Result<(), ApiError> {
 /// even in fields the typed struct would otherwise ignore.
 fn parse_guarded<T: DeserializeOwned>(bytes: &Bytes) -> Result<T, ApiError> {
     let value: Value =
-        serde_json::from_slice(bytes).map_err(|e| ApiError::bad(format!("invalid JSON: {e}")))?;
+        serde_json::from_slice(bytes).map_err(|_| ApiError::bad("invalid JSON"))?;
     guard_no_secrets(&value)?;
     if let Some(delay) = value.get("csv_delay").and_then(Value::as_u64) {
         if delay < 144 { return Err(ApiError::bad("csv_delay must be at least 144 blocks for the vault construction API")); }
     }
-    serde_json::from_value(value).map_err(|e| ApiError::bad(format!("bad request fields: {e}")))
+    serde_json::from_value(value).map_err(|_| ApiError::bad("invalid or unknown request fields"))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -154,9 +154,7 @@ fn parse_network(s: &str) -> Result<Network, ApiError> {
         "testnet" | "test" => Ok(Network::Testnet),
         "signet" => Ok(Network::Signet),
         "regtest" => Ok(Network::Regtest),
-        other => Err(ApiError::bad(format!(
-            "unknown network `{other}` (use mainnet|testnet|signet|regtest)"
-        ))),
+        _ => Err(ApiError::bad("unknown network (use mainnet|testnet|signet|regtest)")),
     }
 }
 
@@ -165,7 +163,7 @@ fn parse_network(s: &str) -> Result<Network, ApiError> {
 /// only compressed *public* keys.
 fn parse_pubkey(field: &str, hexstr: &str) -> Result<PublicKey, ApiError> {
     let raw = hex::decode(hexstr.trim())
-        .map_err(|e| ApiError::bad(format!("{field}: not hex ({e})")))?;
+        .map_err(|_| ApiError::bad(format!("{field}: not hex")))?;
     if raw.len() == 32 {
         return Err(ApiError::bad(format!(
             "{field}: 32 bytes looks like a PRIVATE key or x-only key. This API is \
@@ -178,12 +176,12 @@ fn parse_pubkey(field: &str, hexstr: &str) -> Result<PublicKey, ApiError> {
             raw.len()
         )));
     }
-    PublicKey::from_slice(&raw).map_err(|e| ApiError::bad(format!("{field}: invalid pubkey ({e})")))
+    PublicKey::from_slice(&raw).map_err(|_| ApiError::bad(format!("{field}: invalid pubkey")))
 }
 
 fn parse_hash32(field: &str, hexstr: &str) -> Result<[u8; 32], ApiError> {
     let raw = hex::decode(hexstr.trim())
-        .map_err(|e| ApiError::bad(format!("{field}: not hex ({e})")))?;
+        .map_err(|_| ApiError::bad(format!("{field}: not hex")))?;
     if raw.len() != 32 {
         return Err(ApiError::bad(format!(
             "{field}: expected 32 bytes (SHA-256 H(r)), got {} bytes",
@@ -196,11 +194,11 @@ fn parse_hash32(field: &str, hexstr: &str) -> Result<[u8; 32], ApiError> {
 }
 
 fn parse_txid(field: &str, s: &str) -> Result<Txid, ApiError> {
-    Txid::from_str(s.trim()).map_err(|e| ApiError::bad(format!("{field}: invalid txid ({e})")))
+    Txid::from_str(s.trim()).map_err(|_| ApiError::bad(format!("{field}: invalid txid")))
 }
 
 fn hexbytes(field: &str, hexstr: &str) -> Result<Vec<u8>, ApiError> {
-    hex::decode(hexstr.trim()).map_err(|e| ApiError::bad(format!("{field}: not hex ({e})")))
+    hex::decode(hexstr.trim()).map_err(|_| ApiError::bad(format!("{field}: not hex")))
 }
 
 fn tx_hex(tx: &bitcoin::Transaction) -> String {
@@ -346,7 +344,7 @@ fn parse_anchor_verify(body: &Bytes) -> Result<AnchorVerifyReq, ApiError> {
         None
     } else {
         Some(serde_json::from_value(Value::Object(map))
-            .map_err(|e| ApiError::bad(format!("bad anchor fields: {e}")))?)
+            .map_err(|_| ApiError::bad("invalid or unknown anchor fields"))?)
     };
     Ok(AnchorVerifyReq { fields, signature, signed_anchor_hex, trusted_pq_pubkey })
 }
@@ -369,7 +367,7 @@ fn parse_target_chain(s: &str) -> Result<TargetChain, ApiError> {
         "bitcoincash" | "bch" => Ok(TargetChain::BitcoinCash),
         "dogecoin" | "doge" => Ok(TargetChain::Dogecoin),
         "ethereuml1" | "eth" => Ok(TargetChain::EthereumL1),
-        other => Err(ApiError::bad(format!("unknown target_chain `{other}`"))),
+        _ => Err(ApiError::bad("unknown target_chain")),
     }
 }
 
@@ -507,7 +505,7 @@ async fn branch_a_tx(body: Bytes) -> Result<Json<Value>, ApiError> {
     let p = req.vault.to_params(network)?;
     let trigger_op = req.trigger_outpoint.to_outpoint("trigger_outpoint")?;
     let dest = vaultlib::validate_destination(req.destination.trim(), network)
-        .map_err(|e| ApiError::bad(format!("destination: {e}")))?;
+        .map_err(|_| ApiError::bad("invalid destination address"))?;
     if req.fee_sat >= req.trigger_amount_sat {
         return Err(ApiError::bad("fee_sat >= trigger_amount_sat would create a dust/zero output"));
     }
@@ -546,7 +544,7 @@ async fn clawback_tx(body: Bytes) -> Result<Json<Value>, ApiError> {
     let p = req.vault.to_params(network)?;
     let trigger_op = req.trigger_outpoint.to_outpoint("trigger_outpoint")?;
     let safe = vaultlib::validate_destination(req.safe_destination.trim(), network)
-        .map_err(|e| ApiError::bad(format!("safe_destination: {e}")))?;
+        .map_err(|_| ApiError::bad("invalid safe_destination address"))?;
     if req.fee_sat >= req.trigger_amount_sat {
         return Err(ApiError::bad("fee_sat >= trigger_amount_sat would create a dust/zero output"));
     }
@@ -654,8 +652,6 @@ async fn anchor_verify(body: Bytes) -> Result<Json<Value>, ApiError> {
                        trusted_pq_pubkey".to_string(),
             Err(e) => format!("{e:?}"),
         },
-        "verified_against_pq_pubkey": trusted_hex,
-        "commitment_bytes_hex": hex::encode(signed.anchor.commitment_bytes()),
         "non_custodial": SIGN_LOCALLY,
     })))
 }
@@ -1064,10 +1060,11 @@ code{background:#f4f4f4;padding:.1rem .3rem;border-radius:3px}
 table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:.4rem;text-align:left}</style>
 </head><body>
 <h1>PQ-Shield API</h1>
-<p class="banner"><strong>SIGN LOCALLY — non-custodial.</strong> This server never handles a
-private key and never signs. Every route returns an <em>unsigned</em> artifact (address,
+<p class="banner"><strong>SIGN LOCALLY — non-custodial.</strong> Never send private keys,
+seeds or recovery preimages. This server never signs. Every route returns an <em>unsigned</em> artifact (address,
 script, sighash, or commitment bytes) for you to sign on your own device. Requests that
-contain a private key, seed, or the preimage <code>r</code> are rejected (HTTP 400).</p>
+use recognized secret field names are rejected (HTTP 400). This check cannot detect
+secrets hidden in allowed values. Policy text is public and appears in commitment bytes.</p>
 <h2>Routes</h2>
 <table>
 <tr><th>Method</th><th>Path</th><th>Returns (all unsigned)</th></tr>
@@ -1096,6 +1093,45 @@ mod audit_edge_regressions {
             "pq_recovery_pubkey":"01", "csv_delay":144})
     }
     fn bytes(value: Value) -> Bytes { Bytes::from(serde_json::to_vec(&value).unwrap()) }
+
+    #[tokio::test]
+    async fn error_responses_do_not_reflect_untrusted_keys_or_values() {
+        const MARKER: &str = "private_seed_accidental_disclosure_marker";
+        let mut unknown = fields();
+        unknown[MARKER] = json!("value");
+        let mut wrong_type = fields();
+        wrong_type["csv_delay"] = json!(MARKER);
+        let mut wrong_chain = fields();
+        wrong_chain["target_chain"] = json!(MARKER);
+        for request in [unknown, wrong_type, wrong_chain] {
+            let request = axum::http::Request::builder().method("POST").uri("/anchor/commitment")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(serde_json::to_vec(&request).unwrap())).unwrap();
+            let response = router().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), 8192).await.unwrap();
+            assert!(!String::from_utf8_lossy(&body).contains(MARKER));
+        }
+        assert!(!parse_network(MARKER).unwrap_err().message.contains(MARKER));
+    }
+
+    #[tokio::test]
+    async fn verification_does_not_echo_free_form_policy_or_trusted_input() {
+        let marker = "accidentally supplied confidential policy";
+        let trusted = hex::encode(b"accidental confidential trusted key input");
+        let mut request = fields();
+        request["policy"] = json!(marker);
+        request["trusted_pq_pubkey"] = json!(trusted);
+        request["signature"] = json!("00");
+        let Json(response) = anchor_verify(bytes(request)).await.unwrap();
+        assert_eq!(response["valid"], false);
+        assert!(response.get("verified_against_pq_pubkey").is_none());
+        assert!(response.get("commitment_bytes_hex").is_none());
+        let encoded = response.to_string();
+        assert!(!encoded.contains(marker));
+        assert!(!encoded.contains(&hex::encode(marker)));
+        assert!(!encoded.contains(&trusted));
+    }
 
     #[test]
     fn anchor_forms_refuse_unknown_fields_and_ambiguous_encodings() {

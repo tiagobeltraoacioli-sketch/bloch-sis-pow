@@ -51,6 +51,7 @@ fn run(args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
     c.env_remove("BLOCH_KEYSTORE_PASSPHRASE")
         .env_remove("BLOCH_KEYSTORE_PASSPHRASE_FILE")
         .env_remove("BLOCH_KEYSTORE_PASSPHRASE_FD")
+        .env_remove("BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF")
         .env_remove("BLOCH_KEYSTORE_ALLOW_PLAINTEXT");
     for (k, v) in env {
         c.env(k, v);
@@ -131,6 +132,14 @@ fn the_binary_reopens_a_sealed_keystore_only_with_the_passphrase() {
     );
     let row = String::from_utf8_lossy(&ok.stdout);
     assert!(row.starts_with("0\t"), "unexpected cohort row: {row:?}");
+    let recovery = run(&["keygen-public", "--dir", dir.to_str().unwrap()],
+        &[("BLOCH_KEYSTORE_PASSPHRASE", PASSPHRASE), ("BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF", "1")]);
+    assert!(recovery.status.success(), "explicit bounded recovery must preserve ordinary decoding");
+    assert_eq!(recovery.stdout, ok.stdout);
+    let invalid = run(&["keygen-public", "--dir", dir.to_str().unwrap()],
+        &[("BLOCH_KEYSTORE_PASSPHRASE", PASSPHRASE), ("BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF", "2")]);
+    assert!(!invalid.status.success());
+    assert!(stderr(&invalid).contains("BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF must be 0 or 1"));
 
     for env in [
         vec![],
@@ -238,7 +247,8 @@ fn inherited_pipe_credentials_seal_and_reopen_without_secret_environment() {
         let mut command = Command::new(BIN);
         command.args(arguments).env_remove("BLOCH_KEYSTORE_PASSPHRASE")
             .env_remove("BLOCH_KEYSTORE_PASSPHRASE_FILE")
-            .env_remove("BLOCH_KEYSTORE_ALLOW_PLAINTEXT")
+            .env_remove("BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF")
+        .env_remove("BLOCH_KEYSTORE_ALLOW_PLAINTEXT")
             .env("BLOCH_KEYSTORE_PASSPHRASE_FD", "0")
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         if conflict { command.env("BLOCH_KEYSTORE_PASSPHRASE", "unused-conflicting-value"); }

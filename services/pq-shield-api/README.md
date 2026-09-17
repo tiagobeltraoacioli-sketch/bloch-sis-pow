@@ -178,8 +178,10 @@ fields + `signature`, or a full `signed_anchor_hex` blob — **plus a required
   "policy":"watchtower-01", "signature":"<hex PQ signature>",
   "trusted_pq_pubkey":"<hex of the PQ pubkey YOU already trust for this vault>" }
 ```
-Returns `{ "valid": true|false, "reason": "...", "verified_against_pq_pubkey": "...",
-"commitment_bytes_hex": "..." }`. Tampering with any committed field fails closed.
+Returns `{ "valid": true|false, "reason": "...", "non_custodial": "..." }`.
+Tampering with any committed field fails closed. Verification no longer echoes
+supplied trusted-key bytes or commitment bytes (BV-20). Obtain signing bytes
+from `/anchor/commitment`, where returning the public policy is necessary.
 
 > **`trusted_pq_pubkey` is not optional, and it is the whole point.** An anchor carries
 > its own `pq_recovery_pubkey`, so checking the signature against *that* is
@@ -320,3 +322,15 @@ outputs remain unchanged for recovery of existing funds. This does not retrofit
 existing vaults: moving funds requires a separately reviewed migration. It also
 does not resolve deposit/branch-A key reuse, keyless watchtower fee bumping,
 anchor revocation, or recovery preimage lifecycle design.
+
+### Response minimization (BV-20, 2026-09-17)
+
+Invalid JSON/schema, secret-shaped field names and unsupported network/chain
+errors do not repeat submitted keys or values. Verification returns its verdict
+without echoing the input key or policy-containing commitment. This changes
+response fields; clients should retain their own public inputs and use the
+commitment endpoint for signing bytes. No request-content secret detector is
+claimed: allowed policy text remains public, is committed exactly as supplied,
+and is necessarily included in the commitment endpoint's bytes. Never send
+secrets in policy text or other allowed fields. These changes cannot erase data
+already disclosed in a request, nor control proxy/access-log configuration.

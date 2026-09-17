@@ -863,6 +863,9 @@ pub use state_cell::SharedHead;
 #[cfg(test)]
 mod replay_bench;
 
+#[cfg(test)]
+mod proposal_revalidation_tests;
+
 mod local_cache;
 mod verification;
 
@@ -3224,6 +3227,34 @@ impl Engine {
     /// it builds a block every other node rejects — so the epoch comes from
     /// the slot this proposer is building for, not from anything ambient.
     fn select_transactions(&self, epoch: u64) -> Vec<PosTransaction> {
+        // Admission is a historical observation, not a reservation of inputs or
+        // fees. Recheck against this proposal's parent and fee epoch before a
+        // stale high-tip transaction can consume candidate capacity (EN-06).
+        // Do not evict/bar failures here: fees and fork-local UTXOs can change
+        // again, making the exact same signed transaction eligible later.
+        let mut funded_context = None;
+        let candidates = self.mempool.iter().filter(|(encoded, tx)| {
+            if admission::check_transfer(&self.state, tx, encoded.len(), epoch).is_err() {
+                return false;
+            }
+            if matches!(tx, PosTransaction::FundedDeposit(_)) {
+                if !bloch_pos_committee::params::epoch_gate_active(epoch,
+                    bloch_pos_committee::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH) {
+                    return false;
+                }
+                let (rolled, total) = funded_context.get_or_insert_with(|| {
+                    let rolled = self.rolled_to(epoch);
+                    let total = rolled.active_validators().iter().fold(0u128, |sum, v| sum.saturating_add(u128::from(v.effective_stake)));
+                    (rolled, total)
+                });
+                return rolled.validate_lifecycle_transaction(tx, *total, self.state.next_base_fee_at(epoch), &ProbeVerifier).is_ok();
+            }
+            true
+        }).collect();
+        Self::pack_transactions(epoch, candidates)
+    }
+
+    fn pack_transactions(epoch: u64, mut ordered: Vec<(&Vec<u8>, &PosTransaction)>) -> Vec<PosTransaction> {
         let cap = bloch_pos_committee::fee_market::max_block_tx_bytes(epoch);
         let mut out = Vec::new();
         let mut bytes = 0u64;
@@ -3238,7 +3269,7 @@ impl Engine {
         // matter) is exactly where two proposers can disagree for free
         // without it costing security: candidates tied on fee are
         // interchangeable by construction.
-        let mut ordered: Vec<(&Vec<u8>, &PosTransaction)> = self.mempool.iter().collect();
+        let mut reserved = BTreeSet::new();
         ordered.sort_by(|(ka, ta), (kb, tb)| {
             tx_tip_rate(tb).cmp(&tx_tip_rate(ta)).then_with(|| ka.cmp(kb))
         });
@@ -3272,6 +3303,11 @@ impl Engine {
             if bytes.saturating_add(n) > cap {
                 continue;
             }
+            let points = Self::spent_outpoints(tx).unwrap_or_default();
+            if points.iter().any(|point| reserved.contains(point)) {
+                continue;
+            }
+            reserved.extend(points);
             bytes = bytes.saturating_add(n); // checked against `cap` just above
             out.push(tx.clone());
         }
@@ -7544,7 +7580,9 @@ mod transfer_v2_end_to_end {
         }
         assert_eq!(node.mempool.len(), 11, "fixture: all eleven must be distinct");
 
-        let selected = node.select_transactions(epoch);
+        // Exercise the byte packer independently of eligibility; these
+        // synthetic transactions intentionally have no committed inputs.
+        let selected = Engine::pack_transactions(epoch, node.mempool.iter().collect());
         assert!(!selected.is_empty(), "an empty selection would prove nothing");
         // The property the transition enforces at step 10b: the sum of the
         // sizes consensus counts must fit the cap. `max` mirrors the packer:

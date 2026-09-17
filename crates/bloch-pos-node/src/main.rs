@@ -285,7 +285,7 @@ fn print_help() {
                it in a block.\n\
            bloch-pos ws-checkpoint --genesis <manifest> --rpc <a>[,<b>...]\n\
                                    --epoch <E> --signer-set-id <n>\n\
-                                   --out <prefix>\n\
+                                   --out <prefix> [--publication-dir <0700 registry>]\n\
                Derive the weak-subjectivity checkpoint for a FINALIZED\n\
                epoch from running nodes (all --rpc endpoints must agree),\n\
                writing <prefix>.bin (154 canonical bytes) + <prefix>.json\n\
@@ -1084,6 +1084,10 @@ fn genesis_mainnet(args: &[String]) {
     };
 
     // The check that makes this a claim rather than an assertion.
+    if let Err(e) = manifest.validate_new_validator_set() {
+        eprintln!("genesis-mainnet: {e}");
+        exit(1);
+    }
     if let Err(e) = manifest.check_supply() {
         eprintln!("genesis-mainnet: {e}");
         exit(1);
@@ -1186,6 +1190,10 @@ fn genesis_cmd(args: &[String]) {
         format: manifest_format(args),
         pre_state_root: std::sync::OnceLock::new(),
     };
+    if let Err(e) = manifest.validate_new_validator_set() {
+        eprintln!("genesis: {e}");
+        exit(1);
+    }
     if let Err(e) = manifest.check_supply() {
         eprintln!("genesis: {e}");
         exit(1);

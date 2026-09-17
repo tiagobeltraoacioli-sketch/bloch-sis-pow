@@ -575,6 +575,82 @@ fn publication_bytes(
     Ok((existing, true))
 }
 
+/// An optional, operator-owned publication registry coordinates all output
+/// prefixes sharing this directory. Atomic hard-link installation exposes only
+/// fsynced complete artifacts and never replaces a competing epoch record.
+fn coordinate_publication(
+    directory: &Path,
+    checkpoint: WeakSubjectivityCheckpoint,
+    explicit_issued_at: bool,
+) -> Result<WeakSubjectivityCheckpoint, String> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)] {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(format!("publication directory: {error}")),
+    }
+    let metadata = fs::symlink_metadata(directory).map_err(|error| error.to_string())?;
+    if !metadata.is_dir() { return Err("publication directory must be a real directory, not a symlink".into()); }
+    #[cfg(unix)] {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid only reads the process identity.
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            return Err("publication directory must be owned by this user and mode 0700".into());
+        }
+    }
+    // A concurrent caller may observe a newly created directory before its
+    // creator fsyncs the parent. Every successful publisher ensures durability.
+    let parent = directory.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    crate::store::fsync_dir(parent).map_err(|error| error.to_string())?;
+    let name = format!("{}-{}-{}.bin", checkpoint.network_id, hex32(&checkpoint.genesis_root), checkpoint.epoch);
+    let destination = directory.join(name);
+    let path = destination.to_str().ok_or("publication directory path must be UTF-8")?;
+    let (existing, found) = publication_bytes(path, checkpoint, explicit_issued_at)?;
+    if found {
+        crate::store::fsync_dir(directory).map_err(|error| error.to_string())?;
+        return Ok(existing);
+    }
+    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temporary = directory.join(format!(".publication-{}-{serial}.tmp", std::process::id()));
+    let mut created = false;
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)] {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary).map_err(|error| format!("publication staging file: {error}"))?;
+        created = true;
+        file.write_all(&checkpoint.canonical_serialize()).map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        match fs::hard_link(&temporary, &destination) {
+            Ok(()) => {
+                crate::store::fsync_dir(directory).map_err(|error| error.to_string())?;
+                Ok(checkpoint)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Another process won. Compare its complete canonical artifact,
+                // including issuance time when the caller explicitly fixed it.
+                let (winner, found) = publication_bytes(path, checkpoint, explicit_issued_at)?;
+                if !found { return Err("publication record disappeared during concurrent creation; investigate".into()); }
+                crate::store::fsync_dir(directory).map_err(|error| error.to_string())?;
+                Ok(winner)
+            }
+            Err(error) => Err(format!("atomic publication registration failed: {error}")),
+        }
+    })();
+    // A failed exclusive create may name somebody else's stale file. Unlink
+    // only after this invocation created it; never remove the durable record.
+    if created { let _ = fs::remove_file(&temporary); }
+    result
+}
+
 fn checkpoint(args: &[String]) -> Result<(), String> {
     let manifest_path = req(args, "--genesis")?;
     let rpcs: Vec<String> = req(args, "--rpc")?
@@ -691,7 +767,15 @@ fn checkpoint(args: &[String]) -> Result<(), String> {
     };
     let bin_path = format!("{out}.bin");
     let json_path = format!("{out}.json");
-    let (cp, reused) = publication_bytes(&bin_path, cp, crate::arg_value(args, "--issued-at").is_some())?;
+    let explicit_time = crate::arg_value(args, "--issued-at").is_some();
+    let (cp, reused) = publication_bytes(&bin_path, cp, explicit_time)?;
+    let cp = match crate::arg_value(args, "--publication-dir") {
+        Some(directory) => coordinate_publication(Path::new(&directory), cp, explicit_time || reused)?,
+        None => {
+            println!("WARNING: no --publication-dir configured; other output prefixes are not coordinated against same-epoch re-minting");
+            cp
+        }
+    };
     let bytes = cp.canonical_serialize();
     decode_checkpoint(&bytes).map_err(|e| format!("self-check failed: {e}"))?;
     let digest = cp.ws_digest();
@@ -1447,6 +1531,39 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn audit_publication_registry_coordinates_prefixes_and_concurrent_issuance() {
+        let base = tmp("registry");
+        let registry = Path::new(&base).join("publications");
+        let original = WeakSubjectivityCheckpoint {
+            version: WS_FORMAT_VERSION, network_id: 1, genesis_root: [1; 32], epoch: 64,
+            block_root: [2; 32], state_root: [3; 32], validator_set_root: [0; 32],
+            issued_at: 123, signer_set_id: 3,
+        };
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = [123, 456].into_iter().map(|issued_at| {
+            let registry = registry.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                coordinate_publication(&registry, WeakSubjectivityCheckpoint { issued_at, ..original }, false).unwrap()
+            })
+        }).collect();
+        let artifacts: Vec<_> = threads.into_iter().map(|thread| thread.join().unwrap()).collect();
+        assert_eq!(artifacts[0], artifacts[1], "concurrent prefixes must share one issuance/digest");
+        let canonical = artifacts[0];
+        assert_eq!(coordinate_publication(&registry, original, false).unwrap(), canonical);
+        let changed = WeakSubjectivityCheckpoint { state_root: [7; 32], ..original };
+        assert!(coordinate_publication(&registry, changed, false).is_err());
+        let explicit = WeakSubjectivityCheckpoint { issued_at: 999, ..original };
+        assert!(coordinate_publication(&registry, explicit, true).is_err());
+        assert_eq!(fs::read_dir(&registry).unwrap().count(), 1, "staging files are cleaned");
+        let artifact = fs::read_dir(&registry).unwrap().next().unwrap().unwrap().path();
+        fs::write(&artifact, b"incomplete").unwrap();
+        assert!(coordinate_publication(&registry, original, false).is_err());
+        assert_eq!(fs::read(&artifact).unwrap(), b"incomplete");
     }
 
     #[test]

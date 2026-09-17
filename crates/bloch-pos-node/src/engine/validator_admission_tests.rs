@@ -692,3 +692,20 @@ fn randao_automatic_recommit_rehearsal() {
         assert_eq!(check_registry_identity(&replay, index, &keys.pubkey, keys.randao_seed), RegistryIdentity::RandaoMismatch);
     }
 }
+
+#[test]
+fn proposal_selection_keeps_inactive_funded_candidates_out_without_mutation() {
+    assert!(10 < bloch_pos_committee::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH);
+    let (mut engine, _dir, _funding, _joining, tx) = fixture();
+    for expiry in [100, 101, 102] {
+        let mut candidate = tx.clone();
+        candidate.valid_until_epoch = expiry;
+        let candidate = PosTransaction::FundedDeposit(candidate);
+        engine.mempool.insert(candidate.canonical_bytes(), candidate);
+    }
+    let root = engine.state.state_root();
+    assert!(engine.select_transactions(10).is_empty());
+    assert_eq!(engine.mempool.len(), 3);
+    assert_eq!(engine.state.state_root(), root);
+    assert!(engine.rejected.is_empty());
+}

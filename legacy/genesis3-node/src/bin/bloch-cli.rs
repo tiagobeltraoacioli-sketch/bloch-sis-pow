@@ -673,7 +673,10 @@ fn do_import_founder(hd_wallet_path: &str, founder_path: &str) {
     };
 
     let addr = founder_kp.address.clone();
-    wallet.import_keypair(founder_kp, "founder");
+    if let Err(e) = wallet.try_import_keypair(founder_kp, "founder") {
+        eprintln!("Import failed: {}", e);
+        process::exit(1);
+    }
 
     if let Err(e) = wallet.save(hd_path) {
         eprintln!("Save failed: {}", e);
