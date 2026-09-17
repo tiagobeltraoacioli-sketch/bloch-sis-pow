@@ -127,6 +127,7 @@ pub const COOLDOWN_EPOCHS: u64 = 32;
 
 /// One delegation record, as committed in state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
 pub struct Delegation {
     /// Who bonded the coins.
     pub delegator: u32,

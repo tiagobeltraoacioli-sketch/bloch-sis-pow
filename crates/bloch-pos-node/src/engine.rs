@@ -862,6 +862,8 @@ pub use state_cell::SharedHead;
 #[cfg(test)]
 mod replay_bench;
 
+mod local_cache;
+
 struct Engine {
     manifest: Manifest,
     /// Validator indices below this were registered AT GENESIS and are
@@ -3317,6 +3319,11 @@ impl Engine {
                         eprintln!("FATAL: block log append failed: {e}");
                         std::process::exit(1);
                     }
+                    if (self.chain.len() - 1) % local_cache::INTERVAL == 0 {
+                        if let Err(e) = self.write_local_cache() {
+                            eprintln!("state-cache: write failed; block log remains durable: {e}");
+                        }
+                    }
                     let after = self.state.finality();
                     // The head root is FREE here, and it used to cost a whole
                     // state-root computation.
@@ -3693,6 +3700,9 @@ impl Engine {
             if let Err(e) = self.store.rewrite(&canonical_envs) {
                 eprintln!("FATAL: block log rewrite failed: {e}");
                 std::process::exit(1);
+            }
+            if let Err(e) = self.write_local_cache() {
+                eprintln!("state-cache: post-reorg write failed; restart may require full replay: {e}");
             }
             // Free for the same reason as `apply_canonical`'s: every block
             // in `branch` passed `apply_block`, so the adopted head's header
@@ -4297,9 +4307,8 @@ pub(crate) enum KeystoreIdentity {
 /// **That fix is now made, in [`check_registry_identity`] below, and this
 /// function is no longer authoritative.** It survives as a *fast pre-pass*
 /// only: the registry is not reachable here (the store is not open, the log
-/// is not read, and `CommittedState` has no on-disk form — boot is a full
-/// replay), so the authoritative check cannot run until replay finishes,
-/// which on the live fleet is ~21 minutes of silence. Keeping a cheap
+/// and neither replay nor the local restart cache has reconstructed the
+/// committed registry), so the authoritative check waits for state recovery. Keeping a cheap
 /// manifest look first means a genesis operator who mistyped a seed still
 /// learns it in a second instead of after a replay.
 ///
@@ -4367,9 +4376,9 @@ pub(crate) enum RegistryIdentity {
 ///
 /// # Why this had to move past replay
 ///
-/// `CommittedState` has no serialized form; the node persists its *inputs*
-/// (manifest digest + every block envelope) and rebuilds state by replaying
-/// them. So at the point `run` loads the keystore there is no registry to
+/// The committed registry is reconstructed by full replay or a compatible
+/// local cache plus verified tail replay. At the point `run` loads the
+/// keystore neither recovery path has run, so there is no registry to
 /// consult — no `Store`, no log, no `Engine`. The only registry that exists
 /// before replay is the manifest's, i.e. the height-0 one, which by
 /// construction cannot contain anyone added since height 0. Any gate placed
@@ -4860,20 +4869,31 @@ pub fn run(cfg: Config) -> io::Result<()> {
         manifest,
     };
 
-    // ── Replay: restart returns to the same state, by re-running the same
-    // transition over the same inputs. ──
-    //
-    // Progress is reported while this runs, and that is not a nicety. Replay
-    // re-applies the whole chain, and every block re-derives the state root
-    // over the full committed state — 0.59s per block at Genesis-4's carryover
-    // size, so a 12,200-block chain is hours. Throughout, the RPC does not
-    // answer and the node logs nothing, which makes "still working" and
-    // "wedged" indistinguishable from the outside. That ambiguity cost real
-    // hours of investigation on 2026-08-21: a validator was down and there was
-    // no way to tell whether it was progressing, stuck, or minutes from
-    // finishing. An operator needs a rate and a remainder to decide whether to
-    // wait or intervene, and neither existed.
-    let n_logged = logged.len();
+    // Recovery uses a build-bound cache of this node's own committed state
+    // when available, then verifies the remaining log tail normally. A missing
+    // or incompatible cache retains full replay as the reference path. The
+    // historical 0.59 s/block estimate predates the incremental eUTXO tree and
+    // must not be treated as a restart SLA for this binary.
+    let recovery_started = std::time::Instant::now();
+    let force_replay = std::env::var_os("BLOCH_REPLAY_FROM_GENESIS").is_some();
+    let require_cache = std::env::var_os("BLOCH_REQUIRE_STATE_CACHE").is_some();
+    if force_replay && require_cache {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "--replay-from-genesis conflicts with --require-state-cache"));
+    }
+    let skipped = if force_replay { 0 } else {
+        match engine.restore_local_cache(&logged) {
+            Ok(n) => n,
+            Err(e) if require_cache => return Err(e),
+            Err(e) => { println!("state-cache: unavailable ({e}); replaying from genesis"); 0 }
+        }
+    };
+    let n_logged = logged.len().saturating_sub(skipped);
+    let replay_limit = match std::env::var("BLOCH_MAX_REPLAY_BLOCKS") {
+        Ok(value) => Some(value.parse::<usize>().map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid --max-replay-blocks"))?),
+        Err(_) if require_cache => Some(2 * local_cache::INTERVAL - 1),
+        Err(_) => None,
+    };
+    local_cache::check_replay_budget(n_logged, replay_limit)?;
     if n_logged > 0 {
         println!(
             "replaying {n_logged} blocks from the log — the RPC stays silent until this finishes"
@@ -4881,11 +4901,16 @@ pub fn run(cfg: Config) -> io::Result<()> {
     }
     let replay_started = std::time::Instant::now();
     let mut last_report = replay_started;
-    for (i, env) in logged.into_iter().enumerate() {
+    for (i, env) in logged.into_iter().skip(skipped).enumerate() {
         // `ingest_replay`, not `ingest`: these blocks are this node's own
         // committed log, and must not be judged against a wall clock the log
         // knows nothing about. See `Engine::ingest_replay`.
+        let expected_id = env.block_id();
         engine.ingest_replay(env);
+        if engine.state.head() != expected_id {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                "durable block log failed consensus replay; refusing to serve a partial head"));
+        }
         // Time-based, not every-N-blocks: block cost varies by an order of
         // magnitude with how many transactions a block carries, so a fixed
         // count reports in bursts and then goes quiet exactly when the work is
@@ -4905,6 +4930,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
             last_report = std::time::Instant::now();
         }
     }
+    println!("recovery: mode={} skipped_blocks={skipped} replayed_blocks={n_logged} elapsed_ms={}",
+        if skipped > 0 { "local-cache" } else { "full-replay" }, recovery_started.elapsed().as_millis());
     engine.live = true;
     if n_logged > 0 {
         println!(
@@ -5077,6 +5104,14 @@ pub fn run(cfg: Config) -> io::Result<()> {
             let observation_start = now_ms().saturating_sub(engine.manifest.genesis_time_ms)
                 / engine.manifest.slot_ms.max(1);
             engine.start_doppelganger_observation(observation_start);
+        }
+    }
+
+    // Seed the first cache only after identity and weak-subjectivity checks.
+    // On a cache hit with no tail, the existing durable file already suffices.
+    if skipped == 0 || n_logged > 0 {
+        if let Err(e) = engine.write_local_cache() {
+            eprintln!("state-cache: initial write failed; next restart may require full replay: {e}");
         }
     }
 

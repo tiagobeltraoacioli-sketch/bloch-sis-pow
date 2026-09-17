@@ -99,6 +99,7 @@ pub use crate::header::BlockId;
 
 /// An (epoch, block) pair — the unit justification and finality operate on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
 pub struct Checkpoint {
     pub epoch: u64,
     /// Root of the epoch's first block, as attested.
@@ -167,6 +168,7 @@ pub struct UtxoRef {
 /// record has one fixed-width committed encoding — an `Option` would put a
 /// serialisation choice inside consensus state.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
 pub struct ValidatorRecord {
     pub index: u32,
     /// Suite-tagged hybrid public key, 3,745 B. One key serves identity,

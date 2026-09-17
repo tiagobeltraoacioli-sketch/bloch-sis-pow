@@ -1460,8 +1460,9 @@ fn report_boundary_vote_drop(closing: u64, admitted: usize, tallied: usize) {
 ///
 /// A plain value: `Clone` + `PartialEq`, no interior mutability, no handles.
 /// Everything a consensus rule may read arrives through this struct, and the
-/// struct is only ever produced by [`CommittedState::genesis`] or by the
-/// transition itself — there is no constructor that reads a database.
+/// struct is produced by genesis, transitions, or the feature-gated local
+/// restart-cache codec. That codec restores all fields and checks the root;
+/// it is not an untrusted state-sync or consensus wire decoder.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CommittedState {
     // Immutable genesis-manifest context; deliberately outside historical state-root encoding.
@@ -13212,6 +13213,28 @@ mod tests {
         (t, st, atts)
     }
 
+    #[test]
+    #[cfg(feature = "local-state-cache")]
+    fn local_cache_preserves_live_queues_fees_votes_and_ledger() {
+        let (_, mut state, _) = state_with_live_bookkeeping();
+        let header = BlockHeaderV4 {
+            version: BLOCK_VERSION_V4, parent: [0; 32], state_root: state.compute_root(),
+            body_root: [0; 32], slot: state.slot, proposer_index: 0,
+            randao_reveal: [0; 32], randao_mix: state.randao_mix,
+            justified_root: [0; 32], finalized_root: [0; 32],
+            attestation_root: [0; 32], coherence_root: [0; 32],
+        };
+        state.head = header.id();
+        let bytes = state.encode_local_cache().unwrap();
+        let restored = CommittedState::decode_local_cache(&bytes, &header).unwrap();
+        assert_eq!(state, restored);
+        let mut wrong = header.clone(); wrong.state_root[0] ^= 1;
+        assert!(CommittedState::decode_local_cache(&bytes, &wrong).is_err());
+        let mut trailing = bytes.clone(); trailing.push(0);
+        assert!(CommittedState::decode_local_cache(&trailing, &header).is_err());
+        assert!(CommittedState::decode_local_cache(&bytes[..bytes.len()/2], &header).is_err());
+    }
+
     /// Every consensus-relevant `CommittedState` field moves the root; every
     /// deliberately-uncommitted field does not, and says why. This test is
     /// the inventory from the 2026-08-11 gap closure, executable: if someone
@@ -15969,3 +15992,6 @@ mod epoch_advance_bound {
         assert!(MAX_EPOCH_ADVANCE < 1 << 20, "a ceiling that large is not a ceiling");
     }
 }
+
+#[cfg(feature = "local-state-cache")]
+mod local_cache;

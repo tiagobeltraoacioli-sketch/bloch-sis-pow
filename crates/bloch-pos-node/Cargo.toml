@@ -51,7 +51,7 @@ perf-timing = ["bloch-pos-committee/perf-timing"]
 
 [dependencies]
 # The frozen consensus math (pure, sha3-only).
-bloch-pos-committee = { path = "../bloch-pos-committee" }
+bloch-pos-committee = { path = "../bloch-pos-committee", features = ["local-state-cache"] }
 # The hybrid ML-DSA-65 ‖ Falcon-1024 suite (M2: keys/ + KeyVerifier). Path
 # dependency, one-way; pulls the PQClean FFI tree, which is why this crate's
 # build stopped being instant at M2 — planned in the integration doc §6.

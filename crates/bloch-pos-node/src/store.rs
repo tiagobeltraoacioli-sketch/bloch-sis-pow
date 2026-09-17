@@ -635,7 +635,49 @@ pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
+/// A crash can leave an incomplete final frame. Remove only that frame before
+/// any append; merely ignoring it during replay would bury later valid blocks
+/// behind its unfinished length prefix on every subsequent restart.
+fn repair_log_tail(log: &mut File, dir: &Path) -> io::Result<u64> {
+    let length = log.metadata()?.len();
+    let mut at = 0u64;
+    while at < length {
+        if length - at < 4 { break; }
+        log.seek(SeekFrom::Start(at))?;
+        let mut prefix = [0; 4]; log.read_exact(&mut prefix)?;
+        let size = u32::from_le_bytes(prefix) as u64;
+        if size > crate::codec::MAX_FIELD_LEN as u64 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "oversized block log frame; refusing automatic repair"));
+        }
+        let end = at.checked_add(4).and_then(|n| n.checked_add(size))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "block log length overflow"))?;
+        if end > length { break; }
+        at = end;
+    }
+    if at != length {
+        // An index is not authoritative enough to justify deleting bytes, but
+        // evidence of a later committed frame is enough to STOP automatic
+        // repair. A corrupted earlier length prefix must not discard history.
+        if let Ok(mut idx) = File::open(dir.join("blocks.idx")) {
+            let mut magic = [0u8; 8];
+            if idx.read_exact(&mut magic).is_ok() && &magic == IDX_MAGIC {
+                let count = idx_count(&idx)?;
+                if count > 0 && idx_read(&mut idx, count - 1)?.end() > at {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData,
+                        "incomplete frame overlaps indexed history; refusing automatic log truncation"));
+                }
+            }
+        }
+        eprintln!("store: removing {} incomplete trailing log bytes before append", length - at);
+        log.set_len(at)?;
+        log.sync_all()?;
+    }
+    Ok(at)
+}
+
 impl Store {
+    pub(crate) fn directory(&self) -> &Path { &self.dir }
+
     /// Open (or initialize) a data dir for the network identified by
     /// `genesis_digest`. A dir initialized for any other genesis — or holding
     /// anything that is not a bloch-pos meta — is a **refusal, not a
@@ -674,12 +716,12 @@ impl Store {
             }
             Err(e) => return Err(e),
         }
-        let log = OpenOptions::new()
+        let mut log = OpenOptions::new()
             .create(true)
             .append(true)
             .read(true)
             .open(dir.join("blocks.log"))?;
-        let log_len = log.metadata()?.len();
+        let log_len = repair_log_tail(&mut log, dir)?;
         // The index is rebuilt (or caught up) here, on the same boot that
         // already replays the whole log. A data dir written by a binary that
         // predates the index is therefore indexed the first time this one
@@ -1441,6 +1483,47 @@ mod tests {
         assert_eq!(page, logged[8..], "and the rebuilt index describes the right offsets");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovery_never_truncates_indexed_history_after_length_corruption() {
+        let dir = std::env::temp_dir().join(format!("bloch-length-corrupt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        {
+            let mut store = Store::open(&dir, &[0; 32]).unwrap();
+            store.append(&sample_envelope(1)).unwrap();
+            store.append(&sample_envelope(2)).unwrap();
+        }
+        let path = dir.join("blocks.log");
+        let mut bytes = fs::read(&path).unwrap();
+        let corrupt_length = (bytes.len() + 1) as u32;
+        bytes[..4].copy_from_slice(&corrupt_length.to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+        assert!(Store::open(&dir, &[0; 32]).is_err());
+        assert_eq!(fs::read(path).unwrap(), bytes);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn restart_repairs_torn_tail_before_accepting_new_blocks() {
+        for tail in [vec![4u8, 0], vec![100, 0, 0, 0, 42]] {
+            let dir = std::env::temp_dir().join(format!("bloch-tail-{}-{}", std::process::id(), tail.len()));
+            let _ = fs::remove_dir_all(&dir);
+            {
+                let mut store = Store::open(&dir, &[0; 32]).unwrap();
+                store.append(&sample_envelope(1)).unwrap();
+            }
+            OpenOptions::new().append(true).open(dir.join("blocks.log")).unwrap().write_all(&tail).unwrap();
+            {
+                let mut store = Store::open(&dir, &[0; 32]).unwrap();
+                store.append(&sample_envelope(2)).unwrap();
+                let blocks = store.read_all().unwrap();
+                assert_eq!(blocks.iter().map(|b| b.header.slot).collect::<Vec<_>>(), vec![1, 2]);
+            }
+            let store = Store::open(&dir, &[0; 32]).unwrap();
+            assert_eq!(store.read_all().unwrap().len(), 2);
+            drop(store); fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     fn sample_envelope(slot: u64) -> BlockEnvelope {

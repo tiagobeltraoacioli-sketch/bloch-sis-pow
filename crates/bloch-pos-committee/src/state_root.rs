@@ -1053,6 +1053,7 @@ pub fn verify_inclusion(
 
 /// One unspent eUTXO, as committed in state.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
 pub struct EutxoEntry {
     /// Transaction id (a `block_id`-style SHA3 digest under §5.4 rules).
     pub txid: [u8; 32],
@@ -1561,6 +1562,7 @@ impl PendingFeeRecord {
 /// would be `expected_bits` all over again — an uncommitted retarget input,
 /// the exact shape of the 2026-08-08 consensus split.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
 pub struct EvmCommitment {
     /// keccak-256 MPT root of the EVM account trie (address → nonce, balance,
     /// code hash, storage root) after executing this block's EVM segment.

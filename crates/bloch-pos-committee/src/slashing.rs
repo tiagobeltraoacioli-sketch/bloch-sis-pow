@@ -291,6 +291,7 @@ pub struct SlashingOutcome {
 /// `PartialEq` because this is a component of the transition's committed
 /// state, and committed states are compared whole in the determinism tests.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
 pub struct SlashingState {
     /// Identities of applied evidence. Successful applications only — failed
     /// evidence is not recorded, so a forged submission cannot squat an id

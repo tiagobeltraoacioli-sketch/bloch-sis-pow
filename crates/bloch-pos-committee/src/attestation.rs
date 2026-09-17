@@ -19,6 +19,7 @@ use sha3::{Digest, Sha3_256};
 /// signer had to be in, and whether the vote counts toward weight, finality,
 /// or both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
 pub struct AttestationData {
     /// Slot this attestation is for.
     pub slot: u64,

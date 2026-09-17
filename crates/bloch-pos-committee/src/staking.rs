@@ -565,6 +565,7 @@ pub fn validate_wire_deposit(
 
 /// A validated deposit waiting for activation, as committed in state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
 pub struct QueuedDeposit {
     /// SHA3-256 of the hybrid pubkey — 32 bytes of identity instead of 3,745.
     pub pubkey_hash: [u8; 32],

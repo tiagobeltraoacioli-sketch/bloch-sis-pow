@@ -338,10 +338,11 @@ fn print_help() {
                graylists a whole mesh that shares one proxy address.\n\
          \n\
                          [--stop-at-slot <n>]\n\
+                         [--replay-from-genesis | --require-state-cache] [--max-replay-blocks <n>]\n\
                          [--ws-checkpoint <file>] [--ws-signer-set <file>]\n\
                          [--carryover <snapshot.tsv>]\n\
                Run a validator node. <dir> must hold validator.key; chain\n\
-               data persists in <dir> and is replayed on restart.\n\
+               data persists in <dir>; a compatible local state cache skips its replay prefix.\n\
                --carryover is the Genesis-3 balance snapshot\n\
                (bloch-snapshot-utxo's TSV). Required exactly when the\n\
                manifest carries a carryover commitment, and checked against\n\
@@ -351,7 +352,7 @@ fn print_help() {
                          [--rpc-bind <ip>] [--rpc-port <n>|off]\n\
                          [--metrics-bind <ip>] [--metrics-port <n>]\n\
                Run a validator node. <dir> must hold validator.key; chain\n\
-               data persists in <dir> and is replayed on restart.\n\
+               data persists in <dir>; a compatible local state cache skips its replay prefix.\n\
                \n\
                JSON-RPC 2.0 over HTTP is served on --rpc-bind:--rpc-port,\n\
                default 127.0.0.1:16310 (`--rpc-port off` disables it). It\n\
@@ -1420,6 +1421,18 @@ fn run_cmd(args: &[String]) {
     // on `BLOCH_NO_DOPPELGANGER`.
     if args.iter().any(|a| a == "--no-doppelganger-check") {
         unsafe { std::env::set_var("BLOCH_NO_DOPPELGANGER", "1") };
+    }
+    if let Some(value) = arg_value(args, "--max-replay-blocks") {
+        if value.parse::<usize>().is_err() {
+            eprintln!("run: --max-replay-blocks must be a non-negative integer"); exit(2);
+        }
+        unsafe { std::env::set_var("BLOCH_MAX_REPLAY_BLOCKS", value) };
+    }
+    if args.iter().any(|a| a == "--replay-from-genesis") {
+        unsafe { std::env::set_var("BLOCH_REPLAY_FROM_GENESIS", "1") };
+    }
+    if args.iter().any(|a| a == "--require-state-cache") {
+        unsafe { std::env::set_var("BLOCH_REQUIRE_STATE_CACHE", "1") };
     }
     // The transport is decided by a pure function (`decide_transport`) and
     // then ANNOUNCED. Nothing below re-derives it, and nothing silently drops

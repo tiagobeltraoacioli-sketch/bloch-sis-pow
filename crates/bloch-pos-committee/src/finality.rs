@@ -90,6 +90,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// A checkpoint: the block root chosen at an epoch boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
 pub struct Checkpoint {
     pub epoch: u64,
     pub root: [u8; 32],
@@ -162,6 +163,7 @@ pub enum FinalityError {
 /// Justification/finality state. A pure function of `(genesis, vote history)`:
 /// see the module docs for why this is load-bearing and not a platitude.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
 pub struct FinalityState {
     /// Every justified checkpoint, keyed by epoch. At most one per epoch — the
     /// disjoint-quorums argument in the module docs. Kept whole (not pruned at
@@ -211,32 +213,14 @@ impl FinalityState {
     /// Shipping this alone would leave the defect intact — a fresh ledger
     /// starts diverging again the first time two nodes' zero-sets differ.
     ///
-    /// # Why it is presently identical to [`FinalityState::new`]
+    /// # Relaunch and restart are different operations
     ///
-    /// Because `new` already starts empty, and — verified across the whole
-    /// workspace on 2026-08-24 — **nothing ever reconstructs `leaked` from
-    /// committed state**. `leaked` is *written* into the state root as
-    /// [`crate::state_root::LeakRecord`]s and is never read back; the only
-    /// production constructors are `new` (from `CommittedState::genesis`) and
-    /// [`crate::ws::anchor`], both of which start empty. So a
-    /// relaunch-from-genesis already inherits nothing.
-    ///
-    /// That makes this a *pin*, not a patch, and the pin is the point: it
-    /// gives the relaunch one named call site, and
-    /// `the_relaunch_opens_its_books_with_an_empty_leak_ledger` fails the
-    /// build the day someone adds a restore path and quietly wires it here.
-    ///
-    /// # Known asymmetry, stated rather than fixed (LATENT — no live caller)
-    ///
-    /// Because the ledger is committed but never restored, a node that boots
-    /// from a weak-subjectivity checkpoint holds `leaked = {}` while a node
-    /// that replayed the same history holds the accrued balance. Once
-    /// [`crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH`] binds, those two
-    /// nodes derive **different** consensus rosters from the same chain — the
-    /// §5.5 failure shape exactly. It is latent today only because
-    /// [`crate::ws::anchor`] has no caller in the node. Fixing it means either
-    /// restoring the ledger from the checkpoint or dropping it from the state
-    /// root; both are consensus changes and neither belongs in this relaunch.
+    /// Relaunch opens new genesis books and therefore deliberately starts
+    /// with an empty leak ledger. The feature-gated local restart cache instead
+    /// preserves the complete FinalityState, including `leaked` and the epoch
+    /// cursor. It must never call this constructor to restore an existing chain.
+    /// A bare weak-subjectivity anchor also starts empty and is not sufficient
+    /// state for continuing execution of a historical chain.
     pub fn relaunch(genesis: Checkpoint) -> Self {
         let st = Self::new(genesis);
         debug_assert!(st.leaked.is_empty(), "a relaunch must not inherit a leak balance");
@@ -1618,50 +1602,16 @@ mod tests {
         );
     }
 
-    /// **The ledger is committed but never restored** — stated as a finding,
-    /// not fixed here.
-    ///
-    /// `transition.rs` writes every entry into the state root as a
-    /// `LeakRecord`. Nothing anywhere reads them back into a `FinalityState`:
-    /// the ledger is rebuilt only by replaying history. So a checkpoint-booted
-    /// node and a replaying node hold different ledgers for the same chain,
-    /// and once `LEAKED_ROSTER_ACTIVATION_EPOCH` binds they derive different
-    /// consensus rosters from it — the §5.5 shape again. Latent only because
-    /// `ws::anchor` has no caller in the node.
+    /// A WS trust anchor alone is not a restart-state snapshot. The local
+    /// cache codec preserves this ledger separately; it never calls anchor().
     #[test]
-    fn the_leak_ledger_is_committed_but_never_restored() {
-        let transition = include_str!("transition.rs");
-        assert!(
-            transition.contains(".leaked_stakes()"),
-            "the write side vanished; then this finding is stale and must be re-derived"
-        );
-        // Same stripping as `the_leak_ledger_shrinks_only_under_a_governed_rule`,
-        // and for the same reason: `include_str!` reads THIS test too, so the
-        // needles below would otherwise match their own assertion and report a
-        // restore path that does not exist. That is exactly what happened on
-        // the first recorded run of `scripts/prova-relanca.sh` — the gate went
-        // red against an unchanged tree. A self-matching guard is a false
-        // alarm, and a false alarm gets deleted rather than answered.
-        let finality: String = include_str!("finality.rs")
-            .lines()
-            .filter(|l| {
-                let t = l.trim_start();
-                !t.starts_with("//") && !t.contains("concat!(")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        for needle in [concat!("fn from", "_committed"), concat!("fn with", "_leaked")] {
-            assert!(
-                !finality.contains(needle),
-                "a restore path appeared (`{needle}`). GOOD — but the relaunch must now \
-                 decide what it restores FROM, and `relaunch()` must be re-read before it \
-                 is trusted."
-            );
-        }
-        println!(
-            "FINDING (latent): `leaked` is committed as LeakRecord and never read back; \
-             a ws-checkpoint boot and a replay boot disagree on the ledger by construction"
-        );
+    fn a_bare_ws_anchor_does_not_restore_the_leak_ledger() {
+        let cp = ws_fixture();
+        let mut historical = crate::ws::anchor(&cp);
+        historical.leaked.insert(7, 123);
+        let bare = crate::ws::anchor(&cp);
+        assert!(bare.leaked.is_empty());
+        assert_ne!(bare, historical);
     }
 
     /// Minimal checkpoint fixture; `anchor` reads only `epoch`/`block_root`.
@@ -1996,4 +1946,22 @@ mod tests_hook {
     /// Thread-local; see `params::rehearsal::TlFlag`.
     pub(super) static DISABLE_LEAK_RECOVERY: crate::params::rehearsal::TlFlag =
         crate::params::rehearsal::TlFlag(&DISABLE_LEAK_RECOVERY_TL);
+}
+
+#[cfg(all(test, feature = "local-state-cache"))]
+mod local_cache_tests {
+    use super::*;
+    #[test]
+    fn local_cache_preserves_leak_and_finality_history() {
+        let mut state = FinalityState::new(Checkpoint { epoch: 0, root: [1; 32] });
+        state.leaked.insert(7, 123456);
+        state.justified.insert(10, [2; 32]);
+        state.current_justified = Checkpoint { epoch: 10, root: [2; 32] };
+        state.finalized = Checkpoint { epoch: 9, root: [3; 32] };
+        state.next_epoch = 11;
+        let encoded = bincode::serialize(&state).unwrap();
+        let restored: FinalityState = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(restored, state);
+        assert_eq!(restored.leaked.get(&7), Some(&123456));
+    }
 }

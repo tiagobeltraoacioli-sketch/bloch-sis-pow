@@ -1167,3 +1167,75 @@ fn bench(cfg: BenchCfg) {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// Restart-cache measurement on the same cryptographically valid fixture as
+/// full replay. No production SLA is inferred from this local benchmark.
+#[test]
+#[ignore]
+fn perf_local_cache_recovery() {
+    std::thread::Builder::new().stack_size(512 << 20).spawn(|| {
+        let leaves = env_u64("BLOCH_BENCH_CARRYOVER", 8192) as u32;
+        let blocks = env_u64("BLOCH_BENCH_BLOCKS", 96);
+        let tail = env_u64("BLOCH_CACHE_TAIL", 31) as usize;
+        let dir = std::env::temp_dir().join(format!("bloch-cache-bench-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut generator = Generator::new(&dir.join("keys"), leaves, 100);
+        let mut chain = Vec::new();
+        for slot in 1..=blocks {
+            if let Some(block) = generator.block_at(slot) { chain.push(block); }
+        }
+        assert!(chain.len() > tail);
+        let count = chain.len() - tail;
+        let expected = generator.state.clone();
+        // Fresh OS threads isolate the consensus thread-local memos from
+        // fixture generation and from one another. OS filesystem caches are
+        // not flushed, so this is cold application state, not cold storage.
+        let full_manifest = clone_manifest(&generator.manifest);
+        let full_chain = chain.clone();
+        let full_dir = dir.join("full");
+        let full_expected = expected.clone();
+        let (genesis_ms, full_replay_with_cache_write_ms) = std::thread::Builder::new()
+            .stack_size(512 << 20).spawn(move || {
+                let t = Instant::now();
+                let mut full = boot_engine(full_manifest, &full_dir);
+                let genesis_ms = ms(t.elapsed());
+                let t = Instant::now();
+                for (i, block) in full_chain.iter().enumerate() {
+                    full.ingest_replay(block.clone());
+                    if i + 1 == count {
+                        full.store.rewrite(&full_chain[..count]).unwrap();
+                        full.write_local_cache().unwrap();
+                    }
+                }
+                let replay_ms = ms(t.elapsed());
+                assert_eq!(*full.state, full_expected);
+                full.store.rewrite(&full_chain).unwrap();
+                (genesis_ms, replay_ms)
+            }).unwrap().join().unwrap();
+        let restore_manifest = clone_manifest(&generator.manifest);
+        let restore_dir = dir.join("full");
+        let (cached_boot_genesis_ms, log_read_ms, restore_ms, tail_ms, skipped) =
+            std::thread::Builder::new().stack_size(512 << 20).spawn(move || {
+                let t = Instant::now();
+                let mut restored = boot_engine(restore_manifest, &restore_dir);
+                let genesis_ms = ms(t.elapsed());
+                let t = Instant::now();
+                let logged = restored.store.read_all().unwrap();
+                let log_ms = ms(t.elapsed());
+                let t = Instant::now();
+                let skipped = restored.restore_local_cache(&logged).unwrap();
+                let restore_ms = ms(t.elapsed());
+                assert_eq!(skipped, count);
+                let t = Instant::now();
+                for block in logged.into_iter().skip(skipped) { restored.ingest_replay(block); }
+                let tail_ms = ms(t.elapsed());
+                assert_eq!(*restored.state, expected);
+                (genesis_ms, log_ms, restore_ms, tail_ms, skipped)
+            }).unwrap().join().unwrap();
+        println!("RECOVERY_BENCH application_cache=cold filesystem_cache=uncontrolled cpu={:?} leaves={} blocks={} skipped={} tail={} genesis_ms={:.3} full_replay_including_cache_write_ms={:.3} cached_boot_genesis_ms={:.3} log_read_ms={:.3} restore_ms={:.3} tail_ms={:.3} cached_total_ms={:.3}",
+            cpu(), leaves, chain.len(), skipped, tail, genesis_ms, full_replay_with_cache_write_ms,
+            cached_boot_genesis_ms, log_read_ms, restore_ms, tail_ms,
+            cached_boot_genesis_ms + log_read_ms + restore_ms + tail_ms);
+        std::fs::remove_dir_all(dir).unwrap();
+    }).unwrap().join().unwrap();
+}
