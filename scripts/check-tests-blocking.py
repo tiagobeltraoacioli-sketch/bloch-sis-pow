@@ -36,7 +36,9 @@ inside a gated job is refused, even a plausible-looking one.
 Pure Python 3. No toolchain, no build, no network.
 
 Run: python3 scripts/check-tests-blocking.py
-Exit 0 = both pipelines can still fail on a broken test in a live crate.
+Exit 0 = the supported explicit job/command subset passes these checks.
+This is a structural regression guard, not a proof for arbitrary YAML,
+workflow inheritance, branch protection, or shell execution semantics.
 """
 
 from __future__ import annotations
@@ -44,6 +46,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shlex
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -62,8 +65,6 @@ LIVE_CRATES = (
 )
 
 ESCAPES = (
-    (re.compile(r"^\s*allow_failure:\s*true\b"),      "allow_failure: true"),
-    (re.compile(r"^\s*continue-on-error:\s*true\b"),  "continue-on-error: true"),
     (re.compile(r"(^|[;&|\s])exit\s+0\b"),            "an `exit 0` escape (the silent skip)"),
     (re.compile(r"^\s*when:\s*manual\b"),             "when: manual"),
 )
@@ -104,6 +105,71 @@ def job_blocks(text: str, indent: int) -> dict[str, list[str]]:
     return blocks
 
 
+def command_blocks(body: list[str], job_indent: int) -> list[list[str]]:
+    """Extract only explicit script/run fields in the supported CI shapes.
+
+    Indentation is part of the contract: text in env/variables/name scalars
+    cannot become execution evidence. YAML aliases/merges are not supported.
+    """
+    blocks = []
+    context = None
+    index = 0
+    while index < len(body):
+        line = body[index]
+        spaces = len(line) - len(line.lstrip(" "))
+        stripped = line.strip()
+        if spaces == job_indent + 2:
+            context = stripped if stripped in ("script:", "steps:") else None
+        value = None
+        if job_indent == 0 and context == "script:" and spaces == 4 and stripped.startswith("- "):
+            value = stripped[2:]
+        elif job_indent == 2 and context == "steps:":
+            if spaces == 6 and stripped.startswith("- run:"):
+                value = stripped[len("- run:"):].strip()
+            elif spaces == 8 and stripped.startswith("run:"):
+                value = stripped[len("run:"):].strip()
+        index += 1
+        if value is None:
+            continue
+        if value in ("|", "|-", "|+"):
+            content = []
+            required_indent = 6 if job_indent == 0 else 10
+            while index < len(body):
+                candidate = body[index]
+                if len(candidate) - len(candidate.lstrip(" ")) < required_indent:
+                    break
+                content.append(candidate[required_indent:])
+                index += 1
+            blocks.append(content)
+        elif not value.startswith((">", "*", "&", "[", "{", "'", '"')):
+            blocks.append([value])
+    return blocks
+
+
+def complete_test_tokens(command: str) -> list[str] | None:
+    """Only unfiltered cargo tests in the current workspace prove coverage."""
+    tokens = shlex.split(command, comments=True)
+    at = 2 if len(tokens) > 1 and tokens[1].startswith("+") else 1
+    if len(tokens) <= at or tokens[0] != "cargo" or tokens[at] != "test":
+        return None
+    index = at + 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in ("--locked", "--offline", "--frozen", "--workspace", "--all-targets", "--all-features", "--no-default-features", "--release", "--quiet", "-q", "--verbose", "-v"):
+            index += 1
+        elif token in ("-p", "--package", "--features", "-j", "--jobs"):
+            if index + 1 >= len(tokens) or tokens[index + 1].startswith("-"):
+                return None
+            index += 2
+        elif token.startswith(("--package=", "--features=", "--jobs=")):
+            index += 1
+        else:
+            # Includes positional test names, --lib/--bin/--test selection,
+            # --manifest-path, --exclude, --no-run and test-harness filters.
+            return None
+    return tokens
+
+
 def check_job(path: str, job: str, indent: int, label: str) -> list[str]:
     if not os.path.exists(path):
         return ["%s: MISSING — the pipeline definition itself is gone" % label]
@@ -118,27 +184,70 @@ def check_job(path: str, job: str, indent: int, label: str) -> list[str]:
     problems: list[str] = []
 
     for line in body:
+        waiver = re.match(r"^\s*(?:-\s+)?(allow_failure|continue-on-error):\s*(.*?)\s*(?:#.*)?$", line)
+        if waiver and waiver.group(2).strip("\"'").lower() not in ("false", "no", "0"):
+            problems.append(f"{label}: job `{job}` carries {waiver.group(1)}: true or a nonliteral failure waiver")
         for pattern, name in ESCAPES:
             if pattern.search(line):
                 problems.append(
                     "%s: job `%s` carries %s — it cannot fail the build.\n"
                     "      %s" % (label, job, name, line.strip()))
 
-    test_re = re.compile(r"\bcargo\s+(\+\S+\s+)?test\b")
-    test_lines = [line for line in body if test_re.search(line)]
-    if not test_lines:
-        problems.append(
-            "%s: job `%s` no longer runs `cargo test` — a test gate that runs "
-            "no tests is a claim, not a check." % (label, job))
-    # --workspace counts only on the `cargo test` invocation itself: a
-    # `cargo build --workspace` line must not vouch for the test line.
-    elif not any("--workspace" in line for line in test_lines):
+    # Keep the accepted execution language small. The guard does not pretend
+    # that arbitrary shell/YAML syntax can be proved safe using line matches.
+    for line in body:
+        value = re.sub(r"^\s*-\s+", "", line.strip())
+        if re.match(r"^(?:if|rules|only|except):", value) or value.startswith("<<:"):
+            problems.append(f"{label}: conditional/inherited job execution needs explicit review")
+        if re.match(r"^when:\s*(?!on_success\b|always\b)", value):
+            problems.append(f"{label}: conditional or manual job execution cannot certify coverage")
+    blocks = command_blocks(body, indent)
+    if indent == 0:
+        # GitLab script list items share one shell; a condition/set +e in
+        # an earlier item can change whether a later test gates the job.
+        for block in blocks:
+            for line in block:
+                value = line.strip()
+                if re.match(r"^(?:if|for|while|until|case|function)\b", value) or re.match(r"^set\s+\+e\b", value):
+                    problems.append(f"{label}: conditional execution or disabled failure propagation in test job")
+    test_commands = []
+    for block in blocks:
+        logical = []
+        pending = ""
+        for line in block:
+            value = (pending + " " + line.strip()).strip()
+            if value.endswith("\\"):
+                pending = value[:-1]
+                continue
+            logical.append(re.sub(r"\$\{\{[^}]*\}\}", "PINNED", value))
+            pending = ""
+        candidates = [command for command in logical if re.match(r"^cargo\s+(?:\+\S+\s+)?test\b", command)]
+        if not candidates:
+            continue
+        if pending or any(command not in candidates and command != "set -euo pipefail" for command in logical):
+            problems.append(f"{label}: unsupported shell context around cargo test")
+            continue
+        for command in candidates:
+            if any(operator in command for operator in ("|", ";", "&", "$(", "`", "<", ">")):
+                problems.append(f"{label}: compound/masked cargo test command is not a blocking gate")
+                continue
+            try:
+                tokens = complete_test_tokens(command)
+            except ValueError:
+                problems.append(f"{label}: malformed cargo test command")
+                continue
+            if tokens is not None:
+                test_commands.append(tokens)
+    if not test_commands:
+        problems.append(f"{label}: job `{job}` no longer runs `cargo test` commands that execute tests")
+    elif not any("--workspace" in tokens for tokens in test_commands):
+        tested = set()
+        for tokens in test_commands:
+            tested.update(tokens[i + 1] for i, token in enumerate(tokens[:-1]) if token in ("-p", "--package"))
+            tested.update(token.split("=", 1)[1] for token in tokens if token.startswith("--package="))
         for crate in LIVE_CRATES:
-            if not re.search(r"-p\s+%s\b" % re.escape(crate), joined):
-                problems.append(
-                    "%s: job `%s` does not test live crate `%s` (and does not "
-                    "run --workspace, which would cover it)."
-                    % (label, job, crate))
+            if crate not in tested:
+                problems.append(f"{label}: job `{job}` does not test live crate `{crate}`")
 
     if not any(t.search(line) for line in body for t in TIMEOUTS):
         problems.append(
@@ -167,7 +276,7 @@ def main() -> int:
         print("the written reasons; narrow it only there and here together.")
         return 1
 
-    print("test-posture guard: OK — cargo test gates %d live crates on both pipelines"
+    print("test-posture guard: OK — supported explicit test commands cover %d live crates on both pipelines"
           % len(LIVE_CRATES))
     return 0
 

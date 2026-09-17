@@ -38,6 +38,33 @@ export function unwrapResult(result: unknown, method: string): unknown {
  * the connection and never answers stalled the poll loop indefinitely — no
  * progress, no error, no log. */
 const RPC_TIMEOUT_MS = 10_000;
+export const MAX_RPC_RESPONSE_BYTES = 8 * 1024 * 1024;
+
+/** Bound streamed/decompressed bytes even when Content-Length is absent or false. */
+export async function readBoundedResponse(res: Response, method: string): Promise<string> {
+  const declared = res.headers.get("content-length");
+  if (declared !== null && Number(declared) > MAX_RPC_RESPONSE_BYTES) {
+    await res.body?.cancel();
+    throw new RpcError("RPC response exceeds 8 MiB", method);
+  }
+  const reader = res.body?.getReader();
+  if (!reader) return "";
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      size += chunk.value.byteLength;
+      if (size > MAX_RPC_RESPONSE_BYTES) {
+        await reader.cancel();
+        throw new RpcError("RPC response exceeds 8 MiB", method);
+      }
+      chunks.push(chunk.value);
+    }
+  } finally { reader.releaseLock(); }
+  return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks, size));
+}
 
 export class HttpTransport implements JsonRpcTransport {
   constructor(private readonly url: string, private readonly apiKey?: string) {}
@@ -49,11 +76,13 @@ export class HttpTransport implements JsonRpcTransport {
       headers,
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
       signal: AbortSignal.timeout(RPC_TIMEOUT_MS),
+      redirect: "error",
     });
+    const text = await readBoundedResponse(res, method);
     if (!res.ok) {
       let detail = `${res.status} ${res.statusText}`;
       try {
-        const j = parseJsonExactIntegers(await res.text()) as { error?: { code?: number; message?: string } };
+        const j = parseJsonExactIntegers(text) as { error?: { code?: number; message?: string } };
         if (j.error?.message) detail = j.error.message;
         throw new RpcError(detail, method, j.error?.code);
       } catch (e) {
@@ -64,7 +93,7 @@ export class HttpTransport implements JsonRpcTransport {
     // NOT res.json(): that routes every JSON number through a double, which
     // silently rounds satoshi amounts above 2^53. parseJsonExactIntegers keeps
     // oversized integer literals as their raw digit strings for parseSats.
-    const body = parseJsonExactIntegers(await res.text()) as {
+    const body = parseJsonExactIntegers(text) as {
       result?: unknown;
       error?: { code?: number; message?: string };
     };

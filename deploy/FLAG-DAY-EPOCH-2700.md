@@ -186,8 +186,10 @@ is up:
 ```sh
 # On two independently-operated nodes (never two nodes sharing an operator,
 # a network path, or a keystore — that proves nothing about the network):
-bloch-pos-cli getchaininfo --rpc-bind <node-A-rpc>
-bloch-pos-cli getchaininfo --rpc-bind <node-B-rpc>
+curl --fail --silent --show-error -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"getchaininfo","params":[]}' \
+  http://127.0.0.1:8080/
+# Repeat through the approved access path to the second independent node.
 ```
 
 Confirm, on both:

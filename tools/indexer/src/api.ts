@@ -10,12 +10,30 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { IndexStore } from "./store.js";
 import type { IndexerConfig } from "./config.js";
 import { formatSats, satsToBlochDisplay, bigintReplacer } from "./sats.js";
-import { parseAddress } from "./address.js";
+import { parseAddress, encodeAddress } from "./address.js";
+
+export const MAX_API_RESPONSE_BYTES = 1024 * 1024;
+export const MAX_PAGE_SIZE = 500;
+const DEFAULT_PAGE_SIZE = 100;
 
 function json(res: ServerResponse, status: number, body: unknown): void {
   // bigintReplacer is a backstop: every amount below is already formatted, but
   // a stray bigint would otherwise make JSON.stringify throw at request time.
-  const s = JSON.stringify(body, bigintReplacer);
+  let s: string;
+  try {
+    s = JSON.stringify(body, (key, value: unknown) => {
+      if (typeof value === "string" && value.length > 8192) throw new RangeError("oversized response field");
+      return bigintReplacer(key, value);
+    });
+  } catch (error) {
+    if (!(error instanceof RangeError)) throw error;
+    status = 503;
+    s = JSON.stringify({ error: "response field exceeds byte limit" });
+  }
+  if (Buffer.byteLength(s) > MAX_API_RESPONSE_BYTES) {
+    status = 503;
+    s = JSON.stringify({ error: "response exceeds byte limit; request a smaller page" });
+  }
   res.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(s) });
   res.end(s);
 }
@@ -40,14 +58,14 @@ export function createReadApi(cfg: IndexerConfig, store: IndexStore) {
       }
     }
   });
-  // T-1 fix: a throw from an async event handler elsewhere in the process
-  // would otherwise still crash Node by default; this is not a substitute
-  // for the try/catch above (which is the actual fix for THIS server's
-  // synchronous handlers) but a last-resort backstop so a slip anywhere
-  // degrades to a logged error instead of taking the whole process down.
-  process.on("uncaughtException", (e) => {
-    console.error(`[bloch-indexer] uncaughtException (process kept alive): ${e instanceof Error ? e.stack ?? e.message : String(e)}`);
-  });
+  // Bound HTTP resource lifetimes without process-wide exception handlers.
+  server.headersTimeout = 5_000;
+  server.requestTimeout = 10_000;
+  server.keepAliveTimeout = 2_000;
+  server.maxHeadersCount = 32;
+  server.maxRequestsPerSocket = 100;
+  server.maxConnections = 64;
+  server.setTimeout(10_000, (socket) => socket.destroy());
   return server;
 }
 
@@ -58,6 +76,11 @@ function handleRequest(
   res: ServerResponse,
 ): void {
   {
+    if ((req.url?.length ?? 0) > 2048) { json(res, 414, { error: "request URL too long" }); return; }
+    if (req.headers["transfer-encoding"] || (req.headers["content-length"] && req.headers["content-length"] !== "0")) {
+      res.setHeader("connection", "close");
+      json(res, 400, { error: "read API requests cannot have a body" }); return;
+    }
     const url = new URL(req.url ?? "/", "http://localhost");
     const parts = url.pathname.split("/").filter(Boolean);
 
@@ -98,19 +121,28 @@ function handleRequest(
       return;
     }
 
+    if (!store.indexOk()) {
+      json(res, 503, { error: "index snapshot is unreadable; data is not authoritative" });
+      return;
+    }
+
     // GET /address/:addr/(balance|utxos|history)
     if (parts[0] === "address" && parts[1]) {
-      const addr = decodeURIComponent(parts[1]);
+      let rawAddress: string;
+      try { rawAddress = decodeURIComponent(parts[1]); }
+      catch { json(res, 400, { error: "malformed address encoding" }); return; }
+      const parsedAddress = parseAddress(rawAddress);
       // T-1 fix: validate the path segment BEFORE it ever reaches the
       // store. `parseAddress` already existed (address.ts) and was unused
       // by the API; a malformed value (including "__proto__" and friends)
       // now gets a clean 400 instead of a store lookup at all — the
       // null-prototype maps + Object.hasOwn guards in store.ts are the
       // second, independent layer if this one is ever bypassed.
-      if (parseAddress(addr) === null) {
+      if (parsedAddress === null || parsedAddress.network !== cfg.network) {
         json(res, 400, { error: "malformed address" });
         return;
       }
+      const addr = encodeAddress(parsedAddress.hashHex, parsedAddress.network);
       const sub = parts[2] ?? "balance";
       if (sub === "balance") {
         const bal = store.getBalance(addr);
@@ -118,30 +150,28 @@ function handleRequest(
           address: addr,
           balanceSats: formatSats(bal), // canonical: decimal string
           balanceBloch: satsToBlochDisplay(bal), // display only, lossy
-          utxoCount: store.getUtxosForAddress(addr).length,
+          utxoCount: store.getUtxoCount(addr),
         });
         return;
       }
-      if (sub === "utxos") {
-        json(res, 200, {
-          address: addr,
-          utxos: store.getUtxosForAddress(addr).map(({ key, utxo }) => {
-            const [txid, index] = key.split(":");
-            return { txid, index: Number(index), value: formatSats(utxo.value), height: utxo.height };
-          }),
-        });
-        return;
-      }
-      if (sub === "history") {
-        json(res, 200, {
-          address: addr,
-          history: store.getHistory(addr).map((e) => ({
-            txid: e.txid,
-            height: e.height,
-            direction: e.direction,
-            amountSats: formatSats(e.amountSats),
-          })),
-        });
+      if (sub === "utxos" || sub === "history") {
+        const page = parsePage(url, store, addr, sub, res);
+        if (!page) return;
+        const items = sub === "utxos"
+          ? store.getUtxoPage(addr, page.offset, page.limit + 1).map(({ key, utxo }) => {
+              const [txid, index] = key.split(":");
+              return { txid, index: Number(index), value: formatSats(utxo.value), height: utxo.height };
+            })
+          : store.getHistoryPage(addr, page.offset, page.limit + 1).map((entry) => ({
+              txid: entry.txid, height: entry.height, direction: entry.direction,
+              amountSats: formatSats(entry.amountSats),
+            }));
+        const more = items.length > page.limit;
+        if (more) items.pop();
+        const nextCursor = more ? Buffer.from(JSON.stringify({ version: 1, address: addr,
+          kind: sub, snapshot: store.getSnapshotId(), offset: page.offset + items.length })).toString("base64url") : null;
+        json(res, 200, { address: addr, [sub]: items, limit: page.limit,
+          nextCursor, snapshot: store.getSnapshotId(), indexedTip: store.getTip() });
         return;
       }
     }
@@ -177,4 +207,25 @@ function handleRequest(
 
     json(res, 404, { error: "not found" });
   }
+}
+
+function parsePage(url: URL, store: IndexStore, address: string, kind: string, res: ServerResponse): { limit: number; offset: number } | null {
+  const bad = (message: string, status = 400): null => { json(res, status, { error: message }); return null; };
+  if ([...url.searchParams.keys()].some((key) => !["limit", "cursor"].includes(key))
+      || url.searchParams.getAll("limit").length > 1 || url.searchParams.getAll("cursor").length > 1) {
+    return bad("expected only one limit and cursor");
+  }
+  const rawLimit = url.searchParams.get("limit") ?? String(DEFAULT_PAGE_SIZE);
+  if (!/^[1-9][0-9]{0,2}$/.test(rawLimit) || Number(rawLimit) > MAX_PAGE_SIZE) return bad(`limit must be 1..${MAX_PAGE_SIZE}`);
+  const limit = Number(rawLimit);
+  const rawCursor = url.searchParams.get("cursor");
+  if (rawCursor === null) return { limit, offset: 0 };
+  if (rawCursor.length > 1024 || !/^[A-Za-z0-9_-]+$/.test(rawCursor)) return bad("invalid cursor");
+  let cursor: { version?: unknown; address?: unknown; kind?: unknown; snapshot?: unknown; offset?: unknown };
+  try { cursor = JSON.parse(Buffer.from(rawCursor, "base64url").toString("utf8")); }
+  catch { return bad("invalid cursor"); }
+  if (!cursor || cursor.version !== 1 || cursor.address !== address || cursor.kind !== kind
+      || !Number.isSafeInteger(cursor.offset) || (cursor.offset as number) < 0) return bad("invalid cursor");
+  if (cursor.snapshot !== store.getSnapshotId()) return bad("index changed; restart pagination", 409);
+  return { limit, offset: cursor.offset as number };
 }

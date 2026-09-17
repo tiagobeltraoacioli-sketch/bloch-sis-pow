@@ -46,6 +46,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+from urllib.parse import unquote, urlsplit
+from pathlib import PurePosixPath
 import sys
 
 PANIC_LINTS = {"clippy::unwrap_used", "clippy::expect_used"}
@@ -64,8 +67,33 @@ def _is_rustc_error_code(code: str | None) -> bool:
 _SUMMARY_PREFIXES = ("aborting due to", "could not compile")
 
 
-def score(path: str) -> dict:
+def matches_package(record: dict, package: str) -> bool:
+    identity = record.get("package_id", "")
+    if not isinstance(identity, str):
+        return False
+    # Cargo omits #name@ when the package name equals the source path's
+    # final component: path+file:///.../bloch-pos-node#0.1.0-mainnet.
+    # This is the Cargo package identity, not a diagnostic source-file path.
+    if identity.startswith(package + " "):
+        return True  # historical "name version (source)" form
+    source, separator, fragment = identity.rpartition("#")
+    if not separator:
+        return False
+    if "@" in fragment:
+        return fragment.split("@", 1)[0] == package
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)*", fragment):
+        return False
+    parsed = urlsplit(source)
+    return parsed.scheme in ("path+file", "registry+https", "registry+http") and PurePosixPath(unquote(parsed.path)).name == package
+
+
+
+def score(path: str, package: str) -> dict:
     ran = False
+    success = None
+    target_seen = False
+    foreign_errors = []
+    cargo_errors = []
     findings = []  # (level, code, location, text)
     seen = set()
     parse_errors = 0
@@ -74,6 +102,8 @@ def score(path: str) -> dict:
         for line in fh:
             line = line.strip()
             if not line.startswith("{"):
+                if line.startswith("error:") and not line.startswith("error: could not compile"):
+                    cargo_errors.append(line)
                 continue  # cargo's own chatter on stderr; not a diagnostic
             try:
                 rec = json.loads(line)
@@ -84,11 +114,19 @@ def score(path: str) -> dict:
                 continue
             if rec.get("reason") == "build-finished":
                 ran = True
+                success = rec.get("success")
                 continue
+            if rec.get("reason") == "compiler-artifact" and matches_package(rec, package):
+                target_seen = True
             if rec.get("reason") != "compiler-message":
                 continue
             msg = rec.get("message") or {}
             level = msg.get("level")
+            if not matches_package(rec, package):
+                if level == "error":
+                    foreign_errors.append(msg.get("message", "dependency compilation failed"))
+                continue
+            target_seen = True
             if level not in ("error", "warning"):
                 continue
             text = msg.get("message") or ""
@@ -123,6 +161,10 @@ def score(path: str) -> dict:
     ]
     return {
         "ran": ran,
+        "success": success,
+        "target_seen": target_seen,
+        "foreign_errors": foreign_errors,
+        "cargo_errors": cargo_errors,
         "parse_errors": parse_errors,
         "panics": panics,
         "arith": arith,
@@ -142,7 +184,7 @@ def main() -> int:
     args = ap.parse_args()
 
     try:
-        r = score(args.logfile)
+        r = score(args.logfile, args.pkg)
     except OSError as exc:
         print(f"  DID NOT RUN — cannot read the clippy log: {exc}")
         return 2
@@ -155,6 +197,21 @@ def main() -> int:
     if not r["ran"]:
         print(f"  DID NOT RUN — no build-finished record for `{args.pkg}`.")
         print("  This is a harness failure, not a clean crate.")
+        return 2
+
+    if not r["target_seen"]:
+        print(f"  DID NOT RUN — no diagnostic or artifact for `{args.pkg}`.")
+        return 2
+    if r["parse_errors"] or r["foreign_errors"] or r["cargo_errors"]:
+        print("  BUILD FAILURE — malformed diagnostics or a dependency/Cargo error prevents scoring.")
+        return 2
+    # Deny-level lints intentionally produce a failed build at an accepted
+    # baseline. That is the only unsuccessful-build exception; a failure
+    # without an attributable lint is not a zero-finding measurement.
+    explained_failure = any(f[0] == "error" and (f[1] or "").startswith("clippy::")
+                            for group in ("panics", "arith", "other") for f in r[group])
+    if r["success"] is not True and not (r["success"] is False and explained_failure):
+        print("  BUILD FAILURE — unsuccessful build has no attributable deny-level lint.")
         return 2
 
     if r["broken"]:

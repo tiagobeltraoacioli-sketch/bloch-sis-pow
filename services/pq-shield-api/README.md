@@ -1,10 +1,10 @@
 # PQ-Shield API — a non-custodial developer endpoint for PQ-Shield Bitcoin vaults
 
 > ## ⚠️ SIGN LOCALLY — NON-CUSTODIAL
-> **This server never handles a private key and never signs.** Every route does
+> **This server does not sign and does not require private keys.** Every route does
 > **construction + verification only** and returns an *unsigned* artifact — a vault
 > address, a witnessScript, an unsigned transaction, a BIP-143 sighash, or the anchor
-> commitment bytes — for **you to sign locally**. All secret material stays 100%
+> commitment bytes — for **you to sign locally**. Keep all secret material
 > client-side:
 > - the BTC **hot / recovery secp256k1 private keys** (sign the sighashes),
 > - the **PQ secret key** — ML-DSA-65 ‖ Falcon-1024 (signs the anchor commitment),
@@ -32,8 +32,8 @@ Read the crate's `HONEST LIMITS` and the security audit before shipping value: t
 ```bash
 cd services/pq-shield-api
 cargo run                       # binds 127.0.0.1:8787
-PQ_SHIELD_BIND=0.0.0.0:8787 cargo run   # custom bind
-cargo test                      # 7 endpoint tests (round-trip vs. the crate)
+PQ_SHIELD_BIND=127.0.0.1:8787 cargo run   # loopback only
+cargo test                      # endpoint and audit regression tests
 ```
 
 The service is its **own cargo workspace** — building or running it does **not** touch
@@ -285,3 +285,38 @@ preimage derivation) are **never** called by the service.
   crypto are heavy for `wasm32`; the native binary is the recommended host.
 - **Do not** deploy it onto the founder/chain node — it is a separate, standalone
   service.
+
+
+## Internal audit hardening (2026-09-17)
+
+The binary now refuses non-loopback listeners. Expose it only through a local
+TLS proxy with authentication and per-client rate limits. POST routes require
+`Content-Type: application/json`, reject browser `Sec-Fetch-Site: cross-site`,
+and cap bodies at 128 KiB. The existing concurrency ceiling limits simultaneous
+requests; asynchronous timeouts do not preempt synchronous signature checks.
+
+Construction and verification accept only valid Bitcoin addresses sharing a
+network, and require a CSV delay of at least 144 blocks, including nested vault
+parameters and serialized anchor requests. Non-Bitcoin target-chain construction
+is unsupported. Transaction construction rejects outputs below the default
+Bitcoin dust threshold, amounts above MAX_MONEY, and fees over 10% of the input.
+This fee limit is API policy, not a dynamic fee estimator; clients must still
+prepare and validate an emergency fee strategy before funding a vault.
+
+The two anchor verification request forms are exclusive: either provide typed
+anchor fields and `signature`, or provide `signed_anchor_hex`. Unknown fields
+are rejected in both forms. The field-name guard catches common accidental
+secret submissions; it cannot recognize arbitrary secret bytes in allowed
+strings or undo disclosure after a request reaches the service. Public keys
+and unvault plans are sensitive to the vault threat model even though they are
+not private keys: prefer local construction and never treat a remote API as a
+privacy boundary. Address validation does not establish freshness, ownership,
+or correspondence to a particular on-chain vault script.
+
+For new client-side vault key generation, use the explicitly versioned
+`derive_vault_keys_v3` and persist `VaultKeyDerivation::V3HardenedRoles` in the
+backup. V3 uses `m/1999'/coin'/0'/{0',1'}` and a separate PQ domain. V1 and V2
+outputs remain unchanged for recovery of existing funds. This does not retrofit
+existing vaults: moving funds requires a separately reviewed migration. It also
+does not resolve deposit/branch-A key reuse, keyless watchtower fee bumping,
+anchor revocation, or recovery preimage lifecycle design.

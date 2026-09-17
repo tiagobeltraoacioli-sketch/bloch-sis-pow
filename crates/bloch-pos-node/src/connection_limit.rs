@@ -25,7 +25,7 @@ impl Limits {
         if *count >= maximum {
             return None;
         }
-        *count += 1;
+        *count = count.checked_add(1)?;
         Some(Permit {
             limits: self.clone(),
             ip,

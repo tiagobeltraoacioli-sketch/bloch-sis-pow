@@ -81,6 +81,7 @@ clippy-hardened:
   stage: check
   script:
     - bash scripts/hardened-clippy.selftest.sh
+    - python3 scripts/hardened-clippy-score.test.py
     - rustup component add clippy || true
     - bash scripts/hardened-clippy.sh
 
@@ -100,7 +101,7 @@ consensus-tests:
     # independence of GhostDAG colouring, and V2 emission monotonicity + value
     # conservation. Retained because Genesis-4's opening ledger is the output
     # of these rules.
-    - cargo test -p bloch ghostdag_proptest
+    - cargo test --manifest-path legacy/genesis3-node/Cargo.toml -p bloch ghostdag_proptest
     - cargo test -p bloch-crypto --lib tokenomics
 
 # Miri — UB / provenance / uninit-read check on the pure-Rust consensus + emission
@@ -677,9 +678,9 @@ lean-build:
     # `-p bloch` is required now that the repo root is a virtual manifest:
     # there is no root package for a bare `--lib` to resolve to. The package
     # is the same one, at legacy/genesis3-node/.
-    - cargo build -p bloch --no-default-features --lib
-    - "! cargo tree -p bloch --no-default-features -e no-dev -i rocksdb >/dev/null 2>&1 && echo 'ok: no rocksdb in lean graph'"
-    - "! cargo tree -p bloch --no-default-features -e no-dev -i libp2p  >/dev/null 2>&1 && echo 'ok: no libp2p in lean graph'"
+    - cargo build --manifest-path legacy/genesis3-node/Cargo.toml -p bloch --no-default-features --lib
+    - "! cargo tree --manifest-path legacy/genesis3-node/Cargo.toml -p bloch --no-default-features -e no-dev -i rocksdb >/dev/null 2>&1 && echo 'ok: no rocksdb in lean graph'"
+    - "! cargo tree --manifest-path legacy/genesis3-node/Cargo.toml -p bloch --no-default-features -e no-dev -i libp2p  >/dev/null 2>&1 && echo 'ok: no libp2p in lean graph'"
   allow_failure: true   # informational until verified on the new Linux runner
 
 # Postern Wallet core (separate build root) — golden byte-compat + UniFFI wrapper.
@@ -809,3 +810,11 @@ repro:
 # rather than a gap. Deleting an inert placeholder is not lowering coverage;
 # re-add it, properly wired (no `when: never`), the day the `mainnet` feature
 # and its guard test actually land.
+
+# Both CI providers must gate the native Ustav boundary and kernel tests.
+ustav-native:
+  stage: test
+  timeout: 45m
+  script:
+    - python3 scripts/check-ustav-pq-boundary.py cargo +1.94.1
+    - cargo +1.94.1 test --locked -p bloch-euvm -p bloch-ustav

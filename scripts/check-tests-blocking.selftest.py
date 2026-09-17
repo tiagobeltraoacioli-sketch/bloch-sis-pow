@@ -102,6 +102,23 @@ def sub(text: str, old: str, new: str) -> str:
 
 
 CASES = [
+    Case("conditional test execution is not guaranteed", GOOD_GITLAB.replace(CRATE_ARGS, "    - if false; then\n" + CRATE_ARGS + "    - fi\n"), GOOD_GITHUB, must_fail=True),
+    Case("disabled shell failures are refused", GOOD_GITLAB.replace(CRATE_ARGS, "    - set +e\n" + CRATE_ARGS), GOOD_GITHUB, must_fail=True),
+    Case("background test cannot gate", GOOD_GITLAB.replace(CRATE_ARGS, CRATE_ARGS.rstrip() + " &\n"), GOOD_GITHUB, must_fail=True),
+    Case("equals workspace exclusion is refused", WORKSPACE_GITLAB.replace("cargo test --workspace", "cargo test --workspace --exclude=bloch-pos-node"), GOOD_GITHUB, must_fail=True),
+    Case("literal false does not waive failures", GOOD_GITLAB.replace("  timeout: 60m", "  allow_failure: false\n  timeout: 60m", 1), GOOD_GITHUB, must_fail=False),
+    Case("alternate YAML true still waives failures", GOOD_GITLAB.replace("  timeout: 60m", "  allow_failure: YES\n  timeout: 60m", 1), GOOD_GITHUB, must_fail=True),
+    Case("workspace exclusion is not full coverage", WORKSPACE_GITLAB.replace("cargo test --workspace", "cargo test --workspace --exclude bloch-pos-node"), GOOD_GITHUB, must_fail=True),
+    Case("build mentions cannot supply missing test crates",
+         GOOD_GITLAB.replace(CRATE_ARGS, "    - cargo build " + " ".join("-p " + c for c in ("bloch-pos-committee", "bloch-pos-node", "bloch-crypto", "coherence-core", "bloch-sis-pow", "bloch-pq-vault", "pqcrypto-internals", "genesis4-ceremony")) + "\n    - cargo test -p bloch-pos-node\n"),
+         GOOD_GITHUB, must_fail=True),
+    Case("test failure cannot be swallowed",
+         GOOD_GITLAB.replace("cargo test --locked", "cargo test --locked", 1).replace(CRATE_ARGS, CRATE_ARGS.rstrip() + " || true\n"),
+         GOOD_GITHUB, must_fail=True),
+    Case("no-run is not a test execution", GOOD_GITLAB.replace("cargo test", "cargo test --no-run"), GOOD_GITHUB, must_fail=True),
+    Case("echo is not a test execution", GOOD_GITLAB.replace("- cargo test", "- echo cargo test"), GOOD_GITHUB, must_fail=True),
+    Case("pipe cannot mask test failure", GOOD_GITLAB.replace(CRATE_ARGS, CRATE_ARGS.rstrip() + " | cat\n"), GOOD_GITHUB, must_fail=True),
+
     Case("honest pipelines stay green", GOOD_GITLAB, GOOD_GITHUB, must_fail=False),
 
     Case("--workspace is accepted as a superset of the crate list",
@@ -167,6 +184,23 @@ CASES = [
     Case("both files missing entirely fails closed", None, None,
          must_fail=True, expect="MISSING"),
 ]
+
+
+# Audit wave 2: data fields, filtered harnesses and skipped jobs do not prove
+# execution of the live crates' full test suites.
+for name, command in {
+    "positional filter runs zero matching tests": "cargo test --workspace DOES_NOT_EXIST",
+    "library-only selection omits the node binary": "cargo test --workspace --lib",
+    "one integration target omits other suites": "cargo test --workspace --test recovery_fence",
+    "empty skip filter suppresses every test": 'cargo test --workspace -- --skip ""',
+    "another workspace cannot vouch for live crates": "cargo test --workspace --manifest-path services/pq-shield-api/Cargo.toml",
+}.items():
+    CASES.append(Case(name, GOOD_GITLAB.replace(CRATE_ARGS, "    - " + command + "\n"), GOOD_GITHUB, must_fail=True))
+for when in ("never", "manual"):
+    CASES.append(Case("GitLab rules skip " + when, GOOD_GITLAB.replace("  stage: test", "  stage: test\n  rules:\n    - when: " + when, 1), GOOD_GITHUB, must_fail=True))
+CASES.append(Case("GitLab variables are not commands", "build-and-test:\n  timeout: 1h\n  variables:\n    NOTE: |\n      cargo test --workspace\n  script:\n    - true\n", GOOD_GITHUB, must_fail=True))
+CASES.append(Case("GitHub environment strings are not commands", GOOD_GITLAB, "jobs:\n  cargo-test:\n    timeout-minutes: 1\n    env:\n      NOTE: |\n        cargo test --workspace\n    steps:\n      - run: true\n", must_fail=True))
+CASES.append(Case("here-doc contents are not executed", "build-and-test:\n  timeout: 1h\n  script:\n    - |\n      cat <<'EOF'\n      cargo test --workspace\n      EOF\n", GOOD_GITHUB, must_fail=True))
 
 
 def run(case: Case, tmp: str) -> tuple[int, str]:

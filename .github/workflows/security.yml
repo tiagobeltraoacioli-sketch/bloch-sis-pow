@@ -146,7 +146,9 @@ jobs:
       # findings. Prove the counting half against hand-written logs before it
       # is allowed to judge the tree. Pure bash + python3, no toolchain.
       - name: hardened clippy — self-test
-        run: bash scripts/hardened-clippy.selftest.sh
+        run: |
+          bash scripts/hardened-clippy.selftest.sh
+          python3 scripts/hardened-clippy-score.test.py
       - name: Install C toolchain (rocksdb/blst/PQClean)
         run: sudo apt-get update && sudo apt-get install -y clang cmake
       - name: hardened clippy

@@ -68,6 +68,24 @@ use bloch_pos_committee::ws::{
 
 use crate::codec::{DecodeErr, Reader};
 
+/// A policy refusal requires operator action, not an automatic restart loop.
+/// Keep this separate from ordinary permissions and transient filesystem errors.
+#[derive(Debug)]
+pub struct BootRefused(String);
+
+impl std::fmt::Display for BootRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.0.fmt(f) }
+}
+impl std::error::Error for BootRefused {}
+
+pub fn boot_refused(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, BootRefused(message.into()))
+}
+
+pub fn is_non_retryable(error: &io::Error) -> bool {
+    error.get_ref().is_some_and(|cause| cause.is::<BootRefused>())
+}
+
 // ---------------------------------------------------------------------------
 // The hybrid verifier the envelope check runs under
 // ---------------------------------------------------------------------------
@@ -257,22 +275,15 @@ pub fn decode_signer_set_file(bytes: &[u8]) -> Result<SignerSet, DecodeErr> {
         return Err(DecodeErr("signer set: incoherent quorum shape"));
     }
 
-    // Two refusals that belong HERE and nowhere else.
+    // Refuse malformed arrangements at the file boundary.
     //
-    // This decoder is the only path by which a `SignerSet` reaches production:
-    // `ws::verify_envelope`'s single non-test caller is `boot` below, and the
-    // set it judges always comes from this function reading the operator's
-    // `--ws-signer-set` file. So a rule enforced here covers 100% of what any
-    // node will ever accept, while changing nothing in the frozen committee
-    // crate — no consensus edit, no rollout, and artifacts still verify under
-    // the binary the fleet already runs. (A future release that hard-codes the
-    // §6 arrangements next to its pinned genesis would bypass this decoder;
-    // that release must carry both checks with the keys it bakes in.)
+    // Validate locally for actionable file diagnostics. The committee's
+    // standalone verifier also enforces basic shape and distinct keys, so
+    // callers constructing SignerSet directly cannot bypass these rules.
     //
     // 1. ONE KEY IN TWO SLOTS. The quorum counts distinct signer *indices*,
-    //    never distinct *keys* — `ws::verify_envelope`'s `DuplicateSigner`
-    //    compares indices, and nothing anywhere compares two slots' pubkey
-    //    bytes. An arrangement seating one key twice is therefore a 1-of-n
+    //    so public-key uniqueness is checked separately. Without it, an
+    //    arrangement seating one key twice is a 1-of-n
     //    wearing an m-of-n's clothes: its single holder signs once, lists the
     //    byte-identical signature at both indices, the indices differ, and
     //    every rule passes. Seat the duplicate once `internal` and once
@@ -982,6 +993,15 @@ mod tests {
         WS_PHASE_A_THRESHOLD,
     };
 
+    #[test]
+    fn audit_only_typed_ws_policy_refusals_disable_automatic_restart() {
+        let refusal = boot_refused("fresh checkpoint required");
+        assert!(is_non_retryable(&refusal));
+        assert_eq!(refusal.to_string(), "fresh checkpoint required");
+        assert!(!is_non_retryable(&io::Error::new(io::ErrorKind::PermissionDenied, "file permission denied")));
+        assert!(!is_non_retryable(&io::Error::new(io::ErrorKind::Other, "fresh checkpoint required")));
+    }
+
     const NET: u32 = 0xD3_00_00_01;
     const GEN: [u8; 32] = [0x61; 32];
 
@@ -1383,19 +1403,17 @@ mod tests {
             min_external: WS_PHASE_A_MIN_EXTERNAL,
             adopted_epoch: 0,
         };
-        // ONE holder, ONE signature, listed at two indices: the frozen
-        // verifier ACCEPTS. This is the finding, not a hypothetical.
+        // One holder must not satisfy the quorum by occupying two indices.
         let one = strip(&bloch_crypto::crypto::sign(&sk, &digest).expect("sign"));
         let forged = CheckpointEnvelope {
             checkpoint: cp,
             signatures: vec![(0, one.clone()), (2, one)],
         };
-        ws::verify_envelope(&forged, &bad, NET, &GEN, &WsHybridVerifier).expect(
-            "the quorum counts distinct INDICES, not distinct KEYS — if this now fails, \
-             ws::verify_envelope was hardened and this test should be inverted",
+        assert_eq!(
+            ws::verify_envelope(&forged, &bad, NET, &GEN, &WsHybridVerifier),
+            Err(ws::EnvelopeReject::DuplicateSignerKey { first: 0, second: 2 }),
         );
-        // `matches_policy` does see it — but nothing on the acceptance path
-        // calls `matches_policy`, which is exactly why the decoder must.
+        // File decoding independently rejects the same duplicated key.
         assert!(!bad.matches_policy(
             WS_PHASE_A_THRESHOLD,
             WS_PHASE_A_SIGNERS,

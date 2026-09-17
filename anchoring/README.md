@@ -218,3 +218,20 @@ consensus wire bytes.
 security. Postern Labs is one builder among many and holds no protocol
 privilege. Each builder owns their own legal responsibilities, especially for
 RWA.*
+
+
+## Internal audit transport and decoding hardening (2026-09-17)
+
+The optional HTTP transport uses a 5-second connect deadline, 10-second read
+and write deadlines, and a 15-second overall deadline. Responses are capped at
+1 MiB. API keys require HTTPS, embedded URL credentials are refused, and
+redirects are disabled so credentials cannot follow an endpoint redirect.
+Unauthenticated local HTTP remains supported. JSON-RPC responses must echo the
+numeric request ID and version `2.0`; envelopes mixing a result with an error
+are refused.
+
+The reference carrier decoder now requires zero reserved padding and rejects
+transactions containing multiple valid carrier pairs instead of selecting the
+first. These checks do not provide signer binding or turn this scaffold's
+transaction codec into a supported current-node transaction format. The
+framework remains pre-production and requires separate integration work.

@@ -864,6 +864,7 @@ pub use state_cell::SharedHead;
 mod replay_bench;
 
 mod local_cache;
+mod verification;
 
 struct Engine {
     manifest: Manifest,
@@ -879,6 +880,7 @@ struct Engine {
     tr: Transition<HybridVerifier>,
     tr_probe: Transition<ProbeVerifier>,
     verifier: HybridVerifier,
+    gossip_verifier: verification::GossipVerifier<HybridVerifier>,
     /// The validator this node signs as, or `None` in observer mode.
     ///
     /// An observer follows the chain, applies every block and serves the RPC,
@@ -1694,6 +1696,24 @@ impl Engine {
         (rec.pubkey == keys.pubkey).then_some(keys.index)
     }
 
+    /// Publish participation eligibility, not a scheduled or completed duty.
+    /// Read the current registry on every turn so activation, exit and reorg
+    /// key mappings cannot leave a boot-time value behind. These are the same
+    /// activation/exit bounds used by duty_roster_at; no state is advanced.
+    fn refresh_validator_activity(
+        &self,
+        metrics: &crate::metrics::NodeMetrics,
+        slot: u64,
+        in_boot_grace: bool,
+    ) {
+        let epoch = epoch_of(slot);
+        let eligible = !in_boot_grace && !self.doppelganger_blocks_duties(slot)
+            && self.duty_index(&self.state)
+                .and_then(|index| self.state.validator_record(index))
+                .is_some_and(|record| record.activation_epoch <= epoch && epoch < record.exit_epoch);
+        crate::metrics::NodeMetrics::set(&metrics.validator_active, u64::from(eligible));
+    }
+
     /// Doppelgänger protection (R6 HIGH-8): true if `attest`/`propose` must
     /// refuse to act right now — either a live duplicate of this key was
     /// actually SEEN (permanent, until a restart), or this node is still
@@ -1943,8 +1963,8 @@ impl Engine {
         // a block with fewer transactions is always better than no block.
         //
         // Each refusal drops exactly one transaction and retries, so the loop
-        // is bounded by the selection size and terminates: the empty selection
-        // always computes.
+        // is bounded by the selection size and terminates. If the empty
+        // selection also fails, the fault is not attributable to a transaction.
         let mut txs = self.select_transactions(bloch_pos_committee::epoch_of(slot));
         let (post, tx_bytes) = loop {
             let tx_bytes: Vec<Vec<u8>> = txs.iter().map(PosTransaction::canonical_bytes).collect();
@@ -1959,58 +1979,10 @@ impl Engine {
             {
                 Ok(p) => break (p, tx_bytes),
                 Err(err) => {
-                    // WHICH transaction, when the transition says which.
-                    //
-                    // `TransitionError::Transfer(u32, _)` and `Transaction(u32)`
-                    // both carry "the index into the body list" — the doc on the
-                    // variant says so in those words. Popping the TAIL instead
-                    // was a defect with a cost that compounds: if the offender
-                    // sits early in the selection, the loop discards every good
-                    // transaction behind it one at a time, re-running the whole
-                    // transition each round (O(k^2) for k = MAX_TXS_PER_BLOCK),
-                    // and — since the rejection cache landed on 2026-08-30 —
-                    // BARS each of those innocent transactions for
-                    // REJECTION_TTL_SLOTS. One bad transaction could bar up to
-                    // 255 legitimate ones for ~64 minutes. The cache did not
-                    // create the defect; it turned a wasted slot into an hour
-                    // of censorship, which is why the two are fixed together.
-                    //
-                    // The tail is still the fallback for the errors that name
-                    // no index (`Shielded`, root mismatches): dropping SOMEthing
-                    // and retrying is what keeps the node producing, and that is
-                    // the whole point of this loop.
-                    let bad = match culprit_index(&err, txs.len()) {
-                        Some(i) => txs.remove(i),
-                        None => match txs.pop() {
-                            Some(t) => t,
-                            None => {
-                                // Empty and still refused: the fault is not in
-                                // any transaction, so proposing is genuinely
-                                // impossible.
-                                eprintln!(
-                                    "[slot {slot}] produce refused with no transactions: {err:?}"
-                                );
-                                return;
-                            }
-                        },
-                    };
-                    eprintln!(
-                        "[slot {slot}] dropping a transaction the transition refuses ({err:?}); \
-                         proposing without it"
-                    );
-                    // Out of the mempool too, or the next proposer inherits the
-                    // same halt this loop just avoided.
-                    //
-                    // And barred from returning: removal alone is not enough,
-                    // because the peers that still hold it re-offer it and the
-                    // structural admission check has no way to see what the
-                    // transition just saw. Without the bar the node cleans
-                    // itself and refills — observed on the live chain, mempool
-                    // 0 at slot 47,878 and 21 of the same transactions back
-                    // 383 slots later.
-                    let bad_key = bad.canonical_bytes();
-                    self.mempool.remove(&bad_key);
-                    self.reject_transaction(bad_key, slot);
+                    if !self.drop_failed_proposal_transaction(&mut txs, &err, slot) {
+                        eprintln!("[slot {slot}] produce refused with no transactions: {err:?}");
+                        return;
+                    }
                 }
             }
         };
@@ -2275,13 +2247,29 @@ impl Engine {
             // and it is not this node's job to relay it a second time.
             return (Verdict::Ignore, None);
         }
+        // Parked entries have already traversed admission. Suppress exact
+        // repeats before hashing bodies or verifying hybrid signatures. Compare
+        // signatures too: branch-dependent identities may park an envelope
+        // whose signature is not authentic under the eventual parent state.
+        let same_envelope = |seen: &[u8; 32], held: &BlockEnvelope| {
+            *seen == id && held.proposer_sig == env.proposer_sig
+        };
+        if self.orphans.iter().any(|(seen, held)| same_envelope(seen, held))
+            || self.future_blocks.get(&id).is_some_and(|held| held.proposer_sig == env.proposer_sig)
+        {
+            return (Verdict::Ignore, None);
+        }
         // R3 M-1: already judged and refused by the finality latch. Dropped
         // here, before any signature work, so a peer that keeps re-offering
         // an already-refused branch cannot make this node pay to re-derive
         // the same verdict — this is what turns "sync re-fetches and
         // re-refuses forever" into a bounded, cheap no-op. See
         // `Engine::parked_refused_finality`'s doc.
-        if self.parked_refused_finality.iter().any(|(seen, _)| *seen == id) {
+        if self.parked_refused_finality.iter()
+            .any(|(seen, _)| *seen == id || *seen == env.header.parent)
+        {
+            // A child cannot make a locally finality-conflicting ancestor
+            // adoptable. Do not convert it into a missing-parent sync request.
             return (Verdict::Ignore, None);
         }
         // A cheap early reject before the block reaches the transition, using
@@ -2381,6 +2369,14 @@ impl Engine {
             );
             return (Verdict::Ignore, None);
         }
+        // Every valid transition advances its parent's slot. Enforce the
+        // header-only invariant before admitting a fork-choice edge, even
+        // when that branch is not selected for execution (EN-15).
+        if self.blocks.get(&env.header.parent)
+            .is_some_and(|parent| env.header.slot <= parent.header.slot)
+        {
+            return (Verdict::Reject, None);
+        }
         // The proposer is authenticated BEFORE the block takes a byte of
         // `blocks`, and the three outcomes are deliberately not two.
         //
@@ -2436,7 +2432,7 @@ impl Engine {
         // fork-choice tie, and `advance` — which only ever removes the block
         // it tried to apply — never touches the rest.
         let authenticated = match KeyLookup::pubkey(&*self.state, env.header.proposer_index) {
-            Some(pk) => self.verifier.verify_with_key(
+            Some(pk) => self.gossip_verifier.verify_with_key(
                 pk,
                 &env.header.proposal_signing_root(),
                 &env.proposer_sig,
@@ -2574,6 +2570,29 @@ impl Engine {
         self.orphans_evicted = self
             .orphans_evicted
             .saturating_add(before.saturating_sub(self.orphans.len()) as u64);
+    }
+
+    /// Reduce the current proposal after a probe refusal. Only an indexed
+    /// error identifies a transaction that may be removed and barred globally.
+    /// For block-wide errors, omit the tail for this proposal only (EN-16).
+    fn drop_failed_proposal_transaction(
+        &mut self,
+        txs: &mut Vec<PosTransaction>,
+        err: &TransitionError,
+        slot: u64,
+    ) -> bool {
+        if let Some(index) = culprit_index(err, txs.len()) {
+            let bad = txs.remove(index).canonical_bytes();
+            self.mempool.remove(&bad);
+            self.reject_transaction(bad, slot);
+            eprintln!("[slot {slot}] removing indexed transaction refused by transition: {err:?}");
+            true
+        } else if txs.pop().is_some() {
+            eprintln!("[slot {slot}] narrowing proposal after unattributed refusal: {err:?}");
+            true
+        } else {
+            false
+        }
     }
 
     // ── Transaction-status index (R4 F-11, `gettxstatus`) ───────────────────
@@ -3350,7 +3369,9 @@ impl Engine {
                         eprintln!("FATAL: block log append failed: {e}");
                         std::process::exit(1);
                     }
-                    if (self.chain.len() - 1) % local_cache::INTERVAL == 0 {
+                    if self.chain.len().checked_sub(1)
+                        .and_then(|height| height.checked_rem(local_cache::INTERVAL)) == Some(0)
+                    {
                         if let Err(e) = self.write_local_cache() {
                             eprintln!("state-cache: write failed; block log remains durable: {e}");
                         }
@@ -3589,6 +3610,19 @@ impl Engine {
             }
             self.parked_refused_finality.push_back((id, env.clone()));
         }
+        // Entries may have arrived before the parent was refused. Remove the
+        // entire bounded pending subtree, including reverse arrival order.
+        // Retain unrelated gaps; they still need normal synchronization.
+        let mut refused: BTreeSet<[u8; 32]> = branch.iter()
+            .map(|env| *env.block_id().as_bytes()).collect();
+        loop {
+            let Some(index) = self.orphans.iter()
+                .position(|(_, env)| refused.contains(&env.header.parent)) else { break };
+            let Some((id, _)) = self.orphans.remove(index) else { break };
+            refused.insert(id);
+            self.orphans_evicted = self.orphans_evicted.saturating_add(1);
+        }
+
     }
 
     /// Adopt `branch`, attached at canonical `ancestor`. True if adopted;
@@ -3801,6 +3835,11 @@ impl Engine {
     /// One pass of the pure pipeline: window → checkpoint sanity → dedup and
     /// equivocation cap → committee membership → blocks known → signature.
     fn judge(&self, pool: &mut AttestationPool, att: Attestation, epoch: u64) -> GossipDecision {
+        // A forward projection cannot reconstruct a historical roster. Never
+        // silently judge an older duty against the current registry.
+        if epoch < epoch_of(self.state.slot()) {
+            return GossipDecision::Ignore(bloch_pos_committee::gossip::IgnoreReason::Unjudgeable);
+        }
         let rolled = self.rolled_to(epoch);
         let roster = rolled.active_validators();
         // THE SEED COMES FROM THE ATTESTATION'S BRANCH, not from this node's
@@ -3866,7 +3905,7 @@ impl Engine {
         // therefore `committees_at`. Membership and key must come from one
         // snapshot; the old code took membership from here and the key from a
         // boot-time genesis table, which is the inconsistency being removed.
-        pool.process(att, self.wall_slot, &committees_at, &known, &self.verifier, &*rolled)
+        pool.process(att, self.wall_slot, &committees_at, &known, &self.gossip_verifier, &*rolled)
     }
 
     fn apply_decision(&mut self, att: Attestation, decision: GossipDecision, origin: &Origin) {
@@ -3908,46 +3947,17 @@ impl Engine {
             return;
         }
         let mut pool = std::mem::take(&mut self.att_pool);
-        let released = {
-            let rolled_epoch = epoch_of(self.wall_slot);
-            let rolled = self.rolled_to(rolled_epoch);
-            let roster = rolled.active_validators();
-            // Anchored to the BLOCK THAT JUST ARRIVED, not to this node's
-            // head. Everything released by this call was parked waiting for
-            // `root`, so `root` is on the released attestation's own branch
-            // (it is either its head or its target, and the target is an
-            // ancestor of the head), and the boundary mix read off `root`'s
-            // ancestry is the one that branch's transition will use. Judging
-            // the release against this node's head is the same defect the
-            // ingest path was fixed for on 2026-08-24, left standing on the
-            // path that decides whether a parked vote is ever counted.
-            //
-            // KNOWN GAP, deliberately not papered over: `on_block` re-runs the
-            // whole pipeline through ONE `CommitteeLookup` closure that sees
-            // only a slot, so a single seed serves every attestation released
-            // in this batch. That is right whenever they are on one branch,
-            // which is the case that actually occurs (they were all waiting on
-            // the same root); it is wrong if a future caller batches roots.
-            // Fixing it properly means letting the lookup see the attestation,
-            // which is a `gossip.rs` signature change.
-            let seed = self
-                .seed_for_attestation(&root, rolled_epoch)
-                .unwrap_or_else(|| Self::seed_for(&rolled, rolled_epoch));
-            let committees_at = |slot: u64| committees::committee_for_slot(&seed, slot, &roster);
-            let known = |r: &[u8; 32]| self.canonical.contains(r) || self.blocks.contains_key(r);
-            pool.on_block(
-                &root,
-                self.wall_slot,
-                &committees_at,
-                &known,
-                &self.verifier,
-                // Same snapshot `roster` and the seed came from.
-                &*rolled,
-            )
-        };
+        let released: Vec<_> = pool.take_waiting_on(&root).into_iter().map(|att| {
+            let epoch = epoch_of(att.data.slot);
+            let decision = self.judge(&mut pool, att.clone(), epoch);
+            (att, decision)
+        }).collect();
         self.att_pool = pool;
         for (att, decision) in released {
-            if let GossipDecision::Accept { .. } = decision {
+            if let GossipDecision::Accept { slashing_candidate } = decision {
+                if let Some(evidence) = slashing_candidate {
+                    self.report_equivocation((*evidence).into());
+                }
                 self.note_possible_doppelganger(att.validator, att.data.slot);
                 let frame = net::att_frame(&att);
                 self.pool
@@ -4856,6 +4866,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         state: StateCell::new(genesis_state),
         tr: Transition::new(verifier.clone()),
         tr_probe: Transition::new(ProbeVerifier),
+        gossip_verifier: verification::GossipVerifier::new(verifier.clone()),
         verifier,
         keys,
         blocks: BTreeMap::new(),
@@ -5002,7 +5013,6 @@ pub fn run(cfg: Config) -> io::Result<()> {
         };
         match identity {
             RegistryIdentity::Active => {
-                crate::metrics::NodeMetrics::set(&crate::metrics::NODE.validator_active, 1);
                 println!(
                     "validator {} is registered and its key matches the committed \
                      registry at head slot {}",
@@ -5011,7 +5021,6 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 );
             }
             RegistryIdentity::Inactive => {
-                crate::metrics::NodeMetrics::set(&crate::metrics::NODE.validator_active, 0);
                 println!("validator {} has exited; following the chain for withdrawal", registered_index.unwrap_or(keys.index));
             }
             RegistryIdentity::PendingActivation => {
@@ -5128,7 +5137,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 engine.ws_anchor_hard = ws.anchor_is_hard;
                 engine.enforce_ws_anchor();
             }
-            Err(msg) => return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg)),
+            Err(msg) => return Err(crate::ws_boot::boot_refused(msg)),
         }
     }
 
@@ -5311,6 +5320,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         {
             use crate::metrics::{NodeMetrics, NODE};
             let head = engine.state.slot();
+            engine.refresh_validator_activity(&NODE, slot, in_grace);
             NodeMetrics::set(&NODE.heartbeat_unix, crate::metrics::now_unix());
             NodeMetrics::set(&NODE.head_slot, head);
             NodeMetrics::set(&NODE.wall_slot, slot);
@@ -7291,6 +7301,7 @@ mod transfer_v2_end_to_end {
             state: StateCell::new(state),
             tr: Transition::new(verifier.clone()),
             tr_probe: Transition::new(ProbeVerifier),
+            gossip_verifier: verification::GossipVerifier::new(verifier.clone()),
             verifier,
             keys: None,
             blocks: BTreeMap::new(),
@@ -7759,6 +7770,28 @@ mod transfer_v2_end_to_end {
         // Erros que não nomeiam transação nenhuma continuam na cauda.
         assert_eq!(culprit_index(&TransitionError::AttestationRootMismatch, 8), None);
         assert_eq!(culprit_index(&TransitionError::CoherenceRootMismatch, 8), None);
+    }
+
+    #[test]
+    fn audit_unattributed_proposal_errors_do_not_bar_innocent_transactions() {
+        let (entries, tx) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let key = tx.canonical_bytes();
+        node.mempool.insert(key.clone(), tx.clone());
+        let slot = node.wall_slot();
+        for err in [TransitionError::AttestationRootMismatch,
+            TransitionError::BlockGasLimitExceeded, TransitionError::Transaction(99)] {
+            let mut selection = vec![tx.clone()];
+            assert!(node.drop_failed_proposal_transaction(&mut selection, &err, slot));
+            assert!(selection.is_empty());
+            assert!(node.mempool.contains_key(&key));
+            assert!(node.is_rejected(&key, slot).is_none());
+        }
+        let mut selection = vec![tx];
+        assert!(node.drop_failed_proposal_transaction(
+            &mut selection, &TransitionError::Transaction(0), slot));
+        assert!(!node.mempool.contains_key(&key));
+        assert!(node.is_rejected(&key, slot).is_some());
     }
 
     /// **The bar is what makes the drop stick.** Removing a refused
@@ -8346,6 +8379,7 @@ mod perf_support {
             state: StateCell::new(state),
             tr: Transition::new(verifier.clone()),
             tr_probe: Transition::new(ProbeVerifier),
+            gossip_verifier: verification::GossipVerifier::new(verifier.clone()),
             verifier,
             keys: Some(ks),
             blocks: BTreeMap::new(),
@@ -10080,6 +10114,7 @@ mod duty_view_anchor {
             state: StateCell::new(state),
             tr: Transition::new(verifier.clone()),
             tr_probe: Transition::new(ProbeVerifier),
+            gossip_verifier: verification::GossipVerifier::new(verifier.clone()),
             verifier,
             keys: Some(ks0),
             blocks: BTreeMap::new(),
@@ -10344,6 +10379,7 @@ mod slot_horizon {
             state: StateCell::new(state),
             tr: Transition::new(verifier.clone()),
             tr_probe: Transition::new(ProbeVerifier),
+            gossip_verifier: verification::GossipVerifier::new(verifier.clone()),
             verifier,
             keys: None,
             blocks: BTreeMap::new(),
@@ -10718,6 +10754,114 @@ mod ingest_admission_tests {
         }
         assert_eq!(engine.orphans.len(), 1, "dedup by block id");
         assert_eq!(engine.orphans_evicted, 0, "and nothing was pushed out");
+    }
+
+    #[test]
+    fn audit_duplicate_parked_header_stops_before_body_revalidation() {
+        let _clock = validator_lifecycle::clock_at(32);
+        let (mut engine, _dir, template, _) = fixture();
+        let orphan = repointed(&engine, &template, [0x9A; 32], 2);
+        engine.ingest(orphan.clone());
+        let mut duplicate = orphan;
+        // The already parked signed header is sufficient to ignore a repeat;
+        // even an altered body must not make us repeat admission work.
+        duplicate.body.transactions.push(vec![0xFF]);
+        assert!(matches!(engine.ingest_one(duplicate, Source::Gossip).0, Verdict::Ignore));
+        assert_eq!(engine.orphans.len(), 1);
+        assert!(engine.orphans[0].1.body.transactions.is_empty());
+    }
+
+    #[test]
+    fn audit_finality_refusal_discards_pending_descendants_but_keeps_other_gaps() {
+        let (mut engine, _dir, template, _) = fixture();
+        let refused = repointed(&engine, &template, [0xA1; 32], 2);
+        let child = repointed(&engine, &template, *refused.block_id().as_bytes(), 3);
+        let grandchild = repointed(&engine, &template, *child.block_id().as_bytes(), 4);
+        let unrelated = repointed(&engine, &template, [0xB1; 32], 5);
+        for orphan in [grandchild, child.clone(), unrelated.clone()] {
+            engine.park_orphan(*orphan.block_id().as_bytes(), orphan);
+        }
+        engine.refuse_finality_rewind((1, [0xC1; 32]), &[refused]);
+        assert_eq!(engine.orphans.len(), 1);
+        assert_eq!(engine.orphans[0].0, *unrelated.block_id().as_bytes());
+        engine.needs_sync = false;
+        assert!(matches!(engine.ingest_one(child, Source::Gossip).0, Verdict::Ignore));
+        assert!(!engine.needs_sync, "a refused parent is not a missing sync gap");
+    }
+
+    #[test]
+    fn audit_noncanonical_edges_must_advance_the_parent_slot() {
+        let (mut engine, _dir, template, stored) = fixture();
+        let parent = *template.block_id().as_bytes();
+        let non_increasing = repointed(&engine, &template, parent, template.header.slot);
+        assert!(matches!(engine.ingest_one(non_increasing, Source::Gossip).0, Verdict::Reject));
+        assert_eq!(engine.blocks.len(), stored);
+    }
+
+    #[test]
+    fn audit_held_boundary_attestation_uses_its_own_epoch_seed() {
+        let (mut engine, _dir, template, _) = fixture();
+        let validator = engine.manifest.validators[0].clone();
+        engine.manifest.validators = (0..64).map(|index| {
+            let mut record = validator.clone();
+            record.index = index;
+            record
+        }).collect();
+        engine.manifest.pre_state_root = std::sync::OnceLock::new();
+        engine.state.set(engine.manifest.genesis_state());
+        let genesis = engine.manifest.genesis_id();
+        engine.chain = vec![(0, genesis)];
+        engine.canonical = [*genesis.as_bytes()].into_iter().collect();
+        engine.blocks.clear();
+        engine.wall_slot = 63;
+        // Explicit ancestry fixture: epoch 2 sees the slot-40 mix, whereas
+        // the wall epoch (1) sees genesis. This tests gossip context, not
+        // block-transition validity.
+        let mut target = template.clone();
+        target.header.parent = *genesis.as_bytes();
+        target.header.slot = 40;
+        target.header.randao_mix = [0xAD; 32];
+        let target_id = *target.block_id().as_bytes();
+        engine.blocks.insert(target_id, target);
+        let mut head = template;
+        head.header.parent = target_id;
+        head.header.slot = 64;
+        let head_id = *head.block_id().as_bytes();
+        let rolled = engine.rolled_to(2);
+        let roster = rolled.active_validators();
+        let correct = committees::committee_for_slot(&[0xAD; 32], 64, &roster);
+        let wrong = committees::committee_for_slot(&engine.manifest.genesis_mix(), 64, &roster);
+        let validator = *correct.iter().find(|index| !wrong.contains(index))
+            .expect("distinct boundary seeds must exercise different membership");
+        let data = AttestationData {
+            slot: 64, head: head_id, source_epoch: 0,
+            source_root: *genesis.as_bytes(), target_epoch: 2, target_root: target_id,
+        };
+        let att = Attestation { data, validator,
+            signature: engine.keys.as_ref().unwrap().sign(&data.signing_root()) };
+        let mut pool = AttestationPool::new();
+        assert!(matches!(engine.judge(&mut pool, att.clone(), 2), GossipDecision::Hold { .. }));
+        engine.att_pool = pool;
+        engine.blocks.insert(head_id, head);
+        engine.release_held(head_id);
+        assert!(engine.pool.contains_key(&(validator, data.signing_root())));
+        assert_eq!(engine.att_pool.pending_len(), 0);
+    }
+
+    #[test]
+    fn audit_old_epoch_attestations_are_unjudgeable_after_head_advances() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        engine.propose(64);
+        assert_eq!(epoch_of(engine.state.slot()), 2);
+        let data = AttestationData {
+            slot: 32, head: *engine.head_id().as_bytes(), source_epoch: 0,
+            source_root: *engine.chain[0].1.as_bytes(), target_epoch: 1,
+            target_root: *engine.head_id().as_bytes(),
+        };
+        let att = Attestation { data, validator: 0, signature: Vec::new() };
+        let decision = engine.judge(&mut AttestationPool::new(), att, 1);
+        assert!(matches!(decision, GossipDecision::Ignore(
+            bloch_pos_committee::gossip::IgnoreReason::Unjudgeable)));
     }
 
     /// **A forged signature under a key this node HAS registered is refused at
@@ -11699,5 +11843,46 @@ mod branch_gap_repair_tests {
             assert_eq!(node.head_id(), head);
             assert_eq!(node.state.state_root(), root);
         }
+    }
+}
+
+#[cfg(test)]
+mod validator_activity_tests {
+    use super::*;
+
+    #[test]
+    fn audit_validator_activity_tracks_registry_changes_and_signer_halt() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let (other_registry, _other_dir) = perf_support::proposing_engine();
+        let active = engine.state.arc();
+        engine.keys.as_mut().unwrap().index = crate::keys::AUTO_VALIDATOR_INDEX;
+        let metrics = crate::metrics::NodeMetrics::new();
+        let value = || metrics.validator_active.load(Ordering::Relaxed);
+        // A head whose registry does not yet contain this joining key must
+        // report pending. Later matching committed state must enable it
+        // without restarting or replacing the loaded key.
+        engine.state.set_arc(other_registry.state.arc());
+        engine.refresh_validator_activity(&metrics, 32, false);
+        assert_eq!(value(), 0);
+        engine.state.set_arc(active.clone());
+        engine.refresh_validator_activity(&metrics, 32, false);
+        assert_eq!(value(), 1);
+        engine.state.set_arc(other_registry.state.arc());
+        engine.refresh_validator_activity(&metrics, 32, false);
+        assert_eq!(value(), 0, "a changed registry cannot retain boot-time eligibility");
+        engine.state.set_arc(active);
+        engine.refresh_validator_activity(&metrics, 32, true);
+        assert_eq!(value(), 0, "boot grace is a signing gate");
+        engine.start_doppelganger_observation(100);
+        engine.refresh_validator_activity(&metrics, 100, false);
+        assert_eq!(value(), 0);
+        engine.refresh_validator_activity(&metrics, 164, false);
+        assert_eq!(value(), 1, "an observation window expires without restart");
+        engine.start_doppelganger_observation(200);
+        let index = engine.duty_index(&engine.state).unwrap();
+        engine.note_possible_doppelganger(index, 200);
+        assert!(engine.doppelganger_halted);
+        engine.refresh_validator_activity(&metrics, 1000, false);
+        assert_eq!(value(), 0, "a detected duplicate must remain visibly halted");
     }
 }

@@ -2,6 +2,8 @@
 
 Status: **partial remediation, not release approval**. Branch `fix/internal-audit-20260917`, based on `b066e3c` in the isolated `bloch-audit-remediation` worktree. No fleet host, external validator, deployed service, or published binary was changed.
 
+The sections below preserve the first-wave scope and validation (`203b410`). See [second-wave implementation and limits](WAVE-2.md) for subsequent changes and [protocol blockers](PROTOCOL-BLOCKERS.md) for the consensus activation analysis. The finding ledger tracks both waves; a local implementation is not a production security closure.
+
 ## Scope and source reconciliation
 
 Reviewed the six supplied audit artifacts. The audit describes `562e220`; this patch starts from the persisted-recovery release lineage instead. Its lifecycle gates already activate authenticated exits, slashing evidence, withdrawals, funded admission and RANDAO recommit at epoch 2884. The leak-recovery gate is 2880. Those facts invalidate several statements that the corresponding features are universally inert, but do not prove which binary any independent validator runs. Historical replay must retain old epoch rules.
@@ -52,7 +54,7 @@ The first broader run exposed a cold-start fixture expecting only `validator.key
 2. Complete consensus-thread resource isolation and per-peer verification/fairness budgets; bound noncanonical block retention and qualify stale-state signing behavior. Current limits are mitigations, not DDoS immunity.
 3. Separate operator credentials, prove host-loss fencing, prepare independent WS signatures and signed release/rollback artifacts. Source edits cannot establish that remote credentials were rotated or independent signers approved a checkpoint.
 4. Integrate product-owner changes for vault key separation/hardened recovery derivation, watchtower fee strategy, Coherence note authorization and bridge custody before enabling those products. Never reinterpret existing vault addresses by changing V1/V2 derivation in place.
-5. Resolve ledger provenance and legacy exporter issues with reproducible source data. Do not rewrite Genesis-4 balances from an inferred missing subsidy.
+5. Resolve ledger provenance with reproducible source data. The second wave makes the legacy exporter fail on corrupt rows; that does not explain the historical missing subsidy. Do not rewrite Genesis-4 balances from an inferred missing subsidy.
 6. Consolidate EVM, DEX, bridge and aggregator branches, repair inherited CI formatting and run a complete pinned release qualification. Inventory actual binaries on independently operated validators before proposing an activation epoch.
 
 A reviewed upgrade should first run on an isolated chain and observer canary, then on authorized validators with measured restart recovery and rollback checks. This document does not claim a production recovery-time SLA from Mac debug tests.

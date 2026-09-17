@@ -474,23 +474,26 @@ impl AttestationPool {
         verifier: &dyn SignatureVerifier,
         keys: &dyn KeyLookup,
     ) -> Vec<(Attestation, GossipDecision)> {
+        self.take_waiting_on(root).into_iter().map(|att| {
+            let decision = self.process(att.clone(), current_slot, committees, blocks, verifier, keys);
+            (att, decision)
+        }).collect()
+    }
+
+    /// Extract waiters in FIFO order, removing every pending index before
+    /// revalidation. Callers with epoch-dependent context must judge each
+    /// returned attestation separately and must not count it before acceptance.
+    pub fn take_waiting_on(&mut self, root: &[u8; 32]) -> Vec<Attestation> {
         let seqs = match self.pending_by_root.remove(root) {
-            Some(s) => s,
+            Some(seqs) => seqs,
             None => return Vec::new(),
         };
         let mut out = Vec::with_capacity(seqs.len());
         for seq in seqs {
-            // BTreeSet iterates ascending: FIFO replay.
-            let entry = match self.pending.remove(&seq) {
-                Some(e) => e,
-                None => continue, // evicted after indexing; nothing to do
-            };
-            let key = (entry.att.data.slot, entry.att.validator, entry.att.data.signing_root());
-            self.pending_keys.remove(&key);
-            let att = entry.att;
-            let decision =
-                self.process(att.clone(), current_slot, committees, blocks, verifier, keys);
-            out.push((att, decision));
+            if let Some(entry) = self.pending.get(&seq) {
+                out.push(entry.att.clone());
+                self.evict(seq);
+            }
         }
         out
     }
@@ -808,6 +811,33 @@ mod tests {
         let released = pool.on_block(&root(0x22), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
         assert_eq!(released.len(), 1);
         assert!(is_accept(&released[0].1));
+    }
+
+    #[test]
+    fn audit_released_waiters_do_not_leak_per_duty_capacity() {
+        let mut pool = AttestationPool::new();
+        let mut blocks = BTreeSet::new();
+        for head in [0xAA, 0xBB] {
+            assert!(matches!(pool.process(att(1, CURRENT_SLOT, head), CURRENT_SLOT,
+                &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey),
+                GossipDecision::Hold { .. }));
+        }
+        assert_eq!(pool.pending_by_duty.get(&(CURRENT_SLOT, 1)), Some(&2));
+        for head in [0xAA, 0xBB] {
+            blocks.insert(root(head));
+            let released = pool.on_block(&root(head), CURRENT_SLOT, &committees(),
+                &known(&blocks), &RootEchoVerifier, &AnyKey);
+            assert!(matches!(released[0].1, GossipDecision::Hold { .. }));
+            assert_eq!(pool.pending_by_duty.get(&(CURRENT_SLOT, 1)), Some(&2));
+        }
+        blocks.insert(root(0x22));
+        let released = pool.on_block(&root(0x22), CURRENT_SLOT, &committees(),
+            &known(&blocks), &RootEchoVerifier, &AnyKey);
+        assert_eq!(released.len(), 2);
+        assert!(released.iter().all(|(_, decision)| is_accept(decision)));
+        assert!(pool.pending_by_duty.is_empty());
+        assert!(pool.pending_keys.is_empty());
+        assert!(pool.pending_by_root.is_empty());
     }
 
     #[test]

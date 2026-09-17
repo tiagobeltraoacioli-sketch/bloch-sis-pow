@@ -88,6 +88,21 @@ pub struct PqShieldAnchor {
 }
 
 impl PqShieldAnchor {
+    /// Check the Bitcoin addresses against an explicitly selected network.
+    /// This checks syntax/network only: freshness, ownership and correspondence
+    /// to the actual vault script require independent caller verification.
+    /// Signature verification alone intentionally remains format-compatible.
+    pub fn validate_bitcoin_addresses(&self, network: bitcoin::Network) -> Result<(), String> {
+        if self.target_chain != TargetChain::Bitcoin {
+            return Err("Bitcoin address validation requires the Bitcoin target chain".into());
+        }
+        for bytes in [&self.btc_vault_address, &self.designated_safe_dest] {
+            let text = std::str::from_utf8(bytes).map_err(|_| "address is not UTF-8")?;
+            crate::validate_destination(text, network)?;
+        }
+        Ok(())
+    }
+
     /// Deterministic serialization of the **committed fields** (everything the PQ
     /// signature covers). Length-prefixed (`u32` LE) byte fields; scalars LE. A change in
     /// any field changes these bytes and therefore invalidates the signature.

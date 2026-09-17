@@ -70,6 +70,9 @@ export class Indexer {
     for (;;) {
       const block = await this.rpc.getBlockByHeight(nextHeight);
       if (!block) break; // caught up
+      if (block.height !== nextHeight) {
+        throw new Error(`RPC returned height ${block.height} for requested height ${nextHeight}`);
+      }
 
       // Linkage guard: if the node's selected chain shifted mid-apply such that
       // this height is already indexed under a different hash, bail and let the

@@ -387,18 +387,27 @@ serves reads without taking on consensus duties. This is the right mode for an e
 Description=Bloch Genesis-4 node
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=3
 
 [Service]
 Type=simple
 User=bloch
 ExecStart=/usr/local/bin/bloch-pos-quatro run --data-dir /var/lib/bloch/data …
-Restart=always
-RestartSec=5
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=78
 LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+Weak-subjectivity policy refusal exits with status 78 and requires operator
+review of the supplied checkpoint and signer arrangement. The sample supervisor
+does not restart that refusal. Other startup failures are rate-limited; repair
+the cause before resetting a failed unit. This behavior applies to the updated
+binary; older binaries returning only status 1 still rely on the restart limit.
 
 ### Confirm your node agrees with the network
 

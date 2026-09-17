@@ -1,10 +1,11 @@
 # Bloch Reorg-Safe Indexer (reference)
 
 A standalone reference address / UTXO / history indexer for Bloch. It consumes
-blocks via JSON-RPC (`getblockcount`, `getblockhash`, `getblockbyheight`) and —
-the point of this tool — is **reorg-safe**: it tracks the selected-chain tip,
-detects when a reorg replaces blocks, **rolls back** the affected height range,
-and re-applies the new blocks, so address balances and history stay correct.
+blocks via JSON-RPC (`getblockcount`, `getblockhash`, `getblockbyheight`), tracks
+the selected-chain tip, detects replaced blocks, rolls back the affected height
+range and re-applies replacement blocks. Offline tests cover these operations.
+Consistency when RPC responses switch branches during one sync remains an open
+production blocker; this reference is not a qualified live balance authority.
 
 It persists to a simple embedded JSON store and exposes a small read API.
 
@@ -42,8 +43,9 @@ the fix.
 
 ## The reorg-handling approach (explicit)
 
-**Invariant:** the indexer's applied map `chain[height] -> hash` is always a
-**prefix of the node's current selected chain**. Every sync tick enforces it:
+**Target invariant:** the indexer's applied map `chain[height] -> hash` is a
+prefix of the node's selected chain. The following tick logic is tested with a
+consistent RPC view; separate RPC calls do not provide an atomic chain snapshot:
 
 1. **Detect.** If we have an indexed tip at height `Ht` with hash `Hh`, re-fetch
    the node's hash at `Ht` (`getblockhash`). If it differs (or is now missing),
@@ -136,7 +138,7 @@ cd tools/indexer
 npm install
 npm run typecheck    # tsc --noEmit
 npm run build        # tsc -> dist/
-npm test             # alias for selftest
+npm test             # offline selftests and security/regression suite
 npm run selftest     # offline reorg + satoshi-encoding tests (no node)
 
 # Watch reorg handling against the built-in stub chain (no node needed):
@@ -170,3 +172,75 @@ INDEXER_RPC_URL=http://127.0.0.1:16210/ npm start
 
 This is the **community edition**. Do not refer to it as "Postern OS", and never
 use the name "BABA YAGA".
+
+## Internal audit LG-07 hardening (2026-09-17)
+
+Address UTXO and history responses are now **paginated**. This is a client-visible
+change: callers must follow `nextCursor` to obtain all entries. Both endpoints
+accept `?limit=100` (default 100, maximum 500) and an optional opaque `cursor`.
+The existing `utxos`/`history` arrays and decimal-string amounts are preserved;
+responses also contain `nextCursor`, `snapshot`, `limit` and `indexedTip`.
+A null `nextCursor` means the complete result has been read.
+
+Cursors bind the address, endpoint and exact in-memory index revision. A new
+block, rollback or process restart makes an old cursor return HTTP 409; restart
+pagination and discard the incomplete traversal. This prevents a traversal from
+silently mixing revisions, including a reorg returning to the same tip hash.
+It is not a historical snapshot service: a rapidly changing tip may require
+retries. UTXO order is not a transaction-history guarantee. The dense secondary
+index provides O(page-size) page extraction and O(1) balance UTXO counts without
+materializing all UTXOs for a large address.
+
+The API rejects invalid limits/cursors, caps URL length at 2,048 characters,
+refuses request bodies, and bounds connections and HTTP lifetimes. Responses
+are capped at 1 MiB; unusually large individual string fields are refused.
+If a page exceeds the byte cap, HTTP 503 asks the caller to request a smaller
+page. Address spelling is canonicalized and must match the configured network.
+The upstream JSON-RPC client caps streamed response bodies at 8 MiB, including
+responses without Content-Length, retains its 10-second deadline and refuses
+redirects.
+
+Snapshots keep their existing JSON format. Persistence uses a unique, exclusive
+0600 temporary file, fsyncs it, atomically renames it, and fsyncs the directory.
+Unchanged poll cycles skip rewriting the snapshot. The first persist after a
+load still normalizes legacy numeric amount fields to decimal strings. Corrupt
+snapshots are never overwritten automatically, and data queries return HTTP
+503 rather than authoritative-looking empty balances. Repair or rebuild the
+index explicitly after preserving the failed snapshot. Store mutations must go
+through `applyBlock`/`rollbackTo`; the exposed `state` is for inspection.
+
+**Remaining scaling limitation:** every changed snapshot still serializes and
+rewrites the entire index synchronously. Memory use also grows with retained
+UTXOs, history and undo records. A transactional incremental store/WAL and a
+reviewed reorg/pruning policy remain required for production scale. The JSON
+backend is single-writer; these changes do not add multi-process transactions
+or make this reference indexer production-qualified. No deployed index data was
+modified by the audit work.
+
+### Transactional block application follow-up
+
+Block planning now uses a private UTXO overlay. A transaction can consume an
+output created earlier in the same block without leaving a phantom unspent
+output or overstating intermediate addresses' balances. Duplicate spends,
+output collisions and references to outputs created only later in the block
+are rejected before committed state changes. Undo restores only outputs that
+existed before the block, never same-block intermediate outputs. A missing
+historical undo record is detected before rolling back any higher block.
+
+Snapshot loading validates required shapes, numeric counters/heights and
+chain/tip/undo consistency. Cursor and dirty-state revisions are private bigint
+counters independent of persisted statistics. Serialization preserves own keys
+such as `__proto__` in address-indexed maps. Existing valid JSON snapshots and
+legacy decimal/numeric amount decoding remain compatible, but malformed files
+previously treated as empty or partially defaulted now fail closed. These fixes
+do not repair balances already misindexed by an older build: affected indexes
+need a separately authorized rebuild from verified source data.
+
+Fetched blocks must report the requested height. **Remaining source-consistency
+blocker:** several RPC calls do not form an atomic selected-chain snapshot. A
+branch switch between awaits can still mix branch observations. The generic
+`parents` array is not documented here as a unique selected-parent contract,
+so this patch does not assume a linear parent rule for the DAG. Production
+qualification requires a pinned selected-chain snapshot or a verified ancestry
+contract and adversarial branch-switch tests. The indexer is a reference
+consumer of node RPC, not an independent consensus verifier.

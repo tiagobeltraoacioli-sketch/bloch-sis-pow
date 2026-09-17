@@ -85,13 +85,18 @@ pub enum VaultKeyDerivation {
     /// receive chain. Kept so an EXISTING vault keeps deriving the keys it was
     /// built with; never used for a new vault going forward.
     V1SharedReceiveChain,
-    /// A4-M-5 fix: a dedicated hardened BRANCH no ordinary receive/change
+    /// Historical A4-M-5 branch isolation: a dedicated hardened BRANCH no ordinary receive/change
     /// address ever touches — `m/1998'/coin'/0'/0/{0,1}`. Purpose `1998'` is
     /// not assigned by any BIP (the `*_44/49/84/86` family are the only
     /// purpose values `bloch_btc_wallet` or any standard wallet UI derives
-    /// under), so this path can never collide with a receive/change address,
-    /// present or future, however many accounts the wallet creates.
+    /// under). The final role children are NOT hardened: a leaked hot private
+    /// key plus the branch xpub exposes recovery. Restore existing V2 vaults
+    /// with this scheme; use V3 for new vaults.
     V2DedicatedHardenedBranch,
+    /// New vaults: independent hardened role children at
+    /// `m/1999'/coin'/0'/{0',1'}`. A hot private key plus an ancestor
+    /// xpub cannot recover the parent or derive the recovery sibling.
+    V3HardenedRoles,
 }
 
 /// Purpose field for [`VaultKeyDerivation::V2DedicatedHardenedBranch`] —
@@ -130,7 +135,7 @@ pub struct VaultKeys {
 ///
 /// A4-M-5: kept EXACTLY as-is (including panicking on a malformed seed) for
 /// compatibility with existing callers and vaults built under it — see
-/// [`derive_vault_keys_v2`] for the fix (a dedicated, unexposed key branch).
+/// [`derive_vault_keys_v3`] for hardened role separation for new vaults.
 pub fn derive_vault_keys(seed: &[u8], mainnet: bool) -> VaultKeys {
     let secp = Secp256k1::new();
     let net = if mainnet { NetworkKind::Main } else { NetworkKind::Test };
@@ -208,6 +213,40 @@ pub fn derive_vault_keys_v2(seed: &[u8], mainnet: bool) -> Result<VaultKeys, Str
         hot_sk, hot_pubkey, recovery_sk, recovery_pubkey, pq_pubkey, pq_secret,
         key_derivation: VaultKeyDerivation::V2DedicatedHardenedBranch,
     })
+}
+
+/// Derive a new vault using hardened role separation (BV-04).
+///
+/// This is an explicit opt-in format: persist `V3HardenedRoles` with the vault
+/// backup. Never use it to restore a V1/V2 vault. Existing derivation functions
+/// and their outputs are unchanged. Compromise of the master seed still exposes
+/// both roles; hardened derivation protects against child-key plus xpub leakage.
+pub fn derive_vault_keys_v3(seed: &[u8], mainnet: bool) -> Result<VaultKeys, String> {
+    use sha2::{Digest, Sha256};
+    if !(32..=64).contains(&seed.len()) {
+        return Err("V3 seed must contain 32 to 64 bytes".into());
+    }
+    let secp = Secp256k1::new();
+    let net = if mainnet { NetworkKind::Main } else { NetworkKind::Test };
+    let coin = if mainnet { "0'" } else { "1'" };
+    let master = Xpriv::new_master(net, seed).map_err(|e| format!("bip32 master: {e}"))?;
+    let derive = |role: u32| -> Result<(SecretKey, PublicKey), String> {
+        let path = DerivationPath::from_str(&format!("m/1999'/{coin}/0'/{role}'"))
+            .map_err(|e| format!("bip32 path: {e}"))?;
+        let child = master.derive_priv(&secp, &path).map_err(|e| format!("bip32 derive: {e}"))?;
+        Ok((child.private_key, PublicKey::new(child.private_key.public_key(&secp))))
+    };
+    let (hot_sk, hot_pubkey) = derive(0)?;
+    let (recovery_sk, recovery_pubkey) = derive(1)?;
+    let mut hash = Sha256::new();
+    hash.update(b"BLOCH-PQ-VAULT-V3-PQ-KEY");
+    hash.update([u8::from(mainnet)]);
+    hash.update(seed);
+    let pq_seed = hash.finalize();
+    let (pq_pubkey, pq_secret) = bloch_crypto::crypto::generate_keypair_from_seed(&pq_seed)
+        .map_err(|e| format!("pq keygen: {e}"))?;
+    Ok(VaultKeys { hot_sk, hot_pubkey, recovery_sk, recovery_pubkey, pq_pubkey, pq_secret,
+        key_derivation: VaultKeyDerivation::V3HardenedRoles })
 }
 
 /// Produce a Bitcoin `<DER-sig ‖ SIGHASH_ALL>` witness push: sign `sighash` with `sk`.
@@ -586,6 +625,42 @@ mod e2e_tests {
             confirmations: c.confirmations,
             tx_version: c.tx_version,
             sighash: c.sighash,
+        }
+    }
+}
+
+#[cfg(test)]
+mod audit_hardened_roles {
+    use super::*;
+    use bitcoin::bip32::Xpub;
+
+    #[test]
+    fn v3_roles_cannot_be_derived_from_the_shared_public_parent() {
+        let seed = [42; 32];
+        let secp = Secp256k1::new();
+        let master = Xpriv::new_master(NetworkKind::Test, &seed).unwrap();
+        let parent = master.derive_priv(&secp,
+            &DerivationPath::from_str("m/1999'/1'/0'").unwrap()).unwrap();
+        let public = Xpub::from_priv(&secp, &parent);
+        let keys = derive_vault_keys_v3(&seed, false).unwrap();
+        for (role, expected) in [(0, keys.hot_sk), (1, keys.recovery_sk)] {
+            let path = DerivationPath::from_str(&format!("m/{role}'")).unwrap();
+            assert!(public.derive_pub(&secp, &path).is_err());
+            assert_eq!(parent.derive_priv(&secp, &path).unwrap().private_key, expected);
+        }
+        let old = derive_vault_keys_v2(&seed, false).unwrap();
+        assert_ne!(keys.hot_sk, keys.recovery_sk);
+        assert_ne!(keys.hot_sk, old.hot_sk);
+        assert_ne!(keys.recovery_sk, old.recovery_sk);
+        assert_ne!(keys.pq_pubkey, old.pq_pubkey);
+        assert_eq!(keys.hot_sk, derive_vault_keys_v3(&seed, false).unwrap().hot_sk);
+        assert_ne!(keys.hot_sk, derive_vault_keys_v3(&seed, true).unwrap().hot_sk);
+    }
+
+    #[test]
+    fn v3_refuses_invalid_seed_lengths() {
+        for len in [0, 1, 31, 65, 4096] {
+            assert!(derive_vault_keys_v3(&vec![42; len], false).is_err());
         }
     }
 }

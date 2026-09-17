@@ -36,9 +36,10 @@ import json, sys
 
 out, specs = sys.argv[1], sys.argv[2:]
 lines, finish, last = [], True, None
+has_error = False
 
 def emit(code, level, text, n):
-    global last
+    global last, has_error
     for i in range(n):
         msg = {
             "message": text,
@@ -52,7 +53,8 @@ def emit(code, level, text, n):
             }],
             "rendered": f"{level}: {text}\n",
         }
-        last = {"reason": "compiler-message", "message": msg}
+        has_error |= level == "error"
+        last = {"reason": "compiler-message", "package_id": "path+file:///test#bloch-pos-committee@0.1.0", "message": msg}
         lines.append(json.dumps(last))
 
 SEV = {
@@ -86,7 +88,7 @@ for spec in specs:
 # cargo interleaves its own non-JSON chatter on stderr; the scorer must skip it.
 lines.insert(0, "warning: profiles for the non root package will be ignored")
 if finish:
-    lines.append(json.dumps({"reason": "build-finished", "success": False}))
+    lines.append(json.dumps({"reason": "build-finished", "success": not has_error}))
 open(out, "w").write("\n".join(lines) + "\n")
 PY
 }

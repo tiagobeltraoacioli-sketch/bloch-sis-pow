@@ -42,9 +42,14 @@ scrape_configs:
       # endpoint is off unless a port is explicitly given). 9600 here is a
       # placeholder — it MUST match whatever --metrics-port this host's unit
       # file actually passes (os/bloch-pos-node.nix), or this scrape config
-      # silently scrapes nothing and every alert below goes dark rather than
-      # firing. Confirm with `systemctl cat bloch-pos-node | grep metrics-port`.
+      # fails its scrape. BlochMetricsUnavailable then fires; other metric
+      # alerts cannot observe the node. Confirm with `systemctl cat bloch-pos-node | grep metrics-port`.
       - targets: ["127.0.0.1:9600"]   # TO BE FILLED / CONFIRMED by the operator
+        labels:
+          # This target label is available during rule evaluation. External
+          # labels alone are not. Set validator or archival explicitly.
+          role: "REPLACE_ME_validator_or_archival"
+          host_id: "REPLACE_ME_OPAQUE_HOST_ID"
     scrape_interval: 15s
     scrape_timeout: 10s
 
@@ -56,6 +61,8 @@ scrape_configs:
   - job_name: "node-exporter"
     static_configs:
       - targets: ["127.0.0.1:9100"]
+        labels:
+          host_id: "REPLACE_ME_OPAQUE_HOST_ID"
     scrape_interval: 15s
 
 # Alertmanager peering: left to the operator's own paging infrastructure.

@@ -134,6 +134,19 @@ impl KdfParams {
         p_cost: 1,
     };
 
+    fn meets_sealing_floor(self) -> bool {
+        self.m_cost >= Self::PRODUCTION.m_cost && self.t_cost >= Self::PRODUCTION.t_cost
+    }
+
+    fn validate_new_sealing(self) -> io::Result<()> {
+        if !self.meets_sealing_floor() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "new keystore sealing requires Argon2id memory >= 65536 KiB and iterations >= 3"));
+        }
+        self.to_argon2()?;
+        Ok(())
+    }
+
     fn to_argon2(self) -> io::Result<argon2::Argon2<'static>> {
         if self.m_cost > KDF_MAX_M_COST_KIB {
             return Err(io::Error::new(
@@ -203,9 +216,8 @@ impl Unlock {
         }
     }
 
-    /// A passphrase at an explicit cost. Used by tests to keep Argon2id off
-    /// the critical path of an unoptimized test binary; it changes nothing
-    /// about the format, since the cost travels in the file.
+    /// A passphrase at an explicit cost. New writes enforce the production
+    /// floor; reading always uses the authenticated file header parameters.
     pub fn passphrase_with(pass: impl Into<String>, kdf: KdfParams) -> Unlock {
         Unlock::Passphrase {
             pass: Zeroizing::new(pass.into()),
@@ -337,6 +349,48 @@ impl Drop for Keystore {
     }
 }
 
+/// Mutating tools must run as the data-directory and keystore owner. In
+/// particular, running them with sudo must not install root-owned LOCK/key
+/// files that prevent the service account from starting again.
+#[cfg(unix)]
+pub(crate) fn ensure_mutation_ownership(dir: &Path) -> io::Result<()> {
+    // SAFETY: geteuid has no arguments and only reads the effective identity.
+    ensure_mutation_ownership_for_uid(dir, unsafe { libc::geteuid() })
+}
+
+#[cfg(unix)]
+fn ensure_mutation_ownership_for_uid(dir: &Path, uid: libc::uid_t) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let check = |path: &Path, meta: &fs::Metadata| -> io::Result<()> {
+        if meta.uid() != uid {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+                format!("{} is owned by uid {}, but effective uid is {uid}; run keystore mutations as the owning service account", path.display(), meta.uid())));
+        }
+        Ok(())
+    };
+    let directory = fs::symlink_metadata(dir)?;
+    if !directory.is_dir() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            "keystore data directory must be a directory, not a symbolic link or special file"));
+    }
+    check(dir, &directory)?;
+    let path = dir.join("validator.key");
+    match fs::symlink_metadata(&path) {
+        Ok(meta) => {
+            if !meta.is_file() {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                    "validator.key must be a regular file, not a symbolic link or special file"));
+            }
+            check(&path, &meta)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn ensure_mutation_ownership(_dir: &Path) -> io::Result<()> { Ok(()) }
+
 impl Keystore {
     /// Deterministic private RANDAO generations survive restarts and reorgs
     /// without rewriting the keystore. Generation zero preserves genesis.
@@ -367,6 +421,7 @@ impl Keystore {
     /// the environment.
     pub fn generate_with(dir: &Path, index: u32, unlock: &Unlock) -> io::Result<Keystore> {
         fs::create_dir_all(dir)?;
+        ensure_mutation_ownership(dir)?;
         let _lock = crate::store::DirLock::acquire(dir)?;
         if dir.join("validator.key").try_exists()? {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, "validator.key already exists; refusing to replace validator identity"));
@@ -388,6 +443,7 @@ impl Keystore {
     /// for plaintext.
     pub fn save_with(&self, dir: &Path, unlock: &Unlock) -> io::Result<()> {
         fs::create_dir_all(dir)?;
+        ensure_mutation_ownership(dir)?;
         // `Zeroizing` on both arms: the plaintext encoding IS the secret, and
         // the sealed bytes cost nothing to wipe (audit round 3, keystore lows).
         let out: Zeroizing<Vec<u8>> = match unlock {
@@ -414,6 +470,13 @@ impl Keystore {
     /// `BPOSKEY2`: Argon2id over a fresh salt, XChaCha20-Poly1305 over
     /// `secret ‖ randao_seed`, public header as AAD.
     fn seal(&self, passphrase: &str, kdf: KdfParams) -> io::Result<Vec<u8>> {
+        kdf.validate_new_sealing()?;
+        self.seal_payload(passphrase, kdf)
+    }
+
+    // Low-level encoding also constructs historical weak-KDF test fixtures.
+    // Every production writer enters through `seal`, which checks the floor.
+    fn seal_payload(&self, passphrase: &str, kdf: KdfParams) -> io::Result<Vec<u8>> {
         if passphrase.chars().count() < MIN_SEAL_PASSPHRASE_CHARS {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "new keystore passphrase must contain at least 12 characters"));
         }
@@ -650,6 +713,10 @@ impl Keystore {
                 })?,
         );
 
+        if !kdf.meets_sealing_floor() {
+            eprintln!("WARNING: authenticated keystore uses legacy weak Argon2id parameters (memory={} KiB, iterations={}); access remains supported, but migrate to a new sealed backup using at least 65536 KiB and 3 iterations. Do not delete the current keystore or signing history.", kdf.m_cost, kdf.t_cost);
+        }
+
         let mut pr = crate::codec::Reader::new(&plain);
         let secret = pr.bytes().map_err(|_| bad("corrupt keystore body"))?;
         let randao_seed = pr.h32().map_err(|_| bad("corrupt keystore body"))?;
@@ -854,6 +921,7 @@ impl Keystore {
                 ),
             ));
         }
+        ensure_mutation_ownership(dir)?;
         // 1. Nobody may be running over this dir.
         let lock = crate::store::DirLock::acquire(dir).map_err(|e| {
             io::Error::new(
@@ -887,7 +955,7 @@ impl Keystore {
         let tmp = dir.join("validator.key.sealed.tmp");
         {
             let mut opts = fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
+            opts.write(true).create_new(true);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
@@ -1000,7 +1068,7 @@ pub fn read_passphrase_file(path: &Path) -> io::Result<Zeroizing<String>> {
 /// log of every jump host in between.
 #[cfg(unix)]
 pub fn read_passphrase_from_tty(prompt: &str) -> io::Result<Zeroizing<String>> {
-    use std::io::{BufRead, Write};
+    use std::io::{Read, Write};
     let fd = libc::STDIN_FILENO;
     // SAFETY: isatty only inspects the descriptor.
     if unsafe { libc::isatty(fd) } != 1 {
@@ -1012,24 +1080,51 @@ pub fn read_passphrase_from_tty(prompt: &str) -> io::Result<Zeroizing<String>> {
     let mut err = io::stderr();
     err.write_all(prompt.as_bytes())?;
     err.flush()?;
-    // SAFETY: `term` is a plain C struct we own; tcgetattr fills it for `fd`.
+    // Use a private, unbuffered handle: std::io::Stdin retains its shared
+    // read-ahead buffer after the returned passphrase has been zeroized.
+    let mut input = fs::File::open("/dev/tty")?;
+    use std::os::fd::AsRawFd;
+    let fd = input.as_raw_fd();
     let mut term: libc::termios = unsafe { std::mem::zeroed() };
     if unsafe { libc::tcgetattr(fd, &mut term) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    let saved = term;
+    struct Restore { fd: libc::c_int, saved: libc::termios, active: bool }
+    impl Restore {
+        fn restore(&mut self) -> io::Result<()> {
+            if unsafe { libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.saved) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            self.active = false;
+            Ok(())
+        }
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) { if self.active { let _ = self.restore(); } }
+    }
+    let mut restore = Restore { fd, saved: term, active: true };
     term.c_lflag &= !libc::ECHO;
-    // SAFETY: applying a termios struct we just read and modified to our own stdin.
     if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &term) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    let mut line = Zeroizing::new(String::new());
-    let read = io::stdin().lock().read_line(&mut line);
-    // Restore echo whatever happened, then report the read.
-    // SAFETY: restoring the exact struct tcgetattr produced.
-    unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &saved) };
+    let mut bytes = Zeroizing::new(Vec::new());
+    let mut byte = Zeroizing::new([0u8; 1]);
+    let read = (|| -> io::Result<()> {
+        loop {
+            if input.read(&mut byte[..])? == 0 || byte[0] == b'\n' { break; }
+            if bytes.len() >= 4096 {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "passphrase exceeds 4096 bytes"));
+            }
+            bytes.push(byte[0]);
+        }
+        Ok(())
+    })();
+    restore.restore()?;
     let _ = err.write_all(b"\n");
     read?;
+    let mut line = Zeroizing::new(std::str::from_utf8(&bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "passphrase is not UTF-8"))?
+        .to_owned());
     while line.ends_with('\n') || line.ends_with('\r') {
         line.pop();
     }
@@ -1129,6 +1224,61 @@ mod tests {
     /// The real suite, end to end, through the only entry point the trait now
     /// has. Disposable keypair generated in-process — no production or
     /// treasury key material is involved anywhere in this file.
+    #[cfg(unix)]
+    #[test]
+    fn audit_mutations_refuse_foreign_ownership_and_symlink_keys_before_locking() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+        let dir = tmp_dir("ownership-refusal");
+        let owner = fs::metadata(&dir).unwrap().uid();
+        let other = if owner == 0 { 1 } else { 0 };
+        assert_eq!(ensure_mutation_ownership_for_uid(&dir, other).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert!(!dir.join("LOCK").exists());
+        let alias = dir.join("directory-alias");
+        symlink(&dir, &alias).unwrap();
+        assert!(ensure_mutation_ownership(&alias).is_err());
+        let target = dir.join("preserve-key-target");
+        fs::write(&target, b"must remain unchanged").unwrap();
+        symlink(&target, dir.join("validator.key")).unwrap();
+        let pass = Zeroizing::new("a secure passphrase".to_owned());
+        assert!(Keystore::seal_in_place(&dir, &pass, KdfParams::PRODUCTION).is_err());
+        assert!(!dir.join("LOCK").exists(), "reject before creating a lock");
+        assert_eq!(fs::read(&target).unwrap(), b"must remain unchanged");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_sealing_does_not_follow_or_replace_a_preexisting_temp_file() {
+        use std::os::unix::fs::symlink;
+        let dir = tmp_dir("sealing-temp-refusal");
+        Keystore::generate_with(&dir, 1, &Unlock::PlaintextOptIn).unwrap();
+        let before = fs::read(dir.join("validator.key")).unwrap();
+        let target = dir.join("preserve-temp-target");
+        fs::write(&target, b"must remain unchanged").unwrap();
+        symlink(&target, dir.join("validator.key.sealed.tmp")).unwrap();
+        let pass = Zeroizing::new("a secure passphrase".to_owned());
+        assert!(Keystore::seal_in_place(&dir, &pass, KdfParams::PRODUCTION).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"must remain unchanged");
+        assert_eq!(fs::read(dir.join("validator.key")).unwrap(), before);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn audit_new_sealing_rejects_weak_kdf_but_legacy_decryption_survives() {
+        let legacy = KdfParams { m_cost: 8, t_cost: 1, p_cost: 1 };
+        assert!(!legacy.meets_sealing_floor());
+        assert!(KdfParams::PRODUCTION.validate_new_sealing().is_ok());
+        let ks = Keystore { index: 7, pubkey: vec![1], secret: Zeroizing::new(vec![2]), randao_seed: [3; 32] };
+        assert!(ks.seal("legacy passphrase", legacy).is_err());
+        assert!(ks.seal("legacy passphrase", KdfParams { t_cost: 2, ..KdfParams::PRODUCTION }).is_err());
+        assert!(ks.seal("legacy passphrase", KdfParams { m_cost: 32768, ..KdfParams::PRODUCTION }).is_err());
+        let historical = ks.seal_payload("legacy passphrase", legacy).unwrap();
+        let loaded = Keystore::decode_sealed(&historical, &Unlock::passphrase("legacy passphrase")).unwrap();
+        assert_eq!(loaded.pubkey, ks.pubkey);
+        assert_eq!(loaded.secret.as_slice(), ks.secret.as_slice());
+        assert_eq!(loaded.randao_seed, ks.randao_seed);
+    }
+
     #[test]
     fn real_hybrid_signature_verifies_through_the_key_form() {
         let (pk, sk) = bloch_crypto::crypto::generate_keypair();
@@ -1207,14 +1357,8 @@ mod tests {
         d
     }
 
-    /// Argon2id at the format's minimum cost. The parameters travel in the
-    /// file, so this exercises the exact same code path as production —
-    /// only cheaper, which keeps an unoptimized test binary usable.
-    const CHEAP: KdfParams = KdfParams {
-        m_cost: 8,
-        t_cost: 1,
-        p_cost: 1,
-    };
+    // Test all ordinary writes through the actual production KDF floor.
+    const TEST_KDF: KdfParams = KdfParams::PRODUCTION;
 
     /// `Result::expect_err` needs `T: Debug`, and `Keystore` deliberately
     /// implements no `Debug` — that is the property keeping secret bytes out
@@ -1239,7 +1383,7 @@ mod tests {
     #[test]
     fn the_sealed_file_contains_neither_the_secret_key_nor_the_randao_seed() {
         let dir = tmp_dir("sealed");
-        let ks = Keystore::generate_with(&dir, 7, &Unlock::passphrase_with("correct horse", CHEAP))
+        let ks = Keystore::generate_with(&dir, 7, &Unlock::passphrase_with("correct horse", TEST_KDF))
             .expect("generate + seal");
         let raw = fs::read(dir.join("validator.key")).expect("read the keystore back");
 
@@ -1265,7 +1409,7 @@ mod tests {
     #[test]
     fn a_sealed_keystore_round_trips_and_still_signs() {
         let dir = tmp_dir("roundtrip");
-        let unlock = Unlock::passphrase_with("a passphrase", CHEAP);
+        let unlock = Unlock::passphrase_with("a passphrase", TEST_KDF);
         let a = Keystore::generate_with(&dir, 3, &unlock).expect("generate");
         let b = Keystore::load_with(&dir, &unlock).expect("re-open the sealed keystore");
 
@@ -1282,9 +1426,9 @@ mod tests {
     #[test]
     fn the_wrong_passphrase_fails_closed() {
         let dir = tmp_dir("wrongpass");
-        Keystore::generate_with(&dir, 1, &Unlock::passphrase_with("right passphrase", CHEAP)).expect("gen");
+        Keystore::generate_with(&dir, 1, &Unlock::passphrase_with("right passphrase", TEST_KDF)).expect("gen");
         let e = err_of(
-            Keystore::load_with(&dir, &Unlock::passphrase_with("wrong", CHEAP)),
+            Keystore::load_with(&dir, &Unlock::passphrase_with("wrong", TEST_KDF)),
             "a wrong passphrase must not open the keystore",
         );
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
@@ -1297,7 +1441,7 @@ mod tests {
     #[test]
     fn rewriting_the_validator_index_breaks_the_tag() {
         let dir = tmp_dir("aad");
-        let unlock = Unlock::passphrase_with("test passphrase", CHEAP);
+        let unlock = Unlock::passphrase_with("test passphrase", TEST_KDF);
         Keystore::generate_with(&dir, 4, &unlock).expect("gen");
         let path = dir.join("validator.key");
         let mut raw = fs::read(&path).expect("read");
@@ -1328,7 +1472,7 @@ mod tests {
         assert_eq!(&raw[..8], KEYSTORE_MAGIC_V1);
 
         let e = err_of(
-            Keystore::load_with(&dir, &Unlock::passphrase_with("test passphrase", CHEAP)),
+            Keystore::load_with(&dir, &Unlock::passphrase_with("test passphrase", TEST_KDF)),
             "a plaintext keystore must not load under a passphrase policy",
         );
         assert_eq!(
@@ -1350,7 +1494,7 @@ mod tests {
     #[test]
     fn the_plaintext_opt_in_does_not_open_a_sealed_keystore() {
         let dir = tmp_dir("sealedoptin");
-        Keystore::generate_with(&dir, 2, &Unlock::passphrase_with("test passphrase", CHEAP)).expect("gen");
+        Keystore::generate_with(&dir, 2, &Unlock::passphrase_with("test passphrase", TEST_KDF)).expect("gen");
         let e = err_of(
             Keystore::load_with(&dir, &Unlock::PlaintextOptIn),
             "the plaintext opt-in is not a passphrase",
@@ -1367,7 +1511,7 @@ mod tests {
     fn a_missing_keystore_is_still_not_found_not_a_policy_refusal() {
         let dir = tmp_dir("absent");
         let e = err_of(
-            Keystore::load_with(&dir, &Unlock::passphrase_with("test passphrase", CHEAP)),
+            Keystore::load_with(&dir, &Unlock::passphrase_with("test passphrase", TEST_KDF)),
             "there is no keystore in this dir",
         );
         assert_eq!(e.kind(), io::ErrorKind::NotFound);
@@ -1439,7 +1583,7 @@ mod tests {
         Keystore::generate_with(&dir, 11, &Unlock::PlaintextOptIn).expect("gen plaintext");
 
         let e = expect_loud(
-            Keystore::load_optional_with(&dir, &Unlock::passphrase_with("test passphrase", CHEAP)),
+            Keystore::load_optional_with(&dir, &Unlock::passphrase_with("test passphrase", TEST_KDF)),
             "a plaintext keystore under a passphrase policy",
         );
         assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
@@ -1462,18 +1606,18 @@ mod tests {
     #[test]
     fn a_present_keystore_that_will_not_open_is_never_reported_as_absent() {
         let dir = tmp_dir("loudsealed");
-        Keystore::generate_with(&dir, 5, &Unlock::passphrase_with("right passphrase", CHEAP)).expect("gen");
+        Keystore::generate_with(&dir, 5, &Unlock::passphrase_with("right passphrase", TEST_KDF)).expect("gen");
 
         expect_loud(
             Keystore::load_optional_with(&dir, &Unlock::PlaintextOptIn),
             "a sealed keystore and no passphrase",
         );
         expect_loud(
-            Keystore::load_optional_with(&dir, &Unlock::passphrase_with("wrong", CHEAP)),
+            Keystore::load_optional_with(&dir, &Unlock::passphrase_with("wrong", TEST_KDF)),
             "a sealed keystore and the wrong passphrase",
         );
         let ks = expect_loaded(
-            Keystore::load_optional_with(&dir, &Unlock::passphrase_with("right passphrase", CHEAP)),
+            Keystore::load_optional_with(&dir, &Unlock::passphrase_with("right passphrase", TEST_KDF)),
             "the right passphrase",
         );
         assert_eq!(ks.index, 5);
@@ -1487,7 +1631,7 @@ mod tests {
     fn only_an_absent_file_selects_observer_mode() {
         let dir = tmp_dir("observer");
         expect_absent(
-            Keystore::load_optional_with(&dir, &Unlock::passphrase_with("test passphrase", CHEAP)),
+            Keystore::load_optional_with(&dir, &Unlock::passphrase_with("test passphrase", TEST_KDF)),
             "no validator.key in this dir",
         );
         expect_absent(
@@ -1544,7 +1688,7 @@ mod tests {
     /// Junk is junk under every policy — no panic, no partial key.
     #[test]
     fn a_file_that_is_not_a_keystore_is_refused_under_both_policies() {
-        for policy in [Unlock::PlaintextOptIn, Unlock::passphrase_with("test passphrase", CHEAP)] {
+        for policy in [Unlock::PlaintextOptIn, Unlock::passphrase_with("test passphrase", TEST_KDF)] {
             for bad in [
                 Vec::new(),
                 b"BPOS".to_vec(),
@@ -1588,7 +1732,7 @@ mod tests {
     fn a_group_or_world_readable_keystore_is_refused() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tmp_dir("mode");
-        let unlock = Unlock::passphrase_with("test passphrase", CHEAP);
+        let unlock = Unlock::passphrase_with("test passphrase", TEST_KDF);
         Keystore::generate_with(&dir, 7, &unlock).expect("generate");
         let path = dir.join("validator.key");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).expect("chmod");
@@ -1625,11 +1769,11 @@ mod tests {
         assert!(!contains(shown.as_bytes(), &ks.secret));
 
         let dir2 = tmp_dir("inspect-sealed");
-        Keystore::generate_with(&dir2, 22, &Unlock::passphrase_with("test passphrase", CHEAP)).expect("sealed");
+        Keystore::generate_with(&dir2, 22, &Unlock::passphrase_with("test passphrase", TEST_KDF)).expect("sealed");
         let info = Keystore::inspect(&dir2).expect("inspect sealed");
         assert_eq!(info.format, KeystoreFormat::SealedV2);
         assert_eq!(info.index, 22);
-        assert_eq!(info.kdf, Some(CHEAP));
+        assert_eq!(info.kdf, Some(TEST_KDF));
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&dir2);
     }
@@ -1642,9 +1786,9 @@ mod tests {
         let dir = tmp_dir("seal");
         let before = Keystore::generate_with(&dir, 33, &Unlock::PlaintextOptIn).expect("plaintext");
         let pass = Zeroizing::new("a long enough passphrase".to_string());
-        let report = Keystore::seal_in_place(&dir, &pass, CHEAP).expect("seal in place");
+        let report = Keystore::seal_in_place(&dir, &pass, TEST_KDF).expect("seal in place");
         assert_eq!(report.index, 33);
-        assert_eq!(report.kdf, CHEAP);
+        assert_eq!(report.kdf, TEST_KDF);
         assert!(report.plaintext_bytes_overwritten > 8);
 
         let raw = fs::read(dir.join("validator.key")).expect("read");
@@ -1662,7 +1806,7 @@ mod tests {
             assert_eq!(mode, 0o600);
         }
 
-        let after = Keystore::load_with(&dir, &Unlock::passphrase_with(pass.as_str(), CHEAP))
+        let after = Keystore::load_with(&dir, &Unlock::passphrase_with(pass.as_str(), TEST_KDF))
             .expect("the sealed file opens");
         assert_eq!(after.index, before.index);
         assert_eq!(after.pubkey, before.pubkey);
@@ -1678,7 +1822,7 @@ mod tests {
         );
         // Wrong passphrase fails loud.
         expect_err_kind(
-            Keystore::load_with(&dir, &Unlock::passphrase_with("not the passphrase", CHEAP)),
+            Keystore::load_with(&dir, &Unlock::passphrase_with("not the passphrase", TEST_KDF)),
             io::ErrorKind::InvalidData,
             "wrong passphrase",
         );
@@ -1695,14 +1839,14 @@ mod tests {
         let held = crate::store::DirLock::acquire(&dir).expect("the 'node' takes the lock");
         let pass = Zeroizing::new("a long enough passphrase".to_string());
         let e = expect_err_kind(
-            Keystore::seal_in_place(&dir, &pass, CHEAP),
+            Keystore::seal_in_place(&dir, &pass, TEST_KDF),
             io::ErrorKind::AddrInUse,
             "seal under a live lock",
         );
         assert!(e.to_string().contains("stop it first"), "{e}");
         assert_eq!(fs::read(dir.join("validator.key")).unwrap(), raw_before, "untouched");
         drop(held);
-        Keystore::seal_in_place(&dir, &pass, CHEAP).expect("after the node stops it seals");
+        Keystore::seal_in_place(&dir, &pass, TEST_KDF).expect("after the node stops it seals");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1711,16 +1855,16 @@ mod tests {
     #[test]
     fn seal_in_place_refuses_a_sealed_file_and_a_short_passphrase() {
         let dir = tmp_dir("seal-twice");
-        Keystore::generate_with(&dir, 35, &Unlock::passphrase_with("test passphrase", CHEAP)).expect("sealed");
+        Keystore::generate_with(&dir, 35, &Unlock::passphrase_with("test passphrase", TEST_KDF)).expect("sealed");
         let pass = Zeroizing::new("a long enough passphrase".to_string());
         expect_err_kind(
-            Keystore::seal_in_place(&dir, &pass, CHEAP),
+            Keystore::seal_in_place(&dir, &pass, TEST_KDF),
             io::ErrorKind::AlreadyExists,
             "sealing a sealed file",
         );
         let short = Zeroizing::new("short".to_string());
         expect_err_kind(
-            Keystore::seal_in_place(&dir, &short, CHEAP),
+            Keystore::seal_in_place(&dir, &short, TEST_KDF),
             io::ErrorKind::InvalidInput,
             "short passphrase",
         );
@@ -1733,7 +1877,7 @@ mod tests {
     fn keygen_cannot_write_plaintext_without_the_explicit_opt_in() {
         assert!(Unlock::from_sources(None, None, false).is_err());
         let dir = tmp_dir("keygen-sealed");
-        Keystore::generate_with(&dir, 1, &Unlock::passphrase_with("test passphrase", CHEAP)).expect("generate");
+        Keystore::generate_with(&dir, 1, &Unlock::passphrase_with("test passphrase", TEST_KDF)).expect("generate");
         let raw = fs::read(dir.join("validator.key")).expect("read");
         assert_eq!(&raw[..8], KEYSTORE_MAGIC_V2);
         let _ = fs::remove_dir_all(&dir);
@@ -1765,7 +1909,7 @@ mod tests {
             io::ErrorKind::AlreadyExists, "existing identity");
         assert_eq!(fs::read(dir.join("validator.key")).unwrap(), before);
         let other = tmp_dir("audit-weak-keygen");
-        assert!(Keystore::generate_with(&other, 9, &Unlock::passphrase_with("short", CHEAP)).is_err());
+        assert!(Keystore::generate_with(&other, 9, &Unlock::passphrase_with("short", TEST_KDF)).is_err());
         assert!(!other.join("validator.key").exists());
         let _ = fs::remove_dir_all(dir);
         let _ = fs::remove_dir_all(other);

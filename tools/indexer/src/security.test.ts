@@ -307,3 +307,242 @@ test("T-6: an oversized number that is NOT a plain integer literal (already a st
 test("T-6: assertJsonSourceAccessAvailable does not throw on this test runtime (node >= 21 required by package.json)", () => {
   assert.doesNotThrow(() => assertJsonSourceAccessAvailable());
 });
+
+// LG-07: pages bind the immutable revision and never materialize all UTXOs.
+import { encodeAddress } from "./address.js";
+import { MAX_API_RESPONSE_BYTES } from "./api.js";
+import { MAX_RPC_RESPONSE_BYTES, readBoundedResponse } from "./rpc.js";
+import { statSync, readFileSync, readdirSync } from "node:fs";
+
+test("LG-07: bounded pages cover every entry and reject stale/cross-endpoint cursors", async () => {
+  const spk = "11".repeat(20);
+  const address = encodeAddress(spk, "testnet");
+  const store = JsonStore.ephemeral((script) => encodeAddress(script, "testnet"));
+  store.applyBlock(0, "h0", Array.from({ length: 523 }, (_, index) => coinbaseTx(index.toString(16).padStart(64, "0"), spk, 1n)));
+  store.getUtxosForAddress = () => { throw new Error("API must not read the entire UTXO list"); };
+  const server = createReadApi({ network: "testnet" } as IndexerConfig, store);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const endpoint = server.address();
+  if (!endpoint || typeof endpoint === "string") throw new Error("missing listener");
+  const base = `http://127.0.0.1:${endpoint.port}/address/${address}`;
+  try {
+    for (const kind of ["utxos", "history"]) {
+      let cursor: string | null = null;
+      const seen = new Set<string>();
+      do {
+        const response = await fetch(`${base}/${kind}?limit=37${cursor ? `&cursor=${cursor}` : ""}`);
+        assert.equal(response.status, 200);
+        const text = await response.text();
+        assert.ok(Buffer.byteLength(text) <= MAX_API_RESPONSE_BYTES);
+        const page = JSON.parse(text) as { [key: string]: unknown; nextCursor: string | null };
+        const items = page[kind] as Array<{ txid: string }>;
+        assert.ok(items.length <= 37);
+        for (const item of items) { assert.ok(!seen.has(item.txid)); seen.add(item.txid); }
+        cursor = page.nextCursor;
+      } while (cursor !== null);
+      assert.equal(seen.size, 523);
+    }
+    const first = await (await fetch(`${base}/utxos`)).json() as { utxos: unknown[]; nextCursor: string };
+    assert.equal(first.utxos.length, 100);
+    assert.equal((await fetch(`${base}/history?cursor=${first.nextCursor}`)).status, 400);
+    for (const query of ["limit=0", "limit=501", "limit=-1", "limit=1.5", "limit=1&limit=2", "cursor=null", "offset=99"]) {
+      assert.equal((await fetch(`${base}/utxos?${query}`)).status, 400, query);
+    }
+    const balance = await (await fetch(`${base}/balance`)).json() as { utxoCount: number };
+    assert.equal(balance.utxoCount, 523);
+    store.applyBlock(1, "h1", [coinbaseTx("ff".repeat(32), spk, 1n)]);
+    assert.equal((await fetch(`${base}/utxos?cursor=${first.nextCursor}`)).status, 409);
+    store.rollbackTo(0);
+    assert.equal((await fetch(`${base}/utxos?cursor=${first.nextCursor}`)).status, 409, "returning to the same tip must not revive stale cursors");
+    const capitalized = address.slice(0, 7) + address.slice(7).toUpperCase();
+    const alternate = await (await fetch(base.replace(address, capitalized) + "/balance")).json() as { utxoCount: number };
+    assert.equal(alternate.utxoCount, 523);
+  } finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
+});
+
+test("LG-07: API limits oversized fields and request URLs", async () => {
+  const spk = "22".repeat(20);
+  const address = encodeAddress(spk, "testnet");
+  const store = JsonStore.ephemeral((script) => encodeAddress(script, "testnet"));
+  store.applyBlock(0, "h0", [coinbaseTx("a".repeat(16_384), spk, 1n)]);
+  const server = createReadApi({ network: "testnet" } as IndexerConfig, store);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const endpoint = server.address();
+  if (!endpoint || typeof endpoint === "string") throw new Error("missing listener");
+  const base = `http://127.0.0.1:${endpoint.port}`;
+  try {
+    const response = await fetch(`${base}/address/${address}/history`);
+    assert.equal(response.status, 503);
+    assert.ok(Buffer.byteLength(await response.text()) < MAX_API_RESPONSE_BYTES);
+    assert.equal((await fetch(`${base}/${"a".repeat(2050)}`)).status, 414);
+  } finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
+});
+
+test("LG-07: upstream response limits apply to streamed and declared sizes", async () => {
+  const oversized = Buffer.alloc(MAX_RPC_RESPONSE_BYTES + 1, 32);
+  await assert.rejects(readBoundedResponse(new Response(oversized), "test"), /exceeds 8 MiB/);
+  await assert.rejects(readBoundedResponse(new Response("{}", { headers: { "content-length": String(MAX_RPC_RESPONSE_BYTES + 1) } }), "test"), /exceeds 8 MiB/);
+  assert.equal(await readBoundedResponse(new Response("{\"ok\":true}"), "test"), '{"ok":true}');
+});
+
+test("LG-07: unchanged snapshots are not rewritten and corrupt snapshots are preserved", () => {
+  const file = tmpFile();
+  try {
+    const store = JsonStore.open(file, idAddress);
+    store.applyBlock(0, "h0", [coinbaseTx("t1", "spk", 42n)]);
+    store.persist();
+    const first = statSync(file);
+    store.persist();
+    assert.equal(statSync(file).ino, first.ino, "no rename/rewrite during an unchanged poll");
+    assert.equal(statSync(file).mode & 0o777, 0o600);
+    assert.deepEqual(readdirSync(join(file, "..")), ["state.json"]);
+    const restored = JsonStore.open(file, idAddress);
+    assert.equal(restored.getUtxoCount(idAddress("spk")), 1);
+    assert.notEqual(restored.getSnapshotId(), store.getSnapshotId(), "restart invalidates pagination cursors");
+    writeFileSync(file, "{broken");
+    const corrupt = JsonStore.open(file, idAddress);
+    assert.throws(() => corrupt.persist(), /unreadable/);
+    assert.equal(readFileSync(file, "utf8"), "{broken");
+  } finally { rmSync(join(file, ".."), { recursive: true, force: true }); }
+});
+
+test("LG-07: corrupt snapshots cannot produce authoritative empty balance responses", async () => {
+  const file = tmpFile();
+  writeFileSync(file, "{broken");
+  const store = JsonStore.open(file, idAddress);
+  const server = createReadApi({ network: "testnet" } as IndexerConfig, store);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const endpoint = server.address();
+  if (!endpoint || typeof endpoint === "string") throw new Error("missing listener");
+  try {
+    const address = encodeAddress("33".repeat(20), "testnet");
+    const response = await fetch(`http://127.0.0.1:${endpoint.port}/address/${address}/balance`);
+    assert.equal(response.status, 503);
+    assert.equal((await response.json() as { balanceSats?: string }).balanceSats, undefined);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(join(file, ".."), { recursive: true, force: true });
+  }
+});
+
+import { serializeState } from "./store.js";
+
+function spendTx(txid: string, previous: string, destination: string, value: bigint): Tx {
+  return { txid, coinbase: false, inputs: [{ prev_txid: previous, prev_index: 0 }],
+    outputs: [{ index: 0, script_pubkey: destination, value }] };
+}
+
+test("index accuracy: chained same-block spends and persisted undo restore the exact funded UTXO", () => {
+  const file = tmpFile();
+  try {
+    const store = JsonStore.open(file, idAddress);
+    store.applyBlock(0, "h0", [coinbaseTx("funding", "alice", 100n)]);
+    const beforeUtxos = { ...store.state.utxos };
+    const beforeBalances = { ...store.state.balances };
+    const beforeHistory = structuredClone({ ...store.state.history });
+    store.applyBlock(1, "h1", [
+      spendTx("first", "funding", "bob", 90n),
+      spendTx("second", "first", "carol", 80n),
+      spendTx("third", "second", "dave", 70n),
+    ]);
+    assert.equal(store.getUtxo("funding", 0), undefined);
+    assert.equal(store.getUtxo("first", 0), undefined);
+    assert.equal(store.getUtxo("second", 0), undefined);
+    assert.equal(store.getUtxo("third", 0)?.value, 70n);
+    for (const address of ["alice", "bob", "carol"]) {
+      assert.equal(store.getBalance(idAddress(address)), 0n);
+      assert.equal(store.getUtxoCount(idAddress(address)), 0);
+    }
+    assert.deepEqual(store.getHistory(idAddress("bob")).map((entry) => entry.direction), ["in", "out"]);
+    assert.deepEqual(store.state.undo[1]?.spent.map((entry) => entry.key), ["funding:0"]);
+    store.persist();
+    const loaded = JsonStore.open(file, idAddress);
+    loaded.rollbackTo(0);
+    assert.deepEqual({ ...loaded.state.utxos }, beforeUtxos);
+    assert.deepEqual({ ...loaded.state.balances }, beforeBalances);
+    assert.deepEqual({ ...loaded.state.history }, beforeHistory);
+    assert.equal(loaded.getUtxoCount(idAddress("alice")), 1);
+    for (const address of ["bob", "carol", "dave"]) assert.equal(loaded.getUtxoCount(idAddress(address)), 0);
+    assert.deepEqual(loaded.getTip(), { height: 0, hash: "h0" });
+  } finally { rmSync(join(file, ".."), { recursive: true, force: true }); }
+});
+
+test("index accuracy: duplicate spends and outpoint collisions reject atomically", () => {
+  const attempts: Tx[][] = [
+    [spendTx("a", "funding", "bob", 90n), spendTx("b", "funding", "carol", 90n)],
+    [{ ...spendTx("a", "funding", "bob", 90n), inputs: [
+      { prev_txid: "funding", prev_index: 0 }, { prev_txid: "funding", prev_index: 0 },
+    ] }],
+    [spendTx("a", "funding", "bob", 90n), spendTx("b", "a", "carol", 80n), spendTx("c", "a", "dave", 80n)],
+    [coinbaseTx("collision", "bob", 1n), coinbaseTx("collision", "carol", 1n)],
+    [coinbaseTx("funding", "bob", 100n)],
+    [spendTx("child", "later", "bob", 1n), coinbaseTx("later", "carol", 1n)],
+  ];
+  for (const transactions of attempts) {
+    const store = JsonStore.ephemeral(idAddress);
+    store.applyBlock(0, "h0", [coinbaseTx("funding", "alice", 100n)]);
+    const before = JSON.stringify(serializeState(store.state));
+    const revision = store.getSnapshotId();
+    assert.throws(() => store.applyBlock(1, "h1", transactions), /duplicate|before creation/);
+    assert.equal(JSON.stringify(serializeState(store.state)), before);
+    assert.equal(store.getSnapshotId(), revision);
+    assert.equal(store.getUtxoCount(idAddress("alice")), 1);
+    assert.equal(store.getUtxoCount(idAddress("bob")), 0);
+    // A failed block must not prevent a subsequent valid retry at its height.
+    store.applyBlock(1, "valid-h1", [spendTx("valid", "funding", "bob", 90n)]);
+    assert.equal(store.getBalance(idAddress("bob")), 90n);
+    store.rollbackTo(0);
+    assert.equal(store.getBalance(idAddress("alice")), 100n);
+  }
+});
+
+import { deserializeState } from "./store.js";
+import { Indexer } from "./indexer.js";
+import { RpcClient } from "./rpc.js";
+
+test("snapshot validation: malformed shapes and counters cannot freeze revision/persistence", () => {
+  const store = JsonStore.ephemeral(idAddress);
+  store.applyBlock(0, "h0", [coinbaseTx("funding", "alice", 10n)]);
+  const valid = serializeState(store.state) as Record<string, unknown>;
+  for (const bad of [null, {}, [],
+    { ...valid, blocksApplied: "garbage" }, { ...valid, blocksRolledBack: -1 },
+    { ...valid, reorgsHandled: 0.5 }, { ...valid, blocksApplied: Number.MAX_SAFE_INTEGER + 1 },
+    { ...valid, indexedTip: { height: 0, hash: "wrong" } },
+    { ...valid, indexedTip: null }, { ...valid, chain: [] },
+  ]) {
+    assert.throws(() => deserializeState(bad));
+  }
+  assert.deepEqual(deserializeState(valid), store.state);
+});
+
+test("snapshot roundtrip: prototype-shaped own keys preserve balances, history and undo", () => {
+  const store = JsonStore.ephemeral(() => "__proto__");
+  store.applyBlock(0, "h0", [coinbaseTx("funding", "unused", 10n)]);
+  const loaded = deserializeState(JSON.parse(JSON.stringify(serializeState(store.state))));
+  assert.equal(loaded.balances["__proto__"], 10n);
+  assert.equal(loaded.history["__proto__"]?.length, 1);
+  assert.equal(loaded.undo[0]?.deltas["__proto__"], 10n);
+  assert.deepEqual(loaded, store.state);
+});
+
+test("rollback preflight: a missing undo record leaves all higher blocks unchanged", () => {
+  const store = JsonStore.ephemeral(idAddress);
+  for (let height = 0; height < 3; height++) store.applyBlock(height, `h${height}`, [coinbaseTx(`t${height}`, "alice", 10n)]);
+  delete store.state.undo[1];
+  const before = JSON.stringify(serializeState(store.state));
+  const revision = store.getSnapshotId();
+  assert.throws(() => store.rollbackTo(0), /no undo record/);
+  assert.equal(JSON.stringify(serializeState(store.state)), before);
+  assert.equal(store.getSnapshotId(), revision);
+});
+
+test("sync refuses an RPC block whose height differs from the requested position", async () => {
+  const store = JsonStore.ephemeral(idAddress);
+  const rpc = new RpcClient({ async call(method) {
+    assert.equal(method, "getblockbyheight");
+    return { hash: "wrong", height: 9, parents: [], transactions: [] };
+  } });
+  await assert.rejects(new Indexer(rpc, store).syncOnce(), /requested height 0/);
+  assert.equal(store.getTip(), null);
+  assert.equal(store.state.blocksApplied, 0);
+});

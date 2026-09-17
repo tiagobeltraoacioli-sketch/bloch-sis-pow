@@ -29,7 +29,7 @@ default = []
 # `http` wires a real blocking JSON-RPC transport over ureq. Off by default so
 # the crate builds fully offline against the trait + in-memory mock. Enable it
 # to talk to a live Bloch node: `cargo build --features http`.
-http = ["dep:ureq"]
+http = ["dep:ureq", "dep:url"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -38,6 +38,7 @@ hex = "0.4"
 sha3 = "0.10"
 thiserror = "2"
 ureq = { version = "2", optional = true }
+url = { version = "2", optional = true }
 
 [[example]]
 name = "anchored_notary"

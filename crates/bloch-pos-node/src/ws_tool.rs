@@ -369,21 +369,10 @@ fn keygen(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Are all the arrangement's public keys distinct?
-///
-/// `ws::verify_envelope` enforces uniqueness of the signer *index*, not of the
-/// *key*: `DuplicateSigner` fires when one index is listed twice, and nothing
-/// anywhere compares two slots' `pubkey` bytes. So an arrangement that seats
-/// ONE key in TWO slots turns a 2-of-3 into a 1-of-3 that every client
-/// accepts — the holder signs once and the same signature is listed at both
-/// indices, which are distinct, so no rule is broken. Seating the duplicate
-/// once as `internal` and once as `external` defeats `min_external` in the
-/// same stroke, which is the rule §6.1 leans on to make two founder-adjacent
-/// keys not a quorum.
-///
-/// Rejecting this belongs where an arrangement is BORN, not in the acceptance
-/// rules: changing `verify_envelope` would change what a node accepts. The
-/// arrangement is public, so this is a check every reader can also run.
+/// Refuse duplicate keys before publishing an arrangement. The standalone
+/// verifier and boot decoder repeat this invariant at their own boundaries;
+/// ceremony diagnostics identify the offending slots before signatures are
+/// collected. Distinct keys alone do not establish independent operators.
 fn distinct_signer_keys(set: &SignerSet) -> Result<(), String> {
     for i in 0..set.signers.len() {
         // `i + 1` cannot overflow (i < len); saturating_add carries the proof.
@@ -393,7 +382,7 @@ fn distinct_signer_keys(set: &SignerSet) -> Result<(), String> {
                     "slots {i} and {j} hold the SAME public key.\n  \
                      One key in two slots is a forgeable quorum: its holder signs once, \
                      the signature is listed at both indices, and because the INDICES \
-                     differ, ws::verify_envelope's DuplicateSigner rule never fires — a \
+                     differ, index uniqueness alone cannot protect a \
                      {}-of-{} arrangement that one person alone can satisfy. If the two \
                      slots also differ in subset, the >={} external minimum falls with \
                      it.\n  Every slot must hold a key generated on a DIFFERENT holder's \
@@ -1091,6 +1080,9 @@ fn explain_reject(r: &ws::EnvelopeReject, set: &SignerSet) -> String {
             "signer index {index} appears twice. One key must not count twice toward the \
              quorum — most likely the same signer's file was collected from two machines."
         ),
+        E::DuplicateSignerKey { first, second } => format!(
+            "arrangement slots {first} and {second} reuse one public key; each signer must have a distinct key."
+        ),
         E::QuorumNotReached { got, need } => format!(
             "{got} signature(s), but arrangement {} needs {need}. Collect {} more.",
             set.id,
@@ -1712,15 +1704,14 @@ mod tests {
         let one_signature =
             decode_partial_file(&fs::read(format!("{dir}/sig0")).unwrap()).unwrap().signature;
 
-        // ONE signer, ONE signature, listed at two indices: ACCEPTED.
+        // One signer listed twice cannot satisfy the quorum.
         let forged = CheckpointEnvelope {
             checkpoint: cp,
             signatures: vec![(0, one_signature.clone()), (2, one_signature)],
         };
-        assert!(
-            ws::verify_envelope(&forged, &bad, FIX_NET, &FIX_GEN, &WsHybridVerifier).is_ok(),
-            "the quorum counts distinct INDICES, not distinct KEYS — if this now fails, \
-             verify_envelope was hardened and this test should be inverted"
+        assert_eq!(
+            ws::verify_envelope(&forged, &bad, FIX_NET, &FIX_GEN, &WsHybridVerifier),
+            Err(ws::EnvelopeReject::DuplicateSignerKey { first: 0, second: 2 }),
         );
 
         // ...and the tooling refuses to assemble against it anyway.

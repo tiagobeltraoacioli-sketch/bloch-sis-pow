@@ -54,6 +54,7 @@ mod net;
 mod p2p;
 mod rpc;
 mod slashprot;
+mod slashing_cli;
 mod store;
 mod ws_boot;
 mod validator_deposit;
@@ -91,6 +92,24 @@ const DEFAULT_RPC_PORT: u16 = 16310;
 /// different binaries is the exact failure this replaces.
 const VERSION: &str = env!("BLOCH_BUILD_VERSION");
 
+/// Treat the opt-in as a switch only, never as another option's value.
+fn plaintext_opt_in_flag(args: &[String]) -> bool {
+    if !matches!(args.first().map(String::as_str), Some("run" | "keygen" | "keygen-public")) {
+        return false;
+    }
+    let switches = ["--allow-finality-rewind", "--no-doppelganger-check", "--replay-from-genesis",
+        "--require-state-cache", "--behind-proxy", "--bind-genesis"];
+    let mut rest = args.iter().skip(1);
+    while let Some(arg) = rest.next() {
+        if arg == "--" { break; }
+        if arg == "--allow-plaintext-keystore" { return true; }
+        if arg.starts_with("--") && !switches.contains(&arg.as_str()) && !arg.contains('=') {
+            rest.next(); // a value is data even when it spells a security switch
+        }
+    }
+    false
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Audit I-H1. The keystore is sealed (Argon2id + XChaCha20-Poly1305) and
@@ -100,7 +119,7 @@ fn main() {
     // process — never inferred from the file that happened to be on disk.
     // Applies to `run`, `keygen` and `keygen-public` alike, which is why it is
     // read before the subcommand dispatch rather than inside one of them.
-    if args.iter().any(|a| a == "--allow-plaintext-keystore") {
+    if plaintext_opt_in_flag(&args) {
         keys::allow_plaintext_at_rest();
     }
     match args.first().map(String::as_str) {
@@ -138,6 +157,12 @@ fn main() {
         Some("keygen") => keygen(&args[1..]),
         Some("keygen-public") => keygen_public(&args[1..]),
         Some("keys") => keys_cmd(&args[1..]),
+        Some("slashing-protection") => {
+            if let Err(error) = slashing_cli::run(&args[1..]) {
+                eprintln!("slashing-protection: {error}");
+                exit(2);
+            }
+        }
         Some("genesis") => genesis_cmd(&args[1..]),
         Some("genesis-mainnet") => genesis_mainnet(&args[1..]),
         Some("submit-tx") => submit_tx(&args[1..]),
@@ -244,6 +269,11 @@ fn print_help() {
                epoch from running nodes (all --rpc endpoints must agree),\n\
                writing <prefix>.bin (154 canonical bytes) + <prefix>.json\n\
                and printing the ws digest the signers sign.\n\
+           bloch-pos slashing-protection <export|import|set-floor>\n\
+               --data-dir <dir> --validator-pubkey-sha3 <hex32>\n\
+               --genesis-digest <hex32> [--out <file>|--in <file>|--min-slot <n>]\n\
+               Offline only: stop this node and fence any previous signer.\n\
+               Import merges monotone watermarks; it never lowers protection.\n\
            bloch-pos ws-keygen --out <prefix>\n\
            bloch-pos ws-signer-set --id <n> --threshold <m>\n\
                                    --min-external <k> --adopted-epoch <e>\n\
@@ -819,7 +849,7 @@ fn keys_inspect(args: &[String]) {
             println!("file      : {}", dir.join("validator.key").display());
             println!("format    : {}", info.format);
             println!("index     : {}", info.index);
-            println!("pubkey    : sha3-256 {} ({} bytes)", codec::hex8(&info.pubkey_sha3), info.pubkey_len);
+            println!("pubkey    : sha3-256 {} ({} bytes)", codec::hex32(&info.pubkey_sha3), info.pubkey_len);
             match info.kdf {
                 Some(k) => println!("kdf       : Argon2id m={} KiB t={} p={}", k.m_cost, k.t_cost, k.p_cost),
                 None => println!("kdf       : none (PLAINTEXT — run `bloch-pos keys seal`)"),
@@ -837,16 +867,7 @@ fn keys_inspect(args: &[String]) {
             exit(1);
         }
     }
-    // Whether a node is running over the dir, via the same lock the node
-    // takes. Taking and releasing it here is harmless: without a running node
-    // nothing else contends for it, and with one it is refused.
-    match store::DirLock::acquire(&dir) {
-        Ok(lock) => println!("data dir  : lock free ({})", lock.path().display()),
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            println!("data dir  : IN USE by a running node — `keys seal` will refuse until it stops")
-        }
-        Err(e) => println!("data dir  : lock check failed ({e})"),
-    }
+    println!("data dir  : lock not probed (inspection is read-only)");
 }
 
 fn keygen(args: &[String]) {
@@ -1542,7 +1563,9 @@ fn run_cmd(args: &[String]) {
     };
     if let Err(e) = engine::run(cfg) {
         eprintln!("bloch-pos: {e}");
-        exit(1);
+        // Policy refusal requires an operator to repair checkpoint/trust
+        // configuration; restarting the same inputs cannot repair it.
+        exit(if ws_boot::is_non_retryable(&e) { 78 } else { 1 });
     }
 }
 
@@ -1825,5 +1848,17 @@ mod transport_tests {
             let plan = decide_transport(&argv(line)).unwrap();
             assert!(plan.summary.contains(want), "{line} → {}", plan.summary);
         }
+    }
+}
+
+#[cfg(test)]
+mod plaintext_flag_tests {
+    #[test]
+    fn opt_in_must_be_a_switch_on_a_keystore_command() {
+        let args = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(super::plaintext_opt_in_flag(&args(&["run", "--data-dir", "data", "--allow-plaintext-keystore"])));
+        assert!(!super::plaintext_opt_in_flag(&args(&["run", "--data-dir", "--allow-plaintext-keystore"])));
+        assert!(!super::plaintext_opt_in_flag(&args(&["run", "--", "--allow-plaintext-keystore"])));
+        assert!(!super::plaintext_opt_in_flag(&args(&["slashing-protection", "--allow-plaintext-keystore"])));
     }
 }

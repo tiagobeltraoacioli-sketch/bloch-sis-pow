@@ -670,7 +670,7 @@ fn repair_log_tail(log: &mut File, dir: &Path) -> io::Result<u64> {
     let length = log.metadata()?.len();
     let mut at = 0u64;
     while at < length {
-        if length - at < 4 { break; }
+        if length.saturating_sub(at) < 4 { break; }
         log.seek(SeekFrom::Start(at))?;
         let mut prefix = [0; 4]; log.read_exact(&mut prefix)?;
         let size = u32::from_le_bytes(prefix) as u64;
@@ -690,13 +690,15 @@ fn repair_log_tail(log: &mut File, dir: &Path) -> io::Result<u64> {
             let mut magic = [0u8; 8];
             if idx.read_exact(&mut magic).is_ok() && &magic == IDX_MAGIC {
                 let count = idx_count(&idx)?;
-                if count > 0 && idx_read(&mut idx, count - 1)?.end() > at {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData,
-                        "incomplete frame overlaps indexed history; refusing automatic log truncation"));
+                if let Some(last) = count.checked_sub(1) {
+                    if idx_read(&mut idx, last)?.end() > at {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData,
+                            "incomplete frame overlaps indexed history; refusing automatic log truncation"));
+                    }
                 }
             }
         }
-        eprintln!("store: removing {} incomplete trailing log bytes before append", length - at);
+        eprintln!("store: removing {} incomplete trailing log bytes before append", length.saturating_sub(at));
         log.set_len(at)?;
         log.sync_all()?;
     }

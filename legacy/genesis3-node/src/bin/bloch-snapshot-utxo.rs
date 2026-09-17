@@ -43,6 +43,7 @@ use std::path::Path;
 /// which of the two disagreeing conventions to use — see the long comment at
 /// this function's call site for why BOTH exist and why the default
 /// (`canonical = false`) is the historically-INCORRECT one.
+#[cfg(test)]
 fn decode_vout(bytes: [u8; 4], canonical: bool) -> u32 {
     if canonical {
         u32::from_le_bytes(bytes) // correct: matches storage::utxo_key's actual encoding
@@ -199,14 +200,14 @@ fn main() {
     for item in db.iterator_cf(&cf_utxo, rocksdb::IteratorMode::Start) {
         let (key, val) = match item { Ok(kv) => kv, Err(e) => {
             eprintln!("read error while iterating the UTXO set: {e}"); std::process::exit(1); } };
-        if key.len() < 36 { continue; }
-        let txid = key[..key.len() - 4].to_vec();
-        let vout_bytes = [key[key.len()-4], key[key.len()-3], key[key.len()-2], key[key.len()-1]];
-        let vout = decode_vout(vout_bytes, canonical_vout);
-        let output: bloch::core::TxOutput = match bloch::storage::decode(&val) {
-            Ok(o) => o, Err(_) => continue,
+        let row = match bloch::storage::decode_snapshot_row(&key, &val, canonical_vout) {
+            Ok(row) => row,
+            Err(error) => {
+                eprintln!("refusing incomplete UTXO snapshot: {error}");
+                std::process::exit(1);
+            }
         };
-        utxos.push((txid, vout, output.value, output.script_pubkey));
+        utxos.push(row);
     }
     // Sort by (txid, decoded vout) — numeric order on whichever decode mode
     // is active. In the default (historical) mode this is EXACTLY RocksDB's

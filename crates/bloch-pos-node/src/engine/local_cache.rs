@@ -27,7 +27,7 @@ fn log_hash(path: &std::path::Path, len: u64) -> io::Result<[u8; 32]> {
         let n = file.read(&mut buf)?;
         if n == 0 { break; }
         hash.update(&buf[..n]);
-        seen += n as u64;
+        seen = seen.checked_add(n as u64).ok_or_else(|| invalid("cache log prefix length overflow"))?;
     }
     if seen != len { return Err(invalid("cache log prefix is truncated")); }
     Ok(hash.finalize().into())
@@ -47,7 +47,9 @@ impl Engine {
         bytes.extend_from_slice(&Sha3_256::digest(env!("BLOCH_SOURCE_DIGEST").as_bytes()));
         bytes.extend_from_slice(&len.to_le_bytes());
         bytes.extend_from_slice(&log_hash(&log, len)?);
-        bytes.extend_from_slice(&((self.chain.len() - 1) as u64).to_le_bytes());
+        let block_count = self.chain.len().checked_sub(1)
+            .ok_or_else(|| invalid("cache canonical chain is empty"))?;
+        bytes.extend_from_slice(&(block_count as u64).to_le_bytes());
         bytes.extend_from_slice(&self.state.encode_local_cache().map_err(invalid)?);
         let checksum = Sha3_256::digest(&bytes);
         bytes.extend_from_slice(&checksum);
@@ -67,7 +69,7 @@ impl Engine {
         }
         fs::rename(temporary, dir.join("state.cache"))?;
         crate::store::fsync_dir(dir)?;
-        println!("state-cache: persisted slot={} blocks={} bytes={} elapsed_ms={}", self.state.slot(), self.chain.len()-1, bytes.len(), started.elapsed().as_millis());
+        println!("state-cache: persisted slot={} blocks={} bytes={} elapsed_ms={}", self.state.slot(), block_count, bytes.len(), started.elapsed().as_millis());
         Ok(())
     }
 
@@ -106,14 +108,16 @@ impl Engine {
         file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
         // fixed header 120 bytes + checksum 32; variable state follows header.
         if bytes.len() < 152 || bytes.len() as u64 > MAX_BYTES { return Err(invalid("truncated state cache")); }
-        let end = bytes.len() - 32;
+        let end = bytes.len().checked_sub(32).ok_or_else(|| invalid("cache checksum is truncated"))?;
         if Sha3_256::digest(&bytes[..end]).as_slice() != &bytes[end..] { return Err(invalid("state cache checksum mismatch")); }
         if &bytes[..8] != MAGIC || bytes[8..40] != Sha3_256::digest(self.manifest.encode())[..] ||
             bytes[40..72] != Sha3_256::digest(env!("BLOCH_SOURCE_DIGEST").as_bytes())[..] {
             return Err(invalid("state cache schema, network or build mismatch"));
         }
-        let number = |at| -> io::Result<u64> {
-            Ok(u64::from_le_bytes(bytes[at..at+8].try_into().map_err(invalid)?))
+        let number = |at: usize| -> io::Result<u64> {
+            let end = at.checked_add(8).ok_or_else(|| invalid("cache header offset overflow"))?;
+            let value = bytes.get(at..end).ok_or_else(|| invalid("cache header is truncated"))?;
+            Ok(u64::from_le_bytes(value.try_into().map_err(invalid)?))
         };
         let len = number(72)?;
         let count = usize::try_from(number(112)?).map_err(invalid)?;
@@ -127,11 +131,15 @@ impl Engine {
                 return Err(invalid("state cache prefix is not canonical"));
             }
             body_transactions(env).map_err(invalid)?;
-            prefix_len += 4 + crate::codec::encode_envelope(env).len() as u64;
+            prefix_len = prefix_len.checked_add(4)
+                .and_then(|len| len.checked_add(crate::codec::encode_envelope(env).len() as u64))
+                .ok_or_else(|| invalid("cache frame prefix length overflow"))?;
             parent = env.block_id(); slot = env.header.slot;
         }
         if prefix_len != len { return Err(invalid("state cache does not end at its log frame")); }
-        let state = CommittedState::decode_local_cache(&bytes[120..end], &logged[count-1].header).map_err(invalid)?;
+        let last = logged.get(..count).and_then(|prefix| prefix.last())
+            .ok_or_else(|| invalid("cache canonical prefix is empty"))?;
+        let state = CommittedState::decode_local_cache(&bytes[120..end], &last.header).map_err(invalid)?;
         if state.admission_network_domain() != self.state.admission_network_domain() { return Err(invalid("state cache admission domain mismatch")); }
         Ok((state, count))
     }

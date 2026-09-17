@@ -13,7 +13,7 @@
 //!   — the hash — is ever sent to the server; `r` is revealed only in a witness the
 //!   client assembles locally).
 //!
-//! To make the invariant enforceable and not merely aspirational, every request
+//! To catch accidental disclosure under recognizable field names, every request
 //! body is scanned by [`guard_no_secrets`] and rejected (HTTP 400) if any field
 //! name looks like secret material (`secret`, `seed`, `priv`, `mnemonic`, `wif`,
 //! `preimage`, a bare `r`/`sk`, …), and pubkey fields must be 33-byte compressed
@@ -45,9 +45,9 @@ use std::str::FromStr;
 
 /// The banner attached to every response — the non-custodial contract, restated.
 pub const SIGN_LOCALLY: &str =
-    "SIGN LOCALLY — non-custodial. This server never sees a private key and never \
-     signs. Sign the returned artifact with your own key(s) on your device; the BTC \
-     private keys, the PQ secret key, and the preimage r never leave the client.";
+    "SIGN LOCALLY — non-custodial. This server does not sign or require private keys. \
+     Sign the returned artifact with your own key(s) on your device. Never send BTC \
+     private keys, the PQ secret key, or the preimage r to this service.";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Error type
@@ -96,7 +96,8 @@ const FORBIDDEN_EXACT: &[&str] = &["r", "sk", "d", "privkey", "private_key"];
 
 /// Recursively reject any request whose JSON contains a key that looks like a
 /// private key, seed, or the raw preimage `r`. This is the enforcement half of the
-/// non-custodial invariant: the server refuses to even receive secret material.
+/// input hygiene check; it cannot identify arbitrary secret bytes in allowed
+/// string fields, nor undo disclosure once a request reaches the server.
 pub fn guard_no_secrets(v: &Value) -> Result<(), ApiError> {
     match v {
         Value::Object(map) => {
@@ -229,6 +230,7 @@ struct VaultParamsReq {
 
 impl VaultParamsReq {
     fn to_params(&self, network: Network) -> Result<VaultParams, ApiError> {
+        if self.csv_delay < 144 { return Err(ApiError::bad("csv_delay must be at least 144 blocks")); }
         Ok(VaultParams {
             hot_pubkey: parse_pubkey("hot_pubkey", &self.hot_pubkey)?,
             recovery_pubkey: parse_pubkey("recovery_pubkey", &self.recovery_pubkey)?,
@@ -318,23 +320,46 @@ fn default_chain() -> String {
     "bitcoin".into()
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct AnchorVerifyReq {
-    /// Either supply the fields + `signature`, OR a full serialized `signed_anchor_hex`.
-    #[serde(flatten)]
     fields: Option<AnchorFields>,
-    /// The PQ signature (hex) over the commitment bytes, produced CLIENT-SIDE.
-    #[serde(default)]
     signature: Option<String>,
-    /// Alternatively, a full serialized `SignedAnchor` blob (commitment ‖ signature).
-    #[serde(default)]
     signed_anchor_hex: Option<String>,
-    /// REQUIRED. The enveloped ML-DSA-65 ‖ Falcon-1024 PUBLIC key the caller already
-    /// trusts for this vault, obtained out-of-band. Verification is meaningless without
-    /// it: the key carried *inside* an anchor is chosen by whoever produced the anchor.
-    #[serde(default)]
     trusted_pq_pubkey: Option<String>,
+}
+
+// Explicitly split the two request forms. `flatten` plus optional nested fields
+// does not reliably enforce `deny_unknown_fields` on either representation.
+fn parse_anchor_verify(body: &Bytes) -> Result<AnchorVerifyReq, ApiError> {
+    let value: Value = parse_guarded(body)?;
+    let mut map = value.as_object().cloned().ok_or_else(|| ApiError::bad("expected object"))?;
+    let mut string = |key: &str| -> Result<Option<String>, ApiError> {
+        map.remove(key).map(|value| value.as_str().map(str::to_owned)
+            .ok_or_else(|| ApiError::bad(format!("{key} must be a string")))).transpose()
+    };
+    let signature = string("signature")?;
+    let signed_anchor_hex = string("signed_anchor_hex")?;
+    let trusted_pq_pubkey = string("trusted_pq_pubkey")?;
+    let fields = if signed_anchor_hex.is_some() {
+        if signature.is_some() || !map.is_empty() {
+            return Err(ApiError::bad("serialized anchor cannot be mixed with fields or signature"));
+        }
+        None
+    } else {
+        Some(serde_json::from_value(Value::Object(map))
+            .map_err(|e| ApiError::bad(format!("bad anchor fields: {e}")))?)
+    };
+    Ok(AnchorVerifyReq { fields, signature, signed_anchor_hex, trusted_pq_pubkey })
+}
+
+fn validate_anchor_addresses(anchor: &PqShieldAnchor) -> Result<(), ApiError> {
+    if anchor.csv_delay < 144 { return Err(ApiError::bad("csv_delay must be at least 144 blocks")); }
+    // The native script construction service currently implements Bitcoin only.
+    // Both addresses must be valid on one common Bitcoin network.
+    if ![Network::Bitcoin, Network::Testnet, Network::Signet, Network::Regtest]
+        .into_iter().any(|network| anchor.validate_bitcoin_addresses(network).is_ok()) {
+        return Err(ApiError::bad("anchor requires valid Bitcoin addresses on the same network"));
+    }
+    Ok(())
 }
 
 fn parse_target_chain(s: &str) -> Result<TargetChain, ApiError> {
@@ -350,7 +375,7 @@ fn parse_target_chain(s: &str) -> Result<TargetChain, ApiError> {
 
 impl AnchorFields {
     fn to_anchor(&self) -> Result<PqShieldAnchor, ApiError> {
-        Ok(PqShieldAnchor {
+        let anchor = PqShieldAnchor {
             version: ANCHOR_VERSION,
             target_chain: parse_target_chain(&self.target_chain)?,
             btc_vault_address: self.btc_vault_address.trim().as_bytes().to_vec(),
@@ -359,7 +384,9 @@ impl AnchorFields {
             designated_safe_dest: self.designated_safe_dest.trim().as_bytes().to_vec(),
             csv_delay: self.csv_delay,
             policy: self.policy.as_bytes().to_vec(),
-        })
+        };
+        validate_anchor_addresses(&anchor)?;
+        Ok(anchor)
     }
 }
 
@@ -422,6 +449,20 @@ async fn vault_address(body: Bytes) -> Result<Json<Value>, ApiError> {
     })))
 }
 
+/// Conservative API construction limits, not Bitcoin consensus rules. Fee
+/// estimation and emergency fee ladders remain the signing client's responsibility.
+fn check_payment(amount: u64, fee: u64, script: &bitcoin::Script) -> Result<(), ApiError> {
+    const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
+    let output = amount.checked_sub(fee).ok_or_else(|| ApiError::bad("fee exceeds input amount"))?;
+    if amount > MAX_MONEY || output < script.minimal_non_dust().to_sat() {
+        return Err(ApiError::bad("input exceeds MAX_MONEY or output is dust"));
+    }
+    if fee > amount / 10 {
+        return Err(ApiError::bad("fee exceeds the API's 10% input-value safety limit"));
+    }
+    Ok(())
+}
+
 /// POST /vault/unvault-tx — the DEPOSIT→TRIGGER unsigned tx + the hot-key sighash.
 async fn unvault_tx(body: Bytes) -> Result<Json<Value>, ApiError> {
     let req: UnvaultReq = parse_guarded(&body)?;
@@ -432,6 +473,7 @@ async fn unvault_tx(body: Bytes) -> Result<Json<Value>, ApiError> {
     if req.fee_sat >= req.deposit_amount_sat {
         return Err(ApiError::bad("fee_sat >= deposit_amount_sat would create a dust/zero output"));
     }
+    check_payment(req.deposit_amount_sat, req.fee_sat, &trigger_address(&p).script_pubkey())?;
     let u = build_unvault_tx(&p, deposit_op, req.deposit_amount_sat, req.fee_sat);
     let dep_script = deposit_script(&p.recovery_hash, &p.hot_pubkey);
     let sighash = p2wsh_sighash(&u, 0, &dep_script, req.deposit_amount_sat);
@@ -470,6 +512,7 @@ async fn branch_a_tx(body: Bytes) -> Result<Json<Value>, ApiError> {
         return Err(ApiError::bad("fee_sat >= trigger_amount_sat would create a dust/zero output"));
     }
 
+    check_payment(req.trigger_amount_sat, req.fee_sat, &dest.script_pubkey())?;
     let a = build_branch_a_tx(&p, trigger_op, req.trigger_amount_sat, &dest, req.fee_sat);
     let trig_script = trigger_script(&p);
     let sighash = p2wsh_sighash(&a, 0, &trig_script, req.trigger_amount_sat);
@@ -508,6 +551,7 @@ async fn clawback_tx(body: Bytes) -> Result<Json<Value>, ApiError> {
         return Err(ApiError::bad("fee_sat >= trigger_amount_sat would create a dust/zero output"));
     }
 
+    check_payment(req.trigger_amount_sat, req.fee_sat, &safe.script_pubkey())?;
     let claw = build_clawback_tx(trigger_op, req.trigger_amount_sat, &safe, req.fee_sat);
     let trig_script = trigger_script(&p);
     let sighash = p2wsh_sighash(&claw, 0, &trig_script, req.trigger_amount_sat);
@@ -571,7 +615,7 @@ async fn anchor_commitment(body: Bytes) -> Result<Json<Value>, ApiError> {
 
 /// POST /anchor/verify — verify a PQ signature over an anchor. No secrets involved.
 async fn anchor_verify(body: Bytes) -> Result<Json<Value>, ApiError> {
-    let req: AnchorVerifyReq = parse_guarded(&body)?;
+    let req = parse_anchor_verify(&body)?;
 
     let signed = if let Some(blob) = &req.signed_anchor_hex {
         let raw = hexbytes("signed_anchor_hex", blob)?;
@@ -588,6 +632,8 @@ async fn anchor_verify(body: Bytes) -> Result<Json<Value>, ApiError> {
             .ok_or_else(|| ApiError::bad("missing `signature` (hex of the PQ signature)"))?;
         SignedAnchor { anchor: fields.to_anchor()?, signature: hexbytes("signature", signature)? }
     };
+
+    validate_anchor_addresses(&signed.anchor)?;
 
     // The anchor cannot be its own trust root: anyone can sign a well-formed anchor
     // naming their own designated_safe_dest. Refuse to answer without an external key.
@@ -621,9 +667,9 @@ async fn landing() -> Html<&'static str> {
 /// L-16 fix (audit finding): per-request wall-clock deadline. Every route
 /// here does real, CPU-expensive work (P2WSH script assembly and, on
 /// `/anchor/verify`, a hybrid ML-DSA-65 ‖ Falcon-1024 verification) with no
-/// authentication and no rate limiting in front of it (`main.rs` binds
-/// `PQ_SHIELD_BIND`, which accepts `0.0.0.0`). A timeout bounds any single
-/// request's worst case; it does not by itself bound aggregate concurrent
+/// authentication or per-client rate limiting in the application. The binary
+/// accepts only loopback listeners. A timeout bounds asynchronous waits but
+/// cannot preempt synchronous cryptographic work; it does not bound aggregate concurrent
 /// load, which is what [`MAX_CONCURRENT_REQUESTS`] is for.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// L-16 fix: ceiling on requests being handled at once, so a burst of
@@ -636,6 +682,21 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// requirement, not optional hardening.
 const MAX_CONCURRENT_REQUESTS: usize = 64;
 
+async fn require_json_request(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    if request.method() == axum::http::Method::POST {
+        let content_type = request.headers().get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()).unwrap_or("")
+            .split(';').next().unwrap_or("").trim();
+        if !content_type.eq_ignore_ascii_case("application/json") {
+            return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+        }
+        if request.headers().get("sec-fetch-site").and_then(|value| value.to_str().ok()) == Some("cross-site") {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    }
+    next.run(request).await
+}
+
 /// Build the router. Exposed so integration tests can drive it in-process.
 ///
 /// **Deployment note (L-16 fix):** this service speaks plain HTTP and
@@ -643,8 +704,8 @@ const MAX_CONCURRENT_REQUESTS: usize = 64;
 /// construction/verification tool, not a secrets-holding service) — running
 /// it reachable from an untrusted network REQUIRES a TLS-terminating
 /// reverse proxy in front of it (the same requirement `coherence-prover`'s
-/// service documents for its own HTTP surface). `PQ_SHIELD_BIND=0.0.0.0`
-/// binds every interface; do this only behind such a proxy.
+/// service documents for its own HTTP surface). The binary restricts its
+/// listener to loopback; configure authentication and rate limits in the proxy.
 pub fn router() -> Router {
     Router::new()
         .route("/", get(landing))
@@ -660,6 +721,8 @@ pub fn router() -> Router {
             REQUEST_TIMEOUT,
         ))
         .layer(tower::limit::ConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS))
+        .layer(axum::extract::DefaultBodyLimit::max(128 * 1024))
+        .layer(axum::middleware::from_fn(require_json_request))
 }
 
 #[cfg(test)]
@@ -796,15 +859,19 @@ mod tests {
         assert_eq!(resp["sighashes"][0]["sign_with"], "recovery_key (secp256k1)");
     }
 
+    fn fixture_address(opcode: u8) -> String {
+        bitcoin::Address::p2wsh(&bitcoin::ScriptBuf::from_bytes(vec![opcode]), Network::Regtest).to_string()
+    }
+
     #[tokio::test]
     async fn anchor_commitment_and_verify_roundtrip() {
         let (keys, _r, hr) = public_inputs();
         let fields = json!({
             "target_chain": "bitcoin",
-            "btc_vault_address": "bcrt1qexampledepositaddress",
+            "btc_vault_address": fixture_address(0x51),
             "recovery_hash": hex::encode(hr),
             "pq_recovery_pubkey": hex::encode(&keys.pq_pubkey),
-            "designated_safe_dest": "bcrt1qsafecolddestination",
+            "designated_safe_dest": fixture_address(0x52),
             "csv_delay": 144u32,
             "policy": "watchtower-01",
         });
@@ -814,10 +881,10 @@ mod tests {
         let anchor = PqShieldAnchor {
             version: ANCHOR_VERSION,
             target_chain: TargetChain::Bitcoin,
-            btc_vault_address: b"bcrt1qexampledepositaddress".to_vec(),
+            btc_vault_address: fixture_address(0x51).into_bytes(),
             recovery_hash: hr,
             pq_recovery_pubkey: keys.pq_pubkey.clone(),
-            designated_safe_dest: b"bcrt1qsafecolddestination".to_vec(),
+            designated_safe_dest: fixture_address(0x52).into_bytes(),
             csv_delay: 144,
             policy: b"watchtower-01".to_vec(),
         };
@@ -835,7 +902,7 @@ mod tests {
 
         // Tamper the safe dest → verification must fail closed.
         let mut tampered = verify_req.clone();
-        tampered.insert("designated_safe_dest".into(), json!("bcrt1qATTACKER"));
+        tampered.insert("designated_safe_dest".into(), json!(fixture_address(0x53)));
         let vr2 = anchor_verify(body(Value::Object(tampered))).await.expect("ok").0;
         assert_eq!(vr2["valid"], json!(false));
     }
@@ -853,10 +920,10 @@ mod tests {
         let forged_anchor = PqShieldAnchor {
             version: ANCHOR_VERSION,
             target_chain: TargetChain::Bitcoin,
-            btc_vault_address: b"bcrt1qexampledepositaddress".to_vec(),
+            btc_vault_address: fixture_address(0x51).into_bytes(),
             recovery_hash: hr,
             pq_recovery_pubkey: attacker.pq_pubkey.clone(),
-            designated_safe_dest: b"bcrt1qATTACKERpayoutaddress".to_vec(),
+            designated_safe_dest: fixture_address(0x53).into_bytes(),
             csv_delay: 144,
             policy: b"watchtower-01".to_vec(),
         };
@@ -864,10 +931,10 @@ mod tests {
 
         let forged_req = json!({
             "target_chain": "bitcoin",
-            "btc_vault_address": "bcrt1qexampledepositaddress",
+            "btc_vault_address": fixture_address(0x51),
             "recovery_hash": hex::encode(hr),
             "pq_recovery_pubkey": hex::encode(&attacker.pq_pubkey),
-            "designated_safe_dest": "bcrt1qATTACKERpayoutaddress",
+            "designated_safe_dest": fixture_address(0x53),
             "csv_delay": 144u16,
             "policy": "watchtower-01",
             "signature": hex::encode(&forged.signature),
@@ -913,10 +980,10 @@ mod tests {
         let (keys, _r, hr) = public_inputs();
         let req = json!({
             "target_chain": "bitcoin",
-            "btc_vault_address": "bcrt1qexampledepositaddress",
+            "btc_vault_address": fixture_address(0x51),
             "recovery_hash": hex::encode(hr),
             "pq_recovery_pubkey": hex::encode(&keys.pq_pubkey),
-            "designated_safe_dest": "bcrt1qsafecolddestination",
+            "designated_safe_dest": fixture_address(0x52),
             "csv_delay": 65_680u32,
             "policy": "watchtower-01",
         });
@@ -1016,3 +1083,72 @@ contain a private key, seed, or the preimage <code>r</code> are rejected (HTTP 4
 <p><strong>Hardened recovery (audit M1):</strong> derive your recovery key on a HARDENED path,
 not a non-hardened sibling of the hot key.</p>
 </body></html>"#;
+
+#[cfg(test)]
+mod audit_edge_regressions {
+    use super::*;
+    use tower::ServiceExt;
+
+    fn fields() -> Value {
+        let address = bitcoin::Address::p2wsh(&bitcoin::ScriptBuf::new(), Network::Regtest).to_string();
+        json!({"target_chain":"bitcoin", "btc_vault_address":address,
+            "designated_safe_dest":address, "recovery_hash":"00".repeat(32),
+            "pq_recovery_pubkey":"01", "csv_delay":144})
+    }
+    fn bytes(value: Value) -> Bytes { Bytes::from(serde_json::to_vec(&value).unwrap()) }
+
+    #[test]
+    fn anchor_forms_refuse_unknown_fields_and_ambiguous_encodings() {
+        let mut request = fields();
+        request["signature"] = json!("00");
+        request["unrecognized"] = json!("do not echo me");
+        assert!(parse_anchor_verify(&bytes(request)).is_err());
+        assert!(parse_anchor_verify(&bytes(json!({"signed_anchor_hex":"00", "unknown":"value"}))).is_err());
+        assert!(parse_anchor_verify(&bytes(json!({"signed_anchor_hex":"00", "signature":"00"}))).is_err());
+        assert!(parse_anchor_verify(&bytes(json!({"signed_anchor_hex":"00", "trusted_pq_pubkey":"01"}))).is_ok());
+    }
+
+    #[test]
+    fn anchor_addresses_require_valid_same_network_bitcoin_addresses() {
+        let parse = |value| parse_guarded::<AnchorFields>(&bytes(value)).unwrap().to_anchor();
+        assert!(parse(fields()).is_ok());
+        let mut invalid = fields();
+        invalid["designated_safe_dest"] = json!("bcrt1qinvalid");
+        assert!(parse(invalid).is_err());
+        let mut wrong_network = fields();
+        wrong_network["designated_safe_dest"] = json!(bitcoin::Address::p2wsh(
+            &bitcoin::ScriptBuf::new(), Network::Bitcoin).to_string());
+        assert!(parse(wrong_network).is_err());
+        let mut wrong_chain = fields();
+        wrong_chain["target_chain"] = json!("ethereuml1");
+        assert!(parse(wrong_chain).is_err());
+    }
+
+    #[test]
+    fn nested_delay_and_payment_policy_cannot_be_bypassed() {
+        let params = VaultParamsReq { hot_pubkey: String::new(), recovery_pubkey: String::new(),
+            recovery_hash: String::new(), csv_delay: 0 };
+        assert!(params.to_params(Network::Regtest).err().unwrap().message.contains("144"));
+        let script = bitcoin::Address::p2wsh(&bitcoin::ScriptBuf::new(), Network::Regtest).script_pubkey();
+        let dust = script.minimal_non_dust().to_sat();
+        assert!(check_payment(dust - 1, 0, &script).is_err());
+        assert!(check_payment(dust, 0, &script).is_ok());
+        assert!(check_payment(100_000, 10_001, &script).is_err());
+        assert!(check_payment(u64::MAX, 0, &script).is_err());
+        assert!(check_payment(100_000, 500, &script).is_ok());
+    }
+
+    #[tokio::test]
+    async fn http_refuses_form_cross_site_and_oversized_requests() {
+        for (content_type, site, data, expected) in [
+            ("text/plain", "same-origin", "{}".into(), StatusCode::UNSUPPORTED_MEDIA_TYPE),
+            ("application/json", "cross-site", "{}".into(), StatusCode::FORBIDDEN),
+            ("application/json", "same-origin", " ".repeat(128 * 1024 + 1), StatusCode::PAYLOAD_TOO_LARGE),
+        ] {
+            let request = axum::http::Request::builder().method("POST").uri("/anchor/commitment")
+                .header("content-type", content_type).header("sec-fetch-site", site)
+                .body(axum::body::Body::from(data)).unwrap();
+            assert_eq!(router().oneshot(request).await.unwrap().status(), expected);
+        }
+    }
+}

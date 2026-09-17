@@ -5,12 +5,17 @@
 #[path = "../src/slashprot.rs"]
 mod slashprot;
 
-// The journal module uses this only to abbreviate public digests in errors.
-mod codec {
-    pub fn hex8(bytes: &[u8; 32]) -> String {
-        bytes[..4].iter().map(|b| format!("{b:02x}")).collect()
-    }
-}
+// Import the real dependencies: recovery now verifies ownership and performs
+// durable private writes. Stubs would bypass the behavior this test must prove.
+#[allow(dead_code)]
+#[path = "../src/codec.rs"]
+mod codec;
+#[allow(dead_code)]
+#[path = "../src/store.rs"]
+mod store;
+#[allow(dead_code)]
+#[path = "../src/keys.rs"]
+mod keys;
 
 #[test]
 fn legacy_reservation_survives_restart_and_blocks_old_or_surrounding_duties() {

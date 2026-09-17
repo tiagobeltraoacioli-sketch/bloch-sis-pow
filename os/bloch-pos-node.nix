@@ -177,6 +177,8 @@ in
       wantedBy = [ "multi-user.target" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
+      startLimitIntervalSec = 600;
+      startLimitBurst = 3;
 
       serviceConfig = {
         # Sealed passphrase via LoadCredential — see keystorePassphraseFile's
@@ -210,7 +212,8 @@ in
         Group = "bloch-pos";
         StateDirectory = "bloch-pos";
         Restart = "on-failure";
-        RestartSec = 5;
+        RestartSec = 30;
+        RestartPreventExitStatus = [ 78 ];
 
         MemoryMax = cfg.memoryMax;
         MemoryHigh = cfg.memoryHigh;

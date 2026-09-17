@@ -22,6 +22,10 @@ pub enum AnchorError {
     #[error("no valid Bloch anchor commitment found in transaction outputs")]
     NoAnchor,
 
+    /// Multiple carrier pairs make the claimed commitment ambiguous.
+    #[error("multiple Bloch anchor commitments found in transaction outputs")]
+    AmbiguousAnchor,
+
     /// The RPC transport failed (network, IO, etc.).
     #[error("rpc transport error: {0}")]
     Transport(String),

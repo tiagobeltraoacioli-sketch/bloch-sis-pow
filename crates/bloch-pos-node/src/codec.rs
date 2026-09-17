@@ -184,8 +184,13 @@ pub fn decode_envelope(buf: &[u8]) -> Result<BlockEnvelope, DecodeErr> {
         BlockHeaderV4::canonical_deserialize(hb).map_err(|_| DecodeErr("bad header"))?;
     let proposer_sig = r.bytes()?;
     let natt = r.u32()? as usize;
-    if natt > 4096 {
+    if natt > bloch_pos_committee::params::MAX_ATTESTATIONS_PER_BLOCK {
         return Err(DecodeErr("too many attestations"));
+    }
+    // Every attestation has 128 fixed bytes including its signature length.
+    // Reserve only after the frame proves it can contain the declared count.
+    if natt > r.buf.len().saturating_sub(r.at) / 128 {
+        return Err(DecodeErr("truncated attestation collection"));
     }
     let mut attestations = Vec::with_capacity(natt);
     for _ in 0..natt {
@@ -194,6 +199,9 @@ pub fn decode_envelope(buf: &[u8]) -> Result<BlockEnvelope, DecodeErr> {
     let ntx = r.u32()? as usize;
     if ntx > 65_536 {
         return Err(DecodeErr("too many transactions"));
+    }
+    if ntx > r.buf.len().saturating_sub(r.at) / 4 {
+        return Err(DecodeErr("truncated transaction collection"));
     }
     let mut transactions = Vec::with_capacity(ntx);
     for _ in 0..ntx {
@@ -294,6 +302,21 @@ mod tests {
         assert_eq!(back.body.attestations[0].signature, env.body.attestations[0].signature);
         // Identity is preserved through the codec — same bytes, same id.
         assert_eq!(back.block_id(), env.block_id());
+    }
+
+    #[test]
+    fn audit_collection_counts_must_fit_the_remaining_frame() {
+        let mut env = sample_envelope();
+        env.proposer_sig.clear();
+        env.body.attestations.clear();
+        env.body.transactions.clear();
+        let mut bytes = encode_envelope(&env);
+        let counts = BlockHeaderV4::ENCODED_LEN + 4;
+        bytes[counts..counts + 4].copy_from_slice(&4096u32.to_le_bytes());
+        assert_eq!(decode_envelope(&bytes).err().unwrap().0, "truncated attestation collection");
+        bytes[counts..counts + 4].copy_from_slice(&0u32.to_le_bytes());
+        bytes[counts + 4..counts + 8].copy_from_slice(&65536u32.to_le_bytes());
+        assert_eq!(decode_envelope(&bytes).err().unwrap().0, "truncated transaction collection");
     }
 
     #[test]

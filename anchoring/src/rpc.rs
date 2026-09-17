@@ -72,7 +72,7 @@ impl<T: RpcTransport> BlochRpc<T> {
     pub fn call(&self, method: &str, params: Value) -> Result<Value> {
         let id = {
             let mut g = self.id.borrow_mut();
-            *g += 1;
+            *g = g.checked_add(1).ok_or_else(|| AnchorError::BadResponse("RPC request ID exhausted".into()))?;
             *g
         };
         let body = json!({
@@ -84,6 +84,14 @@ impl<T: RpcTransport> BlochRpc<T> {
         .to_string();
 
         let resp = self.transport.request(&body)?;
+
+        if resp.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+            || resp.get("id").and_then(Value::as_u64) != Some(id) {
+            return Err(AnchorError::BadResponse("wrong JSON-RPC version or response ID".into()));
+        }
+        if resp.get("error").is_some_and(|error| !error.is_null()) && resp.get("result").is_some() {
+            return Err(AnchorError::BadResponse("response contains both result and error".into()));
+        }
 
         // Standard JSON-RPC error object.
         if let Some(err) = resp.get("error") {
@@ -129,14 +137,9 @@ impl<T: RpcTransport> BlochRpc<T> {
     /// `gettxstatus` — confirmation depth + (optional) height.
     pub fn get_tx_status(&self, txid: &Txid) -> Result<TxStatus> {
         let result = self.call("gettxstatus", json!([txid.to_hex()]))?;
-        let confirmations = result
-            .get("confirmations")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let height = result
-            .get("height")
-            .and_then(Value::as_u64)
-            .or_else(|| result.get("blockheight").and_then(Value::as_u64));
+        let confirmations = result.get("confirmations").and_then(Value::as_u64)
+            .ok_or_else(|| AnchorError::BadResponse("missing or invalid confirmations".into()))?;
+        let height = parse_height(&result)?;
         Ok(TxStatus {
             confirmations,
             height,
@@ -149,14 +152,9 @@ impl<T: RpcTransport> BlochRpc<T> {
     pub fn get_transaction(&self, txid: &Txid) -> Result<RetrievedTx> {
         let result = self.call("gettransaction", json!([txid.to_hex()]))?;
 
-        let confirmations = result
-            .get("confirmations")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let height = result
-            .get("height")
-            .and_then(Value::as_u64)
-            .or_else(|| result.get("blockheight").and_then(Value::as_u64));
+        let confirmations = result.get("confirmations").and_then(Value::as_u64)
+            .ok_or_else(|| AnchorError::BadResponse("missing or invalid confirmations".into()))?;
+        let height = parse_height(&result)?;
 
         // Preferred: explicit output list.
         let outputs = result
@@ -195,6 +193,20 @@ impl<T: RpcTransport> BlochRpc<T> {
             "gettransaction had neither outputs nor hex".into(),
         ))
     }
+}
+
+fn parse_height(result: &Value) -> Result<Option<u64>> {
+    let mut height = None;
+    for key in ["height", "blockheight"] {
+        if let Some(value) = result.get(key).filter(|value| !value.is_null()) {
+            let parsed = value.as_u64().ok_or_else(|| AnchorError::BadResponse(format!("invalid {key}")))?;
+            if height.is_some_and(|previous| previous != parsed) {
+                return Err(AnchorError::BadResponse("conflicting height fields".into()));
+            }
+            height = Some(parsed);
+        }
+    }
+    Ok(height)
 }
 
 // ─────────────────────────── in-memory mock node ───────────────────────────
@@ -344,5 +356,39 @@ mod tests {
             rpc.get_transaction(&missing),
             Err(AnchorError::Rpc(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod audit_envelope {
+    use super::*;
+    struct Fixed(Value);
+    impl RpcTransport for Fixed {
+        fn request(&self, _: &str) -> Result<Value> { Ok(self.0.clone()) }
+    }
+    #[test]
+    fn refuses_cross_request_and_malformed_envelopes() {
+        for response in [json!({"result": 12}),
+            json!({"jsonrpc":"2.0", "id":2, "result":12}),
+            json!({"jsonrpc":"1.0", "id":1, "result":12}),
+            json!({"jsonrpc":"2.0", "id":1, "result":12, "error":{"code":-1}})] {
+            assert!(BlochRpc::new(Fixed(response)).get_block_count().is_err());
+        }
+        assert_eq!(BlochRpc::new(Fixed(json!({"jsonrpc":"2.0", "id":1, "result":12})))
+            .get_block_count().unwrap(), 12);
+    }
+}
+
+#[cfg(test)]
+mod audit_status {
+    use super::*;
+    #[test]
+    fn refuses_invalid_or_conflicting_height_metadata() {
+        for value in [json!({"height":"3"}), json!({"height":-1}),
+            json!({"height":3, "blockheight":4})] {
+            assert!(parse_height(&value).is_err());
+        }
+        assert_eq!(parse_height(&json!({"height":null})).unwrap(), None);
+        assert_eq!(parse_height(&json!({"height":3,"blockheight":3})).unwrap(), Some(3));
     }
 }

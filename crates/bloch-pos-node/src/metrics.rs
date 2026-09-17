@@ -169,10 +169,11 @@ pub struct NodeMetrics {
     /// 1 while the node considers itself syncing (behind and requesting
     /// blocks), else 0.
     pub is_syncing: AtomicU64,
-    /// 1 when a keystore is loaded AND its key matches the committed registry
-    /// (the node performs duties); 0 on an observer or a pending-activation
-    /// validator. `avg_over_time` of this against the roster is the
-    /// "validator-not-started" alarm.
+    /// 1 when the loaded key matches an active registry record at the current
+    /// wall epoch and boot-grace/doppelganger gates allow participation.
+    /// Refreshed each engine turn; 0 during startup or without an eligible key.
+    /// This does not prove a duty was selected, signed, included, or allowed
+    /// by its durable slashing watermark.
     pub validator_active: AtomicU64,
     /// Unix seconds of the last time the finalized epoch advanced (stamped at
     /// boot to the boot time, so the gauge is never 0 on a live node).
@@ -422,7 +423,7 @@ impl NodeMetrics {
         series(
             "bloch_pos_validator_active",
             "gauge",
-            "1 when this node performs validator duties, 0 on an observer or unarmed validator",
+            "1 when the registered key is epoch-eligible and startup/doppelganger gates are open; not a completed-duty count",
             self.get(&self.validator_active),
         );
         series(
@@ -660,7 +661,7 @@ fn serve_connection(sock: &mut TcpStream, metrics: &NodeMetrics) {
     // GET) is ignored: we answer and close.
     let mut buf: Vec<u8> = Vec::with_capacity(512);
     let mut chunk = [0u8; 1024];
-    let deadline = std::time::Instant::now() + IO_TIMEOUT;
+    let Some(deadline) = std::time::Instant::now().checked_add(IO_TIMEOUT) else { return };
     let head_end = loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() { return; }

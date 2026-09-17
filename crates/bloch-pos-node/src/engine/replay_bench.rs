@@ -656,6 +656,7 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         state: StateCell::new(genesis_state),
         tr: Transition::new(verifier.clone()),
         tr_probe: Transition::new(ProbeVerifier),
+        gossip_verifier: super::verification::GossipVerifier::new(verifier.clone()),
         verifier,
         keys: None, // observer: replay proposes nothing and attests nothing
         blocks: BTreeMap::new(),

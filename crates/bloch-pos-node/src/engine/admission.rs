@@ -39,9 +39,11 @@ impl Mempool {
     pub(super) fn insert(&mut self, key: Vec<u8>, tx: PosTransaction) -> Option<PosTransaction> {
         let old = self.remove(&key);
         self.bytes = self.bytes.saturating_add(key.len());
-        *self.identities.entry(tx.txid()).or_default() += 1;
+        let count = self.identities.entry(tx.txid()).or_default();
+        *count = count.saturating_add(1);
         if let Some(source) = tx_source_hash(&tx) {
-            *self.sources.entry(source).or_default() += 1;
+            let count = self.sources.entry(source).or_default();
+            *count = count.saturating_add(1);
         }
         self.entries.insert(key, tx);
         old
@@ -161,11 +163,20 @@ pub(super) fn check_transfer(
         {
             return Err(Refusal::Invalid("transfer key does not own its input"));
         }
-        spent += u128::from(entry.value);
+        spent = spent
+            .checked_add(u128::from(entry.value))
+            .ok_or(Refusal::Invalid("transfer input sum overflows"))?;
     }
     let charge = fee_market::charge(class, declared, state.next_base_fee(), tip);
-    let created: u128 = outputs.iter().map(|o| u128::from(o.value)).sum();
-    if spent != created + charge.base_fee_sat + charge.priority_fee_sat {
+    let created = outputs
+        .iter()
+        .try_fold(0u128, |total, output| {
+            total.checked_add(u128::from(output.value))
+        })
+        .and_then(|total| total.checked_add(charge.base_fee_sat))
+        .and_then(|total| total.checked_add(charge.priority_fee_sat))
+        .ok_or(Refusal::Invalid("transfer output and fee sum overflows"))?;
+    if spent != created {
         return Err(Refusal::StateDependent(
             "transfer value is not conserved at the current base fee",
         ));

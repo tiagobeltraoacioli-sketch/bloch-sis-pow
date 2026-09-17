@@ -70,7 +70,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CARGO_LOCK="${BLOCH_CARGO_LOCK:-/private/tmp/bloch-cargo-lock.sh}"
+CARGO_LOCK="${BLOCH_CARGO_LOCK:-$ROOT/scripts/cargo-serial.py}"
 DEEP=0
 LIST=0
 COMMANDS=0
@@ -87,9 +87,8 @@ done
 if [ -x "$CARGO_LOCK" ]; then
   CARGO=("$CARGO_LOCK" cargo)
 else
-  echo "WARNING: no cargo lock wrapper at $CARGO_LOCK; running cargo directly." >&2
-  echo "         On the shared build box this is a rule violation. Set BLOCH_CARGO_LOCK." >&2
-  CARGO=(cargo)
+  echo "ERROR: trusted cargo lock wrapper is not executable: $CARGO_LOCK" >&2
+  exit 1
 fi
 
 # ── the manifest of what must be proven ──────────────────────────────────────

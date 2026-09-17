@@ -102,22 +102,24 @@ pub fn encode_default(commitment: &Commitment) -> [AnchorOutput; CARRIER_OUTPUTS
 /// `scripts` is the ordered list of every output `script_pubkey` in the tx.
 /// Returns [`AnchorError::NoAnchor`] if no valid v1 anchor is present.
 pub fn decode(scripts: &[Vec<u8>]) -> Result<(Commitment, Vec<Vec<u8>>)> {
+    let mut found = None;
     for (i, s0) in scripts.iter().enumerate() {
         if s0.len() != SCRIPT_PUBKEY_LEN || s0[..4] != ANCHOR_MAGIC {
             continue;
         }
         // The next output must be the second carrier.
         let s1 = match scripts.get(i + 1) {
-            Some(s) if s.len() == SCRIPT_PUBKEY_LEN => s,
+            Some(s) if s.len() == SCRIPT_PUBKEY_LEN && s[16..20] == [0; 4] => s,
             _ => continue,
         };
         let mut bytes = [0u8; COMMITMENT_LEN];
         bytes[0..16].copy_from_slice(&s0[4..20]);
         bytes[16..32].copy_from_slice(&s1[0..16]);
         let commitment = Commitment::from_bytes(bytes);
-        return Ok((commitment, vec![s0.clone(), s1.clone()]));
+        if found.is_some() { return Err(AnchorError::AmbiguousAnchor); }
+        found = Some((commitment, vec![s0.clone(), s1.clone()]));
     }
-    Err(AnchorError::NoAnchor)
+    found.ok_or(AnchorError::NoAnchor)
 }
 
 #[cfg(test)]
@@ -151,5 +153,21 @@ mod tests {
     fn decode_rejects_when_absent() {
         let scripts = vec![vec![1u8; SCRIPT_PUBKEY_LEN], vec![2u8; SCRIPT_PUBKEY_LEN]];
         assert!(matches!(decode(&scripts), Err(AnchorError::NoAnchor)));
+    }
+}
+
+#[cfg(test)]
+mod audit_ambiguity {
+    use super::*;
+    #[test]
+    fn rejects_noncanonical_padding_and_ambiguous_pairs() {
+        let encoded = encode_default(&Commitment::hash_payload(b"test"));
+        let pair: Vec<Vec<u8>> = encoded.iter().map(|out| out.script_pubkey.to_vec()).collect();
+        let mut bad_padding = pair.clone();
+        bad_padding[1][19] = 1;
+        assert!(matches!(decode(&bad_padding), Err(AnchorError::NoAnchor)));
+        let mut ambiguous = pair.clone();
+        ambiguous.extend(pair);
+        assert!(matches!(decode(&ambiguous), Err(AnchorError::AmbiguousAnchor)));
     }
 }

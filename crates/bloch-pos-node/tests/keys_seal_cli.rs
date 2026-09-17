@@ -83,13 +83,18 @@ fn a_plaintext_keystore_is_sealed_in_place_and_opens_only_under_the_passphrase()
     let plain = std::fs::read(dir.join("validator.key")).expect("read plaintext keystore");
     assert_eq!(&plain[..8], PLAINTEXT_MAGIC);
 
-    // 2. Inspect says plaintext, prints no secret, and reports the lock free.
+    // 2. Inspect says plaintext, prints no secret, and does not mutate the directory lock.
     let i = run(&["keys", "inspect", "--dir", d], &[]);
     assert!(i.status.success(), "{}", text(&i));
     let shown = text(&i);
     assert!(shown.contains("plaintext"), "{shown}");
     assert!(shown.contains("index     : 9"), "{shown}");
-    assert!(shown.contains("lock free"), "{shown}");
+    assert!(shown.contains("inspection is read-only"), "{shown}");
+    // The recovery CLI requires the complete 32-byte binding, not a display prefix.
+    let binding = shown.lines().find_map(|line| line.strip_prefix("pubkey    : sha3-256 "))
+        .and_then(|line| line.split_whitespace().next()).expect("public identity binding");
+    assert_eq!(binding.len(), 64, "recovery binding must contain all 32 bytes");
+    assert!(binding.bytes().all(|b| b.is_ascii_hexdigit()));
     // The RANDAO seed is the last 32 bytes of the plaintext file; the secret
     // key sits before it. Neither may appear in anything inspect prints.
     let seed = &plain[plain.len() - 32..];
@@ -118,6 +123,7 @@ fn a_plaintext_keystore_is_sealed_in_place_and_opens_only_under_the_passphrase()
     let i = run(&["keys", "inspect", "--dir", d], &[]);
     assert!(i.status.success(), "{}", text(&i));
     assert!(text(&i).contains("sealed"), "{}", text(&i));
+    assert!(text(&i).contains(binding), "sealing must preserve the full public identity binding");
 
     // 5. The sealed file opens under the passphrase file and NOT under the
     //    plaintext opt-in: the migration is real, not cosmetic.

@@ -70,8 +70,8 @@
 //! validator slashed.
 
 use std::fmt;
-use std::fs::{self, File};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use sha3::digest::{ExtendableOutput, Update, XofReader};
@@ -178,11 +178,65 @@ pub struct Binding {
 #[derive(Debug)]
 pub struct SlashingProtection {
     path: PathBuf,
-    dir: PathBuf,
     wm: Watermarks,
     /// Identity the file is (or will be, on the next commit) bound to.
     /// `None` only for a caller that supplied none over a legacy file.
     binding: Option<Binding>,
+}
+
+/// Export a bound record while the validator is stopped. No secret key is read.
+pub fn export_bound(dir: &Path, binding: Binding) -> io::Result<Vec<u8>> {
+    crate::keys::ensure_mutation_ownership(dir)?;
+    let _lock = crate::store::DirLock::acquire(dir)?;
+    use std::io::Read;
+    let mut record = Vec::new();
+    fs::File::open(dir.join(FILE_NAME))?.take((RECORD_LEN_V2 + 1) as u64).read_to_end(&mut record)?;
+    let (_, actual) = decode(&record).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid slashing protection record"))?;
+    if actual != Some(binding) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "export requires a bound record matching the validator and network"));
+    }
+    Ok(record)
+}
+
+/// Merge a bound backup without ever decreasing a local watermark. This
+/// protects local recovery; it cannot stop an old host from signing.
+pub fn import_bound(dir: &Path, binding: Binding, bytes: &[u8]) -> io::Result<Watermarks> {
+    let (incoming, actual) = decode(bytes).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid slashing protection backup"))?;
+    if actual != Some(binding) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "backup validator/network binding mismatch or absent"));
+    }
+    merge_bound(dir, binding, incoming)
+}
+
+/// Refuse proposal/attestation slots below `min_slot` after recovery. Epoch
+/// protection conservatively skips the remainder of its preceding epoch.
+/// Operators must independently fence every old host before using this.
+pub fn initialize_floor(dir: &Path, binding: Binding, min_slot: u64) -> io::Result<Watermarks> {
+    if min_slot == 0 || min_slot == u64::MAX {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "minimum slot must be between 1 and u64::MAX - 1"));
+    }
+    let slot = min_slot.checked_sub(1).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "minimum slot must be positive"))?;
+    let epoch = slot / bloch_pos_committee::params::SLOTS_PER_EPOCH;
+    merge_bound(dir, binding, Watermarks {
+        proposal_slot: Some(slot), attestation_slot: Some(slot),
+        source_epoch: Some(epoch), target_epoch: Some(epoch),
+    })
+}
+
+fn merge_bound(dir: &Path, binding: Binding, incoming: Watermarks) -> io::Result<Watermarks> {
+    fs::create_dir_all(dir)?;
+    crate::keys::ensure_mutation_ownership(dir)?;
+    let _lock = crate::store::DirLock::acquire(dir)?;
+    let mut protection = SlashingProtection::open_bound(dir, binding)?;
+    let old = protection.watermarks();
+    let merged = Watermarks {
+        proposal_slot: old.proposal_slot.max(incoming.proposal_slot),
+        attestation_slot: old.attestation_slot.max(incoming.attestation_slot),
+        source_epoch: old.source_epoch.max(incoming.source_epoch),
+        target_epoch: old.target_epoch.max(incoming.target_epoch),
+    };
+    protection.write_durably(merged)?;
+    Ok(merged)
 }
 
 impl SlashingProtection {
@@ -272,7 +326,7 @@ impl SlashingProtection {
             }
             (None, None) => None,
         };
-        Ok(SlashingProtection { path, dir: dir.to_path_buf(), wm, binding })
+        Ok(SlashingProtection { path, wm, binding })
     }
 
     /// The identity the file is bound to (or will be bound to on the next
@@ -281,7 +335,7 @@ impl SlashingProtection {
         self.binding
     }
 
-    /// The loaded watermarks. Read-only: the only writer is a guarded sign.
+    /// The loaded watermarks. Recovery tooling only advances these floors.
     pub fn watermarks(&self) -> Watermarks {
         self.wm
     }
@@ -354,17 +408,7 @@ impl SlashingProtection {
     }
 
     fn write_durably(&self, next: Watermarks) -> io::Result<()> {
-        let tmp = self.path.with_extension("bin.tmp");
-        {
-            let mut f = File::create(&tmp)?;
-            f.write_all(&encode(&next, self.binding.as_ref()))?;
-            f.sync_all()?;
-        }
-        fs::rename(&tmp, &self.path)?;
-        // The rename itself must be durable, or a crash can resurrect the
-        // previous watermark and re-arm the duty this call just consumed.
-        File::open(&self.dir)?.sync_all()?;
-        Ok(())
+        crate::store::atomic_private_write(&self.path, &encode(&next, self.binding.as_ref()))
     }
 }
 
@@ -448,6 +492,7 @@ fn digest(body: &[u8]) -> [u8; 32] {
 mod tests {
     use super::*;
     use std::io::Read;
+    use std::fs::File;
 
     struct Dir(PathBuf);
     impl Drop for Dir {
@@ -643,6 +688,32 @@ mod tests {
     /// is refused by validator B and by A on another network, and the refusal
     /// names which of the two differs. A itself reopens it with the watermarks
     /// intact.
+    #[test]
+    fn audit_recovery_is_bound_monotone_and_durable() {
+        let source = dir("recovery-source");
+        let destination = dir("recovery-destination");
+        initialize_floor(&source.0, KEY_A, 97).unwrap();
+        let backup = export_bound(&source.0, KEY_A).unwrap();
+        assert!(import_bound(&destination.0, KEY_B, &backup).is_err());
+        assert!(!destination.0.exists(), "validate before creating recovery state");
+        let mut bad = backup.clone(); bad.push(0);
+        assert!(import_bound(&destination.0, KEY_A, &bad).is_err());
+        import_bound(&destination.0, KEY_A, &backup).unwrap();
+        initialize_floor(&destination.0, KEY_A, 193).unwrap();
+        let merged = import_bound(&destination.0, KEY_A, &backup).unwrap();
+        assert_eq!(merged.proposal_slot, Some(192));
+        let mut reopened = SlashingProtection::open_bound(&destination.0, KEY_A).unwrap();
+        assert_eq!(reopened.watermarks(), merged);
+        assert!(reopened.guard_proposal(192, || panic!("must not sign")).is_err());
+        assert!(reopened.guard_attestation(193, 0, 1, || panic!("must not sign")).is_err());
+        assert!(initialize_floor(&destination.0, KEY_A, 0).is_err());
+        assert!(initialize_floor(&destination.0, KEY_A, u64::MAX).is_err());
+        let _lock = crate::store::DirLock::acquire(&destination.0).unwrap();
+        assert!(import_bound(&destination.0, KEY_A, &backup).is_err());
+        assert!(initialize_floor(&destination.0, KEY_A, 300).is_err());
+        assert!(export_bound(&destination.0, KEY_A).is_err());
+    }
+
     #[test]
     fn a_watermark_file_bound_to_another_identity_is_refused_naming_the_mismatch() {
         let d = dir("bound");
