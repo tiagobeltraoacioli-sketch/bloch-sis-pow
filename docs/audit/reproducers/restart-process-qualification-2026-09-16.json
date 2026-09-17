@@ -1,0 +1,75 @@
+{
+  "kind": "local_devnet_process_qualification_not_mainnet_sla",
+  "binary": "/Users/tiagobulhoes/repos/github/bloch-node-recovery/target/release/bloch-pos",
+  "binary_sha256": "38b2b7453473bfed00f1765d9b6015eaa81a89fe5e7cfbaea7ae2dcd62a814ec",
+  "buildinfo": {
+    "build_version": "0.1.0-mainnet (5af78a04a27d+dirty)",
+    "package_version": "0.1.0-mainnet",
+    "commit": "5af78a04a27d",
+    "commit_source": "git",
+    "tree_state": "modified",
+    "source_digest": "de31f24a0e3746f54ddf673e8ed4b2f0814cd52a1ff50b151fc3518990f7c157",
+    "source_digest_alg": "sha3-256",
+    "source_digest_scope": "workspace crates dir: rs, toml, c, h, S, s; plus workspace Cargo.toml and Cargo.lock; relative paths, sorted, length-prefixed",
+    "source_files": "211",
+    "source_bytes": "6328302",
+    "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+    "profile": "release",
+    "target": "x86_64-apple-darwin",
+    "digest_note": "different digests prove different source trees; equal digests are evidence of the same source, not proof \u2014 whoever can edit the source can edit the build script that hashes it"
+  },
+  "platform": "macOS-26.6.2-x86_64-i386-64bit",
+  "rpc_poll_interval_seconds": 0.05,
+  "filesystem_cache": "uncontrolled",
+  "cases": [
+    {
+      "case": "cache_and_tail",
+      "rpc_ready_seconds": 0.17168693300000015,
+      "slot": 39,
+      "height": 39,
+      "state_root": "24b28008953a2a2f7e62d8eb5412ca8a01e854cb5c48891fb561b34edf00fc19",
+      "recovery_log": [
+        "state-cache: restored file=state.cache slot=32 skipped_blocks=32",
+        "recovery: mode=local-cache skipped_blocks=32 replayed_blocks=7 elapsed_ms=10",
+        "state-cache: persisted slot=39 blocks=39 bytes=4653 elapsed_ms=54"
+      ]
+    },
+    {
+      "case": "restart_after_sigkill",
+      "rpc_ready_seconds": 0.05877399299999908,
+      "slot": 39,
+      "height": 39,
+      "state_root": "24b28008953a2a2f7e62d8eb5412ca8a01e854cb5c48891fb561b34edf00fc19",
+      "recovery_log": [
+        "state-cache: restored file=state.cache slot=39 skipped_blocks=39",
+        "recovery: mode=local-cache skipped_blocks=39 replayed_blocks=0 elapsed_ms=3"
+      ]
+    },
+    {
+      "case": "full_replay_reference",
+      "rpc_ready_seconds": 0.1577479420000003,
+      "slot": 39,
+      "height": 39,
+      "state_root": "24b28008953a2a2f7e62d8eb5412ca8a01e854cb5c48891fb561b34edf00fc19",
+      "recovery_log": [
+        "recovery: mode=full-replay skipped_blocks=0 replayed_blocks=39 elapsed_ms=38",
+        "state-cache: persisted slot=39 blocks=39 bytes=4653 elapsed_ms=38"
+      ]
+    },
+    {
+      "case": "previous_generation",
+      "rpc_ready_seconds": 0.05540001399999994,
+      "slot": 39,
+      "height": 39,
+      "state_root": "24b28008953a2a2f7e62d8eb5412ca8a01e854cb5c48891fb561b34edf00fc19",
+      "recovery_log": [
+        "state-cache: restored file=state.cache.previous slot=39 skipped_blocks=39",
+        "recovery: mode=local-cache skipped_blocks=39 replayed_blocks=0 elapsed_ms=3"
+      ]
+    },
+    {
+      "case": "both_caches_corrupt",
+      "strict_mode_refused": true
+    }
+  ]
+}

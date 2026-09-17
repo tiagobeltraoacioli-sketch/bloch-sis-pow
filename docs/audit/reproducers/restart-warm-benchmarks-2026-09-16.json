@@ -1,0 +1,34 @@
+[
+  {
+    "leaves": 8192.0,
+    "blocks": 96.0,
+    "skipped": 65.0,
+    "tail": 31.0,
+    "genesis_ms": 123.757,
+    "full_replay_including_cache_write_ms": 2182.766,
+    "cached_boot_genesis_ms": 92.614,
+    "log_read_ms": 9.824,
+    "restore_ms": 145.441,
+    "tail_ms": 735.593,
+    "cached_total_ms": 983.472,
+    "cpu": "Intel(R) Core(TM) i9-9880H CPU @ 2.30GHz",
+    "application_cache": "warm_from_fixture_generation",
+    "scope": "in_process_fixture_not_rpc_readiness"
+  },
+  {
+    "leaves": 452726.0,
+    "blocks": 96.0,
+    "skipped": 65.0,
+    "tail": 31.0,
+    "genesis_ms": 2121.002,
+    "full_replay_including_cache_write_ms": 25555.626,
+    "cached_boot_genesis_ms": 2083.884,
+    "log_read_ms": 3.402,
+    "restore_ms": 2238.36,
+    "tail_ms": 11700.993,
+    "cached_total_ms": 16026.64,
+    "cpu": "Intel(R) Core(TM) i9-9880H CPU @ 2.30GHz",
+    "application_cache": "warm_from_fixture_generation",
+    "scope": "in_process_fixture_not_rpc_readiness"
+  }
+]

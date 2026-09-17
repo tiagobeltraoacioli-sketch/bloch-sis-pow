@@ -1,0 +1,38 @@
+{
+  "kind": "assumption_based_scenario_not_a_measurement",
+  "inputs": {
+    "blocks": 12200,
+    "base_seconds_per_block": 0.59,
+    "growth_seconds_per_block": 0,
+    "daily_blocks": 2880,
+    "days": [
+      0,
+      30
+    ],
+    "startup_overhead_seconds": 0,
+    "metadata_seconds_per_block": 0,
+    "state_load_seconds": 0,
+    "tail_blocks": 31,
+    "rto_seconds": 300.0
+  },
+  "projections": [
+    {
+      "blocks": 12200,
+      "tail_blocks": 31,
+      "full_replay_seconds": 7198.0,
+      "cached_restart_seconds": 18.29,
+      "day": 0,
+      "full_exceeds_rto": true,
+      "cache_exceeds_rto": false
+    },
+    {
+      "blocks": 98600,
+      "tail_blocks": 31,
+      "full_replay_seconds": 58174.0,
+      "cached_restart_seconds": 18.29,
+      "day": 30,
+      "full_exceeds_rto": true,
+      "cache_exceeds_rto": false
+    }
+  ]
+}

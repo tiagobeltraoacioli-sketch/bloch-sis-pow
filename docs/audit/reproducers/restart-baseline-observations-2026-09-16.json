@@ -1,0 +1,63 @@
+{
+  "date": "2026-09-16",
+  "published_release": "2026-09-14",
+  "published_source_sha256": "29784c856c89a341376f51276d067b5c35cf01bb2a008a7654185c5d5db993dd",
+  "published_commit": "58da5ce209acb6e293b3b381dfd826dedb8741fd",
+  "candidate_base_commit": "5af78a0",
+  "mainnet_height_verified": false,
+  "observations": [
+    {
+      "endpoint": "https://blochl1.com/rpc",
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {
+          "code": -32000,
+          "message": "No archival node answered 'getchaininfo'. This is a fault at this endpoint or at the two observer nodes behind it, and it is NOT a statement about Genesis-4: the chain may be finalising normally right now. Retry in a few seconds.",
+          "data": {
+            "reason": "no_upstream_answered",
+            "method": "getchaininfo",
+            "attempts": [
+              {
+                "upstream": "http://139.180.166.5.nip.io:8080/",
+                "outcome": "http 504"
+              },
+              {
+                "upstream": "http://139.180.173.231.nip.io:8080/",
+                "outcome": "http 504"
+              }
+            ],
+            "chainStatusKnown": false
+          }
+        }
+      }
+    },
+    {
+      "endpoint": "https://posternlabs.com/g4rpc",
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {
+          "code": -32000,
+          "message": "No archival node answered 'getchaininfo'. This is a fault at this endpoint or at the two observer nodes behind it, and it is NOT a statement about Genesis-4: the chain may be finalising normally right now. Retry in a few seconds.",
+          "data": {
+            "reason": "no_upstream_answered",
+            "method": "getchaininfo",
+            "attempts": [
+              {
+                "upstream": "http://139.180.166.5.nip.io:8080/",
+                "outcome": "timeout"
+              },
+              {
+                "upstream": "http://139.180.173.231.nip.io:8080/",
+                "outcome": "timeout"
+              }
+            ],
+            "chainStatusKnown": false
+          }
+        },
+        "corroboration": null
+      }
+    }
+  ]
+}

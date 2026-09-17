@@ -1,0 +1,103 @@
+{
+  "observed_utc": "2026-09-16T19:53:03.347285+00:00",
+  "scope": "local working-tree inventory; not live fleet state or completed agent task verification",
+  "published_node": {
+    "release": "2026-09-14",
+    "commit": "58da5ce209acb6e293b3b381dfd826dedb8741fd",
+    "rustc": "1.94.1",
+    "source_digest_sha3_256": "3317c232bfb3427efe87b9d9520bbcead63b90077ffd4b931a096eab97425bf5"
+  },
+  "worktrees": [
+    {
+      "repository": "bloch-node-recovery",
+      "head": "5af78a04a27dcb2c2253c32134fca888a8a965f9",
+      "branch": "fix/persisted-restart-recovery",
+      "working_tree_entries": 27,
+      "working_tree_activation_values": {
+        "LEAK_RECOVERY_ACTIVATION_EPOCH": "2_880",
+        "FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH": "2_884",
+        "EXIT_AUTH_ACTIVATION_EPOCH": "2_884",
+        "WITHDRAWAL_ACTIVATION_EPOCH": "2_884",
+        "SLASHING_EVIDENCE_ACTIVATION_EPOCH": "2_884",
+        "RANDAO_RECOMMIT_ACTIVATION_EPOCH": "2_884"
+      }
+    },
+    {
+      "repository": "bloch-validator-payout",
+      "head": "5af78a04a27dcb2c2253c32134fca888a8a965f9",
+      "branch": "feat/offline-validator-payout",
+      "working_tree_entries": 0,
+      "working_tree_activation_values": {
+        "LEAK_RECOVERY_ACTIVATION_EPOCH": "2_880",
+        "FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH": "2_884",
+        "EXIT_AUTH_ACTIVATION_EPOCH": "2_884",
+        "WITHDRAWAL_ACTIVATION_EPOCH": "2_884",
+        "SLASHING_EVIDENCE_ACTIVATION_EPOCH": "2_884",
+        "RANDAO_RECOMMIT_ACTIVATION_EPOCH": "2_884"
+      }
+    },
+    {
+      "repository": "bloch-historical-indexer",
+      "head": "5af78a04a27dcb2c2253c32134fca888a8a965f9",
+      "branch": "feat/historical-indexer",
+      "working_tree_entries": 0,
+      "working_tree_activation_values": {
+        "LEAK_RECOVERY_ACTIVATION_EPOCH": "2_880",
+        "FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH": "2_884",
+        "EXIT_AUTH_ACTIVATION_EPOCH": "2_884",
+        "WITHDRAWAL_ACTIVATION_EPOCH": "2_884",
+        "SLASHING_EVIDENCE_ACTIVATION_EPOCH": "2_884",
+        "RANDAO_RECOMMIT_ACTIVATION_EPOCH": "2_884"
+      }
+    },
+    {
+      "repository": "bloch-native-wallet-integration",
+      "head": "ec7946eeaad466d01e2466218f887f795b72d1dc",
+      "branch": "codex/native-wallet-integration",
+      "working_tree_entries": 23,
+      "working_tree_activation_values": {
+        "LEAK_RECOVERY_ACTIVATION_EPOCH": "2_700",
+        "FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH": "u64::MAX",
+        "EXIT_AUTH_ACTIVATION_EPOCH": "u64::MAX",
+        "WITHDRAWAL_ACTIVATION_EPOCH": "u64::MAX",
+        "SLASHING_EVIDENCE_ACTIVATION_EPOCH": "u64::MAX",
+        "RANDAO_RECOMMIT_ACTIVATION_EPOCH": "u64::MAX"
+      }
+    },
+    {
+      "repository": "bloch-monday-activation",
+      "head": "c11382228ed0290749a3d44f2cbe1089fa5b71d4",
+      "branch": "release/validator-activation-20260914",
+      "working_tree_entries": 1,
+      "working_tree_activation_values": {
+        "LEAK_RECOVERY_ACTIVATION_EPOCH": "2_880",
+        "FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH": "2_884",
+        "EXIT_AUTH_ACTIVATION_EPOCH": "2_884",
+        "WITHDRAWAL_ACTIVATION_EPOCH": "2_884",
+        "SLASHING_EVIDENCE_ACTIVATION_EPOCH": "2_884",
+        "RANDAO_RECOMMIT_ACTIVATION_EPOCH": "2_884"
+      }
+    },
+    {
+      "repository": "bloch-sis-pow",
+      "head": "4eec48be5bb063969e148c6986dc356698a35492",
+      "branch": "main",
+      "working_tree_entries": 77,
+      "working_tree_activation_values": {
+        "LEAK_RECOVERY_ACTIVATION_EPOCH": "2_700",
+        "FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH": "u64::MAX",
+        "EXIT_AUTH_ACTIVATION_EPOCH": "u64::MAX",
+        "WITHDRAWAL_ACTIVATION_EPOCH": "u64::MAX",
+        "SLASHING_EVIDENCE_ACTIVATION_EPOCH": "u64::MAX",
+        "RANDAO_RECOMMIT_ACTIVATION_EPOCH": "u64::MAX"
+      }
+    },
+    {
+      "repository": "bloch-explorer",
+      "head": "094b88d266158e0bd1e3b17a2fb4701be9d61dc2",
+      "branch": "main",
+      "working_tree_entries": 8
+    }
+  ],
+  "checkpoint_installer_expiry_utc": "2026-09-22T08:43:19+00:00"
+}
