@@ -1,0 +1,106 @@
+{
+  "status": "passed",
+  "activation_epoch": 4,
+  "throwaway_devnet": true,
+  "source_commit": "4eec48be5bb063969e148c6986dc356698a35492",
+  "shipping_params_sha256": "b51409e4dd3df6f05d79cd0e95f73773fdb5d59fddc82929edbd31eb5051725e",
+  "regime": "finite shipping gates compressed to epoch one; lifecycle at epoch four",
+  "devnet_only_flags": [
+    "--allow-plaintext-keystore"
+  ],
+  "completed": [
+    "network-pre-activation-refusal",
+    "network-post-activation-admission",
+    "network-finalized-registration-and-activation",
+    "joining-proposal-attestation-and-terminal-agreement",
+    "joining-duties-included-in-both-committed-logs",
+    "default-doppelganger-observation-before-duties"
+  ],
+  "binary_sha256": "0bf55ac56127e4f8272178e016ff3258e4c542081aa60592c4c0e147cdd8bb7f",
+  "pre_activation_refusal": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "error": {
+      "code": -32008,
+      "message": "funded validator admission is not active: FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH is unarmed or not reached \u2014 this transaction cannot be admitted; retrying the same bytes will not help"
+    }
+  },
+  "submission": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "result": {
+      "accepted": true,
+      "status": "accepted",
+      "kind": "funded_deposit",
+      "bytes": 16949,
+      "tx_hash": "080fadcab579fe154b3b8caa9d2a6082f988e0860141aa7931de9e3f9d58130c",
+      "tx_hash_note": "local correlation handle only (SHA3-256 of the canonical bytes); not a consensus transaction id \u2014 no block commits to it",
+      "confirmation": "this transport does not confirm: watch for the transaction in a block via `getblockbyslot`. `finalized: true` on that block is the strongest signal this chain offers, but it is NOT a settlement guarantee \u2014 no slashing penalty backs it and it is not a latch; see `docs/integration/BLOCH-GENESIS4-EXCHANGE-INTEGRATION.md` \u00a75"
+    }
+  },
+  "active_records": [
+    {
+      "index": 1,
+      "pubkey_hash": "a8b633cacc4e849800e1e78d956a539ad4b60d2d4c25f0261d817e06d3842df7",
+      "pubkey_bytes": 3749,
+      "state": "active",
+      "own_stake_sat": "2500000000000",
+      "effective_stake_sat": "2500000000000",
+      "commission_bps": "500",
+      "randao_commitment": "c7a1f035af20087ccf2ce58c3ca537c67b9fbf28f337117c0d818648c662632c",
+      "slashed": false,
+      "activation_epoch": 12,
+      "exit_epoch": null,
+      "withdrawable_epoch": null,
+      "withdrawal_credentials": "c80b2b64dc5a6859f528f8bb149723e1870f386098fc4979dbd62fa7d20a5d14",
+      "funded": true,
+      "withdrawal_payout_sat": "2500000000000",
+      "unbacked_principal_sat": "0",
+      "randao_generation": 0,
+      "randao_reveals_used": 0
+    },
+    {
+      "index": 1,
+      "pubkey_hash": "a8b633cacc4e849800e1e78d956a539ad4b60d2d4c25f0261d817e06d3842df7",
+      "pubkey_bytes": 3749,
+      "state": "active",
+      "own_stake_sat": "2500000000000",
+      "effective_stake_sat": "2500000000000",
+      "commission_bps": "500",
+      "randao_commitment": "c7a1f035af20087ccf2ce58c3ca537c67b9fbf28f337117c0d818648c662632c",
+      "slashed": false,
+      "activation_epoch": 12,
+      "exit_epoch": null,
+      "withdrawable_epoch": null,
+      "withdrawal_credentials": "c80b2b64dc5a6859f528f8bb149723e1870f386098fc4979dbd62fa7d20a5d14",
+      "funded": true,
+      "withdrawal_payout_sat": "2500000000000",
+      "unbacked_principal_sat": "0",
+      "randao_generation": 0,
+      "randao_reveals_used": 0
+    }
+  ],
+  "activation_observed_epoch": 12,
+  "terminal": [
+    [
+      "703",
+      "640",
+      "a334b8732b18ae71f72090e02fa5f37b1c390fa41bf09f154046de917fac5753"
+    ],
+    [
+      "703",
+      "640",
+      "a334b8732b18ae71f72090e02fa5f37b1c390fa41bf09f154046de917fac5753"
+    ]
+  ],
+  "shipping_source_unchanged": true,
+  "warm_restart": {
+    "status": "passed",
+    "throwaway_devnet": true,
+    "replayed_blocks": 640,
+    "observation_until_slot": 1012,
+    "first_duty_slot": 1012,
+    "binary_sha256": "0bf55ac56127e4f8272178e016ff3258e4c542081aa60592c4c0e147cdd8bb7f",
+    "duplicate_detected": false
+  }
+}

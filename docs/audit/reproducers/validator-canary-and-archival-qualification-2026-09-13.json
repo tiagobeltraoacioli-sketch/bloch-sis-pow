@@ -1,0 +1,203 @@
+{
+  "observed_utc": "2026-09-13T16:44:14.912339+00:00",
+  "canary": {
+    "status": "passed",
+    "validator": 35,
+    "pid": 1162329,
+    "chaininfo": {
+      "block_id": "f5e12d573773be1d73fd07f25acc1ac2f5966281014d3003dc4b247ae0b05736",
+      "slot": 88704,
+      "height": 65329,
+      "finalized_height": 65268,
+      "epoch": 2772,
+      "slot_in_epoch": 0,
+      "slots_per_epoch": 32,
+      "state_root": "949ca7eb79e18b9ea9b09d24352a60d3cb3578235ac01657637aada28b77649b",
+      "justified": {
+        "epoch": 2771,
+        "root": "010ff00fab8ecb2cc6e33ae3cd8265b49f4a23024d7c4dcc21756b582f583311"
+      },
+      "finalized": {
+        "epoch": 2770,
+        "root": "83e711cae608b2ae72ec2576280cabb0bd1f0d7bc3a289502cfd093a826bb868"
+      },
+      "previous_justified": {
+        "epoch": 2770,
+        "root": "83e711cae608b2ae72ec2576280cabb0bd1f0d7bc3a289502cfd093a826bb868"
+      },
+      "validators": {
+        "total": 64,
+        "active": 64
+      },
+      "total_active_stake_sat": "26117558058778795",
+      "base_fee_millisat_per_gas": "10",
+      "next_base_fee_millisat_per_gas": "10",
+      "mempool": 0,
+      "blocks_known": 65329,
+      "wall_slot": 88704,
+      "behind_by_slots": 0,
+      "transport": {
+        "name": "devnet",
+        "peers": {
+          "devnet": 72,
+          "libp2p": null
+        }
+      }
+    },
+    "reference_index": 7,
+    "observe_until": 88626,
+    "baseline_finalized_epoch": 2767,
+    "attestations_logged": 3,
+    "proposals_logged": 1,
+    "duty_inclusion_claim": "Logs establish production of duties; this monitor does not prove inclusion of every attestation.",
+    "observed_utc": "2026-09-13T16:43:34.138480+00:00"
+  },
+  "archivals": [
+    {
+      "host": "139.180.166.5",
+      "cutover": {
+        "utc": "2026-09-13T15:55:44.041070+00:00",
+        "status": "passed-serving-new-binary",
+        "head": {
+          "block_id": "d30c3e4f06f9d3833b2d3b5b222ce1b42d6e34ede0049530be0487b3e6dbc322",
+          "slot": 88608,
+          "height": 65241,
+          "finalized_height": 65179,
+          "epoch": 2769,
+          "slot_in_epoch": 0,
+          "slots_per_epoch": 32,
+          "state_root": "fbc7c26eb6b0ccea0038bc3b581361da56609ae51e3e0f4c2d98205a2ff90ea1",
+          "justified": {
+            "epoch": 2768,
+            "root": "44bbef3b1038d2f441052f7ca236edc10a8da80a63afd899ac86fd5e92903d14"
+          },
+          "finalized": {
+            "epoch": 2767,
+            "root": "f868c92f0476d4c2f0b74afc9eb2a9fa25f2d61f1bd7150181e50e785a34701f"
+          },
+          "previous_justified": {
+            "epoch": 2767,
+            "root": "f868c92f0476d4c2f0b74afc9eb2a9fa25f2d61f1bd7150181e50e785a34701f"
+          },
+          "validators": {
+            "total": 64,
+            "active": 64
+          },
+          "total_active_stake_sat": "26082695929011923",
+          "base_fee_millisat_per_gas": "10",
+          "next_base_fee_millisat_per_gas": "10",
+          "mempool": 0,
+          "blocks_known": 65241,
+          "wall_slot": 88608,
+          "behind_by_slots": 0,
+          "transport": {
+            "name": "devnet",
+            "peers": {
+              "devnet": 63,
+              "libp2p": null
+            }
+          }
+        },
+        "binary_sha256": "a7ab1d0d690d22dd774b091caab766271618bd252f97a036a77e4cb1c89100e7",
+        "serving_unit": "bloch-archival-next.service",
+        "old_unit_stopped": true,
+        "old_history_preserved": true,
+        "admission": {
+          "active": false,
+          "activation_epoch": 2884,
+          "network_domain": "f47d3e498ff978e34471dafff5f94fe139fc3ff489b1a00f469c030258311966",
+          "epoch": 2769,
+          "wire_tag": "0x0b",
+          "signature_suite": "ML-DSA-65 AND Falcon-1024 (0x0001)",
+          "minimum_stake_sat": "2500000000000",
+          "maximum_stake_sat": "260826959290119",
+          "activation_delay_epochs": 8,
+          "activation_requires_finalized_deposit": true,
+          "exit_wire_tag": "0x0c",
+          "withdrawal_wire_tag": "0x0d",
+          "randao_recommit_wire_tag": "0x0a",
+          "exit_delay_epochs": 32,
+          "withdrawal_delay_epochs": 2048,
+          "maximum_exits_per_epoch": 4,
+          "written_off_sat": "0",
+          "maximum_activations_per_epoch": 4,
+          "next_base_fee_millisat_per_gas": "10",
+          "legacy_unfunded_deposit_enabled": false
+        }
+      }
+    },
+    {
+      "host": "139.180.173.231",
+      "cutover": {
+        "utc": "2026-09-13T16:43:42.020000+00:00",
+        "status": "passed-serving-new-binary",
+        "head": {
+          "block_id": "f5e12d573773be1d73fd07f25acc1ac2f5966281014d3003dc4b247ae0b05736",
+          "slot": 88704,
+          "height": 65329,
+          "finalized_height": 65268,
+          "epoch": 2772,
+          "slot_in_epoch": 0,
+          "slots_per_epoch": 32,
+          "state_root": "949ca7eb79e18b9ea9b09d24352a60d3cb3578235ac01657637aada28b77649b",
+          "justified": {
+            "epoch": 2771,
+            "root": "010ff00fab8ecb2cc6e33ae3cd8265b49f4a23024d7c4dcc21756b582f583311"
+          },
+          "finalized": {
+            "epoch": 2770,
+            "root": "83e711cae608b2ae72ec2576280cabb0bd1f0d7bc3a289502cfd093a826bb868"
+          },
+          "previous_justified": {
+            "epoch": 2770,
+            "root": "83e711cae608b2ae72ec2576280cabb0bd1f0d7bc3a289502cfd093a826bb868"
+          },
+          "validators": {
+            "total": 64,
+            "active": 64
+          },
+          "total_active_stake_sat": "26117558058778795",
+          "base_fee_millisat_per_gas": "10",
+          "next_base_fee_millisat_per_gas": "10",
+          "mempool": 0,
+          "blocks_known": 65329,
+          "wall_slot": 88704,
+          "behind_by_slots": 0,
+          "transport": {
+            "name": "devnet",
+            "peers": {
+              "devnet": 63,
+              "libp2p": null
+            }
+          }
+        },
+        "binary_sha256": "a7ab1d0d690d22dd774b091caab766271618bd252f97a036a77e4cb1c89100e7",
+        "serving_unit": "bloch-archival-next.service",
+        "old_unit_stopped": true,
+        "old_history_preserved": true,
+        "admission": {
+          "active": false,
+          "activation_epoch": 2884,
+          "network_domain": "f47d3e498ff978e34471dafff5f94fe139fc3ff489b1a00f469c030258311966",
+          "epoch": 2772,
+          "wire_tag": "0x0b",
+          "signature_suite": "ML-DSA-65 AND Falcon-1024 (0x0001)",
+          "minimum_stake_sat": "2500000000000",
+          "maximum_stake_sat": "261175580587787",
+          "activation_delay_epochs": 8,
+          "activation_requires_finalized_deposit": true,
+          "exit_wire_tag": "0x0c",
+          "withdrawal_wire_tag": "0x0d",
+          "randao_recommit_wire_tag": "0x0a",
+          "exit_delay_epochs": 32,
+          "withdrawal_delay_epochs": 2048,
+          "maximum_exits_per_epoch": 4,
+          "written_off_sat": "0",
+          "maximum_activations_per_epoch": 4,
+          "next_base_fee_millisat_per_gas": "10",
+          "legacy_unfunded_deposit_enabled": false
+        }
+      }
+    }
+  ]
+}

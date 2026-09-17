@@ -1,0 +1,104 @@
+{
+  "status": "passed",
+  "activation_epoch": 4,
+  "throwaway_devnet": true,
+  "completed": [
+    "network-pre-activation-refusal",
+    "network-post-activation-admission",
+    "network-finalized-registration-and-activation",
+    "joining-proposal-attestation-and-terminal-agreement",
+    "joining-duties-committed-in-both-block-logs"
+  ],
+  "pre_activation_refusal": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "error": {
+      "code": -32008,
+      "message": "funded validator admission is not active: FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH is unarmed or not reached \u2014 this transaction cannot be admitted; retrying the same bytes will not help"
+    }
+  },
+  "submission": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "result": {
+      "accepted": true,
+      "status": "accepted",
+      "kind": "funded_deposit",
+      "bytes": 16942,
+      "tx_hash": "2e866a35b46e62dc5663fa5e5256ef0aba6f01fab8bc79f34dee8faf5c12ddbb",
+      "tx_hash_note": "local correlation handle only (SHA3-256 of the canonical bytes); not a consensus transaction id \u2014 no block commits to it",
+      "confirmation": "this transport does not confirm: watch for the transaction in a block via `getblockbyslot`. `finalized: true` on that block is the strongest signal this chain offers, but it is NOT a settlement guarantee \u2014 no slashing penalty backs it and it is not a latch; see `docs/integration/BLOCH-GENESIS4-EXCHANGE-INTEGRATION.md` \u00a75"
+    }
+  },
+  "active_records": [
+    {
+      "index": 1,
+      "pubkey_hash": "a9ff07579f9255d8dff058c8fa3c7955eca739cd6b81359bfe8f4b772d89b457",
+      "pubkey_bytes": 3749,
+      "state": "active",
+      "own_stake_sat": "2500000000000",
+      "effective_stake_sat": "2500000000000",
+      "commission_bps": "500",
+      "randao_commitment": "dedda6ac1fa817ea6a5c81027f2b800c1f69ec818ad3d29b581f8dae21cf7c02",
+      "slashed": false,
+      "activation_epoch": 12,
+      "exit_epoch": null,
+      "withdrawable_epoch": null,
+      "withdrawal_credentials": "cfcf0abcc330f7dde7cdd9a35121fe6bbe4800cb650c31c737526ea395cd9db0",
+      "funded": true,
+      "withdrawal_payout_sat": "2500000000000",
+      "unbacked_principal_sat": "0",
+      "randao_generation": 0,
+      "randao_reveals_used": 0
+    },
+    {
+      "index": 1,
+      "pubkey_hash": "a9ff07579f9255d8dff058c8fa3c7955eca739cd6b81359bfe8f4b772d89b457",
+      "pubkey_bytes": 3749,
+      "state": "active",
+      "own_stake_sat": "2500000000000",
+      "effective_stake_sat": "2500000000000",
+      "commission_bps": "500",
+      "randao_commitment": "dedda6ac1fa817ea6a5c81027f2b800c1f69ec818ad3d29b581f8dae21cf7c02",
+      "slashed": false,
+      "activation_epoch": 12,
+      "exit_epoch": null,
+      "withdrawable_epoch": null,
+      "withdrawal_credentials": "cfcf0abcc330f7dde7cdd9a35121fe6bbe4800cb650c31c737526ea395cd9db0",
+      "funded": true,
+      "withdrawal_payout_sat": "2500000000000",
+      "unbacked_principal_sat": "0",
+      "randao_generation": 0,
+      "randao_reveals_used": 0
+    }
+  ],
+  "activation_observed_epoch": 12,
+  "terminal": [
+    [
+      "703",
+      "703",
+      "f2fe37df18c1b49b37cde8b9ce60a42ac280019cbf0145b60549b49c233afc8a"
+    ],
+    [
+      "703",
+      "703",
+      "f2fe37df18c1b49b37cde8b9ce60a42ac280019cbf0145b60549b49c233afc8a"
+    ]
+  ],
+  "shipping_source_unchanged": true,
+  "source_commit": "4eec48be5bb063969e148c6986dc356698a35492",
+  "shipping_params_sha256": "b51409e4dd3df6f05d79cd0e95f73773fdb5d59fddc82929edbd31eb5051725e",
+  "binary_sha256": "46016abb8707f2701f9363eb0d16a83eeb6a8011d68b6a73c83776026a7466bc",
+  "regime": "finite shipping gates compressed to epoch one; lifecycle at epoch four",
+  "devnet_only_flags": [
+    "--allow-plaintext-keystore",
+    "--no-doppelganger-check"
+  ],
+  "evidence_metadata_note": "Provenance fields added after the successful run from its retained binary and unchanged shipping parameters.",
+  "committed_duties_verification": {
+    "test": "engine::validator_admission_tests::funded_joining_network_evidence",
+    "status": "passed",
+    "evidence": "Actual Rust block-store reader found validator 1 proposals and included attestations in both retained, stopped node stores.",
+    "execution": "Separate targeted test after the successful network run."
+  }
+}
