@@ -1706,6 +1706,37 @@ fn respond(sock: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
 
 /// `getchaininfo` — the method the finality-aware consumers read (V4 §2).
 #[allow(clippy::too_many_arguments)]
+/// Immutable network identity only; this does not authorize native execution.
+/// Keep this available in default builds so ordinary BLCH recovery need not
+/// enable or query the gated native wallet API.
+pub fn with_chain_identity(
+    report: Json,
+    manifest: &crate::genesis::Manifest,
+    committed_domain: Option<[u8; 32]>,
+) -> RpcResult {
+    use sha3::{Digest, Sha3_256};
+    let domain: [u8; 32] = Sha3_256::digest(manifest.encode()).into();
+    if committed_domain != Some(domain) {
+        return Err(RpcError::new(-32000, "canonical network domain does not match manifest"));
+    }
+    let format = match manifest.format {
+        crate::genesis::ManifestFormat::V1Unbound => "BPOSMAN1",
+        crate::genesis::ManifestFormat::V2Bound => "BPOSMAN2",
+        #[cfg(feature = "native-lab")]
+        crate::genesis::ManifestFormat::NativeLab => "BPOSLAB1",
+    };
+    let Json::Obj(mut fields) = report else {
+        return Err(RpcError::new(-32603, "chain identity requires an object"));
+    };
+    fields.extend([
+        ("genesis".into(), Json::hex(manifest.genesis_id().as_bytes())),
+        ("native_domain".into(), Json::hex(&domain)),
+        ("native_format".into(), Json::s(format)),
+        ("chain_identity_rule".into(), Json::s("canonical-manifest-v1")),
+    ]);
+    Ok(Json::Obj(fields))
+}
+
 pub fn chain_info_json(
     state: &CommittedState,
     head: &BlockId,
@@ -2611,5 +2642,51 @@ mod tx_status_rule_tests {
                 ("finality_rule", super::Json::s("canonical-checkpoint-slot-v1")),
             ]));
         }
+    }
+}
+
+#[cfg(test)]
+mod chain_identity_tests {
+    use super::*;
+    use sha3::{Digest, Sha3_256};
+
+    #[cfg(feature = "native-lab")]
+    #[test]
+    fn laboratory_identity_is_explicit_and_never_official() {
+        let mut source = crate::genesis::Manifest::decode(
+            include_bytes!("../../../genesis/mainnet.manifest")).unwrap();
+        source.carryover = None;
+        source.cohort.clear();
+        source.allocations.clear();
+        let mut raw = source.encode();
+        raw[..8].copy_from_slice(b"BPOSLAB1");
+        let lab = crate::genesis::Manifest::decode(&raw).unwrap();
+        let report = with_chain_identity(Json::obj(vec![]), &lab,
+                                         Some(Sha3_256::digest(&raw).into())).unwrap();
+        let Json::Obj(fields) = report else { panic!("expected identity object") };
+        assert!(fields.contains(&("native_format".into(), Json::s("BPOSLAB1"))));
+        assert!(!fields.contains(&("genesis".into(), Json::s(
+            "9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415"))));
+    }
+
+    #[test]
+    fn official_identity_is_available_without_native_activation() {
+        let raw = include_bytes!("../../../genesis/mainnet.manifest");
+        let manifest = crate::genesis::Manifest::decode(raw).unwrap();
+        let domain = Sha3_256::digest(raw).into();
+        let report = with_chain_identity(Json::obj(vec![("height", Json::u(7))]),
+                                         &manifest, Some(domain)).unwrap();
+        assert_eq!(report, Json::obj(vec![
+            ("height", Json::u(7)),
+            ("genesis", Json::s("9953da73a2794e190b1c551a787f39d6486a288f40b69ecc361281d5a893e415")),
+            ("native_domain", Json::s("f47d3e498ff978e34471dafff5f94fe139fc3ff489b1a00f469c030258311966")),
+            ("native_format", Json::s("BPOSMAN1")),
+            ("chain_identity_rule", Json::s("canonical-manifest-v1")),
+        ]));
+        assert!(with_chain_identity(Json::obj(vec![]), &manifest, None).is_err());
+        assert!(with_chain_identity(Json::obj(vec![]), &manifest, Some([9; 32])).is_err());
+        let mut changed = crate::genesis::Manifest::decode(raw).unwrap();
+        changed.genesis_time_ms += 1;
+        assert!(with_chain_identity(Json::obj(vec![]), &changed, Some(domain)).is_err());
     }
 }

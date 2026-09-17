@@ -4215,7 +4215,7 @@ impl Engine {
                     ]))
                 }
             }
-            RpcRequest::ChainInfo => Ok(rpc::chain_info_json(
+            RpcRequest::ChainInfo => rpc::with_chain_identity(rpc::chain_info_json(
                 &self.state,
                 &self.head_id(),
                 self.head_state_root(),
@@ -4230,7 +4230,7 @@ impl Engine {
                 // config, so it cannot disagree with what is bound.
                 self.net.transport_name(),
                 self.net.peer_counts(),
-            )),
+            ), &self.manifest, self.state.admission_network_domain()),
 
             RpcRequest::BlockCount => {
                 let fin = self.state.finality();
