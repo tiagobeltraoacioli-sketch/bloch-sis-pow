@@ -25,5 +25,6 @@
   "chainObservation": null,
   "validatorRoster": null,
   "validatorReadiness": [],
-  "custodyManifest": null
+  "custodyManifest": null,
+  "sourceDepositsOpenEpoch": null
 }

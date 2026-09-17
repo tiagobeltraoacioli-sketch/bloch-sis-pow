@@ -20,11 +20,11 @@ class ActivationProfileTests(unittest.TestCase):
         self.now = 2000000000
         self.gates = {key: "110" for key in m.GATES}
         self.release = {"commit": "ab" * 20, "binarySha256": "cd" * 32, "buildProfile": "release", "features": ["native-wallet-rpc"]}
-        self.observation = {"network": m.NETWORK, "observedAtUnix": str(self.now), "headSlot": "3200", "wallSlot": "3201", "head": "01" * 32, "finalizedEpoch": "98", "finalizedRoot": "02" * 32}
+        self.observation = {"network": m.NETWORK, "observedAtUnix": str(self.now), "headSlot": "3200", "wallSlot": "3201", "head": "01" * 32, "finalizedEpoch": "98", "finalizedSlot": "3135", "finalityRule": "canonical-checkpoint-slot-v1", "finalizedRoot": "02" * 32}
         self.roster = {"network": m.NETWORK, "head": self.observation["head"], "activeValidators": [{"id": "0", "publicKeySha256": "03" * 32}]}
-        self.readiness = {"network": m.NETWORK, "observedAtUnix": str(self.now), "validatorId": "0", "publicKeySha256": "03" * 32, "observedHead": self.observation["head"], "release": self.release, "gateEpochs": self.gates, "checks": {"canonicalReplayPassed": True, "historicalRootsUnchanged": True, "rollbackPrepared": True}, "operatorApprovalReference": "fixture-only:no-production-approval"}
+        self.readiness = {"network": m.NETWORK, "observedAtUnix": str(self.now), "validatorId": "0", "publicKeySha256": "03" * 32, "observedHead": self.observation["head"], "release": self.release, "gateEpochs": self.gates, "checks": {"canonicalReplayPassed": True, "historicalRootsUnchanged": True, "rollbackPrepared": True, "withdrawalSimulationPassed": True, "sourceReleaseRehearsalPassed": True}, "operatorApprovalReference": "fixture-only:no-production-approval"}
         self.custody = {"schema": "postern.mainnet-custody.v1", "route_manifest": {"synthetic": False, "native_domain": "0x" + m.NETWORK["domain"], "native_asset": "0x" + "11" * 32, "routes": [{"network": "ethereum-mainnet", "chain_id": "eip155:1", "vault": "0x" + "22" * 20}]}, "activation": {"format": m.NETWORK["format"], "genesis": "0x" + m.NETWORK["genesis"], "epoch": "110"}}
-        self.profile = {"schema": "bloch.native-mainnet-activation.v1", "network": m.NETWORK, "gateEpochs": self.gates, "minimumLeadEpochs": "4", "release": self.release}
+        self.profile = {"schema": "bloch.native-mainnet-activation.v1", "network": m.NETWORK, "gateEpochs": self.gates, "minimumLeadEpochs": "4", "sourceDepositsOpenEpoch": "110", "release": self.release}
 
     def artifact(self, name, value):
         raw = json.dumps(value).encode()
@@ -80,6 +80,23 @@ class ActivationProfileTests(unittest.TestCase):
                 target[key] = bad
                 with self.assertRaises(ValueError): m.validate(self.save(), self.now)
                 target[key] = old
+
+    def test_exit_order_and_finality_lag_policy(self):
+        cases = [(self.gates, "pool", "111"),
+                 (self.profile, "sourceDepositsOpenEpoch", "109"),
+                 (self.observation, "finalizedSlot", "3103"),
+                 (self.observation, "finalizedSlot", "3201"),
+                 (self.observation, "finalityRule", "epoch-only")]
+        for target, key, bad in cases:
+            old = target[key]
+            target[key] = bad
+            with self.subTest(field=key), self.assertRaises(ValueError):
+                m.validate(self.save(), self.now)
+            target[key] = old
+        for key in ("withdrawalSimulationPassed", "sourceReleaseRehearsalPassed"):
+            self.readiness["checks"][key] = False
+            with self.assertRaises(ValueError): m.validate(self.save(), self.now)
+            self.readiness["checks"][key] = True
 
     def test_hash_tampering_missing_readiness_duplicate_json_and_unarmed_template(self):
         path = self.save()
