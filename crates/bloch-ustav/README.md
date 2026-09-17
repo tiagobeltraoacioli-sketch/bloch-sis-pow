@@ -7,6 +7,23 @@ The host interface has no ECDSA callback, and the native crate has no k256 depen
 Registration, minting, transfers, burns and policy updates are executable locally.
 This crate is a workspace member; it is not a dependency of the live Genesis-4 node.
 
+[Native pairs v1](../bloch-euvm/docs/native-pairs.md) adds jointly PQ-authorized,
+atomic settlement between two registered native assets, including a future native
+stablecoin. Both transfers commit together or neither commits. This is bilateral
+settlement, not an AMM or a stablecoin peg. Base BLCH and live-node activation
+remain outside this reference kernel.
+
+[Native pool custody](../bloch-euvm/docs/native-pool-custody.md) executes local
+Supply-only token AMM operations with locked reserve outputs and PQ-owned LP
+positions. It preserves gateway liabilities and token supply. This separate
+sealed boundary still rejects base BLCH and remains outside live consensus.
+
+The test-only joint BLCH/native dependency explicitly enables the consensus
+crate's optional [rehearsal](../../docs/integration/BLOCH-JOINT-NATIVE-REHEARSAL.md).
+It verifies an atomic transfer with real hybrid signatures and committed BLCH
+UTXOs. This does not enable native execution in default node builds or create
+a live BLCH AMM pool.
+
 [Color-Changing Chameleon v1](../bloch-euvm/docs/chameleon-v1.md) adds sealed
 PQ-native escrow, an explicit Kirpich ERC-20 compatibility profile and an
 executable Rust/EVM/Rust roundtrip with an unrestricted Ustav test asset.
@@ -23,6 +40,8 @@ automatic conversion that could remove a required co-signer.
 ```sh
 cargo +1.94.1 test --locked -p bloch-euvm -p bloch-ustav
 cargo +1.94.1 run --locked -p bloch-ustav --example lifecycle
+cargo +1.94.1 run --locked -p bloch-ustav --example native_pair
+cargo +1.94.1 run --locked -p bloch-ustav --example native_pool
 python3 scripts/check-ustav-pq-boundary.py cargo +1.94.1
 ```
 

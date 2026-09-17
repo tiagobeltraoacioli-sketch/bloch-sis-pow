@@ -1552,6 +1552,7 @@ dependencies = [
 name = "bloch-pos-committee"
 version = "0.1.0"
 dependencies = [
+ "bloch-euvm",
  "hex",
  "sha3 0.10.9",
 ]
@@ -1607,6 +1608,7 @@ version = "0.2.0"
 dependencies = [
  "bloch-crypto",
  "bloch-euvm",
+ "bloch-pos-committee",
  "serde_json",
  "sha3 0.10.9",
 ]
