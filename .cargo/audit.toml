@@ -3,6 +3,16 @@
 # ../deny.toml. cargo-audit does NOT read deny.toml, so the unmaintained-crate
 # dispositions are mirrored here.
 #
+# SCOPE (deep audit 2026-09-16, LD-02): this file governs EVERY lockfile
+# `scripts/audit-all-lockfiles.sh` scans from the repository root — not only
+# the root Cargo.lock — so it is a superset of deny.toml, which only sees the
+# graph cargo resolves for the root workspace. Each entry below says which
+# lockfile(s) still resolve the crate it names, measured 2026-09-16 with
+# `cargo audit -n --file <lock>` from a directory with no audit.toml. Entries
+# that match nothing in ANY scanned lockfile are to be pruned, not kept "just
+# in case"; cargo-audit is silent about an unmatched ignore, so this table is
+# the only record of why each one is still here.
+#
 # POLICY (kept identical to deny.toml — SECURITY_TOOLING.md §Advisory-posture is
 # the authoritative disposition table):
 #   * Genuine VULNERABILITY-class advisories are never dismissed lightly. The two
@@ -23,17 +33,42 @@
 [advisories]
 ignore = [
     # ── Post-quantum crypto: vendored, intentionally pinned (PQClean archived) ──
+    # Lockfiles: root, pool, services/pq-shield-api, fuzz, spikes/prover-cost
+    # (also in deny.toml, which resolves them for the root workspace).
     "RUSTSEC-2026-0165", # pqcrypto-falcon    unmaintained
     "RUSTSEC-2026-0166", # pqcrypto-mldsa     unmaintained
     "RUSTSEC-2026-0162", # pqcrypto-traits    unmaintained
-    "RUSTSEC-2026-0163", # pqcrypto-internals unmaintained (vendored crate)
+    "RUSTSEC-2026-0163", # pqcrypto-internals unmaintained (vendored crate).
+                         # Lockfile: spikes/prover-cost ONLY (registry copy);
+                         # root vendors it as a path crate, which neither
+                         # cargo-audit nor cargo-deny matches — so it is NOT
+                         # in deny.toml (LD-02, 2026-09-16).
     "RUSTSEC-2024-0381", # pqcrypto-kyber     superseded by pqcrypto-mlkem
+                         # Lockfiles: root, fuzz.
     # ── Transitive, no first-party call path ──────────────────────────────────
-    "RUSTSEC-2025-0141", # bincode 1.3.3 unmaintained — wire format uses 2.x
-    "RUSTSEC-2024-0436", # paste unmaintained — compile-time proc-macro helper
-    "RUSTSEC-2026-0173", # proc-macro-error2 unmaintained — compile-time only
-    "RUSTSEC-2025-0134", # rustls-pemfile unmaintained — transitive TLS PEM decode
+    "RUSTSEC-2025-0141", # bincode 1.3.3 unmaintained — wire format uses 2.x.
+                         # Lockfiles: root, pool, services/pq-shield-api, fuzz,
+                         # coherence-prover/{script,service}.
+    "RUSTSEC-2024-0436", # paste unmaintained — compile-time proc-macro helper.
+                         # Lockfiles: root, pool, services/pq-shield-api, fuzz,
+                         # spikes/prover-cost, coherence-prover/{script,service}
+                         # (not pool-proxy, euvm-tooling or the rv32* guests).
+    "RUSTSEC-2026-0173", # proc-macro-error2 unmaintained — compile-time only.
+                         # Lockfile: root Cargo.lock ONLY, and only through the
+                         # 289 entries the root lock still carries from when
+                         # crates/coherence-prover was a workspace member (LD-02):
+                         # cargo-audit reads the raw lock, cargo-deny the resolved
+                         # graph, so this is NOT in deny.toml. Prune it with the
+                         # `cargo update --workspace` that drops those entries.
+    "RUSTSEC-2025-0134", # rustls-pemfile unmaintained — transitive TLS PEM decode.
+                         # Lockfiles: coherence-prover/{script,service}; root only
+                         # through the stale lock entries above. Not in deny.toml.
     # ── SP1 prover / zk host-side toolchain (not the node runtime path) ────────
+    # Lockfiles: crates/coherence-prover/script and /service (the SP1 stack lives
+    # there since coherence-prover left the root workspace); the root Cargo.lock
+    # matches them only through its stale unreachable entries. NONE of these is
+    # in deny.toml any more (LD-02, 2026-09-16): cargo-deny reported all of them
+    # `advisory-not-detected` against the resolved root graph.
     "RUSTSEC-2025-0012", # backoff unmaintained       — via sp1-sdk
     "RUSTSEC-2024-0384", # instant unmaintained       — via backoff (SP1)
     "RUSTSEC-2021-0139", # ansi_term unmaintained     — via tracing-forest (SP1)
@@ -49,8 +84,10 @@ ignore = [
                          # the node consensus/mempool/P2P runtime; the UB needs a
                          # panicking Drop/Hash impl inside the cache, which the
                          # SP1 usage does not have. REMOVE when SP1 repins
-                         # lru >= 0.18.2.
+                         # lru >= 0.18.2. Mirrored in osv-scanner.toml (dated),
+                         # no longer in deny.toml (LD-02).
     # ── Accepted vulnerabilities, no upstream bump path (mirrors deny.toml) ─────
+    # Lockfiles: root, fuzz.
     "RUSTSEC-2026-0118", # hickory-proto NSEC3 unbounded loop — libp2p 0.56-pinned
     "RUSTSEC-2026-0119", # hickory-proto O(n^2) name compression — libp2p-pinned
     # ── crates/coherence-prover/{script,service} ONLY (N-3, Round 3) ───────────

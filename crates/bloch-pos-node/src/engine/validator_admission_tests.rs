@@ -465,6 +465,18 @@ fn randao_automatic_recommit_rehearsal() {
     record.pubkey = joining.pubkey.clone();
     record.randao_commitment = RandaoChain::generate(joining.randao_seed).commitment();
     first.manifest.validators.push(record);
+    // audit LD-05, 2026-09-17: the fixture seeds `genesis_time_ms` from the
+    // wall clock, and under `V2Bound` the genesis mix folds it, so every run
+    // drew a different proposer schedule. Some schedules spend both 16-reveal
+    // chains in the same slot, and a renewal can only be submitted once a
+    // chain is fully spent and only be included by a proposer that still has
+    // a reveal — nobody is left, and the rehearsal failed at random (CI,
+    // 2026-09-17). A pinned genesis time makes the schedule a fixture, not a
+    // lottery; the simultaneous-exhaustion corner itself is a consensus
+    // precondition (`transition.rs` `apply_randao_recommit`) and is tracked
+    // as LD-05 in docs/audit/deep-audit-2026-09-16/A12-dynamic.md. The wall
+    // slot is injected by `clock_at`, so the manifest's clock is inert here.
+    first.manifest.genesis_time_ms = 1_700_000_000_000;
     first.genesis_validator_count = 2;
     first.state = StateCell::new(first.manifest.genesis_state());
     first.chain = vec![(0, first.manifest.genesis_id())];

@@ -17,9 +17,13 @@ yanked = "deny"
 # a written rationale.
 #
 # The ignores below are limited to `unmaintained`/`notice`-class advisories with
-# a written rationale (no fix path). Actual `vulnerability`-class advisories are
-# NEVER ignored here — they must be fixed by bumping the offending dependency.
-# See SECURITY_TOOLING.md §Advisory-posture for the full disposition table.
+# a written rationale (no fix path), plus the two accepted hickory-proto
+# vulnerabilities at the end. Actual `vulnerability`-class advisories are
+# otherwise NEVER ignored here — they must be fixed by bumping the offending
+# dependency. Every entry must match a crate in the RESOLVED root graph:
+# `cargo deny check advisories` must report zero `advisory-not-detected`
+# warnings (deep audit 2026-09-16, LD-02). See SECURITY_TOOLING.md
+# §Advisory-posture for the full disposition table.
 ignore = [
     # ── Post-quantum crypto: vendored, intentionally pinned ────────────────
     # PQClean upstream is being archived, so the pqcrypto-* wrappers are flagged
@@ -37,42 +41,22 @@ ignore = [
                          # and carries no first-party (de)serialization path.
     "RUSTSEC-2024-0436", # paste unmaintained — transitive proc-macro helper,
                          # compile-time only, no runtime attack surface.
-    "RUSTSEC-2026-0163", # pqcrypto-internals unmaintained (PQClean archived) —
-                         # same disposition as the pqcrypto-* wrappers above; it
-                         # is the VENDORED crate (crates/pqcrypto-internals),
-                         # frozen under Cargo.lock with the seeded-RNG override.
-                         # Migration is a deliberate crypto-review event.
-    # ── SP1 prover / zk host-side toolchain (NOT the node runtime path) ────
-    # The following are pulled EXCLUSIVELY through the pinned SP1 zkVM prover
-    # stack (sp1-sdk / sp1-core-machine / arkworks) — host-side proof
-    # generation and CLI UX, never the consensus, mempool, or P2P runtime of
-    # the node. They are unmaintained with no drop-in that keeps the pinned
-    # SP1 4.2.1 build reproducible; replacing them means patching sp1-sdk.
-    "RUSTSEC-2025-0012", # backoff unmaintained — retry helper, via sp1-sdk only.
-    "RUSTSEC-2024-0384", # instant unmaintained — time shim, via backoff (SP1).
-    "RUSTSEC-2021-0139", # ansi_term unmaintained — terminal colour, via
-                         # tracing-forest → sp1-core-machine (prover logging).
-    "RUSTSEC-2024-0388", # derivative unmaintained — derive macro, via ark-ff
-                         # (arkworks field arithmetic in the SP1/zk stack);
-                         # proc-macro, compile-time only, no runtime surface.
-    "RUSTSEC-2025-0119", # number_prefix unmaintained — via indicatif progress
-                         # bars in the SP1 prover CLI; host-side UX only.
-    "RUSTSEC-2026-0002", # lru UNSOUND (IterMut Stacked-Borrows aliasing) — pulled
-                         # ONLY by sp1-prover (host-side proving), not the node
-                         # runtime; the unsoundness manifests only under Miri /
-                         # strict-aliasing, and sp1-prover 4.2.1 pins this lru.
-    "RUSTSEC-2026-0253", # lru 0.12.5 UNSOUND (LruCache::pop() panic safety) —
-                         # EXCEPTION added 2026-09-05 (finding SC1-advisories),
-                         # re-review by 2026-12-01; mirrors audit.toml. Fix is
-                         # lru >= 0.18.2 but sp1-prover 4.2.1 pins `lru ^0.12.4`,
-                         # so there is no bump path without forking the pinned
-                         # SP1 stack. Host-side proving only, not the node
-                         # runtime. REMOVE when SP1 repins lru >= 0.18.2.
-    "RUSTSEC-2026-0173", # proc-macro-error2 unmaintained — compile-time proc-macro
-                         # helper (derive-macro diagnostics); no runtime surface.
-    "RUSTSEC-2025-0134", # rustls-pemfile unmaintained — PEM decode, superseded by
-                         # rustls-pki-types; transitive via the rustls/reqwest TLS
-                         # stack, not a first-party parse path.
+    # ── Entries this file does NOT carry (deep audit 2026-09-16, LD-02) ────
+    # cargo-deny checks the graph cargo RESOLVES for the root workspace, and
+    # reports an ignore that matches nothing as `advisory-not-detected`. Ten
+    # entries were in that state: the SP1 / arkworks host-side prover stack
+    # (RUSTSEC-2025-0012 backoff, 2024-0384 instant, 2021-0139 ansi_term,
+    # 2024-0388 derivative, 2025-0119 number_prefix, 2026-0002 + 2026-0253 lru,
+    # 2026-0173 proc-macro-error2, 2025-0134 rustls-pemfile) stopped being
+    # reachable when crates/coherence-prover left the workspace, and
+    # RUSTSEC-2026-0163 (pqcrypto-internals) names the VENDORED path crate,
+    # which cargo-deny does not match against the registry advisory. They were
+    # removed here so the allowlist only names advisories that exist in the
+    # graph it governs; they still live in .cargo/audit.toml, where cargo-audit
+    # scans the coherence-prover and spikes/prover-cost lockfiles that do
+    # resolve them (see the per-lockfile notes there). A new
+    # `advisory-not-detected` warning from this list is a prune request, not
+    # noise.
     # ── REAL VULNERABILITIES with NO upstream fix available yet (TRACKED) ──────
     # These are genuine advisories, NOT unmaintained-notices. They are ignored
     # ONLY because the fix (hickory 0.26.x, which moved DnssecDnsHandle/NSEC3 code
@@ -157,28 +141,21 @@ skip = [
     { crate = "wit-bindgen@=0.51.0" },
 ]
 
-# ── Target-gated OS-shim subtree (N-5, Round 3) ────────────────────────────
-# `multiple-versions = "deny"` (above) went red on this exact allowlist:
-# windows-sys 0.60.2/0.61.2, windows-targets 0.52.6/0.53.5, and all eight
-# windows_{aarch64,i686,x86_64}_{gnu,gnullvm,msvc} crates at 0.52.6/0.53.1 —
-# ten duplicate pairs the `skip` list above was never extended to cover
-# because it was written against an older lock (the two `windows-sys` entries
-# above still pin 0.52.0/0.59.0, versions the CURRENT lock resolves
-# differently). Per-crate `skip` entries would mean re-deriving this list by
-# hand on every windows-targets bump; `skip-tree` on the single newer
-# `windows-sys` root instead prunes windows-targets 0.53.5 and its eight
-# platform crates in one rule, the same "target-gated, never co-linked"
-# rationale as the `skip` entries above (these are OS ABI shims selected by
-# `cfg(windows)`, not code that runs together). Only the 0.60.2 side is
-# skip-tree'd — 0.61.2 is left as the sole non-skipped `windows-sys` version,
-# so a THIRD `windows-sys` release still trips `multiple-versions = "deny"`
-# rather than silently being absorbed.
-#
-# Verified: `cargo deny --offline check bans` -> `bans ok` after this rule
-# (10 error[duplicate] windows* pairs gone; 0 remaining warnings).
-skip-tree = [
-    "windows-sys@0.60.2",
-]
+# ── Target-gated OS-shim subtree (N-5, Round 3) — RETIRED (LD-02) ──────────
+# Until the deep audit of 2026-09-16 this carried `skip-tree =
+# ["windows-sys@0.60.2"]`: `multiple-versions = "deny"` had gone red on
+# windows-sys 0.60.2/0.61.2, windows-targets 0.52.6/0.53.5 and the eight
+# windows_{aarch64,i686,x86_64}_{gnu,gnullvm,msvc} crates under them, and one
+# rule on the newer `windows-sys` root pruned all ten pairs (OS ABI shims
+# selected by `cfg(windows)`, never co-linked). That root is now one of the
+# lock's unreachable leftovers (A12 §A12.5): `cargo tree --target all -i
+# windows-sys@0.60.2` prints nothing, cargo-deny reported the rule as
+# `unmatched-skip-root`, and `cargo deny check bans` is `bans ok` without it
+# (measured 2026-09-16, cargo-deny 0.20.2). Same policy as the advisories
+# ignore list above: a skip that matches nothing in the graph this file
+# governs is pruned, not kept in case. If a windows-targets bump ever makes
+# two `windows-sys` roots reachable again, `bans` goes red and the rule is
+# re-added against the version that is actually there — that is the point.
 
 [licenses]
 version = 2

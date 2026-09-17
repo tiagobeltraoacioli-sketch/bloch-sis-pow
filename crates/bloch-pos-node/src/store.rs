@@ -670,7 +670,20 @@ impl Store {
                 out.extend_from_slice(META_MAGIC);
                 out.extend_from_slice(&bloch_pos_committee::header::VERSION_G4.to_le_bytes());
                 out.extend_from_slice(genesis_digest);
-                fs::write(&meta_path, out)?;
+                // audit KS-10, 2026-09-16: temp + fsync + rename + dir fsync,
+                // the shape `rewrite` below already uses. This was a bare
+                // `fs::write`, so a crash on first boot could leave an empty
+                // `meta.bin` that the next open refused as "a different
+                // network or schema" — fail-closed, but a misleading message
+                // for a first-boot crash, and an operator-only recovery.
+                let tmp = dir.join("meta.bin.tmp");
+                {
+                    let mut f = File::create(&tmp)?;
+                    f.write_all(&out)?;
+                    f.sync_all()?;
+                }
+                fs::rename(&tmp, &meta_path)?;
+                fsync_dir(dir)?;
             }
             Err(e) => return Err(e),
         }
@@ -1463,5 +1476,25 @@ mod tests {
             proposer_sig: vec![0xAA; 32],
             body: Body { transactions: Vec::new(), attestations: Vec::new() },
         }
+    }
+
+    /// audit KS-10 (2026-09-16): `meta.bin` is installed atomically on first
+    /// open — the 44-byte record is there, the temp file is not, and a
+    /// second open of the same dir for the same genesis accepts it.
+    #[test]
+    fn meta_bin_is_written_atomically_on_first_open() {
+        let dir = std::env::temp_dir().join(format!("bloch-pos-store-meta-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let genesis = [5u8; 32];
+        {
+            let _store = Store::open(&dir, &genesis).expect("first open writes meta.bin");
+            let meta = fs::read(dir.join("meta.bin")).expect("meta.bin exists after open");
+            assert_eq!(meta.len(), 44);
+            assert_eq!(&meta[..8], META_MAGIC);
+            assert_eq!(&meta[12..], &genesis);
+            assert!(!dir.join("meta.bin.tmp").exists(), "temp file left behind");
+        }
+        let _again = Store::open(&dir, &genesis).expect("the installed meta.bin is accepted");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

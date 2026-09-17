@@ -61,6 +61,15 @@ opt-level = 3
 [profile.dev.package.keccak]
 opt-level = 3
 
+# Three bloch-sis-pow tests mine real solutions (solver
+# `mine_with_max_target_succeeds_quickly`, integration
+# `corrupted_solution_fails_verify` / `manually_constructed_pass_through_verify`)
+# and took 18 minutes in an unoptimized binary (deep audit 2026-09-16, LD-03).
+# Same pattern as the overrides above, one crate, dev/test only; the release
+# profile and every consensus check are unchanged.
+[profile.dev.package.bloch-sis-pow]
+opt-level = 3
+
 [profile.release]
 opt-level      = 3
 lto            = true
