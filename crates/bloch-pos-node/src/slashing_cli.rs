@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Offline, identity-bound movement of signing watermarks. Never fences a host.
+//! Offline, identity-bound movement of signing watermarks and RANDAO intents. Never fences a host.
 use crate::{
     codec,
     slashprot::{self, Binding},
@@ -82,19 +82,19 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
                 .unwrap_or(Path::new("."));
             crate::store::fsync_dir(parent).map_err(|e| e.to_string())?;
             println!(
-                "Exported identity-bound signing watermarks. This file contains no private key."
+                "Exported identity-bound signing protection (including any RANDAO intent). This file contains no private key."
             );
         }
         "import" => {
             let mut bytes = Vec::new();
             fs::File::open(required(extra)?)
                 .map_err(|e| e.to_string())?
-                .take(141)
+                .take(slashprot::MAX_RECORD_LEN.saturating_add(1) as u64)
                 .read_to_end(&mut bytes)
                 .map_err(|e| e.to_string())?;
             let marks =
                 slashprot::import_bound(directory, binding, &bytes).map_err(|e| e.to_string())?;
-            println!("Imported monotone signing watermarks: {marks:?}");
+            println!("Imported monotone signing protection; proposal/attestation watermarks: {marks:?}");
             println!("The previous host must remain fenced; importing a file cannot stop another signer.");
         }
         "set-floor" => {

@@ -15,7 +15,7 @@
 import { parseSats, parseJsonExactIntegers } from "./sats.js";
 
 export interface JsonRpcTransport {
-  call(method: string, params: unknown[]): Promise<unknown>;
+  call(method: string, params: unknown[], signal?: AbortSignal): Promise<unknown>;
 }
 
 export class RpcError extends Error {
@@ -67,15 +67,22 @@ export async function readBoundedResponse(res: Response, method: string): Promis
 }
 
 export class HttpTransport implements JsonRpcTransport {
-  constructor(private readonly url: string, private readonly apiKey?: string) {}
-  async call(method: string, params: unknown[]): Promise<unknown> {
+  constructor(private readonly url: string, private readonly apiKey?: string) {
+    const parsed = new URL(url);
+    const local = ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname.toLowerCase().replace(/\.$/, ""));
+    if (parsed.username || parsed.password || parsed.hash
+        || (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && local))) {
+      throw new Error("RPC requires HTTPS outside loopback, without URL credentials or fragments");
+    }
+  }
+  async call(method: string, params: unknown[], signal?: AbortSignal): Promise<unknown> {
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (this.apiKey) headers["x-api-key"] = this.apiKey;
     const res = await fetch(this.url, {
       method: "POST",
       headers,
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-      signal: AbortSignal.timeout(RPC_TIMEOUT_MS),
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(RPC_TIMEOUT_MS)]) : AbortSignal.timeout(RPC_TIMEOUT_MS),
       redirect: "error",
     });
     const text = await readBoundedResponse(res, method);
@@ -198,9 +205,9 @@ export class RpcClient {
   }
 
   /** Returns null when the height is not present (node error "height not found"). */
-  async getBlockHash(height: number): Promise<string | null> {
+  async getBlockHash(height: number, signal?: AbortSignal): Promise<string | null> {
     try {
-      const hash = await this.transport.call("getblockhash", [height]);
+      const hash = await this.transport.call("getblockhash", [height], signal);
       if (typeof hash !== "string" || hash.length === 0) throw new RpcError("invalid block hash response", "getblockhash");
       return hash;
     } catch (e) {
@@ -210,9 +217,9 @@ export class RpcClient {
   }
 
   /** Returns null when the height is not present. Always requests verbose=true. */
-  async getBlockByHeight(height: number): Promise<Block | null> {
+  async getBlockByHeight(height: number, signal?: AbortSignal): Promise<Block | null> {
     try {
-      const raw = (await this.transport.call("getblockbyheight", [height, true])) as {
+      const raw = (await this.transport.call("getblockbyheight", [height, true], signal)) as {
         hash: string;
         height: number;
         parents?: string[];

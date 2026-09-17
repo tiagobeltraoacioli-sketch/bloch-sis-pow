@@ -262,8 +262,14 @@ impl HdWallet {
 
     /// Load and decrypt HD wallet file with mnemonic + passphrase + password.
     pub fn load(path: &Path, mnemonic_str: &str, passphrase: Option<&str>, password: &str) -> Result<Self, String> {
-        let json = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let wallet: HdWalletFile = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+        Self::load_with_file_limit(path, mnemonic_str, passphrase, password, crate::util::DEFAULT_WALLET_FILE_LIMIT)
+    }
+
+    /// Explicit bounded recovery override for large authentic backups (maximum 512 MiB).
+    /// The budget covers input bytes; parsed allocations and KDF work are additional.
+    pub fn load_with_file_limit(path: &Path, mnemonic_str: &str, passphrase: Option<&str>, password: &str, max_bytes: usize) -> Result<Self, String> {
+        let bytes = crate::util::read_wallet_file(path, max_bytes).map_err(|e| e.to_string())?;
+        let wallet: HdWalletFile = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
         validate_wallet_structure(&wallet)?;
 
         // Parse mnemonic
@@ -272,7 +278,7 @@ impl HdWallet {
 
         // Derive master key — route the salt by the file's version (v1 legacy
         // constant salt, v2+ per-wallet), so existing wallets still decrypt.
-        let master_key = derive_master_key(&mnemonic.to_string(), passphrase.unwrap_or(""), password, wallet.version)?;
+        let mut master_key = Zeroizing::new(derive_master_key(&mnemonic.to_string(), passphrase.unwrap_or(""), password, wallet.version)?);
 
         // Verify mnemonic matches (by decrypting and comparing). Wrapped in
         // Zeroizing (A4 lows): this plaintext carries the full mnemonic in
@@ -289,13 +295,14 @@ impl HdWallet {
         // would silently hand back the wrong (empty) addresses.
         let mut addresses = Vec::new();
         let mut imported = BTreeSet::new();
+        let mut seed = Zeroizing::new(mnemonic.to_seed(passphrase.unwrap_or("")).to_vec());
         for addr in &wallet.addresses {
             // Zeroizing (A4 lows): plaintext JSON containing the hex-encoded
             // private key — must not survive past the parse below.
             let bytes = Zeroizing::new(decrypt_with_key(&master_key, &addr.keypair_crypto)?);
             let mut kpp: KeypairPayload = serde_json::from_slice(&bytes)
                 .map_err(|e| format!("keypair {} decrypt failed: {}", addr.index, e))?;
-            let priv_key = hex::decode(&kpp.private_key_hex).map_err(|e| e.to_string())?;
+            let mut priv_key = Zeroizing::new(hex::decode(&kpp.private_key_hex).map_err(|e| e.to_string())?);
             let pub_key  = hex::decode(&kpp.public_key_hex).map_err(|e| e.to_string())?;
             kpp.zeroize();
 
@@ -306,8 +313,14 @@ impl HdWallet {
                 return Err(format!("address {} mismatch — tampered", addr.index));
             }
 
+            if addr.derived {
+                let expected = derive_at(&seed, addr.index, testnet)?;
+                if expected.public_key != pub_key || expected.private_key.as_slice() != priv_key.as_slice() {
+                    return Err(format!("derived keypair {} does not match mnemonic and index", addr.index));
+                }
+            }
             let kp = Keypair {
-                private_key: priv_key,
+                private_key: std::mem::take(&mut *priv_key),
                 public_key:  pub_key,
                 address:     addr.address.clone(),
             };
@@ -315,12 +328,12 @@ impl HdWallet {
             if !addr.derived { imported.insert(addr.index); }
         }
 
-        let seed = mnemonic.to_seed(passphrase.unwrap_or("")).to_vec();
         // A4 H-1 FIX: preserve the file's OWN version — `master_key` above
         // was derived under `wallet.version`'s salt, so `save()` must write
         // that SAME version back, not the current `WALLET_VERSION`.
         Ok(HdWallet {
-            mnemonic, master_key, seed, addresses, imported,
+            mnemonic, master_key: std::mem::take(&mut *master_key),
+            seed: std::mem::take(&mut *seed), addresses, imported,
             network: wallet.network,
             file_version: wallet.version,
         })
@@ -466,6 +479,11 @@ mod tests {
         let addr0 = w.addresses[0].1.address.clone();
         w.save(&tmp).unwrap();
 
+        let file_len = std::fs::metadata(&tmp).unwrap().len() as usize;
+        assert!(HdWallet::load_with_file_limit(&tmp, "invalid mnemonic", None, "wrong", file_len - 1)
+            .err().unwrap().contains("byte limit"));
+        let exact = HdWallet::load_with_file_limit(&tmp, &mnemonic, Some("my-passphrase"), "test-password-12345!", file_len).unwrap();
+        assert_eq!(exact.addresses[0].1.address, addr0);
         let loaded = HdWallet::load(&tmp, &mnemonic, Some("my-passphrase"), "test-password-12345!").unwrap();
         assert_eq!(loaded.addresses[0].1.address, addr0);
         assert_eq!(loaded.mnemonic.to_string(), mnemonic);
@@ -627,6 +645,38 @@ mod tests {
         assert_eq!(w2.file_version, 2);
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn load_authenticates_derived_index_and_private_key_but_preserves_imports() {
+        let path = std::env::temp_dir().join(format!("bloch-derived-auth-{}.json", std::process::id()));
+        let mnemonic = Mnemonic::from_entropy(&[0x43; 32]).unwrap();
+        let phrase = mnemonic.to_string();
+        let password = "fixture-password";
+        let mut file = build_raw_file(&mnemonic, &phrase, password, 3);
+        file.addresses[0].index = 1; // metadata is outside the encrypted payload
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+        assert!(HdWallet::load(&path, &phrase, None, password).err().unwrap().contains("does not match"));
+        file.addresses[0].derived = false;
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+        let imported = HdWallet::load(&path, &phrase, None, password).unwrap();
+        assert!(!imported.is_derived(1));
+        assert_eq!(imported.get(1).unwrap().address, file.addresses[0].address);
+
+        file.addresses[0].index = 0;
+        file.addresses[0].derived = true;
+        let key = derive_master_key(&phrase, "", password, 3).unwrap();
+        let seed = mnemonic.to_seed("");
+        let correct = derive_at(&seed, 0, true).unwrap();
+        let unrelated = derive_at(&seed, 1, true).unwrap();
+        file.addresses[0].keypair_crypto = encrypt_with_key(&key,
+            &serde_json::to_vec(&KeypairPayload {
+                public_key_hex: hex::encode(&correct.public_key),
+                private_key_hex: hex::encode(&unrelated.private_key),
+            }).unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+        assert!(HdWallet::load(&path, &phrase, None, password).err().unwrap().contains("does not match"));
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// Hand-build a genuine `HdWalletFile` at an explicit `version`, with its

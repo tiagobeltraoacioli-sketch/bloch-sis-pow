@@ -866,6 +866,9 @@ mod replay_bench;
 #[cfg(test)]
 mod proposal_revalidation_tests;
 
+#[cfg(test)]
+mod ws_lifecycle_tests;
+
 mod local_cache;
 mod verification;
 
@@ -1072,7 +1075,7 @@ struct Engine {
     /// The weak-subjectivity anchor this node booted under (epoch, root), and
     /// whether it is the node's ONLY defense (it had no finality of its own).
     /// `None` until `ws_boot::boot` has run.
-    ws_anchor: Option<(u64, [u8; 32])>,
+    ws_anchor: Option<bloch_pos_committee::ws::WeakSubjectivityCheckpoint>,
     ws_anchor_hard: bool,
     /// A forward WS_CONFLICT is announced once, not every block.
     ws_conflict_reported: bool,
@@ -1587,58 +1590,52 @@ impl Engine {
     /// (`anchor_is_hard`) has only the anchor between it and a forged
     /// history, so a contradiction is fatal: it is following a chain that
     /// disagrees with the one thing it trusted.
-    fn enforce_ws_anchor(&mut self) {
-        let Some((epoch, root)) = self.ws_anchor else {
-            return;
-        };
-        if self.ws_conflict_reported {
-            return;
-        }
-        let Some(local) = self.own_finalized_root_at(epoch) else {
-            return;
-        };
-        use bloch_pos_committee::ws::{cross_check, WeakSubjectivityCheckpoint, WS_FORMAT_VERSION};
-        // Only `epoch`/`block_root` are read by cross_check; the rest of the
-        // artifact is not re-litigated here (it was verified at boot).
-        let probe = WeakSubjectivityCheckpoint {
-            version: WS_FORMAT_VERSION,
-            network_id: 0,
-            genesis_root: [0u8; 32],
-            epoch,
-            block_root: root,
-            state_root: [0u8; 32],
-            validator_set_root: [0u8; 32],
-            issued_at: 0,
-            signer_set_id: 0,
-        };
-        if let bloch_pos_committee::ws::CrossCheck::Conflict {
-            local_root,
-            published_root,
-        } = cross_check(Some(local), &probe)
-        {
-            self.ws_conflict_reported = true;
-            eprintln!(
-                "WS_CONFLICT at epoch {epoch}: this node finalized {} where its \
-                 weak-subjectivity anchor says {}.",
-                crate::codec::hex32(&local_root),
-                crate::codec::hex32(&published_root),
-            );
-            if self.ws_anchor_hard {
-                eprintln!(
-                    "FATAL: this node synced with no finality of its own — the anchor \
-                     was its only defense against a forged history, and the chain it \
-                     followed contradicts it. Stopping rather than serving a history \
-                     nothing vouches for. Re-check the checkpoint digest across \
-                     independent publication channels before restarting."
-                );
-                std::process::exit(1);
+    /// A missing canonical block is pending evidence, not agreement. The state
+    /// check runs before finality reaches the publication epoch: once this exact
+    /// block is validated, its immutable header root cannot later change.
+    fn ws_anchor_conflict(&self) -> Option<String> {
+        let checkpoint = self.ws_anchor?;
+        let root = checkpoint.block_root;
+        let epoch = checkpoint.epoch;
+        let reserved_genesis = checkpoint.signer_set_id == bloch_pos_committee::ws::WS_GENESIS_SIGNER_SET_ID
+            && epoch == 0 && root == *self.manifest.genesis_id().as_bytes();
+        // The release anchor's manifest-derived state was checked at boot.
+        // Recomputing its whole state after every block would defeat replay
+        // performance. Published genesis-boundary artifacts use the historical
+        // header convention, not the release anchor's different state root.
+        if !reserved_genesis && self.canonical.contains(&root) {
+            let local_state = if root == *self.manifest.genesis_id().as_bytes() {
+                Some(self.manifest.genesis_header().state_root)
+            } else {
+                self.blocks.get(&root).map(|block| block.header.state_root)
+            };
+            if let Some(local_state) = local_state {
+                if checkpoint.state_root != local_state {
+                    return Some(format!("WS_STATE_CONFLICT at epoch {epoch}: published state {} differs from locally validated block {} state {}",
+                        crate::codec::hex32(&checkpoint.state_root), crate::codec::hex32(&root), crate::codec::hex32(&local_state)));
+                }
             }
-            eprintln!(
-                "Own finality stands: NOT reorganizing (a checkpoint can never override \
-                 a running node's finality). Alert the operator and compare the \
-                 published digest across independent channels."
-            );
         }
+        let local = self.own_finalized_root_at(epoch)?;
+        if local != root {
+            return Some(format!("WS_CONFLICT at epoch {epoch}: this node finalized {} where its weak-subjectivity anchor says {}",
+                crate::codec::hex32(&local), crate::codec::hex32(&root)));
+        }
+        None
+    }
+
+    fn enforce_ws_anchor(&mut self) {
+        if self.ws_conflict_reported { return; }
+        let Some(conflict) = self.ws_anchor_conflict() else { return; };
+        self.ws_conflict_reported = true;
+        eprintln!("{conflict}");
+        if self.ws_anchor_hard {
+            eprintln!("FATAL: this node booted without own finality and its checkpoint contradicts validated local evidence. Verify the original artifact and publication channels before restarting.");
+            // A checkpoint contradiction needs operator action, not an
+            // unattended restart loop (same service policy as boot refusal).
+            std::process::exit(78);
+        }
+        eprintln!("Own finality stands: NOT reorganizing or exiting. Alert the operator and compare the published digest across independent channels.");
     }
 
     /// This validator's RANDAO chain, positioned at its committed reveal
@@ -3094,56 +3091,9 @@ impl Engine {
             return Err(Refusal::PreviouslyRefused { until_slot });
         }
         admission::check_transfer(&self.state, &tx, key.len(), epoch_of(self.wall_slot()))?;
-        if self.mempool.bytes().saturating_add(key.len()) > admission::MAX_MEMPOOL_BYTES {
-            return Err(Refusal::AtCapacity);
-        }
-        // R7 M6: per-source cap, before capacity — a source at its own cap
-        // must be refused as such even when the mempool overall has room,
-        // and must not instead be told to look at the (irrelevant) overall
-        // capacity.
-        if let Some(source) = tx_source_hash(&tx) {
-            let from_source =
-                self.mempool.source_count(&source);
-            if from_source >= MEMPOOL_MAX_PER_SOURCE {
-                return Err(Refusal::TooManyFromSource);
-            }
-        }
-        // R7 M6: at capacity, decide WHETHER an eviction is even possible —
-        // read-only, cheap, no crypto paid — but do not COMMIT it yet. The
-        // incoming transaction must still pass `admissible` below before any
-        // real entry is actually removed: otherwise a transaction that
-        // CLAIMS a high `tip_millisat_per_gas` but carries a garbage
-        // signature would evict a real, paying transaction for free and
-        // then itself be refused as `Invalid` — a targeted eviction that
-        // costs the attacker nothing, since `tip_millisat_per_gas` sits
-        // inside the signed root and checking it against the signature is
-        // exactly the expensive step this ordering must not skip.
-        let evict_at_capacity: Option<Vec<u8>> = if self.mempool.len() >= MEMPOOL_MAX {
-            // `min_by_key` breaks ties by iteration order (`BTreeMap`,
-            // ascending canonical bytes) — deterministic, and irrelevant to
-            // security: a tie for LOWEST fee is the one place grinding buys
-            // nothing, since every tied candidate is equally eligible for
-            // eviction regardless of which one this picks.
-            let lowest = self
-                .mempool
-                .iter()
-                .min_by_key(|(_, t)| tx_tip_rate(t))
-                .map(|(k, t)| (k.clone(), tx_tip_rate(t)));
-            match lowest {
-                // Strictly greater, not `>=`: a flood of minimum-fee
-                // transactions must not be able to evict a real payer merely
-                // by arriving. Today's `AtCapacity` at least costs such a
-                // flood nothing extra; letting a TIE evict would make it
-                // actively clear out everyone who already paid, which is
-                // strictly worse than the refusal it replaces.
-                Some((lowest_key, lowest_rate)) if tx_tip_rate(&tx) > lowest_rate => {
-                    Some(lowest_key)
-                }
-                _ => return Err(Refusal::AtCapacity),
-            }
-        } else {
-            None
-        };
+        // Plan capacity cleanup without mutating the pool. A forged incoming
+        // signature must never evict either stale or currently paying entries.
+        let capacity = self.plan_mempool_capacity(&tx, key.len(), epoch_of(self.wall_slot()))?;
         // Refuse the shapes consensus can never apply.
         //
         // Admission used to check duplicate-and-capacity only, so anything
@@ -3182,15 +3132,21 @@ impl Engine {
             }
         }
         admissible(&tx, epoch_of(self.wall_slot())).map_err(Refusal::Invalid)?;
-        if self.funded_mempool_conflict(&tx) {
+        if self.funded_mempool_conflict(&tx, &capacity.stale) {
             return Err(Refusal::Invalid("funded deposit conflicts with a pending input or validator key"));
         }
         self.validate_lifecycle_admission(&tx)?;
-        // R7 M6: only now, with the incoming transaction confirmed
-        // admissible, actually commit the eviction decided above.
-        if let Some(lowest_key) = evict_at_capacity {
+        // Commit only after every incoming admission check succeeds. Removing
+        // state-dependent failures under pressure is retention, never a bar.
+        for stale in &capacity.stale {
+            self.mempool.remove(stale);
+            self.mempool_admitted_at.remove(stale);
+            self.mempool_suspect.remove(stale);
+        }
+        if let Some(lowest_key) = capacity.lower_fee {
             self.mempool.remove(&lowest_key);
             self.mempool_admitted_at.remove(&lowest_key);
+            self.mempool_suspect.remove(&lowest_key);
             self.mempool_evicted_low_fee = self.mempool_evicted_low_fee.saturating_add(1);
         }
         let mut frame = vec![net::FRAME_TX];
@@ -3234,24 +3190,26 @@ impl Engine {
         // again, making the exact same signed transaction eligible later.
         let mut funded_context = None;
         let candidates = self.mempool.iter().filter(|(encoded, tx)| {
-            if admission::check_transfer(&self.state, tx, encoded.len(), epoch).is_err() {
-                return false;
-            }
-            if matches!(tx, PosTransaction::FundedDeposit(_)) {
-                if !bloch_pos_committee::params::epoch_gate_active(epoch,
-                    bloch_pos_committee::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH) {
-                    return false;
-                }
-                let (rolled, total) = funded_context.get_or_insert_with(|| {
-                    let rolled = self.rolled_to(epoch);
-                    let total = rolled.active_validators().iter().fold(0u128, |sum, v| sum.saturating_add(u128::from(v.effective_stake)));
-                    (rolled, total)
-                });
-                return rolled.validate_lifecycle_transaction(tx, *total, self.state.next_base_fee_at(epoch), &ProbeVerifier).is_ok();
-            }
-            true
+            self.candidate_is_backed(tx, encoded.len(), epoch, &mut funded_context)
         }).collect();
         Self::pack_transactions(epoch, candidates)
+    }
+
+    /// Immutable signatures were checked at admission. Re-evaluate only the
+    /// parent/epoch-dependent backing shared by selection and capacity policy.
+    fn candidate_is_backed(&self, tx: &PosTransaction, encoded: usize, epoch: u64,
+        funded_context: &mut Option<(Arc<CommittedState>, u128)>) -> bool {
+        if admission::check_transfer(&self.state, tx, encoded, epoch).is_err() { return false; }
+        if matches!(tx, PosTransaction::FundedDeposit(_)) {
+            if !bloch_pos_committee::params::funded_validator_admission_active(epoch) { return false; }
+            let (rolled, total) = funded_context.get_or_insert_with(|| {
+                let rolled = self.rolled_to(epoch);
+                let total = rolled.active_validators().iter().fold(0u128, |sum, v| sum.saturating_add(u128::from(v.effective_stake)));
+                (rolled, total)
+            });
+            return rolled.validate_lifecycle_transaction(tx, *total, self.state.next_base_fee_at(epoch), &ProbeVerifier).is_ok();
+        }
+        true
     }
 
     fn pack_transactions(epoch: u64, mut ordered: Vec<(&Vec<u8>, &PosTransaction)>) -> Vec<PosTransaction> {
@@ -3447,9 +3405,10 @@ impl Engine {
                             after.finalized.epoch,
                             crate::codec::hex8(&after.finalized.root)
                         );
-                        // New own finality may now reach the anchor's epoch.
-                        self.enforce_ws_anchor();
                     }
+                    // A newly available block can expose a false checkpoint
+                    // state root even before finality advances to its epoch.
+                    self.enforce_ws_anchor();
                 }
                 true
             }
@@ -4533,6 +4492,7 @@ fn start_libp2p(
     cfg: &Config,
     net_tx: mpsc::Sender<NetEvent>,
     head_slot: &Arc<AtomicU64>,
+    inflight: &Arc<net::QueueBudget>,
 ) -> io::Result<crate::p2p::Handle> {
     let parse = |s: &str, what: &str| -> io::Result<crate::p2p::Multiaddr> {
         s.parse().map_err(|e| {
@@ -4560,6 +4520,7 @@ fn start_libp2p(
         },
         net_tx,
         head_slot.clone(),
+        inflight.clone(),
     )?;
     println!("p2p: node identity {}", handle.peer_id);
     Ok(handle)
@@ -4814,7 +4775,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         Transport::Devnet => {
             net::Net::Devnet(start_devnet(&cfg, tx.clone(), &head_slot, &inflight)?)
         }
-        Transport::Libp2p => net::Net::Libp2p(start_libp2p(&cfg, net_tx, &head_slot)?),
+        Transport::Libp2p => net::Net::Libp2p(start_libp2p(&cfg, net_tx, &head_slot, &inflight)?),
         Transport::Dual => {
             // Devnet FIRST. Binding its `TcpListener` is the cheap synchronous
             // failure — a port already in use — and a node that cannot bind
@@ -4822,7 +4783,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
             // that looks like it is bridging two populations and is not.
             // `?` on either line aborts the whole start.
             let mesh = start_devnet(&cfg, tx.clone(), &head_slot, &inflight)?;
-            let handle = start_libp2p(&cfg, net_tx, &head_slot)?;
+            let handle = start_libp2p(&cfg, net_tx, &head_slot, &inflight)?;
             net::Net::Both(mesh, handle)
         }
     };
@@ -5147,7 +5108,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
                     crate::codec::hex8(&ws.anchor_root),
                     if ws.anchor_is_hard { "WITHOUT" } else { "with" },
                 );
-                engine.ws_anchor = Some((ws.anchor_epoch, ws.anchor_root));
+                engine.ws_anchor = Some(ws.checkpoint);
                 engine.ws_anchor_hard = ws.anchor_is_hard;
                 engine.enforce_ws_anchor();
             }
@@ -8201,17 +8162,10 @@ mod transfer_v2_end_to_end {
             e.message
         );
 
-        // THE CONTROL: a genuinely full mempool still reports MEMPOOL_FULL,
-        // and there "retry later" is the correct advice. Without this half,
-        // the assertion above could be satisfied by never reporting a full
-        // mempool at all.
-        //
-        // Each filler entry gets a DISTINCT source (R7 M6's per-source cap,
-        // `MEMPOOL_MAX_PER_SOURCE` = 64, is far below `MEMPOOL_MAX` = 4,096):
-        // without this, every filler shares `tx`'s one source and the fill
-        // trips the per-source cap at 64 entries rather than ever reaching
-        // real capacity, which is a different, more specific refusal
-        // (`TX_REFUSED_SOURCE_CAP`) than the one this control is for.
+        // Under pressure, temporarily unbacked entries may be planned for
+        // cleanup, but an inactive-format incoming transaction must still be
+        // refused without committing those evictions. These placeholders have
+        // distinct sources and intentionally unbacked ownership.
         let mut full = node;
         for i in 0..MEMPOOL_MAX {
             let mut filler = tx.clone();
@@ -8227,12 +8181,8 @@ mod transfer_v2_end_to_end {
         else {
             panic!("a full mempool must produce an RPC error");
         };
-        assert_eq!(e2.code, rpc::MEMPOOL_FULL, "full is not refused: {e2:?}");
-        assert!(
-            e2.message.contains("retry later"),
-            "a full mempool SHOULD advise retrying: {}",
-            e2.message
-        );
+        assert_eq!(e2.code, rpc::TX_REFUSED, "an inactive format stays refused: {e2:?}");
+        assert_eq!(full.mempool.len(), MEMPOOL_MAX, "refused incoming bytes must not commit planned cleanup");
     }
     #[test]
     fn audit_admission_rejects_unowned_missing_duplicate_and_unfunded_spends() {

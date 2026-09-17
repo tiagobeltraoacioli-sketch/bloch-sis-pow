@@ -78,3 +78,83 @@ fn proposal_revalidation_packs_independent_spends_after_higher_tip_conflicts() {
     assert!(node.select_transactions(0).is_empty(), "a now-spent input must be rechecked before packing");
     assert!(!node.rejected.contains_key(&low_key), "selection conflicts must not mint rejection bars");
 }
+
+/// A real fee rise leaves an admitted high-tip transaction temporarily stale.
+fn stale_pool() -> (Engine, perf_support::TestDir, Vec<EutxoEntry>, PosTransaction) {
+    let funds = funds();
+    let (mut node, dir) = perf_support::proposing_engine_funded(&funds);
+    let fee = node.state.next_base_fee_at(0);
+    let stale = spend(&funds[1], 9_000, 100, fee);
+    assert_eq!(node.on_transaction(stale.clone()), Ok(Admitted::New));
+    let filler = spend(&funds[0], fee_market::max_block_tx_bytes(0), 101, fee);
+    node.mempool.insert(filler.canonical_bytes(), filler);
+    node.propose(1);
+    assert_eq!(node.state.slot(), 1);
+    assert!(node.state.next_base_fee_at(0) > fee);
+    (node, dir, funds, stale)
+}
+
+#[test]
+fn capacity_revalidation_reclaims_stale_high_tips_before_count_eviction() {
+    let _clock = validator_lifecycle::clock_at(1);
+    let (mut node, _dir, funds, stale) = stale_pool();
+    // Zero-tip placeholders isolate capacity accounting; the stale spend above
+    // entered through real authenticated admission before a real fee rise.
+    for validator in 1..MEMPOOL_MAX as u32 {
+        let placeholder = PosTransaction::Exit { validator };
+        node.mempool.insert(placeholder.canonical_bytes(), placeholder);
+    }
+    assert_eq!(node.mempool.len(), MEMPOOL_MAX);
+    let incoming = spend(&funds[2], 9_000, 0, node.state.next_base_fee_at(0));
+    let before = node.mempool.bytes();
+    let mut forged = incoming.clone();
+    if let PosTransaction::Transfer { inputs, .. } = &mut forged { inputs[0].signature[0] ^= 1; }
+    assert!(matches!(node.on_transaction(forged), Err(Refusal::Invalid(_))));
+    assert_eq!(node.mempool.len(), MEMPOOL_MAX);
+    assert_eq!(node.mempool.bytes(), before, "failed authentication must not commit cleanup");
+    assert!(node.mempool.contains_key(&stale.canonical_bytes()));
+    assert_eq!(node.on_transaction(incoming.clone()), Ok(Admitted::New));
+    assert_eq!(node.mempool.len(), MEMPOOL_MAX);
+    assert!(!node.mempool.contains_key(&stale.canonical_bytes()));
+    assert!(node.mempool.contains_key(&incoming.canonical_bytes()));
+    assert!(!node.rejected.contains_key(&stale.canonical_bytes()));
+    assert!(!node.mempool_admitted_at.contains_key(&stale.canonical_bytes()));
+    assert_eq!(node.mempool_evicted_low_fee, 0, "stale retention cleanup is not paid-fee replacement");
+    let equally_priced = spend(&funds[2], 9_001, 0, node.state.next_base_fee_at(0));
+    assert_eq!(node.on_transaction(equally_priced), Err(Refusal::AtCapacity),
+        "once stale entries are gone, equal-fee arrivals still cannot evict current payers");
+}
+
+#[test]
+fn capacity_revalidation_reclaims_stale_bytes_without_a_rejection_bar() {
+    let _clock = validator_lifecycle::clock_at(1);
+    let (mut node, _dir, funds, stale) = stale_pool();
+    let incoming = spend(&funds[2], 9_000, 0, node.state.next_base_fee_at(0));
+    let reserved = stale.canonical_bytes().len().max(incoming.canonical_bytes().len());
+    node.mempool.insert(vec![0; admission::MAX_MEMPOOL_BYTES - reserved], PosTransaction::Exit { validator: 9 });
+    assert!(node.mempool.bytes() + incoming.canonical_bytes().len() > admission::MAX_MEMPOOL_BYTES);
+    assert_eq!(node.on_transaction(incoming), Ok(Admitted::New));
+    assert!(node.mempool.bytes() <= admission::MAX_MEMPOOL_BYTES);
+    assert!(!node.mempool.contains_key(&stale.canonical_bytes()));
+    assert!(!node.rejected.contains_key(&stale.canonical_bytes()));
+}
+
+#[test]
+fn capacity_revalidation_reclaims_stale_source_slots_for_a_valid_same_owner() {
+    let _clock = validator_lifecycle::clock_at(1);
+    let funds = funds();
+    let (mut node, _dir) = perf_support::proposing_engine_funded(&funds);
+    let fee = node.state.next_base_fee_at(0);
+    for tip in 1..=MEMPOOL_MAX_PER_SOURCE as u128 {
+        assert_eq!(node.on_transaction(spend(&funds[1], 9_000, tip, fee)), Ok(Admitted::New));
+    }
+    let filler = spend(&funds[0], fee_market::max_block_tx_bytes(0), 101, fee);
+    node.mempool.insert(filler.canonical_bytes(), filler);
+    node.propose(1);
+    assert_eq!(node.mempool.len(), MEMPOOL_MAX_PER_SOURCE);
+    let incoming = spend(&funds[2], 9_000, 0, node.state.next_base_fee_at(0));
+    assert_eq!(node.on_transaction(incoming.clone()), Ok(Admitted::New));
+    assert_eq!(node.mempool.len(), MEMPOOL_MAX_PER_SOURCE);
+    assert_eq!(node.mempool.source_count(&tx_source_hash(&incoming).unwrap()), MEMPOOL_MAX_PER_SOURCE);
+    assert!(node.rejected.is_empty());
+}

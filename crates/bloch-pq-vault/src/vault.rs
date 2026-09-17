@@ -25,10 +25,13 @@
 //! ## The covenant caveat (spec §2.0(2) — stated, not papered over)
 //! On stock Bitcoin there is **no covenant opcode**, so "the deposit may only be spent
 //! by the delayed trigger" is NOT enforced by consensus here. It is enforced
-//! operationally, Revault-style, by *pre-signing* the unvault transaction and
-//! **securely deleting the deposit's bypass key**. This crate builds and (in tests)
-//! signs those transactions; it cannot force the owner to delete a key. See the crate
-//! docs' HONEST LIMITS.
+//! only operationally by a separately designed pre-signing/deletion ceremony.
+//! The legacy `VaultParams` here REUSES the hot key for deposit and branch A;
+//! retaining that hot key or its derivation seed preserves the deposit bypass.
+//! Deleting only a copy does not implement the advertised ceremony. New callers
+//! can explicitly evaluate `construction::SeparatedDepositV1`, which separates
+//! the public roles but cannot prove key independence, deletion or quantum safety.
+//! Neither constructor is a Bitcoin covenant. See the crate HONEST LIMITS.
 
 use bitcoin::absolute::LockTime;
 use bitcoin::opcodes::all as op;

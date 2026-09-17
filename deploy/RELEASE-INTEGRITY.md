@@ -65,6 +65,13 @@ Inputs that define the binary, and where each is pinned:
 Toolchain bumps are a release-integrity event: their own commit, followed by a
 green `pos-release-integrity` run and a new reference hash.
 
+The local guard compares the root lockfile with HEAD, including staged changes.
+Its full-build path refuses nonempty compiler/flags/wrapper/target/profile
+environment overrides before compiling and checks the compiler version token
+exactly. The corresponding regressions run without building a release binary.
+This does not make the host hermetic: Cargo configuration, system libraries and
+the still-unqualified canonical container remain separate release inputs.
+
 ## 3. Reproducibility: what was measured on 2026-08-12 (not estimated)
 
 Host: macOS x86_64, rustc 1.94.1, `cargo build --release --locked`,

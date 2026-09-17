@@ -26,6 +26,14 @@ pub enum AnchorError {
     #[error("multiple Bloch anchor commitments found in transaction outputs")]
     AmbiguousAnchor,
 
+    /// Retrieved carrier data differs from the caller's expected commitment.
+    #[error("retrieved commitment does not match expected commitment")]
+    CommitmentMismatch,
+
+    /// The returned reference fails a caller-selected height/depth requirement.
+    #[error("reference does not satisfy caller policy: {0}")]
+    ReferencePolicy(&'static str),
+
     /// The RPC transport failed (network, IO, etc.).
     #[error("rpc transport error: {0}")]
     Transport(String),

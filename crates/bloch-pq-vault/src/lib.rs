@@ -1,8 +1,8 @@
-//! # bloch-pq-vault — a non-custodial, native, opt-in post-quantum *defensive vault*
+//! # bloch-pq-vault — experimental Bitcoin vault and PQ anchor primitives
 //!
-//! FOUNDATION. Implements the **achievable, honest** scope of
+//! Experimental primitives associated with
 //! `docs/specs/PQ-SHIELD-NONCUSTODIAL-NATIVE.md`: a **commit-delay-reveal P2WSH vault**
-//! on stock Bitcoin, plus a **PQ-gated clawback**, anchored on Bloch by a PQ-signed
+//! on stock Bitcoin, plus a hashlocked classical clawback and a separate PQ-signed
 //! commitment. It composes the repo's building blocks:
 //!
 //! - [`bloch_btc_wallet`] — one seed → BTC (secp256k1) + companion PQ key
@@ -12,7 +12,7 @@
 //!   validators the anchor's guard program reuses.
 //! - the `bitcoin` crate — real P2WSH scripts, transactions, BIP-143 sighashes.
 //!
-//! Three modules:
+//! Modules:
 //! - [`preimage`] — `r = HKDF(pq_sk, "pq-shield/v1" ‖ vault_id)` and `H(r) = SHA256(r)`.
 //! - [`vault`]    — the P2WSH deposit/trigger scripts, addresses, and the unvault /
 //!   branch-A / clawback transactions with real sighash handling.
@@ -33,9 +33,10 @@
 //!    we do not zero them.
 //! 2. **The covenant caveat is structural.** Stock Bitcoin has no covenant opcode
 //!    (`OP_CTV`/`OP_VAULT` are unshippable soft-fork proposals). The commit-delay-reveal
-//!    shape is enforced by **pre-signed transactions + secure deletion of the deposit
-//!    bypass key** (Revault-style) — an *operational* trust assumption, not consensus.
-//!    This crate builds and signs those txs; it cannot make anyone delete a key.
+//!    shape is not enforced by these scripts. Historical parameters reuse the retained
+//!    hot key for the deposit and therefore retain a direct bypass. An experimental
+//!    separate-key construction allows a pre-sign/delete ceremony, but this crate
+//!    cannot verify deletion, and quantum signature forgery can still bypass it.
 //! 3. **Taproot is not quantum-safe at rest.** We use **P2WSH** for the deposit (the
 //!    whole script, hence every pubkey, is behind `SHA256`). A Taproot instantiation
 //!    would protect the spend window only. We do not repeat the false "unspent Taproot is
@@ -57,9 +58,21 @@
 //!    real fix is BIP-360 (P2QRH); this is a stopgap on unmodified Bitcoin. Designed ≠
 //!    built ≠ booted.
 
+//! ## Construction and recovery audit follow-up
+//!
+//! Historical `VaultParams` uses the same seed-derived hot key for deposit and
+//! branch A: deleting a copy while retaining that seed cannot remove the bypass.
+//! [`construction::SeparatedDepositV1`] is a separate, opt-in NEW construction
+//! with a distinct deposit public key; independence remains a caller assumption. Existing V1/V2/V3 key derivations,
+//! scripts and addresses remain unchanged. See `CONSTRUCTION-AUDIT.md` for its
+//! operational, quantum-race and validation limitations. For existing recovery
+//! preimages, [`preimage::restore_recovery_secret_v1`] checks the supplied backup
+//! context against the already committed hash without changing the derivation.
+
 #![forbid(unsafe_code)]
 
 pub mod anchor;
+pub mod construction;
 pub mod preimage;
 pub mod script_eval;
 pub mod vault;

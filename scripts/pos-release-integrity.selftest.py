@@ -104,11 +104,13 @@ def relock(root: str) -> None:
     )
 
 
-def run_guard(root: str):
+def run_guard(root: str, *, args=None, extra_env=None):
+    env = os.environ.copy()
+    env.update(extra_env or {})
     return subprocess.run(
         ["bash", os.path.join(root, "scripts", "pos-release-integrity.sh"),
-         "--locks-only"],
-        cwd=root, capture_output=True, text=True,
+         *(args if args is not None else ["--locks-only"])],
+        cwd=root, capture_output=True, text=True, env=env,
     )
 
 
@@ -208,6 +210,30 @@ def main() -> int:
         with open(os.path.join(root, "Cargo.lock"), "a", encoding="utf-8") as fh:
             fh.write("\n# rewritten by a build\n")
         expect_fail("rewritten root Cargo.lock", root, "root Cargo.lock differs")
+
+    # Staging a changed lock must not hide it from the committed-source check.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = build_fixture(tmp)
+        with open(os.path.join(root, "Cargo.lock"), "a", encoding="utf-8") as fh:
+            fh.write("\n# staged, but not part of HEAD\n")
+        git(root, "add", "Cargo.lock")
+        expect_fail("staged root Cargo.lock", root, "root Cargo.lock differs")
+
+    # Reject ambient build overrides before metadata/compiler execution. Never
+    # echo their contents; flags and wrapper paths may contain private values.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = build_fixture(tmp)
+        for variable in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC_WRAPPER",
+                         "CARGO_PROFILE_RELEASE_LTO", "CARGO_BUILD_TARGET",
+                         "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER"):
+            marker = "private-build-override-never-echo"
+            result = run_guard(root, args=[], extra_env={variable: marker})
+            output = result.stdout + result.stderr
+            if (result.returncode == 0 or f"unset build override {variable}" not in output
+                    or marker in output):
+                FAILURES.append(f"environment override {variable} was not safely refused")
+            else:
+                print(f"  ok   refuses {variable} without echoing its value")
 
     # 7 — source assertion for section 3's call site, which needs a real build
     #     to reach: it must go through the shared root-lock assertion and must

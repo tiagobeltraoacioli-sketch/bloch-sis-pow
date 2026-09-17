@@ -50,9 +50,10 @@ impl Engine {
     /// Reserve funded inputs against every pending spend and reserve the
     /// joining key against duplicate registrations with different signatures.
     /// Conflicts are refused before capacity eviction or any broadcast.
-    pub(super) fn funded_mempool_conflict(&self, tx: &PosTransaction) -> bool {
+    pub(super) fn funded_mempool_conflict(&self, tx: &PosTransaction, evicted: &BTreeSet<Vec<u8>>) -> bool {
         let incoming = Self::spent_outpoints(tx).unwrap_or_default();
-        self.mempool.values().any(|other| {
+        self.mempool.iter().any(|(key, other)| {
+            if evicted.contains(key) { return false; }
             let funded = matches!(tx, PosTransaction::FundedDeposit(_))
                 || matches!(other, PosTransaction::FundedDeposit(_));
             if !funded {
@@ -181,11 +182,21 @@ impl Engine {
             };
             let seed = keys.randao_seed_for(&network, generation);
             let new_commitment = RandaoChain::generate(seed).commitment();
-            let signature = keys.sign(&bloch_pos_committee::beacon::recommit_signing_root(
+            let signing_root = bloch_pos_committee::beacon::recommit_signing_root(
                 index,
                 wall_epoch,
                 &new_commitment,
-            ));
+            );
+            let signature = match self.slashprot.guard_recommit(
+                wall_epoch, generation, new_commitment, signing_root,
+                || keys.sign(&signing_root),
+            ) {
+                Ok(signature) => signature,
+                Err(reason) => {
+                    eprintln!("validator lifecycle RANDAO signing for v{index} refused: {reason}");
+                    return;
+                }
+            };
             Some(PosTransaction::RandaoRecommit {
                 validator: index,
                 epoch: wall_epoch,

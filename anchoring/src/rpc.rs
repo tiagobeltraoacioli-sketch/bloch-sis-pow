@@ -150,6 +150,16 @@ impl<T: RpcTransport> BlochRpc<T> {
     /// depth. Accepts either an `outputs`/`vout` array of `{script_pubkey: hex}`
     /// objects, or a raw `hex` field parsed with the minimal codec.
     pub fn get_transaction(&self, txid: &Txid) -> Result<RetrievedTx> {
+        self.get_transaction_inner(txid, true)
+    }
+
+    /// Require explicit decoded outputs from RPC. Never guess that node raw
+    /// bytes use this crate's incompatible mock transaction codec.
+    pub fn get_transaction_outputs_only(&self, txid: &Txid) -> Result<RetrievedTx> {
+        self.get_transaction_inner(txid, false)
+    }
+
+    fn get_transaction_inner(&self, txid: &Txid, allow_reference_codec: bool) -> Result<RetrievedTx> {
         let result = self.call("gettransaction", json!([txid.to_hex()]))?;
 
         let confirmations = result.get("confirmations").and_then(Value::as_u64)
@@ -179,7 +189,10 @@ impl<T: RpcTransport> BlochRpc<T> {
             });
         }
 
-        // Fallback: raw tx hex.
+        if !allow_reference_codec {
+            return Err(AnchorError::BadResponse("explicit decoded outputs required; mock-codec fallback disabled".into()));
+        }
+        // Historical reference-only fallback; never a consensus decoder.
         if let Some(raw) = result.get("hex").and_then(Value::as_str) {
             let tx = crate::tx::Transaction::from_hex(raw)?;
             return Ok(RetrievedTx {
@@ -304,6 +317,9 @@ impl RpcTransport for MockTransport {
                         let confs = Self::confirmations_of(&st, *mined);
                         ok(json!({
                             "hex": raw,
+                            "outputs": crate::tx::Transaction::from_hex(raw)?.outputs.iter()
+                                .map(|output| json!({"script_pubkey": hex::encode(&output.script_pubkey)}))
+                                .collect::<Vec<_>>(),
                             "confirmations": confs,
                             "height": mined,
                         }))
@@ -345,6 +361,23 @@ mod tests {
         assert_eq!(status.confirmations, 5);
         let got = rpc.get_transaction(&txid).unwrap();
         assert_eq!(got.output_scripts.len(), 1);
+    }
+
+    #[test]
+    fn strict_output_reader_never_guesses_mock_codec_for_rpc_hex() {
+        struct HexOnly;
+        impl RpcTransport for HexOnly {
+            fn request(&self, body: &str) -> Result<Value> {
+                let request: Value = serde_json::from_str(body).map_err(|e| AnchorError::Transport(e.to_string()))?;
+                let tx = crate::tx::Transaction { version: 1, inputs: vec![], outputs: vec![], locktime: 0 };
+                Ok(json!({"jsonrpc":"2.0", "id":request["id"],
+                    "result":{"hex":tx.to_hex(), "height":1, "confirmations":1}}))
+            }
+        }
+        let rpc = BlochRpc::new(HexOnly);
+        let id = Txid::from_bytes([1; 32]);
+        assert!(rpc.get_transaction(&id).is_ok(), "historical mock codec compatibility");
+        assert!(matches!(rpc.get_transaction_outputs_only(&id), Err(AnchorError::BadResponse(_))));
     }
 
     #[test]

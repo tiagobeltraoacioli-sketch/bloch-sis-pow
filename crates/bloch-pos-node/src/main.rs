@@ -392,6 +392,7 @@ fn print_help() {
                          [--stop-at-slot <n>]\n\
                          [--replay-from-genesis | --require-state-cache] [--max-replay-blocks <n>]\n\
                          [--ws-checkpoint <file>] [--ws-signer-set <file>]\n\
+                         [--ws-signer-set-sha3 <independently-verified-hex32>]\n\
                          [--carryover <snapshot.tsv>]\n\
                Run a validator node. <dir> must hold validator.key; chain\n\
                data persists in <dir>; a compatible local state cache skips its replay prefix.\n\
@@ -1522,10 +1523,10 @@ fn run_cmd(args: &[String]) {
     };
     let stop_at_slot = arg_value(args, "--stop-at-slot").and_then(|s| s.parse::<u64>().ok());
 
-    let ws = ws_boot::WsConfig {
-        checkpoint: arg_value(args, "--ws-checkpoint").map(PathBuf::from),
-        signer_set: arg_value(args, "--ws-signer-set").map(PathBuf::from),
-    };
+    let ws = ws_boot::WsConfig::from_args(args).unwrap_or_else(|error| {
+        eprintln!("weak subjectivity configuration: {error}");
+        exit(2);
+    });
 
     // RPC. A malformed --rpc-port is refused rather than silently falling back
     // to the default: an operator who typed a port meant that port, and a node

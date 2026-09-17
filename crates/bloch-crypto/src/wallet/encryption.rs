@@ -186,11 +186,11 @@ impl EncryptedKeyfile {
         rand::rng().fill_bytes(&mut nonce_bytes);
 
         // Derive encryption key via Argon2id
-        let mut key = [0u8; 32];
-        derive_key(password, &salt, params, &mut key)?;
+        let mut key = Zeroizing::new([0u8; 32]);
+        derive_key(password, &salt, params, &mut *key)?;
 
         // Encrypt with AES-256-GCM
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&*key));
         let nonce = Nonce::from_slice(&nonce_bytes);
         // SECURITY (audit M2): bind the public key + network into the AEAD as
         // AAD so they cannot be swapped without breaking the GCM tag. Otherwise
@@ -306,11 +306,11 @@ impl EncryptedKeyfile {
             t_cost: self.kdf.t_cost,
             p_cost: self.kdf.p_cost,
         };
-        let mut key = [0u8; 32];
-        derive_key(password, &salt, params, &mut key)?;
+        let mut key = Zeroizing::new([0u8; 32]);
+        derive_key(password, &salt, params, &mut *key)?;
 
         // Decrypt
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&*key));
         let nonce = Nonce::from_slice(&nonce_bytes);
         // SECURITY (audit M2): verify against the same public+network AAD used
         // at encrypt time. A tampered public key or flipped network breaks the
@@ -366,8 +366,8 @@ impl EncryptedKeyfile {
         rand::rng().fill_bytes(&mut salt);
         rand::rng().fill_bytes(&mut nonce_bytes);
 
-        let mut key = [0u8; 32];
-        derive_key(password, &salt, params, &mut key)?;
+        let mut key = Zeroizing::new([0u8; 32]);
+        derive_key(password, &salt, params, &mut *key)?;
 
         // Plaintext: [4B seed_len LE][seed][secret]. Zeroizing so the buffer
         // wipes on every exit path.
@@ -376,7 +376,7 @@ impl EncryptedKeyfile {
         plain.extend_from_slice(master_seed);
         plain.extend_from_slice(secret);
 
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&*key));
         let nonce = Nonce::from_slice(&nonce_bytes);
         // v2 AAD domain: binds version + public key + network (audit M2 for v1,
         // extended with the version so cross-version replay breaks the tag).
@@ -478,10 +478,10 @@ impl EncryptedKeyfile {
             t_cost: self.kdf.t_cost,
             p_cost: self.kdf.p_cost,
         };
-        let mut key = [0u8; 32];
-        derive_key(password, &salt, params, &mut key)?;
+        let mut key = Zeroizing::new([0u8; 32]);
+        derive_key(password, &salt, params, &mut *key)?;
 
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&*key));
         let nonce = Nonce::from_slice(&nonce_bytes);
         let net: Network = self.network.into();
         let aad = keyfile_aad_v2(&public, net);

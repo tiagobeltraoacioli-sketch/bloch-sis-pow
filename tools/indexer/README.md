@@ -8,8 +8,13 @@ A sync pass stages at most 16 linked blocks before publishing changes, rechecks
 the fork anchor and batch tip, and refuses observed RPC branch shifts without
 changing balances. Concurrent sync callers share one pass. Fork searches stop
 after 2,048 comparisons and require operator reconciliation beyond that bound.
-This is a request-count bound, not a total deadline: slow RPCs can still occupy
-a pass for hours, and shutdown is observed between passes.
+RPC work has a 30-second pass deadline (`INDEXER_SYNC_TIMEOUT_MS`, configurable
+from 1 through 300,000 ms). Fetch and body reads receive cancellation; late
+responses cannot publish a cancelled batch. Collection stops early to leave
+budget for final anchor/tip checks, allowing shorter batches on slow sources.
+SIGINT/SIGTERM cancel pending reads and poll sleeps. Synchronous block application
+and whole-state fsync cannot be preempted by a JavaScript timer, so this is not a
+hard wall-clock bound on those phases.
 Missing verbose bodies and malformed transaction arrays/identifiers/indices are
 errors, not evidence that indexing is complete. No missing spend/output list is
 silently converted into an empty transaction.
@@ -48,9 +53,10 @@ It persists to a simple embedded JSON store and exposes a small read API.
   No claim is made that it "works end-to-end against mainnet."
 - **Testnet-only reference.** Defaults encode addresses with the testnet
   `bloch1t…` prefix.
-- **Test BLCH has NO value.** BLCH is **not a security**; nobody makes any value
-  or investment claim. The base is experimental mainnet-beta: relaxed PoW (k=4)
-  is trivially forgeable and the network is 51%-attackable.
+- **Legacy RPC model.** The reference was written for the retired Genesis-3
+  proof-of-work API. Genesis-4 uses proof of stake; this tool has not established
+  an equivalent canonical-chain contract with that node. Do not infer support
+  for current exchange accounting from the offline examples.
 - **Bloch is ownerless and neutral.** Postern Labs is **one builder among many**
   with **no protocol privilege**.
 
@@ -113,7 +119,7 @@ Consequences, all implemented here:
   timestamps and counts stay `number`.
 - All parsing goes through **one** helper, `parseSats` in `src/sats.ts`. It
   accepts the canonical decimal string *and* the legacy bare-number form that the
-  live Genesis-3 fleet still emits, and rejects negatives, non-integers, and
+  historical Genesis-3 API emitted, and rejects negatives, non-integers, and
   anything above 10^19.
 - `HttpTransport` reads responses with `parseJsonExactIntegers`, not
   `res.json()`: an oversized integer literal is recovered from its **raw source
@@ -217,7 +223,8 @@ are capped at 1 MiB; unusually large individual string fields are refused.
 If a page exceeds the byte cap, HTTP 503 asks the caller to request a smaller
 page. Address spelling is canonicalized and must match the configured network.
 The upstream JSON-RPC client caps streamed response bodies at 8 MiB, including
-responses without Content-Length, retains its 10-second deadline and refuses
+responses without Content-Length, retains its 10-second per-call deadline in
+addition to pass cancellation, and refuses
 redirects.
 
 Snapshots keep their existing JSON format. Persistence uses a unique, exclusive
@@ -264,3 +271,18 @@ so this patch does not assume a linear parent rule for the DAG. Production
 qualification requires a pinned selected-chain snapshot or a verified ancestry
 contract and adversarial branch-switch tests. The indexer is a reference
 consumer of node RPC, not an independent consensus verifier.
+
+
+### Operational configuration (audit continuation, 2026-09-17)
+
+Remote RPC requires HTTPS. Plain HTTP is permitted only for exact loopback
+hostnames/addresses (`localhost`, `127.0.0.1`, `[::1]`). URL credentials and
+fragments are rejected; use `INDEXER_RPC_API_KEY` for an authorization header.
+Startup logs only the RPC origin, not query parameters. Existing remote HTTP
+configurations must provision TLS before adopting this version.
+
+Invalid network/boolean settings now fail at startup rather than selecting a
+different network or live/stub mode silently. Poll intervals must be integer
+10–3,600,000 ms, RPC pass deadlines 1–300,000 ms, and API ports 1–65,535. Defaults
+remain 3,000 ms polling, 30,000 ms pass deadline, and port 8081. These are local
+resource policies, not assurances about upstream honesty or chain finality.

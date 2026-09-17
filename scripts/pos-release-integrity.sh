@@ -50,7 +50,7 @@ fail() { echo "pos-release-integrity: FAIL — $*" >&2; exit 1; }
 # before a minute of building — and section 3, which is the real point: the
 # build must not have touched it.
 assert_root_lock_undrifted() { # $1 = what a difference would mean
-  git diff --exit-code -- "$REPO_ROOT/Cargo.lock" >/dev/null \
+  git diff --exit-code HEAD -- "$REPO_ROOT/Cargo.lock" >/dev/null \
     || fail "the committed root Cargo.lock differs from the working tree: $1"
 }
 
@@ -62,6 +62,23 @@ case "${1:-}" in
   "")           : ;;
   *)            fail "unknown argument '$1' (only --locks-only is accepted)." ;;
 esac
+
+if [ "$LOCKS_ONLY" = 0 ]; then
+# A same-path comparison can pass twice with the same injected compiler flags
+# or wrapper. Refuse environment overrides before calling that result the
+# default release profile. Values are deliberately never printed.
+while IFS= read -r variable; do
+  case "$variable" in
+    RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|RUSTC|RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER|\
+    CARGO_BUILD_RUSTFLAGS|CARGO_BUILD_RUSTC|CARGO_BUILD_RUSTC_WRAPPER|\
+    CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER|CARGO_BUILD_TARGET|\
+    CARGO_PROFILE_*|CARGO_TARGET_*_RUSTFLAGS|CARGO_TARGET_*_LINKER)
+      [ -z "${!variable}" ] || fail "unset build override $variable before the release check"
+      ;;
+  esac
+done < <(compgen -e)
+
+fi
 
 # ── 1. Lockfile honesty ──────────────────────────────────────────────────────
 # THIS SECTION USED TO AIM AT FILES CARGO NEVER OPENS. It resolved --locked
@@ -170,10 +187,11 @@ echo "pinned toolchain: $PINNED"
 ACTIVE="$(cd "$NODE_DIR" && rustc --version)"
 echo "active toolchain in crate dir: $ACTIVE"
 case "$ACTIVE" in
-  *"$PINNED"*) : ;;
+  "rustc $PINNED "*) : ;;
   *) fail "active rustc ($ACTIVE) is not the pinned $PINNED. Install it: \
 rustup toolchain install $PINNED" ;;
 esac
+
 
 # ── 2. Deterministic double build ────────────────────────────────────────────
 # Same source path, two fresh target dirs. BLOCH_BUILD_COMMIT is passed

@@ -630,12 +630,34 @@ pub fn save_latest(dir: &Path, cp: &WeakSubjectivityCheckpoint) -> io::Result<()
 pub struct WsConfig {
     pub checkpoint: Option<PathBuf>,
     pub signer_set: Option<PathBuf>,
+    /// Independently obtained SHA3-256 of the complete BPOSWSS1 file bytes.
+    pub signer_set_sha3: Option<[u8; 32]>,
+}
+
+impl WsConfig {
+    pub fn from_args(args: &[String]) -> Result<Self, String> {
+        let pins = args.iter().filter(|arg| arg.as_str() == "--ws-signer-set-sha3").count();
+        if pins > 1 { return Err("--ws-signer-set-sha3 must be supplied only once".into()); }
+        let pin = crate::arg_value(args, "--ws-signer-set-sha3");
+        if pins == 1 && pin.is_none() { return Err("--ws-signer-set-sha3 requires 64 hexadecimal characters".into()); }
+        let signer_set_sha3 = pin.map(|value| {
+            let bytes = crate::codec::unhex(&value).map_err(|error| format!("--ws-signer-set-sha3: {error}"))?;
+            bytes.try_into().map_err(|_| "--ws-signer-set-sha3 requires exactly 32 bytes (64 hex characters)".to_string())
+        }).transpose()?;
+        Ok(Self {
+            checkpoint: crate::arg_value(args, "--ws-checkpoint").map(PathBuf::from),
+            signer_set: crate::arg_value(args, "--ws-signer-set").map(PathBuf::from),
+            signer_set_sha3,
+        })
+    }
 }
 
 /// What the engine carries out of a successful boot: the anchor it must
 /// enforce once its own finality reaches `anchor_epoch`.
 #[derive(Debug)]
 pub struct WsOutcome {
+    /// Full authenticated artifact, retained for validation as synchronization progresses.
+    pub checkpoint: WeakSubjectivityCheckpoint,
     pub anchor_epoch: u64,
     pub anchor_root: [u8; 32],
     /// True when the node had no finality of its own at boot: the anchor is
@@ -712,6 +734,9 @@ pub fn boot(
     local_state_root: impl Fn(&[u8; 32]) -> Option<[u8; 32]>,
 ) -> io::Result<Result<WsOutcome, String>> {
     let mut warnings = Vec::new();
+    if cfg.signer_set_sha3.is_some() && (cfg.checkpoint.is_none() || cfg.signer_set.is_none()) {
+        return Err(boot_refused("--ws-signer-set-sha3 requires both --ws-checkpoint and --ws-signer-set; a pin cannot authenticate an absent arrangement or a cached checkpoint by itself"));
+    }
 
     // 1. ws_latest, with the genesis anchor as the first checkpoint when no
     //    other has ever been verified (§4.1 precedence, source 3).
@@ -740,6 +765,14 @@ pub fn boot(
             ));
         };
         let set_bytes = fs::read(set_path)?;
+        if let Some(expected) = cfg.signer_set_sha3 {
+            let actual = signer_set_fingerprint(&set_bytes);
+            if actual != expected {
+                return Err(bad(format!("signer arrangement fingerprint mismatch: expected {}, read {}; refusing substituted keys/quorum/review clock", hex32(&expected), hex32(&actual))));
+            }
+        } else {
+            warnings.push("WARNING: signer arrangement is not pinned with --ws-signer-set-sha3; obtain its fingerprint through an independent trusted channel before onboarding. The checkpoint digest does not bind arrangement contents.".into());
+        }
         let set = decode_signer_set_file(&set_bytes)
             .map_err(|e| bad(format!("{}: {e}", set_path.display())))?;
         // The arrangement is an unauthenticated download, exactly like the
@@ -977,6 +1010,7 @@ pub fn boot(
 
     Ok(match gate {
         Ok(()) => Ok(WsOutcome {
+            checkpoint: anchor,
             anchor_epoch: anchor.epoch,
             anchor_root: anchor.block_root,
             anchor_is_hard: !has_local_finality,
@@ -1071,7 +1105,7 @@ mod tests {
     }
 
     fn no_flags() -> WsConfig {
-        WsConfig { checkpoint: None, signer_set: None }
+        WsConfig { checkpoint: None, signer_set: None, signer_set_sha3: None }
     }
 
     // -- codecs -------------------------------------------------------------
@@ -1614,6 +1648,53 @@ mod tests {
     // -- boot orchestration -------------------------------------------------
 
     #[test]
+    fn audit_arrangement_pin_configuration_is_explicit_and_fail_closed() {
+        let args = |values: &[&str]| values.iter().map(|value| value.to_string()).collect::<Vec<_>>();
+        assert!(WsConfig::from_args(&args(&["--ws-signer-set-sha3"])).is_err());
+        assert!(WsConfig::from_args(&args(&["--ws-signer-set-sha3", "abcd"])).is_err());
+        let pin = "11".repeat(32);
+        assert!(WsConfig::from_args(&args(&["--ws-signer-set-sha3", &pin, "--ws-signer-set-sha3", &pin])).is_err());
+        let config = WsConfig::from_args(&args(&["--ws-signer-set-sha3", &pin])).unwrap();
+        assert_eq!(config.signer_set_sha3, Some([0x11; 32]));
+        let dir = tmpdir("pin-missing-artifacts");
+        let error = boot(&config, &dir, NET, &GEN, &genesis_anchor(), 0, false,
+            (0, GEN), |_| None, |_| false, |_| None).err().unwrap();
+        assert!(is_non_retryable(&error));
+        assert!(!dir.join(WS_LATEST_FILE).exists(), "misconfigured pin must not silently initialize trust");
+    }
+
+    #[test]
+    fn audit_arrangement_pin_refuses_review_clock_substitution_before_adoption() {
+        let dir = tmpdir("pinned-arrangement");
+        let mut checkpoint = checkpoint(64);
+        checkpoint.signer_set_id = 3;
+        let (set, signatures) = phase_a_set_and_signatures(3, &checkpoint.ws_digest());
+        let envelope = CheckpointEnvelope { checkpoint, signatures };
+        let original = encode_signer_set_file(&set);
+        let mut changed = set.clone();
+        changed.adopted_epoch = 1;
+        // This is precisely the legacy gap: the old checkpoint signature does
+        // not authenticate a changed arrangement review clock.
+        ws::verify_envelope(&envelope, &changed, NET, &GEN, &WsHybridVerifier).unwrap();
+        let arrangement_path = dir.join("arrangement.bin");
+        let checkpoint_path = dir.join("checkpoint.bin");
+        fs::write(&arrangement_path, encode_signer_set_file(&changed)).unwrap();
+        fs::write(&checkpoint_path, encode_envelope_file(&envelope)).unwrap();
+        let config = WsConfig { checkpoint: Some(checkpoint_path), signer_set: Some(arrangement_path.clone()),
+            signer_set_sha3: Some(signer_set_fingerprint(&original)) };
+        let error = boot(&config, &dir, NET, &GEN, &genesis_anchor(), 70, false,
+            (0, GEN), |_| None, |_| false, |_| None).err().unwrap();
+        assert!(is_non_retryable(&error));
+        assert!(error.to_string().contains("fingerprint mismatch"));
+        assert_eq!(load_latest(&dir, NET, &GEN).unwrap().unwrap(), genesis_anchor());
+        fs::write(&arrangement_path, original).unwrap();
+        let outcome = boot(&config, &dir, NET, &GEN, &genesis_anchor(), 70, false,
+            (0, GEN), |_| None, |_| false, |_| None).unwrap().unwrap();
+        assert_eq!(outcome.checkpoint, checkpoint);
+        assert!(!outcome.warnings.iter().any(|warning| warning.contains("not pinned")));
+    }
+
+    #[test]
     fn audit_genesis_boundary_preserves_published_header_root_convention() {
         let anchor = genesis_anchor();
         for header_root in [[0; 32], [0x77; 32]] {
@@ -1644,7 +1725,7 @@ mod tests {
         let arrangement = dir.join("arrangement.bin");
         fs::write(&envelope, encode_envelope_file(&CheckpointEnvelope { checkpoint: cp, signatures })).unwrap();
         fs::write(&arrangement, encode_signer_set_file(&set)).unwrap();
-        let cfg = WsConfig { checkpoint: Some(envelope), signer_set: Some(arrangement) };
+        let cfg = WsConfig { checkpoint: Some(envelope), signer_set: Some(arrangement), signer_set_sha3: None };
         let local = |root: &[u8; 32]| if *root == cp.block_root { Some([0xee; 32]) } else { None };
         let error = boot(&cfg, &dir, NET, &GEN, &genesis_anchor(), 70, true,
             (64, cp.block_root), |_| Some(cp.block_root), |_| true, local).err().unwrap();
@@ -1666,7 +1747,7 @@ mod tests {
     fn audit_malformed_ws_artifacts_are_typed_but_raw_io_errors_are_not() {
         let dir = tmpdir("operator-errors");
         let path = dir.join("checkpoint.bin");
-        let config = WsConfig { checkpoint: Some(path.clone()), signer_set: None };
+        let config = WsConfig { checkpoint: Some(path.clone()), signer_set: None, signer_set_sha3: None };
         let attempt = || boot(&config, &dir, NET, &GEN, &genesis_anchor(), 0, false, (0, GEN), |_| None, |_| false, |_| None);
         let missing = attempt().err().unwrap();
         assert_eq!(missing.kind(), io::ErrorKind::NotFound);
@@ -1850,7 +1931,7 @@ mod tests {
         fs::write(&env_path, encode_envelope_file(&env)).unwrap();
         fs::write(&set_path, &set_bytes).unwrap();
 
-        let cfg = WsConfig { checkpoint: Some(env_path), signer_set: Some(set_path) };
+        let cfg = WsConfig { checkpoint: Some(env_path), signer_set: Some(set_path), signer_set_sha3: None };
         let err = boot(
             &cfg, &dir, NET, &GEN, &genesis_anchor(),
             300, false, (0, GEN), |_| None, |_| false, |_| None,
@@ -1869,6 +1950,7 @@ mod tests {
         let cfg = WsConfig {
             checkpoint: Some(dir.join("env.bin")),
             signer_set: Some(dir.join("set-ok.bin")),
+            signer_set_sha3: None,
         };
         boot(
             &cfg, &dir, NET, &GEN, &genesis_anchor(),
@@ -1894,7 +1976,7 @@ mod tests {
         fs::write(&env_path, encode_envelope_file(&env)).unwrap();
         fs::write(&set_path, encode_signer_set_file(&set)).unwrap();
 
-        let cfg = WsConfig { checkpoint: Some(env_path), signer_set: Some(set_path) };
+        let cfg = WsConfig { checkpoint: Some(env_path), signer_set: Some(set_path), signer_set_sha3: None };
         let refusal = boot(
             &cfg, &dir, NET, &GEN, &genesis_anchor(),
             1, false, (0, GEN), |_| None, |_| false, |_| None,
@@ -1952,7 +2034,7 @@ mod tests {
         let set_path = dir.join("set.bin");
         fs::write(&env_path, encode_envelope_file(&env)).unwrap();
         fs::write(&set_path, encode_signer_set_file(&set)).unwrap();
-        let cfg = WsConfig { checkpoint: Some(env_path), signer_set: Some(set_path) };
+        let cfg = WsConfig { checkpoint: Some(env_path), signer_set: Some(set_path), signer_set_sha3: None };
 
         // The node's own finalized root at epoch 64 differs from cp's.
         let own_root = [0x99; 32];
@@ -2005,7 +2087,7 @@ mod tests {
         let set_path = dir.join("set.bin");
         fs::write(&env_path, encode_envelope_file(&env)).unwrap();
         fs::write(&set_path, encode_signer_set_file(&set)).unwrap();
-        let cfg = WsConfig { checkpoint: Some(env_path), signer_set: Some(set_path) };
+        let cfg = WsConfig { checkpoint: Some(env_path), signer_set: Some(set_path), signer_set_sha3: None };
         let err = boot(
             &cfg, &dir, NET, &GEN, &genesis_anchor(),
             1, false, (0, GEN), |_| None, |_| false, |_| None,

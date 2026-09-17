@@ -214,7 +214,12 @@ impl Wallet {
 
     /// Load an encrypted keyfile from disk and unlock with password.
     pub fn load_encrypted(path: &std::path::Path, password: &str) -> Result<Self, WalletError> {
-        let bytes = std::fs::read(path).map_err(|e| WalletError::Io(e.to_string()))?;
+        Self::load_encrypted_with_file_limit(path, password, crate::util::DEFAULT_WALLET_FILE_LIMIT)
+    }
+
+    /// Explicit bounded recovery override; byte budget does not bound KDF or parsed memory.
+    pub fn load_encrypted_with_file_limit(path: &std::path::Path, password: &str, max_bytes: usize) -> Result<Self, WalletError> {
+        let bytes = crate::util::read_wallet_file(path, max_bytes).map_err(|e| WalletError::Io(e.to_string()))?;
         let ef: encryption::EncryptedKeyfile = serde_json::from_slice(&bytes)
             .map_err(|e| WalletError::Parse(e.to_string()))?;
 
@@ -738,8 +743,13 @@ impl Keypair {
     }
 
     pub fn load_encrypted(path: &Path, password: &str) -> Result<Self, String> {
-        let json = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let ks: EncryptedKeystore = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+        Self::load_encrypted_with_file_limit(path, password, crate::util::DEFAULT_WALLET_FILE_LIMIT)
+    }
+
+    /// Explicit bounded recovery override for authentic large keystores (maximum 512 MiB).
+    pub fn load_encrypted_with_file_limit(path: &Path, password: &str, max_bytes: usize) -> Result<Self, String> {
+        let bytes = crate::util::read_wallet_file(path, max_bytes).map_err(|e| e.to_string())?;
+        let ks: EncryptedKeystore = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
         if ks.version != 2 { return Err("unsupported keystore version".into()); }
 
         let salt      = b64::STANDARD.decode(&ks.crypto.kdf_params.salt).map_err(|e| e.to_string())?;
@@ -772,7 +782,7 @@ impl Keypair {
         // untrusted file with e.g. `memory_cost` near `u32::MAX` (KiB) would
         // otherwise force a multi-terabyte Argon2 allocation (OOM) on unlock,
         // and `output_len != 32` would panic the AES-256 key conversion below.
-        let mut enc_k = derive_key_with_params(password, &salt, &ks.crypto.kdf_params)?;
+        let mut enc_k = Zeroizing::new(derive_key_with_params(password, &salt, &ks.crypto.kdf_params)?);
 
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&enc_k));
         // Zeroizing (A4 lows): this plaintext carries the hex-encoded private
@@ -784,14 +794,14 @@ impl Keypair {
         enc_k.zeroize();
 
         let mut payload: KeystorePayload = serde_json::from_slice(&plain).map_err(|e| e.to_string())?;
-        let private_key = hex::decode(&payload.private_key_hex).map_err(|e| e.to_string())?;
+        let mut private_key = Zeroizing::new(hex::decode(&payload.private_key_hex).map_err(|e| e.to_string())?);
         let public_key  = hex::decode(&payload.public_key_hex).map_err(|e| e.to_string())?;
         payload.zeroize();
 
         let testnet = ks.address.starts_with(TESTNET_PREFIX);
         let derived = crypto::address_from_pubkey(&public_key, testnet);
         if derived != ks.address { return Err("address mismatch — keystore may be tampered".into()); }
-        Ok(Keypair { private_key, public_key, address: ks.address })
+        Ok(Keypair { private_key: std::mem::take(&mut *private_key), public_key, address: ks.address })
     }
 }
 
@@ -1078,6 +1088,12 @@ mod legacy_keystore_tests {
         let tmp = std::env::temp_dir().join("bloch-kp-roundtrip-test.json");
         let _ = std::fs::remove_file(&tmp);
         kp.save_encrypted(&tmp, "correct-horse-battery-9!").unwrap();
+        let file_len = std::fs::metadata(&tmp).unwrap().len() as usize;
+        assert!(Keypair::load_encrypted_with_file_limit(&tmp, "wrong", file_len - 1)
+            .err().unwrap().contains("byte limit"));
+        assert!(matches!(Wallet::load_encrypted_with_file_limit(&tmp, "wrong", file_len - 1), Err(WalletError::Io(message)) if message.contains("byte limit")));
+        let exact = Keypair::load_encrypted_with_file_limit(&tmp, "correct-horse-battery-9!", file_len).unwrap();
+        assert_eq!(exact.private_key, kp.private_key);
         let loaded = Keypair::load_encrypted(&tmp, "correct-horse-battery-9!").unwrap();
         assert_eq!(loaded.address, kp.address);
         assert_eq!(loaded.private_key, kp.private_key);

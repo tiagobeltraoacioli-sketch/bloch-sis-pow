@@ -72,6 +72,12 @@ impl RpcTransport for HttpTransport {
         if !(200..300).contains(&resp.status()) {
             return Err(AnchorError::Transport("RPC endpoint returned a non-success status".into()));
         }
+        // Refuse declared oversize bodies before reading them; the streamed
+        // limit below still covers absent, malformed or understated lengths.
+        if resp.header("Content-Length").and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|length| length > MAX_RESPONSE_BYTES) {
+            return Err(AnchorError::Transport("RPC response exceeds 1 MiB".into()));
+        }
         let mut bytes = Vec::new();
         resp.into_reader().take(MAX_RESPONSE_BYTES + 1).read_to_end(&mut bytes)
             .map_err(|e| AnchorError::Transport(e.to_string()))?;

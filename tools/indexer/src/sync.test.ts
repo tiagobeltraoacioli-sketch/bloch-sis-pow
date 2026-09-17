@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import test from "node:test";
 import assert from "node:assert/strict";
+import { loadConfig } from "./config.js";
 import { Indexer, MAX_BLOCKS_PER_PASS, MAX_FORK_SEARCH } from "./indexer.js";
 import { JsonStore } from "./store.js";
 import { RpcClient, RpcError, HttpTransport } from "./rpc.js";
@@ -154,4 +155,113 @@ test("truncated or coerced transaction fields fail before balance publication", 
     assert.equal(store.getTip(), null);
     assert.equal(store.state.blocksApplied, 0);
   }
+});
+
+
+test("pass deadline aborts a stalled read without mutating or accepting a late result", async () => {
+  const store = storeForTest();
+  let release: (value: unknown) => void = () => {};
+  let observed: AbortSignal | undefined;
+  const rpc = new RpcClient({ call(_method, _params, signal) {
+    observed = signal;
+    return new Promise(resolve => { release = resolve; });
+  } });
+  const indexer = new Indexer(rpc, store, undefined, 15);
+  await assert.rejects(indexer.syncOnce(), /deadline exceeded/);
+  assert.equal(observed?.aborted, true);
+  release({ hash: "late", height: 0, parents: [], transactions: [] });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(store.getTip(), null);
+  assert.equal(store.state.blocksApplied, 0);
+});
+
+test("shutdown cancels both active reads and long poll sleeps", async () => {
+  for (const pendingRead of [true, false]) {
+    const stop = new AbortController();
+    const store = storeForTest();
+    const rpc = new RpcClient({ async call(method) {
+      if (pendingRead) return new Promise(() => {});
+      throw new RpcError("height not found", method);
+    } });
+    const indexer = new Indexer(rpc, store);
+    const running = indexer.run(60_000, undefined, stop.signal);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    stop.abort();
+    await running;
+    assert.equal(store.getTip(), null);
+  }
+});
+
+test("HTTP transport propagates the pass cancellation through body consumption", async (t) => {
+  let signal: AbortSignal | undefined;
+  t.mock.method(globalThis, "fetch", async (_url: unknown, init: RequestInit) => {
+    signal = init.signal ?? undefined;
+    return new Response(new ReadableStream({ start(controller) {
+      signal?.addEventListener("abort", () => controller.error(signal!.reason), { once: true });
+    } }));
+  });
+  const stop = new AbortController();
+  const call = new HttpTransport("http://localhost:1").call("getblockhash", [0], stop.signal);
+  await new Promise(resolve => setImmediate(resolve));
+  stop.abort(new Error("operator stop"));
+  await assert.rejects(call, /operator stop/);
+  assert.equal(signal?.aborted, true);
+});
+
+test("slow responsive reads publish a shorter checked batch instead of starving", async () => {
+  const transport = new StubChainTransport(blocks("slow", 16));
+  const rpc = new RpcClient({ async call(method, params) {
+    await new Promise(resolve => setTimeout(resolve, 15));
+    return transport.call(method, params);
+  } });
+  const store = storeForTest();
+  const result = await new Indexer(rpc, store, undefined, 180).syncOnce();
+  assert.ok(result.applied >= 1 && result.applied < 16);
+  assert.equal(store.getBalance("slow"), BigInt(result.applied));
+});
+
+
+test("RPC transport refuses remote plaintext and embedded credentials", () => {
+  for (const url of ["http://node.example.org", "ftp://localhost", "https://user:secret@example.org", "https://node.example.org/#secret"]) {
+    assert.throws(() => new HttpTransport(url, "token"), /RPC requires HTTPS/);
+  }
+  for (const url of ["http://127.0.0.1:16210", "http://[::1]:16210", "https://node.example.org"]) {
+    assert.doesNotThrow(() => new HttpTransport(url));
+  }
+});
+
+test("invalid operational configuration fails instead of silently changing network or timing", () => {
+  const names = ["INDEXER_NETWORK", "INDEXER_STUB", "INDEXER_POLL_MS", "INDEXER_API_PORT", "INDEXER_SYNC_TIMEOUT_MS"];
+  const before = Object.fromEntries(names.map(name => [name, process.env[name]]));
+  try {
+    for (const name of names) delete process.env[name];
+    assert.equal(loadConfig().syncTimeoutMs, 30_000);
+    for (const [name, value] of [["INDEXER_NETWORK", "mainent"], ["INDEXER_STUB", "maybe"],
+      ["INDEXER_POLL_MS", "-1"], ["INDEXER_POLL_MS", "1.1"], ["INDEXER_POLL_MS", "NaN"],
+      ["INDEXER_API_PORT", "65536"], ["INDEXER_SYNC_TIMEOUT_MS", "300001"], ["INDEXER_SYNC_TIMEOUT_MS", "0"]]) {
+      process.env[name!] = value;
+      assert.throws(loadConfig, new RegExp(name!));
+      delete process.env[name!];
+    }
+  } finally {
+    for (const name of names) {
+      if (before[name] === undefined) delete process.env[name];
+      else process.env[name] = before[name];
+    }
+  }
+});
+
+
+test("elapsed read deadlines are checked even while the event loop delays timers", async () => {
+  const store = storeForTest();
+  let signal: AbortSignal | undefined;
+  const rpc = new RpcClient({ async call(_method, _params, passedSignal) {
+    signal = passedSignal;
+    const until = performance.now() + 30;
+    while (performance.now() < until) { /* Model synchronous response parsing. */ }
+    return { hash: "too-late", height: 0, parents: [], transactions: [] };
+  } });
+  await assert.rejects(new Indexer(rpc, store, undefined, 10).syncOnce(), /deadline exceeded/);
+  assert.equal(signal?.aborted, true);
+  assert.equal(store.getTip(), null);
 });

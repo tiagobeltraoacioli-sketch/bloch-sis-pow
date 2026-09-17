@@ -6,6 +6,53 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
+/// Default encrypted wallet input budget (64 MiB), before JSON parsing or KDF work.
+pub const DEFAULT_WALLET_FILE_LIMIT: usize = 64 * 1024 * 1024;
+/// Maximum explicit recovery budget. This bounds file bytes, not total process memory.
+pub const MAX_WALLET_FILE_LIMIT: usize = 512 * 1024 * 1024;
+
+pub(crate) fn read_wallet_file(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
+    validate_wallet_file_limit(max_bytes)?;
+    read_wallet_bytes(fs::File::open(path)?, max_bytes)
+}
+
+fn validate_wallet_file_limit(max_bytes: usize) -> io::Result<()> {
+    if max_bytes == 0 || max_bytes > MAX_WALLET_FILE_LIMIT {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "wallet file limit must be between 1 byte and 512 MiB"));
+    }
+    Ok(())
+}
+
+fn read_wallet_bytes(reader: impl io::Read, max_bytes: usize) -> io::Result<Vec<u8>> {
+    use io::Read;
+    validate_wallet_file_limit(max_bytes)?;
+    // Read at most one extra byte: metadata alone is not a bound when files grow.
+    let mut bytes = Vec::new();
+    reader.take((max_bytes as u64).saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "wallet file exceeds configured byte limit"));
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod wallet_input_budget_tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn bounded_reader_checks_actual_bytes_and_leaves_remainder_unread() {
+        assert_eq!(read_wallet_bytes(&b"abcd"[..], 4).unwrap(), b"abcd");
+        let mut stream = &b"abcdefgh"[..];
+        assert_eq!(read_wallet_bytes(&mut stream, 4).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let mut rest = String::new();
+        stream.read_to_string(&mut rest).unwrap();
+        assert_eq!(rest, "fgh");
+        assert!(read_wallet_bytes(&b""[..], 0).is_err());
+        assert!(read_wallet_bytes(&b""[..], usize::MAX).is_err());
+    }
+}
+
 /// Atomically write `contents` to `path`.
 ///
 /// Sprint T.5 — Audit L-4 fix.

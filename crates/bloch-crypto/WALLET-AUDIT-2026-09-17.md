@@ -45,6 +45,54 @@ derived-address/network mismatches before the expensive KDF. Imported and
 pre-v3 keys may retain their existing cross-network addresses. Versions 1/2/3 and their
 existing KDF parameters, stored keys and funded addresses remain unchanged; a
 maximum index remains readable, though adding an address requires available
-index space. This is structural validation, not proof that encrypted stored
-keys match each other or that a `derived` flag truthfully describes their origin.
+index space. The subsequent authenticity check below validates claimed-derived
+keys; imported key-pair authenticity remains a separate concern.
 No arbitrary total-wallet size/address-count limit is added by this change.
+
+## Follow-up: derived-key authenticity and explicit raw verification
+
+CR-07: HD restore now regenerates each entry explicitly marked `derived` using
+its existing mnemonic/passphrase/index derivation, and compares both stored
+public and private key bytes. It rejects mismatched claims instead of replacing
+stored keys or accepting an address whose mnemonic backup would recover a
+different key. Entries marked imported (including missing flags in legacy files)
+retain their original keys. This does not authenticate imported key pairs; a
+malformed imported key remains a separate validation concern. Regenerating
+claimed-derived keys adds per-key unlock work and retains the existing Falcon
+cross-platform derivation caveat. Load-time encryption keys, derived seed and
+decoded private buffers now use zeroizing guards on error paths as well as
+success; no guarantee is made about dependency/compiler copies.
+
+CR-10: `crypto::verify_legacy_hybrid_raw` is an explicit raw-format verifier for
+callers with trusted format context. It never sniffs signature magic bytes and
+requires a raw-length hybrid public key. The existing `verify` and all consensus
+callers remain unchanged. Do not retry failed untrusted envelope verification
+through the raw API: format selection belongs to authenticated context. The
+regression uses fresh real signatures from the existing primitive libraries;
+it is not an independently sourced standard known-answer vector and does not
+claim a generated valid magic-collision fixture. Historical automatic signature
+classification remains a consensus compatibility issue, so CR-10 is partial.
+
+## Bounded wallet file reads (CR-07, partial)
+
+HD, current single-key and legacy keystore loaders now read at most 64 MiB plus
+one sentinel byte before parsing or KDF work. They reject oversized input using
+actual bytes read, not a potentially stale metadata length. Existing load method
+signatures remain unchanged. Explicit `load_with_file_limit` (HD) and
+`load_encrypted_with_file_limit` (both single-key APIs) accept a recovery budget
+between 1 byte and 512 MiB for authenticated large backups; they never truncate
+and accept a prefix. Existing encryption formats and key derivations are unchanged.
+
+The limit is an input-byte budget, not a total memory or execution-time guarantee:
+JSON/decoded allocations, per-address derivation and KDF work remain additional.
+Special files can still block on reads. No claim of arbitrary hostile-file safety
+or imported private/public key authenticity follows from this bound.
+
+## Keyfile KDF output cleanup on errors
+
+Both v1 and v2 encrypt/decrypt paths now hold their locally derived AES key in
+`Zeroizing<[u8; 32]>`. Wrong-password, AEAD, and KDF early returns therefore use
+the same owned-buffer cleanup as success. Existing wrong-password and public-key/
+network AAD tampering regressions exercise these error paths. This does not prove
+absence of compiler copies or erasure of AES dependency-internal expanded keys.
+Ciphertexts, KDF parameters, AAD and funded key derivations are unchanged.

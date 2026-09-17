@@ -667,6 +667,14 @@ fn randao_automatic_recommit_rehearsal() {
     second.chain = first.chain.clone();
     second.canonical = first.canonical.clone();
     second.keys = Some(joining);
+    // Match production's identity-bound durable signer initialization.
+    for (engine, directory) in [(&mut first, &_dir.0), (&mut second, &_second_dir.0)] {
+        let keys = engine.keys.as_ref().unwrap();
+        engine.slashprot = SlashingProtection::open_bound(directory, crate::slashprot::Binding {
+            validator_pubkey_sha3: <sha3::Sha3_256 as sha3::Digest>::digest(&keys.pubkey).into(),
+            genesis_digest: <sha3::Sha3_256 as sha3::Digest>::digest(engine.manifest.encode()).into(),
+        }).unwrap();
+    }
     let mut history = Vec::new();
     let mut produced = 0;
     for slot in 1..=160 { produced += usize::from(try_drive_pair(&mut first, &mut second, slot, &mut history)); }
@@ -707,5 +715,33 @@ fn proposal_selection_keeps_inactive_funded_candidates_out_without_mutation() {
     assert!(engine.select_transactions(10).is_empty());
     assert_eq!(engine.mempool.len(), 3);
     assert_eq!(engine.state.state_root(), root);
+    assert!(engine.rejected.is_empty());
+}
+
+#[test]
+fn active_funded_proposal_selection_uses_actual_gate_and_filters_conflicting_intents() {
+    let activation = bloch_pos_committee::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH;
+    assert_eq!(activation, 2_884);
+    let (mut engine, _dir, funding, joining, mut first) = fixture();
+    first.valid_until_epoch = activation.saturating_add(100);
+    authorize(&mut first, &funding, &joining);
+    let mut alternative = first.clone();
+    alternative.valid_until_epoch = alternative.valid_until_epoch.saturating_add(1);
+    authorize(&mut alternative, &funding, &joining);
+    let first = PosTransaction::FundedDeposit(first);
+    let alternative = PosTransaction::FundedDeposit(alternative);
+    let rolled = engine.rolled_to(activation);
+    let total = rolled.active_validators().iter().map(|v| u128::from(v.effective_stake)).sum();
+    let price = engine.state.next_base_fee_at(activation);
+    for candidate in [&first, &alternative] {
+        assert!(rolled.validate_lifecycle_transaction(candidate, total, price, &engine.verifier).is_ok(),
+            "each real signed funded candidate must be independently valid at the actual activation epoch");
+        engine.mempool.insert(candidate.canonical_bytes(), candidate.clone());
+    }
+    let selected = engine.select_transactions(activation);
+    assert_eq!(selected.len(), 1, "shared inputs cannot be spent by both independently valid intents");
+    assert!(selected.contains(&first) || selected.contains(&alternative));
+    assert_eq!(engine.select_transactions(activation), selected, "reusing the cached epoch view must preserve selection");
+    assert_eq!(engine.mempool.len(), 2, "conflicting intent selection is not eviction");
     assert!(engine.rejected.is_empty());
 }

@@ -543,12 +543,17 @@ const REDIAL_INTERVAL: Duration = Duration::from_secs(10);
 #[derive(Clone, Debug, Default)]
 pub struct Origin {
     inner: Option<(MessageId, PeerId)>,
+    reservation: Option<Arc<crate::net::SourceReservation>>,
 }
 
 impl Origin {
+    pub(crate) fn set_reservation(&mut self, guard: Arc<crate::net::SourceReservation>) {
+        self.reservation = Some(guard);
+    }
+
     /// No provenance: devnet transport, or a message this node produced.
     pub fn none() -> Self {
-        Origin { inner: None }
+        Origin { inner: None, reservation: None }
     }
 }
 
@@ -963,6 +968,7 @@ pub fn start(
     cfg: Config,
     events: EngineSender<NetEvent>,
     head_slot: Arc<AtomicU64>,
+    budget: Arc<crate::net::QueueBudget>,
 ) -> io::Result<Handle> {
     std::fs::create_dir_all(&cfg.data_dir)?;
     let keypair = load_or_create_identity(&cfg.data_dir.join("p2p_identity.bin"))?;
@@ -985,7 +991,7 @@ pub fn start(
             match build_swarm(&keypair, &cfg) {
                 Ok(swarm) => {
                     let _ = ready_tx.send(Ok(()));
-                    run_swarm(swarm, cfg, cmd_rx, events, head_slot, peers_live_swarm).await;
+                    run_swarm(swarm, cfg, cmd_rx, events, head_slot, peers_live_swarm, budget).await;
                 }
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -1063,6 +1069,7 @@ fn build_swarm(keypair: &identity::Keypair, cfg: &Config) -> io::Result<Swarm> {
 
 /// State the swarm loop owns.
 struct Loop {
+    budget: Arc<crate::net::QueueBudget>,
     events: EngineSender<NetEvent>,
     data_dir: PathBuf,
     head_slot: Arc<AtomicU64>,
@@ -1128,8 +1135,9 @@ impl Loop {
         self.recent_blocks.insert(id, now).is_none()
     }
 
-    fn emit(&self, ev: NetEvent) -> bool {
-        self.events.send(ev).is_ok()
+    fn emit(&self, mut ev: NetEvent, peer: PeerId) -> Option<bool> {
+        if !self.budget.admit_peer(&mut ev, peer.to_bytes()) { return None; }
+        Some(self.events.send(ev).is_ok())
     }
 
     /// May this node chase another full page FROM `peer`? Advancing the
@@ -1200,8 +1208,10 @@ async fn run_swarm(
     events: EngineSender<NetEvent>,
     head_slot: Arc<AtomicU64>,
     peers_live: Arc<AtomicUsize>,
+    budget: Arc<crate::net::QueueBudget>,
 ) {
     let mut st = Loop {
+        budget,
         events,
         data_dir: cfg.data_dir.clone(),
         head_slot,
@@ -1531,7 +1541,7 @@ fn handle_swarm_event(
                             // Directed sync, not gossip: there is no message
                             // id to report a verdict against, so `Origin::none`
                             // and the engine's report is a no-op.
-                            if !st.emit(NetEvent::Block(env, Origin::none())) {
+                            if st.emit(NetEvent::Block(env, Origin::none()), peer) == Some(false) {
                                 return false;
                             }
                         }
@@ -1614,8 +1624,11 @@ fn on_gossip(
                 let e = st.peer_head.entry(source).or_insert(0);
                 *e = (*e).max(slot);
                 st.note_block(*env.block_id().as_bytes());
-                let origin = Origin { inner: Some((message_id, source)) };
-                return st.emit(NetEvent::Block(env, origin));
+                let origin = Origin { inner: Some((message_id.clone(), source)), reservation: None };
+                return match st.emit(NetEvent::Block(env, origin), source) {
+                    Some(alive) => alive,
+                    None => { report(swarm, Verdict::Ignore); true }
+                };
             }
             Err(e) => {
                 // Undecodable bytes on the block topic cannot come from a
@@ -1630,8 +1643,11 @@ fn on_gossip(
             Ok(att) => {
                 // No verdict yet. The engine decides through `gossip.rs` and
                 // calls `Handle::report`, which is what finally relays it.
-                let origin = Origin { inner: Some((message_id, source)) };
-                return st.emit(NetEvent::Attestation(att, origin));
+                let origin = Origin { inner: Some((message_id.clone(), source)), reservation: None };
+                return match st.emit(NetEvent::Attestation(att, origin), source) {
+                    Some(alive) => alive,
+                    None => { report(swarm, Verdict::Ignore); true }
+                };
             }
             Err(e) => {
                 eprintln!("p2p: undecodable attestation from {source}: {e}");
@@ -1643,8 +1659,11 @@ fn on_gossip(
             Ok(tx) => {
                 // Decode is not authorization. In particular, funded admission
                 // needs the engine's UTXO view before gossipsub may relay it.
-                let origin = Origin { inner: Some((message_id, source)) };
-                return st.emit(NetEvent::Transaction(tx, origin));
+                let origin = Origin { inner: Some((message_id.clone(), source)), reservation: None };
+                return match st.emit(NetEvent::Transaction(tx, origin), source) {
+                    Some(alive) => alive,
+                    None => { report(swarm, Verdict::Ignore); true }
+                };
             }
             Err(e) => {
                 eprintln!("p2p: undecodable transaction from {source}: {e}");
@@ -1993,6 +2012,7 @@ mod tests {
     fn test_loop() -> Loop {
         let (events, _rx) = std::sync::mpsc::channel();
         Loop {
+            budget: crate::net::QueueBudget::new(),
             events,
             data_dir: PathBuf::from("/tmp/bloch-p2p-test"),
             head_slot: Arc::new(AtomicU64::new(0)),
@@ -2010,6 +2030,29 @@ mod tests {
             },
             peers_live: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    #[test]
+    fn source_admission_bounds_the_first_channel_and_preserves_other_peer_capacity() {
+        let mut st = test_loop();
+        let (tx, rx) = std::sync::mpsc::channel();
+        st.events = tx;
+        let flooder = PeerId::random();
+        let honest = PeerId::random();
+        let event = || NetEvent::Transaction(
+            bloch_pos_committee::transition::PosTransaction::Exit { validator: 0 },
+            Origin::none(),
+        );
+        for _ in 0..256 { assert_eq!(st.emit(event(), flooder), Some(true)); }
+        assert_eq!(st.emit(event(), flooder), None);
+        assert_eq!(st.emit(event(), honest), Some(true));
+        drop(rx.recv().unwrap());
+        assert_eq!(st.emit(event(), flooder), Some(true));
+        drop(rx);
+        assert_eq!(st.emit(event(), flooder), Some(false));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        st.events = tx;
+        assert_eq!(st.emit(event(), flooder), Some(true));
     }
 
     /// R1 A3-M3: the sync-chase budget is PER PEER. A peer that never lets
@@ -2413,6 +2456,7 @@ mod tests {
             },
             tx,
             head.clone(),
+            crate::net::QueueBudget::new(),
         )
         .expect("p2p starts");
         Node { handle, rx, head, addr, _dir: dir }

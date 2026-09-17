@@ -183,3 +183,53 @@ pub(super) fn check_transfer(
     }
     Ok(())
 }
+
+/// Transactional capacity plan; callers commit it only after authenticating the
+/// incoming transaction. Stale entries are not placed in a rejection cache.
+pub(super) struct CapacityPlan {
+    pub stale: BTreeSet<Vec<u8>>,
+    pub lower_fee: Option<Vec<u8>>,
+}
+
+impl Engine {
+    pub(super) fn plan_mempool_capacity(&self, incoming: &PosTransaction, encoded: usize, epoch: u64) -> Result<CapacityPlan, Refusal> {
+        let source = tx_source_hash(incoming);
+        let mut count = self.mempool.len();
+        let mut bytes = self.mempool.bytes();
+        let mut source_count = source.map_or(0, |s| self.mempool.source_count(&s));
+        let mut plan = CapacityPlan { stale: BTreeSet::new(), lower_fee: None };
+        let mut funded_context = None;
+        // No full-pool revalidation on ordinary admission. Under any capacity
+        // pressure, stale backing must not retain priority through claimed tips.
+        if count >= MEMPOOL_MAX || bytes.saturating_add(encoded) > MAX_MEMPOOL_BYTES
+            || source_count >= MEMPOOL_MAX_PER_SOURCE {
+            let mut candidates: Vec<_> = self.mempool.iter().map(|(key, candidate)| {
+                (source.is_some() && tx_source_hash(candidate) == source, key, candidate)
+            }).collect();
+            if source_count >= MEMPOOL_MAX_PER_SOURCE {
+                candidates.sort_by_key(|(same_source, _, _)| !same_source);
+            }
+            for (same_source, key, candidate) in candidates {
+                if source_count >= MEMPOOL_MAX_PER_SOURCE && !same_source { continue; }
+                if self.candidate_is_backed(candidate, key.len(), epoch, &mut funded_context) { continue; }
+                plan.stale.insert(key.clone());
+                count = count.saturating_sub(1);
+                bytes = bytes.saturating_sub(key.len());
+                if same_source { source_count = source_count.saturating_sub(1); }
+                if count < MEMPOOL_MAX && bytes.saturating_add(encoded) <= MAX_MEMPOOL_BYTES
+                    && source_count < MEMPOOL_MAX_PER_SOURCE { break; }
+            }
+        }
+        if bytes.saturating_add(encoded) > MAX_MEMPOOL_BYTES { return Err(Refusal::AtCapacity); }
+        if source_count >= MEMPOOL_MAX_PER_SOURCE { return Err(Refusal::TooManyFromSource); }
+        if count >= MEMPOOL_MAX {
+            let lowest = self.mempool.iter().filter(|(key, _)| !plan.stale.contains(*key))
+                .min_by_key(|(_, tx)| tx_tip_rate(tx));
+            match lowest {
+                Some((key, tx)) if tx_tip_rate(incoming) > tx_tip_rate(tx) => plan.lower_fee = Some(key.clone()),
+                _ => return Err(Refusal::AtCapacity),
+            }
+        }
+        Ok(plan)
+    }
+}

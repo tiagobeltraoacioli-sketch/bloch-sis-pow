@@ -46,6 +46,10 @@
 //!
 //! ## What is guarded
 //!
+//! RANDAO recommits: persist a bound epoch/generation/commitment/signing-root
+//! intent before signing; conflicting or regressing intents are refused. This
+//! upgrades local persistence to V3, which older binaries deliberately reject.
+//!
 //! Proposals: the slot must strictly exceed the last proposed slot.
 //!
 //! Attestations: the slot must strictly exceed the last attested slot, the
@@ -89,6 +93,11 @@ const RECORD_LEN_V1: usize = 8 + 4 + 8 * 4 + 32;
 const MAGIC_V2: &[u8; 8] = b"BPOSSLP2";
 const VERSION_V2: u32 = 2;
 const RECORD_LEN_V2: usize = RECORD_LEN_V1 + 32 + 32;
+/// V3 adds a recommit epoch floor and last epoch/generation/commitment/root.
+/// Older binaries reject the new magic instead of discarding this protection.
+const MAGIC_V3: &[u8; 8] = b"BPOSSLP3";
+const VERSION_V3: u32 = 3;
+pub const MAX_RECORD_LEN: usize = RECORD_LEN_V2 + 8 + 8 + 4 + 32 + 32;
 /// `None`, on disk. No real slot or epoch can reach it.
 const NONE: u64 = u64::MAX;
 
@@ -99,6 +108,21 @@ pub struct Watermarks {
     pub attestation_slot: Option<u64>,
     pub source_epoch: Option<u64>,
     pub target_epoch: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RecommitIntent {
+    epoch: u64,
+    generation: u32,
+    commitment: [u8; 32],
+    signing_root: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RecommitProtection {
+    /// Conservative offline recovery floor; intents at or below it are refused.
+    epoch_floor: Option<u64>,
+    intent: Option<RecommitIntent>,
 }
 
 /// Why a signature was refused. Every variant names the offence it prevented,
@@ -115,6 +139,7 @@ pub enum Refusal {
     DoubleVote { target_epoch: u64, watermark: u64 },
     /// Source epoch going backwards — the surrounding half of `surrounds`.
     SurroundVote { source_epoch: u64, watermark: u64 },
+    Recommit { epoch: u64, generation: u32, reason: &'static str },
     /// The watermark could not be made durable. The signature was NOT made.
     Io(io::Error),
 }
@@ -142,6 +167,8 @@ impl fmt::Display for Refusal {
                 "slashing protection: refusing to attest from source epoch {source_epoch}; \
                  source epoch {watermark} is already signed (surround vote)"
             ),
+            Refusal::Recommit { epoch, generation, reason } => write!(f,
+                "slashing protection: refusing RANDAO recommit at epoch {epoch}, generation {generation}: {reason}"),
             Refusal::Io(e) => write!(
                 f,
                 "slashing protection: refusing to sign because the watermark could not be \
@@ -182,6 +209,8 @@ pub struct SlashingProtection {
     /// Identity the file is (or will be, on the next commit) bound to.
     /// `None` only for a caller that supplied none over a legacy file.
     binding: Option<Binding>,
+    /// Some means V3 must be retained, including after importing older backups.
+    recommit: Option<RecommitProtection>,
 }
 
 /// Export a bound record while the validator is stopped. No secret key is read.
@@ -190,8 +219,8 @@ pub fn export_bound(dir: &Path, binding: Binding) -> io::Result<Vec<u8>> {
     let _lock = crate::store::DirLock::acquire(dir)?;
     use std::io::Read;
     let mut record = Vec::new();
-    fs::File::open(dir.join(FILE_NAME))?.take((RECORD_LEN_V2 + 1) as u64).read_to_end(&mut record)?;
-    let (_, actual) = decode(&record).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid slashing protection record"))?;
+    fs::File::open(dir.join(FILE_NAME))?.take(MAX_RECORD_LEN.saturating_add(1) as u64).read_to_end(&mut record)?;
+    let (_, actual, _) = decode_record(&record).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid slashing protection record"))?;
     if actual != Some(binding) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "export requires a bound record matching the validator and network"));
     }
@@ -201,11 +230,11 @@ pub fn export_bound(dir: &Path, binding: Binding) -> io::Result<Vec<u8>> {
 /// Merge a bound backup without ever decreasing a local watermark. This
 /// protects local recovery; it cannot stop an old host from signing.
 pub fn import_bound(dir: &Path, binding: Binding, bytes: &[u8]) -> io::Result<Watermarks> {
-    let (incoming, actual) = decode(bytes).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid slashing protection backup"))?;
+    let (incoming, actual, recommit) = decode_record(bytes).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid slashing protection backup"))?;
     if actual != Some(binding) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "backup validator/network binding mismatch or absent"));
     }
-    merge_bound(dir, binding, incoming)
+    merge_bound(dir, binding, incoming, recommit)
 }
 
 /// Refuse proposal/attestation slots below `min_slot` after recovery. Epoch
@@ -220,14 +249,14 @@ pub fn initialize_floor(dir: &Path, binding: Binding, min_slot: u64) -> io::Resu
     merge_bound(dir, binding, Watermarks {
         proposal_slot: Some(slot), attestation_slot: Some(slot),
         source_epoch: Some(epoch), target_epoch: Some(epoch),
-    })
+    }, Some(RecommitProtection { epoch_floor: Some(epoch), intent: None }))
 }
 
-fn merge_bound(dir: &Path, binding: Binding, incoming: Watermarks) -> io::Result<Watermarks> {
+fn merge_bound(dir: &Path, binding: Binding, incoming: Watermarks, incoming_recommit: Option<RecommitProtection>) -> io::Result<Watermarks> {
     fs::create_dir_all(dir)?;
     crate::keys::ensure_mutation_ownership(dir)?;
     let _lock = crate::store::DirLock::acquire(dir)?;
-    let mut protection = SlashingProtection::open_bound(dir, binding)?;
+    let protection = SlashingProtection::open_bound(dir, binding)?;
     let old = protection.watermarks();
     let merged = Watermarks {
         proposal_slot: old.proposal_slot.max(incoming.proposal_slot),
@@ -235,7 +264,8 @@ fn merge_bound(dir: &Path, binding: Binding, incoming: Watermarks) -> io::Result
         source_epoch: old.source_epoch.max(incoming.source_epoch),
         target_epoch: old.target_epoch.max(incoming.target_epoch),
     };
-    protection.write_durably(merged)?;
+    let recommit = merge_recommit(protection.recommit, incoming_recommit)?;
+    protection.write_record(merged, recommit)?;
     Ok(merged)
 }
 
@@ -269,8 +299,15 @@ impl SlashingProtection {
     fn open_with(dir: &Path, want: Option<Binding>) -> io::Result<SlashingProtection> {
         fs::create_dir_all(dir)?;
         let path = dir.join(FILE_NAME);
-        let (wm, on_disk) = match fs::read(&path) {
-            Ok(bytes) => decode(&bytes).ok_or_else(|| {
+        // A malformed local record must not allocate according to its file size.
+        let read_record = || -> io::Result<Vec<u8>> {
+            use std::io::Read;
+            let mut bytes = Vec::with_capacity(MAX_RECORD_LEN.saturating_add(1));
+            fs::File::open(&path)?.take(MAX_RECORD_LEN.saturating_add(1) as u64).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        };
+        let (wm, on_disk, recommit) = match read_record() {
+            Ok(bytes) => decode_record(&bytes).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -281,7 +318,7 @@ impl SlashingProtection {
                     ),
                 )
             })?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => (Watermarks::default(), None),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (Watermarks::default(), None, None),
             Err(e) => return Err(e),
         };
         let binding = match (on_disk, want) {
@@ -326,7 +363,7 @@ impl SlashingProtection {
             }
             (None, None) => None,
         };
-        Ok(SlashingProtection { path, wm, binding })
+        Ok(SlashingProtection { path, wm, binding, recommit })
     }
 
     /// The identity the file is bound to (or will be bound to on the next
@@ -394,6 +431,31 @@ impl SlashingProtection {
         Ok(sign())
     }
 
+    /// Persist a RANDAO signing intent before releasing a signature. Repeating
+    /// the exact intent is safe; changing its root within an epoch, changing a
+    /// generation's commitment, or moving epoch/generation backwards is not.
+    pub fn guard_recommit<T>(
+        &mut self, epoch: u64, generation: u32, commitment: [u8; 32], signing_root: [u8; 32],
+        sign: impl FnOnce() -> T,
+    ) -> Result<T, Refusal> {
+        let refusal = |reason| Refusal::Recommit { epoch, generation, reason };
+        if self.binding.is_none() { return Err(refusal("an explicit validator/network binding is required")); }
+        if epoch == u64::MAX || generation == 0 { return Err(refusal("invalid epoch or generation")); }
+        let mut next = self.recommit.unwrap_or_default();
+        if next.epoch_floor.is_some_and(|floor| epoch <= floor) { return Err(refusal("at or below the recovery epoch floor")); }
+        if let Some(previous) = next.intent {
+            if epoch < previous.epoch { return Err(refusal("epoch is below the durable intent")); }
+            if generation < previous.generation { return Err(refusal("generation is below the durable intent")); }
+            if epoch == previous.epoch && signing_root != previous.signing_root { return Err(refusal("different signing root in an already signed epoch")); }
+            if generation == previous.generation && commitment != previous.commitment { return Err(refusal("different commitment for an already used generation")); }
+            if epoch == previous.epoch && generation != previous.generation { return Err(refusal("different generation in an already signed epoch")); }
+        }
+        next.intent = Some(RecommitIntent { epoch, generation, commitment, signing_root });
+        self.write_record(self.wm, Some(next)).map_err(Refusal::Io)?;
+        self.recommit = Some(next);
+        Ok(sign())
+    }
+
     /// Write `next` durably, then adopt it in memory.
     ///
     /// Temp file + fsync + rename + fsync of the directory: a crash leaves
@@ -408,7 +470,17 @@ impl SlashingProtection {
     }
 
     fn write_durably(&self, next: Watermarks) -> io::Result<()> {
-        crate::store::atomic_private_write(&self.path, &encode(&next, self.binding.as_ref()))
+        self.write_record(next, self.recommit)
+    }
+
+    fn write_record(&self, next: Watermarks, recommit: Option<RecommitProtection>) -> io::Result<()> {
+        let bytes = if let Some(protection) = recommit {
+            let binding = self.binding.as_ref().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "V3 recommit protection requires identity binding"))?;
+            encode_v3(&next, binding, &protection)
+        } else {
+            encode(&next, self.binding.as_ref())
+        };
+        crate::store::atomic_private_write(&self.path, &bytes)
     }
 }
 
@@ -435,16 +507,24 @@ fn encode(wm: &Watermarks, binding: Option<&Binding>) -> Vec<u8> {
     out
 }
 
-/// Both record versions. Length, magic and version must agree with each
+/// All record versions. Length, magic and version must agree with each
 /// other AND with the digest, so a V1 body wearing a V2 magic (or the reverse)
 /// is corrupt, not a downgrade.
+#[cfg(test)]
 fn decode(bytes: &[u8]) -> Option<(Watermarks, Option<Binding>)> {
+    decode_record(bytes).map(|(marks, binding, _)| (marks, binding))
+}
+
+fn decode_record(bytes: &[u8]) -> Option<(Watermarks, Option<Binding>, Option<RecommitProtection>)> {
     let (body_len, bound) = match bytes.len() {
         RECORD_LEN_V1 if &bytes[..8] == MAGIC_V1 && bytes[8..12] == VERSION_V1.to_le_bytes() => {
             (RECORD_LEN_V1 - 32, false)
         }
         RECORD_LEN_V2 if &bytes[..8] == MAGIC_V2 && bytes[8..12] == VERSION_V2.to_le_bytes() => {
             (RECORD_LEN_V2 - 32, true)
+        }
+        MAX_RECORD_LEN if &bytes[..8] == MAGIC_V3 && bytes[8..12] == VERSION_V3.to_le_bytes() => {
+            (MAX_RECORD_LEN - 32, true)
         }
         _ => return None,
     };
@@ -453,7 +533,7 @@ fn decode(bytes: &[u8]) -> Option<(Watermarks, Option<Binding>)> {
     }
     // Field `i` is the i-th 8-byte word after the 12-byte preamble — the
     // same bytes `12 + i * 8 .. 12 + i * 8 + 8` named, walked without the
-    // arithmetic. `bytes.len()` is one of the two RECORD_LENs matched above,
+    // arithmetic. `bytes.len()` is one of the RECORD_LENs matched above,
     // so every field the record defines is present.
     let field = |i: usize| {
         let word = bytes.get(12..)?.chunks_exact(8).nth(i)?;
@@ -475,7 +555,54 @@ fn decode(bytes: &[u8]) -> Option<(Watermarks, Option<Binding>)> {
     } else {
         None
     };
-    Some((wm, binding))
+    let recommit = if bytes.len() == MAX_RECORD_LEN {
+        let floor = u64::from_le_bytes(bytes[108..116].try_into().ok()?);
+        let epoch = u64::from_le_bytes(bytes[116..124].try_into().ok()?);
+        let generation = u32::from_le_bytes(bytes[124..128].try_into().ok()?);
+        let commitment = bytes[128..160].try_into().ok()?;
+        let signing_root = bytes[160..192].try_into().ok()?;
+        let intent = if epoch == NONE {
+            if generation != 0 || commitment != [0; 32] || signing_root != [0; 32] { return None; }
+            None
+        } else {
+            if generation == 0 { return None; }
+            Some(RecommitIntent { epoch, generation, commitment, signing_root })
+        };
+        Some(RecommitProtection { epoch_floor: (floor != NONE).then_some(floor), intent })
+    } else { None };
+    Some((wm, binding, recommit))
+}
+
+fn encode_v3(wm: &Watermarks, binding: &Binding, protection: &RecommitProtection) -> Vec<u8> {
+    let mut bytes = encode(wm, Some(binding));
+    bytes.truncate(108); // V2 body, before its checksum.
+    bytes[..8].copy_from_slice(MAGIC_V3);
+    bytes[8..12].copy_from_slice(&VERSION_V3.to_le_bytes());
+    bytes.extend_from_slice(&protection.epoch_floor.unwrap_or(NONE).to_le_bytes());
+    let intent = protection.intent.unwrap_or(RecommitIntent { epoch: NONE, generation: 0, commitment: [0; 32], signing_root: [0; 32] });
+    bytes.extend_from_slice(&intent.epoch.to_le_bytes());
+    bytes.extend_from_slice(&intent.generation.to_le_bytes());
+    bytes.extend_from_slice(&intent.commitment);
+    bytes.extend_from_slice(&intent.signing_root);
+    bytes.extend_from_slice(&digest(&bytes));
+    bytes
+}
+
+fn merge_recommit(left: Option<RecommitProtection>, right: Option<RecommitProtection>) -> io::Result<Option<RecommitProtection>> {
+    let (Some(left), Some(right)) = (left, right) else { return Ok(left.or(right)); };
+    let intent = match (left.intent, right.intent) {
+        (Some(a), Some(b)) => {
+            if (a.epoch == b.epoch && a != b)
+                || (a.generation == b.generation && a.commitment != b.commitment)
+                || (a.epoch < b.epoch && a.generation > b.generation)
+                || (b.epoch < a.epoch && b.generation > a.generation) {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "conflicting RANDAO intent history; refusing to merge"));
+            }
+            Some(if a.epoch >= b.epoch { a } else { b })
+        }
+        (a, b) => a.or(b),
+    };
+    Ok(Some(RecommitProtection { epoch_floor: left.epoch_floor.max(right.epoch_floor), intent }))
 }
 
 /// SHAKE-256/32 over the record body — a torn write is detected, not adopted.
@@ -683,6 +810,71 @@ mod tests {
     const KEY_B: Binding = Binding { validator_pubkey_sha3: [0xB2; 32], genesis_digest: [0x44; 32] };
     const KEY_A_OTHER_NET: Binding =
         Binding { validator_pubkey_sha3: [0xA1; 32], genesis_digest: [0x55; 32] };
+
+    #[test]
+    fn recommit_intent_is_durable_before_signing_and_survives_restart() {
+        let d = dir("recommit-order");
+        let mut sp = SlashingProtection::open_bound(&d.0, KEY_A).unwrap();
+        sp.guard_proposal(1, || ()).unwrap();
+        assert_eq!(&fs::read(d.0.join(FILE_NAME)).unwrap()[..8], MAGIC_V2);
+        sp.guard_recommit(2884, 1, [7; 32], [8; 32], || {
+            let bytes = fs::read(d.0.join(FILE_NAME)).unwrap();
+            assert_eq!(bytes.len(), MAX_RECORD_LEN);
+            assert_eq!(&bytes[..8], MAGIC_V3);
+            let intent = decode_record(&bytes).unwrap().2.unwrap().intent.unwrap();
+            assert_eq!(intent.epoch, 2884);
+            assert_eq!(intent.signing_root, [8; 32]);
+        }).unwrap();
+        let mut sp = SlashingProtection::open_bound(&d.0, KEY_A).unwrap();
+        sp.guard_proposal(2, || ()).unwrap();
+        assert!(sp.guard_recommit(2884, 1, [9; 32], [10; 32], || panic!("conflicting signature")).is_err());
+        assert!(sp.guard_recommit(2883, 1, [7; 32], [8; 32], || panic!("old epoch")).is_err());
+        sp.guard_recommit(2884, 1, [7; 32], [8; 32], || ()).unwrap();
+        sp.guard_recommit(2885, 1, [7; 32], [11; 32], || ()).unwrap();
+        sp.guard_recommit(2886, 2, [12; 32], [13; 32], || ()).unwrap();
+        assert!(sp.guard_recommit(2887, 1, [7; 32], [14; 32], || panic!("old generation")).is_err());
+    }
+
+    #[test]
+    fn recommit_write_failure_and_unbound_identity_never_sign() {
+        let d = dir("recommit-failure");
+        let mut unbound = SlashingProtection::open(&d.0).unwrap();
+        assert!(unbound.guard_recommit(10, 1, [1; 32], [2; 32], || panic!("unbound")).is_err());
+        let mut sp = SlashingProtection::open_bound(&d.0, KEY_A).unwrap();
+        fs::create_dir(d.0.join(FILE_NAME)).unwrap();
+        assert!(sp.guard_recommit(10, 1, [1; 32], [2; 32], || panic!("failed persistence")).is_err());
+        assert_eq!(sp.recommit, None);
+    }
+
+    #[test]
+    fn recommit_backup_merge_and_recovery_floor_cannot_drop_history() {
+        let source = dir("recommit-source");
+        let target = dir("recommit-target");
+        let mut sp = SlashingProtection::open_bound(&source.0, KEY_A).unwrap();
+        sp.guard_recommit(10, 2, [1; 32], [2; 32], || ()).unwrap();
+        let backup = export_bound(&source.0, KEY_A).unwrap();
+        import_bound(&target.0, KEY_A, &backup).unwrap();
+        let legacy = encode(&Watermarks::default(), Some(&KEY_A));
+        import_bound(&target.0, KEY_A, &legacy).unwrap();
+        let mut reopened = SlashingProtection::open_bound(&target.0, KEY_A).unwrap();
+        assert!(reopened.guard_recommit(11, 1, [3; 32], [4; 32], || panic!("generation rollback")).is_err());
+        let before = fs::read(target.0.join(FILE_NAME)).unwrap();
+        let conflicting = encode_v3(&Watermarks::default(), &KEY_A, &RecommitProtection {
+            epoch_floor: None,
+            intent: Some(RecommitIntent { epoch: 10, generation: 2, commitment: [9; 32], signing_root: [9; 32] }),
+        });
+        assert!(import_bound(&target.0, KEY_A, &conflicting).is_err());
+        assert_eq!(fs::read(target.0.join(FILE_NAME)).unwrap(), before);
+        initialize_floor(&target.0, KEY_A, 20 * bloch_pos_committee::params::SLOTS_PER_EPOCH).unwrap();
+        let mut reopened = SlashingProtection::open_bound(&target.0, KEY_A).unwrap();
+        assert!(reopened.guard_recommit(19, 3, [3; 32], [4; 32], || panic!("recovery floor")).is_err());
+        assert_eq!(reopened.recommit.unwrap().intent.unwrap().generation, 2);
+        let mut corrupted = backup.clone();
+        corrupted[128] ^= 1;
+        assert!(decode_record(&corrupted).is_none());
+        let mut trailing = backup; trailing.push(0);
+        assert!(decode_record(&trailing).is_none());
+    }
 
     /// THE regression test for M-8. A watermark file written for validator A
     /// is refused by validator B and by A on another network, and the refusal

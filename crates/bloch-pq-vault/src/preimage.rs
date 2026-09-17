@@ -11,10 +11,10 @@
 //!   H(r) = SHA256(r)                                                                    (single SHA-256, == Bitcoin OP_SHA256)
 //! ```
 //!
-//! Only the holder of `pq_sk` (the ML-DSA-65 ‖ Falcon-1024 secret from `bloch-crypto`)
-//! can produce `r`. Its commitment `H(r)` is what the on-chain script and the Bloch
-//! anchor share. *Ability to reveal `r` ⇒ possession of `pq_sk` at setup time* — that is
-//! the "preimage bound to the PQ key" (spec §2.3).
+//! A client holding `pq_sk` can deterministically derive `r`. Its commitment
+//! `H(r)` is shared by the script and anchor. Possession of `r` is NOT proof of
+//! possessing the PQ key: it can be copied, delegated or revealed on-chain.
+//! Bitcoin checks a hash preimage and classical signature, not PQ-key ownership.
 //!
 //! ## Honest limit (repeated from the spec §2.2)
 //! Once `r` is revealed on-chain (in the unvault or clawback witness), it is public;
@@ -34,8 +34,8 @@ pub const RECOVERY_SECRET_LEN: usize = 32;
 
 /// Derive the recovery secret `r = HKDF-SHA256(pq_sk, "pq-shield/v1" ‖ vault_id)`.
 ///
-/// Deterministic: the same `pq_sk` and `vault_id` always yield the same `r`, and only
-/// the holder of `pq_sk` can compute it. `vault_id` is any per-vault domain separator
+/// Deterministic: the same `pq_sk` and `vault_id` always yield the same `r`.
+/// Anyone given that preimage can reuse it; this function tracks no lifecycle. `vault_id` is any per-vault domain separator
 /// (e.g. the deposit outpoint, a UUID, or a monotonically increasing index) so one PQ
 /// key can guard many independent vaults with independent preimages.
 pub fn derive_recovery_secret(pq_sk: &[u8], vault_id: &[u8]) -> [u8; RECOVERY_SECRET_LEN] {
@@ -47,6 +47,26 @@ pub fn derive_recovery_secret(pq_sk: &[u8], vault_id: &[u8]) -> [u8; RECOVERY_SE
     // HKDF-Expand of 32 bytes never exceeds the 255*HashLen ceiling, so this cannot fail.
     hk.expand(&info, &mut r).expect("HKDF expand of 32 bytes is always within bounds");
     r
+}
+
+/// Restore the EXISTING V1 preimage and check it against the funded vault's
+/// independently retained recovery hash before returning it. This preserves
+/// the original HKDF bytes exactly; the `_v1` suffix selects that existing
+/// derivation explicitly. A wrong key, vault ID or expected hash returns an
+/// error rather than a different apparently usable recovery secret.
+///
+/// Store the original vault ID, V1 derivation label and recovery hash in the
+/// backup. This check establishes a matching hash preimage, not freshness,
+/// single-use, key erasure, PQ-key ownership or authenticity of backup metadata.
+/// Legacy weak/empty input material is not silently re-derived under a new rule.
+pub fn restore_recovery_secret_v1(
+    pq_sk: &[u8], vault_id: &[u8], expected_recovery_hash: &[u8; 32],
+) -> Result<zeroize::Zeroizing<[u8; RECOVERY_SECRET_LEN]>, &'static str> {
+    let secret = zeroize::Zeroizing::new(derive_recovery_secret(pq_sk, vault_id));
+    if &recovery_hash(secret.as_ref()) != expected_recovery_hash {
+        return Err("recovery hash mismatch: check the original key, vault ID and derivation version");
+    }
+    Ok(secret)
 }
 
 /// `H(r) = SHA256(r)` — a **single** SHA-256, matching Bitcoin's `OP_SHA256` (NOT the
@@ -68,6 +88,20 @@ pub fn derive_recovery(pq_sk: &[u8], vault_id: &[u8]) -> ([u8; RECOVERY_SECRET_L
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_restore_preserves_v1_and_refuses_context_mismatch() {
+        let key = b"synthetic recovery material for regression only";
+        let id = b"original-vault-id";
+        let (old_secret, expected) = derive_recovery(key, id);
+        assert_eq!(*restore_recovery_secret_v1(key, id, &expected).unwrap(), old_secret);
+        assert!(restore_recovery_secret_v1(b"wrong-key", id, &expected).is_err());
+        assert!(restore_recovery_secret_v1(key, b"reused-or-wrong-id", &expected).is_err());
+        assert!(restore_recovery_secret_v1(key, id, &[0;32]).is_err());
+        // Restoration never substitutes a new derivation for historical inputs.
+        let (old_secret, expected) = derive_recovery(&[], &[]);
+        assert_eq!(*restore_recovery_secret_v1(&[], &[], &expected).unwrap(), old_secret);
+    }
 
     #[test]
     fn derivation_is_deterministic_and_key_bound() {

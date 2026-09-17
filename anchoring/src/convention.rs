@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! The **anchoring convention** — how a 32-byte commitment is embedded in a
-//! Bloch transaction using ONLY today's primitives.
+//! historical Genesis-3-shaped reference transaction.
 //!
 //! ## Why a convention at all?
 //!
-//! Bloch today has **no data-carrier / `OP_RETURN` output and no script system**
+//! The historical model here has **no data-carrier / `OP_RETURN` output or script system**
 //! (roadmap §1.6). The single output form is a **fixed 20-byte P2PKH**
 //! `script_pubkey = SHA3-256(pubkey)[..20]` (roadmap §1.3). There is no opcode
 //! to say "these bytes are data, not a spend."
 //!
-//! So this reference embeds the commitment the only way today's model allows:
+//! So this reference embeds the commitment a way this historical model allows:
 //! it writes the commitment bytes **into the 20-byte `script_pubkey` fields of a
-//! small number of provably-unspendable P2PKH outputs** (a "burn" anchor). A
+//! small number of P2PKH-shaped outputs with no known spending keys** (a "burn" anchor). A
 //! reader recovers the commitment by reading those outputs straight back off the
 //! chain — no script execution required.
 //!
@@ -29,8 +29,8 @@
 //! `commitment = carrier[0][4..20] ‖ carrier[1][0..16]`.
 //!
 //! Each carrier output is funded with a tiny `dust` value that is **economically
-//! burned** — no keypair is known for these hashes, so the coins are
-//! unspendable. That is the honest cost of the current model.
+//! treated as burned** — the builder knows no keys for these hashes. This is
+//! not a proof of unspendability, and the convention authenticates no signer.
 //!
 //! ## What a data-carrier GIP would fix
 //!

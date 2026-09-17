@@ -1,8 +1,9 @@
 # bloch-anchoring
 
 **A reference L2 / anchoring & commitment framework for Bloch.**
-Submit a compact commitment, wait for PoW confirmations, retrieve and prove it
-by height or txid. Fork it to build an L2, a finality gadget (FFG), a notary, or
+A historical Genesis-3-shaped scaffold: submit a commitment in the offline
+model, query RPC depth and retrieve carrier data by height or txid. This is not
+a Genesis-4 consensus codec, authenticated inclusion proof or finality verifier. Fork it to build an L2, a finality gadget (FFG), a notary, or
 an RWA anchoring system.
 
 > Roadmap reference: **§2.2 (anchored systems)**, **§1.2/1.3 (JSON-RPC, UTXO,
@@ -18,11 +19,9 @@ an RWA anchoring system.
 - **Bloch is ownerless, neutral, and agnostic.** Anyone can build L2s, finality
   gadgets, and RWA systems on it. **No category is reserved to anyone**, and
   **Postern Labs holds no protocol privilege** — it is one builder among many.
-- **The base is experimental.** Mainnet-beta currently runs a **relaxed k=4 PoW
-  regime → work is trivially forgeable**, and the **low-hashrate network is
-  51%-attackable**. Confirmations are a *depth signal*, not a security
-  guarantee, until the protocol track closes k=8 + audit + a proven multi-node
-  network.
+- **The model is historical.** This scaffold models Genesis-3 PoW interfaces.
+  Its depth labels do not implement Genesis-4 validator finality. RPC counts
+  remain unverified assertions, even when they satisfy a caller's policy.
 - **BLCH is neutral gas — not a security, with no value claim from anyone.** It
   pays fees; that is its only role here.
 - **RWA builders own their own legal and regulatory responsibility** (securities,
@@ -115,14 +114,14 @@ check it against the on-chain anchor (the example does exactly this).
 
 ## How the commitment is embedded today (and the honest limitation)
 
-Bloch today has **no data-carrier / `OP_RETURN` output and no script system**
+The historical reference model has **no data-carrier / `OP_RETURN` output or script system**
 (roadmap §1.6). The only output form is a **fixed 20-byte P2PKH**
 `script_pubkey = SHA3-256(pubkey)[..20]` (§1.3). There is no opcode to mark
 bytes as data.
 
 So this reference uses a **convention over existing primitives** (see
 `src/convention.rs`, "Bloch Anchor v1"): it writes the 32-byte commitment into
-the 20-byte `script_pubkey` fields of **two provably-unspendable P2PKH "burn"
+the 20-byte `script_pubkey` fields of **two P2PKH-shaped "burn"
 outputs**:
 
 ```
@@ -235,3 +234,27 @@ transactions containing multiple valid carrier pairs instead of selecting the
 first. These checks do not provide signer binding or turn this scaffold's
 transaction codec into a supported current-node transaction format. The
 framework remains pre-production and requires separate integration work.
+
+## Strict reference parsing and caller policy (BV-21 follow-up)
+
+The mock transaction decoder now rejects trailing bytes, nonminimal/overflowing
+LEB128 encodings, impossible input/output counts and platform-truncated lengths.
+Valid reference serialization is unchanged. This does not make its LEB128 codec
+compatible with consensus transaction bytes.
+
+`BlochRpc::get_transaction_outputs_only` requires an explicit decoded output
+array and refuses raw-hex-only responses. The existing `get_transaction` retains
+its historical mock-codec fallback for reference compatibility; do not use that
+fallback as a production transaction decoder.
+
+`AnchorClient::reference_matching_policy(txid, expected, minimum_height,
+minimum_confirmations)` uses the outputs-only reader, checks the expected
+commitment, requires a mined height at or above the caller's cutoff, and requires
+a positive confirmation threshold. It queries again on each invocation. This
+limits accidental reuse of the wrong or older reference; it does not establish
+wall-clock freshness, signer identity, honest RPC responses, selected-chain
+membership or cryptographic inclusion. A subsequent reorg can invalidate the
+returned observation. Existing `prove_by_*` methods remain inclusion references,
+not proofs. The carrier convention does not prove that its outputs are unspendable.
+BV-21 remains partial pending authenticated signer/chain integration and a real
+consensus transaction codec.

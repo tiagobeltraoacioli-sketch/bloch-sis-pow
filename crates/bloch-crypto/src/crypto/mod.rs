@@ -260,6 +260,21 @@ pub fn verify(public_key_bytes: &[u8], message: &[u8], signature_bytes: &[u8]) -
     }
 }
 
+/// Explicit verification of legacy raw ML-DSA-65 || Falcon-1024 objects.
+///
+/// Use only when trusted format metadata says BOTH the key and signature are
+/// raw legacy hybrid bytes. No magic-byte classification is performed, so a
+/// raw signature beginning with `B1 0C` is not mistaken for an envelope.
+/// Enveloped keys are rejected by their different length; do not strip an
+/// untrusted envelope and retry here after another verification policy fails.
+/// This opt-in API does not change [`verify`] or any historical consensus
+/// caller. The legacy heuristic's ambiguous signatures remain a separate
+/// consensus compatibility/activation issue.
+pub fn verify_legacy_hybrid_raw(public_key_bytes: &[u8], message: &[u8], signature_bytes: &[u8]) -> bool {
+    public_key_bytes.len() == legacy_hybrid_pubkey_len()
+        && verify_hybrid_mldsa_falcon(public_key_bytes, message, signature_bytes)
+}
+
 /// Suite 0x0001 verifier — the pre-envelope `verify` body verbatim, now
 /// operating on the post-header BODY slices. The `<=` length guards, the
 /// `from_bytes` parse-fail⇒false, and the ML-DSA-AND-Falcon combiner are all
@@ -794,7 +809,15 @@ mod kat {
         sig_raw.extend_from_slice(falcon1024::detached_sign(msg, &fsk).as_bytes());
 
         assert_eq!(pk_raw.len(), legacy_hybrid_pubkey_len());
-        assert!(verify(&pk_raw, msg, &sig_raw), "genuine raw legacy hybrid must verify");
+        assert!(verify_legacy_hybrid_raw(&pk_raw, msg, &sig_raw));
+        assert!(!verify_legacy_hybrid_raw(&pk_raw, b"other", &sig_raw));
+        assert!(!verify_legacy_hybrid_raw(&wrap_envelope(SUITE_MLDSA65_FALCON1024, &pk_raw), msg, &sig_raw));
+        assert!(!verify_legacy_hybrid_raw(&pk_raw, msg, &wrap_envelope(SUITE_MLDSA65_FALCON1024, &sig_raw)));
+        // Historical auto-detection remains unchanged. Its rare raw-signature
+        // collision is deliberately not promoted into an unversioned fallback.
+        if !sig_raw.starts_with(&[0xb1, 0x0c]) {
+            assert!(verify(&pk_raw, msg, &sig_raw), "unambiguous raw legacy hybrid must verify");
+        }
         assert!(!verify(&pk_raw, b"other", &sig_raw));
     }
 

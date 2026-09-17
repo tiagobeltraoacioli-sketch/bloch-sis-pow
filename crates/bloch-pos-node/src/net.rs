@@ -108,6 +108,8 @@ pub const FRAME_GET_BLOCKS: u8 = 0x03;
 pub const FRAME_TX: u8 = 0x04;
 
 pub use crate::p2p::{Origin, Verdict};
+mod source_budget;
+pub(crate) use source_budget::Reservation as SourceReservation;
 
 /// What the engine receives from a transport.
 pub enum NetEvent {
@@ -323,8 +325,8 @@ pub fn queued_bytes(ev: &NetEvent) -> usize {
 /// consist of, and a node that sheds blocks while queuing transactions has its
 /// priorities inverted); attestations up to three quarters; transactions up to
 /// half. So under memory pressure transactions are shed first, attestations
-/// second, blocks last — and a flood of one class can never exclude a higher
-/// class from the budget.
+/// second, blocks last in the byte budget. Event-count limits are shared:
+/// many tiny messages can still consume all count slots for their source.
 fn class_bytes_cap(class: EventClass, bytes_cap: usize) -> usize {
     match class {
         EventClass::Block => bytes_cap,
@@ -354,6 +356,7 @@ fn class_bytes_cap(class: EventClass, bytes_cap: usize) -> usize {
 /// counter to `usize::MAX`, which is the failure that once made a dual-
 /// transport node shed every frame forever (see `engine::run`).
 pub struct QueueBudget {
+    sources: Arc<Mutex<source_budget::Registry>>,
     count: std::sync::atomic::AtomicUsize,
     bytes: std::sync::atomic::AtomicUsize,
     count_cap: usize,
@@ -374,6 +377,7 @@ impl QueueBudget {
     /// with anything but the two constants.
     pub fn with_caps(count_cap: usize, bytes_cap: usize) -> QueueBudget {
         QueueBudget {
+            sources: Arc::new(Mutex::new(source_budget::Registry::default())),
             count: std::sync::atomic::AtomicUsize::new(0),
             bytes: std::sync::atomic::AtomicUsize::new(0),
             count_cap,
@@ -382,6 +386,27 @@ impl QueueBudget {
             shed_attestations: AtomicU64::new(0),
             shed_transactions: AtomicU64::new(0),
         }
+    }
+
+    /// Reserve before either transport's first engine-facing channel. The
+    /// Origin guard survives forwarding and handling, including error paths.
+    fn admit_source(&self, ev: &mut NetEvent, source: source_budget::Source) -> bool {
+        let class = class_of(ev);
+        let Some(guard) = source_budget::Registry::reserve(
+            &self.sources, source, class, queued_bytes(ev), self.count_cap, self.bytes_cap,
+        ) else {
+            self.shed_counter(class).fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        match ev {
+            NetEvent::Block(_, origin) | NetEvent::Attestation(_, origin)
+                | NetEvent::Transaction(_, origin) => origin.set_reservation(guard),
+        }
+        true
+    }
+
+    pub(crate) fn admit_peer(&self, ev: &mut NetEvent, peer: Vec<u8>) -> bool {
+        self.admit_source(ev, source_budget::Source::Peer(peer))
     }
 
     /// Reserve room for `ev`, or record a shed and return `false`.
@@ -735,7 +760,7 @@ fn run_outbound_reader(
                 if frame.first() == Some(&FRAME_GET_BLOCKS) {
                     responder.answer(&_half.0, address.ip(), frame, &mut limiter);
                 } else if let Some(event) = decode_event(&frame) {
-                    if !send_to_engine(&events, &budget, event) { return; }
+                    if !send_from_ip(&events, &budget, address.ip(), event) { return; }
                 }
             }
             Err(_) => return,
@@ -886,6 +911,13 @@ impl SyncScheduler {
 /// a round trip. Keeping all of them costs the process.
 ///
 /// Returns false when the engine is gone, so callers can stop their thread.
+fn send_from_ip(events: &Sender<EngineEvent>, budget: &QueueBudget, ip: std::net::IpAddr, mut ev: NetEvent) -> bool {
+    // One NAT address shares a burst allowance across connections. This is not
+    // a validator identity: no score, persistent ban, or disconnect follows.
+    if !budget.admit_source(&mut ev, source_budget::Source::ip(ip)) { return true; }
+    send_to_engine(events, budget, ev)
+}
+
 fn send_to_engine(events: &Sender<EngineEvent>, budget: &QueueBudget, ev: NetEvent) -> bool {
     // Atomic reservation of BOTH the count and the bytes (O06): the old
     // `load >= CAP` followed by `fetch_add` let concurrent readers overshoot
@@ -1240,7 +1272,7 @@ pub fn start(
                                 if frame.first() == Some(&FRAME_GET_BLOCKS) {
                                     responder.answer(&_half.0, address.ip(), frame, &mut get_blocks_limiter);
                                 } else if let Some(ev) = decode_event(&frame) {
-                                    if !send_to_engine(&events, &inflight, ev) {
+                                    if !send_from_ip(&events, &inflight, address.ip(), ev) {
                                         return;
                                     }
                                 }
@@ -1797,6 +1829,33 @@ mod tests {
         assert_eq!(budget.inflight_bytes(), bytes_before, "shedding must not charge bytes");
         assert!(rx.try_recv().is_err(), "an event at the cap must be shed");
         assert_eq!(budget.shed(), (0, 1, 0));
+    }
+
+    #[test]
+    fn source_admission_lasts_through_processing_and_failed_delivery_releases_it() {
+        let (tx, rx) = mpsc::channel::<EngineEvent>();
+        let budget = QueueBudget::with_caps(1, 1 << 20);
+        let ip = "192.0.2.1".parse().unwrap();
+        let event = || NetEvent::Attestation(sample_attestation(), Origin::none());
+        assert!(send_from_ip(&tx, &budget, ip, event()));
+        let EngineEvent::Net(processing) = rx.recv().unwrap() else { panic!("network event") };
+        // Match the engine's early release of the legacy queue accounting.
+        // The source guard must remain held until processing actually ends.
+        budget.release(&processing);
+        assert!(send_from_ip(&tx, &budget, ip, event()));
+        assert!(rx.try_recv().is_err());
+        drop(processing);
+        assert!(send_from_ip(&tx, &budget, ip, event()));
+        let EngineEvent::Net(next) = rx.recv().unwrap() else { panic!("network event") };
+        budget.release(&next);
+        drop(next);
+        drop(rx);
+        assert!(!send_from_ip(&tx, &budget, ip, event()));
+        assert_eq!(budget.inflight(), 0);
+        // A dead receiver drops both the queue reservation and Origin guard.
+        let (live_tx, live_rx) = mpsc::channel();
+        assert!(send_from_ip(&live_tx, &budget, ip, event()));
+        assert!(live_rx.try_recv().is_ok());
     }
 
     /// O06 — the invariant `count <= cap` holds under contention. Eight

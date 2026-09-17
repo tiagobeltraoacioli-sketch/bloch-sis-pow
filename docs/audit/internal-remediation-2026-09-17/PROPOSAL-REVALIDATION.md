@@ -10,15 +10,15 @@ Skipped transactions remain in the mempool and are not entered into the rejectio
 
 Funded deposits receive a state-aware check using a lazily constructed proposal-epoch view, its active stake total, the parent's epoch-specific next fee, and the probe verifier. That context is constructed at most once per selection and only when an enabled funded candidate needs it. The current funded admission gate is **epoch 2884**, not `u64::MAX`; candidates before that gate are skipped before projection. Immutable signature checks are not repeated here; admission and final block validation retain their existing roles.
 
-Residual capacity policy: existing mempool entries are still ranked by their advertised tip during capacity eviction. A transaction temporarily invalid under a changed fee can therefore retain capacity priority while selection skips it. This patch does not introduce ordinary-transfer input reservation at admission, fee replacement, package admission, or a new capacity-eviction policy. EN-06 remains partial for those admission/capacity concerns.
+Capacity-time stale-priority cleanup is implemented in the follow-up below. Ordinary-transfer fee replacement, package admission and input reservation at admission remain separate policies; no new general replacement policy is implied.
 
 ### Evidence
 
 - `/private/tmp/bloch-audit-wave5-proposal-final.log`: five tests passed, zero ignored. New tests apply real signed, funded blocks to demonstrate fee increase, stale transaction exclusion without a bar, fee decrease and re-eligibility of the exact same bytes; candidate-epoch pricing at the byte-target boundary; and selection of independent spends behind a higher-tip conflicting spend. Another new test checks multiple funded candidates before the actual activation epoch without state mutation or rejection bars.
 - `/private/tmp/bloch-audit-wave5-transfer-compat.log`: all 21 existing transfer end-to-end tests passed. The declared-byte geometry regression now tests the packer directly because its deliberately unsigned/unfunded synthetic inputs are ineligible for proposal selection.
-- A new dedicated multiple-funded-candidate test at an **active** admission epoch was not run. No ignored rehearsal was added as qualification, and no activation constant was changed. Existing broader activated-path qualification is tracked by the release coordinator.
+- Active-funded selection is now independently tested at the actual epoch 2884, as detailed in the follow-up evidence below. No ignored rehearsal or activation edit is used.
 
-Frozen engine source SHA-256: `3883248a6f32ce57a48c1074a726636053c271bcd8cf3e3e8143e761407e10d1`. Admission helper SHA-256: `86304c0849aede7b23c0b6664ad07bce4e0887f51304f696c61247d537b36536`.
+Initial proposal-only checkpoint engine source SHA-256: `3883248a6f32ce57a48c1074a726636053c271bcd8cf3e3e8143e761407e10d1`. Admission helper SHA-256: `86304c0849aede7b23c0b6664ad07bce4e0887f51304f696c61247d537b36536`.
 
 ## EN-10 — remains open; no new signing veto
 
@@ -31,3 +31,17 @@ No stronger trusted completion signal was found in the current engine that would
 Before adding an automatic veto, define a trusted readiness source and explicit recovery behavior. Qualification must contrast (1) a restarted node catching up while the chain advances, (2) a genuinely halted chain with no fresher blocks, (3) malicious high-head claims and orphan floods, and (4) honest delayed page application. The intended policy must let a halted chain recover while preventing an untrusted peer from indefinitely suppressing duties. No restart-time SLA or stronger freshness guarantee is claimed by this patch.
 
 Source anchors: `engine.rs` methods `rolled_to`, `attest`, `propose`, `select_transactions`, `pack_transactions`, and the run-loop `in_grace` condition; `transition.rs::CommittedState::next_base_fee_at` and `Transition::compute_post_state` for the fee epoch rule.
+
+## Follow-up: capacity-time backing revalidation
+
+Capacity decisions now compute a transactional cleanup plan when the entry count, encoded-byte budget, or source allowance is exhausted. Entries which cannot currently back their declared fees/inputs are considered for retention eviction before still-paying entries, regardless of their advertised tip. A source at its allowance first reclaims its own stale entries; combined pressure then considers other stale entries. No stale scan is performed on ordinary admission below these bounds.
+
+The plan commits only after the incoming transaction passes structural/signature/lifecycle checks. Invalid incoming bytes cannot evict even a stale entry. Funded conflict checks disregard only stale entries named in that plan, allowing a valid replacement to reclaim their capacity without weakening reservations against retained pending deposits. Cleanup removes admission timestamps and sweep bookkeeping, but does not create rejection bars or increment the paid low-fee replacement counter. Current, equally priced entries retain their original protection against churn.
+
+This closes the previously documented **stale advertised-tip capacity priority** residual. Ordinary-transfer fee replacement/package admission and reservation of conflicting ordinary spends at admission remain separate policies: these transfers may coexist until selection reserves their inputs. No new general replacement policy is claimed.
+
+Evidence:
+
+- `/private/tmp/bloch-audit-wave6-capacity-final.log`: capacity regressions use a real applied full block to increase fees after authenticated admission, then test count, byte and same-source pressure; forged incoming signatures leave the pool unchanged; an equal-fee arrival still cannot evict a currently eligible entry after cleanup.
+- `/private/tmp/bloch-audit-wave6-transfer-compat.log`: all 21 existing transfer tests pass. The preactivation compatibility test now asserts that inactive incoming bytes do not commit a stale cleanup plan; it no longer assumes unbacked placeholders must force a misleading full-pool response.
+- `/private/tmp/bloch-audit-wave6-active-funded.log`: the previously unqualified active-funded case now passes at the unchanged real epoch **2884**. Two real signed deposit intents are independently validated against the derived epoch view; selection includes only one because they share inputs, and repeating selection preserves the result without evicting either intent. No ignored test or compile-time activation change was used.
