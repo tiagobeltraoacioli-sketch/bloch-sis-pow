@@ -118,7 +118,7 @@ use bloch_pos_committee::{committees, derive, epoch_of, fee_market, schedule};
 
 use sha3::{Digest, Sha3_256};
 
-use super::{now_ms, Engine, StateCell};
+use super::{now_ms, Engine, MempoolIndex, StateCell};
 use crate::genesis::{Manifest, ManifestValidator, GENESIS_MIX};
 use crate::keys::{HybridVerifier, Keystore, ProbeVerifier};
 use crate::net;
@@ -710,6 +710,9 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         tx_slot_index_order: VecDeque::new(),
         doppelganger_observe_until: None,
         doppelganger_halted: false,
+        doppelganger_boot_slot: 0,
+        mempool_index: MempoolIndex::new(),
+        legacy_exits_applied: 0,
         manifest,
     }
 }

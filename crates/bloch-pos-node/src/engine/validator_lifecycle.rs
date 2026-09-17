@@ -86,6 +86,10 @@ impl Engine {
             .retain(|key, _| self.mempool.contains_key(key));
         self.mempool_suspect
             .retain(|key| self.mempool.contains_key(key));
+        // Audit EN-04, 2026-09-16: the `retain` above removes behind the
+        // index's back, so bring it back into agreement here rather than
+        // leave it to the next reconcile.
+        self.mempool_index.reconcile(&self.mempool);
     }
 
     pub(super) fn report_equivocation(&mut self, evidence: SlashingEvidence) {
