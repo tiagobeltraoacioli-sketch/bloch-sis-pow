@@ -336,7 +336,9 @@ fn handle_authorize(
         info!("stratum: session {} proved ownership of {}", session.id, username);
     }
 
-    *session.address.lock() = Some(username.to_string());
+    // The parsed identity, not user-controlled hex casing, keys all new
+    // shares and credits. Existing journals require separate reconciliation.
+    *session.address.lock() = Some(addr.to_string());
     *session.state.lock() = SessionState::Authorized;
     info!("stratum: session {} authorized {}", session.id, username);
 
@@ -547,6 +549,40 @@ async fn submit_found_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_authorized_case_aliases_share_one_accounting_identity() {
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair();
+        let canonical = Address::from_pubkey(&pk, bloch_crypto::address::Network::Testnet).to_string();
+        let uppercase_payload = format!("bloch1t{}", canonical[7..].to_ascii_uppercase());
+        assert_ne!(canonical, uppercase_payload);
+        let pool = Arc::new(PoolState::new(crate::state::Config {
+            node_rpc: "http://127.0.0.1:1".into(), pool_address: canonical.clone(),
+            pool_spk: vec![], fee_bps: 0, share_bits: 0x2100ffff, pplns_window: 100,
+            listen: "127.0.0.1:0".into(), dashboard: "127.0.0.1:0".into(),
+            refresh_secs: 5, coinbase_tag: "audit".into(), confirm_depth: 6,
+            journal: None, require_auth_proof: true,
+        }).unwrap());
+        for (index, name) in [canonical.as_str(), uppercase_payload.as_str()].iter().enumerate() {
+            let session = Arc::new(Session::new(index as u64 + 1, "local fixture".into()));
+            *session.state.lock() = SessionState::Subscribed;
+            let mut message = AUTH_DOMAIN.to_vec();
+            message.extend_from_slice(&session.challenge);
+            let signature = bloch_crypto::crypto::sign(&sk, &message).unwrap();
+            let request = StratumRequest {
+                id: Some(json!(1)), method: methods::AUTHORIZE.into(),
+                params: json!([name, "x", hex::encode(&pk), hex::encode(signature)]),
+            };
+            assert!(handle_authorize(&pool, &session, &request).error.is_none());
+            let identity = session.address.lock().clone().unwrap();
+            assert_eq!(identity, canonical);
+            pool.ledger.lock().record_share(&identity, 10, 0x2100ffff);
+        }
+        let ledger = pool.ledger.lock();
+        assert_eq!(ledger.miners.len(), 1);
+        assert_eq!(ledger.miners[&canonical].shares, 2);
+        assert_eq!(ledger.window_contributions(), vec![(canonical, 20)]);
+    }
 
     /// The authorize ownership proof end to end: a wallet keypair signs
     /// the domain-separated challenge and the pool-side checks (pubkey

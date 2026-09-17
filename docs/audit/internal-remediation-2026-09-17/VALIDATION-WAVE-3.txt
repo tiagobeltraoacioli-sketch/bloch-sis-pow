@@ -1,0 +1,115 @@
+Third-wave validation — 2026-09-17
+Base439a1ca; branch fix/internal-audit-20260917; local macOS x86_64, Rust1.94.1.
+Builds use shared CARGO_TARGET_DIR; this is not Linux production qualification.
+Local logs reside in /private/tmp. SHA256 identifies original bytes; extracts below retain ignored counts.
+
+bloch-audit-wave3-node-full.log
+Command: cargo test -p bloch-pos-node --offline -- --test-threads=4
+Scope: Passed before buffer-capacity-only follow-up; ignored cases remain unqualified. Recovery-fence imports duplicate module tests, not unique extra coverage.
+SHA256 c8ee4bb9ea59d1ba1c6b655e8481de4b9a12aa95ef0a9342e2eaaaeec146ff45
+test result: ok. 413 passed; 0 failed; 19 ignored; 0 measured; 0 filtered out; finished in 79.36s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 53.14s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.22s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.89s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+test result: ok. 62 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.78s
+test result: ok. 0 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.65s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.07s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.78s
+
+bloch-audit-wave3-fd-final.log
+Command: cargo test -p bloch-pos-node --offline --bin bloch-pos audit_inherited_pipe_is_bounded_and_requires_complete_utf8 -- --test-threads=2
+Scope: Passed final preallocated pipe-reader source.
+SHA256 e1f887b5ec41e6a14097316f634a21cb48484eba54cb86ca49c9fcc433fd0726
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 431 filtered out; finished in 0.03s
+
+bloch-audit-wave3-ceremony-final.log
+Command: python3 deploy/genesis4-key-ceremony.test.py
+Scope: Four disposable mocked PTY cases passed, including bash -ax and signal cleanup. No real keys generated.
+SHA256 1143e381106b1c97f37fb88a1be86d3e1c74364ca7763a3481295491327dab14
+Ran 4 tests in 8.066s
+OK
+
+bloch-wave3-keys-full.log
+Command: cargo test -p bloch-pos-node --bin bloch-pos keys::tests
+Scope: 32 key tests passed; later final pipe test separately qualifies preallocation.
+SHA256 389eee77507ab88419738cbf49d1d63c4d03f1e6665ba6e93c3ed124ad979583
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 398 filtered out; finished in 2.61s
+
+bloch-wave3-ws-unit.log
+Command: cargo test -p bloch-pos-node --bin bloch-pos ws_boot::tests
+Scope: 28 WS tests passed, including typed malformed artifacts versus raw I/O.
+SHA256 e76cf452bd8ff78b9b7400e749865d58c405987d42ddd5feb4c0aac01ff58e1f
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 402 filtered out; finished in 0.93s
+
+bloch-wave3-keystore-cli-full.log
+Command: cargo test -p bloch-pos-node --test keystore_at_rest --test keys_seal_cli
+Scope: 8 CLI tests passed; also covered by full integrated node run.
+SHA256 fb840cd0c2214de6fc813968fc68e2e84536af6c2d7228699638444234d7a6bc
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.90s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.99s
+
+audit-wallet-wave3-complete.log
+Command: cargo test -p bloch-crypto -p bloch-btc-wallet -p bloch-pq-vault --offline
+Scope: Wallet/vault unit and integration suites passed; existing ignores remain.
+SHA256 5fabf52e4d1968d512ed1ac3cfddfb5128bc79f7bb0893b9a8c333201e9015e3
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.81s
+test result: ok. 172 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 7.23s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.99s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+audit-wallet-wave3-api.log
+Command: cargo test --manifest-path services/pq-shield-api/Cargo.toml --offline
+Scope: 15 API tests passed with vault Drop integration.
+SHA256 8f86ff282f5eee497b94872f40226d7fb02c89e17915dcae88209df4ce6a3e61
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+bloch-audit-wave3-pool.log
+Command: cargo test --manifest-path pool/Cargo.toml --locked --lib stratum::tests -- --test-threads=2
+Scope: 5 pool authorization/framing tests passed after downloading missing locked dependencies.
+SHA256 118f7dd05f803549f2fc1f6bda41b9d1d8ffb48e7ebbe6f8968d2aea7d52b632
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.55s
+
+bloch-audit-wave3-image-guard.log
+Command: python3 scripts/check-deploy-image-pins.selftest.py; python3 scripts/check-deploy-image-pins.py
+Scope: Seven groups passed including 15 scalar/exemption scenarios; all15 deploy YAML files passed supported structural checks.
+SHA256 ec95d4de8124b45f479085b0d2224801ad615a1403f83e38cffd393c0c4bd4db
+check-deploy-image-pins selftest: OK — 7 cases behave as documented
+check-deploy-image-pins: OK — every deploy/ image: reference is pinned or explicitly non-pullable (15 file(s) scanned)
+
+bloch-audit-wave3-hardened.log
+Command: bash scripts/hardened-clippy.sh
+Scope: Five crate ratchets passed unchanged baselines. Final subsequent changes were buffer capacity and test/documentation-only state-root changes.
+SHA256 153b4ebfb9104e74f476f1208c81d88dc9aafe1e9d8a17b885111fa5a288da92
+hardened-clippy: toolchain 1.94.1 (pinned by rust-toolchain.toml)
+hardened-clippy: OK
+
+audit-state-root-wave3.log
+Command: cargo test -p bloch-pos-committee audit_adr041
+Scope: Three new commitment regressions passed.
+SHA256 14a76bdf6c1b5f55f6988edfc76115d8071f0494f61de5065c88a33a10852720
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 428 filtered out; finished in 0.28s
+
+audit-state-root-tags-wave3.log
+Command: cargo test -p bloch-pos-committee component_tags_are_pairwise_distinct
+Scope: Existing tag uniqueness regression passed.
+SHA256 e026bd2f0a65fb44f96a6598a47aff64abe9fe33da89ebc07e9f85fe03525c78
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 430 filtered out; finished in 0.00s
+
+Additional checks:
+- check-tests-blocking.selftest.py:37 cases passed; checked-in pipelines passed guard.
+- Changed deploy YAML parsed using Ruby YAML.load_file.
+- git diff --check passed.
+- Read-only crossreviews found and fixed allexport secret export, secret-buffer reallocation and quoted flow image-key bypasses.
+
+Limitations: Nix/systemd evaluation and live deployment not performed; native node tty restoration on terminating signals still partial; checkpoint signer independence not established; shared sync fairness/claim validation incomplete; historical pool journals unchanged; no funded key migration or consensus activation.
+Original audit findings remain tracked in FINDINGS.md; these tests do not close the overall audit.

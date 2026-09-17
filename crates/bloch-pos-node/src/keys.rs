@@ -227,6 +227,10 @@ impl Unlock {
 
     /// Resolve the policy from the process environment, in priority order:
     ///
+    /// A single-use inherited pipe may instead be selected with the nonsecret
+    /// `BLOCH_KEYSTORE_PASSPHRASE_FD` descriptor number. It must not be combined
+    /// with either file or environment-value credentials.
+    ///
     /// 1. `BLOCH_KEYSTORE_PASSPHRASE_FILE` — path to a file whose contents
     ///    (one trailing newline stripped) are the passphrase. Preferred: it
     ///    keeps the secret out of `/proc/<pid>/environ` and out of the unit
@@ -239,6 +243,24 @@ impl Unlock {
     /// that quietly read a plaintext key because nobody configured anything
     /// is the defect this function exists to close.
     pub fn from_env() -> io::Result<Unlock> {
+        if let Some(raw) = std::env::var_os("BLOCH_KEYSTORE_PASSPHRASE_FD") {
+            if std::env::var_os("BLOCH_KEYSTORE_PASSPHRASE_FILE").is_some()
+                || std::env::var_os("BLOCH_KEYSTORE_PASSPHRASE").is_some()
+            {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+                    "inherited-pipe credentials cannot be combined with file/environment passphrases"));
+            }
+            let raw = raw.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied,
+                "passphrase descriptor must be an unsigned decimal descriptor number"))?;
+            if raw.is_empty() || !raw.bytes().all(|c| c.is_ascii_digit()) {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "invalid passphrase descriptor number"));
+            }
+            let descriptor = raw.parse::<i32>().map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied,
+                "invalid passphrase descriptor number"))?;
+            let pass = read_passphrase_fd(descriptor, std::time::Duration::from_secs(3))
+                .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, format!("cannot read inherited passphrase pipe: {e}")))?;
+            return Ok(Unlock::passphrase(pass.as_str()));
+        }
         let pass_file = std::env::var_os("BLOCH_KEYSTORE_PASSPHRASE_FILE");
         let pass = std::env::var("BLOCH_KEYSTORE_PASSPHRASE").ok();
         if pass_file.is_none() && pass.as_deref().is_some_and(|p| !p.is_empty()) {
@@ -1062,6 +1084,75 @@ pub fn read_passphrase_file(path: &Path) -> io::Result<Zeroizing<String>> {
     Ok(s)
 }
 
+/// Consume one inherited pipe, including its original descriptor. The
+/// descriptor number is public configuration; only the pipe carries a secret.
+/// Nonblocking reads plus one total deadline bound a stalled/malicious writer.
+#[cfg(unix)]
+fn read_passphrase_fd(descriptor: i32, timeout: std::time::Duration) -> io::Result<Zeroizing<String>> {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    if descriptor < 0 || descriptor == libc::STDOUT_FILENO || descriptor == libc::STDERR_FILENO {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "use stdin or a dedicated inherited pipe descriptor"));
+    }
+    // SAFETY: fcntl inspects an integer descriptor; it does not dereference it.
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    if flags < 0 { return Err(io::Error::last_os_error()); }
+    // SAFETY: the caller transfers ownership of this validated inherited fd.
+    let mut pipe = unsafe { fs::File::from_raw_fd(descriptor) };
+    // The consumed descriptor must never leak into a subsequently spawned child.
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    use std::os::unix::fs::FileTypeExt;
+    if !pipe.metadata()?.file_type().is_fifo() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "passphrase descriptor must refer to a pipe"));
+    }
+    let status = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if status < 0 || unsafe { libc::fcntl(descriptor, libc::F_SETFL, status | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let deadline = std::time::Instant::now().checked_add(timeout)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid pipe deadline"))?;
+    let mut secret = Zeroizing::new(Vec::with_capacity(4096));
+    let mut chunk = Zeroizing::new([0u8; 512]);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "passphrase pipe did not finish within deadline"));
+        }
+        let millis = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX).max(1);
+        let mut poll = libc::pollfd { fd: descriptor, events: libc::POLLIN, revents: 0 };
+        // SAFETY: one live pollfd and its exact array length.
+        let ready = unsafe { libc::poll(&mut poll, 1, millis) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted { continue; }
+            return Err(error);
+        }
+        if ready == 0 { continue; }
+        match pipe.read(&mut chunk[..]) {
+            Ok(0) => break,
+            Ok(count) => {
+                if secret.len().saturating_add(count) > 4096 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "passphrase pipe exceeds 4096 bytes"));
+                }
+                secret.extend_from_slice(&chunk[..count]);
+            }
+            Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    if secret.is_empty() { return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty passphrase pipe")); }
+    let secret = std::str::from_utf8(&secret)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "passphrase pipe is not UTF-8"))?;
+    Ok(Zeroizing::new(secret.to_owned()))
+}
+
+#[cfg(not(unix))]
+fn read_passphrase_fd(_descriptor: i32, _timeout: std::time::Duration) -> io::Result<Zeroizing<String>> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "inherited passphrase pipes require Unix"))
+}
+
 /// A passphrase typed at the controlling terminal, echo off. Refuses when
 /// stdin is not a tty (a pipe is a file; use `--passphrase-file`). Never reads
 /// from argv: a command line is in `ps`, in shell history and in the audit
@@ -1078,8 +1169,6 @@ pub fn read_passphrase_from_tty(prompt: &str) -> io::Result<Zeroizing<String>> {
         ));
     }
     let mut err = io::stderr();
-    err.write_all(prompt.as_bytes())?;
-    err.flush()?;
     // Use a private, unbuffered handle: std::io::Stdin retains its shared
     // read-ahead buffer after the returned passphrase has been zeroized.
     let mut input = fs::File::open("/dev/tty")?;
@@ -1107,7 +1196,10 @@ pub fn read_passphrase_from_tty(prompt: &str) -> io::Result<Zeroizing<String>> {
     if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &term) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    let mut bytes = Zeroizing::new(Vec::new());
+    // Do not expose an actionable prompt until echo is already disabled.
+    err.write_all(prompt.as_bytes())?;
+    err.flush()?;
+    let mut bytes = Zeroizing::new(Vec::with_capacity(4096));
     let mut byte = Zeroizing::new([0u8; 1]);
     let read = (|| -> io::Result<()> {
         loop {
@@ -1224,6 +1316,35 @@ mod tests {
     /// The real suite, end to end, through the only entry point the trait now
     /// has. Disposable keypair generated in-process — no production or
     /// treasury key material is involved anywhere in this file.
+    #[cfg(unix)]
+    #[test]
+    fn audit_inherited_pipe_is_bounded_and_requires_complete_utf8() {
+        use std::os::fd::FromRawFd;
+        use std::io::Write;
+        let make_pipe = || {
+            let mut fds = [-1; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            (fds[0], unsafe { fs::File::from_raw_fd(fds[1]) })
+        };
+        for (bytes, valid) in [
+            (b"temporary test passphrase".to_vec(), true),
+            (vec![], false),
+            (vec![0xff], false),
+            (vec![b'x'; 4097], false),
+        ] {
+            let (read, mut write) = make_pipe();
+            write.write_all(&bytes).unwrap();
+            drop(write);
+            let result = read_passphrase_fd(read, std::time::Duration::from_secs(1));
+            assert_eq!(result.is_ok(), valid);
+            if valid { assert_eq!(result.unwrap().as_bytes(), bytes); }
+        }
+        let (read, _unfinished_writer) = make_pipe();
+        assert_eq!(read_passphrase_fd(read, std::time::Duration::from_millis(25)).unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(read_passphrase_fd(-1, std::time::Duration::from_secs(1)).is_err());
+        assert!(read_passphrase_fd(libc::STDOUT_FILENO, std::time::Duration::from_secs(1)).is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn audit_mutations_refuse_foreign_ownership_and_symlink_keys_before_locking() {

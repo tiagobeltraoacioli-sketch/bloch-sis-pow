@@ -316,12 +316,16 @@ impl Wallet {
         amount: u64,
         fee: u64,
     ) -> Result<Transaction, WalletError> {
-        if utxos.is_empty() {
-            return Err(WalletError::InsufficientFunds { needed: amount + fee, have: 0 });
+        if recipient.network() != self.network {
+            return Err(WalletError::NetworkMismatch);
         }
-
-        let total_in: u64 = utxos.iter().map(|u| u.output.value).sum();
         let needed = amount.checked_add(fee).ok_or(WalletError::Overflow)?;
+        if utxos.is_empty() {
+            return Err(WalletError::InsufficientFunds { needed, have: 0 });
+        }
+        let total_in = utxos.iter().try_fold(0u64, |total, utxo| {
+            total.checked_add(utxo.output.value).ok_or(WalletError::Overflow)
+        })?;
 
         if total_in < needed {
             return Err(WalletError::InsufficientFunds { needed, have: total_in });
@@ -1132,5 +1136,32 @@ mod legacy_sign_tests {
         // And a wrong key must still be rejected (no weakening).
         let (other_env, _) = crypto::generate_keypair();
         assert!(!crypto::verify(&other_env[4..], sighash, &sig), "a different pubkey must NOT verify");
+    }
+}
+
+#[cfg(test)]
+mod audit_transaction_boundaries {
+    use super::*;
+    #[test]
+    fn cross_network_addresses_with_identical_hashes_are_refused() {
+        for network in [Network::Mainnet, Network::Testnet] {
+            let (wallet, _) = Wallet::generate(network).unwrap();
+            let other = if network == Network::Mainnet { Network::Testnet } else { Network::Mainnet };
+            let wrong = Address::from_hash([42;20], other);
+            let right = Address::from_hash([42;20], network);
+            let utxos = || vec![Utxo { txid:[1;32], index:0,
+                output: TxOutput { value:1000, script_pubkey:wallet.address().hash().to_vec() } }];
+            assert!(matches!(wallet.build_tx(utxos(), &wrong, 900, 100), Err(WalletError::NetworkMismatch)));
+            assert!(wallet.build_tx(utxos(), &right, 900, 100).is_ok());
+        }
+    }
+    #[test]
+    fn empty_and_aggregate_input_overflows_return_errors() {
+        let (wallet, _) = Wallet::generate(Network::Testnet).unwrap();
+        assert!(matches!(wallet.build_tx(vec![], wallet.address(), u64::MAX, 1), Err(WalletError::Overflow)));
+        let inputs = [u64::MAX, 1].into_iter().enumerate().map(|(index, value)| Utxo {
+            txid:[1;32], index:index as u32, output:TxOutput { value, script_pubkey:wallet.address().hash().to_vec() }
+        }).collect();
+        assert!(matches!(wallet.build_tx(inputs, wallet.address(), 1, 0), Err(WalletError::Overflow)));
     }
 }

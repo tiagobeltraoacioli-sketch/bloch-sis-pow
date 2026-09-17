@@ -13,8 +13,9 @@ validator: the signing key *and* the RANDAO seed.
 
 ## READ THIS BEFORE DEPLOYING THE BINARY
 
-**Every keystore on the live fleet today is `BPOSKEY1` (plaintext), and the new
-binary refuses to load one unless told to.** The loader returns
+**A `BPOSKEY1` plaintext keystore requires an explicit plaintext opt-in.**
+Inspect each host before rollout; this historical note is not an inventory of
+currently deployed keystore formats. The loader returns
 `PermissionDenied` and the engine stops the boot. A fleet-wide restart onto
 this binary with no other change is a **fleet-wide halt**, not a degraded
 mode.
@@ -30,9 +31,10 @@ Pick one *before* the rollout, not during it:
   binary rollout from the key handling, not as the end state.
 
 - **Option B — re-seal (closes the finding).** Per host, with the node stopped:
-  back the keystore up offline, re-seal it, restart with the passphrase wired
-  into the unit. Sealing an existing key needs a re-seal tool this repo does
-  **not** ship — see "Not covered" below.
+  back the keystore up offline, run `bloch-pos keys seal --dir <data-dir>`
+  as the owning service account, and restart with the passphrase wired into
+  the unit. The command preserves the identity and refuses already-sealed
+  keys; it does not rotate an existing sealed passphrase.
 
 Never do both halves at once on more than one validator: a host that cannot
 open its key does not attest, and enough of them at once moves finality.
@@ -120,3 +122,31 @@ drives the real executable and needs no fleet and no clock.
   secret, the derived key and the passphrase are `Zeroizing` and the RANDAO
   seed is wiped in `Drop`, which bounds the window in core dumps and freed
   pages. It is not a defence against reading a running node's address space.
+
+
+## Single-use pipe credentials for an offline ceremony (KS-14)
+
+`keygen`, `keygen-public` and `run` also accept
+`BLOCH_KEYSTORE_PASSPHRASE_FD=<descriptor-number>` on Unix. The environment
+contains only this public descriptor number. The passphrase arrives as raw
+UTF-8 bytes through an inherited pipe, with EOF as the terminator; no trailing
+newline is removed. The consumer accepts at most 4096 bytes, requires completion
+within three seconds, and closes the descriptor on success or read failure.
+Standard input (descriptor 0) or a dedicated descriptor >= 3 is accepted;
+stdout/stderr, regular files and terminals are refused. Do not combine this
+source with `BLOCH_KEYSTORE_PASSPHRASE` or its `_FILE` alternative.
+
+`deploy/genesis4-key-ceremony.sh` uses a fresh anonymous pipe for each child.
+It clears inherited credential variables, disables shell tracing before reading
+the passphrase, keeps it in an unexported Bash variable, and uses the builtin
+`printf` so the secret never enters an external process argument list. The
+script unsets the variable after the public exports and on exit; Bash cannot
+promise that previous heap allocations, swap or crash dumps are zeroized.
+This reduces environment/argv exposure, not the need for an isolated trusted
+ceremony machine. Public-key export failure now stops the ceremony rather than
+producing a success report containing placeholder identities.
+
+This input path does not change `BPOSKEY1`/`BPOSKEY2`, KDF parameters, key
+identities or the existing file/environment compatibility paths. `keys seal`
+continues to use its explicit passphrase-file or terminal interface. No live
+ceremony or validator migration is implied by these source changes.

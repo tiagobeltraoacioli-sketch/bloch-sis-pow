@@ -868,14 +868,10 @@ mod verification;
 
 struct Engine {
     manifest: Manifest,
-    /// Validator indices below this were registered AT GENESIS and are
-    /// therefore identical on every branch of every fork; indices at or above
-    /// it were (or would be) added by an on-chain `Deposit`, whose
-    /// index-to-key mapping is a property of ONE branch. `ingest_judged` uses
-    /// the line to decide whether a signature failure against this node's
-    /// head registry is a provable forgery (`Reject`) or merely a key this
-    /// node may not hold (`Ignore`, parked) — external audit 2026-09-07, O04.
-    genesis_validator_count: u32,
+    /// Explicit genesis membership is branch-independent even for sparse manifests.
+    /// A failed signature at any other index may belong to a different branch's
+    /// deposited key and must remain retryable (external audit O04 / EN-21).
+    genesis_validator_indices: BTreeSet<u32>,
     state: StateCell,
     tr: Transition<HybridVerifier>,
     tr_probe: Transition<ProbeVerifier>,
@@ -2396,14 +2392,14 @@ impl Engine {
         // miniature.
         //
         // So:
-        //   * GENESIS index (`i < genesis_validator_count`), signature fails
+        //   * GENESIS index (present in the manifest), signature fails
         //     → REFUSED, and `Reject`: the genesis registry is in the manifest
         //     every node booted from, records are append-only per index
         //     (transition step 7's note: "records never removed"), so the key
         //     this node holds at `i` is the key EVERY branch holds at `i`, and
         //     this is a forgery the transition would have rejected too —
         //     provable, and safe to charge to the peer that relayed it.
-        //   * DEPOSIT-ADDED index (`i >= genesis_validator_count`), signature
+        //   * DEPOSIT-ADDED index (absent from the manifest), signature
         //     fails against the HEAD's key → PARKED, `Ignore`, never `Reject`
         //     (external audit 2026-09-07, O04). "Append-only per index" is a
         //     fact about one branch: two branches that each admit a different
@@ -2414,11 +2410,8 @@ impl Engine {
         //     simply not applied yet. The transition judges it against the
         //     parent-derived registry when the branch is applied; until then
         //     it may not weigh on fork choice, which is exactly what parking
-        //     buys. Today `genesis_validator_count` is the whole registry
-        //     (`DEPOSIT_ACTIVATION_EPOCH` is `u64::MAX`, so no index above it
-        //     exists on any branch) and this arm is unreachable; it is here so
-        //     that opening deposits does not silently turn the head-registry
-        //     shortcut into a fork.
+        //     buys. Manifest membership is explicit: genesis indices need
+        //     not be dense or ordered.
         //   * unregistered index → PARKED, never stored, `Ignore`. No verdict
         //     is passed on it: it simply may not weigh on fork choice under an
         //     identity this node cannot check, and the orphan pool is
@@ -2444,7 +2437,7 @@ impl Engine {
             }
         };
         if !authenticated {
-            if env.header.proposer_index >= self.genesis_validator_count {
+            if !self.genesis_validator_indices.contains(&env.header.proposer_index) {
                 // O04: a deposit-added identity whose key this branch may not
                 // hold. Not a verdict on the block, and not a charge on the
                 // peer — hold it and let the transition judge it in context.
@@ -4460,26 +4453,6 @@ pub(crate) enum RegistryIdentity {
 /// its own. So the duty path re-checks the *key*, not just the index, every
 /// time it is about to sign: see `Engine::duty_index`.
 pub(crate) fn check_registry_identity(
-    state: &dyn StateReader,
-    index: u32,
-    pubkey: &[u8],
-    randao_seed: [u8; 32],
-) -> RegistryIdentity {
-    let Some(rec) = state.validator_record(index) else {
-        return RegistryIdentity::PendingActivation;
-    };
-    if rec.pubkey != pubkey {
-        return RegistryIdentity::WrongValidator;
-    }
-    if RandaoChain::generate(randao_seed).commitment() != rec.randao_commitment {
-        return RegistryIdentity::RandaoMismatch;
-    }
-    RegistryIdentity::Active
-}
-
-/// Start the devnet TCP mesh. Called by the `Devnet` and `Dual` arms of
-/// [`run`] with identical arguments.
-fn check_joining_registry_identity(
     state: &CommittedState, index: u32, pubkey: &[u8], randao_seed: [u8; 32],
 ) -> RegistryIdentity {
     let Some(rec) = state.validator_record(index) else { return RegistryIdentity::PendingActivation };
@@ -4912,7 +4885,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         tx_slot_index_order: VecDeque::new(),
         doppelganger_observe_until: None,
         doppelganger_halted: false,
-        genesis_validator_count: manifest.validators.len() as u32,
+        genesis_validator_indices: manifest.validators.iter().map(|v| v.index).collect(),
         manifest,
     };
 
@@ -5006,7 +4979,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
             engine.state.validator_index_by_pubkey(&keys.pubkey)
         } else { Some(keys.index) };
         let identity = match registered_index {
-            Some(index) => check_joining_registry_identity(&engine.state, index, &keys.pubkey,
+            Some(index) => check_registry_identity(&engine.state, index, &keys.pubkey,
                 keys.randao_seed_for(&engine.state.admission_network_domain().unwrap_or([0; 32]),
                     engine.state.validator_randao_generation(index))),
             None => RegistryIdentity::PendingActivation,
@@ -7296,7 +7269,7 @@ mod transfer_v2_end_to_end {
         );
         let verifier = HybridVerifier::new();
         Engine {
-            genesis_validator_count: manifest.validators.len() as u32,
+            genesis_validator_indices: manifest.validators.iter().map(|v| v.index).collect(),
             manifest,
             state: StateCell::new(state),
             tr: Transition::new(verifier.clone()),
@@ -8374,7 +8347,7 @@ mod perf_support {
         );
         let verifier = HybridVerifier::new();
         let engine = Engine {
-            genesis_validator_count: manifest.validators.len() as u32,
+            genesis_validator_indices: manifest.validators.iter().map(|v| v.index).collect(),
             manifest,
             state: StateCell::new(state),
             tr: Transition::new(verifier.clone()),
@@ -10109,7 +10082,7 @@ mod duty_view_anchor {
         let ks0 = Keystore::load_with(&dir.0.join("v0"), &crate::keys::Unlock::PlaintextOptIn)
             .expect("re-load validator 0");
         let engine = Engine {
-            genesis_validator_count: manifest.validators.len() as u32,
+            genesis_validator_indices: manifest.validators.iter().map(|v| v.index).collect(),
             manifest,
             state: StateCell::new(state),
             tr: Transition::new(verifier.clone()),
@@ -10374,7 +10347,7 @@ mod slot_horizon {
         );
         let verifier = HybridVerifier::new();
         Engine {
-            genesis_validator_count: manifest.validators.len() as u32,
+            genesis_validator_indices: manifest.validators.iter().map(|v| v.index).collect(),
             manifest,
             state: StateCell::new(state),
             tr: Transition::new(verifier.clone()),
@@ -10898,14 +10871,14 @@ mod ingest_admission_tests {
     /// still holds for genesis indices.
     ///
     /// The fixture's registry is entirely genesis-registered, so the branch
-    /// is simulated by lowering `genesis_validator_count` to zero: every index
+    /// is simulated by clearing genesis membership: every index
     /// is then "deposit-added" from the engine's point of view. Before the fix
     /// this block was `Reject`ed and counted as unsigned; now it is `Ignore`d
     /// and parked.
     #[test]
     fn a_failed_signature_under_a_deposit_added_index_is_parked_not_refused() {
         let (mut engine, _dir, template, stored) = fixture();
-        engine.genesis_validator_count = 0;
+        engine.genesis_validator_indices.clear();
 
         let mut other_key = repointed(&engine, &template, [0x9A; 32], 2);
         let n = other_key.proposer_sig.len();
@@ -10918,13 +10891,30 @@ mod ingest_admission_tests {
         assert_eq!(engine.rejected_unsigned, 0, "not a forgery, not counted as one");
 
         // The genesis line restored, the identical envelope IS a provable
-        // forgery again — the two rules meet exactly at `genesis_validator_count`.
+        // forgery again — the two rules use exact manifest membership.
         let (mut engine, _dir, template, stored) = fixture();
-        assert!(engine.genesis_validator_count > template.header.proposer_index);
+        assert!(engine.genesis_validator_indices.contains(&template.header.proposer_index));
         let mut forged = repointed(&engine, &template, [0x9A; 32], 2);
         forged.proposer_sig = vec![0u8; n];
         let verdict = engine.ingest_judged(forged);
         assert!(matches!(verdict, Verdict::Reject));
+        assert_eq!(engine.blocks.len(), stored);
+        assert_eq!(engine.rejected_unsigned, 1);
+    }
+
+    #[test]
+    fn sparse_genesis_membership_rejects_forgery_at_high_index() {
+        let (mut engine, _dir, mut envelope, stored) = fixture();
+        let high_index = 91;
+        engine.manifest.validators[0].index = high_index;
+        engine.genesis_validator_indices = engine.manifest.validators.iter().map(|v| v.index).collect();
+        engine.state = StateCell::new(engine.manifest.genesis_state());
+        envelope.header.proposer_index = high_index;
+        envelope.header.parent = [0x9A; 32];
+        envelope.header.slot = 2;
+        envelope.proposer_sig.fill(0);
+        assert!(matches!(engine.ingest_judged(envelope), Verdict::Reject));
+        assert!(engine.orphans.is_empty(), "a sparse genesis identity is still branch-independent");
         assert_eq!(engine.blocks.len(), stored);
         assert_eq!(engine.rejected_unsigned, 1);
     }

@@ -571,7 +571,7 @@ state component, mixed into key derivation so entries from different
 components can never occupy the same leaf even when their natural keys
 coincide. The registry is **append-only** (reusing or renumbering a tag
 silently re-keys every leaf of the component it named) and is, as shipped,
-exactly these 22:
+exactly these 30:
 
 | Tag | Component |
 |---:|---|
@@ -597,6 +597,31 @@ exactly these 22:
 | `0x14` | `TAG_ISSUED_SUPPLY` — cumulative issued supply (hard-cap counter, singleton) |
 | `0x15` | `TAG_BASE_FEE` — L1 fee-market price leaf (singleton) |
 | `0x16` | `TAG_DELEGATOR_FEE_REWARD` — delegator fee-reward ledger |
+| `0x17` | `TAG_VALIDATOR_FEE_REWARD` — validator fee-reward ledger |
+| `0x18` | `TAG_DELEGATOR_ISSUANCE_REWARD` — delegator issuance-reward ledger |
+| `0x19` | `TAG_PROPOSED_CURRENT` — current-epoch proposal participation |
+| `0x1A` | `TAG_FC_RECENT_VOTE` — retained fork-choice equivocation-window votes |
+| `0x1B` | `TAG_WRITTEN_OFF` — ADR-041 cumulative written-off supply |
+| `0x1C` | `TAG_STAKE_LOW_WATER` — ADR-041 validator stake low-water marks |
+| `0x1D` | `TAG_RANDAO_GENERATION` — ADR-041 validator RANDAO generations |
+| `0x1E` | `TAG_FUNDED_VALIDATOR` — ADR-041 funded-validator membership |
+
+The ADR-041 encodings above document the existing implementation; they do not
+change activation gates. `0x1B` uses an empty entry key and a little-endian
+`u128` value, omitted when zero. `0x1C` uses a little-endian `u32` validator
+index as its entry key and a little-endian `u128` floor value; a recorded zero
+floor is present and differs from absence. `0x1D` uses the same validator-key
+encoding and a little-endian `u32` generation, omitted when zero. `0x1E` uses
+the validator-key encoding and the one-byte value `0x01` for each member.
+These are state component tags, a separate namespace from transaction kinds.
+Entries with distinct keys are iteration-order independent; conflicting duplicate
+keys are not an alternative canonical representation of the same state.
+
+The state-root implementation has a bounded thread-local singleton-subtree
+memo with interior mutability. It caches a pure hash indexed by the complete
+(key, value hash, depth) tuple. Cache hits, misses and generation rotation affect
+performance only; no authoritative consensus state is read from this memo.
+
 
 Fixed-length digests use SHA3-256. Variable-length or multi-output derivation
 uses SHAKE-256. SHA-256d survives **only** in the historical verification path

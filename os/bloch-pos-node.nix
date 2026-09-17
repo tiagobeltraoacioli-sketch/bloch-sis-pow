@@ -25,15 +25,7 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = pkgs.blochPos or (pkgs.callPackage ./package.nix { }); # TODO: a
-        # dedicated bloch-pos-node package.nix does not exist yet in os/ —
-        # this falls back to the same builder as the legacy `bloch` package,
-        # which will NOT produce a `bloch-pos` binary until that derivation
-        # is added. Wiring the actual `bloch-pos-node` crate build is a
-        # follow-up; do not enable this module in a real deploy until
-        # `pkgs.blochPos` (or an override of this option) actually resolves
-        # to a package containing `bin/bloch-pos`.
-      description = "The bloch-pos package to run. See the default's TODO — no dedicated derivation exists yet.";
+      description = "Required package containing bin/bloch-pos. The legacy PoW package is not a valid fallback.";
     };
 
     dataDir = lib.mkOption {
@@ -49,18 +41,25 @@ in
 
     transport = lib.mkOption {
       type = lib.types.enum [ "devnet" "libp2p" "dual" ];
-      default = "libp2p";
       description = ''
-        Matches --transport. Defaults to libp2p here (the production,
-        authenticated stack), NOT the node binary's own compiled-in default
-        — see crates/bloch-pos-node/src/main.rs and the Round-3 audit's H-2
-        finding for why the binary's own default is contested (four in-tree
-        comments say `devnet`, the compiled behaviour is `Dual` on
-        0.0.0.0:16400). This module does not inherit that ambiguity: it
-        always passes --transport explicitly, so what runs is always exactly
-        what this option says, never whatever the binary defaults to today
-        or after a future rebuild.
+        Required explicit --transport choice matching the intended peers.
+        The binary defaults to devnet; libp2p alone cannot communicate with
+        devnet-only peers. This module never silently changes that choice.
+        devnet and dual also require meshListenPort.
       '';
+    };
+
+    meshListenPort = lib.mkOption {
+      type = lib.types.nullOr lib.types.port;
+      default = null;
+      description = "Required devnet mesh --listen port for devnet/dual; distinct from p2pListenPort in dual mode.";
+    };
+
+    meshPeers = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "203.0.113.7:16401" ];
+      description = "Devnet mesh host:port peers passed through --peers.";
     };
 
     rpcPort = lib.mkOption {
@@ -161,6 +160,16 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = cfg.transport == "libp2p" || cfg.meshListenPort != null;
+        message = "blochPos devnet/dual requires meshListenPort.";
+      }
+      {
+        assertion = cfg.transport != "dual" || cfg.meshListenPort != cfg.p2pListenPort;
+        message = "blochPos dual requires distinct mesh and libp2p listen ports.";
+      }
+    ];
     users.users.bloch-pos = {
       isSystemUser = true;
       group = "bloch-pos";
@@ -169,8 +178,8 @@ in
     users.groups.bloch-pos = { };
 
     networking.firewall.allowedTCPPorts =
-      lib.mkIf (cfg.transport == "libp2p" || cfg.transport == "dual")
-        [ cfg.p2pListenPort ];
+      lib.optionals (cfg.transport == "libp2p" || cfg.transport == "dual") [ cfg.p2pListenPort ]
+      ++ lib.optionals (cfg.transport != "libp2p" && cfg.meshListenPort != null) [ cfg.meshListenPort ];
 
     systemd.services.bloch-pos-node = {
       description = "Bloch Genesis-4 proof-of-stake node (bloch-pos)";
@@ -201,6 +210,12 @@ in
           "--metrics-bind" "127.0.0.1"
           "--metrics-port" (toString cfg.metricsPort)
         ]
+        ++ lib.optionals (cfg.transport != "libp2p" && cfg.meshListenPort != null) ([
+          "--listen" (toString cfg.meshListenPort)
+          "--listen-addr" "0.0.0.0"
+        ] ++ lib.optionals (cfg.meshPeers != [ ]) [
+          "--peers" (lib.concatStringsSep "," cfg.meshPeers)
+        ])
         ++ lib.optionals (cfg.transport == "libp2p" || cfg.transport == "dual") ([
           "--p2p-listen" "/ip4/0.0.0.0/tcp/${toString cfg.p2pListenPort}"
         ] ++ lib.optionals (cfg.p2pPeers != [ ]) [

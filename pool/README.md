@@ -1,5 +1,11 @@
 # bloch-pool — reference mining pool for Bloch-SIS-PoW
 
+Audit follow-up (2026-09-17): new authenticated sessions use the parsed
+address's canonical spelling for shares and credits. Hex case aliases no
+longer create separate new accounting identities. Existing journals retain
+their original spelling and balances; reconcile historical aliases before
+manual payouts rather than rewriting credited history automatically.
+
 > **Genesis-3-era component. There is nothing to mine.** This pool serves the
 > proof-of-work chain, which stopped at height 39,918 on 2026-08-13. The live
 > chain is **Genesis-4, proof of stake**: blocks come from a proposer schedule

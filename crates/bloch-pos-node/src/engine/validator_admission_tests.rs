@@ -454,7 +454,7 @@ fn funded_validator_two_nodes_rehearsal() {
     println!("PAYOUT_CLI_REPLAY_VERIFIED {}", codec::hex(&replay.state.state_root()));
     let keys = joiner.keys.as_ref().unwrap();
     assert_eq!(
-        check_joining_registry_identity(&replay.state, 1, &keys.pubkey, keys.randao_seed),
+        check_registry_identity(&replay.state, 1, &keys.pubkey, keys.randao_seed),
         RegistryIdentity::Inactive
     );
     let wm = joiner.slashprot.watermarks();
@@ -656,13 +656,13 @@ fn randao_automatic_recommit_rehearsal() {
     record.pubkey = joining.pubkey.clone();
     record.randao_commitment = RandaoChain::generate(joining.randao_seed).commitment();
     first.manifest.validators.push(record);
-    first.genesis_validator_count = 2;
+    first.genesis_validator_indices = BTreeSet::from([0, 1]);
     first.state = StateCell::new(first.manifest.genesis_state());
     first.chain = vec![(0, first.manifest.genesis_id())];
     first.canonical = BTreeSet::from([*first.manifest.genesis_id().as_bytes()]);
     let (mut second, _second_dir) = perf_support::proposing_engine();
     second.manifest = Manifest::decode(&first.manifest.encode()).unwrap();
-    second.genesis_validator_count = 2;
+    second.genesis_validator_indices = BTreeSet::from([0, 1]);
     second.state = StateCell::new(second.manifest.genesis_state());
     second.chain = first.chain.clone();
     second.canonical = first.canonical.clone();
@@ -688,7 +688,7 @@ fn randao_automatic_recommit_rehearsal() {
         let keys = engine.keys.as_ref().unwrap();
         let index = replay.validator_index_by_pubkey(&keys.pubkey).unwrap();
         let seed = keys.randao_seed_for(&replay.admission_network_domain().unwrap(), replay.validator_randao_generation(index));
-        assert_eq!(check_joining_registry_identity(&replay, index, &keys.pubkey, seed), RegistryIdentity::Active);
-        assert_eq!(check_joining_registry_identity(&replay, index, &keys.pubkey, keys.randao_seed), RegistryIdentity::RandaoMismatch);
+        assert_eq!(check_registry_identity(&replay, index, &keys.pubkey, seed), RegistryIdentity::Active);
+        assert_eq!(check_registry_identity(&replay, index, &keys.pubkey, keys.randao_seed), RegistryIdentity::RandaoMismatch);
     }
 }

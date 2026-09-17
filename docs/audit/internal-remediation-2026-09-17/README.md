@@ -2,7 +2,7 @@
 
 Status: **partial remediation, not release approval**. Branch `fix/internal-audit-20260917`, based on `b066e3c` in the isolated `bloch-audit-remediation` worktree. No fleet host, external validator, deployed service, or published binary was changed.
 
-The sections below preserve the first-wave scope and validation (`203b410`). See [second-wave implementation and limits](WAVE-2.md) for subsequent changes and [protocol blockers](PROTOCOL-BLOCKERS.md) for the consensus activation analysis. The finding ledger tracks both waves; a local implementation is not a production security closure.
+The sections below preserve the first-wave scope and validation (`203b410`). See [second-wave implementation and limits](WAVE-2.md), [third-wave corrections](WAVE-3.md), and [protocol blockers](PROTOCOL-BLOCKERS.md) for subsequent work. The finding ledger tracks all waves; a local implementation is not a production security closure.
 
 ## Scope and source reconciliation
 

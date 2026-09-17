@@ -50,6 +50,7 @@ fn run(args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
     let mut c = Command::new(BIN);
     c.env_remove("BLOCH_KEYSTORE_PASSPHRASE")
         .env_remove("BLOCH_KEYSTORE_PASSPHRASE_FILE")
+        .env_remove("BLOCH_KEYSTORE_PASSPHRASE_FD")
         .env_remove("BLOCH_KEYSTORE_ALLOW_PLAINTEXT");
     for (k, v) in env {
         c.env(k, v);
@@ -225,4 +226,39 @@ fn the_plaintext_opt_in_is_the_only_route_to_a_plaintext_file() {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn inherited_pipe_credentials_seal_and_reopen_without_secret_environment() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let dir = tmp_dir("inherited-pipe");
+    let invoke = |arguments: &[&str], conflict: bool| {
+        let mut command = Command::new(BIN);
+        command.args(arguments).env_remove("BLOCH_KEYSTORE_PASSPHRASE")
+            .env_remove("BLOCH_KEYSTORE_PASSPHRASE_FILE")
+            .env_remove("BLOCH_KEYSTORE_ALLOW_PLAINTEXT")
+            .env("BLOCH_KEYSTORE_PASSPHRASE_FD", "0")
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        if conflict { command.env("BLOCH_KEYSTORE_PASSPHRASE", "unused-conflicting-value"); }
+        let mut child = command.spawn().unwrap();
+        if !conflict {
+            child.stdin.take().unwrap().write_all(PASSPHRASE.as_bytes()).unwrap();
+        } else { drop(child.stdin.take()); }
+        let output = child.wait_with_output().unwrap();
+        assert!(!contains(&output.stdout, PASSPHRASE.as_bytes()));
+        assert!(!contains(&output.stderr, PASSPHRASE.as_bytes()));
+        output
+    };
+    let path = dir.to_str().unwrap();
+    let generated = invoke(&["keygen", "--dir", path, "--index", "0"], false);
+    assert!(generated.status.success(), "{}", String::from_utf8_lossy(&generated.stderr));
+    assert_eq!(&std::fs::read(dir.join("validator.key")).unwrap()[..8], SEALED_MAGIC);
+    let opened = invoke(&["keygen-public", "--dir", path], false);
+    assert!(opened.status.success(), "{}", String::from_utf8_lossy(&opened.stderr));
+    let refused = invoke(&["keygen-public", "--dir", path], true);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("cannot be combined"));
+    std::fs::remove_dir_all(dir).unwrap();
 }

@@ -43,13 +43,14 @@ LOCAL_BUILD_COMPOSE = """\
 services:
   node1:
     build: { context: .., dockerfile: Dockerfile }
+    pull_policy: never
     image: bloch:latest  # local build only: docker build -t bloch . — never pulled from a registry
 """
 
 PLACEHOLDER_COMPOSE = """\
 services:
   node:
-    image: bloch:local            # replace with your published image
+    image: REPLACE_WITH_DIGEST_PINNED_IMAGE
 """
 
 MIXED_COMPOSE = """\
@@ -111,8 +112,8 @@ def case_pinned_passes() -> str | None:
 
 def case_placeholder_passes() -> str | None:
     with tempfile.TemporaryDirectory() as tmp:
-        write_deploy(tmp, "docker-compose.yml", PLACEHOLDER_COMPOSE)
-        write_deploy(tmp, "docker-compose.local.yml", LOCAL_BUILD_COMPOSE)
+        write_deploy(tmp, "template.yml", PLACEHOLDER_COMPOSE)
+        write_deploy(tmp, "docker-compose.yml", LOCAL_BUILD_COMPOSE)
         r = run_checker(tmp)
         if r.returncode != 0:
             return "recognised placeholder was rejected:\n%s%s" % (r.stdout, r.stderr)
@@ -159,12 +160,46 @@ def case_nested_yaml_is_scanned() -> str | None:
     return None
 
 
+def case_bypass_regressions() -> str | None:
+    cases = {
+        "comment digest": UNPINNED_COMPOSE.rstrip() + " # @sha256:" + DIGEST + "\n",
+        "TODO comment": UNPINNED_COMPOSE.rstrip() + " # TODO: pin later\n",
+        "user comment": UNPINNED_COMPOSE.rstrip() + " # YOUR_USER\n",
+        "local comment": UNPINNED_COMPOSE.rstrip() + " # local build only\n",
+        "trailing digest bytes": PINNED_COMPOSE.rstrip() + "suffix\n",
+        "missing never": LOCAL_BUILD_COMPOSE.replace("    pull_policy: never\n", ""),
+        "missing build": LOCAL_BUILD_COMPOSE.replace("    build: { context: .., dockerfile: Dockerfile }\n", ""),
+        "other service policy": LOCAL_BUILD_COMPOSE.replace("    pull_policy: never\n", "") + "  other:\n    pull_policy: never\n",
+        "single-quoted inline mapping": "services:\n  node: { 'image': bloch:latest }\n",
+        "quoted inline mapping": 'services:\n  node: { "image": bloch:latest }\n',
+        "inline mapping": "services:\n  node: { image: bloch:latest }\n",
+        "list image": "containers:\n  - image: bloch:latest\n",
+        "quoted key": 'services:\n  node:\n    "image": bloch:latest\n',
+    }
+    for name, content in cases.items():
+        with tempfile.TemporaryDirectory() as tmp:
+            write_deploy(tmp, "docker-compose.yml", content)
+            r = run_checker(tmp)
+            if r.returncode == 0:
+                return "bypass accepted: %s\n%s" % (name, content)
+    with tempfile.TemporaryDirectory() as tmp:
+        write_deploy(tmp, "other.yml", LOCAL_BUILD_COMPOSE)
+        if run_checker(tmp).returncode == 0:
+            return "local-build exception escaped its single reviewed path"
+    with tempfile.TemporaryDirectory() as tmp:
+        write_deploy(tmp, "quoted.yml", PINNED_COMPOSE.replace("image: ", 'image: "').rstrip() + '"\n')
+        if run_checker(tmp).returncode != 0:
+            return "valid quoted digest refused"
+    return None
+
+
 def main() -> int:
     if not os.path.exists(CHECKER):
         print("selftest: FAIL — checker script not found at %s" % CHECKER)
         return 1
 
     cases = [
+        ("15 digest/exemption/syntax regressions", case_bypass_regressions),
         ("bare-tag image fails, names the file:line and the image", case_unpinned_fails),
         ("@sha256-pinned image passes", case_pinned_passes),
         ("recognised placeholder line passes", case_placeholder_passes),

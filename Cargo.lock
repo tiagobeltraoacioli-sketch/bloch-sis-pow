@@ -1493,6 +1493,7 @@ dependencies = [
  "bloch-euvm",
  "sha3 0.10.9",
  "thiserror 2.0.18",
+ "zeroize",
 ]
 
 [[package]]
@@ -1595,6 +1596,7 @@ dependencies = [
  "hex",
  "hkdf",
  "sha2 0.10.9",
+ "zeroize",
 ]
 
 [[package]]

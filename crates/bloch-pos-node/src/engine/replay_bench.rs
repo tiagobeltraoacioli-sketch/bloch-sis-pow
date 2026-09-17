@@ -652,7 +652,7 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
             .expect("loopback devnet transport"),
     );
     Engine {
-        genesis_validator_count: manifest.validators.len() as u32,
+        genesis_validator_indices: manifest.validators.iter().map(|v| v.index).collect(),
         state: StateCell::new(genesis_state),
         tr: Transition::new(verifier.clone()),
         tr_probe: Transition::new(ProbeVerifier),

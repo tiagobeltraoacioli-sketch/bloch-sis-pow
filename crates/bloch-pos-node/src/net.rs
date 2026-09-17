@@ -540,6 +540,9 @@ pub struct DevnetMesh {
     /// constant's doc for why an unbounded queue here was a memory leak
     /// waiting on a peer that never connects.
     peers: Vec<SyncSender<Vec<u8>>>,
+    /// Only live outbound connections participate in directed engine sync.
+    sync_outbound: Arc<Mutex<Vec<InboundPeer>>>,
+    sync_cursor: Mutex<usize>,
     /// Broadcast queues for connections we did NOT dial.
     ///
     /// **Why this exists.** The module header describes a full mesh in which
@@ -675,6 +678,22 @@ impl DevnetMesh {
     /// Broadcast one frame (type byte + payload, no length prefix) to every
     /// peer, dialed or dialing.
     pub fn broadcast(&self, frame: Vec<u8>) {
+        if frame.first() == Some(&FRAME_GET_BLOCKS) {
+            // NET-15: an engine gap request must not fetch one copy of the
+            // same history from every connection. Rotate across both directions
+            // so inbound-only peers and non-primary dialers remain reachable.
+            let mut candidates = Vec::new();
+            for registry in [&self.sync_outbound, &self.inbound] {
+                if let Ok(mut peers) = registry.lock() {
+                    peers.retain(InboundPeer::is_open);
+                    candidates.extend(peers.iter().map(|p| p.frames.clone()));
+                }
+            }
+            if let Ok(mut cursor) = self.sync_cursor.lock() {
+                send_sync_request(candidates, &mut cursor, frame);
+            }
+            return;
+        }
         // `try_send`, not `send` (R3 M-4 / R1 A3-M2): the queue is bounded now,
         // so a peer whose dialer is stuck (unreachable address, or reachable
         // but not draining fast enough) gets this frame DROPPED rather than
@@ -691,6 +710,24 @@ impl DevnetMesh {
         if let Ok(mut inbound) = self.inbound.lock() {
             inbound.retain(|p| p.is_open()
                 && !matches!(p.frames.try_send(frame.clone()), Err(TrySendError::Disconnected(_))));
+        }
+    }
+}
+
+/// Bound each engine-triggered request independently of the periodic dialer
+/// pump (which retains its own SYNC_FANOUT limit). Failed/full queues do not
+/// consume fanout, and the next request resumes after the last attempted peer.
+fn send_sync_request(mut peers: Vec<SyncSender<Vec<u8>>>, cursor: &mut usize, frame: Vec<u8>) {
+    if peers.is_empty() { return; }
+    let start = cursor.checked_rem(peers.len()).unwrap_or(0);
+    peers.rotate_left(start);
+    *cursor = start;
+    let mut sent = 0usize;
+    for peer in &peers {
+        *cursor = cursor.checked_add(1).and_then(|n| n.checked_rem(peers.len())).unwrap_or(0);
+        if peer.try_send(frame.clone()).is_ok() {
+            sent = sent.saturating_add(1);
+            if sent == SYNC_FANOUT { break; }
         }
     }
 }
@@ -1086,11 +1123,13 @@ pub fn start(
     // for history at any moment, however many peers are configured.
     let sync_slots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut peers = Vec::new();
+    let sync_outbound = Arc::new(Mutex::new(Vec::<InboundPeer>::new()));
     for addr in peer_addrs {
         // R3 M-4 / R1 A3-M2: bounded — see [`OUTBOUND_QUEUE_DEPTH`].
         let (tx, rx): (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) =
             mpsc::sync_channel(OUTBOUND_QUEUE_DEPTH);
-        peers.push(tx);
+        peers.push(tx.clone());
+        let sync_outbound = sync_outbound.clone();
         let events = events.clone();
         let head_slot = head_slot.clone();
         let sync_slots = sync_slots.clone();
@@ -1112,6 +1151,10 @@ pub fn start(
                 _counts: (ConnCount::new(&live), None),
                     _ip_permit: None,
             });
+            if let Ok(mut connected) = sync_outbound.lock() {
+                connected.retain(InboundPeer::is_open);
+                connected.push(InboundPeer { frames: tx.clone(), connection: Arc::downgrade(&connection) });
+            }
             let writer_half = ConnectionHalf(connection.clone());
             let reader_half = ConnectionHalf(connection);
             let mut wsock = sock;
@@ -1219,7 +1262,7 @@ pub fn start(
         });
     }
 
-    Ok(DevnetMesh { peers, inbound, live })
+    Ok(DevnetMesh { peers, sync_outbound, sync_cursor: Mutex::new(0), inbound, live })
 }
 
 #[cfg(test)]
@@ -1604,19 +1647,50 @@ mod tests {
             mpsc::sync_channel(OUTBOUND_QUEUE_DEPTH);
         let mesh = DevnetMesh {
             peers: vec![tx],
+            sync_outbound: Arc::new(Mutex::new(Vec::new())),
+            sync_cursor: Mutex::new(0),
             inbound: Arc::new(Mutex::new(Vec::new())),
             live: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         // Never drain `rx` — the stalled-dialer scenario — and broadcast well
         // past the bound.
-        for i in 0..(OUTBOUND_QUEUE_DEPTH + 50) {
-            mesh.broadcast(vec![i as u8]);
+        for _ in 0..(OUTBOUND_QUEUE_DEPTH + 50) {
+            mesh.broadcast(vec![FRAME_BLOCK]);
         }
         let queued = std::iter::from_fn(|| rx.try_recv().ok()).count();
         assert_eq!(
             queued, OUTBOUND_QUEUE_DEPTH,
             "the outbound queue must cap at OUTBOUND_QUEUE_DEPTH, not grow with every broadcast"
         );
+    }
+
+    #[test]
+    fn engine_sync_requests_are_bounded_and_rotate_past_full_queues() {
+        let (blocked, _blocked_rx) = mpsc::sync_channel(1);
+        blocked.try_send(vec![0]).unwrap();
+        let mut senders = vec![blocked];
+        let mut receivers = Vec::new();
+        for _ in 0..5 {
+            let (tx, rx) = mpsc::sync_channel(4);
+            senders.push(tx);
+            receivers.push(rx);
+        }
+        let mut cursor = 0;
+        let frame = get_blocks_frame(17);
+        let mut visited = std::collections::BTreeSet::new();
+        for _ in 0..3 {
+            send_sync_request(senders.clone(), &mut cursor, frame.clone());
+            let mut received = 0usize;
+            for (index, rx) in receivers.iter().enumerate() {
+                if let Ok(actual) = rx.try_recv() {
+                    assert_eq!(actual, frame);
+                    visited.insert(index);
+                    received = received.saturating_add(1);
+                }
+            }
+            assert_eq!(received, SYNC_FANOUT);
+        }
+        assert_eq!(visited.len(), receivers.len(), "every available peer gets a turn");
     }
 
     /// R3 M-4 / R1 A3-M2: the devnet listener accepts at most

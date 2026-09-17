@@ -23,6 +23,8 @@
 //! - the per-delegator ledgers: cumulative slashing losses and cumulative fee
 //!   rewards ([`TAG_DELEGATOR_SLASH_LOSS`], [`TAG_DELEGATOR_FEE_REWARD`]),
 //! - the taint set root (§4.1),
+//! - ADR-041 written-off supply, funded-validator membership, stake low-water
+//!   marks and RANDAO generations (tags `0x1B`–`0x1E`),
 //! - the cumulative issued supply — the hard-cap invariant's counter
 //!   ([`TAG_ISSUED_SUPPLY`], 2026-08-12),
 //! - the Coherence shielded-pool state: the accumulator root and the
@@ -30,7 +32,7 @@
 //!   ledger is not part of what gets finalized.
 //!
 //! The list is closed, and each extension carries the same argument. The
-//! 2026-08-12 fee-market pair is the latest: `TAG_BASE_FEE` because the next
+//! 2026-08-12 fee-market pair illustrates the rule: `TAG_BASE_FEE` because the next
 //! block's price is *derived from* it — a price kept in node-local execution
 //! bookkeeping is `expected_bits` with a different name — and
 //! `TAG_DELEGATOR_FEE_REWARD` because a withdrawal pays it out, so two nodes
@@ -66,10 +68,11 @@
 //! - [`state_root`] is a pure function of a [`ConsensusState`] the caller
 //!   passes in. There is no constructor that reads a database, a clock, or a
 //!   config file.
-//! - There is **no interior mutability and no global mutable state anywhere
-//!   in this module** — no `OnceLock`, no lazily-initialized table, nothing
-//!   that mutates behind a `&self`. Every value a caller can observe is
-//!   reached through a `&mut` it holds.
+//! - Consensus inputs are explicit. A bounded thread-local `RefCell` memo
+//!   caches singleton-subtree hashes by their full (key, value hash, depth)
+//!   input. Its hot/cold generations affect work and memory use, not roots:
+//!   a miss recomputes the same pure hash. Test-only thread-local counters
+//!   measure work. Neither is an authoritative consensus input.
 //! - The tree *does* keep each node's subtree hash beside that node, and
 //!   [`Smt::root`] reads it rather than recomputing. That is not the cache
 //!   §5.5 bans, and the distinction is exact: the banned thing is a cached
@@ -321,9 +324,8 @@ fn counting_node_hashes<T>(f: impl FnOnce() -> T) -> (T, u64) {
 /// an empty subtree whose top sits at depth `d`; `empty[TREE_DEPTH]` is the
 /// empty leaf slot.
 ///
-/// Still not a `OnceLock`: that is global mutable state, and §5.5 bans the
-/// *pattern*, not just the instances that have already bitten us. Each
-/// [`Smt`] computes this table once in its constructor and carries it as an
+/// Each [`Smt`] computes this fixed table once in its constructor and carries
+/// it as an
 /// ordinary field — eager, owned, no lazy initialisation, shared between
 /// clones by refcount because it is the same 257 constants in every tree that
 /// will ever exist. Recomputing it per mutation instead would cost 256 SHA3
@@ -3429,6 +3431,77 @@ mod tests {
             delegator_issuance_rewards: &f.issuance_rewards,
             current_proposed: &f.proposed,
         }
+    }
+
+    // SR-09: pin the existing ADR-041 encodings, including absence semantics.
+    // This tests commitment only; activation remains the transition's job.
+    #[test]
+    fn audit_adr041_leaf_encodings_and_zero_semantics() {
+        let f = fixture();
+        let base = state(&f);
+        let baseline = state_root(&base);
+        let mut populated = base.clone();
+        populated.written_off_sat = (1u128 << 120) + 7;
+        populated.funded_validators = &[0x01020304];
+        populated.stake_low_water = &[(0x05060708, (1u128 << 112) + 9)];
+        populated.randao_generations = &[(0x090a0b0c, 0x10203040)];
+        let mut expected = build_state_tree(&base);
+        expected.insert(derive_key(0x1b, &[]), hash_value(&populated.written_off_sat.to_le_bytes()));
+        expected.insert(derive_key(0x1e, &0x01020304u32.to_le_bytes()), hash_value(&[1]));
+        expected.insert(derive_key(0x1c, &0x05060708u32.to_le_bytes()), hash_value(&((1u128 << 112) + 9).to_le_bytes()));
+        expected.insert(derive_key(0x1d, &0x090a0b0cu32.to_le_bytes()), hash_value(&0x10203040u32.to_le_bytes()));
+        assert_eq!(state_root(&populated), expected.root());
+        let mut zero = base.clone();
+        zero.randao_generations = &[(7, 0)];
+        assert_eq!(state_root(&zero), baseline, "generation zero is absent");
+        zero.stake_low_water = &[(7, 0)];
+        assert_ne!(state_root(&zero), baseline, "a recorded zero floor is present");
+    }
+
+    #[test]
+    fn audit_adr041_every_key_and_value_is_load_bearing() {
+        let f = fixture();
+        let base = state(&f);
+        let mut roots = std::collections::BTreeSet::new();
+        assert!(roots.insert(state_root(&base)));
+        for amount in [1, 2, 1u128 << 120] {
+            let mut changed = base.clone();
+            changed.written_off_sat = amount;
+            assert!(roots.insert(state_root(&changed)), "written-off amount omitted or truncated");
+        }
+        for id in [1, 2, 1u32 << 24] {
+            let ids = [id];
+            let mut changed = base.clone();
+            changed.funded_validators = &ids;
+            assert!(roots.insert(state_root(&changed)), "funded-validator key omitted or truncated");
+            for floor in [0, 1, 1u128 << 120] {
+                let entries = [(id, floor)];
+                changed = base.clone();
+                changed.stake_low_water = &entries;
+                assert!(roots.insert(state_root(&changed)), "low-water key/value omitted or truncated");
+            }
+            for generation in [1, 2, 1u32 << 24] {
+                let entries = [(id, generation)];
+                changed = base.clone();
+                changed.randao_generations = &entries;
+                assert!(roots.insert(state_root(&changed)), "generation key/value omitted or truncated");
+            }
+        }
+    }
+
+    #[test]
+    fn audit_adr041_unique_entries_are_order_independent() {
+        let f = fixture();
+        let mut a = state(&f);
+        a.written_off_sat = 123;
+        a.funded_validators = &[1, 2, 3];
+        a.stake_low_water = &[(1, 0), (2, 123), (3, u128::MAX)];
+        a.randao_generations = &[(1, 0), (2, 1), (3, u32::MAX)];
+        let mut b = a.clone();
+        b.funded_validators = &[3, 2, 1];
+        b.stake_low_water = &[(3, u128::MAX), (2, 123), (1, 0)];
+        b.randao_generations = &[(3, u32::MAX), (2, 1), (1, 0)];
+        assert_eq!(state_root(&a), state_root(&b));
     }
 
     #[test]

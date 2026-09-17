@@ -142,6 +142,7 @@ impl HdWallet {
         testnet: bool,
         count: u32,
     ) -> Result<Self, String> {
+        if count > 4096 { return Err("recovery count exceeds 4096 addresses per request".into()); }
         let mnemonic = Mnemonic::parse(mnemonic_str)
             .map_err(|e| format!("invalid mnemonic: {}", e))?;
         let master_key = derive_master_key(&mnemonic.to_string(), passphrase.unwrap_or(""), password, WALLET_VERSION)?;
@@ -166,7 +167,8 @@ impl HdWallet {
 
     /// Add a new address to the wallet, DERIVED from the seed at the next index.
     pub fn new_address(&mut self, label: &str) -> Result<&Keypair, String> {
-        let next_index = self.addresses.iter().map(|(i, _, _)| *i).max().unwrap_or(0) + 1;
+        let next_index = self.addresses.iter().map(|(i, _, _)| *i).max().unwrap_or(0)
+            .checked_add(1).ok_or_else(|| "HD address index exhausted".to_string())?;
         let testnet = self.network == "testnet";
         let kp = derive_at(&self.seed, next_index, testnet)?;
         self.addresses.push((next_index, kp, label.to_string()));
@@ -200,11 +202,9 @@ impl HdWallet {
     /// Save encrypted wallet file.
     pub fn save(&self, path: &Path) -> Result<(), String> {
         // Encrypt mnemonic with master_key
-        let mnemonic_crypto = encrypt_with_key(
-            &self.master_key,
-            &serde_json::to_vec(&MnemonicPayload { mnemonic: self.mnemonic.to_string() })
-                .map_err(|e| e.to_string())?,
-        )?;
+        let mnemonic_bytes = Zeroizing::new(serde_json::to_vec(
+            &MnemonicPayload { mnemonic: self.mnemonic.to_string() }).map_err(|e| e.to_string())?);
+        let mnemonic_crypto = encrypt_with_key(&self.master_key, &mnemonic_bytes)?;
 
         // Encrypt each keypair with master_key
         let mut addresses = Vec::new();
@@ -213,7 +213,7 @@ impl HdWallet {
                 private_key_hex: hex::encode(&kp.private_key),
                 public_key_hex:  hex::encode(&kp.public_key),
             };
-            let bytes = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
+            let bytes = Zeroizing::new(serde_json::to_vec(&payload).map_err(|e| e.to_string())?);
             let crypto = encrypt_with_key(&self.master_key, &bytes)?;
             addresses.push(HdAddress {
                 index: *idx,
@@ -342,7 +342,7 @@ fn derive_at(seed: &[u8], index: u32, testnet: bool) -> Result<Keypair, String> 
 /// This is what locks/unlocks the wallet file.
 fn derive_master_key(mnemonic: &str, passphrase: &str, password: &str, version: u32) -> Result<Vec<u8>, String> {
     // Combine mnemonic + passphrase + password into the KDF input
-    let mut combined = Vec::with_capacity(mnemonic.len() + passphrase.len() + password.len() + 2);
+    let mut combined = Zeroizing::new(Vec::with_capacity(mnemonic.len() + passphrase.len() + password.len() + 2));
     combined.extend_from_slice(mnemonic.as_bytes());
     combined.push(0);
     combined.extend_from_slice(passphrase.as_bytes());
@@ -371,6 +371,7 @@ fn derive_master_key(mnemonic: &str, passphrase: &str, password: &str, version: 
 }
 
 fn encrypt_with_key(key: &[u8], plaintext: &[u8]) -> Result<KeystoreCrypto, String> {
+    if key.len() != 32 { return Err("AES-256 key must contain 32 bytes".into()); }
     let mut nonce_b = [0u8; 12];
     rand::rng().fill_bytes(&mut nonce_b);
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
@@ -390,6 +391,7 @@ fn encrypt_with_key(key: &[u8], plaintext: &[u8]) -> Result<KeystoreCrypto, Stri
 }
 
 fn decrypt_with_key(key: &[u8], crypto: &KeystoreCrypto) -> Result<Vec<u8>, String> {
+    if key.len() != 32 { return Err("AES-256 key must contain 32 bytes".into()); }
     let nonce_b = b64::STANDARD.decode(&crypto.nonce).map_err(|e| e.to_string())?;
     let ct = b64::STANDARD.decode(&crypto.ciphertext).map_err(|e| e.to_string())?;
     // SECURITY (A4 lows): `Nonce::from_slice` PANICS on any length other than
@@ -628,5 +630,60 @@ mod tests {
             created_at: chrono::Utc::now().to_rfc3339(),
             description: "test fixture".into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod audit_wallet_boundaries {
+    use super::*;
+    use crate::wallet::disclosure::{DisclosureBundle, DisclosureKeyConvention, keypair_at, keypair_at_with_convention};
+    use crate::address::Network;
+
+    #[test]
+    fn disclosure_explicit_hd_convention_matches_existing_funded_keys() {
+        let seed = [42;64];
+        for index in [0, 1, 7] {
+            let existing = derive_at(&seed, index, true).unwrap();
+            let (public, secret) = keypair_at_with_convention(&seed, index, DisclosureKeyConvention::HdWalletV3).unwrap();
+            let _secret = Zeroizing::new(secret);
+            assert_eq!(public, existing.public_key);
+            let (legacy, secret) = keypair_at(&seed, index).unwrap();
+            let _secret = Zeroizing::new(secret);
+            if index == 0 { assert_ne!(legacy, public); } else { assert_eq!(legacy, public); }
+        }
+        let bundle = DisclosureBundle::create_with_convention(&seed, &[0,1], Network::Testnet,
+            "audit", "auditor", DisclosureKeyConvention::HdWalletV3).unwrap();
+        assert!(bundle.verify().is_ok());
+        assert_eq!(bundle.entries[0].address, derive_at(&seed, 0, true).unwrap().address);
+        let legacy = DisclosureBundle::create(&seed, &[0], Network::Testnet, "audit", "auditor").unwrap();
+        assert_ne!(legacy.entries[0].address, bundle.entries[0].address);
+    }
+
+    #[test]
+    fn malformed_aes_keys_and_excessive_recovery_counts_are_refused() {
+        assert!(HdWallet::recover("not even a mnemonic", None, "password", true, u32::MAX)
+            .err().unwrap().contains("4096"));
+        let encrypted = encrypt_with_key(&[42;32], b"test").unwrap();
+        for length in [0, 1, 31, 33, 100] {
+            assert!(encrypt_with_key(&vec![42;length], b"test").is_err());
+            assert!(decrypt_with_key(&vec![42;length], &encrypted).is_err());
+        }
+        for index in [0,1] {
+            assert!(keypair_at_with_convention(&[1;31], index, DisclosureKeyConvention::HdWalletV3).is_err());
+        }
+    }
+
+    #[test]
+    fn exhausted_address_index_returns_error_without_rotating_keys() {
+        let mnemonic = Mnemonic::from_entropy(&[42;32]).unwrap();
+        let seed = mnemonic.to_seed("").to_vec();
+        let key = derive_at(&seed, u32::MAX, true).unwrap();
+        let address = key.address.clone();
+        let mut wallet = HdWallet { mnemonic, master_key:vec![0;32], seed,
+            addresses:vec![(u32::MAX,key,"last".into())], imported:BTreeSet::new(),
+            network:"testnet".into(), file_version:WALLET_VERSION };
+        assert!(wallet.new_address("overflow").err().unwrap().contains("exhausted"));
+        assert_eq!(wallet.addresses.len(), 1);
+        assert_eq!(wallet.addresses[0].1.address, address);
     }
 }

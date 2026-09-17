@@ -56,11 +56,13 @@
 //! UNAUDITED until the independent third-party review (S2 / Coherence P2).
 //! Ship the tool; do not market the claim as audited.
 //!
-//! # Index convention (matches the P4.1 `Wallet::address_at` deliverable)
+//! # Default index convention (P4.1 single-key `Wallet`)
 //!
 //! index 0  == the wallet's BASE keypair (`generate_keypair_from_seed(seed[..32])`,
 //!             i.e. today's `Wallet::from_seed` address) — back-compat.
 //! index N>0 == `crypto::diversified_keypair(master_seed, N)`.
+//! HD wallet v3 instead diversifies index zero too; use
+//! `DisclosureBundle::create_with_convention` with `HdWalletV3` for that family.
 
 use crate::address::{Address, Network};
 use crate::crypto;
@@ -154,10 +156,19 @@ pub enum DisclosureError {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Derivation helper (index convention shared with P4.1)
+// Derivation helper (historical P4.1 default plus explicit HD family)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Keypair at `index` under the shared wallet convention:
+/// Existing wallet families deliberately retain different index-zero keys.
+/// Select the family explicitly when disclosing HD v3 addresses; this does not
+/// change either wallet's derivation or the signed bundle format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisclosureKeyConvention {
+    SingleKeyWallet,
+    HdWalletV3,
+}
+
+/// Keypair at `index` under the historical single-key wallet convention:
 /// 0 = base keypair (`seed[..32]`, i.e. `Wallet::from_seed`); N>0 = diversified.
 ///
 /// `master_seed` is the 64-byte BIP39 seed (`SeedPhrase::to_seed_bytes()`);
@@ -165,7 +176,16 @@ pub enum DisclosureError {
 pub fn keypair_at(master_seed: &[u8], index: u32)
     -> Result<(Vec<u8>, Vec<u8>), crypto::CryptoError>
 {
-    if index == 0 {
+    keypair_at_with_convention(master_seed, index, DisclosureKeyConvention::SingleKeyWallet)
+}
+
+pub fn keypair_at_with_convention(master_seed: &[u8], index: u32, convention: DisclosureKeyConvention)
+    -> Result<(Vec<u8>, Vec<u8>), crypto::CryptoError>
+{
+    if master_seed.len() < 32 {
+        return Err(crypto::CryptoError::InvalidKey("master seed too short (need >= 32 bytes)".into()));
+    }
+    if index == 0 && convention == DisclosureKeyConvention::SingleKeyWallet {
         crypto::generate_keypair_from_seed(&master_seed[..32.min(master_seed.len())])
     } else {
         crypto::diversified_keypair(master_seed, index)
@@ -221,6 +241,17 @@ impl DisclosureBundle {
         purpose: &str,
         audience: &str,
     ) -> Result<Self, DisclosureError> {
+        Self::create_with_convention(master_seed, indices, network, purpose, audience,
+            DisclosureKeyConvention::SingleKeyWallet)
+    }
+
+    /// Explicit wallet-family selection. HD v3 uses diversified derivation even
+    /// at zero. Verification proves control of the included addresses, not the
+    /// derivation convention or common-seed origin; the wire format is unchanged.
+    pub fn create_with_convention(
+        master_seed: &[u8], indices: &[u32], network: Network, purpose: &str,
+        audience: &str, convention: DisclosureKeyConvention,
+    ) -> Result<Self, DisclosureError> {
         if master_seed.len() < 32 {
             return Err(DisclosureError::Crypto("master seed too short (need >= 32 bytes)".into()));
         }
@@ -242,7 +273,7 @@ impl DisclosureBundle {
         // path still wipes them).
         let mut keyed: Vec<(u32, Vec<u8>, Zeroizing<Vec<u8>>)> = Vec::with_capacity(sorted.len());
         for &index in &sorted {
-            let (pk, sk) = keypair_at(master_seed, index)
+            let (pk, sk) = keypair_at_with_convention(master_seed, index, convention)
                 .map_err(|e| DisclosureError::Crypto(e.to_string()))?;
             keyed.push((index, pk, Zeroizing::new(sk)));
         }

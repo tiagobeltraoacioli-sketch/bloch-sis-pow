@@ -1066,10 +1066,10 @@ struct Loop {
     events: EngineSender<NetEvent>,
     data_dir: PathBuf,
     head_slot: Arc<AtomicU64>,
-    /// Highest block slot each peer has been seen forwarding. A relayer holds
-    /// what it relays, so this is a sound (if conservative) hint for choosing
-    /// who to ask for missing blocks.
+    /// Unvalidated height hints from decoded envelopes; never proof that a
+    /// peer holds an acceptable chain. One sync slot ignores these claims.
     peer_head: HashMap<PeerId, u64>,
+    sync_rotation: usize,
     /// Blocks published or received within [`REGOSSIP_SUPPRESS_TTL`]. Pruned
     /// on insert, so it stays bounded by the TTL and not by uptime.
     recent_blocks: HashMap<[u8; 32], Instant>,
@@ -1206,6 +1206,7 @@ async fn run_swarm(
         data_dir: cfg.data_dir.clone(),
         head_slot,
         peer_head: HashMap::new(),
+        sync_rotation: 0,
         recent_blocks: HashMap::new(),
         chase: HashMap::new(),
         dialed: HashMap::new(),
@@ -1371,24 +1372,27 @@ fn publish(swarm: &mut Swarm, topic: IdentTopic, data: Vec<u8>, name: &str) {
     }
 }
 
-/// Direct a `get-blocks` at the peers most likely to hold what we are missing.
-///
-/// Not a broadcast: the Genesis-3 root cause was exactly that, and it produced
-/// O(peers × blocks) amplification that stalled the chain. Not a single peer
-/// either — a silent one would stall recovery — so [`SYNC_FANOUT`] peers,
-/// preferring the highest observed head.
-fn request_blocks(swarm: &mut Swarm, st: &Loop, after_slot: u64) {
-    let mut peers: Vec<PeerId> = swarm.connected_peers().copied().collect();
-    if peers.is_empty() {
-        return;
-    }
-    peers.sort_by_key(|p| {
-        // Descending by observed head, then by PeerId so ties are stable and
-        // the choice is not a function of HashMap iteration order.
-        (std::cmp::Reverse(st.peer_head.get(p).copied().unwrap_or(0)), p.to_bytes())
-    });
+/// Reserve one existing fanout slot for exploration independent of untrusted
+/// height claims. A stable set of high-claiming peers cannot monopolize sync.
+fn sync_targets(mut peers: Vec<PeerId>, heads: &HashMap<PeerId, u64>, rotation: &mut usize) -> Vec<PeerId> {
+    if peers.is_empty() { return peers; }
+    peers.sort_by_key(|p| p.to_bytes());
+    let at = rotation.checked_rem(peers.len()).unwrap_or(0);
+    let Some(explore) = peers.get(at).copied() else { return Vec::new() };
+    *rotation = at.checked_add(1).and_then(|n| n.checked_rem(peers.len())).unwrap_or(0);
+    peers.retain(|p| *p != explore);
+    peers.sort_by_key(|p| (std::cmp::Reverse(heads.get(p).copied().unwrap_or(0)), p.to_bytes()));
+    peers.truncate(SYNC_FANOUT.saturating_sub(1));
+    peers.push(explore);
+    peers
+}
+
+/// Keep bounded directed sync while giving every stable connected peer a turn.
+/// Height preference remains a heuristic, not a validated statement of state.
+fn request_blocks(swarm: &mut Swarm, st: &mut Loop, after_slot: u64) {
+    let peers = sync_targets(swarm.connected_peers().copied().collect(), &st.peer_head, &mut st.sync_rotation);
     let req = SyncRequest::GetBlocks { after_slot, limit: MAX_SYNC_BLOCKS as u32 };
-    for p in peers.into_iter().take(SYNC_FANOUT) {
+    for p in peers {
         swarm.behaviour_mut().sync.send_request(&p, req.clone());
     }
 }
@@ -1964,6 +1968,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sync_exploration_cannot_be_steered_out_by_forged_heights() {
+        let peers: Vec<_> = (0..8).map(|_| PeerId::random()).collect();
+        let heads: HashMap<_, _> = peers.iter().take(SYNC_FANOUT).map(|p| (*p, u64::MAX)).collect();
+        let mut rotation = 0;
+        let mut reached = std::collections::HashSet::new();
+        for _ in 0..peers.len() {
+            let selected = sync_targets(peers.clone(), &heads, &mut rotation);
+            assert_eq!(selected.len(), SYNC_FANOUT);
+            let unique: std::collections::HashSet<_> = selected.iter().copied().collect();
+            assert_eq!(unique.len(), selected.len());
+            reached.extend(selected);
+        }
+        assert_eq!(reached.len(), peers.len(), "unclaimed peers must get requests despite maximum forged claims");
+        let one = sync_targets(vec![peers[0]], &heads, &mut rotation);
+        assert_eq!(one, vec![peers[0]]);
+        assert!(sync_targets(Vec::new(), &heads, &mut rotation).is_empty());
+    }
+
     /// A `Loop` with no swarm attached — every field is a plain value or a
     /// channel, so the per-peer bookkeeping (`may_chase_page`, `note_dialed`,
     /// `forget_peer`) is testable without a real libp2p transport.
@@ -1974,6 +1997,7 @@ mod tests {
             data_dir: PathBuf::from("/tmp/bloch-p2p-test"),
             head_slot: Arc::new(AtomicU64::new(0)),
             peer_head: HashMap::new(),
+            sync_rotation: 0,
             recent_blocks: HashMap::new(),
             chase: HashMap::new(),
             dialed: HashMap::new(),

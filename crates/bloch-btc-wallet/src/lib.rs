@@ -21,7 +21,8 @@
 #![forbid(unsafe_code)]
 
 use bitcoin::bip32::{DerivationPath, Xpriv};
-use bitcoin::key::{CompressedPublicKey, TapTweak};
+use bitcoin::key::CompressedPublicKey;
+use zeroize::Zeroizing;
 use bitcoin::secp256k1::Secp256k1;
 use bitcoin::{Address, KnownHrp, NetworkKind};
 use std::str::FromStr;
@@ -174,9 +175,11 @@ pub fn derive_identity_versioned(
     let (btc_pubkey, btc_p2wpkh, _) = derive_btc(seed, &format!("m/84'/{coin}/0'/0/0"), mainnet)?;
     let (_, _, btc_p2tr) = derive_btc(seed, &format!("m/86'/{coin}/0'/0/0"), mainnet)?;
 
-    let pq_seed_bytes = pq_seed(seed, pq_kdf);
-    let (pq_pubkey, _pq_secret) = bloch_crypto::crypto::generate_keypair_from_seed(&pq_seed_bytes)
+    let pq_seed_bytes = Zeroizing::new(pq_seed(seed, pq_kdf));
+    let (pq_pubkey, pq_secret) = bloch_crypto::crypto::generate_keypair_from_seed(&pq_seed_bytes[..])
         .map_err(|e| IdentityError::PqKeygen(e.to_string()))?;
+    let _pq_secret = Zeroizing::new(pq_secret);
+
     let net = if mainnet {
         bloch_crypto::address::Network::Mainnet
     } else {

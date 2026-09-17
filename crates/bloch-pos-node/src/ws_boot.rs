@@ -590,13 +590,12 @@ pub fn load_latest(
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
+    let bad = boot_refused;
     let cp = decode_checkpoint(&bytes)
         .map_err(|e| bad(format!("{}: {e}", path.display())))?;
     if cp.network_id != network_id || &cp.genesis_root != genesis_root {
         return Err(bad(format!(
-            "{} belongs to a different network; refusing (delete it yourself if that is \
-             really what you want)",
+            "{} belongs to a different network; refusing. Verify the data directory and checkpoint trust configuration before recovery",
             path.display()
         )));
     }
@@ -689,7 +688,7 @@ pub fn boot(
     // 2. Operator-supplied envelope (§4.1 precedence, source 1).
     let mut published: Option<WeakSubjectivityCheckpoint> = None;
     if let Some(path) = &cfg.checkpoint {
-        let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
+        let bad = boot_refused;
         let env = decode_envelope_file(&fs::read(path)?)
             .map_err(|e| bad(format!("{}: {e}", path.display())))?;
         let Some(set_path) = &cfg.signer_set else {
@@ -1574,6 +1573,25 @@ mod tests {
     // -- boot orchestration -------------------------------------------------
 
     #[test]
+    fn audit_malformed_ws_artifacts_are_typed_but_raw_io_errors_are_not() {
+        let dir = tmpdir("operator-errors");
+        let path = dir.join("checkpoint.bin");
+        let config = WsConfig { checkpoint: Some(path.clone()), signer_set: None };
+        let attempt = || boot(&config, &dir, NET, &GEN, &genesis_anchor(), 0, false, (0, GEN), |_| None, |_| false);
+        let missing = attempt().err().unwrap();
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+        assert!(!is_non_retryable(&missing));
+        fs::write(&path, b"malformed").unwrap();
+        assert!(is_non_retryable(&attempt().err().unwrap()));
+        fs::write(&path, encode_envelope_file(&CheckpointEnvelope { checkpoint: checkpoint(0), signatures: vec![] })).unwrap();
+        let absent_arrangement = attempt().err().unwrap();
+        assert!(is_non_retryable(&absent_arrangement));
+        assert!(absent_arrangement.to_string().contains("no signer arrangement"));
+        fs::write(dir.join(WS_LATEST_FILE), b"malformed").unwrap();
+        assert!(is_non_retryable(&load_latest(&dir, NET, &GEN).unwrap_err()));
+    }
+
+    #[test]
     fn fresh_node_boots_under_fresh_genesis_anchor_and_persists_it() {
         let dir = tmpdir("fresh");
         let out = boot(
@@ -1748,6 +1766,7 @@ mod tests {
             300, false, (0, GEN), |_| None, |_| false,
         )
         .expect_err("boot must refuse an arrangement adopted after the checkpoint");
+        assert!(is_non_retryable(&err));
         let msg = err.to_string();
         assert!(msg.contains("outside arrangement"), "{msg}");
         assert!(msg.contains(&far.to_string()), "the message must name the adoption epoch: {msg}");
@@ -1903,6 +1922,7 @@ mod tests {
         )
         .err()
         .expect("a 1-of-1 signer set must not become a root of trust");
+        assert!(is_non_retryable(&err));
         let msg = err.to_string();
         assert!(msg.contains("REFUSED") && msg.contains("Phase A") && msg.contains("Phase B"), "{msg}");
         // Nothing was adopted.

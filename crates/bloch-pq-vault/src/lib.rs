@@ -68,6 +68,7 @@ use bitcoin::bip32::{DerivationPath, Xpriv};
 use bitcoin::secp256k1::{Secp256k1, SecretKey};
 use bitcoin::{Address, NetworkKind, PublicKey};
 use std::str::FromStr;
+use zeroize::{Zeroize, Zeroizing};
 
 /// A4-M-5: which BIP-32 branch derives a vault's `hot`/`recovery` keys.
 ///
@@ -126,6 +127,20 @@ pub struct VaultKeys {
     pub key_derivation: VaultKeyDerivation,
 }
 
+// Wipe the owned PQ allocation, including every explicitly cloned instance.
+// SecretKey is Copy: the library's erase is best effort and cannot wipe copies
+// already held by callers, registers or third-party key-generation internals.
+impl Zeroize for VaultKeys {
+    fn zeroize(&mut self) {
+        self.pq_secret.zeroize();
+        self.hot_sk.non_secure_erase();
+        self.recovery_sk.non_secure_erase();
+    }
+}
+impl Drop for VaultKeys {
+    fn drop(&mut self) { self.zeroize(); }
+}
+
 /// Derive [`VaultKeys`] from a seed under [`VaultKeyDerivation::V1SharedReceiveChain`]
 /// (the historical, UNVERSIONED derivation — BTC hot key at BIP-84 index 0,
 /// recovery at index 1, both on the wallet's ordinary receive chain). The PQ
@@ -137,28 +152,37 @@ pub struct VaultKeys {
 /// compatibility with existing callers and vaults built under it — see
 /// [`derive_vault_keys_v3`] for hardened role separation for new vaults.
 pub fn derive_vault_keys(seed: &[u8], mainnet: bool) -> VaultKeys {
+    derive_vault_keys_versioned(seed, mainnet, VaultKeyDerivation::V1SharedReceiveChain)
+        .expect("valid legacy vault seed")
+}
+
+/// Fallible restoration entry point. The stored derivation version is mandatory:
+/// never guess a different family when restoring an existing funded vault.
+/// V1/V2/V3 valid inputs retain their existing key bytes and derivation domains.
+pub fn derive_vault_keys_versioned(seed: &[u8], mainnet: bool, version: VaultKeyDerivation) -> Result<VaultKeys, String> {
+    match version {
+        VaultKeyDerivation::V2DedicatedHardenedBranch => return derive_vault_keys_v2(seed, mainnet),
+        VaultKeyDerivation::V3HardenedRoles => return derive_vault_keys_v3(seed, mainnet),
+        VaultKeyDerivation::V1SharedReceiveChain => {}
+    }
+    if seed.len() < 32 { return Err("legacy vault seed must contain at least 32 bytes".into()); }
     let secp = Secp256k1::new();
     let net = if mainnet { NetworkKind::Main } else { NetworkKind::Test };
     let coin = if mainnet { "0'" } else { "1'" };
-    let master = Xpriv::new_master(net, seed).expect("valid master seed");
-
-    let derive = |idx: u32| -> (SecretKey, PublicKey) {
-        let path = DerivationPath::from_str(&format!("m/84'/{coin}/0'/0/{idx}")).expect("path");
-        let xpriv = master.derive_priv(&secp, &path).expect("derive");
+    let master = Xpriv::new_master(net, seed).map_err(|e| format!("bip32 master: {e}"))?;
+    let derive = |idx: u32| -> Result<(SecretKey, PublicKey), String> {
+        let path = DerivationPath::from_str(&format!("m/84'/{coin}/0'/0/{idx}"))
+            .map_err(|e| format!("bip32 path: {e}"))?;
+        let xpriv = master.derive_priv(&secp, &path).map_err(|e| format!("bip32 derive: {e}"))?;
         let sk = xpriv.private_key;
-        let pk = PublicKey::new(sk.public_key(&secp));
-        (sk, pk)
+        Ok((sk, PublicKey::new(sk.public_key(&secp))))
     };
-    let (hot_sk, hot_pubkey) = derive(0);
-    let (recovery_sk, recovery_pubkey) = derive(1);
-
-    let (pq_pubkey, pq_secret) =
-        bloch_crypto::crypto::generate_keypair_from_seed(seed).expect("pq keygen from seed");
-
-    VaultKeys {
-        hot_sk, hot_pubkey, recovery_sk, recovery_pubkey, pq_pubkey, pq_secret,
-        key_derivation: VaultKeyDerivation::V1SharedReceiveChain,
-    }
+    let (hot_sk, hot_pubkey) = derive(0)?;
+    let (recovery_sk, recovery_pubkey) = derive(1)?;
+    let (pq_pubkey, pq_secret) = bloch_crypto::crypto::generate_keypair_from_seed(seed)
+        .map_err(|e| format!("pq keygen: {e}"))?;
+    Ok(VaultKeys { hot_sk, hot_pubkey, recovery_sk, recovery_pubkey, pq_pubkey, pq_secret,
+        key_derivation: VaultKeyDerivation::V1SharedReceiveChain })
 }
 
 /// A4-M-5 fix: derive [`VaultKeys`] on a DEDICATED hardened branch
@@ -204,9 +228,9 @@ pub fn derive_vault_keys_v2(seed: &[u8], mainnet: bool) -> Result<VaultKeys, Str
     // identity helper), and the vault needs the secret key too. Sharing
     // `pq_seed_for` (rather than re-hashing the domain tag here) keeps this
     // byte-for-byte identical to `derive_identity_versioned`'s PQ pubkey.
-    let pq_seed = bloch_btc_wallet::pq_seed_for(seed, bloch_btc_wallet::PqSeedKdf::V2DomainSeparated)
-        .ok_or_else(|| format!("seed too short: {} bytes (need at least {})", seed.len(), MIN_SEED_LEN))?;
-    let (pq_pubkey, pq_secret) = bloch_crypto::crypto::generate_keypair_from_seed(&pq_seed)
+    let pq_seed = Zeroizing::new(bloch_btc_wallet::pq_seed_for(seed, bloch_btc_wallet::PqSeedKdf::V2DomainSeparated)
+        .ok_or_else(|| format!("seed too short: {} bytes (need at least {})", seed.len(), MIN_SEED_LEN))?);
+    let (pq_pubkey, pq_secret) = bloch_crypto::crypto::generate_keypair_from_seed(&pq_seed[..])
         .map_err(|e| format!("pq keygen: {e}"))?;
 
     Ok(VaultKeys {
@@ -242,8 +266,8 @@ pub fn derive_vault_keys_v3(seed: &[u8], mainnet: bool) -> Result<VaultKeys, Str
     hash.update(b"BLOCH-PQ-VAULT-V3-PQ-KEY");
     hash.update([u8::from(mainnet)]);
     hash.update(seed);
-    let pq_seed = hash.finalize();
-    let (pq_pubkey, pq_secret) = bloch_crypto::crypto::generate_keypair_from_seed(&pq_seed)
+    let pq_seed = Zeroizing::new(<[u8; 32]>::from(hash.finalize()));
+    let (pq_pubkey, pq_secret) = bloch_crypto::crypto::generate_keypair_from_seed(&pq_seed[..])
         .map_err(|e| format!("pq keygen: {e}"))?;
     Ok(VaultKeys { hot_sk, hot_pubkey, recovery_sk, recovery_pubkey, pq_pubkey, pq_secret,
         key_derivation: VaultKeyDerivation::V3HardenedRoles })
@@ -661,6 +685,47 @@ mod audit_hardened_roles {
     fn v3_refuses_invalid_seed_lengths() {
         for len in [0, 1, 31, 65, 4096] {
             assert!(derive_vault_keys_v3(&vec![42; len], false).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod audit_secret_ownership {
+    use super::*;
+    #[test]
+    fn explicit_wipe_clears_owned_pq_storage_without_changing_public_identity() {
+        let mut keys = derive_vault_keys_v3(&[42;32], false).unwrap();
+        let public = keys.pq_pubkey.clone();
+        let cloned = keys.clone();
+        assert!(!keys.pq_secret.is_empty());
+        keys.zeroize();
+        assert!(keys.pq_secret.is_empty());
+        assert_eq!(keys.pq_pubkey, public);
+        assert!(!cloned.pq_secret.is_empty(), "an independent clone owns its own allocation");
+        // Both objects run the same wiping path on drop. This test deliberately
+        // does not read freed memory or claim to inspect compiler-created copies.
+    }
+}
+
+#[cfg(test)]
+mod audit_versioned_restore {
+    use super::*;
+    #[test]
+    fn explicit_restore_preserves_each_existing_derivation_and_refuses_short_seeds() {
+        let seed = [42;32];
+        for (version, original) in [
+            (VaultKeyDerivation::V1SharedReceiveChain, derive_vault_keys(&seed, false)),
+            (VaultKeyDerivation::V2DedicatedHardenedBranch, derive_vault_keys_v2(&seed, false).unwrap()),
+            (VaultKeyDerivation::V3HardenedRoles, derive_vault_keys_v3(&seed, false).unwrap()),
+        ] {
+            let restored = derive_vault_keys_versioned(&seed, false, version).unwrap();
+            assert_eq!(restored.hot_sk, original.hot_sk);
+            assert_eq!(restored.recovery_sk, original.recovery_sk);
+            assert_eq!(restored.pq_pubkey, original.pq_pubkey);
+            assert_eq!(restored.pq_secret, original.pq_secret);
+            for len in [0,1,31] {
+                assert!(derive_vault_keys_versioned(&vec![42;len], false, version).is_err());
+            }
         }
     }
 }
