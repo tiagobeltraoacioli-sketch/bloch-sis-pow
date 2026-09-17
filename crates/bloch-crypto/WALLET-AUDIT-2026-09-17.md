@@ -96,3 +96,57 @@ the same owned-buffer cleanup as success. Existing wrong-password and public-key
 network AAD tampering regressions exercise these error paths. This does not prove
 absence of compiler copies or erasure of AES dependency-internal expanded keys.
 Ciphertexts, KDF parameters, AAD and funded key derivations are unchanged.
+
+## Transaction-builder hostile inputs (CR-07, partial)
+
+The CLI's legacy `TxBuilder` rejects transaction IDs whose decoded length is not
+exactly 32 bytes; the previous copy panicked for short IDs and silently truncated
+long ones. It checks selected-value addition, requires a 20-byte destination hash,
+and refuses duplicate outpoints before signing. The current `Wallet::build_tx`
+also refuses duplicate outpoints. Distinct output indices of one transaction
+remain valid inputs. Regressions cover every refusal and successful distinct-index
+selection. These checks do not authenticate RPC UTXOs, establish key ownership or
+replace node validation. Existing valid transaction encoding/signing is unchanged.
+
+## Optional network client and standalone CLI input checks
+
+With the `node` feature, balance aggregation now refuses `u64` overflow and RPC
+output indices must fit `u32`; larger indices cannot silently identify a different
+outpoint. The `wallet-cli` parser refuses any malformed UTXO row instead of silently
+filtering it, checks amount-plus-fee addition, and verifies the recipient network
+before converting its address to an untagged hash. CLI amounts now use
+exact decimal input without floating point. Negative/nonfinite/out-of-range values,
+more than eight fractional digits, exponent notation and zero-satoshi payments
+are refused; zero fees remain accepted. These validations do not authenticate RPC
+state, alter chain IDs or modify valid transaction/signature formats.
+
+The retained Genesis-3 `bloch-cli` send caller receives the same checked index,
+complete-row, aggregate-value and network validation. It now shares exact decimal parsing with the standalone wallet rather than
+truncating a floating-point value; ambiguous sub-satoshi or exponent input is
+explicitly rejected. Unit tests compile and exercise that legacy binary directly; this does
+not modify Genesis-3 consensus or republish a retired node.
+
+## Exact CLI amount compatibility
+
+Both CLI entry points retain their existing fee defaults but parse original
+amount/fee tokens as decimal strings with at most eight fractional digits.
+`90071992.54740993` now represents exactly `9007199254740993` satoshis, beyond
+floating-point integer precision. `184467440737.09551615` reaches `u64::MAX`
+exactly; one more satoshi is refused. Signed/exponent notation and more than eight
+fractional digits are no longer accepted or rounded/truncated. Supply ordinary
+decimal notation instead. This is an input-syntax tightening, not a transaction,
+consensus, key or address-format change.
+
+## HTTP response budgets and peer error redaction
+
+The optional `WalletClient` retains its 30-second request timeout and now limits
+successful response bodies to 64 MiB. It rejects oversized advertised lengths and
+counts actual chunks before appending them, including responses without a length.
+The buffer grows with received data instead of allocating the full budget up front.
+This bounds input bytes, not all transport or parsed JSON allocations. Responses
+above the cap are refused; callers with large accounts need bounded RPC queries.
+HTTP failures report status only, without downloading or echoing the peer body.
+JSON-RPC failures retain a numeric code but omit arbitrary peer message/data fields.
+Successful result schemas and transaction formats remain unchanged. Loopback HTTP
+regressions exercise chunked over-limit/exact-limit reads, advertised oversize, and
+both HTTP and JSON-RPC error redaction.

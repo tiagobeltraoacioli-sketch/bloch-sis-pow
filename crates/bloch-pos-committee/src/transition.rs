@@ -1402,6 +1402,27 @@ pub fn reset_eutxo_entry_visits() {
 #[doc(hidden)]
 pub static BOUNDARY_VOTE_DROPS: AtomicU64 = AtomicU64::new(0);
 
+/// Observability only: rejected epoch feeds retain the historical no-op
+/// finality behavior. This process-wide counter is not committed state.
+#[doc(hidden)]
+pub static FINALITY_EPOCH_ORDER_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+fn report_finality_order_failure(error: finality::FinalityError) {
+    use std::io::Write;
+    let previous = FINALITY_EPOCH_ORDER_FAILURES.fetch_update(
+        Ordering::Relaxed, Ordering::Relaxed,
+        |current| Some(current.saturating_add(1)),
+    ).unwrap_or_else(|current| current);
+    let count = previous.saturating_add(1);
+    if count <= 8 || count.is_power_of_two() {
+        let finality::FinalityError::OutOfOrderEpoch { got, expected } = error;
+        // A broken stderr must not change block processing or trigger a panic.
+        let _ = writeln!(std::io::stderr().lock(),
+            "BLOCH-CONSENSUS-DIVERGENCE finality_epoch_order got={got} expected={expected} occurrences={count} action=preserve_existing_finality_noop");
+    }
+}
+
+
 /// Record and report one boundary-partition divergence. **Never panics, never
 /// touches consensus state, and never changes the returned post-state.**
 ///
@@ -4915,8 +4936,8 @@ impl CommittedState {
             // epoch a slash lands in — freezing the epoch's roster at its
             // first slot without needing a flag day, since the write is
             // reachable only behind `SLASHING_EVIDENCE_ACTIVATION_EPOCH`
-            // (still `u64::MAX`) and therefore replays every historical block
-            // unchanged. This guard stays anyway, downgraded to
+            // (currently 2884), preserving pre-activation block semantics.
+            // This guard stays anyway, downgraded to
             // defense-in-depth for a class of bug this crate has already paid
             // for once, per `report_boundary_vote_drop`'s updated docs; the
             // mutation that proves it can still fail is
@@ -4934,10 +4955,12 @@ impl CommittedState {
                 "boundary partition dropped votes that the inclusion check at step 8 admitted - \
                  the two filters have diverged (or a mid-epoch slash moved the roster)"
             );
-            // Out-of-order is unreachable: this is the only call site and it
-            // feeds epochs densely by construction. A total no-op on Err
-            // beats a panic in a consensus path.
-            let _ = st.finality_engine.process_epoch(&epoch_votes);
+            // Preserve the existing no-op on a rejected epoch feed. Expose a
+            // desynchronized cursor without resetting it, rejecting a block,
+            // or introducing a panic into this consensus path.
+            if let Err(error) = st.finality_engine.process_epoch(&epoch_votes) {
+                report_finality_order_failure(error);
+            }
         }
 
         // 2. Rewards for the closed epoch (rewards.rs). Issuance follows the
@@ -16059,3 +16082,31 @@ mod epoch_advance_bound {
 
 #[cfg(feature = "local-state-cache")]
 mod local_cache;
+
+
+#[cfg(test)]
+mod finality_order_observability {
+    use super::*;
+
+    #[test]
+    fn desynchronized_epoch_is_observable_without_reset_or_transition_refusal() {
+        let (_, genesis, _) = super::tests::setup(8);
+        let mut state = genesis.close_epoch();
+        // Actual finality expects epoch1; simulate a corrupted synthetic cursor.
+        state.epoch = 3;
+        let finality_before = state.finality_engine.clone();
+        let count_before = FINALITY_EPOCH_ORDER_FAILURES.load(Ordering::Relaxed);
+        let after = state.close_epoch();
+        assert!(FINALITY_EPOCH_ORDER_FAILURES.load(Ordering::Relaxed) > count_before);
+        assert_eq!(after.finality_engine, finality_before);
+        assert_eq!(after.epoch, 4, "the surrounding transition retains its historical behavior");
+        assert!(after.issued_sat >= state.issued_sat);
+        // A second boundary still diagnoses the cursor gap rather than hiding
+        // it by silently resetting finality or pretending processing succeeded.
+        let count_again = FINALITY_EPOCH_ORDER_FAILURES.load(Ordering::Relaxed);
+        let next = after.close_epoch();
+        assert!(FINALITY_EPOCH_ORDER_FAILURES.load(Ordering::Relaxed) > count_again);
+        assert_eq!(next.finality_engine, finality_before);
+        assert_eq!(next.epoch, 5);
+    }
+}

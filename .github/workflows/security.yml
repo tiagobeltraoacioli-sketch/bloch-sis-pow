@@ -180,6 +180,9 @@ jobs:
             --lockfile=pool-proxy/Cargo.lock
             --lockfile=services/pq-shield-api/Cargo.lock
             --lockfile=euvm-tooling/Cargo.lock
+            --lockfile=crates/coherence-prover/script/Cargo.lock
+            --lockfile=crates/coherence-prover/service/Cargo.lock
+            --lockfile=crates/coherence-prover/program/Cargo.lock
             --lockfile=fuzz/Cargo.lock
             --lockfile=spikes/prover-cost/Cargo.lock
             --lockfile=spikes/prover-cost/rv32/Cargo.lock
@@ -195,8 +198,8 @@ jobs:
   # Runs the SAME command as .gitlab-ci.yml through the same pinned installer,
   # rather than gitleaks-action: this file claims to mirror the GitLab security
   # stage, and two scanners with different scopes and different configs do not
-  # mirror each other. `--no-git` scans the working tree — the scope, and the
-  # 55-finding history backlog it excludes, are written out in .gitleaks.toml.
+  # mirror each other. Tree and full-history scans have separate, reviewed
+  # redacted baselines; see docs/audit/internal-remediation-2026-09-17/HISTORY-SCAN.md.
   secret-scan:
     name: gitleaks (blocking)
     runs-on: ubuntu-latest
@@ -206,7 +209,22 @@ jobs:
         run: |
           CI_TOOLS_BIN="$HOME/.local/bin" bash scripts/ci-install-scanner.sh gitleaks
       - name: gitleaks detect
-        run: '"$HOME/.local/bin/gitleaks" detect --no-git --source . --config .gitleaks.toml --no-banner --redact'
+        run: bash scripts/scan-secrets.sh tree
+
+  secret-history-scan:
+    name: gitleaks history (blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Install verified gitleaks
+        run: CI_TOOLS_BIN="$HOME/.local/bin" bash scripts/ci-install-scanner.sh gitleaks
+      - name: Scan reachable history against reviewed findings
+        run: bash scripts/scan-secrets.sh history
+      - name: Exercise baseline and shallow-checkout refusals
+        run: python3 scripts/scan-secrets.test.py
 
   # scanners-blocking guard — the regression test for finding I-H4 itself. Fails
   # if either CI file re-acquires a scanner escape hatch (`continue-on-error` /

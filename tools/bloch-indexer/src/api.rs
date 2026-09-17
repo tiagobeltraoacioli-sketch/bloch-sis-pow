@@ -6,8 +6,8 @@
 //! read methods, and pulling an async stack in for that would add ~90
 //! transitive crates to a repository whose lock file is part of a reproducible
 //! consensus build. The cost is stated rather than hidden — this speaks the
-//! subset of HTTP/1.1 a JSON client needs (GET, `Content-Length`, no chunked
-//! encoding, no keep-alive, no TLS, no compression) and is not a
+//! subset of HTTP/1.1 a JSON client needs (GET, `Content-Length`, bounded
+//! keep-alive, no chunked encoding, no TLS, no compression) and is not a
 //! general-purpose web server.
 //!
 //! ## What it is allowed to be, that the node's RPC is not
@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 use crate::index::Index;
 use crate::json::Json;
 use crate::model::*;
+use crate::io_deadline::DeadlineStream;
 
 /// Worker threads. Fixed, not one-per-connection.
 ///
@@ -64,12 +65,11 @@ const MAX_KEEPALIVE_REQUESTS: usize = 512;
 /// while the rest sit in the queue. Measured at concurrency 64 against 16
 /// workers, the p50 stayed at 5.6 ms and the **max reached 10.6 s** — the wait
 /// of a connection that was accepted and then simply not served. A deadline
-/// makes the pool rotate, so a slow answer is bounded by the deadline instead
-/// of by another client's request budget.
+/// makes socket readers/writers retire against one absolute deadline rather
+/// than renewing a timeout after each byte. Query CPU work, serialization and
+/// lock acquisition are synchronous and cannot be preempted by this deadline.
 const MAX_CONNECTION_HOLD: Duration = Duration::from_secs(2);
 
-const IO_TIMEOUT: Duration = Duration::from_secs(30);
-const KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 
 /// Largest page any list endpoint will return. An explorer that wants more
@@ -99,8 +99,6 @@ pub fn serve(bind: &str, index: Shared) -> std::io::Result<()> {
                     Err(_) => return,
                 }
             };
-            let _ = stream.set_read_timeout(Some(KEEPALIVE_IDLE));
-            let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
             let _ = stream.set_nodelay(true);
             serve_connection(&stream, &ix);
         });
@@ -112,7 +110,7 @@ pub fn serve(bind: &str, index: Shared) -> std::io::Result<()> {
         // times out. Under the old design that wait was where the 13-second
         // p99 came from.
         if let Err(std::sync::mpsc::TrySendError::Full(s)) = tx.try_send(stream) {
-            let _ = respond(&s, 503, &err("index busy; retry"), false);
+            let _ = respond(DeadlineStream::new(&s, Instant::now() + Duration::from_millis(100)), 503, &err("index busy; retry"), false);
         }
     }
     Ok(())
@@ -121,9 +119,10 @@ pub fn serve(bind: &str, index: Shared) -> std::io::Result<()> {
 /// Serve one connection, keeping it alive across requests unless the client
 /// asked otherwise or something went wrong.
 fn serve_connection(stream: &TcpStream, index: &Shared) {
-    let mut reader = BufReader::new(stream);
-    let opened = Instant::now();
+    let deadline = Instant::now() + MAX_CONNECTION_HOLD;
+    let mut reader = BufReader::new(DeadlineStream::new(stream, deadline));
     for served in 0..MAX_KEEPALIVE_REQUESTS {
+        if Instant::now() >= deadline { return; }
         let mut line = String::new();
         match (&mut reader).take(MAX_HEADER_BYTES as u64 + 1).read_line(&mut line) {
             Ok(0) | Err(_) => return,
@@ -141,7 +140,7 @@ fn serve_connection(stream: &TcpStream, index: &Shared) {
                 Ok(n) => {
                     head += n;
                     if head > MAX_HEADER_BYTES {
-                        let _ = respond(stream, 431, &err("request head too large"), false);
+                        let _ = respond(DeadlineStream::new(stream, deadline), 431, &err("request head too large"), false);
                         return;
                     }
                     let t = h.trim();
@@ -154,11 +153,12 @@ fn serve_connection(stream: &TcpStream, index: &Shared) {
                 }
             }
         }
+        if Instant::now() >= deadline { return; }
         let mut parts = line.split_whitespace();
         let method = parts.next().unwrap_or("");
         let target = parts.next().unwrap_or("/");
         if method != "GET" {
-            let _ = respond(stream, 405, &err("this index is read-only; GET only"), false);
+            let _ = respond(DeadlineStream::new(stream, deadline), 405, &err("this index is read-only; GET only"), false);
             return;
         }
         let (path, query) = match target.split_once('?') {
@@ -172,9 +172,9 @@ fn serve_connection(stream: &TcpStream, index: &Shared) {
         // `WORKERS x (requests / MAX_KEEPALIVE_REQUESTS)` trickle of client
         // errors that were nothing but this cap firing.
         let last =
-            served + 1 == MAX_KEEPALIVE_REQUESTS || opened.elapsed() >= MAX_CONNECTION_HOLD;
+            served + 1 == MAX_KEEPALIVE_REQUESTS || Instant::now() >= deadline;
         let (code, body) = route(path, query, index);
-        if respond(stream, code, &body, !wants_close && !last).is_err() || wants_close || last {
+        if respond(DeadlineStream::new(stream, deadline), code, &body, !wants_close && !last).is_err() || wants_close || last {
             return;
         }
     }
@@ -196,20 +196,37 @@ fn qnum(query: &str, key: &str) -> Option<u64> {
 }
 
 fn page(query: &str) -> (usize, usize) {
-    let limit = qnum(query, "limit").unwrap_or(PAGE_DEFAULT as u64) as usize;
-    let offset = qnum(query, "offset").unwrap_or(0) as usize;
+    let limit = qnum(query, "limit").unwrap_or(PAGE_DEFAULT as u64).min(PAGE_MAX as u64) as usize;
+    let offset = usize::try_from(qnum(query, "offset").unwrap_or(0)).unwrap_or(usize::MAX);
     (limit.min(PAGE_MAX), offset)
 }
 
-fn route(path: &str, query: &str, index: &Shared) -> (u16, Json) {
+/// Dispatch a read query against one locked snapshot, also usable by embedders.
+pub fn route(path: &str, query: &str, index: &Shared) -> (u16, Json) {
     let ix = match index.read() {
         Ok(g) => g,
         Err(_) => return (500, err("index lock poisoned")),
     };
+    if ix.sync_error.is_some() || ix.checked_at.elapsed().as_secs() > 30 {
+        return (503, err("index synchronization unavailable; retry later"));
+    }
     let seg: Vec<&str> = path.trim_matches('/').split('/').collect();
     if matches!(seg.first(), Some(&"health" | &"utxos" | &"history" | &"transactions" | &"outpoint"))
         || matches!(seg.as_slice(), ["tx", _] | ["block", _, "transactions"]) {
         return crate::explorer::route(path, query, &ix);
+    }
+    for key in ["from", "to", "limit", "offset", "step"] {
+        let values: Vec<_> = query.split('&').map(|part| part.split_once('=').unwrap_or((part, "")))
+            .filter(|(name, _)| *name == key).map(|(_, value)| value).collect();
+        if values.len() > 1 || values.first().is_some_and(|value| {
+            value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit())
+                || value.parse::<u64>().is_err()
+        }) {
+            return (400, err("numeric query parameters must be unique unsigned integers"));
+        }
+    }
+    if qnum(query, "limit") == Some(0) || qnum(query, "step") == Some(0) {
+        return (400, err("limit and step must be positive"));
     }
     match seg.as_slice() {
         [""] | ["health"] => (200, Json::Obj(vec![("ok", Json::Bool(true))])),
@@ -249,12 +266,13 @@ fn route(path: &str, query: &str, index: &Shared) -> (u16, Json) {
         ["blocks"] => {
             let from = qnum(query, "from").unwrap_or(0);
             let (limit, _) = page(query);
-            let to = qnum(query, "to").unwrap_or(from + limit as u64 - 1).min(ix.height());
+            let to = qnum(query, "to")
+                .unwrap_or_else(|| from.saturating_add((limit as u64).saturating_sub(1)))
+                .min(ix.height());
             if to < from {
                 return (400, err("to < from"));
             }
-            let n = ((to - from + 1) as usize).min(PAGE_MAX);
-            let rows: Vec<Json> = (from..from + n as u64)
+            let rows: Vec<Json> = (from..=to).take(limit)
                 .filter_map(|h| ix.block_at_height(h))
                 .map(|r| block_summary_json(r))
                 .collect();
@@ -289,12 +307,14 @@ fn route(path: &str, query: &str, index: &Shared) -> (u16, Json) {
             let Ok(id) = crate::parse_script_hash(h) else {
                 return (400, err("txid must be 64 hex characters"));
             };
+            let (limit, offset) = page(query);
+            let total = ix.by_txid.get(&id).map_or(0, Vec::len);
             let hits: Vec<Json> = ix
                 .by_txid
                 .get(&id)
-                .map(|v| v.iter().filter_map(|i| ix.txs.get(*i)).map(tx_json).collect())
+                .map(|v| v.iter().skip(offset).take(limit).filter_map(|i| ix.txs.get(*i)).map(tx_json).collect())
                 .unwrap_or_default();
-            if hits.is_empty() {
+            if total == 0 {
                 return (404, err("no transaction with that id on the indexed chain"));
             }
             (
@@ -302,11 +322,16 @@ fn route(path: &str, query: &str, index: &Shared) -> (u16, Json) {
                 Json::Obj(vec![
                     ("txid", Json::s(h.to_string())),
                     ("count", Json::u(hits.len() as u64)),
+                    ("total", Json::u(total as u64)),
+                    ("offset", Json::u(offset as u64)),
+                    ("next_offset", if offset.saturating_add(hits.len()) < total {
+                        Json::u(offset.saturating_add(hits.len()) as u64)
+                    } else { Json::Null }),
                     (
                         "note",
                         Json::s(
                             "a txid is unique for transfers; the staking variants carry no \
-                             nonce, so two identical ones share an id. Every match is listed.",
+                             nonce, so two identical ones share an id. Matches are paginated.",
                         ),
                     ),
                     ("matches", Json::Arr(hits)),
@@ -513,7 +538,8 @@ fn route(path: &str, query: &str, index: &Shared) -> (u16, Json) {
                         ("fees_sat", Json::sat(r.fees_sat)),
                     ]));
                 }
-                h += step;
+                let Some(next) = h.checked_add(step) else { break; };
+                h = next;
             }
             (
                 200,
@@ -566,9 +592,9 @@ fn status_json(ix: &Index) -> Json {
         (
             "finality_note",
             Json::s(
-                "`finalized` on this chain is not a latch across a reorg — a node has been \
-                 observed below its own finalized checkpoint — so this index keeps its undo \
-                 journal regardless of finality and does not treat any height as settled.",
+                "Finality fields come from indexed headers. The index retains undo history \
+                 and can rebuild from a replacement archival log; these queries do not \
+                 establish independent network finality.",
             ),
         ),
     ])
@@ -682,7 +708,7 @@ fn participation_json(v: u32, p: &Participation) -> Json {
 }
 
 fn respond(
-    mut stream: &TcpStream,
+    mut stream: impl Write,
     code: u16,
     body: &Json,
     keep_alive: bool,

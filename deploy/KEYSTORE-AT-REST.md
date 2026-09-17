@@ -157,3 +157,28 @@ ceremony or validator migration is implied by these source changes.
 Opening a sealed file now defaults to a combined `memory_KiB × passes` ceiling of 1,048,576 KiB-passes, checked before Argon2 allocation. Production remains 65,536 KiB × 3 passes. This is a work bound, not a wall-clock recovery guarantee. The existing absolute memory, iteration, and lane caps remain in force. The default combined limit still permits a 1 GiB allocation at one pass; it is not a small-memory guarantee.
 
 For an independently verified authentic historical file deliberately sealed above the new combined limit, `BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF=1` explicitly restores the original finite decoding limits (1 GiB memory, 64 passes, 16 lanes). It does not authorize more expensive new seals, weaken authentication, or change the file format. The node warns before performing such work; remove the override after recovery. An altered header is still unauthenticated until decryption succeeds, so the override belongs only to a controlled recovery of a known file. Values other than `0` or `1` are refused. Weak historical parameters within the bounds remain decryptable with the existing warning.
+
+### Interactive terminal interruptions
+
+The native `keys seal` prompt runs only in the synchronous CLI startup path,
+before any threads are created. While echo is disabled it temporarily blocks
+INT, TERM, HUP, QUIT and job-control stop signals on that thread, checks pending
+signals between readiness waits with a 100 ms timeout, and restores terminal
+attributes before restoring the caller's signal mask. It does not replace signal
+dispositions: ignored signals remain ignored, previously blocked signals remain
+blocked, and default termination still terminates with the original signal.
+A stop request restores the terminal before suspension; after continuation the
+partial entry is refused and the operator must rerun the command.
+
+This helper must not be moved into the multithreaded node runtime: another thread
+could receive a process-directed signal before terminal restoration. SIGKILL and
+SIGSTOP cannot be deferred and remain outside this guarantee. The private tty
+handle, bounded preallocated zeroizing buffers, and checked normal restoration
+remain in use. No interactive input is read through the shared stdin buffer.
+The regression `native_passphrase_tty` exercises the real CLI with disposable
+PTYs, deliberate confirmation mismatch, termination at both prompts, stop/resume,
+and inherited blocked/ignored signal behavior; it creates no keystore.
+
+Zeroizing buffers are wiped during normal Rust cleanup. Fatal asynchronous
+termination is not a guarantee that every secret allocation has been wiped;
+terminal restoration and process-memory zeroization are separate properties.

@@ -72,12 +72,17 @@ pub struct FrameRef {
 /// the same total size leaves the size unchanged, and on a mirror pulled with
 /// `scp` the mtime moves for reasons unrelated to content. The inode is what
 /// actually changes under `rename`, and it changes on every reorg because
-/// `rewrite` never edits in place.
+/// `rewrite` never edits in place. Subsecond timestamps also detect same-size
+/// in-place mirror updates within one second. This is a change hint, not a
+/// cryptographic commitment to the contents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LogFingerprint {
     pub len: u64,
     pub inode: u64,
     pub mtime_secs: i64,
+    pub mtime_nanos: i64,
+    pub ctime_secs: i64,
+    pub ctime_nanos: i64,
 }
 
 impl LogFingerprint {
@@ -88,7 +93,8 @@ impl LogFingerprint {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            Ok(LogFingerprint { len: m.len(), inode: m.ino(), mtime_secs: m.mtime() })
+            Ok(LogFingerprint { len: m.len(), inode: m.ino(), mtime_secs: m.mtime(),
+                mtime_nanos: m.mtime_nsec(), ctime_secs: m.ctime(), ctime_nanos: m.ctime_nsec() })
         }
         #[cfg(not(unix))]
         {
@@ -96,9 +102,9 @@ impl LogFingerprint {
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            Ok(LogFingerprint { len: m.len(), inode: 0, mtime_secs: mtime })
+                .unwrap_or_default();
+            Ok(LogFingerprint { len: m.len(), inode: 0, mtime_secs: mtime.as_secs() as i64,
+                mtime_nanos: i64::from(mtime.subsec_nanos()), ctime_secs: 0, ctime_nanos: 0 })
         }
     }
 }

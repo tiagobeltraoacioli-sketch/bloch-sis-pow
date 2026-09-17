@@ -52,3 +52,14 @@ quantum-exposure model. Construct locally and do not send them to an untrusted
 remote service. Loopback binding, request minimization and TLS do not erase
 prior disclosures or establish the claimed quantum property. The optional new
 construction does not remove those assumptions.
+
+## Evaluator relative-lock correction (BV-15, partial)
+
+The narrow evaluator now measures block-based maturity against the actual input
+`nSequence`, not merely the script's CSV minimum. A script requiring 144 blocks
+with a signed input sequence of 288 must still fail at ages 144 and 287 and pass
+at 288; the regression uses actual BIP-143 signatures for that transaction.
+This follows [BIP-68](https://github.com/bitcoin/bips/blob/master/bip-0068.mediawiki).
+It does not turn the evaluator into Bitcoin Core validation: full transaction
+acceptance, time-based locks, script policy and regtest qualification remain
+outside its supported model. Emitted default transaction bytes are unchanged.

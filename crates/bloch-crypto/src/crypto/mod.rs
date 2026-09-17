@@ -40,6 +40,14 @@ const SUITE_MAGIC: [u8; 2] = [0xB1, 0x0C];
 pub const SUITE_MLDSA65_FALCON1024: u16 = 0x0001;
 /// ML-DSA-65 only — the "Falcon removed" suite (proof that Falcon is removable).
 pub const SUITE_MLDSA65_ONLY: u16 = 0x0002;
+
+/// Maximum encoded signature length emitted by the currently supported signers.
+/// Producers may reserve this before signing; this does not change wire rules.
+pub fn max_signature_len() -> usize {
+    SUITE_HEADER_LEN.saturating_add(MLDSA_SIG_LEN)
+        .saturating_add(pqcrypto_falcon::falcon1024::signature_bytes())
+}
+
 // 0x0000 and 0xFFFF are reserved and never valid ⇒ verify returns false.
 
 /// Parse the 4-byte suite envelope header. `None` on any malformation
@@ -1017,6 +1025,7 @@ mod kat {
     fn production_signing_is_hedged_nondeterministic() {
         let (pk, sk) = generate_keypair_from_seed(&GOLDEN_SEED).unwrap();
         let s1 = sign(&sk, GOLDEN_MSG).unwrap();
+        assert!(s1.len() <= max_signature_len());
         let s2 = sign(&sk, GOLDEN_MSG).unwrap();
         assert_ne!(s1, s2, "hybrid signing must be hedged (randomized), not deterministic");
         assert!(verify(&pk, GOLDEN_MSG, &s1));
@@ -1036,6 +1045,7 @@ mod kat {
 
         let msg = b"mldsa-only-suite";
         let sig = sign(&sk_env, msg).expect("mldsa-only sign");
+        assert!(sig.len() <= max_signature_len());
         assert_eq!(sig.len(), SUITE_HEADER_LEN + MLDSA_SIG_LEN, "0x0002 sig len");
         assert!(verify(&pk_env, msg, &sig), "mldsa-only sig must verify");
         assert!(!verify(&pk_env, b"other", &sig), "wrong message must fail");

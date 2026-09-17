@@ -55,6 +55,9 @@ path = "src/lib.rs"
 # the duplicate-derivation defect this repo keeps paying for.
 bloch-pos-committee = { path = "../../crates/bloch-pos-committee" }
 sha3 = "0.10"
+# Already present in the workspace lock. Parse diagnostic RPC envelopes rather
+# than accepting unrelated matching field text from an error or nested object.
+serde_json = "1.0"
 # Only for three suite constants that the node's `genesis.rs` manifest decoder
 # checks a validator pubkey against (SUITE_HEADER_LEN, SUITE_MLDSA65_FALCON1024,
 # MLDSA_PUBKEY_LEN). The indexer verifies no signatures — it reads a chain an

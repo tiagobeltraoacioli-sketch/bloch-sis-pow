@@ -470,8 +470,133 @@ fn pagination_is_bound_to_a_canonical_snapshot_and_errors_are_explicit() {
     assert!(second.1.to_string().contains("\"next_cursor\":null"));
     let forked = format!("cursor=0-{}-0", bloch_indexer::hex32(&h32(77)));
     assert_eq!(bloch_indexer::explorer::route(&path, &forked, &ix).0, 409);
-    for q in ["limit=0", "limit=1001", "cursor=bad"] { assert_eq!(bloch_indexer::explorer::route(&path, q, &ix).0, 400); }
+    for q in ["limit=0", "limit=1001", "cursor=bad", "limit", "cursor", "limit=1&limit=2", "limit=+1"] { assert_eq!(bloch_indexer::explorer::route(&path, q, &ix).0, 400); }
     ix.sync_error = Some("log unavailable".into());
     assert_eq!(bloch_indexer::explorer::route("/health", "", &ix).0, 503);
     assert!(bloch_indexer::parse_script_hash(&"é".repeat(32)).is_err());
+}
+
+#[test]
+fn historical_query_numbers_cannot_overflow_or_bypass_the_page_limit() {
+    let genesis = h32(1);
+    let mut ix = Index::new(genesis, vec![], 64);
+    for slot in 1..=3 {
+        let block = envelope(header(slot, ix.tip().block_id, 0, slot as u8), vec![], vec![]);
+        ix.try_apply(&block, 0).unwrap();
+    }
+    let shared = std::sync::Arc::new(std::sync::RwLock::new(ix));
+    for query in ["limit=0", "limit=-1", "limit=one", "from=18446744073709551616",
+        "limit=1&limit=2", "offset=", "step=0", "step=+1", "limit", "from"] {
+        assert_eq!(bloch_indexer::api::route("/blocks", query, &shared).0, 400, "{query}");
+    }
+    let page = bloch_indexer::api::route("/blocks", "from=1&to=3&limit=1", &shared);
+    assert_eq!(page.0, 200);
+    assert!(page.1.to_string().contains("\"count\":1"));
+    assert_eq!(bloch_indexer::api::route("/blocks", "from=18446744073709551615&limit=100", &shared).0, 400);
+    let supply = bloch_indexer::api::route("/supply", "from=1&step=18446744073709551615", &shared);
+    assert_eq!(supply.0, 200);
+    assert!(supply.1.to_string().contains("\"count\":1"));
+}
+
+#[test]
+fn ambiguous_transaction_matches_are_paginated_and_snapshot_filtered() {
+    let genesis = h32(1);
+    let mut ix = Index::new(genesis, vec![], 64);
+    let exit = PosTransaction::Exit { validator: 7 };
+    for slot in 1..=3 {
+        ix.try_apply(&envelope(header(slot, ix.tip().block_id, 0, slot as u8), vec![exit.clone()], vec![]), 0).unwrap();
+    }
+    let path = format!("/tx/{}", bloch_indexer::hex32(&exit.txid()));
+    let first = bloch_indexer::explorer::route(&path, "limit=1", &ix);
+    assert_eq!(first.0, 409);
+    assert_eq!(first.1.to_string().matches("\"kind\":").count(), 1);
+    assert!(first.1.to_string().contains("\"total\":3"));
+    let cursor = format!("limit=1&cursor=3-{}-1", bloch_indexer::hex32(&ix.tip().block_id));
+    let second = bloch_indexer::explorer::route(&path, &cursor, &ix);
+    assert_eq!(second.0, 409);
+    assert!(second.1.to_string().contains("\"height\":2"));
+    let historical = format!("cursor=1-{}-0", bloch_indexer::hex32(&ix.chain[1].block_id));
+    assert_eq!(bloch_indexer::explorer::route(&path, &historical, &ix).0, 200);
+    let shared = std::sync::Arc::new(std::sync::RwLock::new(ix));
+    let legacy = bloch_indexer::api::route(&format!("/txid/{}", bloch_indexer::hex32(&exit.txid())), "limit=1&offset=1", &shared);
+    assert_eq!(legacy.0, 200);
+    assert!(legacy.1.to_string().contains("\"count\":1"));
+    assert!(legacy.1.to_string().contains("\"total\":3"));
+    assert!(legacy.1.to_string().contains("\"next_offset\":2"));
+}
+
+#[test]
+fn legacy_read_routes_refuse_stale_or_failed_sync() {
+    let shared = std::sync::Arc::new(std::sync::RwLock::new(Index::new(h32(1), vec![], 64)));
+    let balance = format!("/script/{}/balance", bloch_indexer::hex32(&h32(2)));
+    for path in ["/status", "/supply", "/blocks", balance.as_str()] {
+        assert_eq!(bloch_indexer::api::route(path, "", &shared).0, 200);
+    }
+    shared.write().unwrap().sync_error = Some("synthetic log failure".into());
+    for path in ["/status", "/supply", "/blocks", balance.as_str()] {
+        assert_eq!(bloch_indexer::api::route(path, "", &shared).0, 503);
+    }
+    {
+        let mut ix = shared.write().unwrap();
+        ix.sync_error = None;
+        ix.checked_at = std::time::Instant::now() - std::time::Duration::from_secs(31);
+    }
+    assert_eq!(bloch_indexer::api::route(&balance, "", &shared).0, 503);
+}
+
+#[test]
+fn same_size_mirror_rewrite_within_one_second_is_detected() {
+    let directory = tmpdir("subsecond-mirror");
+    let path = directory.join("blocks.log");
+    let genesis = h32(1);
+    let old = envelope(header(1, genesis, 0, 1), vec![], vec![]);
+    let replacement = envelope(header(1, genesis, 0, 2), vec![], vec![]);
+    let timestamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    write_log(&path, &[old]);
+    std::fs::File::options().write(true).open(&path).unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(timestamp + std::time::Duration::from_millis(100))).unwrap();
+    let mut reader = LogReader::open(&path).unwrap();
+    let before = reader.fingerprint();
+    let payload = bloch_indexer::codec::encode_envelope(&replacement);
+    let mut replacement_bytes = (payload.len() as u32).to_le_bytes().to_vec();
+    replacement_bytes.extend_from_slice(&payload);
+    // Unlike the rename helper, a mirror may overwrite the same inode.
+    std::fs::write(&path, replacement_bytes).unwrap();
+    std::fs::File::options().write(true).open(&path).unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(timestamp + std::time::Duration::from_millis(200))).unwrap();
+    assert!(reader.changed().unwrap());
+    reader.reopen().unwrap();
+    let after = reader.fingerprint();
+    assert_eq!(before.len, after.len);
+    assert_eq!(before.inode, after.inode);
+    assert_eq!(before.mtime_secs, after.mtime_secs);
+    assert_ne!(before.mtime_nanos, after.mtime_nanos);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn transaction_lookup_and_block_contents_obey_snapshot_and_selector() {
+    let genesis = h32(1);
+    let op = OutPoint { txid: h32(9), vout: 0 };
+    let mut ix = Index::new(genesis, vec![(op, Utxo {
+        value_sat: 1000, script_hash: h32(2), created_height: 0,
+    })], 64);
+    let first = transfer(vec![(op.txid, 0)], vec![(900, h32(3))]);
+    let first_block = envelope(header(1, genesis, 0, 3), vec![first.clone()], vec![]);
+    ix.try_apply(&first_block, 0).unwrap();
+    let anchor = ix.tip().block_id;
+    let second = transfer(vec![(first.txid(), 0)], vec![(800, h32(4))]);
+    ix.try_apply(&envelope(header(2, anchor, 0, 4), vec![second.clone()], vec![]), 0).unwrap();
+    let cursor = format!("cursor=1-{}-0", bloch_indexer::hex32(&anchor));
+    let path = format!("/tx/{}", bloch_indexer::hex32(&second.txid()));
+    assert_eq!(bloch_indexer::explorer::route(&path, "", &ix).0, 200);
+    assert_eq!(bloch_indexer::explorer::route(&path, &cursor, &ix).0, 404);
+    assert_eq!(bloch_indexer::explorer::route(&path, "block=invalid", &ix).0, 400);
+    assert_eq!(bloch_indexer::explorer::route(&path, &format!("block={}", bloch_indexer::hex32(&anchor)), &ix).0, 404);
+    let block_path = format!("/block/{}/transactions", bloch_indexer::hex32(&ix.tip().block_id));
+    assert_eq!(bloch_indexer::explorer::route(&block_path, &cursor, &ix).0, 404);
+    let old_path = format!("/tx/{}", bloch_indexer::hex32(&first.txid()));
+    let old = bloch_indexer::explorer::route(&old_path, &cursor, &ix);
+    assert_eq!(old.0, 200);
+    assert!(old.1.to_string().contains("archival structure only; consensus replay disabled"));
 }

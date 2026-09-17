@@ -450,6 +450,21 @@ mod e2e_tests {
         let after = EvalCtx { confirmations: DELTA as u32, ..reeval(&before) };
         assert_eq!(eval(&secp, &trig_script, witness(), &after), Ok(true));
 
+        // A signer can choose a sequence above the script minimum. BIP-68
+        // maturity follows that actual sequence, not merely the CSV operand.
+        let mut longer = a.clone();
+        longer.input[0].sequence = Sequence::from_height(288);
+        let longer_hash = p2wsh_sighash(&longer, 0, &trig_script, 99_500);
+        let longer_sig = ecdsa_witness_sig(&longer_hash, &keys.hot_sk);
+        let longer_ctx = EvalCtx { input_sequence: longer.input[0].sequence,
+            confirmations: 144, tx_version: longer.version.0, sighash: longer_hash };
+        for confirmations in [144, 287] {
+            let ctx = EvalCtx { confirmations, ..reeval(&longer_ctx) };
+            assert_eq!(eval(&secp, &trig_script, vec![longer_sig.clone(), vec![1]], &ctx), Err(EvalError::Immature));
+        }
+        let mature = EvalCtx { confirmations: 288, ..reeval(&longer_ctx) };
+        assert_eq!(eval(&secp, &trig_script, vec![longer_sig, vec![1]], &mature), Ok(true));
+
         // a branch-A spend whose nSequence does NOT encode the delay (RBF-final) fails CSV
         let mut a_bad = a.clone();
         a_bad.input[0].sequence = Sequence::ENABLE_RBF_NO_LOCKTIME;

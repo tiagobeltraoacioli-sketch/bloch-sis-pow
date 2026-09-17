@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Bounded memoization of cryptographic failures at the gossip boundary.
+//! Bounded memoization of cryptographic failures at network/mempool admission.
 //!
 //! This is not a transaction, validator, or block rejection cache. The exact
 //! public key, signing root, and signature determine each entry. Registry,
@@ -61,6 +61,23 @@ impl<V: SignatureVerifier> SignatureVerifier for GossipVerifier<V> {
         failures.order.push_back(key);
         false
     }
+}
+
+#[cfg(test)]
+pub(super) struct CountedHybrid(std::rc::Rc<std::cell::Cell<usize>>);
+
+#[cfg(test)]
+impl SignatureVerifier for CountedHybrid {
+    fn verify_with_key(&self, key: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
+        self.0.set(self.0.get().saturating_add(1));
+        crate::keys::HybridVerifier::new().verify_with_key(key, root, signature)
+    }
+}
+
+#[cfg(test)]
+pub(super) fn counted_hybrid() -> (GossipVerifier<CountedHybrid>, std::rc::Rc<std::cell::Cell<usize>>) {
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+    (GossipVerifier::new(CountedHybrid(calls.clone())), calls)
 }
 
 #[cfg(test)]

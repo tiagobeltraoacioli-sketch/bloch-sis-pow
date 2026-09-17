@@ -34,7 +34,7 @@ fn ok(msg: &str) {
     println!("  {} {}", green("✓"), msg);
 }
 
-fn err(msg: &str) {
+fn err(msg: &str) -> ! {
     println!("  {} {}", red("✗"), msg);
     std::process::exit(1);
 }
@@ -76,9 +76,9 @@ enum Cmd {
     Send {
         keystore: PathBuf,
         to:       String,
-        amount:   f64,
-        #[arg(long, default_value_t = 0.0001)]
-        fee:      f64,
+        amount:   String,
+        #[arg(long, default_value = "0.0001")]
+        fee:      String,
     },
     /// Sign a message (domain-separated digest — see `verify-message`)
     Sign { keystore: PathBuf, message: String },
@@ -187,16 +187,19 @@ pub fn main() {
 
         Cmd::Send { keystore, to, amount, fee } => {
             let kp          = load_kp(&keystore);
-            let amount_sats = (amount * 1e8).round() as u64;
-            let fee_sats    = (fee * 1e8).round() as u64;
+            let amount_sats = checked_cli_satoshis(&amount, false).unwrap_or_else(|message| err(message));
+            let fee_sats = checked_cli_satoshis(&fee, true).unwrap_or_else(|message| err(message));
+            let total_needed = amount_sats.checked_add(fee_sats)
+                .unwrap_or_else(|| err("amount plus fee exceeds u64"));
+            let to_hex = checked_destination(&to, &kp.address).unwrap_or_else(|message| err(&message));
 
             println!("  {}transaction preview{}", BOLD, RESET);
             println!();
             label("from",   &kp.address);
             label("to",     &to);
-            label("amount", &format!("{:.8} BLOCH  {}({} sats){}",
+            label("amount", &format!("{} BLOCH  {}({} sats){}",
                 amount, MUTED, amount_sats, RESET));
-            label("fee",    &format!("{:.8} BLOCH", fee));
+            label("fee",    &format!("{} BLOCH", fee));
             println!();
 
             // 1. Fetch UTXOs via getutxos (returns full UTXO list for coin selection)
@@ -212,25 +215,15 @@ pub fn main() {
 
             let avail = crate::wallet::sat_u64(&resp["satoshis"]).unwrap_or(0);
             let utxo_count = resp["utxo_count"].as_u64().unwrap_or(0);
-            if avail < amount_sats + fee_sats {
+            if avail < total_needed {
                 err(&format!("Insufficient funds: have {:.8} BLOCH ({} UTXOs), need {:.8} BLOCH",
                     avail as f64 / 1e8, utxo_count,
-                    (amount_sats + fee_sats) as f64 / 1e8));
+                    total_needed as f64 / 1e8));
             }
 
             // 2. Parse UTXOs from getutxos response
-            let utxos_raw = resp["utxos"].as_array().cloned().unwrap_or_default();
-            let available_utxos: Vec<(Vec<u8>, u32, crate::core::TxOutput)> = utxos_raw
-                .iter()
-                .filter_map(|u| {
-                    let txid_hex = u["txid"].as_str()?;
-                    let txid = hex::decode(txid_hex).ok()?;
-                    let idx  = u["index"].as_u64()? as u32;
-                    let val  = crate::wallet::sat_u64(&u["value"])?;
-                    let spk  = hex::decode(u["script_pubkey"].as_str()?).ok()?;
-                    Some((txid, idx, crate::core::TxOutput { value: val, script_pubkey: spk }))
-                })
-                .collect();
+            let available_utxos = parse_send_utxos(&resp)
+                .unwrap_or_else(|message| err(message));
 
             if available_utxos.is_empty() {
                 err("No UTXOs returned by node — cannot build transaction");
@@ -239,17 +232,10 @@ pub fn main() {
             ok(&format!("{} UTXOs available ({:.8} BLOCH)",
                 available_utxos.len(), avail as f64 / 1e8));
 
-            // Sprint K: Parse and validate destination address (checksum-enforced)
-            let to_hex = match crate::address::Address::parse(&to) {
-                Ok(a) => hex::encode(a.hash()),
-                Err(e) => { err(&format!("Invalid destination address: {}\n  Hint: addresses must be 55 chars (bloch1q + 40 hex hash + 8 hex checksum)", e)); unreachable!() }
-            };
 
-            // 4. Build and sign transaction
-            print!("  {}building transaction...{}\r", MUTED, RESET);
             let tx = match crate::wallet::TxBuilder::build(&kp, &available_utxos, &to_hex, amount_sats, fee_sats) {
                 Ok(t)  => t,
-                Err(e) => { err(&format!("Build failed: {}", e)); unreachable!() }
+                Err(e) => { err(&format!("Build failed: {}", e)) }
             };
 
             let txid = tx.txid();
@@ -285,7 +271,7 @@ pub fn main() {
                 .collect::<Result<Vec<_>, _>>()
             {
                 Ok(v) if !v.is_empty() => v,
-                _ => { err("indices must be a comma-separated list of numbers, e.g. 0,2,5"); unreachable!() }
+                _ => { err("indices must be a comma-separated list of numbers, e.g. 0,2,5") }
             };
 
             println!("  {}Selective disclosure — reveals ONLY the listed indices.{}", MUTED, RESET);
@@ -296,7 +282,7 @@ pub fn main() {
             let phrase = prompt_password(&format!("  {}seed phrase:{} ", MUTED, RESET));
             let seed = match crate::wallet::SeedPhrase::parse(&phrase) {
                 Ok(s) => s,
-                Err(e) => { err(&format!("Invalid seed phrase: {}", e)); unreachable!() }
+                Err(e) => { err(&format!("Invalid seed phrase: {}", e)) }
             };
             let network = if cli.testnet { crate::address::Network::Testnet }
                           else { crate::address::Network::Mainnet };
@@ -308,7 +294,7 @@ pub fn main() {
                 &seed_bytes, &idx, network, &purpose, &audience)
             {
                 Ok(b) => b,
-                Err(e) => { err(&format!("Disclosure failed: {}", e)); unreachable!() }
+                Err(e) => { err(&format!("Disclosure failed: {}", e)) }
             };
 
             let json = serde_json::to_string_pretty(&bundle).unwrap();
@@ -399,11 +385,11 @@ pub fn main() {
         Cmd::VerifyMessage { pubkey, message, signature } => {
             let pk = match hex::decode(&pubkey) {
                 Ok(b) => b,
-                Err(e) => { err(&format!("Invalid pubkey hex: {}", e)); unreachable!() }
+                Err(e) => { err(&format!("Invalid pubkey hex: {}", e)) }
             };
             let sig = match hex::decode(&signature) {
                 Ok(b) => b,
-                Err(e) => { err(&format!("Invalid signature hex: {}", e)); unreachable!() }
+                Err(e) => { err(&format!("Invalid signature hex: {}", e)) }
             };
             // Same domain-separated digest `sign` uses — never hex-decode
             // `message` either; verification must mirror signing exactly.
@@ -423,15 +409,15 @@ pub fn main() {
 fn load_and_verify_bundle(path: &PathBuf) -> crate::wallet::VerifiedDisclosure {
     let json = match std::fs::read_to_string(path) {
         Ok(j) => j,
-        Err(e) => { err(&format!("Cannot read bundle: {}", e)); unreachable!() }
+        Err(e) => { err(&format!("Cannot read bundle: {}", e)) }
     };
     let bundle: crate::wallet::DisclosureBundle = match serde_json::from_str(&json) {
         Ok(b) => b,
-        Err(e) => { err(&format!("Bundle parse failed: {}", e)); unreachable!() }
+        Err(e) => { err(&format!("Bundle parse failed: {}", e)) }
     };
     match bundle.verify() {
         Ok(v) => v,
-        Err(e) => { err(&format!("Bundle verification FAILED: {}", e)); unreachable!() }
+        Err(e) => { err(&format!("Bundle verification FAILED: {}", e)) }
     }
 }
 
@@ -439,7 +425,7 @@ fn load_kp(path: &PathBuf) -> crate::wallet::Keypair {
     let pw = prompt_password(&format!("  {}password:{} ", MUTED, RESET));
     match crate::wallet::Keypair::load_encrypted(path, &pw) {
         Ok(kp) => { ok("keystore decrypted"); println!(); kp }
-        Err(e) => { err(&format!("Load failed: {}", e)); unreachable!() }
+        Err(e) => { err(&format!("Load failed: {}", e)) }
     }
 }
 
@@ -498,5 +484,91 @@ fn rpc_call(endpoint: &str, method: &str, params: serde_json::Value) -> serde_js
                 serde_json::json!({ "error": "invalid response" })
             }
         }
+    }
+}
+
+// Parse once from the original CLI token: no float may choose the spend amount.
+fn checked_cli_satoshis(value: &str, allow_zero: bool) -> Result<u64, &'static str> {
+    let satoshis = crate::wallet::parse_bloch_satoshis(value)?;
+    if !allow_zero && satoshis == 0 { return Err("payment must contain at least one satoshi"); }
+    Ok(satoshis)
+}
+
+fn checked_destination(destination: &str, source: &str) -> Result<String, String> {
+    let destination = crate::address::Address::parse(destination).map_err(|_| "invalid destination address".to_string())?;
+    let source = crate::address::Address::parse(source).map_err(|_| "invalid wallet address".to_string())?;
+    if destination.network() != source.network() { return Err("destination address network differs from wallet".into()); }
+    Ok(hex::encode(destination.hash()))
+}
+
+fn parse_send_utxos(response: &serde_json::Value) -> Result<Vec<(Vec<u8>, u32, crate::core::TxOutput)>, &'static str> {
+    let rows = response["utxos"].as_array().ok_or("RPC response missing UTXO array")?;
+    rows.iter().map(|row| {
+        let txid = hex::decode(row["txid"].as_str().ok_or("UTXO missing transaction ID")?)
+            .map_err(|_| "invalid UTXO transaction ID hex")?;
+        if txid.len() != 32 { return Err("UTXO transaction ID must contain 32 bytes"); }
+        let index = row["index"].as_u64().and_then(|value| u32::try_from(value).ok())
+            .ok_or("UTXO index must fit u32")?;
+        let value = crate::wallet::sat_u64(&row["value"]).ok_or("invalid UTXO value")?;
+        let script_pubkey = hex::decode(row["script_pubkey"].as_str().ok_or("UTXO missing script")?)
+            .map_err(|_| "invalid UTXO script hex")?;
+        Ok((txid, index, crate::core::TxOutput { value, script_pubkey }))
+    }).collect()
+}
+
+#[cfg(test)]
+mod audit_cli_input_tests {
+    use super::*;
+    use crate::address::{Address, Network};
+
+    #[test]
+    fn cli_amount_refuses_nonfinite_negative_saturating_and_zero_payment() {
+        for value in ["NaN", "inf", "-inf", "-1", "1e30"] {
+            assert!(checked_cli_satoshis(value, true).is_err());
+        }
+        assert!(checked_cli_satoshis("0", false).is_err());
+        assert!(checked_cli_satoshis("0.000000001", false).is_err());
+        assert_eq!(checked_cli_satoshis("0", true), Ok(0));
+        assert_eq!(checked_cli_satoshis("1.25", false), Ok(125_000_000));
+        assert_eq!(checked_cli_satoshis("0.00000001", false), Ok(1));
+    }
+
+    #[test]
+    fn clap_preserves_exact_amount_and_fee_tokens() {
+        let cli = Cli::try_parse_from(["postern-wallet", "send", "wallet.json", "recipient",
+            "90071992.54740993", "--fee", "0.00000001"]).unwrap();
+        match cli.cmd {
+            Cmd::Send { amount, fee, .. } => {
+                assert_eq!(checked_cli_satoshis(&amount, false).unwrap(), 9_007_199_254_740_993);
+                assert_eq!(checked_cli_satoshis(&fee, true).unwrap(), 1);
+            }
+            _ => panic!("expected send command"),
+        }
+    }
+
+    #[test]
+    fn cli_destination_preserves_network_before_converting_to_hash() {
+        let main = Address::from_hash([1; 20], Network::Mainnet).to_string();
+        let test = Address::from_hash([1; 20], Network::Testnet).to_string();
+        assert!(checked_destination(&main, &test).is_err());
+        assert!(checked_destination(&test, &main).is_err());
+        assert_eq!(checked_destination(&main, &main).unwrap(), "01".repeat(20));
+        assert!(checked_destination("invalid", &main).is_err());
+    }
+
+    #[test]
+    fn cli_utxo_parser_refuses_invalid_rows_without_silent_filtering() {
+        let row = serde_json::json!({"txid": "ab".repeat(32), "index": u32::MAX,
+            "value": "9007199254740993", "script_pubkey": "cd".repeat(20)});
+        let parsed = parse_send_utxos(&serde_json::json!({"utxos": [row.clone()]})).unwrap();
+        assert_eq!(parsed[0].1, u32::MAX);
+        assert_eq!(parsed[0].2.value, 9_007_199_254_740_993);
+        for invalid in [serde_json::json!(4294967296u64), serde_json::json!(-1), serde_json::json!(1.5)] {
+            let mut bad = row.clone(); bad["index"] = invalid;
+            assert!(parse_send_utxos(&serde_json::json!({"utxos": [row.clone(), bad]})).is_err());
+        }
+        let mut bad = row; bad["txid"] = serde_json::json!("ab");
+        assert!(parse_send_utxos(&serde_json::json!({"utxos": [bad]})).is_err());
+        assert!(parse_send_utxos(&serde_json::json!({})).is_err());
     }
 }

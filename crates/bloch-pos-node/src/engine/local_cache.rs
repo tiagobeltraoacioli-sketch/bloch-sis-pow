@@ -2,7 +2,7 @@
 //! A disposable, local restart cache. The block log remains authoritative.
 //! Never accept a downloaded cache as a weak-subjectivity state snapshot.
 use super::*;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use sha3::{Digest, Sha3_256};
 
@@ -54,21 +54,14 @@ impl Engine {
         let checksum = Sha3_256::digest(&bytes);
         bytes.extend_from_slice(&checksum);
         if bytes.len() as u64 > MAX_BYTES { return Err(invalid("state cache exceeds 512 MiB")); }
-        let temporary = dir.join("state.cache.tmp");
-        let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)] {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+        let destination = dir.join("state.cache");
+        let mut staging = crate::store::PrivateStagingFile::create_for(&destination)?;
+        staging.file_mut().write_all(&bytes)?;
+        staging.file_mut().sync_all()?;
+        if destination.exists() {
+            fs::rename(&destination, dir.join("state.cache.previous"))?;
         }
-        let mut file = options.open(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        if dir.join("state.cache").exists() {
-            fs::rename(dir.join("state.cache"), dir.join("state.cache.previous"))?;
-        }
-        fs::rename(temporary, dir.join("state.cache"))?;
-        crate::store::fsync_dir(dir)?;
+        staging.publish(&destination)?;
         println!("state-cache: persisted slot={} blocks={} bytes={} elapsed_ms={}", self.state.slot(), block_count, bytes.len(), started.elapsed().as_millis());
         Ok(())
     }
@@ -180,6 +173,25 @@ mod tests {
         engine.store.rewrite(&logged).unwrap();
         engine.write_local_cache().unwrap();
         (engine, dir, logged)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_staging_preserves_symlink_target_and_previous_generation() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let (mut engine, dir, logged) = fixture();
+        let previous = fs::read(dir.0.join("state.cache")).unwrap();
+        let victim = dir.0.join("unrelated-cache-target");
+        fs::write(&victim, b"do not truncate").unwrap();
+        let legacy = dir.0.join("state.cache.tmp");
+        symlink(&victim, &legacy).unwrap();
+        engine.write_local_cache().unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"do not truncate");
+        assert!(fs::symlink_metadata(&legacy).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(dir.0.join("state.cache.previous")).unwrap(), previous);
+        assert_eq!(fs::metadata(dir.0.join("state.cache")).unwrap().permissions().mode() & 0o777, 0o600);
+        reset(&mut engine);
+        assert_eq!(engine.restore_local_cache(&logged).unwrap(), 70);
     }
 
     #[test]

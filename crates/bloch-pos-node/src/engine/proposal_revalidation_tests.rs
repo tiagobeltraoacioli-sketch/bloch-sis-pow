@@ -158,3 +158,131 @@ fn capacity_revalidation_reclaims_stale_source_slots_for_a_valid_same_owner() {
     assert_eq!(node.mempool.source_count(&tx_source_hash(&incoming).unwrap()), MEMPOOL_MAX_PER_SOURCE);
     assert!(node.rejected.is_empty());
 }
+
+#[test]
+fn transaction_finality_uses_named_checkpoint_not_its_epoch() {
+    let _clock = validator_lifecycle::clock_at(1);
+    let funds = funds();
+    let (mut node, _dir) = perf_support::proposing_engine_funded(&funds);
+    let tx = spend(&funds[0], 9_000, 0, node.state.next_base_fee_at(0));
+    assert_eq!(node.on_transaction(tx.clone()), Ok(Admitted::New));
+    node.propose(1);
+    assert_eq!(node.state.slot(), 1);
+    assert_eq!(node.state.finality().finalized.epoch, 0);
+    assert_eq!(node.tx_status(&tx.txid()), "included", "genesis finality does not cover its descendants");
+    assert_eq!(node.finality_of(1, true), Finality::Canonical);
+
+    // Real votes advance real checkpoints. Pin both sides of each checkpoint
+    // using existing canonical slots, including the first block of its epoch.
+    for slot in 2..=(4 * SLOTS_PER_EPOCH) {
+        node.attest(slot);
+        node.propose(slot);
+        if node.state.finality().finalized.epoch >= 1 { break; }
+    }
+    let fin = node.state.finality();
+    assert!(fin.finalized.epoch >= 1);
+    let finalized_slot = node.slot_of_canonical_root(&fin.finalized.root).unwrap();
+    assert!(finalized_slot >= 1);
+    assert_eq!(node.tx_status(&tx.txid()), "finalized");
+    // These synthetic index entries isolate reporting at real canonical block
+    // boundaries; no finality state or checkpoint root is injected.
+    let checkpoint_tx = PosTransaction::Exit { validator: 991 };
+    let after_checkpoint_tx = PosTransaction::Exit { validator: 992 };
+    let after_justified_tx = PosTransaction::Exit { validator: 993 };
+    let justified_slot = node.slot_of_canonical_root(&fin.justified.root).unwrap();
+    assert!(justified_slot > finalized_slot);
+    node.note_tx_slots(finalized_slot, std::slice::from_ref(&checkpoint_tx));
+    node.note_tx_slots(finalized_slot + 1, std::slice::from_ref(&after_checkpoint_tx));
+    node.note_tx_slots(justified_slot + 1, std::slice::from_ref(&after_justified_tx));
+    assert_eq!(node.tx_status(&checkpoint_tx.txid()), "finalized");
+    assert_eq!(node.tx_status(&after_checkpoint_tx.txid()), "justified");
+    assert_eq!(node.tx_status(&after_justified_tx.txid()), "included");
+}
+
+#[test]
+fn failed_reorg_does_not_publish_candidate_transaction_inclusions() {
+    let _clock = validator_lifecycle::clock_at(1);
+    let funds = funds();
+    let (mut node, _dir) = perf_support::proposing_engine_funded(&funds);
+    let genesis = *node.head_id().as_bytes();
+    let tx = spend(&funds[0], 9_000, 0, node.state.next_base_fee_at(0));
+    assert_eq!(node.on_transaction(tx.clone()), Ok(Admitted::New));
+    node.propose(1);
+    let first = node.blocks.get(node.head_id().as_bytes()).unwrap().clone();
+    assert_eq!(first.body.transactions, vec![tx.canonical_bytes()]);
+    node.propose(2);
+    let mut invalid_second = node.blocks.get(node.head_id().as_bytes()).unwrap().clone();
+    invalid_second.header.state_root = [0xff; 32];
+    invalid_second.proposer_sig = node.keys.as_ref().unwrap().sign(&invalid_second.header.proposal_signing_root());
+    assert!(node.do_reorg(genesis, Vec::new()));
+    assert_eq!(node.tx_status(&tx.txid()), "unknown");
+    let before_index = node.tx_slot_index.clone();
+    let before_order = node.tx_slot_index_order.clone();
+    let before_state = (*node.state).clone();
+    assert!(!node.do_reorg(genesis, vec![first.clone(), invalid_second]));
+    assert_eq!(*node.state, before_state);
+    assert_eq!(*node.head_id().as_bytes(), genesis);
+    assert_eq!(node.tx_slot_index, before_index);
+    assert_eq!(node.tx_slot_index_order, before_order);
+    assert_eq!(node.tx_status(&tx.txid()), "unknown");
+    assert_eq!(node.on_transaction(tx.clone()), Ok(Admitted::New), "a rejected branch must not manufacture Duplicate");
+    assert!(node.do_reorg(genesis, vec![first]));
+    assert_eq!(node.tx_slot_index.get(&tx.txid()), Some(&1));
+    assert_eq!(node.tx_slot_index_order.iter().filter(|id| **id == tx.txid()).count(), 1,
+        "an old FIFO identity must not later evict the re-included transaction");
+    assert_eq!(node.tx_status(&tx.txid()), "included");
+}
+
+#[test]
+fn admission_negative_cache_retries_corrected_transfer_signature_root_and_key() {
+    use bloch_pos_committee::transition::{TransferInputV2, WitnessKey};
+    let funds = funds();
+    let original = spend(&funds[0], 9_000, 0, 1);
+    let PosTransaction::Transfer { inputs, outputs, tx_bytes, tip_millisat_per_gas } = original.clone() else { unreachable!() };
+    let mut v2 = PosTransaction::TransferV2 {
+        keys: vec![WitnessKey { pubkey: inputs[0].pubkey.clone(), signature: Vec::new() }],
+        inputs: vec![TransferInputV2 { txid: inputs[0].txid, vout: inputs[0].vout, key_index: 0 }],
+        outputs, tx_bytes, tip_millisat_per_gas,
+    };
+    let (_, secret) = bloch_crypto::crypto::generate_keypair_from_seed(&[71; 32]).unwrap();
+    let v2_signature = bloch_crypto::crypto::sign(&secret, &v2.spend_signing_root()).unwrap();
+    if let PosTransaction::TransferV2 { keys, .. } = &mut v2 { keys[0].signature = v2_signature; }
+    let activation = bloch_pos_committee::params::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH;
+    let set_signature = |tx: &mut PosTransaction, signature: Vec<u8>| match tx {
+        PosTransaction::Transfer { inputs, .. } => inputs[0].signature = signature,
+        PosTransaction::TransferV2 { keys, .. } => keys[0].signature = signature,
+        _ => unreachable!(),
+    };
+    for valid in [original, v2] {
+        let (verifier, calls) = verification::counted_hybrid();
+        let mut forged = valid.clone();
+        set_signature(&mut forged, vec![0; 4_700]);
+        for _ in 0..16 { assert!(admissible_with_verifier(&forged, activation, &verifier).is_err()); }
+        assert_eq!(calls.get(), 1, "an identical immutable failure must skip repeated cryptography");
+        assert!(admissible_with_verifier(&valid, activation, &verifier).is_ok());
+        assert_eq!(calls.get(), 2);
+        let mut changed = valid.clone();
+        match &mut changed {
+            PosTransaction::Transfer { outputs, .. } | PosTransaction::TransferV2 { outputs, .. } => outputs[0].value -= 1,
+            _ => unreachable!(),
+        }
+        assert!(admissible_with_verifier(&changed, activation, &verifier).is_err());
+        assert_eq!(calls.get(), 3, "a changed signing root must be checked independently");
+        let signature = bloch_crypto::crypto::sign(&secret, &changed.spend_signing_root()).unwrap();
+        set_signature(&mut changed, signature);
+        assert!(admissible_with_verifier(&changed, activation, &verifier).is_ok());
+        let (new_key, new_secret) = bloch_crypto::crypto::generate_keypair_from_seed(&[73; 32]).unwrap();
+        match &mut changed {
+            PosTransaction::Transfer { inputs, .. } => inputs[0].pubkey = new_key,
+            PosTransaction::TransferV2 { keys, .. } => keys[0].pubkey = new_key,
+            _ => unreachable!(),
+        }
+        assert!(admissible_with_verifier(&changed, activation, &verifier).is_err());
+        assert_eq!(calls.get(), 5, "a new public key must not inherit another key's cache result");
+        let signature = bloch_crypto::crypto::sign(&new_secret, &changed.spend_signing_root()).unwrap();
+        set_signature(&mut changed, signature);
+        assert!(admissible_with_verifier(&changed, activation, &verifier).is_ok());
+        assert_eq!(calls.get(), 6);
+        assert_eq!(admissible(&changed, activation), admissible_with_verifier(&changed, activation, &verifier));
+    }
+}

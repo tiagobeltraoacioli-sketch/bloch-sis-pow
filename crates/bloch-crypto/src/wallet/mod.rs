@@ -65,6 +65,30 @@ pub fn sat_u64(v: &serde_json::Value) -> Option<u64> {
     v.as_str().and_then(|s| s.trim().parse::<u64>().ok())
 }
 
+/// Parse an exact BLOCH decimal amount into satoshis without floating point.
+/// Accepts unsigned decimal notation with at most eight fractional digits.
+/// Exponents, signs, sub-satoshi precision and u64 overflow are rejected.
+pub fn parse_bloch_satoshis(amount: &str) -> Result<u64, &'static str> {
+    let amount = amount.trim();
+    let (whole, fraction) = amount.split_once('.').unwrap_or((amount, ""));
+    if (whole.is_empty() && fraction.is_empty()) || fraction.len() > 8
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("amount must use unsigned decimal notation with at most 8 fractional digits");
+    }
+    let whole = if whole.is_empty() { 0 } else {
+        whole.parse::<u64>().map_err(|_| "amount exceeds u64 satoshis")?
+    };
+    let mut fractional = if fraction.is_empty() { 0 } else {
+        fraction.parse::<u64>().map_err(|_| "invalid fractional amount")?
+    };
+    for _ in fraction.len()..8 {
+        fractional = fractional.checked_mul(10).ok_or("amount exceeds u64 satoshis")?;
+    }
+    whole.checked_mul(100_000_000).and_then(|value| value.checked_add(fractional))
+        .ok_or("amount exceeds u64 satoshis")
+}
+
 /// Local UTXO representation for wallet operations.
 #[derive(Debug, Clone)]
 pub struct Utxo {
@@ -328,6 +352,12 @@ impl Wallet {
         if utxos.is_empty() {
             return Err(WalletError::InsufficientFunds { needed, have: 0 });
         }
+        let mut outpoints = std::collections::BTreeSet::new();
+        for utxo in &utxos {
+            if !outpoints.insert((utxo.txid, utxo.index)) {
+                return Err(WalletError::Parse("duplicate UTXO outpoint".into()));
+            }
+        }
         let total_in = utxos.iter().try_fold(0u64, |total, utxo| {
             total.checked_add(utxo.output.value).ok_or(WalletError::Overflow)
         })?;
@@ -378,6 +408,27 @@ impl Wallet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_wallet_custom_file_budget_preserves_authenticated_roundtrip() {
+        let (wallet, _) = Wallet::generate(Network::Testnet).unwrap();
+        let password = "synthetic-backup-password-19!";
+        let encrypted = encryption::EncryptedKeyfile::encrypt_with_params(
+            &wallet.keypair.secret, &wallet.keypair.public, wallet.network, password,
+            encryption::KdfParams { m_cost: 1024, t_cost: 1, p_cost: 1 }).unwrap();
+        let bytes = serde_json::to_vec(&encrypted).unwrap();
+        let path = std::env::temp_dir().join(format!("bloch-current-wallet-budget-{}.json", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let loaded = Wallet::load_encrypted_with_file_limit(&path, password, bytes.len()).unwrap();
+        assert_eq!(loaded.address, wallet.address);
+        assert_eq!(loaded.keypair.secret, wallet.keypair.secret);
+        assert_eq!(loaded.network, Network::Testnet);
+        assert!(matches!(Wallet::load_encrypted_with_file_limit(&path, "wrong", bytes.len() - 1),
+            Err(WalletError::Io(message)) if message.contains("byte limit")));
+        assert!(matches!(Wallet::load_encrypted_with_file_limit(&path, "wrong", bytes.len()),
+            Err(WalletError::WrongPassword)));
+        std::fs::remove_file(path).unwrap();
+    }
 
     /// V4 rule R3: satoshi amounts arrive as decimal strings; live G3 nodes
     /// still send numbers. Wallet parsing must accept BOTH, exactly — including
@@ -833,6 +884,21 @@ impl TxBuilder {
         let total_needed = amount_sats.checked_add(fee_sats)
             .ok_or("amount + fee overflow")?;
 
+        let to_bytes = hex::decode(to_address_hex)
+            .map_err(|_| "invalid destination address hex")?;
+        if to_bytes.len() != 20 {
+            return Err("destination address hash must contain exactly 20 bytes".into());
+        }
+        let mut outpoints = std::collections::BTreeSet::new();
+        for (txid, index, _) in available_utxos {
+            if txid.len() != 32 {
+                return Err("UTXO transaction ID must contain exactly 32 bytes".into());
+            }
+            if !outpoints.insert((txid.as_slice(), *index)) {
+                return Err("duplicate UTXO outpoint".into());
+            }
+        }
+
         // Coin selection: greedy, smallest-first
         let mut selected: Vec<&(Vec<u8>, u32, TxOutput)> = vec![];
         let mut selected_total = 0u64;
@@ -841,7 +907,8 @@ impl TxBuilder {
 
         for utxo in &sorted {
             selected.push(utxo);
-            selected_total += utxo.2.value;
+            selected_total = selected_total.checked_add(utxo.2.value)
+                .ok_or("selected UTXO value overflow")?;
             if selected_total >= total_needed { break; }
         }
 
@@ -855,13 +922,11 @@ impl TxBuilder {
         // Build inputs (script_sig empty for now — filled after sighash)
         let inputs: Vec<TxInput> = selected.iter().map(|(txid, idx, _)| {
             let mut prev_txid = [0u8; 32];
-            prev_txid.copy_from_slice(&txid[..32.min(txid.len())]);
+            prev_txid.copy_from_slice(txid);
             TxInput { prev_txid, prev_index: *idx, script_sig: vec![], sequence: u32::MAX }
         }).collect();
 
-        // Build outputs
-        let to_bytes = hex::decode(to_address_hex)
-            .map_err(|_| "invalid destination address hex")?;
+        // Build outputs (destination was validated before coin selection/signing).
         let mut outputs = vec![TxOutput { value: amount_sats, script_pubkey: to_bytes }];
 
         // Change output
@@ -1179,5 +1244,67 @@ mod audit_transaction_boundaries {
             txid:[1;32], index:index as u32, output:TxOutput { value, script_pubkey:wallet.address().hash().to_vec() }
         }).collect();
         assert!(matches!(wallet.build_tx(inputs, wallet.address(), 1, 0), Err(WalletError::Overflow)));
+    }
+}
+
+#[cfg(test)]
+mod audit_coin_selection_inputs {
+    use super::*;
+
+    #[test]
+    fn legacy_builder_refuses_malformed_outpoints_destinations_duplicates_and_overflow() {
+        let keypair = generate_keypair(true);
+        let output = |value| TxOutput { value, script_pubkey: keypair.address_bytes() };
+        let destination = "ab".repeat(20);
+        for length in [0, 1, 31, 33, 64] {
+            let inputs = vec![(vec![1; length], 0, output(1000))];
+            assert!(TxBuilder::build(&keypair, &inputs, &destination, 900, 100)
+                .err().unwrap().contains("exactly 32 bytes"));
+        }
+        let valid = vec![(vec![1; 32], 0, output(1000))];
+        for destination in [String::new(), "ab".repeat(19), "ab".repeat(21), "zz".repeat(20)] {
+            assert!(TxBuilder::build(&keypair, &valid, &destination, 900, 100).is_err());
+        }
+        let repeated = vec![(vec![1; 32], 0, output(500)), (vec![1; 32], 0, output(500))];
+        assert!(TxBuilder::build(&keypair, &repeated, &destination, 900, 100)
+            .err().unwrap().contains("duplicate"));
+        let overflow = vec![(vec![1; 32], 0, output(1)), (vec![2; 32], 0, output(u64::MAX))];
+        assert!(TxBuilder::build(&keypair, &overflow, &destination, u64::MAX, 0)
+            .err().unwrap().contains("overflow"));
+        // Distinct output indices from the same transaction are legitimate.
+        let distinct = vec![(vec![1; 32], 0, output(500)), (vec![1; 32], 1, output(500))];
+        let tx = TxBuilder::build(&keypair, &distinct, &destination, 900, 100).unwrap();
+        assert_eq!(tx.inputs.len(), 2);
+        assert_eq!(tx.outputs[0].value, 900);
+        assert_eq!(tx.outputs[0].script_pubkey, vec![0xab; 20]);
+    }
+
+    #[test]
+    fn current_builder_refuses_repeated_outpoint_without_rejecting_other_indices() {
+        let (wallet, _) = Wallet::generate(Network::Testnet).unwrap();
+        let utxo = |index| Utxo { txid: [3; 32], index,
+            output: TxOutput { value: 500, script_pubkey: wallet.address().hash().to_vec() } };
+        assert!(matches!(wallet.build_tx(vec![utxo(0), utxo(0)], wallet.address(), 900, 100),
+            Err(WalletError::Parse(message)) if message.contains("duplicate")));
+        let tx = wallet.build_tx(vec![utxo(0), utxo(1)], wallet.address(), 900, 100).unwrap();
+        assert_eq!(tx.inputs.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod audit_exact_decimal_amounts {
+    use super::parse_bloch_satoshis;
+    #[test]
+    fn exact_values_cover_float_precision_and_u64_boundaries() {
+        for (input, expected) in [("0", 0), (".5", 50_000_000), ("1.", 100_000_000),
+            ("0.00000001", 1), ("90071992.54740993", 9_007_199_254_740_993),
+            ("184467440737.09551615", u64::MAX), (" 0001.2500 ", 125_000_000)] {
+            assert_eq!(parse_bloch_satoshis(input), Ok(expected));
+        }
+        for invalid in ["", ".", "-1", "+1", "NaN", "inf", "1e3", "1.2.3",
+            "0.000000001", "1.000000000", "184467440737.09551616", "184467440738",
+            "999999999999999999999999999", "１", "1,000"] {
+            assert!(parse_bloch_satoshis(invalid).is_err());
+        }
     }
 }

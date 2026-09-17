@@ -408,7 +408,7 @@ fn do_send(params: &[&str], rpc_host: &str, rpc_port: u16) {
     let amount_str = params[2];
 
     // Parse fee (default 0.001 BLOCH)
-    let mut fee_bloch: f64 = 0.001;
+    let mut fee_bloch = "0.001";
     // Chain-id to sign for. The sighash folds in the chain-id, so signing for
     // the wrong one yields a SILENTLY-rejected tx ("invalid signature"). The
     // LIVE network is Genesis-2, so default to it (previously the wallet fell
@@ -418,7 +418,7 @@ fn do_send(params: &[&str], rpc_host: &str, rpc_port: u16) {
     let mut i = 3;
     while i < params.len() {
         if params[i] == "--fee" && i + 1 < params.len() {
-            fee_bloch = params[i + 1].parse().unwrap_or_else(|_| die("invalid fee"));
+            fee_bloch = params[i + 1];
             i += 2;
         } else if params[i] == "--chain" && i + 1 < params.len() {
             chain = params[i + 1].to_lowercase();
@@ -450,7 +450,8 @@ fn do_send(params: &[&str], rpc_host: &str, rpc_port: u16) {
     println!("Signing for chain: {}", chain);
 
     let amount_sats = bloch_to_sats(amount_str);
-    let fee_sats = (fee_bloch * 1e8) as u64;
+    let fee_sats = bloch::wallet::parse_bloch_satoshis(fee_bloch).unwrap_or_else(|message| die(message));
+    amount_sats.checked_add(fee_sats).unwrap_or_else(|| die("amount plus fee exceeds u64"));
 
     // Load wallet
     let password = read_password("Wallet password: ");
@@ -480,29 +481,12 @@ fn do_send(params: &[&str], rpc_host: &str, rpc_port: u16) {
         process::exit(1);
     }
 
-    // Convert to TxBuilder format
-    let mut available_utxos: Vec<(Vec<u8>, u32, bloch::core::TxOutput)> = Vec::new();
-    for u in &utxos_json {
-        let txid = hex::decode(u["txid"].as_str().unwrap_or("")).unwrap_or_default();
-        let idx = u["index"].as_u64().unwrap_or(0) as u32;
-        let value = sat_u64(&u["value"]).unwrap_or(0);
-        let spk = hex::decode(u["script_pubkey"].as_str().unwrap_or("")).unwrap_or_default();
-        available_utxos.push((txid, idx, bloch::core::TxOutput { value, script_pubkey: spk }));
-    }
-
-    let total_available: u64 = available_utxos.iter().map(|(_, _, o)| o.value).sum();
+    // Refuse malformed rows before they lose width or network information.
+    let available_utxos = parse_send_utxos(&utxos_json).unwrap_or_else(|message| die(message));
+    let total_available = available_utxos.iter().try_fold(0u64, |total, (_, _, output)| total.checked_add(output.value))
+        .unwrap_or_else(|| die("UTXO value total exceeds u64"));
     println!("Available: {} BLOCH ({} UTXOs)", total_available as f64 / 1e8, available_utxos.len());
-
-    // Sprint K: Parse and validate destination address (checksum-enforced)
-    let to_addr = match bloch::address::Address::parse(to_address) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("Invalid destination address: {}", e);
-            eprintln!("Hint: addresses must be 55 chars total (bloch1q + 40 hex hash + 8 hex checksum)");
-            process::exit(1);
-        }
-    };
-    let to_addr_hex = hex::encode(to_addr.hash());
+    let to_addr_hex = checked_destination(to_address, &keypair.address).unwrap_or_else(|message| die(message));
 
     // Build and sign TX
     let tx = match bloch::wallet::TxBuilder::build(
@@ -749,8 +733,34 @@ fn sat_u64(v: &serde_json::Value) -> Option<u64> {
 }
 
 fn bloch_to_sats(s: &str) -> u64 {
-    let f: f64 = s.parse().unwrap_or_else(|_| die("invalid amount"));
-    (f * 1e8) as u64
+    checked_payment_sats(s).unwrap_or_else(|message| die(message))
+}
+
+fn checked_payment_sats(value: &str) -> Result<u64, &'static str> {
+    let satoshis = bloch::wallet::parse_bloch_satoshis(value)?;
+    if satoshis == 0 { return Err("payment must contain at least one satoshi"); }
+    Ok(satoshis)
+}
+
+fn checked_destination(destination: &str, source: &str) -> Result<String, &'static str> {
+    let destination = bloch::address::Address::parse(destination).map_err(|_| "invalid destination address")?;
+    let source = bloch::address::Address::parse(source).map_err(|_| "invalid wallet address")?;
+    if destination.network() != source.network() { return Err("destination address network differs from wallet"); }
+    Ok(hex::encode(destination.hash()))
+}
+
+fn parse_send_utxos(rows: &[serde_json::Value]) -> Result<Vec<(Vec<u8>, u32, bloch::core::TxOutput)>, &'static str> {
+    rows.iter().map(|row| {
+        let txid = hex::decode(row["txid"].as_str().ok_or("UTXO missing transaction ID")?)
+            .map_err(|_| "invalid UTXO transaction ID hex")?;
+        if txid.len() != 32 { return Err("UTXO transaction ID must contain 32 bytes"); }
+        let index = row["index"].as_u64().and_then(|value| u32::try_from(value).ok())
+            .ok_or("UTXO index must fit u32")?;
+        let value = sat_u64(&row["value"]).ok_or("invalid UTXO value")?;
+        let script_pubkey = hex::decode(row["script_pubkey"].as_str().ok_or("UTXO missing script")?)
+            .map_err(|_| "invalid UTXO script hex")?;
+        Ok((txid, index, bloch::core::TxOutput { value, script_pubkey }))
+    }).collect()
 }
 
 fn require_params(params: &[&str], min: usize, usage: &str) {
@@ -822,4 +832,35 @@ fn print_usage() {
     --rpc-port <port>                      RPC port (default: 16210)
     --help                                 This message
 "#);
+}
+
+#[cfg(test)]
+mod audit_send_inputs {
+    use super::*;
+    #[test]
+    fn amounts_are_exact_and_refuse_sub_satoshi_or_exponent_notation() {
+        for value in ["NaN", "inf", "-1", "1e30", "0.000000019", "0"] {
+            assert!(checked_payment_sats(value).is_err());
+        }
+        assert_eq!(bloch::wallet::parse_bloch_satoshis("0"), Ok(0));
+        assert_eq!(checked_payment_sats("1.25"), Ok(125_000_000));
+        assert_eq!(checked_payment_sats("90071992.54740993"), Ok(9_007_199_254_740_993));
+    }
+    #[test]
+    fn indices_and_networks_are_checked_before_information_is_discarded() {
+        use bloch::address::{Address, Network};
+        let main = Address::from_hash([1; 20], Network::Mainnet).to_string();
+        let test = Address::from_hash([1; 20], Network::Testnet).to_string();
+        assert!(checked_destination(&main, &test).is_err());
+        assert!(checked_destination(&test, &main).is_err());
+        assert_eq!(checked_destination(&main, &main).unwrap(), "01".repeat(20));
+        let mut row = serde_json::json!({"txid": "ab".repeat(32), "index": u32::MAX,
+            "value": "9007199254740993", "script_pubkey": "cd".repeat(20)});
+        let parsed = parse_send_utxos(&[row.clone()]).unwrap();
+        assert_eq!(parsed[0].1, u32::MAX);
+        assert_eq!(parsed[0].2.value, 9_007_199_254_740_993);
+        row["index"] = serde_json::json!(4294967296u64);
+        assert!(parse_send_utxos(&[row]).is_err());
+        assert!(parse_send_utxos(&[serde_json::json!({})]).is_err());
+    }
 }

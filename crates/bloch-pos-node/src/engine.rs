@@ -106,6 +106,7 @@ use sha3::{Digest, Sha3_256};
 
 mod validator_lifecycle;
 mod admission;
+mod proposal_wire;
 
 use crate::genesis::Manifest;
 #[cfg(test)]
@@ -1962,6 +1963,14 @@ impl Engine {
         // is bounded by the selection size and terminates. If the empty
         // selection also fails, the fault is not attributable to a transaction.
         let mut txs = self.select_transactions(bloch_pos_committee::epoch_of(slot));
+        // Local production policy: never sign a block our smallest supported
+        // gossip transport cannot carry. Incoming consensus acceptance stays
+        // unchanged, and the pool keeps omitted votes for a later proposal.
+        if !proposal_wire::fit(&header, &mut atts, &txs) {
+            eprintln!("[slot {slot}] proposal transaction body exceeds local gossip budget");
+            return;
+        }
+        header.attestation_root = derive::attestation_root(&atts);
         let (post, tx_bytes) = loop {
             let tx_bytes: Vec<Vec<u8>> = txs.iter().map(PosTransaction::canonical_bytes).collect();
             header.body_root = derive::body_root(&tx_bytes);
@@ -2522,7 +2531,8 @@ impl Engine {
     }
 
     /// Drop non-canonical blocks — stored and parked — that sit below the
-    /// finalized checkpoint.
+    /// finalized checkpoint, and descendants made unreachable by that removal.
+    /// Still-connected above-floor branches are not count-capped.
     ///
     /// **Why this cannot lose a branch.** `lmd_ghost_head` starts its descent
     /// at the justified root and only ever walks to children, so the head is
@@ -2544,24 +2554,40 @@ impl Engine {
         let Some(floor) = first_slot_of_epoch(finalized_epoch) else {
             return;
         };
-        let doomed: Vec<[u8; 32]> = self
-            .blocks
-            .iter()
+        let mut pending: VecDeque<[u8; 32]> = self.blocks.iter()
             .filter(|(id, env)| env.header.slot < floor && !self.canonical.contains(*id))
-            .map(|(id, _)| *id)
-            .collect();
-        for id in doomed {
-            self.blocks.remove(&id);
-            self.blocks_pruned = self.blocks_pruned.saturating_add(1);
+            .map(|(id, _)| *id).collect();
+        pending.extend(self.orphans.iter()
+            .filter(|(_, env)| env.header.slot < floor).map(|(id, _)| *id));
+        if pending.is_empty() { return; }
+
+        // A descendant cannot reconnect once its already-finalized-away
+        // ancestor is removed. Traverse edges once instead of repeatedly
+        // scanning the whole map, and never remove a canonical envelope.
+        let mut children: BTreeMap<[u8; 32], Vec<[u8; 32]>> = BTreeMap::new();
+        for (id, env) in &self.blocks {
+            if !self.canonical.contains(id) {
+                children.entry(env.header.parent).or_default().push(*id);
+            }
         }
-        // Parked blocks under the floor can never connect to a branch that
-        // could win, so holding them only costs slots other orphans need.
+        for (id, env) in &self.orphans {
+            children.entry(env.header.parent).or_default().push(*id);
+        }
+        let mut doomed = BTreeSet::new();
+        while let Some(id) = pending.pop_front() {
+            if self.canonical.contains(&id) || !doomed.insert(id) { continue; }
+            if let Some(descendants) = children.remove(&id) {
+                pending.extend(descendants);
+            }
+        }
+        for id in &doomed {
+            if self.blocks.remove(id).is_some() {
+                self.blocks_pruned = self.blocks_pruned.saturating_add(1);
+            }
+        }
         let before = self.orphans.len();
-        self.orphans.retain(|(_, env)| env.header.slot >= floor);
-        // `retain` only shrinks, so `before - len` is the eviction count; both
-        // are counters, saturating by design.
-        self.orphans_evicted = self
-            .orphans_evicted
+        self.orphans.retain(|(id, _)| !doomed.contains(id));
+        self.orphans_evicted = self.orphans_evicted
             .saturating_add(before.saturating_sub(self.orphans.len()) as u64);
     }
 
@@ -2619,11 +2645,8 @@ impl Engine {
             let id = tx.txid();
             if self.tx_slot_index.get(&id) == Some(&slot) {
                 self.tx_slot_index.remove(&id);
-                // Left in `tx_slot_index_order`: the FIFO eviction loop in
-                // `note_tx_slots` tolerates a stale id there (it is simply a
-                // no-op removal when its turn comes), and the order queue's
-                // OWN length is what bounds memory, so this costs nothing
-                // beyond one wasted future eviction slot.
+                // The reorg caller compacts the FIFO once after removing the
+                // entire losing tail, before reinserting adopted identities.
             }
         }
     }
@@ -2633,14 +2656,12 @@ impl Engine {
     /// lookup) before the cached mempool identity index (`O(log n)`).
     fn tx_status(&self, txid: &[u8; 32]) -> &'static str {
         if let Some(&slot) = self.tx_slot_index.get(txid) {
-            let fin = self.state.finality();
-            let e = epoch_of(slot);
-            return if e <= fin.finalized.epoch {
-                "finalized"
-            } else if e <= fin.justified.epoch {
-                "justified"
-            } else {
-                "included"
+            // A checkpoint names a block, not every block in its epoch.
+            // Share the exact boundary semantics used by the block RPC.
+            return match self.finality_of(slot, true) {
+                Finality::Finalized => "finalized",
+                Finality::Justified => "justified",
+                _ => "included",
             };
         }
         if self.mempool.has_txid(txid) {
@@ -3131,7 +3152,8 @@ impl Engine {
                 return Err(Refusal::Invalid("funded deposit belongs to a different genesis manifest"));
             }
         }
-        admissible(&tx, epoch_of(self.wall_slot())).map_err(Refusal::Invalid)?;
+        admissible_with_verifier(&tx, epoch_of(self.wall_slot()), &self.gossip_verifier)
+            .map_err(Refusal::Invalid)?;
         if self.funded_mempool_conflict(&tx, &capacity.stale) {
             return Err(Refusal::Invalid("funded deposit conflicts with a pending input or validator key"));
         }
@@ -3659,6 +3681,7 @@ impl Engine {
         // Post-states of the branch, so the ring is refilled for the branch
         // that just won without recomputing anything.
         let mut applied: Vec<([u8; 32], Arc<CommittedState>)> = Vec::with_capacity(branch.len());
+        let mut included_txs = Vec::with_capacity(branch.len());
         for env in &branch {
             let envelope = ProposalEnvelope {
                 header: env.header.clone(),
@@ -3677,13 +3700,11 @@ impl Engine {
                 .apply_block(pre, &envelope, &env.body.attestations, &txs)
             {
                 Ok(post) => {
-                    // R4 F-11: the whole branch is guaranteed adopted from
-                    // here — every remaining block in it either validates
-                    // too or this function returns `false` before any of
-                    // this is observable — so recording now, rather than in
-                    // a second pass after `self.chain` is rebuilt below, does
-                    // not risk indexing a branch that never lands.
-                    self.note_tx_slots(env.header.slot, &txs);
+                    // Keep candidate metadata private until every block passes.
+                    // A later refusal must not report these transactions as
+                    // included, reject their resubmission as duplicates, or
+                    // evict genuine canonical records from the bounded index.
+                    included_txs.push((env.header.slot, txs));
                     applied.push((*env.block_id().as_bytes(), Arc::new(post)));
                 }
                 Err(err) => {
@@ -3709,6 +3730,13 @@ impl Engine {
             .collect();
         for (slot, txs) in stale {
             self.forget_tx_slots_if_stale(slot, &txs);
+        }
+        // Remove stale FIFO identities once for the whole losing tail. If an
+        // adopted transaction is reinserted while its old queue ID remains,
+        // that old ID could later evict the fresh canonical inclusion.
+        self.tx_slot_index_order.retain(|id| self.tx_slot_index.contains_key(id));
+        for (slot, txs) in included_txs {
+            self.note_tx_slots(slot, &txs);
         }
         let st = applied
             .last()
@@ -5618,13 +5646,17 @@ fn declared_size_bound(tx: &PosTransaction, declared: u64) -> Result<(), &'stati
 }
 
 pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'static str> {
+    admissible_with_verifier(tx, wall_epoch, &HybridVerifier::new())
+}
+
+fn admissible_with_verifier(tx: &PosTransaction, wall_epoch: u64, verifier: &dyn SignatureVerifier) -> Result<(), &'static str> {
     match tx {
         PosTransaction::FundedDeposit(deposit) => {
             if !bloch_pos_committee::params::funded_validator_admission_active(wall_epoch) {
                 return Err("funded validator admission is not active: FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH is unarmed or not reached");
             }
             if wall_epoch > deposit.valid_until_epoch { return Err("funded deposit has expired"); }
-            deposit.verify_authorizations(&HybridVerifier::new())
+            deposit.verify_authorizations(verifier)
                 .map_err(|_| "invalid funded deposit shape or hybrid PQ authorization")
         }
 
@@ -5739,7 +5771,7 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
             // the two free ones above.
             let signing_root = tx.spend_signing_root();
             for i in inputs {
-                if !bloch_crypto::crypto::verify(&i.pubkey, &signing_root, &i.signature) {
+                if !verifier.verify_with_key(&i.pubkey, &signing_root, &i.signature) {
                     return Err("transfer carries a signature that does not verify");
                 }
             }
@@ -5886,7 +5918,7 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
             // garbage that every proposer then pays to drop.
             let signing_root = tx.spend_signing_root();
             for k in keys {
-                if !bloch_crypto::crypto::verify(&k.pubkey, &signing_root, &k.signature) {
+                if !verifier.verify_with_key(&k.pubkey, &signing_root, &k.signature) {
                     return Err("transfer carries a signature that does not verify");
                 }
             }
@@ -11173,6 +11205,50 @@ mod ingest_admission_tests {
         );
     }
 
+    #[test]
+    fn finalized_pruning_removes_high_slot_descendants_without_capping_live_branches() {
+        let (mut engine, _dir) = finality_latch_tests::engine_with_own_finality();
+        let floor = first_slot_of_epoch(engine.state.finality().finalized.epoch).unwrap();
+        assert!(floor > 2);
+        let genesis = *engine.chain[0].1.as_bytes();
+        let template = engine.blocks.get(engine.head_id().as_bytes()).unwrap().clone();
+        let root = repointed(&engine, &template, genesis, 2);
+        let child = repointed(&engine, &template, *root.block_id().as_bytes(), floor + 10);
+        let grandchild = repointed(&engine, &template, *child.block_id().as_bytes(), floor + 20);
+        let root_id = *root.block_id().as_bytes();
+        let child_id = *child.block_id().as_bytes();
+        let grandchild_id = *grandchild.block_id().as_bytes();
+        for env in [root, child, grandchild] { engine.blocks.insert(*env.block_id().as_bytes(), env); }
+        let retained = repointed(&engine, &template, *engine.head_id().as_bytes(), floor + 200);
+        let retained_id = *retained.block_id().as_bytes();
+        engine.blocks.insert(retained_id, retained);
+        let orphan = repointed(&engine, &template, grandchild_id, floor + 30);
+        let orphan_child = repointed(&engine, &template, *orphan.block_id().as_bytes(), floor + 40);
+        // Reverse arrival order must not leave a pending descendant behind.
+        engine.orphans.push_back((*orphan_child.block_id().as_bytes(), orphan_child));
+        engine.orphans.push_back((*orphan.block_id().as_bytes(), orphan));
+        let old_gap = repointed(&engine, &template, [0x71; 32], 1);
+        let gap_child = repointed(&engine, &template, *old_gap.block_id().as_bytes(), floor + 50);
+        engine.orphans.push_back((*gap_child.block_id().as_bytes(), gap_child));
+        engine.orphans.push_back((*old_gap.block_id().as_bytes(), old_gap));
+        let unrelated = repointed(&engine, &template, [0x72; 32], floor + 60);
+        let unrelated_id = *unrelated.block_id().as_bytes();
+        engine.orphans.push_back((unrelated_id, unrelated));
+        let canonical = engine.canonical.clone();
+        let chosen_head = engine.forkchoice_head();
+        let before_blocks = engine.blocks_pruned;
+        let before_orphans = engine.orphans_evicted;
+        engine.prune_below_finalized();
+        for id in [root_id, child_id, grandchild_id] { assert!(!engine.blocks.contains_key(&id)); }
+        assert!(engine.blocks.contains_key(&retained_id), "no arbitrary cap on a still-connected branch");
+        assert_eq!(engine.orphans.len(), 1);
+        assert_eq!(engine.orphans[0].0, unrelated_id);
+        assert_eq!(engine.canonical, canonical);
+        assert_eq!(engine.forkchoice_head(), chosen_head);
+        assert_eq!(engine.blocks_pruned - before_blocks, 3);
+        assert_eq!(engine.orphans_evicted - before_orphans, 4);
+    }
+
     /// **Pruning is finality-shaped, not slot-shaped.** With nothing finalized
     /// there is no floor, so nothing may be dropped; this pins that the sweep
     /// cannot start eating a live branch on a chain that has not finalized.
@@ -11543,7 +11619,7 @@ mod finality_latch_tests {
     /// walks epochs as fast as it can sign. This is the expensive fixture —
     /// a couple of epochs of real hybrid signatures — so only the ratchet
     /// test pays for it; the refusal tests arm the latch by hand instead.
-    fn engine_with_own_finality() -> (Engine, perf_support::TestDir) {
+    pub(super) fn engine_with_own_finality() -> (Engine, perf_support::TestDir) {
         let (mut engine, dir) = perf_support::proposing_engine();
         for slot in 1..=(4 * SLOTS_PER_EPOCH) {
             engine.attest(slot);

@@ -5,19 +5,22 @@
 //! ## Read-only, low-rate, archival-only — by construction
 //!
 //! This is the one place the indexer talks to a node, and it exists for one
-//! reason: to prove the index agrees with the chain. It therefore does the
+//! reason: to compare the index with a remote observation. It therefore does the
 //! smallest thing that can prove it — a bounded sample of `getbalance` calls,
 //! serialised, with a delay between them, against an **archival observer**.
 //!
-//! [`Probe::new`] refuses a port that is not an archival's, because the
-//! difference between "a few hundred reads against a keyless observer" and "the
-//! same reads against a validator" is the difference between a check and the
-//! incident this whole crate exists to prevent. If you need to point it
-//! somewhere else, you are pointing it somewhere it should not go.
+//! The historical endpoints use plaintext HTTP. The allowlist limits targets;
+//! it does not authenticate an operator or prove an endpoint remains keyless.
+//! Results are diagnostics, not independent balance or finality trust anchors.
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use serde_json::Value;
+use crate::io_deadline::DeadlineStream;
+
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_HEADER_BYTES: usize = 16 * 1024;
 
 /// The two keyless archival observers. Nothing else is a legitimate target.
 pub const ARCHIVALS: [&str; 2] = ["139.180.166.5:8080", "139.180.173.231:8080"];
@@ -41,12 +44,12 @@ impl Probe {
                 ARCHIVALS.join(", ")
             ));
         }
-        Ok(Probe { addr: addr.to_string(), gap: Duration::from_millis(gap_ms), id: 0 })
+        Ok(Probe { addr: addr.to_string(), gap: Duration::from_millis(gap_ms.max(120)), id: 0 })
     }
 
-    fn call(&mut self, method: &str, params: &str) -> Result<String, String> {
+    fn call(&mut self, method: &str, params: &str) -> Result<Value, String> {
         std::thread::sleep(self.gap);
-        self.id += 1;
+        self.id = self.id.checked_add(1).ok_or("RPC request identifier exhausted")?;
         let body = format!(
             r#"{{"jsonrpc":"2.0","id":{},"method":"{method}","params":{params}}}"#,
             self.id
@@ -57,9 +60,9 @@ impl Probe {
             .map_err(|e| e.to_string())?
             .next()
             .ok_or("no address")?;
-        let mut s = TcpStream::connect_timeout(&sock, Duration::from_secs(10))
+        let socket = TcpStream::connect_timeout(&sock, Duration::from_secs(10))
             .map_err(|e| e.to_string())?;
-        s.set_read_timeout(Some(Duration::from_secs(20))).ok();
+        let mut s = DeadlineStream::new(&socket, Instant::now() + Duration::from_secs(20));
         let host = self.addr.clone();
         let req = format!(
             "POST / HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n\
@@ -67,10 +70,10 @@ impl Probe {
             body.len()
         );
         s.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
-        let mut resp = String::new();
-        s.read_to_string(&mut resp).map_err(|e| e.to_string())?;
-        let (_, b) = resp.split_once("\r\n\r\n").ok_or("no body in response")?;
-        Ok(b.to_string())
+        let mut response = Vec::new();
+        s.take(MAX_RESPONSE_BYTES as u64 + 1).read_to_end(&mut response)
+            .map_err(|_| "diagnostic response read failed or timed out")?;
+        decode_response(&response, self.id)
     }
 
     /// `getbalance` for one `script_hash`, returning the satoshi as the node
@@ -81,48 +84,67 @@ impl Probe {
     /// precisely because the values exceed 2^53, and re-parsing it as a float
     /// somewhere in the middle of a correctness check would defeat the check.
     pub fn balance(&mut self, script_hash_hex: &str) -> Result<u128, String> {
-        let body = self.call("getbalance", &format!(r#"["{script_hash_hex}"]"#))?;
-        extract_string_field(&body, "balance_sat")
-            .ok_or_else(|| format!("no balance_sat in response: {}", trim(&body)))?
-            .parse::<u128>()
-            .map_err(|e| e.to_string())
+        let hash = crate::hex32(&crate::parse_script_hash(script_hash_hex)?);
+        let body = self.call("getbalance", &format!(r#"["{hash}"]"#))?;
+        let decimal = body.get("balance_sat").and_then(Value::as_str).ok_or("missing balance_sat string")?;
+        if decimal.is_empty() || !decimal.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("invalid balance_sat decimal".into());
+        }
+        decimal.parse::<u128>().map_err(|_| "balance_sat exceeds integer range".into())
     }
 
     /// `getchaininfo`, returning `(height, slot, block_id, state_root)`.
     pub fn chaininfo(&mut self) -> Result<(u64, u64, String, String), String> {
         let body = self.call("getchaininfo", "[]")?;
-        let h = extract_num_field(&body, "height").ok_or("no height")?;
-        let s = extract_num_field(&body, "slot").ok_or("no slot")?;
-        let id = extract_string_field(&body, "block_id").ok_or("no block_id")?;
-        let sr = extract_string_field(&body, "state_root").ok_or("no state_root")?;
-        Ok((h as u64, s as u64, id, sr))
+        let h = body.get("height").and_then(Value::as_u64).ok_or("invalid height")?;
+        let s = body.get("slot").and_then(Value::as_u64).ok_or("invalid slot")?;
+        let digest = |key| -> Result<String, String> {
+            let text = body.get(key).and_then(Value::as_str).ok_or("missing chain digest")?;
+            Ok(crate::hex32(&crate::parse_script_hash(text)?))
+        };
+        Ok((h, s, digest("block_id")?, digest("state_root")?))
     }
 }
 
-fn trim(s: &str) -> String {
-    s.chars().take(200).collect()
-}
-
-/// Pull `"key":"value"` out of a JSON document by scanning.
-///
-/// A 40-line scanner rather than a JSON dependency, for the same reason the
-/// rest of this crate has none. It is used only against this node's own
-/// responses, whose shape is fixed by `BLOCH-RPC-V4.md`.
+/// Read an immediate string field from one complete JSON object.
 pub fn extract_string_field(doc: &str, key: &str) -> Option<String> {
-    let pat = format!("\"{key}\":\"");
-    let at = doc.find(&pat)? + pat.len();
-    let rest = &doc[at..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+    serde_json::from_str::<Value>(doc).ok()?.get(key)?.as_str().map(str::to_owned)
 }
 
 pub fn extract_num_field(doc: &str, key: &str) -> Option<u128> {
-    let pat = format!("\"{key}\":");
-    let at = doc.find(&pat)? + pat.len();
-    let rest = &doc[at..];
-    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
-    if end == 0 {
-        return None;
+    serde_json::from_str::<Value>(doc).ok()?.get(key)?.as_u64().map(u128::from)
+}
+
+/// Decode bounded diagnostic HTTP/JSON-RPC without echoing remote body text.
+pub fn decode_response(response: &[u8], expected_id: u64) -> Result<Value, String> {
+    if response.len() > MAX_RESPONSE_BYTES { return Err("diagnostic response exceeds byte budget".into()); }
+    let boundary = response.windows(4).position(|part| part == b"\r\n\r\n").ok_or("missing HTTP header terminator")?;
+    if boundary > MAX_HEADER_BYTES { return Err("diagnostic HTTP header exceeds byte budget".into()); }
+    let head = std::str::from_utf8(&response[..boundary]).map_err(|_| "invalid HTTP header")?;
+    let mut lines = head.split("\r\n");
+    let status: Vec<_> = lines.next().unwrap_or("").split_whitespace().collect();
+    if status.len() < 2 || !matches!(status[0], "HTTP/1.0" | "HTTP/1.1") || status[1] != "200" {
+        return Err("diagnostic HTTP status is not successful".into());
     }
-    rest[..end].parse().ok()
+    let mut content_length = None;
+    for line in lines {
+        let (name, value) = line.split_once(':').ok_or("invalid HTTP header field")?;
+        if name.eq_ignore_ascii_case("transfer-encoding") { return Err("unsupported diagnostic transfer encoding".into()); }
+        if name.eq_ignore_ascii_case("content-length") {
+            let value = value.trim();
+            if content_length.is_some() || value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err("invalid HTTP content length".into());
+            }
+            content_length = Some(value.parse::<usize>().map_err(|_| "invalid HTTP content length")?);
+        }
+    }
+    let body = &response[boundary + 4..];
+    if content_length.is_some_and(|size| size != body.len()) { return Err("HTTP response length mismatch".into()); }
+    let envelope: Value = serde_json::from_slice(body).map_err(|_| "invalid diagnostic JSON")?;
+    if envelope.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || envelope.get("id").and_then(Value::as_u64) != Some(expected_id)
+        || envelope.get("error").is_some_and(|error| !error.is_null()) {
+        return Err("RPC response version, identifier or error mismatch".into());
+    }
+    envelope.get("result").filter(|value| value.is_object()).cloned().ok_or("missing RPC result object".into())
 }

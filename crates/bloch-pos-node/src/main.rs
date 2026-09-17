@@ -818,14 +818,14 @@ fn keys_seal(args: &[String]) {
             }
         }
     } else {
-        let first = match keys::read_passphrase_from_tty("New keystore passphrase: ") {
+        let first = match keys::read_passphrase_from_tty_before_threads("New keystore passphrase: ") {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("keys seal: {e}");
                 exit(1);
             }
         };
-        let again = match keys::read_passphrase_from_tty("Repeat passphrase: ") {
+        let again = match keys::read_passphrase_from_tty_before_threads("Repeat passphrase: ") {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("keys seal: {e}");

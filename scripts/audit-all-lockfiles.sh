@@ -43,6 +43,7 @@ LOCKFILES=(
                                                # added by the P123-sp1-verifier fix
                                                # wave and left off this list)
   crates/coherence-prover/service/Cargo.lock  # SP1 prover HTTP service (same commit)
+  crates/coherence-prover/program/Cargo.lock  # Separately locked SP1 guest
   fuzz/Cargo.lock
   spikes/prover-cost/Cargo.lock
   spikes/prover-cost/rv32/Cargo.lock  # SP1 guest workspaces (rv32*)

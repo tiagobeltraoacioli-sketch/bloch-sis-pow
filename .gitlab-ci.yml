@@ -525,6 +525,7 @@ osv-scanner:
         --lockfile=euvm-tooling/Cargo.lock
         --lockfile=crates/coherence-prover/script/Cargo.lock
         --lockfile=crates/coherence-prover/service/Cargo.lock
+        --lockfile=crates/coherence-prover/program/Cargo.lock
         --lockfile=fuzz/Cargo.lock
         --lockfile=spikes/prover-cost/Cargo.lock
         --lockfile=spikes/prover-cost/rv32/Cargo.lock
@@ -607,20 +608,27 @@ fuzz-smoke:
 # scripts/ci-install-scanner.sh installs a PINNED gitleaks and fails if it
 # cannot.
 #
-# Scope, stated rather than implied: `--no-git` scans the WORKING TREE, so the
-# gate is on what a merge would introduce. Measured 2026-09-04 the tree is clean
-# under .gitleaks.toml (nine findings triaged there as doc/type-alias/public-key
-# shapes, each exempted by line pattern, not by muting the file). A full-history
-# scan reports 55 findings across 2,216 commits — history is immutable, so a
-# blocking job over it could never go green; that triage is separate work and is
-# written down in .gitleaks.toml instead of being hidden behind allow_failure.
-# Local run: gitleaks detect --no-git --source . --config .gitleaks.toml --redact
+# Tree and reachable-history scans are separate blocking jobs. Their reviewed
+# redacted baselines name exact benign findings, not whole files or rules.
+# See docs/audit/internal-remediation-2026-09-17/HISTORY-SCAN.md.
 secret-scan:
   stage: check
   before_script: []
   script:
     - CI_TOOLS_BIN="$HOME/.local/bin" bash scripts/ci-install-scanner.sh gitleaks
-    - '"$HOME/.local/bin/gitleaks" detect --no-git --source . --config .gitleaks.toml --no-banner --redact'
+    - bash scripts/scan-secrets.sh tree
+  allow_failure: false
+
+secret-history-scan:
+  stage: check
+  before_script: []
+  variables:
+    GIT_DEPTH: "0"
+  script:
+    - CI_TOOLS_BIN="$HOME/.local/bin" bash scripts/ci-install-scanner.sh gitleaks
+    - bash scripts/scan-secrets.sh history
+    - python3 scripts/scan-secrets.test.py
+  timeout: 15m
   allow_failure: false
 
 # Build + full test suite (the gate).

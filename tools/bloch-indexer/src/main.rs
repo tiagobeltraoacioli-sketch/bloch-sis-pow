@@ -423,14 +423,9 @@ fn compare(a: &Args) -> Result<(), String> {
     println!("  node state_root {node_root}");
     println!("  index tip state_root {}", hex32(&ix.tip().state_root));
 
-    if ix.height() != node_height {
-        println!(
-            "\n  NOTE: the index is at height {} and the node at {node_height}. The log was \
-             copied at a moment in time and the chain has moved since. Balances are compared \
-             anyway, and a mismatch on an address that received or spent in the gap is EXPECTED \
-             — the per-address lines below say which.",
-            ix.height()
-        );
+    if (ix.height(), ix.tip().slot, hex32(&ix.tip().block_id), hex32(&ix.tip().state_root))
+        != (node_height, node_slot, node_tip.clone(), node_root.clone()) {
+        return Err("comparison inconclusive: local and remote chain anchors differ".into());
     }
 
     let mut holders: Vec<(&[u8; 32], &u128)> = ix.balance.iter().collect();
@@ -465,23 +460,25 @@ fn compare(a: &Args) -> Result<(), String> {
                 disagree.push((hex, *mine, theirs));
             }
             Err(e) => {
-                disagree.push((hex, *mine, 0));
-                eprintln!("  rpc error for {}: {e}", hex32(sh));
+                return Err(format!("balance comparison inconclusive for {hex}: {e}"));
             }
         }
     }
 
     println!("\n  sampled {} script hashes: {agree} agree, {} differ", picks.len(), disagree.len());
     for (hex, mine, theirs) in disagree.iter().take(20) {
-        println!("    {hex}\n      index {mine}\n      node  {theirs}   (delta {})", *theirs as i128 - *mine as i128);
+        let sign = if theirs >= mine { "+" } else { "-" };
+        println!("    {hex}\n      index {mine}\n      node  {theirs}   (delta {sign}{})", theirs.abs_diff(*mine));
     }
-    // Also check that a hash the index has never seen reads zero on both sides,
-    // which is the shape the two-derivation bug takes: a funded key that reads 0.
+    // Compare the zero script hash without assuming it is necessarily unused.
     let never = "00".repeat(32);
-    match probe.balance(&never) {
-        Ok(0) => println!("\n  an unused script_hash reads 0 on the node, as it does here ✓"),
-        Ok(v) => println!("\n  unexpected: an all-zero script_hash holds {v} sat on the node"),
-        Err(e) => println!("\n  could not check the all-zero script_hash: {e}"),
+    let mine = ix.balance_of(&[0; 32]);
+    let theirs = probe.balance(&never)?;
+    if mine != theirs {
+        return Err(format!("zero script-hash balance differs: index {mine}, remote {theirs}"));
+    }
+    if probe.chaininfo()? != (node_height, node_slot, node_tip, node_root) {
+        return Err("comparison inconclusive: remote chain changed during sampling".into());
     }
     if disagree.is_empty() {
         println!("\n  every sampled balance agrees with the node.");

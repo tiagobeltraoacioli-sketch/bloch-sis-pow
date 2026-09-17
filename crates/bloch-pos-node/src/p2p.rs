@@ -186,14 +186,12 @@
 //!   validation, the canonical-address idempotency fix) are Genesis-3 code
 //!   that is not ported yet.
 //!
-//! - **The channel to the engine is unbounded.** During a cold sync the
-//!   in-flight ceiling is roughly `MAX_PAGES_WITHOUT_PROGRESS × MAX_SYNC_BLOCKS`
-//!   blocks per serving peer — a real bound, but a generous one (tens of MB),
-//!   and it is a bound on *memory*, not backpressure. Genesis-3 learned the
-//!   other side of this: a bounded channel that sheds under load dropped the
-//!   very sync replies the orphan pool was waiting on, in silence. Neither
-//!   answer is free; this one is chosen because a syncing node that stalls is
-//!   worse than one that is briefly fat, and it is named rather than assumed.
+//! - **The engine channel is admission-bounded before its first hop.** Source
+//!   reservations and a shared encoded-byte/event budget survive forwarding
+//!   through processing. Overload can shed a page; sync from the applied head
+//!   remains the recovery path, not a promise of lossless delivery. Directed
+//!   outgoing sync also shares one request window across all three callers.
+
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -218,6 +216,7 @@ use libp2p::{identify, identity, noise, yamux, PeerId, StreamProtocol, SwarmBuil
 pub use libp2p::Multiaddr;
 
 use crate::net::NetEvent;
+mod sync_requests;
 
 // ── Protocol identity: a Genesis-4 node must never speak to a Genesis-3 one ──
 
@@ -242,10 +241,13 @@ pub const TOPIC_TXS: &str = "bloch-g4/txs/1";
 
 // ── Bounds that are load-bearing, each pinned by an assertion ────────────────
 
-/// Largest gossip frame. A block with the full validator set attesting is
-/// dominated by hybrid signatures (~4.6 KB each), so this is generous rather
-/// than tight; `codec::MAX_FIELD_LEN` (8 MiB) remains the decoder's own cap.
+/// Largest gossip frame. This is smaller than the maximum consensus-valid
+/// body; local producers therefore pack to MAX_PROPOSAL_ENVELOPE_BYTES.
+/// Increasing receive limits or supporting older oversized blocks needs a
+/// separately qualified transport migration, not a consensus gate change.
 pub const MAX_GOSSIP_BYTES: usize = 4 * 1024 * 1024;
+/// Producer payload allowance with room for topic/author/transport framing.
+pub(crate) const MAX_PROPOSAL_ENVELOPE_BYTES: usize = MAX_GOSSIP_BYTES.saturating_sub(1024);
 
 /// Gossipsub's duplicate-cache retention. See [`REGOSSIP_SUPPRESS_TTL`].
 pub const DUPLICATE_CACHE_TIME: Duration = Duration::from_secs(30);
@@ -1069,6 +1071,7 @@ fn build_swarm(keypair: &identity::Keypair, cfg: &Config) -> io::Result<Swarm> {
 
 /// State the swarm loop owns.
 struct Loop {
+    outgoing_sync: sync_requests::Requests,
     budget: Arc<crate::net::QueueBudget>,
     events: EngineSender<NetEvent>,
     data_dir: PathBuf,
@@ -1192,6 +1195,7 @@ impl Loop {
     /// `SwarmEvent`, and so a future new per-peer map has exactly one place
     /// to be wired into disconnect cleanup.
     fn forget_peer(&mut self, peer: &PeerId) {
+        self.outgoing_sync.forget(peer);
         self.peer_head.remove(peer);
         self.chase.remove(peer);
         self.sync_limiter.forget(peer);
@@ -1211,6 +1215,7 @@ async fn run_swarm(
     budget: Arc<crate::net::QueueBudget>,
 ) {
     let mut st = Loop {
+        outgoing_sync: sync_requests::Requests::default(),
         budget,
         events,
         data_dir: cfg.data_dir.clone(),
@@ -1393,18 +1398,31 @@ fn sync_targets(mut peers: Vec<PeerId>, heads: &HashMap<PeerId, u64>, rotation: 
     peers.retain(|p| *p != explore);
     peers.sort_by_key(|p| (std::cmp::Reverse(heads.get(p).copied().unwrap_or(0)), p.to_bytes()));
     peers.truncate(SYNC_FANOUT.saturating_sub(1));
-    peers.push(explore);
+    // Exploration comes first so even one free request slot cannot be
+    // consumed only by the untrusted-height preference.
+    peers.insert(0, explore);
     peers
 }
 
 /// Keep bounded directed sync while giving every stable connected peer a turn.
 /// Height preference remains a heuristic, not a validated statement of state.
 fn request_blocks(swarm: &mut Swarm, st: &mut Loop, after_slot: u64) {
-    let peers = sync_targets(swarm.connected_peers().copied().collect(), &st.peer_head, &mut st.sync_rotation);
-    let req = SyncRequest::GetBlocks { after_slot, limit: MAX_SYNC_BLOCKS as u32 };
-    for p in peers {
-        swarm.behaviour_mut().sync.send_request(&p, req.clone());
-    }
+    let available = swarm.connected_peers().copied()
+        .filter(|peer| !st.outgoing_sync.contains(peer)).collect();
+    let peers = sync_targets(available, &st.peer_head, &mut st.sync_rotation);
+    for peer in peers { request_peer_blocks(swarm, st, peer, after_slot); }
+}
+
+fn request_peer_blocks(swarm: &mut Swarm, st: &mut Loop, peer: PeerId, after_slot: u64) -> bool {
+    let queued = st.outgoing_sync.enqueue(peer, after_slot);
+    pump_sync_requests(swarm, st);
+    queued
+}
+
+fn pump_sync_requests(swarm: &mut Swarm, st: &mut Loop) {
+    st.outgoing_sync.dispatch(|peer, after_slot| swarm.behaviour_mut().sync.send_request(
+        &peer, SyncRequest::GetBlocks { after_slot, limit: MAX_SYNC_BLOCKS as u32 },
+    ));
 }
 
 /// Returns false when the engine's receiver is gone (the node is shutting
@@ -1459,10 +1477,7 @@ fn handle_swarm_event(
                 // a number an operator can compare against a peer list.
                 st.peers_live.fetch_add(1, Ordering::AcqRel);
                 let after = st.head_slot.load(Ordering::Relaxed);
-                swarm.behaviour_mut().sync.send_request(
-                    &peer_id,
-                    SyncRequest::GetBlocks { after_slot: after, limit: MAX_SYNC_BLOCKS as u32 },
-                );
+                request_peer_blocks(swarm, st, peer_id, after);
             }
         }
         SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. } => {
@@ -1477,6 +1492,7 @@ fn handle_swarm_event(
                     |n| Some(n.saturating_sub(1)),
                 );
                 st.forget_peer(&peer_id);
+                pump_sync_requests(swarm, st);
                 // The cause is the whole diagnostic value of this line. A bare
                 // "disconnected" is what made the Genesis-3 yamux stream-cap
                 // failure take days to find: the transport was terminating
@@ -1527,7 +1543,10 @@ fn handle_swarm_event(
             request_response::Message::Request { request, channel, .. } => {
                 serve_sync(st, resp_tx.clone(), peer, request, channel);
             }
-            request_response::Message::Response { response, .. } => {
+            request_response::Message::Response { request_id, response } => {
+                // Ignore an old connection generation without releasing a
+                // newer request under the same authenticated peer identity.
+                if !st.outgoing_sync.finish(&peer, request_id) { return true; }
                 let SyncResponse::Blocks { envelopes } = response;
                 let was_full = envelopes.len() >= MAX_SYNC_BLOCKS;
                 let mut highest = 0u64;
@@ -1556,21 +1575,19 @@ fn handle_swarm_event(
                 // request from genesis is accepted" and "a node can actually
                 // sync from genesis". A short page ends the walk.
                 if was_full && highest > 0 && st.may_chase_page(peer) {
-                    swarm.behaviour_mut().sync.send_request(
-                        &peer,
-                        SyncRequest::GetBlocks {
-                            after_slot: highest,
-                            limit: MAX_SYNC_BLOCKS as u32,
-                        },
-                    );
+                    request_peer_blocks(swarm, st, peer, highest);
                 }
+                pump_sync_requests(swarm, st);
             }
         },
         SwarmEvent::Behaviour(G4BehaviourEvent::Sync(request_response::Event::OutboundFailure {
             peer,
+            request_id,
             error,
             ..
         })) => {
+            st.outgoing_sync.finish(&peer, request_id);
+            pump_sync_requests(swarm, st);
             // A peer that does not speak /bloch-g4/sync/1 is not a Genesis-4
             // node. Nothing to fall back to — deliberately: Genesis-3
             // compatibility is not a goal, it is the thing the prefix prevents.
@@ -1993,14 +2010,17 @@ mod tests {
         let heads: HashMap<_, _> = peers.iter().take(SYNC_FANOUT).map(|p| (*p, u64::MAX)).collect();
         let mut rotation = 0;
         let mut reached = std::collections::HashSet::new();
+        let mut first_choices = std::collections::HashSet::new();
         for _ in 0..peers.len() {
             let selected = sync_targets(peers.clone(), &heads, &mut rotation);
             assert_eq!(selected.len(), SYNC_FANOUT);
+            first_choices.insert(selected[0]);
             let unique: std::collections::HashSet<_> = selected.iter().copied().collect();
             assert_eq!(unique.len(), selected.len());
             reached.extend(selected);
         }
         assert_eq!(reached.len(), peers.len(), "unclaimed peers must get requests despite maximum forged claims");
+        assert_eq!(first_choices.len(), peers.len(), "even one free request slot must rotate independently of claimed height");
         let one = sync_targets(vec![peers[0]], &heads, &mut rotation);
         assert_eq!(one, vec![peers[0]]);
         assert!(sync_targets(Vec::new(), &heads, &mut rotation).is_empty());
@@ -2012,6 +2032,7 @@ mod tests {
     fn test_loop() -> Loop {
         let (events, _rx) = std::sync::mpsc::channel();
         Loop {
+            outgoing_sync: sync_requests::Requests::default(),
             budget: crate::net::QueueBudget::new(),
             events,
             data_dir: PathBuf::from("/tmp/bloch-p2p-test"),
@@ -2030,6 +2051,52 @@ mod tests {
             },
             peers_live: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    #[test]
+    fn outbound_sync_swarm_response_failure_and_disconnect_release_reservations() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _enter = runtime.enter();
+        let key = identity::Keypair::generate_ed25519();
+        let cfg = Config { listen: Vec::new(), peers: Vec::new(), data_dir: PathBuf::new(), max_peers: 8, behind_proxy: true };
+        let mut swarm = build_swarm(&key, &cfg).unwrap();
+        let mut st = test_loop();
+        let peer = PeerId::random();
+        let (resp_tx, _resp_rx) = tokio::sync::mpsc::unbounded_channel();
+        let connection_id = libp2p::swarm::ConnectionId::new_unchecked(1);
+        let issue = |st: &mut Loop, swarm: &mut Swarm| {
+            let mut id = None;
+            assert!(st.outgoing_sync.start(peer, || {
+                let request = swarm.behaviour_mut().sync.send_request(&peer,
+                    SyncRequest::GetBlocks { after_slot: 0, limit: MAX_SYNC_BLOCKS as u32 });
+                id = Some(request);
+                request
+            }));
+            id.unwrap()
+        };
+        let failed = issue(&mut st, &mut swarm);
+        assert!(handle_swarm_event(&mut swarm, &mut st, &resp_tx,
+            SwarmEvent::Behaviour(G4BehaviourEvent::Sync(request_response::Event::OutboundFailure {
+                peer, connection_id, request_id: failed, error: request_response::OutboundFailure::Timeout,
+            }))));
+        assert!(!st.outgoing_sync.contains(&peer));
+        let completed = issue(&mut st, &mut swarm);
+        assert!(handle_swarm_event(&mut swarm, &mut st, &resp_tx,
+            SwarmEvent::Behaviour(G4BehaviourEvent::Sync(request_response::Event::Message {
+                peer, connection_id, message: request_response::Message::Response {
+                    request_id: completed, response: SyncResponse::Blocks { envelopes: Vec::new() },
+                },
+            }))));
+        assert!(!st.outgoing_sync.contains(&peer));
+        let disconnected = issue(&mut st, &mut swarm);
+        st.forget_peer(&peer);
+        assert!(!st.outgoing_sync.contains(&peer));
+        issue(&mut st, &mut swarm);
+        assert!(handle_swarm_event(&mut swarm, &mut st, &resp_tx,
+            SwarmEvent::Behaviour(G4BehaviourEvent::Sync(request_response::Event::OutboundFailure {
+                peer, connection_id, request_id: disconnected, error: request_response::OutboundFailure::ConnectionClosed,
+            }))));
+        assert!(st.outgoing_sync.contains(&peer), "a late failure must not release the new request");
     }
 
     #[test]
@@ -2539,6 +2606,16 @@ mod tests {
         // a's dial, and it must still be able to publish back.
         b.handle.broadcast(crate::net::block_frame(&envelope(500)));
         assert_eq!(collect_blocks(&a.rx, 1, 20), vec![500], "reverse direction never delivered");
+
+        // The producer's maximum envelope must fit the real gossipsub codec,
+        // not merely our block encoder. Signature bytes are synthetic here:
+        // this fixture exercises transport delivery, not block validation.
+        let mut boundary = envelope(501);
+        let original_size = crate::codec::encode_envelope(&boundary).len();
+        boundary.proposer_sig.resize(boundary.proposer_sig.len() + MAX_PROPOSAL_ENVELOPE_BYTES - original_size, 0);
+        assert_eq!(crate::codec::encode_envelope(&boundary).len(), MAX_PROPOSAL_ENVELOPE_BYTES);
+        b.handle.broadcast(crate::net::block_frame(&boundary));
+        assert_eq!(collect_blocks(&a.rx, 1, 20), vec![501], "producer-sized gossip frame did not fit actual transport");
     }
 
     /// The exchange's question, at the transport layer: a node with an EMPTY

@@ -101,6 +101,13 @@ No Solidity is deployed yet (the L2 is a Rust revm scaffold). The Solidity toolc
 
 > **Scanner posture, corrected 2026-09-04 (finding I-H4).** Until this date the two scanners that back that claim on the GHSA side could not make it. `osv-scanner` and `secret-scan` were `allow_failure: true` in `.gitlab-ci.yml` / `continue-on-error: true` in `.github/workflows/security.yml`, **and** each opened with `if ! command -v <tool>; then echo skipping; exit 0; fi` — so on a runner without the tool the job went green having scanned nothing, and the log line that said so was informational prose, not a warning. osv-scanner is the only tool here that reads the OSV.dev DB, so the GHSA-only residuals below — yamux included — had no gate at all. Both jobs are now BLOCKING, install a pinned binary via `scripts/ci-install-scanner.sh` (which exits non-zero rather than skipping), and the residuals are explicit and expiring in `osv-scanner.toml`. `scripts/check-scanners-blocking.py` (with a selftest that proves it can still fail) holds both pipelines to that posture.
 
+Secret scanning now has separate blocking tracked-tree and full-depth reachable-
+history jobs on both CI providers. Exact redacted baselines contain individually
+reviewed noncredentials; a finding reintroduced in a new commit remains new.
+See [current scope and triage](docs/audit/internal-remediation-2026-09-17/HISTORY-SCAN.md).
+This does not certify unreachable history, credential rotation or hosted job execution.
+
+
 1. **Unmaintained-notice** (no runtime vuln): the vendored `pqcrypto-*` PQ crates (PQClean archived — frozen under Cargo.lock by design), and SP1/zk host-side toolchain crates (backoff, ansi_term, instant, derivative, lru, …) that never touch the consensus/P2P runtime.
 
 2. **⚠️ OPEN real vulnerabilities — tracked, not dismissed:**

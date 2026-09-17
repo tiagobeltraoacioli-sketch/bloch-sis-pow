@@ -179,7 +179,9 @@ fn check_csv(required: i64, ctx: &EvalCtx) -> Result<(), EvalError> {
     }
     // BIP-68 maturity — enforced by the network at tx acceptance, modelled here so a
     // pre-Δ spend is rejected and a post-Δ one accepted.
-    if (ctx.confirmations as i64) < required {
+    // The script operand is only a lower bound. BIP-68 maturity follows
+    // the actual input sequence, which a signer may set higher.
+    if (ctx.confirmations as i64) < seq_blocks {
         return Err(EvalError::Immature);
     }
     Ok(())

@@ -1555,6 +1555,7 @@ version = "0.1.0"
 dependencies = [
  "bloch-crypto",
  "bloch-pos-committee",
+ "serde_json",
  "sha3 0.10.9",
 ]
 

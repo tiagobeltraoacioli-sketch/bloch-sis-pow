@@ -31,6 +31,24 @@ use bloch_pos_committee::header::BlockEnvelope;
 
 const META_MAGIC: &[u8; 8] = b"BPOSMETA";
 
+// Serving threads must not combine an index from one log generation with a
+// replacement log. DirLock excludes external writers; this per-directory guard
+// coordinates local readers without serializing unrelated stores. Weak entries
+// are removed on lookup, so historical directories do not accumulate forever.
+fn log_generation(dir: &Path) -> io::Result<std::sync::Arc<std::sync::RwLock<()>>> {
+    use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+    static GENERATIONS: OnceLock<Mutex<std::collections::BTreeMap<PathBuf, Weak<RwLock<()>>>>> = OnceLock::new();
+    let path = fs::canonicalize(dir)?;
+    let mut generations = GENERATIONS.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
+        .lock().map_err(|_| io::Error::other("log generation registry poisoned; restart required"))?;
+    generations.retain(|_, generation| generation.strong_count() > 0);
+    if let Some(generation) = generations.get(&path).and_then(Weak::upgrade) { return Ok(generation); }
+    let generation = Arc::new(RwLock::new(()));
+    generations.insert(path, Arc::downgrade(&generation));
+    Ok(generation)
+}
+
+
 thread_local! {
     /// Frame-body bytes [`Store::blocks_after`] has actually read on this
     /// thread. Observability only; nothing branches on it.
@@ -393,12 +411,16 @@ pub struct Store {
     /// Append handle for the derived slot → offset index. Written after the
     /// log's own fsync, so it can lag the log and never lead it.
     idx: File,
+    /// After one append failure, retain a contiguous indexed prefix instead
+    /// of burying its missing entry under later successful index appends.
+    index_append_enabled: bool,
     /// Bytes in `blocks.log`, so an append knows the offset it is writing at
     /// without asking the filesystem.
     log_len: u64,
     /// Exclusive ownership of `dir`, held for as long as the store is. Never
     /// read; its `Drop` is the whole point. See [`DirLock`].
     _lock: DirLock,
+    generation: std::sync::Arc<std::sync::RwLock<()>>,
 }
 
 /// Exclusive ownership of a data dir, for the lifetime of this `Store`.
@@ -635,32 +657,57 @@ pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
-/// Persist a private file without exposing a truncated destination after a crash.
-/// `create_new` prevents following a pre-positioned temporary symlink.
-pub(crate) fn atomic_private_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = path.parent().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent directory"))?;
-    let suffix = format!(".write-{}-{}.tmp", std::process::id(), {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    });
-    let mut name = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing filename"))?.to_os_string();
-    name.push(suffix);
-    let temporary = dir.join(name);
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)] {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+/// Exclusive, private staging for a streamed atomic replacement. A legacy
+/// predictable `.tmp` path is never opened or truncated. Cleanup owns only the
+/// exact file successfully created by this value; publication disarms cleanup.
+pub(crate) struct PrivateStagingFile {
+    path: Option<PathBuf>,
+    file: File,
+}
+
+impl PrivateStagingFile {
+    pub(crate) fn create_for(destination: &Path) -> io::Result<Self> {
+        let dir = destination.parent().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent directory"))?;
+        let suffix = format!(".write-{}-{}.tmp", std::process::id(), {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        });
+        let mut name = destination.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing filename"))?.to_os_string();
+        name.push(suffix);
+        let path = dir.join(name);
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)] {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path)?;
+        Ok(Self { path: Some(path), file })
     }
-    let mut file = options.open(&temporary)?;
-    let result = (|| {
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        fs::rename(&temporary, path)?;
+
+    pub(crate) fn file_mut(&mut self) -> &mut File { &mut self.file }
+
+    pub(crate) fn publish(mut self, destination: &Path) -> io::Result<()> {
+        let dir = destination.parent().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent directory"))?;
+        self.file.sync_all()?;
+        let path = self.path.as_ref().ok_or_else(|| io::Error::other("staging file already published"))?;
+        fs::rename(path, destination)?;
+        self.path = None;
         fsync_dir(dir)
-    })();
-    if result.is_err() { let _ = fs::remove_file(&temporary); }
-    result
+    }
+}
+
+impl Drop for PrivateStagingFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() { let _ = fs::remove_file(path); }
+    }
+}
+
+/// Persist a private file without exposing a truncated destination after a crash.
+pub(crate) fn atomic_private_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut staging = PrivateStagingFile::create_for(path)?;
+    staging.file_mut().write_all(bytes)?;
+    staging.publish(path)
 }
 
 /// A crash can leave an incomplete final frame. Remove only that frame before
@@ -751,6 +798,15 @@ pub fn inspect_log(dir: &Path) -> io::Result<LogInspection> {
     Ok(report)
 }
 
+fn encode_log_payload(env: &BlockEnvelope) -> io::Result<Vec<u8>> {
+    let payload = crate::codec::encode_envelope(env);
+    if payload.len() > crate::codec::MAX_FIELD_LEN {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            "block envelope exceeds the existing 8 MiB log frame limit"));
+    }
+    Ok(payload)
+}
+
 impl Store {
     pub(crate) fn directory(&self) -> &Path { &self.dir }
 
@@ -764,6 +820,9 @@ impl Store {
         // process over the same dir is a double-signing hazard, not a
         // file-format one. See [`DirLock`].
         let _lock = DirLock::acquire(dir)?;
+        let generation = log_generation(dir)?;
+        let _generation = generation.write()
+            .map_err(|_| io::Error::other("log generation guard poisoned; restart required"))?;
         let meta_path = dir.join("meta.bin");
         match fs::read(&meta_path) {
             Ok(bytes) => {
@@ -807,8 +866,12 @@ impl Store {
             .read(true)
             .write(true)
             .open(dir.join("blocks.idx"))?;
+        // The index is disposable: a crash after an older writer renamed a
+        // reorg log can leave a perfectly sized index describing another chain.
+        // Rebuild from header-only log reads; covered length is not identity.
+        idx.set_len(0)?;
         repair_index(&mut idx, &dir.join("blocks.log"), log_len)?;
-        Ok(Store { dir: dir.to_path_buf(), log, idx, log_len, _lock })
+        Ok(Store { dir: dir.to_path_buf(), log, idx, index_append_enabled: true, log_len, _lock, generation: std::sync::Arc::clone(&generation) })
     }
 
     /// Append one applied block. One write, then fsync — the block is only
@@ -816,7 +879,7 @@ impl Store {
     /// us is durable locally (the producer-side equivocation fence across
     /// restarts).
     pub fn append(&mut self, env: &BlockEnvelope) -> io::Result<()> {
-        let payload = crate::codec::encode_envelope(env);
+        let payload = encode_log_payload(env)?;
         // Capacity hint only: saturating is the intended semantics.
         let mut frame = Vec::with_capacity(4usize.saturating_add(payload.len()));
         frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -842,10 +905,11 @@ impl Store {
         // `repair_index` reads records through this same handle, and a record
         // written at a stale cursor would not append to the index, it would
         // OVERWRITE part of it.
-        if let Err(e) =
-            self.idx.seek(SeekFrom::End(0)).and_then(|_| self.idx.write_all(&entry.encode()))
-        {
-            eprintln!("store: block-index append failed ({e}); it will be rebuilt on next open");
+        if self.index_append_enabled {
+            if let Err(e) = self.idx.seek(SeekFrom::End(0)).and_then(|_| self.idx.write_all(&entry.encode())) {
+                self.index_append_enabled = false;
+                eprintln!("store: block-index append failed ({e}); retaining its valid prefix and scanning the unindexed tail until restart or reorg rebuild");
+            }
         }
         Ok(())
     }
@@ -901,20 +965,23 @@ impl Store {
     /// crash mid-rewrite leaves either the old log or the new one — never a
     /// half-written file.
     pub fn rewrite(&mut self, envs: &[BlockEnvelope]) -> io::Result<()> {
-        let tmp = self.dir.join("blocks.log.tmp");
-        {
-            let mut f = File::create(&tmp)?;
-            for env in envs {
-                let payload = crate::codec::encode_envelope(env);
-                f.write_all(&(payload.len() as u32).to_le_bytes())?;
-                f.write_all(&payload)?;
-            }
-            f.sync_data()?;
+        let destination = self.dir.join("blocks.log");
+        let mut staging = PrivateStagingFile::create_for(&destination)?;
+        for env in envs {
+            let payload = encode_log_payload(env)?;
+            staging.file_mut().write_all(&(payload.len() as u32).to_le_bytes())?;
+            staging.file_mut().write_all(&payload)?;
         }
-        fs::rename(&tmp, self.dir.join("blocks.log"))?;
-        // The rename must be durable too, or a crash can resurrect the
-        // pre-reorg log (M-6). Same discipline as slashprot's watermark write.
-        fsync_dir(&self.dir)?;
+        staging.file_mut().sync_all()?;
+        let _generation = self.generation.write()
+            .map_err(|_| io::Error::other("log generation guard poisoned; restart required"))?;
+        // Invalidate durably BEFORE replacing the authoritative log. Every
+        // crash/error after this point leaves either an empty index or a prefix
+        // rebuilt from the winning log, never plausible offsets from the loser.
+        self.idx.set_len(0)?;
+        self.idx.sync_all()?;
+        // Publication fsyncs the staged file and the directory rename.
+        staging.publish(&destination)?;
         self.log = OpenOptions::new()
             .create(true)
             .append(true)
@@ -926,6 +993,7 @@ impl Store {
         // log that won.
         self.idx.set_len(0)?;
         repair_index(&mut self.idx, &self.dir.join("blocks.log"), self.log_len)?;
+        self.index_append_enabled = true;
         Ok(())
     }
 
@@ -954,11 +1022,15 @@ impl Store {
     /// What comes back is unchanged by all three: the log's own bytes, in log
     /// order, filtered by the same `slot > after_slot` predicate over headers
     /// read back from the log itself. The index is a hint about *where to
-    /// start*; every way it can be wrong falls back to the full scan.
+    /// start*. Detected header discrepancies fall back to a full scan;
+    /// startup rebuild and generation locking prevent stale replacement hints.
     ///
     /// Reads the log file fresh so a reader thread never touches the append
     /// handle.
     pub fn blocks_after(dir: &Path, after_slot: u64, limit: usize) -> io::Result<Vec<Vec<u8>>> {
+        let generation = log_generation(dir)?;
+        let _generation = generation.read()
+            .map_err(|_| io::Error::other("log generation guard poisoned; restart required"))?;
         let log_path = dir.join("blocks.log");
         let log_len = fs::metadata(&log_path)?.len();
         // A missing or unreadable index is not an error: it is the state
@@ -1106,6 +1178,142 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persistence_refuses_oversized_frames_before_mutation_and_accepts_exact_limit() {
+        let dir = std::env::temp_dir().join(format!("bloch-store-frame-cap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x77; 32]).unwrap();
+        store.append(&sample_envelope(1)).unwrap();
+        let before_log = fs::read(dir.join("blocks.log")).unwrap();
+        let before_index = fs::read(dir.join("blocks.idx")).unwrap();
+        let mut boundary = sample_envelope(2);
+        let overhead = crate::codec::encode_envelope(&boundary).len() - boundary.proposer_sig.len();
+        boundary.proposer_sig.resize(crate::codec::MAX_FIELD_LEN - overhead + 1, 0xAA);
+        assert_eq!(store.append(&boundary).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert!(store.rewrite(&[sample_envelope(3), boundary.clone()]).is_err());
+        assert_eq!(fs::read(dir.join("blocks.log")).unwrap(), before_log);
+        assert_eq!(fs::read(dir.join("blocks.idx")).unwrap(), before_index);
+        assert!(!fs::read_dir(&dir).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().contains(".write-")));
+        boundary.proposer_sig.pop();
+        assert_eq!(crate::codec::encode_envelope(&boundary).len(), crate::codec::MAX_FIELD_LEN);
+        store.append(&boundary).unwrap();
+        drop(store);
+        let reopened = Store::open(&dir, &[0x77; 32]).unwrap();
+        let frames = reopened.read_all().unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(crate::codec::encode_envelope(&frames[1]), crate::codec::encode_envelope(&boundary));
+        drop(reopened);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_index_append_never_turns_a_later_entry_into_a_gap() {
+        let dir = std::env::temp_dir().join(format!("bloch-store-index-gap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x76; 32]).unwrap();
+        store.append(&sample_envelope(1)).unwrap();
+        let working = std::mem::replace(&mut store.idx, File::open(dir.join("blocks.idx")).unwrap());
+        store.append(&sample_envelope(2)).unwrap(); // log succeeds, index fails
+        store.idx = working;
+        store.append(&sample_envelope(3)).unwrap();
+        let page = Store::blocks_after(&dir, 1, 10).unwrap();
+        let slots: Vec<_> = page.iter().map(|bytes| crate::codec::decode_envelope(bytes).unwrap().header.slot).collect();
+        assert!(!store.index_append_enabled);
+        store.rewrite(&[sample_envelope(1), sample_envelope(2), sample_envelope(3)]).unwrap();
+        assert!(store.index_append_enabled);
+        store.append(&sample_envelope(4)).unwrap();
+        assert_eq!(idx_count(&store.idx).unwrap(), 4);
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
+        assert_eq!(slots, vec![2, 3], "an index write failure must not hide the missing frame behind a later index entry");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_staging_ignores_legacy_symlinks_and_cleans_only_its_own_file() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = std::env::temp_dir().join(format!("bloch-store-private-stage-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x75; 32]).unwrap();
+        store.append(&sample_envelope(1)).unwrap();
+        let victim = dir.join("unrelated-file");
+        fs::write(&victim, b"must remain intact").unwrap();
+        let legacy = dir.join("blocks.log.tmp");
+        symlink(&victim, &legacy).unwrap();
+        store.rewrite(&[sample_envelope(100)]).unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"must remain intact");
+        assert!(fs::symlink_metadata(&legacy).unwrap().file_type().is_symlink());
+        assert_eq!(fs::metadata(dir.join("blocks.log")).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(store.read_all().unwrap()[0].header.slot, 100);
+        let destination = dir.join("abandoned-state");
+        let staging = PrivateStagingFile::create_for(&destination).unwrap();
+        let owned = staging.path.clone().unwrap();
+        assert!(owned.exists());
+        drop(staging);
+        assert!(!owned.exists());
+        assert!(legacy.is_symlink());
+        assert_eq!(fs::read(&victim).unwrap(), b"must remain intact");
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rewrite_refuses_before_publication_if_index_cannot_be_invalidated() {
+        let dir = std::env::temp_dir().join(format!("bloch-store-index-invalidate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x74; 32]).unwrap();
+        store.append(&sample_envelope(1)).unwrap();
+        let before = fs::read(dir.join("blocks.log")).unwrap();
+        // A real read-only descriptor forces set_len failure before log rename.
+        store.idx = File::open(dir.join("blocks.idx")).unwrap();
+        assert!(store.rewrite(&[sample_envelope(100)]).is_err());
+        assert_eq!(fs::read(dir.join("blocks.log")).unwrap(), before);
+        let page = Store::blocks_after(&dir, 0, 10).unwrap();
+        assert_eq!(crate::codec::decode_envelope(&page[0]).unwrap().header.slot, 1);
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generation_guards_share_aliases_but_not_unrelated_stores() {
+        let first = std::env::temp_dir().join(format!("bloch-store-generation-a-{}", std::process::id()));
+        let second = std::env::temp_dir().join(format!("bloch-store-generation-b-{}", std::process::id()));
+        fs::create_dir_all(&first).unwrap(); fs::create_dir_all(&second).unwrap();
+        let a = log_generation(&first).unwrap();
+        let alias = log_generation(&first.join(".")).unwrap();
+        let b = log_generation(&second).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&a, &alias));
+        assert!(!std::sync::Arc::ptr_eq(&a, &b));
+        let held = a.write().unwrap();
+        assert!(alias.try_read().is_err());
+        assert!(b.try_read().is_ok(), "one store's rewrite must not block unrelated serving");
+        drop(held); drop(a); drop(alias); drop(b);
+        let _ = fs::remove_dir_all(first); let _ = fs::remove_dir_all(second);
+    }
+
+    #[test]
+    fn restart_rebuilds_same_length_index_left_by_interrupted_reorg() {
+        let dir = std::env::temp_dir().join(format!("bloch-store-reorg-index-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x73; 32]).unwrap();
+        store.append(&sample_envelope(1)).unwrap();
+        store.append(&sample_envelope(2)).unwrap();
+        let old_index = fs::read(dir.join("blocks.idx")).unwrap();
+        let old_length = fs::metadata(dir.join("blocks.log")).unwrap().len();
+        store.rewrite(&[sample_envelope(100), sample_envelope(200)]).unwrap();
+        assert_eq!(fs::metadata(dir.join("blocks.log")).unwrap().len(), old_length);
+        drop(store);
+        // Exact crash residue: replacement log was published, old index had
+        // not yet been invalidated. Its offsets and covered length still fit.
+        fs::write(dir.join("blocks.idx"), old_index).unwrap();
+        let store = Store::open(&dir, &[0x73; 32]).unwrap();
+        let page = Store::blocks_after(&dir, 50, 10).unwrap();
+        let slots: Vec<_> = page.iter().map(|bytes| crate::codec::decode_envelope(bytes).unwrap().header.slot).collect();
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(slots, vec![100, 200], "an index from the old log must not hide replacement blocks");
+    }
 
     #[test]
     fn audit_log_diagnostic_is_bounded_and_does_not_repair_or_hide_corruption() {

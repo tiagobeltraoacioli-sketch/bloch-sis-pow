@@ -745,3 +745,49 @@ fn active_funded_proposal_selection_uses_actual_gate_and_filters_conflicting_int
     assert_eq!(engine.mempool.len(), 2, "conflicting intent selection is not eviction");
     assert!(engine.rejected.is_empty());
 }
+
+#[test]
+fn admission_negative_cache_funded_authorization_remains_retryable_at_actual_gate() {
+    let activation = bloch_pos_committee::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH;
+    assert_eq!(activation, 2_884);
+    let (engine, _dir, funding, joining, mut deposit) = fixture();
+    deposit.valid_until_epoch = activation + 100;
+    authorize(&mut deposit, &funding, &joining);
+    let valid = PosTransaction::FundedDeposit(deposit.clone());
+    let (verifier, calls) = verification::counted_hybrid();
+    assert!(admissible_with_verifier(&valid, activation - 1, &verifier).is_err());
+    assert!(admissible_with_verifier(&valid, deposit.valid_until_epoch + 1, &verifier).is_err());
+    assert_eq!(calls.get(), 0, "epoch/expiry refusals must not become cached crypto failures");
+    let mut forged = deposit.clone();
+    let last = forged.funding_signature.last_mut().unwrap();
+    *last ^= 1;
+    let forged = PosTransaction::FundedDeposit(forged);
+    for _ in 0..16 { assert!(admissible_with_verifier(&forged, activation, &verifier).is_err()); }
+    assert_eq!(calls.get(), 1);
+    assert!(admissible_with_verifier(&valid, activation, &verifier).is_ok());
+    assert_eq!(calls.get(), 3, "corrected funding signature and joining proof must both run");
+    let mut changed = deposit.clone();
+    changed.valid_until_epoch += 1;
+    assert!(admissible_with_verifier(&PosTransaction::FundedDeposit(changed.clone()), activation, &verifier).is_err());
+    assert_eq!(calls.get(), 4, "a changed funding root must not reuse old verification");
+    authorize(&mut changed, &funding, &joining);
+    let changed = PosTransaction::FundedDeposit(changed);
+    assert!(admissible_with_verifier(&changed, activation, &verifier).is_ok());
+    assert_eq!(calls.get(), 6);
+    let rolled = engine.rolled_to(activation);
+    let total = rolled.active_validators().iter().map(|v| u128::from(v.effective_stake)).sum();
+    assert!(rolled.validate_lifecycle_transaction(&changed, total, engine.state.next_base_fee_at(activation), &verifier).is_ok(),
+        "the corrected real funded candidate must still pass state validation at epoch2884");
+    assert_eq!(admissible(&changed, activation), admissible_with_verifier(&changed, activation, &verifier));
+    let next_joining = Keystore::generate_with(&_dir.0.join("next-joining"), AUTO_VALIDATOR_INDEX, &Unlock::PlaintextOptIn).unwrap();
+    let mut other_key = deposit;
+    other_key.validator_pubkey = next_joining.pubkey.clone();
+    other_key.randao_commitment = RandaoChain::generate(next_joining.randao_seed).commitment();
+    let before = calls.get();
+    assert!(admissible_with_verifier(&PosTransaction::FundedDeposit(other_key.clone()), activation, &verifier).is_err());
+    assert!(calls.get() > before, "a different joining key/root must receive its own crypto check");
+    authorize(&mut other_key, &funding, &next_joining);
+    let other_key = PosTransaction::FundedDeposit(other_key);
+    assert!(admissible_with_verifier(&other_key, activation, &verifier).is_ok());
+    assert!(rolled.validate_lifecycle_transaction(&other_key, total, engine.state.next_base_fee_at(activation), &verifier).is_ok());
+}

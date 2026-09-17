@@ -70,6 +70,12 @@ cargo-audit:
     - cargo audit --deny warnings
   allow_failure: false
 
+secret-history-scan:
+  stage: check
+  script:
+    - bash scripts/scan-secrets.sh history
+  allow_failure: false
+
 supply-chain:
   stage: check
   script:
@@ -111,6 +117,11 @@ jobs:
     steps:
       - run: python3 scripts/check-scanners-blocking.py
 
+  secret-history-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - run: bash scripts/scan-secrets.sh history
+
   cargo-geiger:
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -135,6 +146,17 @@ def sub(text: str, old: str, new: str) -> str:
 
 CASES = [
     Case("honest pipelines stay green", GOOD_GITLAB, GOOD_GITHUB, must_fail=False),
+
+    Case("history scanner deleted",
+         GOOD_GITLAB.replace("secret-history-scan:\n  stage: check\n  script:\n    - bash scripts/scan-secrets.sh history\n  allow_failure: false\n", ""),
+         GOOD_GITHUB, must_fail=True, expect="`secret-history-scan`"),
+
+    Case("history scanner allowed to fail",
+         GOOD_GITLAB,
+         sub(GOOD_GITHUB,
+             "  secret-history-scan:\n    runs-on: ubuntu-latest",
+             "  secret-history-scan:\n    runs-on: ubuntu-latest\n    continue-on-error: true"),
+         must_fail=True, expect="`secret-history-scan`"),
 
     Case("gitlab allow_failure on osv-scanner",
          sub(GOOD_GITLAB,

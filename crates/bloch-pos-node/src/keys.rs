@@ -1188,81 +1188,21 @@ fn read_passphrase_fd(_descriptor: i32, _timeout: std::time::Duration) -> io::Re
     Err(io::Error::new(io::ErrorKind::Unsupported, "inherited passphrase pipes require Unix"))
 }
 
-/// A passphrase typed at the controlling terminal, echo off. Refuses when
-/// stdin is not a tty (a pipe is a file; use `--passphrase-file`). Never reads
-/// from argv: a command line is in `ps`, in shell history and in the audit
-/// log of every jump host in between.
+/// A passphrase typed at the controlling terminal before any threads start.
+/// Only the synchronous `keys seal` CLI may call this: signals are deferred
+/// on this thread until echo is restored, without changing their dispositions.
+/// SIGKILL/SIGSTOP cannot be deferred; ordinary stop/resume aborts the input.
 #[cfg(unix)]
-pub fn read_passphrase_from_tty(prompt: &str) -> io::Result<Zeroizing<String>> {
-    use std::io::{Read, Write};
-    let fd = libc::STDIN_FILENO;
-    // SAFETY: isatty only inspects the descriptor.
-    if unsafe { libc::isatty(fd) } != 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "stdin is not a terminal; supply the passphrase with --passphrase-file <0600 file>",
-        ));
-    }
-    let mut err = io::stderr();
-    // Use a private, unbuffered handle: std::io::Stdin retains its shared
-    // read-ahead buffer after the returned passphrase has been zeroized.
-    let mut input = fs::File::open("/dev/tty")?;
-    use std::os::fd::AsRawFd;
-    let fd = input.as_raw_fd();
-    let mut term: libc::termios = unsafe { std::mem::zeroed() };
-    if unsafe { libc::tcgetattr(fd, &mut term) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    struct Restore { fd: libc::c_int, saved: libc::termios, active: bool }
-    impl Restore {
-        fn restore(&mut self) -> io::Result<()> {
-            if unsafe { libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.saved) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            self.active = false;
-            Ok(())
-        }
-    }
-    impl Drop for Restore {
-        fn drop(&mut self) { if self.active { let _ = self.restore(); } }
-    }
-    let mut restore = Restore { fd, saved: term, active: true };
-    term.c_lflag &= !libc::ECHO;
-    if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &term) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // Do not expose an actionable prompt until echo is already disabled.
-    err.write_all(prompt.as_bytes())?;
-    err.flush()?;
-    let mut bytes = Zeroizing::new(Vec::with_capacity(4096));
-    let mut byte = Zeroizing::new([0u8; 1]);
-    let read = (|| -> io::Result<()> {
-        loop {
-            if input.read(&mut byte[..])? == 0 || byte[0] == b'\n' { break; }
-            if bytes.len() >= 4096 {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "passphrase exceeds 4096 bytes"));
-            }
-            bytes.push(byte[0]);
-        }
-        Ok(())
-    })();
-    restore.restore()?;
-    let _ = err.write_all(b"\n");
-    read?;
-    let mut line = Zeroizing::new(std::str::from_utf8(&bytes)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "passphrase is not UTF-8"))?
-        .to_owned());
-    while line.ends_with('\n') || line.ends_with('\r') {
-        line.pop();
-    }
-    if line.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty passphrase"));
-    }
-    Ok(line)
+#[path = "keys/terminal_input.rs"]
+mod terminal_input;
+
+#[cfg(unix)]
+pub fn read_passphrase_from_tty_before_threads(prompt: &str) -> io::Result<Zeroizing<String>> {
+    terminal_input::read_passphrase(prompt)
 }
 
 #[cfg(not(unix))]
-pub fn read_passphrase_from_tty(_prompt: &str) -> io::Result<Zeroizing<String>> {
+pub fn read_passphrase_from_tty_before_threads(_prompt: &str) -> io::Result<Zeroizing<String>> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "interactive passphrase entry is unix-only; use --passphrase-file",

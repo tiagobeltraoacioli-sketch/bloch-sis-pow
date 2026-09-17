@@ -66,6 +66,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GITLAB_REQUIRED = {
     "osv-scanner":             "the only OSV/GHSA advisory scan (yamux GHSA-vxx9-2994-q338)",
     "secret-scan":             "committed-credential scan",
+    "secret-history-scan":     "reachable-history credential scan",
     "cargo-audit":             "RustSec advisory backstop",
     "supply-chain":            "cargo-deny advisories + licenses + sources",
     "scanners-blocking-guard": "this guard (it must gate its own pipeline)",
@@ -73,6 +74,7 @@ GITLAB_REQUIRED = {
 GITHUB_REQUIRED = {
     "osv-scanner":             "the only OSV/GHSA advisory scan (yamux GHSA-vxx9-2994-q338)",
     "secret-scan":             "committed-credential scan",
+    "secret-history-scan":     "reachable-history credential scan",
     "cargo-audit":             "RustSec advisory backstop",
     "cargo-deny":              "advisories + licenses + sources",
     "scanners-blocking-guard": "this guard (it must gate its own pipeline)",

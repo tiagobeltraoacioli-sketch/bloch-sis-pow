@@ -42,7 +42,7 @@ impl Engine {
                 tx,
                 self.state.active_validators().iter().map(|v| u128::from(v.effective_stake)).sum(),
                 self.state.next_base_fee(),
-                &self.verifier,
+                &self.gossip_verifier,
             )
             .map_err(|_| Refusal::Invalid("lifecycle transaction fails committed-state validation"))
     }
