@@ -26,7 +26,7 @@
 
 **What is not broken.** Consensus determinism, codec injectivity, header and state-root binding, value conservation, the AND hybrid-signature combiner, the vendored PQClean provenance, slashing-protection ordering, the sealed keystore, the finality-incident closure and the CI pinning discipline were each verified in code and are listed in §5. The repository's candour about its own gaps is a control in its own right.
 
-**Totals.** 197 findings + 4 from the dynamic run: 15 High, 36 Medium, 96 Low, 52 Info (lead severities; 1 refuted). 120 are labelled NEW, 65 KNOWN or KNOWN-refined against the eleven prior internal audits in `docs/audit/`. Test suites of the live crates: 1,349 passed, 0 failed (Annex A12).
+**Totals.** 197 findings + 5 from the dynamic run: 15 High, 37 Medium, 96 Low, 52 Info (lead severities; 1 refuted). 120 are labelled NEW, 65 KNOWN or KNOWN-refined against the eleven prior internal audits in `docs/audit/`. Test suites of the live crates: 1,349 passed, 0 failed (Annex A12).
 
 ## 2. Scope and method
 
@@ -153,7 +153,7 @@ KNOWN (`deploy/SSH-ROLE-SEPARATION.md`): one key and one account reach all 65 ho
 | BV-03 | A9 | no | `pq-shield-api` receives exactly the public keys whose secrecy the vault's security rests on (`recovery_pubkey`, `hot_pubkey`) plus the unvault intent, over plaintext HTT… | PARTIALLY_CONFIRMED — skeptic: Medium |
 | BV-04 | A9 | no | Recovery key is a non-hardened BIP-32 sibling of the hot key in *both* derivations (V1 and the A4-M-5 "fix" V2); `hot_sk` + one xpub ⇒ `recovery_sk` | CONFIRMED |
 
-Plus **LD-01** and **LD-04** (Annex A12 §A12.6): blocking supply-chain gates red on the tree — `rustls 0.23.38` (RUSTSEC-2026-0285, via `libp2p-websocket`) and `libp2p-quic 0.13.0` (GHSA-5hq8-qhww-jm7q, CVSS 8.2, remote panic of a QUIC listener, latent while the fleet stays on the devnet transport); both lock bumps are included in this PR.
+Plus **LD-05** (Annex A12 §A12.6): the automatic RANDAO renewal can deadlock when every remaining proposer exhausts before a renewal is included, because consensus only accepts a re-commit from a fully spent chain; the CI rehearsal that covers it seeds its schedule from the wall clock and fails at random — pinned in this PR, the consensus margin needs a flag day. Also **LD-01** and **LD-04** (Annex A12 §A12.6): blocking supply-chain gates red on the tree — `rustls 0.23.38` (RUSTSEC-2026-0285, via `libp2p-websocket`) and `libp2p-quic 0.13.0` (GHSA-5hq8-qhww-jm7q, CVSS 8.2, remote panic of a QUIC listener, latent while the fleet stays on the devnet transport); both lock bumps are included in this PR.
 
 ### 6.3 Low
 
@@ -354,6 +354,7 @@ The order is by *exposure today*, not by severity label: what an unauthenticated
 ### 7.3 Before the next flag day (needs a coordinated consensus change)
 
 19. **Refuse `0x03` in consensus** independently of the ADR-041 lifecycle, or at minimum apply `MAX_EXITS_PER_EPOCH` to the legacy arm. TX-01 / FC-03 / ST-02.
+20a. **Let a RANDAO re-commit land before the chain is fully spent** (accept `reveals_used >= RANDAO_CHAIN_LENGTH − margin`, submit at the margin), so exhaustion never becomes a network-wide race. LD-05, TX-12.
 20. **Bound the inactivity leak so the roster can never reach zero weight for everyone** (cap `t`, or fall back to the unleaked duty roster when the leak-adjusted total is zero), and correct the `MAX_EPOCH_ADVANCE` documentation: the real dark-time ceiling is ~60 epochs, not 45 days. FC-01.
 21. **Redesign the genesis-cohort cap before funded admission opens.** As written, the first 25,000 BLOCH outsider holds 6 % of consensus today, one third at month six and a lone two-thirds finality supermajority at month twelve, and the deposit cap (computed from the *capped* total) prevents anyone from bringing more than the minimum bond. Cap the cohort's *share* only once outsider stake is meaningful relative to the cohort, compute the deposit cap from uncapped stake, and correct tokenomics §3.3.1. FC-02 / ST-01, ST-08, ST-09.
 22. **Check block byte/gas caps *before* executing each transaction** (verdict-preserving; only the error moves earlier). TX-02.
