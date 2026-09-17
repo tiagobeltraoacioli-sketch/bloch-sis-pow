@@ -29,8 +29,11 @@
 # event-listener 5.4.1 -> 5.4.2 (the yanked chacha20 0.10.1 was re-pinned to
 # 0.10.2 in the same pass). The lru advisory is the ONE residual: its fix
 # (lru >= 0.18.2) is unreachable while sp1-prover 4.2.1 pins `lru ^0.12.4`,
-# so it gets a dated, expiring exception below — mirrored in audit.toml and
-# deny.toml — instead of a silent bump-less green.
+# so it gets a dated, expiring exception below — mirrored in audit.toml (and,
+# until the deep audit of 2026-09-16, LD-02, in deny.toml: cargo-deny checks
+# the graph the root workspace RESOLVES, where the SP1 stack no longer is, so
+# that copy matched nothing and was pruned) — instead of a silent bump-less
+# green.
 
 # ── CLOSED 2026-09-05 (audit finding SC3-yamux-dedupe): GHSA-vxx9-2994-q338 ──
 # yamux 0.12.1 (stream-multiplexer DoS, CVSS 8.7, reachable by any peer) is
@@ -53,7 +56,7 @@
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0253"
 ignoreUntil = 2026-12-01
-reason = "lru 0.12.5 unsound pop() (fix >=0.18.2) pinned by sp1-prover 4.2.1 `lru ^0.12.4`; host-side proving only. Mirrors audit.toml/deny.toml; re-review 2026-12-01."
+reason = "lru 0.12.5 unsound pop() (fix >=0.18.2) pinned by sp1-prover 4.2.1 `lru ^0.12.4`; host-side proving only. Mirrors .cargo/audit.toml (not deny.toml since LD-02, 2026-09-16: unreachable from the resolved root graph); re-review 2026-12-01."
 
 # ── SP1 / plonky3 prover stack — host-side proving, never the node runtime ────
 # Pulled exclusively through the pinned SP1 4.2.1 prover; not on the consensus,
@@ -69,10 +72,12 @@ id = "GHSA-3g92-f9ch-qjcm"
 ignoreUntil = 2026-12-01
 reason = "p3-symmetric (CVSS 2.9) via pinned SP1 4.2.1 prover; host-side proof generation only, not the node runtime. Re-review 2026-12-01."
 
-# ── MIRRORED FROM audit.toml / deny.toml ─────────────────────────────────────
+# ── MIRRORED FROM audit.toml (deny.toml carries only the root-graph subset) ──
 # osv-scanner reads neither of those files, so a disposition already written
 # and argued there has to be repeated here or the two tools disagree about the
-# same lockfile. Every entry below is a RUSTSEC id that audit.toml already
+# same lockfile. Like .cargo/audit.toml and unlike deny.toml, this file governs
+# EVERY lockfile the CI job passes with --lockfile (LD-02, 2026-09-16), which
+# is why the SP1-stack entries stay here after being pruned from deny.toml. Every entry below is a RUSTSEC id that audit.toml already
 # ignores WITH a rationale; that file stays the source of truth — when an entry
 # is removed there it must be removed here. Nothing new is accepted in this
 # block, and all of it re-reviews on the same date as the rest of the file.
