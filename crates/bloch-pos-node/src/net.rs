@@ -211,7 +211,9 @@ impl Net {
     }
 }
 
-/// How many peers may be answering our history request at the same time.
+/// Concurrent request leases shared by engine and periodic synchronization.
+/// This bounds request issuance, not outstanding responses: the legacy wire
+/// has no page-completion marker, and late blocks remain subject to QueueBudget.
 ///
 /// **Why this is not "all of them".** Every outbound dialer used to send
 /// `FRAME_GET_BLOCKS` the moment it connected, and `serve_get_blocks` answered
@@ -227,6 +229,10 @@ impl Net {
 /// or lying; the rest stay connected and still deliver broadcasts, they just do
 /// not each dump a copy of history.
 const SYNC_FANOUT: usize = 2;
+/// One request per lease; expiration permits another connection's turn even
+/// when peers stay silent or the applied head has not moved.
+const SYNC_LEASE: Duration = Duration::from_secs(5);
+const MAX_SYNC_SERVING_WORKERS: usize = 4;
 
 /// Blocks in one `FRAME_GET_BLOCKS` answer.
 ///
@@ -540,9 +546,8 @@ pub struct DevnetMesh {
     /// constant's doc for why an unbounded queue here was a memory leak
     /// waiting on a peer that never connects.
     peers: Vec<SyncSender<Vec<u8>>>,
-    /// Only live outbound connections participate in directed engine sync.
-    sync_outbound: Arc<Mutex<Vec<InboundPeer>>>,
-    sync_cursor: Mutex<usize>,
+    /// One request scheduler for both connection directions and both triggers.
+    sync: Arc<SyncScheduler>,
     /// Broadcast queues for connections we did NOT dial.
     ///
     /// **Why this exists.** The module header describes a full mesh in which
@@ -601,6 +606,7 @@ impl Drop for ConnCount {
     }
 }
 
+#[derive(Clone)]
 struct InboundPeer {
     frames: SyncSender<Vec<u8>>,
     connection: Weak<Connection>,
@@ -617,8 +623,22 @@ impl InboundPeer {
 struct Connection {
     socket: TcpStream,
     closed: AtomicBool,
+    pending_sync: Mutex<Option<(u64, Instant)>>,
+    serving_sync: AtomicBool,
     _counts: (ConnCount, Option<ConnCount>),
     _ip_permit: Option<crate::connection_limit::Permit>,
+}
+
+impl Connection {
+    /// Consume one queued authorization only for its matching request. Old
+    /// frames left in a dialer's queue cannot bypass a new connection's lease.
+    fn take_sync_request(&self, frame: &[u8], now: Instant) -> bool {
+        let Ok(mut pending) = self.pending_sync.lock() else { return false };
+        let Some((after, at)) = *pending else { return false };
+        if frame != get_blocks_frame(after) { return false; }
+        *pending = None;
+        now.saturating_duration_since(at) < SYNC_LEASE
+    }
 }
 
 struct ConnectionHalf(Arc<Connection>);
@@ -635,15 +655,64 @@ fn run_inbound_writer(
     socket: Arc<Mutex<TcpStream>>,
     half: ConnectionHalf,
 ) {
+    run_connection_writer(&rx, socket, half);
+}
+
+fn run_connection_writer(rx: &Receiver<Vec<u8>>, socket: Arc<Mutex<TcpStream>>, half: ConnectionHalf) {
     while !half.0.closed.load(Ordering::Acquire) {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(frame) => {
                 let Ok(mut writer) = socket.lock() else { return };
+                if half.0.closed.load(Ordering::Acquire) { return; }
+                if frame.first() == Some(&FRAME_GET_BLOCKS)
+                    && !half.0.take_sync_request(&frame, Instant::now()) { continue; }
                 if write_frame(&mut writer, &frame).is_err() { return; }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
+    }
+}
+
+#[derive(Clone)]
+struct SyncResponder {
+    socket: Arc<Mutex<TcpStream>>,
+    data_dir: PathBuf,
+    budget: Arc<Mutex<SyncBudget>>,
+}
+
+struct SyncServingGuard(Arc<Connection>, Arc<Mutex<SyncBudget>>);
+impl Drop for SyncServingGuard {
+    fn drop(&mut self) {
+        self.0.serving_sync.store(false, Ordering::Release);
+        if let Ok(mut budget) = self.1.lock() { budget.serving = budget.serving.saturating_sub(1); }
+    }
+}
+
+impl SyncResponder {
+    fn reserve(&self, connection: &Arc<Connection>, ip: std::net::IpAddr, limiter: &mut GetBlocksLimiter) -> Option<SyncServingGuard> {
+        let now = Instant::now();
+        if connection.closed.load(Ordering::Acquire) || !limiter.admit(now) { return None; }
+        let mut budget = self.budget.lock().ok()?;
+        if !budget.admit(ip, now) || budget.serving >= MAX_SYNC_SERVING_WORKERS { return None; }
+        if connection.serving_sync.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() { return None; }
+        budget.serving = budget.serving.saturating_add(1);
+        Some(SyncServingGuard(connection.clone(), self.budget.clone()))
+    }
+
+    fn answer(&self, connection: &Arc<Connection>, ip: std::net::IpAddr, frame: Vec<u8>, limiter: &mut GetBlocksLimiter) {
+        if frame.len() != 9 { return; }
+        let Some(guard) = self.reserve(connection, ip, limiter) else { return };
+        let responder = self.clone();
+        // One worker per active connection, with no page queue. Keeping the
+        // reader free is necessary when both peers request pages together:
+        // synchronous serving on both readers can deadlock their TCP buffers.
+        thread::spawn(move || {
+            let _guard = guard;
+            if !_guard.0.closed.load(Ordering::Acquire) {
+                serve_get_blocks(&responder.socket, &responder.data_dir, &frame, &_guard.0);
+            }
+        });
     }
 }
 
@@ -656,11 +725,16 @@ fn run_outbound_reader(
     events: Sender<EngineEvent>,
     budget: Arc<QueueBudget>,
     _half: ConnectionHalf,
+    responder: SyncResponder,
 ) {
+    let Ok(address) = socket.peer_addr() else { return };
+    let mut limiter = GetBlocksLimiter::new();
     loop {
         match read_frame(&mut socket) {
             Ok(frame) => {
-                if let Some(event) = decode_event(&frame) {
+                if frame.first() == Some(&FRAME_GET_BLOCKS) {
+                    responder.answer(&_half.0, address.ip(), frame, &mut limiter);
+                } else if let Some(event) = decode_event(&frame) {
                     if !send_to_engine(&events, &budget, event) { return; }
                 }
             }
@@ -679,18 +753,10 @@ impl DevnetMesh {
     /// peer, dialed or dialing.
     pub fn broadcast(&self, frame: Vec<u8>) {
         if frame.first() == Some(&FRAME_GET_BLOCKS) {
-            // NET-15: an engine gap request must not fetch one copy of the
-            // same history from every connection. Rotate across both directions
-            // so inbound-only peers and non-primary dialers remain reachable.
-            let mut candidates = Vec::new();
-            for registry in [&self.sync_outbound, &self.inbound] {
-                if let Ok(mut peers) = registry.lock() {
-                    peers.retain(InboundPeer::is_open);
-                    candidates.extend(peers.iter().map(|p| p.frames.clone()));
+            if let Some(bytes) = frame.get(1..9).filter(|_| frame.len() == 9) {
+                if let Ok(bytes) = bytes.try_into() {
+                    self.sync.pump(Instant::now(), Some(u64::from_le_bytes(bytes)));
                 }
-            }
-            if let Ok(mut cursor) = self.sync_cursor.lock() {
-                send_sync_request(candidates, &mut cursor, frame);
             }
             return;
         }
@@ -714,21 +780,96 @@ impl DevnetMesh {
     }
 }
 
-/// Bound each engine-triggered request independently of the periodic dialer
-/// pump (which retains its own SYNC_FANOUT limit). Failed/full queues do not
-/// consume fanout, and the next request resumes after the last attempted peer.
-fn send_sync_request(mut peers: Vec<SyncSender<Vec<u8>>>, cursor: &mut usize, frame: Vec<u8>) {
-    if peers.is_empty() { return; }
-    let start = cursor.checked_rem(peers.len()).unwrap_or(0);
-    peers.rotate_left(start);
-    *cursor = start;
-    let mut sent = 0usize;
-    for peer in &peers {
-        *cursor = cursor.checked_add(1).and_then(|n| n.checked_rem(peers.len())).unwrap_or(0);
-        if peer.try_send(frame.clone()).is_ok() {
-            sent = sent.saturating_add(1);
-            if sent == SYNC_FANOUT { break; }
+struct SyncPeer {
+    peer: InboundPeer,
+    requested_at: Option<Instant>,
+}
+
+#[derive(Default)]
+struct SyncSchedule {
+    peers: std::collections::VecDeque<SyncPeer>,
+    requested_after: Option<u64>,
+}
+
+/// Shared request leases, not response-completion accounting: the legacy wire
+/// has no request ID or end-of-page frame. Late responses remain bounded by
+/// QueueBudget admission; expiration never disconnects an honest slow peer.
+struct SyncScheduler {
+    schedule: Mutex<SyncSchedule>,
+    head: Arc<AtomicU64>,
+    budget: Arc<QueueBudget>,
+}
+
+impl SyncScheduler {
+    fn new(head: Arc<AtomicU64>, budget: Arc<QueueBudget>) -> Arc<Self> {
+        Arc::new(Self { schedule: Mutex::new(SyncSchedule::default()), head, budget })
+    }
+
+    fn register(&self, peer: InboundPeer, now: Instant) {
+        if let Ok(mut schedule) = self.schedule.lock() {
+            schedule.peers.retain(|p| p.peer.is_open());
+            // Existing waiters keep their place; a new connection joins before
+            // peers which already consumed this round's lease.
+            let waiting = schedule.peers.iter().position(|p| p.requested_at.is_some()).unwrap_or(schedule.peers.len());
+            schedule.peers.insert(waiting, SyncPeer { peer, requested_at: None });
         }
+        self.pump(now, None);
+    }
+
+    fn pump(&self, now: Instant, requested_after: Option<u64>) {
+        let Ok(mut schedule) = self.schedule.lock() else { return };
+        if let Some(after) = requested_after {
+            schedule.requested_after = Some(schedule.requested_after.map_or(after, |old| old.min(after)));
+        }
+        schedule.peers.retain(|p| p.peer.is_open());
+        for peer in &mut schedule.peers {
+            if peer.requested_at.is_some_and(|at| now.saturating_duration_since(at) >= SYNC_LEASE) {
+                peer.requested_at = None;
+            }
+        }
+        // Slow state application must pause additional fetching, not destroy
+        // lease eligibility. Once the consumer drains, FIFO rotation resumes.
+        if self.budget.inflight() >= self.budget.count_cap.checked_div(2).unwrap_or(0)
+            || self.budget.inflight_bytes() >= self.budget.bytes_cap.checked_div(2).unwrap_or(0) {
+            return;
+        }
+        let mut active = schedule.peers.iter().filter(|p| p.requested_at.is_some()).count();
+        let after = schedule.requested_after.unwrap_or_else(|| self.head.load(Ordering::Acquire));
+        let frame = get_blocks_frame(after);
+        let mut sent = false;
+        for _ in 0..schedule.peers.len() {
+            if active >= SYNC_FANOUT { break; }
+            let Some(mut peer) = schedule.peers.pop_front() else { break };
+            if peer.requested_at.is_none() {
+                if let Some(connection) = peer.peer.connection.upgrade() {
+                    if let Ok(mut pending) = connection.pending_sync.lock() {
+                        // Do not pile up requests behind a stalled writer. It
+                        // clears the old authorization on send or expiry.
+                        if pending.is_none() {
+                            *pending = Some((after, now));
+                            if peer.peer.frames.try_send(frame.clone()).is_ok() {
+                                peer.requested_at = Some(now);
+                                active = active.saturating_add(1);
+                                sent = true;
+                            } else {
+                                *pending = None;
+                            }
+                        }
+                    }
+                }
+            }
+            schedule.peers.push_back(peer);
+        }
+        if sent { schedule.requested_after = None; }
+    }
+
+    fn start_timer(scheduler: &Arc<Self>) {
+        let weak = Arc::downgrade(scheduler);
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_millis(250));
+            let Some(scheduler) = weak.upgrade() else { return };
+            scheduler.pump(Instant::now(), None);
+        });
     }
 }
 
@@ -866,10 +1007,9 @@ fn decode_event(frame: &[u8]) -> Option<NetEvent> {
 
 /// Per-connection admission for `get-blocks` on the devnet transport (R3 M-4
 /// / R1 A3-M2): a token bucket, same shape and same values as the production
-/// transport's [`crate::p2p::SyncLimiter`], simplified because a devnet
-/// connection has exactly one reader thread and therefore exactly one
-/// `get-blocks` in flight at a time BY CONSTRUCTION — `serve_get_blocks` runs
-/// inline in that thread, so there is no concurrency to cap here, only rate.
+/// transport's [`crate::p2p::SyncLimiter`]. This bucket limits request rate;
+/// SyncResponder separately limits serving to one worker per connection and
+/// MAX_SYNC_SERVING_WORKERS globally, including disconnected generations.
 ///
 /// Time is a parameter, not a call to `Instant::now()` inside, for the same
 /// reason `SyncLimiter` takes one: testable refill arithmetic without
@@ -908,9 +1048,10 @@ impl GetBlocksLimiter {
 struct SyncBudget {
     addresses: std::collections::BTreeMap<std::net::IpAddr, GetBlocksLimiter>,
     global: GetBlocksLimiter,
+    serving: usize,
 }
 impl SyncBudget {
-    fn new() -> Self { Self { addresses: Default::default(), global: GetBlocksLimiter { tokens: 128.0, last: Instant::now(), rate: 64.0, capacity: 128.0 } } }
+    fn new() -> Self { Self { serving: 0, addresses: Default::default(), global: GetBlocksLimiter { tokens: 128.0, last: Instant::now(), rate: 64.0, capacity: 128.0 } } }
     fn admit(&mut self, ip: std::net::IpAddr, now: Instant) -> bool {
         let ip = match ip { std::net::IpAddr::V6(v) => v.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(ip), _ => ip };
         if !self.addresses.contains_key(&ip) {
@@ -938,17 +1079,13 @@ fn serve_get_blocks(
     sock: &Arc<Mutex<TcpStream>>,
     data_dir: &PathBuf,
     frame: &[u8],
-    limiter: &mut GetBlocksLimiter,
+    connection: &Connection,
 ) {
-    if frame.len() != 9 {
+    if frame.len() != 9 || connection.closed.load(Ordering::Acquire) {
         return;
     }
-    // R3 M-4 / R1 A3-M2: rate-limited BEFORE the disk is touched — the whole
-    // point is that `Store::blocks_after` below is the expensive step this
-    // guards.
-    if !limiter.admit(Instant::now()) {
-        return;
-    }
+    // SyncResponder admits rate limits and the per-connection worker permit
+    // before this function can touch disk.
     // `frame.len() != 9` already returned above, so `frame[1..9]` is always
     // exactly 8 bytes and the conversion cannot fail; the `else` arm keeps it
     // panic-free by construction rather than by an `unwrap`.
@@ -971,7 +1108,11 @@ fn serve_get_blocks(
                 f.push(FRAME_BLOCK);
                 f.extend_from_slice(&b);
                 let Ok(mut w) = sock.lock() else { return };
+                if connection.closed.load(Ordering::Acquire) { return; }
                 if write_frame(&mut w, &f).is_err() {
+                    // A partial frame cannot be followed by more framed data.
+                    connection.closed.store(true, Ordering::Release);
+                    let _ = connection.socket.shutdown(Shutdown::Both);
                     return;
                 }
             }
@@ -1001,7 +1142,7 @@ pub fn start(
     inflight: Arc<QueueBudget>,
 ) -> std::io::Result<DevnetMesh> {
     // Inbound: accept, then per-connection: read frames; data frames go to
-    // the engine, get-blocks is answered in place from the log.
+    // the engine; get-blocks is answered by a globally bounded serving worker.
     let listener = TcpListener::bind((bind_addr, listen_port))?;
     let inbound: Arc<Mutex<Vec<InboundPeer>>> = Arc::new(Mutex::new(Vec::new()));
     let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1015,6 +1156,8 @@ pub fn start(
     let inbound_live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let ip_limits = Arc::new(crate::connection_limit::Limits::default());
     let sync_budget = Arc::new(Mutex::new(SyncBudget::new()));
+    let sync = SyncScheduler::new(head_slot.clone(), inflight.clone());
+    SyncScheduler::start_timer(&sync);
     {
         let events = events.clone();
         let data_dir = data_dir.clone();
@@ -1022,6 +1165,8 @@ pub fn start(
         let inflight = inflight.clone();
         let live = live.clone();
         let inbound_live = inbound_live.clone();
+        let scheduler = Arc::downgrade(&sync);
+        let sync_budget = sync_budget.clone();
         thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(sock) = conn else { continue };
@@ -1055,7 +1200,7 @@ pub fn start(
                 let Ok(shutdown_socket) = sock.try_clone() else { continue };
                 let connection = Arc::new(Connection {
                     socket: shutdown_socket,
-                    closed: AtomicBool::new(false),
+                    closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
                     _counts: (ConnCount::new(&live), Some(ConnCount::new(&inbound_live))),
                     _ip_permit: Some(ip_permit),
                 });
@@ -1072,9 +1217,9 @@ pub fn start(
                         run_inbound_writer(rx, wsock, half);
                     });
                 }
-                if let Ok(mut reg) = inbound.lock() {
-                    reg.push(InboundPeer { frames: tx, connection: Arc::downgrade(&connection) });
-                }
+                let peer = InboundPeer { frames: tx, connection: Arc::downgrade(&connection) };
+                if let Ok(mut reg) = inbound.lock() { reg.push(peer.clone()); }
+                if let Some(scheduler) = scheduler.upgrade() { scheduler.register(peer, Instant::now()); }
 
                 let events = events.clone();
                 let data_dir = data_dir.clone();
@@ -1084,7 +1229,7 @@ pub fn start(
                 // are moved into the closure, so every `return` below and any
                 // unwind releases both.
                 let half = ConnectionHalf(connection);
-                let sync_budget = sync_budget.clone();
+                let responder = SyncResponder { socket: wsock, data_dir: data_dir.clone(), budget: sync_budget.clone() };
                 thread::spawn(move || {
                     let _half = half;
                     // Per-connection (R3 M-4 / R1 A3-M2): see [`GetBlocksLimiter`].
@@ -1093,14 +1238,7 @@ pub fn start(
                         match read_frame(&mut rsock) {
                             Ok(frame) => {
                                 if frame.first() == Some(&FRAME_GET_BLOCKS) {
-                                    let allowed = sync_budget.lock().map(|mut b| b.admit(address.ip(), Instant::now())).unwrap_or(false);
-                                    if !allowed { continue; }
-                                    serve_get_blocks(
-                                        &wsock,
-                                        &data_dir,
-                                        &frame,
-                                        &mut get_blocks_limiter,
-                                    );
+                                    responder.answer(&_half.0, address.ip(), frame, &mut get_blocks_limiter);
                                 } else if let Some(ev) = decode_event(&frame) {
                                     if !send_to_engine(&events, &inflight, ev) {
                                         return;
@@ -1115,24 +1253,18 @@ pub fn start(
         });
     }
 
-    // Outbound: one dialer per peer with a frame queue; a reader thread on
-    // the same socket receives the peer's sync responses.
-    //
-    // `sync_slots` is what keeps a corrected peer list from being a denial of
-    // service against ourselves: at most `SYNC_FANOUT` dialers may be asking
-    // for history at any moment, however many peers are configured.
-    let sync_slots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Both triggers use the same scheduler. Dialers only write queued frames;
+    // they never acquire lifetime sync slots or independently request pages.
     let mut peers = Vec::new();
-    let sync_outbound = Arc::new(Mutex::new(Vec::<InboundPeer>::new()));
     for addr in peer_addrs {
         // R3 M-4 / R1 A3-M2: bounded — see [`OUTBOUND_QUEUE_DEPTH`].
         let (tx, rx): (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) =
             mpsc::sync_channel(OUTBOUND_QUEUE_DEPTH);
         peers.push(tx.clone());
-        let sync_outbound = sync_outbound.clone();
+        let scheduler = Arc::downgrade(&sync);
+        let data_dir = data_dir.clone();
+        let sync_budget = sync_budget.clone();
         let events = events.clone();
-        let head_slot = head_slot.clone();
-        let sync_slots = sync_slots.clone();
         let inflight = inflight.clone();
         let live = live.clone();
         thread::spawn(move || loop {
@@ -1147,122 +1279,37 @@ pub fn start(
             let Ok(shutdown_socket) = sock.try_clone() else { continue };
             let connection = Arc::new(Connection {
                 socket: shutdown_socket,
-                closed: AtomicBool::new(false),
+                closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
                 _counts: (ConnCount::new(&live), None),
                     _ip_permit: None,
             });
-            if let Ok(mut connected) = sync_outbound.lock() {
-                connected.retain(InboundPeer::is_open);
-                connected.push(InboundPeer { frames: tx.clone(), connection: Arc::downgrade(&connection) });
+            if let Some(scheduler) = scheduler.upgrade() {
+                scheduler.register(InboundPeer { frames: tx.clone(), connection: Arc::downgrade(&connection) }, Instant::now());
             }
             let writer_half = ConnectionHalf(connection.clone());
             let reader_half = ConnectionHalf(connection);
-            let mut wsock = sock;
+            let wsock = sock;
             // R3 M-4 / R1 A3-M2: same bound as the inbound side — see
             // [`DEVNET_IO_TIMEOUT`]. Best-effort; a platform that refuses the
             // option gets an unbounded-latency socket, not a broken one.
             let _ = wsock.set_read_timeout(Some(DEVNET_IO_TIMEOUT));
             let _ = wsock.set_write_timeout(Some(DEVNET_IO_TIMEOUT));
-            // Reader half: the peer answers our get-blocks on this socket.
+            let wsock = Arc::new(Mutex::new(wsock));
+            // Reader half also answers reverse-direction requests, so an
+            // inbound-only connection can participate in recovery.
             {
                 let events = events.clone();
                 let inflight = inflight.clone();
+                let responder = SyncResponder { socket: wsock.clone(), data_dir: data_dir.clone(), budget: sync_budget.clone() };
                 thread::spawn(move || {
-                    run_outbound_reader(rsock, events, inflight, reader_half);
+                    run_outbound_reader(rsock, events, inflight, reader_half, responder);
                 });
             }
-            // Claim one of the `SYNC_FANOUT` sync slots before asking for
-            // history. A dialer that cannot claim one stays connected and keeps
-            // receiving broadcasts — it just does not add another concurrent
-            // copy of the chain to a node that may still be replaying.
-            let holds_slot = sync_slots
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                    // `n` only ever takes small values near `SYNC_FANOUT`
-                    // (== 2): this same closure is the only place that
-                    // increments it, and only when `n < SYNC_FANOUT`; the
-                    // rest of this module only decrements it. Nowhere near
-                    // overflowing `usize`.
-                    #[allow(clippy::arithmetic_side_effects)]
-                    let next = n + 1;
-                    (n < SYNC_FANOUT).then_some(next)
-                })
-                .is_ok();
-            if holds_slot
-                && write_frame(&mut wsock, &get_blocks_frame(head_slot.load(Ordering::Relaxed)))
-                    .is_err()
-            {
-                sync_slots.fetch_sub(1, Ordering::AcqRel);
-                continue;
-            }
-            let drop_slot = |held: &mut bool| {
-                if *held {
-                    sync_slots.fetch_sub(1, Ordering::AcqRel);
-                    *held = false;
-                }
-            };
-            let mut held = holds_slot;
-            loop {
-                if writer_half.0.closed.load(Ordering::Acquire) {
-                    drop_slot(&mut held);
-                    break; // the reader exited; reconnect even with an idle queue
-                }
-                match rx.recv_timeout(Duration::from_secs(5)) {
-                    Ok(frame) => {
-                        if write_frame(&mut wsock, &frame).is_err() {
-                            drop_slot(&mut held);
-                            break; // reconnect
-                        }
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        // The idle tick is the sync pump: while this dialer
-                        // holds a slot, re-ask from wherever the engine has got
-                        // to. Each answer is one page, so this walks the chain
-                        // forward instead of demanding it at once, and a node
-                        // that falls behind later notices on the next tick.
-                        //
-                        // It asks on EVERY tick, not only when the head moved.
-                        // The first version released the slot the moment a tick
-                        // found the head unchanged, on the theory that an
-                        // unchanged head meant "caught up". Two things made
-                        // that wrong, and the canary showed both:
-                        //
-                        //   - Nothing re-acquired the slot. `held` went false
-                        //     and no path set it back inside the connection
-                        //     loop, so a stable TCP connection meant the node
-                        //     never asked again — it could only fall further
-                        //     behind, silently, forever.
-                        //   - Five seconds is shorter than the work. Applying
-                        //     one block costs ~0.9s of state root at this
-                        //     state size, so a 512-block page takes minutes.
-                        //     The head is *supposed* to look unchanged on the
-                        //     next tick. The release fired on the first tick
-                        //     essentially always, which turned the sync pump
-                        //     off after a single request.
-                        //
-                        // Asking unconditionally costs a request every five
-                        // seconds from at most SYNC_FANOUT peers, and an
-                        // already-caught-up node gets an empty page back. That
-                        // is the cheap end of the trade; the other end was a
-                        // validator attesting to a head it could no longer
-                        // advance, which is what this was measured doing.
-                        if held {
-                            let at = head_slot.load(Ordering::Relaxed);
-                            if write_frame(&mut wsock, &get_blocks_frame(at)).is_err() {
-                                drop_slot(&mut held);
-                                break;
-                            }
-                        }
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        drop_slot(&mut held);
-                        return;
-                    }
-                }
-            }
+            run_connection_writer(&rx, wsock, writer_half);
         });
     }
 
-    Ok(DevnetMesh { peers, sync_outbound, sync_cursor: Mutex::new(0), inbound, live })
+    Ok(DevnetMesh { peers, sync, inbound, live })
 }
 
 #[cfg(test)]
@@ -1283,6 +1330,248 @@ mod tests {
     }
 
     use super::*;
+
+    struct SyncTestPeer {
+        peer: InboundPeer,
+        received: Receiver<Vec<u8>>,
+        connection: Arc<Connection>,
+        _remote: TcpStream,
+    }
+
+    impl SyncTestPeer {
+        fn receive(&self) -> Result<Vec<u8>, mpsc::TryRecvError> {
+            let frame = self.received.try_recv()?;
+            if frame.first() == Some(&FRAME_GET_BLOCKS) {
+                assert!(self.connection.take_sync_request(&frame, Instant::now()));
+            }
+            Ok(frame)
+        }
+    }
+
+    fn sync_test_peer() -> SyncTestPeer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let remote = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let connection = Arc::new(Connection { socket, closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
+            _counts: (ConnCount::new(&live), None), _ip_permit: None });
+        let (frames, received) = mpsc::sync_channel(1);
+        let peer = InboundPeer { frames, connection: Arc::downgrade(&connection) };
+        SyncTestPeer { peer, received, connection, _remote: remote }
+    }
+
+    #[test]
+    fn shared_sync_leases_rotate_without_head_progress_and_bound_both_triggers() {
+        let now = Instant::now();
+        let scheduler = SyncScheduler::new(Arc::new(AtomicU64::new(42)), QueueBudget::new());
+        let peers: Vec<_> = (0..3).map(|_| sync_test_peer()).collect();
+        for peer in &peers { scheduler.register(peer.peer.clone(), now); }
+        assert_eq!(peers[0].receive().unwrap(), get_blocks_frame(42));
+        assert_eq!(peers[1].receive().unwrap(), get_blocks_frame(42));
+        assert!(peers[2].receive().is_err());
+        for _ in 0..100 {
+            scheduler.pump(now, Some(7));
+            scheduler.pump(now, None);
+        }
+        assert!(peers.iter().all(|p| p.receive().is_err()), "engine and timer must share the two leases");
+        scheduler.pump(now + SYNC_LEASE, None);
+        assert_eq!(peers[2].receive().unwrap(), get_blocks_frame(7), "a silent first pair cannot exclude the next peer");
+        let mut covered = std::collections::BTreeSet::new();
+        for turn in 1..=6u32 {
+            scheduler.pump(now + SYNC_LEASE * turn, None);
+            for (index, peer) in peers.iter().enumerate() {
+                if peer.receive().is_ok() { covered.insert(index); }
+                assert!(peer.peer.is_open(), "lease expiration must not disconnect slow honest peers");
+            }
+            assert!(scheduler.schedule.lock().unwrap().peers.iter().filter(|p| p.requested_at.is_some()).count() <= SYNC_FANOUT);
+        }
+        assert_eq!(covered.len(), peers.len(), "all connections must reacquire without a head change");
+    }
+
+    #[test]
+    fn shared_sync_backpressure_disconnect_and_full_queue_preserve_reacquisition() {
+        let now = Instant::now();
+        let budget = Arc::new(QueueBudget::with_caps(4, 100));
+        let scheduler = SyncScheduler::new(Arc::new(AtomicU64::new(42)), budget.clone());
+        let first = sync_test_peer();
+        let second = sync_test_peer();
+        let third = sync_test_peer();
+        first.peer.frames.try_send(vec![FRAME_ATT]).unwrap(); // saturated writer
+        scheduler.register(first.peer.clone(), now);
+        scheduler.register(second.peer.clone(), now);
+        scheduler.register(third.peer.clone(), now);
+        assert_eq!(second.receive().unwrap(), get_blocks_frame(42));
+        assert_eq!(third.receive().unwrap(), get_blocks_frame(42));
+        assert_eq!(first.receive().unwrap(), vec![FRAME_ATT]);
+        assert!(budget.reserve_raw(EventClass::Block, 60)); // slow application
+        scheduler.pump(now + SYNC_LEASE, Some(3));
+        assert!(first.receive().is_err());
+        assert!(second.receive().is_err());
+        assert!(third.receive().is_err());
+        assert!(budget.reserve_raw(EventClass::Block, 40));
+        assert!(!budget.reserve_raw(EventClass::Block, 1), "late replies still obey the byte cap");
+        budget.release_raw(60);
+        budget.release_raw(40);
+        scheduler.pump(now + SYNC_LEASE, None);
+        assert_eq!(first.receive().unwrap(), get_blocks_frame(3));
+        assert_eq!(second.receive().unwrap(), get_blocks_frame(3));
+        second.connection.closed.store(true, Ordering::Release);
+        scheduler.pump(now + SYNC_LEASE, None);
+        assert_eq!(third.receive().unwrap(), get_blocks_frame(42), "disconnect frees its lease without waiting for expiry");
+        let replacement = sync_test_peer();
+        scheduler.register(replacement.peer.clone(), now + SYNC_LEASE);
+        scheduler.pump(now + SYNC_LEASE * 2, None);
+        assert_eq!(replacement.receive().unwrap(), get_blocks_frame(42), "reconnection enters the fair queue");
+    }
+
+    #[test]
+    fn shared_sync_stalled_writer_cannot_accumulate_or_flush_expired_requests() {
+        let now = Instant::now();
+        let scheduler = SyncScheduler::new(Arc::new(AtomicU64::new(42)), QueueBudget::new());
+        let peer = sync_test_peer();
+        scheduler.register(peer.peer.clone(), now);
+        for turn in 1..=5 { scheduler.pump(now + SYNC_LEASE * turn, Some(3)); }
+        let stale = peer.received.try_recv().unwrap();
+        assert_eq!(stale, get_blocks_frame(42));
+        assert!(peer.received.try_recv().is_err(), "only one authorization may wait behind a blocked writer");
+        assert!(!peer.connection.take_sync_request(&stale, now + SYNC_LEASE * 5));
+        scheduler.pump(now + SYNC_LEASE * 5, None);
+        let fresh = peer.received.try_recv().unwrap();
+        assert_eq!(fresh, get_blocks_frame(3));
+        assert!(!peer.connection.take_sync_request(&stale, now + SYNC_LEASE * 5), "a stale frame must not consume a different request's authorization");
+        assert!(peer.connection.take_sync_request(&fresh, now + SYNC_LEASE * 5));
+        assert!(!peer.connection.take_sync_request(&fresh, now + SYNC_LEASE * 5), "authorization is single use");
+    }
+
+    fn sync_test_block() -> BlockEnvelope {
+        use bloch_pos_committee::header::{BlockHeaderV4, Body, VERSION_G4};
+        BlockEnvelope {
+            header: BlockHeaderV4 { version: VERSION_G4, parent: [1; 32], state_root: [2; 32],
+                body_root: [3; 32], slot: 43, proposer_index: 0, randao_reveal: [4; 32],
+                randao_mix: [5; 32], justified_root: [6; 32], finalized_root: [7; 32],
+                attestation_root: [8; 32], coherence_root: [9; 32] },
+            proposer_sig: vec![0xAA; 32],
+            body: Body { transactions: Vec::new(), attestations: Vec::new() },
+        }
+    }
+
+    #[test]
+    fn shared_sync_two_silent_outbound_peers_cannot_starve_responsive_inbound() {
+        let silent_a = TcpListener::bind("127.0.0.1:0").unwrap();
+        let silent_b = TcpListener::bind("127.0.0.1:0").unwrap();
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let (events, received) = mpsc::channel();
+        let mesh = start("127.0.0.1", port,
+            vec![silent_a.local_addr().unwrap().to_string(), silent_b.local_addr().unwrap().to_string()],
+            events, std::env::temp_dir(), Arc::new(AtomicU64::new(42)), QueueBudget::new()).unwrap();
+        let (mut a, _) = silent_a.accept().unwrap();
+        let (mut b, _) = silent_b.accept().unwrap();
+        for socket in [&mut a, &mut b] {
+            assert_eq!(read_frame_until(socket, Instant::now() + Duration::from_secs(3)).unwrap(), get_blocks_frame(42));
+        }
+        let mut responder = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        for _ in 0..20 { mesh.broadcast(get_blocks_frame(42)); }
+        assert_eq!(read_frame_until(&mut responder, Instant::now() + Duration::from_secs(8)).unwrap(), get_blocks_frame(42));
+        let block = sync_test_block();
+        write_frame(&mut responder, &block_frame(&block)).unwrap();
+        match received.recv_timeout(Duration::from_secs(2)).unwrap() {
+            EngineEvent::Net(NetEvent::Block(actual, _)) => assert_eq!(actual.block_id(), block.block_id()),
+            _ => panic!("responsive peer did not deliver the missing block"),
+        }
+        assert_eq!(mesh.peer_count(), 3, "rotation must preserve silent and responsive connections");
+    }
+
+    #[test]
+    fn shared_sync_outbound_reader_serves_reverse_direction_requests() {
+        let dir = std::env::temp_dir().join(format!("bloch-reverse-sync-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let block = sync_test_block();
+        let mut store = crate::store::Store::open(&dir, &[7; 32]).unwrap();
+        store.append(&block).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (events, _received) = mpsc::channel();
+        let _mesh = start("127.0.0.1", 0, vec![listener.local_addr().unwrap().to_string()],
+            events, dir.clone(), Arc::new(AtomicU64::new(43)), QueueBudget::new()).unwrap();
+        let (mut remote, _) = listener.accept().unwrap();
+        assert_eq!(read_frame_until(&mut remote, Instant::now() + Duration::from_secs(3)).unwrap(), get_blocks_frame(43));
+        write_frame(&mut remote, &get_blocks_frame(42)).unwrap();
+        assert_eq!(read_frame_until(&mut remote, Instant::now() + Duration::from_secs(3)).unwrap(), block_frame(&block));
+        drop(remote);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn shared_sync_bidirectional_large_pages_keep_both_readers_draining() {
+        let base = std::env::temp_dir().join(format!("bloch-duplex-sync-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let left_dir = base.join("left");
+        let right_dir = base.join("right");
+        let mut block = sync_test_block();
+        // Larger than ordinary TCP send buffers: two synchronous serving
+        // readers would each block writing before either drained the other.
+        block.body.transactions.push(vec![0xA5; 4 * 1024 * 1024]);
+        let mut left_store = crate::store::Store::open(&left_dir, &[7; 32]).unwrap();
+        let mut right_store = crate::store::Store::open(&right_dir, &[7; 32]).unwrap();
+        left_store.append(&block).unwrap();
+        right_store.append(&block).unwrap();
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let (left_tx, left_rx) = mpsc::channel();
+        let (right_tx, right_rx) = mpsc::channel();
+        let left = start("127.0.0.1", port, Vec::new(), left_tx, left_dir,
+            Arc::new(AtomicU64::new(42)), QueueBudget::new()).unwrap();
+        let right = start("127.0.0.1", 0, vec![format!("127.0.0.1:{port}")], right_tx, right_dir,
+            Arc::new(AtomicU64::new(42)), QueueBudget::new()).unwrap();
+        for received in [left_rx, right_rx] {
+            match received.recv_timeout(Duration::from_secs(8)).unwrap() {
+                EngineEvent::Net(NetEvent::Block(actual, _)) => assert_eq!(actual.body.transactions, block.body.transactions),
+                _ => panic!("a bidirectional page was not delivered"),
+            }
+        }
+        assert_eq!(left.peer_count(), 1);
+        assert_eq!(right.peer_count(), 1);
+        drop((left, right, left_store, right_store));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn shared_sync_serving_cap_survives_reconnect_generations_and_closes_failed_writes() {
+        let dir = std::env::temp_dir().join(format!("bloch-sync-workers-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut store = crate::store::Store::open(&dir, &[7; 32]).unwrap();
+        store.append(&sync_test_block()).unwrap();
+        let peers: Vec<_> = (0..=MAX_SYNC_SERVING_WORKERS).map(|_| sync_test_peer()).collect();
+        let sockets: Vec<_> = peers.iter().map(|p| Arc::new(Mutex::new(p.connection.socket.try_clone().unwrap()))).collect();
+        let budget = Arc::new(Mutex::new(SyncBudget::new()));
+        let responders: Vec<_> = sockets.iter().map(|s| SyncResponder { socket: s.clone(), data_dir: dir.clone(), budget: budget.clone() }).collect();
+        let ip = "127.0.0.1".parse().unwrap();
+        // Keep the same guards the worker owns alive, modelling outstanding
+        // storage work deterministically across disconnected generations.
+        let guards: Vec<_> = peers.iter().zip(&responders).take(MAX_SYNC_SERVING_WORKERS).map(|(peer, responder)| {
+            responder.reserve(&peer.connection, ip, &mut GetBlocksLimiter::new()).unwrap()
+        }).collect();
+        assert_eq!(budget.lock().unwrap().serving, MAX_SYNC_SERVING_WORKERS);
+        for peer in peers.iter().take(MAX_SYNC_SERVING_WORKERS) { peer.connection.closed.store(true, Ordering::Release); }
+        let last = peers.last().unwrap();
+        let responder = responders.last().unwrap();
+        assert!(responder.reserve(&last.connection, ip, &mut GetBlocksLimiter::new()).is_none(), "fresh reconnect generations cannot bypass old serving work");
+        drop(guards);
+        assert_eq!(budget.lock().unwrap().serving, 0, "worker completion must return capacity");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        // A response failing after framing begins must close the connection,
+        // so the normal writer cannot append frames to a corrupted stream.
+        last.connection.socket.shutdown(Shutdown::Write).unwrap();
+        responder.answer(&last.connection, ip, get_blocks_frame(42), &mut GetBlocksLimiter::new());
+        while !last.connection.closed.load(Ordering::Acquire) || budget.lock().unwrap().serving != 0 {
+            assert!(Instant::now() < deadline, "failed response did not close/release its connection");
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn outbound_reader_failure_reconnects_and_reclaims_sync_permit() {
@@ -1334,7 +1623,7 @@ mod tests {
         let inbound_live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let connection = Arc::new(Connection {
             socket: socket.try_clone().unwrap(),
-            closed: AtomicBool::new(false),
+            closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
             _counts: (ConnCount::new(&live), Some(ConnCount::new(&inbound_live))),
                     _ip_permit: None,
         });
@@ -1370,7 +1659,7 @@ mod tests {
         let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let connection = Arc::new(Connection {
             socket: socket.try_clone().unwrap(),
-            closed: AtomicBool::new(false),
+            closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
             _counts: (ConnCount::new(&live), Some(ConnCount::new(&live))),
             _ip_permit: None,
         });
@@ -1647,8 +1936,7 @@ mod tests {
             mpsc::sync_channel(OUTBOUND_QUEUE_DEPTH);
         let mesh = DevnetMesh {
             peers: vec![tx],
-            sync_outbound: Arc::new(Mutex::new(Vec::new())),
-            sync_cursor: Mutex::new(0),
+            sync: SyncScheduler::new(Arc::new(AtomicU64::new(0)), QueueBudget::new()),
             inbound: Arc::new(Mutex::new(Vec::new())),
             live: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
@@ -1662,35 +1950,6 @@ mod tests {
             queued, OUTBOUND_QUEUE_DEPTH,
             "the outbound queue must cap at OUTBOUND_QUEUE_DEPTH, not grow with every broadcast"
         );
-    }
-
-    #[test]
-    fn engine_sync_requests_are_bounded_and_rotate_past_full_queues() {
-        let (blocked, _blocked_rx) = mpsc::sync_channel(1);
-        blocked.try_send(vec![0]).unwrap();
-        let mut senders = vec![blocked];
-        let mut receivers = Vec::new();
-        for _ in 0..5 {
-            let (tx, rx) = mpsc::sync_channel(4);
-            senders.push(tx);
-            receivers.push(rx);
-        }
-        let mut cursor = 0;
-        let frame = get_blocks_frame(17);
-        let mut visited = std::collections::BTreeSet::new();
-        for _ in 0..3 {
-            send_sync_request(senders.clone(), &mut cursor, frame.clone());
-            let mut received = 0usize;
-            for (index, rx) in receivers.iter().enumerate() {
-                if let Ok(actual) = rx.try_recv() {
-                    assert_eq!(actual, frame);
-                    visited.insert(index);
-                    received = received.saturating_add(1);
-                }
-            }
-            assert_eq!(received, SYNC_FANOUT);
-        }
-        assert_eq!(visited.len(), receivers.len(), "every available peer gets a turn");
     }
 
     /// R3 M-4 / R1 A3-M2: the devnet listener accepts at most

@@ -705,6 +705,52 @@ fn repair_log_tail(log: &mut File, dir: &Path) -> io::Result<u64> {
     Ok(at)
 }
 
+/// Framing/codec diagnosis only: a decoded frame is not proof of valid consensus
+/// execution. Inspect a stopped node or an immutable copy; never change the log.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LogInspection {
+    pub log_bytes: u64,
+    pub decoded_frames: u64,
+    pub valid_prefix_bytes: u64,
+    pub issue: Option<String>,
+}
+
+pub fn inspect_log(dir: &Path) -> io::Result<LogInspection> {
+    let mut log = File::open(dir.join("blocks.log"))?;
+    let length = log.metadata()?.len();
+    let mut report = LogInspection { log_bytes: length, decoded_frames: 0, valid_prefix_bytes: 0, issue: None };
+    while report.valid_prefix_bytes < length {
+        let remaining = length.saturating_sub(report.valid_prefix_bytes);
+        if remaining < 4 {
+            report.issue = Some("incomplete trailing length prefix".into());
+            break;
+        }
+        let mut prefix = [0; 4];
+        log.read_exact(&mut prefix)?;
+        let size = u32::from_le_bytes(prefix) as usize;
+        if size > crate::codec::MAX_FIELD_LEN {
+            report.issue = Some("frame length exceeds codec cap; cannot infer a safe truncation".into());
+            break;
+        }
+        if (size as u64) > remaining.saturating_sub(4) {
+            report.issue = Some("incomplete frame body; may be a torn append or corrupted length, not permission to truncate".into());
+            break;
+        }
+        let mut payload = vec![0; size];
+        log.read_exact(&mut payload)?;
+        if let Err(error) = crate::codec::decode_envelope(&payload) {
+            report.issue = Some(format!("invalid envelope: {error}; preserve the original log and restore from a verified backup"));
+            break;
+        }
+        report.valid_prefix_bytes = report.valid_prefix_bytes.saturating_add(4).saturating_add(size as u64);
+        report.decoded_frames = report.decoded_frames.saturating_add(1);
+    }
+    if log.metadata()?.len() != length {
+        return Err(io::Error::new(io::ErrorKind::WouldBlock, "block log changed during inspection; stop the node or inspect an immutable copy"));
+    }
+    Ok(report)
+}
+
 impl Store {
     pub(crate) fn directory(&self) -> &Path { &self.dir }
 
@@ -1060,6 +1106,35 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_log_diagnostic_is_bounded_and_does_not_repair_or_hide_corruption() {
+        let dir = std::env::temp_dir().join(format!("bloch-store-diagnostic-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("blocks.log");
+        let payload = crate::codec::encode_envelope(&sample_envelope(1));
+        let mut valid = (payload.len() as u32).to_le_bytes().to_vec();
+        valid.extend_from_slice(&payload);
+        fs::write(&path, &valid).unwrap();
+        let good = inspect_log(&dir).unwrap();
+        assert_eq!(good.decoded_frames, 1);
+        assert_eq!(good.valid_prefix_bytes, valid.len() as u64);
+        assert_eq!(good.issue, None);
+        for suffix in [&[0u8][..], &[0u8; 4][..], &[255u8; 4][..], &[5, 0, 0, 0, 1][..]] {
+            let mut damaged = valid.clone();
+            damaged.extend_from_slice(suffix);
+            fs::write(&path, &damaged).unwrap();
+            let report = inspect_log(&dir).unwrap();
+            assert_eq!(report.decoded_frames, 1);
+            assert_eq!(report.valid_prefix_bytes, valid.len() as u64);
+            assert!(report.issue.is_some());
+            assert_eq!(fs::read(&path).unwrap(), damaged);
+            assert!(!dir.join("LOCK").exists());
+            assert!(!dir.join("blocks.idx").exists());
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     /// The from-genesis path, at the store level: `after_slot = 0` must return
     /// the chain from its beginning, and the cap must be a cap.

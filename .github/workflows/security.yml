@@ -204,10 +204,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install gitleaks (pinned; fails if it cannot)
         run: |
-          bash scripts/ci-install-scanner.sh gitleaks
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          CI_TOOLS_BIN="$HOME/.local/bin" bash scripts/ci-install-scanner.sh gitleaks
       - name: gitleaks detect
-        run: gitleaks detect --no-git --source . --config .gitleaks.toml --no-banner --redact
+        run: '"$HOME/.local/bin/gitleaks" detect --no-git --source . --config .gitleaks.toml --no-banner --redact'
 
   # scanners-blocking guard — the regression test for finding I-H4 itself. Fails
   # if either CI file re-acquires a scanner escape hatch (`continue-on-error` /
@@ -218,6 +217,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Offline scanner installer regressions
+        run: python3 scripts/ci-install-scanner.test.py
       - name: selftest (the guard must be able to fail)
         run: python3 scripts/check-scanners-blocking.selftest.py
       - name: guard

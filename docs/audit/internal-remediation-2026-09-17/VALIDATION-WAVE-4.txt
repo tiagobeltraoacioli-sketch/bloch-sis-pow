@@ -1,0 +1,142 @@
+Fourth-wave validation — 2026-09-17
+Base 253e26b; branch fix/internal-audit-20260917; local macOS x86_64, Rust 1.94.1.
+Builds use shared CARGO_TARGET_DIR and two build jobs. Integrated node tests use four test threads.
+Socket-dependent tests used sandbox escalation. No Linux production, hosted CI or live Pages qualification.
+SHA256 identifies original local /private/tmp logs. Imported-module integration tests duplicate some unit coverage.
+
+bloch-wave4-node-final.log
+Command: cargo test -p bloch-pos-node
+Scope: Complete integrated node suite. Final comment/test refinement additionally covered by frozen-source net suite below.
+SHA256 99e2d480959edeaa9b959e677a233c3faa3b7e2c5d8b28ba54006306f7f4ee04
+test result: ok. 424 passed; 0 failed; 19 ignored; 0 measured; 0 filtered out; finished in 79.92s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.12s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 52.52s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.14s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.04s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+test result: ok. 63 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.18s
+test result: ok. 0 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.65s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.30s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.97s
+
+bloch-audit-wave4-net-final-frozen.log
+Command: cargo test -p bloch-pos-node --bin bloch-pos net::tests
+Scope: Final net.rs SHA256 6bc92f5842cde8b372fc6d92f41af1a081024160c76efcc6289e1eeda2d8cbea; 23 transport tests. Not a fleet SLA.
+SHA256 849f3560d1acee8b1443385c9d5eeef62ecfe3b77daf566e7dd8352d450f0f54
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 420 filtered out; finished in 5.06s
+
+bloch-wave4-hardened-final.log
+Command: bash scripts/hardened-clippy.sh
+Scope: Five crate ratchets; no raised baselines.
+SHA256 153b4ebfb9104e74f476f1208c81d88dc9aafe1e9d8a17b885111fa5a288da92
+hardened-clippy: toolchain 1.94.1 (pinned by rust-toolchain.toml)
+hardened-clippy: OK
+
+bloch-wave4-ws-genesis-final.log
+Command: cargo test -p bloch-pos-node --bin bloch-pos ws_boot::tests
+Scope: Final genesis-boundary compatibility plus checkpoint boot regressions.
+SHA256 e25aef3a535800d37e01cc95e9e7f7f323415b13009857d078fb8e07b5078c1e
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 411 filtered out; finished in 1.24s
+
+bloch-wave4-log-cli.log
+Command: cargo test -p bloch-pos-node --test block_log_inspect_cli
+Scope: Read-only real-binary diagnostic and refusal of unsupported repair invocation.
+SHA256 ffaac8373caee0af7dc45cf96d6de0fd16a80f889f40fa657c19ef412561bb09
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.56s
+
+audit-crypto-wave4.log
+Command: cargo test -p pqcrypto-internals -p bloch-crypto -p bloch-sis-pow
+Scope: Only crypto results below are claimed from this combined run; broad legacy PoW brute-force execution was interrupted. Scoped PoW evidence follows.
+SHA256 ea7a49d41bdabfdbb52e6d12ee83d475a76aa4d250b4f5a36d044e10da1ddd2f
+test result: ok. 172 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 8.02s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+audit-pq-internals-wave4-final.log
+Command: cargo test -p pqcrypto-internals
+Scope: Final RNG/TLS tests, vendor-integrity tests and doctests; ignored cases remain unqualified.
+SHA256 62f2e06119ba962ebea45385f5b6608ec8620306485a6703f24d61d0290b6fa6
+test result: ok. 17 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.36s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.00s
+
+audit-pow-difficulty-wave4.log
+Command: cargo test -p bloch-sis-pow --lib difficulty::tests
+Scope: Relevant legacy difficulty unit suite.
+SHA256 a98057bd662a151c5aceb5fc5e0c5e20910820206ee242465abab72bdde783b6
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 61 filtered out; finished in 0.00s
+
+audit-pow-properties-wave4.log
+Command: cargo test -p bloch-sis-pow --test difficulty_props
+Scope: Difficulty property suite.
+SHA256 33d2d76192e091de094dfc160dde5b80b93bccda4c60d76d3046c0b206b6eef5
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+audit-pow-nostd-wave4.log
+Command: cargo check -p bloch-sis-pow --no-default-features
+Scope: no_std compatibility check.
+SHA256 de37bcd264a94709e817ad9928a7cc8265d864e736d01b556041647d868c2f30
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.83s
+
+bloch-wave4-rpc-tests.log
+Command: node --test apps/_shared/rpc-proxy.test.mjs
+Scope: 12 mocked public transport regressions; Node24.21.0.
+SHA256 a968f4ce464b76140642d6ab3222bc27e08f92564ae97737072b7b81f2159786
+ℹ tests 12
+ℹ pass 12
+ℹ fail 0
+
+bloch-wave4-pages-build.log
+Command: wrangler pages functions build apps/explorer/functions --outfile /private/tmp/bloch-wave4-explorer-worker.js
+Scope: Wrangler4.131.1 cached locally; successful Functions bundle, no deployment.
+SHA256 298b2873e37643c47eba5a9e02847ceab008869af6b323bd0da21a4a96d8026f
+✨ Compiled Worker successfully
+
+bloch-wave4-pool-pages-build.log
+Command: wrangler pages functions build apps/posternpool-site/functions --outfile /private/tmp/bloch-wave4-pool-worker.js
+Scope: Wrangler4.131.1 cached locally; successful Functions bundle, no deployment.
+SHA256 298b2873e37643c47eba5a9e02847ceab008869af6b323bd0da21a4a96d8026f
+✨ Compiled Worker successfully
+
+bloch-wave4-scanner-tests.log
+Command: python3 scripts/ci-install-scanner.test.py
+Scope: Six offline installer regressions.
+SHA256 b76f5f120ed2835f9f2f283cab98c8d93d9b4361f4ac10fb006c7f687a55a47f
+Ran 6 tests in 4.227s
+OK
+
+bloch-wave4-scanner-guard.log
+Command: python3 scripts/check-scanners-blocking.selftest.py; python3 scripts/check-scanners-blocking.py
+Scope: Nine guard selftests and live CI posture check.
+SHA256 e7660246a31ec10a0cebe07ed06dab104d70fae8611ba96490457904f7a44216
+selftest: OK — 9 cases, both directions
+scanner-posture guard: OK — 5 GitLab + 5 GitHub scanner jobs are blocking
+
+audit-scanner-ci-path-validation.log
+Command: Ruby YAML parse and Shellwords comparison of CI scan arguments
+Scope: Verified exact binary paths, unchanged scan arguments and shell syntax.
+SHA256 196b4a721eb8bf69f030ed0064da48253b3beb1973576304dce05fc7799c173f
+.github/workflows/security.yml: parsed YAML, fixed installer paths, absolute scanner commands, unchanged scan arguments
+.gitlab-ci.yml: parsed YAML, fixed installer paths, absolute scanner commands, unchanged scan arguments
+
+bloch-wave4-scanner-real.log
+Command: CI_TOOLS_BIN=/private/tmp/bloch-wave4-verified-scanners bash scripts/ci-install-scanner.sh osv-scanner
+Scope: Official macOS x64 artifact downloaded and verified using committed checksum; not a vulnerability scan.
+SHA256 d412ccdc710963771b89702f1166b6dc5ae11c5786bedea9ac0166b97122a367
+[ci-install-scanner] osv-scanner installed from committed checksum 487ab433b2c2a8c80b737c0bd428a80e6d2e211b4adf775a52a6964163fa3249
+
+bloch-wave4-gitleaks-real.log
+Command: CI_TOOLS_BIN=/private/tmp/bloch-wave4-verified-scanners bash scripts/ci-install-scanner.sh gitleaks
+Scope: Official macOS x64 archive downloaded and verified before extraction; not a secret scan.
+SHA256 f9c86d91fb9f31446e8aee0f6ad25066faef0bf8cd52872c6556a6ae8c7b7aa3
+[ci-install-scanner] gitleaks installed from committed checksum 1a69e5666b13cd374889cbcb1939ed1573b63b551251283d5d2329a53cf58e2f
+
+bloch-wave4-scanner-versions.log
+Command: Verified absolute scanner binaries: osv-scanner --version; gitleaks version
+Scope: Only after successful checksum-verified installation in private temporary directory.
+SHA256 5f4d65e591f133653af25c7b527d848d6e6535473714dd94c419ebfe29606624
+osv-scanner version: 1.9.2
+8.18.4

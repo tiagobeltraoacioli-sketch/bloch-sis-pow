@@ -552,6 +552,29 @@ fn signer_set(args: &[String]) -> Result<(), String> {
 /// `wscheckpoint-<epoch>.bin`) and `<prefix>.json` (the human view quoting
 /// the ws digest). The digest printed at the end is the exact 32 bytes each
 /// signer signs.
+/// Reusing an output prefix is an idempotent publication, never a re-mint.
+/// An omitted timestamp means reuse the original issuance time. Every other
+/// field must still agree with the independently re-derived chain view.
+fn publication_bytes(
+    path: &str,
+    mut checkpoint: WeakSubjectivityCheckpoint,
+    explicit_issued_at: bool,
+) -> Result<(WeakSubjectivityCheckpoint, bool), String> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((checkpoint, false)),
+        Err(error) => return Err(format!("cannot read existing publication {path}: {error}")),
+    };
+    let mut bytes = Vec::new();
+    file.take(155).read_to_end(&mut bytes).map_err(|error| error.to_string())?;
+    let existing = decode_checkpoint(&bytes).map_err(|error| format!("existing publication {path}: {error}"))?;
+    if !explicit_issued_at { checkpoint.issued_at = existing.issued_at; }
+    if checkpoint != existing {
+        return Err(format!("refusing to replace existing checkpoint {path}: its signed fields differ; reuse the original artifact or investigate the discrepancy, never re-mint an already published epoch"));
+    }
+    Ok((existing, true))
+}
+
 fn checkpoint(args: &[String]) -> Result<(), String> {
     let manifest_path = req(args, "--genesis")?;
     let rpcs: Vec<String> = req(args, "--rpc")?
@@ -589,10 +612,16 @@ fn checkpoint(args: &[String]) -> Result<(), String> {
     // genesis anchor carries zeros for the same reason (`engine::run`, "no
     // validator-set SMT root exposed at this milestone"). The field stays in
     // the format so the day state download exists the artifact does not
-    // change shape; until then zeros are the honest value, and an override
-    // exists for that day.
+    // change shape; until then zero is an explicit unavailable-root sentinel.
+    // Do not permit an operator-supplied nonzero value to appear validated.
     let validator_set_root = match crate::arg_value(args, "--validator-set-root") {
-        Some(s) => parse_hex32(&s, "--validator-set-root")?,
+        Some(s) => {
+            let root = parse_hex32(&s, "--validator-set-root")?;
+            if root != [0; 32] {
+                return Err("nonzero --validator-set-root is unsupported: this tool cannot independently derive a validator registry commitment; use the historical zero sentinel".into());
+            }
+            root
+        },
         None => [0u8; 32],
     };
 
@@ -660,13 +689,21 @@ fn checkpoint(args: &[String]) -> Result<(), String> {
         issued_at,
         signer_set_id,
     };
+    let bin_path = format!("{out}.bin");
+    let json_path = format!("{out}.json");
+    let (cp, reused) = publication_bytes(&bin_path, cp, crate::arg_value(args, "--issued-at").is_some())?;
     let bytes = cp.canonical_serialize();
     decode_checkpoint(&bytes).map_err(|e| format!("self-check failed: {e}"))?;
     let digest = cp.ws_digest();
-
-    let bin_path = format!("{out}.bin");
-    let json_path = format!("{out}.json");
-    write_file(&bin_path, &bytes, false)?;
+    if !reused {
+        // Exclusive creation closes the check/create race between publishers.
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&bin_path)
+            .map_err(|error| format!("cannot create publication {bin_path}: {error}"))?;
+        file.write_all(&bytes).map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+    } else {
+        println!("reusing original checkpoint issuance time and digest from {bin_path}");
+    }
     // §2.3: the JSON is a *view*; the binary is the artifact. The view quotes
     // the digest so an announcement and the file can be compared by eye.
     let view = Json::obj(vec![
@@ -1410,6 +1447,40 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn audit_checkpoint_creation_refuses_invented_validator_root_before_rpc() {
+        let args = ["--genesis", "unused", "--rpc", "unused:1", "--epoch", "64",
+            "--signer-set-id", "3", "--out", "unused", "--validator-set-root"];
+        let mut args: Vec<String> = args.into_iter().map(String::from).collect();
+        args.push(hex32(&[7; 32]));
+        let error = checkpoint(&args).unwrap_err();
+        assert!(error.contains("nonzero --validator-set-root is unsupported"));
+    }
+
+    #[test]
+    fn audit_checkpoint_publication_reuses_original_digest_and_refuses_changes() {
+        let dir = tmp("publication-reuse");
+        let path = format!("{dir}/epoch.bin");
+        let original = WeakSubjectivityCheckpoint {
+            version: WS_FORMAT_VERSION, network_id: 1, genesis_root: [1; 32], epoch: 64,
+            block_root: [2; 32], state_root: [3; 32], validator_set_root: [0; 32],
+            issued_at: 123, signer_set_id: 3,
+        };
+        assert!(!publication_bytes(&path, original, false).unwrap().1);
+        fs::write(&path, original.canonical_serialize()).unwrap();
+        let mut later = original;
+        later.issued_at = 456;
+        let (reused, existing) = publication_bytes(&path, later, false).unwrap();
+        assert!(existing);
+        assert_eq!(reused.ws_digest(), original.ws_digest());
+        assert!(publication_bytes(&path, later, true).is_err());
+        later.state_root = [9; 32];
+        assert!(publication_bytes(&path, later, false).is_err());
+        assert_eq!(decode_checkpoint(&fs::read(&path).unwrap()).unwrap(), original);
+        fs::write(&path, vec![0; 156]).unwrap();
+        assert!(publication_bytes(&path, original, false).is_err());
     }
 
     /// The whole ceremony, files and all, against real hybrid crypto and the

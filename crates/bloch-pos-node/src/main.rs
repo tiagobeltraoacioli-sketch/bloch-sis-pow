@@ -157,6 +157,25 @@ fn main() {
         Some("keygen") => keygen(&args[1..]),
         Some("keygen-public") => keygen_public(&args[1..]),
         Some("keys") => keys_cmd(&args[1..]),
+        Some("block-log-inspect") => {
+            let parameters = &args[1..];
+            if parameters.len() != 2 || parameters[0] != "--data-dir" {
+                eprintln!("usage: bloch-pos block-log-inspect --data-dir <stopped-node-or-copy>");
+                exit(2);
+            }
+            match store::inspect_log(std::path::Path::new(&parameters[1])) {
+                Ok(report) => {
+                    println!("log_bytes={} decoded_frames={} valid_prefix_bytes={}",
+                        report.log_bytes, report.decoded_frames, report.valid_prefix_bytes);
+                    println!("Framing/codec inspection only; consensus execution and checksums are not verified. No files modified.");
+                    if let Some(issue) = report.issue {
+                        eprintln!("block-log-inspect: offset {}: {issue}", report.valid_prefix_bytes);
+                        exit(1);
+                    }
+                }
+                Err(error) => { eprintln!("block-log-inspect: {error}"); exit(2); }
+            }
+        }
         Some("slashing-protection") => {
             if let Err(error) = slashing_cli::run(&args[1..]) {
                 eprintln!("slashing-protection: {error}");
@@ -201,6 +220,8 @@ fn print_help() {
         "{NAME} {VERSION} — Bloch Genesis-4 Proof-of-Stake node\n\
          \n\
          USAGE:\n\
+           bloch-pos block-log-inspect --data-dir <stopped-node-or-copy>\n\
+               Read-only bounded block-log framing/codec diagnosis. No repair.\n\
            bloch-pos selfcheck\n\
                Verify the frozen consensus parameters this binary links.\n\
            bloch-pos buildinfo\n\

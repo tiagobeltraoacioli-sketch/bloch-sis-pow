@@ -116,17 +116,14 @@ pub fn generate_keypair_from_seed(seed: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Cry
     // BIP39 PBKDF2), the caller is responsible for hashing down to 32 bytes
     // if they want the full entropy preserved — here we take the first 32
     // for simplicity.
-    let mut seed32 = [0u8; 32];
+    let mut seed32 = zeroize::Zeroizing::new([0u8; 32]);
     seed32.copy_from_slice(&seed[..32]);
 
-    // Activate thread-local seeded RNG for PQClean's internal randombytes().
-    // Guard is RAII — on drop (end of this function), OS RNG is restored.
-    let _guard = pqcrypto_internals::with_seeded_rng(&seed32);
-    // Both keygens draw from the same seeded randombytes stream → deterministic
-    // given the seed (ML-DSA is fully deterministic; Falcon is deterministic
-    // given the byte stream — the platform-float caveat is documented in B6).
-    let (mpk, msk) = mldsa65::keypair();
-    let (fpk, fsk) = falcon::keypair();
+    // Both keygens consume the unchanged stream within a non-escaping scope.
+    // Cleanup also removes any accidentally forgotten nested legacy guards.
+    let ((mpk, msk), (fpk, fsk)) = pqcrypto_internals::with_seeded_rng_scope(&seed32, || {
+        (mldsa65::keypair(), falcon::keypair())
+    });
     let mut pk = mpk.as_bytes().to_vec(); pk.extend_from_slice(&fpk);
     let mut sk = msk.as_bytes().to_vec(); sk.extend_from_slice(&fsk);
     Ok((wrap_envelope(SUITE_MLDSA65_FALCON1024, &pk),

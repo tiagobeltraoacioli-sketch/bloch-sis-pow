@@ -5094,6 +5094,11 @@ pub fn run(cfg: Config) -> io::Result<()> {
             (fin.epoch, fin.root),
             |e| local_at.iter().find(|(k, _)| *k == e).map(|(_, r)| *r),
             |root| canonical.contains(root),
+            |root| {
+                if *root == genesis_root { return Some(engine.manifest.genesis_header().state_root); }
+                if !canonical.contains(root) { return None; }
+                engine.blocks.get(root).map(|block| block.header.state_root)
+            },
         )?;
         match outcome {
             Ok(ws) => {

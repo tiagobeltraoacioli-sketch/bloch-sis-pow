@@ -343,6 +343,7 @@ scanners-blocking-guard:
   stage: check
   before_script: []
   script:
+    - python3 scripts/ci-install-scanner.test.py
     - python3 scripts/check-scanners-blocking.selftest.py
     - python3 scripts/check-scanners-blocking.py
   allow_failure: false
@@ -511,12 +512,12 @@ osv-scanner:
   stage: check
   before_script: []
   script:
-    - export PATH="$HOME/.local/bin:$PATH"
-    - bash scripts/ci-install-scanner.sh osv-scanner
+    - CI_TOOLS_BIN="$HOME/.local/bin" bash scripts/ci-install-scanner.sh osv-scanner
     # Every workspace lockfile (finding SC2-sharks-shamir), mirroring
     # scripts/audit-all-lockfiles.sh — a root-only scan misses the
     # standalone workspaces' pins.
-    - osv-scanner --config=osv-scanner.toml
+    - >-
+        "$HOME/.local/bin/osv-scanner" --config=osv-scanner.toml
         --lockfile=Cargo.lock
         --lockfile=pool/Cargo.lock
         --lockfile=pool-proxy/Cargo.lock
@@ -618,9 +619,8 @@ secret-scan:
   stage: check
   before_script: []
   script:
-    - export PATH="$HOME/.local/bin:$PATH"
-    - bash scripts/ci-install-scanner.sh gitleaks
-    - gitleaks detect --no-git --source . --config .gitleaks.toml --no-banner --redact
+    - CI_TOOLS_BIN="$HOME/.local/bin" bash scripts/ci-install-scanner.sh gitleaks
+    - '"$HOME/.local/bin/gitleaks" detect --no-git --source . --config .gitleaks.toml --no-banner --redact'
   allow_failure: false
 
 # Build + full test suite (the gate).

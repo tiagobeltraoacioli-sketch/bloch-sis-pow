@@ -1,0 +1,14 @@
+# Reviewed upstream release asset SHA-256 pins; changing versions requires review.
+# Retrieved 2026-09-17 from:
+# https://github.com/google/osv-scanner/releases/download/v1.9.2/osv-scanner_SHA256SUMS
+# https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_checksums.txt
+# These are byte pins, not a claim of independently authenticated upstream signatures.
+# tool version asset sha256
+osv-scanner v1.9.2 osv-scanner_darwin_amd64 487ab433b2c2a8c80b737c0bd428a80e6d2e211b4adf775a52a6964163fa3249
+osv-scanner v1.9.2 osv-scanner_darwin_arm64 393f2c7089d9431bd26a3804d6e46d417b1c05abd5d49c41c7dfc174c520acf0
+osv-scanner v1.9.2 osv-scanner_linux_amd64 d6af4b67fa5de658598bd2d445efb99e90d1734b3146962418719c4350ecb74b
+osv-scanner v1.9.2 osv-scanner_linux_arm64 9c6160afb26c79449a1f1b667323b989a57dda8fc19f22936c9ff920fd97ddfa
+gitleaks 8.18.4 gitleaks_8.18.4_darwin_x64.tar.gz 1a69e5666b13cd374889cbcb1939ed1573b63b551251283d5d2329a53cf58e2f
+gitleaks 8.18.4 gitleaks_8.18.4_darwin_arm64.tar.gz a480d8593acd8215b22402cf0f3f88b01dcd3610c63b5391db640f7767e62104
+gitleaks 8.18.4 gitleaks_8.18.4_linux_x64.tar.gz ba6dbb656933921c775ee5a2d1c13a91046e7952e9d919f9bac4cec61d628e7d
+gitleaks 8.18.4 gitleaks_8.18.4_linux_arm64.tar.gz bf5f7f466ebfade1296c8bd32cf7d3f592c2aa78836aa9980ffbe2cadca7a861

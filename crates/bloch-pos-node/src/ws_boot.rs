@@ -656,6 +656,43 @@ fn window_days() -> u64 {
     ws::WS_PERIOD_EPOCHS / ws::EPOCHS_PER_DAY
 }
 
+/// Compare only against locally replay-validated canonical state. Missing local
+/// evidence is not a successful validation and must never manufacture trust.
+fn check_local_state(
+    checkpoint: &WeakSubjectivityCheckpoint,
+    genesis_anchor: &WeakSubjectivityCheckpoint,
+    local_state_root: &impl Fn(&[u8; 32]) -> Option<[u8; 32]>,
+    warnings: &mut Vec<String>,
+) -> io::Result<()> {
+    // The reserved release anchor records the manifest-derived genesis state.
+    // Published checkpoints instead use the named block's header field, as the
+    // RPC/tool always did, including a genesis boundary after missed slots.
+    // Legacy genesis headers carry zero; bound manifests carry a pre-state
+    // commitment. Neither is interchangeable with the reserved anchor's root.
+    let root = if checkpoint.signer_set_id == ws::WS_GENESIS_SIGNER_SET_ID
+        && checkpoint.epoch == 0 && checkpoint.block_root == genesis_anchor.block_root {
+        Some(genesis_anchor.state_root)
+    } else {
+        local_state_root(&checkpoint.block_root)
+    };
+    if let Some(root) = root {
+        if root != checkpoint.state_root {
+            return Err(boot_refused(format!(
+                "WS_STATE_CONFLICT: checkpoint epoch {} state root {} differs from locally validated block {} state root {}",
+                checkpoint.epoch, hex32(&checkpoint.state_root), hex32(&checkpoint.block_root), hex32(&root)
+            )));
+        }
+    } else {
+        warnings.push(format!("checkpoint epoch {} state root has no local canonical block evidence yet; it is not locally validated", checkpoint.epoch));
+    }
+    if checkpoint.validator_set_root != [0; 32] {
+        warnings.push(format!("WARNING: checkpoint epoch {} has a nonzero validator_set_root that this node cannot independently derive; this field is not validated", checkpoint.epoch));
+    }
+    // Zero is the existing published format's unavailable-root sentinel, not
+    // a validator registry commitment. Preserve that historical encoding.
+    Ok(())
+}
+
 /// The whole boot sequence described in the module docs. `local_root_at`
 /// returns this node's own finalized checkpoint root at an epoch (`None` if
 /// its finality has not reached it); `is_canonical` answers whether a block
@@ -672,6 +709,7 @@ pub fn boot(
     local_finalized: (u64, [u8; 32]),
     local_root_at: impl Fn(u64) -> Option<[u8; 32]>,
     is_canonical: impl Fn(&[u8; 32]) -> bool,
+    local_state_root: impl Fn(&[u8; 32]) -> Option<[u8; 32]>,
 ) -> io::Result<Result<WsOutcome, String>> {
     let mut warnings = Vec::new();
 
@@ -684,6 +722,8 @@ pub fn boot(
             *genesis_anchor
         }
     };
+
+    check_local_state(&anchor, genesis_anchor, &local_state_root, &mut warnings)?;
 
     // 2. Operator-supplied envelope (§4.1 precedence, source 1).
     let mut published: Option<WeakSubjectivityCheckpoint> = None;
@@ -777,6 +817,7 @@ pub fn boot(
             ));
         }
         let cp = env.checkpoint;
+        check_local_state(&cp, genesis_anchor, &local_state_root, &mut warnings)?;
 
         // 4 (order matters): the cross-check against OWN finality comes
         // before admission. A published checkpoint that contradicts what this
@@ -1573,11 +1614,60 @@ mod tests {
     // -- boot orchestration -------------------------------------------------
 
     #[test]
+    fn audit_genesis_boundary_preserves_published_header_root_convention() {
+        let anchor = genesis_anchor();
+        for header_root in [[0; 32], [0x77; 32]] {
+            let local = |root: &[u8; 32]| if *root == GEN { Some(header_root) } else { None };
+            let mut warnings = Vec::new();
+            check_local_state(&anchor, &anchor, &local, &mut warnings).unwrap();
+            let mut published = anchor;
+            published.epoch = 1;
+            published.signer_set_id = 3;
+            published.state_root = header_root;
+            check_local_state(&published, &anchor, &local, &mut warnings).unwrap();
+            published.state_root = [0x99; 32];
+            assert!(check_local_state(&published, &anchor, &local, &mut warnings).is_err());
+            let mut corrupt_anchor = anchor;
+            corrupt_anchor.state_root = header_root;
+            assert!(check_local_state(&corrupt_anchor, &anchor, &local, &mut warnings).is_err());
+        }
+    }
+
+    #[test]
+    fn audit_checkpoint_state_is_checked_before_admission_and_on_restart() {
+        let dir = tmpdir("local-state");
+        let mut cp = checkpoint(64);
+        cp.signer_set_id = 3;
+        cp.validator_set_root = [0; 32]; // Published legacy sentinel remains valid.
+        let (set, signatures) = phase_a_set_and_signatures(3, &cp.ws_digest());
+        let envelope = dir.join("checkpoint.bin");
+        let arrangement = dir.join("arrangement.bin");
+        fs::write(&envelope, encode_envelope_file(&CheckpointEnvelope { checkpoint: cp, signatures })).unwrap();
+        fs::write(&arrangement, encode_signer_set_file(&set)).unwrap();
+        let cfg = WsConfig { checkpoint: Some(envelope), signer_set: Some(arrangement) };
+        let local = |root: &[u8; 32]| if *root == cp.block_root { Some([0xee; 32]) } else { None };
+        let error = boot(&cfg, &dir, NET, &GEN, &genesis_anchor(), 70, true,
+            (64, cp.block_root), |_| Some(cp.block_root), |_| true, local).err().unwrap();
+        assert!(is_non_retryable(&error));
+        assert!(error.to_string().contains("WS_STATE_CONFLICT"));
+        assert_eq!(load_latest(&dir, NET, &GEN).unwrap().unwrap(), genesis_anchor());
+
+        boot(&cfg, &dir, NET, &GEN, &genesis_anchor(), 70, true,
+            (64, cp.block_root), |_| Some(cp.block_root), |_| true,
+            |root| if *root == cp.block_root { Some(cp.state_root) } else { None }).unwrap().unwrap();
+        assert_eq!(load_latest(&dir, NET, &GEN).unwrap().unwrap(), cp);
+        let error = boot(&no_flags(), &dir, NET, &GEN, &genesis_anchor(), 70, true,
+            (64, cp.block_root), |_| Some(cp.block_root), |_| true, local).err().unwrap();
+        assert!(is_non_retryable(&error));
+        assert!(error.to_string().contains("WS_STATE_CONFLICT"));
+    }
+
+    #[test]
     fn audit_malformed_ws_artifacts_are_typed_but_raw_io_errors_are_not() {
         let dir = tmpdir("operator-errors");
         let path = dir.join("checkpoint.bin");
         let config = WsConfig { checkpoint: Some(path.clone()), signer_set: None };
-        let attempt = || boot(&config, &dir, NET, &GEN, &genesis_anchor(), 0, false, (0, GEN), |_| None, |_| false);
+        let attempt = || boot(&config, &dir, NET, &GEN, &genesis_anchor(), 0, false, (0, GEN), |_| None, |_| false, |_| None);
         let missing = attempt().err().unwrap();
         assert_eq!(missing.kind(), io::ErrorKind::NotFound);
         assert!(!is_non_retryable(&missing));
@@ -1604,7 +1694,7 @@ mod tests {
             false,
             (0, GEN),
             |_| None,
-            |_| false,
+            |_| false, |_| None,
         )
         .unwrap()
         .expect("fresh node inside the trust-once window must sync");
@@ -1629,7 +1719,7 @@ mod tests {
             false,
             (0, GEN),
             |_| None,
-            |_| false,
+            |_| false, |_| None,
         )
         .unwrap()
         .expect_err("a fresh node with only a stale anchor must not sync");
@@ -1645,7 +1735,7 @@ mod tests {
         // Fresh: age 0.
         let out = boot(
             &no_flags(), &dir, NET, &GEN, &genesis_anchor(),
-            10, true, (10, [0x55; 32]), |_| None, |_| false,
+            10, true, (10, [0x55; 32]), |_| None, |_| false, |_| None,
         )
         .unwrap()
         .expect("fresh own finality resumes");
@@ -1654,7 +1744,7 @@ mod tests {
         // Stale but inside the window: resumes with a prominent warning.
         let out = boot(
             &no_flags(), &dir, NET, &GEN, &genesis_anchor(),
-            ws::WS_FRESH_EPOCHS + 5, true, (5, [0x55; 32]), |_| None, |_| false,
+            ws::WS_FRESH_EPOCHS + 5, true, (5, [0x55; 32]), |_| None, |_| false, |_| None,
         )
         .unwrap()
         .expect("inside the window still resumes");
@@ -1666,7 +1756,7 @@ mod tests {
         let dir = tmpdir("refuse-stale");
         let refusal = boot(
             &no_flags(), &dir, NET, &GEN, &genesis_anchor(),
-            WS_PERIOD_EPOCHS + 7, true, (7, [0x55; 32]), |_| None, |_| false,
+            WS_PERIOD_EPOCHS + 7, true, (7, [0x55; 32]), |_| None, |_| false, |_| None,
         )
         .unwrap()
         .expect_err("beyond the window with no checkpoint must refuse");
@@ -1763,7 +1853,7 @@ mod tests {
         let cfg = WsConfig { checkpoint: Some(env_path), signer_set: Some(set_path) };
         let err = boot(
             &cfg, &dir, NET, &GEN, &genesis_anchor(),
-            300, false, (0, GEN), |_| None, |_| false,
+            300, false, (0, GEN), |_| None, |_| false, |_| None,
         )
         .expect_err("boot must refuse an arrangement adopted after the checkpoint");
         assert!(is_non_retryable(&err));
@@ -1782,7 +1872,7 @@ mod tests {
         };
         boot(
             &cfg, &dir, NET, &GEN, &genesis_anchor(),
-            300, false, (0, GEN), |_| None, |_| false,
+            300, false, (0, GEN), |_| None, |_| false, |_| None,
         )
         .expect("io")
         .expect("a sanely-adopted arrangement must still boot");
@@ -1807,7 +1897,7 @@ mod tests {
         let cfg = WsConfig { checkpoint: Some(env_path), signer_set: Some(set_path) };
         let refusal = boot(
             &cfg, &dir, NET, &GEN, &genesis_anchor(),
-            1, false, (0, GEN), |_| None, |_| false,
+            1, false, (0, GEN), |_| None, |_| false, |_| None,
         )
         .unwrap()
         .expect_err("an equivocal same-epoch checkpoint must refuse the boot");
@@ -1870,7 +1960,7 @@ mod tests {
             &cfg, &dir, NET, &GEN, &genesis_anchor(),
             70, true, (70, own_root),
             move |e| if e <= 70 { Some(own_root) } else { None },
-            |_| false,
+            |_| false, |_| None,
         )
         .unwrap()
         .expect("a conflicting published checkpoint must not stop a fresh node's resume");
@@ -1918,7 +2008,7 @@ mod tests {
         let cfg = WsConfig { checkpoint: Some(env_path), signer_set: Some(set_path) };
         let err = boot(
             &cfg, &dir, NET, &GEN, &genesis_anchor(),
-            1, false, (0, GEN), |_| None, |_| false,
+            1, false, (0, GEN), |_| None, |_| false, |_| None,
         )
         .err()
         .expect("a 1-of-1 signer set must not become a root of trust");
