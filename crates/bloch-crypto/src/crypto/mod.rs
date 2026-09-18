@@ -689,12 +689,11 @@ pub mod falcon {
                 "645bf4db96650515c016aa1f615b78ad4dac5985363abdfbb8a3e0fc4a5d2e24";
             const KAT_SIG_LEN: usize = 1271;
 
-            let (pk, sk, sig) = {
-                let _guard = pqcrypto_internals::with_seeded_rng(&KAT_SEED);
+            let (pk, sk, sig) = pqcrypto_internals::with_seeded_rng_scope(&KAT_SEED, || {
                 let (pk, sk) = keypair();
                 let sig = sign(&sk, KAT_MSG).expect("seeded falcon sign");
                 (pk, sk, sig)
-            };
+            });
             // Falcon signatures are variable-length in general; under a fixed
             // randomness stream the length is fixed too, so pin it as well.
             assert_eq!(sig.len(), KAT_SIG_LEN, "seeded Falcon signature length drifted");
@@ -972,9 +971,9 @@ mod kat {
         // golden vector. This exercises the deterministic-signing path used
         // ONLY for regression pinning — NOT the production signer.
         let (_pk, sk) = generate_keypair_from_seed(&GOLDEN_SEED).unwrap();
-        let _guard = pqcrypto_internals::with_seeded_rng(&GOLDEN_SEED);
-        let sig = sign(&sk, GOLDEN_MSG).unwrap();
-        drop(_guard);
+        let sig = pqcrypto_internals::with_seeded_rng_scope(&GOLDEN_SEED, || {
+            sign(&sk, GOLDEN_MSG).unwrap()
+        });
         // Hash VALUE unchanged; slice shifts by the 4-byte header: sig[4..4+3309].
         assert_eq!(
             hex::encode(Sha3_256::digest(&sig[SUITE_HEADER_LEN..SUITE_HEADER_LEN + MLDSA_SIG_LEN])),

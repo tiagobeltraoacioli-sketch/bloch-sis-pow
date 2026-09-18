@@ -79,26 +79,11 @@ thread_local! {
     static SEEDED_RNG_STACK: RefCell<Vec<SeededEntry>> = const { RefCell::new(Vec::new()) };
 }
 
-/// RAII guard that removes this call's seeded RNG from the thread-local stack.
-///
-/// Returned by [`with_seeded_rng`]. Hold this for the duration of any
-/// PQClean call that should consume deterministic bytes.
-///
-/// The guard is neither `Send` nor `Sync`: its destructor must run on the
-/// thread whose entropy source it changed. Moving the old zero-sized guard
-/// to another thread left the original thread deterministically seeded.
-///
-/// ```compile_fail
-/// let guard = pqcrypto_internals::with_seeded_rng(&[7; 32]);
-/// std::thread::spawn(move || drop(guard));
-/// ```
-///
-/// ```compile_fail
-/// fn require_sync<T: Sync>() {}
-/// require_sync::<pqcrypto_internals::SeededRngGuard>();
-/// ```
+/// Internal RAII guard for the scoped public API. Keeping this type and its
+/// constructor private prevents downstream callers from forgetting a guard
+/// and leaving deterministic entropy active for later operations.
 #[must_use = "guard must remain in scope — dropping it restores the previous RNG (or OS RNG)"]
-pub struct SeededRngGuard {
+struct SeededRngGuard {
     // Rc both binds the guard to its thread and identifies its exact entry.
     id: Rc<()>,
 }
@@ -117,30 +102,12 @@ impl Drop for SeededRngGuard {
     }
 }
 
-/// Activate deterministic bytes for PQClean calls on this thread.
+/// Activate deterministic bytes for an internal PQClean test scope.
 ///
 /// Subsequent calls to `PQCRYPTO_RUST_randombytes` on this thread will
 /// return bytes from a ChaCha20 CSPRNG keyed with `seed`. When the
 /// returned guard is dropped, the override is cleared and OS RNG is
 /// restored.
-///
-/// # Example
-///
-/// ```ignore
-/// use pqcrypto_internals::with_seeded_rng;
-/// use pqcrypto_mldsa::mldsa65;
-///
-/// let seed = [0u8; 32]; // derive this from BIP39 / HKDF / etc.
-/// let (pk1, sk1) = {
-///     let _guard = with_seeded_rng(&seed);
-///     mldsa65::keypair()
-/// };
-/// let (pk2, sk2) = {
-///     let _guard = with_seeded_rng(&seed);
-///     mldsa65::keypair()
-/// };
-/// // Same seed → same keypair bytes.
-/// ```
 ///
 /// # Nesting (I-2)
 ///
@@ -160,10 +127,9 @@ impl Drop for SeededRngGuard {
 /// Still not recommended as a matter of style (a nested call SHOULD have a
 /// reason), but it can no longer corrupt an enclosing scope's determinism.
 ///
-/// Prefer [`with_seeded_rng_scope`]. Forgetting this legacy guard leaves its
-/// override active until an enclosing scoped call returns or the thread exits.
-/// The opaque `rand_chacha` state does not support guaranteed zeroization.
-pub fn with_seeded_rng(seed: &[u8; 32]) -> SeededRngGuard {
+/// This primitive stays private. Downstream code must use
+/// [`with_seeded_rng_scope`], which owns cleanup across return and unwind.
+fn with_seeded_rng(seed: &[u8; 32]) -> SeededRngGuard {
     let rng = ChaCha20Rng::from_seed(*seed);
     let id = Rc::new(());
     SEEDED_RNG_STACK.with(|stack| {
@@ -182,6 +148,12 @@ pub fn with_seeded_rng(seed: &[u8; 32]) -> SeededRngGuard {
 /// Do not return an async future expecting the override to cover its polling.
 /// The ChaCha byte stream and C ABI are unchanged; opaque RNG state erasure
 /// remains unsupported by the current dependency.
+///
+/// The old manual guard is deliberately not part of the public API:
+///
+/// ```compile_fail
+/// let _forgotten = pqcrypto_internals::with_seeded_rng(&[7; 32]);
+/// ```
 pub fn with_seeded_rng_scope<T>(seed: &[u8; 32], operation: impl FnOnce() -> T) -> T {
     struct Scope(SeededRngGuard);
     impl Drop for Scope {
@@ -202,7 +174,8 @@ pub fn with_seeded_rng_scope<T>(seed: &[u8; 32], operation: impl FnOnce() -> T) 
 
 /// Fill `buf` with random bytes — safe-Rust core of the FFI entry point.
 ///
-/// - If a seeded RNG is active on this thread (via [`with_seeded_rng`]):
+/// - If a seeded RNG is active on this thread (via
+///   [`with_seeded_rng_scope`]):
 ///   fills `buf` with deterministic bytes from that RNG (infallible).
 /// - Otherwise: fills `buf` with OS entropy via `getrandom::fill` —
 ///   identical to upstream pqcrypto-internals — and propagates any OS RNG
