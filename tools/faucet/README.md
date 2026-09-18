@@ -127,5 +127,5 @@ emitted JS from `dist/` (NodeNext `.js` import specifiers).
 
 ## Naming
 
-This is the **community edition**. Do not refer to it as "Postern OS", and never
-use the name "BABA YAGA".
+This is the **community edition**. Do not refer to it as "Postern OS" or by the
+registered legacy mark; approved names are Yagabona and Izbushka.

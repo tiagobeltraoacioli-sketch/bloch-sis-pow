@@ -44,7 +44,11 @@ fail=0
 # Matches: "baba yaga", "baba-yaga", "baba_yaga", "babayaga" (any case).
 TRADEMARK_RE='baba[[:space:]_-]*yaga|babayaga'
 
-tm_hits="$(git grep -iInE -- "$TRADEMARK_RE" -- . ':!scripts/ci-banned-words.sh' || true)"
+# The self-test necessarily contains hostile fixture strings. It executes this
+# checker against a synthetic tracked file, so scanning the fixture source in
+# the real repository would make the gate fail because its own regression
+# exists rather than because shipping prose uses the mark.
+tm_hits="$(git grep -iInE -- "$TRADEMARK_RE" -- . ':!scripts/ci-banned-words.sh' ':!scripts/ci-banned-words.selftest.sh' || true)"
 if [ -n "$tm_hits" ]; then
   echo "❌ TRADEMARK VIOLATION — 'BABA YAGA' (federally registered, Class 9) must NEVER ship."
   echo "   Ship as Yagabona / Izbushka. Offending lines:"
@@ -77,7 +81,10 @@ NEGATION_RE='\b(not|no|never|without|nothing|isn.?t|aren.?t|cannot|can.?t)\b'
 NEGATION_WINDOW=40
 NEGATION_FILTER="$(dirname "${BASH_SOURCE[0]}")/ci-banned-words-negation-filter.py"
 
-ew_hits="$(git grep -iInE -- "$EARNED_RE" -- . ':!scripts/ci-banned-words.sh' ':!scripts/ci-banned-words-negation-filter.py' || true)"
+# Exclusions are executable fixtures or immutable scan evidence, not product
+# prose. `.gitleaks-history-baseline.json` embeds historical commit messages
+# verbatim; rewriting those messages would falsify the baseline it records.
+ew_hits="$(git grep -iInE -- "$EARNED_RE" -- . ':!scripts/ci-banned-words.sh' ':!scripts/ci-banned-words.selftest.sh' ':!scripts/ci-banned-words-negation-filter.py' ':!.gitleaks-history-baseline.json' || true)"
 if [ -n "$ew_hits" ]; then
   ew_hits="$(printf '%s\n' "$ew_hits" | python3 "$NEGATION_FILTER" "$EARNED_RE" "$NEGATION_RE" "$NEGATION_WINDOW")"
 fi
