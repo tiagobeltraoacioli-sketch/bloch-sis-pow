@@ -399,10 +399,7 @@ impl QueueBudget {
     /// Origin guard survives forwarding and handling, including error paths.
     fn admit_source(&self, ev: &mut NetEvent, source: source_budget::Source) -> bool {
         let class = class_of(ev);
-        let Some(guard) = source_budget::Registry::reserve(
-            &self.sources, source, class, queued_bytes(ev), self.count_cap, self.bytes_cap,
-        ) else {
-            self.shed_counter(class).fetch_add(1, Ordering::Relaxed);
+        let Some(guard) = self.reserve_source_frame(source, class, queued_bytes(ev)) else {
             return false;
         };
         match ev {
@@ -414,6 +411,39 @@ impl QueueBudget {
 
     pub(crate) fn admit_peer(&self, ev: &mut NetEvent, peer: Vec<u8>) -> bool {
         self.admit_source(ev, source_budget::Source::Peer(peer))
+    }
+
+    /// Reserve a libp2p peer's bounded first-hop allowance before parsing its
+    /// gossip payload. `size` is the already-bounded gossipsub frame length;
+    /// callers must verify that a successfully decoded canonical value has the
+    /// same class and encoded size before attaching the returned guard.
+    pub(crate) fn reserve_peer_frame(
+        &self,
+        class: EventClass,
+        size: usize,
+        peer: Vec<u8>,
+    ) -> Option<Arc<SourceReservation>> {
+        self.reserve_source_frame(source_budget::Source::Peer(peer), class, size)
+    }
+
+    fn reserve_source_frame(
+        &self,
+        source: source_budget::Source,
+        class: EventClass,
+        size: usize,
+    ) -> Option<Arc<SourceReservation>> {
+        let guard = source_budget::Registry::reserve(
+            &self.sources,
+            source,
+            class,
+            size,
+            self.count_cap,
+            self.bytes_cap,
+        );
+        if guard.is_none() {
+            self.shed_counter(class).fetch_add(1, Ordering::Relaxed);
+        }
+        guard
     }
 
     /// Reserve room for `ev`, or record a shed and return `false`.

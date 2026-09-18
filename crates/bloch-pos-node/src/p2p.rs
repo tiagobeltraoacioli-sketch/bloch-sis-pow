@@ -1167,7 +1167,13 @@ impl Loop {
     }
 
     fn emit(&self, mut ev: NetEvent, peer: PeerId) -> Option<bool> {
-        if !self.budget.admit_peer(&mut ev, peer.to_bytes()) { return None; }
+        // Gossip reserves from its bounded frame length before decoding. Sync
+        // responses arrive already decoded, so they reserve here instead.
+        if !has_source_reservation(&ev)
+            && !self.budget.admit_peer(&mut ev, peer.to_bytes())
+        {
+            return None;
+        }
         Some(self.events.send(ev).is_ok())
     }
 
@@ -1659,6 +1665,28 @@ fn on_gossip(
             .report_message_validation_result(&message_id, &source, v.into());
     };
 
+    // Charge the bounded wire bytes before any canonical decoder allocates or
+    // walks attacker-controlled collections. Saturation is local overload,
+    // not proof of peer misconduct, so it is Ignore rather than Reject.
+    let class = if topic == st.topics.blocks.hash() {
+        crate::net::EventClass::Block
+    } else if topic == st.topics.attestations.hash() {
+        crate::net::EventClass::Attestation
+    } else if topic == st.topics.txs.hash() {
+        crate::net::EventClass::Transaction
+    } else {
+        report(swarm, Verdict::Ignore);
+        return true;
+    };
+    let Some(reservation) = st.budget.reserve_peer_frame(
+        class,
+        message.data.len(),
+        source.to_bytes(),
+    ) else {
+        report(swarm, Verdict::Ignore);
+        return true;
+    };
+
     if topic == st.topics.blocks.hash() {
         match crate::codec::decode_envelope(&message.data) {
             Ok(env) => {
@@ -1674,13 +1702,19 @@ fn on_gossip(
                     format!("← block slot {} from {source}", env.header.slot)
                 });
                 let slot = env.header.slot;
-                st.note_block(*env.block_id().as_bytes());
+                let block_id = *env.block_id().as_bytes();
                 let origin = Origin {
                     inner: Some((message_id.clone(), source)),
                     block_hint: Some((source, slot)),
-                    reservation: None,
+                    reservation: Some(reservation),
                 };
-                return match st.emit(NetEvent::Block(env, origin), source) {
+                let event = NetEvent::Block(env, origin);
+                if crate::net::queued_bytes(&event) != message.data.len() {
+                    report(swarm, Verdict::Reject);
+                    return true;
+                }
+                st.note_block(block_id);
+                return match st.emit(event, source) {
                     Some(alive) => alive,
                     None => { report(swarm, Verdict::Ignore); true }
                 };
@@ -1701,9 +1735,14 @@ fn on_gossip(
                 let origin = Origin {
                     inner: Some((message_id.clone(), source)),
                     block_hint: None,
-                    reservation: None,
+                    reservation: Some(reservation),
                 };
-                return match st.emit(NetEvent::Attestation(att, origin), source) {
+                let event = NetEvent::Attestation(att, origin);
+                if crate::net::queued_bytes(&event) != message.data.len() {
+                    report(swarm, Verdict::Reject);
+                    return true;
+                }
+                return match st.emit(event, source) {
                     Some(alive) => alive,
                     None => { report(swarm, Verdict::Ignore); true }
                 };
@@ -1721,9 +1760,14 @@ fn on_gossip(
                 let origin = Origin {
                     inner: Some((message_id.clone(), source)),
                     block_hint: None,
-                    reservation: None,
+                    reservation: Some(reservation),
                 };
-                return match st.emit(NetEvent::Transaction(tx, origin), source) {
+                let event = NetEvent::Transaction(tx, origin);
+                if crate::net::queued_bytes(&event) != message.data.len() {
+                    report(swarm, Verdict::Reject);
+                    return true;
+                }
+                return match st.emit(event, source) {
                     Some(alive) => alive,
                     None => { report(swarm, Verdict::Ignore); true }
                 };
@@ -1733,12 +1777,16 @@ fn on_gossip(
                 report(swarm, Verdict::Reject);
             }
         }
-    } else {
-        // A topic we never subscribed to cannot reach here; if it somehow
-        // does, ignoring it is the answer that penalizes nobody.
-        report(swarm, Verdict::Ignore);
     }
     true
+}
+
+fn has_source_reservation(ev: &NetEvent) -> bool {
+    match ev {
+        NetEvent::Block(_, origin)
+        | NetEvent::Attestation(_, origin)
+        | NetEvent::Transaction(_, origin) => origin.reservation.is_some(),
+    }
 }
 
 /// Answer a `get-blocks` off the blocking pool, capped in both blocks and
@@ -2218,6 +2266,49 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         st.events = tx;
         assert_eq!(st.emit(event(), flooder), Some(true));
+    }
+
+    /// Gossip admission is charged from the bounded frame length before its
+    /// decoder runs. A malformed frame has no event to carry the guard, so
+    /// dropping that guard must restore capacity; a valid decoded event that
+    /// does carry it must not be charged a second time by `Loop::emit`.
+    #[test]
+    fn predecode_peer_admission_releases_failures_and_is_not_charged_twice() {
+        let mut st = test_loop();
+        let (events, rx) = std::sync::mpsc::channel();
+        st.events = events;
+        st.budget = Arc::new(crate::net::QueueBudget::with_caps(2, 1_024));
+        let peer = PeerId::random();
+        let class = crate::net::EventClass::Transaction;
+
+        let malformed = st
+            .budget
+            .reserve_peer_frame(class, 1, peer.to_bytes())
+            .expect("first bounded frame is admitted before decode");
+        assert!(
+            st.budget.reserve_peer_frame(class, 1, peer.to_bytes()).is_none(),
+            "the predecode reservation must consume the one transaction slot",
+        );
+        drop(malformed);
+
+        let guard = st
+            .budget
+            .reserve_peer_frame(class, 1, peer.to_bytes())
+            .expect("failed decode released its predecode reservation");
+        let event = NetEvent::Transaction(
+            bloch_pos_committee::transition::PosTransaction::Exit { validator: 0 },
+            Origin {
+                inner: None,
+                block_hint: None,
+                reservation: Some(guard),
+            },
+        );
+        assert_eq!(
+            st.emit(event, peer),
+            Some(true),
+            "an event carrying the predecode guard must bypass a duplicate source charge",
+        );
+        drop(rx.recv().expect("pre-reserved event reached the first channel"));
     }
 
     /// R1 A3-M3: the sync-chase budget is PER PEER. A peer that never lets
