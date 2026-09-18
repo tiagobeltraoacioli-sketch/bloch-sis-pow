@@ -678,21 +678,13 @@ impl PosTransaction {
         h.finalize().into()
     }
 
-    /// This chain's own network-binding value (A2-3 / R7 M2): folded into
-    /// [`Self::checked_signing_root`] under `DS_SPEND2` once
-    /// [`crate::params::SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH`] arms — see
-    /// that constant's docs for the carryover-replay hole this closes.
+    /// Legacy source-tree label retained for API compatibility.
     ///
-    /// Fixed content, not `CommittedState`: this chain's genesis identity
-    /// does not evolve over its life, so it needs no Merkle commitment of
-    /// its own any more than `DS_SPEND` itself does — a node compiled
-    /// against a different value computes a different
-    /// `checked_signing_root` for every transfer from the instant the gate
-    /// arms and diverges at the very first activation-epoch block, exactly
-    /// as a bugged hardcoded domain tag would. The exact bytes are
-    /// arbitrary; only their being distinct from whatever OTHER network is
-    /// built from this same source is load-bearing, which is why they name
-    /// Genesis-4 by label rather than by anything computed.
+    /// This is not a network identity: two networks built from the same source
+    /// share it. Consensus uses [`Self::checked_signing_root_for_network`]
+    /// with the committed manifest digest. Existing external tools can keep
+    /// using [`Self::checked_signing_root`] while the gate is inert; after a
+    /// future activation they must migrate or their signatures fail closed.
     pub const fn network_binding() -> [u8; 32] {
         const LABEL: &[u8] = b"BLCH4:GENESIS-4:MAINNET";
         let mut out = [0u8; 32];
@@ -717,25 +709,21 @@ impl PosTransaction {
         h.finalize().into()
     }
 
-    /// The value a transfer's witnesses are actually checked against.
+    /// Compatibility root for callers that do not yet accept a network domain.
     ///
     /// Below [`CommittedState::sighash_network_binding_active`] this is
     /// exactly [`Self::spend_signing_root`] — unchanged, so every signing
     /// root this crate has ever computed replays identically. At and above
     /// it, the base root is folded again ([`Self::fold_network_binding`])
-    /// under `DS_SPEND2` with [`Self::network_binding`] — a NEW 16-byte tag
+    /// under `DS_SPEND2` with the legacy [`Self::network_binding`] label — a
+    /// NEW 16-byte tag
     /// that is neither a prefix of `DS_SPEND` nor prefixed by it (both are
     /// exactly 16 bytes with different content), so the result cannot
     /// collide with any digest `DS_SPEND` alone ever produced.
     ///
-    /// `spend_signing_root` itself is UNTOUCHED — its signature and its
-    /// value are exactly what they always were, on every call site
-    /// including `bloch-pos-node`'s wallets — so nothing outside this
-    /// crate's own signature CHECK need change before the gate arms.
-    /// Wallets adopt this fold only once the founder announces it, per
-    /// `SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH`'s docs; until then, arming
-    /// with no wallet-side change simply makes every existing signature
-    /// invalid (fail-closed, not fail-open).
+    /// `spend_signing_root` itself is untouched. This helper is preserved so
+    /// source users do not break before an activation migration, but it is no
+    /// longer the consensus verification path.
     ///
     /// V1 and V2 share this fold because both already share
     /// `spend_signing_root`'s fold (one function, both callers), so the two
@@ -752,6 +740,25 @@ impl PosTransaction {
             return base;
         }
         Self::fold_network_binding(base, Self::network_binding())
+    }
+
+    /// Consensus candidate using the genesis-manifest domain committed in
+    /// state instead of [`Self::network_binding`]'s compatibility label.
+    ///
+    /// Before the inert gate this always returns the historical root, even
+    /// for an old replay state without a domain. Once rehearsed open it fails
+    /// closed when the state has no domain and otherwise binds the supplied
+    /// identity under `DS_SPEND2`.
+    pub fn checked_signing_root_for_network(
+        &self,
+        epoch: u64,
+        network_domain: Option<&[u8; 32]>,
+    ) -> Option<[u8; 32]> {
+        let base = self.spend_signing_root();
+        if !CommittedState::sighash_network_binding_active(epoch) {
+            return Some(base);
+        }
+        network_domain.map(|domain| Self::fold_network_binding(base, *domain))
     }
 
     /// The canonical wire encoding of a consensus transaction — the bytes the
@@ -3994,9 +4001,11 @@ impl CommittedState {
         // One signing root for the whole transfer, so N inputs cost N
         // verifications and not N roots. The root excludes the witnesses (see
         // `spend_signing_root`). Below `SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH`
-        // (A2-3 / R7 M2) `checked_signing_root` returns exactly that root;
+        // (A2-3 / R7 M2) the network-aware helper returns exactly that root;
         // see its docs for what changes once the gate arms.
-        let signing_root = tx.checked_signing_root(self.epoch);
+        let signing_root = tx
+            .checked_signing_root_for_network(self.epoch, self.admission_network_domain.as_ref())
+            .ok_or(TransferReject::MissingNetworkBinding)?;
         for i in inputs {
             if !verifier.verify_with_key(&i.pubkey, &signing_root, &i.signature) {
                 return Err(TransferReject::BadSignature);
@@ -4251,10 +4260,12 @@ impl CommittedState {
         // The whole point of the format: the signing root covers every spend
         // point, so one signature per key authorises all of that key's
         // inputs. k verifications instead of n; each is the SAME check a V1
-        // input would get. Same `checked_signing_root` as V1 — one fold,
+        // input would get. Same network-aware root as V1 — one fold,
         // shared by both callers, so the two formats cannot drift into
         // different network-binding rules once the gate arms (A2-3 / R7 M2).
-        let signing_root = tx.checked_signing_root(self.epoch);
+        let signing_root = tx
+            .checked_signing_root_for_network(self.epoch, self.admission_network_domain.as_ref())
+            .ok_or(TransferReject::MissingNetworkBinding)?;
         for k in keys {
             if !verifier.verify_with_key(&k.pubkey, &signing_root, &k.signature) {
                 return Err(TransferReject::BadSignature);
@@ -9514,7 +9525,8 @@ mod tests {
         let alice = owner_key(0x91);
         let to = script_of(&owner_key(0x92));
         let coin = opening(0x9A, 0, 50_000_000, &alice);
-        let (_t, g, _c) = setup_funded(4, &[coin.clone()]);
+        let (_t, mut g, _c) = setup_funded(4, &[coin.clone()]);
+        g.admission_network_domain = Some([0xD4; 32]);
         let price = g.next_base_fee();
 
         let tx = transfer_spending(std::slice::from_ref(&coin), &alice, to, 512, 1, price);
@@ -9527,9 +9539,12 @@ mod tests {
             "a signature over the plain root must not satisfy the bound check",
         );
 
-        // Re-sign over the value `checked_signing_root` actually demands.
+        // Re-sign over the state-derived network root consensus actually demands.
         let mut bound_tx = tx.clone();
-        let bound_root = bound_tx.checked_signing_root(g.epoch);
+        let network = g.admission_network_domain.expect("bound genesis fixture");
+        let bound_root = bound_tx
+            .checked_signing_root_for_network(g.epoch, Some(&network))
+            .expect("bound state supplies a network domain");
         if let PosTransaction::Transfer { inputs, .. } = &mut bound_tx {
             for i in inputs.iter_mut() {
                 i.signature = toy_sign(&alice, &bound_root);
@@ -9538,6 +9553,42 @@ mod tests {
         assert!(
             g.clone().apply_transfer(&bound_tx, price, &ToyVerifier).is_ok(),
             "a signature over the bound root must satisfy the check once the gate is open",
+        );
+    }
+
+    #[test]
+    fn network_aware_candidate_preserves_replay_and_fails_closed_without_a_domain() {
+        let tx = PosTransaction::Transfer {
+            inputs: vec![TransferInput {
+                txid: [7u8; 32],
+                vout: 0,
+                pubkey: vec![1u8; 4],
+                signature: vec![2u8; 4],
+            }],
+            outputs: vec![TransferOutput { value: 100, script_hash: [9u8; 32] }],
+            tx_bytes: 64,
+            tip_millisat_per_gas: 0,
+        };
+
+        assert_eq!(
+            tx.checked_signing_root_for_network(0, None),
+            Some(tx.spend_signing_root()),
+            "historical states without a domain must replay byte-identically below the gate",
+        );
+
+        let _open = crate::params::rehearsal::sighash_network_binding_gate_open_guard();
+        assert_eq!(tx.checked_signing_root_for_network(0, None), None);
+        let a = tx.checked_signing_root_for_network(0, Some(&[0xAA; 32])).unwrap();
+        let b = tx.checked_signing_root_for_network(0, Some(&[0xBB; 32])).unwrap();
+        assert_ne!(a, b, "the same transfer must require different signatures on two geneses");
+    }
+
+    #[test]
+    fn validator_network_binding_candidate_stays_unarmed() {
+        assert_eq!(
+            crate::params::VALIDATOR_NETWORK_BINDING_ACTIVATION_EPOCH,
+            u64::MAX,
+            "validator binding needs coordinated signing, validation, gossip and slashing activation",
         );
     }
 

@@ -529,10 +529,13 @@ because of it.
 ### 3.2 `SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH` — the one gate that needs wallet coordination
 
 Currently `u64::MAX` (inert). Once armed, a signature is checked against
-`SHA3-256(DS_SPEND2 ‖ network_binding() ‖ spend_signing_root())` instead of
-`spend_signing_root()` alone (`network_binding()` a fixed 32-byte label,
-`b"BLCH4:GENESIS-4:MAINNET"`) — `spend_signing_root()` itself, and therefore
-every `txid`, is untouched. The code states the consequence for wallets
+`SHA3-256(DS_SPEND2 ‖ admission_network_domain ‖ spend_signing_root())` instead
+of `spend_signing_root()` alone. `admission_network_domain` is the canonical
+genesis-manifest digest committed in state; an activation-epoch state without
+it fails closed. The older `network_binding()` source label remains only as a
+compatibility API for pre-activation tooling and is not the consensus check.
+`spend_signing_root()` itself, and therefore every `txid`, is untouched. The
+code states the consequence for wallets
 explicitly: **"arming with no wallet-side change simply makes every existing
 signature invalid (fail-closed, not fail-open)"** — every outstanding
 signed-but-unconfirmed transaction becomes permanently `BadSignature` the
@@ -557,7 +560,7 @@ consensus path.
 | Enveloped hybrid sizes | Pubkey 4+1952+1793 = **3,749 B**; secret key 4+4032+2305 = **6,341 B**; signature (max) 4+3309+1462 = **4,775 B** | `transition.rs:207` (`WitnessKey` doc, "3,749 B key" / "4,775 B proofs") |
 | "Measured" gas-pricing signature size | **`HYBRID_SIG_BYTES = 4,589` bytes** — a *measured* figure (3,309 + a Falcon component priced at 1,280, not the 1,462 theoretical ceiling), used only to budget mempool declared-size slack, not a hard maximum. | `bloch-pos-committee/src/fee_market.rs:135-137` |
 | Hashing | SHA3-256 / SHAKE-256, domain-separated | throughout `bloch-crypto`, `bloch-pos-committee` |
-| Domain separation tags (16 bytes each, exact) | `DS_BLOCK = b"BLCH4:BLOCK\0\0\0\0\0"` (`params.rs:1820`); `DS_SPEND = b"BLCH4:SPEND\0\0\0\0\0"` (`:1838`); `DS_SPEND2 = b"BLCH4:SPEND2\0\0\0\0"` (`:1848`, inert, §3.2); `DS_TXID = b"BLCH4:TXID\0\0\0\0\0\0"` (`:1857`); `DS_PROPOSE = b"BLCH4:PROPOSE\0\0\0"` (`:1869`); `DS_EXIT = b"BLCH4:EXIT\0\0\0\0\0\0"` (`:1876`); `DS_WSCKPT = b"BLCH4:WSCKPT\0\0\0\0"` (`:1881`) | `bloch-pos-committee/src/params.rs`, per-tag line numbers given inline (file order: `DS_BLOCK`, `DS_SPEND`, `DS_SPEND2`, `DS_TXID`, `DS_PROPOSE`, `DS_EXIT`, `DS_WSCKPT`) |
+| Domain separation tags (16 bytes each, exact) | The complete registry is `params::DOMAIN_TAGS`. Relevant here: `DS_SPEND2 = b"BLCH4:SPEND2\0\0\0\0"` for the inert spend gate and `DS_NETSIG2 = b"BLCH4:NETSIG2\0\0\0"` for the unarmed validator-duty candidate. | `bloch-pos-committee/src/params.rs`; normative complete table in `BLOCH-POS-SHA3-LATTICE-MIGRATION.md` §6.1 |
 | Constant-time / fail-closed properties | `crypto::verify` auto-detects enveloped vs. legacy-raw form by exact byte length and returns `false` (never panics) on a suite mismatch between pubkey and signature — a documented consensus rule, not merely a library nicety. OS-RNG failure fails **closed** (aborts) rather than silently falling back to a weaker source (a fixed Round-3 defect, K-H1). | `crypto/mod.rs:239-262` |
 
 <div class="note">

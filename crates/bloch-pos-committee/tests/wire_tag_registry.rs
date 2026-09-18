@@ -478,6 +478,7 @@ const RELEASED_DS: &[(&str, &str)] = &[
     ("DS_COHERENCE", r"BLCH4:COHERE\0\0\0\0"),
     ("DS_DEPOSIT", r"BLCH4:DEPOSIT\0\0\0"),
     ("DS_EXIT", r"BLCH4:EXIT\0\0\0\0\0\0"),
+    ("DS_NETSIG2", r"BLCH4:NETSIG2\0\0\0"),
     ("DS_PROPOSE", r"BLCH4:PROPOSE\0\0\0"),
     ("DS_RANDAO", r"BLCH4:RANDAO\0\0\0\0"),
     ("DS_SLASH", r"BLCH4:SLASH\0\0\0\0\0"),

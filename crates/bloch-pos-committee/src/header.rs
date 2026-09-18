@@ -67,7 +67,7 @@
 //! *is*.
 
 use crate::attestation::Attestation;
-use crate::params::{DS_BLOCK, DS_PROPOSE};
+use crate::params::{DS_BLOCK, DS_NETSIG2, DS_PROPOSE};
 use sha3::{Digest, Sha3_256};
 
 /// Genesis-4 header version tag (§5.3).
@@ -226,6 +226,23 @@ impl BlockHeaderV4 {
         let mut h = Sha3_256::new();
         h.update(DS_PROPOSE);
         h.update(self.canonical_serialize());
+        h.finalize().into()
+    }
+
+    /// Candidate genesis-bound proposal root.
+    ///
+    /// Production consensus deliberately continues to use
+    /// [`Self::proposal_signing_root`] while the validator-network-binding
+    /// flag day is unarmed. This method exists so a future coordinated
+    /// activation cannot invent a second, tooling-only preimage.
+    pub fn network_bound_proposal_signing_root(
+        &self,
+        network_domain: &[u8; 32],
+    ) -> [u8; 32] {
+        let mut h = Sha3_256::new();
+        h.update(DS_NETSIG2);
+        h.update(network_domain);
+        h.update(self.proposal_signing_root());
         h.finalize().into()
     }
 }
@@ -410,6 +427,21 @@ mod tests {
             attestation_root: [0x88; 32],
             coherence_root: [0x99; 32],
         }
+    }
+
+    #[test]
+    fn candidate_root_binds_proposal_to_one_genesis_without_changing_legacy_root() {
+        let header = base_header();
+        let legacy = header.proposal_signing_root();
+        let a = header.network_bound_proposal_signing_root(&[0xA1; 32]);
+        let b = header.network_bound_proposal_signing_root(&[0xB2; 32]);
+        assert_ne!(a, b);
+        assert_ne!(a, legacy);
+        assert_eq!(
+            header.proposal_signing_root(),
+            legacy,
+            "candidate must not mutate replay roots",
+        );
     }
 
     #[test]

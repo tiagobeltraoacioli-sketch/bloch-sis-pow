@@ -542,6 +542,7 @@ zero byte; every tag is exactly 16 bytes.
 | `DS_SLASH` | `BLCH4:SLASH\0\0\0\0\0` | Evidence identity over nested `DS_ATTEST` or `DS_PROPOSE` roots (§7.3) |
 | `DS_SPEND` | `BLCH4:SPEND\0\0\0\0\0` | eUTXO spend-authorisation signing root (witness-free) |
 | `DS_SPEND2` | `BLCH4:SPEND2\0\0\0\0` | Network-bound eUTXO spend-authorisation root behind its inert flag day |
+| `DS_NETSIG2` | `BLCH4:NETSIG2\0\0\0` | Candidate outer fold for genesis-bound attestation/proposal roots; activation remains inert |
 | `DS_TXID` | `BLCH4:TXID\0\0\0\0\0\0` | Transaction identity: `txid = SHA3-256(DS_TXID ‖ spend signing root)` |
 | `DS_PROPOSE` | `BLCH4:PROPOSE\0\0\0` | Proposer signature over the header — deliberately **not** the block-id domain |
 | `DS_EXIT` | `BLCH4:EXIT\0\0\0\0\0\0` | Voluntary-exit signing root (§7.2) |

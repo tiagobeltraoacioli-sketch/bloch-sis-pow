@@ -1835,8 +1835,8 @@ pub const WITHDRAWAL_ACTIVATION_EPOCH: u64 = 2_884;
 ///   `(n_spends, spend points, outputs, tx_bytes, tip)` preimage under
 ///   `DS_SPEND`, byte for byte;
 /// - **at and above**: the fold additionally covers a network-binding value
-///   (see [`crate::transition::PosTransaction::network_binding`]) under a NEW, distinct
-///   16-byte tag, `DS_SPEND2` (`b"BLCH4:SPEND2\0\0\0\0"` — not a prefix of
+///   (the committed genesis-manifest digest) under a NEW, distinct 16-byte
+///   tag, `DS_SPEND2` (`b"BLCH4:SPEND2\0\0\0\0"` — not a prefix of
 ///   `DS_SPEND` and not prefixed by it, since both are exactly 16 bytes with
 ///   different content), so a signature becomes a statement about one
 ///   transfer on ONE chain. V1 and V2 share the fold (one function, both
@@ -1858,6 +1858,15 @@ pub const WITHDRAWAL_ACTIVATION_EPOCH: u64 = 2_884;
 /// others do not need. Ships INERT at `u64::MAX`;
 /// `sighash_network_binding_gate_is_inert` pins the value.
 pub const SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Candidate flag day for genesis-bound validator duty signatures.
+///
+/// This remains deliberately unarmed. Attestation and proposal candidate roots
+/// are available for interoperability fixtures, but production signing,
+/// validation, gossip identity, and slashing evidence continue to use the
+/// historical roots until a coordinated activation specification covers all
+/// of those consumers and mixed-version behavior.
+pub const VALIDATOR_NETWORK_BINDING_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// One shipped domain separator and the preimage shapes that use it.
 ///
@@ -1919,6 +1928,11 @@ pub const DS_SPEND: [u8; 16] = *b"BLCH4:SPEND\0\0\0\0\0";
 /// (`'2'` vs `DS_SPEND`'s trailing `\0`), so neither can ever be mistaken
 /// for the other.
 pub const DS_SPEND2: [u8; 16] = *b"BLCH4:SPEND2\0\0\0\0";
+/// Candidate outer domain for genesis-bound attestation and proposal roots.
+/// The nested legacy root retains the role-specific `DS_ATTEST`/`DS_PROPOSE`
+/// separation; this tag adds one canonical network identity without changing
+/// any historical root.
+pub const DS_NETSIG2: [u8; 16] = *b"BLCH4:NETSIG2\0\0\0";
 /// Transaction identity: `txid = SHA3-256(DS_TXID ‖ spend signing root)`.
 ///
 /// Derived from the witness-free signing root, so a transaction's id — and
@@ -2024,6 +2038,14 @@ pub const DOMAIN_TAGS: &[DomainTag] = &[
         name: "DS_SPEND2",
         bytes: DS_SPEND2,
         preimage_shapes: &["network-bound witness-free spend authorization"],
+    },
+    DomainTag {
+        name: "DS_NETSIG2",
+        bytes: DS_NETSIG2,
+        preimage_shapes: &[
+            "candidate network-bound attestation root over DS_ATTEST root",
+            "candidate network-bound proposal root over DS_PROPOSE root",
+        ],
     },
     DomainTag {
         name: "DS_TXID",

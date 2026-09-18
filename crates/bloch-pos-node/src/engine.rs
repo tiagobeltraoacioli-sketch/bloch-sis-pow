@@ -3300,8 +3300,13 @@ impl Engine {
                 return Err(Refusal::Invalid("funded deposit belongs to a different genesis manifest"));
             }
         }
-        admissible_with_verifier(&tx, epoch_of(self.wall_slot()), &self.gossip_verifier)
-            .map_err(Refusal::Invalid)?;
+        admissible_with_network_verifier(
+            &tx,
+            epoch_of(self.wall_slot()),
+            self.state.admission_network_domain().as_ref(),
+            &self.gossip_verifier,
+        )
+        .map_err(Refusal::Invalid)?;
         if self.funded_mempool_conflict(&tx, &capacity.stale) {
             return Err(Refusal::Invalid("funded deposit conflicts with a pending input or validator key"));
         }
@@ -5947,6 +5952,15 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
 }
 
 fn admissible_with_verifier(tx: &PosTransaction, wall_epoch: u64, verifier: &dyn SignatureVerifier) -> Result<(), &'static str> {
+    admissible_with_network_verifier(tx, wall_epoch, None, verifier)
+}
+
+fn admissible_with_network_verifier(
+    tx: &PosTransaction,
+    wall_epoch: u64,
+    network_domain: Option<&[u8; 32]>,
+    verifier: &dyn SignatureVerifier,
+) -> Result<(), &'static str> {
     match tx {
         PosTransaction::FundedDeposit(deposit) => {
             if !bloch_pos_committee::params::funded_validator_admission_active(wall_epoch) {
@@ -6087,7 +6101,9 @@ fn admissible_with_verifier(tx: &PosTransaction, wall_epoch: u64, verifier: &dyn
             // Refusing at the mempool door is what stops it PROPAGATING. The
             // signature is the expensive check and it is deliberately last, after
             // the two free ones above.
-            let signing_root = tx.spend_signing_root();
+            let signing_root = tx
+                .checked_signing_root_for_network(wall_epoch, network_domain)
+                .ok_or("network-bound spend gate requires a committed genesis domain")?;
             for i in inputs {
                 if !verifier.verify_with_key(&i.pubkey, &signing_root, &i.signature) {
                     return Err("transfer carries a signature that does not verify");
@@ -6246,7 +6262,9 @@ fn admissible_with_verifier(tx: &PosTransaction, wall_epoch: u64, verifier: &dyn
             // per key authorises all of that key's inputs. Admitting an
             // unverified table would hand an attacker free propagation of
             // garbage that every proposer then pays to drop.
-            let signing_root = tx.spend_signing_root();
+            let signing_root = tx
+                .checked_signing_root_for_network(wall_epoch, network_domain)
+                .ok_or("network-bound spend gate requires a committed genesis domain")?;
             for k in keys {
                 if !verifier.verify_with_key(&k.pubkey, &signing_root, &k.signature) {
                     return Err("transfer carries a signature that does not verify");

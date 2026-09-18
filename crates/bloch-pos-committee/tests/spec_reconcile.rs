@@ -153,7 +153,7 @@ fn f05_header_wire_layout_matches_code() {
 fn f06_domain_and_state_tags_all_published() {
     let doc = spec(MIGRATION);
 
-    assert_eq!(params::DOMAIN_TAGS.len(), 15, "review every new domain tag");
+    assert_eq!(params::DOMAIN_TAGS.len(), 16, "review every new domain tag");
     for tag in params::DOMAIN_TAGS {
         assert!(
             !tag.preimage_shapes.is_empty(),

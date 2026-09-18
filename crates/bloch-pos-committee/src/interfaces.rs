@@ -552,6 +552,10 @@ pub enum TransferReject {
     /// transfer's signing root. **The rule that stops anyone spending anyone
     /// else's coins.**
     BadSignature,
+    /// The network-bound spend gate was active, but the judging state had no
+    /// committed genesis/manifest domain. Refuse rather than falling back to
+    /// a source-tree label shared by independently opened networks.
+    MissingNetworkBinding,
     /// `sum(inputs) != sum(outputs) + fee`, where the fee is what the fee
     /// market charges — never a number the transaction declares. Value is
     /// neither created nor destroyed outside the emission schedule.
