@@ -38,12 +38,12 @@ cleanup identifies its entry rather than assuming stack length is unchanged.
 The scope is synchronous: it does not cover later polling of a returned future.
 Other threads are unaffected; no active override means OS entropy is used.
 
-The legacy `with_seeded_rng` guard API remains compatible. Dropping its guard
-removes exactly its entry, including out-of-order drops. Destruction after the
-RNG thread-local has already been destroyed is safe; late entropy requests use
-the OS. Forgetting a standalone legacy guard still leaves the override active
-until thread exit; a new scope does not remove overrides created before it.
-Do not put signing operations under deterministic key-generation scopes.
+The manual guard is now a private implementation detail. The scoped API is the
+only public deterministic-entropy entry point, so downstream callers cannot
+forget a guard and leave the thread seeded. This is an intentional breaking
+change for any external consumer of this internal fork; every workspace caller
+was inventoried and migrated. Do not put signing operations under deterministic
+key-generation scopes.
 
 CR-08 remains **partial**: `rand_chacha` 0.9 exposes no guaranteed zeroization
 of its opaque RNG state. Removing an entry drops it but does not promise to

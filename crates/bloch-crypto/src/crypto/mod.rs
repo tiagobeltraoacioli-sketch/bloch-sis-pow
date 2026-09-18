@@ -98,7 +98,7 @@ pub fn generate_keypair() -> (Vec<u8>, Vec<u8>) {
 /// - Different seeds → independent keypairs (ChaCha20 gives cryptographic
 ///   separation).
 /// - The RNG state does not leak across calls: a thread-local RAII guard
-///   (`SeededRngGuard`) clears the override on drop.
+///   owns cleanup and clears the override on return or unwind.
 ///
 /// # Compatibility warning
 ///

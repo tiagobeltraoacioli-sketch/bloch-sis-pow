@@ -42,7 +42,7 @@
 //! - The override is a NO-OP for signing randomness if the caller doesn't
 //!   set the thread-local — signing remains hedged (randomized) by
 //!   default, which is the FIPS 204 recommended mode.
-//! - DO NOT use `with_seeded_rng` around `sign()` unless you explicitly
+//! - DO NOT use `with_seeded_rng_scope` around `sign()` unless you explicitly
 //!   want deterministic signatures. Deterministic signatures are more
 //!   vulnerable to fault attacks; the hedged variant is preferred.
 //!   Keygen is different — keygen is inherently deterministic-from-seed

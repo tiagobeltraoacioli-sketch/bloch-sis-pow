@@ -90,7 +90,7 @@ futures = "0.3"
 async-trait = "0.1"
 
 # Same vendored fork the root workspace patches in (root Cargo.toml
-# [patch.crates-io]): bloch-crypto calls `with_seeded_rng`, which only exists
+# [patch.crates-io]): bloch-crypto calls `with_seeded_rng_scope`, which only exists
 # in the vendored pqcrypto-internals 0.2.11 fork. A standalone workspace does
 # not inherit the root's patch table, so it is restated here.
 [patch.crates-io]

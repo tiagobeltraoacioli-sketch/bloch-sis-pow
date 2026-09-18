@@ -18,6 +18,9 @@ public way to activate deterministic PQClean entropy. Current and Genesis-3
 KATs were migrated to it without changing their pinned bytes. A compile-fail
 doctest fixes the public boundary, while internal unit tests retain direct
 access to exercise nested, forgotten and out-of-order cleanup behavior.
+Removing the manual API is intentionally breaking for any consumer outside
+this repository; the repository workspace was fully inventoried, but no claim
+is made about unknown downstream users of this internal fork.
 
 ## Status and residual
 

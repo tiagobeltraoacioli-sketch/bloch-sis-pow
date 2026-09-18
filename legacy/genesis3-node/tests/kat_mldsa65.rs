@@ -11,7 +11,7 @@
 // the official NIST ML-DSA-65 `.rsp` KAT files are NOT vendored in-tree. NIST
 // reproduces its keypair from an AES-256-CTR DRBG, while Bloch's
 // `generate_keypair_from_seed` drives keygen from a ChaCha20 stream via the
-// `pqcrypto-internals` fork's `with_seeded_rng`. A signed NIST `.rsp` vector
+// `pqcrypto-internals` fork's `with_seeded_rng_scope`. A signed NIST `.rsp` vector
 // therefore does NOT reproduce a Bloch seeded keypair, so this file does NOT
 // claim NIST-KAT equivalence. What it DOES pin, with no fabrication:
 //   (1) FIPS-204 ML-DSA-65 parameter sizes (pk 1952 / sk 4032 / sig 3309),

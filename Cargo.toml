@@ -86,7 +86,7 @@ overflow-checks = true
 # pqcrypto-internals fork VENDORED at crates/pqcrypto-internals (was a private
 # git dep that no clean build — Docker, Akash, CI — could fetch). It is a
 # drop-in modification of pqcrypto-internals 0.2.11 adding thread-local
-# seeded-RNG support (`with_seeded_rng`) for deterministic ML-DSA-65 / Falcon
+# scoped seeded-RNG support (`with_seeded_rng_scope`) for deterministic ML-DSA-65 / Falcon
 # keygen, enabling Wallet::from_seed(). Vendoring makes the workspace
 # self-contained and reproducible.
 [patch.crates-io]
