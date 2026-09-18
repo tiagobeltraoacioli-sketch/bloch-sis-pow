@@ -15,7 +15,8 @@
 #   ./verify-bootnodes.sh --deep       # also ssh each bootnode to re-prove
 #                                      # keylessness, transport and one chain
 #
-# The plain run is the one a third party can do; --deep needs our fleet key.
+# The plain run is the one a third party can do; --deep needs a dedicated
+# read-only verification key. It deliberately refuses the fleet admin key.
 #
 # Exit 0 = every published entry passed. Non-zero = do not publish.
 set -uo pipefail
@@ -25,12 +26,20 @@ LIST=bootnodes.txt
 # A dedicated, read-only key — never the fleet admin/validator key. Per
 # deploy/SSH-ROLE-SEPARATION.md this key's authorized_keys entry is restricted
 # with a `command=`/`from=` ForceCommand to the read-only verify path only; it
-# cannot start, stop, or reconfigure anything. BLOCH_FLEET_KEY is accepted as a
-# deprecated fallback for one release so existing operators are not broken
-# silently, but every fleet should migrate to a key scoped this way.
-KEY=${BLOCH_VERIFY_RO_KEY:-${BLOCH_FLEET_KEY:-$HOME/.ssh/edgevana_verify_ro}}
+# cannot start, stop, or reconfigure anything. There is no BLOCH_FLEET_KEY
+# fallback: a read-only check must never require or accept the credential whose
+# fleet-wide blast radius this control exists to remove.
+KEY=${BLOCH_VERIFY_RO_KEY:-}
 DEEP=0
 [ "${1:-}" = "--deep" ] && DEEP=1
+
+if [ "$DEEP" -eq 1 ]; then
+  [ -n "$KEY" ] || {
+    echo "FAIL: --deep requires BLOCH_VERIFY_RO_KEY; the fleet/admin key is not accepted" >&2
+    exit 2
+  }
+  [ -f "$KEY" ] || { echo "FAIL: BLOCH_VERIFY_RO_KEY is not a regular file: $KEY" >&2; exit 2; }
+fi
 
 # bash 3.2 (the macOS default) has no `mapfile`, and this script has to run on
 # whatever an operator has. Plain word-splitting over a newline list is enough.
@@ -110,14 +119,10 @@ for e in $ENTRIES; do
   # 2. Still keyless, still devnet, still following. A bootnode that has
   #    acquired a validator.key must come off the public list immediately: we
   #    would be publishing an unauthenticated push surface into consensus.
-  OUT=$(ssh -o ConnectTimeout=10 -o BatchMode=yes -i "$KEY" ubuntu@"$HOST" '
-      if find /home/ubuntu/g4 -name validator.key 2>/dev/null | grep -q .; then
-        echo "KEY=present"; else echo "KEY=absent"; fi
-      systemctl cat bloch-archival.service 2>/dev/null | grep -oE -- "--transport [a-z0-9]+" | head -1
-      curl -s --max-time 8 -X POST http://127.0.0.1:16400 \
-        -H "content-type: application/json" \
-        -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getchaininfo\",\"params\":[]}"
-    ' 2>/dev/null)
+  # `verify` is the only accepted SSH_ORIGINAL_COMMAND in the root-owned
+  # ForceCommand wrapper. No caller-supplied shell fragment crosses this
+  # boundary.
+  OUT=$(ssh -o ConnectTimeout=10 -o BatchMode=yes -i "$KEY" ubuntu@"$HOST" verify 2>/dev/null)
 
   case "$OUT" in
     *KEY=absent*)  echo "   keyless        : yes" ;;
