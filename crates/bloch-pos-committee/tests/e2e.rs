@@ -15,23 +15,15 @@
 //! that seam; this file makes `produce → transition` on shared state the
 //! central assertion, executed at every slot of every scenario.
 //!
-//! ## Wiring status (read before touching)
+//! ## Harness status (read before touching)
 //!
-//! DEV-1's `transition.rs` (the crate's `StateTransition` implementation) and
-//! DEV-2's `produce.rs` (block production) have **not landed yet**. Until
-//! they do, this file runs against the frozen Phase-1 traits in
-//! `interfaces.rs` through a reference harness built ONLY from the crate's
-//! shipped primitives (`schedule`, `sample`, `beacon`, `finality`,
-//! `state_root`, `attestation`). The two swap points are marked:
-//!
-//! - `SWAP POINT (DEV-1)`: replace `harness::RefTransition` (and its
-//!   `NodeState`) with the real `StateTransition` implementor.
-//! - `SWAP POINT (DEV-2)`: replace `harness::produce` with the real
-//!   production entry point.
-//!
-//! The scenario assertions are written against `StateReader` /
-//! `StateTransition` and against on-chain facts (headers, roots, finality),
-//! so they survive the swap unchanged.
+//! This is the historical Phase-1 reference harness over the frozen traits.
+//! The production `Transition` and node engine have since landed, while the
+//! separate `produce.rs`/`derive::validate_block` stack was deleted after it
+//! drifted. This fixture remains useful for trait-level deterministic
+//! scenarios, but it is not a second production validator and must not be
+//! presented as coverage of the engine's producer. Production proposal and
+//! self-validation coverage lives with the engine/transition tests.
 //!
 //! ## Determinism contract
 //!
@@ -693,8 +685,9 @@ mod harness {
 
     // ── Reference block production ──────────────────────────────────────────
     //
-    // SWAP POINT (DEV-2): when `produce.rs` lands, this function is replaced
-    // by its entry point. The shape to preserve: the producer derives the
+    // Historical reference producer. `produce.rs` was deleted; this test-only
+    // function remains to prove the frozen trait scenario. The shape preserved
+    // here is that the producer derives the
     // header's `state_root` by running THE SAME state update the validator
     // path runs, on THE SAME parent state. h28080 happened because those two
     // computations drifted apart inside one node.

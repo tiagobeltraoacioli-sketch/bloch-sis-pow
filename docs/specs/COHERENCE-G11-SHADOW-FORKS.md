@@ -39,11 +39,9 @@ validator re-derives from parent-committed state.
    every published `nf`). If A3 prefers a node-side export, it is a ~50-line
    debug RPC (`getcoherencepool`) walking `CommitmentTree.leaves` and the
    nullifier `HashSet` — flag it `--debug-rpc`, never ship enabled.
-3. **The Genesis-4 node / genesis loader does not exist yet** (DEV-1). Steps
-   marked **[G4-loader]** run against `bloch-pos-committee` interfaces
-   (`CommittedState::genesis`, `derive::validate_block`) until it does; the
-   fork is only fully closed when a real loader consumes the ceremony
-   document.
+3. **Historical note:** this plan predates the Genesis-4 node/loader. Current
+   rehearsals run `CommittedState::genesis` and the node's one production
+   `Transition::compute_post_state` / `Transition::apply_block` path.
 4. The nullifier-set root is the **ratified C1.1** commitment: a SHAKE-256
    sparse Merkle tree over the nullifier keyspace under `DOM_NFSET`
    (`coherence_core::NullifierSet`, `COHERENCE-C1.1.md`). This replaced an
@@ -75,9 +73,10 @@ The fork that must match what the real ceremony will do.
 4. Negative: rerun with (a) `--coherence-shake256` off by one hex digit,
    (b) an artifact with one fabricated leaf appended. **Assert:** both refuse
    before writing any output ("coherence digest mismatch").
-5. **[G4-loader]** Feed the document's `coherence-accumulator-root` /
+5. Feed the document's `coherence-accumulator-root` /
    `coherence-nullifier-root` into `CommittedState::genesis`; produce and
-   validate 3 blocks with `produce::produce_block` / `derive::validate_block`.
+   validate 3 blocks with the node engine's producer and
+   `Transition::apply_block`.
    **Assert:** every child carries `coherence_root =
    coherence_binding(acc, nf)` and a mutated `coherence_root` rejects with
    `CoherenceRootMismatch` (mutation already covered by the crate's matrix
@@ -155,7 +154,7 @@ refused or is a visibly different chain.
 | Shield-before / spend-after, three forks | Forks A (vacuous but rehearsed), B (§4–5), C (§1 negative) |
 | Nullifier set provably unbroken | B §4–5 (old nf still burns), C §2 (drop is refused/visible) |
 | Accumulator provably unbroken | B §3–4 (root equality + old witness), C §1/§3 |
-| Shielded roots finalized (§6.6) | A §5 / B §5: roots inside `state_root` leaves + `coherence_root` mirror validated by `derive::validate_block`, under FFG finality |
+| Shielded roots finalized (§6.6) | A §5 / B §5: roots inside `state_root` leaves + `coherence_root` mirror validated by `Transition::apply_block`, under FFG finality |
 
 ## What this plan does not cover (say it now, not in week three)
 

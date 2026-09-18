@@ -356,13 +356,10 @@ open item 3 in `BLOCH-POS-NODE-INTEGRATION.md` §8 and is marked there as
 
 - `body_root` for every block containing a transfer → block identity. Expected;
   pre-launch it is free.
-- `derive::ChainState` (`derive.rs:66`) carries a **second** `eutxos: Vec<EutxoEntry>`
-  (`:70`) rooted independently (`:134-137`). `derive::validate_block` was
-  deleted, but `ChainState` is still `pub` and re-exported (`lib.rs:119`). Any
-  new eUTXO component must be threaded through both or they silently diverge —
-  this is precisely the failure `tests/one_state_root.rs` was written about.
-  **Consider deleting `ChainState` as part of this item** rather than
-  maintaining a second carrier.
+- **Resolved:** `derive::validate_block`, `ChainState`, `ParentState` and the
+  separate producer were deleted. The node produces and validates through
+  `Transition::compute_post_state` / `Transition::apply_block`; `derive`
+  retains only shared header/body commitment helpers.
 - The field-coverage test `every_committed_state_field_is_bound_by_the_root`
   (`transition.rs:3448`, mutation list `:3462-3568`) has **no entry for
   `eutxos`** (nor `issued_sat`). eUTXO sensitivity is pinned one layer down at

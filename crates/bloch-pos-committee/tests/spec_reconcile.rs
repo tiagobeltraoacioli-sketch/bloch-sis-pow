@@ -413,3 +413,50 @@ fn tx20_legacy_interfaces_are_classified_accurately() {
         );
     }
 }
+
+/// TX-21 — comments about deleted code do not constitute a second validation
+/// stack. Scan executable source so the retired symbols cannot return quietly.
+#[test]
+fn tx21_only_one_block_validation_stack_is_compiled() {
+    let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        !crate_root.join("src/produce.rs").exists(),
+        "the deleted parallel producer module returned"
+    );
+
+    let executable_lines = |text: String| {
+        text.lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//") && !trimmed.is_empty()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let derive = executable_lines(
+        fs::read_to_string(crate_root.join("src/derive.rs")).expect("read derive source"),
+    );
+    let lib = executable_lines(
+        fs::read_to_string(crate_root.join("src/lib.rs")).expect("read crate source"),
+    );
+    for retired in [
+        "fn validate_block",
+        "struct ParentState",
+        "struct ChainState",
+        "fn post_state_root",
+        "fn post_chain_state",
+    ] {
+        assert!(!derive.contains(retired), "retired derivation returned: {retired}");
+    }
+    assert!(
+        !lib.contains("mod produce"),
+        "the deleted producer module is compiled again"
+    );
+
+    let engine = fs::read_to_string(crate_root.join("../bloch-pos-node/src/engine.rs"))
+        .expect("read node engine source");
+    assert!(
+        engine.contains(".compute_post_state(") && engine.contains(".apply_block("),
+        "node production and validation no longer share Transition"
+    );
+}

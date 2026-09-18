@@ -16,7 +16,7 @@
 //! `ParentState`/`ChainState`, with its own frozen error order and no caller.
 //! It was deleted on 2026-08-12 (the checklist comparison is in `derive.rs`
 //! where it stood); `derive` keeps only the shared derivation functions, which
-//! `produce.rs` stamps with and `transition` checks against.
+//! this engine uses while assembling a header and `transition` checks against.
 //!
 //! This engine binds `Transition`/`CommittedState`: the seam that implements
 //! the frozen `StateTransition`/`StateReader` traits, composes finality, and —
@@ -27,7 +27,7 @@
 //!
 //! ## Producer = validator, structurally
 //!
-//! The producer fills `state_root` by running `Transition::compute_post_state`
+//! The engine's producer fills `state_root` by running `Transition::compute_post_state`
 //! — the *same* function `apply_block` is defined as — on the same parent
 //! state, then every block (own or peer) passes `apply_block` under the real
 //! hybrid verifier before it is stored or broadcast. A node that rejects its

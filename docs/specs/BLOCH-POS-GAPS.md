@@ -21,11 +21,9 @@ nor implemented**. A fourth section lists defects in implemented code —
 things that exist and are wrong or divergent, which is a different kind of
 missing.
 
-The one-line summary, so nobody mistakes the state of the project: **the
-pure consensus crate is substantially built and tested; the node is a
-134-line skeleton; every I/O-shaped spec has zero corresponding code; and
-the two validation stacks inside the pure crate do not agree with each
-other.**
+The one-line summary below was true at creation time and is retained as
+historical context. It is not current status: the node and production
+transition landed, and the uncalled second validation stack was deleted.
 
 ---
 
@@ -206,11 +204,10 @@ path". Nothing has started.
 - `lib.rs:107-139`: three name collisions (`Checkpoint`, `FinalityState`,
   `ValidatorRecord`) deliberately visible, awaiting the integration
   decision.
-- `tests/e2e.rs` still runs every scenario against its own
-  `harness::RefTransition` (`e2e.rs:54`, `:411`) although the real
-  `transition.rs`/`produce.rs` have landed; the SWAP POINT markers
-  (`e2e.rs:27-29`) were never exercised. The e2e suite currently proves
-  the harness, not the product.
+- `tests/e2e.rs` still runs its historical trait scenarios against
+  `harness::RefTransition`. It is now labelled a reference harness, not a
+  second production validator. It proves the fixture rather than the product;
+  engine/transition tests own production proposal and self-validation coverage.
 - `transition.rs:1447`: the inactivity leak is *not* wired into the
   transition ("eventually the inactivity leak") — the arithmetic exists in
   `finality.rs`, nothing calls it on protracted non-finality.
