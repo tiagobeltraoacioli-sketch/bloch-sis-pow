@@ -67,6 +67,6 @@ vault is reinterpreted or automatically migrated.
 - `git diff --check`: passed.
 
 Ledger counts are unchanged (`IMPLEMENTED: 71`, `PARTIAL: 98`, `UNARMED
-CANDIDATE: 15`, `PROTOCOL DECISION: 5`, `BASE CHANGED: 4`, `OPEN: 7`): this
+CANDIDATE: 15`, `PROTOCOL DECISION: 5`, `BASE CHANGED: 7`, `OPEN: 1`): this
 wave materially narrows two partials but does not claim their external
 operational boundaries are closed.

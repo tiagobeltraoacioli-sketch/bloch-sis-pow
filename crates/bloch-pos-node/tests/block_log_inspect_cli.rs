@@ -3,6 +3,19 @@ use std::fs;
 use std::process::Command;
 
 #[test]
+fn help_prints_the_tail_repair_invocation_without_patch_artifacts() {
+    let output = Command::new(env!("CARGO_BIN_EXE_bloch-pos"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(help.contains("block-log-repair-tail --data-dir <stopped-node>"));
+    assert!(help.contains("--truncate-to <inspected-offset> --backup <new-file>"));
+    assert!(!help.contains("\n+               --truncate-to"));
+}
+
+#[test]
 fn offline_diagnostic_reports_corruption_without_mutating_log_or_creating_store_files() {
     let directory = std::env::temp_dir().join(format!("bloch-log-inspect-cli-{}", std::process::id()));
     let _ = fs::remove_dir_all(&directory);

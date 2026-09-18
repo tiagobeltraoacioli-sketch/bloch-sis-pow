@@ -31,6 +31,15 @@ EOF
 make_fixture "$work/a"
 cp -R "$work/a" "$work/b"
 bash scripts/compare-pos-release-builds.sh "$work/a" "$work/b" >/dev/null
+if bash scripts/compare-pos-release-builds.sh "$work/a" "$work/a" >/dev/null 2>&1; then
+  echo "selftest: one directory was accepted as two builders" >&2; exit 1
+fi
+
+chmod 0644 "$work/b/bloch-pos"
+if bash scripts/compare-pos-release-builds.sh "$work/a" "$work/b" >/dev/null 2>&1; then
+  echo "selftest: non-executable binary was accepted" >&2; exit 1
+fi
+chmod 0755 "$work/b/bloch-pos"
 
 printf 'tampered\n' >> "$work/b/bloch-pos"
 if bash scripts/compare-pos-release-builds.sh "$work/a" "$work/b" >/dev/null 2>&1; then
@@ -47,6 +56,11 @@ cp "$work/a/BUILD-INFO" "$work/b/BUILD-INFO"
 printf 'signed=true\n' >> "$work/b/BUILD-INFO"
 if bash scripts/compare-pos-release-builds.sh "$work/a" "$work/b" >/dev/null 2>&1; then
   echo "selftest: duplicate authorization field was accepted" >&2; exit 1
+fi
+cp "$work/a/BUILD-INFO" "$work/b/BUILD-INFO"
+printf 'unexpected=same-looking-but-unsupported\n' >> "$work/b/BUILD-INFO"
+if bash scripts/compare-pos-release-builds.sh "$work/a" "$work/b" >/dev/null 2>&1; then
+  echo "selftest: noncanonical metadata field was accepted" >&2; exit 1
 fi
 
 echo "compare-pos-release-builds selftest: PASS"

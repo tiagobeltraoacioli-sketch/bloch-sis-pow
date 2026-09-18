@@ -29,6 +29,9 @@ for dir in "$a" "$b"; do
   for file in bloch-pos SHA256SUMS BUILD-INFO; do
     [ -f "$dir/$file" ] || fail "missing $dir/$file"
   done
+  [ -x "$dir/bloch-pos" ] || fail "$dir/bloch-pos is not executable"
+  [ "$(wc -l < "$dir/BUILD-INFO" | tr -d ' ')" = 8 ] \
+    || fail "$dir/BUILD-INFO must contain exactly the eight canonical fields"
   actual_sha="$(sha256_file "$dir/bloch-pos")"
   manifest_sha="$(awk '$2 == "bloch-pos" { print $1 }' "$dir/SHA256SUMS")"
   metadata_sha="$(field binary_sha256 "$dir/BUILD-INFO")"
@@ -42,11 +45,18 @@ for dir in "$a" "$b"; do
     || fail "$dir does not refuse deployment authorization"
 done
 
+a_real="$(cd "$a" && pwd -P)"
+b_real="$(cd "$b" && pwd -P)"
+[ "$a_real" != "$b_real" ] \
+  || fail "the two inputs resolve to the same directory; obtain a second builder output"
+
 cmp -s "$a/bloch-pos" "$b/bloch-pos" || fail "binary bytes differ"
+cmp -s "$a/BUILD-INFO" "$b/BUILD-INFO" || fail "complete BUILD-INFO differs"
 for key in source_commit source_date_epoch debian_snapshot target binary_sha256; do
   av="$(field "$key" "$a/BUILD-INFO")"
   bv="$(field "$key" "$b/BUILD-INFO")"
   [ "$av" = "$bv" ] || fail "$key differs between builders"
 done
 
-echo "compare-pos-release-builds: PASS — independent outputs are byte-identical"
+echo "compare-pos-release-builds: PASS — distinct supplied outputs are byte-identical"
+echo "builder independence still requires separately authenticated build records"

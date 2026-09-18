@@ -125,7 +125,10 @@ canonical release. A canonical-container candidate now exists at
 the Debian archive timestamp, the committed source archive, Cargo lock and
 build stamp. It has **not** yet earned "reproducible": that requires two
 independent Linux builders to run `scripts/build-pos-release-container.sh` and
-pass `scripts/compare-pos-release-builds.sh` byte for byte. Do not use the word
+pass `scripts/compare-pos-release-builds.sh` byte for byte, with separately
+authenticated records establishing that the two outputs really came from
+independent builders. The comparator refuses one path supplied twice but
+cannot authenticate builder identity. Do not use the word
 "reproducible" in any public artifact for `bloch-pos` until that is green — the
 trademark/earned-word gate applies.
 

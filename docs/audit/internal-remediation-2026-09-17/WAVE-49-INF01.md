@@ -31,14 +31,20 @@ configuration and concurrent edits therefore cannot enter the context. It
 requires Docker Buildx, verifies the exported checksum and provenance, and
 refuses to replace an existing output directory.
 
-`scripts/compare-pos-release-builds.sh` accepts two independently transported
-output directories only when each checksum is internally valid, the binary
-bytes are identical, and commit, commit timestamp, Debian snapshot, target and
-binary digest agree. It requires exactly one value for each metadata field and
-never upgrades the artifacts' unsigned or unauthorized markers. The
-adversarial self-test proves changed binary bytes, changed provenance and a
-duplicate authorization field are refused, and now runs in the blocking
-GitLab release-integrity job.
+`scripts/compare-pos-release-builds.sh` accepts two distinct transported output
+directories only when each binary is executable, each checksum is internally
+valid, the binary and complete canonical metadata bytes are identical, and
+commit, commit timestamp, Debian snapshot, target and binary digest agree. It
+requires exactly the eight canonical fields and never upgrades the artifacts'
+unsigned or unauthorized markers. The adversarial self-test proves one input
+presented twice, a non-executable binary, changed binary bytes, changed
+provenance, duplicate authorization and unknown metadata are refused. It now
+runs in the blocking GitLab release-integrity job.
+
+Distinct paths do not prove independent builders. Builder identity and the
+authenticity of each build record remain release evidence that must be
+established outside this byte comparator; its success message says only that
+the distinct supplied outputs match.
 
 ## Status and release boundary
 
@@ -53,8 +59,8 @@ rollout and fleet `/proc` digest verification.
 ## Validation
 
 - `bash -n` passed for all three release-container scripts.
-- `bash scripts/compare-pos-release-builds.selftest.sh` passed its honest,
-  tampered-binary, mismatched-provenance and duplicate-field cases.
+- `bash scripts/compare-pos-release-builds.selftest.sh` passed its honest and
+  six refusal cases.
 - `git diff --check` passed.
 - `docker buildx version` returned command-not-found; no container build or
   reproducibility claim is made.

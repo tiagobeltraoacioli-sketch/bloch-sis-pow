@@ -254,7 +254,7 @@ fn print_help() {
          USAGE:\n\
            bloch-pos block-log-inspect --data-dir <stopped-node-or-copy>\n\
                Read-only bounded block-log framing/codec diagnosis. No repair.\n\
-           bloch-pos block-log-repair-tail --data-dir <stopped-node> \\\n+               --truncate-to <inspected-offset> --backup <new-file>\n\
+           bloch-pos block-log-repair-tail --data-dir <stopped-node> \\\n               --truncate-to <inspected-offset> --backup <new-file>\n\
                Repair only an incomplete/all-zero tail after exact offset\n\
                confirmation and a durable raw-byte backup.\n\
            bloch-pos selfcheck\n\
