@@ -90,7 +90,8 @@ impl PqShieldAnchor {
     /// Check the Bitcoin addresses against an explicitly selected network.
     /// This checks syntax/network only: freshness, ownership and correspondence
     /// to the actual vault script require independent caller verification.
-    /// Signature verification alone intentionally remains format-compatible.
+    /// Signature verification alone intentionally remains format-compatible;
+    /// Bitcoin relying parties should use [`verify_bitcoin_anchor`].
     pub fn validate_bitcoin_addresses(&self, network: bitcoin::Network) -> Result<(), String> {
         if self.target_chain != TargetChain::Bitcoin {
             return Err("Bitcoin address validation requires the Bitcoin target chain".into());
@@ -154,6 +155,10 @@ pub enum AnchorError {
     Malformed,
     /// Unknown `target_chain` tag on deserialize.
     UnknownChain(u8),
+    /// The Bitcoin-specific checked verifier was used for another target chain.
+    WrongTargetChain(TargetChain),
+    /// A committed Bitcoin address is malformed or does not match the expected network.
+    InvalidBitcoinAddress,
     /// K-2 fix: the Kirpich internal audit ([`bloch_euvm::kirpich`]) denied the
     /// charter used to build an anchor guard program — e.g. an empty or malformed
     /// `pq_recovery_pubkey` / `btc_pubkey`, which the un-audited `compile_charter`
@@ -216,6 +221,38 @@ pub fn verify_anchor(
     } else {
         Err(AnchorError::BadSignature)
     }
+}
+
+/// Verify a Bitcoin anchor's signature, externally trusted owner key and both
+/// committed addresses against the caller's expected network.
+///
+/// This is the checked low-level entry point for Bitcoin relying parties. The
+/// generic [`verify_anchor`] remains format-compatible for historical and
+/// non-Bitcoin anchors, and therefore does not infer address semantics. In
+/// particular, the network is an input here rather than guessed from attacker-
+/// supplied strings: a syntactically valid testnet anchor must not authorize a
+/// mainnet watchtower action.
+pub fn verify_bitcoin_anchor(
+    signed: &SignedAnchor,
+    trusted_pq_pubkey: &[u8],
+    expected_network: bitcoin::Network,
+) -> Result<(), AnchorError> {
+    // Preserve the generic verifier's cheap identity/version error precedence
+    // without paying for a hybrid verification before address validation.
+    if signed.anchor.version != ANCHOR_VERSION {
+        return Err(AnchorError::UnsupportedVersion(signed.anchor.version));
+    }
+    if signed.anchor.pq_recovery_pubkey.as_slice() != trusted_pq_pubkey {
+        return Err(AnchorError::UntrustedKey);
+    }
+    if signed.anchor.target_chain != TargetChain::Bitcoin {
+        return Err(AnchorError::WrongTargetChain(signed.anchor.target_chain));
+    }
+    signed
+        .anchor
+        .validate_bitcoin_addresses(expected_network)
+        .map_err(|_| AnchorError::InvalidBitcoinAddress)?;
+    verify_anchor(signed, trusted_pq_pubkey)
 }
 
 impl SignedAnchor {
@@ -386,6 +423,15 @@ impl Cursor<'_> {
 mod tests {
     use super::*;
 
+    fn bitcoin_address(network: bitcoin::Network, opcode: u8) -> Vec<u8> {
+        bitcoin::Address::p2wsh(
+            &bitcoin::ScriptBuf::from_bytes(vec![opcode]),
+            network,
+        )
+        .to_string()
+        .into_bytes()
+    }
+
     fn sample(pq_pubkey: Vec<u8>) -> PqShieldAnchor {
         PqShieldAnchor {
             version: ANCHOR_VERSION,
@@ -422,6 +468,78 @@ mod tests {
         let mut t3 = signed.clone();
         t3.anchor.csv_delay = 6;
         assert_eq!(verify_anchor(&t3, &pk), Err(AnchorError::BadSignature));
+    }
+
+    #[test]
+    fn checked_bitcoin_verify_binds_both_addresses_to_expected_network() {
+        let (pk, sk) =
+            bloch_crypto::crypto::generate_keypair_from_seed(&[53u8; 32]).unwrap();
+        let mut anchor = sample(pk.clone());
+        anchor.btc_vault_address = bitcoin_address(bitcoin::Network::Regtest, 0x51);
+        anchor.designated_safe_dest = bitcoin_address(bitcoin::Network::Regtest, 0x52);
+        let signed = sign_anchor(&anchor, &sk).unwrap();
+
+        assert_eq!(
+            verify_bitcoin_anchor(&signed, &pk, bitcoin::Network::Regtest),
+            Ok(()),
+        );
+        assert_eq!(
+            verify_bitcoin_anchor(&signed, &pk, bitcoin::Network::Bitcoin),
+            Err(AnchorError::InvalidBitcoinAddress),
+        );
+
+        let mut mixed = anchor.clone();
+        mixed.designated_safe_dest = bitcoin_address(bitcoin::Network::Bitcoin, 0x52);
+        let mixed = sign_anchor(&mixed, &sk).unwrap();
+        assert_eq!(
+            verify_bitcoin_anchor(&mixed, &pk, bitcoin::Network::Regtest),
+            Err(AnchorError::InvalidBitcoinAddress),
+        );
+
+        let mut malformed = anchor.clone();
+        malformed.btc_vault_address = vec![0xff, 0xfe];
+        let malformed = sign_anchor(&malformed, &sk).unwrap();
+        assert_eq!(
+            verify_bitcoin_anchor(&malformed, &pk, bitcoin::Network::Regtest),
+            Err(AnchorError::InvalidBitcoinAddress),
+        );
+
+        let mut other_chain = anchor;
+        other_chain.target_chain = TargetChain::EthereumL1;
+        let other_chain = sign_anchor(&other_chain, &sk).unwrap();
+        assert_eq!(
+            verify_bitcoin_anchor(&other_chain, &pk, bitcoin::Network::Regtest),
+            Err(AnchorError::WrongTargetChain(TargetChain::EthereumL1)),
+        );
+    }
+
+    #[test]
+    fn checked_bitcoin_verify_retains_trust_and_signature_checks() {
+        let (pk, sk) =
+            bloch_crypto::crypto::generate_keypair_from_seed(&[54u8; 32]).unwrap();
+        let (other_pk, _) =
+            bloch_crypto::crypto::generate_keypair_from_seed(&[55u8; 32]).unwrap();
+        let mut anchor = sample(pk.clone());
+        anchor.btc_vault_address = bitcoin_address(bitcoin::Network::Regtest, 0x53);
+        anchor.designated_safe_dest = bitcoin_address(bitcoin::Network::Regtest, 0x54);
+        let signed = sign_anchor(&anchor, &sk).unwrap();
+
+        assert_eq!(
+            verify_bitcoin_anchor(&signed, &other_pk, bitcoin::Network::Regtest),
+            Err(AnchorError::UntrustedKey),
+        );
+        let mut bad_signature = signed;
+        let last = bad_signature.signature.len() - 1;
+        bad_signature.signature[last] ^= 1;
+        assert_eq!(
+            verify_bitcoin_anchor(&bad_signature, &pk, bitcoin::Network::Regtest),
+            Err(AnchorError::BadSignature),
+        );
+
+        // Historical generic verification remains byte/behavior compatible;
+        // callers must opt into chain-specific address semantics explicitly.
+        let legacy = sign_anchor(&sample(pk.clone()), &sk).unwrap();
+        assert_eq!(verify_anchor(&legacy, &pk), Ok(()));
     }
 
     /// REGRESSION (K-M6-anchor-selfcert). The attacker holds no part of the owner's PQ
