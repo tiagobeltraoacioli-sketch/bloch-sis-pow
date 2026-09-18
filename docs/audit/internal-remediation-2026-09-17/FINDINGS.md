@@ -4,7 +4,7 @@ Audited source: `562e220`. Remediation base: `b066e3c`. Branch: `fix/internal-au
 
 All 200 findings are retained, including duplicates. IMPLEMENTED means code changed in this branch, not deployed, externally audited, or universally resolved on the live fleet. PARTIAL is not closure. No production binary was published.
 
-IMPLEMENTED: 53, PARTIAL: 75, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE CHANGED: 7, OPEN: 59, REFUTED IN AUDIT: 1.
+IMPLEMENTED: 54, PARTIAL: 75, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE CHANGED: 7, OPEN: 58, REFUTED IN AUDIT: 1.
 
 | Finding | Status | Evidence / remaining work | Original title |
 |---|---|---|---|
@@ -136,7 +136,7 @@ IMPLEMENTED: 53, PARTIAL: 75, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE C
 | SR-01 | OPEN | Not closed by this bundle. Requires dedicated implementation, protocol design, external operational evidence or product-owner integration; original finding remains tracked. | Genesis cohort is bound by neither the state root nor the genesis block id (only by the 32-bit `network_id`) |
 | SR-04 | IMPLEMENTED | ws-verify enforces the boot arrangement window and refuses duplicate keys. | `ws-verify` diverges from the booting node: it omits the `arrangement_window` lower bound and carries stale duplicate-key text |
 | SR-05 | PARTIAL | Full checkpoint retained and state root rechecked on canonical live apply/reorg before finality processing; conflicting evidence exits78. Missing/noncanonical evidence stays pending. Historical validator-set roots remain unverified. | A checkpoint's `state_root` / `validator_set_root` are never validated against the block they name, on either side |
-| SR-06 | OPEN | Not closed by this bundle. Requires dedicated implementation, protocol design, external operational evidence or product-owner integration; original finding remains tracked. | `single_derivation_path` has scan blind spots (currently clean) |
+| SR-06 | IMPLEMENTED | `single_derivation_path` now recursively scans all 29 Rust sources under `src/`, including nested transition modules, and normalizes whitespace before checking construction/impl/alias evasions. A regression pins nested coverage and spacing variants; production identity bytes are unchanged. | `single_derivation_path` has scan blind spots (currently clean) |
 | SR-07 | IMPLEMENTED | Standalone verifier rejects zero/impossible thresholds and duplicate signer public keys; node and committee regressions. | `ws::verify_envelope` alone accepts a zero-threshold arrangement and does not compare signer keys; the crate relies on the node decoder for both |
 | SR-08 | IMPLEMENTED | Decoder bounds counts by remaining bytes and shared attestation cap before allocation. | `codec::decode_envelope` pre-allocates from untrusted counts and hard-codes the attestation cap |
 | SR-09 | IMPLEMENTED | Three ADR-041 commitment regressions pin existing encodings/zero semantics, mutate every key/value and test unique-entry order independence. Existing tag registry extended through 0x1E; production roots unchanged. | ADR-041 leaves (`0x1B`–`0x1E`) have no root-binding test, and the spec registry stops at `0x16` |
