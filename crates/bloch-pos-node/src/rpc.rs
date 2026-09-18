@@ -2396,9 +2396,10 @@ pub fn build_info_json() -> Json {
         (
             "build_environment_scope",
             Json::s(
-                "rustc -vV; cargo --version --verbose; target; profile; \
-                 codegen environment selected by the build script; \
-                 sorted, length-prefixed; values hashed, not disclosed",
+                "rustc -vV; cargo --version --verbose; host; target; profile; \
+                 selected Rust/C codegen variables, including absent exact \
+                 host/target forms; sorted, length-prefixed; values hashed, \
+                 not directly disclosed",
             ),
         ),
         (

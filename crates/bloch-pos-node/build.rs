@@ -165,27 +165,89 @@ fn hex(b: &[u8]) -> String {
 const FIXED_BUILD_ENV: &[&str] = &[
     "AR",
     "BINDGEN_EXTRA_CLANG_ARGS",
+    "CARGO_BUILD_RUSTC",
+    "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+    "CARGO_BUILD_RUSTC_WRAPPER",
+    "CARGO_BUILD_RUSTFLAGS",
+    "CARGO_BUILD_TARGET",
     "CARGO_ENCODED_RUSTFLAGS",
     "CARGO_INCREMENTAL",
     "CC",
     "CFLAGS",
     "CPPFLAGS",
+    "DEBUG",
+    "HOST_AR",
+    "HOST_CC",
+    "HOST_CFLAGS",
+    "HOST_CPPFLAGS",
+    "HOST_CXX",
+    "HOST_CXXFLAGS",
+    "HOST_RANLIB",
     "MACOSX_DEPLOYMENT_TARGET",
+    "OPT_LEVEL",
+    "RANLIB",
+    "RUSTC",
     "RUSTC_BOOTSTRAP",
+    "RUSTC_LINKER",
     "RUSTC_WORKSPACE_WRAPPER",
     "RUSTC_WRAPPER",
     "RUSTFLAGS",
     "SDKROOT",
     "SOURCE_DATE_EPOCH",
+    "TARGET_AR",
+    "TARGET_CC",
+    "TARGET_CFLAGS",
+    "TARGET_CPPFLAGS",
+    "TARGET_CXX",
+    "TARGET_CXXFLAGS",
+    "TARGET_RANLIB",
 ];
 
 fn relevant_build_env(key: &str) -> bool {
     FIXED_BUILD_ENV.contains(&key)
         || key.starts_with("AR_")
+        || key.starts_with("BINDGEN_EXTRA_CLANG_ARGS_")
         || key.starts_with("CC_")
         || key.starts_with("CFLAGS_")
+        || key.starts_with("CPPFLAGS_")
+        || key.starts_with("CXX_")
+        || key.starts_with("CXXFLAGS_")
+        || key.starts_with("RANLIB_")
+        || key.starts_with("CARGO_BUILD_")
+        || key.starts_with("CARGO_CFG_")
+        || key.starts_with("CARGO_FEATURE_")
         || key.starts_with("CARGO_PROFILE_")
         || key.starts_with("CARGO_TARGET_")
+}
+
+/// Exact target/host forms used by Cargo, cc-rs and bindgen. Watching these
+/// while absent closes the incremental-build hole that wildcard-like prefix
+/// discovery alone cannot close.
+fn exact_build_env(target: &str, host: &str) -> Vec<String> {
+    let mut keys: Vec<String> = FIXED_BUILD_ENV.iter().map(|key| (*key).to_owned()).collect();
+    for triple in [target, host] {
+        let underscored = triple.replace('-', "_");
+        for stem in [
+            "AR",
+            "BINDGEN_EXTRA_CLANG_ARGS",
+            "CC",
+            "CFLAGS",
+            "CPPFLAGS",
+            "CXX",
+            "CXXFLAGS",
+            "RANLIB",
+        ] {
+            keys.push(format!("{stem}_{triple}"));
+            keys.push(format!("{stem}_{underscored}"));
+        }
+    }
+    let cargo_target = target.to_ascii_uppercase().replace('-', "_");
+    for suffix in ["LINKER", "RUNNER", "RUSTFLAGS"] {
+        keys.push(format!("CARGO_TARGET_{cargo_target}_{suffix}"));
+    }
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
 /// Hash the compiler/Cargo identities, effective target/profile and selected
@@ -196,21 +258,34 @@ fn build_environment_digest(
     cargo_verbose: &str,
     profile: &str,
     target: &str,
+    host: &str,
 ) -> (String, usize) {
     // An absent fixed variable is also watched: setting it after an incremental
     // build must rerun this script rather than leave a stale fingerprint.
-    for key in FIXED_BUILD_ENV {
+    let watched = exact_build_env(target, host);
+    for key in &watched {
         println!("cargo:rerun-if-env-changed={key}");
     }
     let mut fields = vec![
-        ("cargo-version".to_owned(), cargo_verbose.to_owned()),
-        ("profile".to_owned(), profile.to_owned()),
-        ("rustc-version".to_owned(), rustc_verbose.to_owned()),
-        ("target".to_owned(), target.to_owned()),
+        ("cargo-version".to_owned(), Some(cargo_verbose.to_owned())),
+        ("host".to_owned(), Some(host.to_owned())),
+        ("profile".to_owned(), Some(profile.to_owned())),
+        ("rustc-version".to_owned(), Some(rustc_verbose.to_owned())),
+        ("target".to_owned(), Some(target.to_owned())),
     ];
+    for key in watched {
+        let value = match std::env::var(&key) {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                panic!("build environment variable {key} is not Unicode")
+            }
+        };
+        fields.push((format!("env:{key}"), value));
+    }
     for (key, value) in std::env::vars().filter(|(key, _)| relevant_build_env(key)) {
         println!("cargo:rerun-if-env-changed={key}");
-        fields.push((format!("env:{key}"), value));
+        fields.push((format!("env:{key}"), Some(value)));
     }
     fields.sort();
     fields.dedup();
@@ -220,8 +295,14 @@ fn build_environment_digest(
     for (key, value) in &fields {
         h.update((key.len() as u64).to_le_bytes());
         h.update(key.as_bytes());
-        h.update((value.len() as u64).to_le_bytes());
-        h.update(value.as_bytes());
+        match value {
+            Some(value) => {
+                h.update([1]);
+                h.update((value.len() as u64).to_le_bytes());
+                h.update(value.as_bytes());
+            }
+            None => h.update([0]),
+        }
     }
     (hex(&h.finalize()), fields.len())
 }
@@ -340,8 +421,9 @@ fn main() {
     let cargo_v = cargo_verbose.lines().next().unwrap_or("unknown");
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "unknown".into());
     let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".into());
+    let host = std::env::var("HOST").unwrap_or_else(|_| "unknown".into());
     let (environment_digest, environment_fields) =
-        build_environment_digest(&rustc_verbose, &cargo_verbose, &profile, &target);
+        build_environment_digest(&rustc_verbose, &cargo_verbose, &profile, &target, &host);
     println!("cargo:rustc-env=BLOCH_BUILD_RUSTC={rustc_v}");
     println!("cargo:rustc-env=BLOCH_BUILD_CARGO={cargo_v}");
     println!("cargo:rustc-env=BLOCH_BUILD_PROFILE={profile}");

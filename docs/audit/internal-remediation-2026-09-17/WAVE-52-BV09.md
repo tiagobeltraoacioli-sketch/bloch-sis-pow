@@ -20,6 +20,11 @@ compile-fail doctest now prevents accidental restoration of whole-object
 cloning. This is intentionally a Rust API hardening change, not a migration or
 reinterpretation of any existing vault.
 
+Removing the trait is source-breaking for an unknown downstream Rust consumer
+that called `VaultKeys::clone`. Only repository consumers were inventoried and
+qualified; external users must redesign ownership rather than recreate a
+whole-secret convenience copy.
+
 ## Validation
 
 - `cargo test --locked -p bloch-pq-vault --offline`: 42 unit tests passed;

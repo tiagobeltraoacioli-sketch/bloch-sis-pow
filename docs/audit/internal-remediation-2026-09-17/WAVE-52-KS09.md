@@ -16,7 +16,7 @@ The node build now creates a domain-separated SHA3-256
 `build_environment_digest` over canonical, length-prefixed fields:
 
 - verbose rustc and Cargo identities;
-- effective target triple and Cargo profile;
+- effective host/target triples and Cargo profile;
 - Rust flags, wrappers, bootstrap and incremental controls;
 - C compiler, archiver, flags and bindgen controls, including observed
   target-specific forms;
@@ -24,12 +24,16 @@ The node build now creates a domain-separated SHA3-256
 - SDK/deployment-target and reproducible-build timestamp controls.
 
 Only the digest and number of bound fields are published. Raw environment
-values can contain local wrapper or SDK paths and are not exposed. Known
-variables are watched even when absent so setting one invalidates an
-incremental build; observed prefixed variables are watched individually.
+values can contain local wrapper or SDK paths and are not directly exposed;
+as with any public digest, low-entropy values may still be guessed. Known
+variables and the exact Cargo/cc-rs/bindgen forms for the current host and
+target are watched even when absent, so setting one invalidates an incremental
+build. Additional observed prefixed variables are watched individually.
 `getbuildinfo` and `bloch-pos buildinfo` return the same additive fields. The
 source-scope text was also corrected to name `.macros` and
 `rust-toolchain.toml`, which were already hashed.
+Consumers that deserialize the identity object should ignore unknown fields;
+the method's additive object has no closed-schema version negotiation.
 
 ## Validation and boundary
 
@@ -38,8 +42,9 @@ target and profile, and preserve the no-path/no-secret disclosure contract.
 The focused RPC/build-identity suite and full node suite are run at Wave 52
 integration.
 
-KS-09 remains `PARTIAL`. This fingerprint does not hash sysroot, linker, SDK,
-native library or operating-system contents; it cannot discover an undeclared
-environment variable used by future build logic; and a malicious builder can
-modify the build script or reported binary. Independent hermetic builders,
-binary comparison, signed provenance and publication are still required.
+KS-09 remains `PARTIAL`. This fingerprint names configured compiler/linker/SDK
+controls but does not hash the referenced sysroot, linker, SDK, native library
+or operating-system contents; it cannot discover an undeclared environment
+variable used by future build logic; and a malicious builder can modify the
+build script or reported binary. Independent hermetic builders, binary
+comparison, signed provenance and publication are still required.

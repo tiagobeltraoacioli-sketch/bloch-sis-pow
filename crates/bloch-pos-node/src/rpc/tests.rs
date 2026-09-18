@@ -1626,7 +1626,8 @@ fn getbuildinfo_carries_a_bounded_build_environment_fingerprint() {
         .unwrap()
         .as_str()
         .unwrap();
-    assert!(scope.contains("values hashed, not disclosed"));
+    assert!(scope.contains("values hashed"));
+    assert!(scope.contains("not directly disclosed"));
 }
 
 /// Nothing here is anything an operator would refuse to publish.
