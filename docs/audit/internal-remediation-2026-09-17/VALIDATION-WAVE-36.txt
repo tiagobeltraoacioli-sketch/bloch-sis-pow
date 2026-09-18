@@ -1,0 +1,24 @@
+Validation wave 36 — 2026-09-18
+Branch: fix/internal-audit-20260917
+Evidence reconciliation only; no new implementation commit.
+
+PASS
+
+cargo test --locked --offline --manifest-path services/pq-shield-api/Cargo.toml
+  17 passed; 0 failed; 0 ignored.
+  0 binary tests and 0 doc tests; all passed.
+
+Ledger parser
+  200 rows; 200 unique finding IDs.
+  66 IMPLEMENTED; 85 PARTIAL; 35 OPEN; 7 BASE CHANGED;
+  4 PROTOCOL DECISION; 1 UNARMED CANDIDATE;
+  1 REFUTED IN AUDIT; 1 VERIFIED POSITIVE.
+
+git diff --check
+  Passed after the documentation update.
+
+BOUNDARY
+
+BV-03 still exposes public inputs and intent to any deliberately selected remote
+operator/proxy. BV-07 still has no format-level freshness, ordering or revocation
+mechanism. Both remain PARTIAL.
