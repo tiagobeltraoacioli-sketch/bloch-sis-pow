@@ -914,7 +914,7 @@ pub struct RpcCall {
 }
 
 /// The production backend: hand the request to the engine's event loop and wait
-/// — except for the two ledger reads, which are answered from the published
+/// — except for state-only reads, which are answered from the published
 /// head (see [`Self::from_head`]).
 ///
 /// Nearly everything goes through the consensus thread rather than through a
@@ -925,8 +925,8 @@ pub struct RpcCall {
 /// queries behind the loop means a query can never observe a half-applied
 /// block, and it means no reader can be looking at last epoch's answer.
 ///
-/// **The exception, and why it does not reopen that.** `getbalance` and
-/// `getutxos` are served from an `Arc<CommittedState>` the consensus thread
+/// **The exception, and why it does not reopen that.** Ledger and validator
+/// registry reads are served from an `Arc<CommittedState>` the consensus thread
 /// publishes — the identical value it holds, not a copy shaped like it, so
 /// there is nothing to drift and no half-applied state to observe. They earn
 /// the exception because they were the only reads whose cost scaled with the
@@ -966,13 +966,13 @@ impl EngineBackend {
     ///
     /// # Which requests, and why only these
     ///
-    /// `getbalance` and `getutxos` read the eUTXO set and nothing else. They
-    /// touch no mempool, no block store and no fork-choice store — the three
-    /// things that live only on the consensus thread — so a committed state is
-    /// a complete answer to them.
+    /// These requests read the committed eUTXO set or validator registry and
+    /// nothing else. They touch no mempool, block store or fork-choice store —
+    /// the three things that live only on the consensus thread — so a
+    /// committed state is a complete answer to them.
     ///
-    /// They are also the only two reads whose cost is set by the size of the
-    /// **ledger** rather than by the size of the answer, which is what makes
+    /// The ledger reads are the requests whose cost is set by the size of the
+    /// ledger rather than by the size of the answer, which is what first made
     /// this necessary rather than merely nice: on 2026-08-21 a balance query
     /// over the founder's 452,726 outputs sat in the slot loop for its whole
     /// duration, and the node missed duties while an honest holder waited for
@@ -995,7 +995,14 @@ impl EngineBackend {
         // Matched BEFORE the state is cloned, so a request that must go to the
         // loop does not even touch the lock.
         match req {
-            RpcRequest::Balance(_) | RpcRequest::Utxos { .. } | RpcRequest::TxOut { .. } | RpcRequest::ValidatorAdmission => {}
+            RpcRequest::Balance(_)
+            | RpcRequest::Utxos { .. }
+            | RpcRequest::TxOut { .. }
+            | RpcRequest::Validator(_)
+            | RpcRequest::ValidatorCount
+            | RpcRequest::ValidatorByKey(_)
+            | RpcRequest::ValidatorAdmission
+            | RpcRequest::Validators => {}
             _ => return None,
         }
         // The lock is held for one `Arc::clone` and dropped. The query below
@@ -1010,7 +1017,11 @@ impl EngineBackend {
             Arc::clone(&guard)
         };
         match req {
+            RpcRequest::Validator(index) => Some(validator_record_json(&state, *index)),
+            RpcRequest::ValidatorCount => Some(Ok(validator_count_json(&state))),
+            RpcRequest::ValidatorByKey(hash) => Some(validator_by_key_json(&state, hash)),
             RpcRequest::ValidatorAdmission => Some(Ok(validator_admission_json(&state))),
+            RpcRequest::Validators => Some(Ok(validator_registry_json(&state))),
             RpcRequest::TxOut { txid, vout } => Some(Ok(txout_json(&state, txid, *vout))),
             RpcRequest::Balance(script_hash) => Some(Ok(balance_json(&state, script_hash))),
             RpcRequest::Utxos { script_hash, limit } => {
@@ -2131,6 +2142,68 @@ pub fn validators_json(entries: &[(ValidatorRecord, Option<u64>)], current_epoch
             })
             .collect(),
     )
+}
+
+/// State-only answer for `getvalidator`. Shared by the published-head backend
+/// and the engine fallback so moving the read off the consensus thread cannot
+/// create a second response derivation.
+pub fn validator_record_json(state: &CommittedState, index: u32) -> RpcResult {
+    let rec = state.validator_record(index).ok_or_else(|| {
+        RpcError::new(
+            VALIDATOR_NOT_FOUND,
+            format!(
+                "validator {index} is not in the committed registry ({} registered)",
+                state.validator_count()
+            ),
+        )
+    })?;
+    let effective = state
+        .active_validators()
+        .iter()
+        .find(|v| v.index == index)
+        .map(|v| v.effective_stake);
+    Ok(validator_lifecycle_json(state, &rec, effective))
+}
+
+/// State-only answer for `getvalidatorbykey`.
+pub fn validator_by_key_json(state: &CommittedState, hash: &[u8; 32]) -> RpcResult {
+    let index = state.validator_index_by_hash(hash).ok_or_else(|| {
+        RpcError::new(
+            VALIDATOR_NOT_FOUND,
+            "validator public-key hash is not registered",
+        )
+    })?;
+    validator_record_json(state, index)
+}
+
+/// State-only answer for `getvalidatorcount`.
+pub fn validator_count_json(state: &CommittedState) -> Json {
+    Json::obj(vec![
+        ("total", Json::u(state.validator_count() as u64)),
+        ("active", Json::u(state.active_validators().len() as u64)),
+        (
+            "total_active_stake_sat",
+            Json::sat(state.total_active_stake_sat()),
+        ),
+    ])
+}
+
+/// State-only answer for `getvalidators`.
+pub fn validator_registry_json(state: &CommittedState) -> Json {
+    let active = state.active_validators();
+    let current_epoch = epoch_of(state.slot());
+    let entries: Vec<(ValidatorRecord, Option<u64>)> =
+        (0..state.validator_count() as u32)
+            .filter_map(|index| {
+                let rec = state.validator_record(index)?;
+                let effective = active
+                    .iter()
+                    .find(|v| v.index == index)
+                    .map(|v| v.effective_stake);
+                Some((rec, effective))
+            })
+            .collect();
+    validators_json(&entries, current_epoch)
 }
 
 /// `gettxstatus` (R4 F-11): one of `pending | included | justified |

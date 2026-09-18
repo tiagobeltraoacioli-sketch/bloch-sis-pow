@@ -96,7 +96,7 @@ use bloch_pos_committee::fee_market;
 use bloch_pos_committee::forkchoice::{BlockTree, LatestMessage, Store as FcStore};
 use bloch_pos_committee::gossip::{AttestationPool, GossipDecision};
 use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, VERSION_G4};
-use bloch_pos_committee::interfaces::{ProposalEnvelope, StateReader, StateTransition, ValidatorRecord};
+use bloch_pos_committee::interfaces::{ProposalEnvelope, StateReader, StateTransition};
 use bloch_pos_committee::params::{
     MAX_ATTESTATIONS_PER_BLOCK, MAX_EPOCH_ADVANCE, SLOTS_PER_EPOCH,
 };
@@ -4351,42 +4351,11 @@ impl Engine {
                 Ok(self.block_reply(&env))
             }
 
-            RpcRequest::ValidatorByKey(hash) => {
-                let index = self.state.validator_index_by_hash(&hash).ok_or_else(||
-                    RpcError::new(rpc::VALIDATOR_NOT_FOUND, "validator public-key hash is not registered"))?;
-                self.serve_rpc(RpcRequest::Validator(index))
-            }
+            RpcRequest::ValidatorByKey(hash) => rpc::validator_by_key_json(&self.state, &hash),
             RpcRequest::ValidatorAdmission => Ok(rpc::validator_admission_json(&self.state)),
-            RpcRequest::Validator(index) => {
-                let rec = self.state.validator_record(index).ok_or_else(|| {
-                    RpcError::new(
-                        rpc::VALIDATOR_NOT_FOUND,
-                        format!(
-                            "validator {index} is not in the committed registry ({} registered)",
-                            self.state.validator_count()
-                        ),
-                    )
-                })?;
-                let effective = self
-                    .state
-                    .active_validators()
-                    .iter()
-                    .find(|v| v.index == index)
-                    .map(|v| v.effective_stake);
-                Ok(rpc::validator_lifecycle_json(&self.state, &rec, effective))
-            }
+            RpcRequest::Validator(index) => rpc::validator_record_json(&self.state, index),
 
-            RpcRequest::ValidatorCount => Ok(Json::obj(vec![
-                ("total", Json::u(self.state.validator_count() as u64)),
-                (
-                    "active",
-                    Json::u(self.state.active_validators().len() as u64),
-                ),
-                (
-                    "total_active_stake_sat",
-                    Json::sat(self.state.total_active_stake_sat()),
-                ),
-            ])),
+            RpcRequest::ValidatorCount => Ok(rpc::validator_count_json(&self.state)),
 
             RpcRequest::Balance(script_hash) => Ok(rpc::balance_json(&self.state, &script_hash)),
 
@@ -4491,19 +4460,7 @@ impl Engine {
             )),
 
             // R4 F-11.
-            RpcRequest::Validators => {
-                let active = self.state.active_validators();
-                let current_epoch = epoch_of(self.state.slot());
-                let entries: Vec<(ValidatorRecord, Option<u64>)> = (0..self.state.validator_count()
-                    as u32)
-                    .filter_map(|i| {
-                        let rec = self.state.validator_record(i)?;
-                        let effective = active.iter().find(|v| v.index == i).map(|v| v.effective_stake);
-                        Some((rec, effective))
-                    })
-                    .collect();
-                Ok(rpc::validators_json(&entries, current_epoch))
-            }
+            RpcRequest::Validators => Ok(rpc::validator_registry_json(&self.state)),
 
             RpcRequest::TxStatus(txid) => Ok(rpc::tx_status_json(self.tx_status(&txid))),
         }

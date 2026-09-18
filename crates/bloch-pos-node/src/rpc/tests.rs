@@ -592,7 +592,7 @@ fn ledger_reads_use_the_script_index_and_stop_at_the_page() {
     assert_eq!(st.utxo_count_for_script(&[0x77; 32]), OTHERS as usize);
 }
 
-/// **H6, half (b).** The ledger reads are answered off the published head, so
+/// **H6, half (b).** State-only reads are answered off the published head, so
 /// a large query cannot occupy the consensus thread.
 ///
 /// Proved by taking the consensus thread away: the receiver is dropped, so
@@ -601,7 +601,8 @@ fn ledger_reads_use_the_script_index_and_stop_at_the_page() {
 /// chain store and legitimately belongs on the loop — still fails, so the test
 /// is pinning a *split*, not a backend that answers everything locally.
 #[test]
-fn ledger_reads_are_served_off_the_published_head() {
+fn state_only_reads_are_served_off_the_published_head() {
+    use sha3::{Digest, Sha3_256};
     use std::sync::Mutex as StdMutex;
 
     let st = Arc::new(state_with_balances());
@@ -622,6 +623,31 @@ fn ledger_reads_are_served_off_the_published_head() {
         .expect("getutxos must be answerable with no consensus thread listening");
     assert_eq!(u.get("total").unwrap().as_u64(), Some(3));
     assert_eq!(u.get("returned").unwrap().as_u64(), Some(2));
+
+    let validator = backend
+        .call(RpcRequest::Validator(0))
+        .expect("getvalidator must not need the consensus thread");
+    assert_eq!(validator.get("index").unwrap().as_u64(), Some(0));
+
+    let count = backend
+        .call(RpcRequest::ValidatorCount)
+        .expect("getvalidatorcount must not need the consensus thread");
+    assert_eq!(count.get("total").unwrap().as_u64(), Some(2));
+
+    let key_hash: [u8; 32] = Sha3_256::digest(&st.validator_record(1).unwrap().pubkey).into();
+    let by_key = backend
+        .call(RpcRequest::ValidatorByKey(key_hash))
+        .expect("getvalidatorbykey must not need the consensus thread");
+    assert_eq!(by_key.get("index").unwrap().as_u64(), Some(1));
+
+    let validators = backend
+        .call(RpcRequest::Validators)
+        .expect("getvalidators must not need the consensus thread");
+    let Json::Arr(entries) = validators else { panic!("getvalidators must return an array") };
+    assert_eq!(entries.len(), 2);
+
+    let missing = backend.call(RpcRequest::Validator(u32::MAX)).unwrap_err();
+    assert_eq!(missing.code, VALIDATOR_NOT_FOUND);
 
     assert!(
         backend.call(RpcRequest::ChainInfo).is_err(),
