@@ -2,8 +2,9 @@
 
 # BLOCH-L1-FEE-MARKET — one market, one unit, one price
 
-**Status:** proposed 2026-08-11; **wired into consensus 2026-08-12** (§6.1
-and §4.4 are no longer integration seams — see §8). Code authority:
+**Status:** proposed 2026-08-11; **the eUTXO market is wired into consensus**
+(§6.1 and §4.4 are no longer integration seams). EVM and Coherence classes
+remain design-only: no `PosTransaction` variant admits either one. Code authority:
 `crates/bloch-pos-committee/src/fee_market.rs` (constants and arithmetic),
 `crates/bloch-pos-committee/src/rewards.rs` (the fee split, decided
 2026-08-11, `BLOCH-TOKENOMICS-V4.md` §6.3.2), and
@@ -18,16 +19,19 @@ gate G10 (byte budgets), `COHERENCE-C1.md` (shielded pool).
 
 ---
 
-## 1. What a block carries, and what each thing actually costs
+## 1. What a block carries, and what the design prices
 
-A Genesis-4 block can carry three transaction classes, and they consume
-three different resources:
+A Genesis-4 block currently carries eUTXO transfers and protocol lifecycle
+transactions. Lifecycle transactions reuse the eUTXO intrinsic-cost shape,
+with the number of hybrid verifications actually performed. The market also
+reserves cost functions for two future classes; those enum variants are not
+admission paths and must not be read as deployed L1 features:
 
 | Class | Dominant real cost | Where measured |
 |---|---|---|
-| eUTXO transfer | One hybrid ML-DSA-65 ‖ Falcon-1024 verification **per input** — `HYBRID_VERIFY_INSTRUCTIONS` = 7,274,849 RV32IM instructions — plus `HYBRID_SIG_BYTES` = 4,589 B of signature on the wire | `spikes/prover-cost/RESULTS.md`; migration spec §6.5 |
-| EVM transaction | Computation and state growth, metered per opcode; envelope bytes; one authorisation verify | EVM schedule (adopted, §3.2) |
-| Coherence shielded | One FRI-STARK proof verification, and the proof's bytes — "tens to hundreds of KB" | `COHERENCE-C1.md` |
+| eUTXO / lifecycle — **live** | Hybrid ML-DSA-65 ‖ Falcon-1024 verification when the transaction requires one — `HYBRID_VERIFY_INSTRUCTIONS` = 7,274,849 RV32IM instructions — plus `HYBRID_SIG_BYTES` = 4,589 B per signature on the wire | `spikes/prover-cost/RESULTS.md`; migration spec §6.5; `transition.rs::staking_tx_charge` |
+| EVM transaction — **design only** | Computation and state growth, metered per opcode; envelope bytes; one authorisation verify | Proposed schedule (§3.2); there is no EVM `PosTransaction` variant |
+| Coherence shielded — **design only** | One FRI-STARK proof verification, and the proof's bytes — "tens to hundreds of KB" | `COHERENCE-C1.md`; there is no shielded `PosTransaction` variant |
 
 Three costs, and the classical menu is one fee market per class (three
 prices), a multidimensional market (one market, several prices), or one
@@ -35,9 +39,9 @@ market with one unit.
 
 ## 2. Decision: one market, unit = gas
 
-**One fee market. The common unit is gas (`u64`), and every class buys it
-through a class-specific cost function** (§3). One price — the base fee —
-clears the whole block.
+**One fee market. The common unit is gas (`u64`), and each admitted class buys
+it through a class-specific cost function** (§3). Today that means the eUTXO
+cost shape. One price — the base fee — clears the whole block.
 
 ### 2.1 Why one unit, and why that unit is gas and not bytes
 
@@ -48,8 +52,8 @@ eUTXO transaction; the FRI proof is the largest object in a shielded one.
 Bytes-as-the-unit was therefore seriously considered — it is the simpler
 market and it prices the true bottleneck directly.
 
-It loses to gas on one fact: **EVM at L1 makes computation a first-class
-resource that bytes cannot see.** A 200-byte transaction that runs a
+It loses to gas on one design requirement: **an eventual EVM at L1 would make
+computation a first-class resource that bytes cannot see.** A 200-byte transaction that runs a
 10 M-step contract loop costs every validator CPU that a byte price would
 give away for free; a byte-only market is an invitation to buy cheap bytes
 and spend expensive cycles. Gas is the unit that can express *both* "you
@@ -64,14 +68,14 @@ priced — dominantly so (§3.1) — but as a term inside gas, not as the unit.
   per byte, which is a single market with extra steps and worse UX.
 - A block is one propagation event. Its scarcity is joint; a price per class
   pretends it is separable.
-- The committee crate treats transactions as opaque bytes (`derive.rs` §1.2);
-  one market keeps the consensus surface to two caps and one controller
-  instead of per-class quota machinery.
+- The committee crate decodes a typed `PosTransaction` and derives its cost
+  centrally; one market keeps the consensus surface to two caps and one
+  controller instead of per-class quota machinery.
 
 ### 2.3 The cost of the choice, stated
 
-One price for three cost profiles means **cross-subsidised congestion**: a
-surge of EVM demand raises the base fee that a shielded spender pays, even
+One price for the three designed cost profiles would mean **cross-subsidised
+congestion**: a surge of EVM demand would raise the base fee that a shielded spender pays, even
 though the shielded transaction consumes no EVM compute. That is a real
 distortion and it is accepted, for now, on three grounds: (a) the shared
 byte term *is* most of every class's cost, so the price they share mostly
@@ -81,7 +85,7 @@ priced dimension later (the EIP-4844 move) is an additive change, not a
 redesign; (c) three markets at launch means three thin, manipulable markets
 on a chain that will open with modest traffic.
 
-## 3. Costing the three classes
+## 3. Costing the live and reserved classes
 
 ### 3.1 The common terms
 
@@ -107,10 +111,10 @@ intrinsic = TX_FLAT_GAS + tx_bytes · GAS_PER_BYTE + verify_gas(class)
 
 | Class | verify_gas | Execution gas | Notes |
 |---|---|---|---|
-| eUTXO, n inputs | n · `HYBRID_VERIFY_GAS` | none (transfers) | Bytes + verify are the whole cost |
-| EVM from PQ account | `HYBRID_VERIFY_GAS` | **Ethereum's live opcode schedule, adopted 1:1** (1 EVM gas = 1 Bloch gas), with the intrinsic 21,000 and the per-byte calldata terms **zeroed** — flat, bytes and authorisation are already charged by §3.1, and double-charging bytes would silently re-price every deployed contract's calldata assumptions | Contracts and tooling port with familiar economics |
+| eUTXO, n verifications — **live** | n · `HYBRID_VERIFY_GAS` | none (transfers/lifecycle) | Bytes + verifications are the whole cost |
+| EVM from PQ account — **design only** | `HYBRID_VERIFY_GAS` | **Proposed:** Ethereum's opcode schedule 1:1 (1 EVM gas = 1 Bloch gas), with the intrinsic 21,000 and per-byte calldata terms zeroed — flat, bytes and authorisation are already charged by §3.1 | No consensus transaction variant exists |
 | EVM from secp256k1 account — **GATED** | `SECP256K1_VERIFY_GAS` = 3,000 (the ECRECOVER precedent) | same as above | Priced so the founder's dual-auth options are comparable; existence is not decided here |
-| Shielded (C1) | `SHIELDED_VERIFY_GAS_PROVISIONAL` | none | **PROVISIONAL** — see below |
+| Shielded (C1) — **design only** | `SHIELDED_VERIFY_GAS_PROVISIONAL` | none | **PROVISIONAL** — see below; no consensus transaction variant exists |
 
 The fee-market face of the dual-authorisation decision, made explicit as the
 fleet brief requires: a PQ-account EVM transaction pays `HYBRID_VERIFY_GAS`
@@ -129,8 +133,8 @@ FRI-STARK *verifier* with the same harness that measured the signature
 verifiers (`coherence-prover` has it). Activation with this number
 unmeasured is forbidden by this spec. Separately, `COHERENCE-C1.md` bounds
 proofs only as "tens to hundreds of KB": **if the measured worst-case proof
-exceeds `MAX_BLOCK_TX_BYTES` (§5), shielded transactions cannot be included
-at all** — the byte cap was sized to make that unlikely (256 KiB), but the
+exceeds `max_block_tx_bytes(epoch)` (§5), shielded transactions cannot be included
+at all** — the live post-epoch-800 cap is 512 KiB (the earlier cap was 256 KiB), but the
 proof-size measurement is a blocking prerequisite, and a conflict is a
 founder decision (bigger blocks vs proof recursion), not a silent constant
 bump.
@@ -154,7 +158,7 @@ margin instead of gifting it.
 
 `fee_market::next_base_fee` is EIP-1559's controller with one change:
 utilisation is **max(gas axis, byte axis)**, each measured against half its
-cap (`BLOCK_GAS_TARGET`, `BLOCK_TX_BYTES_TARGET`), compared by
+cap (`BLOCK_GAS_TARGET`, `block_tx_bytes_target(epoch)`), compared by
 cross-multiplication in `u128`.
 
 Plain gas-only 1559 mis-prices this chain, and not as a corner case: a block
@@ -267,10 +271,10 @@ Measured against total supply, the way the tokenomics measures it
 (`annual_inflation_bps`):
 
 - **Era 1 gross:** the recommended decay curve peaks in year 1 at
-  `annual_inflation_bps(0)` = **436 bps = 4.36%** (4,367,467,014 BLCH =
-  `INITIAL_ANNUAL_SAT`), then 286 bps in year 5, 169 bps in year 10.
+  `annual_inflation_bps(0)` = **434 bps** (4,349,651,692.52191762 BLCH =
+  `INITIAL_ANNUAL_SAT`), then 285 bps in year 5 and 168 bps in year 10.
 - **Era 1 net:** net = gross − burned, and burned ≥ 0 every slot, so
-  **net ≤ 4.36% < the 7% target in every year, with 264 bps of margin
+  **net ≤ 4.35% < the 7% target in every year, with more than 265 bps of margin
   before any burn is even counted**. The target is met by the emission
   curve alone; the burn only widens the margin, and with heavy fee traffic
   net issuance can go negative (deflation) — consistent with the hard cap,
@@ -279,26 +283,23 @@ Measured against total supply, the way the tokenomics measures it
   Total supply ends at `TOTAL_SUPPLY_BLOCH` minus everything burned in
   era 1 (the cap is a ceiling, not a landing point — §6.3.2's note).
 
-The `net_inflation_stays_under_the_7_percent_target` test pins the three bps
-figures and both era properties. (The doc comment in `tokenomics_v4.rs`
-carried year-1 figures from the superseded 100 B draft; corrected this wave
-and added to `check_stale.py`.)
+The committee tests `decay_curve_meets_the_inflation_target` and
+`the_split_left_the_inflation_schedule_untouched` pin the basis-point schedule.
 
 ## 5. DoS: the two caps and the G10 gate — which one commands
 
 Consensus enforces **two independent per-block caps**, and a block is
 invalid if it exceeds *either*:
 
-1. `MAX_BLOCK_TX_BYTES` = 262,144 (256 KiB) on transaction payload bytes —
-   sized to admit one worst-case C1 proof (§3.2) and ~54 minimal eUTXO
-   transfers (~1.8 tx/s; the honest throughput of 4.6 KB signatures on 30 s
-   slots).
+1. `max_block_tx_bytes(epoch)` on transaction payload bytes: 262,144
+   (256 KiB) before `BLOCK_BYTES_V2_ACTIVATION_EPOCH = 800`, and 524,288
+   (512 KiB) from that epoch onward. The target is always half the active cap.
 2. `BLOCK_GAS_LIMIT` = 60,000,000 — 2 M gas/s, the CPU/state backstop, the
    same order as Ethereum's 3 M gas/s.
 
 **When they disagree, the byte cap commands.** It is the cap G10's fleet
 measurement stands behind, and the compile-time assertion
-`MAX_BLOCK_TX_BYTES · GAS_PER_BYTE ≤ BLOCK_GAS_LIMIT` guarantees the gas
+`MAX_BLOCK_TX_BYTES_V2 · GAS_PER_BYTE ≤ BLOCK_GAS_LIMIT` guarantees the gas
 cap can never make the byte cap unreachable — bytes can bind first (and for
 signature-heavy traffic always do), gas cannot forbid a byte-legal block on
 byte grounds. Attestation bytes are outside both caps: the protocol itself
@@ -310,14 +311,14 @@ neither profits from nor pays for them.
 attestation traffic of §6.5 — the tx payload this fee market admits comes
 *on top*. The gate that actually validates this design is:
 
-- worst block ≈ 588 KB + `MAX_BLOCK_TX_BYTES` (256 KiB) ≈ **850 KB**,
+- worst post-epoch-800 block ≈ 588 KB + `MAX_BLOCK_TX_BYTES_V2` (512 KiB) ≈ **1.1 MB**,
   p99 propagation < 5 s;
-- sustained average ≈ 54 KB + `BLOCK_TX_BYTES_TARGET` (128 KiB) ≈
-  **182 KB/block** for ≥ 14 days, no mesh degradation, no yamux
+- sustained post-epoch-800 average ≈ 54 KB + `BLOCK_TX_BYTES_TARGET_V2`
+  (256 KiB) ≈ **310 KB/block** for ≥ 14 days, no mesh degradation, no yamux
   stream-limit failures.
 
 Direction of resolution is fixed: **if the fleet cannot sustain that,
-`MAX_BLOCK_TX_BYTES` comes down; the gate's pass bar never comes down to
+the active byte cap comes down through a coordinated rule; the gate's pass bar never comes down to
 meet the constant.** The launch gate commands the constant, the constant
 commands block validity.
 
@@ -365,9 +366,9 @@ warm-up history. Truncation dust goes to the operator. Pinned end-to-end by
 ### 6.2 MEV: what the design does, and the honest bill for it
 
 A proposer chooses and orders transactions, so a proposer that picks
-expensive transactions earns more — and with EVM at L1 this stops being
-theoretical: DEX arbitrage, liquidations and sandwiching arrive with the
-first AMM deployment. What this design does:
+expensive transactions earns more. If EVM admission is added at L1, DEX
+arbitrage, liquidations and sandwiching arrive with the first AMM deployment.
+What this design does:
 
 - **Structurally removes the auction component.** The protocol base fee
   eliminates first-price overbidding spam; the burn (era 1) takes half the
@@ -396,16 +397,16 @@ first AMM deployment. What this design does:
    market is indifferent; the security note in the fleet brief is not.
 2. **PQ fee subsidy** — whether to discount the ~12× PQ-vs-secp intrinsic
    gap if dual-auth is adopted, or let true cost stand (§3.2).
-3. **Shielded proof size vs `MAX_BLOCK_TX_BYTES`** — if measurement shows a
-   worst-case C1 proof above 256 KiB (§3.2): bigger blocks or recursion.
+3. **Shielded proof size vs the active byte cap** — if measurement shows a
+   worst-case C1 proof above 512 KiB (§3.2): bigger blocks or recursion.
 
-## 8. Not done this wave
+## 8. Implementation boundary
 
-- No transaction parsing/serialisation, no EVM engine, no mempool: this
-  crate treats transactions as opaque bytes; the module is the arithmetic
-  and the constants, as `rewards.rs` is for the split.
-- The base-fee state leaf (tag `0x09`) is specified (§4.4), not added —
-  the SMT component list is a closed list owned by the state-root design.
+- Transaction parsing, canonical serialisation, admission and block execution
+  are implemented outside `fee_market.rs`; that module owns the arithmetic and
+  constants. The consensus transaction itself is typed, not opaque.
+- The base-fee state leaf is live under append-only `TAG_BASE_FEE = 0x15`, as
+  described in §4.4.
 - ~~`transition.rs` step 11 not rewired~~ / ~~`Transfer` carries declared
   fees~~ — **both done 2026-08-12** (§6.1, §4.4). `PosTransaction::Transfer`
   is now `{ inputs, tx_bytes, tip_millisat_per_gas }`: gas is derived by

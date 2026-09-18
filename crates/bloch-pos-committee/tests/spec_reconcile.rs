@@ -15,6 +15,7 @@
 //! hard-coded, so a *code* change that invalidates a published figure also
 //! fails here and forces the spec to move in the same commit.
 
+use bloch_pos_committee::fee_market;
 use bloch_pos_committee::header::BlockHeaderV4;
 use bloch_pos_committee::params;
 use bloch_pos_committee::staking::MIN_DEPOSIT_SAT;
@@ -33,6 +34,27 @@ fn spec(name: &str) -> String {
 
 const MIGRATION: &str = "BLOCH-POS-SHA3-LATTICE-MIGRATION.md";
 const TOKENOMICS: &str = "BLOCH-TOKENOMICS-V4.md";
+const FEE_MARKET: &str = "BLOCH-L1-FEE-MARKET.md";
+
+fn comma_u128(value: u128) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i != 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn hex_prefix(bytes: &[u8], take: usize) -> String {
+    bytes
+        .iter()
+        .take(take)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 /// Render a 16-byte domain tag the way the spec table writes it:
 /// printable ASCII prefix, then one `\0` per padding byte.
@@ -289,4 +311,89 @@ fn f12_emission_table_matches_shipped_curve() {
         !doc.contains("4,151.90"),
         "{TOKENOMICS} still carries the draft year-1 reward the chain does not pay"
     );
+}
+
+/// TX-19 — the fee-market spec must distinguish deployed transaction classes
+/// from reserved costing variants and publish the active epoch-aware byte cap.
+#[test]
+fn tx19_fee_market_scope_and_caps_match_code() {
+    let doc = spec(FEE_MARKET);
+
+    assert!(
+        doc.contains("EVM transaction — **design only**")
+            && doc.contains("Coherence shielded — **design only**")
+            && doc.contains("no `PosTransaction` variant admits either one"),
+        "{FEE_MARKET} presents reserved costing variants as deployed L1 transactions"
+    );
+    assert!(
+        !doc.contains("A Genesis-4 block can carry three transaction classes")
+            && !doc.contains("crate treats transactions as opaque bytes"),
+        "{FEE_MARKET} retained a stale transaction-scope claim"
+    );
+
+    for claim in [
+        format!(
+            "`BLOCK_BYTES_V2_ACTIVATION_EPOCH = {}`",
+            params::BLOCK_BYTES_V2_ACTIVATION_EPOCH
+        ),
+        comma_u128(fee_market::MAX_BLOCK_TX_BYTES as u128),
+        comma_u128(fee_market::MAX_BLOCK_TX_BYTES_V2 as u128),
+        format!("`TAG_BASE_FEE = 0x{:02x}`", 0x15),
+    ] {
+        assert!(
+            doc.contains(&claim),
+            "{FEE_MARKET} missing live claim {claim:?}"
+        );
+    }
+
+    let annual_blch = tk::INITIAL_ANNUAL_SAT / tk::SAT_PER_BLOCH;
+    assert!(
+        doc.contains(&comma_u128(annual_blch))
+            && doc.contains(&format!("**{} bps**", tk::annual_inflation_bps(0)))
+            && doc.contains(&format!("{} bps in year 5", tk::annual_inflation_bps(4)))
+            && doc.contains(&format!("{} bps in year 10", tk::annual_inflation_bps(9))),
+        "{FEE_MARKET} inflation prose diverges from the shipped integer recurrence"
+    );
+}
+
+/// TX-19 — terminal carryover and allocation facts in tokenomics are derived
+/// from the same constants used to construct Genesis-4.
+#[test]
+fn tx19_tokenomics_terminal_facts_match_code() {
+    let doc = spec(TOKENOMICS);
+    let other_holders = tk::CARRYOVER_TOTAL_BLOCH - tk::LARGEST_CARRYOVER_ADDRESS_BLOCH;
+
+    for claim in [
+        "Status:     FINAL — shipped constants are code authority".to_owned(),
+        comma_u128(tk::CARRYOVER_TOTAL_BLOCH),
+        comma_u128(tk::VALIDATOR_EMISSION_BLOCH),
+        comma_u128(other_holders),
+        format!("`{}…`", hex_prefix(&tk::CARRYOVER_MEASURED_ROOT, 8)),
+        format!(
+            "`{}…`",
+            hex_prefix(&tk::CARRYOVER_MEASURED_FILE_SHA3_256, 8)
+        ),
+        format!("`{}…`", hex_prefix(&tk::CARRYOVER_MEASURED_FILE_SHA256, 8)),
+    ] {
+        assert!(
+            doc.contains(&claim),
+            "{TOKENOMICS} missing terminal claim {claim:?}"
+        );
+    }
+
+    for stale in [
+        "Status:     DRAFT",
+        "| Addresses | 15 |",
+        "| The other 14 |",
+        "23,970,850,000 BLCH",
+        "17.970.850.000",
+        "43.029.120.000",
+        "280d604b32525f03",
+        "92918209a106f297",
+    ] {
+        assert!(
+            !doc.contains(stale),
+            "{TOKENOMICS} retained stale claim {stale:?}"
+        );
+    }
 }
