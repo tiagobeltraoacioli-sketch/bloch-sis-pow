@@ -379,7 +379,7 @@ impl RecoveryContextV1 {
         }
         let keys = derive_vault_keys_versioned(seed, self.mainnet, self.key_derivation)
             .map_err(|_| RecoveryContextError::KeyDerivationFailed)?;
-        restore_recovery_secret_v1(&keys.pq_secret, &self.vault_id, funded_recovery_hash)
+        restore_recovery_secret_v1(keys.pq_secret_key(), &self.vault_id, funded_recovery_hash)
             .map_err(|_| RecoveryContextError::RecoveryHashMismatch)
     }
 }
@@ -496,7 +496,7 @@ mod tests {
             VaultKeyDerivation::V3HardenedRoles,
         ] {
             let keys = derive_vault_keys_versioned(&seed, false, version).unwrap();
-            let (expected_secret, expected_hash) = derive_recovery(&keys.pq_secret, vault_id);
+            let (expected_secret, expected_hash) = derive_recovery(keys.pq_secret_key(), vault_id);
             let context = RecoveryContextV1::new(version, false, vault_id, expected_hash).unwrap();
             let decoded = RecoveryContextV1::decode(&context.encode()).unwrap();
             assert_eq!(decoded, context);
@@ -514,7 +514,7 @@ mod tests {
         let keys =
             derive_vault_keys_versioned(&seed, false, VaultKeyDerivation::V1SharedReceiveChain)
                 .unwrap();
-        let (_, expected_hash) = derive_recovery(&keys.pq_secret, vault_id);
+        let (_, expected_hash) = derive_recovery(keys.pq_secret_key(), vault_id);
         let context = RecoveryContextV1::new(
             VaultKeyDerivation::V1SharedReceiveChain,
             false,
@@ -674,7 +674,8 @@ mod tests {
         let seed = [51u8; 32];
         let keys =
             derive_vault_keys_versioned(&seed, false, VaultKeyDerivation::V3HardenedRoles).unwrap();
-        let (expected_secret, expected_hash) = derive_recovery(&keys.pq_secret, b"wave-51-vault");
+        let (expected_secret, expected_hash) =
+            derive_recovery(keys.pq_secret_key(), b"wave-51-vault");
         let context = RecoveryContextV1::new(
             VaultKeyDerivation::V3HardenedRoles,
             false,
@@ -682,7 +683,7 @@ mod tests {
             expected_hash,
         )
         .unwrap();
-        let signed = SignedRecoveryContextV1::sign(&context, &keys.pq_secret).unwrap();
+        let signed = SignedRecoveryContextV1::sign(&context, keys.pq_secret_key()).unwrap();
         let decoded = SignedRecoveryContextV1::decode(&signed.encode()).unwrap();
         assert_eq!(decoded, signed);
         assert_eq!(decoded.verify(&keys.pq_pubkey), Ok(()));

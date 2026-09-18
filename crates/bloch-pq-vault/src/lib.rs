@@ -134,22 +134,53 @@ const VAULT_PURPOSE_V2: &str = "1998'";
 ///     let _second_owner = keys.clone();
 /// }
 /// ```
+///
+/// Secret fields are private. Callers must opt in to a borrowed view instead
+/// of obtaining or replacing secret-bearing fields directly:
+///
+/// ```compile_fail
+/// # let keys = bloch_pq_vault::derive_vault_keys(&[7u8; 32], false);
+/// let copied = keys.pq_secret.clone();
+/// ```
 pub struct VaultKeys {
     /// Hot spend key (deposit spend + trigger branch A).
-    pub hot_sk: SecretKey,
+    hot_sk: SecretKey,
     pub hot_pubkey: PublicKey,
     /// Recovery key (trigger branch B clawback).
-    pub recovery_sk: SecretKey,
+    recovery_sk: SecretKey,
     pub recovery_pubkey: PublicKey,
     /// Enveloped ML-DSA-65 ‖ Falcon-1024 public key (PQ identity / anchor key).
     pub pq_pubkey: Vec<u8>,
     /// Enveloped PQ secret key — produces `r` and signs the anchor. Keep secret.
-    pub pq_secret: Vec<u8>,
+    pq_secret: Vec<u8>,
     /// A4-M-5: which BIP-32 branch produced `hot_sk`/`recovery_sk`. Carried so
     /// a caller that persists vault key material also records how to
     /// re-derive it — a vault built under one version must always be
     /// re-derived under that SAME version.
     pub key_derivation: VaultKeyDerivation,
+}
+
+impl VaultKeys {
+    /// Borrow the hot Bitcoin secret key for an explicit signing operation.
+    ///
+    /// The reference avoids making field access itself copy the `SecretKey`.
+    /// The upstream type is still `Copy`, so a caller can deliberately copy it.
+    pub fn hot_secret_key(&self) -> &SecretKey {
+        &self.hot_sk
+    }
+
+    /// Borrow the recovery Bitcoin secret key for an explicit signing operation.
+    ///
+    /// The reference avoids making field access itself copy the `SecretKey`.
+    /// The upstream type is still `Copy`, so a caller can deliberately copy it.
+    pub fn recovery_secret_key(&self) -> &SecretKey {
+        &self.recovery_sk
+    }
+
+    /// Borrow the enveloped PQ secret key without exposing its owned vector.
+    pub fn pq_secret_key(&self) -> &[u8] {
+        &self.pq_secret
+    }
 }
 
 // Wipe this object's owned PQ allocation. VaultKeys is intentionally non-Clone
@@ -733,6 +764,19 @@ mod audit_hardened_roles {
 #[cfg(test)]
 mod audit_secret_ownership {
     use super::*;
+
+    #[test]
+    fn secret_accessors_borrow_the_owned_storage() {
+        let keys = derive_vault_keys_v3(&[42; 32], false).unwrap();
+        assert!(std::ptr::eq(keys.hot_secret_key(), &keys.hot_sk));
+        assert!(std::ptr::eq(
+            keys.recovery_secret_key(),
+            &keys.recovery_sk,
+        ));
+        assert_eq!(keys.pq_secret_key().as_ptr(), keys.pq_secret.as_ptr());
+        assert_eq!(keys.pq_secret_key().len(), keys.pq_secret.len());
+    }
+
     #[test]
     fn explicit_wipe_clears_owned_pq_storage_without_changing_public_identity() {
         let mut keys = derive_vault_keys_v3(&[42;32], false).unwrap();

@@ -778,7 +778,7 @@ mod tests {
     /// receives any of the secrets below.
     fn public_inputs() -> (VaultKeys, [u8; 32], [u8; 32]) {
         let keys = derive_vault_keys(&seed(), false);
-        let (r, hr) = derive_recovery(&keys.pq_secret, b"api-test-vault");
+        let (r, hr) = derive_recovery(keys.pq_secret_key(), b"api-test-vault");
         (keys, r, hr)
     }
 
@@ -973,7 +973,7 @@ mod tests {
 
         // Sign CLIENT-SIDE (test-only secret) and verify via the API, against the PQ key
         // the caller already trusts for this vault.
-        let signed = sign_anchor(&anchor, &keys.pq_secret).unwrap();
+        let signed = sign_anchor(&anchor, keys.pq_secret_key()).unwrap();
         assert!(verify_anchor(&signed, &keys.pq_pubkey).is_ok());
         let mut verify_req = fields.as_object().unwrap().clone();
         verify_req.insert("signature".into(), json!(hex::encode(&signed.signature)));
@@ -1008,7 +1008,7 @@ mod tests {
             csv_delay: 144,
             policy: b"watchtower-01".to_vec(),
         };
-        let forged = sign_anchor(&forged_anchor, &attacker.pq_secret).unwrap();
+        let forged = sign_anchor(&forged_anchor, attacker.pq_secret_key()).unwrap();
 
         let forged_req = json!({
             "target_chain": "bitcoin",
