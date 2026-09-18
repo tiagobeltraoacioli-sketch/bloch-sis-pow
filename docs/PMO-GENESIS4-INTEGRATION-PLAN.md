@@ -315,11 +315,10 @@ The pieces that already exist and are waiting:
 
 1. **A txid derivation.** Domain-separated, per §5.4 discipline. This is a new
    consensus primitive and needs a KAT.
-2. **A spend signing root** and a `DS_SPEND` domain tag. `params.rs:73-97`
-   currently has `DS_ATTEST`, `DS_BLOCK`, `DS_STATE`, `DS_DEPOSIT`,
-   `DS_PROPOSE`, `DS_BODY`. A new tag must be 16 bytes, zero-padded, and
-   pairwise-distinct — `header.rs:734` (`domain_tag_shape`) and `main.rs`'s
-   selfcheck both police this.
+2. **Resolved:** the witness-free spend root and `DS_SPEND` shipped; the inert
+   network-bound successor uses `DS_SPEND2`. All shipped separators are listed
+   by `params::DOMAIN_TAGS`, which records their preimage shapes and is checked
+   for 16-byte uniqueness and spec coverage.
 3. **Accessors on `eutxos`** and on `EutxoEntry::entry_key`/`serialize`, which
    are private (`state_root.rs:419`, `:425`).
 4. **The fee debit.** Today fees are computed and *credited* to the proposer

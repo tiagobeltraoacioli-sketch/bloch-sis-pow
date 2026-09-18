@@ -1850,8 +1850,25 @@ pub const WITHDRAWAL_ACTIVATION_EPOCH: u64 = 2_884;
 /// `sighash_network_binding_gate_is_inert` pins the value.
 pub const SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+/// One shipped domain separator and the preimage shapes that use it.
+///
+/// `preimage_shapes` is an audit registry, not an encoding layer. Some frozen
+/// domains intentionally serve multiple structurally disjoint shapes; the
+/// descriptions name the marker, role byte, length or nested-domain property
+/// that keeps those shapes apart without changing historical digest bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DomainTag {
+    pub name: &'static str,
+    pub bytes: [u8; 16],
+    pub preimage_shapes: &'static [&'static str],
+}
+
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
-/// no tag can be a prefix of another.
+/// no tag can be a prefix of another. [`DOMAIN_TAGS`] below is the complete
+/// machine-readable registry.
+///
+/// Sortition covers weighted slot/epoch draws and the epoch partition. Their
+/// final role bytes (`0x01`, `0x02`, `0x03`) are disjoint subdomains.
 pub const DS_SORTITION: [u8; 16] = *b"BLCH4:SORTIT\0\0\0\0";
 /// Attestation signing root domain.
 pub const DS_ATTEST: [u8; 16] = *b"BLCH4:ATTEST\0\0\0\0";
@@ -1859,13 +1876,18 @@ pub const DS_ATTEST: [u8; 16] = *b"BLCH4:ATTEST\0\0\0\0";
 /// `SHA3-256(DS_BLOCK ‖ canonical header)` — the tag is what guarantees a block
 /// id can never collide with any other domain's digest of the same bytes.
 pub const DS_BLOCK: [u8; 16] = *b"BLCH4:BLOCK\0\0\0\0\0";
-/// Transaction Merkle tree (`body_root`).
+/// Transaction/attestation Merkle trees (`body_root`). A marker byte separates
+/// leaf/node/empty and a following kind byte separates the two trees.
 pub const DS_BODY: [u8; 16] = *b"BLCH4:BODY\0\0\0\0\0\0";
-/// State SMT nodes (`state_root`).
+/// State SMT (`state_root`). Its next byte separates leaf, node, empty, key
+/// derivation and value hashing.
 pub const DS_STATE: [u8; 16] = *b"BLCH4:STATE\0\0\0\0\0";
-/// Beacon mixing (§6.3): `mix' = SHA3-256(DS_RANDAO ‖ mix ‖ reveal)`.
+/// Beacon mixing and recommitment (§6.3). Their fixed preimages are 80 and 60
+/// bytes including the tag, respectively, so neither is a prefix of the other.
 pub const DS_RANDAO: [u8; 16] = *b"BLCH4:RANDAO\0\0\0\0";
-/// Deposit message signing root (§7.1 proof of possession).
+/// Deposit proof-of-possession roots. The legacy fixed-width deposit and the
+/// funded wire deposit are frozen uses; the latter length-prefixes both
+/// variable-width fields and covers its additional commission field.
 pub const DS_DEPOSIT: [u8; 16] = *b"BLCH4:DEPOSIT\0\0\0";
 /// The signing root an eUTXO spend authorisation covers: the domain under
 /// which an output's owner authorises *this* transfer and no other.
@@ -1896,24 +1918,18 @@ pub const DS_SPEND2: [u8; 16] = *b"BLCH4:SPEND2\0\0\0\0";
 /// which is the malleability class that made Bitcoin's chained-transaction
 /// wallets unsafe before segwit.
 pub const DS_TXID: [u8; 16] = *b"BLCH4:TXID\0\0\0\0\0\0";
-/// Slashing evidence and voluntary-exit signing roots (§7.2, §7.3).
+/// Slashing-evidence anti-replay identities (§7.3). Proposal and attestation
+/// evidence share the same outer `(validator, low root, high root)` shape;
+/// their nested roots use distinct `DS_PROPOSE` and `DS_ATTEST` domains.
 pub const DS_SLASH: [u8; 16] = *b"BLCH4:SLASH\0\0\0\0\0";
 /// Proposer signature domain over the header.
 ///
-/// **Not in the §6.1 table** — the spec assigns a tag to block identity but
-/// none to the proposer's signature, leaving the signature to cover the same
-/// domain-tagged bytes as the id. Signing the id would work, but a signature
+/// The §6.1 registry assigns this separately from block identity. A signature
 /// domain that is also an identifier domain invites exactly the cross-protocol
-/// replay games domain separation exists to end, so this crate freezes a
-/// distinct tag and the spec table needs the row added (flagged in
-/// `BLOCH-POS-INTERFACES.md`).
+/// replay games domain separation exists to end.
 pub const DS_PROPOSE: [u8; 16] = *b"BLCH4:PROPOSE\0\0\0";
-/// Deposit proof-of-possession domain (§6.1, §7.1). A PoP bound to its own
-/// domain cannot be replayed as an attestation or a block signature — the tag
-/// is what makes a signature mean one thing only.
-/// Voluntary-exit signing domain (§7.2). Not in the §6.1 table by name, but
-/// the exit is "a hybrid-signed message" and every signed message gets its own
-/// tag; all tags are fixed 16 bytes, so no tag can prefix another.
+/// Voluntary-exit signing domain (§7.2). Every signed message gets its own tag;
+/// all tags are fixed 16 bytes, so no tag can prefix another.
 pub const DS_EXIT: [u8; 16] = *b"BLCH4:EXIT\0\0\0\0\0\0";
 /// Weak-subjectivity checkpoint digest domain
 /// (`BLOCH-WEAK-SUBJECTIVITY.md` §2.1). The checkpoint is signed and verified
@@ -1930,10 +1946,108 @@ pub const DS_WSCKPT: [u8; 16] = *b"BLCH4:WSCKPT\0\0\0\0";
 /// Coherence already is, and this tag is on the "rest of the chain" side of
 /// that line.
 pub const DS_COHERENCE: [u8; 16] = *b"BLCH4:COHERE\0\0\0\0";
-/// State SMT node domain (§6.1) — every hash in [`crate::state_root`] starts
-/// with this tag so a state-tree node can never collide with a block id, a
-/// transaction Merkle node, or any other SHA3 use in the protocol.
-/// Slashing-evidence identity domain (anti-replay key, §7.3).
+
+/// Complete authority for shipped `BLCH4:*` domain separators and their live
+/// preimage shapes. Tests consume this registry for uniqueness and spec/code
+/// reconciliation, so a new constant cannot remain invisible in prose.
+pub const DOMAIN_TAGS: &[DomainTag] = &[
+    DomainTag {
+        name: "DS_SORTITION",
+        bytes: DS_SORTITION,
+        preimage_shapes: &[
+            "weighted draw: mix|index|role(01/02)",
+            "epoch partition: mix|epoch|role(03)",
+        ],
+    },
+    DomainTag {
+        name: "DS_ATTEST",
+        bytes: DS_ATTEST,
+        preimage_shapes: &["attestation signing root"],
+    },
+    DomainTag {
+        name: "DS_BLOCK",
+        bytes: DS_BLOCK,
+        preimage_shapes: &["canonical block-header identity"],
+    },
+    DomainTag {
+        name: "DS_BODY",
+        bytes: DS_BODY,
+        preimage_shapes: &[
+            "transaction tree: marker|kind(01)|payload",
+            "attestation tree: marker|kind(02)|payload",
+        ],
+    },
+    DomainTag {
+        name: "DS_STATE",
+        bytes: DS_STATE,
+        preimage_shapes: &[
+            "leaf marker(00)",
+            "node marker(01)",
+            "empty marker(02)",
+            "key marker(03)",
+            "value marker(04)",
+        ],
+    },
+    DomainTag {
+        name: "DS_RANDAO",
+        bytes: DS_RANDAO,
+        preimage_shapes: &[
+            "mix|reveal (80 bytes including tag)",
+            "validator|epoch|commitment (60 bytes including tag)",
+        ],
+    },
+    DomainTag {
+        name: "DS_DEPOSIT",
+        bytes: DS_DEPOSIT,
+        preimage_shapes: &[
+            "legacy fixed-width deposit PoP",
+            "length-prefixed funded deposit PoP",
+        ],
+    },
+    DomainTag {
+        name: "DS_SPEND",
+        bytes: DS_SPEND,
+        preimage_shapes: &["legacy witness-free spend authorization"],
+    },
+    DomainTag {
+        name: "DS_SPEND2",
+        bytes: DS_SPEND2,
+        preimage_shapes: &["network-bound witness-free spend authorization"],
+    },
+    DomainTag {
+        name: "DS_TXID",
+        bytes: DS_TXID,
+        preimage_shapes: &["transaction identity over spend root"],
+    },
+    DomainTag {
+        name: "DS_SLASH",
+        bytes: DS_SLASH,
+        preimage_shapes: &[
+            "attestation evidence identity over DS_ATTEST roots",
+            "proposal evidence identity over DS_PROPOSE roots",
+        ],
+    },
+    DomainTag {
+        name: "DS_PROPOSE",
+        bytes: DS_PROPOSE,
+        preimage_shapes: &["proposal signature over canonical header"],
+    },
+    DomainTag {
+        name: "DS_EXIT",
+        bytes: DS_EXIT,
+        preimage_shapes: &["voluntary-exit signing root"],
+    },
+    DomainTag {
+        name: "DS_WSCKPT",
+        bytes: DS_WSCKPT,
+        preimage_shapes: &["weak-subjectivity checkpoint digest"],
+    },
+    DomainTag {
+        name: "DS_COHERENCE",
+        bytes: DS_COHERENCE,
+        preimage_shapes: &["accumulator|nullifier header binding"],
+    },
+];
 
 /// Role tags, mixed into the sortition seed so the per-slot subcommittee is not
 /// a predictable subset of the epoch committee.

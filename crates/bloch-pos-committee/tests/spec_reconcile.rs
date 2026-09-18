@@ -117,28 +117,34 @@ fn f05_header_wire_layout_matches_code() {
 fn f06_domain_and_state_tags_all_published() {
     let doc = spec(MIGRATION);
 
-    let tags: [(&str, &[u8; 16]); 14] = [
-        ("DS_BLOCK", &params::DS_BLOCK),
-        ("DS_BODY", &params::DS_BODY),
-        ("DS_STATE", &params::DS_STATE),
-        ("DS_ATTEST", &params::DS_ATTEST),
-        ("DS_RANDAO", &params::DS_RANDAO),
-        ("DS_SORTITION", &params::DS_SORTITION),
-        ("DS_DEPOSIT", &params::DS_DEPOSIT),
-        ("DS_SLASH", &params::DS_SLASH),
-        ("DS_SPEND", &params::DS_SPEND),
-        ("DS_TXID", &params::DS_TXID),
-        ("DS_PROPOSE", &params::DS_PROPOSE),
-        ("DS_EXIT", &params::DS_EXIT),
-        ("DS_WSCKPT", &params::DS_WSCKPT),
-        ("DS_COHERENCE", &params::DS_COHERENCE),
-    ];
-    for (name, bytes) in tags {
-        let rendered = format!("| `{name}` | `{}` |", render_tag(bytes));
+    assert_eq!(params::DOMAIN_TAGS.len(), 15, "review every new domain tag");
+    for tag in params::DOMAIN_TAGS {
+        assert!(
+            !tag.preimage_shapes.is_empty(),
+            "{} has no registered preimage",
+            tag.name
+        );
+        let rendered = format!(
+            "| `{}` | `{}` |",
+            tag.name,
+            render_tag(&tag.bytes)
+        );
         assert!(
             doc.contains(&rendered),
-            "{MIGRATION} §6.1 registry missing or byte-inexact for {name}: expected row start {rendered:?}"
+            "{MIGRATION} §6.1 registry missing or byte-inexact for {}: expected row start {rendered:?}",
+            tag.name
         );
+    }
+
+    for (i, left) in params::DOMAIN_TAGS.iter().enumerate() {
+        for right in &params::DOMAIN_TAGS[i + 1..] {
+            assert_ne!(left.name, right.name, "duplicate domain name");
+            assert_ne!(
+                left.bytes, right.bytes,
+                "{} and {} share a domain",
+                left.name, right.name
+            );
+        }
     }
 
     // State-tree preimage markers 0x00..0x04 and every live component tag.

@@ -525,22 +525,23 @@ merge blocker for DEV-1, and A4 audits for it explicitly.
 One hash function, many uses; every use gets a tag. Tags are ASCII, fixed
 length 16, right-padded with `0x00` (so no tag can be a prefix of another).
 The table below is the **complete** registry as shipped
-(`crates/bloch-pos-committee/src/params.rs`); an earlier revision listed only
-the first eight and an independent implementer would have derived incompatible
-digests for every message in the missing six domains. Each `\0` below is one
+(`crates/bloch-pos-committee/src/params.rs`, `DOMAIN_TAGS`); an earlier revision
+listed only the first eight and later omitted `DS_SPEND2`. An independent
+implementer would derive incompatible digests in a missing domain. Each `\0` below is one
 zero byte; every tag is exactly 16 bytes.
 
 | Constant | Tag (16 bytes) | Use |
 |---|---|---|
 | `DS_BLOCK` | `BLCH4:BLOCK\0\0\0\0\0` | Block identity (§5.4) |
-| `DS_BODY` | `BLCH4:BODY\0\0\0\0\0\0` | Transaction Merkle tree (`body_root`) |
-| `DS_STATE` | `BLCH4:STATE\0\0\0\0\0` | State SMT nodes (`state_root`; see marker bytes below) |
+| `DS_BODY` | `BLCH4:BODY\0\0\0\0\0\0` | Transaction and attestation Merkle trees; marker then kind byte separates shapes |
+| `DS_STATE` | `BLCH4:STATE\0\0\0\0\0` | State SMT leaf/node/empty/key/value shapes; see marker bytes below |
 | `DS_ATTEST` | `BLCH4:ATTEST\0\0\0\0` | Attestation signing root |
-| `DS_RANDAO` | `BLCH4:RANDAO\0\0\0\0` | Beacon mixing (§6.3) |
-| `DS_SORTITION` | `BLCH4:SORTIT\0\0\0\0` | Sortition draw |
-| `DS_DEPOSIT` | `BLCH4:DEPOSIT\0\0\0` | Deposit proof-of-possession signing root (§7.1) |
-| `DS_SLASH` | `BLCH4:SLASH\0\0\0\0\0` | Slashing-evidence signing roots (§7.3) |
+| `DS_RANDAO` | `BLCH4:RANDAO\0\0\0\0` | 80-byte beacon mixing and 60-byte recommitment preimages (§6.3) |
+| `DS_SORTITION` | `BLCH4:SORTIT\0\0\0\0` | Weighted draw roles `0x01`/`0x02` and epoch-partition role `0x03` |
+| `DS_DEPOSIT` | `BLCH4:DEPOSIT\0\0\0` | Frozen legacy fixed-width and funded length-prefixed PoP roots (§7.1) |
+| `DS_SLASH` | `BLCH4:SLASH\0\0\0\0\0` | Evidence identity over nested `DS_ATTEST` or `DS_PROPOSE` roots (§7.3) |
 | `DS_SPEND` | `BLCH4:SPEND\0\0\0\0\0` | eUTXO spend-authorisation signing root (witness-free) |
+| `DS_SPEND2` | `BLCH4:SPEND2\0\0\0\0` | Network-bound eUTXO spend-authorisation root behind its inert flag day |
 | `DS_TXID` | `BLCH4:TXID\0\0\0\0\0\0` | Transaction identity: `txid = SHA3-256(DS_TXID ‖ spend signing root)` |
 | `DS_PROPOSE` | `BLCH4:PROPOSE\0\0\0` | Proposer signature over the header — deliberately **not** the block-id domain |
 | `DS_EXIT` | `BLCH4:EXIT\0\0\0\0\0\0` | Voluntary-exit signing root (§7.2) |

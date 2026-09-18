@@ -968,8 +968,8 @@ pub trait StakingLifecycle {
     /// majority in one epoch.
     fn activation_epoch(&self, deposit_epoch: u64, queue_ahead: u64) -> u64;
 
-    /// Signing root of a voluntary exit, under `DS_SLASH`'s sibling domain
-    /// (see [`crate::params::DS_SLASH`]): `SHA3-256(DS_SLASH ‖ fields)`.
+    /// Signing root of a voluntary exit under its dedicated domain
+    /// (see [`crate::params::DS_EXIT`]): `SHA3-256(DS_EXIT ‖ fields)`.
     fn exit_signing_root(&self, exit: &ExitTx) -> [u8; 32];
 
     /// Validate a voluntary exit against the committed record.

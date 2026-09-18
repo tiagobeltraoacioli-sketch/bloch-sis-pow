@@ -195,7 +195,7 @@ path". Nothing has started.
   implemented Solana rule.
 - `DS_PROPOSE` exists in `params.rs` but the §6.1 domain-tag table in the
   spec had no row for it (interfaces doc §4.1). **Resolved 2026-09-05:** §6.1
-  now carries the complete 14-tag registry plus the state-tree marker bytes
+  now carries the complete 15-tag registry plus the state-tree marker bytes
   and all 30 component tags through `TAG_FUNDED_VALIDATOR = 0x1E`.
 - `params.rs:98-108`: orphan doc-comments (merge residue), and
   `SLOT_SUBCOMMITTEE_SIZE`/`COMMITTEE_SIZE` are dead constants under the

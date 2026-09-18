@@ -483,6 +483,7 @@ const RELEASED_DS: &[(&str, &str)] = &[
     ("DS_SLASH", r"BLCH4:SLASH\0\0\0\0\0"),
     ("DS_SORTITION", r"BLCH4:SORTIT\0\0\0\0"),
     ("DS_SPEND", r"BLCH4:SPEND\0\0\0\0\0"),
+    ("DS_SPEND2", r"BLCH4:SPEND2\0\0\0\0"),
     ("DS_STATE", r"BLCH4:STATE\0\0\0\0\0"),
     ("DS_TXID", r"BLCH4:TXID\0\0\0\0\0\0"),
     ("DS_WSCKPT", r"BLCH4:WSCKPT\0\0\0\0"),
@@ -1047,6 +1048,11 @@ fn scan_ds(src: &str) -> Vec<(String, String)> {
 fn domain_separators_match_the_frozen_registry() {
     let found = scan_ds(PARAMS_RS);
     assert!(!found.is_empty(), "no DS_* consts found in params.rs — did the path move?");
+    assert_eq!(
+        found.len(),
+        RELEASED_DS.len(),
+        "every DS_* constant must be reviewed into the frozen registry"
+    );
 
     for (name, value) in RELEASED_DS {
         let actual: Vec<&(String, String)> = found.iter().filter(|(n, _)| n == name).collect();
