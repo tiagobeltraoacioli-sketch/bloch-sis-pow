@@ -4,7 +4,7 @@ Audited source: `562e220`. Remediation base: `b066e3c`. Branch: `fix/internal-au
 
 All 200 findings are retained, including duplicates. IMPLEMENTED means code changed in this branch, not deployed, externally audited, or universally resolved on the live fleet. PARTIAL is not closure. No production binary was published.
 
-IMPLEMENTED: 58, PARTIAL: 76, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE CHANGED: 7, OPEN: 53, REFUTED IN AUDIT: 1.
+IMPLEMENTED: 59, PARTIAL: 76, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE CHANGED: 7, OPEN: 52, REFUTED IN AUDIT: 1.
 
 | Finding | Status | Evidence / remaining work | Original title |
 |---|---|---|---|
@@ -199,7 +199,7 @@ IMPLEMENTED: 58, PARTIAL: 76, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE C
 | ST-16 | OPEN | Not closed by this bundle. Requires dedicated implementation, protocol design, external operational evidence or product-owner integration; original finding remains tracked. | A queued funded validator whose deposit epoch is never finalized has no exit: `ExitV2` requires `activation_epoch <= epoch`, `Withdraw` requires an ex… |
 | TX-17 | IMPLEMENTED | Funded decoding retains wire/resource bounds but no longer invokes the economic shape judge. Bounded invalid semantics decode and then fail `validate_shape`; node admission and committed-state validation still judge every deposit. Full committee suite passes; see WAVE-18.md. | `FundedDeposit::decode` enforces consensus rules (`validate_shape`) inside the decoder, contrary to the stated decode/judge split |
 | TX-18 | IMPLEMENTED | Tag `0x04` retains its frozen eligibility byte, but transition validation now rejects caller-supplied `false` atomically and stores derived `true`. A regression pins codec compatibility and state ownership; full committee suite passes. See WAVE-19.md. | `Delegate.eligible` is a wire-supplied bit that consensus records verbatim |
-| TX-19 | OPEN | Not closed by this bundle. Requires dedicated implementation, protocol design, external operational evidence or product-owner integration; original finding remains tracked. | Spec/code drift in `BLOCH-L1-FEE-MARKET.md` and `BLOCH-TOKENOMICS-V4.md` |
+| TX-19 | IMPLEMENTED | Fee-market scope/caps/base-fee tag/inflation and terminal tokenomics totals/digests/shares now match shipped constants. Two executable spec guards reject the audited stale claims. See WAVE-20.md. | Spec/code drift in `BLOCH-L1-FEE-MARKET.md` and `BLOCH-TOKENOMICS-V4.md` |
 | TX-20 | OPEN | Not closed by this bundle. Requires dedicated implementation, protocol design, external operational evidence or product-owner integration; original finding remains tracked. | `interfaces.rs` `StateRoots` (14 fields, "closed again at eight components") vs `state_root.rs` (~25 tags) and the frozen `StateTransition::apply_bloc… |
 | TX-21 | OPEN | Not closed by this bundle. Requires dedicated implementation, protocol design, external operational evidence or product-owner integration; original finding remains tracked. | Two block-validation stacks (`derive::validate_block` vs `transition`) still coexist |
 | TX-22 | PARTIAL | New genesis/genesis-mainnet CLI creation rejects duplicate validator indices/public keys and inconsistent cohorts before output. Historical decoding and committed-state constructors remain compatible; arbitrary programmatic callers still require separate policy. | `CommittedState::genesis` silently overwrites duplicate validator indices / pubkeys from the manifest |
