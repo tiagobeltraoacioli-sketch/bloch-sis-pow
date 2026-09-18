@@ -544,6 +544,10 @@ const REDIAL_INTERVAL: Duration = Duration::from_secs(10);
 #[derive(Clone, Debug, Default)]
 pub struct Origin {
     inner: Option<(MessageId, PeerId)>,
+    /// The peer and advertised slot for a block awaiting the engine's
+    /// admission verdict. Unlike `inner`, this is also present for directed
+    /// sync responses, which have no gossipsub message id.
+    block_hint: Option<(PeerId, u64)>,
     reservation: Option<Arc<crate::net::SourceReservation>>,
 }
 
@@ -554,7 +558,20 @@ impl Origin {
 
     /// No provenance: devnet transport, or a message this node produced.
     pub fn none() -> Self {
-        Origin { inner: None, reservation: None }
+        Origin {
+            inner: None,
+            block_hint: None,
+            reservation: None,
+        }
+    }
+
+    /// A directed-sync block has peer provenance but no gossipsub message id.
+    fn sync_block(peer: PeerId, slot: u64) -> Self {
+        Origin {
+            inner: None,
+            block_hint: Some((peer, slot)),
+            reservation: None,
+        }
     }
 }
 
@@ -915,7 +932,7 @@ impl Handle {
     /// Report the engine's decision on a gossip message. A no-op for an
     /// [`Origin::none`].
     pub fn report(&self, origin: &Origin, verdict: Verdict) {
-        if origin.inner.is_some() {
+        if origin.inner.is_some() || origin.block_hint.is_some() {
             let _ = self.cmd.send(Command::Report(origin.clone(), verdict));
         }
     }
@@ -1075,8 +1092,9 @@ struct Loop {
     events: EngineSender<NetEvent>,
     data_dir: PathBuf,
     head_slot: Arc<AtomicU64>,
-    /// Unvalidated height hints from decoded envelopes; never proof that a
-    /// peer holds an acceptable chain. One sync slot ignores these claims.
+    /// Height hints from blocks the engine admitted. An admitted block is not
+    /// proof of canonical progress, so one sync slot still ignores these
+    /// claims and rotates across the connected set.
     peer_head: HashMap<PeerId, u64>,
     sync_rotation: usize,
     /// Blocks published or received within [`REGOSSIP_SUPPRESS_TTL`]. Pruned
@@ -1131,6 +1149,17 @@ struct Topics {
 }
 
 impl Loop {
+    /// Update the height preference only after the engine has admitted the
+    /// block. Decoding an envelope is deliberately insufficient: otherwise a
+    /// peer can steer two sync fanout slots with an arbitrary header slot.
+    fn note_block_verdict(&mut self, peer: PeerId, slot: u64, verdict: Verdict) {
+        if verdict != Verdict::Accept {
+            return;
+        }
+        let e = self.peer_head.entry(peer).or_insert(0);
+        *e = (*e).max(slot);
+    }
+
     fn note_block(&mut self, id: [u8; 32]) -> bool {
         let now = Instant::now();
         self.recent_blocks.retain(|_, t| now.duration_since(*t) < REGOSSIP_SUPPRESS_TTL);
@@ -1312,6 +1341,11 @@ fn peer_id_of(addr: &Multiaddr) -> Option<PeerId> {
 fn handle_command(swarm: &mut Swarm, st: &mut Loop, cmd: Command) {
     match cmd {
         Command::Report(origin, verdict) => {
+            if let Some((source, slot)) = origin.block_hint {
+                if swarm.is_connected(&source) {
+                    st.note_block_verdict(source, slot, verdict);
+                }
+            }
             if let Some((msg_id, source)) = origin.inner {
                 swarm
                     .behaviour_mut()
@@ -1554,12 +1588,15 @@ fn handle_swarm_event(
                         Ok(env) => {
                             let slot = env.header.slot;
                             highest = highest.max(slot);
-                            let e = st.peer_head.entry(peer).or_insert(0);
-                            *e = (*e).max(slot);
                             // Directed sync, not gossip: there is no message
-                            // id to report a verdict against, so `Origin::none`
-                            // and the engine's report is a no-op.
-                            if st.emit(NetEvent::Block(env, Origin::none()), peer) == Some(false) {
+                            // id to report a verdict against. It still carries
+                            // peer provenance so only an engine-admitted block
+                            // may update the sync height preference.
+                            if st.emit(
+                                NetEvent::Block(env, Origin::sync_block(peer, slot)),
+                                peer,
+                            ) == Some(false)
+                            {
                                 return false;
                             }
                         }
@@ -1637,10 +1674,12 @@ fn on_gossip(
                     format!("← block slot {} from {source}", env.header.slot)
                 });
                 let slot = env.header.slot;
-                let e = st.peer_head.entry(source).or_insert(0);
-                *e = (*e).max(slot);
                 st.note_block(*env.block_id().as_bytes());
-                let origin = Origin { inner: Some((message_id.clone(), source)), reservation: None };
+                let origin = Origin {
+                    inner: Some((message_id.clone(), source)),
+                    block_hint: Some((source, slot)),
+                    reservation: None,
+                };
                 return match st.emit(NetEvent::Block(env, origin), source) {
                     Some(alive) => alive,
                     None => { report(swarm, Verdict::Ignore); true }
@@ -1659,7 +1698,11 @@ fn on_gossip(
             Ok(att) => {
                 // No verdict yet. The engine decides through `gossip.rs` and
                 // calls `Handle::report`, which is what finally relays it.
-                let origin = Origin { inner: Some((message_id.clone(), source)), reservation: None };
+                let origin = Origin {
+                    inner: Some((message_id.clone(), source)),
+                    block_hint: None,
+                    reservation: None,
+                };
                 return match st.emit(NetEvent::Attestation(att, origin), source) {
                     Some(alive) => alive,
                     None => { report(swarm, Verdict::Ignore); true }
@@ -1675,7 +1718,11 @@ fn on_gossip(
             Ok(tx) => {
                 // Decode is not authorization. In particular, funded admission
                 // needs the engine's UTXO view before gossipsub may relay it.
-                let origin = Origin { inner: Some((message_id.clone(), source)), reservation: None };
+                let origin = Origin {
+                    inner: Some((message_id.clone(), source)),
+                    block_hint: None,
+                    reservation: None,
+                };
                 return match st.emit(NetEvent::Transaction(tx, origin), source) {
                     Some(alive) => alive,
                     None => { report(swarm, Verdict::Ignore); true }
@@ -2049,6 +2096,57 @@ mod tests {
                 txs: IdentTopic::new(TOPIC_TXS),
             },
             peers_live: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    #[test]
+    fn sync_height_hint_requires_engine_acceptance_and_is_monotonic() {
+        let mut state = test_loop();
+        let peer = PeerId::random();
+
+        state.note_block_verdict(peer, u64::MAX, Verdict::Ignore);
+        state.note_block_verdict(peer, u64::MAX, Verdict::Reject);
+        assert!(
+            !state.peer_head.contains_key(&peer),
+            "decoded or rejected headers must not steer sync selection",
+        );
+
+        state.note_block_verdict(peer, 41, Verdict::Accept);
+        assert_eq!(state.peer_head.get(&peer), Some(&41));
+        state.note_block_verdict(peer, 7, Verdict::Accept);
+        assert_eq!(
+            state.peer_head.get(&peer),
+            Some(&41),
+            "an older admitted block must not lower the peer's hint",
+        );
+        state.forget_peer(&peer);
+        assert!(
+            !state.peer_head.contains_key(&peer),
+            "disconnect must remove a judged height hint",
+        );
+    }
+
+    #[test]
+    fn directed_sync_origin_reports_every_engine_verdict() {
+        let (cmd, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = Handle {
+            cmd,
+            peer_id: PeerId::random(),
+            peers_live: Arc::new(AtomicUsize::new(0)),
+        };
+        let source = PeerId::random();
+        let origin = Origin::sync_block(source, 99);
+
+        for expected in [Verdict::Accept, Verdict::Ignore, Verdict::Reject] {
+            handle.report(&origin, expected);
+            match rx.try_recv().expect("directed-sync verdict was dropped") {
+                Command::Report(reported, actual) => {
+                    assert_eq!(actual, expected);
+                    assert_eq!(reported.block_hint, Some((source, 99)));
+                    assert!(reported.inner.is_none());
+                }
+                Command::Broadcast(_) => panic!("verdict became a broadcast"),
+            }
         }
     }
 
