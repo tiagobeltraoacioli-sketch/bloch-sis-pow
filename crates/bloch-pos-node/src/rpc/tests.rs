@@ -680,10 +680,7 @@ fn build_info_is_answered_before_the_engine_queue() {
     let info = backend
         .call(RpcRequest::BuildInfo)
         .expect("compiled build identity must not need the consensus thread");
-    assert_eq!(
-        info.get("source_digest").and_then(Json::as_str),
-        Some(env!("BLOCH_SOURCE_DIGEST"))
-    );
+    assert_eq!(info, build_info_json(), "local dispatch must use the canonical formatter");
 
     assert!(
         backend.call(RpcRequest::ChainInfo).is_err(),
