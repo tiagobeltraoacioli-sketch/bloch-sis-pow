@@ -250,6 +250,19 @@ fn parse_pubkey_envelope_or_legacy(b: &[u8]) -> (u16, &[u8]) {
     parse_envelope_or_legacy(b)
 }
 
+/// Whether a public-key encoding names the live hybrid suite.
+///
+/// This is a format/policy predicate, not a cryptographic verification: it
+/// accepts the exact legacy raw `ML-DSA-65 || Falcon-1024` key shape and the
+/// exact suite-0x0001 envelope shape.  In particular it refuses suite 0x0002
+/// even though [`verify`] deliberately retains support for that crypto-agility
+/// suite.  Admission callers use this distinction to keep new ML-DSA-only
+/// transfers out of the live network without changing historical consensus.
+pub fn is_hybrid_public_key(public_key_bytes: &[u8]) -> bool {
+    let (suite, body) = parse_pubkey_envelope_or_legacy(public_key_bytes);
+    suite == SUITE_MLDSA65_FALCON1024 && body.len() == legacy_hybrid_pubkey_len()
+}
+
 pub fn verify(public_key_bytes: &[u8], message: &[u8], signature_bytes: &[u8]) -> bool {
     // Suite-ID dispatch (design §2.3). Accepts enveloped objects AND legacy
     // pre-envelope (raw hybrid) objects from the carry-over. A pk of one suite
@@ -854,6 +867,25 @@ mod kat {
         let (old_suite, old_body) = parse_envelope_or_legacy(&raw_pk);
         assert_eq!(old_body.len(), len - SUITE_HEADER_LEN, "sanity: the naive heuristic strips a header here");
         assert_ne!(old_suite, suite, "sanity: the naive heuristic derives a bogus suite id from key bytes");
+    }
+
+    #[test]
+    fn hybrid_public_key_policy_distinguishes_live_and_crypto_agility_suites() {
+        let raw_hybrid = vec![0xabu8; legacy_hybrid_pubkey_len()];
+        let enveloped_hybrid = wrap_envelope(SUITE_MLDSA65_FALCON1024, &raw_hybrid);
+        let mldsa_only = wrap_envelope(SUITE_MLDSA65_ONLY, &vec![0xcdu8; MLDSA_PUBKEY_LEN]);
+
+        assert!(is_hybrid_public_key(&raw_hybrid));
+        assert!(is_hybrid_public_key(&enveloped_hybrid));
+        assert!(!is_hybrid_public_key(&mldsa_only));
+        assert!(!is_hybrid_public_key(&enveloped_hybrid[..enveloped_hybrid.len() - 1]));
+
+        // The exact legacy length wins over coincidental magic, just as it
+        // does in verification; old funds are not stranded by this policy.
+        let mut magic_collision = raw_hybrid;
+        magic_collision[..2].copy_from_slice(&SUITE_MAGIC);
+        magic_collision[2..4].copy_from_slice(&SUITE_MLDSA65_ONLY.to_le_bytes());
+        assert!(is_hybrid_public_key(&magic_collision));
     }
 
     // ─── (A) Reference-equivalence: Bloch-built halves parse as upstream prims ─

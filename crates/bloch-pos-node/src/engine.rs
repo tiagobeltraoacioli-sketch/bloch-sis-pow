@@ -5890,6 +5890,23 @@ fn admissible_with_verifier(tx: &PosTransaction, wall_epoch: u64, verifier: &dyn
             if outputs.is_empty() {
                 return Err("transfer has no outputs — it pays no one and cannot apply");
             }
+            // CR-03 — NODE-LOCAL POLICY, live ungated. `crypto::verify`
+            // intentionally knows suite 0x0002 for crypto-agility, but this
+            // chain promises hybrid ML-DSA-65 || Falcon-1024 authorisation.
+            // Refuse NEW non-hybrid spends before they enter the mempool.
+            // Consensus remains unchanged because an already-created 0x0002
+            // output cannot safely be declared nonexistent without a state
+            // inventory and a flag day. The shared classifier also preserves
+            // exact-length legacy raw hybrid keys, including magic collisions.
+            if inputs
+                .iter()
+                .any(|i| !bloch_crypto::crypto::is_hybrid_public_key(&i.pubkey))
+            {
+                return Err(
+                    "transfer uses a non-hybrid public-key suite — live spends require \
+                     ML-DSA-65 and Falcon-1024",
+                );
+            }
             // H-R7-3, the mempool half — NODE-LOCAL POLICY, live ungated.
             // Every output is a permanent ~76-byte `EutxoEntry` on every
             // node, priced only by the one-time fee on its bytes (~6.4 sat
@@ -6036,6 +6053,18 @@ fn admissible_with_verifier(tx: &PosTransaction, wall_epoch: u64, verifier: &dyn
             if keys.is_empty() {
                 return Err(
                     "deduplicated transfer carries no witness keys — nothing authorises it",
+                );
+            }
+            // Same CR-03 admission policy as V1, once per witness-table key.
+            // Keep it before pricing/table walks and, crucially, before any
+            // expensive signature verification.
+            if keys
+                .iter()
+                .any(|k| !bloch_crypto::crypto::is_hybrid_public_key(&k.pubkey))
+            {
+                return Err(
+                    "transfer uses a non-hybrid public-key suite — live spends require \
+                     ML-DSA-65 and Falcon-1024",
                 );
             }
             // The two price bounds, on the V2 class term (one verification
@@ -7168,6 +7197,44 @@ mod admission_authorisation {
             keys[0].signature = sig;
         }
         tx
+    }
+
+    /// CR-03: suite 0x0002 remains a supported crypto-agility primitive, but
+    /// it is not a live transfer suite. Both wire formats must refuse it at
+    /// admission, before an attacker earns even one signature verification.
+    #[test]
+    fn non_hybrid_transfer_keys_are_refused_before_signature_verification() {
+        struct MustNotVerify;
+        impl bloch_pos_committee::attestation::SignatureVerifier for MustNotVerify {
+            fn verify_with_key(&self, _: &[u8], _: &[u8; 32], _: &[u8]) -> bool {
+                panic!("suite policy must run before signature verification")
+            }
+        }
+
+        let mut v1 = signed_transfer().0;
+        if let PosTransaction::Transfer { inputs, .. } = &mut v1 {
+            assert_eq!(&inputs[0].pubkey[..2], &[0xb1, 0x0c]);
+            inputs[0].pubkey[2..4]
+                .copy_from_slice(&bloch_crypto::crypto::SUITE_MLDSA65_ONLY.to_le_bytes());
+        }
+        let err = admissible_with_verifier(&v1, 0, &MustNotVerify)
+            .expect_err("suite 0x0002 must not enter the V1 mempool");
+        assert!(err.contains("non-hybrid"), "wrong refusal: {err}");
+
+        let mut v2 = signed_transfer_v2(2);
+        if let PosTransaction::TransferV2 { keys, .. } = &mut v2 {
+            assert_eq!(&keys[0].pubkey[..2], &[0xb1, 0x0c]);
+            keys[0].pubkey[2..4]
+                .copy_from_slice(&bloch_crypto::crypto::SUITE_MLDSA65_ONLY.to_le_bytes());
+        }
+        let err = admissible_with_verifier(&v2, V2_FLAG_DAY, &MustNotVerify)
+            .expect_err("suite 0x0002 must not enter the V2 mempool");
+        assert!(err.contains("non-hybrid"), "wrong refusal: {err}");
+
+        // Controls: the untouched hybrid fixtures still traverse the real
+        // verifier successfully in both encodings.
+        assert!(admissible(&signed_transfer().0, 0).is_ok());
+        assert!(admissible(&signed_transfer_v2(2), V2_FLAG_DAY).is_ok());
     }
 
     /// The flag day itself, with the unit pinned: both epochs are DERIVED
