@@ -228,14 +228,16 @@ struct VaultParamsReq {
 
 impl VaultParamsReq {
     fn to_params(&self, network: Network) -> Result<VaultParams, ApiError> {
-        if self.csv_delay < 144 { return Err(ApiError::bad("csv_delay must be at least 144 blocks")); }
-        Ok(VaultParams {
+        if self.csv_delay < MIN_NEW_VAULT_CSV_DELAY { return Err(ApiError::bad("csv_delay must be at least 144 blocks")); }
+        let params = VaultParams {
             hot_pubkey: parse_pubkey("hot_pubkey", &self.hot_pubkey)?,
             recovery_pubkey: parse_pubkey("recovery_pubkey", &self.recovery_pubkey)?,
             recovery_hash: parse_hash32("recovery_hash", &self.recovery_hash)?,
             csv_delay: self.csv_delay,
             network,
-        })
+        };
+        validate_new_vault_params(&params).map_err(|error| ApiError::bad(error.to_string()))?;
+        Ok(params)
     }
 }
 
@@ -413,6 +415,7 @@ async fn vault_address(body: Bytes) -> Result<Json<Value>, ApiError> {
         csv_delay: req.csv_delay,
         network,
     };
+    validate_new_vault_params(&p).map_err(|error| ApiError::bad(error.to_string()))?;
 
     let dep_script = deposit_script(&p.recovery_hash, &p.hot_pubkey);
     let dep_addr = deposit_address(&p);
@@ -447,20 +450,6 @@ async fn vault_address(body: Bytes) -> Result<Json<Value>, ApiError> {
     })))
 }
 
-/// Conservative API construction limits, not Bitcoin consensus rules. Fee
-/// estimation and emergency fee ladders remain the signing client's responsibility.
-fn check_payment(amount: u64, fee: u64, script: &bitcoin::Script) -> Result<(), ApiError> {
-    const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
-    let output = amount.checked_sub(fee).ok_or_else(|| ApiError::bad("fee exceeds input amount"))?;
-    if amount > MAX_MONEY || output < script.minimal_non_dust().to_sat() {
-        return Err(ApiError::bad("input exceeds MAX_MONEY or output is dust"));
-    }
-    if fee > amount / 10 {
-        return Err(ApiError::bad("fee exceeds the API's 10% input-value safety limit"));
-    }
-    Ok(())
-}
-
 /// POST /vault/unvault-tx — the DEPOSIT→TRIGGER unsigned tx + the hot-key sighash.
 async fn unvault_tx(body: Bytes) -> Result<Json<Value>, ApiError> {
     let req: UnvaultReq = parse_guarded(&body)?;
@@ -468,13 +457,11 @@ async fn unvault_tx(body: Bytes) -> Result<Json<Value>, ApiError> {
     let p = req.vault.to_params(network)?;
     let deposit_op = req.deposit_outpoint.to_outpoint("deposit_outpoint")?;
 
-    if req.fee_sat >= req.deposit_amount_sat {
-        return Err(ApiError::bad("fee_sat >= deposit_amount_sat would create a dust/zero output"));
-    }
-    check_payment(req.deposit_amount_sat, req.fee_sat, &trigger_address(&p).script_pubkey())?;
-    let u = build_unvault_tx(&p, deposit_op, req.deposit_amount_sat, req.fee_sat);
+    let u = build_unvault_tx_checked(&p, deposit_op, req.deposit_amount_sat, req.fee_sat)
+        .map_err(|error| ApiError::bad(error.to_string()))?;
     let dep_script = deposit_script(&p.recovery_hash, &p.hot_pubkey);
-    let sighash = p2wsh_sighash(&u, 0, &dep_script, req.deposit_amount_sat);
+    let sighash = p2wsh_sighash_checked(&u, 0, &dep_script, req.deposit_amount_sat)
+        .map_err(|error| ApiError::bad(error.to_string()))?;
     let trig_addr = trigger_address(&p);
 
     Ok(Json(json!({
@@ -506,14 +493,11 @@ async fn branch_a_tx(body: Bytes) -> Result<Json<Value>, ApiError> {
     let trigger_op = req.trigger_outpoint.to_outpoint("trigger_outpoint")?;
     let dest = vaultlib::validate_destination(req.destination.trim(), network)
         .map_err(|_| ApiError::bad("invalid destination address"))?;
-    if req.fee_sat >= req.trigger_amount_sat {
-        return Err(ApiError::bad("fee_sat >= trigger_amount_sat would create a dust/zero output"));
-    }
-
-    check_payment(req.trigger_amount_sat, req.fee_sat, &dest.script_pubkey())?;
-    let a = build_branch_a_tx(&p, trigger_op, req.trigger_amount_sat, &dest, req.fee_sat);
+    let a = build_branch_a_tx_checked(&p, trigger_op, req.trigger_amount_sat, &dest, req.fee_sat)
+        .map_err(|error| ApiError::bad(error.to_string()))?;
     let trig_script = trigger_script(&p);
-    let sighash = p2wsh_sighash(&a, 0, &trig_script, req.trigger_amount_sat);
+    let sighash = p2wsh_sighash_checked(&a, 0, &trig_script, req.trigger_amount_sat)
+        .map_err(|error| ApiError::bad(error.to_string()))?;
 
     Ok(Json(json!({
         "unsigned_tx_hex": tx_hex(&a),
@@ -545,14 +529,11 @@ async fn clawback_tx(body: Bytes) -> Result<Json<Value>, ApiError> {
     let trigger_op = req.trigger_outpoint.to_outpoint("trigger_outpoint")?;
     let safe = vaultlib::validate_destination(req.safe_destination.trim(), network)
         .map_err(|_| ApiError::bad("invalid safe_destination address"))?;
-    if req.fee_sat >= req.trigger_amount_sat {
-        return Err(ApiError::bad("fee_sat >= trigger_amount_sat would create a dust/zero output"));
-    }
-
-    check_payment(req.trigger_amount_sat, req.fee_sat, &safe.script_pubkey())?;
-    let claw = build_clawback_tx(trigger_op, req.trigger_amount_sat, &safe, req.fee_sat);
+    let claw = build_clawback_tx_checked(trigger_op, req.trigger_amount_sat, &safe, req.fee_sat)
+        .map_err(|error| ApiError::bad(error.to_string()))?;
     let trig_script = trigger_script(&p);
-    let sighash = p2wsh_sighash(&claw, 0, &trig_script, req.trigger_amount_sat);
+    let sighash = p2wsh_sighash_checked(&claw, 0, &trig_script, req.trigger_amount_sat)
+        .map_err(|error| ApiError::bad(error.to_string()))?;
 
     Ok(Json(json!({
         "unsigned_tx_hex": tx_hex(&claw),
@@ -1161,17 +1142,30 @@ mod audit_edge_regressions {
     }
 
     #[test]
-    fn nested_delay_and_payment_policy_cannot_be_bypassed() {
+    fn nested_delay_cannot_be_bypassed() {
         let params = VaultParamsReq { hot_pubkey: String::new(), recovery_pubkey: String::new(),
             recovery_hash: String::new(), csv_delay: 0 };
         assert!(params.to_params(Network::Regtest).err().unwrap().message.contains("144"));
-        let script = bitcoin::Address::p2wsh(&bitcoin::ScriptBuf::new(), Network::Regtest).script_pubkey();
-        let dust = script.minimal_non_dust().to_sat();
-        assert!(check_payment(dust - 1, 0, &script).is_err());
-        assert!(check_payment(dust, 0, &script).is_ok());
-        assert!(check_payment(100_000, 10_001, &script).is_err());
-        assert!(check_payment(u64::MAX, 0, &script).is_err());
-        assert!(check_payment(100_000, 500, &script).is_ok());
+    }
+
+    #[tokio::test]
+    async fn unvault_route_uses_checked_builder_for_hostile_values() {
+        let keys = vaultlib::derive_vault_keys(&[7; 32], false);
+        let request = |txid: &str, vout: u32, amount: u64, fee: u64| json!({
+            "network": "regtest",
+            "vault": { "hot_pubkey": keys.hot_pubkey.to_string(),
+                "recovery_pubkey": keys.recovery_pubkey.to_string(),
+                "recovery_hash": hex::encode([8; 32]), "csv_delay": 144u16 },
+            "deposit_outpoint": { "txid": txid, "vout": vout },
+            "deposit_amount_sat": amount, "fee_sat": fee,
+        });
+        let valid = "0000000000000000000000000000000000000000000000000000000000000001";
+        let null = "0000000000000000000000000000000000000000000000000000000000000000";
+        assert!(unvault_tx(bytes(request(null, u32::MAX, 100_000, 500))).await.is_err());
+        assert!(unvault_tx(bytes(request(valid, 0, 1, 0))).await.is_err());
+        assert!(unvault_tx(bytes(request(valid, 0, 100_000, 10_001))).await.is_err());
+        assert!(unvault_tx(bytes(request(valid, 0, BITCOIN_MAX_MONEY_SAT + 1, 0))).await.is_err());
+        assert!(unvault_tx(bytes(request(valid, 0, 100_000, 500))).await.is_ok());
     }
 
     #[tokio::test]
