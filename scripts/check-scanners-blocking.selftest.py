@@ -107,6 +107,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   clippy-hardened:
     runs-on: ubuntu-latest
@@ -324,6 +327,18 @@ CASES = [
          GOOD_GITLAB,
          GOOD_GITHUB.replace("  pull_request:\n", "  pull_request_target:\n"),
          must_fail=True, expect="privileged `pull_request_target:`"),
+
+    Case("GitHub token write permission is refused",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace("  contents: read", "  contents: write"),
+         must_fail=True, expect="write-capable or unsupported"),
+
+    Case("required job cannot override token permissions",
+         GOOD_GITLAB,
+         sub(GOOD_GITHUB,
+             "  cargo-audit:\n    runs-on: ubuntu-latest",
+             "  cargo-audit:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: write"),
+         must_fail=True, expect="job-level permissions override"),
 
     Case("or-true masks a scanner verdict",
          GOOD_GITLAB.replace("cargo audit --deny warnings", "cargo audit --deny warnings || true"),

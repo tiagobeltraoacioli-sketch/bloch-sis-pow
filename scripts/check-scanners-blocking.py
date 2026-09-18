@@ -42,6 +42,8 @@ security job, fails if the job:
     `workflow:` / `include:` content this local guard does not inspect.
   * removes the GitHub `push` or `pull_request` trigger, or substitutes the
     privileged `pull_request_target` event.
+  * removes the explicit read-only GitHub token posture or adds a job-level
+    permission override to a required scanner.
 
 It does NOT require every job to be blocking. cargo-geiger, miri and the fuzz
 smoke are deliberately report-only, with written reasons, and stay green here.
@@ -147,7 +149,8 @@ def check_file(path: str, required: dict[str, str], indent: int, label: str) -> 
                     "%s: top-level `%s:` moves pipeline semantics outside the "
                     "locally inspectable blocking subset" % (label, key))
     if label == ".github/workflows/security.yml":
-        trigger_lines = job_blocks(text, 0).get("on")
+        top_level = job_blocks(text, 0)
+        trigger_lines = top_level.get("on")
         if trigger_lines is None:
             problems.append(
                 "%s: top-level `on:` trigger block is missing or not in the "
@@ -167,6 +170,27 @@ def check_file(path: str, required: dict[str, str], indent: int, label: str) -> 
                 problems.append(
                     "%s: privileged `pull_request_target:` is outside the "
                     "supported security-workflow trigger subset" % label)
+        permission_lines = top_level.get("permissions")
+        if permission_lines is None:
+            problems.append(
+                "%s: explicit top-level read-only `permissions:` block is missing"
+                % label)
+        else:
+            permissions = {}
+            for line in permission_lines:
+                match = re.match(
+                    r"^  ([A-Za-z0-9_-]+):\s*([^\s#]+)", line)
+                if match:
+                    permissions[match.group(1)] = match.group(2).strip("\"'").lower()
+            if permissions.get("contents") != "read":
+                problems.append(
+                    "%s: top-level `permissions:` must explicitly set `contents: read`"
+                    % label)
+            for scope, access in sorted(permissions.items()):
+                if access not in {"read", "none"}:
+                    problems.append(
+                        "%s: top-level permission `%s: %s` is write-capable or unsupported"
+                        % (label, scope, access))
     for job, why in sorted(required.items()):
         if job not in blocks:
             problems.append(
@@ -198,6 +222,13 @@ def check_file(path: str, required: dict[str, str], indent: int, label: str) -> 
                     "the supported blocking subset requires locally inspectable values"
                     % (label, job, why))
             line_indent = len(line) - len(line.lstrip(" "))
+            if (label == ".github/workflows/security.yml"
+                    and line_indent == indent + 2
+                    and re.match(r"^permissions:", value)):
+                problems.append(
+                    "%s: job `%s` (%s) has a job-level permissions override; "
+                    "required scanners must inherit the checked read-only posture"
+                    % (label, job, why))
             if (label == ".github/workflows/security.yml"
                     and line_indent == indent + 2
                     and re.match(r"^uses:", value)):
