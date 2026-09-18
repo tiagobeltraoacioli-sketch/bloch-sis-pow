@@ -668,6 +668,29 @@ fn a_backend_without_a_head_still_routes_balance_to_the_loop() {
     assert!(backend.call(RpcRequest::Balance([0xAB; 32])).is_err());
 }
 
+/// Process identity is compiled into the RPC module. It must remain available
+/// without a published head or a listening consensus thread, while a genuine
+/// engine read still fails in that setup. This pins both sides of the split.
+#[test]
+fn build_info_is_answered_before_the_engine_queue() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    drop(rx);
+    let backend = EngineBackend::new(tx);
+
+    let info = backend
+        .call(RpcRequest::BuildInfo)
+        .expect("compiled build identity must not need the consensus thread");
+    assert_eq!(
+        info.get("source_digest").and_then(Json::as_str),
+        Some(env!("BLOCH_SOURCE_DIGEST"))
+    );
+
+    assert!(
+        backend.call(RpcRequest::ChainInfo).is_err(),
+        "chain-owned reads must still cross the unavailable engine queue"
+    );
+}
+
 #[test]
 fn getmempoolinfo_reports_size_capacity_and_the_next_price() {
     let v = mempool_info_json(7, 4_096, 1_750, 1_000, 12, 34, 9, 3);

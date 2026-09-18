@@ -914,8 +914,8 @@ pub struct RpcCall {
 }
 
 /// The production backend: hand the request to the engine's event loop and wait
-/// — except for state-only reads, which are answered from the published
-/// head (see [`Self::from_head`]).
+/// — except for process-local and state-only reads, which are answered before
+/// the queue (see [`Self::locally`] and [`Self::from_head`]).
 ///
 /// Nearly everything goes through the consensus thread rather than through a
 /// shared snapshot of state, and that is a deliberate cost. The engine's whole
@@ -959,6 +959,21 @@ impl EngineBackend {
         head: crate::engine::SharedHead,
     ) -> Self {
         EngineBackend { engine: Mutex::new(engine), head: Some(head), pending: Arc::default() }
+    }
+
+    /// Answer requests whose complete input is compiled into this process.
+    ///
+    /// `getbuildinfo` does not observe the chain, mempool or engine at all.
+    /// Routing it through the consensus thread let a caller consume the same
+    /// bounded queue permits as real engine work and made a static response
+    /// wait behind block processing. Keeping this dispatch separate from
+    /// [`Self::from_head`] is intentional: it works even for a backend without
+    /// a published chain-state handle and cannot acquire that handle's lock.
+    fn locally(req: &RpcRequest) -> Option<RpcResult> {
+        match req {
+            RpcRequest::BuildInfo => Some(Ok(build_info_json())),
+            _ => None,
+        }
     }
 
     /// Answer `req` from the published head, or `None` if it is not one of the
@@ -1034,6 +1049,9 @@ impl EngineBackend {
 
 impl RpcBackend for EngineBackend {
     fn call(&self, req: RpcRequest) -> RpcResult {
+        if let Some(answered) = Self::locally(&req) {
+            return answered;
+        }
         if let Some(answered) = self.from_head(&req) {
             return answered;
         }
