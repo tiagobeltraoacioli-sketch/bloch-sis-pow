@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Regression for INF-10: a published bootnode may expose P2P, never raw RPC.
+set -euo pipefail
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/bootnode-verifier-selftest.XXXXXX")
+trap 'rm -rf "$WORK"' EXIT
+
+cp "$HERE/verify-bootnodes.sh" "$WORK/verify-bootnodes.sh"
+printf '192.0.2.10:19100\n' > "$WORK/bootnodes.txt"
+mkdir "$WORK/bin"
+
+# The verifier first probes a closed loopback port to select the macOS/Linux
+# netcat spelling. Thereafter the fake exposes only P2P, plus the RPC port named
+# by FAKE_OPEN_RPC for the negative case.
+cat > "$WORK/bin/nc" <<'SHIM'
+#!/usr/bin/env bash
+host="${@: -2:1}"
+port="${@: -1}"
+if [ "$host" = 127.0.0.1 ] && [ "$port" = 1 ]; then
+  exit 1
+fi
+if [ "$port" = 19100 ]; then
+  exit 0
+fi
+if [ -n "${FAKE_OPEN_RPC:-}" ] && [ "$port" = "$FAKE_OPEN_RPC" ]; then
+  exit 0
+fi
+exit 1
+SHIM
+chmod 0755 "$WORK/bin/nc"
+
+closed=$(cd "$WORK" && PATH="$WORK/bin:$PATH" bash ./verify-bootnodes.sh 2>&1)
+printf '%s' "$closed" | grep -q 'public RPC     : closed (8080, 16310, 16400)'
+printf '%s' "$closed" | grep -q 'PASS — every published entry is reachable and sound.'
+
+set +e
+opened=$(cd "$WORK" && FAKE_OPEN_RPC=8080 PATH="$WORK/bin:$PATH" \
+  bash ./verify-bootnodes.sh 2>&1)
+rc=$?
+set -e
+[ "$rc" -ne 0 ]
+printf '%s' "$opened" | grep -q 'public RPC     : OPEN on 8080'
+printf '%s' "$opened" | grep -q 'FAIL — fix or unpublish'
+
+echo "verify-bootnodes selftest: PASS — closed RPC passes; exposed :8080 fails"

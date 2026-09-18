@@ -52,6 +52,7 @@ else
 fi
 
 echo "Checking $COUNT published entries from $LIST"
+echo "Public RPC refusal: ports 8080, 16310 and 16400 must be CLOSED on every entry"
 if [ $DEEP -eq 1 ]; then
   echo "NOTE: --deep facts (keyless/transport/chain state below) are SELF-REPORTED"
   echo "  by each host over its own ssh session. This script does not independently"
@@ -82,6 +83,26 @@ for e in $ENTRIES; do
   else
     echo "   reachable      : NO (3 attempts)  <-- a stranger cannot peer here"
     FAIL=1; continue
+  fi
+
+  # INF-10 / NET-01: these observers are public P2P entry points, not public
+  # raw-RPC endpoints. The fleet incident exposed the full unauthenticated
+  # method set (including sendrawtransaction) through :8080 even though the
+  # unit claimed a loopback bind. Check from OUTSIDE the host: inspecting the
+  # unit over SSH proves configuration intent, not the firewall/NAT/proxy path
+  # an attacker reaches. 16310 is the compiled RPC default; 16400 is the
+  # historical/custom fleet RPC port used by the deep check below.
+  RPC_OPEN=""
+  for rpc_port in 8080 16310 16400; do
+    if probe "$HOST" "$rpc_port"; then
+      RPC_OPEN="$RPC_OPEN $rpc_port"
+    fi
+  done
+  if [ -n "$RPC_OPEN" ]; then
+    echo "   public RPC     : OPEN on$RPC_OPEN  <-- REMOVE EXPOSURE BEFORE PUBLISHING"
+    FAIL=1
+  else
+    echo "   public RPC     : closed (8080, 16310, 16400)"
   fi
 
   [ $DEEP -eq 0 ] && continue

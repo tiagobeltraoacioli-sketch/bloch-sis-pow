@@ -88,6 +88,8 @@ jobs:
         run: python3 scripts/rehearse-validator-admission.py
       - name: Validator withdrawal guard mutations
         run: python3 scripts/check-validator-lifecycle-mutations.py
+      - name: Public bootnode RPC refusal regression
+        run: bash deploy/bootnodes/verify-bootnodes.selftest.sh
       - name: Finite validator activation boundary and replay
         run: python3 scripts/rehearse-validator-activation.py --output "$RUNNER_TEMP/validator-activation"
       - name: Funded validator joining between independent processes
