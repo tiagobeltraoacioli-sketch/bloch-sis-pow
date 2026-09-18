@@ -714,6 +714,11 @@ fn replay(manifest: Manifest, dir: &Path, chain: &[BlockEnvelope]) -> Vec<Sample
         assert!(engine.ingest_replay(env.clone()), "generated canonical frame must replay");
         let total = t.elapsed();
         let counters = perf::take();
+        assert_eq!(
+            counters[perf::Phase::ForkChoice as usize].1,
+            0,
+            "boot replay must not invoke fork choice"
+        );
         let mut phases = [Duration::ZERO; perf::N_PHASES];
         for (i, (d, _)) in counters.iter().enumerate() {
             phases[i] = *d;

@@ -2464,15 +2464,10 @@ impl Engine {
         // is the CONSENSUS ceiling on the same walk and applies to every
         // source.
         //
-        // Both exemptions are carried by `src` and by nothing else. In
-        // particular replay does NOT lean on `self.live`: replay happens to
-        // run before `live` is set (`run`, after the replay loop), so the
-        // tolerance below is skipped for it too — but that is an ordering
-        // coincidence, not the rule, and it never covered THIS check at all.
-        // Boot replay routes through `ingest` -> `ingest_judged`, which used
-        // to hand it `Source::Gossip`, so a replayed block was subject to this
-        // horizon and only the wall clock's usual agreement with the log kept
-        // that from mattering.
+        // Both live-admission exemptions are carried by `src` and by nothing
+        // else. Boot replay does not lean on `self.live`: its dedicated
+        // canonical-extension path never enters this gossip/local admission
+        // function, so a skewed wall clock cannot reject durable history.
         //
         // It is also not shadowed by the much tighter `FUTURE_SLOT_TOLERANCE`
         // below, which is skipped entirely while `!self.live` — during boot
@@ -11784,17 +11779,30 @@ mod ingest_admission_tests {
         engine.canonical = BTreeSet::from([*genesis.as_bytes()]);
         engine.recent_states.clear();
         engine.finalized_latch = None;
+        engine.head_slot.store(0, Ordering::Relaxed);
         engine.live = false;
 
         assert!(!engine.ingest_replay(second.clone()), "a log gap must stop replay");
         assert_eq!(engine.state.head(), genesis, "a refused frame must not move state");
         assert!(engine.blocks.is_empty(), "a refused frame must not become fork-choice input");
+        assert_eq!(engine.chain.len(), 1);
+        assert_eq!(engine.canonical, BTreeSet::from([*genesis.as_bytes()]));
+        assert!(engine.recent_states.is_empty());
+        assert_eq!(engine.head_slot.load(Ordering::Relaxed), 0);
+        assert!(engine.finalized_latch.is_none());
+        assert!(engine.tx_slot_index.is_empty());
 
         let mut forged = first.clone();
         forged.proposer_sig[0] ^= 1;
         assert!(!engine.ingest_replay(forged), "direct replay must retain full signature verification");
         assert_eq!(engine.state.head(), genesis);
         assert!(engine.blocks.is_empty());
+        assert_eq!(engine.chain.len(), 1);
+        assert_eq!(engine.canonical, BTreeSet::from([*genesis.as_bytes()]));
+        assert!(engine.recent_states.is_empty());
+        assert_eq!(engine.head_slot.load(Ordering::Relaxed), 0);
+        assert!(engine.finalized_latch.is_none());
+        assert!(engine.tx_slot_index.is_empty());
 
         assert!(engine.ingest_replay(first));
         assert!(engine.ingest_replay(second));

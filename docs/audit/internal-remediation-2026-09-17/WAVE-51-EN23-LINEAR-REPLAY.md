@@ -30,8 +30,9 @@ bounded recent authenticated-proposal window after transition verification, so
 live equivocation observation after boot retains its prior local context.
 
 The ignored end-to-end replay benchmark now calls the same `ingest_replay`
-entry point as production boot. Its fork-choice timing column is explicitly a
-zero-cost regression signal rather than a component of expected replay work.
+entry point as production boot and asserts that the fork-choice entry counter
+stays zero for every frame. Its timing column is a regression signal rather
+than a production SLA or a proof that every remaining data structure is O(1).
 
 ## Compatibility and boundary
 
@@ -56,7 +57,8 @@ Ledger status and aggregate counts remain unchanged.
 - `cargo test -p bloch-pos-node --bin bloch-pos local_cache::tests --offline --
   --nocapture`: 6 passed.
 - The new regression proves out-of-order frames and a forged proposer
-  signature fail without moving state or entering the block map, then proves
-  the same two valid frames replay to the expected head in order.
+  signature fail without moving state, chain, canonical/recent indexes,
+  head-slot/finality latches, transaction index or block map, then proves the
+  same two valid frames replay to the expected head in order.
 - Both fixture groups required loopback socket permission outside the sandbox;
   the initial sandbox refusal was `PermissionDenied`, not a test failure.
