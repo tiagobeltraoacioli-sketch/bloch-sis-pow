@@ -4,7 +4,7 @@ Audited source: `562e220`. Remediation base: `b066e3c`. Branch: `fix/internal-au
 
 All 200 findings are retained, including duplicates. IMPLEMENTED means code changed in this branch, not deployed, externally audited, or universally resolved on the live fleet. PARTIAL is not closure. No production binary was published.
 
-IMPLEMENTED: 65, PARTIAL: 79, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE CHANGED: 7, OPEN: 42, REFUTED IN AUDIT: 1, VERIFIED POSITIVE: 1.
+IMPLEMENTED: 66, PARTIAL: 79, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE CHANGED: 7, OPEN: 41, REFUTED IN AUDIT: 1, VERIFIED POSITIVE: 1.
 
 | Finding | Status | Evidence / remaining work | Original title |
 |---|---|---|---|
@@ -182,7 +182,7 @@ IMPLEMENTED: 65, PARTIAL: 79, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE C
 | LG-09 | PARTIAL | New authorized pool sessions use canonical parsed address spelling; proof-to-accounting regression joins case aliases. Historical journals/credits remain unchanged and need reconciliation before manual payouts. | Pool: shares and ledger keyed by the raw `mining.authorize` username, not the parsed address |
 | LG-10 | IMPLEMENTED | Terminal snapshot figures and deterministic 57-satoshi recipient are re-derived by an executable artifact test; the historical zero-value anchor is documented/tested; source and integration prose use the terminal vintage; the exporter reads the real selected-height index with an endianness regression. See WAVE-17.md. | Documentation drift on the ledger-critical code (dust recipient, snapshot vintage, zero-value rows, dead "tip height" print) |
 | LG-11 | OPEN | Not closed by this bundle. Requires dedicated implementation, protocol design, external operational evidence or product-owner integration; original finding remains tracked. | Pool/pool-proxy: advisor findings verified closed; residual notes for a redeploy |
-| LG-12 | OPEN | Not closed by this bundle. Requires dedicated implementation, protocol design, external operational evidence or product-owner integration; original finding remains tracked. | euvm / ffg reachability from the live node |
+| LG-12 | IMPLEMENTED | A fail-closed Cargo-graph guard proves the live `bloch-pos-node` package has no direct or transitive reachability to the retired `bloch`, `bloch-euvm` or `bloch-ffg` crates. Direct/transitive adversarial fixtures and a missing-root case prove the guard can fail; both blocking pipelines run it. See WAVE-31.md. | euvm / ffg reachability from the live node |
 | LG-13 | PARTIAL | SP1 service preserves fixed-int proof encoding, rejects trailing/oversized proofs, authenticates before JSON and retains native worker permits after request timeout. Actual SDK unit build11tests passed; real guest/proof, spike/fuzz and funded authorization qualification remain open. | coherence-prover / SP1, spikes, fuzz |
 | NET-21 | OPEN | Not closed by this bundle. Requires dedicated implementation, protocol design, external operational evidence or product-owner integration; original finding remains tracked. | Information exposure by design (Info) |
 | NET-22 | OPEN | Not closed by this bundle. Requires dedicated implementation, protocol design, external operational evidence or product-owner integration; original finding remains tracked. | Minor code-level notes (Info) |
