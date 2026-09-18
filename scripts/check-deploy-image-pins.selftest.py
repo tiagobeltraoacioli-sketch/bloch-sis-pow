@@ -203,6 +203,9 @@ def case_yaml_inheritance_fails_closed() -> str | None:
         "merge key": "services:\n  node:\n    <<: *base\n",
         "quoted merge key": 'services:\n  node:\n    "<<": *base\n',
         "flow alias": "services: { node: *base }\n",
+        "quoted hash before anchor": 'x-base: { note: "x#y", holder: &base { image: bloch:latest } }\n',
+        "quoted hash before alias": 'services: { note: "x#y", node: *base }\n',
+        "flow literal merge": "services: { node: { <<: { image: bloch:latest } } }\n",
     }
     for name, content in cases.items():
         with tempfile.TemporaryDirectory() as tmp:
@@ -212,6 +215,21 @@ def case_yaml_inheritance_fails_closed() -> str | None:
                 return "YAML inheritance bypass accepted: %s\n%s" % (name, content)
             if "unsupported YAML inheritance" not in r.stdout:
                 return "inheritance refusal did not name its reason: %s\n%s" % (name, r.stdout)
+
+    accepted = {
+        "quoted alias text": PINNED_COMPOSE + 'x-note: "use *base here and x#y"\n',
+        "single quoted alias text": PINNED_COMPOSE + "x-note: 'use *base and x#y'\n",
+        "block scalar alias text": PINNED_COMPOSE + "x-script: |\n  cp *base /tmp/output\n  echo x#y\n",
+        "folded scalar anchor text": PINNED_COMPOSE + "x-script: >-\n  echo &base is documentation\n",
+    }
+    for name, content in accepted.items():
+        with tempfile.TemporaryDirectory() as tmp:
+            write_deploy(tmp, "literal.yml", content)
+            r = run_checker(tmp)
+            if r.returncode != 0:
+                return "ordinary quoted/block text was refused: %s\n%s%s" % (
+                    name, r.stdout, r.stderr
+                )
     return None
 
 
