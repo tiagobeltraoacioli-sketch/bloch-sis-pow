@@ -62,6 +62,13 @@ Wave 50 adds a [strict BV-10 public recovery context](WAVE-50-BV10.md) that
 records the vault key family, network, vault ID and funded recovery hash for
 deterministic restore. It does not provide a global reuse registry or make an
 unauthenticated backup authoritative.
+External weak-subjectivity onboarding now requires a [mandatory independently
+distributed signer-arrangement pin](WAVE-50-SR02.md), including fail-closed CLI
+tuple parsing. The V1 checkpoint digest still does not bind the arrangement.
+Metrics bound beyond loopback now require an [explicit public-exposure
+acknowledgement](WAVE-50-NET21.md); this is not authentication, TLS or firewall
+evidence. The [Wave 50 integration checkpoint](WAVE-50-INTEGRATION.md) records
+the four-agent review, validation and unchanged launch blockers.
 
 ## Scope and source reconciliation
 
