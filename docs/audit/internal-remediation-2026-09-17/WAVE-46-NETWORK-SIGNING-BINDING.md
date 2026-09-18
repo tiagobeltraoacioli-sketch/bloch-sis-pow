@@ -19,10 +19,11 @@ The itemized findings were recovered from repository commit `a79c88b`:
   evidence across mainnet, devnets, rehearsals, or chain splits. The existing
   distinct-key warning covered exits, not every duty.
 
-The live tree already commits `admission_network_domain`, the canonical genesis
-manifest digest, in `CommittedState`. Local slashing-protection files also bind
-their records to a genesis digest, but that protects one database and does not
-prevent the same secret from being used with independent data directories.
+The live tree already carries `admission_network_domain`, the canonical genesis
+manifest digest, as immutable `CommittedState` context, but deliberately leaves
+it outside the historical state-root encoding. Local slashing-protection files
+also bind their records to a genesis digest, but that protects one database and
+does not prevent the same secret from being used with independent data directories.
 `SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH` was already `u64::MAX`; no equivalent
 validator-duty candidate existed.
 
