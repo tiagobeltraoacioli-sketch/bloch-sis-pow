@@ -64,7 +64,7 @@
 //! from reading it.
 
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
@@ -86,10 +86,45 @@ pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 /// Largest request head (request line + headers) accepted before the body.
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 
-/// Connections served concurrently. Past this the listener answers 503 and
-/// closes, rather than spawning threads until the process dies — the node's
-/// consensus thread must survive its RPC port being hammered.
+/// Connections served concurrently. Past this the listener closes the
+/// accepted socket instead of spawning more threads — the node's consensus
+/// thread must survive its RPC port being hammered.
 const MAX_CONNECTIONS: usize = 64;
+
+/// Concurrent workers retained by one normalized source address.
+const MAX_CONNECTIONS_PER_IP: usize = 8;
+
+/// Own both listener admission charges through the complete worker lifetime.
+/// In particular, an unwind inside request parsing or a backend cannot leak a
+/// global slot while the per-IP guard is released automatically.
+struct RpcConnectionPermit {
+    _ip: crate::connection_limit::Permit,
+    live: Arc<AtomicUsize>,
+}
+
+impl Drop for RpcConnectionPermit {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn reserve_connection(
+    ip: IpAddr,
+    live: &Arc<AtomicUsize>,
+    ip_limits: &Arc<crate::connection_limit::Limits>,
+) -> Option<RpcConnectionPermit> {
+    let ip_permit = ip_limits.reserve(ip, MAX_CONNECTIONS_PER_IP)?;
+    // Reserve before spawning: incrementing inside the worker would let an
+    // unbounded burst spawn first and count later.
+    if live.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+        live.fetch_sub(1, Ordering::SeqCst);
+        return None;
+    }
+    Some(RpcConnectionPermit {
+        _ip: ip_permit,
+        live: Arc::clone(live),
+    })
+}
 
 /// Total time allowed to receive a request, and per-write response timeout.
 /// Occasional bytes must not renew a connection's request budget.
@@ -1395,21 +1430,15 @@ pub fn serve(
         for conn in listener.incoming() {
             let Ok(sock) = conn else { continue };
             let Ok(address) = sock.peer_addr() else { continue };
-            let Some(permit) = ip_limits.reserve(address.ip(), 8) else { continue };
-            // Reserve a slot before spawning: incrementing inside the thread
-            // would let an unbounded burst spawn first and count later.
-            if live.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
-                live.fetch_sub(1, Ordering::SeqCst);
+            let Some(permit) = reserve_connection(address.ip(), &live, &ip_limits) else {
                 continue;
-            }
+            };
             let backend = backend.clone();
-            let live = live.clone();
             let hosts = hosts.clone();
             thread::spawn(move || {
                 let _permit = permit;
                 let mut sock = sock;
                 serve_connection(&mut sock, backend.as_ref(), &hosts);
-                live.fetch_sub(1, Ordering::SeqCst);
             });
         }
     });

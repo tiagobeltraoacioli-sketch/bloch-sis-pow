@@ -668,6 +668,49 @@ fn a_backend_without_a_head_still_routes_balance_to_the_loop() {
     assert!(backend.call(RpcRequest::Balance([0xAB; 32])).is_err());
 }
 
+#[test]
+fn rpc_connection_admission_releases_per_ip_and_global_slots_together() {
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let limits = Arc::new(crate::connection_limit::Limits::default());
+    let crowded: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+    let mapped: std::net::IpAddr = "::ffff:192.0.2.1".parse().unwrap();
+    let mut held = Vec::new();
+
+    for _ in 0..MAX_CONNECTIONS_PER_IP {
+        held.push(reserve_connection(crowded, &live, &limits).expect("source has room"));
+    }
+    assert!(
+        reserve_connection(mapped, &live, &limits).is_none(),
+        "IPv4-mapped IPv6 must share the source cap",
+    );
+    assert!(
+        reserve_connection("192.0.2.2".parse().unwrap(), &live, &limits).is_some(),
+        "one source must not consume the global allowance",
+    );
+    drop(held.pop());
+    assert!(
+        reserve_connection(crowded, &live, &limits).is_some(),
+        "dropping the combined guard restores both charges",
+    );
+    drop(held);
+    assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let limits = Arc::new(crate::connection_limit::Limits::default());
+    let mut all = Vec::new();
+    for octet in 1..=MAX_CONNECTIONS {
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, octet as u8));
+        all.push(reserve_connection(ip, &live, &limits).expect("global budget has room"));
+    }
+    assert!(
+        reserve_connection("203.0.113.1".parse().unwrap(), &live, &limits).is_none(),
+        "distinct sources must still obey the global worker cap",
+    );
+    drop(all);
+    assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(reserve_connection("203.0.113.1".parse().unwrap(), &live, &limits).is_some());
+}
+
 /// Process identity is compiled into the RPC module. It must remain available
 /// without a published head or a listening consensus thread, while a genuine
 /// engine read still fails in that setup. This pins both sides of the split.
