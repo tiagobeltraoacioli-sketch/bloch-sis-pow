@@ -36,7 +36,8 @@ security job, fails if the job:
   * contains `exit 0`       — the silent skip that started this;
   * masks a command with `|| true`, `| true`, or `; true`;
   * conditionally skips execution through `if`, `rules`, `only`, `except`,
-    inheritance, or a `when` other than `on_success`/`always`.
+    GitLab inheritance, a GitHub reusable-workflow delegation, or a `when`
+    other than `on_success`/`always`.
 
 It does NOT require every job to be blocking. cargo-geiger, miri and the fuzz
 smoke are deliberately report-only, with written reasons, and stay green here.
@@ -52,8 +53,8 @@ Pure Python 3. No toolchain, no build, no network.
 
 Run: python3 scripts/check-scanners-blocking.py
 Exit 0 = the supported explicit job subset can still fail on every registered
-security verdict. This is not a proof for arbitrary YAML inheritance or shell
-execution semantics.
+security verdict. This is not a proof for full YAML parsing, dynamic shell
+execution semantics, or hosted branch protection.
 """
 
 from __future__ import annotations
@@ -152,10 +153,18 @@ def check_file(path: str, required: dict[str, str], indent: int, label: str) -> 
                     % (label, job, why, waiver.group(1)))
 
             value = re.sub(r"^\s*-\s+", "", line.strip())
-            if re.match(r"^(?:if|rules|only|except):", value) or value.startswith("<<:"):
+            if re.match(r"^(?:if|rules|only|except|extends|inherit):", value) or value.startswith("<<:"):
                 problems.append(
                     "%s: job `%s` (%s) has conditional or inherited execution; "
                     "the supported blocking subset requires an unconditional job"
+                    % (label, job, why))
+            line_indent = len(line) - len(line.lstrip(" "))
+            if (label == ".github/workflows/security.yml"
+                    and line_indent == indent + 2
+                    and re.match(r"^uses:", value)):
+                problems.append(
+                    "%s: job `%s` (%s) delegates to a reusable workflow; "
+                    "the supported blocking subset requires locally inspectable steps"
                     % (label, job, why))
             when = re.match(r"^when:\s*([^\s#]+)", value)
             if when and when.group(1).strip("\"'").lower() not in SAFE_WHEN:

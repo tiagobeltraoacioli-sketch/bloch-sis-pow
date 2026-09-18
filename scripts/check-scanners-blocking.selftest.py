@@ -273,6 +273,23 @@ CASES = [
              "osv-scanner:\n  stage: check", "osv-scanner:\n  <<: *scanner-defaults\n  stage: check"),
          GOOD_GITHUB, must_fail=True, expect="conditional or inherited"),
 
+    Case("GitLab extends cannot hide required job semantics",
+         GOOD_GITLAB.replace(
+             "osv-scanner:\n  stage: check", "osv-scanner:\n  extends: .scanner-defaults\n  stage: check"),
+         GOOD_GITHUB, must_fail=True, expect="conditional or inherited"),
+
+    Case("GitLab inherit cannot change required job defaults",
+         GOOD_GITLAB.replace(
+             "cargo-audit:\n  stage: check", "cargo-audit:\n  inherit:\n    default: false\n  stage: check"),
+         GOOD_GITHUB, must_fail=True, expect="conditional or inherited"),
+
+    Case("GitHub reusable workflow is outside the inspectable subset",
+         GOOD_GITLAB,
+         sub(GOOD_GITHUB,
+             "  osv-scanner:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: google/osv-scanner-action/osv-scanner-action@v1.9.2",
+             "  osv-scanner:\n    uses: example/security/.github/workflows/osv.yml@0123456789abcdef"),
+         must_fail=True, expect="delegates to a reusable workflow"),
+
     Case("or-true masks a scanner verdict",
          GOOD_GITLAB.replace("cargo audit --deny warnings", "cargo audit --deny warnings || true"),
          GOOD_GITHUB, must_fail=True, expect="shell-success masking"),
