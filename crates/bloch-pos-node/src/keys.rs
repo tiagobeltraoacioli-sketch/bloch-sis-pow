@@ -107,6 +107,12 @@ const KDF_MAX_M_COST_KIB: u32 = 1_048_576; // 1 GiB
 /// keystore and refuse everything an attacker-supplied header could ask for.
 const KDF_MAX_T_COST: u32 = 64;
 const KDF_MAX_P_COST: u32 = 16;
+/// Default one-pass allocation ceiling for an unauthenticated header. This is
+/// independent of the combined work budget below: without it, `m=1 GiB,t=1`
+/// passed the product check and allocated a GiB before AEAD authentication.
+/// Production is 64 MiB; 256 MiB leaves 4x tuning headroom. Historical files
+/// above it require the explicit finite recovery override.
+const KDF_DEFAULT_MAX_M_COST_KIB: u32 = 262_144; // 256 MiB
 /// Bound combined memory/pass work before allocation; independent maxima alone
 /// previously admitted 64 GiB-passes. Production uses 192 MiB-passes.
 const KDF_DEFAULT_MAX_WORK_KIB: u64 = 1_048_576;
@@ -172,6 +178,10 @@ impl KdfParams {
                 io::ErrorKind::InvalidData,
                 "keystore KDF parallelism is over this node's cap",
             ));
+        }
+        if !allow_expensive && self.m_cost > KDF_DEFAULT_MAX_M_COST_KIB {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                "keystore KDF memory cost exceeds the default 256 MiB cap; for a verified authentic legacy file only, explicitly set BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF=1 (the finite 1 GiB hard cap still applies)"));
         }
         let work = u64::from(self.m_cost).saturating_mul(u64::from(self.t_cost));
         if !allow_expensive && work > KDF_DEFAULT_MAX_WORK_KIB {
@@ -743,7 +753,9 @@ impl Keystore {
         let sealed = r.bytes().map_err(|_| bad("truncated keystore"))?;
         r.finish().map_err(|_| bad("trailing bytes in keystore"))?;
 
-        if *allow_expensive_kdf && u64::from(kdf.m_cost).saturating_mul(u64::from(kdf.t_cost)) > KDF_DEFAULT_MAX_WORK_KIB {
+        if *allow_expensive_kdf && (kdf.m_cost > KDF_DEFAULT_MAX_M_COST_KIB
+            || u64::from(kdf.m_cost).saturating_mul(u64::from(kdf.t_cost)) > KDF_DEFAULT_MAX_WORK_KIB)
+        {
             eprintln!("WARNING: explicit legacy KDF recovery permits expensive derivation from an unauthenticated header; original memory/time/lane caps remain enforced");
         }
         let key = kdf.derive_with_legacy_work(pass, &salt, *allow_expensive_kdf)?;
@@ -1360,20 +1372,31 @@ mod tests {
     }
 
     #[test]
-    fn audit_combined_kdf_work_is_bounded_before_allocation_and_recovery_stays_finite() {
+    fn audit_default_kdf_memory_and_combined_work_are_bounded_before_allocation() {
+        let high_memory = KdfParams { m_cost: KDF_DEFAULT_MAX_M_COST_KIB + 1, t_cost: 1, p_cost: 1 };
+        let error = high_memory.to_argon2().err().unwrap();
+        assert!(error.to_string().contains("default 256 MiB cap"));
+        assert!(high_memory.to_argon2_with_legacy_work(true).is_ok(), "explicit recovery retains the finite historical memory ceiling without allocating in this test");
+        assert!(KdfParams { m_cost: KDF_DEFAULT_MAX_M_COST_KIB, t_cost: 1, p_cost: 1 }.to_argon2().is_ok());
+
+        let high_work = KdfParams { m_cost: KDF_DEFAULT_MAX_M_COST_KIB, t_cost: 5, p_cost: 1 };
+        let error = high_work.to_argon2().err().unwrap();
+        assert!(error.to_string().contains("combined KDF work"));
+        assert!(high_work.to_argon2_with_legacy_work(true).is_ok());
+
         let hostile = KdfParams { m_cost: KDF_MAX_M_COST_KIB, t_cost: KDF_MAX_T_COST, p_cost: 1 };
         let error = hostile.to_argon2().err().unwrap();
-        assert!(error.to_string().contains("combined KDF work"));
+        assert!(error.to_string().contains("default 256 MiB cap"));
         assert!(hostile.to_argon2_with_legacy_work(true).is_ok(), "explicit recovery preserves historical bounded costs without executing them in this test");
         assert!(KdfParams { t_cost: u32::MAX, ..hostile }.to_argon2_with_legacy_work(true).is_err());
         assert!(KdfParams { m_cost: u32::MAX, ..hostile }.to_argon2_with_legacy_work(true).is_err());
         assert!(KdfParams::PRODUCTION.to_argon2().is_ok());
         let key = Keystore { index: 1, pubkey: vec![1], secret: Zeroizing::new(vec![2]), randao_seed: [3; 32] };
         let mut bytes = key.seal_payload("disposable fixture", KdfParams { m_cost: 8, t_cost: 1, p_cost: 1 }).unwrap();
-        bytes[9..13].copy_from_slice(&hostile.m_cost.to_le_bytes());
-        bytes[13..17].copy_from_slice(&hostile.t_cost.to_le_bytes());
+        bytes[9..13].copy_from_slice(&high_memory.m_cost.to_le_bytes());
+        bytes[13..17].copy_from_slice(&high_memory.t_cost.to_le_bytes());
         let error = Keystore::decode_sealed(&bytes, &Unlock::passphrase("disposable fixture")).err().unwrap();
-        assert!(error.to_string().contains("combined KDF work"), "header must be refused before hash/decryption");
+        assert!(error.to_string().contains("default 256 MiB cap"), "header must be refused before hash/decryption");
         assert!(hostile.validate_new_sealing().is_err(), "recovery cannot authorize new expensive files");
     }
 
