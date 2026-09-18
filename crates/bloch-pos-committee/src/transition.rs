@@ -14077,9 +14077,9 @@ mod tests {
     /// write-off that never fired.
     #[test]
     fn the_replay_compatibility_gates_are_inert_until_armed() {
-        // LEAK_RECOVERY_ACTIVATION_EPOCH left this list on 2026-09-06, when it
-        // was armed at 2700 — see `leak_recovery_armed_epoch_matches_the_runbook`
-        // below, which took over its tripwire duty in the armed form.
+        // LEAK_RECOVERY_ACTIVATION_EPOCH left this list when it was scheduled;
+        // after the epoch-2700 deadline was missed, the replacement tripwire
+        // below pinned it to epoch 2880.
         for (name, value) in [
             ("ANCESTRY_SEED_ACTIVATION_EPOCH", crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH),
         ] {

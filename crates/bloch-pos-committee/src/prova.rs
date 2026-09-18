@@ -565,9 +565,10 @@ mod tests {
         println!(
             "INCIDENT (s0): 3 disjoint partitions of 4 of 64 validators (6.25% each) EACH \
              finalized checkpoint epoch {ce} at epoch {e0}, on 3 DIFFERENT roots \
-             ({:02x?}, {:02x?}, {:02x?}), after the leak destroyed {:.1}% of network stake. \
+             ({:02x?}, {:02x?}, {:02x?}), after the leak discounted {:.1}% of network \
+             quorum weight. \
              No mutation switch was touched: this is the arithmetic a shipped binary runs \
-             below epoch 2700 (LEAK_RECOVERY_ACTIVATION_EPOCH, armed 2026-09-06).",
+             below epoch 2880 (LEAK_RECOVERY_ACTIVATION_EPOCH).",
             &roots[0][..2],
             &roots[1][..2],
             &roots[2][..2],
@@ -605,8 +606,8 @@ mod tests {
         println!(
             "CURE (s0): with the floor at {}/{} of the unleaked total in force, all 3 \
              partitions of 4 of 64 failed to finalize in {INCIDENT_HORIZON} epochs. The \
-             floor binds in production at epoch 2700 (LEAK_RECOVERY_ACTIVATION_EPOCH, \
-             armed by founder decision on 2026-09-06).",
+             floor binds in source at epoch 2880 (LEAK_RECOVERY_ACTIVATION_EPOCH; fleet \
+             deployment remains separate evidence).",
             crate::params::MIN_QUORUM_DENOMINATOR_NUM,
             crate::params::MIN_QUORUM_DENOMINATOR_DEN
         );
@@ -691,8 +692,8 @@ mod tests {
         // said so on the first run: `gap 2000000000 -> 0`. The leak has a
         // floor at zero, so once a stall is deep enough every absent validator
         // on both nodes is pinned at exactly zero and the two ledgers become
-        // IDENTICAL again. The ledgers reconverge — by destroying everything
-        // they disagreed about.
+        // IDENTICAL again. The ledgers reconverge — by discounting all quorum
+        // weight they disagreed about, not by burning bonded coins.
         //
         // What does not come back is the CHAIN. Each epoch of non-finality
         // takes more validators to zero, none ever returns (there is no decay
@@ -707,23 +708,24 @@ mod tests {
             r.zeros_start,
             r.zeros_end
         );
-        // How much of the fleet the stall has eaten. Reported rather than
+        // How much of the fleet's quorum weight the stall has discounted.
+        // Reported rather than
         // pinned to an exact count: a validator whose vote happens to survive
         // the mismatched partition is spared that epoch, so the exact terminal
         // count is a property of the shuffle, not of the finding.
         assert!(
             r.destroyed_end * 10 > (N as u128 * STAKE as u128) * 9,
-            "the stall destroyed only {} of {} satoshis; the fleet is not being consumed \
-             and the absorbing state is unproven",
+            "the stall discounted only {} of {} satoshis of quorum weight; the fleet is \
+             not being consumed and the absorbing state is unproven",
             r.destroyed_end,
             N as u128 * STAKE as u128
         );
         println!(
             "DISEASE: 2 nodes, zero-sets differing by {} validators, {} epochs of 100% honest \
              participation. Justified: L={} R={}, AGREED on {}. Boundary kept {:.1}% of \
-             admitted votes. Fully-leaked validators {} -> {} of {}; {} satoshis destroyed \
-             ({:.0}% of the fleet). The denominator is now ZERO: no quorum is reachable on \
-             any input, and nothing gives the stake back.",
+             admitted votes. Fully-leaked validators {} -> {} of {}; {} satoshis of quorum \
+             weight discounted ({:.0}% of the fleet). The denominator is now ZERO: no quorum \
+             is reachable on any input until recovery activates; bonded coins were not burned.",
             r.zero_set_symmetric_difference,
             r.epochs,
             r.left_justified,

@@ -33,9 +33,45 @@ fn spec(name: &str) -> String {
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
 
+fn committee_source(name: &str) -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src").join(name);
+    fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+}
+
 const MIGRATION: &str = "BLOCH-POS-SHA3-LATTICE-MIGRATION.md";
 const TOKENOMICS: &str = "BLOCH-TOKENOMICS-V4.md";
 const FEE_MARKET: &str = "BLOCH-L1-FEE-MARKET.md";
+
+/// FC-14 — source-level protocol prose must describe the gated seed rule and
+/// the inactivity leak as quorum accounting, not as an unconditional F6 rule
+/// or a coin burn. These exact stale descriptions caused the audit finding.
+#[test]
+fn fc14_source_prose_matches_the_live_protocol_shape() {
+    let schedule = committee_source("schedule.rs");
+    let committees = committee_source("committees.rs");
+    let finality = committee_source("finality.rs");
+
+    for (name, text) in [("schedule.rs", &schedule), ("committees.rs", &committees)] {
+        assert!(
+            text.contains("ANCESTRY_SEED_ACTIVATION_EPOCH"),
+            "{name} describes seed selection without naming its activation gate"
+        );
+    }
+    assert!(
+        schedule.contains("second rule is not active in a shipped build"),
+        "schedule.rs again presents the post-F6 look-ahead as unconditional"
+    );
+    assert!(
+        finality.contains("not debit `ValidatorRecord::staked_sat`")
+            && finality.contains("burn coins or change supply"),
+        "finality.rs no longer states that the leak only discounts quorum weight"
+    );
+    assert!(
+        finality.contains("older sampled") && finality.contains("reference sortition APIs"),
+        "finality.rs again presents the retired sampled 8/128 committee as live"
+    );
+}
 
 fn comma_u128(value: u128) -> String {
     let digits = value.to_string();

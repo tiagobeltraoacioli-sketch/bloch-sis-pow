@@ -2,13 +2,13 @@
 
 //! Justification and finality — the Casper-style gadget (§5.1, §6.5.2).
 //!
-//! One checkpoint per epoch (`EPOCHS_PER_CHECKPOINT = 1`). The **full epoch
-//! committee of 128** votes once at the epoch boundary; those votes — and only
-//! those — drive justification and finality. The per-slot subcommittee of 8
-//! exists purely to give LMD-GHOST intra-epoch fork-choice weight (§6.5.2) and
-//! must never be fed into this module: its members are not in the epoch
-//! committee for that epoch (different sortition role tag), so its votes are
-//! rejected here by the membership check rather than by caller discipline.
+//! One checkpoint per epoch (`EPOCHS_PER_CHECKPOINT = 1`). The active registry
+//! is deterministically partitioned across that epoch's slots, and each
+//! validator's slot attestation carries both intra-epoch fork-choice weight and
+//! its epoch justification vote. [`crate::finality::votes_from_partition`]
+//! admits only the member assigned to that attestation's slot; those admitted
+//! votes — and only those — drive justification and finality. The older sampled
+//! 8/128 committee design survives only in reference sortition APIs.
 //!
 //! ## The rules
 //!
@@ -23,9 +23,10 @@
 //!   checkpoint becomes finalized. A justified checkpoint whose next epoch also
 //!   justifies (building on it) is final.
 //! - **Inactivity leak.** After `INACTIVITY_LEAK_THRESHOLD_EPOCHS` (4) epochs
-//!   without finality, committee members who fail to cast a valid vote bleed
-//!   stake quadratically, until the remaining live stake is again ≥ 2/3 of the
-//!   (shrunken) total and finality resumes.
+//!   without finality, an accounting accumulator quadratically discounts the
+//!   quorum weight of members who fail to cast a valid vote, until the live
+//!   weight is again ≥ 2/3 of the adjusted total and finality resumes. It does
+//!   not debit `ValidatorRecord::staked_sat`, burn coins or change supply.
 //!
 //! ## Why the source must be the highest justified checkpoint
 //!
@@ -68,9 +69,10 @@
 //! ledger is a function of the attestations *this node heard*. Two nodes that
 //! heard different subsets hold different denominators, so "two disjoint 2/3
 //! quorums out of one total" never has to happen — each side is a 2/3 quorum
-//! out of its OWN, smaller total. With no floor on that denominator (which is
-//! the shipped configuration BELOW epoch 2700; the gate was armed at 2700 on
-//! 2026-09-06) a set of any size finalizes alone once the stall is long enough:
+//! out of its OWN, smaller total. For blocks below epoch 2880 the source uses
+//! no floor on that denominator; the replacement gate was scheduled at 2880
+//! after the epoch-2700 deadline was missed. Under that pre-gate rule, a set of
+//! any size finalizes alone once the stall is long enough:
 //! one node needs 28 epochs, four need 25.
 //!
 //! That is not a hypothetical — it is the 2026-08-24 incident, three nodes
@@ -227,8 +229,10 @@ impl FinalityState {
         st
     }
 
-    /// Total stake the inactivity leak has destroyed, across every validator.
-    /// Zero on a state that has inherited nothing — which is what makes
+    /// Total quorum weight currently discounted by the inactivity leak across
+    /// every validator. This is not a coin burn: the bonded `staked_sat` and
+    /// supply accounting remain unchanged. Zero on a state that has inherited
+    /// nothing — which is what makes
     /// "the relaunch starts clean" a number the caller can assert on rather
     /// than a property it has to take on trust.
     pub fn leaked_total(&self) -> u128 {
@@ -503,8 +507,8 @@ impl FinalityState {
         if leaking {
             // Linear-in-time per-epoch bite ⇒ quadratic cumulative loss, the
             // classic Casper shape: the longer the stall, the faster absent
-            // stake evaporates, so recovery time is bounded instead of
-            // drifting with the size of the absent fraction.
+            // quorum weight is discounted, so recovery time is bounded
+            // instead of drifting with the size of the absent fraction.
             // Cannot underflow: `leaking` is exactly
             // `since_finality > INACTIVITY_LEAK_THRESHOLD_EPOCHS`.
             #[allow(clippy::arithmetic_side_effects)]
@@ -1024,7 +1028,7 @@ mod tests {
     #[test]
     fn a_partitioned_minority_finalizes_because_the_leak_shrinks_the_denominator() {
         let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
-        let (epoch, destroyed_pct) = run_partition(false);
+        let (epoch, discounted_pct) = run_partition(false);
         let epoch = epoch.expect(
             "a 4-of-64 partition must eventually self-finalize — if it never does, the \
              leak-adjusted denominator is not the mechanism and this analysis is wrong",
@@ -1039,7 +1043,8 @@ mod tests {
         );
         println!(
             "FALSE QUORUM: 4 of 64 validators (6.25%) first justified at epoch {epoch} of \
-             non-finality, after the leak destroyed {destroyed_pct:.1}% of total network stake"
+             non-finality, after the leak discounted {discounted_pct:.1}% of total network \
+             quorum weight"
         );
     }
 
@@ -1829,9 +1834,9 @@ mod tests {
                 })
                 .unwrap();
             if out.justified.is_some() {
-                let destroyed: u64 = (0..64u32).map(|v| st.leaked_of(v)).sum();
+                let discounted: u64 = (0..64u32).map(|v| st.leaked_of(v)).sum();
                 let total = STAKE_EACH as u128 * 64;
-                return (Some(e), destroyed as f64 / total as f64 * 100.0);
+                return (Some(e), discounted as f64 / total as f64 * 100.0);
             }
         }
         (None, 0.0)
