@@ -51,8 +51,9 @@
 //! since finality advanced, and the incident counters.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -95,6 +96,42 @@ const MAX_HEAD_BYTES: usize = 8 * 1024;
 /// Connections served concurrently. A scraper plus a probe plus slack; past
 /// this the listener answers 503 and closes rather than spawning threads.
 const MAX_CONNECTIONS: usize = 16;
+
+/// One source may occupy only a quarter of the worker budget. Four concurrent
+/// scrapes from one monitoring address are already more than an honest
+/// Prometheus/health-probe pair needs, while leaving twelve slots for other
+/// operators behind distinct addresses.
+const MAX_CONNECTIONS_PER_IP: usize = 4;
+
+/// Holds both halves of metrics connection admission until its worker exits.
+/// A guard makes every early return and panic release the global and per-IP
+/// slots together instead of relying on matching decrements in every path.
+struct MetricsConnectionPermit {
+    _ip: crate::connection_limit::Permit,
+    live: Arc<AtomicUsize>,
+}
+
+impl Drop for MetricsConnectionPermit {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn reserve_connection(
+    ip: IpAddr,
+    live: &Arc<AtomicUsize>,
+    ip_limits: &Arc<crate::connection_limit::Limits>,
+) -> Option<MetricsConnectionPermit> {
+    let ip_permit = ip_limits.reserve(ip, MAX_CONNECTIONS_PER_IP)?;
+    if live.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+        live.fetch_sub(1, Ordering::SeqCst);
+        return None;
+    }
+    Some(MetricsConnectionPermit {
+        _ip: ip_permit,
+        live: Arc::clone(live),
+    })
+}
 
 /// The process-wide registry. Const-initialised, so incrementing from
 /// anywhere in the binary is one relaxed atomic op with no setup and no
@@ -691,19 +728,23 @@ pub fn fs_free_bytes(path: &std::path::Path) -> u64 {
 pub fn serve(bind_addr: &str, port: u16, metrics: &'static NodeMetrics) -> std::io::Result<SocketAddr> {
     let listener = TcpListener::bind((bind_addr, port))?;
     let local = listener.local_addr()?;
-    let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let live = Arc::new(AtomicUsize::new(0));
+    let ip_limits = Arc::new(crate::connection_limit::Limits::default());
     thread::spawn(move || {
         for conn in listener.incoming() {
             let Ok(mut sock) = conn else { continue };
-            if live.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
-                live.fetch_sub(1, Ordering::SeqCst);
+            let Ok(address) = sock.peer_addr() else { continue };
+            let Some(permit) = reserve_connection(address.ip(), &live, &ip_limits) else {
+                // Preserve the existing small 503 response, but never let an
+                // uncooperative saturated client block the accept thread
+                // before worker socket timeouts are configured.
+                let _ = sock.set_nonblocking(true);
                 let _ = respond(&mut sock, 503, "text/plain", "too many connections");
                 continue;
-            }
-            let live = live.clone();
+            };
             thread::spawn(move || {
+                let _permit = permit;
                 serve_connection(&mut sock, metrics);
-                live.fetch_sub(1, Ordering::SeqCst);
             });
         }
     });
@@ -789,6 +830,48 @@ fn respond(sock: &mut TcpStream, status: u16, ctype: &str, body: &str) -> std::i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_admission_is_per_ip_global_and_released_by_guard() {
+        let live = Arc::new(AtomicUsize::new(0));
+        let limits = Arc::new(crate::connection_limit::Limits::default());
+        let crowded: IpAddr = "192.0.2.1".parse().unwrap();
+        let mapped: IpAddr = "::ffff:192.0.2.1".parse().unwrap();
+        let mut held = Vec::new();
+
+        for _ in 0..MAX_CONNECTIONS_PER_IP {
+            held.push(reserve_connection(crowded, &live, &limits).expect("source has room"));
+        }
+        assert!(
+            reserve_connection(mapped, &live, &limits).is_none(),
+            "IPv4-mapped IPv6 must share the source cap",
+        );
+        assert!(
+            reserve_connection("192.0.2.2".parse().unwrap(), &live, &limits).is_some(),
+            "one source must not consume every metrics worker",
+        );
+        drop(held.pop());
+        assert!(
+            reserve_connection(crowded, &live, &limits).is_some(),
+            "dropping a worker guard must restore that source's capacity",
+        );
+        drop(held);
+
+        let live = Arc::new(AtomicUsize::new(0));
+        let limits = Arc::new(crate::connection_limit::Limits::default());
+        let mut all = Vec::new();
+        for octet in 1..=MAX_CONNECTIONS {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, octet as u8));
+            all.push(reserve_connection(ip, &live, &limits).expect("global budget has room"));
+        }
+        assert!(
+            reserve_connection("203.0.113.1".parse().unwrap(), &live, &limits).is_none(),
+            "distinct sources must still obey the global worker cap",
+        );
+        drop(all);
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+        assert!(reserve_connection("203.0.113.1".parse().unwrap(), &live, &limits).is_some());
+    }
 
     /// Mutation-style: an increment must be VISIBLE in the rendered text. If
     /// any `inc` call or the render line for the series is deleted, this
