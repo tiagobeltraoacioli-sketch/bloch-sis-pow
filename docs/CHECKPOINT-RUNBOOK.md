@@ -37,11 +37,14 @@ Check where the window stands before anything else:
 bloch-pos ws-verify --envelope <latest published env.bin> \
                     --signer-set <set.bin> \
                     --genesis <manifest> \
-                    --rpc <a node you run>
+                    --rpc <a node you run> \
+                    --require-fresh
 ```
 
 The `FRESHNESS` line says `FRESH`, `STALE` or `EXPIRED`. `STALE` means publish
-now. `EXPIRED` means new nodes are already being turned away.
+now. `EXPIRED` means new nodes are already being turned away and makes this
+release-gate invocation exit nonzero. `--require-fresh` also refuses to pass
+when neither `--rpc` nor `--now-epoch` supplied a clock.
 
 ---
 

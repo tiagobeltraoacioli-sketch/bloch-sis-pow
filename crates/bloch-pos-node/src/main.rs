@@ -321,12 +321,17 @@ fn print_help() {
                                  [--genesis <manifest>] --out <env.bin>\n\
            bloch-pos ws-verify --envelope <env.bin> --signer-set <set.bin>\n\
                                --genesis <manifest> [--rpc <a>] [--now-epoch <n>]\n\
+                               [--require-fresh]\n\
            bloch-pos ws-verify --checkpoint <cp.bin>\n\
            bloch-pos ws-verify --partial <partialfile>\n\
                The two read-only forms need no arrangement and no manifest:\n\
                the first prints the 154 bytes and the digest they hash to\n\
                (what a signer runs BEFORE signing), the second prints which\n\
                digest a partial was actually made over.\n\
+               With --require-fresh, envelope verification also requires an\n\
+               RPC/current epoch and refuses an artifact outside the boot\n\
+               weak-subjectivity window. An expired envelope is refused\n\
+               whenever either clock option is supplied.\n\
                The rest of the signing ceremony (BLOCH-WEAK-SUBJECTIVITY.md\n\
                section 6): per-signer keypairs, the signer-arrangement file\n\
                that --ws-signer-set consumes, offline signing of the ws\n\

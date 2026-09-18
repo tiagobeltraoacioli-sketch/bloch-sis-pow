@@ -1274,7 +1274,7 @@ fn probe_signatures(
 // ─── ws-verify ──────────────────────────────────────────────────────────────
 
 /// `ws-verify --envelope <file> --signer-set <file> --genesis <manifest>
-///  [--rpc <host:port>] [--now-epoch <n>]`
+///  [--rpc <host:port>] [--now-epoch <n>] [--require-fresh]`
 ///
 /// The exact check a booting node runs (`ws::verify_envelope` under the real
 /// hybrid verifier, against the chain identity the manifest fixes), minus the
@@ -1351,6 +1351,49 @@ fn show_partial(path: &str) -> Result<(), String> {
          assembly, is which checkpoint this signer actually signed.",
         p.signer_index
     );
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckpointFreshness {
+    Fresh,
+    Stale,
+    Expired,
+}
+
+fn checkpoint_freshness(checkpoint_epoch: u64, now_epoch: u64) -> CheckpointFreshness {
+    let age = now_epoch.saturating_sub(checkpoint_epoch);
+    if age >= ws::WS_PERIOD_EPOCHS {
+        CheckpointFreshness::Expired
+    } else if age >= ws::WS_FRESH_EPOCHS {
+        CheckpointFreshness::Stale
+    } else {
+        CheckpointFreshness::Fresh
+    }
+}
+
+fn enforce_checkpoint_freshness(
+    checkpoint_epoch: u64,
+    freshness: Option<CheckpointFreshness>,
+    require_fresh: bool,
+) -> Result<(), String> {
+    if freshness == Some(CheckpointFreshness::Expired) {
+        return Err(format!(
+            "VERDICT: REFUSED FOR FRESH INSTALL — the envelope is cryptographically \
+             valid, but checkpoint epoch {checkpoint_epoch} is outside the {}-epoch \
+             weak-subjectivity window at the supplied current epoch. A booting fresh \
+             node refuses it; publish a newer signed checkpoint.",
+            ws::WS_PERIOD_EPOCHS,
+        ));
+    }
+    if require_fresh && freshness.is_none() {
+        return Err(
+            "VERDICT: FRESHNESS UNKNOWN — --require-fresh needs --now-epoch <n> or \
+             --rpc <host:port>; cryptographic validity alone is not fresh-install \
+             readiness."
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -1455,16 +1498,20 @@ fn verify(args: &[String]) -> Result<(), String> {
             None => None,
         },
     };
+    let require_fresh = args.iter().any(|arg| arg == "--require-fresh");
     let window_days = ws::WS_PERIOD_EPOCHS / ws::EPOCHS_PER_DAY;
-    match now_epoch {
-        Some(now) => {
+    let freshness = now_epoch.map(|now| checkpoint_freshness(cp.epoch, now));
+    match (now_epoch, freshness) {
+        (Some(now), Some(freshness)) => {
             let age = now.saturating_sub(cp.epoch);
-            let state = if age >= ws::WS_PERIOD_EPOCHS {
-                "EXPIRED — a fresh node given this checkpoint would STILL refuse to sync"
-            } else if age >= ws::WS_FRESH_EPOCHS {
-                "STALE — inside the window but past the freshness threshold; publish a newer one"
-            } else {
-                "FRESH"
+            let state = match freshness {
+                CheckpointFreshness::Expired => {
+                    "EXPIRED — a fresh node given this checkpoint would STILL refuse to sync"
+                }
+                CheckpointFreshness::Stale => {
+                    "STALE — inside the window but past the freshness threshold; publish a newer one"
+                }
+                CheckpointFreshness::Fresh => "FRESH",
             };
             println!(
                 "FRESHNESS  epoch {} vs now {now}: age {age} of {} epochs (~{window_days} days) — {state}",
@@ -1472,11 +1519,12 @@ fn verify(args: &[String]) -> Result<(), String> {
                 ws::WS_PERIOD_EPOCHS
             );
         }
-        None => println!(
+        (None, None) => println!(
             "FRESHNESS  not evaluated (pass --rpc <host:port> or --now-epoch <n>). The window \
              is {} epochs, ~{window_days} days.",
             ws::WS_PERIOD_EPOCHS
         ),
+        _ => unreachable!("freshness exists exactly when a clock exists"),
     }
     println!();
 
@@ -1491,6 +1539,7 @@ fn verify(args: &[String]) -> Result<(), String> {
         p_min_external,
     ) {
         Ok(ok) => {
+            enforce_checkpoint_freshness(cp.epoch, freshness, require_fresh)?;
             if ok.arrangement_past_review {
                 println!(
                     "WARNING: the arrangement is past its 12-month review deadline (epoch {}, \
@@ -1531,6 +1580,57 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn audit_release_freshness_matches_the_boot_window_boundary() {
+        let checkpoint = 1_536;
+        assert_eq!(
+            checkpoint_freshness(checkpoint, checkpoint),
+            CheckpointFreshness::Fresh,
+        );
+        assert_eq!(
+            checkpoint_freshness(checkpoint, checkpoint + ws::WS_FRESH_EPOCHS),
+            CheckpointFreshness::Stale,
+        );
+        assert_eq!(
+            checkpoint_freshness(checkpoint, checkpoint + ws::WS_PERIOD_EPOCHS - 1),
+            CheckpointFreshness::Stale,
+        );
+        assert_eq!(
+            checkpoint_freshness(checkpoint, checkpoint + ws::WS_PERIOD_EPOCHS),
+            CheckpointFreshness::Expired,
+        );
+    }
+
+    #[test]
+    fn audit_future_checkpoint_does_not_underflow_its_freshness_age() {
+        assert_eq!(
+            checkpoint_freshness(100, 99),
+            CheckpointFreshness::Fresh,
+        );
+    }
+
+    #[test]
+    fn audit_release_gate_refuses_expired_or_unclocked_required_artifacts() {
+        let expired = enforce_checkpoint_freshness(
+            1_536,
+            Some(CheckpointFreshness::Expired),
+            false,
+        )
+        .unwrap_err();
+        assert!(expired.contains("REFUSED FOR FRESH INSTALL"), "{expired}");
+        let unknown = enforce_checkpoint_freshness(1_536, None, true).unwrap_err();
+        assert!(unknown.contains("FRESHNESS UNKNOWN"), "{unknown}");
+        assert!(
+            enforce_checkpoint_freshness(
+                1_536,
+                Some(CheckpointFreshness::Stale),
+                true,
+            )
+            .is_ok(),
+            "stale is a publication warning but remains inside the boot window",
+        );
     }
 
     #[test]
