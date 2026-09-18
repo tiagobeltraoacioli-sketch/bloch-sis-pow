@@ -765,8 +765,8 @@ fn run_outbound_reader(
             Ok(frame) => {
                 if frame.first() == Some(&FRAME_GET_BLOCKS) {
                     responder.answer(&_half.0, address.ip(), frame, &mut limiter);
-                } else if let Some(event) = decode_event(&frame) {
-                    if !send_from_ip(&events, &budget, address.ip(), event) { return; }
+                } else if !decode_and_send_from_ip(&events, &budget, address.ip(), &frame) {
+                    return;
                 }
             }
             Err(_) => return,
@@ -917,11 +917,70 @@ impl SyncScheduler {
 /// a round trip. Keeping all of them costs the process.
 ///
 /// Returns false when the engine is gone, so callers can stop their thread.
+#[cfg(test)]
 fn send_from_ip(events: &Sender<EngineEvent>, budget: &QueueBudget, ip: std::net::IpAddr, mut ev: NetEvent) -> bool {
     // One NAT address shares a burst allowance across connections. This is not
     // a validator identity: no score, persistent ban, or disconnect follows.
     if !budget.admit_source(&mut ev, source_budget::Source::ip(ip)) { return true; }
     send_to_engine(events, budget, ev)
+}
+
+/// Class and payload bytes available from the fixed one-byte frame tag,
+/// before any payload parsing or allocation performed by `decode_event`.
+fn framed_event_shape(frame: &[u8]) -> Option<(EventClass, usize)> {
+    let class = match frame.first()? {
+        &FRAME_BLOCK => EventClass::Block,
+        &FRAME_ATT => EventClass::Attestation,
+        &FRAME_TX => EventClass::Transaction,
+        _ => return None,
+    };
+    Some((class, frame.len().saturating_sub(1)))
+}
+
+/// Admit a legacy devnet frame before decoding it.
+fn decode_and_send_from_ip(
+    events: &Sender<EngineEvent>,
+    budget: &QueueBudget,
+    ip: std::net::IpAddr,
+    frame: &[u8],
+) -> bool {
+    let Some((class, size)) = framed_event_shape(frame) else { return true };
+    let Some(source_guard) = source_budget::Registry::reserve(
+        &budget.sources,
+        source_budget::Source::ip(ip),
+        class,
+        size,
+        budget.count_cap,
+        budget.bytes_cap,
+    ) else {
+        budget.shed_counter(class).fetch_add(1, Ordering::Relaxed);
+        return true;
+    };
+    if !budget.reserve_raw(class, size) {
+        budget.shed_counter(class).fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+
+    let Some(mut event) = decode_event(frame) else {
+        budget.release_raw(size);
+        return true;
+    };
+    // All three decoders are canonical. A future permissive decoder must not
+    // release a different byte charge from the one reserved before it ran.
+    if class_of(&event) != class || queued_bytes(&event) != size {
+        budget.release_raw(size);
+        return true;
+    }
+    match &mut event {
+        NetEvent::Block(_, origin)
+        | NetEvent::Attestation(_, origin)
+        | NetEvent::Transaction(_, origin) => origin.set_reservation(source_guard),
+    }
+    if events.send(EngineEvent::Net(event)).is_err() {
+        budget.release_raw(size);
+        return false;
+    }
+    true
 }
 
 fn send_to_engine(events: &Sender<EngineEvent>, budget: &QueueBudget, ev: NetEvent) -> bool {
@@ -1277,10 +1336,13 @@ pub fn start(
                             Ok(frame) => {
                                 if frame.first() == Some(&FRAME_GET_BLOCKS) {
                                     responder.answer(&_half.0, address.ip(), frame, &mut get_blocks_limiter);
-                                } else if let Some(ev) = decode_event(&frame) {
-                                    if !send_from_ip(&events, &inflight, address.ip(), ev) {
-                                        return;
-                                    }
+                                } else if !decode_and_send_from_ip(
+                                    &events,
+                                    &inflight,
+                                    address.ip(),
+                                    &frame,
+                                ) {
+                                    return;
                                 }
                             }
                             Err(_) => return,
@@ -1862,6 +1924,73 @@ mod tests {
         let (live_tx, live_rx) = mpsc::channel();
         assert!(send_from_ip(&live_tx, &budget, ip, event()));
         assert!(live_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn devnet_reserves_before_decode_and_releases_malformed_frames() {
+        let (tx, rx) = mpsc::channel::<EngineEvent>();
+        let budget = QueueBudget::with_caps(1, 1 << 20);
+        let ip = "192.0.2.44".parse().unwrap();
+        let malformed = vec![FRAME_ATT, 0xFF];
+
+        // Occupy the aggregate slot first. The malformed payload would fail
+        // decoding, but it must be shed on the tag/length reservation before
+        // a decoder gets the chance to inspect it.
+        assert!(budget.reserve_raw(EventClass::Attestation, 1));
+        assert!(decode_and_send_from_ip(&tx, &budget, ip, &malformed));
+        assert_eq!(budget.shed(), (0, 1, 0));
+        assert_eq!(budget.inflight(), 1);
+        assert!(rx.try_recv().is_err());
+        assert!(source_budget::Registry::reserve(
+            &budget.sources,
+            source_budget::Source::ip(ip),
+            EventClass::Attestation,
+            1,
+            1,
+            1 << 20,
+        ).is_some(), "pre-decode shedding must release the per-IP charge");
+        budget.release_raw(1);
+
+        // With capacity available the decoder rejects it, and both the global
+        // and per-IP reservations are returned on that path.
+        assert!(decode_and_send_from_ip(&tx, &budget, ip, &malformed));
+        assert_eq!(budget.inflight(), 0);
+        assert_eq!(budget.inflight_bytes(), 0);
+        assert!(source_budget::Registry::reserve(
+            &budget.sources,
+            source_budget::Source::ip(ip),
+            EventClass::Attestation,
+            1,
+            1,
+            1 << 20,
+        ).is_some(), "decode failure must release the per-IP charge");
+    }
+
+    #[test]
+    fn devnet_predecode_charge_matches_the_engine_release_charge() {
+        let (tx, rx) = mpsc::channel::<EngineEvent>();
+        let budget = QueueBudget::with_caps(4, 1 << 20);
+        let ip = "192.0.2.45".parse().unwrap();
+        let frame = att_frame(&sample_attestation());
+        assert!(decode_and_send_from_ip(&tx, &budget, ip, &frame));
+        assert_eq!(budget.inflight(), 1);
+        assert_eq!(budget.inflight_bytes(), frame.len() - 1);
+
+        let EngineEvent::Net(event) = rx.recv().unwrap() else { panic!("network event") };
+        assert_eq!(class_of(&event), EventClass::Attestation);
+        assert_eq!(queued_bytes(&event), frame.len() - 1);
+        budget.release(&event);
+        drop(event);
+        assert_eq!(budget.inflight(), 0);
+        assert_eq!(budget.inflight_bytes(), 0);
+        assert!(source_budget::Registry::reserve(
+            &budget.sources,
+            source_budget::Source::ip(ip),
+            EventClass::Attestation,
+            1,
+            1,
+            1 << 20,
+        ).is_some(), "event drop must release the per-IP charge");
     }
 
     /// O06 — the invariant `count <= cap` holds under contention. Eight
