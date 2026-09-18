@@ -110,9 +110,9 @@ const KDF_MAX_P_COST: u32 = 16;
 /// Default one-pass allocation ceiling for an unauthenticated header. This is
 /// independent of the combined work budget below: without it, `m=1 GiB,t=1`
 /// passed the product check and allocated a GiB before AEAD authentication.
-/// Production is 64 MiB; 256 MiB leaves 4x tuning headroom. Historical files
+/// Production is 64 MiB; 128 MiB leaves 2x tuning headroom. Historical files
 /// above it require the explicit finite recovery override.
-const KDF_DEFAULT_MAX_M_COST_KIB: u32 = 262_144; // 256 MiB
+const KDF_DEFAULT_MAX_M_COST_KIB: u32 = 131_072; // 128 MiB
 /// Bound combined memory/pass work before allocation; independent maxima alone
 /// previously admitted 64 GiB-passes. Production uses 192 MiB-passes; the
 /// ordinary ceiling permits one additional 64 MiB pass, or one pass at the
@@ -184,7 +184,7 @@ impl KdfParams {
         }
         if !allow_expensive && self.m_cost > KDF_DEFAULT_MAX_M_COST_KIB {
             return Err(io::Error::new(io::ErrorKind::InvalidData,
-                "keystore KDF memory cost exceeds the default 256 MiB cap; for a verified authentic legacy file only, explicitly set BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF=1 (the finite 1 GiB hard cap still applies)"));
+                "keystore KDF memory cost exceeds the default 128 MiB cap; for a verified authentic legacy file only, explicitly set BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF=1 (the finite 1 GiB hard cap still applies)"));
         }
         let work = u64::from(self.m_cost).saturating_mul(u64::from(self.t_cost));
         if !allow_expensive && work > KDF_DEFAULT_MAX_WORK_KIB {
@@ -1378,9 +1378,12 @@ mod tests {
     fn audit_default_kdf_memory_and_combined_work_are_bounded_before_allocation() {
         let high_memory = KdfParams { m_cost: KDF_DEFAULT_MAX_M_COST_KIB + 1, t_cost: 1, p_cost: 1 };
         let error = high_memory.to_argon2().err().unwrap();
-        assert!(error.to_string().contains("default 256 MiB cap"));
+        assert!(error.to_string().contains("default 128 MiB cap"));
         assert!(high_memory.to_argon2_with_legacy_work(true).is_ok(), "explicit recovery retains the finite historical memory ceiling without allocating in this test");
         assert!(KdfParams { m_cost: KDF_DEFAULT_MAX_M_COST_KIB, t_cost: 1, p_cost: 1 }.to_argon2().is_ok());
+        let former_default = KdfParams { m_cost: 262_144, t_cost: 1, p_cost: 1 };
+        assert!(former_default.to_argon2().is_err());
+        assert!(former_default.to_argon2_with_legacy_work(true).is_ok());
 
         let default_work_boundary = KdfParams {
             m_cost: KdfParams::PRODUCTION.m_cost,
@@ -1403,7 +1406,7 @@ mod tests {
 
         let hostile = KdfParams { m_cost: KDF_MAX_M_COST_KIB, t_cost: KDF_MAX_T_COST, p_cost: 1 };
         let error = hostile.to_argon2().err().unwrap();
-        assert!(error.to_string().contains("default 256 MiB cap"));
+        assert!(error.to_string().contains("default 128 MiB cap"));
         assert!(hostile.to_argon2_with_legacy_work(true).is_ok(), "explicit recovery preserves historical bounded costs without executing them in this test");
         assert!(KdfParams { t_cost: u32::MAX, ..hostile }.to_argon2_with_legacy_work(true).is_err());
         assert!(KdfParams { m_cost: u32::MAX, ..hostile }.to_argon2_with_legacy_work(true).is_err());
@@ -1413,7 +1416,7 @@ mod tests {
         bytes[9..13].copy_from_slice(&high_memory.m_cost.to_le_bytes());
         bytes[13..17].copy_from_slice(&high_memory.t_cost.to_le_bytes());
         let error = Keystore::decode_sealed(&bytes, &Unlock::passphrase("disposable fixture")).err().unwrap();
-        assert!(error.to_string().contains("default 256 MiB cap"), "header must be refused before hash/decryption");
+        assert!(error.to_string().contains("default 128 MiB cap"), "header must be refused before hash/decryption");
         assert!(hostile.validate_new_sealing().is_err(), "recovery cannot authorize new expensive files");
     }
 
