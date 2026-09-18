@@ -77,9 +77,12 @@ still requires a written lifecycle/evidence policy, committed offence-age
 representation, historical migration, mixed-version replay analysis and a
 coordinated activation decision.
 
-The post-wave ledger retains all 200 findings: 71 implemented, 95 partial, 10
-open, ten unarmed candidates, seven base-changed, four protocol decisions, two
-verified positives and one finding refuted by the original audit.
+On this wave's isolated `1711937`-based branch, the post-wave ledger retained
+all 200 findings: 71 implemented, 95 partial, 10 open, ten unarmed candidates,
+seven base-changed, four protocol decisions, two verified positives and one
+finding refuted by the original audit. Those branch-relative totals are not the
+integrated ledger; the canonical `FINDINGS.md` counts were recomputed after all
+concurrent Wave 47 changes were merged.
 
 ## Validation
 
