@@ -3378,7 +3378,34 @@ mod blp02_hybrid_suite {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../genesis/mainnet.manifest");
         let Ok(bytes) = std::fs::read(path) else { return };
         match Manifest::decode(&bytes) {
-            Ok(m) => assert_eq!(m.validators.len(), 64, "the live set is 64 validators"),
+            Ok(m) => {
+                assert_eq!(m.validators.len(), 64, "the live set is 64 validators");
+
+                // ST-11 tripwire: these two immutable manifest-derived values
+                // are consensus inputs even though historical state roots do
+                // not carry them. Pin the published mainnet encoding so a
+                // format or manifest edit cannot silently move funded-deposit
+                // authorization or genesis-principal write-off semantics.
+                let expected_domain = [
+                    0xf4, 0x7d, 0x3e, 0x49, 0x8f, 0xf9, 0x78, 0xe3, 0x44, 0x71, 0xda, 0xff,
+                    0xf5, 0xf9, 0x4f, 0xe1, 0x39, 0xfc, 0x3f, 0xf4, 0x89, 0xb1, 0xa0, 0x0f,
+                    0x46, 0x9c, 0x03, 0x02, 0x58, 0x31, 0x19, 0x66,
+                ];
+                assert_eq!(
+                    <[u8; 32]>::from(Sha3_256::digest(m.encode())),
+                    expected_domain,
+                    "the live admission network domain is a release identity",
+                );
+
+                let principal = m.validators.iter().try_fold(0u128, |sum, validator| {
+                    sum.checked_add(validator.stake_sat)
+                });
+                assert_eq!(
+                    principal,
+                    Some(1_600_000u128 * bloch_pos_committee::tokenomics_v4::SAT_PER_BLOCH),
+                    "the live genesis principal is the 64-validator launch bond",
+                );
+            }
             Err(e) => panic!("the live Genesis-4 manifest must decode, got: {}", e.0),
         }
     }
