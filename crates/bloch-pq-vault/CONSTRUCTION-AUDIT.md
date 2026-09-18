@@ -40,6 +40,16 @@ The caller must persist the derivation version and context. This does not
 prevent reusing a vault ID/preimage or authenticate metadata from an untrusted
 backup. Historical inputs are not silently changed during restoration.
 
+`preimage::RecoveryContextV1` is the opt-in public backup envelope for this
+metadata. Its canonical bounded encoding records the V1/V2/V3 key family,
+Bitcoin network, non-empty vault ID and recovery hash. Restore derives exactly
+the recorded family—never a guessed sequence—and requires both the expected
+network and the funded vault's independently retained hash. Unknown tags,
+truncation, trailing bytes and altered context fail closed. The record contains
+no secret and is not self-authenticating: retain the funded hash independently.
+It also cannot detect reuse across separate backups; uniqueness and single-use
+lifecycle policy remain the client's responsibility.
+
 Knowing a preimage does not prove possession of a PQ key: the preimage can be
 copied, delegated or learned from a witness. Bitcoin checks the preimage hash
 and a classical signature, not a PQ signature. Single-use lifecycle enforcement

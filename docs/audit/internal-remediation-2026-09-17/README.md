@@ -58,6 +58,10 @@ findings and the remaining launch blockers.
 Wave 50 removes the simultaneous raw whole-log boot copy via
 [streaming block-log decode](WAVE-50-EN23.md). Decoded history, quadratic cold
 replay, retention growth and production-scale recovery qualification remain.
+Wave 50 adds a [strict BV-10 public recovery context](WAVE-50-BV10.md) that
+records the vault key family, network, vault ID and funded recovery hash for
+deterministic restore. It does not provide a global reuse registry or make an
+unauthenticated backup authoritative.
 
 ## Scope and source reconciliation
 
