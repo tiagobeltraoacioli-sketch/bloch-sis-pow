@@ -4,7 +4,7 @@ Audited source: `562e220`. Remediation base: `b066e3c`. Branch: `fix/internal-au
 
 All 200 findings are retained, including duplicates. IMPLEMENTED means code changed in this branch, not deployed, externally audited, or universally resolved on the live fleet. PARTIAL is not closure. No production binary was published.
 
-IMPLEMENTED: 61, PARTIAL: 76, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE CHANGED: 7, OPEN: 49, REFUTED IN AUDIT: 1, VERIFIED POSITIVE: 1.
+IMPLEMENTED: 62, PARTIAL: 76, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE CHANGED: 7, OPEN: 48, REFUTED IN AUDIT: 1, VERIFIED POSITIVE: 1.
 
 | Finding | Status | Evidence / remaining work | Original title |
 |---|---|---|---|
@@ -187,7 +187,7 @@ IMPLEMENTED: 61, PARTIAL: 76, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE C
 | NET-21 | OPEN | Not closed by this bundle. Requires dedicated implementation, protocol design, external operational evidence or product-owner integration; original finding remains tracked. | Information exposure by design (Info) |
 | NET-22 | OPEN | Not closed by this bundle. Requires dedicated implementation, protocol design, external operational evidence or product-owner integration; original finding remains tracked. | Minor code-level notes (Info) |
 | SR-10 | IMPLEMENTED | State-root documentation now accurately describes bounded thread-local RefCell memoization and its non-authoritative role; no production behavior changed. | `state_root.rs` doc claims "no global mutable state" while holding a thread-local two-generation memo (consensus-safe, doc false) |
-| SR-11 | OPEN | Not closed by this bundle. Requires dedicated implementation, protocol design, external operational evidence or product-owner integration; original finding remains tracked. | Domain-tag hygiene: several tags cover two or three preimage shapes, docs are stale, and three tags live outside the registry |
+| SR-11 | IMPLEMENTED | `params::DOMAIN_TAGS` is the complete 15-domain authority and records every live preimage shape. Frozen multi-shape domains document their marker/role/length/nested-domain separation without changing digest bytes. `DS_SPEND2` joined the independent frozen guard and normative table; stale exit/slash prose was corrected. Full committee suite passes. See WAVE-24.md. | Domain-tag hygiene: several tags cover two or three preimage shapes, docs are stale, and three tags live outside the registry |
 | SR-12 | BASE CHANGED | Recovery/release base differs from audited commit: inspect activated lifecycle gates or TCP reconnect fix. Fleet binary inventory and historical epochs still require verification. | The weak-subjectivity window's slashability premise is void while slashing, exits and withdrawals are unarmed |
 | SR-13 | PARTIAL | Same-prefix issuance remains immutable. Optional owned0700 publication directory coordinates network/genesis/epoch records across prefixes using fsynced atomic no-replace publication, including races. Independent registries, old tooling and omitted option remain outside protection. | Same-epoch re-mint is a permanent boot refusal for every node that stored the first artifact |
 | ST-10 | IMPLEMENTED | Slashing module, decoder, transition, application, admission and release-test prose now state the scheduled epoch-2884 behavior and separate source reachability from deployment evidence. Lifecycle/leak comments were reconciled too; the automated constant guard reports zero contradictions. | Stale/contradictory comments on the slashing path |
