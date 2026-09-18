@@ -685,9 +685,9 @@ build-and-test:
     - bash deploy/bootnodes/verify-bootnodes.selftest.sh
     - cargo build --workspace --all-targets
     - cargo test --locked -p bloch-pos-committee -p bloch-pos-node -p bloch-crypto -p coherence-core -p bloch-sis-pow -p bloch-pq-vault -p pqcrypto-internals -p genesis4-ceremony
-  # Memory-hard (Argon2) wallet tests + a testnet Module-SIS mining test;
-  # measured 2026-09-05: ~51 min of test wall time alone in a debug build
-  # (two ~23 min suites), before compile. 60m gated by luck.
+  # Memory-hard wallet tests and long consensus reveal-chain tests still need
+  # CI headroom. The former ~19-minute debug SIS suite is now ~2 minutes via
+  # the root package profile (LD-03); keep 120m for the full eight-crate job.
   timeout: 120m
 
 # workspace-tests — the FULL suite: everything build-and-test gates (now

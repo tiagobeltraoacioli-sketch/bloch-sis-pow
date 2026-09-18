@@ -64,10 +64,10 @@ jobs:
   cargo-test:
     name: cargo test — live crates (blocking)
     runs-on: ubuntu-latest
-    # Measured 2026-09-05 on an 8-core dev machine: ~51 min of test wall time
-    # alone (the committee's 8,192-step SHAKE reveal chains and the Module-SIS
-    # mining test are ~23 min EACH in a debug build) before compile. 60 would
-    # gate by luck on a 2-core hosted runner.
+    # The committee's 8,192-step SHAKE reveal chains remain intentionally
+    # expensive. The former ~19-minute debug SIS suite is now ~2 minutes via
+    # the root package profile (LD-03), but 120 minutes preserves headroom for
+    # the full eight-crate suite on a 2-core hosted runner.
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

@@ -62,6 +62,14 @@ opt-level = 3
 [profile.dev.package.keccak]
 opt-level = 3
 
+# The reference SIS miner performs real matrix expansion and brute-force
+# solution searches in three ordinary tests. In an unoptimized dependency this
+# made the 78-test crate take ~19 minutes and dominate both blocking pipelines.
+# Keep debug assertions/overflow checks in the workspace while optimizing this
+# package's implementation, just as the costly crypto dependencies above are.
+[profile.dev.package.bloch-sis-pow]
+opt-level = 3
+
 [profile.release]
 opt-level      = 3
 lto            = true
