@@ -114,8 +114,11 @@ const KDF_MAX_P_COST: u32 = 16;
 /// above it require the explicit finite recovery override.
 const KDF_DEFAULT_MAX_M_COST_KIB: u32 = 262_144; // 256 MiB
 /// Bound combined memory/pass work before allocation; independent maxima alone
-/// previously admitted 64 GiB-passes. Production uses 192 MiB-passes.
-const KDF_DEFAULT_MAX_WORK_KIB: u64 = 1_048_576;
+/// previously admitted 64 GiB-passes. Production uses 192 MiB-passes; the
+/// ordinary ceiling permits one additional 64 MiB pass, or one pass at the
+/// independent 256 MiB allocation ceiling. Larger verified legacy settings
+/// require the explicit finite recovery override.
+const KDF_DEFAULT_MAX_WORK_KIB: u64 = 262_144; // 256 MiB-pass
 
 /// Shortest passphrase `keys seal` will seal under. Argon2id makes guessing
 /// expensive per attempt, not impossible; a validator identity behind eight
@@ -1379,7 +1382,21 @@ mod tests {
         assert!(high_memory.to_argon2_with_legacy_work(true).is_ok(), "explicit recovery retains the finite historical memory ceiling without allocating in this test");
         assert!(KdfParams { m_cost: KDF_DEFAULT_MAX_M_COST_KIB, t_cost: 1, p_cost: 1 }.to_argon2().is_ok());
 
-        let high_work = KdfParams { m_cost: KDF_DEFAULT_MAX_M_COST_KIB, t_cost: 5, p_cost: 1 };
+        let default_work_boundary = KdfParams {
+            m_cost: KdfParams::PRODUCTION.m_cost,
+            t_cost: 4,
+            p_cost: 1,
+        };
+        assert_eq!(
+            u64::from(default_work_boundary.m_cost) * u64::from(default_work_boundary.t_cost),
+            KDF_DEFAULT_MAX_WORK_KIB,
+        );
+        assert!(default_work_boundary.to_argon2().is_ok());
+
+        let high_work = KdfParams {
+            t_cost: default_work_boundary.t_cost + 1,
+            ..default_work_boundary
+        };
         let error = high_work.to_argon2().err().unwrap();
         assert!(error.to_string().contains("combined KDF work"));
         assert!(high_work.to_argon2_with_legacy_work(true).is_ok());
