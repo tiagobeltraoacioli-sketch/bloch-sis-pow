@@ -24,8 +24,10 @@
 //!    they were not, delegation would be a free option: all of the yield, none
 //!    of the risk, and no reason to care who you delegate to.
 //! 4. **Ineligible stake delegates to nothing — and in Genesis-4 nothing is
-//!    ineligible by origin.** The `eligible` bit is the fail-closed door the
-//!    retired §4.1 taint set used to feed. That set is empty: the carryover —
+//!    ineligible by origin.** The internal `eligible` bit is the fail-closed
+//!    door the retired §4.1 taint set used to feed. The legacy transaction
+//!    byte is required to be true and never copied from the sender into state.
+//!    The taint set is empty: the carryover —
 //!    the founder's balance included — delegates like any other liquid coin,
 //!    because a carried-over balance that is liquid is also stakeable
 //!    (founder decision, 2026-08-11). The door stays because the transition
@@ -139,7 +141,9 @@ pub struct Delegation {
     /// Epoch deactivation was requested, if any.
     pub deactivate_epoch: Option<u64>,
     /// Fail-closed eligibility bit; when false the delegation is recorded but
-    /// never contributes stake. **Always `true` by origin in Genesis-4**: the
+    /// never contributes stake. **Always `true` at admission in Genesis-4**:
+    /// transition validation refuses a false legacy wire bit rather than
+    /// copying caller-chosen eligibility. The
     /// §4.1 taint set that used to drive it is retired and empty, and a
     /// carried-over balance that is liquid is also stakeable — the founder's
     /// included (founder decision, 2026-08-11). No oracle may derive `false`

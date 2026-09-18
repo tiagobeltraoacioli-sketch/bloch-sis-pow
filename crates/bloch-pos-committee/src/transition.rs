@@ -553,9 +553,9 @@ pub enum PosTransaction {
         delegator: u32,
         validator: u32,
         amount_sat: u128,
-        /// Resolved by the taint oracle at admission (§4.1): an ineligible
-        /// delegation is recorded but never contributes stake — the record
-        /// exists so the ineligibility is itself a committed, auditable fact.
+        /// Frozen legacy wire bit. The retired taint design allowed `false`,
+        /// but Genesis-4 has no eligibility oracle and consensus requires this
+        /// field to be `true`; it is never copied as caller-chosen state.
         eligible: bool,
     },
     /// A §7.3 evidence transaction: two conflicting signed messages proving
@@ -3607,6 +3607,14 @@ impl CommittedState {
                 if *amount_sat < delegation::MIN_DELEGATION_SAT {
                     return Err(TxReject::StakingRule);
                 }
+                // The bit remains in tag 0x04's frozen wire encoding, but the
+                // taint oracle that once gave it meaning was retired before
+                // Genesis-4. A sender may not manufacture consensus state by
+                // choosing it. `false` is noncanonical policy and is refused;
+                // the stored fact is derived from the one admissible value.
+                if !*eligible {
+                    return Err(TxReject::StakingRule);
+                }
                 self.delegations.push(Delegation {
                     delegator: *delegator,
                     validator: *validator,
@@ -3617,7 +3625,7 @@ impl CommittedState {
                     // change it (the same principle as ACTIVATION_DELAY).
                     requested_epoch: self.epoch + 1,
                     deactivate_epoch: None,
-                    eligible: *eligible,
+                    eligible: true,
                 });
                 // R7 M1: unauthenticated — no signature is verified here.
                 Ok(Self::staking_tx_charge(self.epoch, 0, tx.canonical_bytes().len()))
@@ -9945,6 +9953,54 @@ mod tests {
             t.apply_block(&g, &b, &[], std::slice::from_ref(&delegate)),
             Err(TransitionError::Transaction(0)),
         );
+    }
+
+    /// Tag 0x04 retains its historical eligibility byte, but there is no
+    /// Genesis-4 oracle that may set it false. The sender cannot write that
+    /// bit into committed delegation state: false is rejected and true is
+    /// re-derived as the only admissible value.
+    #[test]
+    fn delegate_wire_eligibility_cannot_choose_committed_state() {
+        let _bonding = crate::params::rehearsal::bonding_gate_open_guard();
+        let (_t, mut state, _chains) = setup(4);
+        let mut tx = PosTransaction::Delegate {
+            delegator: 900,
+            validator: 0,
+            amount_sat: delegation::MIN_DELEGATION_SAT,
+            eligible: false,
+        };
+        assert_eq!(
+            PosTransaction::from_canonical_bytes(&tx.canonical_bytes()),
+            Ok(tx.clone()),
+            "the frozen wire byte still decodes; the transition owns its meaning"
+        );
+        let before = state.state_root();
+        assert_eq!(
+            state.apply_transaction(
+                &tx,
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &OkVerifier,
+            ),
+            Err(TxReject::StakingRule)
+        );
+        assert!(state.delegations.is_empty());
+        assert_eq!(state.state_root(), before, "rejection must be atomic");
+
+        let PosTransaction::Delegate { eligible, .. } = &mut tx else {
+            unreachable!()
+        };
+        *eligible = true;
+        state
+            .apply_transaction(
+                &tx,
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &OkVerifier,
+            )
+            .expect("the canonical legacy bit is admitted when the gate is open");
+        assert_eq!(state.delegations.len(), 1);
+        assert!(state.delegations[0].eligible);
     }
 
     /// The gate reads the epoch of the BLOCK, and the same body flips verdict
