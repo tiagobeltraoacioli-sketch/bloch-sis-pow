@@ -68,6 +68,8 @@
 //! operational, quantum-race and validation limitations. For existing recovery
 //! preimages, [`preimage::restore_recovery_secret_v1`] checks the supplied backup
 //! context against the already committed hash without changing the derivation.
+//! New backups can persist [`preimage::RecoveryContextV1`] so restoration also
+//! selects the recorded V1/V2/V3 key family and network instead of guessing.
 
 #![forbid(unsafe_code)]
 

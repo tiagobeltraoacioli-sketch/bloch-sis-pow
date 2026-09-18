@@ -22,6 +22,7 @@
 //! CRQC-derivable in time and on the watchtower winning the fee race — NOT on `r`
 //! staying secret. `r` is single-use.
 
+use crate::{derive_vault_keys_versioned, VaultKeyDerivation};
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 
@@ -31,6 +32,168 @@ pub const INFO_PREFIX: &[u8] = b"pq-shield/v1";
 pub const HKDF_SALT: &[u8] = b"bloch-pq-shield-vault/HKDF-salt/v1";
 /// Length of the derived recovery secret `r`, in bytes (spec §7: ≥ 32).
 pub const RECOVERY_SECRET_LEN: usize = 32;
+/// Maximum caller context retained in a recovery record. This easily fits an
+/// outpoint, UUID or application salt while bounding untrusted backup input.
+pub const MAX_VAULT_ID_LEN: usize = 1024;
+
+const RECOVERY_CONTEXT_MAGIC: &[u8; 8] = b"BPQRCTX\0";
+const RECOVERY_CONTEXT_VERSION: u8 = 1;
+const RECOVERY_CONTEXT_FIXED_LEN: usize = 8 + 1 + 1 + 1 + 1 + 2 + 32;
+
+/// Refusals for the strict, public recovery-context record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryContextError {
+    Malformed,
+    UnsupportedVersion,
+    UnknownKeyDerivation,
+    UnknownNetwork,
+    NonCanonicalReservedByte,
+    EmptyVaultId,
+    VaultIdTooLong,
+    ZeroRecoveryHash,
+    NetworkMismatch,
+    RecoveryHashMismatch,
+    KeyDerivationFailed,
+}
+
+impl std::fmt::Display for RecoveryContextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Malformed => "malformed or trailing recovery-context bytes",
+            Self::UnsupportedVersion => "unsupported recovery-context version",
+            Self::UnknownKeyDerivation => "unknown vault key-derivation tag",
+            Self::UnknownNetwork => "unknown recovery-context network tag",
+            Self::NonCanonicalReservedByte => "recovery-context reserved byte must be zero",
+            Self::EmptyVaultId => "vault ID must not be empty",
+            Self::VaultIdTooLong => "vault ID exceeds the recovery-context limit",
+            Self::ZeroRecoveryHash => "recovery hash must not be all zero",
+            Self::NetworkMismatch => "recovery-context network does not match the funded vault",
+            Self::RecoveryHashMismatch => "recovery context does not match the funded vault hash",
+            Self::KeyDerivationFailed => "vault keys could not be derived from the supplied seed",
+        })
+    }
+}
+
+impl std::error::Error for RecoveryContextError {}
+
+/// Versioned public metadata needed to reproduce an existing V1 recovery
+/// preimage without guessing its key family or free-form vault ID.
+///
+/// The record contains no secret. Its `recovery_hash` must still be compared
+/// with an independently retained/funded vault commitment during restoration;
+/// the record is not self-authenticating and is not a uniqueness registry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryContextV1 {
+    key_derivation: VaultKeyDerivation,
+    mainnet: bool,
+    vault_id: Vec<u8>,
+    recovery_hash: [u8; 32],
+}
+
+impl RecoveryContextV1 {
+    pub fn new(
+        key_derivation: VaultKeyDerivation,
+        mainnet: bool,
+        vault_id: &[u8],
+        recovery_hash: [u8; 32],
+    ) -> Result<Self, RecoveryContextError> {
+        if vault_id.is_empty() {
+            return Err(RecoveryContextError::EmptyVaultId);
+        }
+        if vault_id.len() > MAX_VAULT_ID_LEN {
+            return Err(RecoveryContextError::VaultIdTooLong);
+        }
+        if recovery_hash == [0; 32] {
+            return Err(RecoveryContextError::ZeroRecoveryHash);
+        }
+        Ok(Self { key_derivation, mainnet, vault_id: vault_id.to_vec(), recovery_hash })
+    }
+
+    pub fn key_derivation(&self) -> VaultKeyDerivation { self.key_derivation }
+    pub fn mainnet(&self) -> bool { self.mainnet }
+    pub fn vault_id(&self) -> &[u8] { &self.vault_id }
+    pub fn recovery_hash(&self) -> [u8; 32] { self.recovery_hash }
+
+    /// Canonical public backup bytes. Unknown versions/tags, nonzero reserved
+    /// fields, truncation and trailing data are rejected by [`Self::decode`].
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(RECOVERY_CONTEXT_FIXED_LEN + self.vault_id.len());
+        out.extend_from_slice(RECOVERY_CONTEXT_MAGIC);
+        out.push(RECOVERY_CONTEXT_VERSION);
+        out.push(match self.key_derivation {
+            VaultKeyDerivation::V1SharedReceiveChain => 1,
+            VaultKeyDerivation::V2DedicatedHardenedBranch => 2,
+            VaultKeyDerivation::V3HardenedRoles => 3,
+        });
+        out.push(u8::from(self.mainnet));
+        out.push(0); // reserved for a future fail-closed format revision
+        out.extend_from_slice(&(self.vault_id.len() as u16).to_le_bytes());
+        out.extend_from_slice(&self.vault_id);
+        out.extend_from_slice(&self.recovery_hash);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecoveryContextError> {
+        if bytes.len() < RECOVERY_CONTEXT_FIXED_LEN || &bytes[..8] != RECOVERY_CONTEXT_MAGIC {
+            return Err(RecoveryContextError::Malformed);
+        }
+        if bytes[8] != RECOVERY_CONTEXT_VERSION {
+            return Err(RecoveryContextError::UnsupportedVersion);
+        }
+        let key_derivation = match bytes[9] {
+            1 => VaultKeyDerivation::V1SharedReceiveChain,
+            2 => VaultKeyDerivation::V2DedicatedHardenedBranch,
+            3 => VaultKeyDerivation::V3HardenedRoles,
+            _ => return Err(RecoveryContextError::UnknownKeyDerivation),
+        };
+        let mainnet = match bytes[10] {
+            0 => false,
+            1 => true,
+            _ => return Err(RecoveryContextError::UnknownNetwork),
+        };
+        if bytes[11] != 0 {
+            return Err(RecoveryContextError::NonCanonicalReservedByte);
+        }
+        let vault_id_len = u16::from_le_bytes([bytes[12], bytes[13]]) as usize;
+        if vault_id_len == 0 {
+            return Err(RecoveryContextError::EmptyVaultId);
+        }
+        if vault_id_len > MAX_VAULT_ID_LEN {
+            return Err(RecoveryContextError::VaultIdTooLong);
+        }
+        let expected_len = RECOVERY_CONTEXT_FIXED_LEN
+            .checked_add(vault_id_len)
+            .ok_or(RecoveryContextError::Malformed)?;
+        if bytes.len() != expected_len {
+            return Err(RecoveryContextError::Malformed);
+        }
+        let hash_start = 14 + vault_id_len;
+        let mut recovery_hash = [0; 32];
+        recovery_hash.copy_from_slice(&bytes[hash_start..hash_start + 32]);
+        Self::new(key_derivation, mainnet, &bytes[14..hash_start], recovery_hash)
+    }
+
+    /// Restore using the recorded V1/V2/V3 key family, then bind the result to
+    /// the independently supplied network and funded `H(r)`. No version is
+    /// guessed or tried in sequence.
+    pub fn restore(
+        &self,
+        seed: &[u8],
+        expected_mainnet: bool,
+        funded_recovery_hash: &[u8; 32],
+    ) -> Result<zeroize::Zeroizing<[u8; RECOVERY_SECRET_LEN]>, RecoveryContextError> {
+        if self.mainnet != expected_mainnet {
+            return Err(RecoveryContextError::NetworkMismatch);
+        }
+        if &self.recovery_hash != funded_recovery_hash {
+            return Err(RecoveryContextError::RecoveryHashMismatch);
+        }
+        let keys = derive_vault_keys_versioned(seed, self.mainnet, self.key_derivation)
+            .map_err(|_| RecoveryContextError::KeyDerivationFailed)?;
+        restore_recovery_secret_v1(&keys.pq_secret, &self.vault_id, funded_recovery_hash)
+            .map_err(|_| RecoveryContextError::RecoveryHashMismatch)
+    }
+}
 
 /// Derive the recovery secret `r = HKDF-SHA256(pq_sk, "pq-shield/v1" ‖ vault_id)`.
 ///
@@ -121,5 +284,135 @@ mod tests {
         // different key → different r (only the pq_sk holder can produce r)
         let (r4, _) = derive_recovery(b"a-DIFFERENT-pq-secret-key-material", b"vault-1");
         assert_ne!(r1, r4);
+    }
+
+    #[test]
+    fn versioned_context_restores_all_existing_key_families_without_guessing() {
+        let seed = [42u8; 32];
+        let vault_id = b"vault-backup-context-17";
+        for version in [
+            VaultKeyDerivation::V1SharedReceiveChain,
+            VaultKeyDerivation::V2DedicatedHardenedBranch,
+            VaultKeyDerivation::V3HardenedRoles,
+        ] {
+            let keys = derive_vault_keys_versioned(&seed, false, version).unwrap();
+            let (expected_secret, expected_hash) = derive_recovery(&keys.pq_secret, vault_id);
+            let context = RecoveryContextV1::new(version, false, vault_id, expected_hash).unwrap();
+            let decoded = RecoveryContextV1::decode(&context.encode()).unwrap();
+            assert_eq!(decoded, context);
+            assert_eq!(*decoded.restore(&seed, false, &expected_hash).unwrap(), expected_secret);
+        }
+    }
+
+    #[test]
+    fn context_restore_refuses_network_hash_and_metadata_substitution() {
+        let seed = [43u8; 32];
+        let vault_id = b"funded-vault-9";
+        let keys = derive_vault_keys_versioned(
+            &seed,
+            false,
+            VaultKeyDerivation::V1SharedReceiveChain,
+        ).unwrap();
+        let (_, expected_hash) = derive_recovery(&keys.pq_secret, vault_id);
+        let context = RecoveryContextV1::new(
+            VaultKeyDerivation::V1SharedReceiveChain,
+            false,
+            vault_id,
+            expected_hash,
+        ).unwrap();
+
+        assert_eq!(
+            context.restore(&seed, true, &expected_hash).unwrap_err(),
+            RecoveryContextError::NetworkMismatch,
+        );
+        assert_eq!(
+            context.restore(&seed, false, &[7; 32]).unwrap_err(),
+            RecoveryContextError::RecoveryHashMismatch,
+        );
+        assert_eq!(
+            context.restore(&[1; 3], false, &expected_hash).unwrap_err(),
+            RecoveryContextError::KeyDerivationFailed,
+        );
+        assert_eq!(
+            context.restore(&[44; 32], false, &expected_hash).unwrap_err(),
+            RecoveryContextError::RecoveryHashMismatch,
+        );
+
+        let mut changed_id = context.encode();
+        changed_id[14] ^= 1;
+        let changed_id = RecoveryContextV1::decode(&changed_id).unwrap();
+        assert_eq!(
+            changed_id.restore(&seed, false, &expected_hash).unwrap_err(),
+            RecoveryContextError::RecoveryHashMismatch,
+        );
+
+        let mut changed_version = context.encode();
+        changed_version[9] = 2;
+        let changed_version = RecoveryContextV1::decode(&changed_version).unwrap();
+        assert_eq!(
+            changed_version.restore(&seed, false, &expected_hash).unwrap_err(),
+            RecoveryContextError::RecoveryHashMismatch,
+        );
+    }
+
+    #[test]
+    fn recovery_context_codec_is_bounded_strict_and_canonical() {
+        let context = RecoveryContextV1::new(
+            VaultKeyDerivation::V3HardenedRoles,
+            true,
+            b"unique-vault-salt",
+            [9; 32],
+        ).unwrap();
+        let encoded = context.encode();
+        for end in 0..encoded.len() {
+            assert!(RecoveryContextV1::decode(&encoded[..end]).is_err());
+        }
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert_eq!(RecoveryContextV1::decode(&trailing), Err(RecoveryContextError::Malformed));
+
+        for (offset, value, expected) in [
+            (8, 2, RecoveryContextError::UnsupportedVersion),
+            (9, 0, RecoveryContextError::UnknownKeyDerivation),
+            (10, 2, RecoveryContextError::UnknownNetwork),
+            (11, 1, RecoveryContextError::NonCanonicalReservedByte),
+        ] {
+            let mut malformed = encoded.clone();
+            malformed[offset] = value;
+            assert_eq!(RecoveryContextV1::decode(&malformed), Err(expected));
+        }
+        let mut empty = encoded.clone();
+        empty[12..14].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(RecoveryContextV1::decode(&empty), Err(RecoveryContextError::EmptyVaultId));
+        let mut oversized = encoded.clone();
+        oversized[12..14].copy_from_slice(&((MAX_VAULT_ID_LEN + 1) as u16).to_le_bytes());
+        assert_eq!(RecoveryContextV1::decode(&oversized), Err(RecoveryContextError::VaultIdTooLong));
+        assert_eq!(
+            RecoveryContextV1::new(
+                VaultKeyDerivation::V3HardenedRoles,
+                false,
+                b"",
+                [1; 32],
+            ),
+            Err(RecoveryContextError::EmptyVaultId),
+        );
+        assert_eq!(
+            RecoveryContextV1::new(
+                VaultKeyDerivation::V3HardenedRoles,
+                false,
+                &vec![1; MAX_VAULT_ID_LEN + 1],
+                [1; 32],
+            ),
+            Err(RecoveryContextError::VaultIdTooLong),
+        );
+        assert_eq!(
+            RecoveryContextV1::new(
+                VaultKeyDerivation::V3HardenedRoles,
+                false,
+                b"vault",
+                [0; 32],
+            ),
+            Err(RecoveryContextError::ZeroRecoveryHash),
+        );
     }
 }
