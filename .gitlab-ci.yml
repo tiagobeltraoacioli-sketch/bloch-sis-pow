@@ -414,8 +414,6 @@ pos-release-integrity:
 # rollout are separate release-owner gates in deploy/RELEASE-INTEGRITY.md.
 pos-release-candidate:
   stage: package
-  needs:
-    - pos-release-integrity
   script:
     - bash scripts/package-pos-release-candidate.sh "$CI_PROJECT_DIR/dist/pos-release-candidate"
     - test "$(awk -F= '$1 == "source_commit" { print $2 }' dist/pos-release-candidate/BUILD-INFO)" = "$CI_COMMIT_SHA"

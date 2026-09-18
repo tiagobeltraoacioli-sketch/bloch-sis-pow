@@ -1,0 +1,43 @@
+Validation wave 9 — 2026-09-17
+Branch: fix/internal-audit-20260917
+Implementation commits: e15e818, a802f8b
+
+PASS
+
+bash -n scripts/package-pos-release-candidate.sh
+  Passed.
+
+ruby -e 'require "yaml"; YAML.safe_load(File.read(".gitlab-ci.yml"), permitted_classes: [], aliases: true)'
+  Passed: GitLab YAML parses as YAML.
+
+scripts/package-pos-release-candidate.sh /private/tmp/bloch-pos-candidate-dirty-test
+  Failed before build as intended because tracked source differed from HEAD.
+
+scripts/package-pos-release-candidate.sh /private/tmp/bloch-pos-candidate-a802f8b
+  Passed from a clean tree with Rust 1.94.1 and the committed Cargo.lock.
+  Produced x86_64-apple-darwin bloch-pos for commit
+  a802f8b382507a1dff064fbead0d4a303a8fd439.
+  SHA256: b38412d5bf60f85d55b6b734c1bae39d10173823492fa9e63d581bba85e0e85c.
+
+shasum -a 256 -c SHA256SUMS
+  bloch-pos: OK.
+
+BUILD-INFO independent checks
+  Every record has exactly one key/value separator.
+  source_commit equals git rev-parse HEAD.
+  tracked_tree_clean=true.
+  signed=false and deployment_authorized=false.
+
+CORRECTED FAILURE
+
+The first clean build passed checksum and commit checks but showed that the
+two-line `bloch-pos --version` output made `binary_version` span two manifest
+lines. Packaging now records `binary_version` and `binary_source_identity` as
+separate one-line fields. The complete clean build and metadata checks were then
+repeated successfully at a802f8b.
+
+NOT RUN / NOT A RELEASE CLAIM
+
+Hosted GitLab CI, canonical Linux container builds, cross-builder comparison,
+release-key signing, publication, fleet inventory and deployment were not run.
+The retained local output is an unsigned candidate and cannot authorize rollout.
