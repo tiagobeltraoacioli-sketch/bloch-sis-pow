@@ -59,7 +59,9 @@ than closed.
 - Adversarial tests cover wrong network/hash, vault-ID and derivation
   substitution, every truncated prefix, trailing bytes, unknown tags,
   noncanonical reserved data, empty/oversized IDs and zero hashes.
-- `cargo test --locked -p bloch-pq-vault --offline`: 38 passed, zero failed.
+- Independent review added a fixed golden byte fixture plus exact 1,024-byte
+  vault-ID/mainnet round-trip coverage. The focused preimage suite passes 7/7
+  and `cargo test --locked -p bloch-pq-vault --offline` passes 40/40.
 - `git diff --check`: passed.
 
 The ledger remains at `IMPLEMENTED: 71`, `PARTIAL: 98`, `UNARMED CANDIDATE:

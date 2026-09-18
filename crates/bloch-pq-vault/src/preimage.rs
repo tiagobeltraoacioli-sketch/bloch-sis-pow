@@ -415,4 +415,43 @@ mod tests {
             Err(RecoveryContextError::ZeroRecoveryHash),
         );
     }
+
+    #[test]
+    fn recovery_context_encoding_has_stable_golden_bytes() {
+        let context = RecoveryContextV1::new(
+            VaultKeyDerivation::V2DedicatedHardenedBranch,
+            true,
+            b"gold",
+            [0xab; 32],
+        ).unwrap();
+        let expected = [
+            0x42, 0x50, 0x51, 0x52, 0x43, 0x54, 0x58, 0x00, // BPQRCTX\0
+            0x01, // recovery-context version
+            0x02, // V2DedicatedHardenedBranch
+            0x01, // mainnet
+            0x00, // reserved
+            0x04, 0x00, // little-endian vault-id length
+            0x67, 0x6f, 0x6c, 0x64, // "gold"
+            0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+            0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+            0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+            0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+        ];
+        assert_eq!(context.encode(), expected);
+        assert_eq!(RecoveryContextV1::decode(&expected).unwrap(), context);
+    }
+
+    #[test]
+    fn recovery_context_round_trips_maximum_vault_id_on_mainnet() {
+        let vault_id = vec![0x5a; MAX_VAULT_ID_LEN];
+        let context = RecoveryContextV1::new(
+            VaultKeyDerivation::V3HardenedRoles,
+            true,
+            &vault_id,
+            [0x7c; 32],
+        ).unwrap();
+        let encoded = context.encode();
+        assert_eq!(encoded.len(), RECOVERY_CONTEXT_FIXED_LEN + MAX_VAULT_ID_LEN);
+        assert_eq!(RecoveryContextV1::decode(&encoded).unwrap(), context);
+    }
 }

@@ -20,10 +20,17 @@ mismatch remains a typed non-retryable boot refusal. Normal boot from genesis
 or a previously verified `ws_latest` needs no new flag and historical bytes are
 not reinterpreted.
 
+The CLI parser also treats those inputs as one fail-closed tuple. It rejects
+incomplete combinations, duplicate options, option tokens used as values and
+weak-subjectivity options placed after `--`. This prevents an operator from
+believing a pin or signer set was active when argument parsing had silently
+ignored or mis-associated it.
+
 Operator guides now show the mandatory pin and state its real trust boundary:
 the fingerprint must arrive through an independent trusted channel. A hash
 downloaded beside the same untrusted envelope and signer-set file proves
-nothing about their origin.
+nothing about their origin. The stale-anchor recovery message and ceremony
+publication checklist now name the same complete three-input requirement.
 
 ## Status and residual
 
@@ -40,5 +47,7 @@ downgrade refusal and mixed-version qualification.
   refused without the pin before its checkpoint can be admitted.
 - Existing mismatch and review-clock substitution regressions retain their
   fail-closed verdicts.
+- Parser regressions cover the complete tuple, incomplete combinations,
+  duplicates, option-as-value confusion and the `--` boundary.
 - Full focused `ws_boot::tests` and operator-document checks are run during
   Wave 50 integration.

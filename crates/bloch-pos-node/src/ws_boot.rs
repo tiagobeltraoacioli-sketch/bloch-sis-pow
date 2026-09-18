@@ -636,17 +636,48 @@ pub struct WsConfig {
 
 impl WsConfig {
     pub fn from_args(args: &[String]) -> Result<Self, String> {
-        let pins = args.iter().filter(|arg| arg.as_str() == "--ws-signer-set-sha3").count();
-        if pins > 1 { return Err("--ws-signer-set-sha3 must be supplied only once".into()); }
-        let pin = crate::arg_value(args, "--ws-signer-set-sha3");
-        if pins == 1 && pin.is_none() { return Err("--ws-signer-set-sha3 requires 64 hexadecimal characters".into()); }
+        let mut checkpoint = None;
+        let mut signer_set = None;
+        let mut pin = None;
+        let mut index = 0;
+        while index < args.len() {
+            if args[index] == "--" {
+                if args[index + 1..].iter().any(|arg| matches!(arg.as_str(),
+                    "--ws-checkpoint" | "--ws-signer-set" | "--ws-signer-set-sha3")) {
+                    return Err("weak-subjectivity options must appear before `--`".into());
+                }
+                break;
+            }
+            let destination = match args[index].as_str() {
+                "--ws-checkpoint" => Some((&mut checkpoint, "--ws-checkpoint")),
+                "--ws-signer-set" => Some((&mut signer_set, "--ws-signer-set")),
+                "--ws-signer-set-sha3" => Some((&mut pin, "--ws-signer-set-sha3")),
+                _ => None,
+            };
+            if let Some((slot, name)) = destination {
+                if slot.is_some() {
+                    return Err(format!("{name} must be supplied only once"));
+                }
+                let value = args.get(index + 1)
+                    .filter(|value| !value.starts_with("--"))
+                    .ok_or_else(|| format!("{name} requires a value"))?;
+                *slot = Some(value.clone());
+                index += 2;
+                continue;
+            }
+            index += 1;
+        }
+        let supplied = [checkpoint.is_some(), signer_set.is_some(), pin.is_some()];
+        if supplied.iter().any(|present| *present) && !supplied.iter().all(|present| *present) {
+            return Err("--ws-checkpoint, --ws-signer-set and --ws-signer-set-sha3 must be supplied together".into());
+        }
         let signer_set_sha3 = pin.map(|value| {
             let bytes = crate::codec::unhex(&value).map_err(|error| format!("--ws-signer-set-sha3: {error}"))?;
             bytes.try_into().map_err(|_| "--ws-signer-set-sha3 requires exactly 32 bytes (64 hex characters)".to_string())
         }).transpose()?;
         Ok(Self {
-            checkpoint: crate::arg_value(args, "--ws-checkpoint").map(PathBuf::from),
-            signer_set: crate::arg_value(args, "--ws-signer-set").map(PathBuf::from),
+            checkpoint: checkpoint.map(PathBuf::from),
+            signer_set: signer_set.map(PathBuf::from),
             signer_set_sha3,
         })
     }
@@ -1051,8 +1082,9 @@ fn where_checkpoints_come_from() -> String {
      2. Compare its 64-hex ws digest across AT LEAST TWO independent channels — \
      agreement across independent operators is the evidence, not the artifact's \
      say-so.\n  \
-     3. Restart with:  --ws-checkpoint <file>   (on devnet builds also \
-     --ws-signer-set <file>, since no signer arrangement is baked in)."
+     3. Obtain the signer-arrangement SHA3-256 fingerprint through an independent \
+     trusted channel, then restart with all three inputs: --ws-checkpoint <file> \
+     --ws-signer-set <file> --ws-signer-set-sha3 <independently-verified-hex32>."
         .to_string()
 }
 
@@ -1655,10 +1687,34 @@ mod tests {
         assert!(WsConfig::from_args(&args(&["--ws-signer-set-sha3", "abcd"])).is_err());
         let pin = "11".repeat(32);
         assert!(WsConfig::from_args(&args(&["--ws-signer-set-sha3", &pin, "--ws-signer-set-sha3", &pin])).is_err());
-        let config = WsConfig::from_args(&args(&["--ws-signer-set-sha3", &pin])).unwrap();
+        for incomplete in [
+            vec!["--ws-checkpoint", "checkpoint.bin"],
+            vec!["--ws-signer-set", "set.bin"],
+            vec!["--ws-signer-set-sha3", pin.as_str()],
+            vec!["--ws-checkpoint", "checkpoint.bin", "--ws-signer-set", "set.bin"],
+        ] {
+            assert!(WsConfig::from_args(&args(&incomplete)).is_err());
+        }
+        assert!(WsConfig::from_args(&args(&["--ws-checkpoint", "--ws-signer-set", "set.bin"])).is_err());
+        assert!(WsConfig::from_args(&args(&["--ws-checkpoint", "a", "--ws-checkpoint", "b",
+            "--ws-signer-set", "set.bin", "--ws-signer-set-sha3", &pin])).is_err());
+        assert!(WsConfig::from_args(&args(&["--", "--ws-checkpoint", "checkpoint.bin",
+            "--ws-signer-set", "set.bin", "--ws-signer-set-sha3", &pin])).is_err());
+        let config = WsConfig::from_args(&args(&["--ws-checkpoint", "checkpoint.bin",
+            "--ws-signer-set", "set.bin", "--ws-signer-set-sha3", &pin])).unwrap();
+        assert_eq!(config.checkpoint, Some(PathBuf::from("checkpoint.bin")));
+        assert_eq!(config.signer_set, Some(PathBuf::from("set.bin")));
         assert_eq!(config.signer_set_sha3, Some([0x11; 32]));
+
+        // Keep a second line of defense for programmatic callers that bypass
+        // the CLI parser: a pin alone must not initialize ws_latest.
+        let invalid = WsConfig {
+            checkpoint: None,
+            signer_set: None,
+            signer_set_sha3: Some([0x11; 32]),
+        };
         let dir = tmpdir("pin-missing-artifacts");
-        let error = boot(&config, &dir, NET, &GEN, &genesis_anchor(), 0, false,
+        let error = boot(&invalid, &dir, NET, &GEN, &genesis_anchor(), 0, false,
             (0, GEN), |_| None, |_| false, |_| None).err().unwrap();
         assert!(is_non_retryable(&error));
         assert!(!dir.join(WS_LATEST_FILE).exists(), "misconfigured pin must not silently initialize trust");

@@ -241,9 +241,11 @@ signatures. Do not publish. Go back to §2.
 - `wscheckpoint-<epoch>.envelope.bin`
 - `signer-set-1.bin`
 - the ws digest, **in the announcement text**
+- the signer-set SHA3-256 fingerprint, **through an independently authenticated
+  channel** (and preferably repeated in every independent announcement)
 
-Agreement of the digest across independent channels is the evidence. The
-artifact's own say-so is not.
+Agreement of the digest and signer-arrangement fingerprint across independent
+channels is the evidence. The artifacts' own say-so is not.
 
 ---
 
