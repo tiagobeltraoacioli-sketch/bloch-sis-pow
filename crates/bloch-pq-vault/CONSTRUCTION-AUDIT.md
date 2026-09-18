@@ -45,6 +45,24 @@ copied, delegated or learned from a witness. Bitcoin checks the preimage hash
 and a classical signature, not a PQ signature. Single-use lifecycle enforcement
 and a complete authenticated recovery manifest remain separate work.
 
+## Checked transaction construction (BV-05/BV-08/BV-19, partial)
+
+New callers can use `build_unvault_tx_checked`,
+`build_branch_a_tx_checked`, and `build_clawback_tx_checked`. These entry points
+reject null outpoints, values above Bitcoin's money range, subtraction
+underflow, dust outputs, and fees above the conservative ten-percent safety
+limit. New unvault and branch-A construction also requires compressed,
+different hot/recovery keys and at least 144 blocks of CSV delay.
+`p2wsh_sighash_checked` rejects an absent input index instead of panicking.
+
+The historical unchecked functions retain their exact behavior for source and
+funded-output compatibility; a regression pins their zero-delay and saturating
+subtraction behavior. The shield API now uses only the checked functions for
+new transaction responses. These checks are construction policy, not Bitcoin
+consensus. They do not estimate current fees, create a fee ladder, authenticate
+an anchor, prove key independence, or make a pre-signed clawback dynamically
+fee-bumpable.
+
 ## Public data exposure (BV-03, still partial)
 
 Even public role keys and unvault intent are sensitive under this design's
