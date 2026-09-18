@@ -26,6 +26,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use bloch_pos_committee::header::BlockEnvelope;
 
@@ -421,6 +422,20 @@ pub struct Store {
     /// read; its `Drop` is the whole point. See [`DirLock`].
     _lock: DirLock,
     generation: std::sync::Arc<std::sync::RwLock<()>>,
+    /// A whole-log replacement being written and published by the dedicated
+    /// reorg writer. Ordinary appends join it first, preserving log order.
+    pending_rewrite: Option<mpsc::Receiver<io::Result<u64>>>,
+    /// Completion can be observed after an append had to join the writer.
+    rewrite_completed: bool,
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        // Keep the data-dir lock alive until a background publisher has
+        // stopped touching the directory. Errors cannot be returned from
+        // Drop; live operation observes them through poll/append and exits.
+        let _ = self.finish_pending_rewrite();
+    }
 }
 
 /// Exclusive ownership of a data dir, for the lifetime of this `Store`.
@@ -807,6 +822,57 @@ fn encode_log_payload(env: &BlockEnvelope) -> io::Result<Vec<u8>> {
     Ok(payload)
 }
 
+/// Durable reorg publication using handles owned only by the writer thread.
+/// Staging deliberately happens before the generation write lock, so bounded
+/// sync readers remain available during the expensive encoding and write.
+fn rewrite_files(
+    dir: &Path,
+    generation: &std::sync::Arc<std::sync::RwLock<()>>,
+    envs: &[BlockEnvelope],
+) -> io::Result<u64> {
+    let destination = dir.join("blocks.log");
+    let mut staging = PrivateStagingFile::create_for(&destination)?;
+    for env in envs {
+        let payload = encode_log_payload(env)?;
+        staging.file_mut().write_all(&(payload.len() as u32).to_le_bytes())?;
+        staging.file_mut().write_all(&payload)?;
+    }
+    staging.file_mut().sync_all()?;
+
+    let index_path = dir.join("blocks.idx");
+    let mut idx = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&index_path)?;
+    publish_staged_rewrite(dir, generation, staging, &mut idx)
+}
+
+/// The short publication transaction shared by synchronous tests/tools and
+/// the asynchronous live writer. Keeping this ordering in one function makes
+/// the existing forced-index-failure regression cover both entry points.
+fn publish_staged_rewrite(
+    dir: &Path,
+    generation: &std::sync::Arc<std::sync::RwLock<()>>,
+    staging: PrivateStagingFile,
+    idx: &mut File,
+) -> io::Result<u64> {
+    let destination = dir.join("blocks.log");
+    let _generation = generation
+        .write()
+        .map_err(|_| io::Error::other("log generation guard poisoned; restart required"))?;
+    // This ordering is the crash-safety contract: an old-generation index is
+    // made durably unusable before the new authoritative log can appear.
+    idx.set_len(0)?;
+    idx.sync_all()?;
+    staging.publish(&destination)?;
+    let log_len = fs::metadata(&destination)?.len();
+    idx.set_len(0)?;
+    repair_index(idx, &destination, log_len)?;
+    Ok(log_len)
+}
+
 impl Store {
     pub(crate) fn directory(&self) -> &Path { &self.dir }
 
@@ -871,7 +937,17 @@ impl Store {
         // Rebuild from header-only log reads; covered length is not identity.
         idx.set_len(0)?;
         repair_index(&mut idx, &dir.join("blocks.log"), log_len)?;
-        Ok(Store { dir: dir.to_path_buf(), log, idx, index_append_enabled: true, log_len, _lock, generation: std::sync::Arc::clone(&generation) })
+        Ok(Store {
+            dir: dir.to_path_buf(),
+            log,
+            idx,
+            index_append_enabled: true,
+            log_len,
+            _lock,
+            generation: std::sync::Arc::clone(&generation),
+            pending_rewrite: None,
+            rewrite_completed: false,
+        })
     }
 
     /// Append one applied block. One write, then fsync — the block is only
@@ -879,6 +955,11 @@ impl Store {
     /// us is durable locally (the producer-side equivocation fence across
     /// restarts).
     pub fn append(&mut self, env: &BlockEnvelope) -> io::Result<()> {
+        // A block applied after a reorg belongs after the replacement log.
+        // Joining here preserves that order if it arrives before the writer's
+        // normal completion poll. The consensus thread is otherwise free
+        // while the rewrite runs.
+        self.finish_pending_rewrite()?;
         let payload = encode_log_payload(env)?;
         // Capacity hint only: saturating is the intended semantics.
         let mut frame = Vec::with_capacity(4usize.saturating_add(payload.len()));
@@ -965,6 +1046,7 @@ impl Store {
     /// crash mid-rewrite leaves either the old log or the new one — never a
     /// half-written file.
     pub fn rewrite(&mut self, envs: &[BlockEnvelope]) -> io::Result<()> {
+        self.finish_pending_rewrite()?;
         let destination = self.dir.join("blocks.log");
         let mut staging = PrivateStagingFile::create_for(&destination)?;
         for env in envs {
@@ -973,26 +1055,97 @@ impl Store {
             staging.file_mut().write_all(&payload)?;
         }
         staging.file_mut().sync_all()?;
-        let _generation = self.generation.write()
-            .map_err(|_| io::Error::other("log generation guard poisoned; restart required"))?;
-        // Invalidate durably BEFORE replacing the authoritative log. Every
-        // crash/error after this point leaves either an empty index or a prefix
-        // rebuilt from the winning log, never plausible offsets from the loser.
-        self.idx.set_len(0)?;
-        self.idx.sync_all()?;
-        // Publication fsyncs the staged file and the directory rename.
-        staging.publish(&destination)?;
+        let generation = std::sync::Arc::clone(&self.generation);
+        publish_staged_rewrite(&self.dir, &generation, staging, &mut self.idx)?;
+        self.reopen_after_rewrite()?;
+        Ok(())
+    }
+
+    /// Start a durable whole-log replacement on a dedicated writer thread.
+    ///
+    /// The worker performs encoding, file writes, fsyncs, index invalidation,
+    /// atomic publication and index reconstruction. The caller must poll with
+    /// [`Store::poll_rewrite`] and fail-stop on an error. [`Store::append`]
+    /// also joins the worker before writing, so a post-reorg block can never
+    /// land in the old generation or before the replacement.
+    pub fn rewrite_async(&mut self, envs: Vec<BlockEnvelope>) -> io::Result<()> {
+        self.finish_pending_rewrite()?;
+        let dir = self.dir.clone();
+        let generation = std::sync::Arc::clone(&self.generation);
+        let (tx, rx) = mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("block-log-reorg-writer".into())
+            .spawn(move || {
+                let result = rewrite_files(&dir, &generation, &envs);
+                let _ = tx.send(result);
+            })?;
+        self.pending_rewrite = Some(rx);
+        Ok(())
+    }
+
+    pub fn rewrite_pending(&self) -> bool {
+        self.pending_rewrite.is_some()
+    }
+
+    /// Poll the reorg writer without waiting. `true` means a rewrite became
+    /// durable since the preceding poll (including one joined by `append`).
+    pub fn poll_rewrite(&mut self) -> io::Result<bool> {
+        if let Some(rx) = self.pending_rewrite.as_ref() {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.pending_rewrite = None;
+                    self.complete_rewrite(result?)?;
+                }
+                Err(mpsc::TryRecvError::Empty) => return Ok(false),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending_rewrite = None;
+                    return Err(io::Error::other("block-log reorg writer terminated without a result"));
+                }
+            }
+        }
+        Ok(std::mem::take(&mut self.rewrite_completed))
+    }
+
+    /// Wait for durable reorg publication during an orderly shutdown.
+    pub fn flush_rewrite(&mut self) -> io::Result<bool> {
+        self.finish_pending_rewrite()?;
+        Ok(std::mem::take(&mut self.rewrite_completed))
+    }
+
+    fn finish_pending_rewrite(&mut self) -> io::Result<()> {
+        let Some(rx) = self.pending_rewrite.take() else { return Ok(()) };
+        let result = rx.recv().map_err(|_| {
+            io::Error::other("block-log reorg writer terminated without a result")
+        })?;
+        self.complete_rewrite(result?)
+    }
+
+    fn complete_rewrite(&mut self, log_len: u64) -> io::Result<()> {
+        self.reopen_after_rewrite()?;
+        if self.log_len != log_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "published block-log length changed before writer completion",
+            ));
+        }
+        self.rewrite_completed = true;
+        Ok(())
+    }
+
+    fn reopen_after_rewrite(&mut self) -> io::Result<()> {
         self.log = OpenOptions::new()
             .create(true)
             .append(true)
             .read(true)
             .open(self.dir.join("blocks.log"))?;
         self.log_len = self.log.metadata()?.len();
-        // A reorg replaces the log, so every offset in the index is now a lie
-        // about a different branch. Throw it away and re-derive it from the
-        // log that won.
-        self.idx.set_len(0)?;
-        repair_index(&mut self.idx, &self.dir.join("blocks.log"), self.log_len)?;
+        self.idx = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.dir.join("blocks.idx"))?;
+        self.idx.seek(SeekFrom::End(0))?;
         self.index_append_enabled = true;
         Ok(())
     }
@@ -1290,6 +1443,112 @@ mod tests {
         assert!(b.try_read().is_ok(), "one store's rewrite must not block unrelated serving");
         drop(held); drop(a); drop(alias); drop(b);
         let _ = fs::remove_dir_all(first); let _ = fs::remove_dir_all(second);
+    }
+
+    #[test]
+    fn asynchronous_rewrite_publishes_then_orders_the_next_append() {
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-store-async-rewrite-order-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x72; 32]).unwrap();
+        store.append(&sample_envelope(1)).unwrap();
+
+        store.rewrite_async(vec![sample_envelope(100), sample_envelope(200)]).unwrap();
+        // `append` must join the writer before it writes. This pins the
+        // generation ordering even when the normal loop has not polled yet.
+        store.append(&sample_envelope(300)).unwrap();
+        assert!(store.poll_rewrite().unwrap(), "joined completion remains observable");
+        assert!(!store.poll_rewrite().unwrap(), "completion is reported once");
+
+        let slots: Vec<_> = store.read_all().unwrap().into_iter()
+            .map(|env| env.header.slot).collect();
+        assert_eq!(slots, vec![100, 200, 300]);
+        let served: Vec<_> = Store::blocks_after(&dir, 0, 10).unwrap().into_iter()
+            .map(|bytes| crate::codec::decode_envelope(&bytes).unwrap().header.slot)
+            .collect();
+        assert_eq!(served, slots, "rebuilt index and authoritative log agree");
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn asynchronous_rewrite_returns_before_durable_publication() {
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-store-async-rewrite-responsive-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x69; 32]).unwrap();
+        store.append(&sample_envelope(1)).unwrap();
+        let generation = std::sync::Arc::clone(&store.generation);
+        let reader = generation.read().unwrap();
+
+        // The writer can stage, but cannot enter its publication transaction
+        // while this reader holds the generation. Returning here proves the
+        // caller did not perform or wait for durable publication itself.
+        store.rewrite_async(vec![sample_envelope(100)]).unwrap();
+        assert!(store.rewrite_pending());
+        assert!(!store.poll_rewrite().unwrap());
+        drop(reader);
+        while !store.poll_rewrite().unwrap() {
+            std::thread::yield_now();
+        }
+        assert_eq!(store.read_all().unwrap()[0].header.slot, 100);
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn asynchronous_rewrite_reports_failure_without_replacing_the_log() {
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-store-async-rewrite-failure-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x71; 32]).unwrap();
+        store.append(&sample_envelope(1)).unwrap();
+        let before_log = fs::read(dir.join("blocks.log")).unwrap();
+        let before_index = fs::read(dir.join("blocks.idx")).unwrap();
+        let mut oversized = sample_envelope(2);
+        oversized.proposer_sig.resize(crate::codec::MAX_FIELD_LEN, 0xAA);
+
+        store.rewrite_async(vec![oversized]).unwrap();
+        let error = loop {
+            match store.poll_rewrite() {
+                Ok(false) => std::thread::yield_now(),
+                Ok(true) => panic!("oversized asynchronous rewrite succeeded"),
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(fs::read(dir.join("blocks.log")).unwrap(), before_log);
+        assert_eq!(fs::read(dir.join("blocks.idx")).unwrap(), before_index);
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dropping_store_joins_the_reorg_writer_before_releasing_the_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-store-async-rewrite-drop-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x70; 32]).unwrap();
+        store.append(&sample_envelope(1)).unwrap();
+        let replacement: Vec<_> = (100..400).map(sample_envelope).collect();
+        store.rewrite_async(replacement).unwrap();
+        drop(store); // must not release DirLock while the worker still writes
+
+        let reopened = Store::open(&dir, &[0x70; 32]).unwrap();
+        let frames = reopened.read_all().unwrap();
+        assert_eq!(frames.len(), 300);
+        assert_eq!(frames.first().unwrap().header.slot, 100);
+        assert_eq!(frames.last().unwrap().header.slot, 399);
+        drop(reopened);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

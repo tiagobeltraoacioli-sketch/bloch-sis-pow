@@ -3894,12 +3894,9 @@ impl Engine {
                 .iter()
                 .map(|(_, id)| self.blocks.get(id.as_bytes()).expect("stored").clone())
                 .collect();
-            if let Err(e) = self.store.rewrite(&canonical_envs) {
-                eprintln!("FATAL: block log rewrite failed: {e}");
+            if let Err(e) = self.store.rewrite_async(canonical_envs) {
+                eprintln!("FATAL: could not start block log rewrite: {e}");
                 std::process::exit(1);
-            }
-            if let Err(e) = self.write_local_cache() {
-                eprintln!("state-cache: post-reorg write failed; restart may require full replay: {e}");
             }
             // Free for the same reason as `apply_canonical`'s: every block
             // in `branch` passed `apply_block`, so the adopted head's header
@@ -3915,7 +3912,7 @@ impl Engine {
                     .unwrap_or_else(|| self.state.state_root()),
             };
             println!(
-                "REORG: adopted branch of {} blocks at ancestor {} (head slot {} -> {}), root {}",
+                "REORG: adopted branch of {} blocks at ancestor {} (head slot {} -> {}), root {}; durable log publication queued",
                 branch.len(),
                 crate::codec::hex8(&ancestor),
                 old_head,
@@ -5430,6 +5427,20 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let mut metrics_sampled_slot: u64 = 0;
 
     loop {
+        match engine.store.poll_rewrite() {
+            Ok(true) => {
+                if let Err(e) = engine.write_local_cache() {
+                    eprintln!("state-cache: post-reorg write failed; restart may require full replay: {e}");
+                }
+            }
+            Ok(false) => {}
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("FATAL: block log rewrite failed: {e}"),
+                ));
+            }
+        }
         let now = now_ms();
         if now < genesis_ms {
             // cannot underflow: now < genesis_ms.
@@ -5458,6 +5469,11 @@ pub fn run(cfg: Config) -> io::Result<()> {
 
         if let Some(stop) = cfg.stop_at_slot {
             if slot >= stop {
+                if engine.store.flush_rewrite()? {
+                    if let Err(e) = engine.write_local_cache() {
+                        eprintln!("state-cache: shutdown post-reorg write failed; restart may require full replay: {e}");
+                    }
+                }
                 let fin = engine.state.finality();
                 println!(
                     "STOP at slot {stop}: head slot {}, {} blocks, state root {}, justified e{} ({}), finalized e{} ({})",
@@ -5500,8 +5516,12 @@ pub fn run(cfg: Config) -> io::Result<()> {
             now,
             two_slots_ms,
         );
-        let duties_blocked =
-            validator_duties_blocked(in_grace, stale_head_quarantined);
+        // A reorg is visible in memory before its replacement log finishes.
+        // Do not spend a signing watermark or broadcast locally produced work
+        // until that canonical generation is durable. RPC/network handling
+        // remains responsive while the writer runs.
+        let duties_blocked = validator_duties_blocked(in_grace, stale_head_quarantined)
+            || engine.store.rewrite_pending();
 
         // Ask for the missing history before considering local signatures.
         // Rate-limited; idempotent on the receiving side (dedup discards
