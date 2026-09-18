@@ -349,6 +349,12 @@ impl NodeMetrics {
             self.get(&self.blocks_rejected_total),
         );
         series(
+            "bloch_pos_boundary_vote_drops_total",
+            "counter",
+            "Epoch-boundary votes admitted at inclusion but absent from the boundary partition; nonzero indicates consensus-roster divergence",
+            bloch_pos_committee::transition::BOUNDARY_VOTE_DROPS.load(Ordering::Relaxed),
+        );
+        series(
             "bloch_pos_rejection_logs_suppressed_total",
             "counter",
             "Rejection diagnostics suppressed by bounded logging; validation and peer verdicts still execute",
@@ -767,6 +773,7 @@ mod tests {
             // gauge and the parked-blocks gauge.
             "bloch_pos_equivocations_observed_total",
             "bloch_pos_finality_rewinds_refused_total",
+            "bloch_pos_boundary_vote_drops_total",
             "bloch_pos_peer_count_devnet",
             "bloch_pos_peer_count_p2p",
             "bloch_pos_keystore_sealed",

@@ -129,7 +129,7 @@ pub fn seed_mix(
 ) -> Option<[u8; 32]> {
     match seed_epoch(epoch) {
         None => Some(*genesis_mix),
-        Some(e) => boundary_mixes.get(e as usize).copied(),
+        Some(e) => boundary_mixes.get(usize::try_from(e).ok()?).copied(),
     }
 }
 
@@ -569,6 +569,17 @@ mod tests {
 
     fn set(n: u32) -> Vec<Validator> {
         (0..n).map(|index| Validator { index, effective_stake: STAKE }).collect()
+    }
+
+    /// A 64-bit epoch must never wrap onto an existing slice entry on a
+    /// 32-bit target. On 64-bit targets it is simply out of range; either way
+    /// missing history is `None`, never the wrong consensus seed.
+    #[test]
+    fn seed_mix_refuses_an_epoch_that_cannot_be_a_slice_index() {
+        let mixes = [[0x22; 32]];
+        let boundary_epoch = u32::MAX as u64 + 1;
+        let epoch = boundary_epoch + MIN_SEED_LOOKAHEAD_EPOCHS + 1;
+        assert_eq!(seed_mix(&[0x11; 32], &mixes, epoch), None);
     }
 
     /// `transition::with_leak_applied`'s exact shape: `saturating_sub`, so a

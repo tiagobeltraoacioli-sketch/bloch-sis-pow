@@ -1438,28 +1438,18 @@ fn report_finality_order_failure(error: finality::FinalityError) {
 /// hence non-fatal in release, fatal in a test build.
 ///
 /// So the requirement behind the guard — *production must be able to SEE this
-/// class of divergence if it ever recurs* — is met without the fatality: an
-/// unconditional, loud, structured, rate-limited line on stderr plus a
-/// counter. The `debug_assert_eq!` at the call site stays, because in a test
-/// build the condition IS a bug and should stop the run.
-///
-/// Rate-limited by power-of-two backoff rather than by a clock: this crate has
-/// no time source and must not acquire one (§5.5), and a replaying node can
-/// close thousands of epochs in seconds. The first eight are printed, then
-/// every doubling, so a live divergence is never silent and a backfill can
-/// never drown the log.
+/// class of divergence if it ever recurs* — is met without making consensus
+/// depend on a potentially blocking stderr write: the unconditional process
+/// counter is exported by the node's Prometheus endpoint. The
+/// `debug_assert_eq!` at the call site stays, because in a test build the
+/// condition IS a bug and should stop the run.
 #[cold]
-fn report_boundary_vote_drop(closing: u64, admitted: usize, tallied: usize) {
-    let n = BOUNDARY_VOTE_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
-    if n <= 8 || n.is_power_of_two() {
-        eprintln!(
-            "BLOCH-CONSENSUS-DIVERGENCE boundary_partition_dropped_votes \
-             epoch={closing} admitted={admitted} tallied={tallied} dropped={} occurrences={n} \
-             note=the inclusion check at step 8 and the boundary tally partitioned different \
-             rosters; expected only after a mid-epoch slashing, a bug otherwise",
-            admitted.saturating_sub(tallied)
-        );
-    }
+fn report_boundary_vote_drop(_closing: u64, _admitted: usize, _tallied: usize) {
+    let _ = BOUNDARY_VOTE_DROPS.fetch_update(
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+        |current| Some(current.saturating_add(1)),
+    );
 }
 
 /// The committed post-state of one block — [`StateTransition::State`].
