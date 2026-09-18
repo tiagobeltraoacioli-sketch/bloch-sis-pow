@@ -47,6 +47,11 @@ The next pass begins with a [canonical `bloch-pos` container
 candidate](WAVE-49-INF01.md). Its recipe and two-builder comparator close a
 repository gap, but no Linux build, signature, publication or rollout is
 claimed.
+Wave 49 adds a [bounded pre-signable clawback fee
+ladder](WAVE-49-VAULT-FEE-LADDER.md) so a keyless watchtower can receive finite
+RBF alternatives without receiving the recovery key. Dynamic fee selection,
+package delivery and relay-policy qualification remain outside that local
+construction change.
 
 ## Scope and source reconciliation
 

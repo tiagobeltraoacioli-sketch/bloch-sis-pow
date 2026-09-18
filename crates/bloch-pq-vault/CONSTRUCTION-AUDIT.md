@@ -27,8 +27,8 @@ key deletion is not a Bitcoin covenant and does not prevent that attack.
 Regressions use real ECDSA/BIP-143 signatures with the existing narrow script
 evaluator: the deposit accepts its separate key and rejects the retained hot
 key, while branch A accepts the hot key and rejects the deposit key. These are
-not Bitcoin Core/bitcoinconsensus or regtest qualification. Watchtower fee
-packages, deletion ceremonies, recovery provenance and external validation
+not Bitcoin Core/bitcoinconsensus or regtest qualification. Watchtower package
+delivery, deletion ceremonies, recovery provenance and external validation
 remain outstanding. Do not treat this as a deployable security product.
 
 ## Restore against the committed hash (BV-10, partial)
@@ -59,9 +59,15 @@ The historical unchecked functions retain their exact behavior for source and
 funded-output compatibility; a regression pins their zero-delay and saturating
 subtraction behavior. The shield API now uses only the checked functions for
 new transaction responses. These checks are construction policy, not Bitcoin
-consensus. They do not estimate current fees, create a fee ladder, authenticate
-an anchor, prove key independence, or make a pre-signed clawback dynamically
-fee-bumpable.
+consensus.
+
+`build_clawback_fee_ladder_checked` adds a bounded, opt-in package of two to 32
+strictly increasing replacement fees. Each transaction independently passes
+the checked value/dust/fee rules and carries its own `SIGHASH_ALL` for offline
+recovery-key signing. A keyless watchtower can receive the resulting finite
+signed package without receiving the key. The builder does not estimate fees,
+guarantee BIP-125 acceptance, distribute or refresh signed packages,
+authenticate an anchor, or prove key independence.
 
 ## Public data exposure (BV-03, still partial)
 
