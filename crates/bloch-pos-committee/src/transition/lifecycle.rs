@@ -198,8 +198,9 @@ impl CommittedState {
                 if !Self::slashing_evidence_active(self.epoch) {
                     return Err(TxReject::EvidenceNotActive);
                 }
+                let roster = self.consensus_roster_at(self.epoch);
                 self.clone()
-                    .apply_slashing_evidence(evidence, 0, total_active_sat, verifier)
+                    .apply_slashing_evidence(evidence, 0, &roster, verifier)
                     .map_err(|_| TxReject::StakingRule)
             }
             PosTransaction::ExitV2 { .. } | PosTransaction::RandaoRecommit { .. } => self

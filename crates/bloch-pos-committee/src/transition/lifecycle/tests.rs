@@ -158,8 +158,9 @@ fn slashing_records_floor_caps_reward_and_extends_withdrawal_lock() {
         }
         state.epoch = 5;
         state.validators.get_mut(&0).unwrap().withdrawable_epoch = 7;
+        let roster = state.consensus_roster_at(state.epoch);
         state
-            .apply_slashing_evidence(&double_vote_evidence(0), 1, principal * 8, &OkVerifier)
+            .apply_slashing_evidence(&double_vote_evidence(0), 1, &roster, &OkVerifier)
             .unwrap();
         let rec = state.validator_record(0).unwrap();
         assert!(rec.staked_sat < principal);

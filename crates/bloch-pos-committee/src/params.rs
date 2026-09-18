@@ -1407,6 +1407,53 @@ pub const FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// The release tests pin this gate to the same epoch as funded admission.
 pub const SLASHING_EVIDENCE_ACTIVATION_EPOCH: u64 = 2_884;
 
+/// Candidate ST-03/ST-04 slashing-economics rules. `u64::MAX` means INERT.
+///
+/// Once armed, the correlation window records the penalty applied to the
+/// offender's effective consensus exposure, measured from the same frozen
+/// roster as the `total_active` denominator. This removes the current
+/// raw-bond/effective-stake unit mismatch. The same flag day also makes a
+/// slash lock the residue for at least the delay a same-epoch voluntary exit
+/// would have imposed; self-slashing can no longer release funds earlier.
+///
+/// This candidate deliberately does not cap or queue slashing ejections.
+/// Evidence still ejects at E+1 so a churn limit cannot buy immunity for a
+/// proven equivocator. Activation therefore remains an economic and liveness
+/// policy decision requiring historical replay, adversarial simulation and a
+/// coordinated release; this source does not make that decision.
+pub const SLASHING_ECONOMICS_V2_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+pub(crate) fn slashing_economics_v2_active(epoch: u64) -> bool {
+    slashing_economics_v2_start(epoch).is_some()
+}
+
+/// First epoch whose effective-exposure window entries belong to V2. At a
+/// future flag day, legacy raw-loss entries remain committed for replay but
+/// are not mixed into the new unit system.
+pub(crate) fn slashing_economics_v2_start(epoch: u64) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(start) = slashing_economics_v2_rehearsal::start() {
+        return (epoch >= start).then_some(start);
+    }
+    epoch_gate_active(epoch, SLASHING_ECONOMICS_V2_ACTIVATION_EPOCH)
+        .then_some(SLASHING_ECONOMICS_V2_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod slashing_economics_v2_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static START: Cell<Option<u64>> = const { Cell::new(None) }; }
+    pub fn start() -> Option<u64> { START.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        open_at(0)
+    }
+    pub fn open_at(epoch: u64) -> impl Drop {
+        struct Restore(Option<u64>);
+        impl Drop for Restore { fn drop(&mut self) { START.with(|v| v.set(self.0)); } }
+        Restore(START.with(|v| v.replace(Some(epoch))))
+    }
+}
+
 /// **Flag day for the transfer dust rule — SHIPS INERT (`u64::MAX`).**
 ///
 /// H-R7-3: the transfer arms accept zero-value outputs, outputs of any

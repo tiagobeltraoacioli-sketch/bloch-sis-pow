@@ -4340,7 +4340,7 @@ impl CommittedState {
         &mut self,
         evidence: &SlashingEvidence,
         including_proposer: u32,
-        total_active_sat: u128,
+        consensus_roster: &[Validator],
         verifier: &dyn SignatureVerifier,
     ) -> Result<(), ()> {
         let offender = match evidence {
@@ -4353,6 +4353,15 @@ impl CommittedState {
             return Err(());
         };
         let own_bond_sat = offender_rec.staked_sat;
+        let total_active_sat = consensus_roster
+            .iter()
+            .map(|v| v.effective_stake as u128)
+            .sum();
+        let offender_effective_sat = consensus_roster
+            .iter()
+            .find(|v| v.index == offender)
+            .map(|v| v.effective_stake as u128)
+            .unwrap_or(0);
         // Refuse unknown historical backing; repeated evidence must not erase
         // an indeterminate classification by manufacturing a newer floor.
         if self.is_write_off_indeterminate(offender) { return Err(()); }
@@ -4412,25 +4421,27 @@ impl CommittedState {
                 // slashing set fields, they do not delete), so evidence
                 // against an exited or already-slashed validator still
                 // resolves its key here.
-                self.slashing.process(
+                self.slashing.process_with_effective_exposure(
                     &pair,
                     self.epoch,
                     own_bond_sat,
                     &exposure,
                     total_active_sat,
+                    offender_effective_sat,
                     including_proposer,
                     verifier,
                     &self.validators,
                 )
             }
             SlashingEvidence::ProposerEquivocation { first, second } => {
-                self.slashing.process_proposer(
+                self.slashing.process_proposer_with_effective_exposure(
                     first,
                     second,
                     self.epoch,
                     own_bond_sat,
                     &exposure,
                     total_active_sat,
+                    offender_effective_sat,
                     including_proposer,
                     verifier,
                     &self.validators,
@@ -4479,7 +4490,12 @@ impl CommittedState {
             // The residue stays reachable through the weak-subjectivity
             // margin, and a slash never *shortens* a scheduled lock
             // (`u64::MAX` means no lock was scheduled at all).
-            let lock = epoch.saturating_add(staking::WITHDRAWAL_DELAY_EPOCHS);
+            let withdrawal_delay = if crate::params::slashing_economics_v2_active(epoch) {
+                staking::EXIT_DELAY_EPOCHS.saturating_add(staking::WITHDRAWAL_DELAY_EPOCHS)
+            } else {
+                staking::WITHDRAWAL_DELAY_EPOCHS
+            };
+            let lock = epoch.saturating_add(withdrawal_delay);
             rec.withdrawable_epoch = if rec.withdrawable_epoch == u64::MAX {
                 lock
             } else {
@@ -5966,7 +5982,7 @@ impl<V: SignatureVerifier> Transition<V> {
                     .apply_slashing_evidence(
                         ev,
                         header.proposer_index,
-                        total_active,
+                        &roster,
                         &self.verifier,
                     )
                     // R7 M1: two hybrid verifications — `apply_slashing_evidence`
@@ -13122,6 +13138,64 @@ mod tests {
 
     // ── slashing through the transition (§7.3) ──────────────────────────────
 
+    #[test]
+    fn slashing_economics_v2_gate_ships_inert() {
+        assert_eq!(
+            crate::params::SLASHING_ECONOMICS_V2_ACTIVATION_EPOCH,
+            u64::MAX,
+            "ST-03/ST-04 changes need an explicit coordinated activation",
+        );
+        for epoch in [0, 2_884, 100_000, u64::MAX] {
+            assert!(!crate::params::slashing_economics_v2_active(epoch));
+        }
+    }
+
+    /// ST-04 candidate: self-slashing may still eject at E+1, because an
+    /// exit queue must not become immunity from proven equivocation, but it
+    /// must not release funds earlier than a voluntary exit requested in the
+    /// same epoch. The cap-free ejection remains an explicit residual.
+    #[test]
+    fn slashing_economics_candidate_removes_the_faster_withdrawal_incentive() {
+        let _candidate = crate::params::slashing_economics_v2_rehearsal::open();
+        let (_t, g, _c) = setup(4);
+        let offender = 0;
+        let mut st = g.clone();
+        let roster = st.consensus_roster_at(st.epoch);
+
+        st.apply_slashing_evidence(&double_vote_evidence(offender), 1, &roster, &OkVerifier)
+            .unwrap();
+
+        let rec = st.validator_record(offender).unwrap();
+        assert_eq!(rec.exit_epoch, st.epoch + 1, "candidate does not queue proven ejection");
+        assert_eq!(
+            rec.withdrawable_epoch,
+            st.epoch + staking::EXIT_DELAY_EPOCHS + staking::WITHDRAWAL_DELAY_EPOCHS,
+            "self-slashing must not unlock earlier than a same-epoch voluntary exit",
+        );
+        assert_eq!(
+            st.voluntary_exits_this_epoch(),
+            0,
+            "cap-free ejection remains residual rather than being silently reclassified",
+        );
+    }
+
+    #[test]
+    fn inert_slashing_economics_gate_preserves_the_historical_lock() {
+        let (_t, g, _c) = setup(4);
+        let offender = 0;
+        let mut st = g.clone();
+        let roster = st.consensus_roster_at(st.epoch);
+
+        st.apply_slashing_evidence(&double_vote_evidence(offender), 1, &roster, &OkVerifier)
+            .unwrap();
+
+        assert_eq!(
+            st.validator_record(offender).unwrap().withdrawable_epoch,
+            st.epoch + staking::WITHDRAWAL_DELAY_EPOCHS,
+            "closed candidate gate must preserve replay exactly",
+        );
+    }
+
     /// A double vote by `v`: two attestations, same target epoch, different
     /// heads. Signatures are the OkVerifier/MarkerVerifier-passing kind.
     fn double_vote_evidence(v: u32) -> SlashingEvidence {
@@ -13372,7 +13446,8 @@ mod tests {
         assert_eq!(activated, delegation::MIN_CHURN_SAT, "fixture premise: exactly half activates");
         assert!(activated < big, "fixture premise: the delegation is still partially queued");
 
-        st.apply_slashing_evidence(&double_vote_evidence(offender), 1, sat(1_000_000), &OkVerifier)
+        let roster = st.consensus_roster_at(st.epoch);
+        st.apply_slashing_evidence(&double_vote_evidence(offender), 1, &roster, &OkVerifier)
             .unwrap();
 
         let expected_loss = activated * slashing::SLASH_PROPOSER_EQUIV_BPS / 10_000;
