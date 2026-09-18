@@ -913,6 +913,14 @@ pub struct RpcCall {
     _permit: crate::connection_limit::Permit,
 }
 
+/// One complete `getblockcount` answer published after a canonical change.
+///
+/// The mutex bundles height, slot and finality into one generation: readers
+/// see either the previous committed answer or the next one, never fields from
+/// both. The value is already-derived, small JSON so a polling client performs
+/// no chain lookup and cannot occupy the consensus thread.
+pub(crate) type SharedBlockCount = Arc<Mutex<Json>>;
+
 /// The production backend: hand the request to the engine's event loop and wait
 /// — except for process-local and state-only reads, which are answered before
 /// the queue (see [`Self::locally`] and [`Self::from_head`]).
@@ -934,6 +942,11 @@ pub struct RpcCall {
 /// the slot loop while the node missed its duties. The `expected_bits` lesson
 /// is about a second *derivation* of a consensus value; this is the same
 /// value, handed over by reference.
+///
+/// `getblockcount` is the other narrow exception. Its six-field answer is
+/// derived by the engine's own formatter and published whole only after a
+/// canonical mutation finishes. It is not independently recomputed by the RPC
+/// thread, and the one-value mutex prevents mixed height/finality generations.
 pub struct EngineBackend {
     /// `Mutex` because `mpsc::Sender` only became `Sync` in Rust 1.72 and this
     /// crate pins no MSRV. The lock is held exactly long enough to clone.
@@ -944,12 +957,19 @@ pub struct EngineBackend {
     /// backend, and a backend with no handle behaves exactly as it did before
     /// this field existed: everything goes through the loop.
     head: Option<crate::engine::SharedHead>,
+    /// Complete canonical summary for the polling-only `getblockcount` call.
+    block_count: Option<SharedBlockCount>,
     pending: Arc<crate::connection_limit::Limits>,
 }
 
 impl EngineBackend {
     pub fn new(engine: Sender<crate::engine::EngineEvent>) -> Self {
-        EngineBackend { engine: Mutex::new(engine), head: None, pending: Arc::default() }
+        EngineBackend {
+            engine: Mutex::new(engine),
+            head: None,
+            block_count: None,
+            pending: Arc::default(),
+        }
     }
 
     /// The production constructor: the channel to the loop, plus the handle on
@@ -958,7 +978,28 @@ impl EngineBackend {
         engine: Sender<crate::engine::EngineEvent>,
         head: crate::engine::SharedHead,
     ) -> Self {
-        EngineBackend { engine: Mutex::new(engine), head: Some(head), pending: Arc::default() }
+        EngineBackend {
+            engine: Mutex::new(engine),
+            head: Some(head),
+            block_count: None,
+            pending: Arc::default(),
+        }
+    }
+
+    /// Production constructor with both immutable-state and canonical-summary
+    /// publication. Kept separate from [`Self::with_head`] so existing callers
+    /// that only publish state retain their exact routing behavior.
+    pub(crate) fn with_published(
+        engine: Sender<crate::engine::EngineEvent>,
+        head: crate::engine::SharedHead,
+        block_count: SharedBlockCount,
+    ) -> Self {
+        EngineBackend {
+            engine: Mutex::new(engine),
+            head: Some(head),
+            block_count: Some(block_count),
+            pending: Arc::default(),
+        }
     }
 
     /// Answer requests whose complete input is compiled into this process.
@@ -974,6 +1015,19 @@ impl EngineBackend {
             RpcRequest::BuildInfo => Some(Ok(build_info_json())),
             _ => None,
         }
+    }
+
+    /// Answer the canonical polling summary without entering the engine queue.
+    fn from_block_count(&self, req: &RpcRequest) -> Option<RpcResult> {
+        if !matches!(req, RpcRequest::BlockCount) {
+            return None;
+        }
+        let published = self.block_count.as_ref()?;
+        let answer = match published.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        Some(Ok(answer))
     }
 
     /// Answer `req` from the published head, or `None` if it is not one of the
@@ -1050,6 +1104,9 @@ impl EngineBackend {
 impl RpcBackend for EngineBackend {
     fn call(&self, req: RpcRequest) -> RpcResult {
         if let Some(answered) = Self::locally(&req) {
+            return answered;
+        }
+        if let Some(answered) = self.from_block_count(&req) {
             return answered;
         }
         if let Some(answered) = self.from_head(&req) {

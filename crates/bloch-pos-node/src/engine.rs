@@ -87,7 +87,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bloch_pos_committee::attestation::{Attestation, AttestationData, KeyLookup, SignatureVerifier};
@@ -1199,6 +1199,9 @@ struct Engine {
     slashprot: SlashingProtection,
     net: net::Net,
     head_slot: Arc<AtomicU64>,
+    /// Complete `getblockcount` response published after each canonical
+    /// change. This is a response snapshot, not mutable consensus state.
+    block_count: rpc::SharedBlockCount,
     /// False during boot replay: no log appends, no broadcasts, no logs.
     live: bool,
     needs_sync: bool,
@@ -1456,6 +1459,30 @@ impl Engine {
     /// Canonical height of the head: `chain.len() - 1`, genesis being height 0.
     fn head_height(&self) -> u64 {
         (self.chain.len() as u64).saturating_sub(1)
+    }
+
+    /// One derivation shared by the engine fallback and published RPC path.
+    fn block_count_reply(&self) -> Json {
+        let fin = self.state.finality();
+        rpc::block_count_json(
+            self.head_height(),
+            self.head_slot_now(),
+            self.finalized_height(),
+            fin.justified.epoch,
+            fin.finalized.epoch,
+        )
+    }
+
+    /// Publish only after state and canonical chain have both moved. Readers
+    /// clone one complete response under the short lock, so they cannot mix a
+    /// new height with old finality (or vice versa).
+    fn publish_block_count(&self) {
+        let next = self.block_count_reply();
+        let mut published = match self.block_count.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *published = next;
     }
 
     /// The committed state root at the head, READ rather than recomputed.
@@ -3599,6 +3626,10 @@ impl Engine {
                     // state root even before finality advances to its epoch.
                     self.enforce_ws_anchor();
                 }
+                // Match the old queued-RPC visibility boundary: publish only
+                // after all synchronous apply work (including the durable
+                // live append) has completed successfully.
+                self.publish_block_count();
                 true
             }
             Err(err) => {
@@ -3973,6 +4004,10 @@ impl Engine {
             // A reorg can move the finalized root at the anchor's epoch.
             self.enforce_ws_anchor();
         }
+        // The old queued reply could run only after `do_reorg` returned. Keep
+        // that visibility boundary: the asynchronous rewrite is at least
+        // accepted (or the process fail-stops) before readers see this head.
+        self.publish_block_count();
         true
     }
 
@@ -4154,10 +4189,10 @@ impl Engine {
 
     // ── RPC service ─────────────────────────────────────────────────────────
     //
-    // Answered on the consensus thread, between duties. Every method reads the
-    // committed state this thread owns, so no query can observe a half-applied
-    // block and no reader can be served a stale copy. The formatting lives in
-    // `rpc.rs` as free functions of their inputs; what is here is only the
+    // Engine fallbacks are answered on the consensus thread, between duties.
+    // Published-head and published-block-count routes bypass this function;
+    // each sees one complete committed generation. The formatting lives in
+    // `rpc.rs` as free functions of its inputs; what is here is only the
     // lookup — which block, which record, which outputs.
 
     /// The slot the wall clock is in, by the manifest's own cadence.
@@ -4302,16 +4337,7 @@ impl Engine {
                 self.net.peer_counts(),
             )),
 
-            RpcRequest::BlockCount => {
-                let fin = self.state.finality();
-                Ok(rpc::block_count_json(
-                    self.head_height(),
-                    self.head_slot_now(),
-                    self.finalized_height(),
-                    fin.justified.epoch,
-                    fin.finalized.epoch,
-                ))
-            }
+            RpcRequest::BlockCount => Ok(self.block_count_reply()),
 
             RpcRequest::BlockBySlot(slot) => {
                 let Some((_, id)) = self.chain.binary_search_by_key(&slot, |(s, _)| *s)
@@ -5081,6 +5107,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         slashprot,
         net,
         head_slot,
+        block_count: Arc::new(Mutex::new(rpc::block_count_json(0, 0, Some(0), 0, 0))),
         live: false,
         needs_sync: false,
         orphans: VecDeque::new(),
@@ -5373,12 +5400,13 @@ pub fn run(cfg: Config) -> io::Result<()> {
     if let Some(port) = cfg.rpc_port {
         // The reads that are bounded by the size of the ledger rather than by
         // the size of the answer (`getbalance`, `getutxos`) are served from
-        // this handle, off the slot loop. Everything else still goes through
-        // the loop, which is where anything touching the mempool or the chain
-        // store belongs.
-        let backend = Arc::new(crate::rpc::EngineBackend::with_head(
+        // this handle, off the slot loop. The small block-count polling answer
+        // is also published whole after canonical changes. Everything that
+        // still touches the mempool or block store stays on the loop.
+        let backend = Arc::new(crate::rpc::EngineBackend::with_published(
             tx.clone(),
             engine.state.published_head(),
+            Arc::clone(&engine.block_count),
         ));
         match crate::rpc::serve(&cfg.rpc_bind, port, backend) {
             Ok(addr) => {
@@ -7811,6 +7839,7 @@ mod transfer_v2_end_to_end {
             slashprot: SlashingProtection::open(&dir).expect("open slashing protection"),
             net,
             head_slot,
+            block_count: Arc::new(Mutex::new(rpc::block_count_json(0, 0, Some(0), 0, 0))),
             live: true,
             needs_sync: false,
             orphans: VecDeque::new(),
@@ -8880,6 +8909,7 @@ mod perf_support {
             slashprot: SlashingProtection::open(&dir).expect("open slashing protection"),
             net,
             head_slot,
+            block_count: Arc::new(Mutex::new(rpc::block_count_json(0, 0, Some(0), 0, 0))),
             live: true,
             needs_sync: false,
             orphans: VecDeque::new(),
@@ -10031,6 +10061,15 @@ mod reorg_state_tests {
             engine.do_reorg(fork_point, Vec::new()),
             "handing the rival back must succeed"
         );
+        let published = match engine.block_count.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        assert_eq!(
+            published,
+            engine.block_count_reply(),
+            "a successful reorg must publish one complete new block-count generation"
+        );
         assert_eq!(
             *engine.head_id().as_bytes(),
             fork_point,
@@ -10612,6 +10651,7 @@ mod duty_view_anchor {
             slashprot: SlashingProtection::open(&dir.0).expect("open slashing protection"),
             net,
             head_slot,
+            block_count: Arc::new(Mutex::new(rpc::block_count_json(0, 0, Some(0), 0, 0))),
             live: true,
             needs_sync: false,
             orphans: VecDeque::new(),
@@ -10876,6 +10916,7 @@ mod slot_horizon {
             store,
             net,
             head_slot,
+            block_count: Arc::new(Mutex::new(rpc::block_count_json(0, 0, Some(0), 0, 0))),
             live: true,
             needs_sync: false,
             last_applied_ms: now_ms(),

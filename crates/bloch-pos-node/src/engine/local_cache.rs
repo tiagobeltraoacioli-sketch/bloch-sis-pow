@@ -88,6 +88,11 @@ impl Engine {
                     self.remember_state(*self.state.head().as_bytes(), self.state.arc());
                     self.ratchet_finalized();
                     self.head_slot.store(self.state.slot(), Ordering::Relaxed);
+                    // A cache hit may consume the entire log, leaving no tail
+                    // block to pass through `apply_canonical`. Publish the
+                    // restored canonical summary here so RPC cannot retain
+                    // the genesis placeholder after a no-tail restart.
+                    self.publish_block_count();
                     println!("state-cache: restored file={name} slot={} skipped_blocks={count}", self.state.slot());
                     return Ok(count);
                 }
@@ -214,6 +219,15 @@ mod tests {
         reset(&mut engine);
         assert_eq!(engine.restore_local_cache(&mut logged).unwrap(), 70);
         assert_eq!(logged.len(), 1, "only uncached tail remains for replay");
+        let published = match engine.block_count.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        assert_eq!(
+            published,
+            engine.block_count_reply(),
+            "cache restore must publish its canonical height even before tail replay"
+        );
         assert_eq!(logged[0].block_id(), next.block_id());
         assert_eq!(engine.blocks[first_id.as_bytes()].proposer_sig.as_ptr(), signature_ptr, "cached envelopes must retain their original allocations");
         assert_eq!(*engine.state, *at_cache);

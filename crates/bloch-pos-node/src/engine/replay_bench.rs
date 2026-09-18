@@ -678,6 +678,13 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
             .expect("open slashing protection"),
         net,
         head_slot,
+        block_count: Arc::new(std::sync::Mutex::new(crate::rpc::block_count_json(
+            0,
+            0,
+            Some(0),
+            0,
+            0,
+        ))),
         live: false,
         needs_sync: false,
         orphans: VecDeque::new(),

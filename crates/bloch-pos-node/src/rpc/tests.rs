@@ -688,6 +688,32 @@ fn build_info_is_answered_before_the_engine_queue() {
     );
 }
 
+/// The block-count polling response is one complete published generation and
+/// does not consume engine queue capacity. A chain-owned query without such a
+/// publication still proves the dropped receiver is genuinely unavailable.
+#[test]
+fn block_count_is_answered_from_the_published_canonical_summary() {
+    use std::sync::Mutex as StdMutex;
+
+    let state = Arc::new(state_with_balances());
+    let head: crate::engine::SharedHead = Arc::new(StdMutex::new(state));
+    let expected = block_count_json(17, 23, Some(11), 2, 1);
+    let published: SharedBlockCount = Arc::new(StdMutex::new(expected.clone()));
+    let (tx, rx) = std::sync::mpsc::channel();
+    drop(rx);
+
+    let backend = EngineBackend::with_published(tx, head, published);
+    assert_eq!(
+        backend.call(RpcRequest::BlockCount),
+        Ok(expected),
+        "published block count must not need a listening consensus thread"
+    );
+    assert!(
+        backend.call(RpcRequest::ChainInfo).is_err(),
+        "other chain-owned reads must still cross the unavailable queue"
+    );
+}
+
 #[test]
 fn getmempoolinfo_reports_size_capacity_and_the_next_price() {
     let v = mempool_info_json(7, 4_096, 1_750, 1_000, 12, 34, 9, 3);
