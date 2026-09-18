@@ -777,6 +777,13 @@ pub struct LogInspection {
     pub issue: Option<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct LogRepair {
+    pub original_bytes: u64,
+    pub retained_bytes: u64,
+    pub backup_bytes: u64,
+}
+
 pub fn inspect_log(dir: &Path) -> io::Result<LogInspection> {
     let mut log = File::open(dir.join("blocks.log"))?;
     let length = log.metadata()?.len();
@@ -811,6 +818,125 @@ pub fn inspect_log(dir: &Path) -> io::Result<LogInspection> {
         return Err(io::Error::new(io::ErrorKind::WouldBlock, "block log changed during inspection; stop the node or inspect an immutable copy"));
     }
     Ok(report)
+}
+
+/// Offline, operator-confirmed recovery of an unambiguously damaged trailing
+/// write. The ordinary log format remains unchanged and no decoded or
+/// consensus-invalid complete frame is ever removed by this function.
+///
+/// `expected_prefix` must exactly match a fresh [`inspect_log`] result. The
+/// removable suffix must be either an incomplete length/body or entirely
+/// zero-filled after the last decodable frame. A durable, exclusively-created
+/// backup of the removed raw bytes is completed before truncation.
+pub fn repair_log_tail_offline(
+    dir: &Path,
+    expected_prefix: u64,
+    backup_path: &Path,
+) -> io::Result<LogRepair> {
+    let _lock = DirLock::acquire(dir)?;
+    let report = inspect_log(dir)?;
+    if report.valid_prefix_bytes != expected_prefix {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "confirmed prefix {expected_prefix} does not match freshly inspected prefix {}",
+                report.valid_prefix_bytes
+            ),
+        ));
+    }
+    let Some(issue) = report.issue.as_deref() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "block log has no damaged tail",
+        ));
+    };
+    if expected_prefix >= report.log_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "inspection did not identify a non-empty damaged tail",
+        ));
+    }
+
+    let mut log = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join("blocks.log"))?;
+    if log.metadata()?.len() != report.log_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "block log changed after inspection; retry against a stopped node",
+        ));
+    }
+    log.seek(SeekFrom::Start(expected_prefix))?;
+    let structurally_incomplete = issue == "incomplete trailing length prefix"
+        || issue.starts_with("incomplete frame body;");
+    let mut all_zero = true;
+    let mut remaining = report.log_bytes.saturating_sub(expected_prefix);
+    let mut buffer = [0u8; 8192];
+    while remaining > 0 {
+        let take = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "damaged tail length does not fit memory indexing",
+                )
+            })?;
+        log.read_exact(&mut buffer[..take])?;
+        all_zero &= buffer[..take].iter().all(|byte| *byte == 0);
+        remaining = remaining.saturating_sub(take as u64);
+    }
+    if !structurally_incomplete && !all_zero {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "refusing repair: suffix is not an incomplete frame or an all-zero power-loss tail",
+        ));
+    }
+
+    let backup_parent = backup_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let reserved_name = matches!(
+        backup_path.file_name().and_then(|name| name.to_str()),
+        Some("blocks.log" | "blocks.idx" | "meta.bin" | "LOCK")
+    );
+    if reserved_name && fs::canonicalize(backup_parent)? == fs::canonicalize(dir)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "backup must not use a store-managed filename in the data directory",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut backup = options.open(backup_path)?;
+    log.seek(SeekFrom::Start(expected_prefix))?;
+    let removed = report.log_bytes.saturating_sub(expected_prefix);
+    let copied = io::copy(&mut (&log).take(removed), &mut backup)?;
+    if copied != removed {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "block log changed while copying the damaged tail"));
+    }
+    backup.sync_all()?;
+    fsync_dir(backup_parent)?;
+
+    if log.metadata()?.len() != report.log_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "block log changed before truncation; backup retained, log unchanged by this tool",
+        ));
+    }
+    log.set_len(expected_prefix)?;
+    log.sync_all()?;
+    fsync_dir(dir)?;
+    Ok(LogRepair {
+        original_bytes: report.log_bytes,
+        retained_bytes: expected_prefix,
+        backup_bytes: copied,
+    })
 }
 
 fn encode_log_payload(env: &BlockEnvelope) -> io::Result<Vec<u8>> {
@@ -1600,6 +1726,62 @@ mod tests {
             assert!(!dir.join("LOCK").exists());
             assert!(!dir.join("blocks.idx").exists());
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn offline_tail_repair_backs_up_only_confirmed_incomplete_or_zero_suffixes() {
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-store-tail-repair-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("blocks.log");
+        let payload = crate::codec::encode_envelope(&sample_envelope(1));
+        let mut valid = (payload.len() as u32).to_le_bytes().to_vec();
+        valid.extend_from_slice(&payload);
+
+        let mut damaged = valid.clone();
+        damaged.extend_from_slice(&[0u8; 12]);
+        fs::write(&path, &damaged).unwrap();
+        let backup = dir.join("zero-tail.backup");
+        let live_lock = DirLock::acquire(&dir).unwrap();
+        let live_error =
+            repair_log_tail_offline(&dir, valid.len() as u64, &backup).unwrap_err();
+        assert_eq!(live_error.kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(fs::read(&path).unwrap(), damaged);
+        assert!(!backup.exists());
+        drop(live_lock);
+
+        let repaired = repair_log_tail_offline(&dir, valid.len() as u64, &backup).unwrap();
+        assert_eq!(repaired.retained_bytes, valid.len() as u64);
+        assert_eq!(repaired.backup_bytes, 12);
+        assert_eq!(fs::read(&path).unwrap(), valid);
+        assert_eq!(fs::read(&backup).unwrap(), [0u8; 12]);
+
+        fs::write(&path, &damaged).unwrap();
+        let existing = repair_log_tail_offline(&dir, valid.len() as u64, &backup).unwrap_err();
+        assert_eq!(existing.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&path).unwrap(), damaged);
+
+        let mut corrupt = valid.clone();
+        corrupt.extend_from_slice(&[1, 0, 0, 0, 0xff]);
+        fs::write(&path, &corrupt).unwrap();
+        let refused_backup = dir.join("corrupt-tail.backup");
+        let error =
+            repair_log_tail_offline(&dir, valid.len() as u64, &refused_backup).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&path).unwrap(), corrupt);
+        assert!(!refused_backup.exists());
+
+        let mut incomplete = valid.clone();
+        incomplete.extend_from_slice(&[5, 0, 0, 0, 0xaa]);
+        fs::write(&path, &incomplete).unwrap();
+        let incomplete_backup = dir.join("incomplete-tail.backup");
+        repair_log_tail_offline(&dir, valid.len() as u64, &incomplete_backup).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), valid);
+        assert_eq!(fs::read(&incomplete_backup).unwrap(), [5, 0, 0, 0, 0xaa]);
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -176,6 +176,38 @@ fn main() {
                 Err(error) => { eprintln!("block-log-inspect: {error}"); exit(2); }
             }
         }
+        Some("block-log-repair-tail") => {
+            let parameters = &args[1..];
+            if parameters.len() != 6
+                || parameters[0] != "--data-dir"
+                || parameters[2] != "--truncate-to"
+                || parameters[4] != "--backup"
+            {
+                eprintln!("usage: bloch-pos block-log-repair-tail --data-dir <stopped-node> --truncate-to <inspected-offset> --backup <new-file>");
+                exit(2);
+            }
+            let truncate_to = match parameters[3].parse::<u64>() {
+                Ok(value) => value,
+                Err(_) => {
+                    eprintln!("block-log-repair-tail: invalid --truncate-to offset");
+                    exit(2);
+                }
+            };
+            match store::repair_log_tail_offline(
+                std::path::Path::new(&parameters[1]),
+                truncate_to,
+                std::path::Path::new(&parameters[5]),
+            ) {
+                Ok(report) => println!(
+                    "block-log-repair-tail: retained_bytes={} removed_bytes={} original_bytes={} backup={}",
+                    report.retained_bytes, report.backup_bytes, report.original_bytes, parameters[5]
+                ),
+                Err(error) => {
+                    eprintln!("block-log-repair-tail: {error}");
+                    exit(2);
+                }
+            }
+        }
         Some("slashing-protection") => {
             if let Err(error) = slashing_cli::run(&args[1..]) {
                 eprintln!("slashing-protection: {error}");
@@ -222,6 +254,9 @@ fn print_help() {
          USAGE:\n\
            bloch-pos block-log-inspect --data-dir <stopped-node-or-copy>\n\
                Read-only bounded block-log framing/codec diagnosis. No repair.\n\
+           bloch-pos block-log-repair-tail --data-dir <stopped-node> \\\n+               --truncate-to <inspected-offset> --backup <new-file>\n\
+               Repair only an incomplete/all-zero tail after exact offset\n\
+               confirmation and a durable raw-byte backup.\n\
            bloch-pos selfcheck\n\
                Verify the frozen consensus parameters this binary links.\n\
            bloch-pos buildinfo\n\

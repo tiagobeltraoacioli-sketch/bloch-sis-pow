@@ -26,3 +26,50 @@ fn offline_diagnostic_reports_corruption_without_mutating_log_or_creating_store_
     assert_eq!(fs::read(&log).unwrap(), [0, 0, 0, 0]);
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn offline_repair_requires_the_inspected_offset_and_preserves_the_removed_tail() {
+    let directory = std::env::temp_dir().join(format!(
+        "bloch-log-repair-cli-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&directory);
+    fs::create_dir_all(&directory).unwrap();
+    let log = directory.join("blocks.log");
+    let backup = directory.join("removed-tail.bin");
+    let damaged = [0u8; 12];
+    fs::write(&log, damaged).unwrap();
+
+    let wrong = Command::new(env!("CARGO_BIN_EXE_bloch-pos"))
+        .arg("block-log-repair-tail")
+        .arg("--data-dir")
+        .arg(&directory)
+        .arg("--truncate-to")
+        .arg("1")
+        .arg("--backup")
+        .arg(&backup)
+        .output()
+        .unwrap();
+    assert_eq!(wrong.status.code(), Some(2));
+    assert_eq!(fs::read(&log).unwrap(), damaged);
+    assert!(!backup.exists());
+
+    let repaired = Command::new(env!("CARGO_BIN_EXE_bloch-pos"))
+        .arg("block-log-repair-tail")
+        .arg("--data-dir")
+        .arg(&directory)
+        .arg("--truncate-to")
+        .arg("0")
+        .arg("--backup")
+        .arg(&backup)
+        .output()
+        .unwrap();
+    assert!(
+        repaired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repaired.stderr)
+    );
+    assert!(fs::read(&log).unwrap().is_empty());
+    assert_eq!(fs::read(&backup).unwrap(), damaged);
+    fs::remove_dir_all(directory).unwrap();
+}
