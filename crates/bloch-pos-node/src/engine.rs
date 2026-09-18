@@ -2392,30 +2392,6 @@ impl Engine {
             // adoptable. Do not convert it into a missing-parent sync request.
             return (Verdict::Ignore, None);
         }
-        // A cheap early reject before the block reaches the transition, using
-        // the same `derive::*` functions the transition checks with — one
-        // definition, called twice, not two definitions. The transition is the
-        // authority (step 3b); this only avoids paying for a state clone on a
-        // block that is obviously mismatched.
-        if env.header.attestation_root != derive::attestation_root(&env.body.attestations)
-            || env.header.body_root != derive::body_root(&env.body.transactions)
-        {
-            crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!(
-                "reject {}: body/attestation commitment mismatch",
-                crate::codec::hex8(&id)
-            ));
-            return (Verdict::Reject, None);
-        }
-        // A block carrying transactions used to be rejected here, because the
-        // node had no tx codec and failing closed was the honest response. The
-        // codec exists now (`PosTransaction::from_canonical_bytes`), so the
-        // check that replaces it is decodability: bytes this build cannot read
-        // must not reach the transition, since the proposer's post-state would
-        // then be unreproducible.
-        if let Err(e) = body_transactions(&env) {
-            crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!("reject {}: {e}", crate::codec::hex8(&id)));
-            return (Verdict::Reject, None);
-        }
         if env.header.slot == 0 {
             // genesis is synthesized, never received
             return (Verdict::Reject, None);
@@ -2576,6 +2552,35 @@ impl Engine {
             ));
             return (Verdict::Reject, None);
         }
+
+        // TX-16: authenticate the fixed-size header BEFORE hashing or decoding
+        // the attacker-sized body. The proposal signature commits to
+        // `body_root` and `attestation_root`; only a registered proposer can
+        // therefore buy the Merkle work and transaction decoding below. The
+        // transition remains authoritative and repeats these checks against
+        // the parent state when the block is applied.
+        if env.header.attestation_root != derive::attestation_root(&env.body.attestations)
+            || env.header.body_root != derive::body_root(&env.body.transactions)
+        {
+            crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!(
+                "reject {}: body/attestation commitment mismatch",
+                crate::codec::hex8(&id)
+            ));
+            return (Verdict::Reject, None);
+        }
+        // A block carrying transactions used to be rejected here, because the
+        // node had no tx codec and failing closed was the honest response. The
+        // codec exists now (`PosTransaction::from_canonical_bytes`), so bytes
+        // this build cannot read must not reach the transition. Retain the
+        // decoded vector for the registry-growth scan instead of parsing the
+        // same untrusted bytes twice.
+        let decoded_transactions = match body_transactions(&env) {
+            Ok(txs) => txs,
+            Err(e) => {
+                crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!("reject {}: {e}", crate::codec::hex8(&id)));
+                return (Verdict::Reject, None);
+            }
+        };
         // Authenticated near-future blocks must not enter fork choice until
         // their signed slot. Bound both count and payload memory (EN-05).
         if src.bounded_by_wall_clock() && self.live && env.header.slot > self.wall_slot() {
@@ -2598,12 +2603,8 @@ impl Engine {
         // Read before `env` moves: whether this block could have registered a
         // validator index. Decoding already succeeded above, so this is a
         // scan of a decoded list, not a second parse.
-        let grew_registry = body_transactions(&env)
-            .map(|txs| {
-                txs.iter()
-                    .any(|tx| matches!(tx, PosTransaction::Deposit { .. } | PosTransaction::FundedDeposit(_)))
-            })
-            .unwrap_or(false);
+        let grew_registry = decoded_transactions.iter()
+            .any(|tx| matches!(tx, PosTransaction::Deposit { .. } | PosTransaction::FundedDeposit(_)));
         // Read before `env` moves — R6 HIGH-8: an authenticated (this door's
         // signature check already ran, above) proposal by `proposer_index`
         // is exactly the class of sighting doppelgänger protection exists to
@@ -10656,9 +10657,9 @@ mod slot_horizon {
         }
     }
 
-    /// An envelope that clears every check `ingest_judged` runs BEFORE the
-    /// horizon — the body/attestation commitments and the tx decode — so the
-    /// horizon is the only thing left that can refuse it. It names a parent
+    /// An envelope that clears the structural checks `ingest_judged` can run
+    /// around the horizon. The horizon deliberately precedes authentication,
+    /// so an absurd slot is the only thing left that can refuse it. It names a parent
     /// this node does not have, which is on purpose: a block that fails the
     /// horizon must never be stored, and one that passes it must be stored
     /// even though it cannot be applied. That separates "did the door let it
@@ -11112,6 +11113,29 @@ mod ingest_admission_tests {
             "a provable forgery must not consume a slot the honest gap needs"
         );
         assert_eq!(engine.rejected_unsigned, 1, "and it must be counted");
+    }
+
+    /// TX-16: an unauthenticated sender must not buy Merkle hashing or body
+    /// decoding. Combining a forged proposer signature with a body whose
+    /// bytes disagree with the signed root pins the precedence: signature
+    /// rejection must win. Moving the commitment/decode checks back above the
+    /// identity gate makes this return first without incrementing the forged
+    /// signature counter.
+    #[test]
+    fn forged_proposer_is_refused_before_malformed_body_work() {
+        let (mut engine, _dir, template, stored) = fixture();
+
+        let mut forged = repointed(&engine, &template, [0x9A; 32], 2);
+        forged.proposer_sig.fill(0);
+        forged.body.transactions.push(vec![0xFF; 4096]);
+        // Keep the signed header's original empty body_root on purpose.
+        let verdict = engine.ingest_judged(forged);
+
+        assert_eq!(verdict, Verdict::Reject);
+        assert_eq!(engine.rejected_unsigned, 1,
+            "authentication must run before body hashing or decoding");
+        assert_eq!(engine.blocks.len(), stored);
+        assert!(engine.orphans.is_empty());
     }
 
     /// **O04 (external audit 2026-09-07): a signature failure under a
