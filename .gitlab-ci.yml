@@ -447,7 +447,7 @@ rollback-package-integrity:
   stage: check
   before_script: []
   script:
-    - command -v minisign >/dev/null || sudo apt-get install -y minisign || true
+    - command -v minisign >/dev/null || { echo "minisign must be provisioned on the runner" >&2; exit 1; }
     - bash deploy/rollback/make-rollback-package.selftest.sh
   allow_failure: false
 
@@ -852,5 +852,5 @@ ustav-native:
   stage: test
   timeout: 45m
   script:
-    - python3 scripts/check-ustav-pq-boundary.py cargo +1.94.1
-    - cargo +1.94.1 test --locked -p bloch-euvm -p bloch-ustav
+    - python3 scripts/check-ustav-pq-boundary.py cargo +"$(python3 scripts/pinned-rust-toolchain.py)"
+    - cargo +"$(python3 scripts/pinned-rust-toolchain.py)" test --locked -p bloch-euvm -p bloch-ustav
