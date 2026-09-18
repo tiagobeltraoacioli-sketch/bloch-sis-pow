@@ -60,8 +60,10 @@ Wave 50 removes the simultaneous raw whole-log boot copy via
 replay, retention growth and production-scale recovery qualification remain.
 Wave 50 adds a [strict BV-10 public recovery context](WAVE-50-BV10.md) that
 records the vault key family, network, vault ID and funded recovery hash for
-deterministic restore. It does not provide a global reuse registry or make an
-unauthenticated backup authoritative.
+deterministic restore. Wave 51 adds an opt-in
+[PQ-authenticated context envelope](WAVE-51-BV10-SIGNED-CONTEXT.md) verified
+against an independently trusted owner key before restore. Neither change
+provides a global reuse/single-use registry or on-chain PQ proof.
 External weak-subjectivity onboarding now requires a [mandatory independently
 distributed signer-arrangement pin](WAVE-50-SR02.md), including fail-closed CLI
 tuple parsing. The V1 checkpoint digest still does not bind the arrangement.
