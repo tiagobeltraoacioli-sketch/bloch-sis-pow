@@ -595,6 +595,77 @@ pub mod falcon {
         falcon1024::verify_detached_signature(&sig, message, &pk).is_ok()
     }
 
+    /// Verify only Falcon-1024's compact, non-padded detached encoding.
+    ///
+    /// The historical verifier deliberately accepts PQClean's alternate
+    /// 1280-byte zero-padded representation. That is consensus compatibility,
+    /// but it also gives one mathematical signature two byte encodings. New
+    /// non-consensus formats can opt into this entry point to require the exact
+    /// compact encoding emitted by [`sign`].
+    pub fn verify_canonical(
+        public_key_bytes: &[u8],
+        message: &[u8],
+        signature_bytes: &[u8],
+    ) -> bool {
+        is_compact_signature_encoding(signature_bytes)
+            && verify(public_key_bytes, message, signature_bytes)
+    }
+
+    const FALCON1024_HEADER: u8 = 0x30 + 10;
+    const FALCON_NONCE_LEN: usize = 40;
+    const FALCON1024_COEFFICIENTS: usize = 1024;
+
+    fn is_compact_signature_encoding(signature: &[u8]) -> bool {
+        if signature.len() <= 1 + FALCON_NONCE_LEN || signature[0] != FALCON1024_HEADER {
+            return false;
+        }
+        let encoded = &signature[1 + FALCON_NONCE_LEN..];
+        compact_encoding_len(encoded) == Some(encoded.len())
+    }
+
+    /// Length-only mirror of PQClean's `comp_decode` framing. It validates the
+    /// unique sign/magnitude+unary encoding without performing signature math.
+    fn compact_encoding_len(encoded: &[u8]) -> Option<usize> {
+        let mut accumulator = 0u32;
+        let mut remaining_bits = 0u32;
+        let mut consumed = 0usize;
+
+        for _ in 0..FALCON1024_COEFFICIENTS {
+            let next = *encoded.get(consumed)?;
+            consumed += 1;
+            accumulator = (accumulator << 8) | u32::from(next);
+            let first = accumulator >> remaining_bits;
+            let sign = first & 128;
+            let mut magnitude = first & 127;
+
+            loop {
+                if remaining_bits == 0 {
+                    let next = *encoded.get(consumed)?;
+                    consumed += 1;
+                    accumulator = (accumulator << 8) | u32::from(next);
+                    remaining_bits = 8;
+                }
+                remaining_bits -= 1;
+                if ((accumulator >> remaining_bits) & 1) != 0 {
+                    break;
+                }
+                magnitude += 128;
+                if magnitude > 2047 {
+                    return None;
+                }
+            }
+            if sign != 0 && magnitude == 0 {
+                return None;
+            }
+        }
+
+        let unused_mask = (1u32 << remaining_bits).wrapping_sub(1);
+        if accumulator & unused_mask != 0 {
+            return None;
+        }
+        Some(consumed)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -607,6 +678,34 @@ pub mod falcon {
             assert!(!verify(&pk, b"other message", &sig), "wrong message must fail");
             let mut bad = sig.clone(); bad[0] ^= 0x01;
             assert!(!verify(&pk, msg, &bad), "tampered sig must fail");
+        }
+
+        #[test]
+        fn canonical_verifier_rejects_the_legacy_zero_padded_variant() {
+            let (pk, sk) = keypair();
+            let msg = b"falcon-canonical-encoding";
+            let sig = sign(&sk, msg).unwrap();
+            assert!(verify_canonical(&pk, msg, &sig));
+
+            let mut padded = sig.clone();
+            padded.resize(
+                pqcrypto_falcon::falconpadded1024::signature_bytes(),
+                0,
+            );
+            assert_ne!(
+                padded, sig,
+                "fresh compact signature must leave padding room"
+            );
+            assert!(
+                verify(&pk, msg, &padded),
+                "legacy verifier accepts PQClean padding"
+            );
+            assert!(!verify_canonical(&pk, msg, &padded));
+
+            assert!(!verify_canonical(&pk, msg, &sig[..sig.len() - 1]));
+            let mut tampered = sig;
+            tampered[1] ^= 1;
+            assert!(!verify_canonical(&pk, msg, &tampered));
         }
 
         // ── F1 guard: the constant-time `clean` path must be the ONLY Falcon ──
