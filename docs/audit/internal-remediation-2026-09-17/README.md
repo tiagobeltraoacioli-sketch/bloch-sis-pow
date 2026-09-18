@@ -52,6 +52,9 @@ ladder](WAVE-49-VAULT-FEE-LADDER.md) so a keyless watchtower can receive finite
 RBF alternatives without receiving the recovery key. Dynamic fee selection,
 package delivery and relay-policy qualification remain outside that local
 construction change.
+The [Wave 49 integration checkpoint](WAVE-49-INTEGRATION.md) combines the
+release, CI, block-log recovery and vault work, including independent review
+findings and the remaining launch blockers.
 
 ## Scope and source reconciliation
 
