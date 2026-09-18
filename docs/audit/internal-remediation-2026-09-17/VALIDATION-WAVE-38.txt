@@ -1,0 +1,26 @@
+Validation wave 38 — 2026-09-18
+Branch: fix/internal-audit-20260917
+Evidence reconciliation only; no new implementation commit.
+
+PASS
+
+cargo test --locked --offline -p bloch-euvm --test chameleon
+  12 passed; 0 failed; 0 ignored.
+
+cargo test --locked --offline -p bloch-ustav --test chameleon_crypto
+  1 passed; 0 failed; 0 ignored.
+
+Ledger parser
+  200 rows; 200 unique finding IDs.
+  66 IMPLEMENTED; 87 PARTIAL; 33 OPEN; 7 BASE CHANGED;
+  4 PROTOCOL DECISION; 1 UNARMED CANDIDATE;
+  1 REFUTED IN AUDIT; 1 VERIFIED POSITIVE.
+
+git diff --check
+  Passed after the documentation update.
+
+BOUNDARY
+
+The implementation is an escrow/representation bridge, not a chameleon hash.
+Foreign checkpoint authentication and consensus integration remain external;
+BV-16 is PARTIAL.
