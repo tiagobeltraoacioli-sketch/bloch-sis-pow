@@ -1,11 +1,12 @@
 //! Official NIST ACVP sample sigVer fixtures, not ACVP certification or keygen KATs.
 //! See vectors/ACVP-MLDSA-PROVENANCE.md for exact source and scope.
 use pqcrypto_mldsa::mldsa65;
-use pqcrypto_traits::sign::{DetachedSignature as _, PublicKey as _};
+use pqcrypto_traits::sign::{DetachedSignature as _, PublicKey as _, SecretKey as _};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const FIXTURE: &[u8] = include_bytes!("vectors/acvp-mldsa65-sigver.json");
+const KEYGEN_FIXTURE: &[u8] = include_bytes!("vectors/acvp-mldsa65-keygen-tc26.json");
 
 fn cases() -> Vec<Value> {
     assert_eq!(hex::encode(Sha256::digest(FIXTURE)),
@@ -47,4 +48,40 @@ fn production_empty_context_wrapper_rejects_context_bound_positives_and_official
             &bytes(&case, "pk"), &bytes(&case, "message"), &bytes(&case, "signature")),
             "empty-context wrapper must reject tcId {}", case["tcId"]);
     }
+}
+
+#[test]
+fn production_signer_interoperates_with_an_official_acvp_keypair() {
+    assert_eq!(
+        hex::encode(Sha256::digest(KEYGEN_FIXTURE)),
+        "d062ba074dda6ddf44b545e3612f82c36c231fe1f95cc5e5fc8c29a28f63b4f4"
+    );
+    let fixture: Value = serde_json::from_slice(KEYGEN_FIXTURE).unwrap();
+    assert_eq!(fixture["parameterSet"], "ML-DSA-65");
+    assert_eq!(fixture["tcId"], 26);
+    assert_eq!(bytes(&fixture, "seed").len(), 32);
+
+    let public_key = mldsa65::PublicKey::from_bytes(&bytes(&fixture, "pk")).unwrap();
+    let secret_key = mldsa65::SecretKey::from_bytes(&bytes(&fixture, "sk")).unwrap();
+    let message = b"Bloch NIST ACVP key interoperability";
+    let signature = mldsa65::detached_sign(message, &secret_key);
+
+    assert!(bloch_crypto::crypto::verify_mldsa65_raw(
+        public_key.as_bytes(),
+        message,
+        signature.as_bytes(),
+    ));
+    assert!(!bloch_crypto::crypto::verify_mldsa65_raw(
+        public_key.as_bytes(),
+        b"wrong message",
+        signature.as_bytes(),
+    ));
+
+    let mut bad_signature = signature.as_bytes().to_vec();
+    bad_signature[0] ^= 1;
+    assert!(!bloch_crypto::crypto::verify_mldsa65_raw(
+        public_key.as_bytes(),
+        message,
+        &bad_signature,
+    ));
 }
