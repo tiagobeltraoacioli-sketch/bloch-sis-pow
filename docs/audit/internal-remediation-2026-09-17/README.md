@@ -20,6 +20,8 @@ The related [sub-epoch duty-view finding](WAVE-46-FC08.md) is retained as
 partial because its source-checkpoint half still needs late-inclusion rules;
 the same pass stages the separate [inactive ST-13 activation-queue
 candidate](WAVE-46-ST13.md).
+Wave 47 starts with an [honest observer-reward message](WAVE-47-ST15.md), while
+the underlying whistleblower attribution remains a protocol choice.
 
 ## Scope and source reconciliation
 
