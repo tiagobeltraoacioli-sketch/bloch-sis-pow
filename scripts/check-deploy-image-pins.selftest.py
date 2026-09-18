@@ -9,6 +9,8 @@ configs happen to be pinned today:
   * a bare-tag `image:` (the MED-7 shape) goes red, BY NAME (file:line in the
     output);
   * a `@sha256:`-pinned image, and a recognised placeholder line, stay green;
+  * YAML anchors, aliases and merge keys fail closed rather than bypassing the
+    explicit image-scalar scan;
   * a `deploy/` directory that does not exist at all is refused, not skipped.
 
 Run: python3 scripts/check-deploy-image-pins.selftest.py
@@ -193,6 +195,25 @@ def case_bypass_regressions() -> str | None:
     return None
 
 
+def case_yaml_inheritance_fails_closed() -> str | None:
+    cases = {
+        "anchor": "x-base: &base\n  image: docker.io/blochv/bloch@sha256:%s\n" % DIGEST,
+        "alias": "services:\n  node: *base\n",
+        "merge key": "services:\n  node:\n    <<: *base\n",
+        "quoted merge key": 'services:\n  node:\n    "<<": *base\n',
+        "flow alias": "services: { node: *base }\n",
+    }
+    for name, content in cases.items():
+        with tempfile.TemporaryDirectory() as tmp:
+            write_deploy(tmp, "inheritance.yml", content)
+            r = run_checker(tmp)
+            if r.returncode == 0:
+                return "YAML inheritance bypass accepted: %s\n%s" % (name, content)
+            if "unsupported YAML inheritance" not in r.stdout:
+                return "inheritance refusal did not name its reason: %s\n%s" % (name, r.stdout)
+    return None
+
+
 def main() -> int:
     if not os.path.exists(CHECKER):
         print("selftest: FAIL — checker script not found at %s" % CHECKER)
@@ -200,6 +221,7 @@ def main() -> int:
 
     cases = [
         ("15 digest/exemption/syntax regressions", case_bypass_regressions),
+        ("YAML anchors, aliases and merge keys fail closed", case_yaml_inheritance_fails_closed),
         ("bare-tag image fails, names the file:line and the image", case_unpinned_fails),
         ("@sha256-pinned image passes", case_pinned_passes),
         ("recognised placeholder line passes", case_placeholder_passes),

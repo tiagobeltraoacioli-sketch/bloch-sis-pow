@@ -247,21 +247,15 @@ doc-sweep:
     - python3 tools/doc-sweep/check_stale.py --ci
   allow_failure: false
 
-# Deploy-image pin guard (finding MED-7, Round 1). Every Dockerfile in this
-# repo pins its base images by digest ("Update the digest deliberately, never
-# float the tag" — Dockerfile:27); the deploy/ Akash SDLs and docker-compose
-# files that pull the BUILT node/pool image do not: `bloch:latest`,
-# `docker.io/blochv/bloch:0.1`, and similar bare, mutable tags. This job wires
-# the check in; it does not itself pin anything, and pinning deploy/ YAML is
-# NOT this workstream's ownership (CI/supply-chain) — it belongs to whoever
-# owns the deployment/ops configs. See scripts/check-deploy-image-pins.py's
-# own docstring for that boundary stated the same way.
+# Deploy-image pin guard (finding MED-7, Round 1). Explicit deploy image
+# scalars require a SHA-256 digest, the non-pullable template sentinel, or the
+# single reviewed same-service local-build/never-pull shape. YAML inheritance
+# is refused rather than partially interpreted. The selftest mutates every
+# accepted boundary; the current deploy tree passes. Registry signatures and
+# generated deployment output remain separate release checks.
 #
-# STAGE: `nix` (terminal), same reasoning as doc-sweep and repro-inputs-guard
-# just above (finding N-2) — this job is RED ON THIS REVISION (12 unpinned
-# images across deploy/) and a currently-red, non-`allow_failure` job in
-# `check` or `test` would block every job behind it. Pure Python 3, no
-# toolchain, no build, no Nix.
+# STAGE: `nix` (terminal), matching the other pure structural guards. Pure
+# Python 3; no toolchain, build or Nix evaluation is needed.
 # Local run: python3 scripts/check-deploy-image-pins.py
 deploy-image-pins:
   stage: nix
