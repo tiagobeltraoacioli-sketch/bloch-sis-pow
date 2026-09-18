@@ -296,6 +296,33 @@ pub fn verify_enveloped(
     verify_parsed(pk_suite, pk_body, message, sig_suite, sig_body)
 }
 
+/// Verify explicitly enveloped objects and require canonical primitive encodings.
+///
+/// This opt-in entry point has the same strict envelope and suite dispatch as
+/// [`verify_enveloped`]. For hybrid suite `0x0001`, it additionally rejects
+/// Falcon's alternate 1,280-byte zero-padded representation. Existing
+/// consensus and compatibility callers are intentionally not migrated here.
+pub fn verify_enveloped_canonical(
+    public_key_bytes: &[u8],
+    message: &[u8],
+    signature_bytes: &[u8],
+) -> bool {
+    let Some((pk_suite, pk_body)) = parse_envelope(public_key_bytes) else {
+        return false;
+    };
+    let Some((sig_suite, sig_body)) = parse_envelope(signature_bytes) else {
+        return false;
+    };
+    verify_parsed_with_falcon(
+        pk_suite,
+        pk_body,
+        message,
+        sig_suite,
+        sig_body,
+        falcon::verify_canonical,
+    )
+}
+
 fn verify_parsed(
     pk_suite: u16,
     pk_body: &[u8],
@@ -303,12 +330,32 @@ fn verify_parsed(
     sig_suite: u16,
     sig_body: &[u8],
 ) -> bool {
+    verify_parsed_with_falcon(
+        pk_suite,
+        pk_body,
+        message,
+        sig_suite,
+        sig_body,
+        falcon::verify,
+    )
+}
+
+fn verify_parsed_with_falcon(
+    pk_suite: u16,
+    pk_body: &[u8],
+    message: &[u8],
+    sig_suite: u16,
+    sig_body: &[u8],
+    verify_falcon: fn(&[u8], &[u8], &[u8]) -> bool,
+) -> bool {
     if pk_suite != sig_suite {
         debug!("crypto::verify: suite mismatch (pk={:#06x}, sig={:#06x})", pk_suite, sig_suite);
         return false;
     }
     match pk_suite {
-        SUITE_MLDSA65_FALCON1024 => verify_hybrid_mldsa_falcon(pk_body, message, sig_body),
+        SUITE_MLDSA65_FALCON1024 => {
+            verify_hybrid_mldsa_falcon_with(pk_body, message, sig_body, verify_falcon)
+        }
         SUITE_MLDSA65_ONLY       => verify_mldsa65_only(pk_body, message, sig_body),
         other => { debug!("crypto::verify: unknown/reserved suite {:#06x}", other); false }
     }
@@ -336,6 +383,15 @@ pub fn verify_legacy_hybrid_raw(public_key_bytes: &[u8], message: &[u8], signatu
 /// families). Behaviour on 0x0001 objects is byte-for-byte identical to the
 /// legacy path except for the 4-byte header strip.
 fn verify_hybrid_mldsa_falcon(pk_body: &[u8], message: &[u8], sig_body: &[u8]) -> bool {
+    verify_hybrid_mldsa_falcon_with(pk_body, message, sig_body, falcon::verify)
+}
+
+fn verify_hybrid_mldsa_falcon_with(
+    pk_body: &[u8],
+    message: &[u8],
+    sig_body: &[u8],
+    verify_falcon: fn(&[u8], &[u8], &[u8]) -> bool,
+) -> bool {
     if pk_body.len() <= MLDSA_PUBKEY_LEN || sig_body.len() <= MLDSA_SIG_LEN {
         debug!("crypto::verify: hybrid pubkey/sig body too short (pk={}, sig={})",
                pk_body.len(), sig_body.len());
@@ -356,7 +412,7 @@ fn verify_hybrid_mldsa_falcon(pk_body: &[u8], message: &[u8], sig_body: &[u8]) -
         return false;
     }
     // Falcon half.
-    falcon::verify(fpk, message, fsig)
+    verify_falcon(fpk, message, fsig)
 }
 
 /// Suite 0x0002 verifier — ML-DSA-65 only (Falcon removed). Exact-length bodies
@@ -959,6 +1015,44 @@ mod kat {
         assert!(!verify_enveloped(&pk, msg, raw_sig));
         assert!(!verify_enveloped(raw_pk, msg, raw_sig));
         assert!(!verify_enveloped(&pk, b"other", &sig));
+    }
+
+    #[test]
+    fn canonical_enveloped_verifier_rejects_padded_falcon_half() {
+        let msg = b"canonical-enveloped-format";
+        let (pk, sk) = generate_keypair_from_seed(&[0x58; 32]).unwrap();
+        let sig = pqcrypto_internals::with_seeded_rng_scope(&[0xA5; 32], || {
+            sign(&sk, msg).unwrap()
+        });
+
+        assert!(verify_enveloped(&pk, msg, &sig));
+        assert!(verify_enveloped_canonical(&pk, msg, &sig));
+
+        let falcon_offset = SUITE_HEADER_LEN + MLDSA_SIG_LEN;
+        let padded_len = falcon_offset + pqcrypto_falcon::falconpadded1024::signature_bytes();
+        assert!(
+            sig.len() < padded_len,
+            "pinned compact signature must fit padded form"
+        );
+        let mut padded = sig.clone();
+        padded.resize(padded_len, 0);
+
+        assert!(
+            verify_enveloped(&pk, msg, &padded),
+            "compatibility verifier must retain the accepted padded form"
+        );
+        assert!(!verify_enveloped_canonical(&pk, msg, &padded));
+        assert!(!verify_enveloped_canonical(
+            &pk[SUITE_HEADER_LEN..],
+            msg,
+            &sig
+        ));
+
+        let (mpk, msk) = mldsa65::keypair();
+        let mldsa_pk = wrap_envelope(SUITE_MLDSA65_ONLY, mpk.as_bytes());
+        let mldsa_sk = wrap_envelope(SUITE_MLDSA65_ONLY, msk.as_bytes());
+        let mldsa_sig = sign(&mldsa_sk, msg).unwrap();
+        assert!(verify_enveloped_canonical(&mldsa_pk, msg, &mldsa_sig));
     }
 
     /// A genuine LEGACY (non-enveloped) hybrid object — no magic, no header,
