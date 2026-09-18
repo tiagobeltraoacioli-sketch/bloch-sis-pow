@@ -5794,6 +5794,17 @@ impl<V: SignatureVerifier> Transition<V> {
         //    build.
         let dedup_active = CommittedState::attestation_dedup_active(st.epoch);
         let mut seen: BTreeSet<(u32, [u8; 32])> = BTreeSet::new();
+        // Verdict-preserving replay suppression below the flag day. The live
+        // rule still ACCEPTS a repeated pair, so it cannot use the gated
+        // `DuplicateAttestation` refusal yet. It can, however, avoid paying
+        // twice for an *identical* attestation: after the first copy has
+        // verified, the same validator/root/signature bytes necessarily have
+        // the same result. Signature bytes are part of the key on purpose —
+        // two randomized encodings of one vote must each be checked, or an
+        // invalid second signature would change from reject to accept.
+        // Borrowed slices keep the bounded (MAX_ATTESTATIONS_PER_BLOCK) index
+        // small instead of cloning up to 4.6 KB per entry.
+        let mut validated_exact: BTreeSet<(u32, [u8; 32], &[u8])> = BTreeSet::new();
 
         for (i, att) in attestations.iter().enumerate() {
             let reject = TransitionError::Attestation(i as u32);
@@ -5801,8 +5812,12 @@ impl<V: SignatureVerifier> Transition<V> {
                 return Err(reject);
             }
             let signing_root = att.data.signing_root();
-            if dedup_active && !seen.insert((att.validator, signing_root)) {
+            let first_pair = seen.insert((att.validator, signing_root));
+            if dedup_active && !first_pair {
                 return Err(TransitionError::DuplicateAttestation(i as u32));
+            }
+            if !validated_exact.insert((att.validator, signing_root, att.signature.as_slice())) {
+                continue;
             }
             // Same slice `committee_for_slot` would have returned, from the
             // partition drawn once above. `unwrap_or` rather than an index:
@@ -6469,6 +6484,14 @@ mod tests {
     pub(super) struct OkVerifier;
     impl SignatureVerifier for OkVerifier {
         fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            true
+        }
+    }
+
+    struct CountingOkVerifier(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl SignatureVerifier for CountingOkVerifier {
+        fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            self.0.fetch_add(1, Ordering::Relaxed);
             true
         }
     }
@@ -7464,6 +7487,50 @@ mod tests {
             Err(TransitionError::StateRootMismatch),
             "below the gate a duplicate pair must reach step 12 like any other body — \
              DuplicateAttestation here would mean the tightening is still ungated"
+        );
+    }
+
+    /// TX-15: below the flag day the second copy remains consensus-accepted,
+    /// but byte-identical replay must not buy a second hybrid verification.
+    /// The count is one proposer plus one attestation, not two attestations.
+    #[test]
+    fn an_exact_attestation_replay_reuses_its_successful_verification() {
+        let (_t, s, mut chains) = epoch1_fixture();
+        let (att_slot, member) = a_committee_seat(&s);
+        let one = attest(&s, member, att_slot, *s.head.as_bytes());
+        let two = vec![one.clone(), one];
+        let dup = build_header_over(&s, 63, &two, &mut chains);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let t = Transition::new(CountingOkVerifier(calls.clone()));
+
+        assert_eq!(
+            t.apply_block(&s, &dup, &two, &[]),
+            Err(TransitionError::StateRootMismatch),
+            "the optimization must preserve the pre-gate accepted-body verdict"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "one proposer plus one unique attestation should be verified"
+        );
+    }
+
+    /// Same voter and signing root is not enough to reuse success: signature
+    /// bytes that differ retain the old verification and rejection behavior.
+    #[test]
+    fn a_signature_variant_of_the_same_vote_is_still_verified() {
+        let (_t, s, mut chains) = epoch1_fixture();
+        let (att_slot, member) = a_committee_seat(&s);
+        let one = attest(&s, member, att_slot, *s.head.as_bytes());
+        let mut invalid = one.clone();
+        invalid.signature[0] ^= 0xff;
+        let two = vec![one, invalid];
+        let dup = build_header_over(&s, 63, &two, &mut chains);
+
+        assert_eq!(
+            Transition::new(ToyVerifier).apply_block(&s, &dup, &two, &[]),
+            Err(TransitionError::Attestation(1)),
+            "a pair-only cache would wrongly accept the invalid signature variant"
         );
     }
 
