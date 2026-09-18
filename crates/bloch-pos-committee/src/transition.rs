@@ -11070,6 +11070,26 @@ mod tests {
         let expected = rewards::split_fees_at(charge.base_fee_sat, charge.priority_fee_sat, 1);
         assert!(expected.burned > 0, "era 1 must burn half the base fee");
 
+        // TX-14 evidence: `issued_sat` is intentionally a gross, monotone
+        // issuance counter, not circulating supply. A burn therefore leaves
+        // it unchanged while reducing accounted holdings (and the signed
+        // supply gap) by the exact burned amount. Retrofitting burns into the
+        // counter would redefine a committed historical field and requires a
+        // migration/activation decision; this assertion pins the current
+        // compatibility contract instead of pretending the two quantities
+        // are interchangeable.
+        assert_eq!(s1.issued_sat(), g.issued_sat(), "a fee burn must not decrement gross issuance");
+        assert_eq!(
+            g.accounted_supply_sat() - s1.accounted_supply_sat(),
+            expected.burned,
+            "the ledger must lose exactly the base-fee share burned by omission"
+        );
+        assert_eq!(
+            g.supply_gap_sat() - s1.supply_gap_sat(),
+            i128::try_from(expected.burned).expect("fee burn is bounded by total supply"),
+            "the observable supply gap must record the exact burn while issued_sat stays monotone"
+        );
+
         // During the epoch the fee accrues but the bond — and with it every
         // committee — is untouched.
         assert_eq!(s1.validator_record(p).unwrap().staked_sat, sat(200_000));
