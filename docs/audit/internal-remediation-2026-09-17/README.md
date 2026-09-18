@@ -22,6 +22,9 @@ the same pass stages the separate [inactive ST-13 activation-queue
 candidate](WAVE-46-ST13.md).
 Wave 47 starts with an [honest observer-reward message](WAVE-47-ST15.md), while
 the underlying whistleblower attribution remains a protocol choice.
+Wave 47 also adds an [inactive FC-05 slot-tiebreak
+candidate](WAVE-47-FC05.md) that removes the exact next-slot root-grinding
+lever while leaving proposer boost, balancing, and same-slot grinding open.
 
 ## Scope and source reconciliation
 
