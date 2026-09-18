@@ -298,6 +298,18 @@ struct ClawbackReq {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ClawbackLadderReq {
+    network: String,
+    vault: VaultParamsReq,
+    trigger_outpoint: OutpointReq,
+    trigger_amount_sat: u64,
+    safe_destination: String,
+    /// Absolute fees for mutually replacing transactions, lowest first.
+    fee_ladder_sat: Vec<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AnchorFields {
     #[serde(default = "default_chain")]
     target_chain: String,
@@ -563,6 +575,49 @@ async fn clawback_tx(body: Bytes) -> Result<Json<Value>, ApiError> {
     })))
 }
 
+/// POST /vault/clawback-ladder — bounded unsigned RBF replacements, each with
+/// its own recovery-key sighash for offline pre-signing.
+async fn clawback_ladder(body: Bytes) -> Result<Json<Value>, ApiError> {
+    let req: ClawbackLadderReq = parse_guarded(&body)?;
+    let network = parse_network(&req.network)?;
+    let p = req.vault.to_params(network)?;
+    let trigger_op = req.trigger_outpoint.to_outpoint("trigger_outpoint")?;
+    let safe = vaultlib::validate_destination(req.safe_destination.trim(), network)
+        .map_err(|_| ApiError::bad("invalid safe_destination address"))?;
+    let ladder = build_clawback_fee_ladder_checked(
+        &p,
+        trigger_op,
+        req.trigger_amount_sat,
+        &safe,
+        &req.fee_ladder_sat,
+    ).map_err(|error| ApiError::bad(error.to_string()))?;
+    let trigger_script_hex = script_hex(&trigger_script(&p));
+    let replacements: Vec<Value> = ladder.into_iter().enumerate().map(|(index, step)| {
+        json!({
+            "index": index,
+            "fee_sat": step.fee_sat,
+            "unsigned_tx_hex": tx_hex(&step.transaction),
+            "txid": step.transaction.compute_txid().to_string(),
+            "output_amount_sat": req.trigger_amount_sat - step.fee_sat,
+            "sighash_hex": hex::encode(step.sighash),
+            "sighash_type": "SIGHASH_ALL",
+            "sign_with": "recovery_key (secp256k1)",
+            "witness_script_hex": trigger_script_hex,
+            "prevout_amount_sat": req.trigger_amount_sat,
+            "witness_stack": "[ <your_recovery_sig ‖ 0x01>, <r>, <> ]",
+        })
+    }).collect();
+
+    Ok(Json(json!({
+        "replacements": replacements,
+        "safe_destination": safe.to_string(),
+        "pre_signing_required": true,
+        "watchtower_needs_recovery_key": false,
+        "warning": "Sign every SIGHASH_ALL candidate offline before funding and validate fee deltas against current relay policy. This is not dynamic fee estimation or a guarantee of BIP-125 acceptance.",
+        "non_custodial": SIGN_LOCALLY,
+    })))
+}
+
 /// POST /anchor/commitment — the canonical bytes to PQ-sign CLIENT-SIDE.
 async fn anchor_commitment(body: Bytes) -> Result<Json<Value>, ApiError> {
     let req: AnchorFields = parse_guarded(&body)?;
@@ -691,6 +746,7 @@ pub fn router() -> Router {
         .route("/vault/unvault-tx", post(unvault_tx))
         .route("/vault/branch-a-tx", post(branch_a_tx))
         .route("/vault/clawback-tx", post(clawback_tx))
+        .route("/vault/clawback-ladder", post(clawback_ladder))
         .route("/anchor/commitment", post(anchor_commitment))
         .route("/anchor/verify", post(anchor_verify))
         .layer(tower_http::timeout::TimeoutLayer::with_status_code(
@@ -834,6 +890,54 @@ mod tests {
             hex::encode(p2wsh_sighash(&claw, 0, &trig, 99_500))
         );
         assert_eq!(resp["sighashes"][0]["sign_with"], "recovery_key (secp256k1)");
+    }
+
+    #[tokio::test]
+    async fn clawback_ladder_returns_distinct_presignable_replacements() {
+        let (keys, _r, hr) = public_inputs();
+        let p = VaultParams {
+            hot_pubkey: keys.hot_pubkey,
+            recovery_pubkey: keys.recovery_pubkey,
+            recovery_hash: hr,
+            csv_delay: 144,
+            network: Network::Regtest,
+        };
+        let safe = trigger_address(&p).to_string();
+        let request = json!({
+            "network": NET,
+            "vault": {
+                "hot_pubkey": keys.hot_pubkey.to_string(),
+                "recovery_pubkey": keys.recovery_pubkey.to_string(),
+                "recovery_hash": hex::encode(hr),
+                "csv_delay": 144,
+            },
+            "trigger_outpoint": {
+                "txid": "0000000000000000000000000000000000000000000000000000000000000003",
+                "vout": 0,
+            },
+            "trigger_amount_sat": 100_000,
+            "safe_destination": safe,
+            "fee_ladder_sat": [500, 1_000, 2_000],
+        });
+        let response = clawback_ladder(body(request.clone())).await.unwrap().0;
+        let replacements = response["replacements"].as_array().unwrap();
+        assert_eq!(replacements.len(), 3);
+        assert_eq!(replacements[0]["fee_sat"], 500);
+        assert_eq!(replacements[1]["fee_sat"], 1_000);
+        assert_eq!(replacements[2]["fee_sat"], 2_000);
+        assert_eq!(replacements[0]["output_amount_sat"], 99_500);
+        assert_eq!(replacements[2]["output_amount_sat"], 98_000);
+        assert_ne!(replacements[0]["txid"], replacements[1]["txid"]);
+        assert_ne!(replacements[0]["sighash_hex"], replacements[1]["sighash_hex"]);
+        assert_eq!(response["pre_signing_required"], true);
+        assert_eq!(response["watchtower_needs_recovery_key"], false);
+
+        let mut duplicate = request.as_object().unwrap().clone();
+        duplicate.insert("fee_ladder_sat".into(), json!([500, 500]));
+        assert!(clawback_ladder(body(Value::Object(duplicate))).await.is_err());
+        let mut excessive = request.as_object().unwrap().clone();
+        excessive.insert("fee_ladder_sat".into(), json!([500, 10_001]));
+        assert!(clawback_ladder(body(Value::Object(excessive))).await.is_err());
     }
 
     fn fixture_address(opcode: u8) -> String {

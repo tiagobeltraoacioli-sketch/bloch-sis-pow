@@ -154,6 +154,28 @@ Returns the unsigned tx + `sighashes[0]` (`sign_with: "recovery_key"`); witness
 locally (trailing empty item selects branch B). `safe_destination` must equal the
 anchored `designated_safe_dest` and be a **fresh, unexposed** address.
 
+### `POST /vault/clawback-ladder`
+Build two to 32 mutually replacing clawbacks for offline pre-signing before the
+vault is funded. The request replaces `fee_sat` above with a strictly increasing
+`fee_ladder_sat` array:
+```json
+{
+  "network": "regtest",
+  "vault": { "hot_pubkey": "...", "recovery_pubkey": "...", "recovery_hash": "...", "csv_delay": 144 },
+  "trigger_outpoint": { "txid": "<trigger txid>", "vout": 0 },
+  "trigger_amount_sat": 99500,
+  "safe_destination": "bcrt1q<fresh unexposed cold addr>",
+  "fee_ladder_sat": [500, 1000, 2000, 5000]
+}
+```
+Every returned replacement spends the same RBF-enabled input to the same safe
+destination and carries its own `SIGHASH_ALL`. Sign every step locally with the
+recovery key, assemble its branch-B witness, and give only those finite signed
+transactions to the watchtower. The server bounds every candidate by the same
+dust, money-range and ten-percent fee rules. Increasing absolute fees alone do
+not guarantee BIP-125 acceptance: validate the deltas against current relay
+policy and refresh the package before funding when necessary.
+
 ### `POST /anchor/commitment`
 The canonical bytes to **PQ-sign client-side** (ML-DSA-65 ‖ Falcon-1024). The server
 does **not** sign.
@@ -276,6 +298,7 @@ curl -s -X POST $BASE/vault/clawback-tx -d "{
 | `POST /vault/unvault-tx` | no | the hot-key sighash; reveals `r` in witness |
 | `POST /vault/branch-a-tx` | no | the hot-key sighash |
 | `POST /vault/clawback-tx` | no | the recovery-key sighash; reveals `r` |
+| `POST /vault/clawback-ladder` | no | every replacement's recovery-key sighash; reveals `r` |
 | `POST /anchor/commitment` | no | PQ-signs the returned commitment bytes |
 | `POST /anchor/verify` | no | nothing (verification only) |
 | `GET /health`, `GET /` | no | — |
@@ -309,8 +332,10 @@ network, and require a CSV delay of at least 144 blocks, including nested vault
 parameters and serialized anchor requests. Non-Bitcoin target-chain construction
 is unsupported. Transaction construction rejects outputs below the default
 Bitcoin dust threshold, amounts above MAX_MONEY, and fees over 10% of the input.
-This fee limit is API policy, not a dynamic fee estimator; clients must still
-prepare and validate an emergency fee strategy before funding a vault.
+This fee limit is API policy, not a dynamic fee estimator. The optional
+clawback ladder creates bounded pre-signable alternatives, but clients must
+still validate replacement deltas and the emergency fee strategy before
+funding a vault.
 
 The two anchor verification request forms are exclusive: either provide typed
 anchor fields and `signature`, or provide `signed_anchor_hex`. Unknown fields
@@ -327,8 +352,9 @@ For new client-side vault key generation, use the explicitly versioned
 backup. V3 uses `m/1999'/coin'/0'/{0',1'}` and a separate PQ domain. V1 and V2
 outputs remain unchanged for recovery of existing funds. This does not retrofit
 existing vaults: moving funds requires a separately reviewed migration. It also
-does not resolve deposit/branch-A key reuse, keyless watchtower fee bumping,
-anchor revocation, or recovery preimage lifecycle design.
+does not resolve deposit/branch-A key reuse, dynamic watchtower fee estimation,
+signed-package delivery, anchor revocation, or recovery preimage lifecycle
+design.
 
 ### Response minimization (BV-20, 2026-09-17)
 
