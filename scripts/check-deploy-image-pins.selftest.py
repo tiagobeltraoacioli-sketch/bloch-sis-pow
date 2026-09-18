@@ -205,6 +205,8 @@ def case_yaml_inheritance_fails_closed() -> str | None:
         "flow alias": "services: { node: *base }\n",
         "quoted hash before anchor": 'x-base: { note: "x#y", holder: &base { image: bloch:latest } }\n',
         "quoted hash before alias": 'services: { note: "x#y", node: *base }\n',
+        "plain hash before anchor": "x-base: { note: x#y, holder: &base { image: bloch:latest } }\n",
+        "plain hash before alias": "services: { note: x#y, node: *base }\n",
         "flow literal merge": "services: { node: { <<: { image: bloch:latest } } }\n",
     }
     for name, content in cases.items():
@@ -216,11 +218,20 @@ def case_yaml_inheritance_fails_closed() -> str | None:
             if "unsupported YAML inheritance" not in r.stdout:
                 return "inheritance refusal did not name its reason: %s\n%s" % (name, r.stdout)
 
+    multiline_quote = 'x-base: { note: "first\n  second#third", holder: &base { image: bloch:latest } }\n'
+    with tempfile.TemporaryDirectory() as tmp:
+        write_deploy(tmp, "multiline.yml", multiline_quote)
+        r = run_checker(tmp)
+        if r.returncode == 0 or "unsupported multiline quoted scalar" not in r.stdout:
+            return "multiline quoted scalar did not fail closed:\n%s%s" % (r.stdout, r.stderr)
+
     accepted = {
         "quoted alias text": PINNED_COMPOSE + 'x-note: "use *base here and x#y"\n',
         "single quoted alias text": PINNED_COMPOSE + "x-note: 'use *base and x#y'\n",
+        "plain hash scalar": PINNED_COMPOSE + "x-note: x#y\n",
         "block scalar alias text": PINNED_COMPOSE + "x-script: |\n  cp *base /tmp/output\n  echo x#y\n",
         "folded scalar anchor text": PINNED_COMPOSE + "x-script: >-\n  echo &base is documentation\n",
+        "list block scalar alias text": PINNED_COMPOSE + "x-scripts:\n  - |\n    cp *base /tmp/output\n",
     }
     for name, content in accepted.items():
         with tempfile.TemporaryDirectory() as tmp:

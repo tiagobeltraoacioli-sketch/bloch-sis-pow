@@ -32,14 +32,14 @@ MERGE_KEY_RE = re.compile(r"(?:^|[\s\[\{,])<<\s*:")
 # YAML anchor/alias tokens begin at a structural separator. Quoted and block
 # scalar content is removed by yaml_line_views before this expression runs.
 ANCHOR_ALIAS_RE = re.compile(r"(?:^|[\s:\[\{,])([&*])[^\s\[\]\{\},]+(?=$|[\s,\]\}])")
-BLOCK_SCALAR_RE = re.compile(r"(?:^|:)\s*[|>](?:[1-9][+-]?|[+-][1-9]?)?\s*$")
+BLOCK_SCALAR_RE = re.compile(r"(?:^|:|-\s+)\s*[|>](?:[1-9][+-]?|[+-][1-9]?)?\s*$")
 
 
 def find_yaml_files(root: Path) -> list[Path]:
     return sorted(p for p in root.rglob("*") if p.is_file() and p.suffix in (".yaml", ".yml"))
 
 
-def yaml_line_views(line: str) -> tuple[str, str]:
+def yaml_line_views(line: str) -> tuple[str, str, bool]:
     """Return uncommented text and an inheritance-token view.
 
     A `#` starts a comment only outside quotes. The structural view replaces
@@ -77,7 +77,9 @@ def yaml_line_views(line: str) -> tuple[str, str]:
                 quote = None
             index += 1
             continue
-        if char == "#":
+        # YAML permits `#` inside a plain scalar such as `x#y`. It begins a
+        # comment only with separation from the preceding token.
+        if char == "#" and (index == 0 or line[index - 1].isspace()):
             break
         visible.append(char)
         if char in ("'", '"'):
@@ -86,7 +88,7 @@ def yaml_line_views(line: str) -> tuple[str, str]:
         else:
             structural.append(char)
         index += 1
-    return "".join(visible).rstrip(), "".join(structural).rstrip()
+    return "".join(visible).rstrip(), "".join(structural).rstrip(), quote is not None
 
 
 def local_build_only(path: Path, lines: list[str], index: int, value: str) -> bool:
@@ -128,7 +130,13 @@ def check_file(path: Path) -> list[str]:
                 continue
             block_indent = None
 
-        line, structural = yaml_line_views(raw_line)
+        line, structural, unterminated_quote = yaml_line_views(raw_line)
+        if unterminated_quote:
+            problems.append(
+                f"{path.relative_to(REPO)}:{index + 1}: unsupported multiline quoted scalar; "
+                "keep deploy review fields on one line"
+            )
+            continue
         begins_block = BLOCK_SCALAR_RE.search(structural) is not None
         if MERGE_KEY_RE.search(structural) or ANCHOR_ALIAS_RE.search(structural):
             problems.append(
