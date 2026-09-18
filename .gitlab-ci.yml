@@ -853,4 +853,5 @@ ustav-native:
   timeout: 45m
   script:
     - python3 scripts/check-ustav-pq-boundary.py cargo +"$(python3 scripts/pinned-rust-toolchain.py)"
+    - python3 scripts/check-pq-shield-claims.py
     - cargo +"$(python3 scripts/pinned-rust-toolchain.py)" test --locked -p bloch-euvm -p bloch-ustav

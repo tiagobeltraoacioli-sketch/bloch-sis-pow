@@ -1,4 +1,4 @@
-//! # vault — the Bitcoin-side commit-delay-reveal P2WSH vault + PQ-gated clawback
+//! # vault — the Bitcoin-side commit-delay-reveal P2WSH vault + hashlocked recovery
 //!
 //! Implements spec §2: three outputs (DEPOSIT `V` → TRIGGER `T` → destination /
 //! clawback), built with real `rust-bitcoin` primitives so the transactions are valid,
@@ -15,12 +15,13 @@
 //! ```text
 //!   OP_IF                                            # branch A — normal delayed spend
 //!       <Δ> OP_CSV OP_DROP <hot_pubkey> OP_CHECKSIG
-//!   OP_ELSE                                          # branch B — immediate PQ-gated clawback
+//!   OP_ELSE                                          # branch B — immediate hashlocked recovery
 //!       OP_SHA256 <H(r)> OP_EQUALVERIFY <recovery_pubkey> OP_CHECKSIG
 //!   OP_ENDIF
 //! ```
 //! Branch A carries the CSV relative-timelock delay Δ (BIP-112/BIP-68); branch B has NO
-//! delay but is gated by the PQ-derived preimage `r` plus a recovery signature.
+//! delay but requires the PQ-derived preimage `r` plus a recovery signature. Once the
+//! unvault reveals `r`, the recovery signature is the remaining authorization check.
 //!
 //! ## The covenant caveat (spec §2.0(2) — stated, not papered over)
 //! On stock Bitcoin there is **no covenant opcode**, so "the deposit may only be spent
@@ -144,7 +145,7 @@ pub fn deposit_script(recovery_hash: &[u8; 32], hot_pubkey: &PublicKey) -> Scrip
 }
 
 /// The TRIGGER witnessScript `T` (spec §2.1) — branch A (delayed normal spend) OR
-/// branch B (immediate PQ-gated clawback), selected by the `OP_IF` boolean.
+/// branch B (immediate hashlocked recovery), selected by the `OP_IF` boolean.
 pub fn trigger_script(p: &VaultParams) -> ScriptBuf {
     Builder::new()
         .push_opcode(op::OP_IF)
@@ -260,8 +261,9 @@ pub fn build_branch_a_tx_checked(p: &VaultParams, trigger_outpoint: OutPoint,
 
 /// Build the **branch B** clawback spend of the TRIGGER `T` to `safe_destination`
 /// (the anchored `designated_safe_dest`). Immediate — no relative timelock — so the
-/// owner/watchtower can execute it during the delay window Δ. `nSequence` enables RBF so
-/// a watchtower can fee-bump it to win the race (spec §2.2 / §4.1).
+/// owner/watchtower can execute it during the delay window Δ. `nSequence` opts into RBF,
+/// but a keyless watchtower needs pre-signed replacements; the bit alone grants no
+/// third-party fee-bump authority (spec §2.2 / §4.1).
 pub fn build_clawback_tx(
     trigger_outpoint: OutPoint,
     trigger_amount_sat: u64,

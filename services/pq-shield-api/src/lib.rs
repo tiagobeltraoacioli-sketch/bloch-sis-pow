@@ -436,7 +436,7 @@ async fn vault_address(body: Bytes) -> Result<Json<Value>, ApiError> {
             "witness_script_hex": script_hex(&trig_script),
             "script_pubkey_hex": script_hex(&trig_addr.script_pubkey()),
             "branch_a_witness": "[ <hot_sig>, 0x01 ]  (delayed normal spend, matures after Δ)",
-            "branch_b_witness": "[ <recovery_sig>, <r>, <> ]  (immediate PQ-gated clawback)",
+            "branch_b_witness": "[ <recovery_sig>, <r>, <> ]  (immediate hashlocked recovery; r is public after unvault)",
         },
         "import_descriptor": format!("addr({})", dep_addr),
         "notes": [
@@ -521,7 +521,7 @@ async fn branch_a_tx(body: Bytes) -> Result<Json<Value>, ApiError> {
     })))
 }
 
-/// POST /vault/clawback-tx — the immediate PQ-gated clawback (trigger→safe dest).
+/// POST /vault/clawback-tx — the immediate hashlocked recovery (trigger→safe dest).
 async fn clawback_tx(body: Bytes) -> Result<Json<Value>, ApiError> {
     let req: ClawbackReq = parse_guarded(&body)?;
     let network = parse_network(&req.network)?;
@@ -1053,7 +1053,7 @@ secrets hidden in allowed values. Policy text is public and appears in commitmen
 <tr><td>POST</td><td>/vault/address</td><td>P2WSH deposit + trigger address, witnessScripts, descriptor</td></tr>
 <tr><td>POST</td><td>/vault/unvault-tx</td><td>unsigned DEPOSIT→TRIGGER tx + hot-key sighash</td></tr>
 <tr><td>POST</td><td>/vault/branch-a-tx</td><td>unsigned delayed withdrawal + hot-key sighash</td></tr>
-<tr><td>POST</td><td>/vault/clawback-tx</td><td>unsigned PQ-gated clawback + recovery-key sighash</td></tr>
+<tr><td>POST</td><td>/vault/clawback-tx</td><td>unsigned hashlocked recovery + recovery-key sighash</td></tr>
 <tr><td>POST</td><td>/anchor/commitment</td><td>canonical bytes to PQ-sign client-side + Bloch guard hash</td></tr>
 <tr><td>POST</td><td>/anchor/verify</td><td>verify a PQ signature over an anchor against a <em>trusted_pq_pubkey</em> you supply (valid/invalid)</td></tr>
 </table>

@@ -572,7 +572,7 @@ mod e2e_tests {
         assert_eq!(
             eval(&secp, &trig_script, vec![sig_c, r.to_vec(), vec![]], &ctx_c),
             Ok(true),
-            "PQ-authorized clawback succeeds to the safe destination within Δ"
+            "hashlocked recovery succeeds to the safe destination within Δ"
         );
     }
 

@@ -5,17 +5,16 @@
 //! `bloch-crypto`), binding
 //! `{btc_vault_address, H(r), pq_recovery_pubkey, designated_safe_destination, policy}`.
 //!
-//! **Division of labour (spec §2.3):** Bitcoin enforces the hash + timelock half; Bloch
-//! enforces the PQ half; the shared `recovery_hash = H(r)` and `designated_safe_dest`
-//! are the hinge. Bitcoin never sees a PQ signature — so revealing `r` on Bitcoin is not
-//! by itself a proof of PQ authorization. This anchor is what makes the *legitimate*
-//! recovery flow PQ-authorized and auditable; a compliant watchtower fee-bumps a
-//! clawback **only** to the anchored `designated_safe_dest`.
+//! **Current division of labour (spec §2.3):** Bitcoin enforces only the hash, timelock
+//! and classical signatures. This module can sign and verify a separate PQ commitment
+//! off chain and compile candidate guard programs. No code here posts, orders or enforces
+//! anchors on Bloch consensus, and Bitcoin never sees the PQ signature. A relying party
+//! must authenticate the anchor and separately enforce its `designated_safe_dest` policy.
 //!
 //! ## Mapping onto `bloch-euvm` (spec §3.2)
-//! The anchor is an ordinary Bloch eUTXO whose *datum* carries these fields and whose
-//! *guard program* is the existing, audited-compiler custody/governance validator — no
-//! new opcode, no new module kind. [`anchor_guard_governance`] emits a `Governance`
+//! The proposed integration represents the anchor as a Bloch eUTXO whose *datum* carries
+//! these fields and whose *guard program* uses the existing audited-compiler
+//! custody/governance validator. [`anchor_guard_governance`] emits a `Governance`
 //! 1-of-1 over the PQ key (minimum); [`anchor_guard_custody`] emits the `Custody` 2-of-2
 //! (BTC key AND PQ key — the same hybrid identity that owns the BTC vault owns its
 //! anchor), reusing `bloch_btc_wallet::hybrid_wbtc_validator`.
@@ -187,7 +186,7 @@ pub fn sign_anchor(
 /// Verifying under `signed.anchor.pq_recovery_pubkey` is *self-certifying* and decides
 /// nothing: anyone can generate a PQ keypair, write their own `designated_safe_dest`
 /// into an anchor, sign it with their own secret, and publish a blob that "verifies".
-/// A watchtower that fee-bumps a clawback to that destination would be paying an
+/// A watchtower that acts on a clawback to that destination would be paying an
 /// attacker. Authenticity here means "signed by **the** owner", so the owner's identity
 /// has to be an input, not a self-declaration.
 ///
@@ -427,8 +426,9 @@ mod tests {
 
     /// REGRESSION (K-M6-anchor-selfcert). The attacker holds no part of the owner's PQ
     /// key. They mint a *perfectly signed* anchor under their own key, naming their own
-    /// `designated_safe_dest` — the address a compliant watchtower would fee-bump a
-    /// clawback to. Under the old self-certifying `verify_anchor(&signed)` this returned
+    /// `designated_safe_dest` — the address a compliant watchtower would treat as the
+    /// authorized clawback destination. Under the old self-certifying
+    /// `verify_anchor(&signed)` this returned
     /// `Ok(())`, because the blob supplied both the claim and the key that judged it.
     #[test]
     fn forged_anchor_signed_by_attacker_key_is_rejected() {

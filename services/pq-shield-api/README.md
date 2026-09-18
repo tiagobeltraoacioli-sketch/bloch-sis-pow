@@ -18,12 +18,15 @@
 
 This service wraps the public, non-secret functions of the
 [`bloch-pq-vault`](../../crates/bloch-pq-vault) crate. It builds a **commit-delay-reveal
-P2WSH vault + a PQ-gated clawback on stock Bitcoin**, plus a **PQ-signed Bloch anchor**.
+P2WSH construction + hashlocked classical recovery on stock Bitcoin**, plus an
+off-chain **PQ-signed anchor commitment**.
 It is *not* the video/demo — this endpoint is how third-party builders integrate the
 feature into their own products.
 
-Read the crate's `HONEST LIMITS` and the security audit before shipping value: this is
-**transition-era defense-in-depth, NOT unconditional quantum immunity**.
+Read the crate's `HONEST LIMITS` and
+[`CONSTRUCTION-AUDIT.md`](../../crates/bloch-pq-vault/CONSTRUCTION-AUDIT.md) before
+testing it. Those are internal follow-up notes, not external product qualification.
+This is **transition-era defense-in-depth, NOT unconditional quantum immunity**.
 
 ---
 
@@ -52,17 +55,18 @@ the Bloch chain node. Do **not** colocate it on a founder/chain node.
    │ OP_SHA256    │──────tx──────▶│ IF  Δ OP_CSV <hot> CHECKSIG│──branch A (delayed)──▶ destination
    │  <H(r)>      │  (reveals r)  │ ELSE SHA256 <H(r)> EQ-VER  │
    │ OP_EQUALVERIFY│              │      <recovery> CHECKSIG   │──branch B (immediate)─▶ safe_dest
-   │ <hot> CHECKSIG│              │ ENDIF                      │   = PQ-gated CLAWBACK
+   │ <hot> CHECKSIG│              │ ENDIF                      │   = hashlocked RECOVERY
    └──────────────┘              └───────────────────────────┘
 ```
 
 - **Branch A** carries the CSV relative-timelock Δ (normal, delayed spend, hot key).
-- **Branch B** is immediate but gated by revealing the PQ-derived preimage `r` +
-  a recovery-key signature — the *clawback* an owner/watchtower uses to beat an
-  attacker within Δ.
+- **Branch B** is immediate and requires the PQ-derived preimage `r` plus a
+  recovery-key signature. The unvault reveals `r`, so after that event the
+  recovery signature is the remaining authorization check.
 - The **Bloch anchor** is the PQ-signed record binding
-  `{vault address, H(r), pq pubkey, safe dest, Δ, policy}`; Bitcoin enforces the
-  hash+timelock half, Bloch enforces the PQ half.
+  `{vault address, H(r), pq pubkey, safe dest, Δ, policy}`. This repository can
+  construct and verify that record off chain, but does not post, order, revoke,
+  or enforce it on Bloch consensus. Bitcoin enforces only its own script.
 
 ---
 
@@ -134,7 +138,7 @@ Returns the unsigned tx + `sighashes[0]` (`sign_with: "hot_key"`); witness
 Δ blocks after the trigger confirms.
 
 ### `POST /vault/clawback-tx`
-The **immediate PQ-gated clawback** **TRIGGER → safe_destination** (branch B).
+The **immediate hashlocked recovery** **TRIGGER → safe_destination** (branch B).
 ```json
 {
   "network": "regtest",
@@ -187,8 +191,8 @@ from `/anchor/commitment`, where returning the public policy is necessary.
 > its own `pq_recovery_pubkey`, so checking the signature against *that* is
 > self-certifying: an attacker generates a PQ keypair, writes their own
 > `designated_safe_dest` into an anchor, signs it with their own secret, and publishes a
-> blob that "verifies" perfectly. A watchtower trusting that answer would fee-bump a
-> clawback straight to the attacker. Authenticity here means *signed by **the** owner*,
+> blob that "verifies" perfectly. A watchtower trusting that answer could accept the
+> attacker's destination as authorized. Authenticity here means *signed by **the** owner*,
 > so you must pass the key you obtained out-of-band — from vault registration or from
 > the anchor guard hash, which commits to it. A mismatch returns
 > `reason: "UntrustedKey"`. Omitting the field is a `400`, never an implicit "valid".
@@ -243,8 +247,8 @@ curl -s -X POST $BASE/vault/clawback-tx -d "{
 
 ## Security notes
 
-- **Hardened recovery derivation (audit finding M1, Medium).** The security audit's
-  single Medium finding: the recovery key must **not** be a *non-hardened* BIP-32
+- **Hardened recovery derivation (historical finding M1).** The recovery key must
+  **not** be a *non-hardened* BIP-32
   sibling of the hot key, or a hot-key compromise plus a watch-only account xpub can
   derive the recovery key too — collapsing the hot-vs-recovery separation. **Derive the
   recovery key on a HARDENED path** (e.g. a separate hardened account
@@ -256,10 +260,13 @@ curl -s -X POST $BASE/vault/clawback-tx -d "{
   reused/Taproot address just moves the same exposure.
 - **`r` is single-use and public after reveal.** Use a unique `vault_id` per vault
   (client-side) so preimages are independent; never re-fund a spent deposit address.
-- **Honest ceiling.** Protection is a *spend-window delay + PQ-authorized recovery*, and
+- **A broadcaster is keyless only when it receives finite pre-signed replacements.**
+  Giving a service `recovery_sk` or a signing oracle makes it custodial and able to
+  redirect funds; the RBF sequence bit alone grants no replacement authority.
+- **Honest ceiling.** Protection is a *spend-window delay + hashlocked classical recovery*, and
   depends on the owner/watchtower being online during Δ and winning the fee race. It is
-  not unconditional quantum immunity. The Bloch-side PQ enforcement (`bloch-euvm`) is
-  itself FOUNDATION / not consensus-wired. The real fix is a PQ soft fork (BIP-360).
+  not unconditional quantum immunity. The separate PQ commitment is verified off chain;
+  no Bloch anchor registry is consensus-wired. The real fix is a PQ soft fork (BIP-360).
 
 ## Non-custodial audit of the routes (self-check)
 

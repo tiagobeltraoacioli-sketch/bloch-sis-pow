@@ -27,6 +27,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Native PQ dependency boundary
         run: python3 scripts/check-ustav-pq-boundary.py cargo
+      - name: PQ Shield trust-boundary claims
+        run: python3 scripts/check-pq-shield-claims.py
       - name: Existing EUVM suite and Ustav regressions
         run: cargo test --locked -p bloch-euvm -p bloch-ustav
       - name: Transition and cryptographic regressions in release profile
