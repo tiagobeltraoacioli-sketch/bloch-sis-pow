@@ -83,6 +83,13 @@ the [effective build environment](WAVE-52-KS09.md), and moves
 [validator registry RPC reads](WAVE-52-NET01.md) off the consensus thread. The
 [Wave 52 integration checkpoint](WAVE-52-INTEGRATION.md) records the four-agent
 review, validation and unchanged external release boundary.
+Wave 53 adds [Bitcoin-network-aware anchor verification](WAVE-53-BV11.md),
+serves [static build identity before the engine queue](WAVE-53-EN18.md),
+reserves [devnet backlog capacity before payload decode](WAVE-53-NET22.md),
+and makes deploy-image review [fail closed on YAML
+inheritance](WAVE-53-INF14.md). The [Wave 53 integration
+checkpoint](WAVE-53-INTEGRATION.md) records adversarial lexer review, final
+validation and the unchanged external launch gates.
 
 ## Scope and source reconciliation
 
