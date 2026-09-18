@@ -4,7 +4,7 @@ Audited source: `562e220`. Remediation base: `b066e3c`. Branch: `fix/internal-au
 
 All 200 findings are retained, including duplicates. IMPLEMENTED means code changed in this branch, not deployed, externally audited, or universally resolved on the live fleet. PARTIAL is not closure. No production binary was published.
 
-IMPLEMENTED: 66, PARTIAL: 82, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE CHANGED: 7, OPEN: 38, REFUTED IN AUDIT: 1, VERIFIED POSITIVE: 1.
+IMPLEMENTED: 66, PARTIAL: 83, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE CHANGED: 7, OPEN: 37, REFUTED IN AUDIT: 1, VERIFIED POSITIVE: 1.
 
 | Finding | Status | Evidence / remaining work | Original title |
 |---|---|---|---|
@@ -178,7 +178,7 @@ IMPLEMENTED: 66, PARTIAL: 82, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE C
 | KS-15 | PARTIAL | Drill creates a new private directory and unlinks only its four disposable secret files on normal/error/signal exits. SIGKILL/power loss and secure media erasure cannot be covered by shell cleanup. | `scripts/ws-ceremony-drill.sh` leaves throwaway signer `.sk` files in its work dir |
 | KS-16 | PARTIAL | WS policy and malformed/configuration artifact refusals are typed exit 78; raw filesystem I/O remains ordinary failure. Supplied units suppress 78 and rate-limit other restarts; fleet deployment remains unverified. | WS boot refusal + `Restart=on-failure` is a replay-every-5-seconds crash loop |
 | KS-17 | IMPLEMENTED | Plaintext opt-in consumed only as a recognized run/keygen option, never as another option value; regression test. | `--allow-plaintext-keystore` is matched anywhere in argv |
-| KS-18 | OPEN | Not closed by this bundle. Requires dedicated implementation, protocol design, external operational evidence or product-owner integration; original finding remains tracked. | Doppelganger protection is in-memory, window-bounded and flag-bypassable |
+| KS-18 | PARTIAL | Detection now ignores pre-observation duties, covers held-attestation release and authenticated proposal sightings, starts a full window after replay/WS boot, blocks duties throughout observation and indefinitely after a live duplicate, and parses the opt-out strictly. Nine regressions pass. Detection state is still process-local/window-bound and an explicit operator bypass remains. See WAVE-35.md. | Doppelganger protection is in-memory, window-bounded and flag-bypassable |
 | LG-09 | PARTIAL | New authorized pool sessions use canonical parsed address spelling; proof-to-accounting regression joins case aliases. Historical journals/credits remain unchanged and need reconciliation before manual payouts. | Pool: shares and ledger keyed by the raw `mining.authorize` username, not the parsed address |
 | LG-10 | IMPLEMENTED | Terminal snapshot figures and deterministic 57-satoshi recipient are re-derived by an executable artifact test; the historical zero-value anchor is documented/tested; source and integration prose use the terminal vintage; the exporter reads the real selected-height index with an endianness regression. See WAVE-17.md. | Documentation drift on the ledger-critical code (dust recipient, snapshot vintage, zero-value rows, dead "tip height" print) |
 | LG-11 | OPEN | Not closed by this bundle. Requires dedicated implementation, protocol design, external operational evidence or product-owner integration; original finding remains tracked. | Pool/pool-proxy: advisor findings verified closed; residual notes for a redeploy |
