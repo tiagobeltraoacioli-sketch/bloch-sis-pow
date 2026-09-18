@@ -948,6 +948,44 @@ fn encode_log_payload(env: &BlockEnvelope) -> io::Result<Vec<u8>> {
     Ok(payload)
 }
 
+/// Decode the complete prefix of a framed log without retaining a second,
+/// whole-file byte buffer alongside the decoded envelopes. `length` is the
+/// stable file length observed before the scan; the data-directory lock keeps
+/// the normal writer out while boot replay reads it.
+fn read_log_frames<R: Read>(reader: R, length: u64) -> io::Result<Vec<BlockEnvelope>> {
+    let mut reader = io::BufReader::new(reader);
+    let mut out = Vec::new();
+    let mut at = 0u64;
+    while length.saturating_sub(at) >= 4 {
+        let mut prefix = [0u8; 4];
+        reader.read_exact(&mut prefix)?;
+        let len = u32::from_le_bytes(prefix) as usize;
+        if len > crate::codec::MAX_FIELD_LEN {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "log frame over cap"));
+        }
+        let Some(frame_end) = at
+            .checked_add(4)
+            .and_then(|body_at| body_at.checked_add(len as u64))
+        else {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "log frame length overflow"));
+        };
+        if frame_end > length {
+            eprintln!("store: dropping truncated trailing log frame (crash mid-append)");
+            return Ok(out);
+        }
+        let mut payload = vec![0u8; len];
+        reader.read_exact(&mut payload)?;
+        let env = crate::codec::decode_envelope(&payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        out.push(env);
+        at = frame_end;
+    }
+    if at < length {
+        eprintln!("store: dropping truncated trailing log frame (crash mid-append)");
+    }
+    Ok(out)
+}
+
 /// Durable reorg publication using handles owned only by the writer thread.
 /// Staging deliberately happens before the generation write lock, so bounded
 /// sync readers remain available during the expensive encoding and write.
@@ -1126,45 +1164,9 @@ impl Store {
     /// body is an error, because silently skipping mid-chain data would make
     /// replay diverge from what the network saw.
     pub fn read_all(&self) -> io::Result<Vec<BlockEnvelope>> {
-        let mut f = File::open(self.dir.join("blocks.log"))?;
-        let mut bytes = Vec::new();
-        f.read_to_end(&mut bytes)?;
-        let mut out = Vec::new();
-        let mut at = 0usize;
-        // `at` never exceeds `bytes.len()` (it only ever advances to a value
-        // already checked against `bytes.len()` below), and `bytes.len()` is
-        // this process's own in-memory copy of one local file — nowhere near
-        // `usize::MAX`. So every `saturating_add` here is exact, never an
-        // actual saturation; it is used instead of `+` purely to keep this
-        // loop over on-disk bytes free of raw arithmetic operators clippy
-        // must otherwise trust are pre-bounded.
-        while bytes.len().saturating_sub(at) >= 4 {
-            let body_at = at.saturating_add(4);
-            // `body_at - at == 4` exactly (see above), so this slice is
-            // always exactly 4 bytes and `try_into` cannot fail; the `else`
-            // arm is unreachable but keeps the conversion panic-free by
-            // construction.
-            let Ok(len_bytes) = bytes[at..body_at].try_into() else {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "corrupt log length prefix"));
-            };
-            let len = u32::from_le_bytes(len_bytes) as usize;
-            if len > crate::codec::MAX_FIELD_LEN {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "log frame over cap"));
-            }
-            let frame_end = body_at.saturating_add(len);
-            if frame_end > bytes.len() {
-                eprintln!("store: dropping truncated trailing log frame (crash mid-append)");
-                break;
-            }
-            let env = crate::codec::decode_envelope(&bytes[body_at..frame_end])
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            out.push(env);
-            at = frame_end;
-        }
-        if at.saturating_add(4) > bytes.len() && at < bytes.len() {
-            eprintln!("store: dropping truncated trailing log frame (crash mid-append)");
-        }
-        Ok(out)
+        let file = File::open(self.dir.join("blocks.log"))?;
+        let length = file.metadata()?.len();
+        read_log_frames(file, length)
     }
 
     /// Replace the whole log with `envs` (a reorg adopted a different
@@ -1457,6 +1459,62 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct BoundedRead {
+        inner: io::Cursor<Vec<u8>>,
+        max_request: usize,
+        largest_request: usize,
+    }
+
+    impl Read for BoundedRead {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if buf.len() > self.max_request {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "reader was asked for a whole-log-sized buffer",
+                ));
+            }
+            self.largest_request = self.largest_request.max(buf.len());
+            self.inner.read(buf)
+        }
+    }
+
+    #[test]
+    fn replay_log_decode_streams_bounded_frames_and_preserves_tail_refusals() {
+        let envelopes: Vec<_> = (1..=128).map(sample_envelope).collect();
+        let mut bytes = Vec::new();
+        for envelope in &envelopes {
+            let payload = crate::codec::encode_envelope(envelope);
+            bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&payload);
+        }
+        assert!(bytes.len() > 8 * 1024, "fixture must exceed the bounded reader request");
+        let mut reader = BoundedRead {
+            inner: io::Cursor::new(bytes.clone()),
+            max_request: 8 * 1024,
+            largest_request: 0,
+        };
+        let decoded = read_log_frames(&mut reader, bytes.len() as u64).unwrap();
+        assert_eq!(
+            decoded.iter().map(|env| env.header.slot).collect::<Vec<_>>(),
+            (1..=128).collect::<Vec<_>>(),
+        );
+        assert!(reader.largest_request <= reader.max_request);
+
+        let mut torn = bytes.clone();
+        torn.extend_from_slice(&[3, 0]);
+        assert_eq!(read_log_frames(io::Cursor::new(&torn), torn.len() as u64).unwrap().len(), 128);
+
+        let mut zero_frame = bytes;
+        zero_frame.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            read_log_frames(io::Cursor::new(&zero_frame), zero_frame.len() as u64)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData,
+            "a complete zero-length frame remains corruption, not a truncatable tail",
+        );
+    }
 
     #[test]
     fn persistence_refuses_oversized_frames_before_mutation_and_accepts_exact_limit() {
