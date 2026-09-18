@@ -443,7 +443,7 @@ fn print_help() {
                total — before a single balance is admitted. A devnet\n\
                manifest commits to none and the flag is then refused.\n\
                          [--rpc-bind <ip>] [--rpc-port <n>|off]\n\
-                         [--metrics-bind <ip>] [--metrics-port <n>]\n\
+                         [--metrics-bind <ip>] [--metrics-port <n>] [--allow-public-metrics]\n\
                Run a validator node. <dir> must hold validator.key; chain\n\
                data persists in <dir>; a compatible local state cache skips its replay prefix.\n\
                \n\
@@ -458,7 +458,9 @@ fn print_help() {
                text: restarts, disk space, finality stalls, peers,\n\
                behind-by-slots, is-syncing, validator-active) on\n\
                --metrics-bind (default 127.0.0.1). Read-only, GET-only,\n\
-               unauthenticated — firewall it like the RPC.\n\
+               unauthenticated. A non-loopback bind is refused unless\n\
+               --allow-public-metrics explicitly acknowledges the exposure;\n\
+               that flag adds no authentication, so firewall it like RPC.\n\
                  Methods: getbuildinfo, getchaininfo, getblockcount,\n\
                  getblockbyslot, getblockbyid, getvalidator,\n\
                  getvalidatorcount, getbalance, gettxout, getutxos (alias\n\
@@ -706,6 +708,55 @@ fn arg_value(args: &[String], name: &str) -> Option<String> {
 /// the addition (`i` is an index into `args`, so `get(i..)` is `Some`).
 fn arg_after(args: &[String], i: usize) -> Option<&String> {
     args.get(i..).and_then(|rest| rest.get(1))
+}
+
+/// True only when `name` is a standalone run-command switch.
+///
+/// An exact argv search is insufficient for a safety acknowledgement: in
+/// `--metrics-bind --allow-public-metrics`, the latter token is malformed data
+/// for the former option, not an operator opt-in. Stop at `--` for the same
+/// reason. This parser intentionally needs to know only which run flags do not
+/// consume a following value; every other `--flag` consumes one token here.
+fn run_switch(args: &[String], name: &str) -> bool {
+    const SWITCHES: &[&str] = &[
+        "--allow-finality-rewind",
+        "--allow-plaintext-keystore",
+        "--allow-public-metrics",
+        "--behind-proxy",
+        "--bind-genesis",
+        "--no-doppelganger-check",
+        "--replay-from-genesis",
+        "--require-state-cache",
+    ];
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if arg == "--" { break; }
+        if arg == name { return true; }
+        if arg.starts_with("--") && !SWITCHES.contains(&arg.as_str()) && !arg.contains('=') {
+            rest.next();
+        }
+    }
+    false
+}
+
+/// Validate the metrics listener's exposure posture before the engine starts.
+/// Metrics are intentionally unauthenticated; an explicit flag acknowledges a
+/// routable bind but does not pretend to make it private.
+fn metrics_bind_plan(args: &[String], port: Option<u16>) -> Result<String, String> {
+    let bind = arg_value(args, "--metrics-bind").unwrap_or_else(|| "127.0.0.1".to_string());
+    if port.is_none() {
+        return Ok(bind);
+    }
+    let ip = bind.parse::<std::net::IpAddr>().map_err(|_| {
+        format!("--metrics-bind must be an IP address when metrics are enabled (got `{bind}`)")
+    })?;
+    if !ip.is_loopback() && !run_switch(args, "--allow-public-metrics") {
+        return Err(format!(
+            "refusing unauthenticated metrics on non-loopback {bind}; bind loopback or add \
+             --allow-public-metrics and firewall the port"
+        ));
+    }
+    Ok(bind)
 }
 
 /// `now + start_in seconds` as Unix milliseconds, for a manifest's
@@ -1599,6 +1650,10 @@ fn run_cmd(args: &[String]) {
             }
         },
     };
+    let metrics_bind = metrics_bind_plan(args, metrics_port).unwrap_or_else(|error| {
+        eprintln!("run: {error}");
+        exit(2);
+    });
 
     let cfg = engine::Config {
         data_dir: PathBuf::from(data_dir),
@@ -1628,7 +1683,7 @@ fn run_cmd(args: &[String]) {
         // Loopback unless asked otherwise, like the RPC: /metrics is
         // read-only but still maps the node's peers, lag and validator
         // status for anyone who can reach it.
-        metrics_bind: arg_value(args, "--metrics-bind").unwrap_or_else(|| "127.0.0.1".to_string()),
+        metrics_bind,
         metrics_port,
     };
     if let Err(e) = engine::run(cfg) {
@@ -1930,5 +1985,77 @@ mod plaintext_flag_tests {
         assert!(!super::plaintext_opt_in_flag(&args(&["run", "--data-dir", "--allow-plaintext-keystore"])));
         assert!(!super::plaintext_opt_in_flag(&args(&["run", "--", "--allow-plaintext-keystore"])));
         assert!(!super::plaintext_opt_in_flag(&args(&["slashing-protection", "--allow-plaintext-keystore"])));
+    }
+}
+
+#[cfg(test)]
+mod metrics_bind_tests {
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[test]
+    fn enabled_metrics_default_and_explicit_loopback_are_allowed() {
+        assert_eq!(
+            super::metrics_bind_plan(&args(&["--metrics-port", "9100"]), Some(9100)).unwrap(),
+            "127.0.0.1"
+        );
+        for bind in ["127.0.0.2", "::1"] {
+            let plan = super::metrics_bind_plan(
+                &args(&["--metrics-port", "9100", "--metrics-bind", bind]),
+                Some(9100),
+            )
+            .unwrap();
+            assert_eq!(plan, bind);
+        }
+    }
+
+    #[test]
+    fn enabled_metrics_refuse_every_non_loopback_without_acknowledgement() {
+        for bind in ["0.0.0.0", "::", "10.8.0.4", "203.0.113.7"] {
+            let error = super::metrics_bind_plan(
+                &args(&["--metrics-port", "9100", "--metrics-bind", bind]),
+                Some(9100),
+            )
+            .expect_err(bind);
+            assert!(error.contains("--allow-public-metrics"), "{bind}: {error}");
+        }
+    }
+
+    #[test]
+    fn explicit_public_metrics_acknowledgement_allows_the_bind() {
+        let plan = super::metrics_bind_plan(
+            &args(&[
+                "--metrics-bind", "0.0.0.0", "--metrics-port", "9100",
+                "--allow-public-metrics",
+            ]),
+            Some(9100),
+        )
+        .unwrap();
+        assert_eq!(plan, "0.0.0.0");
+    }
+
+    #[test]
+    fn acknowledgement_as_an_option_value_is_not_a_switch() {
+        let malformed = args(&[
+            "--metrics-bind", "--allow-public-metrics", "--metrics-port", "9100",
+        ]);
+        assert!(!super::run_switch(&malformed, "--allow-public-metrics"));
+        assert!(super::metrics_bind_plan(&malformed, Some(9100)).is_err());
+
+        let after_separator = args(&[
+            "--metrics-bind", "0.0.0.0", "--metrics-port", "9100", "--",
+            "--allow-public-metrics",
+        ]);
+        assert!(!super::run_switch(&after_separator, "--allow-public-metrics"));
+        assert!(super::metrics_bind_plan(&after_separator, Some(9100)).is_err());
+    }
+
+    #[test]
+    fn disabled_metrics_do_not_turn_an_unused_bind_into_an_exposure() {
+        assert_eq!(
+            super::metrics_bind_plan(&args(&["--metrics-bind", "metrics.internal"]), None).unwrap(),
+            "metrics.internal"
+        );
     }
 }
