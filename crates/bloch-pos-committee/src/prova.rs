@@ -27,8 +27,9 @@
 //!   leak-adjusted with no floor, so a node that can hear only a handful of
 //!   the fleet shrinks its own denominator until that handful is two thirds of
 //!   it, and finalizes alone. Three partitions did it at once, on one epoch,
-//!   under three roots. This is **live in every shipped binary today**, because
-//!   [`crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH`] is 2700 (armed 2026-09-06); below it the incident arithmetic still runs.
+//!   under three roots. [`crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH`] is
+//!   2880; below that scheduled boundary the incident arithmetic runs, while
+//!   at and above it the denominator floor and recovery rule apply.
 //! - **Scenarios 1 to 4 are the roster split**, described below. It is a real
 //!   defect, it was fixed on 2026-08-24, and it was **provably inert at the
 //!   time of the incident** — mainnet was at ~epoch 986 and the rule that
@@ -484,13 +485,12 @@ mod tests {
     /// the same epoch, on three different roots.
     ///
     /// Nothing in this test touches a mutation switch. **It runs the arithmetic
-    /// a shipped binary runs today**, because
-    /// [`crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH`] is 2700 (armed); below that epoch
-    /// `process_epoch` takes the unfloored `leak_adjusted` branch on every
-    /// epoch a real chain can reach. The floor and the leak recovery that
-    /// landed on 2026-08-25 are correct and are NOT in force. That is the
-    /// finding, and it is why this test is not decorated as a historical
-    /// curiosity: it is a description of the code the fleet is running.
+    /// the pre-boundary rule**, because
+    /// [`crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH`] is 2880. Below that
+    /// epoch `process_epoch` takes the unfloored `leak_adjusted` branch; at
+    /// and above it the denominator floor and leak recovery apply. The test is
+    /// retained as the counterexample that proves why the scheduled rule
+    /// exists, not as a claim about which epoch a deployed fleet has reached.
     ///
     /// The companion below shows the floor stops it, so this is not a test
     /// that merely cannot fail.

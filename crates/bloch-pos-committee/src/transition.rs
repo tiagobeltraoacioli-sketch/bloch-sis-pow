@@ -461,8 +461,8 @@ pub enum PosTransaction {
     Exit { validator: u32 },
     /// ADR-041: permissionless, metered withdrawal to the registered script.
     Withdraw { validator: u32 },
-    /// Authenticated voluntary exit (§7.2) — consensus-INVALID until
-    /// [`crate::params::EXIT_AUTH_ACTIVATION_EPOCH`], which is `u64::MAX`.
+    /// Authenticated voluntary exit (§7.2) — consensus-INVALID before
+    /// [`crate::params::EXIT_AUTH_ACTIVATION_EPOCH`] (epoch 2884).
     ///
     /// What it adds over [`Self::Exit`], and both are necessary:
     ///
@@ -489,8 +489,7 @@ pub enum PosTransaction {
     },
     /// Install a fresh RANDAO chain head for an EXHAUSTED validator (§6.3
     /// step 4) — consensus-INVALID until
-    /// [`crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH`], which is
-    /// `u64::MAX`.
+    /// [`crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH`] (epoch 2884).
     ///
     /// # Why this variant exists
     ///
@@ -1003,10 +1002,11 @@ impl PosTransaction {
     /// Whether evidence is ACTIVE is not this function's question — the
     /// flag-day gate lives in the transition (`TxReject::EvidenceNotActive`),
     /// against the committed epoch, and
-    /// [`crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH`] ships INERT
-    /// (`u64::MAX`): until the founder arms it, a block carrying this tag is
-    /// refused by every node, which is byte-for-byte the verdict a
-    /// pre-format binary reaches at its decoder.
+    /// [`crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH`] is scheduled at
+    /// epoch 2884: below it a block carrying this tag is refused by every
+    /// current node, which is byte-for-byte the verdict a pre-format binary
+    /// reaches at its decoder; at and above it, the transition judges the
+    /// evidence.
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, TxDecodeError> {
         let mut r = TxReader { b: bytes, i: 0 };
         let tag = r.u8()?;
@@ -3091,8 +3091,8 @@ impl CommittedState {
         let forced = crate::params::rehearsal::exit_auth_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        // `EXIT_AUTH_ACTIVATION_EPOCH` is `u64::MAX` today (inert gate, founder's
-        // to arm) — the comparison is always false outside `forced`, by design.
+        // The production gate is epoch 2884. `forced` lets deliberately old
+        // fixtures exercise the post-boundary rules without changing it.
         #[allow(clippy::absurd_extreme_comparisons)]
         {
             forced || crate::params::epoch_gate_active(epoch, crate::params::EXIT_AUTH_ACTIVATION_EPOCH)
@@ -3107,16 +3107,16 @@ impl CommittedState {
     /// walk — committed state, never a clock. Below the gate a block carrying
     /// evidence is refused (`TxReject::EvidenceNotActive`), which is the same
     /// verdict a pre-format binary reaches at its decoder, so a mixed fleet
-    /// agrees on every block until the founder arms
-    /// [`crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH`].
+    /// agrees on every pre-boundary block. The scheduled boundary is
+    /// [`crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH`] (epoch 2884).
     fn slashing_evidence_active(epoch: u64) -> bool {
         #[cfg(test)]
         let forced = crate::params::rehearsal::slashing_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        // `SLASHING_EVIDENCE_ACTIVATION_EPOCH` is `u64::MAX` today (inert gate,
-        // founder's to arm) — the comparison is always false outside `forced`,
-        // by design.
+        // The production gate is epoch 2884. `forced` exists only so fixtures
+        // whose committed epoch is deliberately earlier can exercise the
+        // post-boundary rule without weakening that schedule.
         #[allow(clippy::absurd_extreme_comparisons)]
         {
             forced || crate::params::epoch_gate_active(epoch, crate::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH)
@@ -3199,9 +3199,8 @@ impl CommittedState {
         let forced = crate::params::rehearsal::randao_recommit_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        // `RANDAO_RECOMMIT_ACTIVATION_EPOCH` is `u64::MAX` today (inert gate,
-        // founder's to arm) — the comparison is always false outside `forced`,
-        // by design.
+        // The production gate is epoch 2884. `forced` lets deliberately old
+        // fixtures exercise the post-boundary rules without changing it.
         #[allow(clippy::absurd_extreme_comparisons)]
         {
             forced || crate::params::epoch_gate_active(epoch, crate::params::RANDAO_RECOMMIT_ACTIVATION_EPOCH)
@@ -3341,19 +3340,18 @@ impl CommittedState {
     /// Is the **withdrawal transaction** (R7 M4) active in `epoch`? One
     /// reader for one gate, mirroring [`Self::exit_auth_active`]. `epoch` is
     /// the caller's `self.epoch`: committed state rolled to the judged
-    /// block's own `epoch_of(header.slot)`, never a clock. Ships inert —
-    /// `params::WITHDRAWAL_ACTIVATION_EPOCH` is `u64::MAX` — and the
-    /// rehearsal switch exists so the withdrawal rules' tests are not dead
-    /// code until the founder arms it.
+    /// block's own `epoch_of(header.slot)`, never a clock. The production
+    /// boundary is `params::WITHDRAWAL_ACTIVATION_EPOCH` (epoch 2884); the
+    /// rehearsal switch lets deliberately earlier fixtures exercise the
+    /// post-boundary withdrawal rules.
     ///
     fn withdrawal_active(epoch: u64) -> bool {
         #[cfg(test)]
         let forced = crate::params::rehearsal::withdrawal_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        // `WITHDRAWAL_ACTIVATION_EPOCH` is `u64::MAX` today (inert gate,
-        // founder's to arm) — the comparison is always false outside
-        // `forced`, by design.
+        // The production gate is epoch 2884. `forced` lets deliberately old
+        // fixtures exercise the post-boundary rules without changing it.
         #[allow(clippy::absurd_extreme_comparisons)]
         {
             forced || crate::params::epoch_gate_active(epoch, crate::params::WITHDRAWAL_ACTIVATION_EPOCH)
@@ -3569,11 +3567,10 @@ impl CommittedState {
             PosTransaction::RandaoRecommit { validator, new_commitment, epoch, signature } => {
                 // THE FLAG-DAY GATE, FIRST — same discipline as every other
                 // gated arm, read from `self.epoch` (committed state, never
-                // node-local). `RANDAO_RECOMMIT_ACTIVATION_EPOCH` is
-                // `u64::MAX`, so today this refuses at EVERY epoch and the
-                // fleet's behaviour is unchanged: chains stay terminal until
-                // the founder arms the flag day (deadline ~2027-02-11, the
-                // first exhaustion — see the constant's docs).
+                // node-local). `RANDAO_RECOMMIT_ACTIVATION_EPOCH` is 2884:
+                // earlier blocks refuse, while blocks at and above the
+                // lifecycle boundary judge the registered validator's signed
+                // re-commitment (see the constant's deployment caveat).
                 if !Self::randao_recommit_active(self.epoch) {
                     return Err(TxReject::StakingNotActive);
                 }
@@ -4456,11 +4453,10 @@ impl CommittedState {
             // already exiting earlier (or at exactly this epoch, via its own
             // voluntary exit) must not have its exit pushed LATER by a slash.
             //
-            // Replay-safety: this path is reachable only once
-            // `SLASHING_EVIDENCE_ACTIVATION_EPOCH` (still `u64::MAX`) is
-            // armed, so no historical block has ever executed this write —
-            // changing it needs no gate of its own (`params.rs`'s doc on that
-            // constant covers the argument).
+            // Replay-safety: this path is reachable only at and above
+            // `SLASHING_EVIDENCE_ACTIVATION_EPOCH` (2884), so pre-boundary
+            // historical blocks never executed this write. The lifecycle
+            // boundary itself is the gate (`params.rs` documents the rollout).
             let effective_exit = epoch.saturating_add(1);
             if effective_exit < rec.exit_epoch {
                 rec.exit_epoch = effective_exit;
@@ -5897,10 +5893,10 @@ impl<V: SignatureVerifier> Transition<V> {
         for (i, tx) in transactions.iter().enumerate() {
             let applied = match tx {
                 // The gate first: below SLASHING_EVIDENCE_ACTIVATION_EPOCH
-                // (u64::MAX today — INERT) a block carrying evidence is
-                // consensus-invalid on every node, byte-for-byte the verdict
-                // a pre-format binary reaches at its decoder. Judged off the
-                // block's own committed epoch, never a clock — the 2026-08-08
+                // (2884) a block carrying evidence is consensus-invalid on
+                // every current node, byte-for-byte the verdict a pre-format
+                // binary reaches at its decoder. Judged off the block's own
+                // committed epoch, never a clock — the 2026-08-08
                 // expected_bits fork is the standing reason.
                 PosTransaction::SlashingEvidence(_)
                     if !CommittedState::slashing_evidence_active(block_epoch) =>
@@ -12889,9 +12885,9 @@ mod tests {
         // refuses at every epoch. The switch says so out loud rather than the
         // constant being weakened to keep an old fixture green.
         let _bonding = crate::params::rehearsal::bonding_gate_open_guard();
-        // The flag day, rehearsed: `SLASHING_EVIDENCE_ACTIVATION_EPOCH` ships
-        // inert (`u64::MAX`), so the post-gate rules this test exercises are
-        // reachable only through the guard.
+        // The fixture is at epoch zero, below the scheduled lifecycle boundary
+        // 2884, so it opens the test-only gate to exercise the post-boundary
+        // rules without changing the production constant.
         let _gate = crate::params::rehearsal::slashing_gate_open_guard();
         let (t, g, mut chains) = setup(4);
         let seed = g.seed_for_epoch(0);

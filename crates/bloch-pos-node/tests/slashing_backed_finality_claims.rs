@@ -356,13 +356,11 @@ fn the_activation_constant_is_unique_and_matches_the_schedule() {
 // This test walks the CHECKED-OUT WORKING TREE. It can therefore only ever
 // support a claim about the tree that is built — never a claim about "this
 // repository", which is 1,300+ refs, most of which no released binary contains.
-// `SLASHING_EVIDENCE_ACTIVATION_EPOCH` is declared today on `d21c3370`
-// (`params.rs:638`, `u64::MAX`), a direct child of fleet commit `46133196`
-// pushed to a public remote, and this test was green the whole time — correctly,
-// because that commit is not in this tree. It was the retraction PROSE that
-// overreached, by saying "does not exist in this repository" about a measurement
-// that only covered one lineage. No test in a tree can close that gap; only a
-// narrower sentence can, which is why the sentences now say "release lineage".
+// Historical scope example: `d21c3370` declared the gate as `u64::MAX` on a
+// different release lineage, while this tree schedules epoch 2884. A test over
+// the checked-out tree cannot establish which lineage a fleet runs. It was the
+// old retraction prose that overreached by turning a tree measurement into a
+// repository/deployment claim; the current text requires binary inventory.
 
 /// The observation hook must submit evidence and report a gated refusal;
 /// silently dropping an observed pair must not return during integration.

@@ -6173,7 +6173,7 @@ fn admissible_with_verifier(tx: &PosTransaction, wall_epoch: u64, verifier: &dyn
         // ingress could construct one. Named explicitly for the reason the
         // `ExitV2` arm states: a variant that reaches `_` is a variant the
         // mempool admits, and consensus refuses this one at every epoch below
-        // the INERT `SLASHING_EVIDENCE_ACTIVATION_EPOCH`
+        // the scheduled `SLASHING_EVIDENCE_ACTIVATION_EPOCH` (2884)
         // (`TxReject::EvidenceNotActive`), so admitting it pre-gate would
         // relay transactions no block can carry — the mempool-stuffing class.
         //
@@ -6203,9 +6203,8 @@ fn admissible_with_verifier(tx: &PosTransaction, wall_epoch: u64, verifier: &dyn
         }
         // The RANDAO re-commit (H-R7-1) — named explicitly for the same
         // reason ExitV2 is: a variant that reaches `_` is a variant the
-        // mempool ADMITS, and this shape is consensus-refused at every epoch
-        // (`RANDAO_RECOMMIT_ACTIVATION_EPOCH` is `u64::MAX`) with its wire
-        // byte (0x0A) unassigned besides. Pre-activation the refusal is
+        // mempool ADMITS, and this shape is consensus-refused before
+        // `RANDAO_RECOMMIT_ACTIVATION_EPOCH` (2884). Pre-activation the refusal is
         // unconditional; post-activation the signature half still belongs to
         // consensus alone (this function is stateless — no registry to
         // resolve the validator's committed key against).
@@ -6224,13 +6223,11 @@ fn admissible_with_verifier(tx: &PosTransaction, wall_epoch: u64, verifier: &dyn
 /// of `admissible` so it can be TESTED.
 ///
 /// It cannot be tested through `admissible` itself, and that is not an
-/// oversight in the test: `EXIT_AUTH_ACTIVATION_EPOCH` is `u64::MAX`, so the
-/// flag-day check in front of these rules refuses at every epoch any chain can
-/// reach, and no argument to `admissible` ever gets past it. Rules that only
-/// run after a flag day are exactly the rules that get to the flag day
-/// unexercised. Extracting them makes them a pure function of three values and
-/// therefore checkable today, on the tree the fleet runs, without arming
-/// anything.
+/// oversight in the test: fixtures below `EXIT_AUTH_ACTIVATION_EPOCH` (2884)
+/// cannot reach these rules through `admissible`. Rules that only run after a
+/// flag day are exactly the rules that can reach the boundary unexercised.
+/// Extracting them makes them a pure function of three values and therefore
+/// checkable without changing the production schedule.
 ///
 /// Both rules mirror consensus (`CommittedState::apply_exit_v2`) rather than
 /// inventing relay policy:

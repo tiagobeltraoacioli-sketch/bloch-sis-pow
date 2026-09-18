@@ -1,32 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Candidate schedule: lifecycle epoch 2884, 2026-09-14 22:35:19 UTC.
+//! Source schedule: lifecycle epoch 2884, 2026-09-14 22:35:19 UTC.
 //! Evidence is refused before that epoch; valid evidence can apply penalties
-//! at and after it. A source schedule does not establish deployed readiness
-//! or an economic settlement guarantee. The following retraction records the
-//! historical, unarmed release and must be read in that scope.
+//! at and after it. The wire decoder carries both signed envelopes and the
+//! node observation hook submits detected pairs through ordinary admission.
+//! A source schedule does not establish which binary a fleet runs, deployed
+//! readiness, or an economic settlement guarantee.
 //!
 //! Slashing execution — the state machine behind §7.3.
 //!
-//! > **NOT REACHABLE FROM THE NETWORK (stated 2026-09-01; mechanism changed
-//! > 2026-09-05, verdict unchanged).** Everything in this module is complete,
-//! > unit-tested and correct, and nothing can invoke it on the live chain.
-//! > What stands in the way moved once. As first stated, evidence rode on
-//! > wire tag `0x05` and `transition::PosTransaction::from_canonical_bytes`
-//! > refused that tag unconditionally — the encoder folded the nested
-//! > messages in as the signing roots they were signed over, so the envelopes
-//! > were unrecoverable by construction (Round-2 finding F-02). Since
-//! > 2026-09-05 the tag DECODES (the envelopes travel whole), and what stands
-//! > in the way is the flag day: the transition refuses the evidence
-//! > transaction at every epoch below
-//! > `params::SLASHING_EVIDENCE_ACTIVATION_EPOCH`, which ships INERT at
-//! > `u64::MAX` and is the founder's to arm — after a full fleet rollout of
-//! > the decoder, since the released binaries still refuse the tag at decode.
-//! > Nothing constructs the transaction outside tests. Read the penalties
-//! > below as a *design*, and do not let them back a finality guarantee
-//! > anywhere: the retraction on `bloch-pos-node`'s `rpc::Finality` says why,
-//! > and `crates/bloch-pos-node/tests/slashing_backed_finality_claims.rs`
-//! > keeps this note, that codec and that gate in step.
+//! Historical note: before 2026-09-05, tag `0x05` was structurally
+//! unreachable because `PosTransaction::from_canonical_bytes` refused it.
+//! Later revisions decoded the envelopes but kept the activation epoch at
+//! `u64::MAX`. Neither description is current for this source: the constant is
+//! 2884 and release tests pin it to the lifecycle schedule. Do not infer from
+//! source reachability that a particular deployed network has upgraded or
+//! that finality is economically settled; that requires binary inventory and
+//! finalized-chain evidence. The retraction on `bloch-pos-node`'s
+//! `rpc::Finality` and `slashing_backed_finality_claims.rs` preserve that
+//! operational boundary.
 //!
 //! [`crate::attestation`] supplies *detection* (`surrounds`, `is_double_vote`)
 //! and [`crate::delegation::apply_slash`] supplies the pro-rata *arithmetic*.

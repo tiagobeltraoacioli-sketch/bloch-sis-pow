@@ -1396,9 +1396,9 @@ pub const FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// boundary walk — committed state, never a clock. The 2026-08-08
 /// `expected_bits` fork is the standing reason.
 ///
-/// # ARMING THIS IS A FOUNDER DECISION, AND IT HAS A PRECONDITION
+/// # Deployment precondition and evidence boundary
 ///
-/// The whole fleet must already run a binary whose decoder understands the
+/// The schedule requires the whole fleet to run a binary whose decoder understands the
 /// evidence wire format: below the gate old and new binaries agree (both
 /// refuse the block, one at decode and one at the transition), but the first
 /// post-gate block that carries evidence is accepted only by nodes that can
@@ -1587,8 +1587,8 @@ pub const ATTESTATION_DEDUP_ACTIVATION_EPOCH: u64 = u64::MAX;
 ///    `att.data.target_epoch == st.epoch` or `att.data.source_epoch` to name
 ///    the CURRENT justified checkpoint, and a validator with two DISTINCT
 ///    signing roots in the epoch (an in-block equivocator, caught by
-///    [`SLASHING_EVIDENCE_ACTIVATION_EPOCH`] once THAT arms, not by the
-///    reward pass) still earns full credit for whichever landed last. At and
+///    [`SLASHING_EVIDENCE_ACTIVATION_EPOCH`] from epoch 2884 onward, not by
+///    the reward pass) still earns full credit for whichever landed last. At and
 ///    above the gate, `close_epoch`'s credit loop additionally requires the
 ///    target/source binding and withholds credit from a two-signing-root
 ///    validator.

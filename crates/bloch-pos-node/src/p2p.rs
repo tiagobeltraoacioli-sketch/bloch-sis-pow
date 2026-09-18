@@ -335,11 +335,10 @@ const MAX_PAGES_WITHOUT_PROGRESS: u32 = 64;
 /// how many a well-formed identify message may carry. Without a bound, one
 /// peer advertising many addresses — or many short-lived peers advertising a
 /// few each — grows this map for the life of the process. "A few hundred" is
-/// generous headroom over any real deployment: `--max-peers` defaults to 64
-/// connected peers, so 512 is 8 addresses remembered per peer at the current
-/// default, and the map is ALSO pruned of a peer's own entries the moment its
-/// last connection closes (`Loop::forget_peer`), so a stable mesh never gets
-/// close to the cap at all.
+/// generous headroom over the default connected-peer count and allows several
+/// remembered addresses per peer. The map is ALSO pruned of a peer's own
+/// entries the moment its last connection closes (`Loop::forget_peer`), so a
+/// stable mesh never gets close to the cap at all.
 const MAX_DIALED_ADDRS: usize = 512;
 
 // ── What one peer may make this node do (the serving side) ──────────────────

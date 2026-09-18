@@ -540,10 +540,9 @@ const OUTBOUND_QUEUE_DEPTH: usize = 256;
 /// header): binding a routable address is opt-in and, once bound, ANY TCP
 /// connection this node accepts costs two threads (one reader, one writer)
 /// and one bounded queue for as long as it stays open — before this bound,
-/// forever. `engine::Config::max_peers` defaults to 64 configured/dialed
-/// peers; this is double that, generous headroom for inbound connections
-/// from peers that dialed first, past which a new connection is closed
-/// immediately, before either thread is spawned.
+/// forever. This ceiling leaves generous headroom over the default configured
+/// peer count for inbound connections from peers that dialed first; past it a
+/// new connection is closed immediately, before either thread is spawned.
 const MAX_INBOUND_CONNECTIONS: usize = 128;
 const MAX_INBOUND_PER_IP: usize = 32;
 
