@@ -52,10 +52,135 @@ struct CachedState {
     eutxos: Vec<crate::state_root::EutxoEntry>,
 }
 
+#[derive(serde::Serialize)]
+struct CachedStateRef<'a> {
+    admission_network_domain: &'a Option<[u8; 32]>,
+    slot: &'a u64,
+    epoch: &'a u64,
+    validators: &'a BTreeMap<u32, ValidatorRecord>,
+    reveals_used: &'a BTreeMap<u32, u32>,
+    randao_mix: &'a [u8; 32],
+    boundary_mixes: &'a BTreeMap<u64, [u8; 32]>,
+    genesis_mix: &'a [u8; 32],
+    genesis_cohort: &'a Vec<u32>,
+    genesis_principal_sat: &'a BTreeMap<u32, u128>,
+    written_off_sat: &'a u128,
+    funded_validators: &'a BTreeSet<u32>,
+    stake_low_water: &'a BTreeMap<u32, u128>,
+    randao_generations: &'a BTreeMap<u32, u32>,
+    finality_engine: &'a finality::FinalityState,
+    previous_justified: &'a Checkpoint,
+    pending_votes: &'a BTreeMap<(u32, [u8; 32]), AttestationData>,
+    latest_messages: &'a BTreeMap<u32, (u64, [u8; 32])>,
+    fc_equivocators: &'a BTreeSet<u32>,
+    fc_recent_votes: &'a BTreeMap<u32, BTreeMap<u64, [u8; 32]>>,
+    current_participation: &'a BTreeMap<u32, bool>,
+    previous_participation: &'a BTreeMap<u32, bool>,
+    deposit_history: &'a Vec<QueuedDeposit>,
+    pubkey_index: &'a BTreeMap<[u8; 32], u32>,
+    delegations: &'a Vec<Delegation>,
+    pending_fee_rewards: &'a BTreeMap<u32, u128>,
+    slashing: &'a slashing::SlashingState,
+    delegator_slash_losses: &'a BTreeMap<u32, u128>,
+    delegator_fee_rewards: &'a BTreeMap<u32, u128>,
+    validator_fee_rewards: &'a BTreeMap<u32, u128>,
+    delegator_issuance_rewards: &'a BTreeMap<u32, u128>,
+    current_proposed: &'a BTreeMap<u32, bool>,
+    base_fee_millisat_per_gas: &'a u128,
+    block_gas_used: &'a u64,
+    block_tx_bytes: &'a u64,
+    taint_root: &'a [u8; 32],
+    coherence_accumulator_root: &'a [u8; 32],
+    coherence_nullifier_root: &'a [u8; 32],
+    evm: &'a EvmCommitment,
+    issued_sat: &'a u128,
+    eutxos: EutxoValues<'a>,
+}
+
+struct EutxoValues<'a>(&'a EutxoSet);
+impl serde::Serialize for EutxoValues<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut sequence = serializer.serialize_seq(Some(self.0.entries.by_outpoint.len()))?;
+        for entry in self.0.values() { sequence.serialize_element(entry)?; }
+        sequence.end()
+    }
+}
+
 impl CommittedState {
     /// Encode only locally committed state. The node binds these bytes to its
     /// build, manifest, log prefix and checksum before accepting a restore.
     pub fn encode_local_cache(&self) -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        self.append_local_cache(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Append the identical local-cache payload without cloning committed state
+    /// or allocating a second encoded payload. Restore the original destination
+    /// length if serialization fails; existing prefix bytes remain untouched.
+    pub fn append_local_cache(&self, bytes: &mut Vec<u8>) -> Result<(), String> {
+        let CommittedState { head: _, eutxos, admission_network_domain, slot, epoch, validators, reveals_used, randao_mix, boundary_mixes, genesis_mix, genesis_cohort, genesis_principal_sat, written_off_sat, funded_validators, stake_low_water, randao_generations, finality_engine, previous_justified, pending_votes, latest_messages, fc_equivocators, fc_recent_votes, current_participation, previous_participation, deposit_history, pubkey_index, delegations, pending_fee_rewards, slashing, delegator_slash_losses, delegator_fee_rewards, validator_fee_rewards, delegator_issuance_rewards, current_proposed, base_fee_millisat_per_gas, block_gas_used, block_tx_bytes, taint_root, coherence_accumulator_root, coherence_nullifier_root, evm, issued_sat } = self;
+        let value = CachedStateRef {
+            admission_network_domain,
+            slot,
+            epoch,
+            validators,
+            reveals_used,
+            randao_mix,
+            boundary_mixes,
+            genesis_mix,
+            genesis_cohort,
+            genesis_principal_sat,
+            written_off_sat,
+            funded_validators,
+            stake_low_water,
+            randao_generations,
+            finality_engine,
+            previous_justified,
+            pending_votes,
+            latest_messages,
+            fc_equivocators,
+            fc_recent_votes,
+            current_participation,
+            previous_participation,
+            deposit_history,
+            pubkey_index,
+            delegations,
+            pending_fee_rewards,
+            slashing,
+            delegator_slash_losses,
+            delegator_fee_rewards,
+            validator_fee_rewards,
+            delegator_issuance_rewards,
+            current_proposed,
+            base_fee_millisat_per_gas,
+            block_gas_used,
+            block_tx_bytes,
+            taint_root,
+            coherence_accumulator_root,
+            coherence_nullifier_root,
+            evm,
+            issued_sat,
+            eutxos: EutxoValues(eutxos),
+        };
+        let size = bincode::DefaultOptions::new().with_limit(LIMIT)
+            .serialized_size(&value).map_err(|e| e.to_string())?;
+        let size = usize::try_from(size).map_err(|e| e.to_string())?;
+        bytes.try_reserve_exact(size).map_err(|e| e.to_string())?;
+        let original_len = bytes.len();
+        if let Err(error) = bincode::DefaultOptions::new().with_limit(LIMIT)
+            .serialize_into(&mut *bytes, &value) {
+            bytes.truncate(original_len);
+            return Err(error.to_string());
+        }
+        Ok(())
+    }
+
+    // Retain the former owned serializer only as an independent compatibility
+    // oracle: equality catches changes to field order and eUTXO sequence framing.
+    #[cfg(test)]
+    pub(super) fn encode_local_cache_owned_reference(&self) -> Result<Vec<u8>, String> {
         let CommittedState { head: _, eutxos, admission_network_domain, slot, epoch, validators, reveals_used, randao_mix, boundary_mixes, genesis_mix, genesis_cohort, genesis_principal_sat, written_off_sat, funded_validators, stake_low_water, randao_generations, finality_engine, previous_justified, pending_votes, latest_messages, fc_equivocators, fc_recent_votes, current_participation, previous_participation, deposit_history, pubkey_index, delegations, pending_fee_rewards, slashing, delegator_slash_losses, delegator_fee_rewards, validator_fee_rewards, delegator_issuance_rewards, current_proposed, base_fee_millisat_per_gas, block_gas_used, block_tx_bytes, taint_root, coherence_accumulator_root, coherence_nullifier_root, evm, issued_sat } = self;
         let value = CachedState {
             admission_network_domain: admission_network_domain.clone(),

@@ -50,35 +50,39 @@ impl Engine {
         let block_count = self.chain.len().checked_sub(1)
             .ok_or_else(|| invalid("cache canonical chain is empty"))?;
         bytes.extend_from_slice(&(block_count as u64).to_le_bytes());
-        bytes.extend_from_slice(&self.state.encode_local_cache().map_err(invalid)?);
+        self.state.append_local_cache(&mut bytes).map_err(invalid)?;
         let checksum = Sha3_256::digest(&bytes);
-        bytes.extend_from_slice(&checksum);
-        if bytes.len() as u64 > MAX_BYTES { return Err(invalid("state cache exceeds 512 MiB")); }
+        let file_len = bytes.len().checked_add(checksum.len())
+            .ok_or_else(|| invalid("cache length overflow"))?;
+        if file_len as u64 > MAX_BYTES { return Err(invalid("state cache exceeds 512 MiB")); }
         let destination = dir.join("state.cache");
         let mut staging = crate::store::PrivateStagingFile::create_for(&destination)?;
         staging.file_mut().write_all(&bytes)?;
+        staging.file_mut().write_all(&checksum)?;
         staging.file_mut().sync_all()?;
         if destination.exists() {
             fs::rename(&destination, dir.join("state.cache.previous"))?;
         }
         staging.publish(&destination)?;
-        println!("state-cache: persisted slot={} blocks={} bytes={} elapsed_ms={}", self.state.slot(), block_count, bytes.len(), started.elapsed().as_millis());
+        println!("state-cache: persisted slot={} blocks={} bytes={} elapsed_ms={}", self.state.slot(), block_count, file_len, started.elapsed().as_millis());
         Ok(())
     }
 
     /// Validate completely before changing any engine state. A failed cache
-    /// leaves the genesis engine intact, ready for the ordinary replay path.
-    pub(super) fn restore_local_cache(&mut self, logged: &[BlockEnvelope]) -> io::Result<usize> {
+    /// leaves the genesis engine and complete log intact for ordinary replay.
+    /// Success moves the validated prefix into the engine and leaves only the
+    /// uncached tail in `logged`; signatures and bodies are never deep-cloned.
+    pub(super) fn restore_local_cache(&mut self, logged: &mut Vec<BlockEnvelope>) -> io::Result<usize> {
         let mut errors = Vec::new();
         for name in ["state.cache", "state.cache.previous"] {
             match self.read_local_cache(name, logged) {
                 Ok((state, count)) => {
-                    for env in &logged[..count] {
+                    for env in logged.drain(..count) {
                         let id = env.block_id();
                         self.chain.push((env.header.slot, id));
                         self.canonical.insert(*id.as_bytes());
-                        self.blocks.insert(*id.as_bytes(), env.clone());
-                        self.note_tx_slots(env.header.slot, &body_transactions(env).map_err(invalid)?);
+                        self.note_tx_slots(env.header.slot, &body_transactions(&env).map_err(invalid)?);
+                        self.blocks.insert(*id.as_bytes(), env);
                     }
                     self.state.set(state);
                     self.remember_state(*self.state.head().as_bytes(), self.state.arc());
@@ -179,7 +183,7 @@ mod tests {
     #[test]
     fn cache_staging_preserves_symlink_target_and_previous_generation() {
         use std::os::unix::fs::{symlink, PermissionsExt};
-        let (mut engine, dir, logged) = fixture();
+        let (mut engine, dir, mut logged) = fixture();
         let previous = fs::read(dir.0.join("state.cache")).unwrap();
         let victim = dir.0.join("unrelated-cache-target");
         fs::write(&victim, b"do not truncate").unwrap();
@@ -191,7 +195,7 @@ mod tests {
         assert_eq!(fs::read(dir.0.join("state.cache.previous")).unwrap(), previous);
         assert_eq!(fs::metadata(dir.0.join("state.cache")).unwrap().permissions().mode() & 0o777, 0o600);
         reset(&mut engine);
-        assert_eq!(engine.restore_local_cache(&logged).unwrap(), 70);
+        assert_eq!(engine.restore_local_cache(&mut logged).unwrap(), 70);
     }
 
     #[test]
@@ -203,35 +207,44 @@ mod tests {
         let expected = engine.state.arc();
         logged.push(next.clone());
         engine.store.rewrite(&logged).unwrap();
+        let full_log = logged.clone();
+        let first_id = logged[0].block_id();
+        assert!(!logged[0].proposer_sig.is_empty());
+        let signature_ptr = logged[0].proposer_sig.as_ptr();
         reset(&mut engine);
-        assert_eq!(engine.restore_local_cache(&logged).unwrap(), 70);
+        assert_eq!(engine.restore_local_cache(&mut logged).unwrap(), 70);
+        assert_eq!(logged.len(), 1, "only uncached tail remains for replay");
+        assert_eq!(logged[0].block_id(), next.block_id());
+        assert_eq!(engine.blocks[first_id.as_bytes()].proposer_sig.as_ptr(), signature_ptr, "cached envelopes must retain their original allocations");
         assert_eq!(*engine.state, *at_cache);
         engine.ingest_replay(next);
         assert_eq!(*engine.state, *expected);
         let restored = engine.state.arc();
         reset(&mut engine);
-        for block in logged { engine.ingest_replay(block); }
+        for block in full_log { engine.ingest_replay(block); }
         assert_eq!(*engine.state, *restored, "cached continuation must equal full verified replay");
     }
 
     #[test]
     fn corrupt_or_torn_cache_falls_back_to_previous_generation() {
-        let (mut engine, dir, logged) = fixture();
+        let (mut engine, dir, mut logged) = fixture();
         engine.write_local_cache().unwrap();
         fs::write(dir.0.join("state.cache"), b"torn").unwrap();
         reset(&mut engine);
-        assert_eq!(engine.restore_local_cache(&logged).unwrap(), 70);
+        assert_eq!(engine.restore_local_cache(&mut logged).unwrap(), 70);
+        logged = engine.store.read_all().unwrap();
         fs::write(dir.0.join("state.cache.previous"), b"also torn").unwrap();
         reset(&mut engine);
-        assert!(engine.restore_local_cache(&logged).is_err());
+        assert!(engine.restore_local_cache(&mut logged).is_err());
         assert_eq!(engine.state.slot(), 0);
+        assert_eq!(logged.len(), 70, "failed restore must preserve every replay block");
         for block in logged { engine.ingest_replay(block); }
         assert_eq!(engine.state.slot(), 70);
     }
 
     #[test]
     fn cache_rejects_changed_log_build_network_and_state_root() {
-        let (mut engine, dir, logged) = fixture();
+        let (mut engine, dir, mut logged) = fixture();
         let cache = fs::read(dir.0.join("state.cache")).unwrap();
         for offset in [8usize, 40, 120] {
             let mut changed = cache.clone();
@@ -241,27 +254,27 @@ mod tests {
             changed[end..].copy_from_slice(&checksum);
             fs::write(dir.0.join("state.cache"), &changed).unwrap();
             reset(&mut engine);
-            assert!(engine.restore_local_cache(&logged).is_err());
+            assert!(engine.restore_local_cache(&mut logged).is_err());
             assert_eq!(engine.chain.len(), 1);
         }
         fs::write(dir.0.join("state.cache"), cache).unwrap();
         engine.store.rewrite(&logged[..40]).unwrap();
-        assert!(engine.restore_local_cache(&logged[..40]).is_err());
+        assert!(engine.restore_local_cache(&mut logged[..40].to_vec()).is_err());
         assert_eq!(engine.state.slot(), 0);
     }
 
     #[test]
     fn checksum_rejects_single_bit_corruption_and_trailing_bytes() {
-        let (mut engine, dir, logged) = fixture();
+        let (mut engine, dir, mut logged) = fixture();
         let cache = fs::read(dir.0.join("state.cache")).unwrap();
         let mut changed = cache.clone();
         changed[150] ^= 1;
         fs::write(dir.0.join("state.cache"), changed).unwrap();
         reset(&mut engine);
-        assert!(engine.restore_local_cache(&logged).is_err());
+        assert!(engine.restore_local_cache(&mut logged).is_err());
         let mut changed = cache;
         changed.push(0);
         fs::write(dir.0.join("state.cache"), changed).unwrap();
-        assert!(engine.restore_local_cache(&logged).is_err());
+        assert!(engine.restore_local_cache(&mut logged).is_err());
     }
 }

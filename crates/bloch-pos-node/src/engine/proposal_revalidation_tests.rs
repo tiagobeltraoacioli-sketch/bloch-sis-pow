@@ -286,3 +286,46 @@ fn admission_negative_cache_retries_corrected_transfer_signature_root_and_key() 
         assert_eq!(admissible(&changed, activation), admissible_with_verifier(&changed, activation, &verifier));
     }
 }
+
+#[test]
+fn canonical_lookups_preserve_gaps_forks_reorgs_and_missing_envelope_fallback() {
+    let _clock = validator_lifecycle::clock_at(1);
+    let (mut node, _dir) = perf_support::proposing_engine_funded(&funds());
+    let genesis = *node.head_id().as_bytes();
+    assert_eq!(node.height_of(&genesis), Some(0));
+    assert_eq!(node.slot_of_canonical_root(&genesis), Some(0));
+    assert!(node.serve_rpc(RpcRequest::BlockBySlot(0)).is_ok());
+    node.propose(1);
+    let first = node.blocks[node.head_id().as_bytes()].clone();
+    let first_id = *first.block_id().as_bytes();
+    node.propose(3);
+    let last = node.blocks[node.head_id().as_bytes()].clone();
+    let last_id = *last.block_id().as_bytes();
+    assert_eq!(node.serve_rpc(RpcRequest::BlockBySlot(2)).unwrap_err().code, rpc::SLOT_EMPTY);
+    assert!(node.serve_rpc(RpcRequest::BlockBySlot(3)).is_ok());
+    assert_eq!(node.height_of(&first_id), Some(1));
+    assert_eq!(node.height_of(&last_id), Some(2));
+    assert_eq!(node.slot_of_canonical_root(&last_id), Some(3));
+    // A stored same-slot envelope is not a canonical identity. Its validity
+    // is irrelevant to lookup; it must not inherit the canonical slot's height.
+    let mut other = first.clone();
+    other.header.state_root = [211; 32];
+    let other_id = *other.block_id().as_bytes();
+    node.blocks.insert(other_id, other);
+    assert_eq!(node.height_of(&other_id), None);
+    assert_eq!(node.slot_of_canonical_root(&other_id), None);
+    assert_eq!(node.height_of(&[212; 32]), None);
+    let saved = node.blocks.remove(&first_id).unwrap();
+    assert_eq!(node.height_of(&first_id), Some(1));
+    assert_eq!(node.slot_of_canonical_root(&first_id), Some(1));
+    node.blocks.insert(first_id, saved);
+    assert!(node.do_reorg(genesis, Vec::new()));
+    assert_eq!(node.height_of(&first_id), None);
+    assert_eq!(node.height_of(&last_id), None);
+    assert!(node.do_reorg(genesis, vec![first, last]));
+    for (height, (slot, id)) in node.chain.iter().enumerate() {
+        assert_eq!(node.height_of(id.as_bytes()), Some(height as u64));
+        assert_eq!(node.slot_of_canonical_root(id.as_bytes()), Some(*slot));
+    }
+    assert_eq!(node.height_of(&other_id), None);
+}

@@ -1,6 +1,6 @@
 export const meta = {
   name: 'roadmap-execution',
-  description: 'Advance the Bloch-SIS roadmap: audit every track to its gate, plan per-track, implement the top buildable workstreams (P1 FRI verifier, S3 multi-node harness, P4 view keys, S5 cargo-audit+metrics) as reviewable patches, synthesize progress + remaining gates',
+  description: 'Audit the checked-out Bloch source and current roadmap, derive scoped work from verified findings, and return reviewable patches with validation and remaining gates',
   phases: [
     { title: 'Audit' },
     { title: 'Plan' },
@@ -9,18 +9,17 @@ export const meta = {
   ],
 }
 
-const REPO = '/Users/tiagoacioli/dev/BlochSISPoW-project'
+// Run the workflow host from the repository root. No personal checkout or branch is assumed.
+const REPO = '.'
 
 const CTX = `
-PROJECT: Bloch-SIS — a post-quantum, privacy-first blockchain (node + SIS-gated hashcash PoW + hybrid Falcon‖ML-DSA signatures + attestation L1-L3 + the Coherence shielded-tx privacy layer + SP1/FRI prover + clients). REPO: ${REPO} (branch euvm/integrate).
+PROJECT: Bloch. Repository root: ${REPO}, resolved from the workflow host's working directory. Read AGENTS.md and inspect the actual checkout, branch, Cargo workspace and current roadmap before planning. Do not infer fleet state, activation status or implementation gaps from this template.
 
-THE ROADMAP (ROADMAP.md + docs/ROADMAP-GATED-ITEMS.md). North star: maximize SECURITY and PRIVACY; add DEPTH not surface.
-Security track: S1 canonical PoW security claim (freeze k=8/β=q/16 gate params + no-shortcut proof + calibrate difficulty — RESEARCH-GATED); S2 independent audit + fuzzing (EXTERNAL-GATED, but continuous differential fuzzing harnesses are buildable); S3 live multi-node network (deploy ≥3 seeds is gated, but the in-process two-NetworkNode convergence + adversarial harness is BUILDABLE); S4 attestation on real SEV-SNP/TDX hardware (HARDWARE-GATED); S5 supply-chain + key hygiene (cargo-audit CI + SLSA + reorg observability metrics bloch_reorg_* are BUILDABLE; PAT/HSM rotation is operator-gated); S6 on-chain k-of-n multisig custody GIP-008 (descriptor-hash output type + consensus verification is BUILDABLE; activation is live-net-gated); S7 FFG-BFT finality overlay (scaffold exists at bft/postern-bft-finality; gated on S1+S2).
-Privacy track (Coherence): P1 turn shielded tx ON — wire the node-side FRI verifier replacing the reject-all verify=false stub, into the block-verify/reorg path (the verifier + integration is BUILDABLE; SP1-prover GPU deploy is the external gate); P2 external audit (GATED); P3 network metadata privacy — Dandelion++ routing core done (src/dandelion.rs), the unicast stem transport is BUILDABLE (live-net test gated); P4 wallet privacy — diversified addresses done (crypto::diversified_*, WalletCore::address_at/sign_at), REMAINING & BUILDABLE: surface rotation in client UIs, encrypted-at-rest keystores, and VIEW KEYS / selective disclosure (MatRiCT-Au-style opt-in, user-side, never a protocol backdoor); P5 lattice upgrade (AUDIT-GATED).
-Enablers: OS images (Nix-host-gated), mobile wallet UI, Blochscan explorer hosting, whitepaper (threat model written docs/THREAT-MODEL.md; consolidated whitepaper pending).
-RULE OF ENGAGEMENT: engineering builds EVERYTHING up to each item's gate and STATES the gate; nothing gated is reported "done". No consensus break without a GIP + node-operator signaling. No inflation/premine beyond genesis 17%. No misleading claims.
+SOURCE OF TRUTH: the checked-out code and tests, ROADMAP.md where present, current integration/release documents, and docs/audit/internal-remediation-2026-09-17/FINDINGS.md where present. Older audit records are evidence tied to their original source revisions, not automatically current defects. Distinguish live Genesis-4 PoS crates from retired Genesis-3 code and experimental subsystems. Locate files before citing them.
 
-DELIVERY MODE: produce REVIEWABLE artifacts as TEXT (unified diffs, full new files, plans). DO NOT modify files in ${REPO} — return diffs/contents; the human operator applies them in an isolated worktree, builds, and tests. Consensus/crypto code is high-risk: prefer additive, well-tested, gate-aware changes.
+CONSTRAINTS: keep code, comments, reports and user-facing software text in English. Verify current consensus gates; never infer that a planned gate is active or silently change a historical validity rule. Treat the Coherence spend-authorization and funded-vault design questions as separate from proof verification or infrastructure deployment; wiring a verifier alone does not make a funded product safe. Do not assume an audit, hardware qualification or production deployment has occurred.
+
+DELIVERY MODE: return reviewable patches, new-file contents and exact validation instructions as text. This workflow does not edit the checkout, publish artifacts, deploy, restart validators, issue credentials or authorize external messages. Report missing runtime/test capabilities honestly. Coordinate file ownership with any other active workstreams before proposing overlapping changes. No model/provider or founder-specific path is required by this template.
 `
 
 const FINDINGS_SCHEMA = {
@@ -38,22 +37,14 @@ const FINDINGS_SCHEMA = {
 }
 
 const AUDIT_AREAS = [
-  { key: 'S1-pow-params', label: 'assist:S1-pow-hardness',
-    prompt: 'Audit S1 (canonical PoW security claim). Read crates/bloch-sis-pow (verify/solver/params), legacy/specs/POW-HARDNESS.md, deploy/pow-estimator. What k/β params exist, where is the relaxed testnet regime vs canonical, what is buildable now (param freeze plumbing, calibration harness, estimator runs) vs research-gated (the no-shortcut proof).' },
-  { key: 'S2-fuzz', label: 'assist:S2-fuzzing',
-    prompt: 'Audit S2 fuzzing surface. Identify the consensus engine, tx/block deserialization, PoW verify, and PEX entry points that need differential/continuous fuzzing. What fuzz harnesses (cargo-fuzz/libfuzzer/proptest) exist or are buildable now. The external audit itself is gated; the fuzz harnesses are buildable.' },
-  { key: 'S3-multinode', label: 'assist:S3-multinode',
-    prompt: 'Audit S3. Find the NetworkNode/network stack (src/network, gossipsub, sync). Is there an in-process two-node convergence harness (inherited Sprint EE)? What adversarial cases (equivocation, invalid blocks, eclipse) are testable in-process. Deploying real seeds is gated; the in-process harness is BUILDABLE.' },
-  { key: 'S5-supplychain', label: 'assist:S5-supplychain-metrics',
-    prompt: 'Audit S5. Is there cargo-audit in CI, SLSA/signed-release config, and reorg observability metrics (bloch_reorg_*, inherited Sprint FF)? Where would the metrics hook into the DAG/reorg path. cargo-audit CI + metrics are BUILDABLE; PAT/HSM rotation is operator-gated.' },
-  { key: 'S6-multisig', label: 'assist:S6-multisig-gip008',
-    prompt: 'Audit S6 / GIP-008. Read gips/ and docs/research/MOFN-CUSTODY-DECISION.md and the output/script model (core). GIP-008 is APPROVED for an on-chain k-of-n hybrid Falcon‖ML-DSA descriptor-hash output type. What consensus code (new output type + verification) is buildable now; activation is live-net-gated. Assess risk (consensus change).' },
-  { key: 'P1-fri', label: 'assist:P1-FRI-verifier',
-    prompt: 'Audit P1. Find the Coherence shielded-tx path + the reject-all verify=false stub for the node-side FRI verifier (grep verify=false / FRI / SP1 / coherence). What is needed to wire a real node-side FRI verifier into the block-verify/reorg path. The verifier+integration is BUILDABLE; the SP1-prover GPU deploy is the external gate.' },
-  { key: 'P3-dandelion', label: 'assist:P3-dandelion-stem',
-    prompt: 'Audit P3. Read src/dandelion.rs (routing core, DandelionRelay, RelayAction). The routing core is done+unit-tested. What is needed for the unicast stem transport (gossipsub is broadcast-only) and wiring the relay into the tx path (Fluff=gossipsub publish works today). Live-net test is the gate; the transport code is BUILDABLE.' },
-  { key: 'P4-wallet-privacy', label: 'assist:P4-viewkeys-wallet',
-    prompt: 'Audit P4. Diversified addresses are done (crypto::diversified_{seed,keypair,address}, WalletCore::address_at/sign_at). REMAINING & BUILDABLE: surfacing rotation in the client UIs, encrypted-at-rest keystores, and VIEW KEYS / selective disclosure (MatRiCT-Au-style, user opt-in). Find the wallet core + client UI code; specify the buildable view-key / selective-disclosure design (never a protocol backdoor).' },
+  {key: 'node-consensus', label: 'audit:node-consensus', prompt: 'Audit the live node and committee transition, fork choice, transaction status and current consensus gates. Separate source correctness from activation and independent-validator rollout. Find a reproducible defect before proposing behavior changes.'},
+  {key: 'recovery', label: 'audit:recovery', prompt: 'Audit restart caches, log/index crash consistency, checkpoint validation, slashing protection and keystore handling. Preserve signing history and cache-format compatibility; quantify test scope rather than inventing restart SLAs.'},
+  {key: 'network-admission', label: 'audit:network-admission', prompt: 'Audit actual transports, bounded queues, source admission, sync requests and RPC. Review existing tests before proposing another harness. Distinguish local admission policy from block validity.'},
+  {key: 'supply-chain', label: 'audit:supply-chain', prompt: 'Audit both checked-in CI definitions, scanner enforcement, release/rollback tooling, pinned inputs and metrics. Hosted CI, canonical Linux builds, signatures and fleet parity require separate evidence.'},
+  {key: 'crypto-wallet', label: 'audit:crypto-wallet', prompt: 'Audit current and optional/legacy wallet consumers, input amounts, signature encodings, secret lifetime and external verification vectors. Preserve funded derivations and distinguish primitive tests from standards certification.'},
+  {key: 'shielded-vault', label: 'audit:shielded-vault', prompt: 'Audit the shared Coherence statement, SP1 service and vault construction/evaluator. Read current authorization blockers before proposing proof wiring. Keep funded activation blocked until its actual design and validation requirements are met.'},
+  {key: 'legacy-carryover', label: 'audit:legacy-carryover', prompt: 'Audit retired Genesis-3 exporters and compatibility tools that affect the carried ledger. Do not present legacy network/mining paths as the active PoS node or silently rewrite committed carryover data.'},
+  {key: 'integration-roadmap', label: 'audit:integration-roadmap', prompt: 'Read the actual roadmap and integration notes, including EVM, DEX, bridge and aggregator ownership where available. Identify cross-component contracts and remaining evidence without assuming another agent has or has not completed a task.'},
 ]
 
 phase('Audit')
@@ -76,10 +67,10 @@ const PLAN_SCHEMA = {
   },
 }
 const TRACKS = [
-  { key: 'PMO-Security', prompt: 'You own the SECURITY track (S1,S2,S3,S5). Synthesize the audit into an ordered, gate-aware plan; pick the top BUILDABLE security deliverable (likely the S3 in-process multi-node convergence+adversarial harness).' },
-  { key: 'PMO-Privacy', prompt: 'You own the PRIVACY track (P1,P3,P4). Synthesize into an ordered plan; pick the top BUILDABLE privacy deliverable (P1 node-side FRI verifier wiring is the biggest privacy win, or P4 view keys).' },
-  { key: 'PMO-Enablers', prompt: 'You own ENABLERS + supply-chain (S5 cargo-audit CI + reorg metrics, whitepaper, Blochscan, mobile UI, OS images). Pick the top BUILDABLE deliverable (S5 cargo-audit CI + bloch_reorg_* metrics).' },
-  { key: 'PMO-Consensus', prompt: 'You own CONSENSUS-GATED items (S6 GIP-008 multisig, S7 FFG-BFT). Assess what consensus code is buildable-but-not-activatable (descriptor-hash output type; FFG scaffold buildout) and the GIP/activation gates. Flag risk honestly.' },
+  { key: 'Plan-Node', prompt: 'Plan verified node/network corrections from this audit, ordered by impact and evidence. Assign concrete file ownership and distinguish admission policy from consensus validity. Do not prescribe a feature already implemented.' },
+  { key: 'Plan-Recovery', prompt: 'Plan verified restart, checkpoint, durable-signing and key-handling corrections. State compatibility and rollback constraints. Keep deployment and measured recovery SLA separate from source work.' },
+  { key: 'Plan-Wallet', prompt: 'Plan verified crypto/wallet/vault corrections, preserving funded derivations and existing formats. Separate primitive correctness, product authorization, external audits and activation requirements.' },
+  { key: 'Plan-Infrastructure', prompt: 'Plan verified CI, release, observability and explorer corrections. Identify coordination with other integration workstreams and required hosted/Linux/GPU evidence. Do not treat a local patch as deployment.' },
 ]
 const plans = (await parallel(TRACKS.map(t => () =>
   agent(`${CTX}\n\nAUDIT FINDINGS (JSON):\n${JSON.stringify(audit)}\n\nYOU ARE ${t.key}. ${t.prompt}\nReturn a gate-aware ordered plan for your track and your single top buildable workstream.`,
@@ -102,14 +93,14 @@ const PATCH_SCHEMA = {
   },
 }
 const DEVS = [
-  { key: 'dev1-P1-FRI', prompt: 'YOU ARE DEV-1 (Fable-5). Implement P1: wire a node-side FRI verifier that REPLACES the reject-all verify=false stub in the Coherence shielded-tx path, integrated into the block-verify/reorg wiring, feature-gated/config-gated so it is safe to land before the SP1-prover GPU deploy (the external gate). Additive, well-tested. Read the real Coherence/verify code first. Return the patch + tests; STATE the SP1-deploy gate. Do not modify repo files.' },
-  { key: 'dev2-S3-harness', prompt: 'YOU ARE DEV-2 (Fable-5). Implement S3: an in-process two-NetworkNode convergence + adversarial (equivocation / invalid-block / eclipse) test harness proving consensus/reorg/gossip without real seeds. Read src/network. Return the harness + test cases as a patch; STATE the live-seed-deploy gate. Do not modify repo files.' },
-  { key: 'dev3-P4-viewkeys', prompt: 'YOU ARE DEV-3 (Fable-5). Implement P4: VIEW KEYS / selective disclosure (MatRiCT-Au-style, user opt-in, NEVER a protocol backdoor) on top of the existing diversified-address wallet core, plus encrypted-at-rest keystore hardening. Read the wallet core + crypto::diversified_*. Return the patch + tests; STATE any audit gate for the disclosure-proof claim. Do not modify repo files.' },
-  { key: 'dev4-S5-ci-metrics', prompt: 'YOU ARE DEV-4 (Fable-5). Implement S5 buildable pieces: (1) cargo-audit + a supply-chain check in CI (GitLab CI is used — .gitlab-ci.yml), (2) reorg observability metrics bloch_reorg_* hooked into the DAG/reorg path (inherited Sprint FF). Read the CI config + the reorg/DAG code. Return the patch(es)/new files + how to verify; STATE the SLSA/HSM operator gates. Do not modify repo files.' },
+  {key: 'dev-node', prompt: 'Take the highest-priority verified node/network finding from the plans. Return the smallest compatible patch and meaningful regression. Preserve consensus gates and state encoding. Coordinate recovery ownership and state what remains unresolved.'},
+  {key: 'dev-recovery', prompt: 'Take the highest-priority verified recovery/key-handling finding from the plans. Return a patch with crash/fallback or secret-handling regressions as appropriate. Preserve durable signing history and state/cache compatibility; do not promise production recovery time without measurements.'},
+  {key: 'dev-wallet', prompt: 'Take the highest-priority verified crypto/wallet/vault finding from the plans. Return a compatible implementation and adversarial tests. Do not turn infrastructure improvements into a funded-authorization claim or silently replace funded derivations.'},
+  {key: 'dev-infrastructure', prompt: 'Take the highest-priority verified CI/release/observability/explorer finding from the plans. Return a reviewable patch with relevant validation. Distinguish local checks from hosted CI, Linux/GPU qualification and fleet deployment.'},
 ]
 const patches = (await parallel(DEVS.map(d => () =>
   agent(`${CTX}\n\nRELEVANT PLANS (JSON):\n${JSON.stringify(plans)}\n\n${d.prompt}`,
-    { label: d.key, phase: 'Implement', schema: PATCH_SCHEMA, model: 'fable', effort: 'high' })
+    { label: d.key, phase: 'Implement', schema: PATCH_SCHEMA, effort: 'high' })
 ))).filter(Boolean)
 log(`Dev patches ready: ${patches.length}/${DEVS.length}`)
 

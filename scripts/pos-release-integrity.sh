@@ -111,9 +111,8 @@ fi
 LOCK_META="$(mktemp "${TMPDIR:-/tmp}/pos-lock-meta.XXXXXX")"
 trap 'rm -f "$LOCK_META"' EXIT
 ( cd "$NODE_DIR" && cargo metadata --format-version 1 --locked ) > "$LOCK_META" \
-  || fail "the root Cargo.lock is stale — it does not resolve with --locked. \
-Commit the lockfile change deliberately (cargo update -p <crate>), never as a \
-build side effect."
+  || fail "locked metadata resolution failed; inspect Cargo's error above for network, toolchain or lockfile causes. \
+Do not rewrite Cargo.lock to bypass a download or environment failure."
 
 LOCK_META_PATH="$LOCK_META" REPO_ROOT="$REPO_ROOT" python3 - <<'PY' \
   || fail "workspace/lockfile layout is not what this guard assumes (above)."

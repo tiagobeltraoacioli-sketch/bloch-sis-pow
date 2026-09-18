@@ -150,3 +150,73 @@ JSON-RPC failures retain a numeric code but omit arbitrary peer message/data fie
 Successful result schemas and transaction formats remain unchanged. Loopback HTTP
 regressions exercise chunked over-limit/exact-limit reads, advertised oversize, and
 both HTTP and JSON-RPC error redaction.
+
+## RPC correlation and G4 status compatibility
+
+Each HTTP client now assigns monotonically increasing numeric request IDs with
+checked atomic allocation. Exhaustion fails before sending a request; IDs never
+wrap or repeat within that client. Responses must identify JSON-RPC 2.0 and echo
+the exact integer ID. Missing results, malformed errors and envelopes containing
+both a result and a non-null error are refused. A null result remains valid, and
+`error: null` remains accepted beside a successful result for compatibility.
+These checks correlate responses; they do not authenticate a dishonest RPC node.
+
+`TxStatus` retains G3 `Confirmed` and depth-based `Final` variants and adds
+separate G4 `Included`, `Justified` and `Finalized` variants. No confirmation depth
+is invented for G4. `Finalized` represents the queried node's statement, not an
+independently verified checkpoint. The public enum addition requires downstream
+exhaustive matches to handle the new variants; repository callers were checked.
+Malformed/missing status fields now return an error; unknown future strings remain
+`Unknown`. Existing valid G3 status responses remain supported.
+
+This status support does not make the legacy wallet transaction client a complete
+G4 wallet adapter. G4 balance/UTXO requests use 32-byte script hashes and expose
+`balance_sat`, `vout`, `value_sat` and `script_hash`; the existing wallet methods
+use address-based G3 schemas and transaction types. A separate reviewed adapter
+is required rather than silently aliasing fields or truncating amounts/hashes.
+
+## HTTP endpoint and initialization boundaries
+
+`WalletClient` refuses redirects, including 307/308 responses that could otherwise
+replay a signed transaction or query body to a different endpoint. Configure the
+final RPC URL directly. Transport errors remove attached URLs before display so
+query credentials and endpoint paths are not reflected. A loopback regression
+checks that a redirect target is never contacted and connection errors omit a
+synthetic query token. Existing HTTP/HTTPS endpoint acceptance is unchanged.
+
+New `try_new` allows callers to handle HTTP transport initialization failure.
+The existing `new` signature remains compatible and retains its documented panic
+contract; this is not complete elimination of constructor panics. The two
+standalone CLI callers now share the bounded synchronous transport described
+below. They remain HTTP-only compatibility tools, separate from the asynchronous
+`WalletClient` implementation and its HTTPS support.
+
+## Shared bounded CLI HTTP transport
+
+Both standalone wallet and retained Genesis-3 CLI now use `wallet::http_rpc` for
+synchronous HTTP RPC. Response framing is parsed as bytes before JSON/UTF-8:
+valid UTF-8 split across HTTP chunks is reconstructed, while malformed lengths,
+size overflow, truncation, ambiguous Content-Length/Transfer-Encoding and trailing
+bytes are rejected. Chunk extensions and trailers are not supported and are
+explicitly refused. Normal G3 length-delimited, chunked or connection-close JSON
+responses remain accepted. Requests explicitly ask the peer to close the connection.
+
+The transport bounds decoded bodies to 64 MiB and received wire bytes to that
+budget plus 64 KiB; HTTP headers have a separate 64 KiB ceiling. Memory for parsed
+JSON and temporary decoding buffers is additional. One monotonic 30-second
+budget covers name resolution, connect, each write and each read, so a slow drip
+cannot reset an idle timeout. The OS DNS worker can outlive a caller timeout;
+this does not claim resolver cancellation or a hard scheduler wall-clock bound.
+
+HTTP and JSON errors do not echo arbitrary peer bodies; RPC error codes remain
+available. Legacy API-key authentication remains supported and control characters
+are refused before connecting. The standalone caller still supports HTTP, not TLS;
+non-root paths now fail instead of being silently discarded. JSON-RPC 2.0 and the
+matching request ID are required. CLI response-schema/transaction semantics remain
+G3; this is not a complete G4 wallet migration.
+
+The retained G3 server's actual `rpc_handler` wraps successful dispatch results in
+`jsonrpc: "2.0"`, echoed `id`, and `result`; authentication/rate-limit failures use
+structured JSON-RPC errors and non-success HTTP status. Bare JSON and string-valued
+outer errors formerly tolerated by the legacy CLI are now deliberately refused.
+This redacts transport/envelope errors, not successful application result fields.

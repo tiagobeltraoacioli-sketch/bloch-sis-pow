@@ -325,13 +325,11 @@ impl Index {
 
     /// Apply one block to the index, recording how to undo it.
     ///
-    /// This is deliberately NOT a consensus transition: the blocks come from
-    /// an archival observer that already validated them, and re-running
-    /// `Transition` here would mean a second, slower opinion about a chain the
-    /// index does not get to vote on. What it is instead is the eUTXO
-    /// bookkeeping — spend the inputs, create the outputs — whose result is
-    /// checked against the node's own `state_root` by the `verify` subcommand
-    /// and against live `getbalance` by `compare`.
+    /// With `replay` initialized (the serving CLI's path), re-execute the state
+    /// transition and check the resulting state root before updating tables.
+    /// `ArchiveVerifier` skips cryptographic signature verification; this is
+    /// state-consistency checking of a trusted archive, not independent node
+    /// validation. Fixture callers without replay use bookkeeping alone.
     pub fn apply(&mut self, env: &BlockEnvelope, frame_len: u32) {
         self.try_apply(env, frame_len).expect("valid index block");
     }

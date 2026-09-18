@@ -1517,7 +1517,7 @@ fn handle_swarm_event(
             }
         }
         SwarmEvent::IncomingConnectionError { error, send_back_addr, .. } => {
-            eprintln!("p2p: inbound connection from {send_back_addr} failed: {error}");
+            crate::net::rejection_log::emit(crate::net::rejection_log::Class::Connection, || eprintln!("p2p: inbound connection from {send_back_addr} failed: {error}"));
         }
         SwarmEvent::Behaviour(G4BehaviourEvent::Identify(identify::Event::Received {
             peer_id,
@@ -1565,7 +1565,7 @@ fn handle_swarm_event(
                             }
                         }
                         Err(e) => {
-                            eprintln!("p2p: undecodable block in sync response from {peer}: {e}");
+                            crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!("p2p: undecodable block in sync response from {peer}: {e}"));
                         }
                     }
                 }
@@ -1591,7 +1591,7 @@ fn handle_swarm_event(
             // A peer that does not speak /bloch-g4/sync/1 is not a Genesis-4
             // node. Nothing to fall back to — deliberately: Genesis-3
             // compatibility is not a goal, it is the thing the prefix prevents.
-            eprintln!("p2p: sync request to {peer} failed: {error}");
+            crate::net::rejection_log::emit(crate::net::rejection_log::Class::Sync, || eprintln!("p2p: sync request to {peer} failed: {error}"));
         }
         _ => {}
     }
@@ -1650,7 +1650,7 @@ fn on_gossip(
             Err(e) => {
                 // Undecodable bytes on the block topic cannot come from a
                 // compliant node: that is a Reject, and P4 counts it.
-                eprintln!("p2p: undecodable block from {source}: {e}");
+                crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!("p2p: undecodable block from {source}: {e}"));
                 report(swarm, Verdict::Reject);
             }
         }
@@ -1667,7 +1667,7 @@ fn on_gossip(
                 };
             }
             Err(e) => {
-                eprintln!("p2p: undecodable attestation from {source}: {e}");
+                crate::net::rejection_log::emit(crate::net::rejection_log::Class::Attestation, || eprintln!("p2p: undecodable attestation from {source}: {e}"));
                 report(swarm, Verdict::Reject);
             }
         }
@@ -1683,7 +1683,7 @@ fn on_gossip(
                 };
             }
             Err(e) => {
-                eprintln!("p2p: undecodable transaction from {source}: {e}");
+                crate::net::rejection_log::emit(crate::net::rejection_log::Class::Transaction, || eprintln!("p2p: undecodable transaction from {source}: {e}"));
                 report(swarm, Verdict::Reject);
             }
         }
@@ -1740,7 +1740,7 @@ fn serve_sync(
 /// per refusal it provoked, and the in-flight cap it had just tripped would
 /// stop binding. Pinned by `refused_requests_do_not_free_in_flight_slots`.
 fn refusal_answer(peer: PeerId, why: SyncRefusal) -> (Option<SyncPermit>, SyncResponse) {
-    eprintln!("p2p: refusing get-blocks from {peer}: {why:?}");
+    crate::net::rejection_log::emit(crate::net::rejection_log::Class::Sync, || eprintln!("p2p: refusing get-blocks from {peer}: {why:?}"));
     (None, SyncResponse::Blocks { envelopes: Vec::new() })
 }
 
@@ -2110,8 +2110,9 @@ mod tests {
             bloch_pos_committee::transition::PosTransaction::Exit { validator: 0 },
             Origin::none(),
         );
-        for _ in 0..256 { assert_eq!(st.emit(event(), flooder), Some(true)); }
-        assert_eq!(st.emit(event(), flooder), None);
+        let mut admitted = 0;
+        while st.emit(event(), flooder) == Some(true) { admitted += 1; }
+        assert_eq!(admitted, 128, "transaction count quota must retain half the per-peer slots");
         assert_eq!(st.emit(event(), honest), Some(true));
         drop(rx.recv().unwrap());
         assert_eq!(st.emit(event(), flooder), Some(true));

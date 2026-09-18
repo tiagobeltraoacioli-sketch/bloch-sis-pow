@@ -6,14 +6,7 @@
 //!   bloch-cli send &lt;wallet.json&gt; &lt;to_address&gt; &lt;amount_bloch&gt; [--fee 0.001]
 //!   bloch-cli --help
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::process;
-
-// L-4: UTF-8-safe truncation of a node-response-derived string (see
-// `rpc_call` below) — reuses the same fix `network/mod.rs` already applies
-// on its own log paths, rather than repeating the byte-slice bug here.
-use bloch::network::truncate_utf8;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -279,125 +272,10 @@ fn main() {
 
 // ── RPC client ──────────────────────────────────────────────────────────────
 
-fn rpc_call(
-    host: &str,
-    port: u16,
-    method: &str,
-    params: &serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": method,
-        "params": params,
-    });
-    let body_str = body.to_string();
-
-    let addr = format!("{}:{}", host, port);
-    let mut stream = TcpStream::connect(&addr)
-        .map_err(|e| format!("cannot connect to {} — is the node running? ({})", addr, e))?;
-
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))
-        .map_err(|e| e.to_string())?;
-
-    // Optional API key for auth-required writes (sendrawtransaction): set
-    // BLOCH_RPC_API_KEY. Sent as the x-api-key header the node expects.
-    //
-    // M-11 (audit): this request is built by hand (`format!`, not an HTTP
-    // client library), so nothing else stands between the environment
-    // variable's content and the raw request bytes. Before this fix, a
-    // `BLOCH_RPC_API_KEY` containing `\r\n` injected an arbitrary extra
-    // header — or, with a second `\r\n`, a whole pipelined second request —
-    // into the connection. INVARIANT (M-11): a value that cannot possibly be
-    // a well-formed single header value (contains a CR, LF, or any other
-    // ASCII control character) must abort the request with a clear error,
-    // never be interpolated as-is. The environment is operator-controlled
-    // here (this is a CLI, not a network-facing surface), so this is a
-    // robustness fix, not a privilege-boundary one — but it costs nothing
-    // and a hand-rolled HTTP client should never trust its own inputs less
-    // carefully than the node it is talking to trusts the network.
-    let api_key_hdr = match std::env::var("BLOCH_RPC_API_KEY") {
-        Ok(k) if k.chars().any(|c| c.is_ascii_control()) => {
-            return Err(
-                "BLOCH_RPC_API_KEY contains a control character (e.g. CR/LF) — \
-                 refusing to build a request with it (would allow HTTP header \
-                 injection)".to_string(),
-            );
-        }
-        Ok(k) => format!("x-api-key: {}\r\n", k),
-        Err(_) => String::new(),
-    };
-    let request = format!(
-        "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-        addr, api_key_hdr, body_str.len(), body_str
-    );
-
-    stream.write_all(request.as_bytes()).map_err(|e| format!("write failed: {}", e))?;
-    stream.flush().map_err(|e| e.to_string())?;
-
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).map_err(|e| format!("read failed: {}", e))?;
-
-    let response_str = String::from_utf8_lossy(&response);
-
-    // Find JSON body (after \r\n\r\n)
-    let json_start = response_str.find("\r\n\r\n")
-        .map(|i| i + 4)
-        .unwrap_or(0);
-    let json_body = &response_str[json_start..];
-
-    // Handle chunked transfer encoding
-    let json_clean = if response_str.contains("Transfer-Encoding: chunked") {
-        parse_chunked(json_body)
-    } else {
-        json_body.trim().to_string()
-    };
-
-    // L-4: was `&json_clean[..200.min(json_clean.len())]` — a byte-index
-    // slice on a node-response-derived string. `String::from_utf8_lossy`
-    // upstream can still place a multi-byte UTF-8 character across byte 200,
-    // and 200 need not be (and, per `is_char_boundary`, was not guaranteed to
-    // be) a char boundary — that slice panics the CLI on such a response.
-    let resp: serde_json::Value = serde_json::from_str(&json_clean)
-        .map_err(|e| format!("invalid JSON response: {} — raw: {}", e, truncate_utf8(&json_clean, 200)))?;
-
-    if let Some(err) = resp.get("error").and_then(|e| e.as_str()) {
-        return Err(err.to_string());
-    }
-
-    Ok(resp.get("result").cloned().unwrap_or(resp))
-}
-
-/// Parse HTTP chunked transfer encoding
-fn parse_chunked(body: &str) -> String {
-    let mut result = String::new();
-    let mut remaining = body.trim();
-
-    loop {
-        // Read chunk size (hex)
-        let nl = match remaining.find("\r\n") {
-            Some(i) => i,
-            None => break,
-        };
-        let size_str = remaining[..nl].trim();
-        let size = match usize::from_str_radix(size_str, 16) {
-            Ok(0) => break, // terminal chunk
-            Ok(s) => s,
-            Err(_) => {
-                // Not chunked, return as-is
-                return body.trim().to_string();
-            }
-        };
-        remaining = &remaining[nl + 2..];
-        if remaining.len() < size { break; }
-        result.push_str(&remaining[..size]);
-        remaining = &remaining[size..];
-        if remaining.starts_with("\r\n") {
-            remaining = &remaining[2..];
-        }
-    }
-
-    if result.is_empty() { body.trim().to_string() } else { result }
+fn rpc_call(host: &str, port: u16, method: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let authority = if host.contains(':') && !host.starts_with('[') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
+    let api_key = std::env::var("BLOCH_RPC_API_KEY").ok();
+    bloch::wallet::http_rpc::call(&authority, method, params, api_key.as_deref())
 }
 
 // ── Send command ────────────────────────────────────────────────────────────

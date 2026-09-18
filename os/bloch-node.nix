@@ -1,4 +1,6 @@
-# NixOS module: run the Bloch-SIS node as a hardened systemd service.
+# NixOS module for the RETIRED Genesis-3 node (bloch).
+# For Genesis-4 use bloch-pos-node.nix and an explicitly supplied PoS package.
+# The legacy package derivation still needs independent Nix build qualification.
 # Enable on any NixOS host with `services.bloch.enable = true;`.
 { config, lib, pkgs, ... }:
 
@@ -7,7 +9,7 @@ let
 in
 {
   options.services.bloch = {
-    enable = lib.mkEnableOption "the Bloch-SIS node";
+    enable = lib.mkEnableOption "the retired Genesis-3 node";
 
     package = lib.mkOption {
       type = lib.types.package;
@@ -29,8 +31,8 @@ in
 
     rpcPort = lib.mkOption {
       type = lib.types.port;
-      default = 8645;
-      description = "JSON-RPC port.";
+      default = 16210; # legacy/genesis3-node/src/main.rs --rpc-port default
+      description = "Genesis-3 JSON-RPC port. Existing installations using 8645 must set rpcPort = 8645 explicitly before adopting this default.";
     };
 
     # MED-6: fixed, safe default bind. Previously no --rpc-bind was passed at

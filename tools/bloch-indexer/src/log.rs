@@ -37,7 +37,7 @@
 //!    `sync_data`; a crash mid-append leaves a frame whose declared length runs
 //!    past EOF. The node drops it (`store.rs:110`) and so does this.
 //! 2. **A reorg replaces the file, inode and all.** `Store::rewrite` writes a
-//!    fresh `blocks.log.tmp` holding the whole new chain and renames it over
+//!    fresh private staging file holding the whole new chain and renames it over
 //!    `blocks.log`, so the file can *shrink* and every offset a previous scan
 //!    held is meaningless. [`LogReader::open`] therefore records the file's
 //!    identity ([`LogFingerprint`]) and [`LogReader::changed`] reports when a
@@ -114,7 +114,7 @@ impl LogFingerprint {
 pub enum ScanEnd {
     /// The whole file parsed into whole frames.
     Clean,
-    /// The last frame's declared length runs past EOF — a crash mid-append.
+    /// The last length prefix or declared payload runs past EOF — a crash mid-append.
     /// Normal; the node drops the same frame.
     TornTrailingFrame,
     /// A length field below the 304-byte header, so no header can be read.
@@ -247,11 +247,11 @@ fn scan_frames(file: &mut File, file_len: u64) -> io::Result<(Vec<FrameRef>, Sca
     let mut hdr_buf = [0u8; HDR];
     loop {
         if at + 4 > file_len {
-            return Ok((out, ScanEnd::Clean));
+            return Ok((out, if at == file_len { ScanEnd::Clean } else { ScanEnd::TornTrailingFrame }));
         }
         if let Err(e) = file.read_exact(&mut len_buf) {
             if e.kind() == io::ErrorKind::UnexpectedEof {
-                return Ok((out, ScanEnd::Clean));
+                return Ok((out, ScanEnd::TornTrailingFrame));
             }
             return Err(e);
         }

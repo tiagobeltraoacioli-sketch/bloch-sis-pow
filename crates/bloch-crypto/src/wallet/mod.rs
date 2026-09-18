@@ -43,6 +43,7 @@ pub mod encryption;
 #[cfg(feature = "node")]
 pub mod client;
 pub mod errors;
+pub mod http_rpc;
 pub mod disclosure;
 
 pub use seed::{SeedPhrase, SeedVersion};

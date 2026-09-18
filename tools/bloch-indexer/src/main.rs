@@ -202,17 +202,28 @@ fn serve(a: &Args) -> Result<(), String> {
             Ok(r) => r,
             Err(e) => { writer.write().unwrap().sync_error = Some(e.to_string()); return; }
         };
+        // This reader was opened after build(); reconcile once even if its
+        // fingerprint stays unchanged. Later unchanged polls need no full-chain
+        // header walk under the API's write lock.
+        let mut needs_sync = true;
         loop {
             std::thread::sleep(poll);
             let result = (|| -> std::io::Result<()> {
-                if reader.changed()? { reader.reopen()?; }
+                if reader.changed()? {
+                    needs_sync = true;
+                    reader.reopen()?;
+                }
                 let mut ix = writer.write().unwrap();
-                ix.sync(&mut reader)?;
+                if needs_sync {
+                    ix.sync(&mut reader)?;
+                    needs_sync = false;
+                }
                 ix.checked_at = Instant::now();
                 ix.sync_error = None;
                 Ok(())
             })();
             if let Err(e) = result {
+                needs_sync = true;
                 writer.write().unwrap().sync_error = Some(e.to_string());
                 eprintln!("sync failed; API unavailable while rebuilding: {e}");
                 match build(&args) {

@@ -14,12 +14,14 @@ handling. Failed channel sends and shed events release the reservation.
 Policy:
 
 - Each devnet remote IP or authenticated libp2p PeerId can hold 256 events and
-  16 MiB of charged encoded bytes. Transactions may consume only half the byte
-  allowance and attestations three quarters; blocks can use the full allowance.
-  Count slots are shared across classes: 256 tiny lower-priority messages can
-  still exclude a block from that same source (including its shared NAT).
+  16 MiB of charged encoded bytes. Transactions may consume only half the
+  byte/count allowance and attestations three quarters; blocks can use the full
+  allowance. Thus transactions stop at 128 outstanding events, attestations at
+  192, and blocks at 256. The thresholds apply to total source occupancy, not
+  separate additive per-class pools.
 - The source registry also enforces the shared queue's aggregate 4,096 events
-  and 64 MiB (with the same class byte headroom), bounding the libp2p first hop.
+  and 64 MiB (with the same class byte/count headroom), bounding the libp2p first
+  hop. The engine-facing atomic queue repeats the class count thresholds.
 - At most 1,024 source entries are live. An entry is removed when its outstanding
   event count reaches zero. Reconnects cannot reset outstanding reservations.
 - IPv4-mapped IPv6 addresses normalize to IPv4. A libp2p overload verdict is
@@ -62,10 +64,34 @@ path, not all possible scheduling or verification unfairness.
 Under quota saturation a libp2p sync page can be only partially enqueued. Its
 transport chase hints can still advance; periodic sync from the applied engine
 head remains the recovery path. This change does not promise complete page
-admission or strict priority at the event-count limit.
+admission or strict scheduling priority. Headroom does not evict already queued
+blocks, and 1,024 live source identities can still exclude a new identity even
+when event headroom remains. Sybil-resistant identity admission is separate.
 
 Qualification: `source_` selection passed 8 tests (including 5 new source-budget
 and channel-lifetime tests); `net::` passed 27 tests; `p2p::` passed 23 tests. Logs:
 `/private/tmp/bloch-audit-wave6-source-budget.log` and
 `/private/tmp/bloch-audit-wave6-net.log`, and
 `/private/tmp/bloch-audit-wave6-p2p.log`.
+
+
+## Wave 8: count headroom
+
+The 2026-09-17 follow-up applies existing byte shares to event counts at all
+three checks: per-source backlog, aggregate first-hop backlog, and engine queue.
+A nonzero tiny test budget retains one usable slot per class; a zero budget admits
+nothing. Production capacities are divisible by four, so no rounding is involved.
+No validator registry membership, consensus validity, wire format or activation
+changes. Lower-priority bursts are shed earlier; validators sharing a devnet NAT
+still share those allowances and there is no guarantee of vote delivery.
+
+Regression coverage fills each class threshold with one-byte messages, proves
+remaining block capacity behind the same NAT and across sources, checks cloned
+reservation cleanup and fresh admission after release, and races eight threads
+against the attestation threshold before filling the reserved block allowance.
+Existing failed-channel and processing-lifetime tests remain enabled.
+
+Qualification: `cargo test -p bloch-pos-node --bin bloch-pos net:: --
+--test-threads=4` passed **30 tests**, zero failures or ignored tests. Log:
+`/private/tmp/bloch-wave8-count-headroom.log`. Broader integration and hardened
+qualification are recorded by the release owner separately.

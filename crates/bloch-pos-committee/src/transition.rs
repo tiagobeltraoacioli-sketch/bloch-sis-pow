@@ -13288,6 +13288,12 @@ mod tests {
         };
         state.head = header.id();
         let bytes = state.encode_local_cache().unwrap();
+        assert_eq!(bytes, state.encode_local_cache_owned_reference().unwrap(), "borrowed encoding must preserve the former cache bytes");
+        let prefix = b"existing cache header";
+        let mut prefixed = prefix.to_vec();
+        state.append_local_cache(&mut prefixed).unwrap();
+        assert_eq!(&prefixed[..prefix.len()], prefix);
+        assert_eq!(&prefixed[prefix.len()..], bytes.as_slice());
         let restored = CommittedState::decode_local_cache(&bytes, &header).unwrap();
         assert_eq!(state, restored);
         let mut wrong = header.clone(); wrong.state_root[0] ^= 1;
@@ -13295,6 +13301,35 @@ mod tests {
         let mut trailing = bytes.clone(); trailing.push(0);
         assert!(CommittedState::decode_local_cache(&trailing, &header).is_err());
         assert!(CommittedState::decode_local_cache(&bytes[..bytes.len()/2], &header).is_err());
+    }
+
+    /// Run the compiled test binary directly under the platform RSS tool in
+    /// separate processes for each mode; compiler memory must not be included.
+    #[test]
+    #[ignore = "bounded local cache serializer memory measurement"]
+    #[cfg(feature = "local-state-cache")]
+    fn local_cache_serializer_memory_measurement() {
+        let mode = std::env::var("BLOCH_CACHE_SERIALIZER").unwrap_or_else(|_| "borrowed".into());
+        assert!(matches!(mode.as_str(), "borrowed" | "owned"));
+        let count = std::env::var("BLOCH_CACHE_BENCH_UTXOS")
+            .map(|value| value.parse::<u32>().unwrap()).unwrap_or(100_000);
+        assert!((1..=200_000).contains(&count), "keep this local fixture bounded");
+        let (_, mut state, _) = state_with_live_bookkeeping();
+        state.eutxos = (0..count).map(|index| {
+            let txid: [u8; 32] = Sha3_256::digest(index.to_le_bytes()).into();
+            crate::state_root::EutxoEntry {
+                txid, vout: 0, value: 1_000_000, script_hash: txid,
+            }
+        }).collect();
+        let started = std::time::Instant::now();
+        let bytes = if mode == "owned" {
+            state.encode_local_cache_owned_reference().unwrap()
+        } else {
+            state.encode_local_cache().unwrap()
+        };
+        println!("CACHE_SERIALIZER mode={mode} utxos={count} bytes={} elapsed_ms={} sha3={:x}",
+            bytes.len(), started.elapsed().as_millis(), Sha3_256::digest(&bytes));
+        std::hint::black_box((&state, &bytes));
     }
 
     /// Every consensus-relevant `CommittedState` field moves the root; every

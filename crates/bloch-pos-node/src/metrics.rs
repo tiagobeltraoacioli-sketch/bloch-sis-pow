@@ -349,6 +349,12 @@ impl NodeMetrics {
             self.get(&self.blocks_rejected_total),
         );
         series(
+            "bloch_pos_rejection_logs_suppressed_total",
+            "counter",
+            "Rejection diagnostics suppressed by bounded logging; validation and peer verdicts still execute",
+            crate::net::rejection_log::suppressed_total(),
+        );
+        series(
             "bloch_pos_equivocations_observed_total",
             "counter",
             "Equivocations captured by the gossip pool (two attestations, one validator, one slot)",
@@ -771,6 +777,7 @@ mod tests {
             "bloch_pos_net_shed_blocks_total",
             "bloch_pos_net_shed_attestations_total",
             "bloch_pos_net_shed_transactions_total",
+            "bloch_pos_rejection_logs_suppressed_total",
         ] {
             assert!(text.contains(name), "missing series {name}");
             assert!(text.contains(&format!("# TYPE {name}")), "missing TYPE for {name}");

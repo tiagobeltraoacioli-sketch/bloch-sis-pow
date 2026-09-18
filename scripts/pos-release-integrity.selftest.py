@@ -165,7 +165,7 @@ def main() -> int:
               CRATE_MANIFEST.format(name="bloch-pos-extra"))
         write(os.path.join(crate, "src", "lib.rs"), "")
         write_root(root, ("bloch-pos-node", "bloch-pos-committee", "bloch-pos-extra"))
-        expect_fail("stale root Cargo.lock", root, "root Cargo.lock is stale")
+        expect_fail("locked metadata failure", root, "locked metadata resolution failed")
 
     # 3 — a deleted per-member lockfile comes back.
     with tempfile.TemporaryDirectory() as tmp:

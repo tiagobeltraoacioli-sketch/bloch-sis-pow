@@ -1,0 +1,48 @@
+Validation wave 8 — 2026-09-17
+Branch: fix/internal-audit-20260917
+Base: 3ae823b
+
+PASS
+
+cargo test -p bloch-pos-node --offline -- --test-threads=4
+  581 passed; 0 failed; 25 ignored across unit and integration binaries.
+  Required loopback socket access outside the restricted sandbox.
+
+cargo test -p bloch-pos-committee -p bloch-crypto --offline -- --test-threads=4
+  committee: 615 passed; 0 failed; 7 ignored.
+  crypto: 189 passed; 0 failed; 2 ignored.
+
+cargo test --manifest-path tools/bloch-indexer/Cargo.toml --offline
+  22 passed; 0 failed; 0 ignored.
+  Required loopback socket access outside the restricted sandbox.
+
+cargo test --manifest-path legacy/genesis3-node/Cargo.toml --bin bloch-cli --offline
+  2 passed; 0 failed; 0 ignored.
+
+python3 scripts/pos-release-integrity.selftest.py
+  14 cases passed.
+
+git diff --check
+  Passed before the ledger/checkpoint documentation update and repeated before
+  commit.
+
+EXPECTED / NOT A RELEASE CLAIM
+
+cargo fmt -p bloch-pos-node -p bloch-pos-committee -p bloch-crypto -- --check
+  Fails on the inherited workspace-wide formatting backlog. Output spans many
+  unchanged files; no bulk formatting migration was mixed into this patch.
+
+node --check .claude/workflows/roadmap-execution.js
+  Not run: no node, bun, deno, qjs or nodejs executable is installed on this host.
+  The file was source-reviewed; the external workflow host was not available.
+
+nix evaluation/build, hosted CI, Linux release build, production RSS/restart
+measurement, fleet inventory, deployment and consensus activation were not run.
+
+CORRECTED FAILURE
+
+The first broad node run reported 472 passed, 1 failed and 19 ignored in the main
+binary. `source_admission_bounds_the_first_channel_and_preserves_other_peer_capacity`
+still expected 256 admitted transaction frames after transaction count share was
+intentionally reduced to 128. The test now discovers the refusal boundary and pins
+the 128-slot policy. The targeted test and the complete node suite then passed.

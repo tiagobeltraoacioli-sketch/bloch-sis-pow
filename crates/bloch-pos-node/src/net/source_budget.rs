@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
-use super::{class_bytes_cap, EventClass};
+use super::{class_bytes_cap, class_count_cap, EventClass};
 
 const SOURCE_EVENTS: usize = 256;
 const SOURCE_BYTES: usize = 16 * 1024 * 1024;
@@ -53,8 +53,8 @@ impl Registry {
         let count = usage.map_or(0, |u| u.count);
         let source_bytes = usage.map_or(0, |u| u.bytes).checked_add(bytes)?;
         let total_bytes = state.total.bytes.checked_add(bytes)?;
-        if count >= SOURCE_EVENTS || source_bytes > class_bytes_cap(class, SOURCE_BYTES)
-            || state.total.count >= count_cap
+        if count >= class_count_cap(class, SOURCE_EVENTS) || source_bytes > class_bytes_cap(class, SOURCE_BYTES)
+            || state.total.count >= class_count_cap(class, count_cap)
             || total_bytes > class_bytes_cap(class, bytes_cap)
             || (usage.is_none() && state.sources.len() >= MAX_SOURCES)
         { return None; }
@@ -94,14 +94,14 @@ mod tests {
         let bad = Source::Peer(vec![1]);
         let honest = Source::Peer(vec![2]);
         let mut held = Vec::new();
-        for _ in 0..SOURCE_EVENTS {
+        for _ in 0..class_count_cap(EventClass::Attestation, SOURCE_EVENTS) {
             held.push(reserve(&registry, bad.clone(), EventClass::Attestation, 512).unwrap());
         }
         assert!(reserve(&registry, bad.clone(), EventClass::Transaction, 1).is_none());
         let last = held.pop().unwrap();
         let clone = last.clone();
         drop(last);
-        assert!(reserve(&registry, bad.clone(), EventClass::Block, 1).is_none());
+        assert!(reserve(&registry, bad.clone(), EventClass::Attestation, 1).is_none());
         let honest_guard = reserve(&registry, honest, EventClass::Block, 8 * 1024 * 1024).unwrap();
         drop(clone);
         assert!(reserve(&registry, bad, EventClass::Block, 1).is_some());
@@ -110,6 +110,50 @@ mod tests {
         let state = registry.lock().unwrap();
         assert!(state.sources.is_empty());
         assert_eq!((state.total.count, state.total.bytes), (0, 0));
+    }
+
+    #[test]
+    fn tiny_messages_preserve_same_nat_count_headroom_and_release_every_charge() {
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let source = Source::ip("192.0.2.19".parse().unwrap());
+        let mut held = Vec::new();
+        for (class, target) in [
+            (EventClass::Transaction, SOURCE_EVENTS / 2),
+            (EventClass::Attestation, SOURCE_EVENTS / 4 * 3),
+            (EventClass::Block, SOURCE_EVENTS),
+        ] {
+            while held.len() < target {
+                held.push(reserve(&registry, source.clone(), class, 1).unwrap());
+            }
+            assert!(reserve(&registry, source.clone(), class, 1).is_none());
+        }
+        assert_eq!(registry.lock().unwrap().total.bytes, SOURCE_EVENTS);
+        let clone = held.last().unwrap().clone();
+        drop(held);
+        assert_eq!(registry.lock().unwrap().total.count, 1);
+        assert!(reserve(&registry, source, EventClass::Transaction, 1).is_some());
+        drop(clone);
+        let state = registry.lock().unwrap();
+        assert!(state.sources.is_empty());
+        assert_eq!((state.total.count, state.total.bytes), (0, 0));
+    }
+
+    #[test]
+    fn tiny_messages_preserve_aggregate_count_headroom_across_sources() {
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let mut held = Vec::new();
+        for (class, target) in [
+            (EventClass::Transaction, 4), (EventClass::Attestation, 6), (EventClass::Block, 8),
+        ] {
+            while held.len() < target {
+                let source = Source::Peer(vec![held.len() as u8]);
+                held.push(Registry::reserve(&registry, source, class, 1, 8, 1 << 20).unwrap());
+            }
+            assert!(Registry::reserve(&registry, Source::Peer(vec![99]), class, 1, 8, 1 << 20).is_none());
+        }
+        drop(held);
+        assert_eq!(registry.lock().unwrap().total.count, 0);
+        assert!(Registry::reserve(&registry, Source::Peer(vec![99]), EventClass::Transaction, 1, 8, 1 << 20).is_some());
     }
 
     #[test]

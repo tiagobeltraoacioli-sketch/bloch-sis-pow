@@ -2285,10 +2285,10 @@ impl Engine {
         if env.header.attestation_root != derive::attestation_root(&env.body.attestations)
             || env.header.body_root != derive::body_root(&env.body.transactions)
         {
-            eprintln!(
+            crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!(
                 "reject {}: body/attestation commitment mismatch",
                 crate::codec::hex8(&id)
-            );
+            ));
             return (Verdict::Reject, None);
         }
         // A block carrying transactions used to be rejected here, because the
@@ -2298,7 +2298,7 @@ impl Engine {
         // must not reach the transition, since the proposer's post-state would
         // then be unreproducible.
         if let Err(e) = body_transactions(&env) {
-            eprintln!("reject {}: {e}", crate::codec::hex8(&id));
+            crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!("reject {}: {e}", crate::codec::hex8(&id)));
             return (Verdict::Reject, None);
         }
         if env.header.slot == 0 {
@@ -2338,14 +2338,14 @@ impl Engine {
         // and sync this horizon is the only thing bounding a gossiped slot.
         let horizon = self.wall_slot().saturating_add(MAX_FUTURE_SLOTS);
         if src.bounded_by_wall_clock() && env.header.slot > horizon {
-            eprintln!(
+            crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!(
                 "reject {}: slot {} is past this node's horizon {} (wall {} + {})",
                 crate::codec::hex8(&id),
                 env.header.slot,
                 horizon,
                 self.wall_slot(),
                 MAX_FUTURE_SLOTS,
-            );
+            ));
             return (Verdict::Reject, None);
         }
         // A slot the clock will never reach is a write into `blocks` that no
@@ -2366,12 +2366,12 @@ impl Engine {
             && env.header.slot > self.wall_slot().saturating_add(FUTURE_SLOT_TOLERANCE)
         {
             self.rejected_future = self.rejected_future.saturating_add(1);
-            eprintln!(
+            crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!(
                 "reject {}: slot {} is more than {FUTURE_SLOT_TOLERANCE} ahead of wall slot {}",
                 crate::codec::hex8(&id),
                 env.header.slot,
                 self.wall_slot(),
-            );
+            ));
             return (Verdict::Ignore, None);
         }
         // Every valid transition advances its parent's slot. Enforce the
@@ -2454,11 +2454,11 @@ impl Engine {
                 return (Verdict::Ignore, None);
             }
             self.rejected_unsigned = self.rejected_unsigned.saturating_add(1);
-            eprintln!(
+            crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!(
                 "reject {}: proposer {} signature does not verify",
                 crate::codec::hex8(&id),
                 env.header.proposer_index,
-            );
+            ));
             return (Verdict::Reject, None);
         }
         // Authenticated near-future blocks must not enter fork choice until
@@ -3305,7 +3305,7 @@ impl Engine {
         let txs = match body_transactions(env) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("apply refused: {e}");
+                crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!("apply refused: {e}"));
                 return false;
             }
         };
@@ -3437,11 +3437,11 @@ impl Engine {
             Err(err) => {
                 crate::metrics::NodeMetrics::inc(&crate::metrics::NODE.blocks_rejected_total);
                 if self.live {
-                    eprintln!(
+                    crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!(
                         "reject {} at slot {}: {err:?}",
                         crate::codec::hex8(id.as_bytes()),
                         env.header.slot
-                    );
+                    ));
                 }
                 false
             }
@@ -3690,7 +3690,7 @@ impl Engine {
             let txs = match body_transactions(env) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("reorg candidate rejected at slot {}: {e}", env.header.slot);
+                    crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!("reorg candidate rejected at slot {}: {e}", env.header.slot));
                     return false;
                 }
             };
@@ -3708,11 +3708,11 @@ impl Engine {
                     applied.push((*env.block_id().as_bytes(), Arc::new(post)));
                 }
                 Err(err) => {
-                    eprintln!(
+                    crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!(
                         "reorg candidate {} invalid at slot {}: {err:?}",
                         crate::codec::hex8(env.block_id().as_bytes()),
                         env.header.slot
-                    );
+                    ));
                     self.blocks.remove(env.block_id().as_bytes());
                     return false;
                 }
@@ -3946,7 +3946,7 @@ impl Engine {
                 self.net.report(origin, Verdict::Ignore);
             }
             GossipDecision::Reject(reason) => {
-                eprintln!("attestation from v{} REJECTED: {reason:?}", att.validator);
+                crate::net::rejection_log::emit(crate::net::rejection_log::Class::Attestation, || eprintln!("attestation from v{} REJECTED: {reason:?}", att.validator));
                 self.net.report(origin, Verdict::Reject);
             }
         }
@@ -4022,18 +4022,30 @@ impl Engine {
     /// Canonical height of a block id — its position on the canonical chain,
     /// genesis at 0. `None` for a block this node has stored but not adopted.
     fn height_of(&self, id: &[u8; 32]) -> Option<u64> {
-        self.chain
-            .iter()
-            .position(|(_, cid)| cid.as_bytes() == id)
-            .map(|p| p as u64)
+        if !self.canonical.contains(id) { return None; }
+        if self.chain.first().is_some_and(|(_, root)| root.as_bytes() == id) {
+            return Some(0);
+        }
+        // Canonical envelopes survive finalized-floor pruning. Their slots
+        // locate the authoritative chain position without another mutable index.
+        if let Some(envelope) = self.blocks.get(id) {
+            if let Ok(position) = self.chain.binary_search_by_key(&envelope.header.slot, |(slot, _)| *slot) {
+                if self.chain.get(position).is_some_and(|(_, root)| root.as_bytes() == id) {
+                    return Some(position as u64);
+                }
+            }
+        }
+        // Preserve canonical lookup if a future retention policy omits an old
+        // envelope; missing optional storage must not erase canonical history.
+        self.chain.iter().position(|(_, root)| root.as_bytes() == id).map(|p| p as u64)
     }
 
     /// Slot of a canonical block named by root, if this node has it canonical.
     fn slot_of_canonical_root(&self, root: &[u8; 32]) -> Option<u64> {
-        self.chain
-            .iter()
-            .find(|(_, id)| id.as_bytes() == root)
-            .map(|(s, _)| *s)
+        self.height_of(root)
+            .and_then(|height| usize::try_from(height).ok())
+            .and_then(|position| self.chain.get(position))
+            .map(|(slot, _)| *slot)
     }
 
     /// Where a block stands against this node's own checkpoints.
@@ -4138,7 +4150,8 @@ impl Engine {
             }
 
             RpcRequest::BlockBySlot(slot) => {
-                let Some((_, id)) = self.chain.iter().find(|(s, _)| *s == slot) else {
+                let Some((_, id)) = self.chain.binary_search_by_key(&slot, |(s, _)| *s)
+                    .ok().and_then(|position| self.chain.get(position)) else {
                     // A slot with no canonical block is the ordinary PoS case —
                     // a proposer missed its turn — and is reported as its own
                     // code so a scanner advances instead of alerting.
@@ -4734,7 +4747,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         crate::codec::hex8(&digest),
     );
 
-    let logged = store.read_all()?;
+    let mut logged = store.read_all()?;
     let head_slot = Arc::new(AtomicU64::new(0));
     // Network events queued but not yet handled. The transport reads it to
     // decide when to shed rather than queue — see `net::send_to_engine`. It is
@@ -4926,13 +4939,13 @@ pub fn run(cfg: Config) -> io::Result<()> {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "--replay-from-genesis conflicts with --require-state-cache"));
     }
     let skipped = if force_replay { 0 } else {
-        match engine.restore_local_cache(&logged) {
+        match engine.restore_local_cache(&mut logged) {
             Ok(n) => n,
             Err(e) if require_cache => return Err(e),
             Err(e) => { println!("state-cache: unavailable ({e}); replaying from genesis"); 0 }
         }
     };
-    let n_logged = logged.len().saturating_sub(skipped);
+    let n_logged = logged.len();
     let replay_limit = match std::env::var("BLOCH_MAX_REPLAY_BLOCKS") {
         Ok(value) => Some(value.parse::<usize>().map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid --max-replay-blocks"))?),
         Err(_) if require_cache => Some(2 * local_cache::INTERVAL - 1),
@@ -4946,7 +4959,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
     }
     let replay_started = std::time::Instant::now();
     let mut last_report = replay_started;
-    for (i, env) in logged.into_iter().skip(skipped).enumerate() {
+    for (i, env) in logged.into_iter().enumerate() {
         // `ingest_replay`, not `ingest`: these blocks are this node's own
         // committed log, and must not be judged against a wall clock the log
         // knows nothing about. See `Engine::ingest_replay`.
@@ -10925,6 +10938,21 @@ mod ingest_admission_tests {
         assert!(matches!(verdict, Verdict::Reject));
         assert_eq!(engine.blocks.len(), stored);
         assert_eq!(engine.rejected_unsigned, 1);
+    }
+
+    #[test]
+    fn rejection_logging_burst_preserves_every_forgery_verdict_and_counter() {
+        let (mut engine, _dir, template, stored) = fixture();
+        let mut forged = repointed(&engine, &template, [0x9A; 32], 2);
+        forged.proposer_sig.fill(0);
+        let before = crate::net::rejection_log::suppressed_total();
+        for _ in 0..100 {
+            assert!(matches!(engine.ingest_judged(forged.clone()), Verdict::Reject));
+        }
+        assert_eq!(engine.rejected_unsigned, 100);
+        assert_eq!(engine.blocks.len(), stored);
+        assert!(engine.orphans.is_empty());
+        assert!(crate::net::rejection_log::suppressed_total() > before);
     }
 
     #[test]

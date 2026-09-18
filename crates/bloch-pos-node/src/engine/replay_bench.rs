@@ -1222,14 +1222,14 @@ fn perf_local_cache_recovery() {
                 let mut restored = boot_engine(restore_manifest, &restore_dir);
                 let genesis_ms = ms(t.elapsed());
                 let t = Instant::now();
-                let logged = restored.store.read_all().unwrap();
+                let mut logged = restored.store.read_all().unwrap();
                 let log_ms = ms(t.elapsed());
                 let t = Instant::now();
-                let skipped = restored.restore_local_cache(&logged).unwrap();
+                let skipped = restored.restore_local_cache(&mut logged).unwrap();
                 let restore_ms = ms(t.elapsed());
                 assert_eq!(skipped, count);
                 let t = Instant::now();
-                for block in logged.into_iter().skip(skipped) { restored.ingest_replay(block); }
+                for block in logged { restored.ingest_replay(block); }
                 let tail_ms = ms(t.elapsed());
                 assert_eq!(*restored.state, expected);
                 (genesis_ms, log_ms, restore_ms, tail_ms, skipped)

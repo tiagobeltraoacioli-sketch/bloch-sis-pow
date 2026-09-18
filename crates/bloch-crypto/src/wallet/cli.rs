@@ -458,33 +458,9 @@ fn prompt_new_password() -> String {
 }
 
 fn rpc_call(endpoint: &str, method: &str, params: serde_json::Value) -> serde_json::Value {
-    let body = serde_json::to_string(&serde_json::json!({
-        "jsonrpc": "2.0", "id": 1, "method": method, "params": params
-    })).unwrap();
-    let url  = endpoint.trim_start_matches("http://");
-    let (host, _) = url.split_once('/').unwrap_or((url, ""));
-    match std::net::TcpStream::connect(host) {
-        Err(_) => serde_json::json!({ "error": "node not reachable" }),
-        Ok(mut s) => {
-            use std::io::{Write, Read};
-            let req = format!(
-                "POST / HTTP/1.0\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                host, body.len(), body
-            );
-            let _ = s.write_all(req.as_bytes());
-            let mut buf = String::new();
-            let _ = s.read_to_string(&mut buf);
-            if let Some(p) = buf.find("\r\n\r\n") {
-                serde_json::from_str(&buf[p+4..])
-                    .ok()
-                    .and_then(|v: serde_json::Value|
-                        v.get("result").cloned())
-                    .unwrap_or(serde_json::json!({}))
-            } else {
-                serde_json::json!({ "error": "invalid response" })
-            }
-        }
-    }
+    let authority = endpoint.strip_prefix("http://").unwrap_or(endpoint).trim_end_matches('/');
+    crate::wallet::http_rpc::call(authority, method, &params, None)
+        .unwrap_or_else(|error| serde_json::json!({"error":error}))
 }
 
 // Parse once from the original CLI token: no float may choose the spend amount.

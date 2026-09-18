@@ -109,6 +109,7 @@ pub const FRAME_TX: u8 = 0x04;
 
 pub use crate::p2p::{Origin, Verdict};
 mod source_budget;
+pub(crate) mod rejection_log;
 pub(crate) use source_budget::Reservation as SourceReservation;
 
 /// What the engine receives from a transport.
@@ -325,8 +326,8 @@ pub fn queued_bytes(ev: &NetEvent) -> usize {
 /// consist of, and a node that sheds blocks while queuing transactions has its
 /// priorities inverted); attestations up to three quarters; transactions up to
 /// half. So under memory pressure transactions are shed first, attestations
-/// second, blocks last in the byte budget. Event-count limits are shared:
-/// many tiny messages can still consume all count slots for their source.
+/// second, blocks last. The same shares reserve event-count headroom, so
+/// many tiny lower-priority messages cannot consume the block allowance.
 fn class_bytes_cap(class: EventClass, bytes_cap: usize) -> usize {
     match class {
         EventClass::Block => bytes_cap,
@@ -336,6 +337,12 @@ fn class_bytes_cap(class: EventClass, bytes_cap: usize) -> usize {
         EventClass::Attestation => bytes_cap.checked_div(4).unwrap_or(0).saturating_mul(3),
         EventClass::Transaction => bytes_cap.checked_div(2).unwrap_or(0),
     }
+}
+
+/// Count thresholds use the byte policy's shares, retaining one usable slot
+/// for nonzero tiny test budgets. A zero budget never admits an event.
+fn class_count_cap(class: EventClass, count_cap: usize) -> usize {
+    class_bytes_cap(class, count_cap).max(usize::from(count_cap != 0))
 }
 
 /// The admission budget shared by every transport that feeds the engine.
@@ -426,7 +433,7 @@ impl QueueBudget {
     }
 
     fn reserve_raw(&self, class: EventClass, size: usize) -> bool {
-        let count_cap = self.count_cap;
+        let count_cap = class_count_cap(class, self.count_cap);
         if self
             .count
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
@@ -1883,8 +1890,37 @@ mod tests {
         for h in handles {
             h.join().expect("racer");
         }
-        assert_eq!(admitted.load(Ordering::Relaxed), cap, "exactly cap reservations succeed");
+        let attestation_cap = class_count_cap(EventClass::Attestation, cap);
+        assert_eq!(admitted.load(Ordering::Relaxed), attestation_cap);
+        assert_eq!(budget.inflight(), attestation_cap);
+        for _ in attestation_cap..cap {
+            assert!(budget.reserve_raw(EventClass::Block, 1));
+        }
+        assert!(!budget.reserve_raw(EventClass::Block, 1));
         assert_eq!(budget.inflight(), cap);
+    }
+
+    #[test]
+    fn count_quotas_preserve_block_headroom_and_recover_after_release() {
+        let budget = QueueBudget::with_caps(8, 1 << 20);
+        for (class, target) in [
+            (EventClass::Transaction, 4), (EventClass::Attestation, 6), (EventClass::Block, 8),
+        ] {
+            while budget.inflight() < target {
+                assert!(budget.reserve_raw(class, 1));
+            }
+            assert!(!budget.reserve_raw(class, 1));
+            assert_eq!(budget.inflight_bytes(), target);
+        }
+        for _ in 0..8 { budget.release_raw(1); }
+        assert_eq!((budget.inflight(), budget.inflight_bytes()), (0, 0));
+        assert!(budget.reserve_raw(EventClass::Transaction, 1));
+        for class in [EventClass::Transaction, EventClass::Attestation, EventClass::Block] {
+            assert!(!QueueBudget::with_caps(0, 1024).reserve_raw(class, 1));
+            let tiny = QueueBudget::with_caps(1, 1024);
+            assert!(tiny.reserve_raw(class, 1));
+            assert!(!tiny.reserve_raw(class, 1));
+        }
     }
 
     /// O06 — the per-class byte quotas: transactions stop at half the

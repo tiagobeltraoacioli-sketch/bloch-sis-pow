@@ -177,6 +177,17 @@ fn a_torn_trailing_frame_is_dropped_and_the_rest_survives() {
     let reader = LogReader::open(&p).unwrap();
     assert_eq!(reader.len(), 3, "three whole frames survive");
     assert_eq!(reader.scan_end(), ScanEnd::TornTrailingFrame);
+    // A crash can tear the four-byte length prefix itself. Do not label
+    // those trailing bytes a clean archive, or discard preceding blocks.
+    for trailing in 1..=3 {
+        let mut partial_prefix = whole.clone();
+        partial_prefix.extend_from_slice(&[0x34, 0x12, 0x01][..trailing]);
+        std::fs::write(&p, partial_prefix).unwrap();
+        let mut reader = LogReader::open(&p).unwrap();
+        assert_eq!(reader.len(), 4);
+        assert_eq!(reader.scan_end(), ScanEnd::TornTrailingFrame);
+        assert_eq!(reader.envelope_at(3).unwrap().block_id(), envs[3].block_id());
+    }
     let _ = std::fs::remove_dir_all(&d);
 }
 
