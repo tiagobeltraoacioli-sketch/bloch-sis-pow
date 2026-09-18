@@ -146,7 +146,11 @@ impl FundedDeposit {
         let valid_until_epoch = r.u64()?;
         let funding_pubkey = bounded(r, ADMISSION_PQ_KEY_BYTES)?;
         let n = r.u32()? as usize;
-        if n == 0 || n > MAX_FUNDING_INPUTS {
+        // This is a decoder resource bound, not an economic judgment. An
+        // empty input vector is syntactically representable and is decoded;
+        // validate_shape/state admission reject it. The upper bound stays
+        // here so hostile bytes cannot drive unbounded work/allocation.
+        if n > MAX_FUNDING_INPUTS {
             return Err(TxDecodeError::NotCanonical(FUNDED_DEPOSIT_TAG));
         }
         let mut inputs = Vec::new();
@@ -157,7 +161,7 @@ impl FundedDeposit {
             });
         }
         let validator_pubkey = bounded(r, ADMISSION_PQ_KEY_BYTES)?;
-        let tx = Self {
+        Ok(Self {
             network_domain,
             valid_until_epoch,
             funding_pubkey,
@@ -176,10 +180,7 @@ impl FundedDeposit {
             tx_bytes: r.u64()?,
             funding_signature: bounded(r, ADMISSION_PQ_SIGNATURE_MAX)?,
             proof_of_possession: bounded(r, ADMISSION_PQ_SIGNATURE_MAX)?,
-        };
-        tx.validate_shape()
-            .map_err(|_| TxDecodeError::NotCanonical(FUNDED_DEPOSIT_TAG))?;
-        Ok(tx)
+        })
     }
 
     /// Also accepts unsigned drafts; neither consensus nor mempool stops here.

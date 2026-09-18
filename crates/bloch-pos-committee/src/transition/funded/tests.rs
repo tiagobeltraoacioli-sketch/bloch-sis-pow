@@ -131,6 +131,20 @@ fn funded_decoder_bounds_lengths_before_allocating() {
 }
 
 #[test]
+fn funded_decoder_parses_bounded_wire_shape_and_the_judge_rejects_semantics() {
+    let mut invalid = deposit(21);
+    invalid.inputs.clear();
+    let wire = PosTransaction::FundedDeposit(invalid.clone());
+    let decoded = PosTransaction::from_canonical_bytes(&wire.canonical_bytes())
+        .expect("zero inputs are bounded, syntactically decodable bytes");
+    assert_eq!(decoded, wire);
+    let PosTransaction::FundedDeposit(decoded) = decoded else {
+        panic!("funded tag must decode as a funded deposit");
+    };
+    assert_eq!(decoded.validate_shape(), Err(FundedDepositReject::Shape));
+}
+
+#[test]
 fn funded_gate_obeys_the_scheduled_boundary_and_legacy_stays_closed() {
     let gate = crate::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH;
     assert!(!crate::params::funded_validator_admission_active(gate - 1));

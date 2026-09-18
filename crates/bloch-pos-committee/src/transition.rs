@@ -989,6 +989,12 @@ impl PosTransaction {
     /// `tests::canonical_bytes_round_trips` pins it against the encoder rather
     /// than against a hand-written expectation.
     ///
+    /// Decoding answers only whether the bytes have the bounded wire shape.
+    /// Transaction rules belong to the admission/transition judge. In
+    /// particular, a syntactically decodable funded deposit can still fail
+    /// `FundedDeposit::validate_shape`; keeping that verdict out of this
+    /// function preserves the decode/judge separation used by the other tags.
+    ///
     /// # `SlashingEvidence` (tag `0x05`) decodes — corrected 2026-09-05
     ///
     /// This arm used to return [`TxDecodeError::EvidenceNotDecodable`]
