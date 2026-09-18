@@ -4,7 +4,7 @@ Audited source: `562e220`. Remediation base: `b066e3c`. Branch: `fix/internal-au
 
 All 200 findings are retained, including duplicates. IMPLEMENTED means code changed in this branch, not deployed, externally audited, or universally resolved on the live fleet. PARTIAL is not closure. No production binary was published.
 
-IMPLEMENTED: 64, PARTIAL: 79, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE CHANGED: 7, OPEN: 43, REFUTED IN AUDIT: 1, VERIFIED POSITIVE: 1.
+IMPLEMENTED: 65, PARTIAL: 79, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE CHANGED: 7, OPEN: 42, REFUTED IN AUDIT: 1, VERIFIED POSITIVE: 1.
 
 | Finding | Status | Evidence / remaining work | Original title |
 |---|---|---|---|
@@ -207,4 +207,4 @@ IMPLEMENTED: 64, PARTIAL: 79, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE C
 | TX-07 | PARTIAL | Live node admission caps declared size at canonical encoding plus the shared slack, and proposal selection budgets the consensus-declared size. Consensus has the same `OverdeclaredSize` rule and regressions behind inert `TX_BYTES_BOUND_ACTIVATION_EPOCH`; a hand-built body remains valid until a coordinated flag day. | Declared `tx_bytes` may exceed the encoding by any amount; one small transfer can fill the block byte budget |
 | LD-01 | IMPLEMENTED | Root rustls 0.23.45 and rustls-webpki 0.103.15; configured cargo-audit passes. | Rustls advisory |
 | LD-02 | PARTIAL | Updated inaccurate bincode rationale; cross-workspace exception pruning and stale-lock cleanup deferred pending all-lockfile verification. | Lockfile and advisory exception hygiene |
-| LD-03 | OPEN | Legacy PoW test optimization not part of the live-node security patch. | Unoptimized legacy PoW test duration |
+| LD-03 | IMPLEMENTED | The root dev/test profile now optimizes `bloch-sis-pow` while retaining debug assertions and overflow checks. The complete offline suite passed 81 tests (3 ignored) in 2m27s including recompilation, versus the audited 18m45s. Both CI timeout comments were reconciled. See WAVE-30.md. | Unoptimized legacy PoW test duration |

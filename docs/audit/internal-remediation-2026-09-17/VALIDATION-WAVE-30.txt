@@ -1,0 +1,24 @@
+Validation wave 30 — 2026-09-18
+Branch: fix/internal-audit-20260917
+Implementation: ba0dea6
+
+PASS
+
+/usr/bin/time -p cargo test --locked --offline -p bloch-sis-pow
+  81 passed; 0 failed; 3 ignored.
+  real 146.92 seconds, including 18.11 seconds compiling the new profile.
+
+ruby -e 'require "yaml"; YAML.load_file(...)'
+  .github/workflows/tests.yml and .gitlab-ci.yml parsed successfully.
+
+python3 scripts/check-tests-blocking.py
+  Both pipelines still covered all 8 live crates in blocking test jobs.
+
+git diff --check
+  Passed before the implementation commit and after the documentation update.
+
+BOUNDARY
+
+This changes only the development/test compilation profile for one package.
+The release profile, source behavior, test inputs, ignored-test policy and CI
+timeouts are unchanged.
