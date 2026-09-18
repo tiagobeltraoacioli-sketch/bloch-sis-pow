@@ -3401,6 +3401,11 @@ impl CommittedState {
                 if !Self::unfunded_bonding_active(self.epoch) {
                     return Err(TxReject::StakingNotActive);
                 }
+                if crate::params::activation_queue_v2_active(self.epoch)
+                    && self.validators.len() >= staking::MAX_VALIDATOR_REGISTRY_ENTRIES
+                {
+                    return Err(TxReject::StakingRule);
+                }
                 let pubkey_hash: [u8; 32] = Sha3_256::digest(pubkey).into();
                 // A second deposit of a registered key is a top-up path
                 // decision the interface refuses to make implicitly.

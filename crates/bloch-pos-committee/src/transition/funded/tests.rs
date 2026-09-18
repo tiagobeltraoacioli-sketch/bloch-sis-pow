@@ -176,6 +176,35 @@ fn funded_gate_obeys_the_scheduled_boundary_and_legacy_stays_closed() {
 }
 
 #[test]
+fn activation_queue_v2_is_inert_and_caps_the_permanent_registry_when_rehearsed() {
+    assert_eq!(crate::params::ACTIVATION_QUEUE_V2_ACTIVATION_EPOCH, u64::MAX);
+    assert!(!crate::params::activation_queue_v2_active(0));
+    assert!(!crate::params::activation_queue_v2_active(u64::MAX));
+
+    run(|| {
+        let tx = deposit(70);
+        let (_, mut state, _) = fixture(std::slice::from_ref(&tx));
+        let template = state.validator_record(0).unwrap().clone();
+        while state.validators.len() < staking::MAX_VALIDATOR_REGISTRY_ENTRIES {
+            let index = state.validators.len() as u32;
+            state.validators.insert(index, ValidatorRecord { index, ..template.clone() });
+        }
+        assert_eq!(state.validators.len(), staking::MAX_VALIDATOR_REGISTRY_ENTRIES);
+        let history_before = state.deposit_history.len();
+
+        let _gate = crate::params::activation_queue_v2_rehearsal::open();
+        assert!(crate::params::activation_queue_v2_active(state.epoch));
+        assert_eq!(
+            apply(&mut state, &tx),
+            Err(TxReject::FundedDeposit(FundedDepositReject::RegistryCapacity)),
+            "the armed candidate must reject before growing permanent registry/history state"
+        );
+        assert_eq!(state.validators.len(), staking::MAX_VALIDATOR_REGISTRY_ENTRIES);
+        assert_eq!(state.deposit_history.len(), history_before);
+    });
+}
+
+#[test]
 fn funded_apply_conserves_value_refunds_fee_budget_and_rejects_replay() {
     run(|| {
         let tx = deposit(23);

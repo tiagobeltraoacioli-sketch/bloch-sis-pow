@@ -1876,8 +1876,9 @@ pub struct DomainTag {
 /// no tag can be a prefix of another. [`DOMAIN_TAGS`] below is the complete
 /// machine-readable registry.
 ///
-/// Sortition covers weighted slot/epoch draws and the epoch partition. Their
-/// final role bytes (`0x01`, `0x02`, `0x03`) are disjoint subdomains.
+/// Sortition covers weighted slot/epoch draws, the epoch partition and the
+/// inactive activation-queue candidate. Their final role bytes
+/// (`0x01`, `0x02`, `0x03`, `0x04`) are disjoint subdomains.
 pub const DS_SORTITION: [u8; 16] = *b"BLCH4:SORTIT\0\0\0\0";
 /// Attestation signing root domain.
 pub const DS_ATTEST: [u8; 16] = *b"BLCH4:ATTEST\0\0\0\0";
@@ -1966,6 +1967,7 @@ pub const DOMAIN_TAGS: &[DomainTag] = &[
         preimage_shapes: &[
             "weighted draw: mix|index|role(01/02)",
             "epoch partition: mix|epoch|role(03)",
+            "activation queue: mix|pubkey_hash|role(04)",
         ],
     },
     DomainTag {
@@ -2062,11 +2064,50 @@ pub const DOMAIN_TAGS: &[DomainTag] = &[
 /// a predictable subset of the epoch committee.
 pub(crate) const ROLE_SLOT: u8 = 0x01;
 pub(crate) const ROLE_EPOCH: u8 = 0x02;
+/// Candidate activation-queue permutation, separated from proposer,
+/// committee and epoch-partition draws under [`DS_SORTITION`].
+pub(crate) const ROLE_ACTIVATION_QUEUE: u8 = 0x04;
 
 /// ADR-041 lifecycle epoch for funded validator admission (wire 0x0B).
 /// Scheduled at epoch 2884, 2026-09-14 22:35:19 UTC. This never enables
 /// unfunded legacy Deposit/Delegate formats. No runtime override exists.
 pub const FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH: u64 = 2_884;
+
+/// Candidate ST-13 activation-queue rules. `u64::MAX` means INERT.
+///
+/// Once armed, this binds two changes together: funded registration refuses
+/// to grow the permanent validator/deposit-history state beyond
+/// [`crate::staking::MAX_VALIDATOR_REGISTRY_ENTRIES`], and same-deposit-epoch
+/// activation priority is keyed by the activation epoch's beacon seed instead
+/// of the applicant-chosen public-key hash. Both alter block validity or a
+/// committed activation epoch, so neither may ship live without historical
+/// replay, resource qualification and a coordinated protocol activation.
+///
+/// The seed is only fixed at the boundary immediately before activation. With
+/// the eight-epoch activation delay an applicant cannot know it when choosing
+/// a key. Residual beacon withholding influence remains the separate FC-04
+/// problem; this candidate does not claim unbiased randomness.
+pub const ACTIVATION_QUEUE_V2_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+pub(crate) fn activation_queue_v2_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if activation_queue_v2_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, ACTIVATION_QUEUE_V2_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod activation_queue_v2_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
 
 pub fn funded_validator_admission_active(epoch: u64) -> bool {
     #[cfg(test)]

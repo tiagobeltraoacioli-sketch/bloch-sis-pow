@@ -59,6 +59,7 @@ pub enum FundedDepositReject {
     Signature,
     Stake,
     AlreadyRegistered,
+    RegistryCapacity,
     MissingInput,
     Ownership,
     FeeCap,
@@ -283,6 +284,11 @@ impl CommittedState {
         use FundedDepositReject as R;
         if !crate::params::funded_validator_admission_active(self.epoch) {
             return Err(R::NotActive);
+        }
+        if crate::params::activation_queue_v2_active(self.epoch)
+            && self.validators.len() >= staking::MAX_VALIDATOR_REGISTRY_ENTRIES
+        {
+            return Err(R::RegistryCapacity);
         }
         tx.validate_shape()?;
         if self.admission_network_domain != Some(tx.network_domain) {
