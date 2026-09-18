@@ -71,6 +71,12 @@ Metrics bound beyond loopback now require an [explicit public-exposure
 acknowledgement](WAVE-50-NET21.md); this is not authentication, TLS or firewall
 evidence. The [Wave 50 integration checkpoint](WAVE-50-INTEGRATION.md) records
 the four-agent review, validation and unchanged launch blockers.
+Wave 51 makes the deterministic PQ test override
+[scoped-only](WAVE-51-CR08.md), removes repeated fork-choice work from
+[canonical cold replay](WAVE-51-EN23-LINEAR-REPLAY.md), and makes block serving
+[fail boundedly on an unusable index](WAVE-51-NET22.md). The
+[Wave 51 integration checkpoint](WAVE-51-INTEGRATION.md) records cross-review,
+the final green local suites and the still-open external launch gates.
 
 ## Scope and source reconciliation
 

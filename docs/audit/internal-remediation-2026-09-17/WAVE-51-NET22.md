@@ -1,8 +1,8 @@
 # Wave 51: NET-22 bounded block-index failure
 
 Date: 2026-09-18. Base: `2abb416`. Scope: local source, tests and audit
-ledger only. No node, peer, public endpoint, consensus rule, activation epoch,
-authoritative format or network wire encoding was changed.
+ledger only. No running node, peer, public endpoint, consensus rule, activation
+epoch, authoritative format or network wire encoding was changed.
 
 ## Change
 
