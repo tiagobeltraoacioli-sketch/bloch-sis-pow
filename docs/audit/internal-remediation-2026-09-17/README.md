@@ -25,6 +25,9 @@ the underlying whistleblower attribution remains a protocol choice.
 Wave 47 also adds an [inactive FC-05 slot-tiebreak
 candidate](WAVE-47-FC05.md) that removes the exact next-slot root-grinding
 lever while leaving proposer boost, balancing, and same-slot grinding open.
+The [Wave 45–47 integration checkpoint](WAVE-47-INTEGRATION.md) records the
+combined 200-row ledger, final validation, inactive-gate review, and the seven
+findings that still require external evidence or protocol decisions.
 
 ## Scope and source reconciliation
 
