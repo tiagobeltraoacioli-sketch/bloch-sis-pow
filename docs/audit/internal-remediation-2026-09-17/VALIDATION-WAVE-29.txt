@@ -1,0 +1,23 @@
+Validation wave 29 — 2026-09-18
+Branch: fix/internal-audit-20260917
+Implementation: 33d3115
+
+PASS
+
+cargo test --locked --offline -p bloch-pos-node --bin bloch-pos \
+  forged_proposer_is_refused_before_malformed_body_work
+  1 passed; 0 failed; 504 filtered out.
+
+cargo test --locked --offline -p bloch-pos-node --bin bloch-pos \
+  engine::ingest_admission_tests
+  19 passed; 0 failed; 486 filtered out.
+
+git diff --check
+  Passed before the implementation commit and after the documentation update.
+
+ENVIRONMENT NOTE
+
+The initial restricted invocation could not bind the fixture's ephemeral
+loopback socket and stopped with PermissionDenied before executing the test.
+Both passing commands above ran the same local/offline artifacts with socket
+access. No internet endpoint or deployed service was contacted.
