@@ -99,7 +99,7 @@ pub fn sync_frames_scanned() -> u64 {
 // reads it; the frames served are still the log's own bytes, still filtered
 // by the same `slot > after_slot` predicate over the header actually read
 // back from the log. Every way it can be wrong ends in the same place — the
-// full scan the code did before:
+// recovery path below:
 //
 //   * missing, empty, wrong magic, or torn  → rebuilt on `open`;
 //   * behind the log (crash between the log fsync and the index append, or
@@ -162,8 +162,7 @@ impl IdxEntry {
         // decide whether the index is trustworthy — a corrupt on-disk index
         // record that would otherwise wrap around to a small value instead
         // saturates to a value that reliably reads as "past the log", which
-        // is the same "distrust the index, fall back to a full scan"
-        // behaviour those callers already give a merely-stale index.
+        // makes callers distrust the index and fail boundedly.
         self.offset.saturating_add(4).saturating_add(self.len as u64)
     }
 }
@@ -228,8 +227,8 @@ fn scan_index(log_path: &Path, from: u64) -> io::Result<Vec<IdxEntry>> {
         // below; `len <= MAX_FIELD_LEN` was just checked), so this cannot
         // overflow in practice — `checked_add` makes that explicit rather
         // than assumed, and treats the unreachable overflow case exactly
-        // like a truncated trailing frame: stop indexing, the full scan in
-        // `blocks_after` remains the authority.
+        // like a truncated trailing frame: stop indexing and let open-time
+        // repair or a bounded serving error preserve the log as authority.
         let Some(frame_end) = at.checked_add(4).and_then(|v| v.checked_add(len as u64)) else {
             break;
         };
@@ -336,7 +335,8 @@ enum Start {
     At { offset: u64, expect_slot: Option<u64> },
 }
 
-/// Consult the index. `Ok(None)` means "no usable index" — scan from zero.
+/// Consult the index. `Ok(None)` means "no usable index"; network serving
+/// fails boundedly until `Store::open` rebuilds it.
 fn index_start(dir: &Path, after_slot: u64, log_len: u64) -> io::Result<Option<Start>> {
     let mut idx = File::open(dir.join("blocks.idx"))?;
     if idx.metadata()?.len() < 8 {
@@ -349,7 +349,14 @@ fn index_start(dir: &Path, after_slot: u64, log_len: u64) -> io::Result<Option<S
     }
     let n = idx_count(&idx)?;
     if n == 0 {
-        // Freshly created index over a log that may already have frames.
+        if log_len != 0 {
+            // An open store always indexes every complete frame before it is
+            // exposed. Magic without records beside a non-empty log is thus
+            // either corruption or an index-append failure, not permission
+            // for a remote request to scan the entire history.
+            return Ok(None);
+        }
+        // A genuinely empty log and freshly created index agree.
         return Ok(Some(Start::At { offset: 0, expect_slot: None }));
     }
     // Guarded by the `n == 0` return just above: n >= 1 here.
@@ -2255,7 +2262,7 @@ mod tests {
         }
         drop(store);
 
-        for replacement in [None, Some(b"BADINDEX".as_slice())] {
+        for replacement in [None, Some(b"BADINDEX".as_slice()), Some(IDX_MAGIC.as_slice())] {
             let idx_path = dir.join("blocks.idx");
             match replacement {
                 None => fs::remove_file(&idx_path).expect("remove index"),
