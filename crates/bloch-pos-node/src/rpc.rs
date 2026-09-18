@@ -2377,16 +2377,34 @@ pub fn build_info_json() -> Json {
         (
             "source_digest_scope",
             Json::s(
-                "workspace crates dir: rs, toml, c, h, S, s; \
-                 plus workspace Cargo.toml and Cargo.lock; \
+                "workspace crates dir: rs, toml, c, h, S, s, macros; \
+                 plus workspace Cargo.toml, Cargo.lock and rust-toolchain.toml; \
                  relative paths, sorted, length-prefixed",
             ),
         ),
         ("source_files", Json::s(env!("BLOCH_SOURCE_FILES"))),
         ("source_bytes", Json::s(env!("BLOCH_SOURCE_BYTES"))),
         ("rustc", Json::s(env!("BLOCH_BUILD_RUSTC"))),
+        ("cargo", Json::s(env!("BLOCH_BUILD_CARGO"))),
         ("profile", Json::s(env!("BLOCH_BUILD_PROFILE"))),
         ("target", Json::s(env!("BLOCH_BUILD_TARGET"))),
+        (
+            "build_environment_digest",
+            Json::s(env!("BLOCH_BUILD_ENV_DIGEST")),
+        ),
+        ("build_environment_digest_alg", Json::s("sha3-256")),
+        (
+            "build_environment_scope",
+            Json::s(
+                "rustc -vV; cargo --version --verbose; target; profile; \
+                 codegen environment selected by the build script; \
+                 sorted, length-prefixed; values hashed, not disclosed",
+            ),
+        ),
+        (
+            "build_environment_fields",
+            Json::s(env!("BLOCH_BUILD_ENV_FIELDS")),
+        ),
         // The bound rides with the answer. A client that reads `source_digest`
         // and stops reading has been told, in the response itself, what it is
         // allowed to conclude.

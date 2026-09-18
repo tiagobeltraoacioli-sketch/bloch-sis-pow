@@ -1284,7 +1284,7 @@ Every method in the frozen registry (`method_registry.rs`, `tests/rpc_method_reg
 | Method | Params (name, type; position) | Returns | Notes |
 |---|---|---|---|
 | `getchaininfo` | none | See §10.3 | |
-| `getbuildinfo` | none | `build_version, package_version, commit, commit_source (git\|asserted\|none), tree_state (clean\|modified\|unverified\|unknown), source_digest (sha3-256 hex), source_digest_alg, source_digest_scope, source_files, source_bytes, rustc, profile, target, digest_note` | Constant cost, no chain-state read. Compare `source_digest` across nodes you trust — identical digests mean identical *source*, not identical binary behaviour (see the warning below). |
+| `getbuildinfo` | none | `build_version, package_version, commit, commit_source (git\|asserted\|none), tree_state (clean\|modified\|unverified\|unknown), source_digest (sha3-256 hex), source_digest_alg, source_digest_scope, source_files, source_bytes, rustc, cargo, profile, target, build_environment_digest (sha3-256 hex), build_environment_digest_alg, build_environment_scope, build_environment_fields, digest_note` | Constant cost, no chain-state read. Compare both digests across trusted builders: source equality alone does not establish equal compiler/code-generation inputs (see the warning below). |
 | `getblockcount` | none | `height, slot, epoch, finalized_height (u64\|null), justified_epoch, finalized_epoch` | |
 | `getblockbyslot` | `slot` (u64; pos 0) | Block object, §7.2 | `-32007 SLOT_EMPTY` if no canonical block at that slot (message names the current head) |
 | `getblockbyid` | `block_id` (64-hex; pos 0) | Block object, §7.2 | `-32000 BLOCK_NOT_FOUND` if unknown |
@@ -1656,9 +1656,14 @@ whether a field is a string vs. a number, where `null` can appear).
   "build_version": "0.4.0-genesis4", "package_version": "0.4.0",
   "commit": "72e5525...", "commit_source": "git", "tree_state": "clean",
   "source_digest": "3d67...b308", "source_digest_alg": "sha3-256",
-  "source_digest_scope": "workspace crates dir: rs, toml, c, h, S, s; plus workspace Cargo.toml and Cargo.lock; relative paths, sorted, length-prefixed",
+  "source_digest_scope": "workspace crates dir: rs, toml, c, h, S, s, macros; plus workspace Cargo.toml, Cargo.lock and rust-toolchain.toml; relative paths, sorted, length-prefixed",
   "source_files": "812", "source_bytes": "9134221",
-  "rustc": "1.94.1", "profile": "release", "target": "x86_64-unknown-linux-gnu",
+  "rustc": "rustc 1.94.1 (...)", "cargo": "cargo 1.94.1 (...)",
+  "profile": "release", "target": "x86_64-unknown-linux-gnu",
+  "build_environment_digest": "f27a...71c4",
+  "build_environment_digest_alg": "sha3-256",
+  "build_environment_scope": "rustc -vV; cargo --version --verbose; target; profile; codegen environment selected by the build script; sorted, length-prefixed; values hashed, not disclosed",
+  "build_environment_fields": "7",
   "digest_note": "different digests prove different source trees; equal digests are evidence of the same source, not proof — whoever can edit the source can edit the build script that hashes it"
 }
 ```
@@ -2053,10 +2058,13 @@ source-digest sha3-256:<hex> (<N> files, <M> bytes) commit-source:<git|asserted|
 
 `getbuildinfo` (RPC) and `bloch-pos buildinfo` (CLI) return the identical
 object: `build_version, package_version, commit, commit_source,
-tree_state, source_digest (SHA3-256 over every `crates/**/*.{rs,toml,c,h,S,s}`
-file plus the workspace `Cargo.toml`/`Cargo.lock`, computed at build time),
+tree_state, source_digest (SHA3-256 over every
+`crates/**/*.{rs,toml,c,h,S,s,macros}` file plus the workspace
+`Cargo.toml`/`Cargo.lock`/`rust-toolchain.toml`, computed at build time),
 source_digest_alg, source_digest_scope, source_files, source_bytes, rustc,
-profile, target, digest_note`.
+cargo, profile, target, build_environment_digest,
+build_environment_digest_alg, build_environment_scope,
+build_environment_fields, digest_note`.
 
 <div class="warn">
 

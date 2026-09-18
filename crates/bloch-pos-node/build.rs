@@ -159,6 +159,73 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// Build knobs whose values can change generated machine code without changing
+/// the source tree. Values are hashed, never published verbatim. Prefixes cover
+/// Cargo's target/profile-specific forms and the C toolchain used by PQClean.
+const FIXED_BUILD_ENV: &[&str] = &[
+    "AR",
+    "BINDGEN_EXTRA_CLANG_ARGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "CARGO_INCREMENTAL",
+    "CC",
+    "CFLAGS",
+    "CPPFLAGS",
+    "MACOSX_DEPLOYMENT_TARGET",
+    "RUSTC_BOOTSTRAP",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "RUSTC_WRAPPER",
+    "RUSTFLAGS",
+    "SDKROOT",
+    "SOURCE_DATE_EPOCH",
+];
+
+fn relevant_build_env(key: &str) -> bool {
+    FIXED_BUILD_ENV.contains(&key)
+        || key.starts_with("AR_")
+        || key.starts_with("CC_")
+        || key.starts_with("CFLAGS_")
+        || key.starts_with("CARGO_PROFILE_")
+        || key.starts_with("CARGO_TARGET_")
+}
+
+/// Hash the compiler/Cargo identities, effective target/profile and selected
+/// code-generation environment. The canonical framing keeps the digest stable
+/// without publishing machine paths that wrappers or SDK variables may carry.
+fn build_environment_digest(
+    rustc_verbose: &str,
+    cargo_verbose: &str,
+    profile: &str,
+    target: &str,
+) -> (String, usize) {
+    // An absent fixed variable is also watched: setting it after an incremental
+    // build must rerun this script rather than leave a stale fingerprint.
+    for key in FIXED_BUILD_ENV {
+        println!("cargo:rerun-if-env-changed={key}");
+    }
+    let mut fields = vec![
+        ("cargo-version".to_owned(), cargo_verbose.to_owned()),
+        ("profile".to_owned(), profile.to_owned()),
+        ("rustc-version".to_owned(), rustc_verbose.to_owned()),
+        ("target".to_owned(), target.to_owned()),
+    ];
+    for (key, value) in std::env::vars().filter(|(key, _)| relevant_build_env(key)) {
+        println!("cargo:rerun-if-env-changed={key}");
+        fields.push((format!("env:{key}"), value));
+    }
+    fields.sort();
+    fields.dedup();
+
+    let mut h = Sha3_256::new();
+    h.update(b"bloch-pos/build-environment/v1\0");
+    for (key, value) in &fields {
+        h.update((key.len() as u64).to_le_bytes());
+        h.update(key.as_bytes());
+        h.update((value.len() as u64).to_le_bytes());
+        h.update(value.as_bytes());
+    }
+    (hex(&h.finalize()), fields.len())
+}
+
 
 
 fn main() {
@@ -253,22 +320,34 @@ fn main() {
     // Build inputs that change behaviour and are not source: the compiler, the
     // profile and the target. All three are safe to publish — none of them
     // says anything about the box, its paths or its operator.
-    let rustc_v = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
-        .arg("--version")
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+    let rustc_verbose = Command::new(&rustc)
+        .arg("-vV")
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "unknown".into());
+    let rustc_v = rustc_verbose.lines().next().unwrap_or("unknown");
+    let cargo_verbose = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .args(["--version", "--verbose"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let cargo_v = cargo_verbose.lines().next().unwrap_or("unknown");
+    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "unknown".into());
+    let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".into());
+    let (environment_digest, environment_fields) =
+        build_environment_digest(&rustc_verbose, &cargo_verbose, &profile, &target);
     println!("cargo:rustc-env=BLOCH_BUILD_RUSTC={rustc_v}");
-    println!(
-        "cargo:rustc-env=BLOCH_BUILD_PROFILE={}",
-        std::env::var("PROFILE").unwrap_or_else(|_| "unknown".into())
-    );
-    println!(
-        "cargo:rustc-env=BLOCH_BUILD_TARGET={}",
-        std::env::var("TARGET").unwrap_or_else(|_| "unknown".into())
-    );
+    println!("cargo:rustc-env=BLOCH_BUILD_CARGO={cargo_v}");
+    println!("cargo:rustc-env=BLOCH_BUILD_PROFILE={profile}");
+    println!("cargo:rustc-env=BLOCH_BUILD_TARGET={target}");
+    println!("cargo:rustc-env=BLOCH_BUILD_ENV_DIGEST={environment_digest}");
+    println!("cargo:rustc-env=BLOCH_BUILD_ENV_FIELDS={environment_fields}");
 
     // ── `BLOCH_BUILD_DIRTY` is deliberately NOT stamped ────────────────────
     //

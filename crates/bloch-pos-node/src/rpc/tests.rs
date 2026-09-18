@@ -1526,8 +1526,13 @@ fn getbuildinfo_reports_the_fields_a_partner_compares() {
         "source_files",
         "source_bytes",
         "rustc",
+        "cargo",
         "profile",
         "target",
+        "build_environment_digest",
+        "build_environment_digest_alg",
+        "build_environment_scope",
+        "build_environment_fields",
         "digest_note",
     ] {
         let f = v.get(k).unwrap_or_else(|| panic!("getbuildinfo has no `{k}`"));
@@ -1536,6 +1541,13 @@ fn getbuildinfo_reports_the_fields_a_partner_compares() {
     }
 
     assert_eq!(v.get("source_digest_alg").unwrap().as_str(), Some("sha3-256"));
+    assert_eq!(
+        v.get("build_environment_digest_alg").unwrap().as_str(),
+        Some("sha3-256")
+    );
+    let source_scope = v.get("source_digest_scope").unwrap().as_str().unwrap();
+    assert!(source_scope.contains("macros"));
+    assert!(source_scope.contains("rust-toolchain.toml"));
 
     // `commit_source` is the field that separates evidence from assertion.
     // Anything outside this set means the build script grew a case nobody
@@ -1584,6 +1596,37 @@ fn getbuildinfo_digest_is_computed_not_typed() {
     let bytes: u64 = v.get("source_bytes").unwrap().as_str().unwrap().parse().unwrap();
     assert!(files > 100, "digest scope covers only {files} files — it lost the tree");
     assert!(bytes > 1_000_000, "digest scope covers only {bytes} bytes — it lost the tree");
+}
+
+/// Compiler flags and wrappers are build inputs even though they are not
+/// source. Their values must be comparable without being exposed verbatim.
+#[test]
+fn getbuildinfo_carries_a_bounded_build_environment_fingerprint() {
+    let v = build_info_json();
+    let d = v
+        .get("build_environment_digest")
+        .unwrap()
+        .as_str()
+        .unwrap();
+    assert_eq!(d.len(), 64, "sha3-256 is 64 hex characters, got {d:?}");
+    assert!(
+        d.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "environment digest must be lowercase hex: {d}"
+    );
+    let fields: usize = v
+        .get("build_environment_fields")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(fields >= 4, "compiler, Cargo, profile and target must be bound");
+    let scope = v
+        .get("build_environment_scope")
+        .unwrap()
+        .as_str()
+        .unwrap();
+    assert!(scope.contains("values hashed, not disclosed"));
 }
 
 /// Nothing here is anything an operator would refuse to publish.
