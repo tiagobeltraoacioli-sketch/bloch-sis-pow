@@ -528,9 +528,9 @@ const MAX_TX_SLOT_INDEX: usize = 65_536;
 /// It is NOT a consensus rule and is deliberately not applied to boot replay:
 /// the log is this node's own history, its slots are by construction in the
 /// past, and making replay depend on the wall clock is how a node with a
-/// skewed clock refuses to restart. That exemption is carried by
-/// [`Source::Replay`] — NOT by `live == false`, which is a separate rule
-/// about gossip arriving while this node is still catching up. Tolerance is generous
+/// skewed clock refuses to restart. That exemption is carried by the
+/// dedicated boot-replay path — NOT by `live == false`, which is a separate
+/// rule about gossip arriving while this node is still catching up. Tolerance is generous
 /// because the cost of being wrong is asymmetric — a dropped block is
 /// re-requested by the sync path, and 8 slots is four minutes at the fleet's
 /// 30 s cadence, far more skew than NTP ever leaves.
@@ -543,12 +543,9 @@ const FUTURE_SLOT_TOLERANCE: u64 = 8;
 ///
 /// A producer chose the slot it is proposing for; re-judging its own block
 /// against the clock is how a node refuses to produce when the box is loaded
-/// enough that the two disagree by a few slots. A block coming off this
-/// node's own log was already judged when it first arrived, and the log is
-/// the record of what this node COMMITTED to — re-judging it against a clock
-/// the log knows nothing about is how a node refuses to restart. Every other
-/// gate applies identically to all three: a locally built or replayed block
-/// still has to authenticate and still has to connect.
+/// enough that the two disagree by a few slots. Boot replay has a dedicated
+/// linear path because the log is already the selected canonical chain; that
+/// path still requires exact parent continuity and runs the full transition.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Source {
     /// Arrived over the network, or was promoted out of the orphan pool
@@ -556,13 +553,6 @@ enum Source {
     Gossip,
     /// Built by this node's own `propose`.
     Local,
-    /// Read back out of this node's own block log by the boot replay loop.
-    ///
-    /// Replay is not a second opinion about whether these blocks are
-    /// admissible — they were judged when they first arrived, and the log is
-    /// what this node already committed to. It is the same transition run
-    /// over the same inputs to get back to the same state.
-    Replay,
 }
 
 impl Source {
@@ -580,7 +570,7 @@ impl Source {
     fn bounded_by_wall_clock(self) -> bool {
         match self {
             Source::Gossip => true,
-            Source::Local | Source::Replay => false,
+            Source::Local => false,
         }
     }
 }
@@ -2310,11 +2300,36 @@ impl Engine {
     /// logic — or a log whose head slot simply sits ahead of a fresh box's
     /// clock — and a node would refuse to replay its own FINALIZED log.
     ///
-    /// There is no peer to report to and nothing to relay, so no verdict:
-    /// these blocks are this node's committed history, being re-run through
-    /// the same transition to arrive back at the same state.
-    fn ingest_replay(&mut self, env: BlockEnvelope) {
-        self.ingest_from(env, Source::Replay);
+    /// There is no peer to report to, nothing to relay and no branch to
+    /// choose: `blocks.log` is the already-selected canonical chain. Running
+    /// every prefix through `advance` used to recompute LMD-GHOST over every
+    /// previously decoded block, making cold replay quadratic before useful
+    /// transition work was even counted. Replay now requires the next frame
+    /// to extend the current head and applies it directly through the same
+    /// full consensus transition as live canonical adoption.
+    ///
+    /// `false` is a fail-closed replay refusal. The caller must stop boot; it
+    /// must never continue from a partial durable history.
+    fn ingest_replay(&mut self, env: BlockEnvelope) -> bool {
+        let id = *env.block_id().as_bytes();
+        if env.header.parent != *self.head_id().as_bytes()
+            || self.blocks.contains_key(&id)
+            || self.canonical.contains(&id)
+        {
+            return false;
+        }
+        if !self.apply_canonical(&env) {
+            return false;
+        }
+        // Rebuild the bounded recent proposal window used by live
+        // equivocation detection, but only after the transition authenticated
+        // the proposer. Orphan release and branch pruning are intentionally
+        // absent: a canonical log contains neither collection, and scanning
+        // the growing canonical map to prove that after every frame was the
+        // other quadratic replay cost this path removes.
+        self.observe_proposer_equivocation(&env);
+        self.blocks.insert(id, env);
+        true
     }
 
     /// Ingest `env` and then everything it unblocks.
@@ -2441,10 +2456,10 @@ impl Engine {
         // Gossip only, for the same reason the tolerance below is: this bounds
         // what an UNTRUSTED `slot` can make this node walk, and neither the
         // producer's own proposal (`Source::Local`) nor a block read back out
-        // of this node's own log (`Source::Replay`) is untrusted. Removing the
+        // of this node's own log (the dedicated replay path) is untrusted. Removing the
         // `Local` exemption would refuse the node's own block on a loaded box
-        // — the h28080 shape; removing the `Replay` one would let a skewed
-        // clock stop a node from replaying its own FINALIZED log. And the path
+        // — the h28080 shape; routing replay back through this door would let
+        // a skewed clock stop the node replaying its own FINALIZED log. The path
         // that skips this door is not unguarded: `params::MAX_EPOCH_ADVANCE`
         // is the CONSENSUS ceiling on the same walk and applies to every
         // source.
@@ -2477,8 +2492,8 @@ impl Engine {
         // A slot the clock will never reach is a write into `blocks` that no
         // `advance` will ever consume. Gossip only — boot replay reads this
         // node's own log and must not depend on the wall clock, which is why
-        // it is `Source::Replay` and exempt by SOURCE here, exactly as it is
-        // at the horizon above (see [`FUTURE_SLOT_TOLERANCE`]).
+        // it never enters this gossip/local admission path, exactly as at the
+        // horizon above (see [`FUTURE_SLOT_TOLERANCE`]).
         //
         // `self.live` stays, and it is a rule about GOSSIP during sync, not
         // about replay: a node catching up is fetching blocks that are in the
@@ -5183,8 +5198,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         // committed log, and must not be judged against a wall clock the log
         // knows nothing about. See `Engine::ingest_replay`.
         let expected_id = env.block_id();
-        engine.ingest_replay(env);
-        if engine.state.head() != expected_id {
+        if !engine.ingest_replay(env) || engine.state.head() != expected_id {
             return Err(io::Error::new(io::ErrorKind::InvalidData,
                 "durable block log failed consensus replay; refusing to serve a partial head"));
         }
@@ -8968,7 +8982,7 @@ mod doppelganger_tests {
         // Even an accidentally pre-armed window must not classify disk history
         // as gossip. Keep live=true to test the explicit replay source guard.
         engine.start_doppelganger_observation(0);
-        engine.ingest_replay(block);
+        assert!(engine.ingest_replay(block));
         assert_eq!(engine.state.slot(), 1, "replay must actually accept the block");
         assert!(!engine.doppelganger_halted);
     }
@@ -11650,7 +11664,8 @@ mod ingest_admission_tests {
     }
 
     /// **A node must be able to replay its own log whatever its clock says —
-    /// and that must be true BY SOURCE, not by an accident of ordering.**
+    /// and that must be true by its dedicated path, not by an accident of
+    /// ordering.**
     ///
     /// The two halves are the same envelope, byte for byte, and they must get
     /// opposite answers:
@@ -11670,10 +11685,10 @@ mod ingest_admission_tests {
     /// node's log and its clock usually agree. `live` is set AFTER the replay
     /// loop, and it guards the OTHER check.
     ///
-    /// Mutation check: give replay `Source::Gossip` again (or drop `Replay`
-    /// from `Source::bounded_by_wall_clock`'s exempt arm) and the first half
-    /// fails — the head stays at genesis, the node having refused to replay
-    /// its own log. Drop the `Gossip` arm and the second half fails.
+    /// Mutation check: route replay through `Source::Gossip` again and the
+    /// first half fails — the head stays at genesis, the node having refused
+    /// to replay its own log. Drop the `Gossip` bound and the second half
+    /// fails.
     #[test]
     fn boot_replay_applies_a_block_the_same_node_would_reject_from_gossip() {
         let (mut engine, _dir) = perf_support::proposing_engine();
@@ -11714,11 +11729,11 @@ mod ingest_admission_tests {
         forget(&mut engine);
 
         // ── Half one: the boot path. `live` is false here exactly as it is
-        // during `run`'s replay loop, but the exemption under test is the one
-        // carried by `Source::Replay` — the horizon this block is past is not
+        // during `run`'s replay loop, but the exemption under test is the
+        // dedicated replay path — the horizon this block is past is not
         // guarded by `live` at all.
         engine.live = false;
-        engine.ingest_replay(env.clone());
+        assert!(engine.ingest_replay(env.clone()));
         assert_eq!(
             engine.head_slot_now(),
             far,
@@ -11751,6 +11766,41 @@ mod ingest_admission_tests {
             0,
             "nor move the head"
         );
+    }
+
+    #[test]
+    fn boot_replay_is_linear_canonical_extension_and_fails_closed() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        engine.propose(1);
+        let first = engine.blocks.get(engine.head_id().as_bytes()).unwrap().clone();
+        engine.propose(2);
+        let second = engine.blocks.get(engine.head_id().as_bytes()).unwrap().clone();
+        let final_head = second.block_id();
+        let genesis = engine.manifest.genesis_id();
+
+        engine.state = StateCell::new(engine.manifest.genesis_state());
+        engine.blocks.clear();
+        engine.chain.truncate(1);
+        engine.canonical = BTreeSet::from([*genesis.as_bytes()]);
+        engine.recent_states.clear();
+        engine.finalized_latch = None;
+        engine.live = false;
+
+        assert!(!engine.ingest_replay(second.clone()), "a log gap must stop replay");
+        assert_eq!(engine.state.head(), genesis, "a refused frame must not move state");
+        assert!(engine.blocks.is_empty(), "a refused frame must not become fork-choice input");
+
+        let mut forged = first.clone();
+        forged.proposer_sig[0] ^= 1;
+        assert!(!engine.ingest_replay(forged), "direct replay must retain full signature verification");
+        assert_eq!(engine.state.head(), genesis);
+        assert!(engine.blocks.is_empty());
+
+        assert!(engine.ingest_replay(first));
+        assert!(engine.ingest_replay(second));
+        assert_eq!(engine.state.head(), final_head);
+        assert_eq!(engine.chain.len(), 3);
+        assert_eq!(engine.blocks.len(), 2);
     }
 
     #[test]

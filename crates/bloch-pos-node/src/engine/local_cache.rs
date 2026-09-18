@@ -217,11 +217,11 @@ mod tests {
         assert_eq!(logged[0].block_id(), next.block_id());
         assert_eq!(engine.blocks[first_id.as_bytes()].proposer_sig.as_ptr(), signature_ptr, "cached envelopes must retain their original allocations");
         assert_eq!(*engine.state, *at_cache);
-        engine.ingest_replay(next);
+        assert!(engine.ingest_replay(next));
         assert_eq!(*engine.state, *expected);
         let restored = engine.state.arc();
         reset(&mut engine);
-        for block in full_log { engine.ingest_replay(block); }
+        for block in full_log { assert!(engine.ingest_replay(block)); }
         assert_eq!(*engine.state, *restored, "cached continuation must equal full verified replay");
     }
 
@@ -238,7 +238,7 @@ mod tests {
         assert!(engine.restore_local_cache(&mut logged).is_err());
         assert_eq!(engine.state.slot(), 0);
         assert_eq!(logged.len(), 70, "failed restore must preserve every replay block");
-        for block in logged { engine.ingest_replay(block); }
+        for block in logged { assert!(engine.ingest_replay(block)); }
         assert_eq!(engine.state.slot(), 70);
     }
 

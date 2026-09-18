@@ -448,7 +448,7 @@ fn funded_validator_two_nodes_rehearsal() {
     replay.canonical = BTreeSet::from([*replay.manifest.genesis_id().as_bytes()]);
     replay.keys = None;
     for env in history {
-        replay.ingest_replay(env);
+        assert!(replay.ingest_replay(env));
     }
     assert_eq!(replay.state.state_root(), joiner.state.state_root());
     println!("PAYOUT_CLI_REPLAY_VERIFIED {}", codec::hex(&replay.state.state_root()));
@@ -526,7 +526,7 @@ fn funded_activation_boundary_rehearsal() {
                            crate::codec::encode_envelope(envelope)).unwrap();
         }
     }
-    for envelope in history { replay.ingest_replay(envelope); }
+    for envelope in history { assert!(replay.ingest_replay(envelope)); }
     assert_eq!(replay.head_id(), founder.head_id());
     assert_eq!(replay.state.state_root(), founder.state.state_root());
     assert!(replay.state.is_funded_validator(1));
@@ -554,7 +554,7 @@ fn funded_pre_activation_compatibility_rehearsal() {
         assert!(epoch_of(envelope.header.slot) < activation);
         let root = envelope.header.state_root;
         let slot = envelope.header.slot;
-        replay.ingest_replay(envelope);
+        assert!(replay.ingest_replay(envelope));
         assert_eq!(replay.state.slot(), slot);
         assert_eq!(replay.state.state_root(), root,
                    "unarmed and armed builds must agree below L at slot {slot}");
