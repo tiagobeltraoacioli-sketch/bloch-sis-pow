@@ -227,6 +227,13 @@ const MEMPOOL_MAX: usize = 4_096;
 /// source's worst case to 64 / 4,096 ≈ 1.6% of total mempool capacity.
 const MEMPOOL_MAX_PER_SOURCE: usize = 64;
 
+/// Expensive lifecycle authorization calls allowed for one identity in one
+/// wall slot. The consensus validator performs cheap state/shape checks before
+/// invoking the budgeted verifier. Two calls cover the largest transaction
+/// (four algorithm checks because every authorization is hybrid); a fresh
+/// allowance arrives after 30 seconds.
+const LIFECYCLE_VERIFICATIONS_PER_SOURCE_PER_SLOT: usize = 2;
+
 /// Doppelgänger protection window (R6 HIGH-8, node half): slots this node
 /// observes the network for its OWN validator index attesting or proposing
 /// before it will start duties itself.
@@ -505,12 +512,10 @@ fn tx_tip_rate(tx: &PosTransaction) -> u128 {
 }
 
 /// The spend-authority hash of this transaction's FIRST input — its "source"
-/// for [`MEMPOOL_MAX_PER_SOURCE`] (R7 M6). `None` for a transaction with no
-/// eUTXO inputs (every non-transfer message, and a structurally-empty
-/// transfer `admissible` would refuse anyway), which exempts it from the
-/// per-source cap entirely rather than grouping every such message under one
-/// shared bucket — a bucket that shape would make USELESS as a spam bound
-/// the moment two unrelated staking messages arrived close together.
+/// for [`MEMPOOL_MAX_PER_SOURCE`] (R7 M6). Lifecycle messages use their
+/// validator identity, domain-separated from spend keys. `None` remains only
+/// for legacy staking shapes that admission refuses and structurally-empty
+/// transfers.
 ///
 /// Hashed exactly like every other script-hash site in this codebase
 /// (`Sha3_256::digest(pubkey)`) — see `rpc.rs`'s `validator_json` and this
@@ -527,8 +532,33 @@ fn tx_source_hash(tx: &PosTransaction) -> Option<[u8; 32]> {
             Some(Sha3_256::digest(pk).into())
         }
         PosTransaction::FundedDeposit(tx) => Some(Sha3_256::digest(&tx.funding_pubkey).into()),
+        PosTransaction::ExitV2 { pubkey_hash, .. } =>
+            Some(lifecycle_source_hash(b"exit", pubkey_hash)),
+        PosTransaction::Withdraw { validator }
+        | PosTransaction::RandaoRecommit { validator, .. } =>
+            Some(validator_lifecycle_source(*validator)),
+        PosTransaction::SlashingEvidence(evidence) => {
+            let validator = match evidence {
+                bloch_pos_committee::interfaces::SlashingEvidence::AttestationOffence { first, .. } => first.validator,
+                bloch_pos_committee::interfaces::SlashingEvidence::ProposerEquivocation { first, .. } => first.header.proposer_index,
+            };
+            Some(validator_lifecycle_source(validator))
+        }
         _ => None,
     }
+}
+
+fn lifecycle_source_hash(domain: &[u8], identity: &[u8]) -> [u8; 32] {
+    let mut h = Sha3_256::new();
+    h.update(b"bloch/mempool/lifecycle-source/v1");
+    h.update((domain.len() as u64).to_le_bytes());
+    h.update(domain);
+    h.update(identity);
+    h.finalize().into()
+}
+
+fn validator_lifecycle_source(validator: u32) -> [u8; 32] {
+    lifecycle_source_hash(b"validator-index", &validator.to_le_bytes())
 }
 
 /// The canonical committed state, plus the memo of epoch-rolled copies of it.
@@ -1214,9 +1244,9 @@ struct ForkChoiceInputs {
 
 /// Why a transaction was turned away at the door.
 ///
-/// The distinction is load-bearing, not cosmetic: three of these mean "ask me
-/// again in a moment" and one means "these bytes will never be admitted,
-/// stop sending them". Collapsing them into one RPC code is how an operator
+/// The distinction is load-bearing, not cosmetic: some mean "ask me again in
+/// a moment" and `Invalid` means "these bytes will never be admitted, stop
+/// sending them". Collapsing them into one RPC code is how an operator
 /// ends up growing the mempool to fix a bad signature — or, the way it
 /// actually happened, how an exchange told "never resubmit after -32008"
 /// writes off transactions that a self-lifting bar would have admitted an
@@ -1253,6 +1283,9 @@ enum Refusal {
     /// transactions to clear", not "retry later" (which reads as "the whole
     /// network is busy") and not "these bytes are invalid" (they are not).
     TooManyFromSource,
+    /// This validator identity consumed its hybrid-verification allowance for
+    /// the wall slot. The caller may retry when the next slot starts.
+    LifecycleVerificationLimited { until_slot: u64 },
 }
 
 impl Refusal {
@@ -1267,6 +1300,9 @@ impl Refusal {
             }
             Refusal::TooManyFromSource => {
                 "this source already has MEMPOOL_MAX_PER_SOURCE transactions pending"
+            }
+            Refusal::LifecycleVerificationLimited { .. } => {
+                "lifecycle authorization verification allowance is exhausted for this slot"
             }
         }
     }
@@ -4234,7 +4270,7 @@ impl Engine {
 
             RpcRequest::SendRawTransaction(tx) => match self.on_transaction(tx.clone()) {
                 Ok(outcome) => Ok(rpc::submitted_json(&tx, outcome)),
-                // The three refusals are not the same fact and must not
+                // The refusals are not the same fact and must not
                 // carry the same advice, and each has its own code:
                 // MEMPOOL_FULL (-32003), TX_REFUSED_RETRYABLE (-32009),
                 // TX_REFUSED (-32008). "Retry later" is correct for a full
@@ -4304,6 +4340,12 @@ impl Engine {
                         MEMPOOL_MAX_PER_SOURCE,
                     ),
                 )),
+                Err(Refusal::LifecycleVerificationLimited { until_slot }) =>
+                    Err(RpcError::tx_refused_retryable(
+                        until_slot,
+                        format!("lifecycle authorization verification allowance is exhausted for \
+                                 this validator identity; retry from slot {until_slot}"),
+                    )),
             },
 
             // Identity of the binary, not of the chain: no state read, no
@@ -5669,8 +5711,12 @@ fn admissible_with_verifier(tx: &PosTransaction, wall_epoch: u64, verifier: &dyn
                 return Err("funded validator admission is not active: FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH is unarmed or not reached");
             }
             if wall_epoch > deposit.valid_until_epoch { return Err("funded deposit has expired"); }
-            deposit.verify_authorizations(verifier)
-                .map_err(|_| "invalid funded deposit shape or hybrid PQ authorization")
+            // Shape only here. The state-aware lifecycle door resolves and
+            // prices committed funding before its budgeted verifier checks
+            // both authorizations. Verifying here as well used to charge four
+            // hybrid calls per valid deposit and left the first two unbounded.
+            deposit.validate_shape()
+                .map_err(|_| "invalid funded deposit shape")
         }
 
         // Staking messages are refused outright until bonding is funded from

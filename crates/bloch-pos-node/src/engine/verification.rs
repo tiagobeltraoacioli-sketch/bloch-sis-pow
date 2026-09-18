@@ -32,10 +32,8 @@ impl<V> GossipVerifier<V> {
     pub(super) fn new(verifier: V) -> Self {
         Self { verifier, failures: RefCell::new(Failures::default()) }
     }
-}
 
-impl<V: SignatureVerifier> SignatureVerifier for GossipVerifier<V> {
-    fn verify_with_key(&self, pubkey: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
+    fn failure_key(pubkey: &[u8], root: &[u8; 32], signature: &[u8]) -> [u8; 32] {
         let mut hash = Sha3_256::new();
         hash.update(b"bloch-node-gossip-invalid-signature-v1");
         hash.update((pubkey.len() as u64).to_le_bytes());
@@ -43,7 +41,23 @@ impl<V: SignatureVerifier> SignatureVerifier for GossipVerifier<V> {
         hash.update(root);
         hash.update((signature.len() as u64).to_le_bytes());
         hash.update(signature);
-        let key: [u8; 32] = hash.finalize().into();
+        hash.finalize().into()
+    }
+
+    pub(super) fn is_known_failure(
+        &self,
+        pubkey: &[u8],
+        root: &[u8; 32],
+        signature: &[u8],
+    ) -> bool {
+        let key = Self::failure_key(pubkey, root, signature);
+        self.failures.borrow().known.contains(&key)
+    }
+}
+
+impl<V: SignatureVerifier> SignatureVerifier for GossipVerifier<V> {
+    fn verify_with_key(&self, pubkey: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
+        let key = Self::failure_key(pubkey, root, signature);
         if self.failures.borrow().known.contains(&key) {
             return false;
         }

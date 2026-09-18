@@ -32,19 +32,116 @@ fn is_lifecycle(tx: &PosTransaction) -> bool {
     )
 }
 
+/// Delegates only cryptographic calls that survive consensus' cheap-first
+/// lifecycle checks. The budget lives at this seam so random identities that
+/// fail lookup do not consume it and valid messages do not clone state twice.
+struct LifecycleAdmissionVerifier<'a, V> {
+    inner: &'a verification::GossipVerifier<V>,
+    mempool: std::cell::RefCell<&'a mut admission::Mempool>,
+    source: Option<[u8; 32]>,
+    wall_slot: u64,
+    limited: std::cell::Cell<bool>,
+}
+
+impl<V: SignatureVerifier> SignatureVerifier for LifecycleAdmissionVerifier<'_, V> {
+    fn verify_with_key(&self, public_key: &[u8], message: &[u8; 32], signature: &[u8]) -> bool {
+        // Exact immutable failures are already cheap and must not let a replay
+        // consume the allowance that exists to bound actual cryptography.
+        if self.inner.is_known_failure(public_key, message, signature) {
+            return false;
+        }
+        if let Some(source) = self.source {
+            if !self.mempool.borrow_mut().reserve_lifecycle_verification(source, self.wall_slot) {
+                self.limited.set(true);
+                return false;
+            }
+        }
+        self.inner.verify_with_key(public_key, message, signature)
+    }
+}
+
+#[cfg(test)]
+mod verification_budget_tests {
+    use super::*;
+
+    struct Counting(std::rc::Rc<std::cell::Cell<usize>>);
+    impl SignatureVerifier for Counting {
+        fn verify_with_key(&self, _: &[u8], _: &[u8; 32], _: &[u8]) -> bool {
+            self.0.set(self.0.get() + 1);
+            false
+        }
+    }
+
+    #[test]
+    fn wrapper_stops_before_crypto_and_reopens_on_the_next_slot() {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let inner = verification::GossipVerifier::new(Counting(calls.clone()));
+        let mut mempool = admission::Mempool::default();
+        let source = validator_lifecycle_source(3);
+        {
+            let verifier = LifecycleAdmissionVerifier {
+                inner: &inner, mempool: std::cell::RefCell::new(&mut mempool),
+                source: Some(source), wall_slot: 10, limited: std::cell::Cell::new(false),
+            };
+            assert!(!verifier.verify_with_key(&[], &[0; 32], &[1]));
+            // An exact replay hits the failure cache and consumes no budget.
+            assert!(!verifier.verify_with_key(&[], &[0; 32], &[1]));
+            assert!(!verifier.verify_with_key(&[], &[0; 32], &[2]));
+            assert!(!verifier.verify_with_key(&[], &[0; 32], &[3]));
+            assert!(verifier.limited.get());
+        }
+        assert_eq!(calls.get(), LIFECYCLE_VERIFICATIONS_PER_SOURCE_PER_SLOT);
+        let verifier = LifecycleAdmissionVerifier {
+            inner: &inner, mempool: std::cell::RefCell::new(&mut mempool),
+            source: Some(source), wall_slot: 11, limited: std::cell::Cell::new(false),
+        };
+        assert!(!verifier.verify_with_key(&[], &[0; 32], &[4]));
+        assert_eq!(calls.get(), LIFECYCLE_VERIFICATIONS_PER_SOURCE_PER_SLOT + 1);
+    }
+}
+
 impl Engine {
-    pub(super) fn validate_lifecycle_admission(&self, tx: &PosTransaction) -> Result<(), Refusal> {
+    pub(super) fn validate_lifecycle_admission(&mut self, tx: &PosTransaction) -> Result<(), Refusal> {
         if !is_lifecycle(tx) {
             return Ok(());
         }
-        self.state
-            .validate_lifecycle_transaction(
-                tx,
-                self.state.active_validators().iter().map(|v| u128::from(v.effective_stake)).sum(),
-                self.state.next_base_fee(),
-                &self.gossip_verifier,
-            )
-            .map_err(|_| Refusal::Invalid("lifecycle transaction fails committed-state validation"))
+        let total = self.state.active_validators().iter()
+            .map(|v| u128::from(v.effective_stake)).sum();
+        let fee = self.state.next_base_fee();
+        let wall_slot = self.wall_slot();
+        let source = self.lifecycle_verification_source(tx);
+        let verifier = LifecycleAdmissionVerifier {
+            inner: &self.gossip_verifier,
+            mempool: std::cell::RefCell::new(&mut self.mempool),
+            source, wall_slot, limited: std::cell::Cell::new(false),
+        };
+        let verdict = self.state.validate_lifecycle_transaction(tx, total, fee, &verifier);
+        if verifier.limited.get() {
+            return Err(Refusal::LifecycleVerificationLimited {
+                until_slot: wall_slot.saturating_add(1),
+            });
+        }
+        verdict.map_err(|_| Refusal::Invalid("lifecycle transaction fails committed-state validation"))
+    }
+
+    fn lifecycle_verification_source(&self, tx: &PosTransaction) -> Option<[u8; 32]> {
+        match tx {
+            PosTransaction::FundedDeposit(deposit) =>
+                Some(lifecycle_source_hash(b"funding-key", &deposit.funding_pubkey)),
+            PosTransaction::ExitV2 { pubkey_hash, .. } => self.state
+                .validator_index_by_hash(pubkey_hash).map(validator_lifecycle_source),
+            PosTransaction::RandaoRecommit { validator, .. } =>
+                Some(validator_lifecycle_source(*validator)),
+            PosTransaction::SlashingEvidence(evidence) => {
+                let validator = match evidence {
+                    SlashingEvidence::AttestationOffence { first, .. } => first.validator,
+                    SlashingEvidence::ProposerEquivocation { first, .. } => first.header.proposer_index,
+                };
+                Some(validator_lifecycle_source(validator))
+            }
+            PosTransaction::Withdraw { .. } => None,
+            _ => None,
+        }
     }
 
     /// Reserve funded inputs against every pending spend and reserve the

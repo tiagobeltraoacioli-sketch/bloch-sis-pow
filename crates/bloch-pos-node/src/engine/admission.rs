@@ -12,6 +12,8 @@ pub(super) struct Mempool {
     identities: BTreeMap<[u8; 32], usize>,
     sources: BTreeMap<[u8; 32], usize>,
     bytes: usize,
+    lifecycle_verification_slot: Option<u64>,
+    lifecycle_verifications: BTreeMap<[u8; 32], usize>,
 }
 impl std::ops::Deref for Mempool {
     type Target = BTreeMap<Vec<u8>, PosTransaction>;
@@ -35,6 +37,16 @@ impl Mempool {
     }
     pub(super) fn source_count(&self, source: &[u8; 32]) -> usize {
         self.sources.get(source).copied().unwrap_or(0)
+    }
+    pub(super) fn reserve_lifecycle_verification(&mut self, source: [u8; 32], wall_slot: u64) -> bool {
+        if self.lifecycle_verification_slot != Some(wall_slot) {
+            self.lifecycle_verification_slot = Some(wall_slot);
+            self.lifecycle_verifications.clear();
+        }
+        let used = self.lifecycle_verifications.entry(source).or_default();
+        if *used >= LIFECYCLE_VERIFICATIONS_PER_SOURCE_PER_SLOT { return false; }
+        *used = used.saturating_add(1);
+        true
     }
     pub(super) fn insert(&mut self, key: Vec<u8>, tx: PosTransaction) -> Option<PosTransaction> {
         let old = self.remove(&key);
@@ -71,6 +83,40 @@ impl Mempool {
     #[cfg(test)]
     pub(super) fn clear(&mut self) {
         *self = Self::default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_verification_budget_is_per_source_and_renews_each_slot() {
+        let mut pool = Mempool::default();
+        let first = validator_lifecycle_source(7);
+        let second = validator_lifecycle_source(8);
+        for _ in 0..LIFECYCLE_VERIFICATIONS_PER_SOURCE_PER_SLOT {
+            assert!(pool.reserve_lifecycle_verification(first, 100));
+        }
+        assert!(!pool.reserve_lifecycle_verification(first, 100));
+        assert!(pool.reserve_lifecycle_verification(second, 100));
+        assert!(pool.reserve_lifecycle_verification(first, 101));
+    }
+
+    #[test]
+    fn lifecycle_mempool_sources_bind_identity_not_witness_bytes() {
+        let a = PosTransaction::ExitV2 { pubkey_hash: [0x31; 32], epoch: 9, signature: vec![1] };
+        let b = PosTransaction::ExitV2 { pubkey_hash: [0x31; 32], epoch: 9, signature: vec![2, 3] };
+        assert_eq!(tx_source_hash(&a), tx_source_hash(&b));
+        assert_ne!(tx_source_hash(&a), tx_source_hash(&PosTransaction::ExitV2 {
+            pubkey_hash: [0x32; 32], epoch: 9, signature: vec![1],
+        }));
+        assert_eq!(
+            tx_source_hash(&PosTransaction::Withdraw { validator: 7 }),
+            tx_source_hash(&PosTransaction::RandaoRecommit {
+                validator: 7, epoch: 9, new_commitment: [0x44; 32], signature: vec![5],
+            }),
+        );
     }
 }
 fn decrement(map: &mut BTreeMap<[u8; 32], usize>, key: [u8; 32]) {
