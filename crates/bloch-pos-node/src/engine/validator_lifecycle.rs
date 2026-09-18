@@ -189,6 +189,14 @@ impl Engine {
             .retain(|key| self.mempool.contains_key(key));
     }
 
+    fn evidence_admitted_log(offender: u32) -> String {
+        format!(
+            "slashing evidence against v{offender} admitted and broadcast; the observer earns no \
+             protocol reward, and only the proposer of a block that includes the evidence may \
+             receive the whistleblower credit"
+        )
+    }
+
     pub(super) fn report_equivocation(&mut self, evidence: SlashingEvidence) {
         let offender = match &evidence {
             SlashingEvidence::AttestationOffence { first, .. } => first.validator,
@@ -196,7 +204,7 @@ impl Engine {
         };
         crate::metrics::NodeMetrics::inc(&crate::metrics::NODE.equivocations_observed_total);
         match self.on_transaction(PosTransaction::SlashingEvidence(evidence)) {
-            Ok(_) => eprintln!("slashing evidence against v{offender} admitted and broadcast"),
+            Ok(_) => eprintln!("{}", Self::evidence_admitted_log(offender)),
             Err(reason) => {
                 eprintln!("slashing evidence against v{offender} not submitted: {reason:?}")
             }
@@ -309,5 +317,18 @@ impl Engine {
                 eprintln!("validator lifecycle action for v{index} deferred: {reason:?}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod audit_reward_attribution_tests {
+    use super::Engine;
+
+    #[test]
+    fn evidence_submission_log_does_not_promise_the_observer_a_reward() {
+        let message = Engine::evidence_admitted_log(7);
+        assert!(message.contains("v7 admitted and broadcast"));
+        assert!(message.contains("observer earns no protocol reward"));
+        assert!(message.contains("proposer of a block that includes the evidence"));
     }
 }
