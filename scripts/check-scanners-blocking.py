@@ -38,6 +38,8 @@ security job, fails if the job:
   * conditionally skips execution through `if`, `rules`, `only`, `except`,
     GitLab inheritance, a YAML alias/reference, a GitHub reusable-workflow
     delegation, or a `when` other than `on_success`/`always`.
+  * moves GitLab pipeline selection or configuration behind top-level
+    `workflow:` / `include:` content this local guard does not inspect.
 
 It does NOT require every job to be blocking. cargo-geiger, miri and the fuzz
 smoke are deliberately report-only, with written reasons, and stay green here.
@@ -135,6 +137,13 @@ def check_file(path: str, required: dict[str, str], indent: int, label: str) -> 
     text = open(path, encoding="utf-8").read()
     blocks = job_blocks(text, indent)
     problems: list[str] = []
+    if label == ".gitlab-ci.yml":
+        for line in text.splitlines():
+            if re.match(r"^(?:include|workflow):(?:\s|$)", line):
+                key = line.split(":", 1)[0]
+                problems.append(
+                    "%s: top-level `%s:` moves pipeline semantics outside the "
+                    "locally inspectable blocking subset" % (label, key))
     for job, why in sorted(required.items()):
         if job not in blocks:
             problems.append(

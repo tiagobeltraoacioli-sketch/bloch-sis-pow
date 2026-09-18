@@ -303,6 +303,14 @@ CASES = [
              "  cargo-deny:\n    runs-on: ubuntu-latest\n    steps: *scanner-steps"),
          must_fail=True, expect="YAML alias or GitLab reference"),
 
+    Case("GitLab external include is outside the local proof",
+         "include: https://example.invalid/security.yml\n\n" + GOOD_GITLAB,
+         GOOD_GITHUB, must_fail=True, expect="top-level `include:`"),
+
+    Case("GitLab workflow rules cannot skip every required job",
+         "workflow:\n  rules:\n    - when: never\n\n" + GOOD_GITLAB,
+         GOOD_GITHUB, must_fail=True, expect="top-level `workflow:`"),
+
     Case("or-true masks a scanner verdict",
          GOOD_GITLAB.replace("cargo audit --deny warnings", "cargo audit --deny warnings || true"),
          GOOD_GITHUB, must_fail=True, expect="shell-success masking"),
