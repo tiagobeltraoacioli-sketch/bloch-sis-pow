@@ -55,6 +55,9 @@ construction change.
 The [Wave 49 integration checkpoint](WAVE-49-INTEGRATION.md) combines the
 release, CI, block-log recovery and vault work, including independent review
 findings and the remaining launch blockers.
+Wave 50 removes the simultaneous raw whole-log boot copy via
+[streaming block-log decode](WAVE-50-EN23.md). Decoded history, quadratic cold
+replay, retention growth and production-scale recovery qualification remain.
 
 ## Scope and source reconciliation
 

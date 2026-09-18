@@ -10,10 +10,12 @@ before any envelope is moved. If both candidates fail, the genesis engine and
 complete input log remain available for full replay.
 
 This removes one simultaneous deep copy of the cached prefix's signature,
-transaction and attestation buffers. It does not make startup constant-memory:
-`Store::read_all` still reads the entire log, the engine retains its canonical
-block history, and the drained vector can retain its original allocation until
-replay consumes it. The existing replay benchmark uses the same move/tail path.
+transaction and attestation buffers. Wave 50 additionally changed
+`Store::read_all` to decode one bounded frame at a time instead of retaining the
+complete raw log beside the decoded envelopes. It does not make startup
+constant-memory: the engine still retains decoded canonical block history, and
+the drained vector can retain its original allocation until replay consumes it.
+The existing replay benchmark uses the same move/tail path.
 
 Cache serialization now borrows every committed-state field and serializes
 unspent outputs directly as an ordered sequence. It no longer clones the state
