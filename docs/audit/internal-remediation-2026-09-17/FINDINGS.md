@@ -4,7 +4,7 @@ Audited source: `562e220`. Remediation base: `b066e3c`. Branch: `fix/internal-au
 
 All 200 findings are retained, including duplicates. IMPLEMENTED means code changed in this branch, not deployed, externally audited, or universally resolved on the live fleet. PARTIAL is not closure. No production binary was published.
 
-IMPLEMENTED: 71, PARTIAL: 95, UNARMED CANDIDATE: 10, PROTOCOL DECISION: 4, BASE CHANGED: 7, OPEN: 10, REFUTED IN AUDIT: 1, VERIFIED POSITIVE: 2.
+IMPLEMENTED: 71, PARTIAL: 95, UNARMED CANDIDATE: 11, PROTOCOL DECISION: 4, BASE CHANGED: 7, OPEN: 9, REFUTED IN AUDIT: 1, VERIFIED POSITIVE: 2.
 
 | Finding | Status | Evidence / remaining work | Original title |
 |---|---|---|---|
@@ -133,7 +133,7 @@ IMPLEMENTED: 71, PARTIAL: 95, UNARMED CANDIDATE: 10, PROTOCOL DECISION: 4, BASE 
 | NET-17 | IMPLEMENTED | 8 MiB encoded page budget; first frame allowed for progress, frame cap still applies. | Devnet page has a block-count cap but no byte cap (unlike libp2p) |
 | NET-19 | IMPLEMENTED | Private atomic fsynced identity-file creation under the existing node directory lock. | libp2p identity file is written non-atomically with the default umask before `chmod 0600`, and the chmod result is ignored |
 | NET-20 | PARTIAL | Producer uses actual codec bytes plus current signer maximum before watermark/signing, retaining a deterministic attestation prefix below the gossip ceiling. Exact boundary and real transport payload tests pass. Incoming/historical oversized-block compatibility remains unresolved. | Frame-cliff vs consensus caps on the production transport |
-| SR-01 | OPEN | Not closed by this bundle. Requires dedicated implementation, protocol design, external operational evidence or product-owner integration; original finding remains tracked. | Genesis cohort is bound by neither the state root nor the genesis block id (only by the 32-bit `network_id`) |
+| SR-01 | UNARMED CANDIDATE | The unpublished BPOSMAN2 candidate now folds the canonical manifest digest into its genesis mix, binding cohort membership and all other encoded network parameters into both the genesis block id and opening state root. Published BPOSMAN1 identity remains byte-frozen. Ceremony-tool reconciliation, independent review, an explicit network launch decision and publication of a new manifest remain required; no live network changed. See WAVE-47-SR01-GENESIS-COHORT-BINDING.md. | Genesis cohort is bound by neither the state root nor the genesis block id (only by the 32-bit `network_id`) |
 | SR-04 | IMPLEMENTED | ws-verify enforces the boot arrangement window and refuses duplicate keys. | `ws-verify` diverges from the booting node: it omits the `arrangement_window` lower bound and carries stale duplicate-key text |
 | SR-05 | PARTIAL | Full checkpoint retained and state root rechecked on canonical live apply/reorg before finality processing; conflicting evidence exits78. Missing/noncanonical evidence stays pending. Historical validator-set roots remain unverified. | A checkpoint's `state_root` / `validator_set_root` are never validated against the block they name, on either side |
 | SR-06 | IMPLEMENTED | `single_derivation_path` now recursively scans all 29 Rust sources under `src/`, including nested transition modules, and normalizes whitespace before checking construction/impl/alias evasions. A regression pins nested coverage and spacing variants; production identity bytes are unchanged. | `single_derivation_path` has scan blind spots (currently clean) |
