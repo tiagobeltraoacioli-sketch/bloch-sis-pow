@@ -200,6 +200,85 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+/// Whether the local committed head is stale enough that validator duties
+/// must stop and the sync path must run first.
+///
+/// A one-slot gap is normal: at the start of wall slot `s`, the newest block
+/// can only be from `s - 1`. A larger gap alone is not enough either — an
+/// honest chain can have empty slots. Requiring two slots without canonical
+/// progress preserves that recovery path while refusing to manufacture a
+/// duty view by rolling an actually stale head across epochs.
+fn node_is_behind(
+    head_slot: u64,
+    wall_slot: u64,
+    now_ms: u64,
+    last_applied_ms: u64,
+    stale_after_ms: u64,
+) -> bool {
+    head_slot.saturating_add(1) < wall_slot
+        && now_ms.saturating_sub(last_applied_ms) > stale_after_ms
+}
+
+/// A bounded stale-head quarantine for the slot loop.
+///
+/// Once the ordinary lag heuristic fires, a fresh block must not immediately
+/// make duties eligible while a multi-page catch-up is still in progress:
+/// `last_applied_ms` becomes fresh after the *first* page, not after the node
+/// reaches the tip. This guard remembers the wall tip we were trying to reach
+/// and extends its quarantine whenever canonical progress arrives.
+///
+/// The timeout is equally important. Slot numbers may be skipped legitimately;
+/// without an end-of-sync marker from both transports, requiring the head to
+/// reach `wall - 1` forever would make two empty slots halt every validator.
+/// After one quiet window the guard permits recovery duties and waits one more
+/// window before another stale-head probe can quarantine them again.
+#[derive(Default)]
+struct DutySyncGate {
+    target_slot: Option<u64>,
+    observed_head: u64,
+    last_progress_ms: u64,
+    retry_after_ms: u64,
+}
+
+impl DutySyncGate {
+    fn update(
+        &mut self,
+        behind: bool,
+        head_slot: u64,
+        wall_slot: u64,
+        now_ms: u64,
+        quiet_window_ms: u64,
+    ) -> bool {
+        if let Some(target) = self.target_slot {
+            if head_slot >= target {
+                self.target_slot = None;
+            } else if head_slot > self.observed_head {
+                self.observed_head = head_slot;
+                self.last_progress_ms = now_ms;
+            } else if now_ms.saturating_sub(self.last_progress_ms) > quiet_window_ms {
+                self.target_slot = None;
+                self.retry_after_ms = now_ms.saturating_add(quiet_window_ms);
+            }
+        }
+
+        if self.target_slot.is_none() && behind && now_ms >= self.retry_after_ms {
+            self.target_slot = Some(wall_slot.saturating_sub(1));
+            self.observed_head = head_slot;
+            self.last_progress_ms = now_ms;
+        }
+        self.target_slot.is_some()
+    }
+}
+
+/// One gate for every local signing path driven by the slot loop.
+///
+/// Keeping the decision outside `attest`/`propose` is intentional: neither
+/// method may call `rolled_to` (or consume a
+/// slashing-protection watermark) until this predicate has passed.
+fn validator_duties_blocked(in_boot_grace: bool, stale_head_quarantined: bool) -> bool {
+    in_boot_grace || stale_head_quarantined
+}
+
 const NO_TXS: [PosTransaction; 0] = [];
 
 /// Ceiling on mempool entries. Past this, [`Engine::on_transaction`] evicts
@@ -1737,10 +1816,10 @@ impl Engine {
         &self,
         metrics: &crate::metrics::NodeMetrics,
         slot: u64,
-        in_boot_grace: bool,
+        duties_blocked: bool,
     ) {
         let epoch = epoch_of(slot);
-        let eligible = !in_boot_grace && !self.doppelganger_blocks_duties(slot)
+        let eligible = !duties_blocked && !self.doppelganger_blocks_duties(slot)
             && self.duty_index(&self.state)
                 .and_then(|index| self.state.validator_record(index))
                 .is_some_and(|record| record.activation_epoch <= epoch && epoch < record.exit_epoch);
@@ -5271,6 +5350,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let mut last_attested: u64 = engine.state.slot();
     let mut last_built: u64 = engine.state.slot();
     let mut last_sync_req: u64 = 0;
+    let mut duty_sync_gate = DutySyncGate::default();
 
     // Metrics baseline (C-R6-2). The finality clock starts NOW: replay stamps
     // nothing (it re-finalizes the past), and a `last_finality_advance_unix`
@@ -5337,6 +5417,45 @@ pub fn run(cfg: Config) -> io::Result<()> {
         // duties, so a restarted proposer does not build on a stale head.
         let in_grace = now.saturating_sub(engine.booted_ms) < two_slots_ms;
 
+        // Decide freshness BEFORE any duty can roll the local state forward.
+        // `rolled_to` is only a deterministic view of THIS head; it cannot
+        // invent the RANDAO mix, registry or finality changes in blocks this
+        // node has not received. Signing from that artificial view both
+        // emits invalid work and consumes slash-protection watermarks that a
+        // later correct duty needs. The stateful gate below also survives the
+        // first successful sync page, whose fresh timestamp alone would make
+        // the stateless `behind` heuristic briefly false during catch-up.
+        let behind = node_is_behind(
+            engine.state.slot(),
+            slot,
+            now,
+            engine.last_applied_ms,
+            two_slots_ms,
+        );
+        let sync_needed = behind || engine.needs_sync;
+        let stale_head_quarantined = duty_sync_gate.update(
+            behind,
+            engine.state.slot(),
+            slot,
+            now,
+            two_slots_ms,
+        );
+        let duties_blocked =
+            validator_duties_blocked(in_grace, stale_head_quarantined);
+
+        // Ask for the missing history before considering local signatures.
+        // Rate-limited; idempotent on the receiving side (dedup discards
+        // repeats). The duty gate was settled above before the request latch
+        // can be cleared, so requesting sync cannot accidentally enable the
+        // duties immediately below it.
+        if sync_needed && now.saturating_sub(last_sync_req) > two_slots_ms {
+            engine
+                .net
+                .broadcast(net::get_blocks_frame(engine.sync_after_slot()));
+            engine.needs_sync = false;
+            last_sync_req = now;
+        }
+
         // `slot` here IS `wall_slot()` — same expression, computed once per
         // turn above. It is what reaches the slashing-protection watermark, so
         // "refuse unless the slot exceeds the watermark" is literally "refuse
@@ -5348,27 +5467,15 @@ pub fn run(cfg: Config) -> io::Result<()> {
         // this function's stack — a restart forgets them entirely. They stop
         // duplicate work within one run; `slashprot` is what stops a second
         // signature across runs and across processes.
-        if !in_grace && slot > last_attested {
+        if !duties_blocked && slot > last_attested {
             engine.maintain_validator_lifecycle(wall_epoch);
             engine.attest(slot);
             last_attested = slot;
         }
         let propose_at = slot_start.saturating_add(slot_ms / 3); // a deadline
-        if !in_grace && now >= propose_at && slot > last_built {
+        if !duties_blocked && now >= propose_at && slot > last_built {
             engine.propose(slot);
             last_built = slot;
-        }
-
-        // Sync when behind or when a stored branch has holes. Rate-limited;
-        // idempotent on the receiving side (dedup discards repeats).
-        let behind = engine.state.slot().saturating_add(1) < slot
-            && now.saturating_sub(engine.last_applied_ms) > two_slots_ms;
-        if (behind || engine.needs_sync) && now.saturating_sub(last_sync_req) > two_slots_ms {
-            engine
-                .net
-                .broadcast(net::get_blocks_frame(engine.sync_after_slot()));
-            engine.needs_sync = false;
-            last_sync_req = now;
         }
 
         // ── Metrics turn (C-R6-2): pure exports of state already computed ──
@@ -5378,7 +5485,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         {
             use crate::metrics::{NodeMetrics, NODE};
             let head = engine.state.slot();
-            engine.refresh_validator_activity(&NODE, slot, in_grace);
+            engine.refresh_validator_activity(&NODE, slot, duties_blocked);
             NodeMetrics::set(&NODE.heartbeat_unix, crate::metrics::now_unix());
             NodeMetrics::set(&NODE.head_slot, head);
             NodeMetrics::set(&NODE.wall_slot, slot);
@@ -5387,7 +5494,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
             NodeMetrics::set(&NODE.finalized_epoch, fin.finalized.epoch);
             NodeMetrics::set(&NODE.justified_epoch, fin.justified.epoch);
             NodeMetrics::set(&NODE.mempool_size, engine.mempool.len() as u64);
-            NodeMetrics::set(&NODE.is_syncing, u64::from(behind || engine.needs_sync));
+            NodeMetrics::set(
+                &NODE.is_syncing,
+                u64::from(sync_needed || stale_head_quarantined),
+            );
             let (devnet_peers, p2p_peers) = engine.net.peer_counts();
             NodeMetrics::set(
                 &NODE.peer_count,
@@ -12017,5 +12127,63 @@ mod validator_activity_tests {
         assert!(engine.doppelganger_halted);
         engine.refresh_validator_activity(&metrics, 1000, false);
         assert_eq!(value(), 0, "a detected duplicate must remain visibly halted");
+    }
+}
+
+#[cfg(test)]
+mod stale_head_duty_gate_tests {
+    use super::*;
+
+    #[test]
+    fn a_normal_one_slot_head_gap_does_not_block_duties() {
+        assert!(!node_is_behind(99, 100, 50_000, 0, 20_000));
+        assert!(!validator_duties_blocked(false, false));
+    }
+
+    #[test]
+    fn distance_without_a_stalled_head_does_not_claim_sync_lag() {
+        assert!(!node_is_behind(90, 100, 50_000, 40_000, 20_000));
+        assert!(!node_is_behind(90, 100, 50_000, 30_000, 20_000));
+    }
+
+    #[test]
+    fn a_stalled_distant_head_blocks_every_slot_loop_duty() {
+        let behind = node_is_behind(90, 100, 50_001, 30_000, 20_000);
+        assert!(behind);
+        let mut gate = DutySyncGate::default();
+        assert!(gate.update(behind, 90, 100, 50_001, 20_000));
+        assert!(validator_duties_blocked(false, true));
+    }
+
+    #[test]
+    fn boot_grace_uses_the_same_final_gate() {
+        assert!(validator_duties_blocked(true, false));
+    }
+
+    #[test]
+    fn first_sync_progress_does_not_reenable_stale_duties() {
+        let mut gate = DutySyncGate::default();
+        assert!(gate.update(true, 10, 100, 1_000, 20_000));
+        // Applying the first page refreshes `last_applied_ms`, making the
+        // outer `behind` heuristic false. The remembered target still blocks.
+        assert!(gate.update(false, 42, 100, 2_000, 20_000));
+        assert!(gate.update(false, 98, 100, 3_000, 20_000));
+        assert!(!gate.update(false, 99, 100, 3_001, 20_000));
+    }
+
+    #[test]
+    fn quiet_sparse_chain_escapes_quarantine_with_a_retry_cooldown() {
+        let mut gate = DutySyncGate::default();
+        assert!(gate.update(true, 10, 100, 1_000, 20_000));
+        assert!(!gate.update(true, 10, 101, 21_001, 20_000));
+        // Still behind, but do not immediately re-arm and create a permanent
+        // halt when the missing slots were genuinely empty.
+        assert!(!gate.update(true, 10, 101, 30_000, 20_000));
+        assert!(gate.update(true, 10, 102, 41_001, 20_000));
+    }
+
+    #[test]
+    fn clock_regression_cannot_fabricate_elapsed_staleness() {
+        assert!(!node_is_behind(1, 100, 10, 20, 1));
     }
 }
