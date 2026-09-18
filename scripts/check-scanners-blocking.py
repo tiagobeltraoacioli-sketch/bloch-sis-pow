@@ -40,6 +40,8 @@ security job, fails if the job:
     delegation, or a `when` other than `on_success`/`always`.
   * moves GitLab pipeline selection or configuration behind top-level
     `workflow:` / `include:` content this local guard does not inspect.
+  * removes the GitHub `push` or `pull_request` trigger, or substitutes the
+    privileged `pull_request_target` event.
 
 It does NOT require every job to be blocking. cargo-geiger, miri and the fuzz
 smoke are deliberately report-only, with written reasons, and stay green here.
@@ -144,6 +146,27 @@ def check_file(path: str, required: dict[str, str], indent: int, label: str) -> 
                 problems.append(
                     "%s: top-level `%s:` moves pipeline semantics outside the "
                     "locally inspectable blocking subset" % (label, key))
+    if label == ".github/workflows/security.yml":
+        trigger_lines = job_blocks(text, 0).get("on")
+        if trigger_lines is None:
+            problems.append(
+                "%s: top-level `on:` trigger block is missing or not in the "
+                "supported explicit mapping form" % label)
+        else:
+            triggers = set()
+            for line in trigger_lines:
+                match = re.match(r"^  ([A-Za-z0-9_-]+):(?:\s|$)", line)
+                if match:
+                    triggers.add(match.group(1))
+            for trigger in ("push", "pull_request"):
+                if trigger not in triggers:
+                    problems.append(
+                        "%s: required top-level `%s:` trigger is missing"
+                        % (label, trigger))
+            if "pull_request_target" in triggers:
+                problems.append(
+                    "%s: privileged `pull_request_target:` is outside the "
+                    "supported security-workflow trigger subset" % label)
     for job, why in sorted(required.items()):
         if job not in blocks:
             problems.append(

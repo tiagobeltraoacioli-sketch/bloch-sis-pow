@@ -103,6 +103,10 @@ rollback-package-integrity:
 
 GOOD_GITHUB = """\
 name: security
+on:
+  push:
+  pull_request:
+
 jobs:
   clippy-hardened:
     runs-on: ubuntu-latest
@@ -310,6 +314,16 @@ CASES = [
     Case("GitLab workflow rules cannot skip every required job",
          "workflow:\n  rules:\n    - when: never\n\n" + GOOD_GITLAB,
          GOOD_GITHUB, must_fail=True, expect="top-level `workflow:`"),
+
+    Case("GitHub pull request trigger cannot be removed",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace("  pull_request:\n", ""),
+         must_fail=True, expect="required top-level `pull_request:` trigger is missing"),
+
+    Case("GitHub privileged pull request target is refused",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace("  pull_request:\n", "  pull_request_target:\n"),
+         must_fail=True, expect="privileged `pull_request_target:`"),
 
     Case("or-true masks a scanner verdict",
          GOOD_GITLAB.replace("cargo audit --deny warnings", "cargo audit --deny warnings || true"),
