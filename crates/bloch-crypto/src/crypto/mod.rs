@@ -270,6 +270,39 @@ pub fn verify(public_key_bytes: &[u8], message: &[u8], signature_bytes: &[u8]) -
     // panic (consensus rule). NO security is claimed.
     let (pk_suite, pk_body) = parse_pubkey_envelope_or_legacy(public_key_bytes);
     let (sig_suite, sig_body) = parse_envelope_or_legacy(signature_bytes);
+    verify_parsed(pk_suite, pk_body, message, sig_suite, sig_body)
+}
+
+/// Verify objects whose trusted format contract requires an explicit suite envelope.
+///
+/// Unlike [`verify`], this entry point never falls back to the legacy raw hybrid
+/// encoding and therefore never guesses whether signature bytes beginning with
+/// the envelope magic are raw material or a header. Use it only for versioned
+/// formats that already require both their key and signature to be enveloped.
+/// Historical consensus and carry-over wallet verification must keep using
+/// [`verify`] or [`verify_legacy_hybrid_raw`] according to their trusted format
+/// metadata.
+pub fn verify_enveloped(
+    public_key_bytes: &[u8],
+    message: &[u8],
+    signature_bytes: &[u8],
+) -> bool {
+    let Some((pk_suite, pk_body)) = parse_envelope(public_key_bytes) else {
+        return false;
+    };
+    let Some((sig_suite, sig_body)) = parse_envelope(signature_bytes) else {
+        return false;
+    };
+    verify_parsed(pk_suite, pk_body, message, sig_suite, sig_body)
+}
+
+fn verify_parsed(
+    pk_suite: u16,
+    pk_body: &[u8],
+    message: &[u8],
+    sig_suite: u16,
+    sig_body: &[u8],
+) -> bool {
     if pk_suite != sig_suite {
         debug!("crypto::verify: suite mismatch (pk={:#06x}, sig={:#06x})", pk_suite, sig_suite);
         return false;
@@ -812,6 +845,21 @@ mod kat {
         );
         // Sanity: a different message must fail (the wrapper really checks it).
         assert!(!verify(&pk, b"other", &sig));
+    }
+
+    #[test]
+    fn strict_enveloped_verifier_rejects_raw_and_mixed_encodings() {
+        let msg = b"strict-enveloped-format";
+        let (pk, sk) = generate_keypair();
+        let sig = sign(&sk, msg).unwrap();
+        let raw_pk = &pk[SUITE_HEADER_LEN..];
+        let raw_sig = &sig[SUITE_HEADER_LEN..];
+
+        assert!(verify_enveloped(&pk, msg, &sig));
+        assert!(!verify_enveloped(raw_pk, msg, &sig));
+        assert!(!verify_enveloped(&pk, msg, raw_sig));
+        assert!(!verify_enveloped(raw_pk, msg, raw_sig));
+        assert!(!verify_enveloped(&pk, b"other", &sig));
     }
 
     /// A genuine LEGACY (non-enveloped) hybrid object — no magic, no header,

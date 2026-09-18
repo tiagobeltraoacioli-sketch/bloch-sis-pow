@@ -221,7 +221,7 @@ pub fn verify_anchor(
         return Err(AnchorError::UntrustedKey);
     }
     // Verify under the caller's copy, so the anchor's own bytes cannot steer the check.
-    let ok = bloch_crypto::crypto::verify(
+    let ok = bloch_crypto::crypto::verify_enveloped(
         trusted_pq_pubkey,
         &signed.anchor.commitment_bytes(),
         &signed.signature,
@@ -469,6 +469,15 @@ mod tests {
 
         let signed = sign_anchor(&anchor, &sk).unwrap();
         assert!(verify_anchor(&signed, &pk).is_ok(), "honest anchor must verify");
+
+        // This format has always documented an enveloped signature. Refuse a
+        // stripped raw body instead of invoking the generic legacy heuristic.
+        let mut raw_signature = signed.clone();
+        raw_signature.signature.drain(..bloch_crypto::crypto::SUITE_HEADER_LEN);
+        assert_eq!(
+            verify_anchor(&raw_signature, &pk),
+            Err(AnchorError::BadSignature),
+        );
 
         // tamper the safe destination → verify fails closed
         let mut t1 = signed.clone();

@@ -179,9 +179,11 @@ impl SignedRecoveryContextV1 {
         })
     }
 
-    /// Verify under a public key supplied independently of the backup record.
+    /// Verify under an enveloped public key supplied independently of the
+    /// backup record. Both the key and stored signature must retain their
+    /// suite envelopes; this versioned format never guesses legacy raw bytes.
     pub fn verify(&self, trusted_pq_pubkey: &[u8]) -> Result<(), RecoveryContextError> {
-        if bloch_crypto::crypto::verify(
+        if bloch_crypto::crypto::verify_enveloped(
             trusted_pq_pubkey,
             &Self::signing_bytes(&self.context),
             &self.signature,
@@ -687,6 +689,16 @@ mod tests {
         let decoded = SignedRecoveryContextV1::decode(&signed.encode()).unwrap();
         assert_eq!(decoded, signed);
         assert_eq!(decoded.verify(&keys.pq_pubkey), Ok(()));
+
+        let mut raw_signature = decoded.clone();
+        raw_signature
+            .signature
+            .drain(..bloch_crypto::crypto::SUITE_HEADER_LEN);
+        assert_eq!(
+            raw_signature.verify(&keys.pq_pubkey),
+            Err(RecoveryContextError::BadSignature),
+        );
+
         assert_eq!(
             *decoded
                 .verify_and_restore(&keys.pq_pubkey, &seed, false, &expected_hash)
