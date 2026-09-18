@@ -46,9 +46,12 @@ Bitcoin network, non-empty vault ID and recovery hash. Restore derives exactly
 the recorded family—never a guessed sequence—and requires both the expected
 network and the funded vault's independently retained hash. Unknown tags,
 truncation, trailing bytes and altered context fail closed. The record contains
-no secret and is not self-authenticating: retain the funded hash independently.
-It also cannot detect reuse across separate backups; uniqueness and single-use
-lifecycle policy remain the client's responsibility.
+no secret. New workflows can wrap it in `SignedRecoveryContextV1`, whose strict
+bounded codec authenticates the exact context against an independently trusted
+owner PQ public key before restore. The funded hash still must be retained
+independently: a backup signature is not on-chain state. Neither form detects
+reuse across separate backups; uniqueness and single-use lifecycle policy remain
+the client's responsibility.
 
 Knowing a preimage does not prove possession of a PQ key: the preimage can be
 copied, delegated or learned from a witness. Bitcoin checks the preimage hash

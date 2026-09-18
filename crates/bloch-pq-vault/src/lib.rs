@@ -70,6 +70,8 @@
 //! context against the already committed hash without changing the derivation.
 //! New backups can persist [`preimage::RecoveryContextV1`] so restoration also
 //! selects the recorded V1/V2/V3 key family and network instead of guessing.
+//! [`preimage::SignedRecoveryContextV1`] can additionally authenticate those
+//! exact bytes against an independently trusted owner PQ public key before restore.
 
 #![forbid(unsafe_code)]
 
