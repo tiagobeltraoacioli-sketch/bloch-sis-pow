@@ -1,0 +1,25 @@
+Validation wave 12 — 2026-09-17
+Branch: fix/internal-audit-20260917
+Implementation commit: 6eba843
+
+PASS
+
+cargo test -p bloch-pos-committee attestation_replay_reuses --locked
+  1 passed; exact duplicate preserved the pre-gate verdict and caused only
+  proposer + one unique-attestation verification.
+
+cargo test -p bloch-pos-committee signature_variant_of_the_same_vote --locked
+  1 passed; a mutated signature for the same voter/root was still verified and
+  refused at attestation index 1.
+
+cargo test -p bloch-pos-committee --locked
+  617 passed; 0 failed; 6 ignored across unit, integration and doc tests.
+
+git diff --check
+  Passed before the implementation commit and before this evidence checkpoint.
+
+NOT A FLAG-DAY ACTIVATION
+
+`ATTESTATION_DEDUP_ACTIVATION_EPOCH`, `DUST_RULE_ACTIVATION_EPOCH` and
+`TX_BYTES_BOUND_ACTIVATION_EPOCH` remain `u64::MAX`. This wave changes no
+historical validity rule and proposes no activation epoch.
