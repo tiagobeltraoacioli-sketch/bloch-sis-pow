@@ -152,9 +152,9 @@ pub const MAX_EXITS_PER_EPOCH: usize = 4;
 ///
 /// `voluntary_exits_this_epoch` counts the records whose `exit_epoch` equals
 /// `epoch + EXIT_DELAY_EPOCHS`, and it is allowed to do that *only* because a
-/// slashing ejection writes `exit_epoch = epoch` with no delay. Those two
-/// numbers are distinguishable exactly while [`EXIT_DELAY_EPOCHS`] is
-/// non-zero. Set it to zero and the two paths become indistinguishable in
+/// slashing ejection writes `exit_epoch = epoch + 1`. Those two numbers are
+/// distinguishable exactly while [`EXIT_DELAY_EPOCHS`] is greater than one.
+/// Set it to one and the two paths become indistinguishable in
 /// state: a wave of ejections would silently consume the voluntary budget and
 /// freeze honest exits, and an attacker could buy immunity from ejection by
 /// spending the epoch's exits first — a consensus rule quietly changing
@@ -165,9 +165,9 @@ pub const MAX_EXITS_PER_EPOCH: usize = 4;
 /// and it fails the build of whoever edits the delay rather than a node in
 /// production.
 const _: () = assert!(
-    EXIT_DELAY_EPOCHS > 0,
+    EXIT_DELAY_EPOCHS > 1,
     "MAX_EXITS_PER_EPOCH accounting distinguishes a voluntary exit from a slashing \
-     ejection by the delay alone; with EXIT_DELAY_EPOCHS = 0 they are the same number",
+     ejection by the delay alone; with EXIT_DELAY_EPOCHS = 1 they are the same number",
 );
 
 /// Epochs between a voluntary exit and the validator no longer being assigned
