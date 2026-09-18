@@ -32,7 +32,7 @@ MERGE_KEY_RE = re.compile(r"^\s*(?:-\s*)?(?:<<|\"<<\"|'<<')\s*:")
 # YAML anchor/alias tokens begin at a structural separator, not in an ordinary
 # scalar such as a Prometheus expression containing ` * `. Quoted occurrences
 # are deliberately outside this supported subset and fail if they form a key.
-ANCHOR_ALIAS_RE = re.compile(r"(?:^|[\s:\[\{,])([&*])[A-Za-z0-9_-]+(?=$|[\s,\]\}])")
+ANCHOR_ALIAS_RE = re.compile(r"(?:^|[\s:\[\{,])([&*])[^\s\[\]\{\},]+(?=$|[\s,\]\}])")
 
 
 def find_yaml_files(root: Path) -> list[Path]:

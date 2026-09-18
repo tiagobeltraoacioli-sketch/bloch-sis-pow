@@ -198,6 +198,7 @@ def case_bypass_regressions() -> str | None:
 def case_yaml_inheritance_fails_closed() -> str | None:
     cases = {
         "anchor": "x-base: &base\n  image: docker.io/blochv/bloch@sha256:%s\n" % DIGEST,
+        "punctuated anchor": "x-base: &base.v1/path\n  image: docker.io/blochv/bloch@sha256:%s\n" % DIGEST,
         "alias": "services:\n  node: *base\n",
         "merge key": "services:\n  node:\n    <<: *base\n",
         "quoted merge key": 'services:\n  node:\n    "<<": *base\n',
