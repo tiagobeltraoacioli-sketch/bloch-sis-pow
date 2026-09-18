@@ -153,6 +153,17 @@ pub struct NodeMetrics {
     /// would exceed consensus `MAX_EPOCH_ADVANCE`. This is observability only:
     /// it is never read by consensus or duty selection.
     pub epoch_advance_headroom_epochs: AtomicU64,
+    /// Historical size of the committed `fc_equivocators` set. This is a
+    /// gauge, not the gossip event counter above: canonical reorgs can replace
+    /// the state being observed even though the set is monotone within one
+    /// branch.
+    pub forkchoice_equivocators: AtomicU64,
+    /// Members of the committed bar that remain in the current consensus
+    /// roster. Exited validators remain in `forkchoice_equivocators` but do
+    /// not contribute here.
+    pub forkchoice_equivocators_active: AtomicU64,
+    /// Leak-adjusted active stake excluded by the committed bar, in satoshis.
+    pub forkchoice_equivocator_active_stake_sat: AtomicU64,
     /// Committed finalized epoch.
     pub finalized_epoch: AtomicU64,
     /// Committed justified epoch.
@@ -260,6 +271,9 @@ impl NodeMetrics {
             epoch_advance_headroom_epochs: AtomicU64::new(
                 bloch_pos_committee::params::MAX_EPOCH_ADVANCE,
             ),
+            forkchoice_equivocators: AtomicU64::new(0),
+            forkchoice_equivocators_active: AtomicU64::new(0),
+            forkchoice_equivocator_active_stake_sat: AtomicU64::new(0),
             finalized_epoch: AtomicU64::new(0),
             justified_epoch: AtomicU64::new(0),
             peer_count: AtomicU64::new(0),
@@ -402,6 +416,24 @@ impl NodeMetrics {
             "gauge",
             "Wall-clock epochs remaining before one restart block exceeds consensus MAX_EPOCH_ADVANCE; alert before this reaches zero",
             self.get(&self.epoch_advance_headroom_epochs),
+        );
+        series(
+            "bloch_pos_forkchoice_equivocators",
+            "gauge",
+            "Validators in the canonical state's permanent committed fork-choice bar",
+            self.get(&self.forkchoice_equivocators),
+        );
+        series(
+            "bloch_pos_forkchoice_equivocators_active",
+            "gauge",
+            "Committed fork-choice equivocators still present in the active consensus roster",
+            self.get(&self.forkchoice_equivocators_active),
+        );
+        series(
+            "bloch_pos_forkchoice_equivocator_active_stake_sat",
+            "gauge",
+            "Leak-adjusted active stake excluded by the committed fork-choice equivocator bar, in satoshis",
+            self.get(&self.forkchoice_equivocator_active_stake_sat),
         );
         series(
             "bloch_pos_finalized_epoch",
@@ -781,6 +813,9 @@ mod tests {
             "bloch_pos_peer_count",
             "bloch_pos_behind_by_slots",
             "bloch_pos_epoch_advance_headroom_epochs",
+            "bloch_pos_forkchoice_equivocators",
+            "bloch_pos_forkchoice_equivocators_active",
+            "bloch_pos_forkchoice_equivocator_active_stake_sat",
             "bloch_pos_is_syncing",
             // R3 metrics-gap follow-up: equivocations, the finality-latch
             // refusal counter, per-transport peer counts, the sealed-keystore

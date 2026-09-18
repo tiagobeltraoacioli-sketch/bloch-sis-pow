@@ -5462,8 +5462,12 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // Two slots of wall time, the grace/sync/rate-limit window used below.
     let two_slots_ms = slot_ms.saturating_mul(2);
     let mut finality_stalled = false;
-    let mut metrics_sampled_slot: u64 = 0;
+    // Sentinel guarantees one sample immediately, including at genesis slot
+    // zero; otherwise disk and committed-bar gauges would retain defaults for
+    // the entire first slot.
+    let mut metrics_sampled_slot: u64 = u64::MAX;
     let mut epoch_advance_warning_level: u8 = 0;
+    let mut reported_fc_equivocators = None;
 
     loop {
         match engine.store.poll_rewrite() {
@@ -5674,6 +5678,29 @@ pub fn run(cfg: Config) -> io::Result<()> {
                     &NODE.data_dir_fs_free_bytes,
                     crate::metrics::fs_free_bytes(&cfg.data_dir),
                 );
+                let summary = engine.state.forkchoice_equivocator_summary();
+                NodeMetrics::set(&NODE.forkchoice_equivocators, summary.total);
+                NodeMetrics::set(&NODE.forkchoice_equivocators_active, summary.active);
+                NodeMetrics::set(
+                    &NODE.forkchoice_equivocator_active_stake_sat,
+                    summary.active_stake_sat,
+                );
+                // Report the canonical-state value at boot and whenever a
+                // block/reorg changes it. The metrics above are the durable
+                // alerting surface; this bounded diagnostic makes the bar
+                // visible even on a fleet that has not installed a rule yet.
+                if reported_fc_equivocators != Some(summary) {
+                    if summary.total > 0 {
+                        eprintln!(
+                            "WARNING: canonical state permanently bars {} fork-choice \
+                             equivocator(s); {} remain active, excluding {} sat of \
+                             leak-adjusted weight. No automatic expiry or recovery is \
+                             active; investigate slashing/ejection and network quorum.",
+                            summary.total, summary.active, summary.active_stake_sat,
+                        );
+                    }
+                    reported_fc_equivocators = Some(summary);
+                }
             }
             // Finality stall: count the EDGE into the stalled condition, so a
             // three-hour stall is one incident, not ten thousand scrapes.

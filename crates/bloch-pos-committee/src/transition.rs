@@ -1459,6 +1459,24 @@ fn report_boundary_vote_drop(_closing: u64, _admitted: usize, _tallied: usize) {
     );
 }
 
+/// Read-only summary of the committed fork-choice equivocator bar.
+///
+/// `total` is the monotone historical set committed in the state root.
+/// `active` and `active_stake_sat` are its intersection with the current
+/// leak-adjusted consensus roster. Keeping both views is important: an exited
+/// validator remains in the historical set forever, but no longer removes
+/// live fork-choice weight.
+///
+/// This is observability only. In particular, reading this value does not
+/// expire a bar, restore a latest message, alter a roster, or feed a consensus
+/// verdict back into the transition.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ForkChoiceEquivocatorSummary {
+    pub total: u64,
+    pub active: u64,
+    pub active_stake_sat: u64,
+}
+
 /// The committed post-state of one block — [`StateTransition::State`].
 ///
 /// A plain value: `Clone` + `PartialEq`, no interior mutability, no handles.
@@ -4569,6 +4587,28 @@ impl CommittedState {
         self.validators.len()
     }
 
+    /// Summarise the permanent committed fork-choice bar for operators.
+    ///
+    /// The active stake uses the same leak-adjusted roster that block
+    /// transition fork choice receives. The sum saturates defensively at
+    /// `u64::MAX`; the protocol supply is below that bound, but a read surface
+    /// must not wrap if it is ever called on a synthetic or corrupt state.
+    pub fn forkchoice_equivocator_summary(&self) -> ForkChoiceEquivocatorSummary {
+        let mut active = 0u64;
+        let mut active_stake_sat = 0u64;
+        for validator in self.consensus_roster_at(self.epoch) {
+            if self.fc_equivocators.contains(&validator.index) {
+                active = active.saturating_add(1);
+                active_stake_sat = active_stake_sat.saturating_add(validator.effective_stake);
+            }
+        }
+        ForkChoiceEquivocatorSummary {
+            total: self.fc_equivocators.len() as u64,
+            active,
+            active_stake_sat,
+        }
+    }
+
     /// Every unspent output, in `(txid, vout)` order.
     ///
     /// Order is the map's, so it is a function of the data and not of insertion
@@ -7630,6 +7670,44 @@ mod tests {
         assert!(CommittedState::forkchoice_equivocation_horizon_active(
             crate::params::FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH
         ));
+    }
+
+    /// FC-12 observability must describe today's permanent-bar semantics,
+    /// not accidentally introduce recovery semantics of its own. An exited
+    /// validator remains in the committed historical set across an epoch
+    /// boundary, while only currently active barred validators contribute to
+    /// the live weight gauge.
+    #[test]
+    fn forkchoice_equivocator_summary_separates_history_from_active_weight() {
+        let (_t, mut st, _chains) = setup(4);
+        assert_eq!(
+            st.forkchoice_equivocator_summary(),
+            ForkChoiceEquivocatorSummary::default(),
+        );
+
+        st.fc_equivocators.extend([1, 3]);
+        assert_eq!(
+            st.forkchoice_equivocator_summary(),
+            ForkChoiceEquivocatorSummary {
+                total: 2,
+                active: 2,
+                active_stake_sat: sat(400_000) as u64,
+            },
+        );
+
+        // Model validator 3 having left the active roster. FC-12's exact
+        // residual is that lifecycle progress does not clear its bar.
+        st.validators.get_mut(&3).unwrap().exit_epoch = st.epoch;
+        let rolled = st.close_epoch();
+        assert!(rolled.fc_equivocators.contains(&3));
+        assert_eq!(
+            rolled.forkchoice_equivocator_summary(),
+            ForkChoiceEquivocatorSummary {
+                total: 2,
+                active: 1,
+                active_stake_sat: sat(200_000) as u64,
+            },
+        );
     }
 
     /// The O01 model: one validator, A = (s, x), B = (s, y) conflicting at
