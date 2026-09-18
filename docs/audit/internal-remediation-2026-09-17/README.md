@@ -17,7 +17,9 @@ candidate](WAVE-45-TX10.md). Wave 46 begins by reconciling the existing
 [inactive Rewards V2 candidate](WAVE-46-TX09.md), then reconciles their
 interaction with the [inactive RANDAO-grinding candidate](WAVE-46-FC04.md).
 The related [sub-epoch duty-view finding](WAVE-46-FC08.md) is retained as
-partial because its source-checkpoint half still needs late-inclusion rules.
+partial because its source-checkpoint half still needs late-inclusion rules;
+the same pass stages the separate [inactive ST-13 activation-queue
+candidate](WAVE-46-ST13.md).
 
 ## Scope and source reconciliation
 
