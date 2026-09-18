@@ -63,11 +63,15 @@ BLOCH_BUILD_COMMIT="${commit:0:12}" cargo build --release --locked \
   -p bloch-pos-node --bin bloch-pos --target-dir "$work/target"
 binary="$work/target/release/bloch-pos"
 [ -x "$binary" ] || fail "release binary was not produced"
-version="$($binary --version)"
-case "$version" in
+version_output="$($binary --version)"
+case "$version_output" in
   *"${commit:0:12}"*) : ;;
   *) fail "binary version does not contain ${commit:0:12}" ;;
 esac
+binary_version="$(printf '%s\n' "$version_output" | sed -n '1p')"
+source_identity="$(printf '%s\n' "$version_output" | sed -n '2p')"
+[ -n "$binary_version" ] || fail "binary version output is empty"
+[ -n "$source_identity" ] || fail "binary source identity output is missing"
 
 stage="$work/stage"
 mkdir -p "$stage"
@@ -82,7 +86,9 @@ printf '%s  bloch-pos\n' "$binary_sha" > "$stage/SHA256SUMS"
   printf 'rust_toolchain=%s\n' "$pin"
   printf 'target=%s\n' "$(rustc -vV | sed -n 's/^host: //p')"
   printf 'binary_sha256=%s\n' "$binary_sha"
-  printf 'binary_version=%s\n' "$version"
+  printf 'binary_version=%s\n' "$binary_version"
+  printf 'binary_source_identity=%s\n' "$source_identity"
+  printf 'tracked_tree_clean=true\n'
   printf 'canonical_container=false\n'
   printf 'signed=false\n'
   printf 'deployment_authorized=false\n'
