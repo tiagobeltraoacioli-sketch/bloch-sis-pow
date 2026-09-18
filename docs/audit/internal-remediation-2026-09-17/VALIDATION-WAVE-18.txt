@@ -1,0 +1,30 @@
+Validation wave 18 — 2026-09-17
+Branch: fix/internal-audit-20260917
+Implementation: 5173c7c
+
+PASS
+
+cargo test --locked -p bloch-pos-committee funded_decoder
+  2 passed; bounded hostile sizes remain decoder failures; bounded invalid
+  semantics decode and are rejected by FundedDeposit::validate_shape.
+
+cargo test --locked -p bloch-pos-committee
+  Library: 432 passed, 4 ignored.
+  Integration suites: 185 passed, 2 ignored.
+  Doc tests: 2 passed.
+  Aggregate: 619 passed, 0 failed, 6 ignored.
+
+python3 scripts/check-comment-constants.py
+  430 files; 565 resolvable constants; 46 claims; 0 contradictions.
+
+bash scripts/ci-banned-words.sh
+  Passed.
+
+git diff --check
+  Passed before the implementation commit and before this evidence checkpoint.
+
+LIMIT
+
+No wire encoding, activation schedule, economic rule or fleet binary changed.
+Workspace-wide rustfmt remains the inherited baseline described by prior
+waves; this wave did not perform a broad formatting rewrite.
