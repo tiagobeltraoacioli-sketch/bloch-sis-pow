@@ -1,0 +1,36 @@
+Validation wave 27 — 2026-09-18
+Branch: fix/internal-audit-20260917
+Implementation: e96f794
+
+PASS
+
+ruby -e 'require "yaml"; YAML.load_file(...)'
+  .github/workflows/security.yml and .gitlab-ci.yml parse successfully.
+
+python3 scripts/check-scanners-blocking.selftest.py
+  12 cases passed in both directions.
+
+python3 scripts/check-scanners-blocking.py
+  7 GitLab + 7 GitHub required security jobs are blocking.
+
+python3 scripts/check-tests-blocking.py
+  Both pipelines cover all 8 live crates in blocking test jobs.
+
+bash -n deploy/rollback/make-rollback-package.sh \
+  deploy/rollback/make-rollback-package.selftest.sh
+  Passed.
+
+git diff --check
+  Passed before the implementation commit.
+
+NOT EXECUTED LOCALLY
+
+bash deploy/rollback/make-rollback-package.selftest.sh
+  Failed closed before exercising a package: minisign is not installed on this
+  workstation. The blocking GitLab and GitHub jobs install minisign before
+  invoking this test. No cryptographic self-test pass is claimed locally.
+
+LIMIT
+
+No release key was generated, no trust root was pinned on a host, no real N-1
+artifact was staged, and no systemd or fleet rollback drill was performed.
