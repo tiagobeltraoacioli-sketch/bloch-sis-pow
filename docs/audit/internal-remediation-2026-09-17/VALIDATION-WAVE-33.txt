@@ -1,0 +1,20 @@
+Validation wave 33 — 2026-09-18
+Branch: fix/internal-audit-20260917
+Evidence reconciliation only; no new implementation commit.
+
+PASS
+
+cargo test --locked --offline -p bloch-pos-node --bin bloch-pos source_budget
+  5 passed; 0 failed; 503 filtered out.
+
+bash deploy/bootnodes/verify-bootnodes.selftest.sh
+  Closed RPC with reachable P2P passed; exposed RPC on 8080 failed the verifier.
+
+git diff --check
+  Passed after the documentation update.
+
+BOUNDARY
+
+No live host, firewall or topology was inspected or changed. Devnet transport
+authentication, end-to-end origin and peer sanctions remain absent; NET-12 is
+PARTIAL.

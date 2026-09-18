@@ -4,7 +4,7 @@ Audited source: `562e220`. Remediation base: `b066e3c`. Branch: `fix/internal-au
 
 All 200 findings are retained, including duplicates. IMPLEMENTED means code changed in this branch, not deployed, externally audited, or universally resolved on the live fleet. PARTIAL is not closure. No production binary was published.
 
-IMPLEMENTED: 66, PARTIAL: 80, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE CHANGED: 7, OPEN: 40, REFUTED IN AUDIT: 1, VERIFIED POSITIVE: 1.
+IMPLEMENTED: 66, PARTIAL: 81, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE CHANGED: 7, OPEN: 39, REFUTED IN AUDIT: 1, VERIFIED POSITIVE: 1.
 
 | Finding | Status | Evidence / remaining work | Original title |
 |---|---|---|---|
@@ -47,7 +47,7 @@ IMPLEMENTED: 66, PARTIAL: 80, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE C
 | NET-09 | BASE CHANGED | Recovery/release base differs from audited commit: inspect activated lifecycle gates or TCP reconnect fix. Fleet binary inventory and historical epochs still require verification. | Devnet idle-close at 120 s silently drops the first broadcast after an idle period; the honest cadence on non-sync connections is ~16 minutes |
 | NET-10 | IMPLEMENTED | JSON value-count cap and bounded scalar IDs. | RPC JSON parser memory amplification and id echo |
 | NET-11 | IMPLEMENTED | Eight RPC connections per IP; overflow sockets are dropped without blocking the accept loop. | RPC connection exhaustion/slowloris: 64 slots, 30 s deadline, no per-IP limit |
-| NET-12 | OPEN | Not closed by this bundle. Requires dedicated implementation, protocol design, external operational evidence or product-owner integration; original finding remains tracked. | Bootnode/observer hosts are a privileged frame-push position into all 63 validators |
+| NET-12 | PARTIAL | Observer compromise still grants an allowlisted frame-push position, but per-source queue reservations, per-IP connection/sync budgets, exact-failure caching/log suppression, authenticated-before-body proposal admission, SSH hardening and public-RPC refusal bound several consequences and reduce host exposure. Transport identity/origin, peer penalties and fleet firewall evidence remain open. See WAVE-33.md. | Bootnode/observer hosts are a privileged frame-push position into all 63 validators |
 | SR-02 | PARTIAL | Optional --ws-signer-set-sha3 pins every signer-arrangement byte before trust/persistence. Independent pin distribution and adoption required; current checkpoint signature still binds only numeric arrangement ID. Versioned digest binding remains unactivated design. | The signer arrangement (keys + quorum rule + review clock) is not bound by the checkpoint digest |
 | SR-03 | OPEN | Not closed by this bundle. Requires dedicated implementation, protocol design, external operational evidence or product-owner integration; original finding remains tracked. | Fresh-install onboarding is currently refused: the genesis anchor aged out at epoch 2016 and no signed envelope exists anywhere in the tree |
 | ST-03 | OPEN | Not closed by this bundle. Requires dedicated implementation, protocol design, external operational evidence or product-owner integration; original finding remains tracked. | Correlated-slashing amplification mixes raw-bond penalties (numerator) with effective, capped/leaked stake (denominator): one slash of a cohort valida… |
