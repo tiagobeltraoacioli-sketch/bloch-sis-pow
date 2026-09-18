@@ -105,8 +105,8 @@ pub fn sync_frames_scanned() -> u64 {
 //   * behind the log (crash between the log fsync and the index append, or
 //     an index from an older binary) → the unindexed tail is scanned;
 //   * ahead of the log, out of order, or pointing at a frame that does not
-//     carry the slot it claims → distrusted, and the answer is scanned from
-//     byte zero.
+//     carry the slot it claims → distrusted, and serving fails closed until
+//     `Store::open` rebuilds the disposable index.
 //
 // The log is written first and fsynced first, so the index can only ever lag
 // it. There is no state in which a lost or damaged index can make this node
@@ -331,8 +331,8 @@ enum Start {
     /// to return zero bytes.
     Nothing,
     /// Seek here. `expect_slot` is what the index says the frame at that
-    /// offset carries; a mismatch means the index lies and the caller falls
-    /// back to the full scan.
+    /// offset carries; a mismatch means the index lies and serving fails
+    /// closed until the next index rebuild.
     At { offset: u64, expect_slot: Option<u64> },
 }
 
@@ -1303,8 +1303,9 @@ impl Store {
     /// What comes back is unchanged by all three: the log's own bytes, in log
     /// order, filtered by the same `slot > after_slot` predicate over headers
     /// read back from the log itself. The index is a hint about *where to
-    /// start*. Detected header discrepancies fall back to a full scan;
-    /// startup rebuild and generation locking prevent stale replacement hints.
+    /// start*. Detected index/header discrepancies fail the request with a
+    /// bounded error; startup rebuild and generation locking repair the
+    /// disposable index without reopening a whole-history scan to callers.
     ///
     /// Reads the log file fresh so a reader thread never touches the append
     /// handle.
@@ -1314,10 +1315,11 @@ impl Store {
             .map_err(|_| io::Error::other("log generation guard poisoned; restart required"))?;
         let log_path = dir.join("blocks.log");
         let log_len = fs::metadata(&log_path)?.len();
-        // A missing or unreadable index is not an error: it is the state
-        // every pre-index data dir is in, and the answer is the scan this
-        // function has always done.
-        match index_start(dir, after_slot, log_len).unwrap_or(None) {
+        // `Store::open` creates or rebuilds this derived index before network
+        // serving starts. A later missing/corrupt index is therefore a local
+        // fault, not a reason to let a remote request reopen the historical
+        // O(chain length) scan. Fail boundedly and let restart/open repair it.
+        match index_start(dir, after_slot, log_len)? {
             Some(Start::Nothing) => return Ok(Vec::new()),
             Some(Start::At { offset, expect_slot }) => {
                 if let Some(page) =
@@ -1325,20 +1327,27 @@ impl Store {
                 {
                     return Ok(page);
                 }
-                eprintln!(
-                    "store: block index disagrees with the log at offset {offset}; \
-                     serving from a full scan (it will be rebuilt on next open)"
-                );
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "block index disagrees with the log at offset {offset}; \
+                         restart to rebuild the derived index"
+                    ),
+                ));
             }
-            None => {}
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "block index is unusable; restart to rebuild the derived index",
+                ));
+            }
         }
-        Ok(Self::scan_page(&log_path, 0, None, after_slot, limit)?.unwrap_or_default())
     }
 
     /// The scan itself, from `from` to the cap. Returns `Ok(None)` — and only
     /// then — when `expect_slot` is set and the frame at `from` does not carry
     /// it, which is the caller's signal that the index is not describing this
-    /// log and the answer must be re-derived from byte zero.
+    /// log and serving must fail closed until the index is rebuilt.
     fn scan_page(
         log_path: &Path,
         from: u64,
@@ -2196,11 +2205,12 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// An index that points somewhere the log does not agree with is a hint
-    /// that is wrong, not a source of truth. The answer must be re-derived
-    /// from the log, unchanged.
+    /// An index that points somewhere the log does not agree with is a local
+    /// fault, not a source of truth and not permission for a remote caller to
+    /// trigger a whole-history scan. Restart/open repairs the disposable
+    /// index.
     #[test]
-    fn a_lying_index_falls_back_to_the_full_scan() {
+    fn a_lying_index_fails_boundedly_until_restart_rebuilds_it() {
         let dir = std::env::temp_dir().join(format!("bloch-pos-idx-lie-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let mut store = Store::open(&dir, &[13u8; 32]).expect("open");
@@ -2220,9 +2230,51 @@ mod tests {
         raw[at + 8..at + 16].copy_from_slice(&3u64.to_le_bytes());
         fs::write(&idx_path, &raw).expect("write idx");
 
-        let page = Store::blocks_after(&dir, 5, 100).expect("scan");
-        assert_eq!(page, logged[5..], "a wrong index changed the answer instead of being ignored");
+        let before = sync_frames_scanned();
+        let error = Store::blocks_after(&dir, 5, 100).unwrap_err();
+        let scanned = sync_frames_scanned() - before;
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("restart to rebuild"));
+        assert!(scanned <= 1, "corrupt index reopened a whole-log scan: {scanned} frames");
 
+        let store = Store::open(&dir, &[13u8; 32]).expect("restart rebuild");
+        let page = Store::blocks_after(&dir, 5, 100).expect("serve after rebuild");
+        assert_eq!(page, logged[5..], "rebuild changed the authoritative log answer");
+        drop(store);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_or_bad_magic_index_never_reopens_the_full_scan() {
+        let dir = std::env::temp_dir().join(format!("bloch-pos-idx-unusable-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x13; 32]).expect("open");
+        for slot in 1..=64u64 {
+            store.append(&sample_envelope(slot)).expect("append");
+        }
+        drop(store);
+
+        for replacement in [None, Some(b"BADINDEX".as_slice())] {
+            let idx_path = dir.join("blocks.idx");
+            match replacement {
+                None => fs::remove_file(&idx_path).expect("remove index"),
+                Some(bytes) => fs::write(&idx_path, bytes).expect("replace index"),
+            }
+            let before = sync_frames_scanned();
+            let error = Store::blocks_after(&dir, 32, 16).unwrap_err();
+            assert!(matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::InvalidData));
+            assert_eq!(
+                sync_frames_scanned() - before,
+                0,
+                "unusable index must fail before any log-header scan"
+            );
+            let rebuilt = Store::open(&dir, &[0x13; 32]).expect("rebuild index on restart");
+            drop(rebuilt);
+        }
+
+        let page = Store::blocks_after(&dir, 60, 16).expect("serve after rebuild");
+        assert_eq!(page.len(), 4);
         let _ = fs::remove_dir_all(&dir);
     }
 
