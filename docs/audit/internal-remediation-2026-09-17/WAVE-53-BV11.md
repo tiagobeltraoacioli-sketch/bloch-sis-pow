@@ -27,6 +27,13 @@ performs the existing hybrid PQ signature verification. It never guesses a
 network from attacker-provided strings. A valid testnet anchor therefore cannot
 authorize a mainnet watchtower action through this entry point.
 
+The checked function uses its own additive `BitcoinAnchorError`; the historical
+public `AnchorError` enum gains no variants, preserving source compatibility for
+existing exhaustive matches. Bitcoin address encodings distinguish mainnet
+from the test-network family, but some legacy encodings are shared by testnet,
+signet and regtest. Exact test-chain identity must therefore be bound by caller
+context in addition to address validation.
+
 ## Regression evidence
 
 Focused tests cover a valid regtest anchor, wrong expected network, mixed
@@ -39,7 +46,7 @@ old low-level behavior.
 Validation:
 
 - `cargo test --locked -p bloch-pq-vault anchor::tests --offline`: 11 passed;
-- the complete vault suite is run before the track handoff;
+- `cargo test --locked -p bloch-pq-vault --offline`: 44 passed plus 1 doctest;
 - `git diff --check` is required for the scoped files.
 
 ## Honest residual boundary

@@ -155,10 +155,6 @@ pub enum AnchorError {
     Malformed,
     /// Unknown `target_chain` tag on deserialize.
     UnknownChain(u8),
-    /// The Bitcoin-specific checked verifier was used for another target chain.
-    WrongTargetChain(TargetChain),
-    /// A committed Bitcoin address is malformed or does not match the expected network.
-    InvalidBitcoinAddress,
     /// K-2 fix: the Kirpich internal audit ([`bloch_euvm::kirpich`]) denied the
     /// charter used to build an anchor guard program — e.g. an empty or malformed
     /// `pq_recovery_pubkey` / `btc_pubkey`, which the un-audited `compile_charter`
@@ -167,6 +163,20 @@ pub enum AnchorError {
     /// [`AuditReport`] so the caller can see every finding, not just the fact that
     /// one fired.
     CharterAuditDenied(AuditReport),
+}
+
+/// Additive errors from [`verify_bitcoin_anchor`]. Keeping chain/address
+/// policy outside [`AnchorError`] avoids breaking existing exhaustive matches
+/// over the historical generic verifier and codec error type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BitcoinAnchorError {
+    /// The generic version/trusted-key/signature verifier failed.
+    Anchor(AnchorError),
+    /// The Bitcoin-specific checked verifier was used for another target chain.
+    WrongTargetChain(TargetChain),
+    /// A committed Bitcoin address is malformed or not valid for the requested
+    /// network encoding family.
+    InvalidAddress,
 }
 
 /// Sign a `PqShieldAnchor` with the owner's PQ secret key (ML-DSA-65 ‖ Falcon-1024).
@@ -231,28 +241,34 @@ pub fn verify_anchor(
 /// non-Bitcoin anchors, and therefore does not infer address semantics. In
 /// particular, the network is an input here rather than guessed from attacker-
 /// supplied strings: a syntactically valid testnet anchor must not authorize a
-/// mainnet watchtower action.
+/// mainnet watchtower action. Some legacy test-network address encodings are
+/// shared by testnet, signet and regtest; callers needing an exact test-chain
+/// identity must bind it separately from the address string.
 pub fn verify_bitcoin_anchor(
     signed: &SignedAnchor,
     trusted_pq_pubkey: &[u8],
     expected_network: bitcoin::Network,
-) -> Result<(), AnchorError> {
+) -> Result<(), BitcoinAnchorError> {
     // Preserve the generic verifier's cheap identity/version error precedence
     // without paying for a hybrid verification before address validation.
     if signed.anchor.version != ANCHOR_VERSION {
-        return Err(AnchorError::UnsupportedVersion(signed.anchor.version));
+        return Err(BitcoinAnchorError::Anchor(AnchorError::UnsupportedVersion(
+            signed.anchor.version,
+        )));
     }
     if signed.anchor.pq_recovery_pubkey.as_slice() != trusted_pq_pubkey {
-        return Err(AnchorError::UntrustedKey);
+        return Err(BitcoinAnchorError::Anchor(AnchorError::UntrustedKey));
     }
     if signed.anchor.target_chain != TargetChain::Bitcoin {
-        return Err(AnchorError::WrongTargetChain(signed.anchor.target_chain));
+        return Err(BitcoinAnchorError::WrongTargetChain(
+            signed.anchor.target_chain,
+        ));
     }
     signed
         .anchor
         .validate_bitcoin_addresses(expected_network)
-        .map_err(|_| AnchorError::InvalidBitcoinAddress)?;
-    verify_anchor(signed, trusted_pq_pubkey)
+        .map_err(|_| BitcoinAnchorError::InvalidAddress)?;
+    verify_anchor(signed, trusted_pq_pubkey).map_err(BitcoinAnchorError::Anchor)
 }
 
 impl SignedAnchor {
@@ -485,7 +501,7 @@ mod tests {
         );
         assert_eq!(
             verify_bitcoin_anchor(&signed, &pk, bitcoin::Network::Bitcoin),
-            Err(AnchorError::InvalidBitcoinAddress),
+            Err(BitcoinAnchorError::InvalidAddress),
         );
 
         let mut mixed = anchor.clone();
@@ -493,7 +509,7 @@ mod tests {
         let mixed = sign_anchor(&mixed, &sk).unwrap();
         assert_eq!(
             verify_bitcoin_anchor(&mixed, &pk, bitcoin::Network::Regtest),
-            Err(AnchorError::InvalidBitcoinAddress),
+            Err(BitcoinAnchorError::InvalidAddress),
         );
 
         let mut malformed = anchor.clone();
@@ -501,7 +517,7 @@ mod tests {
         let malformed = sign_anchor(&malformed, &sk).unwrap();
         assert_eq!(
             verify_bitcoin_anchor(&malformed, &pk, bitcoin::Network::Regtest),
-            Err(AnchorError::InvalidBitcoinAddress),
+            Err(BitcoinAnchorError::InvalidAddress),
         );
 
         let mut other_chain = anchor;
@@ -509,7 +525,7 @@ mod tests {
         let other_chain = sign_anchor(&other_chain, &sk).unwrap();
         assert_eq!(
             verify_bitcoin_anchor(&other_chain, &pk, bitcoin::Network::Regtest),
-            Err(AnchorError::WrongTargetChain(TargetChain::EthereumL1)),
+            Err(BitcoinAnchorError::WrongTargetChain(TargetChain::EthereumL1)),
         );
     }
 
@@ -526,14 +542,14 @@ mod tests {
 
         assert_eq!(
             verify_bitcoin_anchor(&signed, &other_pk, bitcoin::Network::Regtest),
-            Err(AnchorError::UntrustedKey),
+            Err(BitcoinAnchorError::Anchor(AnchorError::UntrustedKey)),
         );
         let mut bad_signature = signed;
         let last = bad_signature.signature.len() - 1;
         bad_signature.signature[last] ^= 1;
         assert_eq!(
             verify_bitcoin_anchor(&bad_signature, &pk, bitcoin::Network::Regtest),
-            Err(AnchorError::BadSignature),
+            Err(BitcoinAnchorError::Anchor(AnchorError::BadSignature)),
         );
 
         // Historical generic verification remains byte/behavior compatible;
