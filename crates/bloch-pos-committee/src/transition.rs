@@ -5120,6 +5120,17 @@ impl CommittedState {
                     for (delegator, reward) in shares {
                         if reward > 0 {
                             *st.delegator_issuance_rewards.entry(delegator).or_insert(0) += reward;
+                            // This ledger credit is newly minted issuance in
+                            // exactly the same sense as the operator credit
+                            // above. Leaving it out of the counter makes the
+                            // unconditional supply-conservation check reject
+                            // the first rewards-v2 boundary that has an active
+                            // delegation. This branch remains behind the inert
+                            // rewards-v2 gate, so historical/pre-activation
+                            // state roots are unchanged.
+                            if !mutation_mints_from_nothing() {
+                                st.issued_sat += reward;
+                            }
                         }
                     }
                     // Truncation dust compounds into the operator's bond —
@@ -8019,10 +8030,12 @@ mod tests {
         );
     }
 
-    /// R1 M4 regression: a delegator's pro-rata share of issuance must be
-    /// settled into the committed ledger, not silently discarded. Reverting
-    /// the fix (feeding `rewards::distribute` `delegated_stake: 0` again)
-    /// makes this go red.
+    /// R1 M4 / ST-06 regression: a delegator's pro-rata share of issuance
+    /// must be settled into the committed ledger and advance `issued_sat` by
+    /// the same amount. Reverting either half makes this go red: omitting the
+    /// ledger credit discards the delegator's reward, while omitting the
+    /// counter advance makes the supply-conservation guard refuse the first
+    /// rewards-v2 boundary with an active delegation.
     #[test]
     fn rewards_v2_settles_delegator_issuance_share() {
         let (_t, s, _chains) = epoch1_fixture();
@@ -8051,12 +8064,37 @@ mod tests {
             eligible: true,
         });
 
+        // Below the gate the new ledger and its issuance accounting remain
+        // completely inert. This is the historical-compatibility leg: the
+        // patch must not move any pre-activation committed quantity.
+        let legacy = st.clone().close_epoch();
+        assert_eq!(legacy.delegator_issuance_reward_sat(900), 0);
+
+        let issued_before = st.issued_sat();
+        let accounted_before = st.accounted_supply_sat();
         let _gate = crate::params::rehearsal::rewards_v2_gate_open_guard();
         let closed = st.close_epoch();
+        let delegator_reward = closed.delegator_issuance_reward_sat(900);
         assert!(
-            closed.delegator_issuance_reward_sat(900) > 0,
+            delegator_reward > 0,
             "R1 M4: a delegator behind an attesting, capped-eligible validator must earn a \
              pro-rata share of issuance"
+        );
+        let minted = closed.issued_sat() - issued_before;
+        let holdings_growth = closed.accounted_supply_sat() - accounted_before;
+        assert_eq!(
+            holdings_growth, minted,
+            "ST-06: every rewards-v2 ledger credit must advance issued_sat; otherwise the \
+             next boundary is refused as unconserved supply"
+        );
+        assert!(
+            minted >= delegator_reward,
+            "the committed issuance delta must include the delegator's newly minted share"
+        );
+        assert!(
+            CommittedState::supply_conserved(&st, &closed, 0),
+            "an honest rewards-v2 boundary with delegation must pass the production \
+             supply-conservation predicate"
         );
     }
 
