@@ -31,6 +31,8 @@ findings that still require external evidence or protocol decisions.
 Wave 48 begins with [fail-closed operational boundaries](WAVE-48-OPERATIONS.md)
 for the read-only fleet verifier and weak-subjectivity release check; neither
 change rotates a live credential or creates the still-missing signed envelope.
+It also records the [FC-07 disjoint-finality proof and unresolved protocol
+choice](WAVE-48-FC07.md); it changes no consensus rule.
 
 ## Scope and source reconciliation
 
