@@ -290,6 +290,19 @@ CASES = [
              "  osv-scanner:\n    uses: example/security/.github/workflows/osv.yml@0123456789abcdef"),
          must_fail=True, expect="delegates to a reusable workflow"),
 
+    Case("GitLab reference cannot hide a required script",
+         GOOD_GITLAB.replace(
+             "cargo-audit:\n  stage: check\n  script:\n    - cargo audit --deny warnings",
+             "cargo-audit:\n  stage: check\n  script: !reference [.scanner-template, script]"),
+         GOOD_GITHUB, must_fail=True, expect="YAML alias or GitLab reference"),
+
+    Case("GitHub alias cannot hide required steps",
+         GOOD_GITLAB,
+         sub(GOOD_GITHUB,
+             "  cargo-deny:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo deny check advisories bans licenses sources",
+             "  cargo-deny:\n    runs-on: ubuntu-latest\n    steps: *scanner-steps"),
+         must_fail=True, expect="YAML alias or GitLab reference"),
+
     Case("or-true masks a scanner verdict",
          GOOD_GITLAB.replace("cargo audit --deny warnings", "cargo audit --deny warnings || true"),
          GOOD_GITHUB, must_fail=True, expect="shell-success masking"),

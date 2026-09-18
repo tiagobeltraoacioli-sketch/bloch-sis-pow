@@ -36,8 +36,8 @@ security job, fails if the job:
   * contains `exit 0`       — the silent skip that started this;
   * masks a command with `|| true`, `| true`, or `; true`;
   * conditionally skips execution through `if`, `rules`, `only`, `except`,
-    GitLab inheritance, a GitHub reusable-workflow delegation, or a `when`
-    other than `on_success`/`always`.
+    GitLab inheritance, a YAML alias/reference, a GitHub reusable-workflow
+    delegation, or a `when` other than `on_success`/`always`.
 
 It does NOT require every job to be blocking. cargo-geiger, miri and the fuzz
 smoke are deliberately report-only, with written reasons, and stay green here.
@@ -157,6 +157,13 @@ def check_file(path: str, required: dict[str, str], indent: int, label: str) -> 
                 problems.append(
                     "%s: job `%s` (%s) has conditional or inherited execution; "
                     "the supported blocking subset requires an unconditional job"
+                    % (label, job, why))
+            if (re.match(r"^[A-Za-z0-9_.-]+:\s*(?:\*|!reference\b)", value)
+                    or value.startswith("*")
+                    or value.startswith("!reference")):
+                problems.append(
+                    "%s: job `%s` (%s) uses a YAML alias or GitLab reference; "
+                    "the supported blocking subset requires locally inspectable values"
                     % (label, job, why))
             line_indent = len(line) - len(line.lstrip(" "))
             if (label == ".github/workflows/security.yml"
