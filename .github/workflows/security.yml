@@ -11,9 +11,11 @@
 # blst, pqcrypto/PQClean).
 #
 # Gating philosophy (identical to GitLab):
-#   BLOCKING     — cargo-audit, cargo-deny, clippy-hardened. A known
-#                  high-severity advisory, a supply-chain/license violation, or
-#                  a panic/overflow in consensus code must fail the pipeline.
+#   BLOCKING     — cargo-audit, cargo-deny, clippy-hardened and rollback
+#                  package authentication. A known high-severity advisory, a
+#                  supply-chain/license violation, a panic/overflow in
+#                  consensus code, or an unauthenticated rollback path must
+#                  fail the pipeline.
 #   REPORT-ONLY  — cargo-geiger, miri, cargo-fuzz smoke (early-warning surfaces;
 #                  nightly-dependent or known-noisy, triaged in
 #                  SECURITY_TOOLING.md, not yet hard gates). These use
@@ -227,9 +229,10 @@ jobs:
         run: python3 scripts/scan-secrets.test.py
 
   # scanners-blocking guard — the regression test for finding I-H4 itself. Fails
-  # if either CI file re-acquires a scanner escape hatch (`continue-on-error` /
+  # if either CI file re-acquires a required-job escape (`continue-on-error` /
   # `allow_failure: true`, an `exit 0` skip, `when: manual`) or drops a required
-  # scanner job entirely. Pure Python 3, no toolchain.
+  # security job entirely. This also holds rollback-package authentication in
+  # both pipelines. Pure Python 3, no toolchain.
   scanners-blocking-guard:
     name: scanners-blocking guard (blocking)
     runs-on: ubuntu-latest
@@ -242,7 +245,23 @@ jobs:
       - name: guard
         run: python3 scripts/check-scanners-blocking.py
 
-  # ── REPORT-ONLY (early-warning; continue-on-error) ──────────────────────────
+  # Rollback-package authentication (audit I-H3 / INF-09). GitLab runs this
+  # disposable-key end-to-end test; the GitHub mirror must exercise the same
+  # root-execution boundary. It proves that a rewritten manifest, edited
+  # installer, missing signature, wrong trust root and cross-package signature
+  # are refused before staging. No fleet service or release key is touched.
+  rollback-package-integrity:
+    name: rollback package integrity (blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Authenticate rollback package and rejection paths
+        run: bash deploy/rollback/make-rollback-package.selftest.sh
+
+  # ── REPORT-ONLY jobs begin here ───────────────────────────────────────────────
 
   # clippy (full, pedantic) — informational; the fork is not yet pedantic-clean.
   clippy:

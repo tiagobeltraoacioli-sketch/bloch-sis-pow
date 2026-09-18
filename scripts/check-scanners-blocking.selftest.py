@@ -87,6 +87,12 @@ scanners-blocking-guard:
   script:
     - python3 scripts/check-scanners-blocking.py
   allow_failure: false
+
+rollback-package-integrity:
+  stage: check
+  script:
+    - bash deploy/rollback/make-rollback-package.selftest.sh
+  allow_failure: false
 """
 
 GOOD_GITHUB = """\
@@ -121,6 +127,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: bash scripts/scan-secrets.sh history
+
+  rollback-package-integrity:
+    runs-on: ubuntu-latest
+    steps:
+      - run: bash deploy/rollback/make-rollback-package.selftest.sh
 
   cargo-geiger:
     runs-on: ubuntu-latest
@@ -205,6 +216,13 @@ CASES = [
              "  scanners-blocking-guard:\n    runs-on: ubuntu-latest\n"
              "    steps:\n      - run: python3 scripts/check-scanners-blocking.py\n\n", ""),
          must_fail=True, expect="MISSING"),
+
+    Case("github rollback integrity job deleted outright",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  rollback-package-integrity:\n    runs-on: ubuntu-latest\n"
+             "    steps:\n      - run: bash deploy/rollback/make-rollback-package.selftest.sh\n\n", ""),
+         must_fail=True, expect="`rollback-package-integrity`"),
 
     Case("both files missing entirely fails closed", None, None,
          must_fail=True, expect="MISSING"),

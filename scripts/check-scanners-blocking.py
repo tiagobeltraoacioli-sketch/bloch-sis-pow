@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Refuse a security-scanner job that cannot fail the build.
+"""Refuse a required security job that cannot fail the build.
 
 WHY THIS EXISTS
 ---------------
@@ -29,7 +29,7 @@ that job could not fail.
 WHAT THIS GUARD DOES
 --------------------
 Reads both CI files as text (no PyYAML on the runners) and, for each REQUIRED
-scanner job, fails if the job:
+security job, fails if the job:
 
   * is ABSENT               — a deleted gate must not read as a passing gate;
   * `allow_failure: true`   — GitLab escape;
@@ -42,15 +42,15 @@ smoke are deliberately report-only, with written reasons, and stay green here.
 The set below is the list of jobs whose failure must stop a merge; adding an
 escape to one of them is the regression this file exists to catch.
 
-Deliberately blunt about `exit 0`: any occurrence inside a required scanner job
-is refused, even a plausible-looking one. There is no legitimate reason for a
-blocking scanner to hand-roll a success exit, and a guard that tries to tell a
-good early-exit from a bad one is a guard that can be talked around.
+Deliberately blunt about `exit 0`: any occurrence inside a required security
+job is refused, even a plausible-looking one. There is no legitimate reason
+for a blocking gate to hand-roll a success exit, and a guard that tries to tell
+a good early-exit from a bad one is a guard that can be talked around.
 
 Pure Python 3. No toolchain, no build, no network.
 
 Run: python3 scripts/check-scanners-blocking.py
-Exit 0 = both pipelines can still fail on a scanner finding.
+Exit 0 = both pipelines can still fail on every registered security verdict.
 """
 
 from __future__ import annotations
@@ -70,6 +70,7 @@ GITLAB_REQUIRED = {
     "cargo-audit":             "RustSec advisory backstop",
     "supply-chain":            "cargo-deny advisories + licenses + sources",
     "scanners-blocking-guard": "this guard (it must gate its own pipeline)",
+    "rollback-package-integrity": "signed rollback-package rejection paths",
 }
 GITHUB_REQUIRED = {
     "osv-scanner":             "the only OSV/GHSA advisory scan (yamux GHSA-vxx9-2994-q338)",
@@ -78,6 +79,7 @@ GITHUB_REQUIRED = {
     "cargo-audit":             "RustSec advisory backstop",
     "cargo-deny":              "advisories + licenses + sources",
     "scanners-blocking-guard": "this guard (it must gate its own pipeline)",
+    "rollback-package-integrity": "signed rollback-package rejection paths",
 }
 
 ESCAPES = (
@@ -160,7 +162,7 @@ def main() -> int:
         print("never by letting the job go green.")
         return 1
 
-    print("scanner-posture guard: OK — %d GitLab + %d GitHub scanner jobs are blocking"
+    print("security-posture guard: OK — %d GitLab + %d GitHub jobs are blocking"
           % (len(GITLAB_REQUIRED), len(GITHUB_REQUIRED)))
     return 0
 
