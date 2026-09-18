@@ -2867,11 +2867,12 @@ impl Engine {
     fn forkchoice_head(&self) -> [u8; 32] {
         // Instrumentation only; compiled out without `perf-timing`.
         let _perf = bloch_pos_committee::perf::span(bloch_pos_committee::perf::Phase::ForkChoice);
-        lmd_ghost_head(
+        lmd_ghost_head_at_epoch(
             &self.blocks,
             self.pool.values(),
             &self.state.active_validators(),
             self.state.finality().justified.root,
+            epoch_of(self.state.slot()),
         )
     }
 
@@ -5783,6 +5784,34 @@ pub fn lmd_ghost_head<'a>(
     fc.head(&tree, justified, &children)
 }
 
+/// LMD-GHOST with epoch-gated FC-05 candidate selection. The gate is inert,
+/// so production currently takes the exact [`lmd_ghost_head`] path above.
+pub fn lmd_ghost_head_at_epoch<'a>(
+    blocks: &BTreeMap<[u8; 32], BlockEnvelope>,
+    pool: impl Iterator<Item = &'a Attestation>,
+    validators: &[bloch_pos_committee::sample::Validator],
+    justified: [u8; 32],
+    epoch: u64,
+) -> [u8; 32] {
+    if !bloch_pos_committee::params::forkchoice_slot_tiebreak_active(epoch) {
+        return lmd_ghost_head(blocks, pool, validators, justified);
+    }
+    lmd_ghost_head_with_slot_tiebreak(blocks, pool, validators, justified)
+}
+
+fn lmd_ghost_head_with_slot_tiebreak<'a>(
+    blocks: &BTreeMap<[u8; 32], BlockEnvelope>,
+    pool: impl Iterator<Item = &'a Attestation>,
+    validators: &[bloch_pos_committee::sample::Validator],
+    justified: [u8; 32],
+) -> [u8; 32] {
+    let (fc, parents, children) = forkchoice_store(blocks, pool, validators);
+    let slots: HashMap<[u8; 32], u64> =
+        blocks.iter().map(|(id, env)| (*id, env.header.slot)).collect();
+    let tree = BlockTree { parents: &parents };
+    fc.head_with_slot_tiebreak(&tree, justified, &children, &slots)
+}
+
 /// [`lmd_ghost_head`] through the pre-2026-08-23 O(V·D²) fork choice.
 ///
 /// The differential oracle, and nothing else:
@@ -6639,6 +6668,77 @@ mod forkchoice_tests {
         assert_eq!(
             lmd_ghost_head(&blocks, pool_flipped.iter(), &validators, g),
             a3
+        );
+    }
+
+    /// FC-05 attack regression. With no votes, a next-slot sibling can grind
+    /// `body_root` until its block id is larger and therefore win today's
+    /// root tiebreak. The inactive candidate instead keeps the earlier-slot
+    /// honest sibling. Same-slot siblings deliberately retain the historical
+    /// root fallback; the final assertion records that residual rather than
+    /// claiming this narrow candidate is proposer boost.
+    #[test]
+    fn next_slot_body_grind_cannot_win_the_inactive_slot_tiebreak_candidate() {
+        let g = [0x99u8; 32];
+        let honest_header = header(g, 10, 0x11);
+        let honest = *BlockId::of(&honest_header).as_bytes();
+
+        let (attacker_header, attacker) = (1u8..=u8::MAX)
+            .find_map(|marker| {
+                let mut h = header(g, 11, 0x22);
+                h.body_root = [marker; 32];
+                let id = *BlockId::of(&h).as_bytes();
+                (id > honest).then_some((h, id))
+            })
+            .expect("a one-byte body-root grind must find a root above the honest block");
+
+        let envelope = |header: BlockHeaderV4| BlockEnvelope {
+            header,
+            proposer_sig: Vec::new(),
+            body: Body { transactions: Vec::new(), attestations: Vec::new() },
+        };
+        let mut blocks = BTreeMap::new();
+        blocks.insert(honest, envelope(honest_header.clone()));
+        blocks.insert(attacker, envelope(attacker_header));
+        let validators = vals(2);
+
+        assert_eq!(
+            lmd_ghost_head(&blocks, [].iter(), &validators, g),
+            attacker,
+            "control: today's zero-weight tie must be grindable through the larger root"
+        );
+        assert_eq!(
+            bloch_pos_committee::params::FORKCHOICE_SLOT_TIEBREAK_ACTIVATION_EPOCH,
+            u64::MAX,
+            "the candidate must remain inactive"
+        );
+        assert_eq!(
+            lmd_ghost_head_at_epoch(&blocks, [].iter(), &validators, g, u64::MAX),
+            attacker,
+            "the u64::MAX sentinel must preserve today's root tiebreak"
+        );
+        assert_eq!(
+            lmd_ghost_head_with_slot_tiebreak(&blocks, [].iter(), &validators, g),
+            honest,
+            "the candidate must prefer the signed earlier slot over a ground next-slot root"
+        );
+
+        let mut same_slot_attacker = honest_header;
+        same_slot_attacker.body_root = blocks[&attacker].header.body_root;
+        same_slot_attacker.slot = 10;
+        let same_slot_id = *BlockId::of(&same_slot_attacker).as_bytes();
+        let mut same_slot_blocks = BTreeMap::new();
+        same_slot_blocks.insert(honest, envelope(header(g, 10, 0x11)));
+        same_slot_blocks.insert(same_slot_id, envelope(same_slot_attacker));
+        assert_eq!(
+            lmd_ghost_head_with_slot_tiebreak(
+                &same_slot_blocks,
+                [].iter(),
+                &validators,
+                g,
+            ),
+            honest.max(same_slot_id),
+            "same-slot equal-weight siblings retain the documented root-grinding residual"
         );
     }
 

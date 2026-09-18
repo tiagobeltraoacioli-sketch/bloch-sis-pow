@@ -226,6 +226,29 @@ impl Store {
         justified: [u8; 32],
         children: &HashMap<[u8; 32], Vec<[u8; 32]>>,
     ) -> [u8; 32] {
+        self.head_inner(tree, justified, children, None)
+    }
+
+    /// FC-05 candidate: equal-weight siblings from different slots prefer the
+    /// earlier slot. The ordinary [`Self::head`] remains byte-for-byte
+    /// unchanged; the node calls this only after the inert activation gate.
+    pub fn head_with_slot_tiebreak(
+        &self,
+        tree: &BlockTree<'_>,
+        justified: [u8; 32],
+        children: &HashMap<[u8; 32], Vec<[u8; 32]>>,
+        slots: &HashMap<[u8; 32], u64>,
+    ) -> [u8; 32] {
+        self.head_inner(tree, justified, children, Some(slots))
+    }
+
+    fn head_inner(
+        &self,
+        tree: &BlockTree<'_>,
+        justified: [u8; 32],
+        children: &HashMap<[u8; 32], Vec<[u8; 32]>>,
+        slots: Option<&HashMap<[u8; 32], u64>>,
+    ) -> [u8; 32] {
         let weights = self.subtree_weights(tree);
         let mut steps = 0u64;
         // Bounded for the same reason `is_descendant_or_self` is bounded: a
@@ -247,7 +270,14 @@ impl Store {
             let mut best_w = w_of(&best);
             for child in &kids[1..] {
                 let w = w_of(child);
-                if w > best_w || (w == best_w && *child > best) {
+                let wins_tie = if let Some(slots) = slots {
+                    let child_slot = slots.get(child).copied().unwrap_or(u64::MAX);
+                    let best_slot = slots.get(&best).copied().unwrap_or(u64::MAX);
+                    child_slot < best_slot || (child_slot == best_slot && *child > best)
+                } else {
+                    *child > best
+                };
+                if w > best_w || (w == best_w && wins_tie) {
                     best = *child;
                     best_w = w;
                 }

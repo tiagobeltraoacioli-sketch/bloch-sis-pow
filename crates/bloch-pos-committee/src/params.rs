@@ -1707,6 +1707,23 @@ pub const REWARDS_V2_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// `forkchoice_equivocation_horizon_gate_is_inert` pins the inert value.
 pub const FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+/// Candidate FC-05 fork-choice tiebreak. `u64::MAX` means INERT.
+///
+/// Once armed, equal-weight siblings from different slots prefer the earlier
+/// slot before falling back to the historical larger-root order. Slot is a
+/// signed, validated header field, so the next-slot proposer cannot grind its
+/// body root to displace an earlier honest sibling at zero weight. Same-slot
+/// siblings still need a deterministic root fallback and remain grindable;
+/// balancing attacks and a full proposer-boost design remain residual.
+///
+/// This changes the selected head, so activation requires attack simulation,
+/// historical replay and a coordinated fleet flag day.
+pub const FORKCHOICE_SLOT_TIEBREAK_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+pub fn forkchoice_slot_tiebreak_active(epoch: u64) -> bool {
+    epoch_gate_active(epoch, FORKCHOICE_SLOT_TIEBREAK_ACTIVATION_EPOCH)
+}
+
 /// How many slots of per-validator vote history the committed
 /// `fc_recent_votes` component retains once
 /// [`FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH`] binds: after the
