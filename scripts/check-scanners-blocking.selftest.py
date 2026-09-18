@@ -14,10 +14,10 @@ So this builds synthetic CI files in a temporary directory — never the real
 tree, so a failed selftest cannot leave the working copy dirty — and asserts
 BOTH directions:
 
-  * every escape shape must be caught, and caught BY NAME (a checker failing
-    for some other reason would otherwise look like a pass): allow_failure,
-    continue-on-error, an `exit 0` skip, `when: manual`, and a job deleted
-    outright;
+  * every supported escape shape must be caught, and caught BY NAME (a checker
+    failing for some other reason would otherwise look like a pass): alternate
+    waiver spellings, expressions/structured values, shell-success masking,
+    conditional/inherited execution, and a job deleted outright;
   * the honest shape must stay green, INCLUDING the shapes one word away from a
     violation — a deliberately report-only job (cargo-geiger) that is allowed
     to fail, and a comment that merely mentions `allow_failure` next to a
@@ -49,6 +49,12 @@ cargo-geiger:
   script:
     - cargo geiger || true
   allow_failure: true
+
+clippy-hardened:
+  stage: check
+  script:
+    - bash scripts/hardened-clippy.selftest.sh
+    - bash scripts/hardened-clippy.sh
 
 osv-scanner:
   stage: check
@@ -98,6 +104,11 @@ rollback-package-integrity:
 GOOD_GITHUB = """\
 name: security
 jobs:
+  clippy-hardened:
+    runs-on: ubuntu-latest
+    steps:
+      - run: bash scripts/hardened-clippy.sh
+
   cargo-audit:
     runs-on: ubuntu-latest
     steps:
@@ -223,6 +234,63 @@ CASES = [
              "  rollback-package-integrity:\n    runs-on: ubuntu-latest\n"
              "    steps:\n      - run: bash deploy/rollback/make-rollback-package.selftest.sh\n\n", ""),
          must_fail=True, expect="`rollback-package-integrity`"),
+
+    Case("required clippy job deleted",
+         GOOD_GITLAB.replace(
+             "clippy-hardened:\n  stage: check\n  script:\n"
+             "    - bash scripts/hardened-clippy.selftest.sh\n"
+             "    - bash scripts/hardened-clippy.sh\n\n", ""),
+         GOOD_GITHUB, must_fail=True, expect="`clippy-hardened`"),
+
+    Case("alternate YAML True waives a scanner",
+         GOOD_GITLAB.replace("  allow_failure: false", "  allow_failure: True", 1),
+         GOOD_GITHUB, must_fail=True, expect="allow_failure"),
+
+    Case("GitHub expression waives a scanner",
+         GOOD_GITLAB,
+         sub(GOOD_GITHUB, "  osv-scanner:\n    runs-on: ubuntu-latest",
+             "  osv-scanner:\n    runs-on: ubuntu-latest\n    continue-on-error: ${{ true }}"),
+         must_fail=True, expect="continue-on-error"),
+
+    Case("structured GitLab failure waiver",
+         GOOD_GITLAB.replace(
+             "  allow_failure: false", "  allow_failure: {exit_codes: [1]}", 1),
+         GOOD_GITHUB, must_fail=True, expect="allow_failure"),
+
+    Case("rules can skip a required job",
+         GOOD_GITLAB.replace(
+             "osv-scanner:\n  stage: check", "osv-scanner:\n  stage: check\n  rules:\n    - when: never"),
+         GOOD_GITHUB, must_fail=True, expect="conditional or inherited"),
+
+    Case("GitHub if can skip a required job",
+         GOOD_GITLAB,
+         sub(GOOD_GITHUB, "  secret-scan:\n    runs-on: ubuntu-latest",
+             "  secret-scan:\n    runs-on: ubuntu-latest\n    if: false"),
+         must_fail=True, expect="conditional or inherited"),
+
+    Case("YAML inheritance is outside the supported subset",
+         GOOD_GITLAB.replace(
+             "osv-scanner:\n  stage: check", "osv-scanner:\n  <<: *scanner-defaults\n  stage: check"),
+         GOOD_GITHUB, must_fail=True, expect="conditional or inherited"),
+
+    Case("or-true masks a scanner verdict",
+         GOOD_GITLAB.replace("cargo audit --deny warnings", "cargo audit --deny warnings || true"),
+         GOOD_GITHUB, must_fail=True, expect="shell-success masking"),
+
+    Case("semicolon-true masks a scanner verdict",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace("cargo deny check advisories bans licenses sources",
+                             "cargo deny check advisories bans licenses sources; true"),
+         must_fail=True, expect="shell-success masking"),
+
+    Case("pipe-to-true masks a scanner verdict",
+         GOOD_GITLAB.replace("cargo audit --deny warnings", "cargo audit --deny warnings | true"),
+         GOOD_GITHUB, must_fail=True, expect="shell-success masking"),
+
+    Case("set plus-e disables failure propagation",
+         GOOD_GITLAB.replace(
+             "    - cargo audit --deny warnings", "    - set +e\n    - cargo audit --deny warnings"),
+         GOOD_GITHUB, must_fail=True, expect="disabled shell failure"),
 
     Case("both files missing entirely fails closed", None, None,
          must_fail=True, expect="MISSING"),

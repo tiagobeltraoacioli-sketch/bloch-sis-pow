@@ -83,7 +83,6 @@ clippy-hardened:
   script:
     - bash scripts/hardened-clippy.selftest.sh
     - python3 scripts/hardened-clippy-score.test.py
-    - rustup component add clippy || true
     - bash scripts/hardened-clippy.sh
 
 # Consensus invariants, called out from the workspace run for visibility.

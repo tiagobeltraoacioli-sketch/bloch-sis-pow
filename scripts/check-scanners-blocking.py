@@ -32,10 +32,11 @@ Reads both CI files as text (no PyYAML on the runners) and, for each REQUIRED
 security job, fails if the job:
 
   * is ABSENT               — a deleted gate must not read as a passing gate;
-  * `allow_failure: true`   — GitLab escape;
-  * `continue-on-error: true` — the GitHub spelling of the same thing;
+  * any non-false `allow_failure` / `continue-on-error` value;
   * contains `exit 0`       — the silent skip that started this;
-  * is `when: manual`       — a gate nobody triggers is not a gate.
+  * masks a command with `|| true`, `| true`, or `; true`;
+  * conditionally skips execution through `if`, `rules`, `only`, `except`,
+    inheritance, or a `when` other than `on_success`/`always`.
 
 It does NOT require every job to be blocking. cargo-geiger, miri and the fuzz
 smoke are deliberately report-only, with written reasons, and stay green here.
@@ -50,7 +51,9 @@ a good early-exit from a bad one is a guard that can be talked around.
 Pure Python 3. No toolchain, no build, no network.
 
 Run: python3 scripts/check-scanners-blocking.py
-Exit 0 = both pipelines can still fail on every registered security verdict.
+Exit 0 = the supported explicit job subset can still fail on every registered
+security verdict. This is not a proof for arbitrary YAML inheritance or shell
+execution semantics.
 """
 
 from __future__ import annotations
@@ -64,6 +67,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Jobs whose failure must stop a merge, per file. Keys are the YAML job keys.
 GITLAB_REQUIRED = {
+    "clippy-hardened":          "consensus panic/arithmetic ratchet",
     "osv-scanner":             "the only OSV/GHSA advisory scan (yamux GHSA-vxx9-2994-q338)",
     "secret-scan":             "committed-credential scan",
     "secret-history-scan":     "reachable-history credential scan",
@@ -73,6 +77,7 @@ GITLAB_REQUIRED = {
     "rollback-package-integrity": "signed rollback-package rejection paths",
 }
 GITHUB_REQUIRED = {
+    "clippy-hardened":          "consensus panic/arithmetic ratchet",
     "osv-scanner":             "the only OSV/GHSA advisory scan (yamux GHSA-vxx9-2994-q338)",
     "secret-scan":             "committed-credential scan",
     "secret-history-scan":     "reachable-history credential scan",
@@ -82,12 +87,14 @@ GITHUB_REQUIRED = {
     "rollback-package-integrity": "signed rollback-package rejection paths",
 }
 
-ESCAPES = (
-    (re.compile(r"^\s*allow_failure:\s*true\b"),      "allow_failure: true"),
-    (re.compile(r"^\s*continue-on-error:\s*true\b"),  "continue-on-error: true"),
-    (re.compile(r"(^|[;&|\s])exit\s+0\b"),            "an `exit 0` escape (the silent skip)"),
-    (re.compile(r"^\s*when:\s*manual\b"),             "when: manual"),
+SHELL_ESCAPES = (
+    (re.compile(r"(^|[;&|\s])exit\s+0\b"), "an `exit 0` escape (the silent skip)"),
+    (re.compile(r"(?:\|\||\||;)\s*true\b"), "a shell-success masking escape"),
+    (re.compile(r"^\s*(?:-\s+)?set\s+\+e\b"), "disabled shell failure propagation"),
 )
+
+FALSE_LITERALS = {"false", "no", "0"}
+SAFE_WHEN = {"on_success", "always"}
 
 
 def job_blocks(text: str, indent: int) -> dict[str, list[str]]:
@@ -134,7 +141,29 @@ def check_file(path: str, required: dict[str, str], indent: int, label: str) -> 
                 "gate that passed." % (label, job, why))
             continue
         for line in blocks[job]:
-            for pattern, name in ESCAPES:
+            waiver = re.match(
+                r"^\s*(?:-\s+)?(allow_failure|continue-on-error):\s*(.*?)\s*(?:#.*)?$",
+                line,
+            )
+            if waiver and waiver.group(2).strip("\"'").lower() not in FALSE_LITERALS:
+                problems.append(
+                    "%s: job `%s` (%s) carries %s with a true, structured, "
+                    "expression, or missing value — it cannot certify a blocking verdict"
+                    % (label, job, why, waiver.group(1)))
+
+            value = re.sub(r"^\s*-\s+", "", line.strip())
+            if re.match(r"^(?:if|rules|only|except):", value) or value.startswith("<<:"):
+                problems.append(
+                    "%s: job `%s` (%s) has conditional or inherited execution; "
+                    "the supported blocking subset requires an unconditional job"
+                    % (label, job, why))
+            when = re.match(r"^when:\s*([^\s#]+)", value)
+            if when and when.group(1).strip("\"'").lower() not in SAFE_WHEN:
+                problems.append(
+                    "%s: job `%s` (%s) carries conditional `when: %s`"
+                    % (label, job, why, when.group(1)))
+
+            for pattern, name in SHELL_ESCAPES:
                 if pattern.search(line):
                     problems.append(
                         "%s: job `%s` (%s) carries %s — it cannot fail the "
