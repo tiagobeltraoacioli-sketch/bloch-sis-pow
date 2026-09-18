@@ -2,9 +2,10 @@
 
 Audit follow-up (2026-09-17): new authenticated sessions use the parsed
 address's canonical spelling for shares and credits. Hex case aliases no
-longer create separate new accounting identities. Existing journals retain
-their original spelling and balances; reconcile historical aliases before
-manual payouts rather than rewriting credited history automatically.
+longer create separate accounting identities. Historical journals remain an
+immutable audit trail, while startup replay canonicalizes every valid address
+in shares, block finders and snapshotted payouts. Consequently old case aliases
+converge to one derived balance before any manual payout.
 
 > **Genesis-3-era component. There is nothing to mine.** This pool serves the
 > proof-of-work chain, which stopped at height 39,918 on 2026-08-13. The live
