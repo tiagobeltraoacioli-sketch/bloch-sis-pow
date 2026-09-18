@@ -28,6 +28,9 @@ lever while leaving proposer boost, balancing, and same-slot grinding open.
 The [Wave 45–47 integration checkpoint](WAVE-47-INTEGRATION.md) records the
 combined 200-row ledger, final validation, inactive-gate review, and the seven
 findings that still require external evidence or protocol decisions.
+Wave 48 begins with [fail-closed operational boundaries](WAVE-48-OPERATIONS.md)
+for the read-only fleet verifier and weak-subjectivity release check; neither
+change rotates a live credential or creates the still-missing signed envelope.
 
 ## Scope and source reconciliation
 
