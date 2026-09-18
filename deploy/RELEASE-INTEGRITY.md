@@ -114,12 +114,14 @@ already embodies for G3:
 > the container to compare honestly.
 
 Honest-claim ladder (mirrors `REPRO.md`): today `bloch-pos` has earned
-**"deterministic, same-path, single host — measured"**. It has **not** yet
-earned "reproducible": that requires the two-independent-builder bit-for-bit
-match of the canonical container build, and the `bloch-pos` release container
-does not exist yet (§8.1). Do not use the word "reproducible" in any public
-artifact for `bloch-pos` until that is green — the trademark/earned-word gate
-applies.
+**"deterministic, same-path, single host — measured"**. GitLab retains an
+unsigned release candidate with its source commit, toolchain, target, version
+and SHA256 (`scripts/package-pos-release-candidate.sh`), but that is not the
+canonical release. It has **not** yet earned "reproducible": that requires the
+two-independent-builder bit-for-bit match of the canonical container build,
+and the `bloch-pos` release container does not exist yet (§8.1). Do not use the
+word "reproducible" in any public artifact for `bloch-pos` until that is green
+— the trademark/earned-word gate applies.
 
 ## 4. Fleet-vs-release verification (the sweep that would have caught f819e87f)
 
