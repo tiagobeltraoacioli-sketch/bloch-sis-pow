@@ -97,7 +97,9 @@ use bloch_pos_committee::forkchoice::{BlockTree, LatestMessage, Store as FcStore
 use bloch_pos_committee::gossip::{AttestationPool, GossipDecision};
 use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, VERSION_G4};
 use bloch_pos_committee::interfaces::{ProposalEnvelope, StateReader, StateTransition, ValidatorRecord};
-use bloch_pos_committee::params::{MAX_ATTESTATIONS_PER_BLOCK, SLOTS_PER_EPOCH};
+use bloch_pos_committee::params::{
+    MAX_ATTESTATIONS_PER_BLOCK, MAX_EPOCH_ADVANCE, SLOTS_PER_EPOCH,
+};
 use bloch_pos_committee::schedule::first_slot_of_epoch;
 use bloch_pos_committee::transition::{CommittedState, PosTransaction, Transition};
 use bloch_pos_committee::interfaces::TransitionError;
@@ -217,6 +219,36 @@ fn node_is_behind(
 ) -> bool {
     head_slot.saturating_add(1) < wall_slot
         && now_ms.saturating_sub(last_applied_ms) > stale_after_ms
+}
+
+/// Remaining wall-clock epochs before a single block extending `head_slot`
+/// would exceed the consensus epoch-walk ceiling.
+///
+/// This is deliberately a pure observation. Feeding it back into block
+/// validity, fork choice or duties would turn a local clock into consensus.
+/// At zero, the current wall epoch is the last one inside the ceiling when
+/// the gap is exactly `MAX_EPOCH_ADVANCE`; a larger gap is already outside.
+fn epoch_advance_headroom_epochs(head_slot: u64, wall_slot: u64) -> u64 {
+    let gap = epoch_of(wall_slot).saturating_sub(epoch_of(head_slot));
+    MAX_EPOCH_ADVANCE.saturating_sub(gap)
+}
+
+const EPOCH_ADVANCE_EARLY_WARNING_EPOCHS: u64 = 512;
+const EPOCH_ADVANCE_CRITICAL_WARNING_EPOCHS: u64 = 128;
+
+/// Monotone severity for rate-limiting the operator warning while a head is
+/// stalled. A catching-up head lowers the level, allowing a later independent
+/// outage to warn again.
+fn epoch_advance_risk_level(headroom: u64) -> u8 {
+    if headroom == 0 {
+        3
+    } else if headroom <= EPOCH_ADVANCE_CRITICAL_WARNING_EPOCHS {
+        2
+    } else if headroom <= EPOCH_ADVANCE_EARLY_WARNING_EPOCHS {
+        1
+    } else {
+        0
+    }
 }
 
 /// A bounded stale-head quarantine for the slot loop.
@@ -5425,6 +5457,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let two_slots_ms = slot_ms.saturating_mul(2);
     let mut finality_stalled = false;
     let mut metrics_sampled_slot: u64 = 0;
+    let mut epoch_advance_warning_level: u8 = 0;
 
     loop {
         match engine.store.poll_rewrite() {
@@ -5570,6 +5603,25 @@ pub fn run(cfg: Config) -> io::Result<()> {
             NodeMetrics::set(&NODE.head_slot, head);
             NodeMetrics::set(&NODE.wall_slot, slot);
             NodeMetrics::set(&NODE.behind_by_slots, slot.saturating_sub(head));
+            let epoch_headroom = epoch_advance_headroom_epochs(head, slot);
+            NodeMetrics::set(&NODE.epoch_advance_headroom_epochs, epoch_headroom);
+            let risk_level = epoch_advance_risk_level(epoch_headroom);
+            if risk_level > epoch_advance_warning_level {
+                let gap = wall_epoch.saturating_sub(epoch_of(head));
+                let urgency = match risk_level {
+                    1 => "EARLY WARNING",
+                    2 => "CRITICAL WARNING",
+                    _ => "RECOVERY CEILING REACHED",
+                };
+                eprintln!(
+                    "{urgency}: canonical head is {gap} epochs behind the wall clock; \
+                     {epoch_headroom} epochs remain before a single restart block exceeds \
+                     consensus MAX_EPOCH_ADVANCE={MAX_EPOCH_ADVANCE}. Restore canonical \
+                     progress before the headroom reaches zero; changing the constant \
+                     requires a coordinated consensus release."
+                );
+            }
+            epoch_advance_warning_level = risk_level;
             let fin = engine.state.finality();
             NodeMetrics::set(&NODE.finalized_epoch, fin.finalized.epoch);
             NodeMetrics::set(&NODE.justified_epoch, fin.justified.epoch);
@@ -12297,6 +12349,49 @@ mod validator_activity_tests {
 #[cfg(test)]
 mod stale_head_duty_gate_tests {
     use super::*;
+
+    #[test]
+    fn epoch_advance_headroom_is_exact_and_saturating() {
+        let head_epoch = 10;
+        let head = head_epoch * SLOTS_PER_EPOCH + (SLOTS_PER_EPOCH - 1);
+
+        assert_eq!(
+            epoch_advance_headroom_epochs(head, head),
+            MAX_EPOCH_ADVANCE,
+            "a current head has the entire consensus gap available"
+        );
+        assert_eq!(
+            epoch_advance_headroom_epochs(
+                head,
+                (head_epoch + MAX_EPOCH_ADVANCE) * SLOTS_PER_EPOCH,
+            ),
+            0,
+            "exactly at the ceiling, no additional wall epoch remains"
+        );
+        assert_eq!(
+            epoch_advance_headroom_epochs(
+                head,
+                (head_epoch + MAX_EPOCH_ADVANCE + 1) * SLOTS_PER_EPOCH,
+            ),
+            0,
+            "past the ceiling the operator gauge saturates instead of wrapping"
+        );
+        assert_eq!(
+            epoch_advance_headroom_epochs(head, 0),
+            MAX_EPOCH_ADVANCE,
+            "a wall clock behind the head must not manufacture a warning"
+        );
+    }
+
+    #[test]
+    fn epoch_advance_warning_levels_cross_only_the_documented_thresholds() {
+        assert_eq!(epoch_advance_risk_level(EPOCH_ADVANCE_EARLY_WARNING_EPOCHS + 1), 0);
+        assert_eq!(epoch_advance_risk_level(EPOCH_ADVANCE_EARLY_WARNING_EPOCHS), 1);
+        assert_eq!(epoch_advance_risk_level(EPOCH_ADVANCE_CRITICAL_WARNING_EPOCHS + 1), 1);
+        assert_eq!(epoch_advance_risk_level(EPOCH_ADVANCE_CRITICAL_WARNING_EPOCHS), 2);
+        assert_eq!(epoch_advance_risk_level(1), 2);
+        assert_eq!(epoch_advance_risk_level(0), 3);
+    }
 
     #[test]
     fn a_normal_one_slot_head_gap_does_not_block_duties() {

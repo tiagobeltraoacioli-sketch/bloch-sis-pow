@@ -149,6 +149,10 @@ pub struct NodeMetrics {
     /// `wall_slot - head_slot` (saturating). The "node is quietly behind"
     /// signal; on a healthy node this is 0 or 1.
     pub behind_by_slots: AtomicU64,
+    /// Epochs of wall-clock outage still available before one restart block
+    /// would exceed consensus `MAX_EPOCH_ADVANCE`. This is observability only:
+    /// it is never read by consensus or duty selection.
+    pub epoch_advance_headroom_epochs: AtomicU64,
     /// Committed finalized epoch.
     pub finalized_epoch: AtomicU64,
     /// Committed justified epoch.
@@ -253,6 +257,9 @@ impl NodeMetrics {
             head_slot: AtomicU64::new(0),
             wall_slot: AtomicU64::new(0),
             behind_by_slots: AtomicU64::new(0),
+            epoch_advance_headroom_epochs: AtomicU64::new(
+                bloch_pos_committee::params::MAX_EPOCH_ADVANCE,
+            ),
             finalized_epoch: AtomicU64::new(0),
             justified_epoch: AtomicU64::new(0),
             peer_count: AtomicU64::new(0),
@@ -389,6 +396,12 @@ impl NodeMetrics {
             "gauge",
             "wall_slot minus head_slot; 0-1 on a healthy node",
             self.get(&self.behind_by_slots),
+        );
+        series(
+            "bloch_pos_epoch_advance_headroom_epochs",
+            "gauge",
+            "Wall-clock epochs remaining before one restart block exceeds consensus MAX_EPOCH_ADVANCE; alert before this reaches zero",
+            self.get(&self.epoch_advance_headroom_epochs),
         );
         series(
             "bloch_pos_finalized_epoch",
@@ -767,6 +780,7 @@ mod tests {
             "bloch_pos_finality_stalls_total",
             "bloch_pos_peer_count",
             "bloch_pos_behind_by_slots",
+            "bloch_pos_epoch_advance_headroom_epochs",
             "bloch_pos_is_syncing",
             // R3 metrics-gap follow-up: equivocations, the finality-latch
             // refusal counter, per-transport peer counts, the sealed-keystore
@@ -789,6 +803,13 @@ mod tests {
             assert!(text.contains(name), "missing series {name}");
             assert!(text.contains(&format!("# TYPE {name}")), "missing TYPE for {name}");
         }
+        assert!(
+            text.contains(&format!(
+                "bloch_pos_epoch_advance_headroom_epochs {}",
+                bloch_pos_committee::params::MAX_EPOCH_ADVANCE,
+            )),
+            "the pre-slot-loop default must report full headroom, not a false zero alarm"
+        );
     }
 
     /// The health verdict is a pure function of heartbeat age and sync state.
