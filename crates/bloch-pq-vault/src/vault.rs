@@ -49,6 +49,9 @@ use bitcoin::{
 pub const MIN_NEW_VAULT_CSV_DELAY: u16 = 144;
 /// Bitcoin's maximum representable monetary supply, in satoshis.
 pub const BITCOIN_MAX_MONEY_SAT: u64 = 21_000_000 * 100_000_000;
+/// Bound on pre-signed clawback replacements retained per vault. This limits
+/// construction/backup size; it is not a Bitcoin relay-policy constant.
+pub const MAX_CLAWBACK_FEE_LADDER_STEPS: usize = 32;
 
 /// Refusals returned by the checked transaction-building API.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +65,9 @@ pub enum VaultTxError {
     UncompressedRoleKey,
     ReusedRoleKey,
     InvalidInputIndex,
+    FeeLadderTooShort,
+    FeeLadderTooLong,
+    FeeLadderNotIncreasing,
 }
 
 impl std::fmt::Display for VaultTxError {
@@ -76,6 +82,9 @@ impl std::fmt::Display for VaultTxError {
             Self::UncompressedRoleKey => "vault role keys must be compressed",
             Self::ReusedRoleKey => "hot and recovery keys must be distinct",
             Self::InvalidInputIndex => "sighash input index is out of range",
+            Self::FeeLadderTooShort => "a clawback fee ladder requires at least two steps",
+            Self::FeeLadderTooLong => "clawback fee ladder exceeds 32 steps",
+            Self::FeeLadderNotIncreasing => "clawback fee ladder must be strictly increasing",
         })
     }
 }
@@ -296,6 +305,64 @@ pub fn build_clawback_tx_checked(trigger_outpoint: OutPoint, trigger_amount_sat:
     Ok(build_clawback_tx(trigger_outpoint, trigger_amount_sat, safe_destination, fee_sat))
 }
 
+/// One unsigned replacement in a clawback fee ladder.
+///
+/// `SIGHASH_ALL` commits the input, destination and fee-dependent output, so
+/// every step needs its own recovery-key signature before the package is
+/// handed to a keyless watchtower.
+#[derive(Clone, Debug)]
+pub struct ClawbackReplacement {
+    pub fee_sat: u64,
+    pub transaction: Transaction,
+    pub sighash: [u8; 32],
+}
+
+/// Build a bounded set of pre-signable RBF clawback replacements.
+///
+/// Fees must be strictly increasing and each candidate independently passes
+/// the checked money-range, dust and ten-percent fee-policy checks. All steps
+/// spend the same trigger outpoint to the same safe destination and opt into
+/// RBF. This supplies authorization alternatives to a keyless watchtower; it
+/// does not estimate fees or guarantee that a particular node will accept a
+/// replacement under its current BIP-125/incremental-relay policy.
+pub fn build_clawback_fee_ladder_checked(
+    p: &VaultParams,
+    trigger_outpoint: OutPoint,
+    trigger_amount_sat: u64,
+    safe_destination: &Address,
+    fees_sat: &[u64],
+) -> Result<Vec<ClawbackReplacement>, VaultTxError> {
+    validate_new_vault_params(p)?;
+    if fees_sat.len() < 2 {
+        return Err(VaultTxError::FeeLadderTooShort);
+    }
+    if fees_sat.len() > MAX_CLAWBACK_FEE_LADDER_STEPS {
+        return Err(VaultTxError::FeeLadderTooLong);
+    }
+    if fees_sat.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(VaultTxError::FeeLadderNotIncreasing);
+    }
+
+    let witness_script = trigger_script(p);
+    let mut ladder = Vec::with_capacity(fees_sat.len());
+    for &fee_sat in fees_sat {
+        let transaction = build_clawback_tx_checked(
+            trigger_outpoint,
+            trigger_amount_sat,
+            safe_destination,
+            fee_sat,
+        )?;
+        let sighash = p2wsh_sighash_checked(
+            &transaction,
+            0,
+            &witness_script,
+            trigger_amount_sat,
+        )?;
+        ladder.push(ClawbackReplacement { fee_sat, transaction, sighash });
+    }
+    Ok(ladder)
+}
+
 /// Compute the BIP-143 P2WSH (segwit v0) sighash for `input_index`, over `witness_script`
 /// with the spent output's `amount_sat`, `SIGHASH_ALL`. This is the message the hot /
 /// recovery secp256k1 key signs.
@@ -337,6 +404,7 @@ pub fn p2wsh_sighash_checked(tx: &Transaction, input_index: usize,
 mod tests {
     use super::*;
     use bitcoin::hex::DisplayHex;
+    use crate::{ecdsa_witness_sig, preimage::recovery_hash, script_eval::{eval, EvalCtx}};
 
     fn test_pubkey(byte: u8) -> PublicKey {
         // A valid, deterministic secp256k1 pubkey from a fixed secret.
@@ -435,5 +503,86 @@ mod tests {
         assert_eq!(branch_a.input[0].sequence, Sequence::from_height(0));
         let clawback = build_clawback_tx(OutPoint::null(), 1, &destination, 2);
         assert_eq!(clawback.output[0].value, Amount::ZERO);
+    }
+
+    #[test]
+    fn clawback_fee_ladder_is_bounded_ordered_and_individually_signable() {
+        use bitcoin::{hashes::Hash, Txid};
+        use bitcoin::secp256k1::{Secp256k1, SecretKey};
+
+        let recovery_secret = SecretKey::from_slice(&[0x22; 32]).unwrap();
+        let preimage = [0x44; 32];
+        let mut p = params();
+        p.recovery_hash = recovery_hash(&preimage);
+        let outpoint = OutPoint { txid: Txid::from_byte_array([7; 32]), vout: 1 };
+        let safe = deposit_address(&p);
+        let fees = [500, 1_000, 2_000, 5_000];
+        let ladder = build_clawback_fee_ladder_checked(
+            &p,
+            outpoint,
+            100_000,
+            &safe,
+            &fees,
+        ).unwrap();
+
+        assert_eq!(ladder.len(), fees.len());
+        let trigger = trigger_script(&p);
+        for (index, step) in ladder.iter().enumerate() {
+            assert_eq!(step.fee_sat, fees[index]);
+            assert_eq!(step.transaction.input[0].previous_output, outpoint);
+            assert_eq!(step.transaction.input[0].sequence, Sequence::ENABLE_RBF_NO_LOCKTIME);
+            assert_eq!(step.transaction.output[0].script_pubkey, safe.script_pubkey());
+            assert_eq!(step.transaction.output[0].value.to_sat(), 100_000 - fees[index]);
+            assert_eq!(
+                step.sighash,
+                p2wsh_sighash(&step.transaction, 0, &trigger, 100_000),
+            );
+            let ctx = EvalCtx {
+                input_sequence: step.transaction.input[0].sequence,
+                confirmations: 0,
+                tx_version: step.transaction.version.0,
+                sighash: step.sighash,
+            };
+            assert_eq!(
+                eval(
+                    &Secp256k1::new(),
+                    &trigger,
+                    vec![ecdsa_witness_sig(&step.sighash, &recovery_secret), preimage.to_vec(), vec![]],
+                    &ctx,
+                ),
+                Ok(true),
+                "every replacement must be independently signable for branch B",
+            );
+        }
+        assert!(ladder.windows(2).all(|pair| {
+            pair[0].transaction.compute_txid() != pair[1].transaction.compute_txid()
+                && pair[0].sighash != pair[1].sighash
+        }));
+    }
+
+    #[test]
+    fn clawback_fee_ladder_rejects_unsafe_or_ambiguous_schedules() {
+        use bitcoin::{hashes::Hash, Txid};
+        let p = params();
+        let outpoint = OutPoint { txid: Txid::from_byte_array([8; 32]), vout: 0 };
+        let safe = deposit_address(&p);
+        let build = |fees: &[u64]| {
+            build_clawback_fee_ladder_checked(&p, outpoint, 100_000, &safe, fees)
+                .map(|_| ())
+        };
+        assert_eq!(build(&[]), Err(VaultTxError::FeeLadderTooShort));
+        assert_eq!(build(&[500]), Err(VaultTxError::FeeLadderTooShort));
+        assert_eq!(build(&[500, 500]), Err(VaultTxError::FeeLadderNotIncreasing));
+        assert_eq!(build(&[1_000, 500]), Err(VaultTxError::FeeLadderNotIncreasing));
+        assert_eq!(
+            build(&vec![1; MAX_CLAWBACK_FEE_LADDER_STEPS + 1]),
+            Err(VaultTxError::FeeLadderTooLong),
+        );
+        assert_eq!(build(&[500, 10_001]), Err(VaultTxError::ExcessiveFee));
+        assert_eq!(
+            build_clawback_fee_ladder_checked(&p, OutPoint::null(), 100_000, &safe, &[500, 1_000])
+                .map(|_| ()),
+            Err(VaultTxError::NullOutpoint),
+        );
     }
 }

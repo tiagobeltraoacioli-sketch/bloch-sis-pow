@@ -80,6 +80,9 @@ impl SeparatedDepositV1 {
                 vault::VaultTxError::UncompressedRoleKey => "vault role keys must be compressed",
                 vault::VaultTxError::ReusedRoleKey => "vault role keys must be distinct",
                 vault::VaultTxError::InvalidInputIndex => "unexpected sighash input index",
+                vault::VaultTxError::FeeLadderTooShort => "unexpected fee ladder error",
+                vault::VaultTxError::FeeLadderTooLong => "unexpected fee ladder error",
+                vault::VaultTxError::FeeLadderNotIncreasing => "unexpected fee ladder error",
             })
     }
 }
