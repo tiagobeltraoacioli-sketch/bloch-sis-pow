@@ -8948,14 +8948,11 @@ mod bench {
 
     /// The opening-ledger size this bench sizes its state to.
     ///
-    /// It does NOT agree with `CARRYOVER-SNAPSHOT.md`, which records 452,726
-    /// rows, nor with `engine/replay_bench.rs`'s `CARRYOVER_N`, which is that
-    /// same 452,726 — a gap of 593 outputs. The constant is left at 452,133
-    /// rather than quietly moved: this is an `#[ignore]`d measurement that
-    /// asserts nothing, so the gap costs nothing today, and editing a figure to
-    /// match a document is exactly how a wrong figure becomes load-bearing.
-    /// Which of the two is stale is for the founder to settle.
-    const MAINNET_EUTXOS: u32 = 452_133;
+    /// This is the terminal artifact's committed row count, shared with
+    /// `CARRYOVER-SNAPSHOT.md`, `CARRYOVER_MEASURED_UTXOS` and replay_bench's
+    /// `CARRYOVER_N`. The earlier 452,133 measurement was taken 590 heights
+    /// before terminal and must not size a benchmark presented as mainnet.
+    const MAINNET_EUTXOS: u32 = 452_726;
 
     fn mainnet_sized_state(n: u32) -> CommittedState {
         let entries: Vec<EutxoEntry> = (0..n)
@@ -9094,7 +9091,7 @@ mod bench {
     ///
     /// Sized at 452,726 eUTXO leaves — the Genesis-4 carryover's own count,
     /// the same constant `tests/replay_hotpath_perf.rs` calls `CARRYOVER_N`.
-    /// The 452,133 above it is Genesis-3's and is left alone.
+    /// The benchmark constant above uses the same terminal count.
     ///
     /// BEFORE is not a paraphrase: it is `state.state_root()` followed by the
     /// same `chain_info_json` call, which is exactly what the old body did

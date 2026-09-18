@@ -37,7 +37,11 @@
 //! ```
 
 use std::io::Write;
-use std::path::Path;
+
+fn decode_height_key(key: &[u8]) -> Option<u64> {
+    let bytes: [u8; 8] = key.try_into().ok()?;
+    Some(u64::from_be_bytes(bytes))
+}
 
 /// Decode a UTXO key's 4-byte vout suffix. Legacy M-3: `canonical` selects
 /// which of the two disagreeing conventions to use — see the long comment at
@@ -88,6 +92,15 @@ mod decode_vout_tests {
             assert_eq!(decode_vout(written, true), vout,
                 "canonical decode must recover vout={vout} from its own LE encoding");
         }
+    }
+
+    #[test]
+    fn selected_height_index_keys_are_big_endian() {
+        for height in [0u64, 1, 39_918, u32::MAX as u64, u64::MAX] {
+            assert_eq!(decode_height_key(&height.to_be_bytes()), Some(height));
+        }
+        assert_eq!(decode_height_key(&[0; 7]), None);
+        assert_eq!(decode_height_key(&[0; 9]), None);
     }
 }
 
@@ -164,7 +177,27 @@ fn main() {
             .and_then(|cf| db.get_cf(&cf, key.as_bytes()).ok().flatten())
             .and_then(|b| b.as_slice().try_into().ok().map(u64::from_le_bytes))
     };
-    let height = read_u64_meta("tip_height");
+    // Heights are keys in CF_HEIGHT; the node never writes a `tip_height`
+    // metadata record. Reading that dead key made every snapshot print
+    // "unknown" even though the selected-height index was present. Match
+    // Storage::get_tip_height: the final big-endian key is the highest height.
+    let height = match db.cf_handle("height") {
+        None => None,
+        Some(cf) => match db.iterator_cf(&cf, rocksdb::IteratorMode::End).next() {
+            None => None,
+            Some(Ok((key, _))) => match decode_height_key(key.as_ref()) {
+                Some(height) => Some(height),
+                None => {
+                    eprintln!("height index has a non-u64 key; refusing misleading snapshot metadata");
+                    std::process::exit(1);
+                }
+            },
+            Some(Err(error)) => {
+                eprintln!("cannot read the selected-height index: {error}");
+                std::process::exit(1);
+            }
+        },
+    };
     let pruned = read_u64_meta("pruned_height").unwrap_or(0);
 
     // DOC-DRIFT FIX (Legacy M-3): this comment used to say CF_UTXO keys are
@@ -225,7 +258,7 @@ fn main() {
     // file and the root are therefore two views of one artifact — you can
     // recompute the root from the file and get the same answer, which is what
     // makes independent verification possible.
-    use sha3::{Digest, Shake256};
+    use sha3::Shake256;
     use sha3::digest::{Update, ExtendableOutput, XofReader};
     let mut hasher = Shake256::default();
 

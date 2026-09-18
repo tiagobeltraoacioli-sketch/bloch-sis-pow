@@ -8,6 +8,12 @@
 > settlement guarantee. See `docs/VALIDATOR-OPENING.md` and the September 13
 > activation preflight for the release conditions and retained evidence.
 
+> **Carryover status update — 2026-09-17.** This is a historical implementation
+> plan written before Genesis-3 stopped. Its 452,133-row/height-39,328 figures
+> describe an interim snapshot. The committed terminal artifact is height
+> 39,918, 452,726 rows and 3,810,744,000 Genesis-3 BLCH; after the ×100/21 split
+> it is 18,146,400,000 BLOCH. `CARRYOVER-SNAPSHOT.md` is authoritative.
+
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 
 # Genesis-4 — Integration Plan for the Four Remaining Items
@@ -436,24 +442,17 @@ it. Two adaptations are required, and both are decisions, not typing:
 
 ### 5.3 Three decisions that block this item
 
-**D1 — the dust rule for the 100/21 split. Unresolved in code, and the code
-says so.** `tokenomics_v4.rs:57-67`:
+**D1 — the dust rule for the 100/21 split (resolved after this plan).**
+`genesis.rs::read_carryover_snapshot` applies the split per output, then gives
+the accumulated remainder to the highest-value output, ties broken by the
+lowest `(txid, vout)`. The terminal artifact has 452,726 outputs totalling
+3,810,744,000 Genesis-3 BLCH. Its aggregate split is 18,146,400,000 BLOCH;
+111 rows have a fractional remainder and the deterministic adjustment is 57
+satoshis.
 
-> *"This is the function the carryover rebuild must apply per balance. It
-> truncates: a balance not divisible by 21 loses up to 20/21 of a satoshi. The
-> ceremony pins the artifact's TOTAL against `CARRYOVER_TOTAL_BLOCH` exactly,
-> so the builder must state its dust rule (who absorbs the sub-satoshi
-> remainders) and make the rows sum to the pinned figure — **truncate-and-hope
-> does not close the accounting**."*
-
-Concretely: the snapshot is 452,133 outputs totalling 3,805,746,000 BLCH
-(pre-split). `CARRYOVER_TOTAL_BLOCH = 18_122_600_000` (`tokenomics_v4.rs:187`),
-and `3,805,746,000 × 100 / 21 = 18,122,600,000` **exactly** at the aggregate.
-Per row it does not divide: truncating each of 452,133 rows loses under 1 sat
-each, so the row sum can fall short of the pinned total by up to ~452,133 sat
-(≈0.0045 BLCH). `check_supply` demands **exact** equality (`genesis.rs:253`),
-so even a 1-sat shortfall is a hard refusal. Someone must name who absorbs the
-remainder. This is a founder/tokenomics call, not a DEV call.
+The recipient is address `cb339d2e…`, which owns the artifact's largest single
+output; it is not the founder address. `Manifest::check_supply` continues to
+require exact equality, so dropping the adjustment remains a hard refusal.
 
 **D2 — which hash, and over what.** The legacy loader digests with
 **SHAKE-256 over the file's raw bytes** (`src/storage/mod.rs:1172-1175`).
@@ -489,10 +488,9 @@ Breaks: `state_root` of block 1 onward (expected, §2). Also:
   claim at `genesis.rs:100-102` that vesting "is enforced by every node" is
   **not implemented**. Not item 3's job to build, but the doc comment should
   stop asserting it.
-- **The test fixture carries stale figures.** `mainnet_sample()`
-  (`genesis.rs:414-417`) still uses `entry_count: 413_743` and
-  `17_970_880_000` BLCH — the pre-re-measurement numbers. Should be 452,133 and
-  18,122,600,000 to match `tokenomics_v4.rs:187/:201`.
+- **Historical observation, since resolved:** `mainnet_sample()` used
+  pre-terminal figures when this plan was written. Current tests bind the
+  terminal count (452,726) and 18,146,400,000 BLOCH total.
 - **`check_supply` must start being called at load**, or the whole commitment
   apparatus stays decorative.
 

@@ -274,10 +274,9 @@ pub mod alloc_purpose {
 //
 // sorted by (txid, vout) — the tool sorts explicitly so the artifact does not
 // depend on a RocksDB iteration detail — with a trailing newline on every
-// line. Measured on the real file (2026-08-13, h39,328): 452,133 lines, ~54 MB,
-// 16 distinct addresses, 380,574,600,000,000,000 G3 satoshis; column 1 is 64
-// hex characters and column 4 is 40 in every single row. It only grows until
-// Genesis-3 halts.
+// line. Measured on the terminal file (h39,918): 452,726 lines, ~54 MB,
+// 16 distinct addresses, 381,074,400,000,000,000 G3 satoshis; column 1 is 64
+// hex characters and column 4 is 40 in every single row.
 //
 // Three properties this reader is built around:
 //
@@ -305,7 +304,7 @@ pub const MAX_CARRYOVER_ENTRIES: u64 = 16_000_000;
 const MAX_SNAPSHOT_LINE: usize = 4_096;
 
 /// A Genesis-3 address as the snapshot carries it: hash160, 20 bytes. Measured
-/// across all 452,133 rows of the 2026-08-13 snapshot — every one is 40 hex
+/// across all 452,726 rows of the terminal snapshot — every one is 40 hex
 /// characters, not one is a longer script.
 const G3_ADDRESS_BYTES: usize = 20;
 const G3_ADDRESS_HEX: usize = G3_ADDRESS_BYTES * 2;
@@ -486,7 +485,7 @@ fn canonical_u64(s: &str) -> Option<u64> {
 ///
 /// ## Who owns a carried output — founder decision, 2026-08-13
 ///
-/// The snapshot's fourth column is 20 bytes in every one of the 452,133 rows:
+/// The snapshot's fourth column is 20 bytes in every one of the 452,726 rows:
 /// a Genesis-3 hash160 address, not a script. The committed column
 /// (`EutxoEntry::script_hash`) is 32. The conversion is therefore a consensus
 /// rule — it decides who owns each output — and it was decided, not inferred:
@@ -525,14 +524,14 @@ fn canonical_u64(s: &str) -> Option<u64> {
 /// writes down, and the whole point of the 2026-08-12 decision is that every
 /// balance moves by the same ratio.
 ///
-/// Measured on the real snapshot (2026-08-13, 452,133 outputs): the aggregate
-/// is exact — 380,574,600,000,000,000 G3 sat × 100/21 =
-/// 1,812,260,000,000,000,000 with no remainder — and 452,021 rows split
+/// Measured on the terminal snapshot (height 39,918, 452,726 outputs): the
+/// aggregate is exact — 381,074,400,000,000,000 G3 sat × 100/21 =
+/// 1,814,640,000,000,000,000 with no remainder — and 452,615 rows split
 /// exactly, because a Genesis-3 coinbase of 8,400 BLCH is divisible by 21.
-/// **112 rows leave a remainder, and truncating them row by row loses 59
-/// satoshis** across the whole ledger: 0.00000059 BLOCH. Tiny, and fatal
+/// **111 rows leave a remainder, and truncating them row by row loses 57
+/// satoshis** across the whole ledger: 0.00000057 BLOCH. Tiny, and fatal
 /// anyway — [`Manifest::check_supply`] demands equality, so a launch would
-/// stop on a rounding error 59 satoshis wide.
+/// stop on a rounding error 57 satoshis wide.
 ///
 /// **The rule, stated: the largest output absorbs the whole remainder.** The
 /// remainder is `split_g3_sat(total) - Σ split_g3_sat(value_i)` — the exact
@@ -543,14 +542,18 @@ fn canonical_u64(s: &str) -> Option<u64> {
 /// state roots, so "the largest" is not enough on its own and the tie-break
 /// is part of the rule.
 ///
-/// On the real snapshot that lands the 59 satoshis on the founder's address
-/// (`e986db51…`, which holds 425,599 of the 452,133 outputs) — the same
-/// posture as the 100 B split, where the founder absorbs the rounding. The
-/// alternative considered and rejected was to declare the truncated sum as
-/// the carryover total, which closes by construction but leaves
-/// `CARRYOVER_TOTAL_BLOCH` a non-round 18,122,599,999.99999941. What is *not*
-/// acceptable is dropping the remainder, the one option that cannot close the
-/// accounting at all.
+/// On the terminal snapshot that lands the 57 satoshis on its largest single
+/// output, owned by address `cb339d2e…`, not on the founder address. The
+/// recipient follows from the committed ordering/value rule; it is not an
+/// allocation choice. The alternative considered and rejected was to declare
+/// the truncated sum as the carryover total, which would leave it a non-round
+/// 18,146,399,999.99999943 BLOCH. What is *not* acceptable is dropping the
+/// remainder, the one option that cannot close the accounting at all.
+///
+/// The terminal artifact also contains one zero-value Genesis-3 anchor
+/// coinbase. It is retained because its row is part of the committed digest,
+/// set root and count. It creates no spendable value; adding or removing such
+/// a row from mainnet fails those commitments.
 pub fn read_carryover_snapshot<R: BufRead>(
     mut src: R,
 ) -> Result<CarryoverSnapshot, CarryoverError> {
@@ -675,8 +678,8 @@ pub fn read_carryover_snapshot<R: BufRead>(
                 what: format!("value must be a canonical u64 decimal of satoshis, got {value_s:?}"),
             });
         };
-        // The address column: exactly 20 bytes in all 452,133 rows of the
-        // measured snapshot, a Genesis-3 hash160. Any other length has no
+        // The address column: exactly 20 bytes in all 452,726 rows of the
+        // terminal snapshot, a Genesis-3 hash160. Any other length has no
         // decided conversion into the 32-byte committed field, and guessing
         // one would hand the output to an owner nobody chose.
         if script_s.len() != G3_ADDRESS_HEX || !hex_into(script_s, &mut hexbuf) {
@@ -1494,7 +1497,7 @@ impl Manifest {
     /// If the manifest commits to a carryover and none was ingested. That
     /// combination is the bug this path exists to make impossible — a mainnet
     /// launched from it opens with a state root nobody else computes and
-    /// 452,133 outputs missing, and it would do so silently, which is the one
+    /// 452,726 outputs missing, and it would do so silently, which is the one
     /// outcome worse than not starting. It also panics on a duplicated
     /// outpoint between the two sets: `CommittedState::genesis` keys its map
     /// by `(txid, vout)`, so a collision would drop an output and leave the
@@ -1761,7 +1764,7 @@ mod tests {
     //     BLCH is, so most real rows cross the split with no remainder at all;
     //   - three small values that are NOT, so the per-row truncation and the
     //     dust rule are live in every test that uses this file rather than
-    //     being dead code until the real 452,133-line snapshot arrives.
+    //     being dead code until the real 452,726-line snapshot arrives.
     //
     // The arithmetic, in full, because a fixture whose numbers are asserted
     // but not derived is a fixture that can agree with a broken split:
@@ -2579,6 +2582,24 @@ mod tests {
         assert_ne!(s.entries[0].script_hash, s.entries[2].script_hash);
     }
 
+    /// The published terminal artifact contains the zero-value Genesis-3
+    /// anchor coinbase. Its value remains zero after the split, but the row is
+    /// still identity-bearing committed state and must not be silently
+    /// dropped by a parser that otherwise accepts the published bytes.
+    #[test]
+    fn committed_zero_value_anchor_is_preserved() {
+        let row = concat!(
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "\t0\t0\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        );
+        let snapshot = read(row).expect("the historical zero-value row is canonical");
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].value, 0);
+        assert_eq!(snapshot.g3_total_sat, 0);
+        assert_eq!(snapshot.total_sat, 0);
+        assert_eq!(snapshot.dust_sat, 0);
+    }
+
     /// The ownership rule, pinned in the only way that catches the failure
     /// that matters: the Genesis-3 address occupies the FIRST 20 bytes and the
     /// LAST 12 are zero.
@@ -2705,7 +2726,7 @@ mod tests {
 
     /// The accounting closes at scale, on a file where almost every row
     /// truncates. Four rows can be reasoned about by hand; 20,000 cannot, and
-    /// the real snapshot is 452,133 — the case where a per-row dust rule
+    /// the terminal snapshot is 452,726 — the case where a per-row dust rule
     /// either closes the total or quietly loses a few hundred thousand
     /// satoshis. Also the shape a streaming reader is for: this file is
     /// ~1.4 MB, the real one is ~54 MB, and neither is ever held as a
@@ -2892,7 +2913,7 @@ mod tests {
         assert_ne!(
             with.genesis_state().state_root(),
             without.genesis_state().state_root(),
-            "452,133 outputs must not be invisible at the state root"
+            "452,726 outputs must not be invisible at the state root"
         );
         // And the carried outputs are actually in the committed set, not
         // merely different-looking: carryover first, then allocations.

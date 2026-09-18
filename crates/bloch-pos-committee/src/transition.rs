@@ -321,7 +321,7 @@ pub enum PosTransaction {
     ///
     /// It then read `Transfer { inputs: u32, tx_bytes, tip }` — three gas
     /// terms with **no sender, no recipient and no amount**. The committed
-    /// state carried the 452,133-output opening ledger and the state root
+    /// state carried the 452,726-output opening ledger and the state root
     /// committed to it, but no transaction could take a satoshi out of it: the
     /// chain had balances and no payments. This revision is what makes the
     /// ledger move, and it is where the authorisation rule lives — an output
@@ -1704,7 +1704,7 @@ pub struct CommittedState {
     /// anything — so the balance component of the state root was committed
     /// empty on every block since genesis. Genesis-4 had a `TAG_EUTXO` slot in
     /// its schema and no balances in it: a chain where nobody holds anything,
-    /// including the 452,133 outputs the Genesis-3 snapshot carries.
+    /// including the 452,726 outputs the Genesis-3 snapshot carries.
     ///
     /// The set lives in the state because the state root commits to it. What
     /// stays out of this crate is the general script format; what an output is
