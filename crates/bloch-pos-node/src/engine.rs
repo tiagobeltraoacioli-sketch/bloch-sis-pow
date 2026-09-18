@@ -4689,6 +4689,54 @@ fn start_libp2p(
     Ok(handle)
 }
 
+/// Parse a boot-time boolean without the dangerous "presence means true"
+/// convention. Safety overrides must not arm because an orchestrator rendered
+/// `NAME=0`, nor silently fall back because it rendered a typo.
+fn parse_boot_switch(name: &str, value: Option<std::ffi::OsString>) -> io::Result<bool> {
+    match value {
+        None => Ok(false),
+        Some(value) => match value.to_str() {
+            Some("1" | "true") => Ok(true),
+            Some("0" | "false") => Ok(false),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} must be exactly 0, 1, false or true"),
+            )),
+        },
+    }
+}
+
+#[cfg(test)]
+mod boot_switch_tests {
+    use super::parse_boot_switch;
+    use std::ffi::OsString;
+
+    #[test]
+    fn absent_and_explicit_false_switches_stay_off() {
+        assert!(!parse_boot_switch("TEST_SWITCH", None).unwrap());
+        for value in ["0", "false"] {
+            assert!(!parse_boot_switch("TEST_SWITCH", Some(OsString::from(value))).unwrap());
+        }
+    }
+
+    #[test]
+    fn only_explicit_true_switches_arm() {
+        for value in ["1", "true"] {
+            assert!(parse_boot_switch("TEST_SWITCH", Some(OsString::from(value))).unwrap());
+        }
+    }
+
+    #[test]
+    fn ambiguous_switch_values_fail_closed() {
+        for value in ["", "TRUE", "yes", "2", " true"] {
+            let error = parse_boot_switch("TEST_SWITCH", Some(OsString::from(value)))
+                .expect_err("ambiguous boot switch must be rejected");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("TEST_SWITCH"));
+        }
+    }
+}
+
 pub fn run(cfg: Config) -> io::Result<()> {
     // Metrics FIRST, before the manifest is even read (audit C-R6-2): the
     // replay window is the one stretch where the node is alive, mute, and
@@ -4980,8 +5028,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // it might. Logged loudly HERE too (not only when it fires): an operator
     // who set this should see it confirmed immediately, not only discover it
     // was armed the first time a rewind actually happens.
-    let allow_finality_rewind = std::env::var_os("BLOCH_ALLOW_FINALITY_REWIND")
-        .is_some_and(|v| v == "1" || v == "true");
+    let allow_finality_rewind = parse_boot_switch(
+        "BLOCH_ALLOW_FINALITY_REWIND",
+        std::env::var_os("BLOCH_ALLOW_FINALITY_REWIND"),
+    )?;
     if allow_finality_rewind {
         println!(
             "FINALITY_LATCH: BLOCH_ALLOW_FINALITY_REWIND is set — this node will ALLOW a \
@@ -4993,7 +5043,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
 
     // Read the opt-out once, but arm observation only after replay and the
     // weak-subjectivity gate. Time spent reading disk is not live observation.
-    let no_doppelganger_check = std::env::var_os("BLOCH_NO_DOPPELGANGER").is_some();
+    let no_doppelganger_check = parse_boot_switch(
+        "BLOCH_NO_DOPPELGANGER",
+        std::env::var_os("BLOCH_NO_DOPPELGANGER"),
+    )?;
 
     let mut engine = Engine {
         state: StateCell::new(genesis_state),
@@ -5055,8 +5108,14 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // historical 0.59 s/block estimate predates the incremental eUTXO tree and
     // must not be treated as a restart SLA for this binary.
     let recovery_started = std::time::Instant::now();
-    let force_replay = std::env::var_os("BLOCH_REPLAY_FROM_GENESIS").is_some();
-    let require_cache = std::env::var_os("BLOCH_REQUIRE_STATE_CACHE").is_some();
+    let force_replay = parse_boot_switch(
+        "BLOCH_REPLAY_FROM_GENESIS",
+        std::env::var_os("BLOCH_REPLAY_FROM_GENESIS"),
+    )?;
+    let require_cache = parse_boot_switch(
+        "BLOCH_REQUIRE_STATE_CACHE",
+        std::env::var_os("BLOCH_REQUIRE_STATE_CACHE"),
+    )?;
     if force_replay && require_cache {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "--replay-from-genesis conflicts with --require-state-cache"));
     }
