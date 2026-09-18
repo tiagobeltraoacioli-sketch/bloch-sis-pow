@@ -4,7 +4,7 @@ Audited source: `562e220`. Remediation base: `b066e3c`. Branch: `fix/internal-au
 
 All 200 findings are retained, including duplicates. IMPLEMENTED means code changed in this branch, not deployed, externally audited, or universally resolved on the live fleet. PARTIAL is not closure. No production binary was published.
 
-IMPLEMENTED: 71, PARTIAL: 97, UNARMED CANDIDATE: 12, PROTOCOL DECISION: 5, BASE CHANGED: 7, OPEN: 5, REFUTED IN AUDIT: 1, VERIFIED POSITIVE: 2.
+IMPLEMENTED: 71, PARTIAL: 97, UNARMED CANDIDATE: 13, PROTOCOL DECISION: 5, BASE CHANGED: 7, OPEN: 4, REFUTED IN AUDIT: 1, VERIFIED POSITIVE: 2.
 
 | Finding | Status | Evidence / remaining work | Original title |
 |---|---|---|---|
