@@ -683,6 +683,8 @@ build-and-test:
   stage: test
   script:
     - bash deploy/bootnodes/verify-bootnodes.selftest.sh
+    - python3 scripts/check-live-node-retired-isolation.py --selftest
+    - python3 scripts/check-live-node-retired-isolation.py
     - cargo build --workspace --all-targets
     - cargo test --locked -p bloch-pos-committee -p bloch-pos-node -p bloch-crypto -p coherence-core -p bloch-sis-pow -p bloch-pq-vault -p pqcrypto-internals -p genesis4-ceremony
   # Memory-hard wallet tests and long consensus reveal-chain tests still need
