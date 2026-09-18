@@ -43,6 +43,75 @@ use bitcoin::{
     Witness,
 };
 
+/// Conservative construction floor for new vaults. This is an application
+/// policy, not a Bitcoin consensus rule.
+pub const MIN_NEW_VAULT_CSV_DELAY: u16 = 144;
+/// Bitcoin's maximum representable monetary supply, in satoshis.
+pub const BITCOIN_MAX_MONEY_SAT: u64 = 21_000_000 * 100_000_000;
+
+/// Refusals returned by the checked transaction-building API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VaultTxError {
+    NullOutpoint,
+    AmountOutOfRange,
+    FeeExceedsAmount,
+    ExcessiveFee,
+    DustOutput,
+    CsvDelayTooShort,
+    UncompressedRoleKey,
+    ReusedRoleKey,
+    InvalidInputIndex,
+}
+
+impl std::fmt::Display for VaultTxError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NullOutpoint => "funding outpoint cannot be null",
+            Self::AmountOutOfRange => "input amount exceeds Bitcoin's money range",
+            Self::FeeExceedsAmount => "fee exceeds input amount",
+            Self::ExcessiveFee => "fee exceeds the checked builder's 10% safety limit",
+            Self::DustOutput => "output is below the script dust threshold",
+            Self::CsvDelayTooShort => "new vaults require at least 144 blocks of CSV delay",
+            Self::UncompressedRoleKey => "vault role keys must be compressed",
+            Self::ReusedRoleKey => "hot and recovery keys must be distinct",
+            Self::InvalidInputIndex => "sighash input index is out of range",
+        })
+    }
+}
+
+impl std::error::Error for VaultTxError {}
+
+/// Validate parameters used for a new legacy-shaped vault. Existing funded
+/// vaults may still need the unchecked compatibility functions below, but new
+/// construction should reject short delays and shared role keys.
+pub fn validate_new_vault_params(p: &VaultParams) -> Result<(), VaultTxError> {
+    if !p.hot_pubkey.compressed || !p.recovery_pubkey.compressed {
+        return Err(VaultTxError::UncompressedRoleKey);
+    }
+    if p.hot_pubkey == p.recovery_pubkey {
+        return Err(VaultTxError::ReusedRoleKey);
+    }
+    if p.csv_delay < MIN_NEW_VAULT_CSV_DELAY {
+        return Err(VaultTxError::CsvDelayTooShort);
+    }
+    Ok(())
+}
+
+fn checked_output_value(input_amount_sat: u64, fee_sat: u64, script_pubkey: &bitcoin::Script)
+    -> Result<u64, VaultTxError> {
+    if input_amount_sat > BITCOIN_MAX_MONEY_SAT {
+        return Err(VaultTxError::AmountOutOfRange);
+    }
+    let output = input_amount_sat.checked_sub(fee_sat).ok_or(VaultTxError::FeeExceedsAmount)?;
+    if fee_sat > input_amount_sat / 10 {
+        return Err(VaultTxError::ExcessiveFee);
+    }
+    if output < script_pubkey.minimal_non_dust().to_sat() {
+        return Err(VaultTxError::DustOutput);
+    }
+    Ok(output)
+}
+
 /// Parameters that define one vault instance. `hot_pubkey` guards the normal spend path
 /// (deposit hash-gate + trigger branch A); `recovery_pubkey` guards the clawback
 /// (trigger branch B). Both are on-chain secp256k1 keys; the *post-quantum* authority
@@ -141,6 +210,15 @@ pub fn build_unvault_tx(
     }
 }
 
+/// Checked new-construction counterpart to [`build_unvault_tx`].
+pub fn build_unvault_tx_checked(p: &VaultParams, deposit_outpoint: OutPoint,
+    deposit_amount_sat: u64, fee_sat: u64) -> Result<Transaction, VaultTxError> {
+    validate_new_vault_params(p)?;
+    if deposit_outpoint.is_null() { return Err(VaultTxError::NullOutpoint); }
+    checked_output_value(deposit_amount_sat, fee_sat, &trigger_script_pubkey(p))?;
+    Ok(build_unvault_tx(p, deposit_outpoint, deposit_amount_sat, fee_sat))
+}
+
 /// Build the **branch A** (normal, delayed) spend of the TRIGGER `T` to `destination`.
 /// Its input `nSequence` encodes the CSV relative timelock Δ (BIP-68), so the network
 /// will only accept it once Δ blocks have matured since `T` confirmed.
@@ -170,6 +248,16 @@ pub fn build_branch_a_tx(
     }
 }
 
+/// Checked new-construction counterpart to [`build_branch_a_tx`].
+pub fn build_branch_a_tx_checked(p: &VaultParams, trigger_outpoint: OutPoint,
+    trigger_amount_sat: u64, destination: &Address, fee_sat: u64)
+    -> Result<Transaction, VaultTxError> {
+    validate_new_vault_params(p)?;
+    if trigger_outpoint.is_null() { return Err(VaultTxError::NullOutpoint); }
+    checked_output_value(trigger_amount_sat, fee_sat, &destination.script_pubkey())?;
+    Ok(build_branch_a_tx(p, trigger_outpoint, trigger_amount_sat, destination, fee_sat))
+}
+
 /// Build the **branch B** clawback spend of the TRIGGER `T` to `safe_destination`
 /// (the anchored `designated_safe_dest`). Immediate — no relative timelock — so the
 /// owner/watchtower can execute it during the delay window Δ. `nSequence` enables RBF so
@@ -197,6 +285,15 @@ pub fn build_clawback_tx(
     }
 }
 
+/// Checked new-construction counterpart to [`build_clawback_tx`]. The caller
+/// must separately bind `safe_destination` to an authenticated anchor.
+pub fn build_clawback_tx_checked(trigger_outpoint: OutPoint, trigger_amount_sat: u64,
+    safe_destination: &Address, fee_sat: u64) -> Result<Transaction, VaultTxError> {
+    if trigger_outpoint.is_null() { return Err(VaultTxError::NullOutpoint); }
+    checked_output_value(trigger_amount_sat, fee_sat, &safe_destination.script_pubkey())?;
+    Ok(build_clawback_tx(trigger_outpoint, trigger_amount_sat, safe_destination, fee_sat))
+}
+
 /// Compute the BIP-143 P2WSH (segwit v0) sighash for `input_index`, over `witness_script`
 /// with the spent output's `amount_sat`, `SIGHASH_ALL`. This is the message the hot /
 /// recovery secp256k1 key signs.
@@ -218,6 +315,20 @@ pub fn p2wsh_sighash(
     let mut out = [0u8; 32];
     out.copy_from_slice(sh.as_ref());
     out
+}
+
+/// Fallible counterpart to [`p2wsh_sighash`] for untrusted transactions/indexes.
+pub fn p2wsh_sighash_checked(tx: &Transaction, input_index: usize,
+    witness_script: &ScriptBuf, amount_sat: u64) -> Result<[u8; 32], VaultTxError> {
+    if input_index >= tx.input.len() { return Err(VaultTxError::InvalidInputIndex); }
+    if amount_sat > BITCOIN_MAX_MONEY_SAT { return Err(VaultTxError::AmountOutOfRange); }
+    let mut cache = SighashCache::new(tx);
+    let sh = cache.p2wsh_signature_hash(input_index, witness_script,
+        Amount::from_sat(amount_sat), EcdsaSighashType::All)
+        .map_err(|_| VaultTxError::InvalidInputIndex)?;
+    let mut out = [0u8; 32];
+    out.copy_from_slice(sh.as_ref());
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -281,5 +392,46 @@ mod tests {
         // a different spent amount changes the BIP-143 sighash
         let h3 = p2wsh_sighash(&u, 0, &dep, 99_999);
         assert_ne!(h1, h3, "sighash commits to the amount ({})", h1.to_lower_hex_string());
+    }
+
+    #[test]
+    fn checked_builders_reject_adversarial_values() {
+        use bitcoin::{hashes::Hash, Txid};
+        let p = params();
+        let outpoint = OutPoint { txid: Txid::from_byte_array([7; 32]), vout: 0 };
+        let destination = deposit_address(&p);
+        assert!(build_unvault_tx_checked(&p, outpoint, 100_000, 500).is_ok());
+        assert!(build_branch_a_tx_checked(&p, outpoint, 100_000, &destination, 500).is_ok());
+        assert!(build_clawback_tx_checked(outpoint, 100_000, &destination, 500).is_ok());
+        assert_eq!(build_unvault_tx_checked(&p, OutPoint::null(), 100_000, 500), Err(VaultTxError::NullOutpoint));
+        assert_eq!(build_unvault_tx_checked(&p, outpoint, 1_000, 1_001), Err(VaultTxError::FeeExceedsAmount));
+        assert_eq!(build_unvault_tx_checked(&p, outpoint, 10_000, 1_001), Err(VaultTxError::ExcessiveFee));
+        assert_eq!(build_unvault_tx_checked(&p, outpoint, BITCOIN_MAX_MONEY_SAT + 1, 0), Err(VaultTxError::AmountOutOfRange));
+        assert_eq!(build_clawback_tx_checked(outpoint, 1, &destination, 0), Err(VaultTxError::DustOutput));
+        let mut short = p.clone(); short.csv_delay = MIN_NEW_VAULT_CSV_DELAY - 1;
+        assert_eq!(build_branch_a_tx_checked(&short, outpoint, 100_000, &destination, 500), Err(VaultTxError::CsvDelayTooShort));
+        let mut reused = p.clone(); reused.recovery_pubkey = reused.hot_pubkey;
+        assert_eq!(validate_new_vault_params(&reused), Err(VaultTxError::ReusedRoleKey));
+    }
+
+    #[test]
+    fn checked_sighash_and_legacy_compatibility() {
+        let mut p = params();
+        let tx = build_unvault_tx(&p, OutPoint::null(), 100_000, 500);
+        let script = deposit_script(&p.recovery_hash, &p.hot_pubkey);
+        assert_eq!(p2wsh_sighash_checked(&tx, 1, &script, 100_000), Err(VaultTxError::InvalidInputIndex));
+        assert_eq!(p2wsh_sighash_checked(&tx, 0, &script, BITCOIN_MAX_MONEY_SAT + 1), Err(VaultTxError::AmountOutOfRange));
+        assert_eq!(p2wsh_sighash_checked(&tx, 0, &script, 100_000).unwrap(), p2wsh_sighash(&tx, 0, &script, 100_000));
+
+        // Historical unchecked builders retain their byte-level behavior.
+        p.csv_delay = 0;
+        let unvault = build_unvault_tx(&p, OutPoint::null(), 1, 2);
+        assert_eq!(unvault.output[0].value, Amount::ZERO);
+        let destination = deposit_address(&p);
+        let branch_a = build_branch_a_tx(&p, OutPoint::null(), 1, &destination, 2);
+        assert_eq!(branch_a.output[0].value, Amount::ZERO);
+        assert_eq!(branch_a.input[0].sequence, Sequence::from_height(0));
+        let clawback = build_clawback_tx(OutPoint::null(), 1, &destination, 2);
+        assert_eq!(clawback.output[0].value, Amount::ZERO);
     }
 }

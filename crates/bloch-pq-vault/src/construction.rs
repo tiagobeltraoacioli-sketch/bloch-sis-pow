@@ -37,7 +37,7 @@ impl SeparatedDepositV1 {
             || trigger.hot_pubkey == trigger.recovery_pubkey {
             return Err("deposit, delayed-spend and recovery keys must be distinct");
         }
-        if trigger.csv_delay < 144 {
+        if trigger.csv_delay < vault::MIN_NEW_VAULT_CSV_DELAY {
             return Err("new separated-deposit constructions require at least 144 blocks of delay");
         }
         Ok(Self { deposit_pubkey, trigger })
@@ -69,13 +69,18 @@ impl SeparatedDepositV1 {
     /// checked here. No signing key is accepted or retained by this builder.
     pub fn build_unvault_tx(&self, outpoint: OutPoint, amount_sat: u64, fee_sat: u64)
         -> Result<Transaction, &'static str> {
-        if outpoint.is_null() { return Err("deposit outpoint cannot be null"); }
-        if amount_sat > 21_000_000u64 * 100_000_000 { return Err("deposit amount exceeds Bitcoin money range"); }
-        let output = amount_sat.checked_sub(fee_sat).ok_or("fee exceeds deposit amount")?;
-        if output < vault::trigger_script_pubkey(&self.trigger).minimal_non_dust().to_sat() {
-            return Err("unvault output is below the script dust threshold");
-        }
-        Ok(vault::build_unvault_tx(&self.trigger, outpoint, amount_sat, fee_sat))
+        vault::build_unvault_tx_checked(&self.trigger, outpoint, amount_sat, fee_sat)
+            .map_err(|error| match error {
+                vault::VaultTxError::NullOutpoint => "deposit outpoint cannot be null",
+                vault::VaultTxError::AmountOutOfRange => "deposit amount exceeds Bitcoin money range",
+                vault::VaultTxError::FeeExceedsAmount => "fee exceeds deposit amount",
+                vault::VaultTxError::ExcessiveFee => "fee exceeds the checked builder safety limit",
+                vault::VaultTxError::DustOutput => "unvault output is below the script dust threshold",
+                vault::VaultTxError::CsvDelayTooShort => "CSV delay is below the new-construction minimum",
+                vault::VaultTxError::UncompressedRoleKey => "vault role keys must be compressed",
+                vault::VaultTxError::ReusedRoleKey => "vault role keys must be distinct",
+                vault::VaultTxError::InvalidInputIndex => "unexpected sighash input index",
+            })
     }
 }
 
