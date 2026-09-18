@@ -125,3 +125,7 @@ jobs:
         run: python3 scripts/devnet-particao-report.test.py
       - name: Activation rehearsal refuses unexpected gate changes
         run: python3 scripts/rehearse-validator-activation.test.py
+      - name: Attested-image remote-access guard selftest
+        run: python3 scripts/check-attested-ssh.selftest.py
+      - name: Attested-image remote-access guard
+        run: python3 scripts/check-attested-ssh.py

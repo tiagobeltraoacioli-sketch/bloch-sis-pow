@@ -320,6 +320,8 @@ iso-hardening-guard:
   script:
     - python3 scripts/check-iso-hardening.selftest.py
     - python3 scripts/check-iso-hardening.py
+    - python3 scripts/check-attested-ssh.selftest.py
+    - python3 scripts/check-attested-ssh.py
   allow_failure: false
 
 # Scanner-posture guard (finding I-H4, 2026-09-04). BLOCKING.

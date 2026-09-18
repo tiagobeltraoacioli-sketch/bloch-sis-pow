@@ -61,6 +61,7 @@
   networking.firewall.enable = true;
   networking.firewall.allowedTCPPorts = [ 16510 ];  # postern-seal-gate
   networking.firewall.allowedUDPPorts = [ 51820 ];  # WireGuard
+  networking.firewall.interfaces.wg0.allowedTCPPorts = [ 22 ];
   # Everything else (desktop, SSH) binds to wg0 only — reachable solely after
   # the client's verifier returned Verdict::Trusted and the tunnel is up.
 
@@ -187,8 +188,10 @@
 
   # SSH for administration — key-only, never exposed pre-attestation.
   services.openssh = {
-    enable = lib.mkDefault true;
+    # Explicit deployment exception to attested.nix's appliance default.
+    enable = lib.mkForce true;
     openFirewall = false;                       # wg0 only
+    settings.PermitRootLogin = "no";
     settings.PasswordAuthentication = false;
     settings.KbdInteractiveAuthentication = false;
   };
