@@ -47,6 +47,11 @@ for the exact contract. Both endpoints are loopback-bound and off unless
 matches the running unit file**. A failed scrape triggers the availability
 alert; the remaining rules cannot observe an unreachable endpoint.
 
+The node refuses an enabled non-loopback `--metrics-bind` unless the command
+also carries `--allow-public-metrics`. That flag is an exposure acknowledgement,
+not authentication: a deliberately routable endpoint still needs a firewall
+and must not be treated as safe for the public internet.
+
 ## Additional exported signals and alert coverage
 
 The current exporter includes `bloch_pos_finality_rewinds_refused_total`,
