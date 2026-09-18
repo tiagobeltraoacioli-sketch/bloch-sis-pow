@@ -1515,21 +1515,61 @@ impl HostPolicy {
 
     fn allows(&self, host: Option<&str>) -> bool {
         let Some(h) = host else { return false };
-        let name = host_name_only(h).to_ascii_lowercase();
+        let Some(name) = host_name_only(h) else { return false };
+        let name = name.to_ascii_lowercase();
         self.allowed.iter().any(|a| *a == name)
     }
 }
 
 /// The hostname portion of an HTTP `Host` header value, with a trailing
 /// `:<port>` stripped. Handles the IPv6 literal form (`[::1]:8080` or bare
-/// `[::1]`), which a naive split on `:` would mangle into `[` and a garbled
-/// remainder.
-fn host_name_only(host: &str) -> &str {
+/// `[::1]`), and rejects malformed authorities rather than extracting an
+/// allowed prefix from them.
+fn host_name_only(host: &str) -> Option<&str> {
     let host = host.trim();
-    if let Some(rest) = host.strip_prefix('[') {
-        return rest.split(']').next().unwrap_or(rest);
+    if host.is_empty() {
+        return None;
     }
-    host.split_once(':').map_or(host, |(name, _)| name)
+    if let Some(rest) = host.strip_prefix('[') {
+        let close = rest.find(']')?;
+        let name = &rest[..close];
+        if name.parse::<std::net::Ipv6Addr>().is_err()
+            || !valid_host_port_suffix(&rest[close.saturating_add(1)..])
+        {
+            return None;
+        }
+        return Some(name);
+    }
+    if host.contains('[') || host.contains(']') {
+        return None;
+    }
+    let (name, suffix) = match host.split_once(':') {
+        Some((name, port)) => (name, Some(port)),
+        None => (host, None),
+    };
+    if name.is_empty()
+        || !name.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=%".contains(&b)
+        })
+        || suffix.is_some_and(|port| {
+            port.is_empty()
+                || !port.bytes().all(|b| b.is_ascii_digit())
+                || port.parse::<u16>().is_err()
+        })
+    {
+        return None;
+    }
+    Some(name)
+}
+
+fn valid_host_port_suffix(suffix: &str) -> bool {
+    if suffix.is_empty() {
+        return true;
+    }
+    let Some(port) = suffix.strip_prefix(':') else { return false };
+    !port.is_empty()
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && port.parse::<u16>().is_ok()
 }
 
 /// `Content-Type`, ignoring `;`-separated parameters (e.g. `; charset=utf-8`)

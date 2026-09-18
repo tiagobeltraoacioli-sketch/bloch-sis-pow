@@ -1503,6 +1503,37 @@ fn the_host_allowlist_env_var_adds_exactly_the_named_hosts() {
 }
 
 #[test]
+fn host_policy_rejects_malformed_authorities_instead_of_allowed_prefixes() {
+    let hosts = HostPolicy {
+        allowed: vec!["localhost".into(), "::1".into()],
+    };
+
+    for valid in ["localhost", "LOCALHOST:8080", "[::1]", "[::1]:8080"] {
+        assert!(hosts.allows(Some(valid)), "valid Host authority was refused: {valid}");
+    }
+    for malformed in [
+        "",
+        "localhost:",
+        "localhost:anything",
+        "localhost:65536",
+        "localhost:80:90",
+        "local host",
+        "user@localhost",
+        "[::1",
+        "[::1]suffix",
+        "[::1]:",
+        "[::1]:anything",
+        "[::1]:65536",
+        "[::1]::8080",
+    ] {
+        assert!(
+            !hosts.allows(Some(malformed)),
+            "malformed Host authority extracted an allowed prefix: {malformed}",
+        );
+    }
+}
+
+#[test]
 fn a_body_that_is_not_utf8_is_a_parse_error_not_a_dropped_connection() {
     let (addr, _) = test_server();
     use std::io::{Read as _, Write as _};
