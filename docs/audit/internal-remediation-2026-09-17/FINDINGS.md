@@ -4,7 +4,7 @@ Audited source: `562e220`. Remediation base: `b066e3c`. Branch: `fix/internal-au
 
 All 200 findings are retained, including duplicates. IMPLEMENTED means code changed in this branch, not deployed, externally audited, or universally resolved on the live fleet. PARTIAL is not closure. No production binary was published.
 
-IMPLEMENTED: 62, PARTIAL: 76, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE CHANGED: 7, OPEN: 48, REFUTED IN AUDIT: 1, VERIFIED POSITIVE: 1.
+IMPLEMENTED: 62, PARTIAL: 77, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE CHANGED: 7, OPEN: 47, REFUTED IN AUDIT: 1, VERIFIED POSITIVE: 1.
 
 | Finding | Status | Evidence / remaining work | Original title |
 |---|---|---|---|
@@ -168,7 +168,7 @@ IMPLEMENTED: 62, PARTIAL: 76, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE C
 | EN-22 | OPEN | Not closed by this bundle. Requires dedicated implementation, protocol design, external operational evidence or product-owner integration; original finding remains tracked. | Env/flag-driven node-local safety behaviour (summary; see §3) |
 | EN-23 | PARTIAL | Persisted validated restart caches and incremental state roots retained. Warm restore moves the validated cached prefix instead of cloning its envelopes; cache serialization borrows state and appends directly. Reorg crash residues and index append gaps are repaired. Full-log loading, cold replay/retention, peak RSS and production-scale recovery SLA remain unqualified. | Per-ingest cost and memory grow with chain age; replay is quadratic |
 | EN-24 | IMPLEMENTED | Same shared sync budget as NET-05. | Serving `get_blocks` is rate-limited per connection, not per peer/IP |
-| FC-13 | OPEN | Not closed by this bundle. Requires dedicated implementation, protocol design, external operational evidence or product-owner integration; original finding remains tracked. | Arithmetic/panic notes (Info) |
+| FC-13 | PARTIAL | Latent 64-bit epoch-to-slice narrowing now fails closed on 32-bit targets. Boundary divergence observation no longer performs blocking stderr I/O inside consensus; a saturating atomic counter is exported as `bloch_pos_boundary_vote_drops_total`. Remaining aggregate notes include the seed fallback contract, exhaustion fallback bias, infallible canonical-encoding length casts and release-only invariant posture. See WAVE-25.md. | Arithmetic/panic notes (Info) |
 | FC-14 | OPEN | Not closed by this bundle. Requires dedicated implementation, protocol design, external operational evidence or product-owner integration; original finding remains tracked. | Documentation / spec divergences (Info) |
 | INF-05 | REFUTED IN AUDIT | Auditor explicitly refuted bans failure; do not count as a fix. | `deny.toml` duplicate allowlist no longer matches `Cargo.lock`; the blocking `supply-chain` gate is very likely red — MEDIUM — NEW |
 | INF-21 | IMPLEMENTED | Repository-owned workflow no longer assumes a personal checkout, retired architecture, fixed provider/model or already-missing features; it derives bounded review work from the current checkout and explicitly separates patches from activation/deployment. External workflow-host execution remains outside source verification. | A checked-in agent workflow with a stale, founder-specific context — INFO — NEW |
