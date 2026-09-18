@@ -2151,8 +2151,7 @@ pub(crate) mod activation_queue_v2_rehearsal {
 pub fn funded_validator_admission_active(epoch: u64) -> bool {
     #[cfg(test)]
     if funded_admission_rehearsal::enabled() { return true; }
-    FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH != u64::MAX
-        && epoch.checked_sub(FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH).is_some()
+    epoch_gate_active(epoch, FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH)
 }
 
 #[cfg(test)]
@@ -2171,6 +2170,25 @@ pub(crate) mod funded_admission_rehearsal {
 /// MAX is always an unarmed sentinel, including on synthetic boundary inputs.
 pub const fn epoch_gate_active(epoch: u64, activation: u64) -> bool {
     activation != u64::MAX && epoch >= activation
+}
+
+#[cfg(test)]
+mod epoch_gate_tests {
+    use super::epoch_gate_active;
+
+    #[test]
+    fn max_is_an_unarmed_sentinel_even_at_the_synthetic_boundary() {
+        for epoch in [0, u64::MAX - 1, u64::MAX] {
+            assert!(!epoch_gate_active(epoch, u64::MAX));
+        }
+    }
+
+    #[test]
+    fn a_finite_gate_opens_at_its_activation_epoch() {
+        assert!(!epoch_gate_active(41, 42));
+        assert!(epoch_gate_active(42, 42));
+        assert!(epoch_gate_active(u64::MAX, 42));
+    }
 }
 
 // ADR-041: one lifecycle release. A partially armed build must not compile.

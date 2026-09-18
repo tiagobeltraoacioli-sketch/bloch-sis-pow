@@ -2391,7 +2391,11 @@ impl CommittedState {
         let gate_open = crate::params::rehearsal::gates_are_forced_open();
         #[cfg(not(test))]
         let gate_open = false;
-        let lookahead = if !gate_open && epoch < crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH {
+        let gate_active = crate::params::epoch_gate_active(
+            epoch,
+            crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH,
+        );
+        let lookahead = if !gate_open && !gate_active {
             0
         } else {
             #[cfg(test)]
@@ -3045,14 +3049,11 @@ impl CommittedState {
         let forced = crate::params::rehearsal::bonding_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        // `DEPOSIT_ACTIVATION_EPOCH` is `u64::MAX` (an inert, permanently-closed
-        // gate — see the constant's docs), so this comparison is always false
-        // outside the `forced` rehearsal path; that is the intended, documented
-        // shape of the gate, not a bug for clippy to flag.
-        #[allow(clippy::absurd_extreme_comparisons)]
-        {
-            forced || epoch >= crate::params::DEPOSIT_ACTIVATION_EPOCH
-        }
+        forced
+            || crate::params::epoch_gate_active(
+                epoch,
+                crate::params::DEPOSIT_ACTIVATION_EPOCH,
+            )
     }
 
     /// Is the **fee-to-stake decoupling** (finding C-R2-2) active in `epoch`?
@@ -3068,13 +3069,11 @@ impl CommittedState {
         let forced = crate::params::rehearsal::fee_stake_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        // `FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH` is `u64::MAX` today (inert gate,
-        // founder's to arm) — the comparison is always false outside `forced`,
-        // by design, not a bug.
-        #[allow(clippy::absurd_extreme_comparisons)]
-        {
-            forced || epoch >= crate::params::FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH
-        }
+        forced
+            || crate::params::epoch_gate_active(
+                epoch,
+                crate::params::FEE_STAKE_DECOUPLE_ACTIVATION_EPOCH,
+            )
     }
 
     /// Is the AUTHENTICATED exit rule active in `epoch`?
@@ -3134,12 +3133,11 @@ impl CommittedState {
         let forced = crate::params::rehearsal::dust_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        // `DUST_RULE_ACTIVATION_EPOCH` is `u64::MAX` today (inert gate, founder's
-        // to arm) — the comparison is always false outside `forced`, by design.
-        #[allow(clippy::absurd_extreme_comparisons)]
-        {
-            forced || epoch >= crate::params::DUST_RULE_ACTIVATION_EPOCH
-        }
+        forced
+            || crate::params::epoch_gate_active(
+                epoch,
+                crate::params::DUST_RULE_ACTIVATION_EPOCH,
+            )
     }
 
     /// Is the fork-choice equivocation retention horizon (external audit
@@ -3154,13 +3152,11 @@ impl CommittedState {
         let forced = crate::params::rehearsal::forkchoice_equivocation_horizon_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        // `FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH` is `u64::MAX`
-        // today (inert gate, founder's to arm) — the comparison is always
-        // false outside `forced`, by design.
-        #[allow(clippy::absurd_extreme_comparisons)]
-        {
-            forced || epoch >= crate::params::FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH
-        }
+        forced
+            || crate::params::epoch_gate_active(
+                epoch,
+                crate::params::FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH,
+            )
     }
 
     /// H-R7-3, the consensus half: refuse outputs below
@@ -3220,13 +3216,11 @@ impl CommittedState {
         let forced = crate::params::rehearsal::tx_bytes_bound_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        // `TX_BYTES_BOUND_ACTIVATION_EPOCH` is `u64::MAX` today (inert gate,
-        // founder's to arm) — the comparison is always false outside `forced`,
-        // by design.
-        #[allow(clippy::absurd_extreme_comparisons)]
-        {
-            forced || epoch >= crate::params::TX_BYTES_BOUND_ACTIVATION_EPOCH
-        }
+        forced
+            || crate::params::epoch_gate_active(
+                epoch,
+                crate::params::TX_BYTES_BOUND_ACTIVATION_EPOCH,
+            )
     }
 
     /// Is the **duplicate-attestation refusal** (R3 M-2) active in `epoch`?
@@ -3241,13 +3235,11 @@ impl CommittedState {
         let forced = crate::params::rehearsal::attestation_dedup_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        // `ATTESTATION_DEDUP_ACTIVATION_EPOCH` is `u64::MAX` today (inert
-        // gate, founder's to arm) — the comparison is always false outside
-        // `forced`, by design.
-        #[allow(clippy::absurd_extreme_comparisons)]
-        {
-            forced || epoch >= crate::params::ATTESTATION_DEDUP_ACTIVATION_EPOCH
-        }
+        forced
+            || crate::params::epoch_gate_active(
+                epoch,
+                crate::params::ATTESTATION_DEDUP_ACTIVATION_EPOCH,
+            )
     }
 
     /// Is **rewards v2** (R1 M1 + M3 + M4, R7 M5) active in `epoch`? One
@@ -3263,13 +3255,11 @@ impl CommittedState {
         let forced = crate::params::rehearsal::rewards_v2_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        // `REWARDS_V2_ACTIVATION_EPOCH` is `u64::MAX` today (inert gate,
-        // founder's to arm) — the comparison is always false outside
-        // `forced`, by design.
-        #[allow(clippy::absurd_extreme_comparisons)]
-        {
-            forced || epoch >= crate::params::REWARDS_V2_ACTIVATION_EPOCH
-        }
+        forced
+            || crate::params::epoch_gate_active(
+                epoch,
+                crate::params::REWARDS_V2_ACTIVATION_EPOCH,
+            )
     }
 
     /// Is **staking-transaction metering** (R7 M1 / TX-10) active in `epoch`?
@@ -3283,13 +3273,11 @@ impl CommittedState {
         let forced = crate::params::rehearsal::staking_tx_metering_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        // `STAKING_TX_METERING_ACTIVATION_EPOCH` is `u64::MAX` today (inert
-        // gate, founder's to arm) — the comparison is always false outside
-        // `forced`, by design.
-        #[allow(clippy::absurd_extreme_comparisons)]
-        {
-            forced || epoch >= crate::params::STAKING_TX_METERING_ACTIVATION_EPOCH
-        }
+        forced
+            || crate::params::epoch_gate_active(
+                epoch,
+                crate::params::STAKING_TX_METERING_ACTIVATION_EPOCH,
+            )
     }
 
     /// R7 M1: the charge a staking-class transaction owes for its own bytes
@@ -3365,13 +3353,11 @@ impl CommittedState {
         let forced = crate::params::rehearsal::sighash_network_binding_gate_forced_open();
         #[cfg(not(test))]
         let forced = false;
-        // `SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH` is `u64::MAX` today
-        // (inert gate, founder's to arm) — the comparison is always false
-        // outside `forced`, by design.
-        #[allow(clippy::absurd_extreme_comparisons)]
-        {
-            forced || epoch >= crate::params::SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH
-        }
+        forced
+            || crate::params::epoch_gate_active(
+                epoch,
+                crate::params::SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH,
+            )
     }
 
     fn apply_transaction(
@@ -6911,6 +6897,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_unarmed_ancestry_seed_gate_stays_closed_at_the_synthetic_boundary() {
+        let (_transition, mut state, _chains) = setup(4);
+        let legacy_mix = [0xA1; 32];
+        let gated_mix = [0xB2; 32];
+        state.boundary_mixes.insert(u64::MAX - 1, legacy_mix);
+        state.boundary_mixes.insert(u64::MAX - 2, gated_mix);
+
+        assert_eq!(state.seed_for_epoch(u64::MAX), legacy_mix);
+    }
+
     /// **The retention claim, tested rather than argued.**
     ///
     /// The whole "no state-root change" argument rests on
@@ -7608,12 +7605,32 @@ mod tests {
     /// and of nothing else.
     #[test]
     fn the_dedup_gate_is_a_function_of_the_block_epoch_alone() {
-        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1] {
+        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1, u64::MAX] {
             assert!(!CommittedState::attestation_dedup_active(e), "epoch {e} must be below");
         }
-        assert!(CommittedState::attestation_dedup_active(
-            crate::params::ATTESTATION_DEDUP_ACTIVATION_EPOCH
-        ));
+    }
+
+    #[test]
+    fn every_legacy_unarmed_gate_stays_closed_at_the_synthetic_boundary() {
+        let epoch = u64::MAX;
+        let verdicts = [
+            ("deposit", CommittedState::unfunded_bonding_active(epoch)),
+            ("fee/stake", CommittedState::fee_stake_decouple_active(epoch)),
+            ("dust", CommittedState::dust_rule_active(epoch)),
+            (
+                "fork-choice equivocation horizon",
+                CommittedState::forkchoice_equivocation_horizon_active(epoch),
+            ),
+            ("transaction bytes", CommittedState::tx_bytes_bound_active(epoch)),
+            ("attestation dedup", CommittedState::attestation_dedup_active(epoch)),
+            ("rewards v2", CommittedState::rewards_v2_active(epoch)),
+            ("staking metering", CommittedState::staking_tx_metering_active(epoch)),
+            ("sighash network binding", CommittedState::sighash_network_binding_active(epoch)),
+        ];
+
+        for (name, active) in verdicts {
+            assert!(!active, "the {name} gate must treat MAX as an unarmed sentinel");
+        }
     }
 
     // -- REWARDS_V2_ACTIVATION_EPOCH (audit R1 M1 + M3 + M4, R7 M5) ----------
@@ -7635,10 +7652,9 @@ mod tests {
     /// Same shape as every other gate's function-of-the-epoch-alone test.
     #[test]
     fn the_rewards_v2_gate_is_a_function_of_the_block_epoch_alone() {
-        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1] {
+        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1, u64::MAX] {
             assert!(!CommittedState::rewards_v2_active(e), "epoch {e} must be below");
         }
-        assert!(CommittedState::rewards_v2_active(crate::params::REWARDS_V2_ACTIVATION_EPOCH));
     }
 
     // -- FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH (external audit -----
@@ -7662,15 +7678,12 @@ mod tests {
     /// Same shape as every other gate's function-of-the-epoch-alone test.
     #[test]
     fn the_forkchoice_equivocation_horizon_gate_is_a_function_of_the_block_epoch_alone() {
-        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1] {
+        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1, u64::MAX] {
             assert!(
                 !CommittedState::forkchoice_equivocation_horizon_active(e),
                 "epoch {e} must be below"
             );
         }
-        assert!(CommittedState::forkchoice_equivocation_horizon_active(
-            crate::params::FORKCHOICE_EQUIVOCATION_HORIZON_ACTIVATION_EPOCH
-        ));
     }
 
     /// FC-12 observability must describe today's permanent-bar semantics,
@@ -8382,12 +8395,9 @@ mod tests {
     /// Same shape as every other gate's function-of-the-epoch-alone test.
     #[test]
     fn the_staking_tx_metering_gate_is_a_function_of_the_block_epoch_alone() {
-        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1] {
+        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1, u64::MAX] {
             assert!(!CommittedState::staking_tx_metering_active(e), "epoch {e} must be below");
         }
-        assert!(CommittedState::staking_tx_metering_active(
-            crate::params::STAKING_TX_METERING_ACTIVATION_EPOCH
-        ));
     }
 
     /// ST-12 regression: ADR-041 activated the withdrawal/lifecycle gate at
@@ -9533,12 +9543,9 @@ mod tests {
     /// Same shape as every other gate's function-of-the-epoch-alone test.
     #[test]
     fn the_sighash_network_binding_gate_is_a_function_of_the_block_epoch_alone() {
-        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1] {
+        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1, u64::MAX] {
             assert!(!CommittedState::sighash_network_binding_active(e), "epoch {e} must be below");
         }
-        assert!(CommittedState::sighash_network_binding_active(
-            crate::params::SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH
-        ));
     }
 
     /// KAT: below the gate, `checked_signing_root` is byte-identical to
@@ -10224,14 +10231,9 @@ mod tests {
     #[test]
     fn the_gate_is_a_function_of_the_block_epoch_alone() {
         // Below the flag day: refused, at every epoch a chain can reach.
-        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1] {
+        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1, u64::MAX] {
             assert!(!CommittedState::unfunded_bonding_active(e), "epoch {e} must be below");
         }
-        // At and above it: allowed. Reached only by moving the constant, which
-        // `deposit_gate_is_inert` forbids — the arm is covered, not open.
-        assert!(CommittedState::unfunded_bonding_active(
-            crate::params::DEPOSIT_ACTIVATION_EPOCH
-        ));
     }
 
     /// TRIPWIRE. `DEPOSIT_ACTIVATION_EPOCH` must stay `u64::MAX`.

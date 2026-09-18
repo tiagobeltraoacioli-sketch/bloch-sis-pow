@@ -1683,7 +1683,10 @@ impl Engine {
         // history lives in `ParentState::chain.randao_mixes`, whose retention
         // is a separate question from `boundary_mixes`'. Arming this flag day
         // is not safe until that is closed.
-        let lookahead = if epoch < bloch_pos_committee::params::ANCESTRY_SEED_ACTIVATION_EPOCH {
+        let lookahead = if !bloch_pos_committee::params::epoch_gate_active(
+            epoch,
+            bloch_pos_committee::params::ANCESTRY_SEED_ACTIVATION_EPOCH,
+        ) {
             0
         } else {
             committees::MIN_SEED_LOOKAHEAD_EPOCHS
