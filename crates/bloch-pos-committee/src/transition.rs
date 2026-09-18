@@ -3247,18 +3247,12 @@ impl CommittedState {
         }
     }
 
-    /// Is **staking-transaction metering** (R7 M1) active in `epoch`? One
-    /// reader for the charge every staking variant reads.
-    /// [`crate::params::STAKING_TX_METERING_ACTIVATION_EPOCH`]'s docs record
-    /// a second half of R7 M1 — a transaction-COUNT cap — that this pass
-    /// could NOT wire in (it needs a new `TransitionError` variant, and
-    /// `TransitionError` lives in the unowned `interfaces.rs`), so this
-    /// predicate gates only the metering charge, not a count check that does
-    /// not exist. `epoch` is the caller's `self.epoch`: committed state
-    /// rolled to the judged block's own `epoch_of(header.slot)`, never a
-    /// clock. Ships inert — `params::STAKING_TX_METERING_ACTIVATION_EPOCH`
-    /// is `u64::MAX` — and the rehearsal switch exists so the metering
-    /// rule's tests are not dead code until the founder arms it.
+    /// Is **staking-transaction metering** (R7 M1 / TX-10) active in `epoch`?
+    /// One reader for both the charge every staking variant reads and the
+    /// transaction-count ceiling. `epoch` is the judged block's committed
+    /// epoch, never a clock. Ships inert — the parameter is `u64::MAX` — and
+    /// the rehearsal switch keeps both candidate rules testable before a
+    /// coordinated protocol decision arms them.
     fn staking_tx_metering_active(epoch: u64) -> bool {
         #[cfg(test)]
         let forced = crate::params::rehearsal::staking_tx_metering_gate_forced_open();
@@ -5494,6 +5488,17 @@ impl<V: SignatureVerifier> Transition<V> {
         // 3. Version.
         if header.version != BLOCK_VERSION_V4 {
             return Err(TransitionError::Proposal(ProposalReject::WrongVersion));
+        }
+
+        // TX-10 candidate: cap dispatch/state work by transaction COUNT as
+        // well as by gas and bytes. This intentionally runs before canonical
+        // serialization and body-root hashing, the first work proportional
+        // to transaction count. The gate is inert in production, preserving
+        // every historical verdict until a coordinated activation is chosen.
+        if CommittedState::staking_tx_metering_active(block_epoch)
+            && transactions.len() > crate::params::MAX_TRANSACTIONS_PER_BLOCK
+        {
+            return Err(TransitionError::TooManyTransactions);
         }
 
         // 3b. THE HEADER MUST COMMIT TO WHAT IT CARRIES.
@@ -8273,6 +8278,45 @@ mod tests {
         assert_eq!(at.tx_bytes, 123);
         assert_eq!(at.base_fee_sat, 0);
         assert_eq!(at.priority_fee_sat, 0);
+    }
+
+    /// TX-10: the count ceiling is a rehearsable consensus candidate, not a
+    /// silently-live tightening. Below the gate an oversized body reaches the
+    /// pre-existing body-root verdict; with the gate forced open it is refused
+    /// before body serialization. Exactly the ceiling is not over it.
+    #[test]
+    fn transaction_count_cap_is_inert_until_the_metering_gate_opens() {
+        let tx = PosTransaction::Delegate {
+            delegator: 900,
+            validator: 0,
+            amount_sat: delegation::MIN_DELEGATION_SAT,
+            eligible: true,
+        };
+
+        let (t, s, mut chains) = epoch1_fixture();
+        let over = vec![tx.clone(); crate::params::MAX_TRANSACTIONS_PER_BLOCK + 1];
+        let env = build_header_over(&s, 63, &[], &mut chains);
+        assert_eq!(
+            t.compute_post_state(&s, &env, &[], &over),
+            Err(TransitionError::BodyRootMismatch),
+            "production gate is inert: the new count candidate must not change today's verdict"
+        );
+
+        let _gate = crate::params::rehearsal::staking_tx_metering_gate_open_guard();
+        assert_eq!(
+            t.compute_post_state(&s, &env, &[], &over),
+            Err(TransitionError::TooManyTransactions),
+            "an armed node must refuse the whole body before judging its transactions"
+        );
+
+        let (t, s, mut chains) = epoch1_fixture();
+        let at = vec![tx; crate::params::MAX_TRANSACTIONS_PER_BLOCK];
+        let env = build_header_over(&s, 63, &[], &mut chains);
+        assert_eq!(
+            t.compute_post_state(&s, &env, &[], &at),
+            Err(TransitionError::BodyRootMismatch),
+            "a body exactly at MAX_TRANSACTIONS_PER_BLOCK is not over the candidate cap"
+        );
     }
 
     /// R7 M1 regression, the unauthenticated arms: below the gate a

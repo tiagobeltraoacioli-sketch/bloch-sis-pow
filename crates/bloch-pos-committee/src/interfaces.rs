@@ -422,6 +422,15 @@ pub enum TransitionError {
     /// refuses is a supplied pre-state or a future code path where that stops
     /// being true.
     SupplyNotConserved,
+    /// The body carries more than
+    /// `params::MAX_TRANSACTIONS_PER_BLOCK` transactions.
+    ///
+    /// This is deliberately a property of the whole body rather than a
+    /// `Transaction(i)` failure: no individual transaction is invalid. The
+    /// rule remains behind `STAKING_TX_METERING_ACTIVATION_EPOCH`, so merely
+    /// adding this diagnostic does not change historical replay or today's
+    /// accepted block set.
+    TooManyTransactions,
     /// The block's transactions consume more than `fee_market::BLOCK_GAS_LIMIT`
     /// gas — the CPU/state backstop of the L1 fee market
     /// (`BLOCH-L1-FEE-MARKET.md` §5).

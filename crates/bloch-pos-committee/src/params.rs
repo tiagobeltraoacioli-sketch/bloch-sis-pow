@@ -1737,8 +1737,7 @@ pub const FORKCHOICE_EQUIVOCATION_HORIZON_SLOTS: u64 = SLOTS_PER_EPOCH;
 /// `u64::MAX` = INERT, below it every staking variant (`Deposit`, `Exit`,
 /// `Delegate`, `ExitV2`, `RandaoRecommit`, `SlashingEvidence`) is charged
 /// `fee_market::TxCharge { gas: 0, tx_bytes: 0, .. }` exactly as today, and
-/// no transaction-COUNT cap exists to consult (see "Not yet closed by this
-/// gate" below).
+/// [`MAX_TRANSACTIONS_PER_BLOCK`] is not consulted.
 ///
 /// # The hole this closes
 ///
@@ -1771,12 +1770,11 @@ pub const FORKCHOICE_EQUIVOCATION_HORIZON_SLOTS: u64 = SLOTS_PER_EPOCH;
 ///   what makes them bind on a staking-only body; no new cap is needed for
 ///   that half.
 ///
-/// **Not yet closed by this gate**: a consensus `MAX_TRANSACTIONS_PER_BLOCK`
-/// bound on transaction COUNT (of any kind), independent of the two byte/gas
-/// caps. That needs a new `TransitionError` variant, and `TransitionError`
-/// is defined in `interfaces.rs`, outside this pass's ownership; the
-/// metering half above is complete and gated, the count half is not — flagged
-/// here rather than silently dropped.
+/// The same gate also enables [`MAX_TRANSACTIONS_PER_BLOCK`], a count bound
+/// independent of byte/gas accounting. It covers every transaction class:
+/// otherwise a mixed body could evade the resource ceiling merely by changing
+/// tags. The check precedes canonical serialization, so an armed node does not
+/// allocate and hash an attacker-selected number of transactions first.
 ///
 /// The gate reads `CommittedState::epoch` — committed state rolled to the
 /// judged block's own `epoch_of(header.slot)`, never a clock. The 2026-08-08
@@ -1791,6 +1789,17 @@ pub const FORKCHOICE_EQUIVOCATION_HORIZON_SLOTS: u64 = SLOTS_PER_EPOCH;
 /// any epoch is named. Ships INERT at `u64::MAX`;
 /// `staking_tx_metering_gate_is_inert` pins the value.
 pub const STAKING_TX_METERING_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Candidate consensus ceiling on transaction count, consulted only when
+/// [`STAKING_TX_METERING_ACTIVATION_EPOCH`] is armed.
+///
+/// The reference producer already stops at 256 transactions and its mempool
+/// holds at most 4,096. Matching the latter gives the candidate 16x headroom
+/// over an honest proposal while placing an implementation-independent bound
+/// on per-transaction dispatch and state-map work. This number is not a claim
+/// about historical non-reference producers, which is why the rule is not
+/// active without a coordinated protocol decision and replay qualification.
+pub const MAX_TRANSACTIONS_PER_BLOCK: usize = 4_096;
 
 /// ADR-041 lifecycle release epoch for withdrawals (tag 0x0D).
 /// Scheduled at epoch 2884. Must equal funded admission, authenticated exit,
