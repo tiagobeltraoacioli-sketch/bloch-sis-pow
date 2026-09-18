@@ -20,6 +20,7 @@ impl CommittedState {
                 let rec = self.validators.get(&index)?;
                 (self.funded_validators.contains(&index)
                     && rec.activation_epoch == u64::MAX
+                    && rec.exit_epoch == u64::MAX
                     && !rec.slashed
                     && d.deposit_epoch < finalized
                     && d.deposit_epoch

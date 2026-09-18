@@ -3717,11 +3717,28 @@ impl CommittedState {
         let Some(rec) = self.validators.get(&index) else {
             return Err(TxReject::StakingRule);
         };
-        // Same lifecycle rules as the legacy arm — active, not already
-        // exiting, not slashed. Slashing owns its own ejection path and must
-        // not share the voluntary one, or a slashed validator could reset its
-        // withdrawal clock.
-        if rec.slashed || rec.activation_epoch > self.epoch || rec.exit_epoch != u64::MAX {
+        // The normal path requires an active validator. The separately gated
+        // ST-16 candidate also admits a funded registration that is still in
+        // the activation queue after its ordinary delay. It deliberately
+        // reuses this message: the registered validator key, signed inclusion
+        // epoch, churn ceiling and replay rules remain identical.
+        let queued_funded_cancellation =
+            crate::params::funded_validator_cancellation_active(self.epoch)
+                && self.funded_validators.contains(&index)
+                && rec.activation_epoch == u64::MAX
+                && self.deposit_history.iter().any(|deposit| {
+                    deposit.pubkey_hash == *pubkey_hash
+                        && deposit
+                            .deposit_epoch
+                            .checked_add(staking::ACTIVATION_DELAY_EPOCHS)
+                            .is_some_and(|eligible| eligible <= self.epoch)
+                });
+        // Slashing owns its own ejection path and must not share the voluntary
+        // one, or a slashed validator could reset its withdrawal clock.
+        if rec.slashed
+            || (rec.activation_epoch > self.epoch && !queued_funded_cancellation)
+            || rec.exit_epoch != u64::MAX
+        {
             return Err(TxReject::StakingRule);
         }
         // THE CHURN BUDGET. Deliberately before the signature: it is the rule

@@ -2112,6 +2112,41 @@ pub(crate) const ROLE_ACTIVATION_QUEUE: u8 = 0x04;
 /// unfunded legacy Deposit/Delegate formats. No runtime override exists.
 pub const FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH: u64 = 2_884;
 
+/// Candidate ST-16 cancellation path for funded validators that remain in the
+/// activation queue. `u64::MAX` means INERT.
+///
+/// Once armed, an authenticated `ExitV2` may schedule the normal delayed
+/// withdrawal for a funded registration whose activation epoch is still the
+/// sentinel, after the ordinary activation delay has elapsed. It does not
+/// delete or reuse the registry index, public key or deposit-history entry.
+/// The existing exit signature, epoch replay binding, churn ceiling and
+/// withdrawal accounting remain authoritative.
+///
+/// This changes block validity and queue membership. Activation therefore
+/// requires historical replay, mixed-fleet and economic qualification plus a
+/// coordinated epoch. It must not precede authenticated exit or withdrawal.
+pub const FUNDED_VALIDATOR_CANCELLATION_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+pub(crate) fn funded_validator_cancellation_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if funded_cancellation_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, FUNDED_VALIDATOR_CANCELLATION_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod funded_cancellation_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
 /// Candidate ST-13 activation-queue rules. `u64::MAX` means INERT.
 ///
 /// Once armed, this binds two changes together: funded registration refuses
@@ -2198,6 +2233,10 @@ const _: () = {
     assert!(WITHDRAWAL_ACTIVATION_EPOCH == SLASHING_EVIDENCE_ACTIVATION_EPOCH);
     assert!(SLASHING_EVIDENCE_ACTIVATION_EPOCH == RANDAO_RECOMMIT_ACTIVATION_EPOCH);
     assert!(DEPOSIT_ACTIVATION_EPOCH == u64::MAX);
+    assert!(FUNDED_VALIDATOR_CANCELLATION_ACTIVATION_EPOCH == u64::MAX
+        || (FUNDED_VALIDATOR_CANCELLATION_ACTIVATION_EPOCH >= EXIT_AUTH_ACTIVATION_EPOCH
+            && FUNDED_VALIDATOR_CANCELLATION_ACTIVATION_EPOCH
+                >= WITHDRAWAL_ACTIVATION_EPOCH));
     assert!(crate::slashing::CORRELATION_WINDOW_EPOCHS >= 2 * crate::staking::WITHDRAWAL_DELAY_EPOCHS);
 };
 
