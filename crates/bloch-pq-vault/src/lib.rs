@@ -125,7 +125,15 @@ const VAULT_PURPOSE_V2: &str = "1998'";
 /// The BTC `hot`/`recovery` keys guard the Bitcoin spend paths; the PQ key produces the
 /// preimage `r` and signs the Bloch anchor. Same seed → both, per the hybrid-identity
 /// model of [`bloch_btc_wallet`].
-#[derive(Clone)]
+/// Secret-bearing aggregate deliberately does not implement `Clone`: duplicating
+/// every private key defeats the owned-storage wipe performed on drop.
+///
+/// ```compile_fail
+/// use bloch_pq_vault::VaultKeys;
+/// fn duplicate(keys: VaultKeys) {
+///     let _second_owner = keys.clone();
+/// }
+/// ```
 pub struct VaultKeys {
     /// Hot spend key (deposit spend + trigger branch A).
     pub hot_sk: SecretKey,
@@ -144,7 +152,8 @@ pub struct VaultKeys {
     pub key_derivation: VaultKeyDerivation,
 }
 
-// Wipe the owned PQ allocation, including every explicitly cloned instance.
+// Wipe this object's owned PQ allocation. VaultKeys is intentionally non-Clone
+// so the library does not offer a convenience path that duplicates every secret.
 // SecretKey is Copy: the library's erase is best effort and cannot wipe copies
 // already held by callers, registers or third-party key-generation internals.
 impl Zeroize for VaultKeys {
@@ -728,14 +737,13 @@ mod audit_secret_ownership {
     fn explicit_wipe_clears_owned_pq_storage_without_changing_public_identity() {
         let mut keys = derive_vault_keys_v3(&[42;32], false).unwrap();
         let public = keys.pq_pubkey.clone();
-        let cloned = keys.clone();
         assert!(!keys.pq_secret.is_empty());
         keys.zeroize();
         assert!(keys.pq_secret.is_empty());
         assert_eq!(keys.pq_pubkey, public);
-        assert!(!cloned.pq_secret.is_empty(), "an independent clone owns its own allocation");
-        // Both objects run the same wiping path on drop. This test deliberately
-        // does not read freed memory or claim to inspect compiler-created copies.
+        // This test deliberately does not read freed memory or claim to inspect
+        // compiler-created copies. The compile-fail example on `VaultKeys`
+        // separately prevents restoration of the whole-object Clone surface.
     }
 }
 
