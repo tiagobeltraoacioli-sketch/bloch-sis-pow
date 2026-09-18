@@ -6,7 +6,9 @@ The sections below preserve the first-wave scope and validation (`203b410`). See
 
 The resumed pass continues with [asynchronous reorg publication](WAVE-43-STORAGE.md),
 [checked vault construction](WAVE-43-VAULT.md), and
-[network transport reconciliation](WAVE-43-NETWORK.md).
+[network transport reconciliation](WAVE-43-NETWORK.md). The four-track result
+and its combined validation are recorded in the [2026-09-18 integration
+checkpoint](WAVE-44-INTEGRATION.md).
 
 ## Scope and source reconciliation
 
