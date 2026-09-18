@@ -20,6 +20,7 @@ use bloch_pos_committee::header::BlockHeaderV4;
 use bloch_pos_committee::params;
 use bloch_pos_committee::staking::MIN_DEPOSIT_SAT;
 use bloch_pos_committee::tokenomics_v4 as tk;
+use bloch_pos_committee::STATE_COMPONENT_TAGS;
 
 use std::fs;
 use std::path::PathBuf;
@@ -140,39 +141,20 @@ fn f06_domain_and_state_tags_all_published() {
         );
     }
 
-    // State-tree preimage markers 0x00..0x04 and the 22 component tags.
+    // State-tree preimage markers 0x00..0x04 and every live component tag.
     for marker in ["MARK_LEAF", "MARK_NODE", "MARK_EMPTY", "MARK_KEY", "MARK_VALUE"] {
         assert!(doc.contains(marker), "{MIGRATION} missing state-tree marker {marker}");
     }
-    for tag in [
-        "TAG_EUTXO",
-        "TAG_VALIDATOR",
-        "TAG_PARTICIPATION_CURRENT",
-        "TAG_PARTICIPATION_PREVIOUS",
-        "TAG_RANDAO",
-        "TAG_TAINT_ROOT",
-        "TAG_COHERENCE_ACCUMULATOR",
-        "TAG_COHERENCE_NULLIFIERS",
-        "TAG_FINALITY",
-        "TAG_PENDING_VOTE",
-        "TAG_FC_MESSAGE",
-        "TAG_FC_EQUIVOCATOR",
-        "TAG_DEPOSIT_QUEUE",
-        "TAG_DELEGATION",
-        "TAG_PENDING_FEE",
-        "TAG_EVM_COMMITMENT",
-        "TAG_SLASH_APPLIED",
-        "TAG_SLASH_WINDOW",
-        "TAG_DELEGATOR_SLASH_LOSS",
-        "TAG_ISSUED_SUPPLY",
-        "TAG_BASE_FEE",
-        "TAG_DELEGATOR_FEE_REWARD",
-    ] {
-        assert!(doc.contains(tag), "{MIGRATION} missing state component tag {tag}");
+    for (name, tag) in STATE_COMPONENT_TAGS {
+        let row = format!("| `0x{tag:02X}` | `{name}`");
+        assert!(
+            doc.contains(&row),
+            "{MIGRATION} missing or misnumbering state component row {row:?}"
+        );
     }
     assert!(
-        doc.contains("| `0x16` | `TAG_DELEGATOR_FEE_REWARD`"),
-        "{MIGRATION} component-tag table must number the registry up to 0x16"
+        doc.contains("| `0x1E` | `TAG_FUNDED_VALIDATOR`"),
+        "{MIGRATION} component-tag table must number the live registry through 0x1E"
     );
 }
 
@@ -394,6 +376,40 @@ fn tx19_tokenomics_terminal_facts_match_code() {
         assert!(
             !doc.contains(stale),
             "{TOKENOMICS} retained stale claim {stale:?}"
+        );
+    }
+}
+
+/// TX-20 — the frozen Phase-1 DTO must not be presented as the schema that
+/// production uses, and local diagnostic precedence is not consensus data.
+#[test]
+fn tx20_legacy_interfaces_are_classified_accurately() {
+    assert_eq!(
+        STATE_COMPONENT_TAGS.len(),
+        30,
+        "update the interface reconciliation when the append-only registry grows"
+    );
+
+    let doc = spec("BLOCH-POS-INTERFACES.md");
+    for claim in [
+        "DTO with 14 top-level fields",
+        "`STATE_COMPONENT_TAGS` registry",
+        "currently contains 30 components",
+        "winning error for a multiply-invalid block is not consensus data",
+    ] {
+        assert!(doc.contains(claim), "interface spec missing TX-20 claim {claim:?}");
+    }
+
+    let source = include_str!("../src/interfaces.rs");
+    let transition = include_str!("../src/transition.rs");
+    for stale in [
+        "closed again at\neight components",
+        "error order is consensus-\n    /// visible",
+        "Frozen error order (consensus-visible",
+    ] {
+        assert!(
+            !source.contains(stale) && !transition.contains(stale),
+            "legacy consensus-interface claim returned: {stale:?}"
         );
     }
 }

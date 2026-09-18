@@ -26,8 +26,18 @@
 //! >   undifferentiated set. [`StateRoots::taint_root`] is retained as a
 //! >   reserved, all-zero slot (removing it would re-open the freeze);
 //! >   `Tainted` variants are never produced.
-//! > - **the hybrid PoW phase** — erased: Genesis-3 halts at height 50,000
-//! >   and Genesis-4 launches from a snapshot.
+//! > - **the hybrid PoW phase** — erased: Genesis-3 halted at terminal height
+//! >   39,918 and Genesis-4 launched from the signed snapshot.
+//! > - **the state-root component list** — [`StateRoots`] is a frozen legacy
+//! >   DTO with 14 top-level fields and has no production implementation.
+//! >   It is not the exhaustive schema of the live SMT. The authoritative,
+//! >   append-only registry is [`crate::state_root::STATE_COMPONENT_TAGS`]
+//! >   (30 components); production commits [`crate::state_root::ConsensusState`]
+//! >   through [`crate::state_root::state_root`].
+//! > - **transition error order** — reject precedence is useful for stable
+//! >   diagnostics and cheap-first DoS handling, but error variants are not
+//! >   encoded in blocks or committed state. Consensus requires identical
+//! >   accept/reject and child-state results, not identical local error text.
 //!
 //! §9.2 of the migration design: *"Interfaces between the three [developers]
 //! are frozen at the end of Phase 1 as Rust traits with no implementations;
@@ -369,10 +379,10 @@ pub enum TransitionError {
     /// This variant is that loop's ceiling, and it is a plain bound live at
     /// every epoch, not an activation waiting to be armed.
     ///
-    /// Placed immediately before the walk rather than beside the step-1 slot
-    /// checks on purpose: every reject path that existed before this variant
-    /// still returns exactly the error it returned, so the frozen error order
-    /// above is extended, never reordered.
+    /// Placed immediately before the walk rather than beside the cheap slot
+    /// checks so existing callers keep their diagnostic precedence. That
+    /// precedence is an API/operations compatibility property, not committed
+    /// consensus data.
     ///
     /// It cannot fire on committed history — see the constant's own docs for
     /// the replay argument and for the liveness ceiling it buys the bound
@@ -681,8 +691,9 @@ pub trait KeyVerifier {
 /// behind one question.
 ///
 /// Purity note: implementations answer from the taint-set state committed at
-/// the parent block (its root is in [`StateRoots::taint_root`]), not from any
-/// live index. Two nodes at the same parent must give byte-identical answers.
+/// the parent block (`TAG_TAINT_ROOT` in the live component registry), not
+/// from any live index. Two nodes at the same parent must give byte-identical
+/// answers. [`StateRoots::taint_root`] is the legacy DTO representation.
 pub trait StakeEligibility {
     fn deposit_input_status(&self, input: &UtxoRef) -> DepositInputStatus;
 }
@@ -693,8 +704,8 @@ pub trait StakeEligibility {
 /// Implemented by DEV-1's state object; consumed by everything. The methods
 /// are the closed list of what any consensus rule is allowed to need. If a
 /// rule wants a value this trait does not expose, the value must first become
-/// committed state (and appear under [`StateRoots`]) — that pressure is
-/// intentional, and it is the §5.5 rule expressed as an API.
+/// committed state (and appear in [`crate::state_root::STATE_COMPONENT_TAGS`])
+/// — that pressure is intentional, and it is the §5.5 rule expressed as an API.
 pub trait StateReader {
     /// Slot of the block whose post-state this is.
     fn slot(&self) -> u64;
@@ -801,9 +812,10 @@ pub trait StateTransition {
     /// Apply one block. Pure: the child state is a function of `pre` and the
     /// block contents, and two nodes applying the same block to the same
     /// parent state must produce bit-identical `state_root`s. Failure returns
-    /// the *first* error in validation order — error order is consensus-
-    /// visible (it decides which reject a node reports), so it is part of the
-    /// frozen contract, not an implementation detail.
+    /// the first error encountered by the implementation. Reject precedence is
+    /// API-visible and should remain cheap-first, but the variant is not
+    /// encoded or committed: consensus observes acceptance and the resulting
+    /// state root, not which diagnostic wins for a multiply invalid block.
     fn apply_block(
         &self,
         pre: &Self::State,
@@ -1042,20 +1054,16 @@ pub trait SlashingRules {
 
 // ─── Boundary 7: state commitment (§5.4, §5.5) ──────────────────────────────
 
-/// Every root in [`StateRoots`] is the commitment to one component the §5.5
-/// rule requires to be committed. The list is closed: a consensus rule that
-/// needs a value not represented here must first add its component — visibly,
-/// in a spec change — rather than reading it from anywhere else.
+/// Frozen Phase-1 state-root DTO retained for source compatibility.
 ///
-/// That path was exercised exactly once, on 2026-08-11: the transition
-/// demonstrably read the finality bookkeeping, the RANDAO chain positions,
-/// the staking queues, pending fees and the fork-choice messages from state
-/// the list did not bind — the `expected_bits` shape, flagged (not smuggled)
-/// by the transition's author. The six `*_root` fields below the taint root
-/// are that extension; the registry component simultaneously grew its RANDAO
-/// chain, withdrawable-epoch and withdrawal-credential columns. Recorded in
-/// the migration doc §5.5 and `BLOCH-POS-INTERFACES.md` §2.7; as an
-/// interfaces change it carries the two-reviewer rule.
+/// This type has 14 top-level fields, has no production [`StateCommitment`]
+/// implementation, and is **not exhaustive** for the live state tree. The
+/// transition later grew independent components that cannot be represented
+/// here. Production commits [`crate::state_root::ConsensusState`] through
+/// [`crate::state_root::state_root`]; its authoritative append-only component
+/// registry is [`crate::state_root::STATE_COMPONENT_TAGS`]. Adding consensus
+/// state requires extending that registry and the concrete tree fold, not
+/// pretending this compatibility DTO is still the live schema.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StateRoots {
     /// eUTXO set.
@@ -1095,16 +1103,14 @@ pub struct StateRoots {
     /// L1 EVM execution commitment — **carried, never recomputed**, the same
     /// posture as the Coherence roots: the execution layer owns the keccak-256
     /// MPT and the fee-market pair, this layer only commits them. Added by
-    /// `docs/specs/BLOCH-L1-EVM-STATE-MODEL.md` §2 — the visible spec change
-    /// the closed-list rule above demands. The list is now closed again at
-    /// eight components.
+    /// `docs/specs/BLOCH-L1-EVM-STATE-MODEL.md` §2. This was the fourteenth
+    /// field added to the legacy DTO; it did not re-close the live SMT schema.
     pub evm: crate::state_root::EvmCommitment,
 }
 
-/// The hashing boundary: block identity, body root, attestation root, state
-/// root. Implemented by DEV-2 (owner of §6.1 domain separation); consumed by
-/// everyone — these four functions are the only place consensus bytes become
-/// digests.
+/// Frozen Phase-1 hashing-boundary trait. The production implementations are
+/// the concrete header/derive/state-root functions; no type implements this
+/// trait in the shipped path.
 ///
 /// A1's KATs pin every method here; no output of these functions may change
 /// without a new vector file, because each one *is* a consensus constant in
@@ -1124,7 +1130,8 @@ pub trait StateCommitment {
     /// be pruned (§6.5.1) without disturbing the transaction commitment.
     fn attestation_root(&self, attestations: &[Attestation]) -> [u8; 32];
 
-    /// The committed state root over all components, under `DS_STATE` —
-    /// what [`BlockHeaderV4::state_root`] must equal.
+    /// Legacy DTO fold. There is no production implementation; the live
+    /// committed root is [`crate::state_root::state_root`] over
+    /// [`crate::state_root::ConsensusState`].
     fn state_root(&self, roots: &StateRoots) -> [u8; 32];
 }

@@ -281,6 +281,46 @@ const TAG_STAKE_LOW_WATER: u8 = 0x1C;
 const TAG_RANDAO_GENERATION: u8 = 0x1D;
 const TAG_FUNDED_VALIDATOR: u8 = 0x1E;
 
+/// Append-only registry of every component namespace in the live state SMT.
+///
+/// This is the machine-readable authority for component count, names and tag
+/// bytes. `interfaces::StateRoots` predates most of these leaves and is a
+/// compatibility DTO, not an exhaustive model of the live tree. New
+/// components must be appended here as well as in the tree fold; the
+/// uniqueness and spec-reconciliation tests consume this registry directly.
+pub const STATE_COMPONENT_TAGS: [(&str, u8); 30] = [
+    ("TAG_EUTXO", TAG_EUTXO),
+    ("TAG_VALIDATOR", TAG_VALIDATOR),
+    ("TAG_PARTICIPATION_CURRENT", TAG_PARTICIPATION_CURRENT),
+    ("TAG_PARTICIPATION_PREVIOUS", TAG_PARTICIPATION_PREVIOUS),
+    ("TAG_RANDAO", TAG_RANDAO),
+    ("TAG_TAINT_ROOT", TAG_TAINT_ROOT),
+    ("TAG_COHERENCE_ACCUMULATOR", TAG_COHERENCE_ACCUMULATOR),
+    ("TAG_COHERENCE_NULLIFIERS", TAG_COHERENCE_NULLIFIERS),
+    ("TAG_FINALITY", TAG_FINALITY),
+    ("TAG_PENDING_VOTE", TAG_PENDING_VOTE),
+    ("TAG_FC_MESSAGE", TAG_FC_MESSAGE),
+    ("TAG_FC_EQUIVOCATOR", TAG_FC_EQUIVOCATOR),
+    ("TAG_DEPOSIT_QUEUE", TAG_DEPOSIT_QUEUE),
+    ("TAG_DELEGATION", TAG_DELEGATION),
+    ("TAG_PENDING_FEE", TAG_PENDING_FEE),
+    ("TAG_EVM_COMMITMENT", TAG_EVM_COMMITMENT),
+    ("TAG_SLASH_APPLIED", TAG_SLASH_APPLIED),
+    ("TAG_SLASH_WINDOW", TAG_SLASH_WINDOW),
+    ("TAG_DELEGATOR_SLASH_LOSS", TAG_DELEGATOR_SLASH_LOSS),
+    ("TAG_ISSUED_SUPPLY", TAG_ISSUED_SUPPLY),
+    ("TAG_BASE_FEE", TAG_BASE_FEE),
+    ("TAG_DELEGATOR_FEE_REWARD", TAG_DELEGATOR_FEE_REWARD),
+    ("TAG_VALIDATOR_FEE_REWARD", TAG_VALIDATOR_FEE_REWARD),
+    ("TAG_DELEGATOR_ISSUANCE_REWARD", TAG_DELEGATOR_ISSUANCE_REWARD),
+    ("TAG_PROPOSED_CURRENT", TAG_PROPOSED_CURRENT),
+    ("TAG_FC_RECENT_VOTE", TAG_FC_RECENT_VOTE),
+    ("TAG_WRITTEN_OFF", TAG_WRITTEN_OFF),
+    ("TAG_STAKE_LOW_WATER", TAG_STAKE_LOW_WATER),
+    ("TAG_RANDAO_GENERATION", TAG_RANDAO_GENERATION),
+    ("TAG_FUNDED_VALIDATOR", TAG_FUNDED_VALIDATOR),
+];
+
 
 fn sha3(parts: &[&[u8]]) -> [u8; 32] {
     let mut h = Sha3_256::new();
@@ -3572,37 +3612,13 @@ mod tests {
     /// [`TAG_FC_RECENT_VOTE`] docs rule out by choosing the next free byte.
     #[test]
     fn component_tags_are_pairwise_distinct() {
-        let tags = [
-            TAG_EUTXO,
-            TAG_VALIDATOR,
-            TAG_PARTICIPATION_CURRENT,
-            TAG_PARTICIPATION_PREVIOUS,
-            TAG_RANDAO,
-            TAG_TAINT_ROOT,
-            TAG_COHERENCE_ACCUMULATOR,
-            TAG_COHERENCE_NULLIFIERS,
-            TAG_FINALITY,
-            TAG_PENDING_VOTE,
-            TAG_FC_MESSAGE,
-            TAG_FC_EQUIVOCATOR,
-            TAG_DEPOSIT_QUEUE,
-            TAG_DELEGATION,
-            TAG_PENDING_FEE,
-            TAG_EVM_COMMITMENT,
-            TAG_SLASH_APPLIED,
-            TAG_SLASH_WINDOW,
-            TAG_DELEGATOR_SLASH_LOSS,
-            TAG_ISSUED_SUPPLY,
-            TAG_BASE_FEE,
-            TAG_DELEGATOR_FEE_REWARD,
-            TAG_VALIDATOR_FEE_REWARD,
-            TAG_DELEGATOR_ISSUANCE_REWARD,
-            TAG_PROPOSED_CURRENT,
-            TAG_FC_RECENT_VOTE,
-            TAG_WRITTEN_OFF, TAG_STAKE_LOW_WATER, TAG_RANDAO_GENERATION, TAG_FUNDED_VALIDATOR,
-        ];
-        let distinct: std::collections::BTreeSet<u8> = tags.iter().copied().collect();
-        assert_eq!(distinct.len(), tags.len(), "two state-root components share a tag byte");
+        let distinct: std::collections::BTreeSet<u8> =
+            STATE_COMPONENT_TAGS.iter().map(|(_, tag)| *tag).collect();
+        assert_eq!(
+            distinct.len(),
+            STATE_COMPONENT_TAGS.len(),
+            "two state-root components share a tag byte"
+        );
         assert_eq!(TAG_FC_RECENT_VOTE, 0x1A, "the O01 component takes the next free byte after 0x19");
     }
 

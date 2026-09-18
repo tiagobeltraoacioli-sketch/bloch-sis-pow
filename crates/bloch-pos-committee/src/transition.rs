@@ -33,38 +33,17 @@
 //!    [`crate::delegation::Registry::cap_sat`]. This module *calls* those and
 //!    never re-derives either denominator.
 //!
-//! ## Frozen error order (consensus-visible, per the `StateTransition` docs)
+//! ## Validation order (stable diagnostics, not consensus data)
 //!
-//! Cheapest first, so spam is rejected before any hybrid verify runs:
-//!
-//! 1. `NonMonotonicSlot` — slot must advance, and must not land in an epoch
-//!    the caller already processed past.
-//! 2. `WrongParent` — header `parent` vs the pre-state's head id.
-//! 3. `Proposal(WrongVersion)`.
-//! 4. `Proposal(NotScheduledProposer)` — the `schedule` draw (a hash, no sig).
-//! 5. `Proposal(BadRandaoReveal)` — preimage check + mix consistency (two
-//!    hashes).
-//! 6. `FinalityRegression` — header finality roots vs parent-committed
-//!    finality (a comparison).
-//! 7. `Proposal(BadSignature)` — the proposer's hybrid signature: one
-//!    expensive verify, placed before the N attestation verifies.
-//! 8. `Attestation(i)` — in body order; membership (cheap) is checked before
-//!    each signature inside [`crate::attestation::validate`].
-//! 9. `Transaction(i)` / `Transfer(i, reason)` — in body order. The staking
-//!    arms are cheap state lookups. A transfer runs its own frozen
-//!    cheapest-first order *within* the transaction (structure, size floor,
-//!    set membership, script hashes, conservation, then the hybrid
-//!    verifications last) — see [`CommittedState::apply_transfer`] — and
-//!    reports which rule it broke, because those rules decide who may move
-//!    coins and a bare index is not enough to debug a divergence over one.
-//! 10. `StateRootMismatch` — last, because the root only exists once the
-//!     whole transition has run.
-//!
-//! `EpochAdvanceTooLarge` was appended to this order, not inserted into it: it
-//! sits between the header-commitment checks and the epoch boundary walk it
-//! bounds, which is the first point at which the walk's cost is about to be
-//! paid. Every block that was a reject before the rule existed still returns
-//! the error it returned before.
+//! The production path keeps cheap structural and commitment checks ahead of
+//! hybrid verification, processes body items deterministically, and checks the
+//! computed state root only after building the child. That ordering is a DoS
+//! property and a useful API compatibility promise. It is not itself committed
+//! consensus state: [`TransitionError`] never appears in a block or state root.
+//! Nodes must agree whether a block is accepted and, when accepted, on its
+//! child root; two implementations choosing different diagnostics for the same
+//! multiply-invalid block do not fork. Tests pin important precedence where
+//! callers rely on it without mislabelling the diagnostic as consensus bytes.
 //!
 //! ## Double-apply is a reject, not a no-op — decided here
 //!
@@ -5546,8 +5525,8 @@ impl<V: SignatureVerifier> Transition<V> {
         //
         // They sit here — after the two integer comparisons, before the
         // sortition draw and long before the hybrid verify — because they are
-        // hashes over data already in hand, and the frozen error order is
-        // cheap-to-expensive. The functions are `derive`'s: one derivation
+        // hashes over data already in hand, preserving the cheap-to-expensive
+        // DoS posture. The functions are `derive`'s: one derivation
         // path means the producer stamps and the validator checks by calling
         // the same code, which is the whole anti-h28080 invariant `produce.rs`
         // is built on.

@@ -526,11 +526,12 @@ mod harness {
         type State = NodeState;
         type Transaction = ();
 
-        /// Apply one block. Validation order is part of the frozen contract
-        /// (error order is consensus-visible): cheap structural checks first,
-        /// the hybrid signature after them, and the state root LAST — the
+        /// Apply one block. This legacy fixture keeps cheap structural checks
+        /// first, the hybrid signature after them, and the state root LAST — the
         /// root check is the h28080 seam, and it must judge the fully-built
-        /// post-state, not a partially-validated one.
+        /// post-state, not a partially-validated one. Reject precedence is a
+        /// diagnostic/DoS property; only acceptance and the child root are
+        /// consensus-visible.
         fn apply_block(
             &self,
             pre: &NodeState,

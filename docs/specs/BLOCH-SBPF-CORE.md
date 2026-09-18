@@ -40,9 +40,9 @@ metered, sandboxed, bit-reproducible across machines.
   closed (Transfer/Deposit/Exit/Delegate/SlashingEvidence); `script_hash`
   stays SHA3-256(pubkey). Wiring any VM into L1 requires a flag-day
   (`LEAKED_ROSTER_ACTIVATION_EPOCH` idiom, params.rs:106) AND a
-  `StateRoots` component addition, and SR-2 says that list is re-frozen
-  exactly once (milestone X1). A third engine beside bloch-euvm and the
-  ADR-040 EVM cannot silently join that re-freeze. **Founder decision
+  append-only `STATE_COMPONENT_TAGS` addition plus the concrete state fold.
+  The legacy `StateRoots` DTO is not the live registry. A third engine beside
+  bloch-euvm and the ADR-040 EVM cannot silently join consensus. **Founder decision
   required before any consensus milestone is even planned.**
 - It is **not a JIT** and has no parallel scheduler. Interpreter only.
   A JIT is a determinism and security liability we are not buying now;
