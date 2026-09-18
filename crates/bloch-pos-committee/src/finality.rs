@@ -1452,6 +1452,78 @@ mod tests {
         );
     }
 
+    /// FC-07 attack regression: the one-half denominator floor permits two
+    /// disjoint one-third partitions to finalize different checkpoints after
+    /// the absent stake leaks. Each validator signs on only one branch, so
+    /// neither branch observes an equivocator and there is no double vote to
+    /// slash. This pins the accepted residual; it is not a candidate fix.
+    #[test]
+    fn disjoint_one_third_partitions_finalize_conflicting_checkpoints_without_equivocation() {
+        let _gates = crate::params::rehearsal::gates_open_guard();
+        let committee = [
+            validator(0, STAKE_EACH),
+            validator(1, STAKE_EACH),
+            validator(2, STAKE_EACH),
+        ];
+        let branch_root = |marker: u8, epoch: u64| {
+            let mut out = [marker; 32];
+            out[..8].copy_from_slice(&epoch.to_le_bytes());
+            out
+        };
+        let mut left = FinalityState::new(genesis());
+        let mut right = FinalityState::new(genesis());
+        let mut left_finalized = None;
+        let mut right_finalized = None;
+
+        for epoch in 1..=128 {
+            let left_vote = [vote(
+                0,
+                epoch,
+                branch_root(0xA1, epoch),
+                left.current_justified(),
+            )];
+            let right_vote = [vote(
+                1,
+                epoch,
+                branch_root(0xB2, epoch),
+                right.current_justified(),
+            )];
+            let left_out = left
+                .process_epoch(&EpochVotes {
+                    epoch,
+                    active_set: &committee,
+                    attestations: &left_vote,
+                })
+                .unwrap();
+            let right_out = right
+                .process_epoch(&EpochVotes {
+                    epoch,
+                    active_set: &committee,
+                    attestations: &right_vote,
+                })
+                .unwrap();
+
+            assert!(left_out.equivocators.is_empty());
+            assert!(right_out.equivocators.is_empty());
+            left_finalized = left_finalized.or(left_out.finalized);
+            right_finalized = right_finalized.or(right_out.finalized);
+            if left_finalized.is_some() && right_finalized.is_some() {
+                break;
+            }
+        }
+
+        let left_finalized = left_finalized.expect("one third must finalize under the 1/2 floor");
+        let right_finalized =
+            right_finalized.expect("the disjoint one third must also finalize under the 1/2 floor");
+        assert_eq!(left_finalized.epoch, right_finalized.epoch);
+        assert_ne!(left_finalized.root, right_finalized.root);
+        assert_eq!(
+            (left_finalized.epoch, right_finalized.epoch),
+            (18, 18),
+            "the symmetric branches must cross the floor on the same measured schedule",
+        );
+    }
+
     // ── TASK 1: zeroing the leak accumulator for the relaunch ──────────────
     //
     // SECOND LINE OF DEFENCE. Dev A's roster unification is the fix. These
