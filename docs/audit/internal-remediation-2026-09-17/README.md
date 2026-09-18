@@ -8,7 +8,8 @@ The resumed pass continues with [asynchronous reorg publication](WAVE-43-STORAGE
 [checked vault construction](WAVE-43-VAULT.md), and
 [network transport reconciliation](WAVE-43-NETWORK.md). The four-track result
 and its combined validation are recorded in the [2026-09-18 integration
-checkpoint](WAVE-44-INTEGRATION.md).
+checkpoint](WAVE-44-INTEGRATION.md). Continued work records the lifecycle
+metering/runbook reconciliation in [Wave 45 ST-12](WAVE-45-ST12.md).
 
 ## Scope and source reconciliation
 
