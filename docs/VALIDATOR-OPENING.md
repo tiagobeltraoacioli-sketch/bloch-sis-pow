@@ -42,6 +42,12 @@ Implementation reference: `21a9311` (ADR-041), merged in `22b8b7f`.
 - Withdrawals pay backed stake to committed credentials; unissued genesis
   principal is written off. Evidence submission and automatic withdrawal and
   RANDAO renewal are implemented.
+- The lifecycle boundary also makes every lifecycle transaction consume the
+  existing block gas and byte budgets. This includes `ExitV2`,
+  `RandaoRecommit`, and `SlashingEvidence`, even though the standalone
+  `STAKING_TX_METERING_ACTIVATION_EPOCH` remains inert: the charge deliberately
+  opens when `WITHDRAWAL_ACTIVATION_EPOCH` opens. This does not charge a money
+  fee and does not add a transaction-count cap.
 
 These are implementation findings, not deployment or independent-audit claims.
 The September 8 admission review describes an older base; its reproductions

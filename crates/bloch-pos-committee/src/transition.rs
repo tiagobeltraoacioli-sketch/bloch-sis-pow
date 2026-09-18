@@ -8252,6 +8252,29 @@ mod tests {
         ));
     }
 
+    /// ST-12 regression: ADR-041 activated the withdrawal/lifecycle gate at
+    /// epoch 2,884 while the standalone metering gate remained inert. The
+    /// explicit `withdrawal_active` coupling in `staking_tx_charge` therefore
+    /// makes lifecycle transactions consume the existing gas and byte budgets
+    /// at the lifecycle boundary. Keep that release behavior visible: removing
+    /// the coupling would silently restore free lifecycle transactions, while
+    /// moving it earlier would break historical replay.
+    #[test]
+    fn lifecycle_gate_also_activates_staking_capacity_metering() {
+        let gate = crate::params::WITHDRAWAL_ACTIVATION_EPOCH;
+        assert_eq!(crate::params::STAKING_TX_METERING_ACTIVATION_EPOCH, u64::MAX);
+
+        let before = CommittedState::staking_tx_charge(gate - 1, 1, 123);
+        assert_eq!(before.gas, 0);
+        assert_eq!(before.tx_bytes, 0);
+
+        let at = CommittedState::staking_tx_charge(gate, 1, 123);
+        assert!(at.gas > 0);
+        assert_eq!(at.tx_bytes, 123);
+        assert_eq!(at.base_fee_sat, 0);
+        assert_eq!(at.priority_fee_sat, 0);
+    }
+
     /// R7 M1 regression, the unauthenticated arms: below the gate a
     /// `Delegate` (or legacy `Exit`) is free; at and above it, it is charged
     /// intrinsic gas for its own bytes and NOTHING for verification (it
