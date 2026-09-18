@@ -1,0 +1,35 @@
+Validation wave 13 — 2026-09-17
+Branch: fix/internal-audit-20260917
+Implementation commit: 6743395
+
+PASS
+
+cargo test -p bloch-crypto hybrid_public_key_policy_distinguishes_live_and_crypto_agility_suites
+  1 passed; exact enveloped/raw hybrid shapes accepted, suite 0x0002 and a
+  truncated envelope refused, legacy magic collision preserved.
+
+cargo test -p bloch-pos-node non_hybrid_transfer_keys_are_refused_before_signature_verification
+  1 passed; V1 and V2 suite-0x0002 keys refused before the verifier, with real
+  hybrid controls accepted.
+
+cargo test -p bloch-crypto
+  190 passed; 0 failed; 4 ignored across unit, integration and doc tests.
+
+cargo test -p bloch-pos-node
+  592 passed; 0 failed; 25 ignored across unit and integration tests.
+
+git diff --check
+  Passed before the implementation commit and before this evidence checkpoint.
+
+KNOWN FORMATTER BASELINE
+
+rustfmt --check on the two touched source files reports the repository's
+pre-existing broad formatting drift, including thousands of unchanged lines.
+No workspace-wide formatting migration is mixed into this security patch.
+
+NOT A CONSENSUS ACTIVATION
+
+This wave changes node admission policy only. The generic crypto verifier and
+the block state transition retain suite-0x0002 compatibility. Full CR-03
+closure still requires output inventory, a protocol decision and a coordinated
+consensus activation.
