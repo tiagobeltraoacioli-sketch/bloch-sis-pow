@@ -1,0 +1,22 @@
+Validation wave 32 — 2026-09-18
+Branch: fix/internal-audit-20260917
+Implementation: 735a2c1
+
+PASS
+
+cargo test --locked --offline -p bloch-pos-node --bin bloch-pos \
+  boot_switch_tests
+  3 passed; 0 failed; 505 filtered out.
+
+Covered:
+  - absent, 0 and false stay off;
+  - 1 and true arm;
+  - empty, TRUE, yes, 2 and whitespace-prefixed true fail with InvalidInput.
+
+git diff --check
+  Passed before the implementation commit and after the documentation update.
+
+BOUNDARY
+
+Explicit overrides remain supported. No environment value enters the pure
+committee transition, and no consensus rule or accepted block set changed.

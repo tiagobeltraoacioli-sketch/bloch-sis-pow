@@ -4,7 +4,7 @@ Audited source: `562e220`. Remediation base: `b066e3c`. Branch: `fix/internal-au
 
 All 200 findings are retained, including duplicates. IMPLEMENTED means code changed in this branch, not deployed, externally audited, or universally resolved on the live fleet. PARTIAL is not closure. No production binary was published.
 
-IMPLEMENTED: 66, PARTIAL: 79, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE CHANGED: 7, OPEN: 41, REFUTED IN AUDIT: 1, VERIFIED POSITIVE: 1.
+IMPLEMENTED: 66, PARTIAL: 80, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE CHANGED: 7, OPEN: 40, REFUTED IN AUDIT: 1, VERIFIED POSITIVE: 1.
 
 | Finding | Status | Evidence / remaining work | Original title |
 |---|---|---|---|
@@ -165,7 +165,7 @@ IMPLEMENTED: 66, PARTIAL: 79, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE C
 | CR-12 | PARTIAL | New checked ASERT API rejects regressed heights, overflow and malformed/zero targets; unit/property/no_std checks pass. Historical consensus callers retain old behavior pending migration. | Genesis-3 PoW crate: `asert_next_bits` underflows on `new_height < anchor_height`; `bits_to_target` maps invalid compact bits to `Target::MIN` |
 | EN-20 | IMPLEMENTED | One registry-identity helper serves production and tests, preserving consumed-reveal and generation-specific RANDAO checks. Nine registry gate tests and integrated node suite cover it. | Two implementations of the boot identity rule; the tested one has no production caller |
 | EN-21 | IMPLEMENTED | Actual genesis validator index membership replaces dense-index assumption; sparse genesis identity and deposited-key retry regressions pass. | `genesis_validator_count` assumes dense manifest indices |
-| EN-22 | OPEN | Not closed by this bundle. Requires dedicated implementation, protocol design, external operational evidence or product-owner integration; original finding remains tracked. | Env/flag-driven node-local safety behaviour (summary; see §3) |
+| EN-22 | PARTIAL | Finality-rewind, doppelgänger bypass and recovery/cache environment switches now accept only explicit `0/1/false/true`, are read once at boot and fail startup on empty, misspelled or otherwise ambiguous values. Three pure parser regressions pass. Deliberate safety overrides and KS-18's persistent-doppelgänger gap remain. See WAVE-32.md. | Env/flag-driven node-local safety behaviour (summary; see §3) |
 | EN-23 | PARTIAL | Persisted validated restart caches and incremental state roots retained. Warm restore moves the validated cached prefix instead of cloning its envelopes; cache serialization borrows state and appends directly. Reorg crash residues and index append gaps are repaired. Full-log loading, cold replay/retention, peak RSS and production-scale recovery SLA remain unqualified. | Per-ingest cost and memory grow with chain age; replay is quadratic |
 | EN-24 | IMPLEMENTED | Same shared sync budget as NET-05. | Serving `get_blocks` is rate-limited per connection, not per peer/IP |
 | FC-13 | PARTIAL | Latent 64-bit epoch-to-slice narrowing now fails closed on 32-bit targets. Boundary divergence observation no longer performs blocking stderr I/O inside consensus; a saturating atomic counter is exported as `bloch_pos_boundary_vote_drops_total`. Remaining aggregate notes include the seed fallback contract, exhaustion fallback bias, infallible canonical-encoding length casts and release-only invariant posture. See WAVE-25.md. | Arithmetic/panic notes (Info) |
