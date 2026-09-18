@@ -765,13 +765,14 @@ pub fn boot(
             ));
         };
         let set_bytes = fs::read(set_path)?;
-        if let Some(expected) = cfg.signer_set_sha3 {
-            let actual = signer_set_fingerprint(&set_bytes);
-            if actual != expected {
-                return Err(bad(format!("signer arrangement fingerprint mismatch: expected {}, read {}; refusing substituted keys/quorum/review clock", hex32(&expected), hex32(&actual))));
-            }
-        } else {
-            warnings.push("WARNING: signer arrangement is not pinned with --ws-signer-set-sha3; obtain its fingerprint through an independent trusted channel before onboarding. The checkpoint digest does not bind arrangement contents.".into());
+        let Some(expected) = cfg.signer_set_sha3 else {
+            return Err(bad(
+                "--ws-checkpoint REFUSED without --ws-signer-set-sha3: the V1 checkpoint digest binds only the arrangement id, so accepting an unpinned file would let one download substitute its keys, quorum and review clock together with the envelope".into(),
+            ));
+        };
+        let actual = signer_set_fingerprint(&set_bytes);
+        if actual != expected {
+            return Err(bad(format!("signer arrangement fingerprint mismatch: expected {}, read {}; refusing substituted keys/quorum/review clock", hex32(&expected), hex32(&actual))));
         }
         let set = decode_signer_set_file(&set_bytes)
             .map_err(|e| bad(format!("{}: {e}", set_path.display())))?;
@@ -1725,7 +1726,12 @@ mod tests {
         let arrangement = dir.join("arrangement.bin");
         fs::write(&envelope, encode_envelope_file(&CheckpointEnvelope { checkpoint: cp, signatures })).unwrap();
         fs::write(&arrangement, encode_signer_set_file(&set)).unwrap();
-        let cfg = WsConfig { checkpoint: Some(envelope), signer_set: Some(arrangement), signer_set_sha3: None };
+        let unpinned = WsConfig { checkpoint: Some(envelope.clone()), signer_set: Some(arrangement.clone()), signer_set_sha3: None };
+        let error = boot(&unpinned, &dir, NET, &GEN, &genesis_anchor(), 70, true,
+            (64, cp.block_root), |_| Some(cp.block_root), |_| true, |_| None).err().unwrap();
+        assert!(is_non_retryable(&error));
+        assert!(error.to_string().contains("REFUSED without --ws-signer-set-sha3"));
+        let cfg = pinned_config(envelope, arrangement);
         let local = |root: &[u8; 32]| if *root == cp.block_root { Some([0xee; 32]) } else { None };
         let error = boot(&cfg, &dir, NET, &GEN, &genesis_anchor(), 70, true,
             (64, cp.block_root), |_| Some(cp.block_root), |_| true, local).err().unwrap();
@@ -1931,7 +1937,7 @@ mod tests {
         fs::write(&env_path, encode_envelope_file(&env)).unwrap();
         fs::write(&set_path, &set_bytes).unwrap();
 
-        let cfg = WsConfig { checkpoint: Some(env_path), signer_set: Some(set_path), signer_set_sha3: None };
+        let cfg = pinned_config(env_path, set_path);
         let err = boot(
             &cfg, &dir, NET, &GEN, &genesis_anchor(),
             300, false, (0, GEN), |_| None, |_| false, |_| None,
@@ -1947,11 +1953,7 @@ mod tests {
         // adopted_epoch and to nothing else about this envelope.
         let sane = SignerSet { adopted_epoch: 0, ..set };
         fs::write(dir.join("set-ok.bin"), encode_signer_set_file(&sane)).unwrap();
-        let cfg = WsConfig {
-            checkpoint: Some(dir.join("env.bin")),
-            signer_set: Some(dir.join("set-ok.bin")),
-            signer_set_sha3: None,
-        };
+        let cfg = pinned_config(dir.join("env.bin"), dir.join("set-ok.bin"));
         boot(
             &cfg, &dir, NET, &GEN, &genesis_anchor(),
             300, false, (0, GEN), |_| None, |_| false, |_| None,
@@ -1976,7 +1978,7 @@ mod tests {
         fs::write(&env_path, encode_envelope_file(&env)).unwrap();
         fs::write(&set_path, encode_signer_set_file(&set)).unwrap();
 
-        let cfg = WsConfig { checkpoint: Some(env_path), signer_set: Some(set_path), signer_set_sha3: None };
+        let cfg = pinned_config(env_path, set_path);
         let refusal = boot(
             &cfg, &dir, NET, &GEN, &genesis_anchor(),
             1, false, (0, GEN), |_| None, |_| false, |_| None,
@@ -2020,6 +2022,15 @@ mod tests {
         (set, sigs)
     }
 
+    fn pinned_config(checkpoint: PathBuf, signer_set: PathBuf) -> WsConfig {
+        let bytes = fs::read(&signer_set).unwrap();
+        WsConfig {
+            checkpoint: Some(checkpoint),
+            signer_set: Some(signer_set),
+            signer_set_sha3: Some(signer_set_fingerprint(&bytes)),
+        }
+    }
+
     /// A published checkpoint that contradicts OWN finality raises the alarm,
     /// is not admitted as the anchor, and never blocks the node from
     /// resuming on its own finality — the §5 structural limit.
@@ -2034,7 +2045,7 @@ mod tests {
         let set_path = dir.join("set.bin");
         fs::write(&env_path, encode_envelope_file(&env)).unwrap();
         fs::write(&set_path, encode_signer_set_file(&set)).unwrap();
-        let cfg = WsConfig { checkpoint: Some(env_path), signer_set: Some(set_path), signer_set_sha3: None };
+        let cfg = pinned_config(env_path, set_path);
 
         // The node's own finalized root at epoch 64 differs from cp's.
         let own_root = [0x99; 32];
@@ -2087,7 +2098,7 @@ mod tests {
         let set_path = dir.join("set.bin");
         fs::write(&env_path, encode_envelope_file(&env)).unwrap();
         fs::write(&set_path, encode_signer_set_file(&set)).unwrap();
-        let cfg = WsConfig { checkpoint: Some(env_path), signer_set: Some(set_path), signer_set_sha3: None };
+        let cfg = pinned_config(env_path, set_path);
         let err = boot(
             &cfg, &dir, NET, &GEN, &genesis_anchor(),
             1, false, (0, GEN), |_| None, |_| false, |_| None,

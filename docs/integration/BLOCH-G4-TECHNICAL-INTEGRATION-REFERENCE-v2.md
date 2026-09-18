@@ -319,7 +319,8 @@ signed it could not all have withdrawn yet.
   recent checkpoint obtained OUT OF BAND is the only sound way in."* The
   message then names the recovery path: fetch a signed checkpoint envelope
   from a trusted channel, compare its digest across at least two independent
-  channels, and restart with `--ws-checkpoint <file> --ws-signer-set <file>`.
+  channels, obtain the signer-set fingerprint independently, and restart with
+  `--ws-checkpoint <file> --ws-signer-set <file> --ws-signer-set-sha3 <hex32>`.
 - **No such checkpoint exists in this repository.** `genesis/` contains only
   `mainnet.manifest` and `README.md` — no `ws_latest.bin`, no checkpoint
   envelope, no signer-set file. The signing ceremony that would produce one
@@ -1933,7 +1934,7 @@ fresh today** — read that section before planning around this section.
 | `--metrics-port <n>\|off` | **off — no default listener** | |
 | `--max-peers <n>` | 64 | libp2p/dual only |
 | `--behind-proxy` | off | libp2p/dual only — zeroes an IP-colocation peer-scoring penalty |
-| `--ws-checkpoint <file>` + `--ws-signer-set <file>` | none | Must be given together. See §2.6/§13.4. |
+| `--ws-checkpoint <file>` + `--ws-signer-set <file>` + `--ws-signer-set-sha3 <hex32>` | none | All three are required for an external envelope. See §2.6/§13.4. |
 | `--stop-at-slot <n>` | none | test/ops convenience |
 | `--allow-finality-rewind` (env: `BLOCH_ALLOW_FINALITY_REWIND=1`) | off | Not recommended for an observer node. |
 | `--no-doppelganger-check` (env: `BLOCH_NO_DOPPELGANGER=1`) | off | Meaningless for an observer (no keystore, no duties). |
@@ -1978,8 +1979,9 @@ from genesis and then **refuse to complete**, loudly, with the
 `ERR_WS_REQUIRE_CHECKPOINT` message quoted in full in §2.6 — this is the
 mechanism working as designed, not a bug to work around. If a checkpoint has
 since been published, obtain it from a channel you trust, verify its digest
-across at least two independent channels, and supply it via
-`--ws-checkpoint <file> --ws-signer-set <file>`.
+across at least two independent channels, obtain the arrangement fingerprint
+independently, and supply it via `--ws-checkpoint <file> --ws-signer-set <file>
+--ws-signer-set-sha3 <hex32>`.
 
 ### 13.5 RPC exposure
 

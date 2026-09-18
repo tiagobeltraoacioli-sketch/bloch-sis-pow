@@ -180,7 +180,7 @@ it prints `MATCHES NEITHER §6.1 PHASE`, stop: that is fine for a drill and
 wrong for publication.
 
 `signer-set-1.bin` is public. Publish it alongside every envelope — a node
-needs both (`--ws-checkpoint` *and* `--ws-signer-set`) — and **publish its
+needs the envelope, arrangement and independent `--ws-signer-set-sha3` pin — and **publish its
 SHA3-256 fingerprint the way you publish the ws digest**. The command prints
 it. Agreement of the fingerprint across independent channels is the only thing
 that makes the arrangement as checkable as the checkpoint it accompanies.
@@ -361,11 +361,13 @@ artifact's own say-so is not.
 ```
 bloch-pos run --data-dir <dir> \
               --ws-checkpoint wscheckpoint-<epoch>.envelope.bin \
-              --ws-signer-set signer-set-1.bin
+              --ws-signer-set signer-set-1.bin \
+              --ws-signer-set-sha3 <fingerprint-from-an-independent-channel>
 ```
 
 Before starting, they should run the `ws-verify` of step 5 themselves and
-compare the printed digest against a second publication channel.
+compare the printed digest and arrangement fingerprint against independent
+publication channels. An external envelope is refused without the pin.
 
 Boot refusals and what they mean:
 

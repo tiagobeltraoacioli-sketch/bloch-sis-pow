@@ -365,7 +365,7 @@ answer, and it has exactly two regimes:
 | Chain age | What a fresh node needs | What it must trust |
 |---|---|---|
 | < `WS_PERIOD_EPOCHS` (2016 epochs ≈ **22.4 days** at 30 s slots) | the genesis manifest, nothing else | nothing — the genesis block is its own anchor |
-| ≥ `WS_PERIOD_EPOCHS` | a signed checkpoint (`--ws-checkpoint` + `--ws-signer-set`) | the checkpoint signers, for **one fact**: which finalized root is real at one epoch |
+| ≥ `WS_PERIOD_EPOCHS` | a signed checkpoint (`--ws-checkpoint` + `--ws-signer-set` + independently obtained `--ws-signer-set-sha3`) | the checkpoint signers, for **one fact**: which finalized root is real at one epoch |
 
 A node past the window that is given no checkpoint **refuses to sync** and says
 so; it does not follow a peer quietly. In the second regime the checkpoint is

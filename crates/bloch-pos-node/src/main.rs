@@ -431,8 +431,8 @@ fn print_help() {
          \n\
                          [--stop-at-slot <n>]\n\
                          [--replay-from-genesis | --require-state-cache] [--max-replay-blocks <n>]\n\
-                         [--ws-checkpoint <file>] [--ws-signer-set <file>]\n\
-                         [--ws-signer-set-sha3 <independently-verified-hex32>]\n\
+                         [--ws-checkpoint <file> --ws-signer-set <file>\n\
+                          --ws-signer-set-sha3 <independently-verified-hex32>]\n\
                          [--carryover <snapshot.tsv>]\n\
                Run a validator node. <dir> must hold validator.key; chain\n\
                data persists in <dir>; a compatible local state cache skips its replay prefix.\n\

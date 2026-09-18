@@ -252,11 +252,13 @@ artifact's own say-so is not.
 ```
 bloch-pos run --data-dir <dir> \
               --ws-checkpoint wscheckpoint-<epoch>.envelope.bin \
-              --ws-signer-set signer-set-1.bin
+              --ws-signer-set signer-set-1.bin \
+              --ws-signer-set-sha3 <fingerprint-from-an-independent-channel>
 ```
 
-Both flags are required together. Before starting, they should run the §7
-`ws-verify` themselves and compare the digest against a second channel.
+All three flags are required together. Before starting, they should run the §7
+`ws-verify` themselves and compare the digest and arrangement fingerprint
+against independent channels.
 
 ---
 

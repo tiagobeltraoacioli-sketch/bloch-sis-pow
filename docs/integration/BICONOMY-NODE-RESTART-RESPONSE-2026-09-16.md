@@ -56,8 +56,9 @@ on a standby observer while the existing observer remains available.
 
 ## 2. Weak-subjectivity checkpoints and skipping history
 
-You are correct about `--ws-checkpoint` and `--ws-signer-set`: they establish the
-trust anchor and do **not** shorten replay in the published release. The checkpoint
+You are correct about `--ws-checkpoint` and `--ws-signer-set` (now accompanied
+by the mandatory independently obtained `--ws-signer-set-sha3` pin): they
+establish the trust anchor and do **not** shorten replay in the published release. The checkpoint
 contains commitments, not the UTXOs, queues and accounting state necessary to
 execute the next block.
 
