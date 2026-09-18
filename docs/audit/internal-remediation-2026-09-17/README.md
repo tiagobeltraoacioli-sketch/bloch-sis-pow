@@ -77,6 +77,12 @@ Wave 51 makes the deterministic PQ test override
 [fail boundedly on an unusable index](WAVE-51-NET22.md). The
 [Wave 51 integration checkpoint](WAVE-51-INTEGRATION.md) records cross-review,
 the final green local suites and the still-open external launch gates.
+Wave 52 removes whole-object [`VaultKeys` cloning](WAVE-52-BV09.md), adds an
+independent [default Argon2 allocation ceiling](WAVE-52-KS11.md), fingerprints
+the [effective build environment](WAVE-52-KS09.md), and moves
+[validator registry RPC reads](WAVE-52-NET01.md) off the consensus thread. The
+[Wave 52 integration checkpoint](WAVE-52-INTEGRATION.md) records the four-agent
+review, validation and unchanged external release boundary.
 
 ## Scope and source reconciliation
 
