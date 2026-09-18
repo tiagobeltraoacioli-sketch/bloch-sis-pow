@@ -10,7 +10,9 @@ The resumed pass continues with [asynchronous reorg publication](WAVE-43-STORAGE
 and its combined validation are recorded in the [2026-09-18 integration
 checkpoint](WAVE-44-INTEGRATION.md). Continued work records the lifecycle
 metering/runbook reconciliation in [Wave 45 ST-12](WAVE-45-ST12.md) and the
-mainnet manifest-input tripwires in [Wave 45 ST-11](WAVE-45-ST11.md).
+mainnet manifest-input tripwires in [Wave 45 ST-11](WAVE-45-ST11.md). The
+same pass stages a [deliberately inactive TX-10 resource
+candidate](WAVE-45-TX10.md).
 
 ## Scope and source reconciliation
 
@@ -33,9 +35,15 @@ The complete [finding ledger](FINDINGS.md) retains all 197 area findings plus LD
 - Vault API refuses PQ keys that previously reached a panicking wrapper and explicit CSV delays below 144. Signed anchors reject trailing bytes. Watchtower documentation no longer claims RBF alone gives a keyless watcher replacement authority. Existing low-level vault derivation and spending formats are unchanged.
 - Root Rust toolchain is pinned to 1.94.1. Source digests include C `.macros` inputs, hidden source directories and the toolchain pin. Docker excludes common secret files. Root rustls is 0.23.45 and rustls-webpki is 0.103.15, addressing [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285.html).
 
-## Consensus candidate, deliberately inactive
+## Consensus candidates, deliberately inactive
 
 FC-01 has a regression reproducing an all-zero duty roster and a candidate fallback to the unleaked consensus roster. `DUTY_ROSTER_RECOVERY_ACTIVATION_EPOCH = u64::MAX` means production behavior is unchanged. This is **not a closed liveness finding**. Its gated regression passed again after the final gate-helper change. The candidate affects every consumer of the consensus roster, including the rewards-v2 path, and must be qualified with complete outage/rejoin, partition, finality, rewards, historical replay and weak-subjectivity tests before activation. No activation epoch is proposed here.
+
+TX-10 now also has a transaction-count candidate behind
+`STAKING_TX_METERING_ACTIVATION_EPOCH = u64::MAX`. The 4,096 ceiling is not
+consulted in production and its regression proves the pre-gate verdict is
+unchanged. It must not be armed without historical replay, non-reference
+producer analysis, resource qualification, and a coordinated fleet release.
 
 For FC-02/ST-01 the proposed direction is stake-proportional weight rather than a calendar allocation that gives one outsider a supermajority. Counting public keys cannot establish independent operators. No cohort economics were silently changed; a reviewed protocol decision and coordinated validator release remain required.
 
