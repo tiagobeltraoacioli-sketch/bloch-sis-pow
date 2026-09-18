@@ -82,6 +82,8 @@ No activation epoch is proposed by this wave.
   and permanent registry/history identities.
 - `cargo test -p bloch-pos-committee --lib`: 448 passed, four ignored and zero
   failed.
+- `cargo clippy -p bloch-pos-committee --lib`: completed with inherited
+  warnings and no errors.
 - `git diff --check`: passed.
 
 The build emitted inherited unused-import, unused-doc-comment and dead-code

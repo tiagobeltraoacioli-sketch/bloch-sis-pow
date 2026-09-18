@@ -2207,6 +2207,10 @@ pub const fn epoch_gate_active(epoch: u64, activation: u64) -> bool {
     activation != u64::MAX && epoch >= activation
 }
 
+const fn gate_is_inert_or_not_before(gate: u64, prerequisite: u64) -> bool {
+    gate == u64::MAX || gate >= prerequisite
+}
+
 #[cfg(test)]
 mod epoch_gate_tests {
     use super::epoch_gate_active;
@@ -2233,10 +2237,14 @@ const _: () = {
     assert!(WITHDRAWAL_ACTIVATION_EPOCH == SLASHING_EVIDENCE_ACTIVATION_EPOCH);
     assert!(SLASHING_EVIDENCE_ACTIVATION_EPOCH == RANDAO_RECOMMIT_ACTIVATION_EPOCH);
     assert!(DEPOSIT_ACTIVATION_EPOCH == u64::MAX);
-    assert!(FUNDED_VALIDATOR_CANCELLATION_ACTIVATION_EPOCH == u64::MAX
-        || (FUNDED_VALIDATOR_CANCELLATION_ACTIVATION_EPOCH >= EXIT_AUTH_ACTIVATION_EPOCH
-            && FUNDED_VALIDATOR_CANCELLATION_ACTIVATION_EPOCH
-                >= WITHDRAWAL_ACTIVATION_EPOCH));
+    assert!(gate_is_inert_or_not_before(
+        FUNDED_VALIDATOR_CANCELLATION_ACTIVATION_EPOCH,
+        EXIT_AUTH_ACTIVATION_EPOCH,
+    ));
+    assert!(gate_is_inert_or_not_before(
+        FUNDED_VALIDATOR_CANCELLATION_ACTIVATION_EPOCH,
+        WITHDRAWAL_ACTIVATION_EPOCH,
+    ));
     assert!(crate::slashing::CORRELATION_WINDOW_EPOCHS >= 2 * crate::staking::WITHDRAWAL_DELAY_EPOCHS);
 };
 
