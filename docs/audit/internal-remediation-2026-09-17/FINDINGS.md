@@ -4,7 +4,7 @@ Audited source: `562e220`. Remediation base: `b066e3c`. Branch: `fix/internal-au
 
 All 200 findings are retained, including duplicates. IMPLEMENTED means code changed in this branch, not deployed, externally audited, or universally resolved on the live fleet. PARTIAL is not closure. No production binary was published.
 
-IMPLEMENTED: 66, PARTIAL: 87, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE CHANGED: 7, OPEN: 33, REFUTED IN AUDIT: 1, VERIFIED POSITIVE: 1.
+IMPLEMENTED: 66, PARTIAL: 88, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE CHANGED: 7, OPEN: 32, REFUTED IN AUDIT: 1, VERIFIED POSITIVE: 1.
 
 | Finding | Status | Evidence / remaining work | Original title |
 |---|---|---|---|
@@ -116,7 +116,7 @@ IMPLEMENTED: 66, PARTIAL: 87, UNARMED CANDIDATE: 1, PROTOCOL DECISION: 4, BASE C
 | KS-10 | IMPLEMENTED | Atomic private replacement plus fsync for validator.key and initial meta.bin. | Non-atomic writes: `save_with` truncates `validator.key` in place; `meta.bin` written with `fs::write` and no fsync |
 | KS-11 | PARTIAL | Default combined Argon2 memory/pass work capped at 1 GiB-pass before allocation; production parameters unchanged. Explicit legacy recovery remains bounded by original individual maxima and cannot authorize expensive new seals. A one-pass header can still allocate 1 GiB. | Header-supplied KDF cost is honored down to the Argon2 floor with no minimum or warning; caps still allow minutes of CPU per open |
 | KS-12 | IMPLEMENTED | Root toolchain pinned to Rust 1.94.1. | Toolchain pin is crate-scoped; documented root-level build commands bypass it |
-| LG-02 | OPEN | Not closed by this bundle. Requires dedicated implementation, protocol design, external operational evidence or product-owner integration; original finding remains tracked. | vout endianness (Legacy M-3): the bug is in the exporter/`iter_utxos_sorted`, the Genesis-4 loader carries the corrupted index verbatim into committed… |
+| LG-02 | PARTIAL | The mismatch is now documented and regression-pinned: historical mode reproduces the committed artifact byte-for-byte, while `bloch-snapshot-utxo --canonical-vout` decodes the little-endian key correctly for new exports. Five focused tests pass. The 38 mislabelled vout=1 rows remain committed as vout=16,777,216 in the immutable Genesis-4 opening artifact; correcting live outpoints requires an explicit state migration/protocol decision. See WAVE-39.md. | vout endianness (Legacy M-3): the bug is in the exporter/`iter_utxos_sorted`, the Genesis-4 loader carries the corrupted index verbatim into committed… |
 | LG-03 | IMPLEMENTED | UTXO iterator/export fail on malformed keys, undecodable values or trailing bytes; valid historical endian behavior preserved and tested. | Snapshot exporter and `iter_utxos_sorted` silently drop undecodable UTXO rows (fail-open on the ledger-producing path) |
 | LG-04 | IMPLEMENTED | Canonical address before cooldown lookup. | Faucet per-address cooldown is bypassable by hex case variation |
 | LG-05 | IMPLEMENTED | Require application/json and reject cross-site Fetch Metadata. | Faucet accepts cross-site form POSTs (CSRF-driven drips) |
