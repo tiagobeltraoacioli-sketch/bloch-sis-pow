@@ -3523,8 +3523,9 @@ impl CommittedState {
                 // boundary walk, never node-local. At and above
                 // EXIT_AUTH_ACTIVATION_EPOCH the unauthenticated message is
                 // dead and `ExitV2` is the only voluntary exit; the constant
-                // is `u64::MAX`, so today this never fires and everything
-                // below is byte-for-byte the behaviour that shipped.
+                // is epoch 2884. Below that boundary this condition remains
+                // false and the historical legacy behavior is replayed; at
+                // and above it the legacy message is refused here.
                 if Self::exit_auth_active(self.epoch)
                     || crate::params::funded_validator_admission_active(self.epoch)
                 {
