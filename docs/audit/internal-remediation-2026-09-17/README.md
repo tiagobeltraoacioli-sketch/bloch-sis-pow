@@ -38,6 +38,11 @@ candidate](WAVE-48-ST03-ST04.md): correlation accounting uses effective
 exposure consistently and self-slashing loses its 32-epoch withdrawal
 advantage. The cap-free E+1 ejection path remains an explicit protocol-policy
 residual; no activation or deployment occurred.
+The same wave stages a [funded-queue cancellation candidate](WAVE-48-ST16.md)
+behind an inert gate and adds a [fail-closed LG-01 evidence
+intake](WAVE-48-LG01.md) without changing any historical balance. The combined
+result, validation and remaining external boundary are recorded in the
+[Wave 48 integration checkpoint](WAVE-48-INTEGRATION.md).
 
 ## Scope and source reconciliation
 
