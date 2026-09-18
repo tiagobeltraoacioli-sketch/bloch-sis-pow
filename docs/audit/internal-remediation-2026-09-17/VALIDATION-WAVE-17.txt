@@ -1,0 +1,42 @@
+Validation wave 17 — 2026-09-17
+Branch: fix/internal-audit-20260917
+Python guard repair: 5fde0d1
+Carryover reconciliation: b37d7e6
+
+PASS
+
+cargo test --locked -p bloch-pos-node genesis::tests
+  57 passed; 0 failed; 447 filtered out. Includes the committed zero-value
+  anchor regression and all carryover parsing, commitment and dust tests.
+
+cargo test --locked -p bloch-pos-node --test published_checksums \
+  the_terminal_carryover_facts_match_ledger_documentation
+  1 passed. Streamed carryover.tsv.gz and proved terminal count, pre/post split
+  totals, 111 remainder rows, 57-satoshi adjustment, one zero row and the
+  deterministic largest-output recipient.
+
+cargo test --locked --manifest-path legacy/genesis3-node/Cargo.toml \
+  --bin bloch-snapshot-utxo
+  4 passed; vout compatibility and selected-height index decoding covered.
+
+python3 scripts/check-comment-constants.py
+  430 files; 565 resolvable constants; 46 claims; 0 contradictions.
+
+python3 scripts/check-no-source-archives.selftest.py
+  5/5 cases passed on the repository Python.
+
+python3 scripts/check-no-source-archives.py
+  One tracked data archive accepted; zero compiled artifacts; passed.
+
+bash scripts/ci-banned-words.sh
+  Passed.
+
+git diff --check
+  Passed before the implementation commits and before this evidence checkpoint.
+
+LIMIT
+
+The workspace-wide rustfmt check still reports the inherited formatting
+baseline across untouched code. No Genesis-3 block history or second datadir
+was introduced; this wave corrects the named documentation/tooling drift and
+proves facts from the committed terminal artifact.
