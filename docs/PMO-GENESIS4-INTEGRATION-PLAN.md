@@ -165,9 +165,11 @@ So the rule ships as a manifest format, `genesis::ManifestFormat`:
   `unbound_genesis_identity_is_frozen`.
 - **`BPOSMAN2` / `V2Bound`** — `state_root` carries the genesis state's own
   root (`Manifest::genesis_pre_state_root`) and `randao_mix` is
-  `SHA3-256(DS_RANDAO ‖ 0 ‖ carryover_digest)`, the expression
-  `genesis4-ceremony::genesis_header` has always published. Two manifests
-  describing different ledgers then have different genesis ids.
+  `SHA3-256(DS_RANDAO ‖ 0 ‖ SHA3-256(Manifest::encode()))`. The canonical
+  manifest digest binds the genesis cohort as well as the validator set,
+  carryover commitment, allocations and clock. Two manifests describing
+  different networks then have different genesis ids. The ceremony tool's
+  older carryover-only expression must be reconciled before publication.
 
 Emit one with `bloch-pos genesis --bind-genesis` / `genesis-mainnet
 --bind-genesis`. Nothing selects it by default, because a manifest carrying it
@@ -178,9 +180,11 @@ deployment.
 The self-reference is cut at the anchor: `CommittedState::genesis` seeds its
 checkpoints with the genesis block id, so the root committed is that of the
 state anchored at the *pre-commitment* header's id (the same header with
-`state_root` still zero). Every ledger fact — registry, cohort, all opening
-balances, `issued_sat`, the carried roots — is under it; only the 32 bytes
-that are the answer are not.
+`state_root` still zero). Every ledger fact — registry, all opening balances,
+`issued_sat`, the carried roots — is under it; only the 32 bytes that are the
+answer are not. The cohort is intentionally absent from the state-root
+inventory and is instead bound by the canonical manifest digest in the V2
+mix.
 
 ---
 

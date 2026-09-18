@@ -60,10 +60,11 @@ const MANIFEST_MAGIC_V2: &[u8; 8] = b"BPOSMAN2";
 ///    whatever block happened to expose it.
 ///
 /// [`ManifestFormat::V2Bound`] closes that: `state_root` carries the genesis
-/// state's own root and `randao_mix` is seeded from the carryover digest, the
-/// way `genesis4-ceremony::genesis_header` has always assembled the published
-/// header. Two manifests that describe different ledgers then have different
-/// genesis ids, which is the property the block graph was missing.
+/// state's own root and `randao_mix` is seeded from the canonical manifest
+/// digest. The digest covers the cohort as well as the ledger, validator set,
+/// carryover commitment and clock. Two manifests that describe different
+/// networks then have different genesis ids, which is the property the block
+/// graph was missing.
 ///
 /// # Why v1 is still here
 ///
@@ -1263,9 +1264,10 @@ impl Manifest {
     /// manifest. Genesis is a block, so its id derives from a header through
     /// the single §5.4 path — never from a label.
     ///
-    /// Under [`ManifestFormat::V2Bound`] it commits to the ledger: the genesis
-    /// state root in `state_root` and a carryover-seeded `randao_mix`, so no
-    /// two manifests describing different chains can share a genesis id.
+    /// Under [`ManifestFormat::V2Bound`] it commits to the canonical manifest:
+    /// the genesis state root in `state_root` and a manifest-digest-seeded
+    /// `randao_mix`, so no two manifests describing different chains can
+    /// share a genesis id.
     /// Under [`ManifestFormat::V1Unbound`] every field is a constant and the
     /// id is the same for every network — see [`ManifestFormat`] for why that
     /// rule is still reachable and what it costs.
@@ -1280,26 +1282,24 @@ impl Manifest {
     /// The beacon mix genesis opens with.
     ///
     /// Under [`ManifestFormat::V2Bound`] this is one §6.3 mixing step over the
-    /// carryover digest AND the chain's clock:
-    /// `SHA3-256(DS_RANDAO ‖ 0 ‖ carryover_digest ‖ genesis_time_ms ‖ slot_ms)`.
-    /// The beacon's origin entropy is then pinned to the artifact the chain
-    /// opens with and to the cadence it opens at, instead of being a constant
-    /// an operator can reuse across networks. A manifest with no carryover (a
-    /// devnet) mixes over a zero digest: the ledger binding then rests
-    /// entirely on `state_root`, which is where it belongs anyway, and the
-    /// clock terms still separate two devnets launched at different times.
+    /// canonical manifest digest:
+    /// `SHA3-256(DS_RANDAO ‖ 0 ‖ SHA3-256(Manifest::encode()))`.
+    /// The beacon's origin entropy is then pinned to every encoded network
+    /// parameter, including the genesis cohort, validator set, carryover
+    /// commitment, allocations and clock. A manifest with no carryover (a
+    /// devnet) is still fully bound rather than falling back to a constant.
     ///
-    /// The two clock terms are the gap the first cut of this fix left open
-    /// (see the body). Correcting the expression is free today because no
-    /// `BPOSMAN2` manifest has ever been published — the format is inert
-    /// until a founder publishes one.
+    /// The full digest closes the cohort gap left by the earlier ledger-and-
+    /// clock expression. Correcting the expression is free today because no
+    /// `BPOSMAN2` manifest has ever been published — the format is inert until
+    /// a founder publishes one.
     ///
     /// # Before any `BPOSMAN2` manifest is published
     ///
     /// `tools/genesis4-ceremony::genesis_header` assembles the header the
     /// ceremony PUBLISHES, and it does not agree with this function. It mixes
-    /// `SHA3-256(DS_RANDAO ‖ 0 ‖ carryover_digest)` with no clock terms, and
-    /// it also differs in three fields this one leaves zero
+    /// `SHA3-256(DS_RANDAO ‖ 0 ‖ carryover_digest)` rather than the manifest
+    /// digest, and it also differs in three fields this one leaves zero
     /// (`proposer_index`, `coherence_root`, and the state root it computes
     /// from its own `Genesis`). That disagreement PREDATES this correction —
     /// the tool has never matched the v1 rule the live chain runs either —
@@ -1314,35 +1314,20 @@ impl Manifest {
         match self.format {
             ManifestFormat::V1Unbound => GENESIS_MIX,
             ManifestFormat::V2Bound => {
-                let digest = self.carryover.as_ref().map(|c| c.digest).unwrap_or([0u8; 32]);
+                let manifest_digest: [u8; 32] = Sha3_256::digest(self.encode()).into();
                 let mut h = Sha3_256::new();
                 h.update(bloch_pos_committee::params::DS_RANDAO);
                 h.update(GENESIS_MIX);
-                h.update(digest);
-                // The CLOSED GAP. The first cut of this fix mixed over the
-                // carryover digest alone, which binds the ledger and stops
-                // there. `state_root` binds the ledger too, so between them
-                // the ONLY manifest fields left out of the genesis id were
-                // these two -- and they are the two that define the chain's
-                // clock. Measured on the b2 branch: two manifests differing
-                // only in `slot_ms` produced the SAME genesis block id under
-                // the bound format, and so did two differing only in
-                // `genesis_time_ms`.
-                //
-                // That is the finding's own sentence unfulfilled. A node on
-                // `slot_ms = 1_000` and a node on `slot_ms = 30_000` compute
-                // different slots for the same instant, therefore different
-                // epochs, committees and duties: they are not one network
-                // that disagrees, they are two networks. Leaving them sharing
-                // a genesis id reproduces exactly what C5 exists to close --
-                // a substituted manifest that pairs at height 0 and diverges
-                // later, as somebody else's block being blamed.
-                //
-                // Fixed widths, little-endian, declaration order: the same
-                // encoding `Manifest::encode` writes them in, so there is one
-                // reading of these bytes in the codebase and not two.
-                h.update(self.genesis_time_ms.to_le_bytes());
-                h.update(self.slot_ms.to_le_bytes());
+                // SR-01. The cohort changes duty weights at every epoch, but
+                // `CommittedState::compute_root` intentionally excludes it.
+                // The old V2 expression covered carryover and the clock only,
+                // so two networks with different cohorts still paired at
+                // block zero. Hashing the canonical encoding binds every
+                // manifest field without duplicating a second field list that
+                // can drift again. Loaded carryover entries are represented by
+                // their four-field commitment in that encoding and are also
+                // checked independently before state construction.
+                h.update(manifest_digest);
                 h.finalize().into()
             }
         }
@@ -1386,12 +1371,14 @@ impl Manifest {
     /// The cut: the state is built against [`Self::anchor_header`]'s id — the
     /// header with `state_root` still zero — and its root is what the final
     /// header carries. Every ledger fact is inside it: the validator registry
-    /// with its stakes, commissions and RANDAO commitments; the genesis
-    /// cohort; every opening balance (the whole carryover plus the vested
+    /// with its stakes, commissions and RANDAO commitments; every opening
+    /// balance (the whole carryover plus the vested
     /// allocations, through the eUTXO subtree); `issued_sat`; the taint,
     /// coherence and EVM commitments; epoch-0 participation. The only input
     /// NOT under it is the 32 bytes that are the answer — and those are
-    /// determined by everything that is.
+    /// determined by everything that is. The genesis cohort is deliberately
+    /// outside this state root; V2 binds it through the manifest digest in
+    /// [`Self::genesis_mix`] instead.
     ///
     /// So `genesis_id` becomes a function of the ledger, which is the whole
     /// point: substituting a manifest now moves the genesis block id, and a
@@ -2355,31 +2342,55 @@ mod tests {
             "the fixture must differ in balances alone for this test to mean anything"
         );
         assert_ne!(a.genesis_pre_state_root(), b.genesis_pre_state_root());
-        // A changed cohort must move it too — same commitment, other half.
+        // A changed validator stake must move it too — same commitment,
+        // registry half.
         let mut c = bound(mainnet_sample());
         c.validators[1].stake_sat += 1;
         assert_ne!(a.genesis_pre_state_root(), c.genesis_pre_state_root());
     }
 
-    /// The mix is seeded by the carryover digest, by the same expression
-    /// `genesis4-ceremony::genesis_header` publishes:
-    /// `SHA3-256(DS_RANDAO ‖ 0 ‖ carryover_digest)`.
+    /// SR-01: the cohort changes consensus duties but is intentionally absent
+    /// from `CommittedState::compute_root`. The V2 manifest digest must carry
+    /// it into both the genesis header and the state root (through the opening
+    /// mix). V1 remains frozen for historical replay.
+    #[test]
+    fn bound_genesis_identity_follows_the_genesis_cohort() {
+        let a = bound(mainnet_sample());
+        let mut b = bound(mainnet_sample());
+        b.cohort = vec![1];
+
+        assert_ne!(
+            a.encode(),
+            b.encode(),
+            "fixture must differ in cohort membership"
+        );
+        assert_ne!(a.genesis_mix(), b.genesis_mix());
+        assert_ne!(a.genesis_pre_state_root(), b.genesis_pre_state_root());
+        assert_ne!(a.genesis_id().as_bytes(), b.genesis_id().as_bytes());
+
+        let legacy_a = mainnet_sample();
+        let mut legacy_b = mainnet_sample();
+        legacy_b.cohort = vec![1];
+        assert_eq!(
+            legacy_a.genesis_id().as_bytes(),
+            legacy_b.genesis_id().as_bytes(),
+            "BPOSMAN1 replay identity is consensus-frozen"
+        );
+    }
+
+    /// The V2 mix is seeded by the digest of the canonical manifest bytes:
+    /// `SHA3-256(DS_RANDAO ‖ 0 ‖ SHA3-256(Manifest::encode()))`.
     ///
     /// Written out by hand rather than called through `genesis_mix`, so this
     /// pins the formula and not the implementation of it.
     #[test]
-    fn bound_genesis_mix_is_seeded_by_the_carryover_digest() {
+    fn bound_genesis_mix_is_seeded_by_the_manifest_digest() {
         let m = bound(mainnet_sample());
         let mut h = Sha3_256::new();
         h.update(bloch_pos_committee::params::DS_RANDAO);
         h.update([0u8; 32]);
-        h.update(m.carryover.as_ref().expect("the mainnet fixture commits to a carryover").digest);
-        // The clock terms, in the widths and order `Manifest::encode` writes
-        // them. Pinned here by hand for the same reason the rest of the
-        // expression is: a formula a test derives through the function it is
-        // checking pins nothing.
-        h.update(m.genesis_time_ms.to_le_bytes());
-        h.update(m.slot_ms.to_le_bytes());
+        let manifest_digest: [u8; 32] = Sha3_256::digest(m.encode()).into();
+        h.update(manifest_digest);
         let want: [u8; 32] = h.finalize().into();
 
         assert_eq!(m.genesis_mix(), want);
