@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Compare outputs produced on two independent builders. Success is evidence of
+# equality, not signing, publication or deployment authorization.
+set -euo pipefail
+
+a="${1:?usage: compare-pos-release-builds.sh <builder-a-dir> <builder-b-dir>}"
+b="${2:?usage: compare-pos-release-builds.sh <builder-a-dir> <builder-b-dir>}"
+fail() { echo "compare-pos-release-builds: FAIL — $*" >&2; exit 1; }
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    fail "sha256sum or shasum is required"
+  fi
+}
+field() {
+  local key="$1" file="$2"
+  awk -F= -v key="$key" '
+    $1 == key { count++; value = substr($0, length(key) + 2) }
+    END { if (count != 1 || value == "") exit 1; print value }
+  ' "$file" || fail "$file must contain exactly one nonempty $key field"
+}
+
+for dir in "$a" "$b"; do
+  [ -d "$dir" ] || fail "not a directory: $dir"
+  for file in bloch-pos SHA256SUMS BUILD-INFO; do
+    [ -f "$dir/$file" ] || fail "missing $dir/$file"
+  done
+  actual_sha="$(sha256_file "$dir/bloch-pos")"
+  manifest_sha="$(awk '$2 == "bloch-pos" { print $1 }' "$dir/SHA256SUMS")"
+  metadata_sha="$(field binary_sha256 "$dir/BUILD-INFO")"
+  [ "$actual_sha" = "$manifest_sha" ] || fail "checksum verification failed in $dir"
+  [ "$actual_sha" = "$metadata_sha" ] || fail "BUILD-INFO checksum mismatch in $dir"
+  [ "$(field artifact_kind "$dir/BUILD-INFO")" = canonical-container-candidate ] \
+    || fail "$dir is not a canonical-container candidate"
+  [ "$(field signed "$dir/BUILD-INFO")" = false ] \
+    || fail "$dir does not declare its unsigned state"
+  [ "$(field deployment_authorized "$dir/BUILD-INFO")" = false ] \
+    || fail "$dir does not refuse deployment authorization"
+done
+
+cmp -s "$a/bloch-pos" "$b/bloch-pos" || fail "binary bytes differ"
+for key in source_commit source_date_epoch debian_snapshot target binary_sha256; do
+  av="$(field "$key" "$a/BUILD-INFO")"
+  bv="$(field "$key" "$b/BUILD-INFO")"
+  [ "$av" = "$bv" ] || fail "$key differs between builders"
+done
+
+echo "compare-pos-release-builds: PASS — independent outputs are byte-identical"

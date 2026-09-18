@@ -404,6 +404,8 @@ pos-release-integrity:
   stage: check
   script:
     - python3 scripts/pos-release-integrity.selftest.py
+    - bash -n scripts/build-pos-release-container.sh scripts/compare-pos-release-builds.sh scripts/compare-pos-release-builds.selftest.sh
+    - bash scripts/compare-pos-release-builds.selftest.sh
     - rustup toolchain install "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' crates/bloch-pos-node/rust-toolchain.toml)" --profile minimal || true
     - bash scripts/pos-release-integrity.sh
   allow_failure: false

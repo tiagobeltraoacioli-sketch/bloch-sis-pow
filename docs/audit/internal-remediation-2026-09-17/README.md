@@ -43,6 +43,10 @@ behind an inert gate and adds a [fail-closed LG-01 evidence
 intake](WAVE-48-LG01.md) without changing any historical balance. The combined
 result, validation and remaining external boundary are recorded in the
 [Wave 48 integration checkpoint](WAVE-48-INTEGRATION.md).
+The next pass begins with a [canonical `bloch-pos` container
+candidate](WAVE-49-INF01.md). Its recipe and two-builder comparator close a
+repository gap, but no Linux build, signature, publication or rollout is
+claimed.
 
 ## Scope and source reconciliation
 

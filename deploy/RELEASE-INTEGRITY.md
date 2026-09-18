@@ -69,8 +69,10 @@ The local guard compares the root lockfile with HEAD, including staged changes.
 Its full-build path refuses nonempty compiler/flags/wrapper/target/profile
 environment overrides before compiling and checks the compiler version token
 exactly. The corresponding regressions run without building a release binary.
-This does not make the host hermetic: Cargo configuration, system libraries and
-the still-unqualified canonical container remain separate release inputs.
+This does not make the host hermetic: Cargo configuration and system libraries
+remain separate release inputs. The canonical-container candidate under
+`deploy/pos-release/` removes those host inputs from the release recipe, but it
+is not qualified until two independent Linux builders reproduce its bytes.
 
 ## 3. Reproducibility: what was measured on 2026-08-12 (not estimated)
 
@@ -113,15 +115,19 @@ already embodies for G3:
 > match, and that mismatch alone is not evidence of tampering — rebuild in
 > the container to compare honestly.
 
-Honest-claim ladder (mirrors `REPRO.md`): today `bloch-pos` has earned
+Honest-claim ladder (mirrors `REPRO.md`): the last executed evidence for
+`bloch-pos` has earned
 **"deterministic, same-path, single host — measured"**. GitLab retains an
 unsigned release candidate with its source commit, toolchain, target, version
 and SHA256 (`scripts/package-pos-release-candidate.sh`), but that is not the
-canonical release. It has **not** yet earned "reproducible": that requires the
-two-independent-builder bit-for-bit match of the canonical container build,
-and the `bloch-pos` release container does not exist yet (§8.1). Do not use the
-word "reproducible" in any public artifact for `bloch-pos` until that is green
-— the trademark/earned-word gate applies.
+canonical release. A canonical-container candidate now exists at
+`deploy/pos-release/Dockerfile`: it fixes `/build`, the Rust base-image digest,
+the Debian archive timestamp, the committed source archive, Cargo lock and
+build stamp. It has **not** yet earned "reproducible": that requires two
+independent Linux builders to run `scripts/build-pos-release-container.sh` and
+pass `scripts/compare-pos-release-builds.sh` byte for byte. Do not use the word
+"reproducible" in any public artifact for `bloch-pos` until that is green — the
+trademark/earned-word gate applies.
 
 ## 4. Fleet-vs-release verification (the sweep that would have caught f819e87f)
 
@@ -358,15 +364,16 @@ releases.
 
 ## 8. Not done here — stated, not narrowed away
 
-1. **No `bloch-pos` release container exists yet.** `Dockerfile` /
-   `deploy/repro/build.sh` build the Genesis-3 `bloch` node. The canonical
-   `/build` container (pinned base digest, `BLOCH_BUILD_COMMIT`,
-   `SOURCE_DATE_EPOCH`) for `bloch-pos` is specified here but not written —
-   deliberately, while the crate is a skeleton whose dependency set changes
-   per integration milestone. It must exist before the first real release.
+1. **The `bloch-pos` release-container candidate has not been built and
+   independently reproduced.** `deploy/pos-release/Dockerfile` and
+   `scripts/build-pos-release-container.sh` now define the canonical `/build`
+   recipe and export an explicitly unsigned, unauthorized candidate.
+   `scripts/compare-pos-release-builds.sh` refuses byte or provenance
+   disagreement. This macOS worktree had no Docker/BuildKit engine, so it did
+   not execute the Linux build.
 2. **No two-builder measurement.** Same-path determinism is measured (§3);
-   cross-builder container reproducibility is not — it needs the container
-   from (1) plus a second host.
+   cross-builder container reproducibility still needs two independent Linux
+   hosts to build the same commit and retain the passing comparison record.
 3. **The measurement platform was macOS x86_64, not the fleet's Linux.** The
    findings (path-dependent `-Cmetadata`, same-path determinism) are
    compiler-level and expected to hold on Linux, but the Linux numbers have
