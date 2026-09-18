@@ -33,6 +33,11 @@ for the read-only fleet verifier and weak-subjectivity release check; neither
 change rotates a live credential or creates the still-missing signed envelope.
 It also records the [FC-07 disjoint-finality proof and unresolved protocol
 choice](WAVE-48-FC07.md); it changes no consensus rule.
+Wave 48 also adds a jointly gated, [deliberately inactive slashing-economics
+candidate](WAVE-48-ST03-ST04.md): correlation accounting uses effective
+exposure consistently and self-slashing loses its 32-epoch withdrawal
+advantage. The cap-free E+1 ejection path remains an explicit protocol-policy
+residual; no activation or deployment occurred.
 
 ## Scope and source reconciliation
 
