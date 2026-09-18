@@ -12,7 +12,8 @@ checkpoint](WAVE-44-INTEGRATION.md). Continued work records the lifecycle
 metering/runbook reconciliation in [Wave 45 ST-12](WAVE-45-ST12.md) and the
 mainnet manifest-input tripwires in [Wave 45 ST-11](WAVE-45-ST11.md). The
 same pass stages a [deliberately inactive TX-10 resource
-candidate](WAVE-45-TX10.md).
+candidate](WAVE-45-TX10.md). Wave 46 begins by reconciling the existing
+[inactive fee-to-stake candidate](WAVE-46-TX08.md).
 
 ## Scope and source reconciliation
 
