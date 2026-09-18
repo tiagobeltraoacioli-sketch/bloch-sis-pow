@@ -115,10 +115,9 @@ const KDF_MAX_P_COST: u32 = 16;
 const KDF_DEFAULT_MAX_M_COST_KIB: u32 = 131_072; // 128 MiB
 /// Bound combined memory/pass work before allocation; independent maxima alone
 /// previously admitted 64 GiB-passes. Production uses 192 MiB-passes; the
-/// ordinary ceiling permits one additional 64 MiB pass, or one pass at the
-/// independent 256 MiB allocation ceiling. Larger verified legacy settings
-/// require the explicit finite recovery override.
-const KDF_DEFAULT_MAX_WORK_KIB: u64 = 262_144; // 256 MiB-pass
+/// ordinary ceiling is exactly that shipped profile. More expensive verified
+/// legacy settings require the explicit finite recovery override.
+const KDF_DEFAULT_MAX_WORK_KIB: u64 = 196_608; // 192 MiB-pass
 
 /// Shortest passphrase `keys seal` will seal under. Argon2id makes guessing
 /// expensive per attempt, not impossible; a validator identity behind eight
@@ -189,7 +188,7 @@ impl KdfParams {
         let work = u64::from(self.m_cost).saturating_mul(u64::from(self.t_cost));
         if !allow_expensive && work > KDF_DEFAULT_MAX_WORK_KIB {
             return Err(io::Error::new(io::ErrorKind::InvalidData,
-                "keystore combined KDF work exceeds the default cap; for a verified authentic legacy file only, explicitly set BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF=1 (original finite parameter caps still apply)"));
+                "keystore combined KDF work exceeds the default 192 MiB-pass cap; for a verified authentic legacy file only, explicitly set BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF=1 (original finite parameter caps still apply)"));
         }
         let params = argon2::Params::new(self.m_cost, self.t_cost, self.p_cost, Some(32))
             .map_err(|_| {
@@ -1385,11 +1384,7 @@ mod tests {
         assert!(former_default.to_argon2().is_err());
         assert!(former_default.to_argon2_with_legacy_work(true).is_ok());
 
-        let default_work_boundary = KdfParams {
-            m_cost: KdfParams::PRODUCTION.m_cost,
-            t_cost: 4,
-            p_cost: 1,
-        };
+        let default_work_boundary = KdfParams::PRODUCTION;
         assert_eq!(
             u64::from(default_work_boundary.m_cost) * u64::from(default_work_boundary.t_cost),
             KDF_DEFAULT_MAX_WORK_KIB,
@@ -1401,7 +1396,7 @@ mod tests {
             ..default_work_boundary
         };
         let error = high_work.to_argon2().err().unwrap();
-        assert!(error.to_string().contains("combined KDF work"));
+        assert!(error.to_string().contains("default 192 MiB-pass cap"));
         assert!(high_work.to_argon2_with_legacy_work(true).is_ok());
 
         let hostile = KdfParams { m_cost: KDF_MAX_M_COST_KIB, t_cost: KDF_MAX_T_COST, p_cost: 1 };
