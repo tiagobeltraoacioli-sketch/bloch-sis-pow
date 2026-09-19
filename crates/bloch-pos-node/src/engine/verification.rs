@@ -7,7 +7,7 @@
 //! Consensus execution continues to use its independent, uncached verifier.
 use bloch_pos_committee::attestation::SignatureVerifier;
 use sha3::{Digest, Sha3_256};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, VecDeque};
 
 const MAX_FAILURES: usize = 4096;
@@ -26,11 +26,32 @@ struct Failures {
 pub(super) struct GossipVerifier<V> {
     verifier: V,
     failures: RefCell<Failures>,
+    budget: RefCell<SlotBudget>,
+}
+
+#[derive(Default)]
+struct SlotBudget {
+    slot: Option<u64>,
+    used: usize,
+}
+
+/// One node-local admission view of [`GossipVerifier`]. Exhaustion is exposed
+/// separately from an invalid signature so callers can shed with `Ignore`
+/// rather than mis-score an honest peer during local overload.
+pub(super) struct BudgetedVerifier<'a, V> {
+    owner: &'a GossipVerifier<V>,
+    slot: u64,
+    cap: usize,
+    limited: Cell<bool>,
 }
 
 impl<V> GossipVerifier<V> {
     pub(super) fn new(verifier: V) -> Self {
-        Self { verifier, failures: RefCell::new(Failures::default()) }
+        Self {
+            verifier,
+            failures: RefCell::new(Failures::default()),
+            budget: RefCell::new(SlotBudget::default()),
+        }
     }
 
     fn failure_key(pubkey: &[u8], root: &[u8; 32], signature: &[u8]) -> [u8; 32] {
@@ -52,6 +73,40 @@ impl<V> GossipVerifier<V> {
     ) -> bool {
         let key = Self::failure_key(pubkey, root, signature);
         self.failures.borrow().known.contains(&key)
+    }
+
+    pub(super) fn budgeted(&self, slot: u64, cap: usize) -> BudgetedVerifier<'_, V> {
+        BudgetedVerifier { owner: self, slot, cap, limited: Cell::new(false) }
+    }
+
+    fn reserve_verification(&self, slot: u64, cap: usize) -> bool {
+        let mut budget = self.budget.borrow_mut();
+        if budget.slot != Some(slot) {
+            budget.slot = Some(slot);
+            budget.used = 0;
+        }
+        if budget.used >= cap { return false; }
+        budget.used = budget.used.saturating_add(1);
+        true
+    }
+}
+
+impl<V> BudgetedVerifier<'_, V> {
+    pub(super) fn limited(&self) -> bool { self.limited.get() }
+}
+
+impl<V: SignatureVerifier> SignatureVerifier for BudgetedVerifier<'_, V> {
+    fn verify_with_key(&self, pubkey: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
+        // Exact known failures remain cheap and deterministic, and consuming
+        // no allowance for them preserves the cache-before-budget ordering.
+        if self.owner.is_known_failure(pubkey, root, signature) {
+            return false;
+        }
+        if !self.owner.reserve_verification(self.slot, self.cap) {
+            self.limited.set(true);
+            return false;
+        }
+        self.owner.verify_with_key(pubkey, root, signature)
     }
 }
 
@@ -151,5 +206,41 @@ mod tests {
         assert!(!verifier.verify_with_key(b"invalid key", &[0; 32], &0usize.to_le_bytes()));
         assert_eq!(verifier.verifier.calls.get(), calls + 1);
         assert_eq!(verifier.failures.borrow().known.len(), MAX_FAILURES);
+    }
+
+    #[test]
+    fn slot_budget_counts_unique_crypto_not_cached_failures_and_renews() {
+        let verifier = fixture();
+        let bad = [0xA5; 32];
+        let bad_signature = [0xCC; 32];
+        {
+            let bounded = verifier.budgeted(70, 1);
+            assert!(!bounded.verify_with_key(b"registered key", &bad, &bad_signature));
+            assert!(!bounded.limited(), "the one real call fits the allowance");
+        }
+        assert_eq!(verifier.verifier.calls.get(), 1);
+
+        // Exact failure is answered by the cache and consumes no new call or
+        // allowance. A distinct input in the same slot is locally limited.
+        let bounded = verifier.budgeted(70, 1);
+        assert!(!bounded.verify_with_key(b"registered key", &bad, &bad_signature));
+        assert!(!bounded.limited());
+        let other = [0x5A; 32];
+        assert!(!bounded.verify_with_key(b"registered key", &other, &bad_signature));
+        assert!(bounded.limited());
+        assert_eq!(verifier.verifier.calls.get(), 1);
+        drop(bounded);
+
+        // The owner's ordinary verifier remains outside relay admission. The
+        // node's own proposal path and consensus verifier must not inherit a
+        // local gossip-shedding decision.
+        let local = [0x11; 32];
+        assert!(verifier.verify_with_key(b"registered key", &local, &local));
+        assert_eq!(verifier.verifier.calls.get(), 2);
+
+        let renewed = verifier.budgeted(71, 1);
+        assert!(renewed.verify_with_key(b"registered key", &other, &other));
+        assert!(!renewed.limited());
+        assert_eq!(verifier.verifier.calls.get(), 3);
     }
 }

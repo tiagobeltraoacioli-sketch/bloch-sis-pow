@@ -352,6 +352,13 @@ const LIFECYCLE_VERIFICATIONS_PER_SOURCE_PER_SLOT: usize = 2;
 /// 30 seconds; overload is retryable in the next slot.
 const LIFECYCLE_VERIFICATIONS_TOTAL_PER_SLOT: usize = 256;
 
+/// New hybrid verifications allowed across block, attestation and transaction
+/// network admission in one wall slot. Consensus execution and this node's own
+/// proposal are deliberately outside this node-local relay budget. At the
+/// 30-second cadence, 1,024 leaves large honest burst headroom while making
+/// unique-signature CPU finite even as the bounded transport queue drains.
+const GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT: usize = 1_024;
+
 /// Doppelgänger protection window (R6 HIGH-8, node half): slots this node
 /// observes the network for its OWN validator index attesting or proposing
 /// before it will start duties itself.
@@ -580,6 +587,39 @@ impl Source {
             Source::Local => false,
         }
     }
+}
+
+/// A budget refusal is this node's load state, never evidence that the bytes
+/// or their forwarding peer are bad. The pure gossip policy sees the budgeted
+/// verifier's `false`; translate only when that verifier records exhaustion.
+fn locally_limited_gossip_decision(
+    decision: GossipDecision,
+    limited: bool,
+) -> GossipDecision {
+    if limited {
+        GossipDecision::Ignore(bloch_pos_committee::gossip::IgnoreReason::Unjudgeable)
+    } else {
+        decision
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn local_verification_exhaustion_never_becomes_a_peer_reject() {
+    let rejected = GossipDecision::Reject(
+        bloch_pos_committee::attestation::RejectReason::BadSignature,
+    );
+    assert!(matches!(
+        locally_limited_gossip_decision(rejected, true),
+        GossipDecision::Ignore(_)
+    ));
+    let rejected = GossipDecision::Reject(
+        bloch_pos_committee::attestation::RejectReason::BadSignature,
+    );
+    assert!(matches!(
+        locally_limited_gossip_decision(rejected, false),
+        GossipDecision::Reject(_)
+    ));
 }
 
 /// Decode a block body's transactions.
@@ -1397,6 +1437,9 @@ enum Refusal {
     /// The per-identity or aggregate lifecycle hybrid-verification allowance
     /// is exhausted for the wall slot. The caller may retry next slot.
     LifecycleVerificationLimited { until_slot: u64 },
+    /// Aggregate block/attestation/transaction admission verification is
+    /// exhausted for this wall slot. This is local load, never invalid bytes.
+    GossipVerificationLimited { until_slot: u64 },
 }
 
 impl Refusal {
@@ -1414,6 +1457,9 @@ impl Refusal {
             }
             Refusal::LifecycleVerificationLimited { .. } => {
                 "lifecycle authorization verification allowance is exhausted for this slot"
+            }
+            Refusal::GossipVerificationLimited { .. } => {
+                "network admission verification allowance is exhausted for this slot"
             }
         }
     }
@@ -2604,6 +2650,24 @@ impl Engine {
         // fork-choice tie, and `advance` — which only ever removes the block
         // it tried to apply — never touches the rest.
         let authenticated = match KeyLookup::pubkey(&*self.state, env.header.proposer_index) {
+            Some(pk) if src.bounded_by_wall_clock() => {
+                let verifier = self.gossip_verifier.budgeted(
+                    self.wall_slot(),
+                    GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
+                );
+                let verified = verifier.verify_with_key(
+                    pk,
+                    &env.header.proposal_signing_root(),
+                    &env.proposer_sig,
+                );
+                if verifier.limited() {
+                    // Local overload is not proof of a forgery. Ignore so an
+                    // honest relay is not scored; sync retries from the
+                    // applied head on its ordinary timer.
+                    return (Verdict::Ignore, None);
+                }
+                verified
+            }
             Some(pk) => self.gossip_verifier.verify_with_key(
                 pk,
                 &env.header.proposal_signing_root(),
@@ -3348,13 +3412,24 @@ impl Engine {
                 return Err(Refusal::Invalid("funded deposit belongs to a different genesis manifest"));
             }
         }
-        admissible_with_network_verifier(
+        let verifier = self.gossip_verifier.budgeted(
+            self.wall_slot(),
+            GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
+        );
+        let admission = admissible_with_network_verifier(
             &tx,
             epoch_of(self.wall_slot()),
             self.state.admission_network_domain().as_ref(),
-            &self.gossip_verifier,
-        )
-        .map_err(Refusal::Invalid)?;
+            &verifier,
+        );
+        let limited = verifier.limited();
+        drop(verifier);
+        if limited {
+            return Err(Refusal::GossipVerificationLimited {
+                until_slot: self.wall_slot().saturating_add(1),
+            });
+        }
+        admission.map_err(Refusal::Invalid)?;
         if self.funded_mempool_conflict(&tx, &capacity.stale) {
             return Err(Refusal::Invalid("funded deposit conflicts with a pending input or validator key"));
         }
@@ -4127,7 +4202,19 @@ impl Engine {
         // therefore `committees_at`. Membership and key must come from one
         // snapshot; the old code took membership from here and the key from a
         // boot-time genesis table, which is the inconsistency being removed.
-        pool.process(att, self.wall_slot, &committees_at, &known, &self.gossip_verifier, &*rolled)
+        let verifier = self.gossip_verifier.budgeted(
+            self.wall_slot(),
+            GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
+        );
+        let decision = pool.process(
+            att,
+            self.wall_slot,
+            &committees_at,
+            &known,
+            &verifier,
+            &*rolled,
+        );
+        locally_limited_gossip_decision(decision, verifier.limited())
     }
 
     fn apply_decision(&mut self, att: Attestation, decision: GossipDecision, origin: &Origin) {
@@ -4474,6 +4561,12 @@ impl Engine {
                     Err(RpcError::tx_refused_retryable(
                         until_slot,
                         format!("lifecycle authorization verification allowance is exhausted for \
+                                 this slot; retry from slot {until_slot}"),
+                    )),
+                Err(Refusal::GossipVerificationLimited { until_slot }) =>
+                    Err(RpcError::tx_refused_retryable(
+                        until_slot,
+                        format!("network admission verification allowance is exhausted for \
                                  this slot; retry from slot {until_slot}"),
                     )),
             },
