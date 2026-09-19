@@ -355,6 +355,7 @@ tests-blocking-guard:
   script:
     - python3 -I scripts/check-tests-blocking.selftest.py
     - python3 -I scripts/check-tests-blocking.py
+    - python3 -I scripts/pinned-rust-toolchain.test.py
   allow_failure: false
 
 # Falcon constant-time guard (PoS finding F1, BLOCH-FALCON-ONLINE-SIGNING.md
@@ -680,6 +681,7 @@ build-and-test:
     - bash deploy/bootnodes/verify-bootnodes.selftest.sh
     - python3 -I scripts/check-live-node-retired-isolation.py --selftest
     - python3 -I scripts/check-live-node-retired-isolation.py
+    - python3 -I scripts/pinned-rust-toolchain.py
     - cargo build --workspace --all-targets
     - cargo test --locked -p bloch-pos-committee -p bloch-pos-node -p bloch-crypto -p coherence-core -p bloch-sis-pow -p bloch-pq-vault -p pqcrypto-internals -p genesis4-ceremony
   # Memory-hard wallet tests and long consensus reveal-chain tests still need

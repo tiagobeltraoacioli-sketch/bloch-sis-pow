@@ -10,7 +10,7 @@ SCRIPT = Path(__file__).with_name("pinned-rust-toolchain.py")
 
 
 def run(*paths: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run([sys.executable, str(SCRIPT), *(str(path) for path in paths)],
+    return subprocess.run([sys.executable, "-I", str(SCRIPT), *(str(path) for path in paths)],
                           text=True, capture_output=True, check=False)
 
 

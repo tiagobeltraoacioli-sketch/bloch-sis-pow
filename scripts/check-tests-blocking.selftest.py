@@ -69,6 +69,7 @@ build-and-test:
     - bash deploy/bootnodes/verify-bootnodes.selftest.sh
     - python3 -I scripts/check-live-node-retired-isolation.py --selftest
     - python3 -I scripts/check-live-node-retired-isolation.py
+    - python3 -I scripts/pinned-rust-toolchain.py
     - cargo build --workspace --all-targets
 """ + CRATE_ARGS + """\
   timeout: 120m
@@ -90,11 +91,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - run: |
-          ch="$(sed -n 's/^channel *= *"\(.*\)".*/\\1/p' crates/bloch-pos-node/rust-toolchain.toml)"
-          if [ -z "$ch" ]; then
-            echo "cannot read the toolchain pin — refusing to test on a floating toolchain" >&2
-            exit 1
-          fi
+          ch="$(python3 -I scripts/pinned-rust-toolchain.py)"
           rustup toolchain install "$ch" --profile minimal --no-self-update
           echo "toolchain=$ch" >> "$GITHUB_OUTPUT"
       - run: sudo apt-get update && sudo apt-get install -y clang cmake
@@ -127,6 +124,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - run: python3 -I scripts/check-tests-blocking.selftest.py
       - run: python3 -I scripts/check-tests-blocking.py
+      - run: python3 -I scripts/pinned-rust-toolchain.test.py
       - run: python3 -I scripts/devnet-particao-report.test.py
       - run: python3 -I scripts/rehearse-validator-activation.test.py
       - run: python3 -I scripts/check-attested-ssh.selftest.py
@@ -304,6 +302,14 @@ CASES = [
              "python3 scripts/rehearse-validator-admission.py", 1),
          must_fail=True, expect="reviewed ordered command list"),
 
+    Case("github toolchain setup cannot regress to one-file sed parsing",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             'ch="$(python3 -I scripts/pinned-rust-toolchain.py)"',
+             'ch="$(sed -n \'s/^channel *= *"\\(.*\\)".*/\\1/p\' '
+             'crates/bloch-pos-node/rust-toolchain.toml)"'),
+         must_fail=True, expect="reviewed ordered command list"),
+
     Case("gitlab Python entrypoint cannot drop isolated mode",
          GOOD_GITLAB.replace(
              "python3 -I scripts/check-live-node-retired-isolation.py --selftest",
@@ -329,6 +335,11 @@ CASES = [
     Case("github guard selftest cannot be removed while guard literal remains",
          GOOD_GITLAB,
          sub(GOOD_GITHUB, "      - run: python3 -I scripts/check-tests-blocking.selftest.py\n", ""),
+         must_fail=True, expect="exact ordered contract"),
+
+    Case("github toolchain parser selftest cannot be removed",
+         GOOD_GITLAB,
+         sub(GOOD_GITHUB, "      - run: python3 -I scripts/pinned-rust-toolchain.test.py\n", ""),
          must_fail=True, expect="exact ordered contract"),
 
     Case("github guard and selftest cannot be reordered",
@@ -444,6 +455,11 @@ CASES = [
     Case("gitlab build-and-test cannot remove setup selftest",
          GOOD_GITLAB.replace(
              "    - bash deploy/bootnodes/verify-bootnodes.selftest.sh\n", ""),
+         GOOD_GITHUB, must_fail=True, expect="exact ordered command contract"),
+
+    Case("gitlab build-and-test cannot remove toolchain pin validation",
+         GOOD_GITLAB.replace(
+             "    - python3 -I scripts/pinned-rust-toolchain.py\n", ""),
          GOOD_GITHUB, must_fail=True, expect="exact ordered command contract"),
 
     Case("gitlab build-and-test commands cannot be reordered",

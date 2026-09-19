@@ -43,6 +43,9 @@ GitLab `.gitlab-ci.yml` job `build-and-test`, to the reviewed posture:
     whose SHA-256 content and parent/load relationships match the contract.
   * every reviewed Python CI command uses isolated mode (`python3 -I`), and
     this guard refuses to run unless its own interpreter reports that mode.
+  * both repository Rust toolchain pins are parsed by the protected helper;
+    GitHub installs that validated channel and GitLab validates it before its
+    root-workspace Cargo invocations. The parser's adversarial test is gated.
 
 The live-crate list is duplicated in `.github/workflows/tests.yml` on
 purpose: the workflow states what it gates, this file makes dropping a crate
@@ -84,11 +87,7 @@ LIVE_CRATES = (
     "genesis4-ceremony",
 )
 GITHUB_CARGO_TEST_RUNS = (
-    'ch="$(sed -n \'s/^channel *= *"\\(.*\\)".*/\\1/p\' crates/bloch-pos-node/rust-toolchain.toml)"\n'
-    'if [ -z "$ch" ]; then\n'
-    'echo "cannot read the toolchain pin — refusing to test on a floating toolchain" >&2\n'
-    'exit 1\n'
-    'fi\n'
+    'ch="$(python3 -I scripts/pinned-rust-toolchain.py)"\n'
     'rustup toolchain install "$ch" --profile minimal --no-self-update\n'
     'echo "toolchain=$ch" >> "$GITHUB_OUTPUT"',
     "sudo apt-get update && sudo apt-get install -y clang cmake",
@@ -115,6 +114,7 @@ GITHUB_TEST_GUARD_STEPS = (
     ("uses", "actions/checkout@11d5960a326750d5838078e36cf38b85af677262", ()),
     ("run", "python3 -I scripts/check-tests-blocking.selftest.py", ()),
     ("run", "python3 -I scripts/check-tests-blocking.py", ()),
+    ("run", "python3 -I scripts/pinned-rust-toolchain.test.py", ()),
     ("run", "python3 -I scripts/devnet-particao-report.test.py", ()),
     ("run", "python3 -I scripts/rehearse-validator-activation.test.py", ()),
     ("run", "python3 -I scripts/check-attested-ssh.selftest.py", ()),
@@ -135,6 +135,7 @@ GITLAB_BUILD_TEST_SCRIPT = (
     "bash deploy/bootnodes/verify-bootnodes.selftest.sh",
     "python3 -I scripts/check-live-node-retired-isolation.py --selftest",
     "python3 -I scripts/check-live-node-retired-isolation.py",
+    "python3 -I scripts/pinned-rust-toolchain.py",
     "cargo build --workspace --all-targets",
     "cargo test --locked -p bloch-pos-committee -p bloch-pos-node "
     "-p bloch-crypto -p coherence-core -p bloch-sis-pow -p bloch-pq-vault "
@@ -146,6 +147,7 @@ GITLAB_BUILD_TEST_BODY = (
     "- bash deploy/bootnodes/verify-bootnodes.selftest.sh",
     "- python3 -I scripts/check-live-node-retired-isolation.py --selftest",
     "- python3 -I scripts/check-live-node-retired-isolation.py",
+    "- python3 -I scripts/pinned-rust-toolchain.py",
     "- cargo build --workspace --all-targets",
     "- cargo test --locked -p bloch-pos-committee -p bloch-pos-node "
     "-p bloch-crypto -p coherence-core -p bloch-sis-pow -p bloch-pq-vault "
@@ -164,7 +166,7 @@ CI_SCRIPT_ENTRYPOINT_SHA256 = {
     "scripts/check-live-node-retired-isolation.py":
         "45ece7368931469c2c64c161708009b41aebcbf3c1033fa75006e16d5e16518d",
     "scripts/check-tests-blocking.selftest.py":
-        "6b9090c2b9d0c70a4f56534b1400542c4baec931b453d032c6d2512faefdd53a",
+        "ed150a57090c7157a2d735fcdb40cc222732bfb5076c02e8eef2bf74c4b48a1f",
     "scripts/check-validator-lifecycle-mutations.py":
         "12b477e5043bc3ea98387be33ca586976494b30083522b214cea7d88c0e9f429",
     "scripts/devnet-particao-report.test.py":
@@ -173,6 +175,8 @@ CI_SCRIPT_ENTRYPOINT_SHA256 = {
         "de0b39b7bfd7baf0da6ddab10d55b62c3a5371a262ac2f5cc38f8a5759ed5e2d",
     "scripts/pinned-rust-toolchain.py":
         "8e0bf93355825f811b619da27a0667d7349105ca8e7a9bf5d5e31ee60bf5d205",
+    "scripts/pinned-rust-toolchain.test.py":
+        "83c030e986546e42269e0331fb3485484d3001e97e47baffc9666d401176ab39",
     "scripts/rehearse-validator-activation.py":
         "e2e527bb71046fb20b88003403b8cca633581839974a7ddb7f8e314e36d33762",
     "scripts/rehearse-validator-activation.test.py":
@@ -566,11 +570,12 @@ def check_ci_script_entrypoints(root: str) -> list[str]:
     # whose bytes are pinned here; the exact CI job runs selftest before guard.
     invoked.discard("scripts/check-tests-blocking.py")
     transitive = set(CI_TRANSITIVE_ENTRYPOINT_REFERENCES)
-    declared = set(CI_SCRIPT_ENTRYPOINT_SHA256) - transitive
+    declared = set(CI_SCRIPT_ENTRYPOINT_SHA256)
     problems = []
-    if invoked != declared:
-        missing = sorted(invoked - declared)
-        stale = sorted(declared - invoked)
+    covered = invoked | transitive
+    if covered != declared:
+        missing = sorted(covered - declared)
+        stale = sorted(declared - covered)
         problems.append(
             "CI script digest scope differs from exact job contracts "
             f"(missing={missing}, stale={stale})")
