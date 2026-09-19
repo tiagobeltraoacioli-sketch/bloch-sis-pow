@@ -1,0 +1,86 @@
+{
+  "observed_utc": "2026-09-13T03:46:04.932496+00:00",
+  "status": "passed",
+  "checks": {
+    "slot": true,
+    "block_id": true,
+    "state_root": true,
+    "height": true,
+    "approved_checkpoint_finalized": true
+  },
+  "chaininfo": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "result": {
+      "block_id": "c5873bb8e6f322ba3bd75bac868511eb9986c65c107cf6db877d2aa8435ec249",
+      "slot": 86916,
+      "height": 63683,
+      "finalized_height": 63619,
+      "epoch": 2716,
+      "slot_in_epoch": 4,
+      "slots_per_epoch": 32,
+      "state_root": "f3d175945681996a94ec7a8390f7bb21d5b55fdde3cb21d43ba595b36673e524",
+      "justified": {
+        "epoch": 2715,
+        "root": "329be1cc1d61404f85974cbd7027e0fc21e56b7ad885ef7631cd2b86c4b1daa4"
+      },
+      "finalized": {
+        "epoch": 2714,
+        "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+      },
+      "previous_justified": {
+        "epoch": 2714,
+        "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+      },
+      "validators": {
+        "total": 64,
+        "active": 64
+      },
+      "total_active_stake_sat": "25476803980163119",
+      "base_fee_millisat_per_gas": "10",
+      "next_base_fee_millisat_per_gas": "10",
+      "mempool": 0,
+      "blocks_known": 63683,
+      "wall_slot": 87149,
+      "behind_by_slots": 233,
+      "transport": {
+        "name": "devnet",
+        "peers": {
+          "devnet": 0,
+          "libp2p": null
+        }
+      }
+    }
+  },
+  "approved_checkpoint": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "result": {
+      "block_id": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1",
+      "version": 2970353669,
+      "parent": "dc1d29d9f9a489216df3f6480556b1d38c3ccbbf20f73b608d74553f7dbbe3e5",
+      "slot": 86814,
+      "epoch": 2712,
+      "height": 63592,
+      "proposer_index": 7,
+      "timestamp": 1789261099,
+      "state_root": "4bde5eec161cf01e82c6a9e4220f98a9162fc5438d62d5c55541cd4d33d9d1ab",
+      "body_root": "3d272a088c490760c4f7d74cb6c3d2275f884842ad4e6ccb9e40a34a9e5a8400",
+      "randao_reveal": "c84375a5b2340cb809dc061cd23b33b76bd0eb003dcbf315ede36666964b7a50",
+      "randao_mix": "9d48a197c00e9287e352c592ffc7051a36b99a73cacc1b90a75e3d911e8313c7",
+      "justified_root": "e6e00471fb3a040a00d95139296fd6aac0261ea6648f135f5654e6c048886370",
+      "finalized_root": "5a7cf00f366100094cbffc16d0eec2bf5b5e1706cb2608dc556adbec38ffdc35",
+      "attestation_root": "37224fd3f6d2ab5a4b20b63616a33dc848dbfc1d39025b4d5294ff5af75fde62",
+      "coherence_root": "3ac97a48fe4c1dc2de33022b2473e76e609c85ce0c0bce96540851f682bccb56",
+      "finality": "finalized",
+      "finalized": true,
+      "tx_count": 0,
+      "attestation_count": 2
+    }
+  },
+  "source_commit": "22b8b7fdbbe0d69c91d2494b4844d68568fc382f",
+  "only_parameter_change": "LEAK_RECOVERY_ACTIVATION_EPOCH 2700 -> u64::MAX",
+  "keyless": true,
+  "peers": [],
+  "binary_sha256": "cd5a2963df93bc85c9bf3fb1cb728cf1331e2bf9862f94bae52b1966ce26946d"
+}

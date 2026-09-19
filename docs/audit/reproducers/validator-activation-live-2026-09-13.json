@@ -1,0 +1,1649 @@
+{
+  "description": "Read-only RPC survey; indices are labels from the operational inventory, not independently proven signing identities.",
+  "hosts": [
+    {
+      "host_id": "HOST-001",
+      "observed_utc": "2026-09-13T01:32:49.432212+00:00",
+      "nodes": [
+        {
+          "index_label": 0,
+          "block_id": "2978b4edf8fa43cc6b79664f8b0d8c1108712e7eb7b821b2eff545aa672b58b8",
+          "slot": 79686,
+          "height": 54459,
+          "epoch": 2490,
+          "finalized": {
+            "epoch": 2488,
+            "root": "0a79524e32f850dc33a4c02340a9d8c60f862700c9d52c81a393654dbd9e0712"
+          },
+          "justified": {
+            "epoch": 2489,
+            "root": "afe0a458ef3b79d218a70e3fd1808632f087f9665829090e00d570b9577429da"
+          },
+          "state_root": "4f08c39a452807ac12add9b4d08009e6ffce26cafb9fe84de6e28074356fa31c",
+          "behind_by_slots": 7196,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 7,
+          "block_id": "63d907672fcd557f9ac4f56e2125841ded46e3a38b4d48eb43ef88e25f89cd6e",
+          "slot": 86882,
+          "height": 63653,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "7a262d23126693d6d88bcbb66cd8a17bfebacd389e94ecf61a6171e844c88378",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 14,
+          "block_id": "63d907672fcd557f9ac4f56e2125841ded46e3a38b4d48eb43ef88e25f89cd6e",
+          "slot": 86882,
+          "height": 63653,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "7a262d23126693d6d88bcbb66cd8a17bfebacd389e94ecf61a6171e844c88378",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 21,
+          "block_id": "63d907672fcd557f9ac4f56e2125841ded46e3a38b4d48eb43ef88e25f89cd6e",
+          "slot": 86882,
+          "height": 63653,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "7a262d23126693d6d88bcbb66cd8a17bfebacd389e94ecf61a6171e844c88378",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 28,
+          "block_id": "63d907672fcd557f9ac4f56e2125841ded46e3a38b4d48eb43ef88e25f89cd6e",
+          "slot": 86882,
+          "height": 63653,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "7a262d23126693d6d88bcbb66cd8a17bfebacd389e94ecf61a6171e844c88378",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 35,
+          "block_id": "22ed3860fed920cc9894cbdc773ec3f940d37a5ce5259a4c3e331118c8c65bdd",
+          "slot": 86882,
+          "height": 62281,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "d3c7461e76257bf237d43737b8e83e2bd6129010c18835979c5f3526dd4f9ec8"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "16b10bb83f79691fc168ce9e3b3925ef53c395b6da42e3787d8010116c7e7fb7"
+          },
+          "state_root": "afc5a9af1becb890c88577b4e55703dc629610b40bd2452f747a594fce42638c",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 42,
+          "block_id": "22ed3860fed920cc9894cbdc773ec3f940d37a5ce5259a4c3e331118c8c65bdd",
+          "slot": 86882,
+          "height": 62281,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "d3c7461e76257bf237d43737b8e83e2bd6129010c18835979c5f3526dd4f9ec8"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "16b10bb83f79691fc168ce9e3b3925ef53c395b6da42e3787d8010116c7e7fb7"
+          },
+          "state_root": "afc5a9af1becb890c88577b4e55703dc629610b40bd2452f747a594fce42638c",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 49,
+          "block_id": "22ed3860fed920cc9894cbdc773ec3f940d37a5ce5259a4c3e331118c8c65bdd",
+          "slot": 86882,
+          "height": 62281,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "d3c7461e76257bf237d43737b8e83e2bd6129010c18835979c5f3526dd4f9ec8"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "16b10bb83f79691fc168ce9e3b3925ef53c395b6da42e3787d8010116c7e7fb7"
+          },
+          "state_root": "afc5a9af1becb890c88577b4e55703dc629610b40bd2452f747a594fce42638c",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 56,
+          "block_id": "22ed3860fed920cc9894cbdc773ec3f940d37a5ce5259a4c3e331118c8c65bdd",
+          "slot": 86882,
+          "height": 62281,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "d3c7461e76257bf237d43737b8e83e2bd6129010c18835979c5f3526dd4f9ec8"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "16b10bb83f79691fc168ce9e3b3925ef53c395b6da42e3787d8010116c7e7fb7"
+          },
+          "state_root": "afc5a9af1becb890c88577b4e55703dc629610b40bd2452f747a594fce42638c",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 63,
+          "rpc_available": false
+        }
+      ]
+    },
+    {
+      "host_id": "HOST-002",
+      "observed_utc": "2026-09-13T01:32:54.517357+00:00",
+      "nodes": [
+        {
+          "index_label": 1,
+          "block_id": "63d907672fcd557f9ac4f56e2125841ded46e3a38b4d48eb43ef88e25f89cd6e",
+          "slot": 86882,
+          "height": 63653,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "7a262d23126693d6d88bcbb66cd8a17bfebacd389e94ecf61a6171e844c88378",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 8,
+          "block_id": "63d907672fcd557f9ac4f56e2125841ded46e3a38b4d48eb43ef88e25f89cd6e",
+          "slot": 86882,
+          "height": 63653,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "7a262d23126693d6d88bcbb66cd8a17bfebacd389e94ecf61a6171e844c88378",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 15,
+          "block_id": "63d907672fcd557f9ac4f56e2125841ded46e3a38b4d48eb43ef88e25f89cd6e",
+          "slot": 86882,
+          "height": 63653,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "7a262d23126693d6d88bcbb66cd8a17bfebacd389e94ecf61a6171e844c88378",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 22,
+          "block_id": "63d907672fcd557f9ac4f56e2125841ded46e3a38b4d48eb43ef88e25f89cd6e",
+          "slot": 86882,
+          "height": 63653,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "7a262d23126693d6d88bcbb66cd8a17bfebacd389e94ecf61a6171e844c88378",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 29,
+          "block_id": "63d907672fcd557f9ac4f56e2125841ded46e3a38b4d48eb43ef88e25f89cd6e",
+          "slot": 86882,
+          "height": 63653,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "7a262d23126693d6d88bcbb66cd8a17bfebacd389e94ecf61a6171e844c88378",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 36,
+          "block_id": "22ed3860fed920cc9894cbdc773ec3f940d37a5ce5259a4c3e331118c8c65bdd",
+          "slot": 86882,
+          "height": 62281,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "d3c7461e76257bf237d43737b8e83e2bd6129010c18835979c5f3526dd4f9ec8"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "16b10bb83f79691fc168ce9e3b3925ef53c395b6da42e3787d8010116c7e7fb7"
+          },
+          "state_root": "afc5a9af1becb890c88577b4e55703dc629610b40bd2452f747a594fce42638c",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 43,
+          "block_id": "63d907672fcd557f9ac4f56e2125841ded46e3a38b4d48eb43ef88e25f89cd6e",
+          "slot": 86882,
+          "height": 63653,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "7a262d23126693d6d88bcbb66cd8a17bfebacd389e94ecf61a6171e844c88378",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 50,
+          "block_id": "22ed3860fed920cc9894cbdc773ec3f940d37a5ce5259a4c3e331118c8c65bdd",
+          "slot": 86882,
+          "height": 62281,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "d3c7461e76257bf237d43737b8e83e2bd6129010c18835979c5f3526dd4f9ec8"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "16b10bb83f79691fc168ce9e3b3925ef53c395b6da42e3787d8010116c7e7fb7"
+          },
+          "state_root": "afc5a9af1becb890c88577b4e55703dc629610b40bd2452f747a594fce42638c",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 57,
+          "block_id": "63d907672fcd557f9ac4f56e2125841ded46e3a38b4d48eb43ef88e25f89cd6e",
+          "slot": 86882,
+          "height": 63653,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "7a262d23126693d6d88bcbb66cd8a17bfebacd389e94ecf61a6171e844c88378",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 63,
+          "rpc_available": false
+        }
+      ]
+    },
+    {
+      "host_id": "HOST-003",
+      "observed_utc": "2026-09-13T01:32:59.949627+00:00",
+      "nodes": [
+        {
+          "index_label": 2,
+          "block_id": "63d907672fcd557f9ac4f56e2125841ded46e3a38b4d48eb43ef88e25f89cd6e",
+          "slot": 86882,
+          "height": 63653,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "7a262d23126693d6d88bcbb66cd8a17bfebacd389e94ecf61a6171e844c88378",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 9,
+          "block_id": "63d907672fcd557f9ac4f56e2125841ded46e3a38b4d48eb43ef88e25f89cd6e",
+          "slot": 86882,
+          "height": 63653,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "7a262d23126693d6d88bcbb66cd8a17bfebacd389e94ecf61a6171e844c88378",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 16,
+          "block_id": "63d907672fcd557f9ac4f56e2125841ded46e3a38b4d48eb43ef88e25f89cd6e",
+          "slot": 86882,
+          "height": 63653,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "7a262d23126693d6d88bcbb66cd8a17bfebacd389e94ecf61a6171e844c88378",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 23,
+          "block_id": "63d907672fcd557f9ac4f56e2125841ded46e3a38b4d48eb43ef88e25f89cd6e",
+          "slot": 86882,
+          "height": 63653,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "7a262d23126693d6d88bcbb66cd8a17bfebacd389e94ecf61a6171e844c88378",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 30,
+          "block_id": "63d907672fcd557f9ac4f56e2125841ded46e3a38b4d48eb43ef88e25f89cd6e",
+          "slot": 86882,
+          "height": 63653,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "7a262d23126693d6d88bcbb66cd8a17bfebacd389e94ecf61a6171e844c88378",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 37,
+          "block_id": "63d907672fcd557f9ac4f56e2125841ded46e3a38b4d48eb43ef88e25f89cd6e",
+          "slot": 86882,
+          "height": 63653,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "7a262d23126693d6d88bcbb66cd8a17bfebacd389e94ecf61a6171e844c88378",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 44,
+          "block_id": "63d907672fcd557f9ac4f56e2125841ded46e3a38b4d48eb43ef88e25f89cd6e",
+          "slot": 86882,
+          "height": 63653,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "7a262d23126693d6d88bcbb66cd8a17bfebacd389e94ecf61a6171e844c88378",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 51,
+          "block_id": "63d907672fcd557f9ac4f56e2125841ded46e3a38b4d48eb43ef88e25f89cd6e",
+          "slot": 86882,
+          "height": 63653,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "7a262d23126693d6d88bcbb66cd8a17bfebacd389e94ecf61a6171e844c88378",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 58,
+          "block_id": "63d907672fcd557f9ac4f56e2125841ded46e3a38b4d48eb43ef88e25f89cd6e",
+          "slot": 86882,
+          "height": 63653,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "7a262d23126693d6d88bcbb66cd8a17bfebacd389e94ecf61a6171e844c88378",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 63,
+          "rpc_available": false
+        }
+      ]
+    },
+    {
+      "host_id": "HOST-004",
+      "observed_utc": "2026-09-13T01:33:04.842949+00:00",
+      "nodes": [
+        {
+          "index_label": 3,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 10,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 17,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 24,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 31,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 38,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 45,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 52,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 59,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 63,
+          "rpc_available": false
+        }
+      ]
+    },
+    {
+      "host_id": "HOST-005",
+      "observed_utc": "2026-09-13T01:33:10.457821+00:00",
+      "nodes": [
+        {
+          "index_label": 4,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 11,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 18,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 25,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 32,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 39,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 46,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 53,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 60,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 63,
+          "rpc_available": false
+        }
+      ]
+    },
+    {
+      "host_id": "HOST-006",
+      "observed_utc": "2026-09-13T01:33:15.832458+00:00",
+      "nodes": [
+        {
+          "index_label": 5,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 12,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 19,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 26,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 33,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 40,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 47,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 54,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 61,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 0,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 63,
+          "rpc_available": false
+        }
+      ]
+    },
+    {
+      "host_id": "HOST-007",
+      "observed_utc": "2026-09-13T01:33:21.935282+00:00",
+      "nodes": [
+        {
+          "index_label": 6,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 13,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 20,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 27,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 34,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 41,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 48,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 55,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 62,
+          "block_id": "3f9c14f943227ab7977ddfd7d5c78796d9281fadfb5ccfe2f2084cbd30c2f2ca",
+          "slot": 86883,
+          "height": 63654,
+          "epoch": 2715,
+          "finalized": {
+            "epoch": 2713,
+            "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+          },
+          "justified": {
+            "epoch": 2714,
+            "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+          },
+          "state_root": "5e4a18646468727a9dc0966a9e70cf3868e8dd3b41c65e947a099638d73518b5",
+          "behind_by_slots": 1,
+          "validators": {
+            "total": 64,
+            "active": 64
+          }
+        },
+        {
+          "index_label": 63,
+          "rpc_available": false
+        }
+      ]
+    }
+  ],
+  "first_host_binary_sha256": "b37d3b87c3a4fdf75d2954563f47f8f066cdf6b27f50f0384d0ea8bd12f46c10",
+  "first_host_manifest_sha256": "7eef82a70ef9b0e1dd86f86d33cba11fc10cdfc7395c2e5f6669613fa1beb2dd",
+  "repeat_first_host": {
+    "observed_utc": "2026-09-13T01:21:57.584943+00:00",
+    "nodes": [
+      {
+        "index_label": 0,
+        "block_id": "2978b4edf8fa43cc6b79664f8b0d8c1108712e7eb7b821b2eff545aa672b58b8",
+        "slot": 79686,
+        "height": 54459,
+        "epoch": 2490,
+        "finalized": {
+          "epoch": 2488,
+          "root": "0a79524e32f850dc33a4c02340a9d8c60f862700c9d52c81a393654dbd9e0712"
+        },
+        "justified": {
+          "epoch": 2489,
+          "root": "afe0a458ef3b79d218a70e3fd1808632f087f9665829090e00d570b9577429da"
+        },
+        "state_root": "4f08c39a452807ac12add9b4d08009e6ffce26cafb9fe84de6e28074356fa31c",
+        "behind_by_slots": 7175,
+        "validators": {
+          "total": 64,
+          "active": 64
+        },
+        "binary_sha256": "b37d3b87c3a4fdf75d2954563f47f8f066cdf6b27f50f0384d0ea8bd12f46c10"
+      },
+      {
+        "index_label": 7,
+        "block_id": "56543af52dfc6077f31bced96cea830dfc1a53b4f8323c985b7d04d892096c9b",
+        "slot": 86860,
+        "height": 63632,
+        "epoch": 2714,
+        "finalized": {
+          "epoch": 2712,
+          "root": "6d5f336bff8090d6c689f4e315c2ee1ceb051c61153a5cc692bc1905b8d371f7"
+        },
+        "justified": {
+          "epoch": 2713,
+          "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+        },
+        "state_root": "ea882956a1f161d0064130710647c020759561604ce1956c6eec9187b9dfab4e",
+        "behind_by_slots": 1,
+        "validators": {
+          "total": 64,
+          "active": 64
+        },
+        "binary_sha256": "b37d3b87c3a4fdf75d2954563f47f8f066cdf6b27f50f0384d0ea8bd12f46c10"
+      },
+      {
+        "index_label": 14,
+        "block_id": "56543af52dfc6077f31bced96cea830dfc1a53b4f8323c985b7d04d892096c9b",
+        "slot": 86860,
+        "height": 63632,
+        "epoch": 2714,
+        "finalized": {
+          "epoch": 2712,
+          "root": "6d5f336bff8090d6c689f4e315c2ee1ceb051c61153a5cc692bc1905b8d371f7"
+        },
+        "justified": {
+          "epoch": 2713,
+          "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+        },
+        "state_root": "ea882956a1f161d0064130710647c020759561604ce1956c6eec9187b9dfab4e",
+        "behind_by_slots": 1,
+        "validators": {
+          "total": 64,
+          "active": 64
+        },
+        "binary_sha256": "b37d3b87c3a4fdf75d2954563f47f8f066cdf6b27f50f0384d0ea8bd12f46c10"
+      },
+      {
+        "index_label": 21,
+        "block_id": "56543af52dfc6077f31bced96cea830dfc1a53b4f8323c985b7d04d892096c9b",
+        "slot": 86860,
+        "height": 63632,
+        "epoch": 2714,
+        "finalized": {
+          "epoch": 2712,
+          "root": "6d5f336bff8090d6c689f4e315c2ee1ceb051c61153a5cc692bc1905b8d371f7"
+        },
+        "justified": {
+          "epoch": 2713,
+          "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+        },
+        "state_root": "ea882956a1f161d0064130710647c020759561604ce1956c6eec9187b9dfab4e",
+        "behind_by_slots": 1,
+        "validators": {
+          "total": 64,
+          "active": 64
+        },
+        "binary_sha256": "b37d3b87c3a4fdf75d2954563f47f8f066cdf6b27f50f0384d0ea8bd12f46c10"
+      },
+      {
+        "index_label": 28,
+        "block_id": "56543af52dfc6077f31bced96cea830dfc1a53b4f8323c985b7d04d892096c9b",
+        "slot": 86860,
+        "height": 63632,
+        "epoch": 2714,
+        "finalized": {
+          "epoch": 2712,
+          "root": "6d5f336bff8090d6c689f4e315c2ee1ceb051c61153a5cc692bc1905b8d371f7"
+        },
+        "justified": {
+          "epoch": 2713,
+          "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+        },
+        "state_root": "ea882956a1f161d0064130710647c020759561604ce1956c6eec9187b9dfab4e",
+        "behind_by_slots": 1,
+        "validators": {
+          "total": 64,
+          "active": 64
+        },
+        "binary_sha256": "b37d3b87c3a4fdf75d2954563f47f8f066cdf6b27f50f0384d0ea8bd12f46c10"
+      },
+      {
+        "index_label": 35,
+        "block_id": "a51b39558d567eed3cebad1f3006716efe91b1fb4e5f1c8d5c4a48fc8b86a22c",
+        "slot": 86860,
+        "height": 62260,
+        "epoch": 2714,
+        "finalized": {
+          "epoch": 2712,
+          "root": "409c9338dce53352653626f318270726a4a36106d82b475e9fc1b1f97d6235ba"
+        },
+        "justified": {
+          "epoch": 2713,
+          "root": "d3c7461e76257bf237d43737b8e83e2bd6129010c18835979c5f3526dd4f9ec8"
+        },
+        "state_root": "307c1d98184121eff6cecf9a13ba4ecc1c63148812e88c17a793309c5edb635d",
+        "behind_by_slots": 1,
+        "validators": {
+          "total": 64,
+          "active": 64
+        },
+        "binary_sha256": "b37d3b87c3a4fdf75d2954563f47f8f066cdf6b27f50f0384d0ea8bd12f46c10"
+      },
+      {
+        "index_label": 42,
+        "block_id": "a51b39558d567eed3cebad1f3006716efe91b1fb4e5f1c8d5c4a48fc8b86a22c",
+        "slot": 86860,
+        "height": 62260,
+        "epoch": 2714,
+        "finalized": {
+          "epoch": 2712,
+          "root": "409c9338dce53352653626f318270726a4a36106d82b475e9fc1b1f97d6235ba"
+        },
+        "justified": {
+          "epoch": 2713,
+          "root": "d3c7461e76257bf237d43737b8e83e2bd6129010c18835979c5f3526dd4f9ec8"
+        },
+        "state_root": "307c1d98184121eff6cecf9a13ba4ecc1c63148812e88c17a793309c5edb635d",
+        "behind_by_slots": 1,
+        "validators": {
+          "total": 64,
+          "active": 64
+        },
+        "binary_sha256": "b37d3b87c3a4fdf75d2954563f47f8f066cdf6b27f50f0384d0ea8bd12f46c10"
+      },
+      {
+        "index_label": 49,
+        "block_id": "a51b39558d567eed3cebad1f3006716efe91b1fb4e5f1c8d5c4a48fc8b86a22c",
+        "slot": 86860,
+        "height": 62260,
+        "epoch": 2714,
+        "finalized": {
+          "epoch": 2712,
+          "root": "409c9338dce53352653626f318270726a4a36106d82b475e9fc1b1f97d6235ba"
+        },
+        "justified": {
+          "epoch": 2713,
+          "root": "d3c7461e76257bf237d43737b8e83e2bd6129010c18835979c5f3526dd4f9ec8"
+        },
+        "state_root": "307c1d98184121eff6cecf9a13ba4ecc1c63148812e88c17a793309c5edb635d",
+        "behind_by_slots": 1,
+        "validators": {
+          "total": 64,
+          "active": 64
+        },
+        "binary_sha256": "b37d3b87c3a4fdf75d2954563f47f8f066cdf6b27f50f0384d0ea8bd12f46c10"
+      },
+      {
+        "index_label": 56,
+        "block_id": "a51b39558d567eed3cebad1f3006716efe91b1fb4e5f1c8d5c4a48fc8b86a22c",
+        "slot": 86860,
+        "height": 62260,
+        "epoch": 2714,
+        "finalized": {
+          "epoch": 2712,
+          "root": "409c9338dce53352653626f318270726a4a36106d82b475e9fc1b1f97d6235ba"
+        },
+        "justified": {
+          "epoch": 2713,
+          "root": "d3c7461e76257bf237d43737b8e83e2bd6129010c18835979c5f3526dd4f9ec8"
+        },
+        "state_root": "307c1d98184121eff6cecf9a13ba4ecc1c63148812e88c17a793309c5edb635d",
+        "behind_by_slots": 1,
+        "validators": {
+          "total": 64,
+          "active": 64
+        },
+        "binary_sha256": "b37d3b87c3a4fdf75d2954563f47f8f066cdf6b27f50f0384d0ea8bd12f46c10"
+      }
+    ]
+  },
+  "archivals": [
+    {
+      "endpoint": "http://139.180.166.5:8080",
+      "observed_utc": "2026-09-13T01:36:50.806353+00:00",
+      "block_id": "c186eda012469989a2562960de6e22be57c6065f8f6077b2bdb93ea599a45b33",
+      "slot": 86890,
+      "height": 63660,
+      "epoch": 2715,
+      "finalized": {
+        "epoch": 2713,
+        "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+      },
+      "justified": {
+        "epoch": 2714,
+        "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+      },
+      "state_root": "e1ca75cb10e8921e6e91d37581c30e3e3f86d71f0f3d6b48ade2a9183f64a108",
+      "behind_by_slots": 1,
+      "validators": {
+        "total": 64,
+        "active": 64
+      }
+    },
+    {
+      "endpoint": "http://139.180.173.231:8080",
+      "observed_utc": "2026-09-13T01:36:51.614664+00:00",
+      "block_id": "c186eda012469989a2562960de6e22be57c6065f8f6077b2bdb93ea599a45b33",
+      "slot": 86890,
+      "height": 63660,
+      "epoch": 2715,
+      "finalized": {
+        "epoch": 2713,
+        "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+      },
+      "justified": {
+        "epoch": 2714,
+        "root": "fa5b8ef6ce9257e0405294d1a40416b7c78ad388e638247c8a458bb179f946d7"
+      },
+      "state_root": "e1ca75cb10e8921e6e91d37581c30e3e3f86d71f0f3d6b48ade2a9183f64a108",
+      "behind_by_slots": 1,
+      "validators": {
+        "total": 64,
+        "active": 64
+      }
+    }
+  ]
+}

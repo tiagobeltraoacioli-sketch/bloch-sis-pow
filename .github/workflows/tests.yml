@@ -86,6 +86,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y clang cmake
       - name: Funded validator admission (isolated epoch-zero rehearsal)
         run: python3 scripts/rehearse-validator-admission.py
+      - name: Validator withdrawal guard mutations
+        run: python3 scripts/check-validator-lifecycle-mutations.py
+      - name: Finite validator activation boundary and replay
+        run: python3 scripts/rehearse-validator-activation.py --output "$RUNNER_TEMP/validator-activation"
+      - name: Funded validator joining between independent processes
+        run: python3 scripts/rehearse-validator-joining-network.py --output "$RUNNER_TEMP/validator-joining-network"
       - name: Input-boundary regressions (before the full suite)
         run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-node --bin bloch-pos audit_
       - name: Entropy guard regressions and thread-affinity doctests
@@ -154,3 +160,7 @@ jobs:
         run: python3 scripts/check-tests-blocking.selftest.py
       - name: guard
         run: python3 scripts/check-tests-blocking.py
+      - name: Partition report rejects missing evidence
+        run: python3 scripts/devnet-particao-report.test.py
+      - name: Activation rehearsal refuses unexpected gate changes
+        run: python3 scripts/rehearse-validator-activation.test.py

@@ -1,13 +1,14 @@
 # Funded validator admission
 
-Status: implemented, **not activated on mainnet**. The independent
+Status: implemented, **not activated on mainnet**. The
 `FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH` is `u64::MAX`. This work prepares
 registration and node onboarding for a coordinated consensus release; merging
 it does not open deposits on the running network.
 
 The legacy `Deposit` (0x02) and `Delegate` (0x04) create bonds without consuming
 UTXOs. Their gate remains closed. New registration uses **0x0B**, a fresh wire
-assignment, without interpreting any contested 0x07–0x0A format.
+assignment. ADR-041 permanently retires contested bytes 0x07–0x09 and assigns
+0x0A to RANDAO recommit, 0x0C to authenticated exit and 0x0D to withdrawal.
 
 ## Protocol
 
@@ -74,13 +75,12 @@ never added to the legacy `unfunded_bonded` supply exception.
 ### Activation and identity
 
 Registration queues the key; it does not immediately give it voting weight.
-The existing queue orders by `(deposit epoch, public-key hash)`, waits at least
-**eight epochs**, and admits at most **four validators per epoch**. The resolver
-now sorts once and advances directly to eligibility/churn boundaries rather
-than rescanning every historical epoch. Differential tests preserve the
-previous schedule. Eight epochs are a delay, not a separate proof that the
-deposit is finalized; a finality-aware activation policy requires its own
-consensus decision.
+The funded queue orders by `(deposit epoch, public-key hash)`, waits at least
+**eight epochs**, and admits at most **four validators per epoch**. It also
+requires `finalized.epoch > deposit_epoch`: checkpoint E covers the end of
+epoch E-1. A finality stall leaves registrations queued. Once finality resumes,
+activation occurs at a subsequent epoch boundary under the same churn cap;
+it is never backdated. These checks use committed state on the relevant branch.
 
 A joining keystore uses the existing index field's sentinel `4294967295`
 (`--index auto`). Each duty resolves its public key in the committed registry
@@ -103,6 +103,12 @@ rehearsing a candidate outside the genesis set. Keep the validator's sealed
 keystore, its RANDAO seed and the withdrawal authority's backups secure.
 Withdrawals must name a script whose PQ spending key the intended recipient
 actually controls; registration does not establish that control for them.
+
+Funding inputs must use the full 32-byte SHA3-256 hash of the suite-enveloped
+funding public key. Carried legacy 20-byte hashes padded to 32 bytes do not
+qualify directly. First transfer those coins to a native suite-1 output and
+verify its inclusion, value and script before preparing a deposit. Keep the
+withdrawal spending key backed up separately from the validator signing key.
 
 1. Query `getvalidatoradmission`. An unarmed build reports `active: false` and
    `activation_epoch: null`, plus its network domain, head epoch, stake bounds,
@@ -138,13 +144,15 @@ bloch-pos validator-deposit prepare \
   --expiry <inclusive-epoch> --commission <basis-points> --out draft.hex
 
 bloch-pos validator-deposit inspect --tx draft.hex
-bloch-pos validator-deposit sign --tx draft.hex --role funding \
+bloch-pos validator-deposit sign --genesis genesis.bin --tx draft.hex --role funding \
   --dir funding-keystore --out funded.hex
 bloch-pos validator-deposit inspect --tx funded.hex
-bloch-pos validator-deposit sign --tx funded.hex --role validator \
+bloch-pos validator-deposit sign --genesis genesis.bin --tx funded.hex --role validator \
   --dir validator-keystore --out ready.hex
 ```
 
+Each signer supplies an independently trusted genesis manifest; the command
+rejects a network mismatch before unlocking the keystore.
 Each signing invocation uses the existing sealed-keystore passphrase sourcing;
 there is no passphrase argument. Inspect all inputs, the network domain,
 validator hash, withdrawal script, commission and fee budget on each signing
@@ -184,13 +192,14 @@ rehearse the same activation boundary. No runtime option enables the format.
 Historical roots and pre-activation validity remain unchanged.
 
 The admission flag day also refuses unauthenticated legacy `Exit` messages
-for every validator. **This PR does not activate authenticated exits,
-withdrawals, slashing evidence or RANDAO recommit.** Those paths have their own
-unarmed gates, and some still have contested wire assignments. Admission must
-not be opened for public funds until the operator-approved lifecycle and those
-existing release dependencies are resolved. Otherwise bonds have no activated
-withdrawal path and validator RANDAO chains remain finite. This is a concrete
-limitation of the current code, not a promise of a complete staking lifecycle.
+for every validator. Authenticated exits, backed withdrawals, slashing evidence
+submission and automatic RANDAO recommit are implemented under ADR-041, but
+all five activation epochs remain unarmed. Mempool admission validates funded
+state before eviction or relay and revalidates lifecycle messages on head changes.
+Implementation does not establish mainnet release readiness. Follow the
+[release checklist](../VALIDATOR-OPENING.md), including process-level network
+qualification, a coordinated activation epoch and a settled mainnet withdrawal
+before announcing public admission.
 
 Coverage includes funding conservation/refunds, atomic failures, replay,
 network/field substitution, both PQ algorithms in both roles, bounded parsing,

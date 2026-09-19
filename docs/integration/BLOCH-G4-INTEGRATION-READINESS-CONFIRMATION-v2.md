@@ -1,5 +1,7 @@
 # Bloch Genesis-4 — Integration Readiness Confirmation
 
+> **12 September 2026 correction:** See [BLOCH-G4-EXCHANGE-CORRECTIONS-2026-09-12](BLOCH-G4-EXCHANGE-CORRECTIONS-2026-09-12.md), which supersedes bootstrap-readiness and error-classification statements below where they conflict. No confirmed Phase-A date is available in the reviewed evidence. Seeded directories alone do not meet the independent-observer crediting rule. Node `-32010` is conditionally retryable, not terminal. Historical operational claims below retain their original dates.
+
 **Edition 2 · 2026-09-07 · Code revision `72e5525` (branch `main`)**
 
 Restates the three items requested of edition 1 — API documentation, chain

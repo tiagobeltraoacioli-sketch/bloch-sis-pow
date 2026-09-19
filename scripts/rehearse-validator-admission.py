@@ -72,7 +72,11 @@ def main():
             )
         (checkout / PARAMS).write_text(armed)
         test_name = TEST + ("funded_mempool_rejects_invalid_state_rehearsal" if args.audit_mempool else "")
-        test_options = ["--ignored", "--nocapture", "--skip", "randao_automatic_recommit_rehearsal"]
+        test_options = ["--ignored", "--nocapture", "--skip", "randao_automatic_recommit_rehearsal",
+                        "--skip", "funded_activation_boundary_rehearsal",
+                        "--skip", "funded_pre_activation_compatibility_rehearsal",
+                        "--skip", "funded_joining_network_fixture",
+                        "--skip", "funded_joining_network_evidence"]
         if not args.randao_only:
             subprocess.run(
                 ["cargo", f"+{pin.group(1)}", "test", "--locked", "-p", "bloch-pos-node",
