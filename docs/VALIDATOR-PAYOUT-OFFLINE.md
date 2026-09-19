@@ -96,6 +96,11 @@ not a private-key file. File creation refuses existing paths, including
 symlinks. The reserved byte count covers the suite's maximum signature size
 and is fixed before signing.
 
+Signature inspection uses that validated suite-1 key as trusted format
+metadata: it checks enveloped signatures explicitly, then the legacy raw
+hybrid layout, and retains generic autodetection only as a final compatibility
+fallback for previously retained payout artifacts.
+
 ## Inspect and sign privately
 
 On the custodian's offline machine, independently verify the common options

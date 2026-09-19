@@ -183,6 +183,22 @@ fn check_pubkey(pubkey: &[u8], withdrawal: &[u8; 32]) -> Result<(), String> {
     }
     Ok(())
 }
+fn verify_payout_signature(public_key: &[u8], root: &[u8], signature: &[u8]) -> bool {
+    if bloch_crypto::crypto::verify_enveloped(public_key, root, signature) {
+        return true;
+    }
+    if public_key.len() == ADMISSION_PQ_KEY_BYTES
+        && public_key.starts_with(&[0xb1, 0x0c, 1, 0])
+        && bloch_crypto::crypto::verify_legacy_hybrid_raw(
+            &public_key[bloch_crypto::crypto::SUITE_HEADER_LEN..],
+            root,
+            signature,
+        )
+    {
+        return true;
+    }
+    bloch_crypto::crypto::verify(public_key, root, signature)
+}
 fn fee(bytes: u64, tip: u128, o: &Observation) -> Result<u64, String> {
     if tip > fee_market::MAX_TIP_MILLISAT_PER_GAS {
         return Err("tip exceeds consensus maximum".into());
@@ -253,7 +269,7 @@ fn inspect(tx: &PosTransaction, o: &Observation) -> Result<(), String> {
     let signature = &keys[0].signature;
     if !signature.is_empty()
         && (signature.len() > ADMISSION_PQ_SIGNATURE_MAX
-            || !bloch_crypto::crypto::verify(&keys[0].pubkey, &root, signature))
+            || !verify_payout_signature(&keys[0].pubkey, &root, signature))
     {
         return Err("invalid existing payout signature".into());
     }
@@ -361,5 +377,77 @@ pub fn run(args: &[String]) -> Result<(), String> {
             inspect(&read_tx(a.get("--tx")?)?, &Observation::read(&a)?)
         }
         _ => Err("expected prepare, inspect, sign or --help".into()),
+    }
+}
+
+#[cfg(test)]
+mod audit_signature_policy_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_policy_accepts_genuine_magic_prefixed_raw_payout_signature() {
+        const SEARCH_COUNTER: u64 = 19_830;
+        const SIGNING_SEED_HEX: &str =
+            "669adde213cc9d27054989bc755943b83364b48aa4b146f492421402b7b997ea";
+        const ROOT_HEX: &str =
+            "14dd03330118a6495e0880801a40438e67a880adfa80e78b5adbf8807b5fcdb4";
+
+        let (pubkey, secret_key) =
+            bloch_crypto::crypto::generate_keypair_from_seed(&[0x69; 32]).unwrap();
+        let o = Observation {
+            validator: 71,
+            value: 2_500_000_000_000,
+            withdrawal: Sha3_256::digest(&pubkey).into(),
+            destination: [0x82; 32],
+            base_fee: 10,
+            epoch: 5000,
+            max_fee: 1_000_000,
+        };
+        let mut tx = PosTransaction::TransferV2 {
+            keys: vec![WitnessKey { pubkey: pubkey.clone(), signature: vec![] }],
+            inputs: vec![TransferInputV2 { txid: o.outpoint(), vout: 0, key_index: 0 }],
+            outputs: vec![TransferOutput { value: 1, script_hash: o.destination }],
+            tx_bytes: 0,
+            tip_millisat_per_gas: 5,
+        };
+        let reserved = reserved_size(&tx).unwrap();
+        let total_fee = fee(reserved, 5, &o).unwrap();
+        if let PosTransaction::TransferV2 { tx_bytes, outputs, .. } = &mut tx {
+            *tx_bytes = reserved;
+            outputs[0].value = o.value - total_fee;
+        }
+        let root = tx.checked_signing_root(o.epoch);
+        assert_eq!(codec::hex(&root), ROOT_HEX);
+
+        let mut h = Sha3_256::new();
+        h.update(b"bloch/validator-payout/cr10/signing-rng/v1");
+        h.update(SEARCH_COUNTER.to_le_bytes());
+        let signing_seed: [u8; 32] = h.finalize().into();
+        assert_eq!(codec::hex(&signing_seed), SIGNING_SEED_HEX);
+        let enveloped_signature =
+            pqcrypto_internals::with_seeded_rng_scope(&signing_seed, || {
+                bloch_crypto::crypto::sign(&secret_key, &root).unwrap()
+            });
+        assert!(verify_payout_signature(&pubkey, &root, &enveloped_signature));
+        assert!(bloch_crypto::crypto::verify_enveloped_canonical(
+            &pubkey,
+            &root,
+            &enveloped_signature,
+        ));
+
+        let raw_signature =
+            enveloped_signature[bloch_crypto::crypto::SUITE_HEADER_LEN..].to_vec();
+        assert_eq!(&raw_signature[..2], &[0xb1, 0x0c]);
+        assert!(
+            !bloch_crypto::crypto::verify(&pubkey, &root, &raw_signature),
+            "generic autodetection must misclassify this genuine raw signature"
+        );
+        assert!(verify_payout_signature(&pubkey, &root, &raw_signature));
+
+        let PosTransaction::TransferV2 { keys, .. } = &mut tx else {
+            unreachable!()
+        };
+        keys[0].signature = raw_signature;
+        assert!(inspect(&tx, &o).is_ok());
     }
 }
