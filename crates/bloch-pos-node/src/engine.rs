@@ -12351,8 +12351,18 @@ mod ingest_admission_tests {
         let second_root_att = make_attestation(63, second_root, 1);
 
         let mut pool = AttestationPool::new();
-        for att in first_root_atts.iter().chain(std::iter::once(&second_root_att)) {
-            let decision = engine.judge(&mut pool, att.clone(), 1);
+        for (index, att) in first_root_atts
+            .iter()
+            .chain(std::iter::once(&second_root_att))
+            .enumerate()
+        {
+            // This fixture intentionally reaches the root-wide outer bound,
+            // so distribute its authenticated entries across attributed
+            // sources instead of exercising the smaller source-free bucket.
+            let source_group = index
+                / bloch_pos_committee::gossip::MAX_PENDING_ATTESTATIONS_PER_SOURCE_ROOT;
+            let source = [0x40 + source_group as u8; 32];
+            let decision = engine.judge_from(&mut pool, att.clone(), 1, Some(source));
             assert!(
                 matches!(decision, GossipDecision::Hold { .. }),
                 "unexpected held-attestation fixture decision: {decision:?}",

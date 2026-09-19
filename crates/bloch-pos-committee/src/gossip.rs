@@ -77,10 +77,19 @@ pub const MAX_PENDING_ATTESTATIONS_PER_ROOT: usize = 32;
 pub const MAX_PENDING_ATTESTATION_ROOTS: usize = 32;
 /// Pending attestations attributed to one normalized transport source across
 /// all missing roots. Unattributed/local input does not acquire a fabricated
-/// identity and remains covered by the aggregate pool/root limits.
+/// identity; it shares the separate collective limits below.
 pub const MAX_PENDING_ATTESTATIONS_PER_SOURCE: usize = 32;
 /// Pending attestations one attributed source may park for one missing root.
 pub const MAX_PENDING_ATTESTATIONS_PER_SOURCE_ROOT: usize = 8;
+/// Pending attestations whose caller supplied no transport identity. These
+/// entries share one collective bucket rather than bypassing source fairness:
+/// no synthetic peer identity is invented, while embedded/local ingress can
+/// no longer occupy the entire aggregate pool.
+pub const MAX_PENDING_UNATTRIBUTED_ATTESTATIONS: usize = 32;
+/// Unattributed pending attestations parked for one missing root. This mirrors
+/// the attributed per-source/root share and leaves root headroom for traffic
+/// carrying a real normalized source.
+pub const MAX_PENDING_UNATTRIBUTED_ATTESTATIONS_PER_ROOT: usize = 8;
 
 /// Distinct attestations accepted per duty before further ones are ignored
 /// (spec §6.2). Two, because slashing evidence needs exactly a conflicting
@@ -158,6 +167,11 @@ pub enum IgnoreReason {
     /// This attributed transport source already occupies its share for this
     /// missing root.
     PendingSourceRootLimit,
+    /// Source-free callers collectively exhausted their pending-pool share.
+    /// No identity is fabricated; all unattributed ingress shares this cap.
+    PendingUnattributedLimit,
+    /// Source-free callers collectively exhausted their share for this root.
+    PendingUnattributedRootLimit,
 }
 
 /// The decision on one arriving attestation. The node maps this onto
@@ -263,10 +277,14 @@ pub struct AttestationPool {
     /// eviction), in [`AttestationPool::evict`], so it never drifts from
     /// `pending`'s actual contents.
     pending_by_duty: BTreeMap<DutyKey, usize>,
-    /// Attributed-source indexes. These are admission/replay fairness only;
-    /// they never affect attestation validity and omit unattributed entries.
+    /// Attributed-source indexes. These are admission/replay fairness only
+    /// and never affect attestation validity.
     pending_by_source: BTreeMap<[u8; 32], usize>,
     pending_by_source_root: BTreeMap<([u8; 32], [u8; 32]), usize>,
+    /// Source-free ingress is not assigned a synthetic identity. All such
+    /// entries instead share one bounded aggregate/root bucket.
+    pending_unattributed: usize,
+    pending_unattributed_by_root: BTreeMap<[u8; 32], usize>,
     /// Monotone insertion counter. Never reused, so FIFO order is total and
     /// deterministic across identical histories.
     next_seq: u64,
@@ -514,6 +532,17 @@ impl AttestationPool {
                     {
                         return GossipDecision::Ignore(IgnoreReason::PendingSourceRootLimit);
                     }
+                } else {
+                    if self.pending_unattributed >= MAX_PENDING_UNATTRIBUTED_ATTESTATIONS {
+                        return GossipDecision::Ignore(IgnoreReason::PendingUnattributedLimit);
+                    }
+                    if self.pending_unattributed_by_root.get(&root).copied().unwrap_or(0)
+                        >= MAX_PENDING_UNATTRIBUTED_ATTESTATIONS_PER_ROOT
+                    {
+                        return GossipDecision::Ignore(
+                            IgnoreReason::PendingUnattributedRootLimit,
+                        );
+                    }
                 }
                 return self.hold(duty, att, root, data_hash, verification_source);
             }
@@ -696,6 +725,9 @@ impl AttestationPool {
             if let Some(source) = verification_source {
                 *self.pending_by_source.entry(source).or_insert(0) += 1;
                 *self.pending_by_source_root.entry((source, missing_root)).or_insert(0) += 1;
+            } else {
+                self.pending_unattributed += 1;
+                *self.pending_unattributed_by_root.entry(missing_root).or_insert(0) += 1;
             }
         }
         self.pending.insert(
@@ -730,6 +762,14 @@ impl AttestationPool {
                     *count = count.saturating_sub(1);
                     if *count == 0 {
                         self.pending_by_source_root.remove(&source_root);
+                    }
+                }
+            } else {
+                self.pending_unattributed = self.pending_unattributed.saturating_sub(1);
+                if let Some(count) = self.pending_unattributed_by_root.get_mut(&entry.missing_root) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.pending_unattributed_by_root.remove(&entry.missing_root);
                     }
                 }
             }
@@ -1113,13 +1153,14 @@ mod tests {
         for i in 0..MAX_PENDING_ATTESTATIONS_PER_ROOT {
             let validator = 1 + (i % 8) as u32;
             let slot = CURRENT_SLOT.saturating_sub((i / 8) as u64);
-            let decision = pool.process(
+            let decision = pool.process_from_source(
                 att(validator, slot, 0xAA),
                 CURRENT_SLOT,
                 &committees(),
                 &known(&blocks),
                 &RootEchoVerifier,
                 &AnyKey,
+                Some([0x10 + (i / MAX_PENDING_ATTESTATIONS_PER_SOURCE_ROOT) as u8; 32]),
             );
             assert!(matches!(decision, GossipDecision::Hold { missing_root } if missing_root == root(0xAA)));
         }
@@ -1127,13 +1168,14 @@ mod tests {
 
         let overflow = att(1, CURRENT_SLOT - 4, 0xAA);
         assert!(matches!(
-            pool.process(
+            pool.process_from_source(
                 overflow.clone(),
                 CURRENT_SLOT,
                 &committees(),
                 &known(&blocks),
                 &RootEchoVerifier,
                 &AnyKey,
+                Some([0xEE; 32]),
             ),
             GossipDecision::Ignore(IgnoreReason::PendingRootLimit),
         ));
@@ -1141,13 +1183,14 @@ mod tests {
 
         let independent = att(2, CURRENT_SLOT - 4, 0xBB);
         assert!(matches!(
-            pool.process(
+            pool.process_from_source(
                 independent,
                 CURRENT_SLOT,
                 &committees(),
                 &known(&blocks),
                 &RootEchoVerifier,
                 &AnyKey,
+                Some([0xEE; 32]),
             ),
             GossipDecision::Hold { missing_root } if missing_root == root(0xBB),
         ));
@@ -1157,13 +1200,14 @@ mod tests {
         assert_eq!(released.len(), MAX_PENDING_ATTESTATIONS_PER_ROOT);
         assert_eq!(pool.pending_len(), 1, "the independent root remains parked");
         assert!(matches!(
-            pool.process(
+            pool.process_from_source(
                 overflow,
                 CURRENT_SLOT,
                 &committees(),
                 &known(&blocks),
                 &RootEchoVerifier,
                 &AnyKey,
+                Some([0xEE; 32]),
             ),
             GossipDecision::Hold { missing_root } if missing_root == root(0xAA),
         ));
@@ -1290,6 +1334,110 @@ mod tests {
     }
 
     #[test]
+    fn unattributed_ingress_has_collective_bounds_and_cannot_consume_source_headroom() {
+        let mut pool = AttestationPool::new();
+        let blocks = BTreeSet::new();
+
+        // Thirty-two distinct duties spread across five roots stay below the
+        // eight-entry root share while filling the collective source-free
+        // bucket. Before this bound, the same pattern could continue until it
+        // occupied all 256 global entries.
+        for i in 0..MAX_PENDING_UNATTRIBUTED_ATTESTATIONS {
+            let validator = 1 + (i % 8) as u32;
+            let slot = CURRENT_SLOT.saturating_sub((i / 8) as u64);
+            let head = 0x40 + (i % 5) as u8;
+            assert!(matches!(
+                pool.process(
+                    att(validator, slot, head),
+                    CURRENT_SLOT,
+                    &committees(),
+                    &known(&blocks),
+                    &RootEchoVerifier,
+                    &AnyKey,
+                ),
+                GossipDecision::Hold { .. }
+            ));
+        }
+        assert_eq!(pool.pending_unattributed, MAX_PENDING_UNATTRIBUTED_ATTESTATIONS);
+
+        let overflow = att(1, CURRENT_SLOT - 4, 0x42);
+        assert!(matches!(
+            pool.process(
+                overflow.clone(),
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+            ),
+            GossipDecision::Ignore(IgnoreReason::PendingUnattributedLimit),
+        ));
+
+        // Source-free pressure must not consume an attributed source's own
+        // share when the independent aggregate/root bounds have headroom.
+        assert!(matches!(
+            pool.process_from_source(
+                overflow,
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+                Some([0xA5; 32]),
+            ),
+            GossipDecision::Hold { .. },
+        ));
+    }
+
+    #[test]
+    fn unattributed_root_share_reopens_exactly_when_an_entry_leaves() {
+        let mut pool = AttestationPool::new();
+        let blocks = BTreeSet::new();
+        for i in 0..MAX_PENDING_UNATTRIBUTED_ATTESTATIONS_PER_ROOT {
+            assert!(matches!(
+                pool.process(
+                    att(1 + i as u32, CURRENT_SLOT, 0xAA),
+                    CURRENT_SLOT,
+                    &committees(),
+                    &known(&blocks),
+                    &RootEchoVerifier,
+                    &AnyKey,
+                ),
+                GossipDecision::Hold { .. }
+            ));
+        }
+        let overflow = att(1, CURRENT_SLOT - 1, 0xAA);
+        assert!(matches!(
+            pool.process(
+                overflow.clone(),
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+            ),
+            GossipDecision::Ignore(IgnoreReason::PendingUnattributedRootLimit),
+        ));
+
+        let (released, remains) = pool.take_waiting_on_limit(&root(0xAA), 1);
+        assert_eq!(released.len(), 1);
+        assert!(remains);
+        assert_eq!(pool.pending_unattributed, 7);
+        assert_eq!(pool.pending_unattributed_by_root.get(&root(0xAA)), Some(&7));
+        assert!(matches!(
+            pool.process(
+                overflow,
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+            ),
+            GossipDecision::Hold { .. },
+        ));
+    }
+
+    #[test]
     fn one_source_cannot_fill_one_root_and_other_sources_keep_headroom() {
         let mut pool = AttestationPool::new();
         let blocks = BTreeSet::new();
@@ -1346,25 +1494,27 @@ mod tests {
             let validator = 1 + (i % 8) as u32;
             let slot = CURRENT_SLOT.saturating_sub((i / 8) as u64);
             assert!(matches!(
-                pool.process(
+                pool.process_from_source(
                     att(validator, slot, 0xAA),
                     CURRENT_SLOT,
                     &committees(),
                     &known(&blocks),
                     &RootEchoVerifier,
                     &AnyKey,
+                    Some([0x20 + (i / MAX_PENDING_ATTESTATIONS_PER_SOURCE_ROOT) as u8; 32]),
                 ),
                 GossipDecision::Hold { .. },
             ));
         }
         assert!(matches!(
-            pool.process(
+            pool.process_from_source(
                 att(3, CURRENT_SLOT - 1, 0xBB),
                 CURRENT_SLOT,
                 &committees(),
                 &known(&blocks),
                 &RootEchoVerifier,
                 &AnyKey,
+                Some([0x30; 32]),
             ),
             GossipDecision::Hold { .. },
         ));
@@ -1449,7 +1599,13 @@ mod tests {
                 h[..8].copy_from_slice(&root_index.to_le_bytes());
                 h
             };
-            let d = pool.process(signed(v, d0), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
+            let source_number = i / MAX_PENDING_ATTESTATIONS_PER_SOURCE as u64;
+            let mut source = [0u8; 32];
+            source[..8].copy_from_slice(&source_number.to_le_bytes());
+            let d = pool.process_from_source(
+                signed(v, d0), CURRENT_SLOT, &committees(), &known(&blocks),
+                &RootEchoVerifier, &AnyKey, Some(source),
+            );
             assert!(matches!(d, GossipDecision::Hold { .. }));
         }
         // Never exceeds capacity, and the evictees are exactly the oldest 8.
