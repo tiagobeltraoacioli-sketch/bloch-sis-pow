@@ -175,14 +175,6 @@ impl IdxEntry {
     }
 }
 
-fn write_index_entries<W: Write>(writer: &mut W, entries: &[IdxEntry]) -> io::Result<()> {
-    let mut buffered = BufWriter::with_capacity(INDEX_WRITE_BUFFER_BYTES, writer);
-    for entry in entries {
-        buffered.write_all(&entry.encode())?;
-    }
-    buffered.flush()
-}
-
 /// Records in an open index file (the magic is not one).
 fn idx_count(idx: &File) -> io::Result<u64> {
     let len = idx.metadata()?.len();
@@ -208,14 +200,14 @@ fn idx_read(idx: &mut File, i: u64) -> io::Result<IdxEntry> {
     IdxEntry::decode(&b)
 }
 
-/// Index records for every **complete** frame in `blocks.log` at or after
-/// `from`. Header-only reads: a rebuild of a 145 MB log touches one header
-/// per block and no body.
+/// Stream one index record for every **complete** frame in `blocks.log` at or
+/// after `from`. Header-only reads: a rebuild of a 145 MB log touches one
+/// header per block and no body.
 ///
 /// A torn trailing frame (crash mid-append) ends the scan without an error,
 /// exactly as `read_all` and `blocks_after` treat it — it is not indexed, so
 /// it cannot be served, which is the same answer the log itself gives.
-fn scan_index(log_path: &Path, from: u64) -> io::Result<Vec<IdxEntry>> {
+fn scan_index_into<W: Write>(log_path: &Path, from: u64, writer: &mut W) -> io::Result<()> {
     let log_len = fs::metadata(log_path)?.len();
     let mut f = io::BufReader::new(File::open(log_path)?);
     if from > 0 {
@@ -223,7 +215,6 @@ fn scan_index(log_path: &Path, from: u64) -> io::Result<Vec<IdxEntry>> {
     }
     let hdr_len = bloch_pos_committee::header::BlockHeaderV4::ENCODED_LEN;
     let mut at = from;
-    let mut out = Vec::new();
     let mut len4 = [0u8; 4];
     let mut hdr = [0u8; bloch_pos_committee::header::BlockHeaderV4::ENCODED_LEN];
     loop {
@@ -261,7 +252,7 @@ fn scan_index(log_path: &Path, from: u64) -> io::Result<Vec<IdxEntry>> {
         else {
             break;
         };
-        out.push(IdxEntry { slot: header.slot, offset: at, len: len as u32 });
+        writer.write_all(&IdxEntry { slot: header.slot, offset: at, len: len as u32 }.encode())?;
         // `len >= hdr_len` was already checked above (the `len < hdr_len`
         // arm breaks first), so this subtraction cannot underflow; written
         // as `checked_sub` so that invariant is enforced, not assumed.
@@ -273,7 +264,7 @@ fn scan_index(log_path: &Path, from: u64) -> io::Result<Vec<IdxEntry>> {
         }
         at = frame_end;
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Bring `idx` in line with a log of `log_len` bytes: rebuild it if it is
@@ -325,9 +316,10 @@ fn repair_index(idx: &mut File, log_path: &Path, log_len: u64) -> io::Result<()>
         covered = 0;
     }
     if covered < log_len {
-        let tail = scan_index(log_path, covered)?;
         idx.seek(SeekFrom::End(0))?;
-        write_index_entries(idx, &tail)?;
+        let mut buffered = BufWriter::with_capacity(INDEX_WRITE_BUFFER_BYTES, &mut *idx);
+        scan_index_into(log_path, covered, &mut buffered)?;
+        buffered.flush()?;
     }
     idx.sync_data()
 }
@@ -1578,6 +1570,20 @@ mod tests {
         }
     }
 
+    fn index_log_fixture(count: u64) -> (Vec<u8>, Vec<IdxEntry>) {
+        let mut log = Vec::new();
+        let mut entries = Vec::new();
+        let mut offset = 0u64;
+        for slot in 1..=count {
+            let payload = crate::codec::encode_envelope(&sample_envelope(slot));
+            entries.push(IdxEntry { slot, offset, len: payload.len() as u32 });
+            log.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            log.extend_from_slice(&payload);
+            offset = offset.saturating_add(4).saturating_add(payload.len() as u64);
+        }
+        (log, entries)
+    }
+
     #[test]
     fn replay_log_decode_streams_bounded_frames_and_preserves_tail_refusals() {
         let envelopes: Vec<_> = (1..=128).map(sample_envelope).collect();
@@ -1753,17 +1759,25 @@ mod tests {
             fn flush(&mut self) -> io::Result<()> { Ok(()) }
         }
 
-        let entries: Vec<_> = (0..1_000u64)
-            .map(|slot| IdxEntry { slot, offset: slot.saturating_mul(257), len: 253 })
-            .collect();
+        let dir = std::env::temp_dir().join(format!("bloch-index-stream-exact-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (log, entries) = index_log_fixture(1_000);
+        let log_path = dir.join("blocks.log");
+        fs::write(&log_path, log).unwrap();
         let mut expected = Vec::new();
         for entry in &entries { expected.extend_from_slice(&entry.encode()); }
         let mut writer = RecordingWriter::default();
-        write_index_entries(&mut writer, &entries).expect("stream index entries");
+        {
+            let mut buffered = BufWriter::with_capacity(INDEX_WRITE_BUFFER_BYTES, &mut writer);
+            scan_index_into(&log_path, 0, &mut buffered).expect("scan index entries");
+            buffered.flush().expect("flush index entries");
+        }
 
         assert_eq!(writer.bytes, expected, "buffering must not change index bytes or order");
         assert!(writer.largest <= INDEX_WRITE_BUFFER_BYTES);
         assert!(writer.writes > 1, "fixture must cross the fixed buffer boundary");
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1790,16 +1804,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bloch-index-buffer-fault-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        let mut log = Vec::new();
-        let mut entries = Vec::new();
-        let mut offset = 0u64;
-        for slot in 1..=500u64 {
-            let payload = crate::codec::encode_envelope(&sample_envelope(slot));
-            entries.push(IdxEntry { slot, offset, len: payload.len() as u32 });
-            log.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            log.extend_from_slice(&payload);
-            offset = offset.saturating_add(4).saturating_add(payload.len() as u64);
-        }
+        let (log, entries) = index_log_fixture(500);
         let log_path = dir.join("blocks.log");
         fs::write(&log_path, &log).unwrap();
 
@@ -1807,10 +1812,14 @@ mod tests {
             bytes: Vec::new(),
             remaining: INDEX_WRITE_BUFFER_BYTES.saturating_add(7),
         };
-        assert_eq!(
-            write_index_entries(&mut failed, &entries).unwrap_err().kind(),
-            io::ErrorKind::BrokenPipe,
-        );
+        {
+            let mut buffered = BufWriter::with_capacity(INDEX_WRITE_BUFFER_BYTES, &mut failed);
+            scan_index_into(&log_path, 0, &mut buffered).expect("scan reaches final flush");
+            assert_eq!(
+                buffered.flush().unwrap_err().kind(),
+                io::ErrorKind::BrokenPipe,
+            );
+        }
         assert_ne!(failed.bytes.len() % IDX_ENTRY_LEN as usize, 0, "fault must split a record");
         let idx_path = dir.join("blocks.idx");
         let mut damaged = IDX_MAGIC.to_vec();
@@ -1824,6 +1833,38 @@ mod tests {
         assert_eq!(fs::read(&idx_path).unwrap(), expected);
 
         drop(idx);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn streamed_index_scan_preserves_torn_and_corrupt_log_prefixes() {
+        let dir = std::env::temp_dir().join(format!("bloch-index-stream-prefix-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (valid, entries) = index_log_fixture(2);
+        let mut expected = IDX_MAGIC.to_vec();
+        for entry in &entries { expected.extend_from_slice(&entry.encode()); }
+
+        let mut torn = valid.clone();
+        torn.extend_from_slice(&[5, 0, 0, 0, 0xAA]);
+        let mut corrupt = valid;
+        corrupt.extend_from_slice(&1u32.to_le_bytes());
+        corrupt.push(0xFF);
+
+        for (name, log) in [("torn", torn), ("corrupt", corrupt)] {
+            let log_path = dir.join(format!("{name}.log"));
+            let idx_path = dir.join(format!("{name}.idx"));
+            fs::write(&log_path, &log).unwrap();
+            let mut idx = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(&idx_path)
+                .unwrap();
+            repair_index(&mut idx, &log_path, log.len() as u64).expect("repair valid prefix");
+            assert_eq!(fs::read(&idx_path).unwrap(), expected, "{name} tail changed valid prefix");
+        }
+
         let _ = fs::remove_dir_all(dir);
     }
 
