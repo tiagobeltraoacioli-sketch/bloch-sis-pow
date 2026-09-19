@@ -709,17 +709,18 @@ impl Keypair {
         // Legacy v2 keystores stored the RAW private key (no 4-byte suite envelope),
         // while newer keys and crypto::sign use the enveloped form. If this key is
         // un-enveloped, wrap it under the SAME suite the (enveloped) public key
-        // declares, so the signature matches the address's suite. Never mutates the
-        // stored key; only the bytes handed to sign().
-        let sk: std::borrow::Cow<[u8]> = if crypto::parse_envelope(&self.private_key).is_some() {
-            std::borrow::Cow::Borrowed(&self.private_key)
+        // declares, so the signature matches the address's suite. Never mutates
+        // the stored key. The temporary owned wrapper contains the entire secret,
+        // so keep it in zeroizing storage instead of a plain `Cow::Owned` buffer.
+        if crypto::parse_envelope(&self.private_key).is_some() {
+            crypto::sign(&self.private_key, msg).map_err(|e| e.to_string())
         } else {
             let suite = crypto::parse_envelope(&self.public_key)
                 .map(|(s, _)| s)
                 .unwrap_or(crypto::SUITE_MLDSA65_FALCON1024);
-            std::borrow::Cow::Owned(crypto::wrap_envelope(suite, &self.private_key))
-        };
-        crypto::sign(&sk, msg).map_err(|e| e.to_string())
+            let sk = Zeroizing::new(crypto::wrap_envelope(suite, &self.private_key));
+            crypto::sign(&sk, msg).map_err(|e| e.to_string())
+        }
     }
 
     /// Verify arbitrary wallet data while preserving legacy format compatibility.
@@ -1247,6 +1248,31 @@ mod legacy_sign_tests {
         let msg = b"experimental-tx-sighash";
         let sig = kp.sign(msg).expect("legacy sign must succeed");
         assert!(crypto::verify(&pk_env, msg, &sig), "signature must verify under enveloped pubkey");
+    }
+
+    /// The zeroizing legacy-wrapper path must remain fail-closed when hostile
+    /// wallet material has the expected raw shape but does not belong to the
+    /// stored public key. Some backends accept any correctly-sized secret
+    /// byte string and emit an unusable signature; others reject it. Neither
+    /// outcome may authenticate the corrupted wallet record.
+    #[test]
+    fn corrupted_legacy_raw_secret_never_authenticates() {
+        let (pk_env, sk_env) = crypto::generate_keypair();
+        let mut raw_sk = sk_env[crypto::SUITE_HEADER_LEN..].to_vec();
+        let middle = raw_sk.len() / 2;
+        raw_sk[middle] ^= 0x80;
+        let kp = Keypair {
+            private_key: raw_sk,
+            public_key: pk_env.clone(),
+            address: crypto::address_from_pubkey(&pk_env, false),
+        };
+        let message = b"wallet-legacy-secret-authentication-regression";
+        if let Ok(signature) = kp.sign(message) {
+            assert!(
+                !Keypair::verify(&pk_env, message, &signature),
+                "a signature from corrupted legacy secret bytes must not authenticate"
+            );
+        }
     }
 
     /// THE founder case: a fully PRE-ENVELOPE wallet — RAW pubkey AND RAW privkey,
