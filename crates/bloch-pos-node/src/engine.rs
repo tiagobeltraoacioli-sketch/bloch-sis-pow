@@ -130,6 +130,114 @@ pub enum EngineEvent {
     Rpc(RpcCall),
 }
 
+/// Maximum work admitted by the network queue plus the RPC listener's 64
+/// concurrent workers. Draining this much into the local scheduler makes a
+/// high-priority class visible even when it arrived behind the largest legal
+/// lower-priority backlog, while the per-turn processing limit below still
+/// returns to slot duties after bounded work.
+const ENGINE_SCHEDULER_CAP: usize = net::ENGINE_QUEUE_CAP + 64;
+const ENGINE_EVENTS_PER_TURN: usize = 32;
+
+/// Node-local fair scheduler for already-admitted work. FIFO is preserved
+/// inside each class; strict round-robin between non-empty classes prevents a
+/// transaction, attestation, block, or RPC flood from starving the others.
+struct FairQueue<T> {
+    classes: [VecDeque<T>; 4],
+    cursor: usize,
+}
+
+impl<T> Default for FairQueue<T> {
+    fn default() -> Self {
+        Self {
+            classes: std::array::from_fn(|_| VecDeque::new()),
+            cursor: 0,
+        }
+    }
+}
+
+impl<T> FairQueue<T> {
+    fn len(&self) -> usize {
+        self.classes.iter().fold(0usize, |total, queue| {
+            total.saturating_add(queue.len())
+        })
+    }
+
+    fn is_empty(&self) -> bool { self.len() == 0 }
+
+    fn push(&mut self, class: usize, event: T) {
+        self.classes[class % self.classes.len()].push_back(event);
+    }
+
+    fn pop_batch(&mut self, limit: usize) -> Vec<T> {
+        let mut batch = Vec::with_capacity(limit.min(self.len()));
+        while batch.len() < limit && !self.is_empty() {
+            for offset in 0..4 {
+                let class = self.cursor.saturating_add(offset) % 4;
+                let next = self.classes[class].pop_front();
+                if let Some(event) = next {
+                    batch.push(event);
+                    self.cursor = class.saturating_add(1) % 4;
+                    break;
+                }
+            }
+        }
+        batch
+    }
+}
+
+fn engine_event_class(event: &EngineEvent) -> usize {
+    match event {
+        EngineEvent::Net(NetEvent::Block(..)) => 0,
+        EngineEvent::Net(NetEvent::Attestation(..)) => 1,
+        EngineEvent::Net(NetEvent::Transaction(..)) => 2,
+        EngineEvent::Rpc(_) => 3,
+    }
+}
+
+#[cfg(test)]
+mod fair_engine_queue_tests {
+    use super::FairQueue;
+
+    #[test]
+    fn lower_priority_backlog_cannot_hide_other_admitted_classes() {
+        let mut queue = FairQueue::default();
+        for sequence in 0..4096 {
+            queue.push(2, (2usize, sequence));
+        }
+        queue.push(3, (3, 0));
+        queue.push(1, (1, 0));
+        queue.push(0, (0, 0));
+
+        assert_eq!(
+            queue.pop_batch(4),
+            vec![(0, 0), (1, 0), (2, 0), (3, 0)],
+            "every admitted class must receive headroom in the first turn",
+        );
+        assert_eq!(queue.pop_batch(2), vec![(2, 1), (2, 2)]);
+    }
+
+    #[test]
+    fn sustained_mixed_backlog_is_strict_round_robin_and_fifo_per_class() {
+        let mut queue = FairQueue::default();
+        for class in 0..4 {
+            for sequence in 0..64 {
+                queue.push(class, (class, sequence));
+            }
+        }
+
+        for turn in 0..8 {
+            let batch = queue.pop_batch(32);
+            let mut counts = [0usize; 4];
+            for (class, sequence) in batch {
+                assert_eq!(sequence, turn * 8 + counts[class]);
+                counts[class] = counts[class].saturating_add(1);
+            }
+            assert_eq!(counts, [8, 8, 8, 8]);
+        }
+        assert!(queue.is_empty());
+    }
+}
+
 /// Which transport the node runs.
 ///
 /// `Devnet` is still the default: a 64-validator devnet across five hosts
@@ -5636,6 +5744,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let mut metrics_sampled_slot: u64 = u64::MAX;
     let mut epoch_advance_warning_level: u8 = 0;
     let mut reported_fc_equivocators = None;
+    let mut admitted_work = FairQueue::default();
+    let mut engine_channel_open = true;
 
     loop {
         match engine.store.poll_rewrite() {
@@ -5891,25 +6001,38 @@ pub fn run(cfg: Config) -> io::Result<()> {
             slot_start.saturating_add(slot_ms) // a deadline
         };
         let wait = next_deadline.saturating_sub(now_ms()).clamp(1, 500);
-        match rx.recv_timeout(Duration::from_millis(wait)) {
-            Ok(ev) => {
-                let mut pending = vec![ev];
-                for _ in 1..32 {
-                    match rx.try_recv() { Ok(more) => pending.push(more), Err(_) => break }
+        if admitted_work.is_empty() && engine_channel_open {
+            match rx.recv_timeout(Duration::from_millis(wait)) {
+                Ok(event) => admitted_work.push(engine_event_class(&event), event),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => engine_channel_open = false,
+            }
+        }
+        while engine_channel_open && admitted_work.len() < ENGINE_SCHEDULER_CAP {
+            match rx.try_recv() {
+                Ok(event) => admitted_work.push(engine_event_class(&event), event),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    engine_channel_open = false;
+                    break;
                 }
-                // Queue telemetry, before the batch is worked: what the
-                // transports hold for this engine right now, and what they
-                // have shed since start (O06).
-                {
-                    use crate::metrics::{NodeMetrics, NODE};
-                    NodeMetrics::set(&NODE.net_queue_inflight, inflight.inflight() as u64);
-                    NodeMetrics::set(&NODE.net_queue_bytes, inflight.inflight_bytes() as u64);
-                    let (sb, sa, st) = inflight.shed();
-                    NodeMetrics::set(&NODE.net_shed_blocks_total, sb);
-                    NodeMetrics::set(&NODE.net_shed_attestations_total, sa);
-                    NodeMetrics::set(&NODE.net_shed_transactions_total, st);
-                }
-                for ev in pending {
+            }
+        }
+        if !admitted_work.is_empty() {
+            let pending = admitted_work.pop_batch(ENGINE_EVENTS_PER_TURN);
+            // Queue telemetry, before the batch is worked: what the
+            // transports hold for this engine right now, and what they
+            // have shed since start (O06).
+            {
+                use crate::metrics::{NodeMetrics, NODE};
+                NodeMetrics::set(&NODE.net_queue_inflight, inflight.inflight() as u64);
+                NodeMetrics::set(&NODE.net_queue_bytes, inflight.inflight_bytes() as u64);
+                let (sb, sa, st) = inflight.shed();
+                NodeMetrics::set(&NODE.net_shed_blocks_total, sb);
+                NodeMetrics::set(&NODE.net_shed_attestations_total, sa);
+                NodeMetrics::set(&NODE.net_shed_transactions_total, st);
+            }
+            for ev in pending {
                     // Every `EngineEvent::Net` was reserved in the budget by
                     // the transport; releasing it here — after handling, not
                     // on dequeue — is what makes the cap mean "work the engine
@@ -5956,15 +6079,13 @@ pub fn run(cfg: Config) -> io::Result<()> {
                             let _ = call.reply.send(result);
                         }
                     }
-                }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "network channel closed",
-                ));
-            }
+        }
+        if !engine_channel_open && admitted_work.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "network channel closed",
+            ));
         }
     }
 }
