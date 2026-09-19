@@ -167,7 +167,9 @@ impl HdWallet {
 
     /// Add a new address to the wallet, DERIVED from the seed at the next index.
     pub fn new_address(&mut self, label: &str) -> Result<&Keypair, String> {
-        let next_index = self.addresses.iter().map(|(i, _, _)| *i).max().unwrap_or(0)
+        let current_index = self.addresses.iter().map(|(i, _, _)| *i).max()
+            .ok_or_else(|| "HD wallet contains no addresses".to_string())?;
+        let next_index = current_index
             .checked_add(1).ok_or_else(|| "HD address index exhausted".to_string())?;
         let testnet = self.network == "testnet";
         let kp = derive_at(&self.seed, next_index, testnet)?;
@@ -188,7 +190,9 @@ impl HdWallet {
     /// wallet is unchanged; this consumes the supplied keypair. Keep its backup.
     /// Both import entry points report exhaustion without panicking or wrapping.
     pub fn try_import_keypair(&mut self, keypair: Keypair, label: &str) -> Result<(), String> {
-        let next_index = self.addresses.iter().map(|(i, _, _)| *i).max().unwrap_or(0)
+        let current_index = self.addresses.iter().map(|(i, _, _)| *i).max()
+            .ok_or_else(|| "HD wallet contains no addresses".to_string())?;
+        let next_index = current_index
             .checked_add(1).ok_or_else(|| "HD address index exhausted".to_string())?;
         self.addresses.push((next_index, keypair, label.to_string()));
         self.imported.insert(next_index);
@@ -355,6 +359,7 @@ fn validate_wallet_structure(wallet: &HdWalletFile) -> Result<(), String> {
         "mainnet" => crate::core::MAINNET_PREFIX,
         _ => return Err("unsupported wallet network".into()),
     };
+    if wallet.addresses.is_empty() { return Err("HD wallet contains no addresses".into()); }
     let mut indices = BTreeSet::new();
     for address in &wallet.addresses {
         if !indices.insert(address.index) { return Err("duplicate HD address index".into()); }
@@ -770,6 +775,9 @@ mod audit_wallet_boundaries {
         assert_eq!(validate_wallet_structure(&file).unwrap_err(), "derived address and wallet network differ");
         file.network = "unrecognized".into();
         assert_eq!(validate_wallet_structure(&file).unwrap_err(), "unsupported wallet network");
+        file.network = "testnet".into();
+        file.addresses.clear();
+        assert_eq!(validate_wallet_structure(&file).unwrap_err(), "HD wallet contains no addresses");
     }
 
     #[test]
@@ -806,5 +814,21 @@ mod audit_wallet_boundaries {
         assert!(wallet.imported.is_empty());
         assert_eq!(wallet.addresses[0].0, u32::MAX);
         assert_eq!(wallet.addresses[0].1.address, address);
+    }
+
+    #[test]
+    fn empty_wallet_state_is_refused_without_synthesizing_index_one() {
+        let mnemonic = Mnemonic::from_entropy(&[42;32]).unwrap();
+        let seed = mnemonic.to_seed("").to_vec();
+        let mut wallet = HdWallet { mnemonic, master_key:vec![0;32], seed,
+            addresses:Vec::new(), imported:BTreeSet::new(),
+            network:"testnet".into(), file_version:WALLET_VERSION };
+
+        assert_eq!(wallet.new_address("unexpected").unwrap_err(), "HD wallet contains no addresses");
+        let imported_key = derive_at(&wallet.seed, 0, true).unwrap();
+        assert_eq!(wallet.try_import_keypair(imported_key, "unexpected").unwrap_err(),
+            "HD wallet contains no addresses");
+        assert!(wallet.addresses.is_empty());
+        assert!(wallet.imported.is_empty());
     }
 }
