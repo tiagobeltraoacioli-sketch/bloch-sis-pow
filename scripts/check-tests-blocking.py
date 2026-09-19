@@ -58,6 +58,7 @@ workflow inheritance, branch protection, or shell execution semantics.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 import shlex
@@ -146,6 +147,30 @@ GITLAB_BUILD_TEST_BODY = (
     "-p pqcrypto-internals -p genesis4-ceremony",
     "timeout: 120m",
 )
+CI_SCRIPT_ENTRYPOINT_SHA256 = {
+    "deploy/bootnodes/verify-bootnodes.selftest.sh":
+        "95bb6c90d395f9a706f8349eede35330afd4b62e5979497fcaecc5410f0b3612",
+    "scripts/check-attested-ssh.py":
+        "c684c6adc23b1286a68c8205b0540a0b3673942d3e798e71a37e7be531fba602",
+    "scripts/check-attested-ssh.selftest.py":
+        "16245f0a98bf1ad1ea49ea930cbc1e3edd175f476617d7aee105c15ac4a6e9ac",
+    "scripts/check-live-node-retired-isolation.py":
+        "45ece7368931469c2c64c161708009b41aebcbf3c1033fa75006e16d5e16518d",
+    "scripts/check-tests-blocking.selftest.py":
+        "c0c598066436f115147714b279dd9f286dee96ffaa69b14e4d0179479c60026b",
+    "scripts/check-validator-lifecycle-mutations.py":
+        "a1b061037c6166bacbf4995d7710f1138023d92cdde4af2a8781528fa2b050e5",
+    "scripts/devnet-particao-report.test.py":
+        "468cab1a77759e7e63d4b18204b57ce9c9b2d6b68f6412a385d23fecea7c840e",
+    "scripts/rehearse-validator-activation.py":
+        "e2e527bb71046fb20b88003403b8cca633581839974a7ddb7f8e314e36d33762",
+    "scripts/rehearse-validator-activation.test.py":
+        "3a1188041f8541d47a8132639d4675822dfbb23d7b40f4d016da86be798121c9",
+    "scripts/rehearse-validator-admission.py":
+        "2992e7e32d51406665b57f74debb74cba2c073c1f11f6e8db3c56faf6faf6b65",
+    "scripts/rehearse-validator-joining-network.py":
+        "fb3b69d21805a6361d0737d64c50a225cf7a9d0389e954b8f0c0b049d99449e4",
+}
 
 ESCAPES = (
     (re.compile(r"(^|[;&|\s])exit\s+0\b"),            "an `exit 0` escape (the silent skip)"),
@@ -500,6 +525,52 @@ def check_gitlab_build_contract(body: list[str]) -> list[str]:
     return problems
 
 
+def check_ci_script_entrypoints(root: str) -> list[str]:
+    """Require every non-self CI script entrypoint to match reviewed bytes."""
+    commands = list(GITHUB_CARGO_TEST_RUNS) + list(GITLAB_BUILD_TEST_SCRIPT)
+    commands += [value for kind, value, _ in GITHUB_TEST_GUARD_STEPS if kind == "run"]
+    invoked = set()
+    for command in commands:
+        for line in command.splitlines():
+            match = re.match(r"^(?:python3|bash)\s+([A-Za-z0-9_./-]+)(?:\s|$)", line.strip())
+            if match:
+                invoked.add(match.group(1))
+
+    # This checker cannot contain its own digest without an impossible
+    # self-referential hash. Its behavior is instead proved by the selftest,
+    # whose bytes are pinned here; the exact CI job runs selftest before guard.
+    invoked.discard("scripts/check-tests-blocking.py")
+    declared = set(CI_SCRIPT_ENTRYPOINT_SHA256)
+    problems = []
+    if invoked != declared:
+        missing = sorted(invoked - declared)
+        stale = sorted(declared - invoked)
+        problems.append(
+            "CI script digest scope differs from exact job contracts "
+            f"(missing={missing}, stale={stale})")
+
+    for relative, expected in sorted(CI_SCRIPT_ENTRYPOINT_SHA256.items()):
+        path = os.path.join(root, relative)
+        component = root
+        traverses_symlink = os.path.islink(component)
+        for part in relative.split("/"):
+            component = os.path.join(component, part)
+            traverses_symlink = traverses_symlink or os.path.islink(component)
+        if traverses_symlink:
+            problems.append(
+                f"CI script entrypoint `{relative}` is or traverses a symlink")
+            continue
+        if not os.path.isfile(path):
+            problems.append(f"CI script entrypoint `{relative}` is MISSING or not a regular file")
+            continue
+        with open(path, "rb") as fh:
+            actual = hashlib.sha256(fh.read()).hexdigest()
+        if actual != expected:
+            problems.append(
+                f"CI script entrypoint `{relative}` digest differs from reviewed content")
+    return problems
+
+
 def check_gitlab_job_context(body: list[str], job: str, indent: int) -> list[str]:
     problems = []
     for line in body:
@@ -647,12 +718,15 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--gitlab", default=os.path.join(REPO, ".gitlab-ci.yml"))
     ap.add_argument("--github", default=os.path.join(REPO, ".github/workflows/tests.yml"))
+    ap.add_argument("--entrypoint-root", default=REPO,
+                    help="repository root used for local entrypoint integrity checks")
     args = ap.parse_args()
 
     problems = []
     problems += check_job(args.gitlab, "build-and-test", 0, ".gitlab-ci.yml")
     problems += check_job(args.github, "cargo-test", 2, ".github/workflows/tests.yml")
     problems += check_github_test_guard(args.github)
+    problems += check_ci_script_entrypoints(args.entrypoint_root)
 
     if problems:
         print("test-posture guard: FAIL — %d problem(s)\n" % len(problems))

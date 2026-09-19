@@ -15,6 +15,8 @@ directions:
     (allow_failure, continue-on-error, exit 0, when: manual);
   * the honest exact GitLab/GitHub contracts stay green, including a comment
     that merely mentions `allow_failure` next to a gated job.
+  * missing, replaced, or symlinked local script entrypoints fail their byte
+    integrity contract while the checked-in entrypoints stay green.
 
 Run: python3 scripts/check-tests-blocking.selftest.py
 Exit 0 = the guard behaves as documented on all cases.
@@ -537,6 +539,19 @@ def run(case: Case, tmp: str) -> tuple[int, str]:
     return proc.returncode, proc.stdout + proc.stderr
 
 
+def run_with_entrypoint_root(tmp: str, root: str) -> tuple[int, str]:
+    gl = os.path.join(tmp, "entrypoint-gitlab-ci.yml")
+    gh = os.path.join(tmp, "entrypoint-tests.yml")
+    for path, body in ((gl, GOOD_GITLAB), (gh, GOOD_GITHUB)):
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+    proc = subprocess.run(
+        [sys.executable, CHECKER, "--gitlab", gl, "--github", gh,
+         "--entrypoint-root", root],
+        capture_output=True, text=True)
+    return proc.returncode, proc.stdout + proc.stderr
+
+
 def main() -> int:
     failures = []
     with tempfile.TemporaryDirectory() as tmp:
@@ -551,13 +566,37 @@ def main() -> int:
                     "%s: guard failed, but not for the stated reason (%r absent):\n%s"
                     % (case.name, case.expect, out))
 
+        missing_root = os.path.join(tmp, "missing-entrypoints")
+        os.makedirs(missing_root)
+        code, out = run_with_entrypoint_root(tmp, missing_root)
+        if code == 0 or "is MISSING or not a regular file" not in out:
+            failures.append("missing entrypoint: expected named fail-closed error:\n%s" % out)
+
+        replaced_root = os.path.join(tmp, "replaced-entrypoints")
+        replaced = os.path.join(replaced_root, "scripts", "check-attested-ssh.py")
+        os.makedirs(os.path.dirname(replaced))
+        with open(replaced, "w", encoding="utf-8") as fh:
+            fh.write("#!/usr/bin/env python3\nraise SystemExit(0)\n")
+        code, out = run_with_entrypoint_root(tmp, replaced_root)
+        if code == 0 or "`scripts/check-attested-ssh.py` digest differs" not in out:
+            failures.append("replaced entrypoint: expected digest failure:\n%s" % out)
+
+        symlink_root = os.path.join(tmp, "symlink-entrypoints")
+        symlink = os.path.join(symlink_root, "scripts", "check-attested-ssh.py")
+        os.makedirs(os.path.dirname(symlink))
+        os.symlink(CHECKER, symlink)
+        code, out = run_with_entrypoint_root(tmp, symlink_root)
+        if code == 0 or "`scripts/check-attested-ssh.py` is or traverses a symlink" not in out:
+            failures.append("symlink entrypoint: expected symlink failure:\n%s" % out)
+
     if failures:
         print("check-tests-blocking selftest: FAIL — %d case(s)\n" % len(failures))
         for f in failures:
             print("  * %s" % f)
         return 1
 
-    print("check-tests-blocking selftest: OK — %d cases behave as documented" % len(CASES))
+    print("check-tests-blocking selftest: OK — %d cases behave as documented"
+          % (len(CASES) + 3))
     return 0
 
 
