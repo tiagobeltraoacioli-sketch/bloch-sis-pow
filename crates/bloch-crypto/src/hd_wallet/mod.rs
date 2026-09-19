@@ -564,6 +564,24 @@ struct WalletRecordLimitSeed {
     max_derived_key_checks: Option<usize>,
 }
 
+const HD_WALLET_FIELDS: &[&str] = &[
+    "version",
+    "format",
+    "network",
+    "mnemonic_crypto",
+    "addresses",
+    "created_at",
+    "description",
+];
+
+const HD_ADDRESS_FIELDS: &[&str] = &[
+    "index",
+    "address",
+    "label",
+    "keypair_crypto",
+    "derived",
+];
+
 impl<'de> DeserializeSeed<'de> for WalletRecordLimitSeed {
     type Value = ();
 
@@ -571,10 +589,18 @@ impl<'de> DeserializeSeed<'de> for WalletRecordLimitSeed {
     where
         D: serde::Deserializer<'de>,
     {
-        deserializer.deserialize_map(WalletRecordLimitVisitor {
-            max_addresses: self.max_addresses,
-            max_derived_key_checks: self.max_derived_key_checks,
-        })
+        // Match HdWalletFile's derived Deserialize entry point exactly.
+        // serde_json accepts a struct as either a keyed object or a positional
+        // sequence; the preflight must account both shapes before the real
+        // deserializer is allowed to allocate either one.
+        deserializer.deserialize_struct(
+            "HdWalletFile",
+            HD_WALLET_FIELDS,
+            WalletRecordLimitVisitor {
+                max_addresses: self.max_addresses,
+                max_derived_key_checks: self.max_derived_key_checks,
+            },
+        )
     }
 }
 
@@ -608,6 +634,40 @@ impl<'de> Visitor<'de> for WalletRecordLimitVisitor {
             } else {
                 map.next_value::<IgnoredAny>()?;
             }
+        }
+        Ok(())
+    }
+
+    fn visit_seq<S>(self, mut sequence: S) -> Result<Self::Value, S::Error>
+    where
+        S: SeqAccess<'de>,
+    {
+        // Derived HdWalletFile order: version, format, network,
+        // mnemonic_crypto, addresses, created_at, description. Missing or
+        // ill-typed non-accounting fields are left for the real deserializer;
+        // this pass only needs to reach and bound `addresses` without
+        // retaining the preceding values.
+        for _ in 0..4 {
+            if sequence.next_element::<IgnoredAny>()?.is_none() {
+                return Ok(());
+            }
+        }
+        if sequence
+            .next_element_seed(AddressSequenceLimitSeed {
+                max_addresses: self.max_addresses,
+                max_derived_key_checks: self.max_derived_key_checks,
+            })?
+            .is_none()
+        {
+            return Ok(());
+        }
+        for _ in 0..2 {
+            if sequence.next_element::<IgnoredAny>()?.is_none() {
+                return Ok(());
+            }
+        }
+        if sequence.next_element::<IgnoredAny>()?.is_some() {
+            return Err(de::Error::invalid_length(8, &self));
         }
         Ok(())
     }
@@ -681,10 +741,14 @@ impl<'de> DeserializeSeed<'de> for AddressRecordLimitSeed<'_> {
                 *self.addresses, self.max_addresses
             )));
         }
-        deserializer.deserialize_map(AddressRecordLimitVisitor {
-            derived_key_checks: self.derived_key_checks,
-            max_derived_key_checks: self.max_derived_key_checks,
-        })
+        deserializer.deserialize_struct(
+            "HdAddress",
+            HD_ADDRESS_FIELDS,
+            AddressRecordLimitVisitor {
+                derived_key_checks: self.derived_key_checks,
+                max_derived_key_checks: self.max_derived_key_checks,
+            },
+        )
     }
 }
 
@@ -725,6 +789,35 @@ impl<'de> Visitor<'de> for AddressRecordLimitVisitor<'_> {
             } else {
                 map.next_value::<IgnoredAny>()?;
             }
+        }
+        Ok(())
+    }
+
+    fn visit_seq<S>(self, mut sequence: S) -> Result<Self::Value, S::Error>
+    where
+        S: SeqAccess<'de>,
+    {
+        // Derived HdAddress order: index, address, label, keypair_crypto,
+        // derived. The outer seed has already charged this record before any
+        // of these payload fields are visited.
+        for _ in 0..4 {
+            if sequence.next_element::<IgnoredAny>()?.is_none() {
+                return Ok(());
+            }
+        }
+        if sequence.next_element::<bool>()?.unwrap_or(false) {
+            *self.derived_key_checks += 1;
+            if let Some(limit) = self.max_derived_key_checks {
+                if *self.derived_key_checks > limit {
+                    return Err(de::Error::custom(format_args!(
+                        "HD wallet derived-key check count {} exceeds configured limit {}",
+                        *self.derived_key_checks, limit
+                    )));
+                }
+            }
+        }
+        if sequence.next_element::<IgnoredAny>()?.is_some() {
+            return Err(de::Error::invalid_length(6, &self));
         }
         Ok(())
     }
@@ -1339,6 +1432,115 @@ mod audit_wallet_boundaries {
         let hostile_overflow = br#"{"addresses":[{}, {}, {"huge": "#;
         assert_eq!(
             preflight_wallet_record_limits(hostile_overflow, 2, None).unwrap_err(),
+            "HD wallet address count 3 exceeds configured limit 2"
+        );
+    }
+
+    #[test]
+    fn json_preflight_matches_serde_struct_sequence_semantics_and_limits() {
+        fn positional_struct(
+            value: serde_json::Value,
+            fields: &[&str],
+        ) -> serde_json::Value {
+            let mut object = value.as_object().cloned().expect("serialized struct object");
+            serde_json::Value::Array(
+                fields
+                    .iter()
+                    .map(|field| object.remove(*field).expect("serialized struct field"))
+                    .collect(),
+            )
+        }
+
+        let crypto = encrypt_with_key(&[0; 32], b"fixture").unwrap();
+        let file = HdWalletFile {
+            version: 3,
+            format: "hd-wallet-v1".into(),
+            network: "testnet".into(),
+            mnemonic_crypto: crypto.clone(),
+            addresses: vec![
+                HdAddress {
+                    index: 0,
+                    address: format!("{}derived", TESTNET_PREFIX),
+                    label: "derived".into(),
+                    keypair_crypto: crypto.clone(),
+                    derived: true,
+                },
+                HdAddress {
+                    index: 1,
+                    address: format!("{}imported", TESTNET_PREFIX),
+                    label: "imported".into(),
+                    keypair_crypto: crypto,
+                    derived: false,
+                },
+            ],
+            created_at: String::new(),
+            description: String::new(),
+        };
+
+        let map_bytes = serde_json::to_vec(&file).unwrap();
+        let mut top = serde_json::to_value(&file)
+            .unwrap()
+            .as_object()
+            .cloned()
+            .unwrap();
+        let positional_addresses = top
+            .remove("addresses")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .cloned()
+            .map(|address| positional_struct(address, HD_ADDRESS_FIELDS))
+            .collect();
+        top.insert(
+            "addresses".into(),
+            serde_json::Value::Array(positional_addresses),
+        );
+        let sequence_bytes = serde_json::to_vec(&positional_struct(
+            serde_json::Value::Object(top),
+            HD_WALLET_FIELDS,
+        ))
+        .unwrap();
+
+        // Both representations are accepted by HdWalletFile's actual Serde
+        // implementation and must receive identical preflight accounting.
+        assert_eq!(
+            serde_json::from_slice::<HdWalletFile>(&sequence_bytes)
+                .unwrap()
+                .addresses
+                .len(),
+            2
+        );
+        let path = std::env::temp_dir().join(format!(
+            "bloch-hd-positional-preflight-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, &sequence_bytes).unwrap();
+        assert_eq!(
+            HdWalletFile::read_public_with_limits(&path, sequence_bytes.len(), 2)
+                .unwrap()
+                .addresses
+                .len(),
+            2
+        );
+        std::fs::remove_file(path).unwrap();
+        for bytes in [&map_bytes[..], &sequence_bytes[..]] {
+            assert!(preflight_wallet_record_limits(bytes, 2, Some(1)).is_ok());
+            assert_eq!(
+                preflight_wallet_record_limits(bytes, 1, Some(1)).unwrap_err(),
+                "HD wallet address count 2 exceeds configured limit 1"
+            );
+            assert_eq!(
+                preflight_wallet_record_limits(bytes, 2, Some(0)).unwrap_err(),
+                "HD wallet derived-key check count 1 exceeds configured limit 0"
+            );
+        }
+
+        // Sequence form keeps the same early-charge guarantee: the third
+        // record is counted before its truncated payload is parsed.
+        let hostile_sequence = br#"[null,null,null,null,[[],[],["#;
+        assert_eq!(
+            preflight_wallet_record_limits(hostile_sequence, 2, None).unwrap_err(),
             "HD wallet address count 3 exceeds configured limit 2"
         );
     }

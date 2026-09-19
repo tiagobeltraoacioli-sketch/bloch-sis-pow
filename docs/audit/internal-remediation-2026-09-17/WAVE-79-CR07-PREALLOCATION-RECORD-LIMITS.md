@@ -26,6 +26,15 @@ error text, unknown-field behavior, the HD-wallet schema, cryptography and
 trusted compatibility entry points remain unchanged. Duplicate resource fields
 are rejected consistently instead of creating ambiguous preflight accounting.
 
+A separate adversarial review caught one compatibility edge in the first
+implementation: Serde's derived struct decoder accepts both keyed JSON objects
+and positional JSON sequences, while the preflight initially requested a map
+only. The visitor now enters through `deserialize_struct`, exactly like the
+real `HdWalletFile` and `HdAddress` decoders, and implements both `visit_map`
+and `visit_seq`. Positional address records are still charged by the outer seed
+before any of their fields are visited, so compatibility does not weaken the
+allocation boundary.
+
 ## Adversarial regression
 
 The new regression proves that two records and one derived record are accepted
@@ -38,12 +47,19 @@ entry rather than allocated and inspected first.
 The prior authentic 1,024/1,025 public-wallet and 256/257 derived-work boundary
 tests continue to pass through the production APIs.
 
+An additional parity regression constructs a genuine wallet in both keyed and
+Serde-supported positional forms. It proves that the real decoder accepts the
+sequence, that both representations receive identical aggregate and derived
+limits, and that a truncated third positional record returns the address-cap
+error before parsing its payload.
+
 ## Validation
 
 - `cargo test -p bloch-crypto json_preflight_enforces_exact_record_limits_before_full_allocation --offline`: passed.
 - `cargo test -p bloch-crypto bounded_default_accepts_exact_work_limits_and_rejects_each_excess --offline`: passed.
 - `cargo test -p bloch-crypto public_metadata_reader_accepts_exact_bounds_and_rejects_each_excess --offline`: passed.
-- `cargo test -p bloch-crypto --offline`: library 199 passed, 0 failed, 2 ignored; integration 6 passed, 0 failed; doc tests 2 ignored. The complete run used the approved unsandboxed test prefix because three HTTP regressions bind loopback sockets.
+- `cargo test -p bloch-crypto json_preflight_matches_serde_struct_sequence_semantics_and_limits --offline`: passed.
+- `cargo test -p bloch-crypto --offline`: library 200 passed, 0 failed, 2 ignored; integration 6 passed, 0 failed; doc tests 2 ignored. The complete run used the approved unsandboxed test prefix because three HTTP regressions bind loopback sockets.
 - `git diff --check` on the wallet source and this report: passed.
 
 ## Residual risk
