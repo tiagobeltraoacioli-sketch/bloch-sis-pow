@@ -456,8 +456,12 @@ impl DutySyncGate {
 /// Keeping the decision outside `attest`/`propose` is intentional: neither
 /// method may call `rolled_to` (or consume a
 /// slashing-protection watermark) until this predicate has passed.
-fn validator_duties_blocked(in_boot_grace: bool, stale_head_quarantined: bool) -> bool {
-    in_boot_grace || stale_head_quarantined
+fn validator_duties_blocked(
+    in_boot_grace: bool,
+    stale_head_quarantined: bool,
+    ready_future_blocks_pending: bool,
+) -> bool {
+    in_boot_grace || stale_head_quarantined || ready_future_blocks_pending
 }
 
 const NO_TXS: [PosTransaction; 0] = [];
@@ -625,6 +629,13 @@ const MAX_TXS_PER_BLOCK: usize = 256;
 /// up to 64 ahead of wall clock, so the walk is at most two `close_epoch`
 /// turns. That is the point — bounded, not zero.
 const MAX_FUTURE_SLOTS: u64 = 2 * bloch_pos_committee::params::SLOTS_PER_EPOCH;
+
+/// Authenticated future blocks reprocessed between two slot-loop turns.
+/// One block can execute a transition and rebuild fork choice, so releasing
+/// the whole 32-entry pool at a slot boundary would bypass the scheduler's
+/// one-block slice. Duties remain gated until every now-eligible block has
+/// crossed this one-at-a-time path.
+const FUTURE_BLOCKS_PER_TURN: usize = 1;
 
 /// How many recently-applied canonical post-states are retained so a reorg
 /// can start from the fork point instead of from genesis.
@@ -3261,17 +3272,22 @@ impl Engine {
         None
     }
 
-    /// Release authenticated future blocks only once their slot arrives.
-    fn release_future_blocks(&mut self, slot: u64) {
+    /// Release at most `limit` authenticated future blocks whose slot arrived.
+    /// Returns whether another eligible block remains, allowing the caller to
+    /// gate duties and immediately give it a fresh bounded loop turn.
+    fn release_future_blocks(&mut self, slot: u64, limit: usize) -> bool {
         let ready: Vec<_> = self.future_blocks.iter()
             .filter(|(_, (block, _))| block.header.slot <= slot)
             .map(|(id, _)| *id)
+            .take(limit)
             .collect();
         for id in ready {
             if let Some((block, source)) = self.future_blocks.remove(&id) {
                 self.ingest_from_judged(block, source);
             }
         }
+        self.future_blocks.values()
+            .any(|(block, _)| block.header.slot <= slot)
     }
 
     /// Make the canonical chain equal the LMD-GHOST head.
@@ -5891,11 +5907,19 @@ pub fn run(cfg: Config) -> io::Result<()> {
             // reads no clock of its own, so this is the only thing that bounds
             // it — without the call its `seen` map grows with uptime.
             engine.att_pool.prune(slot);
-            engine.release_future_blocks(slot);
         }
+        // Future admission already reported `Ignore` and retained its source.
+        // Reprocessing is local and silent, one block per loop turn. Keep
+        // duties gated and spin directly into the next turn while an eligible
+        // tail remains: signing before it drains would use a partial view;
+        // sleeping or serving another full batch would defer that view.
+        let ready_future_blocks_pending = engine.release_future_blocks(
+            slot,
+            FUTURE_BLOCKS_PER_TURN,
+        );
 
         if let Some(stop) = cfg.stop_at_slot {
-            if slot >= stop {
+            if slot >= stop && !ready_future_blocks_pending {
                 if engine.store.flush_rewrite()? {
                     if let Err(e) = engine.write_local_cache() {
                         eprintln!("state-cache: shutdown post-reorg write failed; restart may require full replay: {e}");
@@ -5947,7 +5971,11 @@ pub fn run(cfg: Config) -> io::Result<()> {
         // Do not spend a signing watermark or broadcast locally produced work
         // until that canonical generation is durable. RPC/network handling
         // remains responsive while the writer runs.
-        let duties_blocked = validator_duties_blocked(in_grace, stale_head_quarantined)
+        let duties_blocked = validator_duties_blocked(
+            in_grace,
+            stale_head_quarantined,
+            ready_future_blocks_pending,
+        )
             || engine.store.rewrite_pending();
 
         // Ask for the missing history before considering local signatures.
@@ -6099,6 +6127,13 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 );
             }
             finality_stalled = stalled_now;
+        }
+
+        if ready_future_blocks_pending {
+            // Do not sleep or process a second block through the admitted-work
+            // scheduler before the next slot/duty check. The future pool is
+            // capped, so this immediate drain is itself bounded.
+            continue;
         }
 
         let next_deadline = if slot > last_built && now < propose_at {
@@ -11770,6 +11805,40 @@ mod ingest_admission_tests {
     }
 
     #[test]
+    fn ready_future_block_release_is_sliced_and_gates_duties() {
+        let _clock = validator_lifecycle::clock_at(0);
+        let (mut engine, _dir, template, stored) = fixture();
+        let first = repointed(&engine, &template, [0xB1; 32], template.header.slot);
+        let second = repointed(
+            &engine,
+            &template,
+            [0xB2; 32],
+            template.header.slot.saturating_add(1),
+        );
+
+        assert_eq!(engine.ingest_judged(first), Verdict::Ignore);
+        assert_eq!(engine.ingest_judged(second), Verdict::Ignore);
+        assert_eq!(engine.future_blocks.len(), 2);
+        assert_eq!(engine.blocks.len(), stored);
+
+        let release_slot = template.header.slot.saturating_add(1);
+        let _release_clock = validator_lifecycle::clock_at(release_slot);
+        let pending = engine.release_future_blocks(release_slot, FUTURE_BLOCKS_PER_TURN);
+        assert!(pending, "one ready block must remain for a fresh loop turn");
+        assert_eq!(engine.future_blocks.len(), 1);
+        assert!(
+            validator_duties_blocked(false, false, pending),
+            "duties cannot sign from a partially released future view",
+        );
+
+        let pending = engine.release_future_blocks(release_slot, FUTURE_BLOCKS_PER_TURN);
+        assert!(!pending);
+        assert!(engine.future_blocks.is_empty());
+        assert_eq!(engine.orphans.len(), 2, "neither ready block was stranded");
+        assert!(!validator_duties_blocked(false, false, pending));
+    }
+
+    #[test]
     fn audit_duplicate_parked_header_stops_before_body_revalidation() {
         let _clock = validator_lifecycle::clock_at(32);
         let (mut engine, _dir, template, _) = fixture();
@@ -12052,10 +12121,10 @@ mod ingest_admission_tests {
         );
         assert_eq!(engine.blocks.len(), stored, "future gossip cannot enter fork choice");
         assert_eq!(engine.rejected_future, 1, "and nothing more was refused");
-        engine.release_future_blocks(release_slot - 1);
+        assert!(!engine.release_future_blocks(release_slot - 1, FUTURE_BLOCKS_PER_TURN));
         assert_eq!(engine.future_blocks.len(), 1);
         let _clock = validator_lifecycle::clock_at(release_slot);
-        engine.release_future_blocks(release_slot);
+        assert!(!engine.release_future_blocks(release_slot, FUTURE_BLOCKS_PER_TURN));
         assert!(engine.future_blocks.is_empty());
         assert_eq!(engine.orphans.len(), 1, "at its slot the unknown-parent block follows normal ingestion");
         assert_eq!(
@@ -13129,7 +13198,7 @@ mod stale_head_duty_gate_tests {
     #[test]
     fn a_normal_one_slot_head_gap_does_not_block_duties() {
         assert!(!node_is_behind(99, 100, 50_000, 0, 20_000));
-        assert!(!validator_duties_blocked(false, false));
+        assert!(!validator_duties_blocked(false, false, false));
     }
 
     #[test]
@@ -13144,12 +13213,12 @@ mod stale_head_duty_gate_tests {
         assert!(behind);
         let mut gate = DutySyncGate::default();
         assert!(gate.update(behind, 90, 100, 50_001, 20_000));
-        assert!(validator_duties_blocked(false, true));
+        assert!(validator_duties_blocked(false, true, false));
     }
 
     #[test]
     fn boot_grace_uses_the_same_final_gate() {
-        assert!(validator_duties_blocked(true, false));
+        assert!(validator_duties_blocked(true, false, false));
     }
 
     #[test]
