@@ -230,6 +230,82 @@ fn build_tool_digest(command: &str) -> Option<String> {
     Some(hex(&h.finalize()))
 }
 
+/// Return the executable portion of a configured tool command. Cargo and the
+/// `cc` crate accept either a bare executable/path or a wrapper followed by
+/// arguments. In the latter case the wrapper is the program the build invokes
+/// directly, so fingerprint that boundary and leave delegated tools explicit
+/// in the residual rather than guessing at shell semantics.
+fn configured_program(command: &str) -> Option<&str> {
+    let command = command.trim();
+    if command.is_empty() {
+        return None;
+    }
+    let first = command.as_bytes()[0];
+    if first == b'\'' || first == b'"' {
+        let quote = first as char;
+        let rest = &command[1..];
+        let end = rest.find(quote)?;
+        return (end > 0).then(|| &rest[..end]);
+    }
+    command.split_ascii_whitespace().next()
+}
+
+/// Build environment variables whose value begins with an executable. This
+/// deliberately excludes flags and SDK directories. Target/host spellings are
+/// already enumerated by `exact_build_env`; prefix forms cover the variants
+/// that Cargo and cc-rs may actually export.
+fn configured_tool_key(key: &str) -> bool {
+    matches!(
+        key,
+        "AR"
+            | "CARGO_BUILD_RUSTC"
+            | "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"
+            | "CARGO_BUILD_RUSTC_WRAPPER"
+            | "CC"
+            | "CXX"
+            | "HOST_AR"
+            | "HOST_CC"
+            | "HOST_CXX"
+            | "HOST_RANLIB"
+            | "RANLIB"
+            | "RUSTC_LINKER"
+            | "RUSTC_WORKSPACE_WRAPPER"
+            | "RUSTC_WRAPPER"
+            | "TARGET_AR"
+            | "TARGET_CC"
+            | "TARGET_CXX"
+            | "TARGET_RANLIB"
+    ) || key.starts_with("AR_")
+        || key.starts_with("CC_")
+        || key.starts_with("CXX_")
+        || key.starts_with("RANLIB_")
+        || (key.starts_with("CARGO_TARGET_") && key.ends_with("_LINKER"))
+}
+
+/// Fingerprint every explicitly configured compiler/linker/archive/wrapper
+/// executable without disclosing its command or path. The environment value
+/// itself is separately included in the canonical build-environment fields.
+fn configured_tool_digests(target: &str, host: &str) -> Vec<(String, String)> {
+    let mut keys = exact_build_env(target, host);
+    keys.extend(
+        std::env::vars()
+            .map(|(key, _)| key)
+            .filter(|key| relevant_build_env(key)),
+    );
+    keys.sort();
+    keys.dedup();
+
+    keys.into_iter()
+        .filter(|key| configured_tool_key(key))
+        .filter_map(|key| {
+            let value = std::env::var(&key).ok()?;
+            let program = configured_program(&value)?;
+            let digest = build_tool_digest(program)?;
+            Some((key, digest))
+        })
+        .collect()
+}
+
 /// Fingerprint the compiler implementation and target standard library that
 /// `rustc` selected from its sysroot. Hashing this small, load-bearing subset
 /// avoids walking an entire toolchain while binding more than version text or
@@ -353,6 +429,7 @@ fn build_environment_digest(
     rustc_binary_digest: Option<String>,
     cargo_binary_digest: Option<String>,
     rust_sysroot_digest: Option<String>,
+    configured_tool_digests: &[(String, String)],
     profile: &str,
     target: &str,
     host: &str,
@@ -373,6 +450,9 @@ fn build_environment_digest(
         ("rustc-version".to_owned(), Some(rustc_verbose.to_owned())),
         ("target".to_owned(), Some(target.to_owned())),
     ];
+    fields.extend(configured_tool_digests.iter().map(|(key, digest)| {
+        (format!("configured-tool-binary-sha3-256:{key}"), Some(digest.clone()))
+    }));
     for key in watched {
         let value = match std::env::var(&key) {
             Ok(value) => Some(value),
@@ -526,6 +606,8 @@ fn main() {
     let rustc_binary_digest = build_tool_digest(&rustc);
     let cargo_binary_digest = build_tool_digest(&cargo);
     let (rust_sysroot_digest, rust_sysroot_components) = rust_sysroot_digest(&rustc);
+    let configured_tool_digests = configured_tool_digests(&target, &host);
+    let configured_tool_binaries = configured_tool_digests.len();
     let tool_binaries = usize::from(rustc_binary_digest.is_some())
         + usize::from(cargo_binary_digest.is_some());
     let (environment_digest, environment_fields) = build_environment_digest(
@@ -534,6 +616,7 @@ fn main() {
         rustc_binary_digest,
         cargo_binary_digest,
         rust_sysroot_digest,
+        &configured_tool_digests,
         &profile,
         &target,
         &host,
@@ -546,6 +629,7 @@ fn main() {
     println!("cargo:rustc-env=BLOCH_BUILD_ENV_FIELDS={environment_fields}");
     println!("cargo:rustc-env=BLOCH_BUILD_TOOL_BINARIES={tool_binaries}");
     println!("cargo:rustc-env=BLOCH_BUILD_SYSROOT_COMPONENTS={rust_sysroot_components}");
+    println!("cargo:rustc-env=BLOCH_BUILD_CONFIGURED_TOOL_BINARIES={configured_tool_binaries}");
 
     // ── `BLOCH_BUILD_DIRTY` is deliberately NOT stamped ────────────────────
     //

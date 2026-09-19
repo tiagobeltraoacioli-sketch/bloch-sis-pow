@@ -1681,6 +1681,7 @@ fn getbuildinfo_reports_the_fields_a_partner_compares() {
         "build_environment_fields",
         "build_tool_binaries_hashed",
         "build_sysroot_components_hashed",
+        "build_configured_tool_binaries_hashed",
         "digest_note",
     ] {
         let f = v.get(k).unwrap_or_else(|| panic!("getbuildinfo has no `{k}`"));
@@ -1777,6 +1778,7 @@ fn getbuildinfo_carries_a_bounded_build_environment_fingerprint() {
     assert!(scope.contains("values hashed"));
     assert!(scope.contains("not directly disclosed"));
     assert!(scope.contains("executable bytes"));
+    assert!(scope.contains("configured linker/compiler/archive/wrapper bytes"));
     assert_eq!(
         v.get("build_tool_binaries_hashed").unwrap().as_str(),
         Some("2"),
@@ -1792,6 +1794,17 @@ fn getbuildinfo_carries_a_bounded_build_environment_fingerprint() {
     assert!(
         sysroot_components >= 2,
         "workspace builds must bind rustc and at least one target libstd component",
+    );
+    let configured_tool_binaries: usize = v
+        .get("build_configured_tool_binaries_hashed")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        configured_tool_binaries <= fields,
+        "configured tool fingerprints must be part of the environment fields",
     );
 }
 
