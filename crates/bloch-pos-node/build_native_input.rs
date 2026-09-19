@@ -57,14 +57,21 @@ pub(crate) fn native_input_tree_digest(root: &Path) -> Option<(String, usize, u6
     Some((digest, files.len(), bytes))
 }
 
-/// The freestanding-libc dependency exports a header directory that the
-/// checked-in PQ build consumes directly. Its selector value is already bound;
-/// bind the selected bytes as well whenever Cargo exports it.
+fn native_inputs_for_target_os(target_os: &str) -> &'static [&'static str] {
+    if target_os == "wasi" {
+        &["WASI_SDK_DIR"]
+    } else {
+        &["DEP_WASM32_UNKNOWN_UNKNOWN_OPENBSD_LIBC_INCLUDE"]
+    }
+}
+
+/// The checked-in PQ build selects either a WASI sysroot or the freestanding
+/// libc include tree. Their selector values are already bound; bind the bytes
+/// that the target-specific branch can consume as well.
 #[cfg(not(test))]
-pub(crate) fn required_native_input_digests() -> Vec<(String, String)> {
-    const INPUTS: &[&str] = &["DEP_WASM32_UNKNOWN_UNKNOWN_OPENBSD_LIBC_INCLUDE"];
+pub(crate) fn required_native_input_digests(target_os: &str) -> Vec<(String, String)> {
     let mut digests = Vec::new();
-    for key in INPUTS {
+    for key in native_inputs_for_target_os(target_os) {
         let Some(path) = std::env::var_os(key) else {
             continue;
         };
@@ -111,6 +118,15 @@ mod tests {
         assert_ne!(mutated.0, extended.0);
         assert_eq!(extended.1, 3);
         fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn target_selects_only_the_native_tree_its_build_branch_consumes() {
+        assert_eq!(native_inputs_for_target_os("wasi"), &["WASI_SDK_DIR"]);
+        assert_eq!(
+            native_inputs_for_target_os("linux"),
+            &["DEP_WASM32_UNKNOWN_UNKNOWN_OPENBSD_LIBC_INCLUDE"],
+        );
     }
 
     #[cfg(unix)]

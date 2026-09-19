@@ -1785,7 +1785,7 @@ fn getbuildinfo_carries_a_bounded_build_environment_fingerprint() {
     assert!(scope.contains("configured linker/compiler/archive/wrapper bytes"));
     assert!(scope.contains("compiler delegated by known wrappers"));
     assert!(scope.contains("C compiler and archiver selected by cc-rs even when"));
-    assert!(scope.contains("selected freestanding native include-tree contents"));
+    assert!(scope.contains("selected freestanding or WASI native input-tree contents"));
     assert!(scope.contains("linker selected by effective Rust flags"));
     assert!(scope.contains("platform default linker observed from a target link probe"));
     assert_eq!(

@@ -674,12 +674,14 @@ fn main() {
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "unknown".into());
     let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".into());
     let host = std::env::var("HOST").unwrap_or_else(|_| "unknown".into());
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS")
+        .expect("Cargo did not provide CARGO_CFG_TARGET_OS to the build script");
     let rustc_binary_digest = build_tool_digest(&rustc);
     let cargo_binary_digest = build_tool_digest(&cargo);
     let (rust_sysroot_digest, rust_sysroot_components) = rust_sysroot_digest(&rustc);
     let configured_tool_digests = configured_tool_digests(&target, &host);
     let configured_tool_binaries = configured_tool_digests.len();
-    let native_input_digests = required_native_input_digests();
+    let native_input_digests = required_native_input_digests(&target_os);
     let cc_compiler_digest = required_cc_compiler_digest(&target, &host);
     let cc_archiver_digest = required_cc_archiver_digest(&target, &host);
     let default_linker_digest = default_linker_digest(&rustc, &target);
