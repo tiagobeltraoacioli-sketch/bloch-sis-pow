@@ -8,7 +8,7 @@
 use bloch_pos_committee::attestation::SignatureVerifier;
 use sha3::{Digest, Sha3_256};
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 const MAX_FAILURES: usize = 4096;
 
@@ -33,6 +33,7 @@ pub(super) struct GossipVerifier<V> {
 struct SlotBudget {
     slot: Option<u64>,
     used: usize,
+    by_source: BTreeMap<[u8; 32], usize>,
 }
 
 /// One node-local admission view of [`GossipVerifier`]. Exhaustion is exposed
@@ -42,6 +43,8 @@ pub(super) struct BudgetedVerifier<'a, V> {
     owner: &'a GossipVerifier<V>,
     slot: u64,
     cap: usize,
+    source: Option<[u8; 32]>,
+    source_cap: usize,
     limited: Cell<bool>,
 }
 
@@ -76,17 +79,48 @@ impl<V> GossipVerifier<V> {
     }
 
     pub(super) fn budgeted(&self, slot: u64, cap: usize) -> BudgetedVerifier<'_, V> {
-        BudgetedVerifier { owner: self, slot, cap, limited: Cell::new(false) }
+        BudgetedVerifier {
+            owner: self,
+            slot,
+            cap,
+            source: None,
+            source_cap: usize::MAX,
+            limited: Cell::new(false),
+        }
     }
 
-    fn reserve_verification(&self, slot: u64, cap: usize) -> bool {
+    pub(super) fn budgeted_for_source(
+        &self,
+        slot: u64,
+        cap: usize,
+        source: Option<[u8; 32]>,
+        source_cap: usize,
+    ) -> BudgetedVerifier<'_, V> {
+        BudgetedVerifier { owner: self, slot, cap, source, source_cap, limited: Cell::new(false) }
+    }
+
+    fn reserve_verification(
+        &self,
+        slot: u64,
+        cap: usize,
+        source: Option<[u8; 32]>,
+        source_cap: usize,
+    ) -> bool {
         let mut budget = self.budget.borrow_mut();
         if budget.slot != Some(slot) {
             budget.slot = Some(slot);
             budget.used = 0;
+            budget.by_source.clear();
+        }
+        if source.is_some_and(|key| budget.by_source.get(&key).copied().unwrap_or(0) >= source_cap) {
+            return false;
         }
         if budget.used >= cap { return false; }
         budget.used = budget.used.saturating_add(1);
+        if let Some(key) = source {
+            let used = budget.by_source.entry(key).or_default();
+            *used = used.saturating_add(1);
+        }
         true
     }
 }
@@ -102,7 +136,12 @@ impl<V: SignatureVerifier> SignatureVerifier for BudgetedVerifier<'_, V> {
         if self.owner.is_known_failure(pubkey, root, signature) {
             return false;
         }
-        if !self.owner.reserve_verification(self.slot, self.cap) {
+        if !self.owner.reserve_verification(
+            self.slot,
+            self.cap,
+            self.source,
+            self.source_cap,
+        ) {
             self.limited.set(true);
             return false;
         }
@@ -241,6 +280,30 @@ mod tests {
         let renewed = verifier.budgeted(71, 1);
         assert!(renewed.verify_with_key(b"registered key", &other, &other));
         assert!(!renewed.limited());
+        assert_eq!(verifier.verifier.calls.get(), 3);
+    }
+
+    #[test]
+    fn one_source_cannot_spend_another_sources_slot_allowance() {
+        let verifier = fixture();
+        let noisy = [0x01; 32];
+        let honest = [0x02; 32];
+        let signature = [0xCC; 32];
+
+        for n in 0u8..2 {
+            let root = [n; 32];
+            let bounded = verifier.budgeted_for_source(90, 4, Some(noisy), 2);
+            assert!(!bounded.verify_with_key(b"registered key", &root, &signature));
+            assert!(!bounded.limited());
+        }
+        let noisy_limited = verifier.budgeted_for_source(90, 4, Some(noisy), 2);
+        assert!(!noisy_limited.verify_with_key(b"registered key", &[3; 32], &signature));
+        assert!(noisy_limited.limited());
+        drop(noisy_limited);
+
+        let honest_admitted = verifier.budgeted_for_source(90, 4, Some(honest), 2);
+        assert!(!honest_admitted.verify_with_key(b"registered key", &[4; 32], &signature));
+        assert!(!honest_admitted.limited(), "another source retains aggregate headroom");
         assert_eq!(verifier.verifier.calls.get(), 3);
     }
 }

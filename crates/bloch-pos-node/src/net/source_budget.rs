@@ -2,6 +2,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
+use sha3::{Digest, Sha3_256};
 
 use super::{class_bytes_cap, class_count_cap, EventClass};
 
@@ -22,6 +23,27 @@ impl Source {
             _ => ip,
         })
     }
+
+    fn verification_key(&self) -> [u8; 32] {
+        let mut hash = Sha3_256::new();
+        hash.update(b"bloch-node-verification-source-v1");
+        match self {
+            Source::Ip(IpAddr::V4(ip)) => {
+                hash.update([0x04]);
+                hash.update(ip.octets());
+            }
+            Source::Ip(IpAddr::V6(ip)) => {
+                hash.update([0x06]);
+                hash.update(ip.octets());
+            }
+            Source::Peer(peer) => {
+                hash.update([0x50]);
+                hash.update((peer.len() as u64).to_le_bytes());
+                hash.update(peer);
+            }
+        }
+        hash.finalize().into()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -41,6 +63,14 @@ pub(crate) struct Reservation {
     registry: Arc<Mutex<Registry>>,
     source: Source,
     bytes: usize,
+}
+
+impl Reservation {
+    /// Opaque admission identity for expensive-work fairness. Both transports
+    /// reuse the normalization that already owns their count/byte reservation.
+    pub(crate) fn verification_source(&self) -> [u8; 32] {
+        self.source.verification_key()
+    }
 }
 
 impl Registry {
@@ -190,5 +220,20 @@ mod tests {
         assert!(reserve(&registry, Source::Peer(vec![5]), EventClass::Block, 1).is_none());
         drop(all);
         assert_eq!(registry.lock().unwrap().total.bytes, 0);
+    }
+
+    #[test]
+    fn verification_source_fingerprint_reuses_normalization_and_separates_peers() {
+        let v4 = Source::ip("192.0.2.44".parse().unwrap());
+        let mapped = Source::ip("::ffff:192.0.2.44".parse().unwrap());
+        assert_eq!(v4.verification_key(), mapped.verification_key());
+        assert_ne!(
+            Source::Peer(vec![1]).verification_key(),
+            Source::Peer(vec![2]).verification_key(),
+        );
+        assert_ne!(
+            v4.verification_key(),
+            Source::Peer(vec![192, 0, 2, 44]).verification_key(),
+        );
     }
 }

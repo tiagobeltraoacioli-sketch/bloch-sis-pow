@@ -359,6 +359,11 @@ const LIFECYCLE_VERIFICATIONS_TOTAL_PER_SLOT: usize = 256;
 /// unique-signature CPU finite even as the bounded transport queue drains.
 const GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT: usize = 1_024;
 
+/// Share one normalized transport source may spend from the aggregate relay
+/// verification allowance in one wall slot. Eight independent sources can
+/// fill the aggregate ceiling; one alone cannot starve all remaining peers.
+const GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT: usize = 128;
+
 /// Doppelgänger protection window (R6 HIGH-8, node half): slots this node
 /// observes the network for its OWN validator index attesting or proposing
 /// before it will start duties itself.
@@ -3352,6 +3357,14 @@ impl Engine {
     /// peer is not waiting on a verdict, and a duplicate arriving twice over a
     /// full mesh is the normal case rather than a fault.
     fn on_transaction(&mut self, tx: PosTransaction) -> Result<Admitted, Refusal> {
+        self.on_transaction_from(tx, None)
+    }
+
+    fn on_transaction_from(
+        &mut self,
+        tx: PosTransaction,
+        verification_source: Option<[u8; 32]>,
+    ) -> Result<Admitted, Refusal> {
         let key = tx.canonical_bytes();
         // A recent canonical inclusion remains a duplicate even if gossip
         // re-offers it after its pending entry was removed.
@@ -3412,9 +3425,11 @@ impl Engine {
                 return Err(Refusal::Invalid("funded deposit belongs to a different genesis manifest"));
             }
         }
-        let verifier = self.gossip_verifier.budgeted(
+        let verifier = self.gossip_verifier.budgeted_for_source(
             self.wall_slot(),
             GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
+            verification_source,
+            GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
         );
         let admission = admissible_with_network_verifier(
             &tx,
@@ -4124,7 +4139,12 @@ impl Engine {
         // `att_pool` is moved out for the call so the lookups below can borrow
         // the chain immutably; it is put back before returning.
         let mut pool = std::mem::take(&mut self.att_pool);
-        let decision = self.judge(&mut pool, att.clone(), e);
+        let decision = self.judge_from(
+            &mut pool,
+            att.clone(),
+            e,
+            origin.verification_source(),
+        );
         self.att_pool = pool;
         self.apply_decision(att, decision, &origin);
     }
@@ -4132,6 +4152,16 @@ impl Engine {
     /// One pass of the pure pipeline: window → checkpoint sanity → dedup and
     /// equivocation cap → committee membership → blocks known → signature.
     fn judge(&self, pool: &mut AttestationPool, att: Attestation, epoch: u64) -> GossipDecision {
+        self.judge_from(pool, att, epoch, None)
+    }
+
+    fn judge_from(
+        &self,
+        pool: &mut AttestationPool,
+        att: Attestation,
+        epoch: u64,
+        verification_source: Option<[u8; 32]>,
+    ) -> GossipDecision {
         // A forward projection cannot reconstruct a historical roster. Never
         // silently judge an older duty against the current registry.
         if epoch < epoch_of(self.state.slot()) {
@@ -4202,9 +4232,11 @@ impl Engine {
         // therefore `committees_at`. Membership and key must come from one
         // snapshot; the old code took membership from here and the key from a
         // boot-time genesis table, which is the inconsistency being removed.
-        let verifier = self.gossip_verifier.budgeted(
+        let verifier = self.gossip_verifier.budgeted_for_source(
             self.wall_slot(),
             GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
+            verification_source,
+            GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
         );
         let decision = pool.process(
             att,
@@ -5860,7 +5892,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
                             engine.on_attestation(att, origin, wall_epoch)
                         }
                         EngineEvent::Net(NetEvent::Transaction(tx, origin)) => {
-                            let verdict = match engine.on_transaction(tx) {
+                            let verdict = match engine.on_transaction_from(
+                                tx,
+                                origin.verification_source(),
+                            ) {
                                 Ok(_) => Verdict::Accept,
                                 // A peer may have a different head, fee, epoch
                                 // or pending input. Refuse relay without scoring

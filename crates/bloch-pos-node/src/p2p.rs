@@ -556,6 +556,13 @@ impl Origin {
         self.reservation = Some(guard);
     }
 
+    /// Opaque transport admission identity used only for node-local expensive
+    /// work fairness. Devnet contributes its normalized IP; libp2p contributes
+    /// its authenticated peer id through the same reservation type.
+    pub(crate) fn verification_source(&self) -> Option<[u8; 32]> {
+        self.reservation.as_ref().map(|guard| guard.verification_source())
+    }
+
     /// No provenance: devnet transport, or a message this node produced.
     pub fn none() -> Self {
         Origin {

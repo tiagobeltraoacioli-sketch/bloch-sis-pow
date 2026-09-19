@@ -1937,6 +1937,14 @@ mod tests {
         let event = || NetEvent::Attestation(sample_attestation(), Origin::none());
         assert!(send_from_ip(&tx, &budget, ip, event()));
         let EngineEvent::Net(processing) = rx.recv().unwrap() else { panic!("network event") };
+        match &processing {
+            NetEvent::Block(_, origin)
+            | NetEvent::Attestation(_, origin)
+            | NetEvent::Transaction(_, origin) => assert!(
+                origin.verification_source().is_some(),
+                "the engine must receive the same normalized source carried by its guard",
+            ),
+        }
         // Match the engine's early release of the legacy queue accounting.
         // The source guard must remain held until processing actually ends.
         budget.release(&processing);
@@ -2009,6 +2017,13 @@ mod tests {
         let EngineEvent::Net(event) = rx.recv().unwrap() else { panic!("network event") };
         assert_eq!(class_of(&event), EventClass::Attestation);
         assert_eq!(queued_bytes(&event), frame.len() - 1);
+        match &event {
+            NetEvent::Block(_, origin)
+            | NetEvent::Attestation(_, origin)
+            | NetEvent::Transaction(_, origin) => {
+                assert!(origin.verification_source().is_some())
+            }
+        }
         budget.release(&event);
         drop(event);
         assert_eq!(budget.inflight(), 0);
