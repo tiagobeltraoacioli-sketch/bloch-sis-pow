@@ -19,6 +19,7 @@ fn main() {
     // Parse --rpc-url flag (default: 127.0.0.1:16210)
     let mut rpc_host = "127.0.0.1".to_string();
     let mut rpc_port = 16210u16;
+    let mut allow_large_hd_wallet = false;
     let mut cmd_args: Vec<&str> = Vec::new();
 
     let mut i = 1;
@@ -26,6 +27,7 @@ fn main() {
         match args[i].as_str() {
             "--rpc-host" => { i += 1; if i < args.len() { rpc_host = args[i].clone(); } }
             "--rpc-port" => { i += 1; if i < args.len() { rpc_port = args[i].parse().unwrap_or(16210); } }
+            "--allow-large-hd-wallet" => { allow_large_hd_wallet = true; }
             _ => { cmd_args.push(&args[i]); }
         }
         i += 1;
@@ -174,7 +176,7 @@ fn main() {
         "newaddress" => {
             require_params(params, 1, "newaddress <wallet-hd.json> [label]");
             let label = params.get(1).copied().unwrap_or("new");
-            do_newaddress(params[0], label);
+            do_newaddress(params[0], label, allow_large_hd_wallet);
             return;
         }
 
@@ -186,7 +188,7 @@ fn main() {
 
         "importfounder" | "import-founder" => {
             require_params(params, 2, "importfounder <wallet-hd.json> <founder.json>");
-            do_import_founder(params[0], params[1]);
+            do_import_founder(params[0], params[1], allow_large_hd_wallet);
             return;
         }
 
@@ -459,14 +461,44 @@ fn do_newseed(output_path: &str) {
     println!("Wallet file:   {}", output_path);
 }
 
-fn do_newaddress(wallet_path: &str, label: &str) {
+fn load_hd_wallet(
+    path: &std::path::Path,
+    mnemonic: &str,
+    passphrase: Option<&str>,
+    password: &str,
+    allow_large: bool,
+) -> Result<bloch::hd_wallet::HdWallet, String> {
+    if allow_large {
+        // Explicit recovery mode for a trusted historical backup. It retains
+        // the parser's absolute byte ceiling but intentionally relaxes the
+        // normal address and rederivation work budgets.
+        bloch::hd_wallet::HdWallet::load_with_file_limit(
+            path,
+            mnemonic,
+            passphrase,
+            password,
+            bloch::util::MAX_WALLET_FILE_LIMIT,
+        )
+    } else {
+        bloch::hd_wallet::HdWallet::load_bounded(path, mnemonic, passphrase, password)
+            .map_err(|error| {
+                if error.contains("exceeds configured limit") || error.contains("wallet file exceeds configured") {
+                    format!("{error}; for a trusted historical backup retry with --allow-large-hd-wallet")
+                } else {
+                    error
+                }
+            })
+    }
+}
+
+fn do_newaddress(wallet_path: &str, label: &str, allow_large_hd_wallet: bool) {
     let password = read_password("Wallet password: ");
     let passphrase_input = read_password("Passphrase (Enter to skip): ");
     let passphrase = if passphrase_input.is_empty() { None } else { Some(passphrase_input.as_str()) };
     let mnemonic = read_password("Mnemonic (24 words): ");
 
     let path = std::path::Path::new(wallet_path);
-    let mut wallet = match bloch::hd_wallet::HdWallet::load(path, &mnemonic, passphrase, &password) {
+    let mut wallet = match load_hd_wallet(path, &mnemonic, passphrase, &password, allow_large_hd_wallet) {
         Ok(w) => w,
         Err(e) => { eprintln!("Load failed: {}", e); process::exit(1); }
     };
@@ -509,7 +541,7 @@ fn do_list_addresses(wallet_path: &str) {
     println!("Total: {} address(es)", wallet.addresses.len());
 }
 
-fn do_import_founder(hd_wallet_path: &str, founder_path: &str) {
+fn do_import_founder(hd_wallet_path: &str, founder_path: &str, allow_large_hd_wallet: bool) {
     println!("Importing founder.json into HD wallet...");
     println!();
 
@@ -529,7 +561,7 @@ fn do_import_founder(hd_wallet_path: &str, founder_path: &str) {
     let mnemonic = read_password("HD wallet mnemonic (24 words): ");
 
     let hd_path = std::path::Path::new(hd_wallet_path);
-    let mut wallet = match bloch::hd_wallet::HdWallet::load(hd_path, &mnemonic, hd_passphrase, &hd_password) {
+    let mut wallet = match load_hd_wallet(hd_path, &mnemonic, hd_passphrase, &hd_password, allow_large_hd_wallet) {
         Ok(w) => w,
         Err(e) => { eprintln!("Failed to load HD wallet: {}", e); process::exit(1); }
     };
@@ -708,6 +740,7 @@ fn print_usage() {
   OPTIONS
     --rpc-host <host>                      RPC host (default: 127.0.0.1)
     --rpc-port <port>                      RPC port (default: 16210)
+    --allow-large-hd-wallet                Trusted-backup recovery (up to 512 MiB)
     --help                                 This message
 "#);
 }

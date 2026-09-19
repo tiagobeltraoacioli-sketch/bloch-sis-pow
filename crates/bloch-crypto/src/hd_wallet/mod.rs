@@ -111,6 +111,22 @@ pub struct HdWalletLoadLimits {
     pub max_derived_key_checks: usize,
 }
 
+/// Conservative policy for interactive wallet consumers.
+///
+/// A thousand imported/legacy records remain available, while the more
+/// expensive mnemonic rederivation work is capped separately. Applications
+/// should use [`HdWallet::load_bounded`] for ordinary unlocks and expose an
+/// explicit, trusted-backup recovery workflow when these limits are too low.
+pub const DEFAULT_HD_WALLET_LOAD_LIMITS: HdWalletLoadLimits = HdWalletLoadLimits {
+    max_file_bytes: crate::util::DEFAULT_WALLET_FILE_LIMIT,
+    max_addresses: 1_024,
+    max_derived_key_checks: 256,
+};
+
+impl Default for HdWalletLoadLimits {
+    fn default() -> Self { DEFAULT_HD_WALLET_LOAD_LIMITS }
+}
+
 impl Drop for HdWallet {
     fn drop(&mut self) { self.master_key.zeroize(); self.seed.zeroize(); }
 }
@@ -298,6 +314,14 @@ impl HdWallet {
     /// Load and decrypt HD wallet file with mnemonic + passphrase + password.
     pub fn load(path: &Path, mnemonic_str: &str, passphrase: Option<&str>, password: &str) -> Result<Self, String> {
         Self::load_with_file_limit(path, mnemonic_str, passphrase, password, crate::util::DEFAULT_WALLET_FILE_LIMIT)
+    }
+
+    /// Load using the conservative policy intended for normal interactive use.
+    ///
+    /// This is deliberately distinct from [`Self::load`], whose historical
+    /// compatibility contract does not cap address or rederivation counts.
+    pub fn load_bounded(path: &Path, mnemonic_str: &str, passphrase: Option<&str>, password: &str) -> Result<Self, String> {
+        Self::load_with_limits(path, mnemonic_str, passphrase, password, HdWalletLoadLimits::default())
     }
 
     /// Explicit bounded recovery override for large authentic backups (maximum 512 MiB).
@@ -1002,6 +1026,46 @@ mod audit_wallet_boundaries {
         .unwrap();
         assert!(admitted.contains("invalid mnemonic"));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn bounded_default_accepts_exact_work_limits_and_rejects_each_excess() {
+        let crypto = encrypt_with_key(&[0; 32], b"fixture").unwrap();
+        let address = |index, derived| HdAddress {
+            index,
+            address: format!("{}fixture-{index}", TESTNET_PREFIX),
+            label: String::new(),
+            keypair_crypto: crypto.clone(),
+            derived,
+        };
+        let limits = HdWalletLoadLimits::default();
+        assert_eq!(limits, DEFAULT_HD_WALLET_LOAD_LIMITS);
+
+        let mut file = HdWalletFile {
+            version: 3,
+            format: "hd-wallet-v1".into(),
+            network: "testnet".into(),
+            mnemonic_crypto: crypto.clone(),
+            addresses: (0..limits.max_addresses)
+                .map(|index| address(index as u32, index < limits.max_derived_key_checks))
+                .collect(),
+            created_at: String::new(),
+            description: String::new(),
+        };
+        assert!(validate_wallet_load_limits(&file, limits).is_ok());
+
+        file.addresses.push(address(limits.max_addresses as u32, false));
+        assert_eq!(
+            validate_wallet_load_limits(&file, limits).unwrap_err(),
+            "HD wallet address count 1025 exceeds configured limit 1024"
+        );
+
+        file.addresses.truncate(limits.max_derived_key_checks + 1);
+        for address in &mut file.addresses { address.derived = true; }
+        assert_eq!(
+            validate_wallet_load_limits(&file, limits).unwrap_err(),
+            "HD wallet derived-key check count 257 exceeds configured limit 256"
+        );
     }
 
     #[test]
