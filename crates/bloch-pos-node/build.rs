@@ -165,6 +165,7 @@ fn hex(b: &[u8]) -> String {
 const FIXED_BUILD_ENV: &[&str] = &[
     "AR",
     "BINDGEN_EXTRA_CLANG_ARGS",
+    "CARGO",
     "CARGO_BUILD_RUSTC",
     "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
     "CARGO_BUILD_RUSTC_WRAPPER",
@@ -202,6 +203,32 @@ const FIXED_BUILD_ENV: &[&str] = &[
     "TARGET_CXXFLAGS",
     "TARGET_RANLIB",
 ];
+
+/// Hash the executable bytes selected for a build tool without publishing its
+/// path. Cargo normally supplies absolute `RUSTC`/`CARGO` paths; resolving a
+/// bare command through PATH preserves ordinary local builds. The selected
+/// file itself is watched so an in-place tool replacement cannot leave an
+/// incremental build stamped with the old fingerprint.
+fn build_tool_digest(command: &str) -> Option<String> {
+    let direct = PathBuf::from(command);
+    let path = if direct.components().count() > 1 {
+        direct
+    } else {
+        std::env::var_os("PATH")
+            .and_then(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|dir| dir.join(command))
+                    .find(|path| path.is_file())
+            })?
+    };
+    let body = std::fs::read(&path).ok()?;
+    println!("cargo:rerun-if-changed={}", path.display());
+    let mut h = Sha3_256::new();
+    h.update(b"bloch-pos/build-tool-binary/v1\0");
+    h.update((body.len() as u64).to_le_bytes());
+    h.update(body);
+    Some(hex(&h.finalize()))
+}
 
 fn relevant_build_env(key: &str) -> bool {
     FIXED_BUILD_ENV.contains(&key)
@@ -256,6 +283,8 @@ fn exact_build_env(target: &str, host: &str) -> Vec<String> {
 fn build_environment_digest(
     rustc_verbose: &str,
     cargo_verbose: &str,
+    rustc_binary_digest: Option<String>,
+    cargo_binary_digest: Option<String>,
     profile: &str,
     target: &str,
     host: &str,
@@ -268,8 +297,10 @@ fn build_environment_digest(
     }
     let mut fields = vec![
         ("cargo-version".to_owned(), Some(cargo_verbose.to_owned())),
+        ("cargo-binary-sha3-256".to_owned(), cargo_binary_digest),
         ("host".to_owned(), Some(host.to_owned())),
         ("profile".to_owned(), Some(profile.to_owned())),
+        ("rustc-binary-sha3-256".to_owned(), rustc_binary_digest),
         ("rustc-version".to_owned(), Some(rustc_verbose.to_owned())),
         ("target".to_owned(), Some(target.to_owned())),
     ];
@@ -410,7 +441,8 @@ fn main() {
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "unknown".into());
     let rustc_v = rustc_verbose.lines().next().unwrap_or("unknown");
-    let cargo_verbose = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let cargo_verbose = Command::new(&cargo)
         .args(["--version", "--verbose"])
         .output()
         .ok()
@@ -422,14 +454,26 @@ fn main() {
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "unknown".into());
     let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".into());
     let host = std::env::var("HOST").unwrap_or_else(|_| "unknown".into());
-    let (environment_digest, environment_fields) =
-        build_environment_digest(&rustc_verbose, &cargo_verbose, &profile, &target, &host);
+    let rustc_binary_digest = build_tool_digest(&rustc);
+    let cargo_binary_digest = build_tool_digest(&cargo);
+    let tool_binaries = usize::from(rustc_binary_digest.is_some())
+        + usize::from(cargo_binary_digest.is_some());
+    let (environment_digest, environment_fields) = build_environment_digest(
+        &rustc_verbose,
+        &cargo_verbose,
+        rustc_binary_digest,
+        cargo_binary_digest,
+        &profile,
+        &target,
+        &host,
+    );
     println!("cargo:rustc-env=BLOCH_BUILD_RUSTC={rustc_v}");
     println!("cargo:rustc-env=BLOCH_BUILD_CARGO={cargo_v}");
     println!("cargo:rustc-env=BLOCH_BUILD_PROFILE={profile}");
     println!("cargo:rustc-env=BLOCH_BUILD_TARGET={target}");
     println!("cargo:rustc-env=BLOCH_BUILD_ENV_DIGEST={environment_digest}");
     println!("cargo:rustc-env=BLOCH_BUILD_ENV_FIELDS={environment_fields}");
+    println!("cargo:rustc-env=BLOCH_BUILD_TOOL_BINARIES={tool_binaries}");
 
     // ── `BLOCH_BUILD_DIRTY` is deliberately NOT stamped ────────────────────
     //

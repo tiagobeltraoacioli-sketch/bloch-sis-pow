@@ -1679,6 +1679,7 @@ fn getbuildinfo_reports_the_fields_a_partner_compares() {
         "build_environment_digest_alg",
         "build_environment_scope",
         "build_environment_fields",
+        "build_tool_binaries_hashed",
         "digest_note",
     ] {
         let f = v.get(k).unwrap_or_else(|| panic!("getbuildinfo has no `{k}`"));
@@ -1774,6 +1775,12 @@ fn getbuildinfo_carries_a_bounded_build_environment_fingerprint() {
         .unwrap();
     assert!(scope.contains("values hashed"));
     assert!(scope.contains("not directly disclosed"));
+    assert!(scope.contains("executable bytes"));
+    assert_eq!(
+        v.get("build_tool_binaries_hashed").unwrap().as_str(),
+        Some("2"),
+        "workspace builds must bind both selected tool executables",
+    );
 }
 
 /// Nothing here is anything an operator would refuse to publish.
