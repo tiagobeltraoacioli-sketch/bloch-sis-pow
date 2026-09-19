@@ -1506,6 +1506,16 @@ fn pump_sync_requests(swarm: &mut Swarm, st: &mut Loop) {
     ));
 }
 
+/// Bound peer-controlled connection churn diagnostics. This helper owns only
+/// formatting/output: connection counters, cleanup and sync scheduling must
+/// remain outside its closure so suppression can never suppress state work.
+fn connection_diagnostic(output: impl FnOnce()) {
+    crate::net::rejection_log::emit(
+        crate::net::rejection_log::Class::Connection,
+        output,
+    );
+}
+
 /// Returns false when the engine's receiver is gone (the node is shutting
 /// down) — the loop then exits.
 fn handle_swarm_event(
@@ -1523,7 +1533,7 @@ fn handle_swarm_event(
             println!("p2p: listening on {address}");
         }
         SwarmEvent::ConnectionEstablished { peer_id, ref endpoint, num_established, .. } => {
-            println!("p2p: connected {peer_id}");
+            connection_diagnostic(|| println!("p2p: connected {peer_id}"));
             if let libp2p::core::ConnectedPoint::Dialer { address, .. } = endpoint {
                 st.note_dialed(address.clone(), peer_id);
             }
@@ -1579,8 +1589,12 @@ fn handle_swarm_event(
                 // failure take days to find: the transport was terminating
                 // connections and the log said only that peers came and went.
                 match cause {
-                    Some(e) => println!("p2p: disconnected {peer_id}: {e}"),
-                    None => println!("p2p: disconnected {peer_id} (closed cleanly)"),
+                    Some(e) => connection_diagnostic(|| {
+                        println!("p2p: disconnected {peer_id}: {e}")
+                    }),
+                    None => connection_diagnostic(|| {
+                        println!("p2p: disconnected {peer_id} (closed cleanly)")
+                    }),
                 }
             }
         }
@@ -1592,13 +1606,17 @@ fn handle_swarm_event(
             // simultaneous dial from both ends — noise that reads exactly like
             // a real outage and would teach an operator to ignore the line.
             if swarm.connected_peers().next().is_none() {
-                eprintln!("p2p: NO PEERS — dial failed ({peer_id:?}): {error}");
+                connection_diagnostic(|| {
+                    eprintln!("p2p: NO PEERS — dial failed ({peer_id:?}): {error}")
+                });
             } else {
                 trace(|| format!("dial failed ({peer_id:?}): {error}"));
             }
         }
         SwarmEvent::IncomingConnectionError { error, send_back_addr, .. } => {
-            crate::net::rejection_log::emit(crate::net::rejection_log::Class::Connection, || eprintln!("p2p: inbound connection from {send_back_addr} failed: {error}"));
+            connection_diagnostic(|| {
+                eprintln!("p2p: inbound connection from {send_back_addr} failed: {error}")
+            });
         }
         SwarmEvent::Behaviour(G4BehaviourEvent::Identify(identify::Event::Received {
             peer_id,
@@ -2235,6 +2253,79 @@ mod tests {
             },
             peers_live: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    #[test]
+    fn connection_log_suppression_never_suppresses_disconnect_state_work() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _enter = runtime.enter();
+        let key = identity::Keypair::generate_ed25519();
+        let cfg = Config { listen: Vec::new(), peers: Vec::new(), data_dir: PathBuf::new(), max_peers: 8, behind_proxy: true };
+        let mut swarm = build_swarm(&key, &cfg).unwrap();
+        let mut state = test_loop();
+        let peer = PeerId::random();
+        let waiting = PeerId::random();
+        let address: Multiaddr = "/ip4/127.0.0.1/tcp/19444".parse().unwrap();
+
+        state.peers_live.store(1, Ordering::Release);
+        state.peer_head.insert(peer, 99);
+        state.note_dialed(address.clone(), peer);
+        let permit = state.sync_limiter.begin(peer, Instant::now()).unwrap();
+        state.sync_limiter.release(permit);
+        let active = swarm.behaviour_mut().sync.send_request(
+            &peer,
+            SyncRequest::GetBlocks { after_slot: 0, limit: MAX_SYNC_BLOCKS as u32 },
+        );
+        assert!(state.outgoing_sync.start(peer, || active));
+        assert!(state.outgoing_sync.enqueue(waiting, 7));
+
+        // Saturate the production connection diagnostic immediately before
+        // the close event. Other parallel tests may have consumed some burst,
+        // so pin the invariant rather than assuming a fresh global window:
+        // at most BURST callbacks run, and every remaining call is counted.
+        let callbacks = std::cell::Cell::new(0u64);
+        let suppressed_before = crate::net::rejection_log::suppressed_total();
+        for _ in 0..100 {
+            connection_diagnostic(|| callbacks.set(callbacks.get().saturating_add(1)));
+        }
+        let suppressed_after = crate::net::rejection_log::suppressed_total();
+        assert!(callbacks.get() <= 8, "the connection burst must remain bounded");
+        assert!(
+            suppressed_after.saturating_sub(suppressed_before)
+                >= 100u64.saturating_sub(callbacks.get()),
+            "every callback denied by this burst must increment the shared suppression metric",
+        );
+
+        let (resp_tx, _resp_rx) = tokio::sync::mpsc::unbounded_channel();
+        let suppressed_before_close = crate::net::rejection_log::suppressed_total();
+        assert!(handle_swarm_event(
+            &mut swarm,
+            &mut state,
+            &resp_tx,
+            SwarmEvent::ConnectionClosed {
+                peer_id: peer,
+                connection_id: libp2p::swarm::ConnectionId::new_unchecked(1),
+                endpoint: libp2p::core::ConnectedPoint::Listener {
+                    local_addr: address.clone(),
+                    send_back_addr: address,
+                },
+                num_established: 0,
+                cause: None,
+            },
+        ));
+        let suppressed_after_close = crate::net::rejection_log::suppressed_total();
+        assert!(
+            suppressed_after_close.saturating_sub(suppressed_before_close) >= 1,
+            "the synthetic close must hit the saturated diagnostic window",
+        );
+
+        assert_eq!(state.peers_live.load(Ordering::Acquire), 0);
+        assert!(!state.peer_head.contains_key(&peer));
+        assert!(!state.dialed.values().any(|remembered| *remembered == peer));
+        assert_eq!(state.sync_limiter.tracked(), 0);
+        assert!(!state.outgoing_sync.contains(&peer));
+        assert!(state.outgoing_sync.contains(&waiting),
+            "disconnect cleanup must still pump the next queued sync request while logging is suppressed");
     }
 
     #[test]
