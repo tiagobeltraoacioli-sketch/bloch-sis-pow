@@ -2654,7 +2654,8 @@ pub fn build_info_json() -> Json {
                 "rustc and cargo executable bytes plus version output; \
                  selected rustc driver and target libstd sysroot components; \
                  explicitly configured linker/compiler/archive/wrapper bytes, \
-                 including an unambiguous compiler delegated by known wrappers; \
+                 including an unambiguous compiler delegated by known wrappers \
+                 and the linker selected by effective Rust flags; \
                  host; target; profile; \
                  selected Rust/C codegen variables, including absent exact \
                  host/target forms; sorted, length-prefixed; values hashed, \

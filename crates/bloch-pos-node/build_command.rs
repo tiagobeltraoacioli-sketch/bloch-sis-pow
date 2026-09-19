@@ -67,6 +67,41 @@ pub(crate) fn delegated_compiler(words: &[String]) -> Option<&str> {
     (!delegate.starts_with('-')).then_some(delegate.as_str())
 }
 
+/// Extract the last explicit `-C linker=...` selection, which is the one rustc
+/// applies. Cargo's encoded form uses unit separators and does not need shell
+/// parsing; plain RUSTFLAGS uses the same restricted tokenizer as tool values.
+pub(crate) fn rustflags_linker(flags: &str, encoded: bool) -> Option<String> {
+    let words = if encoded {
+        flags
+            .split('\u{1f}')
+            .filter(|word| !word.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    } else {
+        configured_command_words(flags)?
+    };
+    let mut linker = None;
+    let mut index = 0usize;
+    while index < words.len() {
+        let word = &words[index];
+        if let Some(value) = word.strip_prefix("-Clinker=") {
+            if !value.is_empty() {
+                linker = Some(value.to_owned());
+            }
+        } else if word == "-C" {
+            if let Some(value) = words.get(index.saturating_add(1))
+                .and_then(|next| next.strip_prefix("linker="))
+                .filter(|value| !value.is_empty())
+            {
+                linker = Some(value.to_owned());
+                index = index.saturating_add(1);
+            }
+        }
+        index = index.saturating_add(1);
+    }
+    linker
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +133,20 @@ mod tests {
         );
         assert_eq!(delegated_compiler(&["sccache".into(), "--start-server".into()]), None);
         assert_eq!(delegated_compiler(&["sccache".into()]), None);
+    }
+
+    #[test]
+    fn rustflags_linker_uses_the_effective_last_selection() {
+        assert_eq!(
+            rustflags_linker("-C linker='/opt/tool chain/ld' -Copt-level=2", false),
+            Some("/opt/tool chain/ld".into())
+        );
+        assert_eq!(
+            rustflags_linker("-Clinker=old\u{1f}-C\u{1f}linker=new", true),
+            Some("new".into())
+        );
+        assert_eq!(rustflags_linker("-C linker=", false), None);
+        assert_eq!(rustflags_linker("-C target-cpu=native", false), None);
+        assert_eq!(rustflags_linker("-C linker='unterminated", false), None);
     }
 }

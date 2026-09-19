@@ -70,7 +70,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod build_command;
-use build_command::{configured_command_words, delegated_compiler};
+use build_command::{configured_command_words, delegated_compiler, rustflags_linker};
 
 /// Extensions that are build inputs for this binary.
 const SOURCE_EXT: &[&str] = &["rs", "toml", "c", "h", "S", "s", "macros"];
@@ -295,6 +295,26 @@ fn configured_tool_digests(target: &str, host: &str) -> Vec<(String, String)> {
             }
         }
     }
+    let flags_linker = std::env::var("CARGO_ENCODED_RUSTFLAGS")
+        .ok()
+        .and_then(|flags| rustflags_linker(&flags, true))
+        .or_else(|| {
+            std::env::var("CARGO_BUILD_RUSTFLAGS")
+                .ok()
+                .and_then(|flags| rustflags_linker(&flags, false))
+        })
+        .or_else(|| {
+            std::env::var("RUSTFLAGS")
+                .ok()
+                .and_then(|flags| rustflags_linker(&flags, false))
+        });
+    if let Some(linker) = flags_linker {
+        if let Some(digest) = build_tool_digest(&linker) {
+            digests.push(("rustflags-linker".to_owned(), digest));
+        }
+    }
+    digests.sort();
+    digests.dedup();
     digests
 }
 
