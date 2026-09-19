@@ -73,15 +73,23 @@ esac
       --target-dir "$work/target" )
 binary="$work/target/release/bloch-pos"
 [ -x "$binary" ] || fail "release binary was not produced"
-version_output="$($binary --version)"
-case "$version_output" in
-  *"${commit:0:12}"*) : ;;
-  *) fail "binary version does not contain ${commit:0:12}" ;;
+version_file="$work/binary-version"
+"$binary" --version > "$version_file" \
+  || fail "release binary --version failed"
+[ "$(wc -l < "$version_file" | tr -d '[:space:]')" = 2 ] \
+  || fail "binary version output must contain exactly two newline-terminated lines"
+binary_version="$(sed -n '1p' "$version_file")"
+source_identity="$(sed -n '2p' "$version_file")"
+cmp -s <(printf '%s\n%s\n' "$binary_version" "$source_identity") "$version_file" \
+  || fail "binary version output must contain exactly two canonical text lines"
+case "$binary_version" in
+  *"(${commit:0:12})"*) : ;;
+  *) fail "binary version line does not contain (${commit:0:12})" ;;
 esac
-binary_version="$(printf '%s\n' "$version_output" | sed -n '1p')"
-source_identity="$(printf '%s\n' "$version_output" | sed -n '2p')"
-[ -n "$binary_version" ] || fail "binary version output is empty"
-[ -n "$source_identity" ] || fail "binary source identity output is missing"
+LC_ALL=C grep -Eq \
+  '^source-digest sha3-256:[0-9a-f]{64} \([0-9]+ files, [0-9]+ bytes\) commit-source:asserted tree:asserted-clean$' \
+  <<< "$source_identity" \
+  || fail "binary source identity line is not the exact asserted clean-source format"
 
 stage="$work/stage"
 mkdir -p "$stage"

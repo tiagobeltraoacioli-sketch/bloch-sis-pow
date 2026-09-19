@@ -92,20 +92,60 @@ source_marker="$(cat source-marker)"
 config_marker="$(sed -n 's/^# //p' .cargo/config.toml)"
 pin="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' \
   crates/bloch-pos-node/rust-toolchain.toml)"
+version_mode="${FAKE_VERSION_MODE:-canonical}"
 mkdir -p "$target_dir/release"
 cat > "$target_dir/release/bloch-pos" <<BIN
 #!/usr/bin/env bash
-printf '%s\n' 'bloch-pos ${BLOCH_BUILD_COMMIT}'
-printf '%s\n' 'source=$source_marker config=$config_marker pin=$pin'
+# source=$source_marker config=$config_marker pin=$pin
+case '$version_mode' in
+  canonical)
+    printf '%s\n' 'bloch-pos-node 0.0.0 (${BLOCH_BUILD_COMMIT}) (Genesis-4, block version 0x00000004)'
+    printf '%s\n' 'source-digest sha3-256:0000000000000000000000000000000000000000000000000000000000000000 (1 files, 1 bytes) commit-source:asserted tree:asserted-clean'
+    ;;
+  missing-commit)
+    printf '%s\n' 'bloch-pos-node 0.0.0 (unbound) (Genesis-4, block version 0x00000004)'
+    printf '%s\n' 'source-digest sha3-256:0000000000000000000000000000000000000000000000000000000000000000 (1 files, 1 bytes) commit-source:asserted tree:asserted-clean'
+    ;;
+  decoy-third)
+    printf '%s\n' 'bloch-pos-node 0.0.0 (unbound) (Genesis-4, block version 0x00000004)'
+    printf '%s\n' 'source-digest sha3-256:0000000000000000000000000000000000000000000000000000000000000000 (1 files, 1 bytes) commit-source:asserted tree:asserted-clean'
+    printf '%s\n' 'decoy (${BLOCH_BUILD_COMMIT})'
+    ;;
+  extra-line)
+    printf '%s\n' 'bloch-pos-node 0.0.0 (${BLOCH_BUILD_COMMIT}) (Genesis-4, block version 0x00000004)'
+    printf '%s\n' 'source-digest sha3-256:0000000000000000000000000000000000000000000000000000000000000000 (1 files, 1 bytes) commit-source:asserted tree:asserted-clean'
+    printf '%s\n' 'unexpected third line'
+    ;;
+  malformed-source)
+    printf '%s\n' 'bloch-pos-node 0.0.0 (${BLOCH_BUILD_COMMIT}) (Genesis-4, block version 0x00000004)'
+    printf '%s\n' 'source-digest sha3-256:NOT-LOWERCASE-HEX (1 files, 1 bytes) commit-source:asserted tree:dirty'
+    ;;
+esac
 BIN
 chmod 0755 "$target_dir/release/bloch-pos"
 EOF
 chmod 0755 "$fake_bin/cargo"
 
 run_package() {
+  local version_mode="${2:-canonical}"
   ( cd "$test_repo" && PATH="$fake_bin:$PATH" REAL_GIT="$real_git" \
+      FAKE_VERSION_MODE="$version_mode" \
       TEST_REPO="$test_repo" "$test_repo/scripts/package-pos-release-candidate.sh" \
       "$1" )
+}
+
+expect_version_failure() {
+  local mode="$1" expected="$2"
+  local output="$work/version-$mode" log="$work/version-$mode.log"
+  if run_package "$output" "$mode" > "$log" 2>&1; then
+    echo "selftest: noncanonical --version mode $mode was accepted" >&2
+    exit 1
+  fi
+  grep -Fq "$expected" "$log" || {
+    echo "selftest: --version mode $mode failed without expected diagnostic" >&2
+    cat "$log" >&2
+    exit 1
+  }
 }
 
 # Dirty input must still be refused before any archive or build is attempted.
@@ -123,8 +163,9 @@ FAKE_ADVANCE_HEAD=1 run_package "$work/race-output" > "$work/race.log" 2>&1
 grep -Fxq "source_commit=$baseline_commit" "$work/race-output/BUILD-INFO"
 grep -Fxq 'rust_toolchain=1.80.0' "$work/race-output/BUILD-INFO"
 race_version="$($work/race-output/bloch-pos --version)"
-printf '%s\n' "$race_version" | grep -Fq \
-  'source=baseline-source config=baseline-config pin=1.80.0'
+printf '%s\n' "$race_version" | grep -Fq "(${baseline_commit:0:12})"
+grep -Fq '# source=baseline-source config=baseline-config pin=1.80.0' \
+  "$work/race-output/bloch-pos"
 late_commit="$(git -C "$test_repo" rev-parse HEAD)"
 [ "$late_commit" != "$baseline_commit" ]
 
@@ -133,7 +174,17 @@ run_package "$work/late-output" > "$work/late.log" 2>&1
 grep -Fxq "source_commit=$late_commit" "$work/late-output/BUILD-INFO"
 grep -Fxq 'rust_toolchain=1.81.0' "$work/late-output/BUILD-INFO"
 late_version="$($work/late-output/bloch-pos --version)"
-printf '%s\n' "$late_version" | grep -Fq \
-  'source=late-source config=late-config pin=1.81.0'
+printf '%s\n' "$late_version" | grep -Fq "(${late_commit:0:12})"
+grep -Fq '# source=late-source config=late-config pin=1.81.0' \
+  "$work/late-output/bloch-pos"
+
+expect_version_failure missing-commit \
+  'binary version line does not contain ('
+expect_version_failure decoy-third \
+  'binary version output must contain exactly two newline-terminated lines'
+expect_version_failure extra-line \
+  'binary version output must contain exactly two newline-terminated lines'
+expect_version_failure malformed-source \
+  'binary source identity line is not the exact asserted clean-source format'
 
 echo "package-pos-release-candidate selftest: PASS"
