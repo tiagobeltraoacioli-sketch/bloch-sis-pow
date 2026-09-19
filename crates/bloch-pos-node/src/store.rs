@@ -25,7 +25,7 @@
 //! replay detects and drops.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
@@ -119,6 +119,7 @@ const IDX_MAGIC: &[u8; 8] = b"BPOSIDX1";
 
 /// One index record: `slot u64 LE ‖ offset u64 LE ‖ frame_len u32 LE`.
 const IDX_ENTRY_LEN: u64 = 8 + 8 + 4;
+const INDEX_WRITE_BUFFER_BYTES: usize = 8 * 1024;
 
 /// Maximum complete frames one network request may inspect beyond the last
 /// valid index record. A normal crash window is one frame; 4,096 is over a day
@@ -172,6 +173,14 @@ impl IdxEntry {
         // makes callers distrust the index and fail boundedly.
         self.offset.saturating_add(4).saturating_add(self.len as u64)
     }
+}
+
+fn write_index_entries<W: Write>(writer: &mut W, entries: &[IdxEntry]) -> io::Result<()> {
+    let mut buffered = BufWriter::with_capacity(INDEX_WRITE_BUFFER_BYTES, writer);
+    for entry in entries {
+        buffered.write_all(&entry.encode())?;
+    }
+    buffered.flush()
 }
 
 /// Records in an open index file (the magic is not one).
@@ -317,14 +326,8 @@ fn repair_index(idx: &mut File, log_path: &Path, log_len: u64) -> io::Result<()>
     }
     if covered < log_len {
         let tail = scan_index(log_path, covered)?;
-        // Capacity hint only: saturating is the intended semantics (a
-        // saturated hint under-reserves, it does not corrupt the buffer).
-        let mut buf = Vec::with_capacity(tail.len().saturating_mul(IDX_ENTRY_LEN as usize));
-        for e in &tail {
-            buf.extend_from_slice(&e.encode());
-        }
         idx.seek(SeekFrom::End(0))?;
-        idx.write_all(&buf)?;
+        write_index_entries(idx, &tail)?;
     }
     idx.sync_data()
 }
@@ -1728,6 +1731,100 @@ mod tests {
         drop(store);
         let _ = fs::remove_dir_all(dir);
         assert_eq!(slots, vec![2, 3], "an index write failure must not hide the missing frame behind a later index entry");
+    }
+
+    #[test]
+    fn index_repair_writer_is_fixed_bounded_and_byte_exact() {
+        #[derive(Default)]
+        struct RecordingWriter {
+            bytes: Vec<u8>,
+            largest: usize,
+            writes: usize,
+        }
+
+        impl Write for RecordingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.largest = self.largest.max(bytes.len());
+                self.writes = self.writes.saturating_add(1);
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+
+        let entries: Vec<_> = (0..1_000u64)
+            .map(|slot| IdxEntry { slot, offset: slot.saturating_mul(257), len: 253 })
+            .collect();
+        let mut expected = Vec::new();
+        for entry in &entries { expected.extend_from_slice(&entry.encode()); }
+        let mut writer = RecordingWriter::default();
+        write_index_entries(&mut writer, &entries).expect("stream index entries");
+
+        assert_eq!(writer.bytes, expected, "buffering must not change index bytes or order");
+        assert!(writer.largest <= INDEX_WRITE_BUFFER_BYTES);
+        assert!(writer.writes > 1, "fixture must cross the fixed buffer boundary");
+    }
+
+    #[test]
+    fn partial_buffered_index_record_is_truncated_and_rebuilt() {
+        struct FailInsideRecord {
+            bytes: Vec<u8>,
+            remaining: usize,
+        }
+
+        impl Write for FailInsideRecord {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.remaining == 0 {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "injected index failure"));
+                }
+                let accepted = bytes.len().min(self.remaining);
+                self.bytes.extend_from_slice(&bytes[..accepted]);
+                self.remaining = self.remaining.saturating_sub(accepted);
+                Ok(accepted)
+            }
+
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+
+        let dir = std::env::temp_dir().join(format!("bloch-index-buffer-fault-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut log = Vec::new();
+        let mut entries = Vec::new();
+        let mut offset = 0u64;
+        for slot in 1..=500u64 {
+            let payload = crate::codec::encode_envelope(&sample_envelope(slot));
+            entries.push(IdxEntry { slot, offset, len: payload.len() as u32 });
+            log.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            log.extend_from_slice(&payload);
+            offset = offset.saturating_add(4).saturating_add(payload.len() as u64);
+        }
+        let log_path = dir.join("blocks.log");
+        fs::write(&log_path, &log).unwrap();
+
+        let mut failed = FailInsideRecord {
+            bytes: Vec::new(),
+            remaining: INDEX_WRITE_BUFFER_BYTES.saturating_add(7),
+        };
+        assert_eq!(
+            write_index_entries(&mut failed, &entries).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe,
+        );
+        assert_ne!(failed.bytes.len() % IDX_ENTRY_LEN as usize, 0, "fault must split a record");
+        let idx_path = dir.join("blocks.idx");
+        let mut damaged = IDX_MAGIC.to_vec();
+        damaged.extend_from_slice(&failed.bytes);
+        fs::write(&idx_path, damaged).unwrap();
+
+        let mut idx = OpenOptions::new().read(true).write(true).open(&idx_path).unwrap();
+        repair_index(&mut idx, &log_path, log.len() as u64).expect("repair partial index");
+        let mut expected = IDX_MAGIC.to_vec();
+        for entry in &entries { expected.extend_from_slice(&entry.encode()); }
+        assert_eq!(fs::read(&idx_path).unwrap(), expected);
+
+        drop(idx);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[cfg(unix)]
