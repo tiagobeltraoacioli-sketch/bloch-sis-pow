@@ -81,7 +81,26 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - run: |
-          cargo test --locked \\
+          ch="$(sed -n 's/^channel *= *"\(.*\)".*/\\1/p' crates/bloch-pos-node/rust-toolchain.toml)"
+          if [ -z "$ch" ]; then
+            echo "cannot read the toolchain pin — refusing to test on a floating toolchain" >&2
+            exit 1
+          fi
+          rustup toolchain install "$ch" --profile minimal --no-self-update
+          echo "toolchain=$ch" >> "$GITHUB_OUTPUT"
+      - run: sudo apt-get update && sudo apt-get install -y clang cmake
+      - run: python3 scripts/rehearse-validator-admission.py
+      - run: python3 scripts/check-validator-lifecycle-mutations.py
+      - run: bash deploy/bootnodes/verify-bootnodes.selftest.sh
+      - run: |
+          python3 scripts/check-live-node-retired-isolation.py --selftest
+          python3 scripts/check-live-node-retired-isolation.py
+      - run: python3 scripts/rehearse-validator-activation.py --output "$RUNNER_TEMP/validator-activation"
+      - run: python3 scripts/rehearse-validator-joining-network.py --output "$RUNNER_TEMP/validator-joining-network"
+      - run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-node --bin bloch-pos audit_
+      - run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p pqcrypto-internals
+      - run: |
+          cargo +${{ steps.pin.outputs.toolchain }} test --locked \\
             -p bloch-pos-committee \\
             -p bloch-pos-node \\
             -p bloch-crypto \\
@@ -169,13 +188,37 @@ CASES = [
              "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"
              "        with:\n          path: scripts"),
          must_fail=True, expect="unreviewed `with:` inputs"),
-    Case("GitHub output channel does not mutate cargo environment",
+    Case("even inert extra cargo run steps need explicit review",
          GOOD_GITLAB,
          GOOD_GITHUB.replace(
              "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
              "      - run: echo status=ready >> \"$GITHUB_OUTPUT\"\n"
              "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262"),
-         must_fail=False),
+         must_fail=True, expect="reviewed ordered command list"),
+    Case("extra cargo setup cannot overwrite a rehearsal entrypoint",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - run: python3 scripts/rehearse-validator-admission.py",
+             "      - run: cp scripts/fake-rehearsal.py scripts/rehearse-validator-admission.py\n"
+             "      - run: python3 scripts/rehearse-validator-admission.py"),
+         must_fail=True, expect="reviewed ordered command list"),
+    Case("cargo setup commands cannot be reordered",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - run: python3 scripts/rehearse-validator-admission.py\n"
+             "      - run: python3 scripts/check-validator-lifecycle-mutations.py",
+             "      - run: python3 scripts/check-validator-lifecycle-mutations.py\n"
+             "      - run: python3 scripts/rehearse-validator-admission.py"),
+         must_fail=True, expect="reviewed ordered command list"),
+    Case("cargo guard setup cannot be deleted",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - run: bash deploy/bootnodes/verify-bootnodes.selftest.sh\n", ""),
+         must_fail=True, expect="reviewed ordered command list"),
+    Case("folded YAML cannot merge toolchain setup commands",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace("      - run: |\n", "      - run: >\n", 1),
+         must_fail=True, expect="reviewed ordered command list"),
     Case("GitHub PATH command file cannot replace cargo",
          GOOD_GITLAB,
          GOOD_GITHUB.replace(
@@ -251,7 +294,7 @@ CASES = [
 
     Case("github job kept but cargo test removed",
          GOOD_GITLAB,
-         sub(GOOD_GITHUB, "cargo test --locked", "cargo build --locked"),
+         GOOD_GITHUB.replace(" test --locked", " build --locked"),
          must_fail=True, expect="no longer runs `cargo test`"),
 
     Case("github drops one live crate from the list",

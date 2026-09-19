@@ -32,6 +32,8 @@ job `build-and-test` — to the posture the finding required:
     reviewed immutable form.
   * no required GitHub run step writes the cross-step PATH/environment command
     files that can replace `cargo` before the approved test command.
+  * the `cargo-test` job's setup, rehearsals and test commands exactly match
+    the reviewed ordered run-step list and YAML block semantics.
 
 The live-crate list is duplicated in `.github/workflows/tests.yml` on
 purpose: the workflow states what it gates, this file makes dropping a crate
@@ -70,6 +72,34 @@ LIVE_CRATES = (
     "bloch-pq-vault",
     "pqcrypto-internals",
     "genesis4-ceremony",
+)
+GITHUB_CARGO_TEST_RUNS = (
+    'ch="$(sed -n \'s/^channel *= *"\\(.*\\)".*/\\1/p\' crates/bloch-pos-node/rust-toolchain.toml)"\n'
+    'if [ -z "$ch" ]; then\n'
+    'echo "cannot read the toolchain pin — refusing to test on a floating toolchain" >&2\n'
+    'exit 1\n'
+    'fi\n'
+    'rustup toolchain install "$ch" --profile minimal --no-self-update\n'
+    'echo "toolchain=$ch" >> "$GITHUB_OUTPUT"',
+    "sudo apt-get update && sudo apt-get install -y clang cmake",
+    "python3 scripts/rehearse-validator-admission.py",
+    "python3 scripts/check-validator-lifecycle-mutations.py",
+    "bash deploy/bootnodes/verify-bootnodes.selftest.sh",
+    "python3 scripts/check-live-node-retired-isolation.py --selftest\n"
+    "python3 scripts/check-live-node-retired-isolation.py",
+    'python3 scripts/rehearse-validator-activation.py --output "$RUNNER_TEMP/validator-activation"',
+    'python3 scripts/rehearse-validator-joining-network.py --output "$RUNNER_TEMP/validator-joining-network"',
+    "cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-node --bin bloch-pos audit_",
+    "cargo +${{ steps.pin.outputs.toolchain }} test --locked -p pqcrypto-internals",
+    "cargo +${{ steps.pin.outputs.toolchain }} test --locked \\\n"
+    "-p bloch-pos-committee \\\n"
+    "-p bloch-pos-node \\\n"
+    "-p bloch-crypto \\\n"
+    "-p coherence-core \\\n"
+    "-p bloch-sis-pow \\\n"
+    "-p bloch-pq-vault \\\n"
+    "-p pqcrypto-internals \\\n"
+    "-p genesis4-ceremony",
 )
 
 ESCAPES = (
@@ -177,6 +207,40 @@ def command_blocks(body: list[str], job_indent: int) -> list[list[str]]:
         elif not value.startswith((">", "*", "&", "[", "{", "'", '"')):
             blocks.append([value])
     return blocks
+
+
+def github_run_values(body: list[str], job_indent: int) -> list[str]:
+    values = []
+    index = 0
+    while index < len(body):
+        line = body[index]
+        spaces = len(line) - len(line.lstrip(" "))
+        stripped = line.strip()
+        value = None
+        field_indent = spaces
+        if spaces == job_indent + 4 and stripped.startswith("- run:"):
+            value = stripped[len("- run:"):].strip()
+        elif spaces == job_indent + 6 and stripped.startswith("run:"):
+            value = stripped[len("run:"):].strip()
+        index += 1
+        if value is None:
+            continue
+        if value in ("|", "|-", "|+", ">", ">-", ">+"):
+            separator = "\n" if value.startswith("|") else " "
+            continuation = []
+            while index < len(body):
+                candidate = body[index]
+                candidate_indent = len(candidate) - len(candidate.lstrip(" "))
+                if candidate_indent <= field_indent:
+                    break
+                continuation.append(candidate.strip())
+                index += 1
+            value = separator.join(continuation)
+        value = re.sub(r"\s+#.*$", "", value).strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values.append(value)
+    return values
 
 
 def github_action_steps(
@@ -332,6 +396,9 @@ def check_job(path: str, job: str, indent: int, label: str) -> list[str]:
             elif inputs:
                 problems.append(
                     f"{label}: job `{job}` action `{action}` has unreviewed `with:` inputs")
+        if tuple(github_run_values(body, indent)) != GITHUB_CARGO_TEST_RUNS:
+            problems.append(
+                f"{label}: job `{job}` run steps differ from the reviewed ordered command list")
 
     for line in body:
         waiver = re.match(r"^\s*(?:-\s+)?(allow_failure|continue-on-error):\s*(.*?)\s*(?:#.*)?$", line)
