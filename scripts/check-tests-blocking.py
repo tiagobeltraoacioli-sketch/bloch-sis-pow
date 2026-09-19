@@ -32,6 +32,9 @@ GitLab `.gitlab-ci.yml` job `build-and-test`, to the reviewed posture:
     run shell clears inherited shell/Python/Rust substitution variables while
     replacing PATH; required jobs use no containers/services/env overrides,
     and every action plus input is a reviewed immutable form.
+  * the GitHub workflow retains push and pull-request triggers, refuses the
+    privileged pull-request-target event, and grants only read-only contents
+    permission through one plain top-level mapping.
   * no required GitHub run step writes the cross-step PATH/environment command
     files that can replace `cargo` before the approved test command.
   * the `cargo-test` job's setup, rehearsals and test commands exactly match
@@ -210,7 +213,7 @@ CI_SCRIPT_ENTRYPOINT_SHA256 = {
     "scripts/check-iso-hardening.sh":
         "f0dae2e22aa766301def84a0c671ca4f79ff0c1b87d6e8647e9f6671669b91b3",
     "scripts/check-tests-blocking.selftest.py":
-        "bd82e89c6c7b38d87f0fab98dab998dd6f89028c39ca54d27cae6051ade87747",
+        "e150f483368175faa79d3bb74328646c72fe824356f88146089259c6c1e2dab6",
     "scripts/check-validator-lifecycle-mutations.py":
         "12b477e5043bc3ea98387be33ca586976494b30083522b214cea7d88c0e9f429",
     "scripts/devnet-particao-report.test.py":
@@ -794,6 +797,10 @@ def check_job(path: str, job: str, indent: int, label: str) -> list[str]:
             text, "defaults", label, required=True)
         problems += protected_global_key_problems(
             text, "env", label, required=False)
+        problems += protected_global_key_problems(
+            text, "on", label, required=True)
+        problems += protected_global_key_problems(
+            text, "permissions", label, required=True)
         top_level = job_blocks(text, 0)
         default_count = sum(
             bool(re.match(r"^defaults:\s*(?:#.*)?$", line))
@@ -809,6 +816,24 @@ def check_job(path: str, job: str, indent: int, label: str) -> list[str]:
                 or normalized_yaml_lines(env_lines) != SAFE_GITHUB_ENV):
             problems.append(
                 f"{label}: top-level `env:` differs from the reviewed inert subset")
+        trigger_lines = top_level.get("on")
+        triggers = set()
+        if trigger_lines is not None:
+            for line in trigger_lines:
+                match = re.match(r"^  ([A-Za-z0-9_-]+):(?:\s|$)", line)
+                if match:
+                    triggers.add(match.group(1))
+        for trigger in ("push", "pull_request"):
+            if trigger not in triggers:
+                problems.append(f"{label}: required top-level `{trigger}:` trigger is missing")
+        if "pull_request_target" in triggers:
+            problems.append(
+                f"{label}: privileged `pull_request_target:` is outside the supported trigger subset")
+        permission_lines = top_level.get("permissions")
+        if (permission_lines is None
+                or normalized_yaml_lines(permission_lines) != ("contents: read",)):
+            problems.append(
+                f"{label}: top-level `permissions:` must be exactly `contents: read`")
         for action, inputs in github_action_steps(body, indent):
             if action not in REVIEWED_GITHUB_ACTIONS:
                 problems.append(

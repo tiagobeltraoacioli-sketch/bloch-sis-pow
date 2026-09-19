@@ -290,6 +290,22 @@ CASES = [
          must_fail=True,
          expect="protected top-level `env:` key must occur at most once"),
 
+    Case("GitHub quoted duplicate trigger mapping cannot disable security pull requests",
+         GOOD_GITLAB,
+         GOOD_GITHUB +
+         "\n\"on\":\n"
+         "  workflow_dispatch:\n",
+         must_fail=True,
+         expect="protected top-level `on:` key must occur exactly once"),
+
+    Case("GitHub quoted duplicate permissions cannot replace security token posture",
+         GOOD_GITLAB,
+         GOOD_GITHUB +
+         "\n'permissions':\n"
+         "  contents: write\n",
+         must_fail=True,
+         expect="protected top-level `permissions:` key must occur exactly once"),
+
     Case("GitHub scanner step PATH cannot replace cargo",
          GOOD_GITLAB,
          GOOD_GITHUB.replace(

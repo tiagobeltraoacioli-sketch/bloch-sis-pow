@@ -105,6 +105,14 @@ tests-blocking-guard:
 
 GOOD_GITHUB = """\
 name: tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
 defaults:
   run:
     shell: /usr/bin/env -u BASH_ENV -u ENV -u PYTHONHOME -u PYTHONPATH -u CARGO_HOME -u RUSTUP_HOME -u RUSTUP_TOOLCHAIN -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS -u RUSTC -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER -u CARGO_BUILD_RUSTFLAGS -u CARGO_BUILD_RUSTC -u CARGO_BUILD_RUSTC_WRAPPER -u CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER PATH=/home/runner/.cargo/bin:/home/runner/.local/bin:/usr/local/bin:/usr/bin:/bin /bin/bash --noprofile --norc -euo pipefail {0}
@@ -206,6 +214,39 @@ CASES = [
          GOOD_GITHUB, must_fail=True, expect="reviewed runner tags and fail-fast before_script"),
     Case("reviewed GitHub global test environment stays green",
          GOOD_GITLAB, GOOD_GITHUB_WITH_ENV, must_fail=False),
+
+    Case("GitHub tests must run on pull requests",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace("  pull_request:\n", ""),
+         must_fail=True, expect="required top-level `pull_request:` trigger is missing"),
+
+    Case("GitHub tests refuse privileged pull request target",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  pull_request:\n",
+             "  pull_request:\n  pull_request_target:\n"),
+         must_fail=True, expect="privileged `pull_request_target:`"),
+
+    Case("GitHub tests token cannot gain write permission",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace("  contents: read\n", "  contents: write\n"),
+         must_fail=True, expect="must be exactly `contents: read`"),
+
+    Case("GitHub quoted duplicate trigger mapping cannot disable pull requests",
+         GOOD_GITLAB,
+         GOOD_GITHUB +
+         "\n\"on\":\n"
+         "  workflow_dispatch:\n",
+         must_fail=True,
+         expect="protected top-level `on:` key must occur exactly once"),
+
+    Case("GitHub quoted duplicate permissions cannot replace read-only token",
+         GOOD_GITLAB,
+         GOOD_GITHUB +
+         "\n'permissions':\n"
+         "  contents: write\n",
+         must_fail=True,
+         expect="protected top-level `permissions:` key must occur exactly once"),
     Case("reviewed GitHub run shell stays green",
          GOOD_GITLAB, GOOD_GITHUB, must_fail=False),
     Case("GitHub run shell cannot retain inherited RUSTC",

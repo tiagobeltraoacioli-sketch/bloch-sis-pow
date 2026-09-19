@@ -617,6 +617,10 @@ def check_file(
             text, "defaults", label, required=True)
         problems += protected_global_key_problems(
             text, "env", label, required=False)
+        problems += protected_global_key_problems(
+            text, "on", label, required=True)
+        problems += protected_global_key_problems(
+            text, "permissions", label, required=True)
         top_level = job_blocks(text, 0)
         default_count = sum(
             bool(re.match(r"^defaults:\s*(?:#.*)?$", line))
