@@ -4712,13 +4712,14 @@ impl Engine {
             verification_source,
             GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
         );
-        let decision = pool.process(
+        let decision = pool.process_from_source(
             att,
             self.wall_slot,
             &committees_at,
             &known,
             &verifier,
             &*rolled,
+            verification_source,
         );
         locally_limited_gossip_decision(decision, verifier.limited())
     }
@@ -4769,13 +4770,13 @@ impl Engine {
             return false;
         };
         let mut pool = std::mem::take(&mut self.att_pool);
-        let (waiting, root_remains) = pool.take_waiting_on_limit(
+        let (waiting, root_remains) = pool.take_waiting_on_limit_with_sources(
             &root,
             HELD_ATTESTATIONS_PER_TURN,
         );
-        let released: Vec<_> = waiting.into_iter().map(|att| {
+        let released: Vec<_> = waiting.into_iter().map(|(att, verification_source)| {
             let epoch = epoch_of(att.data.slot);
-            let decision = self.judge(&mut pool, att.clone(), epoch);
+            let decision = self.judge_from(&mut pool, att.clone(), epoch, verification_source);
             (att, decision)
         }).collect();
         self.att_pool = pool;

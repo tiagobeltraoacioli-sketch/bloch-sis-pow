@@ -71,6 +71,16 @@ pub const MAX_PENDING_ATTESTATIONS: usize = 256;
 /// ingestion. This is a node-local work/retention slice: the global pool still
 /// accepts other roots, and overflow is Ignore rather than peer fault.
 pub const MAX_PENDING_ATTESTATIONS_PER_ROOT: usize = 32;
+/// Distinct missing roots represented in the pending pool. Without this
+/// aggregate bound, one valid duty per invented root can turn one later sync
+/// page into hundreds of independently queued replay roots.
+pub const MAX_PENDING_ATTESTATION_ROOTS: usize = 32;
+/// Pending attestations attributed to one normalized transport source across
+/// all missing roots. Unattributed/local input does not acquire a fabricated
+/// identity and remains covered by the aggregate pool/root limits.
+pub const MAX_PENDING_ATTESTATIONS_PER_SOURCE: usize = 32;
+/// Pending attestations one attributed source may park for one missing root.
+pub const MAX_PENDING_ATTESTATIONS_PER_SOURCE_ROOT: usize = 8;
 
 /// Distinct attestations accepted per duty before further ones are ignored
 /// (spec §6.2). Two, because slashing evidence needs exactly a conflicting
@@ -139,6 +149,15 @@ pub enum IgnoreReason {
     /// The cap prevents one later block arrival from replaying the entire
     /// global pending pool in one non-preemptible engine event.
     PendingRootLimit,
+    /// The aggregate pending pool already represents the maximum number of
+    /// distinct missing roots. Capacity pressure is local state, not guilt.
+    PendingRootSetLimit,
+    /// This attributed transport source already occupies its aggregate share
+    /// of the pending pool across missing roots.
+    PendingSourceLimit,
+    /// This attributed transport source already occupies its share for this
+    /// missing root.
+    PendingSourceRootLimit,
 }
 
 /// The decision on one arriving attestation. The node maps this onto
@@ -217,6 +236,7 @@ struct DutyRecord {
 struct PendingEntry {
     att: Attestation,
     missing_root: [u8; 32],
+    verification_source: Option<[u8; 32]>,
 }
 
 /// The attestation pool: dedup, equivocation capture, and the pending
@@ -243,6 +263,10 @@ pub struct AttestationPool {
     /// eviction), in [`AttestationPool::evict`], so it never drifts from
     /// `pending`'s actual contents.
     pending_by_duty: BTreeMap<DutyKey, usize>,
+    /// Attributed-source indexes. These are admission/replay fairness only;
+    /// they never affect attestation validity and omit unattributed entries.
+    pending_by_source: BTreeMap<[u8; 32], usize>,
+    pending_by_source_root: BTreeMap<([u8; 32], [u8; 32]), usize>,
     /// Monotone insertion counter. Never reused, so FIFO order is total and
     /// deterministic across identical histories.
     next_seq: u64,
@@ -324,6 +348,22 @@ impl AttestationPool {
         blocks: &impl BlockLookup,
         verifier: &dyn SignatureVerifier,
         keys: &dyn KeyLookup,
+    ) -> GossipDecision {
+        self.process_from_source(att, current_slot, committees, blocks, verifier, keys, None)
+    }
+
+    /// [`Self::process`] with the normalized transport identity retained for
+    /// node-local pending/replay fairness. `None` deliberately means
+    /// unattributed; callers must not invent an identity for local input.
+    pub fn process_from_source(
+        &mut self,
+        att: Attestation,
+        current_slot: u64,
+        committees: &impl CommitteeLookup,
+        blocks: &impl BlockLookup,
+        verifier: &dyn SignatureVerifier,
+        keys: &dyn KeyLookup,
+        verification_source: Option<[u8; 32]>,
     ) -> GossipDecision {
         let slot = att.data.slot;
 
@@ -455,7 +495,27 @@ impl AttestationPool {
                 if pending_for_root >= MAX_PENDING_ATTESTATIONS_PER_ROOT {
                     return GossipDecision::Ignore(IgnoreReason::PendingRootLimit);
                 }
-                return self.hold(duty, att, root, data_hash);
+                if !self.pending_by_root.contains_key(&root)
+                    && self.pending_by_root.len() >= MAX_PENDING_ATTESTATION_ROOTS
+                {
+                    return GossipDecision::Ignore(IgnoreReason::PendingRootSetLimit);
+                }
+                if let Some(source) = verification_source {
+                    if self.pending_by_source.get(&source).copied().unwrap_or(0)
+                        >= MAX_PENDING_ATTESTATIONS_PER_SOURCE
+                    {
+                        return GossipDecision::Ignore(IgnoreReason::PendingSourceLimit);
+                    }
+                    if self.pending_by_source_root
+                        .get(&(source, root))
+                        .copied()
+                        .unwrap_or(0)
+                        >= MAX_PENDING_ATTESTATIONS_PER_SOURCE_ROOT
+                    {
+                        return GossipDecision::Ignore(IgnoreReason::PendingSourceRootLimit);
+                    }
+                }
+                return self.hold(duty, att, root, data_hash, verification_source);
             }
         }
 
@@ -490,10 +550,21 @@ impl AttestationPool {
         verifier: &dyn SignatureVerifier,
         keys: &dyn KeyLookup,
     ) -> Vec<(Attestation, GossipDecision)> {
-        self.take_waiting_on(root).into_iter().map(|att| {
-            let decision = self.process(att.clone(), current_slot, committees, blocks, verifier, keys);
-            (att, decision)
-        }).collect()
+        self.take_waiting_on_limit_with_sources(root, usize::MAX)
+            .0
+            .into_iter()
+            .map(|(att, verification_source)| {
+                let decision = self.process_from_source(
+                    att.clone(),
+                    current_slot,
+                    committees,
+                    blocks,
+                    verifier,
+                    keys,
+                    verification_source,
+                );
+                (att, decision)
+            }).collect()
     }
 
     /// Extract waiters in FIFO order, removing every pending index before
@@ -511,6 +582,18 @@ impl AttestationPool {
         root: &[u8; 32],
         limit: usize,
     ) -> (Vec<Attestation>, bool) {
+        let (waiting, remains) = self.take_waiting_on_limit_with_sources(root, limit);
+        (waiting.into_iter().map(|(att, _)| att).collect(), remains)
+    }
+
+    /// Source-preserving form of [`Self::take_waiting_on_limit`]. The node
+    /// feeds this identity back into both verification budgeting and any
+    /// second hold when the attestation's other root is still missing.
+    pub fn take_waiting_on_limit_with_sources(
+        &mut self,
+        root: &[u8; 32],
+        limit: usize,
+    ) -> (Vec<(Attestation, Option<[u8; 32]>)>, bool) {
         let seqs: Vec<u64> = self.pending_by_root.get(root)
             .into_iter()
             .flat_map(|entries| entries.iter().take(limit))
@@ -519,7 +602,7 @@ impl AttestationPool {
         let mut out = Vec::with_capacity(seqs.len());
         for seq in seqs {
             if let Some(entry) = self.pending.get(&seq) {
-                out.push(entry.att.clone());
+                out.push((entry.att.clone(), entry.verification_source));
                 self.evict(seq);
             }
         }
@@ -587,6 +670,7 @@ impl AttestationPool {
         att: Attestation,
         missing_root: [u8; 32],
         data_hash: [u8; 32],
+        verification_source: Option<[u8; 32]>,
     ) -> GossipDecision {
         while self.pending.len() >= MAX_PENDING_ATTESTATIONS {
             // Oldest first. `keys().next()` on a BTreeMap is the smallest
@@ -609,8 +693,15 @@ impl AttestationPool {
         #[allow(clippy::arithmetic_side_effects)]
         {
             *self.pending_by_duty.entry(duty).or_insert(0) += 1;
+            if let Some(source) = verification_source {
+                *self.pending_by_source.entry(source).or_insert(0) += 1;
+                *self.pending_by_source_root.entry((source, missing_root)).or_insert(0) += 1;
+            }
         }
-        self.pending.insert(seq, PendingEntry { att, missing_root });
+        self.pending.insert(
+            seq,
+            PendingEntry { att, missing_root, verification_source },
+        );
         GossipDecision::Hold { missing_root }
     }
 
@@ -625,6 +716,21 @@ impl AttestationPool {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
                     self.pending_by_duty.remove(&duty);
+                }
+            }
+            if let Some(source) = entry.verification_source {
+                if let Some(count) = self.pending_by_source.get_mut(&source) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.pending_by_source.remove(&source);
+                    }
+                }
+                let source_root = (source, entry.missing_root);
+                if let Some(count) = self.pending_by_source_root.get_mut(&source_root) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.pending_by_source_root.remove(&source_root);
+                    }
                 }
             }
             self.pending_keys.remove(&(
@@ -1065,6 +1171,174 @@ mod tests {
     }
 
     #[test]
+    fn multi_root_flood_is_aggregate_bounded_and_release_reopens_capacity() {
+        let mut pool = AttestationPool::new();
+        let blocks = BTreeSet::new();
+
+        for i in 0..MAX_PENDING_ATTESTATION_ROOTS {
+            let validator = 1 + (i % 8) as u32;
+            let slot = CURRENT_SLOT.saturating_sub((i / 8) as u64);
+            assert!(matches!(
+                pool.process(
+                    att(validator, slot, 0x40 + i as u8),
+                    CURRENT_SLOT,
+                    &committees(),
+                    &known(&blocks),
+                    &RootEchoVerifier,
+                    &AnyKey,
+                ),
+                GossipDecision::Hold { .. }
+            ));
+        }
+        assert_eq!(pool.pending_by_root.len(), MAX_PENDING_ATTESTATION_ROOTS);
+
+        let overflow = att(1, CURRENT_SLOT - 4, 0xE0);
+        assert!(matches!(
+            pool.process(
+                overflow.clone(),
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+            ),
+            GossipDecision::Ignore(IgnoreReason::PendingRootSetLimit),
+        ));
+        assert_eq!(pool.pending_len(), MAX_PENDING_ATTESTATION_ROOTS);
+
+        assert_eq!(pool.take_waiting_on(&root(0x40)).len(), 1);
+        assert!(matches!(
+            pool.process(
+                overflow,
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+            ),
+            GossipDecision::Hold { missing_root } if missing_root == root(0xE0),
+        ));
+    }
+
+    #[test]
+    fn attributed_source_is_bounded_across_roots_and_identity_survives_release() {
+        let mut pool = AttestationPool::new();
+        let blocks = BTreeSet::new();
+        let source_a = [0xA1; 32];
+        let source_b = [0xB2; 32];
+
+        for i in 0..MAX_PENDING_ATTESTATIONS_PER_SOURCE {
+            let validator = 1 + (i % 8) as u32;
+            let slot = CURRENT_SLOT.saturating_sub((i / 8) as u64);
+            assert!(matches!(
+                pool.process_from_source(
+                    att(validator, slot, 0x40 + i as u8),
+                    CURRENT_SLOT,
+                    &committees(),
+                    &known(&blocks),
+                    &RootEchoVerifier,
+                    &AnyKey,
+                    Some(source_a),
+                ),
+                GossipDecision::Hold { .. }
+            ));
+        }
+
+        let overflow = att(1, CURRENT_SLOT - 4, 0x40);
+        assert!(matches!(
+            pool.process_from_source(
+                overflow.clone(),
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+                Some(source_a),
+            ),
+            GossipDecision::Ignore(IgnoreReason::PendingSourceLimit),
+        ));
+        assert!(matches!(
+            pool.process_from_source(
+                overflow.clone(),
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+                Some(source_b),
+            ),
+            GossipDecision::Hold { .. },
+        ));
+
+        let (released, remains) = pool.take_waiting_on_limit_with_sources(&root(0x40), 1);
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].1, Some(source_a));
+        assert!(remains, "source B's later waiter must remain in root FIFO");
+        let recovery = att(2, CURRENT_SLOT - 4, 0x41);
+        assert!(matches!(
+            pool.process_from_source(
+                recovery,
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+                Some(source_a),
+            ),
+            GossipDecision::Hold { .. },
+        ));
+    }
+
+    #[test]
+    fn one_source_cannot_fill_one_root_and_other_sources_keep_headroom() {
+        let mut pool = AttestationPool::new();
+        let blocks = BTreeSet::new();
+        let source_a = [0xA1; 32];
+        let source_b = [0xB2; 32];
+
+        for i in 0..MAX_PENDING_ATTESTATIONS_PER_SOURCE_ROOT {
+            assert!(matches!(
+                pool.process_from_source(
+                    att(1 + i as u32, CURRENT_SLOT, 0xAA),
+                    CURRENT_SLOT,
+                    &committees(),
+                    &known(&blocks),
+                    &RootEchoVerifier,
+                    &AnyKey,
+                    Some(source_a),
+                ),
+                GossipDecision::Hold { .. }
+            ));
+        }
+
+        let overflow = att(1, CURRENT_SLOT - 1, 0xAA);
+        assert!(matches!(
+            pool.process_from_source(
+                overflow,
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+                Some(source_a),
+            ),
+            GossipDecision::Ignore(IgnoreReason::PendingSourceRootLimit),
+        ));
+        assert!(matches!(
+            pool.process_from_source(
+                att(2, CURRENT_SLOT - 1, 0xAA),
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+                Some(source_b),
+            ),
+            GossipDecision::Hold { .. },
+        ));
+    }
+
+    #[test]
     fn pending_root_release_is_sliced_fifo_without_stranding_tail() {
         let mut pool = AttestationPool::new();
         let blocks = BTreeSet::new();
@@ -1166,12 +1440,13 @@ mod tests {
             let v = 1 + (i / window) as u32;
             assert!(v <= 8, "test committee only has 8 members");
             let slot = CURRENT_SLOT - (i % window);
-            // Distinct head per i too, belt-and-suspenders against collapsing
-            // any two entries into one dedup key.
+            // Exercise the global FIFO without bypassing the independent
+            // distinct-root bound: 32 roots each carry eight distinct duties.
             let mut d0 = data(slot, 0xAA);
             d0.head = {
                 let mut h = [0u8; 32];
-                h[..8].copy_from_slice(&i.to_le_bytes());
+                let root_index = i % MAX_PENDING_ATTESTATION_ROOTS as u64;
+                h[..8].copy_from_slice(&root_index.to_le_bytes());
                 h
             };
             let d = pool.process(signed(v, d0), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
