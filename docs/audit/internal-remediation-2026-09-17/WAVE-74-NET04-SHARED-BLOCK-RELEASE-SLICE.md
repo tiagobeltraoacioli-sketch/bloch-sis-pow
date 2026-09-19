@@ -43,10 +43,11 @@ or reorder blocks within a class.
 - `deferred_block_classes_share_one_fair_slice` holds both classes ready for
   128 turns and proves strict alternation, then proves a newly ready competing
   class receives the next shared turn and empty queues select no work.
-- `future_and_orphan_releases_share_one_block_transition_turn` creates both
-  retained classes together and proves the first call consumes only the future
-  class while leaving the exact orphan FIFO entry intact; only a second control
-  turn consumes that class.
+- `future_and_orphan_releases_share_one_block_transition_turn` builds a real,
+  sequential `b1 -> b2 -> b3` chain, retains `b2` as ready future work and
+  `b3` as its blocked orphan, then proves the first call applies only `b2` and
+  merely moves the exact `b3` entry into the deferred FIFO; only a second
+  control turn applies `b3`. The fixture asserts distinct block ids.
 
 Existing class-specific regressions also passed:
 

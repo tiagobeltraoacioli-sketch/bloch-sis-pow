@@ -12091,7 +12091,6 @@ mod ingest_admission_tests {
 
         engine.propose(2);
         let future = engine.blocks[engine.head_id().as_bytes()].clone();
-        assert!(engine.do_reorg(parent, Vec::new()));
         engine.propose(3);
         let orphan = engine.blocks[engine.head_id().as_bytes()].clone();
         assert!(engine.do_reorg(parent, Vec::new()));
@@ -12110,14 +12109,15 @@ mod ingest_admission_tests {
             orphan,
             Source::Gossip(Some([0x04; 32])),
         );
-        engine.schedule_unblocked_orphans(parent, false);
         assert_eq!(engine.future_blocks.len(), 1);
-        assert_eq!(engine.deferred_orphans.len(), 1);
+        assert_eq!(engine.orphans.len(), 1);
+        assert!(engine.deferred_orphans.is_empty());
 
         let mut scheduler = DeferredBlockScheduler::default();
         let pending = engine.release_deferred_block_turn(3, &mut scheduler);
         assert_eq!(pending, (false, true));
         assert!(engine.future_blocks.is_empty());
+        assert!(engine.orphans.is_empty(), "landing the parent unlocks its child");
         assert_eq!(engine.deferred_orphans.len(), 1);
         assert!(engine.blocks.contains_key(&future_id));
         assert_eq!(
