@@ -1155,14 +1155,23 @@ mod kat {
 
     #[test]
     fn canonical_raw_verifier_rejects_padded_falcon_half_without_sniffing() {
-        let msg = b"canonical-raw-legacy-format";
-        let (mpk, msk) = mldsa65::keypair();
-        let (fpk, fsk) = falcon1024::keypair();
-
-        let mut pk = mpk.as_bytes().to_vec();
-        pk.extend_from_slice(fpk.as_bytes());
-        let mut sig = mldsa65::detached_sign(msg, &msk).as_bytes().to_vec();
-        sig.extend_from_slice(falcon1024::detached_sign(msg, &fsk).as_bytes());
+        // Reuse the exact deterministic compact fixture from the enveloped
+        // test above, then strip only its suite headers. Random Falcon
+        // signatures vary in encoded length and can already fill the padded
+        // form, making this fixture precondition flaky before either verifier
+        // is exercised.
+        let msg = b"canonical-enveloped-format";
+        let (enveloped_pk, enveloped_sk) =
+            generate_keypair_from_seed(&[0x58; 32]).unwrap();
+        let enveloped_sig = pqcrypto_internals::with_seeded_rng_scope(&[0xA5; 32], || {
+            sign(&enveloped_sk, msg).unwrap()
+        });
+        let (pk_suite, pk) = split_envelope(&enveloped_pk).unwrap();
+        let (sig_suite, sig) = split_envelope(&enveloped_sig).unwrap();
+        assert_eq!(pk_suite, SUITE_MLDSA65_FALCON1024);
+        assert_eq!(sig_suite, SUITE_MLDSA65_FALCON1024);
+        let pk = pk.to_vec();
+        let sig = sig.to_vec();
 
         assert!(verify_legacy_hybrid_raw(&pk, msg, &sig));
         assert!(verify_legacy_hybrid_raw_canonical(&pk, msg, &sig));
