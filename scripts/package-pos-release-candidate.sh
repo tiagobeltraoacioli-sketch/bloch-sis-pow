@@ -91,6 +91,20 @@ LC_ALL=C grep -Eq \
   <<< "$source_identity" \
   || fail "binary source identity line is not the exact asserted clean-source format"
 
+rustc_verbose="$(cd "$source" && rustc -vV)" \
+  || fail "rustc -vV failed while resolving the release target"
+target_count="$(printf '%s\n' "$rustc_verbose" \
+  | awk '/^host: / { count++ } END { print count + 0 }')"
+[ "$target_count" = 1 ] \
+  || fail "rustc -vV must report exactly one host target"
+target="$(printf '%s\n' "$rustc_verbose" | sed -n 's/^host: //p')"
+case "$target" in
+  ''|*[!abcdefghijklmnopqrstuvwxyz0123456789_-]*|-*|*-|*--*)
+    fail "rustc host target must be a lowercase ASCII Rust triple" ;;
+  *-*-*) : ;;
+  *) fail "rustc host target must be a lowercase ASCII Rust triple" ;;
+esac
+
 stage="$work/stage"
 mkdir -p "$stage"
 cp "$binary" "$stage/bloch-pos"
@@ -102,7 +116,7 @@ printf '%s  bloch-pos\n' "$binary_sha" > "$stage/SHA256SUMS"
   printf 'source_commit=%s\n' "$commit"
   printf 'source_commit_short=%s\n' "${commit:0:12}"
   printf 'rust_toolchain=%s\n' "$pin"
-  printf 'target=%s\n' "$(cd "$source" && rustc -vV | sed -n 's/^host: //p')"
+  printf 'target=%s\n' "$target"
   printf 'binary_sha256=%s\n' "$binary_sha"
   printf 'binary_version=%s\n' "$binary_version"
   printf 'binary_source_identity=%s\n' "$source_identity"

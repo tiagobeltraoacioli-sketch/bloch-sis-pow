@@ -68,8 +68,25 @@ pin="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$toolchain_file")"
 case "${1:-}" in
   --version) printf 'rustc %s (selftest)\n' "$pin" ;;
   -vV)
-    printf 'rustc %s (selftest)\n' "$pin"
-    printf 'host: x86_64-unknown-linux-gnu\n'
+    case "${FAKE_RUSTC_MODE:-canonical}" in
+      canonical)
+        printf 'rustc %s (selftest)\n' "$pin"
+        printf 'host: x86_64-unknown-linux-gnu\n'
+        ;;
+      exit) exit 70 ;;
+      missing)
+        printf 'rustc %s (selftest)\n' "$pin"
+        ;;
+      duplicate)
+        printf 'rustc %s (selftest)\n' "$pin"
+        printf 'host: x86_64-unknown-linux-gnu\n'
+        printf 'host: aarch64-unknown-linux-gnu\n'
+        ;;
+      malformed)
+        printf 'rustc %s (selftest)\n' "$pin"
+        printf 'host: NOT A TARGET\n'
+        ;;
+    esac
     ;;
   *) exit 64 ;;
 esac
@@ -128,8 +145,10 @@ chmod 0755 "$fake_bin/cargo"
 
 run_package() {
   local version_mode="${2:-canonical}"
+  local rustc_mode="${3:-canonical}"
   ( cd "$test_repo" && PATH="$fake_bin:$PATH" REAL_GIT="$real_git" \
       FAKE_VERSION_MODE="$version_mode" \
+      FAKE_RUSTC_MODE="$rustc_mode" \
       TEST_REPO="$test_repo" "$test_repo/scripts/package-pos-release-candidate.sh" \
       "$1" )
 }
@@ -143,6 +162,20 @@ expect_version_failure() {
   fi
   grep -Fq "$expected" "$log" || {
     echo "selftest: --version mode $mode failed without expected diagnostic" >&2
+    cat "$log" >&2
+    exit 1
+  }
+}
+
+expect_target_failure() {
+  local mode="$1" expected="$2"
+  local output="$work/target-$mode" log="$work/target-$mode.log"
+  if run_package "$output" canonical "$mode" > "$log" 2>&1; then
+    echo "selftest: noncanonical rustc target mode $mode was accepted" >&2
+    exit 1
+  fi
+  grep -Fq "$expected" "$log" || {
+    echo "selftest: rustc target mode $mode failed without expected diagnostic" >&2
     cat "$log" >&2
     exit 1
   }
@@ -186,5 +219,14 @@ expect_version_failure extra-line \
   'binary version output must contain exactly two newline-terminated lines'
 expect_version_failure malformed-source \
   'binary source identity line is not the exact asserted clean-source format'
+
+expect_target_failure exit \
+  'rustc -vV failed while resolving the release target'
+expect_target_failure missing \
+  'rustc -vV must report exactly one host target'
+expect_target_failure duplicate \
+  'rustc -vV must report exactly one host target'
+expect_target_failure malformed \
+  'rustc host target must be a lowercase ASCII Rust triple'
 
 echo "package-pos-release-candidate selftest: PASS"
