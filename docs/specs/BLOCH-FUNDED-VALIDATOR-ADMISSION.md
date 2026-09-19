@@ -159,6 +159,11 @@ Each signing invocation uses the existing sealed-keystore passphrase sourcing;
 there is no passphrase argument. Inspect all inputs, the network domain,
 validator hash, withdrawal script, commission and fee budget on each signing
 machine. Rebuilding any intent field invalidates both signatures.
+`inspect` authenticates every signature already present before reporting the
+artifact. It uses the format's suite-enveloped key as trusted metadata, checks
+enveloped and legacy raw signatures explicitly, then retains generic detection
+only as a compatibility fallback. Inspection compatibility does not relax the
+consensus requirement below that completed deposits carry suite envelopes.
 
 ## Wire and hash contract
 

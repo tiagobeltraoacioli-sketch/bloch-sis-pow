@@ -194,11 +194,40 @@ fn prepare(args: &[String]) -> Result<(), String> {
     tx.change.value = u64::try_from(change).map_err(|_| "change exceeds a u64 UTXO")?;
     tx.validate_shape()
         .map_err(|e| format!("invalid change or deposit: {e:?}"))?;
-    inspect(&tx);
+    inspect(&tx)?;
     write_tx(a.get("--out")?, &tx)
 }
 
-fn inspect(tx: &FundedDeposit) {
+fn verify_existing_authorization(public_key: &[u8], root: &[u8], signature: &[u8]) -> bool {
+    if bloch_crypto::crypto::verify_enveloped(public_key, root, signature) {
+        return true;
+    }
+    if public_key.len() == bloch_pos_committee::transition::funded::ADMISSION_PQ_KEY_BYTES
+        && public_key.starts_with(&[0xb1, 0x0c, 1, 0])
+        && bloch_crypto::crypto::verify_legacy_hybrid_raw(
+            &public_key[bloch_crypto::crypto::SUITE_HEADER_LEN..],
+            root,
+            signature,
+        )
+    {
+        return true;
+    }
+    bloch_crypto::crypto::verify(public_key, root, signature)
+}
+
+fn inspect(tx: &FundedDeposit) -> Result<(), String> {
+    for (public_key, root, signature) in [
+        (&tx.funding_pubkey, tx.funding_root(), &tx.funding_signature),
+        (
+            &tx.validator_pubkey,
+            tx.possession_root(),
+            &tx.proof_of_possession,
+        ),
+    ] {
+        if !signature.is_empty() && !verify_existing_authorization(public_key, &root, signature) {
+            return Err("existing authorization does not match the intent".into());
+        }
+    }
     let pk_hash = |key: &[u8]| codec::hex(&Sha3_256::digest(key));
     println!("Network domain: {}", codec::hex(&tx.network_domain));
     println!("Funding authority: {}", pk_hash(&tx.funding_pubkey));
@@ -248,6 +277,7 @@ fn inspect(tx: &FundedDeposit) {
         !tx.funding_signature.is_empty(),
         !tx.proof_of_possession.is_empty()
     );
+    Ok(())
 }
 
 fn sign(args: &[String]) -> Result<(), String> {
@@ -262,20 +292,10 @@ fn sign(args: &[String]) -> Result<(), String> {
     if role != "funding" && role != "validator" {
         return Err("role must be funding or validator".into());
     }
-    // Verify any existing signatures before opening a secret. An invalid
-    // counterparty signature must not be laundered into a signed artifact.
-    for (pk, root, sig) in [
-        (&tx.funding_pubkey, tx.funding_root(), &tx.funding_signature),
-        (
-            &tx.validator_pubkey,
-            tx.possession_root(),
-            &tx.proof_of_possession,
-        ),
-    ] {
-        if !sig.is_empty() && !bloch_crypto::crypto::verify(pk, &root, sig) {
-            return Err("existing authorization does not match the intent".into());
-        }
-    }
+    // Inspect and authenticate every existing authorization before opening a
+    // secret. An invalid counterparty signature must not be laundered into a
+    // signed artifact.
+    inspect(&tx)?;
     let keys = Keystore::load(Path::new(a.get("--dir")?)).map_err(error)?;
     let expected = if role == "funding" {
         &tx.funding_pubkey
@@ -290,7 +310,6 @@ fn sign(args: &[String]) -> Result<(), String> {
     {
         return Err("validator keystore does not open the signed RANDAO commitment".into());
     }
-    inspect(&tx);
     if role == "funding" {
         tx.funding_signature = keys.sign(&tx.funding_root());
     } else {
@@ -317,9 +336,87 @@ pub fn run(args: &[String]) -> Result<(), String> {
         "sign" => sign(rest),
         "inspect" => {
             let a = Args::parse(rest, &["--tx"])?;
-            inspect(&read_tx(a.get("--tx")?)?);
-            Ok(())
+            inspect(&read_tx(a.get("--tx")?)?)
         }
         _ => Err("expected prepare, inspect, sign or --help".into()),
+    }
+}
+
+#[cfg(test)]
+mod audit_signature_policy_tests {
+    use super::*;
+
+    #[test]
+    fn inspect_accepts_genuine_magic_prefixed_raw_deposit_authorization() {
+        const SEARCH_COUNTER: u64 = 85_528;
+        const SIGNING_SEED_HEX: &str =
+            "a5478420173088fc02f628995681944cd45bf41ac24fc5c6caf1cade222054bf";
+        const POSSESSION_ROOT_HEX: &str =
+            "3982ce6fabe71afda53af24bf206546f2c462d64ec4d882a273cbcfeeabf7279";
+
+        let (funding_pubkey, _) =
+            bloch_crypto::crypto::generate_keypair_from_seed(&[0x67; 32]).unwrap();
+        let (validator_pubkey, validator_secret) =
+            bloch_crypto::crypto::generate_keypair_from_seed(&[0x68; 32]).unwrap();
+        let mut tx = FundedDeposit {
+            network_domain: [1; 32],
+            valid_until_epoch: 3016,
+            funding_pubkey,
+            inputs: vec![FundingInput {
+                txid: [2; 32],
+                vout: 0,
+            }],
+            validator_pubkey: validator_pubkey.clone(),
+            amount_sat: 2_500_000_000_000,
+            randao_commitment: [3; 32],
+            withdrawal_credentials: [4; 32],
+            commission_bps: 0,
+            change: TransferOutput {
+                value: 955709,
+                script_hash: [4; 32],
+            },
+            max_base_fee_millisat_per_gas: 100,
+            tip_millisat_per_gas: 5,
+            tx_bytes: 0,
+            funding_signature: vec![],
+            proof_of_possession: vec![],
+        };
+        tx.tx_bytes = tx.reserved_tx_bytes();
+        let root = tx.possession_root();
+        assert_eq!(codec::hex(&root), POSSESSION_ROOT_HEX);
+
+        let mut h = Sha3_256::new();
+        h.update(b"bloch/deposit-funding/cr10/signing-rng/v1");
+        h.update(SEARCH_COUNTER.to_le_bytes());
+        let signing_seed: [u8; 32] = h.finalize().into();
+        assert_eq!(codec::hex(&signing_seed), SIGNING_SEED_HEX);
+        let enveloped_signature =
+            pqcrypto_internals::with_seeded_rng_scope(&signing_seed, || {
+                bloch_crypto::crypto::sign(&validator_secret, &root).unwrap()
+            });
+        assert!(bloch_crypto::crypto::verify_enveloped_canonical(
+            &validator_pubkey,
+            &root,
+            &enveloped_signature,
+        ));
+
+        let raw_signature =
+            enveloped_signature[bloch_crypto::crypto::SUITE_HEADER_LEN..].to_vec();
+        assert_eq!(&raw_signature[..2], &[0xb1, 0x0c]);
+        assert!(
+            !bloch_crypto::crypto::verify(&validator_pubkey, &root, &raw_signature),
+            "generic autodetection must misclassify this genuine raw signature"
+        );
+        assert!(verify_existing_authorization(
+            &validator_pubkey,
+            &root,
+            &raw_signature,
+        ));
+        tx.proof_of_possession = raw_signature;
+        assert!(inspect(&tx).is_ok());
+
+        let last = tx.proof_of_possession.len() - 1;
+        tx.proof_of_possession[last] ^= 1;
+        assert!(inspect(&tx).is_err());
     }
 }
