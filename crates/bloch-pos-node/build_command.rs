@@ -89,7 +89,8 @@ pub(crate) fn rustflags_linker(flags: &str, encoded: bool) -> Option<String> {
                 linker = Some(value.to_owned());
             }
         } else if word == "-C" {
-            if let Some(value) = words.get(index.saturating_add(1))
+            if let Some(value) = words
+                .get(index.saturating_add(1))
                 .and_then(|next| next.strip_prefix("linker="))
                 .filter(|value| !value.is_empty())
             {
@@ -112,35 +113,66 @@ fn environment_assignment(word: &str) -> bool {
             .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
 }
 
-/// Extract the executable from stable rustc `--print link-args` output. Unix
-/// rustc may prefix the linker with `env`, unsets and assignments; other
-/// targets commonly print the linker directly. Unknown `env` options fail
-/// closed instead of guessing which later word is executable.
-pub(crate) fn linker_from_printed_args(output: &str) -> Option<String> {
+/// Extract the executable and any effective PATH override from stable rustc
+/// `--print link-args` output. Unix rustc may prefix the linker with `env`,
+/// unsets and assignments; other targets commonly print the linker directly.
+/// Unknown options and a bare command after PATH was cleared fail closed
+/// instead of fingerprinting a same-named executable from the build script's
+/// different environment.
+pub(crate) fn linker_from_printed_args(output: &str) -> Option<(String, Option<String>)> {
     let words = configured_command_words(output)?;
     let first = words.first()?;
     let is_env = Path::new(first)
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.eq_ignore_ascii_case("env") || name.eq_ignore_ascii_case("env.exe"));
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("env") || name.eq_ignore_ascii_case("env.exe")
+        });
     if !is_env {
-        return Some(first.clone());
+        return Some((first.clone(), None));
     }
 
     let mut index = 1usize;
+    let mut path_cleared = false;
+    let mut path_override = None;
     while index < words.len() {
         match words[index].as_str() {
             "-u" | "--unset" => {
+                let name = words.get(index.checked_add(1)?)?;
+                if name.eq_ignore_ascii_case("PATH") {
+                    path_cleared = true;
+                    path_override = None;
+                }
                 index = index.checked_add(2)?;
-                if index > words.len() {
+            }
+            "-i" | "--ignore-environment" => {
+                path_cleared = true;
+                path_override = None;
+                index = index.saturating_add(1);
+            }
+            word if word.starts_with("--unset=") => {
+                if word["--unset=".len()..].eq_ignore_ascii_case("PATH") {
+                    path_cleared = true;
+                    path_override = None;
+                }
+                index = index.saturating_add(1);
+            }
+            word if word.starts_with('-') => return None,
+            word if environment_assignment(word) => {
+                let (name, value) = word.split_once('=')?;
+                if name.eq_ignore_ascii_case("PATH") {
+                    path_cleared = false;
+                    path_override = Some(value.to_owned());
+                }
+                index = index.saturating_add(1);
+            }
+            command => {
+                let has_path = Path::new(command).components().count() > 1;
+                if !has_path && path_cleared && path_override.is_none() {
                     return None;
                 }
+                return Some((command.to_owned(), path_override));
             }
-            "-i" | "--ignore-environment" => index = index.saturating_add(1),
-            word if word.starts_with("--unset=") => index = index.saturating_add(1),
-            word if word.starts_with('-') => return None,
-            word if environment_assignment(word) => index = index.saturating_add(1),
-            command => return Some(command.to_owned()),
         }
     }
     None
@@ -154,7 +186,11 @@ mod tests {
     fn command_words_preserve_quoted_paths_and_reject_ambiguous_quotes() {
         assert_eq!(
             configured_command_words("'/opt/cache wrapper' clang -O2"),
-            Some(vec!["/opt/cache wrapper".into(), "clang".into(), "-O2".into()])
+            Some(vec![
+                "/opt/cache wrapper".into(),
+                "clang".into(),
+                "-O2".into()
+            ])
         );
         assert_eq!(
             configured_command_words(r"C:\toolchain\cc.exe -O2"),
@@ -175,7 +211,10 @@ mod tests {
             delegated_compiler(&["/usr/bin/clang".into(), "-O2".into()]),
             None
         );
-        assert_eq!(delegated_compiler(&["sccache".into(), "--start-server".into()]), None);
+        assert_eq!(
+            delegated_compiler(&["sccache".into(), "--start-server".into()]),
+            None
+        );
         assert_eq!(delegated_compiler(&["sccache".into()]), None);
     }
 
@@ -198,13 +237,23 @@ mod tests {
     fn printed_link_args_identify_direct_and_env_wrapped_linkers() {
         assert_eq!(
             linker_from_printed_args(r#""/usr/bin/clang" "one.o" -o out"#),
-            Some("/usr/bin/clang".into())
+            Some(("/usr/bin/clang".into(), None))
         );
         assert_eq!(
             linker_from_printed_args(
                 r#"env -u SDKROOT LC_ALL="C" PATH="/tool bin:/usr/bin" "cc" one.o"#,
             ),
-            Some("cc".into())
+            Some(("cc".into(), Some("/tool bin:/usr/bin".into())))
+        );
+        assert_eq!(linker_from_printed_args("env -u PATH cc one.o"), None);
+        assert_eq!(linker_from_printed_args("env -i cc one.o"), None);
+        assert_eq!(
+            linker_from_printed_args("env -i PATH=/reviewed/bin cc one.o"),
+            Some(("cc".into(), Some("/reviewed/bin".into())))
+        );
+        assert_eq!(
+            linker_from_printed_args("env -u PATH /usr/bin/cc one.o"),
+            Some(("/usr/bin/cc".into(), None))
         );
         assert_eq!(linker_from_printed_args("env --unknown cc one.o"), None);
         assert_eq!(linker_from_printed_args("env -u SDKROOT"), None);

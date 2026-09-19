@@ -66,6 +66,7 @@
 // about the commit.
 
 use sha3::{Digest, Sha3_256};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -95,10 +96,14 @@ fn workspace_root() -> Option<PathBuf> {
 
 /// Collect the hashed set, workspace-relative, sorted, deduplicated.
 fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in entries.flatten() {
         let path = e.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
         // Build outputs and VCS metadata are not source. `target/` in
         // particular is enormous and changes on every build, which would make
         // the digest a random number.
@@ -214,17 +219,18 @@ const FIXED_BUILD_ENV: &[&str] = &[
 /// bare command through PATH preserves ordinary local builds. The selected
 /// file itself is watched so an in-place tool replacement cannot leave an
 /// incremental build stamped with the old fingerprint.
-fn build_tool_digest(command: &str) -> Option<String> {
+fn build_tool_digest_with_path(command: &str, search_path: Option<&str>) -> Option<String> {
     let direct = PathBuf::from(command);
     let path = if direct.components().count() > 1 {
         direct
     } else {
-        std::env::var_os("PATH")
-            .and_then(|paths| {
-                std::env::split_paths(&paths)
-                    .map(|dir| dir.join(command))
-                    .find(|path| path.is_file())
-            })?
+        let paths = search_path
+            .map(OsStr::new)
+            .map(ToOwned::to_owned)
+            .or_else(|| std::env::var_os("PATH"))?;
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join(command))
+            .find(|path| path.is_file())?
     };
     let body = std::fs::read(&path).ok()?;
     println!("cargo:rerun-if-changed={}", path.display());
@@ -235,6 +241,10 @@ fn build_tool_digest(command: &str) -> Option<String> {
     Some(hex(&h.finalize()))
 }
 
+fn build_tool_digest(command: &str) -> Option<String> {
+    build_tool_digest_with_path(command, None)
+}
+
 /// Build environment variables whose value begins with an executable. This
 /// deliberately excludes flags and SDK directories. Target/host spellings are
 /// already enumerated by `exact_build_env`; prefix forms cover the variants
@@ -242,8 +252,7 @@ fn build_tool_digest(command: &str) -> Option<String> {
 fn configured_tool_key(key: &str) -> bool {
     matches!(
         key,
-        "AR"
-            | "CARGO_BUILD_RUSTC"
+        "AR" | "CARGO_BUILD_RUSTC"
             | "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"
             | "CARGO_BUILD_RUSTC_WRAPPER"
             | "CC"
@@ -322,7 +331,10 @@ fn configured_tool_digests(target: &str, host: &str) -> Vec<(String, String)> {
 
 fn explicit_linker_selected(target: &str) -> bool {
     let cargo_target = target.to_ascii_uppercase().replace('-', "_");
-    for key in ["RUSTC_LINKER".to_owned(), format!("CARGO_TARGET_{cargo_target}_LINKER")] {
+    for key in [
+        "RUSTC_LINKER".to_owned(),
+        format!("CARGO_TARGET_{cargo_target}_LINKER"),
+    ] {
         if std::env::var(key).is_ok_and(|value| !value.trim().is_empty()) {
             return true;
         }
@@ -377,8 +389,8 @@ fn default_linker_digest(rustc: &str, target: &str) -> Option<String> {
         return None;
     }
     let printed = String::from_utf8(output.stdout).ok()?;
-    let linker = linker_from_printed_args(&printed)?;
-    build_tool_digest(&linker)
+    let (linker, search_path) = linker_from_printed_args(&printed)?;
+    build_tool_digest_with_path(&linker, search_path.as_deref())
 }
 
 /// Fingerprint the compiler implementation and target standard library that
@@ -403,11 +415,12 @@ fn rust_sysroot_digest(rustc: &str) -> (Option<String>, usize) {
         Some(path) => path,
         None => return (None, 0),
     };
-    let mut files = vec![sysroot.join("bin").join(if cfg!(windows) {
-        "rustc.exe"
-    } else {
-        "rustc"
-    })];
+    let mut files =
+        vec![
+            sysroot
+                .join("bin")
+                .join(if cfg!(windows) { "rustc.exe" } else { "rustc" }),
+        ];
     for dir in [sysroot.join("lib"), target_libdir] {
         let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
@@ -469,7 +482,10 @@ fn relevant_build_env(key: &str) -> bool {
 /// while absent closes the incremental-build hole that wildcard-like prefix
 /// discovery alone cannot close.
 fn exact_build_env(target: &str, host: &str) -> Vec<String> {
-    let mut keys: Vec<String> = FIXED_BUILD_ENV.iter().map(|key| (*key).to_owned()).collect();
+    let mut keys: Vec<String> = FIXED_BUILD_ENV
+        .iter()
+        .map(|key| (*key).to_owned())
+        .collect();
     for triple in [target, host] {
         let underscored = triple.replace('-', "_");
         for stem in [
@@ -522,13 +538,22 @@ fn build_environment_digest(
         ("host".to_owned(), Some(host.to_owned())),
         ("profile".to_owned(), Some(profile.to_owned())),
         ("rustc-binary-sha3-256".to_owned(), rustc_binary_digest),
-        ("rust-sysroot-components-sha3-256".to_owned(), rust_sysroot_digest),
-        ("probed-default-linker-sha3-256".to_owned(), default_linker_digest),
+        (
+            "rust-sysroot-components-sha3-256".to_owned(),
+            rust_sysroot_digest,
+        ),
+        (
+            "probed-default-linker-sha3-256".to_owned(),
+            default_linker_digest,
+        ),
         ("rustc-version".to_owned(), Some(rustc_verbose.to_owned())),
         ("target".to_owned(), Some(target.to_owned())),
     ];
     fields.extend(configured_tool_digests.iter().map(|(key, digest)| {
-        (format!("configured-tool-binary-sha3-256:{key}"), Some(digest.clone()))
+        (
+            format!("configured-tool-binary-sha3-256:{key}"),
+            Some(digest.clone()),
+        )
     }));
     for key in watched {
         let value = match std::env::var(&key) {
@@ -564,8 +589,6 @@ fn build_environment_digest(
     (hex(&h.finalize()), fields.len())
 }
 
-
-
 fn main() {
     let pkg = env!("CARGO_PKG_VERSION");
 
@@ -580,9 +603,7 @@ fn main() {
     };
     // The same, but with an empty answer folded into "could not answer" —
     // correct for `rev-parse`, where a blank line is not a commit id.
-    let git = |args: &[&str]| -> Option<String> {
-        git_raw(args).filter(|s| !s.is_empty())
-    };
+    let git = |args: &[&str]| -> Option<String> { git_raw(args).filter(|s| !s.is_empty()) };
 
     let commit = std::env::var("BLOCH_BUILD_COMMIT")
         .ok()
@@ -687,8 +708,8 @@ fn main() {
     let configured_tool_binaries = configured_tool_digests.len();
     let default_linker_digest = default_linker_digest(&rustc, &target);
     let default_linker_binaries = usize::from(default_linker_digest.is_some());
-    let tool_binaries = usize::from(rustc_binary_digest.is_some())
-        + usize::from(cargo_binary_digest.is_some());
+    let tool_binaries =
+        usize::from(rustc_binary_digest.is_some()) + usize::from(cargo_binary_digest.is_some());
     let (environment_digest, environment_fields) = build_environment_digest(
         &rustc_verbose,
         &cargo_verbose,
