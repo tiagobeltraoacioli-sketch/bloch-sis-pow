@@ -52,11 +52,13 @@ impl HdWalletFile {
     /// [`Self::read_public_with_limits`] only for an explicit trusted-backup
     /// workflow that needs different limits.
     pub fn read_public_bounded(path: &Path) -> Result<Self, String> {
-        Self::read_public_with_limits(
+        let wallet = Self::read_public_with_limits(
             path,
             DEFAULT_HD_WALLET_LOAD_LIMITS.max_file_bytes,
             DEFAULT_HD_WALLET_LOAD_LIMITS.max_addresses,
-        )
+        )?;
+        validate_wallet_encrypted_payload_limits(&wallet)?;
+        Ok(wallet)
     }
 
     /// Read public wallet metadata with explicit byte and address limits.
@@ -519,7 +521,7 @@ fn validate_wallet_load_limits(
             derived_key_checks, limits.max_derived_key_checks
         ));
     }
-    Ok(())
+    validate_wallet_encrypted_payload_limits(wallet)
 }
 
 fn validate_wallet_address_limit(wallet: &HdWalletFile, max_addresses: usize) -> Result<(), String> {
@@ -527,6 +529,57 @@ fn validate_wallet_address_limit(wallet: &HdWalletFile, max_addresses: usize) ->
         return Err(format!(
             "HD wallet address count {} exceeds configured limit {}",
             wallet.addresses.len(), max_addresses
+        ));
+    }
+    Ok(())
+}
+
+// These are encoded-string ceilings, checked before Base64 decoding or the
+// master-key KDF. Genuine HD-wallet payloads are much smaller (a mnemonic JSON
+// object and one fixed-suite hybrid keypair JSON object respectively). The
+// generous headroom preserves every repository-produced and historical key
+// shape while preventing a bounded 64 MiB file from creating another
+// file-sized nonce/ciphertext allocation during each decrypt. Explicit legacy
+// recovery loaders intentionally bypass this ordinary interactive policy.
+const MAX_HD_WALLET_NONCE_B64_BYTES: usize = 64;
+const MAX_HD_WALLET_MNEMONIC_CIPHERTEXT_B64_BYTES: usize = 4 * 1024;
+const MAX_HD_WALLET_KEYPAIR_CIPHERTEXT_B64_BYTES: usize = 64 * 1024;
+
+fn validate_wallet_encrypted_payload_limits(wallet: &HdWalletFile) -> Result<(), String> {
+    validate_encrypted_payload_limit(
+        "mnemonic",
+        &wallet.mnemonic_crypto,
+        MAX_HD_WALLET_MNEMONIC_CIPHERTEXT_B64_BYTES,
+    )?;
+    for address in &wallet.addresses {
+        validate_encrypted_payload_limit(
+            &format!("keypair {}", address.index),
+            &address.keypair_crypto,
+            MAX_HD_WALLET_KEYPAIR_CIPHERTEXT_B64_BYTES,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_encrypted_payload_limit(
+    field: &str,
+    crypto: &KeystoreCrypto,
+    max_ciphertext_b64_bytes: usize,
+) -> Result<(), String> {
+    if crypto.nonce.len() > MAX_HD_WALLET_NONCE_B64_BYTES {
+        return Err(format!(
+            "HD wallet {} nonce encoding length {} exceeds bounded limit {}",
+            field,
+            crypto.nonce.len(),
+            MAX_HD_WALLET_NONCE_B64_BYTES
+        ));
+    }
+    if crypto.ciphertext.len() > max_ciphertext_b64_bytes {
+        return Err(format!(
+            "HD wallet {} ciphertext encoding length {} exceeds bounded limit {}",
+            field,
+            crypto.ciphertext.len(),
+            max_ciphertext_b64_bytes
         ));
     }
     Ok(())
@@ -1405,6 +1458,78 @@ mod audit_wallet_boundaries {
             validate_wallet_load_limits(&file, limits).unwrap_err(),
             "HD wallet derived-key check count 257 exceeds configured limit 256"
         );
+    }
+
+    #[test]
+    fn bounded_payload_caps_accept_exact_limits_and_reject_before_credentials() {
+        let mut mnemonic_crypto = encrypt_with_key(&[0; 32], b"fixture").unwrap();
+        mnemonic_crypto.ciphertext = "A".repeat(MAX_HD_WALLET_MNEMONIC_CIPHERTEXT_B64_BYTES);
+        mnemonic_crypto.nonce = "A".repeat(MAX_HD_WALLET_NONCE_B64_BYTES);
+        let mut keypair_crypto = mnemonic_crypto.clone();
+        keypair_crypto.ciphertext = "A".repeat(MAX_HD_WALLET_KEYPAIR_CIPHERTEXT_B64_BYTES);
+        let mut file = HdWalletFile {
+            version: 3,
+            format: "hd-wallet-v1".into(),
+            network: "testnet".into(),
+            mnemonic_crypto,
+            addresses: vec![HdAddress {
+                index: 0,
+                address: format!("{}payload-cap", TESTNET_PREFIX),
+                label: String::new(),
+                keypair_crypto,
+                derived: false,
+            }],
+            created_at: String::new(),
+            description: String::new(),
+        };
+        let limits = HdWalletLoadLimits {
+            max_file_bytes: crate::util::DEFAULT_WALLET_FILE_LIMIT,
+            max_addresses: 1,
+            max_derived_key_checks: 0,
+        };
+        assert!(validate_wallet_load_limits(&file, limits).is_ok());
+
+        file.mnemonic_crypto.ciphertext.push('A');
+        assert_eq!(
+            validate_wallet_load_limits(&file, limits).unwrap_err(),
+            "HD wallet mnemonic ciphertext encoding length 4097 exceeds bounded limit 4096"
+        );
+        file.mnemonic_crypto.ciphertext.pop();
+        file.addresses[0].keypair_crypto.ciphertext.push('A');
+        assert_eq!(
+            validate_wallet_load_limits(&file, limits).unwrap_err(),
+            "HD wallet keypair 0 ciphertext encoding length 65537 exceeds bounded limit 65536"
+        );
+        file.addresses[0].keypair_crypto.ciphertext.pop();
+        file.addresses[0].keypair_crypto.nonce.push('A');
+        assert_eq!(
+            validate_wallet_load_limits(&file, limits).unwrap_err(),
+            "HD wallet keypair 0 nonce encoding length 65 exceeds bounded limit 64"
+        );
+
+        // Exercise both production bounded readers with an excess ciphertext.
+        // The resource error must win over invalid credentials, proving that
+        // no Argon2, Base64 decode or AES plaintext allocation was attempted.
+        file.addresses[0].keypair_crypto.nonce.pop();
+        file.addresses[0].keypair_crypto.ciphertext.push('A');
+        let bytes = serde_json::to_vec(&file).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "bloch-hd-payload-caps-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, &bytes).unwrap();
+        let expected =
+            "HD wallet keypair 0 ciphertext encoding length 65537 exceeds bounded limit 65536";
+        assert_eq!(HdWalletFile::read_public_bounded(&path).err().unwrap(), expected);
+        assert_eq!(
+            HdWallet::load_with_limits(&path, "not a mnemonic", None, "wrong", limits)
+                .err().unwrap(),
+            expected
+        );
+
+        // Explicit trusted public recovery retains its historical policy.
+        assert!(HdWalletFile::read_public_with_limits(&path, bytes.len(), 1).is_ok());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
