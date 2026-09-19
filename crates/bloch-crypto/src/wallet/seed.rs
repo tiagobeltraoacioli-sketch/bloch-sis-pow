@@ -68,8 +68,8 @@ impl Default for SeedVersion {
     fn default() -> Self { SeedVersion::V2Bip39Sha512 }
 }
 
-/// Materialize the exact BIP39 salt without leaving the caller's optional
-/// passphrase in an ordinary heap buffer after PBKDF2 returns.
+/// Materialize the exact BIP39 salt without leaving its passphrase copy in an
+/// ordinary heap buffer after PBKDF2 returns.
 fn bip39_salt(passphrase: &str) -> Zeroizing<Vec<u8>> {
     let mut salt = Zeroizing::new(Vec::with_capacity(8 + passphrase.len()));
     salt.extend_from_slice(b"mnemonic");
