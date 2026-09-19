@@ -183,6 +183,13 @@ case '$version_mode' in
     printf '%s\n' 'bloch-pos-node 0.0.0 (${BLOCH_BUILD_COMMIT}) (Genesis-4, block version 0x00000004)'
     printf '%s\n' 'source-digest sha3-256:NOT-LOWERCASE-HEX (1 files, 1 bytes) commit-source:asserted tree:dirty'
     ;;
+  self-mutating)
+    printf '%s\n' 'bloch-pos-node 0.0.0 (${BLOCH_BUILD_COMMIT}) (Genesis-4, block version 0x00000004)'
+    printf '%s\n' 'source-digest sha3-256:0000000000000000000000000000000000000000000000000000000000000000 (1 files, 1 bytes) commit-source:asserted tree:asserted-clean'
+    printf '%s\n' '#!/usr/bin/env bash' \
+      "printf '%s\\n' 'mutated after version output'" > "\$0"
+    chmod 0755 "\$0"
+    ;;
 esac
 BIN
 chmod 0755 "$target_dir/release/bloch-pos"
@@ -329,6 +336,8 @@ expect_version_failure extra-line \
   'binary version output must contain exactly two newline-terminated lines'
 expect_version_failure malformed-source \
   'binary source identity line is not the exact asserted clean-source format'
+expect_version_failure self-mutating \
+  'packaged binary changed while reporting its version'
 
 expect_target_failure exit \
   'rustc -vV failed while resolving the release target'

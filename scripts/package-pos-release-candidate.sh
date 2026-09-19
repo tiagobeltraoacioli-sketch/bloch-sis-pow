@@ -18,6 +18,18 @@ sha256_file() {
     fail "sha256sum or shasum is required"
   fi
 }
+validated_sha256_file() {
+  local digest
+  digest="$(sha256_file "$1")" \
+    || fail "SHA-256 tool failed for the packaged binary"
+  case "$digest" in
+    ''|*[!0123456789abcdef]*)
+      fail "SHA-256 tool returned a non-lowercase hexadecimal digest" ;;
+  esac
+  [ "${#digest}" = 64 ] \
+    || fail "SHA-256 tool returned a digest that is not exactly 64 characters"
+  printf '%s\n' "$digest"
+}
 
 commit="$(git rev-parse HEAD)"
 case "$commit" in
@@ -74,9 +86,17 @@ esac
       --target-dir "$work/target" )
 binary="$work/target/release/bloch-pos"
 [ -x "$binary" ] || fail "release binary was not produced"
+stage="$work/stage"
+mkdir -p "$stage"
+cp "$binary" "$stage/bloch-pos"
+chmod 0755 "$stage/bloch-pos"
+binary_sha_before_version="$(validated_sha256_file "$stage/bloch-pos")"
 version_file="$work/binary-version"
-"$binary" --version > "$version_file" \
+"$stage/bloch-pos" --version > "$version_file" \
   || fail "release binary --version failed"
+binary_sha="$(validated_sha256_file "$stage/bloch-pos")"
+[ "$binary_sha_before_version" = "$binary_sha" ] \
+  || fail "packaged binary changed while reporting its version"
 [ "$(wc -l < "$version_file" | tr -d '[:space:]')" = 2 ] \
   || fail "binary version output must contain exactly two newline-terminated lines"
 binary_version="$(sed -n '1p' "$version_file")"
@@ -106,18 +126,6 @@ case "$target" in
   *) fail "rustc host target must be a lowercase ASCII Rust triple" ;;
 esac
 
-stage="$work/stage"
-mkdir -p "$stage"
-cp "$binary" "$stage/bloch-pos"
-chmod 0755 "$stage/bloch-pos"
-binary_sha="$(sha256_file "$stage/bloch-pos")" \
-  || fail "SHA-256 tool failed for the packaged binary"
-case "$binary_sha" in
-  ''|*[!0123456789abcdef]*)
-    fail "SHA-256 tool returned a non-lowercase hexadecimal digest" ;;
-esac
-[ "${#binary_sha}" = 64 ] \
-  || fail "SHA-256 tool returned a digest that is not exactly 64 characters"
 printf '%s  bloch-pos\n' "$binary_sha" > "$stage/SHA256SUMS"
 {
   printf 'artifact_kind=unsigned-release-candidate\n'
