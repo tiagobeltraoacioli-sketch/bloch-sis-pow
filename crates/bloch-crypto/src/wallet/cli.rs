@@ -2,7 +2,7 @@
 //! Colors: amber accent · green success · red error · muted gray
 
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ── ANSI colors ───────────────────────────────────────────────────────────────
 const AMBER:   &str = "\x1b[38;5;214m";   // #EF9F27 equivalent
@@ -19,6 +19,12 @@ const RESET:   &str = "\x1b[0m";
 const CLI_DISCLOSURE_KEY_CONVENTION:
     crate::wallet::disclosure::DisclosureKeyConvention =
     crate::wallet::disclosure::DisclosureKeyConvention::SingleKeyWallet;
+
+// Verified bundles have bounded entry counts and bounded text/key/signature
+// fields; 64 MiB leaves ample headroom over the ordinary serialization of
+// those bounded typed fields. Keep the CLI file read itself bounded too,
+// before JSON allocates its fields.
+const CLI_DISCLOSURE_FILE_LIMIT: usize = crate::util::DEFAULT_WALLET_FILE_LIMIT;
 
 fn amber(s: &str)  -> String { format!("{}{}{}", AMBER, s, RESET) }
 fn green(s: &str)  -> String { format!("{}{}{}", GREEN, s, RESET) }
@@ -464,18 +470,28 @@ fn load_and_verify_bundle(
     path: &PathBuf,
     canonical: bool,
 ) -> crate::wallet::VerifiedDisclosure {
-    let json = match std::fs::read_to_string(path) {
-        Ok(j) => j,
-        Err(e) => { err(&format!("Cannot read bundle: {}", e)) }
-    };
-    let bundle: crate::wallet::DisclosureBundle = match serde_json::from_str(&json) {
+    let bundle = match read_disclosure_bundle_with_limit(path, CLI_DISCLOSURE_FILE_LIMIT) {
         Ok(b) => b,
-        Err(e) => { err(&format!("Bundle parse failed: {}", e)) }
+        Err(e) => { err(&e) }
     };
     match verify_bundle_with_policy(&bundle, canonical) {
         Ok(v) => v,
         Err(e) => { err(&format!("Bundle verification FAILED: {}", e)) }
     }
+}
+
+fn read_disclosure_bundle_with_limit(
+    path: &Path,
+    max_bytes: usize,
+) -> Result<crate::wallet::DisclosureBundle, String> {
+    let bytes = crate::util::read_wallet_file(path, max_bytes).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::InvalidData {
+            format!("Disclosure bundle exceeds {}-byte input limit", max_bytes)
+        } else {
+            format!("Cannot read bundle: {}", error)
+        }
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| format!("Bundle parse failed: {}", error))
 }
 
 fn load_kp(path: &PathBuf) -> crate::wallet::Keypair {
@@ -651,6 +667,35 @@ mod audit_cli_input_tests {
         let _hd_child_secret = zeroize::Zeroizing::new(hd_child_secret);
 
         assert_eq!(cli_child_public, hd_child_public);
+    }
+
+    #[test]
+    fn cli_disclosure_file_budget_accepts_exact_limit_and_rejects_one_more_byte() {
+        let bundle = crate::wallet::DisclosureBundle {
+            version: crate::wallet::disclosure::DISCLOSURE_VERSION,
+            network: "testnet".into(),
+            purpose: "budget fixture".into(),
+            audience: "auditor".into(),
+            created_at: "2026-09-19T00:00:00Z".into(),
+            entries: Vec::new(),
+        };
+        let mut bytes = serde_json::to_vec(&bundle).unwrap();
+        let exact_limit = bytes.len() + 32;
+        bytes.resize(exact_limit, b' ');
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), &bytes).unwrap();
+        let parsed = read_disclosure_bundle_with_limit(file.path(), exact_limit).unwrap();
+        assert_eq!(parsed.purpose, bundle.purpose);
+
+        bytes.push(b' ');
+        std::fs::write(file.path(), &bytes).unwrap();
+        let error = read_disclosure_bundle_with_limit(file.path(), exact_limit).unwrap_err();
+        assert_eq!(
+            error,
+            format!("Disclosure bundle exceeds {}-byte input limit", exact_limit),
+        );
+        assert!(!error.contains("Bundle parse failed"));
     }
 
     #[test]
