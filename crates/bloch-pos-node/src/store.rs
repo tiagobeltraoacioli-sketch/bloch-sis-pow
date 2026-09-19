@@ -20,8 +20,9 @@
 //! RocksDB layer with block-id-keyed state remains M-later work.
 //!
 //! Log frame: `u32 LE length ‖ envelope bytes` (codec::encode_envelope).
-//! Appends are single `write_all` calls followed by fsync, so a crash leaves
-//! at most one truncated trailing frame, which replay detects and drops.
+//! Appends stream the prefix and encoded envelope under one exclusive writer,
+//! then fsync, so a crash leaves at most one truncated trailing frame, which
+//! replay detects and drops.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -968,6 +969,18 @@ fn encode_log_payload(env: &BlockEnvelope) -> io::Result<Vec<u8>> {
     Ok(payload)
 }
 
+fn write_log_frame<W: Write>(writer: &mut W, payload: &[u8]) -> io::Result<usize> {
+    let len = u32::try_from(payload.len()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "block log frame length exceeds u32")
+    })?;
+    let frame_len = 4usize.checked_add(payload.len()).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "block log frame length overflow")
+    })?;
+    writer.write_all(&len.to_le_bytes())?;
+    writer.write_all(payload)?;
+    Ok(frame_len)
+}
+
 /// Decode the complete prefix of a framed log without retaining a second,
 /// whole-file byte buffer alongside the decoded envelopes. `length` is the
 /// stable file length observed before the scan; the data-directory lock keeps
@@ -1134,7 +1147,7 @@ impl Store {
         })
     }
 
-    /// Append one applied block. One write, then fsync — the block is only
+    /// Append one applied block. Prefix and payload writes, then fsync — the block is only
     /// broadcast after this returns, so anything the network has seen from
     /// us is durable locally (the producer-side equivocation fence across
     /// restarts).
@@ -1145,11 +1158,7 @@ impl Store {
         // while the rewrite runs.
         self.finish_pending_rewrite()?;
         let payload = encode_log_payload(env)?;
-        // Capacity hint only: saturating is the intended semantics.
-        let mut frame = Vec::with_capacity(4usize.saturating_add(payload.len()));
-        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&payload);
-        self.log.write_all(&frame)?;
+        let frame_len = write_log_frame(&mut self.log, &payload)?;
         self.log.sync_data()?;
         // Index AFTER the log is durable. A crash in between leaves the index
         // one record short, which the next `open` fixes and which
@@ -1164,7 +1173,7 @@ impl Store {
         // condition a real deployment's storage can produce.
         #[allow(clippy::arithmetic_side_effects)]
         {
-            self.log_len += frame.len() as u64;
+            self.log_len += frame_len as u64;
         }
         // Seek to the end explicitly rather than trusting the handle's cursor:
         // `repair_index` reads records through this same handle, and a record
@@ -1600,6 +1609,74 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidData,
             "a complete zero-length frame remains corruption, not a truncatable tail",
+        );
+    }
+
+    #[test]
+    fn log_frame_writer_streams_prefix_then_payload_across_short_writes() {
+        #[derive(Default)]
+        struct ShortWriter {
+            bytes: Vec<u8>,
+            offered: Vec<usize>,
+        }
+
+        impl Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.offered.push(bytes.len());
+                let cap = if self.offered.len() <= 2 { 2 } else { 257 };
+                let accepted = bytes.len().min(cap);
+                self.bytes.extend_from_slice(&bytes[..accepted]);
+                Ok(accepted)
+            }
+
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+
+        let payload = crate::codec::encode_envelope(&sample_envelope(11));
+        let mut writer = ShortWriter::default();
+        let frame_len = write_log_frame(&mut writer, &payload).expect("stream frame");
+
+        assert_eq!(frame_len, 4usize.saturating_add(payload.len()));
+        assert_eq!(&writer.bytes[..4], &(payload.len() as u32).to_le_bytes());
+        assert_eq!(&writer.bytes[4..], payload.as_slice());
+        assert_eq!(
+            writer.offered[..3],
+            [4, 2, payload.len()],
+            "payload must begin only after the complete prefix",
+        );
+    }
+
+    #[test]
+    fn log_frame_writer_prefix_only_failure_remains_a_recoverable_torn_tail() {
+        #[derive(Default)]
+        struct PrefixThenFail {
+            bytes: Vec<u8>,
+            writes: usize,
+        }
+
+        impl Write for PrefixThenFail {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.writes = self.writes.saturating_add(1);
+                if self.writes > 1 {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "injected body failure"));
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+
+        let payload = crate::codec::encode_envelope(&sample_envelope(12));
+        let mut writer = PrefixThenFail::default();
+        let error = write_log_frame(&mut writer, &payload).expect_err("body write must fail");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(writer.bytes, (payload.len() as u32).to_le_bytes());
+        assert_eq!(writer.writes, 2, "the error occurs on the payload phase");
+        assert!(
+            read_log_frames(io::Cursor::new(&writer.bytes), writer.bytes.len() as u64)
+                .expect("prefix-only tail remains recoverable")
+                .is_empty(),
         );
     }
 
