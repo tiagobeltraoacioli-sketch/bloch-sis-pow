@@ -71,6 +71,7 @@ build-and-test:
     - python3 -I scripts/check-live-node-retired-isolation.py --selftest
     - python3 -I scripts/check-live-node-retired-isolation.py
     - python3 -I scripts/pinned-rust-toolchain.py
+    - python3 -I scripts/check-validator-lifecycle-mutations.py
     - cargo build --workspace --all-targets
 """ + CRATE_ARGS + """\
   timeout: 120m
@@ -336,6 +337,12 @@ CASES = [
              "python3 scripts/rehearse-validator-admission.py", 1),
          must_fail=True, expect="reviewed ordered command list"),
 
+    Case("github cannot remove the shared validator lifecycle mutation check",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - run: python3 -I scripts/check-validator-lifecycle-mutations.py\n", ""),
+         must_fail=True, expect="reviewed ordered command list"),
+
     Case("github toolchain setup cannot regress to one-file sed parsing",
          GOOD_GITLAB,
          GOOD_GITHUB.replace(
@@ -494,6 +501,11 @@ CASES = [
     Case("gitlab build-and-test cannot remove toolchain pin validation",
          GOOD_GITLAB.replace(
              "    - python3 -I scripts/pinned-rust-toolchain.py\n", ""),
+         GOOD_GITHUB, must_fail=True, expect="exact ordered command contract"),
+
+    Case("gitlab cannot remove the shared validator lifecycle mutation check",
+         GOOD_GITLAB.replace(
+             "    - python3 -I scripts/check-validator-lifecycle-mutations.py\n", ""),
          GOOD_GITHUB, must_fail=True, expect="exact ordered command contract"),
 
     Case("gitlab build-and-test commands cannot be reordered",
