@@ -463,7 +463,7 @@ impl HdWallet {
         // Verify mnemonic matches (by decrypting and comparing). Wrapped in
         // Zeroizing (A4 lows): this plaintext carries the full mnemonic in
         // JSON form and must not linger in memory after the comparison below.
-        let mnemonic_bytes = Zeroizing::new(decrypt_with_key(&master_key, &wallet.mnemonic_crypto)?);
+        let mnemonic_bytes = decrypt_with_key(&master_key, &wallet.mnemonic_crypto)?;
         let payload: BorrowedMnemonicPayload<'_> = serde_json::from_slice(&mnemonic_bytes)
             .map_err(|e| format!("mnemonic decrypt failed — wrong password/passphrase/mnemonic ({})", e))?;
         if payload.mnemonic.as_ref() != canonical_mnemonic.as_str() {
@@ -479,7 +479,7 @@ impl HdWallet {
         for addr in wallet.addresses {
             // Zeroizing (A4 lows): plaintext JSON containing the hex-encoded
             // private key — must not survive past the parse below.
-            let bytes = Zeroizing::new(decrypt_with_key(&master_key, &addr.keypair_crypto)?);
+            let bytes = decrypt_with_key(&master_key, &addr.keypair_crypto)?;
             let kpp: BorrowedKeypairPayload<'_> = serde_json::from_slice(&bytes)
                 .map_err(|e| format!("keypair {} decrypt failed: {}", addr.index, e))?;
             let mut priv_key = Zeroizing::new(hex::decode(kpp.private_key_hex.as_ref()).map_err(|e| e.to_string())?);
@@ -1039,7 +1039,7 @@ fn encrypt_with_key(key: &[u8], plaintext: &[u8]) -> Result<KeystoreCrypto, Stri
     })
 }
 
-fn decrypt_with_key(key: &[u8], crypto: &KeystoreCrypto) -> Result<Vec<u8>, String> {
+fn decrypt_with_key(key: &[u8], crypto: &KeystoreCrypto) -> Result<Zeroizing<Vec<u8>>, String> {
     if key.len() != 32 { return Err("AES-256 key must contain 32 bytes".into()); }
     let nonce_b = b64::STANDARD.decode(&crypto.nonce).map_err(|e| e.to_string())?;
     // Decrypt the decoded ciphertext in place. Besides avoiding a second
@@ -1049,7 +1049,7 @@ fn decrypt_with_key(key: &[u8], crypto: &KeystoreCrypto) -> Result<Vec<u8>, Stri
         b64::STANDARD.decode(&crypto.ciphertext).map_err(|e| e.to_string())?,
     );
     decrypt_ciphertext_in_place(key, &nonce_b, &mut plaintext)?;
-    Ok(std::mem::take(&mut *plaintext))
+    Ok(plaintext)
 }
 
 fn decrypt_ciphertext_in_place(
@@ -1550,6 +1550,21 @@ mod audit_wallet_boundaries {
         for index in [0,1] {
             assert!(keypair_at_with_convention(&[1;31], index, DisclosureKeyConvention::HdWalletV3).is_err());
         }
+    }
+
+    #[test]
+    fn hd_decrypt_return_has_exact_zeroizing_ownership_and_bytes() {
+        let _: fn(&[u8], &KeystoreCrypto) -> Result<Zeroizing<Vec<u8>>, String> =
+            decrypt_with_key;
+        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
+
+        let key = [0x27; 32];
+        let expected = b"authenticated HD wallet secret";
+        let encrypted = encrypt_with_key(&key, expected).unwrap();
+        let mut plaintext = decrypt_with_key(&key, &encrypted).unwrap();
+        assert_eq!(&plaintext[..], expected);
+        plaintext.zeroize();
+        assert!(plaintext.is_empty());
     }
 
     #[test]
