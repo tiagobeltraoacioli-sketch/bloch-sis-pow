@@ -979,6 +979,22 @@ fn canonical_mnemonic_for_kdf(mnemonic: &Mnemonic) -> Zeroizing<String> {
     Zeroizing::new(mnemonic.to_string())
 }
 
+fn hd_master_key_salt(mnemonic: &str, version: u32) -> Zeroizing<[u8; 32]> {
+    use sha3::{Digest, Sha3_256};
+
+    let mut hash = Sha3_256::new();
+    if version >= 2 {
+        hash.update(b"bloch-sis/hd-wallet/salt/v2");
+        hash.update(mnemonic.as_bytes());
+    } else {
+        hash.update(b"bloch-layer-hd-wallet-v1");
+    }
+
+    let mut salt = Zeroizing::new([0u8; 32]);
+    hash.finalize_into((&mut *salt).into());
+    salt
+}
+
 /// Derive the master encryption key from mnemonic + passphrase + password.
 /// This is what locks/unlocks the wallet file.
 fn derive_master_key(mnemonic: &str, passphrase: &str, password: &str, version: u32) -> Result<Zeroizing<Vec<u8>>, String> {
@@ -994,20 +1010,12 @@ fn derive_master_key(mnemonic: &str, passphrase: &str, password: &str, version: 
     // precomputation against one wallet transfers to all). Kept only so existing
     // v1 files still decrypt. v2+ binds the salt to the mnemonic, so it is unique
     // per wallet + deterministic (no stored salt, no format change).
-    use sha3::{Sha3_256, Digest};
-    let salt = if version >= 2 {
-        let mut h = Sha3_256::new();
-        h.update(b"bloch-sis/hd-wallet/salt/v2");
-        h.update(mnemonic.as_bytes());
-        h.finalize().to_vec()
-    } else {
-        Sha3_256::digest(b"bloch-layer-hd-wallet-v1").to_vec()
-    };
+    let salt = hd_master_key_salt(mnemonic, version);
 
     let params = Params::new(262144, 4, 4, Some(32)).map_err(|e| e.to_string())?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut key = Zeroizing::new(vec![0u8; 32]);
-    argon2.hash_password_into(&combined, &salt, &mut key).map_err(|e| e.to_string())?;
+    argon2.hash_password_into(&combined, &salt[..], &mut key).map_err(|e| e.to_string())?;
     Ok(key)
 }
 
@@ -1163,6 +1171,32 @@ mod tests {
         assert_eq!(canonical.as_str(), expected);
         canonical.zeroize();
         assert!(canonical.is_empty());
+    }
+
+    #[test]
+    fn master_key_salt_has_exact_zeroizing_ownership_and_stable_bytes() {
+        let _: fn(&str, u32) -> Zeroizing<[u8; 32]> = hd_master_key_salt;
+        assert!(std::mem::needs_drop::<Zeroizing<[u8; 32]>>());
+
+        for (version, expected) in [
+            (1, [
+                0x1e, 0xe2, 0xb6, 0xe3, 0x39, 0x12, 0xb0, 0xe9,
+                0x27, 0x7d, 0x9b, 0x8f, 0x32, 0xa6, 0x7c, 0x20,
+                0xc7, 0x54, 0x39, 0x7f, 0xd0, 0xb5, 0xc9, 0x25,
+                0xdd, 0x9e, 0xc4, 0xa3, 0x1f, 0x0f, 0xcf, 0xf2,
+            ]),
+            (3, [
+                0x64, 0x42, 0x1e, 0x9c, 0x12, 0x31, 0xe0, 0x7c,
+                0xa9, 0x4e, 0x94, 0x35, 0xc5, 0x0f, 0xe7, 0x9c,
+                0xa1, 0xf7, 0x3c, 0xa2, 0x0e, 0x31, 0x2a, 0xcb,
+                0x02, 0x73, 0xf1, 0xc2, 0x5a, 0x3e, 0x77, 0x12,
+            ]),
+        ] {
+            let mut salt = hd_master_key_salt("synthetic mnemonic material", version);
+            assert_eq!(&salt[..], &expected);
+            salt.zeroize();
+            assert!(salt.iter().all(|byte| *byte == 0));
+        }
     }
 
     #[test]
