@@ -28,7 +28,8 @@ default:
   tags:
     - bloch-linux-aarch64
   before_script:
-    - export PATH="$HOME/.cargo/bin:$PATH"
+    - unset BASH_ENV ENV PYTHONHOME PYTHONPATH CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_RUSTC CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER
+    - export PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
     - rustc --version && cargo --version
     - clang --version | head -1 || true
     - cmake --version | head -1 || true

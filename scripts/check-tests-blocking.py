@@ -166,7 +166,7 @@ CI_SCRIPT_ENTRYPOINT_SHA256 = {
     "scripts/check-live-node-retired-isolation.py":
         "45ece7368931469c2c64c161708009b41aebcbf3c1033fa75006e16d5e16518d",
     "scripts/check-tests-blocking.selftest.py":
-        "ed150a57090c7157a2d735fcdb40cc222732bfb5076c02e8eef2bf74c4b48a1f",
+        "53ec6fc1beeaac7918ab2337575da38565d672eb7679a14f2f559f9e0873c5ea",
     "scripts/check-validator-lifecycle-mutations.py":
         "12b477e5043bc3ea98387be33ca586976494b30083522b214cea7d88c0e9f429",
     "scripts/devnet-particao-report.test.py":
@@ -212,7 +212,11 @@ SAFE_GITLAB_DEFAULT = (
     "tags:",
     "- bloch-linux-aarch64",
     "before_script:",
-    '- export PATH="$HOME/.cargo/bin:$PATH"',
+    "- unset BASH_ENV ENV PYTHONHOME PYTHONPATH CARGO_HOME RUSTUP_HOME "
+    "RUSTUP_TOOLCHAIN RUSTC "
+    "RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_RUSTC "
+    "CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+    '- export PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"',
     "- rustc --version && cargo --version",
     "- clang --version | head -1 || true",
     "- cmake --version | head -1 || true",

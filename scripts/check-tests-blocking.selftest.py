@@ -49,7 +49,8 @@ default:
   tags:
     - bloch-linux-aarch64
   before_script:
-    - export PATH="$HOME/.cargo/bin:$PATH"
+    - unset BASH_ENV ENV PYTHONHOME PYTHONPATH CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_RUSTC CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER
+    - export PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
     - rustc --version && cargo --version
     - clang --version | head -1 || true
     - cmake --version | head -1 || true
@@ -153,6 +154,24 @@ def sub(text: str, old: str, new: str) -> str:
 
 
 CASES = [
+    Case("GitLab reviewed execution environment stays green",
+         GOOD_GITLAB, GOOD_GITHUB, must_fail=False),
+    Case("GitLab cannot inherit the runner PATH suffix",
+         GOOD_GITLAB.replace(
+             'export PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"',
+             'export PATH="$HOME/.cargo/bin:$PATH"'),
+         GOOD_GITHUB, must_fail=True, expect="reviewed runner tags and fail-fast before_script"),
+    Case("GitLab cannot retain Rust tool substitution variables",
+         GOOD_GITLAB.replace(
+             "unset BASH_ENV ENV PYTHONHOME PYTHONPATH CARGO_HOME RUSTUP_HOME "
+             "RUSTUP_TOOLCHAIN RUSTC ",
+             "unset BASH_ENV ENV PYTHONHOME PYTHONPATH CARGO_HOME RUSTUP_HOME RUSTC "),
+         GOOD_GITHUB, must_fail=True, expect="reviewed runner tags and fail-fast before_script"),
+    Case("GitLab cannot retain Python startup substitution variables",
+         GOOD_GITLAB.replace(
+             "unset BASH_ENV ENV PYTHONHOME PYTHONPATH CARGO_HOME",
+             "unset BASH_ENV ENV CARGO_HOME"),
+         GOOD_GITHUB, must_fail=True, expect="reviewed runner tags and fail-fast before_script"),
     Case("reviewed GitHub global test environment stays green",
          GOOD_GITLAB, GOOD_GITHUB_WITH_ENV, must_fail=False),
     Case("GitHub global test BASH_ENV is refused",
@@ -503,7 +522,11 @@ CASES = [
              "default:\n"
              "  tags:\n    - bloch-linux-aarch64\n"
              "  before_script:\n"
-             "    - export PATH=\"$HOME/.cargo/bin:$PATH\"\n"
+             "    - unset BASH_ENV ENV PYTHONHOME PYTHONPATH CARGO_HOME RUSTUP_HOME "
+             "RUSTUP_TOOLCHAIN RUSTC "
+             "RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_RUSTC "
+             "CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER\n"
+             "    - export PATH=\"$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin\"\n"
              "    - rustc --version && cargo --version\n"
              "    - clang --version | head -1 || true\n"
              "    - cmake --version | head -1 || true\n\n", ""),
