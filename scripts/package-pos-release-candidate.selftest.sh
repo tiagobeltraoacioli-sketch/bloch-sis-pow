@@ -193,7 +193,9 @@ run_package() {
   local version_mode="${2:-canonical}"
   local rustc_mode="${3:-canonical}"
   local sha_mode="${4:-canonical}"
-  ( cd "$test_repo" && PATH="$fake_bin:$PATH" REAL_GIT="$real_git" \
+  local package_umask="${5:-022}"
+  ( umask "$package_umask"
+    cd "$test_repo" && PATH="$fake_bin:$PATH" REAL_GIT="$real_git" \
       REAL_SHA_TOOL="$real_sha_tool" REAL_SHA_KIND="$real_sha_kind" \
       FAKE_VERSION_MODE="$version_mode" \
       FAKE_RUSTC_MODE="$rustc_mode" \
@@ -293,6 +295,31 @@ late_version="$($work/late-output/bloch-pos --version)"
 printf '%s\n' "$late_version" | grep -Fq "(${late_commit:0:12})"
 grep -Fq '# source=late-source config=late-config pin=1.81.0' \
   "$work/late-output/bloch-pos"
+
+# Published modes are deterministic even under a maximally permissive umask.
+mode_output="$work/permissive-umask-output"
+run_package "$mode_output" canonical canonical canonical 000 \
+  > "$work/permissive-umask.log" 2>&1
+for mode_path in "$mode_output" "$mode_output/bloch-pos"; do
+  [ "$(find "$mode_path" -prune -perm 0755 -exec printf x \;)" = x ] || {
+    echo "selftest: $mode_path is not mode 0755" >&2
+    exit 1
+  }
+done
+for mode_path in "$mode_output/SHA256SUMS" "$mode_output/BUILD-INFO"; do
+  [ "$(find "$mode_path" -prune -perm 0644 -exec printf x \;)" = x ] || {
+    echo "selftest: $mode_path is not mode 0644" >&2
+    exit 1
+  }
+  [ -r "$mode_path" ] || {
+    echo "selftest: $mode_path is not readable" >&2
+    exit 1
+  }
+done
+[ -x "$mode_output/bloch-pos" ] || {
+  echo "selftest: packaged binary is not executable" >&2
+  exit 1
+}
 
 expect_version_failure missing-commit \
   'binary version line does not contain ('

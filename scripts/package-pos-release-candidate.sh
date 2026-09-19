@@ -133,6 +133,8 @@ printf '%s  bloch-pos\n' "$binary_sha" > "$stage/SHA256SUMS"
   printf 'signed=false\n'
   printf 'deployment_authorized=false\n'
 } > "$stage/BUILD-INFO"
+chmod 0644 "$stage/SHA256SUMS" "$stage/BUILD-INFO"
+chmod 0755 "$stage/bloch-pos" "$stage"
 
 mkdir -p "$(dirname "$out_dir")"
 [ ! -e "$out_dir" ] || fail "output path already exists: $out_dir"
