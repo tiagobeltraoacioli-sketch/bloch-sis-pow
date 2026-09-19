@@ -941,6 +941,12 @@ const WALLET_VERSION: u32 = 3;
 /// imported keypair. The signature is immediately discarded.
 const IMPORT_KEY_AUTH_CHALLENGE: &[u8] = b"BLOCH-HD-WALLET-IMPORT-AUTH-v1";
 
+/// Take ownership of a repository-derived HD private key immediately, without
+/// cloning its allocation, until it can be transferred into `Keypair`.
+fn hd_private_key_owner(private_key: Vec<u8>) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(private_key)
+}
+
 /// Derive the keypair for `index` from the BIP39 seed.
 ///
 /// Deterministic and domain-separated (`crypto::diversified_seed`), so the same
@@ -949,8 +955,13 @@ const IMPORT_KEY_AUTH_CHALLENGE: &[u8] = b"BLOCH-HD-WALLET-IMPORT-AUTH-v1";
 fn derive_at(seed: &[u8], index: u32, testnet: bool) -> Result<Keypair, String> {
     let (public_key, private_key) = crypto::diversified_keypair(seed, index)
         .map_err(|e| format!("key derivation failed at index {}: {}", index, e))?;
+    let mut private_key = hd_private_key_owner(private_key);
     let address = crypto::address_from_pubkey(&public_key, testnet);
-    Ok(Keypair { private_key, public_key, address })
+    Ok(Keypair {
+        private_key: std::mem::take(&mut *private_key),
+        public_key,
+        address,
+    })
 }
 
 fn fresh_hd_entropy() -> Zeroizing<[u8; 32]> {
@@ -1067,6 +1078,40 @@ fn decrypt_ciphertext_in_place(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hd_private_key_owner_preserves_allocation_and_wipes_while_live() {
+        let _: fn(Vec<u8>) -> Zeroizing<Vec<u8>> = hd_private_key_owner;
+        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
+
+        let mut private_key = Vec::with_capacity(96);
+        private_key.extend_from_slice(&[0x31, 0x42, 0x53, 0x64]);
+        let pointer = private_key.as_ptr();
+        let capacity = private_key.capacity();
+        let mut owned = hd_private_key_owner(private_key);
+        assert_eq!(owned.as_ptr(), pointer);
+        assert_eq!(owned.capacity(), capacity);
+        assert_eq!(&owned[..], &[0x31, 0x42, 0x53, 0x64]);
+        owned.zeroize();
+        assert!(owned.is_empty());
+    }
+
+    #[test]
+    fn hd_derivation_keeps_private_public_and_address_bytes() {
+        let seed = [0x6du8; 64];
+        for (index, testnet) in [(0, false), (1, true), (7, false)] {
+            let derived = derive_at(&seed, index, testnet).unwrap();
+            let (public_key, private_key) = crypto::diversified_keypair(&seed, index).unwrap();
+            let private_key = Zeroizing::new(private_key);
+
+            assert_eq!(derived.public_key, public_key);
+            assert_eq!(derived.private_key.as_slice(), private_key.as_slice());
+            assert_eq!(
+                derived.address,
+                crypto::address_from_pubkey(&public_key, testnet),
+            );
+        }
+    }
 
     #[test]
     fn hd_seed_has_exact_zeroizing_ownership_and_bip39_bytes() {
