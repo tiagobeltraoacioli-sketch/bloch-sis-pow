@@ -722,8 +722,15 @@ impl Keypair {
         crypto::sign(&sk, msg).map_err(|e| e.to_string())
     }
 
+    /// Verify arbitrary wallet data while preserving legacy format compatibility.
+    ///
+    /// Matching enveloped and raw-hybrid pairs are attempted explicitly before
+    /// the historical autodetecting verifier. The final fallback preserves mixed
+    /// raw/enveloped inputs previously accepted by this broad compatibility API.
     pub fn verify(pk: &[u8], msg: &[u8], sig: &[u8]) -> bool {
-        crypto::verify(pk, msg, sig)
+        crypto::verify_enveloped(pk, msg, sig)
+            || crypto::verify_legacy_hybrid_raw(pk, msg, sig)
+            || crypto::verify(pk, msg, sig)
     }
 
     /// A4-M-4: sign an arbitrary user-supplied MESSAGE (never a raw digest).
@@ -1053,6 +1060,46 @@ pub mod cli;
 #[cfg(test)]
 mod legacy_keystore_tests {
     use super::*;
+
+    #[test]
+    fn keypair_verify_accepts_genuine_magic_prefixed_raw_signature_explicitly() {
+        const MESSAGE: &[u8] = b"BLOCH-CR10-MAGIC-PREFIX-FIXTURE-v1";
+        const SEARCH_COUNTER: u64 = 23_156;
+        const SIGNING_SEED_HEX: &str =
+            "5d051b8c445a2f169a9a0104877500c39332cb493ec6de2723cb37dfbb233042";
+
+        let (enveloped_public_key, enveloped_secret_key) =
+            crypto::generate_keypair_from_seed(&[0x64; 32]).unwrap();
+        let mut h = Sha3_256::new();
+        h.update(b"bloch/cr10/signing-rng/v1");
+        h.update(SEARCH_COUNTER.to_le_bytes());
+        let signing_seed: [u8; 32] = h.finalize().into();
+        assert_eq!(hex::encode(signing_seed), SIGNING_SEED_HEX);
+        let enveloped_signature =
+            pqcrypto_internals::with_seeded_rng_scope(&signing_seed, || {
+                crypto::sign(&enveloped_secret_key, MESSAGE).unwrap()
+            });
+
+        assert!(Keypair::verify(
+            &enveloped_public_key,
+            MESSAGE,
+            &enveloped_signature,
+        ));
+        assert!(crypto::verify_enveloped_canonical(
+            &enveloped_public_key,
+            MESSAGE,
+            &enveloped_signature,
+        ));
+
+        let raw_public_key = &enveloped_public_key[crypto::SUITE_HEADER_LEN..];
+        let raw_signature = &enveloped_signature[crypto::SUITE_HEADER_LEN..];
+        assert_eq!(&raw_signature[..2], &[0xb1, 0x0c]);
+        assert!(
+            !crypto::verify(raw_public_key, MESSAGE, raw_signature),
+            "generic autodetection must misclassify this genuine raw signature"
+        );
+        assert!(Keypair::verify(raw_public_key, MESSAGE, raw_signature));
+    }
 
     /// A4 lows: `Keypair::save_encrypted` must enforce the same blocking
     /// password policy as the new-style keyfile — a weak password must never
