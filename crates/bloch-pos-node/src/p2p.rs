@@ -1589,25 +1589,27 @@ fn handle_swarm_event(
                 let SyncResponse::Blocks { envelopes } = response;
                 let was_full = envelopes.len() >= MAX_SYNC_BLOCKS;
                 let mut highest = 0u64;
+                let mut page_complete = true;
                 for bytes in envelopes {
-                    match crate::codec::decode_envelope(&bytes) {
-                        Ok(env) => {
-                            let slot = env.header.slot;
+                    match admit_sync_envelope(st, peer, &bytes) {
+                        SyncEnvelopeAdmission::Admitted { slot, engine_alive } => {
                             highest = highest.max(slot);
-                            // Directed sync, not gossip: there is no message
-                            // id to report a verdict against. It still carries
-                            // peer provenance so only an engine-admitted block
-                            // may update the sync height preference.
-                            if st.emit(
-                                NetEvent::Block(env, Origin::sync_block(peer, slot)),
-                                peer,
-                            ) == Some(false)
-                            {
+                            if !engine_alive {
                                 return false;
                             }
                         }
-                        Err(e) => {
+                        SyncEnvelopeAdmission::Saturated => {
+                            // The remainder of this page is recoverable from
+                            // the applied head. Do not decode work that cannot
+                            // enter the engine, and do not page-chase past the
+                            // gap this local overload just created.
+                            page_complete = false;
+                            break;
+                        }
+                        SyncEnvelopeAdmission::Malformed(e) => {
                             crate::net::rejection_log::emit(crate::net::rejection_log::Class::Block, || eprintln!("p2p: undecodable block in sync response from {peer}: {e}"));
+                            page_complete = false;
+                            break;
                         }
                     }
                 }
@@ -1616,7 +1618,7 @@ fn handle_swarm_event(
                 // engine's sync timer — that is the difference between "a
                 // request from genesis is accepted" and "a node can actually
                 // sync from genesis". A short page ends the walk.
-                if was_full && highest > 0 && st.may_chase_page(peer) {
+                if was_full && page_complete && highest > 0 && st.may_chase_page(peer) {
                     request_peer_blocks(swarm, st, peer, highest);
                 }
                 pump_sync_requests(swarm, st);
@@ -1779,6 +1781,45 @@ fn on_gossip(
         }
     }
     true
+}
+
+/// Result of charging and decoding one block from a directed sync page.
+///
+/// The response frame is already bounded by [`MAX_SYNC_FRAME`] and
+/// [`MAX_SYNC_BLOCKS`], but the envelope decoder still walks and allocates
+/// attacker-controlled collections. Charge its bounded encoded length before
+/// that work, exactly as the gossip receive path does. The guard travels with
+/// the event so [`Loop::emit`] neither double-charges nor loses the reservation
+/// on channel failure.
+enum SyncEnvelopeAdmission {
+    Admitted { slot: u64, engine_alive: bool },
+    Saturated,
+    Malformed(crate::codec::DecodeErr),
+}
+
+fn admit_sync_envelope(st: &Loop, peer: PeerId, bytes: &[u8]) -> SyncEnvelopeAdmission {
+    let Some(reservation) = st.budget.reserve_peer_frame(
+        crate::net::EventClass::Block,
+        bytes.len(),
+        peer.to_bytes(),
+    ) else {
+        return SyncEnvelopeAdmission::Saturated;
+    };
+    let env = match crate::codec::decode_envelope(bytes) {
+        Ok(env) => env,
+        Err(e) => return SyncEnvelopeAdmission::Malformed(e),
+    };
+    let slot = env.header.slot;
+    let mut origin = Origin::sync_block(peer, slot);
+    origin.set_reservation(reservation);
+    let event = NetEvent::Block(env, origin);
+    if crate::net::queued_bytes(&event) != bytes.len() {
+        return SyncEnvelopeAdmission::Malformed(crate::codec::DecodeErr(
+            "sync envelope is not canonical",
+        ));
+    }
+    let engine_alive = st.emit(event, peer).unwrap_or(false);
+    SyncEnvelopeAdmission::Admitted { slot, engine_alive }
 }
 
 fn has_source_reservation(ev: &NetEvent) -> bool {
@@ -2309,6 +2350,52 @@ mod tests {
             "an event carrying the predecode guard must bypass a duplicate source charge",
         );
         drop(rx.recv().expect("pre-reserved event reached the first channel"));
+    }
+
+    /// Directed sync has the same predecode admission property as gossip.
+    /// A saturated peer must not buy an envelope decode, malformed input must
+    /// release its tentative charge, and a valid event must carry that charge
+    /// through the engine channel instead of taking it twice.
+    #[test]
+    fn sync_envelopes_reserve_before_decode_and_release_every_exit() {
+        let mut st = test_loop();
+        let (events, rx) = std::sync::mpsc::channel();
+        st.events = events;
+        st.budget = Arc::new(crate::net::QueueBudget::with_caps(1, 1 << 20));
+        let peer = PeerId::random();
+        let class = crate::net::EventClass::Block;
+
+        let held = st
+            .budget
+            .reserve_peer_frame(class, 1, peer.to_bytes())
+            .expect("first block allowance");
+        assert!(matches!(
+            admit_sync_envelope(&st, peer, &[0xff]),
+            SyncEnvelopeAdmission::Saturated
+        ));
+        drop(held);
+
+        assert!(matches!(
+            admit_sync_envelope(&st, peer, &[0xff]),
+            SyncEnvelopeAdmission::Malformed(_)
+        ));
+        let bytes = crate::codec::encode_envelope(&envelope(73));
+        assert!(matches!(
+            admit_sync_envelope(&st, peer, &bytes),
+            SyncEnvelopeAdmission::Admitted { slot: 73, engine_alive: true }
+        ));
+        assert!(matches!(
+            admit_sync_envelope(&st, peer, &[0xff]),
+            SyncEnvelopeAdmission::Saturated
+        ));
+
+        let event = rx.recv().expect("pre-reserved sync block reached engine");
+        assert!(matches!(event, NetEvent::Block(_, _)));
+        drop(event);
+        assert!(matches!(
+            admit_sync_envelope(&st, peer, &[0xff]),
+            SyncEnvelopeAdmission::Malformed(_)
+        ));
     }
 
     /// R1 A3-M3: the sync-chase budget is PER PEER. A peer that never lets
