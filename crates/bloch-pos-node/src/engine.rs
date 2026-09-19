@@ -11690,6 +11690,11 @@ mod ingest_admission_tests {
 
     #[test]
     fn third_genesis_key_proposal_for_one_duty_is_ignored_without_peer_blame() {
+        // Building the real hybrid-signature fixture can cross a wall-clock
+        // slot in an unoptimised/full-suite run. Pin the test clock so the
+        // retained evidence pair deterministically exercises the future pool
+        // instead of racing into the equally valid orphan path.
+        let _clock = validator_lifecycle::clock_at(0);
         let (mut engine, _dir, template, stored) = fixture();
         let slot = template.header.slot;
         let first_equivocation = repointed(&engine, &template, [0xA1; 32], slot);
