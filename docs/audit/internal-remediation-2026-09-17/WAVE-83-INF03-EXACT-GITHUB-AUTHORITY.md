@@ -87,4 +87,3 @@ against the final bytes before commit.
   not whether a completed required job can return a false green verdict.
 - Repository rules, hosted runner policy, required-check selection, and actual
   event delivery remain external evidence requirements.
-
