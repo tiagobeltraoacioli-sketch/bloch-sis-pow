@@ -88,6 +88,12 @@ entry_count="$(
 for artifact in bloch-pos SHA256SUMS BUILD-INFO; do
   [ -f "$stage/$artifact" ] && [ ! -L "$stage/$artifact" ] \
     || fail "container export $artifact must be a regular non-symlink file"
+  unexpected_link_count="$(
+    find "$stage/$artifact" ! -links 1 -exec printf x \; \
+      | wc -c | tr -d '[:space:]'
+  )"
+  [ "$unexpected_link_count" = 0 ] \
+    || fail "container export $artifact must have exactly one hard link"
   unsafe_write_count="$(
     find "$stage/$artifact" \( -perm -020 -o -perm -002 \) -exec printf x \; \
       | wc -c | tr -d '[:space:]'

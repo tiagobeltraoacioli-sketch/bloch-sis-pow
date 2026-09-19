@@ -134,6 +134,12 @@ if [ -n "${FAKE_SYMLINK_ARTIFACT:-}" ]; then
   mv "$stage/$artifact" "$target"
   ln -s "$target" "$stage/$artifact"
 fi
+if [ -n "${FAKE_HARDLINK_ARTIFACT:-}" ]; then
+  artifact="$FAKE_HARDLINK_ARTIFACT"
+  target="$context/engine-hardlink-$artifact"
+  mv "$stage/$artifact" "$target"
+  ln "$target" "$stage/$artifact"
+fi
 case "${FAKE_EXTRA_ENTRY:-none}" in
   none) ;;
   regular) printf 'unexpected\n' > "$stage/unexpected-file" ;;
@@ -160,6 +166,7 @@ run_wrapper() {
   local symlink_artifact="${11:-}"
   local extra_entry="${12:-none}"
   local unsafe_mode_artifact="${13:-}"
+  local hardlink_artifact="${14:-}"
   FAKE_MANIFEST_MODE="$mode" FAKE_DEPLOYMENT_AUTHORIZED="$authorized" \
     FAKE_DUPLICATE_DEPLOYMENT_AUTHORIZED="$duplicate" \
     FAKE_SIGNED="$signed" FAKE_DUPLICATE_SIGNED="$signed_duplicate" \
@@ -170,8 +177,29 @@ run_wrapper() {
     FAKE_SYMLINK_ARTIFACT="$symlink_artifact" \
     FAKE_EXTRA_ENTRY="$extra_entry" \
     FAKE_UNSAFE_MODE_ARTIFACT="$unsafe_mode_artifact" \
+    FAKE_HARDLINK_ARTIFACT="$hardlink_artifact" \
     CONTAINER_ENGINE="$fake_engine" \
     bash scripts/build-pos-release-container.sh "$output"
+}
+
+expect_hardlink_failure() {
+  local artifact="$1" output="$work/hardlink-$1" log="$work/hardlink-$1.log"
+  if run_wrapper canonical "$output" false 0 false 0 "" 0 \
+      canonical-container-candidate 0 "" none "" "$artifact" \
+      > "$log" 2>&1; then
+    echo "selftest: wrapper accepted hardlinked $artifact export" >&2
+    exit 1
+  fi
+  grep -Fq "container export $artifact must have exactly one hard link" \
+      "$log" || {
+    echo "selftest: hardlinked $artifact failed without expected diagnostic" >&2
+    cat "$log" >&2
+    exit 1
+  }
+  [ ! -e "$output" ] || {
+    echo "selftest: wrapper published output after rejecting hardlinked $artifact" >&2
+    exit 1
+  }
 }
 
 run_build_info_wrapper() {
@@ -305,6 +333,9 @@ expect_sha_failure multirow \
 
 for artifact in bloch-pos SHA256SUMS BUILD-INFO; do
   expect_symlink_failure "$artifact"
+done
+for artifact in bloch-pos SHA256SUMS BUILD-INFO; do
+  expect_hardlink_failure "$artifact"
 done
 for mode in regular dotfile subdir fifo; do
   expect_extra_entry_failure "$mode"
