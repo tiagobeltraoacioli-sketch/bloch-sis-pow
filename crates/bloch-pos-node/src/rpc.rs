@@ -2150,60 +2150,83 @@ pub enum Admitted {
 /// to `tx_hash`, and building deposit crediting on it would be building on a
 /// number this node invented. Take the txid from the eUTXO set instead
 /// (`listunspent`, `gettxout`), where it is the consensus one.
+pub(crate) struct PreparedSubmission {
+    kind: &'static str,
+    bytes: u64,
+    hash: [u8; 32],
+}
+
+impl PreparedSubmission {
+    /// Called by the private engine admission seam with the exact canonical
+    /// owner it is about to retain. Fields remain private so the rendered
+    /// receipt cannot later be edited away from that binding.
+    pub(crate) fn new(tx: &PosTransaction, canonical: &[u8]) -> Self {
+        use sha3::{Digest, Sha3_256};
+        let hash: [u8; 32] = Sha3_256::digest(canonical).into();
+        let kind = match tx {
+            PosTransaction::Transfer { .. } => "transfer",
+            PosTransaction::TransferV2 { .. } => "transfer_v2",
+            PosTransaction::Deposit { .. } => "deposit",
+            PosTransaction::FundedDeposit(_) => "funded_deposit",
+            PosTransaction::Exit { .. } => "exit",
+            // Distinct from "exit" on purpose: the two are different messages with
+            // different rules (one authenticated, one not) and an operator reading
+            // this field needs to see which one the chain took.
+            PosTransaction::ExitV2 { .. } => "exit_v2",
+            PosTransaction::Withdraw { .. } => "withdraw",
+            PosTransaction::Delegate { .. } => "delegate",
+            PosTransaction::SlashingEvidence(_) => "slashing_evidence",
+            // Unreachable today twice over — the wire byte (0x0A) is undecodable
+            // and `admissible` refuses the shape below its flag day — but this
+            // match is exhaustive on purpose, and an operator reading the field
+            // post-activation needs the honest name.
+            PosTransaction::RandaoRecommit { .. } => "randao_recommit",
+        };
+        Self {
+            kind,
+            bytes: canonical.len() as u64,
+            hash,
+        }
+    }
+
+    pub(crate) fn into_json(self, outcome: Admitted) -> Json {
+        Json::obj(vec![
+            ("accepted", Json::Bool(true)),
+            (
+                "status",
+                Json::s(match outcome {
+                    Admitted::New => "accepted",
+                    Admitted::Duplicate => "duplicate",
+                }),
+            ),
+            ("kind", Json::s(self.kind)),
+            ("bytes", Json::u(self.bytes)),
+            ("tx_hash", Json::hex(&self.hash)),
+            (
+                "tx_hash_note",
+                Json::s(
+                    "local correlation handle only (SHA3-256 of the canonical bytes); \
+                     not a consensus transaction id — no block commits to it",
+                ),
+            ),
+            (
+                "confirmation",
+                Json::s(
+                    "this transport does not confirm: watch for the transaction in a \
+                     block via `getblockbyslot`. `finalized: true` on that block is \
+                     the strongest signal this chain offers, but it is NOT a \
+                     settlement guarantee across nodes; evidence penalties depend on \
+                     the activated protocol rules. See `docs/integration/\
+                     BLOCH-GENESIS4-EXCHANGE-INTEGRATION.md` \u{a7}5",
+                ),
+            ),
+        ])
+    }
+}
+
 pub fn submitted_json(tx: &PosTransaction, outcome: Admitted) -> Json {
-    use sha3::{Digest, Sha3_256};
-    let bytes = tx.canonical_bytes();
-    let hash: [u8; 32] = Sha3_256::digest(&bytes).into();
-    let kind = match tx {
-        PosTransaction::Transfer { .. } => "transfer",
-        PosTransaction::TransferV2 { .. } => "transfer_v2",
-        PosTransaction::Deposit { .. } => "deposit",
-        PosTransaction::FundedDeposit(_) => "funded_deposit",
-        PosTransaction::Exit { .. } => "exit",
-        // Distinct from "exit" on purpose: the two are different messages with
-        // different rules (one authenticated, one not) and an operator reading
-        // this field needs to see which one the chain took.
-        PosTransaction::ExitV2 { .. } => "exit_v2",
-        PosTransaction::Withdraw { .. } => "withdraw",
-        PosTransaction::Delegate { .. } => "delegate",
-        PosTransaction::SlashingEvidence(_) => "slashing_evidence",
-        // Unreachable today twice over — the wire byte (0x0A) is undecodable
-        // and `admissible` refuses the shape below its flag day — but this
-        // match is exhaustive on purpose, and an operator reading the field
-        // post-activation needs the honest name.
-        PosTransaction::RandaoRecommit { .. } => "randao_recommit",
-    };
-    Json::obj(vec![
-        ("accepted", Json::Bool(true)),
-        (
-            "status",
-            Json::s(match outcome {
-                Admitted::New => "accepted",
-                Admitted::Duplicate => "duplicate",
-            }),
-        ),
-        ("kind", Json::s(kind)),
-        ("bytes", Json::u(bytes.len() as u64)),
-        ("tx_hash", Json::hex(&hash)),
-        (
-            "tx_hash_note",
-            Json::s(
-                "local correlation handle only (SHA3-256 of the canonical bytes); \
-                 not a consensus transaction id — no block commits to it",
-            ),
-        ),
-        (
-            "confirmation",
-            Json::s(
-                "this transport does not confirm: watch for the transaction in a \
-                 block via `getblockbyslot`. `finalized: true` on that block is \
-                 the strongest signal this chain offers, but it is NOT a \
-                 settlement guarantee across nodes; evidence penalties depend on \
-                 the activated protocol rules. See `docs/integration/\
-                 BLOCH-GENESIS4-EXCHANGE-INTEGRATION.md` \u{a7}5",
-            ),
-        ),
-    ])
+    let canonical = tx.canonical_bytes();
+    PreparedSubmission::new(tx, &canonical).into_json(outcome)
 }
 
 /// Lifecycle of one validator as of `current_epoch`.

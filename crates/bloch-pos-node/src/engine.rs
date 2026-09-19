@@ -4060,13 +4060,29 @@ impl Engine {
         verification_source: Option<[u8; 32]>,
     ) -> Result<Admitted, Refusal> {
         let key = tx.canonical_bytes();
+        self.on_transaction_from_canonical(tx, key, verification_source, |_, _| ())
+            .map(|(outcome, ())| outcome)
+    }
+
+    /// Admit a transaction with canonical bytes derived from that same value
+    /// at the RPC edge. Private so no external caller can forge the binding;
+    /// ordinary gossip continues through `on_transaction_from` above.
+    fn on_transaction_from_canonical<R>(
+        &mut self,
+        tx: PosTransaction,
+        key: Vec<u8>,
+        verification_source: Option<[u8; 32]>,
+        prepare_result: impl FnOnce(&PosTransaction, &[u8]) -> R,
+    ) -> Result<(Admitted, R), Refusal> {
         // A recent canonical inclusion remains a duplicate even if gossip
         // re-offers it after its pending entry was removed.
         if self.tx_slot_index.contains_key(&tx.txid()) {
-            return Ok(Admitted::Duplicate);
+            let prepared = prepare_result(&tx, &key);
+            return Ok((Admitted::Duplicate, prepared));
         }
         if self.mempool.has_txid(&tx.txid()) {
-            return Ok(Admitted::Duplicate);
+            let prepared = prepare_result(&tx, &key);
+            return Ok((Admitted::Duplicate, prepared));
         }
         // Before capacity, and before the structural check: a transaction this
         // node's own proposer already watched the transition refuse must not
@@ -4156,6 +4172,10 @@ impl Engine {
             self.mempool_suspect.remove(&lowest_key);
             self.mempool_evicted_low_fee = self.mempool_evicted_low_fee.saturating_add(1);
         }
+        // Construct caller output only once admission has succeeded. The RPC
+        // receipt hashes `key`; invalid submissions must not buy that extra
+        // proportional work merely because the optimized success path exists.
+        let prepared = prepare_result(&tx, &key);
         let broadcast = net::PreparedTransactionBroadcast::new(&key);
         // The retention clock starts at the head this node is on, not at the
         // wall slot: the TTL is "this many blocks of chain went by and never
@@ -4165,7 +4185,7 @@ impl Engine {
             .insert(key.clone(), self.head_slot_now());
         self.mempool.insert(key, tx);
         self.net.broadcast_transaction(broadcast);
-        Ok(Admitted::New)
+        Ok((Admitted::New, prepared))
     }
 
     /// Transactions for the block this node is about to propose.
@@ -5289,93 +5309,100 @@ impl Engine {
 
             RpcRequest::TxOut { txid, vout } => Ok(rpc::txout_json(&self.state, &txid, vout)),
 
-            RpcRequest::SendRawTransaction(tx) => match self.on_transaction_from(
-                tx.clone(),
-                verification_source,
-            ) {
-                Ok(outcome) => Ok(rpc::submitted_json(&tx, outcome)),
-                // The refusals are not the same fact and must not
-                // carry the same advice, and each has its own code:
-                // MEMPOOL_FULL (-32003), TX_REFUSED_RETRYABLE (-32009),
-                // TX_REFUSED (-32008). "Retry later" is correct for a full
-                // mempool and actively harmful for a refused transaction:
-                // the founder's consolidation sweep submits hundreds of
-                // thousands of transfers through this method, and an
-                // operator told to retry bytes that can NEVER be admitted
-                // chases capacity while the real fault — an unverifiable
-                // signature, an empty witness table — goes unread. Before
-                // this, every refusal returned MEMPOOL_FULL with the words
-                // "the transaction was not judged invalid" appended, which
-                // for an invalid transaction was simply false.
-                Err(Refusal::AtCapacity) => Err(RpcError::new(
-                    rpc::MEMPOOL_FULL,
-                    format!(
-                        "mempool is at capacity ({MEMPOOL_MAX} entries); retry later — \
-                         the transaction was not judged invalid"
-                    ),
-                )),
-                //
-                // And the two REFUSALS are not the same fact either, which is
-                // the split this arm exists for. `PreviouslyRefused` is a
-                // verdict on the bytes AGAINST A STATE: the bar lifts by
-                // itself after REJECTION_TTL_SLOTS, so the correct advice is
-                // "resubmit after slot N". `Invalid` is a verdict on the bytes
-                // and the correct advice is "stop". They shared TX_REFUSED
-                // until now, distinguishable only by reading the English —
-                // and the `Refusal` enum's own doc says a caller that must act
-                // on the difference has to match the variant, which is exactly
-                // what this boundary was throwing away. An exchange following
-                // our published "-32008 means never resubmit" guidance
-                // permanently abandoned transactions this node would have
-                // taken ~64 minutes later.
-                //
-                // The deadline goes in `error.data.until_slot` as well as in
-                // the sentence: the codes are stable, the wording is not.
-                Err(Refusal::PreviouslyRefused { until_slot }) => {
-                    Err(RpcError::tx_refused_retryable(
-                        until_slot,
+            RpcRequest::SendRawTransaction(tx) => {
+                let canonical = tx.canonical_bytes();
+                match self.on_transaction_from_canonical(
+                    tx,
+                    canonical,
+                    verification_source,
+                    rpc::PreparedSubmission::new,
+                ) {
+                    Ok((outcome, receipt)) => Ok(receipt.into_json(outcome)),
+                    // The refusals are not the same fact and must not
+                    // carry the same advice, and each has its own code:
+                    // MEMPOOL_FULL (-32003), TX_REFUSED_RETRYABLE (-32009),
+                    // TX_REFUSED (-32008). "Retry later" is correct for a full
+                    // mempool and actively harmful for a refused transaction:
+                    // the founder's consolidation sweep submits hundreds of
+                    // thousands of transfers through this method, and an
+                    // operator told to retry bytes that can NEVER be admitted
+                    // chases capacity while the real fault — an unverifiable
+                    // signature, an empty witness table — goes unread. Before
+                    // this, every refusal returned MEMPOOL_FULL with the words
+                    // "the transaction was not judged invalid" appended, which
+                    // for an invalid transaction was simply false.
+                    Err(Refusal::AtCapacity) => Err(RpcError::new(
+                        rpc::MEMPOOL_FULL,
                         format!(
-                            "this node's proposer already had the transition refuse this \
+                            "mempool is at capacity ({MEMPOOL_MAX} entries); retry later — \
+                         the transaction was not judged invalid"
+                        ),
+                    )),
+                    //
+                    // And the two REFUSALS are not the same fact either, which is
+                    // the split this arm exists for. `PreviouslyRefused` is a
+                    // verdict on the bytes AGAINST A STATE: the bar lifts by
+                    // itself after REJECTION_TTL_SLOTS, so the correct advice is
+                    // "resubmit after slot N". `Invalid` is a verdict on the bytes
+                    // and the correct advice is "stop". They shared TX_REFUSED
+                    // until now, distinguishable only by reading the English —
+                    // and the `Refusal` enum's own doc says a caller that must act
+                    // on the difference has to match the variant, which is exactly
+                    // what this boundary was throwing away. An exchange following
+                    // our published "-32008 means never resubmit" guidance
+                    // permanently abandoned transactions this node would have
+                    // taken ~64 minutes later.
+                    //
+                    // The deadline goes in `error.data.until_slot` as well as in
+                    // the sentence: the codes are stable, the wording is not.
+                    Err(Refusal::PreviouslyRefused { until_slot }) => {
+                        Err(RpcError::tx_refused_retryable(
+                            until_slot,
+                            format!(
+                                "this node's proposer already had the transition refuse this \
                              transaction, so it is barred until slot {until_slot}. The usual \
                              cause is that it spends an output this chain does not have — \
                              either it was built against a node on a different branch, or its \
                              parent transaction has not landed yet. This bar lifts on its own: \
                              resubmit the same bytes from slot {until_slot}, or sooner once \
                              the parent confirms. See `error.data.until_slot`."
-                        ),
-                    ))
-                }
-                Err(Refusal::StateDependent(why)) => Err(RpcError::tx_refused_retryable(
-                    self.wall_slot().saturating_add(1), why,
-                )),
-                Err(Refusal::Invalid(why)) => Err(RpcError::new(
-                    rpc::TX_REFUSED,
-                    format!("{why} — this transaction cannot be admitted; retrying \
+                            ),
+                        ))
+                    }
+                    Err(Refusal::StateDependent(why)) => Err(RpcError::tx_refused_retryable(
+                        self.wall_slot().saturating_add(1), why,
+                    )),
+                    Err(Refusal::Invalid(why)) => Err(RpcError::new(
+                        rpc::TX_REFUSED,
+                        format!("{why} — this transaction cannot be admitted; retrying \
                              the same bytes will not help"),
-                )),
-                // R7 M6: a third, distinct shape — see `rpc::TX_REFUSED_SOURCE_CAP`'s
-                // own doc for why this is neither `MEMPOOL_FULL` nor `TX_REFUSED`.
-                Err(Refusal::TooManyFromSource) => Err(RpcError::new(
-                    rpc::TX_REFUSED_SOURCE_CAP,
-                    format!(
-                        "{} pending transactions already sharing this source \
+                    )),
+                    // R7 M6: a third, distinct shape — see `rpc::TX_REFUSED_SOURCE_CAP`'s
+                    // own doc for why this is neither `MEMPOOL_FULL` nor `TX_REFUSED`.
+                    Err(Refusal::TooManyFromSource) => Err(RpcError::new(
+                        rpc::TX_REFUSED_SOURCE_CAP,
+                        format!(
+                            "{} pending transactions already sharing this source \
                          (MEMPOOL_MAX_PER_SOURCE); wait for one to clear before \
                          submitting another",
-                        MEMPOOL_MAX_PER_SOURCE,
-                    ),
-                )),
-                Err(Refusal::LifecycleVerificationLimited { until_slot }) =>
-                    Err(RpcError::tx_refused_retryable(
-                        until_slot,
-                        format!("lifecycle authorization verification allowance is exhausted for \
-                                 this slot; retry from slot {until_slot}"),
+                            MEMPOOL_MAX_PER_SOURCE,
+                        ),
                     )),
-                Err(Refusal::GossipVerificationLimited { until_slot }) =>
-                    Err(RpcError::tx_refused_retryable(
-                        until_slot,
-                        format!("network admission verification allowance is exhausted for \
+                    Err(Refusal::LifecycleVerificationLimited { until_slot }) => {
+                        Err(RpcError::tx_refused_retryable(
+                            until_slot,
+                            format!("lifecycle authorization verification allowance is exhausted for \
                                  this slot; retry from slot {until_slot}"),
-                    )),
+                        ))
+                    }
+                    Err(Refusal::GossipVerificationLimited { until_slot }) => {
+                        Err(RpcError::tx_refused_retryable(
+                            until_slot,
+                            format!("network admission verification allowance is exhausted for \
+                                 this slot; retry from slot {until_slot}"),
+                        ))
+                    }
+                }
             },
 
             // Identity of the binary, not of the chain: no state read, no
@@ -8964,6 +8991,33 @@ mod transfer_v2_end_to_end {
         );
         let selected_rpc = rpc_node.select_transactions(epoch_of(rpc_node.wall_slot()));
         assert_eq!(selected_rpc, vec![tx]);
+    }
+
+    #[test]
+    fn rpc_submission_moves_one_prepared_transaction_and_canonical_owner() {
+        let source = include_str!("engine.rs");
+        let arm = source
+            .split("RpcRequest::SendRawTransaction(tx) => {")
+            .nth(1)
+            .expect("sendrawtransaction engine arm exists")
+            .split("RpcRequest::BuildInfo")
+            .next()
+            .expect("build-info arm follows sendrawtransaction");
+        assert!(arm.contains("rpc::PreparedSubmission::new"));
+        assert!(arm.contains("on_transaction_from_canonical("));
+        assert_eq!(
+            arm.matches("tx.canonical_bytes()").count(),
+            1,
+            "RPC submission must derive exactly one canonical owner"
+        );
+        assert!(
+            !arm.contains("tx.clone()"),
+            "RPC submission again clones the proportional transaction before admission"
+        );
+        assert!(
+            !arm.contains("rpc::submitted_json(&tx"),
+            "RPC submission again re-encodes the retained transaction for its receipt"
+        );
     }
 
     #[test]

@@ -799,6 +799,27 @@ fn sendrawtransaction_reply_names_the_kind_and_disclaims_the_hash() {
     assert_eq!(dup.get("accepted"), Some(&Json::Bool(true)));
 }
 
+#[test]
+fn prepared_submission_reuses_large_canonical_owner_with_exact_reply_parity() {
+    let tx = test_transfer(8_192, 500_000, 7);
+    let oracle = tx.canonical_bytes();
+    assert!(
+        oracle.len() > 400 * 1024,
+        "fixture must make a proportional copy material"
+    );
+    assert!(
+        oracle.len().saturating_mul(2) < MAX_BODY_BYTES,
+        "fixture's hex form must remain inside the real RPC body cap"
+    );
+
+    let prepared = PreparedSubmission::new(&tx, &oracle);
+    assert_eq!(
+        prepared.into_json(Admitted::New),
+        submitted_json(&tx, Admitted::New),
+        "the reused canonical owner must not change any RPC receipt field",
+    );
+}
+
 // ─── 2. Routing and the JSON-RPC envelope ───────────────────────────────────
 
 #[test]
