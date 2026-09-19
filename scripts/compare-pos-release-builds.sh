@@ -81,6 +81,12 @@ for dir in "$a" "$b"; do
       fail "$dir/BUILD-INFO debian_snapshot must have exact YYYYMMDDTHHMMSSZ syntax" ;;
   esac
   target="$(field target "$dir/BUILD-INFO")"
+  case "$target" in
+    ''|*[!abcdefghijklmnopqrstuvwxyz0123456789_-]*|-*|*-|*--*)
+      fail "$dir/BUILD-INFO target must be a lowercase ASCII Rust host triple" ;;
+    *-*-*) : ;;
+    *) fail "$dir/BUILD-INFO target must be a lowercase ASCII Rust host triple" ;;
+  esac
   cmp -s <(printf '%s\n' \
       'artifact_kind=canonical-container-candidate' \
       "source_commit=$source_commit" \

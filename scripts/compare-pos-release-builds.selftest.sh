@@ -183,6 +183,28 @@ expect_bad_snapshot separator 20260917-000000Z
 expect_bad_snapshot short 20260917T00000Z
 expect_bad_snapshot whitespace "20260917T000000Z "
 
+target_error="target must be a lowercase ASCII Rust host triple"
+expect_bad_target() {
+  local label="$1" value="$2"
+  local left="$work/target-$label-a" right="$work/target-$label-b"
+  cp -R "$work/a" "$left"
+  cp -R "$work/a" "$right"
+  local dir
+  for dir in "$left" "$right"; do
+    awk -v value="$value" \
+      '{ if ($0 ~ /^target=/) print "target=" value; else print }' \
+      "$dir/BUILD-INFO" > "$dir/BUILD-INFO.new"
+    mv "$dir/BUILD-INFO.new" "$dir/BUILD-INFO"
+  done
+  expect_failure "matching malformed target ($label)" "$target_error" \
+    bash scripts/compare-pos-release-builds.sh "$left" "$right"
+}
+expect_bad_target whitespace "x86_64 unknown linux gnu"
+expect_bad_target uppercase X86_64-unknown-linux-gnu
+expect_bad_target path /tmp/custom-target.json
+expect_bad_target two-components linux-gnu
+expect_bad_target empty-component x86_64--linux-gnu
+
 build_info_order_error="BUILD-INFO is not in the exact canonical field order and encoding"
 expect_bad_build_info_order() {
   local label="$1" mode="$2"
