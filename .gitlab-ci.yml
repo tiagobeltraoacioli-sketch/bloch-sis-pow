@@ -361,6 +361,8 @@ tests-blocking-guard:
     - python3 -I scripts/rehearse-validator-activation.test.py
     - python3 -I scripts/check-attested-ssh.selftest.py
     - python3 -I scripts/check-attested-ssh.py
+    - python3 -I scripts/check-iso-hardening.selftest.py
+    - python3 -I scripts/check-iso-hardening.py
   timeout: 10m
   allow_failure: false
 

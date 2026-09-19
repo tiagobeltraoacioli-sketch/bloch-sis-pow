@@ -97,6 +97,8 @@ tests-blocking-guard:
     - python3 -I scripts/rehearse-validator-activation.test.py
     - python3 -I scripts/check-attested-ssh.selftest.py
     - python3 -I scripts/check-attested-ssh.py
+    - python3 -I scripts/check-iso-hardening.selftest.py
+    - python3 -I scripts/check-iso-hardening.py
   timeout: 10m
   allow_failure: false
 """
@@ -151,6 +153,8 @@ jobs:
       - run: python3 -I scripts/rehearse-validator-activation.test.py
       - run: python3 -I scripts/check-attested-ssh.selftest.py
       - run: python3 -I scripts/check-attested-ssh.py
+      - run: python3 -I scripts/check-iso-hardening.selftest.py
+      - run: python3 -I scripts/check-iso-hardening.py
 """
 GOOD_GITHUB_WITH_ENV = GOOD_GITHUB.replace(
     "name: tests\n",
@@ -447,6 +451,24 @@ CASES = [
 
     Case("gitlab attested SSH verdict cannot be removed",
          sub(GOOD_GITLAB, "    - python3 -I scripts/check-attested-ssh.py\n", ""),
+         GOOD_GITHUB, must_fail=True, expect="exact blocking contract"),
+
+    Case("github ISO hardening selftest cannot be removed",
+         GOOD_GITLAB,
+         sub(GOOD_GITHUB, "      - run: python3 -I scripts/check-iso-hardening.selftest.py\n", ""),
+         must_fail=True, expect="exact ordered contract"),
+
+    Case("gitlab ISO hardening selftest cannot be removed",
+         sub(GOOD_GITLAB, "    - python3 -I scripts/check-iso-hardening.selftest.py\n", ""),
+         GOOD_GITHUB, must_fail=True, expect="exact blocking contract"),
+
+    Case("github ISO hardening verdict cannot be removed",
+         GOOD_GITLAB,
+         sub(GOOD_GITHUB, "      - run: python3 -I scripts/check-iso-hardening.py\n", ""),
+         must_fail=True, expect="exact ordered contract"),
+
+    Case("gitlab ISO hardening verdict cannot be removed",
+         sub(GOOD_GITLAB, "    - python3 -I scripts/check-iso-hardening.py\n", ""),
          GOOD_GITHUB, must_fail=True, expect="exact blocking contract"),
 
     Case("github toolchain parser selftest cannot be removed",
