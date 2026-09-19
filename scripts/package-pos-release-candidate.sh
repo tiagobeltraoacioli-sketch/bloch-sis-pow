@@ -33,14 +33,6 @@ fi
 git diff --quiet -- || fail "tracked working tree differs from HEAD"
 git diff --cached --quiet -- || fail "index differs from HEAD"
 
-pin="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' crates/bloch-pos-node/rust-toolchain.toml)"
-[ -n "$pin" ] || fail "node toolchain pin is missing"
-active="$(cd crates/bloch-pos-node && rustc --version)"
-case "$active" in
-  "rustc $pin "*) : ;;
-  *) fail "active Rust compiler does not match the node pin $pin" ;;
-esac
-
 # Keep this list aligned with the release-integrity gate. A candidate built
 # with a target-specific linker, a profile override or a compiler wrapper is
 # not the default locked release recipe, even if its source commit is clean.
@@ -59,8 +51,26 @@ done < <(compgen -e)
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/bloch-pos-package.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
-BLOCH_BUILD_COMMIT="${commit:0:12}" cargo build --release --locked \
-  -p bloch-pos-node --bin bloch-pos --target-dir "$work/target"
+source="$work/src"
+mkdir -p "$source"
+git archive "$commit" | tar -x -C "$source" \
+  || fail "could not materialize the captured commit archive"
+
+# Resolve both the reviewed pin and the active toolchain from the captured
+# source tree. Running Rust and Cargo there also loads only the archived Cargo
+# configuration, never a config or source file changed after the clean checks.
+pin="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' \
+  "$source/crates/bloch-pos-node/rust-toolchain.toml")"
+[ -n "$pin" ] || fail "node toolchain pin is missing"
+active="$(cd "$source/crates/bloch-pos-node" && rustc --version)"
+case "$active" in
+  "rustc $pin "*) : ;;
+  *) fail "active Rust compiler does not match the node pin $pin" ;;
+esac
+
+( cd "$source" && BLOCH_BUILD_COMMIT="${commit:0:12}" \
+    cargo build --release --locked -p bloch-pos-node --bin bloch-pos \
+      --target-dir "$work/target" )
 binary="$work/target/release/bloch-pos"
 [ -x "$binary" ] || fail "release binary was not produced"
 version_output="$($binary --version)"
@@ -84,7 +94,7 @@ printf '%s  bloch-pos\n' "$binary_sha" > "$stage/SHA256SUMS"
   printf 'source_commit=%s\n' "$commit"
   printf 'source_commit_short=%s\n' "${commit:0:12}"
   printf 'rust_toolchain=%s\n' "$pin"
-  printf 'target=%s\n' "$(rustc -vV | sed -n 's/^host: //p')"
+  printf 'target=%s\n' "$(cd "$source" && rustc -vV | sed -n 's/^host: //p')"
   printf 'binary_sha256=%s\n' "$binary_sha"
   printf 'binary_version=%s\n' "$binary_version"
   printf 'binary_source_identity=%s\n' "$source_identity"
