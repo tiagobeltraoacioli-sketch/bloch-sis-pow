@@ -913,6 +913,10 @@ impl Keypair {
         let ks: EncryptedKeystore = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
         if ks.version != 2 { return Err("unsupported keystore version".into()); }
 
+        // Reject attacker-controlled Argon2 work before any Base64 decoder can
+        // allocate output for the remaining untrusted fields.
+        validate_kdf_params(&ks.crypto.kdf_params)?;
+
         let salt      = b64::STANDARD.decode(&ks.crypto.kdf_params.salt).map_err(|e| e.to_string())?;
         let nonce_b   = b64::STANDARD.decode(&ks.crypto.nonce).map_err(|e| e.to_string())?;
         // Reuse the decoded ciphertext allocation for authenticated plaintext.
@@ -1151,11 +1155,7 @@ const MAX_M_COST_KIB: u32 = 1024 * 1024; // 1 GiB
 const MAX_T_COST: u32 = 16;
 const MAX_P_COST: u32 = 16;
 
-fn derive_key_with_params(
-    pw: &str,
-    salt: &[u8],
-    p: &KdfParams,
-) -> Result<Zeroizing<Vec<u8>>, String> {
+fn validate_kdf_params(p: &KdfParams) -> Result<(), String> {
     if p.memory_cost > MAX_M_COST_KIB || p.time_cost > MAX_T_COST || p.parallelism > MAX_P_COST {
         return Err(format!(
             "KDF params out of bounds (memory_cost={} KiB, time_cost={}, parallelism={})",
@@ -1167,6 +1167,16 @@ fn derive_key_with_params(
             "KDF output_len must be 32 (AES-256 key), got {}", p.output_len
         ));
     }
+    Ok(())
+}
+
+fn derive_key_with_params(
+    pw: &str,
+    salt: &[u8],
+    p: &KdfParams,
+) -> Result<Zeroizing<Vec<u8>>, String> {
+    // Keep validation here as a defense for any future non-file caller.
+    validate_kdf_params(p)?;
     let params = Params::new(p.memory_cost, p.time_cost, p.parallelism, Some(32))
         .map_err(|e| e.to_string())?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
@@ -1249,6 +1259,115 @@ mod legacy_keystore_tests {
         assert_eq!(&actual[..], &expected);
         actual.zeroize();
         assert!(actual.is_empty() || actual.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn legacy_loader_checks_every_kdf_bound_before_base64() {
+        let password = "synthetic-test-password";
+        let path = std::env::temp_dir().join(format!(
+            "bloch-wave176-legacy-kdf-order-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let baseline = KdfParams {
+            memory_cost: 8,
+            time_cost: 1,
+            parallelism: 1,
+            salt: b64::STANDARD.encode([0x19; 32]),
+            output_len: 32,
+        };
+        let cases = [
+            (
+                KdfParams { memory_cost: MAX_M_COST_KIB + 1, ..baseline.clone() },
+                format!(
+                    "KDF params out of bounds (memory_cost={} KiB, time_cost=1, parallelism=1)",
+                    MAX_M_COST_KIB + 1
+                ),
+            ),
+            (
+                KdfParams { time_cost: MAX_T_COST + 1, ..baseline.clone() },
+                format!(
+                    "KDF params out of bounds (memory_cost=8 KiB, time_cost={}, parallelism=1)",
+                    MAX_T_COST + 1
+                ),
+            ),
+            (
+                KdfParams { parallelism: MAX_P_COST + 1, ..baseline.clone() },
+                format!(
+                    "KDF params out of bounds (memory_cost=8 KiB, time_cost=1, parallelism={})",
+                    MAX_P_COST + 1
+                ),
+            ),
+            (
+                KdfParams { output_len: 31, ..baseline.clone() },
+                "KDF output_len must be 32 (AES-256 key), got 31".to_string(),
+            ),
+        ];
+
+        for (kdf_params, expected) in cases {
+            let keystore = EncryptedKeystore {
+                version: 2,
+                address: "unused".into(),
+                network: "mainnet".into(),
+                crypto: KeystoreCrypto {
+                    cipher: "aes-256-gcm".into(),
+                    // If policy ordering regresses, this deliberately invalid
+                    // large sentinel produces a Base64 error instead.
+                    ciphertext: "!".repeat(64 * 1024),
+                    nonce: b64::STANDARD.encode([0x28; 12]),
+                    kdf: "argon2id".into(),
+                    kdf_params,
+                },
+                created_at: String::new(),
+                description: String::new(),
+            };
+            let bytes = serde_json::to_vec(&keystore).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(
+                Keypair::load_encrypted_with_file_limit(&path, password, bytes.len())
+                    .unwrap_err(),
+                expected
+            );
+        }
+
+        // A valid, inexpensive parameter set still reaches the unchanged
+        // Argon2/AES path and round-trips an authentic legacy keystore.
+        let keypair = generate_keypair(false);
+        let salt = [0x19; 32];
+        let nonce = [0x28; 12];
+        let kdf_params = baseline;
+        let key = derive_key_with_params(password, &salt, &kdf_params).unwrap();
+        let payload = Zeroizing::new(serde_json::to_vec(&KeystorePayload {
+            private_key_hex: hex::encode(&keypair.private_key),
+            public_key_hex: hex::encode(&keypair.public_key),
+        }).unwrap());
+        let ciphertext = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key))
+            .encrypt(Nonce::from_slice(&nonce), payload.as_ref())
+            .unwrap();
+        let keystore = EncryptedKeystore {
+            version: 2,
+            address: keypair.address.clone(),
+            network: "mainnet".into(),
+            crypto: KeystoreCrypto {
+                cipher: "aes-256-gcm".into(),
+                ciphertext: b64::STANDARD.encode(ciphertext),
+                nonce: b64::STANDARD.encode(nonce),
+                kdf: "argon2id".into(),
+                kdf_params,
+            },
+            created_at: String::new(),
+            description: String::new(),
+        };
+        let bytes = serde_json::to_vec(&keystore).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let loaded = Keypair::load_encrypted_with_file_limit(&path, password, bytes.len())
+            .unwrap();
+        assert_eq!(loaded.private_key, keypair.private_key);
+        assert_eq!(loaded.public_key, keypair.public_key);
+        assert_eq!(loaded.address, keypair.address);
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
