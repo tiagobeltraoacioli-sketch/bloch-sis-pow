@@ -123,6 +123,12 @@ struct KeyMaterial {
     public: Vec<u8>,
 }
 
+/// Take ownership of a repository-produced wallet secret immediately, without
+/// cloning its allocation, until it can be transferred into `KeyMaterial`.
+fn wallet_secret_owner(secret: Vec<u8>) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(secret)
+}
+
 impl Wallet {
     /// Generate a new wallet with a fresh random seed phrase.
     ///
@@ -172,6 +178,7 @@ impl Wallet {
         // ML-DSA-65 keygen from 32-byte seed
         let (public, secret) = crypto::generate_keypair_from_seed(&seed_bytes[..32])
             .map_err(|e| WalletError::Crypto(e.to_string()))?;
+        let mut secret = wallet_secret_owner(secret);
 
         let hash_full = Sha3_256::digest(&public);
         let mut addr_hash = [0u8; 20];
@@ -179,7 +186,10 @@ impl Wallet {
         let addr = Address::from_hash(addr_hash, network);
 
         Ok(Wallet {
-            keypair: KeyMaterial { secret, public },
+            keypair: KeyMaterial {
+                secret: std::mem::take(&mut *secret),
+                public,
+            },
             address: addr,
             network,
         })
@@ -253,13 +263,17 @@ impl Wallet {
             .map_err(|e| WalletError::Parse(e.to_string()))?;
 
         let (secret, public, network) = ef.decrypt(password)?;
+        let mut secret = wallet_secret_owner(secret);
         let hash_full = Sha3_256::digest(&public);
         let mut addr_hash = [0u8; 20];
         addr_hash.copy_from_slice(&hash_full[..20]);
         let addr = Address::from_hash(addr_hash, network);
 
         Ok(Wallet {
-            keypair: KeyMaterial { secret, public },
+            keypair: KeyMaterial {
+                secret: std::mem::take(&mut *secret),
+                public,
+            },
             address: addr,
             network,
         })
@@ -413,6 +427,24 @@ impl Wallet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wallet_secret_owner_preserves_allocation_and_wipes_while_live() {
+        let _: fn(Vec<u8>) -> Zeroizing<Vec<u8>> = wallet_secret_owner;
+        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
+
+        let secret = Vec::from([0x19, 0x27, 0x43, 0x61, 0x7f]);
+        let pointer = secret.as_ptr();
+        let capacity = secret.capacity();
+        let expected = secret.clone();
+        let mut owner = wallet_secret_owner(secret);
+
+        assert_eq!(owner.as_ptr(), pointer);
+        assert_eq!(owner.capacity(), capacity);
+        assert_eq!(owner.as_slice(), expected.as_slice());
+        owner.zeroize();
+        assert!(owner.iter().all(|byte| *byte == 0));
+    }
 
     #[test]
     fn current_wallet_custom_file_budget_preserves_authenticated_roundtrip() {
