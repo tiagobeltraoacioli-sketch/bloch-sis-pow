@@ -345,6 +345,13 @@ const MEMPOOL_MAX_PER_SOURCE: usize = 64;
 /// allowance arrives after 30 seconds.
 const LIFECYCLE_VERIFICATIONS_PER_SOURCE_PER_SLOT: usize = 2;
 
+/// Expensive lifecycle authorization calls allowed across all identities in
+/// one wall slot. This is deliberately a node-local relay ceiling: it bounds
+/// identity cycling on the unauthenticated transport without changing block
+/// validity. 256 calls retain two attempts for 128 independent identities in
+/// 30 seconds; overload is retryable in the next slot.
+const LIFECYCLE_VERIFICATIONS_TOTAL_PER_SLOT: usize = 256;
+
 /// Doppelgänger protection window (R6 HIGH-8, node half): slots this node
 /// observes the network for its OWN validator index attesting or proposing
 /// before it will start duties itself.

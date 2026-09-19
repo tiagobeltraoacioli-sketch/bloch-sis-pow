@@ -13,6 +13,7 @@ pub(super) struct Mempool {
     sources: BTreeMap<[u8; 32], usize>,
     bytes: usize,
     lifecycle_verification_slot: Option<u64>,
+    lifecycle_verifications_total: usize,
     lifecycle_verifications: BTreeMap<[u8; 32], usize>,
 }
 impl std::ops::Deref for Mempool {
@@ -41,11 +42,16 @@ impl Mempool {
     pub(super) fn reserve_lifecycle_verification(&mut self, source: [u8; 32], wall_slot: u64) -> bool {
         if self.lifecycle_verification_slot != Some(wall_slot) {
             self.lifecycle_verification_slot = Some(wall_slot);
+            self.lifecycle_verifications_total = 0;
             self.lifecycle_verifications.clear();
+        }
+        if self.lifecycle_verifications_total >= LIFECYCLE_VERIFICATIONS_TOTAL_PER_SLOT {
+            return false;
         }
         let used = self.lifecycle_verifications.entry(source).or_default();
         if *used >= LIFECYCLE_VERIFICATIONS_PER_SOURCE_PER_SLOT { return false; }
         *used = used.saturating_add(1);
+        self.lifecycle_verifications_total = self.lifecycle_verifications_total.saturating_add(1);
         true
     }
     pub(super) fn insert(&mut self, key: Vec<u8>, tx: PosTransaction) -> Option<PosTransaction> {
@@ -101,6 +107,24 @@ mod tests {
         assert!(!pool.reserve_lifecycle_verification(first, 100));
         assert!(pool.reserve_lifecycle_verification(second, 100));
         assert!(pool.reserve_lifecycle_verification(first, 101));
+    }
+
+    #[test]
+    fn lifecycle_verification_budget_is_globally_bounded_and_renews_each_slot() {
+        let mut pool = Mempool::default();
+        for identity in 0..LIFECYCLE_VERIFICATIONS_TOTAL_PER_SLOT {
+            let mut source = [0u8; 32];
+            source[..8].copy_from_slice(&(identity as u64).to_le_bytes());
+            assert!(pool.reserve_lifecycle_verification(source, 200));
+        }
+        assert!(!pool.reserve_lifecycle_verification([0xff; 32], 200));
+        assert_eq!(
+            pool.lifecycle_verifications.len(),
+            LIFECYCLE_VERIFICATIONS_TOTAL_PER_SLOT,
+        );
+        assert!(pool.reserve_lifecycle_verification([0xff; 32], 201));
+        assert_eq!(pool.lifecycle_verifications_total, 1);
+        assert_eq!(pool.lifecycle_verifications.len(), 1);
     }
 
     #[test]
