@@ -190,6 +190,64 @@ def sub(text: str, old: str, new: str) -> str:
 CASES = [
     Case("GitLab reviewed execution environment stays green",
          GOOD_GITLAB, GOOD_GITHUB, must_fail=False),
+    Case("GitLab quoted scalar values remain in the supported subset",
+         GOOD_GITLAB, GOOD_GITHUB, must_fail=False),
+    Case("GitLab key-shaped block script text remains data",
+         GOOD_GITLAB +
+         "\nquoted-script-data:\n"
+         "  stage: test\n"
+         "  script:\n"
+         "    - |\n"
+         "      \"not-a-yaml-key\": shell data\n",
+         GOOD_GITHUB, must_fail=False),
+    Case("GitLab escaped default authority key is rejected globally",
+         GOOD_GITLAB +
+         "\n\"defa\\u0075lt\":\n"
+         "  tags: [attacker-controlled]\n"
+         "  before_script: [\"true\"]\n",
+         GOOD_GITHUB, must_fail=True, expect="quoted YAML mapping keys"),
+    Case("GitLab escaped required test job key is rejected globally",
+         GOOD_GITLAB +
+         "\n\"build-and-te\\u0073t\":\n"
+         "  stage: test\n"
+         "  script:\n    - true\n"
+         "  allow_failure: true\n",
+         GOOD_GITHUB, must_fail=True, expect="quoted YAML mapping keys"),
+    Case("GitLab escaped test waiver key is rejected globally",
+         GOOD_GITLAB.replace(
+             "build-and-test:\n  stage: test",
+             "build-and-test:\n  \"allow_fail\\u0075re\": true\n  stage: test"),
+         GOOD_GITHUB, must_fail=True, expect="quoted YAML mapping keys"),
+    Case("GitLab escaped test script key is rejected globally",
+         GOOD_GITLAB.replace("  script:\n", "  \"scr\\u0069pt\":\n", 1),
+         GOOD_GITHUB, must_fail=True, expect="quoted YAML mapping keys"),
+    Case("GitLab explicit escaped default key is rejected globally",
+         GOOD_GITLAB +
+         "\n? \"defa\\u0075lt\"\n"
+         ":\n  tags: [attacker-controlled]\n",
+         GOOD_GITHUB, must_fail=True,
+         expect="explicit, tagged, anchored or aliased"),
+    Case("GitLab multiline explicit default key is rejected globally",
+         GOOD_GITLAB +
+         "\n?\n  default\n"
+         ":\n  tags: [attacker-controlled]\n",
+         GOOD_GITHUB, must_fail=True,
+         expect="explicit, tagged, anchored or aliased"),
+    Case("GitLab tagged default key is rejected globally",
+         GOOD_GITLAB +
+         "\n!!str default:\n  tags: [attacker-controlled]\n",
+         GOOD_GITHUB, must_fail=True,
+         expect="explicit, tagged, anchored or aliased"),
+    Case("GitLab anchored default key is rejected globally",
+         GOOD_GITLAB +
+         "\n&hidden default:\n  tags: [attacker-controlled]\n",
+         GOOD_GITHUB, must_fail=True,
+         expect="explicit, tagged, anchored or aliased"),
+    Case("GitLab flow mapping authority is rejected globally",
+         GOOD_GITLAB.replace(
+             "variables:\n  CARGO_TERM_COLOR: \"always\"\n  RUST_BACKTRACE: \"1\"",
+             "variables: {\"BASH_ENV\": scripts/mask-tests.sh}"),
+         GOOD_GITHUB, must_fail=True, expect="flow-style YAML mappings"),
     Case("GitHub quoted text inside a block script is not a mapping key",
          GOOD_GITLAB,
          GOOD_GITHUB +

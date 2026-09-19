@@ -249,6 +249,66 @@ def sub(text: str, old: str, new: str) -> str:
 
 CASES = [
     Case("honest pipelines stay green", GOOD_GITLAB, GOOD_GITHUB, must_fail=False),
+    Case("GitLab quoted scanner scalar values remain supported",
+         GOOD_GITLAB, GOOD_GITHUB, must_fail=False),
+    Case("GitLab scanner block script key-shaped text remains data",
+         GOOD_GITLAB +
+         "\nquoted-script-data:\n"
+         "  stage: test\n"
+         "  script:\n"
+         "    - |\n"
+         "      \"not-a-yaml-key\": shell data\n",
+         GOOD_GITHUB, must_fail=False),
+    Case("GitLab escaped scanner default authority key is rejected globally",
+         GOOD_GITLAB +
+         "\n\"defa\\u0075lt\":\n"
+         "  tags: [attacker-controlled]\n"
+         "  before_script: [\"true\"]\n",
+         GOOD_GITHUB, must_fail=True, expect="quoted YAML mapping keys"),
+    Case("GitLab escaped required scanner job key is rejected globally",
+         GOOD_GITLAB +
+         "\n\"supply-cha\\u0069n\":\n"
+         "  stage: check\n"
+         "  script:\n    - true\n"
+         "  allow_failure: true\n",
+         GOOD_GITHUB, must_fail=True, expect="quoted YAML mapping keys"),
+    Case("GitLab escaped scanner waiver key is rejected globally",
+         sub(GOOD_GITLAB,
+             "supply-chain:\n  stage: check",
+             "supply-chain:\n  \"allow_fail\\u0075re\": true\n  stage: check"),
+         GOOD_GITHUB, must_fail=True, expect="quoted YAML mapping keys"),
+    Case("GitLab escaped scanner script key is rejected globally",
+         sub(GOOD_GITLAB,
+             "supply-chain:\n  stage: check\n  script:",
+             "supply-chain:\n  stage: check\n  \"scr\\u0069pt\":"),
+         GOOD_GITHUB, must_fail=True, expect="quoted YAML mapping keys"),
+    Case("GitLab explicit escaped scanner default key is rejected globally",
+         GOOD_GITLAB +
+         "\n? \"defa\\u0075lt\"\n"
+         ":\n  tags: [attacker-controlled]\n",
+         GOOD_GITHUB, must_fail=True,
+         expect="explicit, tagged, anchored or aliased"),
+    Case("GitLab multiline explicit scanner default is rejected globally",
+         GOOD_GITLAB +
+         "\n?\n  default\n"
+         ":\n  tags: [attacker-controlled]\n",
+         GOOD_GITHUB, must_fail=True,
+         expect="explicit, tagged, anchored or aliased"),
+    Case("GitLab tagged scanner default key is rejected globally",
+         GOOD_GITLAB +
+         "\n!!str default:\n  tags: [attacker-controlled]\n",
+         GOOD_GITHUB, must_fail=True,
+         expect="explicit, tagged, anchored or aliased"),
+    Case("GitLab anchored scanner default key is rejected globally",
+         GOOD_GITLAB +
+         "\n&hidden default:\n  tags: [attacker-controlled]\n",
+         GOOD_GITHUB, must_fail=True,
+         expect="explicit, tagged, anchored or aliased"),
+    Case("GitLab flow scanner authority mapping is rejected globally",
+         GOOD_GITLAB.replace(
+             "variables:\n  CARGO_TERM_COLOR: \"always\"\n  RUST_BACKTRACE: \"1\"",
+             "variables: {\"BASH_ENV\": scripts/mask-scanners.sh}"),
+         GOOD_GITHUB, must_fail=True, expect="flow-style YAML mappings"),
     Case("GitHub quoted text inside a scanner block script is not a mapping key",
          GOOD_GITLAB,
          GOOD_GITHUB +

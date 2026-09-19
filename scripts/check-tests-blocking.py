@@ -28,6 +28,9 @@ GitLab `.gitlab-ci.yml` job `build-and-test`, to the reviewed posture:
     explicit subset, exactly once, with no job-local script hooks or execution
     variables. The `build-and-test` header and complete ordered script match
     the reviewed whole-job contract.
+  * both CI documents reject quoted/escaped, explicit, tagged, anchored,
+    aliased and flow-style mapping keys outside block scalar script data, so
+    semantic duplicates cannot hide from the supported textual subset.
   * its GitHub environment is the reviewed inert pair and its exact global
     run shell clears inherited shell/Python/Rust substitution variables while
     replacing PATH; required jobs use no containers/services/env overrides,
@@ -216,7 +219,7 @@ CI_SCRIPT_ENTRYPOINT_SHA256 = {
     "scripts/check-iso-hardening.sh":
         "f0dae2e22aa766301def84a0c671ca4f79ff0c1b87d6e8647e9f6671669b91b3",
     "scripts/check-tests-blocking.selftest.py":
-        "ca6b715915fd3c65ae3b48af8d53ee6e7db3a5a4a0b244b13d2cb5167cb9ba42",
+        "f3a0fbfb81f1fd11351b9eddcee06d4821d436842e3824b0656e47f16154bc80",
     "scripts/check-validator-lifecycle-mutations.py":
         "12b477e5043bc3ea98387be33ca586976494b30083522b214cea7d88c0e9f429",
     "scripts/devnet-particao-report.test.py":
@@ -660,8 +663,8 @@ QUOTED_MAPPING_KEY = re.compile(
     r"^\s*(?:-\s+)?(?:\"(?:\\.|[^\"\\])*\"|'(?:''|[^'])*')\s*:"
 )
 BLOCK_SCALAR_VALUE = re.compile(
-    r"^\s*(?:-\s+)?(?:[A-Za-z0-9_-]+|\"(?:\\.|[^\"\\])*\"|'(?:''|[^'])*')"
-    r"\s*:\s*[|>][0-9+-]*(?:\s+#.*)?$"
+    r"^\s*(?:(?:-\s+)?(?:[A-Za-z0-9_-]+|\"(?:\\.|[^\"\\])*\"|'(?:''|[^'])*')"
+    r"\s*:\s*|-\s+)[|>][0-9+-]*(?:\s+#.*)?$"
 )
 EXPLICIT_MAPPING_INDICATOR = re.compile(r"^\s*(?:-\s+)?[?:](?:\s|$)")
 NODE_PROPERTY_MAPPING_KEY = re.compile(
@@ -674,10 +677,12 @@ FLOW_MAPPING_START = re.compile(
 )
 
 
-def github_mapping_key_syntax_problems(text: str, label: str) -> list[str]:
+def ci_mapping_key_syntax_problems(
+    text: str, label: str, provider: str
+) -> list[str]:
     """Reject unsupported YAML mapping keys outside block scalar bodies.
 
-    The supported GitHub subset uses plain keys throughout. Quoted keys can
+    The supported CI subsets use plain keys throughout. Quoted keys can
     hide Unicode/hex escapes from the textual authority parsers while GitHub's
     YAML parser resolves them to security-sensitive semantic duplicates.
     """
@@ -695,17 +700,17 @@ def github_mapping_key_syntax_problems(text: str, label: str) -> list[str]:
         if QUOTED_MAPPING_KEY.match(line):
             problems.append(
                 f"{label}:{number}: quoted YAML mapping keys are outside the "
-                "supported GitHub workflow subset")
+                f"supported {provider} workflow subset")
         if (EXPLICIT_MAPPING_INDICATOR.match(line)
                 or NODE_PROPERTY_MAPPING_KEY.match(line)
                 or ALIAS_MAPPING_KEY.match(line)):
             problems.append(
                 f"{label}:{number}: explicit, tagged, anchored or aliased YAML "
-                "mapping keys are outside the supported GitHub workflow subset")
+                f"mapping keys are outside the supported {provider} workflow subset")
         if FLOW_MAPPING_START.match(line):
             problems.append(
                 f"{label}:{number}: flow-style YAML mappings are outside the "
-                "supported GitHub workflow subset")
+                f"supported {provider} workflow subset")
     return problems
 
 
@@ -863,7 +868,7 @@ def check_job(path: str, job: str, indent: int, label: str) -> list[str]:
     blocks = job_blocks(text, indent)
     problems: list[str] = []
     if label == ".github/workflows/tests.yml":
-        problems += github_mapping_key_syntax_problems(text, label)
+        problems += ci_mapping_key_syntax_problems(text, label, "GitHub")
         problems += protected_job_key_problems(text, job, indent, label)
     if job not in blocks:
         problems.append(
@@ -874,6 +879,7 @@ def check_job(path: str, job: str, indent: int, label: str) -> list[str]:
     body = blocks[job]
 
     if label == ".gitlab-ci.yml":
+        problems += ci_mapping_key_syntax_problems(text, label, "GitLab")
         problems += check_gitlab_global_context(text, job_blocks(text, 0))
         problems += check_gitlab_job_context(body, job, indent)
         problems += check_gitlab_build_contract(body)

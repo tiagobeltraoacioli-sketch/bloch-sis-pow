@@ -51,6 +51,8 @@ security job, fails if the job:
     and GitHub step `run:`/`uses:` fields, never names, comments or variables.
   * duplicates or quotes a required job key, so the CI parser cannot select a
     different mapping value than the plain-key block reviewed here.
+  * disguises any mapping key with quoting/escapes, explicit-key syntax, tags,
+    anchors, aliases or flow mappings outside literal/folded block scalar data.
   * makes the GitHub OSV verdict mutable by replacing its full commit pin with
     a tag/branch, or removes this guard's own adversarial self-test.
   * lets the GitHub OSV lockfile scope drift from the complete set of tracked
@@ -510,8 +512,8 @@ QUOTED_MAPPING_KEY = re.compile(
     r"^\s*(?:-\s+)?(?:\"(?:\\.|[^\"\\])*\"|'(?:''|[^'])*')\s*:"
 )
 BLOCK_SCALAR_VALUE = re.compile(
-    r"^\s*(?:-\s+)?(?:[A-Za-z0-9_-]+|\"(?:\\.|[^\"\\])*\"|'(?:''|[^'])*')"
-    r"\s*:\s*[|>][0-9+-]*(?:\s+#.*)?$"
+    r"^\s*(?:(?:-\s+)?(?:[A-Za-z0-9_-]+|\"(?:\\.|[^\"\\])*\"|'(?:''|[^'])*')"
+    r"\s*:\s*|-\s+)[|>][0-9+-]*(?:\s+#.*)?$"
 )
 EXPLICIT_MAPPING_INDICATOR = re.compile(r"^\s*(?:-\s+)?[?:](?:\s|$)")
 NODE_PROPERTY_MAPPING_KEY = re.compile(
@@ -524,7 +526,9 @@ FLOW_MAPPING_START = re.compile(
 )
 
 
-def github_mapping_key_syntax_problems(text: str, label: str) -> list[str]:
+def ci_mapping_key_syntax_problems(
+    text: str, label: str, provider: str
+) -> list[str]:
     """Reject unsupported YAML mapping keys outside block scalar bodies."""
     problems = []
     block_parent_indent: int | None = None
@@ -540,17 +544,17 @@ def github_mapping_key_syntax_problems(text: str, label: str) -> list[str]:
         if QUOTED_MAPPING_KEY.match(line):
             problems.append(
                 f"{label}:{number}: quoted YAML mapping keys are outside the "
-                "supported GitHub workflow subset")
+                f"supported {provider} workflow subset")
         if (EXPLICIT_MAPPING_INDICATOR.match(line)
                 or NODE_PROPERTY_MAPPING_KEY.match(line)
                 or ALIAS_MAPPING_KEY.match(line)):
             problems.append(
                 f"{label}:{number}: explicit, tagged, anchored or aliased YAML "
-                "mapping keys are outside the supported GitHub workflow subset")
+                f"mapping keys are outside the supported {provider} workflow subset")
         if FLOW_MAPPING_START.match(line):
             problems.append(
                 f"{label}:{number}: flow-style YAML mappings are outside the "
-                "supported GitHub workflow subset")
+                f"supported {provider} workflow subset")
     return problems
 
 
@@ -687,6 +691,7 @@ def check_file(
     blocks = job_blocks(text, indent)
     problems: list[str] = []
     if label == ".gitlab-ci.yml":
+        problems += ci_mapping_key_syntax_problems(text, label, "GitLab")
         top_level = job_blocks(text, 0)
         problems += check_gitlab_global_context(text, top_level)
         for line in text.splitlines():
@@ -696,7 +701,7 @@ def check_file(
                     "%s: top-level `%s:` moves pipeline semantics outside the "
                     "locally inspectable blocking subset" % (label, key))
     if label == ".github/workflows/security.yml":
-        problems += github_mapping_key_syntax_problems(text, label)
+        problems += ci_mapping_key_syntax_problems(text, label, "GitHub")
         problems += protected_global_key_problems(
             text, "defaults", label, required=True)
         problems += protected_global_key_problems(
