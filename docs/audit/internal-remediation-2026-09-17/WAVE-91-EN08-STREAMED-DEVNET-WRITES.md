@@ -53,7 +53,7 @@ Existing reverse-direction and bidirectional large-page sync regressions cover
 the real locked TCP call sites. The root ran both outside the restricted
 sandbox.
 
-## Validation checkpoint
+## Validation
 
 ```text
 cargo check -p bloch-pos-node --tests --offline
@@ -73,12 +73,15 @@ cargo test -p bloch-pos-node --bin bloch-pos \
   net::tests::shared_sync_bidirectional_large_pages_keep_both_readers_draining \
   --offline -- --exact
 # 1 passed; 0 failed; 591 filtered out
+
+cargo test -p bloch-pos-node --bin bloch-pos --offline
+# 573 passed; 0 failed; 19 ignored; finished in 57.17s
 ```
 
 Compiler output contained only existing unused-code/import warnings.
 
-The two socket-bearing focused tests were executed by the root outside the
-restricted sandbox. The integrated node suite remains pending.
+The two socket-bearing focused tests and complete node suite were executed by
+the root outside the restricted sandbox.
 
 ## Residual boundaries
 

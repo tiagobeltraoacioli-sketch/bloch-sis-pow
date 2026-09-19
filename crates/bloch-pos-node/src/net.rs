@@ -1120,6 +1120,25 @@ fn write_frame<W: Write>(writer: &mut W, frame: &[u8]) -> std::io::Result<()> {
     writer.write_all(frame)
 }
 
+fn write_typed_frame<W: Write>(
+    writer: &mut W,
+    frame_type: u8,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    // Production payloads are bounded by MAX_FIELD_LEN before they reach this
+    // sync-serving edge. Keep overflow fail-closed rather than wrapping a
+    // length prefix if that invariant ever changes.
+    let frame_len = payload.len().checked_add(1).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "frame length overflow")
+    })?;
+    let frame_len = u32::try_from(frame_len).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "frame length exceeds u32")
+    })?;
+    writer.write_all(&frame_len.to_le_bytes())?;
+    writer.write_all(&[frame_type])?;
+    writer.write_all(payload)
+}
+
 fn read_frame(sock: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     let deadline = Instant::now().checked_add(DEVNET_IO_TIMEOUT)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "frame deadline out of range"))?;
@@ -1281,13 +1300,9 @@ fn serve_get_blocks(
     match crate::store::Store::blocks_after(data_dir, after, SYNC_PAGE_BLOCKS) {
         Ok(blocks) => {
             for b in blocks {
-                // Capacity hint only: saturating is the intended semantics.
-                let mut f = Vec::with_capacity(1usize.saturating_add(b.len()));
-                f.push(FRAME_BLOCK);
-                f.extend_from_slice(&b);
                 let Ok(mut w) = sock.lock() else { return };
                 if connection.closed.load(Ordering::Acquire) { return; }
-                if write_frame(&mut *w, &f).is_err() {
+                if write_typed_frame(&mut *w, FRAME_BLOCK, &b).is_err() {
                     // A partial frame cannot be followed by more framed data.
                     connection.closed.store(true, Ordering::Release);
                     let _ = connection.socket.shutdown(Shutdown::Both);
@@ -1922,6 +1937,42 @@ mod tests {
         assert_eq!(&writer.bytes[4..], payload.as_slice());
         assert_eq!(writer.offered[..3], [4, 2, payload.len()],
             "payload writing must begin only after the complete prefix");
+    }
+
+    #[test]
+    fn write_typed_frame_streams_length_tag_and_payload_across_short_writes() {
+        #[derive(Default)]
+        struct ShortWriter {
+            bytes: Vec<u8>,
+            offered: Vec<usize>,
+        }
+
+        impl Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.offered.push(bytes.len());
+                // Split the prefix, accept the one-byte tag, then split the
+                // large payload independently of both preceding phases.
+                let cap = if self.offered.len() <= 2 { 2 } else { 4_093 };
+                let accepted = bytes.len().min(cap);
+                self.bytes.extend_from_slice(&bytes[..accepted]);
+                Ok(accepted)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let payload = vec![0x5A; 1 << 20];
+        let mut writer = ShortWriter::default();
+        write_typed_frame(&mut writer, FRAME_BLOCK, &payload).unwrap();
+
+        let frame_len = payload.len() + 1;
+        assert_eq!(&writer.bytes[..4], &(frame_len as u32).to_le_bytes());
+        assert_eq!(writer.bytes[4], FRAME_BLOCK);
+        assert_eq!(&writer.bytes[5..], payload.as_slice());
+        assert_eq!(writer.offered[..4], [4, 2, 1, payload.len()],
+            "payload writing must begin only after the complete prefix and tag");
     }
 
     #[test]
