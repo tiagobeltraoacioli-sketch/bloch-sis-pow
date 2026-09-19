@@ -955,25 +955,30 @@ pub fn repair_log_tail_offline(
     })
 }
 
-fn encode_log_payload(env: &BlockEnvelope) -> io::Result<Vec<u8>> {
-    let payload = crate::codec::encode_envelope(env);
-    if payload.len() > crate::codec::MAX_FIELD_LEN {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput,
-            "block envelope exceeds the existing 8 MiB log frame limit"));
+fn write_log_envelope<W: Write>(
+    writer: &mut W,
+    env: &BlockEnvelope,
+) -> io::Result<(usize, u32)> {
+    // Full preflight before the prefix or any canonical field reaches the
+    // writer. `encoded_envelope_len` includes every per-item length prefix,
+    // so passing this 8 MiB cap also proves every component length and both
+    // collection counts fit their u32 wire fields.
+    let payload_len = crate::codec::encoded_envelope_len(env);
+    if payload_len > crate::codec::MAX_FIELD_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "block envelope exceeds the existing 8 MiB log frame limit",
+        ));
     }
-    Ok(payload)
-}
-
-fn write_log_frame<W: Write>(writer: &mut W, payload: &[u8]) -> io::Result<usize> {
-    let len = u32::try_from(payload.len()).map_err(|_| {
+    let payload_len_u32 = u32::try_from(payload_len).map_err(|_| {
         io::Error::new(io::ErrorKind::InvalidInput, "block log frame length exceeds u32")
     })?;
-    let frame_len = 4usize.checked_add(payload.len()).ok_or_else(|| {
+    let frame_len = 4usize.checked_add(payload_len).ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "block log frame length overflow")
     })?;
-    writer.write_all(&len.to_le_bytes())?;
-    writer.write_all(payload)?;
-    Ok(frame_len)
+    writer.write_all(&payload_len_u32.to_le_bytes())?;
+    crate::codec::write_envelope(writer, env)?;
+    Ok((frame_len, payload_len_u32))
 }
 
 /// Decode the complete prefix of a framed log without retaining a second,
@@ -1025,9 +1030,7 @@ fn rewrite_files(
     let destination = dir.join("blocks.log");
     let mut staging = PrivateStagingFile::create_for(&destination)?;
     for env in envs {
-        let payload = encode_log_payload(env)?;
-        staging.file_mut().write_all(&(payload.len() as u32).to_le_bytes())?;
-        staging.file_mut().write_all(&payload)?;
+        write_log_envelope(staging.file_mut(), env)?;
     }
     staging.file_mut().sync_all()?;
 
@@ -1152,8 +1155,7 @@ impl Store {
         // normal completion poll. The consensus thread is otherwise free
         // while the rewrite runs.
         self.finish_pending_rewrite()?;
-        let payload = encode_log_payload(env)?;
-        let frame_len = write_log_frame(&mut self.log, &payload)?;
+        let (frame_len, payload_len) = write_log_envelope(&mut self.log, env)?;
         self.log.sync_data()?;
         // Index AFTER the log is durable. A crash in between leaves the index
         // one record short, which the next `open` fixes and which
@@ -1161,8 +1163,7 @@ impl Store {
         // so this write is deliberately not fsynced. An index entry that
         // cannot be written is not worth failing an applied block over: log
         // it, and let the next open rebuild.
-        let entry =
-            IdxEntry { slot: env.header.slot, offset: self.log_len, len: payload.len() as u32 };
+        let entry = IdxEntry { slot: env.header.slot, offset: self.log_len, len: payload_len };
         // `log_len` tracks bytes actually fsynced to `blocks.log` on this
         // disk; reaching anywhere near u64::MAX (18 exabytes) is not a
         // condition a real deployment's storage can produce.
@@ -1202,9 +1203,7 @@ impl Store {
         let destination = self.dir.join("blocks.log");
         let mut staging = PrivateStagingFile::create_for(&destination)?;
         for env in envs {
-            let payload = encode_log_payload(env)?;
-            staging.file_mut().write_all(&(payload.len() as u32).to_le_bytes())?;
-            staging.file_mut().write_all(&payload)?;
+            write_log_envelope(staging.file_mut(), env)?;
         }
         staging.file_mut().sync_all()?;
         let generation = std::sync::Arc::clone(&self.generation);
@@ -1641,50 +1640,55 @@ mod tests {
             fn flush(&mut self) -> io::Result<()> { Ok(()) }
         }
 
-        let payload = crate::codec::encode_envelope(&sample_envelope(11));
+        let envelope = sample_envelope(11);
+        let payload = crate::codec::encode_envelope(&envelope);
         let mut writer = ShortWriter::default();
-        let frame_len = write_log_frame(&mut writer, &payload).expect("stream frame");
+        let (frame_len, payload_len) =
+            write_log_envelope(&mut writer, &envelope).expect("stream frame");
 
         assert_eq!(frame_len, 4usize.saturating_add(payload.len()));
+        assert_eq!(payload_len as usize, payload.len());
         assert_eq!(&writer.bytes[..4], &(payload.len() as u32).to_le_bytes());
         assert_eq!(&writer.bytes[4..], payload.as_slice());
         assert_eq!(
-            writer.offered[..3],
-            [4, 2, payload.len()],
-            "payload must begin only after the complete prefix",
+            writer.offered[..2],
+            [4, 2],
+            "canonical payload must begin only after the complete prefix",
         );
     }
 
     #[test]
-    fn log_frame_writer_prefix_only_failure_remains_a_recoverable_torn_tail() {
-        #[derive(Default)]
-        struct PrefixThenFail {
+    fn log_frame_writer_partial_canonical_failure_remains_a_recoverable_torn_tail() {
+        struct PartialThenFail {
             bytes: Vec<u8>,
-            writes: usize,
+            remaining: usize,
         }
 
-        impl Write for PrefixThenFail {
+        impl Write for PartialThenFail {
             fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                self.writes = self.writes.saturating_add(1);
-                if self.writes > 1 {
+                if self.remaining == 0 {
                     return Err(io::Error::new(io::ErrorKind::BrokenPipe, "injected body failure"));
                 }
-                self.bytes.extend_from_slice(bytes);
-                Ok(bytes.len())
+                let accepted = bytes.len().min(self.remaining);
+                self.bytes.extend_from_slice(&bytes[..accepted]);
+                self.remaining = self.remaining.saturating_sub(accepted);
+                Ok(accepted)
             }
 
             fn flush(&mut self) -> io::Result<()> { Ok(()) }
         }
 
-        let payload = crate::codec::encode_envelope(&sample_envelope(12));
-        let mut writer = PrefixThenFail::default();
-        let error = write_log_frame(&mut writer, &payload).expect_err("body write must fail");
+        let envelope = sample_envelope(12);
+        let payload = crate::codec::encode_envelope(&envelope);
+        let mut writer = PartialThenFail { bytes: Vec::new(), remaining: 41 };
+        let error =
+            write_log_envelope(&mut writer, &envelope).expect_err("body write must fail");
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
-        assert_eq!(writer.bytes, (payload.len() as u32).to_le_bytes());
-        assert_eq!(writer.writes, 2, "the error occurs on the payload phase");
+        assert_eq!(&writer.bytes[..4], &(payload.len() as u32).to_le_bytes());
+        assert_eq!(&writer.bytes[4..], &payload[..37]);
         assert!(
             read_log_frames(io::Cursor::new(&writer.bytes), writer.bytes.len() as u64)
-                .expect("prefix-only tail remains recoverable")
+                .expect("partial canonical tail remains recoverable")
                 .is_empty(),
         );
     }
@@ -1700,6 +1704,21 @@ mod tests {
         let mut boundary = sample_envelope(2);
         let overhead = crate::codec::encode_envelope(&boundary).len() - boundary.proposer_sig.len();
         boundary.proposer_sig.resize(crate::codec::MAX_FIELD_LEN - overhead + 1, 0xAA);
+        #[derive(Default)]
+        struct CountingWriter(usize);
+        impl Write for CountingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0 = self.0.saturating_add(bytes.len());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+        let mut untouched = CountingWriter::default();
+        assert_eq!(
+            write_log_envelope(&mut untouched, &boundary).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput,
+        );
+        assert_eq!(untouched.0, 0, "over-cap preflight must precede every write");
         assert_eq!(store.append(&boundary).unwrap_err().kind(), io::ErrorKind::InvalidInput);
         assert!(store.rewrite(&[sample_envelope(3), boundary.clone()]).is_err());
         assert_eq!(fs::read(dir.join("blocks.log")).unwrap(), before_log);

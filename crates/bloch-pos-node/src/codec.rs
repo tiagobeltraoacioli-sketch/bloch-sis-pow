@@ -17,6 +17,7 @@
 
 use bloch_pos_committee::attestation::{Attestation, AttestationData};
 use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, Body};
+use std::io::{self, Write};
 
 /// Hard cap on any decoded length field, so a corrupt frame cannot ask for a
 /// multi-gigabyte allocation. Generous for a devnet block (12 validators ×
@@ -131,14 +132,23 @@ pub fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
 // ── Attestations ────────────────────────────────────────────────────────────
 
 pub fn encode_attestation(out: &mut Vec<u8>, a: &Attestation) {
-    out.extend_from_slice(&a.data.slot.to_le_bytes());
-    out.extend_from_slice(&a.data.head);
-    out.extend_from_slice(&a.data.source_epoch.to_le_bytes());
-    out.extend_from_slice(&a.data.source_root);
-    out.extend_from_slice(&a.data.target_epoch.to_le_bytes());
-    out.extend_from_slice(&a.data.target_root);
-    out.extend_from_slice(&a.validator.to_le_bytes());
-    put_bytes(out, &a.signature);
+    write_attestation(out, a).expect("writing to Vec cannot fail");
+}
+
+fn write_attestation<W: Write>(out: &mut W, a: &Attestation) -> io::Result<()> {
+    out.write_all(&a.data.slot.to_le_bytes())?;
+    out.write_all(&a.data.head)?;
+    out.write_all(&a.data.source_epoch.to_le_bytes())?;
+    out.write_all(&a.data.source_root)?;
+    out.write_all(&a.data.target_epoch.to_le_bytes())?;
+    out.write_all(&a.data.target_root)?;
+    out.write_all(&a.validator.to_le_bytes())?;
+    write_bytes(out, &a.signature)
+}
+
+fn write_bytes<W: Write>(out: &mut W, bytes: &[u8]) -> io::Result<()> {
+    out.write_all(&(bytes.len() as u32).to_le_bytes())?;
+    out.write_all(bytes)
 }
 
 pub fn decode_attestation(r: &mut Reader<'_>) -> Result<Attestation, DecodeErr> {
@@ -184,17 +194,26 @@ pub fn encode_envelope(env: &BlockEnvelope) -> Vec<u8> {
     // `MAX_FIELD_LEN` (8 MiB) everywhere it is produced, far below
     // `usize::MAX - 512`, so saturation is not reachable in practice either.
     let mut out = Vec::with_capacity(512usize.saturating_add(env.proposer_sig.len()));
-    out.extend_from_slice(&env.header.canonical_serialize());
-    put_bytes(&mut out, &env.proposer_sig);
-    out.extend_from_slice(&(env.body.attestations.len() as u32).to_le_bytes());
-    for a in &env.body.attestations {
-        encode_attestation(&mut out, a);
-    }
-    out.extend_from_slice(&(env.body.transactions.len() as u32).to_le_bytes());
-    for tx in &env.body.transactions {
-        put_bytes(&mut out, tx);
-    }
+    write_envelope(&mut out, env).expect("writing to Vec cannot fail");
     out
+}
+
+/// Emit the canonical envelope bytes without first aggregating them in a
+/// second payload buffer. This is the shared authority for public encoding and
+/// persistence; callers that write to fallible storage must preflight their
+/// own frame cap before invoking it.
+pub(crate) fn write_envelope<W: Write>(out: &mut W, env: &BlockEnvelope) -> io::Result<()> {
+    out.write_all(&env.header.canonical_serialize())?;
+    write_bytes(out, &env.proposer_sig)?;
+    out.write_all(&(env.body.attestations.len() as u32).to_le_bytes())?;
+    for attestation in &env.body.attestations {
+        write_attestation(out, attestation)?;
+    }
+    out.write_all(&(env.body.transactions.len() as u32).to_le_bytes())?;
+    for transaction in &env.body.transactions {
+        write_bytes(out, transaction)?;
+    }
+    Ok(())
 }
 
 pub fn decode_envelope(buf: &[u8]) -> Result<BlockEnvelope, DecodeErr> {
@@ -340,6 +359,43 @@ mod tests {
 
         env.proposer_sig.resize(MAX_FIELD_LEN, 0x5A);
         assert_eq!(encoded_envelope_len(&env), encode_envelope(&env).len());
+    }
+
+    #[test]
+    fn canonical_envelope_emitter_matches_public_bytes_across_short_writes() {
+        #[derive(Default)]
+        struct ShortWriter {
+            bytes: Vec<u8>,
+            writes: usize,
+        }
+
+        impl Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.writes = self.writes.saturating_add(1);
+                let accepted = bytes.len().min(17);
+                self.bytes.extend_from_slice(&bytes[..accepted]);
+                Ok(accepted)
+            }
+
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+
+        let full = sample_envelope();
+        let mut empty = sample_envelope();
+        empty.proposer_sig.clear();
+        empty.body.attestations.clear();
+        empty.body.transactions.clear();
+        let mut large = sample_envelope();
+        large.body.transactions.push(vec![0xA5; 1 << 20]);
+
+        for envelope in [empty, full, large] {
+            let expected = encode_envelope(&envelope);
+            let mut writer = ShortWriter::default();
+            write_envelope(&mut writer, &envelope).expect("stream canonical envelope");
+            assert_eq!(writer.bytes, expected);
+            assert_eq!(writer.bytes.len(), encoded_envelope_len(&envelope));
+            assert!(writer.writes > 1, "fixture must exercise write_all retries");
+        }
     }
 
     #[test]
