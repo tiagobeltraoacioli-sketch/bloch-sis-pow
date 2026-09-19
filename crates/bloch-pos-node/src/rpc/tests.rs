@@ -1680,6 +1680,7 @@ fn getbuildinfo_reports_the_fields_a_partner_compares() {
         "build_environment_scope",
         "build_environment_fields",
         "build_tool_binaries_hashed",
+        "build_sysroot_components_hashed",
         "digest_note",
     ] {
         let f = v.get(k).unwrap_or_else(|| panic!("getbuildinfo has no `{k}`"));
@@ -1780,6 +1781,17 @@ fn getbuildinfo_carries_a_bounded_build_environment_fingerprint() {
         v.get("build_tool_binaries_hashed").unwrap().as_str(),
         Some("2"),
         "workspace builds must bind both selected tool executables",
+    );
+    let sysroot_components: usize = v
+        .get("build_sysroot_components_hashed")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        sysroot_components >= 2,
+        "workspace builds must bind rustc and at least one target libstd component",
     );
 }
 

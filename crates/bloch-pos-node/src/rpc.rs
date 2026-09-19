@@ -2614,6 +2614,7 @@ pub fn build_info_json() -> Json {
             "build_environment_scope",
             Json::s(
                 "rustc and cargo executable bytes plus version output; \
+                 selected rustc driver and target libstd sysroot components; \
                  host; target; profile; \
                  selected Rust/C codegen variables, including absent exact \
                  host/target forms; sorted, length-prefixed; values hashed, \
@@ -2627,6 +2628,10 @@ pub fn build_info_json() -> Json {
         (
             "build_tool_binaries_hashed",
             Json::s(env!("BLOCH_BUILD_TOOL_BINARIES")),
+        ),
+        (
+            "build_sysroot_components_hashed",
+            Json::s(env!("BLOCH_BUILD_SYSROOT_COMPONENTS")),
         ),
         // The bound rides with the answer. A client that reads `source_digest`
         // and stops reading has been told, in the response itself, what it is

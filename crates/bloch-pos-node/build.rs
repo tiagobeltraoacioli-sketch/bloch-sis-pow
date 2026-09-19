@@ -230,6 +230,73 @@ fn build_tool_digest(command: &str) -> Option<String> {
     Some(hex(&h.finalize()))
 }
 
+/// Fingerprint the compiler implementation and target standard library that
+/// `rustc` selected from its sysroot. Hashing this small, load-bearing subset
+/// avoids walking an entire toolchain while binding more than version text or
+/// a rustup shim. The aggregate publishes neither paths nor component names.
+fn rust_sysroot_digest(rustc: &str) -> (Option<String>, usize) {
+    let query = |kind: &str| -> Option<PathBuf> {
+        let out = Command::new(rustc).args(["--print", kind]).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let value = String::from_utf8(out.stdout).ok()?;
+        let value = value.trim();
+        (!value.is_empty()).then(|| PathBuf::from(value))
+    };
+    let sysroot = match query("sysroot") {
+        Some(path) => path,
+        None => return (None, 0),
+    };
+    let target_libdir = match query("target-libdir") {
+        Some(path) => path,
+        None => return (None, 0),
+    };
+    let mut files = vec![sysroot.join("bin").join(if cfg!(windows) {
+        "rustc.exe"
+    } else {
+        "rustc"
+    })];
+    for dir in [sysroot.join("lib"), target_libdir] {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.contains("rustc_driver")
+                || name.starts_with("libstd-")
+                || name.starts_with("std-")
+            {
+                files.push(entry.path());
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+
+    let mut h = Sha3_256::new();
+    h.update(b"bloch-pos/rust-sysroot-components/v1\0");
+    let mut count = 0usize;
+    for path in files {
+        let Ok(body) = std::fs::read(&path) else {
+            continue;
+        };
+        println!("cargo:rerun-if-changed={}", path.display());
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        h.update((name.len() as u64).to_le_bytes());
+        h.update(name.as_bytes());
+        h.update((body.len() as u64).to_le_bytes());
+        h.update(body);
+        count = count.saturating_add(1);
+    }
+    if count == 0 {
+        (None, 0)
+    } else {
+        (Some(hex(&h.finalize())), count)
+    }
+}
+
 fn relevant_build_env(key: &str) -> bool {
     FIXED_BUILD_ENV.contains(&key)
         || key.starts_with("AR_")
@@ -285,6 +352,7 @@ fn build_environment_digest(
     cargo_verbose: &str,
     rustc_binary_digest: Option<String>,
     cargo_binary_digest: Option<String>,
+    rust_sysroot_digest: Option<String>,
     profile: &str,
     target: &str,
     host: &str,
@@ -301,6 +369,7 @@ fn build_environment_digest(
         ("host".to_owned(), Some(host.to_owned())),
         ("profile".to_owned(), Some(profile.to_owned())),
         ("rustc-binary-sha3-256".to_owned(), rustc_binary_digest),
+        ("rust-sysroot-components-sha3-256".to_owned(), rust_sysroot_digest),
         ("rustc-version".to_owned(), Some(rustc_verbose.to_owned())),
         ("target".to_owned(), Some(target.to_owned())),
     ];
@@ -456,6 +525,7 @@ fn main() {
     let host = std::env::var("HOST").unwrap_or_else(|_| "unknown".into());
     let rustc_binary_digest = build_tool_digest(&rustc);
     let cargo_binary_digest = build_tool_digest(&cargo);
+    let (rust_sysroot_digest, rust_sysroot_components) = rust_sysroot_digest(&rustc);
     let tool_binaries = usize::from(rustc_binary_digest.is_some())
         + usize::from(cargo_binary_digest.is_some());
     let (environment_digest, environment_fields) = build_environment_digest(
@@ -463,6 +533,7 @@ fn main() {
         &cargo_verbose,
         rustc_binary_digest,
         cargo_binary_digest,
+        rust_sysroot_digest,
         &profile,
         &target,
         &host,
@@ -474,6 +545,7 @@ fn main() {
     println!("cargo:rustc-env=BLOCH_BUILD_ENV_DIGEST={environment_digest}");
     println!("cargo:rustc-env=BLOCH_BUILD_ENV_FIELDS={environment_fields}");
     println!("cargo:rustc-env=BLOCH_BUILD_TOOL_BINARIES={tool_binaries}");
+    println!("cargo:rustc-env=BLOCH_BUILD_SYSROOT_COMPONENTS={rust_sysroot_components}");
 
     // ── `BLOCH_BUILD_DIRTY` is deliberately NOT stamped ────────────────────
     //
