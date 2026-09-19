@@ -2507,9 +2507,14 @@ impl Engine {
             validator: index,
             signature,
         };
+        // Encode while the locally signed value is still borrowed, then move
+        // its sole owned signature allocation into the pool. The frame is the
+        // independent wire owner and is broadcast only after pool insertion,
+        // preserving the former publish order without cloning `att`.
+        let frame = net::att_frame(&att);
         self.pool
-            .insert((att.validator, att.data.signing_root()), att.clone());
-        self.net.broadcast(net::att_frame(&att));
+            .insert((att.validator, att.data.signing_root()), att);
+        self.net.broadcast(frame);
         println!(
             "[slot {slot}] attested (epoch {e}, head {}, target {})",
             crate::codec::hex8(&data.head),
@@ -10057,6 +10062,35 @@ mod perf_support {
     }
 }
 
+#[cfg(test)]
+mod local_attestation_ownership {
+    #[test]
+    fn locally_signed_attestation_prepares_frame_then_moves_into_pool() {
+        let source = include_str!("engine.rs");
+        let start = source.find("    fn attest(&mut self, slot: u64)").expect("attest");
+        let end = source[start..]
+            .find("    fn propose(&mut self, slot: u64)")
+            .map(|offset| start + offset)
+            .expect("end of attest");
+        let attest = &source[start..end];
+
+        assert!(!attest.contains("att.clone()"));
+        let frame = attest
+            .find("let frame = net::att_frame(&att);")
+            .expect("canonical owned frame");
+        let insert = attest
+            .find(".insert((att.validator, att.data.signing_root()), att);")
+            .expect("move into pool under the original key");
+        let broadcast = attest
+            .find("self.net.broadcast(frame);")
+            .expect("broadcast prepared owner");
+        assert!(
+            frame < insert && insert < broadcast,
+            "frame preparation, pool ownership and publication order changed"
+        );
+    }
+}
+
 /// The proposer keeps the decoded selection alive through local ingestion so
 /// the normal, adopted-block path does not need a second owned copy of every
 /// canonical transaction body. These tests pin both sides: the ordinary body
@@ -11140,6 +11174,30 @@ mod rolled_memo_tests {
         let attested_at = attested_at.expect(
             "this engine is the whole committee, so exactly one slot of epoch 1 is its duty; \
              finding none means the test never exercised the attest path at all",
+        );
+        let stored = engine
+            .pool
+            .values()
+            .find(|att| att.data.slot == attested_at)
+            .expect("the signed duty moved into the pool");
+        let keys = engine.keys.as_ref().expect("proposing fixture has keys");
+        assert!(
+            engine.verifier.verify_with_key(
+                &keys.pubkey,
+                &stored.data.signing_root(),
+                &stored.signature,
+            ),
+            "moving the locally signed attestation must preserve its hybrid signature"
+        );
+        let frame = net::att_frame(stored);
+        assert_eq!(frame.first(), Some(&net::FRAME_ATT));
+        let mut reader = crate::codec::Reader::new(&frame[1..]);
+        let decoded = crate::codec::decode_attestation(&mut reader)
+            .expect("the prepared wire owner remains canonical");
+        reader.finish().expect("the prepared frame has no trailing bytes");
+        assert_eq!(
+            &decoded, stored,
+            "pool ownership and the canonical broadcast frame must carry the same duty"
         );
 
         // What a restart would load.
