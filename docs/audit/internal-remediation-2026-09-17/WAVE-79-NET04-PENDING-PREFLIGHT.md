@@ -29,9 +29,11 @@ The ordering preserves the important boundaries:
 - known-root attestations bypass pending preflight and still authenticate, so
   pool saturation cannot hide an invalid message on the acceptance path;
 - the missing-root order, counter priority, FIFO eviction, source identity,
-  wire encoding, consensus validity and persistent state are unchanged; and
-- no state changes between preflight and hold because one `&mut` pool
-  operation owns the entire sequence.
+  wire encoding, consensus validity and persistent state are unchanged;
+- pending-pool state and counters cannot change between preflight and hold
+  because one `&mut AttestationPool` operation owns the sequence; and
+- the missing-root observation separately relies on the snapshot-stable
+  `BlockLookup` contract described below.
 
 The capacity rules are centralized in `pending_capacity_reason`, avoiding
 duplicated checks and preserving the prior limit priority.
