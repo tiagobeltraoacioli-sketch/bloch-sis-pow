@@ -1107,11 +1107,7 @@ pub fn get_blocks_frame(after_slot: u64) -> Vec<u8> {
 /// Confirmation is seeing the transaction land in a block.
 pub fn send_transaction(addr: &str, tx_bytes: &[u8]) -> std::io::Result<()> {
     let mut sock = TcpStream::connect(addr)?;
-    // Capacity hint only: saturating is the intended semantics.
-    let mut frame = Vec::with_capacity(1usize.saturating_add(tx_bytes.len()));
-    frame.push(FRAME_TX);
-    frame.extend_from_slice(tx_bytes);
-    write_frame(&mut sock, &frame)
+    write_typed_frame(&mut sock, FRAME_TX, tx_bytes)
 }
 
 fn write_frame<W: Write>(writer: &mut W, frame: &[u8]) -> std::io::Result<()> {
@@ -1997,14 +1993,81 @@ mod tests {
 
         let payload = vec![0x5A; 1 << 20];
         let mut writer = ShortWriter::default();
-        write_typed_frame(&mut writer, FRAME_BLOCK, &payload).unwrap();
+        write_typed_frame(&mut writer, FRAME_TX, &payload).unwrap();
 
         let frame_len = payload.len() + 1;
         assert_eq!(&writer.bytes[..4], &(frame_len as u32).to_le_bytes());
-        assert_eq!(writer.bytes[4], FRAME_BLOCK);
+        assert_eq!(writer.bytes[4], FRAME_TX);
         assert_eq!(&writer.bytes[5..], payload.as_slice());
         assert_eq!(writer.offered[..4], [4, 2, 1, payload.len()],
             "payload writing must begin only after the complete prefix and tag");
+    }
+
+    #[test]
+    fn transaction_typed_frame_matches_legacy_oracle_and_preserves_partial_errors() {
+        for payload in [Vec::new(), vec![1, 2, 3], vec![0xA5; 1 << 20]] {
+            let mut expected_frame = vec![FRAME_TX];
+            expected_frame.extend_from_slice(&payload);
+            let mut expected_wire = (expected_frame.len() as u32).to_le_bytes().to_vec();
+            expected_wire.extend_from_slice(&expected_frame);
+
+            let mut wire = Vec::new();
+            write_typed_frame(&mut wire, FRAME_TX, &payload).unwrap();
+            assert_eq!(wire, expected_wire);
+        }
+
+        struct PartialThenFail {
+            bytes: Vec<u8>,
+            remaining: usize,
+        }
+
+        impl Write for PartialThenFail {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.remaining == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "injected transaction write failure",
+                    ));
+                }
+                let accepted = bytes.len().min(self.remaining);
+                self.bytes.extend_from_slice(&bytes[..accepted]);
+                self.remaining = self.remaining.saturating_sub(accepted);
+                Ok(accepted)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+
+        let payload = vec![0x6C; 32];
+        let mut writer = PartialThenFail { bytes: Vec::new(), remaining: 12 };
+        assert_eq!(
+            write_typed_frame(&mut writer, FRAME_TX, &payload).unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe,
+        );
+        assert_eq!(&writer.bytes[..4], &33u32.to_le_bytes());
+        assert_eq!(writer.bytes[4], FRAME_TX);
+        assert_eq!(&writer.bytes[5..], &payload[..7]);
+    }
+
+    #[test]
+    fn send_transaction_writes_exact_wire_then_closes_without_ack() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reader = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut wire = Vec::new();
+            socket.read_to_end(&mut wire).unwrap();
+            wire
+        });
+        let payload = vec![0xA7; 1 << 20];
+        send_transaction(&addr.to_string(), &payload).unwrap();
+        let wire = reader.join().unwrap();
+
+        let mut expected_frame = vec![FRAME_TX];
+        expected_frame.extend_from_slice(&payload);
+        let mut expected_wire = (expected_frame.len() as u32).to_le_bytes().to_vec();
+        expected_wire.extend_from_slice(&expected_frame);
+        assert_eq!(wire, expected_wire);
     }
 
     #[test]
