@@ -143,8 +143,9 @@ const ENGINE_EVENTS_PER_TURN: usize = 32;
 /// retain the eight-event share they received under a fully mixed round.
 const ENGINE_EVENTS_PER_CLASS_PER_TURN: [usize; 4] = [1, 8, 8, 8];
 /// Authenticated attestations re-judged for one newly available block root
-/// between slot-loop control points.
-const HELD_ATTESTATIONS_PER_TURN: usize = 4;
+/// between slot-loop control points. One is the smallest useful unit: each
+/// entry must complete its hybrid verification before its verdict is known.
+const HELD_ATTESTATIONS_PER_TURN: usize = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DeferredBlockClass {
@@ -2835,7 +2836,7 @@ impl Engine {
 
     /// Release one bounded class of deferred consensus work. Block work keeps
     /// its inner future/orphan round robin; held attestations keep their
-    /// per-root FIFO and verification slice. The outer cursor ensures those
+    /// per-root FIFO and one-verification slice. The outer cursor ensures those
     /// two budgets cannot compose in one control turn.
     fn release_deferred_work_turn(
         &mut self,
@@ -4760,7 +4761,7 @@ impl Engine {
         self.held_release_roots.push_back(root);
     }
 
-    /// Replay one FIFO slice for the earliest landed root. Returns whether a
+    /// Replay one FIFO entry for the earliest landed root. Returns whether a
     /// ready tail remains, so the slot loop can gate duties and immediately
     /// provide the next slice a fresh control turn.
     fn release_held_turn(&mut self) -> bool {
@@ -12288,6 +12289,107 @@ mod ingest_admission_tests {
             "the next turn advances held replay without a second block release",
         );
         assert!(engine.pool.contains_key(&(0, data.signing_root())));
+    }
+
+    #[test]
+    fn held_replay_spends_exactly_one_verification_and_preserves_root_fifo() {
+        let _clock = validator_lifecycle::clock_at(63);
+        let (mut engine, _dir, template, _) = fixture();
+        let validator = engine.manifest.validators[0].clone();
+        engine.manifest.validators = (0..64)
+            .map(|index| {
+                let mut record = validator.clone();
+                record.index = index;
+                record
+            })
+            .collect();
+        engine.manifest.pre_state_root = std::sync::OnceLock::new();
+        engine.state.set(engine.manifest.genesis_state());
+        let genesis_id = engine.manifest.genesis_id();
+        engine.chain = vec![(0, genesis_id)];
+        engine.canonical = [*genesis_id.as_bytes()].into_iter().collect();
+        engine.blocks.clear();
+        engine.wall_slot = 63;
+        let genesis = *genesis_id.as_bytes();
+        let target = *engine.head_id().as_bytes();
+        let seed = engine
+            .seed_for_attestation(&target, 1)
+            .expect("genesis has an epoch-1 committee seed");
+        let roster = engine.rolled_to(1).active_validators();
+
+        let first_block = repointed(&engine, &template, [0xA8; 32], 63);
+        let first_root = *first_block.block_id().as_bytes();
+        let second_block = repointed(&engine, &template, [0xA9; 32], 63);
+        let second_root = *second_block.block_id().as_bytes();
+
+        let make_attestation = |slot, head, member| {
+            let data = AttestationData {
+                slot,
+                head,
+                source_epoch: 0,
+                source_root: genesis,
+                target_epoch: 1,
+                target_root: target,
+            };
+            let validator = *committees::committee_for_slot(&seed, slot, &roster)
+                .get(member)
+                .expect("the 64-validator fixture has two members in every slot");
+            Attestation {
+                data,
+                validator,
+                signature: engine
+                    .keys
+                    .as_ref()
+                    .expect("the proposing fixture holds a keystore")
+                    .sign(&data.signing_root()),
+            }
+        };
+        let first_root_atts: Vec<_> = (32..64)
+            .map(|slot| make_attestation(slot, first_root, 0))
+            .collect();
+        let second_root_att = make_attestation(63, second_root, 1);
+
+        let mut pool = AttestationPool::new();
+        for att in first_root_atts.iter().chain(std::iter::once(&second_root_att)) {
+            let decision = engine.judge(&mut pool, att.clone(), 1);
+            assert!(
+                matches!(decision, GossipDecision::Hold { .. }),
+                "unexpected held-attestation fixture decision: {decision:?}",
+            );
+        }
+        engine.att_pool = pool;
+        engine.blocks.insert(first_root, first_block);
+        engine.blocks.insert(second_root, second_block);
+        engine.schedule_held_release(first_root);
+        engine.schedule_held_release(second_root);
+
+        for (turn, att) in first_root_atts.iter().enumerate() {
+            assert!(engine.release_held_turn());
+            assert_eq!(
+                engine.att_pool.pending_for_root(&first_root),
+                first_root_atts.len() - turn - 1,
+                "one control turn must consume exactly one hybrid verification",
+            );
+            assert_eq!(engine.att_pool.pending_for_root(&second_root), 1);
+            assert!(engine
+                .pool
+                .contains_key(&(att.validator, att.data.signing_root())));
+            assert_eq!(
+                engine.held_release_roots.front(),
+                Some(if turn + 1 == first_root_atts.len() {
+                    &second_root
+                } else {
+                    &first_root
+                }),
+                "the later root must wait for the complete FIFO tail",
+            );
+        }
+
+        assert!(!engine.release_held_turn());
+        assert_eq!(engine.att_pool.pending_for_root(&second_root), 0);
+        assert!(engine
+            .pool
+            .contains_key(&(second_root_att.validator, second_root_att.data.signing_root())));
     }
 
     #[test]
