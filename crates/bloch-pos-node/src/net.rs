@@ -398,11 +398,9 @@ pub fn queued_bytes(ev: &NetEvent) -> usize {
         // The shared canonical-length authority avoids allocating and copying
         // the complete block body merely to charge its immutable queue entry.
         NetEvent::Block(env, _) => crate::codec::encoded_envelope_len(env),
-        NetEvent::Attestation(att, _) => {
-            let mut b = Vec::new();
-            crate::codec::encode_attestation(&mut b, att);
-            b.len()
-        }
+        // As for blocks, sizing shares the codec's exact length authority and
+        // never needs a second owner of the signature bytes.
+        NetEvent::Attestation(att, _) => crate::codec::encoded_attestation_len(att),
         NetEvent::Transaction(tx, _) => tx.canonical_bytes().len(),
     }
 }
@@ -1751,6 +1749,24 @@ mod tests {
             assert_eq!(calculated_len, canonical_len);
             assert_eq!(queued_bytes(&event), canonical_len);
             assert_eq!(charged_bytes(&event), canonical_len);
+        }
+    }
+
+    #[test]
+    fn attestation_queue_charge_matches_canonical_length_without_payload_owner() {
+        let mut attestation = sample_attestation();
+        for signature_len in [0, 4_589, 1 << 20] {
+            attestation.signature.resize(signature_len, 0xA5);
+            let mut canonical = Vec::new();
+            crate::codec::encode_attestation(&mut canonical, &attestation);
+            let event = NetEvent::Attestation(attestation.clone(), Origin::none());
+
+            assert_eq!(
+                crate::codec::encoded_attestation_len(&attestation),
+                canonical.len(),
+            );
+            assert_eq!(queued_bytes(&event), canonical.len());
+            assert_eq!(charged_bytes(&event), canonical.len());
         }
     }
 

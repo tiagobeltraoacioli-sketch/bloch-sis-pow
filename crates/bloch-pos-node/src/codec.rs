@@ -135,6 +135,14 @@ pub fn encode_attestation(out: &mut Vec<u8>, a: &Attestation) {
     write_attestation(out, a).expect("writing to Vec cannot fail");
 }
 
+/// Exact wire length of [`encode_attestation`] without allocating and copying
+/// its signature solely to measure the resulting buffer.
+pub(crate) fn encoded_attestation_len(a: &Attestation) -> usize {
+    // Fixed fields: slot (8), head (32), source epoch/root (8 + 32), target
+    // epoch/root (8 + 32), validator (4), and signature length prefix (4).
+    128usize.saturating_add(a.signature.len())
+}
+
 fn write_attestation<W: Write>(out: &mut W, a: &Attestation) -> io::Result<()> {
     out.write_all(&a.data.slot.to_le_bytes())?;
     out.write_all(&a.data.head)?;
@@ -177,8 +185,7 @@ pub fn encoded_envelope_len(env: &BlockEnvelope) -> usize {
         .saturating_add(env.proposer_sig.len())
         .saturating_add(4);
     for attestation in &env.body.attestations {
-        // Fixed attestation fields plus its length-prefixed signature.
-        len = len.saturating_add(128).saturating_add(attestation.signature.len());
+        len = len.saturating_add(encoded_attestation_len(attestation));
     }
     len = len.saturating_add(4);
     for transaction in &env.body.transactions {
@@ -359,6 +366,19 @@ mod tests {
 
         env.proposer_sig.resize(MAX_FIELD_LEN, 0x5A);
         assert_eq!(encoded_envelope_len(&env), encode_envelope(&env).len());
+    }
+
+    #[test]
+    fn encoded_attestation_len_matches_encoder_for_empty_realistic_and_large_signatures() {
+        let mut attestation = sample_envelope().body.attestations.remove(0);
+        for signature_len in [0, 4_589, 1 << 20] {
+            attestation.signature.resize(signature_len, 0xA5);
+            let mut encoded = Vec::new();
+            encode_attestation(&mut encoded, &attestation);
+
+            assert_eq!(encoded_attestation_len(&attestation), encoded.len());
+            assert_eq!(encoded.len(), 128usize.saturating_add(signature_len));
+        }
     }
 
     #[test]
