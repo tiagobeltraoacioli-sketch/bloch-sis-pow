@@ -376,6 +376,27 @@ pub fn verify_legacy_hybrid_raw(public_key_bytes: &[u8], message: &[u8], signatu
         && verify_hybrid_mldsa_falcon(public_key_bytes, message, signature_bytes)
 }
 
+/// Verify explicitly raw legacy hybrid objects with canonical Falcon encoding.
+///
+/// This is the canonical-policy counterpart of [`verify_legacy_hybrid_raw`].
+/// It is only appropriate when trusted format metadata already requires BOTH
+/// objects to use the raw legacy hybrid layout. It performs no envelope
+/// detection or fallback and rejects Falcon's alternate zero-padded encoding.
+/// Existing consensus and compatibility callers are intentionally unchanged.
+pub fn verify_legacy_hybrid_raw_canonical(
+    public_key_bytes: &[u8],
+    message: &[u8],
+    signature_bytes: &[u8],
+) -> bool {
+    public_key_bytes.len() == legacy_hybrid_pubkey_len()
+        && verify_hybrid_mldsa_falcon_with(
+            public_key_bytes,
+            message,
+            signature_bytes,
+            falcon::verify_canonical,
+        )
+}
+
 /// Suite 0x0001 verifier — the pre-envelope `verify` body verbatim, now
 /// operating on the post-header BODY slices. The `<=` length guards, the
 /// `from_bytes` parse-fail⇒false, and the ML-DSA-AND-Falcon combiner are all
@@ -1053,6 +1074,44 @@ mod kat {
         let mldsa_sk = wrap_envelope(SUITE_MLDSA65_ONLY, msk.as_bytes());
         let mldsa_sig = sign(&mldsa_sk, msg).unwrap();
         assert!(verify_enveloped_canonical(&mldsa_pk, msg, &mldsa_sig));
+    }
+
+    #[test]
+    fn canonical_raw_verifier_rejects_padded_falcon_half_without_sniffing() {
+        let msg = b"canonical-raw-legacy-format";
+        let (mpk, msk) = mldsa65::keypair();
+        let (fpk, fsk) = falcon1024::keypair();
+
+        let mut pk = mpk.as_bytes().to_vec();
+        pk.extend_from_slice(fpk.as_bytes());
+        let mut sig = mldsa65::detached_sign(msg, &msk).as_bytes().to_vec();
+        sig.extend_from_slice(falcon1024::detached_sign(msg, &fsk).as_bytes());
+
+        assert!(verify_legacy_hybrid_raw(&pk, msg, &sig));
+        assert!(verify_legacy_hybrid_raw_canonical(&pk, msg, &sig));
+
+        let padded_len = MLDSA_SIG_LEN
+            + pqcrypto_falcon::falconpadded1024::signature_bytes();
+        assert!(sig.len() < padded_len, "compact fixture must leave padding room");
+        let mut padded = sig.clone();
+        padded.resize(padded_len, 0);
+
+        assert!(
+            verify_legacy_hybrid_raw(&pk, msg, &padded),
+            "compatibility raw verifier must retain padded acceptance"
+        );
+        assert!(!verify_legacy_hybrid_raw_canonical(&pk, msg, &padded));
+        assert!(!verify_legacy_hybrid_raw_canonical(
+            &wrap_envelope(SUITE_MLDSA65_FALCON1024, &pk),
+            msg,
+            &sig,
+        ));
+        assert!(!verify_legacy_hybrid_raw_canonical(
+            &pk,
+            msg,
+            &wrap_envelope(SUITE_MLDSA65_FALCON1024, &sig),
+        ));
+        assert!(!verify_legacy_hybrid_raw_canonical(&pk, b"other", &sig));
     }
 
     /// A genuine LEGACY (non-enveloped) hybrid object — no magic, no header,
