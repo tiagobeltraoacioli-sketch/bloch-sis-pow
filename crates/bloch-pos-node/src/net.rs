@@ -395,7 +395,9 @@ pub fn class_of(ev: &NetEvent) -> EventClass {
 /// serialization of the same immutable payload.
 pub fn queued_bytes(ev: &NetEvent) -> usize {
     match ev {
-        NetEvent::Block(env, _) => crate::codec::encode_envelope(env).len(),
+        // The shared canonical-length authority avoids allocating and copying
+        // the complete block body merely to charge its immutable queue entry.
+        NetEvent::Block(env, _) => crate::codec::encoded_envelope_len(env),
         NetEvent::Attestation(att, _) => {
             let mut b = Vec::new();
             crate::codec::encode_attestation(&mut b, att);
@@ -1728,6 +1730,27 @@ mod tests {
             assert_eq!(decoded.proposer_sig, env.proposer_sig);
             assert_eq!(decoded.body.transactions, env.body.transactions);
             assert_eq!(decoded.body.attestations.len(), env.body.attestations.len());
+        }
+    }
+
+    #[test]
+    fn block_queue_charge_matches_canonical_length_for_empty_full_and_large_bodies() {
+        let empty = sync_test_block();
+        let mut full = sync_test_block();
+        full.proposer_sig = vec![0xBB; 4_589];
+        full.body.attestations.push(sample_attestation());
+        full.body.transactions.push(vec![0xCC; 4_097]);
+        let mut large = full.clone();
+        large.body.transactions.push(vec![0xA5; 1 << 20]);
+
+        for env in [empty, full, large] {
+            let canonical_len = crate::codec::encode_envelope(&env).len();
+            let calculated_len = crate::codec::encoded_envelope_len(&env);
+            let event = NetEvent::Block(env, Origin::none());
+
+            assert_eq!(calculated_len, canonical_len);
+            assert_eq!(queued_bytes(&event), canonical_len);
+            assert_eq!(charged_bytes(&event), canonical_len);
         }
     }
 
