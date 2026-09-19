@@ -134,7 +134,45 @@ def prepare_full_mode_fixture(tmp: str):
     fake_binary = os.path.join(tmp, "fake-bloch-pos")
     write(fake_binary, """#!/usr/bin/env bash
 set -euo pipefail
-printf 'bloch-pos selftest (%s)\\n' "${INTEGRITY_TEST_COMMIT:?}"
+case "${INTEGRITY_VERSION_MODE:-canonical}" in
+  canonical)
+    printf 'bloch-pos selftest (%s)\\n' "${INTEGRITY_TEST_COMMIT:?}"
+    printf '%s\\n' 'source-digest sha3-256:0000000000000000000000000000000000000000000000000000000000000000 (1 files, 1 bytes) commit-source:asserted tree:asserted-clean'
+    ;;
+  exit) exit 75 ;;
+  missing-commit)
+    printf '%s\\n' 'bloch-pos selftest (unbound)'
+    printf '%s\\n' 'source-digest sha3-256:0000000000000000000000000000000000000000000000000000000000000000 (1 files, 1 bytes) commit-source:asserted tree:asserted-clean'
+    ;;
+  undelimited-commit)
+    printf 'bloch-pos selftest commit=%s\\n' "${INTEGRITY_TEST_COMMIT:?}"
+    printf '%s\\n' 'source-digest sha3-256:0000000000000000000000000000000000000000000000000000000000000000 (1 files, 1 bytes) commit-source:asserted tree:asserted-clean'
+    ;;
+  decoy-third)
+    printf '%s\\n' 'bloch-pos selftest (unbound)'
+    printf '%s\\n' 'source-digest sha3-256:0000000000000000000000000000000000000000000000000000000000000000 (1 files, 1 bytes) commit-source:asserted tree:asserted-clean'
+    printf 'decoy (%s)\\n' "${INTEGRITY_TEST_COMMIT:?}"
+    ;;
+  extra-line)
+    printf 'bloch-pos selftest (%s)\\n' "${INTEGRITY_TEST_COMMIT:?}"
+    printf '%s\\n' 'source-digest sha3-256:0000000000000000000000000000000000000000000000000000000000000000 (1 files, 1 bytes) commit-source:asserted tree:asserted-clean'
+    printf '%s\\n' 'unexpected third line'
+    ;;
+  malformed-source)
+    printf 'bloch-pos selftest (%s)\\n' "${INTEGRITY_TEST_COMMIT:?}"
+    printf '%s\\n' 'source-digest sha3-256:NOT-LOWERCASE-HEX (1 files, 1 bytes) commit-source:asserted tree:dirty'
+    ;;
+  missing-final-newline)
+    printf 'bloch-pos selftest (%s)\\n' "${INTEGRITY_TEST_COMMIT:?}"
+    printf '%s' 'source-digest sha3-256:0000000000000000000000000000000000000000000000000000000000000000 (1 files, 1 bytes) commit-source:asserted tree:asserted-clean'
+    ;;
+  trailing-byte)
+    printf 'bloch-pos selftest (%s)\\n' "${INTEGRITY_TEST_COMMIT:?}"
+    printf '%s\\n' 'source-digest sha3-256:0000000000000000000000000000000000000000000000000000000000000000 (1 files, 1 bytes) commit-source:asserted tree:asserted-clean'
+    printf x
+    ;;
+  *) exit 76 ;;
+esac
 """)
 
     metadata = json.dumps({
@@ -221,6 +259,7 @@ esac
         "REAL_SHA256SUM": real_sha256sum,
         "REAL_SHASUM": real_shasum,
         "INTEGRITY_SHA_MODE": "canonical",
+        "INTEGRITY_VERSION_MODE": "canonical",
         "INTEGRITY_FAKE_BINARY": fake_binary,
         "INTEGRITY_TEST_COMMIT": subprocess.run(
             ["git", "-C", root, "rev-parse", "--short=12", "HEAD"],
@@ -446,6 +485,34 @@ def main() -> int:
                 else:
                     print(f"  ok   full mode refuses {mode} SHA-256 output")
 
+            version_cases = {
+                "exit": "release binary --version failed",
+                "missing-commit": "binary version line does not contain (",
+                "undelimited-commit": "binary version line does not contain (",
+                "decoy-third": "exactly two newline-terminated lines",
+                "extra-line": "exactly two newline-terminated lines",
+                "malformed-source":
+                    "binary source identity line is not the exact asserted clean-source format",
+                "missing-final-newline": "exactly two newline-terminated lines",
+                "trailing-byte": "exactly two canonical text lines",
+            }
+            for mode, expected in version_cases.items():
+                result = run_guard(
+                    root, args=[],
+                    extra_env={**full_env, "INTEGRITY_VERSION_MODE": mode},
+                )
+                output = result.stdout + result.stderr
+                if result.returncode == 0:
+                    FAILURES.append(f"full mode accepted {mode} version output\n{output}")
+                elif expected not in output:
+                    FAILURES.append(f"full mode rejected {mode} version output "
+                                    f"without {expected!r}\n{output}")
+                elif "pos-release-integrity: PASS" in output:
+                    FAILURES.append(f"full mode reported PASS after rejecting "
+                                    f"{mode} version output\n{output}")
+                else:
+                    print(f"  ok   full mode refuses {mode} version output")
+
     # 7 — source assertion for section 3's call site, which needs a real build
     #     to reach: it must go through the shared root-lock assertion and must
     #     not have drifted back to a per-member path.
@@ -476,9 +543,9 @@ def main() -> int:
             print(f"\n- {f}", file=sys.stderr)
         return 1
     print("\npos-release-integrity.selftest: PASS — lock/layout drift, tracked "
-          "release-source edits, aliased build outputs and malformed full-mode "
-          "digests fail closed; untracked output remains outside the cleanliness "
-          "contract.")
+          "release-source edits, aliased build outputs, malformed full-mode "
+          "digests and noncanonical version identities fail closed; untracked "
+          "output remains outside the cleanliness contract.")
     return 0
 
 

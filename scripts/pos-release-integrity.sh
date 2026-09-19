@@ -258,13 +258,25 @@ Compare with: diff <(nm t1/release/bloch-pos) <(nm t2/release/bloch-pos)"
 echo "determinism: ok (bit-identical, same path)"
 
 # ── 3. Stamp is live and truthful ────────────────────────────────────────────
-VOUT="$("$WORK/t1/release/bloch-pos" --version)"
-echo "--version: $VOUT"
-case "$VOUT" in
-  *"$COMMIT"*) : ;;
-  *) fail "--version does not contain the built commit $COMMIT. The build.rs \
-stamp is broken or bypassed; a fleet running this binary is unidentifiable." ;;
+VERSION_FILE="$WORK/binary-version"
+"$WORK/t1/release/bloch-pos" --version > "$VERSION_FILE" \
+  || fail "release binary --version failed"
+[ "$(wc -l < "$VERSION_FILE" | tr -d '[:space:]')" = 2 ] \
+  || fail "binary version output must contain exactly two newline-terminated lines"
+BINARY_VERSION="$(sed -n '1p' "$VERSION_FILE")"
+SOURCE_IDENTITY="$(sed -n '2p' "$VERSION_FILE")"
+cmp -s <(printf '%s\n%s\n' "$BINARY_VERSION" "$SOURCE_IDENTITY") "$VERSION_FILE" \
+  || fail "binary version output must contain exactly two canonical text lines"
+case "$BINARY_VERSION" in
+  *"($COMMIT)"*) : ;;
+  *) fail "binary version line does not contain ($COMMIT). The build.rs stamp \
+is broken or bypassed; a fleet running this binary is unidentifiable." ;;
 esac
+LC_ALL=C grep -Eq \
+  '^source-digest sha3-256:[0-9a-f]{64} \([0-9]+ files, [0-9]+ bytes\) commit-source:asserted tree:asserted-clean$' \
+  <<< "$SOURCE_IDENTITY" \
+  || fail "binary source identity line is not the exact asserted clean-source format"
+printf '%s\n' "--version: $BINARY_VERSION" "source identity: $SOURCE_IDENTITY"
 
 # The lockfile must not have been rewritten by the builds above. Section 1
 # proved it was clean going in, so a difference here is the build's doing.
