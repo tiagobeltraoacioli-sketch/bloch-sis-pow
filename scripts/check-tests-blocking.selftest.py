@@ -414,10 +414,42 @@ CASES = [
          sub(GOOD_GITHUB, "  cargo-test:", "  cargo-test-disabled:"),
          must_fail=True, expect="`cargo-test` is MISSING"),
 
+    Case("github quoted duplicate cargo-test cannot override reviewed job",
+         GOOD_GITLAB,
+         GOOD_GITHUB +
+         "\n  \"cargo-test\":\n"
+         "    runs-on: ubuntu-latest\n"
+         "    continue-on-error: true\n"
+         "    steps:\n"
+         "      - run: echo skipped\n",
+         must_fail=True,
+         expect="protected `cargo-test:` job key must occur exactly once"),
+
     Case("github tests-blocking-guard job deleted",
          GOOD_GITLAB,
          sub(GOOD_GITHUB, "  tests-blocking-guard:", "  tests-blocking-guard-disabled:"),
          must_fail=True, expect="`tests-blocking-guard` is MISSING"),
+
+    Case("github quoted duplicate test guard cannot override reviewed job",
+         GOOD_GITLAB,
+         GOOD_GITHUB +
+         "\n  'tests-blocking-guard':\n"
+         "    runs-on: ubuntu-latest\n"
+         "    continue-on-error: true\n"
+         "    steps:\n"
+         "      - run: echo skipped\n",
+         must_fail=True,
+         expect="protected `tests-blocking-guard:` job key must occur exactly once"),
+
+    Case("gitlab quoted duplicate test guard cannot override reviewed job",
+         GOOD_GITLAB +
+         "\n'tests-blocking-guard':\n"
+         "  stage: check\n"
+         "  script:\n"
+         "    - echo skipped\n"
+         "  allow_failure: true\n",
+         GOOD_GITHUB, must_fail=True,
+         expect="protected `tests-blocking-guard:` key must occur exactly once"),
 
     Case("github guard selftest cannot be removed while guard literal remains",
          GOOD_GITLAB,

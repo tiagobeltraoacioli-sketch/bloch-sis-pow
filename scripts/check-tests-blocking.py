@@ -210,7 +210,7 @@ CI_SCRIPT_ENTRYPOINT_SHA256 = {
     "scripts/check-iso-hardening.sh":
         "f0dae2e22aa766301def84a0c671ca4f79ff0c1b87d6e8647e9f6671669b91b3",
     "scripts/check-tests-blocking.selftest.py":
-        "eb36a1505e0b310e41e8930482190d2133418efb97d8dbc86eb4d93166531f11",
+        "d986a494daa23e12b933c7a33f85ceeddbae35c05abf8943b4cf0f58369c6511",
     "scripts/check-validator-lifecycle-mutations.py":
         "12b477e5043bc3ea98387be33ca586976494b30083522b214cea7d88c0e9f429",
     "scripts/devnet-particao-report.test.py":
@@ -331,6 +331,25 @@ def job_blocks(text: str, indent: int) -> dict[str, list[str]]:
             continue
         blocks[current].append(line)
     return blocks
+
+
+def protected_job_key_problems(
+    text: str, job: str, indent: int, label: str
+) -> list[str]:
+    """Require one unquoted semantic YAML key for a reviewed job."""
+    protected = [
+        match.group("quote")
+        for line in text.splitlines()
+        if (match := re.match(
+            r"^ {%d}(?P<quote>['\"]?)%s(?P=quote)\s*:"
+            % (indent, re.escape(job)), line))
+    ]
+    if len(protected) != 1 or protected[0]:
+        return [
+            f"{label}: protected `{job}:` job key must occur exactly once in "
+            "the supported plain-key form"
+        ]
+    return []
 
 
 def command_blocks(body: list[str], job_indent: int) -> list[list[str]]:
@@ -503,8 +522,11 @@ def check_github_test_guard(path: str) -> list[str]:
         return [f"{label}: MISSING — the pipeline definition itself is gone"]
     text = open(path, encoding="utf-8").read()
     blocks = job_blocks(text, 2)
+    problems = protected_job_key_problems(text, job, 2, label)
     if job not in blocks:
-        return [f"{label}: job `{job}` is MISSING. A guard that was deleted is not a guard that passed."]
+        problems.append(
+            f"{label}: job `{job}` is MISSING. A guard that was deleted is not a guard that passed.")
+        return problems
 
     body = blocks[job]
     direct = tuple(
@@ -512,7 +534,6 @@ def check_github_test_guard(path: str) -> list[str]:
         for line in body
         if len(line) - len(line.lstrip(" ")) == 4
     )
-    problems = []
     if direct != GITHUB_TEST_GUARD_HEADER:
         problems.append(
             f"{label}: job `{job}` header differs from the reviewed runner/timeout/steps contract")
@@ -732,12 +753,16 @@ def check_job(path: str, job: str, indent: int, label: str) -> list[str]:
         return ["%s: MISSING — the pipeline definition itself is gone" % label]
     text = open(path, encoding="utf-8").read()
     blocks = job_blocks(text, indent)
+    problems: list[str] = []
+    if label == ".github/workflows/tests.yml":
+        problems += protected_job_key_problems(text, job, indent, label)
     if job not in blocks:
-        return ["%s: job `%s` is MISSING. A gate that was deleted is not a "
-                "gate that passed." % (label, job)]
+        problems.append(
+            "%s: job `%s` is MISSING. A gate that was deleted is not a "
+            "gate that passed." % (label, job))
+        return problems
 
     body = blocks[job]
-    problems: list[str] = []
 
     if label == ".gitlab-ci.yml":
         problems += check_gitlab_global_context(text, job_blocks(text, 0))
