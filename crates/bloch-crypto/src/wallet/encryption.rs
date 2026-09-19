@@ -511,11 +511,28 @@ impl EncryptedKeyfile {
             return Err(WalletError::Parse(format!(
                 "v2 payload seed length {} out of bounds", seed_len)));
         }
-        let master_seed = Zeroizing::new(plain[4..4 + seed_len].to_vec());
-        let secret = Zeroizing::new(plain[4 + seed_len..].to_vec());
+        let (master_seed, secret) = split_v2_plaintext(plain, seed_len);
 
         Ok((master_seed, secret, public, net))
     }
+}
+
+/// Split the authenticated v2 layout while retaining the original plaintext
+/// allocation for the usually much larger private key. The seed requires its
+/// own owner because the compatibility API returns both values independently;
+/// the shifted key overwrites former header/seed prefix, wipes remaining old
+/// logical tail, then truncates the reused allocation.
+fn split_v2_plaintext(
+    mut plain: Zeroizing<Vec<u8>>,
+    seed_len: usize,
+) -> (Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>) {
+    let secret_offset = 4 + seed_len;
+    let master_seed = Zeroizing::new(plain[4..secret_offset].to_vec());
+    let secret_len = plain.len() - secret_offset;
+    plain.copy_within(secret_offset.., 0);
+    plain[secret_len..].zeroize();
+    plain.truncate(secret_len);
+    (master_seed, plain)
 }
 
 /// Authenticate and decrypt a validated keyfile payload without allocating a
@@ -927,6 +944,34 @@ mod tests {
             &seed, &secret, &public, Network::Testnet, "password-abcd-12", fast_params
         ).unwrap();
         (kf, seed, secret, public)
+    }
+
+    #[test]
+    fn v2_plaintext_split_reuses_secret_allocation_and_wipes_live_owners() {
+        let seed = [0x42u8; 64];
+        // Longer than the header+seed prefix so the in-place move exercises
+        // the overlapping copy shape used by real hybrid private keys.
+        let secret = [0xA5u8; 192];
+        let mut layout = Vec::with_capacity(512);
+        layout.extend_from_slice(&(seed.len() as u32).to_le_bytes());
+        layout.extend_from_slice(&seed);
+        layout.extend_from_slice(&secret);
+        let allocation = layout.as_ptr();
+        let capacity = layout.capacity();
+
+        let (mut split_seed, mut split_secret) =
+            split_v2_plaintext(Zeroizing::new(layout), seed.len());
+
+        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
+        assert_eq!(split_seed.as_slice(), seed);
+        assert_eq!(split_secret.as_slice(), secret);
+        assert_eq!(split_secret.as_ptr(), allocation);
+        assert_eq!(split_secret.capacity(), capacity);
+
+        split_seed.zeroize();
+        split_secret.zeroize();
+        assert!(split_seed.is_empty());
+        assert!(split_secret.is_empty());
     }
 
     #[test]
