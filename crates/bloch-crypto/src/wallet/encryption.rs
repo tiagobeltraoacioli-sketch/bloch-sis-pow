@@ -565,6 +565,11 @@ fn derive_key(
     Ok(())
 }
 
+/// Own the repository-created denylist comparison copy under wiping drop.
+fn normalized_password_for_denylist(password: &str) -> Zeroizing<String> {
+    Zeroizing::new(password.trim().to_lowercase())
+}
+
 /// Reject passwords that would defeat the Argon2id hardening anyway.
 ///
 /// Sprint T.3 — Audit M-5 fix. Two checks:
@@ -617,7 +622,7 @@ pub(crate) fn validate_password_strength(password: &str) -> Result<(), WalletErr
         ));
     }
 
-    let normalized = password.trim().to_lowercase();
+    let normalized = normalized_password_for_denylist(password);
     if DENYLIST.iter().any(|banned| *banned == normalized.as_str()) {
         return Err(WalletError::WeakPassword(
             "password appears on the list of commonly breached passwords; \
@@ -695,6 +700,28 @@ mod tests {
             Err(other) => panic!("expected WeakPassword error, got different error: {}", other),
             Ok(_)      => panic!("expected WeakPassword error, got Ok(_)"),
         }
+    }
+
+    #[test]
+    fn denylist_normalization_has_zeroizing_ownership_and_preserves_policy() {
+        let _: fn(&str) -> Zeroizing<String> = normalized_password_for_denylist;
+        assert!(std::mem::needs_drop::<Zeroizing<String>>());
+
+        let mut normalized = normalized_password_for_denylist("  PASSWORD1234  ");
+        assert_eq!(normalized.as_str(), "password1234");
+        normalized.zeroize();
+        assert!(normalized.is_empty());
+
+        assert_eq!(
+            normalized_password_for_denylist("  ÄBCdef-Unique-42!  ").as_str(),
+            "äbcdef-unique-42!",
+        );
+
+        assert!(matches!(
+            validate_password_strength("  PASSWORD1234  "),
+            Err(WalletError::WeakPassword(_))
+        ));
+        assert!(validate_password_strength("  Unique-Diceware-42!  ").is_ok());
     }
 
     /// Sprint T.3: length-boundary check — exactly 11 chars must be rejected,
