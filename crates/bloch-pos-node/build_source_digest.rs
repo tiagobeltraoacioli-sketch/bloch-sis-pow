@@ -56,7 +56,6 @@ pub(crate) fn source_digest(root: &Path) -> Option<(String, usize, u64)> {
             Ok(metadata) if metadata.file_type().is_symlink() => return None,
             Ok(metadata) if metadata.is_file() => files.push((extra.to_owned(), path)),
             Ok(_) => return None,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return None,
         }
     }
@@ -84,6 +83,14 @@ pub(crate) fn source_digest(root: &Path) -> Option<(String, usize, u64)> {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     Some((digest, files.len(), bytes_total))
+}
+
+/// A detected workspace promises a complete source identity. Refuse its build
+/// rather than producing a runnable binary whose identity is `unavailable`.
+pub(crate) fn required_source_digest(root: &Path) -> (String, usize, u64) {
+    source_digest(root).unwrap_or_else(|| {
+        panic!("detected workspace source inventory is incomplete; refusing an unidentified build")
+    })
 }
 
 #[cfg(test)]
@@ -138,6 +145,27 @@ mod tests {
         fs::write(root.join("outside.rs"), b"pub fn outside() {}\n").expect("target");
         symlink(root.join("outside.rs"), root.join("crates/linked.rs")).expect("symlink");
         assert!(source_digest(&root).is_none());
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn missing_required_workspace_input_invalidates_digest() {
+        let root = fixture();
+        fs::remove_file(root.join("rust-toolchain.toml")).expect("remove required input");
+        assert!(source_digest(&root).is_none());
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detected_workspace_refuses_to_build_from_an_incomplete_inventory() {
+        use std::os::unix::fs::symlink;
+
+        let root = fixture();
+        fs::write(root.join("outside.rs"), b"pub fn outside() {}\n").expect("target");
+        symlink(root.join("outside.rs"), root.join("crates/linked.rs")).expect("symlink");
+        let refusal = std::panic::catch_unwind(|| required_source_digest(&root));
+        assert!(refusal.is_err(), "an incomplete detected workspace must stop the build");
         fs::remove_dir_all(root).expect("remove fixture");
     }
 

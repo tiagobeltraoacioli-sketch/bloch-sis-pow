@@ -75,7 +75,7 @@ mod build_source_digest;
 use build_command::{
     command_from_env, delegated_compiler, linker_from_printed_args, rustflags_linker,
 };
-use build_source_digest::source_digest;
+use build_source_digest::required_source_digest;
 
 /// Walk from the crate directory to the workspace root: the first ancestor
 /// holding both `Cargo.lock` and a `crates/` directory. Returns `None` when
@@ -608,15 +608,18 @@ fn main() {
     };
     println!("cargo:rustc-env=BLOCH_BUILD_TREE_STATE={tree_state}");
 
-    match source_digest(&workspace_root().unwrap_or_else(|| PathBuf::from("."))) {
-        Some((digest, files, bytes)) => {
+    match workspace_root() {
+        Some(root) => {
+            let (digest, files, bytes) = required_source_digest(&root);
             println!("cargo:rustc-env=BLOCH_SOURCE_DIGEST={digest}");
             println!("cargo:rustc-env=BLOCH_SOURCE_FILES={files}");
             println!("cargo:rustc-env=BLOCH_SOURCE_BYTES={bytes}");
         }
         None => {
-            // Say so, rather than emit a digest of nothing. A client can tell
-            // "I could not compute this" from "here is the tree".
+            // A genuinely vendored/git-dependency copy has no enclosing
+            // workspace to identify. Say so rather than hashing an arbitrary
+            // nearby directory. Detected workspaces take the fail-closed arm
+            // above and cannot produce an unidentified binary.
             println!("cargo:rustc-env=BLOCH_SOURCE_DIGEST=unavailable");
             println!("cargo:rustc-env=BLOCH_SOURCE_FILES=0");
             println!("cargo:rustc-env=BLOCH_SOURCE_BYTES=0");
