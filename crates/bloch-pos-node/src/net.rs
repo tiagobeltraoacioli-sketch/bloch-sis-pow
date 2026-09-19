@@ -644,13 +644,18 @@ const DEVNET_IO_TIMEOUT: Duration = Duration::from_secs(120);
 const GET_BLOCKS_ANSWERS_PER_SEC: f64 = 8.0;
 const GET_BLOCKS_BURST: f64 = 32.0;
 
+/// One immutable wire frame shared by the bounded devnet writer queues.
+/// Conversion happens once before fanout; queue clones only retain the same
+/// allocation, including attempts refused because a writer queue is full.
+type SharedFrame = Arc<[u8]>;
+
 /// The devnet TCP mesh: one queue per peer we dialed, plus one per peer that
 /// dialed us.
 pub struct DevnetMesh {
     /// Bounded per [`OUTBOUND_QUEUE_DEPTH`] (R3 M-4 / R1 A3-M2) — see that
     /// constant's doc for why an unbounded queue here was a memory leak
     /// waiting on a peer that never connects.
-    peers: Vec<SyncSender<Vec<u8>>>,
+    peers: Vec<SyncSender<SharedFrame>>,
     /// One request scheduler for both connection directions and both triggers.
     sync: Arc<SyncScheduler>,
     /// Broadcast queues for connections we did NOT dial.
@@ -713,7 +718,7 @@ impl Drop for ConnCount {
 
 #[derive(Clone)]
 struct InboundPeer {
-    frames: SyncSender<Vec<u8>>,
+    frames: SyncSender<SharedFrame>,
     connection: Weak<Connection>,
 }
 
@@ -756,22 +761,22 @@ impl Drop for ConnectionHalf {
 }
 
 fn run_inbound_writer(
-    rx: Receiver<Vec<u8>>,
+    rx: Receiver<SharedFrame>,
     socket: Arc<Mutex<TcpStream>>,
     half: ConnectionHalf,
 ) {
     run_connection_writer(&rx, socket, half);
 }
 
-fn run_connection_writer(rx: &Receiver<Vec<u8>>, socket: Arc<Mutex<TcpStream>>, half: ConnectionHalf) {
+fn run_connection_writer(rx: &Receiver<SharedFrame>, socket: Arc<Mutex<TcpStream>>, half: ConnectionHalf) {
     while !half.0.closed.load(Ordering::Acquire) {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(frame) => {
                 let Ok(mut writer) = socket.lock() else { return };
                 if half.0.closed.load(Ordering::Acquire) { return; }
                 if frame.first() == Some(&FRAME_GET_BLOCKS)
-                    && !half.0.take_sync_request(&frame, Instant::now()) { continue; }
-                if write_frame(&mut writer, &frame).is_err() { return; }
+                    && !half.0.take_sync_request(frame.as_ref(), Instant::now()) { continue; }
+                if write_frame(&mut writer, frame.as_ref()).is_err() { return; }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -865,6 +870,7 @@ impl DevnetMesh {
             }
             return;
         }
+        let frame: SharedFrame = frame.into();
         // `try_send`, not `send` (R3 M-4 / R1 A3-M2): the queue is bounded now,
         // so a peer whose dialer is stuck (unreachable address, or reachable
         // but not draining fast enough) gets this frame DROPPED rather than
@@ -940,7 +946,7 @@ impl SyncScheduler {
         }
         let mut active = schedule.peers.iter().filter(|p| p.requested_at.is_some()).count();
         let after = schedule.requested_after.unwrap_or_else(|| self.head.load(Ordering::Acquire));
-        let frame = get_blocks_frame(after);
+        let frame: SharedFrame = get_blocks_frame(after).into();
         let mut sent = false;
         for _ in 0..schedule.peers.len() {
             if active >= SYNC_FANOUT { break; }
@@ -1380,7 +1386,7 @@ pub fn start(
                 // One writer thread per connection, fed by a bounded queue, so
                 // a peer that stops reading fills its own queue and is dropped
                 // from there rather than blocking this node's broadcast loop.
-                let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(INBOUND_QUEUE_DEPTH);
+                let (tx, rx) = mpsc::sync_channel::<SharedFrame>(INBOUND_QUEUE_DEPTH);
                 {
                     let wsock = wsock.clone();
                     let half = ConnectionHalf(connection.clone());
@@ -1432,7 +1438,7 @@ pub fn start(
     let mut peers = Vec::new();
     for addr in peer_addrs {
         // R3 M-4 / R1 A3-M2: bounded — see [`OUTBOUND_QUEUE_DEPTH`].
-        let (tx, rx): (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) =
+        let (tx, rx): (SyncSender<SharedFrame>, Receiver<SharedFrame>) =
             mpsc::sync_channel(OUTBOUND_QUEUE_DEPTH);
         peers.push(tx.clone());
         let scheduler = Arc::downgrade(&sync);
@@ -1507,16 +1513,16 @@ mod tests {
 
     struct SyncTestPeer {
         peer: InboundPeer,
-        received: Receiver<Vec<u8>>,
+        received: Receiver<SharedFrame>,
         connection: Arc<Connection>,
         _remote: TcpStream,
     }
 
     impl SyncTestPeer {
-        fn receive(&self) -> Result<Vec<u8>, mpsc::TryRecvError> {
+        fn receive(&self) -> Result<SharedFrame, mpsc::TryRecvError> {
             let frame = self.received.try_recv()?;
             if frame.first() == Some(&FRAME_GET_BLOCKS) {
-                assert!(self.connection.take_sync_request(&frame, Instant::now()));
+                assert!(self.connection.take_sync_request(frame.as_ref(), Instant::now()));
             }
             Ok(frame)
         }
@@ -1540,8 +1546,8 @@ mod tests {
         let scheduler = SyncScheduler::new(Arc::new(AtomicU64::new(42)), QueueBudget::new());
         let peers: Vec<_> = (0..3).map(|_| sync_test_peer()).collect();
         for peer in &peers { scheduler.register(peer.peer.clone(), now); }
-        assert_eq!(peers[0].receive().unwrap(), get_blocks_frame(42));
-        assert_eq!(peers[1].receive().unwrap(), get_blocks_frame(42));
+        assert_eq!(peers[0].receive().unwrap().as_ref(), get_blocks_frame(42).as_slice());
+        assert_eq!(peers[1].receive().unwrap().as_ref(), get_blocks_frame(42).as_slice());
         assert!(peers[2].receive().is_err());
         for _ in 0..100 {
             scheduler.pump(now, Some(7));
@@ -1549,7 +1555,7 @@ mod tests {
         }
         assert!(peers.iter().all(|p| p.receive().is_err()), "engine and timer must share the two leases");
         scheduler.pump(now + SYNC_LEASE, None);
-        assert_eq!(peers[2].receive().unwrap(), get_blocks_frame(7), "a silent first pair cannot exclude the next peer");
+        assert_eq!(peers[2].receive().unwrap().as_ref(), get_blocks_frame(7).as_slice(), "a silent first pair cannot exclude the next peer");
         let mut covered = std::collections::BTreeSet::new();
         for turn in 1..=6u32 {
             scheduler.pump(now + SYNC_LEASE * turn, None);
@@ -1570,13 +1576,13 @@ mod tests {
         let first = sync_test_peer();
         let second = sync_test_peer();
         let third = sync_test_peer();
-        first.peer.frames.try_send(vec![FRAME_ATT]).unwrap(); // saturated writer
+        first.peer.frames.try_send(vec![FRAME_ATT].into()).unwrap(); // saturated writer
         scheduler.register(first.peer.clone(), now);
         scheduler.register(second.peer.clone(), now);
         scheduler.register(third.peer.clone(), now);
-        assert_eq!(second.receive().unwrap(), get_blocks_frame(42));
-        assert_eq!(third.receive().unwrap(), get_blocks_frame(42));
-        assert_eq!(first.receive().unwrap(), vec![FRAME_ATT]);
+        assert_eq!(second.receive().unwrap().as_ref(), get_blocks_frame(42).as_slice());
+        assert_eq!(third.receive().unwrap().as_ref(), get_blocks_frame(42).as_slice());
+        assert_eq!(first.receive().unwrap().as_ref(), [FRAME_ATT]);
         assert!(budget.reserve_raw(EventClass::Block, 60)); // slow application
         scheduler.pump(now + SYNC_LEASE, Some(3));
         assert!(first.receive().is_err());
@@ -1587,15 +1593,15 @@ mod tests {
         budget.release_raw(60);
         budget.release_raw(40);
         scheduler.pump(now + SYNC_LEASE, None);
-        assert_eq!(first.receive().unwrap(), get_blocks_frame(3));
-        assert_eq!(second.receive().unwrap(), get_blocks_frame(3));
+        assert_eq!(first.receive().unwrap().as_ref(), get_blocks_frame(3).as_slice());
+        assert_eq!(second.receive().unwrap().as_ref(), get_blocks_frame(3).as_slice());
         second.connection.closed.store(true, Ordering::Release);
         scheduler.pump(now + SYNC_LEASE, None);
-        assert_eq!(third.receive().unwrap(), get_blocks_frame(42), "disconnect frees its lease without waiting for expiry");
+        assert_eq!(third.receive().unwrap().as_ref(), get_blocks_frame(42).as_slice(), "disconnect frees its lease without waiting for expiry");
         let replacement = sync_test_peer();
         scheduler.register(replacement.peer.clone(), now + SYNC_LEASE);
         scheduler.pump(now + SYNC_LEASE * 2, None);
-        assert_eq!(replacement.receive().unwrap(), get_blocks_frame(42), "reconnection enters the fair queue");
+        assert_eq!(replacement.receive().unwrap().as_ref(), get_blocks_frame(42).as_slice(), "reconnection enters the fair queue");
     }
 
     #[test]
@@ -1606,15 +1612,15 @@ mod tests {
         scheduler.register(peer.peer.clone(), now);
         for turn in 1..=5 { scheduler.pump(now + SYNC_LEASE * turn, Some(3)); }
         let stale = peer.received.try_recv().unwrap();
-        assert_eq!(stale, get_blocks_frame(42));
+        assert_eq!(stale.as_ref(), get_blocks_frame(42).as_slice());
         assert!(peer.received.try_recv().is_err(), "only one authorization may wait behind a blocked writer");
-        assert!(!peer.connection.take_sync_request(&stale, now + SYNC_LEASE * 5));
+        assert!(!peer.connection.take_sync_request(stale.as_ref(), now + SYNC_LEASE * 5));
         scheduler.pump(now + SYNC_LEASE * 5, None);
         let fresh = peer.received.try_recv().unwrap();
-        assert_eq!(fresh, get_blocks_frame(3));
-        assert!(!peer.connection.take_sync_request(&stale, now + SYNC_LEASE * 5), "a stale frame must not consume a different request's authorization");
-        assert!(peer.connection.take_sync_request(&fresh, now + SYNC_LEASE * 5));
-        assert!(!peer.connection.take_sync_request(&fresh, now + SYNC_LEASE * 5), "authorization is single use");
+        assert_eq!(fresh.as_ref(), get_blocks_frame(3).as_slice());
+        assert!(!peer.connection.take_sync_request(stale.as_ref(), now + SYNC_LEASE * 5), "a stale frame must not consume a different request's authorization");
+        assert!(peer.connection.take_sync_request(fresh.as_ref(), now + SYNC_LEASE * 5));
+        assert!(!peer.connection.take_sync_request(fresh.as_ref(), now + SYNC_LEASE * 5), "authorization is single use");
     }
 
     fn sync_test_block() -> BlockEnvelope {
@@ -1834,7 +1840,7 @@ mod tests {
         assert!(!peer.is_open());
         assert_eq!(live.load(Ordering::Acquire), 0);
         assert_eq!(inbound_live.load(Ordering::Acquire), 0);
-        assert!(matches!(peer.frames.try_send(vec![1]), Err(TrySendError::Disconnected(_))));
+        assert!(matches!(peer.frames.try_send(vec![1].into()), Err(TrySendError::Disconnected(_))));
     }
 
     #[test]
@@ -2278,7 +2284,7 @@ mod tests {
     /// `OUTBOUND_QUEUE_DEPTH` and every broadcast past that is dropped.
     #[test]
     fn devnet_broadcast_outbound_queue_is_bounded() {
-        let (tx, rx): (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) =
+        let (tx, rx): (SyncSender<SharedFrame>, Receiver<SharedFrame>) =
             mpsc::sync_channel(OUTBOUND_QUEUE_DEPTH);
         let mesh = DevnetMesh {
             peers: vec![tx],
@@ -2296,6 +2302,36 @@ mod tests {
             queued, OUTBOUND_QUEUE_DEPTH,
             "the outbound queue must cap at OUTBOUND_QUEUE_DEPTH, not grow with every broadcast"
         );
+    }
+
+    /// EN-08: fanout retains one immutable wire allocation, rather than one
+    /// payload allocation per writer queue. A full queue must still keep its
+    /// oldest frame and drop the incoming frame without changing ordering.
+    #[test]
+    fn devnet_broadcast_shares_wire_bytes_and_full_queues_do_not_displace() {
+        let (first_tx, first_rx) = mpsc::sync_channel::<SharedFrame>(1);
+        let (second_tx, second_rx) = mpsc::sync_channel::<SharedFrame>(1);
+        let mesh = DevnetMesh {
+            peers: vec![first_tx, second_tx],
+            sync: SyncScheduler::new(Arc::new(AtomicU64::new(0)), QueueBudget::new()),
+            inbound: Arc::new(Mutex::new(Vec::new())),
+            live: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let mut retained = vec![0xA5; 1 << 20];
+        retained[0] = FRAME_BLOCK;
+        mesh.broadcast(retained.clone());
+
+        // Both queues are now full. This distinct incoming frame is refused;
+        // `try_send` does not evict or reorder the already retained frame.
+        mesh.broadcast(vec![FRAME_ATT, 0x5A]);
+
+        let first = first_rx.try_recv().unwrap();
+        let second = second_rx.try_recv().unwrap();
+        assert!(Arc::ptr_eq(&first, &second), "both peers must retain the same allocation");
+        assert_eq!(first.as_ref(), retained.as_slice(), "wire bytes must remain exact");
+        assert_eq!(second.as_ref(), retained.as_slice(), "wire bytes must remain exact");
+        assert!(first_rx.try_recv().is_err(), "full queue must drop, not displace or append");
+        assert!(second_rx.try_recv().is_err(), "full queue must drop, not displace or append");
     }
 
     /// R3 M-4 / R1 A3-M2: the devnet listener accepts at most
