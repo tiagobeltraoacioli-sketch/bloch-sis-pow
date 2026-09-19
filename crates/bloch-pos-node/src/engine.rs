@@ -94,7 +94,9 @@ use bloch_pos_committee::attestation::{Attestation, AttestationData, KeyLookup, 
 use bloch_pos_committee::beacon::{mix_in, RandaoChain};
 use bloch_pos_committee::fee_market;
 use bloch_pos_committee::forkchoice::{BlockTree, LatestMessage, Store as FcStore};
-use bloch_pos_committee::gossip::{AttestationPool, GossipDecision};
+use bloch_pos_committee::gossip::{
+    AttestationPool, AuthenticatedPendingAttestation, GossipDecision,
+};
 use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, VERSION_G4};
 use bloch_pos_committee::interfaces::{ProposalEnvelope, StateReader, StateTransition};
 use bloch_pos_committee::params::{
@@ -1820,6 +1822,32 @@ fn culprit_index(err: &TransitionError, len: usize) -> Option<usize> {
             (i < len).then_some(i)
         }
         _ => None,
+    }
+}
+
+/// Separates fresh wire input from a pool-issued, opaque authentication proof.
+/// Only the latter may use the held-replay fast path.
+enum AttestationAdmission {
+    Fresh {
+        att: Attestation,
+        verification_source: Option<[u8; 32]>,
+    },
+    Pending(AuthenticatedPendingAttestation),
+}
+
+impl AttestationAdmission {
+    fn attestation(&self) -> &Attestation {
+        match self {
+            Self::Fresh { att, .. } => att,
+            Self::Pending(pending) => pending.attestation(),
+        }
+    }
+
+    fn verification_source(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Fresh { verification_source, .. } => *verification_source,
+            Self::Pending(pending) => pending.verification_source(),
+        }
     }
 }
 
@@ -4636,6 +4664,28 @@ impl Engine {
         epoch: u64,
         verification_source: Option<[u8; 32]>,
     ) -> GossipDecision {
+        self.judge_admission(
+            pool,
+            AttestationAdmission::Fresh { att, verification_source },
+            epoch,
+        )
+    }
+
+    fn judge_pending(
+        &self,
+        pool: &mut AttestationPool,
+        pending: AuthenticatedPendingAttestation,
+        epoch: u64,
+    ) -> GossipDecision {
+        self.judge_admission(pool, AttestationAdmission::Pending(pending), epoch)
+    }
+
+    fn judge_admission(
+        &self,
+        pool: &mut AttestationPool,
+        admission: AttestationAdmission,
+        epoch: u64,
+    ) -> GossipDecision {
         // A forward projection cannot reconstruct a historical roster. Never
         // silently judge an older duty against the current registry.
         if epoch < epoch_of(self.state.slot()) {
@@ -4675,9 +4725,10 @@ impl Engine {
         // every boundary vote.
         let known_root =
             |root: &[u8; 32]| self.canonical.contains(root) || self.blocks.contains_key(root);
-        let seed = match self.seed_for_attestation(&att.data.target_root, epoch) {
+        let target_root = admission.attestation().data.target_root;
+        let seed = match self.seed_for_attestation(&target_root, epoch) {
             Some(seed) => Some(seed),
-            None if !known_root(&att.data.target_root) => None,
+            None if !known_root(&target_root) => None,
             None => {
                 return GossipDecision::Ignore(
                     bloch_pos_committee::gossip::IgnoreReason::Unjudgeable,
@@ -4709,18 +4760,28 @@ impl Engine {
         let verifier = self.gossip_verifier.budgeted_for_source(
             self.wall_slot(),
             GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
-            verification_source,
+            admission.verification_source(),
             GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
         );
-        let decision = pool.process_from_source(
-            att,
-            self.wall_slot,
-            &committees_at,
-            &known,
-            &verifier,
-            &*rolled,
-            verification_source,
-        );
+        let decision = match admission {
+            AttestationAdmission::Fresh { att, verification_source } => pool.process_from_source(
+                att,
+                self.wall_slot,
+                &committees_at,
+                &known,
+                &verifier,
+                &*rolled,
+                verification_source,
+            ),
+            AttestationAdmission::Pending(pending) => pool.process_authenticated_pending(
+                pending,
+                self.wall_slot,
+                &committees_at,
+                &known,
+                &verifier,
+                &*rolled,
+            ),
+        };
         locally_limited_gossip_decision(decision, verifier.limited())
     }
 
@@ -4770,13 +4831,14 @@ impl Engine {
             return false;
         };
         let mut pool = std::mem::take(&mut self.att_pool);
-        let (waiting, root_remains) = pool.take_waiting_on_limit_with_sources(
+        let (waiting, root_remains) = pool.take_authenticated_waiting_on_limit(
             &root,
             HELD_ATTESTATIONS_PER_TURN,
         );
-        let released: Vec<_> = waiting.into_iter().map(|(att, verification_source)| {
+        let released: Vec<_> = waiting.into_iter().map(|pending| {
+            let att = pending.attestation().clone();
             let epoch = epoch_of(att.data.slot);
-            let decision = self.judge_from(&mut pool, att.clone(), epoch, verification_source);
+            let decision = self.judge_pending(&mut pool, pending, epoch);
             (att, decision)
         }).collect();
         self.att_pool = pool;
@@ -12293,7 +12355,7 @@ mod ingest_admission_tests {
     }
 
     #[test]
-    fn held_replay_spends_exactly_one_verification_and_preserves_root_fifo() {
+    fn authenticated_held_replay_skips_second_verification_and_preserves_root_fifo() {
         let _clock = validator_lifecycle::clock_at(63);
         let (mut engine, _dir, template, _) = fixture();
         let validator = engine.manifest.validators[0].clone();
@@ -12379,7 +12441,7 @@ mod ingest_admission_tests {
             assert_eq!(
                 engine.att_pool.pending_for_root(&first_root),
                 first_root_atts.len() - turn - 1,
-                "one control turn must consume exactly one hybrid verification",
+                "one control turn must consume exactly one authenticated waiter",
             );
             assert_eq!(engine.att_pool.pending_for_root(&second_root), 1);
             assert!(engine

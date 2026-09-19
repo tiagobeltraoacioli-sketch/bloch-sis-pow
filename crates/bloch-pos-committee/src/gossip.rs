@@ -43,6 +43,7 @@
 use crate::attestation::{Attestation, KeyLookup, RejectReason, SignatureVerifier};
 use crate::params::SLOTS_PER_EPOCH;
 use crate::slashing::SlashingEvidence;
+use sha3::{Digest, Sha3_256};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Acceptance window, in slots: two epochs, matching the seen-cache retention
@@ -251,6 +252,32 @@ struct PendingEntry {
     att: Attestation,
     missing_root: [u8; 32],
     verification_source: Option<[u8; 32]>,
+    /// Binds the local authentication proof to the registry key that was
+    /// actually used. A changed projection must verify again, never inherit
+    /// trust from a different key at the same validator index.
+    verified_pubkey_sha3: [u8; 32],
+}
+
+/// A pending attestation carrying proof that this pool authenticated it.
+///
+/// Fields and construction stay private so callers cannot manufacture a
+/// signature-verification bypass. Consuming the token permits exactly one
+/// replay through [`AttestationPool::process_authenticated_pending`].
+#[derive(Debug)]
+pub struct AuthenticatedPendingAttestation {
+    att: Attestation,
+    verification_source: Option<[u8; 32]>,
+    verified_pubkey_sha3: [u8; 32],
+}
+
+impl AuthenticatedPendingAttestation {
+    pub fn attestation(&self) -> &Attestation {
+        &self.att
+    }
+
+    pub fn verification_source(&self) -> Option<[u8; 32]> {
+        self.verification_source
+    }
 }
 
 /// The attestation pool: dedup, equivocation capture, and the pending
@@ -382,6 +409,56 @@ impl AttestationPool {
         keys: &dyn KeyLookup,
         verification_source: Option<[u8; 32]>,
     ) -> GossipDecision {
+        self.process_inner(
+            att,
+            current_slot,
+            committees,
+            blocks,
+            verifier,
+            keys,
+            verification_source,
+            None,
+        )
+    }
+
+    /// Re-judge a waiter extracted from this pool without repeating its
+    /// hybrid verification when the current registry resolves the identical
+    /// public key. Mutable policy and chain-view checks still run in full.
+    /// If the key fingerprint changed, verification runs again and fails
+    /// closed. The opaque, consumed token is the authority for this fast path.
+    pub fn process_authenticated_pending(
+        &mut self,
+        pending: AuthenticatedPendingAttestation,
+        current_slot: u64,
+        committees: &impl CommitteeLookup,
+        blocks: &impl BlockLookup,
+        verifier: &dyn SignatureVerifier,
+        keys: &dyn KeyLookup,
+    ) -> GossipDecision {
+        self.process_inner(
+            pending.att,
+            current_slot,
+            committees,
+            blocks,
+            verifier,
+            keys,
+            pending.verification_source,
+            Some(pending.verified_pubkey_sha3),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_inner(
+        &mut self,
+        att: Attestation,
+        current_slot: u64,
+        committees: &impl CommitteeLookup,
+        blocks: &impl BlockLookup,
+        verifier: &dyn SignatureVerifier,
+        keys: &dyn KeyLookup,
+        verification_source: Option<[u8; 32]>,
+        authenticated_pubkey_sha3: Option<[u8; 32]>,
+    ) -> GossipDecision {
         let slot = att.data.slot;
 
         // 1. Window. Both sides are Ignore, not Reject: behind is a stale
@@ -505,11 +582,17 @@ impl AttestationPool {
             }
         }
 
-        // 7. Signature. Both halves of the hybrid suite, via the injected
-        //    verifier. Only verified attestations are ever recorded or
-        //    parked, so every equivocation pair handed to slashing already
-        //    carries two valid signatures: a forger cannot frame a validator.
-        if !verifier.verify_with_key(pubkey, &data_hash, &att.signature) {
+        // 7. Signature. An opaque pending token proves that this exact
+        //    attestation already passed both halves of the hybrid suite. It
+        //    is reusable only while the current registry resolves the exact
+        //    same key fingerprint; a defensive key mismatch takes the normal
+        //    verification path. Only verified attestations are recorded or
+        //    parked, so a forger cannot frame a validator.
+        let current_pubkey_sha3: [u8; 32] = Sha3_256::digest(pubkey).into();
+        let already_authenticated = authenticated_pubkey_sha3 == Some(current_pubkey_sha3);
+        if !already_authenticated
+            && !verifier.verify_with_key(pubkey, &data_hash, &att.signature)
+        {
             return GossipDecision::Reject(RejectReason::BadSignature);
         }
 
@@ -526,7 +609,14 @@ impl AttestationPool {
         //    at an epoch boundary the target IS the block just produced, and
         //    it races too.
         if let Some(root) = missing_root {
-            return self.hold(duty, att, root, data_hash, verification_source);
+            return self.hold(
+                duty,
+                att,
+                root,
+                data_hash,
+                verification_source,
+                current_pubkey_sha3,
+            );
         }
 
         // 9. Record. Second distinct data for the duty = equivocation:
@@ -595,11 +685,10 @@ impl AttestationPool {
     ///
     /// Call *after* the block is queryable through the [`BlockLookup`], or
     /// the waiters will simply be re-held. Entries are replayed in insertion
-    /// order (deterministic), and each goes through the full pipeline again —
-    /// so an attestation still missing its *other* root is re-held under that
-    /// root, and one whose signature turns out bad is rejected now. Returns
-    /// each released attestation with its final decision; the node relays the
-    /// Accepts (they were never relayed while parked).
+    /// order (deterministic), and each goes through every mutable policy and
+    /// chain-view check again. The paid signature proof is reused only while
+    /// bound to the same registry key; a changed key is verified normally.
+    /// An attestation still missing its *other* root is re-held under it.
     pub fn on_block(
         &mut self,
         root: &[u8; 32],
@@ -609,18 +698,18 @@ impl AttestationPool {
         verifier: &dyn SignatureVerifier,
         keys: &dyn KeyLookup,
     ) -> Vec<(Attestation, GossipDecision)> {
-        self.take_waiting_on_limit_with_sources(root, usize::MAX)
+        self.take_authenticated_waiting_on_limit(root, usize::MAX)
             .0
             .into_iter()
-            .map(|(att, verification_source)| {
-                let decision = self.process_from_source(
-                    att.clone(),
+            .map(|pending| {
+                let att = pending.attestation().clone();
+                let decision = self.process_authenticated_pending(
+                    pending,
                     current_slot,
                     committees,
                     blocks,
                     verifier,
                     keys,
-                    verification_source,
                 );
                 (att, decision)
             }).collect()
@@ -653,6 +742,24 @@ impl AttestationPool {
         root: &[u8; 32],
         limit: usize,
     ) -> (Vec<(Attestation, Option<[u8; 32]>)>, bool) {
+        let (waiting, remains) = self.take_authenticated_waiting_on_limit(root, limit);
+        (
+            waiting
+                .into_iter()
+                .map(|pending| (pending.att, pending.verification_source))
+                .collect(),
+            remains,
+        )
+    }
+
+    /// Authenticated, source-preserving extraction for internal replay.
+    /// Tokens are opaque and consumed by the only API allowed to reuse the
+    /// signature proof, preventing a general verification bypass.
+    pub fn take_authenticated_waiting_on_limit(
+        &mut self,
+        root: &[u8; 32],
+        limit: usize,
+    ) -> (Vec<AuthenticatedPendingAttestation>, bool) {
         let seqs: Vec<u64> = self.pending_by_root.get(root)
             .into_iter()
             .flat_map(|entries| entries.iter().take(limit))
@@ -661,7 +768,11 @@ impl AttestationPool {
         let mut out = Vec::with_capacity(seqs.len());
         for seq in seqs {
             if let Some(entry) = self.pending.get(&seq) {
-                out.push((entry.att.clone(), entry.verification_source));
+                out.push(AuthenticatedPendingAttestation {
+                    att: entry.att.clone(),
+                    verification_source: entry.verification_source,
+                    verified_pubkey_sha3: entry.verified_pubkey_sha3,
+                });
                 self.evict(seq);
             }
         }
@@ -730,6 +841,7 @@ impl AttestationPool {
         missing_root: [u8; 32],
         data_hash: [u8; 32],
         verification_source: Option<[u8; 32]>,
+        verified_pubkey_sha3: [u8; 32],
     ) -> GossipDecision {
         while self.pending.len() >= MAX_PENDING_ATTESTATIONS {
             // Oldest first. `keys().next()` on a BTreeMap is the smallest
@@ -762,7 +874,12 @@ impl AttestationPool {
         }
         self.pending.insert(
             seq,
-            PendingEntry { att, missing_root, verification_source },
+            PendingEntry {
+                att,
+                missing_root,
+                verification_source,
+                verified_pubkey_sha3,
+            },
         );
         GossipDecision::Hold { missing_root }
     }
@@ -822,6 +939,7 @@ impl AttestationPool {
 mod tests {
     use super::*;
     use crate::attestation::AttestationData;
+    use std::cell::Cell;
     use std::collections::BTreeSet;
 
     /// A signature is "valid" iff it equals the signing root — same device as
@@ -839,6 +957,13 @@ mod tests {
         }
     }
 
+    struct FixedKey(&'static [u8]);
+    impl crate::attestation::KeyLookup for FixedKey {
+        fn pubkey(&self, _v: u32) -> Option<&[u8]> {
+            Some(self.0)
+        }
+    }
+
     impl SignatureVerifier for RootEchoVerifier {
         fn verify_with_key(&self, _pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
             sig == root
@@ -850,7 +975,15 @@ mod tests {
     struct PanicVerifier;
     impl SignatureVerifier for PanicVerifier {
         fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
-            panic!("pending-capacity preflight must run before signature verification")
+            panic!("this path must finish before signature verification")
+        }
+    }
+
+    struct CountingRejectVerifier(Cell<usize>);
+    impl SignatureVerifier for CountingRejectVerifier {
+        fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            self.0.set(self.0.get() + 1);
+            false
         }
     }
 
@@ -987,11 +1120,46 @@ mod tests {
 
         // Block arrives, becomes queryable, waiters are replayed.
         blocks.insert(root(0xAA));
-        let released = pool.on_block(&root(0xAA), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
+        let released = pool.on_block(&root(0xAA), CURRENT_SLOT, &committees(), &known(&blocks), &PanicVerifier, &AnyKey);
         assert_eq!(released.len(), 1);
         assert!(is_accept(&released[0].1));
         assert_eq!(pool.pending_len(), 0);
         assert_eq!(pool.accepted_hashes(CURRENT_SLOT, 1).len(), 1);
+    }
+
+    #[test]
+    fn authenticated_replay_reverifies_and_fails_closed_if_registry_key_changes() {
+        let mut pool = AttestationPool::new();
+        let mut blocks = [root(0x22)].into_iter().collect::<BTreeSet<_>>();
+        let a = att(1, CURRENT_SLOT, 0xAA);
+        assert!(matches!(
+            pool.process(
+                a,
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &FixedKey(b"registry-key-a"),
+            ),
+            GossipDecision::Hold { .. }
+        ));
+
+        blocks.insert(root(0xAA));
+        let verifier = CountingRejectVerifier(Cell::new(0));
+        let released = pool.on_block(
+            &root(0xAA),
+            CURRENT_SLOT,
+            &committees(),
+            &known(&blocks),
+            &verifier,
+            &FixedKey(b"registry-key-b"),
+        );
+        assert_eq!(verifier.0.get(), 1, "changed key must spend a fresh verification");
+        assert!(matches!(
+            released.as_slice(),
+            [(_, GossipDecision::Reject(RejectReason::BadSignature))]
+        ));
+        assert!(pool.accepted_hashes(CURRENT_SLOT, 1).is_empty());
     }
 
     #[test]
@@ -1022,13 +1190,13 @@ mod tests {
         // Head arrives but the target (an epoch-boundary block, racing too)
         // has not: the full pipeline re-runs and re-holds under the target.
         blocks.insert(root(0xAA));
-        let released = pool.on_block(&root(0xAA), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
+        let released = pool.on_block(&root(0xAA), CURRENT_SLOT, &committees(), &known(&blocks), &PanicVerifier, &AnyKey);
         assert_eq!(released.len(), 1);
         assert!(matches!(released[0].1, GossipDecision::Hold { missing_root } if missing_root == root(0x22)));
         assert_eq!(pool.pending_len(), 1);
 
         blocks.insert(root(0x22));
-        let released = pool.on_block(&root(0x22), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
+        let released = pool.on_block(&root(0x22), CURRENT_SLOT, &committees(), &known(&blocks), &PanicVerifier, &AnyKey);
         assert_eq!(released.len(), 1);
         assert!(is_accept(&released[0].1));
     }
