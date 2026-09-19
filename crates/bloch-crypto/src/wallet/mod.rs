@@ -164,7 +164,11 @@ impl Wallet {
         version: SeedVersion,
         network: Network,
     ) -> Result<Self, WalletError> {
-        let seed_bytes = seed.to_seed_bytes_versioned(version, passphrase)?;
+        // Own the returned master-seed copy under zeroizing drop for the
+        // complete (potentially slow) hybrid key-generation call.
+        let seed_bytes = Zeroizing::new(
+            seed.to_seed_bytes_versioned(version, passphrase)?,
+        );
         // ML-DSA-65 keygen from 32-byte seed
         let (public, secret) = crypto::generate_keypair_from_seed(&seed_bytes[..32])
             .map_err(|e| WalletError::Crypto(e.to_string()))?;
@@ -466,6 +470,34 @@ mod tests {
         // from_seed()/generate() must be the V2 default, never silently V1.
         let default = Wallet::from_seed(&seed, Network::Mainnet).unwrap();
         assert_eq!(default.address().to_string(), v2.address().to_string());
+    }
+
+    #[test]
+    fn wallet_master_seed_consumer_uses_exact_zeroizing_array() {
+        let seed = SeedPhrase::parse(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        ).unwrap();
+        let mut seed_bytes = Zeroizing::new(
+            seed.to_seed_bytes_versioned(SeedVersion::V2Bip39Sha512, "TREZOR")
+                .unwrap(),
+        );
+        assert!(std::mem::needs_drop::<Zeroizing<[u8; 64]>>());
+        let (expected_public, expected_secret) =
+            crypto::generate_keypair_from_seed(&seed_bytes[..32]).unwrap();
+        let expected_secret = Zeroizing::new(expected_secret);
+        let wallet = Wallet::from_seed_versioned(
+            &seed,
+            "TREZOR",
+            SeedVersion::V2Bip39Sha512,
+            Network::Mainnet,
+        ).unwrap();
+        assert_eq!(wallet.keypair.public, expected_public);
+        assert_eq!(wallet.keypair.secret.as_slice(), expected_secret.as_slice());
+
+        // Structural evidence only: this proves the production owner type and
+        // its array implement Zeroize, not the contents of storage after Drop.
+        seed_bytes.zeroize();
+        assert!(seed_bytes.iter().all(|byte| *byte == 0));
     }
 
     /// K-M3: `recover_ambiguous` must return BOTH candidates, never guess.
