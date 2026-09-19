@@ -88,6 +88,12 @@ entry_count="$(
 for artifact in bloch-pos SHA256SUMS BUILD-INFO; do
   [ -f "$stage/$artifact" ] && [ ! -L "$stage/$artifact" ] \
     || fail "container export $artifact must be a regular non-symlink file"
+  unsafe_write_count="$(
+    find "$stage/$artifact" \( -perm -020 -o -perm -002 \) -exec printf x \; \
+      | wc -c | tr -d '[:space:]'
+  )"
+  [ "$unsafe_write_count" = 0 ] \
+    || fail "container export $artifact must not be writable by group or others"
 done
 [ -x "$stage/bloch-pos" ] || fail "container did not export bloch-pos"
 binary_sha="$(validated_sha256_file "$stage/bloch-pos")"

@@ -127,6 +127,7 @@ case "${FAKE_MANIFEST_MODE:-canonical}" in
   omit-binary) printf '%s  BUILD-INFO\n' "$build_info_sha" > "$stage/SHA256SUMS" ;;
   *) exit 64 ;;
 esac
+chmod 0644 "$stage/SHA256SUMS" "$stage/BUILD-INFO"
 if [ -n "${FAKE_SYMLINK_ARTIFACT:-}" ]; then
   artifact="$FAKE_SYMLINK_ARTIFACT"
   target="$context/engine-export-$artifact"
@@ -141,6 +142,12 @@ case "${FAKE_EXTRA_ENTRY:-none}" in
   fifo) mkfifo "$stage/unexpected-fifo" ;;
   *) exit 66 ;;
 esac
+case "${FAKE_UNSAFE_MODE_ARTIFACT:-}" in
+  '') ;;
+  bloch-pos) chmod 0777 "$stage/bloch-pos" ;;
+  SHA256SUMS|BUILD-INFO) chmod 0666 "$stage/$FAKE_UNSAFE_MODE_ARTIFACT" ;;
+  *) exit 67 ;;
+esac
 ENGINE
 chmod 0755 "$fake_engine"
 
@@ -152,6 +159,7 @@ run_wrapper() {
   local artifact_duplicate="${10:-0}"
   local symlink_artifact="${11:-}"
   local extra_entry="${12:-none}"
+  local unsafe_mode_artifact="${13:-}"
   FAKE_MANIFEST_MODE="$mode" FAKE_DEPLOYMENT_AUTHORIZED="$authorized" \
     FAKE_DUPLICATE_DEPLOYMENT_AUTHORIZED="$duplicate" \
     FAKE_SIGNED="$signed" FAKE_DUPLICATE_SIGNED="$signed_duplicate" \
@@ -161,6 +169,7 @@ run_wrapper() {
     FAKE_DUPLICATE_ARTIFACT_KIND="$artifact_duplicate" \
     FAKE_SYMLINK_ARTIFACT="$symlink_artifact" \
     FAKE_EXTRA_ENTRY="$extra_entry" \
+    FAKE_UNSAFE_MODE_ARTIFACT="$unsafe_mode_artifact" \
     CONTAINER_ENGINE="$fake_engine" \
     bash scripts/build-pos-release-container.sh "$output"
 }
@@ -246,6 +255,25 @@ expect_extra_entry_failure() {
   }
 }
 
+expect_unsafe_mode_failure() {
+  local artifact="$1" output="$work/unsafe-mode-$1" log="$work/unsafe-mode-$1.log"
+  if run_wrapper canonical "$output" false 0 false 0 "" 0 \
+      canonical-container-candidate 0 "" none "$artifact" > "$log" 2>&1; then
+    echo "selftest: wrapper accepted unsafe write mode on $artifact" >&2
+    exit 1
+  fi
+  grep -Fq "container export $artifact must not be writable by group or others" \
+      "$log" || {
+    echo "selftest: unsafe $artifact mode failed without expected diagnostic" >&2
+    cat "$log" >&2
+    exit 1
+  }
+  [ ! -e "$output" ] || {
+    echo "selftest: wrapper published output after rejecting unsafe $artifact mode" >&2
+    exit 1
+  }
+}
+
 run_wrapper canonical "$work/canonical" > "$work/canonical.log" 2>&1
 grep -Fq 'build-pos-release-container: PASS' "$work/canonical.log"
 cmp -s <(printf '%s  bloch-pos\n' "$(
@@ -255,6 +283,15 @@ cmp -s <(printf '%s  bloch-pos\n' "$(
     shasum -a 256 "$work/canonical/bloch-pos" | awk '{print $1}'
   fi
 )") "$work/canonical/SHA256SUMS"
+
+( umask 000
+  run_wrapper canonical "$work/canonical-umask-000"
+) > "$work/canonical-umask-000.log" 2>&1
+grep -Fq 'build-pos-release-container: PASS' "$work/canonical-umask-000.log"
+[ "$(find "$work/canonical-umask-000/bloch-pos" -prune -perm 0755 -exec printf x \;)" = x ]
+for artifact in SHA256SUMS BUILD-INFO; do
+  [ "$(find "$work/canonical-umask-000/$artifact" -prune -perm 0644 -exec printf x \;)" = x ]
+done
 
 expect_sha_failure exit 'SHA-256 tool failed for exported bloch-pos'
 expect_sha_failure short \
@@ -271,6 +308,9 @@ for artifact in bloch-pos SHA256SUMS BUILD-INFO; do
 done
 for mode in regular dotfile subdir fifo; do
   expect_extra_entry_failure "$mode"
+done
+for artifact in bloch-pos SHA256SUMS BUILD-INFO; do
+  expect_unsafe_mode_failure "$artifact"
 done
 
 manifest_error='exported SHA256SUMS is not the exact canonical one-line manifest'
