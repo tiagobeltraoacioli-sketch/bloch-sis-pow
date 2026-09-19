@@ -689,6 +689,7 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         live: false,
         needs_sync: false,
         orphans: VecDeque::new(),
+        deferred_orphans: VecDeque::new(),
         orphans_evicted: 0,
         orphans_admitted: 0,
         blocks_pruned: 0,

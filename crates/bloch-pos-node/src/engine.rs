@@ -464,11 +464,13 @@ fn validator_duties_blocked(
     stale_head_quarantined: bool,
     ready_future_blocks_pending: bool,
     held_attestations_pending: bool,
+    deferred_orphans_pending: bool,
 ) -> bool {
     in_boot_grace
         || stale_head_quarantined
         || ready_future_blocks_pending
         || held_attestations_pending
+        || deferred_orphans_pending
 }
 
 const NO_TXS: [PosTransaction; 0] = [];
@@ -695,6 +697,10 @@ const REORG_STATE_WINDOW: usize = 2;
 /// recovered by the `get_blocks` request the parking sets `needs_sync` for —
 /// which is why evicting here costs a round trip and never a fork.
 const ORPHAN_MAX: usize = 256;
+/// Parked blocks re-tried between two slot-loop control points. One promotion
+/// can execute a transition, rebuild fork choice, and unlock more work, so it
+/// receives the same one-block slice as ordinary admitted blocks.
+const ORPHAN_PROMOTIONS_PER_TURN: usize = 1;
 
 /// Distinct authenticated proposals retained per genesis validator duty.
 /// One is the protocol intent; two preserve the complete equivocation pair.
@@ -1568,6 +1574,10 @@ struct Engine {
     /// asked for over the wire. That is what makes eviction cheap: the worst
     /// case is a round trip, never a missed branch.
     orphans: VecDeque<([u8; 32], BlockEnvelope, Source)>,
+    /// Previously parked blocks made judgeable by a landed parent or registry
+    /// growth. FIFO preserves the old worklist's breadth-first ordering while
+    /// promotion is cooperatively sliced by the slot loop.
+    deferred_orphans: VecDeque<([u8; 32], BlockEnvelope, Source)>,
     /// Orphans dropped at the cap, and orphans later connected. Counted so
     /// "the bound is holding" is a measurement rather than an inference — a
     /// pool with evictions and zero admissions is a node that is not syncing.
@@ -2639,64 +2649,52 @@ impl Engine {
         true
     }
 
-    /// Ingest `env` and then everything it unblocks.
+    /// Ingest the caller's envelope and queue anything it unblocks.
     ///
-    /// The orphan pool means one arrival can connect a chain of parked
-    /// blocks, and that promotion is a WORKLIST rather than recursion on
-    /// purpose: `ingest_one` calls `advance`, which calls `apply_block`, and
-    /// [`ORPHAN_MAX`] nested copies of that stack is a crash a peer chooses
-    /// the depth of. Here the depth is one frame no matter how long the
-    /// parked chain is.
+    /// The verdict belongs only to the caller's envelope. Previously this
+    /// method synchronously drained a bounded orphan worklist; the same FIFO
+    /// now lives on `Engine` so the slot loop can give each promotion a fresh
+    /// control turn without losing breadth-first ordering.
     fn ingest_from_judged(&mut self, env: BlockEnvelope, src: Source) -> Verdict {
-        let mut queue: VecDeque<(BlockEnvelope, Source)> = VecDeque::new();
-        queue.push_back((env, src));
-        // The verdict belongs to the envelope the CALLER handed in — the
-        // first one out of the queue — and to no other. Blocks promoted out
-        // of the orphan pool below arrived on their own gossip message and
-        // were judged then; charging their outcome to the peer that relayed
-        // the block which merely unblocked them would punish it for the one
-        // thing it did right.
-        let mut verdict: Option<Verdict> = None;
-        // Bounded: every iteration either drops the envelope or takes one
-        // entry out of `orphans`, and `orphans` is capped.
-        while let Some((next, next_source)) = queue.pop_front() {
-            let (v, landing) = self.ingest_one(next, next_source);
-            verdict.get_or_insert(v);
-            let Some((landed, grew_registry)) = landing else {
-                continue;
-            };
-            // Whatever was waiting on the block that just landed can be
-            // tried now, in arrival order.
-            //
-            // `grew_registry` widens that to the WHOLE pool for one reason:
-            // a block carrying a `Deposit` registers a validator index, and
-            // blocks parked for an unregistered proposer are exactly the ones
-            // that identity was missing for. Without this they would sit
-            // until eviction even though the node can now check them.
-            // Deposits are rare (and gated off entirely today), so the sweep
-            // is not on any hot path.
-            let mut i = 0;
-            while i < self.orphans.len() {
-                if grew_registry || self.orphans[i].1.header.parent == landed {
-                    // `i < len` (loop guard), so `remove` is `Some`; the
-                    // `else` is unreachable and ends the sweep.
-                    let Some((_, env, orphan_source)) = self.orphans.remove(i) else {
-                        break;
-                    };
-                    self.orphans_admitted = self.orphans_admitted.saturating_add(1);
-                    queue.push_back((env, orphan_source));
-                } else {
-                    // cannot overflow: i < self.orphans.len().
-                    #[allow(clippy::arithmetic_side_effects)]
-                    {
-                        i += 1;
-                    }
+        let (verdict, landing) = self.ingest_one(env, src);
+        if let Some((landed, grew_registry)) = landing {
+            self.schedule_unblocked_orphans(landed, grew_registry);
+        }
+        verdict
+    }
+
+    fn schedule_unblocked_orphans(&mut self, landed: [u8; 32], grew_registry: bool) {
+        let mut i = 0;
+        while i < self.orphans.len() {
+            if grew_registry || self.orphans[i].1.header.parent == landed {
+                let Some((_, env, orphan_source)) = self.orphans.remove(i) else {
+                    break;
+                };
+                self.orphans_admitted = self.orphans_admitted.saturating_add(1);
+                let id = *env.block_id().as_bytes();
+                self.deferred_orphans.push_back((id, env, orphan_source));
+            } else {
+                #[allow(clippy::arithmetic_side_effects)]
+                {
+                    i += 1;
                 }
             }
         }
-        // An empty queue cannot happen — one envelope always goes in — but
-        // `Ignore` is the answer that charges nobody if it ever did.
-        verdict.unwrap_or(Verdict::Ignore)
+    }
+
+    /// Promote at most one previously parked block. Its prior gossip verdict
+    /// was already `Ignore`; no result here is attributed to the parent relay.
+    fn release_orphan_turn(&mut self) -> bool {
+        for _ in 0..ORPHAN_PROMOTIONS_PER_TURN {
+            let Some((_, env, source)) = self.deferred_orphans.pop_front() else {
+                break;
+            };
+            let (_, landing) = self.ingest_one(env, source);
+            if let Some((landed, grew_registry)) = landing {
+                self.schedule_unblocked_orphans(landed, grew_registry);
+            }
+        }
+        !self.deferred_orphans.is_empty()
     }
 
     /// One envelope through the door.
@@ -3026,17 +3024,26 @@ impl Engine {
 
     /// Park a block whose parent is unknown, and ask the mesh for the gap.
     ///
-    /// Deduplicated by id, so a mesh that hands the same orphan back on every
-    /// heartbeat occupies one slot rather than the whole pool.
+    /// Deduplicated by id across both waiting and ready-to-promote tails, so a
+    /// mesh that hands the same orphan back on every heartbeat occupies one
+    /// slot rather than the whole pool.
     fn park_orphan(&mut self, id: [u8; 32], env: BlockEnvelope, src: Source) {
-        if self.orphans.iter().any(|(seen, _, _)| *seen == id) {
+        if self.orphans.iter().any(|(seen, _, _)| *seen == id)
+            || self.deferred_orphans.iter().any(|(seen, _, _)| *seen == id)
+        {
             return;
         }
-        // FIFO: at the cap the OLDEST goes, since its parent has had the
-        // longest to arrive and has not.
-        while self.orphans.len() >= ORPHAN_MAX {
+        // The parked and ready-to-promote queues share one hard cap. Prefer
+        // evicting the oldest still-blocked orphan; a connected block already
+        // queued for its bounded promotion turn must not be displaced by new
+        // remote work. If the ready tail alone fills the cap, drop the new
+        // orphan (still an Ignore verdict, never peer guilt).
+        while self.orphans.len().saturating_add(self.deferred_orphans.len()) >= ORPHAN_MAX {
             if self.orphans.pop_front().is_some() {
                 self.orphans_evicted = self.orphans_evicted.saturating_add(1);
+            } else {
+                self.orphans_evicted = self.orphans_evicted.saturating_add(1);
+                return;
             }
         }
         self.orphans.push_back((id, env, src));
@@ -5560,6 +5567,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         live: false,
         needs_sync: false,
         orphans: VecDeque::new(),
+        deferred_orphans: VecDeque::new(),
         orphans_evicted: 0,
         orphans_admitted: 0,
         blocks_pruned: 0,
@@ -5967,12 +5975,14 @@ pub fn run(cfg: Config) -> io::Result<()> {
             slot,
             FUTURE_BLOCKS_PER_TURN,
         );
+        let deferred_orphans_pending = engine.release_orphan_turn();
         let held_attestations_pending = engine.release_held_turn();
 
         if let Some(stop) = cfg.stop_at_slot {
             if slot >= stop
                 && !ready_future_blocks_pending
                 && !held_attestations_pending
+                && !deferred_orphans_pending
             {
                 if engine.store.flush_rewrite()? {
                     if let Err(e) = engine.write_local_cache() {
@@ -6030,6 +6040,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
             stale_head_quarantined,
             ready_future_blocks_pending,
             held_attestations_pending,
+            deferred_orphans_pending,
         )
             || engine.store.rewrite_pending();
 
@@ -6131,11 +6142,16 @@ pub fn run(cfg: Config) -> io::Result<()> {
             NodeMetrics::set(&NODE.slot_secs, (engine.manifest.slot_ms / 1000).max(1));
             NodeMetrics::set(&NODE.last_applied_unix, engine.last_applied_ms / 1000);
             // Blocks parked rather than admitted: orphans waiting on a
-            // missing parent, plus branches the finality latch refused (R3
+            // missing parent, connected orphans awaiting their cooperative
+            // promotion turn, plus branches the finality latch refused (R3
             // M-1) rather than deleted.
             NodeMetrics::set(
                 &NODE.blocks_parked,
-                engine.orphans.len().saturating_add(engine.parked_refused_finality.len()) as u64,
+                engine
+                    .orphans
+                    .len()
+                    .saturating_add(engine.deferred_orphans.len())
+                    .saturating_add(engine.parked_refused_finality.len()) as u64,
             );
             // Once per slot, not per turn: `peer_counts` is cheap but
             // `statvfs` is a syscall against the data volume.
@@ -6184,9 +6200,12 @@ pub fn run(cfg: Config) -> io::Result<()> {
             finality_stalled = stalled_now;
         }
 
-        if ready_future_blocks_pending || held_attestations_pending {
+        if ready_future_blocks_pending
+            || held_attestations_pending
+            || deferred_orphans_pending
+        {
             // Do not sleep or process a second admitted-work batch before the
-            // next slot/duty check. Both deferred pools are capped, so this
+            // next slot/duty check. All deferred pools are capped, so this
             // immediate drain is itself bounded.
             continue;
         }
@@ -8344,6 +8363,7 @@ mod transfer_v2_end_to_end {
             live: true,
             needs_sync: false,
             orphans: VecDeque::new(),
+            deferred_orphans: VecDeque::new(),
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
@@ -9460,6 +9480,7 @@ mod perf_support {
             live: true,
             needs_sync: false,
             orphans: VecDeque::new(),
+            deferred_orphans: VecDeque::new(),
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
@@ -11205,6 +11226,7 @@ mod duty_view_anchor {
             live: true,
             needs_sync: false,
             orphans: VecDeque::new(),
+            deferred_orphans: VecDeque::new(),
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
@@ -11487,6 +11509,7 @@ mod slot_horizon {
             doppelganger_observe_until: None,
             doppelganger_halted: false,
             orphans: VecDeque::new(),
+            deferred_orphans: VecDeque::new(),
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
@@ -11856,6 +11879,47 @@ mod ingest_admission_tests {
     }
 
     #[test]
+    fn deferred_orphan_tail_shares_the_hard_cap_and_deduplication() {
+        let (mut engine, _dir, template, _stored) = fixture();
+        let landed = [0xA7; 32];
+
+        for i in 0..ORPHAN_MAX {
+            let mut env = template.clone();
+            env.header.parent = landed;
+            env.header.slot = (i as u64).saturating_add(2);
+            let id = *env.block_id().as_bytes();
+            engine.park_orphan(id, env, Source::Gossip(Some([0xD7; 32])));
+        }
+        engine.schedule_unblocked_orphans(landed, false);
+        assert!(engine.orphans.is_empty());
+        assert_eq!(engine.deferred_orphans.len(), ORPHAN_MAX);
+
+        let duplicate = engine.deferred_orphans[ORPHAN_MAX / 2].1.clone();
+        let duplicate_id = *duplicate.block_id().as_bytes();
+        engine.park_orphan(duplicate_id, duplicate, Source::Gossip(Some([0xD8; 32])));
+        assert_eq!(engine.deferred_orphans.len(), ORPHAN_MAX, "ready tail deduplicates");
+        assert_eq!(engine.orphans_evicted, 0, "a duplicate is not an eviction");
+
+        let mut fresh = template.clone();
+        fresh.header.parent = [0xB8; 32];
+        fresh.header.slot = (ORPHAN_MAX as u64).saturating_add(20);
+        let fresh_id = *fresh.block_id().as_bytes();
+        engine.park_orphan(fresh_id, fresh.clone(), Source::Gossip(Some([0xD9; 32])));
+        assert!(engine.orphans.is_empty(), "new work cannot exceed a full ready tail");
+        assert_eq!(engine.deferred_orphans.len(), ORPHAN_MAX);
+        assert_eq!(engine.orphans_evicted, 1, "the bounded drop is observable");
+
+        engine.deferred_orphans.pop_front().expect("one promotion turn");
+        engine.park_orphan(fresh_id, fresh, Source::Gossip(Some([0xD9; 32])));
+        assert_eq!(engine.orphans.len(), 1);
+        assert_eq!(
+            engine.orphans.len().saturating_add(engine.deferred_orphans.len()),
+            ORPHAN_MAX,
+            "one released slot admits exactly one new orphan",
+        );
+    }
+
+    #[test]
     fn third_genesis_key_proposal_for_one_duty_is_ignored_without_peer_blame() {
         // Building the real hybrid-signature fixture can cross a wall-clock
         // slot in an unoptimised/full-suite run. Pin the test clock so the
@@ -11915,7 +11979,7 @@ mod ingest_admission_tests {
         assert!(pending, "one ready block must remain for a fresh loop turn");
         assert_eq!(engine.future_blocks.len(), 1);
         assert!(
-            validator_duties_blocked(false, false, pending, false),
+            validator_duties_blocked(false, false, pending, false, false),
             "duties cannot sign from a partially released future view",
         );
 
@@ -11923,7 +11987,7 @@ mod ingest_admission_tests {
         assert!(!pending);
         assert!(engine.future_blocks.is_empty());
         assert_eq!(engine.orphans.len(), 2, "neither ready block was stranded");
-        assert!(!validator_duties_blocked(false, false, pending, false));
+        assert!(!validator_duties_blocked(false, false, pending, false, false));
     }
 
     #[test]
@@ -12409,14 +12473,60 @@ mod ingest_admission_tests {
 
         // Then the parent, which must pull the child in behind it.
         engine.ingest_judged_from_source(b1.clone(), Some(parent_source));
-        assert!(engine.orphans.is_empty(), "the child was promoted");
+        assert!(engine.orphans.is_empty(), "the child left the parked pool");
+        assert_eq!(engine.deferred_orphans.len(), 1, "promotion is scheduled");
         assert!(engine.orphans_admitted >= 1, "and the promotion was counted");
+        assert_eq!(*engine.head_id().as_bytes(), *b1.block_id().as_bytes());
+        assert!(!engine.release_orphan_turn(), "the one-child tail is drained");
         assert_eq!(
             *engine.head_id().as_bytes(),
             *b2.block_id().as_bytes(),
             "out-of-order delivery must still land on the same head as in-order \
              delivery — a bounded pool that never releases is just a slower leak"
         );
+    }
+
+    #[test]
+    fn reverse_orphan_chain_promotes_one_block_per_control_turn() {
+        let _clock = validator_lifecycle::clock_at(32);
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let genesis = *engine.head_id().as_bytes();
+        let mut chain = Vec::new();
+        for slot in 1..=5 {
+            engine.propose(slot);
+            chain.push(engine.blocks[engine.head_id().as_bytes()].clone());
+        }
+        assert!(engine.do_reorg(genesis, Vec::new()));
+        for block in &chain {
+            engine.blocks.remove(block.block_id().as_bytes()).expect("stored proposal");
+        }
+
+        let source = [0xE1; 32];
+        for block in chain[1..].iter().rev() {
+            assert_eq!(
+                engine.ingest_judged_from_source(block.clone(), Some(source)),
+                Verdict::Ignore,
+            );
+        }
+        assert_eq!(engine.orphans.len(), 4);
+
+        assert_eq!(
+            engine.ingest_judged_from_source(chain[0].clone(), Some([0xE2; 32])),
+            Verdict::Accept,
+        );
+        assert_eq!(engine.deferred_orphans.len(), 1);
+        assert_eq!(engine.orphans.len(), 3);
+        assert_eq!(*engine.head_id().as_bytes(), *chain[0].block_id().as_bytes());
+
+        for expected in &chain[1..4] {
+            assert!(engine.release_orphan_turn(), "a later child remains queued");
+            assert_eq!(engine.deferred_orphans.len(), 1);
+            assert_eq!(*engine.head_id().as_bytes(), *expected.block_id().as_bytes());
+        }
+        assert!(!engine.release_orphan_turn(), "the final child drains the tail");
+        assert!(engine.deferred_orphans.is_empty());
+        assert!(engine.orphans.is_empty());
+        assert_eq!(*engine.head_id().as_bytes(), *chain[4].block_id().as_bytes());
     }
 
     /// **The slot bound is a rule about PEERS, not about this node's own
@@ -13416,7 +13526,7 @@ mod stale_head_duty_gate_tests {
     #[test]
     fn a_normal_one_slot_head_gap_does_not_block_duties() {
         assert!(!node_is_behind(99, 100, 50_000, 0, 20_000));
-        assert!(!validator_duties_blocked(false, false, false, false));
+        assert!(!validator_duties_blocked(false, false, false, false, false));
     }
 
     #[test]
@@ -13431,17 +13541,22 @@ mod stale_head_duty_gate_tests {
         assert!(behind);
         let mut gate = DutySyncGate::default();
         assert!(gate.update(behind, 90, 100, 50_001, 20_000));
-        assert!(validator_duties_blocked(false, true, false, false));
+        assert!(validator_duties_blocked(false, true, false, false, false));
     }
 
     #[test]
     fn boot_grace_uses_the_same_final_gate() {
-        assert!(validator_duties_blocked(true, false, false, false));
+        assert!(validator_duties_blocked(true, false, false, false, false));
     }
 
     #[test]
     fn deferred_attestation_tail_uses_the_same_final_gate() {
-        assert!(validator_duties_blocked(false, false, false, true));
+        assert!(validator_duties_blocked(false, false, false, true, false));
+    }
+
+    #[test]
+    fn deferred_orphan_tail_uses_the_same_final_gate() {
+        assert!(validator_duties_blocked(false, false, false, false, true));
     }
 
     #[test]
