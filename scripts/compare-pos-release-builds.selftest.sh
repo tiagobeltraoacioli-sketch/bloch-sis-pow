@@ -28,12 +28,44 @@ signed=false
 deployment_authorized=false
 EOF
 }
+expect_failure() {
+  local label="$1" expected="$2"
+  shift 2
+  local output="$work/failure-output"
+  if "$@" >"$output" 2>&1; then
+    echo "selftest: $label was accepted" >&2
+    exit 1
+  fi
+  if ! grep -Fq -- "$expected" "$output"; then
+    echo "selftest: $label failed without expected message: $expected" >&2
+    cat "$output" >&2
+    exit 1
+  fi
+}
 make_fixture "$work/a"
 cp -R "$work/a" "$work/b"
 bash scripts/compare-pos-release-builds.sh "$work/a" "$work/b" >/dev/null
-if bash scripts/compare-pos-release-builds.sh "$work/a" "$work/a" >/dev/null 2>&1; then
-  echo "selftest: one directory was accepted as two builders" >&2; exit 1
-fi
+expect_failure "one directory as two builders" \
+  "the two inputs resolve to the same directory" \
+  bash scripts/compare-pos-release-builds.sh "$work/a" "$work/a"
+
+for file in bloch-pos SHA256SUMS BUILD-INFO; do
+  hardlink_dir="$work/hardlink-$file"
+  cp -R "$work/a" "$hardlink_dir"
+  rm "$hardlink_dir/$file"
+  ln "$work/a/$file" "$hardlink_dir/$file"
+  expect_failure "hardlinked $file" \
+    "the two inputs alias the same filesystem object for $file" \
+    bash scripts/compare-pos-release-builds.sh "$work/a" "$hardlink_dir"
+
+  symlink_dir="$work/symlink-$file"
+  cp -R "$work/a" "$symlink_dir"
+  rm "$symlink_dir/$file"
+  ln -s "$work/a/$file" "$symlink_dir/$file"
+  expect_failure "symlinked $file" \
+    "$symlink_dir/$file must not be a symlink" \
+    bash scripts/compare-pos-release-builds.sh "$work/a" "$symlink_dir"
+done
 
 chmod 0644 "$work/b/bloch-pos"
 if bash scripts/compare-pos-release-builds.sh "$work/a" "$work/b" >/dev/null 2>&1; then

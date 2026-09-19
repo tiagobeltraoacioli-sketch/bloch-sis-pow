@@ -28,6 +28,7 @@ for dir in "$a" "$b"; do
   [ -d "$dir" ] || fail "not a directory: $dir"
   for file in bloch-pos SHA256SUMS BUILD-INFO; do
     [ -f "$dir/$file" ] || fail "missing $dir/$file"
+    [ ! -L "$dir/$file" ] || fail "$dir/$file must not be a symlink"
   done
   [ -x "$dir/bloch-pos" ] || fail "$dir/bloch-pos is not executable"
   [ "$(wc -l < "$dir/BUILD-INFO" | tr -d ' ')" = 8 ] \
@@ -49,6 +50,10 @@ a_real="$(cd "$a" && pwd -P)"
 b_real="$(cd "$b" && pwd -P)"
 [ "$a_real" != "$b_real" ] \
   || fail "the two inputs resolve to the same directory; obtain a second builder output"
+for file in bloch-pos SHA256SUMS BUILD-INFO; do
+  [ ! "$a/$file" -ef "$b/$file" ] \
+    || fail "the two inputs alias the same filesystem object for $file"
+done
 
 cmp -s "$a/bloch-pos" "$b/bloch-pos" || fail "binary bytes differ"
 cmp -s "$a/BUILD-INFO" "$b/BUILD-INFO" || fail "complete BUILD-INFO differs"
