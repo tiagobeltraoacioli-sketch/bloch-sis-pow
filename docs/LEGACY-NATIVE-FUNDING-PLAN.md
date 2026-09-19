@@ -10,9 +10,11 @@ Output zero pays the SHA3-256 of the same public key with the suite-1 header
 added. Output one returns change to the original legacy hash (first 20 bytes
 of SHA3-256 of the raw public key, followed by twelve zeros). Adding the
 public-key header changes the script identity but does not generate a new
-private key. The three tests cover conservation/encoding, rejected limits,
-and a real disposable hybrid signature verified with both representations.
-This does not constitute mainnet transaction qualification.
+private key. The tests cover conservation/encoding, rejected limits, and real
+disposable hybrid signatures verified with both representations. The signing
+self-check uses the known raw-key/enveloped-signature format explicitly, then
+retains raw and generic compatibility routes for historical artifacts. This
+does not constitute mainnet transaction qualification.
 
 Build and test:
 

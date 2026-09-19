@@ -40,6 +40,16 @@ struct Plan {
     native: [u8; 32],
     fee: u64,
 }
+fn verify_native_funding_signature(
+    raw_public_key: &[u8],
+    enveloped_public_key: &[u8],
+    root: &[u8],
+    signature: &[u8],
+) -> bool {
+    bloch_crypto::crypto::verify_enveloped(enveloped_public_key, root, signature)
+        || bloch_crypto::crypto::verify_legacy_hybrid_raw(raw_public_key, root, signature)
+        || bloch_crypto::crypto::verify(raw_public_key, root, signature)
+}
 fn plan(
     pubkey: Vec<u8>,
     txid: [u8; 32],
@@ -160,7 +170,7 @@ where
     }
     let signature = key.sign(&root)?;
     if signature.len() > ADMISSION_PQ_SIGNATURE_MAX
-        || !bloch_crypto::crypto::verify(raw, &root, &signature)
+        || !verify_native_funding_signature(raw, &p.native_key, &root, &signature)
     {
         return Err("Signature failed verification or exceeds reservation".into());
     }
@@ -315,6 +325,78 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicit_policy_handles_native_output_and_magic_prefixed_raw_signature() {
+        use bloch_crypto::wallet::Keypair;
+
+        const SEARCH_COUNTER: u64 = 105_369;
+        const SIGNING_SEED_HEX: &str =
+            "64038e4870402819c277e50da7cb01cbc1705c30b5ac906c331bfba4447ac9fd";
+        const ROOT_HEX: &str =
+            "c12158dd9805338f49702e9a92ea0c0e57522113731dcdd3391c4b9168f28e68";
+
+        let (public, secret) =
+            bloch_crypto::crypto::generate_keypair_from_seed(&[0x71; 32]).unwrap();
+        let raw_public_key = public[4..].to_vec();
+        let key = Keypair {
+            private_key: secret[4..].to_vec(),
+            public_key: raw_public_key.clone(),
+            address: bloch_crypto::crypto::address_from_pubkey(&raw_public_key, false),
+        };
+        let mut p = plan(
+            public[4..].to_vec(),
+            [2; 32],
+            1,
+            4_000_000_000_000,
+            2_500_001_000_000,
+            10,
+            5,
+            1_000_000,
+        )
+        .unwrap();
+        let root = p.tx.checked_signing_root(5000);
+        assert_eq!(hex(&root), ROOT_HEX);
+        let draft = p.tx.canonical_bytes();
+
+        let mut h = Sha3_256::new();
+        h.update(b"bloch/native-funding/cr10/signing-rng/v1");
+        h.update(SEARCH_COUNTER.to_le_bytes());
+        let signing_seed: [u8; 32] = h.finalize().into();
+        assert_eq!(hex(&signing_seed), SIGNING_SEED_HEX);
+        pqcrypto_internals::with_seeded_rng_scope(&signing_seed, || {
+            sign_checked(&mut p, &draft, 5000, root, || Ok(key)).unwrap()
+        });
+
+        let PosTransaction::TransferV2 { keys, .. } = &p.tx else {
+            unreachable!()
+        };
+        let enveloped_signature = &keys[0].signature;
+        assert!(verify_native_funding_signature(
+            &raw_public_key,
+            &public,
+            &root,
+            enveloped_signature,
+        ));
+        assert!(bloch_crypto::crypto::verify_enveloped_canonical(
+            &public,
+            &root,
+            enveloped_signature,
+        ));
+
+        let raw_signature =
+            &enveloped_signature[bloch_crypto::crypto::SUITE_HEADER_LEN..];
+        assert_eq!(&raw_signature[..2], &[0xb1, 0x0c]);
+        assert!(
+            !bloch_crypto::crypto::verify(&raw_public_key, &root, raw_signature),
+            "generic autodetection must misclassify this genuine raw signature"
+        );
+        assert!(verify_native_funding_signature(
+            &raw_public_key,
+            &public,
+            &root,
+            raw_signature,
+        ));
+    }
     #[test]
     fn preserves_key_authority_and_conserves_value() {
         let p = plan(
