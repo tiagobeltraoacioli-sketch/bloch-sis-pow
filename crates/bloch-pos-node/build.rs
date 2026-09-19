@@ -72,7 +72,7 @@ use std::process::Command;
 
 mod build_command;
 use build_command::{
-    configured_command_words, delegated_compiler, linker_from_printed_args, rustflags_linker,
+    command_from_env, delegated_compiler, linker_from_printed_args, rustflags_linker,
 };
 
 /// Extensions that are build inputs for this binary.
@@ -294,14 +294,14 @@ fn configured_tool_digests(target: &str, host: &str) -> Vec<(String, String)> {
         let Ok(value) = std::env::var(&key) else {
             continue;
         };
-        let Some(words) = configured_command_words(&value) else {
+        let Some((words, search_path)) = command_from_env(&value) else {
             continue;
         };
-        if let Some(digest) = build_tool_digest(&words[0]) {
+        if let Some(digest) = build_tool_digest_with_path(&words[0], search_path.as_deref()) {
             digests.push((key.clone(), digest));
         }
         if let Some(delegate) = delegated_compiler(&words) {
-            if let Some(digest) = build_tool_digest(delegate) {
+            if let Some(digest) = build_tool_digest_with_path(delegate, search_path.as_deref()) {
                 digests.push((format!("{key}:delegate"), digest));
             }
         }

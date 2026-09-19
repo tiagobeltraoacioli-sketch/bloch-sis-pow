@@ -113,13 +113,11 @@ fn environment_assignment(word: &str) -> bool {
             .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
 }
 
-/// Extract the executable and any effective PATH override from stable rustc
-/// `--print link-args` output. Unix rustc may prefix the linker with `env`,
-/// unsets and assignments; other targets commonly print the linker directly.
-/// Unknown options and a bare command after PATH was cleared fail closed
-/// instead of fingerprinting a same-named executable from the build script's
-/// different environment.
-pub(crate) fn linker_from_printed_args(output: &str) -> Option<(String, Option<String>)> {
+/// Extract a command and any effective PATH override from a direct or
+/// `env`-wrapped command line. Unknown options and a bare command after PATH
+/// was cleared fail closed instead of fingerprinting a same-named executable
+/// from the build script's different environment.
+pub(crate) fn command_from_env(output: &str) -> Option<(Vec<String>, Option<String>)> {
     let words = configured_command_words(output)?;
     let first = words.first()?;
     let is_env = Path::new(first)
@@ -129,7 +127,7 @@ pub(crate) fn linker_from_printed_args(output: &str) -> Option<(String, Option<S
             name.eq_ignore_ascii_case("env") || name.eq_ignore_ascii_case("env.exe")
         });
     if !is_env {
-        return Some((first.clone(), None));
+        return Some((words, None));
     }
 
     let mut index = 1usize;
@@ -171,11 +169,19 @@ pub(crate) fn linker_from_printed_args(output: &str) -> Option<(String, Option<S
                 if !has_path && path_cleared && path_override.is_none() {
                     return None;
                 }
-                return Some((command.to_owned(), path_override));
+                return Some((words[index..].to_vec(), path_override));
             }
         }
     }
     None
+}
+
+/// Extract the executable and effective PATH from stable rustc
+/// `--print link-args` output. The remaining linker arguments are intentionally
+/// ignored after the shared command parser has identified their boundary.
+pub(crate) fn linker_from_printed_args(output: &str) -> Option<(String, Option<String>)> {
+    let (words, search_path) = command_from_env(output)?;
+    Some((words.first()?.clone(), search_path))
 }
 
 #[cfg(test)]
@@ -258,5 +264,22 @@ mod tests {
         assert_eq!(linker_from_printed_args("env --unknown cc one.o"), None);
         assert_eq!(linker_from_printed_args("env -u SDKROOT"), None);
         assert_eq!(linker_from_printed_args(""), None);
+    }
+
+    #[test]
+    fn env_wrapped_build_tools_preserve_arguments_and_effective_path() {
+        assert_eq!(
+            command_from_env("env PATH=/reviewed/bin sccache clang -O2"),
+            Some((
+                vec!["sccache".into(), "clang".into(), "-O2".into()],
+                Some("/reviewed/bin".into()),
+            ))
+        );
+        assert_eq!(
+            command_from_env("ccache clang -O2"),
+            Some((vec!["ccache".into(), "clang".into(), "-O2".into()], None))
+        );
+        assert_eq!(command_from_env("env --unknown cc"), None);
+        assert_eq!(command_from_env("env -u PATH cc"), None);
     }
 }
