@@ -188,12 +188,24 @@ impl HdWallet {
 
     /// Fallible import for untrusted or exhausted wallet files. On failure the
     /// wallet is unchanged; this consumes the supplied keypair. Keep its backup.
-    /// Both import entry points report exhaustion without panicking or wrapping.
+    /// Both import entry points report exhaustion or inconsistent key material
+    /// without panicking or wrapping.
     pub fn try_import_keypair(&mut self, keypair: Keypair, label: &str) -> Result<(), String> {
         let current_index = self.addresses.iter().map(|(i, _, _)| *i).max()
             .ok_or_else(|| "HD wallet contains no addresses".to_string())?;
         let next_index = current_index
             .checked_add(1).ok_or_else(|| "HD address index exhausted".to_string())?;
+
+        let testnet = keypair.address.starts_with(TESTNET_PREFIX);
+        if crypto::address_from_pubkey(&keypair.public_key, testnet) != keypair.address {
+            return Err("imported keypair public key does not match address".into());
+        }
+        let proof = keypair.sign_message(IMPORT_KEY_AUTH_CHALLENGE)
+            .map_err(|_| "imported keypair private key is invalid".to_string())?;
+        if !Keypair::verify_message(&keypair.public_key, IMPORT_KEY_AUTH_CHALLENGE, &proof) {
+            return Err("imported keypair private/public keys do not match".into());
+        }
+
         self.addresses.push((next_index, keypair, label.to_string()));
         self.imported.insert(next_index);
         Ok(())
@@ -376,6 +388,10 @@ fn validate_wallet_structure(wallet: &HdWalletFile) -> Result<(), String> {
 
 /// Current wallet-file version. v3 = keys derived from the BIP39 seed.
 const WALLET_VERSION: u32 = 3;
+
+/// Non-exported proof-of-possession challenge used only while admitting a new
+/// imported keypair. The signature is immediately discarded.
+const IMPORT_KEY_AUTH_CHALLENGE: &[u8] = b"BLOCH-HD-WALLET-IMPORT-AUTH-v1";
 
 /// Derive the keypair for `index` from the BIP39 seed.
 ///
@@ -830,5 +846,50 @@ mod audit_wallet_boundaries {
             "HD wallet contains no addresses");
         assert!(wallet.addresses.is_empty());
         assert!(wallet.imported.is_empty());
+    }
+
+    #[test]
+    fn import_rejects_inconsistent_key_material_without_mutating_wallet() {
+        let mut wallet = HdWallet::recover(
+            &Mnemonic::from_entropy(&[43;32]).unwrap().to_string(),
+            None, "fixture-password", true, 1,
+        ).unwrap();
+        let original_address = wallet.addresses[0].1.address.clone();
+        let first = derive_at(&wallet.seed, 7, true).unwrap();
+        let second = derive_at(&wallet.seed, 8, true).unwrap();
+
+        let wrong_address = Keypair {
+            private_key: first.private_key.clone(),
+            public_key: first.public_key.clone(),
+            address: second.address.clone(),
+        };
+        assert_eq!(wallet.try_import_keypair(wrong_address, "wrong-address").unwrap_err(),
+            "imported keypair public key does not match address");
+
+        let mismatched_keys = Keypair {
+            private_key: first.private_key.clone(),
+            public_key: second.public_key.clone(),
+            address: second.address.clone(),
+        };
+        assert_eq!(wallet.try_import_keypair(mismatched_keys, "mismatched").unwrap_err(),
+            "imported keypair private/public keys do not match");
+        assert_eq!(wallet.addresses.len(), 1);
+        assert_eq!(wallet.addresses[0].1.address, original_address);
+        assert!(wallet.imported.is_empty());
+
+        wallet.try_import_keypair(first, "valid").unwrap();
+        assert_eq!(wallet.addresses.len(), 2);
+        assert!(wallet.imported.contains(&1));
+
+        let third = derive_at(&wallet.seed, 9, true).unwrap();
+        let raw_public = third.public_key[crypto::SUITE_HEADER_LEN..].to_vec();
+        let raw_legacy = Keypair {
+            private_key: third.private_key[crypto::SUITE_HEADER_LEN..].to_vec(),
+            address: crypto::address_from_pubkey(&raw_public, true),
+            public_key: raw_public,
+        };
+        wallet.try_import_keypair(raw_legacy, "valid-legacy-raw").unwrap();
+        assert_eq!(wallet.addresses.len(), 3);
+        assert!(wallet.imported.contains(&2));
     }
 }
