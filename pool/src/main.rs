@@ -80,6 +80,11 @@ struct Cli {
     /// key controlling their payout address).
     #[arg(long)]
     no_auth_proof: bool,
+
+    /// Require suite-enveloped, canonical ownership-proof signatures.
+    /// Historical raw proofs are accepted when this opt-in flag is absent.
+    #[arg(long)]
+    canonical_auth_proof: bool,
 }
 
 #[tokio::main]
@@ -134,13 +139,15 @@ async fn main() {
         confirm_depth: cli.confirm_depth.max(1),
         journal:      if cli.journal.is_empty() { None } else { Some(cli.journal) },
         require_auth_proof: !cli.no_auth_proof,
+        canonical_auth_proof: cli.canonical_auth_proof,
     };
     info!("payouts → {} | fee {} bps | share bits 0x{:08x} | PPLNS window {} shares \
-           | confirm depth {} | journal {} | ownership proof {}",
+           | confirm depth {} | journal {} | ownership proof {} ({})",
         cfg.pool_address, cfg.fee_bps, cfg.share_bits, cfg.pplns_window,
         cfg.confirm_depth,
         cfg.journal.as_deref().unwrap_or("OFF (memory-only)"),
-        if cfg.require_auth_proof { "required" } else { "OFF" });
+        if cfg.require_auth_proof { "required" } else { "OFF" },
+        if cfg.canonical_auth_proof { "canonical" } else { "compatible" });
 
     let pool = match PoolState::new(cfg) {
         Ok(p) => Arc::new(p),

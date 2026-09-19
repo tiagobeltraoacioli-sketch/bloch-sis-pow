@@ -279,6 +279,7 @@ dependencies = [
  "hex",
  "log",
  "parking_lot",
+ "pqcrypto-internals",
  "rand 0.8.6",
  "serde",
  "serde_json",
