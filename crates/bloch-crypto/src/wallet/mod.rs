@@ -1257,10 +1257,13 @@ mod legacy_sign_tests {
     /// outcome may authenticate the corrupted wallet record.
     #[test]
     fn corrupted_legacy_raw_secret_never_authenticates() {
-        let (pk_env, sk_env) = crypto::generate_keypair();
-        let mut raw_sk = sk_env[crypto::SUITE_HEADER_LEN..].to_vec();
-        let middle = raw_sk.len() / 2;
-        raw_sk[middle] ^= 0x80;
+        let (pk_env, _) = crypto::generate_keypair();
+        // Use a different, structurally valid secret of the exact legacy raw
+        // length. Flipping an arbitrary byte is not a reliable corruption:
+        // Falcon's encoded secret can contain representation bits that do not
+        // change the effective key, making this regression probabilistic.
+        let (_, unrelated_sk_env) = crypto::generate_keypair();
+        let raw_sk = unrelated_sk_env[crypto::SUITE_HEADER_LEN..].to_vec();
         let kp = Keypair {
             private_key: raw_sk,
             public_key: pk_env.clone(),

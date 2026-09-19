@@ -92,6 +92,25 @@ pub struct HdWallet {
     file_version: u32,
 }
 
+/// Resource policy for loading an HD-wallet backup.
+///
+/// The historical [`HdWallet::load`] and [`HdWallet::load_with_file_limit`]
+/// entry points intentionally keep accepting every wallet that fits their
+/// existing byte budget. Callers handling untrusted or unusually large
+/// backups can opt into this stricter policy without changing the on-disk
+/// format or making old backups unrecoverable through the compatibility APIs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HdWalletLoadLimits {
+    /// Maximum bytes read from the wallet file.
+    pub max_file_bytes: usize,
+    /// Maximum total address records decrypted and retained in memory.
+    pub max_addresses: usize,
+    /// Maximum `derived: true` records rederived from the mnemonic and checked.
+    /// This separately accounts for the expensive diversified-key derivation
+    /// performed after decryption; imported/legacy records do not consume it.
+    pub max_derived_key_checks: usize,
+}
+
 impl Drop for HdWallet {
     fn drop(&mut self) { self.master_key.zeroize(); self.seed.zeroize(); }
 }
@@ -284,9 +303,46 @@ impl HdWallet {
     /// Explicit bounded recovery override for large authentic backups (maximum 512 MiB).
     /// The budget covers input bytes; parsed allocations and KDF work are additional.
     pub fn load_with_file_limit(path: &Path, mnemonic_str: &str, passphrase: Option<&str>, password: &str, max_bytes: usize) -> Result<Self, String> {
+        Self::load_internal(path, mnemonic_str, passphrase, password, max_bytes, None)
+    }
+
+    /// Load with explicit aggregate address and derived-key work limits.
+    ///
+    /// Both counters are checked after the bounded JSON parse but before the
+    /// master-key KDF or any ciphertext/key derivation work. Exact-limit files
+    /// are accepted; exceeding either counter fails closed without trying the
+    /// supplied credentials.
+    pub fn load_with_limits(
+        path: &Path,
+        mnemonic_str: &str,
+        passphrase: Option<&str>,
+        password: &str,
+        limits: HdWalletLoadLimits,
+    ) -> Result<Self, String> {
+        Self::load_internal(
+            path,
+            mnemonic_str,
+            passphrase,
+            password,
+            limits.max_file_bytes,
+            Some(limits),
+        )
+    }
+
+    fn load_internal(
+        path: &Path,
+        mnemonic_str: &str,
+        passphrase: Option<&str>,
+        password: &str,
+        max_bytes: usize,
+        limits: Option<HdWalletLoadLimits>,
+    ) -> Result<Self, String> {
         let bytes = crate::util::read_wallet_file(path, max_bytes).map_err(|e| e.to_string())?;
         let wallet: HdWalletFile = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
         validate_wallet_structure(&wallet)?;
+        if let Some(limits) = limits {
+            validate_wallet_load_limits(&wallet, limits)?;
+        }
 
         // Parse mnemonic
         let mnemonic = Mnemonic::parse(mnemonic_str)
@@ -380,6 +436,26 @@ fn validate_wallet_structure(wallet: &HdWalletFile) -> Result<(), String> {
         if address.derived && !address.address.starts_with(prefix) {
             return Err("derived address and wallet network differ".into());
         }
+    }
+    Ok(())
+}
+
+fn validate_wallet_load_limits(
+    wallet: &HdWalletFile,
+    limits: HdWalletLoadLimits,
+) -> Result<(), String> {
+    if wallet.addresses.len() > limits.max_addresses {
+        return Err(format!(
+            "HD wallet address count {} exceeds configured limit {}",
+            wallet.addresses.len(), limits.max_addresses
+        ));
+    }
+    let derived_key_checks = wallet.addresses.iter().filter(|address| address.derived).count();
+    if derived_key_checks > limits.max_derived_key_checks {
+        return Err(format!(
+            "HD wallet derived-key check count {} exceeds configured limit {}",
+            derived_key_checks, limits.max_derived_key_checks
+        ));
     }
     Ok(())
 }
@@ -846,6 +922,86 @@ mod audit_wallet_boundaries {
             "HD wallet contains no addresses");
         assert!(wallet.addresses.is_empty());
         assert!(wallet.imported.is_empty());
+    }
+
+    #[test]
+    fn opt_in_load_limits_accept_exact_bounds_and_reject_excess_before_credentials() {
+        let crypto = encrypt_with_key(&[0; 32], b"fixture").unwrap();
+        let address = |index, derived| HdAddress {
+            index,
+            address: format!("{}fixture-{index}", TESTNET_PREFIX),
+            label: format!("address-{index}"),
+            keypair_crypto: crypto.clone(),
+            derived,
+        };
+        let mut file = HdWalletFile {
+            version: 3,
+            format: "hd-wallet-v1".into(),
+            network: "testnet".into(),
+            mnemonic_crypto: crypto.clone(),
+            addresses: vec![address(0, true), address(1, false), address(2, true)],
+            created_at: String::new(),
+            description: String::new(),
+        };
+
+        let exact = HdWalletLoadLimits {
+            max_file_bytes: crate::util::DEFAULT_WALLET_FILE_LIMIT,
+            max_addresses: 3,
+            max_derived_key_checks: 2,
+        };
+        assert!(validate_wallet_load_limits(&file, exact).is_ok());
+
+        let address_excess = HdWalletLoadLimits { max_addresses: 2, ..exact };
+        assert_eq!(
+            validate_wallet_load_limits(&file, address_excess).unwrap_err(),
+            "HD wallet address count 3 exceeds configured limit 2"
+        );
+        let derivation_excess = HdWalletLoadLimits { max_derived_key_checks: 1, ..exact };
+        assert_eq!(
+            validate_wallet_load_limits(&file, derivation_excess).unwrap_err(),
+            "HD wallet derived-key check count 2 exceeds configured limit 1"
+        );
+
+        // Exercise the public path with deliberately invalid credentials. The
+        // resource error must win, proving it is returned before mnemonic
+        // parsing, Argon2 and per-address decryption.
+        file.addresses.truncate(1);
+        file.addresses[0].derived = false;
+        let bytes = serde_json::to_vec(&file).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "bloch-hd-load-limits-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, &bytes).unwrap();
+        let rejected = HdWallet::load_with_limits(
+            &path,
+            "not a mnemonic",
+            None,
+            "wrong",
+            HdWalletLoadLimits {
+                max_file_bytes: bytes.len(),
+                max_addresses: 0,
+                max_derived_key_checks: 0,
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(rejected.contains("address count 1 exceeds configured limit 0"));
+        let admitted = HdWallet::load_with_limits(
+            &path,
+            "not a mnemonic",
+            None,
+            "wrong",
+            HdWalletLoadLimits {
+                max_file_bytes: bytes.len(),
+                max_addresses: 1,
+                max_derived_key_checks: 0,
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(admitted.contains("invalid mnemonic"));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
