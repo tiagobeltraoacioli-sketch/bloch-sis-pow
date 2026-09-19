@@ -12,9 +12,11 @@ three owners already had wiping drop behavior, their lexical lifetime extended
 through the complete address-decryption and derived-key verification loop after
 the mnemonic comparison had succeeded.
 
-That loop is deliberately bounded for the ordinary loader but may still process
-many records.  Neither the authenticated plaintext, its borrowed or Serde-owned
-parsed view, nor the canonical KDF string is needed once equality is established.
+The loop is explicitly count/work-bounded under `load_bounded`; the historical
+compatibility loaders remain bounded only by their file-byte budget and may
+still process many records.  Neither the authenticated plaintext, its borrowed
+or Serde-owned parsed view, nor the canonical KDF string is needed once equality
+is established.
 
 ## Correction and invariants
 
