@@ -56,8 +56,6 @@ sha() {
   if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}';
   else shasum -a 256 "$1" | awk '{print $1}'; fi
 }
-HASH="$(sha "$BIN")"
-
 # ── signing key, resolved BEFORE anything is assembled ───────────────────────
 # Fail closed and fail early: an unsigned rollback package must not exist even
 # transiently, because a tarball on disk is indistinguishable from a released
@@ -78,12 +76,7 @@ SECKEY="${BLOCH_ROLLBACK_SECKEY:-}"
 }
 [ -f "$SECKEY" ] || { echo "FAIL: no such minisign secret key: $SECKEY" >&2; exit 1; }
 
-# Short id for filenames: the parenthesised commit if present, else the hash.
-ID="$(printf '%s' "$STAMP" | sed -n 's/.*(\([0-9a-f]\{7,\}\)).*/\1/p')"
-ID="${ID:-${HASH:0:12}}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/bloch-pos-rollback.XXXXXX")"
-PKGDIR="$WORK/bloch-pos-rollback-$ID"
-mkdir -p "$PKGDIR" "$OUTDIR"
 
 PUBFILE="${BLOCH_ROLLBACK_PUBKEY:-}"
 if [ -z "$PUBFILE" ]; then
@@ -95,17 +88,31 @@ fi
 PUBLINE="$(grep -v '^untrusted comment:' "$PUBFILE" | tr -d '[:space:]')"
 [ -n "$PUBLINE" ] || { echo "FAIL: $PUBFILE holds no minisign public key line" >&2; exit 1; }
 
-# If the binary runs on this host, refuse a stamp that contradicts it — a
-# rollback package whose label lies is worse than none.
-if V="$("$BIN" --version 2>/dev/null)"; then
+# Copy the caller-controlled path exactly once into the private work directory.
+# Every identity and package byte below comes from this snapshot, never from a
+# path that can be swapped between hashing, version inspection and assembly.
+SNAPSHOT="$WORK/input-bloch-pos"
+cp "$BIN" "$SNAPSHOT"
+chmod 0755 "$SNAPSHOT"
+
+# If the private snapshot runs on this host, refuse a stamp that contradicts
+# it. Compute its identity only after execution because even an executable that
+# rewrites itself during --version must leave one consistently named byte set.
+if V="$("$SNAPSHOT" --version 2>/dev/null)"; then
   case "$V" in
     *"$STAMP"*) : ;;
     *) echo "STAMP MISMATCH: --version says '$V', you said '$STAMP'." >&2; exit 1 ;;
   esac
 fi
+HASH="$(sha "$SNAPSHOT")"
 
-cp "$BIN" "$PKGDIR/bloch-pos"
-chmod 0755 "$PKGDIR/bloch-pos"
+# Short id for filenames: the parenthesised commit if present, else the hash.
+ID="$(printf '%s' "$STAMP" | sed -n 's/.*(\([0-9a-f]\{7,\}\)).*/\1/p')"
+ID="${ID:-${HASH:0:12}}"
+PKGDIR="$WORK/bloch-pos-rollback-$ID"
+mkdir -p "$PKGDIR" "$OUTDIR"
+
+mv "$SNAPSHOT" "$PKGDIR/bloch-pos"
 
 printf 'stamp: %s\n' "$STAMP" > "$PKGDIR/STAMP"
 

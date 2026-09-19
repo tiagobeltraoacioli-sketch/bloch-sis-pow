@@ -200,7 +200,51 @@ verify paste "$W/case-paste" "$W/rel.pub"
 expect_fail paste "a valid signature from another package is refused" \
   "signed statement does not name"
 
-# ── 12. --verify-only changes nothing ──────────────────────────────────────
+# ── 12. an input that rewrites itself during --version stays coherent ───────
+MUTATING_STAMP='0.0.1-self-mutating (feedface1234)'
+cat > "$W/self-mutating-bloch-pos" <<'MUTATING'
+#!/usr/bin/env bash
+stamp='0.0.1-self-mutating (feedface1234)'
+if [ "${1:-}" = --version ]; then
+  printf 'bloch-pos-node %s before-mutation\n' "$stamp"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    "echo 'bloch-pos-node $stamp final-private-bytes'" > "$0"
+  chmod 0755 "$0"
+fi
+MUTATING
+chmod 0755 "$W/self-mutating-bloch-pos"
+BLOCH_ROLLBACK_SECKEY="$W/rel.key" BLOCH_ROLLBACK_PUBKEY="$W/rel.pub" \
+  "$ASSEMBLER" "$W/self-mutating-bloch-pos" "$MUTATING_STAMP" \
+  "$W/dist-mutating" > "$W/mutating-assemble.log" 2>&1 || {
+  echo "FAIL: self-mutating input assembly failed"
+  sed 's/^/       /' "$W/mutating-assemble.log"
+  exit 1
+}
+MUTATING_TARBALL="$W/dist-mutating/bloch-pos-rollback-feedface1234.tar.gz"
+mkdir -p "$W/x-mutating"
+tar -xzf "$MUTATING_TARBALL" -C "$W/x-mutating"
+MUTATING_PKG="$W/x-mutating/bloch-pos-rollback-feedface1234"
+MUTATING_HASH="$(sha256sum "$MUTATING_PKG/bloch-pos" | awk '{print $1}')"
+MUTATING_MANIFEST_HASH="$(awk '$2 == "bloch-pos" { print $1 }' \
+  "$MUTATING_PKG/SHA256SUMS")"
+MUTATING_INSTALL_HASH="$(sed -n 's/^PACKAGE_BINARY_SHA256=//p' \
+  "$MUTATING_PKG/install.sh")"
+MUTATING_STATEMENT="$(minisign -V -Q -p "$W/rel.pub" \
+  -x "$MUTATING_PKG/SHA256SUMS.minisig" \
+  -m "$MUTATING_PKG/SHA256SUMS")"
+if [ "$MUTATING_HASH" = "$MUTATING_MANIFEST_HASH" ] \
+   && [ "$MUTATING_HASH" = "$MUTATING_INSTALL_HASH" ] \
+   && grep -Fq "sha256(bloch-pos) = $MUTATING_HASH" "$MUTATING_PKG/README" \
+   && printf '%s\n' "$MUTATING_STATEMENT" | grep -Fq \
+        "sha256(bloch-pos)=$MUTATING_HASH"; then
+  ok "self-mutating input has one binary identity in package, manifest, installer, README and signature"
+else
+  bad "self-mutating input produced conflicting binary identities"
+fi
+verify mutating "$MUTATING_PKG" "$W/rel.pub"
+expect_ok mutating "self-mutating input's final private bytes verify"
+
+# ── 13. --verify-only changes nothing ──────────────────────────────────────
 if grep -q 'Nothing was installed' "$W/good.out" \
    && ! grep -qE 'systemctl|install -m 0755' "$W/good.out"; then
   ok "--verify-only stages nothing and restarts nothing"
