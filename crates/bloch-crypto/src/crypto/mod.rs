@@ -71,11 +71,24 @@ pub(crate) fn wrap_envelope(suite: u16, body: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Assemble the repository-owned hybrid secret body under wiping ownership.
+/// The public key-generation APIs still return their final secret-key `Vec`
+/// for compatibility; this protects the additional pre-envelope copy.
+fn hybrid_secret_body(mldsa: &[u8], falcon: &[u8]) -> zeroize::Zeroizing<Vec<u8>> {
+    let mut body = zeroize::Zeroizing::new(Vec::with_capacity(
+        mldsa.len().saturating_add(falcon.len()),
+    ));
+    body.extend_from_slice(mldsa);
+    body.extend_from_slice(falcon);
+    body
+}
+
 pub fn generate_keypair() -> (Vec<u8>, Vec<u8>) {
     let (mpk, msk) = mldsa65::keypair();
     let (fpk, fsk) = falcon::keypair();
+    let fsk = zeroize::Zeroizing::new(fsk);
     let mut pk = mpk.as_bytes().to_vec(); pk.extend_from_slice(&fpk);
-    let mut sk = msk.as_bytes().to_vec(); sk.extend_from_slice(&fsk);
+    let sk = hybrid_secret_body(msk.as_bytes(), &fsk);
     // Enveloped under suite 0x0001 (magic ‖ 01 00 ‖ body). The enveloped pk is
     // THE public key everywhere (keygen, address hashing, script_sig) so
     // addresses become suite-committing (design §2.4).
@@ -132,8 +145,9 @@ pub fn generate_keypair_from_seed(seed: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Cry
     let ((mpk, msk), (fpk, fsk)) = pqcrypto_internals::with_seeded_rng_scope(&seed32, || {
         (mldsa65::keypair(), falcon::keypair())
     });
+    let fsk = zeroize::Zeroizing::new(fsk);
     let mut pk = mpk.as_bytes().to_vec(); pk.extend_from_slice(&fpk);
-    let mut sk = msk.as_bytes().to_vec(); sk.extend_from_slice(&fsk);
+    let sk = hybrid_secret_body(msk.as_bytes(), &fsk);
     Ok((wrap_envelope(SUITE_MLDSA65_FALCON1024, &pk),
         wrap_envelope(SUITE_MLDSA65_FALCON1024, &sk)))
 }
@@ -552,6 +566,18 @@ pub enum CryptoError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hybrid_keygen_secret_body_has_exact_zeroizing_ownership() {
+        use zeroize::Zeroize;
+
+        let _: fn(&[u8], &[u8]) -> zeroize::Zeroizing<Vec<u8>> = hybrid_secret_body;
+        let mut body = hybrid_secret_body(&[0x11, 0x22], &[0x33, 0x44, 0x55]);
+
+        assert!(std::mem::needs_drop::<zeroize::Zeroizing<Vec<u8>>>());
+        assert_eq!(&body[..], &[0x11, 0x22, 0x33, 0x44, 0x55]);
+        body.zeroize();
+        assert!(body.is_empty() || body.iter().all(|byte| *byte == 0));
+    }
     #[test] fn sign_verify_roundtrip() {
         let (pk, sk) = generate_keypair();
         let sig = sign(&sk, b"test").unwrap();
