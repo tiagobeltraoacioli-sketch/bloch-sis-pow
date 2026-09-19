@@ -78,6 +78,13 @@ impl Reservation {
     pub(crate) fn verification_source(&self) -> [u8; 32] {
         self.source.verification_key()
     }
+
+    /// Exact bounded wire bytes charged when this immutable event entered the
+    /// first-hop queue. Receive paths prove the decoded canonical size before
+    /// the guarded event reaches later queue accounting.
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
 }
 
 impl Registry {

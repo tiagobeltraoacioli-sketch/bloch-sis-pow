@@ -5883,7 +5883,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 if !inflight.try_reserve(&ev) {
                     continue; // shed and counted; the transport stays healthy
                 }
-                let size = net::queued_bytes(&ev);
+                let size = net::charged_bytes(&ev);
                 if tx.send(EngineEvent::Net(ev)).is_err() {
                     inflight.release_raw(size);
                     return; // engine gone; nothing left to deliver to
@@ -6685,11 +6685,13 @@ pub fn run(cfg: Config) -> io::Result<()> {
             }
             for ev in pending {
                     // Every `EngineEvent::Net` was reserved in the budget by
-                    // the transport; releasing it here — after handling, not
-                    // on dequeue — is what makes the cap mean "work the engine
-                    // has not done yet". The release charges the same pure
-                    // size function the reservation did, so the two cancel
-                    // exactly (see `net::queued_bytes`).
+                    // the transport; releasing it as the event leaves this
+                    // queue, immediately before handling, keeps accounting
+                    // independent of handler success. The release uses the
+                    // exact validated wire charge carried by the transport
+                    // reservation, so it cancels admission without
+                    // reserializing the payload.
+                    // Source-free work falls back to its canonical size.
                     if let EngineEvent::Net(ref net_ev) = ev {
                         inflight.release(net_ev);
                     }

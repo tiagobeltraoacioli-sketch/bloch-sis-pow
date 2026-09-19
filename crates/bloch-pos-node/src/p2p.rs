@@ -563,6 +563,13 @@ impl Origin {
         self.reservation.as_ref().map(|guard| guard.verification_source())
     }
 
+    /// Exact wire charge retained by the transport reservation after
+    /// canonical decoding. `None` is local/source-free work, which falls back
+    /// to computing its canonical size at queue admission.
+    pub(crate) fn reserved_bytes(&self) -> Option<usize> {
+        self.reservation.as_ref().map(|guard| guard.bytes())
+    }
+
     /// No provenance: devnet transport, or a message this node produced.
     pub fn none() -> Self {
         Origin {
@@ -1715,13 +1722,15 @@ fn on_gossip(
                 let origin = Origin {
                     inner: Some((message_id.clone(), source)),
                     block_hint: Some((source, slot)),
-                    reservation: Some(reservation),
+                    reservation: None,
                 };
-                let event = NetEvent::Block(env, origin);
+                let mut event = NetEvent::Block(env, origin);
                 if crate::net::queued_bytes(&event) != message.data.len() {
                     report(swarm, Verdict::Reject);
                     return true;
                 }
+                let NetEvent::Block(_, origin) = &mut event else { unreachable!() };
+                origin.set_reservation(reservation);
                 st.note_block(block_id);
                 return match st.emit(event, source) {
                     Some(alive) => alive,
@@ -1744,13 +1753,15 @@ fn on_gossip(
                 let origin = Origin {
                     inner: Some((message_id.clone(), source)),
                     block_hint: None,
-                    reservation: Some(reservation),
+                    reservation: None,
                 };
-                let event = NetEvent::Attestation(att, origin);
+                let mut event = NetEvent::Attestation(att, origin);
                 if crate::net::queued_bytes(&event) != message.data.len() {
                     report(swarm, Verdict::Reject);
                     return true;
                 }
+                let NetEvent::Attestation(_, origin) = &mut event else { unreachable!() };
+                origin.set_reservation(reservation);
                 return match st.emit(event, source) {
                     Some(alive) => alive,
                     None => { report(swarm, Verdict::Ignore); true }
@@ -1769,13 +1780,15 @@ fn on_gossip(
                 let origin = Origin {
                     inner: Some((message_id.clone(), source)),
                     block_hint: None,
-                    reservation: Some(reservation),
+                    reservation: None,
                 };
-                let event = NetEvent::Transaction(tx, origin);
+                let mut event = NetEvent::Transaction(tx, origin);
                 if crate::net::queued_bytes(&event) != message.data.len() {
                     report(swarm, Verdict::Reject);
                     return true;
                 }
+                let NetEvent::Transaction(_, origin) = &mut event else { unreachable!() };
+                origin.set_reservation(reservation);
                 return match st.emit(event, source) {
                     Some(alive) => alive,
                     None => { report(swarm, Verdict::Ignore); true }
@@ -1817,14 +1830,15 @@ fn admit_sync_envelope(st: &Loop, peer: PeerId, bytes: &[u8]) -> SyncEnvelopeAdm
         Err(e) => return SyncEnvelopeAdmission::Malformed(e),
     };
     let slot = env.header.slot;
-    let mut origin = Origin::sync_block(peer, slot);
-    origin.set_reservation(reservation);
-    let event = NetEvent::Block(env, origin);
+    let origin = Origin::sync_block(peer, slot);
+    let mut event = NetEvent::Block(env, origin);
     if crate::net::queued_bytes(&event) != bytes.len() {
         return SyncEnvelopeAdmission::Malformed(crate::codec::DecodeErr(
             "sync envelope is not canonical",
         ));
     }
+    let NetEvent::Block(_, origin) = &mut event else { unreachable!() };
+    origin.set_reservation(reservation);
     let engine_alive = st.emit(event, peer).unwrap_or(false);
     SyncEnvelopeAdmission::Admitted { slot, engine_alive }
 }
@@ -2387,6 +2401,12 @@ mod tests {
             SyncEnvelopeAdmission::Malformed(_)
         ));
         let bytes = crate::codec::encode_envelope(&envelope(73));
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(matches!(
+            admit_sync_envelope(&st, peer, &trailing),
+            SyncEnvelopeAdmission::Malformed(_)
+        ));
         assert!(matches!(
             admit_sync_envelope(&st, peer, &bytes),
             SyncEnvelopeAdmission::Admitted { slot: 73, engine_alive: true }

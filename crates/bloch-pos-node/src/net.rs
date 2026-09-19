@@ -299,15 +299,10 @@ pub fn class_of(ev: &NetEvent) -> EventClass {
 
 /// The bytes an event is charged to the budget: its canonical wire size.
 ///
-/// A PURE function of the event value, evaluated identically at reservation
-/// (`try_reserve`) and at release (`release`). That is the whole accounting
-/// invariant: because both sides compute the same number from the same value,
-/// `bytes` after a release equals `bytes` before the matching reservation,
-/// with no ticket to thread through the engine's event type. Encoding a block
-/// costs one allocation the size of the block; the engine already encodes
-/// every block it stores, and the hybrid signature check it runs on each is
-/// four orders of magnitude more expensive, so this is not on the critical
-/// path.
+/// A pure canonical-size function used at source-free admission and to prove
+/// decoded transport bytes are canonical. Transport reservations retain that
+/// proved size for later engine-queue reserve/release, avoiding repeated
+/// serialization of the same immutable payload.
 pub fn queued_bytes(ev: &NetEvent) -> usize {
     match ev {
         NetEvent::Block(env, _) => crate::codec::encode_envelope(env).len(),
@@ -318,6 +313,18 @@ pub fn queued_bytes(ev: &NetEvent) -> usize {
         }
         NetEvent::Transaction(tx, _) => tx.canonical_bytes().len(),
     }
+}
+
+/// Bytes charged to the engine-facing queue. Transport-originated events
+/// carry the exact validated wire charge in their private reservation;
+/// source-free/local events still compute their canonical size here.
+pub(crate) fn charged_bytes(ev: &NetEvent) -> usize {
+    let retained = match ev {
+        NetEvent::Block(_, origin)
+        | NetEvent::Attestation(_, origin)
+        | NetEvent::Transaction(_, origin) => origin.reserved_bytes(),
+    };
+    retained.unwrap_or_else(|| queued_bytes(ev))
 }
 
 /// Per-class share of [`ENGINE_QUEUE_BYTES_CAP`] a class may fill.
@@ -455,7 +462,7 @@ impl QueueBudget {
     /// invariants hold under any interleaving of any number of callers.
     pub fn try_reserve(&self, ev: &NetEvent) -> bool {
         let class = class_of(ev);
-        let size = queued_bytes(ev);
+        let size = charged_bytes(ev);
         let admitted = self.reserve_raw(class, size);
         if !admitted {
             self.shed_counter(class).fetch_add(1, Ordering::Relaxed);
@@ -490,10 +497,10 @@ impl QueueBudget {
         reserved
     }
 
-    /// Release the reservation made for `ev` — the same pure size function,
-    /// so the two calls cancel exactly.
+    /// Release the reservation made for `ev` using the same retained charge
+    /// as admission. Source-free work falls back to its canonical size.
     pub fn release(&self, ev: &NetEvent) {
-        self.release_raw(queued_bytes(ev));
+        self.release_raw(charged_bytes(ev));
     }
 
     /// Release a reservation whose event has already been moved away (the
@@ -1021,7 +1028,7 @@ fn send_to_engine(events: &Sender<EngineEvent>, budget: &QueueBudget, ev: NetEve
     if !budget.try_reserve(&ev) {
         return true; // shed, but the connection stays healthy
     }
-    let size = queued_bytes(&ev);
+    let size = charged_bytes(&ev);
     if events.send(EngineEvent::Net(ev)).is_err() {
         budget.release_raw(size);
         return false;
@@ -1958,7 +1965,7 @@ mod tests {
         drop(next);
         drop(rx);
         assert!(!send_from_ip(&tx, &budget, ip, event()));
-        assert_eq!(budget.inflight(), 0);
+        assert_eq!((budget.inflight(), budget.inflight_bytes()), (0, 0));
         // A dead receiver drops both the queue reservation and Origin guard.
         let (live_tx, live_rx) = mpsc::channel();
         assert!(send_from_ip(&live_tx, &budget, ip, event()));
@@ -2010,14 +2017,15 @@ mod tests {
         let (tx, rx) = mpsc::channel::<EngineEvent>();
         let budget = QueueBudget::with_caps(4, 1 << 20);
         let ip = "192.0.2.45".parse().unwrap();
-        let frame = att_frame(&sample_attestation());
+        let frame = block_frame(&sync_test_block());
         assert!(decode_and_send_from_ip(&tx, &budget, ip, &frame));
         assert_eq!(budget.inflight(), 1);
         assert_eq!(budget.inflight_bytes(), frame.len() - 1);
 
-        let EngineEvent::Net(event) = rx.recv().unwrap() else { panic!("network event") };
-        assert_eq!(class_of(&event), EventClass::Attestation);
+        let EngineEvent::Net(mut event) = rx.recv().unwrap() else { panic!("network event") };
+        assert_eq!(class_of(&event), EventClass::Block);
         assert_eq!(queued_bytes(&event), frame.len() - 1);
+        assert_eq!(charged_bytes(&event), frame.len() - 1);
         match &event {
             NetEvent::Block(_, origin)
             | NetEvent::Attestation(_, origin)
@@ -2025,6 +2033,14 @@ mod tests {
                 assert!(origin.verification_source().is_some())
             }
         }
+        // Queue consumers do not mutate events, but accounting must remain
+        // bound to the bytes that were actually reserved even on an
+        // unexpected internal mutation. Re-encoding at release would leak
+        // the difference here.
+        let NetEvent::Block(env, _) = &mut event else { unreachable!() };
+        env.proposer_sig.clear();
+        assert_ne!(queued_bytes(&event), frame.len() - 1);
+        assert_eq!(charged_bytes(&event), frame.len() - 1);
         budget.release(&event);
         drop(event);
         assert_eq!(budget.inflight(), 0);
@@ -2037,6 +2053,18 @@ mod tests {
             1,
             1 << 20,
         ).is_some(), "event drop must release the per-IP charge");
+    }
+
+    #[test]
+    fn source_free_queue_events_fall_back_to_canonical_size() {
+        let event = NetEvent::Attestation(sample_attestation(), Origin::none());
+        assert_eq!(charged_bytes(&event), queued_bytes(&event));
+        let budget = QueueBudget::with_caps(1, 1 << 20);
+        let expected = queued_bytes(&event);
+        assert!(budget.try_reserve(&event));
+        assert_eq!(budget.inflight_bytes(), expected);
+        budget.release(&event);
+        assert_eq!((budget.inflight(), budget.inflight_bytes()), (0, 0));
     }
 
     /// O06 — the invariant `count <= cap` holds under contention. Eight
