@@ -1394,8 +1394,8 @@ enum Refusal {
     /// transactions to clear", not "retry later" (which reads as "the whole
     /// network is busy") and not "these bytes are invalid" (they are not).
     TooManyFromSource,
-    /// This validator identity consumed its hybrid-verification allowance for
-    /// the wall slot. The caller may retry when the next slot starts.
+    /// The per-identity or aggregate lifecycle hybrid-verification allowance
+    /// is exhausted for the wall slot. The caller may retry next slot.
     LifecycleVerificationLimited { until_slot: u64 },
 }
 
@@ -4474,7 +4474,7 @@ impl Engine {
                     Err(RpcError::tx_refused_retryable(
                         until_slot,
                         format!("lifecycle authorization verification allowance is exhausted for \
-                                 this validator identity; retry from slot {until_slot}"),
+                                 this slot; retry from slot {until_slot}"),
                     )),
             },
 
