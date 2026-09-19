@@ -689,6 +689,7 @@ build-and-test:
     - python3 -I scripts/rehearse-validator-admission.py
     - python3 -I scripts/check-validator-lifecycle-mutations.py
     - python3 -I scripts/rehearse-validator-activation.py --output "$CI_PROJECT_DIR/.ci-validator-activation"
+    - python3 -I scripts/rehearse-validator-joining-network.py --output "$CI_PROJECT_DIR/.ci-validator-joining-network"
     - cargo build --workspace --all-targets
     - cargo test --locked -p bloch-pos-committee -p bloch-pos-node -p bloch-crypto -p coherence-core -p bloch-sis-pow -p bloch-pq-vault -p pqcrypto-internals -p genesis4-ceremony
   # Memory-hard wallet tests and long consensus reveal-chain tests still need

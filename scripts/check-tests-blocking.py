@@ -42,6 +42,8 @@ GitLab `.gitlab-ci.yml` job `build-and-test`, to the reviewed posture:
     removing it from either reviewed job fails independently.
   * the finite validator-activation boundary/replay rehearsal is blocking in
     both pipelines; removing it from either reviewed job fails independently.
+  * the independent-process funded-joining rehearsal is blocking in both
+    pipelines; removing it from either reviewed job fails independently.
   * the `tests-blocking-guard` job has the reviewed runner/timeout and exact
     ordered checkout, selftest and guard/rehearsal command sequence on GitHub;
     GitLab runs the same posture, toolchain, partition-report and activation
@@ -160,6 +162,7 @@ GITLAB_BUILD_TEST_SCRIPT = (
     "python3 -I scripts/rehearse-validator-admission.py",
     "python3 -I scripts/check-validator-lifecycle-mutations.py",
     'python3 -I scripts/rehearse-validator-activation.py --output "$CI_PROJECT_DIR/.ci-validator-activation"',
+    'python3 -I scripts/rehearse-validator-joining-network.py --output "$CI_PROJECT_DIR/.ci-validator-joining-network"',
     "cargo build --workspace --all-targets",
     "cargo test --locked -p bloch-pos-committee -p bloch-pos-node "
     "-p bloch-crypto -p coherence-core -p bloch-sis-pow -p bloch-pq-vault "
@@ -175,6 +178,7 @@ GITLAB_BUILD_TEST_BODY = (
     "- python3 -I scripts/rehearse-validator-admission.py",
     "- python3 -I scripts/check-validator-lifecycle-mutations.py",
     '- python3 -I scripts/rehearse-validator-activation.py --output "$CI_PROJECT_DIR/.ci-validator-activation"',
+    '- python3 -I scripts/rehearse-validator-joining-network.py --output "$CI_PROJECT_DIR/.ci-validator-joining-network"',
     "- cargo build --workspace --all-targets",
     "- cargo test --locked -p bloch-pos-committee -p bloch-pos-node "
     "-p bloch-crypto -p coherence-core -p bloch-sis-pow -p bloch-pq-vault "
@@ -193,7 +197,7 @@ CI_SCRIPT_ENTRYPOINT_SHA256 = {
     "scripts/check-live-node-retired-isolation.py":
         "45ece7368931469c2c64c161708009b41aebcbf3c1033fa75006e16d5e16518d",
     "scripts/check-tests-blocking.selftest.py":
-        "90c129dfd8bd812d452ba2d178c35ec067fc8e8a7fcc1074341c886d99fc9ee3",
+        "190470e049ad24c57e06fb6d27a2e6543d801f9d68c082d3a35dc423c948b39c",
     "scripts/check-validator-lifecycle-mutations.py":
         "12b477e5043bc3ea98387be33ca586976494b30083522b214cea7d88c0e9f429",
     "scripts/devnet-particao-report.test.py":
@@ -214,6 +218,9 @@ CI_SCRIPT_ENTRYPOINT_SHA256 = {
         "fb3b69d21805a6361d0737d64c50a225cf7a9d0389e954b8f0c0b049d99449e4",
 }
 CI_TRANSITIVE_ENTRYPOINT_REFERENCES = {
+    "scripts/rehearse-validator-activation.py": (
+        ("scripts/rehearse-validator-joining-network.py", "scripts/rehearse-validator-activation.py"),
+    ),
     "deploy/bootnodes/verify-bootnodes.sh": (
         ("deploy/bootnodes/verify-bootnodes.selftest.sh", "verify-bootnodes.sh"),
     ),
