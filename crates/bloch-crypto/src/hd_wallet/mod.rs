@@ -223,17 +223,17 @@ impl HdWallet {
         drop(canonical_mnemonic);
 
         // Address 0 is DERIVED from the seed, so the mnemonic recovers it.
-        let seed = mnemonic.to_seed(passphrase.unwrap_or("")).to_vec();
+        let mut seed = hd_seed_owner(&mnemonic, passphrase.unwrap_or(""));
         let kp = derive_at(&seed, 0, testnet)?;
         let network = if testnet { "testnet" } else { "mainnet" }.to_string();
 
         Ok(HdWallet {
             mnemonic,
-            seed,
             addresses: vec![(0, kp, "primary".to_string())],
             imported: BTreeSet::new(),
             network,
             file_version: WALLET_VERSION,
+            seed: std::mem::take(&mut *seed),
             master_key: std::mem::take(&mut *master_key),
         })
     }
@@ -257,7 +257,7 @@ impl HdWallet {
         let canonical_mnemonic = canonical_mnemonic_for_kdf(&mnemonic);
         let mut master_key = derive_master_key(&canonical_mnemonic, passphrase.unwrap_or(""), password, WALLET_VERSION)?;
         drop(canonical_mnemonic);
-        let seed = mnemonic.to_seed(passphrase.unwrap_or("")).to_vec();
+        let mut seed = hd_seed_owner(&mnemonic, passphrase.unwrap_or(""));
 
         let mut addresses = Vec::with_capacity(count.max(1) as usize);
         for index in 0..count.max(1) {
@@ -267,11 +267,11 @@ impl HdWallet {
 
         Ok(HdWallet {
             mnemonic,
-            seed,
             addresses,
             imported: BTreeSet::new(),
             network: if testnet { "testnet" } else { "mainnet" }.to_string(),
             file_version: WALLET_VERSION,
+            seed: std::mem::take(&mut *seed),
             master_key: std::mem::take(&mut *master_key),
         })
     }
@@ -475,7 +475,7 @@ impl HdWallet {
         // would silently hand back the wrong (empty) addresses.
         let mut addresses = Vec::with_capacity(wallet.addresses.len());
         let mut imported = BTreeSet::new();
-        let mut seed = Zeroizing::new(mnemonic.to_seed(passphrase.unwrap_or("")).to_vec());
+        let mut seed = hd_seed_owner(&mnemonic, passphrase.unwrap_or(""));
         for addr in wallet.addresses {
             // Zeroizing (A4 lows): plaintext JSON containing the hex-encoded
             // private key — must not survive past the parse below.
@@ -511,9 +511,10 @@ impl HdWallet {
         // was derived under `wallet.version`'s salt, so `save()` must write
         // that SAME version back, not the current `WALLET_VERSION`.
         Ok(HdWallet {
-            mnemonic, seed: std::mem::take(&mut *seed), addresses, imported,
+            mnemonic, addresses, imported,
             network: wallet.network,
             file_version: wallet.version,
+            seed: std::mem::take(&mut *seed),
             master_key: std::mem::take(&mut *master_key),
         })
     }
@@ -958,6 +959,11 @@ fn fresh_hd_entropy() -> Zeroizing<[u8; 32]> {
     entropy
 }
 
+fn hd_seed_owner(mnemonic: &Mnemonic, passphrase: &str) -> Zeroizing<Vec<u8>> {
+    let seed = Zeroizing::new(mnemonic.to_seed(passphrase));
+    Zeroizing::new(seed.to_vec())
+}
+
 fn canonical_mnemonic_for_kdf(mnemonic: &Mnemonic) -> Zeroizing<String> {
     Zeroizing::new(mnemonic.to_string())
 }
@@ -1061,6 +1067,34 @@ fn decrypt_ciphertext_in_place(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hd_seed_has_exact_zeroizing_ownership_and_bip39_bytes() {
+        let _: fn(&Mnemonic, &str) -> Zeroizing<Vec<u8>> = hd_seed_owner;
+        assert!(std::mem::needs_drop::<Zeroizing<[u8; 64]>>());
+        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
+
+        let mnemonic = Mnemonic::parse(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        )
+        .unwrap();
+        let mut seed = hd_seed_owner(&mnemonic, "");
+        assert_eq!(
+            &seed[..],
+            &[
+                0x5e, 0xb0, 0x0b, 0xbd, 0xdc, 0xf0, 0x69, 0x08,
+                0x48, 0x89, 0xa8, 0xab, 0x91, 0x55, 0x56, 0x81,
+                0x65, 0xf5, 0xc4, 0x53, 0xcc, 0xb8, 0x5e, 0x70,
+                0x81, 0x1a, 0xae, 0xd6, 0xf6, 0xda, 0x5f, 0xc1,
+                0x9a, 0x5a, 0xc4, 0x0b, 0x38, 0x9c, 0xd3, 0x70,
+                0xd0, 0x86, 0x20, 0x6d, 0xec, 0x8a, 0xa6, 0xc4,
+                0x3d, 0xae, 0xa6, 0x69, 0x0f, 0x20, 0xad, 0x3d,
+                0x8d, 0x48, 0xb2, 0xd2, 0xce, 0x9e, 0x38, 0xe4,
+            ]
+        );
+        seed.zeroize();
+        assert!(seed.iter().all(|byte| *byte == 0));
+    }
 
     #[test]
     fn hd_entropy_has_exact_zeroizing_ownership() {
