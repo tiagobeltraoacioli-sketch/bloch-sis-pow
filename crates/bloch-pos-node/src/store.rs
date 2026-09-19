@@ -215,6 +215,7 @@ fn scan_index(log_path: &Path, from: u64) -> io::Result<Vec<IdxEntry>> {
     let mut at = from;
     let mut out = Vec::new();
     let mut len4 = [0u8; 4];
+    let mut hdr = [0u8; bloch_pos_committee::header::BlockHeaderV4::ENCODED_LEN];
     loop {
         match f.read_exact(&mut len4) {
             Ok(()) => {}
@@ -241,7 +242,6 @@ fn scan_index(log_path: &Path, from: u64) -> io::Result<Vec<IdxEntry>> {
         if frame_end > log_len {
             break; // truncated trailing frame
         }
-        let mut hdr = vec![0u8; hdr_len];
         match f.read_exact(&mut hdr) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
@@ -1389,6 +1389,8 @@ impl Store {
         let mut out = Vec::new();
         let mut page_bytes = 0usize;
         let mut len4 = [0u8; 4];
+        let hdr_len = bloch_pos_committee::header::BlockHeaderV4::ENCODED_LEN;
+        let mut hdr_buf = [0u8; bloch_pos_committee::header::BlockHeaderV4::ENCODED_LEN];
         loop {
             if out.len() >= limit {
                 break;
@@ -1427,7 +1429,6 @@ impl Store {
             // predicate over the same headers. Only the reads that produced
             // nothing are gone. Not a consensus change -- this function
             // serves bytes off the log and computes no state.
-            let hdr_len = bloch_pos_committee::header::BlockHeaderV4::ENCODED_LEN;
             if len < hdr_len {
                 if expect.is_some() {
                     return Ok(None);
@@ -1437,7 +1438,6 @@ impl Store {
                     "log frame shorter than a header",
                 ));
             }
-            let mut hdr_buf = vec![0u8; hdr_len];
             match f.read_exact(&mut hdr_buf) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
@@ -1473,7 +1473,8 @@ impl Store {
                 page_bytes = page_bytes.saturating_add(len);
                 // Wanted: read the body and hand back the whole frame, byte
                 // for byte identical to what the old path pushed.
-                let mut payload = hdr_buf;
+                let mut payload = Vec::with_capacity(len);
+                payload.extend_from_slice(&hdr_buf);
                 payload.resize(len, 0);
                 match f.read_exact(&mut payload[hdr_len..]) {
                     Ok(()) => {}
@@ -1981,6 +1982,56 @@ mod tests {
         assert!(
             read < fat_bytes,
             "the skip path read at least as much as the bodies it skipped"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fixed_header_scan_preserves_skipped_and_served_frames_exactly() {
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-pos-fixed-header-scan-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x89; 32]).expect("open");
+        let mut logged = Vec::new();
+        for slot in 1..=6u64 {
+            let mut env = sample_envelope(slot);
+            env.proposer_sig = vec![slot as u8; slot as usize * 257];
+            logged.push(crate::codec::encode_envelope(&env));
+            store.append(&env).expect("append");
+        }
+        drop(store);
+
+        let headers_before = sync_frames_scanned();
+        let bodies_before = sync_body_bytes_read();
+        let page = Store::scan_page(
+            &dir.join("blocks.log"),
+            0,
+            None,
+            3,
+            100,
+            MAX_UNINDEXED_TAIL_SCAN_FRAMES,
+        )
+        .expect("bounded scan")
+        .expect("no index mismatch in an unindexed scan");
+
+        assert_eq!(page, logged[3..], "served frames must remain byte-for-byte exact");
+        assert_eq!(
+            sync_frames_scanned() - headers_before,
+            logged.len() as u64,
+            "three skipped and three served frames must each parse exactly one header",
+        );
+        let header_len = bloch_pos_committee::header::BlockHeaderV4::ENCODED_LEN;
+        let returned_body_bytes: u64 = logged[3..]
+            .iter()
+            .map(|frame| frame.len().saturating_sub(header_len) as u64)
+            .sum();
+        assert_eq!(
+            sync_body_bytes_read() - bodies_before,
+            returned_body_bytes,
+            "skipped bodies must remain seek-only while served bodies are read exactly once",
         );
 
         let _ = fs::remove_dir_all(&dir);

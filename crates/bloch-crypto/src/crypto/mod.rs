@@ -506,11 +506,19 @@ pub fn diversified_seed(master_seed: &[u8], index: u32) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// Repository-owned per-index seed used for key generation. The public
+/// `diversified_seed` return remains caller-owned for API compatibility; this
+/// wrapper keeps the internal copy under wiping ownership for its full use.
+fn zeroizing_diversified_seed(master_seed: &[u8], index: u32) -> zeroize::Zeroizing<[u8; 32]> {
+    zeroize::Zeroizing::new(diversified_seed(master_seed, index))
+}
+
 /// Diversified keypair for `index` — independent, unlinkable, deterministic.
 pub fn diversified_keypair(master_seed: &[u8], index: u32)
     -> Result<(Vec<u8>, Vec<u8>), CryptoError>
 {
-    generate_keypair_from_seed(&diversified_seed(master_seed, index))
+    let seed = zeroizing_diversified_seed(master_seed, index);
+    generate_keypair_from_seed(&seed[..])
 }
 
 /// Diversified address string for `index`.
@@ -569,6 +577,26 @@ mod tests {
         assert!(a0.starts_with("bloch1t"));
         // A different master seed gives a different address at the same index.
         assert_ne!(a0, diversified_address(&[8u8; 64], 0, true).unwrap());
+    }
+    #[test]
+    fn diversified_keypair_owns_exact_subseed_under_zeroizing_drop() {
+        use zeroize::Zeroize;
+
+        let master_seed = [0x5au8; 64];
+        let index = 0x1020_3040;
+        let public_seed = diversified_seed(&master_seed, index);
+        let mut owned_seed = zeroizing_diversified_seed(&master_seed, index);
+
+        assert!(std::mem::needs_drop::<zeroize::Zeroizing<[u8; 32]>>());
+        assert_eq!(&owned_seed[..], &public_seed);
+
+        let expected = generate_keypair_from_seed(&public_seed).unwrap();
+        let actual = diversified_keypair(&master_seed, index).unwrap();
+        assert_eq!(actual, expected, "zeroizing ownership must not change key bytes");
+
+        // Structural evidence for the live owner; no post-Drop memory claim.
+        owned_seed.zeroize();
+        assert!(owned_seed.iter().all(|byte| *byte == 0));
     }
     #[test] fn address_format() {
         let (pk, _) = generate_keypair();
