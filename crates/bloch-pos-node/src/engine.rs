@@ -4074,13 +4074,18 @@ impl Engine {
         verification_source: Option<[u8; 32]>,
         prepare_result: impl FnOnce(&PosTransaction, &[u8]) -> R,
     ) -> Result<(Admitted, R), Refusal> {
+        // Identity is witness-free but not free: transfers fold every input
+        // and output, and funded deposits build their intent preimage. Keep
+        // this one derivation bound to `tx` through both duplicate indexes and
+        // the eventual mempool identity insertion.
+        let txid = tx.txid();
         // A recent canonical inclusion remains a duplicate even if gossip
         // re-offers it after its pending entry was removed.
-        if self.tx_slot_index.contains_key(&tx.txid()) {
+        if self.tx_slot_index.contains_key(&txid) {
             let prepared = prepare_result(&tx, &key);
             return Ok((Admitted::Duplicate, prepared));
         }
-        if self.mempool.has_txid(&tx.txid()) {
+        if self.mempool.has_txid(&txid) {
             let prepared = prepare_result(&tx, &key);
             return Ok((Admitted::Duplicate, prepared));
         }
@@ -4183,7 +4188,7 @@ impl Engine {
         // expire transactions it never had a chance to include.
         self.mempool_admitted_at
             .insert(key.clone(), self.head_slot_now());
-        self.mempool.insert(key, tx);
+        self.mempool.insert_with_txid(key, tx, txid);
         self.net.broadcast_transaction(broadcast);
         Ok((Admitted::New, prepared))
     }
@@ -9018,6 +9023,26 @@ mod transfer_v2_end_to_end {
             !arm.contains("rpc::submitted_json(&tx"),
             "RPC submission again re-encodes the retained transaction for its receipt"
         );
+    }
+
+    #[test]
+    fn transaction_admission_derives_one_txid_for_checks_and_insertion() {
+        let source = include_str!("engine.rs");
+        let admission = source
+            .split("fn on_transaction_from_canonical<R>(")
+            .nth(1)
+            .expect("canonical transaction admission exists")
+            .split("/// Transactions for the block")
+            .next()
+            .expect("transaction selection follows admission");
+        assert_eq!(
+            admission.matches(".txid()").count(),
+            1,
+            "admission must not repeat the proportional transaction identity fold",
+        );
+        assert!(admission.contains("contains_key(&txid)"));
+        assert!(admission.contains("has_txid(&txid)"));
+        assert!(admission.contains("insert_with_txid(key, tx, txid)"));
     }
 
     #[test]

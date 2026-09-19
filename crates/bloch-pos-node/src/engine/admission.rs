@@ -55,9 +55,23 @@ impl Mempool {
         true
     }
     pub(super) fn insert(&mut self, key: Vec<u8>, tx: PosTransaction) -> Option<PosTransaction> {
+        let txid = tx.txid();
+        self.insert_with_txid(key, tx, txid)
+    }
+    /// Insert with the identity already derived by the admission path from
+    /// this exact transaction. Kept inside the engine module: the supplied
+    /// identity drives duplicate accounting and must never come from another
+    /// value. The ordinary fixture-facing [`Self::insert`] remains the
+    /// self-contained authority for callers without a prepared identity.
+    pub(super) fn insert_with_txid(
+        &mut self,
+        key: Vec<u8>,
+        tx: PosTransaction,
+        txid: [u8; 32],
+    ) -> Option<PosTransaction> {
         let old = self.remove(&key);
         self.bytes = self.bytes.saturating_add(key.len());
-        let count = self.identities.entry(tx.txid()).or_default();
+        let count = self.identities.entry(txid).or_default();
         *count = count.saturating_add(1);
         if let Some(source) = tx_source_hash(&tx) {
             let count = self.sources.entry(source).or_default();
@@ -141,6 +155,52 @@ mod tests {
                 validator: 7, epoch: 9, new_commitment: [0x44; 32], signature: vec![5],
             }),
         );
+    }
+
+    #[test]
+    fn prepared_txid_insert_matches_authority_and_preserves_variant_multiplicity() {
+        use bloch_pos_committee::transition::{TransferInput, TransferOutput};
+
+        let first = PosTransaction::Transfer {
+            inputs: vec![TransferInput {
+                txid: [0x11; 32],
+                vout: 3,
+                pubkey: vec![0x22; 32],
+                signature: vec![0x33],
+            }],
+            outputs: vec![TransferOutput { value: 7, script_hash: [0x44; 32] }],
+            tx_bytes: 512,
+            tip_millisat_per_gas: 9,
+        };
+        let mut variant = first.clone();
+        let PosTransaction::Transfer { inputs, .. } = &mut variant else {
+            unreachable!()
+        };
+        inputs[0].signature.push(0x55);
+        let txid = first.txid();
+        assert_eq!(variant.txid(), txid, "witness variants share one transaction identity");
+        let first_key = first.canonical_bytes();
+        let variant_key = variant.canonical_bytes();
+        assert_ne!(first_key, variant_key, "fixture must exercise two canonical entries");
+
+        let mut ordinary = Mempool::default();
+        ordinary.insert(first_key.clone(), first.clone());
+        let mut prepared = Mempool::default();
+        prepared.insert_with_txid(first_key.clone(), first, txid);
+        assert_eq!(prepared.bytes, ordinary.bytes);
+        assert_eq!(prepared.identities, ordinary.identities);
+        assert_eq!(prepared.sources, ordinary.sources);
+        assert_eq!(prepared.entries, ordinary.entries);
+
+        prepared.insert_with_txid(variant_key.clone(), variant, txid);
+        assert_eq!(prepared.identities.get(&txid), Some(&2));
+        prepared.remove(&first_key);
+        assert_eq!(prepared.identities.get(&txid), Some(&1));
+        assert!(prepared.has_txid(&txid));
+        prepared.remove(&variant_key);
+        assert!(!prepared.has_txid(&txid));
+        assert!(prepared.entries.is_empty());
+        assert_eq!(prepared.bytes(), 0);
     }
 }
 fn decrement(map: &mut BTreeMap<[u8; 32], usize>, key: [u8; 32]) {
