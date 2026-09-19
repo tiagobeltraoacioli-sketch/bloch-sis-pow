@@ -47,6 +47,8 @@ security job, fails if the job:
   * keeps the job name but removes/replaces its actual scanner or guard
     command. Evidence is accepted only from explicit GitLab `script:` items
     and GitHub step `run:`/`uses:` fields, never names, comments or variables.
+  * makes the GitHub OSV verdict mutable by replacing its full commit pin with
+    a tag/branch, or removes this guard's own adversarial self-test.
 
 It does NOT require every job to be blocking. cargo-geiger, miri and the fuzz
 smoke are deliberately report-only, with written reasons, and stay green here.
@@ -113,13 +115,17 @@ GITLAB_VERDICTS = {
 }
 GITHUB_VERDICTS = {
     "clippy-hardened": GITLAB_VERDICTS["clippy-hardened"],
-    "osv-scanner": re.compile(r"^google/osv-scanner-action/osv-scanner-action@[0-9A-Za-z._-]+$"),
+    "osv-scanner": re.compile(r"^google/osv-scanner-action/osv-scanner-action@[0-9a-f]{40}$"),
     "secret-scan": GITLAB_VERDICTS["secret-scan"],
     "secret-history-scan": GITLAB_VERDICTS["secret-history-scan"],
     "cargo-audit": GITLAB_VERDICTS["cargo-audit"],
     "cargo-deny": GITLAB_VERDICTS["supply-chain"],
     "scanners-blocking-guard": GITLAB_VERDICTS["scanners-blocking-guard"],
     "rollback-package-integrity": GITLAB_VERDICTS["rollback-package-integrity"],
+}
+SELFTEST_VERDICTS = {
+    "scanners-blocking-guard": re.compile(
+        r"^python3\s+scripts/check-scanners-blocking\.selftest\.py(?:\s|$)"),
 }
 
 SHELL_ESCAPES = (
@@ -278,14 +284,23 @@ def check_file(path: str, required: dict[str, str], indent: int, label: str) -> 
         executable = explicit_execution_values(blocks[job], indent, label)
         # A required verdict must be a direct command/action, not one operand
         # of a compound shell expression that can replace its exit status.
-        has_verdict = any(
-            verdicts[job].search(value)
-            and not re.search(r"(?:\|\||&&|[;|&]|\$\(|`)", value)
-            for value in executable)
+        def has_direct_entrypoint(pattern: re.Pattern[str]) -> bool:
+            return any(
+                pattern.search(value)
+                and not re.search(r"(?:\|\||&&|[;|&]|\$\(|`)", value)
+                for value in executable)
+
+        has_verdict = has_direct_entrypoint(verdicts[job])
         if not has_verdict:
             problems.append(
                 "%s: job `%s` (%s) no longer executes its required verdict "
                 "in an explicit local script/run/uses field"
+                % (label, job, why))
+        companion = SELFTEST_VERDICTS.get(job)
+        if companion is not None and not has_direct_entrypoint(companion):
+            problems.append(
+                "%s: job `%s` (%s) no longer executes the adversarial "
+                "self-test that proves its guard can fail"
                 % (label, job, why))
         for line in blocks[job]:
             waiver = re.match(

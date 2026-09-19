@@ -91,6 +91,7 @@ supply-chain:
 scanners-blocking-guard:
   stage: check
   script:
+    - python3 scripts/check-scanners-blocking.selftest.py
     - python3 scripts/check-scanners-blocking.py
   allow_failure: false
 
@@ -129,7 +130,7 @@ jobs:
   osv-scanner:
     runs-on: ubuntu-latest
     steps:
-      - uses: google/osv-scanner-action/osv-scanner-action@v1.9.2
+      - uses: google/osv-scanner-action/osv-scanner-action@764c91816374ff2d8fc2095dab36eecd42d61638
 
   secret-scan:
     runs-on: ubuntu-latest
@@ -139,6 +140,7 @@ jobs:
   scanners-blocking-guard:
     runs-on: ubuntu-latest
     steps:
+      - run: python3 scripts/check-scanners-blocking.selftest.py
       - run: python3 scripts/check-scanners-blocking.py
 
   secret-history-scan:
@@ -232,8 +234,27 @@ CASES = [
          GOOD_GITLAB,
          GOOD_GITHUB.replace(
              "  scanners-blocking-guard:\n    runs-on: ubuntu-latest\n"
-             "    steps:\n      - run: python3 scripts/check-scanners-blocking.py\n\n", ""),
+             "    steps:\n      - run: python3 scripts/check-scanners-blocking.selftest.py\n"
+             "      - run: python3 scripts/check-scanners-blocking.py\n\n", ""),
          must_fail=True, expect="MISSING"),
+
+    Case("gitlab scanner guard cannot drop its adversarial selftest",
+         GOOD_GITLAB.replace(
+             "    - python3 scripts/check-scanners-blocking.selftest.py\n", ""),
+         GOOD_GITHUB, must_fail=True, expect="adversarial self-test"),
+
+    Case("github scanner guard cannot drop its adversarial selftest",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - run: python3 scripts/check-scanners-blocking.selftest.py\n", ""),
+         must_fail=True, expect="adversarial self-test"),
+
+    Case("github OSV action must use an immutable commit pin",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "google/osv-scanner-action/osv-scanner-action@764c91816374ff2d8fc2095dab36eecd42d61638",
+             "google/osv-scanner-action/osv-scanner-action@main"),
+         must_fail=True, expect="no longer executes its required verdict"),
 
     Case("gitlab job name cannot replace the scanner verdict",
          GOOD_GITLAB.replace(
@@ -319,7 +340,7 @@ CASES = [
     Case("GitHub reusable workflow is outside the inspectable subset",
          GOOD_GITLAB,
          sub(GOOD_GITHUB,
-             "  osv-scanner:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: google/osv-scanner-action/osv-scanner-action@v1.9.2",
+             "  osv-scanner:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: google/osv-scanner-action/osv-scanner-action@764c91816374ff2d8fc2095dab36eecd42d61638",
              "  osv-scanner:\n    uses: example/security/.github/workflows/osv.yml@0123456789abcdef"),
          must_fail=True, expect="delegates to a reusable workflow"),
 
