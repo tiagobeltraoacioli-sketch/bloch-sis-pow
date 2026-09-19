@@ -146,6 +146,38 @@ const ENGINE_EVENTS_PER_CLASS_PER_TURN: [usize; 4] = [1, 8, 8, 8];
 /// between slot-loop control points.
 const HELD_ATTESTATIONS_PER_TURN: usize = 4;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeferredBlockClass {
+    Future,
+    Orphan,
+}
+
+/// Round-robin cursor shared by the two local queues whose release can run a
+/// full block transition. It turns their two independent one-block slices into
+/// one aggregate one-block slice without changing either queue's FIFO order.
+#[derive(Default)]
+struct DeferredBlockScheduler {
+    cursor: usize,
+}
+
+impl DeferredBlockScheduler {
+    fn next(&mut self, future_ready: bool, orphan_ready: bool) -> Option<DeferredBlockClass> {
+        let ready = [future_ready, orphan_ready];
+        for offset in 0..ready.len() {
+            let class = self.cursor.saturating_add(offset) % ready.len();
+            if ready[class] {
+                self.cursor = class.saturating_add(1) % ready.len();
+                return Some(if class == 0 {
+                    DeferredBlockClass::Future
+                } else {
+                    DeferredBlockClass::Orphan
+                });
+            }
+        }
+        None
+    }
+}
+
 /// Node-local fair scheduler for already-admitted work. FIFO is preserved
 /// inside each class; strict round-robin between non-empty classes prevents a
 /// transaction, attestation, block, or RPC flood from starving the others.
@@ -214,7 +246,10 @@ fn engine_event_class(event: &EngineEvent) -> usize {
 
 #[cfg(test)]
 mod fair_engine_queue_tests {
-    use super::{FairQueue, ENGINE_EVENTS_PER_CLASS_PER_TURN};
+    use super::{
+        DeferredBlockClass, DeferredBlockScheduler, FairQueue,
+        ENGINE_EVENTS_PER_CLASS_PER_TURN,
+    };
 
     #[test]
     fn lower_priority_backlog_cannot_hide_other_admitted_classes() {
@@ -279,6 +314,26 @@ mod fair_engine_queue_tests {
             vec![(0, 1)],
             "a block-only tail must return to duty checks after every block",
         );
+    }
+
+    #[test]
+    fn deferred_block_classes_share_one_fair_slice() {
+        let mut scheduler = DeferredBlockScheduler::default();
+        for turn in 0..128 {
+            let expected = if turn % 2 == 0 {
+                DeferredBlockClass::Future
+            } else {
+                DeferredBlockClass::Orphan
+            };
+            assert_eq!(scheduler.next(true, true), Some(expected));
+        }
+        assert_eq!(scheduler.next(true, false), Some(DeferredBlockClass::Future));
+        assert_eq!(
+            scheduler.next(true, true),
+            Some(DeferredBlockClass::Orphan),
+            "a class that becomes ready gets the next shared turn",
+        );
+        assert_eq!(scheduler.next(false, false), None);
     }
 }
 
@@ -2697,6 +2752,31 @@ impl Engine {
         !self.deferred_orphans.is_empty()
     }
 
+    /// Release at most one block across both locally deferred block classes.
+    /// Recompute the tails after release because a future block can become an
+    /// orphan, and a promoted orphan can make more descendants ready.
+    fn release_deferred_block_turn(
+        &mut self,
+        slot: u64,
+        scheduler: &mut DeferredBlockScheduler,
+    ) -> (bool, bool) {
+        let future_ready = self.ready_future_block_pending(slot);
+        let orphan_ready = !self.deferred_orphans.is_empty();
+        match scheduler.next(future_ready, orphan_ready) {
+            Some(DeferredBlockClass::Future) => {
+                self.release_future_blocks(slot, FUTURE_BLOCKS_PER_TURN);
+            }
+            Some(DeferredBlockClass::Orphan) => {
+                self.release_orphan_turn();
+            }
+            None => {}
+        }
+        (
+            self.ready_future_block_pending(slot),
+            !self.deferred_orphans.is_empty(),
+        )
+    }
+
     /// One envelope through the door.
     ///
     /// Returns the gossip verdict for THIS envelope, and `Some((id,
@@ -3333,7 +3413,12 @@ impl Engine {
                 self.ingest_from_judged(block, source);
             }
         }
-        self.future_blocks.values()
+        self.ready_future_block_pending(slot)
+    }
+
+    fn ready_future_block_pending(&self, slot: u64) -> bool {
+        self.future_blocks
+            .values()
             .any(|(block, _)| block.header.slot <= slot)
     }
 
@@ -5931,6 +6016,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let mut epoch_advance_warning_level: u8 = 0;
     let mut reported_fc_equivocators = None;
     let mut admitted_work = FairQueue::default();
+    let mut deferred_block_scheduler = DeferredBlockScheduler::default();
     let mut engine_channel_open = true;
 
     loop {
@@ -5972,16 +6058,17 @@ pub fn run(cfg: Config) -> io::Result<()> {
             // it — without the call its `seen` map grows with uptime.
             engine.att_pool.prune(slot);
         }
-        // Future admission already reported `Ignore` and retained its source.
-        // Reprocessing is local and silent, one block per loop turn. Keep
-        // duties gated and spin directly into the next turn while an eligible
-        // tail remains: signing before it drains would use a partial view;
-        // sleeping or serving another full batch would defer that view.
-        let ready_future_blocks_pending = engine.release_future_blocks(
+        // Future admission and orphan parking already reported `Ignore` and
+        // retained their sources. Reprocessing is local and silent. Both
+        // queues share one block-transition slice, round-robin when both are
+        // ready, so their combination cannot double the expensive work in one
+        // control turn. Keep duties gated and spin directly into the next turn
+        // while either eligible tail remains.
+        let (ready_future_blocks_pending, deferred_orphans_pending) =
+            engine.release_deferred_block_turn(
             slot,
-            FUTURE_BLOCKS_PER_TURN,
+            &mut deferred_block_scheduler,
         );
-        let deferred_orphans_pending = engine.release_orphan_turn();
         let held_attestations_pending = engine.release_held_turn();
 
         if let Some(stop) = cfg.stop_at_slot {
@@ -11994,6 +12081,55 @@ mod ingest_admission_tests {
         assert!(engine.future_blocks.is_empty());
         assert_eq!(engine.orphans.len(), 2, "neither ready block was stranded");
         assert!(!validator_duties_blocked(false, false, pending, false, false));
+    }
+
+    #[test]
+    fn future_and_orphan_releases_share_one_block_transition_turn() {
+        let _clock = validator_lifecycle::clock_at(3);
+        let (mut engine, _dir, _template, _) = fixture();
+        let parent = *engine.head_id().as_bytes();
+
+        engine.propose(2);
+        let future = engine.blocks[engine.head_id().as_bytes()].clone();
+        assert!(engine.do_reorg(parent, Vec::new()));
+        engine.propose(3);
+        let orphan = engine.blocks[engine.head_id().as_bytes()].clone();
+        assert!(engine.do_reorg(parent, Vec::new()));
+        let future_id = *future.block_id().as_bytes();
+        let orphan_id = *orphan.block_id().as_bytes();
+        assert_ne!(future_id, orphan_id, "the two release classes need distinct work");
+        engine.blocks.remove(&future_id).expect("stored future fixture");
+        engine.blocks.remove(&orphan_id).expect("stored orphan fixture");
+
+        engine.future_blocks.insert(
+            future_id,
+            (future, Source::Gossip(Some([0xF4; 32]))),
+        );
+        engine.park_orphan(
+            orphan_id,
+            orphan,
+            Source::Gossip(Some([0x04; 32])),
+        );
+        engine.schedule_unblocked_orphans(parent, false);
+        assert_eq!(engine.future_blocks.len(), 1);
+        assert_eq!(engine.deferred_orphans.len(), 1);
+
+        let mut scheduler = DeferredBlockScheduler::default();
+        let pending = engine.release_deferred_block_turn(3, &mut scheduler);
+        assert_eq!(pending, (false, true));
+        assert!(engine.future_blocks.is_empty());
+        assert_eq!(engine.deferred_orphans.len(), 1);
+        assert!(engine.blocks.contains_key(&future_id));
+        assert_eq!(
+            engine.deferred_orphans[0].0,
+            orphan_id,
+            "the second expensive class must wait for another control turn",
+        );
+
+        let pending = engine.release_deferred_block_turn(3, &mut scheduler);
+        assert_eq!(pending, (false, false));
+        assert!(engine.deferred_orphans.is_empty());
+        assert!(engine.blocks.contains_key(&orphan_id));
     }
 
     #[test]
