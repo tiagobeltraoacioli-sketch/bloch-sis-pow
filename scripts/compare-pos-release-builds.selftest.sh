@@ -183,6 +183,50 @@ expect_bad_snapshot separator 20260917-000000Z
 expect_bad_snapshot short 20260917T00000Z
 expect_bad_snapshot whitespace "20260917T000000Z "
 
+build_info_order_error="BUILD-INFO is not in the exact canonical field order and encoding"
+expect_bad_build_info_order() {
+  local label="$1" mode="$2"
+  local left="$work/order-$label-a" right="$work/order-$label-b" dir
+  cp -R "$work/a" "$left"
+  cp -R "$work/a" "$right"
+  for dir in "$left" "$right"; do
+    case "$mode" in
+      first-two)
+        awk 'NR == 1 { first = $0; next }
+             NR == 2 { print; print first; next }
+             { print }' "$dir/BUILD-INFO" > "$dir/BUILD-INFO.new" ;;
+      reverse)
+        awk '{ lines[NR] = $0 }
+             END { for (n = NR; n >= 1; n--) print lines[n] }' \
+          "$dir/BUILD-INFO" > "$dir/BUILD-INFO.new" ;;
+      middle)
+        awk 'NR == 4 { fourth = $0; next }
+             NR == 5 { print; print fourth; next }
+             { print }' "$dir/BUILD-INFO" > "$dir/BUILD-INFO.new" ;;
+    esac
+    mv "$dir/BUILD-INFO.new" "$dir/BUILD-INFO"
+  done
+  expect_failure "matching noncanonical BUILD-INFO order ($label)" \
+    "$build_info_order_error" \
+    bash scripts/compare-pos-release-builds.sh "$left" "$right"
+}
+expect_bad_build_info_order first-two first-two
+expect_bad_build_info_order reverse reverse
+expect_bad_build_info_order middle middle
+
+no_build_info_newline_left="$work/no-build-info-newline-a"
+no_build_info_newline_right="$work/no-build-info-newline-b"
+cp -R "$work/a" "$no_build_info_newline_left"
+cp -R "$work/a" "$no_build_info_newline_right"
+for dir in "$no_build_info_newline_left" "$no_build_info_newline_right"; do
+  build_info_without_newline="$(cat "$dir/BUILD-INFO")"
+  printf '%s' "$build_info_without_newline" > "$dir/BUILD-INFO"
+done
+expect_failure "BUILD-INFO missing final newline" \
+  "BUILD-INFO must contain exactly the eight canonical fields" \
+  bash scripts/compare-pos-release-builds.sh \
+    "$no_build_info_newline_left" "$no_build_info_newline_right"
+
 chmod 0644 "$work/b/bloch-pos"
 if bash scripts/compare-pos-release-builds.sh "$work/a" "$work/b" >/dev/null 2>&1; then
   echo "selftest: non-executable binary was accepted" >&2; exit 1

@@ -80,14 +80,29 @@ for dir in "$a" "$b"; do
     ''|*[!0123456789]*)
       fail "$dir/BUILD-INFO debian_snapshot must have exact YYYYMMDDTHHMMSSZ syntax" ;;
   esac
+  target="$(field target "$dir/BUILD-INFO")"
+  cmp -s <(printf '%s\n' \
+      'artifact_kind=canonical-container-candidate' \
+      "source_commit=$source_commit" \
+      "source_date_epoch=$source_date_epoch" \
+      "debian_snapshot=$debian_snapshot" \
+      "target=$target" \
+      "binary_sha256=$metadata_sha" \
+      'signed=false' \
+      'deployment_authorized=false') "$dir/BUILD-INFO" \
+    || fail "$dir/BUILD-INFO is not in the exact canonical field order and encoding"
   if [ "$dir" = "$a" ]; then
     a_source_commit="$source_commit"
     a_source_date_epoch="$source_date_epoch"
     a_debian_snapshot="$debian_snapshot"
+    a_target="$target"
+    a_binary_sha256="$metadata_sha"
   else
     b_source_commit="$source_commit"
     b_source_date_epoch="$source_date_epoch"
     b_debian_snapshot="$debian_snapshot"
+    b_target="$target"
+    b_binary_sha256="$metadata_sha"
   fi
 done
 
@@ -108,11 +123,9 @@ cmp -s "$a/BUILD-INFO" "$b/BUILD-INFO" || fail "complete BUILD-INFO differs"
   || fail "source_date_epoch differs between builders"
 [ "$a_debian_snapshot" = "$b_debian_snapshot" ] \
   || fail "debian_snapshot differs between builders"
-for key in target binary_sha256; do
-  av="$(field "$key" "$a/BUILD-INFO")"
-  bv="$(field "$key" "$b/BUILD-INFO")"
-  [ "$av" = "$bv" ] || fail "$key differs between builders"
-done
+[ "$a_target" = "$b_target" ] || fail "target differs between builders"
+[ "$a_binary_sha256" = "$b_binary_sha256" ] \
+  || fail "binary_sha256 differs between builders"
 
 echo "compare-pos-release-builds: PASS — distinct supplied outputs are byte-identical"
 echo "builder independence still requires separately authenticated build records"
