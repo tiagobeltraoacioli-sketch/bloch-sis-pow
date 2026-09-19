@@ -144,9 +144,22 @@ printf '%s  bloch-pos\n' "$binary_sha" > "$stage/SHA256SUMS"
 chmod 0644 "$stage/SHA256SUMS" "$stage/BUILD-INFO"
 chmod 0755 "$stage/bloch-pos" "$stage"
 
+# Portable `mv source destination` nests the source below destination when a
+# directory appears at destination after the absence check.  Bind the success
+# claim to this exact staged directory with a fresh direct-child token.
+[ -d "$stage" ] && [ ! -L "$stage" ] \
+  || fail "candidate stage root must be a real non-symlink directory"
+publication_token="$(mktemp "$stage/.bloch-pos-publication.XXXXXX")" \
+  || fail "could not create the publication ownership token"
+publication_marker="${publication_token##*/}"
 mkdir -p "$(dirname "$out_dir")"
 [ ! -e "$out_dir" ] || fail "output path already exists: $out_dir"
 mv "$stage" "$out_dir"
+[ -d "$out_dir" ] && [ ! -L "$out_dir" ] \
+  || fail "published output root must be a real non-symlink directory: $out_dir"
+[ -f "$out_dir/$publication_marker" ] && [ ! -L "$out_dir/$publication_marker" ] \
+  || fail "output path changed during publication; refusing a nested or replaced destination: $out_dir"
+rm -f "$out_dir/$publication_marker"
 trap - EXIT
 rm -rf "$work"
 echo "package-pos-release-candidate: PASS — $out_dir ($binary_sha)"

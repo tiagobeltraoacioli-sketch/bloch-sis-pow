@@ -38,6 +38,7 @@ git -C "$test_repo" add .
 git -C "$test_repo" commit -qm baseline
 baseline_commit="$(git -C "$test_repo" rev-parse HEAD)"
 real_git="$(command -v git)"
+real_mv="$(command -v mv)"
 if command -v sha256sum >/dev/null 2>&1; then
   real_sha_tool="$(command -v sha256sum)"
   real_sha_kind=sha256sum
@@ -83,6 +84,12 @@ pin="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$toolchain_file")"
 case "${1:-}" in
   --version) printf 'rustc %s (selftest)\n' "$pin" ;;
   -vV)
+    if [ "${FAKE_PUBLICATION_MODE:-canonical}" = stage-symlink ]; then
+      package_work="$(dirname "$(cat "$TEST_REPO/.package-target")")"
+      "$REAL_MV" "$package_work/stage" "$package_work/stage-real"
+      ln -s "$package_work/stage-real" "$package_work/stage"
+      : > "$TEST_REPO/.stage-symlink-injected"
+    fi
     case "${FAKE_RUSTC_MODE:-canonical}" in
       canonical)
         printf 'rustc %s (selftest)\n' "$pin"
@@ -151,6 +158,7 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 [ -n "$target_dir" ]
+printf '%s\n' "$target_dir" > "$TEST_REPO/.package-target"
 source_marker="$(cat source-marker)"
 config_marker="$(sed -n 's/^# //p' .cargo/config.toml)"
 pin="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' \
@@ -196,19 +204,73 @@ chmod 0755 "$target_dir/release/bloch-pos"
 EOF
 chmod 0755 "$fake_bin/cargo"
 
+cat > "$fake_bin/mv" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${FAKE_PUBLICATION_MODE:-canonical}" = collision ] \
+    && [ "${1:-}" != "" ] && [ "${2:-}" != "" ] \
+    && [ "$(basename "$1")" = stage ]; then
+  mkdir -p "$2"
+  : > "$TEST_REPO/.publication-collision-injected"
+fi
+exec "$REAL_MV" "$@"
+EOF
+chmod 0755 "$fake_bin/mv"
+
 run_package() {
   local version_mode="${2:-canonical}"
   local rustc_mode="${3:-canonical}"
   local sha_mode="${4:-canonical}"
   local package_umask="${5:-022}"
+  local publication_mode="${6:-canonical}"
   ( umask "$package_umask"
     cd "$test_repo" && PATH="$fake_bin:$PATH" REAL_GIT="$real_git" \
+      REAL_MV="$real_mv" \
       REAL_SHA_TOOL="$real_sha_tool" REAL_SHA_KIND="$real_sha_kind" \
       FAKE_VERSION_MODE="$version_mode" \
       FAKE_RUSTC_MODE="$rustc_mode" \
       FAKE_SHA_MODE="$sha_mode" \
+      FAKE_PUBLICATION_MODE="$publication_mode" \
       TEST_REPO="$test_repo" "$test_repo/scripts/package-pos-release-candidate.sh" \
       "$1" )
+}
+
+expect_publication_collision_failure() {
+  local output="$work/publication-collision"
+  local log="$work/publication-collision.log"
+  if run_package "$output" canonical canonical canonical 022 collision \
+      > "$log" 2>&1; then
+    echo "selftest: packager reported PASS after a raced output collision" >&2
+    exit 1
+  fi
+  grep -Fq 'output path changed during publication; refusing a nested or replaced destination' \
+    "$log" || {
+      echo "selftest: raced output collision lacked the expected diagnostic" >&2
+      cat "$log" >&2
+      exit 1
+    }
+  ! grep -Fq 'package-pos-release-candidate: PASS' "$log"
+  [ -e "$test_repo/.publication-collision-injected" ]
+  [ ! -e "$output/bloch-pos" ]
+  [ -f "$output/stage/bloch-pos" ]
+}
+
+expect_stage_symlink_failure() {
+  local output="$work/stage-symlink"
+  local log="$work/stage-symlink.log"
+  if run_package "$output" canonical canonical canonical 022 stage-symlink \
+      > "$log" 2>&1; then
+    echo "selftest: packager reported PASS for a symlinked stage root" >&2
+    exit 1
+  fi
+  grep -Fq 'candidate stage root must be a real non-symlink directory' "$log" || {
+    echo "selftest: symlinked stage root lacked the expected diagnostic" >&2
+    cat "$log" >&2
+    exit 1
+  }
+  ! grep -Fq 'package-pos-release-candidate: PASS' "$log"
+  [ -e "$test_repo/.stage-symlink-injected" ]
+  [ ! -e "$output" ]
 }
 
 expect_sha_failure() {
@@ -291,6 +353,8 @@ race_version="$($work/race-output/bloch-pos --version)"
 printf '%s\n' "$race_version" | grep -Fq "(${baseline_commit:0:12})"
 grep -Fq '# source=baseline-source config=baseline-config pin=1.80.0' \
   "$work/race-output/bloch-pos"
+[ -z "$(find "$work/race-output" -maxdepth 1 \
+  -name '.bloch-pos-publication.*' -print -quit)" ]
 late_commit="$(git -C "$test_repo" rev-parse HEAD)"
 [ "$late_commit" != "$baseline_commit" ]
 
@@ -302,6 +366,8 @@ late_version="$($work/late-output/bloch-pos --version)"
 printf '%s\n' "$late_version" | grep -Fq "(${late_commit:0:12})"
 grep -Fq '# source=late-source config=late-config pin=1.81.0' \
   "$work/late-output/bloch-pos"
+[ -z "$(find "$work/late-output" -maxdepth 1 \
+  -name '.bloch-pos-publication.*' -print -quit)" ]
 
 # Published modes are deterministic even under a maximally permissive umask.
 mode_output="$work/permissive-umask-output"
@@ -327,6 +393,11 @@ done
   echo "selftest: packaged binary is not executable" >&2
   exit 1
 }
+[ -z "$(find "$mode_output" -maxdepth 1 \
+  -name '.bloch-pos-publication.*' -print -quit)" ]
+
+expect_publication_collision_failure
+expect_stage_symlink_failure
 
 expect_version_failure missing-commit \
   'binary version line does not contain ('
