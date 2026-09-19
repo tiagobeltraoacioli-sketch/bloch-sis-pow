@@ -359,6 +359,8 @@ tests-blocking-guard:
     - python3 -I scripts/pinned-rust-toolchain.test.py
     - python3 -I scripts/devnet-particao-report.test.py
     - python3 -I scripts/rehearse-validator-activation.test.py
+    - python3 -I scripts/check-attested-ssh.selftest.py
+    - python3 -I scripts/check-attested-ssh.py
   timeout: 10m
   allow_failure: false
 

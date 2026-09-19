@@ -46,9 +46,10 @@ GitLab `.gitlab-ci.yml` job `build-and-test`, to the reviewed posture:
     pipelines; removing it from either reviewed job fails independently.
   * the `tests-blocking-guard` job has the reviewed runner/timeout and exact
     ordered checkout, selftest and guard/rehearsal command sequence on GitHub;
-    GitLab runs the same posture, toolchain, partition-report and activation
-    parser tests under an exact blocking contract. This prevents the guard's
-    own CI entrypoint from becoming a decorative literal.
+    GitLab runs the same posture, toolchain, partition-report, activation
+    parser and attested-image remote-access tests under an exact blocking
+    contract. This prevents the guard's own CI entrypoint from becoming a
+    decorative literal.
   * local script entrypoints named directly by those commands, plus the
     reviewed transitively loaded executables, are regular non-symlink files
     whose SHA-256 content and parent/load relationships match the contract.
@@ -146,6 +147,8 @@ GITLAB_TEST_GUARD_BODY = (
     "- python3 -I scripts/pinned-rust-toolchain.test.py",
     "- python3 -I scripts/devnet-particao-report.test.py",
     "- python3 -I scripts/rehearse-validator-activation.test.py",
+    "- python3 -I scripts/check-attested-ssh.selftest.py",
+    "- python3 -I scripts/check-attested-ssh.py",
     "timeout: 10m",
     "allow_failure: false",
 )
@@ -197,7 +200,7 @@ CI_SCRIPT_ENTRYPOINT_SHA256 = {
     "scripts/check-live-node-retired-isolation.py":
         "45ece7368931469c2c64c161708009b41aebcbf3c1033fa75006e16d5e16518d",
     "scripts/check-tests-blocking.selftest.py":
-        "190470e049ad24c57e06fb6d27a2e6543d801f9d68c082d3a35dc423c948b39c",
+        "65d74422b1a7562128875326d7131ed6104003717910e364c60063902dc3974a",
     "scripts/check-validator-lifecycle-mutations.py":
         "12b477e5043bc3ea98387be33ca586976494b30083522b214cea7d88c0e9f429",
     "scripts/devnet-particao-report.test.py":

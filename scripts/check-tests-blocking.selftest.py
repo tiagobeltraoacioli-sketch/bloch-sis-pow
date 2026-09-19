@@ -95,6 +95,8 @@ tests-blocking-guard:
     - python3 -I scripts/pinned-rust-toolchain.test.py
     - python3 -I scripts/devnet-particao-report.test.py
     - python3 -I scripts/rehearse-validator-activation.test.py
+    - python3 -I scripts/check-attested-ssh.selftest.py
+    - python3 -I scripts/check-attested-ssh.py
   timeout: 10m
   allow_failure: false
 """
@@ -427,6 +429,24 @@ CASES = [
 
     Case("gitlab activation parser adversarial test cannot be removed",
          sub(GOOD_GITLAB, "    - python3 -I scripts/rehearse-validator-activation.test.py\n", ""),
+         GOOD_GITHUB, must_fail=True, expect="exact blocking contract"),
+
+    Case("github attested SSH selftest cannot be removed",
+         GOOD_GITLAB,
+         sub(GOOD_GITHUB, "      - run: python3 -I scripts/check-attested-ssh.selftest.py\n", ""),
+         must_fail=True, expect="exact ordered contract"),
+
+    Case("gitlab attested SSH selftest cannot be removed",
+         sub(GOOD_GITLAB, "    - python3 -I scripts/check-attested-ssh.selftest.py\n", ""),
+         GOOD_GITHUB, must_fail=True, expect="exact blocking contract"),
+
+    Case("github attested SSH verdict cannot be removed",
+         GOOD_GITLAB,
+         sub(GOOD_GITHUB, "      - run: python3 -I scripts/check-attested-ssh.py\n", ""),
+         must_fail=True, expect="exact ordered contract"),
+
+    Case("gitlab attested SSH verdict cannot be removed",
+         sub(GOOD_GITLAB, "    - python3 -I scripts/check-attested-ssh.py\n", ""),
          GOOD_GITHUB, must_fail=True, expect="exact blocking contract"),
 
     Case("github toolchain parser selftest cannot be removed",
