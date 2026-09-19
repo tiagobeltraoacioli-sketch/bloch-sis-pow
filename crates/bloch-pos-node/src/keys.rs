@@ -229,9 +229,9 @@ pub enum Unlock {
         /// Cost used when *writing*. Reading always uses the parameters
         /// recorded in the file.
         kdf: KdfParams,
-        /// Exact operator-reviewed recovery cost for an existing file only;
-        /// never changes new sealing. `None` keeps the ordinary limits.
-        expected_expensive_kdf: Option<KdfParams>,
+        /// Exact explicitly selected cost for an existing non-production
+        /// file. `None` accepts only the production tuple.
+        expected_existing_kdf: Option<KdfParams>,
     },
     /// Explicit, operator-visible opt-in to PLAINTEXT at rest: read a legacy
     /// `BPOSKEY1` file, or write one. Devnet and tests.
@@ -244,23 +244,23 @@ impl Unlock {
         Unlock::Passphrase {
             pass: Zeroizing::new(pass.into()),
             kdf: KdfParams::PRODUCTION,
-            expected_expensive_kdf: None,
+            expected_existing_kdf: None,
         }
     }
 
     /// A passphrase at an explicit cost. New writes enforce the production
-    /// floor; reading always uses the authenticated file header parameters.
+    /// floor. Reading accepts exactly this explicitly selected tuple.
     pub fn passphrase_with(pass: impl Into<String>, kdf: KdfParams) -> Unlock {
         Unlock::Passphrase {
             pass: Zeroizing::new(pass.into()),
             kdf,
-            expected_expensive_kdf: None,
+            expected_existing_kdf: Some(kdf),
         }
     }
 
     fn allow_expensive_existing(mut self, expected: Option<KdfParams>) -> Self {
-        if let Self::Passphrase { expected_expensive_kdf, .. } = &mut self {
-            *expected_expensive_kdf = expected;
+        if let Self::Passphrase { expected_existing_kdf, .. } = &mut self {
+            *expected_existing_kdf = expected;
         }
         self
     }
@@ -755,7 +755,7 @@ impl Keystore {
 
     fn decode_sealed(bytes: &[u8], unlock: &Unlock) -> io::Result<Keystore> {
         let bad = |m: &'static str| io::Error::new(io::ErrorKind::InvalidData, m);
-        let Unlock::Passphrase { pass, expected_expensive_kdf, .. } = unlock else {
+        let Unlock::Passphrase { pass, expected_existing_kdf, .. } = unlock else {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "validator.key is sealed and no passphrase is configured: set \
@@ -773,9 +773,10 @@ impl Keystore {
             t_cost: r.u32().map_err(|_| bad("truncated keystore"))?,
             p_cost: r.u32().map_err(|_| bad("truncated keystore"))?,
         };
-        if expected_expensive_kdf.is_some_and(|expected| expected != kdf) {
+        let expected_kdf = expected_existing_kdf.unwrap_or(KdfParams::PRODUCTION);
+        if expected_kdf != kdf {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied,
-                "keystore KDF header does not match BLOCH_KEYSTORE_EXPECT_KDF; refusing before derivation"));
+                "keystore KDF header does not match BLOCH_KEYSTORE_EXPECT_KDF or the default production profile; refusing before derivation"));
         }
         let salt = r.h32().map_err(|_| bad("truncated keystore"))?;
         // `take(24)` returns a slice of exactly 24 bytes or an `Err` above,
@@ -799,7 +800,7 @@ impl Keystore {
         let sealed = r.bytes().map_err(|_| bad("truncated keystore"))?;
         r.finish().map_err(|_| bad("trailing bytes in keystore"))?;
 
-        let allow_expensive_kdf = expected_expensive_kdf.is_some();
+        let allow_expensive_kdf = expected_existing_kdf.is_some();
         if allow_expensive_kdf && (kdf.m_cost > KDF_DEFAULT_MAX_M_COST_KIB
             || u64::from(kdf.m_cost).saturating_mul(u64::from(kdf.t_cost)) > KDF_DEFAULT_MAX_WORK_KIB)
         {
@@ -1457,7 +1458,7 @@ mod tests {
         bytes[9..13].copy_from_slice(&high_memory.m_cost.to_le_bytes());
         bytes[13..17].copy_from_slice(&high_memory.t_cost.to_le_bytes());
         let error = Keystore::decode_sealed(&bytes, &Unlock::passphrase("disposable fixture")).err().unwrap();
-        assert!(error.to_string().contains("default 64 MiB cap"), "header must be refused before hash/decryption");
+        assert!(error.to_string().contains("default production profile"), "non-production header must be refused before hash/decryption");
         assert!(hostile.validate_new_sealing().is_err(), "recovery cannot authorize new expensive files");
     }
 
@@ -1487,6 +1488,12 @@ mod tests {
 
         let key = Keystore { index: 1, pubkey: vec![1], secret: Zeroizing::new(vec![2]), randao_seed: [3; 32] };
         let bytes = key.seal_payload("disposable fixture", KdfParams { m_cost: 8, t_cost: 1, p_cost: 1 }).unwrap();
+        let default_error = Keystore::decode_sealed(
+            &bytes,
+            &Unlock::passphrase("disposable fixture"),
+        ).err().unwrap();
+        assert_eq!(default_error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(default_error.to_string().contains("default production profile"));
         let error = Keystore::decode_sealed(
             &bytes,
             &Unlock::passphrase("disposable fixture").allow_expensive_existing(Some(production)),
@@ -1505,7 +1512,14 @@ mod tests {
         assert!(ks.seal("legacy passphrase", KdfParams { t_cost: 2, ..KdfParams::PRODUCTION }).is_err());
         assert!(ks.seal("legacy passphrase", KdfParams { m_cost: 32768, ..KdfParams::PRODUCTION }).is_err());
         let historical = ks.seal_payload("legacy passphrase", legacy).unwrap();
-        let loaded = Keystore::decode_sealed(&historical, &Unlock::passphrase("legacy passphrase")).unwrap();
+        assert!(Keystore::decode_sealed(
+            &historical,
+            &Unlock::passphrase("legacy passphrase"),
+        ).is_err(), "non-production legacy costs require an exact recovery expectation");
+        let loaded = Keystore::decode_sealed(
+            &historical,
+            &Unlock::passphrase_with("legacy passphrase", legacy),
+        ).unwrap();
         assert_eq!(loaded.pubkey, ks.pubkey);
         assert_eq!(loaded.secret.as_slice(), ks.secret.as_slice());
         assert_eq!(loaded.randao_seed, ks.randao_seed);

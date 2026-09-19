@@ -160,17 +160,19 @@ of combined `memory_KiB × passes` work. Production is exactly 65,536 KiB × 3
 passes. These are resource bounds, not a wall-clock recovery guarantee;
 the existing absolute memory, iteration and lane caps also remain in force.
 
-For an independently verified authentic historical file deliberately sealed
-above either default limit, first run `bloch-pos keys inspect` without opening
-the file and independently confirm the artifact. Recovery then requires both
+Ordinary opening accepts only that exact production tuple, so an
+unauthenticated header cannot select even a cheaper non-production cost. For
+an independently verified authentic historical file sealed with any different
+parameters, first run `bloch-pos keys inspect` without opening the file and
+independently confirm the artifact. Recovery then requires both
 `BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF=1` and the exact public header tuple in
 `BLOCH_KEYSTORE_EXPECT_KDF=<memory_kib,passes,lanes>`. Any missing, malformed
 or different tuple is refused before Argon2. A matching tuple restores the
 original finite decoding limits (1 GiB memory, 64 passes, 16 lanes); it does
 not authorize more expensive new seals, weaken AEAD authentication or change
-the file format. Remove both variables after recovery. Weak historical
-parameters within the ordinary bounds remain decryptable with the existing
-warning.
+the file format. Remove both variables after recovery. An authenticated weak
+historical file remains recoverable under its exact reviewed tuple and emits
+the existing migration warning.
 
 ### Interactive terminal interruptions
 
