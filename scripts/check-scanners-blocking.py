@@ -522,6 +522,9 @@ NODE_PROPERTY_MAPPING_KEY = re.compile(
 )
 ALIAS_MAPPING_KEY = re.compile(r"^\s*(?:-\s+)?\*\S+\s*:")
 MERGE_MAPPING_KEY = re.compile(r"^\s*(?:-\s+)?<<\s*:")
+YAML_DIRECTIVE_OR_DOCUMENT_MARKER = re.compile(
+    r"^\s*(?:%.*|(?:---|\.\.\.)(?:\s+#.*)?)\s*$"
+)
 FLOW_MAPPING_START = re.compile(
     r"^\s*(?:-\s*)?(?:(?:[A-Za-z0-9_-]+)\s*:\s*)?\{(?!\{)"
 )
@@ -556,6 +559,10 @@ def ci_mapping_key_syntax_problems(
             problems.append(
                 f"{label}:{number}: YAML merge keys are outside the supported "
                 f"{provider} workflow subset")
+        if YAML_DIRECTIVE_OR_DOCUMENT_MARKER.match(line):
+            problems.append(
+                f"{label}:{number}: YAML directives and document boundaries are "
+                f"outside the supported {provider} workflow subset")
         if FLOW_MAPPING_START.match(line):
             problems.append(
                 f"{label}:{number}: flow-style YAML mappings are outside the "

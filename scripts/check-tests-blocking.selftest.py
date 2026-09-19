@@ -198,8 +198,26 @@ CASES = [
          "  stage: test\n"
          "  script:\n"
          "    - |\n"
-         "      \"not-a-yaml-key\": shell data\n",
+         "      \"not-a-yaml-key\": shell data\n"
+         "      %YAML 1.2\n"
+         "      --- # embedded document-looking data\n"
+         "      ...\n",
          GOOD_GITHUB, must_fail=False),
+    Case("GitLab leading YAML document marker is outside the subset",
+         "---\n" + GOOD_GITLAB, GOOD_GITHUB, must_fail=True,
+         expect="YAML directives and document boundaries"),
+    Case("GitLab earlier decoy document cannot hide the reviewed pipeline",
+         "decoy-only: true\n--- # later reviewed document\n" + GOOD_GITLAB,
+         GOOD_GITHUB, must_fail=True,
+         expect="YAML directives and document boundaries"),
+    Case("GitLab YAML directive is outside the subset",
+         "%TAG !audit! tag:example.invalid,2026:\n---\n" + GOOD_GITLAB,
+         GOOD_GITHUB, must_fail=True,
+         expect="YAML directives and document boundaries"),
+    Case("GitLab document-end marker is outside the subset",
+         GOOD_GITLAB + "\n... # end reviewed document\n",
+         GOOD_GITHUB, must_fail=True,
+         expect="YAML directives and document boundaries"),
     Case("GitLab root merge cannot inject an unreviewed runner image",
          ".runner-policy: &runner_policy\n"
          "  image: attacker.invalid/controlled:latest\n\n"
@@ -285,8 +303,24 @@ CASES = [
          "    runs-on: ubuntu-latest\n"
          "    steps:\n"
          "      - run: |\n"
-         "          \"not-a-yaml-key\": shell data\n",
+         "          \"not-a-yaml-key\": shell data\n"
+         "          %YAML 1.2\n"
+         "          --- # embedded document-looking data\n"
+         "          ...\n",
          must_fail=False),
+    Case("GitHub leading YAML document marker is outside the subset",
+         GOOD_GITLAB, "---\n" + GOOD_GITHUB, must_fail=True,
+         expect="YAML directives and document boundaries"),
+    Case("GitHub earlier decoy document cannot hide the reviewed workflow",
+         GOOD_GITLAB,
+         "decoy-only: true\n--- # later reviewed document\n" + GOOD_GITHUB,
+         must_fail=True, expect="YAML directives and document boundaries"),
+    Case("GitHub YAML directive is outside the subset",
+         GOOD_GITLAB, "%YAML 1.2\n---\n" + GOOD_GITHUB, must_fail=True,
+         expect="YAML directives and document boundaries"),
+    Case("GitHub document-end marker is outside the subset",
+         GOOD_GITLAB, GOOD_GITHUB + "\n...\n", must_fail=True,
+         expect="YAML directives and document boundaries"),
     Case("GitHub escaped workflow authority key is rejected globally",
          GOOD_GITLAB,
          GOOD_GITHUB + "\n\"permi\\u0073sions\":\n  contents: write\n",
