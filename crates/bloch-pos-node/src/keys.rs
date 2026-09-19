@@ -183,12 +183,12 @@ impl KdfParams {
         }
         if !allow_expensive && self.m_cost > KDF_DEFAULT_MAX_M_COST_KIB {
             return Err(io::Error::new(io::ErrorKind::InvalidData,
-                "keystore KDF memory cost exceeds the default 64 MiB cap; for a verified authentic legacy file only, explicitly set BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF=1 (the finite 1 GiB hard cap still applies)"));
+                "keystore KDF memory cost exceeds the default 64 MiB cap; for a verified authentic legacy file only, set BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF=1 and the exact BLOCH_KEYSTORE_EXPECT_KDF tuple (the finite 1 GiB hard cap still applies)"));
         }
         let work = u64::from(self.m_cost).saturating_mul(u64::from(self.t_cost));
         if !allow_expensive && work > KDF_DEFAULT_MAX_WORK_KIB {
             return Err(io::Error::new(io::ErrorKind::InvalidData,
-                "keystore combined KDF work exceeds the default 192 MiB-pass cap; for a verified authentic legacy file only, explicitly set BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF=1 (original finite parameter caps still apply)"));
+                "keystore combined KDF work exceeds the default 192 MiB-pass cap; for a verified authentic legacy file only, set BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF=1 and the exact BLOCH_KEYSTORE_EXPECT_KDF tuple (original finite parameter caps still apply)"));
         }
         let params = argon2::Params::new(self.m_cost, self.t_cost, self.p_cost, Some(32))
             .map_err(|_| {
@@ -229,8 +229,9 @@ pub enum Unlock {
         /// Cost used when *writing*. Reading always uses the parameters
         /// recorded in the file.
         kdf: KdfParams,
-        /// Recovery opt-in for existing files only; never changes new sealing.
-        allow_expensive_kdf: bool,
+        /// Exact operator-reviewed recovery cost for an existing file only;
+        /// never changes new sealing. `None` keeps the ordinary limits.
+        expected_expensive_kdf: Option<KdfParams>,
     },
     /// Explicit, operator-visible opt-in to PLAINTEXT at rest: read a legacy
     /// `BPOSKEY1` file, or write one. Devnet and tests.
@@ -243,7 +244,7 @@ impl Unlock {
         Unlock::Passphrase {
             pass: Zeroizing::new(pass.into()),
             kdf: KdfParams::PRODUCTION,
-            allow_expensive_kdf: false,
+            expected_expensive_kdf: None,
         }
     }
 
@@ -253,13 +254,56 @@ impl Unlock {
         Unlock::Passphrase {
             pass: Zeroizing::new(pass.into()),
             kdf,
-            allow_expensive_kdf: false,
+            expected_expensive_kdf: None,
         }
     }
 
-    fn allow_expensive_existing(mut self, allowed: bool) -> Self {
-        if let Self::Passphrase { allow_expensive_kdf, .. } = &mut self { *allow_expensive_kdf = allowed; }
+    fn allow_expensive_existing(mut self, expected: Option<KdfParams>) -> Self {
+        if let Self::Passphrase { expected_expensive_kdf, .. } = &mut self {
+            *expected_expensive_kdf = expected;
+        }
         self
+    }
+
+    fn expensive_kdf_expectation(
+        allow: Option<&std::ffi::OsStr>,
+        expected: Option<&std::ffi::OsStr>,
+    ) -> io::Result<Option<KdfParams>> {
+        let allowed = match allow {
+            None => false,
+            Some(value) if value == "0" => false,
+            Some(value) if value == "1" => true,
+            Some(_) => return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+                "BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF must be 0 or 1")),
+        };
+        if !allowed {
+            if expected.is_some() {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+                    "BLOCH_KEYSTORE_EXPECT_KDF requires BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF=1"));
+            }
+            return Ok(None);
+        }
+        let raw = expected.and_then(std::ffi::OsStr::to_str).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::PermissionDenied,
+                "expensive KDF recovery requires BLOCH_KEYSTORE_EXPECT_KDF=<memory_kib,passes,lanes> from a verified keys inspect result")
+        })?;
+        let mut parts = raw.split(',');
+        let mut next = || -> io::Result<u32> {
+            let value = parts.next().filter(|value| {
+                !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+            }).ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied,
+                "BLOCH_KEYSTORE_EXPECT_KDF must be exactly memory_kib,passes,lanes"))?;
+            value.parse().map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied,
+                "BLOCH_KEYSTORE_EXPECT_KDF contains an out-of-range value"))
+        };
+        let params = KdfParams { m_cost: next()?, t_cost: next()?, p_cost: next()? };
+        drop(next);
+        if parts.next().is_some() {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+                "BLOCH_KEYSTORE_EXPECT_KDF must be exactly memory_kib,passes,lanes"));
+        }
+        params.to_argon2_with_legacy_work(true)?;
+        Ok(Some(params))
     }
 
     /// Resolve the policy from the process environment, in priority order:
@@ -280,13 +324,9 @@ impl Unlock {
     /// that quietly read a plaintext key because nobody configured anything
     /// is the defect this function exists to close.
     pub fn from_env() -> io::Result<Unlock> {
-        let expensive = match std::env::var_os("BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF") {
-            None => false,
-            Some(value) if value == "0" => false,
-            Some(value) if value == "1" => true,
-            Some(_) => return Err(io::Error::new(io::ErrorKind::PermissionDenied,
-                "BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF must be 0 or 1")),
-        };
+        let expensive = std::env::var_os("BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF");
+        let expected = std::env::var_os("BLOCH_KEYSTORE_EXPECT_KDF");
+        let expensive = Self::expensive_kdf_expectation(expensive.as_deref(), expected.as_deref())?;
         if let Some(raw) = std::env::var_os("BLOCH_KEYSTORE_PASSPHRASE_FD") {
             if std::env::var_os("BLOCH_KEYSTORE_PASSPHRASE_FILE").is_some()
                 || std::env::var_os("BLOCH_KEYSTORE_PASSPHRASE").is_some()
@@ -715,7 +755,7 @@ impl Keystore {
 
     fn decode_sealed(bytes: &[u8], unlock: &Unlock) -> io::Result<Keystore> {
         let bad = |m: &'static str| io::Error::new(io::ErrorKind::InvalidData, m);
-        let Unlock::Passphrase { pass, allow_expensive_kdf, .. } = unlock else {
+        let Unlock::Passphrase { pass, expected_expensive_kdf, .. } = unlock else {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "validator.key is sealed and no passphrase is configured: set \
@@ -733,6 +773,10 @@ impl Keystore {
             t_cost: r.u32().map_err(|_| bad("truncated keystore"))?,
             p_cost: r.u32().map_err(|_| bad("truncated keystore"))?,
         };
+        if expected_expensive_kdf.is_some_and(|expected| expected != kdf) {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+                "keystore KDF header does not match BLOCH_KEYSTORE_EXPECT_KDF; refusing before derivation"));
+        }
         let salt = r.h32().map_err(|_| bad("truncated keystore"))?;
         // `take(24)` returns a slice of exactly 24 bytes or an `Err` above,
         // so the conversion cannot fail; the `else` arm keeps it panic-free
@@ -755,12 +799,13 @@ impl Keystore {
         let sealed = r.bytes().map_err(|_| bad("truncated keystore"))?;
         r.finish().map_err(|_| bad("trailing bytes in keystore"))?;
 
-        if *allow_expensive_kdf && (kdf.m_cost > KDF_DEFAULT_MAX_M_COST_KIB
+        let allow_expensive_kdf = expected_expensive_kdf.is_some();
+        if allow_expensive_kdf && (kdf.m_cost > KDF_DEFAULT_MAX_M_COST_KIB
             || u64::from(kdf.m_cost).saturating_mul(u64::from(kdf.t_cost)) > KDF_DEFAULT_MAX_WORK_KIB)
         {
-            eprintln!("WARNING: explicit legacy KDF recovery permits expensive derivation from an unauthenticated header; original memory/time/lane caps remain enforced");
+            eprintln!("WARNING: explicit legacy KDF recovery matched the operator-reviewed header cost; original memory/time/lane caps remain enforced");
         }
-        let key = kdf.derive_with_legacy_work(pass, &salt, *allow_expensive_kdf)?;
+        let key = kdf.derive_with_legacy_work(pass, &salt, allow_expensive_kdf)?;
         let cipher = XChaCha20Poly1305::new_from_slice(key.as_ref())
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "AEAD key length"))?;
         let plain = Zeroizing::new(
@@ -1414,6 +1459,40 @@ mod tests {
         let error = Keystore::decode_sealed(&bytes, &Unlock::passphrase("disposable fixture")).err().unwrap();
         assert!(error.to_string().contains("default 64 MiB cap"), "header must be refused before hash/decryption");
         assert!(hostile.validate_new_sealing().is_err(), "recovery cannot authorize new expensive files");
+    }
+
+    #[test]
+    fn audit_expensive_kdf_recovery_requires_one_exact_reviewed_tuple() {
+        let production = KdfParams::PRODUCTION;
+        assert_eq!(
+            Unlock::expensive_kdf_expectation(
+                Some(std::ffi::OsStr::new("1")),
+                Some(std::ffi::OsStr::new("65536,3,1")),
+            ).unwrap(),
+            Some(production),
+        );
+        assert!(Unlock::expensive_kdf_expectation(
+            Some(std::ffi::OsStr::new("1")), None).is_err());
+        assert!(Unlock::expensive_kdf_expectation(
+            None, Some(std::ffi::OsStr::new("65536,3,1"))).is_err());
+        for malformed in ["", "65536", "65536,3", "65536,3,1,0", "65536, 3,1", "-1,3,1"] {
+            assert!(Unlock::expensive_kdf_expectation(
+                Some(std::ffi::OsStr::new("1")), Some(std::ffi::OsStr::new(malformed))).is_err(),
+                "accepted malformed tuple {malformed:?}");
+        }
+        assert!(Unlock::expensive_kdf_expectation(
+            Some(std::ffi::OsStr::new("1")),
+            Some(std::ffi::OsStr::new("1048577,1,1")),
+        ).is_err());
+
+        let key = Keystore { index: 1, pubkey: vec![1], secret: Zeroizing::new(vec![2]), randao_seed: [3; 32] };
+        let bytes = key.seal_payload("disposable fixture", KdfParams { m_cost: 8, t_cost: 1, p_cost: 1 }).unwrap();
+        let error = Keystore::decode_sealed(
+            &bytes,
+            &Unlock::passphrase("disposable fixture").allow_expensive_existing(Some(production)),
+        ).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("does not match BLOCH_KEYSTORE_EXPECT_KDF"));
     }
 
     #[test]

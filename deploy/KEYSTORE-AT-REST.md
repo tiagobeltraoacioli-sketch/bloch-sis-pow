@@ -154,21 +154,23 @@ ceremony or validator migration is implied by these source changes.
 
 ### Default KDF resource limits (updated 2026-09-18)
 
-Opening a sealed file now applies two default limits before invoking Argon2: at
-most 262,144 KiB (256 MiB) for one allocation, and at most 1,048,576
-KiB-passes of combined `memory_KiB × passes` work. Production remains 65,536
-KiB × 3 passes. These are resource bounds, not a wall-clock recovery guarantee;
+Opening a sealed file applies two default limits before invoking Argon2: at
+most 65,536 KiB (64 MiB) for one allocation, and at most 196,608 KiB-passes
+of combined `memory_KiB × passes` work. Production is exactly 65,536 KiB × 3
+passes. These are resource bounds, not a wall-clock recovery guarantee;
 the existing absolute memory, iteration and lane caps also remain in force.
 
 For an independently verified authentic historical file deliberately sealed
-above either default limit, `BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF=1` explicitly
-restores the original finite decoding limits (1 GiB memory, 64 passes, 16
-lanes). It does not authorize more expensive new seals, weaken authentication,
-or change the file format. The node warns before performing such work; remove
-the override after recovery. An altered header is still unauthenticated until
-decryption succeeds, so the override belongs only to a controlled recovery of
-a known file. Values other than `0` or `1` are refused. Weak historical
-parameters within the bounds remain decryptable with the existing warning.
+above either default limit, first run `bloch-pos keys inspect` without opening
+the file and independently confirm the artifact. Recovery then requires both
+`BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF=1` and the exact public header tuple in
+`BLOCH_KEYSTORE_EXPECT_KDF=<memory_kib,passes,lanes>`. Any missing, malformed
+or different tuple is refused before Argon2. A matching tuple restores the
+original finite decoding limits (1 GiB memory, 64 passes, 16 lanes); it does
+not authorize more expensive new seals, weaken AEAD authentication or change
+the file format. Remove both variables after recovery. Weak historical
+parameters within the ordinary bounds remain decryptable with the existing
+warning.
 
 ### Interactive terminal interruptions
 

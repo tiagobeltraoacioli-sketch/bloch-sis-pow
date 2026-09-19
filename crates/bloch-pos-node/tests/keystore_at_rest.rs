@@ -52,6 +52,7 @@ fn run(args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
         .env_remove("BLOCH_KEYSTORE_PASSPHRASE_FILE")
         .env_remove("BLOCH_KEYSTORE_PASSPHRASE_FD")
         .env_remove("BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF")
+        .env_remove("BLOCH_KEYSTORE_EXPECT_KDF")
         .env_remove("BLOCH_KEYSTORE_ALLOW_PLAINTEXT");
     for (k, v) in env {
         c.env(k, v);
@@ -133,9 +134,26 @@ fn the_binary_reopens_a_sealed_keystore_only_with_the_passphrase() {
     let row = String::from_utf8_lossy(&ok.stdout);
     assert!(row.starts_with("0\t"), "unexpected cohort row: {row:?}");
     let recovery = run(&["keygen-public", "--dir", dir.to_str().unwrap()],
-        &[("BLOCH_KEYSTORE_PASSPHRASE", PASSPHRASE), ("BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF", "1")]);
+        &[("BLOCH_KEYSTORE_PASSPHRASE", PASSPHRASE),
+          ("BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF", "1"),
+          ("BLOCH_KEYSTORE_EXPECT_KDF", "65536,3,1")]);
     assert!(recovery.status.success(), "explicit bounded recovery must preserve ordinary decoding");
     assert_eq!(recovery.stdout, ok.stdout);
+    let missing_expectation = run(&["keygen-public", "--dir", dir.to_str().unwrap()],
+        &[("BLOCH_KEYSTORE_PASSPHRASE", PASSPHRASE), ("BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF", "1")]);
+    assert!(!missing_expectation.status.success());
+    assert!(stderr(&missing_expectation).contains("expensive KDF recovery requires BLOCH_KEYSTORE_EXPECT_KDF"));
+    let wrong_expectation = run(&["keygen-public", "--dir", dir.to_str().unwrap()],
+        &[("BLOCH_KEYSTORE_PASSPHRASE", PASSPHRASE),
+          ("BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF", "1"),
+          ("BLOCH_KEYSTORE_EXPECT_KDF", "65536,4,1")]);
+    assert!(!wrong_expectation.status.success());
+    assert!(stderr(&wrong_expectation).contains("does not match BLOCH_KEYSTORE_EXPECT_KDF"));
+    let expectation_without_opt_in = run(&["keygen-public", "--dir", dir.to_str().unwrap()],
+        &[("BLOCH_KEYSTORE_PASSPHRASE", PASSPHRASE),
+          ("BLOCH_KEYSTORE_EXPECT_KDF", "65536,3,1")]);
+    assert!(!expectation_without_opt_in.status.success());
+    assert!(stderr(&expectation_without_opt_in).contains("requires BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF=1"));
     let invalid = run(&["keygen-public", "--dir", dir.to_str().unwrap()],
         &[("BLOCH_KEYSTORE_PASSPHRASE", PASSPHRASE), ("BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF", "2")]);
     assert!(!invalid.status.success());
@@ -248,7 +266,8 @@ fn inherited_pipe_credentials_seal_and_reopen_without_secret_environment() {
         command.args(arguments).env_remove("BLOCH_KEYSTORE_PASSPHRASE")
             .env_remove("BLOCH_KEYSTORE_PASSPHRASE_FILE")
             .env_remove("BLOCH_KEYSTORE_ALLOW_EXPENSIVE_KDF")
-        .env_remove("BLOCH_KEYSTORE_ALLOW_PLAINTEXT")
+            .env_remove("BLOCH_KEYSTORE_EXPECT_KDF")
+            .env_remove("BLOCH_KEYSTORE_ALLOW_PLAINTEXT")
             .env("BLOCH_KEYSTORE_PASSPHRASE_FD", "0")
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         if conflict { command.env("BLOCH_KEYSTORE_PASSPHRASE", "unused-conflicting-value"); }
