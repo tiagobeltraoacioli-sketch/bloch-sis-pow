@@ -131,6 +131,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: google/osv-scanner-action/osv-scanner-action@764c91816374ff2d8fc2095dab36eecd42d61638
+        with:
+          scan-args: |-
+            --config=osv-scanner.toml
+            --lockfile=Cargo.lock
+            --lockfile=pool/Cargo.lock
+            --lockfile=pool-proxy/Cargo.lock
+            --lockfile=services/pq-shield-api/Cargo.lock
+            --lockfile=euvm-tooling/Cargo.lock
+            --lockfile=crates/coherence-prover/script/Cargo.lock
+            --lockfile=crates/coherence-prover/service/Cargo.lock
+            --lockfile=crates/coherence-prover/program/Cargo.lock
+            --lockfile=fuzz/Cargo.lock
+            --lockfile=spikes/prover-cost/Cargo.lock
+            --lockfile=spikes/prover-cost/rv32/Cargo.lock
+            --lockfile=spikes/prover-cost/rv32f/Cargo.lock
+            --lockfile=spikes/prover-cost/rv32h/Cargo.lock
+            --lockfile=spikes/prover-cost/rv32k/Cargo.lock
 
   secret-scan:
     runs-on: ubuntu-latest
@@ -255,6 +272,29 @@ CASES = [
              "google/osv-scanner-action/osv-scanner-action@764c91816374ff2d8fc2095dab36eecd42d61638",
              "google/osv-scanner-action/osv-scanner-action@main"),
          must_fail=True, expect="no longer executes its required verdict"),
+
+    Case("github OSV action cannot replace scanning with help",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "            --config=osv-scanner.toml",
+             "            --help"),
+         must_fail=True, expect="exact reviewed config and complete lockfile scan scope"),
+
+    Case("github OSV action cannot drop a standalone workspace lockfile",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "            --lockfile=pool/Cargo.lock\n", ""),
+         must_fail=True, expect="exact reviewed config and complete lockfile scan scope"),
+
+    Case("OSV config decoy in another step is not action input",
+         GOOD_GITLAB,
+         sub(
+             GOOD_GITHUB.replace("            --config=osv-scanner.toml\n", ""),
+             "            --lockfile=spikes/prover-cost/rv32k/Cargo.lock",
+             "            --lockfile=spikes/prover-cost/rv32k/Cargo.lock\n"
+             "      - name: --config=osv-scanner.toml\n"
+             "        run: echo decoy"),
+         must_fail=True, expect="exact reviewed config and complete lockfile scan scope"),
 
     Case("gitlab job name cannot replace the scanner verdict",
          GOOD_GITLAB.replace(

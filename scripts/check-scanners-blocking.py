@@ -73,6 +73,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shlex
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -127,6 +128,23 @@ SELFTEST_VERDICTS = {
     "scanners-blocking-guard": re.compile(
         r"^python3\s+scripts/check-scanners-blocking\.selftest\.py(?:\s|$)"),
 }
+OSV_REQUIRED_SCAN_ARGS = (
+    "--config=osv-scanner.toml",
+    "--lockfile=Cargo.lock",
+    "--lockfile=pool/Cargo.lock",
+    "--lockfile=pool-proxy/Cargo.lock",
+    "--lockfile=services/pq-shield-api/Cargo.lock",
+    "--lockfile=euvm-tooling/Cargo.lock",
+    "--lockfile=crates/coherence-prover/script/Cargo.lock",
+    "--lockfile=crates/coherence-prover/service/Cargo.lock",
+    "--lockfile=crates/coherence-prover/program/Cargo.lock",
+    "--lockfile=fuzz/Cargo.lock",
+    "--lockfile=spikes/prover-cost/Cargo.lock",
+    "--lockfile=spikes/prover-cost/rv32/Cargo.lock",
+    "--lockfile=spikes/prover-cost/rv32f/Cargo.lock",
+    "--lockfile=spikes/prover-cost/rv32h/Cargo.lock",
+    "--lockfile=spikes/prover-cost/rv32k/Cargo.lock",
+)
 
 SHELL_ESCAPES = (
     (re.compile(r"(^|[;&|\s])exit\s+0\b"), "an `exit 0` escape (the silent skip)"),
@@ -218,6 +236,64 @@ def explicit_execution_values(body: list[str], job_indent: int, label: str) -> l
     return values
 
 
+def github_action_input(
+    body: list[str], job_indent: int, action: re.Pattern[str], input_name: str
+) -> str | None:
+    """Read one scalar input from the same explicit step as a pinned action."""
+    step_indent = job_indent + 4
+    steps: list[list[str]] = []
+    current: list[str] | None = None
+    for line in body:
+        spaces = len(line) - len(line.lstrip(" "))
+        if spaces == step_indent and line.strip().startswith("- "):
+            current = []
+            steps.append(current)
+        if current is not None:
+            current.append(line)
+
+    for step in steps:
+        action_value = None
+        for line in step:
+            spaces = len(line) - len(line.lstrip(" "))
+            stripped = line.strip()
+            if spaces == step_indent and stripped.startswith("- uses:"):
+                action_value = stripped.split(":", 1)[1].strip()
+            elif spaces == step_indent + 2 and stripped.startswith("uses:"):
+                action_value = stripped.split(":", 1)[1].strip()
+        if action_value is None:
+            continue
+        action_value = re.sub(r"\s+#.*$", "", action_value).strip(" \"'")
+        if not action.fullmatch(action_value):
+            continue
+
+        in_with = False
+        index = 0
+        while index < len(step):
+            line = step[index]
+            spaces = len(line) - len(line.lstrip(" "))
+            stripped = line.strip()
+            if spaces == step_indent + 2:
+                in_with = stripped == "with:"
+            if in_with and spaces == step_indent + 4:
+                match = re.match(r"^([A-Za-z0-9_-]+):\s*(.*)$", stripped)
+                if match and match.group(1) == input_name:
+                    value = match.group(2).strip()
+                    index += 1
+                    if value in ("|", "|-", "|+", ">", ">-", ">+"):
+                        continuation = []
+                        while index < len(step):
+                            candidate = step[index]
+                            candidate_indent = len(candidate) - len(candidate.lstrip(" "))
+                            if candidate_indent <= spaces:
+                                break
+                            continuation.append(candidate.strip())
+                            index += 1
+                        return " ".join(continuation)
+                    return re.sub(r"\s+#.*$", "", value).strip(" \"'")
+            index += 1
+    return None
+
+
 def check_file(path: str, required: dict[str, str], indent: int, label: str) -> list[str]:
     if not os.path.exists(path):
         return ["%s: MISSING — the pipeline definition itself is gone" % label]
@@ -302,6 +378,19 @@ def check_file(path: str, required: dict[str, str], indent: int, label: str) -> 
                 "%s: job `%s` (%s) no longer executes the adversarial "
                 "self-test that proves its guard can fail"
                 % (label, job, why))
+        if label == ".github/workflows/security.yml" and job == "osv-scanner":
+            scan_args = github_action_input(
+                blocks[job], indent, GITHUB_VERDICTS[job], "scan-args")
+            try:
+                tokens = shlex.split(scan_args, comments=True) if scan_args is not None else []
+            except ValueError:
+                tokens = []
+            if (len(tokens) != len(OSV_REQUIRED_SCAN_ARGS)
+                    or set(tokens) != set(OSV_REQUIRED_SCAN_ARGS)):
+                problems.append(
+                    "%s: job `%s` must give the pinned action the exact reviewed "
+                    "config and complete lockfile scan scope"
+                    % (label, job))
         for line in blocks[job]:
             waiver = re.match(
                 r"^\s*(?:-\s+)?(allow_failure|continue-on-error):\s*(.*?)\s*(?:#.*)?$",
