@@ -2723,13 +2723,19 @@ impl Engine {
             return (Verdict::Ignore, None);
         }
         // Parked entries have already traversed admission. Suppress exact
-        // repeats before hashing bodies or verifying hybrid signatures. Compare
-        // signatures too: branch-dependent identities may park an envelope
-        // whose signature is not authentic under the eventual parent state.
+        // repeats across waiting, ready-to-promote, and future queues before
+        // hashing bodies or verifying hybrid signatures. The ready queue is
+        // load-bearing here: its parent is now known, so a repeated envelope
+        // would otherwise bypass cooperative promotion and enter immediately.
+        // Compare signatures too: branch-dependent identities may park an
+        // envelope whose signature is not authentic under the eventual parent
+        // state.
         let same_envelope = |seen: &[u8; 32], held: &BlockEnvelope| {
             *seen == id && held.proposer_sig == env.proposer_sig
         };
         if self.orphans.iter().any(|(seen, held, _)| same_envelope(seen, held))
+            || self.deferred_orphans.iter()
+                .any(|(seen, held, _)| same_envelope(seen, held))
             || self.future_blocks.get(&id)
                 .is_some_and(|(held, _)| held.proposer_sig == env.proposer_sig)
         {
@@ -12117,6 +12123,62 @@ mod ingest_admission_tests {
                 .count(),
             1,
         );
+    }
+
+    #[test]
+    fn repeated_deferred_orphan_cannot_bypass_its_promotion_slice() {
+        let _clock = validator_lifecycle::clock_at(32);
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let genesis = *engine.head_id().as_bytes();
+
+        engine.propose(1);
+        let parent = engine.blocks[engine.head_id().as_bytes()].clone();
+        engine.propose(2);
+        let child = engine.blocks[engine.head_id().as_bytes()].clone();
+        assert!(engine.do_reorg(genesis, Vec::new()));
+        engine.blocks.remove(parent.block_id().as_bytes()).expect("stored parent");
+        engine.blocks.remove(child.block_id().as_bytes()).expect("stored child");
+
+        let child_source = Source::Gossip(Some([0x73; 32]));
+        assert_eq!(
+            engine.ingest_from_judged(child.clone(), child_source),
+            Verdict::Ignore,
+        );
+        assert_eq!(
+            engine.ingest_from_judged(parent.clone(), Source::Gossip(Some([0x74; 32]))),
+            Verdict::Accept,
+        );
+        assert!(engine.orphans.is_empty());
+        assert_eq!(engine.deferred_orphans.len(), 1);
+        assert_eq!(engine.deferred_orphans[0].2, child_source);
+        assert_eq!(*engine.head_id().as_bytes(), *parent.block_id().as_bytes());
+
+        // Keep the already authenticated signed header, but make the body
+        // inconsistent with its commitment. Without the deferred-queue check,
+        // each delivery reaches body hashing and returns Reject; an unchanged
+        // duplicate can go further and enter immediately because its parent is
+        // now known, bypassing the one-block cooperative slice.
+        let mut replay = child.clone();
+        replay.body.transactions.push(vec![0xFF]);
+        assert_eq!(*replay.block_id().as_bytes(), *child.block_id().as_bytes());
+        for sequence in 0..ENGINE_EVENTS_PER_TURN.saturating_mul(2) {
+            let (verdict, landing) = engine.ingest_one(
+                replay.clone(),
+                Source::Gossip(Some([(sequence & 0xFF) as u8; 32])),
+            );
+            assert_eq!(verdict, Verdict::Ignore, "repeat {sequence} must be a cheap no-op");
+            assert!(landing.is_none());
+        }
+        assert_eq!(engine.deferred_orphans.len(), 1, "the FIFO copy remains unique");
+        assert_eq!(
+            crate::codec::encode_envelope(&engine.deferred_orphans[0].1),
+            crate::codec::encode_envelope(&child),
+            "reoffers cannot replace the authenticated FIFO copy",
+        );
+        assert_eq!(*engine.head_id().as_bytes(), *parent.block_id().as_bytes());
+
+        assert!(!engine.release_orphan_turn());
+        assert_eq!(*engine.head_id().as_bytes(), *child.block_id().as_bytes());
     }
 
     #[test]
