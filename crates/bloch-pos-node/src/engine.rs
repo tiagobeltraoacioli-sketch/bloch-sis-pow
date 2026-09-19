@@ -644,6 +644,10 @@ const FUTURE_BLOCKS_PER_TURN: usize = 1;
 const FUTURE_BLOCKS_MAX: usize = 32;
 const FUTURE_BLOCK_BYTES_MAX: usize = 16 * 1024 * 1024;
 const FUTURE_BLOCKS_PER_SOURCE: usize = 8;
+const FUTURE_BLOCK_BYTES_PER_SOURCE: usize = FUTURE_BLOCK_BYTES_MAX / 4;
+const _: () = assert!(
+    FUTURE_BLOCK_BYTES_PER_SOURCE >= crate::p2p::MAX_PROPOSAL_ENVELOPE_BYTES
+);
 
 /// How many recently-applied canonical post-states are retained so a reorg
 /// can start from the fork point instead of from genesis.
@@ -2955,15 +2959,20 @@ impl Engine {
         // their signed slot. Bound both count and payload memory (EN-05).
         if src.bounded_by_wall_clock() && self.live && env.header.slot > self.wall_slot() {
             let bytes = crate::codec::encode_envelope(&env).len();
-            let held: usize = self.future_blocks.values()
-                .map(|(block, _)| crate::codec::encode_envelope(block).len())
-                .sum();
-            let held_by_source = self.future_blocks.values()
-                .filter(|(_, held_source)| *held_source == src)
-                .count();
+            let (held, held_by_source, held_bytes_by_source) = self.future_blocks.values()
+                .fold((0usize, 0usize, 0usize), |acc, (block, held_source)| {
+                    let block_bytes = crate::codec::encode_envelope(block).len();
+                    let same_source = usize::from(*held_source == src);
+                    (
+                        acc.0.saturating_add(block_bytes),
+                        acc.1.saturating_add(same_source),
+                        acc.2.saturating_add(block_bytes.saturating_mul(same_source)),
+                    )
+                });
             if self.future_blocks.len() < FUTURE_BLOCKS_MAX
                 && held.saturating_add(bytes) <= FUTURE_BLOCK_BYTES_MAX
                 && held_by_source < FUTURE_BLOCKS_PER_SOURCE
+                && held_bytes_by_source.saturating_add(bytes) <= FUTURE_BLOCK_BYTES_PER_SOURCE
             {
                 self.future_blocks.insert(id, (env, src));
             }
@@ -11672,6 +11681,35 @@ mod ingest_admission_tests {
         env
     }
 
+    fn padded_repointed(
+        engine: &Engine,
+        template: &BlockEnvelope,
+        parent: [u8; 32],
+        slot: u64,
+        signature_bytes: usize,
+    ) -> BlockEnvelope {
+        let mut env = repointed(engine, template, parent, slot);
+        env.body.attestations.push(Attestation {
+            data: AttestationData {
+                slot,
+                head: parent,
+                source_epoch: 0,
+                source_root: [0; 32],
+                target_epoch: epoch_of(slot),
+                target_root: parent,
+            },
+            validator: 0,
+            signature: vec![0xA5; signature_bytes],
+        });
+        env.header.attestation_root = derive::attestation_root(&env.body.attestations);
+        env.proposer_sig = engine
+            .keys
+            .as_ref()
+            .expect("the proposing fixture holds a keystore")
+            .sign(&env.header.proposal_signing_root());
+        env
+    }
+
     /// One real proposal to use as a template, and the store size to compare
     /// against.
     fn fixture() -> (Engine, perf_support::TestDir, BlockEnvelope, usize) {
@@ -11918,6 +11956,66 @@ mod ingest_admission_tests {
                 .count(),
             1,
             "an independent source keeps its reserved share",
+        );
+    }
+
+    #[test]
+    fn one_source_cannot_occupy_the_future_byte_budget_and_capacity_reopens() {
+        let _clock = validator_lifecycle::clock_at(0);
+        let (mut engine, _dir, template, stored) = fixture();
+        let source_a = [0x41; 32];
+        let source_b = [0x42; 32];
+        let padding = 3 * 1024 * 1024;
+
+        let first_a = padded_repointed(&engine, &template, [0xA1; 32], 1, padding);
+        let envelope_bytes = crate::codec::encode_envelope(&first_a).len();
+        assert!(envelope_bytes <= FUTURE_BLOCK_BYTES_PER_SOURCE);
+        assert!(envelope_bytes.saturating_mul(2) > FUTURE_BLOCK_BYTES_PER_SOURCE);
+        assert!(envelope_bytes <= crate::p2p::MAX_PROPOSAL_ENVELOPE_BYTES);
+        assert_eq!(
+            engine.ingest_judged_from_source(first_a, Some(source_a)),
+            Verdict::Ignore,
+        );
+
+        let excess_a = padded_repointed(&engine, &template, [0xA2; 32], 2, padding);
+        let excess_a_id = *excess_a.block_id().as_bytes();
+        assert_eq!(
+            engine.ingest_judged_from_source(excess_a, Some(source_a)),
+            Verdict::Ignore,
+            "source byte pressure is local overload, never peer guilt",
+        );
+        assert_eq!(engine.future_blocks.len(), 1);
+        assert!(!engine.future_blocks.contains_key(&excess_a_id));
+
+        let first_b = padded_repointed(&engine, &template, [0xB1; 32], 3, padding);
+        assert_eq!(
+            engine.ingest_judged_from_source(first_b, Some(source_b)),
+            Verdict::Ignore,
+        );
+        assert_eq!(engine.future_blocks.len(), 2);
+        assert_eq!(engine.blocks.len(), stored);
+
+        let _release_clock = validator_lifecycle::clock_at(1);
+        assert!(!engine.release_future_blocks(1, FUTURE_BLOCKS_PER_TURN));
+        assert_eq!(engine.future_blocks.len(), 1);
+
+        let reopened_a = padded_repointed(&engine, &template, [0xA4; 32], 4, padding);
+        assert_eq!(
+            engine.ingest_judged_from_source(reopened_a, Some(source_a)),
+            Verdict::Ignore,
+        );
+        assert_eq!(
+            engine.future_blocks.values()
+                .filter(|(_, source)| *source == Source::Gossip(Some(source_a)))
+                .count(),
+            1,
+            "releasing the large envelope must reopen its byte allowance",
+        );
+        assert_eq!(
+            engine.future_blocks.values()
+                .filter(|(_, source)| *source == Source::Gossip(Some(source_b)))
+                .count(),
+            1,
         );
     }
 
