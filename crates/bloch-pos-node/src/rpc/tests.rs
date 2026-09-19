@@ -1779,6 +1779,7 @@ fn getbuildinfo_carries_a_bounded_build_environment_fingerprint() {
     assert!(scope.contains("not directly disclosed"));
     assert!(scope.contains("executable bytes"));
     assert!(scope.contains("configured linker/compiler/archive/wrapper bytes"));
+    assert!(scope.contains("compiler delegated by known wrappers"));
     assert_eq!(
         v.get("build_tool_binaries_hashed").unwrap().as_str(),
         Some("2"),
