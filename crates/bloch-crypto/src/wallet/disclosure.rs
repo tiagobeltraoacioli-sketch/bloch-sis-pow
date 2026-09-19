@@ -103,8 +103,8 @@ pub struct DisclosureEntry {
     pub address: String,
     /// The enveloped hybrid public key, base64.
     pub pubkey_b64: String,
-    /// Signature over the bundle's canonical digest, made with THIS index's
-    /// secret key. Base64.
+    /// Suite-enveloped hybrid signature over the bundle's canonical digest,
+    /// made with THIS index's secret key. Base64.
     pub sig_b64: String,
 }
 
@@ -317,6 +317,23 @@ impl DisclosureBundle {
     /// See the module docs for what a successful verify does and does NOT
     /// prove (no completeness, no same-seed claim).
     pub fn verify(&self) -> Result<VerifiedDisclosure, DisclosureError> {
+        self.verify_with(crypto::verify)
+    }
+
+    /// Verify a bundle with strict suite envelopes and canonical primitives.
+    ///
+    /// Version 1 documents both entry keys and signatures as enveloped. This
+    /// opt-in policy enforces that contract and rejects Falcon's alternate
+    /// zero-padded representation. [`Self::verify`] remains compatibility
+    /// preserving for disclosure files already distributed to auditors.
+    pub fn verify_canonical(&self) -> Result<VerifiedDisclosure, DisclosureError> {
+        self.verify_with(crypto::verify_enveloped_canonical)
+    }
+
+    fn verify_with(
+        &self,
+        verify_signature: fn(&[u8], &[u8], &[u8]) -> bool,
+    ) -> Result<VerifiedDisclosure, DisclosureError> {
         if self.version != DISCLOSURE_VERSION {
             return Err(DisclosureError::UnsupportedVersion(self.version));
         }
@@ -387,7 +404,7 @@ impl DisclosureBundle {
                 return Err(DisclosureError::Invalid(format!(
                     "entry {}: signature length {} out of bounds", e.index, sig.len())));
             }
-            if !crypto::verify(pk, &digest, &sig) {
+            if !verify_signature(pk, &digest, &sig) {
                 return Err(DisclosureError::SignatureInvalid { index: e.index });
             }
         }
@@ -506,6 +523,65 @@ mod tests {
         let json = serde_json::to_string_pretty(&bundle).unwrap();
         let back: DisclosureBundle = serde_json::from_str(&json).unwrap();
         back.verify().expect("serde roundtrip must still verify");
+    }
+
+    #[test]
+    fn canonical_verify_rejects_raw_and_padded_signature_encodings() {
+        let mut bundle = DisclosureBundle::create(
+            &SEED,
+            &[7],
+            Network::Testnet,
+            "canonical encoding audit",
+            "Acme Auditors LLP",
+        )
+        .unwrap();
+        let pk = B64.decode(&bundle.entries[0].pubkey_b64).unwrap();
+        let digest = bundle_digest(
+            Network::Testnet,
+            &bundle.purpose,
+            &bundle.audience,
+            &bundle.created_at,
+            &[(7, pk)],
+        );
+        let (_, sk) = keypair_at(&SEED, 7).unwrap();
+        let padded_len = crypto::SUITE_HEADER_LEN
+            + crypto::MLDSA_SIG_LEN
+            + crypto::falcon::padded_signature_len();
+        let compact = (0..64)
+            .map(|_| crypto::sign(&sk, &digest).unwrap())
+            .find(|candidate| {
+                candidate.len() < padded_len
+                    && !candidate[crypto::SUITE_HEADER_LEN..].starts_with(&[0xb1, 0x0c])
+            })
+            .expect("fixture must permit both raw fallback and Falcon padding");
+        bundle.entries[0].sig_b64 = B64.encode(&compact);
+
+        assert!(bundle.verify().is_ok());
+        assert!(bundle.verify_canonical().is_ok());
+
+        let mut raw = bundle.clone();
+        raw.entries[0].sig_b64 = B64.encode(&compact[crypto::SUITE_HEADER_LEN..]);
+        assert!(
+            raw.verify().is_ok(),
+            "compatibility verifier retains mixed enveloped-key/raw-signature fallback"
+        );
+        assert!(matches!(
+            raw.verify_canonical(),
+            Err(DisclosureError::SignatureInvalid { index: 7 })
+        ));
+
+        let mut padded_signature = compact;
+        padded_signature.resize(padded_len, 0);
+        let mut padded = bundle;
+        padded.entries[0].sig_b64 = B64.encode(&padded_signature);
+        assert!(
+            padded.verify().is_ok(),
+            "compatibility verifier retains padded Falcon acceptance"
+        );
+        assert!(matches!(
+            padded.verify_canonical(),
+            Err(DisclosureError::SignatureInvalid { index: 7 })
+        ));
     }
 
     #[test]
