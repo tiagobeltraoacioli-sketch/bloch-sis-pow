@@ -77,6 +77,14 @@ git archive --format=tar "$commit" | tar -xf - -C "$context"
   --file "$context/deploy/pos-release/Dockerfile" \
   "$context"
 
+# Emit one fixed byte per entry rather than counting printed path lines: an
+# engine-controlled filename containing a newline must not alter cardinality.
+entry_count="$(
+  find "$stage" -mindepth 1 -maxdepth 1 -exec printf x \; \
+    | wc -c | tr -d '[:space:]'
+)"
+[ "$entry_count" = 3 ] \
+  || fail "container export must contain exactly bloch-pos, SHA256SUMS and BUILD-INFO (found $entry_count entries)"
 for artifact in bloch-pos SHA256SUMS BUILD-INFO; do
   [ -f "$stage/$artifact" ] && [ ! -L "$stage/$artifact" ] \
     || fail "container export $artifact must be a regular non-symlink file"

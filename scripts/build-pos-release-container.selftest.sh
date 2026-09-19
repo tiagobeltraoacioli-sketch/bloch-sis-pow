@@ -133,6 +133,14 @@ if [ -n "${FAKE_SYMLINK_ARTIFACT:-}" ]; then
   mv "$stage/$artifact" "$target"
   ln -s "$target" "$stage/$artifact"
 fi
+case "${FAKE_EXTRA_ENTRY:-none}" in
+  none) ;;
+  regular) printf 'unexpected\n' > "$stage/unexpected-file" ;;
+  dotfile) printf 'unexpected\n' > "$stage/.unexpected-file" ;;
+  subdir) mkdir "$stage/unexpected-directory" ;;
+  fifo) mkfifo "$stage/unexpected-fifo" ;;
+  *) exit 66 ;;
+esac
 ENGINE
 chmod 0755 "$fake_engine"
 
@@ -143,6 +151,7 @@ run_wrapper() {
   local artifact_kind="${9:-canonical-container-candidate}"
   local artifact_duplicate="${10:-0}"
   local symlink_artifact="${11:-}"
+  local extra_entry="${12:-none}"
   FAKE_MANIFEST_MODE="$mode" FAKE_DEPLOYMENT_AUTHORIZED="$authorized" \
     FAKE_DUPLICATE_DEPLOYMENT_AUTHORIZED="$duplicate" \
     FAKE_SIGNED="$signed" FAKE_DUPLICATE_SIGNED="$signed_duplicate" \
@@ -151,6 +160,7 @@ run_wrapper() {
     FAKE_ARTIFACT_KIND="$artifact_kind" \
     FAKE_DUPLICATE_ARTIFACT_KIND="$artifact_duplicate" \
     FAKE_SYMLINK_ARTIFACT="$symlink_artifact" \
+    FAKE_EXTRA_ENTRY="$extra_entry" \
     CONTAINER_ENGINE="$fake_engine" \
     bash scripts/build-pos-release-container.sh "$output"
 }
@@ -217,6 +227,25 @@ expect_symlink_failure() {
   }
 }
 
+expect_extra_entry_failure() {
+  local mode="$1" output="$work/extra-$1" log="$work/extra-$1.log"
+  if run_wrapper canonical "$output" false 0 false 0 "" 0 \
+      canonical-container-candidate 0 "" "$mode" > "$log" 2>&1; then
+    echo "selftest: wrapper accepted $mode extra export entry" >&2
+    exit 1
+  fi
+  grep -Fq 'container export must contain exactly bloch-pos, SHA256SUMS and BUILD-INFO (found 4 entries)' \
+      "$log" || {
+    echo "selftest: $mode extra entry failed without expected diagnostic" >&2
+    cat "$log" >&2
+    exit 1
+  }
+  [ ! -e "$output" ] || {
+    echo "selftest: wrapper published output after rejecting $mode extra entry" >&2
+    exit 1
+  }
+}
+
 run_wrapper canonical "$work/canonical" > "$work/canonical.log" 2>&1
 grep -Fq 'build-pos-release-container: PASS' "$work/canonical.log"
 cmp -s <(printf '%s  bloch-pos\n' "$(
@@ -239,6 +268,9 @@ expect_sha_failure multirow \
 
 for artifact in bloch-pos SHA256SUMS BUILD-INFO; do
   expect_symlink_failure "$artifact"
+done
+for mode in regular dotfile subdir fifo; do
+  expect_extra_entry_failure "$mode"
 done
 
 manifest_error='exported SHA256SUMS is not the exact canonical one-line manifest'
