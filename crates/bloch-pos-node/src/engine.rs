@@ -137,6 +137,11 @@ pub enum EngineEvent {
 /// returns to slot duties after bounded work.
 const ENGINE_SCHEDULER_CAP: usize = net::ENGINE_QUEUE_CAP + 64;
 const ENGINE_EVENTS_PER_TURN: usize = 32;
+/// Maximum events from each class between two slot/duty checks. Blocks have
+/// the smallest slice because one admitted block can execute a transition,
+/// rebuild fork choice, and release parked descendants. The other classes
+/// retain the eight-event share they received under a fully mixed round.
+const ENGINE_EVENTS_PER_CLASS_PER_TURN: [usize; 4] = [1, 8, 8, 8];
 
 /// Node-local fair scheduler for already-admitted work. FIFO is preserved
 /// inside each class; strict round-robin between non-empty classes prevents a
@@ -168,17 +173,27 @@ impl<T> FairQueue<T> {
         self.classes[class % self.classes.len()].push_back(event);
     }
 
-    fn pop_batch(&mut self, limit: usize) -> Vec<T> {
+    fn pop_batch(&mut self, limit: usize, class_limits: [usize; 4]) -> Vec<T> {
         let mut batch = Vec::with_capacity(limit.min(self.len()));
+        let mut used = [0usize; 4];
         while batch.len() < limit && !self.is_empty() {
+            let mut found = false;
             for offset in 0..4 {
                 let class = self.cursor.saturating_add(offset) % 4;
+                if used[class] >= class_limits[class] {
+                    continue;
+                }
                 let next = self.classes[class].pop_front();
                 if let Some(event) = next {
                     batch.push(event);
+                    used[class] = used[class].saturating_add(1);
                     self.cursor = class.saturating_add(1) % 4;
+                    found = true;
                     break;
                 }
+            }
+            if !found {
+                break;
             }
         }
         batch
@@ -196,7 +211,7 @@ fn engine_event_class(event: &EngineEvent) -> usize {
 
 #[cfg(test)]
 mod fair_engine_queue_tests {
-    use super::FairQueue;
+    use super::{FairQueue, ENGINE_EVENTS_PER_CLASS_PER_TURN};
 
     #[test]
     fn lower_priority_backlog_cannot_hide_other_admitted_classes() {
@@ -209,15 +224,18 @@ mod fair_engine_queue_tests {
         queue.push(0, (0, 0));
 
         assert_eq!(
-            queue.pop_batch(4),
+            queue.pop_batch(4, ENGINE_EVENTS_PER_CLASS_PER_TURN),
             vec![(0, 0), (1, 0), (2, 0), (3, 0)],
             "every admitted class must receive headroom in the first turn",
         );
-        assert_eq!(queue.pop_batch(2), vec![(2, 1), (2, 2)]);
+        assert_eq!(
+            queue.pop_batch(2, ENGINE_EVENTS_PER_CLASS_PER_TURN),
+            vec![(2, 1), (2, 2)],
+        );
     }
 
     #[test]
-    fn sustained_mixed_backlog_is_strict_round_robin_and_fifo_per_class() {
+    fn sustained_mixed_backlog_is_cost_sliced_and_fifo_per_class() {
         let mut queue = FairQueue::default();
         for class in 0..4 {
             for sequence in 0..64 {
@@ -226,15 +244,38 @@ mod fair_engine_queue_tests {
         }
 
         for turn in 0..8 {
-            let batch = queue.pop_batch(32);
+            let batch = queue.pop_batch(32, ENGINE_EVENTS_PER_CLASS_PER_TURN);
             let mut counts = [0usize; 4];
             for (class, sequence) in batch {
-                assert_eq!(sequence, turn * 8 + counts[class]);
+                let expected_start = if class == 0 { turn } else { turn * 8 };
+                assert_eq!(sequence, expected_start + counts[class]);
                 counts[class] = counts[class].saturating_add(1);
             }
-            assert_eq!(counts, [8, 8, 8, 8]);
+            assert_eq!(counts, ENGINE_EVENTS_PER_CLASS_PER_TURN);
         }
-        assert!(queue.is_empty());
+        assert_eq!(queue.len(), 56, "only the expensive block tail remains");
+    }
+
+    #[test]
+    fn block_flood_yields_to_the_slot_loop_after_one_event() {
+        let mut queue = FairQueue::default();
+        for sequence in 0..4096 {
+            queue.push(0, (0usize, sequence));
+        }
+        queue.push(1, (1, 0));
+        queue.push(2, (2, 0));
+        queue.push(3, (3, 0));
+
+        assert_eq!(
+            queue.pop_batch(32, ENGINE_EVENTS_PER_CLASS_PER_TURN),
+            vec![(0, 0), (1, 0), (2, 0), (3, 0)],
+            "one expensive block and every other present class make progress",
+        );
+        assert_eq!(
+            queue.pop_batch(32, ENGINE_EVENTS_PER_CLASS_PER_TURN),
+            vec![(0, 1)],
+            "a block-only tail must return to duty checks after every block",
+        );
     }
 }
 
@@ -6084,7 +6125,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
             }
         }
         if !admitted_work.is_empty() {
-            let pending = admitted_work.pop_batch(ENGINE_EVENTS_PER_TURN);
+            let pending = admitted_work.pop_batch(
+                ENGINE_EVENTS_PER_TURN,
+                ENGINE_EVENTS_PER_CLASS_PER_TURN,
+            );
             // Queue telemetry, before the batch is worked: what the
             // transports hold for this engine right now, and what they
             // have shed since start (O06).
