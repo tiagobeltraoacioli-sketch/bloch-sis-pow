@@ -166,7 +166,16 @@ case "${1:-}" in
     done
     [ -n "$target" ]
     mkdir -p "$target/release"
-    cp "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos"
+    case "${INTEGRITY_BINARY_MODE:-canonical}:$target" in
+      canonical:*) cp "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
+      symlink-first:*/t1) ln -s "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
+      symlink-second:*/t2) ln -s "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
+      hardlink-first:*/t1) ln "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
+      hardlink-second:*/t2) ln "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
+      symlink-first:*|symlink-second:*|hardlink-first:*|hardlink-second:*)
+        cp "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
+      *) exit 74 ;;
+    esac
     chmod 0755 "$target/release/bloch-pos"
     ;;
   *) exit 70 ;;
@@ -390,6 +399,29 @@ def main() -> int:
             else:
                 print("  ok   canonical full-mode SHA-256 output passes")
 
+            binary_cases = {
+                "symlink-first": "release build 1 output is not a regular non-symlink file",
+                "symlink-second": "release build 2 output is not a regular non-symlink file",
+                "hardlink-first": "release build 1 output must have exactly one hard link",
+                "hardlink-second": "release build 2 output must have exactly one hard link",
+            }
+            for mode, expected in binary_cases.items():
+                result = run_guard(
+                    root, args=[],
+                    extra_env={**full_env, "INTEGRITY_BINARY_MODE": mode},
+                )
+                output = result.stdout + result.stderr
+                if result.returncode == 0:
+                    FAILURES.append(f"full mode accepted {mode} binary alias\n{output}")
+                elif expected not in output:
+                    FAILURES.append(f"full mode rejected {mode} binary alias "
+                                    f"without {expected!r}\n{output}")
+                elif "determinism: ok" in output:
+                    FAILURES.append(f"full mode claimed determinism after rejecting "
+                                    f"{mode} binary alias\n{output}")
+                else:
+                    print(f"  ok   full mode refuses {mode} binary alias")
+
             sha_cases = {
                 "exit": "SHA-256 tool failed for release build 1",
                 "short": "digest that is not exactly 64 characters for release build 1",
@@ -444,8 +476,9 @@ def main() -> int:
             print(f"\n- {f}", file=sys.stderr)
         return 1
     print("\npos-release-integrity.selftest: PASS — lock/layout drift, tracked "
-          "release-source edits and malformed full-mode digests fail closed; "
-          "untracked output remains outside the cleanliness contract.")
+          "release-source edits, aliased build outputs and malformed full-mode "
+          "digests fail closed; untracked output remains outside the cleanliness "
+          "contract.")
     return 0
 
 
