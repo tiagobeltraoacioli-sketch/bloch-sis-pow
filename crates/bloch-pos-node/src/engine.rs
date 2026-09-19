@@ -4613,13 +4613,26 @@ impl Engine {
         // Retain unrelated gaps; they still need normal synchronization.
         let mut refused: BTreeSet<[u8; 32]> = branch.iter()
             .map(|env| *env.block_id().as_bytes()).collect();
-        loop {
-            let Some(index) = self.orphans.iter()
-                .position(|(_, env, _, _, _)| refused.contains(&env.header.parent)) else { break };
-            let Some((id, _, _, _, _)) = self.orphans.remove(index) else { break };
-            refused.insert(id);
-            self.orphans_evicted = self.orphans_evicted.saturating_add(1);
+        let mut pending: VecDeque<[u8; 32]> = refused.iter().copied().collect();
+        let mut children: BTreeMap<[u8; 32], Vec<[u8; 32]>> = BTreeMap::new();
+        for (id, env, _, _, _) in &self.orphans {
+            children.entry(env.header.parent).or_default().push(*id);
         }
+        let mut doomed = BTreeSet::new();
+        while let Some(parent) = pending.pop_front() {
+            if let Some(descendants) = children.remove(&parent) {
+                for id in descendants {
+                    doomed.insert(id);
+                    if refused.insert(id) {
+                        pending.push_back(id);
+                    }
+                }
+            }
+        }
+        let before = self.orphans.len();
+        self.orphans.retain(|(id, _, _, _, _)| !doomed.contains(id));
+        self.orphans_evicted = self.orphans_evicted
+            .saturating_add(before.saturating_sub(self.orphans.len()) as u64);
 
     }
 
@@ -13309,6 +13322,61 @@ mod ingest_admission_tests {
         engine.needs_sync = false;
         assert!(matches!(engine.ingest_one(child, Source::Gossip(None)).0, Verdict::Ignore));
         assert!(!engine.needs_sync, "a refused parent is not a missing sync gap");
+    }
+
+    #[test]
+    fn finality_refusal_removes_reverse_arrival_tree_once_and_preserves_survivor() {
+        let (mut engine, _dir, template, _) = fixture();
+        let refused = repointed(&engine, &template, [0xA2; 32], 2);
+        let refused_id = *refused.block_id().as_bytes();
+
+        // 253 blocks form a chain. Two more branch from its middle, so the
+        // traversal must handle multiple children as well as reverse arrival.
+        let mut descendants = Vec::with_capacity(ORPHAN_MAX - 1);
+        let mut parent = refused_id;
+        for i in 0..(ORPHAN_MAX - 3) {
+            let env = repointed(&engine, &template, parent, (i as u64).saturating_add(3));
+            parent = *env.block_id().as_bytes();
+            descendants.push(env);
+        }
+        let branch_parent = *descendants[ORPHAN_MAX / 2].block_id().as_bytes();
+        for slot in [10_000, 10_001] {
+            descendants.push(repointed(&engine, &template, branch_parent, slot));
+        }
+        assert_eq!(descendants.len(), ORPHAN_MAX - 1);
+        let branch_ids: Vec<_> = descendants[descendants.len() - 2..]
+            .iter()
+            .map(|env| *env.block_id().as_bytes())
+            .collect();
+
+        // The direct child lands last. The old `position + remove` loop
+        // therefore walked nearly the whole shrinking queue per discovery.
+        for orphan in descendants.into_iter().rev() {
+            engine.park_orphan(*orphan.block_id().as_bytes(), orphan, Source::Local);
+        }
+        let unrelated = repointed(&engine, &template, [0xB2; 32], 20_000);
+        let unrelated_id = *unrelated.block_id().as_bytes();
+        let unrelated_bytes = crate::codec::encoded_envelope_len(&unrelated);
+        let unrelated_source = Source::Gossip(Some([0xB2; 32]));
+        engine.park_orphan(unrelated_id, unrelated.clone(), unrelated_source);
+        assert_eq!(engine.orphans.len(), ORPHAN_MAX);
+
+        engine.needs_sync = false;
+        let evicted_before = engine.orphans_evicted;
+        engine.refuse_finality_rewind((1, [0xC2; 32]), &[refused]);
+
+        assert_eq!(engine.orphans_evicted - evicted_before, (ORPHAN_MAX - 1) as u64);
+        assert_eq!(engine.orphans.len(), 1);
+        let (id, retained, source, authentication, bytes) = &engine.orphans[0];
+        assert_eq!(*id, unrelated_id);
+        assert_eq!(crate::codec::encode_envelope(retained), crate::codec::encode_envelope(&unrelated));
+        assert_eq!(*source, unrelated_source);
+        assert!(authentication.is_none());
+        assert_eq!(*bytes, unrelated_bytes);
+        assert!(!engine.needs_sync, "finality cleanup does not fabricate a new sync gap");
+        assert_eq!(engine.parked_refused_finality.len(), 1);
+        assert_eq!(engine.parked_refused_finality[0], refused_id);
+        assert!(branch_ids.iter().all(|id| !engine.parked_refused_finality.contains(id)));
     }
 
     #[test]
