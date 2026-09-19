@@ -119,6 +119,12 @@ const IDX_MAGIC: &[u8; 8] = b"BPOSIDX1";
 /// One index record: `slot u64 LE ‖ offset u64 LE ‖ frame_len u32 LE`.
 const IDX_ENTRY_LEN: u64 = 8 + 8 + 4;
 
+/// Maximum complete frames one network request may inspect beyond the last
+/// valid index record. A normal crash window is one frame; 4,096 is over a day
+/// of 30-second slots while still making a persistent index-append failure a
+/// bounded local fault repaired by restart instead of remote O(chain) work.
+const MAX_UNINDEXED_TAIL_SCAN_FRAMES: usize = 4_096;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct IdxEntry {
     slot: u64,
@@ -1330,7 +1336,14 @@ impl Store {
             Some(Start::Nothing) => return Ok(Vec::new()),
             Some(Start::At { offset, expect_slot }) => {
                 if let Some(page) =
-                    Self::scan_page(&log_path, offset, expect_slot, after_slot, limit)?
+                    Self::scan_page(
+                        &log_path,
+                        offset,
+                        expect_slot,
+                        after_slot,
+                        limit,
+                        MAX_UNINDEXED_TAIL_SCAN_FRAMES,
+                    )?
                 {
                     return Ok(page);
                 }
@@ -1351,22 +1364,28 @@ impl Store {
         }
     }
 
-    /// The scan itself, from `from` to the cap. Returns `Ok(None)` — and only
-    /// then — when `expect_slot` is set and the frame at `from` does not carry
-    /// it, which is the caller's signal that the index is not describing this
-    /// log and serving must fail closed until the index is rebuilt.
+    /// The scan itself, from `from` to the page cap. A scan beyond the valid
+    /// index prefix also has a frame-work cap; indexed hits are already bounded
+    /// by the response count/byte limits and do not spend that allowance.
+    /// Returns `Ok(None)` — and only then — when `expect_slot` is set and the
+    /// frame at `from` does not carry it, which is the caller's signal that the
+    /// index is not describing this log and serving must fail closed until the
+    /// index is rebuilt.
     fn scan_page(
         log_path: &Path,
         from: u64,
         expect_slot: Option<u64>,
         after_slot: u64,
         limit: usize,
+        max_unindexed_frames: usize,
     ) -> io::Result<Option<Vec<Vec<u8>>>> {
         let mut f = io::BufReader::new(File::open(log_path)?);
         if from > 0 {
             f.seek(SeekFrom::Start(from))?;
         }
+        let unindexed_tail = expect_slot.is_none();
         let mut expect = expect_slot;
+        let mut unindexed_frames = 0usize;
         let mut out = Vec::new();
         let mut page_bytes = 0usize;
         let mut len4 = [0u8; 4];
@@ -1381,6 +1400,16 @@ impl Store {
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e),
             }
+            if unindexed_tail && unindexed_frames >= max_unindexed_frames {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unindexed block-log tail exceeds the {max_unindexed_frames}-frame \
+                         serving bound; restart to rebuild the derived index"
+                    ),
+                ));
+            }
+            unindexed_frames = unindexed_frames.saturating_add(1);
             let len = u32::from_le_bytes(len4) as usize;
             if len > crate::codec::MAX_FIELD_LEN {
                 if expect.is_some() {
@@ -2209,6 +2238,55 @@ mod tests {
         let tail_only = Store::blocks_after(&dir, 9, 100).expect("scan");
         assert_eq!(tail_only, logged[9..], "the unindexed tip must still be served");
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_excessive_unindexed_tail_fails_at_the_scan_bound() {
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-pos-idx-tail-bound-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[15u8; 32]).expect("open");
+        for slot in 1..=4u64 {
+            store.append(&sample_envelope(slot)).expect("append");
+        }
+        drop(store);
+
+        // Leave one indexed frame and three valid log frames beyond it. The
+        // production allowance is intentionally generous, so inject a bound
+        // of two here to reach the same branch without creating thousands of
+        // fsynced blocks in a unit test.
+        let idx_path = dir.join("blocks.idx");
+        let idx = OpenOptions::new().write(true).open(&idx_path).expect("open idx");
+        idx.set_len(8 + IDX_ENTRY_LEN).expect("truncate idx");
+        drop(idx);
+        let mut idx = File::open(&idx_path).expect("read idx");
+        let covered = idx_read(&mut idx, 0).expect("first record").end();
+
+        let before = sync_frames_scanned();
+        let error = Store::scan_page(
+            &dir.join("blocks.log"),
+            covered,
+            None,
+            u64::MAX,
+            100,
+            2,
+        )
+        .expect_err("the third unindexed frame must exceed the injected bound");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("restart to rebuild the derived index"));
+        assert_eq!(
+            sync_frames_scanned() - before,
+            2,
+            "the frame past the allowance must not have its header parsed",
+        );
+
+        // The same valid tail remains below the production allowance and is
+        // served unchanged, preserving the ordinary one-append crash window.
+        let page = Store::blocks_after(&dir, 1, 100).expect("short tail remains compatible");
+        assert_eq!(page.len(), 3);
         let _ = fs::remove_dir_all(&dir);
     }
 
