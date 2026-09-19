@@ -840,10 +840,10 @@ const MAX_PROPOSALS_PER_GENESIS_DUTY: usize = 2;
 
 /// Cap on [`Engine::parked_refused_finality`] (R3 M-1). Same order as
 /// [`ORPHAN_MAX`] and the same FIFO-eviction shape, for the same reason:
-/// remembering a refusal must cost this node a bounded amount of memory, not
-/// one entry per byte a peer chooses to keep re-sending. 512 rather than 256
-/// because a refused BRANCH can be several blocks deep, where an orphan is
-/// always exactly one.
+/// remembering refusals must cost this node a bounded number of fixed-size
+/// identities, independent of the bodies a peer chose to send. 512 rather
+/// than 256 because a refused BRANCH can be several blocks deep, where an
+/// orphan is always exactly one.
 const MAX_PARKED_REFUSED_FINALITY: usize = 512;
 
 /// Cap on [`Engine::tx_slot_index`] (R4 F-11, `gettxstatus`). A public chain
@@ -1633,8 +1633,8 @@ struct Engine {
     /// `/metrics` as `bloch_pos_finality_rewinds_refused_total` and in
     /// `getchaininfo` (finding R3 M-1 — previously neither).
     finality_rewinds_refused: u64,
-    /// Blocks refused by the finality latch, PARKED rather than deleted (R3
-    /// M-1).
+    /// Block identities refused by the finality latch, PARKED rather than
+    /// forgotten (R3 M-1).
     ///
     /// The pre-fix behaviour deleted a refused branch's blocks from
     /// `self.blocks` outright. If the block(s) ever arrived again — and
@@ -1643,7 +1643,8 @@ struct Engine {
     /// refused — deletion meant re-authenticating them from scratch and
     /// running the whole `advance` cycle again, only to refuse and delete
     /// them again: a silent, unbounded-in-time loop with no trace beyond the
-    /// refusal counter. Parking them here means [`Engine::ingest_one`] can
+    /// refusal counter. Parking their identities here means
+    /// [`Engine::ingest_one`] can
     /// recognise a re-offer BEFORE any signature work and drop it at the
     /// door — the refusal becomes a fact this node remembers cheaply,
     /// instead of a verdict it re-derives expensively, forever.
@@ -1659,7 +1660,10 @@ struct Engine {
     /// bytes arriving, which is exactly the busy-loop deletion was trying to
     /// avoid — parking fixes the re-authentication cost without
     /// reintroducing that one.
-    parked_refused_finality: VecDeque<([u8; 32], BlockEnvelope)>,
+    /// Full envelopes are deliberately not retained: no later path reads
+    /// their header, signature or body, and a branch below this process's
+    /// finality latch can never become adoptable without a restart/override.
+    parked_refused_finality: VecDeque<[u8; 32]>,
     /// Set once at boot from `BLOCH_ALLOW_FINALITY_REWIND=1` /
     /// `--allow-finality-rewind` (R3 M-1): an operator's explicit,
     /// deliberate acknowledgement that a rewind below this node's own
@@ -3020,7 +3024,7 @@ impl Engine {
         // re-refuses forever" into a bounded, cheap no-op. See
         // `Engine::parked_refused_finality`'s doc.
         if self.parked_refused_finality.iter()
-            .any(|(seen, _)| *seen == id || *seen == env.header.parent)
+            .any(|seen| *seen == id || *seen == env.header.parent)
         {
             // A child cannot make a locally finality-conflicting ancestor
             // adoptable. Do not convert it into a missing-parent sync request.
@@ -4540,9 +4544,9 @@ impl Engine {
     /// and re-refusing the same head on every tick, forever, even with no new
     /// bytes arriving. That much is unchanged from before this fix.
     ///
-    /// What changes is that the blocks are not simply dropped: they are
-    /// parked in [`Engine::parked_refused_finality`], bounded and FIFO, so a
-    /// re-offer of the SAME branch is recognised and refused at the door
+    /// What changes is that the blocks are not simply forgotten: their
+    /// identities are parked in [`Engine::parked_refused_finality`], bounded
+    /// and FIFO, so a re-offer of the SAME branch is recognised at the door
     /// (`ingest_one`) before any signature work — never re-authenticated,
     /// never re-run through a whole `advance` cycle, never silently
     /// re-refused in a way this node cannot distinguish from the first time.
@@ -4552,8 +4556,8 @@ impl Engine {
         if self.live {
             eprintln!(
                 "FINALITY_LATCH: refused a reorg below this node's finalized checkpoint \
-                 (height {floor}, {}); parking the {} conflicting block(s) (cap {}, {} \
-                 currently parked) instead of deleting them, so a re-offer is refused at \
+                 (height {floor}, {}); parking identities for {} conflicting block(s) \
+                 (cap {}, {} currently parked) instead of forgetting them, so a re-offer is refused at \
                  the door rather than re-judged from scratch. Refusals so far: {}. If this \
                  rewind is EXPECTED, restart with --allow-finality-rewind or \
                  BLOCH_ALLOW_FINALITY_REWIND=1.",
@@ -4567,13 +4571,13 @@ impl Engine {
         for env in branch {
             let id = *env.block_id().as_bytes();
             self.blocks.remove(&id);
-            if self.parked_refused_finality.iter().any(|(seen, _)| *seen == id) {
+            if self.parked_refused_finality.contains(&id) {
                 continue;
             }
             while self.parked_refused_finality.len() >= MAX_PARKED_REFUSED_FINALITY {
                 self.parked_refused_finality.pop_front();
             }
-            self.parked_refused_finality.push_back((id, env.clone()));
+            self.parked_refused_finality.push_back(id);
         }
         // Entries may have arrived before the parent was refused. Remove the
         // entire bounded pending subtree, including reverse arrival order.
@@ -14375,9 +14379,72 @@ mod finality_latch_tests {
         engine.refuse_finality_rewind(latch, &[env]);
 
         assert!(
-            engine.parked_refused_finality.iter().any(|(id, _)| *id == evil_id),
+            engine.parked_refused_finality.contains(&evil_id),
             "a refused block must be parked, not merely dropped"
         );
+    }
+
+    #[test]
+    fn refused_finality_parks_only_ids_with_exact_fifo_and_descendant_door() {
+        let (mut engine, _dir, _floor, _root) = latched_engine();
+        let template = engine.blocks
+            .get(engine.chain[1].1.as_bytes())
+            .expect("block 1 stored")
+            .clone();
+        let mut branch = Vec::with_capacity(MAX_PARKED_REFUSED_FINALITY + 1);
+        for i in 0..=MAX_PARKED_REFUSED_FINALITY {
+            let mut env = template.clone();
+            env.header.slot = (i as u64).saturating_add(10_000);
+            env.header.parent = [0xD4; 32];
+            if i == 1 {
+                env.body.transactions.push(vec![0xA5; 3 * 1024 * 1024]);
+                assert!(
+                    crate::codec::encoded_envelope_len(&env)
+                        <= crate::p2p::MAX_PROPOSAL_ENVELOPE_BYTES,
+                    "the large control remains a transport-admissible envelope",
+                );
+            }
+            branch.push(env);
+        }
+        let oldest = *branch[0].block_id().as_bytes();
+        let large_id = *branch[1].block_id().as_bytes();
+        let newest = *branch.last().expect("cap+1 branch").block_id().as_bytes();
+        let before_refusals = engine.finality_rewinds_refused;
+        engine.refuse_finality_rewind(
+            engine.finalized_latch.expect("fixture is latched"),
+            &branch,
+        );
+
+        assert_eq!(engine.finality_rewinds_refused, before_refusals + 1);
+        assert_eq!(engine.parked_refused_finality.len(), MAX_PARKED_REFUSED_FINALITY);
+        assert!(!engine.parked_refused_finality.contains(&oldest), "cap+1 evicts FIFO oldest");
+        assert!(engine.parked_refused_finality.contains(&large_id));
+        assert!(engine.parked_refused_finality.contains(&newest));
+        assert_eq!(
+            std::mem::size_of_val(&engine.parked_refused_finality[0]),
+            std::mem::size_of::<[u8; 32]>(),
+            "parked entries retain identity only, never the large body",
+        );
+
+        let order_before = engine.parked_refused_finality.clone();
+        let mut same_id_variant = branch[1].clone();
+        same_id_variant.body.transactions.push(vec![0x5A]);
+        assert_eq!(*same_id_variant.block_id().as_bytes(), large_id);
+        engine.refuse_finality_rewind(
+            engine.finalized_latch.expect("fixture stays latched"),
+            &[same_id_variant],
+        );
+        assert_eq!(engine.parked_refused_finality, order_before, "exact-id dedup preserves FIFO");
+
+        let mut child = template;
+        child.header.parent = large_id;
+        child.header.slot = 20_000;
+        child.header.proposer_index = u32::MAX;
+        engine.needs_sync = false;
+        let rejected_before = engine.rejected_unsigned;
+        assert_eq!(engine.ingest_one(child, Source::Gossip(None)).0, Verdict::Ignore);
+        assert_eq!(engine.rejected_unsigned, rejected_before, "descendant door precedes crypto");
+        assert!(!engine.needs_sync, "a refused parent is not converted into a sync gap");
     }
 
     /// A re-offer of an already-parked, already-refused block is dropped at
