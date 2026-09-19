@@ -262,8 +262,7 @@ impl Wallet {
         let ef: encryption::EncryptedKeyfile = serde_json::from_slice(&bytes)
             .map_err(|e| WalletError::Parse(e.to_string()))?;
 
-        let (secret, public, network) = ef.decrypt(password)?;
-        let mut secret = wallet_secret_owner(secret);
+        let (mut secret, public, network) = ef.decrypt_zeroizing(password)?;
         let hash_full = Sha3_256::digest(&public);
         let mut addr_hash = [0u8; 20];
         addr_hash.copy_from_slice(&hash_full[..20]);

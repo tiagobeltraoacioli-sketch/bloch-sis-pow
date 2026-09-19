@@ -235,6 +235,16 @@ impl EncryptedKeyfile {
 
     /// Decrypt with password. Returns (secret, public, network).
     pub fn decrypt(&self, password: &str) -> Result<(Vec<u8>, Vec<u8>, Network), WalletError> {
+        let (mut secret, public, network) = self.decrypt_zeroizing(password)?;
+        Ok((std::mem::take(&mut *secret), public, network))
+    }
+
+    /// Repository-internal v1 decrypt path that retains wiping ownership until
+    /// the final wallet takes ownership of the authenticated secret.
+    pub(super) fn decrypt_zeroizing(
+        &self,
+        password: &str,
+    ) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>, Network), WalletError> {
         // Version check
         if self.version != KEYFILE_VERSION {
             return Err(WalletError::UnsupportedVersion(self.version));
@@ -320,11 +330,10 @@ impl EncryptedKeyfile {
         let net: Network = self.network.into();
         let aad = keyfile_aad(&public, net);
         decrypt_keyfile_ciphertext_in_place(&*key, &nonce_bytes, &aad, &mut ciphertext)?;
-        let secret = std::mem::take(&mut *ciphertext);
 
         key.zeroize();
 
-        Ok((secret, public, net))
+        Ok((ciphertext, public, net))
     }
 
     // ── v2: master seed encrypted at rest (P4) ────────────────────────────────
@@ -658,6 +667,43 @@ mod tests {
         assert_eq!(decrypted_secret, secret);
         assert_eq!(decrypted_public, public);
         assert!(matches!(decrypted_network, Network::Mainnet));
+    }
+
+    #[test]
+    fn v1_internal_decrypt_preserves_public_bytes_under_zeroizing_ownership() {
+        let _: fn(
+            &EncryptedKeyfile,
+            &str,
+        ) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>, Network), WalletError> =
+            EncryptedKeyfile::decrypt_zeroizing;
+        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
+
+        let secret = b"authenticated v1 keyfile secret";
+        let public = b"authenticated v1 public key";
+        let password = "correct horse battery staple";
+        let fast_params = KdfParams { m_cost: 1024, t_cost: 1, p_cost: 1 };
+        let keyfile = EncryptedKeyfile::encrypt_with_params(
+            secret,
+            public,
+            Network::Testnet,
+            password,
+            fast_params,
+        )
+        .unwrap();
+
+        let (mut protected, protected_public, protected_network) =
+            keyfile.decrypt_zeroizing(password).unwrap();
+        let (compatible, compatible_public, compatible_network) =
+            keyfile.decrypt(password).unwrap();
+        assert_eq!(&protected[..], secret);
+        assert_eq!(protected.as_slice(), compatible.as_slice());
+        assert_eq!(protected_public, compatible_public);
+        assert_eq!(protected_public, public);
+        assert!(matches!(protected_network, Network::Testnet));
+        assert!(matches!(compatible_network, Network::Testnet));
+
+        protected.zeroize();
+        assert!(protected.is_empty());
     }
 
     #[test]
