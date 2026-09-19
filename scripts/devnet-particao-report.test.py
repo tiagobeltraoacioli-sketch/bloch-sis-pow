@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 SCRIPT = Path(__file__).with_name("devnet-particao.sh").read_text()
-REPORT = SCRIPT.split('python3 - "$WORKDIR" "$tag" "$N" <<\'PY\'\n', 1)[1].split("\nPY\n", 1)[0]
+REPORT = SCRIPT.split('python3 -I - "$WORKDIR" "$tag" "$N" <<\'PY\'\n', 1)[1].split("\nPY\n", 1)[0]
 
 
 class ReportTests(unittest.TestCase):
@@ -35,7 +35,7 @@ class ReportTests(unittest.TestCase):
                 (root / "rpc" / f"test.node{index}.json").write_text(
                     json.dumps({"result": result}))
             return subprocess.run(
-                [sys.executable, "-c", REPORT, temp, "test", str(len(heads))],
+                [sys.executable, "-I", "-c", REPORT, temp, "test", str(len(heads))],
                 capture_output=True, text=True)
 
     def test_no_samples_fail(self):

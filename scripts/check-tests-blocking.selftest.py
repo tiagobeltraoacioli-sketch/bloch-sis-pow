@@ -18,8 +18,10 @@ directions:
   * missing, replaced, or symlinked local script entrypoints fail their byte
     integrity contract, including a transitively executed helper, while the
     checked-in entrypoints stay green.
+  * dropping Python isolated mode from either pipeline, or invoking the guard
+    itself without `-I`, fails closed.
 
-Run: python3 scripts/check-tests-blocking.selftest.py
+Run: python3 -I scripts/check-tests-blocking.selftest.py
 Exit 0 = the guard behaves as documented on all cases.
 """
 
@@ -65,8 +67,8 @@ build-and-test:
   stage: test
   script:
     - bash deploy/bootnodes/verify-bootnodes.selftest.sh
-    - python3 scripts/check-live-node-retired-isolation.py --selftest
-    - python3 scripts/check-live-node-retired-isolation.py
+    - python3 -I scripts/check-live-node-retired-isolation.py --selftest
+    - python3 -I scripts/check-live-node-retired-isolation.py
     - cargo build --workspace --all-targets
 """ + CRATE_ARGS + """\
   timeout: 120m
@@ -96,14 +98,14 @@ jobs:
           rustup toolchain install "$ch" --profile minimal --no-self-update
           echo "toolchain=$ch" >> "$GITHUB_OUTPUT"
       - run: sudo apt-get update && sudo apt-get install -y clang cmake
-      - run: python3 scripts/rehearse-validator-admission.py
-      - run: python3 scripts/check-validator-lifecycle-mutations.py
+      - run: python3 -I scripts/rehearse-validator-admission.py
+      - run: python3 -I scripts/check-validator-lifecycle-mutations.py
       - run: bash deploy/bootnodes/verify-bootnodes.selftest.sh
       - run: |
-          python3 scripts/check-live-node-retired-isolation.py --selftest
-          python3 scripts/check-live-node-retired-isolation.py
-      - run: python3 scripts/rehearse-validator-activation.py --output "$RUNNER_TEMP/validator-activation"
-      - run: python3 scripts/rehearse-validator-joining-network.py --output "$RUNNER_TEMP/validator-joining-network"
+          python3 -I scripts/check-live-node-retired-isolation.py --selftest
+          python3 -I scripts/check-live-node-retired-isolation.py
+      - run: python3 -I scripts/rehearse-validator-activation.py --output "$RUNNER_TEMP/validator-activation"
+      - run: python3 -I scripts/rehearse-validator-joining-network.py --output "$RUNNER_TEMP/validator-joining-network"
       - run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-node --bin bloch-pos audit_
       - run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p pqcrypto-internals
       - run: |
@@ -123,12 +125,12 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - run: python3 scripts/check-tests-blocking.selftest.py
-      - run: python3 scripts/check-tests-blocking.py
-      - run: python3 scripts/devnet-particao-report.test.py
-      - run: python3 scripts/rehearse-validator-activation.test.py
-      - run: python3 scripts/check-attested-ssh.selftest.py
-      - run: python3 scripts/check-attested-ssh.py
+      - run: python3 -I scripts/check-tests-blocking.selftest.py
+      - run: python3 -I scripts/check-tests-blocking.py
+      - run: python3 -I scripts/devnet-particao-report.test.py
+      - run: python3 -I scripts/rehearse-validator-activation.test.py
+      - run: python3 -I scripts/check-attested-ssh.selftest.py
+      - run: python3 -I scripts/check-attested-ssh.py
 """
 GOOD_GITHUB_WITH_ENV = GOOD_GITHUB.replace(
     "name: tests\n",
@@ -212,17 +214,17 @@ CASES = [
     Case("extra cargo setup cannot overwrite a rehearsal entrypoint",
          GOOD_GITLAB,
          GOOD_GITHUB.replace(
-             "      - run: python3 scripts/rehearse-validator-admission.py",
+             "      - run: python3 -I scripts/rehearse-validator-admission.py",
              "      - run: cp scripts/fake-rehearsal.py scripts/rehearse-validator-admission.py\n"
-             "      - run: python3 scripts/rehearse-validator-admission.py"),
+             "      - run: python3 -I scripts/rehearse-validator-admission.py"),
          must_fail=True, expect="reviewed ordered command list"),
     Case("cargo setup commands cannot be reordered",
          GOOD_GITLAB,
          GOOD_GITHUB.replace(
-             "      - run: python3 scripts/rehearse-validator-admission.py\n"
-             "      - run: python3 scripts/check-validator-lifecycle-mutations.py",
-             "      - run: python3 scripts/check-validator-lifecycle-mutations.py\n"
-             "      - run: python3 scripts/rehearse-validator-admission.py"),
+             "      - run: python3 -I scripts/rehearse-validator-admission.py\n"
+             "      - run: python3 -I scripts/check-validator-lifecycle-mutations.py",
+             "      - run: python3 -I scripts/check-validator-lifecycle-mutations.py\n"
+             "      - run: python3 -I scripts/rehearse-validator-admission.py"),
          must_fail=True, expect="reviewed ordered command list"),
     Case("cargo guard setup cannot be deleted",
          GOOD_GITLAB,
@@ -295,6 +297,19 @@ CASES = [
 
     Case("honest pipelines stay green", GOOD_GITLAB, GOOD_GITHUB, must_fail=False),
 
+    Case("github Python entrypoint cannot drop isolated mode",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "python3 -I scripts/rehearse-validator-admission.py",
+             "python3 scripts/rehearse-validator-admission.py", 1),
+         must_fail=True, expect="reviewed ordered command list"),
+
+    Case("gitlab Python entrypoint cannot drop isolated mode",
+         GOOD_GITLAB.replace(
+             "python3 -I scripts/check-live-node-retired-isolation.py --selftest",
+             "python3 scripts/check-live-node-retired-isolation.py --selftest", 1),
+         GOOD_GITHUB, must_fail=True, expect="exact ordered command contract"),
+
     Case("workspace superset cannot replace the reviewed GitLab script",
          WORKSPACE_GITLAB, GOOD_GITHUB, must_fail=True, expect="exact ordered command contract"),
 
@@ -313,24 +328,24 @@ CASES = [
 
     Case("github guard selftest cannot be removed while guard literal remains",
          GOOD_GITLAB,
-         sub(GOOD_GITHUB, "      - run: python3 scripts/check-tests-blocking.selftest.py\n", ""),
+         sub(GOOD_GITHUB, "      - run: python3 -I scripts/check-tests-blocking.selftest.py\n", ""),
          must_fail=True, expect="exact ordered contract"),
 
     Case("github guard and selftest cannot be reordered",
          GOOD_GITLAB,
          GOOD_GITHUB.replace(
-             "      - run: python3 scripts/check-tests-blocking.selftest.py\n"
-             "      - run: python3 scripts/check-tests-blocking.py\n",
-             "      - run: python3 scripts/check-tests-blocking.py\n"
-             "      - run: python3 scripts/check-tests-blocking.selftest.py\n"),
+             "      - run: python3 -I scripts/check-tests-blocking.selftest.py\n"
+             "      - run: python3 -I scripts/check-tests-blocking.py\n",
+             "      - run: python3 -I scripts/check-tests-blocking.py\n"
+             "      - run: python3 -I scripts/check-tests-blocking.selftest.py\n"),
          must_fail=True, expect="exact ordered contract"),
 
     Case("github guard checkout cannot move after commands",
          GOOD_GITLAB,
          GOOD_GITHUB.replace(
              "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"
-             "      - run: python3 scripts/check-tests-blocking.selftest.py\n",
-             "      - run: python3 scripts/check-tests-blocking.selftest.py\n"
+             "      - run: python3 -I scripts/check-tests-blocking.selftest.py\n",
+             "      - run: python3 -I scripts/check-tests-blocking.selftest.py\n"
              "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"),
          must_fail=True, expect="exact ordered contract"),
 
@@ -357,16 +372,16 @@ CASES = [
     Case("github guard cannot append a masking command",
          GOOD_GITLAB,
          GOOD_GITHUB.replace(
-             "      - run: python3 scripts/check-attested-ssh.py\n",
-             "      - run: python3 scripts/check-attested-ssh.py\n"
+             "      - run: python3 -I scripts/check-attested-ssh.py\n",
+             "      - run: python3 -I scripts/check-attested-ssh.py\n"
              "      - run: echo verdict replaced\n"),
          must_fail=True, expect="exact ordered contract"),
 
     Case("github guard command cannot gain step environment",
          GOOD_GITLAB,
          GOOD_GITHUB.replace(
-             "      - run: python3 scripts/check-tests-blocking.py\n",
-             "      - run: python3 scripts/check-tests-blocking.py\n"
+             "      - run: python3 -I scripts/check-tests-blocking.py\n",
+             "      - run: python3 -I scripts/check-tests-blocking.py\n"
              "        env:\n          PATH: /attacker/bin\n"),
          must_fail=True, expect="exact ordered contract"),
 
@@ -433,10 +448,10 @@ CASES = [
 
     Case("gitlab build-and-test commands cannot be reordered",
          GOOD_GITLAB.replace(
-             "    - python3 scripts/check-live-node-retired-isolation.py --selftest\n"
-             "    - python3 scripts/check-live-node-retired-isolation.py\n",
-             "    - python3 scripts/check-live-node-retired-isolation.py\n"
-             "    - python3 scripts/check-live-node-retired-isolation.py --selftest\n"),
+             "    - python3 -I scripts/check-live-node-retired-isolation.py --selftest\n"
+             "    - python3 -I scripts/check-live-node-retired-isolation.py\n",
+             "    - python3 -I scripts/check-live-node-retired-isolation.py\n"
+             "    - python3 -I scripts/check-live-node-retired-isolation.py --selftest\n"),
          GOOD_GITHUB, must_fail=True, expect="exact ordered command contract"),
 
     Case("gitlab duplicate script key is ambiguous",
@@ -535,7 +550,7 @@ def run(case: Case, tmp: str) -> tuple[int, str]:
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(body)
     proc = subprocess.run(
-        [sys.executable, CHECKER, "--gitlab", gl, "--github", gh],
+        [sys.executable, "-I", CHECKER, "--gitlab", gl, "--github", gh],
         capture_output=True, text=True)
     return proc.returncode, proc.stdout + proc.stderr
 
@@ -547,13 +562,16 @@ def run_with_entrypoint_root(tmp: str, root: str) -> tuple[int, str]:
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(body)
     proc = subprocess.run(
-        [sys.executable, CHECKER, "--gitlab", gl, "--github", gh,
+        [sys.executable, "-I", CHECKER, "--gitlab", gl, "--github", gh,
          "--entrypoint-root", root],
         capture_output=True, text=True)
     return proc.returncode, proc.stdout + proc.stderr
 
 
 def main() -> int:
+    if not sys.flags.isolated:
+        print("check-tests-blocking selftest: FAIL — invoke with `python3 -I` isolated mode")
+        return 1
     failures = []
     with tempfile.TemporaryDirectory() as tmp:
         for case in CASES:
@@ -566,6 +584,18 @@ def main() -> int:
                 failures.append(
                     "%s: guard failed, but not for the stated reason (%r absent):\n%s"
                     % (case.name, case.expect, out))
+
+        gl = os.path.join(tmp, "nonisolated-gitlab-ci.yml")
+        gh = os.path.join(tmp, "nonisolated-tests.yml")
+        for path, body in ((gl, GOOD_GITLAB), (gh, GOOD_GITHUB)):
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(body)
+        proc = subprocess.run(
+            [sys.executable, CHECKER, "--gitlab", gl, "--github", gh],
+            capture_output=True, text=True)
+        out = proc.stdout + proc.stderr
+        if proc.returncode == 0 or "invoke with `python3 -I` isolated mode" not in out:
+            failures.append("non-isolated checker invocation did not fail closed:\n%s" % out)
 
         missing_root = os.path.join(tmp, "missing-entrypoints")
         os.makedirs(missing_root)
@@ -615,7 +645,7 @@ def main() -> int:
         return 1
 
     print("check-tests-blocking selftest: OK — %d cases behave as documented"
-          % (len(CASES) + 5))
+          % (len(CASES) + 6))
     return 0
 
 

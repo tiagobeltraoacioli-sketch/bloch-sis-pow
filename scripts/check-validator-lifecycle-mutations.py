@@ -50,7 +50,7 @@ def main():
         env = os.environ.copy()
         env["CARGO_TARGET_DIR"] = str(ROOT / "target" / "validator-lifecycle-mutations")
         toolchain = subprocess.check_output(
-            ["python3", str(ROOT / "scripts/pinned-rust-toolchain.py")], text=True
+            ["python3", "-I", str(ROOT / "scripts/pinned-rust-toolchain.py")], text=True
         ).strip()
         command = ["cargo", f"+{toolchain}", "test", "--locked", "-p", "bloch-pos-committee",
                    "--lib", "transition::tests::validator_lifecycle::", "--", "--nocapture"]

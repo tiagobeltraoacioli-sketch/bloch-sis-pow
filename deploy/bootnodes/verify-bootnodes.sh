@@ -139,7 +139,7 @@ for e in $ENTRIES; do
   # 3. Following the chain, not merely answering. A forked node responds.
   #    The finalized height and root are appended for the cross-check below;
   #    a check that only prints them proves nothing on its own.
-  echo "$OUT" | grep -o '{"jsonrpc".*' | HOST="$HOST" ROOTS="$ROOTS" python3 -c '
+  echo "$OUT" | grep -o '{"jsonrpc".*' | HOST="$HOST" ROOTS="$ROOTS" python3 -I -c '
 import sys, json, os
 try:
     d = json.load(sys.stdin)["result"]

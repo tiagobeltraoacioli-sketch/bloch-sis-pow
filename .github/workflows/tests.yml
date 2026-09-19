@@ -85,19 +85,19 @@ jobs:
       - name: Install C toolchain (rocksdb bindgen, blst, PQClean)
         run: sudo apt-get update && sudo apt-get install -y clang cmake
       - name: Funded validator admission (isolated epoch-zero rehearsal)
-        run: python3 scripts/rehearse-validator-admission.py
+        run: python3 -I scripts/rehearse-validator-admission.py
       - name: Validator withdrawal guard mutations
-        run: python3 scripts/check-validator-lifecycle-mutations.py
+        run: python3 -I scripts/check-validator-lifecycle-mutations.py
       - name: Public bootnode RPC refusal regression
         run: bash deploy/bootnodes/verify-bootnodes.selftest.sh
       - name: Retired consensus isolation
         run: |
-          python3 scripts/check-live-node-retired-isolation.py --selftest
-          python3 scripts/check-live-node-retired-isolation.py
+          python3 -I scripts/check-live-node-retired-isolation.py --selftest
+          python3 -I scripts/check-live-node-retired-isolation.py
       - name: Finite validator activation boundary and replay
-        run: python3 scripts/rehearse-validator-activation.py --output "$RUNNER_TEMP/validator-activation"
+        run: python3 -I scripts/rehearse-validator-activation.py --output "$RUNNER_TEMP/validator-activation"
       - name: Funded validator joining between independent processes
-        run: python3 scripts/rehearse-validator-joining-network.py --output "$RUNNER_TEMP/validator-joining-network"
+        run: python3 -I scripts/rehearse-validator-joining-network.py --output "$RUNNER_TEMP/validator-joining-network"
       - name: Input-boundary regressions (before the full suite)
         run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-node --bin bloch-pos audit_
       - name: Entropy guard regressions and thread-affinity doctests
@@ -124,14 +124,14 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: selftest (the guard must be able to fail)
-        run: python3 scripts/check-tests-blocking.selftest.py
+        run: python3 -I scripts/check-tests-blocking.selftest.py
       - name: guard
-        run: python3 scripts/check-tests-blocking.py
+        run: python3 -I scripts/check-tests-blocking.py
       - name: Partition report rejects missing evidence
-        run: python3 scripts/devnet-particao-report.test.py
+        run: python3 -I scripts/devnet-particao-report.test.py
       - name: Activation rehearsal refuses unexpected gate changes
-        run: python3 scripts/rehearse-validator-activation.test.py
+        run: python3 -I scripts/rehearse-validator-activation.test.py
       - name: Attested-image remote-access guard selftest
-        run: python3 scripts/check-attested-ssh.selftest.py
+        run: python3 -I scripts/check-attested-ssh.selftest.py
       - name: Attested-image remote-access guard
-        run: python3 scripts/check-attested-ssh.py
+        run: python3 -I scripts/check-attested-ssh.py

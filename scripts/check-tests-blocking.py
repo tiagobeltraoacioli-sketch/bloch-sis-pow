@@ -41,6 +41,8 @@ GitLab `.gitlab-ci.yml` job `build-and-test`, to the reviewed posture:
   * local script entrypoints named directly by those commands, plus the
     reviewed transitively loaded executables, are regular non-symlink files
     whose SHA-256 content and parent/load relationships match the contract.
+  * every reviewed Python CI command uses isolated mode (`python3 -I`), and
+    this guard refuses to run unless its own interpreter reports that mode.
 
 The live-crate list is duplicated in `.github/workflows/tests.yml` on
 purpose: the workflow states what it gates, this file makes dropping a crate
@@ -52,7 +54,7 @@ inside a gated job is refused, even a plausible-looking one.
 
 Pure Python 3. No toolchain, no build, no network.
 
-Run: python3 scripts/check-tests-blocking.py
+Run: python3 -I scripts/check-tests-blocking.py
 Exit 0 = the supported explicit job/command subset passes these checks.
 This is a structural regression guard, not a proof for arbitrary YAML,
 workflow inheritance, branch protection, or shell execution semantics.
@@ -90,13 +92,13 @@ GITHUB_CARGO_TEST_RUNS = (
     'rustup toolchain install "$ch" --profile minimal --no-self-update\n'
     'echo "toolchain=$ch" >> "$GITHUB_OUTPUT"',
     "sudo apt-get update && sudo apt-get install -y clang cmake",
-    "python3 scripts/rehearse-validator-admission.py",
-    "python3 scripts/check-validator-lifecycle-mutations.py",
+    "python3 -I scripts/rehearse-validator-admission.py",
+    "python3 -I scripts/check-validator-lifecycle-mutations.py",
     "bash deploy/bootnodes/verify-bootnodes.selftest.sh",
-    "python3 scripts/check-live-node-retired-isolation.py --selftest\n"
-    "python3 scripts/check-live-node-retired-isolation.py",
-    'python3 scripts/rehearse-validator-activation.py --output "$RUNNER_TEMP/validator-activation"',
-    'python3 scripts/rehearse-validator-joining-network.py --output "$RUNNER_TEMP/validator-joining-network"',
+    "python3 -I scripts/check-live-node-retired-isolation.py --selftest\n"
+    "python3 -I scripts/check-live-node-retired-isolation.py",
+    'python3 -I scripts/rehearse-validator-activation.py --output "$RUNNER_TEMP/validator-activation"',
+    'python3 -I scripts/rehearse-validator-joining-network.py --output "$RUNNER_TEMP/validator-joining-network"',
     "cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-node --bin bloch-pos audit_",
     "cargo +${{ steps.pin.outputs.toolchain }} test --locked -p pqcrypto-internals",
     "cargo +${{ steps.pin.outputs.toolchain }} test --locked \\\n"
@@ -111,12 +113,12 @@ GITHUB_CARGO_TEST_RUNS = (
 )
 GITHUB_TEST_GUARD_STEPS = (
     ("uses", "actions/checkout@11d5960a326750d5838078e36cf38b85af677262", ()),
-    ("run", "python3 scripts/check-tests-blocking.selftest.py", ()),
-    ("run", "python3 scripts/check-tests-blocking.py", ()),
-    ("run", "python3 scripts/devnet-particao-report.test.py", ()),
-    ("run", "python3 scripts/rehearse-validator-activation.test.py", ()),
-    ("run", "python3 scripts/check-attested-ssh.selftest.py", ()),
-    ("run", "python3 scripts/check-attested-ssh.py", ()),
+    ("run", "python3 -I scripts/check-tests-blocking.selftest.py", ()),
+    ("run", "python3 -I scripts/check-tests-blocking.py", ()),
+    ("run", "python3 -I scripts/devnet-particao-report.test.py", ()),
+    ("run", "python3 -I scripts/rehearse-validator-activation.test.py", ()),
+    ("run", "python3 -I scripts/check-attested-ssh.selftest.py", ()),
+    ("run", "python3 -I scripts/check-attested-ssh.py", ()),
 )
 GITHUB_TEST_GUARD_HEADER = (
     "name: tests-blocking guard (blocking)",
@@ -131,8 +133,8 @@ GITLAB_BUILD_TEST_HEADER = (
 )
 GITLAB_BUILD_TEST_SCRIPT = (
     "bash deploy/bootnodes/verify-bootnodes.selftest.sh",
-    "python3 scripts/check-live-node-retired-isolation.py --selftest",
-    "python3 scripts/check-live-node-retired-isolation.py",
+    "python3 -I scripts/check-live-node-retired-isolation.py --selftest",
+    "python3 -I scripts/check-live-node-retired-isolation.py",
     "cargo build --workspace --all-targets",
     "cargo test --locked -p bloch-pos-committee -p bloch-pos-node "
     "-p bloch-crypto -p coherence-core -p bloch-sis-pow -p bloch-pq-vault "
@@ -142,8 +144,8 @@ GITLAB_BUILD_TEST_BODY = (
     "stage: test",
     "script:",
     "- bash deploy/bootnodes/verify-bootnodes.selftest.sh",
-    "- python3 scripts/check-live-node-retired-isolation.py --selftest",
-    "- python3 scripts/check-live-node-retired-isolation.py",
+    "- python3 -I scripts/check-live-node-retired-isolation.py --selftest",
+    "- python3 -I scripts/check-live-node-retired-isolation.py",
     "- cargo build --workspace --all-targets",
     "- cargo test --locked -p bloch-pos-committee -p bloch-pos-node "
     "-p bloch-crypto -p coherence-core -p bloch-sis-pow -p bloch-pq-vault "
@@ -152,7 +154,7 @@ GITLAB_BUILD_TEST_BODY = (
 )
 CI_SCRIPT_ENTRYPOINT_SHA256 = {
     "deploy/bootnodes/verify-bootnodes.sh":
-        "c43231df3353c06762e508b7abaf5e9dd30aaf6fe35795c2250a79629cf397ec",
+        "151e6f8e621d2be1cadeacc31eac7d385fe660ea73b1a028435ef1d0c56952c0",
     "deploy/bootnodes/verify-bootnodes.selftest.sh":
         "95bb6c90d395f9a706f8349eede35330afd4b62e5979497fcaecc5410f0b3612",
     "scripts/check-attested-ssh.py":
@@ -162,13 +164,13 @@ CI_SCRIPT_ENTRYPOINT_SHA256 = {
     "scripts/check-live-node-retired-isolation.py":
         "45ece7368931469c2c64c161708009b41aebcbf3c1033fa75006e16d5e16518d",
     "scripts/check-tests-blocking.selftest.py":
-        "85f0b1bb8f207b8cd7e7227bdc3a7b84ec572f4f0d56f7b37482d04e2529f68a",
+        "6b9090c2b9d0c70a4f56534b1400542c4baec931b453d032c6d2512faefdd53a",
     "scripts/check-validator-lifecycle-mutations.py":
-        "a1b061037c6166bacbf4995d7710f1138023d92cdde4af2a8781528fa2b050e5",
+        "12b477e5043bc3ea98387be33ca586976494b30083522b214cea7d88c0e9f429",
     "scripts/devnet-particao-report.test.py":
-        "468cab1a77759e7e63d4b18204b57ce9c9b2d6b68f6412a385d23fecea7c840e",
+        "a2416dba17ddb42a97ab83d2a71d55d746a0c5ac8989d1ba07f494ec969f71b6",
     "scripts/devnet-particao.sh":
-        "89f4d64b6e00339e1b23fcf6c3f4115b5734ce1f04680d95141c2e6efb0bd9bf",
+        "de0b39b7bfd7baf0da6ddab10d55b62c3a5371a262ac2f5cc38f8a5759ed5e2d",
     "scripts/pinned-rust-toolchain.py":
         "8e0bf93355825f811b619da27a0667d7349105ca8e7a9bf5d5e31ee60bf5d205",
     "scripts/rehearse-validator-activation.py":
@@ -553,7 +555,9 @@ def check_ci_script_entrypoints(root: str) -> list[str]:
     invoked = set()
     for command in commands:
         for line in command.splitlines():
-            match = re.match(r"^(?:python3|bash)\s+([A-Za-z0-9_./-]+)(?:\s|$)", line.strip())
+            match = re.match(
+                r"^(?:python3\s+-I|bash)\s+([A-Za-z0-9_./-]+)(?:\s|$)",
+                line.strip())
             if match:
                 invoked.add(match.group(1))
 
@@ -749,6 +753,9 @@ def check_job(path: str, job: str, indent: int, label: str) -> list[str]:
 
 
 def main() -> int:
+    if not sys.flags.isolated:
+        print("test-posture guard: FAIL — invoke with `python3 -I` isolated mode")
+        return 1
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--gitlab", default=os.path.join(REPO, ".gitlab-ci.yml"))
     ap.add_argument("--github", default=os.path.join(REPO, ".github/workflows/tests.yml"))

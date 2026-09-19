@@ -129,7 +129,7 @@ launch() { # $1=mode $2=stop $3=tag ; runs nodes, samples RPC, waits
 report() { # $1=tag
   local tag="$1"
   echo "── phase $tag ──────────────────────────────────────────────"
-  python3 - "$WORKDIR" "$tag" "$N" <<'PY'
+  python3 -I - "$WORKDIR" "$tag" "$N" <<'PY'
 import json,os,sys,re
 wd,tag,n=sys.argv[1],sys.argv[2],int(sys.argv[3])
 heads={}; heights={}; roots={}; stopped={}; proposed={}; refused={}; landed=set()
