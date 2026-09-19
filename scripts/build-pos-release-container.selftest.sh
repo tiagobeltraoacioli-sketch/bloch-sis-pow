@@ -7,6 +7,45 @@ work="$(mktemp -d "${TMPDIR:-/tmp}/bloch-pos-build-wrapper-test.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 fake_engine="$work/fake-engine"
 
+# Put a controllable SHA-256 shim first on PATH. Canonical mode delegates to
+# the host implementation, while malformed modes exercise only the wrapper:
+# the fake engine below always hashes with the captured real implementation.
+mkdir -p "$work/bin"
+REAL_SHA256SUM="$(command -v sha256sum || true)"
+REAL_SHASUM="$(command -v shasum || true)"
+[ -n "$REAL_SHA256SUM" ] || [ -n "$REAL_SHASUM" ] || {
+  echo "selftest: no host SHA-256 implementation is available" >&2
+  exit 1
+}
+export REAL_SHA256SUM REAL_SHASUM
+cat > "$work/bin/sha256sum" <<'SHIM'
+#!/usr/bin/env bash
+set -euo pipefail
+delegate() {
+  if [ -n "${REAL_SHA256SUM:-}" ]; then
+    exec "$REAL_SHA256SUM" "$@"
+  elif [ "${1:-}" = -c ]; then
+    exec "$REAL_SHASUM" -a 256 -c "$2"
+  else
+    exec "$REAL_SHASUM" -a 256 "$@"
+  fi
+}
+case "${BUILD_WRAPPER_SHA_MODE:-canonical}" in
+  canonical) delegate "$@" ;;
+  exit) exit 71 ;;
+  short) printf '%063d  %s\n' 0 "${1:-input}" ;;
+  nonhex) printf '%064d  %s\n' 0 "${1:-input}" | tr 0 g ;;
+  uppercase) printf '%064d  %s\n' 0 "${1:-input}" | tr 0 A ;;
+  multirow)
+    printf '%064d  %s\n' 0 "${1:-input}"
+    printf '%064d  second-row\n' 0
+    ;;
+  *) exit 72 ;;
+esac
+SHIM
+chmod 0755 "$work/bin/sha256sum"
+export PATH="$work/bin:$PATH"
+
 cat > "$fake_engine" <<'ENGINE'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -30,10 +69,10 @@ else
   printf '#!/bin/sh\necho fake canonical candidate\n' > "$stage/bloch-pos"
 fi
 chmod 0755 "$stage/bloch-pos"
-if command -v sha256sum >/dev/null 2>&1; then
-  binary_sha="$(sha256sum "$stage/bloch-pos" | awk '{print $1}')"
+if [ -n "${REAL_SHA256SUM:-}" ]; then
+  binary_sha="$("$REAL_SHA256SUM" "$stage/bloch-pos" | awk '{print $1}')"
 else
-  binary_sha="$(shasum -a 256 "$stage/bloch-pos" | awk '{print $1}')"
+  binary_sha="$("$REAL_SHASUM" -a 256 "$stage/bloch-pos" | awk '{print $1}')"
 fi
 cat > "$stage/BUILD-INFO" <<EOF
 artifact_kind=${FAKE_ARTIFACT_KIND:-canonical-container-candidate}
@@ -76,10 +115,10 @@ case "${FAKE_BUILD_INFO_MODE:-canonical}" in
     printf '%s' "$build_info_without_newline" > "$stage/BUILD-INFO" ;;
   *) exit 65 ;;
 esac
-if command -v sha256sum >/dev/null 2>&1; then
-  build_info_sha="$(sha256sum "$stage/BUILD-INFO" | awk '{print $1}')"
+if [ -n "${REAL_SHA256SUM:-}" ]; then
+  build_info_sha="$("$REAL_SHA256SUM" "$stage/BUILD-INFO" | awk '{print $1}')"
 else
-  build_info_sha="$(shasum -a 256 "$stage/BUILD-INFO" | awk '{print $1}')"
+  build_info_sha="$("$REAL_SHASUM" -a 256 "$stage/BUILD-INFO" | awk '{print $1}')"
 fi
 case "${FAKE_MANIFEST_MODE:-canonical}" in
   canonical) printf '%s  bloch-pos\n' "$binary_sha" > "$stage/SHA256SUMS" ;;
@@ -132,6 +171,25 @@ expect_build_info_failure() {
   }
 }
 
+expect_sha_failure() {
+  local mode="$1" expected="$2"
+  local output="$work/sha-$mode" log="$work/sha-$mode.log"
+  if BUILD_WRAPPER_SHA_MODE="$mode" run_wrapper canonical "$output" \
+      > "$log" 2>&1; then
+    echo "selftest: wrapper accepted $mode SHA-256 output" >&2
+    exit 1
+  fi
+  grep -Fq "$expected" "$log" || {
+    echo "selftest: $mode SHA-256 output failed without expected diagnostic" >&2
+    cat "$log" >&2
+    exit 1
+  }
+  [ ! -e "$output" ] || {
+    echo "selftest: wrapper published output after rejecting $mode SHA-256 output" >&2
+    exit 1
+  }
+}
+
 run_wrapper canonical "$work/canonical" > "$work/canonical.log" 2>&1
 grep -Fq 'build-pos-release-container: PASS' "$work/canonical.log"
 cmp -s <(printf '%s  bloch-pos\n' "$(
@@ -141,6 +199,16 @@ cmp -s <(printf '%s  bloch-pos\n' "$(
     shasum -a 256 "$work/canonical/bloch-pos" | awk '{print $1}'
   fi
 )") "$work/canonical/SHA256SUMS"
+
+expect_sha_failure exit 'SHA-256 tool failed for exported bloch-pos'
+expect_sha_failure short \
+  'SHA-256 tool returned a digest that is not exactly 64 characters for exported bloch-pos'
+expect_sha_failure nonhex \
+  'SHA-256 tool returned a non-lowercase hexadecimal digest for exported bloch-pos'
+expect_sha_failure uppercase \
+  'SHA-256 tool returned a non-lowercase hexadecimal digest for exported bloch-pos'
+expect_sha_failure multirow \
+  'SHA-256 tool returned a non-lowercase hexadecimal digest for exported bloch-pos'
 
 manifest_error='exported SHA256SUMS is not the exact canonical one-line manifest'
 for mode in extra omit-binary; do

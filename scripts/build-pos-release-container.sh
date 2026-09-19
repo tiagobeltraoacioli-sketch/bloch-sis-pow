@@ -26,6 +26,18 @@ sha256_file() {
     fail "sha256sum or shasum is required"
   fi
 }
+validated_sha256_file() {
+  local digest
+  digest="$(sha256_file "$1")" \
+    || fail "SHA-256 tool failed for exported bloch-pos"
+  case "$digest" in
+    ''|*[!0123456789abcdef]*)
+      fail "SHA-256 tool returned a non-lowercase hexadecimal digest for exported bloch-pos" ;;
+  esac
+  [ "${#digest}" -eq 64 ] \
+    || fail "SHA-256 tool returned a digest that is not exactly 64 characters for exported bloch-pos"
+  printf '%s\n' "$digest"
+}
 check_sha256() {
   if command -v sha256sum >/dev/null 2>&1; then
     (cd "$1" && sha256sum -c SHA256SUMS)
@@ -66,7 +78,7 @@ git archive --format=tar "$commit" | tar -xf - -C "$context"
   "$context"
 
 [ -x "$stage/bloch-pos" ] || fail "container did not export bloch-pos"
-binary_sha="$(sha256_file "$stage/bloch-pos")"
+binary_sha="$(validated_sha256_file "$stage/bloch-pos")"
 cmp -s <(printf '%s  bloch-pos\n' "$binary_sha") "$stage/SHA256SUMS" \
   || fail "exported SHA256SUMS is not the exact canonical one-line manifest"
 check_sha256 "$stage" || fail "exported checksum does not verify"
