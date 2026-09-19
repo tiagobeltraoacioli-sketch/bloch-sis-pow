@@ -9,6 +9,15 @@ out_dir="${1:?usage: build-pos-release-container.sh <new-output-directory>}"
 engine="${CONTAINER_ENGINE:-docker}"
 
 fail() { echo "build-pos-release-container: FAIL — $*" >&2; exit 1; }
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    fail "sha256sum or shasum is required"
+  fi
+}
 check_sha256() {
   if command -v sha256sum >/dev/null 2>&1; then
     (cd "$1" && sha256sum -c SHA256SUMS)
@@ -47,6 +56,9 @@ git archive --format=tar HEAD | tar -xf - -C "$context"
   "$context"
 
 [ -x "$stage/bloch-pos" ] || fail "container did not export bloch-pos"
+binary_sha="$(sha256_file "$stage/bloch-pos")"
+cmp -s <(printf '%s  bloch-pos\n' "$binary_sha") "$stage/SHA256SUMS" \
+  || fail "exported SHA256SUMS is not the exact canonical one-line manifest"
 check_sha256 "$stage" || fail "exported checksum does not verify"
 grep -Fx "source_commit=$commit" "$stage/BUILD-INFO" >/dev/null \
   || fail "BUILD-INFO does not bind HEAD"
