@@ -625,6 +625,12 @@ const REORG_STATE_WINDOW: usize = 2;
 /// which is why evicting here costs a round trip and never a fork.
 const ORPHAN_MAX: usize = 256;
 
+/// Distinct authenticated proposals retained per genesis validator duty.
+/// One is the protocol intent; two preserve the complete equivocation pair.
+/// A third proposal signed by the same key for the same slot proves nothing
+/// new and is ignored as node-local retention pressure, never peer fault.
+const MAX_PROPOSALS_PER_GENESIS_DUTY: usize = 2;
+
 /// Cap on [`Engine::parked_refused_finality`] (R3 M-1). Same order as
 /// [`ORPHAN_MAX`] and the same FIFO-eviction shape, for the same reason:
 /// remembering a refusal must cost this node a bounded amount of memory, not
@@ -1496,6 +1502,12 @@ struct Engine {
     /// checkpoint. Same reason: pruning that never fires is pruning that is
     /// not wired.
     blocks_pruned: u64,
+    /// Authenticated genesis-key proposal ids observed above the finalized
+    /// floor, and their per-duty counts. This prevents deferred promotion
+    /// from charging the same proposal twice while bounding equivocation
+    /// variants before they enter fork-choice retention.
+    proposal_admission_seen: BTreeMap<[u8; 32], (u32, u64)>,
+    proposal_admission_counts: BTreeMap<(u32, u64), usize>,
     /// Envelopes turned away at the door, by reason.
     rejected_unsigned: u64,
     rejected_future: u64,
@@ -2542,6 +2554,12 @@ impl Engine {
         // the growing canonical map to prove that after every frame was the
         // other quadratic replay cost this path removes.
         self.observe_proposer_equivocation(&env);
+        let _ = self.admit_proposal_variant(
+            id,
+            env.header.proposer_index,
+            env.header.slot,
+            Source::Local,
+        );
         self.blocks.insert(id, env);
         true
     }
@@ -2833,6 +2851,18 @@ impl Engine {
             return (Verdict::Reject, None);
         }
 
+        if !self.admit_proposal_variant(
+            id,
+            env.header.proposer_index,
+            env.header.slot,
+            src,
+        ) {
+            // The signature proves the key equivocated, not that the relay is
+            // malicious. Two variants retain the complete evidence pair; a
+            // third is local retention pressure and is silently ignored.
+            return (Verdict::Ignore, None);
+        }
+
         // TX-16: authenticate the fixed-size header BEFORE hashing or decoding
         // the attacker-sized body. The proposal signature commits to
         // `body_root` and `attestation_root`; only a registered proposer can
@@ -2928,6 +2958,37 @@ impl Engine {
         self.needs_sync = true;
     }
 
+    /// Record one authenticated proposal, returning false only when gossip
+    /// would add a third distinct variant for one genesis-key duty.
+    ///
+    /// Genesis membership matters: those keys are immutable on every branch,
+    /// so authentication at the head is branch-independent. Deposit-added
+    /// indices may name different keys on competing branches and remain
+    /// outside this local cap until parent-derived admission exists.
+    fn admit_proposal_variant(
+        &mut self,
+        id: [u8; 32],
+        proposer: u32,
+        slot: u64,
+        src: Source,
+    ) -> bool {
+        if !self.genesis_validator_indices.contains(&proposer) {
+            return true;
+        }
+        if self.proposal_admission_seen.contains_key(&id) {
+            return true;
+        }
+        let duty = (proposer, slot);
+        let count = self.proposal_admission_counts.get(&duty).copied().unwrap_or(0);
+        if src.bounded_by_wall_clock() && count >= MAX_PROPOSALS_PER_GENESIS_DUTY {
+            return false;
+        }
+        self.proposal_admission_seen.insert(id, duty);
+        self.proposal_admission_counts
+            .insert(duty, count.saturating_add(1));
+        true
+    }
+
     /// Drop non-canonical blocks — stored and parked — that sit below the
     /// finalized checkpoint, and descendants made unreachable by that removal.
     /// Still-connected above-floor branches are not count-capped.
@@ -2952,6 +3013,8 @@ impl Engine {
         let Some(floor) = first_slot_of_epoch(finalized_epoch) else {
             return;
         };
+        self.proposal_admission_seen.retain(|_, (_, slot)| *slot >= floor);
+        self.proposal_admission_counts.retain(|(_, slot), _| *slot >= floor);
         let mut pending: VecDeque<[u8; 32]> = self.blocks.iter()
             .filter(|(id, env)| env.header.slot < floor && !self.canonical.contains(*id))
             .map(|(id, _)| *id).collect();
@@ -5393,6 +5456,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
         orphans_evicted: 0,
         orphans_admitted: 0,
         blocks_pruned: 0,
+        proposal_admission_seen: BTreeMap::new(),
+        proposal_admission_counts: BTreeMap::new(),
         rejected_unsigned: 0,
         rejected_future: 0,
         last_applied_ms: now_ms(),
@@ -8147,6 +8212,8 @@ mod transfer_v2_end_to_end {
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
+            proposal_admission_seen: BTreeMap::new(),
+            proposal_admission_counts: BTreeMap::new(),
             rejected_unsigned: 0,
             rejected_future: 0,
             last_applied_ms: now_ms(),
@@ -9260,6 +9327,8 @@ mod perf_support {
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
+            proposal_admission_seen: BTreeMap::new(),
+            proposal_admission_counts: BTreeMap::new(),
             rejected_unsigned: 0,
             rejected_future: 0,
             last_applied_ms: now_ms(),
@@ -11002,6 +11071,8 @@ mod duty_view_anchor {
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
+            proposal_admission_seen: BTreeMap::new(),
+            proposal_admission_counts: BTreeMap::new(),
             rejected_unsigned: 0,
             rejected_future: 0,
             last_applied_ms: now_ms(),
@@ -11281,6 +11352,8 @@ mod slot_horizon {
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
+            proposal_admission_seen: BTreeMap::new(),
+            proposal_admission_counts: BTreeMap::new(),
             rejected_unsigned: 0,
             rejected_future: 0,
             slashprot: SlashingProtection::open(&dir).expect("open slashing protection"),
@@ -11613,6 +11686,38 @@ mod ingest_admission_tests {
         }
         assert_eq!(engine.orphans.len(), 1, "dedup by block id");
         assert_eq!(engine.orphans_evicted, 0, "and nothing was pushed out");
+    }
+
+    #[test]
+    fn third_genesis_key_proposal_for_one_duty_is_ignored_without_peer_blame() {
+        let (mut engine, _dir, template, stored) = fixture();
+        let slot = template.header.slot;
+        let first_equivocation = repointed(&engine, &template, [0xA1; 32], slot);
+        let third_variant = repointed(&engine, &template, [0xA2; 32], slot);
+
+        assert_eq!(
+            engine.ingest_judged_from_source(first_equivocation, Some([0x11; 32])),
+            Verdict::Ignore,
+            "the second distinct proposal is retained as the evidence pair",
+        );
+        assert_eq!(engine.future_blocks.len(), 1);
+        assert_eq!(engine.blocks.len(), stored);
+
+        assert_eq!(
+            engine.ingest_judged_from_source(third_variant, Some([0x22; 32])),
+            Verdict::Ignore,
+            "a third signed variant is retention pressure, not forwarding-peer guilt",
+        );
+        assert_eq!(engine.future_blocks.len(), 1, "the third variant must not consume retention");
+        assert_eq!(engine.blocks.len(), stored, "the third variant must not reach fork choice");
+
+        let next_duty = repointed(&engine, &template, [0xA3; 32], slot.saturating_add(1));
+        assert_eq!(
+            engine.ingest_judged_from_source(next_duty, Some([0x22; 32])),
+            Verdict::Ignore,
+            "the cap is scoped to one proposer duty, not a durable key ban",
+        );
+        assert_eq!(engine.future_blocks.len(), 2);
     }
 
     #[test]

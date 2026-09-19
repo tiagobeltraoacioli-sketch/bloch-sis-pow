@@ -691,6 +691,8 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         orphans_evicted: 0,
         orphans_admitted: 0,
         blocks_pruned: 0,
+        proposal_admission_seen: BTreeMap::new(),
+        proposal_admission_counts: BTreeMap::new(),
         rejected_unsigned: 0,
         rejected_future: 0,
         last_applied_ms: now_ms(),
