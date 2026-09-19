@@ -218,7 +218,9 @@ impl HdWallet {
             .map_err(|e| format!("mnemonic generation failed: {}", e))?;
 
         // New wallets use the v2 per-wallet salt (v3 files keep it).
-        let mut master_key = derive_master_key(&mnemonic.to_string(), passphrase.unwrap_or(""), password, WALLET_VERSION)?;
+        let canonical_mnemonic = canonical_mnemonic_for_kdf(&mnemonic);
+        let mut master_key = derive_master_key(&canonical_mnemonic, passphrase.unwrap_or(""), password, WALLET_VERSION)?;
+        drop(canonical_mnemonic);
 
         // Address 0 is DERIVED from the seed, so the mnemonic recovers it.
         let seed = mnemonic.to_seed(passphrase.unwrap_or("")).to_vec();
@@ -252,7 +254,9 @@ impl HdWallet {
         if count > 4096 { return Err("recovery count exceeds 4096 addresses per request".into()); }
         let mnemonic = Mnemonic::parse(mnemonic_str)
             .map_err(|e| format!("invalid mnemonic: {}", e))?;
-        let mut master_key = derive_master_key(&mnemonic.to_string(), passphrase.unwrap_or(""), password, WALLET_VERSION)?;
+        let canonical_mnemonic = canonical_mnemonic_for_kdf(&mnemonic);
+        let mut master_key = derive_master_key(&canonical_mnemonic, passphrase.unwrap_or(""), password, WALLET_VERSION)?;
+        drop(canonical_mnemonic);
         let seed = mnemonic.to_seed(passphrase.unwrap_or("")).to_vec();
 
         let mut addresses = Vec::with_capacity(count.max(1) as usize);
@@ -450,7 +454,7 @@ impl HdWallet {
         // Parse mnemonic
         let mnemonic = Mnemonic::parse(mnemonic_str)
             .map_err(|e| format!("invalid mnemonic: {}", e))?;
-        let canonical_mnemonic = Zeroizing::new(mnemonic.to_string());
+        let canonical_mnemonic = canonical_mnemonic_for_kdf(&mnemonic);
 
         // Derive master key — route the salt by the file's version (v1 legacy
         // constant salt, v2+ per-wallet), so existing wallets still decrypt.
@@ -948,6 +952,10 @@ fn derive_at(seed: &[u8], index: u32, testnet: bool) -> Result<Keypair, String> 
     Ok(Keypair { private_key, public_key, address })
 }
 
+fn canonical_mnemonic_for_kdf(mnemonic: &Mnemonic) -> Zeroizing<String> {
+    Zeroizing::new(mnemonic.to_string())
+}
+
 /// Derive the master encryption key from mnemonic + passphrase + password.
 /// This is what locks/unlocks the wallet file.
 fn derive_master_key(mnemonic: &str, passphrase: &str, password: &str, version: u32) -> Result<Zeroizing<Vec<u8>>, String> {
@@ -1047,6 +1055,19 @@ fn decrypt_ciphertext_in_place(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_kdf_mnemonic_has_exact_zeroizing_ownership() {
+        let _: fn(&Mnemonic) -> Zeroizing<String> = canonical_mnemonic_for_kdf;
+        assert!(std::mem::needs_drop::<Zeroizing<String>>());
+
+        let mnemonic = Mnemonic::from_entropy(&[0u8; 32]).unwrap();
+        let mut canonical = canonical_mnemonic_for_kdf(&mnemonic);
+        let expected = format!("{}art", "abandon ".repeat(23));
+        assert_eq!(canonical.as_str(), expected);
+        canonical.zeroize();
+        assert!(canonical.is_empty());
+    }
 
     #[test]
     fn master_key_kdf_output_has_zeroizing_ownership_and_stable_bytes() {
