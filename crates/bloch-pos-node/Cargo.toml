@@ -102,3 +102,7 @@ pqcrypto-internals = { path = "../pqcrypto-internals" }
 # depends on at runtime, so this adds no package to Cargo.lock.
 [build-dependencies]
 sha3 = "0.10"
+
+[dev-dependencies]
+# Deterministic adversarial signature fixtures in offline-tool tests only.
+pqcrypto-internals = { path = "../pqcrypto-internals" }

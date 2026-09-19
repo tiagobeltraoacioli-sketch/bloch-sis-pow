@@ -10,6 +10,8 @@ intent and independently approved funding root, verifies the validator's
 possession signature, and refuses an existing funding signature. After unlock
 it requires the wallet public key, with the suite-1 envelope, to match the
 funding authority. Both signatures are verified before creating a new output.
+Verification tries matching suite envelopes and legacy raw-hybrid objects
+explicitly before the historical mixed-format compatibility fallback.
 The password file must be a regular owner-only file. Keep it temporary and
 remove it immediately after signing. Never put passwords in command arguments.
 
@@ -22,11 +24,11 @@ DEPOSIT_FUNDING_BIN="$PWD/target/debug/examples/sign-deposit-funding" \
   --example sign-deposit-funding -- --include-ignored
 ```
 
-The three tests cover intent/signature tampering before unlock, wrong ownership,
-both signature roles, and a real CLI roundtrip using a disposable encrypted
-wallet, including wrong password, unchanged wallet, output overwrite refusal,
-and password-file permissions. They do not qualify mainnet withdrawals or
-production custody.
+The four tests cover intent/signature tampering before unlock, wrong ownership,
+both signature roles, a genuine magic-prefixed raw-signature ambiguity, and a
+real CLI roundtrip using a disposable encrypted wallet, including wrong
+password, unchanged wallet, output overwrite refusal, and password-file
+permissions. They do not qualify mainnet withdrawals or production custody.
 
 Read-only verification, without opening a wallet:
 

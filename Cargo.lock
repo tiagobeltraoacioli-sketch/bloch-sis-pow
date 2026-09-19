@@ -1581,6 +1581,7 @@ dependencies = [
  "futures",
  "libc",
  "libp2p",
+ "pqcrypto-internals",
  "sha3 0.10.9",
  "tokio",
  "zeroize",

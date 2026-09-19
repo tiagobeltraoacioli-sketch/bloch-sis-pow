@@ -73,6 +73,11 @@ fn read_tx(path: &str) -> Result<FundedDeposit, String> {
         _ => Err("Expected funded deposit".into()),
     }
 }
+fn verify_deposit_signature(public_key: &[u8], root: &[u8], signature: &[u8]) -> bool {
+    bloch_crypto::crypto::verify_enveloped(public_key, root, signature)
+        || bloch_crypto::crypto::verify_legacy_hybrid_raw(public_key, root, signature)
+        || bloch_crypto::crypto::verify(public_key, root, signature)
+}
 fn check(
     tx: &FundedDeposit,
     approved: &FundedDeposit,
@@ -90,7 +95,7 @@ fn check(
         return Err("Intent differs from approved draft or funding root".into());
     }
     if tx.proof_of_possession.is_empty()
-        || !bloch_crypto::crypto::verify(
+        || !verify_deposit_signature(
             &tx.validator_pubkey,
             &tx.possession_root(),
             &tx.proof_of_possession,
@@ -100,7 +105,7 @@ fn check(
     }
     if complete {
         if tx.funding_signature.is_empty()
-            || !bloch_crypto::crypto::verify(
+            || !verify_deposit_signature(
                 &tx.funding_pubkey,
                 &tx.funding_root(),
                 &tx.funding_signature,
@@ -227,6 +232,7 @@ mod tests {
     use super::*;
     use bloch_crypto::{crypto, wallet::Keypair};
     use bloch_pos_committee::transition::{FundingInput, TransferOutput};
+    use sha3::{Digest, Sha3_256};
     fn fixture() -> (FundedDeposit, FundedDeposit, Keypair) {
         let (pubkey, secret) = crypto::generate_keypair();
         let raw = pubkey[4..].to_vec();
@@ -297,6 +303,76 @@ mod tests {
         assert!(sign_checked(&mut tx, &approved, &root, || panic!("must not unlock")).is_err());
         tx.funding_signature[10] ^= 1;
         assert!(check(&tx, &approved, &root, true).is_err());
+    }
+    #[test]
+    fn explicit_policy_accepts_genuine_magic_prefixed_raw_deposit_signature() {
+        const SEARCH_COUNTER: u64 = 85_528;
+        const SIGNING_SEED_HEX: &str =
+            "a5478420173088fc02f628995681944cd45bf41ac24fc5c6caf1cade222054bf";
+        const POSSESSION_ROOT_HEX: &str =
+            "3982ce6fabe71afda53af24bf206546f2c462d64ec4d882a273cbcfeeabf7279";
+
+        let (funding_pubkey, _) = crypto::generate_keypair_from_seed(&[0x67; 32]).unwrap();
+        let (validator_pubkey, validator_secret) =
+            crypto::generate_keypair_from_seed(&[0x68; 32]).unwrap();
+        let mut tx = FundedDeposit {
+            network_domain: [1; 32],
+            valid_until_epoch: 3016,
+            funding_pubkey,
+            inputs: vec![FundingInput {
+                txid: [2; 32],
+                vout: 0,
+            }],
+            validator_pubkey: validator_pubkey.clone(),
+            amount_sat: 2_500_000_000_000,
+            randao_commitment: [3; 32],
+            withdrawal_credentials: [4; 32],
+            commission_bps: 0,
+            change: TransferOutput {
+                value: 955709,
+                script_hash: [4; 32],
+            },
+            max_base_fee_millisat_per_gas: 100,
+            tip_millisat_per_gas: 5,
+            tx_bytes: 0,
+            funding_signature: vec![],
+            proof_of_possession: vec![],
+        };
+        tx.tx_bytes = tx.reserved_tx_bytes();
+        let root = tx.possession_root();
+        assert_eq!(hex(&root), POSSESSION_ROOT_HEX);
+
+        let mut h = Sha3_256::new();
+        h.update(b"bloch/deposit-funding/cr10/signing-rng/v1");
+        h.update(SEARCH_COUNTER.to_le_bytes());
+        let signing_seed: [u8; 32] = h.finalize().into();
+        assert_eq!(hex(&signing_seed), SIGNING_SEED_HEX);
+        let enveloped_signature =
+            pqcrypto_internals::with_seeded_rng_scope(&signing_seed, || {
+                crypto::sign(&validator_secret, &root).unwrap()
+            });
+        assert!(verify_deposit_signature(
+            &validator_pubkey,
+            &root,
+            &enveloped_signature,
+        ));
+        assert!(crypto::verify_enveloped_canonical(
+            &validator_pubkey,
+            &root,
+            &enveloped_signature,
+        ));
+
+        let raw_public_key = &validator_pubkey[crypto::SUITE_HEADER_LEN..];
+        let raw_signature = &enveloped_signature[crypto::SUITE_HEADER_LEN..];
+        assert_eq!(&raw_signature[..2], &[0xb1, 0x0c]);
+        assert!(
+            !crypto::verify(raw_public_key, &root, raw_signature),
+            "generic autodetection must misclassify this genuine raw signature"
+        );
+        assert!(
+            verify_deposit_signature(raw_public_key, &root, raw_signature),
+            "offline compatibility policy must try the trusted raw layout first"
+        );
     }
     #[test]
     #[ignore = "requires DEPOSIT_FUNDING_BIN pointing to the built example"]
