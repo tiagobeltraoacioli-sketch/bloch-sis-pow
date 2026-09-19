@@ -24,7 +24,8 @@ corrections.
 
 ```text
 cargo test -p bloch-crypto --features wallet-cli --offline
-# 247 passed; 0 failed; 2 ignored
+# library 241 passed; 0 failed; 2 ignored; integrations 6 passed; 0 failed;
+# doc tests 0 failed; 2 ignored; aggregate 247 passed; 0 failed; 4 ignored
 
 cargo test -p bloch-pos-node --bin bloch-pos --offline
 # 606 passed; 0 failed; 19 ignored; 63.09s
