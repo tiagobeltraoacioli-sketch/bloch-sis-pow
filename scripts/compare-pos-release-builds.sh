@@ -30,6 +30,14 @@ for dir in "$a" "$b"; do
     [ -f "$dir/$file" ] || fail "missing $dir/$file"
     [ ! -L "$dir/$file" ] || fail "$dir/$file must not be a symlink"
   done
+  # Emit one fixed byte per top-level entry instead of counting printed path
+  # lines: a filename containing a newline must not confuse the cardinality.
+  entry_count="$(
+    find "$dir" -mindepth 1 -maxdepth 1 -exec printf x \; \
+      | wc -c | tr -d '[:space:]'
+  )"
+  [ "$entry_count" = 3 ] \
+    || fail "$dir must contain exactly bloch-pos, SHA256SUMS and BUILD-INFO (found $entry_count entries)"
   [ -x "$dir/bloch-pos" ] || fail "$dir/bloch-pos is not executable"
   [ "$(wc -l < "$dir/BUILD-INFO" | tr -d ' ')" = 8 ] \
     || fail "$dir/BUILD-INFO must contain exactly the eight canonical fields"

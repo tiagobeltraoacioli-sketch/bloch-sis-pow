@@ -67,6 +67,36 @@ for file in bloch-pos SHA256SUMS BUILD-INFO; do
     bash scripts/compare-pos-release-builds.sh "$work/a" "$symlink_dir"
 done
 
+extra_file_dir="$work/extra-file"
+cp -R "$work/a" "$extra_file_dir"
+printf '#!/bin/sh\necho unreviewed installer\n' > "$extra_file_dir/install.sh"
+chmod 0755 "$extra_file_dir/install.sh"
+expect_failure "extra executable file" \
+  "must contain exactly bloch-pos, SHA256SUMS and BUILD-INFO (found 4 entries)" \
+  bash scripts/compare-pos-release-builds.sh "$work/a" "$extra_file_dir"
+
+extra_dotfile_dir="$work/extra-dotfile"
+cp -R "$work/a" "$extra_dotfile_dir"
+printf 'unreviewed\n' > "$extra_dotfile_dir/.release-context"
+expect_failure "extra dotfile" \
+  "must contain exactly bloch-pos, SHA256SUMS and BUILD-INFO (found 4 entries)" \
+  bash scripts/compare-pos-release-builds.sh "$work/a" "$extra_dotfile_dir"
+
+extra_subdir_dir="$work/extra-subdir"
+cp -R "$work/a" "$extra_subdir_dir"
+mkdir "$extra_subdir_dir/unreviewed"
+expect_failure "extra subdirectory" \
+  "must contain exactly bloch-pos, SHA256SUMS and BUILD-INFO (found 4 entries)" \
+  bash scripts/compare-pos-release-builds.sh "$work/a" "$extra_subdir_dir"
+
+extra_newline_dir="$work/extra-newline"
+cp -R "$work/a" "$extra_newline_dir"
+printf 'unreviewed\n' > "$extra_newline_dir/line
+break"
+expect_failure "extra newline-bearing filename" \
+  "must contain exactly bloch-pos, SHA256SUMS and BUILD-INFO (found 4 entries)" \
+  bash scripts/compare-pos-release-builds.sh "$work/a" "$extra_newline_dir"
+
 chmod 0644 "$work/b/bloch-pos"
 if bash scripts/compare-pos-release-builds.sh "$work/a" "$work/b" >/dev/null 2>&1; then
   echo "selftest: non-executable binary was accepted" >&2; exit 1
