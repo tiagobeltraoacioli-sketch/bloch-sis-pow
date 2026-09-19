@@ -12,9 +12,9 @@ suite of the chain that is producing blocks had no green-able gate anywhere.
 
 WHAT THIS GUARD DOES
 --------------------
-Reads both CI files as text (no PyYAML on the runners) and holds two jobs —
-GitHub `.github/workflows/tests.yml` job `cargo-test`, GitLab `.gitlab-ci.yml`
-job `build-and-test` — to the posture the finding required:
+Reads both CI files as text (no PyYAML on the runners) and holds the GitHub
+`.github/workflows/tests.yml` jobs `cargo-test` and `tests-blocking-guard`, plus
+GitLab `.gitlab-ci.yml` job `build-and-test`, to the reviewed posture:
 
   * the job EXISTS — a deleted gate must not read as a passing gate;
   * it runs `cargo test`;
@@ -34,6 +34,9 @@ job `build-and-test` — to the posture the finding required:
     files that can replace `cargo` before the approved test command.
   * the `cargo-test` job's setup, rehearsals and test commands exactly match
     the reviewed ordered run-step list and YAML block semantics.
+  * the `tests-blocking-guard` job has the reviewed runner/timeout and exact
+    ordered checkout, selftest and guard/rehearsal command sequence. This
+    prevents the guard's own CI entrypoint from becoming a decorative literal.
 
 The live-crate list is duplicated in `.github/workflows/tests.yml` on
 purpose: the workflow states what it gates, this file makes dropping a crate
@@ -100,6 +103,21 @@ GITHUB_CARGO_TEST_RUNS = (
     "-p bloch-pq-vault \\\n"
     "-p pqcrypto-internals \\\n"
     "-p genesis4-ceremony",
+)
+GITHUB_TEST_GUARD_STEPS = (
+    ("uses", "actions/checkout@11d5960a326750d5838078e36cf38b85af677262", ()),
+    ("run", "python3 scripts/check-tests-blocking.selftest.py", ()),
+    ("run", "python3 scripts/check-tests-blocking.py", ()),
+    ("run", "python3 scripts/devnet-particao-report.test.py", ()),
+    ("run", "python3 scripts/rehearse-validator-activation.test.py", ()),
+    ("run", "python3 scripts/check-attested-ssh.selftest.py", ()),
+    ("run", "python3 scripts/check-attested-ssh.py", ()),
+)
+GITHUB_TEST_GUARD_HEADER = (
+    "name: tests-blocking guard (blocking)",
+    "runs-on: ubuntu-latest",
+    "timeout-minutes: 10",
+    "steps:",
 )
 
 ESCAPES = (
@@ -283,6 +301,78 @@ def github_action_steps(
             action = re.sub(r"\s+#.*$", "", action).strip(" \"'")
             result.append((action, inputs))
     return result
+
+
+def github_execution_steps(
+    body: list[str], job_indent: int
+) -> list[tuple[str, str, tuple[tuple[str, str], ...]]]:
+    """Return one ordered signature for every GitHub step.
+
+    A step with zero or multiple execution fields gets an explicit unsupported
+    signature so it cannot disappear while an approved literal remains later.
+    """
+    step_indent = job_indent + 4
+    steps: list[list[str]] = []
+    current: list[str] | None = None
+    for line in body:
+        spaces = len(line) - len(line.lstrip(" "))
+        if spaces == step_indent and line.strip().startswith("- "):
+            current = []
+            steps.append(current)
+        if current is not None:
+            current.append(line)
+
+    result = []
+    for step in steps:
+        actions = github_action_steps(step, job_indent)
+        runs = github_run_values(step, job_indent)
+        metadata = []
+        for line in step:
+            spaces = len(line) - len(line.lstrip(" "))
+            value = line.strip()
+            if spaces == step_indent and value.startswith("- "):
+                value = value[2:]
+            elif spaces != step_indent + 2:
+                continue
+            match = re.match(r"^([A-Za-z0-9_-]+):", value)
+            if match:
+                metadata.append(match.group(1))
+        unsupported_metadata = set(metadata) - {"name", "run", "uses"}
+        if len(actions) + len(runs) != 1 or unsupported_metadata:
+            result.append(("unsupported", normalized_yaml_lines(step).__repr__(), ()))
+        elif actions:
+            action, inputs = actions[0]
+            result.append(("uses", action, tuple(sorted(inputs.items()))))
+        else:
+            result.append(("run", runs[0], ()))
+    return result
+
+
+def check_github_test_guard(path: str) -> list[str]:
+    """Bind the job that runs this guard to its complete execution contract."""
+    label = ".github/workflows/tests.yml"
+    job = "tests-blocking-guard"
+    if not os.path.exists(path):
+        return [f"{label}: MISSING — the pipeline definition itself is gone"]
+    text = open(path, encoding="utf-8").read()
+    blocks = job_blocks(text, 2)
+    if job not in blocks:
+        return [f"{label}: job `{job}` is MISSING. A guard that was deleted is not a guard that passed."]
+
+    body = blocks[job]
+    direct = tuple(
+        re.sub(r"\s+#.*$", "", line.strip())
+        for line in body
+        if len(line) - len(line.lstrip(" ")) == 4
+    )
+    problems = []
+    if direct != GITHUB_TEST_GUARD_HEADER:
+        problems.append(
+            f"{label}: job `{job}` header differs from the reviewed runner/timeout/steps contract")
+    if tuple(github_execution_steps(body, 2)) != GITHUB_TEST_GUARD_STEPS:
+        problems.append(
+            f"{label}: job `{job}` execution steps differ from the reviewed exact ordered contract")
+    return problems
 
 
 def complete_test_tokens(command: str) -> list[str] | None:
@@ -495,6 +585,7 @@ def main() -> int:
     problems = []
     problems += check_job(args.gitlab, "build-and-test", 0, ".gitlab-ci.yml")
     problems += check_job(args.github, "cargo-test", 2, ".github/workflows/tests.yml")
+    problems += check_github_test_guard(args.github)
 
     if problems:
         print("test-posture guard: FAIL — %d problem(s)\n" % len(problems))

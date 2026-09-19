@@ -111,10 +111,17 @@ jobs:
             -p genesis4-ceremony
 
   tests-blocking-guard:
+    name: tests-blocking guard (blocking)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: python3 scripts/check-tests-blocking.selftest.py
       - run: python3 scripts/check-tests-blocking.py
+      - run: python3 scripts/devnet-particao-report.test.py
+      - run: python3 scripts/rehearse-validator-activation.test.py
+      - run: python3 scripts/check-attested-ssh.selftest.py
+      - run: python3 scripts/check-attested-ssh.py
 """
 GOOD_GITHUB_WITH_ENV = GOOD_GITHUB.replace(
     "name: tests\n",
@@ -291,6 +298,70 @@ CASES = [
          GOOD_GITLAB,
          sub(GOOD_GITHUB, "  cargo-test:", "  cargo-test-disabled:"),
          must_fail=True, expect="`cargo-test` is MISSING"),
+
+    Case("github tests-blocking-guard job deleted",
+         GOOD_GITLAB,
+         sub(GOOD_GITHUB, "  tests-blocking-guard:", "  tests-blocking-guard-disabled:"),
+         must_fail=True, expect="`tests-blocking-guard` is MISSING"),
+
+    Case("github guard selftest cannot be removed while guard literal remains",
+         GOOD_GITLAB,
+         sub(GOOD_GITHUB, "      - run: python3 scripts/check-tests-blocking.selftest.py\n", ""),
+         must_fail=True, expect="exact ordered contract"),
+
+    Case("github guard and selftest cannot be reordered",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - run: python3 scripts/check-tests-blocking.selftest.py\n"
+             "      - run: python3 scripts/check-tests-blocking.py\n",
+             "      - run: python3 scripts/check-tests-blocking.py\n"
+             "      - run: python3 scripts/check-tests-blocking.selftest.py\n"),
+         must_fail=True, expect="exact ordered contract"),
+
+    Case("github guard checkout cannot move after commands",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"
+             "      - run: python3 scripts/check-tests-blocking.selftest.py\n",
+             "      - run: python3 scripts/check-tests-blocking.selftest.py\n"
+             "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"),
+         must_fail=True, expect="exact ordered contract"),
+
+    Case("github guard checkout cannot float",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  tests-blocking-guard:\n    name: tests-blocking guard (blocking)\n"
+             "    runs-on: ubuntu-latest\n    timeout-minutes: 10\n    steps:\n"
+             "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n",
+             "  tests-blocking-guard:\n    name: tests-blocking guard (blocking)\n"
+             "    runs-on: ubuntu-latest\n    timeout-minutes: 10\n    steps:\n"
+             "      - uses: actions/checkout@v4\n"),
+         must_fail=True, expect="exact ordered contract"),
+
+    Case("github guard timeout is exact",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  tests-blocking-guard:\n    name: tests-blocking guard (blocking)\n"
+             "    runs-on: ubuntu-latest\n    timeout-minutes: 10\n",
+             "  tests-blocking-guard:\n    name: tests-blocking guard (blocking)\n"
+             "    runs-on: ubuntu-latest\n    timeout-minutes: 60\n"),
+         must_fail=True, expect="header differs"),
+
+    Case("github guard cannot append a masking command",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - run: python3 scripts/check-attested-ssh.py\n",
+             "      - run: python3 scripts/check-attested-ssh.py\n"
+             "      - run: echo verdict replaced\n"),
+         must_fail=True, expect="exact ordered contract"),
+
+    Case("github guard command cannot gain step environment",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - run: python3 scripts/check-tests-blocking.py\n",
+             "      - run: python3 scripts/check-tests-blocking.py\n"
+             "        env:\n          PATH: /attacker/bin\n"),
+         must_fail=True, expect="exact ordered contract"),
 
     Case("github job kept but cargo test removed",
          GOOD_GITLAB,
