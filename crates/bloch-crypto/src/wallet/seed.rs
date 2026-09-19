@@ -77,6 +77,16 @@ fn bip39_salt(passphrase: &str) -> Zeroizing<Vec<u8>> {
     salt
 }
 
+/// Generate the repository-owned entropy for a new BIP39 mnemonic under
+/// wiping ownership. The OS RNG writes directly into the final array.
+fn fresh_entropy() -> Zeroizing<[u8; 32]> {
+    use rand::RngCore;
+
+    let mut entropy = Zeroizing::new([0u8; 32]);
+    rand::rng().fill_bytes(&mut entropy[..]);
+    entropy
+}
+
 // English BIP39 wordlist — 2048 words
 // In production, this should be loaded from a file; for simplicity we include
 // a minimal subset here as an illustration. The real implementation should use
@@ -96,10 +106,10 @@ pub struct SeedPhrase {
 impl SeedPhrase {
     /// Generate a new 24-word seed phrase using OS-level CSPRNG.
     pub fn generate() -> Result<Self, WalletError> {
-        use rand::RngCore;
-        let mut entropy = [0u8; 32];
-        rand::rng().fill_bytes(&mut entropy);
-        let mnemonic = bip39::Mnemonic::from_entropy(&entropy)
+        let entropy = fresh_entropy();
+        let mnemonic = bip39::Mnemonic::from_entropy(&entropy[..]);
+        drop(entropy);
+        let mnemonic = mnemonic
             .map_err(|e| WalletError::Crypto(format!("bip39 generate: {}", e)))?;
         Ok(SeedPhrase {
             phrase: mnemonic.to_string(),
@@ -234,6 +244,15 @@ mod tests {
     fn generate_produces_24_words() {
         let seed = SeedPhrase::generate().unwrap();
         assert_eq!(seed.word_count(), 24);
+    }
+
+    #[test]
+    fn fresh_entropy_has_zeroizing_ownership_and_wipes_while_live() {
+        let mut entropy = fresh_entropy();
+        assert!(std::mem::needs_drop::<Zeroizing<[u8; 32]>>());
+        assert_eq!(entropy.len(), 32);
+        entropy.zeroize();
+        assert!(entropy.iter().all(|byte| *byte == 0));
     }
 
     #[test]
