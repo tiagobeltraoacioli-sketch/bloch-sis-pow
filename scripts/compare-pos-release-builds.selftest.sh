@@ -148,6 +148,23 @@ expect_bad_commit uppercase "$(printf '%s' "$canonical_commit" | tr 'a-f' 'A-F')
 expect_bad_commit short "${canonical_commit%?}"
 expect_bad_commit long "${canonical_commit}0"
 
+epoch_error="source_date_epoch must be a nonempty decimal integer"
+expect_bad_epoch() {
+  local label="$1" value="$2"
+  local left="$work/epoch-$label-a" right="$work/epoch-$label-b"
+  cp -R "$work/a" "$left"
+  cp -R "$work/a" "$right"
+  sed -i.bak "s/^source_date_epoch=.*/source_date_epoch=$value/" \
+    "$left/BUILD-INFO" "$right/BUILD-INFO"
+  rm "$left/BUILD-INFO.bak" "$right/BUILD-INFO.bak"
+  expect_failure "matching malformed source_date_epoch ($label)" "$epoch_error" \
+    bash scripts/compare-pos-release-builds.sh "$left" "$right"
+}
+expect_bad_epoch letters not-a-timestamp
+expect_bad_epoch negative -1789689600
+expect_bad_epoch decimal 1789689600.5
+expect_bad_epoch whitespace "1789689600 "
+
 chmod 0644 "$work/b/bloch-pos"
 if bash scripts/compare-pos-release-builds.sh "$work/a" "$work/b" >/dev/null 2>&1; then
   echo "selftest: non-executable binary was accepted" >&2; exit 1

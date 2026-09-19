@@ -64,10 +64,17 @@ for dir in "$a" "$b"; do
   esac
   [ "${#source_commit}" = 40 ] \
     || fail "$dir/BUILD-INFO source_commit must be a 40-character lowercase hexadecimal commit"
+  source_date_epoch="$(field source_date_epoch "$dir/BUILD-INFO")"
+  case "$source_date_epoch" in
+    ''|*[!0-9]*)
+      fail "$dir/BUILD-INFO source_date_epoch must be a nonempty decimal integer" ;;
+  esac
   if [ "$dir" = "$a" ]; then
     a_source_commit="$source_commit"
+    a_source_date_epoch="$source_date_epoch"
   else
     b_source_commit="$source_commit"
+    b_source_date_epoch="$source_date_epoch"
   fi
 done
 
@@ -84,7 +91,9 @@ cmp -s "$a/bloch-pos" "$b/bloch-pos" || fail "binary bytes differ"
 cmp -s "$a/BUILD-INFO" "$b/BUILD-INFO" || fail "complete BUILD-INFO differs"
 [ "$a_source_commit" = "$b_source_commit" ] \
   || fail "source_commit differs between builders"
-for key in source_date_epoch debian_snapshot target binary_sha256; do
+[ "$a_source_date_epoch" = "$b_source_date_epoch" ] \
+  || fail "source_date_epoch differs between builders"
+for key in debian_snapshot target binary_sha256; do
   av="$(field "$key" "$a/BUILD-INFO")"
   bv="$(field "$key" "$b/BUILD-INFO")"
   [ "$av" = "$bv" ] || fail "$key differs between builders"
