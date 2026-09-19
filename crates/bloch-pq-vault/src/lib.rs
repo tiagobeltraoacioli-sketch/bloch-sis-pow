@@ -296,6 +296,18 @@ pub fn derive_vault_keys_v2(seed: &[u8], mainnet: bool) -> Result<VaultKeys, Str
     })
 }
 
+fn derive_v3_pq_seed(seed: &[u8], mainnet: bool) -> Zeroizing<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+
+    let mut hash = Sha256::new();
+    hash.update(b"BLOCH-PQ-VAULT-V3-PQ-KEY");
+    hash.update([u8::from(mainnet)]);
+    hash.update(seed);
+    let mut pq_seed = Zeroizing::new([0u8; 32]);
+    hash.finalize_into((&mut *pq_seed).into());
+    pq_seed
+}
+
 /// Derive a new vault using hardened role separation (BV-04).
 ///
 /// This is an explicit opt-in format: persist `V3HardenedRoles` with the vault
@@ -303,7 +315,6 @@ pub fn derive_vault_keys_v2(seed: &[u8], mainnet: bool) -> Result<VaultKeys, Str
 /// and their outputs are unchanged. Compromise of the master seed still exposes
 /// both roles; hardened derivation protects against child-key plus xpub leakage.
 pub fn derive_vault_keys_v3(seed: &[u8], mainnet: bool) -> Result<VaultKeys, String> {
-    use sha2::{Digest, Sha256};
     if !(32..=64).contains(&seed.len()) {
         return Err("V3 seed must contain 32 to 64 bytes".into());
     }
@@ -319,11 +330,7 @@ pub fn derive_vault_keys_v3(seed: &[u8], mainnet: bool) -> Result<VaultKeys, Str
     };
     let (hot_sk, hot_pubkey) = derive(0)?;
     let (recovery_sk, recovery_pubkey) = derive(1)?;
-    let mut hash = Sha256::new();
-    hash.update(b"BLOCH-PQ-VAULT-V3-PQ-KEY");
-    hash.update([u8::from(mainnet)]);
-    hash.update(seed);
-    let pq_seed = Zeroizing::new(<[u8; 32]>::from(hash.finalize()));
+    let pq_seed = derive_v3_pq_seed(seed, mainnet);
     let (pq_pubkey, pq_secret) = bloch_crypto::crypto::generate_keypair_from_seed(&pq_seed[..])
         .map_err(|e| format!("pq keygen: {e}"))?;
     Ok(VaultKeys { hot_sk, hot_pubkey, recovery_sk, recovery_pubkey, pq_pubkey, pq_secret,
@@ -764,6 +771,32 @@ mod audit_hardened_roles {
 #[cfg(test)]
 mod audit_secret_ownership {
     use super::*;
+
+    #[test]
+    fn v3_pq_seed_is_derived_directly_into_zeroizing_owner() {
+        let _: fn(&[u8], bool) -> Zeroizing<[u8; 32]> = derive_v3_pq_seed;
+        assert!(std::mem::needs_drop::<Zeroizing<[u8; 32]>>());
+
+        for (mainnet, expected) in [
+            (false, [
+                0x9a, 0xff, 0xa9, 0x5d, 0xd2, 0x1a, 0x4e, 0x5f,
+                0x50, 0x17, 0xd7, 0xfd, 0x97, 0x49, 0x31, 0xd2,
+                0x58, 0xfe, 0xde, 0x2e, 0x44, 0x41, 0x0b, 0xf8,
+                0xcb, 0x88, 0x9b, 0x9a, 0xb5, 0xcc, 0xc6, 0x0f,
+            ]),
+            (true, [
+                0xba, 0xd8, 0x17, 0x42, 0x36, 0x48, 0x75, 0x30,
+                0xe2, 0xac, 0xcb, 0xad, 0x44, 0x17, 0x11, 0xff,
+                0x12, 0x49, 0xfc, 0xb0, 0x5e, 0x0d, 0xf6, 0xd1,
+                0x1f, 0xa4, 0xd6, 0xa2, 0x31, 0x76, 0xbf, 0xb9,
+            ]),
+        ] {
+            let mut pq_seed = derive_v3_pq_seed(&[42; 32], mainnet);
+            assert_eq!(*pq_seed, expected);
+            pq_seed.zeroize();
+            assert!(pq_seed.iter().all(|byte| *byte == 0));
+        }
+    }
 
     #[test]
     fn secret_accessors_borrow_the_owned_storage() {
