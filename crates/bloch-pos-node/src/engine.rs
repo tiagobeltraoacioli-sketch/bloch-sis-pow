@@ -3410,20 +3410,25 @@ impl Engine {
             self.orphans_evicted = self.orphans_evicted.saturating_add(1);
             return;
         }
+        // Compute the combined byte charge once. Re-summing both queues after
+        // every FIFO pop made one admissible large orphan turn a full
+        // 256-entry queue into quadratic metadata work. Envelope bytes are
+        // immutable while retained, so subtracting the cached charge of the
+        // entry removed below is exactly the same accounting without the
+        // repeated scans.
+        let waiting_bytes = self.orphans.iter()
+            .fold(0usize, |sum, (_, _, _, _, bytes)| sum.saturating_add(*bytes));
+        let mut held_bytes = deferred_bytes.saturating_add(waiting_bytes);
         // The parked and ready-to-promote queues share one hard cap. Prefer
         // evicting the oldest still-blocked orphan; a connected block already
         // queued for its bounded promotion turn must not be displaced by new
         // remote work. If the ready tail alone fills the cap, drop the new
         // orphan (still an Ignore verdict, never peer guilt).
         while self.orphans.len().saturating_add(self.deferred_orphans.len()) >= ORPHAN_MAX
-            || !retention_bytes_fit(
-                self.orphans.iter().chain(self.deferred_orphans.iter())
-                    .fold(0usize, |sum, (_, _, _, _, bytes)| sum.saturating_add(*bytes)),
-                retained_bytes,
-                ORPHAN_BYTES_MAX,
-            )
+            || !retention_bytes_fit(held_bytes, retained_bytes, ORPHAN_BYTES_MAX)
         {
-            if self.orphans.pop_front().is_some() {
+            if let Some((_, _, _, _, evicted_bytes)) = self.orphans.pop_front() {
+                held_bytes = held_bytes.saturating_sub(evicted_bytes);
                 self.orphans_evicted = self.orphans_evicted.saturating_add(1);
             } else {
                 self.orphans_evicted = self.orphans_evicted.saturating_add(1);
@@ -12456,6 +12461,78 @@ mod ingest_admission_tests {
             ORPHAN_BYTES_MAX,
             "one equal-sized FIFO eviction admits the new waiting entry at the exact cap",
         );
+    }
+
+    #[test]
+    fn full_orphan_byte_cap_evicts_many_waiting_entries_in_exact_fifo_order() {
+        let (mut engine, _dir, template, _stored) = fixture();
+        const LARGE_ENTRIES: usize = 8;
+        let tiny_entries = ORPHAN_MAX - LARGE_ENTRIES;
+        let tiny_bytes = 1024usize;
+        let tiny_total = tiny_entries.saturating_mul(tiny_bytes);
+        let large_total = ORPHAN_BYTES_MAX.saturating_sub(tiny_total);
+        let large_bytes = large_total / LARGE_ENTRIES;
+        let large_remainder = large_total % LARGE_ENTRIES;
+
+        assert_eq!(large_remainder, 0);
+        assert_eq!(
+            (tiny_entries / LARGE_ENTRIES).saturating_mul(tiny_bytes) + large_bytes,
+            ORPHAN_BYTES_PER_SOURCE,
+        );
+        assert!(large_bytes.saturating_add(1) <= crate::p2p::MAX_PROPOSAL_ENVELOPE_BYTES);
+        for i in 0..tiny_entries {
+            let mut parent = [0xC1; 32];
+            parent[..2].copy_from_slice(&(i as u16).to_le_bytes());
+            let env = orphan_with_encoded_len(&template, parent, tiny_bytes);
+            let source = Source::Gossip(Some([(i % LARGE_ENTRIES) as u8; 32]));
+            engine.park_orphan(*env.block_id().as_bytes(), env, source);
+        }
+
+        let mut large_ids = Vec::with_capacity(LARGE_ENTRIES);
+        let mut first_large_bytes = 0usize;
+        for i in 0..LARGE_ENTRIES {
+            let mut parent = [0xD1; 32];
+            parent[0] = 0xD1u8.saturating_add(i as u8);
+            let bytes = large_bytes + usize::from(i < large_remainder);
+            if i == 0 { first_large_bytes = bytes; }
+            let env = orphan_with_encoded_len(&template, parent, bytes);
+            large_ids.push(*env.block_id().as_bytes());
+            engine.park_orphan(
+                *env.block_id().as_bytes(),
+                env,
+                Source::Gossip(Some([i as u8; 32])),
+            );
+        }
+        assert_eq!(engine.orphans.len(), ORPHAN_MAX);
+        assert_eq!(
+            engine.orphans.iter().map(|(_, _, _, _, bytes)| *bytes).sum::<usize>(),
+            ORPHAN_BYTES_MAX,
+            "the reachable fixture fills both the count and encoded-byte caps exactly",
+        );
+
+        let incoming = orphan_with_encoded_len(&template, [0xEF; 32], first_large_bytes);
+        let incoming_id = *incoming.block_id().as_bytes();
+        let evicted_before = engine.orphans_evicted;
+        engine.park_orphan(incoming_id, incoming, Source::Gossip(Some([0xEF; 32])));
+
+        let expected_evictions = tiny_entries + 1;
+        assert_eq!(
+            engine.orphans_evicted - evicted_before,
+            expected_evictions as u64,
+            "248 tiny entries and the oldest large entry leave before the incoming block fits",
+        );
+        assert_eq!(engine.orphans.len(), LARGE_ENTRIES);
+        assert_eq!(
+            engine.orphans.iter().map(|(id, _, _, _, _)| *id).collect::<Vec<_>>(),
+            large_ids[1..].iter().copied().chain(std::iter::once(incoming_id)).collect::<Vec<_>>(),
+            "FIFO eviction preserves the untouched suffix and appends the newcomer",
+        );
+        assert_eq!(
+            engine.orphans.iter().map(|(_, _, _, _, bytes)| *bytes).sum::<usize>(),
+            ORPHAN_BYTES_MAX - tiny_total,
+            "subtracting cached charges reopens exactly the bytes evicted",
+        );
+        assert!(engine.needs_sync, "admitted orphan still requests recovery");
     }
 
     #[test]
