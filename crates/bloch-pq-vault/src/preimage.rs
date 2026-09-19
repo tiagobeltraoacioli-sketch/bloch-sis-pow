@@ -432,13 +432,20 @@ impl RecoveryContextV1 {
 /// (e.g. the deposit outpoint, a UUID, or a monotonically increasing index) so one PQ
 /// key can guard many independent vaults with independent preimages.
 pub fn derive_recovery_secret(pq_sk: &[u8], vault_id: &[u8]) -> [u8; RECOVERY_SECRET_LEN] {
+    *derive_recovery_secret_zeroizing(pq_sk, vault_id)
+}
+
+fn derive_recovery_secret_zeroizing(
+    pq_sk: &[u8],
+    vault_id: &[u8],
+) -> zeroize::Zeroizing<[u8; RECOVERY_SECRET_LEN]> {
     let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), pq_sk);
     let mut info = Vec::with_capacity(INFO_PREFIX.len() + vault_id.len());
     info.extend_from_slice(INFO_PREFIX);
     info.extend_from_slice(vault_id);
-    let mut r = [0u8; RECOVERY_SECRET_LEN];
+    let mut r = zeroize::Zeroizing::new([0u8; RECOVERY_SECRET_LEN]);
     // HKDF-Expand of 32 bytes never exceeds the 255*HashLen ceiling, so this cannot fail.
-    hk.expand(&info, &mut r)
+    hk.expand(&info, r.as_mut())
         .expect("HKDF expand of 32 bytes is always within bounds");
     r
 }
@@ -458,7 +465,7 @@ pub fn restore_recovery_secret_v1(
     vault_id: &[u8],
     expected_recovery_hash: &[u8; 32],
 ) -> Result<zeroize::Zeroizing<[u8; RECOVERY_SECRET_LEN]>, &'static str> {
-    let secret = zeroize::Zeroizing::new(derive_recovery_secret(pq_sk, vault_id));
+    let secret = derive_recovery_secret_zeroizing(pq_sk, vault_id);
     if &recovery_hash(secret.as_ref()) != expected_recovery_hash {
         return Err(
             "recovery hash mismatch: check the original key, vault ID and derivation version",
@@ -478,14 +485,40 @@ pub fn recovery_hash(r: &[u8]) -> [u8; 32] {
 
 /// Convenience: derive `r` and return `(r, H(r))` in one call.
 pub fn derive_recovery(pq_sk: &[u8], vault_id: &[u8]) -> ([u8; RECOVERY_SECRET_LEN], [u8; 32]) {
-    let r = derive_recovery_secret(pq_sk, vault_id);
-    let h = recovery_hash(&r);
-    (r, h)
+    let r = derive_recovery_secret_zeroizing(pq_sk, vault_id);
+    let h = recovery_hash(r.as_ref());
+    (*r, h)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_secret_internal_owner_is_exact_and_zeroizing() {
+        use zeroize::Zeroize;
+
+        let _: fn(&[u8], &[u8]) -> zeroize::Zeroizing<[u8; RECOVERY_SECRET_LEN]> =
+            derive_recovery_secret_zeroizing;
+        assert!(std::mem::needs_drop::<
+            zeroize::Zeroizing<[u8; RECOVERY_SECRET_LEN]>,
+        >());
+
+        let mut secret = derive_recovery_secret_zeroizing(
+            b"synthetic recovery material for regression only",
+            b"original-vault-id",
+        );
+        assert_eq!(
+            *secret,
+            [
+                0x4b, 0x5a, 0x85, 0x31, 0x5b, 0xd9, 0x64, 0x87, 0xe9, 0x51, 0xbe, 0x65, 0xda, 0xce,
+                0x16, 0x65, 0x82, 0xdc, 0x0a, 0xee, 0x25, 0x2a, 0x1c, 0x17, 0x4e, 0x9b, 0xbf, 0x58,
+                0xb0, 0xd1, 0xbb, 0xf6,
+            ]
+        );
+        secret.zeroize();
+        assert!(secret.iter().all(|byte| *byte == 0));
+    }
 
     #[test]
     fn checked_restore_preserves_v1_and_refuses_context_mismatch() {
