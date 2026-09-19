@@ -42,9 +42,12 @@ source_date_epoch=$epoch
 debian_snapshot=20260917T000000Z
 target=x86_64-unknown-linux-gnu
 binary_sha256=$binary_sha
-signed=false
+signed=${FAKE_SIGNED:-false}
 deployment_authorized=${FAKE_DEPLOYMENT_AUTHORIZED:-false}
 EOF
+if [ "${FAKE_DUPLICATE_SIGNED:-0}" = 1 ]; then
+  printf 'signed=true\n' >> "$stage/BUILD-INFO"
+fi
 if [ "${FAKE_DUPLICATE_DEPLOYMENT_AUTHORIZED:-0}" = 1 ]; then
   printf 'deployment_authorized=true\n' >> "$stage/BUILD-INFO"
 fi
@@ -65,8 +68,10 @@ chmod 0755 "$fake_engine"
 
 run_wrapper() {
   local mode="$1" output="$2" authorized="${3:-false}" duplicate="${4:-0}"
+  local signed="${5:-false}" signed_duplicate="${6:-0}"
   FAKE_MANIFEST_MODE="$mode" FAKE_DEPLOYMENT_AUTHORIZED="$authorized" \
     FAKE_DUPLICATE_DEPLOYMENT_AUTHORIZED="$duplicate" \
+    FAKE_SIGNED="$signed" FAKE_DUPLICATE_SIGNED="$signed_duplicate" \
     CONTAINER_ENGINE="$fake_engine" \
     bash scripts/build-pos-release-container.sh "$output"
 }
@@ -113,6 +118,28 @@ fi
 grep -Fq "$authorization_error" "$work/authorized-duplicate.log" || {
   echo "selftest: duplicate deployment_authorized failed without expected diagnostic" >&2
   cat "$work/authorized-duplicate.log" >&2
+  exit 1
+}
+
+signed_error='BUILD-INFO does not explicitly declare its unsigned state'
+if run_wrapper canonical "$work/signed-true" false 0 true \
+    > "$work/signed-true.log" 2>&1; then
+  echo "selftest: signed=true was accepted" >&2
+  exit 1
+fi
+grep -Fq "$signed_error" "$work/signed-true.log" || {
+  echo "selftest: signed=true failed without expected diagnostic" >&2
+  cat "$work/signed-true.log" >&2
+  exit 1
+}
+if run_wrapper canonical "$work/signed-duplicate" false 0 false 1 \
+    > "$work/signed-duplicate.log" 2>&1; then
+  echo "selftest: duplicate signed fields were accepted" >&2
+  exit 1
+fi
+grep -Fq "$signed_error" "$work/signed-duplicate.log" || {
+  echo "selftest: duplicate signed fields failed without expected diagnostic" >&2
+  cat "$work/signed-duplicate.log" >&2
   exit 1
 }
 

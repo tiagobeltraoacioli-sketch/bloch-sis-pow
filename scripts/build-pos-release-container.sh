@@ -67,6 +67,11 @@ grep -Fx "source_commit=$commit" "$stage/BUILD-INFO" >/dev/null \
 grep -Fx "source_date_epoch=$source_date_epoch" "$stage/BUILD-INFO" >/dev/null \
   || fail "BUILD-INFO does not bind the commit timestamp"
 awk -F= '
+  $1 == "signed" { count++; value = substr($0, length($1) + 2) }
+  END { exit !(count == 1 && value == "false") }
+' "$stage/BUILD-INFO" \
+  || fail "BUILD-INFO does not explicitly declare its unsigned state"
+awk -F= '
   $1 == "deployment_authorized" { count++; value = substr($0, length($1) + 2) }
   END { exit !(count == 1 && value == "false") }
 ' "$stage/BUILD-INFO" \
