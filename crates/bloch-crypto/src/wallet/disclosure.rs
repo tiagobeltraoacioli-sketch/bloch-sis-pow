@@ -89,6 +89,29 @@ pub const MAX_TEXT_LEN: usize = 4096;
 const MAX_PUBKEY_LEN: usize = 8 * 1024;
 /// Upper bound on a b64-decoded signature (hybrid enveloped sig is ~4.6 KB).
 const MAX_SIG_LEN: usize = 16 * 1024;
+/// Padded standard Base64 needs exactly four characters per three decoded
+/// bytes, rounded up. Preflight these encoded lengths before asking the
+/// decoder to allocate; the decoded-length checks remain authoritative.
+const MAX_PUBKEY_B64_LEN: usize = 4 * ((MAX_PUBKEY_LEN + 2) / 3);
+const MAX_SIG_B64_LEN: usize = 4 * ((MAX_SIG_LEN + 2) / 3);
+
+fn preflight_base64_len(
+    encoded: &str,
+    max_encoded_len: usize,
+    index: u32,
+    field: &str,
+) -> Result<(), DisclosureError> {
+    if encoded.len() > max_encoded_len {
+        return Err(DisclosureError::Invalid(format!(
+            "entry {}: {} base64 length {} exceeds pre-decode limit {}",
+            index,
+            field,
+            encoded.len(),
+            max_encoded_len,
+        )));
+    }
+    Ok(())
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -369,6 +392,7 @@ impl DisclosureBundle {
             }
             last_index = Some(e.index);
 
+            preflight_base64_len(&e.pubkey_b64, MAX_PUBKEY_B64_LEN, e.index, "pubkey")?;
             let pk = B64.decode(&e.pubkey_b64)
                 .map_err(|err| DisclosureError::Invalid(format!("entry {}: bad pubkey b64: {}", e.index, err)))?;
             if pk.is_empty() || pk.len() > MAX_PUBKEY_LEN {
@@ -398,6 +422,7 @@ impl DisclosureBundle {
         let digest = bundle_digest(
             network, &self.purpose, &self.audience, &self.created_at, &digest_input);
         for (e, (_, pk)) in self.entries.iter().zip(&digest_input) {
+            preflight_base64_len(&e.sig_b64, MAX_SIG_B64_LEN, e.index, "signature")?;
             let sig = B64.decode(&e.sig_b64)
                 .map_err(|err| DisclosureError::Invalid(format!("entry {}: bad sig b64: {}", e.index, err)))?;
             if sig.is_empty() || sig.len() > MAX_SIG_LEN {
@@ -658,6 +683,35 @@ mod tests {
         bundle.entries[0].sig_b64 = B64.encode(&sig);
         assert!(matches!(bundle.verify(),
             Err(DisclosureError::SignatureInvalid { index: 0 })));
+    }
+
+    #[test]
+    fn oversized_base64_fields_fail_before_decode_at_exact_encoded_boundaries() {
+        assert!(preflight_base64_len(
+            &"A".repeat(MAX_PUBKEY_B64_LEN),
+            MAX_PUBKEY_B64_LEN,
+            7,
+            "pubkey",
+        ).is_ok());
+        assert!(preflight_base64_len(
+            &"A".repeat(MAX_SIG_B64_LEN),
+            MAX_SIG_B64_LEN,
+            7,
+            "signature",
+        ).is_ok());
+
+        let base = make_bundle();
+        let mut oversized_pubkey = base.clone();
+        oversized_pubkey.entries[0].pubkey_b64 = "!".repeat(MAX_PUBKEY_B64_LEN + 1);
+        let pubkey_error = oversized_pubkey.verify().unwrap_err().to_string();
+        assert!(pubkey_error.contains("pubkey base64 length"));
+        assert!(!pubkey_error.contains("bad pubkey b64"));
+
+        let mut oversized_signature = base;
+        oversized_signature.entries[0].sig_b64 = "!".repeat(MAX_SIG_B64_LEN + 1);
+        let signature_error = oversized_signature.verify().unwrap_err().to_string();
+        assert!(signature_error.contains("signature base64 length"));
+        assert!(!signature_error.contains("bad sig b64"));
     }
 
     #[test]
