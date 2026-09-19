@@ -916,6 +916,7 @@ impl Keypair {
         // Reject attacker-controlled Argon2 work before any Base64 decoder can
         // allocate output for the remaining untrusted fields.
         validate_kdf_params(&ks.crypto.kdf_params)?;
+        validate_legacy_nonce_base64_length(&ks.crypto.nonce)?;
 
         let salt      = b64::STANDARD.decode(&ks.crypto.kdf_params.salt).map_err(|e| e.to_string())?;
         let nonce_b   = b64::STANDARD.decode(&ks.crypto.nonce).map_err(|e| e.to_string())?;
@@ -1154,6 +1155,18 @@ fn derive_key(pw: &str, salt: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
 const MAX_M_COST_KIB: u32 = 1024 * 1024; // 1 GiB
 const MAX_T_COST: u32 = 16;
 const MAX_P_COST: u32 = 16;
+const LEGACY_NONCE_B64_LEN: usize = 16; // 12 decoded bytes
+
+fn validate_legacy_nonce_base64_length(nonce_b64: &str) -> Result<(), String> {
+    if nonce_b64.len() != LEGACY_NONCE_B64_LEN {
+        return Err(format!(
+            "keystore nonce Base64 has invalid encoded length: expected {} bytes, got {}",
+            LEGACY_NONCE_B64_LEN,
+            nonce_b64.len()
+        ));
+    }
+    Ok(())
+}
 
 fn validate_kdf_params(p: &KdfParams) -> Result<(), String> {
     if p.memory_cost > MAX_M_COST_KIB || p.time_cost > MAX_T_COST || p.parallelism > MAX_P_COST {
@@ -1366,6 +1379,85 @@ mod legacy_keystore_tests {
         assert_eq!(loaded.private_key, keypair.private_key);
         assert_eq!(loaded.public_key, keypair.public_key);
         assert_eq!(loaded.address, keypair.address);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_nonce_base64_length_precedes_decode_without_restricting_salt() {
+        let path = std::env::temp_dir().join(format!(
+            "bloch-wave181-legacy-nonce-shape-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let password = "synthetic-test-password";
+        let keypair = generate_keypair(false);
+        let salt = [0x19; 8];
+        let nonce = [0x28; 12];
+        let kdf_params = KdfParams {
+            memory_cost: 8,
+            time_cost: 1,
+            parallelism: 1,
+            salt: b64::STANDARD.encode(salt),
+            output_len: 32,
+        };
+        let key = derive_key_with_params(password, &salt, &kdf_params).unwrap();
+        let payload = Zeroizing::new(serde_json::to_vec(&KeystorePayload {
+            private_key_hex: hex::encode(&keypair.private_key),
+            public_key_hex: hex::encode(&keypair.public_key),
+        }).unwrap());
+        let ciphertext = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key))
+            .encrypt(Nonce::from_slice(&nonce), payload.as_ref())
+            .unwrap();
+        let baseline = EncryptedKeystore {
+            version: 2,
+            address: keypair.address.clone(),
+            network: "mainnet".into(),
+            crypto: KeystoreCrypto {
+                cipher: "aes-256-gcm".into(),
+                ciphertext: b64::STANDARD.encode(ciphertext),
+                nonce: b64::STANDARD.encode(nonce),
+                kdf: "argon2id".into(),
+                // Legacy load historically accepts any Argon2-valid salt
+                // length; this non-save-produced salt pins that compatibility.
+                kdf_params,
+            },
+            created_at: String::new(),
+            description: String::new(),
+        };
+        let load = |keystore: &EncryptedKeystore| {
+            let bytes = serde_json::to_vec(keystore).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            Keypair::load_encrypted_with_file_limit(
+                &path,
+                password,
+                bytes.len(),
+            )
+        };
+
+        assert_eq!(baseline.crypto.nonce.len(), LEGACY_NONCE_B64_LEN);
+        let loaded = load(&baseline).unwrap();
+        assert_eq!(loaded.private_key, keypair.private_key);
+        assert_eq!(loaded.public_key, keypair.public_key);
+        assert_eq!(loaded.address, keypair.address);
+
+        let mut exact_sentinel = baseline.clone();
+        exact_sentinel.crypto.nonce = "!".repeat(LEGACY_NONCE_B64_LEN);
+        assert!(
+            !load(&exact_sentinel).unwrap_err().contains("invalid encoded length"),
+            "an exact-length nonce sentinel must reach the Base64 decoder",
+        );
+
+        let mut one_over = baseline;
+        one_over.crypto.nonce = "!".repeat(LEGACY_NONCE_B64_LEN + 1);
+        assert_eq!(
+            load(&one_over).unwrap_err(),
+            format!(
+                "keystore nonce Base64 has invalid encoded length: expected {} bytes, got {}",
+                LEGACY_NONCE_B64_LEN,
+                LEGACY_NONCE_B64_LEN + 1
+            ),
+        );
 
         let _ = std::fs::remove_file(path);
     }

@@ -71,6 +71,30 @@ pub const KEYFILE_VERSION_V2: u32 = 2;
 const V2_SEED_MIN: usize = 32;
 const V2_SEED_MAX: usize = 128;
 
+// `base64::STANDARD` requires canonical padding, so fixed decoded fields have
+// one accepted encoded length. Check that shape before asking the decoder to
+// allocate output; the decoded-length checks below remain authoritative.
+const KEYFILE_SALT_B64_LEN: usize = 24; // 16 decoded bytes
+const KEYFILE_NONCE_B64_LEN: usize = 16; // 12 decoded bytes
+
+fn validate_fixed_base64_lengths(salt_b64: &str, nonce_b64: &str) -> Result<(), WalletError> {
+    if salt_b64.len() != KEYFILE_SALT_B64_LEN {
+        return Err(WalletError::Parse(format!(
+            "keyfile salt Base64 has invalid encoded length: expected {} bytes, got {}",
+            KEYFILE_SALT_B64_LEN,
+            salt_b64.len()
+        )));
+    }
+    if nonce_b64.len() != KEYFILE_NONCE_B64_LEN {
+        return Err(WalletError::Parse(format!(
+            "keyfile nonce Base64 has invalid encoded length: expected {} bytes, got {}",
+            KEYFILE_NONCE_B64_LEN,
+            nonce_b64.len()
+        )));
+    }
+    Ok(())
+}
+
 /// KDF parameters. Tuned for ~4 seconds on modern CPU (2026).
 ///
 /// Sprint T.2 — Audit M-4 fix: bumped from 64MiB/m_cost=65536 to 256MiB/m_cost=262144
@@ -275,6 +299,8 @@ impl EncryptedKeyfile {
             )));
         }
 
+        validate_fixed_base64_lengths(&self.kdf.salt_b64, &self.cipher.nonce_b64)?;
+
         // Decode base64
         let salt = B64.decode(&self.kdf.salt_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
         let nonce_bytes = B64.decode(&self.cipher.nonce_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
@@ -457,6 +483,8 @@ impl EncryptedKeyfile {
                 "KDF params out of bounds (m_cost={} KiB, t_cost={}, p_cost={})",
                 self.kdf.m_cost, self.kdf.t_cost, self.kdf.p_cost)));
         }
+
+        validate_fixed_base64_lengths(&self.kdf.salt_b64, &self.cipher.nonce_b64)?;
 
         let salt = B64.decode(&self.kdf.salt_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
         let nonce_bytes = B64.decode(&self.cipher.nonce_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
@@ -900,6 +928,106 @@ mod tests {
         v2.kdf.m_cost = u32::MAX;
         v2.cipher.ciphertext_b64 = "!".repeat(64 * 1024);
         assert_expected(v2.decrypt_v2(password).unwrap_err());
+    }
+
+    #[test]
+    fn fixed_base64_lengths_precede_decode_for_both_keyfile_versions() {
+        const PASSWORD: &str = "password-abcd-12";
+        let fast_params = KdfParams { m_cost: 1024, t_cost: 1, p_cost: 1 };
+
+        let make = |v2: bool| {
+            if v2 {
+                EncryptedKeyfile::encrypt_seed_v2_with_params(
+                    &[0x17; 64],
+                    b"secret",
+                    b"public",
+                    Network::Testnet,
+                    PASSWORD,
+                    fast_params,
+                )
+                .unwrap()
+            } else {
+                EncryptedKeyfile::encrypt_with_params(
+                    b"secret",
+                    b"public",
+                    Network::Mainnet,
+                    PASSWORD,
+                    fast_params,
+                )
+                .unwrap()
+            }
+        };
+        let decrypt_error = |keyfile: &EncryptedKeyfile, v2: bool| {
+            if v2 {
+                keyfile.decrypt_v2(PASSWORD).unwrap_err()
+            } else {
+                keyfile.decrypt(PASSWORD).unwrap_err()
+            }
+        };
+
+        // Authentic canonical encodings at the exact lengths still traverse
+        // the unchanged decoder/KDF/AES paths for both schema versions.
+        let v1 = make(false);
+        assert_eq!(v1.kdf.salt_b64.len(), KEYFILE_SALT_B64_LEN);
+        assert_eq!(v1.cipher.nonce_b64.len(), KEYFILE_NONCE_B64_LEN);
+        assert_eq!(v1.decrypt(PASSWORD).unwrap().0, b"secret");
+        let v2 = make(true);
+        assert_eq!(v2.kdf.salt_b64.len(), KEYFILE_SALT_B64_LEN);
+        assert_eq!(v2.cipher.nonce_b64.len(), KEYFILE_NONCE_B64_LEN);
+        let (seed, secret, ..) = v2.decrypt_v2(PASSWORD).unwrap();
+        assert_eq!(&seed[..], &[0x17; 64]);
+        assert_eq!(&secret[..], b"secret");
+
+        for v2 in [false, true] {
+            for salt in [true, false] {
+                let (field, exact, expected) = if salt {
+                    (
+                        "salt",
+                        KEYFILE_SALT_B64_LEN,
+                        format!(
+                            "keyfile salt Base64 has invalid encoded length: expected {} bytes, got {}",
+                            KEYFILE_SALT_B64_LEN,
+                            KEYFILE_SALT_B64_LEN + 1
+                        ),
+                    )
+                } else {
+                    (
+                        "nonce",
+                        KEYFILE_NONCE_B64_LEN,
+                        format!(
+                            "keyfile nonce Base64 has invalid encoded length: expected {} bytes, got {}",
+                            KEYFILE_NONCE_B64_LEN,
+                            KEYFILE_NONCE_B64_LEN + 1
+                        ),
+                    )
+                };
+
+                let mut at_exact = make(v2);
+                if salt {
+                    at_exact.kdf.salt_b64 = "!".repeat(exact);
+                } else {
+                    at_exact.cipher.nonce_b64 = "!".repeat(exact);
+                }
+                let WalletError::Parse(message) = decrypt_error(&at_exact, v2) else {
+                    panic!("exact-length {field} sentinel must reach the Base64 decoder")
+                };
+                assert!(
+                    !message.contains("invalid encoded length"),
+                    "exact-length {field} sentinel must pass the shape preflight: {message}",
+                );
+
+                let mut one_over = make(v2);
+                if salt {
+                    one_over.kdf.salt_b64 = "!".repeat(exact + 1);
+                } else {
+                    one_over.cipher.nonce_b64 = "!".repeat(exact + 1);
+                }
+                let WalletError::Parse(message) = decrypt_error(&one_over, v2) else {
+                    panic!("one-over {field} sentinel must fail the encoded-length preflight")
+                };
+                assert_eq!(message, expected);
+            }
+        }
     }
 
     #[test]
