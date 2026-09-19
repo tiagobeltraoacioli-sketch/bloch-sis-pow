@@ -13,6 +13,13 @@ const BOLD:    &str = "\x1b[1m";
 const DIM:     &str = "\x1b[2m";
 const RESET:   &str = "\x1b[0m";
 
+// The `disclose` command documents index zero as the base single-key wallet
+// address. Keep that product policy explicit instead of inheriting a public
+// compatibility wrapper's default convention.
+const CLI_DISCLOSURE_KEY_CONVENTION:
+    crate::wallet::disclosure::DisclosureKeyConvention =
+    crate::wallet::disclosure::DisclosureKeyConvention::SingleKeyWallet;
+
 fn amber(s: &str)  -> String { format!("{}{}{}", AMBER, s, RESET) }
 fn green(s: &str)  -> String { format!("{}{}{}", GREEN, s, RESET) }
 fn red(s: &str)    -> String { format!("{}{}{}", RED, s, RESET) }
@@ -309,8 +316,9 @@ pub fn main() {
             // Disclosure key generation can be slow and derive many children;
             // keep its returned master-seed copy zeroizing for that lifetime.
             let seed_bytes = zeroize::Zeroizing::new(seed.to_seed_bytes());
-            let bundle = match crate::wallet::DisclosureBundle::create(
-                &seed_bytes[..], &idx, network, &purpose, &audience)
+            let bundle = match crate::wallet::DisclosureBundle::create_with_convention(
+                &seed_bytes[..], &idx, network, &purpose, &audience,
+                CLI_DISCLOSURE_KEY_CONVENTION)
             {
                 Ok(b) => b,
                 Err(e) => { err(&format!("Disclosure failed: {}", e)) }
@@ -592,6 +600,57 @@ mod audit_cli_input_tests {
 
         confirmed.zeroize();
         assert!(confirmed.is_empty());
+    }
+
+    #[test]
+    fn cli_disclosure_uses_explicit_single_key_convention() {
+        use crate::wallet::disclosure::{
+            keypair_at_with_convention, DisclosureKeyConvention,
+        };
+
+        assert_eq!(
+            CLI_DISCLOSURE_KEY_CONVENTION,
+            DisclosureKeyConvention::SingleKeyWallet,
+        );
+
+        let seed = [0x47; 64];
+        let (base_public, base_secret) =
+            crate::crypto::generate_keypair_from_seed(&seed[..32]).unwrap();
+        let _base_secret = zeroize::Zeroizing::new(base_secret);
+        let (cli_zero_public, cli_zero_secret) = keypair_at_with_convention(
+            &seed,
+            0,
+            CLI_DISCLOSURE_KEY_CONVENTION,
+        )
+        .unwrap();
+        let _cli_zero_secret = zeroize::Zeroizing::new(cli_zero_secret);
+        let (hd_zero_public, hd_zero_secret) = keypair_at_with_convention(
+            &seed,
+            0,
+            DisclosureKeyConvention::HdWalletV3,
+        )
+        .unwrap();
+        let _hd_zero_secret = zeroize::Zeroizing::new(hd_zero_secret);
+
+        assert_eq!(cli_zero_public, base_public);
+        assert_ne!(cli_zero_public, hd_zero_public);
+
+        let (cli_child_public, cli_child_secret) = keypair_at_with_convention(
+            &seed,
+            7,
+            CLI_DISCLOSURE_KEY_CONVENTION,
+        )
+        .unwrap();
+        let _cli_child_secret = zeroize::Zeroizing::new(cli_child_secret);
+        let (hd_child_public, hd_child_secret) = keypair_at_with_convention(
+            &seed,
+            7,
+            DisclosureKeyConvention::HdWalletV3,
+        )
+        .unwrap();
+        let _hd_child_secret = zeroize::Zeroizing::new(hd_child_secret);
+
+        assert_eq!(cli_child_public, hd_child_public);
     }
 
     #[test]
