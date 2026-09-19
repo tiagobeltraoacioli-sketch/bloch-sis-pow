@@ -146,16 +146,22 @@ jobs:
   clippy-hardened:
     runs-on: ubuntu-latest
     steps:
+      - run: |
+          bash scripts/hardened-clippy.selftest.sh
+          python3 scripts/hardened-clippy-score.test.py
+      - run: sudo apt-get update && sudo apt-get install -y clang cmake
       - run: bash scripts/hardened-clippy.sh
 
   cargo-audit:
     runs-on: ubuntu-latest
     steps:
+      - run: cargo install cargo-audit --version 0.22.2 --locked
       - run: bash scripts/audit-all-lockfiles.sh
 
   cargo-deny:
     runs-on: ubuntu-latest
     steps:
+      - run: cargo install cargo-deny --version 0.20.2 --locked
       - run: cargo deny check advisories bans licenses sources
 
   osv-scanner:
@@ -183,22 +189,27 @@ jobs:
   secret-scan:
     runs-on: ubuntu-latest
     steps:
+      - run: CI_TOOLS_BIN="$HOME/.local/bin" bash scripts/ci-install-scanner.sh gitleaks
       - run: bash scripts/scan-secrets.sh tree
 
   scanners-blocking-guard:
     runs-on: ubuntu-latest
     steps:
+      - run: python3 scripts/ci-install-scanner.test.py
       - run: python3 scripts/check-scanners-blocking.selftest.py
       - run: python3 scripts/check-scanners-blocking.py
 
   secret-history-scan:
     runs-on: ubuntu-latest
     steps:
+      - run: CI_TOOLS_BIN="$HOME/.local/bin" bash scripts/ci-install-scanner.sh gitleaks
       - run: bash scripts/scan-secrets.sh history
+      - run: python3 scripts/scan-secrets.test.py
 
   rollback-package-integrity:
     runs-on: ubuntu-latest
     steps:
+      - run: sudo apt-get update && sudo apt-get install -y minisign
       - run: bash deploy/rollback/make-rollback-package.selftest.sh
 
   cargo-geiger:
@@ -298,13 +309,42 @@ CASES = [
              "        with:\n          experimental: true\n          scan-args:"),
          must_fail=True, expect="unreviewed `with:` inputs"),
 
-    Case("GitHub output channel does not mutate scanner environment",
+    Case("even inert extra scanner run steps need explicit review",
          GOOD_GITLAB,
          GOOD_GITHUB.replace(
              "      - run: cargo deny check advisories bans licenses sources",
              "      - run: echo status=ready >> \"$GITHUB_OUTPUT\"\n"
              "      - run: cargo deny check advisories bans licenses sources"),
-         must_fail=False),
+         must_fail=True, expect="reviewed ordered command list"),
+
+    Case("extra run step cannot overwrite a scanner entrypoint",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - run: bash scripts/audit-all-lockfiles.sh",
+             "      - run: cp scripts/fake-audit.sh scripts/audit-all-lockfiles.sh\n"
+             "      - run: bash scripts/audit-all-lockfiles.sh"),
+         must_fail=True, expect="reviewed ordered command list"),
+
+    Case("scanner verdict cannot run before its pinned setup",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - run: cargo install cargo-deny --version 0.20.2 --locked\n"
+             "      - run: cargo deny check advisories bans licenses sources",
+             "      - run: cargo deny check advisories bans licenses sources\n"
+             "      - run: cargo install cargo-deny --version 0.20.2 --locked"),
+         must_fail=True, expect="reviewed ordered command list"),
+
+    Case("scanner installer setup cannot be deleted",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - run: CI_TOOLS_BIN=\"$HOME/.local/bin\" bash scripts/ci-install-scanner.sh gitleaks\n",
+             "", 1),
+         must_fail=True, expect="reviewed ordered command list"),
+
+    Case("folded YAML cannot merge two reviewed setup commands",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace("      - run: |\n", "      - run: >\n", 1),
+         must_fail=True, expect="reviewed ordered command list"),
 
     Case("GitHub PATH command file cannot replace scanner binaries",
          GOOD_GITLAB,
@@ -444,7 +484,8 @@ CASES = [
          GOOD_GITLAB,
          GOOD_GITHUB.replace(
              "  scanners-blocking-guard:\n    runs-on: ubuntu-latest\n"
-             "    steps:\n      - run: python3 scripts/check-scanners-blocking.selftest.py\n"
+             "    steps:\n      - run: python3 scripts/ci-install-scanner.test.py\n"
+             "      - run: python3 scripts/check-scanners-blocking.selftest.py\n"
              "      - run: python3 scripts/check-scanners-blocking.py\n\n", ""),
          must_fail=True, expect="MISSING"),
 
@@ -538,7 +579,8 @@ CASES = [
          GOOD_GITLAB,
          GOOD_GITHUB.replace(
              "  rollback-package-integrity:\n    runs-on: ubuntu-latest\n"
-             "    steps:\n      - run: bash deploy/rollback/make-rollback-package.selftest.sh\n\n", ""),
+             "    steps:\n      - run: sudo apt-get update && sudo apt-get install -y minisign\n"
+             "      - run: bash deploy/rollback/make-rollback-package.selftest.sh\n\n", ""),
          must_fail=True, expect="`rollback-package-integrity`"),
 
     Case("required clippy job deleted",
@@ -605,7 +647,9 @@ CASES = [
     Case("GitHub alias cannot hide required steps",
          GOOD_GITLAB,
          sub(GOOD_GITHUB,
-             "  cargo-deny:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo deny check advisories bans licenses sources",
+             "  cargo-deny:\n    runs-on: ubuntu-latest\n    steps:\n"
+             "      - run: cargo install cargo-deny --version 0.20.2 --locked\n"
+             "      - run: cargo deny check advisories bans licenses sources",
              "  cargo-deny:\n    runs-on: ubuntu-latest\n    steps: *scanner-steps"),
          must_fail=True, expect="YAML alias or GitLab reference"),
 

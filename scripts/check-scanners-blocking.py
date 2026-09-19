@@ -59,6 +59,8 @@ security job, fails if the job:
     unreviewed/mutable action (including new inputs to a reviewed action).
   * writes GitHub's cross-step PATH/environment command files before an
     otherwise unchanged scanner or guard command.
+  * adds, removes or reorders a required GitHub security job's reviewed run
+    steps, including folding distinct literal-block commands together.
 
 It does NOT require every job to be blocking. cargo-geiger, miri and the fuzz
 smoke are deliberately report-only, with written reasons, and stay green here.
@@ -172,6 +174,40 @@ REVIEWED_GITHUB_ACTIONS = {
     "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
     "google/osv-scanner-action/osv-scanner-action@764c91816374ff2d8fc2095dab36eecd42d61638",
 }
+GITHUB_REVIEWED_RUNS = {
+    "clippy-hardened": (
+        "bash scripts/hardened-clippy.selftest.sh\npython3 scripts/hardened-clippy-score.test.py",
+        "sudo apt-get update && sudo apt-get install -y clang cmake",
+        "bash scripts/hardened-clippy.sh",
+    ),
+    "osv-scanner": (),
+    "secret-scan": (
+        'CI_TOOLS_BIN="$HOME/.local/bin" bash scripts/ci-install-scanner.sh gitleaks',
+        "bash scripts/scan-secrets.sh tree",
+    ),
+    "secret-history-scan": (
+        'CI_TOOLS_BIN="$HOME/.local/bin" bash scripts/ci-install-scanner.sh gitleaks',
+        "bash scripts/scan-secrets.sh history",
+        "python3 scripts/scan-secrets.test.py",
+    ),
+    "cargo-audit": (
+        "cargo install cargo-audit --version 0.22.2 --locked",
+        "bash scripts/audit-all-lockfiles.sh",
+    ),
+    "cargo-deny": (
+        "cargo install cargo-deny --version 0.20.2 --locked",
+        "cargo deny check advisories bans licenses sources",
+    ),
+    "scanners-blocking-guard": (
+        "python3 scripts/ci-install-scanner.test.py",
+        "python3 scripts/check-scanners-blocking.selftest.py",
+        "python3 scripts/check-scanners-blocking.py",
+    ),
+    "rollback-package-integrity": (
+        "sudo apt-get update && sudo apt-get install -y minisign",
+        "bash deploy/rollback/make-rollback-package.selftest.sh",
+    ),
+}
 GITHUB_STATE_CHANNEL = re.compile(
     r"GITHUB_(?:PATH|ENV)\b|github\.(?:path|env)\b|::(?:add-path|set-env)\b",
     re.IGNORECASE,
@@ -253,6 +289,39 @@ def explicit_execution_values(body: list[str], job_indent: int, label: str) -> l
             value = " ".join(continuation)
         # Inline YAML comments annotate pinned actions in the real workflow;
         # they are metadata, not part of the executable value.
+        value = re.sub(r"\s+#.*$", "", value).strip()
+        values.append(value.strip("\"'"))
+    return values
+
+
+def github_run_values(body: list[str], job_indent: int) -> list[str]:
+    """Extract ordered explicit run values, excluding names/actions/inputs."""
+    values = []
+    index = 0
+    while index < len(body):
+        line = body[index]
+        spaces = len(line) - len(line.lstrip(" "))
+        stripped = line.strip()
+        value = None
+        field_indent = spaces
+        if spaces == job_indent + 4 and stripped.startswith("- run:"):
+            value = stripped[len("- run:"):].strip()
+        elif spaces == job_indent + 6 and stripped.startswith("run:"):
+            value = stripped[len("run:"):].strip()
+        index += 1
+        if value is None:
+            continue
+        if value in ("|", "|-", "|+", ">", ">-", ">+"):
+            separator = "\n" if value.startswith("|") else " "
+            continuation = []
+            while index < len(body):
+                candidate = body[index]
+                candidate_indent = len(candidate) - len(candidate.lstrip(" "))
+                if candidate_indent <= field_indent:
+                    break
+                continuation.append(candidate.strip())
+                index += 1
+            value = separator.join(continuation)
         value = re.sub(r"\s+#.*$", "", value).strip()
         values.append(value.strip("\"'"))
     return values
@@ -566,6 +635,12 @@ def check_file(
             problems += check_gitlab_job_context(blocks[job], job, indent)
         executable = explicit_execution_values(blocks[job], indent, label)
         if label == ".github/workflows/security.yml":
+            runs = tuple(github_run_values(blocks[job], indent))
+            if runs != GITHUB_REVIEWED_RUNS[job]:
+                problems.append(
+                    "%s: job `%s` (%s) run steps differ from the reviewed "
+                    "ordered command list"
+                    % (label, job, why))
             if any(GITHUB_STATE_CHANNEL.search(value) for value in executable):
                 problems.append(
                     "%s: job `%s` (%s) writes a cross-step environment/PATH "
