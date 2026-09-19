@@ -72,6 +72,7 @@ build-and-test:
     - python3 -I scripts/check-live-node-retired-isolation.py
     - python3 -I scripts/pinned-rust-toolchain.py
     - python3 -I scripts/check-validator-lifecycle-mutations.py
+    - python3 -I scripts/rehearse-validator-activation.py --output "$CI_PROJECT_DIR/.ci-validator-activation"
     - cargo build --workspace --all-targets
 """ + CRATE_ARGS + """\
   timeout: 120m
@@ -355,6 +356,12 @@ CASES = [
              "      - run: python3 -I scripts/check-validator-lifecycle-mutations.py\n", ""),
          must_fail=True, expect="reviewed ordered command list"),
 
+    Case("github cannot remove the finite validator activation rehearsal",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             '      - run: python3 -I scripts/rehearse-validator-activation.py --output "$RUNNER_TEMP/validator-activation"\n', ""),
+         must_fail=True, expect="reviewed ordered command list"),
+
     Case("github toolchain setup cannot regress to one-file sed parsing",
          GOOD_GITLAB,
          GOOD_GITHUB.replace(
@@ -536,6 +543,11 @@ CASES = [
     Case("gitlab cannot remove the shared validator lifecycle mutation check",
          GOOD_GITLAB.replace(
              "    - python3 -I scripts/check-validator-lifecycle-mutations.py\n", ""),
+         GOOD_GITHUB, must_fail=True, expect="exact ordered command contract"),
+
+    Case("gitlab cannot remove the finite validator activation rehearsal",
+         GOOD_GITLAB.replace(
+             '    - python3 -I scripts/rehearse-validator-activation.py --output "$CI_PROJECT_DIR/.ci-validator-activation"\n', ""),
          GOOD_GITHUB, must_fail=True, expect="exact ordered command contract"),
 
     Case("gitlab build-and-test commands cannot be reordered",
