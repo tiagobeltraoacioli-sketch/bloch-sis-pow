@@ -21,6 +21,7 @@ use crate::crypto;
 use crate::wallet::{Keypair, KdfParams, KeystoreCrypto};
 use crate::core::TESTNET_PREFIX;
 use serde::{Serialize, Deserialize};
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, KeyInit}};
 use argon2::{Argon2, Algorithm, Version, Params};
@@ -60,9 +61,9 @@ impl HdWalletFile {
 
     /// Read public wallet metadata with explicit byte and address limits.
     ///
-    /// The byte budget is enforced while reading. The address limit is checked
-    /// immediately after parsing and structural validation, before the parsed
-    /// value can escape this API. Exact-limit inputs are accepted.
+    /// The byte budget is enforced while reading. A non-retaining JSON
+    /// preflight rejects excess address records before they are allocated by
+    /// the full wallet deserializer. Exact-limit inputs are accepted.
     pub fn read_public_with_limits(
         path: &Path,
         max_file_bytes: usize,
@@ -70,6 +71,7 @@ impl HdWalletFile {
     ) -> Result<Self, String> {
         let bytes = crate::util::read_wallet_file(path, max_file_bytes)
             .map_err(|error| error.to_string())?;
+        preflight_wallet_record_limits(&bytes, max_addresses, None)?;
         let wallet: Self = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
         validate_wallet_structure(&wallet)?;
         validate_wallet_address_limit(&wallet, max_addresses)?;
@@ -366,10 +368,10 @@ impl HdWallet {
 
     /// Load with explicit aggregate address and derived-key work limits.
     ///
-    /// Both counters are checked after the bounded JSON parse but before the
-    /// master-key KDF or any ciphertext/key derivation work. Exact-limit files
-    /// are accepted; exceeding either counter fails closed without trying the
-    /// supplied credentials.
+    /// Both counters are checked by a non-retaining JSON preflight before the
+    /// full wallet value is allocated, and before the master-key KDF or any
+    /// ciphertext/key derivation work. Exact-limit files are accepted;
+    /// exceeding either counter fails closed without trying the credentials.
     pub fn load_with_limits(
         path: &Path,
         mnemonic_str: &str,
@@ -396,6 +398,13 @@ impl HdWallet {
         limits: Option<HdWalletLoadLimits>,
     ) -> Result<Self, String> {
         let bytes = crate::util::read_wallet_file(path, max_bytes).map_err(|e| e.to_string())?;
+        if let Some(limits) = limits {
+            preflight_wallet_record_limits(
+                &bytes,
+                limits.max_addresses,
+                Some(limits.max_derived_key_checks),
+            )?;
+        }
         let wallet: HdWalletFile = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
         validate_wallet_structure(&wallet)?;
         if let Some(limits) = limits {
@@ -521,6 +530,204 @@ fn validate_wallet_address_limit(wallet: &HdWalletFile, max_addresses: usize) ->
         ));
     }
     Ok(())
+}
+
+/// Scan only the JSON shape needed for resource accounting. `IgnoredAny`
+/// consumes all payload fields without retaining their strings or encrypted
+/// blobs. The address counter is charged as soon as an array element begins,
+/// so an excess record is rejected before any of its fields are visited.
+fn preflight_wallet_record_limits(
+    bytes: &[u8],
+    max_addresses: usize,
+    max_derived_key_checks: Option<usize>,
+) -> Result<(), String> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    WalletRecordLimitSeed { max_addresses, max_derived_key_checks }
+        .deserialize(&mut deserializer)
+        .map_err(normalize_preflight_error)?;
+    deserializer.end().map_err(|error| error.to_string())
+}
+
+fn normalize_preflight_error(error: serde_json::Error) -> String {
+    let rendered = error.to_string();
+    if rendered.starts_with("HD wallet address count ")
+        || rendered.starts_with("HD wallet derived-key check count ")
+    {
+        rendered.split(" at line ").next().unwrap_or(&rendered).to_string()
+    } else {
+        rendered
+    }
+}
+
+struct WalletRecordLimitSeed {
+    max_addresses: usize,
+    max_derived_key_checks: Option<usize>,
+}
+
+impl<'de> DeserializeSeed<'de> for WalletRecordLimitSeed {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(WalletRecordLimitVisitor {
+            max_addresses: self.max_addresses,
+            max_derived_key_checks: self.max_derived_key_checks,
+        })
+    }
+}
+
+struct WalletRecordLimitVisitor {
+    max_addresses: usize,
+    max_derived_key_checks: Option<usize>,
+}
+
+impl<'de> Visitor<'de> for WalletRecordLimitVisitor {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an HD-wallet JSON object")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut saw_addresses = false;
+        while let Some(field) = map.next_key::<String>()? {
+            if field == "addresses" {
+                if saw_addresses {
+                    return Err(de::Error::duplicate_field("addresses"));
+                }
+                saw_addresses = true;
+                map.next_value_seed(AddressSequenceLimitSeed {
+                    max_addresses: self.max_addresses,
+                    max_derived_key_checks: self.max_derived_key_checks,
+                })?;
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+struct AddressSequenceLimitSeed {
+    max_addresses: usize,
+    max_derived_key_checks: Option<usize>,
+}
+
+impl<'de> DeserializeSeed<'de> for AddressSequenceLimitSeed {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(AddressSequenceLimitVisitor {
+            max_addresses: self.max_addresses,
+            max_derived_key_checks: self.max_derived_key_checks,
+        })
+    }
+}
+
+struct AddressSequenceLimitVisitor {
+    max_addresses: usize,
+    max_derived_key_checks: Option<usize>,
+}
+
+impl<'de> Visitor<'de> for AddressSequenceLimitVisitor {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an array of HD-wallet address records")
+    }
+
+    fn visit_seq<S>(self, mut sequence: S) -> Result<Self::Value, S::Error>
+    where
+        S: SeqAccess<'de>,
+    {
+        let mut addresses = 0usize;
+        let mut derived_key_checks = 0usize;
+        while sequence.next_element_seed(AddressRecordLimitSeed {
+            addresses: &mut addresses,
+            derived_key_checks: &mut derived_key_checks,
+            max_addresses: self.max_addresses,
+            max_derived_key_checks: self.max_derived_key_checks,
+        })?.is_some() {}
+        Ok(())
+    }
+}
+
+struct AddressRecordLimitSeed<'a> {
+    addresses: &'a mut usize,
+    derived_key_checks: &'a mut usize,
+    max_addresses: usize,
+    max_derived_key_checks: Option<usize>,
+}
+
+impl<'de> DeserializeSeed<'de> for AddressRecordLimitSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        *self.addresses += 1;
+        if *self.addresses > self.max_addresses {
+            return Err(de::Error::custom(format_args!(
+                "HD wallet address count {} exceeds configured limit {}",
+                *self.addresses, self.max_addresses
+            )));
+        }
+        deserializer.deserialize_map(AddressRecordLimitVisitor {
+            derived_key_checks: self.derived_key_checks,
+            max_derived_key_checks: self.max_derived_key_checks,
+        })
+    }
+}
+
+struct AddressRecordLimitVisitor<'a> {
+    derived_key_checks: &'a mut usize,
+    max_derived_key_checks: Option<usize>,
+}
+
+impl<'de> Visitor<'de> for AddressRecordLimitVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an HD-wallet address object")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut saw_derived = false;
+        while let Some(field) = map.next_key::<String>()? {
+            if field == "derived" {
+                if saw_derived {
+                    return Err(de::Error::duplicate_field("derived"));
+                }
+                saw_derived = true;
+                if map.next_value::<bool>()? {
+                    *self.derived_key_checks += 1;
+                    if let Some(limit) = self.max_derived_key_checks {
+                        if *self.derived_key_checks > limit {
+                            return Err(de::Error::custom(format_args!(
+                                "HD wallet derived-key check count {} exceeds configured limit {}",
+                                *self.derived_key_checks, limit
+                            )));
+                        }
+                    }
+                }
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(())
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -1104,6 +1311,35 @@ mod audit_wallet_boundaries {
         assert_eq!(
             validate_wallet_load_limits(&file, limits).unwrap_err(),
             "HD wallet derived-key check count 257 exceeds configured limit 256"
+        );
+    }
+
+    #[test]
+    fn json_preflight_enforces_exact_record_limits_before_full_allocation() {
+        let exact = br#"{
+            "ignored": {"large-shaped-payload": [1, 2, 3]},
+            "addresses": [
+                {"derived": true, "label": "first"},
+                {"label": "legacy", "derived": false}
+            ]
+        }"#;
+        assert!(preflight_wallet_record_limits(exact, 2, Some(1)).is_ok());
+        assert_eq!(
+            preflight_wallet_record_limits(exact, 1, Some(1)).unwrap_err(),
+            "HD wallet address count 2 exceeds configured limit 1"
+        );
+        assert_eq!(
+            preflight_wallet_record_limits(exact, 2, Some(0)).unwrap_err(),
+            "HD wallet derived-key check count 1 exceeds configured limit 0"
+        );
+
+        // The third record is deliberately truncated. Charging the record as
+        // soon as it begins must return the resource-limit error before either
+        // parsing or allocating any of that excess record's fields.
+        let hostile_overflow = br#"{"addresses":[{}, {}, {"huge": "#;
+        assert_eq!(
+            preflight_wallet_record_limits(hostile_overflow, 2, None).unwrap_err(),
+            "HD wallet address count 3 exceeds configured limit 2"
         );
     }
 
