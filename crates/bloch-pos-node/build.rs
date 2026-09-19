@@ -69,6 +69,9 @@ use sha3::{Digest, Sha3_256};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod build_command;
+use build_command::{configured_command_words, delegated_compiler};
+
 /// Extensions that are build inputs for this binary.
 const SOURCE_EXT: &[&str] = &["rs", "toml", "c", "h", "S", "s", "macros"];
 
@@ -230,26 +233,6 @@ fn build_tool_digest(command: &str) -> Option<String> {
     Some(hex(&h.finalize()))
 }
 
-/// Return the executable portion of a configured tool command. Cargo and the
-/// `cc` crate accept either a bare executable/path or a wrapper followed by
-/// arguments. In the latter case the wrapper is the program the build invokes
-/// directly, so fingerprint that boundary and leave delegated tools explicit
-/// in the residual rather than guessing at shell semantics.
-fn configured_program(command: &str) -> Option<&str> {
-    let command = command.trim();
-    if command.is_empty() {
-        return None;
-    }
-    let first = command.as_bytes()[0];
-    if first == b'\'' || first == b'"' {
-        let quote = first as char;
-        let rest = &command[1..];
-        let end = rest.find(quote)?;
-        return (end > 0).then(|| &rest[..end]);
-    }
-    command.split_ascii_whitespace().next()
-}
-
 /// Build environment variables whose value begins with an executable. This
 /// deliberately excludes flags and SDK directories. Target/host spellings are
 /// already enumerated by `exact_build_env`; prefix forms cover the variants
@@ -295,15 +278,24 @@ fn configured_tool_digests(target: &str, host: &str) -> Vec<(String, String)> {
     keys.sort();
     keys.dedup();
 
-    keys.into_iter()
-        .filter(|key| configured_tool_key(key))
-        .filter_map(|key| {
-            let value = std::env::var(&key).ok()?;
-            let program = configured_program(&value)?;
-            let digest = build_tool_digest(program)?;
-            Some((key, digest))
-        })
-        .collect()
+    let mut digests = Vec::new();
+    for key in keys.into_iter().filter(|key| configured_tool_key(key)) {
+        let Ok(value) = std::env::var(&key) else {
+            continue;
+        };
+        let Some(words) = configured_command_words(&value) else {
+            continue;
+        };
+        if let Some(digest) = build_tool_digest(&words[0]) {
+            digests.push((key.clone(), digest));
+        }
+        if let Some(delegate) = delegated_compiler(&words) {
+            if let Some(digest) = build_tool_digest(delegate) {
+                digests.push((format!("{key}:delegate"), digest));
+            }
+        }
+    }
+    digests
 }
 
 /// Fingerprint the compiler implementation and target standard library that

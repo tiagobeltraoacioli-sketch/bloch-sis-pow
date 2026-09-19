@@ -1451,8 +1451,9 @@ enum Refusal {
     /// The per-identity or aggregate lifecycle hybrid-verification allowance
     /// is exhausted for the wall slot. The caller may retry next slot.
     LifecycleVerificationLimited { until_slot: u64 },
-    /// Aggregate block/attestation/transaction admission verification is
-    /// exhausted for this wall slot. This is local load, never invalid bytes.
+    /// Per-source or aggregate block/attestation/transaction admission
+    /// verification is exhausted for this wall slot. This is local load,
+    /// never invalid bytes.
     GossipVerificationLimited { until_slot: u64 },
 }
 
@@ -4472,6 +4473,14 @@ impl Engine {
     }
 
     fn serve_rpc(&mut self, req: RpcRequest) -> RpcResult {
+        self.serve_rpc_from(req, None)
+    }
+
+    fn serve_rpc_from(
+        &mut self,
+        req: RpcRequest,
+        verification_source: Option<[u8; 32]>,
+    ) -> RpcResult {
         match req {
             RpcRequest::ChainInfo => Ok(rpc::chain_info_json(
                 &self.state,
@@ -4544,7 +4553,10 @@ impl Engine {
 
             RpcRequest::TxOut { txid, vout } => Ok(rpc::txout_json(&self.state, &txid, vout)),
 
-            RpcRequest::SendRawTransaction(tx) => match self.on_transaction(tx.clone()) {
+            RpcRequest::SendRawTransaction(tx) => match self.on_transaction_from(
+                tx.clone(),
+                verification_source,
+            ) {
                 Ok(outcome) => Ok(rpc::submitted_json(&tx, outcome)),
                 // The refusals are not the same fact and must not
                 // carry the same advice, and each has its own code:
@@ -5935,7 +5947,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
                             engine.net.report(&origin, verdict);
                         }
                         EngineEvent::Rpc(call) => {
-                            let result = engine.serve_rpc(call.req);
+                            let result = engine.serve_rpc_from(
+                                call.req,
+                                call.verification_source,
+                            );
                             // A client that hung up between asking and being
                             // answered is normal, not an error worth logging.
                             let _ = call.reply.send(result);
@@ -8146,6 +8161,49 @@ mod transfer_v2_end_to_end {
         );
         let selected_rpc = rpc_node.select_transactions(epoch_of(rpc_node.wall_slot()));
         assert_eq!(selected_rpc, vec![tx]);
+    }
+
+    #[test]
+    fn rpc_source_exhaustion_is_retryable_and_leaves_other_source_headroom() {
+        let (entries, tx) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let noisy = [0xA1; 32];
+        let honest = [0xA2; 32];
+        let slot = node.wall_slot();
+
+        // Distinct malformed inputs spend this source's real-crypto allowance
+        // without populating the exact-failure cache for the next input.
+        for n in 0..GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT {
+            let mut root = [0u8; 32];
+            root[..8].copy_from_slice(&(n as u64).to_le_bytes());
+            let verifier = node.gossip_verifier.budgeted_for_source(
+                slot,
+                GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
+                Some(noisy),
+                GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
+            );
+            assert!(!verifier.verify_with_key(b"malformed", &root, b"malformed"));
+            assert!(!verifier.limited());
+        }
+
+        let RpcResult::Err(limited) = node.serve_rpc_from(
+            RpcRequest::SendRawTransaction(tx.clone()),
+            Some(noisy),
+        ) else {
+            panic!("an exhausted source must receive a retryable RPC error");
+        };
+        assert_eq!(limited.code, rpc::TX_REFUSED_RETRYABLE);
+        assert_eq!(
+            limited.data.as_ref().and_then(|data| data.get("until_slot"))
+                .and_then(Json::as_u64),
+            Some(slot.saturating_add(1)),
+        );
+        assert!(node.mempool.is_empty(), "overload cannot partially admit the transaction");
+
+        assert!(
+            node.serve_rpc_from(RpcRequest::SendRawTransaction(tx), Some(honest)).is_ok(),
+            "another RPC source retains aggregate headroom",
+        );
     }
 
     /// **H-R7-2, the mempool door**: a validly-signed transfer declaring far

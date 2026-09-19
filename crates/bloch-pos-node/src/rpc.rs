@@ -938,6 +938,12 @@ pub enum RpcRequest {
 /// and JSON layers are exercised without standing up a node.
 pub trait RpcBackend: Send + Sync + 'static {
     fn call(&self, req: RpcRequest) -> RpcResult;
+
+    /// HTTP entry point with the socket peer's address. Test and embedded
+    /// backends retain the source-free `call` contract by default.
+    fn call_from(&self, req: RpcRequest, _source: IpAddr) -> RpcResult {
+        self.call(req)
+    }
 }
 
 /// One in-flight request handed to the consensus thread, with the channel it
@@ -945,6 +951,7 @@ pub trait RpcBackend: Send + Sync + 'static {
 pub struct RpcCall {
     pub req: RpcRequest,
     pub reply: Sender<RpcResult>,
+    pub(crate) verification_source: Option<[u8; 32]>,
     _permit: crate::connection_limit::Permit,
 }
 
@@ -1134,10 +1141,8 @@ impl EngineBackend {
             _ => None,
         }
     }
-}
 
-impl RpcBackend for EngineBackend {
-    fn call(&self, req: RpcRequest) -> RpcResult {
+    fn call_attributed(&self, req: RpcRequest, source: Option<IpAddr>) -> RpcResult {
         if let Some(answered) = Self::locally(&req) {
             return answered;
         }
@@ -1149,8 +1154,10 @@ impl RpcBackend for EngineBackend {
         }
         // Reservation travels with the queued request, so HTTP timeouts do
         // not free capacity while the consensus thread still owes the work.
-        let permit = self.pending.reserve(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 16)
+        let queue_source = source.unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let permit = self.pending.reserve(queue_source, 16)
             .ok_or_else(|| RpcError::unavailable("RPC engine queue is full; retry later"))?;
+        let verification_source = source.map(crate::net::verification_source_for_ip);
         let (tx, rx) = mpsc::channel::<RpcResult>();
         let sender = match self.engine.lock() {
             Ok(guard) => guard.clone(),
@@ -1158,7 +1165,12 @@ impl RpcBackend for EngineBackend {
             // itself is still fine, but saying so honestly beats unwrapping.
             Err(poisoned) => poisoned.into_inner().clone(),
         };
-        if sender.send(crate::engine::EngineEvent::Rpc(RpcCall { req, reply: tx, _permit: permit })).is_err() {
+        if sender.send(crate::engine::EngineEvent::Rpc(RpcCall {
+            req,
+            reply: tx,
+            verification_source,
+            _permit: permit,
+        })).is_err() {
             return Err(RpcError::unavailable("node is shutting down"));
         }
         match rx.recv_timeout(ENGINE_TIMEOUT) {
@@ -1171,6 +1183,16 @@ impl RpcBackend for EngineBackend {
                 Err(RpcError::unavailable("node is shutting down"))
             }
         }
+    }
+}
+
+impl RpcBackend for EngineBackend {
+    fn call(&self, req: RpcRequest) -> RpcResult {
+        self.call_attributed(req, None)
+    }
+
+    fn call_from(&self, req: RpcRequest, source: IpAddr) -> RpcResult {
+        self.call_attributed(req, Some(source))
     }
 }
 
@@ -1360,6 +1382,14 @@ fn envelope(id: Json, outcome: RpcResult) -> String {
 /// "malformed input crashes the node" and "anyone can stop the validator" are
 /// the same sentence.
 pub fn handle_body(body: &str, backend: &dyn RpcBackend) -> String {
+    handle_body_from(body, backend, None)
+}
+
+fn handle_body_from(
+    body: &str,
+    backend: &dyn RpcBackend,
+    source: Option<IpAddr>,
+) -> String {
     let request = match parse_json(body) {
         Ok(v) => v,
         Err(why) => return envelope(Json::Null, Err(RpcError::parse_error(why))),
@@ -1399,7 +1429,10 @@ pub fn handle_body(body: &str, backend: &dyn RpcBackend) -> String {
     };
 
     let params = request.get("params").filter(|p| !matches!(p, Json::Null));
-    let outcome = route(method, params).and_then(|req| backend.call(req));
+    let outcome = route(method, params).and_then(|req| match source {
+        Some(source) => backend.call_from(req, source),
+        None => backend.call(req),
+    });
     envelope(id, outcome)
 }
 
@@ -1438,14 +1471,19 @@ pub fn serve(
             thread::spawn(move || {
                 let _permit = permit;
                 let mut sock = sock;
-                serve_connection(&mut sock, backend.as_ref(), &hosts);
+                serve_connection(&mut sock, backend.as_ref(), &hosts, address.ip());
             });
         }
     });
     Ok(local)
 }
 
-fn serve_connection(sock: &mut TcpStream, backend: &dyn RpcBackend, hosts: &HostPolicy) {
+fn serve_connection(
+    sock: &mut TcpStream,
+    backend: &dyn RpcBackend,
+    hosts: &HostPolicy,
+    source: IpAddr,
+) {
     let _ = sock.set_read_timeout(Some(IO_TIMEOUT));
     let _ = sock.set_write_timeout(Some(IO_TIMEOUT));
     match read_request(sock, hosts) {
@@ -1453,7 +1491,7 @@ fn serve_connection(sock: &mut TcpStream, backend: &dyn RpcBackend, hosts: &Host
             // The body must be text before it can be JSON. Invalid UTF-8 is a
             // parse error with a JSON-RPC shape, not a dropped connection.
             let response = match std::str::from_utf8(&body) {
-                Ok(text) => handle_body(text, backend),
+                Ok(text) => handle_body_from(text, backend, Some(source)),
                 Err(_) => envelope(Json::Null, Err(RpcError::parse_error("body is not UTF-8"))),
             };
             let _ = respond(sock, 200, &response);

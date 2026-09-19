@@ -2039,3 +2039,29 @@ fn audit_timed_out_rpc_work_remains_bounded_until_engine_drops_it() {
     call.reply.send(Ok(Json::Null)).unwrap();
     assert_eq!(next.join().unwrap().unwrap(), Json::Null);
 }
+
+#[test]
+fn rpc_source_identity_survives_queueing_and_normalizes_mapped_ipv4() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let backend = std::sync::Arc::new(EngineBackend::new(tx));
+    let ipv4: std::net::IpAddr = "192.0.2.61".parse().unwrap();
+    let mapped: std::net::IpAddr = "::ffff:192.0.2.61".parse().unwrap();
+    let expected = crate::net::verification_source_for_ip(ipv4);
+
+    // More than the per-source queue cap: sequential completion must release
+    // each permit, including across the two normalized address forms.
+    for source in [ipv4, mapped].into_iter().cycle().take(32) {
+        let worker = {
+            let backend = backend.clone();
+            std::thread::spawn(move || backend.call_from(RpcRequest::ChainInfo, source))
+        };
+        let crate::engine::EngineEvent::Rpc(call) =
+            rx.recv_timeout(Duration::from_secs(5)).expect("queued RPC call")
+        else {
+            panic!("expected an RPC request");
+        };
+        assert_eq!(call.verification_source, Some(expected));
+        call.reply.send(Ok(Json::Null)).unwrap();
+        assert_eq!(worker.join().unwrap().unwrap(), Json::Null);
+    }
+}

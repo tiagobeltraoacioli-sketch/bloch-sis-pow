@@ -46,6 +46,13 @@ impl Source {
     }
 }
 
+/// Stable admission identity for an RPC/devnet address. Keep this at the
+/// transport normalization seam so IPv4 and its mapped IPv6 form cannot buy
+/// separate expensive-work allowances.
+pub(crate) fn verification_source_for_ip(ip: IpAddr) -> [u8; 32] {
+    Source::ip(ip).verification_key()
+}
+
 #[derive(Debug, Default)]
 struct Usage { count: usize, bytes: usize }
 
@@ -140,6 +147,15 @@ mod tests {
         let state = registry.lock().unwrap();
         assert!(state.sources.is_empty());
         assert_eq!((state.total.count, state.total.bytes), (0, 0));
+    }
+
+    #[test]
+    fn verification_identity_normalizes_ipv4_mapped_addresses() {
+        let ipv4 = "192.0.2.44".parse().unwrap();
+        let mapped = "::ffff:192.0.2.44".parse().unwrap();
+        let other = "192.0.2.45".parse().unwrap();
+        assert_eq!(verification_source_for_ip(ipv4), verification_source_for_ip(mapped));
+        assert_ne!(verification_source_for_ip(ipv4), verification_source_for_ip(other));
     }
 
     #[test]

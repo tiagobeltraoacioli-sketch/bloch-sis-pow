@@ -1662,7 +1662,7 @@ whether a field is a string vs. a number, where `null` can appear).
   "profile": "release", "target": "x86_64-unknown-linux-gnu",
   "build_environment_digest": "f27a...71c4",
   "build_environment_digest_alg": "sha3-256",
-  "build_environment_scope": "rustc and cargo executable bytes plus version output; selected rustc driver and target libstd sysroot components; explicitly configured linker/compiler/archive/wrapper bytes; host; target; profile; selected Rust/C codegen variables, including absent exact host/target forms; sorted, length-prefixed; values hashed, not directly disclosed",
+  "build_environment_scope": "rustc and cargo executable bytes plus version output; selected rustc driver and target libstd sysroot components; explicitly configured linker/compiler/archive/wrapper bytes, including an unambiguous compiler delegated by known wrappers; host; target; profile; selected Rust/C codegen variables, including absent exact host/target forms; sorted, length-prefixed; values hashed, not directly disclosed",
   "build_environment_fields": "7",
   "build_tool_binaries_hashed": "2",
   "build_sysroot_components_hashed": "4",

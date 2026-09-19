@@ -111,6 +111,7 @@ pub use crate::p2p::{Origin, Verdict};
 mod source_budget;
 pub(crate) mod rejection_log;
 pub(crate) use source_budget::Reservation as SourceReservation;
+pub(crate) use source_budget::verification_source_for_ip;
 
 /// What the engine receives from a transport.
 pub enum NetEvent {
