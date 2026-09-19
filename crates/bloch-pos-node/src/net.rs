@@ -1079,8 +1079,11 @@ fn send_to_engine(events: &Sender<EngineEvent>, budget: &QueueBudget, ev: NetEve
 }
 
 pub fn block_frame(env: &BlockEnvelope) -> Vec<u8> {
-    let mut f = vec![FRAME_BLOCK];
-    f.extend_from_slice(&crate::codec::encode_envelope(env));
+    let frame_len = 1usize.saturating_add(crate::codec::encoded_envelope_len(env));
+    let mut f = Vec::with_capacity(frame_len);
+    f.push(FRAME_BLOCK);
+    crate::codec::write_envelope(&mut f, env).expect("writing to Vec cannot fail");
+    debug_assert_eq!(f.len(), frame_len);
     f
 }
 
@@ -1652,10 +1655,39 @@ mod tests {
     }
 
     #[test]
+    fn block_frame_matches_canonical_oracle_for_empty_full_and_large_bodies() {
+        let empty = sync_test_block();
+        let mut full = sync_test_block();
+        full.proposer_sig = vec![0xBB; 4_589];
+        full.body.attestations.push(sample_attestation());
+        full.body.transactions.push(vec![0xCC; 4_097]);
+        let mut large = full.clone();
+        large.body.transactions.push(vec![0xA5; 1 << 20]);
+
+        for env in [empty, full, large] {
+            let payload = crate::codec::encode_envelope(&env);
+            let mut expected = Vec::with_capacity(1usize.saturating_add(payload.len()));
+            expected.push(FRAME_BLOCK);
+            expected.extend_from_slice(&payload);
+            let frame = block_frame(&env);
+
+            assert_eq!(frame, expected);
+            assert_eq!(frame.len(), 1usize.saturating_add(crate::codec::encoded_envelope_len(&env)));
+            let decoded = crate::codec::decode_envelope(&frame[1..]).expect("canonical payload");
+            assert_eq!(decoded.header, env.header);
+            assert_eq!(decoded.proposer_sig, env.proposer_sig);
+            assert_eq!(decoded.body.transactions, env.body.transactions);
+            assert_eq!(decoded.body.attestations.len(), env.body.attestations.len());
+        }
+    }
+
+    #[test]
     fn prepared_block_broadcast_binds_large_wire_bytes_and_exact_id() {
         let mut env = sync_test_block();
         env.body.transactions = vec![vec![0xA5; 1 << 20]];
-        let expected_frame = block_frame(&env);
+        let payload = crate::codec::encode_envelope(&env);
+        let mut expected_frame = vec![FRAME_BLOCK];
+        expected_frame.extend_from_slice(&payload);
         let expected_id = *env.block_id().as_bytes();
 
         let prepared = PreparedBlockBroadcast::new(&env);
