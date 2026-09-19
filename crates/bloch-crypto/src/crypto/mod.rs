@@ -973,6 +973,47 @@ mod kat {
     // Falcon-1024 public-key length (used for the reverse-split oracle test).
     const FALCON_PUBKEY_LEN: usize = 1793;
 
+    #[test]
+    fn valid_magic_prefixed_raw_signature_requires_explicit_legacy_policy() {
+        const MESSAGE: &[u8] = b"BLOCH-CR10-MAGIC-PREFIX-FIXTURE-v1";
+        const SEARCH_COUNTER: u64 = 23_156;
+        const SIGNING_SEED_HEX: &str =
+            "5d051b8c445a2f169a9a0104877500c39332cb493ec6de2723cb37dfbb233042";
+
+        let (enveloped_pk, enveloped_sk) =
+            generate_keypair_from_seed(&[0x64; 32]).unwrap();
+        let mut h = Sha3_256::new();
+        h.update(b"bloch/cr10/signing-rng/v1");
+        h.update(SEARCH_COUNTER.to_le_bytes());
+        let signing_seed: [u8; 32] = h.finalize().into();
+        assert_eq!(hex::encode(signing_seed), SIGNING_SEED_HEX);
+
+        let enveloped_sig = pqcrypto_internals::with_seeded_rng_scope(
+            &signing_seed,
+            || sign(&enveloped_sk, MESSAGE).unwrap(),
+        );
+        let raw_pk = &enveloped_pk[SUITE_HEADER_LEN..];
+        let raw_sig = &enveloped_sig[SUITE_HEADER_LEN..];
+
+        assert_eq!(&raw_sig[..2], &SUITE_MAGIC, "fixture must hit the ambiguity");
+        assert!(
+            verify_legacy_hybrid_raw(raw_pk, MESSAGE, raw_sig),
+            "the magic-prefixed raw signature is cryptographically genuine"
+        );
+        assert!(verify_legacy_hybrid_raw_canonical(raw_pk, MESSAGE, raw_sig));
+        assert!(
+            !verify(raw_pk, MESSAGE, raw_sig),
+            "generic autodetection must misclassify the raw magic prefix"
+        );
+
+        let (misclassified_suite, _) = parse_envelope(raw_sig).unwrap();
+        assert_ne!(
+            misclassified_suite,
+            SUITE_MLDSA65_FALCON1024,
+            "bytes after the coincidental magic are not trusted format metadata"
+        );
+    }
+
     // ─── (A) Reference-equivalence: primitive length KATs ─────────────────────
     // The hybrid wrapper hard-codes the ML-DSA split offsets. If the upstream
     // crate ever changed a length, the fixed 1952/4032/3309 splits would slice
