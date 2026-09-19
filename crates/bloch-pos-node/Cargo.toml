@@ -101,6 +101,7 @@ pqcrypto-internals = { path = "../pqcrypto-internals" }
 # FILES rather than from a string someone typed. Same version the crate already
 # depends on at runtime, so this adds no package to Cargo.lock.
 [build-dependencies]
+cc = "1.2.60"
 sha3 = "0.10"
 
 [dev-dependencies]
