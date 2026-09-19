@@ -1110,8 +1110,13 @@ impl TxBuilder {
 
 pub fn generate_keypair(testnet: bool) -> Keypair {
     let (public_key, private_key) = crypto::generate_keypair();
+    let mut private_key = wallet_secret_owner(private_key);
     let address = crypto::address_from_pubkey(&public_key, testnet);
-    Keypair { private_key, public_key, address }
+    Keypair {
+        private_key: std::mem::take(&mut *private_key),
+        public_key,
+        address,
+    }
 }
 
 pub fn validate_password(pw: &str) -> Result<(), String> {
@@ -1181,6 +1186,25 @@ pub mod cli;
 #[cfg(test)]
 mod legacy_keystore_tests {
     use super::*;
+
+    #[test]
+    fn legacy_keygen_preserves_address_and_signing_on_both_networks() {
+        assert!(std::mem::needs_drop::<Keypair>());
+
+        for testnet in [false, true] {
+            let keypair = generate_keypair(testnet);
+            assert_eq!(
+                keypair.address,
+                crypto::address_from_pubkey(&keypair.public_key, testnet),
+            );
+            let signature = keypair.sign(b"wave-136-keygen-parity").unwrap();
+            assert!(Keypair::verify(
+                &keypair.public_key,
+                b"wave-136-keygen-parity",
+                &signature,
+            ));
+        }
+    }
 
     #[test]
     fn legacy_save_temporaries_have_zeroizing_ownership_and_exact_json() {
