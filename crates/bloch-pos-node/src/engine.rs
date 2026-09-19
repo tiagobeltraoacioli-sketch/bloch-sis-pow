@@ -152,6 +152,38 @@ enum DeferredBlockClass {
     Orphan,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeferredWorkClass {
+    Block,
+    HeldAttestation,
+}
+
+/// Round-robin cursor shared by the two kinds of deferred consensus work.
+/// A block transition and a held-attestation verification slice must not run
+/// additively before the slot loop regains its duty/control point.
+#[derive(Default)]
+struct DeferredWorkScheduler {
+    cursor: usize,
+}
+
+impl DeferredWorkScheduler {
+    fn next(&mut self, block_ready: bool, held_ready: bool) -> Option<DeferredWorkClass> {
+        let ready = [block_ready, held_ready];
+        for offset in 0..ready.len() {
+            let class = self.cursor.saturating_add(offset) % ready.len();
+            if ready[class] {
+                self.cursor = class.saturating_add(1) % ready.len();
+                return Some(if class == 0 {
+                    DeferredWorkClass::Block
+                } else {
+                    DeferredWorkClass::HeldAttestation
+                });
+            }
+        }
+        None
+    }
+}
+
 /// Round-robin cursor shared by the two local queues whose release can run a
 /// full block transition. It turns their two independent one-block slices into
 /// one aggregate one-block slice without changing either queue's FIFO order.
@@ -247,7 +279,8 @@ fn engine_event_class(event: &EngineEvent) -> usize {
 #[cfg(test)]
 mod fair_engine_queue_tests {
     use super::{
-        DeferredBlockClass, DeferredBlockScheduler, FairQueue,
+        DeferredBlockClass, DeferredBlockScheduler, DeferredWorkClass,
+        DeferredWorkScheduler, FairQueue,
         ENGINE_EVENTS_PER_CLASS_PER_TURN,
     };
 
@@ -332,6 +365,29 @@ mod fair_engine_queue_tests {
             scheduler.next(true, true),
             Some(DeferredBlockClass::Orphan),
             "a class that becomes ready gets the next shared turn",
+        );
+        assert_eq!(scheduler.next(false, false), None);
+    }
+
+    #[test]
+    fn deferred_blocks_and_held_attestations_share_one_fair_slice() {
+        let mut scheduler = DeferredWorkScheduler::default();
+        for turn in 0..256 {
+            let expected = if turn % 2 == 0 {
+                DeferredWorkClass::Block
+            } else {
+                DeferredWorkClass::HeldAttestation
+            };
+            assert_eq!(scheduler.next(true, true), Some(expected));
+        }
+        assert_eq!(
+            scheduler.next(false, true),
+            Some(DeferredWorkClass::HeldAttestation),
+        );
+        assert_eq!(
+            scheduler.next(true, true),
+            Some(DeferredWorkClass::Block),
+            "a block tail cannot be starved by sustained replay pressure",
         );
         assert_eq!(scheduler.next(false, false), None);
     }
@@ -2774,6 +2830,35 @@ impl Engine {
         (
             self.ready_future_block_pending(slot),
             !self.deferred_orphans.is_empty(),
+        )
+    }
+
+    /// Release one bounded class of deferred consensus work. Block work keeps
+    /// its inner future/orphan round robin; held attestations keep their
+    /// per-root FIFO and verification slice. The outer cursor ensures those
+    /// two budgets cannot compose in one control turn.
+    fn release_deferred_work_turn(
+        &mut self,
+        slot: u64,
+        scheduler: &mut DeferredWorkScheduler,
+        block_scheduler: &mut DeferredBlockScheduler,
+    ) -> (bool, bool, bool) {
+        let block_ready = self.ready_future_block_pending(slot)
+            || !self.deferred_orphans.is_empty();
+        let held_ready = !self.held_release_roots.is_empty();
+        match scheduler.next(block_ready, held_ready) {
+            Some(DeferredWorkClass::Block) => {
+                self.release_deferred_block_turn(slot, block_scheduler);
+            }
+            Some(DeferredWorkClass::HeldAttestation) => {
+                self.release_held_turn();
+            }
+            None => {}
+        }
+        (
+            self.ready_future_block_pending(slot),
+            !self.deferred_orphans.is_empty(),
+            !self.held_release_roots.is_empty(),
         )
     }
 
@@ -6016,6 +6101,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let mut epoch_advance_warning_level: u8 = 0;
     let mut reported_fc_equivocators = None;
     let mut admitted_work = FairQueue::default();
+    let mut deferred_work_scheduler = DeferredWorkScheduler::default();
     let mut deferred_block_scheduler = DeferredBlockScheduler::default();
     let mut engine_channel_open = true;
 
@@ -6058,18 +6144,21 @@ pub fn run(cfg: Config) -> io::Result<()> {
             // it — without the call its `seen` map grows with uptime.
             engine.att_pool.prune(slot);
         }
-        // Future admission and orphan parking already reported `Ignore` and
-        // retained their sources. Reprocessing is local and silent. Both
-        // queues share one block-transition slice, round-robin when both are
-        // ready, so their combination cannot double the expensive work in one
-        // control turn. Keep duties gated and spin directly into the next turn
-        // while either eligible tail remains.
-        let (ready_future_blocks_pending, deferred_orphans_pending) =
-            engine.release_deferred_block_turn(
+        // Future blocks, promoted orphans, and held attestations already
+        // reported `Ignore`; replay is local and silent. Future/orphan work
+        // shares an inner one-block slice, while that aggregate block class
+        // and the held-attestation slice share an outer round robin. Thus no
+        // two deferred consensus budgets compose before the next duty/control
+        // point. Keep duties gated and spin while any eligible tail remains.
+        let (
+            ready_future_blocks_pending,
+            deferred_orphans_pending,
+            held_attestations_pending,
+        ) = engine.release_deferred_work_turn(
             slot,
+            &mut deferred_work_scheduler,
             &mut deferred_block_scheduler,
         );
-        let held_attestations_pending = engine.release_held_turn();
 
         if let Some(stop) = cfg.stop_at_slot {
             if slot >= stop
@@ -12130,6 +12219,75 @@ mod ingest_admission_tests {
         assert_eq!(pending, (false, false));
         assert!(engine.deferred_orphans.is_empty());
         assert!(engine.blocks.contains_key(&orphan_id));
+    }
+
+    #[test]
+    fn deferred_block_and_held_replay_take_separate_control_turns() {
+        let _clock = validator_lifecycle::clock_at(32);
+        let (mut engine, _dir, template, _) = fixture();
+        engine.wall_slot = 32;
+        let genesis = *engine.manifest.genesis_id().as_bytes();
+        let parent = *engine.head_id().as_bytes();
+
+        engine.propose(2);
+        let future = engine.blocks[engine.head_id().as_bytes()].clone();
+        assert!(engine.do_reorg(parent, Vec::new()));
+        let future_id = *future.block_id().as_bytes();
+        engine.blocks.remove(&future_id).expect("stored future fixture");
+        engine.future_blocks.insert(
+            future_id,
+            (future, Source::Gossip(Some([0xB1; 32]))),
+        );
+
+        // Hold a valid attestation on a block that is not queryable yet, then
+        // make that exact block queryable without dispatching either release
+        // path. This isolates the outer scheduler from block-ingest effects.
+        let held_block = repointed(&engine, &template, [0xA7; 32], 32);
+        let held_id = *held_block.block_id().as_bytes();
+        let data = AttestationData {
+            slot: 32,
+            head: held_id,
+            source_epoch: 0,
+            source_root: genesis,
+            target_epoch: 1,
+            target_root: parent,
+        };
+        let att = Attestation {
+            data,
+            validator: 0,
+            signature: engine
+                .keys
+                .as_ref()
+                .expect("the proposing fixture holds a keystore")
+                .sign(&data.signing_root()),
+        };
+        let mut pool = AttestationPool::new();
+        let decision = engine.judge(&mut pool, att.clone(), 1);
+        assert!(
+            matches!(decision, GossipDecision::Hold { .. }),
+            "unexpected held-attestation fixture decision: {decision:?}",
+        );
+        engine.att_pool = pool;
+        engine.blocks.insert(held_id, held_block);
+        engine.schedule_held_release(held_id);
+        assert_eq!(engine.att_pool.pending_for_root(&held_id), 1);
+
+        let mut scheduler = DeferredWorkScheduler::default();
+        let mut block_scheduler = DeferredBlockScheduler::default();
+        assert_eq!(
+            engine.release_deferred_work_turn(32, &mut scheduler, &mut block_scheduler),
+            (false, false, true),
+            "the first turn releases one block but not the ready attestation slice",
+        );
+        assert!(engine.blocks.contains_key(&future_id));
+        assert_eq!(engine.att_pool.pending_for_root(&held_id), 1);
+
+        assert_eq!(
+            engine.release_deferred_work_turn(32, &mut scheduler, &mut block_scheduler),
+            (false, false, false),
+            "the next turn advances held replay without a second block release",
+        );
+        assert!(engine.pool.contains_key(&(0, data.signing_root())));
     }
 
     #[test]
