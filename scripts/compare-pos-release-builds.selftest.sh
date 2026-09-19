@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
 set -euo pipefail
+# Keep mutation fixtures deterministic instead of inheriting a permissive
+# caller umask that would trip the independent unsafe-write-mode preflight.
+umask 022
 cd "$(dirname "$0")/.."
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/bloch-pos-compare-test.XXXXXX")"
@@ -27,6 +30,7 @@ binary_sha256=$sha
 signed=false
 deployment_authorized=false
 EOF
+  chmod 0644 "$dir/SHA256SUMS" "$dir/BUILD-INFO"
 }
 expect_failure() {
   local label="$1" expected="$2"
@@ -64,13 +68,24 @@ expect_unsafe_write_mode SHA256SUMS 0666
 expect_unsafe_write_mode BUILD-INFO 0666
 
 for file in bloch-pos SHA256SUMS BUILD-INFO; do
+  external_left="$work/external-$file-a"
+  external_right="$work/external-$file-b"
+  external_alias="$work/external-$file-alias"
+  cp -R "$work/a" "$external_left"
+  cp -R "$work/a" "$external_right"
+  ln "$external_left/$file" "$external_alias"
+  expect_failure "externally hardlinked $file" \
+    "$external_left/$file must have exactly one hard link" \
+    bash scripts/compare-pos-release-builds.sh "$external_left" "$external_right"
+
   hardlink_dir="$work/hardlink-$file"
   cp -R "$work/a" "$hardlink_dir"
   rm "$hardlink_dir/$file"
   ln "$work/a/$file" "$hardlink_dir/$file"
   expect_failure "hardlinked $file" \
-    "the two inputs alias the same filesystem object for $file" \
+    "$work/a/$file must have exactly one hard link" \
     bash scripts/compare-pos-release-builds.sh "$work/a" "$hardlink_dir"
+  rm -rf "$hardlink_dir"
 
   symlink_dir="$work/symlink-$file"
   cp -R "$work/a" "$symlink_dir"

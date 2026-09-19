@@ -30,6 +30,12 @@ for dir in "$a" "$b"; do
   for file in bloch-pos SHA256SUMS BUILD-INFO; do
     [ -f "$dir/$file" ] || fail "missing $dir/$file"
     [ ! -L "$dir/$file" ] || fail "$dir/$file must not be a symlink"
+    unexpected_link_count="$(
+      find "$dir/$file" ! -links 1 -exec printf x \; \
+        | wc -c | tr -d '[:space:]'
+    )"
+    [ "$unexpected_link_count" = 0 ] \
+      || fail "$dir/$file must have exactly one hard link"
     unsafe_write_count="$(
       find "$dir/$file" \( -perm -020 -o -perm -002 \) -exec printf x \; \
         | wc -c | tr -d '[:space:]'
