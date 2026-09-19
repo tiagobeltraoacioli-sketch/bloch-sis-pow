@@ -500,10 +500,22 @@ impl AttestationPool {
     /// revalidation. Callers with epoch-dependent context must judge each
     /// returned attestation separately and must not count it before acceptance.
     pub fn take_waiting_on(&mut self, root: &[u8; 32]) -> Vec<Attestation> {
-        let seqs = match self.pending_by_root.remove(root) {
-            Some(seqs) => seqs,
-            None => return Vec::new(),
-        };
+        self.take_waiting_on_limit(root, usize::MAX).0
+    }
+
+    /// Extract at most `limit` waiters for one root in FIFO order, leaving the
+    /// tail fully indexed for a later engine turn. The boolean reports whether
+    /// such a tail remains.
+    pub fn take_waiting_on_limit(
+        &mut self,
+        root: &[u8; 32],
+        limit: usize,
+    ) -> (Vec<Attestation>, bool) {
+        let seqs: Vec<u64> = self.pending_by_root.get(root)
+            .into_iter()
+            .flat_map(|entries| entries.iter().take(limit))
+            .copied()
+            .collect();
         let mut out = Vec::with_capacity(seqs.len());
         for seq in seqs {
             if let Some(entry) = self.pending.get(&seq) {
@@ -511,7 +523,14 @@ impl AttestationPool {
                 self.evict(seq);
             }
         }
-        out
+        let remains = self.pending_by_root.get(root).is_some_and(|entries| !entries.is_empty());
+        (out, remains)
+    }
+
+    /// Current waiters for one missing root. Used by the engine to avoid
+    /// queueing empty release work when an unrelated block lands.
+    pub fn pending_for_root(&self, root: &[u8; 32]) -> usize {
+        self.pending_by_root.get(root).map_or(0, BTreeSet::len)
     }
 
     /// Drop everything the acceptance window has moved past. Deterministic:
@@ -1043,6 +1062,55 @@ mod tests {
             GossipDecision::Hold { missing_root } if missing_root == root(0xAA),
         ));
         assert_eq!(pool.pending_len(), 2, "release reopens root capacity");
+    }
+
+    #[test]
+    fn pending_root_release_is_sliced_fifo_without_stranding_tail() {
+        let mut pool = AttestationPool::new();
+        let blocks = BTreeSet::new();
+        for i in 0..10usize {
+            let validator = 1 + (i % 8) as u32;
+            let slot = CURRENT_SLOT.saturating_sub((i / 8) as u64);
+            assert!(matches!(
+                pool.process(
+                    att(validator, slot, 0xAA),
+                    CURRENT_SLOT,
+                    &committees(),
+                    &known(&blocks),
+                    &RootEchoVerifier,
+                    &AnyKey,
+                ),
+                GossipDecision::Hold { .. },
+            ));
+        }
+        assert!(matches!(
+            pool.process(
+                att(3, CURRENT_SLOT - 1, 0xBB),
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+            ),
+            GossipDecision::Hold { .. },
+        ));
+
+        let (first, remains) = pool.take_waiting_on_limit(&root(0xAA), 4);
+        assert!(remains);
+        assert_eq!(first.iter().map(|att| att.validator).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+        assert_eq!(pool.pending_for_root(&root(0xAA)), 6);
+        assert_eq!(pool.pending_for_root(&root(0xBB)), 1);
+
+        let (second, remains) = pool.take_waiting_on_limit(&root(0xAA), 4);
+        assert!(remains);
+        assert_eq!(second.iter().map(|att| att.validator).collect::<Vec<_>>(), vec![5, 6, 7, 8]);
+        assert_eq!(pool.pending_for_root(&root(0xAA)), 2);
+
+        let (last, remains) = pool.take_waiting_on_limit(&root(0xAA), 4);
+        assert!(!remains);
+        assert_eq!(last.iter().map(|att| att.validator).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(pool.pending_for_root(&root(0xAA)), 0);
+        assert_eq!(pool.pending_for_root(&root(0xBB)), 1, "other roots stay indexed");
     }
 
     #[test]

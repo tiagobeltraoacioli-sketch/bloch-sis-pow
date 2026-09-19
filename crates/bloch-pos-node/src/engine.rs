@@ -142,6 +142,9 @@ const ENGINE_EVENTS_PER_TURN: usize = 32;
 /// rebuild fork choice, and release parked descendants. The other classes
 /// retain the eight-event share they received under a fully mixed round.
 const ENGINE_EVENTS_PER_CLASS_PER_TURN: [usize; 4] = [1, 8, 8, 8];
+/// Authenticated attestations re-judged for one newly available block root
+/// between slot-loop control points.
+const HELD_ATTESTATIONS_PER_TURN: usize = 4;
 
 /// Node-local fair scheduler for already-admitted work. FIFO is preserved
 /// inside each class; strict round-robin between non-empty classes prevents a
@@ -460,8 +463,12 @@ fn validator_duties_blocked(
     in_boot_grace: bool,
     stale_head_quarantined: bool,
     ready_future_blocks_pending: bool,
+    held_attestations_pending: bool,
 ) -> bool {
-    in_boot_grace || stale_head_quarantined || ready_future_blocks_pending
+    in_boot_grace
+        || stale_head_quarantined
+        || ready_future_blocks_pending
+        || held_attestations_pending
 }
 
 const NO_TXS: [PosTransaction; 0] = [];
@@ -1324,6 +1331,10 @@ struct Engine {
     /// Hold verb — the one that keeps an attestation racing ahead of its block
     /// from being scored as an offence — did not exist here at all.
     att_pool: AttestationPool,
+    /// Block roots whose authenticated held attestations became judgeable.
+    /// FIFO by block landing; the front root stays in place until its own
+    /// attestation FIFO is drained in bounded slices.
+    held_release_roots: VecDeque<[u8; 32]>,
     /// Wall-clock slot, refreshed by the slot loop. `att_pool` never reads a
     /// clock (that is its determinism rule), so the node supplies one.
     wall_slot: u64,
@@ -3007,7 +3018,7 @@ impl Engine {
         // The block is queryable now, so attestations parked on it can be
         // re-run. `advance()` first: an attestation released here votes on
         // fork choice, and it should see the chain the block already moved.
-        self.release_held(id);
+        self.schedule_held_release(id);
         // After `advance`, because that is what can have moved finality.
         self.prune_below_finalized();
         (Verdict::Accept, Some((id, grew_registry)))
@@ -4556,23 +4567,37 @@ impl Engine {
         }
     }
 
-    /// A block landed: replay every attestation that was waiting on it.
-    ///
-    /// Called after the block is queryable, which is what
-    /// [`AttestationPool::on_block`] requires — earlier and the waiters would
-    /// simply be re-held. Released Accepts are relayed here, since they were
-    /// deliberately not relayed while parked.
-    fn release_held(&mut self, root: [u8; 32]) {
-        if self.att_pool.pending_len() == 0 {
+    /// A block landed: queue its authenticated waiters for bounded replay.
+    fn schedule_held_release(&mut self, root: [u8; 32]) {
+        if self.att_pool.pending_for_root(&root) == 0
+            || self.held_release_roots.contains(&root)
+        {
             return;
         }
+        self.held_release_roots.push_back(root);
+    }
+
+    /// Replay one FIFO slice for the earliest landed root. Returns whether a
+    /// ready tail remains, so the slot loop can gate duties and immediately
+    /// provide the next slice a fresh control turn.
+    fn release_held_turn(&mut self) -> bool {
+        let Some(root) = self.held_release_roots.front().copied() else {
+            return false;
+        };
         let mut pool = std::mem::take(&mut self.att_pool);
-        let released: Vec<_> = pool.take_waiting_on(&root).into_iter().map(|att| {
+        let (waiting, root_remains) = pool.take_waiting_on_limit(
+            &root,
+            HELD_ATTESTATIONS_PER_TURN,
+        );
+        let released: Vec<_> = waiting.into_iter().map(|att| {
             let epoch = epoch_of(att.data.slot);
             let decision = self.judge(&mut pool, att.clone(), epoch);
             (att, decision)
         }).collect();
         self.att_pool = pool;
+        if !root_remains {
+            self.held_release_roots.pop_front();
+        }
         for (att, decision) in released {
             if let GossipDecision::Accept { slashing_candidate } = decision {
                 if let Some(evidence) = slashing_candidate {
@@ -4590,6 +4615,7 @@ impl Engine {
                 }
             }
         }
+        !self.held_release_roots.is_empty()
     }
 
     // ── RPC service ─────────────────────────────────────────────────────────
@@ -5515,6 +5541,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         recent_states: VecDeque::new(),
         pool: BTreeMap::new(),
         att_pool: AttestationPool::new(),
+        held_release_roots: VecDeque::new(),
         wall_slot: 0,
         mempool: admission::Mempool::default(),
             future_blocks: BTreeMap::new(),
@@ -5940,9 +5967,13 @@ pub fn run(cfg: Config) -> io::Result<()> {
             slot,
             FUTURE_BLOCKS_PER_TURN,
         );
+        let held_attestations_pending = engine.release_held_turn();
 
         if let Some(stop) = cfg.stop_at_slot {
-            if slot >= stop && !ready_future_blocks_pending {
+            if slot >= stop
+                && !ready_future_blocks_pending
+                && !held_attestations_pending
+            {
                 if engine.store.flush_rewrite()? {
                     if let Err(e) = engine.write_local_cache() {
                         eprintln!("state-cache: shutdown post-reorg write failed; restart may require full replay: {e}");
@@ -5998,6 +6029,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
             in_grace,
             stale_head_quarantined,
             ready_future_blocks_pending,
+            held_attestations_pending,
         )
             || engine.store.rewrite_pending();
 
@@ -6152,10 +6184,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
             finality_stalled = stalled_now;
         }
 
-        if ready_future_blocks_pending {
-            // Do not sleep or process a second block through the admitted-work
-            // scheduler before the next slot/duty check. The future pool is
-            // capped, so this immediate drain is itself bounded.
+        if ready_future_blocks_pending || held_attestations_pending {
+            // Do not sleep or process a second admitted-work batch before the
+            // next slot/duty check. Both deferred pools are capped, so this
+            // immediate drain is itself bounded.
             continue;
         }
 
@@ -8293,6 +8325,7 @@ mod transfer_v2_end_to_end {
             recent_states: VecDeque::new(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
+            held_release_roots: VecDeque::new(),
             wall_slot: 0,
             mempool: admission::Mempool::default(),
             future_blocks: BTreeMap::new(),
@@ -9408,6 +9441,7 @@ mod perf_support {
             recent_states: VecDeque::new(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
+            held_release_roots: VecDeque::new(),
             wall_slot: 0,
             mempool: admission::Mempool::default(),
             future_blocks: BTreeMap::new(),
@@ -11152,6 +11186,7 @@ mod duty_view_anchor {
             recent_states: VecDeque::new(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
+            held_release_roots: VecDeque::new(),
             wall_slot: 0,
             mempool: admission::Mempool::default(),
             future_blocks: BTreeMap::new(),
@@ -11420,6 +11455,7 @@ mod slot_horizon {
             recent_states: VecDeque::new(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
+            held_release_roots: VecDeque::new(),
             wall_slot: 0,
             mempool: admission::Mempool::default(),
             future_blocks: BTreeMap::new(),
@@ -11879,7 +11915,7 @@ mod ingest_admission_tests {
         assert!(pending, "one ready block must remain for a fresh loop turn");
         assert_eq!(engine.future_blocks.len(), 1);
         assert!(
-            validator_duties_blocked(false, false, pending),
+            validator_duties_blocked(false, false, pending, false),
             "duties cannot sign from a partially released future view",
         );
 
@@ -11887,7 +11923,7 @@ mod ingest_admission_tests {
         assert!(!pending);
         assert!(engine.future_blocks.is_empty());
         assert_eq!(engine.orphans.len(), 2, "neither ready block was stranded");
-        assert!(!validator_duties_blocked(false, false, pending));
+        assert!(!validator_duties_blocked(false, false, pending, false));
     }
 
     #[test]
@@ -12106,7 +12142,8 @@ mod ingest_admission_tests {
         assert!(matches!(engine.judge(&mut pool, att.clone(), 2), GossipDecision::Hold { .. }));
         engine.att_pool = pool;
         engine.blocks.insert(head_id, head);
-        engine.release_held(head_id);
+        engine.schedule_held_release(head_id);
+        assert!(!engine.release_held_turn());
         assert!(engine.pool.contains_key(&(validator, data.signing_root())));
         assert_eq!(engine.att_pool.pending_len(), 0);
     }
@@ -13379,7 +13416,7 @@ mod stale_head_duty_gate_tests {
     #[test]
     fn a_normal_one_slot_head_gap_does_not_block_duties() {
         assert!(!node_is_behind(99, 100, 50_000, 0, 20_000));
-        assert!(!validator_duties_blocked(false, false, false));
+        assert!(!validator_duties_blocked(false, false, false, false));
     }
 
     #[test]
@@ -13394,12 +13431,17 @@ mod stale_head_duty_gate_tests {
         assert!(behind);
         let mut gate = DutySyncGate::default();
         assert!(gate.update(behind, 90, 100, 50_001, 20_000));
-        assert!(validator_duties_blocked(false, true, false));
+        assert!(validator_duties_blocked(false, true, false, false));
     }
 
     #[test]
     fn boot_grace_uses_the_same_final_gate() {
-        assert!(validator_duties_blocked(true, false, false));
+        assert!(validator_duties_blocked(true, false, false, false));
+    }
+
+    #[test]
+    fn deferred_attestation_tail_uses_the_same_final_gate() {
+        assert!(validator_duties_blocked(false, false, false, true));
     }
 
     #[test]

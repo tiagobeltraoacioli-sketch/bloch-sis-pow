@@ -658,6 +658,7 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         recent_states: VecDeque::new(),
         pool: BTreeMap::new(),
         att_pool: AttestationPool::new(),
+        held_release_roots: VecDeque::new(),
         wall_slot: 0,
         mempool: super::admission::Mempool::default(),
         future_blocks: BTreeMap::new(),
