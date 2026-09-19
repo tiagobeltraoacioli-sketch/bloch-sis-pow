@@ -642,12 +642,16 @@ const SYNC_TAG_GET_BLOCKS: u8 = 0x01;
 const SYNC_TAG_BLOCKS: u8 = 0x01;
 
 pub fn encode_sync_request(req: &SyncRequest) -> Vec<u8> {
+    sync_request_bytes(req).to_vec()
+}
+
+fn sync_request_bytes(req: &SyncRequest) -> [u8; 13] {
     match req {
         SyncRequest::GetBlocks { after_slot, limit } => {
-            let mut out = Vec::with_capacity(13);
-            out.push(SYNC_TAG_GET_BLOCKS);
-            out.extend_from_slice(&after_slot.to_le_bytes());
-            out.extend_from_slice(&limit.to_le_bytes());
+            let mut out = [0u8; 13];
+            out[0] = SYNC_TAG_GET_BLOCKS;
+            out[1..9].copy_from_slice(&after_slot.to_le_bytes());
+            out[9..13].copy_from_slice(&limit.to_le_bytes());
             out
         }
     }
@@ -705,7 +709,8 @@ pub fn decode_sync_response(buf: &[u8]) -> Result<SyncResponse, crate::codec::De
 }
 
 /// Delimited-by-EOF codec: request-response opens a fresh substream per
-/// message and closes the write half, so `read_to_end` frames it exactly.
+/// message and closes the write half, so a sentinel read after the declared
+/// fields distinguishes the exact message from `encode(x) || junk`.
 #[derive(Clone, Default)]
 pub struct SyncCodec;
 
@@ -719,11 +724,7 @@ impl RrCodec for SyncCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        // A request is exactly 13 bytes. Read one sentinel to reject junk
-        // without allocating a response-sized buffer for a tiny request.
-        let mut buf = Vec::with_capacity(14);
-        io.take(14).read_to_end(&mut buf).await?;
-        decode_sync_request(&buf).map_err(bad_data)
+        read_sync_request(io).await
     }
 
     async fn read_response<T>(&mut self, _: &StreamProtocol, io: &mut T) -> io::Result<SyncResponse>
@@ -742,7 +743,7 @@ impl RrCodec for SyncCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        io.write_all(&encode_sync_request(&req)).await
+        write_sync_request(io, &req).await
     }
 
     async fn write_response<T>(
@@ -756,6 +757,24 @@ impl RrCodec for SyncCodec {
     {
         write_sync_response(io, resp).await
     }
+}
+
+async fn read_sync_request<T: AsyncRead + Unpin + Send>(io: &mut T) -> io::Result<SyncRequest> {
+    let mut bytes = [0u8; 13];
+    read_sync_exact(io, &mut bytes).await?;
+    let mut sentinel = [0u8; 1];
+    match io.read(&mut sentinel).await {
+        Ok(0) => decode_sync_request(&bytes).map_err(bad_data),
+        Ok(_) => Err(bad_data(crate::codec::DecodeErr("trailing bytes"))),
+        Err(e) => Err(e),
+    }
+}
+
+async fn write_sync_request<T: AsyncWrite + Unpin + Send>(
+    io: &mut T,
+    request: &SyncRequest,
+) -> io::Result<()> {
+    io.write_all(&sync_request_bytes(request)).await
 }
 
 async fn write_sync_response<T>(io: &mut T, resp: SyncResponse) -> io::Result<()>
@@ -2104,6 +2123,107 @@ mod tests {
         if let Some(over) = (u32::MAX as usize).checked_add(1) {
             assert_eq!(sync_wire_len(over).unwrap_err().kind(), io::ErrorKind::InvalidInput);
         }
+    }
+
+    #[test]
+    fn sync_request_streams_fixed_oracle_across_short_io_and_preserves_errors() {
+        struct OneByteReader {
+            bytes: Vec<u8>,
+            at: usize,
+            fail_at: Option<usize>,
+        }
+
+        impl AsyncRead for OneByteReader {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                out: &mut [u8],
+            ) -> std::task::Poll<io::Result<usize>> {
+                if self.fail_at == Some(self.at) {
+                    return std::task::Poll::Ready(Err(io::Error::other(
+                        "injected request read failure",
+                    )));
+                }
+                if self.at == self.bytes.len() {
+                    return std::task::Poll::Ready(Ok(0));
+                }
+                out[0] = self.bytes[self.at];
+                self.at = self.at.saturating_add(1);
+                std::task::Poll::Ready(Ok(1))
+            }
+        }
+
+        #[derive(Default)]
+        struct OneByteWriter {
+            bytes: Vec<u8>,
+            writes: usize,
+        }
+
+        impl AsyncWrite for OneByteWriter {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                bytes: &[u8],
+            ) -> std::task::Poll<io::Result<usize>> {
+                self.writes = self.writes.saturating_add(1);
+                self.bytes.push(bytes[0]);
+                std::task::Poll::Ready(Ok(1))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_close(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        futures::executor::block_on(async {
+            let request = SyncRequest::GetBlocks { after_slot: 4242, limit: 64 };
+            let oracle = encode_sync_request(&request);
+            assert_eq!(oracle.as_slice(), sync_request_bytes(&request));
+
+            let mut reader = OneByteReader { bytes: oracle.clone(), at: 0, fail_at: None };
+            assert_eq!(read_sync_request(&mut reader).await.unwrap(), request);
+
+            let mut writer = OneByteWriter::default();
+            write_sync_request(&mut writer, &request).await.unwrap();
+            assert_eq!(writer.bytes, oracle);
+            assert_eq!(writer.writes, 13, "fixture must force every byte through write_all");
+
+            for truncated in [Vec::new(), writer.bytes[..12].to_vec()] {
+                let mut reader = OneByteReader { bytes: truncated, at: 0, fail_at: None };
+                assert_eq!(
+                    read_sync_request(&mut reader).await.unwrap_err().kind(),
+                    io::ErrorKind::InvalidData,
+                );
+            }
+
+            let mut trailing = writer.bytes.clone();
+            trailing.push(0xA5);
+            let mut reader = OneByteReader { bytes: trailing, at: 0, fail_at: None };
+            assert_eq!(
+                read_sync_request(&mut reader).await.unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+            );
+
+            let mut reader = OneByteReader {
+                bytes: writer.bytes,
+                at: 0,
+                fail_at: Some(5),
+            };
+            assert_eq!(
+                read_sync_request(&mut reader).await.unwrap_err().kind(),
+                io::ErrorKind::Other,
+            );
+        });
     }
 
     #[test]
