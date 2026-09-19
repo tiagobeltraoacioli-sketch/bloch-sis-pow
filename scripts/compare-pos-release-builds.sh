@@ -69,12 +69,25 @@ for dir in "$a" "$b"; do
     ''|*[!0-9]*)
       fail "$dir/BUILD-INFO source_date_epoch must be a nonempty decimal integer" ;;
   esac
+  debian_snapshot="$(field debian_snapshot "$dir/BUILD-INFO")"
+  snapshot_digits="${debian_snapshot:0:8}${debian_snapshot:9:6}"
+  if [ "${#debian_snapshot}" != 16 ] \
+      || [ "${debian_snapshot:8:1}" != T ] \
+      || [ "${debian_snapshot:15:1}" != Z ]; then
+    fail "$dir/BUILD-INFO debian_snapshot must have exact YYYYMMDDTHHMMSSZ syntax"
+  fi
+  case "$snapshot_digits" in
+    ''|*[!0123456789]*)
+      fail "$dir/BUILD-INFO debian_snapshot must have exact YYYYMMDDTHHMMSSZ syntax" ;;
+  esac
   if [ "$dir" = "$a" ]; then
     a_source_commit="$source_commit"
     a_source_date_epoch="$source_date_epoch"
+    a_debian_snapshot="$debian_snapshot"
   else
     b_source_commit="$source_commit"
     b_source_date_epoch="$source_date_epoch"
+    b_debian_snapshot="$debian_snapshot"
   fi
 done
 
@@ -93,7 +106,9 @@ cmp -s "$a/BUILD-INFO" "$b/BUILD-INFO" || fail "complete BUILD-INFO differs"
   || fail "source_commit differs between builders"
 [ "$a_source_date_epoch" = "$b_source_date_epoch" ] \
   || fail "source_date_epoch differs between builders"
-for key in debian_snapshot target binary_sha256; do
+[ "$a_debian_snapshot" = "$b_debian_snapshot" ] \
+  || fail "debian_snapshot differs between builders"
+for key in target binary_sha256; do
   av="$(field "$key" "$a/BUILD-INFO")"
   bv="$(field "$key" "$b/BUILD-INFO")"
   [ "$av" = "$bv" ] || fail "$key differs between builders"
