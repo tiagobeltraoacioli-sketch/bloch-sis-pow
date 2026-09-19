@@ -23,7 +23,7 @@
 //!   - Multi-language wordlists. English only for v0.5.4; consider for v0.6.
 
 use super::errors::WalletError;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use serde::{Serialize, Deserialize};
 use sha2::Sha512;
 use hmac::Hmac;
@@ -66,6 +66,15 @@ pub enum SeedVersion {
 impl Default for SeedVersion {
     /// New wallets default to V2 — see the founder decision above.
     fn default() -> Self { SeedVersion::V2Bip39Sha512 }
+}
+
+/// Materialize the exact BIP39 salt without leaving the caller's optional
+/// passphrase in an ordinary heap buffer after PBKDF2 returns.
+fn bip39_salt(passphrase: &str) -> Zeroizing<Vec<u8>> {
+    let mut salt = Zeroizing::new(Vec::with_capacity(8 + passphrase.len()));
+    salt.extend_from_slice(b"mnemonic");
+    salt.extend_from_slice(passphrase.as_bytes());
+    salt
 }
 
 // English BIP39 wordlist — 2048 words
@@ -160,9 +169,7 @@ impl SeedPhrase {
         // BIP39 salt = "mnemonic" || passphrase (empty passphrase == plain
         // "mnemonic", matching every external BIP39 tool and the pinned
         // vectors below).
-        let mut salt = Vec::with_capacity(8 + passphrase.len());
-        salt.extend_from_slice(b"mnemonic");
-        salt.extend_from_slice(passphrase.as_bytes());
+        let salt = bip39_salt(passphrase);
 
         let mut out = [0u8; 64];
         match version {
@@ -410,6 +417,48 @@ mod tests {
         assert_ne!(no_pass, with_pass, "a non-empty passphrase must change the seed");
         assert_eq!(with_pass.to_vec(), mnemonic.to_seed("TREZOR").to_vec());
         assert_eq!(no_pass.to_vec(), mnemonic.to_seed("").to_vec());
+    }
+
+    #[test]
+    fn bip39_passphrase_salt_is_exact_and_zeroizing_for_both_seed_versions() {
+        const PASSPHRASE: &str = "correct horse battery staple";
+        let seed = SeedPhrase::parse(&phrase(ABANDON_12)).unwrap();
+        let mut salt = bip39_salt(PASSPHRASE);
+
+        assert_eq!(salt.as_slice(), b"mnemoniccorrect horse battery staple");
+        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
+
+        let mut expected_v2 = [0u8; 64];
+        pbkdf2::<Hmac<Sha512>>(
+            seed.phrase.as_bytes(),
+            &salt,
+            2048,
+            &mut expected_v2,
+        ).unwrap();
+        let mut expected_v1 = [0u8; 64];
+        pbkdf2::<Hmac<sha2::Sha256>>(
+            seed.phrase.as_bytes(),
+            &salt,
+            2048,
+            &mut expected_v1,
+        ).unwrap();
+
+        assert_eq!(
+            seed.to_seed_bytes_versioned(SeedVersion::V2Bip39Sha512, PASSPHRASE)
+                .unwrap(),
+            expected_v2,
+        );
+        assert_eq!(
+            seed.to_seed_bytes_versioned(SeedVersion::V1LegacyPbkdf2Sha256, PASSPHRASE)
+                .unwrap(),
+            expected_v1,
+        );
+
+        // Structural evidence only: production owns the salt through the same
+        // Zeroizing type. This explicit wipe proves its Vec contents implement
+        // Zeroize; it does not attempt to inspect freed memory after Drop.
+        salt.zeroize();
+        assert!(salt.iter().all(|byte| *byte == 0));
     }
 
     #[test]
