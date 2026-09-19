@@ -776,7 +776,7 @@ fn run_connection_writer(rx: &Receiver<SharedFrame>, socket: Arc<Mutex<TcpStream
                 if half.0.closed.load(Ordering::Acquire) { return; }
                 if frame.first() == Some(&FRAME_GET_BLOCKS)
                     && !half.0.take_sync_request(frame.as_ref(), Instant::now()) { continue; }
-                if write_frame(&mut writer, frame.as_ref()).is_err() { return; }
+                if write_frame(&mut *writer, frame.as_ref()).is_err() { return; }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -1111,12 +1111,13 @@ pub fn send_transaction(addr: &str, tx_bytes: &[u8]) -> std::io::Result<()> {
     write_frame(&mut sock, &frame)
 }
 
-fn write_frame(sock: &mut TcpStream, frame: &[u8]) -> std::io::Result<()> {
-    // Capacity hint only: saturating is the intended semantics.
-    let mut buf = Vec::with_capacity(4usize.saturating_add(frame.len()));
-    buf.extend_from_slice(&(frame.len() as u32).to_le_bytes());
-    buf.extend_from_slice(frame);
-    sock.write_all(&buf)
+fn write_frame<W: Write>(writer: &mut W, frame: &[u8]) -> std::io::Result<()> {
+    // Keep the prefix and payload under the caller's existing whole-frame
+    // lock, but do not allocate and copy the complete payload merely to join
+    // these two immutable slices. `write_all` already handles short writes;
+    // an error in either phase remains a partial-frame connection failure.
+    writer.write_all(&(frame.len() as u32).to_le_bytes())?;
+    writer.write_all(frame)
 }
 
 fn read_frame(sock: &mut TcpStream) -> std::io::Result<Vec<u8>> {
@@ -1286,7 +1287,7 @@ fn serve_get_blocks(
                 f.extend_from_slice(&b);
                 let Ok(mut w) = sock.lock() else { return };
                 if connection.closed.load(Ordering::Acquire) { return; }
-                if write_frame(&mut w, &f).is_err() {
+                if write_frame(&mut *w, &f).is_err() {
                     // A partial frame cannot be followed by more framed data.
                     connection.closed.store(true, Ordering::Release);
                     let _ = connection.socket.shutdown(Shutdown::Both);
@@ -1885,6 +1886,42 @@ mod tests {
         let error = result.unwrap_err();
         // Linux reports SO_RCVTIMEO as WouldBlock; other platforms use TimedOut.
         assert!(matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock));
+    }
+
+    #[test]
+    fn write_frame_streams_prefix_then_large_payload_across_short_writes() {
+        #[derive(Default)]
+        struct ShortWriter {
+            bytes: Vec<u8>,
+            offered: Vec<usize>,
+        }
+
+        impl Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.offered.push(bytes.len());
+                // Split the four-byte prefix twice, then make the large
+                // payload cross many writes. `write_all` must preserve both
+                // phase order and every byte across those partial accepts.
+                let cap = if self.offered.len() <= 2 { 2 } else { 4_093 };
+                let accepted = bytes.len().min(cap);
+                self.bytes.extend_from_slice(&bytes[..accepted]);
+                Ok(accepted)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut payload = vec![0xA5; 1 << 20];
+        payload[0] = FRAME_BLOCK;
+        let mut writer = ShortWriter::default();
+        write_frame(&mut writer, &payload).unwrap();
+
+        assert_eq!(&writer.bytes[..4], &(payload.len() as u32).to_le_bytes());
+        assert_eq!(&writer.bytes[4..], payload.as_slice());
+        assert_eq!(writer.offered[..3], [4, 2, payload.len()],
+            "payload writing must begin only after the complete prefix");
     }
 
     #[test]
