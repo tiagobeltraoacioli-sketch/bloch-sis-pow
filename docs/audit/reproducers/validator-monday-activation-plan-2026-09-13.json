@@ -1,0 +1,62 @@
+{
+  "status": "production-rollout-paused-for-review",
+  "operator_schedule": "Monday 2026-09-14; operator delegated the best technical time",
+  "timezone": "America/Sao_Paulo",
+  "leak_recovery": {
+    "epoch": 2880,
+    "utc": "2026-09-14T21:31:19Z",
+    "local": "2026-09-14T18:31:19-03:00"
+  },
+  "lifecycle": {
+    "epoch": 2884,
+    "utc": "2026-09-14T22:35:19Z",
+    "local": "2026-09-14T19:35:19-03:00",
+    "gates": [
+      "FUNDED_VALIDATOR_ADMISSION",
+      "EXIT_AUTH",
+      "WITHDRAWAL",
+      "SLASHING_EVIDENCE",
+      "RANDAO_RECOMMIT"
+    ]
+  },
+  "unchanged_policy": "One-half denominator floor; legacy unfunded deposit remains disabled.",
+  "approved_checkpoint": {
+    "epoch": 2713,
+    "root": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1"
+  },
+  "production_migrations_completed": 1,
+  "preconditions": [
+    "Exact legacy-compatible replay matches approved history",
+    "Default restart observation fix in qualified binary",
+    "Canary 35 and all batches converge without signing overlap",
+    "All 64 validators and serving archivals carry the qualified schedule before the first boundary",
+    "No conflicting finalized checkpoints; live available stake verified before each batch"
+  ],
+  "deadline_policy": "Postpone the coordinated activation before the boundary if qualification or fleet readiness is incomplete; never leave a partially upgraded fleet crossing a finite gate.",
+  "external_opening": "Controlled admission after L; broad external opening remains subject to the ADR-041 real withdrawal-and-spend qualification.",
+  "progress_observed_utc": "2026-09-13T18:32:43.903308+00:00",
+  "qualified_validator_indices": [
+    35
+  ],
+  "new_binary_validator_processes": 11,
+  "started_validator_indices": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    35,
+    36,
+    42,
+    49,
+    50,
+    56
+  ],
+  "serving_archivals_upgraded": 2,
+  "published_bootnodes_verified": 2,
+  "explorer_rpc_operational": true,
+  "explorer_code_deployment": "99da93a-published-fb37c8f4-byte-verified-2026-09-13T19:45:53Z",
+  "deferred_contingency": "staged-on-nine-hosts-isolated-replay-in-progress-not-selected",
+  "pause_reason": "Qualification guardians stopped validators 3, 36, 42, 49 and 50 after alignment checks failed; subsequent batches did not start.",
+  "pause_observed_utc": "2026-09-13T19:25:07Z"
+}

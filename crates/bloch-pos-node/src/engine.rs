@@ -1212,15 +1212,6 @@ struct Engine {
     /// [`Engine::run`]), or a test constructed this `Engine` directly, which
     /// must not gain a suppression window it never asked for.
     doppelganger_observe_until: Option<u64>,
-    /// The wall slot this process booted at (audit EN-03, 2026-09-16): a
-    /// sighting of this node's own index counts as a live duplicate only if
-    /// the duty was SIGNED for a slot after this one. Its own pre-restart
-    /// attestation — still inside `on_attestation`'s epoch window, unknown to
-    /// the fresh `AttestationPool`, verified by its own key — is replayable
-    /// by any peer and used to halt the validator permanently on every
-    /// mid-epoch restart. Zero when the window is not armed (and in tests
-    /// that construct an `Engine` directly), which counts every slot.
-    doppelganger_boot_slot: u64,
     /// Set once, permanently, the instant this node's OWN validator index is
     /// seen attesting or proposing while `doppelganger_observe_until` says it
     /// should not yet be live anywhere. Never cleared without a restart: a
@@ -1767,57 +1758,53 @@ impl Engine {
         matches!(self.doppelganger_observe_until, Some(until) if slot < until)
     }
 
-    /// A duty-bearing message (an attestation or a proposed block) under
-    /// `index` was just ACCEPTED. If that index is this node's own and the
-    /// observation window says this node has not itself started duties yet,
-    /// that is unambiguous evidence of a live duplicate of this key
-    /// somewhere on the network — this process has been refusing to produce
-    /// anything under `index` this whole window, so it did not produce this.
+    fn start_doppelganger_observation(&mut self, wall_slot: u64) {
+        self.wall_slot = wall_slot;
+        let until = wall_slot.saturating_add(DOPPELGANGER_OBSERVE_SLOTS);
+        self.doppelganger_observe_until = Some(until);
+        println!(
+            "DOPPELGANGER PROTECTION: observing after replay through wall slot {until} \
+             ({DOPPELGANGER_OBSERVE_SLOTS} slots) before starting duties."
+        );
+    }
+
+    /// An accepted, authenticated duty under this key proves a duplicate only
+    /// if it was signed during live observation. Check the observation deadline
+    /// against our wall clock, and exclude duties predating its start.
     ///
-    /// The WINDOW is checked against `self.wall_slot` — the slot THIS
-    /// sighting happened at — because the window's own deadline is defined
-    /// in this node's wall-clock terms.
-    ///
-    /// The SIGHTING is checked against `signed_slot` — the slot the duty was
-    /// signed for (an attestation's `data.slot`, a block header's `slot`) —
-    /// and only counts when that slot is strictly after
-    /// `doppelganger_boot_slot` (audit EN-03, 2026-09-16). Without this
-    /// floor the hook halted a validator on its OWN pre-restart attestation:
-    /// a validator attests once per epoch, a restart later in the same epoch
-    /// leaves that attestation inside `on_attestation`'s window and unknown
-    /// to the fresh `AttestationPool`, and any peer holding it (the mesh is
-    /// unauthenticated and attestations are public) could replay it into
-    /// the new process — verified by its own key, `Accept`, permanent halt,
-    /// on every routine restart wave. The signed slot is inside the
-    /// signature, so a peer cannot forge it; and a duty signed for a slot
-    /// after this process booted cannot be this process's own (it signs
-    /// nothing inside the window) and cannot be the pre-restart instance's
-    /// (that one stopped before we started) — it is unambiguous evidence
-    /// of a second instance. Strictly after, not at: the boot slot itself is
-    /// the one slot the pre-restart instance may still have signed for
-    /// before it died, and a real duplicate attesting in that slot is seen
-    /// again within one epoch, well inside the two-epoch window.
-    fn note_possible_doppelganger(&mut self, index: u32, signed_slot: u64) {
+    /// Audit EN-03 (2026-09-16): without the floor on the duty's own signed
+    /// slot, a peer replaying this node's pre-restart attestation (still
+    /// inside `on_attestation`'s epoch window, unknown to the fresh pool,
+    /// verified by its own key) halted the validator on every mid-epoch
+    /// restart. The signed slot is inside the signature, so it cannot be
+    /// forged; a duty signed for a slot at or after the observation start
+    /// cannot be this process's own (it signs nothing while observing).
+    /// Called on the direct-Accept path and on `release_held`.
+    fn note_possible_doppelganger(&mut self, index: u32, duty_slot: u64) {
         let Some(my_index) = self.duty_index(&self.state) else { return };
         if index != my_index || self.doppelganger_halted {
             return;
         }
-        if !matches!(self.doppelganger_observe_until, Some(until) if self.wall_slot < until) {
-            return; // window not armed, or already closed: this node may be live itself now
+        let Some(until) = self.doppelganger_observe_until else { return };
+        if !self.live || self.wall_slot >= until {
+            return; // replay is not evidence of a live duplicate
         }
-        if signed_slot <= self.doppelganger_boot_slot {
-            return; // signed before this process existed: could be our own, replayed
+        // A delayed duty signed before observation began can be this key's
+        // own historical work. Its authenticated slot cannot prove a duplicate.
+        if duty_slot < until.saturating_sub(DOPPELGANGER_OBSERVE_SLOTS) {
+            return;
         }
         self.doppelganger_halted = true;
         eprintln!(
             "DOPPELGANGER DETECTED: validator {index} produced a duty signed for slot \
-             {signed_slot} (seen at wall slot {}, after this process booted at slot {}) while \
-             this process was still inside its {DOPPELGANGER_OBSERVE_SLOTS}-slot observation \
+             {duty_slot} (seen at wall slot {}, observation started at slot {}) while this \
+             process was still inside its {DOPPELGANGER_OBSERVE_SLOTS}-slot observation \
              window and had not yet started its own duties — another instance of this key is \
              signing on the network right now. REFUSING to start duties. This requires an \
              operator to confirm only one instance of this key is running before restarting; \
              bypass with --no-doppelganger-check or BLOCH_NO_DOPPELGANGER=1 (NOT recommended).",
-            self.wall_slot, self.doppelganger_boot_slot,
+            self.wall_slot,
+            until.saturating_sub(DOPPELGANGER_OBSERVE_SLOTS),
         );
     }
 
@@ -2562,10 +2549,12 @@ impl Engine {
         // is exactly the class of sighting doppelgänger protection exists to
         // catch, symmetric with the attestation hook in `apply_decision`.
         let proposer_index = env.header.proposer_index;
-        let proposed_slot = env.header.slot; // signature-bound: audit EN-03
+        let proposer_slot = env.header.slot;
         self.observe_proposer_equivocation(&env);
         self.blocks.insert(id, env);
-        self.note_possible_doppelganger(proposer_index, proposed_slot);
+        if src.bounded_by_wall_clock() {
+            self.note_possible_doppelganger(proposer_index, proposer_slot);
+        }
         self.advance();
         // The block is queryable now, so attestations parked on it can be
         // re-run. `advance()` first: an attestation released here votes on
@@ -5115,36 +5104,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
         );
     }
 
-    // R6 HIGH-8 (doppelgänger protection, node half): only a validator (has
-    // a keystore) needs this — an observer performs no duties to protect.
-    // Disabled by BLOCH_NO_DOPPELGANGER / --no-doppelganger-check (main.rs
-    // sets the same env var). Computed from the manifest directly, the same
-    // arithmetic `Engine::wall_slot` uses, because the engine does not exist
-    // yet to ask.
+    // Read the opt-out once, but arm observation only after replay and the
+    // weak-subjectivity gate. Time spent reading disk is not live observation.
     let no_doppelganger_check = std::env::var_os("BLOCH_NO_DOPPELGANGER").is_some();
-    // cannot divide by zero: the divisor is `.max(1)`.
-    #[allow(clippy::arithmetic_side_effects)]
-    let boot_wall_slot =
-        now_ms().saturating_sub(manifest.genesis_time_ms) / manifest.slot_ms.max(1);
-    let doppelganger_observe_until = if keys.is_some() && !no_doppelganger_check {
-        let until = boot_wall_slot.saturating_add(DOPPELGANGER_OBSERVE_SLOTS);
-        println!(
-            "DOPPELGANGER PROTECTION: observing for this node's own validator index through \
-             wall slot {until} ({DOPPELGANGER_OBSERVE_SLOTS} slots) before starting duties. \
-             Disable with --no-doppelganger-check or BLOCH_NO_DOPPELGANGER=1 (NOT recommended \
-             on a live validator key)."
-        );
-        Some(until)
-    } else {
-        if keys.is_some() {
-            println!(
-                "DOPPELGANGER PROTECTION: DISABLED (BLOCH_NO_DOPPELGANGER is set). This node \
-                 will start duties immediately without checking whether another instance of \
-                 this key is already signing."
-            );
-        }
-        None
-    };
 
     let mut engine = Engine {
         state: StateCell::new(genesis_state),
@@ -5192,11 +5154,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
         finality_rewind_override: allow_finality_rewind,
         tx_slot_index: BTreeMap::new(),
         tx_slot_index_order: VecDeque::new(),
-        doppelganger_observe_until,
+        doppelganger_observe_until: None,
         doppelganger_halted: false,
-        // Audit EN-03: the floor under a sighting's SIGNED slot. Set even
-        // when the window is not armed — it is then never consulted.
-        doppelganger_boot_slot: boot_wall_slot,
         mempool_index: MempoolIndex::new(),
         legacy_exits_applied: 0,
         genesis_validator_count: manifest.validators.len() as u32,
@@ -5409,6 +5368,17 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 engine.enforce_ws_anchor();
             }
             Err(msg) => return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg)),
+        }
+    }
+
+    if engine.keys.is_some() {
+        if no_doppelganger_check {
+            println!("DOPPELGANGER PROTECTION: DISABLED (BLOCH_NO_DOPPELGANGER is set).");
+        } else {
+            #[allow(clippy::arithmetic_side_effects)]
+            let observation_start = now_ms().saturating_sub(engine.manifest.genesis_time_ms)
+                / engine.manifest.slot_ms.max(1);
+            engine.start_doppelganger_observation(observation_start);
         }
     }
 
@@ -7602,7 +7572,6 @@ mod transfer_v2_end_to_end {
             tx_slot_index_order: VecDeque::new(),
             doppelganger_observe_until: None,
             doppelganger_halted: false,
-            doppelganger_boot_slot: 0,
             mempool_index: MempoolIndex::new(),
             legacy_exits_applied: 0,
         }
@@ -8613,7 +8582,6 @@ mod perf_support {
             tx_slot_index_order: VecDeque::new(),
             doppelganger_observe_until: None,
             doppelganger_halted: false,
-            doppelganger_boot_slot: 0,
             mempool_index: MempoolIndex::new(),
             legacy_exits_applied: 0,
         };
@@ -8626,6 +8594,52 @@ mod perf_support {
 #[cfg(test)]
 mod doppelganger_tests {
     use super::*;
+
+    #[test]
+    fn replay_of_own_committed_proposal_does_not_report_a_duplicate() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        engine.propose(1);
+        assert_eq!(engine.chain.len(), 2, "fixture must commit an own proposal");
+        let block = engine.blocks.get(engine.head_id().as_bytes()).unwrap().clone();
+        let genesis = engine.manifest.genesis_id();
+        engine.state = StateCell::new(engine.manifest.genesis_state());
+        engine.blocks.clear();
+        engine.chain.truncate(1);
+        engine.canonical = BTreeSet::from([*genesis.as_bytes()]);
+        engine.recent_states.clear();
+        // Even an accidentally pre-armed window must not classify disk history
+        // as gossip. Keep live=true to test the explicit replay source guard.
+        engine.start_doppelganger_observation(0);
+        engine.ingest_replay(block);
+        assert_eq!(engine.state.slot(), 1, "replay must actually accept the block");
+        assert!(!engine.doppelganger_halted);
+    }
+
+    #[test]
+    fn observation_keeps_a_full_window_after_a_long_replay() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        assert!(engine.doppelganger_observe_until.is_none());
+        engine.start_doppelganger_observation(10_000);
+        assert!(engine.doppelganger_blocks_duties(10_000));
+        assert!(engine.doppelganger_blocks_duties(10_063));
+        assert!(!engine.doppelganger_blocks_duties(10_064));
+    }
+
+    #[test]
+    fn delayed_old_duty_is_ignored_but_current_duty_halts() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let index = engine.keys.as_ref().unwrap().index;
+        engine.start_doppelganger_observation(100);
+        let mut old = sample_attestation_for(index);
+        old.data.slot = 99;
+        engine.apply_decision(old, GossipDecision::Accept { slashing_candidate: None }, &Origin::none());
+        assert!(!engine.doppelganger_halted);
+        let mut current = sample_attestation_for(index);
+        current.data.slot = 100;
+        engine.apply_decision(current, GossipDecision::Accept { slashing_candidate: None }, &Origin::none());
+        assert!(engine.doppelganger_halted);
+        assert!(engine.doppelganger_blocks_duties(10_000));
+    }
 
     fn sample_attestation_for(validator: u32) -> Attestation {
         sample_attestation_at(validator, 1)
@@ -8648,74 +8662,18 @@ mod doppelganger_tests {
         }
     }
 
-    /// **Audit EN-03, the finding's own scenario.** This node restarted at
-    /// wall slot 100, later in the epoch it had already attested in. A peer
-    /// replays its OWN attestation for slot 90 — genuinely signed, unknown
-    /// to the fresh pool, inside the epoch window. That is not a duplicate,
-    /// it is this key's past, and it must not halt the validator. The boot
-    /// slot itself is on the same side of the line: the pre-restart instance
-    /// may have signed for it before it died.
-    #[test]
-    fn a_replay_of_the_nodes_own_pre_boot_attestation_does_not_halt() {
-        let (mut engine, _dir) = perf_support::proposing_engine();
-        let my_index = engine.keys.as_ref().expect("fixture: has a keystore").index;
-        engine.doppelganger_boot_slot = 100;
-        engine.doppelganger_observe_until = Some(100 + DOPPELGANGER_OBSERVE_SLOTS);
-        engine.wall_slot = 105; // inside the window
-
-        for signed_slot in [90, 100] {
-            engine.apply_decision(
-                sample_attestation_at(my_index, signed_slot),
-                GossipDecision::Accept { slashing_candidate: None },
-                &Origin::none(),
-            );
-            assert!(
-                !engine.doppelganger_halted,
-                "an attestation signed for slot {signed_slot}, at or before the boot slot 100, \
-                 could be this node's own pre-restart duty replayed — it must not halt"
-            );
-        }
-        assert!(
-            engine.doppelganger_blocks_duties(105),
-            "control: still observing, duties still wait — nothing was bypassed"
-        );
-    }
-
-    /// The other half, so the floor cannot be satisfied by never halting: a
-    /// duty signed for a slot AFTER this process booted cannot be its own
-    /// (it signs nothing inside the window) and cannot be the pre-restart
-    /// instance's (that one stopped before we started) — halt.
-    #[test]
-    fn an_attestation_signed_after_boot_under_own_index_halts() {
-        let (mut engine, _dir) = perf_support::proposing_engine();
-        let my_index = engine.keys.as_ref().expect("fixture: has a keystore").index;
-        engine.doppelganger_boot_slot = 100;
-        engine.doppelganger_observe_until = Some(100 + DOPPELGANGER_OBSERVE_SLOTS);
-        engine.wall_slot = 105;
-
-        engine.apply_decision(
-            sample_attestation_at(my_index, 101),
-            GossipDecision::Accept { slashing_candidate: None },
-            &Origin::none(),
-        );
-        assert!(
-            engine.doppelganger_halted,
-            "a duty signed for slot 101, after the boot slot 100, is a live duplicate"
-        );
-    }
-
     /// **Audit EN-03, the related gap.** An attestation that outran its
     /// block is HELD, not accepted, and the hook used to run only on the
     /// direct-Accept path — a duplicate whose vote arrived before its block
     /// was never detected. Two engines on one key: `other` proposes at the
     /// slot before its epoch-1 attestation duty and attests at the duty;
-    /// `me` — booted at the block's slot, still observing — sees the
-    /// attestation first (held: its head is unknown), then the block. The
-    /// block itself is signed for the boot slot and must NOT count (it is
-    /// exactly what a pre-restart instance could have produced); the
-    /// released attestation, signed one slot later, must.
+    /// `me` — observing since the duty slot — sees the attestation first
+    /// (held: its head is unknown), then the block. The block is signed for
+    /// the slot before observation started and must NOT count (it is what a
+    /// pre-restart instance could have produced); the released attestation,
+    /// signed for the observation start itself, must.
     #[test]
-    fn a_held_then_released_post_boot_attestation_halts() {
+    fn a_held_then_released_attestation_signed_during_observation_halts() {
         let (mut other, dir) = perf_support::proposing_engine();
         // Committees partition the roster over an epoch's slots, so a lone
         // validator has exactly one attestation slot per epoch — find it in
@@ -8752,9 +8710,7 @@ mod doppelganger_tests {
         me.state = StateCell::new(me.manifest.genesis_state());
         me.chain = vec![(0, me.manifest.genesis_id())];
         me.canonical = BTreeSet::from([*me.manifest.genesis_id().as_bytes()]);
-        me.doppelganger_boot_slot = boot;
-        me.doppelganger_observe_until = Some(boot + DOPPELGANGER_OBSERVE_SLOTS);
-        me.wall_slot = duty;
+        me.start_doppelganger_observation(duty);
 
         me.on_attestation(att, Origin::none(), epoch_of(duty));
         assert_eq!(me.att_pool.pending_len(), 1, "fixture: the attestation must be HELD");
@@ -8764,8 +8720,8 @@ mod doppelganger_tests {
         assert_eq!(me.head_id(), head, "fixture: the block must be adopted");
         assert!(
             me.doppelganger_halted,
-            "the released attestation, signed for slot {duty} after boot slot {boot}, is a \
-             live duplicate and must halt — the block alone (signed for the boot slot) must not"
+            "the released attestation, signed for slot {duty} at the observation start, is a \
+             live duplicate and must halt — the block alone (signed for slot {boot}) must not"
         );
     }
 
@@ -8779,7 +8735,7 @@ mod doppelganger_tests {
     fn a_synthetic_gossip_attestation_from_own_index_is_detected() {
         let (mut engine, _dir) = perf_support::proposing_engine();
         let my_index = engine.keys.as_ref().expect("fixture: has a keystore").index;
-        engine.doppelganger_observe_until = Some(1_000);
+        engine.doppelganger_observe_until = Some(DOPPELGANGER_OBSERVE_SLOTS);
         engine.wall_slot = 5; // well inside the window
 
         assert!(!engine.doppelganger_halted, "must not start halted");
@@ -8800,7 +8756,7 @@ mod doppelganger_tests {
     fn an_attestation_from_another_index_is_not_a_doppelganger() {
         let (mut engine, _dir) = perf_support::proposing_engine();
         let my_index = engine.keys.as_ref().expect("fixture: has a keystore").index;
-        engine.doppelganger_observe_until = Some(1_000);
+        engine.doppelganger_observe_until = Some(DOPPELGANGER_OBSERVE_SLOTS);
         engine.wall_slot = 5;
 
         engine.apply_decision(
@@ -8870,11 +8826,11 @@ mod doppelganger_tests {
     fn inside_the_window_with_nothing_seen_duties_are_blocked_without_halting() {
         let (engine, _dir) = perf_support::proposing_engine();
         let mut engine = engine;
-        engine.doppelganger_observe_until = Some(1_000);
+        engine.doppelganger_observe_until = Some(DOPPELGANGER_OBSERVE_SLOTS);
         assert!(engine.doppelganger_blocks_duties(5), "still observing: duties must wait");
         assert!(!engine.doppelganger_halted, "observing alone is not a detected duplicate");
         assert!(
-            !engine.doppelganger_blocks_duties(1_000),
+            !engine.doppelganger_blocks_duties(DOPPELGANGER_OBSERVE_SLOTS),
             "at the deadline slot itself, the window has closed"
         );
     }
@@ -10801,7 +10757,6 @@ mod duty_view_anchor {
             tx_slot_index_order: VecDeque::new(),
             doppelganger_observe_until: None,
             doppelganger_halted: false,
-            doppelganger_boot_slot: 0,
             mempool_index: MempoolIndex::new(),
             legacy_exits_applied: 0,
         };
@@ -11060,7 +11015,6 @@ mod slot_horizon {
             tx_slot_index_order: VecDeque::new(),
             doppelganger_observe_until: None,
             doppelganger_halted: false,
-            doppelganger_boot_slot: 0,
             mempool_index: MempoolIndex::new(),
             legacy_exits_applied: 0,
             orphans: VecDeque::new(),

@@ -4,8 +4,10 @@
 > chain, which stopped at height 39,918 on 2026-08-13. The live chain is
 > **Genesis-4, proof of stake**, and this VM is **not wired into it** — see
 > the "designed ≠ built ≠ booted" table in the root `README.md`. The direction
-> for contracts at L1 has since moved to an EVM
-> (`docs/adr/ADR-040-evm-and-ustav-at-l1.md`), for which no code exists yet.
+> in ADR-040 was amended on 2026-09-08: native L1 authorization stays PQ-only,
+> while EVM/ECDSA wallet compatibility belongs to L2. The Ustav v3 kernel and
+> [native pair settlement](docs/native-pairs.md) are executable reference
+> extensions; they remain unactivated in Genesis-4.
 > Kept buildable for audit. Read every present-tense sentence below about
 > "the chain" as describing Genesis-3.
 
@@ -81,6 +83,17 @@ a valid swap passes; a swap that would drain the pool is rejected by the validat
   language over these opcodes, and the batcher/routing layer for AMM concurrency.
 
 ## Files
+
+- [Federated USDT gateway reference](docs/usdt-gateway.md): two source routes,
+  native PQ authorization, accounting and remaining consensus/launch work.
+- [Native AMM arithmetic](docs/native-amm.md): liquidity and swap calculations,
+  explicit user deltas and the remaining custody boundary.
+- [Gateway binary transport](docs/usdt-gateway-wire.md): bounded import/burn
+  envelopes, full witnesses and sealed dispatch.
+- [Sealed native pool custody](docs/native-pool-custody.md): authenticated
+  token funding, locked reserves, LP ownership and complete state restoration.
+- [Native pool wire](docs/native-pool-wire.md): bounded add/swap/remove requests
+  dispatched through the same sealed custody boundary.
 
 - `src/lib.rs` — the whole VM: `Val`, `Op`, `run`, `ExtOutput`/`Value`, `spend`,
   `validator_hash`, `validate_tx`/`validate_block`, `fee_burn`, and the 15 tests.

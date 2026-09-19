@@ -1,0 +1,345 @@
+{
+  "public_rpc": {
+    "utc": "2026-09-13T18:05:27.222888+00:00",
+    "archivals": [
+      {
+        "url": "http://139.180.166.5.nip.io:8080/",
+        "getchaininfo": {
+          "jsonrpc": "2.0",
+          "id": 1,
+          "result": {
+            "block_id": "9b6c29f19e4e32cbdf245b6cf453cbd22ed285ac31bd8bb521498757e5afeb0f",
+            "slot": 88867,
+            "height": 65472,
+            "finalized_height": 65412,
+            "epoch": 2777,
+            "slot_in_epoch": 3,
+            "slots_per_epoch": 32,
+            "state_root": "21d42c9e8de4655078ddd644c1b4093a2a99ae0dc45f8dea68bae615060558fa",
+            "justified": {
+              "epoch": 2776,
+              "root": "68b4654c69ec7b584e765eb9d56121cecb310af49b0477dc2f84efc2bacf83a4"
+            },
+            "finalized": {
+              "epoch": 2775,
+              "root": "12c9cf538cc73a88fd536bb356820dd797f233d4d4348402e1212aa40f60ba00"
+            },
+            "previous_justified": {
+              "epoch": 2775,
+              "root": "12c9cf538cc73a88fd536bb356820dd797f233d4d4348402e1212aa40f60ba00"
+            },
+            "validators": {
+              "total": 64,
+              "active": 64
+            },
+            "total_active_stake_sat": "26171875077562679",
+            "base_fee_millisat_per_gas": "10",
+            "next_base_fee_millisat_per_gas": "10",
+            "mempool": 3,
+            "blocks_known": 65472,
+            "wall_slot": 88868,
+            "behind_by_slots": 1,
+            "transport": {
+              "name": "devnet",
+              "peers": {
+                "devnet": 64,
+                "libp2p": null
+              }
+            }
+          }
+        },
+        "getbuildinfo": {
+          "jsonrpc": "2.0",
+          "id": 1,
+          "result": {
+            "build_version": "0.1.0-mainnet (e7261e6c74194662cdec0fa77e2124c5eda9da21)",
+            "package_version": "0.1.0-mainnet",
+            "commit": "e7261e6c74194662cdec0fa77e2124c5eda9da21",
+            "commit_source": "asserted",
+            "tree_state": "unverified",
+            "source_digest": "55673e14cd2f98809a3e9c9b7bb3948bb9b1a5296254773240f0c272114e4c66",
+            "source_digest_alg": "sha3-256",
+            "source_digest_scope": "workspace crates dir: rs, toml, c, h, S, s; plus workspace Cargo.toml and Cargo.lock; relative paths, sorted, length-prefixed",
+            "source_files": "204",
+            "source_bytes": "6218639",
+            "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
+            "profile": "release",
+            "target": "x86_64-unknown-linux-gnu",
+            "digest_note": "different digests prove different source trees; equal digests are evidence of the same source, not proof \u2014 whoever can edit the source can edit the build script that hashes it"
+          }
+        },
+        "getvalidatoradmission": {
+          "jsonrpc": "2.0",
+          "id": 1,
+          "result": {
+            "active": false,
+            "activation_epoch": 2884,
+            "network_domain": "f47d3e498ff978e34471dafff5f94fe139fc3ff489b1a00f469c030258311966",
+            "epoch": 2777,
+            "wire_tag": "0x0b",
+            "signature_suite": "ML-DSA-65 AND Falcon-1024 (0x0001)",
+            "minimum_stake_sat": "2500000000000",
+            "maximum_stake_sat": "261718750775626",
+            "activation_delay_epochs": 8,
+            "activation_requires_finalized_deposit": true,
+            "exit_wire_tag": "0x0c",
+            "withdrawal_wire_tag": "0x0d",
+            "randao_recommit_wire_tag": "0x0a",
+            "exit_delay_epochs": 32,
+            "withdrawal_delay_epochs": 2048,
+            "maximum_exits_per_epoch": 4,
+            "written_off_sat": "0",
+            "maximum_activations_per_epoch": 4,
+            "next_base_fee_millisat_per_gas": "10",
+            "legacy_unfunded_deposit_enabled": false
+          }
+        }
+      },
+      {
+        "url": "http://139.180.173.231.nip.io:8080/",
+        "getchaininfo": {
+          "jsonrpc": "2.0",
+          "id": 1,
+          "result": {
+            "block_id": "9b6c29f19e4e32cbdf245b6cf453cbd22ed285ac31bd8bb521498757e5afeb0f",
+            "slot": 88867,
+            "height": 65472,
+            "finalized_height": 65412,
+            "epoch": 2777,
+            "slot_in_epoch": 3,
+            "slots_per_epoch": 32,
+            "state_root": "21d42c9e8de4655078ddd644c1b4093a2a99ae0dc45f8dea68bae615060558fa",
+            "justified": {
+              "epoch": 2776,
+              "root": "68b4654c69ec7b584e765eb9d56121cecb310af49b0477dc2f84efc2bacf83a4"
+            },
+            "finalized": {
+              "epoch": 2775,
+              "root": "12c9cf538cc73a88fd536bb356820dd797f233d4d4348402e1212aa40f60ba00"
+            },
+            "previous_justified": {
+              "epoch": 2775,
+              "root": "12c9cf538cc73a88fd536bb356820dd797f233d4d4348402e1212aa40f60ba00"
+            },
+            "validators": {
+              "total": 64,
+              "active": 64
+            },
+            "total_active_stake_sat": "26171875077562679",
+            "base_fee_millisat_per_gas": "10",
+            "next_base_fee_millisat_per_gas": "10",
+            "mempool": 3,
+            "blocks_known": 65472,
+            "wall_slot": 88868,
+            "behind_by_slots": 1,
+            "transport": {
+              "name": "devnet",
+              "peers": {
+                "devnet": 64,
+                "libp2p": null
+              }
+            }
+          }
+        },
+        "getbuildinfo": {
+          "jsonrpc": "2.0",
+          "id": 1,
+          "result": {
+            "build_version": "0.1.0-mainnet (e7261e6c74194662cdec0fa77e2124c5eda9da21)",
+            "package_version": "0.1.0-mainnet",
+            "commit": "e7261e6c74194662cdec0fa77e2124c5eda9da21",
+            "commit_source": "asserted",
+            "tree_state": "unverified",
+            "source_digest": "55673e14cd2f98809a3e9c9b7bb3948bb9b1a5296254773240f0c272114e4c66",
+            "source_digest_alg": "sha3-256",
+            "source_digest_scope": "workspace crates dir: rs, toml, c, h, S, s; plus workspace Cargo.toml and Cargo.lock; relative paths, sorted, length-prefixed",
+            "source_files": "204",
+            "source_bytes": "6218639",
+            "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
+            "profile": "release",
+            "target": "x86_64-unknown-linux-gnu",
+            "digest_note": "different digests prove different source trees; equal digests are evidence of the same source, not proof \u2014 whoever can edit the source can edit the build script that hashes it"
+          }
+        },
+        "getvalidatoradmission": {
+          "jsonrpc": "2.0",
+          "id": 1,
+          "result": {
+            "active": false,
+            "activation_epoch": 2884,
+            "network_domain": "f47d3e498ff978e34471dafff5f94fe139fc3ff489b1a00f469c030258311966",
+            "epoch": 2777,
+            "wire_tag": "0x0b",
+            "signature_suite": "ML-DSA-65 AND Falcon-1024 (0x0001)",
+            "minimum_stake_sat": "2500000000000",
+            "maximum_stake_sat": "261718750775626",
+            "activation_delay_epochs": 8,
+            "activation_requires_finalized_deposit": true,
+            "exit_wire_tag": "0x0c",
+            "withdrawal_wire_tag": "0x0d",
+            "randao_recommit_wire_tag": "0x0a",
+            "exit_delay_epochs": 32,
+            "withdrawal_delay_epochs": 2048,
+            "maximum_exits_per_epoch": 4,
+            "written_off_sat": "0",
+            "maximum_activations_per_epoch": 4,
+            "next_base_fee_millisat_per_gas": "10",
+            "legacy_unfunded_deposit_enabled": false
+          }
+        }
+      }
+    ],
+    "explorer": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "result": {
+        "block_id": "9b6c29f19e4e32cbdf245b6cf453cbd22ed285ac31bd8bb521498757e5afeb0f",
+        "slot": 88867,
+        "height": 65472,
+        "finalized_height": 65412,
+        "epoch": 2777,
+        "slot_in_epoch": 3,
+        "slots_per_epoch": 32,
+        "state_root": "21d42c9e8de4655078ddd644c1b4093a2a99ae0dc45f8dea68bae615060558fa",
+        "justified": {
+          "epoch": 2776,
+          "root": "68b4654c69ec7b584e765eb9d56121cecb310af49b0477dc2f84efc2bacf83a4"
+        },
+        "finalized": {
+          "epoch": 2775,
+          "root": "12c9cf538cc73a88fd536bb356820dd797f233d4d4348402e1212aa40f60ba00"
+        },
+        "previous_justified": {
+          "epoch": 2775,
+          "root": "12c9cf538cc73a88fd536bb356820dd797f233d4d4348402e1212aa40f60ba00"
+        },
+        "validators": {
+          "total": 64,
+          "active": 64
+        },
+        "total_active_stake_sat": "26171875077562679",
+        "base_fee_millisat_per_gas": "10",
+        "next_base_fee_millisat_per_gas": "10",
+        "mempool": 3,
+        "blocks_known": 65472,
+        "wall_slot": 88868,
+        "behind_by_slots": 1,
+        "transport": {
+          "name": "devnet",
+          "peers": {
+            "devnet": 64,
+            "libp2p": null
+          }
+        },
+        "corroboration": {
+          "level": "corroborated",
+          "archival_witnesses": 2,
+          "of": 2,
+          "fleet_witness": true,
+          "cache_salt": 177,
+          "witness": {
+            "available": true,
+            "age_ms": 1195,
+            "height": 65472,
+            "slot": 88867,
+            "finalized_epoch": 2775,
+            "finalized_root": "12c9cf538cc73a88fd536bb356820dd797f233d4d4348402e1212aa40f60ba00",
+            "finalized_height": 65412,
+            "reason": null
+          },
+          "plane": {
+            "certified": true,
+            "responding": 2,
+            "of": 2,
+            "agree_on_head": true,
+            "height": 65472,
+            "behind_by_slots": 1,
+            "witness_certified": true,
+            "reason": null,
+            "detail": null,
+            "age_ms": 0
+          },
+          "reorg_events": [
+            {
+              "signal": "BURN",
+              "kind": "cache_salt_burned",
+              "salt": 177,
+              "at": 1789308368670
+            },
+            {
+              "signal": "R4",
+              "kind": "receding_head",
+              "was": 65033,
+              "now": 54459,
+              "plane": "witness",
+              "at": 1789308368670
+            },
+            {
+              "signal": "R2",
+              "kind": "descending_finality",
+              "epoch": 2488,
+              "was": 2760,
+              "plane": "witness",
+              "at": 1789308368670
+            },
+            {
+              "signal": "BURN",
+              "kind": "cache_salt_burned",
+              "salt": 176,
+              "at": 1789308230151
+            },
+            {
+              "signal": "R4",
+              "kind": "receding_head",
+              "was": 65026,
+              "now": 54459,
+              "plane": "witness",
+              "at": 1789308230151
+            },
+            {
+              "signal": "R2",
+              "kind": "descending_finality",
+              "epoch": 2488,
+              "was": 2759,
+              "plane": "witness",
+              "at": 1789308230151
+            },
+            {
+              "signal": "BURN",
+              "kind": "cache_salt_burned",
+              "salt": 175,
+              "at": 1789174533285
+            },
+            {
+              "signal": "R4",
+              "kind": "receding_head",
+              "was": 60889,
+              "now": 54459,
+              "plane": "witness",
+              "at": 1789174533285
+            }
+          ]
+        }
+      }
+    }
+  },
+  "published_p2p": {
+    "utc": "2026-09-13T18:13:07.639248+00:00",
+    "results": [
+      {
+        "host": "139.180.166.5",
+        "port": 19100,
+        "status": "block-frame-received",
+        "frame_bytes": 33168,
+        "requested_after_slot": 88879
+      },
+      {
+        "host": "139.180.173.231",
+        "port": 19100,
+        "status": "block-frame-received",
+        "frame_bytes": 33168,
+        "requested_after_slot": 88879
+      }
+    ]
+  }
+}

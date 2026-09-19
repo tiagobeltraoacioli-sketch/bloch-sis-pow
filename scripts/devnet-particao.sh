@@ -10,7 +10,7 @@
 # PROVENANCE. Written by PMO10/devA as `devnet-partition2.sh`, derived from
 # dev8's `scripts/devnet-partition.sh` skeleton, which had never been executed
 # (it passed no --rpc-port, so every node used the default 127.0.0.1:16310 and
-# all but one failed to bind). Brought in-tree unmodified except for this
+# all but one failed to bind). Originally brought in-tree unmodified except for this
 # header and the credit, because the founder's requirement is that a proof be
 # runnable by a third party from the repo, not from somebody's scratch
 # directory. Measured with it: n=8 control WITHOUT a split CONVERGES; n=8 WITH
@@ -24,7 +24,7 @@
 # prove. The two are distinct and must not be reported as one:
 #
 #   * THIS harness         — a partition splits fork choice and the halves do
-#                            not reconverge on heal. Live today at any epoch.
+#                            did not reconverge on heal on the original base.
 #   * prova.rs scenarios   — a leak ledger makes `epoch_committees` shuffle a
 #                            different-length list, so attestations admitted
 #                            into a block are dropped at the boundary tally.
@@ -46,6 +46,13 @@
 # harness that can only print DIVERGED is not measuring anything.
 #
 # DEVNET ONLY: binds 127.0.0.1, throwaway keys, never a production manifest.
+# Keys are explicitly plaintext and doppelganger observation is disabled only
+# for these freshly generated identities. Each phase is shorter than the
+# production observation window; leaving it enabled measures idle genesis.
+# A successful final verdict requires every node, nonzero chain height and
+# actual proposals. Missing samples and divergent heads return a nonzero exit.
+# This manifest starts at epoch zero. A run ending below a shipped activation
+# epoch exercises historical rules, not that activation's production regime.
 #
 # Original header follows.
 #
@@ -95,6 +102,7 @@ launch() { # $1=mode $2=stop $3=tag ; runs nodes, samples RPC, waits
   for i in $(seq 0 $(( N - 1 ))); do
     local d="$WORKDIR/node$i"
     "$BIN" run --data-dir "$d" --genesis "$WORKDIR/genesis.blg" --transport devnet \
+      --no-doppelganger-check \
       --listen "$(( BASE_PORT + i ))" --peers "$(peers_for "$i" "$mode")" \
       --rpc-bind 127.0.0.1 --rpc-port "$(( RPC_BASE + i ))" \
       --stop-at-slot "$stop" >> "$d/$tag.log" 2>&1 &
@@ -124,7 +132,7 @@ report() { # $1=tag
   python3 - "$WORKDIR" "$tag" "$N" <<'PY'
 import json,os,sys,re
 wd,tag,n=sys.argv[1],sys.argv[2],int(sys.argv[3])
-heads={}; proposed={}; refused={}; landed=set()
+heads={}; heights={}; roots={}; stopped={}; proposed={}; refused={}; landed=set()
 for i in range(n):
     f=f"{wd}/rpc/{tag}.node{i}.json"
     log=f"{wd}/node{i}/{tag}.log"
@@ -135,12 +143,16 @@ for i in range(n):
         proposed[i]=set(re.findall(r"\] proposing block ([0-9a-f]+)",t))
         refused[i]=len(re.findall(r"REFUSED OWN BLOCK",t))
         landed.update(re.findall(r"\] applied ([0-9a-f]+)",t))
+        terminal=re.findall(r"STOP at slot (\d+): head slot (\d+), (\d+) blocks, state root ([0-9a-f]{64})",t)
+        if terminal: stopped[i]=terminal[-1]
     if os.path.exists(f):
         try: d=json.load(open(f))["result"]
         except Exception: d=None
     else: d=None
     if d:
         heads[i]=d["block_id"]
+        heights[i]=d["height"]
+        roots[i]=d.get("state_root")
         print(f"node{i:<2} slot={d['slot']:<5} height={d['height']:<5} head={d['block_id'][:8]} "
               f"fin=e{d['finalized']['epoch']}/{d['finalized']['root'][:8]} "
               f"just=e{d['justified']['epoch']} blocks_known={d['blocks_known']:<5} "
@@ -154,17 +166,44 @@ for i in range(n):
         print(f"  node{i} proposed={len(pr):<4} landed={len(ld):<4} never_landed={len(pr)-len(ld):<4} refused_own={refused.get(i,0)}")
 if tp: print(f"  TOTAL proposed={tp} landed={tl} never_landed={tp-tl} ({100.0*(tp-tl)/tp:.1f}%) refused_own={tr}")
 distinct=sorted(set(heads.values()))
-if not heads: print("VERDICT: NO DATA")
-elif len(distinct)==1: print(f"VERDICT[{tag}]: CONVERGED on {distinct[0][:8]} ({len(heads)}/{n} nodes reporting)")
+if len(heads) != n:
+    print(f"VERDICT[{tag}]: INCOMPLETE ({len(heads)}/{n} nodes reporting)")
+    sys.exit(1)
+elif not all(h > 0 for h in heights.values()) or not tp:
+    print(f"VERDICT[{tag}]: NO PROGRESS — all nodes must advance beyond genesis and produce blocks")
+    sys.exit(1)
+elif not all(roots.values()):
+    print(f"VERDICT[{tag}]: INCOMPLETE — missing state roots")
+    sys.exit(1)
+elif len({(heads[i], roots[i]) for i in heads}) != len(distinct):
+    print(f"VERDICT[{tag}]: DIVERGED — same block with different state roots")
+    sys.exit(1)
+elif stopped:
+    # RPC samples are taken sequentially while the chain moves. Compare the
+    # full committed roots after all processes stop at the same boundary.
+    if len(stopped) != n or len(set(stopped.values())) != 1:
+        print(f"VERDICT[{tag}]: DIVERGED OR INCOMPLETE terminal states")
+        sys.exit(1)
+    stop,slot,height,root=next(iter(stopped.values()))
+    if int(height) == 0:
+        print(f"VERDICT[{tag}]: NO PROGRESS at shutdown")
+        sys.exit(1)
+    print(f"VERDICT[{tag}]: CONVERGED terminal slot {slot}, state {root} ({n}/{n} nodes)")
+elif len(distinct)==1:
+    if len(set(roots.values())) != 1:
+        print(f"VERDICT[{tag}]: DIVERGED — same block with different state roots")
+        sys.exit(1)
+    print(f"VERDICT[{tag}]: CONVERGED on {distinct[0][:8]} ({len(heads)}/{n} nodes reporting)")
 else:
     print(f"VERDICT[{tag}]: DIVERGED — {len(distinct)} distinct heads")
     for h in distinct: print("   ",h[:8],"=",sorted(k for k,v in heads.items() if v==h))
+    sys.exit(1)
 PY
 }
 
 for i in $(seq 0 $(( N - 1 ))); do
   d="$WORKDIR/node$i"; mkdir -p "$d"
-  "$BIN" keygen --dir "$d" --index "$i" >/dev/null || { echo "keygen failed" >&2; exit 1; }
+  "$BIN" keygen --dir "$d" --index "$i" --allow-plaintext-keystore >/dev/null || { echo "keygen failed" >&2; exit 1; }
   KEYDIRS="${KEYDIRS:-}${KEYDIRS:+,}$d"
 done
 "$BIN" genesis --keys "$KEYDIRS" --out "$WORKDIR/genesis.blg" --slot-ms "$SLOT_MS" --start-in 5 \
@@ -179,4 +218,6 @@ launch $P2MODE "$HEAL_AT"  phase2
 launch mesh    "$STOP_AT"  phase3-heal
 T1=$(date +%s)
 report phase1-mesh; report phase2; report phase3-heal
+VERDICT_STATUS=$?
 echo; echo "wall-clock: $(( T1 - T0 ))s for n=$N slot_ms=$SLOT_MS stop@$STOP_AT mode=$MODE"
+exit "$VERDICT_STATUS"

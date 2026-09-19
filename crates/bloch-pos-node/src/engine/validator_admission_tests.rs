@@ -76,6 +76,44 @@ fn fixture() -> (
 }
 
 #[test]
+#[ignore = "exports fresh throwaway identities for the isolated joining network rehearsal"]
+fn funded_joining_network_fixture() {
+    let activation = bloch_pos_committee::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH;
+    assert!((2..=16).contains(&activation), "use an isolated finite-gate build");
+    let out = std::path::PathBuf::from(std::env::var_os("BLOCH_JOINING_NETWORK_FIXTURE").unwrap());
+    std::fs::create_dir(&out).unwrap();
+    let (mut founder, _dir, funding, joining, mut deposit) = fixture();
+    founder.manifest.genesis_time_ms = now_ms() + 20_000;
+    founder.manifest.slot_ms = 500;
+    founder.manifest.pre_state_root = std::sync::OnceLock::new();
+    let state = founder.manifest.genesis_state();
+    deposit.network_domain = state.admission_network_domain().unwrap();
+    let opening = founder.manifest.opening_balances();
+    deposit.inputs[0] = FundingInput { txid: opening[0].txid, vout: opening[0].vout };
+    authorize(&mut deposit, &funding, &joining);
+    for name in ["founder", "joining"] { std::fs::create_dir(out.join(name)).unwrap(); }
+    founder.keys.as_ref().unwrap().save_with(&out.join("founder"), &Unlock::PlaintextOptIn).unwrap();
+    joining.save_with(&out.join("joining"), &Unlock::PlaintextOptIn).unwrap();
+    std::fs::write(out.join("genesis.bin"), founder.manifest.encode()).unwrap();
+    std::fs::write(out.join("deposit.bin"), PosTransaction::FundedDeposit(deposit).canonical_bytes()).unwrap();
+}
+
+#[test]
+#[ignore = "checks committed public logs from the isolated joining network rehearsal"]
+fn funded_joining_network_evidence() {
+    let out = std::path::PathBuf::from(std::env::var_os("BLOCH_JOINING_NETWORK_FIXTURE").unwrap());
+    let (_manifest, digest) = Manifest::load(&out.join("genesis.bin")).unwrap();
+    for name in ["founder", "joining"] {
+        let store = Store::open(&out.join(name), &digest).unwrap();
+        let blocks = store.read_all().unwrap();
+        assert!(blocks.iter().any(|b| b.header.proposer_index == 1),
+                "the new identity's proposal must be committed by {name}");
+        assert!(blocks.iter().any(|b| b.body.attestations.iter().any(|a| a.validator == 1)),
+                "the new identity's attestation must be included in {name}'s committed history");
+    }
+}
+
+#[test]
 fn real_pq_admission_requires_both_algorithms_for_both_roles() {
     let (_engine, _dir, funding, joining, tx) = fixture();
     assert_eq!(funding.pubkey.len(), ADMISSION_PQ_KEY_BYTES);
@@ -370,8 +408,101 @@ fn funded_validator_two_nodes_rehearsal() {
     assert!(SlashingProtection::open_bound(&joiner_dir.0, other_binding).is_err());
 }
 
-/// Advance two separate engine states through actual encoded blocks, signed
-/// attestations and the same admission/automatic-action paths as the runtime.
+/// Exercise a finite flag day under the already-active consensus regime.
+#[test]
+#[ignore = "requires isolated finite-epoch activation rehearsal"]
+fn funded_activation_boundary_rehearsal() {
+    let activation = bloch_pos_committee::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH;
+    assert!((1..=16).contains(&activation), "use the isolated activation script");
+    let boundary = activation * SLOTS_PER_EPOCH;
+    let (mut founder, _dir, _funding, _joining, deposit) = fixture();
+    let (mut observer, _observer_dir) = perf_support::proposing_engine();
+    observer.manifest = Manifest::decode(&founder.manifest.encode()).unwrap();
+    observer.state = StateCell::new(observer.manifest.genesis_state());
+    observer.chain = vec![(0, observer.manifest.genesis_id())];
+    observer.canonical = BTreeSet::from([*observer.manifest.genesis_id().as_bytes()]);
+    observer.keys = None;
+    let tx = PosTransaction::FundedDeposit(deposit);
+    let mut history = Vec::new();
+    for slot in 1..boundary {
+        assert!(founder.on_transaction(tx.clone()).is_err());
+        drive_pair(&mut founder, &mut observer, slot, &mut history);
+    }
+    // Advancing a local clock must not open admission before the committed
+    // head crosses L. State-aware validation shares the consensus gate.
+    let _clock = super::validator_lifecycle::clock_at(boundary);
+    founder.wall_slot = boundary;
+    let before = founder.state.state_root();
+    assert!(founder.on_transaction(tx.clone()).is_err());
+    assert!(founder.state.validate_lifecycle_transaction(
+        &tx, founder.state.total_active_stake_sat(), founder.state.next_base_fee(),
+        &HybridVerifier::new(),
+    ).is_err());
+    assert_eq!(founder.state.state_root(), before);
+    assert!(founder.state.validator_record(1).is_none());
+    drive_pair(&mut founder, &mut observer, boundary, &mut history);
+    assert!(founder.state.validate_lifecycle_transaction(
+        &tx, founder.state.total_active_stake_sat(), founder.state.next_base_fee(),
+        &HybridVerifier::new(),
+    ).is_ok());
+    founder.on_transaction(tx.clone()).unwrap();
+    drive_pair(&mut founder, &mut observer, boundary + 1, &mut history);
+    assert!(history.last().unwrap().body.transactions.contains(&tx.canonical_bytes()));
+    assert!(founder.state.is_funded_validator(1));
+    assert_eq!(founder.state.validator_record(1).unwrap().activation_epoch, u64::MAX);
+    assert!(founder.on_transaction(tx).is_err(), "included funding cannot be replayed");
+    let (mut replay, _replay_dir) = perf_support::proposing_engine();
+    replay.manifest = Manifest::decode(&founder.manifest.encode()).unwrap();
+    replay.state = StateCell::new(replay.manifest.genesis_state());
+    replay.chain = vec![(0, replay.manifest.genesis_id())];
+    replay.canonical = BTreeSet::from([*replay.manifest.genesis_id().as_bytes()]);
+    replay.keys = None;
+    if let Some(path) = std::env::var_os("BLOCH_ACTIVATION_FIXTURE") {
+        let path = std::path::PathBuf::from(path);
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("genesis.bin"), founder.manifest.encode()).unwrap();
+        for envelope in history.iter().filter(|e| e.header.slot < boundary) {
+            std::fs::write(path.join(format!("{:016}.block", envelope.header.slot)),
+                           crate::codec::encode_envelope(envelope)).unwrap();
+        }
+    }
+    for envelope in history { replay.ingest_replay(envelope); }
+    assert_eq!(replay.head_id(), founder.head_id());
+    assert_eq!(replay.state.state_root(), founder.state.state_root());
+    assert!(replay.state.is_funded_validator(1));
+}
+
+#[test]
+#[ignore = "requires public blocks exported by the finite activation rehearsal"]
+fn funded_pre_activation_compatibility_rehearsal() {
+    assert_eq!(bloch_pos_committee::params::FUNDED_VALIDATOR_ADMISSION_ACTIVATION_EPOCH, u64::MAX);
+    let path = std::path::PathBuf::from(std::env::var_os("BLOCH_ACTIVATION_FIXTURE").unwrap());
+    let activation: u64 = std::env::var("BLOCH_ACTIVATION_TEST_EPOCH").unwrap().parse().unwrap();
+    assert!((2..=16).contains(&activation));
+    let (mut replay, _dir) = perf_support::proposing_engine();
+    replay.manifest = Manifest::decode(&std::fs::read(path.join("genesis.bin")).unwrap()).unwrap();
+    replay.state = StateCell::new(replay.manifest.genesis_state());
+    replay.chain = vec![(0, replay.manifest.genesis_id())];
+    replay.canonical = BTreeSet::from([*replay.manifest.genesis_id().as_bytes()]);
+    replay.keys = None;
+    let mut blocks: Vec<_> = std::fs::read_dir(path).unwrap().map(|entry| entry.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "block")).collect();
+    blocks.sort();
+    assert_eq!(blocks.len() as u64, activation * SLOTS_PER_EPOCH - 1);
+    for path in blocks {
+        let envelope = crate::codec::decode_envelope(&std::fs::read(path).unwrap()).unwrap();
+        assert!(epoch_of(envelope.header.slot) < activation);
+        let root = envelope.header.state_root;
+        let slot = envelope.header.slot;
+        replay.ingest_replay(envelope);
+        assert_eq!(replay.state.slot(), slot);
+        assert_eq!(replay.state.state_root(), root,
+                   "unarmed and armed builds must agree below L at slot {slot}");
+    }
+    assert!(replay.state.validator_record(1).is_none());
+}
+
+/// Advance separate engines through signed blocks and runtime admission paths.
 fn drive_pair(a: &mut Engine, b: &mut Engine, slot: u64, history: &mut Vec<BlockEnvelope>) {
     assert!(try_drive_pair(a, b, slot, history), "a proposer must remain live at {slot}");
 }

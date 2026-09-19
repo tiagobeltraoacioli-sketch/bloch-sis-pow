@@ -710,7 +710,6 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         tx_slot_index_order: VecDeque::new(),
         doppelganger_observe_until: None,
         doppelganger_halted: false,
-        doppelganger_boot_slot: 0,
         mempool_index: MempoolIndex::new(),
         legacy_exits_applied: 0,
         manifest,

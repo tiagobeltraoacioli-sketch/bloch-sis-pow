@@ -1,0 +1,31 @@
+name: DevKit bug report
+description: Report a reproducible EVM or Solana developer-tooling problem.
+title: "[DevKit] "
+body:
+  - type: markdown
+    attributes:
+      value: "Do not include private keys, seed phrases or credentials. Use private security reporting for vulnerabilities."
+  - type: dropdown
+    id: track
+    attributes:
+      label: Track
+      options:
+        - EVM / Solidity
+        - Solana / SBF
+        - Installation / export
+    validations:
+      required: true
+  - type: textarea
+    id: versions
+    attributes:
+      label: Environment
+      description: OS, CPU architecture, Python version and bloch-dev doctor output.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands, expected result and actual result.
+    validations:
+      required: true

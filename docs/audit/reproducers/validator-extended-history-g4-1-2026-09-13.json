@@ -1,0 +1,101 @@
+{
+  "status": "passed",
+  "checks": {
+    "slot": true,
+    "block_id": true,
+    "state_root": true,
+    "height": true,
+    "approved_checkpoint_finalized": true
+  },
+  "chaininfo": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "result": {
+      "block_id": "3bc565f1b0b8d733b5e70fa3bb8d352023db818f560c214a7ce936692e7c6dd6",
+      "slot": 87775,
+      "height": 64471,
+      "finalized_height": 64379,
+      "epoch": 2742,
+      "slot_in_epoch": 31,
+      "slots_per_epoch": 32,
+      "state_root": "cd91c4c645b9e8af72803ee9890d1a860d7b4ddb29004fccca663f5f037b7a7b",
+      "justified": {
+        "epoch": 2741,
+        "root": "27c1f4dd02768ac1e9c2a2c223a25bfcd2585794711d4b5435dbf2dc9ee58278"
+      },
+      "finalized": {
+        "epoch": 2740,
+        "root": "da37dc2e73a98d38fb8a4073013ef7db05c058f7c00a8e077d5f0f22be43e937"
+      },
+      "previous_justified": {
+        "epoch": 2740,
+        "root": "da37dc2e73a98d38fb8a4073013ef7db05c058f7c00a8e077d5f0f22be43e937"
+      },
+      "validators": {
+        "total": 64,
+        "active": 64
+      },
+      "total_active_stake_sat": "25773559089805925",
+      "base_fee_millisat_per_gas": "10",
+      "next_base_fee_millisat_per_gas": "10",
+      "mempool": 0,
+      "blocks_known": 64471,
+      "wall_slot": 87872,
+      "behind_by_slots": 97,
+      "transport": {
+        "name": "devnet",
+        "peers": {
+          "devnet": 0,
+          "libp2p": null
+        }
+      }
+    }
+  },
+  "approved_checkpoint": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "result": {
+      "block_id": "f8a49015db6c66a0839a69320df7c2705dec4ddd5f249ba7046338d5f127aac1",
+      "version": 2970353669,
+      "parent": "dc1d29d9f9a489216df3f6480556b1d38c3ccbbf20f73b608d74553f7dbbe3e5",
+      "slot": 86814,
+      "epoch": 2712,
+      "height": 63592,
+      "proposer_index": 7,
+      "timestamp": 1789261099,
+      "state_root": "4bde5eec161cf01e82c6a9e4220f98a9162fc5438d62d5c55541cd4d33d9d1ab",
+      "body_root": "3d272a088c490760c4f7d74cb6c3d2275f884842ad4e6ccb9e40a34a9e5a8400",
+      "randao_reveal": "c84375a5b2340cb809dc061cd23b33b76bd0eb003dcbf315ede36666964b7a50",
+      "randao_mix": "9d48a197c00e9287e352c592ffc7051a36b99a73cacc1b90a75e3d911e8313c7",
+      "justified_root": "e6e00471fb3a040a00d95139296fd6aac0261ea6648f135f5654e6c048886370",
+      "finalized_root": "5a7cf00f366100094cbffc16d0eec2bf5b5e1706cb2608dc556adbec38ffdc35",
+      "attestation_root": "37224fd3f6d2ab5a4b20b63616a33dc848dbfc1d39025b4d5294ff5af75fde62",
+      "coherence_root": "3ac97a48fe4c1dc2de33022b2473e76e609c85ce0c0bce96540851f682bccb56",
+      "finality": "finalized",
+      "finalized": true,
+      "tx_count": 0,
+      "attestation_count": 2
+    }
+  },
+  "expected": {
+    "input_frames": 64471,
+    "slot": 87775,
+    "block_id": "3bc565f1b0b8d733b5e70fa3bb8d352023db818f560c214a7ce936692e7c6dd6",
+    "state_root": "cd91c4c645b9e8af72803ee9890d1a860d7b4ddb29004fccca663f5f037b7a7b"
+  },
+  "release": {
+    "status": "staged-not-qualified",
+    "source_commit": "e7261e6c74194662cdec0fa77e2124c5eda9da21",
+    "source_archive_sha256": "292c661fe9e934414f5e7bc9b555d9214a61670f34085285ce8c28eb0b699626",
+    "binary_sha256": "a7ab1d0d690d22dd774b091caab766271618bd252f97a036a77e4cb1c89100e7",
+    "remote_release": "/home/ubuntu/g4/releases/activation-20260914",
+    "leak_recovery_epoch": 2880,
+    "lifecycle_epoch": 2884,
+    "production_migrations_completed": 0
+  },
+  "keyless": true,
+  "peers": [],
+  "original_prefix_sha256": "fc7d58c5379e3ea6f6ff11e1afcc408dcd82ea3775bb82ae9d88c5314e8290eb",
+  "original_prefix_matches": true,
+  "source_index": 8
+}
