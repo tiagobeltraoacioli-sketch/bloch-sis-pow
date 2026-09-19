@@ -130,6 +130,24 @@ printf '%s  bloch-pos' "$canonical_sha" > "$manifest_no_newline_dir/SHA256SUMS"
 expect_failure "checksum manifest missing final newline" "$manifest_error" \
   bash scripts/compare-pos-release-builds.sh "$work/a" "$manifest_no_newline_dir"
 
+canonical_commit="$(sed -n 's/^source_commit=//p' "$work/a/BUILD-INFO")"
+commit_error="source_commit must be a 40-character lowercase hexadecimal commit"
+expect_bad_commit() {
+  local label="$1" value="$2"
+  local left="$work/commit-$label-a" right="$work/commit-$label-b"
+  cp -R "$work/a" "$left"
+  cp -R "$work/a" "$right"
+  sed -i.bak "s/^source_commit=.*/source_commit=$value/" \
+    "$left/BUILD-INFO" "$right/BUILD-INFO"
+  rm "$left/BUILD-INFO.bak" "$right/BUILD-INFO.bak"
+  expect_failure "matching malformed source_commit ($label)" "$commit_error" \
+    bash scripts/compare-pos-release-builds.sh "$left" "$right"
+}
+expect_bad_commit nonhex "g${canonical_commit#?}"
+expect_bad_commit uppercase "$(printf '%s' "$canonical_commit" | tr 'a-f' 'A-F')"
+expect_bad_commit short "${canonical_commit%?}"
+expect_bad_commit long "${canonical_commit}0"
+
 chmod 0644 "$work/b/bloch-pos"
 if bash scripts/compare-pos-release-builds.sh "$work/a" "$work/b" >/dev/null 2>&1; then
   echo "selftest: non-executable binary was accepted" >&2; exit 1
