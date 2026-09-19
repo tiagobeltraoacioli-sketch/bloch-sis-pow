@@ -643,6 +643,7 @@ use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, AeadInPlace, KeyInit}};
 use argon2::{Argon2, Algorithm, Version, Params};
 use base64::{Engine as _, engine::general_purpose as b64};
 use rand::RngCore;
+use std::borrow::Cow;
 use std::path::Path;
 
 // ── Encrypted keystore ────────────────────────────────────────────────────────
@@ -671,6 +672,28 @@ pub struct KdfParams {
 
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 struct KeystorePayload { private_key_hex: String, public_key_hex: String }
+
+/// Borrow ordinary unescaped key strings from the zeroizing decrypted JSON.
+/// Historical escaped JSON still works through `Cow::Owned`; the fallback is
+/// explicitly wiped instead of leaving a second secret string allocation.
+#[derive(Deserialize)]
+struct BorrowedKeystorePayload<'a> {
+    #[serde(borrow)]
+    private_key_hex: Cow<'a, str>,
+    #[serde(borrow)]
+    public_key_hex: Cow<'a, str>,
+}
+
+impl Drop for BorrowedKeystorePayload<'_> {
+    fn drop(&mut self) {
+        if let Cow::Owned(private_key_hex) = &mut self.private_key_hex {
+            private_key_hex.zeroize();
+        }
+        if let Cow::Owned(public_key_hex) = &mut self.public_key_hex {
+            public_key_hex.zeroize();
+        }
+    }
+}
 
 // ── Keypair ───────────────────────────────────────────────────────────────────
 
@@ -865,10 +888,13 @@ impl Keypair {
         decrypt_legacy_keystore_in_place(&enc_k, &nonce_b, &mut plain)?;
         enc_k.zeroize();
 
-        let mut payload: KeystorePayload = serde_json::from_slice(&plain).map_err(|e| e.to_string())?;
-        let mut private_key = Zeroizing::new(hex::decode(&payload.private_key_hex).map_err(|e| e.to_string())?);
-        let public_key  = hex::decode(&payload.public_key_hex).map_err(|e| e.to_string())?;
-        payload.zeroize();
+        let payload: BorrowedKeystorePayload<'_> =
+            serde_json::from_slice(&plain).map_err(|e| e.to_string())?;
+        let mut private_key = Zeroizing::new(
+            hex::decode(payload.private_key_hex.as_ref()).map_err(|e| e.to_string())?,
+        );
+        let public_key = hex::decode(payload.public_key_hex.as_ref()).map_err(|e| e.to_string())?;
+        drop(payload);
 
         let testnet = ks.address.starts_with(TESTNET_PREFIX);
         let derived = crypto::address_from_pubkey(&public_key, testnet);
@@ -1086,6 +1112,44 @@ pub mod cli;
 #[cfg(test)]
 mod legacy_keystore_tests {
     use super::*;
+
+    #[test]
+    fn legacy_decrypted_key_strings_borrow_plaintext_and_preserve_escaped_json() {
+        let plain = Zeroizing::new(
+            serde_json::to_vec(&KeystorePayload {
+                private_key_hex: "a1b2c3d4".into(),
+                public_key_hex: "01020304".into(),
+            }).unwrap(),
+        );
+        let parsed: BorrowedKeystorePayload<'_> = serde_json::from_slice(&plain).unwrap();
+        assert!(matches!(&parsed.private_key_hex, Cow::Borrowed(_)));
+        assert!(matches!(&parsed.public_key_hex, Cow::Borrowed(_)));
+        let start = plain.as_ptr() as usize;
+        let end = start + plain.len();
+        for pointer in [
+            parsed.private_key_hex.as_ptr() as usize,
+            parsed.public_key_hex.as_ptr() as usize,
+        ] {
+            assert!(pointer >= start && pointer < end);
+        }
+        assert_eq!(
+            hex::decode(parsed.private_key_hex.as_ref()).unwrap(),
+            [0xa1, 0xb2, 0xc3, 0xd4]
+        );
+        drop(parsed);
+
+        let escaped = br#"{
+            "private_key_hex":"\u0061\u0062",
+            "public_key_hex":"\u0063\u0064"
+        }"#;
+        let escaped_parsed: BorrowedKeystorePayload<'_> =
+            serde_json::from_slice(escaped).unwrap();
+        assert!(matches!(&escaped_parsed.private_key_hex, Cow::Owned(_)));
+        assert!(matches!(&escaped_parsed.public_key_hex, Cow::Owned(_)));
+        assert_eq!(hex::decode(escaped_parsed.private_key_hex.as_ref()).unwrap(), [0xab]);
+        assert_eq!(hex::decode(escaped_parsed.public_key_hex.as_ref()).unwrap(), [0xcd]);
+        assert!(std::mem::needs_drop::<BorrowedKeystorePayload<'_>>());
+    }
 
     #[test]
     fn legacy_keystore_decryption_reuses_ciphertext_allocation_at_tag_boundary() {
