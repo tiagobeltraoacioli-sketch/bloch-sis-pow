@@ -265,6 +265,21 @@ CASES = [
              "  secret-scan:\n    runs-on: ubuntu-latest\n    continue-on-error: true"),
          must_fail=True, expect="`secret-scan`"),
 
+    Case("github scanner step cannot override the fail-fast shell",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - run: cargo deny check advisories bans licenses sources",
+             "      - run: cargo deny check advisories bans licenses sources\n"
+             "        shell: bash {0} || true"),
+         must_fail=True, expect="custom shell/defaults"),
+
+    Case("github workflow defaults cannot mask scanner verdicts",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "name: security\n",
+             "name: security\ndefaults:\n  run:\n    shell: bash {0} || true\n"),
+         must_fail=True, expect="top-level `defaults:`"),
+
     Case("github guard job deleted outright",
          GOOD_GITLAB,
          GOOD_GITHUB.replace(

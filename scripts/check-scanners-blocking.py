@@ -51,6 +51,8 @@ security job, fails if the job:
     a tag/branch, or removes this guard's own adversarial self-test.
   * lets the GitHub OSV lockfile scope drift from the complete set of tracked
     `Cargo.lock` files in either direction.
+  * adds GitHub top-level defaults or a required-job custom shell that can
+    replace an otherwise unchanged verdict's exit status.
 
 It does NOT require every job to be blocking. cargo-geiger, miri and the fuzz
 smoke are deliberately report-only, with written reasons, and stay green here.
@@ -341,6 +343,10 @@ def check_file(
                     "locally inspectable blocking subset" % (label, key))
     if label == ".github/workflows/security.yml":
         top_level = job_blocks(text, 0)
+        if "defaults" in top_level:
+            problems.append(
+                "%s: top-level `defaults:` can replace required verdict shells"
+                % label)
         trigger_lines = top_level.get("on")
         if trigger_lines is None:
             problems.append(
@@ -437,6 +443,12 @@ def check_file(
                     % (label, job, why, waiver.group(1)))
 
             value = re.sub(r"^\s*-\s+", "", line.strip())
+            if (label == ".github/workflows/security.yml"
+                    and re.match(r"^(?:defaults|shell):", value)):
+                problems.append(
+                    "%s: job `%s` (%s) uses custom shell/defaults; the "
+                    "supported subset requires the runner's fail-fast shell"
+                    % (label, job, why))
             if re.match(r"^(?:if|rules|only|except|extends|inherit):", value) or value.startswith("<<:"):
                 problems.append(
                     "%s: job `%s` (%s) has conditional or inherited execution; "

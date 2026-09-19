@@ -23,7 +23,8 @@ job `build-and-test` — to the posture the finding required:
   * it has a timeout (`timeout-minutes:` / `timeout:`) — a job that can hang
     forever gates by luck, not by verdict;
   * it carries no escape hatch: `allow_failure: true`, `continue-on-error:
-    true`, an `exit 0` skip, or `when: manual`.
+    true`, an `exit 0` skip, `when: manual`, or a GitHub custom/default shell
+    that can replace the test script's exit status.
 
 The live-crate list is duplicated in `.github/workflows/tests.yml` on
 purpose: the workflow states what it gates, this file makes dropping a crate
@@ -180,8 +181,13 @@ def check_job(path: str, job: str, indent: int, label: str) -> list[str]:
                 "gate that passed." % (label, job)]
 
     body = blocks[job]
-    joined = "\n".join(body)
     problems: list[str] = []
+
+    if label == ".github/workflows/tests.yml":
+        top_level = job_blocks(text, 0)
+        if "defaults" in top_level:
+            problems.append(
+                f"{label}: top-level `defaults:` can replace the required test shell")
 
     for line in body:
         waiver = re.match(r"^\s*(?:-\s+)?(allow_failure|continue-on-error):\s*(.*?)\s*(?:#.*)?$", line)
@@ -201,6 +207,10 @@ def check_job(path: str, job: str, indent: int, label: str) -> list[str]:
             problems.append(f"{label}: conditional/inherited job execution needs explicit review")
         if re.match(r"^when:\s*(?!on_success\b|always\b)", value):
             problems.append(f"{label}: conditional or manual job execution cannot certify coverage")
+        if (label == ".github/workflows/tests.yml"
+                and re.match(r"^(?:defaults|shell):", value)):
+            problems.append(
+                f"{label}: custom shell/defaults can replace the cargo test exit status")
     blocks = command_blocks(body, indent)
     if indent == 0:
         # GitLab script list items share one shell; a condition/set +e in

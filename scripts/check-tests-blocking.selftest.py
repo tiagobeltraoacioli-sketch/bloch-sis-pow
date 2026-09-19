@@ -154,6 +154,29 @@ CASES = [
              "  cargo-test:\n    runs-on: ubuntu-latest\n    continue-on-error: true"),
          must_fail=True, expect="continue-on-error"),
 
+    Case("github step shell cannot mask cargo test status",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "            -p genesis4-ceremony\n",
+             "            -p genesis4-ceremony\n"
+             "        shell: bash {0} || true\n"),
+         must_fail=True, expect="custom shell/defaults"),
+
+    Case("github job defaults cannot mask cargo test status",
+         GOOD_GITLAB,
+         sub(GOOD_GITHUB,
+             "  cargo-test:\n    runs-on: ubuntu-latest",
+             "  cargo-test:\n    runs-on: ubuntu-latest\n"
+             "    defaults:\n      run:\n        shell: bash {0} || true"),
+         must_fail=True, expect="custom shell/defaults"),
+
+    Case("github workflow defaults cannot mask cargo test status",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "name: tests\n",
+             "name: tests\ndefaults:\n  run:\n    shell: bash {0} || true\n"),
+         must_fail=True, expect="top-level `defaults:`"),
+
     Case("gitlab build-and-test deleted",
          sub(GOOD_GITLAB, "build-and-test:", "build-and-test-disabled:"),
          GOOD_GITHUB, must_fail=True, expect="`build-and-test` is MISSING"),
