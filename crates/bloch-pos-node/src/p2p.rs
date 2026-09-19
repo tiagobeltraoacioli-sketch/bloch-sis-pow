@@ -755,8 +755,37 @@ impl RrCodec for SyncCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        io.write_all(&encode_sync_response(&resp)).await
+        write_sync_response(io, resp).await
     }
+}
+
+async fn write_sync_response<T>(io: &mut T, resp: SyncResponse) -> io::Result<()>
+where
+    T: AsyncWrite + Unpin + Send,
+{
+    let SyncResponse::Blocks { envelopes } = resp;
+    let envelope_count = sync_wire_len(envelopes.len())?;
+    // Validate every fixed-width wire length before emitting the header. A
+    // directly constructed impossible response must fail without leaving a
+    // predictable partial response on the substream.
+    for envelope in &envelopes {
+        sync_wire_len(envelope.len())?;
+    }
+    let mut header = [0u8; 5];
+    header[0] = SYNC_TAG_BLOCKS;
+    header[1..].copy_from_slice(&envelope_count.to_le_bytes());
+    io.write_all(&header).await?;
+    for envelope in envelopes {
+        let envelope_len = sync_wire_len(envelope.len())?;
+        io.write_all(&envelope_len.to_le_bytes()).await?;
+        io.write_all(&envelope).await?;
+    }
+    Ok(())
+}
+
+fn sync_wire_len(len: usize) -> io::Result<u32> {
+    u32::try_from(len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "sync field length exceeds u32"))
 }
 
 async fn read_capped<T: AsyncRead + Unpin + Send>(io: &mut T) -> io::Result<Vec<u8>> {
@@ -1997,6 +2026,72 @@ fn read_sync_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_wire_len_rejects_u32_overflow_without_payload_allocation() {
+        assert_eq!(sync_wire_len(u32::MAX as usize).unwrap(), u32::MAX);
+        if let Some(over) = (u32::MAX as usize).checked_add(1) {
+            assert_eq!(sync_wire_len(over).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn sync_response_writer_streams_oracle_bytes_across_short_writes() {
+        #[derive(Default)]
+        struct ShortAsyncWriter {
+            bytes: Vec<u8>,
+            writes: Vec<(usize, usize)>,
+        }
+
+        impl AsyncWrite for ShortAsyncWriter {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                bytes: &[u8],
+            ) -> std::task::Poll<io::Result<usize>> {
+                // Split every codec header and also make a large envelope
+                // cross many polls without making the regression expensive.
+                let cap = if bytes.len() <= 5 { 1 } else { 4_093 };
+                let accepted = bytes.len().min(cap);
+                self.writes.push((bytes.len(), accepted));
+                self.bytes.extend_from_slice(&bytes[..accepted]);
+                std::task::Poll::Ready(Ok(accepted))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_close(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let cases = [
+            SyncResponse::Blocks { envelopes: Vec::new() },
+            SyncResponse::Blocks {
+                envelopes: vec![vec![1, 2, 3], Vec::new(), vec![9; 100]],
+            },
+            SyncResponse::Blocks { envelopes: vec![vec![0xA5; 1 << 20]] },
+        ];
+        for response in cases {
+            let expected = encode_sync_response(&response);
+            let expected_response = response.clone();
+            let mut writer = ShortAsyncWriter::default();
+            futures::executor::block_on(write_sync_response(&mut writer, response)).unwrap();
+
+            assert_eq!(writer.bytes, expected, "streamed response diverged from codec oracle");
+            assert_eq!(decode_sync_response(&writer.bytes).unwrap(), expected_response);
+            assert!(writer.writes.iter().any(|(offered, accepted)| accepted < offered),
+                "fixture must exercise AsyncWrite short-write retries");
+        }
+    }
 
     #[test]
     fn audit_sync_cap_requires_actual_eof() {
