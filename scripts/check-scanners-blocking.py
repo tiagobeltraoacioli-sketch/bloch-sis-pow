@@ -57,6 +57,8 @@ security job, fails if the job:
     required job unreviewed before/after scripts, hooks or variables.
   * adds GitHub environment/container/service replacement context or an
     unreviewed/mutable action (including new inputs to a reviewed action).
+  * writes GitHub's cross-step PATH/environment command files before an
+    otherwise unchanged scanner or guard command.
 
 It does NOT require every job to be blocking. cargo-geiger, miri and the fuzz
 smoke are deliberately report-only, with written reasons, and stay green here.
@@ -170,6 +172,10 @@ REVIEWED_GITHUB_ACTIONS = {
     "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
     "google/osv-scanner-action/osv-scanner-action@764c91816374ff2d8fc2095dab36eecd42d61638",
 }
+GITHUB_STATE_CHANNEL = re.compile(
+    r"GITHUB_(?:PATH|ENV)\b|github\.(?:path|env)\b|::(?:add-path|set-env)\b",
+    re.IGNORECASE,
+)
 
 
 def job_blocks(text: str, indent: int) -> dict[str, list[str]]:
@@ -560,6 +566,11 @@ def check_file(
             problems += check_gitlab_job_context(blocks[job], job, indent)
         executable = explicit_execution_values(blocks[job], indent, label)
         if label == ".github/workflows/security.yml":
+            if any(GITHUB_STATE_CHANNEL.search(value) for value in executable):
+                problems.append(
+                    "%s: job `%s` (%s) writes a cross-step environment/PATH "
+                    "channel that can replace a required executable"
+                    % (label, job, why))
             for action, inputs in github_action_steps(blocks[job], indent):
                 if action not in REVIEWED_GITHUB_ACTIONS:
                     problems.append(

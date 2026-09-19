@@ -169,6 +169,29 @@ CASES = [
              "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"
              "        with:\n          path: scripts"),
          must_fail=True, expect="unreviewed `with:` inputs"),
+    Case("GitHub output channel does not mutate cargo environment",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+             "      - run: echo status=ready >> \"$GITHUB_OUTPUT\"\n"
+             "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262"),
+         must_fail=False),
+    Case("GitHub PATH command file cannot replace cargo",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+             "      - run: |\n"
+             "          mkdir -p scripts/fake-bin\n"
+             "          echo scripts/fake-bin >> \"$GITHUB_PATH\"\n"
+             "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262"),
+         must_fail=True, expect="cross-step environment/PATH channel"),
+    Case("legacy set-env workflow command cannot replace cargo variables",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+             "      - run: echo '::set-env name=BASH_ENV::scripts/mask.sh'\n"
+             "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262"),
+         must_fail=True, expect="cross-step environment/PATH channel"),
     Case("reviewed GitLab inherited test context stays green",
          SAFE_GITLAB_GLOBALS + GOOD_GITLAB, GOOD_GITHUB, must_fail=False),
     Case("GitLab default cannot disable test fail-fast",

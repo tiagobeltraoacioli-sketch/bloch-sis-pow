@@ -30,6 +30,8 @@ job `build-and-test` — to the posture the finding required:
   * its GitHub environment is the reviewed inert pair, required jobs use no
     containers/services/env overrides, and every action plus input is a
     reviewed immutable form.
+  * no required GitHub run step writes the cross-step PATH/environment command
+    files that can replace `cargo` before the approved test command.
 
 The live-crate list is duplicated in `.github/workflows/tests.yml` on
 purpose: the workflow states what it gates, this file makes dropping a crate
@@ -100,6 +102,10 @@ REVIEWED_GITHUB_ACTIONS = {
     "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
     "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
 }
+GITHUB_STATE_CHANNEL = re.compile(
+    r"GITHUB_(?:PATH|ENV)\b|github\.(?:path|env)\b|::(?:add-path|set-env)\b",
+    re.IGNORECASE,
+)
 
 
 def job_blocks(text: str, indent: int) -> dict[str, list[str]]:
@@ -354,6 +360,10 @@ def check_job(path: str, job: str, indent: int, label: str) -> list[str]:
             problems.append(
                 f"{label}: environment/container/service context can replace cargo")
     blocks = command_blocks(body, indent)
+    if (label == ".github/workflows/tests.yml"
+            and any(GITHUB_STATE_CHANNEL.search(line) for block in blocks for line in block)):
+        problems.append(
+            f"{label}: cross-step environment/PATH channel can replace cargo test")
     if indent == 0:
         # GitLab script list items share one shell; a condition/set +e in
         # an earlier item can change whether a later test gates the job.

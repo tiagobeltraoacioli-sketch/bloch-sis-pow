@@ -298,6 +298,32 @@ CASES = [
              "        with:\n          experimental: true\n          scan-args:"),
          must_fail=True, expect="unreviewed `with:` inputs"),
 
+    Case("GitHub output channel does not mutate scanner environment",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - run: cargo deny check advisories bans licenses sources",
+             "      - run: echo status=ready >> \"$GITHUB_OUTPUT\"\n"
+             "      - run: cargo deny check advisories bans licenses sources"),
+         must_fail=False),
+
+    Case("GitHub PATH command file cannot replace scanner binaries",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - run: cargo deny check advisories bans licenses sources",
+             "      - run: |\n"
+             "          mkdir -p scripts/fake-bin\n"
+             "          echo scripts/fake-bin >> \"$GITHUB_PATH\"\n"
+             "      - run: cargo deny check advisories bans licenses sources"),
+         must_fail=True, expect="cross-step environment/PATH channel"),
+
+    Case("GitHub env context file cannot replace scanner variables",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - run: bash scripts/audit-all-lockfiles.sh",
+             "      - run: echo BASH_ENV=scripts/mask.sh >> \"${{ github.env }}\"\n"
+             "      - run: bash scripts/audit-all-lockfiles.sh"),
+         must_fail=True, expect="cross-step environment/PATH channel"),
+
     Case("reviewed GitLab inherited context stays green",
          SAFE_GITLAB_GLOBALS + GOOD_GITLAB, GOOD_GITHUB, must_fail=False),
 
