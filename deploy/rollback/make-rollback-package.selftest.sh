@@ -42,11 +42,12 @@ bad()  { echo "  FAIL $1"; fails=$((fails + 1)); }
 mkdir -p "$W/bin"
 REAL_SHA256SUM="$(command -v sha256sum || true)"
 REAL_SHASUM="$(command -v shasum || true)"
+REAL_LN="$(command -v ln || true)"
 [ -n "$REAL_SHA256SUM" ] || [ -n "$REAL_SHASUM" ] || {
   echo "FAIL: no host SHA-256 implementation is available"
   exit 1
 }
-export REAL_SHA256SUM REAL_SHASUM
+export REAL_SHA256SUM REAL_SHASUM REAL_LN
 cat > "$W/bin/sha256sum" <<'SHIM'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -88,6 +89,24 @@ case "${ROLLBACK_SHA_MODE:-canonical}" in
 esac
 SHIM
 chmod 0755 "$W/bin/sha256sum"
+cat > "$W/bin/ln" <<'SHIM'
+#!/usr/bin/env bash
+set -euo pipefail
+destination="${@: -1}"
+case "${ROLLBACK_LN_MODE:-canonical}:$destination" in
+  fail-final-tarball:*/bloch-pos-rollback-*.tar.gz)
+      echo "injected final tarball publication failure" >&2
+      exit 73
+      ;;
+  race-final-tarball:*/bloch-pos-rollback-*.tar.gz)
+      printf 'concurrent publication sentinel\n' > "$destination"
+      echo "injected concurrent final tarball collision" >&2
+      exec "$REAL_LN" "$@"
+      ;;
+esac
+exec "$REAL_LN" "$@"
+SHIM
+chmod 0755 "$W/bin/ln"
 export PATH="$W/bin:$PATH"
 
 # ── disposable keys ─────────────────────────────────────────────────────────
@@ -132,6 +151,66 @@ expect_sha_failure late-duplicate \
   'non-lowercase hexadecimal digest for rollback manifest entry STAMP'
 expect_sha_failure tarball-duplicate \
   'non-lowercase hexadecimal digest for the rollback tarball'
+
+publication_failure_out="$W/publication-failure"
+mkdir -p "$publication_failure_out"
+if ROLLBACK_LN_MODE=fail-final-tarball \
+    BLOCH_ROLLBACK_SECKEY="$W/rel.key" BLOCH_ROLLBACK_PUBKEY="$W/rel.pub" \
+    "$ASSEMBLER" "$W/bloch-pos" "$STAMP" "$publication_failure_out" \
+    > "$W/publication-failure.log" 2>&1; then
+  bad "assembler accepted a failed final tarball publication"
+elif ! grep -Fq 'injected final tarball publication failure' \
+    "$W/publication-failure.log"; then
+  bad "final tarball publication failed without the injected diagnostic"
+elif [ -n "$(find "$publication_failure_out" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+  bad "failed final tarball publication left public or temporary output"
+else
+  ok "failed final tarball publication rolls back its public key and temporaries"
+fi
+
+publication_race_out="$W/publication-race"
+mkdir -p "$publication_race_out"
+publication_race_tar="$publication_race_out/bloch-pos-rollback-abcdef123456.tar.gz"
+if ROLLBACK_LN_MODE=race-final-tarball \
+    BLOCH_ROLLBACK_SECKEY="$W/rel.key" BLOCH_ROLLBACK_PUBKEY="$W/rel.pub" \
+    "$ASSEMBLER" "$W/bloch-pos" "$STAMP" "$publication_race_out" \
+    > "$W/publication-race.log" 2>&1; then
+  bad "assembler accepted a concurrent final tarball collision"
+elif ! grep -Fq 'injected concurrent final tarball collision' \
+    "$W/publication-race.log"; then
+  bad "concurrent final tarball collision lacked the injected diagnostic"
+elif [ "$(cat "$publication_race_tar")" != 'concurrent publication sentinel' ]; then
+  bad "cleanup removed or modified the concurrent final tarball"
+elif [ "$(find "$publication_race_out" -mindepth 1 -maxdepth 1 -exec printf x \; | wc -c | tr -d '[:space:]')" != 1 ]; then
+  bad "concurrent final tarball collision left owned public or temporary output"
+else
+  ok "concurrent final tarball is preserved while owned publication is rolled back"
+fi
+
+expect_collision_refusal() { # $1 = final suffix
+  suffix="$1"
+  output="$W/collision-${suffix##*.}"
+  mkdir -p "$output"
+  sentinel="$output/bloch-pos-rollback-abcdef123456.$suffix"
+  printf 'preexisting publication sentinel\n' > "$sentinel"
+  if BLOCH_ROLLBACK_SECKEY="$W/rel.key" BLOCH_ROLLBACK_PUBKEY="$W/rel.pub" \
+      "$ASSEMBLER" "$W/bloch-pos" "$STAMP" "$output" \
+      > "$W/collision-${suffix##*.}.log" 2>&1; then
+    bad "assembler overwrote existing rollback $suffix output"
+  elif ! grep -Fq 'refusing to overwrite existing rollback publication' \
+      "$W/collision-${suffix##*.}.log"; then
+    bad "existing rollback $suffix output failed without collision diagnostic"
+  elif [ "$(cat "$sentinel")" != 'preexisting publication sentinel' ]; then
+    bad "existing rollback $suffix output was modified"
+  elif [ "$(find "$output" -mindepth 1 -maxdepth 1 -exec printf x \; | wc -c | tr -d '[:space:]')" != 1 ]; then
+    bad "rollback $suffix collision left additional output"
+  else
+    ok "assembler refuses existing rollback $suffix output without modification"
+  fi
+}
+
+expect_collision_refusal tar.gz
+expect_collision_refusal pub
 
 # ── 1. the assembler fails closed with no signing key ───────────────────────
 out="$(env -u BLOCH_ROLLBACK_SECKEY "$ASSEMBLER" "$W/bloch-pos" "$STAMP" "$W/unsigned" 2>&1)"

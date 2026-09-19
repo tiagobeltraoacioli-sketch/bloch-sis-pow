@@ -95,6 +95,33 @@ SECKEY="${BLOCH_ROLLBACK_SECKEY:-}"
 [ -f "$SECKEY" ] || { echo "FAIL: no such minisign secret key: $SECKEY" >&2; exit 1; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/bloch-pos-rollback.XXXXXX")"
+PUBLICATION_COMPLETE=0
+FINAL_PUB=
+FINAL_TARBALL=
+TEMP_PUB=
+TEMP_TARBALL=
+cleanup() {
+  rc=$?
+  trap - EXIT HUP INT TERM
+  if [ "$PUBLICATION_COMPLETE" != 1 ]; then
+    if [ -n "$TEMP_TARBALL" ] && [ -n "$FINAL_TARBALL" ] \
+        && [ -e "$TEMP_TARBALL" ] && [ -e "$FINAL_TARBALL" ] \
+        && [ "$TEMP_TARBALL" -ef "$FINAL_TARBALL" ]; then
+      rm -f -- "$FINAL_TARBALL"
+    fi
+    if [ -n "$TEMP_PUB" ] && [ -n "$FINAL_PUB" ] \
+        && [ -e "$TEMP_PUB" ] && [ -e "$FINAL_PUB" ] \
+        && [ "$TEMP_PUB" -ef "$FINAL_PUB" ]; then
+      rm -f -- "$FINAL_PUB"
+    fi
+  fi
+  [ -z "$TEMP_TARBALL" ] || rm -f -- "$TEMP_TARBALL"
+  [ -z "$TEMP_PUB" ] || rm -f -- "$TEMP_PUB"
+  rm -rf -- "$WORK"
+  exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
 
 PUBFILE="${BLOCH_ROLLBACK_PUBKEY:-}"
 if [ -z "$PUBFILE" ]; then
@@ -327,15 +354,37 @@ fi
 package_hash="$(validated_sha256_file "$PRIVATE_TARBALL" 'the rollback tarball')"
 
 # The public key is published BESIDE the tarball, never inside it: a key that
-# travels with the bytes it authenticates authenticates nothing.
-TARBALL="$OUTDIR/bloch-pos-rollback-$ID.tar.gz"
-mv "$PRIVATE_TARBALL" "$TARBALL"
-cp "$PUBFILE" "$OUTDIR/bloch-pos-rollback-$ID.pub"
+# travels with the bytes it authenticates authenticates nothing. Refuse to
+# overwrite either final name. Copy both validated inputs to exclusive
+# temporary names on the output filesystem, then hard-link the public key
+# first and the tarball last. `ln` creates each final name atomically without
+# overwrite. The tarball is the completion artifact. On failure, the EXIT trap
+# removes a final name only when `-ef` proves it still aliases this invocation's
+# temporary inode.
+FINAL_TARBALL="$OUTDIR/bloch-pos-rollback-$ID.tar.gz"
+FINAL_PUB="$OUTDIR/bloch-pos-rollback-$ID.pub"
+for destination in "$FINAL_TARBALL" "$FINAL_PUB"; do
+  if [ -e "$destination" ] || [ -L "$destination" ]; then
+    echo "FAIL: refusing to overwrite existing rollback publication: $destination" >&2
+    exit 1
+  fi
+done
+TEMP_PUB="$(mktemp "$OUTDIR/.bloch-pos-rollback-$ID.pub.XXXXXX")"
+TEMP_TARBALL="$(mktemp "$OUTDIR/.bloch-pos-rollback-$ID.tar.gz.XXXXXX")"
+cp -p "$PUBFILE" "$TEMP_PUB"
+cp -p "$PRIVATE_TARBALL" "$TEMP_TARBALL"
 
-echo "rollback package: $TARBALL"
+ln "$TEMP_PUB" "$FINAL_PUB"
+ln "$TEMP_TARBALL" "$FINAL_TARBALL"
+PUBLICATION_COMPLETE=1
+rm -f -- "$TEMP_PUB" "$TEMP_TARBALL"
+TEMP_PUB=
+TEMP_TARBALL=
+
+echo "rollback package: $FINAL_TARBALL"
 echo "sha256(package):  $package_hash"
 echo "signing pubkey:   $PUBLINE"
-echo "                  (also written to $OUTDIR/bloch-pos-rollback-$ID.pub)"
+echo "                  (also written to $FINAL_PUB)"
 echo
 echo "Next (G8): test it on a SCRATCH host per deploy/RELEASE-INTEGRITY.md §5.3,"
 echo "then stage it in the release store alongside the release it protects."
