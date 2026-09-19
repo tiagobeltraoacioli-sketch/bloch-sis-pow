@@ -61,11 +61,16 @@ pub const CLOCK_SKEW_SLOTS: u64 = 1;
 
 /// Capacity of the pending (unknown-head) pool, in attestations (spec §6.3:
 /// 256 ≈ 1.2 MB of hybrid-signed attestations — a mirror of the block orphan
-/// pool). Bounded because entries are held *before* signature verification
-/// (see the pipeline order note below), so the pool must stay cheap to fill
-/// and cheap to evict. Eviction is FIFO by insertion sequence: deterministic,
-/// and under flood the newest — most likely still relevant — entries survive.
+/// pool). Entries are authenticated before hold, but still carry full hybrid
+/// signatures and must be re-judged when their block lands, so retention and
+/// release work remain bounded. Eviction is FIFO by insertion sequence:
+/// deterministic, and under flood the newest — most likely still relevant —
+/// entries survive.
 pub const MAX_PENDING_ATTESTATIONS: usize = 256;
+/// Pending attestations one missing block root may release in a single block
+/// ingestion. This is a node-local work/retention slice: the global pool still
+/// accepts other roots, and overflow is Ignore rather than peer fault.
+pub const MAX_PENDING_ATTESTATIONS_PER_ROOT: usize = 32;
 
 /// Distinct attestations accepted per duty before further ones are ignored
 /// (spec §6.2). Two, because slashing evidence needs exactly a conflicting
@@ -129,6 +134,11 @@ pub enum IgnoreReason {
     /// cost one hybrid verification; that is the intended trade (a bounded,
     /// self-funded cost, not a free one).
     PendingDutyLimit,
+    /// This missing block root already has
+    /// [`MAX_PENDING_ATTESTATIONS_PER_ROOT`] authenticated waiters parked.
+    /// The cap prevents one later block arrival from replaying the entire
+    /// global pending pool in one non-preemptible engine event.
+    PendingRootLimit,
 }
 
 /// The decision on one arriving attestation. The node maps this onto
@@ -438,6 +448,12 @@ impl AttestationPool {
                 let pending_for_duty = *self.pending_by_duty.get(&duty).unwrap_or(&0);
                 if pending_for_duty >= MAX_EQUIVOCATIONS_PER_DUTY {
                     return GossipDecision::Ignore(IgnoreReason::PendingDutyLimit);
+                }
+                let pending_for_root = self.pending_by_root
+                    .get(&root)
+                    .map_or(0, BTreeSet::len);
+                if pending_for_root >= MAX_PENDING_ATTESTATIONS_PER_ROOT {
+                    return GossipDecision::Ignore(IgnoreReason::PendingRootLimit);
                 }
                 return self.hold(duty, att, root, data_hash);
             }
@@ -962,6 +978,71 @@ mod tests {
             GossipDecision::Hold { .. }
         ));
         assert_eq!(pool.pending_len(), MAX_EQUIVOCATIONS_PER_DUTY + 1);
+    }
+
+    #[test]
+    fn one_landed_root_releases_only_its_bounded_pending_share() {
+        let mut pool = AttestationPool::new();
+        let blocks = BTreeSet::new();
+
+        for i in 0..MAX_PENDING_ATTESTATIONS_PER_ROOT {
+            let validator = 1 + (i % 8) as u32;
+            let slot = CURRENT_SLOT.saturating_sub((i / 8) as u64);
+            let decision = pool.process(
+                att(validator, slot, 0xAA),
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+            );
+            assert!(matches!(decision, GossipDecision::Hold { missing_root } if missing_root == root(0xAA)));
+        }
+        assert_eq!(pool.pending_len(), MAX_PENDING_ATTESTATIONS_PER_ROOT);
+
+        let overflow = att(1, CURRENT_SLOT - 4, 0xAA);
+        assert!(matches!(
+            pool.process(
+                overflow.clone(),
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+            ),
+            GossipDecision::Ignore(IgnoreReason::PendingRootLimit),
+        ));
+        assert_eq!(pool.pending_len(), MAX_PENDING_ATTESTATIONS_PER_ROOT);
+
+        let independent = att(2, CURRENT_SLOT - 4, 0xBB);
+        assert!(matches!(
+            pool.process(
+                independent,
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+            ),
+            GossipDecision::Hold { missing_root } if missing_root == root(0xBB),
+        ));
+        assert_eq!(pool.pending_len(), MAX_PENDING_ATTESTATIONS_PER_ROOT + 1);
+
+        let released = pool.take_waiting_on(&root(0xAA));
+        assert_eq!(released.len(), MAX_PENDING_ATTESTATIONS_PER_ROOT);
+        assert_eq!(pool.pending_len(), 1, "the independent root remains parked");
+        assert!(matches!(
+            pool.process(
+                overflow,
+                CURRENT_SLOT,
+                &committees(),
+                &known(&blocks),
+                &RootEchoVerifier,
+                &AnyKey,
+            ),
+            GossipDecision::Hold { missing_root } if missing_root == root(0xAA),
+        ));
+        assert_eq!(pool.pending_len(), 2, "release reopens root capacity");
     }
 
     #[test]

@@ -153,6 +153,7 @@ pub use forkchoice::{BlockTree, LatestMessage, Store};
 pub use gossip::{
     AttestationPool, BlockLookup, CommitteeLookup, GossipDecision, IgnoreReason,
     ATTESTATION_WINDOW_SLOTS, MAX_EQUIVOCATIONS_PER_DUTY, MAX_PENDING_ATTESTATIONS,
+    MAX_PENDING_ATTESTATIONS_PER_ROOT,
 };
 pub use params::{RANDAO_CHAIN_LENGTH, SLOTS_PER_EPOCH};
 // `COMMITTEE_SIZE` / `SLOT_SUBCOMMITTEE_SIZE` used to be re-exported flat here
