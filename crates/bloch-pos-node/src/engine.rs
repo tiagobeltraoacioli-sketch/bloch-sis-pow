@@ -2741,14 +2741,14 @@ impl Engine {
         // `blocks` (`prune` never removes a canonical id), so this is `Some`.
         // If it were not, the slot is lost the same way as the case above —
         // loudly, and without killing the node.
-        let Some(env) = self.blocks.get(id.as_bytes()).cloned() else {
+        let Some(env) = self.blocks.get(id.as_bytes()) else {
             eprintln!(
                 "[slot {slot}] own block {} adopted as head but not stored — not broadcast",
                 crate::codec::hex8(id.as_bytes()),
             );
             return;
         };
-        self.net.broadcast(net::block_frame(&env));
+        self.net.broadcast_block(env);
     }
 
     // ── Block ingestion: store, then advance canonical as far as possible ──

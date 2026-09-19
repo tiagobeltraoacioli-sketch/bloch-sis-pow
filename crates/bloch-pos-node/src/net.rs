@@ -130,6 +130,27 @@ pub enum NetEvent {
     Transaction(bloch_pos_committee::transition::PosTransaction, Origin),
 }
 
+/// One locally-produced block announcement, encoded together with the exact
+/// identity derived from the same borrowed envelope. Fields stay private so
+/// the libp2p suppression hint cannot be paired with unrelated wire bytes.
+pub(crate) struct PreparedBlockBroadcast {
+    frame: Vec<u8>,
+    id: [u8; 32],
+}
+
+impl PreparedBlockBroadcast {
+    fn new(env: &BlockEnvelope) -> Self {
+        Self {
+            frame: block_frame(env),
+            id: *env.block_id().as_bytes(),
+        }
+    }
+
+    pub(crate) fn frame(&self) -> &[u8] { &self.frame }
+    pub(crate) fn id(&self) -> [u8; 32] { self.id }
+    pub(crate) fn into_frame(self) -> Vec<u8> { self.frame }
+}
+
 /// The transport the engine holds, chosen at startup.
 ///
 /// `Devnet` and `Libp2p` are what they always were. [`Net::Both`] is the
@@ -144,6 +165,21 @@ pub enum Net {
 }
 
 impl Net {
+    /// Publish a locally-produced block without cloning its retained envelope
+    /// or making libp2p decode the just-encoded body solely for suppression.
+    /// The private prepared value binds the frame and id to one envelope.
+    pub(crate) fn broadcast_block(&self, env: &BlockEnvelope) {
+        let prepared = PreparedBlockBroadcast::new(env);
+        match self {
+            Net::Devnet(m) => m.broadcast(prepared.into_frame()),
+            Net::Libp2p(h) => h.broadcast_block(prepared),
+            Net::Both(m, h) => {
+                m.broadcast(prepared.frame().to_vec());
+                h.broadcast_block(prepared);
+            }
+        }
+    }
+
     /// Publish one frame (a `FRAME_*` type byte followed by its payload, no
     /// length prefix). The devnet mesh sends it to every peer; libp2p routes
     /// it by that type byte onto the matching gossip topic, or onto the
@@ -1591,6 +1627,19 @@ mod tests {
             proposer_sig: vec![0xAA; 32],
             body: Body { transactions: Vec::new(), attestations: Vec::new() },
         }
+    }
+
+    #[test]
+    fn prepared_block_broadcast_binds_large_wire_bytes_and_exact_id() {
+        let mut env = sync_test_block();
+        env.body.transactions = vec![vec![0xA5; 1 << 20]];
+        let expected_frame = block_frame(&env);
+        let expected_id = *env.block_id().as_bytes();
+
+        let prepared = PreparedBlockBroadcast::new(&env);
+        assert_eq!(prepared.id(), expected_id);
+        assert_eq!(prepared.frame(), expected_frame.as_slice());
+        assert_eq!(prepared.into_frame(), expected_frame);
     }
 
     #[test]

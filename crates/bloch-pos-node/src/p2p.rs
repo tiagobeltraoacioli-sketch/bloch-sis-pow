@@ -913,6 +913,8 @@ enum Command {
     /// A typed frame from the engine (`net::FRAME_*` byte, then payload),
     /// routed to a topic or to the directed-sync path by that byte.
     Broadcast(Vec<u8>),
+    /// A local block whose bytes and suppression id were derived together.
+    BroadcastBlock(crate::net::PreparedBlockBroadcast),
     /// The engine's verdict on a gossip message it was handed.
     Report(Origin, Verdict),
 }
@@ -934,6 +936,10 @@ impl Handle {
     /// byte, so the engine's call sites are identical on both transports.
     pub fn broadcast(&self, frame: Vec<u8>) {
         let _ = self.cmd.send(Command::Broadcast(frame));
+    }
+
+    pub(crate) fn broadcast_block(&self, prepared: crate::net::PreparedBlockBroadcast) {
+        let _ = self.cmd.send(Command::BroadcastBlock(prepared));
     }
 
     /// Peers with a live connection right now. `0` on a swarm that is bound
@@ -1373,46 +1379,68 @@ fn handle_command(swarm: &mut Swarm, st: &mut Loop, cmd: Command) {
                     .report_message_validation_result(&msg_id, &source, verdict.into());
             }
         }
-        Command::Broadcast(frame) => {
-            let Some((&tag, payload)) = frame.split_first() else { return };
-            match tag {
-                crate::net::FRAME_BLOCK => {
-                    // Re-gossip suppression. A block this node produced has a
-                    // content hash nobody has seen, so its own announcement is
-                    // never suppressed; a block that arrived on the mesh in the
-                    // last TTL would be refused by gossipsub's duplicate cache
-                    // anyway, after paying the hash of the whole body.
-                    if let Ok(env) = crate::codec::decode_envelope(payload) {
-                        let id = *env.block_id().as_bytes();
-                        if !st.note_block(id) {
-                            return;
-                        }
-                    }
-                    publish(swarm, st.topics.blocks.clone(), payload.to_vec(), "blocks");
-                }
-                crate::net::FRAME_ATT => {
-                    publish(swarm, st.topics.attestations.clone(), payload.to_vec(), "attestations");
-                }
-                crate::net::FRAME_TX => {
-                    publish(swarm, st.topics.txs.clone(), payload.to_vec(), "txs");
-                }
-                crate::net::FRAME_GET_BLOCKS => {
-                    if payload.len() != 8 {
-                        return;
-                    }
-                    // `payload.len() != 8` already returned above, so this
-                    // conversion cannot fail; the `else` arm keeps it
-                    // panic-free by construction rather than by an `unwrap`.
-                    let Ok(after_bytes) = payload.try_into() else {
-                        return;
-                    };
-                    let after = u64::from_le_bytes(after_bytes);
-                    request_blocks(swarm, st, after);
-                }
-                _ => {}
-            }
+        Command::Broadcast(frame) => handle_broadcast(swarm, st, frame, None),
+        Command::BroadcastBlock(prepared) => {
+            let id = prepared.id();
+            handle_broadcast(swarm, st, prepared.into_frame(), Some(id));
         }
     }
+}
+
+fn handle_broadcast(
+    swarm: &mut Swarm,
+    st: &mut Loop,
+    frame: Vec<u8>,
+    prepared_block_id: Option<[u8; 32]>,
+) {
+    let Some((&tag, payload)) = frame.split_first() else { return };
+    match tag {
+        crate::net::FRAME_BLOCK => {
+            // Re-gossip suppression. A block this node produced has a
+            // content hash nobody has seen, so its own announcement is
+            // never suppressed; a block that arrived on the mesh in the
+            // last TTL would be refused by gossipsub's duplicate cache
+            // anyway, after paying the hash of the whole body.
+            if !outbound_block_is_fresh(st, payload, prepared_block_id) {
+                return;
+            }
+            publish(swarm, st.topics.blocks.clone(), payload.to_vec(), "blocks");
+        }
+        crate::net::FRAME_ATT => {
+            publish(swarm, st.topics.attestations.clone(), payload.to_vec(), "attestations");
+        }
+        crate::net::FRAME_TX => {
+            publish(swarm, st.topics.txs.clone(), payload.to_vec(), "txs");
+        }
+        crate::net::FRAME_GET_BLOCKS => {
+            if payload.len() != 8 {
+                return;
+            }
+            // `payload.len() != 8` already returned above, so this conversion
+            // cannot fail; the `else` arm keeps it panic-free by construction
+            // rather than by an `unwrap`.
+            let Ok(after_bytes) = payload.try_into() else { return };
+            let after = u64::from_le_bytes(after_bytes);
+            request_blocks(swarm, st, after);
+        }
+        _ => {}
+    }
+}
+
+/// Apply outbound block suppression. Local production supplies the id already
+/// bound to the encoded bytes by `PreparedBlockBroadcast`; the generic frame
+/// API retains its historical best-effort decode and malformed-frame publish.
+fn outbound_block_is_fresh(
+    st: &mut Loop,
+    payload: &[u8],
+    prepared_block_id: Option<[u8; 32]>,
+) -> bool {
+    let id = prepared_block_id.or_else(|| {
+        crate::codec::decode_envelope(payload)
+            .ok()
+            .map(|env| *env.block_id().as_bytes())
+    });
+    id.map_or(true, |id| st.note_block(id))
 }
 
 /// Per-message wire tracing, off unless `BLOCH_P2P_TRACE` is set.
@@ -2255,9 +2283,42 @@ mod tests {
                     assert_eq!(reported.block_hint, Some((source, 99)));
                     assert!(reported.inner.is_none());
                 }
-                Command::Broadcast(_) => panic!("verdict became a broadcast"),
+                Command::Broadcast(_) | Command::BroadcastBlock(_) => {
+                    panic!("verdict became a broadcast")
+                }
             }
         }
+    }
+
+    #[test]
+    fn prepared_block_id_suppresses_without_decode_and_generic_fallback_is_unchanged() {
+        let mut state = test_loop();
+        let prepared = envelope(71);
+        let prepared_id = *prepared.block_id().as_bytes();
+        let deliberately_undecodable = [0xFF];
+
+        assert!(outbound_block_is_fresh(
+            &mut state,
+            &deliberately_undecodable,
+            Some(prepared_id),
+        ));
+        assert!(!outbound_block_is_fresh(
+            &mut state,
+            &deliberately_undecodable,
+            Some(prepared_id),
+        ));
+
+        let fallback = envelope(72);
+        let fallback_id = *fallback.block_id().as_bytes();
+        let fallback_payload = crate::codec::encode_envelope(&fallback);
+        assert!(outbound_block_is_fresh(&mut state, &fallback_payload, None));
+        assert!(!outbound_block_is_fresh(&mut state, &fallback_payload, None));
+        assert!(state.recent_blocks.contains_key(&fallback_id));
+
+        let remembered = state.recent_blocks.len();
+        assert!(outbound_block_is_fresh(&mut state, &[0xFF], None));
+        assert_eq!(state.recent_blocks.len(), remembered,
+            "a malformed generic frame remains publishable without inventing a suppression id");
     }
 
     #[test]
