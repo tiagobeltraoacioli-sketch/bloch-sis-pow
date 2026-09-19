@@ -59,9 +59,10 @@ git archive "$commit" | tar -x -C "$source" \
 # Resolve both the reviewed pin and the active toolchain from the captured
 # source tree. Running Rust and Cargo there also loads only the archived Cargo
 # configuration, never a config or source file changed after the clean checks.
-pin="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' \
-  "$source/crates/bloch-pos-node/rust-toolchain.toml")"
-[ -n "$pin" ] || fail "node toolchain pin is missing"
+pin="$(python3 -I "$source/scripts/pinned-rust-toolchain.py" \
+  "$source/rust-toolchain.toml" \
+  "$source/crates/bloch-pos-node/rust-toolchain.toml")" \
+  || fail "archived Rust toolchain pins are invalid or disagree"
 active="$(cd "$source/crates/bloch-pos-node" && rustc --version)"
 case "$active" in
   "rustc $pin "*) : ;;

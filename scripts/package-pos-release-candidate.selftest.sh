@@ -13,11 +13,16 @@ fake_bin="$work/bin"
 mkdir -p "$test_repo/scripts" "$test_repo/crates/bloch-pos-node" \
   "$test_repo/.cargo" "$fake_bin"
 cp "$repo_root/scripts/package-pos-release-candidate.sh" "$test_repo/scripts/"
+cp "$repo_root/scripts/pinned-rust-toolchain.py" "$test_repo/scripts/"
 
 printf 'baseline-source\n' > "$test_repo/source-marker"
 printf '# baseline-config\n[net]\noffline = true\n' \
   > "$test_repo/.cargo/config.toml"
 cat > "$test_repo/crates/bloch-pos-node/rust-toolchain.toml" <<'EOF'
+[toolchain]
+channel = "1.80.0"
+EOF
+cat > "$test_repo/rust-toolchain.toml" <<'EOF'
 [toolchain]
 channel = "1.80.0"
 EOF
@@ -55,8 +60,11 @@ if [ "${1:-}" = archive ] && [ "${FAKE_ADVANCE_HEAD:-0}" = 1 ] \
     > "$TEST_REPO/crates/bloch-pos-node/rust-toolchain.toml.new"
   mv "$TEST_REPO/crates/bloch-pos-node/rust-toolchain.toml.new" \
     "$TEST_REPO/crates/bloch-pos-node/rust-toolchain.toml"
+  sed 's/1\.80\.0/1.81.0/' "$TEST_REPO/rust-toolchain.toml" \
+    > "$TEST_REPO/rust-toolchain.toml.new"
+  mv "$TEST_REPO/rust-toolchain.toml.new" "$TEST_REPO/rust-toolchain.toml"
   "$REAL_GIT" -C "$TEST_REPO" add source-marker .cargo/config.toml \
-    crates/bloch-pos-node/rust-toolchain.toml
+    rust-toolchain.toml crates/bloch-pos-node/rust-toolchain.toml
   "$REAL_GIT" -C "$TEST_REPO" commit -qm late-head
 fi
 exec "$REAL_GIT" "$@"
@@ -208,6 +216,26 @@ expect_sha_failure() {
   }
 }
 
+expect_pin_failure() {
+  local label="$1" root_pin="$2" node_pin="$3"
+  local output="$work/pin-$label" log="$work/pin-$label.log"
+  printf '%s' "$root_pin" > "$test_repo/rust-toolchain.toml"
+  printf '%s' "$node_pin" \
+    > "$test_repo/crates/bloch-pos-node/rust-toolchain.toml"
+  git -C "$test_repo" add rust-toolchain.toml \
+    crates/bloch-pos-node/rust-toolchain.toml
+  git -C "$test_repo" commit -qm "pin-$label"
+  if run_package "$output" > "$log" 2>&1; then
+    echo "selftest: invalid toolchain pin case $label was accepted" >&2
+    exit 1
+  fi
+  grep -Fq 'archived Rust toolchain pins are invalid or disagree' "$log" || {
+    echo "selftest: toolchain pin case $label failed without expected diagnostic" >&2
+    cat "$log" >&2
+    exit 1
+  }
+}
+
 expect_version_failure() {
   local mode="$1" expected="$2"
   local output="$work/version-$mode" log="$work/version-$mode.log"
@@ -294,5 +322,15 @@ expect_sha_failure uppercase \
   'SHA-256 tool returned a non-lowercase hexadecimal digest'
 expect_sha_failure duplicate \
   'SHA-256 tool returned a non-lowercase hexadecimal digest'
+
+expect_pin_failure mismatch \
+  $'[toolchain]\nchannel = "1.82.0"\n' \
+  $'[toolchain]\nchannel = "1.81.0"\n'
+expect_pin_failure duplicate \
+  $'[toolchain]\nchannel = "1.82.0"\n' \
+  $'[toolchain]\nchannel = "1.82.0"\nchannel = "stable"\n'
+expect_pin_failure injection \
+  $'[toolchain]\nchannel = "1.82.0"\n' \
+  $'[toolchain]\nchannel = "$(touch /tmp/never-executed)"\n'
 
 echo "package-pos-release-candidate selftest: PASS"
