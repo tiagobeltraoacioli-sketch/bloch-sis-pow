@@ -127,6 +127,12 @@ case "${FAKE_MANIFEST_MODE:-canonical}" in
   omit-binary) printf '%s  BUILD-INFO\n' "$build_info_sha" > "$stage/SHA256SUMS" ;;
   *) exit 64 ;;
 esac
+if [ -n "${FAKE_SYMLINK_ARTIFACT:-}" ]; then
+  artifact="$FAKE_SYMLINK_ARTIFACT"
+  target="$context/engine-export-$artifact"
+  mv "$stage/$artifact" "$target"
+  ln -s "$target" "$stage/$artifact"
+fi
 ENGINE
 chmod 0755 "$fake_engine"
 
@@ -136,6 +142,7 @@ run_wrapper() {
   local metadata_sha="${7:-}" sha_duplicate="${8:-0}"
   local artifact_kind="${9:-canonical-container-candidate}"
   local artifact_duplicate="${10:-0}"
+  local symlink_artifact="${11:-}"
   FAKE_MANIFEST_MODE="$mode" FAKE_DEPLOYMENT_AUTHORIZED="$authorized" \
     FAKE_DUPLICATE_DEPLOYMENT_AUTHORIZED="$duplicate" \
     FAKE_SIGNED="$signed" FAKE_DUPLICATE_SIGNED="$signed_duplicate" \
@@ -143,6 +150,7 @@ run_wrapper() {
     FAKE_DUPLICATE_BINARY_SHA="$sha_duplicate" \
     FAKE_ARTIFACT_KIND="$artifact_kind" \
     FAKE_DUPLICATE_ARTIFACT_KIND="$artifact_duplicate" \
+    FAKE_SYMLINK_ARTIFACT="$symlink_artifact" \
     CONTAINER_ENGINE="$fake_engine" \
     bash scripts/build-pos-release-container.sh "$output"
 }
@@ -190,6 +198,25 @@ expect_sha_failure() {
   }
 }
 
+expect_symlink_failure() {
+  local artifact="$1" output="$work/symlink-$1" log="$work/symlink-$1.log"
+  if run_wrapper canonical "$output" false 0 false 0 "" 0 \
+      canonical-container-candidate 0 "$artifact" > "$log" 2>&1; then
+    echo "selftest: wrapper accepted symlinked $artifact export" >&2
+    exit 1
+  fi
+  grep -Fq "container export $artifact must be a regular non-symlink file" \
+      "$log" || {
+    echo "selftest: symlinked $artifact failed without expected diagnostic" >&2
+    cat "$log" >&2
+    exit 1
+  }
+  [ ! -e "$output" ] || {
+    echo "selftest: wrapper published output after rejecting symlinked $artifact" >&2
+    exit 1
+  }
+}
+
 run_wrapper canonical "$work/canonical" > "$work/canonical.log" 2>&1
 grep -Fq 'build-pos-release-container: PASS' "$work/canonical.log"
 cmp -s <(printf '%s  bloch-pos\n' "$(
@@ -209,6 +236,10 @@ expect_sha_failure uppercase \
   'SHA-256 tool returned a non-lowercase hexadecimal digest for exported bloch-pos'
 expect_sha_failure multirow \
   'SHA-256 tool returned a non-lowercase hexadecimal digest for exported bloch-pos'
+
+for artifact in bloch-pos SHA256SUMS BUILD-INFO; do
+  expect_symlink_failure "$artifact"
+done
 
 manifest_error='exported SHA256SUMS is not the exact canonical one-line manifest'
 for mode in extra omit-binary; do

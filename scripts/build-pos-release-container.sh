@@ -77,6 +77,10 @@ git archive --format=tar "$commit" | tar -xf - -C "$context"
   --file "$context/deploy/pos-release/Dockerfile" \
   "$context"
 
+for artifact in bloch-pos SHA256SUMS BUILD-INFO; do
+  [ -f "$stage/$artifact" ] && [ ! -L "$stage/$artifact" ] \
+    || fail "container export $artifact must be a regular non-symlink file"
+done
 [ -x "$stage/bloch-pos" ] || fail "container did not export bloch-pos"
 binary_sha="$(validated_sha256_file "$stage/bloch-pos")"
 cmp -s <(printf '%s  bloch-pos\n' "$binary_sha") "$stage/SHA256SUMS" \
