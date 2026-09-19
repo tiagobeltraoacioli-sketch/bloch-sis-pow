@@ -639,7 +639,7 @@ mod tests {
 // ═══════════════════════════════════════════════════════════════════════════
 
 
-use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, KeyInit}};
+use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, AeadInPlace, KeyInit}};
 use argon2::{Argon2, Algorithm, Version, Params};
 use base64::{Engine as _, engine::general_purpose as b64};
 use rand::RngCore;
@@ -828,7 +828,11 @@ impl Keypair {
 
         let salt      = b64::STANDARD.decode(&ks.crypto.kdf_params.salt).map_err(|e| e.to_string())?;
         let nonce_b   = b64::STANDARD.decode(&ks.crypto.nonce).map_err(|e| e.to_string())?;
-        let ct        = b64::STANDARD.decode(&ks.crypto.ciphertext).map_err(|e| e.to_string())?;
+        // Reuse the decoded ciphertext allocation for authenticated plaintext.
+        // The wrapper wipes it if validation, KDF setup or authentication fails.
+        let mut plain = Zeroizing::new(
+            b64::STANDARD.decode(&ks.crypto.ciphertext).map_err(|e| e.to_string())?,
+        );
 
         // SECURITY (A4 lows): `Nonce::from_slice` PANICS on any length other
         // than 12 bytes. `nonce_b` comes from an untrusted keystore file, so
@@ -843,10 +847,10 @@ impl Keypair {
                 NONCE_LEN, nonce_b.len()
             ));
         }
-        if ct.len() < GCM_TAG_LEN {
+        if plain.len() < GCM_TAG_LEN {
             return Err(format!(
                 "keystore ciphertext too short: {} bytes, need at least the {}-byte GCM tag",
-                ct.len(), GCM_TAG_LEN
+                plain.len(), GCM_TAG_LEN
             ));
         }
 
@@ -858,13 +862,7 @@ impl Keypair {
         // and `output_len != 32` would panic the AES-256 key conversion below.
         let mut enc_k = Zeroizing::new(derive_key_with_params(password, &salt, &ks.crypto.kdf_params)?);
 
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&enc_k));
-        // Zeroizing (A4 lows): this plaintext carries the hex-encoded private
-        // key — must not linger in memory past the parse below.
-        let plain = Zeroizing::new(
-            cipher.decrypt(Nonce::from_slice(&nonce_b), ct.as_ref())
-                .map_err(|_| "decryption failed — wrong password or corrupted file".to_string())?
-        );
+        decrypt_legacy_keystore_in_place(&enc_k, &nonce_b, &mut plain)?;
         enc_k.zeroize();
 
         let mut payload: KeystorePayload = serde_json::from_slice(&plain).map_err(|e| e.to_string())?;
@@ -877,6 +875,33 @@ impl Keypair {
         if derived != ks.address { return Err("address mismatch — keystore may be tampered".into()); }
         Ok(Keypair { private_key: std::mem::take(&mut *private_key), public_key, address: ks.address })
     }
+}
+
+fn decrypt_legacy_keystore_in_place(
+    key: &[u8],
+    nonce_b: &[u8],
+    ciphertext: &mut Vec<u8>,
+) -> Result<(), String> {
+    const NONCE_LEN: usize = 12;
+    const GCM_TAG_LEN: usize = 16;
+    if key.len() != 32 {
+        return Err("AES-256 key must contain 32 bytes".into());
+    }
+    if nonce_b.len() != NONCE_LEN {
+        return Err(format!(
+            "keystore nonce has invalid length: expected {} bytes, got {}",
+            NONCE_LEN, nonce_b.len()
+        ));
+    }
+    if ciphertext.len() < GCM_TAG_LEN {
+        return Err(format!(
+            "keystore ciphertext too short: {} bytes, need at least the {}-byte GCM tag",
+            ciphertext.len(), GCM_TAG_LEN
+        ));
+    }
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    cipher.decrypt_in_place(Nonce::from_slice(nonce_b), b"", ciphertext)
+        .map_err(|_| "decryption failed — wrong password or corrupted file".to_string())
 }
 
 impl std::fmt::Debug for Keypair {
@@ -1061,6 +1086,49 @@ pub mod cli;
 #[cfg(test)]
 mod legacy_keystore_tests {
     use super::*;
+
+    #[test]
+    fn legacy_keystore_decryption_reuses_ciphertext_allocation_at_tag_boundary() {
+        let key = [0x82; 32];
+        let nonce = [0x28; 12];
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+
+        for plaintext in [b"".as_slice(), b"legacy wallet secret".as_slice()] {
+            let mut buffer = cipher.encrypt(Nonce::from_slice(&nonce), plaintext).unwrap();
+            let allocation = buffer.as_ptr();
+            let encrypted_len = buffer.len();
+
+            decrypt_legacy_keystore_in_place(&key, &nonce, &mut buffer).unwrap();
+
+            assert_eq!(
+                buffer.as_ptr(), allocation,
+                "legacy decrypt must reuse the Base64-decoded allocation"
+            );
+            assert_eq!(buffer, plaintext);
+            assert_eq!(encrypted_len, plaintext.len() + 16);
+        }
+
+        let mut below_tag = vec![0u8; 15];
+        assert_eq!(
+            decrypt_legacy_keystore_in_place(&key, &nonce, &mut below_tag).unwrap_err(),
+            "keystore ciphertext too short: 15 bytes, need at least the 16-byte GCM tag"
+        );
+
+        let mut tampered = Zeroizing::new(
+            cipher.encrypt(
+                Nonce::from_slice(&nonce),
+                b"authenticated legacy secret".as_slice(),
+            ).unwrap(),
+        );
+        tampered[0] ^= 1;
+        let allocation = tampered.as_ptr();
+        assert_eq!(
+            decrypt_legacy_keystore_in_place(&key, &nonce, &mut tampered).unwrap_err(),
+            "decryption failed — wrong password or corrupted file"
+        );
+        assert_eq!(tampered.as_ptr(), allocation);
+        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
+    }
 
     #[test]
     fn keypair_verify_accepts_genuine_magic_prefixed_raw_signature_explicitly() {
