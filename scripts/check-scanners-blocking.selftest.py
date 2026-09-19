@@ -207,6 +207,10 @@ jobs:
     steps:
       - run: cargo geiger
 """
+GOOD_GITHUB_WITH_ENV = GOOD_GITHUB.replace(
+    "permissions:\n  contents: read\n",
+    "permissions:\n  contents: read\n\n"
+    "env:\n  CARGO_TERM_COLOR: always\n  RUST_BACKTRACE: \"1\"\n")
 
 
 class Case:
@@ -227,6 +231,72 @@ def sub(text: str, old: str, new: str) -> str:
 
 CASES = [
     Case("honest pipelines stay green", GOOD_GITLAB, GOOD_GITHUB, must_fail=False),
+
+    Case("reviewed GitHub global environment stays green",
+         GOOD_GITLAB, GOOD_GITHUB_WITH_ENV, must_fail=False),
+
+    Case("GitHub global BASH_ENV cannot replace scanner commands",
+         GOOD_GITLAB,
+         GOOD_GITHUB_WITH_ENV.replace(
+             '  RUST_BACKTRACE: "1"',
+             '  RUST_BACKTRACE: "1"\n  BASH_ENV: scripts/mask-scanners.sh'),
+         must_fail=True, expect="top-level `env:` differs"),
+
+    Case("GitHub scanner step PATH cannot replace cargo",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - run: cargo deny check advisories bans licenses sources",
+             "      - run: cargo deny check advisories bans licenses sources\n"
+             "        env:\n          PATH: scripts/fake-bin"),
+         must_fail=True, expect="environment/container/service context"),
+
+    Case("GitHub scanner job container cannot replace tools",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  cargo-audit:\n    runs-on: ubuntu-latest",
+             "  cargo-audit:\n    runs-on: ubuntu-latest\n"
+             "    container: attacker.invalid/fake-tools:latest"),
+         must_fail=True, expect="environment/container/service context"),
+
+    Case("GitHub scanner services are outside the supported context",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  secret-scan:\n    runs-on: ubuntu-latest",
+             "  secret-scan:\n    runs-on: ubuntu-latest\n"
+             "    services:\n      helper:\n        image: attacker.invalid/helper:latest"),
+         must_fail=True, expect="environment/container/service context"),
+
+    Case("unreviewed action cannot run before a scanner verdict",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - run: cargo deny check advisories bans licenses sources",
+             "      - uses: attacker/example@0123456789abcdef0123456789abcdef01234567\n"
+             "      - run: cargo deny check advisories bans licenses sources"),
+         must_fail=True, expect="unreviewed or mutable action"),
+
+    Case("reviewed action path cannot regress to a mutable tag",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  cargo-audit:\n    runs-on: ubuntu-latest\n    steps:",
+             "  cargo-audit:\n    runs-on: ubuntu-latest\n    steps:\n"
+             "      - uses: actions/checkout@v4"),
+         must_fail=True, expect="unreviewed or mutable action"),
+
+    Case("reviewed cache action cannot restore unreviewed directories",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  cargo-audit:\n    runs-on: ubuntu-latest\n    steps:",
+             "  cargo-audit:\n    runs-on: ubuntu-latest\n    steps:\n"
+             "      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6\n"
+             "        with:\n          cache-directories: scripts"),
+         must_fail=True, expect="unreviewed `with:` inputs"),
+
+    Case("OSV action cannot add an unreviewed input",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "        with:\n          scan-args:",
+             "        with:\n          experimental: true\n          scan-args:"),
+         must_fail=True, expect="unreviewed `with:` inputs"),
 
     Case("reviewed GitLab inherited context stays green",
          SAFE_GITLAB_GLOBALS + GOOD_GITLAB, GOOD_GITHUB, must_fail=False),
@@ -264,6 +334,18 @@ CASES = [
              "secret-scan:\n  stage: check",
              "secret-scan:\n  stage: check\n  variables:\n    PATH: scripts/fake-bin"),
          GOOD_GITHUB, must_fail=True, expect="unreviewed execution variables"),
+
+    Case("required GitLab scanner cannot restore entrypoints from cache",
+         GOOD_GITLAB.replace(
+             "cargo-audit:\n  stage: check",
+             "cargo-audit:\n  stage: check\n  cache:\n    paths:\n      - scripts/"),
+         GOOD_GITHUB, must_fail=True, expect="unsupported `cache:`"),
+
+    Case("required GitLab scanner cannot import dependency artifacts",
+         GOOD_GITLAB.replace(
+             "secret-scan:\n  stage: check",
+             "secret-scan:\n  stage: check\n  dependencies:\n    - poison-entrypoints"),
+         GOOD_GITHUB, must_fail=True, expect="unsupported `dependencies:`"),
 
     Case("history scanner deleted",
          GOOD_GITLAB.replace("secret-history-scan:\n  stage: check\n  script:\n    - bash scripts/scan-secrets.sh history\n  allow_failure: false\n", ""),

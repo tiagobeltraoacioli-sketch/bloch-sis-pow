@@ -27,6 +27,9 @@ job `build-and-test` — to the posture the finding required:
     that can replace the test script's exit status.
   * its GitLab inherited `default:`/`variables:` context remains the reviewed
     explicit subset, with no job-local script hooks or execution variables.
+  * its GitHub environment is the reviewed inert pair, required jobs use no
+    containers/services/env overrides, and every action plus input is a
+    reviewed immutable form.
 
 The live-crate list is duplicated in `.github/workflows/tests.yml` on
 purpose: the workflow states what it gates, this file makes dropping a crate
@@ -89,6 +92,14 @@ SAFE_GITLAB_VARIABLES = (
     'CARGO_TERM_COLOR: "always"',
     'RUST_BACKTRACE: "1"',
 )
+SAFE_GITHUB_ENV = (
+    "CARGO_TERM_COLOR: always",
+    'RUST_BACKTRACE: "1"',
+)
+REVIEWED_GITHUB_ACTIONS = {
+    "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+    "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+}
 
 
 def job_blocks(text: str, indent: int) -> dict[str, list[str]]:
@@ -162,6 +173,48 @@ def command_blocks(body: list[str], job_indent: int) -> list[list[str]]:
     return blocks
 
 
+def github_action_steps(
+    body: list[str], job_indent: int
+) -> list[tuple[str, dict[str, str]]]:
+    step_indent = job_indent + 4
+    steps: list[list[str]] = []
+    current: list[str] | None = None
+    for line in body:
+        spaces = len(line) - len(line.lstrip(" "))
+        if spaces == step_indent and line.strip().startswith("- "):
+            current = []
+            steps.append(current)
+        if current is not None:
+            current.append(line)
+    result = []
+    for step in steps:
+        action = None
+        inputs: dict[str, str] = {}
+        in_with = False
+        for line in step:
+            spaces = len(line) - len(line.lstrip(" "))
+            stripped = line.strip()
+            if spaces == step_indent and stripped.startswith("- uses:"):
+                action = stripped.split(":", 1)[1].strip()
+            elif spaces == step_indent + 2 and stripped.startswith("uses:"):
+                action = stripped.split(":", 1)[1].strip()
+            if spaces == step_indent + 2:
+                if stripped.startswith("with:") and stripped != "with:":
+                    inputs["<unsupported-with-shape>"] = stripped[len("with:"):].strip()
+                    in_with = False
+                else:
+                    in_with = stripped == "with:"
+            elif in_with and spaces == step_indent + 4:
+                match = re.match(r"^([A-Za-z0-9_-]+):\s*(.*)$", stripped)
+                if match:
+                    inputs[match.group(1)] = re.sub(
+                        r"\s+#.*$", "", match.group(2)).strip(" \"'")
+        if action is not None:
+            action = re.sub(r"\s+#.*$", "", action).strip(" \"'")
+            result.append((action, inputs))
+    return result
+
+
 def complete_test_tokens(command: str) -> list[str] | None:
     """Only unfiltered cargo tests in the current workspace prove coverage."""
     tokens = shlex.split(command, comments=True)
@@ -199,9 +252,9 @@ def check_gitlab_global_context(text: str, blocks: dict[str, list[str]]) -> list
         match.group(1)
         for line in text.splitlines()
         if (match := re.match(
-            r"^(default|variables|before_script|after_script|hooks):", line))
+            r"^(default|variables|before_script|after_script|hooks|image|services|cache):", line))
     }
-    for key in ("before_script", "after_script", "hooks"):
+    for key in ("before_script", "after_script", "hooks", "image", "services", "cache"):
         if key in present:
             problems.append(
                 ".gitlab-ci.yml: top-level `%s:` is outside the supported "
@@ -231,7 +284,8 @@ def check_gitlab_job_context(body: list[str], job: str, indent: int) -> list[str
         key = value.split(":", 1)[0]
         if key == "before_script" and value != "before_script: []":
             problems.append(f".gitlab-ci.yml: job `{job}` has an unreviewed `before_script:`")
-        elif key in ("after_script", "hooks"):
+        elif key in ("after_script", "hooks", "image", "services", "cache",
+                     "artifacts", "dependencies", "needs"):
             problems.append(f".gitlab-ci.yml: job `{job}` uses unsupported `{key}:` context")
         elif key == "variables":
             problems.append(f".gitlab-ci.yml: job `{job}` has unreviewed execution variables")
@@ -259,6 +313,19 @@ def check_job(path: str, job: str, indent: int, label: str) -> list[str]:
         if "defaults" in top_level:
             problems.append(
                 f"{label}: top-level `defaults:` can replace the required test shell")
+        env_lines = top_level.get("env")
+        env_present = any(re.match(r"^env:", line) for line in text.splitlines())
+        if env_present and (env_lines is None
+                or normalized_yaml_lines(env_lines) != SAFE_GITHUB_ENV):
+            problems.append(
+                f"{label}: top-level `env:` differs from the reviewed inert subset")
+        for action, inputs in github_action_steps(body, indent):
+            if action not in REVIEWED_GITHUB_ACTIONS:
+                problems.append(
+                    f"{label}: job `{job}` invokes unreviewed or mutable action `{action}`")
+            elif inputs:
+                problems.append(
+                    f"{label}: job `{job}` action `{action}` has unreviewed `with:` inputs")
 
     for line in body:
         waiver = re.match(r"^\s*(?:-\s+)?(allow_failure|continue-on-error):\s*(.*?)\s*(?:#.*)?$", line)
@@ -282,6 +349,10 @@ def check_job(path: str, job: str, indent: int, label: str) -> list[str]:
                 and re.match(r"^(?:defaults|shell):", value)):
             problems.append(
                 f"{label}: custom shell/defaults can replace the cargo test exit status")
+        if (label == ".github/workflows/tests.yml"
+                and re.match(r"^(?:env|container|services):", value)):
+            problems.append(
+                f"{label}: environment/container/service context can replace cargo")
     blocks = command_blocks(body, indent)
     if indent == 0:
         # GitLab script list items share one shell; a condition/set +e in

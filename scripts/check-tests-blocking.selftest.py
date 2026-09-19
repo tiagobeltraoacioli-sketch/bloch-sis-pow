@@ -79,7 +79,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - run: |
           cargo test --locked \\
             -p bloch-pos-committee \\
@@ -97,6 +97,9 @@ jobs:
     steps:
       - run: python3 scripts/check-tests-blocking.py
 """
+GOOD_GITHUB_WITH_ENV = GOOD_GITHUB.replace(
+    "name: tests\n",
+    "name: tests\nenv:\n  CARGO_TERM_COLOR: always\n  RUST_BACKTRACE: \"1\"\n")
 
 # --workspace covers every member crate; the guard must accept it.
 WORKSPACE_GITLAB = GOOD_GITLAB.replace(CRATE_ARGS, "    - cargo test --workspace\n")
@@ -117,6 +120,55 @@ def sub(text: str, old: str, new: str) -> str:
 
 
 CASES = [
+    Case("reviewed GitHub global test environment stays green",
+         GOOD_GITLAB, GOOD_GITHUB_WITH_ENV, must_fail=False),
+    Case("GitHub global test BASH_ENV is refused",
+         GOOD_GITLAB,
+         GOOD_GITHUB_WITH_ENV.replace(
+             '  RUST_BACKTRACE: "1"',
+             '  RUST_BACKTRACE: "1"\n  BASH_ENV: scripts/mask-tests.sh'),
+         must_fail=True, expect="top-level `env:` differs"),
+    Case("GitHub cargo step PATH is refused",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "            -p genesis4-ceremony\n",
+             "            -p genesis4-ceremony\n"
+             "        env:\n          PATH: scripts/fake-cargo"),
+         must_fail=True, expect="environment/container/service context"),
+    Case("GitHub cargo job container is refused",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  cargo-test:\n    runs-on: ubuntu-latest",
+             "  cargo-test:\n    runs-on: ubuntu-latest\n"
+             "    container: attacker.invalid/fake-rust:latest"),
+         must_fail=True, expect="environment/container/service context"),
+    Case("GitHub cargo services are refused",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  cargo-test:\n    runs-on: ubuntu-latest",
+             "  cargo-test:\n    runs-on: ubuntu-latest\n"
+             "    services:\n      helper:\n        image: attacker.invalid/helper:latest"),
+         must_fail=True, expect="environment/container/service context"),
+    Case("unreviewed action cannot precede cargo test",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+             "      - uses: attacker/example@0123456789abcdef0123456789abcdef01234567\n"
+             "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262"),
+         must_fail=True, expect="unreviewed or mutable action"),
+    Case("checkout action cannot regress to a mutable tag",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+             "actions/checkout@v4"),
+         must_fail=True, expect="unreviewed or mutable action"),
+    Case("reviewed checkout cannot gain unreviewed inputs",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+             "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"
+             "        with:\n          path: scripts"),
+         must_fail=True, expect="unreviewed `with:` inputs"),
     Case("reviewed GitLab inherited test context stays green",
          SAFE_GITLAB_GLOBALS + GOOD_GITLAB, GOOD_GITHUB, must_fail=False),
     Case("GitLab default cannot disable test fail-fast",
@@ -134,6 +186,16 @@ CASES = [
              "build-and-test:\n  stage: test",
              "build-and-test:\n  stage: test\n  variables:\n    PATH: scripts/fake-cargo"),
          GOOD_GITHUB, must_fail=True, expect="unreviewed execution variables"),
+    Case("GitLab test job cannot replace the runner image",
+         GOOD_GITLAB.replace(
+             "build-and-test:\n  stage: test",
+             "build-and-test:\n  stage: test\n  image: attacker.invalid/fake-cargo:latest"),
+         GOOD_GITHUB, must_fail=True, expect="unsupported `image:`"),
+    Case("GitLab test job cannot fetch entrypoint artifacts with needs",
+         GOOD_GITLAB.replace(
+             "build-and-test:\n  stage: test",
+             "build-and-test:\n  stage: test\n  needs:\n    - job: poison-entrypoints\n      artifacts: true"),
+         GOOD_GITHUB, must_fail=True, expect="unsupported `needs:`"),
     Case("conditional test execution is not guaranteed", GOOD_GITLAB.replace(CRATE_ARGS, "    - if false; then\n" + CRATE_ARGS + "    - fi\n"), GOOD_GITHUB, must_fail=True),
     Case("disabled shell failures are refused", GOOD_GITLAB.replace(CRATE_ARGS, "    - set +e\n" + CRATE_ARGS), GOOD_GITHUB, must_fail=True),
     Case("background test cannot gate", GOOD_GITLAB.replace(CRATE_ARGS, CRATE_ARGS.rstrip() + " &\n"), GOOD_GITHUB, must_fail=True),

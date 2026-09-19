@@ -55,6 +55,8 @@ security job, fails if the job:
     replace an otherwise unchanged verdict's exit status.
   * changes the reviewed GitLab inherited default/variable context, or gives a
     required job unreviewed before/after scripts, hooks or variables.
+  * adds GitHub environment/container/service replacement context or an
+    unreviewed/mutable action (including new inputs to a reviewed action).
 
 It does NOT require every job to be blocking. cargo-geiger, miri and the fuzz
 smoke are deliberately report-only, with written reasons, and stay green here.
@@ -157,6 +159,17 @@ SAFE_GITLAB_VARIABLES = (
     'CARGO_TERM_COLOR: "always"',
     'RUST_BACKTRACE: "1"',
 )
+SAFE_GITHUB_ENV = (
+    "CARGO_TERM_COLOR: always",
+    'RUST_BACKTRACE: "1"',
+)
+REVIEWED_GITHUB_ACTIONS = {
+    "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+    "dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87",
+    "dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0",
+    "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+    "google/osv-scanner-action/osv-scanner-action@764c91816374ff2d8fc2095dab36eecd42d61638",
+}
 
 
 def job_blocks(text: str, indent: int) -> dict[str, list[str]]:
@@ -297,6 +310,59 @@ def github_action_input(
     return None
 
 
+def github_action_steps(
+    body: list[str], job_indent: int
+) -> list[tuple[str, dict[str, str]]]:
+    step_indent = job_indent + 4
+    steps: list[list[str]] = []
+    current: list[str] | None = None
+    for line in body:
+        spaces = len(line) - len(line.lstrip(" "))
+        if spaces == step_indent and line.strip().startswith("- "):
+            current = []
+            steps.append(current)
+        if current is not None:
+            current.append(line)
+    result = []
+    for step in steps:
+        action = None
+        inputs: dict[str, str] = {}
+        in_with = False
+        for line in step:
+            spaces = len(line) - len(line.lstrip(" "))
+            stripped = line.strip()
+            if spaces == step_indent and stripped.startswith("- uses:"):
+                action = stripped.split(":", 1)[1].strip()
+            elif spaces == step_indent + 2 and stripped.startswith("uses:"):
+                action = stripped.split(":", 1)[1].strip()
+            if spaces == step_indent + 2:
+                if stripped.startswith("with:") and stripped != "with:":
+                    inputs["<unsupported-with-shape>"] = stripped[len("with:"):].strip()
+                    in_with = False
+                else:
+                    in_with = stripped == "with:"
+            elif in_with and spaces == step_indent + 4:
+                match = re.match(r"^([A-Za-z0-9_-]+):\s*(.*)$", stripped)
+                if match:
+                    value = re.sub(r"\s+#.*$", "", match.group(2)).strip(" \"'")
+                    inputs[match.group(1)] = value
+        if action is not None:
+            action = re.sub(r"\s+#.*$", "", action).strip(" \"'")
+            result.append((action, inputs))
+    return result
+
+
+def reviewed_action_inputs(job: str, action: str) -> dict[str, str]:
+    if job == "osv-scanner" and action.startswith(
+            "google/osv-scanner-action/osv-scanner-action@"):
+        return {"scan-args": "*"}
+    if job == "secret-history-scan" and action.startswith("actions/checkout@"):
+        return {"fetch-depth": "0"}
+    if job == "clippy-hardened" and action.startswith("dtolnay/rust-toolchain@"):
+        return {"toolchain": "1.94.1", "components": "clippy"}
+    return {}
+
+
 def tracked_lockfiles(manifest: str | None) -> tuple[list[str], str | None]:
     """Return the canonical tracked Cargo.lock set, or a fail-closed error.
 
@@ -351,9 +417,9 @@ def check_gitlab_global_context(text: str, blocks: dict[str, list[str]]) -> list
         match.group(1)
         for line in text.splitlines()
         if (match := re.match(
-            r"^(default|variables|before_script|after_script|hooks):", line))
+            r"^(default|variables|before_script|after_script|hooks|image|services|cache):", line))
     }
-    for key in ("before_script", "after_script", "hooks"):
+    for key in ("before_script", "after_script", "hooks", "image", "services", "cache"):
         if key in present:
             problems.append(
                 ".gitlab-ci.yml: top-level `%s:` is outside the supported "
@@ -387,7 +453,8 @@ def check_gitlab_job_context(body: list[str], job: str, indent: int) -> list[str
         if key == "before_script" and value != "before_script: []":
             problems.append(
                 ".gitlab-ci.yml: job `%s` has an unreviewed `before_script:`" % job)
-        elif key in ("after_script", "hooks"):
+        elif key in ("after_script", "hooks", "image", "services", "cache",
+                     "artifacts", "dependencies", "needs"):
             problems.append(
                 ".gitlab-ci.yml: job `%s` uses unsupported `%s:` context" % (job, key))
         elif key == "variables":
@@ -475,6 +542,13 @@ def check_file(
                     problems.append(
                         "%s: top-level permission `%s: %s` is write-capable or unsupported"
                         % (label, scope, access))
+        env_lines = top_level.get("env")
+        env_present = any(re.match(r"^env:", line) for line in text.splitlines())
+        if env_present and (env_lines is None
+                or normalized_yaml_lines(env_lines) != SAFE_GITHUB_ENV):
+            problems.append(
+                "%s: top-level `env:` differs from the reviewed inert subset"
+                % label)
     for job, why in sorted(required.items()):
         if job not in blocks:
             problems.append(
@@ -485,6 +559,21 @@ def check_file(
         if label == ".gitlab-ci.yml":
             problems += check_gitlab_job_context(blocks[job], job, indent)
         executable = explicit_execution_values(blocks[job], indent, label)
+        if label == ".github/workflows/security.yml":
+            for action, inputs in github_action_steps(blocks[job], indent):
+                if action not in REVIEWED_GITHUB_ACTIONS:
+                    problems.append(
+                        "%s: job `%s` (%s) invokes unreviewed or mutable action `%s`"
+                        % (label, job, why, action))
+                    continue
+                expected_inputs = reviewed_action_inputs(job, action)
+                if (expected_inputs == {"scan-args": "*"}
+                        and set(inputs) != {"scan-args"}) or (
+                        expected_inputs != {"scan-args": "*"}
+                        and inputs != expected_inputs):
+                    problems.append(
+                        "%s: job `%s` action `%s` has unreviewed `with:` inputs"
+                        % (label, job, action))
         # A required verdict must be a direct command/action, not one operand
         # of a compound shell expression that can replace its exit status.
         def has_direct_entrypoint(pattern: re.Pattern[str]) -> bool:
@@ -537,6 +626,12 @@ def check_file(
                 problems.append(
                     "%s: job `%s` (%s) uses custom shell/defaults; the "
                     "supported subset requires the runner's fail-fast shell"
+                    % (label, job, why))
+            if (label == ".github/workflows/security.yml"
+                    and re.match(r"^(?:env|container|services):", value)):
+                problems.append(
+                    "%s: job `%s` (%s) uses environment/container/service "
+                    "context that can replace a required executable"
                     % (label, job, why))
             if re.match(r"^(?:if|rules|only|except|extends|inherit):", value) or value.startswith("<<:"):
                 problems.append(
