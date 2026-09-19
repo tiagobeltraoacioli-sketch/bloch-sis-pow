@@ -90,6 +90,9 @@ enum Cmd {
         message: String,
         /// The signature, hex-encoded.
         signature: String,
+        /// Require suite envelopes and canonical signature encoding.
+        #[arg(long)]
+        canonical: bool,
     },
     /// P4.3 — Create a signed selective-disclosure bundle (view/audit key).
     /// Prompts for the BIP39 seed phrase; discloses ONLY the given receive
@@ -395,7 +398,7 @@ pub fn main() {
             }
         }
 
-        Cmd::VerifyMessage { pubkey, message, signature } => {
+        Cmd::VerifyMessage { pubkey, message, signature, canonical } => {
             let pk = match hex::decode(&pubkey) {
                 Ok(b) => b,
                 Err(e) => { err(&format!("Invalid pubkey hex: {}", e)) }
@@ -406,7 +409,7 @@ pub fn main() {
             };
             // Same domain-separated digest `sign` uses — never hex-decode
             // `message` either; verification must mirror signing exactly.
-            if crate::wallet::Keypair::verify_message(&pk, message.as_bytes(), &sig) {
+            if verify_message_with_policy(&pk, message.as_bytes(), &sig, canonical) {
                 ok("signature verifies for this message and public key");
             } else {
                 err("signature does NOT verify for this message and public key");
@@ -427,6 +430,19 @@ fn verify_bundle_with_policy(
         bundle.verify_canonical()
     } else {
         bundle.verify()
+    }
+}
+
+fn verify_message_with_policy(
+    public_key: &[u8],
+    message: &[u8],
+    signature: &[u8],
+    canonical: bool,
+) -> bool {
+    if canonical {
+        crate::wallet::Keypair::verify_message_canonical(public_key, message, signature)
+    } else {
+        crate::wallet::Keypair::verify_message(public_key, message, signature)
     }
 }
 
@@ -524,6 +540,7 @@ mod audit_cli_input_tests {
     use super::*;
     use crate::address::{Address, Network};
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use sha3::{Digest, Sha3_256};
 
     #[test]
     fn cli_amount_refuses_nonfinite_negative_saturating_and_zero_payment() {
@@ -666,5 +683,85 @@ mod audit_cli_input_tests {
             verify_bundle_with_policy(&bundle, true),
             Err(crate::wallet::DisclosureError::SignatureInvalid { index: 0 })
         ));
+    }
+
+    #[test]
+    fn canonical_message_flag_routes_genuine_magic_prefixed_fixture() {
+        let default_cli = Cli::try_parse_from([
+            "postern-wallet",
+            "verify-message",
+            "00",
+            "wave-66-message",
+            "00",
+        ])
+        .unwrap();
+        assert!(matches!(
+            default_cli.cmd,
+            Cmd::VerifyMessage {
+                canonical: false,
+                ..
+            }
+        ));
+        let strict_cli = Cli::try_parse_from([
+            "postern-wallet",
+            "verify-message",
+            "00",
+            "wave-66-message",
+            "00",
+            "--canonical",
+        ])
+        .unwrap();
+        assert!(matches!(
+            strict_cli.cmd,
+            Cmd::VerifyMessage {
+                canonical: true,
+                ..
+            }
+        ));
+
+        const SEARCH_COUNTER: u64 = 44_970;
+        const SIGNING_SEED_HEX: &str =
+            "350dedd0a2e98668324887e0a2ee89384f8f4d4e4fba79224f3eba885ac2bd74";
+        let (enveloped_pk, enveloped_sk) =
+            crate::crypto::generate_keypair_from_seed(&[0x66; 32]).unwrap();
+        let mut h = Sha3_256::new();
+        h.update(b"bloch/wallet-message/cr10/signing-rng/v1");
+        h.update(SEARCH_COUNTER.to_le_bytes());
+        let signing_seed: [u8; 32] = h.finalize().into();
+        assert_eq!(hex::encode(signing_seed), SIGNING_SEED_HEX);
+
+        let message = b"wave-66-message";
+        let digest = crate::crypto::signed_message_digest(message);
+        let enveloped_sig = pqcrypto_internals::with_seeded_rng_scope(&signing_seed, || {
+            crate::crypto::sign(&enveloped_sk, &digest).unwrap()
+        });
+        assert!(verify_message_with_policy(
+            &enveloped_pk,
+            message,
+            &enveloped_sig,
+            false,
+        ));
+        assert!(verify_message_with_policy(
+            &enveloped_pk,
+            message,
+            &enveloped_sig,
+            true,
+        ));
+
+        let raw_pk = &enveloped_pk[crate::crypto::SUITE_HEADER_LEN..];
+        let raw_sig = &enveloped_sig[crate::crypto::SUITE_HEADER_LEN..];
+        assert_eq!(&raw_sig[..2], &[0xb1, 0x0c], "fixture must hit CR-10");
+        assert!(
+            !crate::crypto::verify(raw_pk, &digest, raw_sig),
+            "generic autodetection must misclassify this genuine raw signature"
+        );
+        assert!(
+            verify_message_with_policy(raw_pk, message, raw_sig, false),
+            "compatible wallet policy must use the explicit raw format first"
+        );
+        assert!(
+            !verify_message_with_policy(raw_pk, message, raw_sig, true),
+            "canonical product policy must reject legacy raw records"
+        );
     }
 }

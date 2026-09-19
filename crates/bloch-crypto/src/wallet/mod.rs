@@ -738,10 +738,24 @@ impl Keypair {
     }
 
     /// Verify a signature produced by [`Self::sign_message`] over `message`
-    /// under public key `pk`.
+    /// under public key `pk` while preserving historical wallet compatibility.
+    ///
+    /// Known enveloped and raw-hybrid pairs are tried through their explicit
+    /// format APIs first. The generic verifier remains a final fallback for
+    /// older mixed envelope/raw records whose storage metadata was not retained.
     pub fn verify_message(pk: &[u8], message: &[u8], sig: &[u8]) -> bool {
         let digest = crypto::signed_message_digest(message);
-        crypto::verify(pk, &digest, sig)
+        crypto::verify_enveloped(pk, &digest, sig)
+            || crypto::verify_legacy_hybrid_raw(pk, &digest, sig)
+            || crypto::verify(pk, &digest, sig)
+    }
+
+    /// Verify a newly-issued wallet message using the strict modern policy.
+    /// Both objects must carry suite envelopes and the signature encoding must
+    /// be canonical; legacy raw and mixed-format records are rejected.
+    pub fn verify_message_canonical(pk: &[u8], message: &[u8], sig: &[u8]) -> bool {
+        let digest = crypto::signed_message_digest(message);
+        crypto::verify_enveloped_canonical(pk, &digest, sig)
     }
 
     pub fn address_bytes(&self) -> Vec<u8> {
