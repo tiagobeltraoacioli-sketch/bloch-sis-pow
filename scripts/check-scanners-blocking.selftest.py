@@ -36,6 +36,22 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CHECKER = os.path.join(HERE, "check-scanners-blocking.py")
+TRACKED_LOCKFILES = (
+    "Cargo.lock",
+    "crates/coherence-prover/program/Cargo.lock",
+    "crates/coherence-prover/script/Cargo.lock",
+    "crates/coherence-prover/service/Cargo.lock",
+    "euvm-tooling/Cargo.lock",
+    "fuzz/Cargo.lock",
+    "pool-proxy/Cargo.lock",
+    "pool/Cargo.lock",
+    "services/pq-shield-api/Cargo.lock",
+    "spikes/prover-cost/Cargo.lock",
+    "spikes/prover-cost/rv32/Cargo.lock",
+    "spikes/prover-cost/rv32f/Cargo.lock",
+    "spikes/prover-cost/rv32h/Cargo.lock",
+    "spikes/prover-cost/rv32k/Cargo.lock",
+)
 
 GOOD_GITLAB = """\
 stages:
@@ -179,12 +195,14 @@ jobs:
 
 
 class Case:
-    def __init__(self, name, gitlab, github, *, must_fail, expect=""):
+    def __init__(self, name, gitlab, github, *, must_fail, expect="",
+                 tracked_lockfiles=TRACKED_LOCKFILES):
         self.name = name
         self.gitlab = gitlab
         self.github = github
         self.must_fail = must_fail
         self.expect = expect
+        self.tracked_lockfiles = tracked_lockfiles
 
 
 def sub(text: str, old: str, new: str) -> str:
@@ -295,6 +313,25 @@ CASES = [
              "      - name: --config=osv-scanner.toml\n"
              "        run: echo decoy"),
          must_fail=True, expect="exact reviewed config and complete lockfile scan scope"),
+
+    Case("new tracked lockfile fails until OSV scope includes it",
+         GOOD_GITLAB, GOOD_GITHUB, must_fail=True,
+         expect="exact reviewed config and complete lockfile scan scope",
+         tracked_lockfiles=TRACKED_LOCKFILES + ("future/Cargo.lock",)),
+
+    Case("stale untracked lockfile cannot remain in OSV scope",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "            --lockfile=spikes/prover-cost/rv32k/Cargo.lock",
+             "            --lockfile=spikes/prover-cost/rv32k/Cargo.lock\n"
+             "            --lockfile=retired/Cargo.lock"),
+         must_fail=True, expect="exact reviewed config and complete lockfile scan scope"),
+
+    Case("CI guard invocation cannot inject a lockfile fixture",
+         GOOD_GITLAB.replace(
+             "    - python3 scripts/check-scanners-blocking.py",
+             "    - python3 scripts/check-scanners-blocking.py --tracked-lockfiles=decoy"),
+         GOOD_GITHUB, must_fail=True, expect="no longer executes its required verdict"),
 
     Case("gitlab job name cannot replace the scanner verdict",
          GOOD_GITLAB.replace(
@@ -454,6 +491,7 @@ CASES = [
 def run(case: Case, tmp: str) -> tuple[int, str]:
     gl = os.path.join(tmp, "gitlab-ci.yml")
     gh = os.path.join(tmp, "security.yml")
+    tracked = os.path.join(tmp, "tracked-lockfiles.txt")
     for path, body in ((gl, case.gitlab), (gh, case.github)):
         if body is None:
             if os.path.exists(path):
@@ -461,8 +499,11 @@ def run(case: Case, tmp: str) -> tuple[int, str]:
             continue
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(body)
+    with open(tracked, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(case.tracked_lockfiles) + "\n")
     proc = subprocess.run(
-        [sys.executable, CHECKER, "--gitlab", gl, "--github", gh],
+        [sys.executable, CHECKER, "--gitlab", gl, "--github", gh,
+         "--tracked-lockfiles", tracked],
         capture_output=True, text=True)
     return proc.returncode, proc.stdout + proc.stderr
 

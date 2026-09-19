@@ -49,6 +49,8 @@ security job, fails if the job:
     and GitHub step `run:`/`uses:` fields, never names, comments or variables.
   * makes the GitHub OSV verdict mutable by replacing its full commit pin with
     a tag/branch, or removes this guard's own adversarial self-test.
+  * lets the GitHub OSV lockfile scope drift from the complete set of tracked
+    `Cargo.lock` files in either direction.
 
 It does NOT require every job to be blocking. cargo-geiger, miri and the fuzz
 smoke are deliberately report-only, with written reasons, and stay green here.
@@ -60,7 +62,7 @@ job is refused, even a plausible-looking one. There is no legitimate reason
 for a blocking gate to hand-roll a success exit, and a guard that tries to tell
 a good early-exit from a bad one is a guard that can be talked around.
 
-Pure Python 3. No toolchain, no build, no network.
+Python 3 plus the local Git index. No toolchain, build or network.
 
 Run: python3 scripts/check-scanners-blocking.py
 Exit 0 = the supported explicit job subset can still fail on every registered
@@ -74,6 +76,7 @@ import argparse
 import os
 import re
 import shlex
+import subprocess
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -111,7 +114,7 @@ GITLAB_VERDICTS = {
     "secret-history-scan": re.compile(r"^bash\s+scripts/scan-secrets\.sh\s+history(?:\s|$)"),
     "cargo-audit": re.compile(r"^bash\s+scripts/audit-all-lockfiles\.sh(?:\s|$)"),
     "supply-chain": re.compile(r"^cargo\s+deny\s+check\s+advisories\s+bans\s+licenses\s+sources(?:\s|$)"),
-    "scanners-blocking-guard": re.compile(r"^python3\s+scripts/check-scanners-blocking\.py(?:\s|$)"),
+    "scanners-blocking-guard": re.compile(r"^python3\s+scripts/check-scanners-blocking\.py$"),
     "rollback-package-integrity": re.compile(r"^bash\s+deploy/rollback/make-rollback-package\.selftest\.sh(?:\s|$)"),
 }
 GITHUB_VERDICTS = {
@@ -126,25 +129,8 @@ GITHUB_VERDICTS = {
 }
 SELFTEST_VERDICTS = {
     "scanners-blocking-guard": re.compile(
-        r"^python3\s+scripts/check-scanners-blocking\.selftest\.py(?:\s|$)"),
+        r"^python3\s+scripts/check-scanners-blocking\.selftest\.py$"),
 }
-OSV_REQUIRED_SCAN_ARGS = (
-    "--config=osv-scanner.toml",
-    "--lockfile=Cargo.lock",
-    "--lockfile=pool/Cargo.lock",
-    "--lockfile=pool-proxy/Cargo.lock",
-    "--lockfile=services/pq-shield-api/Cargo.lock",
-    "--lockfile=euvm-tooling/Cargo.lock",
-    "--lockfile=crates/coherence-prover/script/Cargo.lock",
-    "--lockfile=crates/coherence-prover/service/Cargo.lock",
-    "--lockfile=crates/coherence-prover/program/Cargo.lock",
-    "--lockfile=fuzz/Cargo.lock",
-    "--lockfile=spikes/prover-cost/Cargo.lock",
-    "--lockfile=spikes/prover-cost/rv32/Cargo.lock",
-    "--lockfile=spikes/prover-cost/rv32f/Cargo.lock",
-    "--lockfile=spikes/prover-cost/rv32h/Cargo.lock",
-    "--lockfile=spikes/prover-cost/rv32k/Cargo.lock",
-)
 
 SHELL_ESCAPES = (
     (re.compile(r"(^|[;&|\s])exit\s+0\b"), "an `exit 0` escape (the silent skip)"),
@@ -294,7 +280,53 @@ def github_action_input(
     return None
 
 
-def check_file(path: str, required: dict[str, str], indent: int, label: str) -> list[str]:
+def tracked_lockfiles(manifest: str | None) -> tuple[list[str], str | None]:
+    """Return the canonical tracked Cargo.lock set, or a fail-closed error.
+
+    The manifest seam exists only for adversarial self-tests. Checked-in CI is
+    constrained to the argument-free guard invocation and therefore always
+    reads the repository index directly.
+    """
+    if manifest is not None:
+        try:
+            with open(manifest, encoding="utf-8") as fh:
+                values = fh.read().splitlines()
+        except OSError as exc:
+            return [], "cannot read tracked-lockfile fixture: %s" % exc
+    else:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", REPO, "ls-files", "-z", "--", "Cargo.lock",
+                 ":(glob)**/Cargo.lock"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        except OSError as exc:
+            return [], "cannot execute git for tracked lockfile discovery: %s" % exc
+        if proc.returncode != 0:
+            return [], "git tracked-lockfile discovery failed"
+        try:
+            values = [item for item in proc.stdout.decode("utf-8").split("\0") if item]
+        except UnicodeDecodeError:
+            return [], "git returned a non-UTF-8 tracked lockfile path"
+
+    if not values:
+        return [], "tracked Cargo.lock set is empty"
+    if len(values) != len(set(values)):
+        return [], "tracked Cargo.lock set contains duplicates"
+    for value in values:
+        parts = value.split("/")
+        if (not value or value.startswith("/") or ".." in parts
+                or parts[-1] != "Cargo.lock"):
+            return [], "invalid tracked Cargo.lock path: %r" % value
+    return sorted(values), None
+
+
+def check_file(
+    path: str,
+    required: dict[str, str],
+    indent: int,
+    label: str,
+    tracked: list[str],
+) -> list[str]:
     if not os.path.exists(path):
         return ["%s: MISSING — the pipeline definition itself is gone" % label]
     text = open(path, encoding="utf-8").read()
@@ -385,8 +417,10 @@ def check_file(path: str, required: dict[str, str], indent: int, label: str) -> 
                 tokens = shlex.split(scan_args, comments=True) if scan_args is not None else []
             except ValueError:
                 tokens = []
-            if (len(tokens) != len(OSV_REQUIRED_SCAN_ARGS)
-                    or set(tokens) != set(OSV_REQUIRED_SCAN_ARGS)):
+            required_args = ["--config=osv-scanner.toml"] + [
+                "--lockfile=" + path for path in tracked]
+            if (len(tokens) != len(required_args)
+                    or set(tokens) != set(required_args)):
                 problems.append(
                     "%s: job `%s` must give the pinned action the exact reviewed "
                     "config and complete lockfile scan scope"
@@ -448,11 +482,15 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--gitlab", default=os.path.join(REPO, ".gitlab-ci.yml"))
     ap.add_argument("--github", default=os.path.join(REPO, ".github/workflows/security.yml"))
+    ap.add_argument("--tracked-lockfiles", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     problems = []
-    problems += check_file(args.gitlab, GITLAB_REQUIRED, 0, ".gitlab-ci.yml")
-    problems += check_file(args.github, GITHUB_REQUIRED, 2, ".github/workflows/security.yml")
+    tracked, discovery_error = tracked_lockfiles(args.tracked_lockfiles)
+    if discovery_error is not None:
+        problems.append("repository index: " + discovery_error)
+    problems += check_file(args.gitlab, GITLAB_REQUIRED, 0, ".gitlab-ci.yml", tracked)
+    problems += check_file(args.github, GITHUB_REQUIRED, 2, ".github/workflows/security.yml", tracked)
 
     if problems:
         print("scanner-posture guard: FAIL — %d problem(s)\n" % len(problems))
