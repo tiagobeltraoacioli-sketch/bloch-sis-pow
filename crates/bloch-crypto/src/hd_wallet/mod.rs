@@ -218,7 +218,7 @@ impl HdWallet {
             .map_err(|e| format!("mnemonic generation failed: {}", e))?;
 
         // New wallets use the v2 per-wallet salt (v3 files keep it).
-        let master_key = derive_master_key(&mnemonic.to_string(), passphrase.unwrap_or(""), password, WALLET_VERSION)?;
+        let mut master_key = derive_master_key(&mnemonic.to_string(), passphrase.unwrap_or(""), password, WALLET_VERSION)?;
 
         // Address 0 is DERIVED from the seed, so the mnemonic recovers it.
         let seed = mnemonic.to_seed(passphrase.unwrap_or("")).to_vec();
@@ -227,12 +227,12 @@ impl HdWallet {
 
         Ok(HdWallet {
             mnemonic,
-            master_key,
             seed,
             addresses: vec![(0, kp, "primary".to_string())],
             imported: BTreeSet::new(),
             network,
             file_version: WALLET_VERSION,
+            master_key: std::mem::take(&mut *master_key),
         })
     }
 
@@ -252,7 +252,7 @@ impl HdWallet {
         if count > 4096 { return Err("recovery count exceeds 4096 addresses per request".into()); }
         let mnemonic = Mnemonic::parse(mnemonic_str)
             .map_err(|e| format!("invalid mnemonic: {}", e))?;
-        let master_key = derive_master_key(&mnemonic.to_string(), passphrase.unwrap_or(""), password, WALLET_VERSION)?;
+        let mut master_key = derive_master_key(&mnemonic.to_string(), passphrase.unwrap_or(""), password, WALLET_VERSION)?;
         let seed = mnemonic.to_seed(passphrase.unwrap_or("")).to_vec();
 
         let mut addresses = Vec::with_capacity(count.max(1) as usize);
@@ -263,12 +263,12 @@ impl HdWallet {
 
         Ok(HdWallet {
             mnemonic,
-            master_key,
             seed,
             addresses,
             imported: BTreeSet::new(),
             network: if testnet { "testnet" } else { "mainnet" }.to_string(),
             file_version: WALLET_VERSION,
+            master_key: std::mem::take(&mut *master_key),
         })
     }
 
@@ -454,7 +454,7 @@ impl HdWallet {
 
         // Derive master key — route the salt by the file's version (v1 legacy
         // constant salt, v2+ per-wallet), so existing wallets still decrypt.
-        let mut master_key = Zeroizing::new(derive_master_key(&canonical_mnemonic, passphrase.unwrap_or(""), password, wallet.version)?);
+        let mut master_key = derive_master_key(&canonical_mnemonic, passphrase.unwrap_or(""), password, wallet.version)?;
 
         // Verify mnemonic matches (by decrypting and comparing). Wrapped in
         // Zeroizing (A4 lows): this plaintext carries the full mnemonic in
@@ -507,10 +507,10 @@ impl HdWallet {
         // was derived under `wallet.version`'s salt, so `save()` must write
         // that SAME version back, not the current `WALLET_VERSION`.
         Ok(HdWallet {
-            mnemonic, master_key: std::mem::take(&mut *master_key),
-            seed: std::mem::take(&mut *seed), addresses, imported,
+            mnemonic, seed: std::mem::take(&mut *seed), addresses, imported,
             network: wallet.network,
             file_version: wallet.version,
+            master_key: std::mem::take(&mut *master_key),
         })
     }
 
@@ -950,7 +950,7 @@ fn derive_at(seed: &[u8], index: u32, testnet: bool) -> Result<Keypair, String> 
 
 /// Derive the master encryption key from mnemonic + passphrase + password.
 /// This is what locks/unlocks the wallet file.
-fn derive_master_key(mnemonic: &str, passphrase: &str, password: &str, version: u32) -> Result<Vec<u8>, String> {
+fn derive_master_key(mnemonic: &str, passphrase: &str, password: &str, version: u32) -> Result<Zeroizing<Vec<u8>>, String> {
     // Combine mnemonic + passphrase + password into the KDF input
     let mut combined = Zeroizing::new(Vec::with_capacity(mnemonic.len() + passphrase.len() + password.len() + 2));
     combined.extend_from_slice(mnemonic.as_bytes());
@@ -975,7 +975,7 @@ fn derive_master_key(mnemonic: &str, passphrase: &str, password: &str, version: 
 
     let params = Params::new(262144, 4, 4, Some(32)).map_err(|e| e.to_string())?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut key = vec![0u8; 32];
+    let mut key = Zeroizing::new(vec![0u8; 32]);
     argon2.hash_password_into(&combined, &salt, &mut key).map_err(|e| e.to_string())?;
     Ok(key)
 }
@@ -1047,6 +1047,39 @@ fn decrypt_ciphertext_in_place(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn master_key_kdf_output_has_zeroizing_ownership_and_stable_bytes() {
+        let _: fn(&str, &str, &str, u32) -> Result<Zeroizing<Vec<u8>>, String> =
+            derive_master_key;
+        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
+
+        for (version, expected) in [
+            (1, [
+                0x39, 0x75, 0x17, 0x67, 0xd6, 0xcf, 0xce, 0x34,
+                0xc3, 0x95, 0xa8, 0x8b, 0x29, 0xe0, 0x09, 0x3e,
+                0x35, 0xc7, 0x55, 0x88, 0x0e, 0x43, 0x2c, 0x53,
+                0xa1, 0x3a, 0x2c, 0x95, 0x7d, 0xe0, 0xd6, 0x9f,
+            ]),
+            (3, [
+                0x46, 0x6d, 0x53, 0x4b, 0xa5, 0x2c, 0xd8, 0x6a,
+                0x66, 0xa9, 0x3f, 0xf2, 0x67, 0x87, 0x40, 0xb6,
+                0x81, 0xda, 0x41, 0x05, 0x87, 0x37, 0x8d, 0x38,
+                0xf0, 0x5a, 0x5a, 0xb3, 0x68, 0x65, 0x72, 0x1a,
+            ]),
+        ] {
+            let mut key = derive_master_key(
+                "synthetic mnemonic material",
+                "synthetic passphrase",
+                "synthetic password",
+                version,
+            )
+            .unwrap();
+            assert_eq!(&key[..], &expected);
+            key.zeroize();
+            assert!(key.iter().all(|byte| *byte == 0));
+        }
+    }
 
     #[test]
     fn create_save_load_roundtrip() {
