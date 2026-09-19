@@ -27,6 +27,7 @@ use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, KeyInit}};
 use argon2::{Argon2, Algorithm, Version, Params};
 use base64::{Engine as _, engine::general_purpose as b64};
 use rand::RngCore;
+use std::borrow::Cow;
 use std::path::Path;
 use std::collections::BTreeSet;
 use bip39::Mnemonic;
@@ -101,6 +102,39 @@ struct MnemonicPayload { mnemonic: String }
 
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 struct KeypairPayload { private_key_hex: String, public_key_hex: String }
+
+/// Borrow ordinary unescaped secrets directly from their zeroizing decrypted
+/// plaintext buffers. `Cow` retains compatibility with equivalent JSON that
+/// uses escapes; owned secret fallbacks are wiped on drop.
+#[derive(Deserialize)]
+struct BorrowedMnemonicPayload<'a> {
+    #[serde(borrow)]
+    mnemonic: Cow<'a, str>,
+}
+
+impl Drop for BorrowedMnemonicPayload<'_> {
+    fn drop(&mut self) {
+        if let Cow::Owned(mnemonic) = &mut self.mnemonic {
+            mnemonic.zeroize();
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct BorrowedKeypairPayload<'a> {
+    #[serde(borrow)]
+    private_key_hex: Cow<'a, str>,
+    #[serde(borrow)]
+    public_key_hex: Cow<'a, str>,
+}
+
+impl Drop for BorrowedKeypairPayload<'_> {
+    fn drop(&mut self) {
+        if let Cow::Owned(private_key_hex) = &mut self.private_key_hex {
+            private_key_hex.zeroize();
+        }
+    }
+}
 
 // ── HD Wallet type ───────────────────────────────────────────────────────────
 
@@ -416,18 +450,19 @@ impl HdWallet {
         // Parse mnemonic
         let mnemonic = Mnemonic::parse(mnemonic_str)
             .map_err(|e| format!("invalid mnemonic: {}", e))?;
+        let canonical_mnemonic = Zeroizing::new(mnemonic.to_string());
 
         // Derive master key — route the salt by the file's version (v1 legacy
         // constant salt, v2+ per-wallet), so existing wallets still decrypt.
-        let mut master_key = Zeroizing::new(derive_master_key(&mnemonic.to_string(), passphrase.unwrap_or(""), password, wallet.version)?);
+        let mut master_key = Zeroizing::new(derive_master_key(&canonical_mnemonic, passphrase.unwrap_or(""), password, wallet.version)?);
 
         // Verify mnemonic matches (by decrypting and comparing). Wrapped in
         // Zeroizing (A4 lows): this plaintext carries the full mnemonic in
         // JSON form and must not linger in memory after the comparison below.
         let mnemonic_bytes = Zeroizing::new(decrypt_with_key(&master_key, &wallet.mnemonic_crypto)?);
-        let payload: MnemonicPayload = serde_json::from_slice(&mnemonic_bytes)
+        let payload: BorrowedMnemonicPayload<'_> = serde_json::from_slice(&mnemonic_bytes)
             .map_err(|e| format!("mnemonic decrypt failed — wrong password/passphrase/mnemonic ({})", e))?;
-        if payload.mnemonic != mnemonic.to_string() {
+        if payload.mnemonic.as_ref() != canonical_mnemonic.as_str() {
             return Err("mnemonic mismatch — tampered file?".into());
         }
 
@@ -441,11 +476,10 @@ impl HdWallet {
             // Zeroizing (A4 lows): plaintext JSON containing the hex-encoded
             // private key — must not survive past the parse below.
             let bytes = Zeroizing::new(decrypt_with_key(&master_key, &addr.keypair_crypto)?);
-            let mut kpp: KeypairPayload = serde_json::from_slice(&bytes)
+            let kpp: BorrowedKeypairPayload<'_> = serde_json::from_slice(&bytes)
                 .map_err(|e| format!("keypair {} decrypt failed: {}", addr.index, e))?;
-            let mut priv_key = Zeroizing::new(hex::decode(&kpp.private_key_hex).map_err(|e| e.to_string())?);
-            let pub_key  = hex::decode(&kpp.public_key_hex).map_err(|e| e.to_string())?;
-            kpp.zeroize();
+            let mut priv_key = Zeroizing::new(hex::decode(kpp.private_key_hex.as_ref()).map_err(|e| e.to_string())?);
+            let pub_key  = hex::decode(kpp.public_key_hex.as_ref()).map_err(|e| e.to_string())?;
 
             let testnet = addr.address.starts_with(TESTNET_PREFIX);
             // NB: local, not `addr.derived` — this is the recomputed address string.
@@ -1571,6 +1605,55 @@ mod audit_wallet_boundaries {
         assert_eq!(loaded.2.as_ptr(), label_pointer);
         assert_eq!(loaded.1.private_key, vec![1, 2]);
         assert_eq!(loaded.1.public_key, vec![3, 4]);
+    }
+
+    #[test]
+    fn decrypted_secret_strings_borrow_plaintext_and_preserve_escaped_json() {
+        let mnemonic_plaintext = Zeroizing::new(serde_json::to_vec(&MnemonicPayload {
+            mnemonic: "alpha beta gamma".into(),
+        }).unwrap());
+        let mnemonic: BorrowedMnemonicPayload<'_> =
+            serde_json::from_slice(&mnemonic_plaintext).unwrap();
+        assert!(matches!(&mnemonic.mnemonic, Cow::Borrowed(_)));
+        let mnemonic_pointer = mnemonic.mnemonic.as_ptr() as usize;
+        let mnemonic_start = mnemonic_plaintext.as_ptr() as usize;
+        assert!(mnemonic_pointer >= mnemonic_start);
+        assert!(mnemonic_pointer < mnemonic_start + mnemonic_plaintext.len());
+        drop(mnemonic);
+
+        let plaintext = Zeroizing::new(serde_json::to_vec(&KeypairPayload {
+            private_key_hex: "a1b2c3d4".into(),
+            public_key_hex: "01020304".into(),
+        }).unwrap());
+        let parsed: BorrowedKeypairPayload<'_> = serde_json::from_slice(&plaintext).unwrap();
+        assert!(matches!(&parsed.private_key_hex, Cow::Borrowed(_)));
+        assert!(matches!(&parsed.public_key_hex, Cow::Borrowed(_)));
+        let private_pointer = parsed.private_key_hex.as_ptr() as usize;
+        let plaintext_start = plaintext.as_ptr() as usize;
+        assert!(private_pointer >= plaintext_start);
+        assert!(private_pointer < plaintext_start + plaintext.len());
+        assert_eq!(hex::decode(parsed.private_key_hex.as_ref()).unwrap(), [0xa1, 0xb2, 0xc3, 0xd4]);
+        drop(parsed);
+
+        // Serde must allocate to unescape this equivalent historical shape.
+        // Keeping Cow's owned path preserves it, while Drop wipes the owned
+        // private string instead of leaving the compatibility copy behind.
+        let escaped = br#"{
+            "private_key_hex":"\u0061\u0062",
+            "public_key_hex":"\u0063\u0064"
+        }"#;
+        let escaped_parsed: BorrowedKeypairPayload<'_> =
+            serde_json::from_slice(escaped).unwrap();
+        assert!(matches!(&escaped_parsed.private_key_hex, Cow::Owned(_)));
+        assert!(matches!(&escaped_parsed.public_key_hex, Cow::Owned(_)));
+        assert_eq!(hex::decode(escaped_parsed.private_key_hex.as_ref()).unwrap(), [0xab]);
+        assert_eq!(hex::decode(escaped_parsed.public_key_hex.as_ref()).unwrap(), [0xcd]);
+
+        let escaped_mnemonic: BorrowedMnemonicPayload<'_> = serde_json::from_slice(
+            br#"{"mnemonic":"alpha\u0020beta"}"#,
+        ).unwrap();
+        assert!(matches!(&escaped_mnemonic.mnemonic, Cow::Owned(_)));
+        assert_eq!(escaped_mnemonic.mnemonic.as_ref(), "alpha beta");
     }
 
     #[test]
