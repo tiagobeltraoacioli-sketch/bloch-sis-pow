@@ -108,9 +108,19 @@ enum Cmd {
         output: PathBuf,
     },
     /// Verify a disclosure bundle OFFLINE (no node needed)
-    VerifyBundle { bundle: PathBuf },
+    VerifyBundle {
+        bundle: PathBuf,
+        /// Require suite envelopes and canonical Falcon encoding.
+        #[arg(long)]
+        canonical: bool,
+    },
     /// Watch-only audit: verify a bundle, then sum balances over its addresses
-    Watch { bundle: PathBuf },
+    Watch {
+        bundle: PathBuf,
+        /// Require suite envelopes and canonical Falcon encoding.
+        #[arg(long)]
+        canonical: bool,
+    },
 }
 
 pub fn main() {
@@ -296,6 +306,9 @@ pub fn main() {
                 Ok(b) => b,
                 Err(e) => { err(&format!("Disclosure failed: {}", e)) }
             };
+            if let Err(e) = bundle.verify_canonical() {
+                err(&format!("Disclosure canonical self-check failed: {}", e));
+            }
 
             let json = serde_json::to_string_pretty(&bundle).unwrap();
             match crate::util::atomic_write(&output, json.as_bytes()) {
@@ -314,8 +327,8 @@ pub fn main() {
             }
         }
 
-        Cmd::VerifyBundle { bundle } => {
-            let verified = load_and_verify_bundle(&bundle);
+        Cmd::VerifyBundle { bundle, canonical } => {
+            let verified = load_and_verify_bundle(&bundle, canonical);
             ok("bundle signatures + address bindings verified");
             println!();
             label("network",  &format!("{:?}", verified.network));
@@ -332,8 +345,8 @@ pub fn main() {
             println!("  {}Check the audience field names YOU before trusting the bundle.{}", DIM, RESET);
         }
 
-        Cmd::Watch { bundle } => {
-            let verified = load_and_verify_bundle(&bundle);
+        Cmd::Watch { bundle, canonical } => {
+            let verified = load_and_verify_bundle(&bundle, canonical);
             ok(&format!("bundle verified — {} address(es)", verified.addresses.len()));
             println!();
 
@@ -406,7 +419,21 @@ pub fn main() {
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
-fn load_and_verify_bundle(path: &PathBuf) -> crate::wallet::VerifiedDisclosure {
+fn verify_bundle_with_policy(
+    bundle: &crate::wallet::DisclosureBundle,
+    canonical: bool,
+) -> Result<crate::wallet::VerifiedDisclosure, crate::wallet::DisclosureError> {
+    if canonical {
+        bundle.verify_canonical()
+    } else {
+        bundle.verify()
+    }
+}
+
+fn load_and_verify_bundle(
+    path: &PathBuf,
+    canonical: bool,
+) -> crate::wallet::VerifiedDisclosure {
     let json = match std::fs::read_to_string(path) {
         Ok(j) => j,
         Err(e) => { err(&format!("Cannot read bundle: {}", e)) }
@@ -415,7 +442,7 @@ fn load_and_verify_bundle(path: &PathBuf) -> crate::wallet::VerifiedDisclosure {
         Ok(b) => b,
         Err(e) => { err(&format!("Bundle parse failed: {}", e)) }
     };
-    match bundle.verify() {
+    match verify_bundle_with_policy(&bundle, canonical) {
         Ok(v) => v,
         Err(e) => { err(&format!("Bundle verification FAILED: {}", e)) }
     }
@@ -496,6 +523,7 @@ fn parse_send_utxos(response: &serde_json::Value) -> Result<Vec<(Vec<u8>, u32, c
 mod audit_cli_input_tests {
     use super::*;
     use crate::address::{Address, Network};
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 
     #[test]
     fn cli_amount_refuses_nonfinite_negative_saturating_and_zero_payment() {
@@ -546,5 +574,97 @@ mod audit_cli_input_tests {
         let mut bad = row; bad["txid"] = serde_json::json!("ab");
         assert!(parse_send_utxos(&serde_json::json!({"utxos": [bad]})).is_err());
         assert!(parse_send_utxos(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn canonical_bundle_flag_is_opt_in_and_rejects_raw_signature_fallback() {
+        let default_cli = Cli::try_parse_from([
+            "postern-wallet",
+            "verify-bundle",
+            "disclosure.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            default_cli.cmd,
+            Cmd::VerifyBundle {
+                canonical: false,
+                ..
+            }
+        ));
+        let strict_cli = Cli::try_parse_from([
+            "postern-wallet",
+            "verify-bundle",
+            "disclosure.json",
+            "--canonical",
+        ])
+        .unwrap();
+        assert!(matches!(
+            strict_cli.cmd,
+            Cmd::VerifyBundle {
+                canonical: true,
+                ..
+            }
+        ));
+        let default_watch = Cli::try_parse_from([
+            "postern-wallet",
+            "watch",
+            "disclosure.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            default_watch.cmd,
+            Cmd::Watch {
+                canonical: false,
+                ..
+            }
+        ));
+        let strict_watch = Cli::try_parse_from([
+            "postern-wallet",
+            "watch",
+            "disclosure.json",
+            "--canonical",
+        ])
+        .unwrap();
+        assert!(matches!(
+            strict_watch.cmd,
+            Cmd::Watch {
+                canonical: true,
+                ..
+            }
+        ));
+
+        let seed = [62u8; 64];
+        let mut bundle = (0..8)
+            .map(|_| {
+                crate::wallet::DisclosureBundle::create(
+                    &seed,
+                    &[0],
+                    Network::Testnet,
+                    "wave-62 product policy",
+                    "release auditor",
+                )
+                .unwrap()
+            })
+            .find(|candidate| {
+                let signature = B64.decode(&candidate.entries[0].sig_b64).unwrap();
+                !signature[crate::crypto::SUITE_HEADER_LEN..].starts_with(&[0xb1, 0x0c])
+            })
+            .expect("fixture signature body must not mimic the suite magic");
+
+        assert!(verify_bundle_with_policy(&bundle, false).is_ok());
+        assert!(verify_bundle_with_policy(&bundle, true).is_ok());
+        let signature = B64.decode(&bundle.entries[0].sig_b64).unwrap();
+        bundle.entries[0].sig_b64 = B64.encode(
+            &signature[crate::crypto::SUITE_HEADER_LEN..],
+        );
+
+        assert!(
+            verify_bundle_with_policy(&bundle, false).is_ok(),
+            "default CLI policy must preserve historical raw fallback"
+        );
+        assert!(matches!(
+            verify_bundle_with_policy(&bundle, true),
+            Err(crate::wallet::DisclosureError::SignatureInvalid { index: 0 })
+        ));
     }
 }
