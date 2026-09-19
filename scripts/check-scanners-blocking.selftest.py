@@ -825,6 +825,27 @@ CASES = [
              "  cargo-audit:\n    'permissions':\n      contents: write\n    runs-on: ubuntu-latest"),
          must_fail=True, expect="job-level permissions override"),
 
+    Case("required scanner cannot depend on a skipped decoy job",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "jobs:\n  clippy-hardened:\n",
+             "jobs:\n"
+             "  bypass-prerequisite:\n"
+             "    if: ${{ false }}\n"
+             "    runs-on: ubuntu-latest\n"
+             "    steps:\n"
+             "      - run: true\n\n"
+             "  clippy-hardened:\n"
+             "    'needs': bypass-prerequisite\n"),
+         must_fail=True, expect="dependency that can skip the required gate"),
+
+    Case("required scanner cannot move to an unreviewed runner",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  cargo-audit:\n    runs-on: ubuntu-latest",
+             "  cargo-audit:\n    runs-on: [self-hosted, attacker-controlled]"),
+         must_fail=True, expect="reviewed `ubuntu-latest` runner"),
+
     Case("or-true masks a scanner verdict",
          GOOD_GITLAB.replace("bash scripts/audit-all-lockfiles.sh", "bash scripts/audit-all-lockfiles.sh || true"),
          GOOD_GITHUB, must_fail=True, expect="shell-success masking"),

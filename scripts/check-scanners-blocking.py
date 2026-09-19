@@ -44,6 +44,8 @@ security job, fails if the job:
     substitutes the privileged `pull_request_target` event.
   * removes the explicit read-only GitHub token posture or adds a job-level
     permission override to a required scanner.
+  * moves a required GitHub job off `ubuntu-latest`, or gives it a `needs:`
+    dependency whose skipped/failing result can suppress the required job.
   * keeps the job name but removes/replaces its actual scanner or guard
     command. Evidence is accepted only from explicit GitLab `script:` items
     and GitHub step `run:`/`uses:` fields, never names, comments or variables.
@@ -532,6 +534,31 @@ def protected_global_key_problems(
     return []
 
 
+def github_job_authority_problems(
+    body: list[str], job: str, indent: int, label: str
+) -> list[str]:
+    """Bind runner selection and forbid dependency-based job skipping."""
+    direct = [
+        re.sub(r"\s+#.*$", "", line.strip())
+        for line in body
+        if len(line) - len(line.lstrip(" ")) == indent + 2
+    ]
+    runners = [
+        line for line in direct
+        if re.match(r"^(?:['\"]?)runs-on(?:['\"]?)\s*:", line)
+    ]
+    problems = []
+    if runners != ["runs-on: ubuntu-latest"]:
+        problems.append(
+            "%s: job `%s` must select exactly the reviewed `ubuntu-latest` runner"
+            % (label, job))
+    if any(re.match(r"^(?:['\"]?)needs(?:['\"]?)\s*:", line) for line in direct):
+        problems.append(
+            "%s: job `%s` has a `needs:` dependency that can skip the required gate"
+            % (label, job))
+    return problems
+
+
 def check_gitlab_global_context(text: str, blocks: dict[str, list[str]]) -> list[str]:
     """Restrict inherited GitLab execution context to the reviewed subset."""
     problems = []
@@ -715,6 +742,8 @@ def check_file(
         verdicts = GITLAB_VERDICTS if label == ".gitlab-ci.yml" else GITHUB_VERDICTS
         if label == ".gitlab-ci.yml":
             problems += check_gitlab_job_context(blocks[job], job, indent)
+        else:
+            problems += github_job_authority_problems(blocks[job], job, indent, label)
         executable = explicit_execution_values(blocks[job], indent, label)
         if label == ".github/workflows/security.yml":
             runs = tuple(github_run_values(blocks[job], indent))

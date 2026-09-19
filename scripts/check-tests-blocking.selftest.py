@@ -261,6 +261,28 @@ CASES = [
              "  cargo-test:\n    'permissions':\n      contents: write\n    runs-on: ubuntu-latest"),
          must_fail=True, expect="job-level permissions override"),
 
+    Case("GitHub cargo test cannot depend on a skipped decoy job",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "jobs:\n  cargo-test:\n",
+             "jobs:\n"
+             "  bypass-prerequisite:\n"
+             "    if: ${{ false }}\n"
+             "    runs-on: ubuntu-latest\n"
+             "    steps:\n"
+             "      - run: true\n\n"
+             "  cargo-test:\n"
+             "    needs: bypass-prerequisite\n"),
+         must_fail=True, expect="dependency that can skip the required gate"),
+
+    Case("GitHub quoted runner override cannot move cargo test",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  cargo-test:\n    runs-on: ubuntu-latest",
+             "  cargo-test:\n    runs-on: ubuntu-latest\n"
+             "    'runs-on': [self-hosted, attacker-controlled]"),
+         must_fail=True, expect="reviewed `ubuntu-latest` runner"),
+
     Case("GitHub quoted duplicate trigger mapping cannot disable pull requests",
          GOOD_GITLAB,
          GOOD_GITHUB +

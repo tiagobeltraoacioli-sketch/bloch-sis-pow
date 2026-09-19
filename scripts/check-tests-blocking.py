@@ -36,6 +36,8 @@ GitLab `.gitlab-ci.yml` job `build-and-test`, to the reviewed posture:
     trigger mapping, refuses event filters that can suppress PR coverage, and
     grants only read-only contents permission through one plain top-level
     mapping with no required-job override.
+  * required GitHub jobs run exactly on `ubuntu-latest` and have no `needs:`
+    dependency that can turn their reviewed commands into a skipped decoy.
   * no required GitHub run step writes the cross-step PATH/environment command
     files that can replace `cargo` before the approved test command.
   * the `cargo-test` job's setup, rehearsals and test commands exactly match
@@ -214,7 +216,7 @@ CI_SCRIPT_ENTRYPOINT_SHA256 = {
     "scripts/check-iso-hardening.sh":
         "f0dae2e22aa766301def84a0c671ca4f79ff0c1b87d6e8647e9f6671669b91b3",
     "scripts/check-tests-blocking.selftest.py":
-        "72f75170e5900d96a95c6e0ceab903e70b4ce43120b01aa5ff822b4f93f46b2b",
+        "4af0c083683c8aee1ba218d2f5986104c77f52f0e5ca812cb45062d4a9a9972c",
     "scripts/check-validator-lifecycle-mutations.py":
         "12b477e5043bc3ea98387be33ca586976494b30083522b214cea7d88c0e9f429",
     "scripts/devnet-particao-report.test.py":
@@ -360,6 +362,29 @@ def protected_job_key_problems(
             "the supported plain-key form"
         ]
     return []
+
+
+def github_job_authority_problems(
+    body: list[str], job: str, indent: int, label: str
+) -> list[str]:
+    """Bind runner selection and forbid dependency-based job skipping."""
+    direct = [
+        re.sub(r"\s+#.*$", "", line.strip())
+        for line in body
+        if len(line) - len(line.lstrip(" ")) == indent + 2
+    ]
+    runners = [
+        line for line in direct
+        if re.match(r"^(?:['\"]?)runs-on(?:['\"]?)\s*:", line)
+    ]
+    problems = []
+    if runners != ["runs-on: ubuntu-latest"]:
+        problems.append(
+            f"{label}: job `{job}` must select exactly the reviewed `ubuntu-latest` runner")
+    if any(re.match(r"^(?:['\"]?)needs(?:['\"]?)\s*:", line) for line in direct):
+        problems.append(
+            f"{label}: job `{job}` has a `needs:` dependency that can skip the required gate")
+    return problems
 
 
 def protected_global_key_problems(
@@ -800,6 +825,7 @@ def check_job(path: str, job: str, indent: int, label: str) -> list[str]:
         problems += check_gitlab_build_contract(body)
 
     if label == ".github/workflows/tests.yml":
+        problems += github_job_authority_problems(body, job, indent, label)
         problems += protected_global_key_problems(
             text, "defaults", label, required=True)
         problems += protected_global_key_problems(
