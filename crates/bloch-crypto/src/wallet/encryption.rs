@@ -43,7 +43,7 @@
 use super::errors::WalletError;
 use crate::address::Network;
 use serde::{Serialize, Deserialize};
-use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, KeyInit, Payload}};
+use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, AeadInPlace, KeyInit, Payload}};
 use sha3::{Sha3_256, Digest};
 use argon2::{Argon2, Algorithm, Version, Params};
 use rand::RngCore;
@@ -251,7 +251,10 @@ impl EncryptedKeyfile {
         // Decode base64
         let salt = B64.decode(&self.kdf.salt_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
         let nonce_bytes = B64.decode(&self.cipher.nonce_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
-        let ciphertext = B64.decode(&self.cipher.ciphertext_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
+        let mut ciphertext = Zeroizing::new(
+            B64.decode(&self.cipher.ciphertext_b64)
+                .map_err(|e| WalletError::Parse(e.to_string()))?,
+        );
         let public = B64.decode(&self.meta.public_key_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
 
         // SECURITY (audit M): length-guard fields decoded from the untrusted
@@ -310,16 +313,14 @@ impl EncryptedKeyfile {
         derive_key(password, &salt, params, &mut *key)?;
 
         // Decrypt
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&*key));
-        let nonce = Nonce::from_slice(&nonce_bytes);
         // SECURITY (audit M2): verify against the same public+network AAD used
         // at encrypt time. A tampered public key or flipped network breaks the
         // GCM tag → WrongPassword, so a swapped receive address cannot pass as
         // "integrity OK".
         let net: Network = self.network.into();
         let aad = keyfile_aad(&public, net);
-        let secret = cipher.decrypt(nonce, Payload { msg: ciphertext.as_ref(), aad: &aad })
-            .map_err(|_| WalletError::WrongPassword)?;
+        decrypt_keyfile_ciphertext_in_place(&*key, &nonce_bytes, &aad, &mut ciphertext)?;
+        let secret = std::mem::take(&mut *ciphertext);
 
         key.zeroize();
 
@@ -435,7 +436,10 @@ impl EncryptedKeyfile {
 
         let salt = B64.decode(&self.kdf.salt_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
         let nonce_bytes = B64.decode(&self.cipher.nonce_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
-        let ciphertext = B64.decode(&self.cipher.ciphertext_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
+        let mut ciphertext = Zeroizing::new(
+            B64.decode(&self.cipher.ciphertext_b64)
+                .map_err(|e| WalletError::Parse(e.to_string()))?,
+        );
         let public = B64.decode(&self.meta.public_key_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
 
         // Length guards (audit M): Nonce::from_slice panics off-length; salt is
@@ -481,13 +485,10 @@ impl EncryptedKeyfile {
         let mut key = Zeroizing::new([0u8; 32]);
         derive_key(password, &salt, params, &mut *key)?;
 
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&*key));
-        let nonce = Nonce::from_slice(&nonce_bytes);
         let net: Network = self.network.into();
         let aad = keyfile_aad_v2(&public, net);
-        let plain = Zeroizing::new(
-            cipher.decrypt(nonce, Payload { msg: ciphertext.as_ref(), aad: &aad })
-                .map_err(|_| WalletError::WrongPassword)?);
+        decrypt_keyfile_ciphertext_in_place(&*key, &nonce_bytes, &aad, &mut ciphertext)?;
+        let plain = ciphertext;
         key.zeroize();
 
         // Parse [4B seed_len LE][seed][secret] with bounds checks — the
@@ -506,6 +507,21 @@ impl EncryptedKeyfile {
 
         Ok((master_seed, secret, public, net))
     }
+}
+
+/// Authenticate and decrypt a validated keyfile payload without allocating a
+/// second plaintext buffer. Callers retain the `Zeroizing<Vec<u8>>` owner so a
+/// failed authentication wipes the still-encrypted bytes on early return.
+fn decrypt_keyfile_ciphertext_in_place(
+    key: &[u8; 32],
+    nonce_bytes: &[u8],
+    aad: &[u8],
+    ciphertext: &mut Vec<u8>,
+) -> Result<(), WalletError> {
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    cipher
+        .decrypt_in_place(Nonce::from_slice(nonce_bytes), aad, ciphertext)
+        .map_err(|_| WalletError::WrongPassword)
 }
 
 /// AAD that binds the public key + network into the keyfile AEAD (audit M2),
@@ -769,6 +785,62 @@ mod tests {
         // Same secret, same password, but different salt → different output
         assert_ne!(k1.cipher.ciphertext_b64, k2.cipher.ciphertext_b64);
         assert_ne!(k1.kdf.salt_b64, k2.kdf.salt_b64);
+    }
+
+    #[test]
+    fn keyfile_decryption_reuses_ciphertext_allocation_at_tag_boundary() {
+        let key = [0x84; 32];
+        let nonce = [0x48; 12];
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+        let v1_aad = keyfile_aad(b"public", Network::Mainnet);
+        let v2_aad = keyfile_aad_v2(b"public", Network::Testnet);
+
+        for (aad, plaintext) in [
+            (v1_aad.as_slice(), b"".as_slice()),
+            (v2_aad.as_slice(), b"seed and secret payload".as_slice()),
+        ] {
+            let mut buffer = Zeroizing::new(
+                cipher.encrypt(
+                    Nonce::from_slice(&nonce),
+                    Payload { msg: plaintext, aad },
+                ).unwrap(),
+            );
+            let allocation = buffer.as_ptr();
+            let capacity = buffer.capacity();
+            let encrypted_len = buffer.len();
+
+            decrypt_keyfile_ciphertext_in_place(&key, &nonce, aad, &mut buffer).unwrap();
+
+            assert_eq!(buffer.as_ptr(), allocation);
+            assert_eq!(buffer.capacity(), capacity);
+            assert_eq!(buffer.as_slice(), plaintext);
+            assert_eq!(encrypted_len, plaintext.len() + 16);
+        }
+
+        // Authentication failure keeps the allocation under the production
+        // caller's Zeroizing owner until `?` returns and Drop wipes it.
+        let mut tampered = Zeroizing::new(
+            cipher.encrypt(
+                Nonce::from_slice(&nonce),
+                Payload { msg: b"authenticated keyfile secret", aad: &v1_aad },
+            ).unwrap(),
+        );
+        let tag_byte = tampered.len() - 1;
+        tampered[tag_byte] ^= 1;
+        let allocation = tampered.as_ptr();
+        let capacity = tampered.capacity();
+        assert!(matches!(
+            decrypt_keyfile_ciphertext_in_place(
+                &key,
+                &nonce,
+                &v1_aad,
+                &mut tampered,
+            ),
+            Err(WalletError::WrongPassword),
+        ));
+        assert_eq!(tampered.as_ptr(), allocation);
+        assert_eq!(tampered.capacity(), capacity);
+        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
     }
 
     // ── v2 (master seed at rest) ─────────────────────────────────────────────
