@@ -71,12 +71,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod build_command;
+mod build_environment;
 mod build_native_input;
 mod build_native_tool;
 mod build_source_digest;
 use build_command::{
     command_from_env, delegated_compiler, linker_from_printed_args, rustflags_linker,
 };
+use build_environment::FIXED_BUILD_ENV;
 use build_native_input::required_native_input_digests;
 use build_native_tool::{required_cc_archiver_digest, required_cc_compiler_digest};
 use build_source_digest::required_source_digest;
@@ -100,66 +102,6 @@ fn workspace_root() -> Option<PathBuf> {
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
-
-/// Build knobs whose values can change generated machine code without changing
-/// the source tree. Values are hashed, never published verbatim. Prefixes cover
-/// Cargo's target/profile-specific forms and the C toolchain used by PQClean.
-const FIXED_BUILD_ENV: &[&str] = &[
-    "AR",
-    "ARFLAGS",
-    "BINDGEN_EXTRA_CLANG_ARGS",
-    "CARGO",
-    "CARGO_BUILD_RUSTC",
-    "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
-    "CARGO_BUILD_RUSTC_WRAPPER",
-    "CARGO_BUILD_RUSTFLAGS",
-    "CARGO_BUILD_TARGET",
-    "CARGO_ENCODED_RUSTFLAGS",
-    "CARGO_INCREMENTAL",
-    "CC",
-    "CC_FORCE_DISABLE",
-    "CC_KNOWN_WRAPPER_CUSTOM",
-    "CC_SHELL_ESCAPED_FLAGS",
-    "CFLAGS",
-    "CPPFLAGS",
-    "CRATE_CC_NO_DEFAULTS",
-    "CXXSTDLIB",
-    "DEBUG",
-    "DEP_WASM32_UNKNOWN_UNKNOWN_OPENBSD_LIBC_INCLUDE",
-    "HOST_AR",
-    "HOST_ARFLAGS",
-    "HOST_CC",
-    "HOST_CFLAGS",
-    "HOST_CPPFLAGS",
-    "HOST_CXX",
-    "HOST_CXXFLAGS",
-    "HOST_CXXSTDLIB",
-    "HOST_RANLIB",
-    "HOST_RANLIBFLAGS",
-    "MACOSX_DEPLOYMENT_TARGET",
-    "OPT_LEVEL",
-    "RANLIB",
-    "RANLIBFLAGS",
-    "RUSTC",
-    "RUSTC_BOOTSTRAP",
-    "RUSTC_LINKER",
-    "RUSTC_WORKSPACE_WRAPPER",
-    "RUSTC_WRAPPER",
-    "RUSTFLAGS",
-    "SDKROOT",
-    "SOURCE_DATE_EPOCH",
-    "TARGET_AR",
-    "TARGET_ARFLAGS",
-    "TARGET_CC",
-    "TARGET_CFLAGS",
-    "TARGET_CPPFLAGS",
-    "TARGET_CXX",
-    "TARGET_CXXFLAGS",
-    "TARGET_CXXSTDLIB",
-    "TARGET_RANLIB",
-    "TARGET_RANLIBFLAGS",
-    "WASI_SDK_DIR",
-];
 
 /// Hash the executable bytes selected for a build tool without publishing its
 /// path. Cargo normally supplies absolute `RUSTC`/`CARGO` paths; resolving a

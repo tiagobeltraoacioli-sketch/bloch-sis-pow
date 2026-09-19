@@ -1788,6 +1788,7 @@ fn getbuildinfo_carries_a_bounded_build_environment_fingerprint() {
     assert!(scope.contains("selected freestanding or WASI native input-tree contents"));
     assert!(scope.contains("linker selected by effective Rust flags"));
     assert!(scope.contains("platform default linker observed from a target link probe"));
+    assert!(scope.contains("implicit native search and dynamic loader variables"));
     assert_eq!(
         v.get("build_tool_binaries_hashed").unwrap().as_str(),
         Some("2"),

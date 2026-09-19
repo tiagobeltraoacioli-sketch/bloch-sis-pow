@@ -2661,8 +2661,9 @@ pub fn build_info_json() -> Json {
                  and either the linker selected by effective Rust flags or the \
                  platform default linker observed from a target link probe; \
                  host; target; profile; \
-                 selected Rust/C codegen variables, including absent exact \
-                 host/target forms; sorted, length-prefixed; values hashed, \
+                 selected Rust/C codegen, implicit native search and dynamic \
+                 loader variables, including absent exact host/target forms; \
+                 sorted, length-prefixed; values hashed, \
                  not directly disclosed",
             ),
         ),
