@@ -77,6 +77,9 @@ git archive --format=tar "$commit" | tar -xf - -C "$context"
   --file "$context/deploy/pos-release/Dockerfile" \
   "$context"
 
+[ -d "$stage" ] && [ ! -L "$stage" ] \
+  || fail "container export root must be a real non-symlink directory"
+
 # Emit one fixed byte per entry rather than counting printed path lines: an
 # engine-controlled filename containing a newline must not alter cardinality.
 entry_count="$(
@@ -153,8 +156,20 @@ cmp -s <(printf '%s\n' \
     'deployment_authorized=false') "$build_info" \
   || fail "BUILD-INFO is not in the exact canonical field order and encoding"
 
+# `mv source destination` nests source below destination when a directory is
+# created at destination after the early absence check. Put an unpredictable
+# ownership token inside the validated stage and require that exact token at
+# the destination root after the move before claiming publication succeeded.
+publication_token="$(mktemp "$stage/.bloch-pos-publication.XXXXXX")" \
+  || fail "could not create the publication ownership token"
+publication_marker="${publication_token##*/}"
 mkdir -p "$(dirname "$out_dir")"
 mv "$stage" "$out_dir"
+[ -d "$out_dir" ] && [ ! -L "$out_dir" ] \
+  || fail "published output root must be a real non-symlink directory: $out_dir"
+[ -f "$out_dir/$publication_marker" ] && [ ! -L "$out_dir/$publication_marker" ] \
+  || fail "output path changed during publication; refusing a nested or replaced destination: $out_dir"
+rm -f "$out_dir/$publication_marker"
 trap - EXIT
 rm -rf "$work"
 echo "build-pos-release-container: PASS — $out_dir"

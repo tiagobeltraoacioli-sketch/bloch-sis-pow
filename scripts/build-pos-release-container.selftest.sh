@@ -154,6 +154,15 @@ case "${FAKE_UNSAFE_MODE_ARTIFACT:-}" in
   SHA256SUMS|BUILD-INFO) chmod 0666 "$stage/$FAKE_UNSAFE_MODE_ARTIFACT" ;;
   *) exit 67 ;;
 esac
+if [ "${FAKE_OUTPUT_COLLISION:-0}" = 1 ]; then
+  mkdir "$FAKE_COLLISION_OUT"
+fi
+if [ "${FAKE_STAGE_ROOT_SYMLINK:-0}" = 1 ]; then
+  target="$context/engine-export-root"
+  mv "$stage" "$target"
+  ln -s "$target" "$stage"
+  : > "$FAKE_STAGE_ROOT_OBSERVATION"
+fi
 ENGINE
 chmod 0755 "$fake_engine"
 
@@ -167,6 +176,8 @@ run_wrapper() {
   local extra_entry="${12:-none}"
   local unsafe_mode_artifact="${13:-}"
   local hardlink_artifact="${14:-}"
+  local output_collision="${15:-0}"
+  local stage_root_symlink="${16:-0}"
   FAKE_MANIFEST_MODE="$mode" FAKE_DEPLOYMENT_AUTHORIZED="$authorized" \
     FAKE_DUPLICATE_DEPLOYMENT_AUTHORIZED="$duplicate" \
     FAKE_SIGNED="$signed" FAKE_DUPLICATE_SIGNED="$signed_duplicate" \
@@ -178,8 +189,63 @@ run_wrapper() {
     FAKE_EXTRA_ENTRY="$extra_entry" \
     FAKE_UNSAFE_MODE_ARTIFACT="$unsafe_mode_artifact" \
     FAKE_HARDLINK_ARTIFACT="$hardlink_artifact" \
+    FAKE_OUTPUT_COLLISION="$output_collision" \
+    FAKE_COLLISION_OUT="$output" \
+    FAKE_STAGE_ROOT_SYMLINK="$stage_root_symlink" \
+    FAKE_STAGE_ROOT_OBSERVATION="$output.stage-root-observed" \
     CONTAINER_ENGINE="$fake_engine" \
     bash scripts/build-pos-release-container.sh "$output"
+}
+
+expect_stage_root_symlink_failure() {
+  local output="$work/stage-root-symlink"
+  local log="$work/stage-root-symlink.log"
+  if run_wrapper canonical "$output" false 0 false 0 "" 0 \
+      canonical-container-candidate 0 "" none "" "" 0 1 > "$log" 2>&1; then
+    echo "selftest: wrapper accepted a symlinked export root" >&2
+    exit 1
+  fi
+  [ -f "$output.stage-root-observed" ] || {
+    echo "selftest: fixture did not install the export-root symlink" >&2
+    exit 1
+  }
+  grep -Fq 'container export root must be a real non-symlink directory' "$log" || {
+    echo "selftest: symlinked export root failed without expected diagnostic" >&2
+    cat "$log" >&2
+    exit 1
+  }
+  ! grep -Fq 'build-pos-release-container: PASS' "$log" || {
+    echo "selftest: wrapper reported PASS for a symlinked export root" >&2
+    exit 1
+  }
+  [ ! -e "$output" ] || {
+    echo "selftest: wrapper published a symlinked export root" >&2
+    exit 1
+  }
+}
+
+expect_publication_collision_failure() {
+  local output="$work/publication-collision"
+  local log="$work/publication-collision.log"
+  if run_wrapper canonical "$output" false 0 false 0 "" 0 \
+      canonical-container-candidate 0 "" none "" "" 1 > "$log" 2>&1; then
+    echo "selftest: wrapper reported PASS after a raced output collision" >&2
+    exit 1
+  fi
+  grep -Fq 'output path changed during publication; refusing a nested or replaced destination' \
+      "$log" || {
+    echo "selftest: raced output collision failed without expected diagnostic" >&2
+    cat "$log" >&2
+    exit 1
+  }
+  [ ! -f "$output/bloch-pos" ] || {
+    echo "selftest: raced destination unexpectedly exposes the staged binary directly" >&2
+    exit 1
+  }
+  [ -f "$output/output/bloch-pos" ] || {
+    echo "selftest: fixture did not reproduce the nested-stage mv collision" >&2
+    exit 1
+  }
 }
 
 expect_hardlink_failure() {
@@ -311,6 +377,9 @@ cmp -s <(printf '%s  bloch-pos\n' "$(
     shasum -a 256 "$work/canonical/bloch-pos" | awk '{print $1}'
   fi
 )") "$work/canonical/SHA256SUMS"
+[ "$(find "$work/canonical" -mindepth 1 -maxdepth 1 -exec printf x \; \
+  | wc -c | tr -d '[:space:]')" = 3 ]
+[ -z "$(find "$work/canonical" -name '.bloch-pos-publication.*' -print -quit)" ]
 
 ( umask 000
   run_wrapper canonical "$work/canonical-umask-000"
@@ -320,6 +389,9 @@ grep -Fq 'build-pos-release-container: PASS' "$work/canonical-umask-000.log"
 for artifact in SHA256SUMS BUILD-INFO; do
   [ "$(find "$work/canonical-umask-000/$artifact" -prune -perm 0644 -exec printf x \;)" = x ]
 done
+
+expect_publication_collision_failure
+expect_stage_root_symlink_failure
 
 expect_sha_failure exit 'SHA-256 tool failed for exported bloch-pos'
 expect_sha_failure short \
