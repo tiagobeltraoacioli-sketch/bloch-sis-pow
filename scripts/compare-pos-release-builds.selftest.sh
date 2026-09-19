@@ -183,6 +183,23 @@ expect_bad_snapshot separator 20260917-000000Z
 expect_bad_snapshot short 20260917T00000Z
 expect_bad_snapshot whitespace "20260917T000000Z "
 
+snapshot_pin_error="debian_snapshot does not match the canonical Dockerfile snapshot"
+expect_noncanonical_snapshot() {
+  local label="$1" value="$2"
+  local left="$work/snapshot-pin-$label-a" right="$work/snapshot-pin-$label-b"
+  cp -R "$work/a" "$left"
+  cp -R "$work/a" "$right"
+  sed -i.bak "s/^debian_snapshot=.*/debian_snapshot=$value/" \
+    "$left/BUILD-INFO" "$right/BUILD-INFO"
+  rm "$left/BUILD-INFO.bak" "$right/BUILD-INFO.bak"
+  expect_failure "matching noncanonical debian_snapshot ($label)" \
+    "$snapshot_pin_error" \
+    bash scripts/compare-pos-release-builds.sh "$left" "$right"
+}
+expect_noncanonical_snapshot alternate-valid 20260918T000000Z
+expect_noncanonical_snapshot structural-month-13 20261317T000000Z
+expect_noncanonical_snapshot old-valid 20200101T000000Z
+
 target_error="target must be a lowercase ASCII Rust host triple"
 expect_bad_target() {
   local label="$1" value="$2"

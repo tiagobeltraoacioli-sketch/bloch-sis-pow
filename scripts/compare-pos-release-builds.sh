@@ -6,6 +6,7 @@ set -euo pipefail
 
 a="${1:?usage: compare-pos-release-builds.sh <builder-a-dir> <builder-b-dir>}"
 b="${2:?usage: compare-pos-release-builds.sh <builder-a-dir> <builder-b-dir>}"
+canonical_debian_snapshot=20260917T000000Z
 fail() { echo "compare-pos-release-builds: FAIL — $*" >&2; exit 1; }
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -80,6 +81,8 @@ for dir in "$a" "$b"; do
     ''|*[!0123456789]*)
       fail "$dir/BUILD-INFO debian_snapshot must have exact YYYYMMDDTHHMMSSZ syntax" ;;
   esac
+  [ "$debian_snapshot" = "$canonical_debian_snapshot" ] \
+    || fail "$dir/BUILD-INFO debian_snapshot does not match the canonical Dockerfile snapshot"
   target="$(field target "$dir/BUILD-INFO")"
   case "$target" in
     ''|*[!abcdefghijklmnopqrstuvwxyz0123456789_-]*|-*|*-|*--*)
