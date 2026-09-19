@@ -27,6 +27,8 @@ asserts BOTH directions:
   * a renamed PoS crate FAILS rather than dropping out of the guard's scope;
   * full mode refuses tracked source edits both unstaged and staged, while an
     untracked CI-output file advances beyond the source-cleanliness checks.
+  * full mode accepts a real canonical SHA-256 result and rejects tool failure,
+    short, nonhexadecimal, uppercase and multiple-row digest output.
 
 The post-build drift diff (section 3) needs a compiler and a minute of build to
 reach, so it is asserted at the source level instead: it must name the root
@@ -39,7 +41,9 @@ Exit 0 = the guard behaves as documented on all cases.
 from __future__ import annotations
 
 import os
+import json
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -114,6 +118,107 @@ def run_guard(root: str, *, args=None, extra_env=None):
          *(args if args is not None else ["--locks-only"])],
         cwd=root, capture_output=True, text=True, env=env,
     )
+
+
+def prepare_full_mode_fixture(tmp: str):
+    """Return a clean repo plus fake compiler/build tools for full-mode tests."""
+    root = build_fixture(tmp)
+    pin = os.path.join(root, "crates", "bloch-pos-node", "rust-toolchain.toml")
+    write(pin, '[toolchain]\nchannel = "1.94.1"\n')
+    git(root, "add", "crates/bloch-pos-node/rust-toolchain.toml")
+    git(root, "-c", "user.email=selftest@invalid", "-c", "user.name=selftest",
+        "commit", "-qm", "add toolchain pin")
+
+    tools = os.path.join(tmp, "tools")
+    os.makedirs(tools)
+    fake_binary = os.path.join(tmp, "fake-bloch-pos")
+    write(fake_binary, """#!/usr/bin/env bash
+set -euo pipefail
+printf 'bloch-pos selftest (%s)\\n' "${INTEGRITY_TEST_COMMIT:?}"
+""")
+
+    metadata = json.dumps({
+        "workspace_root": root,
+        "workspace_members": ["node", "committee"],
+        "packages": [
+            {"id": "node", "name": "bloch-pos-node",
+             "manifest_path": os.path.join(root, "crates", "bloch-pos-node",
+                                           "Cargo.toml")},
+            {"id": "committee", "name": "bloch-pos-committee",
+             "manifest_path": os.path.join(root, "crates", "bloch-pos-committee",
+                                           "Cargo.toml")},
+        ],
+    })
+    write(os.path.join(tools, "cargo"), """#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  metadata)
+    printf '%s\\n' """ + shlex.quote(metadata) + """
+    ;;
+  build)
+    target=
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = --target-dir ]; then
+        shift
+        target="$1"
+      fi
+      shift
+    done
+    [ -n "$target" ]
+    mkdir -p "$target/release"
+    cp "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos"
+    chmod 0755 "$target/release/bloch-pos"
+    ;;
+  *) exit 70 ;;
+esac
+""")
+    write(os.path.join(tools, "rustc"), """#!/usr/bin/env bash
+set -euo pipefail
+[ "${1:-}" = --version ] || exit 71
+printf 'rustc 1.94.1 (selftest)\\n'
+""")
+    write(os.path.join(tools, "sha256sum"), """#!/usr/bin/env bash
+set -euo pipefail
+delegate() {
+  if [ -n "${REAL_SHA256SUM:-}" ]; then
+    exec "$REAL_SHA256SUM" "$@"
+  else
+    exec "$REAL_SHASUM" -a 256 "$@"
+  fi
+}
+case "${INTEGRITY_SHA_MODE:-canonical}" in
+  canonical) delegate "$@" ;;
+  exit) exit 72 ;;
+  short) printf '%063d  %s\\n' 0 "${1:-input}" ;;
+  nonhex) printf '%064d  %s\\n' 0 "${1:-input}" | tr 0 g ;;
+  uppercase) printf '%064d  %s\\n' 0 "${1:-input}" | tr 0 A ;;
+  multirow)
+    printf '%064d  %s\\n' 0 "${1:-input}"
+    printf '%064d  second-row\\n' 0
+    ;;
+  *) exit 73 ;;
+esac
+""")
+    for name in ("cargo", "rustc", "sha256sum"):
+        os.chmod(os.path.join(tools, name), 0o755)
+    os.chmod(fake_binary, 0o755)
+
+    real_sha256sum = shutil.which("sha256sum") or ""
+    real_shasum = shutil.which("shasum") or ""
+    if not real_sha256sum and not real_shasum:
+        raise RuntimeError("no host SHA-256 implementation is available")
+    env = {
+        "PATH": tools + os.pathsep + os.environ.get("PATH", ""),
+        "REAL_SHA256SUM": real_sha256sum,
+        "REAL_SHASUM": real_shasum,
+        "INTEGRITY_SHA_MODE": "canonical",
+        "INTEGRITY_FAKE_BINARY": fake_binary,
+        "INTEGRITY_TEST_COMMIT": subprocess.run(
+            ["git", "-C", root, "rev-parse", "--short=12", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip(),
+    }
+    return root, env
 
 
 FAILURES: list[str] = []
@@ -264,6 +369,51 @@ def main() -> int:
             else:
                 print(f"  ok   refuses {variable} without echoing its value")
 
+    # The full guard must not call two identical arbitrary strings proof of
+    # byte identity. Fake cargo/rustc avoid a real build, while canonical SHA
+    # mode delegates by absolute path to the host implementation. Adversarial
+    # modes therefore affect only the real guard's digest observation.
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            root, full_env = prepare_full_mode_fixture(tmp)
+        except RuntimeError as exc:
+            FAILURES.append(f"full-mode SHA fixture: {exc}")
+        else:
+            canonical = run_guard(root, args=[], extra_env=full_env)
+            canonical_output = canonical.stdout + canonical.stderr
+            if canonical.returncode != 0:
+                FAILURES.append("canonical full-mode SHA was rejected "
+                                f"(exit {canonical.returncode})\n{canonical_output}")
+            elif "pos-release-integrity: PASS" not in canonical_output:
+                FAILURES.append("canonical full-mode SHA passed without the "
+                                f"guard success diagnostic\n{canonical_output}")
+            else:
+                print("  ok   canonical full-mode SHA-256 output passes")
+
+            sha_cases = {
+                "exit": "SHA-256 tool failed for release build 1",
+                "short": "digest that is not exactly 64 characters for release build 1",
+                "nonhex": "non-lowercase hexadecimal digest for release build 1",
+                "uppercase": "non-lowercase hexadecimal digest for release build 1",
+                "multirow": "non-lowercase hexadecimal digest for release build 1",
+            }
+            for mode, expected in sha_cases.items():
+                result = run_guard(
+                    root, args=[],
+                    extra_env={**full_env, "INTEGRITY_SHA_MODE": mode},
+                )
+                output = result.stdout + result.stderr
+                if result.returncode == 0:
+                    FAILURES.append(f"full mode accepted {mode} SHA-256 output\n{output}")
+                elif expected not in output:
+                    FAILURES.append(f"full mode rejected {mode} SHA-256 output "
+                                    f"without {expected!r}\n{output}")
+                elif "determinism: ok" in output:
+                    FAILURES.append(f"full mode claimed determinism after rejecting "
+                                    f"{mode} SHA-256 output\n{output}")
+                else:
+                    print(f"  ok   full mode refuses {mode} SHA-256 output")
+
     # 7 — source assertion for section 3's call site, which needs a real build
     #     to reach: it must go through the shared root-lock assertion and must
     #     not have drifted back to a per-member path.
@@ -293,9 +443,9 @@ def main() -> int:
         for f in FAILURES:
             print(f"\n- {f}", file=sys.stderr)
         return 1
-    print("\npos-release-integrity.selftest: PASS — lock/layout drift and "
-          "tracked release-source edits fail closed; untracked output remains "
-          "outside the full-mode cleanliness contract.")
+    print("\npos-release-integrity.selftest: PASS — lock/layout drift, tracked "
+          "release-source edits and malformed full-mode digests fail closed; "
+          "untracked output remains outside the cleanliness contract.")
     return 0
 
 

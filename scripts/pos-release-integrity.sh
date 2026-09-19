@@ -222,8 +222,19 @@ sha() { # portable sha256 of $1
   if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}';
   else shasum -a 256 "$1" | awk '{print $1}'; fi
 }
-H1="$(sha "$WORK/t1/release/bloch-pos")"
-H2="$(sha "$WORK/t2/release/bloch-pos")"
+validated_sha256_file() { # $1 = file, $2 = diagnostic context
+  local digest
+  digest="$(sha "$1")" || fail "SHA-256 tool failed for $2"
+  case "$digest" in
+    ''|*[!0123456789abcdef]*)
+      fail "SHA-256 tool returned a non-lowercase hexadecimal digest for $2" ;;
+  esac
+  [ "${#digest}" -eq 64 ] \
+    || fail "SHA-256 tool returned a digest that is not exactly 64 characters for $2"
+  printf '%s\n' "$digest"
+}
+H1="$(validated_sha256_file "$WORK/t1/release/bloch-pos" 'release build 1')"
+H2="$(validated_sha256_file "$WORK/t2/release/bloch-pos" 'release build 2')"
 echo "build 1 sha256: $H1"
 echo "build 2 sha256: $H2"
 [ "$H1" = "$H2" ] || fail "two clean builds of the same commit differ. The \
