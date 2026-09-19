@@ -4481,17 +4481,16 @@ impl Engine {
             .iter()
             .position(|(_, cid)| cid.as_bytes() == &id)
             .expect("replay target is canonical");
-        let prefix: Vec<BlockEnvelope> = self.chain[1..=cut]
-            .iter()
-            .map(|(_, cid)| {
-                self.blocks
-                    .get(cid.as_bytes())
-                    .expect("canonical block stored")
-                    .clone()
-            })
-            .collect();
         let mut st = self.manifest.genesis_state();
-        for env in &prefix {
+        // Borrow each stored envelope in canonical order. The transition only
+        // reads the block, so cloning the whole prefix (including every body,
+        // transaction, attestation and signature) into a temporary Vec added
+        // work proportional to retained history without changing the fold.
+        for (_, cid) in &self.chain[1..=cut] {
+            let env = self
+                .blocks
+                .get(cid.as_bytes())
+                .expect("canonical block stored");
             let envelope = ProposalEnvelope {
                 header: env.header.clone(),
                 proposer_sig: env.proposer_sig.clone(),
@@ -11269,6 +11268,49 @@ mod reorg_state_tests {
             saw_hit && saw_fallback,
             "the sweep must exercise BOTH the retained snapshot and the replay fallback \
              (hit: {saw_hit}, fallback: {saw_fallback})"
+        );
+    }
+
+    /// The deep-reorg fallback must borrow canonical bodies from the block
+    /// store instead of first cloning the entire prefix into a temporary
+    /// aggregate. The behavioural half above proves the borrowed fold is the
+    /// same state transition; this pins the ownership property that removes
+    /// the proportional body copy.
+    #[test]
+    fn replay_fallback_does_not_clone_a_prefix_aggregate() {
+        let source = include_str!("engine.rs");
+        let replay = source
+            .split("fn replay_to(&self")
+            .nth(1)
+            .expect("replay_to exists")
+            .split("// ── The finality latch")
+            .next()
+            .expect("finality section follows replay_to");
+        assert!(
+            !replay.contains("let prefix: Vec<BlockEnvelope>"),
+            "replay_to again materializes an owned canonical-prefix aggregate"
+        );
+
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        for slot in 1..=6 {
+            engine.propose(slot);
+        }
+        let target = *engine.chain[1].1.as_bytes();
+        assert!(
+            !engine.recent_states.iter().any(|(id, _)| *id == target),
+            "fixture must force the deep replay fallback"
+        );
+        let replayed = engine.replay_to(target);
+        let committed = engine
+            .blocks
+            .get(&target)
+            .expect("canonical target remains stored")
+            .header
+            .state_root;
+        assert_eq!(
+            replayed.state_root(),
+            committed,
+            "borrowed replay diverged from the state root committed by the canonical block"
         );
     }
 }
