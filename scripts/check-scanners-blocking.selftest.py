@@ -297,6 +297,16 @@ CASES = [
              "    services:\n      helper:\n        image: attacker.invalid/helper:latest"),
          must_fail=True, expect="environment/container/service context"),
 
+    Case("GitHub quoted duplicate required job cannot override reviewed job",
+         GOOD_GITLAB,
+         GOOD_GITHUB +
+         "\n  \"cargo-deny\":\n"
+         "    runs-on: ubuntu-latest\n"
+         "    continue-on-error: true\n"
+         "    steps:\n"
+         "      - run: echo skipped\n",
+         must_fail=True, expect="protected `cargo-deny:` job key must occur exactly once"),
+
     Case("unreviewed action cannot run before a scanner verdict",
          GOOD_GITLAB,
          GOOD_GITHUB.replace(
@@ -425,6 +435,16 @@ CASES = [
              "scanners-blocking-guard:\n  stage: check",
              "scanners-blocking-guard:\n  stage: check\n  before_script: []"),
          GOOD_GITHUB, must_fail=True, expect="overrides the reviewed inherited `before_script:`"),
+
+    Case("GitLab quoted duplicate required job cannot override reviewed job",
+         GOOD_GITLAB +
+         "\n\"scanners-blocking-guard\":\n"
+         "  stage: check\n"
+         "  script:\n"
+         "    - echo skipped\n"
+         "  allow_failure: true\n",
+         GOOD_GITHUB, must_fail=True,
+         expect="protected `scanners-blocking-guard:` job key must occur exactly once"),
 
     Case("GitLab reviewed default cannot be removed",
          GOOD_GITLAB.replace(SAFE_GITLAB_GLOBALS, ""),

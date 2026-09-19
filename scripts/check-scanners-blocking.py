@@ -47,6 +47,8 @@ security job, fails if the job:
   * keeps the job name but removes/replaces its actual scanner or guard
     command. Evidence is accepted only from explicit GitLab `script:` items
     and GitHub step `run:`/`uses:` fields, never names, comments or variables.
+  * duplicates or quotes a required job key, so the CI parser cannot select a
+    different mapping value than the plain-key block reviewed here.
   * makes the GitHub OSV verdict mutable by replacing its full commit pin with
     a tag/branch, or removes this guard's own adversarial self-test.
   * lets the GitHub OSV lockfile scope drift from the complete set of tracked
@@ -646,6 +648,17 @@ def check_file(
                 "%s: top-level `env:` differs from the reviewed inert subset"
                 % label)
     for job, why in sorted(required.items()):
+        protected = [
+            match.group("quote")
+            for line in text.splitlines()
+            if (match := re.match(
+                r"^ {%d}(?P<quote>['\"]?)%s(?P=quote)\s*:"
+                % (indent, re.escape(job)), line))
+        ]
+        if len(protected) != 1 or protected[0]:
+            problems.append(
+                "%s: protected `%s:` job key must occur exactly once in the "
+                "supported plain-key form" % (label, job))
         if job not in blocks:
             problems.append(
                 "%s: job `%s` is MISSING (%s). A gate that was deleted is not a "
