@@ -357,6 +357,9 @@ tests-blocking-guard:
     - python3 -I scripts/check-tests-blocking.selftest.py
     - python3 -I scripts/check-tests-blocking.py
     - python3 -I scripts/pinned-rust-toolchain.test.py
+    - python3 -I scripts/devnet-particao-report.test.py
+    - python3 -I scripts/rehearse-validator-activation.test.py
+  timeout: 10m
   allow_failure: false
 
 # Falcon constant-time guard (PoS finding F1, BLOCH-FALCON-ONLINE-SIGNING.md

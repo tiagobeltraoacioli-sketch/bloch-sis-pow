@@ -82,6 +82,18 @@ workspace-tests:
     - cargo test --workspace
   allow_failure: true
   timeout: 90m
+
+tests-blocking-guard:
+  stage: check
+  before_script: []
+  script:
+    - python3 -I scripts/check-tests-blocking.selftest.py
+    - python3 -I scripts/check-tests-blocking.py
+    - python3 -I scripts/pinned-rust-toolchain.test.py
+    - python3 -I scripts/devnet-particao-report.test.py
+    - python3 -I scripts/rehearse-validator-activation.test.py
+  timeout: 10m
+  allow_failure: false
 """
 
 GOOD_GITHUB = """\
@@ -377,6 +389,24 @@ CASES = [
          GOOD_GITLAB,
          sub(GOOD_GITHUB, "      - run: python3 -I scripts/check-tests-blocking.selftest.py\n", ""),
          must_fail=True, expect="exact ordered contract"),
+
+    Case("github partition-report adversarial test cannot be removed",
+         GOOD_GITLAB,
+         sub(GOOD_GITHUB, "      - run: python3 -I scripts/devnet-particao-report.test.py\n", ""),
+         must_fail=True, expect="exact ordered contract"),
+
+    Case("gitlab partition-report adversarial test cannot be removed",
+         sub(GOOD_GITLAB, "    - python3 -I scripts/devnet-particao-report.test.py\n", ""),
+         GOOD_GITHUB, must_fail=True, expect="exact blocking contract"),
+
+    Case("github activation parser adversarial test cannot be removed",
+         GOOD_GITLAB,
+         sub(GOOD_GITHUB, "      - run: python3 -I scripts/rehearse-validator-activation.test.py\n", ""),
+         must_fail=True, expect="exact ordered contract"),
+
+    Case("gitlab activation parser adversarial test cannot be removed",
+         sub(GOOD_GITLAB, "    - python3 -I scripts/rehearse-validator-activation.test.py\n", ""),
+         GOOD_GITHUB, must_fail=True, expect="exact blocking contract"),
 
     Case("github toolchain parser selftest cannot be removed",
          GOOD_GITLAB,

@@ -39,8 +39,10 @@ GitLab `.gitlab-ci.yml` job `build-and-test`, to the reviewed posture:
   * the validator-lifecycle mutation check is blocking in both pipelines;
     removing it from either reviewed job fails the corresponding contract.
   * the `tests-blocking-guard` job has the reviewed runner/timeout and exact
-    ordered checkout, selftest and guard/rehearsal command sequence. This
-    prevents the guard's own CI entrypoint from becoming a decorative literal.
+    ordered checkout, selftest and guard/rehearsal command sequence on GitHub;
+    GitLab runs the same posture, toolchain, partition-report and activation
+    parser tests under an exact blocking contract. This prevents the guard's
+    own CI entrypoint from becoming a decorative literal.
   * local script entrypoints named directly by those commands, plus the
     reviewed transitively loaded executables, are regular non-symlink files
     whose SHA-256 content and parent/load relationships match the contract.
@@ -129,6 +131,18 @@ GITHUB_TEST_GUARD_HEADER = (
     "timeout-minutes: 10",
     "steps:",
 )
+GITLAB_TEST_GUARD_BODY = (
+    "stage: check",
+    "before_script: []",
+    "script:",
+    "- python3 -I scripts/check-tests-blocking.selftest.py",
+    "- python3 -I scripts/check-tests-blocking.py",
+    "- python3 -I scripts/pinned-rust-toolchain.test.py",
+    "- python3 -I scripts/devnet-particao-report.test.py",
+    "- python3 -I scripts/rehearse-validator-activation.test.py",
+    "timeout: 10m",
+    "allow_failure: false",
+)
 GITLAB_BUILD_TEST_HEADER = (
     "stage: test",
     "script:",
@@ -171,7 +185,7 @@ CI_SCRIPT_ENTRYPOINT_SHA256 = {
     "scripts/check-live-node-retired-isolation.py":
         "45ece7368931469c2c64c161708009b41aebcbf3c1033fa75006e16d5e16518d",
     "scripts/check-tests-blocking.selftest.py":
-        "1343d910062566f54d5bf34710ef5209196c4c941cc073dbfbe892aa95c11c37",
+        "29eacc9806e90086d195ce698dc38def9f62ef099bdce7acc2dc392f926354ad",
     "scripts/check-validator-lifecycle-mutations.py":
         "12b477e5043bc3ea98387be33ca586976494b30083522b214cea7d88c0e9f429",
     "scripts/devnet-particao-report.test.py":
@@ -471,6 +485,33 @@ def check_github_test_guard(path: str) -> list[str]:
     if tuple(github_execution_steps(body, 2)) != GITHUB_TEST_GUARD_STEPS:
         problems.append(
             f"{label}: job `{job}` execution steps differ from the reviewed exact ordered contract")
+    return problems
+
+
+def check_gitlab_test_guard(path: str) -> list[str]:
+    """Bind GitLab's guard job to the reviewed cross-pipeline proof contract."""
+    label = ".gitlab-ci.yml"
+    job = "tests-blocking-guard"
+    if not os.path.exists(path):
+        return [f"{label}: MISSING — the pipeline definition itself is gone"]
+    text = open(path, encoding="utf-8").read()
+    blocks = job_blocks(text, 0)
+    protected = [
+        match.group("quote")
+        for line in text.splitlines()
+        if (match := re.match(
+            r"^(?P<quote>['\"]?)tests-blocking-guard(?P=quote)\s*:", line))
+    ]
+    if (len(protected) != 1 or protected[0] or job not in blocks):
+        return [
+            f"{label}: protected `{job}:` key must occur exactly once in the "
+            "supported plain-key form"
+        ]
+    body = blocks[job]
+    problems = check_gitlab_job_context(body, job, 0)
+    if normalized_yaml_lines(body) != GITLAB_TEST_GUARD_BODY:
+        problems.append(
+            f"{label}: job `{job}` differs from the reviewed exact blocking contract")
     return problems
 
 
@@ -797,6 +838,7 @@ def main() -> int:
     problems += check_job(args.gitlab, "build-and-test", 0, ".gitlab-ci.yml")
     problems += check_job(args.github, "cargo-test", 2, ".github/workflows/tests.yml")
     problems += check_github_test_guard(args.github)
+    problems += check_gitlab_test_guard(args.gitlab)
     problems += check_ci_script_entrypoints(args.entrypoint_root)
 
     if problems:
