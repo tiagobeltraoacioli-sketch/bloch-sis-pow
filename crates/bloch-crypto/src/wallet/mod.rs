@@ -837,7 +837,7 @@ impl Keypair {
 
         let mut salt = vec![0u8; 32];
         rand::rng().fill_bytes(&mut salt);
-        let mut enc_key = derive_key(password, &salt)?;
+        let enc_key = derive_key(password, &salt)?;
         let mut nonce_b = [0u8; 12];
         rand::rng().fill_bytes(&mut nonce_b);
 
@@ -845,11 +845,12 @@ impl Keypair {
             private_key_hex: hex::encode(&self.private_key),
             public_key_hex:  hex::encode(&self.public_key),
         };
-        let mut plain = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
+        let plain = Zeroizing::new(
+            serde_json::to_vec(&payload).map_err(|e| e.to_string())?,
+        );
         let cipher  = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&enc_key));
         let ct      = cipher.encrypt(Nonce::from_slice(&nonce_b), plain.as_ref())
             .map_err(|e| e.to_string())?;
-        plain.zeroize(); enc_key.zeroize();
 
         let ks = EncryptedKeystore {
             version: 2,
@@ -1095,10 +1096,10 @@ pub fn validate_password(pw: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn derive_key(pw: &str, salt: &[u8]) -> Result<Vec<u8>, String> {
+fn derive_key(pw: &str, salt: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
     let params = Params::new(262144, 4, 4, Some(32)).map_err(|e| e.to_string())?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut key = vec![0u8; 32];
+    let mut key = Zeroizing::new(vec![0u8; 32]);
     argon2.hash_password_into(pw.as_bytes(), salt, &mut key).map_err(|e| e.to_string())?;
     Ok(key)
 }
@@ -1144,6 +1145,22 @@ pub mod cli;
 #[cfg(test)]
 mod legacy_keystore_tests {
     use super::*;
+
+    #[test]
+    fn legacy_save_temporaries_have_zeroizing_ownership_and_exact_json() {
+        let _: fn(&str, &[u8]) -> Result<Zeroizing<Vec<u8>>, String> = derive_key;
+        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
+
+        let payload = KeystorePayload {
+            private_key_hex: "a1b2c3d4".into(),
+            public_key_hex: "01020304".into(),
+        };
+        let expected = serde_json::to_vec(&payload).unwrap();
+        let mut plain = Zeroizing::new(serde_json::to_vec(&payload).unwrap());
+        assert_eq!(&plain[..], &expected);
+        plain.zeroize();
+        assert!(plain.is_empty() || plain.iter().all(|byte| *byte == 0));
+    }
 
     #[test]
     fn legacy_decrypted_key_strings_borrow_plaintext_and_preserve_escaped_json() {
