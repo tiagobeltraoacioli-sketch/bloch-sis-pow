@@ -928,6 +928,20 @@ fn retention_bytes_fit(held: usize, incoming: usize, cap: usize) -> bool {
     held.checked_add(incoming).is_some_and(|total| total <= cap)
 }
 
+fn future_retention_totals<'a>(
+    retained: impl Iterator<Item = (&'a Source, &'a usize)>,
+    incoming_source: Source,
+) -> (usize, usize, usize) {
+    retained.fold((0usize, 0usize, 0usize), |acc, (held_source, block_bytes)| {
+        let same_source = usize::from(*held_source == incoming_source);
+        (
+            acc.0.saturating_add(*block_bytes),
+            acc.1.saturating_add(same_source),
+            acc.2.saturating_add(block_bytes.saturating_mul(same_source)),
+        )
+    })
+}
+
 /// A budget refusal is this node's load state, never evidence that the bytes
 /// or their forwarding peer are bad. The pure gossip policy sees the budgeted
 /// verifier's `false`; translate only when that verifier records exhaustion.
@@ -1506,9 +1520,19 @@ struct Engine {
     /// transfer with no inputs or no outputs, and verifies every spend
     /// signature.
     mempool: admission::Mempool,
+    /// Authenticated near-future envelopes, their source/proof, and the exact
+    /// canonical encoded length computed once at admission. Entries are owned
+    /// and immutable until removal, so the cached length cannot drift; byte
+    /// preflight can sum fixed-size metadata instead of serializing every
+    /// retained body for every new arrival.
     future_blocks: BTreeMap<
         [u8; 32],
-        (BlockEnvelope, Source, Option<AuthenticatedBlockAdmission>),
+        (
+            BlockEnvelope,
+            Source,
+            Option<AuthenticatedBlockAdmission>,
+            usize,
+        ),
     >,
     /// Head slot at which each live mempool key was admitted, for
     /// [`MEMPOOL_TTL_SLOTS`].
@@ -3013,7 +3037,7 @@ impl Engine {
             || self.deferred_orphans.iter()
                 .any(|(seen, held, _, _, _)| same_envelope(seen, held))
             || self.future_blocks.get(&id)
-                .is_some_and(|(held, _, _)| held.proposer_sig == env.proposer_sig)
+                .is_some_and(|(held, _, _, _)| held.proposer_sig == env.proposer_sig)
         {
             return (Verdict::Ignore, None);
         }
@@ -3264,23 +3288,24 @@ impl Engine {
         // Authenticated near-future blocks must not enter fork choice until
         // their signed slot. Bound both count and payload memory (EN-05).
         if src.bounded_by_wall_clock() && self.live && env.header.slot > self.wall_slot() {
-            let bytes = crate::codec::encode_envelope(&env).len();
-            let (held, held_by_source, held_bytes_by_source) = self.future_blocks.values()
-                .fold((0usize, 0usize, 0usize), |acc, (block, held_source, _)| {
-                    let block_bytes = crate::codec::encode_envelope(block).len();
-                    let same_source = usize::from(*held_source == src);
-                    (
-                        acc.0.saturating_add(block_bytes),
-                        acc.1.saturating_add(same_source),
-                        acc.2.saturating_add(block_bytes.saturating_mul(same_source)),
-                    )
-                });
+            // Cache the exact canonical length with the immutable envelope.
+            // Re-encoding every retained body here made each new future
+            // admission allocate and copy up to the complete 16-MiB pool.
+            let bytes = crate::codec::encoded_envelope_len(&env);
+            let (held, held_by_source, held_bytes_by_source) = future_retention_totals(
+                self.future_blocks.values().map(|(_, source, _, bytes)| (source, bytes)),
+                src,
+            );
             if self.future_blocks.len() < FUTURE_BLOCKS_MAX
-                && held.saturating_add(bytes) <= FUTURE_BLOCK_BYTES_MAX
+                && retention_bytes_fit(held, bytes, FUTURE_BLOCK_BYTES_MAX)
                 && held_by_source < FUTURE_BLOCKS_PER_SOURCE
-                && held_bytes_by_source.saturating_add(bytes) <= FUTURE_BLOCK_BYTES_PER_SOURCE
+                && retention_bytes_fit(
+                    held_bytes_by_source,
+                    bytes,
+                    FUTURE_BLOCK_BYTES_PER_SOURCE,
+                )
             {
-                self.future_blocks.insert(id, (env, src, Some(authenticated)));
+                self.future_blocks.insert(id, (env, src, Some(authenticated), bytes));
             }
             return (Verdict::Ignore, None);
         }
@@ -3677,12 +3702,12 @@ impl Engine {
     /// gate duties and immediately give it a fresh bounded loop turn.
     fn release_future_blocks(&mut self, slot: u64, limit: usize) -> bool {
         let ready: Vec<_> = self.future_blocks.iter()
-            .filter(|(_, (block, _, _))| block.header.slot <= slot)
+            .filter(|(_, (block, _, _, _))| block.header.slot <= slot)
             .map(|(id, _)| *id)
             .take(limit)
             .collect();
         for id in ready {
-            if let Some((block, source, authentication)) = self.future_blocks.remove(&id) {
+            if let Some((block, source, authentication, _)) = self.future_blocks.remove(&id) {
                 let (_, landing) = self.ingest_one_deferred(block, source, authentication);
                 if let Some((landed, grew_registry)) = landing {
                     self.schedule_unblocked_orphans(landed, grew_registry);
@@ -3695,7 +3720,7 @@ impl Engine {
     fn ready_future_block_pending(&self, slot: u64) -> bool {
         self.future_blocks
             .values()
-            .any(|(block, _, _)| block.header.slot <= slot)
+            .any(|(block, _, _, _)| block.header.slot <= slot)
     }
 
     /// Make the canonical chain equal the LMD-GHOST head.
@@ -12702,10 +12727,11 @@ mod ingest_admission_tests {
         assert_ne!(future_id, orphan_id, "the two release classes need distinct work");
         engine.blocks.remove(&future_id).expect("stored future fixture");
         engine.blocks.remove(&orphan_id).expect("stored orphan fixture");
+        let future_bytes = crate::codec::encoded_envelope_len(&future);
 
         engine.future_blocks.insert(
             future_id,
-            (future, Source::Gossip(Some([0xF4; 32])), None),
+            (future, Source::Gossip(Some([0xF4; 32])), None, future_bytes),
         );
         engine.park_orphan(
             orphan_id,
@@ -12748,9 +12774,10 @@ mod ingest_admission_tests {
         assert!(engine.do_reorg(parent, Vec::new()));
         let future_id = *future.block_id().as_bytes();
         engine.blocks.remove(&future_id).expect("stored future fixture");
+        let future_bytes = crate::codec::encoded_envelope_len(&future);
         engine.future_blocks.insert(
             future_id,
-            (future, Source::Gossip(Some([0xB1; 32])), None),
+            (future, Source::Gossip(Some([0xB1; 32])), None, future_bytes),
         );
 
         // Hold a valid attestation on a block that is not queryable yet, then
@@ -12958,7 +12985,7 @@ mod ingest_admission_tests {
         assert!(!engine.release_future_blocks(1, FUTURE_BLOCKS_PER_TURN));
         assert_eq!(
             engine.future_blocks.values()
-                .filter(|(_, source, _)| *source == Source::Gossip(Some(source_a)))
+                .filter(|(_, source, _, _)| *source == Source::Gossip(Some(source_a)))
                 .count(),
             FUTURE_BLOCKS_PER_SOURCE - 1,
         );
@@ -12970,14 +12997,14 @@ mod ingest_admission_tests {
         );
         assert_eq!(
             engine.future_blocks.values()
-                .filter(|(_, source, _)| *source == Source::Gossip(Some(source_a)))
+                .filter(|(_, source, _, _)| *source == Source::Gossip(Some(source_a)))
                 .count(),
             FUTURE_BLOCKS_PER_SOURCE,
             "release must reopen capacity without a stale quota cache",
         );
         assert_eq!(
             engine.future_blocks.values()
-                .filter(|(_, source, _)| *source == Source::Gossip(Some(source_b)))
+                .filter(|(_, source, _, _)| *source == Source::Gossip(Some(source_b)))
                 .count(),
             1,
             "an independent source keeps its reserved share",
@@ -12993,7 +13020,8 @@ mod ingest_admission_tests {
         let padding = 3 * 1024 * 1024;
 
         let first_a = padded_repointed(&engine, &template, [0xA1; 32], 1, padding);
-        let envelope_bytes = crate::codec::encode_envelope(&first_a).len();
+        let first_a_duplicate = first_a.clone();
+        let envelope_bytes = crate::codec::encoded_envelope_len(&first_a);
         assert!(envelope_bytes <= FUTURE_BLOCK_BYTES_PER_SOURCE);
         assert!(envelope_bytes.saturating_mul(2) > FUTURE_BLOCK_BYTES_PER_SOURCE);
         assert!(envelope_bytes <= crate::p2p::MAX_PROPOSAL_ENVELOPE_BYTES);
@@ -13001,6 +13029,17 @@ mod ingest_admission_tests {
             engine.ingest_judged_from_source(first_a, Some(source_a)),
             Verdict::Ignore,
         );
+        assert_eq!(
+            engine.future_blocks.values().next().expect("first large future").3,
+            envelope_bytes,
+            "admission caches the exact canonical length beside the immutable envelope",
+        );
+        assert_eq!(
+            engine.ingest_judged_from_source(first_a_duplicate, Some(source_a)),
+            Verdict::Ignore,
+        );
+        assert_eq!(engine.future_blocks.len(), 1, "dedup precedes byte charging");
+        assert_eq!(engine.future_blocks.values().next().unwrap().3, envelope_bytes);
 
         let excess_a = padded_repointed(&engine, &template, [0xA2; 32], 2, padding);
         let excess_a_id = *excess_a.block_id().as_bytes();
@@ -13018,6 +13057,9 @@ mod ingest_admission_tests {
             Verdict::Ignore,
         );
         assert_eq!(engine.future_blocks.len(), 2);
+        assert!(engine.future_blocks.values().all(|(env, _, _, retained_bytes)| {
+            *retained_bytes == crate::codec::encode_envelope(env).len()
+        }), "every retained future entry must cache its exact wire length");
         assert_eq!(engine.blocks.len(), stored);
 
         let _release_clock = validator_lifecycle::clock_at(1);
@@ -13031,17 +13073,75 @@ mod ingest_admission_tests {
         );
         assert_eq!(
             engine.future_blocks.values()
-                .filter(|(_, source, _)| *source == Source::Gossip(Some(source_a)))
+                .filter(|(_, source, _, _)| *source == Source::Gossip(Some(source_a)))
                 .count(),
             1,
             "releasing the large envelope must reopen its byte allowance",
         );
         assert_eq!(
             engine.future_blocks.values()
-                .filter(|(_, source, _)| *source == Source::Gossip(Some(source_b)))
+                .filter(|(_, source, _, _)| *source == Source::Gossip(Some(source_b)))
                 .count(),
             1,
         );
+    }
+
+    #[test]
+    fn future_cached_length_accounting_pins_global_source_exact_and_plus_one() {
+        let source_a = Source::Gossip(Some([0xA1; 32]));
+        let entry_bytes = FUTURE_BLOCK_BYTES_MAX / 8;
+        assert_eq!(entry_bytes * 8, FUTURE_BLOCK_BYTES_MAX);
+        assert!(entry_bytes <= crate::p2p::MAX_PROPOSAL_ENVELOPE_BYTES);
+        let retained = [
+            (source_a, entry_bytes),
+            (source_a, entry_bytes),
+            (Source::Gossip(Some([0xB1; 32])), entry_bytes),
+            (Source::Gossip(Some([0xC1; 32])), entry_bytes),
+            (Source::Gossip(Some([0xD1; 32])), entry_bytes),
+            (Source::Gossip(Some([0xE1; 32])), entry_bytes),
+            (Source::Gossip(Some([0xF1; 32])), entry_bytes),
+            (Source::Gossip(Some([0x71; 32])), entry_bytes),
+        ];
+        let (global, source_count, source_bytes) = future_retention_totals(
+            retained.iter().map(|(source, bytes)| (source, bytes)),
+            source_a,
+        );
+        assert_eq!(global, FUTURE_BLOCK_BYTES_MAX);
+        assert_eq!(source_count, 2);
+        assert_eq!(source_bytes, FUTURE_BLOCK_BYTES_PER_SOURCE);
+        assert!(retention_bytes_fit(0, global, FUTURE_BLOCK_BYTES_MAX));
+        assert!(!retention_bytes_fit(global, 1, FUTURE_BLOCK_BYTES_MAX));
+        assert!(retention_bytes_fit(0, source_bytes, FUTURE_BLOCK_BYTES_PER_SOURCE));
+        assert!(!retention_bytes_fit(
+            source_bytes,
+            1,
+            FUTURE_BLOCK_BYTES_PER_SOURCE,
+        ));
+
+        let (reopened_global, reopened_count, reopened_source_bytes) =
+            future_retention_totals(
+                retained
+                    .iter()
+                    .filter(|(source, _)| *source != source_a)
+                    .map(|(source, bytes)| (source, bytes)),
+                source_a,
+            );
+        assert_eq!(
+            reopened_global,
+            FUTURE_BLOCK_BYTES_MAX - FUTURE_BLOCK_BYTES_PER_SOURCE,
+        );
+        assert_eq!((reopened_count, reopened_source_bytes), (0, 0));
+        assert!(retention_bytes_fit(
+            reopened_global,
+            FUTURE_BLOCK_BYTES_PER_SOURCE,
+            FUTURE_BLOCK_BYTES_MAX,
+        ));
+        assert!(retention_bytes_fit(
+            reopened_source_bytes,
+            FUTURE_BLOCK_BYTES_PER_SOURCE,
+            FUTURE_BLOCK_BYTES_PER_SOURCE,
+        ));
+        assert!(reopened_count.saturating_add(2) <= FUTURE_BLOCKS_PER_SOURCE);
     }
 
     #[test]
