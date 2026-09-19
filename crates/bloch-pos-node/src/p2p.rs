@@ -1017,6 +1017,8 @@ enum Command {
     Broadcast(Vec<u8>),
     /// A local block whose bytes and suppression id were derived together.
     BroadcastBlock(crate::net::PreparedBlockBroadcast),
+    /// One admitted transaction whose canonical payload is already owned.
+    BroadcastTransaction(crate::net::PreparedTransactionBroadcast),
     /// The engine's verdict on a gossip message it was handed.
     Report(Origin, Verdict),
 }
@@ -1042,6 +1044,13 @@ impl Handle {
 
     pub(crate) fn broadcast_block(&self, prepared: crate::net::PreparedBlockBroadcast) {
         let _ = self.cmd.send(Command::BroadcastBlock(prepared));
+    }
+
+    pub(crate) fn broadcast_transaction(
+        &self,
+        prepared: crate::net::PreparedTransactionBroadcast,
+    ) {
+        let _ = self.cmd.send(Command::BroadcastTransaction(prepared));
     }
 
     /// Peers with a live connection right now. `0` on a swarm that is bound
@@ -1489,6 +1498,14 @@ fn handle_command(swarm: &mut Swarm, st: &mut Loop, cmd: Command) {
             {
                 publish(swarm, st.topics.blocks.clone(), payload, "blocks");
             }
+        }
+        Command::BroadcastTransaction(prepared) => {
+            publish(
+                swarm,
+                st.topics.txs.clone(),
+                prepared.into_payload(),
+                "txs",
+            );
         }
     }
 }
@@ -2732,11 +2749,37 @@ mod tests {
                     assert_eq!(reported.block_hint, Some((source, 99)));
                     assert!(reported.inner.is_none());
                 }
-                Command::Broadcast(_) | Command::BroadcastBlock(_) => {
+                Command::Broadcast(_)
+                | Command::BroadcastBlock(_)
+                | Command::BroadcastTransaction(_) => {
                     panic!("verdict became a broadcast")
                 }
             }
         }
+    }
+
+    #[test]
+    fn prepared_transaction_command_moves_same_payload_allocation() {
+        let (cmd, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = Handle {
+            cmd,
+            peer_id: PeerId::random(),
+            peers_live: Arc::new(AtomicUsize::new(0)),
+        };
+        let payload = vec![0x5C; 1 << 20];
+        let prepared = crate::net::PreparedTransactionBroadcast::new(&payload);
+        let original_ptr = prepared.payload().as_ptr();
+        let original_len = prepared.payload().len();
+
+        handle.broadcast_transaction(prepared);
+        let Command::BroadcastTransaction(received) =
+            rx.try_recv().expect("prepared transaction command was dropped")
+        else {
+            panic!("prepared transaction changed command variant");
+        };
+        let moved = received.into_payload();
+        assert_eq!(moved.as_ptr(), original_ptr, "command recopied transaction");
+        assert_eq!(moved.len(), original_len);
     }
 
     #[test]

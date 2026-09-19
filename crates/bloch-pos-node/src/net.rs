@@ -159,6 +159,38 @@ impl PreparedBlockBroadcast {
     pub(crate) fn into_payload(self) -> Vec<u8> { self.payload }
 }
 
+/// One canonical transaction payload prepared for transport-specific
+/// ownership. Construction copies from the engine's canonical mempool key
+/// into a buffer with at least one spare byte, so devnet can prepend its frame
+/// tag in place while libp2p can take the untagged payload without a recopy.
+pub(crate) struct PreparedTransactionBroadcast {
+    payload: Vec<u8>,
+}
+
+impl PreparedTransactionBroadcast {
+    pub(crate) fn new(canonical: &[u8]) -> Self {
+        let mut payload = Vec::with_capacity(canonical.len().saturating_add(1));
+        payload.extend_from_slice(canonical);
+        Self { payload }
+    }
+
+    fn devnet_frame(&self) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(self.payload.len().saturating_add(1));
+        frame.push(FRAME_TX);
+        frame.extend_from_slice(&self.payload);
+        frame
+    }
+
+    fn into_devnet_frame(mut self) -> Vec<u8> {
+        self.payload.insert(0, FRAME_TX);
+        self.payload
+    }
+
+    #[cfg(test)]
+    pub(crate) fn payload(&self) -> &[u8] { &self.payload }
+    pub(crate) fn into_payload(self) -> Vec<u8> { self.payload }
+}
+
 /// The transport the engine holds, chosen at startup.
 ///
 /// `Devnet` and `Libp2p` are what they always were. [`Net::Both`] is the
@@ -189,6 +221,19 @@ impl Net {
         }
     }
 
+    /// Publish one already-admitted canonical transaction without making the
+    /// libp2p command loop copy the complete payload away from a routing tag.
+    pub(crate) fn broadcast_transaction(&self, prepared: PreparedTransactionBroadcast) {
+        match self {
+            Net::Devnet(m) => m.broadcast(prepared.into_devnet_frame()),
+            Net::Libp2p(h) => h.broadcast_transaction(prepared),
+            Net::Both(m, h) => {
+                m.broadcast(prepared.devnet_frame());
+                h.broadcast_transaction(prepared);
+            }
+        }
+    }
+
     /// Publish one frame (a `FRAME_*` type byte followed by its payload, no
     /// length prefix). The devnet mesh sends it to every peer; libp2p routes
     /// it by that type byte onto the matching gossip topic, or onto the
@@ -200,7 +245,7 @@ impl Net {
             Net::Both(m, h) => {
                 // The SAME bytes on both wires. `frame` was built once by the
                 // caller (`block_frame`, `att_frame`, `get_blocks_frame`, or
-                // the transaction frame in `on_transaction`) and each
+                // another generic raw-frame caller) and each
                 // transport gets a copy of it, so there is no second encoding
                 // that could disagree with the first.
                 //
@@ -1700,6 +1745,28 @@ mod tests {
         assert_eq!(prepared.payload(), payload.as_slice());
         assert_eq!(prepared.devnet_frame(), expected_frame);
         assert_eq!(prepared.into_payload(), payload);
+    }
+
+    #[test]
+    fn prepared_transaction_broadcast_preserves_large_payload_and_transport_bytes() {
+        let payload = vec![0xA7; 1 << 20];
+        let prepared = PreparedTransactionBroadcast::new(&payload);
+        let libp2p_ptr = prepared.payload().as_ptr();
+        let devnet = prepared.devnet_frame();
+        let libp2p = prepared.into_payload();
+
+        assert_eq!(libp2p.as_ptr(), libp2p_ptr, "libp2p payload was recopied");
+        assert_eq!(libp2p, payload);
+        assert_eq!(devnet.len(), payload.len() + 1);
+        assert_eq!(devnet[0], FRAME_TX);
+        assert_eq!(&devnet[1..], payload.as_slice());
+
+        let prepared = PreparedTransactionBroadcast::new(&payload);
+        let devnet_ptr = prepared.payload().as_ptr();
+        let devnet = prepared.into_devnet_frame();
+        assert_eq!(devnet.as_ptr(), devnet_ptr, "devnet tag insertion reallocated");
+        assert_eq!(devnet[0], FRAME_TX);
+        assert_eq!(&devnet[1..], payload.as_slice());
     }
 
     #[test]

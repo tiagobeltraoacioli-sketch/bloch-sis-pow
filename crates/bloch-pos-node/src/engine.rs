@@ -4151,8 +4151,7 @@ impl Engine {
             self.mempool_suspect.remove(&lowest_key);
             self.mempool_evicted_low_fee = self.mempool_evicted_low_fee.saturating_add(1);
         }
-        let mut frame = vec![net::FRAME_TX];
-        frame.extend_from_slice(&key);
+        let broadcast = net::PreparedTransactionBroadcast::new(&key);
         // The retention clock starts at the head this node is on, not at the
         // wall slot: the TTL is "this many blocks of chain went by and never
         // took it", and a node whose clock runs ahead of its head must not
@@ -4160,7 +4159,7 @@ impl Engine {
         self.mempool_admitted_at
             .insert(key.clone(), self.head_slot_now());
         self.mempool.insert(key, tx);
-        self.net.broadcast(frame);
+        self.net.broadcast_transaction(broadcast);
         Ok(Admitted::New)
     }
 
