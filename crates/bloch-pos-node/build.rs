@@ -70,7 +70,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod build_command;
-use build_command::{configured_command_words, delegated_compiler, rustflags_linker};
+use build_command::{
+    configured_command_words, delegated_compiler, linker_from_printed_args, rustflags_linker,
+};
 
 /// Extensions that are build inputs for this binary.
 const SOURCE_EXT: &[&str] = &["rs", "toml", "c", "h", "S", "s", "macros"];
@@ -318,6 +320,67 @@ fn configured_tool_digests(target: &str, host: &str) -> Vec<(String, String)> {
     digests
 }
 
+fn explicit_linker_selected(target: &str) -> bool {
+    let cargo_target = target.to_ascii_uppercase().replace('-', "_");
+    for key in ["RUSTC_LINKER".to_owned(), format!("CARGO_TARGET_{cargo_target}_LINKER")] {
+        if std::env::var(key).is_ok_and(|value| !value.trim().is_empty()) {
+            return true;
+        }
+    }
+    std::env::var("CARGO_ENCODED_RUSTFLAGS")
+        .ok()
+        .and_then(|flags| rustflags_linker(&flags, true))
+        .or_else(|| {
+            std::env::var("CARGO_BUILD_RUSTFLAGS")
+                .ok()
+                .and_then(|flags| rustflags_linker(&flags, false))
+        })
+        .or_else(|| {
+            std::env::var("RUSTFLAGS")
+                .ok()
+                .and_then(|flags| rustflags_linker(&flags, false))
+        })
+        .is_some()
+}
+
+/// Ask rustc to link a tiny target binary and report the command it actually
+/// invoked. The exact probe files live in OUT_DIR and are removed immediately.
+fn default_linker_digest(rustc: &str, target: &str) -> Option<String> {
+    if target.is_empty() || target == "unknown" || explicit_linker_selected(target) {
+        return None;
+    }
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR")?);
+    let source = out_dir.join("bloch-linker-probe.rs");
+    let binary = out_dir.join("bloch-linker-probe-bin");
+    std::fs::write(&source, b"fn main() {}\n").ok()?;
+    let output = Command::new(rustc)
+        .arg(&source)
+        .args([
+            "--crate-name",
+            "bloch_linker_probe",
+            "--edition",
+            "2024",
+            "--target",
+            target,
+            "--print",
+            "link-args",
+            "-o",
+        ])
+        .arg(&binary)
+        .output()
+        .ok();
+    let _ = std::fs::remove_file(&source);
+    let _ = std::fs::remove_file(&binary);
+    let _ = std::fs::remove_file(binary.with_extension("exe"));
+    let output = output?;
+    if !output.status.success() {
+        return None;
+    }
+    let printed = String::from_utf8(output.stdout).ok()?;
+    let linker = linker_from_printed_args(&printed)?;
+    build_tool_digest(&linker)
+}
+
 /// Fingerprint the compiler implementation and target standard library that
 /// `rustc` selected from its sysroot. Hashing this small, load-bearing subset
 /// avoids walking an entire toolchain while binding more than version text or
@@ -442,6 +505,7 @@ fn build_environment_digest(
     cargo_binary_digest: Option<String>,
     rust_sysroot_digest: Option<String>,
     configured_tool_digests: &[(String, String)],
+    default_linker_digest: Option<String>,
     profile: &str,
     target: &str,
     host: &str,
@@ -459,6 +523,7 @@ fn build_environment_digest(
         ("profile".to_owned(), Some(profile.to_owned())),
         ("rustc-binary-sha3-256".to_owned(), rustc_binary_digest),
         ("rust-sysroot-components-sha3-256".to_owned(), rust_sysroot_digest),
+        ("probed-default-linker-sha3-256".to_owned(), default_linker_digest),
         ("rustc-version".to_owned(), Some(rustc_verbose.to_owned())),
         ("target".to_owned(), Some(target.to_owned())),
     ];
@@ -620,6 +685,8 @@ fn main() {
     let (rust_sysroot_digest, rust_sysroot_components) = rust_sysroot_digest(&rustc);
     let configured_tool_digests = configured_tool_digests(&target, &host);
     let configured_tool_binaries = configured_tool_digests.len();
+    let default_linker_digest = default_linker_digest(&rustc, &target);
+    let default_linker_binaries = usize::from(default_linker_digest.is_some());
     let tool_binaries = usize::from(rustc_binary_digest.is_some())
         + usize::from(cargo_binary_digest.is_some());
     let (environment_digest, environment_fields) = build_environment_digest(
@@ -629,6 +696,7 @@ fn main() {
         cargo_binary_digest,
         rust_sysroot_digest,
         &configured_tool_digests,
+        default_linker_digest,
         &profile,
         &target,
         &host,
@@ -642,6 +710,7 @@ fn main() {
     println!("cargo:rustc-env=BLOCH_BUILD_TOOL_BINARIES={tool_binaries}");
     println!("cargo:rustc-env=BLOCH_BUILD_SYSROOT_COMPONENTS={rust_sysroot_components}");
     println!("cargo:rustc-env=BLOCH_BUILD_CONFIGURED_TOOL_BINARIES={configured_tool_binaries}");
+    println!("cargo:rustc-env=BLOCH_BUILD_DEFAULT_LINKER_BINARIES={default_linker_binaries}");
 
     // ── `BLOCH_BUILD_DIRTY` is deliberately NOT stamped ────────────────────
     //

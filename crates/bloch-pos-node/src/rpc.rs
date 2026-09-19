@@ -2655,7 +2655,8 @@ pub fn build_info_json() -> Json {
                  selected rustc driver and target libstd sysroot components; \
                  explicitly configured linker/compiler/archive/wrapper bytes, \
                  including an unambiguous compiler delegated by known wrappers \
-                 and the linker selected by effective Rust flags; \
+                 and either the linker selected by effective Rust flags or the \
+                 platform default linker observed from a target link probe; \
                  host; target; profile; \
                  selected Rust/C codegen variables, including absent exact \
                  host/target forms; sorted, length-prefixed; values hashed, \
@@ -2677,6 +2678,10 @@ pub fn build_info_json() -> Json {
         (
             "build_configured_tool_binaries_hashed",
             Json::s(env!("BLOCH_BUILD_CONFIGURED_TOOL_BINARIES")),
+        ),
+        (
+            "build_default_linker_binaries_hashed",
+            Json::s(env!("BLOCH_BUILD_DEFAULT_LINKER_BINARIES")),
         ),
         // The bound rides with the answer. A client that reads `source_digest`
         // and stops reading has been told, in the response itself, what it is

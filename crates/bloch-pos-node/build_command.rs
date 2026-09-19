@@ -102,6 +102,50 @@ pub(crate) fn rustflags_linker(flags: &str, encoded: bool) -> Option<String> {
     linker
 }
 
+fn environment_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+}
+
+/// Extract the executable from stable rustc `--print link-args` output. Unix
+/// rustc may prefix the linker with `env`, unsets and assignments; other
+/// targets commonly print the linker directly. Unknown `env` options fail
+/// closed instead of guessing which later word is executable.
+pub(crate) fn linker_from_printed_args(output: &str) -> Option<String> {
+    let words = configured_command_words(output)?;
+    let first = words.first()?;
+    let is_env = Path::new(first)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("env") || name.eq_ignore_ascii_case("env.exe"));
+    if !is_env {
+        return Some(first.clone());
+    }
+
+    let mut index = 1usize;
+    while index < words.len() {
+        match words[index].as_str() {
+            "-u" | "--unset" => {
+                index = index.checked_add(2)?;
+                if index > words.len() {
+                    return None;
+                }
+            }
+            "-i" | "--ignore-environment" => index = index.saturating_add(1),
+            word if word.starts_with("--unset=") => index = index.saturating_add(1),
+            word if word.starts_with('-') => return None,
+            word if environment_assignment(word) => index = index.saturating_add(1),
+            command => return Some(command.to_owned()),
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +192,22 @@ mod tests {
         assert_eq!(rustflags_linker("-C linker=", false), None);
         assert_eq!(rustflags_linker("-C target-cpu=native", false), None);
         assert_eq!(rustflags_linker("-C linker='unterminated", false), None);
+    }
+
+    #[test]
+    fn printed_link_args_identify_direct_and_env_wrapped_linkers() {
+        assert_eq!(
+            linker_from_printed_args(r#""/usr/bin/clang" "one.o" -o out"#),
+            Some("/usr/bin/clang".into())
+        );
+        assert_eq!(
+            linker_from_printed_args(
+                r#"env -u SDKROOT LC_ALL="C" PATH="/tool bin:/usr/bin" "cc" one.o"#,
+            ),
+            Some("cc".into())
+        );
+        assert_eq!(linker_from_printed_args("env --unknown cc one.o"), None);
+        assert_eq!(linker_from_printed_args("env -u SDKROOT"), None);
+        assert_eq!(linker_from_printed_args(""), None);
     }
 }
