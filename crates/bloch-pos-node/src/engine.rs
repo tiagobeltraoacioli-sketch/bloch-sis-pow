@@ -82,6 +82,7 @@
 //! and, on a devnet, free; when it stops being free the fix is an incremental
 //! store with a test proving it equals the rebuild, not a cache with a comment.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
@@ -5214,12 +5215,15 @@ impl Engine {
         }
     }
 
-    /// Look up one block by id, genesis included.
-    fn envelope_by_id(&self, id: &[u8; 32]) -> Option<BlockEnvelope> {
+    /// Look up one block by id, genesis included. Genesis has no stored
+    /// envelope and remains synthesized; every retained block is immutable
+    /// here, so borrow it rather than copying its potentially large body just
+    /// to render header fields and body counts.
+    fn envelope_by_id<'a>(&'a self, id: &[u8; 32]) -> Option<Cow<'a, BlockEnvelope>> {
         if self.chain[0].1.as_bytes() == id {
-            return Some(self.genesis_envelope());
+            return Some(Cow::Owned(self.genesis_envelope()));
         }
-        self.blocks.get(id).cloned()
+        self.blocks.get(id).map(Cow::Borrowed)
     }
 
     fn block_reply(&self, env: &BlockEnvelope) -> Json {
@@ -5284,7 +5288,7 @@ impl Engine {
                         format!("slot {slot} names a block this node no longer stores"),
                     )
                 })?;
-                Ok(self.block_reply(&env))
+                Ok(self.block_reply(env.as_ref()))
             }
 
             RpcRequest::BlockById(id) => {
@@ -5297,7 +5301,7 @@ impl Engine {
                         ),
                     )
                 })?;
-                Ok(self.block_reply(&env))
+                Ok(self.block_reply(env.as_ref()))
             }
 
             RpcRequest::ValidatorByKey(hash) => rpc::validator_by_key_json(&self.state, &hash),
@@ -10049,6 +10053,74 @@ mod perf_support {
             doppelganger_halted: false,
         };
         (engine, TestDir(dir))
+    }
+}
+
+/// Block RPC lookup is a read of immutable retained data. Genesis is the one
+/// exception because it has no stored envelope and must be synthesized.
+#[cfg(test)]
+mod rpc_block_lookup_ownership {
+    use super::*;
+
+    #[test]
+    fn genesis_is_owned_stored_body_is_borrowed_and_both_rpc_routes_match() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let genesis_id = *engine.manifest.genesis_id().as_bytes();
+        let genesis_lookup = engine.envelope_by_id(&genesis_id).expect("genesis lookup");
+        assert!(matches!(genesis_lookup, Cow::Owned(_)), "genesis has no stored owner");
+        let genesis_json = engine.block_reply(genesis_lookup.as_ref());
+        drop(genesis_lookup);
+        assert_eq!(
+            engine.serve_rpc(RpcRequest::BlockById(genesis_id)),
+            Ok(genesis_json.clone()),
+        );
+        assert_eq!(
+            engine.serve_rpc(RpcRequest::BlockBySlot(0)),
+            Ok(genesis_json),
+        );
+
+        // The payload is deliberately material and absent from block JSON:
+        // only its count is rendered. The lookup must therefore retain the
+        // exact store owner, not reproduce its allocation.
+        let mut stored = engine.genesis_envelope();
+        stored.header.slot = 9;
+        stored.header.parent = genesis_id;
+        stored.body.transactions = vec![vec![0xA5; 1 << 20]];
+        stored.header.body_root = derive::body_root(&stored.body.transactions);
+        let stored_id = *stored.block_id().as_bytes();
+        engine.blocks.insert(stored_id, stored);
+        engine.chain.push((9, BlockId::of(&engine.blocks[&stored_id].header)));
+        engine.canonical.insert(stored_id);
+
+        let authoritative = engine.blocks.get(&stored_id).expect("stored block");
+        let lookup = engine.envelope_by_id(&stored_id).expect("stored lookup");
+        let Cow::Borrowed(borrowed) = lookup else {
+            panic!("a retained block body must not be cloned for an RPC summary")
+        };
+        assert!(std::ptr::eq(borrowed, authoritative));
+        assert_eq!(
+            borrowed.body.transactions[0].as_ptr(),
+            authoritative.body.transactions[0].as_ptr(),
+            "the proportional body allocation must remain the store's exact owner",
+        );
+        let stored_json = engine.block_reply(borrowed);
+
+        assert_eq!(
+            engine.serve_rpc(RpcRequest::BlockById(stored_id)),
+            Ok(stored_json.clone()),
+        );
+        assert_eq!(
+            engine.serve_rpc(RpcRequest::BlockBySlot(9)),
+            Ok(stored_json),
+        );
+        assert_eq!(
+            engine.serve_rpc(RpcRequest::BlockBySlot(8)).unwrap_err().code,
+            rpc::SLOT_EMPTY,
+        );
+        assert_eq!(
+            engine.serve_rpc(RpcRequest::BlockById([0xFF; 32])).unwrap_err().code,
+            rpc::BLOCK_NOT_FOUND,
+        );
     }
 }
 
