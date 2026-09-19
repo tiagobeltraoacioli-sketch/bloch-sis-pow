@@ -916,10 +916,10 @@ impl Keypair {
         // untrusted file with e.g. `memory_cost` near `u32::MAX` (KiB) would
         // otherwise force a multi-terabyte Argon2 allocation (OOM) on unlock,
         // and `output_len != 32` would panic the AES-256 key conversion below.
-        let mut enc_k = Zeroizing::new(derive_key_with_params(password, &salt, &ks.crypto.kdf_params)?);
+        let enc_k = derive_key_with_params(password, &salt, &ks.crypto.kdf_params)?;
 
         decrypt_legacy_keystore_in_place(&enc_k, &nonce_b, &mut plain)?;
-        enc_k.zeroize();
+        drop(enc_k);
 
         let payload: BorrowedKeystorePayload<'_> =
             serde_json::from_slice(&plain).map_err(|e| e.to_string())?;
@@ -1115,7 +1115,11 @@ const MAX_M_COST_KIB: u32 = 1024 * 1024; // 1 GiB
 const MAX_T_COST: u32 = 16;
 const MAX_P_COST: u32 = 16;
 
-fn derive_key_with_params(pw: &str, salt: &[u8], p: &KdfParams) -> Result<Vec<u8>, String> {
+fn derive_key_with_params(
+    pw: &str,
+    salt: &[u8],
+    p: &KdfParams,
+) -> Result<Zeroizing<Vec<u8>>, String> {
     if p.memory_cost > MAX_M_COST_KIB || p.time_cost > MAX_T_COST || p.parallelism > MAX_P_COST {
         return Err(format!(
             "KDF params out of bounds (memory_cost={} KiB, time_cost={}, parallelism={})",
@@ -1130,7 +1134,7 @@ fn derive_key_with_params(pw: &str, salt: &[u8], p: &KdfParams) -> Result<Vec<u8
     let params = Params::new(p.memory_cost, p.time_cost, p.parallelism, Some(32))
         .map_err(|e| e.to_string())?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut key = vec![0u8; 32];
+    let mut key = Zeroizing::new(vec![0u8; 32]);
     argon2.hash_password_into(pw.as_bytes(), salt, &mut key).map_err(|e| e.to_string())?;
     Ok(key)
 }
@@ -1160,6 +1164,36 @@ mod legacy_keystore_tests {
         assert_eq!(&plain[..], &expected);
         plain.zeroize();
         assert!(plain.is_empty() || plain.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn legacy_load_kdf_returns_exact_zeroizing_owner() {
+        let _: fn(
+            &str,
+            &[u8],
+            &KdfParams,
+        ) -> Result<Zeroizing<Vec<u8>>, String> = derive_key_with_params;
+
+        let kdf = KdfParams {
+            memory_cost: 8,
+            time_cost: 1,
+            parallelism: 1,
+            salt: String::new(),
+            output_len: 32,
+        };
+        let salt = [0x39; 16];
+        let mut expected = vec![0u8; 32];
+        let params = Params::new(8, 1, 1, Some(32)).unwrap();
+        Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+            .hash_password_into(b"synthetic-test-password", &salt, &mut expected)
+            .unwrap();
+
+        let mut actual =
+            derive_key_with_params("synthetic-test-password", &salt, &kdf).unwrap();
+        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
+        assert_eq!(&actual[..], &expected);
+        actual.zeroize();
+        assert!(actual.is_empty() || actual.iter().all(|byte| *byte == 0));
     }
 
     #[test]
