@@ -172,6 +172,14 @@ if [ "$LOCKS_ONLY" = 1 ]; then
   exit 0
 fi
 
+# A commit stamp cannot identify bytes read from tracked local edits. Keep
+# untracked CI output out of scope, but refuse both worktree and index changes
+# before selecting a toolchain or starting either release build.
+git diff --quiet -- \
+  || fail "tracked working tree differs from HEAD; commit or restore it before the release check"
+git diff --cached --quiet -- \
+  || fail "index differs from HEAD; commit or restore it before the release check"
+
 # ── 0. Preconditions ─────────────────────────────────────────────────────────
 [ -f "$NODE_DIR/rust-toolchain.toml" ] \
   || fail "crates/bloch-pos-node/rust-toolchain.toml is missing. The release \
@@ -193,9 +201,9 @@ esac
 
 
 # ── 2. Deterministic double build ────────────────────────────────────────────
-# Same source path, two fresh target dirs. BLOCH_BUILD_COMMIT is passed
-# explicitly so the stamp is identical even on a dirty CI tree, and so this is
-# the same code path a container release build uses.
+# Same clean source path, two fresh target dirs. BLOCH_BUILD_COMMIT is passed
+# explicitly so the stamp is identical in both builds and so this is the same
+# code path a container release build uses.
 COMMIT="$(git rev-parse --short=12 HEAD)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pos-repro.XXXXXX")"
 trap 'rm -rf "$WORK" "$LOCK_META"' EXIT

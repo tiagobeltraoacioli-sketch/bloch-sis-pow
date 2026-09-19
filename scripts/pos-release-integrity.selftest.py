@@ -24,7 +24,9 @@ asserts BOTH directions:
     cannot quietly undo itself;
   * a member that grows its own `[workspace]` table FAILS instead of going
     unguarded — the shape the old comments wrongly believed was already true;
-  * a renamed PoS crate FAILS rather than dropping out of the guard's scope.
+  * a renamed PoS crate FAILS rather than dropping out of the guard's scope;
+  * full mode refuses tracked source edits both unstaged and staged, while an
+    untracked CI-output file advances beyond the source-cleanliness checks.
 
 The post-build drift diff (section 3) needs a compiler and a minute of build to
 reach, so it is asserted at the source level instead: it must name the root
@@ -129,8 +131,8 @@ def expect_pass(case: str, root: str, must_say: str) -> None:
         print(f"  ok   {case}")
 
 
-def expect_fail(case: str, root: str, must_say: str) -> None:
-    res = run_guard(root)
+def expect_fail(case: str, root: str, must_say: str, *, args=None) -> None:
+    res = run_guard(root, args=args)
     out = res.stdout + res.stderr
     if res.returncode == 0:
         FAILURES.append(f"{case}: guard PASSED on a tree it must reject\n{out}")
@@ -219,6 +221,33 @@ def main() -> int:
         git(root, "add", "Cargo.lock")
         expect_fail("staged root Cargo.lock", root, "root Cargo.lock differs")
 
+    # A full release check must never label locally edited tracked bytes with
+    # HEAD. These cases stop after metadata/lock validation and before rustc or
+    # either build, so they remain fast and hermetic.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = build_fixture(tmp)
+        write(os.path.join(root, "crates", "bloch-pos-node", "src", "lib.rs"),
+              "// unstaged release source\n")
+        expect_fail("unstaged tracked release source", root,
+                    "tracked working tree differs from HEAD", args=[])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = build_fixture(tmp)
+        source = os.path.join(root, "crates", "bloch-pos-node", "src", "lib.rs")
+        write(source, "// staged release source\n")
+        git(root, "add", "crates/bloch-pos-node/src/lib.rs")
+        expect_fail("staged tracked release source", root,
+                    "index differs from HEAD", args=[])
+
+    # Untracked CI output is deliberately outside the source-cleanliness
+    # contract. Prove it passes the new checks and reaches the next expected
+    # precondition (the minimal fixture intentionally has no toolchain pin).
+    with tempfile.TemporaryDirectory() as tmp:
+        root = build_fixture(tmp)
+        write(os.path.join(root, "untracked-ci-output"), "not a build input\n")
+        expect_fail("untracked output remains permitted", root,
+                    "rust-toolchain.toml is missing", args=[])
+
     # Reject ambient build overrides before metadata/compiler execution. Never
     # echo their contents; flags and wrapper paths may contain private values.
     with tempfile.TemporaryDirectory() as tmp:
@@ -264,9 +293,9 @@ def main() -> int:
         for f in FAILURES:
             print(f"\n- {f}", file=sys.stderr)
         return 1
-    print("\npos-release-integrity.selftest: PASS — the lockfile guard fires on "
-          "root-lock drift, on resurrected per-member lockfiles, and on a "
-          "workspace layout it no longer covers.")
+    print("\npos-release-integrity.selftest: PASS — lock/layout drift and "
+          "tracked release-source edits fail closed; untracked output remains "
+          "outside the full-mode cleanliness contract.")
     return 0
 
 
