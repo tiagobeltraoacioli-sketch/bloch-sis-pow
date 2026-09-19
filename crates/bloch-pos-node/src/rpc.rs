@@ -2655,7 +2655,8 @@ pub fn build_info_json() -> Json {
                  selected rustc driver and target libstd sysroot components; \
                  explicitly configured linker/compiler/archive/wrapper bytes, \
                  including an unambiguous compiler delegated by known wrappers \
-                 plus the C compiler selected by cc-rs even when unconfigured, \
+                 plus the C compiler and archiver selected by cc-rs even when \
+                 unconfigured, \
                  and either the linker selected by effective Rust flags or the \
                  platform default linker observed from a target link probe; \
                  host; target; profile; \

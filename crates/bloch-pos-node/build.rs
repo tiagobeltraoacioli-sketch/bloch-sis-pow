@@ -76,7 +76,7 @@ mod build_source_digest;
 use build_command::{
     command_from_env, delegated_compiler, linker_from_printed_args, rustflags_linker,
 };
-use build_native_tool::required_cc_compiler_digest;
+use build_native_tool::{required_cc_archiver_digest, required_cc_compiler_digest};
 use build_source_digest::required_source_digest;
 
 /// Walk from the crate directory to the workspace root: the first ancestor
@@ -473,6 +473,7 @@ fn build_environment_digest(
     rust_sysroot_digest: Option<String>,
     configured_tool_digests: &[(String, String)],
     cc_compiler_digest: String,
+    cc_archiver_digest: String,
     default_linker_digest: Option<String>,
     profile: &str,
     target: &str,
@@ -501,6 +502,10 @@ fn build_environment_digest(
         (
             "selected-cc-compiler-sha3-256".to_owned(),
             Some(cc_compiler_digest),
+        ),
+        (
+            "selected-cc-archiver-sha3-256".to_owned(),
+            Some(cc_archiver_digest),
         ),
         ("rustc-version".to_owned(), Some(rustc_verbose.to_owned())),
         ("target".to_owned(), Some(target.to_owned())),
@@ -666,6 +671,7 @@ fn main() {
     let configured_tool_digests = configured_tool_digests(&target, &host);
     let configured_tool_binaries = configured_tool_digests.len();
     let cc_compiler_digest = required_cc_compiler_digest(&target, &host);
+    let cc_archiver_digest = required_cc_archiver_digest(&target, &host);
     let default_linker_digest = default_linker_digest(&rustc, &target);
     let default_linker_binaries = usize::from(default_linker_digest.is_some());
     let tool_binaries =
@@ -678,6 +684,7 @@ fn main() {
         rust_sysroot_digest,
         &configured_tool_digests,
         cc_compiler_digest,
+        cc_archiver_digest,
         default_linker_digest,
         &profile,
         &target,

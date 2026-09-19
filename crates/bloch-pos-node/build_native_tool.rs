@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Identity for the C compiler that cc-rs actually selects.
+//! Identity for the native tools that cc-rs actually selects.
 
 use sha3::{Digest, Sha3_256};
 use std::path::Path;
@@ -43,6 +43,25 @@ pub(crate) fn required_cc_compiler_digest(target: &str, host: &str) -> String {
         panic!(
             "cannot read required cc-rs compiler selected for the build: {}",
             compiler.path().display()
+        )
+    })
+}
+
+/// Resolve the archiver used to turn the checked-in PQ objects into static
+/// libraries. cc-rs may select this tool without an explicit `AR`, just as it
+/// may select the compiler without `CC`; both executables are build inputs.
+#[cfg(not(test))]
+pub(crate) fn required_cc_archiver_digest(target: &str, host: &str) -> String {
+    let archiver = cc::Build::new()
+        .target(target)
+        .host(host)
+        .try_get_archiver()
+        .unwrap_or_else(|error| panic!("cannot identify required cc-rs archiver: {error}"));
+    let program = Path::new(archiver.get_program());
+    tool_file_digest(program).unwrap_or_else(|| {
+        panic!(
+            "cannot read required cc-rs archiver selected for the build: {}",
+            program.display()
         )
     })
 }
