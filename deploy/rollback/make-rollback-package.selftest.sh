@@ -35,16 +35,59 @@ fails=0
 ok()   { echo "  ok   $1"; }
 bad()  { echo "  FAIL $1"; fails=$((fails + 1)); }
 
-# macOS has no sha256sum; install.sh is written for the Linux fleet and calls
-# it directly. Shim it so the generated script runs verbatim here too.
+# Put a controllable SHA-256 shim first on PATH. Canonical mode delegates to
+# the host implementation; adversarial modes let the real assembler prove it
+# fails closed on successful-but-malformed output. This also supplies the
+# Linux `sha256sum` interface used by generated install.sh on macOS.
 mkdir -p "$W/bin"
-if ! command -v sha256sum >/dev/null; then
-  cat > "$W/bin/sha256sum" <<'SHIM'
+REAL_SHA256SUM="$(command -v sha256sum || true)"
+REAL_SHASUM="$(command -v shasum || true)"
+[ -n "$REAL_SHA256SUM" ] || [ -n "$REAL_SHASUM" ] || {
+  echo "FAIL: no host SHA-256 implementation is available"
+  exit 1
+}
+export REAL_SHA256SUM REAL_SHASUM
+cat > "$W/bin/sha256sum" <<'SHIM'
 #!/usr/bin/env bash
-if [ "${1:-}" = "-c" ]; then shasum -a 256 -c "$2"; else shasum -a 256 "$@"; fi
+set -euo pipefail
+delegate() {
+  if [ -n "${REAL_SHA256SUM:-}" ]; then
+    exec "$REAL_SHA256SUM" "$@"
+  elif [ "${1:-}" = -c ]; then
+    exec "$REAL_SHASUM" -a 256 -c "$2"
+  else
+    exec "$REAL_SHASUM" -a 256 "$@"
+  fi
+}
+case "${ROLLBACK_SHA_MODE:-canonical}" in
+  canonical) delegate "$@" ;;
+  exit) exit 71 ;;
+  short) printf '%063d  %s\n' 0 "${1:-input}" ;;
+  nonhex) printf '%064d  %s\n' 0 "${1:-input}" | tr 0 g ;;
+  uppercase) printf '%064d  %s\n' 0 "${1:-input}" | tr 0 A ;;
+  duplicate)
+    printf '%064d  %s\n' 0 "${1:-input}"
+    printf '%064d  second-row\n' 0
+    ;;
+  late-duplicate|tarball-duplicate)
+    state="${ROLLBACK_SHA_STATE:?missing ROLLBACK_SHA_STATE}"
+    count=0
+    [ ! -f "$state" ] || count="$(cat "$state")"
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$state"
+    fail_at=3
+    [ "${ROLLBACK_SHA_MODE}" != tarball-duplicate ] || fail_at=7
+    if [ "$count" -eq "$fail_at" ]; then
+      printf '%064d  %s\n' 0 "${1:-input}"
+      printf '%064d  second-row\n' 0
+    else
+      delegate "$@"
+    fi
+    ;;
+  *) exit 72 ;;
+esac
 SHIM
-  chmod 0755 "$W/bin/sha256sum"
-fi
+chmod 0755 "$W/bin/sha256sum"
 export PATH="$W/bin:$PATH"
 
 # ── disposable keys ─────────────────────────────────────────────────────────
@@ -58,6 +101,37 @@ cat > "$W/bloch-pos" <<BINSTUB
 echo "bloch-pos-node $STAMP built-by-selftest"
 BINSTUB
 chmod 0755 "$W/bloch-pos"
+
+expect_sha_failure() { # $1 = mode, $2 = expected diagnostic
+  mode="$1"
+  expected="$2"
+  output="$W/sha-$mode"
+  log="$W/sha-$mode.log"
+  state="$W/sha-$mode.state"
+  if ROLLBACK_SHA_MODE="$mode" ROLLBACK_SHA_STATE="$state" \
+      BLOCH_ROLLBACK_SECKEY="$W/rel.key" BLOCH_ROLLBACK_PUBKEY="$W/rel.pub" \
+      "$ASSEMBLER" "$W/bloch-pos" "$STAMP" "$output" > "$log" 2>&1; then
+    bad "assembler accepted $mode SHA-256 output"
+  elif ! grep -Fq "$expected" "$log"; then
+    bad "assembler rejected $mode SHA-256 output without the expected diagnostic"
+    sed 's/^/       /' "$log"
+  elif [ -d "$output" ] \
+      && [ -n "$(find "$output" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+    bad "assembler published output after rejecting $mode SHA-256 output"
+  else
+    ok "assembler refuses $mode SHA-256 output before publication"
+  fi
+}
+
+expect_sha_failure exit 'SHA-256 tool failed for the rollback binary'
+expect_sha_failure short 'digest that is not exactly 64 characters for the rollback binary'
+expect_sha_failure nonhex 'non-lowercase hexadecimal digest for the rollback binary'
+expect_sha_failure uppercase 'non-lowercase hexadecimal digest for the rollback binary'
+expect_sha_failure duplicate 'non-lowercase hexadecimal digest for the rollback binary'
+expect_sha_failure late-duplicate \
+  'non-lowercase hexadecimal digest for rollback manifest entry STAMP'
+expect_sha_failure tarball-duplicate \
+  'non-lowercase hexadecimal digest for the rollback tarball'
 
 # ── 1. the assembler fails closed with no signing key ───────────────────────
 out="$(env -u BLOCH_ROLLBACK_SECKEY "$ASSEMBLER" "$W/bloch-pos" "$STAMP" "$W/unsigned" 2>&1)"

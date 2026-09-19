@@ -52,9 +52,27 @@ if [ -z "$OUTDIR" ]; then OUTDIR="$(cd "$(dirname "$0")" && pwd)/dist"; fi
 
 [ -f "$BIN" ] || { echo "no such binary: $BIN" >&2; exit 1; }
 
-sha() {
+sha256_file() {
   if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}';
   else shasum -a 256 "$1" | awk '{print $1}'; fi
+}
+validated_sha256_file() { # $1 = file, $2 = diagnostic context
+  local digest
+  digest="$(sha256_file "$1")" || {
+    echo "FAIL: SHA-256 tool failed for $2." >&2
+    return 1
+  }
+  case "$digest" in
+    ''|*[!0123456789abcdef]*)
+      echo "FAIL: SHA-256 tool returned a non-lowercase hexadecimal digest for $2." >&2
+      return 1
+      ;;
+  esac
+  if [ "${#digest}" -ne 64 ]; then
+    echo "FAIL: SHA-256 tool returned a digest that is not exactly 64 characters for $2." >&2
+    return 1
+  fi
+  printf '%s\n' "$digest"
 }
 # ── signing key, resolved BEFORE anything is assembled ───────────────────────
 # Fail closed and fail early: an unsigned rollback package must not exist even
@@ -104,7 +122,7 @@ if V="$("$SNAPSHOT" --version 2>/dev/null)"; then
     *) echo "STAMP MISMATCH: --version says '$V', you said '$STAMP'." >&2; exit 1 ;;
   esac
 fi
-HASH="$(sha "$SNAPSHOT")"
+HASH="$(validated_sha256_file "$SNAPSHOT" 'the rollback binary')"
 
 # Short id for filenames: the parenthesised commit if present, else the hash.
 ID="$(printf '%s' "$STAMP" | sed -n 's/.*(\([0-9a-f]\{7,\}\)).*/\1/p')"
@@ -279,7 +297,8 @@ EOF
 # ── the manifest: every file that reaches root, not just the binary ──────────
 : > "$PKGDIR/SHA256SUMS"
 for f in bloch-pos STAMP 99-rollback.conf install.sh README; do
-  printf '%s  %s\n' "$(sha "$PKGDIR/$f")" "$f" >> "$PKGDIR/SHA256SUMS"
+  file_hash="$(validated_sha256_file "$PKGDIR/$f" "rollback manifest entry $f")"
+  printf '%s  %s\n' "$file_hash" "$f" >> "$PKGDIR/SHA256SUMS"
 done
 
 # ── the detached signature (audit I-H3) ─────────────────────────────────────
@@ -295,23 +314,26 @@ minisign -V -q -p "$PUBFILE" -x "$PKGDIR/SHA256SUMS.minisig" -m "$PKGDIR/SHA256S
   exit 1
 }
 
-TARBALL="$OUTDIR/bloch-pos-rollback-$ID.tar.gz"
+PRIVATE_TARBALL="$WORK/bloch-pos-rollback-$ID.tar.gz"
 # Deterministic-ish tar: sorted names, fixed owner. (GNU tar options guarded
 # for bsdtar on macOS; the tarball hash is recorded either way.)
 if tar --version 2>/dev/null | grep -q GNU; then
   tar --sort=name --owner=0 --group=0 --numeric-owner \
-      -C "$(dirname "$PKGDIR")" -czf "$TARBALL" "$(basename "$PKGDIR")"
+      -C "$(dirname "$PKGDIR")" -czf "$PRIVATE_TARBALL" "$(basename "$PKGDIR")"
 else
   ( cd "$(dirname "$PKGDIR")" && find "$(basename "$PKGDIR")" | sort \
-    | tar -czf "$TARBALL" -T - )
+    | tar -czf "$PRIVATE_TARBALL" -T - )
 fi
+package_hash="$(validated_sha256_file "$PRIVATE_TARBALL" 'the rollback tarball')"
 
 # The public key is published BESIDE the tarball, never inside it: a key that
 # travels with the bytes it authenticates authenticates nothing.
+TARBALL="$OUTDIR/bloch-pos-rollback-$ID.tar.gz"
+mv "$PRIVATE_TARBALL" "$TARBALL"
 cp "$PUBFILE" "$OUTDIR/bloch-pos-rollback-$ID.pub"
 
 echo "rollback package: $TARBALL"
-echo "sha256(package):  $(sha "$TARBALL")"
+echo "sha256(package):  $package_hash"
 echo "signing pubkey:   $PUBLINE"
 echo "                  (also written to $OUTDIR/bloch-pos-rollback-$ID.pub)"
 echo
