@@ -25,6 +25,8 @@ job `build-and-test` — to the posture the finding required:
   * it carries no escape hatch: `allow_failure: true`, `continue-on-error:
     true`, an `exit 0` skip, `when: manual`, or a GitHub custom/default shell
     that can replace the test script's exit status.
+  * its GitLab inherited `default:`/`variables:` context remains the reviewed
+    explicit subset, with no job-local script hooks or execution variables.
 
 The live-crate list is duplicated in `.github/workflows/tests.yml` on
 purpose: the workflow states what it gates, this file makes dropping a crate
@@ -73,6 +75,19 @@ ESCAPES = (
 TIMEOUTS = (
     re.compile(r"^\s*timeout:\s*\S"),          # GitLab
     re.compile(r"^\s*timeout-minutes:\s*\d"),  # GitHub
+)
+SAFE_GITLAB_DEFAULT = (
+    "tags:",
+    "- bloch-linux-aarch64",
+    "before_script:",
+    '- export PATH="$HOME/.cargo/bin:$PATH"',
+    "- rustc --version && cargo --version",
+    "- clang --version | head -1 || true",
+    "- cmake --version | head -1 || true",
+)
+SAFE_GITLAB_VARIABLES = (
+    'CARGO_TERM_COLOR: "always"',
+    'RUST_BACKTRACE: "1"',
 )
 
 
@@ -171,6 +186,58 @@ def complete_test_tokens(command: str) -> list[str] | None:
     return tokens
 
 
+def normalized_yaml_lines(lines: list[str]) -> tuple[str, ...]:
+    return tuple(
+        re.sub(r"\s+#.*$", "", line.strip())
+        for line in lines
+        if re.sub(r"\s+#.*$", "", line.strip()))
+
+
+def check_gitlab_global_context(text: str, blocks: dict[str, list[str]]) -> list[str]:
+    problems = []
+    present = {
+        match.group(1)
+        for line in text.splitlines()
+        if (match := re.match(
+            r"^(default|variables|before_script|after_script|hooks):", line))
+    }
+    for key in ("before_script", "after_script", "hooks"):
+        if key in present:
+            problems.append(
+                ".gitlab-ci.yml: top-level `%s:` is outside the supported "
+                "inherited execution context" % key)
+    if "default" in present and (
+            "default" not in blocks
+            or normalized_yaml_lines(blocks["default"]) != SAFE_GITLAB_DEFAULT):
+        problems.append(
+            ".gitlab-ci.yml: `default:` differs from the reviewed runner tags "
+            "and fail-fast before_script")
+    if "variables" in present and (
+            "variables" not in blocks
+            or normalized_yaml_lines(blocks["variables"]) != SAFE_GITLAB_VARIABLES):
+        problems.append(
+            ".gitlab-ci.yml: top-level `variables:` differs from the reviewed "
+            "non-execution-affecting subset")
+    return problems
+
+
+def check_gitlab_job_context(body: list[str], job: str, indent: int) -> list[str]:
+    problems = []
+    for line in body:
+        spaces = len(line) - len(line.lstrip(" "))
+        if spaces != indent + 2:
+            continue
+        value = re.sub(r"\s+#.*$", "", line.strip())
+        key = value.split(":", 1)[0]
+        if key == "before_script" and value != "before_script: []":
+            problems.append(f".gitlab-ci.yml: job `{job}` has an unreviewed `before_script:`")
+        elif key in ("after_script", "hooks"):
+            problems.append(f".gitlab-ci.yml: job `{job}` uses unsupported `{key}:` context")
+        elif key == "variables":
+            problems.append(f".gitlab-ci.yml: job `{job}` has unreviewed execution variables")
+    return problems
+
+
 def check_job(path: str, job: str, indent: int, label: str) -> list[str]:
     if not os.path.exists(path):
         return ["%s: MISSING — the pipeline definition itself is gone" % label]
@@ -182,6 +249,10 @@ def check_job(path: str, job: str, indent: int, label: str) -> list[str]:
 
     body = blocks[job]
     problems: list[str] = []
+
+    if label == ".gitlab-ci.yml":
+        problems += check_gitlab_global_context(text, job_blocks(text, 0))
+        problems += check_gitlab_job_context(body, job, indent)
 
     if label == ".github/workflows/tests.yml":
         top_level = job_blocks(text, 0)

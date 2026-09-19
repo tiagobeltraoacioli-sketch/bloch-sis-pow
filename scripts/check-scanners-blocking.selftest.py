@@ -52,6 +52,21 @@ TRACKED_LOCKFILES = (
     "spikes/prover-cost/rv32h/Cargo.lock",
     "spikes/prover-cost/rv32k/Cargo.lock",
 )
+SAFE_GITLAB_GLOBALS = """\
+variables:
+  CARGO_TERM_COLOR: "always"
+  RUST_BACKTRACE: "1"
+
+default:
+  tags:
+    - bloch-linux-aarch64
+  before_script:
+    - export PATH="$HOME/.cargo/bin:$PATH"
+    - rustc --version && cargo --version
+    - clang --version | head -1 || true
+    - cmake --version | head -1 || true
+
+"""
 
 GOOD_GITLAB = """\
 stages:
@@ -212,6 +227,43 @@ def sub(text: str, old: str, new: str) -> str:
 
 CASES = [
     Case("honest pipelines stay green", GOOD_GITLAB, GOOD_GITHUB, must_fail=False),
+
+    Case("reviewed GitLab inherited context stays green",
+         SAFE_GITLAB_GLOBALS + GOOD_GITLAB, GOOD_GITHUB, must_fail=False),
+
+    Case("GitLab default before_script cannot disable fail-fast",
+         SAFE_GITLAB_GLOBALS.replace(
+             "    - cmake --version | head -1 || true",
+             "    - cmake --version | head -1 || true\n    - set +e") + GOOD_GITLAB,
+         GOOD_GITHUB, must_fail=True, expect="`default:` differs"),
+
+    Case("GitLab global variables cannot inject BASH_ENV",
+         SAFE_GITLAB_GLOBALS.replace(
+             '  RUST_BACKTRACE: "1"',
+             '  RUST_BACKTRACE: "1"\n  BASH_ENV: scripts/mask-verdict.sh') + GOOD_GITLAB,
+         GOOD_GITHUB, must_fail=True, expect="top-level `variables:` differs"),
+
+    Case("GitLab top-level hooks are outside the supported context",
+         "hooks:\n  pre_get_sources_script:\n    - export PATH=fake:$PATH\n\n" + GOOD_GITLAB,
+         GOOD_GITHUB, must_fail=True, expect="top-level `hooks:`"),
+
+    Case("required GitLab job cannot add a before_script",
+         GOOD_GITLAB.replace(
+             "cargo-audit:\n  stage: check",
+             "cargo-audit:\n  stage: check\n  before_script:\n    - set +e"),
+         GOOD_GITHUB, must_fail=True, expect="unreviewed `before_script:`"),
+
+    Case("required GitLab job cannot add an after_script",
+         GOOD_GITLAB.replace(
+             "supply-chain:\n  stage: check",
+             "supply-chain:\n  stage: check\n  after_script:\n    - true"),
+         GOOD_GITHUB, must_fail=True, expect="unsupported `after_script:`"),
+
+    Case("required GitLab job cannot inject PATH variables",
+         GOOD_GITLAB.replace(
+             "secret-scan:\n  stage: check",
+             "secret-scan:\n  stage: check\n  variables:\n    PATH: scripts/fake-bin"),
+         GOOD_GITHUB, must_fail=True, expect="unreviewed execution variables"),
 
     Case("history scanner deleted",
          GOOD_GITLAB.replace("secret-history-scan:\n  stage: check\n  script:\n    - bash scripts/scan-secrets.sh history\n  allow_failure: false\n", ""),

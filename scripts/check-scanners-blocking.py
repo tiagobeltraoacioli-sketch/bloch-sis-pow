@@ -53,6 +53,8 @@ security job, fails if the job:
     `Cargo.lock` files in either direction.
   * adds GitHub top-level defaults or a required-job custom shell that can
     replace an otherwise unchanged verdict's exit status.
+  * changes the reviewed GitLab inherited default/variable context, or gives a
+    required job unreviewed before/after scripts, hooks or variables.
 
 It does NOT require every job to be blocking. cargo-geiger, miri and the fuzz
 smoke are deliberately report-only, with written reasons, and stay green here.
@@ -142,6 +144,19 @@ SHELL_ESCAPES = (
 
 FALSE_LITERALS = {"false", "no", "0"}
 SAFE_WHEN = {"on_success", "always"}
+SAFE_GITLAB_DEFAULT = (
+    "tags:",
+    "- bloch-linux-aarch64",
+    "before_script:",
+    '- export PATH="$HOME/.cargo/bin:$PATH"',
+    "- rustc --version && cargo --version",
+    "- clang --version | head -1 || true",
+    "- cmake --version | head -1 || true",
+)
+SAFE_GITLAB_VARIABLES = (
+    'CARGO_TERM_COLOR: "always"',
+    'RUST_BACKTRACE: "1"',
+)
 
 
 def job_blocks(text: str, indent: int) -> dict[str, list[str]]:
@@ -322,6 +337,76 @@ def tracked_lockfiles(manifest: str | None) -> tuple[list[str], str | None]:
     return sorted(values), None
 
 
+def normalized_yaml_lines(lines: list[str]) -> tuple[str, ...]:
+    return tuple(
+        re.sub(r"\s+#.*$", "", line.strip())
+        for line in lines
+        if re.sub(r"\s+#.*$", "", line.strip()))
+
+
+def check_gitlab_global_context(text: str, blocks: dict[str, list[str]]) -> list[str]:
+    """Restrict inherited GitLab execution context to the reviewed subset."""
+    problems = []
+    present = {
+        match.group(1)
+        for line in text.splitlines()
+        if (match := re.match(
+            r"^(default|variables|before_script|after_script|hooks):", line))
+    }
+    for key in ("before_script", "after_script", "hooks"):
+        if key in present:
+            problems.append(
+                ".gitlab-ci.yml: top-level `%s:` is outside the supported "
+                "inherited execution context" % key)
+    if "default" in present:
+        if ("default" not in blocks
+                or normalized_yaml_lines(blocks["default"]) != SAFE_GITLAB_DEFAULT):
+            problems.append(
+                ".gitlab-ci.yml: `default:` differs from the reviewed runner "
+                "tags and fail-fast before_script")
+    if "variables" in present:
+        if ("variables" not in blocks
+                or normalized_yaml_lines(blocks["variables"]) != SAFE_GITLAB_VARIABLES):
+            problems.append(
+                ".gitlab-ci.yml: top-level `variables:` differs from the "
+                "reviewed non-execution-affecting subset")
+    return problems
+
+
+def check_gitlab_job_context(body: list[str], job: str, indent: int) -> list[str]:
+    problems = []
+    index = 0
+    while index < len(body):
+        line = body[index]
+        spaces = len(line) - len(line.lstrip(" "))
+        value = re.sub(r"\s+#.*$", "", line.strip())
+        if spaces != indent + 2:
+            index += 1
+            continue
+        key = value.split(":", 1)[0]
+        if key == "before_script" and value != "before_script: []":
+            problems.append(
+                ".gitlab-ci.yml: job `%s` has an unreviewed `before_script:`" % job)
+        elif key in ("after_script", "hooks"):
+            problems.append(
+                ".gitlab-ci.yml: job `%s` uses unsupported `%s:` context" % (job, key))
+        elif key == "variables":
+            nested = []
+            scan = index + 1
+            while scan < len(body):
+                candidate = body[scan]
+                if len(candidate) - len(candidate.lstrip(" ")) <= indent + 2:
+                    break
+                nested.append(candidate)
+                scan += 1
+            expected = ('GIT_DEPTH: "0"',) if job == "secret-history-scan" else ()
+            if value != "variables:" or normalized_yaml_lines(nested) != expected:
+                problems.append(
+                    ".gitlab-ci.yml: job `%s` has unreviewed execution variables" % job)
+        index += 1
+    return problems
+
+
 def check_file(
     path: str,
     required: dict[str, str],
@@ -335,6 +420,8 @@ def check_file(
     blocks = job_blocks(text, indent)
     problems: list[str] = []
     if label == ".gitlab-ci.yml":
+        top_level = job_blocks(text, 0)
+        problems += check_gitlab_global_context(text, top_level)
         for line in text.splitlines():
             if re.match(r"^(?:include|workflow):(?:\s|$)", line):
                 key = line.split(":", 1)[0]
@@ -395,6 +482,8 @@ def check_file(
                 "gate that passed." % (label, job, why))
             continue
         verdicts = GITLAB_VERDICTS if label == ".gitlab-ci.yml" else GITHUB_VERDICTS
+        if label == ".gitlab-ci.yml":
+            problems += check_gitlab_job_context(blocks[job], job, indent)
         executable = explicit_execution_values(blocks[job], indent, label)
         # A required verdict must be a direct command/action, not one operand
         # of a compound shell expression that can replace its exit status.

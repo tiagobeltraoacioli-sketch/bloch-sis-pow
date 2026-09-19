@@ -36,6 +36,21 @@ CRATE_ARGS = (
     " -p bloch-crypto -p coherence-core -p bloch-sis-pow -p bloch-pq-vault"
     " -p pqcrypto-internals -p genesis4-ceremony\n"
 )
+SAFE_GITLAB_GLOBALS = """\
+variables:
+  CARGO_TERM_COLOR: "always"
+  RUST_BACKTRACE: "1"
+
+default:
+  tags:
+    - bloch-linux-aarch64
+  before_script:
+    - export PATH="$HOME/.cargo/bin:$PATH"
+    - rustc --version && cargo --version
+    - clang --version | head -1 || true
+    - cmake --version | head -1 || true
+
+"""
 
 GOOD_GITLAB = """\
 stages:
@@ -102,6 +117,23 @@ def sub(text: str, old: str, new: str) -> str:
 
 
 CASES = [
+    Case("reviewed GitLab inherited test context stays green",
+         SAFE_GITLAB_GLOBALS + GOOD_GITLAB, GOOD_GITHUB, must_fail=False),
+    Case("GitLab default cannot disable test fail-fast",
+         SAFE_GITLAB_GLOBALS.replace(
+             "    - cmake --version | head -1 || true",
+             "    - cmake --version | head -1 || true\n    - set +e") + GOOD_GITLAB,
+         GOOD_GITHUB, must_fail=True, expect="`default:` differs"),
+    Case("GitLab global test variables cannot inject BASH_ENV",
+         SAFE_GITLAB_GLOBALS.replace(
+             '  RUST_BACKTRACE: "1"',
+             '  RUST_BACKTRACE: "1"\n  BASH_ENV: scripts/mask-tests.sh') + GOOD_GITLAB,
+         GOOD_GITHUB, must_fail=True, expect="top-level `variables:` differs"),
+    Case("GitLab test job cannot inject execution variables",
+         GOOD_GITLAB.replace(
+             "build-and-test:\n  stage: test",
+             "build-and-test:\n  stage: test\n  variables:\n    PATH: scripts/fake-cargo"),
+         GOOD_GITHUB, must_fail=True, expect="unreviewed execution variables"),
     Case("conditional test execution is not guaranteed", GOOD_GITLAB.replace(CRATE_ARGS, "    - if false; then\n" + CRATE_ARGS + "    - fi\n"), GOOD_GITHUB, must_fail=True),
     Case("disabled shell failures are refused", GOOD_GITLAB.replace(CRATE_ARGS, "    - set +e\n" + CRATE_ARGS), GOOD_GITHUB, must_fail=True),
     Case("background test cannot gate", GOOD_GITLAB.replace(CRATE_ARGS, CRATE_ARGS.rstrip() + " &\n"), GOOD_GITHUB, must_fail=True),
