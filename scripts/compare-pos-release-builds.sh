@@ -30,6 +30,12 @@ for dir in "$a" "$b"; do
   for file in bloch-pos SHA256SUMS BUILD-INFO; do
     [ -f "$dir/$file" ] || fail "missing $dir/$file"
     [ ! -L "$dir/$file" ] || fail "$dir/$file must not be a symlink"
+    unsafe_write_count="$(
+      find "$dir/$file" \( -perm -020 -o -perm -002 \) -exec printf x \; \
+        | wc -c | tr -d '[:space:]'
+    )"
+    [ "$unsafe_write_count" = 0 ] \
+      || fail "$dir/$file must not be writable by group or others"
   done
   # Emit one fixed byte per top-level entry instead of counting printed path
   # lines: a filename containing a newline must not confuse the cardinality.

@@ -49,6 +49,20 @@ expect_failure "one directory as two builders" \
   "the two inputs resolve to the same directory" \
   bash scripts/compare-pos-release-builds.sh "$work/a" "$work/a"
 
+expect_unsafe_write_mode() {
+  local file="$1" mode="$2"
+  local left="$work/write-mode-$file-a" right="$work/write-mode-$file-b"
+  cp -R "$work/a" "$left"
+  cp -R "$work/a" "$right"
+  chmod "$mode" "$left/$file" "$right/$file"
+  expect_failure "matching unsafe write mode $mode on $file" \
+    "$file must not be writable by group or others" \
+    bash scripts/compare-pos-release-builds.sh "$left" "$right"
+}
+expect_unsafe_write_mode bloch-pos 0777
+expect_unsafe_write_mode SHA256SUMS 0666
+expect_unsafe_write_mode BUILD-INFO 0666
+
 for file in bloch-pos SHA256SUMS BUILD-INFO; do
   hardlink_dir="$work/hardlink-$file"
   cp -R "$work/a" "$hardlink_dir"
