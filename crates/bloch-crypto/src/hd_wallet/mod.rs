@@ -212,10 +212,10 @@ impl HdWallet {
         testnet: bool,
     ) -> Result<Self, String> {
         // Generate 256-bit entropy (24 words)
-        let mut entropy = [0u8; 32];
-        rand::rng().fill_bytes(&mut entropy);
-        let mnemonic = Mnemonic::from_entropy(&entropy)
+        let entropy = fresh_hd_entropy();
+        let mnemonic = Mnemonic::from_entropy(&entropy[..])
             .map_err(|e| format!("mnemonic generation failed: {}", e))?;
+        drop(entropy);
 
         // New wallets use the v2 per-wallet salt (v3 files keep it).
         let canonical_mnemonic = canonical_mnemonic_for_kdf(&mnemonic);
@@ -952,6 +952,12 @@ fn derive_at(seed: &[u8], index: u32, testnet: bool) -> Result<Keypair, String> 
     Ok(Keypair { private_key, public_key, address })
 }
 
+fn fresh_hd_entropy() -> Zeroizing<[u8; 32]> {
+    let mut entropy = Zeroizing::new([0u8; 32]);
+    rand::rng().fill_bytes(&mut *entropy);
+    entropy
+}
+
 fn canonical_mnemonic_for_kdf(mnemonic: &Mnemonic) -> Zeroizing<String> {
     Zeroizing::new(mnemonic.to_string())
 }
@@ -1055,6 +1061,17 @@ fn decrypt_ciphertext_in_place(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hd_entropy_has_exact_zeroizing_ownership() {
+        let _: fn() -> Zeroizing<[u8; 32]> = fresh_hd_entropy;
+        assert!(std::mem::needs_drop::<Zeroizing<[u8; 32]>>());
+
+        let mut entropy = fresh_hd_entropy();
+        assert_eq!(entropy.len(), 32);
+        entropy.zeroize();
+        assert!(entropy.iter().all(|byte| *byte == 0));
+    }
 
     #[test]
     fn canonical_kdf_mnemonic_has_exact_zeroizing_ownership() {
