@@ -97,6 +97,39 @@ expect_failure "extra newline-bearing filename" \
   "must contain exactly bloch-pos, SHA256SUMS and BUILD-INFO (found 4 entries)" \
   bash scripts/compare-pos-release-builds.sh "$work/a" "$extra_newline_dir"
 
+canonical_sha="$(
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$work/a/bloch-pos" | awk '{print $1}'
+  else
+    shasum -a 256 "$work/a/bloch-pos" | awk '{print $1}'
+  fi
+)"
+manifest_error="SHA256SUMS is not the exact canonical one-line manifest"
+
+manifest_comment_dir="$work/manifest-comment"
+cp -R "$work/a" "$manifest_comment_dir"
+printf '# ignored extra payload\n' >> "$manifest_comment_dir/SHA256SUMS"
+expect_failure "checksum manifest comment" "$manifest_error" \
+  bash scripts/compare-pos-release-builds.sh "$work/a" "$manifest_comment_dir"
+
+manifest_blank_dir="$work/manifest-blank"
+cp -R "$work/a" "$manifest_blank_dir"
+printf '\n' >> "$manifest_blank_dir/SHA256SUMS"
+expect_failure "checksum manifest blank line" "$manifest_error" \
+  bash scripts/compare-pos-release-builds.sh "$work/a" "$manifest_blank_dir"
+
+manifest_trailing_dir="$work/manifest-trailing"
+cp -R "$work/a" "$manifest_trailing_dir"
+printf 'trailing-without-newline' >> "$manifest_trailing_dir/SHA256SUMS"
+expect_failure "checksum manifest trailing bytes" "$manifest_error" \
+  bash scripts/compare-pos-release-builds.sh "$work/a" "$manifest_trailing_dir"
+
+manifest_no_newline_dir="$work/manifest-no-newline"
+cp -R "$work/a" "$manifest_no_newline_dir"
+printf '%s  bloch-pos' "$canonical_sha" > "$manifest_no_newline_dir/SHA256SUMS"
+expect_failure "checksum manifest missing final newline" "$manifest_error" \
+  bash scripts/compare-pos-release-builds.sh "$work/a" "$manifest_no_newline_dir"
+
 chmod 0644 "$work/b/bloch-pos"
 if bash scripts/compare-pos-release-builds.sh "$work/a" "$work/b" >/dev/null 2>&1; then
   echo "selftest: non-executable binary was accepted" >&2; exit 1

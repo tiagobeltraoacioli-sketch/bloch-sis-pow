@@ -42,9 +42,14 @@ for dir in "$a" "$b"; do
   [ "$(wc -l < "$dir/BUILD-INFO" | tr -d ' ')" = 8 ] \
     || fail "$dir/BUILD-INFO must contain exactly the eight canonical fields"
   actual_sha="$(sha256_file "$dir/bloch-pos")"
-  manifest_sha="$(awk '$2 == "bloch-pos" { print $1 }' "$dir/SHA256SUMS")"
+  case "$actual_sha" in
+    ''|*[!0-9a-f]*) fail "checksum tool returned a non-lowercase SHA-256 for $dir/bloch-pos" ;;
+  esac
+  [ "${#actual_sha}" = 64 ] \
+    || fail "checksum tool returned a non-64-byte SHA-256 for $dir/bloch-pos"
+  cmp -s <(printf '%s  bloch-pos\n' "$actual_sha") "$dir/SHA256SUMS" \
+    || fail "$dir/SHA256SUMS is not the exact canonical one-line manifest"
   metadata_sha="$(field binary_sha256 "$dir/BUILD-INFO")"
-  [ "$actual_sha" = "$manifest_sha" ] || fail "checksum verification failed in $dir"
   [ "$actual_sha" = "$metadata_sha" ] || fail "BUILD-INFO checksum mismatch in $dir"
   [ "$(field artifact_kind "$dir/BUILD-INFO")" = canonical-container-candidate ] \
     || fail "$dir is not a canonical-container candidate"
