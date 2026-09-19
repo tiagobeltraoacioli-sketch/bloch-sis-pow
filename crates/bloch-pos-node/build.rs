@@ -174,6 +174,7 @@ fn hex(b: &[u8]) -> String {
 /// Cargo's target/profile-specific forms and the C toolchain used by PQClean.
 const FIXED_BUILD_ENV: &[&str] = &[
     "AR",
+    "ARFLAGS",
     "BINDGEN_EXTRA_CLANG_ARGS",
     "CARGO",
     "CARGO_BUILD_RUSTC",
@@ -184,19 +185,28 @@ const FIXED_BUILD_ENV: &[&str] = &[
     "CARGO_ENCODED_RUSTFLAGS",
     "CARGO_INCREMENTAL",
     "CC",
+    "CC_FORCE_DISABLE",
+    "CC_KNOWN_WRAPPER_CUSTOM",
+    "CC_SHELL_ESCAPED_FLAGS",
     "CFLAGS",
     "CPPFLAGS",
+    "CRATE_CC_NO_DEFAULTS",
+    "CXXSTDLIB",
     "DEBUG",
     "HOST_AR",
+    "HOST_ARFLAGS",
     "HOST_CC",
     "HOST_CFLAGS",
     "HOST_CPPFLAGS",
     "HOST_CXX",
     "HOST_CXXFLAGS",
+    "HOST_CXXSTDLIB",
     "HOST_RANLIB",
+    "HOST_RANLIBFLAGS",
     "MACOSX_DEPLOYMENT_TARGET",
     "OPT_LEVEL",
     "RANLIB",
+    "RANLIBFLAGS",
     "RUSTC",
     "RUSTC_BOOTSTRAP",
     "RUSTC_LINKER",
@@ -206,12 +216,15 @@ const FIXED_BUILD_ENV: &[&str] = &[
     "SDKROOT",
     "SOURCE_DATE_EPOCH",
     "TARGET_AR",
+    "TARGET_ARFLAGS",
     "TARGET_CC",
     "TARGET_CFLAGS",
     "TARGET_CPPFLAGS",
     "TARGET_CXX",
     "TARGET_CXXFLAGS",
+    "TARGET_CXXSTDLIB",
     "TARGET_RANLIB",
+    "TARGET_RANLIBFLAGS",
 ];
 
 /// Hash the executable bytes selected for a build tool without publishing its
@@ -464,13 +477,16 @@ fn rust_sysroot_digest(rustc: &str) -> (Option<String>, usize) {
 fn relevant_build_env(key: &str) -> bool {
     FIXED_BUILD_ENV.contains(&key)
         || key.starts_with("AR_")
+        || key.starts_with("ARFLAGS_")
         || key.starts_with("BINDGEN_EXTRA_CLANG_ARGS_")
         || key.starts_with("CC_")
         || key.starts_with("CFLAGS_")
         || key.starts_with("CPPFLAGS_")
         || key.starts_with("CXX_")
         || key.starts_with("CXXFLAGS_")
+        || key.starts_with("CXXSTDLIB_")
         || key.starts_with("RANLIB_")
+        || key.starts_with("RANLIBFLAGS_")
         || key.starts_with("CARGO_BUILD_")
         || key.starts_with("CARGO_CFG_")
         || key.starts_with("CARGO_FEATURE_")
@@ -490,13 +506,16 @@ fn exact_build_env(target: &str, host: &str) -> Vec<String> {
         let underscored = triple.replace('-', "_");
         for stem in [
             "AR",
+            "ARFLAGS",
             "BINDGEN_EXTRA_CLANG_ARGS",
             "CC",
             "CFLAGS",
             "CPPFLAGS",
             "CXX",
             "CXXFLAGS",
+            "CXXSTDLIB",
             "RANLIB",
+            "RANLIBFLAGS",
         ] {
             keys.push(format!("{stem}_{triple}"));
             keys.push(format!("{stem}_{underscored}"));
