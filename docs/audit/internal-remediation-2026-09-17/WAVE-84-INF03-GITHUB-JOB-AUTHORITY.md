@@ -23,6 +23,14 @@ Every required GitHub test and security job must now:
 - contain exactly one plain `runs-on: ubuntu-latest`; and
 - contain no plain, quoted or duplicate semantic `needs:` key.
 
+The supported GitHub workflow subset additionally requires plain mapping keys
+throughout the document. Single- or double-quoted keys (including Unicode or
+hex escapes), explicit `?`/`:` keys, and tagged, anchored or aliased keys are
+rejected before authority or execution extraction. Flow-style mappings are
+also outside this deliberately small block-mapping subset. Quoted scalar
+values remain supported, and key-shaped text inside literal/folded block
+scalars remains script data rather than YAML structure.
+
 This covers `cargo-test` plus all eight required security jobs. The test guard
 retains its exact header/step contract, and both guard jobs retain their exact
 reviewed command sequences in addition to the runner/dependency rule.
@@ -49,6 +57,12 @@ while:
 - adding the same skipped prerequisite through quoted `needs`; and
 - replacing one scanner's runner with self-hosted attacker-controlled labels.
 
+Both selftests also exercise escaped workflow authority, escaped required-job
+duplicates, quoted/escaped `if`, `continue-on-error`, `needs`, `runs-on`,
+`steps`, `run` and `uses` keys. Flow, explicit (inline and multiline), tagged
+and anchored forms are independent regressions. Positive fixtures preserve
+quoted values and key-shaped text inside block scripts.
+
 The honest workflow fixtures retain `ubuntu-latest` without dependencies, so
 both acceptance and rejection directions remain exercised.
 
@@ -56,13 +70,13 @@ both acceptance and rejection directions remain exercised.
 
 ```text
 python3 -I scripts/check-tests-blocking.selftest.py
-# OK — 134 cases behave as documented
+# OK — 150 cases behave as documented
 
 python3 -I scripts/check-tests-blocking.py
 # OK — supported explicit test commands cover 8 live crates on both pipelines
 
 python3 -I scripts/check-scanners-blocking.selftest.py
-# OK — 95 cases, both directions
+# OK — 111 cases, both directions
 
 python3 -I scripts/check-scanners-blocking.py
 # OK — 8 GitLab + 8 GitHub jobs are blocking
@@ -77,7 +91,7 @@ git diff --check -- <Wave 84 files>
 ```
 
 The final `check-tests-blocking.selftest.py` SHA-256 is
-`4af0c083683c8aee1ba218d2f5986104c77f52f0e5ca812cb45062d4a9a9972c` and
+`ca6b715915fd3c65ae3b48af8d53ee6e7db3a5a4a0b244b13d2cb5167cb9ba42` and
 the test guard pins that exact digest.
 
 ## Residual risk

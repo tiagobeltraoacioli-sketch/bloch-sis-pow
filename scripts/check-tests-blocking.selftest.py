@@ -190,6 +190,105 @@ def sub(text: str, old: str, new: str) -> str:
 CASES = [
     Case("GitLab reviewed execution environment stays green",
          GOOD_GITLAB, GOOD_GITHUB, must_fail=False),
+    Case("GitHub quoted text inside a block script is not a mapping key",
+         GOOD_GITLAB,
+         GOOD_GITHUB +
+         "\n  quoted-script-data:\n"
+         "    runs-on: ubuntu-latest\n"
+         "    steps:\n"
+         "      - run: |\n"
+         "          \"not-a-yaml-key\": shell data\n",
+         must_fail=False),
+    Case("GitHub escaped workflow authority key is rejected globally",
+         GOOD_GITLAB,
+         GOOD_GITHUB + "\n\"permi\\u0073sions\":\n  contents: write\n",
+         must_fail=True, expect="quoted YAML mapping keys"),
+    Case("GitHub flow escaped workflow authority key is rejected globally",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "permissions:\n  contents: read",
+             "permissions: {\"cont\\u0065nts\": write}"),
+         must_fail=True, expect="flow-style YAML mappings"),
+    Case("GitHub escaped required test job key is rejected globally",
+         GOOD_GITLAB,
+         GOOD_GITHUB +
+         "\n  \"cargo\\u002dtest\":\n"
+         "    runs-on: [self-hosted, attacker-controlled]\n"
+         "    steps:\n      - run: true\n",
+         must_fail=True, expect="quoted YAML mapping keys"),
+    Case("GitHub quoted test if key is rejected globally",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  cargo-test:\n    runs-on: ubuntu-latest",
+             "  cargo-test:\n    'if': ${{ true }}\n    runs-on: ubuntu-latest"),
+         must_fail=True, expect="quoted YAML mapping keys"),
+    Case("GitHub escaped test continue-on-error key is rejected globally",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  cargo-test:\n    runs-on: ubuntu-latest",
+             "  cargo-test:\n    \"continue-on-\\u0065rror\": true\n"
+             "    runs-on: ubuntu-latest"),
+         must_fail=True, expect="quoted YAML mapping keys"),
+    Case("GitHub escaped test needs key is rejected globally",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  cargo-test:\n    runs-on: ubuntu-latest",
+             "  cargo-test:\n    \"ne\\u0065ds\": bypass-prerequisite\n"
+             "    runs-on: ubuntu-latest"),
+         must_fail=True, expect="quoted YAML mapping keys"),
+    Case("GitHub escaped duplicate test runner key is rejected globally",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  cargo-test:\n    runs-on: ubuntu-latest",
+             "  cargo-test:\n    runs-on: ubuntu-latest\n"
+             "    \"runs\\u002don\": [self-hosted, attacker-controlled]"),
+         must_fail=True, expect="quoted YAML mapping keys"),
+    Case("GitHub explicit escaped test needs key is rejected globally",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  cargo-test:\n    runs-on: ubuntu-latest",
+             "  cargo-test:\n    runs-on: ubuntu-latest\n"
+             "    ? \"ne\\u0065ds\"\n"
+             "    : bypass-prerequisite"),
+         must_fail=True, expect="explicit, tagged, anchored or aliased"),
+    Case("GitHub multiline explicit test needs key is rejected globally",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  cargo-test:\n    runs-on: ubuntu-latest",
+             "  cargo-test:\n    runs-on: ubuntu-latest\n"
+             "    ?\n      needs\n"
+             "    :\n      bypass-prerequisite"),
+         must_fail=True, expect="explicit, tagged, anchored or aliased"),
+    Case("GitHub tagged test needs key is rejected globally",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  cargo-test:\n    runs-on: ubuntu-latest",
+             "  cargo-test:\n    runs-on: ubuntu-latest\n"
+             "    !!str needs: bypass-prerequisite"),
+         must_fail=True, expect="explicit, tagged, anchored or aliased"),
+    Case("GitHub anchored test needs key is rejected globally",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  cargo-test:\n    runs-on: ubuntu-latest",
+             "  cargo-test:\n    runs-on: ubuntu-latest\n"
+             "    &hidden needs: bypass-prerequisite"),
+         must_fail=True, expect="explicit, tagged, anchored or aliased"),
+    Case("GitHub quoted test steps key is rejected globally",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace("    steps:\n", "    'steps':\n", 1),
+         must_fail=True, expect="quoted YAML mapping keys"),
+    Case("GitHub escaped test steps key is rejected globally",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace("    steps:\n", "    \"st\\u0065ps\":\n", 1),
+         must_fail=True, expect="quoted YAML mapping keys"),
+    Case("GitHub quoted test run key is rejected globally",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace("      - run: |\n", "      - 'run': |\n", 1),
+         must_fail=True, expect="quoted YAML mapping keys"),
+    Case("GitHub escaped test uses key is rejected globally",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace("      - uses:", "      - \"us\\u0065s\":", 1),
+         must_fail=True, expect="quoted YAML mapping keys"),
     Case("GitLab cannot inherit the runner PATH suffix",
          GOOD_GITLAB.replace(
              'export PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"',

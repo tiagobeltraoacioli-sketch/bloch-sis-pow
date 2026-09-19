@@ -506,6 +506,54 @@ def normalized_yaml_lines(lines: list[str]) -> tuple[str, ...]:
         if re.sub(r"\s+#.*$", "", line.strip()))
 
 
+QUOTED_MAPPING_KEY = re.compile(
+    r"^\s*(?:-\s+)?(?:\"(?:\\.|[^\"\\])*\"|'(?:''|[^'])*')\s*:"
+)
+BLOCK_SCALAR_VALUE = re.compile(
+    r"^\s*(?:-\s+)?(?:[A-Za-z0-9_-]+|\"(?:\\.|[^\"\\])*\"|'(?:''|[^'])*')"
+    r"\s*:\s*[|>][0-9+-]*(?:\s+#.*)?$"
+)
+EXPLICIT_MAPPING_INDICATOR = re.compile(r"^\s*(?:-\s+)?[?:](?:\s|$)")
+NODE_PROPERTY_MAPPING_KEY = re.compile(
+    r"^\s*(?:-\s+)?(?:(?:!{1,2}\S+|&\S+)\s+)+"
+    r"(?:[A-Za-z0-9_-]+|\"(?:\\.|[^\"\\])*\"|'(?:''|[^'])*')\s*:"
+)
+ALIAS_MAPPING_KEY = re.compile(r"^\s*(?:-\s+)?\*\S+\s*:")
+FLOW_MAPPING_START = re.compile(
+    r"^\s*(?:-\s*)?(?:(?:[A-Za-z0-9_-]+)\s*:\s*)?\{(?!\{)"
+)
+
+
+def github_mapping_key_syntax_problems(text: str, label: str) -> list[str]:
+    """Reject unsupported YAML mapping keys outside block scalar bodies."""
+    problems = []
+    block_parent_indent: int | None = None
+    for number, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip(" "))
+        if block_parent_indent is not None:
+            if not stripped or indent > block_parent_indent:
+                continue
+            block_parent_indent = None
+        if BLOCK_SCALAR_VALUE.match(line):
+            block_parent_indent = indent
+        if QUOTED_MAPPING_KEY.match(line):
+            problems.append(
+                f"{label}:{number}: quoted YAML mapping keys are outside the "
+                "supported GitHub workflow subset")
+        if (EXPLICIT_MAPPING_INDICATOR.match(line)
+                or NODE_PROPERTY_MAPPING_KEY.match(line)
+                or ALIAS_MAPPING_KEY.match(line)):
+            problems.append(
+                f"{label}:{number}: explicit, tagged, anchored or aliased YAML "
+                "mapping keys are outside the supported GitHub workflow subset")
+        if FLOW_MAPPING_START.match(line):
+            problems.append(
+                f"{label}:{number}: flow-style YAML mappings are outside the "
+                "supported GitHub workflow subset")
+    return problems
+
+
 REVIEWED_GITHUB_TRIGGERS = (
     "push:",
     'branches: [main, "euvm/**"]',
@@ -648,6 +696,7 @@ def check_file(
                     "%s: top-level `%s:` moves pipeline semantics outside the "
                     "locally inspectable blocking subset" % (label, key))
     if label == ".github/workflows/security.yml":
+        problems += github_mapping_key_syntax_problems(text, label)
         problems += protected_global_key_problems(
             text, "defaults", label, required=True)
         problems += protected_global_key_problems(

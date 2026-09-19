@@ -216,7 +216,7 @@ CI_SCRIPT_ENTRYPOINT_SHA256 = {
     "scripts/check-iso-hardening.sh":
         "f0dae2e22aa766301def84a0c671ca4f79ff0c1b87d6e8647e9f6671669b91b3",
     "scripts/check-tests-blocking.selftest.py":
-        "4af0c083683c8aee1ba218d2f5986104c77f52f0e5ca812cb45062d4a9a9972c",
+        "ca6b715915fd3c65ae3b48af8d53ee6e7db3a5a4a0b244b13d2cb5167cb9ba42",
     "scripts/check-validator-lifecycle-mutations.py":
         "12b477e5043bc3ea98387be33ca586976494b30083522b214cea7d88c0e9f429",
     "scripts/devnet-particao-report.test.py":
@@ -656,6 +656,59 @@ def normalized_yaml_lines(lines: list[str]) -> tuple[str, ...]:
         if re.sub(r"\s+#.*$", "", line.strip()))
 
 
+QUOTED_MAPPING_KEY = re.compile(
+    r"^\s*(?:-\s+)?(?:\"(?:\\.|[^\"\\])*\"|'(?:''|[^'])*')\s*:"
+)
+BLOCK_SCALAR_VALUE = re.compile(
+    r"^\s*(?:-\s+)?(?:[A-Za-z0-9_-]+|\"(?:\\.|[^\"\\])*\"|'(?:''|[^'])*')"
+    r"\s*:\s*[|>][0-9+-]*(?:\s+#.*)?$"
+)
+EXPLICIT_MAPPING_INDICATOR = re.compile(r"^\s*(?:-\s+)?[?:](?:\s|$)")
+NODE_PROPERTY_MAPPING_KEY = re.compile(
+    r"^\s*(?:-\s+)?(?:(?:!{1,2}\S+|&\S+)\s+)+"
+    r"(?:[A-Za-z0-9_-]+|\"(?:\\.|[^\"\\])*\"|'(?:''|[^'])*')\s*:"
+)
+ALIAS_MAPPING_KEY = re.compile(r"^\s*(?:-\s+)?\*\S+\s*:")
+FLOW_MAPPING_START = re.compile(
+    r"^\s*(?:-\s*)?(?:(?:[A-Za-z0-9_-]+)\s*:\s*)?\{(?!\{)"
+)
+
+
+def github_mapping_key_syntax_problems(text: str, label: str) -> list[str]:
+    """Reject unsupported YAML mapping keys outside block scalar bodies.
+
+    The supported GitHub subset uses plain keys throughout. Quoted keys can
+    hide Unicode/hex escapes from the textual authority parsers while GitHub's
+    YAML parser resolves them to security-sensitive semantic duplicates.
+    """
+    problems = []
+    block_parent_indent: int | None = None
+    for number, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip(" "))
+        if block_parent_indent is not None:
+            if not stripped or indent > block_parent_indent:
+                continue
+            block_parent_indent = None
+        if BLOCK_SCALAR_VALUE.match(line):
+            block_parent_indent = indent
+        if QUOTED_MAPPING_KEY.match(line):
+            problems.append(
+                f"{label}:{number}: quoted YAML mapping keys are outside the "
+                "supported GitHub workflow subset")
+        if (EXPLICIT_MAPPING_INDICATOR.match(line)
+                or NODE_PROPERTY_MAPPING_KEY.match(line)
+                or ALIAS_MAPPING_KEY.match(line)):
+            problems.append(
+                f"{label}:{number}: explicit, tagged, anchored or aliased YAML "
+                "mapping keys are outside the supported GitHub workflow subset")
+        if FLOW_MAPPING_START.match(line):
+            problems.append(
+                f"{label}:{number}: flow-style YAML mappings are outside the "
+                "supported GitHub workflow subset")
+    return problems
+
+
 def check_gitlab_global_context(text: str, blocks: dict[str, list[str]]) -> list[str]:
     problems = []
     protected = [
@@ -810,6 +863,7 @@ def check_job(path: str, job: str, indent: int, label: str) -> list[str]:
     blocks = job_blocks(text, indent)
     problems: list[str] = []
     if label == ".github/workflows/tests.yml":
+        problems += github_mapping_key_syntax_problems(text, label)
         problems += protected_job_key_problems(text, job, indent, label)
     if job not in blocks:
         problems.append(
