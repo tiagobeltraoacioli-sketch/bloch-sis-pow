@@ -33,18 +33,20 @@ command -v "$engine" >/dev/null 2>&1 || fail "container engine not found: $engin
 commit="$(git rev-parse HEAD)"
 case "$commit" in ''|*[!0-9a-f]*) fail "HEAD is not a lowercase hexadecimal commit" ;; esac
 [ "${#commit}" -eq 40 ] || fail "HEAD is not a 40-character commit"
-source_date_epoch="$(git show -s --format=%ct HEAD)"
+source_date_epoch="$(git show -s --format=%ct "$commit")"
 case "$source_date_epoch" in ''|*[!0-9]*) fail "commit timestamp is not numeric" ;; esac
 
-# Archive HEAD instead of copying the worktree. Untracked files, local Cargo
-# configuration, credentials and concurrent edits cannot enter the context.
+# Archive the captured commit instead of copying the worktree or rereading a
+# movable ref. Untracked files, local Cargo configuration, credentials and
+# concurrent edits cannot enter the context.
 work="$(mktemp -d "${TMPDIR:-/tmp}/bloch-pos-container.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 context="$work/context"
 stage="$work/output"
 mkdir -p "$context" "$stage"
-git archive --format=tar HEAD | tar -xf - -C "$context"
-[ -f "$context/deploy/pos-release/Dockerfile" ] || fail "release Dockerfile is not committed at HEAD"
+git archive --format=tar "$commit" | tar -xf - -C "$context"
+[ -f "$context/deploy/pos-release/Dockerfile" ] \
+  || fail "release Dockerfile is not committed at the captured commit"
 
 "$engine" buildx build \
   --progress=plain \

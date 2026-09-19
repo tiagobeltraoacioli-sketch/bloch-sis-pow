@@ -13,6 +13,7 @@ set -euo pipefail
 stage=
 commit=
 epoch=
+context="${@: -1}"
 for arg in "$@"; do
   case "$arg" in
     type=local,dest=*) stage="${arg#type=local,dest=}" ;;
@@ -22,7 +23,12 @@ for arg in "$@"; do
 done
 [ -n "$stage" ] && [ -n "$commit" ] && [ -n "$epoch" ]
 mkdir -p "$stage"
-printf '#!/bin/sh\necho fake canonical candidate\n' > "$stage/bloch-pos"
+if [ "${FAKE_BINARY_FROM_CONTEXT:-0}" = 1 ]; then
+  marker="$(cat "$context/SOURCE-MARKER")"
+  printf '#!/bin/sh\necho %s\n' "$marker" > "$stage/bloch-pos"
+else
+  printf '#!/bin/sh\necho fake canonical candidate\n' > "$stage/bloch-pos"
+fi
 chmod 0755 "$stage/bloch-pos"
 if command -v sha256sum >/dev/null 2>&1; then
   binary_sha="$(sha256sum "$stage/bloch-pos" | awk '{print $1}')"
@@ -82,5 +88,54 @@ for mode in extra omit-binary; do
     exit 1
   }
 done
+
+# HEAD may move after the wrapper captures its commit. The timestamp and
+# archive must still come from that immutable OID, never from the late ref.
+race_repo="$work/race-repo"
+mkdir -p "$race_repo/scripts" "$race_repo/deploy/pos-release"
+cp scripts/build-pos-release-container.sh "$race_repo/scripts/"
+printf 'FROM scratch\n' > "$race_repo/deploy/pos-release/Dockerfile"
+printf 'context-A\n' > "$race_repo/SOURCE-MARKER"
+git -C "$race_repo" init -q
+git -C "$race_repo" config user.email selftest@invalid
+git -C "$race_repo" config user.name selftest
+git -C "$race_repo" add -A
+GIT_AUTHOR_DATE='2001-09-09T01:46:40Z' \
+GIT_COMMITTER_DATE='2001-09-09T01:46:40Z' \
+  git -C "$race_repo" commit -qm A
+commit_a="$(git -C "$race_repo" rev-parse HEAD)"
+epoch_a="$(git -C "$race_repo" show -s --format=%ct "$commit_a")"
+printf 'context-B\n' > "$race_repo/SOURCE-MARKER"
+git -C "$race_repo" add SOURCE-MARKER
+GIT_AUTHOR_DATE='2033-05-18T03:33:20Z' \
+GIT_COMMITTER_DATE='2033-05-18T03:33:20Z' \
+  git -C "$race_repo" commit -qm B
+commit_b="$(git -C "$race_repo" rev-parse HEAD)"
+git -C "$race_repo" reset -q --hard "$commit_a"
+
+real_git="$(command -v git)"
+shim_dir="$work/git-shim"
+mkdir "$shim_dir"
+cat > "$shim_dir/git" <<'GIT_SHIM'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = show ]; then
+  "$REAL_GIT" update-ref HEAD "$RACE_COMMIT_B"
+fi
+exec "$REAL_GIT" "$@"
+GIT_SHIM
+chmod 0755 "$shim_dir/git"
+
+(
+  cd "$race_repo"
+  PATH="$shim_dir:$PATH" REAL_GIT="$real_git" RACE_COMMIT_B="$commit_b" \
+    FAKE_BINARY_FROM_CONTEXT=1 CONTAINER_ENGINE="$fake_engine" \
+    bash scripts/build-pos-release-container.sh "$work/race-output"
+) > "$work/race.log" 2>&1
+grep -Fq 'build-pos-release-container: PASS' "$work/race.log"
+grep -Fq 'echo context-A' "$work/race-output/bloch-pos"
+grep -Fxq "source_commit=$commit_a" "$work/race-output/BUILD-INFO"
+grep -Fxq "source_date_epoch=$epoch_a" "$work/race-output/BUILD-INFO"
+[ "$("$real_git" -C "$race_repo" rev-parse HEAD)" = "$commit_b" ]
 
 echo "build-pos-release-container selftest: PASS"
