@@ -43,8 +43,11 @@ debian_snapshot=20260917T000000Z
 target=x86_64-unknown-linux-gnu
 binary_sha256=$binary_sha
 signed=false
-deployment_authorized=false
+deployment_authorized=${FAKE_DEPLOYMENT_AUTHORIZED:-false}
 EOF
+if [ "${FAKE_DUPLICATE_DEPLOYMENT_AUTHORIZED:-0}" = 1 ]; then
+  printf 'deployment_authorized=true\n' >> "$stage/BUILD-INFO"
+fi
 if command -v sha256sum >/dev/null 2>&1; then
   build_info_sha="$(sha256sum "$stage/BUILD-INFO" | awk '{print $1}')"
 else
@@ -61,8 +64,10 @@ ENGINE
 chmod 0755 "$fake_engine"
 
 run_wrapper() {
-  local mode="$1" output="$2"
-  FAKE_MANIFEST_MODE="$mode" CONTAINER_ENGINE="$fake_engine" \
+  local mode="$1" output="$2" authorized="${3:-false}" duplicate="${4:-0}"
+  FAKE_MANIFEST_MODE="$mode" FAKE_DEPLOYMENT_AUTHORIZED="$authorized" \
+    FAKE_DUPLICATE_DEPLOYMENT_AUTHORIZED="$duplicate" \
+    CONTAINER_ENGINE="$fake_engine" \
     bash scripts/build-pos-release-container.sh "$output"
 }
 
@@ -88,6 +93,28 @@ for mode in extra omit-binary; do
     exit 1
   }
 done
+
+authorization_error='BUILD-INFO does not explicitly refuse deployment authorization'
+if run_wrapper canonical "$work/authorized-true" true \
+    > "$work/authorized-true.log" 2>&1; then
+  echo "selftest: deployment_authorized=true was accepted" >&2
+  exit 1
+fi
+grep -Fq "$authorization_error" "$work/authorized-true.log" || {
+  echo "selftest: deployment_authorized=true failed without expected diagnostic" >&2
+  cat "$work/authorized-true.log" >&2
+  exit 1
+}
+if run_wrapper canonical "$work/authorized-duplicate" false 1 \
+    > "$work/authorized-duplicate.log" 2>&1; then
+  echo "selftest: duplicate deployment_authorized fields were accepted" >&2
+  exit 1
+fi
+grep -Fq "$authorization_error" "$work/authorized-duplicate.log" || {
+  echo "selftest: duplicate deployment_authorized failed without expected diagnostic" >&2
+  cat "$work/authorized-duplicate.log" >&2
+  exit 1
+}
 
 # HEAD may move after the wrapper captures its commit. The timestamp and
 # archive must still come from that immutable OID, never from the late ref.
