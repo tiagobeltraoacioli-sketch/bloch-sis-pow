@@ -182,7 +182,7 @@ fn main() {
 
         "addresses" => {
             require_params(params, 1, "addresses <wallet-hd.json>");
-            do_list_addresses(params[0]);
+            do_list_addresses(params[0], allow_large_hd_wallet);
             return;
         }
 
@@ -518,13 +518,33 @@ fn do_newaddress(wallet_path: &str, label: &str, allow_large_hd_wallet: bool) {
     println!("Label:       {}", label);
 }
 
-fn do_list_addresses(wallet_path: &str) {
-    // For listing we just show what's in the file (no decryption needed for public data)
-    let json = match std::fs::read_to_string(wallet_path) {
-        Ok(s) => s,
-        Err(e) => { eprintln!("Cannot read {}: {}", wallet_path, e); process::exit(1); }
-    };
-    let wallet: bloch::hd_wallet::HdWalletFile = match serde_json::from_str(&json) {
+fn read_public_hd_wallet(
+    wallet_path: &str,
+    allow_large_hd_wallet: bool,
+) -> Result<bloch::hd_wallet::HdWalletFile, String> {
+    let path = std::path::Path::new(wallet_path);
+    if allow_large_hd_wallet {
+        bloch::hd_wallet::HdWalletFile::read_public_with_limits(
+            path,
+            bloch::util::MAX_WALLET_FILE_LIMIT,
+            usize::MAX,
+        )
+    } else {
+        bloch::hd_wallet::HdWalletFile::read_public_bounded(path).map_err(|error| {
+            if error.contains("exceeds configured limit")
+                || error.contains("wallet file exceeds configured")
+            {
+                format!("{error}; for a trusted historical backup retry with --allow-large-hd-wallet")
+            } else {
+                error
+            }
+        })
+    }
+}
+
+fn do_list_addresses(wallet_path: &str, allow_large_hd_wallet: bool) {
+    // Public metadata needs no password, but remains attacker-controlled input.
+    let wallet = match read_public_hd_wallet(wallet_path, allow_large_hd_wallet) {
         Ok(w) => w,
         Err(e) => { eprintln!("Invalid wallet file: {}", e); process::exit(1); }
     };
@@ -748,6 +768,38 @@ fn print_usage() {
 #[cfg(test)]
 mod audit_send_inputs {
     use super::*;
+
+    fn public_wallet_fixture(addresses: usize) -> bloch::hd_wallet::HdWalletFile {
+        let crypto = bloch::wallet::KeystoreCrypto {
+            cipher: "fixture".into(),
+            ciphertext: String::new(),
+            nonce: String::new(),
+            kdf: "fixture".into(),
+            kdf_params: bloch::wallet::KdfParams {
+                memory_cost: 1,
+                time_cost: 1,
+                parallelism: 1,
+                salt: String::new(),
+                output_len: 32,
+            },
+        };
+        bloch::hd_wallet::HdWalletFile {
+            version: 3,
+            format: "hd-wallet-v1".into(),
+            network: "testnet".into(),
+            mnemonic_crypto: crypto.clone(),
+            addresses: (0..addresses).map(|index| bloch::hd_wallet::HdAddress {
+                index: index as u32,
+                address: format!("{}public-{index}", bloch::core::TESTNET_PREFIX),
+                label: String::new(),
+                keypair_crypto: crypto.clone(),
+                derived: false,
+            }).collect(),
+            created_at: String::new(),
+            description: String::new(),
+        }
+    }
+
     #[test]
     fn amounts_are_exact_and_refuse_sub_satoshi_or_exponent_notation() {
         for value in ["NaN", "inf", "-1", "1e30", "0.000000019", "0"] {
@@ -773,5 +825,24 @@ mod audit_send_inputs {
         row["index"] = serde_json::json!(4294967296u64);
         assert!(parse_send_utxos(&[row]).is_err());
         assert!(parse_send_utxos(&[serde_json::json!({})]).is_err());
+    }
+
+    #[test]
+    fn address_listing_is_bounded_unless_trusted_backup_override_is_explicit() {
+        let path = std::env::temp_dir().join(format!(
+            "bloch-cli-public-wallet-limit-{}.json",
+            std::process::id()
+        ));
+        let fixture = public_wallet_fixture(
+            bloch::hd_wallet::DEFAULT_HD_WALLET_LOAD_LIMITS.max_addresses + 1,
+        );
+        std::fs::write(&path, serde_json::to_vec(&fixture).unwrap()).unwrap();
+        let path_str = path.to_str().unwrap();
+
+        let rejected = read_public_hd_wallet(path_str, false).err().unwrap();
+        assert!(rejected.contains("address count 1025 exceeds configured limit 1024"));
+        assert!(rejected.contains("--allow-large-hd-wallet"));
+        assert_eq!(read_public_hd_wallet(path_str, true).unwrap().addresses.len(), 1025);
+        std::fs::remove_file(path).unwrap();
     }
 }

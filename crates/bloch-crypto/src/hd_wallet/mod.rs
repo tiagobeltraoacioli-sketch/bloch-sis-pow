@@ -43,6 +43,40 @@ pub struct HdWalletFile {
     pub description: String,
 }
 
+impl HdWalletFile {
+    /// Read public wallet metadata under the conservative interactive budget.
+    ///
+    /// This does not decrypt keys, but it still bounds both the input bytes and
+    /// the number of address records allocated/returned to callers. Use
+    /// [`Self::read_public_with_limits`] only for an explicit trusted-backup
+    /// workflow that needs different limits.
+    pub fn read_public_bounded(path: &Path) -> Result<Self, String> {
+        Self::read_public_with_limits(
+            path,
+            DEFAULT_HD_WALLET_LOAD_LIMITS.max_file_bytes,
+            DEFAULT_HD_WALLET_LOAD_LIMITS.max_addresses,
+        )
+    }
+
+    /// Read public wallet metadata with explicit byte and address limits.
+    ///
+    /// The byte budget is enforced while reading. The address limit is checked
+    /// immediately after parsing and structural validation, before the parsed
+    /// value can escape this API. Exact-limit inputs are accepted.
+    pub fn read_public_with_limits(
+        path: &Path,
+        max_file_bytes: usize,
+        max_addresses: usize,
+    ) -> Result<Self, String> {
+        let bytes = crate::util::read_wallet_file(path, max_file_bytes)
+            .map_err(|error| error.to_string())?;
+        let wallet: Self = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        validate_wallet_structure(&wallet)?;
+        validate_wallet_address_limit(&wallet, max_addresses)?;
+        Ok(wallet)
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct HdAddress {
     pub index:   u32,
@@ -468,17 +502,22 @@ fn validate_wallet_load_limits(
     wallet: &HdWalletFile,
     limits: HdWalletLoadLimits,
 ) -> Result<(), String> {
-    if wallet.addresses.len() > limits.max_addresses {
-        return Err(format!(
-            "HD wallet address count {} exceeds configured limit {}",
-            wallet.addresses.len(), limits.max_addresses
-        ));
-    }
+    validate_wallet_address_limit(wallet, limits.max_addresses)?;
     let derived_key_checks = wallet.addresses.iter().filter(|address| address.derived).count();
     if derived_key_checks > limits.max_derived_key_checks {
         return Err(format!(
             "HD wallet derived-key check count {} exceeds configured limit {}",
             derived_key_checks, limits.max_derived_key_checks
+        ));
+    }
+    Ok(())
+}
+
+fn validate_wallet_address_limit(wallet: &HdWalletFile, max_addresses: usize) -> Result<(), String> {
+    if wallet.addresses.len() > max_addresses {
+        return Err(format!(
+            "HD wallet address count {} exceeds configured limit {}",
+            wallet.addresses.len(), max_addresses
         ));
     }
     Ok(())
@@ -1066,6 +1105,51 @@ mod audit_wallet_boundaries {
             validate_wallet_load_limits(&file, limits).unwrap_err(),
             "HD wallet derived-key check count 257 exceeds configured limit 256"
         );
+    }
+
+    #[test]
+    fn public_metadata_reader_accepts_exact_bounds_and_rejects_each_excess() {
+        let crypto = encrypt_with_key(&[0; 32], b"fixture").unwrap();
+        let address = |index| HdAddress {
+            index,
+            address: format!("{}public-{index}", TESTNET_PREFIX),
+            label: format!("label-{index}"),
+            keypair_crypto: crypto.clone(),
+            // Public listing performs no mnemonic rederivation. Marking these
+            // imports also proves that only the aggregate record cap applies.
+            derived: false,
+        };
+        let limit = DEFAULT_HD_WALLET_LOAD_LIMITS.max_addresses;
+        let mut file = HdWalletFile {
+            version: 3,
+            format: "hd-wallet-v1".into(),
+            network: "testnet".into(),
+            mnemonic_crypto: crypto.clone(),
+            addresses: (0..limit).map(|index| address(index as u32)).collect(),
+            created_at: String::new(),
+            description: String::new(),
+        };
+        let path = std::env::temp_dir().join(format!(
+            "bloch-hd-public-limits-{}.json",
+            std::process::id()
+        ));
+
+        let exact_bytes = serde_json::to_vec(&file).unwrap();
+        std::fs::write(&path, &exact_bytes).unwrap();
+        let exact = HdWalletFile::read_public_with_limits(&path, exact_bytes.len(), limit)
+            .expect("exact byte and record limits must be accepted");
+        assert_eq!(exact.addresses.len(), limit);
+        assert!(HdWalletFile::read_public_bounded(&path).is_ok());
+        assert!(HdWalletFile::read_public_with_limits(&path, exact_bytes.len() - 1, limit)
+            .err().unwrap().contains("byte limit"));
+
+        file.addresses.push(address(limit as u32));
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+        assert_eq!(
+            HdWalletFile::read_public_bounded(&path).err().unwrap(),
+            "HD wallet address count 1025 exceeds configured limit 1024"
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
