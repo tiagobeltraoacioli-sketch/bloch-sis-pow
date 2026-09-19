@@ -107,6 +107,7 @@ GOOD_GITHUB = """\
 name: tests
 on:
   push:
+    branches: [main, "euvm/**"]
   pull_request:
   workflow_dispatch:
 
@@ -227,10 +228,38 @@ CASES = [
              "  pull_request:\n  pull_request_target:\n"),
          must_fail=True, expect="privileged `pull_request_target:`"),
 
+    Case("GitHub pull request paths cannot suppress the test gate",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  pull_request:\n",
+             "  pull_request:\n    paths-ignore: ['**']\n"),
+         must_fail=True, expect="reviewed exact trigger mapping"),
+
+    Case("GitHub duplicate pull request key cannot add a late filter",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  workflow_dispatch:\n",
+             "  workflow_dispatch:\n  pull_request:\n    branches: [never]\n"),
+         must_fail=True, expect="reviewed exact trigger mapping"),
+
     Case("GitHub tests token cannot gain write permission",
          GOOD_GITLAB,
          GOOD_GITHUB.replace("  contents: read\n", "  contents: write\n"),
          must_fail=True, expect="must be exactly `contents: read`"),
+
+    Case("GitHub cargo test job cannot elevate token permissions",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  cargo-test:\n    runs-on: ubuntu-latest",
+             "  cargo-test:\n    permissions:\n      contents: write\n    runs-on: ubuntu-latest"),
+         must_fail=True, expect="job-level permissions override"),
+
+    Case("GitHub quoted cargo test permissions cannot elevate token",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  cargo-test:\n    runs-on: ubuntu-latest",
+             "  cargo-test:\n    'permissions':\n      contents: write\n    runs-on: ubuntu-latest"),
+         must_fail=True, expect="job-level permissions override"),
 
     Case("GitHub quoted duplicate trigger mapping cannot disable pull requests",
          GOOD_GITLAB,

@@ -32,9 +32,10 @@ GitLab `.gitlab-ci.yml` job `build-and-test`, to the reviewed posture:
     run shell clears inherited shell/Python/Rust substitution variables while
     replacing PATH; required jobs use no containers/services/env overrides,
     and every action plus input is a reviewed immutable form.
-  * the GitHub workflow retains push and pull-request triggers, refuses the
-    privileged pull-request-target event, and grants only read-only contents
-    permission through one plain top-level mapping.
+  * the GitHub workflow retains the exact reviewed push/pull-request/manual
+    trigger mapping, refuses event filters that can suppress PR coverage, and
+    grants only read-only contents permission through one plain top-level
+    mapping with no required-job override.
   * no required GitHub run step writes the cross-step PATH/environment command
     files that can replace `cargo` before the approved test command.
   * the `cargo-test` job's setup, rehearsals and test commands exactly match
@@ -213,7 +214,7 @@ CI_SCRIPT_ENTRYPOINT_SHA256 = {
     "scripts/check-iso-hardening.sh":
         "f0dae2e22aa766301def84a0c671ca4f79ff0c1b87d6e8647e9f6671669b91b3",
     "scripts/check-tests-blocking.selftest.py":
-        "e150f483368175faa79d3bb74328646c72fe824356f88146089259c6c1e2dab6",
+        "72f75170e5900d96a95c6e0ceab903e70b4ce43120b01aa5ff822b4f93f46b2b",
     "scripts/check-validator-lifecycle-mutations.py":
         "12b477e5043bc3ea98387be33ca586976494b30083522b214cea7d88c0e9f429",
     "scripts/devnet-particao-report.test.py":
@@ -284,6 +285,12 @@ SAFE_GITLAB_VARIABLES = (
 SAFE_GITHUB_ENV = (
     "CARGO_TERM_COLOR: always",
     'RUST_BACKTRACE: "1"',
+)
+REVIEWED_GITHUB_TRIGGERS = (
+    "push:",
+    'branches: [main, "euvm/**"]',
+    "pull_request:",
+    "workflow_dispatch:",
 )
 SAFE_GITHUB_DEFAULTS = (
     "run:",
@@ -829,6 +836,10 @@ def check_job(path: str, job: str, indent: int, label: str) -> list[str]:
         if "pull_request_target" in triggers:
             problems.append(
                 f"{label}: privileged `pull_request_target:` is outside the supported trigger subset")
+        if (trigger_lines is None
+                or normalized_yaml_lines(trigger_lines) != REVIEWED_GITHUB_TRIGGERS):
+            problems.append(
+                f"{label}: top-level `on:` must match the reviewed exact trigger mapping")
         permission_lines = top_level.get("permissions")
         if (permission_lines is None
                 or normalized_yaml_lines(permission_lines) != ("contents: read",)):
@@ -846,6 +857,12 @@ def check_job(path: str, job: str, indent: int, label: str) -> list[str]:
                 f"{label}: job `{job}` run steps differ from the reviewed ordered command list")
 
     for line in body:
+        spaces = len(line) - len(line.lstrip(" "))
+        if (label == ".github/workflows/tests.yml" and spaces == indent + 2
+                and re.match(r"^(?:['\"]?)permissions(?:['\"]?)\s*:", line.strip())):
+            problems.append(
+                f"{label}: job `{job}` has a job-level permissions override; "
+                "required tests must inherit the checked read-only posture")
         waiver = re.match(r"^\s*(?:-\s+)?(allow_failure|continue-on-error):\s*(.*?)\s*(?:#.*)?$", line)
         if waiver and waiver.group(2).strip("\"'").lower() not in ("false", "no", "0"):
             problems.append(f"{label}: job `{job}` carries {waiver.group(1)}: true or a nonliteral failure waiver")

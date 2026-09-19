@@ -138,7 +138,9 @@ GOOD_GITHUB = """\
 name: security
 on:
   push:
+    branches: [main, "euvm/**"]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -298,6 +300,20 @@ CASES = [
          must_fail=True,
          expect="protected top-level `on:` key must occur exactly once"),
 
+    Case("GitHub pull request paths cannot suppress security gates",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  pull_request:\n",
+             "  pull_request:\n    paths-ignore: ['**']\n"),
+         must_fail=True, expect="reviewed exact trigger mapping"),
+
+    Case("GitHub duplicate pull request key cannot add a late security filter",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  workflow_dispatch:\n",
+             "  workflow_dispatch:\n  pull_request:\n    branches: [never]\n"),
+         must_fail=True, expect="reviewed exact trigger mapping"),
+
     Case("GitHub quoted duplicate permissions cannot replace security token posture",
          GOOD_GITLAB,
          GOOD_GITHUB +
@@ -305,6 +321,13 @@ CASES = [
          "  contents: write\n",
          must_fail=True,
          expect="protected top-level `permissions:` key must occur exactly once"),
+
+    Case("GitHub quoted permission scope cannot override read-only contents",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "  contents: read\n",
+             "  contents: read\n  'contents': write\n"),
+         must_fail=True, expect="must be exactly `contents: read`"),
 
     Case("GitHub scanner step PATH cannot replace cargo",
          GOOD_GITLAB,
@@ -793,6 +816,13 @@ CASES = [
          sub(GOOD_GITHUB,
              "  cargo-audit:\n    runs-on: ubuntu-latest",
              "  cargo-audit:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: write"),
+         must_fail=True, expect="job-level permissions override"),
+
+    Case("quoted required-job permissions cannot override security token",
+         GOOD_GITLAB,
+         sub(GOOD_GITHUB,
+             "  cargo-audit:\n    runs-on: ubuntu-latest",
+             "  cargo-audit:\n    'permissions':\n      contents: write\n    runs-on: ubuntu-latest"),
          must_fail=True, expect="job-level permissions override"),
 
     Case("or-true masks a scanner verdict",

@@ -40,8 +40,8 @@ security job, fails if the job:
     delegation, or a `when` other than `on_success`/`always`.
   * moves GitLab pipeline selection or configuration behind top-level
     `workflow:` / `include:` content this local guard does not inspect.
-  * removes the GitHub `push` or `pull_request` trigger, or substitutes the
-    privileged `pull_request_target` event.
+  * removes or filters the reviewed GitHub `push`/`pull_request` triggers, or
+    substitutes the privileged `pull_request_target` event.
   * removes the explicit read-only GitHub token posture or adds a job-level
     permission override to a required scanner.
   * keeps the job name but removes/replaces its actual scanner or guard
@@ -504,6 +504,14 @@ def normalized_yaml_lines(lines: list[str]) -> tuple[str, ...]:
         if re.sub(r"\s+#.*$", "", line.strip()))
 
 
+REVIEWED_GITHUB_TRIGGERS = (
+    "push:",
+    'branches: [main, "euvm/**"]',
+    "pull_request:",
+    "workflow_dispatch:",
+)
+
+
 def protected_global_key_problems(
     text: str, key: str, label: str, *, required: bool
 ) -> list[str]:
@@ -651,6 +659,10 @@ def check_file(
                 problems.append(
                     "%s: privileged `pull_request_target:` is outside the "
                     "supported security-workflow trigger subset" % label)
+            if normalized_yaml_lines(trigger_lines) != REVIEWED_GITHUB_TRIGGERS:
+                problems.append(
+                    "%s: top-level `on:` must match the reviewed exact trigger mapping"
+                    % label)
         permission_lines = top_level.get("permissions")
         if permission_lines is None:
             problems.append(
@@ -672,6 +684,10 @@ def check_file(
                     problems.append(
                         "%s: top-level permission `%s: %s` is write-capable or unsupported"
                         % (label, scope, access))
+            if normalized_yaml_lines(permission_lines) != ("contents: read",):
+                problems.append(
+                    "%s: top-level `permissions:` must be exactly `contents: read`"
+                    % label)
         env_lines = top_level.get("env")
         env_present = any(re.match(r"^env:", line) for line in text.splitlines())
         if env_present and (env_lines is None
@@ -800,7 +816,7 @@ def check_file(
             line_indent = len(line) - len(line.lstrip(" "))
             if (label == ".github/workflows/security.yml"
                     and line_indent == indent + 2
-                    and re.match(r"^permissions:", value)):
+                    and re.match(r"^(?:['\"]?)permissions(?:['\"]?)\s*:", value)):
                 problems.append(
                     "%s: job `%s` (%s) has a job-level permissions override; "
                     "required scanners must inherit the checked read-only posture"
