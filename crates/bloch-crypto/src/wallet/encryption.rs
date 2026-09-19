@@ -258,6 +258,23 @@ impl EncryptedKeyfile {
             return Err(WalletError::Parse(format!("unknown cipher: {}", self.cipher.algo)));
         }
 
+        // SECURITY (audit L1): reject absurd KDF params from the untrusted
+        // keyfile before decoding attacker-controlled payloads or handing
+        // them to Argon2. m_cost near u32::MAX (KiB) forces a multi-terabyte
+        // allocation; large t_cost is a CPU slow-loris.
+        const MAX_M_COST_KIB: u32 = 1024 * 1024; // 1 GiB
+        const MAX_T_COST: u32 = 16;
+        const MAX_P_COST: u32 = 16;
+        if self.kdf.m_cost > MAX_M_COST_KIB
+            || self.kdf.t_cost > MAX_T_COST
+            || self.kdf.p_cost > MAX_P_COST
+        {
+            return Err(WalletError::Parse(format!(
+                "KDF params out of bounds (m_cost={} KiB, t_cost={}, p_cost={})",
+                self.kdf.m_cost, self.kdf.t_cost, self.kdf.p_cost
+            )));
+        }
+
         // Decode base64
         let salt = B64.decode(&self.kdf.salt_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
         let nonce_bytes = B64.decode(&self.cipher.nonce_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
@@ -293,23 +310,6 @@ impl EncryptedKeyfile {
             return Err(WalletError::Parse(format!(
                 "keyfile ciphertext too short: {} bytes, need at least the {}-byte GCM tag",
                 ciphertext.len(), GCM_TAG_LEN
-            )));
-        }
-
-        // SECURITY (audit L1): reject absurd KDF params from the untrusted
-        // keyfile BEFORE handing them to Argon2. m_cost near u32::MAX (KiB)
-        // forces a multi-terabyte allocation that OOM-kills the process on any
-        // unlock attempt; large t_cost is a CPU slow-loris.
-        const MAX_M_COST_KIB: u32 = 1024 * 1024; // 1 GiB
-        const MAX_T_COST: u32 = 16;
-        const MAX_P_COST: u32 = 16;
-        if self.kdf.m_cost > MAX_M_COST_KIB
-            || self.kdf.t_cost > MAX_T_COST
-            || self.kdf.p_cost > MAX_P_COST
-        {
-            return Err(WalletError::Parse(format!(
-                "KDF params out of bounds (m_cost={} KiB, t_cost={}, p_cost={})",
-                self.kdf.m_cost, self.kdf.t_cost, self.kdf.p_cost
             )));
         }
 
@@ -443,6 +443,21 @@ impl EncryptedKeyfile {
             return Err(WalletError::Parse(format!("unknown cipher: {}", self.cipher.algo)));
         }
 
+        // KDF-parameter bounds (audit L1): reject OOM/slow-loris params from
+        // the untrusted file before decoding attacker-controlled payloads or
+        // handing the parameters to Argon2.
+        const MAX_M_COST_KIB: u32 = 1024 * 1024; // 1 GiB
+        const MAX_T_COST: u32 = 16;
+        const MAX_P_COST: u32 = 16;
+        if self.kdf.m_cost > MAX_M_COST_KIB
+            || self.kdf.t_cost > MAX_T_COST
+            || self.kdf.p_cost > MAX_P_COST
+        {
+            return Err(WalletError::Parse(format!(
+                "KDF params out of bounds (m_cost={} KiB, t_cost={}, p_cost={})",
+                self.kdf.m_cost, self.kdf.t_cost, self.kdf.p_cost)));
+        }
+
         let salt = B64.decode(&self.kdf.salt_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
         let nonce_bytes = B64.decode(&self.cipher.nonce_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
         let mut ciphertext = Zeroizing::new(
@@ -470,20 +485,6 @@ impl EncryptedKeyfile {
             return Err(WalletError::Parse(format!(
                 "keyfile ciphertext too short: {} bytes, need at least the {}-byte GCM tag",
                 ciphertext.len(), GCM_TAG_LEN)));
-        }
-
-        // KDF-parameter bounds (audit L1): reject OOM/slow-loris params from
-        // the untrusted file before Argon2 sees them.
-        const MAX_M_COST_KIB: u32 = 1024 * 1024; // 1 GiB
-        const MAX_T_COST: u32 = 16;
-        const MAX_P_COST: u32 = 16;
-        if self.kdf.m_cost > MAX_M_COST_KIB
-            || self.kdf.t_cost > MAX_T_COST
-            || self.kdf.p_cost > MAX_P_COST
-        {
-            return Err(WalletError::Parse(format!(
-                "KDF params out of bounds (m_cost={} KiB, t_cost={}, p_cost={})",
-                self.kdf.m_cost, self.kdf.t_cost, self.kdf.p_cost)));
         }
 
         let params = KdfParams {
@@ -860,6 +861,45 @@ mod tests {
         kf_salt.cipher.ciphertext_b64 = B64.encode([0u8; 8]);
         assert!(matches!(kf_salt.decrypt("password-abcd-12"), Err(WalletError::Parse(_))),
             "tag-less ciphertext must be a Parse error");
+    }
+
+    #[test]
+    fn kdf_bounds_precede_payload_base64_decoding_for_both_versions() {
+        let fast_params = KdfParams { m_cost: 1024, t_cost: 1, p_cost: 1 };
+        let password = "password-abcd-12";
+        let expected = format!(
+            "KDF params out of bounds (m_cost={} KiB, t_cost=1, p_cost=1)",
+            u32::MAX,
+        );
+        let assert_expected = |error| match error {
+            WalletError::Parse(message) => assert_eq!(message, expected),
+            other => panic!("expected exact KDF Parse error, got {other}"),
+        };
+
+        let mut v1 = EncryptedKeyfile::encrypt_with_params(
+            b"secret",
+            b"public",
+            Network::Mainnet,
+            password,
+            fast_params,
+        )
+        .unwrap();
+        v1.kdf.m_cost = u32::MAX;
+        v1.cipher.ciphertext_b64 = "!".repeat(64 * 1024);
+        assert_expected(v1.decrypt(password).unwrap_err());
+
+        let mut v2 = EncryptedKeyfile::encrypt_seed_v2_with_params(
+            &[0x17; 64],
+            b"secret",
+            b"public",
+            Network::Testnet,
+            password,
+            fast_params,
+        )
+        .unwrap();
+        v2.kdf.m_cost = u32::MAX;
+        v2.cipher.ciphertext_b64 = "!".repeat(64 * 1024);
+        assert_expected(v2.decrypt_v2(password).unwrap_err());
     }
 
     #[test]
