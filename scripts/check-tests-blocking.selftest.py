@@ -75,7 +75,7 @@ build-and-test:
     - python3 -I scripts/check-validator-lifecycle-mutations.py
     - python3 -I scripts/rehearse-validator-activation.py --output "$CI_PROJECT_DIR/.ci-validator-activation"
     - python3 -I scripts/rehearse-validator-joining-network.py --output "$CI_PROJECT_DIR/.ci-validator-joining-network"
-    - cargo build --workspace --all-targets
+    - cargo build --locked --workspace --all-targets
 """ + CRATE_ARGS + """\
   timeout: 120m
 
@@ -581,10 +581,16 @@ CASES = [
 
     Case("gitlab build-and-test cannot insert a command",
          GOOD_GITLAB.replace(
-             "    - cargo build --workspace --all-targets\n",
+             "    - cargo build --locked --workspace --all-targets\n",
              "    - echo replacing toolchain\n"
-             "    - cargo build --workspace --all-targets\n"),
+             "    - cargo build --locked --workspace --all-targets\n"),
          GOOD_GITHUB, must_fail=True, expect="exact whole-job contract"),
+
+    Case("gitlab workspace build cannot update the committed lockfile",
+         GOOD_GITLAB.replace(
+             "cargo build --locked --workspace --all-targets",
+             "cargo build --workspace --all-targets"),
+         GOOD_GITHUB, must_fail=True, expect="exact ordered command contract"),
 
     Case("gitlab build-and-test cannot remove setup selftest",
          GOOD_GITLAB.replace(
@@ -637,8 +643,8 @@ CASES = [
 
     Case("gitlab block scalar cannot disguise a reviewed command",
          GOOD_GITLAB.replace(
-             "    - cargo build --workspace --all-targets\n",
-             "    - |\n      cargo build --workspace --all-targets\n"),
+             "    - cargo build --locked --workspace --all-targets\n",
+             "    - |\n      cargo build --locked --workspace --all-targets\n"),
          GOOD_GITHUB, must_fail=True, expect="exact whole-job contract"),
 
     Case("gitlab aliased build-and-test job is outside local proof",
@@ -674,8 +680,8 @@ CASES = [
          GOOD_GITHUB, must_fail=True, expect="allow_failure"),
 
     Case("gitlab exit-0 skip inside build-and-test",
-         sub(GOOD_GITLAB, "    - cargo build --workspace --all-targets",
-             "    - |\n      if ! command -v cargo >/dev/null; then\n        echo skipping\n        exit 0\n      fi\n    - cargo build --workspace --all-targets"),
+         sub(GOOD_GITLAB, "    - cargo build --locked --workspace --all-targets",
+             "    - |\n      if ! command -v cargo >/dev/null; then\n        echo skipping\n        exit 0\n      fi\n    - cargo build --locked --workspace --all-targets"),
          GOOD_GITHUB, must_fail=True, expect="exit 0"),
 
     Case("gitlab when: manual on build-and-test",

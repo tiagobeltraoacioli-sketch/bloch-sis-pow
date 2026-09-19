@@ -170,7 +170,7 @@ GITLAB_BUILD_TEST_SCRIPT = (
     "python3 -I scripts/check-validator-lifecycle-mutations.py",
     'python3 -I scripts/rehearse-validator-activation.py --output "$CI_PROJECT_DIR/.ci-validator-activation"',
     'python3 -I scripts/rehearse-validator-joining-network.py --output "$CI_PROJECT_DIR/.ci-validator-joining-network"',
-    "cargo build --workspace --all-targets",
+    "cargo build --locked --workspace --all-targets",
     "cargo test --locked -p bloch-pos-committee -p bloch-pos-node "
     "-p bloch-crypto -p coherence-core -p bloch-sis-pow -p bloch-pq-vault "
     "-p pqcrypto-internals -p genesis4-ceremony",
@@ -186,7 +186,7 @@ GITLAB_BUILD_TEST_BODY = (
     "- python3 -I scripts/check-validator-lifecycle-mutations.py",
     '- python3 -I scripts/rehearse-validator-activation.py --output "$CI_PROJECT_DIR/.ci-validator-activation"',
     '- python3 -I scripts/rehearse-validator-joining-network.py --output "$CI_PROJECT_DIR/.ci-validator-joining-network"',
-    "- cargo build --workspace --all-targets",
+    "- cargo build --locked --workspace --all-targets",
     "- cargo test --locked -p bloch-pos-committee -p bloch-pos-node "
     "-p bloch-crypto -p coherence-core -p bloch-sis-pow -p bloch-pq-vault "
     "-p pqcrypto-internals -p genesis4-ceremony",
@@ -210,7 +210,7 @@ CI_SCRIPT_ENTRYPOINT_SHA256 = {
     "scripts/check-iso-hardening.sh":
         "f0dae2e22aa766301def84a0c671ca4f79ff0c1b87d6e8647e9f6671669b91b3",
     "scripts/check-tests-blocking.selftest.py":
-        "3a6e5df7c49ad96e47db72debec068358f03e2059983dfbafd35d5bbcee4d588",
+        "f518ef2e8a23c7e7704102c7084f39f3af29ada2abdf822c44c794d7fa783966",
     "scripts/check-validator-lifecycle-mutations.py":
         "12b477e5043bc3ea98387be33ca586976494b30083522b214cea7d88c0e9f429",
     "scripts/devnet-particao-report.test.py":
