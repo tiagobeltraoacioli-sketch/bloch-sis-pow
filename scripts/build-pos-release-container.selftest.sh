@@ -36,7 +36,7 @@ else
   binary_sha="$(shasum -a 256 "$stage/bloch-pos" | awk '{print $1}')"
 fi
 cat > "$stage/BUILD-INFO" <<EOF
-artifact_kind=canonical-container-candidate
+artifact_kind=${FAKE_ARTIFACT_KIND:-canonical-container-candidate}
 source_commit=$commit
 source_date_epoch=$epoch
 debian_snapshot=20260917T000000Z
@@ -45,6 +45,9 @@ binary_sha256=${FAKE_METADATA_BINARY_SHA:-$binary_sha}
 signed=${FAKE_SIGNED:-false}
 deployment_authorized=${FAKE_DEPLOYMENT_AUTHORIZED:-false}
 EOF
+if [ "${FAKE_DUPLICATE_ARTIFACT_KIND:-0}" = 1 ]; then
+  printf 'artifact_kind=unsigned-release-candidate\n' >> "$stage/BUILD-INFO"
+fi
 if [ "${FAKE_DUPLICATE_BINARY_SHA:-0}" = 1 ]; then
   printf 'binary_sha256=%064d\n' 0 >> "$stage/BUILD-INFO"
 fi
@@ -73,11 +76,15 @@ run_wrapper() {
   local mode="$1" output="$2" authorized="${3:-false}" duplicate="${4:-0}"
   local signed="${5:-false}" signed_duplicate="${6:-0}"
   local metadata_sha="${7:-}" sha_duplicate="${8:-0}"
+  local artifact_kind="${9:-canonical-container-candidate}"
+  local artifact_duplicate="${10:-0}"
   FAKE_MANIFEST_MODE="$mode" FAKE_DEPLOYMENT_AUTHORIZED="$authorized" \
     FAKE_DUPLICATE_DEPLOYMENT_AUTHORIZED="$duplicate" \
     FAKE_SIGNED="$signed" FAKE_DUPLICATE_SIGNED="$signed_duplicate" \
     FAKE_METADATA_BINARY_SHA="$metadata_sha" \
     FAKE_DUPLICATE_BINARY_SHA="$sha_duplicate" \
+    FAKE_ARTIFACT_KIND="$artifact_kind" \
+    FAKE_DUPLICATE_ARTIFACT_KIND="$artifact_duplicate" \
     CONTAINER_ENGINE="$fake_engine" \
     bash scripts/build-pos-release-container.sh "$output"
 }
@@ -169,6 +176,28 @@ fi
 grep -Fq "$binary_sha_error" "$work/binary-sha-duplicate.log" || {
   echo "selftest: duplicate binary_sha256 failed without expected diagnostic" >&2
   cat "$work/binary-sha-duplicate.log" >&2
+  exit 1
+}
+
+artifact_error='BUILD-INFO does not declare a canonical-container candidate'
+if run_wrapper canonical "$work/artifact-kind-wrong" false 0 false 0 "" 0 \
+    unsigned-release-candidate > "$work/artifact-kind-wrong.log" 2>&1; then
+  echo "selftest: wrong artifact_kind was accepted" >&2
+  exit 1
+fi
+grep -Fq "$artifact_error" "$work/artifact-kind-wrong.log" || {
+  echo "selftest: wrong artifact_kind failed without expected diagnostic" >&2
+  cat "$work/artifact-kind-wrong.log" >&2
+  exit 1
+}
+if run_wrapper canonical "$work/artifact-kind-duplicate" false 0 false 0 "" 0 \
+    canonical-container-candidate 1 > "$work/artifact-kind-duplicate.log" 2>&1; then
+  echo "selftest: duplicate artifact_kind fields were accepted" >&2
+  exit 1
+fi
+grep -Fq "$artifact_error" "$work/artifact-kind-duplicate.log" || {
+  echo "selftest: duplicate artifact_kind failed without expected diagnostic" >&2
+  cat "$work/artifact-kind-duplicate.log" >&2
   exit 1
 }
 

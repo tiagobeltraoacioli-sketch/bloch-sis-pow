@@ -66,6 +66,11 @@ grep -Fx "source_commit=$commit" "$stage/BUILD-INFO" >/dev/null \
   || fail "BUILD-INFO does not bind HEAD"
 grep -Fx "source_date_epoch=$source_date_epoch" "$stage/BUILD-INFO" >/dev/null \
   || fail "BUILD-INFO does not bind the commit timestamp"
+awk -F= '
+  $1 == "artifact_kind" { count++; value = substr($0, length($1) + 2) }
+  END { exit !(count == 1 && value == "canonical-container-candidate") }
+' "$stage/BUILD-INFO" \
+  || fail "BUILD-INFO does not declare a canonical-container candidate"
 awk -F= -v expected="$binary_sha" '
   $1 == "binary_sha256" { count++; value = substr($0, length($1) + 2) }
   END { exit !(count == 1 && value == expected) }
