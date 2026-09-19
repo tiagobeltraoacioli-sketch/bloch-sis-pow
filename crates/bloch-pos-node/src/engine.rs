@@ -811,6 +811,10 @@ const REORG_STATE_WINDOW: usize = 2;
 /// recovered by the `get_blocks` request the parking sets `needs_sync` for —
 /// which is why evicting here costs a round trip and never a fork.
 const ORPHAN_MAX: usize = 256;
+/// Combined waiting + ready-to-promote share for one normalized gossip
+/// source. `Gossip(None)` is one collective unattributed bucket; no identity
+/// is fabricated. Local production is exempt from a transport-fairness rule.
+const ORPHANS_PER_SOURCE: usize = 32;
 /// Parked blocks re-tried between two slot-loop control points. One promotion
 /// can execute a transition, rebuild fork choice, and unlock more work, so it
 /// receives the same one-block slice as ordinary admitted blocks.
@@ -1682,10 +1686,11 @@ struct Engine {
     /// Blocks whose parent this node has never seen, oldest first, with their
     /// ids so a repeat gossip is recognised without re-hashing.
     ///
-    /// Bounded by [`ORPHAN_MAX`] with FIFO eviction. FIFO and not
-    /// lowest-slot-first on purpose: the oldest entry is the one whose parent
-    /// has had the longest to arrive and has not, so it is the one least
-    /// likely to ever connect.
+    /// Bounded by [`ORPHAN_MAX`] with FIFO eviction and by
+    /// [`ORPHANS_PER_SOURCE`] across this queue plus `deferred_orphans`. FIFO
+    /// and not lowest-slot-first on purpose: the oldest entry is the one whose
+    /// parent has had the longest to arrive and has not, so it is the one
+    /// least likely to ever connect.
     ///
     /// Parking sets `needs_sync`, so the gap the orphan is evidence of is
     /// asked for over the wire. That is what makes eviction cheap: the worst
@@ -3311,6 +3316,19 @@ impl Engine {
         if self.orphans.iter().any(|(seen, _, _, _)| *seen == id)
             || self.deferred_orphans.iter().any(|(seen, _, _, _)| *seen == id)
         {
+            return;
+        }
+        // Promotion must not reopen a source's share: count both the blocked
+        // and ready FIFOs. This is retention fairness only; dropping at the
+        // share is local Ignore pressure and never peer guilt.
+        if src.bounded_by_wall_clock()
+            && self.orphans.iter()
+                .chain(self.deferred_orphans.iter())
+                .filter(|(_, _, held_source, _)| *held_source == src)
+                .count()
+                >= ORPHANS_PER_SOURCE
+        {
+            self.orphans_evicted = self.orphans_evicted.saturating_add(1);
             return;
         }
         // The parked and ready-to-promote queues share one hard cap. Prefer
@@ -12166,7 +12184,8 @@ mod ingest_admission_tests {
             if i == 0 {
                 first_parent = env.header.parent;
             }
-            engine.ingest(env);
+            let source_group = i / ORPHANS_PER_SOURCE;
+            engine.ingest_judged_from_source(env, Some([source_group as u8; 32]));
         }
 
         assert_eq!(
@@ -12208,6 +12227,112 @@ mod ingest_admission_tests {
     }
 
     #[test]
+    fn one_source_cannot_fill_combined_orphan_queues_and_capacity_reopens() {
+        let (mut engine, _dir, template, stored) = fixture();
+        let source_a = [0xA1; 32];
+        let source_b = [0xB1; 32];
+        let landed = [0xC1; 32];
+
+        for i in 0..ORPHANS_PER_SOURCE {
+            let mut env = template.clone();
+            env.header.proposer_index = 7;
+            env.header.parent = if i == 0 { landed } else { [i as u8; 32] };
+            env.header.slot = 2;
+            assert_eq!(
+                engine.ingest_judged_from_source(env, Some(source_a)),
+                Verdict::Ignore,
+            );
+        }
+        assert_eq!(engine.orphans.len(), ORPHANS_PER_SOURCE);
+        assert_eq!(engine.blocks.len(), stored);
+
+        let mut excess = template.clone();
+        excess.header.proposer_index = 7;
+        excess.header.parent = [0xD1; 32];
+        excess.header.slot = 2;
+        let evicted_before_excess = engine.orphans_evicted;
+        assert_eq!(
+            engine.ingest_judged_from_source(excess, Some(source_a)),
+            Verdict::Ignore,
+        );
+        assert_eq!(engine.orphans.len(), ORPHANS_PER_SOURCE);
+        assert_eq!(engine.orphans_evicted, evicted_before_excess + 1);
+
+        let mut independent = template.clone();
+        independent.header.proposer_index = 7;
+        independent.header.parent = [0xE1; 32];
+        independent.header.slot = 2;
+        assert_eq!(
+            engine.ingest_judged_from_source(independent, Some(source_b)),
+            Verdict::Ignore,
+        );
+        assert_eq!(engine.orphans.len(), ORPHANS_PER_SOURCE + 1);
+
+        engine.schedule_unblocked_orphans(landed, false);
+        assert_eq!(engine.deferred_orphans.len(), 1);
+        assert_eq!(engine.orphans.len(), ORPHANS_PER_SOURCE);
+        let mut still_full = template.clone();
+        still_full.header.proposer_index = 7;
+        still_full.header.parent = [0xD2; 32];
+        still_full.header.slot = 2;
+        let evicted_before_combined_excess = engine.orphans_evicted;
+        engine.ingest_judged_from_source(still_full, Some(source_a));
+        assert_eq!(
+            engine.orphans.len() + engine.deferred_orphans.len(),
+            ORPHANS_PER_SOURCE + 1,
+            "moving work to the ready FIFO must not reopen source capacity",
+        );
+        assert_eq!(engine.orphans_evicted, evicted_before_combined_excess + 1);
+
+        engine.deferred_orphans.pop_front().expect("one source-A entry leaves");
+        let mut reopened = template;
+        reopened.header.proposer_index = 7;
+        reopened.header.parent = [0xD3; 32];
+        reopened.header.slot = 2;
+        engine.ingest_judged_from_source(reopened, Some(source_a));
+        assert_eq!(
+            engine.orphans.iter()
+                .chain(engine.deferred_orphans.iter())
+                .filter(|(_, _, source, _)| *source == Source::Gossip(Some(source_a)))
+                .count(),
+            ORPHANS_PER_SOURCE,
+            "one departed entry must reopen exactly one slot for its source",
+        );
+
+        // Missing attribution is one honest collective bucket, not an
+        // invented identity per call. Local production is outside this
+        // transport-fairness rule.
+        for i in 0..ORPHANS_PER_SOURCE {
+            let mut env = engine.orphans[0].1.clone();
+            env.header.parent = [0x60; 32];
+            env.header.parent[1] = i as u8;
+            let id = *env.block_id().as_bytes();
+            engine.park_orphan(id, env, Source::Gossip(None));
+        }
+        let before = engine.orphans.len() + engine.deferred_orphans.len();
+        let mut unattributed_excess = engine.orphans[0].1.clone();
+        unattributed_excess.header.parent = [0x61; 32];
+        let excess_id = *unattributed_excess.block_id().as_bytes();
+        let evicted_before_unattributed = engine.orphans_evicted;
+        engine.park_orphan(
+            excess_id,
+            unattributed_excess.clone(),
+            Source::Gossip(None),
+        );
+        assert_eq!(engine.orphans.len() + engine.deferred_orphans.len(), before);
+        assert_eq!(engine.orphans_evicted, evicted_before_unattributed + 1);
+        let local_id = *unattributed_excess.block_id().as_bytes();
+        let evicted_before_local = engine.orphans_evicted;
+        engine.park_orphan(local_id, unattributed_excess, Source::Local);
+        assert_eq!(
+            engine.orphans.len() + engine.deferred_orphans.len(),
+            before + 1,
+            "local production is not charged to the unattributed transport bucket",
+        );
+        assert_eq!(engine.orphans_evicted, evicted_before_local);
+    }
+
+    #[test]
     fn deferred_orphan_tail_shares_the_hard_cap_and_deduplication() {
         let (mut engine, _dir, template, _stored) = fixture();
         let landed = [0xA7; 32];
@@ -12217,7 +12342,12 @@ mod ingest_admission_tests {
             env.header.parent = landed;
             env.header.slot = (i as u64).saturating_add(2);
             let id = *env.block_id().as_bytes();
-            engine.park_orphan(id, env, Source::Gossip(Some([0xD7; 32])));
+            let source_group = i / ORPHANS_PER_SOURCE;
+            engine.park_orphan(
+                id,
+                env,
+                Source::Gossip(Some([source_group as u8; 32])),
+            );
         }
         engine.schedule_unblocked_orphans(landed, false);
         assert!(engine.orphans.is_empty());
