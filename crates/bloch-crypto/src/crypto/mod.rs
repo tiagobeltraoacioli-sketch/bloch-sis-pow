@@ -650,6 +650,14 @@ pub mod falcon {
     /// Falcon-1024 public-key length (bytes).
     pub fn pubkey_len() -> usize { falcon1024::public_key_bytes() }
 
+    /// Length of Falcon-1024's alternate fixed-width padded signature.
+    ///
+    /// The compatibility verifier accepts this representation; canonical
+    /// policies use the value to construct or identify migration fixtures.
+    pub fn padded_signature_len() -> usize {
+        pqcrypto_falcon::falconpadded1024::signature_bytes()
+    }
+
     pub fn keypair() -> (Vec<u8>, Vec<u8>) {
         let (pk, sk) = falcon1024::keypair();
         (pk.as_bytes().to_vec(), sk.as_bytes().to_vec())

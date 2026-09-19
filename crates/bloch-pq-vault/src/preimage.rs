@@ -183,7 +183,33 @@ impl SignedRecoveryContextV1 {
     /// backup record. Both the key and stored signature must retain their
     /// suite envelopes; this versioned format never guesses legacy raw bytes.
     pub fn verify(&self, trusted_pq_pubkey: &[u8]) -> Result<(), RecoveryContextError> {
-        if bloch_crypto::crypto::verify_enveloped(
+        self.verify_with(
+            trusted_pq_pubkey,
+            bloch_crypto::crypto::verify_enveloped,
+        )
+    }
+
+    /// Verify with explicit envelopes and canonical primitive encodings.
+    ///
+    /// This is opt-in so previously accepted recovery records remain usable
+    /// through [`Self::verify`]. New recovery policies can reject Falcon's
+    /// alternate zero-padded representation without changing the wire format.
+    pub fn verify_canonical(
+        &self,
+        trusted_pq_pubkey: &[u8],
+    ) -> Result<(), RecoveryContextError> {
+        self.verify_with(
+            trusted_pq_pubkey,
+            bloch_crypto::crypto::verify_enveloped_canonical,
+        )
+    }
+
+    fn verify_with(
+        &self,
+        trusted_pq_pubkey: &[u8],
+        verify_signature: fn(&[u8], &[u8], &[u8]) -> bool,
+    ) -> Result<(), RecoveryContextError> {
+        if verify_signature(
             trusted_pq_pubkey,
             &Self::signing_bytes(&self.context),
             &self.signature,
@@ -205,6 +231,19 @@ impl SignedRecoveryContextV1 {
         funded_recovery_hash: &[u8; 32],
     ) -> Result<zeroize::Zeroizing<[u8; RECOVERY_SECRET_LEN]>, RecoveryContextError> {
         self.verify(trusted_pq_pubkey)?;
+        self.context
+            .restore(seed, expected_mainnet, funded_recovery_hash)
+    }
+
+    /// Canonical-signature counterpart of [`Self::verify_and_restore`].
+    pub fn verify_and_restore_canonical(
+        &self,
+        trusted_pq_pubkey: &[u8],
+        seed: &[u8],
+        expected_mainnet: bool,
+        funded_recovery_hash: &[u8; 32],
+    ) -> Result<zeroize::Zeroizing<[u8; RECOVERY_SECRET_LEN]>, RecoveryContextError> {
+        self.verify_canonical(trusted_pq_pubkey)?;
         self.context
             .restore(seed, expected_mainnet, funded_recovery_hash)
     }
@@ -735,6 +774,64 @@ mod tests {
         };
         assert_eq!(
             substituted.verify(&keys.pq_pubkey),
+            Err(RecoveryContextError::BadSignature),
+        );
+    }
+
+    #[test]
+    fn canonical_signed_context_rejects_padded_falcon_encoding() {
+        let seed = [58u8; 32];
+        let keys =
+            derive_vault_keys_versioned(&seed, false, VaultKeyDerivation::V3HardenedRoles).unwrap();
+        let (expected_secret, expected_hash) =
+            derive_recovery(keys.pq_secret_key(), b"wave-60-canonical");
+        let context = RecoveryContextV1::new(
+            VaultKeyDerivation::V3HardenedRoles,
+            false,
+            b"wave-60-canonical",
+            expected_hash,
+        )
+        .unwrap();
+        let padded_len = bloch_crypto::crypto::SUITE_HEADER_LEN
+            + bloch_crypto::crypto::MLDSA_SIG_LEN
+            + bloch_crypto::crypto::falcon::padded_signature_len();
+        let signed = (0..64)
+            .map(|_| SignedRecoveryContextV1::sign(&context, keys.pq_secret_key()).unwrap())
+            .find(|candidate| candidate.signature.len() < padded_len)
+            .expect("compact fixture must leave room for Falcon padding");
+
+        assert_eq!(signed.verify_canonical(&keys.pq_pubkey), Ok(()));
+        assert_eq!(
+            *signed
+                .verify_and_restore_canonical(
+                    &keys.pq_pubkey,
+                    &seed,
+                    false,
+                    &expected_hash,
+                )
+                .unwrap(),
+            expected_secret,
+        );
+
+        let mut padded = signed;
+        padded.signature.resize(padded_len, 0);
+
+        assert_eq!(
+            padded.verify(&keys.pq_pubkey),
+            Ok(()),
+            "compatibility boundary must preserve historical padded acceptance"
+        );
+        assert_eq!(
+            padded.verify_canonical(&keys.pq_pubkey),
+            Err(RecoveryContextError::BadSignature),
+        );
+        assert_eq!(
+            padded.verify_and_restore_canonical(
+                &keys.pq_pubkey,
+                &seed,
+                false,
+                &expected_hash,
+            ),
             Err(RecoveryContextError::BadSignature),
         );
     }

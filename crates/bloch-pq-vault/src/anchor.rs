@@ -213,6 +213,35 @@ pub fn verify_anchor(
     signed: &SignedAnchor,
     trusted_pq_pubkey: &[u8],
 ) -> Result<(), AnchorError> {
+    verify_anchor_with(
+        signed,
+        trusted_pq_pubkey,
+        bloch_crypto::crypto::verify_enveloped,
+    )
+}
+
+/// Verify an anchor while also requiring canonical primitive encodings.
+///
+/// This opt-in policy preserves [`verify_anchor`] for previously accepted
+/// artifacts, but lets new relying-party boundaries reject Falcon's alternate
+/// zero-padded representation. The anchor format already requires explicit
+/// suite envelopes, so this never guesses between raw and enveloped bytes.
+pub fn verify_anchor_canonical(
+    signed: &SignedAnchor,
+    trusted_pq_pubkey: &[u8],
+) -> Result<(), AnchorError> {
+    verify_anchor_with(
+        signed,
+        trusted_pq_pubkey,
+        bloch_crypto::crypto::verify_enveloped_canonical,
+    )
+}
+
+fn verify_anchor_with(
+    signed: &SignedAnchor,
+    trusted_pq_pubkey: &[u8],
+    verify_signature: fn(&[u8], &[u8], &[u8]) -> bool,
+) -> Result<(), AnchorError> {
     if signed.anchor.version != ANCHOR_VERSION {
         return Err(AnchorError::UnsupportedVersion(signed.anchor.version));
     }
@@ -221,7 +250,7 @@ pub fn verify_anchor(
         return Err(AnchorError::UntrustedKey);
     }
     // Verify under the caller's copy, so the anchor's own bytes cannot steer the check.
-    let ok = bloch_crypto::crypto::verify_enveloped(
+    let ok = verify_signature(
         trusted_pq_pubkey,
         &signed.anchor.commitment_bytes(),
         &signed.signature,
@@ -249,6 +278,20 @@ pub fn verify_bitcoin_anchor(
     trusted_pq_pubkey: &[u8],
     expected_network: bitcoin::Network,
 ) -> Result<(), BitcoinAnchorError> {
+    verify_bitcoin_anchor_with(
+        signed,
+        trusted_pq_pubkey,
+        expected_network,
+        verify_anchor,
+    )
+}
+
+fn verify_bitcoin_anchor_with(
+    signed: &SignedAnchor,
+    trusted_pq_pubkey: &[u8],
+    expected_network: bitcoin::Network,
+    verify_signature: fn(&SignedAnchor, &[u8]) -> Result<(), AnchorError>,
+) -> Result<(), BitcoinAnchorError> {
     // Preserve the generic verifier's cheap identity/version error precedence
     // without paying for a hybrid verification before address validation.
     if signed.anchor.version != ANCHOR_VERSION {
@@ -268,7 +311,24 @@ pub fn verify_bitcoin_anchor(
         .anchor
         .validate_bitcoin_addresses(expected_network)
         .map_err(|_| BitcoinAnchorError::InvalidAddress)?;
-    verify_anchor(signed, trusted_pq_pubkey).map_err(BitcoinAnchorError::Anchor)
+    verify_signature(signed, trusted_pq_pubkey).map_err(BitcoinAnchorError::Anchor)
+}
+
+/// Bitcoin-specific checked verification with canonical signature encoding.
+///
+/// Address/network and external-key checks are identical to
+/// [`verify_bitcoin_anchor`]; only the final signature policy is stricter.
+pub fn verify_bitcoin_anchor_canonical(
+    signed: &SignedAnchor,
+    trusted_pq_pubkey: &[u8],
+    expected_network: bitcoin::Network,
+) -> Result<(), BitcoinAnchorError> {
+    verify_bitcoin_anchor_with(
+        signed,
+        trusted_pq_pubkey,
+        expected_network,
+        verify_anchor_canonical,
+    )
 }
 
 impl SignedAnchor {
@@ -493,6 +553,45 @@ mod tests {
         let mut t3 = signed.clone();
         t3.anchor.csv_delay = 6;
         assert_eq!(verify_anchor(&t3, &pk), Err(AnchorError::BadSignature));
+    }
+
+    #[test]
+    fn canonical_anchor_policy_rejects_padded_falcon_encoding() {
+        let (pk, sk) =
+            bloch_crypto::crypto::generate_keypair_from_seed(&[57u8; 32]).unwrap();
+        let mut anchor = sample(pk.clone());
+        anchor.btc_vault_address = bitcoin_address(bitcoin::Network::Regtest, 0x55);
+        anchor.designated_safe_dest = bitcoin_address(bitcoin::Network::Regtest, 0x56);
+        let padded_len = bloch_crypto::crypto::SUITE_HEADER_LEN
+            + bloch_crypto::crypto::MLDSA_SIG_LEN
+            + bloch_crypto::crypto::falcon::padded_signature_len();
+        let signed = (0..64)
+            .map(|_| sign_anchor(&anchor, &sk).unwrap())
+            .find(|candidate| candidate.signature.len() < padded_len)
+            .expect("compact fixture must leave room for Falcon padding");
+
+        assert_eq!(verify_anchor_canonical(&signed, &pk), Ok(()));
+        assert_eq!(
+            verify_bitcoin_anchor_canonical(&signed, &pk, bitcoin::Network::Regtest),
+            Ok(()),
+        );
+
+        let mut padded = signed;
+        padded.signature.resize(padded_len, 0);
+
+        assert_eq!(
+            verify_anchor(&padded, &pk),
+            Ok(()),
+            "compatibility boundary must preserve historical padded acceptance"
+        );
+        assert_eq!(
+            verify_anchor_canonical(&padded, &pk),
+            Err(AnchorError::BadSignature),
+        );
+        assert_eq!(
+            verify_bitcoin_anchor_canonical(&padded, &pk, bitcoin::Network::Regtest),
+            Err(BitcoinAnchorError::Anchor(AnchorError::BadSignature)),
+        );
     }
 
     #[test]
