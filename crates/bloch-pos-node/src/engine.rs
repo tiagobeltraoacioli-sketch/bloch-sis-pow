@@ -811,10 +811,22 @@ const REORG_STATE_WINDOW: usize = 2;
 /// recovered by the `get_blocks` request the parking sets `needs_sync` for —
 /// which is why evicting here costs a round trip and never a fork.
 const ORPHAN_MAX: usize = 256;
+/// Combined retained wire bytes across blocked and ready orphan queues. Two
+/// maximum sync responses leave room for a legitimate recovery page while
+/// bounding retained serialized payload independently of entry count (the
+/// decoded objects still have allocator/capacity overhead).
+const ORPHAN_BYTES_MAX: usize = 2 * crate::p2p::MAX_SYNC_FRAME as usize;
 /// Combined waiting + ready-to-promote share for one normalized gossip
 /// source. `Gossip(None)` is one collective unattributed bucket; no identity
 /// is fabricated. Local production is exempt from a transport-fairness rule.
 const ORPHANS_PER_SOURCE: usize = 32;
+/// A gossip source may retain one complete maximum gossip frame. This is at
+/// least one producer-sized proposal, so the share cannot reject every legal
+/// envelope merely because it is large. Local production remains exempt.
+const ORPHAN_BYTES_PER_SOURCE: usize = crate::p2p::MAX_GOSSIP_BYTES;
+const _: () = assert!(ORPHAN_BYTES_PER_SOURCE >= crate::p2p::MAX_PROPOSAL_ENVELOPE_BYTES);
+const _: () = assert!(ORPHAN_BYTES_PER_SOURCE <= ORPHAN_BYTES_MAX);
+const _: () = assert!(ORPHAN_BYTES_MAX >= crate::p2p::MAX_SYNC_FRAME as usize);
 /// Parked blocks re-tried between two slot-loop control points. One promotion
 /// can execute a transition, rebuild fork choice, and unlock more work, so it
 /// receives the same one-block slice as ordinary admitted blocks.
@@ -910,6 +922,10 @@ impl Source {
             Source::Local => None,
         }
     }
+}
+
+fn retention_bytes_fit(held: usize, incoming: usize, cap: usize) -> bool {
+    held.checked_add(incoming).is_some_and(|total| total <= cap)
 }
 
 /// A budget refusal is this node's load state, never evidence that the bytes
@@ -1700,6 +1716,7 @@ struct Engine {
         BlockEnvelope,
         Source,
         Option<AuthenticatedBlockAdmission>,
+        usize,
     )>,
     /// Previously parked blocks made judgeable by a landed parent or registry
     /// growth. FIFO preserves the old worklist's breadth-first ordering while
@@ -1709,6 +1726,7 @@ struct Engine {
         BlockEnvelope,
         Source,
         Option<AuthenticatedBlockAdmission>,
+        usize,
     )>,
     /// Orphans dropped at the cap, and orphans later connected. Counted so
     /// "the bound is holding" is a measurement rather than an inference — a
@@ -2772,7 +2790,7 @@ impl Engine {
     fn sync_after_slot(&self) -> u64 {
         if !self.needs_sync && self.orphans.is_empty() { return self.state.slot(); }
         let missing_before = self.orphans.iter()
-            .map(|(_, env, _, _)| env.header.slot.saturating_sub(1))
+            .map(|(_, env, _, _, _)| env.header.slot.saturating_sub(1))
             .min().unwrap_or(self.state.slot()).min(self.state.slot());
         let finalized = self.state.finality().finalized.root;
         let floor = self.chain.iter().rev().find(|(_, id)| *id.as_bytes() == finalized)
@@ -2857,13 +2875,13 @@ impl Engine {
         let mut i = 0;
         while i < self.orphans.len() {
             if grew_registry || self.orphans[i].1.header.parent == landed {
-                let Some((_, env, orphan_source, authentication)) = self.orphans.remove(i) else {
+                let Some((_, env, orphan_source, authentication, retained_bytes)) = self.orphans.remove(i) else {
                     break;
                 };
                 self.orphans_admitted = self.orphans_admitted.saturating_add(1);
                 let id = *env.block_id().as_bytes();
                 self.deferred_orphans
-                    .push_back((id, env, orphan_source, authentication));
+                    .push_back((id, env, orphan_source, authentication, retained_bytes));
             } else {
                 #[allow(clippy::arithmetic_side_effects)]
                 {
@@ -2877,7 +2895,7 @@ impl Engine {
     /// was already `Ignore`; no result here is attributed to the parent relay.
     fn release_orphan_turn(&mut self) -> bool {
         for _ in 0..ORPHAN_PROMOTIONS_PER_TURN {
-            let Some((_, env, source, authentication)) = self.deferred_orphans.pop_front() else {
+            let Some((_, env, source, authentication, _)) = self.deferred_orphans.pop_front() else {
                 break;
             };
             let (_, landing) = self.ingest_one_deferred(env, source, authentication);
@@ -2987,9 +3005,9 @@ impl Engine {
         let same_envelope = |seen: &[u8; 32], held: &BlockEnvelope| {
             *seen == id && held.proposer_sig == env.proposer_sig
         };
-        if self.orphans.iter().any(|(seen, held, _, _)| same_envelope(seen, held))
+        if self.orphans.iter().any(|(seen, held, _, _, _)| same_envelope(seen, held))
             || self.deferred_orphans.iter()
-                .any(|(seen, held, _, _)| same_envelope(seen, held))
+                .any(|(seen, held, _, _, _)| same_envelope(seen, held))
             || self.future_blocks.get(&id)
                 .is_some_and(|(held, _, _)| held.proposer_sig == env.proposer_sig)
         {
@@ -3313,8 +3331,8 @@ impl Engine {
         src: Source,
         authentication: Option<AuthenticatedBlockAdmission>,
     ) {
-        if self.orphans.iter().any(|(seen, _, _, _)| *seen == id)
-            || self.deferred_orphans.iter().any(|(seen, _, _, _)| *seen == id)
+        if self.orphans.iter().any(|(seen, _, _, _, _)| *seen == id)
+            || self.deferred_orphans.iter().any(|(seen, _, _, _, _)| *seen == id)
         {
             return;
         }
@@ -3324,9 +3342,41 @@ impl Engine {
         if src.bounded_by_wall_clock()
             && self.orphans.iter()
                 .chain(self.deferred_orphans.iter())
-                .filter(|(_, _, held_source, _)| *held_source == src)
+                .filter(|(_, _, held_source, _, _)| *held_source == src)
                 .count()
                 >= ORPHANS_PER_SOURCE
+        {
+            self.orphans_evicted = self.orphans_evicted.saturating_add(1);
+            return;
+        }
+        // Charge exact codec bytes only after deduplication and the cheaper
+        // entry-count share. The length helper does not allocate another
+        // frame-sized buffer.
+        let retained_bytes = crate::codec::encoded_envelope_len(&env);
+        if src.bounded_by_wall_clock() {
+            let source_bytes = self.orphans.iter()
+                .chain(self.deferred_orphans.iter())
+                .filter(|(_, _, held_source, _, _)| *held_source == src)
+                .fold(0usize, |sum, (_, _, _, _, bytes)| sum.saturating_add(*bytes));
+            if !retention_bytes_fit(source_bytes, retained_bytes, ORPHAN_BYTES_PER_SOURCE) {
+                self.orphans_evicted = self.orphans_evicted.saturating_add(1);
+                return;
+            }
+        }
+        // An internally constructed object larger than the whole budget can
+        // never fit. Refuse it before the FIFO loop so it cannot flush every
+        // waiting entry and then be refused anyway.
+        if retained_bytes > ORPHAN_BYTES_MAX {
+            self.orphans_evicted = self.orphans_evicted.saturating_add(1);
+            return;
+        }
+        // Ready-to-promote work is deliberately immutable under new
+        // admission. If it leaves no possible room for this entry, refuse
+        // before evicting any still-waiting orphan to no useful effect.
+        let deferred_bytes = self.deferred_orphans.iter()
+            .fold(0usize, |sum, (_, _, _, _, bytes)| sum.saturating_add(*bytes));
+        if self.deferred_orphans.len() >= ORPHAN_MAX
+            || !retention_bytes_fit(deferred_bytes, retained_bytes, ORPHAN_BYTES_MAX)
         {
             self.orphans_evicted = self.orphans_evicted.saturating_add(1);
             return;
@@ -3336,7 +3386,14 @@ impl Engine {
         // queued for its bounded promotion turn must not be displaced by new
         // remote work. If the ready tail alone fills the cap, drop the new
         // orphan (still an Ignore verdict, never peer guilt).
-        while self.orphans.len().saturating_add(self.deferred_orphans.len()) >= ORPHAN_MAX {
+        while self.orphans.len().saturating_add(self.deferred_orphans.len()) >= ORPHAN_MAX
+            || !retention_bytes_fit(
+                self.orphans.iter().chain(self.deferred_orphans.iter())
+                    .fold(0usize, |sum, (_, _, _, _, bytes)| sum.saturating_add(*bytes)),
+                retained_bytes,
+                ORPHAN_BYTES_MAX,
+            )
+        {
             if self.orphans.pop_front().is_some() {
                 self.orphans_evicted = self.orphans_evicted.saturating_add(1);
             } else {
@@ -3344,7 +3401,7 @@ impl Engine {
                 return;
             }
         }
-        self.orphans.push_back((id, env, src, authentication));
+        self.orphans.push_back((id, env, src, authentication, retained_bytes));
         // The gap is real and the sync loop is the thing that closes it.
         self.needs_sync = true;
     }
@@ -3410,7 +3467,7 @@ impl Engine {
             .filter(|(id, env)| env.header.slot < floor && !self.canonical.contains(*id))
             .map(|(id, _)| *id).collect();
         pending.extend(self.orphans.iter()
-            .filter(|(_, env, _, _)| env.header.slot < floor).map(|(id, _, _, _)| *id));
+            .filter(|(_, env, _, _, _)| env.header.slot < floor).map(|(id, _, _, _, _)| *id));
         if pending.is_empty() { return; }
 
         // A descendant cannot reconnect once its already-finalized-away
@@ -3422,7 +3479,7 @@ impl Engine {
                 children.entry(env.header.parent).or_default().push(*id);
             }
         }
-        for (id, env, _, _) in &self.orphans {
+        for (id, env, _, _, _) in &self.orphans {
             children.entry(env.header.parent).or_default().push(*id);
         }
         let mut doomed = BTreeSet::new();
@@ -3438,7 +3495,7 @@ impl Engine {
             }
         }
         let before = self.orphans.len();
-        self.orphans.retain(|(id, _, _, _)| !doomed.contains(id));
+        self.orphans.retain(|(id, _, _, _, _)| !doomed.contains(id));
         self.orphans_evicted = self.orphans_evicted
             .saturating_add(before.saturating_sub(self.orphans.len()) as u64);
     }
@@ -4525,8 +4582,8 @@ impl Engine {
             .map(|env| *env.block_id().as_bytes()).collect();
         loop {
             let Some(index) = self.orphans.iter()
-                .position(|(_, env, _, _)| refused.contains(&env.header.parent)) else { break };
-            let Some((id, _, _, _)) = self.orphans.remove(index) else { break };
+                .position(|(_, env, _, _, _)| refused.contains(&env.header.parent)) else { break };
+            let Some((id, _, _, _, _)) = self.orphans.remove(index) else { break };
             refused.insert(id);
             self.orphans_evicted = self.orphans_evicted.saturating_add(1);
         }
@@ -12206,7 +12263,7 @@ mod ingest_admission_tests {
             !engine
                 .orphans
                 .iter()
-                .any(|(_, env, _, _)| env.header.parent == first_parent),
+                .any(|(_, env, _, _, _)| env.header.parent == first_parent),
             "FIFO: the oldest entry is the one evicted"
         );
     }
@@ -12224,6 +12281,182 @@ mod ingest_admission_tests {
         }
         assert_eq!(engine.orphans.len(), 1, "dedup by block id");
         assert_eq!(engine.orphans_evicted, 0, "and nothing was pushed out");
+    }
+
+    fn orphan_with_encoded_len(
+        template: &BlockEnvelope,
+        parent: [u8; 32],
+        target: usize,
+    ) -> BlockEnvelope {
+        let mut env = template.clone();
+        env.header.proposer_index = 7;
+        env.header.parent = parent;
+        env.header.slot = 2;
+        env.proposer_sig.clear();
+        env.body.attestations.clear();
+        env.body.transactions.clear();
+        let base = crate::codec::encoded_envelope_len(&env);
+        assert!(target >= base);
+        env.proposer_sig.resize(target - base, 0xA5);
+        assert_eq!(crate::codec::encoded_envelope_len(&env), target);
+        env
+    }
+
+    #[test]
+    fn orphan_source_byte_share_counts_both_queues_and_reopens_exactly() {
+        let (mut engine, _dir, template, _stored) = fixture();
+        let half_share = ORPHAN_BYTES_PER_SOURCE / 2;
+        let landed = [0x81; 32];
+
+        assert!(retention_bytes_fit(0, ORPHAN_BYTES_PER_SOURCE, ORPHAN_BYTES_PER_SOURCE));
+        assert!(!retention_bytes_fit(0, ORPHAN_BYTES_PER_SOURCE + 1, ORPHAN_BYTES_PER_SOURCE));
+        assert!(!retention_bytes_fit(usize::MAX, 1, usize::MAX));
+
+        let first = orphan_with_encoded_len(&template, landed, half_share);
+        let second = orphan_with_encoded_len(&template, [0x82; 32], half_share);
+        let second_duplicate = second.clone();
+        engine.park_orphan(*first.block_id().as_bytes(), first, Source::Gossip(None));
+        engine.park_orphan(*second.block_id().as_bytes(), second, Source::Gossip(None));
+        engine.schedule_unblocked_orphans(landed, false);
+        assert_eq!(engine.orphans.len(), 1);
+        assert_eq!(engine.deferred_orphans.len(), 1);
+        assert_eq!(
+            engine.orphans.iter().chain(engine.deferred_orphans.iter())
+                .map(|(_, _, _, _, bytes)| *bytes).sum::<usize>(),
+            ORPHAN_BYTES_PER_SOURCE,
+        );
+
+        let before_duplicate = engine.orphans_evicted;
+        engine.park_orphan(
+            *second_duplicate.block_id().as_bytes(),
+            second_duplicate,
+            Source::Gossip(None),
+        );
+        assert_eq!(engine.orphans_evicted, before_duplicate, "dedup precedes byte charge");
+
+        let excess = orphan_with_encoded_len(&template, [0x83; 32], half_share);
+        engine.park_orphan(*excess.block_id().as_bytes(), excess, Source::Gossip(None));
+        assert_eq!(engine.orphans_evicted, before_duplicate + 1);
+        assert_eq!(engine.orphans.len() + engine.deferred_orphans.len(), 2);
+
+        engine.deferred_orphans.pop_front().expect("one exact half-share leaves");
+        let reopened = orphan_with_encoded_len(&template, [0x84; 32], half_share);
+        engine.park_orphan(*reopened.block_id().as_bytes(), reopened, Source::Gossip(None));
+        assert_eq!(
+            engine.orphans.iter().chain(engine.deferred_orphans.iter())
+                .map(|(_, _, _, _, bytes)| *bytes).sum::<usize>(),
+            ORPHAN_BYTES_PER_SOURCE,
+            "removal reopens exactly the bytes carried by the removed entry",
+        );
+    }
+
+    #[test]
+    fn deferred_only_global_byte_cap_drops_local_then_reopens() {
+        let (mut engine, _dir, template, _stored) = fixture();
+        let landed = [0x91; 32];
+        let slice = ORPHAN_BYTES_MAX / 8;
+        assert_eq!(slice * 8, ORPHAN_BYTES_MAX);
+
+        for i in 0..8u8 {
+            let mut env = orphan_with_encoded_len(&template, landed, slice);
+            env.header.slot = u64::from(i).saturating_add(2);
+            let source = Source::Gossip(Some([i / 2; 32]));
+            engine.park_orphan(*env.block_id().as_bytes(), env, source);
+        }
+        engine.schedule_unblocked_orphans(landed, false);
+        assert!(engine.orphans.is_empty());
+        assert_eq!(engine.deferred_orphans.len(), 8);
+        assert_eq!(
+            engine.deferred_orphans.iter().map(|(_, _, _, _, bytes)| *bytes).sum::<usize>(),
+            ORPHAN_BYTES_MAX,
+        );
+
+        let local = orphan_with_encoded_len(&template, [0x92; 32], slice);
+        let before = engine.orphans_evicted;
+        engine.park_orphan(*local.block_id().as_bytes(), local, Source::Local);
+        assert_eq!(engine.orphans_evicted, before + 1);
+        assert!(engine.orphans.is_empty(), "ready work is never displaced by new local work");
+
+        engine.deferred_orphans.pop_front().expect("one byte slice leaves");
+        let reopened = orphan_with_encoded_len(&template, [0x93; 32], slice);
+        engine.park_orphan(*reopened.block_id().as_bytes(), reopened, Source::Local);
+        assert_eq!(engine.orphans.len(), 1, "Local is globally bounded but has no source share");
+        assert_eq!(
+            engine.orphans.iter().chain(engine.deferred_orphans.iter())
+                .map(|(_, _, _, _, bytes)| *bytes).sum::<usize>(),
+            ORPHAN_BYTES_MAX,
+        );
+    }
+
+    #[test]
+    fn waiting_global_byte_cap_rejects_oversize_then_evicts_fifo() {
+        let (mut engine, _dir, template, _stored) = fixture();
+        let slice = ORPHAN_BYTES_MAX / 8;
+        for i in 0..8u8 {
+            let mut parent = [0xA1; 32];
+            parent[1] = i;
+            let env = orphan_with_encoded_len(&template, parent, slice);
+            engine.park_orphan(
+                *env.block_id().as_bytes(),
+                env,
+                Source::Gossip(Some([i / 2; 32])),
+            );
+        }
+        let oldest = engine.orphans.front().expect("full waiting FIFO").0;
+        let before_ids: Vec<[u8; 32]> = engine.orphans.iter().map(|(id, _, _, _, _)| *id).collect();
+        let before = engine.orphans_evicted;
+
+        let oversize = orphan_with_encoded_len(&template, [0xA2; 32], ORPHAN_BYTES_MAX + 1);
+        engine.park_orphan(*oversize.block_id().as_bytes(), oversize, Source::Local);
+        assert_eq!(engine.orphans_evicted, before + 1);
+        assert_eq!(
+            engine.orphans.iter().map(|(id, _, _, _, _)| *id).collect::<Vec<_>>(),
+            before_ids,
+            "global-cap+1 is refused before it can flush retained work",
+        );
+
+        let incoming = orphan_with_encoded_len(&template, [0xA3; 32], slice);
+        let incoming_id = *incoming.block_id().as_bytes();
+        engine.park_orphan(incoming_id, incoming, Source::Local);
+        assert_eq!(engine.orphans_evicted, before + 2);
+        assert!(!engine.orphans.iter().any(|(id, _, _, _, _)| *id == oldest));
+        assert!(engine.orphans.iter().any(|(id, _, _, _, _)| *id == incoming_id));
+        assert_eq!(
+            engine.orphans.iter().map(|(_, _, _, _, bytes)| *bytes).sum::<usize>(),
+            ORPHAN_BYTES_MAX,
+            "one equal-sized FIFO eviction admits the new waiting entry at the exact cap",
+        );
+    }
+
+    #[test]
+    fn immutable_deferred_bytes_do_not_flush_waiting_work_uselessly() {
+        let (mut engine, _dir, template, _stored) = fixture();
+        let landed = [0xB1; 32];
+        let slice = ORPHAN_BYTES_MAX / 16;
+
+        for i in 0..15u8 {
+            let mut env = orphan_with_encoded_len(&template, landed, slice);
+            env.header.slot = u64::from(i).saturating_add(2);
+            engine.park_orphan(
+                *env.block_id().as_bytes(),
+                env,
+                Source::Gossip(Some([i / 4; 32])),
+            );
+        }
+        engine.schedule_unblocked_orphans(landed, false);
+        assert_eq!(engine.deferred_orphans.len(), 15);
+
+        let waiting = orphan_with_encoded_len(&template, [0xB2; 32], slice);
+        let waiting_id = *waiting.block_id().as_bytes();
+        engine.park_orphan(waiting_id, waiting, Source::Local);
+        assert_eq!(engine.orphans.len(), 1);
+        let before = engine.orphans_evicted;
+
+        let impossible = orphan_with_encoded_len(&template, [0xB3; 32], slice * 4);
+        engine.park_orphan(*impossible.block_id().as_bytes(), impossible, Source::Local);
+        assert_eq!(engine.orphans_evicted, before + 1);
+        assert_eq!(engine.orphans.len(), 1);
+        assert_eq!(engine.orphans[0].0, waiting_id, "immutable deferred bytes make admission impossible, so waiting work is untouched");
     }
 
     #[test]
@@ -12293,7 +12526,7 @@ mod ingest_admission_tests {
         assert_eq!(
             engine.orphans.iter()
                 .chain(engine.deferred_orphans.iter())
-                .filter(|(_, _, source, _)| *source == Source::Gossip(Some(source_a)))
+                .filter(|(_, _, source, _, _)| *source == Source::Gossip(Some(source_a)))
                 .count(),
             ORPHANS_PER_SOURCE,
             "one departed entry must reopen exactly one slot for its source",
@@ -13576,35 +13809,20 @@ mod ingest_admission_tests {
         let orphan = repointed(&engine, &template, grandchild_id, floor + 30);
         let orphan_child = repointed(&engine, &template, *orphan.block_id().as_bytes(), floor + 40);
         // Reverse arrival order must not leave a pending descendant behind.
-        engine.orphans.push_back((
-            *orphan_child.block_id().as_bytes(),
-            orphan_child,
-            Source::Gossip(None),
-            None,
-        ));
-        engine.orphans.push_back((
-            *orphan.block_id().as_bytes(),
-            orphan,
-            Source::Gossip(None),
-            None,
-        ));
+        let push_orphan = |engine: &mut Engine, env: BlockEnvelope| {
+            let id = *env.block_id().as_bytes();
+            let retained_bytes = crate::codec::encoded_envelope_len(&env);
+            engine.orphans.push_back((id, env, Source::Gossip(None), None, retained_bytes));
+        };
+        push_orphan(&mut engine, orphan_child);
+        push_orphan(&mut engine, orphan);
         let old_gap = repointed(&engine, &template, [0x71; 32], 1);
         let gap_child = repointed(&engine, &template, *old_gap.block_id().as_bytes(), floor + 50);
-        engine.orphans.push_back((
-            *gap_child.block_id().as_bytes(),
-            gap_child,
-            Source::Gossip(None),
-            None,
-        ));
-        engine.orphans.push_back((
-            *old_gap.block_id().as_bytes(),
-            old_gap,
-            Source::Gossip(None),
-            None,
-        ));
+        push_orphan(&mut engine, gap_child);
+        push_orphan(&mut engine, old_gap);
         let unrelated = repointed(&engine, &template, [0x72; 32], floor + 60);
         let unrelated_id = *unrelated.block_id().as_bytes();
-        engine.orphans.push_back((unrelated_id, unrelated, Source::Gossip(None), None));
+        push_orphan(&mut engine, unrelated);
         let canonical = engine.canonical.clone();
         let chosen_head = engine.forkchoice_head();
         let before_blocks = engine.blocks_pruned;

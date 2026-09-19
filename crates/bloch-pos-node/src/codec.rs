@@ -157,6 +157,26 @@ pub fn decode_attestation(r: &mut Reader<'_>) -> Result<Attestation, DecodeErr> 
 
 // ── Block envelope ──────────────────────────────────────────────────────────
 
+/// Exact wire/disk length of [`encode_envelope`] without allocating a second
+/// attacker-sized buffer. Saturation is fail-closed for retention callers:
+/// an object whose component lengths cannot be represented is larger than
+/// every finite byte budget.
+pub fn encoded_envelope_len(env: &BlockEnvelope) -> usize {
+    let mut len = BlockHeaderV4::ENCODED_LEN
+        .saturating_add(4)
+        .saturating_add(env.proposer_sig.len())
+        .saturating_add(4);
+    for attestation in &env.body.attestations {
+        // Fixed attestation fields plus its length-prefixed signature.
+        len = len.saturating_add(128).saturating_add(attestation.signature.len());
+    }
+    len = len.saturating_add(4);
+    for transaction in &env.body.transactions {
+        len = len.saturating_add(4).saturating_add(transaction.len());
+    }
+    len
+}
+
 pub fn encode_envelope(env: &BlockEnvelope) -> Vec<u8> {
     // `with_capacity` is a size hint, not a correctness bound: saturating is
     // the intended semantics here (the alternative to saturation is "guess
@@ -302,6 +322,24 @@ mod tests {
         assert_eq!(back.body.attestations[0].signature, env.body.attestations[0].signature);
         // Identity is preserved through the codec — same bytes, same id.
         assert_eq!(back.block_id(), env.block_id());
+    }
+
+    #[test]
+    fn encoded_envelope_len_tracks_empty_collections_fields_and_limits() {
+        let mut env = sample_envelope();
+        env.proposer_sig.clear();
+        env.body.attestations.clear();
+        env.body.transactions.clear();
+        assert_eq!(encoded_envelope_len(&env), encode_envelope(&env).len());
+
+        env.body.attestations.push(sample_envelope().body.attestations.remove(0));
+        assert_eq!(encoded_envelope_len(&env), encode_envelope(&env).len());
+
+        env.body.transactions.push(vec![0xA5; 4097]);
+        assert_eq!(encoded_envelope_len(&env), encode_envelope(&env).len());
+
+        env.proposer_sig.resize(MAX_FIELD_LEN, 0x5A);
+        assert_eq!(encoded_envelope_len(&env), encode_envelope(&env).len());
     }
 
     #[test]
