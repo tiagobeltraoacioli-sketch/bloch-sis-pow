@@ -310,9 +310,11 @@ impl AttestationPool {
     ///   4. duty membership      → non-member: Reject (cannot be honest skew:
     ///      membership is a deterministic function of committed state both
     ///      sides can compute)
-    ///   5. hybrid signature     → bad: Reject; unresolvable key: Ignore
-    ///   6. head/target known?   → unknown: Hold (capped per duty)
-    ///   7. Accept
+    ///   5. key resolution       → unavailable: Ignore
+    ///   6. pending preflight    → full: Ignore, before expensive crypto
+    ///   7. hybrid signature     → bad: Reject
+    ///   8. head/target known?   → unknown: Hold (already preflighted)
+    ///   9. Accept
     ///
     /// ## R3 NEW-1 — why signature verification moved *before* Hold
     ///
@@ -328,20 +330,17 @@ impl AttestationPool {
     /// parked — at zero cost to the attacker and zero peer-score cost
     /// (Hold → Ignore is, correctly, never a penalty).
     ///
-    /// The fix verifies the signature first whenever the key is resolvable,
-    /// which is always safe to do *before* knowing whether the referenced
-    /// blocks are known: `keys` is a registry projection at a fixed epoch
+    /// The fix verifies the signature before an entry is stored whenever the
+    /// key is resolvable. `keys` is a registry projection at a fixed epoch
     /// (`rolled_to(epoch)`, or the block's pre-state) that does not depend on
-    /// `att.data.head` or `att.data.target_root` having been imported — i.e.
-    /// key resolution and signature verification are head-independent. So
-    /// this reordering cannot turn an honest race into a Reject: a bad
-    /// signature was always going to be Reject once checked (step 6 in the
-    /// old order), and a good signature was always going to reach Hold; only
-    /// *which pool state* an unverifiable frame can occupy changes — from
-    /// "parked, unverified" to "never parked". An unresolvable key (this
-    /// node is behind — see [`IgnoreReason::UnknownValidator`]) still cannot
-    /// be checked, so it still cannot be parked; it Ignores exactly as
-    /// before, just one step earlier.
+    /// `att.data.head` or `att.data.target_root` having been imported. A local
+    /// capacity preflight may now Ignore a frame before that verification,
+    /// but only when the frame could not be stored anyway; it never Accepts
+    /// or Holds unverified input. Thus the ordering cannot turn an honest race
+    /// into a Reject: a bad signature is rejected whenever capacity exists,
+    /// a good signature reaches Hold, and saturation stays a non-penalizing
+    /// Ignore. An unresolvable key (this node is behind — see
+    /// [`IgnoreReason::UnknownValidator`]) still cannot be checked or parked.
     ///
     /// This is *not* a consensus-relevant change and needs no activation
     /// gate: `AttestationPool` is node-local, ephemeral relay/scoring state
@@ -445,13 +444,9 @@ impl AttestationPool {
             return GossipDecision::Reject(RejectReason::NotInCommittee);
         }
 
-        // 5. Signature — moved before the head/target check (R3 NEW-1; see
-        //    the long comment on this function for the replay-safety and
-        //    ordering argument). Both halves of the hybrid suite, via the
-        //    injected verifier. Only verified attestations are ever recorded
-        //    or parked, so every equivocation pair we hand to slashing
-        //    already carries two valid signatures — a forger cannot frame a
-        //    validator here.
+        // 5. Resolve the key before local-capacity preflight. An unavailable
+        //    key remains UnknownValidator even when the pending pool is full:
+        //    that verdict describes this node's lag, not traffic pressure.
         //
         //    The key comes from the SAME state snapshot that drew the
         //    committee checked in step 4 — `rolled_to(epoch)` at the node.
@@ -485,11 +480,37 @@ impl AttestationPool {
             // that can never be cashed in by this node.
             return GossipDecision::Ignore(IgnoreReason::UnknownValidator);
         };
+
+        // 6. Compute the same first missing root that Hold would use and
+        //    preflight every pending-only limit before the expensive hybrid
+        //    verification. This is safe because capacity pressure is a local
+        //    Ignore, never a validity judgment or peer penalty. A frame that
+        //    cannot possibly be retained must not buy repeated consensus-
+        //    thread crypto merely by arriving at a saturated bucket.
+        //
+        //    Known-root attestations deliberately bypass this preflight and
+        //    still authenticate below: pending pressure cannot become a way
+        //    to sneak an invalid message into the accepted path. No state can
+        //    change between preflight and `hold` because this method owns
+        //    `&mut self` for the whole operation.
+        let missing_root = [att.data.head, att.data.target_root]
+            .into_iter()
+            .find(|root| !blocks.is_known(root));
+        if let Some(root) = missing_root {
+            if let Some(reason) = self.pending_capacity_reason(duty, root, verification_source) {
+                return GossipDecision::Ignore(reason);
+            }
+        }
+
+        // 7. Signature. Both halves of the hybrid suite, via the injected
+        //    verifier. Only verified attestations are ever recorded or
+        //    parked, so every equivocation pair handed to slashing already
+        //    carries two valid signatures: a forger cannot frame a validator.
         if !verifier.verify_with_key(pubkey, &data_hash, &att.signature) {
             return GossipDecision::Reject(RejectReason::BadSignature);
         }
 
-        // 6. Referenced blocks. The attestation votes for the head produced
+        // 8. Referenced blocks. The attestation votes for the head produced
         //    in its own slot, so arriving before that block is *guaranteed*
         //    ordinary propagation timing — milliseconds of race, every
         //    boundary. Hold, count nothing against anyone — but only up to
@@ -501,54 +522,11 @@ impl AttestationPool {
         //    capacity. The target root gets the same treatment as the head:
         //    at an epoch boundary the target IS the block just produced, and
         //    it races too.
-        for root in [att.data.head, att.data.target_root] {
-            if !blocks.is_known(&root) {
-                let pending_for_duty = *self.pending_by_duty.get(&duty).unwrap_or(&0);
-                if pending_for_duty >= MAX_EQUIVOCATIONS_PER_DUTY {
-                    return GossipDecision::Ignore(IgnoreReason::PendingDutyLimit);
-                }
-                let pending_for_root = self.pending_by_root
-                    .get(&root)
-                    .map_or(0, BTreeSet::len);
-                if pending_for_root >= MAX_PENDING_ATTESTATIONS_PER_ROOT {
-                    return GossipDecision::Ignore(IgnoreReason::PendingRootLimit);
-                }
-                if !self.pending_by_root.contains_key(&root)
-                    && self.pending_by_root.len() >= MAX_PENDING_ATTESTATION_ROOTS
-                {
-                    return GossipDecision::Ignore(IgnoreReason::PendingRootSetLimit);
-                }
-                if let Some(source) = verification_source {
-                    if self.pending_by_source.get(&source).copied().unwrap_or(0)
-                        >= MAX_PENDING_ATTESTATIONS_PER_SOURCE
-                    {
-                        return GossipDecision::Ignore(IgnoreReason::PendingSourceLimit);
-                    }
-                    if self.pending_by_source_root
-                        .get(&(source, root))
-                        .copied()
-                        .unwrap_or(0)
-                        >= MAX_PENDING_ATTESTATIONS_PER_SOURCE_ROOT
-                    {
-                        return GossipDecision::Ignore(IgnoreReason::PendingSourceRootLimit);
-                    }
-                } else {
-                    if self.pending_unattributed >= MAX_PENDING_UNATTRIBUTED_ATTESTATIONS {
-                        return GossipDecision::Ignore(IgnoreReason::PendingUnattributedLimit);
-                    }
-                    if self.pending_unattributed_by_root.get(&root).copied().unwrap_or(0)
-                        >= MAX_PENDING_UNATTRIBUTED_ATTESTATIONS_PER_ROOT
-                    {
-                        return GossipDecision::Ignore(
-                            IgnoreReason::PendingUnattributedRootLimit,
-                        );
-                    }
-                }
-                return self.hold(duty, att, root, data_hash, verification_source);
-            }
+        if let Some(root) = missing_root {
+            return self.hold(duty, att, root, data_hash, verification_source);
         }
 
-        // 7. Record. Second distinct data for the duty = equivocation:
+        // 9. Record. Second distinct data for the duty = equivocation:
         //    capture the pair for the slashing pool but still Accept — both
         //    messages must propagate, because the rest of the network needs
         //    the same evidence (spec §6.2: "both are needed as slashing
@@ -559,6 +537,55 @@ impl AttestationPool {
         });
         rec.accepted.push((data_hash, att));
         GossipDecision::Accept { slashing_candidate }
+    }
+
+    /// Return the local pending-capacity refusal for an otherwise novel
+    /// attestation, in stable priority order. This performs no authentication
+    /// and must therefore only produce Ignore decisions; `hold` remains
+    /// reachable solely after a successful signature verification.
+    fn pending_capacity_reason(
+        &self,
+        duty: DutyKey,
+        root: [u8; 32],
+        verification_source: Option<[u8; 32]>,
+    ) -> Option<IgnoreReason> {
+        if self.pending_by_duty.get(&duty).copied().unwrap_or(0)
+            >= MAX_EQUIVOCATIONS_PER_DUTY
+        {
+            return Some(IgnoreReason::PendingDutyLimit);
+        }
+        if self.pending_by_root.get(&root).map_or(0, BTreeSet::len)
+            >= MAX_PENDING_ATTESTATIONS_PER_ROOT
+        {
+            return Some(IgnoreReason::PendingRootLimit);
+        }
+        if !self.pending_by_root.contains_key(&root)
+            && self.pending_by_root.len() >= MAX_PENDING_ATTESTATION_ROOTS
+        {
+            return Some(IgnoreReason::PendingRootSetLimit);
+        }
+        if let Some(source) = verification_source {
+            if self.pending_by_source.get(&source).copied().unwrap_or(0)
+                >= MAX_PENDING_ATTESTATIONS_PER_SOURCE
+            {
+                return Some(IgnoreReason::PendingSourceLimit);
+            }
+            if self.pending_by_source_root.get(&(source, root)).copied().unwrap_or(0)
+                >= MAX_PENDING_ATTESTATIONS_PER_SOURCE_ROOT
+            {
+                return Some(IgnoreReason::PendingSourceRootLimit);
+            }
+        } else {
+            if self.pending_unattributed >= MAX_PENDING_UNATTRIBUTED_ATTESTATIONS {
+                return Some(IgnoreReason::PendingUnattributedLimit);
+            }
+            if self.pending_unattributed_by_root.get(&root).copied().unwrap_or(0)
+                >= MAX_PENDING_UNATTRIBUTED_ATTESTATIONS_PER_ROOT
+            {
+                return Some(IgnoreReason::PendingUnattributedRootLimit);
+            }
+        }
+        None
     }
 
     /// A block was imported: re-run every attestation that was waiting on it.
@@ -815,6 +842,15 @@ mod tests {
         }
     }
 
+    /// Proves that a path ended before expensive cryptography. Any accidental
+    /// verification is a test failure, not merely an incremented counter.
+    struct PanicVerifier;
+    impl SignatureVerifier for PanicVerifier {
+        fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            panic!("pending-capacity preflight must run before signature verification")
+        }
+    }
+
     const CURRENT_SLOT: u64 = 100;
 
     /// Committee for every slot in these tests: validators 1..=8, sorted, as
@@ -1023,11 +1059,11 @@ mod tests {
 
     #[test]
     fn forged_signature_is_rejected_before_parking_not_after() {
-        // R3 NEW-1: signature verification now runs BEFORE the head/target
-        // check, precisely so a forgery can never occupy a pending slot —
-        // the opposite of this test's pre-fix name and premise. A forged
-        // frame with an unknown head must Reject immediately, and the pool
-        // must stay empty (nothing was ever parked to release later).
+        // R3 NEW-1: signature verification now runs before parking, precisely
+        // so a forgery can never occupy a pending slot. Capacity preflight may
+        // inspect the head first, but this empty pool has room, so a forged
+        // frame with an unknown head must Reject and nothing can be released
+        // later.
         let mut pool = AttestationPool::new();
         let blocks = [root(0x22)].into_iter().collect::<BTreeSet<_>>(); // head 0xAA unknown
         let mut a = att(1, CURRENT_SLOT, 0xAA);
@@ -1483,6 +1519,67 @@ mod tests {
                 Some(source_b),
             ),
             GossipDecision::Hold { .. },
+        ));
+    }
+
+    #[test]
+    fn saturated_pending_source_stops_before_crypto_but_known_roots_still_authenticate() {
+        let mut pool = AttestationPool::new();
+        let unknown = BTreeSet::new();
+        let source = [0xA1; 32];
+
+        // Fill one source/root share with valid authenticated duties.
+        for validator in 1..=MAX_PENDING_ATTESTATIONS_PER_SOURCE_ROOT as u32 {
+            assert!(matches!(
+                pool.process_from_source(
+                    att(validator, CURRENT_SLOT, 0xAA),
+                    CURRENT_SLOT,
+                    &committees(),
+                    &known(&unknown),
+                    &RootEchoVerifier,
+                    &AnyKey,
+                    Some(source),
+                ),
+                GossipDecision::Hold { .. }
+            ));
+        }
+
+        // A fresh duty for the saturated source/root is a local-capacity
+        // Ignore and must never reach hybrid verification. Before this
+        // preflight, every distinct re-offer paid that cost before discovering
+        // it could not be retained.
+        let overflow = att(1, CURRENT_SLOT - 1, 0xAA);
+        assert!(matches!(
+            pool.process_from_source(
+                overflow,
+                CURRENT_SLOT,
+                &committees(),
+                &known(&unknown),
+                &PanicVerifier,
+                &AnyKey,
+                Some(source),
+            ),
+            GossipDecision::Ignore(IgnoreReason::PendingSourceRootLimit)
+        ));
+        assert_eq!(pool.pending_len(), MAX_PENDING_ATTESTATIONS_PER_SOURCE_ROOT);
+
+        // Capacity is pending-only. If both roots are known, a malformed
+        // signature must still be authenticated and rejected rather than
+        // inheriting the saturated source's Ignore outcome.
+        let all_known = default_known();
+        let mut forged = att(2, CURRENT_SLOT - 1, 0xBB);
+        forged.signature = vec![0xEE; 32];
+        assert!(matches!(
+            pool.process_from_source(
+                forged,
+                CURRENT_SLOT,
+                &committees(),
+                &known(&all_known),
+                &RootEchoVerifier,
+                &AnyKey,
+                Some(source),
+            ),
+            GossipDecision::Reject(RejectReason::BadSignature)
         ));
     }
 
