@@ -4597,16 +4597,25 @@ impl Engine {
                 self.finality_rewinds_refused,
             );
         }
+        // The FIFO remains the ordering authority; this temporary index only
+        // replaces a full identity scan for every block in a refused branch.
+        // Keep it synchronized with every pop and push so an ID evicted by an
+        // earlier block can legitimately reappear later in the same branch.
+        let mut parked_ids: BTreeSet<[u8; 32]> =
+            self.parked_refused_finality.iter().copied().collect();
         for env in branch {
             let id = *env.block_id().as_bytes();
             self.blocks.remove(&id);
-            if self.parked_refused_finality.contains(&id) {
+            if parked_ids.contains(&id) {
                 continue;
             }
             while self.parked_refused_finality.len() >= MAX_PARKED_REFUSED_FINALITY {
-                self.parked_refused_finality.pop_front();
+                if let Some(oldest) = self.parked_refused_finality.pop_front() {
+                    parked_ids.remove(&oldest);
+                }
             }
             self.parked_refused_finality.push_back(id);
+            parked_ids.insert(id);
         }
         // Entries may have arrived before the parent was refused. Remove the
         // entire bounded pending subtree, including reverse arrival order.
@@ -14691,6 +14700,62 @@ mod finality_latch_tests {
         assert_eq!(engine.ingest_one(child, Source::Gossip(None)).0, Verdict::Ignore);
         assert_eq!(engine.rejected_unsigned, rejected_before, "descendant door precedes crypto");
         assert!(!engine.needs_sync, "a refused parent is not converted into a sync gap");
+    }
+
+    #[test]
+    fn refused_finality_identity_index_matches_sequential_fifo_reappearance() {
+        let (mut engine, _dir, _floor, _root) = latched_engine();
+        let template = engine.blocks
+            .get(engine.chain[1].1.as_bytes())
+            .expect("block 1 stored")
+            .clone();
+        let mut reappearing = template.clone();
+        reappearing.header.parent = [0x71; 32];
+        reappearing.header.slot = 30_000;
+        reappearing.header.randao_mix = [0x72; 32];
+        let reappearing_id = *reappearing.block_id().as_bytes();
+
+        let mut initial = VecDeque::with_capacity(MAX_PARKED_REFUSED_FINALITY);
+        initial.push_back(reappearing_id);
+        for i in 1..MAX_PARKED_REFUSED_FINALITY {
+            let mut id = [0x73; 32];
+            id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            assert_ne!(id, reappearing_id);
+            initial.push_back(id);
+        }
+        assert_eq!(initial.iter().copied().collect::<BTreeSet<_>>().len(), initial.len());
+        engine.parked_refused_finality = initial.clone();
+
+        let mut newcomer = template;
+        newcomer.header.parent = [0x74; 32];
+        newcomer.header.slot = 30_001;
+        newcomer.header.randao_mix = [0x75; 32];
+        let newcomer_id = *newcomer.block_id().as_bytes();
+        assert!(!initial.contains(&newcomer_id));
+        let branch = [reappearing.clone(), newcomer, reappearing];
+
+        let mut oracle = initial;
+        for env in &branch {
+            let id = *env.block_id().as_bytes();
+            if oracle.contains(&id) { continue; }
+            while oracle.len() >= MAX_PARKED_REFUSED_FINALITY {
+                oracle.pop_front();
+            }
+            oracle.push_back(id);
+        }
+
+        engine.refuse_finality_rewind(
+            engine.finalized_latch.expect("fixture is latched"),
+            &branch,
+        );
+        assert_eq!(engine.parked_refused_finality, oracle);
+        assert_eq!(engine.parked_refused_finality.len(), MAX_PARKED_REFUSED_FINALITY);
+        assert_eq!(engine.parked_refused_finality.back(), Some(&reappearing_id));
+        assert_eq!(
+            engine.parked_refused_finality.iter().filter(|id| **id == reappearing_id).count(),
+            1,
+            "an ID skipped while present may be appended after an intermediate eviction",
+        );
     }
 
     /// A re-offer of an already-parked, already-refused block is dropped at
