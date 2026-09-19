@@ -71,6 +71,7 @@ build-and-test:
     - python3 -I scripts/check-live-node-retired-isolation.py --selftest
     - python3 -I scripts/check-live-node-retired-isolation.py
     - python3 -I scripts/pinned-rust-toolchain.py
+    - python3 -I scripts/rehearse-validator-admission.py
     - python3 -I scripts/check-validator-lifecycle-mutations.py
     - python3 -I scripts/rehearse-validator-activation.py --output "$CI_PROJECT_DIR/.ci-validator-activation"
     - cargo build --workspace --all-targets
@@ -350,6 +351,12 @@ CASES = [
              "python3 scripts/rehearse-validator-admission.py", 1),
          must_fail=True, expect="reviewed ordered command list"),
 
+    Case("github cannot remove the funded validator admission rehearsal",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - run: python3 -I scripts/rehearse-validator-admission.py\n", ""),
+         must_fail=True, expect="reviewed ordered command list"),
+
     Case("github cannot remove the shared validator lifecycle mutation check",
          GOOD_GITLAB,
          GOOD_GITHUB.replace(
@@ -538,6 +545,11 @@ CASES = [
     Case("gitlab build-and-test cannot remove toolchain pin validation",
          GOOD_GITLAB.replace(
              "    - python3 -I scripts/pinned-rust-toolchain.py\n", ""),
+         GOOD_GITHUB, must_fail=True, expect="exact ordered command contract"),
+
+    Case("gitlab cannot remove the funded validator admission rehearsal",
+         GOOD_GITLAB.replace(
+             "    - python3 -I scripts/rehearse-validator-admission.py\n", ""),
          GOOD_GITHUB, must_fail=True, expect="exact ordered command contract"),
 
     Case("gitlab cannot remove the shared validator lifecycle mutation check",

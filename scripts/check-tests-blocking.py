@@ -38,6 +38,8 @@ GitLab `.gitlab-ci.yml` job `build-and-test`, to the reviewed posture:
     the reviewed ordered run-step list and YAML block semantics.
   * the validator-lifecycle mutation check is blocking in both pipelines;
     removing it from either reviewed job fails the corresponding contract.
+  * the funded validator-admission rehearsal is blocking in both pipelines;
+    removing it from either reviewed job fails independently.
   * the finite validator-activation boundary/replay rehearsal is blocking in
     both pipelines; removing it from either reviewed job fails independently.
   * the `tests-blocking-guard` job has the reviewed runner/timeout and exact
@@ -155,6 +157,7 @@ GITLAB_BUILD_TEST_SCRIPT = (
     "python3 -I scripts/check-live-node-retired-isolation.py --selftest",
     "python3 -I scripts/check-live-node-retired-isolation.py",
     "python3 -I scripts/pinned-rust-toolchain.py",
+    "python3 -I scripts/rehearse-validator-admission.py",
     "python3 -I scripts/check-validator-lifecycle-mutations.py",
     'python3 -I scripts/rehearse-validator-activation.py --output "$CI_PROJECT_DIR/.ci-validator-activation"',
     "cargo build --workspace --all-targets",
@@ -169,6 +172,7 @@ GITLAB_BUILD_TEST_BODY = (
     "- python3 -I scripts/check-live-node-retired-isolation.py --selftest",
     "- python3 -I scripts/check-live-node-retired-isolation.py",
     "- python3 -I scripts/pinned-rust-toolchain.py",
+    "- python3 -I scripts/rehearse-validator-admission.py",
     "- python3 -I scripts/check-validator-lifecycle-mutations.py",
     '- python3 -I scripts/rehearse-validator-activation.py --output "$CI_PROJECT_DIR/.ci-validator-activation"',
     "- cargo build --workspace --all-targets",
@@ -189,7 +193,7 @@ CI_SCRIPT_ENTRYPOINT_SHA256 = {
     "scripts/check-live-node-retired-isolation.py":
         "45ece7368931469c2c64c161708009b41aebcbf3c1033fa75006e16d5e16518d",
     "scripts/check-tests-blocking.selftest.py":
-        "1534a6e18f481b07c00a69f6cbda1735bba4cf053215cb77f812948cef29db2d",
+        "90c129dfd8bd812d452ba2d178c35ec067fc8e8a7fcc1074341c886d99fc9ee3",
     "scripts/check-validator-lifecycle-mutations.py":
         "12b477e5043bc3ea98387be33ca586976494b30083522b214cea7d88c0e9f429",
     "scripts/devnet-particao-report.test.py":
