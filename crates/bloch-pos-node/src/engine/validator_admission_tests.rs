@@ -272,20 +272,30 @@ fn funded_validator_two_nodes_rehearsal() {
     };
     joiner.slashprot = SlashingProtection::open_bound(&joiner_dir.0, binding).unwrap();
     assert_eq!(joiner.duty_index(&joiner.state), None);
-    let mut invalid = tx.clone();
-    invalid.proof_of_possession[100] ^= 1;
-    assert!(founder
-        .on_transaction(PosTransaction::FundedDeposit(invalid))
-        .is_err());
-    let mut wrong_network = tx.clone();
-    wrong_network.network_domain[0] ^= 1;
-    authorize(&mut wrong_network, &funding, joiner.keys.as_ref().unwrap());
-    assert!(founder
-        .on_transaction(PosTransaction::FundedDeposit(wrong_network))
-        .is_err());
-    assert!(founder
-        .on_transaction(PosTransaction::FundedDeposit(tx.clone()))
-        .is_ok());
+    {
+        let _clock = super::validator_lifecycle::clock_at(1);
+        let mut invalid = tx.clone();
+        invalid.proof_of_possession[100] ^= 1;
+        assert!(founder
+            .on_transaction(PosTransaction::FundedDeposit(invalid))
+            .is_err());
+        let mut wrong_network = tx.clone();
+        wrong_network.network_domain[0] ^= 1;
+        authorize(&mut wrong_network, &funding, joiner.keys.as_ref().unwrap());
+        assert!(founder
+            .on_transaction(PosTransaction::FundedDeposit(wrong_network))
+            .is_err());
+        assert!(matches!(
+            founder.on_transaction(PosTransaction::FundedDeposit(tx.clone())),
+            Err(Refusal::LifecycleVerificationLimited { until_slot: 2 })
+        ));
+    }
+    {
+        let _clock = super::validator_lifecycle::clock_at(2);
+        assert!(founder
+            .on_transaction(PosTransaction::FundedDeposit(tx.clone()))
+            .is_ok());
+    }
     let mut saw_joiner_propose = false;
     let mut saw_joiner_attest = false;
     let mut history = Vec::new();
@@ -293,7 +303,7 @@ fn funded_validator_two_nodes_rehearsal() {
     // Selection is stake-weighted and uses fresh keys. Wait for an actual
     // joining proposer instead of assuming one appears in a fixed 154-slot
     // window. The bound remains below one full RANDAO chain.
-    for slot in 1..=4096u64 {
+    for slot in 2..=4096u64 {
         let _clock = super::validator_lifecycle::clock_at(slot);
         founder.wall_slot = slot;
         joiner.wall_slot = slot;
@@ -359,19 +369,29 @@ fn funded_validator_two_nodes_rehearsal() {
     assert!(by_key.contains("\"state\":\"active\""));
     // Exit is authorized by both PQ algorithms and is valid only for the
     // current inclusion epoch. Funding authority cannot sign a validator exit.
-    let _clock = super::validator_lifecycle::clock_at(exit_slot);
     let exit_epoch = epoch_of(exit_slot);
     let root = staking::ExitTx { pubkey_hash: hash, epoch: exit_epoch, signature: Vec::new() }.signing_root();
     let exit = PosTransaction::ExitV2 { pubkey_hash: hash, epoch: exit_epoch,
         signature: joiner.keys.as_ref().unwrap().sign(&root) };
-    for offset in [14, 4 + 3309 + 10] {
-        let mut forged = exit.clone();
-        if let PosTransaction::ExitV2 { signature, .. } = &mut forged { signature[offset] ^= 1; }
-        assert!(founder.on_transaction(forged).is_err());
+    {
+        let _clock = super::validator_lifecycle::clock_at(exit_slot);
+        for offset in [14, 4 + 3309 + 10] {
+            let mut forged = exit.clone();
+            if let PosTransaction::ExitV2 { signature, .. } = &mut forged { signature[offset] ^= 1; }
+            assert!(founder.on_transaction(forged).is_err());
+        }
+        assert!(matches!(
+            founder.on_transaction(exit.clone()),
+            Err(Refusal::LifecycleVerificationLimited { until_slot }) if until_slot == exit_slot + 1
+        ));
     }
-    founder.on_transaction(exit.clone()).unwrap();
-    joiner.on_transaction(exit).unwrap();
-    drive_pair(&mut founder, &mut joiner, exit_slot, &mut history);
+    let exit_admission_slot = exit_slot + 1;
+    {
+        let _clock = super::validator_lifecycle::clock_at(exit_admission_slot);
+        founder.on_transaction(exit.clone()).unwrap();
+        joiner.on_transaction(exit).unwrap();
+    }
+    drive_pair(&mut founder, &mut joiner, exit_admission_slot, &mut history);
     let rec = founder.state.validator_record(1).unwrap();
     assert_eq!(rec.exit_epoch, exit_epoch + staking::EXIT_DELAY_EPOCHS);
     let maturity = rec.withdrawable_epoch;
@@ -382,9 +402,12 @@ fn funded_validator_two_nodes_rehearsal() {
     let mut conflicting = history.iter().rev().find(|env| env.header.proposer_index == 1).unwrap().clone();
     conflicting.header.state_root[0] ^= 1;
     conflicting.proposer_sig = joiner.keys.as_ref().unwrap().sign(&conflicting.header.proposal_signing_root());
-    let _ = founder.ingest_judged(conflicting);
-    assert!(founder.mempool.values().any(|tx| matches!(tx, PosTransaction::SlashingEvidence(_))));
-    drive_pair(&mut founder, &mut joiner, exit_slot + 1, &mut history);
+    {
+        let _clock = super::validator_lifecycle::clock_at(exit_admission_slot + 1);
+        let _ = founder.ingest_judged(conflicting);
+        assert!(founder.mempool.values().any(|tx| matches!(tx, PosTransaction::SlashingEvidence(_))));
+    }
+    drive_pair(&mut founder, &mut joiner, exit_admission_slot + 1, &mut history);
     let rec = founder.state.validator_record(1).unwrap();
     assert!(rec.slashed);
     assert!(rec.staked_sat < stake_before_slash);
@@ -409,7 +432,15 @@ fn funded_validator_two_nodes_rehearsal() {
     assert!(u128::from(paid.value) >= bonded_residue);
     assert_eq!(paid.script_hash, tx.withdrawal_credentials);
     assert_eq!(founder.state.validator_record(1).unwrap().staked_sat, 0);
-    assert!(founder.on_transaction(withdrawal.clone()).is_err());
+    assert_eq!(
+        founder.on_transaction(withdrawal.clone()),
+        Ok(Admitted::Duplicate),
+        "included withdrawal is classified as an already-committed duplicate"
+    );
+    assert!(
+        !founder.mempool.has_txid(&withdrawal.txid()),
+        "included withdrawal is not reinserted into the pending pool"
+    );
     let spend_slot = maturity * SLOTS_PER_EPOCH + 2;
     let _payout_clock = super::validator_lifecycle::clock_at(spend_slot);
     let spend = payout_from_cli(&_founder_dir.0, &funding, &paid, founder.state.next_base_fee(), epoch_of(spend_slot));
@@ -424,7 +455,12 @@ fn funded_validator_two_nodes_rehearsal() {
             }
         }
         let refusal = founder.on_transaction(altered).unwrap_err();
-        assert!(format!("{refusal:?}").contains("signature that does not verify"), "{refusal:?}");
+        let expected = if case == 1 {
+            "transfer value is not conserved at the current base fee"
+        } else {
+            "signature that does not verify"
+        };
+        assert!(format!("{refusal:?}").contains(expected), "{refusal:?}");
     }
     let _clock = super::validator_lifecycle::clock_at(maturity * SLOTS_PER_EPOCH + 2);
     founder.on_transaction(spend.clone()).unwrap();
@@ -510,7 +546,15 @@ fn funded_activation_boundary_rehearsal() {
     assert!(history.last().unwrap().body.transactions.contains(&tx.canonical_bytes()));
     assert!(founder.state.is_funded_validator(1));
     assert_eq!(founder.state.validator_record(1).unwrap().activation_epoch, u64::MAX);
-    assert!(founder.on_transaction(tx).is_err(), "included funding cannot be replayed");
+    assert_eq!(
+        founder.on_transaction(tx.clone()),
+        Ok(Admitted::Duplicate),
+        "included funding is classified as an already-committed duplicate"
+    );
+    assert!(
+        !founder.mempool.has_txid(&tx.txid()),
+        "included funding is not reinserted into the pending pool"
+    );
     let (mut replay, _replay_dir) = perf_support::proposing_engine();
     replay.manifest = Manifest::decode(&founder.manifest.encode()).unwrap();
     replay.state = StateCell::new(replay.manifest.genesis_state());
