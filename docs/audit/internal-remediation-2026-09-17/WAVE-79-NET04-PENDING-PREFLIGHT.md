@@ -38,12 +38,25 @@ duplicated checks and preserving the prior limit priority.
 
 ## Adversarial coverage
 
-The new regression fills one attributed source/root share with authenticated
+The source/root regression fills one attributed share with authenticated
 attestations, then supplies a novel overflow frame to a verifier that panics if
 called. The frame returns `PendingSourceRootLimit` without invoking crypto and
 without changing the pool. The control half presents a bad signature whose
 roots are known and proves it is still verified and rejected despite the same
 source's saturated pending share.
+
+The existing exact-bound regressions now use the same panic sentinel on every
+other overflow path: duty, root, root-set, aggregate attributed source,
+aggregate unattributed ingress and unattributed root. Together the seven
+capacity reasons prove that no saturated pending-only branch reaches hybrid
+verification, while their capacity-reopening controls continue to authenticate
+and hold once an entry leaves.
+
+The ordering comment now distinguishes the state actually protected by
+`&mut AttestationPool` from the chain view. Pending counters cannot change
+during one call; the production engine separately lends an immutable chain
+view, and the public `BlockLookup` contract must provide snapshot-stable
+answers for the duration of `process`.
 
 Focused validation:
 

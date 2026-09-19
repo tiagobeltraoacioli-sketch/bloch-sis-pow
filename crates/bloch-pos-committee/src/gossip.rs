@@ -490,9 +490,12 @@ impl AttestationPool {
         //
         //    Known-root attestations deliberately bypass this preflight and
         //    still authenticate below: pending pressure cannot become a way
-        //    to sneak an invalid message into the accepted path. No state can
-        //    change between preflight and `hold` because this method owns
-        //    `&mut self` for the whole operation.
+        //    to sneak an invalid message into the accepted path. Pending
+        //    counters cannot change between preflight and `hold` because this
+        //    method owns `&mut self`. The production caller also lends one
+        //    immutable engine chain view for the whole call; other BlockLookup
+        //    implementations must likewise return snapshot-stable answers
+        //    while `process` is running.
         let missing_root = [att.data.head, att.data.target_root]
             .into_iter()
             .find(|root| !blocks.is_known(root));
@@ -1161,14 +1164,16 @@ mod tests {
         let blocks = BTreeSet::new(); // nothing known: every distinct variant would hold
         let heads = [0xAAu8, 0xBB, 0xCC, 0xDD, 0xEE];
         let mut parked = 0usize;
-        for &h in &heads {
+        for &h in heads.iter().take(MAX_EQUIVOCATIONS_PER_DUTY) {
             let a = att(1, CURRENT_SLOT, h);
             let d = pool.process(a, CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier, &AnyKey);
-            if matches!(d, GossipDecision::Hold { .. }) {
-                parked += 1;
-            } else {
-                assert!(matches!(d, GossipDecision::Ignore(IgnoreReason::PendingDutyLimit)), "unexpected: {d:?}");
-            }
+            assert!(matches!(d, GossipDecision::Hold { .. }), "unexpected: {d:?}");
+            parked += 1;
+        }
+        for &h in heads.iter().skip(MAX_EQUIVOCATIONS_PER_DUTY) {
+            let d = pool.process(att(1, CURRENT_SLOT, h), CURRENT_SLOT,
+                &committees(), &known(&blocks), &PanicVerifier, &AnyKey);
+            assert!(matches!(d, GossipDecision::Ignore(IgnoreReason::PendingDutyLimit)), "unexpected: {d:?}");
         }
         assert_eq!(parked, MAX_EQUIVOCATIONS_PER_DUTY);
         assert_eq!(pool.pending_len(), MAX_EQUIVOCATIONS_PER_DUTY);
@@ -1209,7 +1214,7 @@ mod tests {
                 CURRENT_SLOT,
                 &committees(),
                 &known(&blocks),
-                &RootEchoVerifier,
+                &PanicVerifier,
                 &AnyKey,
                 Some([0xEE; 32]),
             ),
@@ -1279,7 +1284,7 @@ mod tests {
                 CURRENT_SLOT,
                 &committees(),
                 &known(&blocks),
-                &RootEchoVerifier,
+                &PanicVerifier,
                 &AnyKey,
             ),
             GossipDecision::Ignore(IgnoreReason::PendingRootSetLimit),
@@ -1331,7 +1336,7 @@ mod tests {
                 CURRENT_SLOT,
                 &committees(),
                 &known(&blocks),
-                &RootEchoVerifier,
+                &PanicVerifier,
                 &AnyKey,
                 Some(source_a),
             ),
@@ -1403,7 +1408,7 @@ mod tests {
                 CURRENT_SLOT,
                 &committees(),
                 &known(&blocks),
-                &RootEchoVerifier,
+                &PanicVerifier,
                 &AnyKey,
             ),
             GossipDecision::Ignore(IgnoreReason::PendingUnattributedLimit),
@@ -1449,7 +1454,7 @@ mod tests {
                 CURRENT_SLOT,
                 &committees(),
                 &known(&blocks),
-                &RootEchoVerifier,
+                &PanicVerifier,
                 &AnyKey,
             ),
             GossipDecision::Ignore(IgnoreReason::PendingUnattributedRootLimit),
