@@ -121,6 +121,7 @@ const FIXED_BUILD_ENV: &[&str] = &[
     "CRATE_CC_NO_DEFAULTS",
     "CXXSTDLIB",
     "DEBUG",
+    "DEP_WASM32_UNKNOWN_UNKNOWN_OPENBSD_LIBC_INCLUDE",
     "HOST_AR",
     "HOST_ARFLAGS",
     "HOST_CC",
@@ -153,6 +154,7 @@ const FIXED_BUILD_ENV: &[&str] = &[
     "TARGET_CXXSTDLIB",
     "TARGET_RANLIB",
     "TARGET_RANLIBFLAGS",
+    "WASI_SDK_DIR",
 ];
 
 /// Hash the executable bytes selected for a build tool without publishing its
