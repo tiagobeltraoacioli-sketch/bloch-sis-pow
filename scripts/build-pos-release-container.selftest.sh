@@ -39,8 +39,8 @@ cat > "$stage/BUILD-INFO" <<EOF
 artifact_kind=${FAKE_ARTIFACT_KIND:-canonical-container-candidate}
 source_commit=$commit
 source_date_epoch=$epoch
-debian_snapshot=20260917T000000Z
-target=x86_64-unknown-linux-gnu
+debian_snapshot=${FAKE_DEBIAN_SNAPSHOT:-20260917T000000Z}
+target=${FAKE_TARGET:-x86_64-unknown-linux-gnu}
 binary_sha256=${FAKE_METADATA_BINARY_SHA:-$binary_sha}
 signed=${FAKE_SIGNED:-false}
 deployment_authorized=${FAKE_DEPLOYMENT_AUTHORIZED:-false}
@@ -57,6 +57,25 @@ fi
 if [ "${FAKE_DUPLICATE_DEPLOYMENT_AUTHORIZED:-0}" = 1 ]; then
   printf 'deployment_authorized=true\n' >> "$stage/BUILD-INFO"
 fi
+case "${FAKE_BUILD_INFO_MODE:-canonical}" in
+  canonical) ;;
+  duplicate-source-commit)
+    printf 'source_commit=ffffffffffffffffffffffffffffffffffffffff\n' \
+      >> "$stage/BUILD-INFO" ;;
+  duplicate-source-date)
+    printf 'source_date_epoch=1\n' >> "$stage/BUILD-INFO" ;;
+  extra-field)
+    printf 'unexpected=engine-controlled\n' >> "$stage/BUILD-INFO" ;;
+  reordered)
+    awk 'NR == 1 { first = $0; next }
+         NR == 2 { print; print first; next }
+         { print }' "$stage/BUILD-INFO" > "$stage/BUILD-INFO.new"
+    mv "$stage/BUILD-INFO.new" "$stage/BUILD-INFO" ;;
+  missing-newline)
+    build_info_without_newline="$(cat "$stage/BUILD-INFO")"
+    printf '%s' "$build_info_without_newline" > "$stage/BUILD-INFO" ;;
+  *) exit 65 ;;
+esac
 if command -v sha256sum >/dev/null 2>&1; then
   build_info_sha="$(sha256sum "$stage/BUILD-INFO" | awk '{print $1}')"
 else
@@ -87,6 +106,30 @@ run_wrapper() {
     FAKE_DUPLICATE_ARTIFACT_KIND="$artifact_duplicate" \
     CONTAINER_ENGINE="$fake_engine" \
     bash scripts/build-pos-release-container.sh "$output"
+}
+
+run_build_info_wrapper() {
+  local output="$1" layout="${2:-canonical}"
+  local snapshot="${3:-20260917T000000Z}"
+  local target="${4:-x86_64-unknown-linux-gnu}"
+  FAKE_BUILD_INFO_MODE="$layout" FAKE_DEBIAN_SNAPSHOT="$snapshot" \
+    FAKE_TARGET="$target" CONTAINER_ENGINE="$fake_engine" \
+    bash scripts/build-pos-release-container.sh "$output"
+}
+
+expect_build_info_failure() {
+  local label="$1" layout="$2" snapshot="$3" target="$4" expected="$5"
+  local output="$work/build-info-$label" log="$work/build-info-$label.log"
+  if run_build_info_wrapper "$output" "$layout" "$snapshot" "$target" \
+      > "$log" 2>&1; then
+    echo "selftest: noncanonical BUILD-INFO $label was accepted" >&2
+    exit 1
+  fi
+  grep -Fq "$expected" "$log" || {
+    echo "selftest: BUILD-INFO $label failed without expected diagnostic" >&2
+    cat "$log" >&2
+    exit 1
+  }
 }
 
 run_wrapper canonical "$work/canonical" > "$work/canonical.log" 2>&1
@@ -200,6 +243,30 @@ grep -Fq "$artifact_error" "$work/artifact-kind-duplicate.log" || {
   cat "$work/artifact-kind-duplicate.log" >&2
   exit 1
 }
+
+expect_build_info_failure duplicate-source-commit duplicate-source-commit \
+  20260917T000000Z x86_64-unknown-linux-gnu 'BUILD-INFO does not bind HEAD'
+expect_build_info_failure duplicate-source-date duplicate-source-date \
+  20260917T000000Z x86_64-unknown-linux-gnu \
+  'BUILD-INFO does not bind the commit timestamp'
+expect_build_info_failure alternate-snapshot canonical \
+  20260918T000000Z x86_64-unknown-linux-gnu \
+  'debian_snapshot does not match the canonical Dockerfile snapshot'
+expect_build_info_failure malformed-target canonical \
+  20260917T000000Z 'NOT A TARGET' \
+  'target must be a lowercase ASCII Rust host triple'
+canonical_build_info_error='BUILD-INFO is not in the exact canonical field order and encoding'
+expect_build_info_failure reordered reordered 20260917T000000Z \
+  x86_64-unknown-linux-gnu "$canonical_build_info_error"
+expect_build_info_failure extra-field extra-field 20260917T000000Z \
+  x86_64-unknown-linux-gnu "$canonical_build_info_error"
+expect_build_info_failure missing-newline missing-newline 20260917T000000Z \
+  x86_64-unknown-linux-gnu "$canonical_build_info_error"
+
+run_build_info_wrapper "$work/alternate-valid-target" canonical \
+  20260917T000000Z aarch64-unknown-linux-gnu \
+  > "$work/alternate-valid-target.log" 2>&1
+grep -Fq 'build-pos-release-container: PASS' "$work/alternate-valid-target.log"
 
 # HEAD may move after the wrapper captures its commit. The timestamp and
 # archive must still come from that immutable OID, never from the late ref.

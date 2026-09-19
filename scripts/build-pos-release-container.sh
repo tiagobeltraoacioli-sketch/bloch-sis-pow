@@ -7,8 +7,16 @@ cd "$(dirname "$0")/.."
 repo_root="$(pwd)"
 out_dir="${1:?usage: build-pos-release-container.sh <new-output-directory>}"
 engine="${CONTAINER_ENGINE:-docker}"
+canonical_debian_snapshot=20260917T000000Z
 
 fail() { echo "build-pos-release-container: FAIL — $*" >&2; exit 1; }
+field() {
+  local key="$1" file="$2"
+  awk -F= -v key="$key" '
+    $1 == key { count++; value = substr($0, length(key) + 2) }
+    END { if (count != 1 || value == "") exit 1; print value }
+  ' "$file"
+}
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print $1}'
@@ -62,30 +70,52 @@ binary_sha="$(sha256_file "$stage/bloch-pos")"
 cmp -s <(printf '%s  bloch-pos\n' "$binary_sha") "$stage/SHA256SUMS" \
   || fail "exported SHA256SUMS is not the exact canonical one-line manifest"
 check_sha256 "$stage" || fail "exported checksum does not verify"
-grep -Fx "source_commit=$commit" "$stage/BUILD-INFO" >/dev/null \
-  || fail "BUILD-INFO does not bind HEAD"
-grep -Fx "source_date_epoch=$source_date_epoch" "$stage/BUILD-INFO" >/dev/null \
-  || fail "BUILD-INFO does not bind the commit timestamp"
-awk -F= '
-  $1 == "artifact_kind" { count++; value = substr($0, length($1) + 2) }
-  END { exit !(count == 1 && value == "canonical-container-candidate") }
-' "$stage/BUILD-INFO" \
+build_info="$stage/BUILD-INFO"
+artifact_kind="$(field artifact_kind "$build_info")" \
   || fail "BUILD-INFO does not declare a canonical-container candidate"
-awk -F= -v expected="$binary_sha" '
-  $1 == "binary_sha256" { count++; value = substr($0, length($1) + 2) }
-  END { exit !(count == 1 && value == expected) }
-' "$stage/BUILD-INFO" \
+[ "$artifact_kind" = canonical-container-candidate ] \
+  || fail "BUILD-INFO does not declare a canonical-container candidate"
+metadata_commit="$(field source_commit "$build_info")" \
+  || fail "BUILD-INFO does not bind HEAD"
+[ "$metadata_commit" = "$commit" ] || fail "BUILD-INFO does not bind HEAD"
+metadata_epoch="$(field source_date_epoch "$build_info")" \
+  || fail "BUILD-INFO does not bind the commit timestamp"
+[ "$metadata_epoch" = "$source_date_epoch" ] \
+  || fail "BUILD-INFO does not bind the commit timestamp"
+debian_snapshot="$(field debian_snapshot "$build_info")" \
+  || fail "BUILD-INFO debian_snapshot does not match the canonical Dockerfile snapshot"
+[ "$debian_snapshot" = "$canonical_debian_snapshot" ] \
+  || fail "BUILD-INFO debian_snapshot does not match the canonical Dockerfile snapshot"
+target="$(field target "$build_info")" \
+  || fail "BUILD-INFO target must be a lowercase ASCII Rust host triple"
+case "$target" in
+  ''|*[!abcdefghijklmnopqrstuvwxyz0123456789_-]*|-*|*-|*--*)
+    fail "BUILD-INFO target must be a lowercase ASCII Rust host triple" ;;
+  *-*-*) : ;;
+  *) fail "BUILD-INFO target must be a lowercase ASCII Rust host triple" ;;
+esac
+metadata_sha="$(field binary_sha256 "$build_info")" \
   || fail "BUILD-INFO binary_sha256 does not match the exported binary"
-awk -F= '
-  $1 == "signed" { count++; value = substr($0, length($1) + 2) }
-  END { exit !(count == 1 && value == "false") }
-' "$stage/BUILD-INFO" \
+[ "$metadata_sha" = "$binary_sha" ] \
+  || fail "BUILD-INFO binary_sha256 does not match the exported binary"
+signed="$(field signed "$build_info")" \
   || fail "BUILD-INFO does not explicitly declare its unsigned state"
-awk -F= '
-  $1 == "deployment_authorized" { count++; value = substr($0, length($1) + 2) }
-  END { exit !(count == 1 && value == "false") }
-' "$stage/BUILD-INFO" \
+[ "$signed" = false ] \
+  || fail "BUILD-INFO does not explicitly declare its unsigned state"
+deployment_authorized="$(field deployment_authorized "$build_info")" \
   || fail "BUILD-INFO does not explicitly refuse deployment authorization"
+[ "$deployment_authorized" = false ] \
+  || fail "BUILD-INFO does not explicitly refuse deployment authorization"
+cmp -s <(printf '%s\n' \
+    'artifact_kind=canonical-container-candidate' \
+    "source_commit=$metadata_commit" \
+    "source_date_epoch=$metadata_epoch" \
+    "debian_snapshot=$debian_snapshot" \
+    "target=$target" \
+    "binary_sha256=$metadata_sha" \
+    'signed=false' \
+    'deployment_authorized=false') "$build_info" \
+  || fail "BUILD-INFO is not in the exact canonical field order and encoding"
 
 mkdir -p "$(dirname "$out_dir")"
 mv "$stage" "$out_dir"
