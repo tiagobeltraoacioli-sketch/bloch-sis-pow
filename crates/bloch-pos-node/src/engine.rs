@@ -2706,10 +2706,11 @@ impl Engine {
             env.body.transactions.len(),
             self.mempool.len()
         );
-        // Captured before `env` moves into ingest: if the transition refuses
-        // this block, these are the bytes to drop from the mempool.
-        let produced_txs: Vec<Vec<u8>> = env.body.transactions.clone();
-        let env_tx_count = produced_txs.len();
+        // Keep only the count on the successful path. `txs` is the exact
+        // decoded selection from which `env.body.transactions` was encoded;
+        // if the real transition refuses our probe-approved block, re-encode
+        // that selection only in the exceptional cleanup below.
+        let env_tx_count = txs.len();
         self.ingest_from(env, Source::Local);
         // h28080: a producer whose own node did not adopt its block is a
         // producer/validator split inside one process. It must be LOUD — but it
@@ -2733,8 +2734,8 @@ impl Engine {
                 crate::codec::hex8(id.as_bytes()),
                 env_tx_count,
             );
-            for encoded in &produced_txs {
-                self.mempool.remove(encoded);
+            for tx in &txs {
+                self.mempool.remove(&tx.canonical_bytes());
             }
             return;
         }
@@ -10053,6 +10054,160 @@ mod perf_support {
             doppelganger_halted: false,
         };
         (engine, TestDir(dir))
+    }
+}
+
+/// The proposer keeps the decoded selection alive through local ingestion so
+/// the normal, adopted-block path does not need a second owned copy of every
+/// canonical transaction body. These tests pin both sides: the ordinary body
+/// is unchanged, and the h28080 fail-safe still removes exactly what the
+/// refused proposal carried.
+#[cfg(test)]
+mod proposal_body_ownership {
+    use super::*;
+    use bloch_pos_committee::state_root::EutxoEntry;
+    use bloch_pos_committee::transition::{TransferInput, TransferOutput};
+
+    const INPUT_VALUE: u64 = 10_000_000_000;
+
+    fn funded_transfer(seed: u8) -> (EutxoEntry, PosTransaction) {
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[seed; 32])
+            .expect("hybrid keypair from fixed seed");
+        let script_hash: [u8; 32] = Sha3_256::digest(&pk).into();
+        let entry = EutxoEntry {
+            txid: [seed.wrapping_add(1); 32],
+            vout: 0,
+            value: INPUT_VALUE,
+            script_hash,
+        };
+        let mut tx = PosTransaction::Transfer {
+            inputs: vec![TransferInput {
+                txid: entry.txid,
+                vout: entry.vout,
+                pubkey: pk,
+                signature: Vec::new(),
+            }],
+            outputs: vec![TransferOutput {
+                value: 1,
+                script_hash: [seed.wrapping_add(2); 32],
+            }],
+            tx_bytes: 0,
+            tip_millisat_per_gas: 0,
+        };
+
+        // Falcon's compressed signature has a small variable encoded length.
+        // Sign once to size the canonical transaction, reserve ample declared
+        // slack (the over-declaration gate is intentionally inactive today),
+        // then set the fee/value and sign the final witness-free root.
+        let sizing_sig = bloch_crypto::crypto::sign(&sk, &tx.spend_signing_root())
+            .expect("sizing signature");
+        let PosTransaction::Transfer { inputs, .. } = &mut tx else {
+            unreachable!()
+        };
+        inputs[0].signature = sizing_sig;
+        let declared = tx.canonical_bytes().len() as u64 + 1_024;
+        let charge = fee_market::charge(
+            fee_market::TxClass::Eutxo { inputs: 1 },
+            declared,
+            fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+            0,
+        );
+        let PosTransaction::Transfer {
+            outputs,
+            tx_bytes,
+            ..
+        } = &mut tx
+        else {
+            unreachable!()
+        };
+        *tx_bytes = declared;
+        outputs[0].value = INPUT_VALUE - charge.base_fee_sat as u64;
+        let signature = bloch_crypto::crypto::sign(&sk, &tx.spend_signing_root())
+            .expect("final transfer signature");
+        let PosTransaction::Transfer { inputs, .. } = &mut tx else {
+            unreachable!()
+        };
+        inputs[0].signature = signature;
+        assert!(tx.canonical_bytes().len() as u64 <= declared);
+        (entry, tx)
+    }
+
+    #[test]
+    fn adopted_proposal_keeps_the_exact_canonical_body_without_a_cleanup_copy() {
+        let (entry, tx) = funded_transfer(0x61);
+        let encoded = tx.canonical_bytes();
+        let (mut engine, _dir) = perf_support::proposing_engine_funded(&[entry]);
+        assert_eq!(
+            engine.state.next_base_fee_at(0),
+            fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+            "fixture fee must match the transaction"
+        );
+        engine.mempool.insert(encoded.clone(), tx);
+
+        engine.propose(1);
+
+        assert_eq!(engine.state.slot(), 1, "the proposal must be adopted");
+        let head = *engine.head_id().as_bytes();
+        assert_eq!(
+            engine.blocks.get(&head).expect("stored adopted block").body.transactions,
+            vec![encoded.clone()],
+            "the stored/broadcast body must retain the original canonical bytes"
+        );
+        assert!(!engine.mempool.contains_key(&encoded));
+    }
+
+    #[test]
+    fn refused_own_block_reencodes_only_its_selection_for_exact_cleanup() {
+        let (entry, mut bad) = funded_transfer(0x71);
+        let PosTransaction::Transfer { inputs, .. } = &mut bad else {
+            unreachable!()
+        };
+        inputs[0].signature[0] ^= 0x80;
+        let refused_key = bad.canonical_bytes();
+        let skipped = PosTransaction::Exit { validator: 123 };
+        let skipped_key = skipped.canonical_bytes();
+        let (mut engine, _dir) = perf_support::proposing_engine_funded(&[entry]);
+        engine.mempool.insert(refused_key.clone(), bad);
+        engine.mempool.insert(skipped_key.clone(), skipped);
+        let genesis = *engine.head_id().as_bytes();
+
+        engine.propose(1);
+
+        assert_eq!(*engine.head_id().as_bytes(), genesis, "bad signature must refuse the block");
+        assert!(
+            !engine.mempool.contains_key(&refused_key),
+            "the exact canonical transaction carried by the refused block must be dropped"
+        );
+        assert!(
+            engine.mempool.contains_key(&skipped_key),
+            "an entry excluded from the proposal must not be collateral cleanup"
+        );
+    }
+
+    #[test]
+    fn proposal_cleanup_has_no_eager_body_clone() {
+        let source = include_str!("engine.rs");
+        let start = source.find("    fn propose(&mut self, slot: u64)").expect("propose");
+        let end = source[start..]
+            .find("    // ── Block ingestion")
+            .map(|offset| start + offset)
+            .expect("end of propose");
+        let propose = &source[start..end];
+        assert!(!propose.contains("env.body.transactions.clone()"));
+        assert!(!propose.contains("produced_txs"));
+        assert!(propose.contains("let env_tx_count = txs.len();"));
+
+        let ingest = propose.find("self.ingest_from(env, Source::Local);").expect("local ingest");
+        let refused = propose.find("if self.head_id() != id").expect("refusal guard");
+        let cleanup = propose[refused..]
+            .find("self.mempool.remove(&tx.canonical_bytes());")
+            .map(|offset| refused + offset)
+            .expect("lazy canonical cleanup");
+        assert!(ingest < refused && refused < cleanup);
+        assert!(
+            !propose[ingest..refused].contains("canonical_bytes()"),
+            "cleanup encoding must not run before the refusal is known"
+        );
     }
 }
 
