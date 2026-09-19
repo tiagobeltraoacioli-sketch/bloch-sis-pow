@@ -442,6 +442,13 @@ pub struct Store {
     rewrite_completed: bool,
 }
 
+#[derive(Clone, Copy)]
+struct PageBytes {
+    max: usize,
+    per_frame: usize,
+    first_must_fit: bool,
+}
+
 impl Drop for Store {
     fn drop(&mut self) {
         // Keep the data-dir lock alive until a background publisher has
@@ -1323,6 +1330,37 @@ impl Store {
     /// Reads the log file fresh so a reader thread never touches the append
     /// handle.
     pub fn blocks_after(dir: &Path, after_slot: u64, limit: usize) -> io::Result<Vec<Vec<u8>>> {
+        Self::blocks_after_inner(dir, after_slot, limit, PageBytes {
+            max: crate::codec::MAX_FIELD_LEN,
+            per_frame: 0,
+            first_must_fit: false,
+        })
+    }
+
+    /// Read a directed libp2p page with its smaller, framing-aware budget.
+    /// Unlike the generic page, its old post-filter also refused an oversized
+    /// first frame; checking it here preserves that empty-page result without
+    /// reading the body. Private so the public store/devnet page stays unchanged.
+    pub(crate) fn blocks_after_p2p(
+        dir: &Path,
+        after_slot: u64,
+        limit: usize,
+        max_bytes: usize,
+        per_frame_bytes: usize,
+    ) -> io::Result<Vec<Vec<u8>>> {
+        Self::blocks_after_inner(dir, after_slot, limit, PageBytes {
+            max: max_bytes,
+            per_frame: per_frame_bytes,
+            first_must_fit: true,
+        })
+    }
+
+    fn blocks_after_inner(
+        dir: &Path,
+        after_slot: u64,
+        limit: usize,
+        page_bytes: PageBytes,
+    ) -> io::Result<Vec<Vec<u8>>> {
         let generation = log_generation(dir)?;
         let _generation = generation.read()
             .map_err(|_| io::Error::other("log generation guard poisoned; restart required"))?;
@@ -1343,6 +1381,7 @@ impl Store {
                         after_slot,
                         limit,
                         MAX_UNINDEXED_TAIL_SCAN_FRAMES,
+                        page_bytes,
                     )?
                 {
                     return Ok(page);
@@ -1378,6 +1417,7 @@ impl Store {
         after_slot: u64,
         limit: usize,
         max_unindexed_frames: usize,
+        page_limit: PageBytes,
     ) -> io::Result<Option<Vec<Vec<u8>>>> {
         let mut f = io::BufReader::new(File::open(log_path)?);
         if from > 0 {
@@ -1469,8 +1509,9 @@ impl Store {
             // guard, not merely assumed.
             let rest = len.saturating_sub(hdr_len);
             if header.slot > after_slot {
-                if !out.is_empty() && page_bytes.saturating_add(len) > crate::codec::MAX_FIELD_LEN { break; }
-                page_bytes = page_bytes.saturating_add(len);
+                let next_page_bytes = page_bytes.saturating_add(len).saturating_add(page_limit.per_frame);
+                if (page_limit.first_must_fit || !out.is_empty()) && next_page_bytes > page_limit.max { break; }
+                page_bytes = next_page_bytes;
                 // Wanted: read the body and hand back the whole frame, byte
                 // for byte identical to what the old path pushed.
                 let mut payload = Vec::with_capacity(len);
@@ -2013,6 +2054,7 @@ mod tests {
             3,
             100,
             MAX_UNINDEXED_TAIL_SCAN_FRAMES,
+            PageBytes { max: crate::codec::MAX_FIELD_LEN, per_frame: 0, first_must_fit: false },
         )
         .expect("bounded scan")
         .expect("no index mismatch in an unindexed scan");
@@ -2034,6 +2076,84 @@ mod tests {
             "skipped bodies must remain seek-only while served bodies are read exactly once",
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn p2p_byte_preflight_matches_postfilter_and_skips_the_boundary_body() {
+        let dir = std::env::temp_dir().join(format!("bloch-p2p-page-boundary-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x4A; 32]).expect("open");
+        let first = sample_envelope(1);
+        let mut second = sample_envelope(2);
+        second.proposer_sig.extend_from_slice(&[0x5B; 257]);
+        let first_bytes = crate::codec::encode_envelope(&first);
+        let second_bytes = crate::codec::encode_envelope(&second);
+        store.append(&first).expect("append first");
+        store.append(&second).expect("append second");
+
+        let overhead = 4usize;
+        let exact_cap = first_bytes.len().saturating_add(overhead);
+        let generic = Store::blocks_after(&dir, 0, 10).expect("generic page");
+        assert_eq!(generic, vec![first_bytes.clone(), second_bytes]);
+        let mut charged = 0usize;
+        let oracle: Vec<_> = generic.into_iter().take_while(|frame| {
+            let next = charged.saturating_add(frame.len()).saturating_add(overhead);
+            if next > exact_cap { false } else { charged = next; true }
+        }).collect();
+
+        let headers_before = sync_frames_scanned();
+        let bodies_before = sync_body_bytes_read();
+        let bounded = Store::blocks_after_p2p(&dir, 0, 10, exact_cap, overhead).expect("bounded page");
+        assert_eq!(bounded, oracle, "preflight must return the old post-filter prefix");
+        assert_eq!(bounded, vec![first_bytes.clone()], "equality is admitted; the next frame is not");
+        assert_eq!(sync_frames_scanned() - headers_before, 2, "only the rejected frame's header is needed");
+        let header_len = bloch_pos_committee::header::BlockHeaderV4::ENCODED_LEN;
+        assert_eq!(
+            sync_body_bytes_read() - bodies_before,
+            first_bytes.len().saturating_sub(header_len) as u64,
+            "the body rejected at the boundary must not be read",
+        );
+
+        let bodies_before = sync_body_bytes_read();
+        let plus_one = Store::blocks_after_p2p(&dir, 0, 10, exact_cap.saturating_sub(1), overhead)
+            .expect("one byte over");
+        assert!(plus_one.is_empty(), "a first frame one byte over is refused");
+        assert_eq!(sync_body_bytes_read() - bodies_before, 0, "a refused first body stays unread");
+
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn p2p_real_cap_first_oversized_is_empty_but_generic_wrapper_still_serves_it() {
+        let dir = std::env::temp_dir().join(format!("bloch-p2p-first-oversized-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[0x4B; 32]).expect("open");
+        let max = (crate::p2p::MAX_SYNC_FRAME as usize).saturating_sub(1024);
+        let target_len = max.saturating_sub(4).saturating_add(1);
+        let mut oversized = sample_envelope(1);
+        let base = crate::codec::encode_envelope(&oversized).len();
+        oversized.proposer_sig.resize(
+            oversized.proposer_sig.len().saturating_add(target_len.saturating_sub(base)),
+            0x6C,
+        );
+        let encoded = crate::codec::encode_envelope(&oversized);
+        assert_eq!(encoded.len().saturating_add(4), max.saturating_add(1));
+        assert!(encoded.len() <= crate::codec::MAX_FIELD_LEN);
+        store.append(&oversized).expect("append historical frame");
+
+        assert_eq!(
+            Store::blocks_after(&dir, 0, 1).expect("generic page"),
+            vec![encoded],
+            "the public store/devnet first-frame behavior is unchanged",
+        );
+        let bodies_before = sync_body_bytes_read();
+        let bounded = Store::blocks_after_p2p(&dir, 0, 1, max, 4).expect("p2p page");
+        assert!(bounded.is_empty(), "the old p2p post-filter returned an empty page here");
+        assert_eq!(sync_body_bytes_read() - bodies_before, 0, "the oversized first body stays unread");
+
+        drop(store);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2324,6 +2444,7 @@ mod tests {
             u64::MAX,
             100,
             2,
+            PageBytes { max: crate::codec::MAX_FIELD_LEN, per_frame: 0, first_must_fit: false },
         )
         .expect_err("the third unindexed frame must exceed the injected bound");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);

@@ -1991,29 +1991,14 @@ fn read_sync_page(
     limit: usize,
 ) -> Vec<Vec<u8>> {
     let _ = permit; // held for the whole read; see `SyncPermit`
-    match crate::store::Store::blocks_after(dir, after_slot, limit) {
-        Ok(all) => {
-            let mut out = Vec::new();
-            let mut bytes = 0usize;
-            for b in all.into_iter() {
-                // Byte cap as well as block cap: one answer must never become
-                // a history dump. Leave slack for the framing.
-                // `bytes` only ever accumulates `b.len() + 4` for blocks that
-                // passed this same check, so it stays far below
-                // `MAX_SYNC_FRAME` (8 MiB); saturating keeps a pathological
-                // single block (larger than `usize::MAX`, impossible in
-                // practice) failing this check safely instead of wrapping
-                // small and passing it.
-                if bytes.saturating_add(b.len()).saturating_add(4)
-                    > (MAX_SYNC_FRAME as usize).saturating_sub(1024)
-                {
-                    break;
-                }
-                bytes = bytes.saturating_add(b.len()).saturating_add(4);
-                out.push(b);
-            }
-            out
-        }
+    match crate::store::Store::blocks_after_p2p(
+        dir,
+        after_slot,
+        limit,
+        (MAX_SYNC_FRAME as usize).saturating_sub(1024),
+        4,
+    ) {
+        Ok(page) => page,
         Err(e) => {
             eprintln!("p2p: serving get-blocks failed: {e}");
             Vec::new()
