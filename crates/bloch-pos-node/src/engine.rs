@@ -637,6 +637,14 @@ const MAX_FUTURE_SLOTS: u64 = 2 * bloch_pos_committee::params::SLOTS_PER_EPOCH;
 /// crossed this one-at-a-time path.
 const FUTURE_BLOCKS_PER_TURN: usize = 1;
 
+/// Retention ceilings for authenticated near-future gossip. The global count
+/// and byte bounds cap the pool; the source share prevents one normalized
+/// transport identity (including the unattributed `None` bucket) from owning
+/// every slot until the clock catches up.
+const FUTURE_BLOCKS_MAX: usize = 32;
+const FUTURE_BLOCK_BYTES_MAX: usize = 16 * 1024 * 1024;
+const FUTURE_BLOCKS_PER_SOURCE: usize = 8;
+
 /// How many recently-applied canonical post-states are retained so a reorg
 /// can start from the fork point instead of from genesis.
 ///
@@ -2950,7 +2958,13 @@ impl Engine {
             let held: usize = self.future_blocks.values()
                 .map(|(block, _)| crate::codec::encode_envelope(block).len())
                 .sum();
-            if self.future_blocks.len() < 32 && held.saturating_add(bytes) <= 16 * 1024 * 1024 {
+            let held_by_source = self.future_blocks.values()
+                .filter(|(_, held_source)| *held_source == src)
+                .count();
+            if self.future_blocks.len() < FUTURE_BLOCKS_MAX
+                && held.saturating_add(bytes) <= FUTURE_BLOCK_BYTES_MAX
+                && held_by_source < FUTURE_BLOCKS_PER_SOURCE
+            {
                 self.future_blocks.insert(id, (env, src));
             }
             return (Verdict::Ignore, None);
@@ -11836,6 +11850,75 @@ mod ingest_admission_tests {
         assert!(engine.future_blocks.is_empty());
         assert_eq!(engine.orphans.len(), 2, "neither ready block was stranded");
         assert!(!validator_duties_blocked(false, false, pending));
+    }
+
+    #[test]
+    fn one_source_cannot_occupy_the_future_pool_and_capacity_reopens() {
+        let _clock = validator_lifecycle::clock_at(0);
+        let (mut engine, _dir, template, stored) = fixture();
+        let source_a = [0x31; 32];
+        let source_b = [0x32; 32];
+
+        for offset in 0..FUTURE_BLOCKS_PER_SOURCE {
+            let block = repointed(
+                &engine,
+                &template,
+                [0xC0u8.saturating_add(offset as u8); 32],
+                (offset as u64).saturating_add(1),
+            );
+            assert_eq!(
+                engine.ingest_judged_from_source(block, Some(source_a)),
+                Verdict::Ignore,
+            );
+        }
+        assert_eq!(engine.future_blocks.len(), FUTURE_BLOCKS_PER_SOURCE);
+
+        let excess_a = repointed(&engine, &template, [0xD0; 32], 2);
+        let excess_a_id = *excess_a.block_id().as_bytes();
+        assert_eq!(
+            engine.ingest_judged_from_source(excess_a, Some(source_a)),
+            Verdict::Ignore,
+            "source-local retention pressure is never peer guilt",
+        );
+        assert_eq!(engine.future_blocks.len(), FUTURE_BLOCKS_PER_SOURCE);
+        assert!(!engine.future_blocks.contains_key(&excess_a_id));
+
+        let independent = repointed(&engine, &template, [0xE0; 32], 3);
+        assert_eq!(
+            engine.ingest_judged_from_source(independent, Some(source_b)),
+            Verdict::Ignore,
+        );
+        assert_eq!(engine.future_blocks.len(), FUTURE_BLOCKS_PER_SOURCE + 1);
+        assert_eq!(engine.blocks.len(), stored);
+
+        let _release_clock = validator_lifecycle::clock_at(1);
+        assert!(!engine.release_future_blocks(1, FUTURE_BLOCKS_PER_TURN));
+        assert_eq!(
+            engine.future_blocks.values()
+                .filter(|(_, source)| *source == Source::Gossip(Some(source_a)))
+                .count(),
+            FUTURE_BLOCKS_PER_SOURCE - 1,
+        );
+
+        let reopened = repointed(&engine, &template, [0xF0; 32], 4);
+        assert_eq!(
+            engine.ingest_judged_from_source(reopened, Some(source_a)),
+            Verdict::Ignore,
+        );
+        assert_eq!(
+            engine.future_blocks.values()
+                .filter(|(_, source)| *source == Source::Gossip(Some(source_a)))
+                .count(),
+            FUTURE_BLOCKS_PER_SOURCE,
+            "release must reopen capacity without a stale quota cache",
+        );
+        assert_eq!(
+            engine.future_blocks.values()
+                .filter(|(_, source)| *source == Source::Gossip(Some(source_b)))
+                .count(),
+            1,
+            "an independent source keeps its reserved share",
+        );
     }
 
     #[test]
