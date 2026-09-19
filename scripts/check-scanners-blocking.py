@@ -504,9 +504,33 @@ def normalized_yaml_lines(lines: list[str]) -> tuple[str, ...]:
         if re.sub(r"\s+#.*$", "", line.strip()))
 
 
+def protected_global_key_problems(
+    text: str, key: str, label: str, *, required: bool
+) -> list[str]:
+    """Reject quoted/duplicate global execution-context keys."""
+    protected = [
+        match.group("quote")
+        for line in text.splitlines()
+        if (match := re.match(
+            r"^(?P<quote>['\"]?)%s(?P=quote)\s*:" % re.escape(key), line))
+    ]
+    valid_count = len(protected) == 1 if required else len(protected) <= 1
+    if not valid_count or any(protected):
+        cardinality = "exactly once" if required else "at most once"
+        return [
+            f"{label}: protected top-level `{key}:` key must occur {cardinality} "
+            "in the supported plain-key form"
+        ]
+    return []
+
+
 def check_gitlab_global_context(text: str, blocks: dict[str, list[str]]) -> list[str]:
     """Restrict inherited GitLab execution context to the reviewed subset."""
     problems = []
+    problems += protected_global_key_problems(
+        text, "default", ".gitlab-ci.yml", required=True)
+    problems += protected_global_key_problems(
+        text, "variables", ".gitlab-ci.yml", required=True)
     occurrences = [
         match.group(1)
         for line in text.splitlines()
@@ -589,6 +613,10 @@ def check_file(
                     "%s: top-level `%s:` moves pipeline semantics outside the "
                     "locally inspectable blocking subset" % (label, key))
     if label == ".github/workflows/security.yml":
+        problems += protected_global_key_problems(
+            text, "defaults", label, required=True)
+        problems += protected_global_key_problems(
+            text, "env", label, required=False)
         top_level = job_blocks(text, 0)
         default_count = sum(
             bool(re.match(r"^defaults:\s*(?:#.*)?$", line))

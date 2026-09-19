@@ -273,6 +273,23 @@ CASES = [
              '  RUST_BACKTRACE: "1"\n  BASH_ENV: scripts/mask-scanners.sh'),
          must_fail=True, expect="top-level `env:` differs"),
 
+    Case("GitHub quoted duplicate defaults cannot replace reviewed shell",
+         GOOD_GITLAB,
+         GOOD_GITHUB +
+         "\n\"defaults\":\n"
+         "  run:\n"
+         "    shell: bash {0} || true\n",
+         must_fail=True,
+         expect="protected top-level `defaults:` key must occur exactly once"),
+
+    Case("GitHub quoted duplicate env cannot inject scanner startup variables",
+         GOOD_GITLAB,
+         GOOD_GITHUB_WITH_ENV +
+         "\n'env':\n"
+         "  BASH_ENV: scripts/mask-scanners.sh\n",
+         must_fail=True,
+         expect="protected top-level `env:` key must occur at most once"),
+
     Case("GitHub scanner step PATH cannot replace cargo",
          GOOD_GITLAB,
          GOOD_GITHUB.replace(
@@ -449,6 +466,14 @@ CASES = [
     Case("GitLab reviewed default cannot be removed",
          GOOD_GITLAB.replace(SAFE_GITLAB_GLOBALS, ""),
          GOOD_GITHUB, must_fail=True, expect="`default:` must occur exactly once"),
+
+    Case("GitLab quoted duplicate default cannot replace reviewed environment",
+         GOOD_GITLAB +
+         "\n\"default\":\n"
+         "  before_script:\n"
+         "    - export PATH=attacker/bin\n",
+         GOOD_GITHUB, must_fail=True,
+         expect="protected top-level `default:` key must occur exactly once"),
 
     Case("GitLab top-level hooks are outside the supported context",
          "hooks:\n  pre_get_sources_script:\n    - export PATH=fake:$PATH\n\n" + GOOD_GITLAB,

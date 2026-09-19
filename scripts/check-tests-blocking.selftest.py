@@ -614,6 +614,23 @@ CASES = [
              "name: tests\ndefaults:\n  run:\n    shell: bash {0} || true\n"),
          must_fail=True, expect="top-level `defaults:`"),
 
+    Case("github quoted duplicate defaults cannot replace reviewed shell",
+         GOOD_GITLAB,
+         GOOD_GITHUB +
+         "\n\"defaults\":\n"
+         "  run:\n"
+         "    shell: bash {0} || true\n",
+         must_fail=True,
+         expect="protected top-level `defaults:` key must occur exactly once"),
+
+    Case("github quoted duplicate env cannot inject startup variables",
+         GOOD_GITLAB,
+         GOOD_GITHUB_WITH_ENV +
+         "\n'env':\n"
+         "  BASH_ENV: scripts/mask-tests.sh\n",
+         must_fail=True,
+         expect="protected top-level `env:` key must occur at most once"),
+
     Case("gitlab build-and-test deleted",
          sub(GOOD_GITLAB, "build-and-test:", "build-and-test-disabled:"),
          GOOD_GITHUB, must_fail=True, expect="`build-and-test` is MISSING"),

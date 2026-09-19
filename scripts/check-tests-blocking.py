@@ -210,7 +210,7 @@ CI_SCRIPT_ENTRYPOINT_SHA256 = {
     "scripts/check-iso-hardening.sh":
         "f0dae2e22aa766301def84a0c671ca4f79ff0c1b87d6e8647e9f6671669b91b3",
     "scripts/check-tests-blocking.selftest.py":
-        "d986a494daa23e12b933c7a33f85ceeddbae35c05abf8943b4cf0f58369c6511",
+        "bd82e89c6c7b38d87f0fab98dab998dd6f89028c39ca54d27cae6051ade87747",
     "scripts/check-validator-lifecycle-mutations.py":
         "12b477e5043bc3ea98387be33ca586976494b30083522b214cea7d88c0e9f429",
     "scripts/devnet-particao-report.test.py":
@@ -348,6 +348,26 @@ def protected_job_key_problems(
         return [
             f"{label}: protected `{job}:` job key must occur exactly once in "
             "the supported plain-key form"
+        ]
+    return []
+
+
+def protected_global_key_problems(
+    text: str, key: str, label: str, *, required: bool
+) -> list[str]:
+    """Reject quoted/duplicate global execution-context keys."""
+    protected = [
+        match.group("quote")
+        for line in text.splitlines()
+        if (match := re.match(
+            r"^(?P<quote>['\"]?)%s(?P=quote)\s*:" % re.escape(key), line))
+    ]
+    valid_count = len(protected) == 1 if required else len(protected) <= 1
+    if not valid_count or any(protected):
+        cardinality = "exactly once" if required else "at most once"
+        return [
+            f"{label}: protected top-level `{key}:` key must occur {cardinality} "
+            "in the supported plain-key form"
         ]
     return []
 
@@ -770,6 +790,10 @@ def check_job(path: str, job: str, indent: int, label: str) -> list[str]:
         problems += check_gitlab_build_contract(body)
 
     if label == ".github/workflows/tests.yml":
+        problems += protected_global_key_problems(
+            text, "defaults", label, required=True)
+        problems += protected_global_key_problems(
+            text, "env", label, required=False)
         top_level = job_blocks(text, 0)
         default_count = sum(
             bool(re.match(r"^defaults:\s*(?:#.*)?$", line))
