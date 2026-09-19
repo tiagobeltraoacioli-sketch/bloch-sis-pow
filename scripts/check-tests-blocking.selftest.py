@@ -16,7 +16,8 @@ directions:
   * the honest exact GitLab/GitHub contracts stay green, including a comment
     that merely mentions `allow_failure` next to a gated job.
   * missing, replaced, or symlinked local script entrypoints fail their byte
-    integrity contract while the checked-in entrypoints stay green.
+    integrity contract, including a transitively executed helper, while the
+    checked-in entrypoints stay green.
 
 Run: python3 scripts/check-tests-blocking.selftest.py
 Exit 0 = the guard behaves as documented on all cases.
@@ -581,6 +582,24 @@ def main() -> int:
         if code == 0 or "`scripts/check-attested-ssh.py` digest differs" not in out:
             failures.append("replaced entrypoint: expected digest failure:\n%s" % out)
 
+        transitive_root = os.path.join(tmp, "replaced-transitive-entrypoints")
+        transitive = os.path.join(transitive_root, "scripts", "devnet-particao.sh")
+        os.makedirs(os.path.dirname(transitive))
+        with open(transitive, "w", encoding="utf-8") as fh:
+            fh.write("#!/usr/bin/env bash\nexit 0\n")
+        code, out = run_with_entrypoint_root(tmp, transitive_root)
+        if code == 0 or "`scripts/devnet-particao.sh` digest differs" not in out:
+            failures.append("replaced transitive entrypoint: expected digest failure:\n%s" % out)
+
+        reference_root = os.path.join(tmp, "missing-transitive-reference")
+        parent = os.path.join(reference_root, "scripts", "check-validator-lifecycle-mutations.py")
+        os.makedirs(os.path.dirname(parent))
+        with open(parent, "w", encoding="utf-8") as fh:
+            fh.write("#!/usr/bin/env python3\n# helper invocation removed\n")
+        code, out = run_with_entrypoint_root(tmp, reference_root)
+        if code == 0 or "lost reviewed reference" not in out:
+            failures.append("missing transitive reference: expected scope failure:\n%s" % out)
+
         symlink_root = os.path.join(tmp, "symlink-entrypoints")
         symlink = os.path.join(symlink_root, "scripts", "check-attested-ssh.py")
         os.makedirs(os.path.dirname(symlink))
@@ -596,7 +615,7 @@ def main() -> int:
         return 1
 
     print("check-tests-blocking selftest: OK — %d cases behave as documented"
-          % (len(CASES) + 3))
+          % (len(CASES) + 5))
     return 0
 
 

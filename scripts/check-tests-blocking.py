@@ -38,6 +38,9 @@ GitLab `.gitlab-ci.yml` job `build-and-test`, to the reviewed posture:
   * the `tests-blocking-guard` job has the reviewed runner/timeout and exact
     ordered checkout, selftest and guard/rehearsal command sequence. This
     prevents the guard's own CI entrypoint from becoming a decorative literal.
+  * local script entrypoints named directly by those commands, plus the
+    reviewed transitively loaded executables, are regular non-symlink files
+    whose SHA-256 content and parent/load relationships match the contract.
 
 The live-crate list is duplicated in `.github/workflows/tests.yml` on
 purpose: the workflow states what it gates, this file makes dropping a crate
@@ -148,6 +151,8 @@ GITLAB_BUILD_TEST_BODY = (
     "timeout: 120m",
 )
 CI_SCRIPT_ENTRYPOINT_SHA256 = {
+    "deploy/bootnodes/verify-bootnodes.sh":
+        "c43231df3353c06762e508b7abaf5e9dd30aaf6fe35795c2250a79629cf397ec",
     "deploy/bootnodes/verify-bootnodes.selftest.sh":
         "95bb6c90d395f9a706f8349eede35330afd4b62e5979497fcaecc5410f0b3612",
     "scripts/check-attested-ssh.py":
@@ -157,11 +162,15 @@ CI_SCRIPT_ENTRYPOINT_SHA256 = {
     "scripts/check-live-node-retired-isolation.py":
         "45ece7368931469c2c64c161708009b41aebcbf3c1033fa75006e16d5e16518d",
     "scripts/check-tests-blocking.selftest.py":
-        "c0c598066436f115147714b279dd9f286dee96ffaa69b14e4d0179479c60026b",
+        "85f0b1bb8f207b8cd7e7227bdc3a7b84ec572f4f0d56f7b37482d04e2529f68a",
     "scripts/check-validator-lifecycle-mutations.py":
         "a1b061037c6166bacbf4995d7710f1138023d92cdde4af2a8781528fa2b050e5",
     "scripts/devnet-particao-report.test.py":
         "468cab1a77759e7e63d4b18204b57ce9c9b2d6b68f6412a385d23fecea7c840e",
+    "scripts/devnet-particao.sh":
+        "89f4d64b6e00339e1b23fcf6c3f4115b5734ce1f04680d95141c2e6efb0bd9bf",
+    "scripts/pinned-rust-toolchain.py":
+        "8e0bf93355825f811b619da27a0667d7349105ca8e7a9bf5d5e31ee60bf5d205",
     "scripts/rehearse-validator-activation.py":
         "e2e527bb71046fb20b88003403b8cca633581839974a7ddb7f8e314e36d33762",
     "scripts/rehearse-validator-activation.test.py":
@@ -170,6 +179,18 @@ CI_SCRIPT_ENTRYPOINT_SHA256 = {
         "2992e7e32d51406665b57f74debb74cba2c073c1f11f6e8db3c56faf6faf6b65",
     "scripts/rehearse-validator-joining-network.py":
         "fb3b69d21805a6361d0737d64c50a225cf7a9d0389e954b8f0c0b049d99449e4",
+}
+CI_TRANSITIVE_ENTRYPOINT_REFERENCES = {
+    "deploy/bootnodes/verify-bootnodes.sh": (
+        ("deploy/bootnodes/verify-bootnodes.selftest.sh", "verify-bootnodes.sh"),
+    ),
+    "scripts/devnet-particao.sh": (
+        ("scripts/rehearse-validator-activation.py", "scripts/devnet-particao.sh"),
+        ("scripts/devnet-particao-report.test.py", "devnet-particao.sh"),
+    ),
+    "scripts/pinned-rust-toolchain.py": (
+        ("scripts/check-validator-lifecycle-mutations.py", "scripts/pinned-rust-toolchain.py"),
+    ),
 }
 
 ESCAPES = (
@@ -540,7 +561,8 @@ def check_ci_script_entrypoints(root: str) -> list[str]:
     # self-referential hash. Its behavior is instead proved by the selftest,
     # whose bytes are pinned here; the exact CI job runs selftest before guard.
     invoked.discard("scripts/check-tests-blocking.py")
-    declared = set(CI_SCRIPT_ENTRYPOINT_SHA256)
+    transitive = set(CI_TRANSITIVE_ENTRYPOINT_REFERENCES)
+    declared = set(CI_SCRIPT_ENTRYPOINT_SHA256) - transitive
     problems = []
     if invoked != declared:
         missing = sorted(invoked - declared)
@@ -548,6 +570,9 @@ def check_ci_script_entrypoints(root: str) -> list[str]:
         problems.append(
             "CI script digest scope differs from exact job contracts "
             f"(missing={missing}, stale={stale})")
+
+    if transitive - set(CI_SCRIPT_ENTRYPOINT_SHA256):
+        problems.append("transitive CI entrypoint references lack reviewed digests")
 
     for relative, expected in sorted(CI_SCRIPT_ENTRYPOINT_SHA256.items()):
         path = os.path.join(root, relative)
@@ -568,6 +593,15 @@ def check_ci_script_entrypoints(root: str) -> list[str]:
         if actual != expected:
             problems.append(
                 f"CI script entrypoint `{relative}` digest differs from reviewed content")
+    for dependency, references in sorted(CI_TRANSITIVE_ENTRYPOINT_REFERENCES.items()):
+        for parent, literal in references:
+            parent_path = os.path.join(root, parent)
+            if os.path.isfile(parent_path) and not os.path.islink(parent_path):
+                with open(parent_path, "r", encoding="utf-8") as fh:
+                    source = fh.read()
+                if literal not in source:
+                    problems.append(
+                        f"CI transitive entrypoint `{dependency}` lost reviewed reference in `{parent}`")
     return problems
 
 
