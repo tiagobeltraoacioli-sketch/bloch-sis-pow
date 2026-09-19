@@ -32,7 +32,7 @@ cargo check -p bloch-pos-node --bin bloch-pos --offline
 # passed
 
 cargo test -p bloch-pos-node --bin bloch-pos --offline
-# 598 passed; 0 failed; 19 ignored; 59.24s
+# 598 passed; 0 failed; 19 ignored; 59.70s
 
 bash -n scripts/build-pos-release-container.sh
 bash -n scripts/build-pos-release-container.selftest.sh

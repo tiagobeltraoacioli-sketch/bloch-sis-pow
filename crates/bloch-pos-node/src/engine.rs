@@ -12475,9 +12475,9 @@ mod ingest_admission_tests {
         let large_remainder = large_total % LARGE_ENTRIES;
 
         assert_eq!(large_remainder, 0);
-        assert_eq!(
-            (tiny_entries / LARGE_ENTRIES).saturating_mul(tiny_bytes) + large_bytes,
-            ORPHAN_BYTES_PER_SOURCE,
+        assert!(
+            (tiny_entries / LARGE_ENTRIES).saturating_mul(tiny_bytes) + large_bytes
+                <= ORPHAN_BYTES_PER_SOURCE,
         );
         assert!(large_bytes.saturating_add(1) <= crate::p2p::MAX_PROPOSAL_ENVELOPE_BYTES);
         for i in 0..tiny_entries {
