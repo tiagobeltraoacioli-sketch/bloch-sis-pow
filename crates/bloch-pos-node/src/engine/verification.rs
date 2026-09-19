@@ -306,4 +306,35 @@ mod tests {
         assert!(!honest_admitted.limited(), "another source retains aggregate headroom");
         assert_eq!(verifier.verifier.calls.get(), 3);
     }
+
+    #[test]
+    fn cached_failure_does_not_reconsume_source_or_aggregate_allowance() {
+        let verifier = fixture();
+        let noisy = [0x11; 32];
+        let honest = [0x22; 32];
+        let bad_root = [0x33; 32];
+        let bad_signature = [0x44; 32];
+
+        let first = verifier.budgeted_for_source(91, 2, Some(noisy), 1);
+        assert!(!first.verify_with_key(b"registered key", &bad_root, &bad_signature));
+        assert!(!first.limited());
+        drop(first);
+
+        // The same exact failure is answered before either quota is checked,
+        // even though this source has spent its one real verification.
+        let cached = verifier.budgeted_for_source(91, 2, Some(noisy), 1);
+        assert!(!cached.verify_with_key(b"registered key", &bad_root, &bad_signature));
+        assert!(!cached.limited());
+        drop(cached);
+
+        let honest_root = [0x55; 32];
+        let honest_call = verifier.budgeted_for_source(91, 2, Some(honest), 1);
+        assert!(!honest_call.verify_with_key(
+            b"registered key",
+            &honest_root,
+            &bad_signature,
+        ));
+        assert!(!honest_call.limited());
+        assert_eq!(verifier.verifier.calls.get(), 2);
+    }
 }

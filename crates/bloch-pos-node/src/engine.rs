@@ -569,7 +569,7 @@ const FUTURE_SLOT_TOLERANCE: u64 = 8;
 enum Source {
     /// Arrived over the network, or was promoted out of the orphan pool
     /// after arriving over the network.
-    Gossip,
+    Gossip(Option<[u8; 32]>),
     /// Built by this node's own `propose`.
     Local,
 }
@@ -588,8 +588,17 @@ impl Source {
     /// clock rule it was never meant to answer to.
     fn bounded_by_wall_clock(self) -> bool {
         match self {
-            Source::Gossip => true,
+            Source::Gossip(_) => true,
             Source::Local => false,
+        }
+    }
+
+    /// Stable, node-local transport identity used only for admission
+    /// fairness. Missing attribution still receives the aggregate cap.
+    fn verification_source(self) -> Option<[u8; 32]> {
+        match self {
+            Source::Gossip(source) => source,
+            Source::Local => None,
         }
     }
 }
@@ -1168,7 +1177,7 @@ struct Engine {
     /// transfer with no inputs or no outputs, and verifies every spend
     /// signature.
     mempool: admission::Mempool,
-    future_blocks: BTreeMap<[u8; 32], BlockEnvelope>,
+    future_blocks: BTreeMap<[u8; 32], (BlockEnvelope, Source)>,
     /// Head slot at which each live mempool key was admitted, for
     /// [`MEMPOOL_TTL_SLOTS`].
     ///
@@ -1369,7 +1378,7 @@ struct Engine {
     /// Parking sets `needs_sync`, so the gap the orphan is evidence of is
     /// asked for over the wire. That is what makes eviction cheap: the worst
     /// case is a round trip, never a missed branch.
-    orphans: VecDeque<([u8; 32], BlockEnvelope)>,
+    orphans: VecDeque<([u8; 32], BlockEnvelope, Source)>,
     /// Orphans dropped at the cap, and orphans later connected. Counted so
     /// "the bound is holding" is a measurement rather than an inference — a
     /// pool with evictions and zero admissions is a node that is not syncing.
@@ -2346,7 +2355,17 @@ impl Engine {
     /// score, not a ban. The much tighter [`FUTURE_SLOT_TOLERANCE`] is NOT
     /// charged to anyone, which is why it maps to `Ignore`.
     fn ingest_judged(&mut self, env: BlockEnvelope) -> Verdict {
-        self.ingest_from_judged(env, Source::Gossip)
+        self.ingest_judged_from_source(env, None)
+    }
+
+    /// Judge one transported block while retaining the transport attribution
+    /// through any deferred admission path.
+    fn ingest_judged_from_source(
+        &mut self,
+        env: BlockEnvelope,
+        verification_source: Option<[u8; 32]>,
+    ) -> Verdict {
+        self.ingest_from_judged(env, Source::Gossip(verification_source))
     }
 
     /// Repair a missing branch ancestor, not just a missing newer block.
@@ -2356,7 +2375,8 @@ impl Engine {
     /// backwards until they connect, without rewinding consensus state.
     fn sync_after_slot(&self) -> u64 {
         if !self.needs_sync && self.orphans.is_empty() { return self.state.slot(); }
-        let missing_before = self.orphans.iter().map(|(_, env)| env.header.slot.saturating_sub(1))
+        let missing_before = self.orphans.iter()
+            .map(|(_, env, _)| env.header.slot.saturating_sub(1))
             .min().unwrap_or(self.state.slot()).min(self.state.slot());
         let finalized = self.state.finality().finalized.root;
         let floor = self.chain.iter().rev().find(|(_, id)| *id.as_bytes() == finalized)
@@ -2426,8 +2446,8 @@ impl Engine {
     /// the depth of. Here the depth is one frame no matter how long the
     /// parked chain is.
     fn ingest_from_judged(&mut self, env: BlockEnvelope, src: Source) -> Verdict {
-        let mut queue: VecDeque<BlockEnvelope> = VecDeque::new();
-        queue.push_back(env);
+        let mut queue: VecDeque<(BlockEnvelope, Source)> = VecDeque::new();
+        queue.push_back((env, src));
         // The verdict belongs to the envelope the CALLER handed in — the
         // first one out of the queue — and to no other. Blocks promoted out
         // of the orphan pool below arrived on their own gossip message and
@@ -2437,8 +2457,8 @@ impl Engine {
         let mut verdict: Option<Verdict> = None;
         // Bounded: every iteration either drops the envelope or takes one
         // entry out of `orphans`, and `orphans` is capped.
-        while let Some(next) = queue.pop_front() {
-            let (v, landing) = self.ingest_one(next, src);
+        while let Some((next, next_source)) = queue.pop_front() {
+            let (v, landing) = self.ingest_one(next, next_source);
             verdict.get_or_insert(v);
             let Some((landed, grew_registry)) = landing else {
                 continue;
@@ -2458,11 +2478,11 @@ impl Engine {
                 if grew_registry || self.orphans[i].1.header.parent == landed {
                     // `i < len` (loop guard), so `remove` is `Some`; the
                     // `else` is unreachable and ends the sweep.
-                    let Some((_, env)) = self.orphans.remove(i) else {
+                    let Some((_, env, orphan_source)) = self.orphans.remove(i) else {
                         break;
                     };
                     self.orphans_admitted = self.orphans_admitted.saturating_add(1);
-                    queue.push_back(env);
+                    queue.push_back((env, orphan_source));
                 } else {
                     // cannot overflow: i < self.orphans.len().
                     #[allow(clippy::arithmetic_side_effects)]
@@ -2509,8 +2529,9 @@ impl Engine {
         let same_envelope = |seen: &[u8; 32], held: &BlockEnvelope| {
             *seen == id && held.proposer_sig == env.proposer_sig
         };
-        if self.orphans.iter().any(|(seen, held)| same_envelope(seen, held))
-            || self.future_blocks.get(&id).is_some_and(|held| held.proposer_sig == env.proposer_sig)
+        if self.orphans.iter().any(|(seen, held, _)| same_envelope(seen, held))
+            || self.future_blocks.get(&id)
+                .is_some_and(|(held, _)| held.proposer_sig == env.proposer_sig)
         {
             return (Verdict::Ignore, None);
         }
@@ -2656,9 +2677,11 @@ impl Engine {
         // it tried to apply — never touches the rest.
         let authenticated = match KeyLookup::pubkey(&*self.state, env.header.proposer_index) {
             Some(pk) if src.bounded_by_wall_clock() => {
-                let verifier = self.gossip_verifier.budgeted(
+                let verifier = self.gossip_verifier.budgeted_for_source(
                     self.wall_slot(),
                     GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
+                    src.verification_source(),
+                    GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
                 );
                 let verified = verifier.verify_with_key(
                     pk,
@@ -2680,7 +2703,7 @@ impl Engine {
             ),
             None => {
                 // Unknown identity: hold it, ask for the gap, decide nothing.
-                self.park_orphan(id, env);
+                self.park_orphan(id, env, src);
                 return (Verdict::Ignore, None);
             }
         };
@@ -2689,7 +2712,7 @@ impl Engine {
                 // O04: a deposit-added identity whose key this branch may not
                 // hold. Not a verdict on the block, and not a charge on the
                 // peer — hold it and let the transition judge it in context.
-                self.park_orphan(id, env);
+                self.park_orphan(id, env, src);
                 return (Verdict::Ignore, None);
             }
             self.rejected_unsigned = self.rejected_unsigned.saturating_add(1);
@@ -2733,9 +2756,11 @@ impl Engine {
         // their signed slot. Bound both count and payload memory (EN-05).
         if src.bounded_by_wall_clock() && self.live && env.header.slot > self.wall_slot() {
             let bytes = crate::codec::encode_envelope(&env).len();
-            let held: usize = self.future_blocks.values().map(|b| crate::codec::encode_envelope(b).len()).sum();
+            let held: usize = self.future_blocks.values()
+                .map(|(block, _)| crate::codec::encode_envelope(block).len())
+                .sum();
             if self.future_blocks.len() < 32 && held.saturating_add(bytes) <= 16 * 1024 * 1024 {
-                self.future_blocks.insert(id, env);
+                self.future_blocks.insert(id, (env, src));
             }
             return (Verdict::Ignore, None);
         }
@@ -2745,7 +2770,7 @@ impl Engine {
         if !self.canonical.contains(&env.header.parent)
             && !self.blocks.contains_key(&env.header.parent)
         {
-            self.park_orphan(id, env);
+            self.park_orphan(id, env, src);
             return (Verdict::Ignore, None);
         }
         // Read before `env` moves: whether this block could have registered a
@@ -2778,8 +2803,8 @@ impl Engine {
     ///
     /// Deduplicated by id, so a mesh that hands the same orphan back on every
     /// heartbeat occupies one slot rather than the whole pool.
-    fn park_orphan(&mut self, id: [u8; 32], env: BlockEnvelope) {
-        if self.orphans.iter().any(|(seen, _)| *seen == id) {
+    fn park_orphan(&mut self, id: [u8; 32], env: BlockEnvelope, src: Source) {
+        if self.orphans.iter().any(|(seen, _, _)| *seen == id) {
             return;
         }
         // FIFO: at the cap the OLDEST goes, since its parent has had the
@@ -2789,7 +2814,7 @@ impl Engine {
                 self.orphans_evicted = self.orphans_evicted.saturating_add(1);
             }
         }
-        self.orphans.push_back((id, env));
+        self.orphans.push_back((id, env, src));
         // The gap is real and the sync loop is the thing that closes it.
         self.needs_sync = true;
     }
@@ -2822,7 +2847,7 @@ impl Engine {
             .filter(|(id, env)| env.header.slot < floor && !self.canonical.contains(*id))
             .map(|(id, _)| *id).collect();
         pending.extend(self.orphans.iter()
-            .filter(|(_, env)| env.header.slot < floor).map(|(id, _)| *id));
+            .filter(|(_, env, _)| env.header.slot < floor).map(|(id, _, _)| *id));
         if pending.is_empty() { return; }
 
         // A descendant cannot reconnect once its already-finalized-away
@@ -2834,7 +2859,7 @@ impl Engine {
                 children.entry(env.header.parent).or_default().push(*id);
             }
         }
-        for (id, env) in &self.orphans {
+        for (id, env, _) in &self.orphans {
             children.entry(env.header.parent).or_default().push(*id);
         }
         let mut doomed = BTreeSet::new();
@@ -2850,7 +2875,7 @@ impl Engine {
             }
         }
         let before = self.orphans.len();
-        self.orphans.retain(|(id, _)| !doomed.contains(id));
+        self.orphans.retain(|(id, _, _)| !doomed.contains(id));
         self.orphans_evicted = self.orphans_evicted
             .saturating_add(before.saturating_sub(self.orphans.len()) as u64);
     }
@@ -3026,10 +3051,12 @@ impl Engine {
     /// Release authenticated future blocks only once their slot arrives.
     fn release_future_blocks(&mut self, slot: u64) {
         let ready: Vec<_> = self.future_blocks.iter()
-            .filter(|(_, b)| b.header.slot <= slot).map(|(id, _)| *id).collect();
+            .filter(|(_, (block, _))| block.header.slot <= slot)
+            .map(|(id, _)| *id)
+            .collect();
         for id in ready {
-            if let Some(block) = self.future_blocks.remove(&id) {
-                self.ingest_from_judged(block, Source::Gossip);
+            if let Some((block, source)) = self.future_blocks.remove(&id) {
+                self.ingest_from_judged(block, source);
             }
         }
     }
@@ -3922,8 +3949,8 @@ impl Engine {
             .map(|env| *env.block_id().as_bytes()).collect();
         loop {
             let Some(index) = self.orphans.iter()
-                .position(|(_, env)| refused.contains(&env.header.parent)) else { break };
-            let Some((id, _)) = self.orphans.remove(index) else { break };
+                .position(|(_, env, _)| refused.contains(&env.header.parent)) else { break };
+            let Some((id, _, _)) = self.orphans.remove(index) else { break };
             refused.insert(id);
             self.orphans_evicted = self.orphans_evicted.saturating_add(1);
         }
@@ -5885,7 +5912,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
                             // Judge first, THEN speak. Nothing is relayed
                             // until the engine has an answer — the same
                             // contract the attestation arm below runs on.
-                            let verdict = engine.ingest_judged(env);
+                            let verdict = engine.ingest_judged_from_source(
+                                env,
+                                origin.verification_source(),
+                            );
                             engine.net.report(&origin, verdict);
                         }
                         EngineEvent::Net(NetEvent::Attestation(att, origin)) => {
@@ -11386,7 +11416,7 @@ mod ingest_admission_tests {
             !engine
                 .orphans
                 .iter()
-                .any(|(_, env)| env.header.parent == first_parent),
+                .any(|(_, env, _)| env.header.parent == first_parent),
             "FIFO: the oldest entry is the one evicted"
         );
     }
@@ -11416,7 +11446,7 @@ mod ingest_admission_tests {
         // The already parked signed header is sufficient to ignore a repeat;
         // even an altered body must not make us repeat admission work.
         duplicate.body.transactions.push(vec![0xFF]);
-        assert!(matches!(engine.ingest_one(duplicate, Source::Gossip).0, Verdict::Ignore));
+        assert!(matches!(engine.ingest_one(duplicate, Source::Gossip(None)).0, Verdict::Ignore));
         assert_eq!(engine.orphans.len(), 1);
         assert!(engine.orphans[0].1.body.transactions.is_empty());
     }
@@ -11429,13 +11459,13 @@ mod ingest_admission_tests {
         let grandchild = repointed(&engine, &template, *child.block_id().as_bytes(), 4);
         let unrelated = repointed(&engine, &template, [0xB1; 32], 5);
         for orphan in [grandchild, child.clone(), unrelated.clone()] {
-            engine.park_orphan(*orphan.block_id().as_bytes(), orphan);
+            engine.park_orphan(*orphan.block_id().as_bytes(), orphan, Source::Gossip(None));
         }
         engine.refuse_finality_rewind((1, [0xC1; 32]), &[refused]);
         assert_eq!(engine.orphans.len(), 1);
         assert_eq!(engine.orphans[0].0, *unrelated.block_id().as_bytes());
         engine.needs_sync = false;
-        assert!(matches!(engine.ingest_one(child, Source::Gossip).0, Verdict::Ignore));
+        assert!(matches!(engine.ingest_one(child, Source::Gossip(None)).0, Verdict::Ignore));
         assert!(!engine.needs_sync, "a refused parent is not a missing sync gap");
     }
 
@@ -11444,7 +11474,7 @@ mod ingest_admission_tests {
         let (mut engine, _dir, template, stored) = fixture();
         let parent = *template.block_id().as_bytes();
         let non_increasing = repointed(&engine, &template, parent, template.header.slot);
-        assert!(matches!(engine.ingest_one(non_increasing, Source::Gossip).0, Verdict::Reject));
+        assert!(matches!(engine.ingest_one(non_increasing, Source::Gossip(None)).0, Verdict::Reject));
         assert_eq!(engine.blocks.len(), stored);
     }
 
@@ -11679,8 +11709,14 @@ mod ingest_admission_tests {
             engine.wall_slot() + FUTURE_SLOT_TOLERANCE,
         );
         let release_slot = near.header.slot;
-        engine.ingest(near);
+        let future_source = [0xC1; 32];
+        engine.ingest_judged_from_source(near, Some(future_source));
         assert_eq!(engine.future_blocks.len(), 1, "inside the tolerance it waits for its slot");
+        assert_eq!(
+            engine.future_blocks.values().next().expect("held future block").1,
+            Source::Gossip(Some(future_source)),
+            "future holding must retain the source that paid for later verification",
+        );
         assert_eq!(engine.blocks.len(), stored, "future gossip cannot enter fork choice");
         assert_eq!(engine.rejected_future, 1, "and nothing more was refused");
         engine.release_future_blocks(release_slot - 1);
@@ -11689,6 +11725,11 @@ mod ingest_admission_tests {
         engine.release_future_blocks(release_slot);
         assert!(engine.future_blocks.is_empty());
         assert_eq!(engine.orphans.len(), 1, "at its slot the unknown-parent block follows normal ingestion");
+        assert_eq!(
+            engine.orphans[0].2,
+            Source::Gossip(Some(future_source)),
+            "future release into the orphan pool must preserve attribution",
+        );
     }
 
     /// **The pool is not a black hole.** Out-of-order delivery — the child
@@ -11733,9 +11774,13 @@ mod ingest_admission_tests {
             .expect("stored until now");
         assert_eq!(*engine.head_id().as_bytes(), genesis);
 
-        // The child first.
-        engine.ingest(b2.clone());
+        // The child first. Its source must survive parking; the parent below
+        // is deliberately attributed to a different transport identity.
+        let child_source = [0xD1; 32];
+        let parent_source = [0xD2; 32];
+        engine.ingest_judged_from_source(b2.clone(), Some(child_source));
         assert_eq!(engine.orphans.len(), 1, "the child has nowhere to attach yet");
+        assert_eq!(engine.orphans[0].2, Source::Gossip(Some(child_source)));
         assert_eq!(
             *engine.head_id().as_bytes(),
             genesis,
@@ -11743,7 +11788,7 @@ mod ingest_admission_tests {
         );
 
         // Then the parent, which must pull the child in behind it.
-        engine.ingest(b1.clone());
+        engine.ingest_judged_from_source(b1.clone(), Some(parent_source));
         assert!(engine.orphans.is_empty(), "the child was promoted");
         assert!(engine.orphans_admitted >= 1, "and the promotion was counted");
         assert_eq!(
@@ -11964,15 +12009,31 @@ mod ingest_admission_tests {
         let orphan = repointed(&engine, &template, grandchild_id, floor + 30);
         let orphan_child = repointed(&engine, &template, *orphan.block_id().as_bytes(), floor + 40);
         // Reverse arrival order must not leave a pending descendant behind.
-        engine.orphans.push_back((*orphan_child.block_id().as_bytes(), orphan_child));
-        engine.orphans.push_back((*orphan.block_id().as_bytes(), orphan));
+        engine.orphans.push_back((
+            *orphan_child.block_id().as_bytes(),
+            orphan_child,
+            Source::Gossip(None),
+        ));
+        engine.orphans.push_back((
+            *orphan.block_id().as_bytes(),
+            orphan,
+            Source::Gossip(None),
+        ));
         let old_gap = repointed(&engine, &template, [0x71; 32], 1);
         let gap_child = repointed(&engine, &template, *old_gap.block_id().as_bytes(), floor + 50);
-        engine.orphans.push_back((*gap_child.block_id().as_bytes(), gap_child));
-        engine.orphans.push_back((*old_gap.block_id().as_bytes(), old_gap));
+        engine.orphans.push_back((
+            *gap_child.block_id().as_bytes(),
+            gap_child,
+            Source::Gossip(None),
+        ));
+        engine.orphans.push_back((
+            *old_gap.block_id().as_bytes(),
+            old_gap,
+            Source::Gossip(None),
+        ));
         let unrelated = repointed(&engine, &template, [0x72; 32], floor + 60);
         let unrelated_id = *unrelated.block_id().as_bytes();
-        engine.orphans.push_back((unrelated_id, unrelated));
+        engine.orphans.push_back((unrelated_id, unrelated, Source::Gossip(None)));
         let canonical = engine.canonical.clone();
         let chosen_head = engine.forkchoice_head();
         let before_blocks = engine.blocks_pruned;
@@ -12560,7 +12621,7 @@ mod finality_latch_tests {
 
         let rejected_unsigned_before = engine.rejected_unsigned;
         let orphans_before = engine.orphans.len();
-        let (verdict, released) = engine.ingest_one(env, Source::Gossip);
+        let (verdict, released) = engine.ingest_one(env, Source::Gossip(None));
 
         assert_eq!(verdict, Verdict::Ignore, "a re-offered parked block must be ignored");
         assert!(released.is_none());
