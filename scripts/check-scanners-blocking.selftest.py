@@ -259,6 +259,36 @@ CASES = [
          "    - |\n"
          "      \"not-a-yaml-key\": shell data\n",
          GOOD_GITHUB, must_fail=False),
+    Case("GitLab root merge cannot inject scanner runner image",
+         ".runner-policy: &runner_policy\n"
+         "  image: attacker.invalid/controlled:latest\n\n"
+         "<<: *runner_policy\n\n" + GOOD_GITLAB,
+         GOOD_GITHUB, must_fail=True, expect="YAML merge keys"),
+    Case("GitLab scanner job merge cannot inject an unreviewed runner image",
+         ".runner-policy: &runner_policy\n"
+         "  image: attacker.invalid/controlled:latest\n\n" +
+         sub(GOOD_GITLAB,
+             "supply-chain:\n  stage: check",
+             "supply-chain:\n  <<: *runner_policy\n  stage: check"),
+         GOOD_GITHUB, must_fail=True, expect="YAML merge keys"),
+    Case("GitLab scanner merge-looking block script text remains data",
+         GOOD_GITLAB +
+         "\nmerge-script-data:\n"
+         "  stage: test\n"
+         "  script:\n"
+         "    - |\n"
+         "      <<: *runner_policy\n",
+         GOOD_GITHUB, must_fail=False),
+    Case("GitLab quoted scanner merge key remains rejected by prior preflight",
+         GOOD_GITLAB + "\n'<<': ignored\n",
+         GOOD_GITHUB, must_fail=True, expect="quoted YAML mapping keys"),
+    Case("GitLab explicit scanner merge key remains rejected by prior preflight",
+         GOOD_GITLAB + "\n? <<\n: ignored\n",
+         GOOD_GITHUB, must_fail=True,
+         expect="explicit, tagged, anchored or aliased"),
+    Case("GitLab flow scanner merge remains rejected by prior preflight",
+         GOOD_GITLAB + "\nmerge-flow: {<<: ignored}\n",
+         GOOD_GITHUB, must_fail=True, expect="flow-style YAML mappings"),
     Case("GitLab escaped scanner default authority key is rejected globally",
          GOOD_GITLAB +
          "\n\"defa\\u0075lt\":\n"

@@ -52,7 +52,7 @@ security job, fails if the job:
   * duplicates or quotes a required job key, so the CI parser cannot select a
     different mapping value than the plain-key block reviewed here.
   * disguises any mapping key with quoting/escapes, explicit-key syntax, tags,
-    anchors, aliases or flow mappings outside literal/folded block scalar data.
+    anchors, aliases, merge keys or flow mappings outside literal/folded block scalar data.
   * makes the GitHub OSV verdict mutable by replacing its full commit pin with
     a tag/branch, or removes this guard's own adversarial self-test.
   * lets the GitHub OSV lockfile scope drift from the complete set of tracked
@@ -521,6 +521,7 @@ NODE_PROPERTY_MAPPING_KEY = re.compile(
     r"(?:[A-Za-z0-9_-]+|\"(?:\\.|[^\"\\])*\"|'(?:''|[^'])*')\s*:"
 )
 ALIAS_MAPPING_KEY = re.compile(r"^\s*(?:-\s+)?\*\S+\s*:")
+MERGE_MAPPING_KEY = re.compile(r"^\s*(?:-\s+)?<<\s*:")
 FLOW_MAPPING_START = re.compile(
     r"^\s*(?:-\s*)?(?:(?:[A-Za-z0-9_-]+)\s*:\s*)?\{(?!\{)"
 )
@@ -551,6 +552,10 @@ def ci_mapping_key_syntax_problems(
             problems.append(
                 f"{label}:{number}: explicit, tagged, anchored or aliased YAML "
                 f"mapping keys are outside the supported {provider} workflow subset")
+        if MERGE_MAPPING_KEY.match(line):
+            problems.append(
+                f"{label}:{number}: YAML merge keys are outside the supported "
+                f"{provider} workflow subset")
         if FLOW_MAPPING_START.match(line):
             problems.append(
                 f"{label}:{number}: flow-style YAML mappings are outside the "

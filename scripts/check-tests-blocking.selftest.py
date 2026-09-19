@@ -200,6 +200,36 @@ CASES = [
          "    - |\n"
          "      \"not-a-yaml-key\": shell data\n",
          GOOD_GITHUB, must_fail=False),
+    Case("GitLab root merge cannot inject an unreviewed runner image",
+         ".runner-policy: &runner_policy\n"
+         "  image: attacker.invalid/controlled:latest\n\n"
+         "<<: *runner_policy\n\n" + GOOD_GITLAB,
+         GOOD_GITHUB, must_fail=True, expect="YAML merge keys"),
+    Case("GitLab job merge cannot inject an unreviewed runner image",
+         ".runner-policy: &runner_policy\n"
+         "  image: attacker.invalid/controlled:latest\n\n" +
+         sub(GOOD_GITLAB,
+             "build-and-test:\n  stage: test",
+             "build-and-test:\n  <<: *runner_policy\n  stage: test"),
+         GOOD_GITHUB, must_fail=True, expect="YAML merge keys"),
+    Case("GitLab merge-looking text inside a block script remains data",
+         GOOD_GITLAB +
+         "\nmerge-script-data:\n"
+         "  stage: test\n"
+         "  script:\n"
+         "    - |\n"
+         "      <<: *runner_policy\n",
+         GOOD_GITHUB, must_fail=False),
+    Case("GitLab quoted merge key remains rejected by the prior preflight",
+         GOOD_GITLAB + "\n'<<': ignored\n",
+         GOOD_GITHUB, must_fail=True, expect="quoted YAML mapping keys"),
+    Case("GitLab explicit merge key remains rejected by the prior preflight",
+         GOOD_GITLAB + "\n? <<\n: ignored\n",
+         GOOD_GITHUB, must_fail=True,
+         expect="explicit, tagged, anchored or aliased"),
+    Case("GitLab flow merge mapping remains rejected by the prior preflight",
+         GOOD_GITLAB + "\nmerge-flow: {<<: ignored}\n",
+         GOOD_GITHUB, must_fail=True, expect="flow-style YAML mappings"),
     Case("GitLab escaped default authority key is rejected globally",
          GOOD_GITLAB +
          "\n\"defa\\u0075lt\":\n"

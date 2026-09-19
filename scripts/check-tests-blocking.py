@@ -29,7 +29,7 @@ GitLab `.gitlab-ci.yml` job `build-and-test`, to the reviewed posture:
     variables. The `build-and-test` header and complete ordered script match
     the reviewed whole-job contract.
   * both CI documents reject quoted/escaped, explicit, tagged, anchored,
-    aliased and flow-style mapping keys outside block scalar script data, so
+    aliased, merged and flow-style mapping keys outside block scalar script data, so
     semantic duplicates cannot hide from the supported textual subset.
   * its GitHub environment is the reviewed inert pair and its exact global
     run shell clears inherited shell/Python/Rust substitution variables while
@@ -219,7 +219,7 @@ CI_SCRIPT_ENTRYPOINT_SHA256 = {
     "scripts/check-iso-hardening.sh":
         "f0dae2e22aa766301def84a0c671ca4f79ff0c1b87d6e8647e9f6671669b91b3",
     "scripts/check-tests-blocking.selftest.py":
-        "f3a0fbfb81f1fd11351b9eddcee06d4821d436842e3824b0656e47f16154bc80",
+        "bec0fd069769f4dc8551cd7e413c603bfa37c7789c2e4a52d03a64eb0360639a",
     "scripts/check-validator-lifecycle-mutations.py":
         "12b477e5043bc3ea98387be33ca586976494b30083522b214cea7d88c0e9f429",
     "scripts/devnet-particao-report.test.py":
@@ -672,6 +672,7 @@ NODE_PROPERTY_MAPPING_KEY = re.compile(
     r"(?:[A-Za-z0-9_-]+|\"(?:\\.|[^\"\\])*\"|'(?:''|[^'])*')\s*:"
 )
 ALIAS_MAPPING_KEY = re.compile(r"^\s*(?:-\s+)?\*\S+\s*:")
+MERGE_MAPPING_KEY = re.compile(r"^\s*(?:-\s+)?<<\s*:")
 FLOW_MAPPING_START = re.compile(
     r"^\s*(?:-\s*)?(?:(?:[A-Za-z0-9_-]+)\s*:\s*)?\{(?!\{)"
 )
@@ -707,6 +708,10 @@ def ci_mapping_key_syntax_problems(
             problems.append(
                 f"{label}:{number}: explicit, tagged, anchored or aliased YAML "
                 f"mapping keys are outside the supported {provider} workflow subset")
+        if MERGE_MAPPING_KEY.match(line):
+            problems.append(
+                f"{label}:{number}: YAML merge keys are outside the supported "
+                f"{provider} workflow subset")
         if FLOW_MAPPING_START.match(line):
             problems.append(
                 f"{label}:{number}: flow-style YAML mappings are outside the "
