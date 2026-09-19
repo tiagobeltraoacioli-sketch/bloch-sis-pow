@@ -434,10 +434,10 @@ impl HdWallet {
         // Decrypt each keypair. The stored key always wins — a pre-v3 wallet's
         // OS-random keys are not reproducible from the seed, so re-deriving here
         // would silently hand back the wrong (empty) addresses.
-        let mut addresses = Vec::new();
+        let mut addresses = Vec::with_capacity(wallet.addresses.len());
         let mut imported = BTreeSet::new();
         let mut seed = Zeroizing::new(mnemonic.to_seed(passphrase.unwrap_or("")).to_vec());
-        for addr in &wallet.addresses {
+        for addr in wallet.addresses {
             // Zeroizing (A4 lows): plaintext JSON containing the hex-encoded
             // private key — must not survive past the parse below.
             let bytes = Zeroizing::new(decrypt_with_key(&master_key, &addr.keypair_crypto)?);
@@ -460,13 +460,13 @@ impl HdWallet {
                     return Err(format!("derived keypair {} does not match mnemonic and index", addr.index));
                 }
             }
-            let kp = Keypair {
-                private_key: std::mem::take(&mut *priv_key),
-                public_key:  pub_key,
-                address:     addr.address.clone(),
-            };
-            addresses.push((addr.index, kp, addr.label.clone()));
-            if !addr.derived { imported.insert(addr.index); }
+            let (loaded, is_imported) = into_loaded_address(
+                addr,
+                std::mem::take(&mut *priv_key),
+                pub_key,
+            );
+            if is_imported { imported.insert(loaded.0); }
+            addresses.push(loaded);
         }
 
         // A4 H-1 FIX: preserve the file's OWN version — `master_key` above
@@ -507,6 +507,23 @@ fn validate_wallet_structure(wallet: &HdWalletFile) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Transfer authenticated record ownership into the live wallet without
+/// cloning attacker-controlled address/label strings. Authentication and
+/// mnemonic/index checks happen before this helper is called.
+fn into_loaded_address(
+    address: HdAddress,
+    private_key: Vec<u8>,
+    public_key: Vec<u8>,
+) -> ((u32, Keypair, String), bool) {
+    let is_imported = !address.derived;
+    let keypair = Keypair {
+        private_key,
+        public_key,
+        address: address.address,
+    };
+    ((address.index, keypair, address.label), is_imported)
 }
 
 fn validate_wallet_load_limits(
@@ -1530,6 +1547,30 @@ mod audit_wallet_boundaries {
         // Explicit trusted public recovery retains its historical policy.
         assert!(HdWalletFile::read_public_with_limits(&path, bytes.len(), 1).is_ok());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn authenticated_address_metadata_moves_without_duplicate_buffers() {
+        let crypto = encrypt_with_key(&[0; 32], b"fixture").unwrap();
+        let address_text = format!("{}move-owned-address", TESTNET_PREFIX);
+        let label = "L".repeat(32 * 1024);
+        let address_pointer = address_text.as_ptr();
+        let label_pointer = label.as_ptr();
+        let record = HdAddress {
+            index: 7,
+            address: address_text,
+            label,
+            keypair_crypto: crypto,
+            derived: false,
+        };
+
+        let (loaded, is_imported) = into_loaded_address(record, vec![1, 2], vec![3, 4]);
+        assert_eq!(loaded.0, 7);
+        assert!(is_imported);
+        assert_eq!(loaded.1.address.as_ptr(), address_pointer);
+        assert_eq!(loaded.2.as_ptr(), label_pointer);
+        assert_eq!(loaded.1.private_key, vec![1, 2]);
+        assert_eq!(loaded.1.public_key, vec![3, 4]);
     }
 
     #[test]
