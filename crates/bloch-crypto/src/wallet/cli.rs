@@ -293,7 +293,9 @@ pub fn main() {
             println!();
 
             let phrase = prompt_password(&format!("  {}seed phrase:{} ", MUTED, RESET));
-            let seed = match crate::wallet::SeedPhrase::parse(&phrase) {
+            let parsed_seed = crate::wallet::SeedPhrase::parse(&phrase);
+            drop(phrase);
+            let seed = match parsed_seed {
                 Ok(s) => s,
                 Err(e) => { err(&format!("Invalid seed phrase: {}", e)) }
             };
@@ -468,14 +470,20 @@ fn load_and_verify_bundle(
 
 fn load_kp(path: &PathBuf) -> crate::wallet::Keypair {
     let pw = prompt_password(&format!("  {}password:{} ", MUTED, RESET));
-    match crate::wallet::Keypair::load_encrypted(path, &pw) {
+    let loaded = crate::wallet::Keypair::load_encrypted(path, &pw);
+    drop(pw);
+    match loaded {
         Ok(kp) => { ok("keystore decrypted"); println!(); kp }
         Err(e) => { err(&format!("Load failed: {}", e)) }
     }
 }
 
-fn prompt_password(prompt: &str) -> String {
-    rpassword::prompt_password(prompt).unwrap_or_default()
+fn own_prompt_secret(secret: String) -> zeroize::Zeroizing<String> {
+    zeroize::Zeroizing::new(secret)
+}
+
+fn prompt_password(prompt: &str) -> zeroize::Zeroizing<String> {
+    own_prompt_secret(rpassword::prompt_password(prompt).unwrap_or_default())
 }
 
 fn prompt_new_password() -> String {
@@ -543,6 +551,16 @@ mod audit_cli_input_tests {
     use crate::address::{Address, Network};
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use sha3::{Digest, Sha3_256};
+    use zeroize::Zeroize;
+
+    #[test]
+    fn cli_prompt_secret_owner_preserves_content_and_zeroizes_while_live() {
+        let mut secret = own_prompt_secret(String::from("abandon abandon secret"));
+        assert!(std::mem::needs_drop::<zeroize::Zeroizing<String>>());
+        assert_eq!(secret.as_str(), "abandon abandon secret");
+        secret.zeroize();
+        assert!(secret.is_empty());
+    }
 
     #[test]
     fn cli_amount_refuses_nonfinite_negative_saturating_and_zero_payment() {
