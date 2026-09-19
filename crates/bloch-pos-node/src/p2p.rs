@@ -730,8 +730,7 @@ impl RrCodec for SyncCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        let buf = read_capped(io).await?;
-        decode_sync_response(&buf).map_err(bad_data)
+        read_sync_response(io).await
     }
 
     async fn write_request<T>(
@@ -788,16 +787,71 @@ fn sync_wire_len(len: usize) -> io::Result<u32> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "sync field length exceeds u32"))
 }
 
-async fn read_capped<T: AsyncRead + Unpin + Send>(io: &mut T) -> io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    // `take(cap)` manufactures EOF at the cap. A valid cap-sized prefix
-    // followed by junk would therefore decode successfully. Read one sentinel
-    // byte so only actual EOF can terminate an accepted frame.
-    io.take(MAX_SYNC_FRAME + 1).read_to_end(&mut buf).await?;
-    if buf.len() as u64 > MAX_SYNC_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "sync frame over byte cap"));
+async fn read_sync_response<T: AsyncRead + Unpin + Send>(io: &mut T) -> io::Result<SyncResponse> {
+    let mut header = [0u8; 5];
+    read_sync_exact(io, &mut header).await?;
+    if header[0] != SYNC_TAG_BLOCKS {
+        return Err(bad_data(crate::codec::DecodeErr("unknown sync response tag")));
     }
-    Ok(buf)
+    let count = u32::from_le_bytes(header[1..5].try_into().map_err(|_| {
+        bad_data(crate::codec::DecodeErr("truncated"))
+    })?) as usize;
+    if count > MAX_SYNC_BLOCKS {
+        return Err(bad_data(crate::codec::DecodeErr(
+            "sync response over the block cap",
+        )));
+    }
+
+    let mut wire_bytes = header.len() as u64;
+    let mut envelopes = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut len4 = [0u8; 4];
+        read_sync_exact(io, &mut len4).await?;
+        wire_bytes = wire_bytes.checked_add(len4.len() as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "sync frame length overflow")
+        })?;
+        let len = u32::from_le_bytes(len4) as usize;
+        if len > crate::codec::MAX_FIELD_LEN {
+            return Err(bad_data(crate::codec::DecodeErr("length over cap")));
+        }
+        let frame_end = wire_bytes.checked_add(len as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "sync frame length overflow")
+        })?;
+        // Refuse a declared over-cap field before allocating or reading it.
+        if frame_end > MAX_SYNC_FRAME {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sync frame over byte cap",
+            ));
+        }
+        let mut envelope = vec![0u8; len];
+        read_sync_exact(io, &mut envelope).await?;
+        wire_bytes = frame_end;
+        envelopes.push(envelope);
+    }
+
+    // Request-response frames by EOF. Reading one sentinel after the declared
+    // fields keeps `encode(x) || junk` invalid, including when `x` occupies
+    // exactly MAX_SYNC_FRAME bytes.
+    let mut sentinel = [0u8; 1];
+    match io.read(&mut sentinel).await {
+        Ok(0) => Ok(SyncResponse::Blocks { envelopes }),
+        Ok(_) => Err(bad_data(crate::codec::DecodeErr("trailing bytes"))),
+        Err(e) => Err(e),
+    }
+}
+
+async fn read_sync_exact<T: AsyncRead + Unpin + Send>(
+    io: &mut T,
+    bytes: &mut [u8],
+) -> io::Result<()> {
+    io.read_exact(bytes).await.map_err(|e| {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            bad_data(crate::codec::DecodeErr("truncated"))
+        } else {
+            e
+        }
+    })
 }
 
 fn bad_data(e: crate::codec::DecodeErr) -> io::Error {
@@ -2012,6 +2066,38 @@ fn read_sync_page(
 mod tests {
     use super::*;
 
+    struct ShortAsyncReader {
+        bytes: Vec<u8>,
+        at: usize,
+        fail_at: Option<usize>,
+    }
+
+    impl AsyncRead for ShortAsyncReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            out: &mut [u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            if self.fail_at == Some(self.at) {
+                return std::task::Poll::Ready(Err(io::Error::other(
+                    "injected response read failure",
+                )));
+            }
+            if self.at == self.bytes.len() {
+                return std::task::Poll::Ready(Ok(0));
+            }
+            // Split fixed headers byte by byte, but keep the large case cheap
+            // while still exercising repeated payload reads.
+            let cap = if out.len() <= 5 { 1 } else { 4_093 };
+            let available = self.bytes.len().saturating_sub(self.at);
+            let take = out.len().min(available).min(cap);
+            let end = self.at.saturating_add(take);
+            out[..take].copy_from_slice(&self.bytes[self.at..end]);
+            self.at = end;
+            std::task::Poll::Ready(Ok(take))
+        }
+    }
+
     #[test]
     fn sync_wire_len_rejects_u32_overflow_without_payload_allocation() {
         assert_eq!(sync_wire_len(u32::MAX as usize).unwrap(), u32::MAX);
@@ -2079,7 +2165,26 @@ mod tests {
     }
 
     #[test]
-    fn audit_sync_cap_requires_actual_eof() {
+    fn sync_response_reader_streams_oracle_values_across_short_reads() {
+        futures::executor::block_on(async {
+            let cases = [
+                SyncResponse::Blocks { envelopes: Vec::new() },
+                SyncResponse::Blocks {
+                    envelopes: vec![vec![1, 2, 3], Vec::new(), vec![9; 100]],
+                },
+                SyncResponse::Blocks { envelopes: vec![vec![0xA5; 1 << 20]] },
+            ];
+            for expected in cases {
+                let wire = encode_sync_response(&expected);
+                let oracle = decode_sync_response(&wire).unwrap();
+                let mut reader = ShortAsyncReader { bytes: wire, at: 0, fail_at: None };
+                assert_eq!(read_sync_response(&mut reader).await.unwrap(), oracle);
+            }
+        });
+    }
+
+    #[test]
+    fn audit_streaming_sync_cap_requires_actual_eof() {
         futures::executor::block_on(async {
             // A syntactically valid response that ends exactly at the cap.
             // The envelope is opaque at this framing layer (decoded later).
@@ -2088,26 +2193,65 @@ mod tests {
             };
             let mut wire = encode_sync_response(&response);
             assert_eq!(wire.len() as u64, MAX_SYNC_FRAME);
-            let accepted = read_capped(&mut futures::io::Cursor::new(&wire)).await.unwrap();
-            assert!(decode_sync_response(&accepted).is_ok());
+            assert_eq!(
+                read_sync_response(&mut futures::io::Cursor::new(&wire)).await.unwrap(),
+                response,
+            );
 
             // Previously both distinct streams produced the same accepted
             // bytes: `take(cap)` hid this trailing byte from strict decoding.
             wire.push(0xA5);
-            let error = read_capped(&mut futures::io::Cursor::new(&wire)).await.unwrap_err();
+            let error = read_sync_response(&mut futures::io::Cursor::new(&wire)).await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+            // Declared wire length is cap + 1. Only the framing bytes exist:
+            // refusal must happen before allocating or reading the body.
+            let over_len = (MAX_SYNC_FRAME - 8) as u32;
+            let mut over = vec![SYNC_TAG_BLOCKS];
+            over.extend_from_slice(&1u32.to_le_bytes());
+            over.extend_from_slice(&over_len.to_le_bytes());
+            let error = read_sync_response(&mut futures::io::Cursor::new(over)).await.unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         });
     }
 
     #[test]
-    fn audit_sync_short_frames_still_use_strict_decoding() {
+    fn audit_streaming_sync_rejects_caps_truncation_and_preserves_io_errors() {
         futures::executor::block_on(async {
-            let mut wire = encode_sync_response(&SyncResponse::Blocks { envelopes: Vec::new() });
-            let accepted = read_capped(&mut futures::io::Cursor::new(&wire)).await.unwrap();
-            assert!(decode_sync_response(&accepted).is_ok());
-            wire.push(0);
-            let accepted = read_capped(&mut futures::io::Cursor::new(&wire)).await.unwrap();
-            assert!(decode_sync_response(&accepted).is_err());
+            let mut over_count = vec![SYNC_TAG_BLOCKS];
+            over_count.extend_from_slice(&((MAX_SYNC_BLOCKS as u32) + 1).to_le_bytes());
+            assert_eq!(
+                read_sync_response(&mut futures::io::Cursor::new(over_count))
+                    .await.unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+            );
+
+            let mut one_missing_len = vec![SYNC_TAG_BLOCKS];
+            one_missing_len.extend_from_slice(&1u32.to_le_bytes());
+            let mut one_short_body = one_missing_len.clone();
+            one_short_body.extend_from_slice(&3u32.to_le_bytes());
+            one_short_body.extend_from_slice(&[1, 2]);
+            for truncated in [Vec::new(), vec![SYNC_TAG_BLOCKS], one_missing_len, one_short_body] {
+                assert_eq!(
+                    read_sync_response(&mut futures::io::Cursor::new(truncated))
+                        .await.unwrap_err().kind(),
+                    io::ErrorKind::InvalidData,
+                );
+            }
+
+            let mut failing = ShortAsyncReader {
+                bytes: {
+                    let mut bytes = vec![SYNC_TAG_BLOCKS];
+                    bytes.extend_from_slice(&1u32.to_le_bytes());
+                    bytes
+                },
+                at: 0,
+                fail_at: Some(5),
+            };
+            assert_eq!(
+                read_sync_response(&mut failing).await.unwrap_err().kind(),
+                io::ErrorKind::Other,
+            );
         });
     }
 
