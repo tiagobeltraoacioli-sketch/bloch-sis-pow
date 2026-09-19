@@ -27,6 +27,8 @@ pub(super) struct GossipVerifier<V> {
     verifier: V,
     failures: RefCell<Failures>,
     budget: RefCell<SlotBudget>,
+    #[cfg(test)]
+    panic_on_verification: Cell<bool>,
 }
 
 #[derive(Default)]
@@ -54,6 +56,8 @@ impl<V> GossipVerifier<V> {
             verifier,
             failures: RefCell::new(Failures::default()),
             budget: RefCell::new(SlotBudget::default()),
+            #[cfg(test)]
+            panic_on_verification: Cell::new(false),
         }
     }
 
@@ -123,6 +127,17 @@ impl<V> GossipVerifier<V> {
         }
         true
     }
+
+    #[cfg(test)]
+    pub(super) fn budget_used_at(&self, slot: u64) -> usize {
+        let budget = self.budget.borrow();
+        if budget.slot == Some(slot) { budget.used } else { 0 }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_panic_on_verification(&self, enabled: bool) {
+        self.panic_on_verification.set(enabled);
+    }
 }
 
 impl<V> BudgetedVerifier<'_, V> {
@@ -151,6 +166,11 @@ impl<V: SignatureVerifier> SignatureVerifier for BudgetedVerifier<'_, V> {
 
 impl<V: SignatureVerifier> SignatureVerifier for GossipVerifier<V> {
     fn verify_with_key(&self, pubkey: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
+        #[cfg(test)]
+        assert!(
+            !self.panic_on_verification.get(),
+            "deferred authenticated block must not repeat gossip verification"
+        );
         let key = Self::failure_key(pubkey, root, signature);
         if self.failures.borrow().known.contains(&key) {
             return false;
