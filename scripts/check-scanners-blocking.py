@@ -44,6 +44,9 @@ security job, fails if the job:
     privileged `pull_request_target` event.
   * removes the explicit read-only GitHub token posture or adds a job-level
     permission override to a required scanner.
+  * keeps the job name but removes/replaces its actual scanner or guard
+    command. Evidence is accepted only from explicit GitLab `script:` items
+    and GitHub step `run:`/`uses:` fields, never names, comments or variables.
 
 It does NOT require every job to be blocking. cargo-geiger, miri and the fuzz
 smoke are deliberately report-only, with written reasons, and stay green here.
@@ -94,6 +97,31 @@ GITHUB_REQUIRED = {
     "rollback-package-integrity": "signed rollback-package rejection paths",
 }
 
+# A job name is not evidence that its verdict still runs. Keep these patterns
+# deliberately tied to the repository-owned entrypoints (or, for OSV on
+# GitHub, the reviewed action). Matching happens only against executable YAML
+# fields extracted by explicit_execution_values(), not against the whole job.
+GITLAB_VERDICTS = {
+    "clippy-hardened": re.compile(r"^bash\s+scripts/hardened-clippy\.sh(?:\s|$)"),
+    "osv-scanner": re.compile(r"^(?:osv-scanner|[\"']?[^\s\"']*/osv-scanner[\"']?)\s+.*--config=osv-scanner\.toml.*--lockfile=Cargo\.lock"),
+    "secret-scan": re.compile(r"^bash\s+scripts/scan-secrets\.sh\s+tree(?:\s|$)"),
+    "secret-history-scan": re.compile(r"^bash\s+scripts/scan-secrets\.sh\s+history(?:\s|$)"),
+    "cargo-audit": re.compile(r"^bash\s+scripts/audit-all-lockfiles\.sh(?:\s|$)"),
+    "supply-chain": re.compile(r"^cargo\s+deny\s+check\s+advisories\s+bans\s+licenses\s+sources(?:\s|$)"),
+    "scanners-blocking-guard": re.compile(r"^python3\s+scripts/check-scanners-blocking\.py(?:\s|$)"),
+    "rollback-package-integrity": re.compile(r"^bash\s+deploy/rollback/make-rollback-package\.selftest\.sh(?:\s|$)"),
+}
+GITHUB_VERDICTS = {
+    "clippy-hardened": GITLAB_VERDICTS["clippy-hardened"],
+    "osv-scanner": re.compile(r"^google/osv-scanner-action/osv-scanner-action@[0-9A-Za-z._-]+$"),
+    "secret-scan": GITLAB_VERDICTS["secret-scan"],
+    "secret-history-scan": GITLAB_VERDICTS["secret-history-scan"],
+    "cargo-audit": GITLAB_VERDICTS["cargo-audit"],
+    "cargo-deny": GITLAB_VERDICTS["supply-chain"],
+    "scanners-blocking-guard": GITLAB_VERDICTS["scanners-blocking-guard"],
+    "rollback-package-integrity": GITLAB_VERDICTS["rollback-package-integrity"],
+}
+
 SHELL_ESCAPES = (
     (re.compile(r"(^|[;&|\s])exit\s+0\b"), "an `exit 0` escape (the silent skip)"),
     (re.compile(r"(?:\|\||\||;)\s*true\b"), "a shell-success masking escape"),
@@ -133,6 +161,55 @@ def job_blocks(text: str, indent: int) -> dict[str, list[str]]:
             continue
         blocks[current].append(line)
     return blocks
+
+
+def explicit_execution_values(body: list[str], job_indent: int, label: str) -> list[str]:
+    """Return only locally visible commands/actions in the supported subset.
+
+    This intentionally is not a general YAML parser. Indentation binds
+    evidence to GitLab `script:` list items or GitHub step `run:`/`uses:`
+    fields. Block/folded scalars are joined so a multi-line scanner invocation
+    is one value. Everything else (name/env/variables/comments) is ignored.
+    """
+    values: list[str] = []
+    index = 0
+    in_gitlab_script = False
+    while index < len(body):
+        line = body[index]
+        spaces = len(line) - len(line.lstrip(" "))
+        stripped = line.strip()
+        value: str | None = None
+        field_indent = spaces
+
+        if label == ".gitlab-ci.yml":
+            if spaces == job_indent + 2:
+                in_gitlab_script = stripped == "script:"
+            elif in_gitlab_script and spaces == job_indent + 4 and stripped.startswith("- "):
+                value = stripped[2:].strip()
+        else:
+            if spaces == job_indent + 4 and stripped.startswith(("- run:", "- uses:")):
+                value = stripped.split(":", 1)[1].strip()
+            elif spaces == job_indent + 6 and stripped.startswith(("run:", "uses:")):
+                value = stripped.split(":", 1)[1].strip()
+
+        index += 1
+        if value is None:
+            continue
+        if value in ("|", "|-", "|+", ">", ">-", ">+"):
+            continuation: list[str] = []
+            while index < len(body):
+                candidate = body[index]
+                candidate_indent = len(candidate) - len(candidate.lstrip(" "))
+                if candidate_indent <= field_indent:
+                    break
+                continuation.append(candidate.strip())
+                index += 1
+            value = " ".join(continuation)
+        # Inline YAML comments annotate pinned actions in the real workflow;
+        # they are metadata, not part of the executable value.
+        value = re.sub(r"\s+#.*$", "", value).strip()
+        values.append(value.strip("\"'"))
+    return values
 
 
 def check_file(path: str, required: dict[str, str], indent: int, label: str) -> list[str]:
@@ -197,6 +274,19 @@ def check_file(path: str, required: dict[str, str], indent: int, label: str) -> 
                 "%s: job `%s` is MISSING (%s). A gate that was deleted is not a "
                 "gate that passed." % (label, job, why))
             continue
+        verdicts = GITLAB_VERDICTS if label == ".gitlab-ci.yml" else GITHUB_VERDICTS
+        executable = explicit_execution_values(blocks[job], indent, label)
+        # A required verdict must be a direct command/action, not one operand
+        # of a compound shell expression that can replace its exit status.
+        has_verdict = any(
+            verdicts[job].search(value)
+            and not re.search(r"(?:\|\||&&|[;|&]|\$\(|`)", value)
+            for value in executable)
+        if not has_verdict:
+            problems.append(
+                "%s: job `%s` (%s) no longer executes its required verdict "
+                "in an explicit local script/run/uses field"
+                % (label, job, why))
         for line in blocks[job]:
             waiver = re.match(
                 r"^\s*(?:-\s+)?(allow_failure|continue-on-error):\s*(.*?)\s*(?:#.*)?$",

@@ -67,13 +67,13 @@ secret-scan:
   stage: check
   script:
     - bash scripts/ci-install-scanner.sh gitleaks
-    - gitleaks detect --source . --no-banner --redact
+    - bash scripts/scan-secrets.sh tree
   allow_failure: false
 
 cargo-audit:
   stage: check
   script:
-    - cargo audit --deny warnings
+    - bash scripts/audit-all-lockfiles.sh
   allow_failure: false
 
 secret-history-scan:
@@ -119,7 +119,7 @@ jobs:
   cargo-audit:
     runs-on: ubuntu-latest
     steps:
-      - run: cargo audit --deny warnings
+      - run: bash scripts/audit-all-lockfiles.sh
 
   cargo-deny:
     runs-on: ubuntu-latest
@@ -134,7 +134,7 @@ jobs:
   secret-scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: gitleaks/gitleaks-action@v2
+      - run: bash scripts/scan-secrets.sh tree
 
   scanners-blocking-guard:
     runs-on: ubuntu-latest
@@ -235,6 +235,32 @@ CASES = [
              "    steps:\n      - run: python3 scripts/check-scanners-blocking.py\n\n", ""),
          must_fail=True, expect="MISSING"),
 
+    Case("gitlab job name cannot replace the scanner verdict",
+         GOOD_GITLAB.replace(
+             "    - cargo deny check advisories bans licenses sources",
+             "    - echo scanner job retained"),
+         GOOD_GITHUB, must_fail=True, expect="no longer executes its required verdict"),
+
+    Case("github step name cannot replace the scanner verdict",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - run: bash scripts/scan-secrets.sh history",
+             "      - name: bash scripts/scan-secrets.sh history\n        run: echo scanner removed"),
+         must_fail=True, expect="no longer executes its required verdict"),
+
+    Case("echoing a verdict command is not execution evidence",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - run: bash scripts/scan-secrets.sh tree",
+             "      - run: echo bash scripts/scan-secrets.sh tree"),
+         must_fail=True, expect="no longer executes its required verdict"),
+
+    Case("compound verdict cannot replace its failing exit status",
+         GOOD_GITLAB.replace(
+             "    - cargo deny check advisories bans licenses sources",
+             "    - cargo deny check advisories bans licenses sources || echo ignored"),
+         GOOD_GITHUB, must_fail=True, expect="no longer executes its required verdict"),
+
     Case("github rollback integrity job deleted outright",
          GOOD_GITLAB,
          GOOD_GITHUB.replace(
@@ -299,7 +325,7 @@ CASES = [
 
     Case("GitLab reference cannot hide a required script",
          GOOD_GITLAB.replace(
-             "cargo-audit:\n  stage: check\n  script:\n    - cargo audit --deny warnings",
+             "cargo-audit:\n  stage: check\n  script:\n    - bash scripts/audit-all-lockfiles.sh",
              "cargo-audit:\n  stage: check\n  script: !reference [.scanner-template, script]"),
          GOOD_GITHUB, must_fail=True, expect="YAML alias or GitLab reference"),
 
@@ -341,7 +367,7 @@ CASES = [
          must_fail=True, expect="job-level permissions override"),
 
     Case("or-true masks a scanner verdict",
-         GOOD_GITLAB.replace("cargo audit --deny warnings", "cargo audit --deny warnings || true"),
+         GOOD_GITLAB.replace("bash scripts/audit-all-lockfiles.sh", "bash scripts/audit-all-lockfiles.sh || true"),
          GOOD_GITHUB, must_fail=True, expect="shell-success masking"),
 
     Case("semicolon-true masks a scanner verdict",
@@ -351,12 +377,12 @@ CASES = [
          must_fail=True, expect="shell-success masking"),
 
     Case("pipe-to-true masks a scanner verdict",
-         GOOD_GITLAB.replace("cargo audit --deny warnings", "cargo audit --deny warnings | true"),
+         GOOD_GITLAB.replace("bash scripts/audit-all-lockfiles.sh", "bash scripts/audit-all-lockfiles.sh | true"),
          GOOD_GITHUB, must_fail=True, expect="shell-success masking"),
 
     Case("set plus-e disables failure propagation",
          GOOD_GITLAB.replace(
-             "    - cargo audit --deny warnings", "    - set +e\n    - cargo audit --deny warnings"),
+             "    - bash scripts/audit-all-lockfiles.sh", "    - set +e\n    - bash scripts/audit-all-lockfiles.sh"),
          GOOD_GITHUB, must_fail=True, expect="disabled shell failure"),
 
     Case("both files missing entirely fails closed", None, None,
