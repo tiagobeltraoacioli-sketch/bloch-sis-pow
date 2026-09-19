@@ -210,7 +210,7 @@ CI_SCRIPT_ENTRYPOINT_SHA256 = {
     "scripts/check-iso-hardening.sh":
         "f0dae2e22aa766301def84a0c671ca4f79ff0c1b87d6e8647e9f6671669b91b3",
     "scripts/check-tests-blocking.selftest.py":
-        "f518ef2e8a23c7e7704102c7084f39f3af29ada2abdf822c44c794d7fa783966",
+        "eb36a1505e0b310e41e8930482190d2133418efb97d8dbc86eb4d93166531f11",
     "scripts/check-validator-lifecycle-mutations.py":
         "12b477e5043bc3ea98387be33ca586976494b30083522b214cea7d88c0e9f429",
     "scripts/devnet-particao-report.test.py":
@@ -266,8 +266,8 @@ SAFE_GITLAB_DEFAULT = (
     "- bloch-linux-aarch64",
     "before_script:",
     "- unset BASH_ENV ENV PYTHONHOME PYTHONPATH CARGO_HOME RUSTUP_HOME "
-    "RUSTUP_TOOLCHAIN RUSTC "
-    "RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_RUSTC "
+    "RUSTUP_TOOLCHAIN RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTC "
+    "RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_RUSTFLAGS CARGO_BUILD_RUSTC "
     "CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
     '- export PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"',
     "- rustc --version && cargo --version",

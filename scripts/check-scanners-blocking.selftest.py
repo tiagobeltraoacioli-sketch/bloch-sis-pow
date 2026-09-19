@@ -61,7 +61,7 @@ default:
   tags:
     - bloch-linux-aarch64
   before_script:
-    - unset BASH_ENV ENV PYTHONHOME PYTHONPATH CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_RUSTC CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER
+    - unset BASH_ENV ENV PYTHONHOME PYTHONPATH CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_RUSTFLAGS CARGO_BUILD_RUSTC CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER
     - export PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
     - rustc --version && cargo --version
     - clang --version | head -1 || true
@@ -396,8 +396,16 @@ CASES = [
     Case("GitLab cannot retain compiler substitution variables",
          SAFE_GITLAB_GLOBALS.replace(
              "unset BASH_ENV ENV PYTHONHOME PYTHONPATH CARGO_HOME RUSTUP_HOME "
-             "RUSTUP_TOOLCHAIN RUSTC ",
+             "RUSTUP_TOOLCHAIN RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTC ",
              "unset BASH_ENV ENV PYTHONHOME PYTHONPATH CARGO_HOME RUSTUP_HOME RUSTC ") + GOOD_GITLAB,
+         GOOD_GITHUB, must_fail=True, expect="`default:` differs"),
+
+    Case("GitLab cannot retain inherited Rust compiler flags",
+         SAFE_GITLAB_GLOBALS.replace(
+             "RUSTUP_TOOLCHAIN RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTC",
+             "RUSTUP_TOOLCHAIN RUSTC").replace(
+             "RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_RUSTFLAGS CARGO_BUILD_RUSTC",
+             "RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_RUSTC") + GOOD_GITLAB,
          GOOD_GITHUB, must_fail=True, expect="`default:` differs"),
 
     Case("GitLab default before_script cannot disable fail-fast",
