@@ -18,15 +18,16 @@ GitLab `.gitlab-ci.yml` job `build-and-test`, to the reviewed posture:
 
   * the job EXISTS — a deleted gate must not read as a passing gate;
   * it runs `cargo test`;
-  * every LIVE crate below is named with `-p` (or the job tests the whole
-    workspace with `--workspace`, which is a superset);
+  * every LIVE crate below is named in the reviewed exact test command;
   * it has a timeout (`timeout-minutes:` / `timeout:`) — a job that can hang
     forever gates by luck, not by verdict;
   * it carries no escape hatch: `allow_failure: true`, `continue-on-error:
     true`, an `exit 0` skip, `when: manual`, or a GitHub custom/default shell
     that can replace the test script's exit status.
   * its GitLab inherited `default:`/`variables:` context remains the reviewed
-    explicit subset, with no job-local script hooks or execution variables.
+    explicit subset, exactly once, with no job-local script hooks or execution
+    variables. The `build-and-test` header and complete ordered script match
+    the reviewed whole-job contract.
   * its GitHub environment is the reviewed inert pair, required jobs use no
     containers/services/env overrides, and every action plus input is a
     reviewed immutable form.
@@ -118,6 +119,32 @@ GITHUB_TEST_GUARD_HEADER = (
     "runs-on: ubuntu-latest",
     "timeout-minutes: 10",
     "steps:",
+)
+GITLAB_BUILD_TEST_HEADER = (
+    "stage: test",
+    "script:",
+    "timeout: 120m",
+)
+GITLAB_BUILD_TEST_SCRIPT = (
+    "bash deploy/bootnodes/verify-bootnodes.selftest.sh",
+    "python3 scripts/check-live-node-retired-isolation.py --selftest",
+    "python3 scripts/check-live-node-retired-isolation.py",
+    "cargo build --workspace --all-targets",
+    "cargo test --locked -p bloch-pos-committee -p bloch-pos-node "
+    "-p bloch-crypto -p coherence-core -p bloch-sis-pow -p bloch-pq-vault "
+    "-p pqcrypto-internals -p genesis4-ceremony",
+)
+GITLAB_BUILD_TEST_BODY = (
+    "stage: test",
+    "script:",
+    "- bash deploy/bootnodes/verify-bootnodes.selftest.sh",
+    "- python3 scripts/check-live-node-retired-isolation.py --selftest",
+    "- python3 scripts/check-live-node-retired-isolation.py",
+    "- cargo build --workspace --all-targets",
+    "- cargo test --locked -p bloch-pos-committee -p bloch-pos-node "
+    "-p bloch-crypto -p coherence-core -p bloch-sis-pow -p bloch-pq-vault "
+    "-p pqcrypto-internals -p genesis4-ceremony",
+    "timeout: 120m",
 )
 
 ESCAPES = (
@@ -408,29 +435,68 @@ def normalized_yaml_lines(lines: list[str]) -> tuple[str, ...]:
 
 def check_gitlab_global_context(text: str, blocks: dict[str, list[str]]) -> list[str]:
     problems = []
-    present = {
+    protected = [
+        (match.group("key"), match.group("quote"))
+        for line in text.splitlines()
+        if (match := re.match(
+            r"^(?P<quote>['\"]?)(?P<key>default|variables|build-and-test)"
+            r"(?P=quote)\s*:", line))
+    ]
+    occurrences = [
         match.group(1)
         for line in text.splitlines()
         if (match := re.match(
             r"^(default|variables|before_script|after_script|hooks|image|services|cache):", line))
-    }
+    ]
+    present = set(occurrences)
     for key in ("before_script", "after_script", "hooks", "image", "services", "cache"):
         if key in present:
             problems.append(
                 ".gitlab-ci.yml: top-level `%s:` is outside the supported "
                 "inherited execution context" % key)
-    if "default" in present and (
+    if sum(key == "default" for key, _ in protected) != 1 or any(
+            key == "default" and quote for key, quote in protected) or (
             "default" not in blocks
             or normalized_yaml_lines(blocks["default"]) != SAFE_GITLAB_DEFAULT):
         problems.append(
-            ".gitlab-ci.yml: `default:` differs from the reviewed runner tags "
-            "and fail-fast before_script")
-    if "variables" in present and (
+            ".gitlab-ci.yml: `default:` must occur exactly once and match the "
+            "reviewed runner tags and fail-fast before_script")
+    if sum(key == "variables" for key, _ in protected) != 1 or any(
+            key == "variables" and quote for key, quote in protected) or (
             "variables" not in blocks
             or normalized_yaml_lines(blocks["variables"]) != SAFE_GITLAB_VARIABLES):
         problems.append(
-            ".gitlab-ci.yml: top-level `variables:` differs from the reviewed "
-            "non-execution-affecting subset")
+            ".gitlab-ci.yml: top-level `variables:` must occur exactly once and "
+            "match the reviewed non-execution-affecting subset")
+    if sum(key == "build-and-test" for key, _ in protected) != 1 or any(
+            key == "build-and-test" and quote for key, quote in protected):
+        problems.append(
+            ".gitlab-ci.yml: protected `build-and-test:` key must occur exactly "
+            "once in the supported plain-key form")
+    return problems
+
+
+def check_gitlab_build_contract(body: list[str]) -> list[str]:
+    """Bind build-and-test to its entire reviewed header and ordered script."""
+    direct = tuple(
+        re.sub(r"\s+#.*$", "", line.strip())
+        for line in body
+        if len(line) - len(line.lstrip(" ")) == 2
+    )
+    problems = []
+    if direct != GITLAB_BUILD_TEST_HEADER:
+        problems.append(
+            ".gitlab-ci.yml: job `build-and-test` header differs from the "
+            "reviewed stage/script/timeout contract")
+    if normalized_yaml_lines(body) != GITLAB_BUILD_TEST_BODY:
+        problems.append(
+            ".gitlab-ci.yml: job `build-and-test` YAML structure differs from "
+            "the reviewed exact whole-job contract")
+    commands = command_blocks(body, 0)
+    if tuple(command for block in commands for command in block) != GITLAB_BUILD_TEST_SCRIPT:
+        problems.append(
+            ".gitlab-ci.yml: job `build-and-test` script differs from the "
+            "reviewed exact ordered command contract")
     return problems
 
 
@@ -467,6 +533,7 @@ def check_job(path: str, job: str, indent: int, label: str) -> list[str]:
     if label == ".gitlab-ci.yml":
         problems += check_gitlab_global_context(text, job_blocks(text, 0))
         problems += check_gitlab_job_context(body, job, indent)
+        problems += check_gitlab_build_contract(body)
 
     if label == ".github/workflows/tests.yml":
         top_level = job_blocks(text, 0)

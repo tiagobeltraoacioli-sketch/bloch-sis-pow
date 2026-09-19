@@ -13,9 +13,8 @@ directions:
     job deleted, `cargo test` removed while the job stays, one live crate
     silently dropped, the timeout removed, and each escape hatch
     (allow_failure, continue-on-error, exit 0, when: manual);
-  * the honest shapes stay green — the per-crate `-p` list, a `--workspace`
-    run (a superset of the list), and a comment that merely mentions
-    `allow_failure` next to a gated job.
+  * the honest exact GitLab/GitHub contracts stay green, including a comment
+    that merely mentions `allow_failure` next to a gated job.
 
 Run: python3 scripts/check-tests-blocking.selftest.py
 Exit 0 = the guard behaves as documented on all cases.
@@ -56,13 +55,18 @@ GOOD_GITLAB = """\
 stages:
   - test
 
+""" + SAFE_GITLAB_GLOBALS + """\
+
 # a comment mentioning allow_failure: true must not fail the guard
 build-and-test:
   stage: test
   script:
+    - bash deploy/bootnodes/verify-bootnodes.selftest.sh
+    - python3 scripts/check-live-node-retired-isolation.py --selftest
+    - python3 scripts/check-live-node-retired-isolation.py
     - cargo build --workspace --all-targets
 """ + CRATE_ARGS + """\
-  timeout: 60m
+  timeout: 120m
 
 workspace-tests:
   stage: test
@@ -127,7 +131,7 @@ GOOD_GITHUB_WITH_ENV = GOOD_GITHUB.replace(
     "name: tests\n",
     "name: tests\nenv:\n  CARGO_TERM_COLOR: always\n  RUST_BACKTRACE: \"1\"\n")
 
-# --workspace covers every member crate; the guard must accept it.
+# Semantic coverage alone no longer substitutes for the reviewed exact job.
 WORKSPACE_GITLAB = GOOD_GITLAB.replace(CRATE_ARGS, "    - cargo test --workspace\n")
 
 
@@ -243,17 +247,17 @@ CASES = [
              "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262"),
          must_fail=True, expect="cross-step environment/PATH channel"),
     Case("reviewed GitLab inherited test context stays green",
-         SAFE_GITLAB_GLOBALS + GOOD_GITLAB, GOOD_GITHUB, must_fail=False),
+         GOOD_GITLAB, GOOD_GITHUB, must_fail=False),
     Case("GitLab default cannot disable test fail-fast",
-         SAFE_GITLAB_GLOBALS.replace(
+         GOOD_GITLAB.replace(
              "    - cmake --version | head -1 || true",
-             "    - cmake --version | head -1 || true\n    - set +e") + GOOD_GITLAB,
-         GOOD_GITHUB, must_fail=True, expect="`default:` differs"),
+             "    - cmake --version | head -1 || true\n    - set +e"),
+         GOOD_GITHUB, must_fail=True, expect="`default:` must occur exactly once"),
     Case("GitLab global test variables cannot inject BASH_ENV",
-         SAFE_GITLAB_GLOBALS.replace(
+         GOOD_GITLAB.replace(
              '  RUST_BACKTRACE: "1"',
-             '  RUST_BACKTRACE: "1"\n  BASH_ENV: scripts/mask-tests.sh') + GOOD_GITLAB,
-         GOOD_GITHUB, must_fail=True, expect="top-level `variables:` differs"),
+             '  RUST_BACKTRACE: "1"\n  BASH_ENV: scripts/mask-tests.sh'),
+         GOOD_GITHUB, must_fail=True, expect="top-level `variables:` must occur exactly once"),
     Case("GitLab test job cannot inject execution variables",
          GOOD_GITLAB.replace(
              "build-and-test:\n  stage: test",
@@ -273,8 +277,8 @@ CASES = [
     Case("disabled shell failures are refused", GOOD_GITLAB.replace(CRATE_ARGS, "    - set +e\n" + CRATE_ARGS), GOOD_GITHUB, must_fail=True),
     Case("background test cannot gate", GOOD_GITLAB.replace(CRATE_ARGS, CRATE_ARGS.rstrip() + " &\n"), GOOD_GITHUB, must_fail=True),
     Case("equals workspace exclusion is refused", WORKSPACE_GITLAB.replace("cargo test --workspace", "cargo test --workspace --exclude=bloch-pos-node"), GOOD_GITHUB, must_fail=True),
-    Case("literal false does not waive failures", GOOD_GITLAB.replace("  timeout: 60m", "  allow_failure: false\n  timeout: 60m", 1), GOOD_GITHUB, must_fail=False),
-    Case("alternate YAML true still waives failures", GOOD_GITLAB.replace("  timeout: 60m", "  allow_failure: YES\n  timeout: 60m", 1), GOOD_GITHUB, must_fail=True),
+    Case("even literal false is outside the exact GitLab header", GOOD_GITLAB.replace("  timeout: 120m", "  allow_failure: false\n  timeout: 120m", 1), GOOD_GITHUB, must_fail=True, expect="header differs"),
+    Case("alternate YAML true still waives failures", GOOD_GITLAB.replace("  timeout: 120m", "  allow_failure: YES\n  timeout: 120m", 1), GOOD_GITHUB, must_fail=True),
     Case("workspace exclusion is not full coverage", WORKSPACE_GITLAB.replace("cargo test --workspace", "cargo test --workspace --exclude bloch-pos-node"), GOOD_GITHUB, must_fail=True),
     Case("build mentions cannot supply missing test crates",
          GOOD_GITLAB.replace(CRATE_ARGS, "    - cargo build " + " ".join("-p " + c for c in ("bloch-pos-committee", "bloch-pos-node", "bloch-crypto", "coherence-core", "bloch-sis-pow", "bloch-pq-vault", "pqcrypto-internals", "genesis4-ceremony")) + "\n    - cargo test -p bloch-pos-node\n"),
@@ -288,8 +292,8 @@ CASES = [
 
     Case("honest pipelines stay green", GOOD_GITLAB, GOOD_GITHUB, must_fail=False),
 
-    Case("--workspace is accepted as a superset of the crate list",
-         WORKSPACE_GITLAB, GOOD_GITHUB, must_fail=False),
+    Case("workspace superset cannot replace the reviewed GitLab script",
+         WORKSPACE_GITLAB, GOOD_GITHUB, must_fail=True, expect="exact ordered command contract"),
 
     Case("github tests workflow deleted outright",
          GOOD_GITLAB, None, must_fail=True, expect="MISSING"),
@@ -412,6 +416,66 @@ CASES = [
          sub(GOOD_GITLAB, "build-and-test:", "build-and-test-disabled:"),
          GOOD_GITHUB, must_fail=True, expect="`build-and-test` is MISSING"),
 
+    Case("gitlab build-and-test cannot insert a command",
+         GOOD_GITLAB.replace(
+             "    - cargo build --workspace --all-targets\n",
+             "    - echo replacing toolchain\n"
+             "    - cargo build --workspace --all-targets\n"),
+         GOOD_GITHUB, must_fail=True, expect="exact whole-job contract"),
+
+    Case("gitlab build-and-test cannot remove setup selftest",
+         GOOD_GITLAB.replace(
+             "    - bash deploy/bootnodes/verify-bootnodes.selftest.sh\n", ""),
+         GOOD_GITHUB, must_fail=True, expect="exact ordered command contract"),
+
+    Case("gitlab build-and-test commands cannot be reordered",
+         GOOD_GITLAB.replace(
+             "    - python3 scripts/check-live-node-retired-isolation.py --selftest\n"
+             "    - python3 scripts/check-live-node-retired-isolation.py\n",
+             "    - python3 scripts/check-live-node-retired-isolation.py\n"
+             "    - python3 scripts/check-live-node-retired-isolation.py --selftest\n"),
+         GOOD_GITHUB, must_fail=True, expect="exact ordered command contract"),
+
+    Case("gitlab duplicate script key is ambiguous",
+         GOOD_GITLAB.replace(
+             "  timeout: 120m\n",
+             "  script:\n    - cargo test --workspace\n  timeout: 120m\n", 1),
+         GOOD_GITHUB, must_fail=True, expect="exact whole-job contract"),
+
+    Case("gitlab quoted duplicate job key cannot override reviewed job",
+         GOOD_GITLAB + "\n'build-and-test':\n  stage: test\n  script:\n    - true\n",
+         GOOD_GITHUB, must_fail=True,
+         expect="protected `build-and-test:` key must occur exactly once"),
+
+    Case("gitlab block scalar cannot disguise a reviewed command",
+         GOOD_GITLAB.replace(
+             "    - cargo build --workspace --all-targets\n",
+             "    - |\n      cargo build --workspace --all-targets\n"),
+         GOOD_GITHUB, must_fail=True, expect="exact whole-job contract"),
+
+    Case("gitlab aliased build-and-test job is outside local proof",
+         GOOD_GITLAB.replace(
+             "build-and-test:\n  stage: test\n",
+             "build-and-test: *reviewed-test-job\n"),
+         GOOD_GITHUB, must_fail=True, expect="`build-and-test` is MISSING"),
+
+    Case("gitlab inherited variables cannot be duplicated",
+         "variables:\n  CARGO_TERM_COLOR: always\n" + GOOD_GITLAB,
+         GOOD_GITHUB, must_fail=True,
+         expect="top-level `variables:` must occur exactly once"),
+
+    Case("gitlab inherited default cannot be removed",
+         GOOD_GITLAB.replace(
+             "default:\n"
+             "  tags:\n    - bloch-linux-aarch64\n"
+             "  before_script:\n"
+             "    - export PATH=\"$HOME/.cargo/bin:$PATH\"\n"
+             "    - rustc --version && cargo --version\n"
+             "    - clang --version | head -1 || true\n"
+             "    - cmake --version | head -1 || true\n\n", ""),
+         GOOD_GITHUB, must_fail=True,
+         expect="`default:` must occur exactly once"),
+
     Case("gitlab allow_failure on build-and-test",
          sub(GOOD_GITLAB, "build-and-test:\n  stage: test",
              "build-and-test:\n  stage: test\n  allow_failure: true"),
@@ -432,8 +496,8 @@ CASES = [
          GOOD_GITHUB, must_fail=True, expect="bloch-pq-vault"),
 
     Case("gitlab timeout removed",
-         sub(GOOD_GITLAB, CRATE_ARGS + "  timeout: 60m\n", CRATE_ARGS),
-         GOOD_GITHUB, must_fail=True, expect="no timeout"),
+         sub(GOOD_GITLAB, CRATE_ARGS + "  timeout: 120m\n", CRATE_ARGS),
+         GOOD_GITHUB, must_fail=True, expect="header differs"),
 
     Case("both files missing entirely fails closed", None, None,
          must_fail=True, expect="MISSING"),
