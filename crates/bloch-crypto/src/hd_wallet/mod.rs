@@ -23,7 +23,7 @@ use crate::core::TESTNET_PREFIX;
 use serde::{Serialize, Deserialize};
 use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
-use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, KeyInit}};
+use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, AeadInPlace, KeyInit}};
 use argon2::{Argon2, Algorithm, Version, Params};
 use base64::{Engine as _, engine::general_purpose as b64};
 use rand::RngCore;
@@ -1003,7 +1003,22 @@ fn encrypt_with_key(key: &[u8], plaintext: &[u8]) -> Result<KeystoreCrypto, Stri
 fn decrypt_with_key(key: &[u8], crypto: &KeystoreCrypto) -> Result<Vec<u8>, String> {
     if key.len() != 32 { return Err("AES-256 key must contain 32 bytes".into()); }
     let nonce_b = b64::STANDARD.decode(&crypto.nonce).map_err(|e| e.to_string())?;
-    let ct = b64::STANDARD.decode(&crypto.ciphertext).map_err(|e| e.to_string())?;
+    // Decrypt the decoded ciphertext in place. Besides avoiding a second
+    // plaintext allocation/copy for every wallet secret, `Zeroizing` clears
+    // the decoded buffer if authentication or validation fails.
+    let mut plaintext = Zeroizing::new(
+        b64::STANDARD.decode(&crypto.ciphertext).map_err(|e| e.to_string())?,
+    );
+    decrypt_ciphertext_in_place(key, &nonce_b, &mut plaintext)?;
+    Ok(std::mem::take(&mut *plaintext))
+}
+
+fn decrypt_ciphertext_in_place(
+    key: &[u8],
+    nonce_b: &[u8],
+    ciphertext: &mut Vec<u8>,
+) -> Result<(), String> {
+    if key.len() != 32 { return Err("AES-256 key must contain 32 bytes".into()); }
     // SECURITY (A4 lows): `Nonce::from_slice` PANICS on any length other than
     // 12 bytes. `nonce_b` comes from an untrusted wallet file — guard the
     // length BEFORE it reaches the fixed-size AES-GCM nonce so a truncated or
@@ -1016,14 +1031,14 @@ fn decrypt_with_key(key: &[u8], crypto: &KeystoreCrypto) -> Result<Vec<u8>, Stri
             NONCE_LEN, nonce_b.len()
         ));
     }
-    if ct.len() < GCM_TAG_LEN {
+    if ciphertext.len() < GCM_TAG_LEN {
         return Err(format!(
             "wallet-file ciphertext too short: {} bytes, need at least the {}-byte GCM tag",
-            ct.len(), GCM_TAG_LEN
+            ciphertext.len(), GCM_TAG_LEN
         ));
     }
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    cipher.decrypt(Nonce::from_slice(&nonce_b), ct.as_ref())
+    cipher.decrypt_in_place(Nonce::from_slice(nonce_b), b"", ciphertext)
         .map_err(|_| "decrypt failed — wrong credentials".to_string())
 }
 
@@ -1351,6 +1366,52 @@ mod audit_wallet_boundaries {
         for index in [0,1] {
             assert!(keypair_at_with_convention(&[1;31], index, DisclosureKeyConvention::HdWalletV3).is_err());
         }
+    }
+
+    #[test]
+    fn wallet_secret_decryption_reuses_the_ciphertext_allocation_at_tag_boundary() {
+        let key = [0x81; 32];
+        for plaintext in [b"".as_slice(), b"wallet secret payload".as_slice()] {
+            let encrypted = encrypt_with_key(&key, plaintext).unwrap();
+            let nonce = b64::STANDARD.decode(&encrypted.nonce).unwrap();
+            let mut buffer = b64::STANDARD.decode(&encrypted.ciphertext).unwrap();
+            let allocation = buffer.as_ptr();
+            let encrypted_len = buffer.len();
+
+            decrypt_ciphertext_in_place(&key, &nonce, &mut buffer).unwrap();
+
+            assert_eq!(
+                buffer.as_ptr(), allocation,
+                "in-place decryption must reuse the decoded allocation"
+            );
+            assert_eq!(buffer, plaintext);
+            assert_eq!(encrypted_len, plaintext.len() + 16);
+        }
+
+        // A valid encryption of empty plaintext is exactly the 16-byte GCM
+        // tag and is accepted; one byte below that boundary is rejected before
+        // the AEAD implementation sees it.
+        let mut below_tag = vec![0u8; 15];
+        assert_eq!(
+            decrypt_ciphertext_in_place(&key, &[0u8; 12], &mut below_tag).unwrap_err(),
+            "wallet-file ciphertext too short: 15 bytes, need at least the 16-byte GCM tag"
+        );
+
+        // On authentication failure the production caller's local remains a
+        // Zeroizing<Vec<u8>> until `?` returns and its Drop wipes the buffer.
+        let encrypted = encrypt_with_key(&key, b"authenticated secret").unwrap();
+        let nonce = b64::STANDARD.decode(&encrypted.nonce).unwrap();
+        let mut tampered = Zeroizing::new(
+            b64::STANDARD.decode(&encrypted.ciphertext).unwrap(),
+        );
+        tampered[0] ^= 1;
+        let allocation = tampered.as_ptr();
+        assert_eq!(
+            decrypt_ciphertext_in_place(&key, &nonce, &mut tampered).unwrap_err(),
+            "decrypt failed — wrong credentials"
+        );
+        assert_eq!(tampered.as_ptr(), allocation);
+        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
     }
 
     #[test]
