@@ -804,6 +804,10 @@ pub fn inspect_log(dir: &Path) -> io::Result<LogInspection> {
     let mut log = File::open(dir.join("blocks.log"))?;
     let length = log.metadata()?.len();
     let mut report = LogInspection { log_bytes: length, decoded_frames: 0, valid_prefix_bytes: 0, issue: None };
+    // Inspection discards each owned decoded envelope, so its raw frame can
+    // reuse the same logical-high-water scratch for the next record. The
+    // existing frame cap remains the input bound; allocator capacity is not.
+    let mut payload = Vec::new();
     while report.valid_prefix_bytes < length {
         let remaining = length.saturating_sub(report.valid_prefix_bytes);
         if remaining < 4 {
@@ -821,8 +825,7 @@ pub fn inspect_log(dir: &Path) -> io::Result<LogInspection> {
             report.issue = Some("incomplete frame body; may be a torn append or corrupted length, not permission to truncate".into());
             break;
         }
-        let mut payload = vec![0; size];
-        log.read_exact(&mut payload)?;
+        read_frame_payload(&mut log, &mut payload, size)?;
         if let Err(error) = crate::codec::decode_envelope(&payload) {
             report.issue = Some(format!("invalid envelope: {error}; preserve the original log and restore from a verified backup"));
             break;
@@ -2166,6 +2169,60 @@ mod tests {
             assert!(!dir.join("LOCK").exists());
             assert!(!dir.join("blocks.idx").exists());
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn inspection_scratch_preserves_mixed_prefix_and_first_corruption() {
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-store-inspection-scratch-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("blocks.log");
+
+        let empty = sample_envelope(301);
+        let mut large = sample_envelope(302);
+        large.body.transactions = vec![vec![0xA5; 1 << 20]];
+        let mut small = sample_envelope(303);
+        small.proposer_sig.extend_from_slice(&[0x5C; 29]);
+        let mut valid = Vec::new();
+        for envelope in [&empty, &large, &small] {
+            let payload = crate::codec::encode_envelope(envelope);
+            valid.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            valid.extend_from_slice(&payload);
+        }
+        fs::write(&path, &valid).unwrap();
+        assert_eq!(
+            inspect_log(&dir).unwrap(),
+            LogInspection {
+                log_bytes: valid.len() as u64,
+                decoded_frames: 3,
+                valid_prefix_bytes: valid.len() as u64,
+                issue: None,
+            }
+        );
+
+        let mut corrupt = valid.clone();
+        corrupt.extend_from_slice(&1u32.to_le_bytes());
+        corrupt.push(0xFF);
+        fs::write(&path, &corrupt).unwrap();
+        assert_eq!(
+            inspect_log(&dir).unwrap(),
+            LogInspection {
+                log_bytes: corrupt.len() as u64,
+                decoded_frames: 3,
+                valid_prefix_bytes: valid.len() as u64,
+                issue: Some(
+                    "invalid envelope: decode error: truncated; preserve the original log and restore from a verified backup"
+                        .into(),
+                ),
+            },
+            "inspection must stop at the same first undecodable frame",
+        );
+        assert_eq!(fs::read(&path).unwrap(), corrupt, "inspection mutated the log");
+
         fs::remove_dir_all(dir).unwrap();
     }
 
