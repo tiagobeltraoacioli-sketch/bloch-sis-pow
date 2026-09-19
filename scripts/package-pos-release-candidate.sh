@@ -109,7 +109,14 @@ stage="$work/stage"
 mkdir -p "$stage"
 cp "$binary" "$stage/bloch-pos"
 chmod 0755 "$stage/bloch-pos"
-binary_sha="$(sha256_file "$stage/bloch-pos")"
+binary_sha="$(sha256_file "$stage/bloch-pos")" \
+  || fail "SHA-256 tool failed for the packaged binary"
+case "$binary_sha" in
+  ''|*[!0123456789abcdef]*)
+    fail "SHA-256 tool returned a non-lowercase hexadecimal digest" ;;
+esac
+[ "${#binary_sha}" = 64 ] \
+  || fail "SHA-256 tool returned a digest that is not exactly 64 characters"
 printf '%s  bloch-pos\n' "$binary_sha" > "$stage/SHA256SUMS"
 {
   printf 'artifact_kind=unsigned-release-candidate\n'

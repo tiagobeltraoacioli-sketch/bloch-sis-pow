@@ -33,6 +33,13 @@ git -C "$test_repo" add .
 git -C "$test_repo" commit -qm baseline
 baseline_commit="$(git -C "$test_repo" rev-parse HEAD)"
 real_git="$(command -v git)"
+if command -v sha256sum >/dev/null 2>&1; then
+  real_sha_tool="$(command -v sha256sum)"
+  real_sha_kind=sha256sum
+else
+  real_sha_tool="$(command -v shasum)"
+  real_sha_kind=shasum
+fi
 
 cat > "$fake_bin/git" <<'EOF'
 #!/usr/bin/env bash
@@ -93,6 +100,37 @@ esac
 EOF
 chmod 0755 "$fake_bin/rustc"
 
+cat > "$fake_bin/sha256sum" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${FAKE_SHA_MODE:-canonical}" in
+  canonical)
+    if [ "$REAL_SHA_KIND" = sha256sum ]; then
+      exec "$REAL_SHA_TOOL" "$@"
+    else
+      exec "$REAL_SHA_TOOL" -a 256 "$@"
+    fi
+    ;;
+  exit) exit 71 ;;
+  short) printf 'abc  %s\n' "${1:-binary}" ;;
+  nonhex)
+    printf 'gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg  %s\n' \
+      "${1:-binary}"
+    ;;
+  uppercase)
+    printf 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  %s\n' \
+      "${1:-binary}"
+    ;;
+  duplicate)
+    printf '0000000000000000000000000000000000000000000000000000000000000000  %s\n' \
+      "${1:-binary}"
+    printf '1111111111111111111111111111111111111111111111111111111111111111  %s\n' \
+      "${1:-binary}"
+    ;;
+esac
+EOF
+chmod 0755 "$fake_bin/sha256sum"
+
 cat > "$fake_bin/cargo" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -146,11 +184,28 @@ chmod 0755 "$fake_bin/cargo"
 run_package() {
   local version_mode="${2:-canonical}"
   local rustc_mode="${3:-canonical}"
+  local sha_mode="${4:-canonical}"
   ( cd "$test_repo" && PATH="$fake_bin:$PATH" REAL_GIT="$real_git" \
+      REAL_SHA_TOOL="$real_sha_tool" REAL_SHA_KIND="$real_sha_kind" \
       FAKE_VERSION_MODE="$version_mode" \
       FAKE_RUSTC_MODE="$rustc_mode" \
+      FAKE_SHA_MODE="$sha_mode" \
       TEST_REPO="$test_repo" "$test_repo/scripts/package-pos-release-candidate.sh" \
       "$1" )
+}
+
+expect_sha_failure() {
+  local mode="$1" expected="$2"
+  local output="$work/sha-$mode" log="$work/sha-$mode.log"
+  if run_package "$output" canonical canonical "$mode" > "$log" 2>&1; then
+    echo "selftest: noncanonical SHA-256 mode $mode was accepted" >&2
+    exit 1
+  fi
+  grep -Fq "$expected" "$log" || {
+    echo "selftest: SHA-256 mode $mode failed without expected diagnostic" >&2
+    cat "$log" >&2
+    exit 1
+  }
 }
 
 expect_version_failure() {
@@ -228,5 +283,16 @@ expect_target_failure duplicate \
   'rustc -vV must report exactly one host target'
 expect_target_failure malformed \
   'rustc host target must be a lowercase ASCII Rust triple'
+
+expect_sha_failure exit \
+  'SHA-256 tool failed for the packaged binary'
+expect_sha_failure short \
+  'SHA-256 tool returned a digest that is not exactly 64 characters'
+expect_sha_failure nonhex \
+  'SHA-256 tool returned a non-lowercase hexadecimal digest'
+expect_sha_failure uppercase \
+  'SHA-256 tool returned a non-lowercase hexadecimal digest'
+expect_sha_failure duplicate \
+  'SHA-256 tool returned a non-lowercase hexadecimal digest'
 
 echo "package-pos-release-candidate selftest: PASS"
