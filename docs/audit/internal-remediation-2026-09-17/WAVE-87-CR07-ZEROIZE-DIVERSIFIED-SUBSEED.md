@@ -54,14 +54,26 @@ cargo check --manifest-path pool/Cargo.toml \
 # passed
 
 cargo test -p bloch-crypto --offline
-# 216 passed; 0 failed; 4 ignored
+# sandbox library run: 207 passed; 3 socket-only EPERM; 2 ignored
+
+cargo test -p bloch-crypto wallet::http_rpc::tests \
+  --offline -- --nocapture
+# outside sandbox: 5 passed; 0 failed; 207 filtered out
+
+cargo test -p bloch-crypto --test acvp_mldsa --offline
+cargo test -p bloch-crypto --test falcon_submission --offline
+cargo test -p bloch-crypto --test tx_under_dual_and --offline
+# integration: 3 + 2 + 1 = 6 passed; 0 failed
+
+cargo test -p bloch-crypto --doc --offline
+# documentation: 2 ignored; 0 failed
 ```
 
-The first sandboxed crate-wide run reached the tests but three loopback-socket
-regressions were refused by the macOS sandbox (`Operation not permitted`). The
-same command was rerun with local socket permission and passed with the counts
-above; this was an execution-environment refusal, not a test failure in the
-change.
+Together these runs cover the complete suite: 210 library tests passed with 2
+ignored, 6 integration tests passed, and 2 documentation tests were ignored;
+216 passed, 4 ignored and no code failure. The three failures in the initial
+library run were solely `EPERM` when its HTTP regressions attempted to bind
+loopback sockets inside the sandbox; all five HTTP tests passed outside it.
 
 The crate-wide formatting check remains inapplicable to a focused patch
 because the existing crate has extensive unrelated rustfmt drift. Targeted
