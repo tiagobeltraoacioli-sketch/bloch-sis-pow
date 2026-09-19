@@ -23,6 +23,9 @@ use bloch_pos_committee::header::{BlockHeaderV4, Body, VERSION_G4};
 use bloch_pos_committee::state_root::{EutxoEntry, EvmCommitment};
 use bloch_pos_committee::transition::GenesisValidator;
 
+#[path = "../../build_source_digest.rs"]
+mod build_source_digest_tests;
+
 // ─── Fixtures ───────────────────────────────────────────────────────────────
 
 fn entry(txid: u8, vout: u32, value: u64, script: u8) -> EutxoEntry {

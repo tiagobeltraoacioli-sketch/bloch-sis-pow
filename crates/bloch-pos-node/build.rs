@@ -71,12 +71,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod build_command;
+mod build_source_digest;
 use build_command::{
     command_from_env, delegated_compiler, linker_from_printed_args, rustflags_linker,
 };
-
-/// Extensions that are build inputs for this binary.
-const SOURCE_EXT: &[&str] = &["rs", "toml", "c", "h", "S", "s", "macros"];
+use build_source_digest::source_digest;
 
 /// Walk from the crate directory to the workspace root: the first ancestor
 /// holding both `Cargo.lock` and a `crates/` directory. Returns `None` when
@@ -92,77 +91,6 @@ fn workspace_root() -> Option<PathBuf> {
         }
         dir = dir.parent()?;
     }
-}
-
-/// Collect the hashed set, workspace-relative, sorted, deduplicated.
-fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let path = e.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        // Build outputs and VCS metadata are not source. `target/` in
-        // particular is enormous and changes on every build, which would make
-        // the digest a random number.
-        if name == ".git" || name == "target" {
-            continue;
-        }
-        let Ok(ft) = e.file_type() else { continue };
-        if ft.is_dir() {
-            collect(root, &path, out);
-        } else if ft.is_file() {
-            let ext = path.extension().and_then(|x| x.to_str()).unwrap_or("");
-            if SOURCE_EXT.contains(&ext) {
-                if let Ok(rel) = path.strip_prefix(root) {
-                    let rel = rel.to_string_lossy().replace('\\', "/");
-                    out.push((rel, path));
-                }
-            }
-        }
-    }
-}
-
-/// Hash the tree. Returns `(hex digest, file count, total bytes)`.
-fn source_digest(root: &Path) -> Option<(String, usize, u64)> {
-    let mut files = Vec::new();
-    collect(root, &root.join("crates"), &mut files);
-    for extra in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
-        let p = root.join(extra);
-        if p.is_file() {
-            files.push((extra.to_string(), p));
-        }
-    }
-    if files.is_empty() {
-        return None;
-    }
-    files.sort();
-    files.dedup();
-
-    let mut h = Sha3_256::new();
-    // Domain separator: this digest is not a block hash and must never be
-    // confused for one if it turns up in a log.
-    h.update(b"bloch-pos/source-digest/v1\0");
-    let mut bytes_total: u64 = 0;
-    for (rel, path) in &files {
-        let body = std::fs::read(path).ok()?;
-        // `bytes_total` is a build-time diagnostic counter (printed into the
-        // source-digest stamp), not a value that feeds consensus or a state
-        // root: saturation is the intended semantics for a total this size
-        // could never realistically reach (it would require exabytes of
-        // source under `crates/`).
-        bytes_total = bytes_total.saturating_add(body.len() as u64);
-        h.update(rel.as_bytes());
-        h.update([0u8]);
-        h.update((body.len() as u64).to_le_bytes());
-        h.update(&body);
-        // A stamp that goes stale in an incremental build is worse than no
-        // stamp: it is a confident lie. Every hashed file is watched.
-        println!("cargo:rerun-if-changed={}", path.display());
-    }
-    Some((hex(&h.finalize()), files.len(), bytes_total))
 }
 
 fn hex(b: &[u8]) -> String {
