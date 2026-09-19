@@ -150,7 +150,9 @@ pub fn main() {
 
             let pw = prompt_new_password();
             println!();
-            match kp.save_encrypted(&output, &pw) {
+            let saved = kp.save_encrypted(&output, &pw);
+            drop(pw);
+            match saved {
                 Ok(()) => {
                     ok(&format!("Keystore saved: {}", amber(&output.display().to_string())));
                     println!();
@@ -486,11 +488,22 @@ fn prompt_password(prompt: &str) -> zeroize::Zeroizing<String> {
     own_prompt_secret(rpassword::prompt_password(prompt).unwrap_or_default())
 }
 
-fn prompt_new_password() -> String {
+fn confirmed_prompt_secret(
+    password: zeroize::Zeroizing<String>,
+    confirmation: zeroize::Zeroizing<String>,
+) -> Option<zeroize::Zeroizing<String>> {
+    if password.as_str() == confirmation.as_str() {
+        Some(password)
+    } else {
+        None
+    }
+}
+
+fn prompt_new_password() -> zeroize::Zeroizing<String> {
     loop {
-        let pw  = rpassword::prompt_password(
+        let pw = own_prompt_secret(rpassword::prompt_password(
             &format!("  {}new password:{} ", MUTED, RESET)
-        ).unwrap_or_default();
+        ).unwrap_or_default());
         if let Err(e) = crate::wallet::validate_password(&pw) {
             println!("  {} {}", red("✗"), muted(&format!("weak password: {}", e)));
             continue;
@@ -502,10 +515,12 @@ fn prompt_new_password() -> String {
             println!("  {} {}", red("✗"), muted(&format!("weak password: {}", e)));
             continue;
         }
-        let pw2 = rpassword::prompt_password(
+        let pw2 = own_prompt_secret(rpassword::prompt_password(
             &format!("  {}confirm:     {} ", MUTED, RESET)
-        ).unwrap_or_default();
-        if pw == pw2 { return pw; }
+        ).unwrap_or_default());
+        if let Some(confirmed) = confirmed_prompt_secret(pw, pw2) {
+            return confirmed;
+        }
         println!("  {} {}", red("✗"), muted("passwords do not match"));
     }
 }
@@ -560,6 +575,23 @@ mod audit_cli_input_tests {
         assert_eq!(secret.as_str(), "abandon abandon secret");
         secret.zeroize();
         assert!(secret.is_empty());
+    }
+
+    #[test]
+    fn new_password_confirmation_preserves_only_an_exact_zeroizing_owner() {
+        let password = own_prompt_secret(String::from("correct-horse-battery-9!"));
+        let confirmation = own_prompt_secret(String::from("correct-horse-battery-9!"));
+        let mut confirmed = confirmed_prompt_secret(password, confirmation).unwrap();
+        assert!(std::mem::needs_drop::<zeroize::Zeroizing<String>>());
+        assert_eq!(confirmed.as_str(), "correct-horse-battery-9!");
+
+        assert!(confirmed_prompt_secret(
+            own_prompt_secret(String::from("correct-horse-battery-9!")),
+            own_prompt_secret(String::from("wrong-confirmation")),
+        ).is_none());
+
+        confirmed.zeroize();
+        assert!(confirmed.is_empty());
     }
 
     #[test]
