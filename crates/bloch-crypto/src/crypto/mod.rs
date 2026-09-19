@@ -539,8 +539,11 @@ pub fn diversified_keypair(master_seed: &[u8], index: u32)
 pub fn diversified_address(master_seed: &[u8], index: u32, testnet: bool)
     -> Result<String, CryptoError>
 {
-    let (pk, _) = diversified_keypair(master_seed, index)?;
-    Ok(address_from_pubkey(&pk, testnet))
+    let (pk, secret) = diversified_keypair(master_seed, index)?;
+    let secret = zeroize::Zeroizing::new(secret);
+    let address = address_from_pubkey(&pk, testnet);
+    drop(secret);
+    Ok(address)
 }
 
 /// Format a 20-byte pubkey hash into a bloch1q/bloch1t address with 4-byte checksum.
@@ -603,6 +606,28 @@ mod tests {
         assert!(a0.starts_with("bloch1t"));
         // A different master seed gives a different address at the same index.
         assert_ne!(a0, diversified_address(&[8u8; 64], 0, true).unwrap());
+    }
+    #[test]
+    fn diversified_address_matches_public_half_and_owns_discarded_secret() {
+        let seed = [0x39u8; 64];
+        assert!(std::mem::needs_drop::<zeroize::Zeroizing<Vec<u8>>>());
+
+        for (index, testnet) in [
+            (0, false),
+            (0, true),
+            (0x1020_3040, false),
+            (u32::MAX, true),
+        ] {
+            let (pk, secret) = diversified_keypair(&seed, index).unwrap();
+            let secret = zeroize::Zeroizing::new(secret);
+            let expected = address_from_pubkey(&pk, testnet);
+
+            assert_eq!(
+                diversified_address(&seed, index, testnet).unwrap(),
+                expected,
+            );
+            drop(secret);
+        }
     }
     #[test]
     fn diversified_keypair_owns_exact_subseed_under_zeroizing_drop() {

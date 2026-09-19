@@ -134,21 +134,29 @@ pub enum NetEvent {
 /// identity derived from the same borrowed envelope. Fields stay private so
 /// the libp2p suppression hint cannot be paired with unrelated wire bytes.
 pub(crate) struct PreparedBlockBroadcast {
-    frame: Vec<u8>,
+    payload: Vec<u8>,
     id: [u8; 32],
 }
 
 impl PreparedBlockBroadcast {
     fn new(env: &BlockEnvelope) -> Self {
         Self {
-            frame: block_frame(env),
+            payload: crate::codec::encode_envelope(env),
             id: *env.block_id().as_bytes(),
         }
     }
 
-    pub(crate) fn frame(&self) -> &[u8] { &self.frame }
+    fn devnet_frame(&self) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(1usize.saturating_add(self.payload.len()));
+        frame.push(FRAME_BLOCK);
+        frame.extend_from_slice(&self.payload);
+        frame
+    }
+
+    #[cfg(test)]
+    fn payload(&self) -> &[u8] { &self.payload }
     pub(crate) fn id(&self) -> [u8; 32] { self.id }
-    pub(crate) fn into_frame(self) -> Vec<u8> { self.frame }
+    pub(crate) fn into_payload(self) -> Vec<u8> { self.payload }
 }
 
 /// The transport the engine holds, chosen at startup.
@@ -167,14 +175,15 @@ pub enum Net {
 impl Net {
     /// Publish a locally-produced block without cloning its retained envelope
     /// or making libp2p decode the just-encoded body solely for suppression.
-    /// The private prepared value binds the frame and id to one envelope.
+    /// The private prepared value binds the canonical payload and id to one
+    /// envelope and lets libp2p take ownership without recopying that payload.
     pub(crate) fn broadcast_block(&self, env: &BlockEnvelope) {
-        let prepared = PreparedBlockBroadcast::new(env);
         match self {
-            Net::Devnet(m) => m.broadcast(prepared.into_frame()),
-            Net::Libp2p(h) => h.broadcast_block(prepared),
+            Net::Devnet(m) => m.broadcast(block_frame(env)),
+            Net::Libp2p(h) => h.broadcast_block(PreparedBlockBroadcast::new(env)),
             Net::Both(m, h) => {
-                m.broadcast(prepared.frame().to_vec());
+                let prepared = PreparedBlockBroadcast::new(env);
+                m.broadcast(prepared.devnet_frame());
                 h.broadcast_block(prepared);
             }
         }
@@ -1688,8 +1697,9 @@ mod tests {
 
         let prepared = PreparedBlockBroadcast::new(&env);
         assert_eq!(prepared.id(), expected_id);
-        assert_eq!(prepared.frame(), expected_frame.as_slice());
-        assert_eq!(prepared.into_frame(), expected_frame);
+        assert_eq!(prepared.payload(), payload.as_slice());
+        assert_eq!(prepared.devnet_frame(), expected_frame);
+        assert_eq!(prepared.into_payload(), payload);
     }
 
     #[test]

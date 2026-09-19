@@ -1481,10 +1481,14 @@ fn handle_command(swarm: &mut Swarm, st: &mut Loop, cmd: Command) {
                     .report_message_validation_result(&msg_id, &source, verdict.into());
             }
         }
-        Command::Broadcast(frame) => handle_broadcast(swarm, st, frame, None),
+        Command::Broadcast(frame) => handle_broadcast(swarm, st, frame),
         Command::BroadcastBlock(prepared) => {
             let id = prepared.id();
-            handle_broadcast(swarm, st, prepared.into_frame(), Some(id));
+            if let Some(payload) =
+                prepared_block_payload_if_fresh(st, prepared.into_payload(), id)
+            {
+                publish(swarm, st.topics.blocks.clone(), payload, "blocks");
+            }
         }
     }
 }
@@ -1493,7 +1497,6 @@ fn handle_broadcast(
     swarm: &mut Swarm,
     st: &mut Loop,
     frame: Vec<u8>,
-    prepared_block_id: Option<[u8; 32]>,
 ) {
     let Some((&tag, payload)) = frame.split_first() else { return };
     match tag {
@@ -1503,7 +1506,7 @@ fn handle_broadcast(
             // never suppressed; a block that arrived on the mesh in the
             // last TTL would be refused by gossipsub's duplicate cache
             // anyway, after paying the hash of the whole body.
-            if !outbound_block_is_fresh(st, payload, prepared_block_id) {
+            if !outbound_block_is_fresh(st, payload, None) {
                 return;
             }
             publish(swarm, st.topics.blocks.clone(), payload.to_vec(), "blocks");
@@ -1527,6 +1530,17 @@ fn handle_broadcast(
         }
         _ => {}
     }
+}
+
+/// Consume the canonical payload carried by the private typed command. A
+/// fresh block returns the same allocation for direct handoff to gossipsub;
+/// suppression drops it without exposing a raw frame/id pairing API.
+fn prepared_block_payload_if_fresh(
+    st: &mut Loop,
+    payload: Vec<u8>,
+    id: [u8; 32],
+) -> Option<Vec<u8>> {
+    outbound_block_is_fresh(st, &payload, Some(id)).then_some(payload)
 }
 
 /// Apply outbound block suppression. Local production supplies the id already
@@ -2754,6 +2768,26 @@ mod tests {
         assert!(outbound_block_is_fresh(&mut state, &[0xFF], None));
         assert_eq!(state.recent_blocks.len(), remembered,
             "a malformed generic frame remains publishable without inventing a suppression id");
+    }
+
+    #[test]
+    fn prepared_block_payload_moves_same_allocation_and_suppresses_duplicate() {
+        let mut state = test_loop();
+        let env = envelope(73);
+        let id = *env.block_id().as_bytes();
+        let payload = crate::codec::encode_envelope(&env);
+        let original_ptr = payload.as_ptr();
+        let original_len = payload.len();
+        let original_capacity = payload.capacity();
+
+        let moved = prepared_block_payload_if_fresh(&mut state, payload, id)
+            .expect("fresh prepared block");
+        assert_eq!(moved.as_ptr(), original_ptr, "typed handoff recopied payload");
+        assert_eq!(moved.len(), original_len);
+        assert_eq!(moved.capacity(), original_capacity);
+
+        let duplicate = crate::codec::encode_envelope(&env);
+        assert!(prepared_block_payload_if_fresh(&mut state, duplicate, id).is_none());
     }
 
     #[test]
