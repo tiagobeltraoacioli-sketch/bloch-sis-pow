@@ -54,8 +54,9 @@ security job, fails if the job:
   * changes the exact GitHub global run shell that clears inherited
     shell/Python/Rust substitution variables, fixes PATH, and preserves
     fail-fast semantics, or adds a required-job custom shell.
-  * changes the reviewed GitLab inherited default/variable context, or gives a
-    required job unreviewed before/after scripts, hooks or variables.
+  * removes or changes the reviewed GitLab inherited default/variable context,
+    or lets a required job override it with before/after scripts, hooks or
+    unreviewed variables.
   * adds GitHub environment/container/service replacement context or an
     unreviewed/mutable action (including new inputs to a reviewed action).
   * writes GitHub's cross-step PATH/environment command files before an
@@ -504,29 +505,28 @@ def normalized_yaml_lines(lines: list[str]) -> tuple[str, ...]:
 def check_gitlab_global_context(text: str, blocks: dict[str, list[str]]) -> list[str]:
     """Restrict inherited GitLab execution context to the reviewed subset."""
     problems = []
-    present = {
+    occurrences = [
         match.group(1)
         for line in text.splitlines()
         if (match := re.match(
             r"^(default|variables|before_script|after_script|hooks|image|services|cache):", line))
-    }
+    ]
+    present = set(occurrences)
     for key in ("before_script", "after_script", "hooks", "image", "services", "cache"):
         if key in present:
             problems.append(
                 ".gitlab-ci.yml: top-level `%s:` is outside the supported "
                 "inherited execution context" % key)
-    if "default" in present:
-        if ("default" not in blocks
-                or normalized_yaml_lines(blocks["default"]) != SAFE_GITLAB_DEFAULT):
-            problems.append(
-                ".gitlab-ci.yml: `default:` differs from the reviewed runner "
-                "tags and fail-fast before_script")
-    if "variables" in present:
-        if ("variables" not in blocks
-                or normalized_yaml_lines(blocks["variables"]) != SAFE_GITLAB_VARIABLES):
-            problems.append(
-                ".gitlab-ci.yml: top-level `variables:` differs from the "
-                "reviewed non-execution-affecting subset")
+    if (occurrences.count("default") != 1 or "default" not in blocks
+            or normalized_yaml_lines(blocks["default"]) != SAFE_GITLAB_DEFAULT):
+        problems.append(
+            ".gitlab-ci.yml: `default:` must occur exactly once and match the "
+            "reviewed runner tags and fail-fast before_script")
+    if (occurrences.count("variables") != 1 or "variables" not in blocks
+            or normalized_yaml_lines(blocks["variables"]) != SAFE_GITLAB_VARIABLES):
+        problems.append(
+            ".gitlab-ci.yml: top-level `variables:` must occur exactly once and "
+            "match the reviewed non-execution-affecting subset")
     return problems
 
 
@@ -541,9 +541,9 @@ def check_gitlab_job_context(body: list[str], job: str, indent: int) -> list[str
             index += 1
             continue
         key = value.split(":", 1)[0]
-        if key == "before_script" and value != "before_script: []":
+        if key == "before_script":
             problems.append(
-                ".gitlab-ci.yml: job `%s` has an unreviewed `before_script:`" % job)
+                ".gitlab-ci.yml: job `%s` overrides the reviewed inherited `before_script:`" % job)
         elif key in ("after_script", "hooks", "image", "services", "cache",
                      "artifacts", "dependencies", "needs"):
             problems.append(

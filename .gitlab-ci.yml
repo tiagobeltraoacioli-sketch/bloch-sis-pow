@@ -338,7 +338,6 @@ iso-hardening-guard:
 # (cargo-geiger) is NOT flagged. Pure Python 3, no toolchain, no build.
 scanners-blocking-guard:
   stage: check
-  before_script: []
   script:
     - python3 scripts/ci-install-scanner.test.py
     - python3 scripts/check-scanners-blocking.selftest.py
@@ -449,7 +448,6 @@ pos-release-candidate:
 # fails rather than skipping.
 rollback-package-integrity:
   stage: check
-  before_script: []
   script:
     - command -v minisign >/dev/null || { echo "minisign must be provisioned on the runner" >&2; exit 1; }
     - bash deploy/rollback/make-rollback-package.selftest.sh
@@ -539,7 +537,6 @@ cargo-audit:
 # Local run: osv-scanner --config=osv-scanner.toml --lockfile=Cargo.lock
 osv-scanner:
   stage: check
-  before_script: []
   script:
     - CI_TOOLS_BIN="$HOME/.local/bin" bash scripts/ci-install-scanner.sh osv-scanner
     # Every workspace lockfile (finding SC2-sharks-shamir), mirroring
@@ -642,7 +639,6 @@ fuzz-smoke:
 # See docs/audit/internal-remediation-2026-09-17/HISTORY-SCAN.md.
 secret-scan:
   stage: check
-  before_script: []
   script:
     - CI_TOOLS_BIN="$HOME/.local/bin" bash scripts/ci-install-scanner.sh gitleaks
     - bash scripts/scan-secrets.sh tree
@@ -650,7 +646,6 @@ secret-scan:
 
 secret-history-scan:
   stage: check
-  before_script: []
   variables:
     GIT_DEPTH: "0"
   script:

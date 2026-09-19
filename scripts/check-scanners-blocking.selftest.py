@@ -69,7 +69,7 @@ default:
 
 """
 
-GOOD_GITLAB = """\
+GOOD_GITLAB = SAFE_GITLAB_GLOBALS + """\
 stages:
   - check
 
@@ -385,40 +385,50 @@ CASES = [
          must_fail=True, expect="cross-step environment/PATH channel"),
 
     Case("reviewed GitLab inherited context stays green",
-         SAFE_GITLAB_GLOBALS + GOOD_GITLAB, GOOD_GITHUB, must_fail=False),
+         GOOD_GITLAB, GOOD_GITHUB, must_fail=False),
 
     Case("GitLab cannot inherit the runner PATH suffix",
-         SAFE_GITLAB_GLOBALS.replace(
+         GOOD_GITLAB.replace(
              'export PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"',
-             'export PATH="$HOME/.cargo/bin:$PATH"') + GOOD_GITLAB,
-         GOOD_GITHUB, must_fail=True, expect="`default:` differs"),
+             'export PATH="$HOME/.cargo/bin:$PATH"'),
+         GOOD_GITHUB, must_fail=True, expect="reviewed runner tags and fail-fast before_script"),
 
     Case("GitLab cannot retain compiler substitution variables",
-         SAFE_GITLAB_GLOBALS.replace(
+         GOOD_GITLAB.replace(
              "unset BASH_ENV ENV PYTHONHOME PYTHONPATH CARGO_HOME RUSTUP_HOME "
              "RUSTUP_TOOLCHAIN RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTC ",
-             "unset BASH_ENV ENV PYTHONHOME PYTHONPATH CARGO_HOME RUSTUP_HOME RUSTC ") + GOOD_GITLAB,
-         GOOD_GITHUB, must_fail=True, expect="`default:` differs"),
+             "unset BASH_ENV ENV PYTHONHOME PYTHONPATH CARGO_HOME RUSTUP_HOME RUSTC "),
+         GOOD_GITHUB, must_fail=True, expect="reviewed runner tags and fail-fast before_script"),
 
     Case("GitLab cannot retain inherited Rust compiler flags",
-         SAFE_GITLAB_GLOBALS.replace(
+         GOOD_GITLAB.replace(
              "RUSTUP_TOOLCHAIN RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTC",
              "RUSTUP_TOOLCHAIN RUSTC").replace(
              "RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_RUSTFLAGS CARGO_BUILD_RUSTC",
-             "RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_RUSTC") + GOOD_GITLAB,
-         GOOD_GITHUB, must_fail=True, expect="`default:` differs"),
+             "RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_RUSTC"),
+         GOOD_GITHUB, must_fail=True, expect="reviewed runner tags and fail-fast before_script"),
 
     Case("GitLab default before_script cannot disable fail-fast",
-         SAFE_GITLAB_GLOBALS.replace(
+         GOOD_GITLAB.replace(
              "    - cmake --version | head -1 || true",
-             "    - cmake --version | head -1 || true\n    - set +e") + GOOD_GITLAB,
-         GOOD_GITHUB, must_fail=True, expect="`default:` differs"),
+             "    - cmake --version | head -1 || true\n    - set +e"),
+         GOOD_GITHUB, must_fail=True, expect="reviewed runner tags and fail-fast before_script"),
 
     Case("GitLab global variables cannot inject BASH_ENV",
-         SAFE_GITLAB_GLOBALS.replace(
+         GOOD_GITLAB.replace(
              '  RUST_BACKTRACE: "1"',
-             '  RUST_BACKTRACE: "1"\n  BASH_ENV: scripts/mask-verdict.sh') + GOOD_GITLAB,
-         GOOD_GITHUB, must_fail=True, expect="top-level `variables:` differs"),
+             '  RUST_BACKTRACE: "1"\n  BASH_ENV: scripts/mask-verdict.sh'),
+         GOOD_GITHUB, must_fail=True, expect="reviewed non-execution-affecting subset"),
+
+    Case("GitLab required guard cannot disable inherited execution context",
+         GOOD_GITLAB.replace(
+             "scanners-blocking-guard:\n  stage: check",
+             "scanners-blocking-guard:\n  stage: check\n  before_script: []"),
+         GOOD_GITHUB, must_fail=True, expect="overrides the reviewed inherited `before_script:`"),
+
+    Case("GitLab reviewed default cannot be removed",
+         GOOD_GITLAB.replace(SAFE_GITLAB_GLOBALS, ""),
+         GOOD_GITHUB, must_fail=True, expect="`default:` must occur exactly once"),
 
     Case("GitLab top-level hooks are outside the supported context",
          "hooks:\n  pre_get_sources_script:\n    - export PATH=fake:$PATH\n\n" + GOOD_GITLAB,
@@ -428,7 +438,7 @@ CASES = [
          GOOD_GITLAB.replace(
              "cargo-audit:\n  stage: check",
              "cargo-audit:\n  stage: check\n  before_script:\n    - set +e"),
-         GOOD_GITHUB, must_fail=True, expect="unreviewed `before_script:`"),
+         GOOD_GITHUB, must_fail=True, expect="overrides the reviewed inherited `before_script:`"),
 
     Case("required GitLab job cannot add an after_script",
          GOOD_GITLAB.replace(
