@@ -463,12 +463,15 @@ impl HdWallet {
         // Verify mnemonic matches (by decrypting and comparing). Wrapped in
         // Zeroizing (A4 lows): this plaintext carries the full mnemonic in
         // JSON form and must not linger in memory after the comparison below.
-        let mnemonic_bytes = decrypt_with_key(&master_key, &wallet.mnemonic_crypto)?;
-        let payload: BorrowedMnemonicPayload<'_> = serde_json::from_slice(&mnemonic_bytes)
-            .map_err(|e| format!("mnemonic decrypt failed — wrong password/passphrase/mnemonic ({})", e))?;
-        if payload.mnemonic.as_ref() != canonical_mnemonic.as_str() {
-            return Err("mnemonic mismatch — tampered file?".into());
-        }
+        verify_mnemonic_plaintext(
+            decrypt_with_key(&master_key, &wallet.mnemonic_crypto)?,
+            canonical_mnemonic.as_str(),
+        )?;
+        // The authenticated plaintext and its borrowed/owned parsed view are
+        // dropped inside `verify_mnemonic_plaintext`.  The canonical KDF copy
+        // is no longer needed either; do not retain either mnemonic copy while
+        // every address ciphertext is decrypted and checked below.
+        drop(canonical_mnemonic);
 
         // Decrypt each keypair. The stored key always wins — a pre-v3 wallet's
         // OS-random keys are not reproducible from the seed, so re-deriving here
@@ -563,6 +566,27 @@ fn into_loaded_address(
         address: address.address,
     };
     ((address.index, keypair, address.label), is_imported)
+}
+
+/// Compare the authenticated mnemonic while owning its plaintext under
+/// wiping RAII. Taking the owner by value guarantees that both the plaintext
+/// and any Serde-owned unescaped compatibility string are dropped before this
+/// helper returns to the potentially long address-decryption loop.
+fn verify_mnemonic_plaintext(
+    plaintext: Zeroizing<Vec<u8>>,
+    expected_mnemonic: &str,
+) -> Result<(), String> {
+    let payload: BorrowedMnemonicPayload<'_> = serde_json::from_slice(&plaintext)
+        .map_err(|e| {
+            format!(
+                "mnemonic decrypt failed — wrong password/passphrase/mnemonic ({})",
+                e,
+            )
+        })?;
+    if payload.mnemonic.as_ref() != expected_mnemonic {
+        return Err("mnemonic mismatch — tampered file?".into());
+    }
+    Ok(())
 }
 
 fn validate_wallet_load_limits(
@@ -1171,6 +1195,32 @@ mod tests {
         assert_eq!(canonical.as_str(), expected);
         canonical.zeroize();
         assert!(canonical.is_empty());
+    }
+
+    #[test]
+    fn authenticated_mnemonic_check_consumes_its_zeroizing_plaintext_owner() {
+        let _: fn(Zeroizing<Vec<u8>>, &str) -> Result<(), String> =
+            verify_mnemonic_plaintext;
+        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
+
+        let canonical = "alpha beta";
+        let plaintext = Zeroizing::new(serde_json::to_vec(&MnemonicPayload {
+            mnemonic: canonical.into(),
+        }).unwrap());
+        assert!(verify_mnemonic_plaintext(plaintext, canonical).is_ok());
+
+        // Preserve the historical escaped JSON compatibility path, whose Cow
+        // must own and wipe the unescaped phrase before the helper returns.
+        let escaped = Zeroizing::new(br#"{"mnemonic":"alpha\u0020beta"}"#.to_vec());
+        assert!(verify_mnemonic_plaintext(escaped, canonical).is_ok());
+
+        let mismatch = Zeroizing::new(serde_json::to_vec(&MnemonicPayload {
+            mnemonic: "other phrase".into(),
+        }).unwrap());
+        assert_eq!(
+            verify_mnemonic_plaintext(mismatch, canonical).unwrap_err(),
+            "mnemonic mismatch — tampered file?",
+        );
     }
 
     #[test]
