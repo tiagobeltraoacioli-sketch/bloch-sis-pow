@@ -988,6 +988,11 @@ fn write_log_envelope<W: Write>(
 fn read_log_frames<R: Read>(reader: R, length: u64) -> io::Result<Vec<BlockEnvelope>> {
     let mut reader = io::BufReader::new(reader);
     let mut out = Vec::new();
+    // `decode_envelope` owns every variable field it returns, so this raw
+    // frame can be overwritten after each decode. Keep one high-water
+    // allocation under the logical frame cap instead of allocating once per
+    // historical block; allocator capacity itself is not an RSS bound.
+    let mut payload = Vec::new();
     let mut at = 0u64;
     while length.saturating_sub(at) >= 4 {
         let mut prefix = [0u8; 4];
@@ -1006,8 +1011,7 @@ fn read_log_frames<R: Read>(reader: R, length: u64) -> io::Result<Vec<BlockEnvel
             eprintln!("store: dropping truncated trailing log frame (crash mid-append)");
             return Ok(out);
         }
-        let mut payload = vec![0u8; len];
-        reader.read_exact(&mut payload)?;
+        read_frame_payload(&mut reader, &mut payload, len)?;
         let env = crate::codec::decode_envelope(&payload)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         out.push(env);
@@ -1017,6 +1021,15 @@ fn read_log_frames<R: Read>(reader: R, length: u64) -> io::Result<Vec<BlockEnvel
         eprintln!("store: dropping truncated trailing log frame (crash mid-append)");
     }
     Ok(out)
+}
+
+fn read_frame_payload<R: Read>(
+    reader: &mut R,
+    payload: &mut Vec<u8>,
+    len: usize,
+) -> io::Result<()> {
+    payload.resize(len, 0);
+    reader.read_exact(payload)
 }
 
 /// Durable reorg publication using handles owned only by the writer thread.
@@ -1617,6 +1630,54 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidData,
             "a complete zero-length frame remains corruption, not a truncatable tail",
+        );
+    }
+
+    #[test]
+    fn replay_scratch_reuses_high_water_and_preserves_mixed_frames() {
+        let empty = sample_envelope(201);
+        let mut large = sample_envelope(202);
+        large.body.transactions = vec![vec![0xA5; 1 << 20]];
+        let mut small = sample_envelope(203);
+        small.proposer_sig.extend_from_slice(&[0x5C; 31]);
+        let expected = [empty, large, small];
+
+        let mut log = Vec::new();
+        for envelope in &expected {
+            let encoded = crate::codec::encode_envelope(envelope);
+            log.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+            log.extend_from_slice(&encoded);
+        }
+        let decoded = read_log_frames(io::Cursor::new(&log), log.len() as u64)
+            .expect("mixed replay frames");
+        assert_eq!(decoded.len(), expected.len());
+        for (actual, expected) in decoded.iter().zip(&expected) {
+            assert_eq!(actual.header, expected.header);
+            assert_eq!(actual.proposer_sig, expected.proposer_sig);
+            assert_eq!(actual.body.transactions, expected.body.transactions);
+            assert_eq!(actual.body.attestations, expected.body.attestations);
+        }
+
+        let large_raw = vec![0xD1; 1 << 20];
+        let small_raw = vec![0xD2; 37];
+        let mut raw = large_raw.clone();
+        raw.extend_from_slice(&small_raw);
+        let mut reader = io::Cursor::new(raw);
+        let mut scratch = Vec::new();
+        read_frame_payload(&mut reader, &mut scratch, large_raw.len()).unwrap();
+        let high_water_ptr = scratch.as_ptr();
+        let high_water_capacity = scratch.capacity();
+        assert_eq!(scratch, large_raw);
+        read_frame_payload(&mut reader, &mut scratch, small_raw.len()).unwrap();
+        assert_eq!(scratch.as_ptr(), high_water_ptr, "smaller frame reallocated scratch");
+        assert_eq!(scratch.capacity(), high_water_capacity);
+        assert_eq!(scratch, small_raw);
+
+        let over_cap = ((crate::codec::MAX_FIELD_LEN + 1) as u32).to_le_bytes();
+        assert_eq!(
+            read_log_frames(io::Cursor::new(over_cap), 4).unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+            "over-cap prefix must fail before any payload read or resize",
         );
     }
 
