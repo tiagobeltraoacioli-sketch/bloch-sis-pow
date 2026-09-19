@@ -51,8 +51,9 @@ security job, fails if the job:
     a tag/branch, or removes this guard's own adversarial self-test.
   * lets the GitHub OSV lockfile scope drift from the complete set of tracked
     `Cargo.lock` files in either direction.
-  * adds GitHub top-level defaults or a required-job custom shell that can
-    replace an otherwise unchanged verdict's exit status.
+  * changes the exact GitHub global run shell that clears inherited
+    shell/Python/Rust substitution variables, fixes PATH, and preserves
+    fail-fast semantics, or adds a required-job custom shell.
   * changes the reviewed GitLab inherited default/variable context, or gives a
     required job unreviewed before/after scripts, hooks or variables.
   * adds GitHub environment/container/service replacement context or an
@@ -170,6 +171,17 @@ SAFE_GITLAB_VARIABLES = (
 SAFE_GITHUB_ENV = (
     "CARGO_TERM_COLOR: always",
     'RUST_BACKTRACE: "1"',
+)
+SAFE_GITHUB_DEFAULTS = (
+    "run:",
+    "shell: /usr/bin/env -u BASH_ENV -u ENV -u PYTHONHOME -u PYTHONPATH "
+    "-u CARGO_HOME -u RUSTUP_HOME -u RUSTUP_TOOLCHAIN -u RUSTFLAGS "
+    "-u CARGO_ENCODED_RUSTFLAGS -u RUSTC -u RUSTC_WRAPPER "
+    "-u RUSTC_WORKSPACE_WRAPPER -u CARGO_BUILD_RUSTFLAGS "
+    "-u CARGO_BUILD_RUSTC -u CARGO_BUILD_RUSTC_WRAPPER "
+    "-u CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER "
+    "PATH=/home/runner/.cargo/bin:/home/runner/.local/bin:/usr/local/bin:/usr/bin:/bin "
+    "/bin/bash --noprofile --norc -euo pipefail {0}",
 )
 REVIEWED_GITHUB_ACTIONS = {
     "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
@@ -576,9 +588,14 @@ def check_file(
                     "locally inspectable blocking subset" % (label, key))
     if label == ".github/workflows/security.yml":
         top_level = job_blocks(text, 0)
-        if "defaults" in top_level:
+        default_count = sum(
+            bool(re.match(r"^defaults:\s*(?:#.*)?$", line))
+            for line in text.splitlines())
+        if (default_count != 1 or "defaults" not in top_level
+                or normalized_yaml_lines(top_level["defaults"]) != SAFE_GITHUB_DEFAULTS):
             problems.append(
-                "%s: top-level `defaults:` can replace required verdict shells"
+                "%s: top-level `defaults:` must occur exactly once and match "
+                "the reviewed environment-clearing run shell"
                 % label)
         trigger_lines = top_level.get("on")
         if trigger_lines is None:

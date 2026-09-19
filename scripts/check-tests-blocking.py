@@ -28,9 +28,10 @@ GitLab `.gitlab-ci.yml` job `build-and-test`, to the reviewed posture:
     explicit subset, exactly once, with no job-local script hooks or execution
     variables. The `build-and-test` header and complete ordered script match
     the reviewed whole-job contract.
-  * its GitHub environment is the reviewed inert pair, required jobs use no
-    containers/services/env overrides, and every action plus input is a
-    reviewed immutable form.
+  * its GitHub environment is the reviewed inert pair and its exact global
+    run shell clears inherited shell/Python/Rust substitution variables while
+    replacing PATH; required jobs use no containers/services/env overrides,
+    and every action plus input is a reviewed immutable form.
   * no required GitHub run step writes the cross-step PATH/environment command
     files that can replace `cargo` before the approved test command.
   * the `cargo-test` job's setup, rehearsals and test commands exactly match
@@ -166,7 +167,7 @@ CI_SCRIPT_ENTRYPOINT_SHA256 = {
     "scripts/check-live-node-retired-isolation.py":
         "45ece7368931469c2c64c161708009b41aebcbf3c1033fa75006e16d5e16518d",
     "scripts/check-tests-blocking.selftest.py":
-        "53ec6fc1beeaac7918ab2337575da38565d672eb7679a14f2f559f9e0873c5ea",
+        "106b7b7129e8f9adde3acf0e423a69f623c77526c68297d4c63833f55cbb09db",
     "scripts/check-validator-lifecycle-mutations.py":
         "12b477e5043bc3ea98387be33ca586976494b30083522b214cea7d88c0e9f429",
     "scripts/devnet-particao-report.test.py":
@@ -228,6 +229,17 @@ SAFE_GITLAB_VARIABLES = (
 SAFE_GITHUB_ENV = (
     "CARGO_TERM_COLOR: always",
     'RUST_BACKTRACE: "1"',
+)
+SAFE_GITHUB_DEFAULTS = (
+    "run:",
+    "shell: /usr/bin/env -u BASH_ENV -u ENV -u PYTHONHOME -u PYTHONPATH "
+    "-u CARGO_HOME -u RUSTUP_HOME -u RUSTUP_TOOLCHAIN -u RUSTFLAGS "
+    "-u CARGO_ENCODED_RUSTFLAGS -u RUSTC -u RUSTC_WRAPPER "
+    "-u RUSTC_WORKSPACE_WRAPPER -u CARGO_BUILD_RUSTFLAGS "
+    "-u CARGO_BUILD_RUSTC -u CARGO_BUILD_RUSTC_WRAPPER "
+    "-u CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER "
+    "PATH=/home/runner/.cargo/bin:/home/runner/.local/bin:/usr/local/bin:/usr/bin:/bin "
+    "/bin/bash --noprofile --norc -euo pipefail {0}",
 )
 REVIEWED_GITHUB_ACTIONS = {
     "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
@@ -655,9 +667,14 @@ def check_job(path: str, job: str, indent: int, label: str) -> list[str]:
 
     if label == ".github/workflows/tests.yml":
         top_level = job_blocks(text, 0)
-        if "defaults" in top_level:
+        default_count = sum(
+            bool(re.match(r"^defaults:\s*(?:#.*)?$", line))
+            for line in text.splitlines())
+        if (default_count != 1 or "defaults" not in top_level
+                or normalized_yaml_lines(top_level["defaults"]) != SAFE_GITHUB_DEFAULTS):
             problems.append(
-                f"{label}: top-level `defaults:` can replace the required test shell")
+                f"{label}: top-level `defaults:` must occur exactly once and match "
+                "the reviewed environment-clearing run shell")
         env_lines = top_level.get("env")
         env_present = any(re.match(r"^env:", line) for line in text.splitlines())
         if env_present and (env_lines is None

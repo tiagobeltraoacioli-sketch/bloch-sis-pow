@@ -143,6 +143,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: /usr/bin/env -u BASH_ENV -u ENV -u PYTHONHOME -u PYTHONPATH -u CARGO_HOME -u RUSTUP_HOME -u RUSTUP_TOOLCHAIN -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS -u RUSTC -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER -u CARGO_BUILD_RUSTFLAGS -u CARGO_BUILD_RUSTC -u CARGO_BUILD_RUSTC_WRAPPER -u CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER PATH=/home/runner/.cargo/bin:/home/runner/.local/bin:/usr/local/bin:/usr/bin:/bin /bin/bash --noprofile --norc -euo pipefail {0}
+
 jobs:
   clippy-hardened:
     runs-on: ubuntu-latest
@@ -246,6 +250,21 @@ CASES = [
 
     Case("reviewed GitHub global environment stays green",
          GOOD_GITLAB, GOOD_GITHUB_WITH_ENV, must_fail=False),
+
+    Case("reviewed GitHub run shell stays green",
+         GOOD_GITLAB, GOOD_GITHUB, must_fail=False),
+
+    Case("GitHub run shell cannot retain inherited RUSTC",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(" -u RUSTC -u RUSTC_WRAPPER", " -u RUSTC_WRAPPER"),
+         must_fail=True, expect="environment-clearing run shell"),
+
+    Case("GitHub run shell cannot inherit a PATH suffix",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "PATH=/home/runner/.cargo/bin:/home/runner/.local/bin:/usr/local/bin:/usr/bin:/bin",
+             "PATH=/home/runner/.cargo/bin:$PATH"),
+         must_fail=True, expect="environment-clearing run shell"),
 
     Case("GitHub global BASH_ENV cannot replace scanner commands",
          GOOD_GITLAB,
