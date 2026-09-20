@@ -12,6 +12,10 @@ balances, prior supply, validators, freeze flags or KYC roots in a transaction.
 The ledger selects the registered modules and commits state only after every
 applicable check succeeds. Each transaction concerns one asset.
 
+[Native pairs v1](native-pairs.md) combines two transfers in one atomic, jointly
+PQ-authorized operation. It preserves the v3 ledger and policy checks; it does
+not add a pool custodian, a stablecoin peg or Genesis-4 activation.
+
 This establishes the native-asset kernel proposed for L1. General EVM applications
 remain a separate L2 integration. No EVM precompile, bridge, validity proof, L2
 sequencer, Genesis-4 block field or activation height is introduced here.

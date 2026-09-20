@@ -18,7 +18,10 @@ From the first boundary at which `state.epoch >= LEAKED_ROSTER_ACTIVATION_EPOCH`
 `consensus_roster_at` (transition.rs) subtracts each validator's accrued
 inactivity leak before the proposer draw and the committee partition read the
 roster. Validators the finality layer has already written off stop being drawn
-to propose and stop holding committee seats. Measured on mainnet 2026-08-21:
+to propose; they KEEP their committee seat with zero weight (`with_leak_applied`
+in transition.rs keeps the zeroed record on purpose — membership is a function
+of the index set, and dropping the record would re-open the roster split from
+the other side; `epoch_committees` has no stake filter). Measured on mainnet 2026-08-21:
 seven live validators hold 6.19% of unleaked stake and blocks arrive every
 ~19.2 slots (~10 min against the 30 s slot), because ~94% of proposer draws
 land on validators that produce nothing. The state root is untouched — the

@@ -723,7 +723,7 @@ fn sampling_survives_stake_totals_beyond_u64() {
 fn registry_survives_the_full_supply_delegated() {
     // The entire supply bonded across 150 delegations: resolution, the cap
     // fixpoint, and the concentration metrics must all stay exact. At the
-    // 100 B split the TOTAL itself is 54% of u64::MAX — one more reason,
+    // 100 B split the total supply value itself is 54% of u64::MAX — one more reason,
     // besides the products, that the arithmetic is u128.
     let per = tk::TOTAL_SUPPLY_BLOCH / 150; // BLCH each
     let ds: Vec<Delegation> = (0..150u32)

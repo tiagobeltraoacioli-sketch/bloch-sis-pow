@@ -132,7 +132,7 @@ GITLAB_VERDICTS = {
     "secret-history-scan": re.compile(r"^bash\s+scripts/scan-secrets\.sh\s+history(?:\s|$)"),
     "cargo-audit": re.compile(r"^bash\s+scripts/audit-all-lockfiles\.sh(?:\s|$)"),
     "supply-chain": re.compile(r"^cargo\s+deny\s+check\s+advisories\s+bans\s+licenses\s+sources(?:\s|$)"),
-    "scanners-blocking-guard": re.compile(r"^python3\s+scripts/check-scanners-blocking\.py$"),
+    "scanners-blocking-guard": re.compile(r"^python3\s+-I\s+scripts/check-scanners-blocking\.py$"),
     "rollback-package-integrity": re.compile(r"^bash\s+deploy/rollback/make-rollback-package\.selftest\.sh(?:\s|$)"),
 }
 GITHUB_VERDICTS = {
@@ -147,7 +147,7 @@ GITHUB_VERDICTS = {
 }
 SELFTEST_VERDICTS = {
     "scanners-blocking-guard": re.compile(
-        r"^python3\s+scripts/check-scanners-blocking\.selftest\.py$"),
+        r"^python3\s+-I\s+scripts/check-scanners-blocking\.selftest\.py$"),
     "rollback-package-integrity": re.compile(
         r"^bash\s+deploy/rollback/make-rollback-package\.argv\.selftest\.sh$"),
 }
@@ -201,7 +201,7 @@ REVIEWED_GITHUB_ACTIONS = {
 }
 GITHUB_REVIEWED_RUNS = {
     "clippy-hardened": (
-        "bash scripts/hardened-clippy.selftest.sh\npython3 scripts/hardened-clippy-score.test.py",
+        "bash scripts/hardened-clippy.selftest.sh\npython3 -I scripts/hardened-clippy-score.test.py",
         "sudo apt-get update && sudo apt-get install -y clang cmake",
         "bash scripts/hardened-clippy.sh",
     ),
@@ -213,7 +213,7 @@ GITHUB_REVIEWED_RUNS = {
     "secret-history-scan": (
         'CI_TOOLS_BIN="$HOME/.local/bin" bash scripts/ci-install-scanner.sh gitleaks',
         "bash scripts/scan-secrets.sh history",
-        "python3 scripts/scan-secrets.test.py",
+        "python3 -I scripts/scan-secrets.test.py",
     ),
     "cargo-audit": (
         "cargo install cargo-audit --version 0.22.2 --locked",
@@ -224,9 +224,9 @@ GITHUB_REVIEWED_RUNS = {
         "cargo deny check advisories bans licenses sources",
     ),
     "scanners-blocking-guard": (
-        "python3 scripts/ci-install-scanner.test.py",
-        "python3 scripts/check-scanners-blocking.selftest.py",
-        "python3 scripts/check-scanners-blocking.py",
+        "python3 -I scripts/ci-install-scanner.test.py",
+        "python3 -I scripts/check-scanners-blocking.selftest.py",
+        "python3 -I scripts/check-scanners-blocking.py",
     ),
     "rollback-package-integrity": (
         "sudo apt-get update && sudo apt-get install -y minisign",

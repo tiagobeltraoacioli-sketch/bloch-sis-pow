@@ -157,7 +157,7 @@ jobs:
       - name: hardened clippy — self-test
         run: |
           bash scripts/hardened-clippy.selftest.sh
-          python3 scripts/hardened-clippy-score.test.py
+          python3 -I scripts/hardened-clippy-score.test.py
       - name: Install C toolchain (rocksdb/blst/PQClean)
         run: sudo apt-get update && sudo apt-get install -y clang cmake
       - name: hardened clippy
@@ -198,6 +198,7 @@ jobs:
             --lockfile=spikes/prover-cost/rv32f/Cargo.lock
             --lockfile=spikes/prover-cost/rv32h/Cargo.lock
             --lockfile=spikes/prover-cost/rv32k/Cargo.lock
+            --lockfile=tools/bloch-devkit/templates/svm/Cargo.lock
 
   # gitleaks — catch committed credentials before they reach history (the
   # project has its own PAT-rotation lesson). BLOCKING since 2026-09-04 (finding
@@ -233,7 +234,7 @@ jobs:
       - name: Scan reachable history against reviewed findings
         run: bash scripts/scan-secrets.sh history
       - name: Exercise baseline and shallow-checkout refusals
-        run: python3 scripts/scan-secrets.test.py
+        run: python3 -I scripts/scan-secrets.test.py
 
   # scanners-blocking guard — the regression test for finding I-H4 itself. Fails
   # if either CI file re-acquires a required-job escape (`continue-on-error` /
@@ -246,11 +247,11 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Offline scanner installer regressions
-        run: python3 scripts/ci-install-scanner.test.py
+        run: python3 -I scripts/ci-install-scanner.test.py
       - name: selftest (the guard must be able to fail)
-        run: python3 scripts/check-scanners-blocking.selftest.py
+        run: python3 -I scripts/check-scanners-blocking.selftest.py
       - name: guard
-        run: python3 scripts/check-scanners-blocking.py
+        run: python3 -I scripts/check-scanners-blocking.py
 
   # Rollback-package authentication (audit I-H3 / INF-09). GitLab runs this
   # disposable-key end-to-end test; the GitHub mirror must exercise the same

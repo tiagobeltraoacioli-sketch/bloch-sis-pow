@@ -83,7 +83,7 @@ clippy-hardened:
   stage: check
   script:
     - bash scripts/hardened-clippy.selftest.sh
-    - python3 scripts/hardened-clippy-score.test.py
+    - python3 -I scripts/hardened-clippy-score.test.py
     - bash scripts/hardened-clippy.sh
 
 # Consensus invariants, called out from the workspace run for visibility.
@@ -339,9 +339,9 @@ iso-hardening-guard:
 scanners-blocking-guard:
   stage: check
   script:
-    - python3 scripts/ci-install-scanner.test.py
-    - python3 scripts/check-scanners-blocking.selftest.py
-    - python3 scripts/check-scanners-blocking.py
+    - python3 -I scripts/ci-install-scanner.test.py
+    - python3 -I scripts/check-scanners-blocking.selftest.py
+    - python3 -I scripts/check-scanners-blocking.py
   allow_failure: false
 
 # tests-blocking guard — the regression test for finding TEST1-ci-runs-tests.
@@ -654,7 +654,7 @@ secret-history-scan:
   script:
     - CI_TOOLS_BIN="$HOME/.local/bin" bash scripts/ci-install-scanner.sh gitleaks
     - bash scripts/scan-secrets.sh history
-    - python3 scripts/scan-secrets.test.py
+    - python3 -I scripts/scan-secrets.test.py
   timeout: 15m
   allow_failure: false
 

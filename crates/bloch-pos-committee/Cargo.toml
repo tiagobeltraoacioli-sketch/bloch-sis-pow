@@ -12,6 +12,9 @@ publish = false
 # consensus layer — the opposite of what an audit needs.
 
 [features]
+# Opt-in local rehearsal only. No PosTransaction variant, block-root change or
+# node activation; default node builds retain their original SHA3-only core.
+native-dex-rehearsal = ["dep:bloch-euvm"]
 # Phase timers for the replay benchmark (src/perf.rs). OFF by default and off
 # in every release the fleet runs: with the feature absent the span type is
 # zero-sized with no Drop and every call site disappears. Never enable it on a
@@ -22,6 +25,7 @@ local-state-cache = ["dep:serde", "dep:bincode"]
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }
 bincode = { version = "1.3.3", optional = true }
+bloch-euvm = { path = "../bloch-euvm", optional = true }
 sha3 = { version = "0.10", default-features = false }
 
 [dev-dependencies]

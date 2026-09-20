@@ -51,6 +51,7 @@ TRACKED_LOCKFILES = (
     "spikes/prover-cost/rv32f/Cargo.lock",
     "spikes/prover-cost/rv32h/Cargo.lock",
     "spikes/prover-cost/rv32k/Cargo.lock",
+    "tools/bloch-devkit/templates/svm/Cargo.lock",
 )
 SAFE_GITLAB_GLOBALS = """\
 variables:
@@ -123,8 +124,8 @@ supply-chain:
 scanners-blocking-guard:
   stage: check
   script:
-    - python3 scripts/check-scanners-blocking.selftest.py
-    - python3 scripts/check-scanners-blocking.py
+    - python3 -I scripts/check-scanners-blocking.selftest.py
+    - python3 -I scripts/check-scanners-blocking.py
   allow_failure: false
 
 rollback-package-integrity:
@@ -156,7 +157,7 @@ jobs:
     steps:
       - run: |
           bash scripts/hardened-clippy.selftest.sh
-          python3 scripts/hardened-clippy-score.test.py
+          python3 -I scripts/hardened-clippy-score.test.py
       - run: sudo apt-get update && sudo apt-get install -y clang cmake
       - run: bash scripts/hardened-clippy.sh
 
@@ -193,6 +194,7 @@ jobs:
             --lockfile=spikes/prover-cost/rv32f/Cargo.lock
             --lockfile=spikes/prover-cost/rv32h/Cargo.lock
             --lockfile=spikes/prover-cost/rv32k/Cargo.lock
+            --lockfile=tools/bloch-devkit/templates/svm/Cargo.lock
 
   secret-scan:
     runs-on: ubuntu-latest
@@ -203,16 +205,16 @@ jobs:
   scanners-blocking-guard:
     runs-on: ubuntu-latest
     steps:
-      - run: python3 scripts/ci-install-scanner.test.py
-      - run: python3 scripts/check-scanners-blocking.selftest.py
-      - run: python3 scripts/check-scanners-blocking.py
+      - run: python3 -I scripts/ci-install-scanner.test.py
+      - run: python3 -I scripts/check-scanners-blocking.selftest.py
+      - run: python3 -I scripts/check-scanners-blocking.py
 
   secret-history-scan:
     runs-on: ubuntu-latest
     steps:
       - run: CI_TOOLS_BIN="$HOME/.local/bin" bash scripts/ci-install-scanner.sh gitleaks
       - run: bash scripts/scan-secrets.sh history
-      - run: python3 scripts/scan-secrets.test.py
+      - run: python3 -I scripts/scan-secrets.test.py
 
   rollback-package-integrity:
     runs-on: ubuntu-latest
@@ -844,20 +846,20 @@ CASES = [
          GOOD_GITLAB,
          GOOD_GITHUB.replace(
              "  scanners-blocking-guard:\n    runs-on: ubuntu-latest\n"
-             "    steps:\n      - run: python3 scripts/ci-install-scanner.test.py\n"
-             "      - run: python3 scripts/check-scanners-blocking.selftest.py\n"
-             "      - run: python3 scripts/check-scanners-blocking.py\n\n", ""),
+             "    steps:\n      - run: python3 -I scripts/ci-install-scanner.test.py\n"
+             "      - run: python3 -I scripts/check-scanners-blocking.selftest.py\n"
+             "      - run: python3 -I scripts/check-scanners-blocking.py\n\n", ""),
          must_fail=True, expect="MISSING"),
 
     Case("gitlab scanner guard cannot drop its adversarial selftest",
          GOOD_GITLAB.replace(
-             "    - python3 scripts/check-scanners-blocking.selftest.py\n", ""),
+             "    - python3 -I scripts/check-scanners-blocking.selftest.py\n", ""),
          GOOD_GITHUB, must_fail=True, expect="adversarial self-test"),
 
     Case("github scanner guard cannot drop its adversarial selftest",
          GOOD_GITLAB,
          GOOD_GITHUB.replace(
-             "      - run: python3 scripts/check-scanners-blocking.selftest.py\n", ""),
+             "      - run: python3 -I scripts/check-scanners-blocking.selftest.py\n", ""),
          must_fail=True, expect="adversarial self-test"),
 
     Case("github OSV action must use an immutable commit pin",
@@ -905,8 +907,8 @@ CASES = [
 
     Case("CI guard invocation cannot inject a lockfile fixture",
          GOOD_GITLAB.replace(
-             "    - python3 scripts/check-scanners-blocking.py",
-             "    - python3 scripts/check-scanners-blocking.py --tracked-lockfiles=decoy"),
+             "    - python3 -I scripts/check-scanners-blocking.py",
+             "    - python3 -I scripts/check-scanners-blocking.py --tracked-lockfiles=decoy"),
          GOOD_GITHUB, must_fail=True, expect="no longer executes its required verdict"),
 
     Case("gitlab job name cannot replace the scanner verdict",

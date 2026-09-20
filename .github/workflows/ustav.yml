@@ -32,8 +32,27 @@ jobs:
       - name: Existing EUVM suite and Ustav regressions
         run: cargo test --locked -p bloch-euvm -p bloch-ustav
       - name: Transition and cryptographic regressions in release profile
-        run: cargo test --locked --release -p bloch-euvm -p bloch-ustav --test ustav_kernel --test crypto_kernel --test chameleon --test chameleon_crypto
+        run: cargo test --locked --release -p bloch-euvm -p bloch-ustav --test ustav_kernel --test crypto_kernel --test chameleon --test chameleon_crypto --test native_pairs --test native_pairs_crypto --test native_pairs_wire --test native_amm --test native_pool_custody --test native_pool_crypto --test native_pool_wire --test native_transfer_wire --test native_transfer_plan --test joint_blch_native --test usdt_gateway --test usdt_wire_vectors --test usdt_gateway_crypto
+      - name: Explicit joint BLCH native rehearsal
+        run: cargo test --locked -p bloch-pos-committee --features native-dex-rehearsal --lib native_dex
+      - name: Joint rehearsal in release profile
+        run: cargo test --locked --release -p bloch-pos-committee --features native-dex-rehearsal --lib native_dex
+      - name: Default node excludes native rehearsal execution
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          tree = subprocess.check_output(["cargo", "tree", "--locked", "-p", "bloch-pos-node", "--edges", "normal"], text=True)
+          if any(name in tree for name in ("bloch-euvm ", "bloch-ustav ")):
+              raise SystemExit("Native execution unexpectedly enabled in the default node")
+          print("Default node dependency boundary: OK")
+          PY
       - name: Concrete adapter lint
         run: cargo clippy --locked -p bloch-ustav --all-targets --no-deps -- -D warnings
       - name: Executable lifecycle
         run: cargo run --locked -p bloch-ustav --example lifecycle
+      - name: Atomic native asset pair example
+        run: cargo run --locked -p bloch-ustav --example native_pair
+      - name: Federated USDT gateway example
+        run: cargo run --locked -p bloch-ustav --example usdt_gateway
+      - name: PQ native token pool custody example
+        run: cargo run --locked -p bloch-ustav --example native_pool

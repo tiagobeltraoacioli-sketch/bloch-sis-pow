@@ -112,6 +112,8 @@ use sha3::{Digest, Sha3_256};
 mod validator_lifecycle;
 mod admission;
 mod proposal_wire;
+#[cfg(test)]
+mod devnet_tools_tests;
 
 use crate::genesis::Manifest;
 #[cfg(test)]
@@ -6427,6 +6429,17 @@ pub fn run(cfg: Config) -> io::Result<()> {
     if skipped == 0 || n_logged > 0 {
         if let Err(e) = engine.write_local_cache() {
             eprintln!("state-cache: initial write failed; next restart may require full replay: {e}");
+        }
+    }
+
+    if engine.keys.is_some() {
+        if no_doppelganger_check {
+            println!("DOPPELGANGER PROTECTION: DISABLED (BLOCH_NO_DOPPELGANGER is set).");
+        } else {
+            #[allow(clippy::arithmetic_side_effects)]
+            let observation_start = now_ms().saturating_sub(engine.manifest.genesis_time_ms)
+                / engine.manifest.slot_ms.max(1);
+            engine.start_doppelganger_observation(observation_start);
         }
     }
 

@@ -1477,6 +1477,52 @@ pub struct ForkChoiceEquivocatorSummary {
     pub active_stake_sat: u64,
 }
 
+#[cfg(feature = "native-dex-rehearsal")]
+pub mod native_dex;
+
+/// Internal execution terms derived by the native DEX rehearsal dispatcher.
+/// Never decoded from a client or exposed as public mutation authority. The
+/// legacy path passes None and retains its original transfer-only semantics.
+struct JointTransferContext {
+    envelope_bytes: u64,
+    output_txid: [u8; 32],
+    charge: fee_market::TxCharge,
+    authorization: [u8; 32],
+    #[cfg(feature = "native-dex-rehearsal")]
+    reserve: Option<native_dex::base_reserves::ReserveSpend>,
+}
+
+/// Private proof that one TransferV2 passed every existing consensus check.
+/// The exclusive state borrow prevents intervening mutation; the transaction
+/// borrow keeps validated inputs/outputs immutable until this plan is consumed.
+/// Dropping a plan changes nothing. No unchecked commit authority is public.
+struct ValidatedTransferV2<'a> {
+    state: &'a mut CommittedState,
+    inputs: &'a [TransferInputV2],
+    outputs: &'a [TransferOutput],
+    txid: [u8; 32],
+    charge: fee_market::TxCharge,
+}
+
+impl ValidatedTransferV2<'_> {
+    /// Validation already checked ownership, fees, conservation and collisions.
+    /// Consume the proof once; no fallible validation remains at commit time.
+    fn commit(self) -> fee_market::TxCharge {
+        for input in self.inputs {
+            self.state.eutxos.remove(&(input.txid, input.vout));
+        }
+        for (vout, output) in self.outputs.iter().enumerate() {
+            self.state.eutxos.insert(crate::state_root::EutxoEntry {
+                txid: self.txid,
+                vout: vout as u32,
+                value: output.value,
+                script_hash: output.script_hash,
+            });
+        }
+        self.charge
+    }
+}
+
 /// The committed post-state of one block — [`StateTransition::State`].
 ///
 /// A plain value: `Clone` + `PartialEq`, no interior mutability, no handles.
@@ -4094,6 +4140,32 @@ impl CommittedState {
         base_fee_millisat_per_gas: u128,
         verifier: &dyn SignatureVerifier,
     ) -> Result<fee_market::TxCharge, TransferReject> {
+        Ok(self.plan_transfer_v2(tx, base_fee_millisat_per_gas, verifier)?.commit())
+    }
+
+    /// Validate without changing committed state. The returned private plan
+    /// retains the exclusive borrow until commit or drop, so it cannot be
+    /// applied against a different or subsequently modified UTXO set.
+    fn plan_transfer_v2<'a>(
+        &'a mut self,
+        tx: &'a PosTransaction,
+        base_fee_millisat_per_gas: u128,
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<ValidatedTransferV2<'a>, TransferReject> {
+        self.plan_transfer_v2_with_context(tx, base_fee_millisat_per_gas, verifier, None)
+    }
+
+    /// Shares the frozen validation order with ordinary transfers. Only the
+    /// private rehearsal dispatcher may supply jointly derived size, pricing,
+    /// output identity and authorization; real ownership and signature checks
+    /// remain mandatory. No independently supplied client context is admitted.
+    fn plan_transfer_v2_with_context<'a>(
+        &'a mut self,
+        tx: &'a PosTransaction,
+        base_fee_millisat_per_gas: u128,
+        verifier: &dyn SignatureVerifier,
+        context: Option<JointTransferContext>,
+    ) -> Result<ValidatedTransferV2<'a>, TransferReject> {
         let PosTransaction::TransferV2 { keys, inputs, outputs, tx_bytes, tip_millisat_per_gas } =
             tx
         else {
@@ -4108,7 +4180,10 @@ impl CommittedState {
         }
         // Same floor as V1, against THIS encoding's own length — the table is
         // most of a real transfer's bytes and must be paid for and counted.
-        let encoded_len = tx.canonical_bytes().len() as u64;
+        let encoded_len = context.as_ref().map_or_else(
+            || tx.canonical_bytes().len() as u64,
+            |joint| joint.envelope_bytes,
+        );
         if *tx_bytes < encoded_len {
             return Err(TransferReject::UnderdeclaredSize);
         }
@@ -4157,7 +4232,11 @@ impl CommittedState {
         if *tip_millisat_per_gas > fee_market::MAX_TIP_MILLISAT_PER_GAS {
             return Err(TransferReject::TipAboveCeiling);
         }
-        if fee_market::intrinsic_gas(class, *tx_bytes) > fee_market::MAX_TX_GAS {
+        let gas = context.as_ref().map_or_else(
+            || fee_market::intrinsic_gas(class, *tx_bytes),
+            |joint| joint.charge.gas,
+        );
+        if gas > fee_market::MAX_TX_GAS {
             return Err(TransferReject::TxGasCeilingExceeded);
         }
 
@@ -4222,6 +4301,18 @@ impl CommittedState {
             let Some(entry) = self.eutxos.get(&key) else {
                 return Err(TransferReject::UnknownInput);
             };
+            #[cfg(feature = "native-dex-rehearsal")]
+            if let Some(joint) = context.as_ref() {
+                if let Some(reserve) = joint.reserve.as_ref() {
+                    if reserve.claims(&key) {
+                        if !reserve.authorizes(i, entry, outputs, &joint.authorization) {
+                            return Err(TransferReject::ScriptMismatch);
+                        }
+                        spent_value += entry.value as u128;
+                        continue;
+                    }
+                }
+            }
             let Some(key_hash) = key_hashes.get(i.key_index as usize) else {
                 return Err(TransferReject::BadKeyIndex);
             };
@@ -4253,8 +4344,10 @@ impl CommittedState {
         // verifications, not `inputs.len()`. Both counts are derived from the
         // lists, never asserted; both factors of the multiplication were
         // bounded before it.
-        let charge =
-            fee_market::charge(class, *tx_bytes, base_fee_millisat_per_gas, *tip_millisat_per_gas);
+        let charge = context.as_ref().map_or_else(
+            || fee_market::charge(class, *tx_bytes, base_fee_millisat_per_gas, *tip_millisat_per_gas),
+            |joint| joint.charge,
+        );
 
         // ── Conservation ────────────────────────────────────────────────────
         //
@@ -4270,7 +4363,7 @@ impl CommittedState {
         // The txid comes off the witness-free root, which is byte-identical
         // to the V1 root for the same logical transfer — deliberately, so
         // wallet signatures survive re-encoding (see `spend_signing_root`).
-        let txid = tx.txid();
+        let txid = context.as_ref().map_or_else(|| tx.txid(), |joint| joint.output_txid);
         for vout in 0..outputs.len() as u32 {
             if self.eutxos.contains_key(&(txid, vout)) {
                 return Err(TransferReject::OutputExists);
@@ -4285,32 +4378,22 @@ impl CommittedState {
         // input would get. Same network-aware root as V1 — one fold,
         // shared by both callers, so the two formats cannot drift into
         // different network-binding rules once the gate arms (A2-3 / R7 M2).
-        let signing_root = tx
-            .checked_signing_root_for_network(self.epoch, self.admission_network_domain.as_ref())
-            .ok_or(TransferReject::MissingNetworkBinding)?;
+        let signing_root = match context.as_ref() {
+            Some(joint) => joint.authorization,
+            None => tx
+                .checked_signing_root_for_network(
+                    self.epoch,
+                    self.admission_network_domain.as_ref(),
+                )
+                .ok_or(TransferReject::MissingNetworkBinding)?,
+        };
         for k in keys {
             if !verifier.verify_with_key(&k.pubkey, &signing_root, &k.signature) {
                 return Err(TransferReject::BadSignature);
             }
         }
 
-        // ── Apply ───────────────────────────────────────────────────────────
-        //
-        // Nothing above may fail from here — identical to V1, so a refused
-        // transfer leaves the state untouched.
-        for i in inputs {
-            self.eutxos.remove(&(i.txid, i.vout));
-        }
-        for (vout, o) in outputs.iter().enumerate() {
-            let vout = vout as u32;
-            self.eutxos.insert(crate::state_root::EutxoEntry {
-                txid,
-                vout,
-                value: o.value,
-                script_hash: o.script_hash,
-            });
-        }
-        Ok(charge)
+        Ok(ValidatedTransferV2 { state: self, inputs, outputs, txid, charge })
     }
 
     /// Verify and execute one §7.3 evidence transaction against this state.
@@ -15003,6 +15086,113 @@ mod tests {
             "the slash must still eject the validator, one epoch later than immediately"
         );
         assert!(!after_next_epoch.iter().any(|v| v.index == 3));
+    }
+
+    #[test]
+    fn transfer_v2_explicit_legacy_context_matches_default_plan() {
+        let owner = owner_key(0x60);
+        let coin = opening(0x86, 0, 50_000_000, &owner);
+        let (_, initial, _) = setup_funded(4, std::slice::from_ref(&coin));
+        let price = initial.next_base_fee();
+        let tx = transfer_v2_raw(&[coin], &[&owner], &[0], script_of(&owner_key(0x61)), 512, 2, price);
+        let PosTransaction::TransferV2 { keys, tx_bytes, tip_millisat_per_gas, .. } = &tx else { unreachable!() };
+        let context = JointTransferContext {
+            envelope_bytes: tx.canonical_bytes().len() as u64,
+            output_txid: tx.txid(),
+            charge: fee_market::charge(
+                fee_market::TxClass::Eutxo { inputs: keys.len() as u32 },
+                *tx_bytes, price, *tip_millisat_per_gas,
+            ),
+            authorization: tx.checked_signing_root(initial.epoch),
+            #[cfg(feature = "native-dex-rehearsal")]
+            reserve: None,
+        };
+        let mut legacy = initial.clone();
+        let expected = legacy.plan_transfer_v2(&tx, price, &ToyVerifier).unwrap().commit();
+        let mut explicit = initial;
+        let actual = explicit.plan_transfer_v2_with_context(&tx, price, &ToyVerifier, Some(context)).unwrap().commit();
+        assert_eq!(actual, expected);
+        assert_eq!(explicit, legacy);
+        assert_eq!(explicit.compute_root(), legacy.compute_root());
+    }
+
+    #[test]
+    fn transfer_v2_plan_drop_preserves_complete_state() {
+        let owner = owner_key(0x60);
+        let coin = opening(0x86, 0, 50_000_000, &owner);
+        let (_, mut state, _) = setup_funded(4, std::slice::from_ref(&coin));
+        let price = state.next_base_fee();
+        let tx = transfer_v2_raw(&[coin], &[&owner], &[0], script_of(&owner_key(0x61)), 512, 2, price);
+        let before = state.clone();
+        let root = state.compute_root();
+        // A sibling native-token validation may fail after this succeeds.
+        // Abandoning the base-coin plan must not consume or reserve any input.
+        let plan = state.plan_transfer_v2(&tx, price, &ToyVerifier).unwrap();
+        drop(plan);
+        assert_eq!(state, before);
+        assert_eq!(state.compute_root(), root);
+    }
+
+    #[test]
+    fn transfer_v2_plan_rejections_preserve_state_and_error_order() {
+        let owner = owner_key(0x60);
+        let coin = opening(0x86, 0, 50_000_000, &owner);
+        let (_, initial, _) = setup_funded(4, std::slice::from_ref(&coin));
+        let price = initial.next_base_fee();
+        let valid = transfer_v2_raw(&[coin], &[&owner], &[0], script_of(&owner_key(0x61)), 512, 2, price);
+        for case in 0..6 {
+            let mut tx = valid.clone();
+            let PosTransaction::TransferV2 { inputs, outputs, keys, tx_bytes, .. } = &mut tx else { unreachable!() };
+            let expected = match case {
+                // Each early error also has an invalid signature, checking
+                // that validation did not move expensive crypto earlier.
+                0 => { inputs.clear(); TransferReject::NoInputs }
+                1 => { *tx_bytes = 0; TransferReject::UnderdeclaredSize }
+                2 => { inputs[0].txid = [0xFF; 32]; TransferReject::UnknownInput }
+                3 => { inputs[0].key_index = 99; TransferReject::BadKeyIndex }
+                4 => { outputs[0].value += 1; TransferReject::ValueNotConserved }
+                _ => TransferReject::BadSignature,
+            };
+            keys[0].signature[0] ^= 1;
+            let mut state = initial.clone();
+            let root = state.compute_root();
+            let error = match state.plan_transfer_v2(&tx, price, &ToyVerifier) {
+                Ok(_) => panic!("invalid transfer produced a validated plan"),
+                Err(error) => error,
+            };
+            assert_eq!(error, expected);
+            assert_eq!(state, initial);
+            assert_eq!(state.compute_root(), root);
+            assert_eq!(state.utxos().cloned().collect::<Vec<_>>(), initial.utxos().cloned().collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn transfer_v2_plan_commit_matches_existing_fee_outputs_and_root() {
+        let owner = owner_key(0x60);
+        let coin = opening(0x86, 0, 50_000_000, &owner);
+        let unrelated = opening(0x87, 0, 70_000_000, &owner_key(0x62));
+        let (_, mut state, _) = setup_funded(4, &[coin.clone(), unrelated.clone()]);
+        let price = state.next_base_fee();
+        let tx = transfer_v2_raw(std::slice::from_ref(&coin), &[&owner], &[0], script_of(&owner_key(0x61)), 512, 2, price);
+        let PosTransaction::TransferV2 { outputs, tx_bytes, tip_millisat_per_gas, .. } = &tx else { unreachable!() };
+        let expected_fee = fee_market::charge(fee_market::TxClass::Eutxo { inputs: 1 }, *tx_bytes, price, *tip_millisat_per_gas);
+        let mut expected = state.clone();
+        expected.eutxos.remove(&(coin.txid, coin.vout));
+        for (vout, output) in outputs.iter().enumerate() {
+            expected.eutxos.insert(crate::state_root::EutxoEntry {
+                txid: tx.txid(), vout: vout as u32, value: output.value, script_hash: output.script_hash,
+            });
+        }
+        let bytes = tx.canonical_bytes();
+        let signing_root = tx.checked_signing_root(state.epoch);
+        let charge = state.plan_transfer_v2(&tx, price, &ToyVerifier).unwrap().commit();
+        assert_eq!(charge, expected_fee);
+        assert_eq!(state, expected);
+        assert_eq!(state.compute_root(), expected.compute_root());
+        assert_eq!(state.utxo(&unrelated.txid, unrelated.vout), Some(&unrelated));
+        assert_eq!(tx.canonical_bytes(), bytes);
+        assert_eq!(tx.checked_signing_root(state.epoch), signing_root);
     }
 
     // ── TransferV2: deduplicated witnesses behind their own flag day ────────

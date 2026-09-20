@@ -1,5 +1,7 @@
 # Changes for the endpoint operator
 
+> **12 September 2026 correction:** See [BLOCH-G4-EXCHANGE-CORRECTIONS-2026-09-12](BLOCH-G4-EXCHANGE-CORRECTIONS-2026-09-12.md), which supersedes bootstrap-readiness and error-classification statements below where they conflict. No confirmed Phase-A date is available in the reviewed evidence. Seeded directories alone do not meet the independent-observer crediting rule. Node `-32010` is conditionally retryable, not terminal. Historical operational claims below retain their original dates.
+
 **For:** the operator of `posternlabs.com/g4rpc` and of the two direct nodes
 (`139.180.166.5`, `139.180.173.231`), when rebuilding on the current binary
 (`72e5525` or later). **Source:** code-verified against `72e5525`, 2026-09-07;
