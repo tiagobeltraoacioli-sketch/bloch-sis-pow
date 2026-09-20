@@ -347,12 +347,7 @@ impl HdWallet {
         // Encrypt each keypair with master_key
         let mut addresses = Vec::new();
         for (idx, kp, label) in &self.addresses {
-            let payload = KeypairPayload {
-                private_key_hex: hex::encode(&kp.private_key),
-                public_key_hex:  hex::encode(&kp.public_key),
-            };
-            let bytes = Zeroizing::new(serde_json::to_vec(&payload).map_err(|e| e.to_string())?);
-            let crypto = encrypt_with_key(&self.master_key, &bytes)?;
+            let crypto = encrypt_keypair_for_save(&self.master_key, kp)?;
             addresses.push(HdAddress {
                 index: *idx,
                 address: kp.address.clone(),
@@ -1082,6 +1077,24 @@ fn encrypt_mnemonic_for_save(
     encrypt_with_key(key, &plaintext)
 }
 
+/// Serialize and encrypt one HD address keypair inside a short-lived ownership
+/// boundary. The structured private-key hex and its zeroizing JSON plaintext
+/// are dropped before `HdWallet::save` resumes public metadata assembly.
+fn encrypt_keypair_for_save(
+    key: &[u8],
+    keypair: &Keypair,
+) -> Result<KeystoreCrypto, String> {
+    let payload = KeypairPayload {
+        private_key_hex: hex::encode(&keypair.private_key),
+        public_key_hex: hex::encode(&keypair.public_key),
+    };
+    let plaintext = Zeroizing::new(
+        serde_json::to_vec(&payload).map_err(|e| e.to_string())?,
+    );
+    drop(payload);
+    encrypt_with_key(key, &plaintext)
+}
+
 fn decrypt_with_key(key: &[u8], crypto: &KeystoreCrypto) -> Result<Zeroizing<Vec<u8>>, String> {
     if key.len() != 32 { return Err("AES-256 key must contain 32 bytes".into()); }
     let nonce_b = b64::STANDARD.decode(&crypto.nonce).map_err(|e| e.to_string())?;
@@ -1262,6 +1275,36 @@ mod tests {
         let parsed: BorrowedMnemonicPayload<'_> =
             serde_json::from_slice(&plaintext).unwrap();
         assert_eq!(parsed.mnemonic.as_ref(), mnemonic.to_string());
+    }
+
+    #[test]
+    fn hd_save_keypair_helper_preserves_plaintext_bytes_and_short_lived_ownership() {
+        let _: fn(&[u8], &Keypair) -> Result<KeystoreCrypto, String> =
+            encrypt_keypair_for_save;
+        assert!(std::mem::needs_drop::<KeypairPayload>());
+        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
+
+        let keypair = Keypair {
+            private_key: vec![0xa1, 0xb2, 0xc3, 0xd4],
+            public_key: vec![0x01, 0x02, 0x03, 0x04],
+            address: "unused-test-address".into(),
+        };
+        let expected = serde_json::to_vec(&KeypairPayload {
+            private_key_hex: hex::encode(&keypair.private_key),
+            public_key_hex: hex::encode(&keypair.public_key),
+        }).unwrap();
+        let key = [0x92; 32];
+
+        let encrypted = encrypt_keypair_for_save(&key, &keypair).unwrap();
+        let plaintext = decrypt_with_key(&key, &encrypted).unwrap();
+        assert_eq!(&plaintext[..], &expected);
+
+        let parsed: BorrowedKeypairPayload<'_> =
+            serde_json::from_slice(&plaintext).unwrap();
+        assert!(matches!(&parsed.private_key_hex, Cow::Borrowed(_)));
+        assert!(matches!(&parsed.public_key_hex, Cow::Borrowed(_)));
+        assert_eq!(hex::decode(parsed.private_key_hex.as_ref()).unwrap(), keypair.private_key);
+        assert_eq!(hex::decode(parsed.public_key_hex.as_ref()).unwrap(), keypair.public_key);
     }
 
     #[test]
