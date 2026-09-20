@@ -131,6 +131,7 @@ rollback-package-integrity:
   stage: check
   script:
     - bash deploy/rollback/make-rollback-package.selftest.sh
+    - bash deploy/rollback/make-rollback-package.argv.selftest.sh
   allow_failure: false
 """
 
@@ -218,6 +219,7 @@ jobs:
     steps:
       - run: sudo apt-get update && sudo apt-get install -y minisign
       - run: bash deploy/rollback/make-rollback-package.selftest.sh
+      - run: bash deploy/rollback/make-rollback-package.argv.selftest.sh
 
   cargo-geiger:
     runs-on: ubuntu-latest
@@ -933,12 +935,24 @@ CASES = [
              "    - cargo deny check advisories bans licenses sources || echo ignored"),
          GOOD_GITHUB, must_fail=True, expect="no longer executes its required verdict"),
 
+    Case("gitlab rollback job cannot drop argv preservation selftest",
+         GOOD_GITLAB.replace(
+             "    - bash deploy/rollback/make-rollback-package.argv.selftest.sh\n", ""),
+         GOOD_GITHUB, must_fail=True, expect="adversarial self-test"),
+
+    Case("github rollback job cannot drop argv preservation selftest",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "      - run: bash deploy/rollback/make-rollback-package.argv.selftest.sh\n", ""),
+         must_fail=True, expect="adversarial self-test"),
+
     Case("github rollback integrity job deleted outright",
          GOOD_GITLAB,
          GOOD_GITHUB.replace(
              "  rollback-package-integrity:\n    runs-on: ubuntu-latest\n"
              "    steps:\n      - run: sudo apt-get update && sudo apt-get install -y minisign\n"
-             "      - run: bash deploy/rollback/make-rollback-package.selftest.sh\n\n", ""),
+             "      - run: bash deploy/rollback/make-rollback-package.selftest.sh\n"
+             "      - run: bash deploy/rollback/make-rollback-package.argv.selftest.sh\n\n", ""),
          must_fail=True, expect="`rollback-package-integrity`"),
 
     Case("required clippy job deleted",

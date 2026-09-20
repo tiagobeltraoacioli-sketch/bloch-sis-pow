@@ -255,8 +255,9 @@ jobs:
   # Rollback-package authentication (audit I-H3 / INF-09). GitLab runs this
   # disposable-key end-to-end test; the GitHub mirror must exercise the same
   # root-execution boundary. It proves that a rewritten manifest, edited
-  # installer, missing signature, wrong trust root and cross-package signature
-  # are refused before staging. No fleet service or release key is touched.
+  # installer, missing signature, wrong trust root, cross-package signature and
+  # unsafe/lost service arguments are refused before staging. No fleet service
+  # or release key is touched.
   rollback-package-integrity:
     name: rollback package integrity (blocking)
     runs-on: ubuntu-latest
@@ -267,6 +268,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y minisign
       - name: Authenticate rollback package and rejection paths
         run: bash deploy/rollback/make-rollback-package.selftest.sh
+      - name: Preserve rollback service arguments without shell parsing
+        run: bash deploy/rollback/make-rollback-package.argv.selftest.sh
 
   # ── REPORT-ONLY jobs begin here ───────────────────────────────────────────────
 

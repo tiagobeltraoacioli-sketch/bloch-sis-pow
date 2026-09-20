@@ -182,6 +182,26 @@ mv "$SNAPSHOT" "$PKGDIR/bloch-pos"
 
 printf 'stamp: %s\n' "$STAMP" > "$PKGDIR/STAMP"
 
+# Preserve the running service's effective argv without serialising it through
+# shell/systemd quoting. The installer snapshots /proc/PID/cmdline verbatim;
+# this signed launcher reads that NUL-delimited data into an array and execs it
+# without eval, discarding only the old executable name (argv[0]).
+cat > "$PKGDIR/rollback-launcher" <<'LAUNCHER'
+#!/bin/bash
+set -euo pipefail
+SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+ROLLBACK_ARGV=()
+while IFS= read -r -d '' arg; do
+  ROLLBACK_ARGV+=("$arg")
+done
+[ "${#ROLLBACK_ARGV[@]}" -ge 1 ] && [ -n "${ROLLBACK_ARGV[0]}" ] || {
+  echo "FAIL: rollback argv snapshot has no non-empty argv[0]." >&2
+  exit 1
+}
+exec "$SELF_DIR/bloch-pos" "${ROLLBACK_ARGV[@]:1}" </dev/null
+LAUNCHER
+chmod 0755 "$PKGDIR/rollback-launcher"
+
 # ── the drop-in ──────────────────────────────────────────────────────────────
 # 99- so it sorts LAST: systemd merges up to N drop-ins and for ExecStart the
 # last-read file wins (after the reset line). The 2026-08-11 fleet survey found
@@ -191,7 +211,8 @@ cat > "$PKGDIR/99-rollback.conf" <<EOF
 # Installed by bloch-pos-rollback-$ID — REMOVE this file to leave rollback.
 [Service]
 ExecStart=
-ExecStart=/opt/bloch/releases/rollback-$ID/bloch-pos
+ExecStart=/opt/bloch/releases/rollback-$ID/rollback-launcher
+StandardInput=file:/opt/bloch/releases/rollback-$ID/argv.nul
 EOF
 
 # ── install.sh (runs ON the box, BY the operator, never by CI) ───────────────
@@ -223,6 +244,11 @@ cd "$(dirname "$0")"
 VERIFY_ONLY=0
 if [ "${1:-}" = "--verify-only" ]; then VERIFY_ONLY=1; shift; fi
 SVC="${1:-bloch-pos.service}"
+if ! printf '%s\n' "$SVC" | LC_ALL=C grep -Eq '^[A-Za-z0-9_.@:-]+\.service$' \
+   || [ "${SVC#-}" != "$SVC" ]; then
+  echo "FAIL: invalid systemd service name: $SVC" >&2
+  exit 1
+fi
 ID="$(basename "$(pwd)" | sed 's/^bloch-pos-rollback-//')"
 DEST="/opt/bloch/releases/rollback-$ID"
 
@@ -307,29 +333,64 @@ if [ "$VERIFY_ONLY" = 1 ]; then
   exit 0
 fi
 
-echo "== stage binary =="
+echo "== capture effective argv from the running service =="
+OLDPID="$(systemctl show -p ExecMainPID --value -- "$SVC" || true)"
+[ -n "${OLDPID:-}" ] && [ "$OLDPID" != "0" ] \
+  && [ -e "/proc/$OLDPID/exe" ] && [ -r "/proc/$OLDPID/cmdline" ] || {
+  echo "FAIL: $SVC is not running; effective argv cannot be recovered safely." >&2
+  echo "This installer will not guess the service arguments." >&2
+  exit 1
+}
+# /proc/PID/stat field 22 is the process start time. Remove the parenthesised
+# comm first (it may contain spaces), making it field 20 of the remaining text.
+OLD_STAT="$(cat "/proc/$OLDPID/stat")"
+OLD_START="$(printf '%s\n' "${OLD_STAT##*) }" | awk '{print $20}')"
+[ -n "$OLD_START" ] || { echo "FAIL: cannot identify $SVC main process." >&2; exit 1; }
+ARGV_TMP="$(mktemp "${TMPDIR:-/tmp}/bloch-rollback-argv.XXXXXX")"
+trap 'rm -f -- "${ARGV_TMP:-}"' EXIT
+trap 'exit 1' HUP INT TERM
+cp -- "/proc/$OLDPID/cmdline" "$ARGV_TMP"
+ARGV_COUNT=0
+ARGV0=
+while IFS= read -r -d '' arg; do
+  ARGV_COUNT=$((ARGV_COUNT + 1))
+  if [ "$ARGV_COUNT" -eq 1 ]; then ARGV0="$arg"; fi
+done < "$ARGV_TMP"
+[ "$ARGV_COUNT" -ge 1 ] && [ -n "$ARGV0" ] || {
+  echo "FAIL: /proc/$OLDPID/cmdline has no non-empty argv[0]." >&2
+  exit 1
+}
+CHECKPID="$(systemctl show -p ExecMainPID --value -- "$SVC" || true)"
+NEW_STAT="$(cat "/proc/$OLDPID/stat" 2>/dev/null || true)"
+NEW_START="$(printf '%s\n' "${NEW_STAT##*) }" | awk '{print $20}')"
+if [ "$CHECKPID" != "$OLDPID" ] || [ -z "$NEW_START" ] || [ "$NEW_START" != "$OLD_START" ]; then
+  echo "FAIL: $SVC restarted while its effective argv was being captured." >&2
+  exit 1
+fi
+echo "was: $(readlink "/proc/$OLDPID/exe")  sha256=$(sha256sum "/proc/$OLDPID/exe" | awk '{print $1}')  argc=$ARGV_COUNT"
+
+echo "== stage binary, launcher and captured argv =="
 mkdir -p "$DEST"
 install -m 0755 bloch-pos "$DEST/bloch-pos"
+install -m 0755 rollback-launcher "$DEST/rollback-launcher"
+install -m 0600 "$ARGV_TMP" "$DEST/argv.nul"
+rm -f -- "$ARGV_TMP"
+trap - EXIT HUP INT TERM
 verify_binary_identity "$DEST/bloch-pos"
-
-echo "== record what was running (for the incident log) =="
-OLDPID="$(systemctl show "$SVC" -p ExecMainPID --value || true)"
-if [ -n "${OLDPID:-}" ] && [ "$OLDPID" != "0" ] && [ -e "/proc/$OLDPID/exe" ]; then
-  echo "was: $(readlink "/proc/$OLDPID/exe")  sha256=$(sha256sum "/proc/$OLDPID/exe" | awk '{print $1}')"
-else
-  echo "was: $SVC not running"
-fi
 
 echo "== install drop-in (wins over every stacked drop-in: sorts last) =="
 mkdir -p "/etc/systemd/system/$SVC.d"
 install -m 0644 99-rollback.conf "/etc/systemd/system/$SVC.d/99-rollback.conf"
 systemctl daemon-reload
-systemctl restart "$SVC"
+systemctl restart -- "$SVC"
 
 echo "== PROVE it (the authoritative check: /proc, never the unit file) =="
 sleep 2
-PID="$(systemctl show "$SVC" -p ExecMainPID --value)"
+PID="$(systemctl show -p ExecMainPID --value -- "$SVC")"
 [ -n "$PID" ] && [ "$PID" != "0" ] || { echo "FAIL: $SVC has no main PID after restart"; exit 1; }
+RUN_STAT="$(cat "/proc/$PID/stat" 2>/dev/null || true)"
+RUN_START="$(printf '%s\n' "${RUN_STAT##*) }" | awk '{print $20}')"
+[ -n "$RUN_START" ] || { echo "FAIL: cannot identify restarted $SVC process." >&2; exit 1; }
 RUN_HASH="$(sha256sum "/proc/$PID/exe" | awk '{print $1}')"
 # The bloch-pos row of the SIGNED manifest — not the whole file: it now covers
 # install.sh, the drop-in and the README too.
@@ -341,7 +402,42 @@ if [ "$RUN_HASH" != "$PKG_HASH" ]; then
   echo "  systemd-delta --type=extended | grep $SVC ; systemctl cat $SVC"
   exit 1
 fi
-echo "ROLLBACK APPLIED AND VERIFIED: $SVC runs the packaged binary."
+
+# Prove the launcher preserved every effective argument. Bash arrays retain
+# empty arguments, whitespace and metacharacters without eval or re-quoting;
+# argv cannot itself contain NUL. Ignore argv[0], which intentionally changed
+# from the old executable path to the rollback binary path. Never print the
+# argument values: command lines may contain operational secrets.
+RUN_ARGV_TMP="$(mktemp "${TMPDIR:-/tmp}/bloch-rollback-running-argv.XXXXXX")"
+trap 'rm -f -- "${RUN_ARGV_TMP:-}"' EXIT
+trap 'exit 1' HUP INT TERM
+cp -- "/proc/$PID/cmdline" "$RUN_ARGV_TMP"
+CHECKPID="$(systemctl show -p ExecMainPID --value -- "$SVC" || true)"
+CHECK_STAT="$(cat "/proc/$PID/stat" 2>/dev/null || true)"
+CHECK_START="$(printf '%s\n' "${CHECK_STAT##*) }" | awk '{print $20}')"
+if [ "$CHECKPID" != "$PID" ] || [ -z "$CHECK_START" ] || [ "$CHECK_START" != "$RUN_START" ]; then
+  echo "FAIL: $SVC restarted while its post-rollback argv was being verified." >&2
+  exit 1
+fi
+EXPECTED_ARGV=()
+while IFS= read -r -d '' arg; do EXPECTED_ARGV+=("$arg"); done < "$DEST/argv.nul"
+RUNNING_ARGV=()
+while IFS= read -r -d '' arg; do RUNNING_ARGV+=("$arg"); done < "$RUN_ARGV_TMP"
+rm -f -- "$RUN_ARGV_TMP"
+trap - EXIT HUP INT TERM
+if [ "${#EXPECTED_ARGV[@]}" -ne "${#RUNNING_ARGV[@]}" ]; then
+  echo "FAIL: restarted $SVC argument count differs from the captured command." >&2
+  exit 1
+fi
+ARG_INDEX=1
+while [ "$ARG_INDEX" -lt "${#EXPECTED_ARGV[@]}" ]; do
+  if [ "${EXPECTED_ARGV[$ARG_INDEX]}" != "${RUNNING_ARGV[$ARG_INDEX]}" ]; then
+    echo "FAIL: restarted $SVC argument $ARG_INDEX differs from the captured command." >&2
+    exit 1
+  fi
+  ARG_INDEX=$((ARG_INDEX + 1))
+done
+echo "ROLLBACK APPLIED AND VERIFIED: $SVC runs the packaged binary with the captured argv."
 echo "To leave rollback later: rm /etc/systemd/system/$SVC.d/99-rollback.conf && systemctl daemon-reload && systemctl restart $SVC"
 INSTALL
 } > "$PKGDIR/install.sh"
@@ -369,6 +465,11 @@ Apply on a box:   sudo ./install.sh [service-name]     (default bloch-pos.servic
 Leave rollback:   rm /etc/systemd/system/<svc>.d/99-rollback.conf
                   systemctl daemon-reload && systemctl restart <svc>
 
+The service must be running when install.sh is applied. The installer snapshots
+its effective NUL-delimited argv from /proc/<main-pid>/cmdline and the signed
+launcher passes those arguments to the rollback binary without shell parsing.
+It refuses to guess arguments for an inactive service.
+
 This package must have been TESTED on a scratch host before it counts for
 gate G8 — the procedure is deploy/RELEASE-INTEGRITY.md §5.3. Applying it to
 the live fleet is an operator decision, never automation.
@@ -376,7 +477,7 @@ EOF
 
 # ── the manifest: every file that reaches root, not just the binary ──────────
 : > "$PKGDIR/SHA256SUMS"
-for f in bloch-pos STAMP 99-rollback.conf install.sh README; do
+for f in bloch-pos STAMP rollback-launcher 99-rollback.conf install.sh README; do
   file_hash="$(validated_sha256_file "$PKGDIR/$f" "rollback manifest entry $f")"
   printf '%s  %s\n' "$file_hash" "$f" >> "$PKGDIR/SHA256SUMS"
 done

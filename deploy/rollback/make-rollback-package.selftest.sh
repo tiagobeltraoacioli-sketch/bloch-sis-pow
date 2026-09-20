@@ -77,7 +77,7 @@ case "${ROLLBACK_SHA_MODE:-canonical}" in
     count=$((count + 1))
     printf '%s\n' "$count" > "$state"
     fail_at=3
-    [ "${ROLLBACK_SHA_MODE}" != tarball-duplicate ] || fail_at=7
+    [ "${ROLLBACK_SHA_MODE}" != tarball-duplicate ] || fail_at=8
     if [ "$count" -eq "$fail_at" ]; then
       printf '%064d  %s\n' 0 "${1:-input}"
       printf '%064d  second-row\n' 0
@@ -311,7 +311,7 @@ else
 fi
 
 # ── 3. the manifest covers every file that reaches root, not just the binary ─
-for f in bloch-pos STAMP 99-rollback.conf install.sh README; do
+for f in bloch-pos STAMP rollback-launcher 99-rollback.conf install.sh README; do
   if awk -v n="$f" '$2 == n { found = 1 } END { exit !found }' "$PKG/SHA256SUMS"; then
     ok "manifest covers $f"
   else
@@ -388,7 +388,7 @@ expect_fail version-self-mutating \
 rm -rf "$W/case-swapped"; cp -R "$PKG" "$W/case-swapped"
 printf '#!/bin/sh\necho pwned\n' > "$W/case-swapped/bloch-pos"
 ( cd "$W/case-swapped" && : > SHA256SUMS
-  for f in bloch-pos STAMP 99-rollback.conf install.sh README; do
+  for f in bloch-pos STAMP rollback-launcher 99-rollback.conf install.sh README; do
     printf '%s  %s\n' "$(shasum -a 256 "$f" 2>/dev/null | awk '{print $1}')" "$f" >> SHA256SUMS
   done )
 # sanity: the manifest the attacker wrote is internally consistent

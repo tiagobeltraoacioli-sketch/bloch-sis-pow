@@ -191,11 +191,12 @@ Contents (verified by extracting the test package):
 | File | Purpose |
 |---|---|
 | `bloch-pos` | the known-good canonical binary |
-| `SHA256SUMS` | manifest over **every** file in the package — the binary, `STAMP`, the drop-in, `README` and `install.sh` itself; all of them reach root |
+| `SHA256SUMS` | manifest over **every** file in the package — the binary, `STAMP`, launcher, drop-in, `README` and `install.sh` itself; all of them reach root |
 | `SHA256SUMS.minisig` | **detached minisign signature over that manifest** (§5.4) — the only thing in the package that a tampered tarball cannot forge |
 | `STAMP` | the release identity; `install.sh` prints it and refuses on hash mismatch |
-| `99-rollback.conf` | systemd drop-in — `ExecStart=` reset + rollback path; named `99-` so it sorts after every stacked drop-in and therefore wins |
-| `install.sh` | **verify the detached signature against an out-of-band key → `sha256sum -c` the signed manifest** → stage to `/opt/bloch/releases/rollback-<id>/` → record what WAS running (incident log) → install drop-in → restart → **prove via `/proc` that the running hash equals the packaged hash**, failing loudly if any generator still overrides it. `./install.sh --verify-only` runs the two verification steps and stops |
+| `rollback-launcher` | signed launcher that reads the captured NUL-delimited argv from standard input into an array and `exec`s the rollback binary without `eval`, shell re-parsing or systemd argument re-quoting; systemd opens the root-only staged `argv.nul` via `StandardInput=file:` before applying the unit's `User=` |
+| `99-rollback.conf` | systemd drop-in — `ExecStart=` reset + rollback launcher path; named `99-` so it sorts after every stacked drop-in and therefore wins |
+| `install.sh` | **verify the detached signature against an out-of-band key → `sha256sum -c` the signed manifest** → require a running service and snapshot its effective `/proc/<pid>/cmdline` → stage to `/opt/bloch/releases/rollback-<id>/` → install drop-in → restart → **prove via `/proc` that the running hash equals the packaged hash and every argument after argv[0] is byte-for-byte unchanged**, failing loudly if either differs. `./install.sh --verify-only` runs the package verification and stops |
 | `README` | apply / un-apply instructions, and how to verify the package by hand |
 
 The signing public key is **published beside the tarball, never inside it**
@@ -229,7 +230,12 @@ A package that has not passed this on a scratch host does not count for G8:
 2. Run `sudo ./install.sh bloch-pos-scratch.service` from the extracted
    package. It must end with `ROLLBACK APPLIED AND VERIFIED` — that line is
    printed only after the running `/proc/PID/exe` hash equals the packaged
-   hash, i.e. after proving it beat the stacked drop-ins.
+   hash, i.e. after proving it beat the stacked drop-ins. Give the scratch
+   unit arguments containing spaces, an empty argument, glob characters,
+   quotes, `$()` text and `%` specifier-like text; compare the NUL-delimited
+   `/proc/PID/cmdline` before and after (ignoring argv[0]) and require an exact
+   match. The installer performs this comparison itself and fails closed on a
+   mismatch. This proves arguments are data, not shell or systemd syntax.
 3. Corrupt one byte of the packaged `bloch-pos` and re-run: `install.sh` must
    refuse at the `sha256sum -c` step. (Negative test — a rollback that
    installs corrupt bytes is worse than the outage.)

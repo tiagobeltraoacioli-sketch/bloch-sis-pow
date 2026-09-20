@@ -148,6 +148,8 @@ GITHUB_VERDICTS = {
 SELFTEST_VERDICTS = {
     "scanners-blocking-guard": re.compile(
         r"^python3\s+scripts/check-scanners-blocking\.selftest\.py$"),
+    "rollback-package-integrity": re.compile(
+        r"^bash\s+deploy/rollback/make-rollback-package\.argv\.selftest\.sh$"),
 }
 
 SHELL_ESCAPES = (
@@ -229,6 +231,7 @@ GITHUB_REVIEWED_RUNS = {
     "rollback-package-integrity": (
         "sudo apt-get update && sudo apt-get install -y minisign",
         "bash deploy/rollback/make-rollback-package.selftest.sh",
+        "bash deploy/rollback/make-rollback-package.argv.selftest.sh",
     ),
 }
 GITHUB_STATE_CHANNEL = re.compile(
