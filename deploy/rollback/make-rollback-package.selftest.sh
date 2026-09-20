@@ -115,9 +115,33 @@ minisign -G -W -f -p "$W/other.pub" -s "$W/other.key" >/dev/null 2>&1
 
 # ── a stand-in for the known-good binary ────────────────────────────────────
 STAMP='0.0.1-selftest (abcdef123456)'
-cat > "$W/bloch-pos" <<BINSTUB
+cat > "$W/bloch-pos" <<'BINSTUB'
 #!/usr/bin/env bash
-echo "bloch-pos-node $STAMP built-by-selftest"
+stamp='0.0.1-selftest (abcdef123456)'
+case "${ROLLBACK_SELFTEST_VERSION_MODE:-canonical}" in
+  canonical)
+    printf 'bloch-pos-node %s built-by-selftest\n' "$stamp"
+    ;;
+  exit)
+    exit 73
+    ;;
+  later-decoy)
+    printf '%s\n' 'bloch-pos-node 0.0.1-selftest (deadbeef1234) decoy-first'
+    printf 'decoy %s\n' "$stamp"
+    ;;
+  embedded)
+    printf 'bloch-pos-node x%sy built-by-selftest\n' "$stamp"
+    ;;
+  self-mutating)
+    printf 'bloch-pos-node %s before-mutation\n' "$stamp"
+    printf '%s\n' '#!/usr/bin/env bash' \
+      "echo 'bloch-pos-node $stamp changed-by-version'" > "$0"
+    chmod 0755 "$0"
+    ;;
+  *)
+    exit 74
+    ;;
+esac
 BINSTUB
 chmod 0755 "$W/bloch-pos"
 
@@ -310,9 +334,12 @@ fi
 
 # ── the verification harness ────────────────────────────────────────────────
 # Each case runs on a pristine copy, with the pinned key supplied out of band.
-# verify <case> <package dir> <pinned pubkey> -> $W/<case>.out, rc in $W/<case>.rc
+# verify <case> <package dir> <pinned pubkey> [version mode]
+#   -> $W/<case>.out, rc in $W/<case>.rc
 verify() {
-  ( cd "$2" && BLOCH_ROLLBACK_PUBKEY="$3" ./install.sh --verify-only ) > "$W/$1.out" 2>&1
+  mode="${4:-canonical}"
+  ( cd "$2" && ROLLBACK_SELFTEST_VERSION_MODE="$mode" \
+      BLOCH_ROLLBACK_PUBKEY="$3" ./install.sh --verify-only ) > "$W/$1.out" 2>&1
   printf '%s\n' "$?" > "$W/$1.rc"
 }
 expect_ok() { # $1 = case, $2 = what
@@ -336,6 +363,24 @@ expect_fail() { # $1 = case, $2 = what, $3 = expected message fragment
 rm -rf "$W/case-good"; cp -R "$PKG" "$W/case-good"
 verify good "$W/case-good" "$W/rel.pub"
 expect_ok good "an untampered package verifies"
+
+# ── runtime identity: signed bytes must report their signed stamp ───────────
+for mode in exit later-decoy embedded self-mutating; do
+  rm -rf "$W/case-version-$mode"
+  cp -R "$PKG" "$W/case-version-$mode"
+  verify "version-$mode" "$W/case-version-$mode" "$W/rel.pub" "$mode"
+done
+expect_fail version-exit "a failing packaged --version is refused" \
+  "rollback binary --version failed"
+expect_fail version-later-decoy \
+  "a packaged stamp present only on a later version line is refused" \
+  "first version line does not report the packaged stamp"
+expect_fail version-embedded \
+  "a packaged stamp embedded inside a larger version token is refused" \
+  "first version line does not report the packaged stamp"
+expect_fail version-self-mutating \
+  "a packaged binary that changes while reporting its version is refused" \
+  "rollback binary changed while reporting its version"
 
 # ── 6. THE HEADLINE CASE (I-H3): swapped binary + recomputed manifest ───────
 # The attacker does the obvious thing: replace the binary, then rebuild

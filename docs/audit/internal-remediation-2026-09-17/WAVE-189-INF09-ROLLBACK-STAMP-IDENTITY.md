@@ -70,8 +70,9 @@ the stamp, binary, signing key, checksum/minisign executable or assembly host.
 A runnable malicious binary can still self-report the caller's structurally
 valid stamp. If the snapshot cannot execute on the assembly host, the existing
 cross-platform compatibility behavior still skips runtime comparison; the
-stamp remains carried into the signed package and is checked when applied on a
-compatible host.
+stamp remains carried into the signed package. At this wave's comparison base,
+the generated installer printed but did not yet compare that stamp on a
+compatible host; Wave 193 closes that subsequent residual.
 
 Real release signing and publication, out-of-band host key pinning, a
 scratch-systemd rehearsal, staged N-1 availability, rollback execution and
