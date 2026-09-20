@@ -77,6 +77,26 @@ if [[ -n "$key_link_violation" ]]; then
   exit 2
 fi
 
+# `cosign generate-key-pair` creates an owner-private key. Preserve that
+# confidentiality boundary instead of allowing a permissive umask or later
+# chmod to make the secret group/world accessible. GNU and BSD/macOS expose
+# the same octal mode through different `stat` forms; failure is a refusal.
+if key_mode="$(stat -c '%a' "$COSIGN_KEY_REAL" 2>/dev/null)"; then
+  :
+elif key_mode="$(stat -f '%Lp' "$COSIGN_KEY_REAL" 2>/dev/null)"; then
+  :
+else
+  echo "sign-image.sh: cannot inspect COSIGN_KEY permissions: $COSIGN_KEY_REAL" >&2
+  exit 2
+fi
+case "$key_mode" in
+  400|600) ;;
+  *)
+    echo "sign-image.sh: COSIGN_KEY permissions must be 0400 or 0600 (got: $key_mode): $COSIGN_KEY_REAL" >&2
+    exit 2
+    ;;
+esac
+
 # Pass the physical path whose ancestry and link count were validated.
 COSIGN_KEY="$COSIGN_KEY_REAL"
 
