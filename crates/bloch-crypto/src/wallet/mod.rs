@@ -872,16 +872,16 @@ impl Keypair {
         let mut nonce_b = [0u8; 12];
         rand::rng().fill_bytes(&mut nonce_b);
 
-        let payload = KeystorePayload {
-            private_key_hex: hex::encode(&self.private_key),
-            public_key_hex:  hex::encode(&self.public_key),
-        };
-        let plain = Zeroizing::new(
-            serde_json::to_vec(&payload).map_err(|e| e.to_string())?,
-        );
-        let cipher  = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&enc_key));
-        let ct      = cipher.encrypt(Nonce::from_slice(&nonce_b), plain.as_ref())
-            .map_err(|e| e.to_string())?;
+        let ct = encrypt_legacy_keystore_payload(
+            &enc_key,
+            &nonce_b,
+            &self.private_key,
+            &self.public_key,
+        )?;
+        // The derived key is no longer needed once the private helper has
+        // returned the ciphertext. Wipe it before public metadata assembly,
+        // final JSON serialization and atomic write/fsync below.
+        drop(enc_key);
 
         let ks = EncryptedKeystore {
             version: 2,
@@ -970,6 +970,31 @@ impl Keypair {
         if derived != ks.address { return Err("address mismatch — keystore may be tampered".into()); }
         Ok(Keypair { private_key: std::mem::take(&mut *private_key), public_key, address: ks.address })
     }
+}
+
+/// Serialize and encrypt the legacy keypair while keeping repository-owned
+/// secret copies inside this short-lived boundary. The structured hex payload
+/// is wiped as soon as serialization succeeds; the zeroizing JSON plaintext
+/// is wiped when this helper returns, before public metadata is assembled or
+/// the final keystore is written.
+fn encrypt_legacy_keystore_payload(
+    key: &[u8],
+    nonce: &[u8; 12],
+    private_key: &[u8],
+    public_key: &[u8],
+) -> Result<Vec<u8>, String> {
+    let payload = KeystorePayload {
+        private_key_hex: hex::encode(private_key),
+        public_key_hex: hex::encode(public_key),
+    };
+    let plain = Zeroizing::new(
+        serde_json::to_vec(&payload).map_err(|e| e.to_string())?,
+    );
+    drop(payload);
+
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    cipher.encrypt(Nonce::from_slice(nonce), plain.as_ref())
+        .map_err(|e| e.to_string())
 }
 
 fn decrypt_legacy_keystore_in_place(
@@ -1231,17 +1256,35 @@ mod legacy_keystore_tests {
     #[test]
     fn legacy_save_temporaries_have_zeroizing_ownership_and_exact_json() {
         let _: fn(&str, &[u8]) -> Result<Zeroizing<Vec<u8>>, String> = derive_key;
+        let _: fn(&[u8], &[u8; 12], &[u8], &[u8]) -> Result<Vec<u8>, String> =
+            encrypt_legacy_keystore_payload;
         assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
+        assert!(std::mem::needs_drop::<KeystorePayload>());
 
         let payload = KeystorePayload {
             private_key_hex: "a1b2c3d4".into(),
             public_key_hex: "01020304".into(),
         };
         let expected = serde_json::to_vec(&payload).unwrap();
-        let mut plain = Zeroizing::new(serde_json::to_vec(&payload).unwrap());
-        assert_eq!(&plain[..], &expected);
-        plain.zeroize();
-        assert!(plain.is_empty() || plain.iter().all(|byte| *byte == 0));
+        let key = [0x52; 32];
+        let nonce = [0x73; 12];
+        let historical_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+        let expected_ciphertext = historical_cipher
+            .encrypt(Nonce::from_slice(&nonce), expected.as_slice())
+            .unwrap();
+        let mut ciphertext = Zeroizing::new(
+            encrypt_legacy_keystore_payload(
+                &key,
+                &nonce,
+                &[0xa1, 0xb2, 0xc3, 0xd4],
+                &[0x01, 0x02, 0x03, 0x04],
+            ).unwrap(),
+        );
+        assert_eq!(&ciphertext[..], &expected_ciphertext);
+        decrypt_legacy_keystore_in_place(&key, &nonce, &mut ciphertext).unwrap();
+        assert_eq!(&ciphertext[..], &expected);
+        ciphertext.zeroize();
+        assert!(ciphertext.is_empty() || ciphertext.iter().all(|byte| *byte == 0));
     }
 
     #[test]
