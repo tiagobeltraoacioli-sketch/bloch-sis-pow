@@ -718,6 +718,11 @@ const REJECTION_TTL_SLOTS: u64 = 128;
 /// At the cap the entry expiring SOONEST is evicted first: it is the one whose
 /// door was about to reopen anyway, so the eviction costs the least protection.
 const REJECTION_MAX: usize = 4_096;
+/// Canonical-key bytes retained by the rejection cache. Match the aggregate
+/// mempool payload budget: a sequence of rejected transactions must not turn
+/// the count-bounded retry barrier into a larger payload store than the pool
+/// it protects. This bounds encoded bytes, not map/allocator overhead.
+const REJECTION_BYTES_MAX: usize = admission::MAX_MEMPOOL_BYTES;
 
 /// Transactions a proposal will carry at most, independent of the consensus
 /// byte cap it is also checked against.
@@ -1588,6 +1593,8 @@ struct Engine {
     /// does not have. Each node learns from its own proposals, and convergence
     /// is the fleet arriving at the same answer separately.
     rejected: BTreeMap<Vec<u8>, (u64, u64)>,
+    /// Exact sum of canonical key lengths in `rejected`.
+    rejected_bytes: usize,
     /// Total re-offers this node has barred since boot, across all keys.
     rejected_hits: u64,
     /// Transactions the epoch sweep found spending inputs this chain does not
@@ -3988,8 +3995,41 @@ impl Engine {
     /// this call reclaims the space. A node that stops proposing therefore
     /// stops growing this, which is the correct shape — it also stops learning.
     fn reject_transaction(&mut self, key: Vec<u8>, slot: u64) {
-        self.rejected.retain(|_, (until, _)| *until > slot);
-        while self.rejected.len() >= REJECTION_MAX {
+        self.reject_transaction_bounded(key, slot, REJECTION_BYTES_MAX);
+    }
+
+    /// Shared implementation with an explicit byte limit so boundary tests do
+    /// not need multi-megabyte fixtures. Production always supplies
+    /// [`REJECTION_BYTES_MAX`].
+    fn reject_transaction_bounded(&mut self, key: Vec<u8>, slot: u64, bytes_cap: usize) {
+        // Recompute while the existing expiry scan already visits every key.
+        // This makes one value authoritative after purge even if a future edit
+        // changes the removal mix; all point removals below use one helper.
+        let mut retained_bytes = 0usize;
+        self.rejected.retain(|retained, (until, _)| {
+            let keep = *until > slot;
+            if keep {
+                retained_bytes = retained_bytes
+                    .checked_add(retained.len())
+                    .expect("retained rejection-key bytes fit usize");
+            }
+            keep
+        });
+        self.rejected_bytes = retained_bytes;
+
+        // Re-barring the same key replaces its expiry/hit record. Remove it
+        // before capacity planning so replacement cannot evict an unrelated
+        // entry merely because the cache was exactly full.
+        self.remove_rejected(&key);
+
+        // All production keys passed through the byte-bounded mempool. Keep
+        // this defensive guard fail-bounded if that invariant ever changes.
+        if key.len() > bytes_cap {
+            return;
+        }
+        while self.rejected.len() >= REJECTION_MAX
+            || self.rejected_bytes.saturating_add(key.len()) > bytes_cap
+        {
             // Evict the soonest to lapse: it is the entry closest to being
             // worthless anyway. `BTreeMap` is ordered by KEY, not by value, so
             // the minimum has to be found rather than popped.
@@ -4001,9 +4041,27 @@ impl Engine {
             else {
                 break;
             };
-            self.rejected.remove(&victim);
+            self.remove_rejected(&victim);
         }
+        self.rejected_bytes = self
+            .rejected_bytes
+            .checked_add(key.len())
+            .expect("admitted rejection-key bytes fit the configured cap");
         self.rejected.insert(key, (slot.saturating_add(REJECTION_TTL_SLOTS), 0));
+        debug_assert_eq!(
+            self.rejected_bytes,
+            self.rejected.keys().map(Vec::len).sum::<usize>(),
+        );
+    }
+
+    /// Remove one cached refusal and its exact encoded-byte charge.
+    fn remove_rejected(&mut self, key: &[u8]) -> Option<(u64, u64)> {
+        let removed = self.rejected.remove(key)?;
+        self.rejected_bytes = self
+            .rejected_bytes
+            .checked_sub(key.len())
+            .expect("rejection cache byte accounting matches its keys");
+        Some(removed)
     }
 
     /// Whether `key` is barred as of `slot`, without mutating anything.
@@ -6050,6 +6108,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         mempool_expired: 0,
         mempool_evicted_low_fee: 0,
         rejected: BTreeMap::new(),
+        rejected_bytes: 0,
         rejected_hits: 0,
         mempool_suspect: BTreeSet::new(),
         mempool_swept_epoch: u64::MAX,
@@ -8854,9 +8913,10 @@ mod transfer_v2_end_to_end {
             mempool_expired: 0,
             mempool_evicted_low_fee: 0,
             rejected: BTreeMap::new(),
-        rejected_hits: 0,
-        mempool_suspect: BTreeSet::new(),
-        mempool_swept_epoch: u64::MAX,
+            rejected_bytes: 0,
+            rejected_hits: 0,
+            mempool_suspect: BTreeSet::new(),
+            mempool_swept_epoch: u64::MAX,
             store,
             slashprot: SlashingProtection::open(&dir).expect("open slashing protection"),
             net,
@@ -9619,6 +9679,58 @@ mod transfer_v2_end_to_end {
         assert_eq!(node.on_transaction(tx), Ok(Admitted::New));
     }
 
+    #[test]
+    fn rejection_cache_byte_boundary_eviction_expiry_and_replacement_are_exact() {
+        let (entries, _) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let cap = 10;
+        let first = vec![0xA1; 6];
+        let second = vec![0xB2; 4];
+        let plus_one = vec![0xC3; 1];
+        let refill = vec![0xD4; 5];
+        let after_expiry = vec![0xE5; 1];
+
+        node.reject_transaction_bounded(first.clone(), 10, cap);
+        node.reject_transaction_bounded(second.clone(), 11, cap);
+        assert_eq!(node.rejected_bytes, cap, "the exact byte boundary is admitted");
+        assert_eq!(
+            node.rejected_bytes,
+            node.rejected.keys().map(Vec::len).sum::<usize>(),
+        );
+
+        node.reject_transaction_bounded(plus_one.clone(), 12, cap);
+        assert!(!node.rejected.contains_key(&first), "+1 evicts the earliest expiry");
+        assert!(node.rejected.contains_key(&second));
+        assert!(node.rejected.contains_key(&plus_one));
+        assert_eq!(node.rejected_bytes, 5);
+        node.reject_transaction_bounded(refill.clone(), 13, cap);
+        assert_eq!(node.rejected_bytes, cap, "eviction reopens the exact charge");
+
+        node.reject_transaction_bounded(second.clone(), 20, cap);
+        assert_eq!(node.rejected_bytes, cap, "replacement must not double-charge");
+        assert!(node.rejected.contains_key(&plus_one));
+        assert!(node.rejected.contains_key(&refill));
+        assert_eq!(node.rejected.get(&second), Some(&(148, 0)));
+
+        // `plus_one` expires exactly at slot 140. Its one byte reopens enough
+        // room for another one-byte key without displacing `refill`.
+        node.reject_transaction_bounded(after_expiry.clone(), 140, cap);
+        assert!(!node.rejected.contains_key(&plus_one));
+        assert!(node.rejected.contains_key(&refill));
+        assert!(node.rejected.contains_key(&after_expiry));
+        assert_eq!(node.rejected_bytes, cap);
+        assert_eq!(
+            node.rejected_bytes,
+            node.rejected.keys().map(Vec::len).sum::<usize>(),
+            "cached charge must equal every retained canonical key",
+        );
+
+        let retained = node.rejected.keys().cloned().collect::<Vec<_>>();
+        node.reject_transaction_bounded(vec![0xFF; cap + 1], 140, cap);
+        assert_eq!(node.rejected.keys().cloned().collect::<Vec<_>>(), retained);
+        assert_eq!(node.rejected_bytes, cap, "an individually oversized key is drop-new");
+    }
+
     /// **The bar answers before capacity, and the order is the message.** A
     /// mempool filled to `MEMPOOL_MAX` answering `AtCapacity` tells the sender
     /// to retry later; for a transaction this node has already watched the
@@ -10018,9 +10130,10 @@ mod perf_support {
             mempool_expired: 0,
             mempool_evicted_low_fee: 0,
             rejected: BTreeMap::new(),
-        rejected_hits: 0,
-        mempool_suspect: BTreeSet::new(),
-        mempool_swept_epoch: u64::MAX,
+            rejected_bytes: 0,
+            rejected_hits: 0,
+            mempool_suspect: BTreeSet::new(),
+            mempool_swept_epoch: u64::MAX,
             store,
             slashprot: SlashingProtection::open(&dir).expect("open slashing protection"),
             net,
@@ -12082,6 +12195,7 @@ mod duty_view_anchor {
             mempool_expired: 0,
             mempool_evicted_low_fee: 0,
             rejected: BTreeMap::new(),
+        rejected_bytes: 0,
         rejected_hits: 0,
         mempool_suspect: BTreeSet::new(),
         mempool_swept_epoch: u64::MAX,
@@ -12352,6 +12466,7 @@ mod slot_horizon {
             mempool_expired: 0,
             mempool_evicted_low_fee: 0,
             rejected: BTreeMap::new(),
+            rejected_bytes: 0,
             rejected_hits: 0,
             mempool_suspect: BTreeSet::new(),
             mempool_swept_epoch: u64::MAX,

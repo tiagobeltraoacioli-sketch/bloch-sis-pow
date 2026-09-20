@@ -670,6 +670,7 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         // O cache de recusa (2026-08-30): o replay nao propoe, entao nunca
         // bane nada — o campo existe para o tipo, sempre vazio aqui.
         rejected: BTreeMap::new(),
+        rejected_bytes: 0,
         rejected_hits: 0,
         mempool_suspect: BTreeSet::new(),
         mempool_swept_epoch: u64::MAX,
