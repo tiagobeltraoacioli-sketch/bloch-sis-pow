@@ -339,10 +339,10 @@ impl HdWallet {
 
     /// Save encrypted wallet file.
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        // Encrypt mnemonic with master_key
-        let mnemonic_bytes = Zeroizing::new(serde_json::to_vec(
-            &MnemonicPayload { mnemonic: self.mnemonic.to_string() }).map_err(|e| e.to_string())?);
-        let mnemonic_crypto = encrypt_with_key(&self.master_key, &mnemonic_bytes)?;
+        // Encrypt the mnemonic inside a private ownership boundary so its
+        // zeroizing plaintext JSON is dropped before the per-address loop and
+        // final wallet-file write below.
+        let mnemonic_crypto = encrypt_mnemonic_for_save(&self.master_key, &self.mnemonic)?;
 
         // Encrypt each keypair with master_key
         let mut addresses = Vec::new();
@@ -1063,6 +1063,25 @@ fn encrypt_with_key(key: &[u8], plaintext: &[u8]) -> Result<KeystoreCrypto, Stri
     })
 }
 
+/// Serialize and encrypt the HD mnemonic while keeping every repository-owned
+/// plaintext copy inside this short-lived boundary. The structured payload is
+/// wiped as soon as serialization succeeds; the serialized JSON owner is
+/// wiped when this helper returns, before `HdWallet::save` processes addresses
+/// or writes the final ciphertext file.
+fn encrypt_mnemonic_for_save(
+    key: &[u8],
+    mnemonic: &Mnemonic,
+) -> Result<KeystoreCrypto, String> {
+    let payload = MnemonicPayload {
+        mnemonic: mnemonic.to_string(),
+    };
+    let plaintext = Zeroizing::new(
+        serde_json::to_vec(&payload).map_err(|e| e.to_string())?,
+    );
+    drop(payload);
+    encrypt_with_key(key, &plaintext)
+}
+
 fn decrypt_with_key(key: &[u8], crypto: &KeystoreCrypto) -> Result<Zeroizing<Vec<u8>>, String> {
     if key.len() != 32 { return Err("AES-256 key must contain 32 bytes".into()); }
     let nonce_b = b64::STANDARD.decode(&crypto.nonce).map_err(|e| e.to_string())?;
@@ -1221,6 +1240,28 @@ mod tests {
             verify_mnemonic_plaintext(mismatch, canonical).unwrap_err(),
             "mnemonic mismatch — tampered file?",
         );
+    }
+
+    #[test]
+    fn hd_save_mnemonic_helper_preserves_plaintext_bytes_and_short_lived_ownership() {
+        let _: fn(&[u8], &Mnemonic) -> Result<KeystoreCrypto, String> =
+            encrypt_mnemonic_for_save;
+        assert!(std::mem::needs_drop::<MnemonicPayload>());
+        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
+
+        let mnemonic = Mnemonic::from_entropy(&[0x35; 32]).unwrap();
+        let expected = serde_json::to_vec(&MnemonicPayload {
+            mnemonic: mnemonic.to_string(),
+        }).unwrap();
+        let key = [0x91; 32];
+
+        let encrypted = encrypt_mnemonic_for_save(&key, &mnemonic).unwrap();
+        let plaintext = decrypt_with_key(&key, &encrypted).unwrap();
+        assert_eq!(&plaintext[..], &expected);
+
+        let parsed: BorrowedMnemonicPayload<'_> =
+            serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(parsed.mnemonic.as_ref(), mnemonic.to_string());
     }
 
     #[test]
