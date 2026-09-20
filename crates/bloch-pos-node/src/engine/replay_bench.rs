@@ -671,6 +671,7 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         // bane nada — o campo existe para o tipo, sempre vazio aqui.
         rejected: BTreeMap::new(),
         rejected_bytes: 0,
+        rejected_expiry_hint: None,
         rejected_hits: 0,
         mempool_suspect: BTreeSet::new(),
         mempool_swept_epoch: u64::MAX,

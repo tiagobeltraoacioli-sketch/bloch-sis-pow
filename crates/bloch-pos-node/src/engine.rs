@@ -724,6 +724,12 @@ const REJECTION_MAX: usize = 4_096;
 /// it protects. This bounds encoded bytes, not map/allocator overhead.
 const REJECTION_BYTES_MAX: usize = admission::MAX_MEMPOOL_BYTES;
 
+#[cfg(test)]
+std::thread_local! {
+    /// Test-only proof that the expiry hint actually skips full-map scans.
+    static REJECTION_EXPIRY_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Transactions a proposal will carry at most, independent of the consensus
 /// byte cap it is also checked against.
 const MAX_TXS_PER_BLOCK: usize = 256;
@@ -1595,6 +1601,10 @@ struct Engine {
     rejected: BTreeMap<Vec<u8>, (u64, u64)>,
     /// Exact sum of canonical key lengths in `rejected`.
     rejected_bytes: usize,
+    /// Conservative lower bound on the earliest retained expiry. Point
+    /// removals may leave it stale and too early, causing one harmless extra
+    /// scan; insertion and a completed scan ensure it is never too late.
+    rejected_expiry_hint: Option<u64>,
     /// Total re-offers this node has barred since boot, across all keys.
     rejected_hits: u64,
     /// Transactions the epoch sweep found spending inputs this chain does not
@@ -4002,20 +4012,7 @@ impl Engine {
     /// not need multi-megabyte fixtures. Production always supplies
     /// [`REJECTION_BYTES_MAX`].
     fn reject_transaction_bounded(&mut self, key: Vec<u8>, slot: u64, bytes_cap: usize) {
-        // Recompute while the existing expiry scan already visits every key.
-        // This makes one value authoritative after purge even if a future edit
-        // changes the removal mix; all point removals below use one helper.
-        let mut retained_bytes = 0usize;
-        self.rejected.retain(|retained, (until, _)| {
-            let keep = *until > slot;
-            if keep {
-                retained_bytes = retained_bytes
-                    .checked_add(retained.len())
-                    .expect("retained rejection-key bytes fit usize");
-            }
-            keep
-        });
-        self.rejected_bytes = retained_bytes;
+        self.purge_expired_rejections(slot);
 
         // Re-barring the same key replaces its expiry/hit record. Remove it
         // before capacity planning so replacement cannot evict an unrelated
@@ -4047,11 +4044,43 @@ impl Engine {
             .rejected_bytes
             .checked_add(key.len())
             .expect("admitted rejection-key bytes fit the configured cap");
-        self.rejected.insert(key, (slot.saturating_add(REJECTION_TTL_SLOTS), 0));
+        let until = slot.saturating_add(REJECTION_TTL_SLOTS);
+        self.rejected_expiry_hint = Some(
+            self.rejected_expiry_hint
+                .map_or(until, |hint| hint.min(until)),
+        );
+        self.rejected.insert(key, (until, 0));
         debug_assert_eq!(
             self.rejected_bytes,
             self.rejected.keys().map(Vec::len).sum::<usize>(),
         );
+    }
+
+    /// Purge only when the conservative hint proves that at least one expiry
+    /// may have arrived. A stale early hint can buy one redundant scan, but a
+    /// late hint is impossible: every insertion takes the minimum and a scan
+    /// recomputes the exact next expiry.
+    fn purge_expired_rejections(&mut self, slot: u64) {
+        if !self.rejected_expiry_hint.is_some_and(|until| until <= slot) {
+            return;
+        }
+        #[cfg(test)]
+        REJECTION_EXPIRY_SCANS.with(|scans| scans.set(scans.get().saturating_add(1)));
+
+        let mut retained_bytes = 0usize;
+        let mut next_expiry: Option<u64> = None;
+        self.rejected.retain(|retained, (until, _)| {
+            let keep = *until > slot;
+            if keep {
+                retained_bytes = retained_bytes
+                    .checked_add(retained.len())
+                    .expect("retained rejection-key bytes fit usize");
+                next_expiry = Some(next_expiry.map_or(*until, |next| next.min(*until)));
+            }
+            keep
+        });
+        self.rejected_bytes = retained_bytes;
+        self.rejected_expiry_hint = next_expiry;
     }
 
     /// Remove one cached refusal and its exact encoded-byte charge.
@@ -6109,6 +6138,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         mempool_evicted_low_fee: 0,
         rejected: BTreeMap::new(),
         rejected_bytes: 0,
+        rejected_expiry_hint: None,
         rejected_hits: 0,
         mempool_suspect: BTreeSet::new(),
         mempool_swept_epoch: u64::MAX,
@@ -8914,6 +8944,7 @@ mod transfer_v2_end_to_end {
             mempool_evicted_low_fee: 0,
             rejected: BTreeMap::new(),
             rejected_bytes: 0,
+            rejected_expiry_hint: None,
             rejected_hits: 0,
             mempool_suspect: BTreeSet::new(),
             mempool_swept_epoch: u64::MAX,
@@ -9731,6 +9762,58 @@ mod transfer_v2_end_to_end {
         assert_eq!(node.rejected_bytes, cap, "an individually oversized key is drop-new");
     }
 
+    #[test]
+    fn rejection_expiry_hint_skips_early_scans_and_never_hides_a_boundary() {
+        let (entries, _) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let cap = 4_096;
+        REJECTION_EXPIRY_SCANS.with(|scans| scans.set(0));
+
+        for id in 0..100u64 {
+            node.reject_transaction_bounded(id.to_le_bytes().to_vec(), 10, cap);
+        }
+        assert_eq!(
+            REJECTION_EXPIRY_SCANS.with(std::cell::Cell::get),
+            0,
+            "no entry can expire before the shared slot-138 boundary",
+        );
+        assert_eq!(node.rejected_expiry_hint, Some(138));
+        assert_eq!(node.rejected_bytes, 800);
+
+        let late = 1_000u64.to_le_bytes().to_vec();
+        node.reject_transaction_bounded(late.clone(), 137, cap);
+        assert_eq!(REJECTION_EXPIRY_SCANS.with(std::cell::Cell::get), 0);
+        node.reject_transaction_bounded(1_001u64.to_le_bytes().to_vec(), 138, cap);
+        assert_eq!(REJECTION_EXPIRY_SCANS.with(std::cell::Cell::get), 1);
+        assert_eq!(node.rejected.len(), 2, "all slot-138 expiries leave together");
+        assert!(node.rejected.contains_key(&late));
+        assert_eq!(node.rejected_expiry_hint, Some(265));
+        assert_eq!(node.rejected_bytes, 16);
+
+        // Replacing the key named by the hint deliberately leaves the old
+        // lower bound behind. At 265 that can only cause an extra safe scan;
+        // the actual slot-266 expiry remains visible on the following call.
+        node.reject_transaction_bounded(late.clone(), 140, cap);
+        assert_eq!(node.rejected_expiry_hint, Some(265));
+        node.reject_transaction_bounded(1_002u64.to_le_bytes().to_vec(), 264, cap);
+        assert_eq!(REJECTION_EXPIRY_SCANS.with(std::cell::Cell::get), 1);
+        node.reject_transaction_bounded(1_003u64.to_le_bytes().to_vec(), 265, cap);
+        assert_eq!(REJECTION_EXPIRY_SCANS.with(std::cell::Cell::get), 2);
+        assert_eq!(node.rejected_expiry_hint, Some(266));
+        assert!(node.rejected.contains_key(&late));
+
+        let boundary = 1_001u64.to_le_bytes().to_vec();
+        node.reject_transaction_bounded(1_004u64.to_le_bytes().to_vec(), 266, cap);
+        assert_eq!(REJECTION_EXPIRY_SCANS.with(std::cell::Cell::get), 3);
+        assert!(!node.rejected.contains_key(&boundary));
+        assert!(node.rejected.contains_key(&late));
+        assert_eq!(
+            node.rejected_bytes,
+            node.rejected.keys().map(Vec::len).sum::<usize>(),
+        );
+        assert_eq!(node.rejected_expiry_hint, Some(268));
+    }
+
     /// **The bar answers before capacity, and the order is the message.** A
     /// mempool filled to `MEMPOOL_MAX` answering `AtCapacity` tells the sender
     /// to retry later; for a transaction this node has already watched the
@@ -10131,6 +10214,7 @@ mod perf_support {
             mempool_evicted_low_fee: 0,
             rejected: BTreeMap::new(),
             rejected_bytes: 0,
+            rejected_expiry_hint: None,
             rejected_hits: 0,
             mempool_suspect: BTreeSet::new(),
             mempool_swept_epoch: u64::MAX,
@@ -12195,10 +12279,11 @@ mod duty_view_anchor {
             mempool_expired: 0,
             mempool_evicted_low_fee: 0,
             rejected: BTreeMap::new(),
-        rejected_bytes: 0,
-        rejected_hits: 0,
-        mempool_suspect: BTreeSet::new(),
-        mempool_swept_epoch: u64::MAX,
+            rejected_bytes: 0,
+            rejected_expiry_hint: None,
+            rejected_hits: 0,
+            mempool_suspect: BTreeSet::new(),
+            mempool_swept_epoch: u64::MAX,
             store,
             slashprot: SlashingProtection::open(&dir.0).expect("open slashing protection"),
             net,
@@ -12467,6 +12552,7 @@ mod slot_horizon {
             mempool_evicted_low_fee: 0,
             rejected: BTreeMap::new(),
             rejected_bytes: 0,
+            rejected_expiry_hint: None,
             rejected_hits: 0,
             mempool_suspect: BTreeSet::new(),
             mempool_swept_epoch: u64::MAX,
