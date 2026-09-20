@@ -267,6 +267,13 @@ const _: () = assert!(
     "re-gossip suppression shorter than the duplicate cache is pure waste"
 );
 
+#[cfg(test)]
+std::thread_local! {
+    /// Test-only proof that the expiry hint skips premature full-map scans.
+    static RECENT_BLOCK_EXPIRY_SCANS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Concurrent request-response substreams per connection before new inbound
 /// streams are dropped. libp2p's default is 100; a node catching up opens a
 /// burst well past that and then loses the peer's deliveries.
@@ -1231,6 +1238,10 @@ struct Loop {
     /// Blocks published or received within [`REGOSSIP_SUPPRESS_TTL`]. Pruned
     /// on insert, so it stays bounded by the TTL and not by uptime.
     recent_blocks: HashMap<[u8; 32], Instant>,
+    /// Conservative lower bound on the oldest retained timestamp. Refreshing
+    /// an ID may leave this stale and early, causing one harmless extra scan;
+    /// insertion and a completed scan ensure it is never later than reality.
+    recent_blocks_expiry_hint: Option<Instant>,
     /// Full sync pages chased since the engine's applied head last moved,
     /// PER PEER (R1 A3-M3 — see [`MAX_PAGES_WITHOUT_PROGRESS`]). Evicted on
     /// disconnect by [`Loop::forget_peer`], so identity churn cannot grow
@@ -1292,9 +1303,40 @@ impl Loop {
     }
 
     fn note_block(&mut self, id: [u8; 32]) -> bool {
-        let now = Instant::now();
-        self.recent_blocks.retain(|_, t| now.duration_since(*t) < REGOSSIP_SUPPRESS_TTL);
-        self.recent_blocks.insert(id, now).is_none()
+        self.note_block_at(id, Instant::now())
+    }
+
+    /// Record one block at an explicit instant so expiry behavior is
+    /// deterministic under test. Production supplies only `Instant::now()`.
+    fn note_block_at(&mut self, id: [u8; 32], now: Instant) -> bool {
+        if self
+            .recent_blocks_expiry_hint
+            .is_some_and(|oldest| {
+                now.saturating_duration_since(oldest) >= REGOSSIP_SUPPRESS_TTL
+            })
+        {
+            #[cfg(test)]
+            RECENT_BLOCK_EXPIRY_SCANS.with(|scans| scans.set(scans.get().saturating_add(1)));
+
+            let mut next_oldest: Option<Instant> = None;
+            self.recent_blocks.retain(|_, timestamp| {
+                let keep = now.saturating_duration_since(*timestamp) < REGOSSIP_SUPPRESS_TTL;
+                if keep {
+                    next_oldest = Some(
+                        next_oldest.map_or(*timestamp, |oldest| oldest.min(*timestamp)),
+                    );
+                }
+                keep
+            });
+            self.recent_blocks_expiry_hint = next_oldest;
+        }
+
+        let fresh = self.recent_blocks.insert(id, now).is_none();
+        self.recent_blocks_expiry_hint = Some(
+            self.recent_blocks_expiry_hint
+                .map_or(now, |oldest| oldest.min(now)),
+        );
+        fresh
     }
 
     fn emit(&self, mut ev: NetEvent, peer: PeerId) -> Option<bool> {
@@ -1388,6 +1430,7 @@ async fn run_swarm(
         peer_head: HashMap::new(),
         sync_rotation: 0,
         recent_blocks: HashMap::new(),
+        recent_blocks_expiry_hint: None,
         chase: HashMap::new(),
         dialed: HashMap::new(),
         dialed_order: VecDeque::new(),
@@ -2617,6 +2660,7 @@ mod tests {
             peer_head: HashMap::new(),
             sync_rotation: 0,
             recent_blocks: HashMap::new(),
+            recent_blocks_expiry_hint: None,
             chase: HashMap::new(),
             dialed: HashMap::new(),
             dialed_order: VecDeque::new(),
@@ -2831,6 +2875,60 @@ mod tests {
 
         let duplicate = crate::codec::encode_envelope(&env);
         assert!(prepared_block_payload_if_fresh(&mut state, duplicate, id).is_none());
+    }
+
+    #[test]
+    fn recent_block_expiry_hint_skips_early_scans_and_preserves_refresh() {
+        RECENT_BLOCK_EXPIRY_SCANS.with(|scans| scans.set(0));
+        let mut state = test_loop();
+        let start = Instant::now();
+
+        for byte in 0..100u8 {
+            let mut id = [0u8; 32];
+            id[0] = byte;
+            assert!(state.note_block_at(id, start));
+        }
+        assert_eq!(
+            RECENT_BLOCK_EXPIRY_SCANS.with(std::cell::Cell::get),
+            0,
+            "nothing can expire before the shared TTL boundary",
+        );
+        assert_eq!(state.recent_blocks_expiry_hint, Some(start));
+
+        let boundary = start + REGOSSIP_SUPPRESS_TTL;
+        let mut boundary_id = [0u8; 32];
+        boundary_id[0] = 200;
+        assert!(state.note_block_at(boundary_id, boundary));
+        assert_eq!(RECENT_BLOCK_EXPIRY_SCANS.with(std::cell::Cell::get), 1);
+        assert_eq!(state.recent_blocks.len(), 1);
+        assert!(state.recent_blocks.contains_key(&boundary_id));
+        assert_eq!(state.recent_blocks_expiry_hint, Some(boundary));
+
+        // Refreshing the sole ID keeps duplicate suppression but deliberately
+        // leaves the lower-bound hint early. Reaching that stale boundary can
+        // only cause one safe scan; the refreshed ID remains suppressed until
+        // its own exact equality boundary.
+        RECENT_BLOCK_EXPIRY_SCANS.with(|scans| scans.set(0));
+        let mut refreshed = test_loop();
+        let original = [7u8; 32];
+        assert!(refreshed.note_block_at(original, start));
+        let refreshed_at = start + Duration::from_secs(1);
+        assert!(!refreshed.note_block_at(original, refreshed_at));
+        assert_eq!(refreshed.recent_blocks_expiry_hint, Some(start));
+
+        let stale_boundary = start + REGOSSIP_SUPPRESS_TTL;
+        assert!(refreshed.note_block_at([8u8; 32], stale_boundary));
+        assert_eq!(RECENT_BLOCK_EXPIRY_SCANS.with(std::cell::Cell::get), 1);
+        assert!(refreshed.recent_blocks.contains_key(&original));
+        assert_eq!(refreshed.recent_blocks_expiry_hint, Some(refreshed_at));
+
+        let real_boundary = refreshed_at + REGOSSIP_SUPPRESS_TTL;
+        assert!(refreshed.note_block_at([9u8; 32], real_boundary));
+        assert_eq!(RECENT_BLOCK_EXPIRY_SCANS.with(std::cell::Cell::get), 2);
+        assert!(!refreshed.recent_blocks.contains_key(&original));
+        assert!(refreshed.recent_blocks.contains_key(&[8u8; 32]));
+        assert!(refreshed.recent_blocks.contains_key(&[9u8; 32]));
+        assert_eq!(refreshed.recent_blocks_expiry_hint, Some(stale_boundary));
     }
 
     #[test]
