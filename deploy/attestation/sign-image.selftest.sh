@@ -3,7 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SIGN_IMAGE="$SCRIPT_DIR/sign-image.sh"
-IMAGE="example.invalid/bloch:test"
+DIGEST="$(printf 'a%.0s' {1..64})"
+IMAGE="example.invalid/bloch:test@sha256:$DIGEST"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/sign-image-selftest.XXXXXX")"
 WORK="$(cd -P -- "$WORK" && pwd)"
 trap 'rm -rf -- "$WORK"' EXIT
@@ -27,25 +28,29 @@ fail() {
 }
 
 run_ok() {
-  local name="$1" key="$2" pub="$3" path_dir="${4:-$WORK/bin}" log="$WORK/cosign.log" output
+  local name="$1" key="$2" pub="$3" path_dir="${4:-$WORK/bin}" image="${5:-$IMAGE}" log="$WORK/cosign.log" output
   : >"$log"
   if ! output="$(PATH="$path_dir:$PATH" COSIGN_LOG="$log" COSIGN_KEY="$key" COSIGN_PUB="$pub" \
-      "$SIGN_IMAGE" "$IMAGE" 2>&1)"; then
+      "$SIGN_IMAGE" "$image" 2>&1)"; then
     printf '%s\n' "$output" >&2
     fail "$name: expected success"
   fi
   [[ "$(wc -l <"$log" | tr -d '[:space:]')" == 3 ]] || fail "$name: expected three cosign calls"
-  grep -Fx -- "sign --key $key --yes $IMAGE" "$log" >/dev/null || fail "$name: wrong sign arguments"
-  grep -Fx -- "verify --key $pub $IMAGE" "$log" >/dev/null || fail "$name: wrong verify arguments"
-  grep -Fx -- "triangulate $IMAGE" "$log" >/dev/null || fail "$name: wrong triangulate arguments"
+  grep -Fx -- "sign --key $key --yes $image" "$log" >/dev/null || fail "$name: wrong sign arguments"
+  grep -Fx -- "verify --key $pub $image" "$log" >/dev/null || fail "$name: wrong verify arguments"
+  grep -Fx -- "triangulate $image" "$log" >/dev/null || fail "$name: wrong triangulate arguments"
+  grep -Fx -- "image digest to pin in CoCo policy: sha256:${image##*@sha256:}" <<<"$output" >/dev/null \
+    || fail "$name: exact image digest was not reported"
+  grep -Fx -- "cosign signature object reference (informational):" <<<"$output" >/dev/null \
+    || fail "$name: triangulate output was mislabeled"
 }
 
 run_bad() {
-  local name="$1" expected="$2" key="$3" pub="$4" path_dir="${5:-$WORK/bin}" log="$WORK/cosign.log" output rc
+  local name="$1" expected="$2" key="$3" pub="$4" path_dir="${5:-$WORK/bin}" image="${6:-$IMAGE}" log="$WORK/cosign.log" output rc
   : >"$log"
   set +e
   output="$(PATH="$path_dir:$PATH" COSIGN_LOG="$log" COSIGN_KEY="$key" COSIGN_PUB="$pub" \
-      "$SIGN_IMAGE" "$IMAGE" 2>&1)"
+      "$SIGN_IMAGE" "$image" 2>&1)"
   rc=$?
   set -e
   [[ $rc -ne 0 ]] || fail "$name: expected failure"
@@ -60,6 +65,8 @@ printf '%s\n' secret >"$WORK/external/cosign.key"
 printf '%s\n' public >"$WORK/external/cosign.pub"
 chmod 0600 "$WORK/external/cosign.key"
 run_ok "external canonical key" "$WORK/external/cosign.key" "$WORK/external/cosign.pub"
+run_ok "digest without tag" "$WORK/external/cosign.key" "$WORK/external/cosign.pub" \
+  "$WORK/bin" "example.invalid/bloch@sha256:$DIGEST"
 chmod 0400 "$WORK/external/cosign.key"
 run_ok "external read-only key" "$WORK/external/cosign.key" "$WORK/external/cosign.pub"
 chmod 0600 "$WORK/external/cosign.key"
@@ -121,5 +128,22 @@ run_bad "stat command failure" "cannot inspect COSIGN_KEY permissions" \
   "$WORK/external/cosign.key" "$WORK/external/cosign.pub" "$WORK/stat-fail-bin"
 run_bad "malformed stat output" "permissions must be 0400 or 0600" \
   "$WORK/external/cosign.key" "$WORK/external/cosign.pub" "$WORK/stat-malformed-bin"
+
+SHORT_DIGEST="${DIGEST%?}"
+UPPER_DIGEST="A${DIGEST#?}"
+for invalid_image in \
+  "example.invalid/bloch:test" \
+  "example.invalid/bloch@sha256:$SHORT_DIGEST" \
+  "example.invalid/bloch@sha256:${DIGEST}a" \
+  "example.invalid/bloch@sha256:${DIGEST%?}g" \
+  "example.invalid/bloch@sha256:$UPPER_DIGEST" \
+  "example.invalid/bloch@sha256:$DIGEST.trailing" \
+  "example.invalid/bloch@sha256:$DIGEST@sha256:$DIGEST" \
+  "@sha256:$DIGEST" \
+  "example.invalid/bloch bad@sha256:$DIGEST"
+do
+  run_bad "invalid image reference: $invalid_image" "IMAGE must be an immutable reference" \
+    "$WORK/external/cosign.key" "$WORK/external/cosign.pub" "$WORK/bin" "$invalid_image"
+done
 
 printf '%s\n' "sign-image selftest: all checks passed"

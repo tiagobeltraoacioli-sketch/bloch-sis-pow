@@ -4,7 +4,8 @@
 # attestation to the reproducible digest.
 #
 #   COSIGN_KEY=/secure/out-of-tree/path/cosign.key \
-#     deploy/attestation/sign-image.sh docker.io/blochv/bloch:0.1
+#     deploy/attestation/sign-image.sh \
+#       docker.io/blochv/bloch:0.1@sha256:<64-lowercase-hex-digest>
 #
 # Prereqs: cosign installed; the image pushed to the registry.
 #
@@ -22,7 +23,22 @@
 # from every repo's .gitignore AND never `git add`ed).
 set -euo pipefail
 
-IMAGE="${1:?usage: sign-image.sh <registry>/<repo>:<tag>}"
+IMAGE="${1:?usage: sign-image.sh <registry>/<repo>[:<tag>]@sha256:<64-lowercase-hex>}"
+
+# Sign one immutable image identity, not whichever manifest a mutable tag
+# happens to resolve to at each separate registry operation. This pins the
+# exact same digest-bearing reference across sign, verify and triangulate.
+IMAGE_REPOSITORY="${IMAGE%@sha256:*}"
+IMAGE_DIGEST="${IMAGE##*@sha256:}"
+if [[ -z "$IMAGE_REPOSITORY" \
+   || "$IMAGE" != "$IMAGE_REPOSITORY@sha256:$IMAGE_DIGEST" \
+   || "$IMAGE_REPOSITORY" == *"@"* \
+   || "$IMAGE_REPOSITORY" == *[[:space:]]* \
+   || ${#IMAGE_DIGEST} -ne 64 \
+   || "$IMAGE_DIGEST" == *[!0-9a-f]* ]]; then
+  echo "sign-image.sh: IMAGE must be an immutable reference ending in @sha256:<64 lowercase hex> (got: $IMAGE)" >&2
+  exit 2
+fi
 
 COSIGN_KEY="${COSIGN_KEY:?COSIGN_KEY must be set to an absolute path to an existing cosign private key. This script will not generate one and will not look in the current directory. Generate with: cosign generate-key-pair (into a path OUTSIDE any git working tree), then re-run with COSIGN_KEY=<that path>/cosign.key}"
 
@@ -113,7 +129,8 @@ echo "verifying signature…"
 cosign verify --key "$COSIGN_PUB" "${IMAGE}" >/dev/null && echo "✅ signed & verified"
 
 echo
-echo "digest that CoCo will pin:"
+echo "image digest to pin in CoCo policy: sha256:${IMAGE_DIGEST}"
+echo "cosign signature object reference (informational):"
 cosign triangulate "${IMAGE}" 2>/dev/null || true
 echo
 echo "Next: publish ${COSIGN_PUB} + image-security-policy.json to Trustee/KBS, then"

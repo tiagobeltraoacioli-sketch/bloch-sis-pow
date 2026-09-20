@@ -17,11 +17,16 @@ L1 reproducible image (digest D)
 
 ## Steps
 
-1. Build the reproducible image and note its digest (`deploy/repro/build.sh`).
-2. Push it, then **sign** it:
+1. Build the reproducible image and retain its local build output and hash
+   (`deploy/repro/build.sh`).
+2. Push it, obtain the registry manifest digest, then **sign that exact
+   digest-qualified reference**:
    ```bash
-   deploy/attestation/sign-image.sh docker.io/blochv/bloch:0.1
+   deploy/attestation/sign-image.sh \
+     docker.io/blochv/bloch:0.1@sha256:<64-lowercase-hex-digest>
    ```
+   The digest-qualified reference is mandatory: a mutable tag could resolve to
+   different manifests across signing, verification and policy preparation.
    Keep `cosign.key` secret; you'll publish `cosign.pub` to KBS.
 3. Deliver to **Trustee/KBS**: `cosign.pub` (at the `kbs://` keyPath in
    `image-security-policy.json`) and the policy itself. Configure the KBS
