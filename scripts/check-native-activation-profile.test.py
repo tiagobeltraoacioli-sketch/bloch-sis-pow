@@ -19,7 +19,25 @@ class ActivationProfileTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.now = 2000000000
         self.gates = {key: "110" for key in m.GATES}
-        self.release = {"commit": "ab" * 20, "binarySha256": "cd" * 32, "buildProfile": "release", "features": ["native-wallet-rpc"]}
+        self.release = {"commit": "ab" * 20, "productionBaseCommit": "ac" * 20,
+                        "binarySha256": "cd" * 32,
+                        "cargoLock": self.artifact("Cargo.lock", {"fixture": "lock"}),
+                        "buildImageDigest": "cf" * 32,
+                        "buildImageAttestation": self.artifact(
+                            "build-image.json", {"fixture": "build-image"}),
+                        "buildPath": "/build",
+                        "buildProfile": "release", "features": ["native-wallet-rpc"],
+                        "replayEvidence": self.artifact(
+                            "replay.json", {"fixture": "replay"}),
+                        "rollbackPackageManifest": self.artifact(
+                            "rollback-manifest.json", {"fixture": "rollback"}),
+                        "independentBuilds": [
+                            {"builderId": "builder-a", "binarySha256": "cd" * 32,
+                             "attestation": self.artifact(
+                                 "builder-a.json", {"fixture": "builder-a"})},
+                            {"builderId": "builder-b", "binarySha256": "cd" * 32,
+                             "attestation": self.artifact(
+                                 "builder-b.json", {"fixture": "builder-b"})}]}
         self.observation = {"network": m.NETWORK, "observedAtUnix": str(self.now), "headSlot": "3200", "wallSlot": "3201", "head": "01" * 32, "finalizedEpoch": "98", "finalizedSlot": "3135", "finalityRule": "canonical-checkpoint-slot-v1", "finalizedRoot": "02" * 32}
         self.roster = {"network": m.NETWORK, "head": self.observation["head"], "activeValidators": [{"id": "0", "publicKeySha256": "03" * 32}]}
         self.readiness = {"network": m.NETWORK, "observedAtUnix": str(self.now), "validatorId": "0", "publicKeySha256": "03" * 32, "observedHead": self.observation["head"], "release": self.release, "gateEpochs": self.gates, "checks": {"canonicalReplayPassed": True, "historicalRootsUnchanged": True, "rollbackPrepared": True, "withdrawalSimulationPassed": True, "sourceReleaseRehearsalPassed": True}, "operatorApprovalReference": "fixture-only:no-production-approval"}
@@ -62,6 +80,12 @@ class ActivationProfileTests(unittest.TestCase):
         cases = [(self.profile, "network", {**m.NETWORK, "format": "BPOSLAB1"}),
                  (self.release, "features", ["native-wallet-rpc", "native-lab"]),
                  (self.release, "binarySha256", None),
+                 (self.release, "productionBaseCommit", None),
+                 (self.release, "buildPath", "/tmp/build"),
+                 (self.release["independentBuilds"][1], "builderId", "builder-a"),
+                 (self.release["independentBuilds"][1], "binarySha256", "09" * 32),
+                 (self.release["independentBuilds"][1], "attestation",
+                  self.release["independentBuilds"][0]["attestation"]),
                  (self.observation, "observedAtUnix", str(self.now - 601)),
                  (self.observation, "observedAtUnix", str(self.now + 1)),
                  (self.observation, "wallSlot", "4000"),
@@ -110,6 +134,12 @@ class ActivationProfileTests(unittest.TestCase):
         with self.assertRaises(ValueError): m.validate(path, self.now)
         template = Path(__file__).resolve().parents[1] / "docs/native-mainnet-activation.template.json"
         with self.assertRaises(ValueError): m.validate(template, self.now)
+
+    def test_release_evidence_must_exist_and_match_its_reference(self):
+        path = self.save()
+        (self.root / "replay.json").write_text('{"fixture":"substituted"}')
+        with self.assertRaises(ValueError):
+            m.validate(path, self.now)
 
 if __name__ == "__main__":
     unittest.main()

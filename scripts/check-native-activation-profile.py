@@ -30,10 +30,15 @@ def unique(pairs):
     return result
 
 
-def load(path):
+def read_bounded(path):
     with path.open("rb") as stream:
         raw = stream.read(MAX_FILE + 1)
     require(len(raw) <= MAX_FILE, "artifact exceeds size bound")
+    return raw
+
+
+def load(path):
+    raw = read_bounded(path)
     return json.loads(raw, object_pairs_hook=unique), raw
 
 
@@ -50,20 +55,70 @@ def digest(value, name, length=64):
     return value
 
 
-def artifact(root, reference):
+def artifact_bytes(root, reference):
     require(isinstance(reference, dict) and set(reference) == {"path", "sha256"}, "missing artifact reference")
     require(isinstance(reference["path"], str), "artifact path required")
     relative = Path(reference["path"])
     require(not relative.is_absolute(), "artifact paths must be relative")
     path = (root / relative).resolve()
     require(root in path.parents, "artifact escapes profile directory")
-    value, raw = load(path)
+    raw = read_bounded(path)
     require(hashlib.sha256(raw).hexdigest() == digest(reference["sha256"], "artifact hash"), "artifact hash mismatch")
+    return raw
+
+
+def artifact(root, reference):
+    raw = artifact_bytes(root, reference)
+    value = json.loads(raw, object_pairs_hook=unique)
     return value
 
 
 def identity(value):
     require(value.get("network") == NETWORK, "official network identity mismatch")
+
+
+def release_qualification(root, release):
+    required = {"commit", "productionBaseCommit", "binarySha256", "cargoLock",
+                "buildImageDigest", "buildImageAttestation", "buildPath", "buildProfile",
+                "features", "replayEvidence", "rollbackPackageManifest",
+                "independentBuilds"}
+    require(isinstance(release, dict) and set(release) == required,
+            "complete release qualification pins required")
+    digest(release.get("commit"), "release commit", 40)
+    digest(release.get("productionBaseCommit"), "production base commit", 40)
+    digest(release.get("binarySha256"), "release binary hash")
+    artifact_bytes(root, release.get("cargoLock"))
+    digest(release.get("buildImageDigest"), "build image digest")
+    artifact_bytes(root, release.get("buildImageAttestation"))
+    require(release.get("buildPath") == "/build", "canonical /build release path required")
+    require(release.get("buildProfile") == "release", "release build required")
+    features = release.get("features")
+    require(isinstance(features, list) and all(isinstance(f, str) for f in features)
+            and len(features) == len(set(features)), "unique build features required")
+    require("native-wallet-rpc" in features and "native-lab" not in features,
+            "official build must enable native-wallet-rpc without native-lab")
+    artifact_bytes(root, release.get("replayEvidence"))
+    artifact_bytes(root, release.get("rollbackPackageManifest"))
+    builds = release.get("independentBuilds")
+    require(isinstance(builds, list) and 2 <= len(builds) <= 8,
+            "two to eight independent build attestations required")
+    builders, attestations = set(), set()
+    for build in builds:
+        require(isinstance(build, dict) and set(build) ==
+                {"builderId", "binarySha256", "attestation"},
+                "invalid independent build attestation")
+        builder = build.get("builderId")
+        require(isinstance(builder, str) and re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", builder),
+                "canonical independent builder id required")
+        require(builder not in builders, "duplicate independent builder")
+        builders.add(builder)
+        require(build.get("binarySha256") == release["binarySha256"],
+                "independent build binary mismatch")
+        attestation = build.get("attestation")
+        artifact_bytes(root, attestation)
+        attestation = attestation["sha256"]
+        require(attestation not in attestations, "duplicate independent build attestation")
+        attestations.add(attestation)
 
 
 def recent(value, now):
@@ -89,12 +144,7 @@ def validate(path, now=None):
     deposits_epoch = integer(profile.get("sourceDepositsOpenEpoch"), "source deposit opening epoch")
     require(deposits_epoch >= max(epochs.values()), "source deposits cannot open before every native gate")
     release = profile.get("release", {})
-    digest(release.get("commit"), "release commit", 40)
-    digest(release.get("binarySha256"), "release binary hash")
-    require(release.get("buildProfile") == "release", "release build required")
-    features = release.get("features")
-    require(isinstance(features, list) and all(isinstance(f, str) for f in features) and len(features) == len(set(features)), "unique build features required")
-    require("native-wallet-rpc" in features and "native-lab" not in features, "official build must enable native-wallet-rpc without native-lab")
+    release_qualification(root, release)
     custody = artifact(root, profile.get("custodyManifest"))
     require(custody.get("schema") == "postern.mainnet-custody.v1", "reviewed custody manifest required")
     route_manifest = custody.get("route_manifest", {})

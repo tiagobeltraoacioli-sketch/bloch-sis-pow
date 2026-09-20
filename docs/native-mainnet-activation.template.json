@@ -16,11 +16,19 @@
   "minimumLeadEpochs": "4",
   "release": {
     "commit": null,
+    "productionBaseCommit": null,
     "binarySha256": null,
+    "cargoLock": null,
+    "buildImageDigest": null,
+    "buildImageAttestation": null,
+    "buildPath": "/build",
     "buildProfile": "release",
     "features": [
       "native-wallet-rpc"
-    ]
+    ],
+    "replayEvidence": null,
+    "rollbackPackageManifest": null,
+    "independentBuilds": []
   },
   "chainObservation": null,
   "validatorRoster": null,

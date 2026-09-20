@@ -31,6 +31,18 @@ actual production base. No broad native-integration branch replacement should
 be inferred from the minimal RPC recovery backport. In particular, the latter
 changes recovery observations and does not activate native assets.
 
+The release object therefore also references the exact root `Cargo.lock`, build
+image attestation, production replay evidence, rollback-package manifest, and
+two to eight independent build attestations. It pins the production-base commit,
+canonical build-image digest and `/build` path. Every independent builder must
+report the exact candidate binary digest and a distinct attestation. The checker
+reads and hashes each bounded referenced artifact, detecting missing, substituted
+or internally inconsistent evidence. These remain operator inputs:
+but it does not establish that a builder is organizationally independent or
+that the replay and rollback drill were honestly performed.
+It also does not verify the rollback package's detached signature; that remains
+the release-integrity runbook's out-of-band trust check.
+
 The native checker validates custody identity and the exact custody artifact
 hash, but intentionally does not replace the detailed source custody manifest
 validator. Run both over the same artifact with independently supplied source
