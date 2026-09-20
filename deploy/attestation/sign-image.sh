@@ -38,6 +38,48 @@ if [[ ! -f "$COSIGN_KEY" ]]; then
   exit 2
 fi
 
+if [[ -L "$COSIGN_KEY" ]]; then
+  echo "sign-image.sh: COSIGN_KEY must not be a symbolic link: $COSIGN_KEY" >&2
+  exit 2
+fi
+
+if ! COSIGN_KEY_DIR="$(cd -P -- "$(dirname -- "$COSIGN_KEY")" && pwd)"; then
+  echo "sign-image.sh: cannot resolve COSIGN_KEY parent directory: $COSIGN_KEY" >&2
+  exit 2
+fi
+COSIGN_KEY_REAL="$COSIGN_KEY_DIR/$(basename -- "$COSIGN_KEY")"
+
+if [[ ! -f "$COSIGN_KEY_REAL" || -L "$COSIGN_KEY_REAL" ]]; then
+  echo "sign-image.sh: resolved COSIGN_KEY is not a regular non-symlink file: $COSIGN_KEY_REAL" >&2
+  exit 2
+fi
+
+# Refuse private-key aliases that could make an apparently external path name
+# repository-owned bytes. This is intentionally a conservative local
+# filesystem boundary; it does not claim to discover every possible Git
+# metadata layout or filesystem-level alias.
+key_ancestor="$COSIGN_KEY_DIR"
+while :; do
+  if [[ -e "$key_ancestor/.git" || -L "$key_ancestor/.git" ]]; then
+    echo "sign-image.sh: COSIGN_KEY must be outside a Git worktree: $COSIGN_KEY_REAL" >&2
+    exit 2
+  fi
+  [[ "$key_ancestor" == "/" ]] && break
+  key_ancestor="$(dirname -- "$key_ancestor")"
+done
+
+if ! key_link_violation="$(find "$COSIGN_KEY_REAL" ! -links 1 -exec printf x \;)"; then
+  echo "sign-image.sh: cannot inspect COSIGN_KEY link count: $COSIGN_KEY_REAL" >&2
+  exit 2
+fi
+if [[ -n "$key_link_violation" ]]; then
+  echo "sign-image.sh: COSIGN_KEY must have exactly one hard link: $COSIGN_KEY_REAL" >&2
+  exit 2
+fi
+
+# Pass the physical path whose ancestry and link count were validated.
+COSIGN_KEY="$COSIGN_KEY_REAL"
+
 COSIGN_PUB="${COSIGN_PUB:-${COSIGN_KEY%.key}.pub}"
 if [[ ! -f "$COSIGN_PUB" ]]; then
   echo "sign-image.sh: expected public key at $COSIGN_PUB (override with COSIGN_PUB=)" >&2
