@@ -301,7 +301,7 @@ pub struct AttestationPool {
     /// — the global FIFO cap ([`MAX_PENDING_ATTESTATIONS`]) and the
     /// accepted-side cap (`DutyRecord::accepted`, same limit). Entries are
     /// removed from this map the moment they leave `pending` (release or
-    /// eviction), in [`AttestationPool::evict`], so it never drifts from
+    /// eviction), in [`AttestationPool::remove_pending`], so it never drifts from
     /// `pending`'s actual contents.
     pending_by_duty: BTreeMap<DutyKey, usize>,
     /// Attributed-source indexes. These are admission/replay fairness only
@@ -767,13 +767,12 @@ impl AttestationPool {
             .collect();
         let mut out = Vec::with_capacity(seqs.len());
         for seq in seqs {
-            if let Some(entry) = self.pending.get(&seq) {
+            if let Some(entry) = self.remove_pending(seq) {
                 out.push(AuthenticatedPendingAttestation {
-                    att: entry.att.clone(),
+                    att: entry.att,
                     verification_source: entry.verification_source,
                     verified_pubkey_sha3: entry.verified_pubkey_sha3,
                 });
-                self.evict(seq);
             }
         }
         let remains = self.pending_by_root.get(root).is_some_and(|entries| !entries.is_empty());
@@ -858,7 +857,7 @@ impl AttestationPool {
         self.pending_keys.insert((att.data.slot, att.validator, data_hash));
         self.pending_by_root.entry(missing_root).or_default().insert(seq);
         // Cannot overflow: this count is the number of pending entries for one
-        // duty (incremented here, decremented in `evict` for the same entry),
+        // duty (incremented here, decremented in `remove_pending` for the same entry),
         // so it is <= pending.len() < MAX_PENDING_ATTESTATIONS (256) after the
         // eviction loop above.
         #[allow(clippy::arithmetic_side_effects)]
@@ -884,54 +883,61 @@ impl AttestationPool {
         GossipDecision::Hold { missing_root }
     }
 
-    /// Remove one pending entry and every index pointing at it, including the
-    /// per-duty pending count (R3 NEW-1) — recomputed from the entry itself
-    /// rather than threaded through, so `evict` stays the single place that
-    /// can never leave `pending_by_duty` out of sync with `pending`.
+    /// Discard one pending entry through the same removal authority used by
+    /// ownership-preserving extraction.
     fn evict(&mut self, seq: u64) {
-        if let Some(entry) = self.pending.remove(&seq) {
-            let duty: DutyKey = (entry.att.data.slot, entry.att.validator);
-            if let Some(count) = self.pending_by_duty.get_mut(&duty) {
+        drop(self.remove_pending(seq));
+    }
+
+    /// Remove one pending entry and every index pointing at it, including the
+    /// per-duty pending count (R3 NEW-1), and return its sole owned payload.
+    /// Recomputed from the entry itself rather than threaded through, so this
+    /// remains the single place that cannot leave any pending index out of
+    /// sync. Extraction moves that owner; eviction simply drops it.
+    fn remove_pending(&mut self, seq: u64) -> Option<PendingEntry> {
+        let entry = self.pending.remove(&seq)?;
+        let duty: DutyKey = (entry.att.data.slot, entry.att.validator);
+        if let Some(count) = self.pending_by_duty.get_mut(&duty) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.pending_by_duty.remove(&duty);
+            }
+        }
+        if let Some(source) = entry.verification_source {
+            if let Some(count) = self.pending_by_source.get_mut(&source) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
-                    self.pending_by_duty.remove(&duty);
+                    self.pending_by_source.remove(&source);
                 }
             }
-            if let Some(source) = entry.verification_source {
-                if let Some(count) = self.pending_by_source.get_mut(&source) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        self.pending_by_source.remove(&source);
-                    }
-                }
-                let source_root = (source, entry.missing_root);
-                if let Some(count) = self.pending_by_source_root.get_mut(&source_root) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        self.pending_by_source_root.remove(&source_root);
-                    }
-                }
-            } else {
-                self.pending_unattributed = self.pending_unattributed.saturating_sub(1);
-                if let Some(count) = self.pending_unattributed_by_root.get_mut(&entry.missing_root) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        self.pending_unattributed_by_root.remove(&entry.missing_root);
-                    }
+            let source_root = (source, entry.missing_root);
+            if let Some(count) = self.pending_by_source_root.get_mut(&source_root) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.pending_by_source_root.remove(&source_root);
                 }
             }
-            self.pending_keys.remove(&(
-                entry.att.data.slot,
-                entry.att.validator,
-                entry.att.data.signing_root(),
-            ));
-            if let Some(set) = self.pending_by_root.get_mut(&entry.missing_root) {
-                set.remove(&seq);
-                if set.is_empty() {
-                    self.pending_by_root.remove(&entry.missing_root);
+        } else {
+            self.pending_unattributed = self.pending_unattributed.saturating_sub(1);
+            if let Some(count) = self.pending_unattributed_by_root.get_mut(&entry.missing_root) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.pending_unattributed_by_root.remove(&entry.missing_root);
                 }
             }
         }
+        self.pending_keys.remove(&(
+            entry.att.data.slot,
+            entry.att.validator,
+            entry.att.data.signing_root(),
+        ));
+        if let Some(set) = self.pending_by_root.get_mut(&entry.missing_root) {
+            set.remove(&seq);
+            if set.is_empty() {
+                self.pending_by_root.remove(&entry.missing_root);
+            }
+        }
+        Some(entry)
     }
 }
 
@@ -967,6 +973,13 @@ mod tests {
     impl SignatureVerifier for RootEchoVerifier {
         fn verify_with_key(&self, _pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
             sig == root
+        }
+    }
+
+    struct AcceptAllVerifier;
+    impl SignatureVerifier for AcceptAllVerifier {
+        fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            true
         }
     }
 
@@ -1125,6 +1138,84 @@ mod tests {
         assert!(is_accept(&released[0].1));
         assert_eq!(pool.pending_len(), 0);
         assert_eq!(pool.accepted_hashes(CURRENT_SLOT, 1).len(), 1);
+    }
+
+    #[test]
+    fn authenticated_extraction_moves_signature_owners_and_cleans_indexes_in_fifo_order() {
+        let mut pool = AttestationPool::new();
+        let blocks = [root(0x22)].into_iter().collect::<BTreeSet<_>>();
+        let first_source = [0x51; 32];
+        for (validator, source, fill) in [
+            (1, Some(first_source), 0xA5),
+            (2, None, 0x5A),
+        ] {
+            let mut pending = att(validator, CURRENT_SLOT, 0xAA);
+            pending.signature = vec![fill; 4_589];
+            assert!(matches!(
+                pool.process_from_source(
+                    pending,
+                    CURRENT_SLOT,
+                    &committees(),
+                    &known(&blocks),
+                    &AcceptAllVerifier,
+                    &AnyKey,
+                    source,
+                ),
+                GossipDecision::Hold { missing_root } if missing_root == root(0xAA)
+            ));
+        }
+
+        let retained: Vec<_> = pool
+            .pending
+            .values()
+            .map(|entry| {
+                (
+                    entry.att.validator,
+                    entry.att.signature.as_ptr(),
+                    entry.att.signature.clone(),
+                    entry.att.data.signing_root(),
+                )
+            })
+            .collect();
+        assert_eq!(pool.pending_by_root.get(&root(0xAA)).map(BTreeSet::len), Some(2));
+
+        let (first, remains) = pool.take_authenticated_waiting_on_limit(&root(0xAA), 1);
+        assert!(remains, "the second FIFO entry must remain indexed");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].att.validator, retained[0].0);
+        assert_eq!(first[0].att.signature.as_ptr(), retained[0].1, "signature owner was cloned");
+        assert_eq!(first[0].att.signature, retained[0].2);
+        assert_eq!(first[0].verification_source, Some(first_source));
+        let expected_pubkey_sha3: [u8; 32] = Sha3_256::digest(b"placeholder-key").into();
+        assert_eq!(
+            first[0].verified_pubkey_sha3,
+            expected_pubkey_sha3,
+        );
+        assert!(!pool.pending_by_duty.contains_key(&(CURRENT_SLOT, 1)));
+        assert_eq!(pool.pending_by_duty.get(&(CURRENT_SLOT, 2)), Some(&1));
+        assert!(!pool.pending_by_source.contains_key(&first_source));
+        assert!(!pool.pending_by_source_root.contains_key(&(first_source, root(0xAA))));
+        assert!(!pool.pending_keys.contains(&(CURRENT_SLOT, 1, retained[0].3)));
+        assert!(pool.pending_keys.contains(&(CURRENT_SLOT, 2, retained[1].3)));
+        assert_eq!(pool.pending_unattributed, 1);
+        assert_eq!(pool.pending_unattributed_by_root.get(&root(0xAA)), Some(&1));
+        assert_eq!(pool.pending_len(), 1);
+
+        let (second, remains) = pool.take_authenticated_waiting_on_limit(&root(0xAA), 1);
+        assert!(!remains);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].att.validator, retained[1].0);
+        assert_eq!(second[0].att.signature.as_ptr(), retained[1].1, "signature owner was cloned");
+        assert_eq!(second[0].att.signature, retained[1].2);
+        assert_eq!(second[0].verification_source, None);
+        assert_eq!(pool.pending_len(), 0);
+        assert!(pool.pending_by_root.is_empty());
+        assert!(pool.pending_by_duty.is_empty());
+        assert!(pool.pending_by_source.is_empty());
+        assert!(pool.pending_by_source_root.is_empty());
+        assert!(pool.pending_keys.is_empty());
+        assert_eq!(pool.pending_unattributed, 0);
+        assert!(pool.pending_unattributed_by_root.is_empty());
     }
 
     #[test]
