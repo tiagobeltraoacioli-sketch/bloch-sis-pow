@@ -262,6 +262,11 @@ pub const DUPLICATE_CACHE_TIME: Duration = Duration::from_secs(30);
 /// against a 30 s cache and measured exactly that.
 pub const REGOSSIP_SUPPRESS_TTL: Duration = Duration::from_secs(30);
 
+/// Maximum distinct block IDs retained solely to suppress local re-gossip.
+/// At capacity, a new ID is treated as fresh but not remembered: hostile
+/// churn cannot displace already-retained suppression state.
+const RECENT_BLOCKS_MAX: usize = 4_096;
+
 const _: () = assert!(
     REGOSSIP_SUPPRESS_TTL.as_secs() >= DUPLICATE_CACHE_TIME.as_secs(),
     "re-gossip suppression shorter than the duplicate cache is pure waste"
@@ -1331,7 +1336,23 @@ impl Loop {
             self.recent_blocks_expiry_hint = next_oldest;
         }
 
-        let fresh = self.recent_blocks.insert(id, now).is_none();
+        let at_capacity = self.recent_blocks.len() >= RECENT_BLOCKS_MAX;
+        let fresh = match self.recent_blocks.entry(id) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(now);
+                false
+            }
+            std::collections::hash_map::Entry::Vacant(_) if at_capacity => {
+                // Suppression is an optimization, not an admission verdict.
+                // Drop-new preserves retained work and lets the unchanged
+                // publish path decide how to handle this unremembered ID.
+                return true;
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(now);
+                true
+            }
+        };
         self.recent_blocks_expiry_hint = Some(
             self.recent_blocks_expiry_hint
                 .map_or(now, |oldest| oldest.min(now)),
@@ -2929,6 +2950,49 @@ mod tests {
         assert!(refreshed.recent_blocks.contains_key(&[8u8; 32]));
         assert!(refreshed.recent_blocks.contains_key(&[9u8; 32]));
         assert_eq!(refreshed.recent_blocks_expiry_hint, Some(stale_boundary));
+    }
+
+    #[test]
+    fn recent_block_cache_count_cap_is_drop_new_and_reopens_at_expiry() {
+        let mut state = test_loop();
+        let start = Instant::now();
+        for n in 0..RECENT_BLOCKS_MAX as u64 {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&n.to_le_bytes());
+            assert!(state.note_block_at(id, start));
+        }
+        assert_eq!(state.recent_blocks.len(), RECENT_BLOCKS_MAX);
+        assert_eq!(state.recent_blocks_expiry_hint, Some(start));
+
+        let overflow = [0xFF; 32];
+        assert!(
+            state.note_block_at(overflow, start + Duration::from_secs(1)),
+            "an unremembered ID remains fresh at the local suppression boundary",
+        );
+        assert_eq!(state.recent_blocks.len(), RECENT_BLOCKS_MAX);
+        assert!(!state.recent_blocks.contains_key(&overflow));
+
+        let mut retained = [0u8; 32];
+        retained[..8].copy_from_slice(&1u64.to_le_bytes());
+        let refreshed_at = start + Duration::from_secs(1);
+        assert!(
+            !state.note_block_at(retained, refreshed_at),
+            "an existing ID refreshes and remains suppressed even at capacity",
+        );
+        assert_eq!(state.recent_blocks.len(), RECENT_BLOCKS_MAX);
+        assert_eq!(state.recent_blocks.get(&retained), Some(&refreshed_at));
+
+        let boundary = start + REGOSSIP_SUPPRESS_TTL;
+        let reopened = [0xFE; 32];
+        assert!(state.note_block_at(reopened, boundary));
+        assert_eq!(
+            state.recent_blocks.len(),
+            2,
+            "expired entries leave while the refreshed survivor and newcomer remain",
+        );
+        assert!(state.recent_blocks.contains_key(&retained));
+        assert!(state.recent_blocks.contains_key(&reopened));
+        assert_eq!(state.recent_blocks_expiry_hint, Some(refreshed_at));
     }
 
     #[test]
