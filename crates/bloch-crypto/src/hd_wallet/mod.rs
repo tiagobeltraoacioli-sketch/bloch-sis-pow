@@ -475,13 +475,13 @@ impl HdWallet {
         let mut imported = BTreeSet::new();
         let mut seed = hd_seed_owner(&mnemonic, passphrase.unwrap_or(""));
         for addr in wallet.addresses {
-            // Zeroizing (A4 lows): plaintext JSON containing the hex-encoded
-            // private key — must not survive past the parse below.
-            let bytes = decrypt_with_key(&master_key, &addr.keypair_crypto)?;
-            let kpp: BorrowedKeypairPayload<'_> = serde_json::from_slice(&bytes)
-                .map_err(|e| format!("keypair {} decrypt failed: {}", addr.index, e))?;
-            let mut priv_key = Zeroizing::new(hex::decode(kpp.private_key_hex.as_ref()).map_err(|e| e.to_string())?);
-            let pub_key  = hex::decode(kpp.public_key_hex.as_ref()).map_err(|e| e.to_string())?;
+            // Consume the authenticated plaintext inside a short-lived
+            // parsing boundary. Only the decoded keys survive into address
+            // authentication and the potentially expensive derivation check.
+            let (mut priv_key, pub_key) = decode_keypair_plaintext(
+                decrypt_with_key(&master_key, &addr.keypair_crypto)?,
+                addr.index,
+            )?;
 
             let testnet = addr.address.starts_with(TESTNET_PREFIX);
             // NB: local, not `addr.derived` — this is the recomputed address string.
@@ -582,6 +582,26 @@ fn verify_mnemonic_plaintext(
         return Err("mnemonic mismatch — tampered file?".into());
     }
     Ok(())
+}
+
+/// Decode one authenticated HD keypair plaintext while owning its complete
+/// zeroizing allocation. Canonical strings borrow the plaintext and historical
+/// escaped strings use wiping `Cow::Owned` fallbacks; both parsed views and the
+/// plaintext are dropped before address authentication or derivation resumes.
+fn decode_keypair_plaintext(
+    plaintext: Zeroizing<Vec<u8>>,
+    index: u32,
+) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>), String> {
+    let payload: BorrowedKeypairPayload<'_> = serde_json::from_slice(&plaintext)
+        .map_err(|error| format!("keypair {} decrypt failed: {}", index, error))?;
+    let private_key = Zeroizing::new(
+        hex::decode(payload.private_key_hex.as_ref()).map_err(|error| error.to_string())?,
+    );
+    let public_key =
+        hex::decode(payload.public_key_hex.as_ref()).map_err(|error| error.to_string())?;
+    drop(payload);
+    drop(plaintext);
+    Ok((private_key, public_key))
 }
 
 fn validate_wallet_load_limits(
@@ -1999,6 +2019,38 @@ mod audit_wallet_boundaries {
         assert_eq!(loaded.2.as_ptr(), label_pointer);
         assert_eq!(loaded.1.private_key, vec![1, 2]);
         assert_eq!(loaded.1.public_key, vec![3, 4]);
+    }
+
+    #[test]
+    fn authenticated_keypair_decoder_consumes_zeroizing_plaintext_and_preserves_shapes() {
+        let _: fn(Zeroizing<Vec<u8>>, u32) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>), String> =
+            decode_keypair_plaintext;
+        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
+
+        let canonical = Zeroizing::new(
+            serde_json::to_vec(&KeypairPayload {
+                private_key_hex: "a1b2c3d4".into(),
+                public_key_hex: "01020304".into(),
+            })
+            .unwrap(),
+        );
+        let (mut private_key, public_key) = decode_keypair_plaintext(canonical, 7).unwrap();
+        assert_eq!(&private_key[..], &[0xa1, 0xb2, 0xc3, 0xd4]);
+        assert_eq!(public_key, [1, 2, 3, 4]);
+        private_key.zeroize();
+        assert!(private_key.is_empty());
+
+        // Historical escaped JSON requires Serde-owned compatibility strings;
+        // the consuming helper must preserve their decoded bytes and errors.
+        let escaped = Zeroizing::new(
+            br#"{"private_key_hex":"\u0061\u0062","public_key_hex":"\u0063\u0064"}"#.to_vec(),
+        );
+        let (private_key, public_key) = decode_keypair_plaintext(escaped, 9).unwrap();
+        assert_eq!(&private_key[..], &[0xab]);
+        assert_eq!(public_key, [0xcd]);
+
+        let error = decode_keypair_plaintext(Zeroizing::new(b"not-json".to_vec()), 11).unwrap_err();
+        assert!(error.starts_with("keypair 11 decrypt failed: "));
     }
 
     #[test]
