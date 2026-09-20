@@ -846,9 +846,16 @@ pub mod falcon {
 
         #[test]
         fn canonical_verifier_rejects_the_legacy_zero_padded_variant() {
-            let (pk, sk) = keypair();
-            let msg = b"falcon-canonical-encoding";
-            let sig = sign(&sk, msg).unwrap();
+            // Use the same deterministic RNG fixture as the clean-variant KAT
+            // below. A random compact Falcon signature can legitimately fill
+            // all 1280 bytes, in which case `resize` adds no padding and this
+            // test would fail before exercising either verifier.
+            let msg = b"bloch-pos-falcon-clean-kat-v1";
+            let (pk, sig) = pqcrypto_internals::with_seeded_rng_scope(&[0xB1; 32], || {
+                let (pk, sk) = keypair();
+                let sig = sign(&sk, msg).expect("seeded falcon sign");
+                (pk, sig)
+            });
             assert!(verify_canonical(&pk, msg, &sig));
 
             let mut padded = sig.clone();
