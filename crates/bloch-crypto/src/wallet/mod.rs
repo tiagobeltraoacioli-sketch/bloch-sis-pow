@@ -957,19 +957,32 @@ impl Keypair {
         decrypt_legacy_keystore_in_place(&enc_k, &nonce_b, &mut plain)?;
         drop(enc_k);
 
-        let payload: BorrowedKeystorePayload<'_> =
-            serde_json::from_slice(&plain).map_err(|e| e.to_string())?;
-        let mut private_key = Zeroizing::new(
-            hex::decode(payload.private_key_hex.as_ref()).map_err(|e| e.to_string())?,
-        );
-        let public_key = hex::decode(payload.public_key_hex.as_ref()).map_err(|e| e.to_string())?;
-        drop(payload);
+        let (mut private_key, public_key) = decode_legacy_keystore_payload(plain)?;
 
         let testnet = ks.address.starts_with(TESTNET_PREFIX);
         let derived = crypto::address_from_pubkey(&public_key, testnet);
         if derived != ks.address { return Err("address mismatch — keystore may be tampered".into()); }
         Ok(Keypair { private_key: std::mem::take(&mut *private_key), public_key, address: ks.address })
     }
+}
+
+/// Parse the authenticated legacy plaintext while keeping its complete
+/// private-key JSON inside this short-lived ownership boundary. Canonical key
+/// strings borrow this zeroizing allocation; historical escaped strings use
+/// the wiping `Cow::Owned` fallback. Both the parsed view and plaintext are
+/// dropped before address authentication resumes in the caller.
+fn decode_legacy_keystore_payload(
+    plain: Zeroizing<Vec<u8>>,
+) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>), String> {
+    let payload: BorrowedKeystorePayload<'_> =
+        serde_json::from_slice(&plain).map_err(|e| e.to_string())?;
+    let private_key = Zeroizing::new(
+        hex::decode(payload.private_key_hex.as_ref()).map_err(|e| e.to_string())?,
+    );
+    let public_key = hex::decode(payload.public_key_hex.as_ref()).map_err(|e| e.to_string())?;
+    drop(payload);
+    drop(plain);
+    Ok((private_key, public_key))
 }
 
 /// Serialize and encrypt the legacy keypair while keeping repository-owned
@@ -1507,6 +1520,11 @@ mod legacy_keystore_tests {
 
     #[test]
     fn legacy_decrypted_key_strings_borrow_plaintext_and_preserve_escaped_json() {
+        let _: fn(Zeroizing<Vec<u8>>)
+            -> Result<(Zeroizing<Vec<u8>>, Vec<u8>), String> =
+            decode_legacy_keystore_payload;
+        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
+
         let plain = Zeroizing::new(
             serde_json::to_vec(&KeystorePayload {
                 private_key_hex: "a1b2c3d4".into(),
@@ -1529,6 +1547,9 @@ mod legacy_keystore_tests {
             [0xa1, 0xb2, 0xc3, 0xd4]
         );
         drop(parsed);
+        let (private_key, public_key) = decode_legacy_keystore_payload(plain).unwrap();
+        assert_eq!(&private_key[..], &[0xa1, 0xb2, 0xc3, 0xd4]);
+        assert_eq!(public_key, [0x01, 0x02, 0x03, 0x04]);
 
         let escaped = br#"{
             "private_key_hex":"\u0061\u0062",
@@ -1541,6 +1562,26 @@ mod legacy_keystore_tests {
         assert_eq!(hex::decode(escaped_parsed.private_key_hex.as_ref()).unwrap(), [0xab]);
         assert_eq!(hex::decode(escaped_parsed.public_key_hex.as_ref()).unwrap(), [0xcd]);
         assert!(std::mem::needs_drop::<BorrowedKeystorePayload<'_>>());
+        drop(escaped_parsed);
+
+        let (escaped_private, escaped_public) = decode_legacy_keystore_payload(
+            Zeroizing::new(escaped.to_vec()),
+        ).unwrap();
+        assert_eq!(&escaped_private[..], &[0xab]);
+        assert_eq!(escaped_public, [0xcd]);
+
+        for (private_key_hex, public_key_hex) in [("zz", "01"), ("01", "zz")] {
+            let invalid = Zeroizing::new(
+                serde_json::to_vec(&KeystorePayload {
+                    private_key_hex: private_key_hex.into(),
+                    public_key_hex: public_key_hex.into(),
+                }).unwrap(),
+            );
+            assert_eq!(
+                decode_legacy_keystore_payload(invalid).unwrap_err(),
+                hex::decode("zz").unwrap_err().to_string(),
+            );
+        }
     }
 
     #[test]
