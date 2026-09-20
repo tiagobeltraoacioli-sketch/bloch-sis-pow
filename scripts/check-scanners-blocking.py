@@ -55,7 +55,7 @@ security job, fails if the job:
     anchors, aliases, merge keys or flow mappings outside literal/folded block scalar data.
   * makes the GitHub OSV verdict mutable by replacing its full commit pin with
     a tag/branch, or removes this guard's own adversarial self-test.
-  * lets the GitHub OSV lockfile scope drift from the complete set of tracked
+  * lets either CI's OSV lockfile scope drift from the complete set of tracked
     `Cargo.lock` files in either direction.
   * changes the exact GitHub global run shell that clears inherited
     shell/Python/Rust substitution variables, fixes PATH, and preserves
@@ -860,17 +860,38 @@ def check_file(
                 "%s: job `%s` (%s) no longer executes the adversarial "
                 "self-test that proves its guard can fail"
                 % (label, job, why))
-        if label == ".github/workflows/security.yml" and job == "osv-scanner":
-            scan_args = github_action_input(
-                blocks[job], indent, GITHUB_VERDICTS[job], "scan-args")
-            try:
-                tokens = shlex.split(scan_args, comments=True) if scan_args is not None else []
-            except ValueError:
-                tokens = []
+        if job == "osv-scanner":
             required_args = ["--config=osv-scanner.toml"] + [
                 "--lockfile=" + path for path in tracked]
-            if (len(tokens) != len(required_args)
-                    or set(tokens) != set(required_args)):
+            if label == ".github/workflows/security.yml":
+                scan_args = github_action_input(
+                    blocks[job], indent, GITHUB_VERDICTS[job], "scan-args")
+                try:
+                    tokens = (shlex.split(scan_args, comments=True)
+                              if scan_args is not None else [])
+                except ValueError:
+                    tokens = []
+            else:
+                scanner_commands = [
+                    value for value in executable
+                    if GITLAB_VERDICTS[job].search(value)
+                    and not re.search(r"(?:\|\||&&|[;|&]|\$\(|`)", value)
+                ]
+                try:
+                    # `explicit_execution_values` removes YAML's outer scalar
+                    # quotes. A real command may independently quote only its
+                    # executable (`"$HOME/.../osv-scanner"`), leaving that
+                    # closing quote visible here. Parse from the first reviewed
+                    # option so executable quoting cannot distort the scope.
+                    option_offset = (scanner_commands[0].find("--config=")
+                                     if len(scanner_commands) == 1 else -1)
+                    command_tokens = (shlex.split(
+                        scanner_commands[0][option_offset:], comments=True)
+                        if option_offset >= 0 else [])
+                except ValueError:
+                    command_tokens = []
+                tokens = command_tokens
+            if len(tokens) != len(required_args) or set(tokens) != set(required_args):
                 problems.append(
                     "%s: job `%s` must give the pinned action the exact reviewed "
                     "config and complete lockfile scan scope"

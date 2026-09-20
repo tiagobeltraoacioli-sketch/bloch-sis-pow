@@ -8,6 +8,12 @@ publish = false
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
-solana-program = "=2.3.0"
+# Depend on the maintained split SDK crates that this minimal counter actually
+# uses. The solana-program facade pulls serialization and legacy crypto paths
+# that are unnecessary for an account/entrypoint example.
+solana-account-info = "=3.1.1"
+solana-program-entrypoint = "=3.1.1"
+solana-program-error = "=3.0.1"
+solana-pubkey = "=4.3.0"
 
 [workspace]

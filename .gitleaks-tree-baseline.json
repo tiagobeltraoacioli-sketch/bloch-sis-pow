@@ -1418,5 +1418,25 @@
     "Tags": [],
     "RuleID": "generic-api-key",
     "Fingerprint": "docs/audit/reproducers/validator-monday-local-qualification-2026-09-13.json:generic-api-key:99"
+  },
+  {
+    "Description": "Identified a pattern that may indicate AWS credentials, risking unauthorized cloud resource access and data breaches on AWS platforms.",
+    "StartLine": 8,
+    "EndLine": 8,
+    "StartColumn": 3115,
+    "EndColumn": 3134,
+    "Match": "REDACTED",
+    "Secret": "REDACTED",
+    "File": "crates/bloch-crypto/tests/vectors/acvp-mldsa65-keygen-tc26.json",
+    "SymlinkFile": "",
+    "Commit": "",
+    "Entropy": 3.4464393,
+    "Author": "",
+    "Email": "",
+    "Date": "",
+    "Message": "",
+    "Tags": [],
+    "RuleID": "aws-access-token",
+    "Fingerprint": "crates/bloch-crypto/tests/vectors/acvp-mldsa65-keygen-tc26.json:aws-access-token:8"
   }
 ]

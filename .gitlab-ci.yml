@@ -312,8 +312,8 @@ iso-hardening-guard:
   stage: check
   before_script: []
   script:
-    - python3 scripts/check-iso-hardening.selftest.py
-    - python3 scripts/check-iso-hardening.py
+    - python3 -I scripts/check-iso-hardening.selftest.py
+    - python3 -I scripts/check-iso-hardening.py
     - python3 -I scripts/check-attested-ssh.selftest.py
     - python3 -I scripts/check-attested-ssh.py
   allow_failure: false
@@ -561,6 +561,7 @@ osv-scanner:
         --lockfile=spikes/prover-cost/rv32f/Cargo.lock
         --lockfile=spikes/prover-cost/rv32h/Cargo.lock
         --lockfile=spikes/prover-cost/rv32k/Cargo.lock
+        --lockfile=tools/bloch-devkit/templates/svm/Cargo.lock
   allow_failure: false
 
 # cargo-geiger — quantifies `unsafe` across the dependency tree (own code +

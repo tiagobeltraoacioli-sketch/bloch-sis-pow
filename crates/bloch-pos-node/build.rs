@@ -628,8 +628,8 @@ fn main() {
     let cc_archiver_digest = required_cc_archiver_digest(&target, &host);
     let default_linker_digest = default_linker_digest(&rustc, &target);
     let default_linker_binaries = usize::from(default_linker_digest.is_some());
-    let tool_binaries =
-        usize::from(rustc_binary_digest.is_some()) + usize::from(cargo_binary_digest.is_some());
+    let tool_binaries = usize::from(rustc_binary_digest.is_some())
+        .saturating_add(usize::from(cargo_binary_digest.is_some()));
     let (environment_digest, environment_fields) = build_environment_digest(
         &rustc_verbose,
         &cargo_verbose,

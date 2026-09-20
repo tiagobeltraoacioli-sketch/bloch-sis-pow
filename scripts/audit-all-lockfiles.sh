@@ -50,6 +50,7 @@ LOCKFILES=(
   spikes/prover-cost/rv32f/Cargo.lock
   spikes/prover-cost/rv32h/Cargo.lock
   spikes/prover-cost/rv32k/Cargo.lock
+  tools/bloch-devkit/templates/svm/Cargo.lock # generated SVM project template
 )
 
 # 1) No committed lockfile may be missing from the list above.

@@ -49,4 +49,8 @@ regexes = [
   # `services/pq-shield-api/README.md` — compressed secp256k1 PUBLIC keys in a
   # regtest example (the first is the generator point G).
   '''"(hot|recovery)_pubkey"\s*:\s*"0[23][0-9a-f]{64}"''',
+  # `.gitleaks-tree-baseline-files.json` — the exact source-hash pin for the
+  # public NIST ACVP ML-DSA vector. The pin makes any replacement bytes lose
+  # their reviewed tree exception; this narrow metadata line is not a key.
+  '''"crates/bloch-crypto/tests/vectors/acvp-mldsa65-keygen-tc26\.json"\s*:\s*"[0-9a-f]{64}"''',
 ]

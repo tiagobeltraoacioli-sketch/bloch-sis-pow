@@ -93,7 +93,23 @@ osv-scanner:
   stage: check
   script:
     - bash scripts/ci-install-scanner.sh osv-scanner
-    - osv-scanner --config=osv-scanner.toml --lockfile=Cargo.lock
+    - >-
+        osv-scanner --config=osv-scanner.toml
+        --lockfile=Cargo.lock
+        --lockfile=pool/Cargo.lock
+        --lockfile=pool-proxy/Cargo.lock
+        --lockfile=services/pq-shield-api/Cargo.lock
+        --lockfile=euvm-tooling/Cargo.lock
+        --lockfile=crates/coherence-prover/script/Cargo.lock
+        --lockfile=crates/coherence-prover/service/Cargo.lock
+        --lockfile=crates/coherence-prover/program/Cargo.lock
+        --lockfile=fuzz/Cargo.lock
+        --lockfile=spikes/prover-cost/Cargo.lock
+        --lockfile=spikes/prover-cost/rv32/Cargo.lock
+        --lockfile=spikes/prover-cost/rv32f/Cargo.lock
+        --lockfile=spikes/prover-cost/rv32h/Cargo.lock
+        --lockfile=spikes/prover-cost/rv32k/Cargo.lock
+        --lockfile=tools/bloch-devkit/templates/svm/Cargo.lock
   allow_failure: false
 
 secret-scan:
@@ -788,8 +804,8 @@ CASES = [
 
     Case("gitlab allow_failure on osv-scanner",
          sub(GOOD_GITLAB,
-             "    - osv-scanner --config=osv-scanner.toml --lockfile=Cargo.lock\n  allow_failure: false",
-             "    - osv-scanner --config=osv-scanner.toml --lockfile=Cargo.lock\n  allow_failure: true"),
+             "        --lockfile=tools/bloch-devkit/templates/svm/Cargo.lock\n  allow_failure: false",
+             "        --lockfile=tools/bloch-devkit/templates/svm/Cargo.lock\n  allow_failure: true"),
          GOOD_GITHUB, must_fail=True, expect="`osv-scanner`"),
 
     Case("gitlab exit-0 skip on secret-scan (the silent one)",
@@ -805,12 +821,7 @@ CASES = [
          GOOD_GITHUB, must_fail=True, expect="when: manual"),
 
     Case("gitlab scanner job deleted outright",
-         GOOD_GITLAB.replace(
-             "osv-scanner:\n  stage: check\n"
-             "  script:\n"
-             "    - bash scripts/ci-install-scanner.sh osv-scanner\n"
-             "    - osv-scanner --config=osv-scanner.toml --lockfile=Cargo.lock\n"
-             "  allow_failure: false\n\n", ""),
+         sub(GOOD_GITLAB, "\nosv-scanner:\n", "\nosv-scanner-deleted:\n"),
          GOOD_GITHUB, must_fail=True, expect="MISSING"),
 
     Case("github continue-on-error on osv-scanner",
@@ -882,6 +893,12 @@ CASES = [
              "            --lockfile=pool/Cargo.lock\n", ""),
          must_fail=True, expect="exact reviewed config and complete lockfile scan scope"),
 
+    Case("gitlab OSV cannot drop a standalone workspace lockfile",
+         GOOD_GITLAB.replace(
+             "        --lockfile=pool/Cargo.lock\n", ""),
+         GOOD_GITHUB, must_fail=True,
+         expect="exact reviewed config and complete lockfile scan scope"),
+
     Case("OSV config decoy in another step is not action input",
          GOOD_GITLAB,
          sub(
@@ -897,6 +914,15 @@ CASES = [
          expect="exact reviewed config and complete lockfile scan scope",
          tracked_lockfiles=TRACKED_LOCKFILES + ("future/Cargo.lock",)),
 
+    Case("new tracked lockfile also fails the GitLab OSV scope",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "            --lockfile=tools/bloch-devkit/templates/svm/Cargo.lock",
+             "            --lockfile=tools/bloch-devkit/templates/svm/Cargo.lock\n"
+             "            --lockfile=future/Cargo.lock"),
+         must_fail=True, expect=".gitlab-ci.yml",
+         tracked_lockfiles=TRACKED_LOCKFILES + ("future/Cargo.lock",)),
+
     Case("stale untracked lockfile cannot remain in OSV scope",
          GOOD_GITLAB,
          GOOD_GITHUB.replace(
@@ -904,6 +930,14 @@ CASES = [
              "            --lockfile=spikes/prover-cost/rv32k/Cargo.lock\n"
              "            --lockfile=retired/Cargo.lock"),
          must_fail=True, expect="exact reviewed config and complete lockfile scan scope"),
+
+    Case("stale untracked lockfile cannot remain in GitLab OSV scope",
+         GOOD_GITLAB.replace(
+             "        --lockfile=spikes/prover-cost/rv32k/Cargo.lock",
+             "        --lockfile=spikes/prover-cost/rv32k/Cargo.lock\n"
+             "        --lockfile=retired/Cargo.lock"),
+         GOOD_GITHUB, must_fail=True,
+         expect="exact reviewed config and complete lockfile scan scope"),
 
     Case("CI guard invocation cannot inject a lockfile fixture",
          GOOD_GITLAB.replace(

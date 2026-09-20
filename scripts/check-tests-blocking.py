@@ -211,7 +211,7 @@ CI_SCRIPT_ENTRYPOINT_SHA256 = {
     "scripts/check-attested-ssh.selftest.py":
         "16245f0a98bf1ad1ea49ea930cbc1e3edd175f476617d7aee105c15ac4a6e9ac",
     "scripts/check-live-node-retired-isolation.py":
-        "45ece7368931469c2c64c161708009b41aebcbf3c1033fa75006e16d5e16518d",
+        "d76a589a165ccc61c024194ee020e3df693e695ab2c77eede0e4a2e6c713eae4",
     "scripts/check-iso-hardening.py":
         "f0589590f19ebda59ff04a969dfb4d56adef7daeeb3498e1e8d74a911abcdfb2",
     "scripts/check-iso-hardening.selftest.py":
