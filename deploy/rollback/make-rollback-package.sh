@@ -52,6 +52,23 @@ if [ -z "$OUTDIR" ]; then OUTDIR="$(cd "$(dirname "$0")" && pwd)/dist"; fi
 
 [ -f "$BIN" ] || { echo "no such binary: $BIN" >&2; exit 1; }
 
+# Keep the caller-supplied identity narrow enough that it can be matched as a
+# complete token rather than as an arbitrary substring of --version output.
+# The hexadecimal range admits the abbreviated/full SHA-1 identities used
+# today and a future full SHA-256 object id without claiming which hash Git
+# uses for this release.
+case "$STAMP" in
+  *$'\n'*|*$'\r'*)
+    echo "FAIL: rollback stamp must be one canonical version-and-commit token." >&2
+    exit 1
+    ;;
+esac
+if ! printf '%s\n' "$STAMP" \
+    | LC_ALL=C grep -Eq '^[A-Za-z0-9][A-Za-z0-9._+-]* \([0-9a-f]{7,64}\)$'; then
+  echo "FAIL: rollback stamp must be one canonical version-and-commit token." >&2
+  exit 1
+fi
+
 sha256_file() {
   if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}';
   else shasum -a 256 "$1" | awk '{print $1}'; fi
@@ -141,11 +158,15 @@ cp "$BIN" "$SNAPSHOT"
 chmod 0755 "$SNAPSHOT"
 
 # If the private snapshot runs on this host, refuse a stamp that contradicts
-# it. Compute its identity only after execution because even an executable that
-# rewrites itself during --version must leave one consistently named byte set.
+# the first version line. Require the complete validated token, bounded by
+# ASCII spaces, so a truncated identity, a larger token or a later decoy line
+# cannot satisfy the check. Compute the byte identity only after execution
+# because even an executable that rewrites itself during --version must leave
+# one consistently named byte set.
 if V="$("$SNAPSHOT" --version 2>/dev/null)"; then
-  case "$V" in
-    *"$STAMP"*) : ;;
+  VERSION_FIRST_LINE="${V%%$'\n'*}"
+  case " $VERSION_FIRST_LINE " in
+    *" $STAMP "*) : ;;
     *) echo "STAMP MISMATCH: --version says '$V', you said '$STAMP'." >&2; exit 1 ;;
   esac
 fi

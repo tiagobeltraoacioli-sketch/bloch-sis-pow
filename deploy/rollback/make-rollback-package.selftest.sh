@@ -121,6 +121,49 @@ echo "bloch-pos-node $STAMP built-by-selftest"
 BINSTUB
 chmod 0755 "$W/bloch-pos"
 
+expect_stamp_failure() { # $1 = case, $2 = binary, $3 = stamp, $4 = diagnostic
+  name="$1"
+  binary="$2"
+  stamp="$3"
+  expected="$4"
+  output="$W/stamp-$name"
+  log="$W/stamp-$name.log"
+  if BLOCH_ROLLBACK_SECKEY="$W/rel.key" BLOCH_ROLLBACK_PUBKEY="$W/rel.pub" \
+      "$ASSEMBLER" "$binary" "$stamp" "$output" > "$log" 2>&1; then
+    bad "assembler accepted $name rollback stamp"
+  elif ! grep -Fq "$expected" "$log"; then
+    bad "assembler rejected $name rollback stamp without the expected diagnostic"
+    sed 's/^/       /' "$log"
+  elif [ -d "$output" ] \
+      && [ -n "$(find "$output" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+    bad "assembler published output after rejecting $name rollback stamp"
+  else
+    ok "assembler refuses $name rollback stamp before publication"
+  fi
+}
+
+expect_stamp_failure truncated "$W/bloch-pos" '0.0.1-selftest' \
+  'rollback stamp must be one canonical version-and-commit token'
+
+DECOY_STAMP='0.0.1-selftest (deadbeef1234)'
+cat > "$W/decoy-version-bloch-pos" <<BINSTUB
+#!/usr/bin/env bash
+printf '%s\n' 'bloch-pos-node 0.0.1-selftest (abcdef123456) built-by-selftest'
+printf '%s\n' 'decoy $DECOY_STAMP'
+BINSTUB
+chmod 0755 "$W/decoy-version-bloch-pos"
+expect_stamp_failure second-line-decoy "$W/decoy-version-bloch-pos" \
+  "$DECOY_STAMP" 'STAMP MISMATCH'
+
+EMBEDDED_STAMP='0.0.1-selftest (decafbad1234)'
+cat > "$W/embedded-version-bloch-pos" <<BINSTUB
+#!/usr/bin/env bash
+printf '%s\n' 'bloch-pos-node x${EMBEDDED_STAMP}y built-by-selftest'
+BINSTUB
+chmod 0755 "$W/embedded-version-bloch-pos"
+expect_stamp_failure embedded-token "$W/embedded-version-bloch-pos" \
+  "$EMBEDDED_STAMP" 'STAMP MISMATCH'
+
 expect_sha_failure() { # $1 = mode, $2 = expected diagnostic
   mode="$1"
   expected="$2"
