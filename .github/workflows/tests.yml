@@ -66,9 +66,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # cargo test over the live crates — BLOCKING. One invocation, so a failure
-  # in any crate fails the job; --locked so the gate tests the committed
-  # dependency graph, not whatever resolves on the runner today.
+  # cargo test over the live crates — BLOCKING. One named step per crate makes
+  # a failure attributable from the job summary while every step remains in the
+  # same blocking job; --locked tests the committed dependency graph.
   cargo-test:
     name: cargo test — live crates (blocking)
     runs-on: ubuntu-latest
@@ -106,17 +106,22 @@ jobs:
         run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-node --bin bloch-pos audit_
       - name: Entropy guard regressions and thread-affinity doctests
         run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p pqcrypto-internals
-      - name: cargo test (live crates)
-        run: |
-          cargo +${{ steps.pin.outputs.toolchain }} test --locked \
-            -p bloch-pos-committee \
-            -p bloch-pos-node \
-            -p bloch-crypto \
-            -p coherence-core \
-            -p bloch-sis-pow \
-            -p bloch-pq-vault \
-            -p pqcrypto-internals \
-            -p genesis4-ceremony
+      - name: cargo test — bloch-pos-committee
+        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-committee
+      - name: cargo test — bloch-pos-node
+        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-node
+      - name: cargo test — bloch-crypto
+        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-crypto
+      - name: cargo test — coherence-core
+        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p coherence-core
+      - name: cargo test — bloch-sis-pow
+        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-sis-pow
+      - name: cargo test — bloch-pq-vault
+        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pq-vault
+      - name: cargo test — pqcrypto-internals
+        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p pqcrypto-internals
+      - name: cargo test — genesis4-ceremony
+        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p genesis4-ceremony
 
   # ADR-041 lifecycle flag-day guards (deploy/FLAG-DAY-LIFECYCLE.md). Three
   # things, each blocking, none of which the cargo-test job above measures:

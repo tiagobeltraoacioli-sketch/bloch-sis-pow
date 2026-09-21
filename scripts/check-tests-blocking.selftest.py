@@ -138,16 +138,22 @@ jobs:
       - run: python3 -I scripts/rehearse-validator-joining-network.py --output "$RUNNER_TEMP/validator-joining-network"
       - run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-node --bin bloch-pos audit_
       - run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p pqcrypto-internals
-      - run: |
-          cargo +${{ steps.pin.outputs.toolchain }} test --locked \\
-            -p bloch-pos-committee \\
-            -p bloch-pos-node \\
-            -p bloch-crypto \\
-            -p coherence-core \\
-            -p bloch-sis-pow \\
-            -p bloch-pq-vault \\
-            -p pqcrypto-internals \\
-            -p genesis4-ceremony
+      - name: cargo test — bloch-pos-committee
+        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-committee
+      - name: cargo test — bloch-pos-node
+        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-node
+      - name: cargo test — bloch-crypto
+        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-crypto
+      - name: cargo test — coherence-core
+        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p coherence-core
+      - name: cargo test — bloch-sis-pow
+        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-sis-pow
+      - name: cargo test — bloch-pq-vault
+        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pq-vault
+      - name: cargo test — pqcrypto-internals
+        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p pqcrypto-internals
+      - name: cargo test — genesis4-ceremony
+        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p genesis4-ceremony
 
   tests-blocking-guard:
     name: tests-blocking guard (blocking)
@@ -540,8 +546,8 @@ CASES = [
     Case("GitHub cargo step PATH is refused",
          GOOD_GITLAB,
          GOOD_GITHUB.replace(
-             "            -p genesis4-ceremony\n",
-             "            -p genesis4-ceremony\n"
+             "        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p genesis4-ceremony\n",
+             "        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p genesis4-ceremony\n"
              "        env:\n          PATH: scripts/fake-cargo"),
          must_fail=True, expect="environment/container/service context"),
     Case("GitHub cargo job container is refused",
@@ -889,7 +895,10 @@ CASES = [
 
     Case("github drops one live crate from the list",
          GOOD_GITLAB,
-         sub(GOOD_GITHUB, "            -p bloch-pos-committee \\\n", ""),
+         sub(GOOD_GITHUB,
+             "      - name: cargo test — bloch-pos-committee\n"
+             "        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-committee\n",
+             ""),
          must_fail=True, expect="bloch-pos-committee"),
 
     Case("github timeout removed",
@@ -907,8 +916,8 @@ CASES = [
     Case("github step shell cannot mask cargo test status",
          GOOD_GITLAB,
          GOOD_GITHUB.replace(
-             "            -p genesis4-ceremony\n",
-             "            -p genesis4-ceremony\n"
+             "        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p genesis4-ceremony\n",
+             "        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p genesis4-ceremony\n"
              "        shell: bash {0} || true\n"),
          must_fail=True, expect="custom shell/defaults"),
 

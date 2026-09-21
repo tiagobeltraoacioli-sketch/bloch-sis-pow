@@ -121,15 +121,14 @@ GITHUB_CARGO_TEST_RUNS = (
     'python3 -I scripts/rehearse-validator-joining-network.py --output "$RUNNER_TEMP/validator-joining-network"',
     "cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-node --bin bloch-pos audit_",
     "cargo +${{ steps.pin.outputs.toolchain }} test --locked -p pqcrypto-internals",
-    "cargo +${{ steps.pin.outputs.toolchain }} test --locked \\\n"
-    "-p bloch-pos-committee \\\n"
-    "-p bloch-pos-node \\\n"
-    "-p bloch-crypto \\\n"
-    "-p coherence-core \\\n"
-    "-p bloch-sis-pow \\\n"
-    "-p bloch-pq-vault \\\n"
-    "-p pqcrypto-internals \\\n"
-    "-p genesis4-ceremony",
+    "cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-committee",
+    "cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-node",
+    "cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-crypto",
+    "cargo +${{ steps.pin.outputs.toolchain }} test --locked -p coherence-core",
+    "cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-sis-pow",
+    "cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pq-vault",
+    "cargo +${{ steps.pin.outputs.toolchain }} test --locked -p pqcrypto-internals",
+    "cargo +${{ steps.pin.outputs.toolchain }} test --locked -p genesis4-ceremony",
 )
 GITHUB_TEST_GUARD_STEPS = (
     ("uses", "actions/checkout@11d5960a326750d5838078e36cf38b85af677262", ()),
@@ -219,7 +218,7 @@ CI_SCRIPT_ENTRYPOINT_SHA256 = {
     "scripts/check-iso-hardening.sh":
         "f0dae2e22aa766301def84a0c671ca4f79ff0c1b87d6e8647e9f6671669b91b3",
     "scripts/check-tests-blocking.selftest.py":
-        "d7e7f07f907c127b9ef0404d9887481f862f0115d98e8b7300cee83d89e66187",
+        "8c7d6e0e3ac8eabeb692febf330a0498c7ccaf7d76fb23ffd50d5e8b37196af9",
     "scripts/check-validator-lifecycle-mutations.py":
         "12b477e5043bc3ea98387be33ca586976494b30083522b214cea7d88c0e9f429",
     "scripts/devnet-particao-report.test.py":
