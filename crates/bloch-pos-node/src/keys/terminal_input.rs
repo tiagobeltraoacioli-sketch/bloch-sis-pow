@@ -3,10 +3,9 @@
 //! This must run before creating threads: pthread_sigmask changes this thread's
 //! mask, and another thread could otherwise receive a process-directed signal.
 //! No process-wide signal disposition is installed or replaced.
-use std::fs;
+use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::fd::{AsRawFd, FromRawFd};
 use zeroize::Zeroizing;
 
 const INTERRUPTS: [libc::c_int; 7] = [
@@ -16,7 +15,7 @@ const INTERRUPTS: [libc::c_int; 7] = [
 
 struct SignalMask {
     saved: libc::sigset_t,
-    newly_blocked: [bool; 7],
+    newly_actionable: [bool; 7],
 }
 impl SignalMask {
     fn block() -> io::Result<Self> {
@@ -24,17 +23,33 @@ impl SignalMask {
         let mut signals: libc::sigset_t = unsafe { std::mem::zeroed() };
         let mut saved: libc::sigset_t = unsafe { std::mem::zeroed() };
         unsafe { libc::sigemptyset(&mut signals); }
-        for signal in INTERRUPTS { unsafe { libc::sigaddset(&mut signals, signal); } }
+        for signal in INTERRUPTS {
+            unsafe { libc::sigaddset(&mut signals, signal); }
+        }
         let result = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &signals, &mut saved) };
         if result != 0 { return Err(io::Error::from_raw_os_error(result)); }
-        let newly_blocked = INTERRUPTS.map(|signal| unsafe { libc::sigismember(&saved, signal) } == 0);
-        Ok(Self { saved, newly_blocked })
+        // Establish the guard immediately: every error below must restore the
+        // caller's signal mask before returning.
+        let mut guard = Self { saved, newly_actionable: [false; 7] };
+        for (index, signal) in INTERRUPTS.into_iter().enumerate() {
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            if unsafe { libc::sigaction(signal, std::ptr::null(), &mut action) } != 0 {
+                let error = io::Error::last_os_error();
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("cannot inspect disposition for signal {signal}: {error}"),
+                ));
+            }
+            guard.newly_actionable[index] = action.sa_sigaction != libc::SIG_IGN
+                && unsafe { libc::sigismember(&guard.saved, signal) } == 0;
+        }
+        Ok(guard)
     }
     fn interrupted(&self) -> io::Result<bool> {
         let mut pending: libc::sigset_t = unsafe { std::mem::zeroed() };
         if unsafe { libc::sigpending(&mut pending) } != 0 { return Err(io::Error::last_os_error()); }
-        Ok(INTERRUPTS.iter().zip(self.newly_blocked).any(|(signal, newly)| {
-            newly && unsafe { libc::sigismember(&pending, *signal) } == 1
+        Ok(INTERRUPTS.iter().zip(self.newly_actionable).any(|(signal, actionable)| {
+            actionable && unsafe { libc::sigismember(&pending, *signal) } == 1
         }))
     }
 }
@@ -68,8 +83,14 @@ pub(super) fn read_passphrase(prompt: &str) -> io::Result<Zeroizing<String>> {
     // Declared first so every return/error restores the terminal before
     // releasing signals. Preserve signals that the caller already blocked.
     let signals = SignalMask::block()?;
-    let mut input = fs::OpenOptions::new().read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC).open("/dev/tty")?;
+    // Use one descriptor for terminal control and input. Reopening /dev/tty
+    // read-only makes tcsetattr fail on Darwin, while a separate terminal can
+    // create a control/read split. Duplicating stdin preserves its access mode
+    // without borrowing Rust's buffered global stdin.
+    let fd = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD_CLOEXEC, 0) };
+    if fd < 0 { return Err(io::Error::last_os_error()); }
+    // SAFETY: fcntl returned a new owned descriptor, transferred to File.
+    let mut input = unsafe { File::from_raw_fd(fd) };
     let fd = input.as_raw_fd();
     let mut term: libc::termios = unsafe { std::mem::zeroed() };
     if unsafe { libc::tcgetattr(fd, &mut term) } != 0 { return Err(io::Error::last_os_error()); }
