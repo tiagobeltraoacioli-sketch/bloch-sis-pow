@@ -180,8 +180,34 @@ pub(crate) fn command_from_env(output: &str) -> Option<(Vec<String>, Option<Stri
 /// `--print link-args` output. The remaining linker arguments are intentionally
 /// ignored after the shared command parser has identified their boundary.
 pub(crate) fn linker_from_printed_args(output: &str) -> Option<(String, Option<String>)> {
-    let (words, search_path) = command_from_env(output)?;
-    Some((words.first()?.clone(), search_path))
+    let words = configured_command_words(output)?;
+    let first = words.first()?;
+    let is_env = Path::new(first)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("env") || name.eq_ignore_ascii_case("env.exe")
+        });
+    if is_env {
+        let (command, search_path) = command_from_env(output)?;
+        return Some((command.first()?.clone(), search_path));
+    }
+
+    // Linux rustc prints the link command as POSIX leading assignments
+    // (`LC_ALL=... PATH=... VSLANG=... "cc" ...`) without an `env` command.
+    // These words describe the environment rustc actually gave the linker;
+    // they are not accepted by `command_from_env` for configured tool values,
+    // where Cargo would treat a leading assignment as an executable name.
+    let mut index = 0usize;
+    let mut search_path = None;
+    while let Some(word) = words.get(index).filter(|word| environment_assignment(word)) {
+        let (name, value) = word.split_once('=')?;
+        if name.eq_ignore_ascii_case("PATH") {
+            search_path = Some(value.to_owned());
+        }
+        index = index.saturating_add(1);
+    }
+    Some((words.get(index)?.clone(), search_path))
 }
 
 #[cfg(test)]
@@ -264,6 +290,12 @@ mod tests {
         assert_eq!(linker_from_printed_args("env --unknown cc one.o"), None);
         assert_eq!(linker_from_printed_args("env -u SDKROOT"), None);
         assert_eq!(linker_from_printed_args(""), None);
+        assert_eq!(
+            linker_from_printed_args(
+                r#"LC_ALL="C" PATH="/rust/bin:/usr/bin:/bin" VSLANG="1033" "cc" "symbols.o" -o "probe""#,
+            ),
+            Some(("cc".into(), Some("/rust/bin:/usr/bin:/bin".into())))
+        );
     }
 
     #[test]
