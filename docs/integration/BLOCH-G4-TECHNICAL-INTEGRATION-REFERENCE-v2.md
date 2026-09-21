@@ -1286,7 +1286,7 @@ Every method in the frozen registry (`method_registry.rs`, `tests/rpc_method_reg
 | Method | Params (name, type; position) | Returns | Notes |
 |---|---|---|---|
 | `getchaininfo` | none | See §10.3 | |
-| `getbuildinfo` | none | `build_version, package_version, commit, commit_source (git\|asserted\|none), tree_state (clean\|modified\|unverified\|unknown), source_digest (sha3-256 hex), source_digest_alg, source_digest_scope, source_files, source_bytes, rustc, cargo, profile, target, build_environment_digest (sha3-256 hex), build_environment_digest_alg, build_environment_scope, build_environment_fields, build_tool_binaries_hashed, build_sysroot_components_hashed, build_configured_tool_binaries_hashed, build_default_linker_binaries_hashed, digest_note` | Constant cost, no chain-state read. Compare both digests across trusted builders: source equality alone does not establish equal compiler/code-generation inputs (see the warning below). |
+| `getbuildinfo` | none | `build_version, package_version, commit, commit_source (git\|asserted\|none), tree_state (clean\|modified\|unverified\|unknown), source_digest (sha3-256 hex), source_digest_alg, source_digest_scope, source_files, source_bytes, rustc, cargo, profile, target, build_environment_digest (sha3-256 hex), build_environment_digest_alg, build_environment_scope, build_environment_fields, build_tool_binaries_hashed, build_sysroot_components_hashed, build_configured_tool_binaries_hashed, build_default_linker_binaries_hashed, build_linker_binaries_hashed, digest_note` | Constant cost, no chain-state read. Compare both digests across trusted builders: source equality alone does not establish equal compiler/code-generation inputs (see the warning below). |
 | `getblockcount` | none | `height, slot, epoch, finalized_height (u64\|null), justified_epoch, finalized_epoch` | |
 | `getblockbyslot` | `slot` (u64; pos 0) | Block object, §7.2 | `-32007 SLOT_EMPTY` if no canonical block at that slot (message names the current head) |
 | `getblockbyid` | `block_id` (64-hex; pos 0) | Block object, §7.2 | `-32000 BLOCK_NOT_FOUND` if unknown |
@@ -1664,12 +1664,13 @@ whether a field is a string vs. a number, where `null` can appear).
   "profile": "release", "target": "x86_64-unknown-linux-gnu",
   "build_environment_digest": "f27a...71c4",
   "build_environment_digest_alg": "sha3-256",
-  "build_environment_scope": "rustc and cargo executable bytes plus version output; selected rustc driver and target libstd sysroot components; explicitly configured linker/compiler/archive/wrapper bytes, including an unambiguous compiler delegated by known wrappers and either the linker selected by effective Rust flags or the platform default linker observed from a target link probe; host; target; profile; selected Rust/C codegen variables, including absent exact host/target forms; sorted, length-prefixed; values hashed, not directly disclosed",
+  "build_environment_scope": "rustc and cargo executable bytes plus version output; selected rustc driver and target libstd sysroot components; explicitly configured linker/compiler/archive/wrapper bytes, including an unambiguous compiler delegated by known wrappers and either the explicitly selected linker (including effective Rust flags) or the platform default linker observed from a target link probe; host; target; profile; selected Rust/C codegen variables, including absent exact host/target forms; sorted, length-prefixed; values hashed, not directly disclosed",
   "build_environment_fields": "7",
   "build_tool_binaries_hashed": "2",
   "build_sysroot_components_hashed": "4",
   "build_configured_tool_binaries_hashed": "1",
   "build_default_linker_binaries_hashed": "1",
+  "build_linker_binaries_hashed": "1",
   "digest_note": "different digests prove different source trees; equal digests are evidence of the same source, not proof — whoever can edit the source can edit the build script that hashes it"
 }
 ```
@@ -2073,6 +2074,7 @@ build_environment_digest_alg, build_environment_scope,
 build_environment_fields, build_tool_binaries_hashed,
 build_sysroot_components_hashed, build_configured_tool_binaries_hashed,
 build_default_linker_binaries_hashed,
+build_linker_binaries_hashed,
 digest_note`.
 
 <div class="warn">

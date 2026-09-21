@@ -35,8 +35,9 @@ unreviewed image, service, cache, artifact, dependency and needs context.
 
 KS-09 asks rustc to link a tiny target probe only when no explicit linker is
 selected, parses its reported command fail-closed and fingerprints the observed
-platform-default linker. Buildinfo publishes only the resulting zero/one count
-and incorporates the digest without disclosing a path.
+platform-default linker. Buildinfo publishes the default-route zero/one count
+and a total effective-linker count, and incorporates the digest without
+disclosing a path.
 
 ## Validation
 

@@ -1697,6 +1697,7 @@ fn getbuildinfo_reports_the_fields_a_partner_compares() {
         "build_sysroot_components_hashed",
         "build_configured_tool_binaries_hashed",
         "build_default_linker_binaries_hashed",
+        "build_linker_binaries_hashed",
         "digest_note",
     ] {
         let f = v.get(k).unwrap_or_else(|| panic!("getbuildinfo has no `{k}`"));
@@ -1797,7 +1798,7 @@ fn getbuildinfo_carries_a_bounded_build_environment_fingerprint() {
     assert!(scope.contains("compiler delegated by known wrappers"));
     assert!(scope.contains("C compiler and archiver selected by cc-rs even when"));
     assert!(scope.contains("selected freestanding or WASI native input-tree contents"));
-    assert!(scope.contains("linker selected by effective Rust flags"));
+    assert!(scope.contains("explicitly selected linker"));
     assert!(scope.contains("platform default linker observed from a target link probe"));
     assert!(scope.contains("implicit native search and dynamic loader variables"));
     assert_eq!(
@@ -1827,10 +1828,28 @@ fn getbuildinfo_carries_a_bounded_build_environment_fingerprint() {
         configured_tool_binaries <= fields,
         "configured tool fingerprints must be part of the environment fields",
     );
+    let configured_linker_binaries: usize = env!("BLOCH_BUILD_CONFIGURED_LINKER_BINARIES")
+        .parse()
+        .unwrap();
+    assert!(
+        configured_linker_binaries <= configured_tool_binaries,
+        "configured linker fingerprints must be part of the configured tool fingerprints",
+    );
+    let default_linker_binaries: usize = v
+        .get("build_default_linker_binaries_hashed")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        default_linker_binaries == 1 || configured_linker_binaries > 0,
+        "a native workspace build must bind either its configured linker or rustc's observed default linker",
+    );
     assert_eq!(
-        v.get("build_default_linker_binaries_hashed").unwrap().as_str(),
+        v.get("build_linker_binaries_hashed").unwrap().as_str(),
         Some("1"),
-        "a native workspace build must bind rustc's observed default linker",
+        "a native workspace build must bind exactly one effective linker",
     );
 }
 

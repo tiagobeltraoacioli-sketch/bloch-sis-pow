@@ -21,8 +21,9 @@ Unknown `env` options, malformed command output, cross-target link failure or
 an unresolvable executable produce an unavailable component rather than a
 guessed conventional `cc` path. Explicit linker selection skips the default
 probe because that selected binary is already handled by the configured-tool
-or Rust-flags path. Buildinfo exposes only a zero/one
-`build_default_linker_binaries_hashed` counter.
+or Rust-flags path. Buildinfo exposes the default-probe zero/one counter and a
+`build_linker_binaries_hashed` counter that confirms exactly one effective
+linker was fingerprinted by either route.
 
 ## Validation
 

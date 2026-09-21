@@ -2686,8 +2686,9 @@ pub fn build_info_json() -> Json {
                  plus the C compiler and archiver selected by cc-rs even when \
                  unconfigured, \
                  selected freestanding or WASI native input-tree contents, \
-                 and either the linker selected by effective Rust flags or the \
-                 platform default linker observed from a target link probe; \
+                 and either the explicitly selected linker (including effective \
+                 Rust flags) or the platform default linker observed from a \
+                 target link probe; \
                  host; target; profile; \
                  selected Rust/C codegen, implicit native search and dynamic \
                  loader variables, including absent exact host/target forms; \
@@ -2714,6 +2715,10 @@ pub fn build_info_json() -> Json {
         (
             "build_default_linker_binaries_hashed",
             Json::s(env!("BLOCH_BUILD_DEFAULT_LINKER_BINARIES")),
+        ),
+        (
+            "build_linker_binaries_hashed",
+            Json::s(env!("BLOCH_BUILD_LINKER_BINARIES")),
         ),
         // The bound rides with the answer. A client that reads `source_digest`
         // and stops reading has been told, in the response itself, what it is
