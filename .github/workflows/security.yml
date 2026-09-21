@@ -236,6 +236,36 @@ jobs:
       - name: Exercise baseline and shallow-checkout refusals
         run: python3 -I scripts/scan-secrets.test.py
 
+  # Release-integrity gate (G8). This is the blocking GitHub counterpart of
+  # `.gitlab-ci.yml:pos-release-integrity`: certify the lockfile/layout guard,
+  # exercise the release-build comparator, then prove that two clean builds
+  # are byte-identical and carry the exact source commit stamp. It emits no
+  # signed or deployable artifact; canonical cross-builder reproduction stays
+  # a release-time gate in deploy/RELEASE-INTEGRITY.md.
+  pos-release-integrity:
+    name: pos-release-integrity (blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Pinned toolchain (crates/bloch-pos-node/rust-toolchain.toml)
+        run: |
+          ch="$(python3 -I scripts/pinned-rust-toolchain.py)"
+          rustup toolchain install "$ch" --profile minimal --no-self-update
+      - name: Install C toolchain (rocksdb bindgen, blst, PQClean)
+        run: sudo apt-get update && sudo apt-get install -y clang cmake
+      - name: Certify lockfile and workspace-layout refusals
+        run: python3 -I scripts/pos-release-integrity.selftest.py
+      - name: Release helper syntax and comparator regressions
+        run: |
+          bash -n scripts/pos-release-integrity.sh
+          bash -n scripts/build-pos-release-container.sh
+          bash -n scripts/compare-pos-release-builds.sh
+          bash -n scripts/compare-pos-release-builds.selftest.sh
+          bash scripts/compare-pos-release-builds.selftest.sh
+      - name: Locked deterministic commit-stamped release build
+        run: bash scripts/pos-release-integrity.sh
+
   # scanners-blocking guard — the regression test for finding I-H4 itself. Fails
   # if either CI file re-acquires a required-job escape (`continue-on-error` /
   # `allow_failure: true`, an `exit 0` skip, `when: manual`) or drops a required

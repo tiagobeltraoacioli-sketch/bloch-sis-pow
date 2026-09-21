@@ -306,8 +306,9 @@ the whole flow with a disposable keypair generated into a temp dir.
 
 ## 6. What CI proves automatically (and what it cannot)
 
-`pos-release-integrity` (`.gitlab-ci.yml`, `check` stage, **blocking**, ~1
-min, script `scripts/pos-release-integrity.sh`, modelled on
+`pos-release-integrity` (`.gitlab-ci.yml`, `check` stage, and
+`.github/workflows/security.yml`, both **blocking**, script
+`scripts/pos-release-integrity.sh`, modelled on
 `falcon-clean-guard`) proves on every pipeline:
 
 1. pinned toolchain present and active for the crate directory;
