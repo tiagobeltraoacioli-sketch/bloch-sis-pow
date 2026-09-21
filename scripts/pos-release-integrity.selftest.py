@@ -199,6 +199,12 @@ esac
     })
     write(os.path.join(tools, "cargo"), """#!/usr/bin/env bash
 set -euo pipefail
+materialize_binary() {
+  local target="$1"
+  mkdir -p "$target/release/deps"
+  cp "$INTEGRITY_FAKE_BINARY" "$target/release/deps/bloch-pos-selftest"
+  ln "$target/release/deps/bloch-pos-selftest" "$target/release/bloch-pos"
+}
 case "${1:-}" in
   metadata)
     printf '%s\\n' """ + shlex.quote(metadata) + """
@@ -231,18 +237,24 @@ case "${1:-}" in
     esac
     mkdir -p "$target/release"
     case "${INTEGRITY_BINARY_MODE:-canonical}:$count" in
-      canonical:*) cp "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
-      different-second:1) cp "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
+      canonical:*) materialize_binary "$target" ;;
+      different-second:1) materialize_binary "$target" ;;
       different-second:2)
-        cp "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos"
+        materialize_binary "$target"
         printf '\n# different second build\n' >> "$target/release/bloch-pos"
         ;;
       symlink-first:1) ln -s "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
       symlink-second:2) ln -s "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
-      hardlink-first:1) ln "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
-      hardlink-second:2) ln "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
+      hardlink-first:1)
+        materialize_binary "$target"
+        ln "$target/release/bloch-pos" "${INTEGRITY_FAKE_BINARY}.first-alias"
+        ;;
+      hardlink-second:2)
+        materialize_binary "$target"
+        ln "$target/release/bloch-pos" "${INTEGRITY_FAKE_BINARY}.second-alias"
+        ;;
       symlink-first:*|symlink-second:*|hardlink-first:*|hardlink-second:*)
-        cp "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
+        materialize_binary "$target" ;;
       *) exit 74 ;;
     esac
     chmod 0755 "$target/release/bloch-pos"
@@ -490,8 +502,8 @@ def main() -> int:
             binary_cases = {
                 "symlink-first": "release build 1 output is not a regular non-symlink file",
                 "symlink-second": "release build 2 output is not a regular non-symlink file",
-                "hardlink-first": "release build 1 output must have exactly one hard link",
-                "hardlink-second": "release build 2 output must have exactly one hard link",
+                "hardlink-first": "release build 1 output must not have hard links outside its target directory",
+                "hardlink-second": "release build 2 output must not have hard links outside its target directory",
             }
             for mode, expected in binary_cases.items():
                 result = run_guard(
