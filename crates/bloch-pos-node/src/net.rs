@@ -86,7 +86,7 @@
 //! by the peer's inbound handler on the same socket.
 
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
@@ -706,6 +706,10 @@ type SharedFrame = Arc<[u8]>;
 /// The devnet TCP mesh: one queue per peer we dialed, plus one per peer that
 /// dialed us.
 pub struct DevnetMesh {
+    /// Address selected by the kernel for the inbound listener.  Besides
+    /// reporting the configured endpoint, this lets callers request port 0
+    /// without probing, dropping and racing to re-bind an ephemeral port.
+    listen_addr: SocketAddr,
     /// Bounded per [`OUTBOUND_QUEUE_DEPTH`] (R3 M-4 / R1 A3-M2) — see that
     /// constant's doc for why an unbounded queue here was a memory leak
     /// waiting on a peer that never connects.
@@ -918,6 +922,7 @@ impl DevnetMesh {
     #[cfg(test)]
     pub(crate) fn inert(head: Arc<AtomicU64>, budget: Arc<QueueBudget>) -> Self {
         Self {
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             peers: Vec::new(),
             sync: SyncScheduler::new(head, budget),
             inbound: Arc::new(Mutex::new(Vec::new())),
@@ -928,6 +933,11 @@ impl DevnetMesh {
     /// TCP connections established right now. See [`DevnetMesh::live`].
     pub fn peer_count(&self) -> usize {
         self.live.load(Ordering::Acquire)
+    }
+
+    /// Address actually bound by the inbound listener.
+    pub fn listen_addr(&self) -> SocketAddr {
+        self.listen_addr
     }
 
     /// Broadcast one frame (type byte + payload, no length prefix) to every
@@ -1417,6 +1427,7 @@ pub fn start(
     // Inbound: accept, then per-connection: read frames; data frames go to
     // the engine; get-blocks is answered by a globally bounded serving worker.
     let listener = TcpListener::bind((bind_addr, listen_port))?;
+    let listen_addr = listener.local_addr()?;
     let inbound: Arc<Mutex<Vec<InboundPeer>>> = Arc::new(Mutex::new(Vec::new()));
     let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // Counted separately from `live` (R3 M-4 / R1 A3-M2): `live` also holds
@@ -1585,7 +1596,7 @@ pub fn start(
         });
     }
 
-    Ok(DevnetMesh { peers, sync, inbound, live })
+    Ok(DevnetMesh { listen_addr, peers, sync, inbound, live })
 }
 
 #[cfg(test)]
@@ -1839,13 +1850,11 @@ mod tests {
     fn shared_sync_two_silent_outbound_peers_cannot_starve_responsive_inbound() {
         let silent_a = TcpListener::bind("127.0.0.1:0").unwrap();
         let silent_b = TcpListener::bind("127.0.0.1:0").unwrap();
-        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
         let (events, received) = mpsc::channel();
-        let mesh = start("127.0.0.1", port,
+        let mesh = start("127.0.0.1", 0,
             vec![silent_a.local_addr().unwrap().to_string(), silent_b.local_addr().unwrap().to_string()],
             events, std::env::temp_dir(), Arc::new(AtomicU64::new(42)), QueueBudget::new()).unwrap();
+        let port = mesh.listen_addr().port();
         let (mut a, _) = silent_a.accept().unwrap();
         let (mut b, _) = silent_b.accept().unwrap();
         for socket in [&mut a, &mut b] {
@@ -1896,13 +1905,11 @@ mod tests {
         let mut right_store = crate::store::Store::open(&right_dir, &[7; 32]).unwrap();
         left_store.append(&block).unwrap();
         right_store.append(&block).unwrap();
-        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
         let (left_tx, left_rx) = mpsc::channel();
         let (right_tx, right_rx) = mpsc::channel();
-        let left = start("127.0.0.1", port, Vec::new(), left_tx, left_dir,
+        let left = start("127.0.0.1", 0, Vec::new(), left_tx, left_dir,
             Arc::new(AtomicU64::new(42)), QueueBudget::new()).unwrap();
+        let port = left.listen_addr().port();
         let right = start("127.0.0.1", 0, vec![format!("127.0.0.1:{port}")], right_tx, right_dir,
             Arc::new(AtomicU64::new(42)), QueueBudget::new()).unwrap();
         for received in [left_rx, right_rx] {
@@ -2613,6 +2620,7 @@ mod tests {
         let (tx, rx): (SyncSender<SharedFrame>, Receiver<SharedFrame>) =
             mpsc::sync_channel(OUTBOUND_QUEUE_DEPTH);
         let mesh = DevnetMesh {
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             peers: vec![tx],
             sync: SyncScheduler::new(Arc::new(AtomicU64::new(0)), QueueBudget::new()),
             inbound: Arc::new(Mutex::new(Vec::new())),
@@ -2638,6 +2646,7 @@ mod tests {
         let (first_tx, first_rx) = mpsc::sync_channel::<SharedFrame>(1);
         let (second_tx, second_rx) = mpsc::sync_channel::<SharedFrame>(1);
         let mesh = DevnetMesh {
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             peers: vec![first_tx, second_tx],
             sync: SyncScheduler::new(Arc::new(AtomicU64::new(0)), QueueBudget::new()),
             inbound: Arc::new(Mutex::new(Vec::new())),
@@ -2667,21 +2676,12 @@ mod tests {
     /// against a connection flood on a routable bind.
     #[test]
     fn inbound_connections_are_capped() {
-        // Probe a free loopback port, then hand that exact port to `start` —
-        // `net::start` takes a fixed port, not an ephemeral-port request it
-        // reports back, so this is the standard std::net test pattern. The
-        // TOCTOU window is a loopback address in this process's own test
-        // run; nothing else in this environment is racing for it.
-        let probe = TcpListener::bind(("127.0.0.1", 0)).expect("probe a free port");
-        let port = probe.local_addr().expect("local_addr").port();
-        drop(probe);
-
         let (events, _rx) = mpsc::channel::<EngineEvent>();
         let head_slot = Arc::new(AtomicU64::new(0));
         let inflight = QueueBudget::new();
         let mesh = start(
             "127.0.0.1",
-            port,
+            0,
             Vec::new(),
             events,
             std::env::temp_dir(),
@@ -2689,6 +2689,7 @@ mod tests {
             inflight,
         )
         .expect("bind the devnet transport");
+        let port = mesh.listen_addr().port();
 
         // Open more connections than the cap allows and HOLD them open — a
         // dropped `TcpStream` closes the socket, which would silently undo

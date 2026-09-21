@@ -1045,6 +1045,9 @@ pub struct Handle {
     /// than asked for, because the RPC thread must not block on the swarm's
     /// command channel to answer a status question.
     peers_live: Arc<AtomicUsize>,
+    /// One confirmed bound address per requested listener. In particular, a
+    /// caller that requested `/tcp/0` gets the kernel-selected port here.
+    listen_addrs: Vec<Multiaddr>,
 }
 
 impl Handle {
@@ -1070,6 +1073,12 @@ impl Handle {
     /// sits in while its log says `applied` and `finalized`.
     pub fn peer_count(&self) -> usize {
         self.peers_live.load(Ordering::Acquire)
+    }
+
+    /// One address per listener, confirmed by libp2p's `NewListenAddr` event
+    /// before [`start`] returned.
+    pub fn listen_addrs(&self) -> &[Multiaddr] {
+        &self.listen_addrs
     }
 
     /// Report the engine's decision on a gossip message. A no-op for an
@@ -1136,7 +1145,8 @@ pub fn start(
     let peer_id = PeerId::from(keypair.public());
 
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<io::Result<()>>();
+    let (ready_tx, ready_rx) =
+        std::sync::mpsc::channel::<io::Result<Vec<Multiaddr>>>();
     let peers_live = Arc::new(AtomicUsize::new(0));
     let peers_live_swarm = peers_live.clone();
 
@@ -1150,9 +1160,19 @@ pub fn start(
         };
         rt.block_on(async move {
             match build_swarm(&keypair, &cfg) {
-                Ok(swarm) => {
-                    let _ = ready_tx.send(Ok(()));
-                    run_swarm(swarm, cfg, cmd_rx, events, head_slot, peers_live_swarm, budget).await;
+                Ok((swarm, listeners)) => {
+                    run_swarm(
+                        swarm,
+                        cfg,
+                        cmd_rx,
+                        events,
+                        head_slot,
+                        peers_live_swarm,
+                        budget,
+                        ready_tx,
+                        listeners,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -1162,7 +1182,7 @@ pub fn start(
     })?;
 
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok(Handle { cmd: cmd_tx, peer_id, peers_live }),
+        Ok(Ok(listen_addrs)) => Ok(Handle { cmd: cmd_tx, peer_id, peers_live, listen_addrs }),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(io::Error::other("p2p thread died before it started")),
     }
@@ -1170,7 +1190,12 @@ pub fn start(
 
 type Swarm = libp2p::Swarm<G4Behaviour>;
 
-fn build_swarm(keypair: &identity::Keypair, cfg: &Config) -> io::Result<Swarm> {
+type ListenerId = libp2p::core::transport::ListenerId;
+
+fn build_swarm(
+    keypair: &identity::Keypair,
+    cfg: &Config,
+) -> io::Result<(Swarm, Vec<ListenerId>)> {
     let gs_cfg = gossipsub_config().map_err(io::Error::other)?;
     let mut gs = gossipsub::Behaviour::new(MessageAuthenticity::Signed(keypair.clone()), gs_cfg)
         .map_err(|e| io::Error::other(format!("gossipsub: {e}")))?;
@@ -1222,10 +1247,15 @@ fn build_swarm(keypair: &identity::Keypair, cfg: &Config) -> io::Result<Swarm> {
             .subscribe(&IdentTopic::new(t))
             .map_err(|e| io::Error::other(format!("subscribe {t}: {e}")))?;
     }
+    let mut listeners = Vec::with_capacity(cfg.listen.len());
     for addr in &cfg.listen {
-        swarm.listen_on(addr.clone()).map_err(|e| io::Error::other(e.to_string()))?;
+        listeners.push(
+            swarm
+                .listen_on(addr.clone())
+                .map_err(|e| io::Error::other(e.to_string()))?,
+        );
     }
-    Ok(swarm)
+    Ok((swarm, listeners))
 }
 
 /// State the swarm loop owns.
@@ -1441,6 +1471,8 @@ async fn run_swarm(
     head_slot: Arc<AtomicU64>,
     peers_live: Arc<AtomicUsize>,
     budget: Arc<crate::net::QueueBudget>,
+    ready_tx: std::sync::mpsc::Sender<io::Result<Vec<Multiaddr>>>,
+    listeners: Vec<ListenerId>,
 ) {
     let mut st = Loop {
         outgoing_sync: sync_requests::Requests::default(),
@@ -1463,6 +1495,22 @@ async fn run_swarm(
         },
         peers_live,
     };
+
+    // `listen_on` only queues a bind. Keep processing every swarm event while
+    // waiting for the corresponding NewListenAddr events so a connection on
+    // an already-bound listener cannot disappear from peer bookkeeping while
+    // a second listener is still coming up.
+    let mut ready = Some((
+        ready_tx,
+        listeners,
+        vec![None; cfg.listen.len()],
+    ));
+    if cfg.listen.is_empty() {
+        let Some((tx, _, _)) = ready.take() else { return };
+        let _ = tx.send(Ok(Vec::new()));
+    }
+    let ready_timeout = tokio::time::sleep(Duration::from_secs(30));
+    tokio::pin!(ready_timeout);
 
     // A node's own listen address commonly appears in a peer list that was
     // written once and handed to every node in a fleet. Dialling yourself is
@@ -1491,9 +1539,55 @@ async fn run_swarm(
     loop {
         tokio::select! {
             ev = swarm.select_next_some() => {
+                let mut startup_error = None;
+                let mut startup_complete = false;
+                if let Some((_, listener_ids, addresses)) = ready.as_mut() {
+                    match &ev {
+                        SwarmEvent::NewListenAddr { listener_id, address } => {
+                            if let Some(at) = listener_ids.iter().position(|id| id == listener_id) {
+                                if addresses[at].is_none() {
+                                    addresses[at] = Some(address.clone());
+                                    startup_complete = addresses.iter().all(Option::is_some);
+                                }
+                            }
+                        }
+                        SwarmEvent::ListenerError { listener_id, error }
+                            if listener_ids.contains(listener_id) =>
+                        {
+                            // Non-fatal by libp2p's contract. ListenerClosed
+                            // or the bounded timeout below decides startup.
+                            eprintln!("p2p: listener error before ready ({listener_id:?}): {error}");
+                        }
+                        SwarmEvent::ListenerClosed { listener_id, reason, .. }
+                            if listener_ids.contains(listener_id) =>
+                        {
+                            startup_error = Some(match reason {
+                                Ok(()) => format!("p2p listener {listener_id:?} closed before binding"),
+                                Err(e) => format!("p2p listener {listener_id:?} failed to bind: {e}"),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+                if startup_complete {
+                    let Some((tx, _, addresses)) = ready.take() else { return };
+                    let _ = tx.send(Ok(addresses.into_iter().flatten().collect()));
+                } else if let Some(error) = startup_error {
+                    let Some((tx, _, _)) = ready.take() else { return };
+                    let _ = tx.send(Err(io::Error::other(error)));
+                    return;
+                }
                 if !handle_swarm_event(&mut swarm, &mut st, &resp_tx, ev) {
                     return; // engine gone
                 }
+            }
+            _ = &mut ready_timeout, if ready.is_some() => {
+                let Some((tx, _, _)) = ready.take() else { return };
+                let _ = tx.send(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "p2p listener did not bind within 30s",
+                )));
+                return;
             }
             cmd = cmd_rx.recv() => {
                 match cmd {
@@ -2701,7 +2795,7 @@ mod tests {
         let _enter = runtime.enter();
         let key = identity::Keypair::generate_ed25519();
         let cfg = Config { listen: Vec::new(), peers: Vec::new(), data_dir: PathBuf::new(), max_peers: 8, behind_proxy: true };
-        let mut swarm = build_swarm(&key, &cfg).unwrap();
+        let (mut swarm, _) = build_swarm(&key, &cfg).unwrap();
         let mut state = test_loop();
         let peer = PeerId::random();
         let waiting = PeerId::random();
@@ -2802,6 +2896,7 @@ mod tests {
             cmd,
             peer_id: PeerId::random(),
             peers_live: Arc::new(AtomicUsize::new(0)),
+            listen_addrs: Vec::new(),
         };
         let source = PeerId::random();
         let origin = Origin::sync_block(source, 99);
@@ -2830,6 +2925,7 @@ mod tests {
             cmd,
             peer_id: PeerId::random(),
             peers_live: Arc::new(AtomicUsize::new(0)),
+            listen_addrs: Vec::new(),
         };
         let payload = vec![0x5C; 1 << 20];
         let prepared = crate::net::PreparedTransactionBroadcast::new(&payload);
@@ -3001,7 +3097,7 @@ mod tests {
         let _enter = runtime.enter();
         let key = identity::Keypair::generate_ed25519();
         let cfg = Config { listen: Vec::new(), peers: Vec::new(), data_dir: PathBuf::new(), max_peers: 8, behind_proxy: true };
-        let mut swarm = build_swarm(&key, &cfg).unwrap();
+        let (mut swarm, _) = build_swarm(&key, &cfg).unwrap();
         let mut st = test_loop();
         let peer = PeerId::random();
         let (resp_tx, _resp_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -3500,17 +3596,6 @@ mod tests {
         }
     }
 
-    /// A port nobody is listening on right now. Racy in principle; in practice
-    /// the window between closing this listener and the swarm binding is
-    /// microseconds, and the alternative (fixed ports) collides between
-    /// parallel test binaries for certain.
-    fn free_port() -> u16 {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let p = l.local_addr().expect("addr").port();
-        drop(l);
-        p
-    }
-
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
             "bloch-pos-p2p-{tag}-{}-{:?}",
@@ -3520,6 +3605,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).expect("mkdir");
         d
+    }
+
+    #[test]
+    fn start_waits_for_the_listener_to_bind() {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("occupy port");
+        let port = occupied.local_addr().expect("occupied address").port();
+        let addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}")
+            .parse()
+            .expect("multiaddr");
+        let dir = tmpdir("bind-readiness");
+        let (events, _rx) = std::sync::mpsc::channel();
+
+        let result = start(
+            Config {
+                listen: vec![addr],
+                peers: Vec::new(),
+                data_dir: dir,
+                max_peers: 1,
+                behind_proxy: true,
+            },
+            events,
+            Arc::new(AtomicU64::new(0)),
+            crate::net::QueueBudget::new(),
+        );
+
+        let error = match result {
+            Ok(_) => panic!("start reported ready without owning its port"),
+            Err(error) => error,
+        };
+        assert_ne!(
+            error.kind(),
+            io::ErrorKind::TimedOut,
+            "occupied port was noticed only by the generic startup timeout: {error}",
+        );
     }
 
     struct Node {
@@ -3538,13 +3657,12 @@ mod tests {
         for slot in 1..=blocks {
             store.append(&envelope(slot)).expect("append");
         }
-        let port = free_port();
-        let addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}").parse().expect("addr");
+        let requested_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().expect("addr");
         let (tx, rx) = std::sync::mpsc::channel();
         let head = Arc::new(AtomicU64::new(blocks));
         let handle = start(
             Config {
-                listen: vec![addr.clone()],
+                listen: vec![requested_addr],
                 peers: peers.to_vec(),
                 data_dir: dir.clone(),
                 max_peers: 16,
@@ -3564,6 +3682,11 @@ mod tests {
             crate::net::QueueBudget::new(),
         )
         .expect("p2p starts");
+        let addr = handle
+            .listen_addrs()
+            .first()
+            .cloned()
+            .expect("p2p start confirms its listen address");
         Node { handle, rx, head, addr, _dir: dir }
     }
 

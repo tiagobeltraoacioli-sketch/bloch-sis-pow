@@ -460,10 +460,11 @@ mod audit_rpc_http_budget_tests {
         assert!(matches!(target.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
         worker.join().unwrap();
 
-        let unavailable = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = unavailable.local_addr().unwrap();
-        drop(unavailable);
-        let endpoint = format!("http://{address}/private-path?token=synthetic-query-marker");
+        // Port zero cannot be a remote service endpoint.  Using it directly
+        // keeps this a deterministic connection error instead of probing an
+        // ephemeral port, dropping the listener and racing another process
+        // to claim that port before the request runs.
+        let endpoint = "http://127.0.0.1:0/private-path?token=synthetic-query-marker";
         let error = WalletClient::try_new(endpoint).unwrap().call("getbalance", json!([])).await.unwrap_err().to_string();
         assert!(!error.contains("synthetic-query-marker"));
         assert!(!error.contains("private-path"));
