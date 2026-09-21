@@ -141,7 +141,30 @@ jobs:
       - name: cargo test — bloch-pos-committee
         run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-committee
       - name: cargo test — bloch-pos-node
-        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-node
+        run: |
+          log="$RUNNER_TEMP/bloch-pos-node-test.log"
+          if cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-node 2>&1 | tee "$log"; then
+            status=${PIPESTATUS[0]}
+          else
+            status=${PIPESTATUS[0]}
+          fi
+          if (( status != 0 )); then
+            diagnostic="$(
+              awk '
+                index($0, "failures:") { capture = 1 }
+                capture { print }
+                index($0, "test result: FAILED") { exit }
+              ' "$log"
+            )"
+            if [[ -z "$diagnostic" ]]; then
+              diagnostic="$(tail -n 80 "$log")"
+            fi
+            diagnostic="${diagnostic//'%'/'%25'}"
+            diagnostic="${diagnostic//$'\\r'/'%0D'}"
+            diagnostic="${diagnostic//$'\\n'/'%0A'}"
+            printf '::error title=bloch-pos-node tests failed::%s\\n' "$diagnostic"
+          fi
+          exit "$status"
       - name: cargo test — bloch-crypto
         run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-crypto
       - name: cargo test — coherence-core
@@ -900,6 +923,18 @@ CASES = [
              "        run: cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-committee\n",
              ""),
          must_fail=True, expect="bloch-pos-committee"),
+
+    Case("github node diagnostic cannot serialize the test runner",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace(
+             "test --locked -p bloch-pos-node 2>&1 | tee",
+             "test --locked -p bloch-pos-node -- --test-threads=1 2>&1 | tee"),
+         must_fail=True, expect="reviewed ordered command list"),
+
+    Case("github node diagnostic must preserve the cargo exit status",
+         GOOD_GITLAB,
+         GOOD_GITHUB.replace("status=${PIPESTATUS[0]}", "status=$?"),
+         must_fail=True, expect="reviewed ordered command list"),
 
     Case("github timeout removed",
          GOOD_GITLAB,

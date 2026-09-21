@@ -107,6 +107,34 @@ LIVE_CRATES = (
     "pqcrypto-internals",
     "genesis4-ceremony",
 )
+GITHUB_NODE_CARGO_TEST = (
+    "cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-node"
+)
+GITHUB_NODE_DIAGNOSTIC_RUN = (
+    'log="$RUNNER_TEMP/bloch-pos-node-test.log"\n'
+    f'if {GITHUB_NODE_CARGO_TEST} 2>&1 | tee "$log"; then\n'
+    'status=${PIPESTATUS[0]}\n'
+    'else\n'
+    'status=${PIPESTATUS[0]}\n'
+    'fi\n'
+    'if (( status != 0 )); then\n'
+    'diagnostic="$(\n'
+    "awk '\n"
+    'index($0, "failures:") { capture = 1 }\n'
+    'capture { print }\n'
+    'index($0, "test result: FAILED") { exit }\n'
+    "' \"$log\"\n"
+    ')"\n'
+    'if [[ -z "$diagnostic" ]]; then\n'
+    'diagnostic="$(tail -n 80 "$log")"\n'
+    'fi\n'
+    'diagnostic="${diagnostic//\'%\'/\'%25\'}"\n'
+    'diagnostic="${diagnostic//$\'\\r\'/\'%0D\'}"\n'
+    'diagnostic="${diagnostic//$\'\\n\'/\'%0A\'}"\n'
+    "printf '::error title=bloch-pos-node tests failed::%s\\n' \"$diagnostic\"\n"
+    'fi\n'
+    'exit "$status"'
+)
 GITHUB_CARGO_TEST_RUNS = (
     'ch="$(python3 -I scripts/pinned-rust-toolchain.py)"\n'
     'rustup toolchain install "$ch" --profile minimal --no-self-update\n'
@@ -122,7 +150,7 @@ GITHUB_CARGO_TEST_RUNS = (
     "cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-node --bin bloch-pos audit_",
     "cargo +${{ steps.pin.outputs.toolchain }} test --locked -p pqcrypto-internals",
     "cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-committee",
-    "cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-pos-node",
+    GITHUB_NODE_DIAGNOSTIC_RUN,
     "cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-crypto",
     "cargo +${{ steps.pin.outputs.toolchain }} test --locked -p coherence-core",
     "cargo +${{ steps.pin.outputs.toolchain }} test --locked -p bloch-sis-pow",
@@ -218,7 +246,7 @@ CI_SCRIPT_ENTRYPOINT_SHA256 = {
     "scripts/check-iso-hardening.sh":
         "f0dae2e22aa766301def84a0c671ca4f79ff0c1b87d6e8647e9f6671669b91b3",
     "scripts/check-tests-blocking.selftest.py":
-        "8c7d6e0e3ac8eabeb692febf330a0498c7ccaf7d76fb23ffd50d5e8b37196af9",
+        "c165720356489a7789a0431b7f4353ef61bef019669ed364574a3a1b248b27f5",
     "scripts/check-validator-lifecycle-mutations.py":
         "12b477e5043bc3ea98387be33ca586976494b30083522b214cea7d88c0e9f429",
     "scripts/devnet-particao-report.test.py":
@@ -1026,6 +1054,18 @@ def check_job(path: str, job: str, indent: int, label: str) -> list[str]:
                 continue
             if tokens is not None:
                 test_commands.append(tokens)
+    # The node's reviewed diagnostic wrapper is deliberately a pipeline so its
+    # output can become a GitHub annotation.  It is safe to credit only when
+    # the complete run value is byte-for-byte the reviewed wrapper; the exact
+    # run-step contract above rejects any change to the cargo command,
+    # PIPESTATUS propagation, escaping, annotation, or final exit.
+    if (label == ".github/workflows/tests.yml"
+            and GITHUB_NODE_DIAGNOSTIC_RUN in github_run_values(body, indent)):
+        node_command = re.sub(
+            r"\$\{\{[^}]*\}\}", "PINNED", GITHUB_NODE_CARGO_TEST)
+        node_tokens = complete_test_tokens(node_command)
+        assert node_tokens is not None
+        test_commands.append(node_tokens)
     if not test_commands:
         problems.append(f"{label}: job `{job}` no longer runs `cargo test` commands that execute tests")
     elif not any("--workspace" in tokens for tokens in test_commands):
