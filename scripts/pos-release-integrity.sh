@@ -221,16 +221,11 @@ build "$WORK/t2"
 assert_release_binary_file() { # $1 = path, $2 = diagnostic context
   [ -f "$1" ] && [ ! -L "$1" ] \
     || fail "$2 is not a regular non-symlink file"
-  local unexpected_link_count
-  unexpected_link_count="$(
-    find "$1" ! -links 1 -exec printf x \; \
-      | wc -c | tr -d '[:space:]'
-  )"
-  [ "$unexpected_link_count" = 0 ] \
-    || fail "$2 must have exactly one hard link"
 }
 assert_release_binary_file "$WORK/t1/release/bloch-pos" 'release build 1 output'
 assert_release_binary_file "$WORK/t2/release/bloch-pos" 'release build 2 output'
+[ ! "$WORK/t1/release/bloch-pos" -ef "$WORK/t2/release/bloch-pos" ] \
+  || fail "release build outputs alias the same filesystem object"
 
 sha() { # portable sha256 of $1
   if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}';

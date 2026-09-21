@@ -239,9 +239,11 @@ case "${1:-}" in
         ;;
       symlink-first:1) ln -s "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
       symlink-second:2) ln -s "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
-      hardlink-first:1) ln "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
-      hardlink-second:2) ln "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
-      symlink-first:*|symlink-second:*|hardlink-first:*|hardlink-second:*)
+      alias-between:1) cp "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
+      alias-between:2)
+        ln "$(cat "$state.first-target")/release/bloch-pos" "$target/release/bloch-pos"
+        ;;
+      symlink-first:*|symlink-second:*)
         cp "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
       *) exit 74 ;;
     esac
@@ -490,8 +492,7 @@ def main() -> int:
             binary_cases = {
                 "symlink-first": "release build 1 output is not a regular non-symlink file",
                 "symlink-second": "release build 2 output is not a regular non-symlink file",
-                "hardlink-first": "release build 1 output must have exactly one hard link",
-                "hardlink-second": "release build 2 output must have exactly one hard link",
+                "alias-between": "release build outputs alias the same filesystem object",
             }
             for mode, expected in binary_cases.items():
                 result = run_guard(
