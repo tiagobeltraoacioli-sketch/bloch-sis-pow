@@ -88,16 +88,22 @@ pub(crate) fn required_native_input_digests(target_os: &str) -> Vec<(String, Str
 mod tests {
     use super::*;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
     fn fixture() -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("bloch-native-input-{}-{nonce}", std::process::id()));
-        fs::create_dir_all(root.join("sys")).expect("fixture dirs");
+        let root = loop {
+            let nonce = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+            let candidate = std::env::temp_dir()
+                .join(format!("bloch-native-input-{}-{nonce}", std::process::id()));
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create fixture root: {error}"),
+            }
+        };
+        fs::create_dir(root.join("sys")).expect("fixture dirs");
         fs::write(root.join("stddef.h"), b"typedef unsigned long size_t;\n").expect("header");
         fs::write(root.join("sys/types.h"), b"typedef long ssize_t;\n").expect("nested header");
         root
