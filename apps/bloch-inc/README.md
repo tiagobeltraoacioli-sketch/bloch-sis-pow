@@ -8,6 +8,8 @@ The site intentionally preserves the source material's qualification language:
 - The wallet is described as public beta.
 - DEX software is described as a development preview.
 - Cross-chain aggregator deployment is unverified.
+- Bloch L2 execution components are in development; a complete public node and Bloch L1 settlement are pending.
+- ECDSA is described only as the Bloch L2/EVM authorization model; native Bloch L1 authorization remains ML-DSA-65 + Falcon-1024.
 - Bridge qualification is in progress and public asset transfers are not enabled.
 
 ## Local preview

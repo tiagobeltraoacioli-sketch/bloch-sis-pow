@@ -51,7 +51,7 @@
         </div>
       </div>
       <div class="hero-foot">
-        <div><strong>04</strong><span>Product<br>lines</span></div>
+        <div><strong>05</strong><span>Product<br>lines</span></div>
         <div><strong>01</strong><span>Infrastructure<br>foundation</span></div>
         <div><strong>01</strong><span>Managed research<br>organization</span></div>
       </div>
@@ -79,7 +79,7 @@
           <span>Company</span><h3>Bloch Inc</h3><p>Panama / incorporation in progress</p>
         </article>
         <div class="structure-lines" aria-hidden="true"></div>
-        <article><span>Owned products</span><h3>Product portfolio</h3><ul><li>DEX</li><li>Cross-Chain Aggregator</li><li>Wallet</li><li>Bridge</li></ul></article>
+        <article><span>Owned products</span><h3>Product portfolio</h3><ul><li>DEX</li><li>Cross-Chain Aggregator</li><li>Wallet</li><li>Bloch L2</li><li>Bridge</li></ul></article>
         <article><span>Infrastructure</span><h3>Bloch Protocol</h3><ul><li>Nodes &amp; RPC</li><li>Explorer</li><li>Developer tools</li></ul></article>
         <article><span>Management</span><h3>Postern Labs</h3><ul><li>Research</li><li>Engineering</li><li>Long-term capability</li></ul></article>
       </div>
@@ -87,10 +87,10 @@
 
     <section class="portfolio section-pad" id="portfolio" aria-labelledby="portfolio-title">
       <div class="section-head reveal">
-        <div><p class="eyebrow"><span></span> Product vision</p><h2 id="portfolio-title">Four products.<br>One connected journey.</h2></div>
-        <p>Organized around the actions a user needs to take: access, discover, trade and transfer.</p>
+        <div><p class="eyebrow"><span></span> Product vision</p><h2 id="portfolio-title">Five products.<br>One connected journey.</h2></div>
+        <p>Organized around the actions a user needs to take: access, discover, trade, execute and transfer.</p>
       </div>
-      <div class="journey-line reveal" aria-hidden="true"><span></span><i></i><i></i><i></i><i></i></div>
+      <div class="journey-line reveal" aria-hidden="true"><span></span><i></i><i></i><i></i><i></i><i></i></div>
       <div class="product-grid">
         <article class="product-card reveal" data-product="wallet">
           <div class="card-number">01 <span>Access</span></div>
@@ -116,8 +116,16 @@
           <p>Access market interfaces, route comparison, pool discovery and liquidity mechanisms in a review-first workflow.</p>
           <a href="https://blochdex.com/">Explore Bloch DEX <span>↗</span></a>
         </article>
+        <article class="product-card reveal" data-product="l2">
+          <div class="card-number">04 <span>Execute</span></div>
+          <div class="card-symbol" aria-hidden="true">L<sup>2</sup></div>
+          <p class="card-status"><i></i> Integration in progress</p>
+          <h3>Bloch L2</h3>
+          <p>Build Solidity applications in the ECDSA-based L2 domain with an implemented EVM core and reproducible witness verification, toward settlement on Bloch L1.</p>
+          <a href="https://blochl2.com/">Explore Bloch L2 <span>↗</span></a>
+        </article>
         <article class="product-card reveal" data-product="bridge">
-          <div class="card-number">04 <span>Transfer</span></div>
+          <div class="card-number">05 <span>Transfer</span></div>
           <div class="card-symbol" aria-hidden="true">B</div>
           <p class="card-status"><i></i> Qualification in progress</p>
           <h3>Bridge</h3>
@@ -125,7 +133,7 @@
           <a href="https://blochbridge.com/">Explore Bloch Bridge <span>↗</span></a>
         </article>
       </div>
-      <p class="portfolio-disclosure reveal">Public bridge asset transfers are not enabled. DEX interfaces remain development software. Product status should be verified before use.</p>
+      <p class="portfolio-disclosure reveal">A complete public L2 node, Bloch L1 settlement and public bridge asset transfers are not enabled. DEX interfaces remain development software. Product status should be verified before use.</p>
     </section>
 
     <section class="infrastructure section-pad" id="infrastructure" aria-labelledby="infra-title">
@@ -147,7 +155,7 @@
         <article class="reveal"><span>01</span><h3>Native Layer 1</h3><p>Genesis-4 proof of stake with ML-DSA-65 + Falcon-1024 at the native authorization boundary.</p></article>
         <article class="reveal"><span>02</span><h3>Nodes &amp; validators</h3><p>Node software, checkpoint procedures, operator guidance and validator admission tooling.</p></article>
         <article class="reveal"><span>03</span><h3>Data &amp; visibility</h3><p>RPC access, read-only observation and Bloch Explorer for blocks, transactions, epochs and validators.</p></article>
-        <article class="reveal"><span>04</span><h3>Developer platform</h3><p>Local EVM and Solana DevKits, technical documentation and network adapter development.</p></article>
+        <article class="reveal"><span>04</span><h3>Developer platform</h3><p>Bloch L2 execution, local EVM and Solana DevKits, technical documentation and network adapter development.</p></article>
       </div>
     </section>
 
@@ -158,11 +166,11 @@
         <p>Distinct authorization domains require distinct trust assumptions. A cross-chain path must be assessed end to end.</p>
       </div>
       <div class="boundary-diagram reveal">
-        <article><span>Bloch-native domain</span><h3>Post-quantum authorization</h3><p>Native fund movement retains the ML-DSA-65 + Falcon-1024 authorization boundary.</p><b>PQ</b></article>
+        <article><span>Bloch L1 / native domain</span><h3>Post-quantum authorization</h3><p>Native L1 fund movement retains the ML-DSA-65 + Falcon-1024 authorization boundary. ECDSA does not apply here.</p><b>PQ</b></article>
         <div class="boundary-gate"><span>Verification<br>boundary</span><i></i></div>
-        <article><span>Interoperability domain</span><h3>EVM compatibility</h3><p>ECDSA-based accounts and contracts retain their own security assumptions.</p><b>EVM</b></article>
+        <article><span>Bloch L2 / EVM domain</span><h3>ECDSA applies to L2 only</h3><p>Bloch L2 accounts and contracts use ECDSA and retain separate security assumptions. Settlement on Bloch L1 remains in development.</p><b>EVM</b></article>
       </div>
-      <p class="boundary-note reveal">A bridge or wrapped asset does not automatically inherit native post-quantum guarantees.</p>
+      <p class="boundary-note reveal">ECDSA is confined to Bloch L2/EVM. A bridge, L2 account or wrapped asset does not automatically inherit Bloch L1's native post-quantum guarantees.</p>
     </section>
 
     <section class="audiences section-pad" aria-labelledby="audiences-title">
@@ -222,7 +230,7 @@
   <footer class="site-footer">
     <a class="brand" href="#top" aria-label="Bloch Inc home"><span class="brand-glyph" aria-hidden="true"><i></i><i></i></span><span>Bloch <em>Inc</em></span></a>
     <p>Products. Infrastructure. Long-term research.</p>
-    <div><a href="https://posternlabs.com/">Postern Labs ↗</a><a href="https://blochl1.com/">Explorer ↗</a><a href="https://blochbridge.com/">Bridge ↗</a><a href="https://blochdex.com/">DEX ↗</a><a href="downloads/Bloch_Inc_Institutional_EN_v2.pptx">Presentation .PPTX ↓</a></div>
+    <div><a href="https://posternlabs.com/">Postern Labs ↗</a><a href="https://blochl1.com/">Explorer ↗</a><a href="https://blochl2.com/">Bloch L2 ↗</a><a href="https://blochbridge.com/">Bridge ↗</a><a href="https://blochdex.com/">DEX ↗</a><a href="downloads/Bloch_Inc_Institutional_EN_v2.pptx">Presentation .PPTX ↓</a></div>
     <small>© 2026 Bloch Inc. Incorporation in Panama is in progress. Product and service availability varies by stage and jurisdiction.</small>
   </footer>
 </body>
