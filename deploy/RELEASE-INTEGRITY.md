@@ -41,9 +41,15 @@ change). Behaviour:
 - A build from a dirty tree is marked `+dirty` **loudly** — an unmarked dirty
   build is exactly what made the fleet unidentifiable.
 - A build with no `.git` (container, CI export) takes the commit from the
-  `BLOCH_BUILD_COMMIT` env var; the caller asserts the tree state, so no
-  `+dirty` second-guessing. A build with neither stamps `unknown+nogit`,
-  which any release gate must treat as a hard failure.
+  `BLOCH_BUILD_COMMIT` env var. It reports `tree:unverified` unless the outer
+  recipe also opts into `BLOCH_BUILD_TREE_ASSERTION=clean`, in which case it
+  reports `tree:asserted-clean`. The latter is an explicitly labelled caller
+  assertion, not Git evidence: release scripts may use it only after
+  materializing `git archive <captured-oid>` (or proving tracked worktree and
+  index cleanliness). An assertion without a 12- or 40-character lowercase
+  hexadecimal asserted commit, or any value other than exact `clean`, fails
+  the build. A build with neither stamps `unknown+nogit`, which any release
+  gate must treat as a hard failure.
 - The stamp re-derives when HEAD moves (`rerun-if-changed` on the resolved
   git dir's `HEAD`/`index` — resolved via `--absolute-git-dir`, so it is
   correct in linked worktrees, unlike the G3 original).
@@ -57,7 +63,7 @@ Inputs that define the binary, and where each is pinned:
 | Source | git commit | the stamp (§1) |
 | Compiler | `crates/bloch-pos-node/rust-toolchain.toml` (`1.94.1`) | rustup + a hard assert in `scripts/pos-release-integrity.sh` |
 | Dependency graph | the committed **root** `Cargo.lock`. `bloch-pos-node` and `bloch-pos-committee` are `members` of the root virtual workspace, so cargo resolves them — and every other member — against that one file; a member's own `Cargo.lock` is never read (six such dead files were deleted on 2026-09-04) | `cargo metadata --locked`, resolved from the node crate dir so the toolchain pin still applies, + `git diff --exit-code` on the root lock before **and** after the build |
-| Stamp | `BLOCH_BUILD_COMMIT=<commit-12>` passed explicitly | release script / CI guard |
+| Stamp | `BLOCH_BUILD_COMMIT=<commit-12>` and `BLOCH_BUILD_TREE_ASSERTION=clean` passed explicitly after the outer recipe proves/materializes clean source | release script / CI guard |
 | Profile & flags | default `release` profile, no `RUSTFLAGS` | any `RUSTFLAGS` changes the unit hash — a release build must run with `RUSTFLAGS` unset (the guard builds with a clean invocation) |
 | Build path | **canonical `/build` in the release container** | §3 — measured to matter |
 | Platform | the fleet target (x86_64/aarch64 Linux, per box) | the release container image, pinned by digest like `deploy/repro/build.sh` does for G3 |
@@ -90,8 +96,12 @@ in this worktree). Five builds:
 
 Findings, with the concrete cause:
 
-1. **Same path ⇒ bit-identical.** Clean double builds match exactly. No
-   timestamp, parallelism or incremental nondeterminism was observed.
+1. **Same source path with independent fresh targets ⇒ bit-identical.** Clean
+   double builds match exactly. The build identity normalizes only the
+   Cargo-injected profile-root entries in `LD_LIBRARY_PATH` (Linux) and
+   `DYLD_FALLBACK_LIBRARY_PATH` (macOS); external loader paths and their order
+   remain significant. The CI gate keeps `t1` and `t2` independent so a
+   regression in that normalization fails byte comparison.
 2. **Different path ⇒ different binary, and NOT because of embedded path
    strings.** `strings` shows zero occurrences of either source path in
    either binary. The difference is in mangled symbol hashes:
@@ -117,7 +127,8 @@ already embodies for G3:
 
 Honest-claim ladder (mirrors `REPRO.md`): the last executed evidence for
 `bloch-pos` has earned
-**"deterministic, same-path, single host — measured"**. GitLab retains an
+**"deterministic, same-source-path with independent targets, single host —
+measured"**. GitLab retains an
 unsigned release candidate with its source commit, toolchain, target, version
 and SHA256 (`scripts/package-pos-release-candidate.sh`), but that is not the
 canonical release. A canonical-container candidate now exists at
@@ -314,8 +325,9 @@ the whole flow with a disposable keypair generated into a temp dir.
 1. pinned toolchain present and active for the crate directory;
 2. the root `Cargo.lock` resolves `--locked`, is not rewritten by the build,
    and is not shadowed by a lockfile inside any workspace member;
-3. two clean same-path builds of `bloch-pos` are **bit-identical** (fails =
-   nondeterminism regression — catch it before any release is cut);
+3. two clean builds of `bloch-pos`, from the same source path into independent
+   fresh target directories, are **bit-identical** (fails = nondeterminism or
+   target-path normalization regression — catch it before any release is cut);
 4. `bloch-pos --version` contains the exact commit under build (fails = the
    stamp broke, fleet binaries become untraceable again).
 
@@ -381,7 +393,8 @@ releases.
    `scripts/compare-pos-release-builds.sh` refuses byte or provenance
    disagreement. This macOS worktree had no Docker/BuildKit engine, so it did
    not execute the Linux build.
-2. **No two-builder measurement.** Same-path determinism is measured (§3);
+2. **No two-builder measurement.** Same-source-path determinism with
+   independent targets is measured (§3);
    cross-builder container reproducibility still needs two independent Linux
    hosts to build the same commit and retain the passing comparison record.
 3. **The measurement platform was macOS x86_64, not the fleet's Linux.** The

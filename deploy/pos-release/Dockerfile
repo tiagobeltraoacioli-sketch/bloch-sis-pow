@@ -34,7 +34,7 @@ RUN case "$BLOCH_BUILD_COMMIT" in \
  && test ! -e crates/bloch-pos-committee/Cargo.lock
 
 ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
-RUN BLOCH_BUILD_COMMIT="$BLOCH_BUILD_COMMIT" cargo build \
+RUN BLOCH_BUILD_COMMIT="$BLOCH_BUILD_COMMIT" BLOCH_BUILD_TREE_ASSERTION=clean cargo build \
       --release --locked -p bloch-pos-node --bin bloch-pos
 
 RUN set -eu; \
@@ -43,8 +43,13 @@ RUN set -eu; \
     chmod 0755 /release/bloch-pos; \
     binary_sha="$(sha256sum /release/bloch-pos | awk '{print $1}')"; \
     printf '%s  bloch-pos\n' "$binary_sha" > /release/SHA256SUMS; \
-    version="$(/release/bloch-pos --version)"; \
+    version_file=/tmp/bloch-pos-version; \
+    /release/bloch-pos --version > "$version_file"; \
+    test "$(wc -l < "$version_file" | tr -d '[:space:]')" = 2; \
+    version="$(sed -n '1p' "$version_file")"; \
+    source_identity="$(sed -n '2p' "$version_file")"; \
     printf '%s\n' "$version" | grep -F "${BLOCH_BUILD_COMMIT%${BLOCH_BUILD_COMMIT#????????????}}"; \
+    printf '%s\n' "$source_identity" | grep -E '^source-digest sha3-256:[0-9a-f]{64} \([0-9]+ files, [0-9]+ bytes\) commit-source:asserted tree:asserted-clean$'; \
     { \
       printf 'artifact_kind=canonical-container-candidate\n'; \
       printf 'source_commit=%s\n' "$BLOCH_BUILD_COMMIT"; \

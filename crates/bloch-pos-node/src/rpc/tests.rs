@@ -1724,8 +1724,8 @@ fn getbuildinfo_reports_the_fields_a_partner_compares() {
     );
     let ts = v.get("tree_state").unwrap().as_str().unwrap();
     assert!(
-        ["clean", "modified", "unverified", "unknown"].contains(&ts),
-        "tree_state must be clean|modified|unverified|unknown, got {ts}"
+        ["clean", "asserted-clean", "modified", "unverified", "unknown"].contains(&ts),
+        "tree_state must be clean|asserted-clean|modified|unverified|unknown, got {ts}"
     );
 
     // The bound rides with the answer, so a client cannot read the digest as

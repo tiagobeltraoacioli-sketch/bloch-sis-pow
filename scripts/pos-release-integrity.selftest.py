@@ -27,8 +27,11 @@ asserts BOTH directions:
   * a renamed PoS crate FAILS rather than dropping out of the guard's scope;
   * full mode refuses tracked source edits both unstaged and staged, while an
     untracked CI-output file advances beyond the source-cleanliness checks.
-  * full mode accepts a real canonical SHA-256 result and rejects tool failure,
-    short, nonhexadecimal, uppercase and multiple-row digest output.
+  * full mode accepts a real canonical SHA-256 result, rejects two different
+    regular build outputs, and rejects tool failure, short, nonhexadecimal,
+    uppercase and multiple-row digest output;
+  * full mode really uses two distinct fresh target directories, so the
+    target-path normalization regression cannot be hidden by one reused path.
 
 The post-build drift diff (section 3) needs a compiler and a minute of build to
 reach, so it is asserted at the source level instead: it must name the root
@@ -113,6 +116,13 @@ def relock(root: str) -> None:
 def run_guard(root: str, *, args=None, extra_env=None):
     env = os.environ.copy()
     env.update(extra_env or {})
+    build_state = env.get("INTEGRITY_BUILD_STATE")
+    if build_state:
+        for suffix in (".count", ".first-target"):
+            try:
+                os.unlink(build_state + suffix)
+            except FileNotFoundError:
+                pass
     return subprocess.run(
         ["bash", os.path.join(root, "scripts", "pos-release-integrity.sh"),
          *(args if args is not None else ["--locks-only"])],
@@ -203,13 +213,34 @@ case "${1:-}" in
       shift
     done
     [ -n "$target" ]
+    state="${INTEGRITY_BUILD_STATE:?}"
+    count=0
+    [ ! -f "$state.count" ] || read -r count < "$state.count"
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$state.count"
+    case "$count:$target" in
+      1:*/t1)
+        [ ! -e "$target" ] || exit 77
+        printf '%s\n' "$target" > "$state.first-target"
+        ;;
+      2:*/t2)
+        [ ! -e "$target" ] || exit 78
+        [ "$(cat "$state.first-target")" != "$target" ] || exit 79
+        ;;
+      *) exit 80 ;;
+    esac
     mkdir -p "$target/release"
-    case "${INTEGRITY_BINARY_MODE:-canonical}:$target" in
+    case "${INTEGRITY_BINARY_MODE:-canonical}:$count" in
       canonical:*) cp "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
-      symlink-first:*/t1) ln -s "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
-      symlink-second:*/t2) ln -s "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
-      hardlink-first:*/t1) ln "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
-      hardlink-second:*/t2) ln "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
+      different-second:1) cp "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
+      different-second:2)
+        cp "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos"
+        printf '\n# different second build\n' >> "$target/release/bloch-pos"
+        ;;
+      symlink-first:1) ln -s "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
+      symlink-second:2) ln -s "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
+      hardlink-first:1) ln "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
+      hardlink-second:2) ln "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
       symlink-first:*|symlink-second:*|hardlink-first:*|hardlink-second:*)
         cp "$INTEGRITY_FAKE_BINARY" "$target/release/bloch-pos" ;;
       *) exit 74 ;;
@@ -261,6 +292,7 @@ esac
         "INTEGRITY_SHA_MODE": "canonical",
         "INTEGRITY_VERSION_MODE": "canonical",
         "INTEGRITY_FAKE_BINARY": fake_binary,
+        "INTEGRITY_BUILD_STATE": os.path.join(tmp, "fake-build-state"),
         "INTEGRITY_TEST_COMMIT": subprocess.run(
             ["git", "-C", root, "rev-parse", "--short=12", "HEAD"],
             check=True, capture_output=True, text=True,
@@ -438,6 +470,23 @@ def main() -> int:
             else:
                 print("  ok   canonical full-mode SHA-256 output passes")
 
+            different = run_guard(
+                root, args=[],
+                extra_env={**full_env, "INTEGRITY_BINARY_MODE": "different-second"},
+            )
+            different_output = different.stdout + different.stderr
+            if different.returncode == 0:
+                FAILURES.append("full mode accepted two different valid build outputs\n"
+                                f"{different_output}")
+            elif "two clean builds of the same commit differ" not in different_output:
+                FAILURES.append("full mode rejected different valid build outputs without "
+                                f"the determinism diagnostic\n{different_output}")
+            elif "determinism: ok" in different_output:
+                FAILURES.append("full mode claimed determinism for different valid outputs\n"
+                                f"{different_output}")
+            else:
+                print("  ok   full mode refuses different valid build outputs")
+
             binary_cases = {
                 "symlink-first": "release build 1 output is not a regular non-symlink file",
                 "symlink-second": "release build 2 output is not a regular non-symlink file",
@@ -543,9 +592,10 @@ def main() -> int:
             print(f"\n- {f}", file=sys.stderr)
         return 1
     print("\npos-release-integrity.selftest: PASS — lock/layout drift, tracked "
-          "release-source edits, aliased build outputs, malformed full-mode "
-          "digests and noncanonical version identities fail closed; untracked "
-          "output remains outside the cleanliness contract.")
+          "release-source edits, target-dir regressions, different or aliased "
+          "build outputs, malformed full-mode digests and noncanonical version "
+          "identities fail closed; untracked output remains outside the "
+          "cleanliness contract.")
     return 0
 
 

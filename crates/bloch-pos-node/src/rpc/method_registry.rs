@@ -267,8 +267,8 @@ fn the_surviving_identity_method_still_carries_the_field_it_was_chosen_for() {
     // The clean-tree bug this branch fixed: `tree_state` must be able to say
     // `clean`. Before the `git_raw` split it could only ever say `unknown`.
     assert!(
-        ["clean", "modified", "unverified", "unknown"]
+        ["clean", "asserted-clean", "modified", "unverified", "unknown"]
             .contains(&env!("BLOCH_BUILD_TREE_STATE")),
-        "tree_state must be one of the four registered states"
+        "tree_state must be one of the five registered states"
     );
 }

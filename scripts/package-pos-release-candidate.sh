@@ -82,6 +82,7 @@ case "$active" in
 esac
 
 ( cd "$source" && BLOCH_BUILD_COMMIT="${commit:0:12}" \
+    BLOCH_BUILD_TREE_ASSERTION=clean \
     cargo build --release --locked -p bloch-pos-node --bin bloch-pos \
       --target-dir "$work/target" )
 binary="$work/target/release/bloch-pos"

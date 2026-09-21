@@ -23,7 +23,10 @@
 // the same binary. Container/CI builds have no .git, so the caller passes
 // BLOCH_BUILD_COMMIT explicitly; the env var wins over the repo because the
 // caller knows what it is building, and a build script guessing from a partial
-// checkout is how stamps go stale.
+// checkout is how stamps go stale. Such a commit leaves the tree `unverified`
+// unless an outer recipe that proved/materialized clean source explicitly sets
+// BLOCH_BUILD_TREE_ASSERTION=clean; that state is labelled `asserted-clean`,
+// never confused with Git-derived `clean`.
 
 // ── The source-tree digest ──────────────────────────────────────────────────
 //
@@ -31,10 +34,11 @@
 // the same question as "which tree was compiled", and the gap between them is
 // exactly where this repo has been burned before: a caller can assert
 // BLOCH_BUILD_COMMIT and the stamp will repeat it, dirty or not, because the
-// build script is told not to second-guess a caller who says what it is
-// building. That is the right call for CI. It also means the commit alone
-// cannot stop an operator from editing one file, rebuilding, and reporting a
-// clean tag id.
+// build script cannot verify an exported tree against Git. Such a build is
+// labelled `unverified` unless a release recipe explicitly supplies the
+// separate, visibly asserted clean-tree claim described above. It also means
+// the commit alone cannot stop an operator from editing one file, rebuilding,
+// and reporting a clean tag id.
 //
 // So the build script also hashes the files it is about to hand rustc, and
 // stamps THAT. The digest is computed from bytes on disk. No environment
@@ -72,13 +76,15 @@ use std::process::Command;
 
 mod build_command;
 mod build_environment;
+mod build_identity;
 mod build_native_input;
 mod build_native_tool;
 mod build_source_digest;
 use build_command::{
     command_from_env, delegated_compiler, linker_from_printed_args, rustflags_linker,
 };
-use build_environment::FIXED_BUILD_ENV;
+use build_environment::{FIXED_BUILD_ENV, canonical_environment_value};
+use build_identity::tree_state;
 use build_native_input::required_native_input_digests;
 use build_native_tool::{required_cc_archiver_digest, required_cc_compiler_digest};
 use build_source_digest::required_source_digest;
@@ -412,6 +418,7 @@ fn build_environment_digest(
     profile: &str,
     target: &str,
     host: &str,
+    out_dir: Option<&Path>,
 ) -> (String, usize) {
     // An absent fixed variable is also watched: setting it after an incremental
     // build must rerun this script rather than leave a stale fingerprint.
@@ -458,7 +465,7 @@ fn build_environment_digest(
     }));
     for key in watched {
         let value = match std::env::var(&key) {
-            Ok(value) => Some(value),
+            Ok(value) => Some(canonical_environment_value(&key, &value, out_dir)),
             Err(std::env::VarError::NotPresent) => None,
             Err(std::env::VarError::NotUnicode(_)) => {
                 panic!("build environment variable {key} is not Unicode")
@@ -468,6 +475,7 @@ fn build_environment_digest(
     }
     for (key, value) in std::env::vars().filter(|(key, _)| relevant_build_env(key)) {
         println!("cargo:rerun-if-env-changed={key}");
+        let value = canonical_environment_value(&key, &value, out_dir);
         fields.push((format!("env:{key}"), Some(value)));
     }
     fields.sort();
@@ -506,16 +514,20 @@ fn main() {
     // correct for `rev-parse`, where a blank line is not a commit id.
     let git = |args: &[&str]| -> Option<String> { git_raw(args).filter(|s| !s.is_empty()) };
 
-    let commit = std::env::var("BLOCH_BUILD_COMMIT")
+    let asserted_commit = std::env::var("BLOCH_BUILD_COMMIT")
         .ok()
-        .filter(|s| !s.trim().is_empty())
+        .filter(|s| !s.trim().is_empty());
+    let commit = asserted_commit
+        .clone()
         .or_else(|| git(&["rev-parse", "--short=12", "HEAD"]))
         .unwrap_or_else(|| "unknown".into());
 
     // A dirty build is the thing that made the fleet unidentifiable in the
     // first place, so it is marked loudly rather than hidden.
-    let dirty = if std::env::var("BLOCH_BUILD_COMMIT").is_ok() {
-        // Caller-supplied commit: it asserted the tree state, do not second-guess.
+    let dirty = if asserted_commit.is_some() {
+        // Caller-supplied commit: Git cannot establish the exported tree state.
+        // The separately parsed assertion below decides whether this remains
+        // `unverified` or is explicitly labelled `asserted-clean`.
         ""
     } else {
         // MUST be git_raw, not git. `git status --porcelain` prints NOTHING
@@ -543,10 +555,7 @@ fn main() {
     // Whether the commit is EVIDENCE or an ASSERTION. This is the field that
     // keeps the response honest: `asserted` means whoever ran the build typed
     // the id, and the build script did not check it against anything.
-    let commit_source = if std::env::var("BLOCH_BUILD_COMMIT")
-        .ok()
-        .is_some_and(|s| !s.trim().is_empty())
-    {
+    let commit_source = if asserted_commit.is_some() {
         "asserted"
     } else if commit == "unknown" {
         "none"
@@ -554,12 +563,15 @@ fn main() {
         "git"
     };
     println!("cargo:rustc-env=BLOCH_BUILD_COMMIT_SOURCE={commit_source}");
-    let tree_state = match dirty {
-        "+dirty" => "modified",
-        "+nogit" => "unknown",
-        _ if commit_source == "asserted" => "unverified",
-        _ => "clean",
+    let tree_assertion = match std::env::var("BLOCH_BUILD_TREE_ASSERTION") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("BLOCH_BUILD_TREE_ASSERTION must be Unicode")
+        }
     };
+    let tree_state = tree_state(commit_source, &commit, dirty, tree_assertion.as_deref())
+        .unwrap_or_else(|message| panic!("{message}"));
     println!("cargo:rustc-env=BLOCH_BUILD_TREE_STATE={tree_state}");
 
     match workspace_root() {
@@ -605,6 +617,7 @@ fn main() {
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "unknown".into());
     let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".into());
     let host = std::env::var("HOST").unwrap_or_else(|_| "unknown".into());
+    let out_dir = std::env::var_os("OUT_DIR").map(PathBuf::from);
     let target_os = std::env::var("CARGO_CFG_TARGET_OS")
         .expect("Cargo did not provide CARGO_CFG_TARGET_OS to the build script");
     let rustc_binary_digest = build_tool_digest(&rustc);
@@ -640,6 +653,7 @@ fn main() {
         &profile,
         &target,
         &host,
+        out_dir.as_deref(),
     );
     println!("cargo:rustc-env=BLOCH_BUILD_RUSTC={rustc_v}");
     println!("cargo:rustc-env=BLOCH_BUILD_CARGO={cargo_v}");
@@ -694,6 +708,7 @@ fn main() {
     // worktree --absolute-git-dir points at the per-worktree gitdir, which is
     // where its HEAD and index actually live.
     println!("cargo:rerun-if-env-changed=BLOCH_BUILD_COMMIT");
+    println!("cargo:rerun-if-env-changed=BLOCH_BUILD_TREE_ASSERTION");
     if let Some(gitdir) = git(&["rev-parse", "--absolute-git-dir"]) {
         for f in ["HEAD", "index"] {
             let p = format!("{gitdir}/{f}");

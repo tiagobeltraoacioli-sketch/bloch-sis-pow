@@ -388,9 +388,10 @@ falcon-clean-guard:
 # proves, on every pipeline: (1) the root Cargo.lock — the ONE lockfile cargo
 # reads for the PoS crates, which are members of the root virtual workspace —
 # resolves with --locked, does not drift across the build, and has no dead
-# per-member lockfile shadowing it; (2) two clean builds of bloch-pos at
-# the same commit are bit-identical (same-path determinism — the path-scoped
-# caveat and the canonical /build rule are deploy/RELEASE-INTEGRITY.md §3);
+# per-member lockfile shadowing it; (2) two clean builds of bloch-pos at the
+# same commit and source path, using independent fresh target dirs, are
+# bit-identical (the source-path caveat and canonical /build rule are in
+# deploy/RELEASE-INTEGRITY.md §3);
 # (3) `bloch-pos --version` reports the exact commit being built, so a fleet
 # binary can always be traced to source. Runbook + measured baseline:
 # deploy/RELEASE-INTEGRITY.md. ~1 min: the PoS workspace is small by design.

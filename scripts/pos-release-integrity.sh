@@ -19,11 +19,10 @@
 #      crates — the root Cargo.lock — resolves with --locked and does not drift
 #      during the build, and no member carries a dead lockfile beside it.
 #   2. The build is deterministic where determinism is promised: two clean
-#      builds of bloch-pos from the same source path, same toolchain, same
-#      stamp produce bit-identical binaries. (Path-INdependence is measured
-#      and known-false on stable cargo — -Cmetadata hashes the absolute
-#      manifest path — which is why releases build at the canonical /build
-#      path in a container; see deploy/RELEASE-INTEGRITY.md §3.)
+#      builds of bloch-pos from the same source path into independent fresh
+#      target dirs, with the same toolchain and stamp, produce bit-identical
+#      binaries. Source-path independence is known-false on stable Cargo,
+#      which is why releases build at canonical /build; see the runbook §3.
 #   3. The stamp is live: `bloch-pos --version` reports the exact commit the
 #      CI is building. A binary that cannot say what it is cannot be compared
 #      against a fleet, which is how the G3 divergence stayed invisible.
@@ -201,16 +200,17 @@ esac
 
 
 # ── 2. Deterministic double build ────────────────────────────────────────────
-# Same clean source path, two fresh target dirs. BLOCH_BUILD_COMMIT is passed
-# explicitly so the stamp is identical in both builds and so this is the same
-# code path a container release build uses.
+# Same clean source path, two independent fresh target dirs. This catches any
+# regression in the narrow normalization of Cargo-injected profile-root loader
+# paths while retaining the same stamp and code path as the container build.
 COMMIT="$(git rev-parse --short=12 HEAD)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pos-repro.XXXXXX")"
 trap 'rm -rf "$WORK" "$LOCK_META"' EXIT
 
 build() { # $1 = target dir
   ( cd "$NODE_DIR" && \
-    BLOCH_BUILD_COMMIT="$COMMIT" cargo build --release --locked \
+    BLOCH_BUILD_COMMIT="$COMMIT" BLOCH_BUILD_TREE_ASSERTION=clean \
+      cargo build --release --locked \
       --target-dir "$1" )
 }
 
@@ -255,7 +255,7 @@ echo "build 2 sha256: $H2"
 build is non-deterministic — find the input that changed (toolchain, \
 lockfile, RUSTFLAGS, env leaking into build.rs) BEFORE cutting any release. \
 Compare with: diff <(nm t1/release/bloch-pos) <(nm t2/release/bloch-pos)"
-echo "determinism: ok (bit-identical, same path)"
+echo "determinism: ok (bit-identical, same source path and independent target dirs)"
 
 # ── 3. Stamp is live and truthful ────────────────────────────────────────────
 VERSION_FILE="$WORK/binary-version"
@@ -284,7 +284,7 @@ assert_root_lock_undrifted "a build rewrote it. Find what resolved differently \
 before cutting any release."
 
 echo
-echo "pos-release-integrity: PASS — locked, deterministic (same-path),"
+echo "pos-release-integrity: PASS — locked, deterministic (independent target dirs),"
 echo "commit-stamped. Reference hashes for THIS runner's platform:"
 echo "  bloch-pos @ $COMMIT : $H1"
 echo "NOTE: this hash is platform- and path-scoped. The publishable reference"

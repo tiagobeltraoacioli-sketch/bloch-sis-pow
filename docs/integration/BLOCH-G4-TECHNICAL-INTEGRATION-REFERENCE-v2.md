@@ -1286,7 +1286,7 @@ Every method in the frozen registry (`method_registry.rs`, `tests/rpc_method_reg
 | Method | Params (name, type; position) | Returns | Notes |
 |---|---|---|---|
 | `getchaininfo` | none | See §10.3 | |
-| `getbuildinfo` | none | `build_version, package_version, commit, commit_source (git\|asserted\|none), tree_state (clean\|modified\|unverified\|unknown), source_digest (sha3-256 hex), source_digest_alg, source_digest_scope, source_files, source_bytes, rustc, cargo, profile, target, build_environment_digest (sha3-256 hex), build_environment_digest_alg, build_environment_scope, build_environment_fields, build_tool_binaries_hashed, build_sysroot_components_hashed, build_configured_tool_binaries_hashed, build_default_linker_binaries_hashed, build_linker_binaries_hashed, digest_note` | Constant cost, no chain-state read. Compare both digests across trusted builders: source equality alone does not establish equal compiler/code-generation inputs (see the warning below). |
+| `getbuildinfo` | none | `build_version, package_version, commit, commit_source (git\|asserted\|none), tree_state (clean\|asserted-clean\|modified\|unverified\|unknown), source_digest (sha3-256 hex), source_digest_alg, source_digest_scope, source_files, source_bytes, rustc, cargo, profile, target, build_environment_digest (sha3-256 hex), build_environment_digest_alg, build_environment_scope, build_environment_fields, build_tool_binaries_hashed, build_sysroot_components_hashed, build_configured_tool_binaries_hashed, build_default_linker_binaries_hashed, build_linker_binaries_hashed, digest_note` | Constant cost, no chain-state read. `asserted-clean` is an outer-recipe assertion; only `clean` is Git evidence gathered by the build script. Compare both digests across trusted builders: source equality alone does not establish equal compiler/code-generation inputs (see the warning below). |
 | `getblockcount` | none | `height, slot, epoch, finalized_height (u64\|null), justified_epoch, finalized_epoch` | |
 | `getblockbyslot` | `slot` (u64; pos 0) | Block object, §7.2 | `-32007 SLOT_EMPTY` if no canonical block at that slot (message names the current head) |
 | `getblockbyid` | `block_id` (64-hex; pos 0) | Block object, §7.2 | `-32000 BLOCK_NOT_FOUND` if unknown |
@@ -2060,7 +2060,7 @@ own alert rules from the table above instead.
 ```
 $ bloch-pos --version
 bloch-pos-node <pkg-version> (Genesis-4, block version 0xb10c0005)
-source-digest sha3-256:<hex> (<N> files, <M> bytes) commit-source:<git|asserted|none> tree:<clean|modified|unverified|unknown>
+source-digest sha3-256:<hex> (<N> files, <M> bytes) commit-source:<git|asserted|none> tree:<clean|asserted-clean|modified|unverified|unknown>
 ```
 
 `getbuildinfo` (RPC) and `bloch-pos buildinfo` (CLI) return the identical
