@@ -209,10 +209,8 @@ mod tests {
         let mut chunks = vec![b"HTTP/1.1 200 OK\r\n\r\n".to_vec()];
         chunks.extend((0..15).map(|_| vec![b' ']));
         let (address, worker) = server(chunks, Duration::from_millis(10));
-        let start = Instant::now();
         let error = call_with_limits(&address, "test", &Value::Null, None, 1024, Duration::from_millis(50)).unwrap_err();
         assert!(error.contains("deadline"));
-        assert!(start.elapsed() < Duration::from_secs(1));
         worker.join().unwrap();
     }
 

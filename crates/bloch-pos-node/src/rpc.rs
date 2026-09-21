@@ -1561,6 +1561,11 @@ struct HostPolicy {
 
 impl HostPolicy {
     fn new(bind_addr: &str) -> Self {
+        let extra = std::env::var(RPC_HOST_ALLOWLIST_ENV).ok();
+        Self::with_extra(bind_addr, extra.as_deref())
+    }
+
+    fn with_extra(bind_addr: &str, extra: Option<&str>) -> Self {
         let mut allowed = vec!["127.0.0.1".to_string(), "localhost".to_string(), "::1".to_string()];
         // An operator who bound a specific, literal address made an explicit
         // decision to trust that name — `0.0.0.0`/`::` are wildcard BIND
@@ -1569,7 +1574,7 @@ impl HostPolicy {
         if bind_addr != "0.0.0.0" && bind_addr != "::" && !allowed.iter().any(|a| a == bind_addr) {
             allowed.push(bind_addr.to_string());
         }
-        if let Ok(extra) = std::env::var(RPC_HOST_ALLOWLIST_ENV) {
+        if let Some(extra) = extra {
             allowed.extend(
                 extra
                     .split(',')

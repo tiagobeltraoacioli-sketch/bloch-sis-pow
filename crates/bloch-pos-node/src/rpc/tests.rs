@@ -1549,24 +1549,14 @@ fn a_cors_simple_request_shape_is_refused() {
 /// The operator allowlist (`BLOCH_RPC_HOST_ALLOWLIST`) accepts an extra
 /// hostname, and only that name — not an arbitrary caller's choice.
 ///
-/// Env-var tests share the process, so this constructs [`HostPolicy`]
-/// directly instead of spawning a real server bound under the ambient
-/// (possibly test-polluted) environment.
+/// Exercise the parsed value directly: mutating process-global environment
+/// from a parallel test can change the policy used by unrelated RPC servers.
 #[test]
 fn the_host_allowlist_env_var_adds_exactly_the_named_hosts() {
-    // SAFETY (`set_var`/`remove_var` unsafe since Rust 2024): this test does
-    // not spawn threads that read the environment concurrently with the
-    // mutation below.
-    unsafe {
-        std::env::set_var(RPC_HOST_ALLOWLIST_ENV, " rpc.internal , 10.0.0.5 ");
-    }
-    let hosts = HostPolicy::new("127.0.0.1");
+    let hosts = HostPolicy::with_extra("127.0.0.1", Some(" rpc.internal , 10.0.0.5 "));
     assert!(hosts.allows(Some("rpc.internal")), "an allowlisted host must be accepted");
     assert!(hosts.allows(Some("10.0.0.5:8080")), "allowlist entries ignore a port too");
     assert!(!hosts.allows(Some("evil.example")), "an unlisted host must still be refused");
-    unsafe {
-        std::env::remove_var(RPC_HOST_ALLOWLIST_ENV);
-    }
 }
 
 #[test]

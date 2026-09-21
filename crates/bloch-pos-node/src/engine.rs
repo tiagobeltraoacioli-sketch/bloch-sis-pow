@@ -8847,10 +8847,11 @@ mod admission_authorisation {
 /// does not duplicate: standing up a proposing validator here would re-test
 /// consensus to prove an admission property.
 ///
-/// No mocked clock anywhere: the wall epoch is real `now_ms()` against a
-/// manifest whose `genesis_time_ms` is placed in the past — the same knob
-/// production uses — so `wall_slot()`/`epoch_of` run the very code the live
-/// node runs.
+/// Every harness starts from real `now_ms()` against a manifest whose
+/// `genesis_time_ms` is placed in the past — the same knob production uses —
+/// so `wall_slot()`/`epoch_of` first run the live path.  The one long
+/// pre-activation pressure test pins its thread-local clock only after proving
+/// that real-clock epoch, so scheduler delay cannot change eras mid-test.
 #[cfg(test)]
 mod transfer_v2_end_to_end {
     use super::*;
@@ -8860,12 +8861,12 @@ mod transfer_v2_end_to_end {
     use bloch_pos_committee::SLOTS_PER_EPOCH;
     use sha3::{Digest, Sha3_256};
 
-    /// A real `Engine`: real `Store` on disk, real devnet transport bound to
-    /// an ephemeral port with zero peers (broadcast walks an empty peer
-    /// list, so gossiping an admitted transaction is a no-op instead of a
-    /// hang), observer mode (no keystore), and a genesis state that actually
-    /// HOLDS `entries` — the outputs the sweep spends. `epochs_past` places
-    /// `genesis_time_ms` so the node's real wall epoch is at least that
+    /// A real `Engine`: real `Store` on disk, a transport-shaped inert devnet
+    /// sink with zero peers (broadcast is a no-op without a socket or
+    /// background thread), observer mode (no keystore), and a genesis state
+    /// that actually HOLDS `entries` — the outputs the sweep spends.
+    /// `epochs_past` places `genesis_time_ms` so the node's real wall epoch is
+    /// at least that
     /// (+2 slots of margin so the epoch cannot regress mid-test).
     fn engine_at_wall_epoch(epochs_past: u64, entries: &[EutxoEntry]) -> Engine {
         let slot_ms = 500u64;
@@ -9970,6 +9971,11 @@ mod transfer_v2_end_to_end {
             0,
             "harness: a fresh genesis must put the wall clock in epoch 0"
         );
+        // Prove the real-clock harness above, then pin the rest of this
+        // deliberately pre-activation scenario.  Filling MEMPOOL_MAX performs
+        // enough hashing that a loaded CI runner can otherwise cross the
+        // 16-second epoch boundary while this single test is still running.
+        let _clock = validator_lifecycle::clock_at(0);
 
         // Gossip path: refused with today's string.
         let err = node
