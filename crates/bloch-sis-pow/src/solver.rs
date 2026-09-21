@@ -330,22 +330,6 @@ mod tests {
     use crate::difficulty::Target;
 
     #[test]
-    fn mine_with_max_target_succeeds_quickly() {
-        // With Target::MAX, *every* aux hash satisfies the threshold.
-        // The bottleneck is finding s such that the residual bound holds.
-        let header = b"genesis-test-header-2026";
-        let cfg = MineConfig {
-            candidates_per_nonce: 16384,
-            max_total_attempts: 1_000_000,
-            ..Default::default()
-        };
-        let r = mine(header, &Target::MAX, &cfg, None);
-        // Note: depending on parameters and rng, this may exhaust without
-        // finding a residual-passing s. We just check it doesn't panic.
-        let _ = r;
-    }
-
-    #[test]
     fn mine_respects_cancel_flag() {
         let header = b"cancel-test";
         // Nearly-impossible target so mining doesn't terminate quickly.

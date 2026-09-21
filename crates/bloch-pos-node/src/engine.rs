@@ -8914,23 +8914,9 @@ mod transfer_v2_end_to_end {
         ));
         std::fs::create_dir_all(&dir).expect("create the test data dir");
         let store = Store::open(&dir, &[0u8; 32]).expect("open the test store");
-        let (events, _rx) = mpsc::channel::<EngineEvent>();
-        // `_rx` drops here: nothing dials this node, and the accept loop
-        // exits quietly on a closed channel.
         let head_slot = Arc::new(AtomicU64::new(0));
         let inflight = net::QueueBudget::new();
-        let net = net::Net::Devnet(
-            net::start(
-                "127.0.0.1",
-                0, // ephemeral port: bind for real, listen to nobody
-                Vec::new(),
-                events,
-                dir.clone(),
-                head_slot.clone(),
-                inflight,
-            )
-            .expect("bind the devnet transport on an ephemeral port"),
-        );
+        let net = net::Net::Devnet(net::DevnetMesh::inert(head_slot.clone(), inflight));
         let verifier = HybridVerifier::new();
         Engine {
             genesis_validator_indices: manifest.validators.iter().map(|v| v.index).collect(),
@@ -10186,21 +10172,9 @@ mod perf_support {
         let genesis_id = manifest.genesis_id();
         let state = manifest.genesis_state();
         let store = Store::open(&dir, &[0u8; 32]).expect("open the test store");
-        let (events, _rx) = mpsc::channel::<EngineEvent>();
         let head_slot = Arc::new(AtomicU64::new(0));
         let inflight = net::QueueBudget::new();
-        let net = net::Net::Devnet(
-            net::start(
-                "127.0.0.1",
-                0, // ephemeral port: bind for real, listen to nobody
-                Vec::new(),
-                events,
-                dir.clone(),
-                head_slot.clone(),
-                inflight,
-            )
-            .expect("bind the devnet transport on an ephemeral port"),
-        );
+        let net = net::Net::Devnet(net::DevnetMesh::inert(head_slot.clone(), inflight));
         let verifier = HybridVerifier::new();
         let engine = Engine {
             genesis_validator_indices: manifest.validators.iter().map(|v| v.index).collect(),
@@ -12250,21 +12224,9 @@ mod duty_view_anchor {
         let genesis_id = manifest.genesis_id();
         let state = manifest.genesis_state();
         let store = Store::open(&dir.0, &[0u8; 32]).expect("open the test store");
-        let (events, _rx) = mpsc::channel::<EngineEvent>();
         let head_slot = Arc::new(AtomicU64::new(0));
         let inflight = net::QueueBudget::new();
-        let net = net::Net::Devnet(
-            net::start(
-                "127.0.0.1",
-                0,
-                Vec::new(),
-                events,
-                dir.0.clone(),
-                head_slot.clone(),
-                inflight,
-            )
-            .expect("bind the devnet transport on an ephemeral port"),
-        );
+        let net = net::Net::Devnet(net::DevnetMesh::inert(head_slot.clone(), inflight));
         let verifier = HybridVerifier::new();
         let ks0 = Keystore::load_with(&dir.0.join("v0"), &crate::keys::Unlock::PlaintextOptIn)
             .expect("re-load validator 0");
@@ -12532,13 +12494,9 @@ mod slot_horizon {
         ));
         std::fs::create_dir_all(&dir).expect("create the test data dir");
         let store = Store::open(&dir, &[0u8; 32]).expect("open the test store");
-        let (events, _rx) = mpsc::channel::<EngineEvent>();
         let head_slot = Arc::new(AtomicU64::new(0));
         let inflight = net::QueueBudget::new();
-        let net = net::Net::Devnet(
-            net::start("127.0.0.1", 0, Vec::new(), events, dir.clone(), head_slot.clone(), inflight)
-                .expect("bind the devnet transport on an ephemeral port"),
-        );
+        let net = net::Net::Devnet(net::DevnetMesh::inert(head_slot.clone(), inflight));
         let verifier = HybridVerifier::new();
         Engine {
             genesis_validator_indices: manifest.validators.iter().map(|v| v.index).collect(),

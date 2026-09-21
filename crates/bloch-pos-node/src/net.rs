@@ -908,6 +908,23 @@ fn run_outbound_reader(
 }
 
 impl DevnetMesh {
+    /// A transport-shaped sink for engine unit tests that do not exercise I/O.
+    ///
+    /// Using [`start`] for those fixtures leaves its blocking accept thread
+    /// alive after the fixture is dropped: the listener owns no shutdown
+    /// channel and nobody connects to wake it.  Keep those tests faithful to
+    /// the `DevnetMesh` broadcast semantics (zero peers means a no-op) without
+    /// opening a socket or spawning either background loop.
+    #[cfg(test)]
+    pub(crate) fn inert(head: Arc<AtomicU64>, budget: Arc<QueueBudget>) -> Self {
+        Self {
+            peers: Vec::new(),
+            sync: SyncScheduler::new(head, budget),
+            inbound: Arc::new(Mutex::new(Vec::new())),
+            live: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
     /// TCP connections established right now. See [`DevnetMesh::live`].
     pub fn peer_count(&self) -> usize {
         self.live.load(Ordering::Acquire)
