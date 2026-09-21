@@ -203,6 +203,10 @@ esac
 # Same clean source path, two independent fresh target dirs. This catches any
 # regression in the narrow normalization of Cargo-injected profile-root loader
 # paths while retaining the same stamp and code path as the container build.
+# Cargo currently hard-links the top-level release binary to the hashed copy in
+# `release/deps/`, so the validation below first proves every link stays inside
+# one build tree, then copies the binary into a standalone file for hashing and
+# version checks.
 COMMIT="$(git rev-parse --short=12 HEAD)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pos-repro.XXXXXX")"
 trap 'rm -rf "$WORK" "$LOCK_META"' EXIT
@@ -218,14 +222,43 @@ echo "building bloch-pos twice at commit $COMMIT …"
 build "$WORK/t1"
 build "$WORK/t2"
 
-assert_release_binary_file() { # $1 = path, $2 = diagnostic context
+assert_release_binary_file() { # $1 = path, $2 = target dir, $3 = diagnostic context
   [ -f "$1" ] && [ ! -L "$1" ] \
-    || fail "$2 is not a regular non-symlink file"
+    || fail "$3 is not a regular non-symlink file"
+  local total_link_count target_link_count
+  total_link_count="$(
+    python3 - <<'PY' "$1"
+import os, sys
+print(os.stat(sys.argv[1]).st_nlink)
+PY
+  )"
+  target_link_count="$(
+    find "$2" -samefile "$1" -exec printf x \; \
+      | wc -c | tr -d '[:space:]'
+  )"
+  [ "$target_link_count" = "$total_link_count" ] \
+    || fail "$3 must not have hard links outside its target directory"
 }
-assert_release_binary_file "$WORK/t1/release/bloch-pos" 'release build 1 output'
-assert_release_binary_file "$WORK/t2/release/bloch-pos" 'release build 2 output'
-[ ! "$WORK/t1/release/bloch-pos" -ef "$WORK/t2/release/bloch-pos" ] \
-  || fail "release build outputs alias the same filesystem object"
+materialize_release_binary_file() { # $1 = source path, $2 = target dir, $3 = copy path, $4 = diagnostic context
+  assert_release_binary_file "$1" "$2" "$4"
+  cp -p -- "$1" "$3" \
+    || fail "could not materialize standalone copy for $4"
+  [ -f "$3" ] && [ ! -L "$3" ] \
+    || fail "standalone copy for $4 is not a regular non-symlink file"
+  local unexpected_link_count
+  unexpected_link_count="$(
+    find "$3" ! -links 1 -exec printf x \; \
+      | wc -c | tr -d '[:space:]'
+  )"
+  [ "$unexpected_link_count" = 0 ] \
+    || fail "standalone copy for $4 must have exactly one hard link"
+}
+BIN1="$WORK/bloch-pos.1"
+BIN2="$WORK/bloch-pos.2"
+materialize_release_binary_file "$WORK/t1/release/bloch-pos" "$WORK/t1" "$BIN1" \
+  'release build 1 output'
+materialize_release_binary_file "$WORK/t2/release/bloch-pos" "$WORK/t2" "$BIN2" \
+  'release build 2 output'
 
 sha() { # portable sha256 of $1
   if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}';
@@ -242,8 +275,8 @@ validated_sha256_file() { # $1 = file, $2 = diagnostic context
     || fail "SHA-256 tool returned a digest that is not exactly 64 characters for $2"
   printf '%s\n' "$digest"
 }
-H1="$(validated_sha256_file "$WORK/t1/release/bloch-pos" 'release build 1')"
-H2="$(validated_sha256_file "$WORK/t2/release/bloch-pos" 'release build 2')"
+H1="$(validated_sha256_file "$BIN1" 'release build 1')"
+H2="$(validated_sha256_file "$BIN2" 'release build 2')"
 echo "build 1 sha256: $H1"
 echo "build 2 sha256: $H2"
 [ "$H1" = "$H2" ] || fail "two clean builds of the same commit differ. The \
@@ -254,7 +287,7 @@ echo "determinism: ok (bit-identical, same source path and independent target di
 
 # ── 3. Stamp is live and truthful ────────────────────────────────────────────
 VERSION_FILE="$WORK/binary-version"
-"$WORK/t1/release/bloch-pos" --version > "$VERSION_FILE" \
+"$BIN1" --version > "$VERSION_FILE" \
   || fail "release binary --version failed"
 [ "$(wc -l < "$VERSION_FILE" | tr -d '[:space:]')" = 2 ] \
   || fail "binary version output must contain exactly two newline-terminated lines"
