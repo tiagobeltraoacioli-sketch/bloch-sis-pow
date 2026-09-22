@@ -1,1 +1,3 @@
-/products.html /#ecosystem 301
+# Cloudflare Pages canonicalizes HTML files to extensionless URLs. Never add
+# reverse redirects such as `/docs /docs.html`: they create a redirect loop.
+/products /#ecosystem 301
